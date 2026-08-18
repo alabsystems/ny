@@ -47,6 +47,12 @@ impl BoundStatus {
     pub(super) fn from_width(width: f32, input_epsilon: f32) -> Self {
         if !width.is_finite() {
             BoundStatus::Overflow
+        } else if input_epsilon == 0.0 {
+            if width == 0.0 {
+                BoundStatus::Tight
+            } else {
+                BoundStatus::VeryWide
+            }
         } else {
             let ratio = width / (2.0 * input_epsilon);
             if ratio < 10.0 {

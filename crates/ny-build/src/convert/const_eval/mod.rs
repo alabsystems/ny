@@ -14,7 +14,7 @@ use ny_propagate::Layer;
 use std::collections::HashMap;
 use tracing::debug;
 
-use self::arithmetic::{evaluate_instance_norm_constant, evaluate_linear_constant};
+use self::arithmetic::{evaluate_convolution_constant_exact, evaluate_linear_constant_exact};
 use super::{ConvertContext, LayerSpec};
 
 fn propagate_constant_through_layer(
@@ -22,11 +22,9 @@ fn propagate_constant_through_layer(
     input: ArrayD<f32>,
     _layer_name: &str,
 ) -> Option<ArrayD<f32>> {
-    // Fast path: use single-pass forward for Conv1d/ConvTranspose1d instead
-    // of IBP's 4x W+/W- splitting. For concrete (point) inputs, IBP is
-    // mathematically equivalent but ~4x slower due to unnecessary kernel
-    // decomposition. This is critical for vocoder const-folding where frozen
-    // auxiliary tensors flow through long ConvTranspose1d upsampler chains.
+    // The layer-level policy runs point IBP and admits only certified exact
+    // copy/select/shape operations.  A singleton produced by ordinary f32
+    // arithmetic is not enough to materialize an exact-real constant.
     layer.propagate_concrete(input).ok()
 }
 
@@ -39,6 +37,39 @@ fn lookup_constant_value(
         .get(name)
         .cloned()
         .or_else(|| evaluated_constants.get(name).cloned())
+}
+
+fn lookup_integral_constant_values(
+    weights: &crate::WeightStore,
+    evaluated_constants: &HashMap<String, ArrayD<f32>>,
+    spec: &LayerSpec,
+    name: &str,
+    field: &str,
+    allow_positive_infinity: bool,
+) -> Option<(Vec<i64>, Vec<usize>)> {
+    if let Some(integers) = weights.get_integers(name) {
+        if weights
+            .get(name)
+            .is_some_and(|floats| floats.shape() != integers.shape())
+        {
+            debug!(
+                "{} {} exact integer {} tensor '{}' has a mismatched float-view shape",
+                spec.layer_type, spec.name, field, name
+            );
+            return None;
+        }
+        return Some((
+            integers.iter().copied().collect(),
+            integers.shape().to_vec(),
+        ));
+    }
+    let values = lookup_constant_value(weights, evaluated_constants, name)?;
+    let parsed = values
+        .iter()
+        .copied()
+        .map(|value| parse_integral_constant_value(spec, field, value, allow_positive_infinity))
+        .collect::<Option<Vec<_>>>()?;
+    Some((parsed, values.shape().to_vec()))
 }
 
 fn resolve_constant_axis(spec: &LayerSpec, op_name: &str, ndim: usize, axis: i64) -> Option<usize> {
@@ -84,19 +115,22 @@ fn parse_integral_constant_value(
         );
         return None;
     }
-    // Shape-derived Slice bounds can round-trip through f32 storage after losing
-    // their original ONNX integer type. Truncate finite values here so graph-side
-    // constant evaluation matches convert_slice and the real Kokoro fixed-aux path
-    // still folds out of the graph (#3500).
-    let truncated = value.trunc();
-    if truncated < i64::MIN as f32 || truncated > i64::MAX as f32 {
+    let integral = value.trunc();
+    if integral != value {
+        debug!(
+            "{} {} has non-integral {}={}",
+            spec.layer_type, spec.name, field, value
+        );
+        return None;
+    }
+    if integral < i64::MIN as f32 || integral >= i64::MAX as f32 {
         debug!(
             "{} {} has out-of-range {}={}",
             spec.layer_type, spec.name, field, value
         );
         return None;
     }
-    Some(truncated as i64)
+    Some(integral as i64)
 }
 
 fn normalize_slice_bound(bound: i64, axis_len: i64) -> i64 {
@@ -127,14 +161,18 @@ impl ConvertContext<'_> {
                 let input =
                     lookup_constant_value(self.weights, evaluated_constants, spec.inputs.first()?)?;
                 let layer = self.convert_layer(spec).ok()?;
-                evaluate_linear_constant(&layer, input)
+                evaluate_linear_constant_exact(&layer, input)
             }
             LayerType::Conv1d | LayerType::Conv2d => {
                 let input =
                     lookup_constant_value(self.weights, evaluated_constants, spec.inputs.first()?)?;
                 let layer = self.convert_layer(spec).ok()?;
-                propagate_constant_through_layer(&layer, input, &spec.name)
+                evaluate_convolution_constant_exact(&layer, input)
             }
+            // InstanceNorm contains non-trivial floating-point arithmetic. A
+            // point IBP image may still collapse around a rounded result, so
+            // it is not an exact-real materialization certificate.
+            LayerType::InstanceNorm => None,
             LayerType::ConvTranspose1d | LayerType::ConvTranspose2d => {
                 // Skip constant evaluation for transposed convolutions.
                 // conv1d_transpose_forward uses a scalar loop that is
@@ -161,45 +199,15 @@ impl ConvertContext<'_> {
                 let output_shape = reshape.compute_output_shape(input.shape()).ok()?;
                 input.into_shape_with_order(IxDyn(&output_shape)).ok()
             }
-            LayerType::InstanceNorm => {
-                let input =
-                    lookup_constant_value(self.weights, evaluated_constants, spec.inputs.first()?)?;
-                let layer = self.convert_layer(spec).ok()?;
-                evaluate_instance_norm_constant(&layer, input)
-            }
-            LayerType::Sin => {
-                lookup_constant_value(self.weights, evaluated_constants, spec.inputs.first()?)
-                    .map(|data| data.mapv(|value| value.sin()))
-            }
-            LayerType::Reciprocal => {
-                lookup_constant_value(self.weights, evaluated_constants, spec.inputs.first()?)
-                    .and_then(|data| {
-                        let result = data.mapv(|value| value.recip());
-                        result
-                            .iter()
-                            .all(|value| value.is_finite())
-                            .then_some(result)
-                    })
-            }
-            LayerType::Sqrt => {
-                lookup_constant_value(self.weights, evaluated_constants, spec.inputs.first()?)
-                    .and_then(|data| {
-                        let result = data.mapv(|value| value.sqrt());
-                        result
-                            .iter()
-                            .all(|value| value.is_finite())
-                            .then_some(result)
-                    })
-            }
-            LayerType::ReduceSum
-            | LayerType::ReduceMean
-            | LayerType::ReduceMax
-            | LayerType::ReduceMin => {
+            LayerType::ReduceMax | LayerType::ReduceMin => {
                 let input =
                     lookup_constant_value(self.weights, evaluated_constants, spec.inputs.first()?)?;
                 let layer = self.convert_layer(spec).ok()?;
                 propagate_constant_through_layer(&layer, input, &spec.name)
             }
+            // Sum/mean need an exact accumulation certificate (or an interval
+            // frozen-constant carrier); generic point propagation is not one.
+            LayerType::ReduceSum | LayerType::ReduceMean => None,
             LayerType::Slice => self.evaluate_slice_constant(spec, evaluated_constants),
             LayerType::Squeeze => self.evaluate_squeeze_constant(spec, evaluated_constants),
             LayerType::Unsqueeze => self.evaluate_unsqueeze_constant(spec, evaluated_constants),

@@ -11,6 +11,7 @@ use tracing::info;
 
 use super::super::JsonCliError;
 use super::options::configure_layernorm;
+use crate::commands::terminal_peel::AppliedTerminalPeel;
 use crate::{LayerNormModeArg, LayerNormNormModeArg};
 
 /// Holds either a sequential or graph-based verifiable network.
@@ -70,6 +71,8 @@ pub(crate) struct LoadedModel {
     pub(crate) output_dim: usize,
     /// Pre-loaded VNNLIB spec (when softmax peeling modifies the model during load).
     pub(crate) preloaded_vnnlib: Option<ny_onnx::vnnlib::VnnLibSpec>,
+    /// Exact activation actually removed by the joint model/property pass.
+    pub(crate) applied_terminal_peel: AppliedTerminalPeel,
 }
 
 /// Detect if the model file is NNet format.
@@ -111,6 +114,7 @@ pub(crate) fn load_model(
     let use_native = should_use_native(model, native, is_nnet);
 
     let mut preloaded_vnnlib: Option<ny_onnx::vnnlib::VnnLibSpec> = None;
+    let mut applied_terminal_peel = AppliedTerminalPeel::None;
 
     if peel_off_last_softmax_layer && property.is_none() && !json {
         eprintln!(
@@ -130,9 +134,10 @@ pub(crate) fn load_model(
             json,
         )?
     } else {
-        let (net, shape, dim, vnnlib) =
+        let (net, shape, dim, vnnlib, terminal_peel) =
             load_onnx_model(model, peel_off_last_softmax_layer, property, json)?;
         preloaded_vnnlib = vnnlib;
+        applied_terminal_peel = terminal_peel;
         (net, shape, dim)
     };
 
@@ -141,6 +146,7 @@ pub(crate) fn load_model(
         input_shape,
         output_dim,
         preloaded_vnnlib,
+        applied_terminal_peel,
     })
 }
 
@@ -256,6 +262,7 @@ fn load_onnx_model(
     Vec<usize>,
     usize,
     Option<ny_onnx::vnnlib::VnnLibSpec>,
+    AppliedTerminalPeel,
 )> {
     use ny_onnx::vnnlib::load_vnnlib;
     use ny_onnx::{load_onnx_with_config, OnnxLoadConfig};
@@ -291,10 +298,12 @@ fn load_onnx_model(
         .unwrap_or(10);
 
     let mut preloaded_vnnlib = None;
+    let mut applied_terminal_peel = AppliedTerminalPeel::None;
     if let Some(prop_path) = property {
         let mut vnnlib = load_vnnlib(prop_path)?;
         if peel_off_last_softmax_layer {
             let report = ny_onnx::peel_off_last_softmax_layer(&mut onnx_model, &mut vnnlib);
+            applied_terminal_peel = AppliedTerminalPeel::from_report(&report)?;
             if report.peeled && !json {
                 eprintln!(
                     "Peeled off terminal {:?} layer using VNN-LIB constraints.",
@@ -302,12 +311,13 @@ fn load_onnx_model(
                 );
             }
         } else {
-            // #cgan-sigmoid-peel: default-ON auto-peel for the exactly-
-            // invertible case (terminal Sigmoid + all-constant thresholds,
-            // e.g. the cgan upsample band specs). NY_SIGMOID_PEEL=0 disables.
+            // #cgan-sigmoid-peel compatibility seam. The constant-threshold
+            // proof path is quarantined in ny-onnx and currently always
+            // declines without mutation, even if its old env gate is armed.
             let report = ny_onnx::peel_off_terminal_sigmoid_auto(&mut onnx_model, &mut vnnlib);
+            applied_terminal_peel = AppliedTerminalPeel::from_report(&report)?;
             if report.peeled && !json {
-                eprintln!("Auto-peeled terminal Sigmoid using VNN-LIB constant thresholds.");
+                eprintln!("Applied a qualified terminal-Sigmoid peel.");
             }
         }
         preloaded_vnnlib = Some(vnnlib);
@@ -325,6 +335,7 @@ fn load_onnx_model(
         input_shape,
         output_dim,
         preloaded_vnnlib,
+        applied_terminal_peel,
     ))
 }
 
@@ -424,10 +435,10 @@ pub(crate) fn validate_mode_model_compat(
     if (layer_by_layer || use_block_wise) && !use_native {
         let message = if layer_by_layer {
             "Layer-by-layer mode is only supported for native models (GraphNetwork). \
-            Hint: use --native flag with PyTorch/SafeTensors/GGUF models."
+            Hint: use --native with PyTorch/SafeTensors/CoreML/GGUF models."
         } else {
             "Block-wise mode is only supported for native models (GraphNetwork). \
-            Hint: use --native flag with PyTorch/SafeTensors/GGUF models."
+            Hint: use --native with PyTorch/SafeTensors/CoreML/GGUF models."
         };
         return Err(JsonCliError::new("unsupported_model_format", message).into());
     }

@@ -144,7 +144,7 @@ fn test_multiple_bounds_same_variable_takes_tightest() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_strict_inequality_input_bounds() {
+fn test_strict_inequality_input_bounds_fail_closed() {
     let content = r#"
 (declare-const X_0 Real)
 (declare-const Y_0 Real)
@@ -153,15 +153,14 @@ fn test_strict_inequality_input_bounds() {
 (assert (> X_0 -1.0))
 "#;
 
-    let spec = parse_vnnlib(content).unwrap();
-    // Strict inequalities should still set bounds
-    assert!((spec.input_bounds[0].0 - (-1.0)).abs() < 1e-10);
-    assert!((spec.input_bounds[0].1 - 1.0).abs() < 1e-10);
+    let error = parse_vnnlib(content)
+        .expect_err("an open input endpoint must not become an inclusive box boundary");
+    assert!(error.to_string().contains("Strict input constraints"));
 }
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_reversed_strict_input_bounds() {
+fn test_reversed_strict_input_bounds_fail_closed() {
     let content = r#"
 (declare-const X_0 Real)
 (declare-const Y_0 Real)
@@ -172,9 +171,9 @@ fn test_reversed_strict_input_bounds() {
 (assert (> 1.0 X_0))
 "#;
 
-    let spec = parse_vnnlib(content).unwrap();
-    assert!((spec.input_bounds[0].0 - (-1.0)).abs() < 1e-10);
-    assert!((spec.input_bounds[0].1 - 1.0).abs() < 1e-10);
+    let error = parse_vnnlib(content)
+        .expect_err("a reversed open endpoint must not become an inclusive box boundary");
+    assert!(error.to_string().contains("Strict input constraints"));
 }
 
 #[ntest::timeout(10000)]

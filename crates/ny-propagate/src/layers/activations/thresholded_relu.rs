@@ -123,7 +123,7 @@ impl ThresholdedReluLayer {
 /// Upper bound: identity y=x when l >= 0 (avoids catastrophic f32 cancellation
 /// from steep slope); line through (l,0) when l < 0 with f64 directed rounding.
 /// Lower bound: y = x - max(alpha, 0). Part of #3313.
-fn thresholded_relu_crossing(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
+pub(super) fn thresholded_relu_crossing(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     let (us, ui) = if l >= 0.0 {
         (1.0, 0.0)
     } else {
@@ -176,7 +176,7 @@ fn thresholded_relu_crossing(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
 /// - l < 0: line through (l, 0) with slope >= max(u/(u-l), alpha/(alpha-l))
 ///
 /// Returns a `LinearRelaxation` (lower_slope, lower_intercept, upper_slope, upper_intercept).
-fn thresholded_relu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
+pub(super) fn thresholded_relu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     if l.is_nan() || u.is_nan() || l.is_infinite() {
         // NaN or l=-inf: safe ±inf intercepts so CROWN drives bounds to ±inf.
         // l=-inf must be caught here; without this guard it falls through to the

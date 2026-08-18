@@ -5,9 +5,55 @@
 //! Shared BatchNorm layout decoding and flattened scale/bias expansion.
 
 use ndarray::Array1;
-use ny_core::{checked_shape_product, NyError, Result};
+use ny_core::{checked_shape_product, dd::next_up_f64, NyError, Result};
 
-use super::types::BatchNormLayer;
+use super::types::{BatchNormChannelAxisHint, BatchNormLayer};
+
+/// Add non-negative error radii with an outward binary64 rounding step.
+///
+/// Error metadata is proof-critical and may originate outside BatchNorm.  An
+/// invalid (negative or NaN) radius therefore poisons the result to `+inf`;
+/// exact zero is preserved so structural zero terms do not manufacture a
+/// penalty.  Merely rounding the final binary64 reduction to binary32 is not
+/// sufficient after a long accumulation.
+#[inline]
+pub(super) fn nonnegative_add_up(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() || left < 0.0 || right < 0.0 {
+        return f64::INFINITY;
+    }
+    if left == 0.0 {
+        return right;
+    }
+    if right == 0.0 {
+        return left;
+    }
+    let sum = left + right;
+    if sum.is_finite() {
+        next_up_f64(sum)
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Multiply non-negative error radii with outward binary64 rounding.
+///
+/// `0 * +inf` is structurally zero in coefficient-error arithmetic.  Every
+/// other non-finite or invalid product becomes the conservative `+inf` poison.
+#[inline]
+pub(super) fn nonnegative_mul_up(left: f64, right: f64) -> f64 {
+    if left == 0.0 || right == 0.0 {
+        return 0.0;
+    }
+    if !left.is_finite() || !right.is_finite() || left < 0.0 || right < 0.0 {
+        return f64::INFINITY;
+    }
+    let product = left * right;
+    if product.is_finite() {
+        next_up_f64(product)
+    } else {
+        f64::INFINITY
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct BatchNormInputLayout {
@@ -32,6 +78,7 @@ pub(super) fn detect_input_layout(
     shape: &[usize],
     expected_channels: usize,
     expected_total_elements: Option<usize>,
+    channel_axis_hint: Option<BatchNormChannelAxisHint>,
 ) -> Result<BatchNormInputLayout> {
     if shape.is_empty() {
         return Err(NyError::InvalidSpec(
@@ -39,7 +86,31 @@ pub(super) fn detect_input_layout(
         ));
     }
 
-    let channel_idx = if shape.len() >= 4 {
+    let channel_idx = if let Some(channel_axis_hint) = channel_axis_hint {
+        match channel_axis_hint {
+            BatchNormChannelAxisHint::Fixed(channel_idx) => {
+                if channel_idx >= shape.len() {
+                    return Err(NyError::InvalidSpec(format!(
+                        "BatchNorm: channel-axis hint {channel_idx} is invalid for shape {shape:?}"
+                    )));
+                }
+                channel_idx
+            }
+            BatchNormChannelAxisHint::OnnxNchw { authored_rank } => {
+                if shape.len() == authored_rank {
+                    1
+                } else if shape.len().checked_add(1) == Some(authored_rank) {
+                    0
+                } else {
+                    return Err(NyError::InvalidSpec(format!(
+                        "BatchNorm: propagated shape {shape:?} has rank {}, expected authored ONNX rank {authored_rank} or batch-stripped rank {}",
+                        shape.len(),
+                        authored_rank - 1
+                    )));
+                }
+            }
+        }
+    } else if shape.len() >= 4 {
         // The squeezed, unbatched conversion emits feature tensors of rank <= 3
         // ([C], [C, L], [C, H, W]), so a rank-4+ input necessarily carries a
         // leading batch axis ([N, C, ...]) where the channel axis is 1 by NCHW
@@ -146,10 +217,12 @@ impl BatchNormLayer {
         input_shape: &[usize],
         expected_total_elements: usize,
     ) -> Result<(Array1<f32>, Array1<f32>, Array1<f32>, Array1<f32>)> {
+        self.validate_affine_parameters()?;
         let layout = detect_input_layout(
             input_shape,
             self.num_channels,
             Some(expected_total_elements),
+            self.channel_axis_hint,
         )?;
         let (scale, bias) = self.expand_scale_bias(&layout);
         let (scale_err, bias_err) = self.expand_errs(&layout);
@@ -164,7 +237,13 @@ impl BatchNormLayer {
         input_shape: &[usize],
         expected_total: Option<usize>,
     ) -> Result<(usize, usize)> {
-        let layout = detect_input_layout(input_shape, self.num_channels, expected_total)?;
+        self.validate_affine_parameters()?;
+        let layout = detect_input_layout(
+            input_shape,
+            self.num_channels,
+            expected_total,
+            self.channel_axis_hint,
+        )?;
         if layout.batch_size != 1 {
             return Err(NyError::InvalidSpec(
                 "BatchNorm GPU extraction: batched input unsupported".to_string(),

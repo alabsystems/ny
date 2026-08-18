@@ -5,7 +5,7 @@
 //! Element-wise square root layer: y = sqrt(x).
 
 use ndarray::Array1;
-use ny_core::{NyError, Result};
+use ny_core::{f32_affine_eval_error, f64_to_f32_down, f64_to_f32_up, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 use std::borrow::Cow;
 use tracing::debug;
@@ -185,13 +185,13 @@ pub(crate) fn sqrt_linear_relaxation_with_alpha(l: f32, u: f32, mid: f32) -> Lin
 
     // Directed rounding: compensate for f64→f32 truncation in both slope and
     // intercept. Same pattern as exp_linear_relaxation.
-    let max_abs_x = l.abs().max(u.abs()) as f64;
+    let max_abs_x = l.abs().max(u.abs());
 
     // For concave sqrt: chord is a lower bound, tangent is a global upper bound.
     let lower_slope = chord_slope as f32;
-    let lower_slope_err =
-        next_up_f32(((chord_slope - lower_slope as f64).abs() * max_abs_x) as f32);
-    let lower_intercept = next_down_f32((chord_intercept as f32) - lower_slope_err);
+    let lower_eval_err =
+        f32_affine_eval_error(chord_slope, lower_slope, chord_intercept, max_abs_x);
+    let lower_intercept = next_down_f32(f64_to_f32_down(chord_intercept - lower_eval_err));
 
     let mid = if u > 0.0 {
         mid.clamp(l.max(SQRT_ALPHA_MIN_MID.min(u)), u)
@@ -204,13 +204,24 @@ pub(crate) fn sqrt_linear_relaxation_with_alpha(l: f32, u: f32, mid: f32) -> Lin
     let tangent_slope_f64 = 0.5 / sqrt_mid;
     let tangent_intercept_f64 = sqrt_mid - tangent_slope_f64 * mid64;
     let tangent_slope = tangent_slope_f64 as f32;
-    let tangent_slope_err =
-        next_up_f32(((tangent_slope_f64 - tangent_slope as f64).abs() * max_abs_x) as f32);
-    let tangent_intercept = next_up_f32((tangent_intercept_f64 as f32) + tangent_slope_err);
+    let tangent_eval_err = f32_affine_eval_error(
+        tangent_slope_f64,
+        tangent_slope,
+        tangent_intercept_f64,
+        max_abs_x,
+    );
+    let tangent_intercept = next_up_f32(f64_to_f32_up(tangent_intercept_f64 + tangent_eval_err));
     let upper_slope = tangent_slope;
     let min_intercept = if original_l < 0.0 {
         // Ensure upper bound stays >= 0 for x <= 0.
-        next_up_f32(-tangent_slope * original_l)
+        let zero_intercept = -(tangent_slope as f64) * original_l as f64;
+        let zero_eval_err = f32_affine_eval_error(
+            tangent_slope as f64,
+            tangent_slope,
+            zero_intercept,
+            original_l.abs(),
+        );
+        next_up_f32(f64_to_f32_up(zero_intercept + zero_eval_err))
     } else {
         tangent_intercept
     };

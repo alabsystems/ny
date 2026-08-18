@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "external-vnncomp")]
+
 //! Integration tests covering real VNN-COMP CNN benchmark assets.
 //!
 //! These tests use CIFAR-10 ResNet benchmark files from `benchmarks/vnncomp2021`

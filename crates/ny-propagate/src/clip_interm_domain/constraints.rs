@@ -301,6 +301,56 @@ fn f64_next_down(value: f64) -> f64 {
     }
 }
 
+fn f64_next_up(value: f64) -> f64 {
+    if value == f64::INFINITY || value.is_nan() {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    if value > 0.0 {
+        f64::from_bits(value.to_bits() + 1)
+    } else {
+        f64::from_bits(value.to_bits() - 1)
+    }
+}
+
+fn add_f64_down(a: f64, b: f64) -> f64 {
+    let rounded = a + b;
+    if rounded == f64::INFINITY {
+        f64::MAX
+    } else {
+        f64_next_down(rounded)
+    }
+}
+
+fn add_f64_up(a: f64, b: f64) -> f64 {
+    let rounded = a + b;
+    if rounded == f64::NEG_INFINITY {
+        -f64::MAX
+    } else {
+        f64_next_up(rounded)
+    }
+}
+
+fn mul_f64_down(a: f64, b: f64) -> f64 {
+    let rounded = a * b;
+    if rounded == f64::INFINITY {
+        f64::MAX
+    } else {
+        f64_next_down(rounded)
+    }
+}
+
+fn mul_f64_up(a: f64, b: f64) -> f64 {
+    let rounded = a * b;
+    if rounded == f64::NEG_INFINITY {
+        -f64::MAX
+    } else {
+        f64_next_up(rounded)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn split_constraints_from_store(
     store: &DomainConstraintStore,
@@ -437,15 +487,13 @@ where
         });
     }
 
-    // Compute centroid and half-width with visible polling.
+    // Compute the optimizer's centroid with visible polling.
     let mut x0 = Array1::<f32>::zeros(x_dim);
-    let mut eps = Array1::<f32>::zeros(x_dim);
     for x in 0..x_dim {
         if x.is_multiple_of(CLIP_PREPROCESS_POLL_STRIDE) {
             check_preprocess_deadline(past_deadline, "constraint preprocessing centroid")?;
         }
         x0[x] = f32::midpoint(x_l[x], x_u[x]);
-        eps[x] = (x_u[x] - x_l[x]) / 2.0;
     }
 
     let mut infeasible_mask = vec![false; n];
@@ -471,28 +519,43 @@ where
         let a_row = constraints.a_matrix.row(k);
         let b_k = constraints.b_vector[k];
 
-        // Compute d = A·x0 + b
+        // Compute the centered representation used by the optimizer, plus
+        // independently certified outward bounds for row classification.
+        // The latter must not use the rounded f32 centroid/radius sum: a
+        // cancellation there can label an active necessary condition as
+        // fully covered and falsely complete an adaptive clipping bank.
         let mut d_k = b_k;
-        let mut max_violation = 0.0f32;
+        let mut row_min = f64::from(b_k);
+        let mut row_max = f64::from(b_k);
+        let mut row_certifiable = b_k.is_finite();
         for x in 0..x_dim {
             if cells.is_multiple_of(CLIP_PREPROCESS_POLL_STRIDE) {
                 check_preprocess_deadline(past_deadline, "constraint preprocessing fold")?;
             }
             d_k += a_row[x] * x0[x];
-            max_violation += a_row[x].abs() * eps[x];
+            row_certifiable &= a_row[x].is_finite()
+                && x_l[x].is_finite()
+                && x_u[x].is_finite()
+                && x_l[x] <= x_u[x];
+            let coefficient = f64::from(a_row[x]);
+            let (min_x, max_x) = if coefficient >= 0.0 {
+                (f64::from(x_l[x]), f64::from(x_u[x]))
+            } else {
+                (f64::from(x_u[x]), f64::from(x_l[x]))
+            };
+            row_min = add_f64_down(row_min, mul_f64_down(coefficient, min_x));
+            row_max = add_f64_up(row_max, mul_f64_up(coefficient, max_x));
             cells = cells.saturating_add(1);
         }
 
-        // Check feasibility: if d - max_violation > 0, constraint can never be satisfied
-        // (minimum value of A·x + b over the box is positive)
-        if d_k - max_violation > 1e-8 {
+        // Only filter a row when directed arithmetic certifies the relation
+        // over the entire represented-f32 box.
+        if row_certifiable && row_min > 0.0 {
             infeasible_mask[k] = true;
             continue;
         }
 
-        // Check if fully covered: if d + max_violation <= 0, constraint always satisfied
-        // (maximum value of A·x + b over the box is non-positive)
-        if d_k + max_violation <= 1e-8 {
+        if row_certifiable && row_max <= 0.0 {
             fully_covered_mask[k] = true;
             continue;
         }

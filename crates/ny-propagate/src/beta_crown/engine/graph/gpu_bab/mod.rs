@@ -60,6 +60,7 @@ use tracing::info;
 use crate::batched_domain::BatchedDomainOptions;
 use crate::beta_crown::branching::BranchingHeuristic;
 use crate::beta_crown::engine::graph::shared::setup::build_graph_bab_setup;
+use crate::beta_crown::engine::graph::shared::state::GraphBabLifecycle;
 use crate::beta_crown::result::BabVerificationStatus;
 use crate::GraphNetwork;
 
@@ -80,6 +81,29 @@ use input_split::{
     process_input_split_batch, process_input_split_batch_attempt, InputSplitOutcome,
 };
 use prefilter::prefilter_picked_domains;
+
+/// Latch any DomainList completeness loss into the shared graph-BaB lifecycle.
+fn latch_domain_list_eviction(
+    domain_list: &crate::batched_domain::DomainList,
+    state: &mut BabLoopState,
+) {
+    if domain_list.evicted_count() > 0 {
+        state.unresolved_due_to_eviction = true;
+    }
+}
+
+fn initial_bounds_deadline_status(
+    now: Instant,
+    iterative_deadline: Option<Instant>,
+    overall_deadline: Option<Instant>,
+) -> BabVerificationStatus {
+    match ny_core::phase_yield::classify_expiry(now, iterative_deadline, overall_deadline) {
+        ny_core::phase_yield::Expiry::Global => BabVerificationStatus::Timeout,
+        ny_core::phase_yield::Expiry::PhaseOnly => BabVerificationStatus::Unknown {
+            reason: "Initial-bound warmup exceeded its deadline cap before branching".to_string(),
+        },
+    }
+}
 
 impl BetaCrownVerifier {
     /// Verify GraphNetwork using GPU-accelerated BaB with DomainList storage.
@@ -111,6 +135,10 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<crate::beta_crown::result::BetaCrownResult> {
+        // The input-split IBP pre-screen below may issue a final verdict before
+        // `compute_initial_bounds` reaches its own validation.  This public
+        // ingress therefore owns the fail-closed configuration check.
+        self.config.validate()?;
         let graph = self.configured_graph_for_crown(graph);
         let graph = &graph;
         let engine = self.resolve_engine(engine);
@@ -127,16 +155,19 @@ impl BetaCrownVerifier {
             .phase_budget
             .post_bab_pgd_fraction
             .clamp(0.0, 0.5);
-        let effective_total = match deadline {
+        let bab_timeout = match deadline {
+            // An explicit deadline is already the caller ledger's BaB slice.
             Some(dl) => dl.saturating_duration_since(now),
-            None => self.config.timeout,
+            None => self.config.timeout.mul_f32(1.0 - pgd_frac),
         };
-        let bab_timeout = effective_total.mul_f32(1.0 - pgd_frac);
+        let _complete_clip_deadline = self.complete_clip_deadline_overrides.scoped(Some(
+            GraphBabLifecycle::fail_closed_deadline(now, bab_timeout),
+        ));
         // Foundational IBP pre-screen + node-bounds bootstrap must reach every
         // node, so they get the full global deadline (not the warmup fraction);
         // capping it choked conv-heavy DAGs into premature "deadline exceeded
         // before node 'Conv_0'" with budget unused (#4321).
-        let initial_deadline = Some(now + bab_timeout);
+        let initial_deadline = Some(GraphBabLifecycle::fail_closed_deadline(now, bab_timeout));
         // The genuinely-iterative root α-CROWN warmup + spec-guided output
         // optimization is capped at `initial_bounds_fraction` of the BaB budget
         // (#4095/#4413), mirroring the CPU ReLU-split path. With fraction 0.0 this
@@ -148,7 +179,10 @@ impl BetaCrownVerifier {
                 .phase_budget
                 .initial_bounds_fraction
                 .clamp(0.0, 1.0);
-            Some(now + bab_timeout.mul_f32(frac))
+            Some(GraphBabLifecycle::fail_closed_deadline(
+                now,
+                bab_timeout.mul_f32(frac),
+            ))
         };
 
         // IBP root pre-screen (Part of #3870, parity with CPU single_objective.rs:156-176).
@@ -176,7 +210,7 @@ impl BetaCrownVerifier {
                         .domain_is_verified(ibp_lower, ibp_upper, threshold)
                     {
                         info!(
-                            "GPU BaB: root domain verified by IBP alone \
+                            "DomainList BaB: root domain verified by IBP alone \
                              (lower={}, upper={}, threshold={})",
                             ibp_lower, ibp_upper, threshold
                         );
@@ -194,7 +228,7 @@ impl BetaCrownVerifier {
                 }
                 Err(ny_core::NyError::DeadlineExceeded(_)) => {
                     info!(
-                        "GPU BaB: skipping root IBP pre-screen because the warmup deadline expired"
+                        "DomainList BaB: skipping root IBP pre-screen because the warmup deadline expired"
                     );
                 }
                 Err(err) => return Err(err),
@@ -219,13 +253,18 @@ impl BetaCrownVerifier {
             Ok(init) => init,
             Err(ny_core::NyError::DeadlineExceeded(_)) => {
                 info!(
-                    "GPU BaB: initial-bound warmup exceeded its deadline cap after {:.3}s; returning Unknown",
+                    "DomainList BaB: initial-bound propagation exceeded a deadline after {:.3}s",
                     state.start_time.elapsed().as_secs_f64()
                 );
-                return Ok(state.build_result(BabVerificationStatus::Unknown {
-                    reason: "Initial-bound warmup exceeded its deadline cap before branching"
-                        .to_string(),
-                }));
+                let status = initial_bounds_deadline_status(
+                    Instant::now(),
+                    iterative_deadline,
+                    initial_deadline,
+                );
+                return Ok(match status {
+                    BabVerificationStatus::Timeout => state.timeout_result(),
+                    status => state.build_result(status),
+                });
             }
             Err(err) => return Err(err),
         };
@@ -235,11 +274,14 @@ impl BetaCrownVerifier {
         // CROWN passes. Per-domain passes should use the full bab_timeout,
         // not the warmup fraction.
         if let Some(ref mut bootstrap) = init_result.input_split_bootstrap {
-            bootstrap.deadline = Some(state.start_time + bab_timeout);
+            bootstrap.deadline = Some(GraphBabLifecycle::fail_closed_deadline(
+                state.start_time,
+                bab_timeout,
+            ));
         }
 
         info!(
-            "GPU BaB (DomainList): initial bounds [{:.4}, {:.4}], threshold: {:.4}",
+            "DomainList BaB: initial bounds [{:.4}, {:.4}], threshold: {:.4}",
             init_result.root_lower, init_result.root_upper, threshold
         );
 
@@ -260,7 +302,7 @@ impl BetaCrownVerifier {
             }
             DomainCheckResult::Violation => {
                 return Ok(state.build_result_with_bounds(
-                    BabVerificationStatus::PotentialViolation,
+                    BabVerificationStatus::potential_violation(),
                     init_result.initial_output,
                 ));
             }
@@ -280,6 +322,13 @@ impl BetaCrownVerifier {
 
         // Step 3: Initialize DomainList with root domain
         let graph_setup = build_graph_bab_setup(graph, &init_result.initial_node_bounds);
+        if self.config.enable_clip_interm_domain && !is_input_split_mode {
+            self.complete_clip_root_bounds_cache.store_finalized(
+                graph,
+                input,
+                &graph_setup.initial_node_bounds_arc,
+            );
+        }
         let (mut domain_list, layer_names) = create_domain_list(
             &init_result,
             input,
@@ -288,6 +337,7 @@ impl BetaCrownVerifier {
             is_input_split_mode,
             &graph_setup,
         )?;
+        latch_domain_list_eviction(&domain_list, &mut state);
         let setup = build_setup_context(graph, &self.config, graph_setup.relu_nodes);
 
         // Step 4: BaB loop using DomainList
@@ -345,8 +395,11 @@ impl BetaCrownVerifier {
         let sort_interval = if is_input_split_mode { 1 } else { 3 };
         let mut iterations_since_sort = 0usize;
         let mut batch_index = 0usize;
+        let mut relu_bab_iteration = 0usize;
 
         while !domain_list.is_empty() {
+            latch_domain_list_eviction(&domain_list, &mut state);
+
             // Check termination conditions (use bab_timeout for PGD reservation #4095)
             if let Some(result) = state.check_termination(bab_timeout, self.config.max_domains) {
                 // #bab-frontier graph lane: the surviving DomainList is exactly
@@ -389,12 +442,19 @@ impl BetaCrownVerifier {
                 let input_split_bootstrap =
                     init_result.input_split_bootstrap.as_ref().ok_or_else(|| {
                         ny_core::NyError::InternalError(
-                            "GPU BaB input split: missing root bootstrap context".to_string(),
+                            "DomainList BaB input split: missing root bootstrap context"
+                                .to_string(),
                         )
                     })?;
                 if let Some(controller) = adaptive_microbatch.as_mut() {
                     let mut cursor = OrderedBatchCursor::new(picked.batch_size);
                     while !cursor.is_done() {
+                        // A picked queue wave may span several device
+                        // microbatches. Re-check the authoritative verifier
+                        // deadline before each fresh attempt or refusal retry.
+                        if self.past_effective_graph_bab_deadline() {
+                            return Ok(state.timeout_result());
+                        }
                         let requested = controller.current();
                         let range = cursor.next_range(requested);
                         // Keep the queue batch in place and address the device
@@ -427,17 +487,17 @@ impl BetaCrownVerifier {
                                         processable_picked_indices.len(),
                                         observed_bytes,
                                         elapsed,
-                                        Some(
-                                            (state.start_time + bab_timeout)
-                                                .saturating_duration_since(Instant::now()),
-                                        ),
+                                        self.effective_graph_bab_deadline().map(|deadline| {
+                                            deadline.saturating_duration_since(Instant::now())
+                                        }),
                                     );
                                     batch_index += 1;
                                     if matches!(outcome, InputSplitOutcome::Violation) {
                                         return Ok(state.build_result(
-                                            BabVerificationStatus::PotentialViolation,
+                                            BabVerificationStatus::potential_violation(),
                                         ));
                                     }
+                                    latch_domain_list_eviction(&domain_list, &mut state);
                                     break true;
                                 }
                                 Err(error) => {
@@ -453,7 +513,7 @@ impl BetaCrownVerifier {
                                                 next_microbatch = next,
                                                 queue_batch_size = picked.batch_size,
                                                 retry_start = range.start,
-                                                "GPU BaB input split: retrying refused microbatch"
+                                                "DomainList BaB input split: retrying refused microbatch"
                                             );
                                             break false;
                                         }
@@ -465,7 +525,7 @@ impl BetaCrownVerifier {
                                                 reason = reason.code(),
                                                 queue_batch_size = picked.batch_size,
                                                 retry_start = range.start,
-                                                "GPU BaB input split: retrying one-domain \
+                                                "DomainList BaB input split: retrying one-domain \
                                                  refusal on host"
                                             );
                                             continue;
@@ -499,12 +559,13 @@ impl BetaCrownVerifier {
                         batch_index,
                     )? {
                         InputSplitOutcome::Continue => {
+                            latch_domain_list_eviction(&domain_list, &mut state);
                             batch_index += 1;
                             continue;
                         }
                         InputSplitOutcome::Violation => {
                             return Ok(
-                                state.build_result(BabVerificationStatus::PotentialViolation)
+                                state.build_result(BabVerificationStatus::potential_violation())
                             );
                         }
                     }
@@ -539,12 +600,21 @@ impl BetaCrownVerifier {
             );
 
             if filter_result.violation {
-                return Ok(state.build_result(BabVerificationStatus::PotentialViolation));
+                return Ok(state.build_result(BabVerificationStatus::potential_violation()));
             }
 
             let processable_picked_indices = filter_result.processable_indices;
             if processable_picked_indices.is_empty() {
                 continue;
+            }
+
+            if self.config.enable_clip_interm_domain && !is_input_split_mode {
+                relu_bab_iteration = relu_bab_iteration.saturating_add(1);
+                let _ = self.complete_clip_root_bounds_cache.set_bab_iteration(
+                    graph,
+                    input,
+                    relu_bab_iteration,
+                );
             }
 
             // GPU or CPU execution path
@@ -565,7 +635,7 @@ impl BetaCrownVerifier {
                 };
                 match self.process_gpu_batched(&gpu_ctx, &mut state, &mut domain_list)? {
                     GpuBatchOutcome::Violation => {
-                        return Ok(state.build_result(BabVerificationStatus::PotentialViolation));
+                        return Ok(state.build_result(BabVerificationStatus::potential_violation()));
                     }
                     GpuBatchOutcome::Continue(_captured_la) => {}
                 }
@@ -583,7 +653,7 @@ impl BetaCrownVerifier {
                     &mut state,
                 )? {
                     CpuFallbackOutcome::Violation => {
-                        return Ok(state.build_result(BabVerificationStatus::PotentialViolation));
+                        return Ok(state.build_result(BabVerificationStatus::potential_violation()));
                     }
                     CpuFallbackOutcome::Children(children) => {
                         if !children.is_empty() {
@@ -599,12 +669,17 @@ impl BetaCrownVerifier {
                 }
             }
 
+            latch_domain_list_eviction(&domain_list, &mut state);
+
             // Adaptive batch sizing (#4303): double when domain list supplied a full batch.
-            self.config
-                .try_enlarge_batch_size(&mut batch_size, picked.batch_size, "GPU BaB");
+            self.config.try_enlarge_batch_size(
+                &mut batch_size,
+                picked.batch_size,
+                "DomainList BaB",
+            );
 
             info!(
-                "GPU BaB iteration: explored={}, verified={}, batch_size={}",
+                "DomainList BaB iteration: explored={}, verified={}, batch_size={}",
                 state.domains_explored, state.domains_verified, picked.batch_size
             );
         }
@@ -622,13 +697,12 @@ impl BetaCrownVerifier {
         // Ref: alpha-beta-CROWN bab.py:general_bab returns 'safe' when the domain
         // list is exhausted without setting any other result.
         //
-        // Queue-cap eviction (max_queue_size) deletes unverified domains, so a
+        // Queue-cap eviction (max_queue_size or max_queue_bytes) deletes
+        // unverified domains, so a
         // drained queue after any eviction covers only part of the search
         // space — the exhaustion argument above no longer holds and the result
         // must be Unknown.
-        if domain_list.evicted_count() > 0 {
-            state.unresolved_due_to_eviction = true;
-        }
+        latch_domain_list_eviction(&domain_list, &mut state);
         Ok(state.build_final_result())
     }
 }

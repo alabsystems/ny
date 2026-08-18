@@ -25,15 +25,16 @@ impl BetaCrownVerifier {
     /// Missing/malformed cache entries are omitted.  The dark-gated caller
     /// fills every omission from the historical proxy, so this helper can only
     /// affect advisory ranking where a complete finite cached column exists.
-    pub(in crate::beta_crown::engine) fn compute_graph_babsr_scores_from_cached_la(
+    pub(in crate::beta_crown::engine) fn compute_graph_babsr_scores_from_cached_la<'a>(
         &self,
         graph: &GraphNetwork,
-        node_bounds: &std::collections::HashMap<String, Arc<BoundedTensor>>,
+        node_bounds: impl Into<NodeBoundsView<'a>>,
         input_bounds: &BoundedTensor,
         cached_la: &crate::batched_domain::CachedLinearBounds,
         reduce_op: KfsbReduceOp,
         only_nodes: &std::collections::HashSet<String>,
     ) -> std::collections::HashMap<(String, usize), BabsrScoreParts> {
+        let node_bounds = node_bounds.into();
         let mut scores = std::collections::HashMap::new();
 
         for node_name in only_nodes {
@@ -93,10 +94,10 @@ impl BetaCrownVerifier {
 
     /// Compute BaBSR score parts for graph branching while the signed lA columns
     /// are still available.
-    pub(in crate::beta_crown::engine) fn compute_graph_babsr_scores_from_bounds(
+    pub(in crate::beta_crown::engine) fn compute_graph_babsr_scores_from_bounds<'a>(
         &self,
         graph: &GraphNetwork,
-        node_bounds: &std::collections::HashMap<String, Arc<BoundedTensor>>,
+        node_bounds: impl Into<NodeBoundsView<'a>>,
         input_bounds: &BoundedTensor,
         reduce_op: KfsbReduceOp,
         // #branching-la INC1: when `Some(c)`, seed the coefficient backward with the
@@ -112,6 +113,7 @@ impl BetaCrownVerifier {
         // `None` = full backward (legacy). Advisory-only ⇒ soundness-free.
         only_nodes: Option<&std::collections::HashSet<String>>,
     ) -> Result<std::collections::HashMap<(String, usize), BabsrScoreParts>> {
+        let node_bounds = node_bounds.into();
         self.compute_graph_babsr_scores_from_bounds_impl(
             graph,
             node_bounds,
@@ -120,7 +122,45 @@ impl BetaCrownVerifier {
             objective_seed,
             only_nodes,
             None,
+            None,
         )
+    }
+
+    /// #joint-interm-grad: the objective adjoint at every ReLU's PRE-ACTIVATION
+    /// producer, harvested from the same walk that computes BaBSR scores.
+    ///
+    /// This is the `df/d(pre-activation)` half of the indirect alpha-gradient
+    /// term. The walk already builds this matrix in order to score with it; the
+    /// only change is that a sink keeps it instead of dropping it, so there is no
+    /// extra propagation and no new kernel. Seeding with the objective rows makes
+    /// the recorded matrix the adjoint OF THE OBJECTIVE, which is what the
+    /// sensitivity weights require.
+    ///
+    /// Advisory-only, exactly like the scores it rides along with: the result
+    /// steers which alpha the ascent lands on and is never read by a bound or a
+    /// verdict.
+    pub(in crate::beta_crown::engine) fn objective_adjoints_at_preactivations<'a>(
+        &self,
+        graph: &GraphNetwork,
+        node_bounds: impl Into<NodeBoundsView<'a>>,
+        input_bounds: &BoundedTensor,
+        reduce_op: KfsbReduceOp,
+        objective_seed: Option<&[f32]>,
+        deadline: std::time::Instant,
+    ) -> Result<std::collections::HashMap<String, Array2<f32>>> {
+        let node_bounds = node_bounds.into();
+        let mut sink = std::collections::HashMap::new();
+        self.compute_graph_babsr_scores_from_bounds_impl(
+            graph,
+            node_bounds,
+            input_bounds,
+            reduce_op,
+            objective_seed,
+            None,
+            Some(deadline),
+            Some(&mut sink),
+        )?;
+        Ok(sink)
     }
 
     /// Deadline-aware form used only by bounded research observers.
@@ -130,16 +170,17 @@ impl BetaCrownVerifier {
     /// its deadline-free behavior.  Shadow callers pass their own private
     /// deadline here; expiry before, between, or immediately after graph-node
     /// coefficient steps fails closed with no partial score map.
-    pub(in crate::beta_crown::engine) fn compute_graph_babsr_scores_from_bounds_until(
+    pub(in crate::beta_crown::engine) fn compute_graph_babsr_scores_from_bounds_until<'a>(
         &self,
         graph: &GraphNetwork,
-        node_bounds: &std::collections::HashMap<String, Arc<BoundedTensor>>,
+        node_bounds: impl Into<NodeBoundsView<'a>>,
         input_bounds: &BoundedTensor,
         reduce_op: KfsbReduceOp,
         objective_seed: Option<&[f32]>,
         only_nodes: Option<&std::collections::HashSet<String>>,
         deadline: std::time::Instant,
     ) -> Result<std::collections::HashMap<(String, usize), BabsrScoreParts>> {
+        let node_bounds = node_bounds.into();
         self.compute_graph_babsr_scores_from_bounds_impl(
             graph,
             node_bounds,
@@ -148,6 +189,7 @@ impl BetaCrownVerifier {
             objective_seed,
             only_nodes,
             Some(deadline),
+            None,
         )
     }
 
@@ -155,12 +197,17 @@ impl BetaCrownVerifier {
     fn compute_graph_babsr_scores_from_bounds_impl(
         &self,
         graph: &GraphNetwork,
-        node_bounds: &std::collections::HashMap<String, Arc<BoundedTensor>>,
+        node_bounds: NodeBoundsView<'_>,
         input_bounds: &BoundedTensor,
         reduce_op: KfsbReduceOp,
         objective_seed: Option<&[f32]>,
         only_nodes: Option<&std::collections::HashSet<String>>,
         deadline: Option<std::time::Instant>,
+        // #joint-interm-grad: when `Some`, record the objective adjoint at each
+        // ReLU's PRE-ACTIVATION producer. The walk already materialises exactly
+        // this matrix to score with; the sink just stops it being discarded.
+        // `None` is byte-identical to the historical walk.
+        mut adjoint_sink: Option<&mut std::collections::HashMap<String, Array2<f32>>>,
     ) -> Result<std::collections::HashMap<(String, usize), BabsrScoreParts>> {
         let check_deadline = || {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
@@ -216,7 +263,7 @@ impl BetaCrownVerifier {
 
             match &node.layer {
                 Layer::Linear(linear) => {
-                    let new_coeffs = current.dot(&linear.weight);
+                    let new_coeffs = current.dot(linear.weight());
                     if let Some(input_name) = node.inputs.first() {
                         if input_name != NETWORK_INPUT {
                             let entry =
@@ -248,6 +295,9 @@ impl BetaCrownVerifier {
                         node_bounds.get(pre_name).map(|bounds| bounds.as_ref())
                     };
 
+                    if let Some(sink) = adjoint_sink.as_deref_mut() {
+                        sink.insert(pre_name.to_string(), current.clone());
+                    }
                     if let Some(bounds) = pre_bounds {
                         let flat = bounds.flatten();
                         let num_neurons = current.ncols().min(flat.len());
@@ -320,8 +370,8 @@ impl BetaCrownVerifier {
                 Layer::Conv2d(conv) if conv.input_shape.is_some() => {
                     // The Conv2d layer's coefficient backward is a TRANSPOSE convolution.
                     // The historical lane uses the f64 GEMM coefficient path; a bounded
-                    // observer uses its deadline-aware row-chunked f32 sibling so one large
-                    // Conv2d cannot monopolize the whole shadow budget. Compute the conv
+                    // observer uses the pollable scalar-f64 sibling so no opaque
+                    // faer/engine chunk can monopolize the authority deadline. Compute the conv
                     // OUTPUT spatial dims from the input dims + geometry.
                     let (in_h, in_w) = conv.input_shape.expect("is_some checked");
                     let ksh = conv.kernel.shape();
@@ -333,12 +383,7 @@ impl BetaCrownVerifier {
                     let out_w =
                         (in_w + 2 * conv.padding.1).saturating_sub(eff_kw) / conv.stride.1 + 1;
                     let propagated = if let Some(deadline) = deadline {
-                        // Shadow scoring is wall-bounded, so use the existing
-                        // row-chunked transpose-conv path that polls inside a
-                        // large Conv2d node.  BaBSR is advisory and consumes f32
-                        // coefficients; the historical no-deadline path below
-                        // retains its f64 accumulation byte-for-byte.
-                        match crate::layers::convolution::conv2d::conv2d_transpose_batched_gemm_grouped_with_deadline(
+                        match crate::layers::convolution::conv2d::conv2d_transpose_backward_coeff_f64_with_deadline(
                             &current,
                             &conv.kernel,
                             conv.stride,
@@ -349,10 +394,9 @@ impl BetaCrownVerifier {
                             out_c,
                             conv.groups,
                             1, // advisory propagation retains one result
-                            None,
                             Some(deadline),
                         ) {
-                            Ok(propagated) => propagated,
+                            Ok(propagated) => propagated.mapv(|value| value as f32),
                             Err(error) if error.is_deadline_exceeded() => return Err(error),
                             Err(_) => current.clone(), // shape/overflow => passthrough
                         }
@@ -473,7 +517,7 @@ impl BetaCrownVerifier {
 
             match &node.layer {
                 Layer::Linear(linear) => {
-                    let new_coeffs = current.dot(&linear.weight);
+                    let new_coeffs = current.dot(linear.weight());
                     if let Some(input_name) = node.inputs.first() {
                         if input_name != NETWORK_INPUT {
                             let entry =

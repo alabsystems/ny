@@ -215,7 +215,86 @@ pub(crate) struct PointVjpResidentEntry {
     mask_widths: Vec<usize>,
 }
 
+impl PointVjpResidentEntry {
+    /// Conservative logical bytes retained by this entry.
+    ///
+    /// Each layer's `w_buf` is an `Arc` from the resident-weight cache. We count
+    /// every reference here even though multiple layers/entries may share the
+    /// same allocation; intentional double-counting makes cap admission safely
+    /// conservative without relying on raw buffer identity.
+    fn retained_device_bytes(&self) -> Result<usize> {
+        fn add(total: &mut usize, buffer: &wgpu::Buffer, label: &str) -> Result<()> {
+            let bytes = usize::try_from(buffer.size()).map_err(|_| {
+                NyError::InternalError(format!("point-VJP buffer `{label}` does not fit in usize"))
+            })?;
+            *total = total.checked_add(bytes).ok_or_else(|| {
+                NyError::InternalError("point-VJP retained byte count overflow".into())
+            })?;
+            Ok(())
+        }
+
+        let mut total = 0usize;
+        for buffer in &self.la {
+            add(&mut total, buffer, "coefficient")?;
+        }
+        for buffer in &self.err {
+            add(&mut total, buffer, "error")?;
+        }
+        if let Some(buffer) = self.conv_reshaped.as_ref() {
+            add(&mut total, buffer, "conv_reshaped")?;
+        }
+        if let Some(buffer) = self.conv_gemm.as_ref() {
+            add(&mut total, buffer, "conv_gemm")?;
+        }
+        add(&mut total, &self.beta_zero, "beta_zero")?;
+        add(&mut total, &self.stage, "staging")?;
+
+        for layer in &self.layers {
+            match layer {
+                VjpLayerPlan::Linear { w_buf, gp, .. } => {
+                    add(&mut total, w_buf, "linear_weight_shared")?;
+                    add(&mut total, gp, "linear_params")?;
+                }
+                VjpLayerPlan::Conv {
+                    w_buf,
+                    crp,
+                    gp,
+                    ccp,
+                    ..
+                } => {
+                    add(&mut total, w_buf, "conv_weight_shared")?;
+                    add(&mut total, crp, "conv_reshape_params")?;
+                    add(&mut total, gp, "conv_gemm_params")?;
+                    add(&mut total, ccp, "conv_col2im_params")?;
+                }
+                VjpLayerPlan::MaskAct { slab, actp, .. } => {
+                    add(&mut total, slab, "mask_slab")?;
+                    add(&mut total, actp, "mask_activation_params")?;
+                }
+                VjpLayerPlan::StaticAct { ls, us, actp, .. } => {
+                    add(&mut total, ls, "static_lower_slopes")?;
+                    add(&mut total, us, "static_upper_slopes")?;
+                    add(&mut total, actp, "static_activation_params")?;
+                }
+            }
+        }
+        Ok(total)
+    }
+}
+
 impl WgpuDevice {
+    /// Checked conservative bytes across cached resident point-VJP templates.
+    pub(crate) fn point_vjp_resident_cache_bytes(&self) -> Result<usize> {
+        let cache = self.point_vjp_resident_plans.lock().map_err(|err| {
+            NyError::InternalError(format!("point-vjp plan cache lock poisoned: {err}"))
+        })?;
+        cache.values().try_fold(0usize, |total, entry| {
+            total
+                .checked_add(entry.retained_device_bytes()?)
+                .ok_or_else(|| NyError::InternalError("point-VJP cache byte count overflow".into()))
+        })
+    }
+
     /// Build the cache key, validating the template is a supported pure chain
     /// (Linear / Conv2d / Activation only). `None` ⇒ caller uses the un-cached
     /// stacking path.
@@ -949,7 +1028,8 @@ pub(crate) type PointVjpResidentPlans = Mutex<HashMap<PointVjpPlanKey, Arc<Point
 #[cfg(all(test, feature = "gpu-tests"))]
 mod gpu_tests {
     use super::*;
-    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
+    use ny_test_utils::env::ScopedEnvVar;
 
     /// Deterministic xorshift (no dev-dep).
     struct Rng(u64);
@@ -971,6 +1051,7 @@ mod gpu_tests {
             )),
             out_features: of,
             in_features: if_,
+            cert_err: Default::default(),
         }
     }
 
@@ -1011,6 +1092,7 @@ mod gpu_tests {
                 out_w: out_hw,
                 in_h: in_hw,
                 in_w: in_hw,
+                cert_err: Default::default(),
             },
             oc * out_hw * out_hw,
         )
@@ -1064,6 +1146,39 @@ mod gpu_tests {
             .collect()
     }
 
+    /// Run the legacy stacked VJP as a raw coefficient fold.  The production
+    /// point-VJP helper also concretizes bounds that its caller discards; armed
+    /// C1 correctly refuses that unworded verdict boundary, whereas this test
+    /// needs only the pre-concretization coefficients it compares below.
+    fn uncached_point_vjp_coeff(
+        device: &WgpuDevice,
+        wide: &[GpuCrownLayer],
+        seed: &ny_core::GpuCrownSeed,
+    ) -> Vec<f32> {
+        let zero_a_err = vec![0.0f32; seed.lower_a.len()];
+        let zero_b_err = vec![0.0f32; seed.num_specs];
+        device
+            .crown_backward_sound_resident_coeff_seeded_err_gather(
+                wide,
+                &seed.lower_a,
+                &seed.upper_a,
+                &zero_a_err,
+                &zero_a_err,
+                &seed.lower_b,
+                &seed.upper_b,
+                &zero_b_err,
+                &zero_b_err,
+                seed.num_specs,
+                1,
+                seed.current_dim,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("uncached coefficient fold")
+            .lower_a
+    }
+
     /// THE ORACLE (#vjp-resident): cached vs un-cached gradients are
     /// BIT-IDENTICAL on fixed seeds, across repeated calls with fresh masks
     /// (cache-hit path), for a soundnessbench-shaped conv chain and a
@@ -1071,7 +1186,11 @@ mod gpu_tests {
     #[test]
     fn resident_vjp_gradients_bit_identical_to_uncached() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // This diagnostic compares raw coefficient values and cache behavior,
+        // not verdict authority. Disable words to isolate the value-path cache
+        // from the independently tested Conv receipt channel.
+        let _taint_words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let device = require_verdict_device();
         device.clear_crown_working_set().expect("clear");
 
         let mut rng = Rng(0x5bba_2026 ^ 0xdead_beef);
@@ -1087,6 +1206,8 @@ mod gpu_tests {
 
             // Un-cached reference: the audited stacking path (exactly what the
             // trait fold runs with NY_VJP_RESIDENT=0 / on any resident error).
+            // Use its raw coefficient entry: this VJP oracle never consumes
+            // bounds, and armed C1 rightly refuses an unworded concretization.
             let t0 = std::time::Instant::now();
             let wide = super::super::crown_backward::stack_point_vjp_wide_layers(
                 &layers,
@@ -1102,16 +1223,7 @@ mod gpu_tests {
                 num_specs: k,
                 current_dim: output_dim,
             };
-            let dummy = vec![0.0f32; k * input_dim];
-            let coeff = device
-                .crown_backward_gpu_point_vjp_wide_inner(
-                    &[ny_core::GpuResnetSegment::Chain(wide)],
-                    &seed,
-                    1,
-                    &dummy,
-                    &dummy,
-                )
-                .expect("uncached fold");
+            let coeff = uncached_point_vjp_coeff(&device, &wide, &seed);
             let reference: Vec<Vec<f32>> = (0..k)
                 .map(|d| coeff[d * input_dim..(d + 1) * input_dim].to_vec())
                 .collect();
@@ -1169,7 +1281,10 @@ mod gpu_tests {
     #[test]
     fn resident_vjp_soundnessbench_dims_throughput_probe() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // This is a raw throughput/bit-identity probe, not an authority oracle.
+        // Disable words so the measurement isolates VJP caching overhead.
+        let _taint_words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let device = require_verdict_device();
         device.clear_crown_working_set().expect("clear");
 
         let mut rng = Rng(0x5b_d105);
@@ -1227,16 +1342,7 @@ mod gpu_tests {
                 num_specs: k,
                 current_dim: output_dim,
             };
-            let dummy = vec![0.0f32; k * input_dim];
-            let coeff = device
-                .crown_backward_gpu_point_vjp_wide_inner(
-                    &[ny_core::GpuResnetSegment::Chain(wide)],
-                    &seed,
-                    1,
-                    &dummy,
-                    &dummy,
-                )
-                .expect("uncached fold");
+            let coeff = uncached_point_vjp_coeff(&device, &wide, &seed);
             let reference: Vec<Vec<f32>> = (0..k)
                 .map(|d| coeff[d * input_dim..(d + 1) * input_dim].to_vec())
                 .collect();
@@ -1288,7 +1394,7 @@ mod gpu_tests {
     #[test]
     fn resident_vjp_static_activation_and_content_keying() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         device.clear_crown_working_set().expect("clear");
 
         let mut rng = Rng(0x0dd_ba11);

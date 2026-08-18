@@ -471,74 +471,6 @@ fn test_rmsnorm_inv_rms_split_union_covers() -> Result<()> {
     Ok(())
 }
 
-/// MEASUREMENT (#norm-genbab): how the concretized `sum_i RmsNorm(x)_i` lower
-/// bound improves as the inv_rms window narrows toward the worst corner x=-1
-/// (inv_rms ~ 1). Prints the bound vs window so we can see whether splitting
-/// inv_rms moves the objective and how deep BaB must go.
-#[ntest::timeout(20000)]
-#[ignore = "diagnostic measurement, run explicitly"]
-#[test]
-fn measure_rmsnorm_sum_lower_vs_window() -> Result<()> {
-    let n = 8;
-    let ny = Array1::from_elem(n, 1.0f32);
-    let eps = 1e-5_f32;
-    let x_l = vec![-1.0f32; n];
-    let x_u = vec![1.0f32; n];
-    let x_ibp = BoundedTensor::new(
-        Array1::from_vec(x_l.clone()).into_dyn(),
-        Array1::from_vec(x_u.clone()).into_dyn(),
-    )?;
-    // upstream A = row of ones (objective = sum of RmsNorm outputs).
-    let a = Array2::from_elem((1, n), 1.0f32);
-    let b = Array1::zeros(1);
-    let upstream = constant_batched_bounds(a.clone(), b.clone(), a, b, n);
-
-    let (inv_l, inv_u) = ibp_inv_rms_range(&x_l, &x_u, eps);
-    eprintln!(
-        "inv_rms IBP range [{inv_l}, {inv_u}]; analytic sum-min = {}",
-        -(n as f32)
-    );
-    // Window anchored at inv_l (worst corner) with shrinking width.
-    for k in 0..14 {
-        let hi = (inv_l + (inv_u - inv_l) / 2.0f32.powi(k)).min(inv_u);
-        let res = decomposed_rms_norm_crown_backward_with_override(
-            &upstream,
-            &ny,
-            eps,
-            &x_ibp,
-            Some(InvRmsOverride::single_group(0, inv_l, hi)),
-        )?;
-        let conc = res.bounds.concretize_sound(&x_ibp)?;
-        let lo = conc.lower().as_slice().unwrap()[0];
-        eprintln!(
-            "k={k} window=[{inv_l:.3},{hi:.3}] survived={}/{} sum_lower={lo:.4}",
-            res.validation.total_rows - res.validation.fallback_rows,
-            res.validation.total_rows,
-        );
-    }
-    // High-tail windows [lo_h, inv_u] (small ‖x‖) stay at the standard fused
-    // envelope: RmsNorm output is SCALE-INVARIANT in ‖x‖, so narrowing inv_rms
-    // alone does NOT tighten the high tail (|x_i·inv_rms| ≤ √n regardless of
-    // ‖x‖). Only the low-inv_rms (box-saturating) region tightens — that is
-    // where the worst case lives, but isolating it from the wide IBP range is
-    // the search-efficiency cost.
-    for k in 0..4 {
-        let lo_h = (inv_u / 2.0f32.powi(k + 1)).max(inv_l);
-        let res = decomposed_rms_norm_crown_backward_with_override(
-            &upstream,
-            &ny,
-            eps,
-            &x_ibp,
-            Some(InvRmsOverride::single_group(0, lo_h, inv_u)),
-        )?;
-        let conc = res.bounds.concretize_sound(&x_ibp)?;
-        let lo = conc.lower().as_slice().unwrap()[0];
-        let hi = conc.upper().as_slice().unwrap()[0];
-        eprintln!("HIGH k={k} window=[{lo_h:.2},{inv_u:.2}] sum_bound=[{lo:.3},{hi:.3}]");
-    }
-    Ok(())
-}
-
 /// Override is intersected, never widening: an absurdly wide override
 /// (covering all of inv_rms and beyond) must reproduce the un-narrowed result
 /// exactly (same fallback count), proving intersection semantics.
@@ -601,12 +533,10 @@ proptest! {
         ).unwrap();
         let upstream = identity_upstream(n);
 
-        let result = decomposed_rms_norm_crown_backward(&upstream, &ny, eps, &x_ibp);
-        // Use prop_assume! so proptest generates replacement cases for numerically
-        // ill-conditioned inputs, rather than silently counting errors as passes.
-        // Without this, a regression that always returns Err passes the test vacuously.
-        prop_assume!(result.is_ok(), "decomposed rmsnorm returned error: {:?}", result.err());
-        let result = result.unwrap();
+        let result = decomposed_rms_norm_crown_backward(&upstream, &ny, eps, &x_ibp)
+            .map_err(|error| TestCaseError::fail(
+                format!("decomposed rmsnorm must accept the generated finite domain: {error}")
+            ))?;
         let bounds = &result.bounds;
 
         let x_sample = vec![

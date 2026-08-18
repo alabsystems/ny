@@ -772,10 +772,20 @@ proptest! {
             upper_a_vals, upper_b_vals,
         );
 
-        let expected = layer.propagate_linear(&scalar_bounds)
-            .map_err(|e| TestCaseError::fail(format!("scalar CROWN failed: {e}")))?
-            .into_owned();
-        let actual = layer.propagate_linear_batched(&batched_bounds, None)
+        // Pin the CPU dense budget. NY_DENSE_BUDGET_MB is process-global and
+        // sibling tests set it to 1 MiB; when one of these two conv paths sees
+        // that budget and the other does not, they legitimately diverge and this
+        // equivalence assertion fails. It reproduced only in the full parallel
+        // suite (passing in isolation and in small filtered runs), which is
+        // exactly the signature of that race.
+        let (expected, actual) = crate::tests::with_crown_dense_budget_mb("2048", || {
+            let expected = layer.propagate_linear(&scalar_bounds).map(|b| b.into_owned());
+            let actual = layer.propagate_linear_batched(&batched_bounds, None);
+            (expected, actual)
+        });
+        let expected = expected
+            .map_err(|e| TestCaseError::fail(format!("scalar CROWN failed: {e}")))?;
+        let actual = actual
             .map_err(|e| TestCaseError::fail(format!("batched CROWN failed: {e}")))?;
 
         assert_batched_equiv(&actual, &expected, "Conv2d", EXACT_EQUIV_TOLERANCES)?;
@@ -810,10 +820,16 @@ proptest! {
             upper_a_vals, upper_b_vals,
         );
 
-        let expected = layer.propagate_linear(&scalar_bounds)
-            .map_err(|e| TestCaseError::fail(format!("scalar CROWN failed: {e}")))?
-            .into_owned();
-        let actual = layer.propagate_linear_batched(&batched_bounds, None)
+        // See the bias variant above: NY_DENSE_BUDGET_MB is process-global and a
+        // sibling test setting it to 1 MiB makes these two paths diverge.
+        let (expected, actual) = crate::tests::with_crown_dense_budget_mb("2048", || {
+            let expected = layer.propagate_linear(&scalar_bounds).map(|b| b.into_owned());
+            let actual = layer.propagate_linear_batched(&batched_bounds, None);
+            (expected, actual)
+        });
+        let expected = expected
+            .map_err(|e| TestCaseError::fail(format!("scalar CROWN failed: {e}")))?;
+        let actual = actual
             .map_err(|e| TestCaseError::fail(format!("batched CROWN failed: {e}")))?;
 
         assert_batched_equiv(&actual, &expected, "Conv2d_nobias", EXACT_EQUIV_TOLERANCES)?;

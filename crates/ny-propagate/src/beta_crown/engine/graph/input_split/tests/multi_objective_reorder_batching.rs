@@ -6,11 +6,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::super::batching::bound_deferred_multi_obj_domains_batch;
+use super::super::batching::{
+    bound_deferred_multi_obj_domains_batch, force_override_rebound_parallel,
+};
 use super::super::shared::extract_obj_bounds;
 use super::super::shared::multi_obj_domain_priority;
 use super::*;
 use crate::beta_crown::config::BetaCrownConfig;
+use crate::beta_crown::engine::graph::propagation::batched::SPEC_GATE_TEST_LOCK;
 use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::beta_crown::result::BabVerificationStatus;
 use crate::BranchingHeuristic;
@@ -168,6 +171,90 @@ fn test_bound_deferred_multi_obj_domains_batch_matches_independent_calls_4116() 
             domain.node_bounds_override.is_none(),
             "deferred domain {idx} should consume any queued node-bounds override"
         );
+    }
+}
+
+#[test]
+fn override_parallel_multi_obj_matches_serial() {
+    let _gate_guard = SPEC_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    struct OverrideForceReset;
+    impl Drop for OverrideForceReset {
+        fn drop(&mut self) {
+            force_override_rebound_parallel(None);
+        }
+    }
+    let _force_reset = OverrideForceReset;
+    let graph = build_complete_clip_override_graph();
+    let root_input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+        .expect("valid root input");
+    let root_node_bounds = graph
+        .collect_node_bounds(&root_input)
+        .expect("root node bounds should succeed");
+    let spec_matrix = arr2(&[[1.0_f32], [0.5_f32]]);
+    let thresholds = [0.0_f32, 0.0_f32];
+    let node_bounds_override = build_complete_clip_override_bounds();
+    let child_a = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[0.6_f32]).into_dyn())
+        .expect("valid child_a");
+    let child_b = BoundedTensor::new(arr1(&[-0.4_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+        .expect("valid child_b");
+    let make_domains = || {
+        vec![
+            deferred_multi_obj_domain(child_a.clone(), Some(Arc::clone(&node_bounds_override))),
+            deferred_multi_obj_domain(child_b.clone(), Some(Arc::clone(&node_bounds_override))),
+        ]
+    };
+    let config = BetaCrownConfig {
+        input_split_override_parallel: true,
+        ..BetaCrownConfig::default()
+    };
+    let run = |domains: &mut [MultiObjInputDomain]| {
+        bound_deferred_multi_obj_domains_batch(
+            domains,
+            &graph,
+            &spec_matrix,
+            &thresholds,
+            None,
+            Some(&root_node_bounds),
+            None,
+            None,
+            None,
+            None,
+            &config,
+            None,
+            0,
+        )
+    };
+
+    force_override_rebound_parallel(Some(false));
+    let mut serial = make_domains();
+    let serial_result = run(&mut serial);
+
+    force_override_rebound_parallel(Some(true));
+    let mut parallel = make_domains();
+    let parallel_result = run(&mut parallel);
+
+    serial_result.expect("serial override rebound should succeed");
+    parallel_result.expect("parallel override rebound should succeed");
+    for (idx, (serial_domain, parallel_domain)) in serial.iter().zip(parallel.iter()).enumerate() {
+        assert_eq!(
+            parallel_domain.obj_bounds, serial_domain.obj_bounds,
+            "objective bounds changed at domain {idx}"
+        );
+        assert_eq!(parallel_domain.priority, serial_domain.priority);
+        assert_eq!(parallel_domain.needs_bounding, serial_domain.needs_bounding);
+        assert_eq!(
+            parallel_domain.node_bounds_override.is_some(),
+            serial_domain.node_bounds_override.is_some()
+        );
+        match (&parallel_domain.linear_bounds, &serial_domain.linear_bounds) {
+            (Some(parallel_linear), Some(serial_linear)) => {
+                assert_linear_bounds_match(parallel_linear, serial_linear);
+            }
+            (None, None) => {}
+            _ => panic!("linear-bound availability changed at domain {idx}"),
+        }
     }
 }
 

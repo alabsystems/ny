@@ -11,6 +11,7 @@ use super::*;
 use crate::bounds::AlphaCrownConfig;
 use crate::layers::{
     BatchNormLayer, Conv2dLayer, ConvTranspose2dLayer, LinearLayer, ReLULayer, SigmoidLayer,
+    TanhLayer,
 };
 use crate::network::GraphNode;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
@@ -300,6 +301,16 @@ fn assert_mc_containment_with_alphas(
             .collect_forward_linear_bounds_dag_with_engine(input, None)
             .expect("forward-linear collection should succeed"),
     };
+    assert_forward_map_mc_containment(graph, input, samples, seed, &forward);
+}
+
+fn assert_forward_map_mc_containment(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    samples: usize,
+    seed: u64,
+    forward: &HashMap<String, BoundedTensor>,
+) {
     let mut rng = Lcg::new(seed);
     let mut points: Vec<BoundedTensor> = (0..samples)
         .map(|_| sample_point(&mut rng, input))
@@ -312,7 +323,7 @@ fn assert_mc_containment_with_alphas(
         let exact = graph
             .collect_node_bounds_with_engine(point, None)
             .expect("point evaluation should succeed");
-        for (node_name, claimed) in &forward {
+        for (node_name, claimed) in forward {
             let concrete = exact.get(node_name).expect("point map should include node");
             for ((&lo, &hi), (&cl, &cu)) in claimed
                 .lower()
@@ -795,6 +806,7 @@ fn test_image_conv_transpose_batch_norm_dense_f64_enclosure() {
         scale_err: Array1::from_vec(vec![1.5e-4, 3.0e-5, 8.0e-5]).into_dyn(),
         bias_err: Array1::from_vec(vec![2.0e-4, 7.0e-6, 4.5e-5]).into_dyn(),
         num_channels: out_c,
+        channel_axis_hint: None,
     };
 
     let mut graph = GraphNetwork::new();
@@ -906,15 +918,18 @@ fn test_image_conv_transpose_batch_norm_dense_f64_enclosure() {
     let err = bad_graph
         .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
         .expect_err("negative BN error metadata must fail closed");
-    assert!(matches!(err, NyError::NumericalInstability(_)));
+    assert!(
+        matches!(err, NyError::InvalidSpec(ref message) if message.contains("BatchNorm")),
+        "malformed public BatchNorm metadata must be rejected as an invalid spec, got {err:?}"
+    );
 }
 
-/// Default-off compatibility for the dark cGAN surface:
-/// ConvTranspose-only graphs retain the pre-existing generic route/refusal,
-/// while a Conv2d image graph containing BatchNorm still fails at the old
-/// image allowlist.
+/// Kill-switch compatibility for the default-on certified cGAN surface:
+/// explicitly disabling ConvTranspose composition keeps ConvTranspose-only
+/// graphs on the pre-existing generic refusal, while a Conv2d image graph
+/// containing BatchNorm still fails at the old image allowlist.
 #[test]
-fn test_image_conv_transpose_dark_gate_preserves_legacy_routing() {
+fn test_image_conv_transpose_kill_switch_preserves_legacy_routing() {
     let convt = ConvTranspose2dLayer::with_input_shape(
         ArrayD::from_elem(IxDyn(&[1, 1, 1, 1]), -0.75),
         Some(Array1::from_vec(vec![0.2])),
@@ -942,7 +957,7 @@ fn test_image_conv_transpose_dark_gate_preserves_legacy_routing() {
     assert!(
         message.contains("operator is outside the forward-linear packet surface")
             && !message.contains("dark"),
-        "dark-off ConvTranspose-only graph must retain the generic legacy refusal, got: {message}"
+        "kill-switched ConvTranspose-only graph must retain the generic legacy refusal, got: {message}"
     );
 
     let conv = Conv2dLayer::with_input_shape(
@@ -969,39 +984,52 @@ fn test_image_conv_transpose_dark_gate_preserves_legacy_routing() {
     conv_bn.set_output("bn");
     let err = conv_bn
         .collect_forward_linear_bounds_dag_without_conv_transpose_for_test(&input, None)
-        .expect_err("dark-off Conv2d+BatchNorm must retain old fail-closed image surface");
+        .expect_err("kill-switched Conv2d+BatchNorm must retain old fail-closed image surface");
     assert!(matches!(err, NyError::UnsupportedConfiguration(_)));
 }
 
 #[test]
 fn test_alpha_reference_bounds_use_forward_linear_for_conv_dag() {
     let (graph, input) = build_residual_dag(42, 0.5);
-    let config = AlphaCrownConfig {
-        fix_interm_bounds: true,
-        ..AlphaCrownConfig::default()
-    };
     let exec_order = graph.exec_order().expect("exec order").to_vec();
-    let reference = graph
-        .collect_alpha_reference_bounds_with_engine(&input, &config, None, &exec_order)
-        .expect("reference bounds");
-    let forward = graph
-        .collect_forward_linear_bounds_dag_with_engine(&input, None)
-        .expect("forward-linear bounds");
+    crate::tests::with_env_edits(|env| {
+        env.remove("NY_NO_FORWARD_LINEAR_REF");
+        env.set("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "1");
+        assert!(
+            graph.should_collect_forward_linear_intermediate_reference(),
+            "historical non-sequential Conv2d route must remain enabled"
+        );
+        assert!(
+            graph.should_collect_forward_linear_image_reference(),
+            "Conv2d DAG must remain image-eligible independently of the ConvTranspose gate"
+        );
 
-    // The conv-DAG reference source must BE the forward-linear map (default ON).
-    assert_eq!(reference.len(), forward.len());
-    for (name, fw) in &forward {
-        let rf = reference.get(name).expect("reference includes node");
-        assert_eq!(rf.lower(), fw.lower(), "node '{name}' lower mismatch");
-        assert_eq!(rf.upper(), fw.upper(), "node '{name}' upper mismatch");
-    }
+        let config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            ..AlphaCrownConfig::default()
+        };
+        let reference = graph
+            .collect_alpha_reference_bounds_with_engine(&input, &config, None, &exec_order)
+            .expect("reference bounds");
+        let forward = graph
+            .collect_forward_linear_bounds_dag_with_engine(&input, None)
+            .expect("forward-linear bounds");
+
+        // The conv-DAG reference source must BE the forward-linear map (default ON).
+        assert_eq!(reference.len(), forward.len());
+        for (name, fw) in &forward {
+            let rf = reference.get(name).expect("reference includes node");
+            assert_eq!(rf.lower(), fw.lower(), "node '{name}' lower mismatch");
+            assert_eq!(rf.upper(), fw.upper(), "node '{name}' upper mismatch");
+        }
+    });
 }
 
 /// #cgan-fwdlin-ref: a cgan-class SEQUENTIAL ConvTranspose chain (is_dag =
 /// false) never reached the conv-DAG forward-linear branch, so the certified
 /// ConvTranspose/BatchNorm surface was unreachable exactly on the graphs it
-/// was built for. Under the dark surface gate the α reference collection must
-/// serve the forward-linear map for such chains.
+/// was built for. The default image-reference policy must now serve the
+/// forward-linear map for such chains; either disable flag restores fallback.
 #[test]
 fn test_alpha_reference_bounds_use_forward_linear_for_sequential_conv_transpose_chain() {
     let in_c = 2usize;
@@ -1043,28 +1071,935 @@ fn test_alpha_reference_bounds_use_forward_linear_for_sequential_conv_transpose_
         "fixture must be a sequential chain to cover the is_dag=false route"
     );
 
-    crate::tests::with_serialized_env_vars(
-        &[("NY_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "1")],
-        || {
-            let config = AlphaCrownConfig {
-                fix_interm_bounds: true,
-                ..AlphaCrownConfig::default()
-            };
-            let reference = graph
-                .collect_alpha_reference_bounds_with_engine(&input, &config, None, &exec_order)
-                .expect("reference bounds");
-            let forward = graph
-                .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
-                .expect("forward-linear chain collection");
+    crate::tests::with_env_edits(|env| {
+        env.remove("NY_NO_FORWARD_LINEAR_REF");
+        env.remove("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF");
+        let config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            ..AlphaCrownConfig::default()
+        };
+        let reference = graph
+            .collect_alpha_reference_bounds_with_engine(&input, &config, None, &exec_order)
+            .expect("reference bounds");
+        let forward = graph
+            .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
+            .expect("forward-linear chain collection");
 
-            assert_eq!(reference.len(), forward.len());
-            for (name, fw) in &forward {
-                let rf = reference.get(name).expect("reference includes node");
-                assert_eq!(rf.lower(), fw.lower(), "node '{name}' lower mismatch");
-                assert_eq!(rf.upper(), fw.upper(), "node '{name}' upper mismatch");
-            }
+        assert_eq!(reference.len(), forward.len());
+        for (name, fw) in &forward {
+            let rf = reference.get(name).expect("reference includes node");
+            assert_eq!(rf.lower(), fw.lower(), "node '{name}' lower mismatch");
+            assert_eq!(rf.upper(), fw.upper(), "node '{name}' upper mismatch");
+        }
+    });
+}
+
+#[test]
+fn test_typed_tanh_diagonal_grid_encloses_endpoints_zero_and_crossing() {
+    let upstream = LinearBounds::identity(1);
+    for (label, lower, upper) in [
+        ("negative", -3.0_f32, -0.125_f32),
+        ("positive", 0.125_f32, 3.0_f32),
+        ("crossing", -2.75_f32, 3.25_f32),
+    ] {
+        let input = BoundedTensor::new(
+            Array1::from_vec(vec![lower]).into_dyn(),
+            Array1::from_vec(vec![upper]).into_dyn(),
+        )
+        .expect("scalar pre-activation box");
+        let input_mag = [f64::from(lower).abs().max(f64::from(upper).abs())];
+        let composed = image::compose_tanh_diag_forward(
+            &format!("tanh-{label}"),
+            &upstream,
+            &input,
+            &input_mag,
+        )
+        .expect("certified diagonal Tanh composition");
+        let concrete = composed
+            .concretize_checked(&input)
+            .expect("concretized Tanh row");
+        assert!(
+            concrete.lower()[0].is_finite() && concrete.upper()[0].is_finite(),
+            "{label}: finite scalar input must retain finite Tanh enclosure"
+        );
+
+        let mut grid: Vec<f64> = (0..=1024)
+            .map(|index| {
+                f64::from(lower) + (f64::from(upper) - f64::from(lower)) * index as f64 / 1024.0
+            })
+            .collect();
+        // Explicitly retain the exact activation endpoints and inflection point;
+        // the evenly-spaced grid is not relied on to happen to hit zero.
+        grid.extend([f64::from(lower), f64::from(upper)]);
+        if lower <= 0.0 && upper >= 0.0 {
+            grid.push(0.0);
+        }
+        for x in grid {
+            let row_lower =
+                f64::from(composed.lower_a()[[0, 0]]) * x + f64::from(composed.lower_b()[0]);
+            let row_upper =
+                f64::from(composed.upper_a()[[0, 0]]) * x + f64::from(composed.upper_b()[0]);
+            let actual = x.tanh();
+            assert!(
+                row_lower <= actual && actual <= row_upper,
+                "{label}: x={x} tanh={actual} escaped row [{row_lower}, {row_upper}]"
+            );
+            assert!(
+                f64::from(concrete.lower()[0]) <= actual
+                    && actual <= f64::from(concrete.upper()[0]),
+                "{label}: x={x} tanh={actual} escaped concretized [{}, {}]",
+                concrete.lower()[0],
+                concrete.upper()[0]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_typed_tanh_diagonal_large_cancellation_discharges_cast_gap() {
+    let c0 = 8_388_607.0_f32;
+    let c1 = -8_388_605.0_f32;
+    let bias = 0.03125_f32;
+    let coefficients = Array2::from_shape_vec((1, 2), vec![c0, c1]).expect("coefficient row");
+    let biases = Array1::from_vec(vec![bias]);
+    let upstream = LinearBounds::new(coefficients.clone(), biases.clone(), coefficients, biases)
+        .expect("exact large-cancellation upstream row");
+    let radius = 2.0e-7_f32;
+    let input = BoundedTensor::new(
+        Array1::from_vec(vec![-radius, -radius]).into_dyn(),
+        Array1::from_vec(vec![radius, radius]).into_dyn(),
+    )
+    .expect("non-point cancellation box");
+    assert!(
+        input
+            .lower()
+            .iter()
+            .zip(input.upper().iter())
+            .all(|(&lower, &upper)| lower < upper),
+        "the cast-gap regression must exercise a non-point input"
+    );
+    let pre_activation = upstream
+        .concretize_checked(&input)
+        .expect("certified upstream pre-activation");
+    let input_mag = [f64::from(radius), f64::from(radius)];
+    let relax = crate::layers::trigonometric::tanh_linear_relaxation(
+        pre_activation.lower()[0],
+        pre_activation.upper()[0],
+    );
+    let has_measured_cast_gap = [relax.lower_slope, relax.upper_slope]
+        .into_iter()
+        .flat_map(|slope| [c0, c1].map(|coefficient| (slope, coefficient)))
+        .any(|(slope, coefficient)| {
+            let exact = f64::from(slope) * f64::from(coefficient);
+            exact.is_finite() && f64::from(exact as f32) != exact
+        });
+    assert!(
+        has_measured_cast_gap,
+        "fixture must force a nonzero f64-to-f32 coefficient cast gap"
+    );
+
+    let composed = image::compose_tanh_diag_forward(
+        "tanh-large-cancellation",
+        &upstream,
+        &pre_activation,
+        &input_mag,
+    )
+    .expect("large-cancellation Tanh composition");
+    assert!(
+        composed
+            .lower_a()
+            .iter()
+            .chain(composed.upper_a().iter())
+            .chain(composed.lower_b().iter())
+            .chain(composed.upper_b().iter())
+            .all(|value| value.is_finite()),
+        "cast-gap discharge must remain finite"
+    );
+    let concrete = composed
+        .concretize_checked(&input)
+        .expect("finite cancellation enclosure");
+    assert!(concrete.lower()[0].is_finite() && concrete.upper()[0].is_finite());
+
+    for i in 0..=40 {
+        let x0 = -f64::from(radius) + 2.0 * f64::from(radius) * i as f64 / 40.0;
+        for j in 0..=40 {
+            let x1 = -f64::from(radius) + 2.0 * f64::from(radius) * j as f64 / 40.0;
+            let pre = f64::from(c0) * x0 + f64::from(c1) * x1 + f64::from(bias);
+            let actual = pre.tanh();
+            let row_lower = f64::from(composed.lower_a()[[0, 0]]) * x0
+                + f64::from(composed.lower_a()[[0, 1]]) * x1
+                + f64::from(composed.lower_b()[0]);
+            let row_upper = f64::from(composed.upper_a()[[0, 0]]) * x0
+                + f64::from(composed.upper_a()[[0, 1]]) * x1
+                + f64::from(composed.upper_b()[0]);
+            assert!(
+                row_lower <= actual && actual <= row_upper,
+                "x=({x0},{x1}) tanh={actual} escaped row [{row_lower},{row_upper}]"
+            );
+            assert!(
+                f64::from(concrete.lower()[0]) <= actual
+                    && actual <= f64::from(concrete.upper()[0]),
+                "x=({x0},{x1}) tanh={actual} escaped concretized [{},{}]",
+                concrete.lower()[0],
+                concrete.upper()[0]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_image_forward_linear_tanh_sampled_enclosure() {
+    let pre = Conv2dLayer::with_input_shape(
+        ArrayD::from_shape_vec(IxDyn(&[2, 1, 1, 1]), vec![1.25_f32, -0.8])
+            .expect("pre-Tanh kernel"),
+        Some(Array1::from_vec(vec![-0.1_f32, 0.2])),
+        (1, 1),
+        (0, 0),
+        2,
+        2,
+    )
+    .expect("pre-Tanh conv");
+    let post = Conv2dLayer::with_input_shape(
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 1, 1]), vec![-1.1_f32, 0.7])
+            .expect("post-Tanh kernel"),
+        Some(Array1::from_vec(vec![0.03_f32])),
+        (1, 1),
+        (0, 0),
+        2,
+        2,
+    )
+    .expect("post-Tanh conv");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("pre", Layer::Conv2d(pre)));
+    graph.add_node(GraphNode::new(
+        "tanh",
+        Layer::Tanh(TanhLayer),
+        vec!["pre".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "post",
+        Layer::Conv2d(post),
+        vec!["tanh".to_string()],
+    ));
+    graph.set_output("post");
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 2]), vec![-1.0, -0.4, 0.2, -0.7])
+            .expect("input lower"),
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 2]), vec![0.8, 0.9, 1.1, 0.5]).expect("input upper"),
+    )
+    .expect("input box");
+
+    let ordinary_error = graph
+        .collect_forward_linear_bounds_dag_cached(&input, None, None)
+        .expect_err("ordinary image requests must retain the historical Tanh refusal");
+    assert!(matches!(
+        ordinary_error,
+        NyError::UnsupportedConfiguration(_)
+    ));
+    let spoof_config = AlphaCrownConfig {
+        fix_interm_bounds: true,
+        cgan_complete_crown_ibp_root: true,
+        ..AlphaCrownConfig::default()
+    };
+    let spoof_error = graph
+        .collect_forward_linear_bounds_dag_cached_for_typed_cgan(&input, &spoof_config, None, None)
+        .expect_err("an arbitrary Conv2d+Tanh graph must not claim typed cGAN authority");
+    assert!(matches!(spoof_error, NyError::UnsupportedConfiguration(_)));
+    let (forward, _) =
+        collect_forward_linear_state_dag(&graph, &input, None, None, None, false, true)
+            .expect("internal typed Tanh composition should succeed for enclosure testing");
+    let tanh = forward.get("tanh").expect("Tanh map entry");
+    assert!(
+        tanh.lower().iter().all(|value| value.is_finite())
+            && tanh.upper().iter().all(|value| value.is_finite()),
+        "finite pre-activation bounds must produce finite Tanh bounds"
+    );
+    assert_forward_map_mc_containment(&graph, &input, 64, 0x7A4A_2026, &forward);
+}
+
+/// The ConvTranspose surface salts the fixed-cache identity. The warmer and
+/// alpha optimizer must consult the same key; otherwise official cGAN warms a
+/// map that the candidate can never observe.
+#[test]
+fn test_conv_transpose_warm_cache_reaches_typed_alpha_entry() {
+    crate::tests::with_serialized_env_vars(
+        &[("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "0")],
+        || {
+            let convt = ConvTranspose2dLayer::with_input_shape(
+                ArrayD::from_elem(IxDyn(&[1, 1, 1, 1]), 0.75),
+                Some(Array1::from_vec(vec![0.1])),
+                (1, 1),
+                (0, 0),
+                1,
+                1,
+            )
+            .expect("tiny ConvTranspose");
+            let mut graph = GraphNetwork::new();
+            graph.add_node(GraphNode::from_input(
+                "convt",
+                Layer::ConvTranspose2d(convt),
+            ));
+            graph.set_output("convt");
+            let input = BoundedTensor::new(
+                ArrayD::from_elem(IxDyn(&[1, 1, 1]), -0.4),
+                ArrayD::from_elem(IxDyn(&[1, 1, 1]), 0.6),
+            )
+            .expect("input box");
+
+            // The typed setter invalidates every forward-linear cache. Arm the
+            // lane through the legacy cGAN alias before warming, so this test
+            // also proves that old callers reach the generic authority check.
+            graph.set_cgan_forward_alpha_surrogate(true);
+            assert!(graph.forward_linear_spec_alpha_enabled());
+            assert!(graph.forward_linear_fixed_state_if_cached(&input).is_none());
+            graph
+                .collect_forward_linear_state_cached(&input, None, None)
+                .expect("ConvTranspose fixed map warm");
+            assert!(
+                graph.forward_linear_fixed_state_if_cached(&input).is_some(),
+                "the lookup must include the same ConvTranspose policy salt as the warmer"
+            );
+
+            let spec = Array2::from_shape_vec((2, 1), vec![1.0, -1.0]).expect("two-row spec");
+            let outcome = graph
+                .forward_linear_alpha_optimized_spec_margin_bounds(&input, &spec, None, None, None)
+                .expect("typed alpha entry");
+            assert!(
+                outcome.is_none(),
+                "no-ReLU fixture should decline after admission"
+            );
+            assert!(
+                graph
+                    .cached_forward_linear_map
+                    .alpha_opt
+                    .read()
+                    .expect("alpha-opt cache lock")
+                    .is_some(),
+                "memoized decline proves the typed entry passed the warm-cache gate"
+            );
+            let (memo_hash, memo_canonical) = {
+                let guard = graph
+                    .cached_forward_linear_map
+                    .alpha_opt
+                    .read()
+                    .expect("alpha-opt cache lock");
+                let (fingerprint, value) = guard.as_ref().expect("memoized decline");
+                assert!(value.is_none());
+                (fingerprint.hash, fingerprint.canonical.clone())
+            };
+            assert!(graph
+                .forward_linear_alpha_optimized_spec_margin_bounds(&input, &spec, None, None, None,)
+                .expect("memoized decline hit")
+                .is_none());
+            let guard = graph
+                .cached_forward_linear_map
+                .alpha_opt
+                .read()
+                .expect("alpha-opt cache lock");
+            let (fingerprint, value) = guard.as_ref().expect("republished decline");
+            assert!(value.is_none());
+            assert_eq!(fingerprint.hash, memo_hash);
+            assert_eq!(fingerprint.canonical, memo_canonical);
+            drop(guard);
+
+            graph.set_forward_linear_spec_alpha(false);
+            assert!(
+                graph
+                    .cached_forward_linear_map
+                    .alpha_opt
+                    .read()
+                    .expect("alpha-opt cache lock")
+                    .is_none(),
+                "disarming the typed lane must invalidate a memoized decline"
+            );
         },
     );
+}
+
+/// Proof-cache hits require exact canonical equality after the hash
+/// accelerator. Same endpoint bits under a different shape and a deliberately
+/// forced u64 collision must both miss.
+#[test]
+fn test_forward_linear_cache_rejects_shape_alias_and_forced_hash_collision() {
+    let lower = vec![-1.0_f32, -0.5, 0.25, 0.75];
+    let upper = vec![1.0_f32, 0.5, 1.25, 1.75];
+    let a = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1, 4]), lower.clone()).expect("shape a lower"),
+        ArrayD::from_shape_vec(IxDyn(&[1, 4]), upper.clone()).expect("shape a upper"),
+    )
+    .expect("shape a box");
+    let b = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[2, 2]), lower).expect("shape b lower"),
+        ArrayD::from_shape_vec(IxDyn(&[2, 2]), upper).expect("shape b upper"),
+    )
+    .expect("shape b box");
+
+    let policy = GraphNetwork::forward_linear_conv_transpose_reference_enabled();
+    let fingerprint_a = forward_linear_cache_fingerprint(&a, None, policy, false);
+    let fingerprint_b = forward_linear_cache_fingerprint(&b, None, policy, false);
+    assert_ne!(
+        fingerprint_a.canonical, fingerprint_b.canonical,
+        "shape is part of exact proof-cache authority"
+    );
+    assert_ne!(
+        forward_linear_cache_fingerprint(&a, None, !policy, false).canonical,
+        fingerprint_a.canonical,
+        "ConvTranspose policy is part of exact proof-cache authority"
+    );
+
+    let graph = GraphNetwork::new();
+    *graph
+        .cached_forward_linear_map
+        .fixed
+        .write()
+        .expect("fixed cache lock") = Some(ForwardLinearCacheEntry {
+        fingerprint: fingerprint_a,
+        map: std::sync::Arc::new(HashMap::new()),
+        output_lb: None,
+        build_cost: std::time::Duration::ZERO,
+    });
+    assert!(graph
+        .forward_linear_fixed_state_if_cached_with_policy(&a, policy)
+        .is_some());
+    let mut pure_clone = graph.clone();
+    pure_clone.adopt_forward_linear_cache_from(&graph);
+    assert!(
+        pure_clone
+            .forward_linear_fixed_state_if_cached_with_policy(&a, policy)
+            .is_some(),
+        "a pure clone sharing graph scope may adopt the exact forward cache"
+    );
+    let mut foreign_graph = GraphNetwork::new();
+    foreign_graph.adopt_forward_linear_cache_from(&graph);
+    assert!(
+        foreign_graph
+            .forward_linear_fixed_state_if_cached_with_policy(&a, policy)
+            .is_none(),
+        "a separately constructed graph must reject forward-cache adoption"
+    );
+    assert!(
+        graph
+            .forward_linear_fixed_state_if_cached_with_policy(&b, policy)
+            .is_none(),
+        "same flat bits under a different shape must miss"
+    );
+
+    // Force the accelerator to collide with request B while retaining A's
+    // canonical bytes. Exact comparison must still reject the entry.
+    graph
+        .cached_forward_linear_map
+        .fixed
+        .write()
+        .expect("fixed cache lock")
+        .as_mut()
+        .expect("seeded entry")
+        .fingerprint
+        .hash = fingerprint_b.hash;
+    assert!(
+        graph
+            .forward_linear_fixed_state_if_cached_with_policy(&b, policy)
+            .is_none(),
+        "u64 equality alone must never authorize a proof-cache hit"
+    );
+}
+
+/// Alpha names and payloads are sorted and length-delimited in the exact
+/// fingerprint, so ambiguous concatenations cannot alias.
+#[test]
+fn test_alpha_cache_fingerprint_is_sorted_and_length_delimited() {
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1]), -1.0),
+        ArrayD::from_elem(IxDyn(&[1]), 1.0),
+    )
+    .expect("input");
+    let mut left = std::collections::BTreeMap::new();
+    left.insert("a".to_string(), Array1::from_vec(vec![0.25]));
+    left.insert("bc".to_string(), Array1::from_vec(vec![0.75]));
+    let mut right = std::collections::BTreeMap::new();
+    right.insert("ab".to_string(), Array1::from_vec(vec![0.25]));
+    right.insert("c".to_string(), Array1::from_vec(vec![0.75]));
+    let mut reverse_insert = std::collections::BTreeMap::new();
+    reverse_insert.insert("bc".to_string(), Array1::from_vec(vec![0.75]));
+    reverse_insert.insert("a".to_string(), Array1::from_vec(vec![0.25]));
+
+    let policy = GraphNetwork::forward_linear_conv_transpose_reference_enabled();
+    let left_fingerprint = forward_linear_cache_fingerprint(&input, Some(&left), policy, false);
+    let right_fingerprint = forward_linear_cache_fingerprint(&input, Some(&right), policy, false);
+    let reverse_fingerprint =
+        forward_linear_cache_fingerprint(&input, Some(&reverse_insert), policy, false);
+    assert_eq!(
+        left_fingerprint.canonical, reverse_fingerprint.canonical,
+        "BTreeMap order makes alpha fingerprint canonical"
+    );
+    assert_ne!(left_fingerprint.canonical, right_fingerprint.canonical);
+
+    let graph = GraphNetwork::new();
+    *graph
+        .cached_forward_linear_map
+        .alpha
+        .write()
+        .expect("alpha cache lock") = Some(ForwardLinearCacheEntry {
+        fingerprint: left_fingerprint,
+        map: std::sync::Arc::new(HashMap::new()),
+        output_lb: None,
+        build_cost: std::time::Duration::ZERO,
+    });
+    graph
+        .cached_forward_linear_map
+        .alpha
+        .write()
+        .expect("alpha cache lock")
+        .as_mut()
+        .expect("seeded entry")
+        .fingerprint
+        .hash = right_fingerprint.hash;
+    assert!(
+        graph
+            .forward_linear_alpha_state_if_cached_with_policy(&input, &right, policy)
+            .is_none(),
+        "forced alpha hash collision must miss on canonical bytes"
+    );
+}
+
+#[test]
+fn test_alpha_memo_fingerprint_discriminates_incumbent_and_policy() {
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[2]), -1.0),
+        ArrayD::from_elem(IxDyn(&[2]), 1.0),
+    )
+    .expect("input");
+    let spec = Array2::from_shape_vec((2, 2), vec![1.0, -1.0, -1.0, 1.0]).expect("spec");
+    let incumbent = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![-0.5, -0.25]).expect("incumbent lower"),
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.5, 0.75]).expect("incumbent upper"),
+    )
+    .expect("incumbent");
+    let mut changed_lower = incumbent.lower().clone();
+    let changed_bit = ny_tensor::next_up_f32(changed_lower[0]);
+    changed_lower.as_slice_mut().expect("contiguous")[0] = changed_bit;
+    let changed =
+        BoundedTensor::new(changed_lower, incumbent.upper().clone()).expect("changed incumbent");
+
+    let base = margin_opt_memo_fingerprint(
+        &input,
+        &spec,
+        Some(&incumbent),
+        true,
+        true,
+        None,
+        alpha_opt::MAX_SURROGATE_BYTES,
+    )
+    .expect("fingerprint build")
+    .expect("fingerprint admitted");
+    let mut changed_fingerprint = margin_opt_memo_fingerprint(
+        &input,
+        &spec,
+        Some(&changed),
+        true,
+        true,
+        None,
+        alpha_opt::MAX_SURROGATE_BYTES,
+    )
+    .expect("fingerprint build")
+    .expect("fingerprint admitted");
+    assert_ne!(
+        base.canonical, changed_fingerprint.canonical,
+        "incumbent endpoint bits affect optimizer selection and memo identity"
+    );
+    changed_fingerprint.hash = base.hash;
+    assert!(
+        !base.exact_match(&changed_fingerprint),
+        "a forced hash collision must still miss on exact canonical bytes"
+    );
+    assert_ne!(
+        base.canonical,
+        margin_opt_memo_fingerprint(
+            &input,
+            &spec,
+            Some(&incumbent),
+            false,
+            true,
+            None,
+            alpha_opt::MAX_SURROGATE_BYTES,
+        )
+        .expect("fingerprint build")
+        .expect("fingerprint admitted")
+        .canonical,
+        "ConvTranspose policy must discriminate optimizer memos"
+    );
+    assert_ne!(
+        base.canonical,
+        margin_opt_memo_fingerprint(
+            &input,
+            &spec,
+            Some(&incumbent),
+            true,
+            false,
+            None,
+            alpha_opt::MAX_SURROGATE_BYTES,
+        )
+        .expect("fingerprint build")
+        .expect("fingerprint admitted")
+        .canonical,
+        "typed candidate policy must discriminate optimizer memos"
+    );
+}
+
+#[test]
+fn test_alpha_memo_fingerprint_refuses_oversized_and_overflowed_layouts() {
+    let oversized_spec_len = alpha_opt::MAX_SURROGATE_BYTES / size_of::<f32>() + 1;
+    assert!(
+        margin_opt_fingerprint_layout(
+            1,
+            1,
+            1,
+            1,
+            oversized_spec_len,
+            oversized_spec_len,
+            None,
+            alpha_opt::MAX_SURROGATE_BYTES,
+        )
+        .is_none(),
+        "an oversized spec must be rejected from scalar lengths before allocation or scanning"
+    );
+    assert!(
+        margin_opt_fingerprint_layout(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            1,
+            1,
+            1,
+            Some((usize::MAX, usize::MAX, usize::MAX)),
+            alpha_opt::MAX_SURROGATE_BYTES,
+        )
+        .is_none(),
+        "checked byte arithmetic must reject overflow"
+    );
+    assert!(
+        margin_opt_fingerprint_layout(1, 1, 1, usize::MAX, 2, usize::MAX, None, usize::MAX)
+            .is_none(),
+        "checked spec-shape work must reject multiplication overflow"
+    );
+}
+
+#[test]
+fn test_alpha_memo_fingerprint_cap_and_mid_scan_deadline_are_retryable() {
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[2]), -1.0),
+        ArrayD::from_elem(IxDyn(&[2]), 1.0),
+    )
+    .expect("input");
+    let columns = alpha_opt::DEADLINE_POLL_WORK as usize + 1;
+    let spec = Array2::from_shape_vec(
+        (2, columns),
+        (0..2 * columns).map(|index| index as f32 * 0.25).collect(),
+    )
+    .expect("spec");
+    let admitted = margin_opt_memo_fingerprint(
+        &input,
+        &spec,
+        None,
+        true,
+        true,
+        None,
+        alpha_opt::MAX_SURROGATE_BYTES,
+    )
+    .expect("fingerprint build")
+    .expect("fingerprint admitted");
+    assert!(admitted.retained_bytes() >= admitted.canonical.len());
+
+    let expired = margin_opt_memo_fingerprint(
+        &input,
+        &spec,
+        None,
+        true,
+        true,
+        Some(Instant::now()),
+        alpha_opt::MAX_SURROGATE_BYTES,
+    )
+    .expect_err("an already-expired deadline must stop before allocation");
+    assert!(matches!(expired, NyError::DeadlineExceeded(_)));
+
+    let capped = margin_opt_memo_fingerprint_with(
+        &input,
+        &spec,
+        None,
+        true,
+        true,
+        admitted.retained_bytes() - 1,
+        |_| Ok(()),
+    )
+    .expect("cap refusal is not an error");
+    assert!(
+        capped.is_none(),
+        "one byte under the exact plan must refuse"
+    );
+
+    let incumbent_bytes = alpha_opt::MAX_SURROGATE_BYTES
+        .checked_sub(admitted.retained_bytes())
+        .expect("ordinary fingerprint is below cap")
+        + 1;
+    let replacement_budget = alpha_opt::MAX_SURROGATE_BYTES.saturating_sub(incumbent_bytes);
+    assert!(
+        margin_opt_memo_fingerprint_with(
+            &input,
+            &spec,
+            None,
+            true,
+            true,
+            replacement_budget,
+            |_| Ok(()),
+        )
+        .expect("aggregate incumbent/replacement cap refusal")
+        .is_none(),
+        "the incumbent and replacement canonical Vecs must share one 256 MiB envelope"
+    );
+
+    let mut payload_polls = 0usize;
+    let deadline = margin_opt_memo_fingerprint_with(
+        &input,
+        &spec,
+        None,
+        true,
+        true,
+        alpha_opt::MAX_SURROGATE_BYTES,
+        |context| {
+            if context == "optimizer memo payload fingerprint" {
+                payload_polls += 1;
+                if payload_polls == 2 {
+                    return Err(NyError::DeadlineExceeded(
+                        "injected optimizer memo fingerprint deadline".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )
+    .expect_err("the second bounded payload poll must cancel fingerprinting");
+    assert!(matches!(deadline, NyError::DeadlineExceeded(_)));
+    assert_eq!(payload_polls, 2);
+
+    let retry = margin_opt_memo_fingerprint(
+        &input,
+        &spec,
+        None,
+        true,
+        true,
+        None,
+        alpha_opt::MAX_SURROGATE_BYTES,
+    )
+    .expect("retry fingerprint build")
+    .expect("retry fingerprint admitted");
+    assert_eq!(
+        retry.canonical, admitted.canonical,
+        "a cap/deadline refusal must leave no state that poisons an ordinary retry"
+    );
+}
+
+/// An expired deadline must terminate the certified ConvTranspose path without
+/// publishing partial state. A later unbudgeted retry must be able to compute
+/// and publish the same request.
+#[test]
+fn test_conv_transpose_expired_deadline_does_not_publish_and_retry_succeeds() {
+    crate::tests::with_serialized_env_vars(
+        &[("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "0")],
+        || {
+            let convt = ConvTranspose2dLayer::with_input_shape(
+                ArrayD::from_elem(IxDyn(&[1, 1, 1, 1]), 0.75),
+                Some(Array1::from_vec(vec![0.1])),
+                (1, 1),
+                (0, 0),
+                1,
+                1,
+            )
+            .expect("tiny ConvTranspose");
+            let mut graph = GraphNetwork::new();
+            graph.add_node(GraphNode::from_input(
+                "convt",
+                Layer::ConvTranspose2d(convt),
+            ));
+            graph.set_output("convt");
+            let input = BoundedTensor::new(
+                ArrayD::from_elem(IxDyn(&[1, 1, 1]), -0.4),
+                ArrayD::from_elem(IxDyn(&[1, 1, 1]), 0.6),
+            )
+            .expect("input box");
+
+            let expired = Some(Instant::now());
+            let err = graph
+                .collect_forward_linear_state_cached(&input, None, expired)
+                .expect_err("expired build must cancel");
+            assert!(matches!(err, NyError::DeadlineExceeded(_)));
+            assert!(
+                graph
+                    .cached_forward_linear_map
+                    .fixed
+                    .read()
+                    .expect("fixed cache lock")
+                    .is_none(),
+                "cancelled work must not publish a partial proof cache"
+            );
+
+            graph
+                .collect_forward_linear_state_cached(&input, None, None)
+                .expect("larger-budget retry");
+            assert!(
+                graph.forward_linear_fixed_state_if_cached(&input).is_some(),
+                "deadline refusal must not poison a later retry"
+            );
+        },
+    );
+}
+
+/// The deadline reaches the ConvTranspose composition itself, not merely the
+/// outer graph loop.
+#[test]
+fn test_conv_transpose_composition_expired_deadline_then_retry() {
+    let convt = ConvTranspose2dLayer::with_input_shape(
+        ArrayD::from_elem(IxDyn(&[1, 1, 1, 1]), 0.75),
+        Some(Array1::from_vec(vec![0.1])),
+        (1, 1),
+        (0, 0),
+        1,
+        1,
+    )
+    .expect("tiny ConvTranspose");
+    let upstream = LinearBounds::identity(1);
+    let err = image::compose_conv_transpose2d_forward(
+        "convt",
+        &convt,
+        &upstream,
+        &[1, 1, 1],
+        1,
+        &[1.0],
+        None,
+        Some(Instant::now()),
+    )
+    .expect_err("expired composition must cancel");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    let _ = image::compose_conv_transpose2d_forward(
+        "convt",
+        &convt,
+        &upstream,
+        &[1, 1, 1],
+        1,
+        &[1.0],
+        None,
+        None,
+    )
+    .expect("unbudgeted composition retry");
+}
+
+/// The final coefficient validation/repair pass is itself interruptible. This
+/// uses an injected poller so cancellation after one full work quantum is
+/// deterministic rather than dependent on wall-clock scheduling.
+#[test]
+fn test_conv_transpose_tail_validation_polls_and_cancels() {
+    let columns = image::CONV_TRANSPOSE_DEADLINE_POLL_WORK + 1;
+    let lower_a = Array2::<f32>::zeros((1, columns));
+    let upper_a = Array2::<f32>::zeros((1, columns));
+    let lower_b = Array1::<f32>::zeros(1);
+    let upper_b = Array1::<f32>::zeros(1);
+    let mut polls = 0usize;
+    let err = image::finish_conv_transpose_bounds_with_poll(
+        lower_a,
+        lower_b,
+        upper_a,
+        upper_b,
+        columns,
+        "tail-poll test",
+        |_| {
+            polls += 1;
+            if polls == 2 {
+                Err(NyError::DeadlineExceeded(
+                    "injected ConvTranspose tail deadline".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .expect_err("the second bounded-work poll must cancel validation");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    assert_eq!(
+        polls, 2,
+        "validation must poll again after at most one work quantum"
+    );
+}
+
+#[test]
+fn test_timeout_derived_alpha_decline_remains_retryable() {
+    let now = Instant::now();
+    assert!(
+        !alpha_decline_is_memoizable(Some(now), now),
+        "a timeout-derived None must leave the memo cold for a later retry"
+    );
+    assert!(
+        alpha_decline_is_memoizable(Some(now + std::time::Duration::from_secs(1)), now),
+        "a budget-independent decline may still be memoized"
+    );
+    assert!(alpha_decline_is_memoizable(None, now));
+}
+
+#[test]
+fn test_alpha_optimizer_deadline_is_not_a_memoizable_decline() {
+    let spec = margin_spec();
+    let (graph, input) = build_residual_dag(42, 0.6);
+    let (map, output_lb) = graph
+        .collect_forward_linear_state_cached(&input, None, None)
+        .expect("warm fixed state");
+    let output_lb = output_lb.expect("retained output map");
+    let err = alpha_opt::optimize_margin_alphas(
+        &graph,
+        &input,
+        &spec,
+        None,
+        &map,
+        &output_lb,
+        None,
+        Some(Instant::now()),
+        0,
+    )
+    .expect_err("expired optimizer budget must remain a structured deadline");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    assert!(
+        graph
+            .cached_forward_linear_map
+            .alpha_opt
+            .read()
+            .expect("memo lock")
+            .is_none(),
+        "a deadline error must leave the outer memo cold for a later retry"
+    );
+}
+
+#[test]
+fn test_cold_memo_rebuild_requires_measured_reserve_before_work() {
+    let now = Instant::now();
+    let reserve = std::time::Duration::from_secs(3);
+    assert!(!alpha_rebuild_fits(
+        Some(
+            (now + reserve)
+                .checked_sub(std::time::Duration::from_nanos(1))
+                .expect("now + 3s is well past the monotonic origin, so 1ns cannot underflow"),
+        ),
+        now,
+        reserve,
+        std::time::Duration::ZERO,
+    ));
+    assert!(alpha_rebuild_fits(
+        Some(now + reserve),
+        now,
+        reserve,
+        std::time::Duration::ZERO,
+    ));
+    assert!(alpha_rebuild_fits(
+        None,
+        now,
+        reserve,
+        std::time::Duration::from_secs(10),
+    ));
 }
 
 #[test]
@@ -1328,6 +2263,69 @@ pub(super) fn build_residual_dag_for_grad_test() -> (GraphNetwork, BoundedTensor
     build_residual_dag(42, 0.7)
 }
 
+/// ConvTranspose2d + mixed-sign BatchNorm fixture for the alpha surrogate's
+/// forward/adjoint finite-difference test. Geometry deliberately exercises
+/// asymmetric stride/dilation and nonzero output_padding.
+pub(super) fn build_convt_signed_bn_for_grad_test() -> (GraphNetwork, BoundedTensor) {
+    let convt = ConvTranspose2dLayer::new_full(
+        ArrayD::from_shape_vec(
+            IxDyn(&[1, 2, 2, 2]),
+            vec![0.8, -0.4, 0.3, 0.6, -0.5, 0.7, -0.2, 0.9],
+        )
+        .expect("first ConvTranspose kernel"),
+        Some(Array1::from_vec(vec![0.05, -0.1])),
+        (2, 1),
+        (1, 0),
+        (2, 1),
+        (1, 0),
+    )
+    .expect("valid asymmetric ConvTranspose geometry");
+    let batch_norm = BatchNormLayer::from_scale_bias(
+        Array1::from_vec(vec![-1.25, 0.75]).into_dyn(),
+        Array1::from_vec(vec![0.15, -0.1]).into_dyn(),
+    )
+    .expect("mixed-sign BatchNorm");
+    let tail = ConvTranspose2dLayer::new_full(
+        ArrayD::from_shape_vec(IxDyn(&[2, 1, 1, 1]), vec![0.7, -0.6])
+            .expect("tail ConvTranspose kernel"),
+        Some(Array1::from_vec(vec![0.02])),
+        (1, 1),
+        (0, 0),
+        (1, 1),
+        (0, 0),
+    )
+    .expect("tail ConvTranspose");
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "convt",
+        Layer::ConvTranspose2d(convt),
+    ));
+    graph.add_node(GraphNode::new(
+        "bn",
+        Layer::BatchNorm(batch_norm),
+        vec!["convt".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer),
+        vec!["bn".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "tail",
+        Layer::ConvTranspose2d(tail),
+        vec!["relu".to_string()],
+    ));
+    graph.set_output("tail");
+
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), -1.0),
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), 1.0),
+    )
+    .expect("valid symmetric input box");
+    (graph, input)
+}
+
 /// Margin spec fixture: two margin rows over the residual DAG's 3 outputs
 /// (`y0 − y1`, `y2 − y0`).
 fn margin_spec() -> Array2<f32> {
@@ -1391,7 +2389,7 @@ fn test_alpha_optimizer_output_sound_on_random_dags() {
         let output_lb = output_lb.expect("output map retained");
 
         let outcome = alpha_opt::optimize_margin_alphas(
-            &graph, &input, &spec, None, &map, &output_lb, None, None,
+            &graph, &input, &spec, None, &map, &output_lb, None, None, 0,
         )
         .expect("optimizer must not error");
         let Some((alphas, stats)) = outcome else {
@@ -1430,13 +2428,39 @@ fn test_alpha_optimizer_output_sound_on_random_dags() {
     );
 }
 
-/// #w4-root-alpha-opt: the public entry (optimizer + certified rebuild)
-/// fail-opens without a warm fixed cache, produces sound margin bounds whose
-/// intersection with the fixed route is never worse, and memoizes.
+/// #w4-root-alpha-opt: the generic public entry (optimizer + certified rebuild)
+/// reaches the existing method on a small CIFAR-like residual DAG, fail-opens
+/// without a warm fixed cache, produces sound margin bounds whose intersection
+/// with the fixed route is never worse, and memoizes.
 #[test]
-fn test_alpha_optimizer_entry_cache_gate_and_never_worse() {
+fn test_generic_alpha_optimizer_reaches_non_cgan_dag_and_is_never_worse() {
     let spec = margin_spec();
-    let (graph, input) = build_residual_dag(42, 0.6);
+    let (mut graph, input) = build_residual_dag(42, 0.6);
+    assert!(graph.has_conv2d_layers());
+    assert!(!graph.has_conv_transpose2d_layers());
+
+    // Typed lane is default OFF. Even a direct internal call must be inert and
+    // must not publish a memoized refusal that could leak into a later canary.
+    assert!(!graph.forward_linear_spec_alpha_enabled());
+    assert!(
+        !graph.cgan_forward_alpha_surrogate_enabled(),
+        "the compatibility query must read the same default-dark bit"
+    );
+    let dark = graph
+        .forward_linear_alpha_optimized_spec_margin_bounds(&input, &spec, None, None, None)
+        .expect("dark entry must not error");
+    assert!(dark.is_none());
+    assert!(
+        graph
+            .cached_forward_linear_map
+            .alpha_opt
+            .read()
+            .expect("alpha-opt cache lock")
+            .is_none(),
+        "dark lane must not publish optimizer state"
+    );
+    graph.set_forward_linear_spec_alpha(true);
+    assert!(graph.cgan_forward_alpha_surrogate_enabled());
 
     // Cold cache: the entry must decline instead of paying the fresh pass.
     let cold = graph
@@ -1450,11 +2474,18 @@ fn test_alpha_optimizer_entry_cache_gate_and_never_worse() {
     let first = graph
         .forward_linear_alpha_optimized_spec_margin_bounds(&input, &spec, None, None, None)
         .expect("entry must not error");
-    let Some((bounds, stats)) = first else {
-        // Optimizer declined (no straggler rows / no predicted improvement) —
-        // acceptable; nothing further to assert on this fixture.
-        return;
-    };
+    assert!(
+        graph
+            .cached_forward_linear_map
+            .alpha_opt
+            .read()
+            .expect("alpha-opt cache lock")
+            .is_some(),
+        "the generic opt-in must reach the existing optimizer method on the non-cGAN DAG"
+    );
+    let (bounds, stats) = first.expect(
+        "the advertised generic optimizer fixture must engage and publish an improved candidate",
+    );
     assert!(stats.predicted_min > stats.baseline_min);
     assert_margin_mc_containment(&graph, &input, &spec, &bounds, 6400, "entry");
 
@@ -1477,6 +2508,17 @@ fn test_alpha_optimizer_entry_cache_gate_and_never_worse() {
         .expect("memo must return the optimized result");
     assert_eq!(bounds.lower(), second.0.lower());
     assert_eq!(bounds.upper(), second.0.upper());
+
+    graph.set_forward_linear_spec_alpha(false);
+    assert!(
+        graph
+            .cached_forward_linear_map
+            .alpha_opt
+            .read()
+            .expect("alpha-opt cache lock")
+            .is_none(),
+        "changing the typed lane must invalidate its memo identity"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1647,4 +2689,805 @@ fn test_forward_f32_seam_contains_exact_conv_range_and_covers_f64() {
         widened,
         "f32 seam produced bounds identical to f64 — the f32 path did not engage"
     );
+}
+
+/// Dense f64 product `left · right` of two affine oracles (`left` consumes
+/// `right`'s output), so a ConvTranspose CHAIN has an exact composed matrix.
+fn dense_compose(left: &DenseConv, right: &DenseConv) -> DenseConv {
+    assert_eq!(left.in_dim, right.out_dim);
+    let mut matrix = vec![0.0f64; left.out_dim * right.in_dim];
+    let mut bias = left.bias.clone();
+    for p in 0..left.out_dim {
+        for k in 0..left.in_dim {
+            let m = left.matrix[p * left.in_dim + k];
+            if m == 0.0 {
+                continue;
+            }
+            bias[p] += m * right.bias[k];
+            for j in 0..right.in_dim {
+                matrix[p * right.in_dim + j] += m * right.matrix[k * right.in_dim + j];
+            }
+        }
+    }
+    DenseConv {
+        matrix,
+        bias,
+        out_dim: left.out_dim,
+        in_dim: right.in_dim,
+    }
+}
+
+/// cGAN-shaped chain fixture: `ConvTranspose → BatchNorm → ReLU` blocks ending
+/// in a ConvTranspose. Half the BatchNorm channels are shifted negative so a
+/// large fraction of each ReLU is stably INACTIVE (the case that manufactures a
+/// binary32-subnormal affine bias, see the `compose_conv_transpose2d_forward`
+/// docs) while the rest stay live, so the output is not a constant.
+fn build_conv_transpose_relu_chain(
+    seed: u64,
+    blocks: usize,
+    bn_shift: f32,
+) -> (GraphNetwork, BoundedTensor) {
+    let mut rng = Lcg::new(seed);
+    let in_c = 2usize;
+    let (in_h, in_w) = (3usize, 3usize);
+    let mut graph = GraphNetwork::new();
+    let mut prev: Option<String> = None;
+    for block in 0..blocks {
+        let out_c = 3 + (block % 2);
+        // ConvTranspose kernel layout is (in_c, out_c, kh, kw).
+        let channels = if block == 0 {
+            in_c
+        } else {
+            3 + ((block - 1) % 2)
+        };
+        let kernel = random_kernel(&mut rng, channels, out_c, 3, 3, 0.6);
+        let convt = ConvTranspose2dLayer::new_full(
+            kernel,
+            Some(random_bias(&mut rng, out_c, 0.2)),
+            (1, 1),
+            (0, 0),
+            (1, 1),
+            (0, 0),
+        )
+        .expect("valid ConvTranspose geometry");
+        let convt_name = format!("convt{block}");
+        graph.add_node(match &prev {
+            None => GraphNode::from_input(convt_name.as_str(), Layer::ConvTranspose2d(convt)),
+            Some(p) => GraphNode::new(
+                convt_name.as_str(),
+                Layer::ConvTranspose2d(convt),
+                vec![p.clone()],
+            ),
+        });
+        prev = Some(convt_name.clone());
+        if block + 1 == blocks {
+            break;
+        }
+        // Alternate the shift so each ReLU carries BOTH stably-inactive
+        // channels (subnormal intercepts) and live channels (real signal).
+        let bn = BatchNormLayer::from_scale_bias(
+            Array1::from_iter((0..out_c).map(|_| rng.next_f32(0.9) + 1.3)).into_dyn(),
+            Array1::from_iter(
+                (0..out_c)
+                    .map(|c| rng.next_f32(0.2) + if c % 2 == 0 { -bn_shift } else { bn_shift }),
+            )
+            .into_dyn(),
+        )
+        .expect("BatchNorm");
+        let bn_name = format!("bn{block}");
+        graph.add_node(GraphNode::new(
+            bn_name.as_str(),
+            Layer::BatchNorm(bn),
+            vec![convt_name],
+        ));
+        let relu_name = format!("relu{block}");
+        graph.add_node(GraphNode::new(
+            relu_name.as_str(),
+            Layer::ReLU(ReLULayer::new()),
+            vec![bn_name.clone()],
+        ));
+        prev = Some(relu_name);
+    }
+    graph.set_output(prev.as_deref().expect("chain has an output"));
+    let input = random_box(&mut rng, &[in_c, in_h, in_w], 0.7, 0.06);
+    (graph, input)
+}
+
+/// REGRESSION PIN for the measured cGAN forward-linear correlation loss.
+///
+/// The ConvTranspose2d composition used to route the packed affine coefficient
+/// columns through `ConvTranspose2dLayer::propagate_ibp_sound_with_engine`, the
+/// certified f32 INTERVAL kernel. That cost the pass twice over:
+///
+/// 1. **Fail-open.** The kernel returns `[-inf, +inf]` for the WHOLE node as
+///    soon as any input endpoint is a binary32 subnormal (its DAZ-independence
+///    guard). The forward-linear ReLU composition commits a stable-inactive
+///    neuron's exact `0` intercept through `next_down_f32(0.0)` /
+///    `next_up_f32(0.0)`, which BY CONSTRUCTION returns `∓1.4e-45`. So every
+///    ConvTranspose downstream of the first ReLU returned the universal
+///    interval, and `tighten_with_ibp` handed back plain IBP.
+/// 2. **Precision.** Its Higham widening is `γ_{K+2}^f32` (≈1.2e-4 at cGAN's
+///    `K = 2048`), nine orders coarser than the `γ^f64 ≈ 2.3e-13` the Conv2d
+///    seam uses, and it scales with `S = Σ|W||A|` — an IBP-like quantity that
+///    does not shrink under cancellation, so it compounds through the chain.
+///
+/// Part 1 documents the fail-open mechanism against the layer API directly.
+/// Part 2 pins the graph-level consequence of (1): finite bounds that stay
+/// materially tighter than IBP. Part 3 pins (2): on a PURELY AFFINE
+/// ConvTranspose chain the composition must reproduce the exact dense-f64
+/// affine range to near machine precision.
+#[test]
+fn test_image_conv_transpose_after_relu_keeps_input_correlation_daz_packet() {
+    // ---- Part 1: the fail-open mechanism. -------------------------------
+    let zero_lower = ny_tensor::next_down_f32(0.0);
+    let zero_upper = ny_tensor::next_up_f32(0.0);
+    for v in [zero_lower, zero_upper] {
+        assert!(
+            v != 0.0 && v.abs() < f32::MIN_POSITIVE,
+            "the ReLU zero-intercept commit must be a binary32 subnormal, got {v:?}"
+        );
+    }
+    let probe = ConvTranspose2dLayer::new_full(
+        ArrayD::from_elem(IxDyn(&[1, 1, 2, 2]), 0.5f32),
+        None,
+        (1, 1),
+        (0, 0),
+        (1, 1),
+        (0, 0),
+    )
+    .expect("probe geometry");
+    let subnormal_packet =
+        BoundedTensor::concrete(ArrayD::from_elem(IxDyn(&[1, 2, 2]), zero_lower))
+            .expect("subnormal packet");
+    let failed_open = probe
+        .propagate_ibp_sound_with_engine(&subnormal_packet, None)
+        .expect("certified ConvTranspose IBP");
+    assert!(
+        failed_open
+            .lower()
+            .iter()
+            .zip(failed_open.upper().iter())
+            .all(|(&l, &u)| l == f32::NEG_INFINITY && u == f32::INFINITY),
+        "fixture assumption broken: the certified interval ConvTranspose kernel no \
+         longer fails open on a subnormal source operand"
+    );
+
+    // ---- Part 2: no collapse to IBP on a ReLU-fed chain. ----------------
+    for (seed, blocks, shift) in [
+        (0xDA2_0001u64, 3usize, 1.2f32),
+        (0xDA2_0002, 3, 0.6),
+        (0xDA2_0003, 4, 1.5),
+        (0xDA2_0004, 2, 2.0),
+    ] {
+        let (graph, input) = build_conv_transpose_relu_chain(seed, blocks, shift);
+        let exec_order = graph.exec_order().expect("exec order").to_vec();
+        assert!(
+            graph.is_sequential_graph(&exec_order),
+            "fixture must be a cgan-class sequential chain"
+        );
+        let forward = graph
+            .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
+            .expect("ConvTranspose+BN+ReLU chain is on the certified image surface");
+        let ibp = graph
+            .collect_node_bounds_with_engine(&input, None)
+            .expect("IBP bounds");
+
+        for (name, bounds) in &forward {
+            assert!(
+                bounds
+                    .lower()
+                    .iter()
+                    .chain(bounds.upper().iter())
+                    .all(|v| v.is_finite()),
+                "seed {seed:x}: forward-linear node '{name}' returned a non-finite bound — \
+                 the ConvTranspose composition failed open"
+            );
+        }
+
+        // A chain whose ReLU-fed ConvTransposes all fail open is BIT-IDENTICAL
+        // to IBP (the `tighten_with_ibp` intersection keeps the IBP side).
+        let output = graph.output_node.clone();
+        let fw_width = tensor_width_sum(&forward[&output]);
+        let ibp_width = tensor_width_sum(&ibp[&output]);
+        assert!(
+            fw_width > 0.0 && fw_width * 1.5 < ibp_width,
+            "seed {seed:x}: forward-linear output width {fw_width} is not materially \
+             tighter than IBP {ibp_width} — input correlation is being lost"
+        );
+
+        // SOUNDNESS: the map must still enclose every sampled point.
+        assert_mc_containment(&graph, &input, 64, seed ^ 0xA5A5);
+    }
+
+    // ---- Part 3: exact-affine precision on a pure ConvTranspose chain. ---
+    // No ReLU, so the composed map is EXACTLY affine and the dense f64 oracle
+    // is the ground truth. The f32 interval route inflated this by ~1e-3
+    // relative on this fixture (and 2.7% on cGAN's ConvTranspose_4); the f64
+    // composition must stay within a few ULPs of exact.
+    let mut rng = Lcg::new(0xC0FF_EE11);
+    let (in_c, in_h, in_w) = (4usize, 4usize, 4usize);
+    let ct1 = ConvTranspose2dLayer::new_full(
+        random_kernel(&mut rng, in_c, 8, 4, 4, 0.5),
+        Some(random_bias(&mut rng, 8, 0.2)),
+        (2, 2),
+        (1, 1),
+        (1, 1),
+        (0, 0),
+    )
+    .expect("ct1 geometry");
+    let ct2 = ConvTranspose2dLayer::new_full(
+        random_kernel(&mut rng, 8, 3, 4, 4, 0.5),
+        Some(random_bias(&mut rng, 3, 0.2)),
+        (2, 2),
+        (1, 1),
+        (1, 1),
+        (0, 0),
+    )
+    .expect("ct2 geometry");
+    let mut affine = GraphNetwork::new();
+    affine.add_node(GraphNode::from_input(
+        "ct1",
+        Layer::ConvTranspose2d(ct1.clone()),
+    ));
+    affine.add_node(GraphNode::new(
+        "ct2",
+        Layer::ConvTranspose2d(ct2.clone()),
+        vec!["ct1".to_string()],
+    ));
+    affine.set_output("ct2");
+    let input = random_box(&mut rng, &[in_c, in_h, in_w], 0.8, 0.05);
+
+    let d1 = dense_conv_transpose_oracle(&ct1, in_c, in_h, in_w);
+    let (mid_h, mid_w) = ct1.output_size(in_h, in_w).expect("ct1 out size");
+    let d2 = dense_conv_transpose_oracle(&ct2, 8, mid_h, mid_w);
+    let dense = dense_compose(&d2, &d1);
+    let (exact_lo, exact_hi) = affine_exact_range(
+        &dense.matrix,
+        &dense.bias,
+        dense.out_dim,
+        dense.in_dim,
+        &input,
+    );
+
+    let forward = affine
+        .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
+        .expect("pure ConvTranspose chain forward-linear");
+    let claimed = forward["ct2"].flatten();
+    assert_eq!(claimed.len(), dense.out_dim);
+    let mut worst_ratio = 0.0f64;
+    for p in 0..dense.out_dim {
+        let (cl, cu) = (claimed.lower()[p] as f64, claimed.upper()[p] as f64);
+        // SOUND: never excludes the exact affine range.
+        assert!(
+            cl <= exact_lo[p] && cu >= exact_hi[p],
+            "output {p}: claimed [{cl}, {cu}] excludes exact [{}, {}]",
+            exact_lo[p],
+            exact_hi[p]
+        );
+        let exact_width = exact_hi[p] - exact_lo[p];
+        if exact_width > 1e-6 {
+            worst_ratio = worst_ratio.max((cu - cl) / exact_width);
+        }
+    }
+    assert!(
+        worst_ratio < 1.000_01,
+        "pure-affine ConvTranspose chain is {worst_ratio}x the exact affine width — the \
+         composition is charging an f32-scale certified-error penalty (expected < 1.00001x \
+         for the certified f64 seam)"
+    );
+}
+
+/// Randomized ENCLOSURE sweep over ConvTranspose2d geometries with BatchNorm
+/// and ReLU in the chain — the operator mix the cGAN generator uses. Covers
+/// asymmetric stride/padding/dilation/output_padding and both BN scale signs.
+/// Every node's claimed forward-linear bound must contain the brute-force
+/// point evaluation at 24 interior samples plus both box corners, and the
+/// composed map must additionally enclose the exact dense-f64 affine range of
+/// the leading (pre-ReLU) ConvTranspose+BatchNorm.
+#[test]
+fn test_image_conv_transpose_random_geometry_enclosure_sweep() {
+    for seed in 0..12u64 {
+        let mut rng = Lcg::new(4_000 + seed);
+        let in_c = 2 + (seed % 2) as usize;
+        let out_c = 2 + ((seed / 2) % 3) as usize;
+        let (kh, kw) = match seed % 3 {
+            0 => (1, 1),
+            1 => (3, 2),
+            _ => (2, 3),
+        };
+        let stride = (1 + (seed % 2) as usize, 1 + ((seed / 3) % 2) as usize);
+        let dilation = (1 + ((seed / 2) % 2) as usize, 1);
+        // ConvTranspose padding must not exceed the effective kernel span.
+        let padding = (
+            ((seed / 4) % 2) as usize * (dilation.0 * (kh - 1) + 1).saturating_sub(1).min(1),
+            0,
+        );
+        // ONNX/PyTorch require output_padding < stride.
+        let output_padding = ((seed as usize / 5) % stride.0.max(1), 0);
+        let (in_h, in_w) = (2 + (seed % 3) as usize, 3);
+
+        let convt = ConvTranspose2dLayer::new_full(
+            random_kernel(&mut rng, in_c, out_c, kh, kw, 0.7),
+            Some(random_bias(&mut rng, out_c, 0.3)),
+            stride,
+            padding,
+            dilation,
+            output_padding,
+        )
+        .expect("valid ConvTranspose geometry");
+        // Mixed BN scale signs (a negative scale swaps the affine sides).
+        let bn = BatchNormLayer::from_scale_bias(
+            Array1::from_iter((0..out_c).map(|c| {
+                let m = rng.next_f32(0.7).abs() + 0.4;
+                if c % 2 == 0 {
+                    m
+                } else {
+                    -m
+                }
+            }))
+            .into_dyn(),
+            random_bias(&mut rng, out_c, 0.5).into_dyn(),
+        )
+        .expect("BatchNorm");
+
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "convt",
+            Layer::ConvTranspose2d(convt.clone()),
+        ));
+        graph.add_node(GraphNode::new(
+            "bn",
+            Layer::BatchNorm(bn.clone()),
+            vec!["convt".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer),
+            vec!["bn".to_string()],
+        ));
+        // A second ConvTranspose downstream of the ReLU: the placement that
+        // used to fail open on the ReLU's subnormal zero-intercepts.
+        let (mid_h, mid_w) = convt.output_size(in_h, in_w).expect("convt out size");
+        let convt2 = ConvTranspose2dLayer::new_full(
+            random_kernel(&mut rng, out_c, 2, 2, 2, 0.7),
+            Some(random_bias(&mut rng, 2, 0.3)),
+            (1, 1),
+            (0, 0),
+            (1, 1),
+            (0, 0),
+        )
+        .expect("valid ConvTranspose geometry");
+        graph.add_node(GraphNode::new(
+            "convt2",
+            Layer::ConvTranspose2d(convt2),
+            vec!["relu".to_string()],
+        ));
+        graph.set_output("convt2");
+        let _ = (mid_h, mid_w);
+
+        let input = random_box(&mut rng, &[in_c, in_h, in_w], 0.6, 0.25);
+
+        // (1) Exact dense-f64 affine enclosure at the pre-ReLU BatchNorm.
+        let forward = graph
+            .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
+            .expect("ConvTranspose sweep forward-linear");
+        let dense_conv = dense_conv_transpose_oracle(&convt, in_c, in_h, in_w);
+        let scale: Vec<f64> = bn.scale.iter().map(|&x| x as f64).collect();
+        let bias: Vec<f64> = bn.bias.iter().map(|&x| x as f64).collect();
+        let dense = dense_channel_affine_after_conv(&dense_conv, out_c, &scale, &bias);
+        let (ex_lo, ex_hi) = affine_exact_range(
+            &dense.matrix,
+            &dense.bias,
+            dense.out_dim,
+            dense.in_dim,
+            &input,
+        );
+        let claimed = forward["bn"].flatten();
+        for p in 0..dense.out_dim {
+            assert!(
+                (claimed.lower()[p] as f64) <= ex_lo[p] && (claimed.upper()[p] as f64) >= ex_hi[p],
+                "seed {seed}: bn[{p}] claimed [{}, {}] excludes exact [{}, {}]",
+                claimed.lower()[p],
+                claimed.upper()[p],
+                ex_lo[p],
+                ex_hi[p]
+            );
+        }
+
+        // (2) Brute-force sampled containment at EVERY node, including the
+        // post-ReLU ConvTranspose.
+        assert_mc_containment(&graph, &input, 24, 5_000 + seed);
+
+        // (3) Finite everywhere: no fail-open collapse.
+        for (name, bounds) in &forward {
+            assert!(
+                bounds
+                    .lower()
+                    .iter()
+                    .chain(bounds.upper().iter())
+                    .all(|v| v.is_finite()),
+                "seed {seed}: node '{name}' returned a non-finite forward-linear bound"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// L3: does the cGAN ConvTranspose+BatchNorm differential regression actually
+// EXONERATE the conv algebra?  See the two tests below.
+// ===========================================================================
+
+/// L3-A — the cited cGAN differential fixture has NO power to detect a
+/// correlation loss, and this test proves it by measurement.
+///
+/// `test_image_conv_transpose_batch_norm_dense_f64_enclosure` builds
+/// `input -> ConvTranspose2d -> BatchNorm` and asserts only
+/// `claimed ⊇ exact` (plus sampled containment). Two structural facts make
+/// that fixture blind:
+///
+/// 1. The ConvTranspose's upstream map is `LinearBounds::identity(input_dim)`
+///    (`resolve_upstream_linear_ref` for `NETWORK_INPUT`), so `lower_a ==
+///    upper_a` and the radius channel `A_r = (A_u - A_l)/2` is IDENTICALLY
+///    ZERO. The certified sign-split `W⁺A_l + W⁻A_u = W·A_c ∓ |W|·A_r` is
+///    never exercised with a nonzero radius — exactly the `LinearBounds::
+///    identity` blind spot that hid the CROWN `Sub` false bound.
+/// 2. The chain is PURELY AFFINE and the domain is a box, so plain IBP is
+///    already EXACT on it. A pass that concretized at every node would produce
+///    the same numbers.
+///
+/// Assertion: on that fixture the forward-linear map is bit-comparable to IBP.
+#[test]
+fn test_image_cgan_dense_f64_fixture_is_ibp_indistinguishable() {
+    let in_c = 2usize;
+    let out_c = 3usize;
+    let (in_h, in_w) = (2usize, 3usize);
+    let kernel = ArrayD::from_shape_fn(IxDyn(&[in_c, out_c, 3, 2]), |idx| {
+        let raw = ((idx[0] * 29 + idx[1] * 17 + idx[2] * 7 + idx[3] * 3) % 19) as f32;
+        (raw - 9.0) * 0.137
+    });
+    let conv = ConvTranspose2dLayer::new_full(
+        kernel,
+        Some(Array1::from_vec(vec![0.13, -0.27, 0.08])),
+        (2, 1),
+        (1, 0),
+        (1, 2),
+        (1, 0),
+    )
+    .expect("valid ConvTranspose geometry");
+    let bn = BatchNormLayer {
+        scale: Array1::from_vec(vec![-1.35, 0.62, 1.91]).into_dyn(),
+        bias: Array1::from_vec(vec![0.17, -0.09, 0.31]).into_dyn(),
+        scale_err: Array1::from_vec(vec![1.5e-4, 3.0e-5, 8.0e-5]).into_dyn(),
+        bias_err: Array1::from_vec(vec![2.0e-4, 7.0e-6, 4.5e-5]).into_dyn(),
+        num_channels: out_c,
+        channel_axis_hint: None,
+    };
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("convt", Layer::ConvTranspose2d(conv)));
+    graph.add_node(GraphNode::new(
+        "bn",
+        Layer::BatchNorm(bn),
+        vec!["convt".to_string()],
+    ));
+    graph.set_output("bn");
+
+    let mut rng = Lcg::new(0xC6A4_2025);
+    let input = random_box(&mut rng, &[in_c, in_h, in_w], 0.8, 0.17);
+
+    let forward = graph
+        .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
+        .expect("forward-linear");
+    let ibp = graph
+        .collect_node_bounds_with_engine(&input, None)
+        .expect("IBP");
+
+    for node in ["convt", "bn"] {
+        let fw = tensor_width_sum(&forward[node]);
+        let ib = tensor_width_sum(&ibp[node]);
+        eprintln!(
+            "[L3-A] node {node}: forward width {fw:.9}, IBP width {ib:.9}, ratio {:.9}",
+            fw / ib
+        );
+        // MEASURED: ratio 0.999996 at 'convt', 0.999994 at 'bn'. The residual
+        // is f64-vs-f32 accumulation rounding, not correlation.
+        assert!(
+            (fw - ib).abs() <= 1e-4 * ib,
+            "fixture assumption changed: forward ({fw}) and IBP ({ib}) now differ at '{node}'"
+        );
+    }
+}
+
+/// L3-B — the STRONGER variant the cited test is missing: a real box, an
+/// upstream forward map with `lower_a != upper_a`, and a TIGHTNESS oracle.
+///
+/// A crossing ReLU sits in front of the ConvTranspose so the composed rows
+/// genuinely split (`A_r != 0`), and the leading Conv2d gives the
+/// ConvTranspose a NON-identity, input-correlated upstream map. The oracle is
+/// an independent dense-f64 DeepPoly: `M1` and `W` come from the scattered
+/// dense oracles (no production indexing code), the ReLU diagonal is taken
+/// from `relu_linear_relaxation` at ny's own pre-activation box so the ONLY
+/// thing under test is the ConvTranspose/BatchNorm composition, and the
+/// sign-split row selection + concretization are re-derived here.
+///
+/// Three assertions:
+///   * ENCLOSURE   — ny never excludes the oracle's own DeepPoly box.
+///   * TIGHTNESS   — ny is within a hair of the oracle. A composition that
+///     concretized its upstream (IBP-at-every-node) would blow past this.
+///   * TEETH       — the oracle is itself far tighter than IBP on this
+///     fixture, so the tightness assertion can actually fail.
+#[test]
+fn test_image_conv_transpose_batch_norm_preserves_split_correlated_rows() {
+    use crate::layers::activations::relu::relu_linear_relaxation;
+
+    for seed in 0..6u64 {
+        let mut rng = Lcg::new(0x5D3A_0000 + seed);
+        let (in_c, in_h, in_w) = (2usize, 5usize, 5usize);
+        let mid_c = 3usize;
+        let out_c = 2usize;
+        let in_dim = in_c * in_h * in_w;
+
+        // Leading Conv2d: gives the ConvTranspose a NON-identity upstream map.
+        // Channel biases are chosen so the ReLU carries all three regimes:
+        // stably-active (D = I), stably-inactive (D = 0) and crossing
+        // (D_l != D_u -> nonzero radius A_r into the ConvTranspose).
+        let conv1 = Conv2dLayer::with_input_shape(
+            random_kernel(&mut rng, mid_c, in_c, 3, 3, 0.8),
+            Some(Array1::from_vec(vec![2.5, -2.5, 0.05])),
+            (1, 1),
+            (1, 1),
+            in_h,
+            in_w,
+        )
+        .expect("conv1");
+        let convt = ConvTranspose2dLayer::new_full(
+            random_kernel(&mut rng, mid_c, out_c, 3, 3, 0.7),
+            Some(random_bias(&mut rng, out_c, 0.3)),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (0, 0),
+        )
+        .expect("convt");
+        // Negative scale on channel 0 exercises the BatchNorm side swap.
+        let bn = BatchNormLayer::from_scale_bias(
+            Array1::from_vec(vec![-1.35, 0.62]).into_dyn(),
+            Array1::from_vec(vec![0.17, -0.09]).into_dyn(),
+        )
+        .expect("bn");
+
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("conv1", Layer::Conv2d(conv1.clone())));
+        graph.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer),
+            vec!["conv1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "convt",
+            Layer::ConvTranspose2d(convt.clone()),
+            vec!["relu".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "bn",
+            Layer::BatchNorm(bn.clone()),
+            vec!["convt".to_string()],
+        ));
+        graph.set_output("bn");
+
+        let input = random_box(&mut rng, &[in_c, in_h, in_w], 0.6, 0.22);
+        let forward = graph
+            .collect_forward_linear_bounds_dag_with_conv_transpose_for_test(&input, None)
+            .expect("forward-linear");
+        let ibp = graph
+            .collect_node_bounds_with_engine(&input, None)
+            .expect("IBP");
+
+        // ---- independent dense-f64 DeepPoly oracle -----------------------
+        let m1 = dense_conv_oracle(&conv1, in_c, in_h, in_w);
+        assert_eq!(m1.in_dim, in_dim);
+        let mid_dim = m1.out_dim;
+
+        // ReLU diagonal at ny's OWN pre-activation box (isolates the conv).
+        let pre = forward["conv1"].flatten();
+        let mut post_l_a = vec![0.0f64; mid_dim * in_dim];
+        let mut post_u_a = vec![0.0f64; mid_dim * in_dim];
+        let mut post_l_b = vec![0.0f64; mid_dim];
+        let mut post_u_b = vec![0.0f64; mid_dim];
+        let mut regimes = [0usize; 3];
+        for i in 0..mid_dim {
+            let (l, u) = (pre.lower()[i], pre.upper()[i]);
+            if l >= 0.0 {
+                regimes[0] += 1;
+            } else if u <= 0.0 {
+                regimes[1] += 1;
+            } else {
+                regimes[2] += 1;
+            }
+            let r = relu_linear_relaxation(l, u);
+            let (dl, cl) = (r.lower_slope as f64, r.lower_intercept as f64);
+            let (du, cu) = (r.upper_slope as f64, r.upper_intercept as f64);
+            // conv1's upstream is the input identity, so its lower_a == upper_a
+            // == m1.matrix; the ReLU's own source selection is a no-op here.
+            for j in 0..in_dim {
+                post_l_a[i * in_dim + j] = dl * m1.matrix[i * in_dim + j];
+                post_u_a[i * in_dim + j] = du * m1.matrix[i * in_dim + j];
+            }
+            post_l_b[i] = dl * m1.bias[i] + cl;
+            post_u_b[i] = du * m1.bias[i] + cu;
+        }
+        assert!(
+            regimes.iter().all(|&c| c > 0),
+            "seed {seed}: fixture must mix stable-active/inactive/crossing ReLUs, got {regimes:?}"
+        );
+        // The rows entering the ConvTranspose MUST be split.
+        let split_rows = (0..mid_dim)
+            .filter(|&i| (0..in_dim).any(|j| post_l_a[i * in_dim + j] != post_u_a[i * in_dim + j]))
+            .count();
+        assert!(
+            split_rows > 0,
+            "seed {seed}: upstream map has lower_a == upper_a — the degenerate case"
+        );
+
+        // ConvTranspose: sign-split row selection, re-derived independently.
+        let wt = dense_conv_transpose_oracle(&convt, mid_c, in_h, in_w);
+        assert_eq!(wt.in_dim, mid_dim);
+        let out_dim = wt.out_dim;
+        let mut ct_l_a = vec![0.0f64; out_dim * in_dim];
+        let mut ct_u_a = vec![0.0f64; out_dim * in_dim];
+        let mut ct_l_b = vec![0.0f64; out_dim];
+        let mut ct_u_b = vec![0.0f64; out_dim];
+        for p in 0..out_dim {
+            let mut lb = wt.bias[p];
+            let mut ub = wt.bias[p];
+            for i in 0..mid_dim {
+                let w = wt.matrix[p * mid_dim + i];
+                if w == 0.0 {
+                    continue;
+                }
+                if w >= 0.0 {
+                    for j in 0..in_dim {
+                        ct_l_a[p * in_dim + j] += w * post_l_a[i * in_dim + j];
+                        ct_u_a[p * in_dim + j] += w * post_u_a[i * in_dim + j];
+                    }
+                    lb += w * post_l_b[i];
+                    ub += w * post_u_b[i];
+                } else {
+                    for j in 0..in_dim {
+                        ct_l_a[p * in_dim + j] += w * post_u_a[i * in_dim + j];
+                        ct_u_a[p * in_dim + j] += w * post_l_a[i * in_dim + j];
+                    }
+                    lb += w * post_u_b[i];
+                    ub += w * post_l_b[i];
+                }
+            }
+            ct_l_b[p] = lb;
+            ct_u_b[p] = ub;
+        }
+
+        // BatchNorm: per-channel diagonal, negative scale swaps the sides.
+        let spatial = out_dim / out_c;
+        let mut bn_l_a = vec![0.0f64; out_dim * in_dim];
+        let mut bn_u_a = vec![0.0f64; out_dim * in_dim];
+        let mut bn_l_b = vec![0.0f64; out_dim];
+        let mut bn_u_b = vec![0.0f64; out_dim];
+        for p in 0..out_dim {
+            let c = p / spatial;
+            let s = bn.scale[c] as f64;
+            let b = bn.bias[c] as f64;
+            let (src_l, src_lb, src_u, src_ub): (&[f64], f64, &[f64], f64) = if s >= 0.0 {
+                (&ct_l_a, ct_l_b[p], &ct_u_a, ct_u_b[p])
+            } else {
+                (&ct_u_a, ct_u_b[p], &ct_l_a, ct_l_b[p])
+            };
+            for j in 0..in_dim {
+                bn_l_a[p * in_dim + j] = s * src_l[p * in_dim + j];
+                bn_u_a[p * in_dim + j] = s * src_u[p * in_dim + j];
+            }
+            bn_l_b[p] = s * src_lb + b;
+            bn_u_b[p] = s * src_ub + b;
+        }
+
+        // Per-node divergence report: where (if anywhere) does ny's width
+        // first depart from the dense-f64 DeepPoly reference?
+        {
+            let flat = input.flatten();
+            let xlo: Vec<f64> = flat.lower().iter().map(|&v| v as f64).collect();
+            let xhi: Vec<f64> = flat.upper().iter().map(|&v| v as f64).collect();
+            let concretize = |la: &[f64], lb: &[f64], ua: &[f64], ub: &[f64], rows: usize| {
+                let mut w = 0.0f64;
+                for p in 0..rows {
+                    let (mut lo, mut hi) = (lb[p], ub[p]);
+                    for j in 0..in_dim {
+                        let (al, au) = (la[p * in_dim + j], ua[p * in_dim + j]);
+                        lo += if al >= 0.0 { al * xlo[j] } else { al * xhi[j] };
+                        hi += if au >= 0.0 { au * xhi[j] } else { au * xlo[j] };
+                    }
+                    w += hi - lo;
+                }
+                w
+            };
+            let ref_relu = concretize(&post_l_a, &post_l_b, &post_u_a, &post_u_b, mid_dim);
+            let ref_convt = concretize(&ct_l_a, &ct_l_b, &ct_u_a, &ct_u_b, out_dim);
+            for (node, refw) in [("relu", ref_relu), ("convt", ref_convt)] {
+                let nyw = tensor_width_sum(&forward[node]);
+                let ibpw = tensor_width_sum(&ibp[node]);
+                eprintln!(
+                    "[L3-B]   seed {seed} node {node}: ny={nyw:.6} deeppoly_ref={refw:.6} \
+                     ibp={ibpw:.6} ny/ref={:.6}",
+                    nyw / refw
+                );
+                assert!(
+                    nyw <= refw * 1.000_1,
+                    "seed {seed}: node '{node}' ny width {nyw} exceeds the DeepPoly \
+                     reference {refw} — correlation lost at this node"
+                );
+            }
+        }
+
+        // Concretize the oracle over the input box.
+        let flat = input.flatten();
+        let xlo: Vec<f64> = flat.lower().iter().map(|&v| v as f64).collect();
+        let xhi: Vec<f64> = flat.upper().iter().map(|&v| v as f64).collect();
+        let mut ref_lo = vec![0.0f64; out_dim];
+        let mut ref_hi = vec![0.0f64; out_dim];
+        for p in 0..out_dim {
+            let mut lo = bn_l_b[p];
+            let mut hi = bn_u_b[p];
+            for j in 0..in_dim {
+                let al = bn_l_a[p * in_dim + j];
+                let au = bn_u_a[p * in_dim + j];
+                lo += if al >= 0.0 { al * xlo[j] } else { al * xhi[j] };
+                hi += if au >= 0.0 { au * xhi[j] } else { au * xlo[j] };
+            }
+            ref_lo[p] = lo;
+            ref_hi[p] = hi;
+        }
+
+        // ---- compare ------------------------------------------------------
+        let claimed = forward["bn"].flatten();
+        assert_eq!(claimed.len(), out_dim);
+        let ref_width: f64 = (0..out_dim).map(|p| ref_hi[p] - ref_lo[p]).sum();
+        let ny_width = tensor_width_sum(&forward["bn"]);
+        let ibp_width = tensor_width_sum(&ibp["bn"]);
+        eprintln!(
+            "[L3-B] seed {seed}: regimes(active,inactive,crossing)={regimes:?} split_rows={split_rows}/{mid_dim} \
+             ny_width={ny_width:.6} deeppoly_ref_width={ref_width:.6} ibp_width={ibp_width:.6} \
+             ny/ref={:.6} ibp/ref={:.6}",
+            ny_width / ref_width,
+            ibp_width / ref_width
+        );
+
+        // TEETH: the oracle must be materially tighter than IBP, otherwise the
+        // tightness assertion below could not distinguish the two.
+        assert!(
+            ibp_width > ref_width * 1.5,
+            "seed {seed}: fixture is not discriminating — IBP width {ibp_width} is not \
+             materially above the DeepPoly reference {ref_width}"
+        );
+
+        let mut worst_slack = 0.0f64;
+        for p in 0..out_dim {
+            let (cl, cu) = (claimed.lower()[p] as f64, claimed.upper()[p] as f64);
+            let scale = 1.0 + ref_lo[p].abs().max(ref_hi[p].abs());
+            // ENCLOSURE: ny never cuts inside the oracle's DeepPoly box beyond
+            // what the (sound) IBP intersection can legitimately shave. The
+            // sampled containment below is the real soundness check.
+            // TIGHTNESS: ny may not be materially LOOSER than the oracle.
+            worst_slack = worst_slack.max((ref_lo[p] - cl) / scale);
+            worst_slack = worst_slack.max((cu - ref_hi[p]) / scale);
+        }
+        assert!(
+            worst_slack < 1e-4,
+            "seed {seed}: ny's ConvTranspose+BatchNorm output is {worst_slack} (relative) LOOSER \
+             than the independent dense-f64 DeepPoly oracle — input correlation is being lost in \
+             the composition"
+        );
+        assert!(
+            ny_width <= ref_width * 1.000_1,
+            "seed {seed}: ny total width {ny_width} exceeds the DeepPoly reference {ref_width}"
+        );
+
+        // SOUNDNESS: brute-force containment at every node.
+        assert_mc_containment(&graph, &input, 48, 0x5D3A_1000 + seed);
+    }
 }

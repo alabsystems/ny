@@ -4,7 +4,9 @@
 
 use ndarray::IxDyn;
 use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    next_down_f32, next_up_f32, sub_down_f32, sub_up_f32, BoundedTensor, RepairStrategy,
+};
 
 use crate::shape::broadcast_shapes;
 use crate::LinearBounds;
@@ -19,6 +21,12 @@ pub struct SubLayer;
 
 impl SubLayer {
     /// Propagate IBP bounds through element-wise subtraction.
+    ///
+    /// Both endpoint subtractions are DIRECTED (`sub_down_f32` / `sub_up_f32`)
+    /// for the same reason as [`super::add::AddLayer::propagate_ibp_binary`]:
+    /// a plain f32 `-` is round-to-nearest and can move an endpoint INWARD by
+    /// up to half an ULP, producing an interval that excludes the true
+    /// difference. The directed forms are exact whenever the subtraction is.
     ///
     /// For C = A - B where A ∈ [A_l, A_u] and B ∈ [B_l, B_u]:
     /// - C_lower = A_l - B_u (minimize A, maximize B)
@@ -75,14 +83,22 @@ impl SubLayer {
                     got: input_b.shape().to_vec(),
                 })?;
 
-            let out_lower = &a_lower - &b_upper;
-            let out_upper = &a_upper - &b_lower;
+            let out_lower = ndarray::Zip::from(&a_lower)
+                .and(&b_upper)
+                .map_collect(|&x, &y| sub_down_f32(x, y));
+            let out_upper = ndarray::Zip::from(&a_upper)
+                .and(&b_lower)
+                .map_collect(|&x, &y| sub_up_f32(x, y));
             // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #2742).
             return BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative);
         };
 
-        let out_lower = (&a_lower - &b_upper).into_owned();
-        let out_upper = (&a_upper - &b_lower).into_owned();
+        let out_lower = ndarray::Zip::from(&a_lower)
+            .and(&b_upper)
+            .map_collect(|&x, &y| sub_down_f32(x, y));
+        let out_upper = ndarray::Zip::from(&a_upper)
+            .and(&b_lower)
+            .map_collect(|&x, &y| sub_up_f32(x, y));
         // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #2742).
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
@@ -113,11 +129,26 @@ impl SubLayer {
             upper_b_half.clone(),
         )?;
 
-        // Bounds for B are negated (and swapped for lower/upper)
+        // Bounds for B are NEGATED, with NO lower/upper swap.
+        //
+        // CROWN composes by substitution, so each relation keeps its own
+        // coefficients: from `obj >= lower_a·C + lower_b` and `C = A - B`,
+        //   obj >= lower_a·A + (-lower_a)·B + lower_b,
+        // so B's LOWER coefficient is `-lower_a` — not `-upper_a`. The same for
+        // the upper relation with `upper_a`. `sub_constant.rs:82` states this
+        // rule explicitly ("negates A'; no lower/upper swap").
+        //
+        // Swapping is the rule for negating a bounded QUANTITY
+        // (`l <= x <= u` gives `-u <= -x <= -l`), not for negating the
+        // coefficients of a linear relation, and it is not conservative: with a
+        // downstream relaxation making `lower_a != upper_a`, the swapped form
+        // produced a FALSE bound whenever B could be negative. Reproduced on
+        // `relu(u - v)` with `u = x`, `v = -x`, `x in [-1, 3]`: CROWN returned
+        // an upper bound of 4.256 while `relu(2·2.2) = 4.4` is reachable.
         let bounds_b = LinearBounds::new_or_conservative(
-            -bounds.upper_a(), // negate and swap
-            lower_b_half,
             -bounds.lower_a(),
+            lower_b_half,
+            -bounds.upper_a(),
             upper_b_half,
         )?;
 
@@ -235,14 +266,17 @@ mod tests {
         // Bounds for A: coefficients unchanged
         assert!((ba.lower_a[[0, 0]] - 1.0).abs() < 1e-5);
         assert!((ba.upper_a[[0, 0]] - 1.0).abs() < 1e-5);
-        // Bounds for B: negated and swapped (lower_a_b = -upper_a, upper_a_b = -lower_a)
+        // Bounds for B: negated, NOT swapped (lower_a_b = -lower_a, upper_a_b = -upper_a)
         assert!((bb.lower_a[[0, 0]] - (-1.0)).abs() < 1e-5);
         assert!((bb.upper_a[[0, 0]] - (-1.0)).abs() < 1e-5);
     }
 
     #[test]
-    fn test_crown_negation_and_swap() {
-        // Non-identity W to check negation + swap
+    fn test_crown_negation_no_swap() {
+        // Non-identity W to check negation WITHOUT a lower/upper swap: CROWN
+        // composes `C = A - B` by substitution, so each relation keeps its own
+        // coefficients negated (swapping produced a false bound, see
+        // `propagate_linear_binary`).
         let layer = SubLayer;
         let w = Array2::from_shape_vec((2, 2), vec![2.0, -1.0, 0.0, 3.0]).unwrap();
         let bounds = LinearBounds::new(
@@ -253,14 +287,14 @@ mod tests {
         )
         .unwrap();
         let (_ba, bb) = layer.propagate_linear_binary(&bounds).unwrap();
-        // bb.lower_a = -bounds.upper_a = [[-4, 0], [-1, -5]]
-        assert!((bb.lower_a[[0, 0]] - (-4.0)).abs() < 1e-5);
-        assert!((bb.lower_a[[0, 1]] - 0.0).abs() < 1e-5);
-        assert!((bb.lower_a[[1, 0]] - (-1.0)).abs() < 1e-5);
-        assert!((bb.lower_a[[1, 1]] - (-5.0)).abs() < 1e-5);
-        // bb.upper_a = -bounds.lower_a = [[-2, 1], [0, -3]]
-        assert!((bb.upper_a[[0, 0]] - (-2.0)).abs() < 1e-5);
-        assert!((bb.upper_a[[0, 1]] - 1.0).abs() < 1e-5);
+        // bb.lower_a = -bounds.lower_a = [[-2, 1], [0, -3]]
+        assert!((bb.lower_a[[0, 0]] - (-2.0)).abs() < 1e-5);
+        assert!((bb.lower_a[[0, 1]] - 1.0).abs() < 1e-5);
+        assert!((bb.lower_a[[1, 0]] - 0.0).abs() < 1e-5);
+        assert!((bb.lower_a[[1, 1]] - (-3.0)).abs() < 1e-5);
+        // bb.upper_a = -bounds.upper_a = [[-4, 0], [-1, -5]]
+        assert!((bb.upper_a[[0, 0]] - (-4.0)).abs() < 1e-5);
+        assert!((bb.upper_a[[0, 1]] - 0.0).abs() < 1e-5);
     }
 
     #[test]

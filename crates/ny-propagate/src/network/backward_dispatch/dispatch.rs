@@ -14,8 +14,8 @@ use crate::bounds::LinearBounds;
 use crate::layers::{BoundPropagation, Layer};
 
 use super::helpers::{
-    dispatch_conv_engine_aware, dispatch_propagate_linear, preserve_structured_error,
-    resolve_input_bounds,
+    dispatch_conv_engine_aware, dispatch_propagate_linear, own_propagated_linear_with_deadline,
+    preserve_structured_error, resolve_input_bounds,
 };
 use super::types::{BackwardDispatchResult, DispatchContext};
 
@@ -56,6 +56,72 @@ fn attn_crown_ternary_enabled() -> bool {
 /// handler); the caller decides whether to fall back to IBP or propagate
 /// the error.
 pub(crate) fn dispatch_backward_layer(
+    ctx: &DispatchContext<'_>,
+    node_lb: &LinearBounds,
+) -> Result<BackwardDispatchResult> {
+    check_dispatch_deadline(ctx, "before")?;
+    let result = dispatch_backward_layer_legacy(ctx, node_lb)?;
+    // Ordinary Dense callers historically dispatched every supported layer.
+    // Keep that contract when they carry a verifier deadline: cooperative
+    // Linear/Conv kernels receive the authority through `ctx`, while the entry
+    // and publication checks bracket legacy indivisible operators.
+    check_dispatch_deadline(ctx, "after")?;
+    Ok(result)
+}
+
+/// Dispatch a Dense carrier produced by a finite structured Patches boundary.
+///
+/// Unlike [`dispatch_backward_layer`], a live deadline here is proof authority
+/// for the entire structured transaction.  Legacy Dense operators that do not
+/// poll every allocation and scan therefore decline before work, allowing the
+/// caller to publish its sound forward/reference fallback atomically.  Callers
+/// must opt into this stricter contract based on carrier provenance; the mere
+/// presence of a verifier deadline is not sufficient.
+pub(crate) fn dispatch_backward_layer_finite_boundary(
+    ctx: &DispatchContext<'_>,
+    node_lb: &LinearBounds,
+) -> Result<BackwardDispatchResult> {
+    check_dispatch_deadline(ctx, "before finite structured boundary")?;
+    // Under the expiry-authority arm this must ask the same question the
+    // patches family asks: has the deadline EXPIRED, not merely does one exist.
+    // Otherwise the two halves disagree — patches stays alive, but any carrier
+    // that does densify still hits a dispatcher that declines every family
+    // except SkipMerge/ReLU/Where/Div, and lands on reference bounds anyway.
+    let strict_boundary =
+        if crate::network::core::sequential::crown::patches_step::expiry_authority_armed() {
+            ctx.deadline
+                .is_some_and(|limit| std::time::Instant::now() >= limit)
+        } else {
+            ctx.deadline.is_some()
+        };
+    let result = if strict_boundary {
+        dispatch_backward_layer_finite_boundary_inner(ctx, node_lb)?
+    } else {
+        dispatch_backward_layer_legacy(ctx, node_lb)?
+    };
+    check_dispatch_deadline(ctx, "after finite structured boundary")?;
+    Ok(result)
+}
+
+#[inline]
+fn check_dispatch_deadline(ctx: &DispatchContext<'_>, phase: &str) -> Result<()> {
+    if ctx
+        .deadline
+        .is_some_and(|limit| std::time::Instant::now() >= limit)
+    {
+        Err(NyError::DeadlineExceeded(format!(
+            "backward dispatch deadline expired {phase} node '{}' ({})",
+            ctx.node_name,
+            ctx.layer.layer_type()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Historical Dense-dispatch policy, shared by ordinary finite calls and every
+/// no-deadline call.
+fn dispatch_backward_layer_legacy(
     ctx: &DispatchContext<'_>,
     node_lb: &LinearBounds,
 ) -> Result<BackwardDispatchResult> {
@@ -141,6 +207,47 @@ pub(crate) fn dispatch_backward_layer(
         node_lb
     };
     dispatch_backward_layer_inner(ctx, node_lb)
+}
+
+/// Narrow finite-deadline dispatch authority for a structured boundary.
+///
+/// Every eager discharge, exact-linear carrier duplication, and legacy
+/// operator path can clone, allocate, or scan the full carrier without a
+/// complete cooperative receipt. Those routes decline before doing that work;
+/// only allocation-free control outcomes are admitted here.
+fn dispatch_backward_layer_finite_boundary_inner(
+    ctx: &DispatchContext<'_>,
+    node_lb: &LinearBounds,
+) -> Result<BackwardDispatchResult> {
+    // These outcomes never inspect or transform the incoming carrier, so
+    // certified-error metadata cannot force the legacy duplication/discharge
+    // wrapper.  Keep pass-through and fixed unsupported decisions copy-free.
+    if matches!(
+        ctx.layer,
+        Layer::SkipMerge(_) | Layer::ReLU(_) | Layer::Where(_) | Layer::Div(_)
+    ) {
+        return dispatch_backward_layer_inner(ctx, node_lb);
+    }
+
+    if node_lb.has_coeff_err() && !ctx.layer.propagates_coeff_err() {
+        return Ok(BackwardDispatchResult::Unsupported(format!(
+            "{} CROWN backward at node '{}' declines finite-deadline certified-error discharge",
+            ctx.layer.layer_type(),
+            ctx.node_name
+        )));
+    }
+
+    // The current dense Linear/Conv kernels poll their dominant contraction,
+    // but still allocate/scan surrounding buffers (and scan weights) without a
+    // cooperative receipt. They therefore remain typed-closed under finite
+    // authority along with every other legacy O(N) arm. Callers take their
+    // established sound IBP/reference-bound fallback; no-deadline dispatch is
+    // byte-for-byte unchanged.
+    Ok(BackwardDispatchResult::Unsupported(format!(
+        "{} CROWN backward at node '{}' has no fully cooperative finite-deadline dispatch route",
+        ctx.layer.layer_type(),
+        ctx.node_name
+    )))
 }
 
 /// Carry the certified coefficient error through an EXACT-linear graph op
@@ -324,8 +431,13 @@ fn dispatch_backward_layer_inner(
         Layer::Linear(l) => {
             let new_lb = l
                 .propagate_linear_with_engine_and_deadline(node_lb, ctx.engine, ctx.deadline)
-                .map_err(|e| preserve_structured_error(e, ctx.node_name, "Linear"))?
-                .into_owned();
+                .map_err(|e| preserve_structured_error(e, ctx.node_name, "Linear"))?;
+            let new_lb = own_propagated_linear_with_deadline(
+                new_lb,
+                ctx.deadline,
+                ctx.node_name,
+                "Linear",
+            )?;
             Ok(BackwardDispatchResult::Single(Box::new(new_lb)))
         }
         // === Transpose/Tile/Slice: need input_shape before dispatch (#3105) ===
@@ -357,9 +469,9 @@ fn dispatch_backward_layer_inner(
             node_lb,
             "Conv1d",
             2,
-            |conv, shape, lb, engine, _deadline| {
+            |conv, shape, lb, engine, deadline| {
                 conv.set_input_length(shape[shape.len() - 1]);
-                conv.propagate_linear_with_engine(lb, engine)
+                conv.propagate_linear_with_engine_and_deadline(lb, engine, deadline)
             },
         ),
         Layer::ConvTranspose1d(c) => dispatch_conv_engine_aware(
@@ -368,9 +480,9 @@ fn dispatch_backward_layer_inner(
             node_lb,
             "ConvTranspose1d",
             2,
-            |conv, shape, lb, engine, _deadline| {
+            |conv, shape, lb, engine, deadline| {
                 conv.set_input_length(shape[shape.len() - 1]);
-                conv.propagate_linear_with_engine(lb, engine)
+                conv.propagate_linear_with_engine_and_deadline(lb, engine, deadline)
             },
         ),
         // === Conv2d: use dispatch_conv_engine_aware for preserve_structured_error (#3720) ===
@@ -890,7 +1002,7 @@ fn dispatch_backward_layer_inner(
         // variant without a dispatch arm here is a compile error.
         //
         // Elementwise activations:
-        Layer::GELU(_) | Layer::SiLU(_) | Layer::Tanh(_) | Layer::Sigmoid(_)
+        Layer::GELU(_) | Layer::SiLU(_) | Layer::Tanh(_) | Layer::Sigmoid(_) | Layer::Erf(_)
         | Layer::Exp(_) | Layer::Log(_) | Layer::Sqrt(_) | Layer::Reciprocal(_)
         | Layer::Softplus(_) | Layer::HardSwish(_) | Layer::Mish(_) | Layer::Selu(_)
         | Layer::Softsign(_) | Layer::Arctan(_) | Layer::Tan(_) | Layer::Sin(_)

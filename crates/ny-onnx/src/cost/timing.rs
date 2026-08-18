@@ -271,14 +271,18 @@ fn ceil_time_ns(
 /// for broader compatibility).
 fn next_up_f64(x: f64) -> f64 {
     // next_up is stable since 1.86. Use bit manipulation for portability.
-    if x.is_nan() || x == f64::INFINITY {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > f64::INFINITY.to_bits() || bits == f64::INFINITY.to_bits() {
         return x;
     }
-    if x == f64::NEG_INFINITY {
+    if bits == f64::NEG_INFINITY.to_bits() {
         return f64::MIN;
     }
-    let bits = x.to_bits();
-    let next_bits = if x >= 0.0 || x == 0.0 {
+    if magnitude == 0 {
+        return f64::from_bits(1);
+    }
+    let next_bits = if bits & 0x8000_0000_0000_0000 == 0 {
         bits + 1
     } else {
         bits - 1

@@ -14,7 +14,7 @@ use crate::model::WeightStore;
 use crate::LayerSpec;
 use ndarray::arr1;
 use ny_core::LayerType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn make_layer_norm_spec(input_name: &str, ny_name: &str, beta_name: &str) -> LayerSpec {
     LayerSpec {
@@ -236,6 +236,7 @@ fn test_full_pipeline_3d_channel_ny_produces_instance_norm_3591() {
         &producer_by_output,
         &consumers_by_input,
         &weights,
+        &HashSet::new(),
     )
     .expect("try_fuse_layer_norm should match the decomposed normalization pattern");
     assert_eq!(
@@ -300,6 +301,7 @@ fn test_full_pipeline_3d_last_dim_ny_stays_layer_norm_3591() {
         &producer_by_output,
         &consumers_by_input,
         &weights,
+        &HashSet::new(),
     )
     .expect("try_fuse_layer_norm should match the Pow+Div normalization pattern");
 

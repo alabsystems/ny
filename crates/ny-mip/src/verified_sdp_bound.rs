@@ -62,7 +62,7 @@
 //! `f64::next_up`): each directed op steps a full ULP past the round-to-nearest
 //! result, which strictly encloses the exact real result. This is sound only
 //! with IEEE-754 binary64 gradual underflow (FTZ/DAZ disabled), which is
-//! asserted by [`require_gradual_underflow`] before any bound is trusted; if it
+//! asserted by `require_gradual_underflow` before any bound is trusted; if it
 //! does not hold the routine fails closed to `f64::NEG_INFINITY` (a trivially
 //! valid lower bound). Any non-finite intermediate likewise fails closed.
 
@@ -289,7 +289,7 @@ fn gershgorin_lambda_min_lb(d_lo: &Array2<f64>, d_hi: &Array2<f64>, n: usize) ->
 fn cholesky_try_shift(d_lo: &Array2<f64>, d_hi: &Array2<f64>, n: usize, s: f64) -> Option<f64> {
     // Float center matrix used ONLY to propose L (correctness is a-posteriori).
     let center = faer::Mat::<f64>::from_fn(n, n, |i, j| {
-        let mid = 0.5 * (d_lo[[i, j]] + d_hi[[i, j]]);
+        let mid = f64::midpoint(d_lo[[i, j]], d_hi[[i, j]]);
         if i == j {
             mid + s
         } else {

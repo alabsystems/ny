@@ -5,10 +5,11 @@
 //! Tests for backward CROWN dispatch.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 
-use super::dispatch::dispatch_backward_layer;
+use super::dispatch::{dispatch_backward_layer, dispatch_backward_layer_finite_boundary};
 use super::helpers::resolve_input_bounds;
 use super::types::{BackwardDispatchResult, DispatchContext};
 use crate::bounds::LinearBounds;
@@ -120,6 +121,22 @@ fn dispatch_linear_returns_single() {
     );
 }
 
+#[test]
+fn strict_finite_boundary_linear_typed_closes_before_partial_cooperative_route() {
+    let weight = Array2::eye(3);
+    let bias = Array1::zeros(3);
+    let layer = Layer::Linear(LinearLayer::new(weight, Some(bias)).unwrap());
+    let bounds = simple_bounds(3);
+    let node_bounds = HashMap::new();
+    let inputs = vec!["_input".to_string()];
+    let mut ctx = make_ctx(&layer, &bounds, &bounds, &node_bounds, &inputs);
+    ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
+    let lb = identity_lb(3);
+
+    let result = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
+    assert!(matches!(result, BackwardDispatchResult::Unsupported(_)));
+}
+
 // ===================================================================
 // Add layer dispatch
 // ===================================================================
@@ -138,6 +155,147 @@ fn dispatch_add_returns_binary() {
         matches!(result, BackwardDispatchResult::Binary { .. }),
         "Add dispatch should return Binary, got {result:?}"
     );
+}
+
+#[test]
+fn expired_strict_finite_boundary_declines_before_split_and_leaves_source_atomic() {
+    let layer = Layer::Add(AddLayer);
+    let bounds = simple_bounds(2);
+    let node_bounds = HashMap::new();
+    let inputs = vec!["a".to_string(), "b".to_string()];
+    let mut ctx = make_ctx(&layer, &bounds, &bounds, &node_bounds, &inputs);
+    ctx.deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond fits before now"),
+    );
+    let lb = LinearBounds {
+        lower_a: Array2::eye(2),
+        lower_b: Array1::from_vec(vec![1.0, 2.0]),
+        upper_a: Array2::eye(2),
+        upper_b: Array1::from_vec(vec![3.0, 4.0]),
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+    let before = lb.clone();
+
+    let error = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap_err();
+    assert!(matches!(error, ny_core::NyError::DeadlineExceeded(_)));
+    assert_eq!(lb.lower_a(), before.lower_a());
+    assert_eq!(lb.upper_a(), before.upper_a());
+    assert_eq!(lb.lower_b(), before.lower_b());
+    assert_eq!(lb.upper_b(), before.upper_b());
+}
+
+#[test]
+fn ordinary_finite_dense_add_preserves_historical_split() {
+    let layer = Layer::Add(AddLayer);
+    let bounds = simple_bounds(2);
+    let node_bounds = HashMap::new();
+    let inputs = vec!["a".to_string(), "b".to_string()];
+    let mut ctx = make_ctx(&layer, &bounds, &bounds, &node_bounds, &inputs);
+    ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
+    let lb = LinearBounds {
+        lower_a: Array2::eye(2),
+        lower_b: Array1::from_vec(vec![1.0, 2.0]),
+        upper_a: Array2::eye(2),
+        upper_b: Array1::from_vec(vec![3.0, 4.0]),
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+    let before = lb.clone();
+
+    let result = dispatch_backward_layer(&ctx, &lb).unwrap();
+    match result {
+        BackwardDispatchResult::Binary {
+            bounds_a,
+            bounds_b,
+            bias_lower,
+            bias_upper,
+        } => {
+            assert_eq!(bounds_a.lower_a(), &Array2::<f32>::eye(2));
+            assert_eq!(bounds_a.upper_a(), &Array2::<f32>::eye(2));
+            assert_eq!(bounds_b.lower_a(), &Array2::<f32>::eye(2));
+            assert_eq!(bounds_b.upper_a(), &Array2::<f32>::eye(2));
+            assert_eq!(bias_lower, Array1::from_vec(vec![1.0, 2.0]));
+            assert_eq!(bias_upper, Array1::from_vec(vec![3.0, 4.0]));
+        }
+        other => panic!("ordinary finite Dense Add should split, got {other:?}"),
+    }
+    assert_eq!(lb.lower_a(), before.lower_a());
+    assert_eq!(lb.upper_a(), before.upper_a());
+    assert_eq!(lb.lower_b(), before.lower_b());
+    assert_eq!(lb.upper_b(), before.upper_b());
+}
+
+#[test]
+fn live_strict_finite_boundary_typed_closes_unpollable_split_atomically() {
+    let layer = Layer::Add(AddLayer);
+    let bounds = simple_bounds(2);
+    let node_bounds = HashMap::new();
+    let inputs = vec!["a".to_string(), "b".to_string()];
+    let mut ctx = make_ctx(&layer, &bounds, &bounds, &node_bounds, &inputs);
+    ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
+    let lb = LinearBounds {
+        lower_a: Array2::eye(2),
+        lower_b: Array1::from_vec(vec![1.0, 2.0]),
+        upper_a: Array2::eye(2),
+        upper_b: Array1::from_vec(vec![3.0, 4.0]),
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+    let before = lb.clone();
+
+    let result = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
+    assert!(matches!(result, BackwardDispatchResult::Unsupported(_)));
+    assert_eq!(lb.lower_a(), before.lower_a());
+    assert_eq!(lb.upper_a(), before.upper_a());
+    assert_eq!(lb.lower_b(), before.lower_b());
+    assert_eq!(lb.upper_b(), before.upper_b());
+}
+
+#[test]
+fn live_strict_finite_boundary_declines_coeff_err_duplication_before_work() {
+    let layer = Layer::Add(AddLayer);
+    let bounds = simple_bounds(2);
+    let node_bounds = HashMap::new();
+    let inputs = vec!["a".to_string(), "b".to_string()];
+    let mut ctx = make_ctx(&layer, &bounds, &bounds, &node_bounds, &inputs);
+    ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
+    let mut lb = identity_lb(2);
+    lb.lower_a_err = Some(Array2::from_elem((2, 2), 0.25));
+    lb.upper_a_err = Some(Array2::from_elem((2, 2), 0.5));
+    let before = lb.clone();
+
+    let result = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
+    match result {
+        BackwardDispatchResult::Unsupported(message) => {
+            assert!(message.contains("certified-error discharge"));
+        }
+        other => panic!("expected typed finite refusal, got {other:?}"),
+    }
+    assert_eq!(lb.lower_a_err, before.lower_a_err);
+    assert_eq!(lb.upper_a_err, before.upper_a_err);
+    assert_eq!(lb.lower_b(), before.lower_b());
+    assert_eq!(lb.upper_b(), before.upper_b());
+}
+
+#[test]
+fn live_strict_finite_boundary_skip_merge_with_coeff_err_is_copy_free_pass_through() {
+    let layer = Layer::SkipMerge(SkipMergeLayer);
+    let bounds = simple_bounds(2);
+    let node_bounds = HashMap::new();
+    let inputs = vec!["a".to_string()];
+    let mut ctx = make_ctx(&layer, &bounds, &bounds, &node_bounds, &inputs);
+    ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
+    let mut lb = identity_lb(2);
+    lb.lower_a_err = Some(Array2::from_elem((2, 2), 0.25));
+    lb.upper_a_err = Some(Array2::from_elem((2, 2), 0.5));
+
+    assert!(matches!(
+        dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap(),
+        BackwardDispatchResult::PassThrough
+    ));
 }
 
 #[test]
@@ -765,6 +923,41 @@ fn dispatch_conv2d_2d_input_returns_error() {
         err_msg.contains("Conv2d") && err_msg.contains(">= 3D"),
         "Expected Conv2d dimension error, got: {err_msg}"
     );
+}
+
+#[test]
+fn ordinary_finite_dense_conv2d_matches_no_deadline_dispatch() {
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![1.25_f32]).unwrap();
+    let bias = Array1::from_vec(vec![0.2_f32]);
+    let layer =
+        Layer::Conv2d(Conv2dLayer::new(kernel, Some(bias), (1, 1), (0, 0)).expect("valid Conv2d"));
+    let pre_act = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), -1.0_f32),
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), 1.0_f32),
+    )
+    .unwrap();
+    let node_bounds = HashMap::new();
+    let inputs = vec!["_input".to_string()];
+    let node_lb = identity_lb(4);
+
+    let baseline_ctx = make_ctx(&layer, &pre_act, &pre_act, &node_bounds, &inputs);
+    let baseline = match dispatch_backward_layer(&baseline_ctx, &node_lb).unwrap() {
+        BackwardDispatchResult::Single(bounds) => *bounds,
+        other => panic!("no-deadline Conv2d should return Single, got {other:?}"),
+    };
+    let mut finite_ctx = make_ctx(&layer, &pre_act, &pre_act, &node_bounds, &inputs);
+    finite_ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
+    let finite = match dispatch_backward_layer(&finite_ctx, &node_lb).unwrap() {
+        BackwardDispatchResult::Single(bounds) => *bounds,
+        other => panic!("ordinary finite Dense Conv2d should return Single, got {other:?}"),
+    };
+
+    assert_eq!(finite.lower_a, baseline.lower_a);
+    assert_eq!(finite.lower_b, baseline.lower_b);
+    assert_eq!(finite.upper_a, baseline.upper_a);
+    assert_eq!(finite.upper_b, baseline.upper_b);
+    assert_eq!(finite.lower_a_err, baseline.lower_a_err);
+    assert_eq!(finite.upper_a_err, baseline.upper_a_err);
 }
 
 #[test]

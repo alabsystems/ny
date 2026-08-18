@@ -2,7 +2,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-mod affine_extent;
 mod broadcast;
 pub(super) mod common;
 mod ops;
@@ -63,22 +62,13 @@ pub(super) fn fold_constant_nodes(
     inferred_shapes: &mut HashMap<String, Vec<i64>>,
 ) {
     let model_unbatched = graph_model_is_unbatched(graph, weights);
-    loop {
-        fold_constant_nodes_once(graph, weights, inferred_shapes, model_unbatched);
-        // Affine-extent slice shapes (#cctsdb B2): variable-start slices whose
-        // extent (ends - starts) is provably constant get static output shapes
-        // recorded into `inferred_shapes`; re-run folding so Shape-of-slice
-        // chains (and the shape clusters they feed) cascade. Terminates: each
-        // augmentation round records at least one NEW shape entry, bounded by
-        // the node count.
-        if !affine_extent::augment_inferred_shapes_with_affine_slice_extents(
-            graph,
-            weights,
-            inferred_shapes,
-        ) {
-            break;
-        }
-    }
+    // Variable-start affine Slice extents are intentionally not promoted to
+    // static shapes here. ONNX clamps starts/ends to the data dimension, so
+    // `ends = starts + width` does not imply a constant runtime extent near an
+    // edge. Any future specialized optimization must authenticate the complete
+    // consumer cone (or carry a dynamic/clamped shape), not publish the
+    // unclamped maximum as global Shape authority.
+    fold_constant_nodes_once(graph, weights, inferred_shapes, model_unbatched);
 }
 
 fn fold_constant_nodes_once(
@@ -121,6 +111,9 @@ fn try_fold_node(
     weights: &WeightStore,
     model_unbatched: bool,
 ) -> Option<(String, FoldedTensor)> {
+    if !is_standard_onnx_domain(&node.domain) {
+        return None;
+    }
     let output_name = try_get_output_name(node, weights)?;
     let output_tensor = if node.op_type == "Shape" {
         ops::try_fold_shape_node(node, graph, lookups, weights)
@@ -130,6 +123,10 @@ fn try_fold_node(
         None
     }?;
     Some((output_name, output_tensor))
+}
+
+pub(super) fn is_standard_onnx_domain(domain: &str) -> bool {
+    domain.is_empty() || domain == "ai.onnx"
 }
 
 fn try_get_output_name(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Option<String> {
@@ -142,6 +139,13 @@ fn try_get_output_name(node: &onnx_proto::NodeProto, weights: &WeightStore) -> O
         return None;
     }
     let output_name = node.output.first()?.clone();
+    if output_name.is_empty() {
+        debug!(
+            "Skipping constant fold for {} with an empty output name",
+            node.op_type
+        );
+        return None;
+    }
     (!weights.contains_key(&output_name)).then_some(output_name)
 }
 
@@ -150,6 +154,489 @@ fn all_inputs_constant(node: &onnx_proto::NodeProto, weights: &WeightStore) -> b
         .iter()
         .filter(|input| !input.is_empty())
         .all(|input| weights.contains_key(input))
+}
+
+/// Whether an INT64 Cast has been eliminated into an exact constant value.
+///
+/// This is the only non-FLOAT Cast graph conversion may omit.  Requiring the
+/// exact i64 payload proves the Cast ran on a constant path.  Values without
+/// authenticated INT64 provenance additionally require a bit-identical,
+/// exactly representable f32 mirror.  Authenticated shape arithmetic may
+/// exceed f32's consecutive-integer range; its exact i64 view remains
+/// authoritative because the complete use cone is separately restricted to
+/// structural shape construction.
+pub(super) fn is_exact_materialized_int64_cast(
+    node: &onnx_proto::NodeProto,
+    weights: &WeightStore,
+) -> bool {
+    if node.op_type != "Cast"
+        || !matches!(node.domain.as_str(), "" | "ai.onnx")
+        || node.input.len() != 1
+        || node.input[0].is_empty()
+        || node.output.len() != 1
+        || node.output[0].is_empty()
+        || node.attribute.len() != 1
+    {
+        return false;
+    }
+
+    let mut targets = node
+        .attribute
+        .iter()
+        .filter(|attribute| attribute.name == "to");
+    let Some(target) = targets.next() else {
+        return false;
+    };
+    if target.r#type != onnx_proto::attribute_type::INT
+        || target.i_value() != 7
+        || targets.next().is_some()
+    {
+        return false;
+    }
+
+    let Some(input_integers) = exact_integer_weight_view(weights, &node.input[0]) else {
+        return false;
+    };
+    let Some(output_integers) = exact_integer_weight_view(weights, &node.output[0]) else {
+        return false;
+    };
+    input_integers.shape() == output_integers.shape()
+        && input_integers
+            .iter()
+            .zip(output_integers.iter())
+            .all(|(input, output)| input == output)
+}
+
+pub(super) fn integer_is_exactly_representable_as_f32(value: i64) -> bool {
+    let magnitude = value.unsigned_abs();
+    if magnitude == 0 {
+        return true;
+    }
+    let significant_bits = u64::BITS - magnitude.leading_zeros();
+    significant_bits <= f32::MANTISSA_DIGITS
+        || magnitude.trailing_zeros() >= significant_bits - f32::MANTISSA_DIGITS
+}
+
+fn exact_integer_weight_view<'a>(weights: &'a WeightStore, name: &str) -> Option<&'a ArrayD<i64>> {
+    let integers = weights.get_integers(name)?;
+    let floats = weights.get(name)?;
+    if integers.shape() != floats.shape() {
+        return None;
+    }
+    let authenticated_int64 = weights.get_integer_range(name) == Some((i64::MIN, i64::MAX));
+    integers
+        .iter()
+        .zip(floats.iter())
+        .all(|(&integer, &float)| {
+            ny_core::reshape_copy_axis_from_sentinel(integer).is_none()
+                && (authenticated_int64
+                    || (integer_is_exactly_representable_as_f32(integer)
+                        && (integer as f32 as i64) == integer
+                        && (integer as f32).to_bits() == float.to_bits()))
+        })
+        .then_some(integers)
+}
+
+/// Prove that a materialized INT64 Cast really carries the authored INT64
+/// value: both its operand and its result are exactly materialized (i64 payload
+/// and bit-identical f32 mirror, no private reshape sentinel), and both are
+/// reachable through the raw-protobuf INT64 provenance recursion.
+///
+/// This is the BACKWARD half of `int64_cast_has_static_reshape_shape_use` — it
+/// says the constant is trustworthy, and says nothing about where it is used.
+/// Dropping the node requires the forward half too; LOWERING it to
+/// `LayerType::Trunc` (`loader::convert`) does not, because the node still
+/// exists and its constant pre-evaluation reproduces exactly this value. That
+/// is what admits cctsdb_yolo_2023's `Cast -> Range` limits, whose use cone is
+/// not the cGAN `Reshape`-input-1 cone.
+pub(super) fn int64_cast_has_raw_int64_provenance(
+    cast: &onnx_proto::NodeProto,
+    weights: &WeightStore,
+    raw_int64_shape_values: &std::collections::HashSet<String>,
+) -> bool {
+    is_exact_materialized_int64_cast(cast, weights)
+        && raw_int64_shape_values.contains(&cast.input[0])
+        && raw_int64_shape_values.contains(&cast.output[0])
+}
+
+/// Prove that the whole use cone of a materialized INT64 Cast is static shape
+/// construction and terminates only at the shape input of Reshape.
+///
+/// This predicate is used authoritatively after constant folding and before
+/// proto fusions, then repeated during conversion as defense in depth.
+pub(super) fn int64_cast_has_static_reshape_shape_use(
+    nodes: &[onnx_proto::NodeProto],
+    cast_index: usize,
+    weights: &WeightStore,
+    graph_output_names: &std::collections::HashSet<String>,
+    raw_int64_shape_values: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(cast) = nodes.get(cast_index) else {
+        return false;
+    };
+    if !int64_cast_has_raw_int64_provenance(cast, weights, raw_int64_shape_values) {
+        return false;
+    }
+
+    let mut consumers_by_input: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        for input in node.input.iter().filter(|input| !input.is_empty()) {
+            consumers_by_input
+                .entry(input.as_str())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut pending: Vec<&str> = cast.output.iter().map(String::as_str).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut reached_reshape_shape = false;
+
+    while let Some(value) = pending.pop() {
+        if value.is_empty()
+            || graph_output_names.contains(value)
+            || !raw_int64_shape_values.contains(value)
+            || !seen.insert(value)
+        {
+            return false;
+        }
+        let Some(consumers) = consumers_by_input.get(value) else {
+            return false;
+        };
+        if consumers.is_empty() {
+            return false;
+        }
+
+        for &consumer_index in consumers {
+            let Some(consumer) = nodes.get(consumer_index) else {
+                return false;
+            };
+            let positions: Vec<usize> = consumer
+                .input
+                .iter()
+                .enumerate()
+                .filter_map(|(position, input)| (input == value).then_some(position))
+                .collect();
+            if positions.is_empty() {
+                return false;
+            }
+
+            if consumer.op_type == "Reshape" {
+                if matches!(consumer.domain.as_str(), "" | "ai.onnx")
+                    && consumer.input.len() == 2
+                    && !consumer.input[0].is_empty()
+                    && positions == [1]
+                    && consumer.output.len() == 1
+                    && !consumer.output[0].is_empty()
+                    && consumer.attribute.is_empty()
+                {
+                    reached_reshape_shape = true;
+                    continue;
+                }
+                return false;
+            }
+
+            let allowed_constant_shape_node =
+                match consumer.op_type.as_str() {
+                    "Cast" => is_exact_materialized_int64_cast(consumer, weights),
+                    "Unsqueeze" => {
+                        matches!(consumer.domain.as_str(), "" | "ai.onnx")
+                            && positions.iter().all(|&position| position == 0)
+                    }
+                    "Concat" => {
+                        matches!(consumer.domain.as_str(), "" | "ai.onnx")
+                            && consumer.input.iter().filter(|input| !input.is_empty()).all(
+                                |input| {
+                                    raw_int64_shape_values.contains(input)
+                                        && exact_integer_weight_view(weights, input).is_some()
+                                },
+                            )
+                    }
+                    _ => false,
+                };
+            if !allowed_constant_shape_node || consumer.output.is_empty() {
+                return false;
+            }
+            for output in consumer.output.iter().filter(|output| !output.is_empty()) {
+                if !raw_int64_shape_values.contains(output)
+                    || exact_integer_weight_view(weights, output).is_none()
+                {
+                    return false;
+                }
+                pending.push(output);
+            }
+        }
+    }
+
+    reached_reshape_shape
+}
+
+/// Collect graph values whose authored dtype is provably INT64 along the
+/// narrow static shape language used by the cGAN transformer exporter.
+///
+/// WeightStore's integer sidecar is intentionally not evidence here: tolerant
+/// parsing in unrelated folds (notably FLOAT Range) may synthesize one.  This
+/// recursion consults only raw protobuf dtypes and dtype-preserving shape ops.
+pub(super) fn raw_int64_shape_values(
+    graph: &onnx_proto::GraphProto,
+    weights: &WeightStore,
+) -> std::collections::HashSet<String> {
+    if !graph
+        .node
+        .iter()
+        .any(|node| node.op_type == "Cast" && cast_has_unique_int64_target(node))
+    {
+        return std::collections::HashSet::new();
+    }
+
+    let initializer_types: HashMap<&str, i32> = graph
+        .initializer
+        .iter()
+        .filter(|initializer| !initializer.name.is_empty())
+        .map(|initializer| (initializer.name.as_str(), initializer.data_type))
+        .collect();
+    let mut producer_by_output = HashMap::new();
+    for (index, node) in graph.node.iter().enumerate() {
+        for output in node.output.iter().filter(|output| !output.is_empty()) {
+            producer_by_output.insert(output.as_str(), index);
+        }
+    }
+
+    let mut memo = HashMap::new();
+    let mut proven = std::collections::HashSet::new();
+    let candidates: Vec<&str> = initializer_types
+        .keys()
+        .copied()
+        .chain(producer_by_output.keys().copied())
+        .collect();
+    for value in candidates {
+        if raw_value_is_int64_shape(
+            value,
+            graph,
+            weights,
+            &initializer_types,
+            &producer_by_output,
+            &mut memo,
+            &mut std::collections::HashSet::new(),
+        ) {
+            proven.insert(value.to_string());
+        }
+    }
+    proven
+}
+
+fn raw_value_is_int64_shape<'a>(
+    value: &'a str,
+    graph: &'a onnx_proto::GraphProto,
+    weights: &WeightStore,
+    initializer_types: &HashMap<&'a str, i32>,
+    producer_by_output: &HashMap<&'a str, usize>,
+    memo: &mut HashMap<&'a str, bool>,
+    active: &mut std::collections::HashSet<&'a str>,
+) -> bool {
+    if let Some(&known) = memo.get(value) {
+        return known;
+    }
+    // This graph is authored input. Bound recursive proof depth so a deeply
+    // nested constant-only DAG cannot exhaust the loader stack. The official
+    // cGAN shape cones are fewer than ten nodes deep.
+    const MAX_RAW_INT64_SHAPE_DEPTH: usize = 256;
+    if active.len() >= MAX_RAW_INT64_SHAPE_DEPTH {
+        return false;
+    }
+    if !active.insert(value) {
+        return false;
+    }
+
+    // Require every visited integer value to be exactly materialized and free
+    // of ny's private dynamic-shape sentinels. Checking only the final Cast
+    // would let arithmetic erase a sentinel (for example `s / s -> 1`).
+    if exact_integer_weight_view(weights, value).is_none() {
+        active.remove(value);
+        memo.insert(value, false);
+        return false;
+    }
+
+    let result = if let Some(&dtype) = initializer_types.get(value) {
+        dtype == 7
+    } else if let Some(&producer_index) = producer_by_output.get(value) {
+        let node = &graph.node[producer_index];
+        let standard = matches!(node.domain.as_str(), "" | "ai.onnx");
+        let one_output = node.output.len() == 1 && node.output[0] == value;
+        standard
+            && one_output
+            && match node.op_type.as_str() {
+                "Constant" if node.input.is_empty() => constant_is_raw_int64(node),
+                "Shape"
+                    if node.input.len() == 1
+                        && !node.input[0].is_empty()
+                        && node.attribute.is_empty() =>
+                {
+                    true
+                }
+                "Gather" if node.input.len() == 2 && gather_has_valid_axis_attr(node) => {
+                    node.input.iter().all(|input| {
+                        !input.is_empty()
+                            && raw_value_is_int64_shape(
+                                input,
+                                graph,
+                                weights,
+                                initializer_types,
+                                producer_by_output,
+                                memo,
+                                active,
+                            )
+                    })
+                }
+                "Mul" | "Div" if node.input.len() == 2 && node.attribute.is_empty() => {
+                    node.input.iter().all(|input| {
+                        !input.is_empty()
+                            && raw_value_is_int64_shape(
+                                input,
+                                graph,
+                                weights,
+                                initializer_types,
+                                producer_by_output,
+                                memo,
+                                active,
+                            )
+                    })
+                }
+                "Cast" if node.input.len() == 1 && cast_has_unique_int64_target(node) => {
+                    raw_value_is_int64_shape(
+                        &node.input[0],
+                        graph,
+                        weights,
+                        initializer_types,
+                        producer_by_output,
+                        memo,
+                        active,
+                    )
+                }
+                "Unsqueeze" if node.input.len() == 1 && unsqueeze_has_unique_axes_attr(node) => {
+                    raw_value_is_int64_shape(
+                        &node.input[0],
+                        graph,
+                        weights,
+                        initializer_types,
+                        producer_by_output,
+                        memo,
+                        active,
+                    )
+                }
+                "Unsqueeze" if node.input.len() == 2 && node.attribute.is_empty() => {
+                    node.input.iter().all(|input| {
+                        !input.is_empty()
+                            && raw_value_is_int64_shape(
+                                input,
+                                graph,
+                                weights,
+                                initializer_types,
+                                producer_by_output,
+                                memo,
+                                active,
+                            )
+                    })
+                }
+                "Concat" if !node.input.is_empty() && concat_has_unique_axis_attr(node) => {
+                    node.input.iter().all(|input| {
+                        !input.is_empty()
+                            && raw_value_is_int64_shape(
+                                input,
+                                graph,
+                                weights,
+                                initializer_types,
+                                producer_by_output,
+                                memo,
+                                active,
+                            )
+                    })
+                }
+                _ => false,
+            }
+    } else {
+        false
+    };
+
+    active.remove(value);
+    memo.insert(value, result);
+    result
+}
+
+fn cast_has_unique_int64_target(node: &onnx_proto::NodeProto) -> bool {
+    if node.attribute.len() != 1 {
+        return false;
+    }
+    let mut targets = node
+        .attribute
+        .iter()
+        .filter(|attribute| attribute.name == "to");
+    let Some(target) = targets.next() else {
+        return false;
+    };
+    target.r#type == onnx_proto::attribute_type::INT
+        && target.i_value() == 7
+        && targets.next().is_none()
+}
+
+fn gather_has_valid_axis_attr(node: &onnx_proto::NodeProto) -> bool {
+    match node.attribute.as_slice() {
+        // Gather's default axis is zero.
+        [] => true,
+        [axis] => axis.name == "axis" && axis.r#type == onnx_proto::attribute_type::INT,
+        _ => false,
+    }
+}
+
+fn unsqueeze_has_unique_axes_attr(node: &onnx_proto::NodeProto) -> bool {
+    if node.attribute.len() != 1 {
+        return false;
+    }
+    let mut axes_attributes = node
+        .attribute
+        .iter()
+        .filter(|attribute| attribute.name == "axes");
+    let Some(axes) = axes_attributes.next() else {
+        return false;
+    };
+    axes.r#type == onnx_proto::attribute_type::INTS && axes_attributes.next().is_none()
+}
+
+fn concat_has_unique_axis_attr(node: &onnx_proto::NodeProto) -> bool {
+    if node.attribute.len() != 1 {
+        return false;
+    }
+    let mut axis_attributes = node
+        .attribute
+        .iter()
+        .filter(|attribute| attribute.name == "axis");
+    let Some(axis) = axis_attributes.next() else {
+        return false;
+    };
+    axis.r#type == onnx_proto::attribute_type::INT && axis_attributes.next().is_none()
+}
+
+fn constant_is_raw_int64(node: &onnx_proto::NodeProto) -> bool {
+    // A valid Constant selects exactly one payload attribute. Requiring it to
+    // be the node's only attribute rejects malformed competing payloads (for
+    // example both value_int and value_float) instead of relying on whichever
+    // one the generic folder happens to inspect first.
+    if node.attribute.len() != 1 {
+        return false;
+    }
+    let payload = &node.attribute[0];
+    match payload.name.as_str() {
+        "value" => {
+            payload.r#type == onnx_proto::attribute_type::TENSOR
+                && payload
+                    .t
+                    .as_ref()
+                    .is_some_and(|tensor| tensor.data_type == 7)
+        }
+        "value_int" => payload.r#type == onnx_proto::attribute_type::INT,
+        "value_ints" => payload.r#type == onnx_proto::attribute_type::INTS,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

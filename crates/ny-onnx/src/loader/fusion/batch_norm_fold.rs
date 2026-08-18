@@ -2,8 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use super::bn_fold_interval::{
+    channel_affine_interval, emit_report, fold_interval_report, interval_report_enabled,
+    ChannelAffineInterval, ChannelAxis,
+};
 use crate::loader::const_fold::common::read_tensor_i64s;
 use crate::loader::numeric_cast::i64_to_f32_warned;
+use crate::loader::BatchNormFoldingPolicy;
 use crate::onnx_proto::{self, attribute_type};
 use crate::WeightStore;
 use ndarray::{Array1, ArrayD, Axis};
@@ -23,6 +28,12 @@ fn extended_bn_folds_enabled() -> bool {
 struct BatchNormAffine {
     scale: Vec<f32>,
     shift: Vec<f32>,
+    /// Rigorous f64 enclosures of the same per-channel `scale`/`shift`, present
+    /// only under the `NY_BN_FOLD_INTERVAL_REPORT=1` dark gate
+    /// (#bn-interval-fold). Purely observational: nothing in the fold reads
+    /// this, so the f32 `scale`/`shift` above — and therefore every stored
+    /// weight — are bit-identical whether it is populated or not.
+    intervals: Option<Vec<ChannelAffineInterval>>,
 }
 
 #[cfg(test)]
@@ -30,7 +41,13 @@ pub(crate) fn fold_batch_norm_into_conv_linear(
     nodes: &mut [onnx_proto::NodeProto],
     weights: &mut WeightStore,
 ) -> HashSet<usize> {
-    fold_batch_norm_into_conv_linear_with_context(nodes, weights, &HashMap::new(), &HashSet::new())
+    fold_batch_norm_into_conv_linear_with_context(
+        nodes,
+        weights,
+        &HashMap::new(),
+        &HashSet::new(),
+        BatchNormFoldingPolicy::LegacyEnvironment,
+    )
 }
 
 /// Context-aware entry used by graph conversion. Exact tensor shapes are
@@ -41,8 +58,12 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
     weights: &mut WeightStore,
     tensor_shapes: &HashMap<String, Vec<i64>>,
     graph_output_names: &HashSet<String>,
+    policy: BatchNormFoldingPolicy,
 ) -> HashSet<usize> {
     let mut consumed = HashSet::new();
+    if policy == BatchNormFoldingPolicy::PreserveRaw {
+        return consumed;
+    }
 
     for bn_idx in 0..nodes.len() {
         if nodes[bn_idx].op_type != "BatchNormalization" {
@@ -291,6 +312,36 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
             },
         };
 
+        // #bn-interval-fold (report-only, dark-gated). Runs AFTER the fold has
+        // fully validated and committed to these exact tensors, so the reported
+        // width describes what the loader will actually verify against. Placed
+        // before the inserts purely because `fused_weight`/`fused_bias` are
+        // moved by them.
+        if let Some(intervals) = affine.intervals.as_ref() {
+            let channel_axis = ChannelAxis {
+                axis: if predecessor_op_type == "Conv" {
+                    0
+                } else if is_conv_transpose {
+                    1
+                } else if gemm_trans_b(&nodes[predecessor_idx]) {
+                    0
+                } else {
+                    1
+                },
+                block: 1,
+            };
+            if let Some(report) = fold_interval_report(
+                &predecessor_weight,
+                &fused_weight,
+                existing_bias.as_ref(),
+                &fused_bias,
+                intervals,
+                channel_axis,
+            ) {
+                emit_report(&predecessor_op_type, predecessor_idx, bn_idx, &report);
+            }
+        }
+
         weights.insert(weight_name.clone(), fused_weight);
         weights.insert(bias_name.clone(), fused_bias);
 
@@ -327,7 +378,7 @@ pub(crate) fn fold_batch_norm_into_conv_linear_with_context(
 /// sole nonempty output and `training_mode` is absent/zero.
 fn inference_batch_norm_output(node: &onnx_proto::NodeProto) -> Option<String> {
     if node.attribute.iter().any(|attr| {
-        attr.name == "training_mode" && (attr.r#type != attribute_type::INT || attr.i != 0)
+        attr.name == "training_mode" && (attr.r#type != attribute_type::INT || attr.i_value() != 0)
     }) {
         return None;
     }
@@ -355,24 +406,48 @@ fn batch_norm_affine(
     let epsilon = batch_norm_epsilon(node);
     let mut scale = Vec::with_capacity(ny.len());
     let mut shift = Vec::with_capacity(ny.len());
+    // #bn-interval-fold: side-channel enclosures, gated OFF by default. Built
+    // in the same loop so the report cannot drift out of sync with the f32
+    // values it certifies.
+    let mut intervals = interval_report_enabled().then(|| Vec::with_capacity(ny.len()));
 
     // Fold equations from alpha-beta-CROWN's Conv/BN merge logic:
     // complete_verifier/onnx_opt.py (fuse_conv_and_bn + merge_bn branches).
     for idx in 0..ny.len() {
-        let denominator = (var[idx] + epsilon).sqrt();
+        // #bn-fold-restore: compose in f64 with one final rounding, so the
+        // uncertified residual on the folded parameters is at most the f32
+        // storage rounding (<= 0.5 ulp) rather than accumulated f32 arithmetic
+        // error. The reference fold (alpha-beta-CROWN onnx_opt.py) composes in
+        // f32; this is strictly tighter.
+        let denominator = f64::from(var[idx]) + f64::from(epsilon);
+        let denominator = denominator.sqrt();
         if !denominator.is_finite() || denominator <= 0.0 {
             return None;
         }
-        let channel_scale = ny[idx] / denominator;
-        let channel_shift = beta[idx] - ny[idx] * mean[idx] / denominator;
+        let channel_scale = (f64::from(ny[idx]) / denominator) as f32;
+        let channel_shift =
+            (f64::from(beta[idx]) - f64::from(ny[idx]) * f64::from(mean[idx]) / denominator) as f32;
         if !channel_scale.is_finite() || !channel_shift.is_finite() {
             return None;
         }
         scale.push(channel_scale);
         shift.push(channel_shift);
+        if let Some(intervals) = intervals.as_mut() {
+            // A channel that cannot be enclosed is recorded as an all-real
+            // interval so the report shows it as unenclosable rather than
+            // silently shrinking the reported width.
+            intervals.push(
+                channel_affine_interval(ny[idx], beta[idx], mean[idx], var[idx], epsilon)
+                    .unwrap_or_else(ChannelAffineInterval::unenclosable),
+            );
+        }
     }
 
-    Some(BatchNormAffine { scale, shift })
+    Some(BatchNormAffine {
+        scale,
+        shift,
+        intervals,
+    })
 }
 
 fn batch_norm_epsilon(node: &onnx_proto::NodeProto) -> f32 {
@@ -380,8 +455,8 @@ fn batch_norm_epsilon(node: &onnx_proto::NodeProto) -> f32 {
         .iter()
         .find(|attr| attr.name == "epsilon")
         .and_then(|attr| match attr.r#type {
-            attribute_type::FLOAT => Some(attr.f),
-            attribute_type::INT => Some(i64_to_f32_warned(attr.i, "BatchNorm epsilon INT")),
+            attribute_type::FLOAT => Some(attr.f_value()),
+            attribute_type::INT => Some(i64_to_f32_warned(attr.i_value(), "BatchNorm epsilon INT")),
             attribute_type::FLOATS => attr.floats.first().copied(),
             attribute_type::INTS => attr
                 .ints
@@ -439,7 +514,7 @@ fn conv_transpose_group(node: &onnx_proto::NodeProto) -> i64 {
     node.attribute
         .iter()
         .find(|attr| attr.name == "group")
-        .map(|attr| attr.i)
+        .map(|attr| attr.i_value())
         .unwrap_or(1)
 }
 
@@ -478,7 +553,7 @@ fn gemm_trans_a(node: &onnx_proto::NodeProto) -> bool {
     node.attribute
         .iter()
         .find(|attr| attr.name == "transA")
-        .is_some_and(|attr| attr.i != 0)
+        .is_some_and(|attr| attr.i_value() != 0)
 }
 
 /// Extract the `transB` attribute from a Gemm node.
@@ -489,7 +564,7 @@ fn gemm_trans_b(node: &onnx_proto::NodeProto) -> bool {
     node.attribute
         .iter()
         .find(|attr| attr.name == "transB")
-        .is_some_and(|attr| attr.i != 0)
+        .is_some_and(|attr| attr.i_value() != 0)
 }
 
 /// Extract the `alpha` scalar attribute from a Gemm node.
@@ -501,7 +576,7 @@ fn gemm_alpha(node: &onnx_proto::NodeProto) -> f32 {
     node.attribute
         .iter()
         .find(|attr| attr.name == "alpha")
-        .map(|attr| attr.f)
+        .map(|attr| attr.f_value())
         .unwrap_or(1.0)
 }
 
@@ -515,7 +590,7 @@ fn gemm_beta(node: &onnx_proto::NodeProto) -> f32 {
     node.attribute
         .iter()
         .find(|attr| attr.name == "beta")
-        .map(|attr| attr.f)
+        .map(|attr| attr.f_value())
         .unwrap_or(1.0)
 }
 
@@ -786,6 +861,29 @@ fn try_fold_gemm_reshape_bn(
             name
         }
     };
+
+    // #bn-interval-fold (report-only, dark-gated). This fold's channel map is
+    // `c(f) = f / block`, which is exactly what `ChannelAxis.block` models, so
+    // the same reporter covers it. The BN->Reshape->Gemm tail fold is
+    // deliberately NOT reported: its fused bias is an inner product over all
+    // features rather than a per-channel affine, so its enclosure needs a
+    // summation interval this increment does not implement.
+    if let Some(intervals) = affine.intervals.as_ref() {
+        let channel_axis = ChannelAxis {
+            axis: if trans_b { 0 } else { 1 },
+            block,
+        };
+        if let Some(report) = fold_interval_report(
+            &gemm_weight,
+            &fused_weight,
+            existing_bias.as_ref(),
+            &fused_bias,
+            intervals,
+            channel_axis,
+        ) {
+            emit_report("Gemm->Reshape->BN", gemm_idx, bn_idx, &report);
+        }
+    }
 
     weights.insert(weight_name, fused_weight);
     weights.insert(bias_name.clone(), fused_bias);
@@ -1122,16 +1220,20 @@ fn fuse_bias(
 }
 
 /// Normalize legal ONNX Gemm C broadcasts to the output-feature vector used by
-/// the fusion algebra. Only scalar, `[N]`, and `[1,N]` are independent of the
-/// runtime row count M. In particular `[M,1]` cannot be folded into one bias
-/// vector because its value varies by row.
+/// the fusion algebra. Scalars (`[]`, `[1]`, `[1,1]`), `[N]`, and `[1,N]` are
+/// independent of the runtime row count M. In particular `[M,1]` for M > 1
+/// cannot be folded into one bias vector because its value varies by row.
 fn normalize_gemm_c(bias: &ArrayD<f32>, outputs: usize) -> Option<ArrayD<f32>> {
     if outputs == 0 {
         return None;
     }
     let values = match bias.shape() {
         [] if bias.len() == 1 => vec![*bias.iter().next()?; outputs],
+        [one] if *one == 1 => vec![*bias.iter().next()?; outputs],
         [n] if *n == outputs => bias.iter().copied().collect(),
+        [one_a, one_b] if *one_a == 1 && *one_b == 1 => {
+            vec![*bias.iter().next()?; outputs]
+        }
         [one, n] if *one == 1 && *n == outputs => bias.iter().copied().collect(),
         _ => return None,
     };

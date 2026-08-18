@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use ny_core::Result;
 
+use crate::beta_crown::branching::BranchingHeuristic;
 use crate::beta_crown::engine::graph::input_split::metrics::{
     DenseSpecReboundMode, DenseSpecReboundTiming,
 };
@@ -23,6 +24,54 @@ pub(in crate::beta_crown::engine::graph) enum GraphDomainBatchExecutionMode {
     SharedExecutor,
     ParallelFallback,
     SequentialFallback,
+}
+
+/// Branching semantics required by the ReLU-split loop's current configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReluSplitBranchingSemantics {
+    Relu,
+    GeneralNonlinear,
+}
+
+impl From<&BranchingHeuristic> for ReluSplitBranchingSemantics {
+    fn from(heuristic: &BranchingHeuristic) -> Self {
+        if matches!(heuristic, BranchingHeuristic::GenBaB(_)) {
+            Self::GeneralNonlinear
+        } else {
+            Self::Relu
+        }
+    }
+}
+
+/// Complete eligibility context for one batch from the ReLU-split loop.
+///
+/// The shared single-objective executor implements only ReLU branching. Keeping
+/// the branching semantics in this typed context prevents a GenBaB run from
+/// silently entering that executor and dropping its general-nonlinearity split
+/// candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::beta_crown::engine::graph) struct ReluSplitBatchContext {
+    target_batch_size: usize,
+    engine_available: bool,
+    has_active_cuts: bool,
+    branching: ReluSplitBranchingSemantics,
+}
+
+impl ReluSplitBatchContext {
+    #[must_use]
+    pub(in crate::beta_crown::engine::graph) fn new(
+        target_batch_size: usize,
+        engine_available: bool,
+        has_active_cuts: bool,
+        branching_heuristic: &BranchingHeuristic,
+    ) -> Self {
+        Self {
+            target_batch_size,
+            engine_available,
+            has_active_cuts,
+            branching: branching_heuristic.into(),
+        }
+    }
 }
 
 /// Timing payload used when emitting one graph-domain batch record.
@@ -88,24 +137,33 @@ impl GraphDomainBatchPlan {
     pub(in crate::beta_crown::engine::graph) fn for_relu_split(
         batch_index: usize,
         batch_width: usize,
-        batch_size: usize,
-        engine_available: bool,
-        has_active_cuts: bool,
+        context: ReluSplitBatchContext,
     ) -> Self {
         let mut fallback_reason_counts = BTreeMap::new();
-        let execution_mode = if batch_size > 1 && !has_active_cuts {
-            if engine_available {
-                GraphDomainBatchExecutionMode::SharedExecutor
-            } else {
-                add_fallback_reason_count(
-                    &mut fallback_reason_counts,
-                    GraphDomainBatchFallbackReason::NoEngine.as_str(),
-                    batch_width,
-                );
-                GraphDomainBatchExecutionMode::ParallelFallback
+        let execution_mode = if context.target_batch_size > 1 && !context.has_active_cuts {
+            match (context.engine_available, context.branching) {
+                (true, ReluSplitBranchingSemantics::Relu) => {
+                    GraphDomainBatchExecutionMode::SharedExecutor
+                }
+                (true, ReluSplitBranchingSemantics::GeneralNonlinear) => {
+                    add_fallback_reason_count(
+                        &mut fallback_reason_counts,
+                        GraphDomainBatchFallbackReason::GeneralNonlinearBranching.as_str(),
+                        batch_width,
+                    );
+                    GraphDomainBatchExecutionMode::SequentialFallback
+                }
+                (false, _) => {
+                    add_fallback_reason_count(
+                        &mut fallback_reason_counts,
+                        GraphDomainBatchFallbackReason::NoEngine.as_str(),
+                        batch_width,
+                    );
+                    GraphDomainBatchExecutionMode::ParallelFallback
+                }
             }
         } else {
-            let reason = if has_active_cuts {
+            let reason = if context.has_active_cuts {
                 GraphDomainBatchFallbackReason::CutsEnabled
             } else {
                 GraphDomainBatchFallbackReason::SingletonBatch
@@ -292,7 +350,9 @@ mod tests {
 
     #[test]
     fn test_relu_split_plan_no_engine_preserves_parallel_fallback_4398() {
-        let plan = GraphDomainBatchPlan::for_relu_split(4, 3, 8, false, false);
+        let heuristic = BranchingHeuristic::LargestBoundWidth;
+        let context = ReluSplitBatchContext::new(8, false, false, &heuristic);
+        let plan = GraphDomainBatchPlan::for_relu_split(4, 3, context);
 
         assert_eq!(
             plan.execution_mode(),
@@ -304,6 +364,61 @@ mod tests {
         assert_eq!(record.domains_batched, 0);
         assert_eq!(record.domains_fallback, 3);
         assert_eq!(record.fallback_reason_counts.get("no_engine"), Some(&3));
+    }
+
+    #[test]
+    fn test_relu_split_plan_genbab_bypasses_relu_only_shared_executor() {
+        let heuristic = BranchingHeuristic::GenBaB(Default::default());
+        let context = ReluSplitBatchContext::new(8, true, false, &heuristic);
+        let plan = GraphDomainBatchPlan::for_relu_split(0, 8, context);
+
+        assert_eq!(
+            plan.execution_mode(),
+            GraphDomainBatchExecutionMode::SequentialFallback
+        );
+
+        let record = plan.build_record(GraphDomainBatchEmitTiming::new(0.5));
+        assert_eq!(record.domains_batched, 0);
+        assert_eq!(record.domains_fallback, 8);
+        assert_eq!(
+            record
+                .fallback_reason_counts
+                .get("general_nonlinear_branching"),
+            Some(&8)
+        );
+    }
+
+    #[test]
+    fn test_relu_split_plan_relu_keeps_shared_executor() {
+        let heuristic = BranchingHeuristic::LargestBoundWidth;
+        let context = ReluSplitBatchContext::new(8, true, false, &heuristic);
+        let plan = GraphDomainBatchPlan::for_relu_split(0, 8, context);
+
+        assert_eq!(
+            plan.execution_mode(),
+            GraphDomainBatchExecutionMode::SharedExecutor
+        );
+        assert!(plan
+            .build_record(GraphDomainBatchEmitTiming::new(0.5))
+            .fallback_reason_counts
+            .is_empty());
+    }
+
+    #[test]
+    fn test_relu_split_plan_genbab_without_engine_keeps_parallel_fallback() {
+        let heuristic = BranchingHeuristic::GenBaB(Default::default());
+        let context = ReluSplitBatchContext::new(8, false, false, &heuristic);
+        let plan = GraphDomainBatchPlan::for_relu_split(0, 8, context);
+
+        assert_eq!(
+            plan.execution_mode(),
+            GraphDomainBatchExecutionMode::ParallelFallback
+        );
+        let record = plan.build_record(GraphDomainBatchEmitTiming::new(0.5));
+        assert_eq!(record.fallback_reason_counts.get("no_engine"), Some(&8));
+        assert!(!record
+            .fallback_reason_counts
+            .contains_key("general_nonlinear_branching"));
     }
 
     #[test]
@@ -327,6 +442,34 @@ mod tests {
             Some(&5)
         );
         assert_eq!(record.queue_update_s, Some(0.2));
+    }
+
+    #[test]
+    fn test_multi_objective_plan_disjunctive_with_engine_uses_shared_executor() {
+        let plan = GraphDomainBatchPlan::for_multi_objective(0, 5, 8, true, false);
+
+        assert_eq!(
+            plan.execution_mode(),
+            GraphDomainBatchExecutionMode::SharedExecutor
+        );
+        let record = plan.build_record(GraphDomainBatchEmitTiming::new(0.5));
+        assert_eq!(record.domains_batched, 5);
+        assert_eq!(record.domains_fallback, 0);
+        assert!(record.fallback_reason_counts.is_empty());
+    }
+
+    #[test]
+    fn test_multi_objective_plan_disjunctive_without_engine_uses_legacy_fallback() {
+        let plan = GraphDomainBatchPlan::for_multi_objective(0, 5, 8, false, false);
+
+        assert_eq!(
+            plan.execution_mode(),
+            GraphDomainBatchExecutionMode::SequentialFallback
+        );
+        let record = plan.build_record(GraphDomainBatchEmitTiming::new(0.5));
+        assert_eq!(record.domains_batched, 0);
+        assert_eq!(record.domains_fallback, 5);
+        assert_eq!(record.fallback_reason_counts.get("no_engine"), Some(&5));
     }
 
     #[test]

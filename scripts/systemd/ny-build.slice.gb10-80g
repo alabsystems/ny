@@ -1,0 +1,26 @@
+# Competition-default containment (`gb10-80g`) for the scorecard sweep.
+#
+# Install as ~/.config/systemd/user/ny-build.slice — see install-user-slices.sh.
+#
+# `ny-safe-gpu-run` launches guarded jobs with `systemd-run --user
+# --slice=ny-build.slice`; systemd derives the parent from the dashed name, so
+# this nests under ny.slice automatically, producing the hierarchy that
+# measure_ny_scorecard.sh attests:
+#   /user.slice/user-$UID.slice/user@$UID.service/ny.slice/ny-build.slice
+#
+# Values MUST equal the gb10-80g constants in measure_ny_scorecard.sh and
+# ny_measurement_provenance.py; the sweep refuses on any mismatch.
+# CPUQuota=1000% is the 10-CPU competition lane (use 2000% only with
+# NY_MEASURE_EXPECTED_CPUS=20).
+[Unit]
+Description=ny build and measurement containment (gb10-80g)
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=68719476736
+MemoryMax=85899345920
+MemorySwapMax=8589934592
+TasksAccounting=yes
+TasksMax=4096
+CPUAccounting=yes
+CPUQuota=1000%

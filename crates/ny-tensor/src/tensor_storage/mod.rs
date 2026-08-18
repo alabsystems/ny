@@ -66,17 +66,49 @@ const LINEAR_GROWTH_FACTOR: usize = 32;
 ///
 /// Most owned tensors are already contiguous and borrow directly.
 /// Non-contiguous inputs are flattened into a temporary buffer.
-fn flatten_tensor_data(tensor: &ArrayD<f32>) -> Cow<'_, [f32]> {
+fn flatten_tensor_data(tensor: &ArrayD<f32>) -> Result<Cow<'_, [f32]>> {
     // Use as_slice() (not as_slice_memory_order()) to guarantee row-major order.
     // as_slice_memory_order() returns data in whatever layout the array uses,
     // which is column-major for Fortran-order arrays — contradicting this
     // function's contract. Fortran-layout arrays fall through to the iterator
     // path which always yields logical (row-major) order. Part of #2257.
     if let Some(slice) = tensor.as_slice() {
-        Cow::Borrowed(slice)
+        Ok(Cow::Borrowed(slice))
     } else {
-        Cow::Owned(tensor.iter().copied().collect())
+        let mut data = Vec::new();
+        data.try_reserve_exact(tensor.len()).map_err(|error| {
+            NyError::InvalidSpec(format!(
+                "TensorStorage: non-contiguous input copy of {} elements cannot be allocated: \
+                 {error}",
+                tensor.len()
+            ))
+        })?;
+        data.extend(tensor.iter().copied());
+        Ok(Cow::Owned(data))
     }
+}
+
+fn allocate_storage(elements: usize, context: &str) -> Result<Vec<f32>> {
+    let mut storage = Vec::new();
+    storage.try_reserve_exact(elements).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "{context}: allocation failed for {elements} elements: {error}"
+        ))
+    })?;
+    storage.resize(elements, 0.0);
+    Ok(storage)
+}
+
+fn copy_f32_slice(values: &[f32], context: &str) -> Result<Vec<f32>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(values.len()).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "{context}: copy allocation failed for {} elements: {error}",
+            values.len()
+        ))
+    })?;
+    copy.extend_from_slice(values);
+    Ok(copy)
 }
 
 /// Trait for dynamic tensor storage with append/pop operations.
@@ -177,19 +209,24 @@ impl StackTensorStorage {
         }
 
         let element_shape: Vec<usize> = full_shape[1..].to_vec();
-        let elements_per_entry = checked_shape_product(&element_shape)
-            .ok_or_else(|| {
-                NyError::InvalidSpec(format!(
-                    "TensorStorage: element shape product overflows: {:?}",
-                    element_shape
-                ))
-            })?
-            .max(1);
+        let elements_per_entry = checked_shape_product(&element_shape).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "TensorStorage: element shape product overflows: {:?}",
+                element_shape
+            ))
+        })?;
 
         // Allocate initial storage
         let initial_capacity = initial_size.max(1);
-        let total_elements = initial_capacity * elements_per_entry;
-        let storage = vec![0.0f32; total_elements];
+        let total_elements = initial_capacity
+            .checked_mul(elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                    "StackTensorStorage: capacity {initial_capacity} times \
+                     elements-per-entry {elements_per_entry} overflows usize"
+                ))
+            })?;
+        let storage = allocate_storage(total_elements, "StackTensorStorage")?;
 
         let mut shape = vec![initial_capacity];
         shape.extend_from_slice(&element_shape);
@@ -206,20 +243,49 @@ impl StackTensorStorage {
     }
 
     /// Calculate new capacity given a request size.
-    fn compute_new_capacity(&self, request_size: usize) -> usize {
+    fn compute_new_capacity(&self, request_size: usize) -> Result<usize> {
+        let required_capacity = self.num_used.checked_add(request_size).ok_or_else(|| {
+            NyError::InvalidSpec(
+                "StackTensorStorage: used entry count plus append size overflows usize".to_string(),
+            )
+        })?;
         if self.current_capacity < self.switching_size {
             // Exponential growth
-            (self.current_capacity * 2).max(self.num_used + request_size)
+            let doubled = self.current_capacity.checked_mul(2).ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "StackTensorStorage: exponential capacity growth overflows usize".to_string(),
+                )
+            })?;
+            Ok(doubled.max(required_capacity))
         } else {
             // Linear growth
-            self.current_capacity + request_size * LINEAR_GROWTH_FACTOR
+            let growth = request_size
+                .checked_mul(LINEAR_GROWTH_FACTOR)
+                .ok_or_else(|| {
+                    NyError::InvalidSpec(
+                        "StackTensorStorage: linear capacity growth overflows usize".to_string(),
+                    )
+                })?;
+            self.current_capacity.checked_add(growth).ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "StackTensorStorage: linear capacity growth overflows usize".to_string(),
+                )
+            })
         }
     }
 
     /// Reallocate storage to new capacity.
-    fn reallocate(&mut self, new_capacity: usize) {
-        let new_total = new_capacity * self.elements_per_entry;
-        let mut new_storage = vec![0.0f32; new_total];
+    fn reallocate(&mut self, new_capacity: usize) -> Result<()> {
+        let new_total = new_capacity
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                    "StackTensorStorage: capacity {new_capacity} times \
+                     elements-per-entry {} overflows usize",
+                    self.elements_per_entry
+                ))
+            })?;
+        let mut new_storage = allocate_storage(new_total, "StackTensorStorage")?;
 
         // Copy existing data
         let used_elements = self.num_used * self.elements_per_entry;
@@ -228,39 +294,66 @@ impl StackTensorStorage {
         self.storage = new_storage;
         self.current_capacity = new_capacity;
         self.shape[0] = new_capacity;
+        Ok(())
     }
 }
 
 impl TensorStorage for StackTensorStorage {
     fn append(&mut self, tensor: &ArrayD<f32>) -> Result<()> {
-        let append_size = tensor.shape().first().copied().unwrap_or(0);
-        if append_size == 0 {
-            return Ok(());
-        }
-
         // Validate shape matches
-        let tensor_element_shape = &tensor.shape()[1..];
+        let Some((&append_size, tensor_element_shape)) = tensor.shape().split_first() else {
+            return Err(NyError::InvalidSpec(
+                "StackTensorStorage::append requires a batch dimension".to_string(),
+            ));
+        };
         if tensor_element_shape != &self.element_shape[..] {
             return Err(NyError::ShapeMismatch {
                 expected: self.element_shape.clone(),
                 got: tensor_element_shape.to_vec(),
             });
         }
+        if append_size == 0 {
+            return Ok(());
+        }
+
+        let required_capacity = self.num_used.checked_add(append_size).ok_or_else(|| {
+            NyError::InvalidSpec(
+                "StackTensorStorage: used entry count plus append size overflows usize".to_string(),
+            )
+        })?;
 
         // Reallocate if needed
-        if self.num_used + append_size > self.current_capacity {
-            let new_capacity = self.compute_new_capacity(append_size);
-            self.reallocate(new_capacity);
+        if required_capacity > self.current_capacity {
+            let new_capacity = self.compute_new_capacity(append_size)?;
+            self.reallocate(new_capacity)?;
         }
 
         // Copy data
-        let start = self.num_used * self.elements_per_entry;
-        let append_elements = append_size * self.elements_per_entry;
-        let tensor_data = flatten_tensor_data(tensor);
+        let start = self
+            .num_used
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InternalError(
+                    "StackTensorStorage: used element offset overflows usize".to_string(),
+                )
+            })?;
+        let append_elements = append_size
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "StackTensorStorage: append element count overflows usize".to_string(),
+                )
+            })?;
+        let end = start.checked_add(append_elements).ok_or_else(|| {
+            NyError::InternalError(
+                "StackTensorStorage: append destination end overflows usize".to_string(),
+            )
+        })?;
+        let tensor_data = flatten_tensor_data(tensor)?;
         debug_assert_eq!(tensor_data.len(), append_elements);
-        self.storage[start..start + append_elements].copy_from_slice(&tensor_data);
+        self.storage[start..end].copy_from_slice(&tensor_data);
 
-        self.num_used += append_size;
+        self.num_used = required_capacity;
         Ok(())
     }
 
@@ -273,15 +366,35 @@ impl TensorStorage for StackTensorStorage {
         }
 
         // Pop from end (LIFO)
-        let start = (self.num_used - size) * self.elements_per_entry;
-        let elements = size * self.elements_per_entry;
+        let start = (self.num_used - size)
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InternalError(
+                    "StackTensorStorage::pop start offset overflows usize".to_string(),
+                )
+            })?;
+        let elements = size.checked_mul(self.elements_per_entry).ok_or_else(|| {
+            NyError::InternalError(
+                "StackTensorStorage::pop element count overflows usize".to_string(),
+            )
+        })?;
+        let end = start.checked_add(elements).ok_or_else(|| {
+            NyError::InternalError("StackTensorStorage::pop source end overflows usize".to_string())
+        })?;
 
         let mut result_shape = vec![size];
         result_shape.extend_from_slice(&self.element_shape);
 
         let result = ArrayD::from_shape_vec(
             IxDyn(&result_shape),
-            self.storage[start..start + elements].to_vec(),
+            copy_f32_slice(
+                self.storage.get(start..end).ok_or_else(|| {
+                    NyError::InternalError(
+                        "StackTensorStorage::pop source range is out of bounds".to_string(),
+                    )
+                })?,
+                "StackTensorStorage::pop",
+            )?,
         )
         .map_err(|e| {
             NyError::InternalError(format!("StackTensorStorage::pop shape mismatch: {e}"))
@@ -316,8 +429,14 @@ impl TensorStorage for StackTensorStorage {
         }
 
         // Create temporary buffer for reordering
-        let reorder_elements = num_domains * self.elements_per_entry;
-        let mut temp = vec![0.0f32; reorder_elements];
+        let reorder_elements = num_domains
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InternalError(
+                    "StackTensorStorage::reorder element count overflows usize".to_string(),
+                )
+            })?;
+        let mut temp = allocate_storage(reorder_elements, "StackTensorStorage::reorder")?;
 
         for (new_idx, &old_idx) in indices.iter().enumerate() {
             if old_idx >= num_domains {
@@ -398,18 +517,23 @@ impl QueueTensorStorage {
         }
 
         let element_shape: Vec<usize> = full_shape[1..].to_vec();
-        let elements_per_entry = checked_shape_product(&element_shape)
-            .ok_or_else(|| {
-                NyError::InvalidSpec(format!(
-                    "TensorStorage: element shape product overflows: {:?}",
-                    element_shape
-                ))
-            })?
-            .max(1);
+        let elements_per_entry = checked_shape_product(&element_shape).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "TensorStorage: element shape product overflows: {:?}",
+                element_shape
+            ))
+        })?;
 
         let initial_capacity = initial_size.max(1);
-        let total_elements = initial_capacity * elements_per_entry;
-        let storage = vec![0.0f32; total_elements];
+        let total_elements = initial_capacity
+            .checked_mul(elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                    "QueueTensorStorage: capacity {initial_capacity} times \
+                     elements-per-entry {elements_per_entry} overflows usize"
+                ))
+            })?;
+        let storage = allocate_storage(total_elements, "QueueTensorStorage")?;
 
         let mut shape = vec![initial_capacity];
         shape.extend_from_slice(&element_shape);
@@ -426,18 +550,47 @@ impl QueueTensorStorage {
         })
     }
 
-    fn compute_new_capacity(&self, request_size: usize) -> usize {
+    fn compute_new_capacity(&self, request_size: usize) -> Result<usize> {
+        let required_capacity = self.num_used.checked_add(request_size).ok_or_else(|| {
+            NyError::InvalidSpec(
+                "QueueTensorStorage: used entry count plus append size overflows usize".to_string(),
+            )
+        })?;
         if self.current_capacity < self.switching_size {
-            (self.current_capacity * 2).max(self.num_used + request_size)
+            let doubled = self.current_capacity.checked_mul(2).ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "QueueTensorStorage: exponential capacity growth overflows usize".to_string(),
+                )
+            })?;
+            Ok(doubled.max(required_capacity))
         } else {
-            self.current_capacity + request_size * LINEAR_GROWTH_FACTOR
+            let growth = request_size
+                .checked_mul(LINEAR_GROWTH_FACTOR)
+                .ok_or_else(|| {
+                    NyError::InvalidSpec(
+                        "QueueTensorStorage: linear capacity growth overflows usize".to_string(),
+                    )
+                })?;
+            self.current_capacity.checked_add(growth).ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "QueueTensorStorage: linear capacity growth overflows usize".to_string(),
+                )
+            })
         }
     }
 
     /// Move data to a new storage buffer, making it contiguous from index 0.
-    fn move_to_new_storage(&mut self, new_capacity: usize) {
-        let new_total = new_capacity * self.elements_per_entry;
-        let mut new_storage = vec![0.0f32; new_total];
+    fn move_to_new_storage(&mut self, new_capacity: usize) -> Result<()> {
+        let new_total = new_capacity
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                    "QueueTensorStorage: capacity {new_capacity} times \
+                     elements-per-entry {} overflows usize",
+                    self.elements_per_entry
+                ))
+            })?;
+        let mut new_storage = allocate_storage(new_total, "QueueTensorStorage")?;
 
         // Handle circular buffer wrap-around
         let entries_to_end = (self.current_capacity - self.usage_start).min(self.num_used);
@@ -461,35 +614,55 @@ impl QueueTensorStorage {
         self.current_capacity = new_capacity;
         self.shape[0] = new_capacity;
         self.usage_start = 0;
+        Ok(())
     }
 }
 
 impl TensorStorage for QueueTensorStorage {
     fn append(&mut self, tensor: &ArrayD<f32>) -> Result<()> {
-        let append_size = tensor.shape().first().copied().unwrap_or(0);
-        if append_size == 0 {
-            return Ok(());
-        }
-
-        let tensor_element_shape = &tensor.shape()[1..];
+        let Some((&append_size, tensor_element_shape)) = tensor.shape().split_first() else {
+            return Err(NyError::InvalidSpec(
+                "QueueTensorStorage::append requires a batch dimension".to_string(),
+            ));
+        };
         if tensor_element_shape != &self.element_shape[..] {
             return Err(NyError::ShapeMismatch {
                 expected: self.element_shape.clone(),
                 got: tensor_element_shape.to_vec(),
             });
         }
-
-        // Reallocate if needed
-        if self.num_used + append_size > self.current_capacity {
-            let new_capacity = self.compute_new_capacity(append_size);
-            self.move_to_new_storage(new_capacity);
+        if append_size == 0 {
+            return Ok(());
         }
 
-        let tensor_data = flatten_tensor_data(tensor);
-        debug_assert_eq!(tensor_data.len(), append_size * self.elements_per_entry);
+        let required_capacity = self.num_used.checked_add(append_size).ok_or_else(|| {
+            NyError::InvalidSpec(
+                "QueueTensorStorage: used entry count plus append size overflows usize".to_string(),
+            )
+        })?;
+
+        // Reallocate if needed
+        if required_capacity > self.current_capacity {
+            let new_capacity = self.compute_new_capacity(append_size)?;
+            self.move_to_new_storage(new_capacity)?;
+        }
+
+        let tensor_data = flatten_tensor_data(tensor)?;
+        let append_elements = append_size
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "QueueTensorStorage: append element count overflows usize".to_string(),
+                )
+            })?;
+        debug_assert_eq!(tensor_data.len(), append_elements);
 
         // Find first free index in circular buffer
-        let first_free = (self.usage_start + self.num_used) % self.current_capacity;
+        let first_free = self
+            .usage_start
+            .checked_add(self.num_used)
+            .map(|index| index % self.current_capacity)
+            .unwrap_or_else(|| self.num_used - (self.current_capacity - self.usage_start));
         let entries_at_tail = self.current_capacity - first_free;
 
         // Copy to tail of buffer
@@ -508,7 +681,7 @@ impl TensorStorage for QueueTensorStorage {
                 .copy_from_slice(&tensor_data[src_start..src_start + wrap_elements]);
         }
 
-        self.num_used += append_size;
+        self.num_used = required_capacity;
         Ok(())
     }
 
@@ -522,7 +695,11 @@ impl TensorStorage for QueueTensorStorage {
 
         let mut result_shape = vec![size];
         result_shape.extend_from_slice(&self.element_shape);
-        let result_elements = size * self.elements_per_entry;
+        let result_elements = size.checked_mul(self.elements_per_entry).ok_or_else(|| {
+            NyError::InternalError(
+                "QueueTensorStorage::pop element count overflows usize".to_string(),
+            )
+        })?;
 
         // Pop from start (FIFO)
         let entries_to_end = (self.current_capacity - self.usage_start).min(size);
@@ -530,20 +707,42 @@ impl TensorStorage for QueueTensorStorage {
         if entries_to_end >= size {
             // All entries are contiguous
             let src_start = self.usage_start * self.elements_per_entry;
+            let src_end = src_start.checked_add(result_elements).ok_or_else(|| {
+                NyError::InternalError(
+                    "QueueTensorStorage::pop source end overflows usize".to_string(),
+                )
+            })?;
             let result = ArrayD::from_shape_vec(
                 IxDyn(&result_shape),
-                self.storage[src_start..src_start + result_elements].to_vec(),
+                copy_f32_slice(
+                    self.storage.get(src_start..src_end).ok_or_else(|| {
+                        NyError::InternalError(
+                            "QueueTensorStorage::pop source range is out of bounds".to_string(),
+                        )
+                    })?,
+                    "QueueTensorStorage::pop",
+                )?,
             )
             .map_err(|e| {
                 NyError::InternalError(format!("QueueTensorStorage::pop shape mismatch: {e}"))
             })?;
 
             self.num_used -= size;
-            self.usage_start = (self.usage_start + size) % self.current_capacity;
+            self.usage_start = self
+                .usage_start
+                .checked_add(size)
+                .map(|index| index % self.current_capacity)
+                .unwrap_or_else(|| size - (self.current_capacity - self.usage_start));
             Ok(result)
         } else {
             // Need to concatenate from end and start of buffer
-            let mut data = Vec::with_capacity(result_elements);
+            let mut data = Vec::new();
+            data.try_reserve_exact(result_elements).map_err(|error| {
+                NyError::InvalidSpec(format!(
+                    "QueueTensorStorage::pop: copy allocation failed for {result_elements} \
+                     elements: {error}"
+                ))
+            })?;
 
             // Copy from usage_start to end of buffer
             let src_start = self.usage_start * self.elements_per_entry;
@@ -561,7 +760,11 @@ impl TensorStorage for QueueTensorStorage {
             })?;
 
             self.num_used -= size;
-            self.usage_start = (self.usage_start + size) % self.current_capacity;
+            self.usage_start = self
+                .usage_start
+                .checked_add(size)
+                .map(|index| index % self.current_capacity)
+                .unwrap_or_else(|| size - (self.current_capacity - self.usage_start));
             Ok(result)
         }
     }
@@ -569,7 +772,13 @@ impl TensorStorage for QueueTensorStorage {
     fn tensor(&self) -> Result<ArrayView<'_, f32, IxDyn>> {
         // For a view, we need contiguous data. If wrapped, caller must
         // call reorder() first to make data contiguous.
-        let end_index = self.usage_start + self.num_used;
+        let end_index = self.usage_start.checked_add(self.num_used).ok_or_else(|| {
+            NyError::InternalError(
+                "QueueTensorStorage::tensor() requires contiguous data. \
+                     Call reorder() first."
+                    .into(),
+            )
+        })?;
         if end_index > self.current_capacity {
             return Err(NyError::InternalError(
                 "QueueTensorStorage::tensor() requires contiguous data. \
@@ -601,23 +810,31 @@ impl TensorStorage for QueueTensorStorage {
                 indices.len()
             )));
         }
-
-        // First, make storage contiguous
-        if self.usage_start != 0 {
-            self.move_to_new_storage(self.current_capacity);
-        }
-
-        // Then reorder like stack storage
-        let reorder_elements = num_domains * self.elements_per_entry;
-        let mut temp = vec![0.0f32; reorder_elements];
-
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
+        for &old_idx in indices {
             if old_idx >= num_domains {
                 return Err(NyError::InternalError(format!(
                     "QueueTensorStorage::reorder index {old_idx} out of bounds \
                      (num_domains={num_domains})"
                 )));
             }
+        }
+
+        // First, make storage contiguous
+        if self.usage_start != 0 {
+            self.move_to_new_storage(self.current_capacity)?;
+        }
+
+        // Then reorder like stack storage
+        let reorder_elements = num_domains
+            .checked_mul(self.elements_per_entry)
+            .ok_or_else(|| {
+                NyError::InternalError(
+                    "QueueTensorStorage::reorder element count overflows usize".to_string(),
+                )
+            })?;
+        let mut temp = allocate_storage(reorder_elements, "QueueTensorStorage::reorder")?;
+
+        for (new_idx, &old_idx) in indices.iter().enumerate() {
             let src_start = old_idx * self.elements_per_entry;
             let dst_start = new_idx * self.elements_per_entry;
             temp[dst_start..dst_start + self.elements_per_entry]

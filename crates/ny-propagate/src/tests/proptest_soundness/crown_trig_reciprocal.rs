@@ -409,11 +409,10 @@ proptest! {
             arr1(&[u0, u1]).into_dyn(),
         ).unwrap();
 
-        let result = layer.propagate_linear_with_bounds(&incoming, &pre_activation);
-        // Tan legitimately rejects intervals near asymptotes — use prop_assume to
-        // discard these cases rather than silently passing.
-        prop_assume!(result.is_ok(), "Tan rejected interval near asymptote");
-        let result = result.unwrap();
+        let result = layer.propagate_linear_with_bounds(&incoming, &pre_activation)
+            .map_err(|e| TestCaseError::fail(format!(
+                "Tan rejected generated asymptote-free interval: {e}"
+            )))?;
 
         let samples_0 = sample_points(l0, u0, 20);
         let samples_1 = sample_points(l1, u1, 20);
@@ -423,10 +422,10 @@ proptest! {
                 let fx0 = x0.tan();
                 let fx1 = x1.tan();
 
-                // Skip if tan produces extreme values near asymptotes
-                if !fx0.is_finite() || !fx1.is_finite() || fx0.abs() > 1e6 || fx1.abs() > 1e6 {
-                    continue;
-                }
+                prop_assert!(
+                    fx0.is_finite() && fx1.is_finite() && fx0.abs() <= 1e6 && fx1.abs() <= 1e6,
+                    "asymptote-free Tan generator produced an unusable oracle sample: tan({x0})={fx0}, tan({x1})={fx1}"
+                );
 
                 let incoming_lower = incoming.lower_a[[0, 0]] * fx0
                     + incoming.lower_a[[0, 1]] * fx1

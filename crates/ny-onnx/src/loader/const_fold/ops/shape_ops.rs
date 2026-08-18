@@ -23,7 +23,7 @@ fn read_int_attribute(node: &onnx_proto::NodeProto, name: &str) -> Option<i64> {
         .iter()
         .find(|attr| attr.name == name)
         .and_then(|attr| match attr.r#type {
-            attribute_type::INT => Some(attr.i),
+            attribute_type::INT => Some(attr.i_value()),
             _ => None,
         })
 }
@@ -59,14 +59,15 @@ pub(super) fn try_fold_shape_node(
     };
     let start = clamp_axis(read_int_attribute(node, "start").unwrap_or(0)) as usize;
     let end = clamp_axis(read_int_attribute(node, "end").unwrap_or(rank)) as usize;
-    if start > end {
-        warn!(
-            "Shape fold {}: invalid start/end range ({}..{}) for rank {}; not folding",
-            node.name, start, end, rank
-        );
-        return None;
-    }
-    let shape = &shape[start..end];
+    // Shape-15 defines start > end as a valid empty one-dimensional result,
+    // not an invalid range.  Preserve that distinction: refusing the fold can
+    // strand an INT64 shape value on ny's FLOAT-only runtime path, while
+    // clamping/reordering the endpoints would invent dimensions.
+    let shape = if start <= end {
+        &shape[start..end]
+    } else {
+        &shape[0..0]
+    };
 
     // Encode symbolic dimensions as copy-axis sentinels. A literal -1 means
     // "infer exactly one dimension", and ONNX's public 0 sentinel only copies
@@ -100,10 +101,6 @@ pub(super) fn try_fold_shape_node(
                 })
         })
         .collect();
-    if values.is_empty() {
-        return None;
-    }
-
     let float_data = ArrayD::from_shape_vec(IxDyn(&[values.len()]), values).ok()?;
     let integer_data = ArrayD::from_shape_vec(IxDyn(&[shape_dims.len()]), shape_dims).ok()?;
     debug!(
@@ -114,7 +111,10 @@ pub(super) fn try_fold_shape_node(
     Some(FoldedTensor {
         float_data,
         integer_data: Some(integer_data),
-        integer_range: None,
+        // Shape always produces INT64, irrespective of the activation dtype.
+        // Preserve that dtype provenance so downstream shape arithmetic can
+        // use exact checked i64 semantics rather than the lossy f32 view.
+        integer_range: Some((i64::MIN, i64::MAX)),
     })
 }
 
@@ -237,7 +237,7 @@ fn try_fold_gather_node(
         .attribute
         .iter()
         .find(|attr| attr.name == "axis")
-        .map(|attr| attr.i)
+        .map(|attr| attr.i_value())
         .unwrap_or(0);
     let axis = normalize_axis(axis_attr, data.ndim())?;
     let float_data = const_fold_gather(data, &indices, &indices_shape, axis)?;
@@ -328,10 +328,6 @@ fn try_fold_squeeze(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Opti
     sorted.dedup();
     for &axis in sorted.iter().rev() {
         shape.remove(axis);
-    }
-    // Scalar result: ndarray requires at least one dimension.
-    if shape.is_empty() {
-        shape.push(1);
     }
     let float_data = reshape_with_warning(data.clone(), &shape, "Squeeze")?;
     let integer_data = weights
@@ -463,7 +459,7 @@ fn try_fold_concat(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Optio
         .attribute
         .iter()
         .find(|attr| attr.name == "axis")
-        .map(|attr| attr.i)
+        .map(|attr| attr.i_value())
         .unwrap_or(0);
     let arrays: Vec<&ArrayD<f32>> = node
         .input
@@ -490,10 +486,21 @@ fn try_fold_concat(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Optio
         .collect();
     let integer_data =
         integer_arrays.and_then(|integer_arrays| concat_promoted(integer_arrays, axis));
+    let integer_range = integer_data.as_ref().and_then(|_| {
+        let mut ranges = node
+            .input
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| weights.get_integer_range(name));
+        let first = ranges.next().flatten()?;
+        ranges.all(|range| range == Some(first)).then_some(first)
+    });
     Some(FoldedTensor {
         float_data,
         integer_data,
-        integer_range: None,
+        // Concat is dtype-preserving.  Retain authenticated integer provenance
+        // only when every input carries the same authored integer range.
+        integer_range,
     })
 }
 

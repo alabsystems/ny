@@ -340,7 +340,8 @@ fn test_wgpu_gemm_interval_sound_encloses_true_product_on_gpu() {
             b_hi[i] = c + w;
         }
 
-        let (c_lo, c_hi) = device
+        let diagnostic = super::gemm::WgpuDiagnosticGemm::new(device.as_ref());
+        let (c_lo, c_hi) = diagnostic
             .gemm_interval_sound(m, k, n, &a_lo, &a_hi, &b_lo, &b_hi)
             .expect("gpu interval gemm");
 
@@ -392,7 +393,8 @@ fn test_wgpu_crown_aw_error_step_sound_on_gpu() {
         let a_err: Vec<f32> = (0..m * k).map(|_| (next() * 0.2).abs()).collect();
         let w: Vec<f32> = (0..k * n).map(|_| next() * 3.0).collect();
 
-        let (a_new, a_err_new) = device
+        let diagnostic = super::gemm::WgpuDiagnosticGemm::new(device.as_ref());
+        let (a_new, a_err_new) = diagnostic
             .crown_aw_error_step(m, k, n, &a, &a_err, &w)
             .expect("gpu aw error step");
 
@@ -1316,9 +1318,9 @@ fn test_wgpu_dag_ibp_forward_shape_mismatch_error_4319() {
 // Each sound DAG op emits `[low − r_lo, high + r_hi]` where the directed radius
 // over-bounds every f32 rounding error, so by induction over topological order the
 // GPU box ENCLOSES both the true forward range and any tighter (fast/exact)
-// interval. These oracles prove that containment on Vulkan (which preserves
-// subnormals; the FTZ-flush term is by-construction for Metal and not Vulkan-
-// exercised), plus the routing/degrade contract.
+// interval. These oracles prove containment on the live execution path plus the
+// routing/degrade contract. Subnormal behavior is characterized by the adapter
+// probe, while the FTZ-flush term is checked independently by construction.
 // ============================================================================
 
 /// Concrete f64 forward of the residual DAG: `out = relu(W·x + b) + x`.
@@ -1385,8 +1387,8 @@ fn sound_dag_ibp_residual_encloses_concrete_and_fast_t1_0() {
     };
 
     assert!(
-        device.provides_sound_gpu_dag_ibp(),
-        "wgpu must advertise a sound DAG path"
+        !device.provides_sound_gpu_dag_ibp(),
+        "candidate DAG enclosure tests must not lift the WGPU verdict quarantine"
     );
 
     let sound_plan = device
@@ -1562,16 +1564,15 @@ fn sound_dag_ibp_mini_cnn_encloses_fast_t1_0() {
     }
 }
 
-/// Routing + degrade contract: `provides_sound_gpu_dag_ibp()` is `true`, an empty
-/// plan is `Ok(None)` (fail-closed), and a grouped Conv2d is `Err` (host rejects →
-/// the caller keeps the proven-sound CPU graph loop).
+/// Quarantine + candidate degrade contract: the verdict capability is false,
+/// an empty diagnostic plan is `Ok(None)`, and grouped Conv2d is rejected.
 #[test]
 #[cfg(feature = "gpu-tests")]
 fn sound_dag_ibp_degrade_and_routing_t1_0() {
     let _gpu_serial = gpu_test_serial_guard();
     let device = require_device();
 
-    assert!(device.provides_sound_gpu_dag_ibp());
+    assert!(!device.provides_sound_gpu_dag_ibp());
 
     let empty = GpuDagIbpPlanDesc {
         input_shape: vec![4],
@@ -1775,9 +1776,10 @@ fn maxpool_crown_backward_gpu_sound_encloses_concrete_t1_2() {
 /// must parse, validate under Metal's EXACT capability set — which EXCLUDES FLOAT64
 /// — and emit MSL. A shader that slipped in an f64 op (illegal on Apple GPUs) would
 /// fail `validate` here. This is the COMPILE-TIME half of the Metal enclosure; the
-/// FTZ subnormal-flush *runtime* behavior still needs an Apple-hardware probe
-/// (Vulkan preserves subnormals, so the amplified-flush floors are by-construction
-/// only). Gated on `wgpu` (default), NOT `gpu-tests`, so it runs in a GPU-less CI —
+/// FTZ/DAZ subnormal *runtime* behavior still needs the per-adapter live probe;
+/// backend names do not imply preservation (the observed plain GB10/Vulkan path
+/// also flushes).
+/// Gated on `wgpu` (default), NOT `gpu-tests`, so it runs in a GPU-less CI —
 /// naga's WGSL→MSL translation is pure CPU.
 #[cfg(feature = "wgpu")]
 #[test]
@@ -1785,7 +1787,7 @@ fn sound_shaders_translate_to_metal_msl_t2_2() {
     use naga::back::msl;
     use naga::valid::{ValidationFlags, Validator};
 
-    let shaders: [(&str, String); 10] = [
+    let shaders: [(&str, String); 11] = [
         (
             "linear_ibp_sound",
             super::super::shaders::linear_ibp_sound_source(),
@@ -1827,6 +1829,10 @@ fn sound_shaders_translate_to_metal_msl_t2_2() {
             // floor targets Metal, so its MSL translation matters (self-contained WGSL).
             "crown_aw_error_combine",
             super::super::shaders::CROWN_AW_ERROR_COMBINE_SHADER.to_string(),
+        ),
+        (
+            "crown_strided_gather",
+            super::super::shaders::CROWN_STRIDED_GATHER_SHADER.to_string(),
         ),
     ];
 
@@ -2174,10 +2180,10 @@ fn concrete_forward_mlp(
 ///   GPU_sound_lo <= concrete_sample <= GPU_sound_hi    (S1: encloses TRUE outputs)
 /// with ZERO enclosure violations.
 ///
-/// FTZ note (spec §7/A10): Vulkan PRESERVES subnormals, so the §0 weight-amplified
-/// operand-flush term is computed EXACTLY here and is trivially sound — this oracle
-/// validates the NORMAL-path S1/S2 invariants. The `flush` amplifier is checked
-/// by-construction in `sound_gpu_ibp_flush_radius_amplified_by_weight_t1_1`.
+/// Subnormal note (spec §7/A10): preservation is qualified by the live adapter
+/// probe, not inferred from Vulkan. This oracle validates S1/S2 on the execution
+/// path it actually receives; the `flush` amplifier is checked by construction
+/// in `sound_gpu_ibp_flush_radius_amplified_by_weight_t1_1`.
 ///
 /// The CPU reference is the exact path the GPU replaces: the N-D
 /// `linear.propagate_ibp_sound` (which double-widens by `2·(in+2)` ULPs). We assert
@@ -2210,7 +2216,7 @@ fn sound_gpu_ibp_linear_encloses_cpu_sound_and_samples_t1_1() {
         (&[4, 4, 4], 1.5, 0.15, false),  // cancellation across depth
         (&[2, 3], 64.0, 0.3, false),     // large weights (2^6)
         (&[2, 3], 1024.0, 0.2, false),   // large weights (2^10)
-        (&[3, 4], 1.0, 1e-38, false),    // subnormal-range box (Vulkan exact)
+        (&[3, 4], 1.0, 1e-38, false),    // subnormal-range, live-path-qualified
     ];
 
     let batch = 2usize;
@@ -2366,10 +2372,11 @@ fn sound_gpu_ibp_linear_nan_inf_box_degrades_to_fallback_t1_1() {
     }
 }
 
-/// By-construction check the Vulkan oracle CANNOT do (spec §7): the §0 weight-
-/// amplified operand-flush floor makes the emitted radius `>= |W|·FLT_MIN` even for
-/// a subnormal input Vulkan computes exactly. A weight-INDEPENDENT floor would emit
-/// a radius ~90 binary orders of magnitude too tight here (a false-VERIFIED break).
+/// By-construction check that the sampled execution oracle cannot establish alone
+/// (spec §7): the §0 weight-amplified operand-flush floor makes the emitted radius
+/// `>= |W|·FLT_MIN` even when the execution path preserves a subnormal input. A
+/// weight-INDEPENDENT floor would emit a radius ~90 binary orders of magnitude too
+/// tight here (a false-VERIFIED break).
 #[test]
 #[cfg(feature = "gpu-tests")]
 fn sound_gpu_ibp_flush_radius_amplified_by_weight_t1_1() {
@@ -2378,7 +2385,7 @@ fn sound_gpu_ibp_flush_radius_amplified_by_weight_t1_1() {
     let gpu: &dyn GpuIbpForward = &*device;
 
     let w = 2.0f32.powi(100); // huge weight
-    let x = 2.0f32.powi(-130); // valid subnormal input (Vulkan preserves it)
+    let x = 2.0f32.powi(-130); // valid subnormal; preservation is execution-path-specific
     let layers = vec![GpuIbpLayer::Linear {
         weight: Arc::from(vec![w]),
         bias: Some(Arc::from(vec![0.0f32])),
@@ -2469,7 +2476,7 @@ fn sound_gpu_ibp_view_is_exact_passthrough_t1_1() {
     );
 }
 
-// ── Sound GPU IBP graph-op siblings (§3.2–§3.8) — Vulkan enclosure oracles ─────
+// ── Sound GPU IBP graph-op siblings (§3.2–§3.8) — live-path oracles ──────────
 //
 // These oracles gate the SOUND shader siblings the same way the Linear keystone is
 // gated: the emitted f32 interval must be a SUPERSET of the TRUE mathematical range
@@ -2483,10 +2490,9 @@ fn sound_gpu_ibp_view_is_exact_passthrough_t1_1() {
 // Scale/AvgPool) are NOT verdict-wired until the DAG accessor forwards the sound
 // flag (T1.0), so their oracle asserts the STRONGER `GPU ⊇ exact-f64 truth`.
 //
-// FTZ note (spec §7/A10): Vulkan PRESERVES subnormals, so the §0 weight/|s|-amplified
-// operand-flush term is computed EXACTLY on Vulkan and cannot be probed for
-// under-sizing here — that is a by-construction + CI-on-Metal guarantee, checked
-// directly in the `*_flush_*` tests below by reading back the emitted radius.
+// Subnormal note (spec §7/A10): a Vulkan backend name does not establish
+// preservation. The live adapter gate characterizes the arithmetic; the
+// `*_flush_*` tests below independently read back the emitted widening.
 
 /// A small deterministic LCG in [-1, 1] for the sound graph-op oracles.
 #[cfg(feature = "gpu-tests")]
@@ -2502,7 +2508,7 @@ fn sound_op_rng(seed: u64) -> impl FnMut() -> f32 {
 
 /// S1 oracle for the SOUND MatMul IBP shader (§3.3): the emitted interval encloses
 /// the exact f64 range of the interval matrix product over the box, including
-/// cancellation, large-magnitude, and subnormal-range (Vulkan-exact) configs.
+/// cancellation, large-magnitude, and subnormal-range (live-path-qualified) configs.
 #[test]
 #[cfg(feature = "gpu-tests")]
 fn sound_gpu_ibp_matmul_encloses_truth_t1_1() {
@@ -2516,7 +2522,7 @@ fn sound_gpu_ibp_matmul_encloses_truth_t1_1() {
         (1, 4, 8, 4, 2.0, 0.5, 0.2),
         (1, 3, 6, 3, 3.0, 3.0, 0.5),   // heavy cancellation (S ≫ |y|)
         (1, 2, 3, 2, 64.0, 64.0, 0.3), // large magnitudes
-        (1, 3, 3, 3, 1.0, 1.0, 1e-38), // subnormal-range box (Vulkan exact)
+        (1, 3, 3, 3, 1.0, 1.0, 1e-38), // subnormal-range, live-path-qualified
     ];
     let mut checks = 0usize;
     for &(batch, m, k, n, ascale, bscale, hw) in configs {
@@ -2700,7 +2706,7 @@ fn sound_gpu_ibp_transpose_encloses_truth_t1_1() {
 }
 
 /// S1 oracle for the SOUND Scale IBP shader (§3.8), including `|s| > 16` (the fixed-
-/// floor break) and a `|s|·subnormal` amplification case (Vulkan-exact).
+/// floor break) and a live-path-qualified `|s|·subnormal` amplification case.
 #[test]
 #[cfg(feature = "gpu-tests")]
 fn sound_gpu_ibp_scale_encloses_truth_t1_1() {
@@ -2751,10 +2757,11 @@ fn sound_gpu_ibp_scale_encloses_truth_t1_1() {
     eprintln!("sound GPU IBP scale oracle: {checks} enclosure checks, 0 violations");
 }
 
-/// By-construction check the Vulkan oracle cannot do (spec §7 case d): the §3.8
-/// `|s|`-amplified `scale_floor` makes the emitted half-width `≥ |s|·FLT_MIN` even
-/// for a subnormal input Vulkan computes exactly. A fixed `ADDITIVE1` floor (UNSOUND
-/// for `|s| > 16`) would be ~14 binary orders too tight here.
+/// By-construction check that the sampled execution oracle cannot establish alone
+/// (spec §7 case d): the §3.8 `|s|`-amplified `scale_floor` makes the emitted
+/// half-width `≥ |s|·FLT_MIN` even when the execution path preserves a subnormal
+/// input. A fixed `ADDITIVE1` floor (UNSOUND for `|s| > 16`) would be ~14 binary
+/// orders too tight here.
 #[test]
 #[cfg(feature = "gpu-tests")]
 fn sound_gpu_ibp_scale_flush_amplified_by_scale_t1_1() {

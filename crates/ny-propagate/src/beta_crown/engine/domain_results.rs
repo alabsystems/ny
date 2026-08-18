@@ -40,6 +40,19 @@ pub(super) enum MultiObjectiveGraphDomainResult {
     Violation,
     /// Children created (each child has bounds and verification status)
     Children(Vec<(MultiObjectiveGraphBabDomain, bool)>), // (domain, all_verified)
+    /// Children created, but at least one SIBLING was dropped as a "conclusive
+    /// violation" (#violdrop). The surviving children must still be enqueued —
+    /// a drop on one child says nothing about its siblings' sub-regions — while
+    /// the drop is still recorded so the final verdict cannot claim `Verified`
+    /// for the abandoned region.
+    ///
+    /// The batched GPU lane used to REPLACE the whole `Children` result with
+    /// [`Self::Violation`], discarding every surviving sibling with it; the
+    /// sequential lane never had that defect (its `ChildOutcome::Dropped` is
+    /// per-child and the loop keeps processing the remaining children). Only
+    /// reachable with the legacy drop armed (`NY_BAB_DROP_VIOLATED_CHILD=1`),
+    /// which is off by default.
+    ChildrenWithViolatedDrop(Vec<(MultiObjectiveGraphBabDomain, bool)>),
     /// No unstable neurons - domain cannot be split.
     /// #1866: Now carries `any_violated` so the BaB loop can distinguish
     /// violation (PotentialViolation) from unresolved (Unknown).
@@ -49,4 +62,10 @@ pub(super) enum MultiObjectiveGraphDomainResult {
     },
     /// Child propagation failed — domain is unresolved (#1861).
     PropagationFailure,
+    /// At least one child of this parent was not evaluated because the
+    /// authoritative BaB deadline (or its safe GPU admission reserve) refused
+    /// the next cooperative chunk. This is distinct from a numerical
+    /// propagation failure and must dominate every partial result for the
+    /// parent; the outer verifier terminates with `Timeout`.
+    DeadlineExpired,
 }

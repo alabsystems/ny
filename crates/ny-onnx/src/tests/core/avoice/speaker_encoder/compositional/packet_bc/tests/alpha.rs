@@ -62,8 +62,9 @@ fn alpha_smoke_config_for_stage() -> AlphaCrownConfig {
 /// Part of #3499 criterion 3.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_stage_local_alpha_crown_tightens_stage_outputs_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = bounded_speaker_encoder_cosine_input(
@@ -117,8 +118,9 @@ fn test_ecapa_stage_local_alpha_crown_tightens_stage_outputs_3499() {
 /// Part of #3499 criterion 3.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_alpha_compositional_cosine_distance_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = bounded_speaker_encoder_cosine_input(

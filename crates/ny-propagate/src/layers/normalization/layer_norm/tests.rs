@@ -59,10 +59,15 @@ fn test_builder_methods_chain_correctly() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_eval_standard_hand_computed() {
-    // x = [1, 3], ny = [1, 1], beta = [0, 0], eps = 0 (clamped to 1e-12)
+    // x = [1, 3], ny = [1, 1], beta = [0, 0], eps = supported minimum
     // mean = 2, var = ((1-2)^2 + (3-2)^2)/2 = 1, std ≈ 1
     // y ≈ [1*(1-2)/1 + 0, 1*(3-2)/1 + 0] = [-1, 1]
-    let layer = LayerNormLayer::new(arr1(&[1.0, 1.0]), arr1(&[0.0, 0.0]), 0.0).unwrap();
+    let layer = LayerNormLayer::new(
+        arr1(&[1.0, 1.0]),
+        arr1(&[0.0, 0.0]),
+        crate::layers::normalization::NORMALIZATION_MIN_EPS,
+    )
+    .unwrap();
     let y = layer.eval(&arr1(&[1.0, 3.0])).unwrap();
     assert_close(y[0], -1.0, TOL);
     assert_close(y[1], 1.0, TOL);
@@ -71,10 +76,15 @@ fn test_eval_standard_hand_computed() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_eval_standard_with_ny_beta() {
-    // x = [1, 3], ny = [2, 0.5], beta = [10, -5], eps = 0 (clamped to 1e-12)
+    // x = [1, 3], ny = [2, 0.5], beta = [10, -5], eps = supported minimum
     // mean = 2, std ≈ 1 (from above)
     // y ≈ [2*(-1) + 10, 0.5*(1) + (-5)] = [8, -4.5]
-    let layer = LayerNormLayer::new(arr1(&[2.0, 0.5]), arr1(&[10.0, -5.0]), 0.0).unwrap();
+    let layer = LayerNormLayer::new(
+        arr1(&[2.0, 0.5]),
+        arr1(&[10.0, -5.0]),
+        crate::layers::normalization::NORMALIZATION_MIN_EPS,
+    )
+    .unwrap();
     let y = layer.eval(&arr1(&[1.0, 3.0])).unwrap();
     assert_close(y[0], 8.0, TOL);
     assert_close(y[1], -4.5, TOL);
@@ -86,7 +96,12 @@ fn test_eval_mean_only_mode() {
     // x = [1, 3], ny = [1, 1], beta = [0, 0]
     // mean = 2
     // y = [1*(1-2) + 0, 1*(3-2) + 0] = [-1, 1]
-    let mut layer = LayerNormLayer::new(arr1(&[1.0, 1.0]), arr1(&[0.0, 0.0]), 0.0).unwrap();
+    let mut layer = LayerNormLayer::new(
+        arr1(&[1.0, 1.0]),
+        arr1(&[0.0, 0.0]),
+        crate::layers::normalization::NORMALIZATION_MIN_EPS,
+    )
+    .unwrap();
     layer.mode = LayerNormMode::MeanOnly;
     let y = layer.eval(&arr1(&[1.0, 3.0])).unwrap();
     assert_close(y[0], -1.0, TOL);
@@ -680,9 +695,13 @@ fn test_crown_sampling_jacobian_overflow_returns_error_2901() {
     // ny/std = 1e35/1e-6 = 1e41 → overflows f32 to Inf.
     let large_gamma = arr1(&[1e35, 1e35, 1e35]);
     let beta = arr1(&[0.0, 0.0, 0.0]);
-    let layer = LayerNormLayer::new(large_gamma, beta, 0.0) // eps clamped to 1e-12
-        .unwrap()
-        .with_crown_mode(LayerNormCrownMode::Sampling);
+    let layer = LayerNormLayer::new(
+        large_gamma,
+        beta,
+        crate::layers::normalization::NORMALIZATION_MIN_EPS,
+    )
+    .unwrap()
+    .with_crown_mode(LayerNormCrownMode::Sampling);
 
     let bounds = LinearBounds::identity(3);
     // Nearly constant inputs → var ≈ 0, std ≈ sqrt(eps)
@@ -1029,6 +1048,45 @@ fn test_ibp_forward_mode_soundness_custom_ny_3098() -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// A midpoint rounded to `f32` can be asymmetric by one ULP. The radius must
+/// be rounded up from that stored midpoint or a legal endpoint can be lost.
+#[ntest::timeout(10000)]
+#[test]
+fn test_ibp_forward_mode_narrow_box_contains_mixed_corner_exactly() -> Result<()> {
+    let layer = LayerNormLayer::new(
+        arr1(&[1.9488065, 1.4946282, 0.37475348, 0.19785547]),
+        arr1(&[-0.045644253, 0.05684638, 0.23897907, -0.009834066]),
+        1e-5,
+    )?
+    .with_forward_mode(true);
+    let lower = arr1(&[-0.20841855, 0.023820192, 0.17795724, 0.16860017]);
+    let upper = arr1(&[-0.20841847, 0.023820221, 0.17795737, 0.16860041]);
+    let input = BoundedTensor::new(lower.clone().into_dyn(), upper.clone().into_dyn())?;
+    let output = layer.propagate_ibp(&input)?;
+
+    let corner = arr1(&[upper[0], lower[1], upper[2], upper[3]]);
+    let evaluated = layer.eval(&corner)?;
+    for i in 0..evaluated.len() {
+        assert!(
+            output.lower()[[i]] <= evaluated[i],
+            "dim {i}: lower={} ({:08x}) excludes eval={} ({:08x})",
+            output.lower()[[i]],
+            output.lower()[[i]].to_bits(),
+            evaluated[i],
+            evaluated[i].to_bits()
+        );
+        assert!(
+            evaluated[i] <= output.upper()[[i]],
+            "dim {i}: eval={} ({:08x}) exceeds upper={} ({:08x})",
+            evaluated[i],
+            evaluated[i].to_bits(),
+            output.upper()[[i]],
+            output.upper()[[i]].to_bits()
+        );
     }
     Ok(())
 }

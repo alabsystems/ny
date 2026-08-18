@@ -291,7 +291,9 @@ impl WgpuDevice {
 
                     // Host-side sound error sizing (§3.1). k = reduction length + 3
                     // (dot + {combine, bias-add, final widen-op}).
-                    let k = in_features + 3;
+                    let k = in_features.checked_add(3).ok_or_else(|| {
+                        NyError::InvalidSpec("sound ibp linear reduction length overflow".into())
+                    })?;
                     let k_u32 = gpu_checked_u32(k, "sound ibp linear k")?;
                     let params = LinearIbpSoundParams {
                         batch_size: gpu_checked_u32(batch_size, "sound ibp linear batch")?,
@@ -304,8 +306,8 @@ impl WgpuDevice {
                             2usize.saturating_mul(in_features.saturating_add(2)),
                             "sound ibp linear n_ulps",
                         )?,
-                        gamma_k: gamma_k_f32(k),
-                        slack: combine_slack_f32(k),
+                        gamma_k: gamma_k_f32(k)?,
+                        slack: combine_slack_f32(k)?,
                         additive: ftz_safe_underflow_floor(k_u32),
                         _pad: 0,
                     };
@@ -551,7 +553,9 @@ impl WgpuDevice {
 
                     // k = macs + 3; n_ulps = 2·(macs + 2) — full window (padding taps
                     // over-counted ⇒ sound but looser at the border, §3.2).
-                    let k = macs + 3;
+                    let k = macs.checked_add(3).ok_or_else(|| {
+                        NyError::InvalidSpec("sound ibp conv reduction length overflow".into())
+                    })?;
                     let k_u32 = gpu_checked_u32(k, "sound ibp conv k")?;
                     let params = Conv2dIbpSoundParams {
                         batch_size: gpu_checked_u32(batch_size, "sound ibp conv batch")?,
@@ -572,8 +576,8 @@ impl WgpuDevice {
                             2usize.saturating_mul(macs.saturating_add(2)),
                             "sound ibp conv n_ulps",
                         )?,
-                        gamma_k: gamma_k_f32(k),
-                        slack: combine_slack_f32(k),
+                        gamma_k: gamma_k_f32(k)?,
+                        slack: combine_slack_f32(k)?,
                         additive: ftz_safe_underflow_floor(k_u32),
                         _pad0: 0,
                         _pad1: 0,

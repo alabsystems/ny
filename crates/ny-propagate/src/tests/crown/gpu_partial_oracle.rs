@@ -20,6 +20,7 @@
 
 use super::helpers::assert_bounded_tensor_close;
 use super::*;
+use crate::network::ibp::NetworkIbpExt;
 use ndarray::{arr1, arr2, Array2};
 use ny_core::{
     GemmEngine, GpuCrownBackward, GpuCrownLayer, GpuCrownResult, NaiveCpuGemmEngine, NyError,
@@ -28,6 +29,7 @@ use ny_core::{
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // ScriptedPartialGpuCrownEngine
@@ -38,7 +40,16 @@ enum PartialGpuResult {
     /// Return exact bounds (lower, upper).
     Bounds { lower: Vec<f32>, upper: Vec<f32> },
     /// Return an error to trigger the GPU-error fallback path.
-    Error(&'static str),
+    Error(PartialGpuFailure),
+}
+
+#[derive(Clone, Copy)]
+enum PartialGpuFailure {
+    UnsupportedOp,
+    Device,
+    Validation,
+    Oom,
+    Deadline,
 }
 
 /// One expected GPU call with identity assertions.
@@ -150,7 +161,22 @@ impl GpuCrownBackward for ScriptedPartialGpuCrownEngine {
                 lower_bounds: lower,
                 upper_bounds: upper,
             }),
-            PartialGpuResult::Error(msg) => Err(NyError::UnsupportedConfiguration(msg.to_string())),
+            PartialGpuResult::Error(failure) => Err(match failure {
+                PartialGpuFailure::UnsupportedOp => {
+                    NyError::UnsupportedOp("scripted unsupported GPU op".into())
+                }
+                PartialGpuFailure::Device => NyError::InternalError("scripted device loss".into()),
+                PartialGpuFailure::Validation => {
+                    NyError::InvalidSpec("scripted GPU validation failure".into())
+                }
+                PartialGpuFailure::Oom => NyError::GpuMemoryExceeded {
+                    required_bytes: 2,
+                    budget_bytes: 1,
+                },
+                PartialGpuFailure::Deadline => {
+                    NyError::DeadlineExceeded("scripted GPU deadline refusal".into())
+                }
+            }),
         }
     }
 }
@@ -180,6 +206,25 @@ fn assert_outputs_match(
             au,
             el,
             eu,
+        );
+    }
+}
+
+/// Assert that `outer` is a sound relaxation of an independently computed
+/// enclosure. Equality is intentionally not required: finite authority may
+/// type-refuse an opaque CPU kernel and retain the looser forward bound.
+fn assert_encloses(outer: &BoundedTensor, enclosed: &BoundedTensor, tolerance: f32, label: &str) {
+    assert_eq!(outer.shape(), enclosed.shape(), "{label}: shape mismatch");
+    for (index, ((&outer_lower, &outer_upper), (&inner_lower, &inner_upper))) in outer
+        .lower()
+        .iter()
+        .zip(outer.upper())
+        .zip(enclosed.lower().iter().zip(enclosed.upper()))
+        .enumerate()
+    {
+        assert!(
+            outer_lower <= inner_lower + tolerance && outer_upper + tolerance >= inner_upper,
+            "{label} output {index}: outer=[{outer_lower}, {outer_upper}], enclosed=[{inner_lower}, {inner_upper}]"
         );
     }
 }
@@ -216,54 +261,57 @@ fn build_parity_network(
 #[test]
 fn test_crown_ibp_gpu_partial_dense_parity_matches_cpu_3599() -> Result<()> {
     let _g = lock_gate();
-    // Dense parity fixture from the design doc.
-    // 2 outputs, both potentially unstable → stable_frac < 0.9 → dense mode.
-    let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
-    let b2 = arr1(&[0.0, 0.15]);
-    let (network, input) = build_parity_network(w2, b2)?;
+    tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
+        // Dense parity fixture from the design doc.
+        // 2 outputs, both potentially unstable → stable_frac < 0.9 → dense mode.
+        let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
+        let b2 = arr1(&[0.0, 0.15]);
+        let (network, input) = build_parity_network(w2, b2)?;
 
-    // Step 1: CPU oracle (engine=None).
-    let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
-    let cpu_final = &cpu.bounds[2]; // Layer 2 = final Linear output.
+        // Step 1: CPU oracle (engine=None).
+        let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+        let cpu_final = &cpu.bounds[2]; // Layer 2 = final Linear output.
 
-    // Step 2: Script the GPU engine to return the CPU oracle bounds.
-    // Since cpu_final ⊆ IBP, intersection(IBP, cpu_final) = cpu_final.
-    // This tests that the plumbing (spec construction, layer extraction,
-    // reshape, intersection) preserves the GPU result correctly.
-    let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
-        num_specs: 2,
-        layer_kinds: vec!["Linear", "Activation", "Linear"],
-        result: PartialGpuResult::Bounds {
-            lower: cpu_final.lower().iter().copied().collect(),
-            upper: cpu_final.upper().iter().copied().collect(),
-        },
-    }]);
+        // Step 2: Script the GPU engine to return the CPU oracle bounds.
+        // Since cpu_final ⊆ IBP, intersection(IBP, cpu_final) = cpu_final.
+        // This tests that the plumbing (spec construction, layer extraction,
+        // reshape, intersection) preserves the GPU result correctly.
+        let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
+            num_specs: 2,
+            layer_kinds: vec!["Linear", "Activation", "Linear"],
+            result: PartialGpuResult::Bounds {
+                lower: cpu_final.lower().iter().copied().collect(),
+                upper: cpu_final.upper().iter().copied().collect(),
+            },
+        }]);
 
-    // Step 3: Run CROWN-IBP with the scripted GPU engine.
-    let gpu = network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
+        // Step 3: Run CROWN-IBP with the scripted GPU engine.
+        let gpu =
+            network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
 
-    // Step 4: Assertions.
-    assert_eq!(scripted.gpu_calls(), 1, "GPU should be called exactly once");
-    scripted.assert_all_consumed();
+        // Step 4: Assertions.
+        assert_eq!(scripted.gpu_calls(), 1, "GPU should be called exactly once");
+        scripted.assert_all_consumed();
 
-    // Final output bounds should match CPU oracle.
-    assert_bounded_tensor_close(&gpu.bounds[2], cpu_final, 1e-6, "gpu partial vs cpu");
+        // Final output bounds should match CPU oracle.
+        assert_bounded_tensor_close(&gpu.bounds[2], cpu_final, 1e-6, "gpu partial vs cpu");
 
-    // Provenance for final layer should be Crown (not fallback).
-    assert_eq!(
-        gpu.provenance_for_layer(2),
-        Some(BoundsProvenance::Crown),
-        "final layer should have Crown provenance, not fallback"
-    );
+        // Provenance for final layer should be Crown (not fallback).
+        assert_eq!(
+            gpu.provenance_for_layer(2),
+            Some(BoundsProvenance::Crown),
+            "final layer should have Crown provenance, not fallback"
+        );
 
-    // No fallback events should be recorded for the GPU path.
-    assert!(
-        !gpu.has_fallbacks(),
-        "GPU parity run should produce no fallback events, got: {:?}",
-        gpu.fallback_events
-    );
+        // No fallback events should be recorded for the GPU path.
+        assert!(
+            !gpu.has_fallbacks(),
+            "GPU parity run should produce no fallback events, got: {:?}",
+            gpu.fallback_events
+        );
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -274,74 +322,77 @@ fn test_crown_ibp_gpu_partial_dense_parity_matches_cpu_3599() -> Result<()> {
 #[test]
 fn test_crown_ibp_gpu_partial_sparse_parity_matches_cpu_3599() -> Result<()> {
     let _g = lock_gate();
-    // Sparse parity fixture from the design doc.
-    // 10 outputs, exactly 1 unstable (output 0) → stable_frac = 0.9 → sparse.
-    let w2 = arr2(&[
-        [1.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 0.0, -1.0],
-        [0.5, 0.0, 0.0],
-        [-0.5, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-    ]);
-    let b2 = arr1(&[
-        -0.25, 0.10, -0.10, 0.05, -0.30, 0.20, -0.10, 0.02, -0.02, 0.40,
-    ]);
-    let (network, input) = build_parity_network(w2, b2)?;
+    tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
+        // Sparse parity fixture from the design doc.
+        // 10 outputs, exactly 1 unstable (output 0) → stable_frac = 0.9 → sparse.
+        let w2 = arr2(&[
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.5, 0.0, 0.0],
+            [-0.5, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]);
+        let b2 = arr1(&[
+            -0.25, 0.10, -0.10, 0.05, -0.30, 0.20, -0.10, 0.02, -0.02, 0.40,
+        ]);
+        let (network, input) = build_parity_network(w2, b2)?;
 
-    // Step 1: CPU oracle.
-    let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
-    let cpu_final = &cpu.bounds[2];
+        // Step 1: CPU oracle.
+        let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+        let cpu_final = &cpu.bounds[2];
 
-    // The unstable output is index 0 (IBP interval crosses zero).
-    // Extract just that element as the sparse GPU result.
-    let sparse_lower = vec![cpu_final.lower()[[0]]];
-    let sparse_upper = vec![cpu_final.upper()[[0]]];
+        // The unstable output is index 0 (IBP interval crosses zero).
+        // Extract just that element as the sparse GPU result.
+        let sparse_lower = vec![cpu_final.lower()[[0]]];
+        let sparse_upper = vec![cpu_final.upper()[[0]]];
 
-    // Step 2: Script GPU engine with sparse expectation.
-    // num_specs=1 because only 1 unstable output out of 10.
-    let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
-        num_specs: 1,
-        layer_kinds: vec!["Linear", "Activation", "Linear"],
-        result: PartialGpuResult::Bounds {
-            lower: sparse_lower,
-            upper: sparse_upper,
-        },
-    }]);
+        // Step 2: Script GPU engine with sparse expectation.
+        // num_specs=1 because only 1 unstable output out of 10.
+        let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
+            num_specs: 1,
+            layer_kinds: vec!["Linear", "Activation", "Linear"],
+            result: PartialGpuResult::Bounds {
+                lower: sparse_lower,
+                upper: sparse_upper,
+            },
+        }]);
 
-    // Step 3: Run CROWN-IBP with the scripted GPU engine.
-    let gpu = network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
+        // Step 3: Run CROWN-IBP with the scripted GPU engine.
+        let gpu =
+            network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
 
-    // Step 4: Assertions.
-    assert_eq!(
-        scripted.gpu_calls(),
-        1,
-        "GPU should be called once with sparse spec"
-    );
-    scripted.assert_all_consumed();
+        // Step 4: Assertions.
+        assert_eq!(
+            scripted.gpu_calls(),
+            1,
+            "GPU should be called once with sparse spec"
+        );
+        scripted.assert_all_consumed();
 
-    // All 10 output bounds should match CPU oracle.
-    assert_bounded_tensor_close(&gpu.bounds[2], cpu_final, 1e-6, "gpu partial vs cpu");
+        // All 10 output bounds should match CPU oracle.
+        assert_bounded_tensor_close(&gpu.bounds[2], cpu_final, 1e-6, "gpu partial vs cpu");
 
-    // Verify the stable outputs (1..=9) specifically match IBP (untouched).
-    let ibp_bounds = network.collect_ibp_bounds(&input)?;
-    assert_outputs_match(&gpu.bounds[2], &ibp_bounds[2], 1..10, 1e-6, "stable IBP");
+        // Verify the stable outputs (1..=9) specifically match IBP (untouched).
+        let ibp_bounds = network.collect_ibp_bounds(&input)?;
+        assert_outputs_match(&gpu.bounds[2], &ibp_bounds[2], 1..10, 1e-6, "stable IBP");
 
-    assert_eq!(
-        gpu.provenance_for_layer(2),
-        Some(BoundsProvenance::Crown),
-        "final layer should have Crown provenance"
-    );
-    assert!(
-        !gpu.has_fallbacks(),
-        "sparse parity run should produce no fallback events"
-    );
+        assert_eq!(
+            gpu.provenance_for_layer(2),
+            Some(BoundsProvenance::Crown),
+            "final layer should have Crown provenance"
+        );
+        assert!(
+            !gpu.has_fallbacks(),
+            "sparse parity run should produce no fallback events"
+        );
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -458,41 +509,79 @@ fn test_crown_ibp_gpu_partial_falls_back_on_unsupported_layer_3599() -> Result<(
 #[test]
 fn test_crown_ibp_gpu_partial_falls_back_on_gpu_error_3599() -> Result<()> {
     let _g = lock_gate();
-    // Reuse the dense parity network.
-    let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
-    let b2 = arr1(&[0.0, 0.15]);
-    let (network, input) = build_parity_network(w2, b2)?;
+    tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
+        // Reuse the dense parity network.
+        let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
+        let b2 = arr1(&[0.0, 0.15]);
+        let (network, input) = build_parity_network(w2, b2)?;
 
-    // Script GPU engine to return an error.
-    let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
-        num_specs: 2,
-        layer_kinds: vec!["Linear", "Activation", "Linear"],
-        result: PartialGpuResult::Error("mock gpu failure"),
-    }]);
+        // Script GPU engine to return an error.
+        let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
+            num_specs: 2,
+            layer_kinds: vec!["Linear", "Activation", "Linear"],
+            result: PartialGpuResult::Error(PartialGpuFailure::UnsupportedOp),
+        }]);
 
-    let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
-    let gpu = network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
+        let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+        let gpu =
+            network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
 
-    assert_eq!(
-        scripted.gpu_calls(),
-        1,
-        "GPU should be attempted before falling back"
-    );
-    scripted.assert_all_consumed();
+        assert_eq!(
+            scripted.gpu_calls(),
+            1,
+            "GPU should be attempted before falling back"
+        );
+        scripted.assert_all_consumed();
 
-    // CPU fallback produces same result because try_gpu_crown_partial_backward
-    // returns Ok(None) on GPU error, and the caller falls through to CPU CROWN.
-    assert_bounded_tensor_close(&gpu.bounds[2], &cpu.bounds[2], 1e-6, "gpu partial vs cpu");
+        // CPU fallback produces same result because try_gpu_crown_partial_backward
+        // returns Ok(None) on GPU error, and the caller falls through to CPU CROWN.
+        assert_bounded_tensor_close(&gpu.bounds[2], &cpu.bounds[2], 1e-6, "gpu partial vs cpu");
 
-    // The final layer should still get Crown provenance because the CPU CROWN
-    // fallback path runs after the GPU error.
-    assert_eq!(
-        gpu.provenance_for_layer(2),
-        Some(BoundsProvenance::Crown),
-        "CPU CROWN fallback should produce Crown provenance, not ForwardFallback"
-    );
+        // The final layer should still get Crown provenance because the CPU CROWN
+        // fallback path runs after the GPU error.
+        assert_eq!(
+            gpu.provenance_for_layer(2),
+            Some(BoundsProvenance::Crown),
+            "CPU CROWN fallback should produce Crown provenance, not ForwardFallback"
+        );
 
-    Ok(())
+        Ok(())
+    })
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn partial_gpu_runtime_refusals_all_reach_cpu_crown() -> Result<()> {
+    let _g = lock_gate();
+    tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
+        let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
+        let b2 = arr1(&[0.0, 0.15]);
+        let (network, input) = build_parity_network(w2, b2)?;
+        let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+
+        for (failure, label) in [
+            (PartialGpuFailure::Device, "device failure"),
+            (PartialGpuFailure::Validation, "validation failure"),
+            (PartialGpuFailure::Oom, "GPU OOM"),
+            (PartialGpuFailure::Deadline, "backend deadline refusal"),
+        ] {
+            let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
+                num_specs: 2,
+                layer_kinds: vec!["Linear", "Activation", "Linear"],
+                result: PartialGpuResult::Error(failure),
+            }]);
+            let actual =
+                network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
+            assert_eq!(scripted.gpu_calls(), 1, "{label}: GPU attempt count");
+            scripted.assert_all_consumed();
+            assert_bounded_tensor_close(&actual.bounds[2], &cpu.bounds[2], 1e-6, label);
+            assert_eq!(
+                actual.provenance_for_layer(2),
+                Some(BoundsProvenance::Crown)
+            );
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -503,56 +592,101 @@ fn test_crown_ibp_gpu_partial_falls_back_on_gpu_error_3599() -> Result<()> {
 #[test]
 fn test_crown_ibp_gpu_partial_nan_triggers_cpu_fallback_3752() -> Result<()> {
     let _g = lock_gate();
-    // Fix for #3752: NaN in raw GPU bounds must discard the entire GPU result
-    // and fall back to CPU CROWN. Previously, RepairStrategy::Widen converted
-    // NaN → ±inf before intersection_per_element could detect it, letting
-    // incorrect non-NaN siblings through into the final bounds.
+    tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
+        // Fix for #3752: NaN in raw GPU bounds must discard the entire GPU result
+        // and fall back to CPU CROWN. Previously, RepairStrategy::Widen converted
+        // NaN → ±inf before intersection_per_element could detect it, letting
+        // incorrect non-NaN siblings through into the final bounds.
 
-    let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
-    let b2 = arr1(&[0.0, 0.15]);
-    let (network, input) = build_parity_network(w2, b2)?;
+        let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
+        let b2 = arr1(&[0.0, 0.15]);
+        let (network, input) = build_parity_network(w2, b2)?;
 
-    // CPU oracle (engine=None) — ground truth for comparison.
-    let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
-    let cpu_final = &cpu.bounds[2];
+        // CPU oracle (engine=None) — ground truth for comparison.
+        let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+        let cpu_final = &cpu.bounds[2];
 
-    // Script GPU engine to return bounds with NaN elements.
-    // The NaN pre-check (#3752) should discard this entirely.
-    let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
-        num_specs: 2,
-        layer_kinds: vec!["Linear", "Activation", "Linear"],
-        result: PartialGpuResult::Bounds {
-            lower: vec![f32::NAN, -0.5],
-            upper: vec![0.5, f32::NAN],
-        },
-    }]);
+        // Script GPU engine to return bounds with NaN elements.
+        // The NaN pre-check (#3752) should discard this entirely.
+        let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
+            num_specs: 2,
+            layer_kinds: vec!["Linear", "Activation", "Linear"],
+            result: PartialGpuResult::Bounds {
+                lower: vec![f32::NAN, -0.5],
+                upper: vec![0.5, f32::NAN],
+            },
+        }]);
 
-    let gpu = network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
+        let gpu =
+            network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
 
-    assert_eq!(scripted.gpu_calls(), 1, "GPU should be attempted");
-    scripted.assert_all_consumed();
+        assert_eq!(scripted.gpu_calls(), 1, "GPU should be attempted");
+        scripted.assert_all_consumed();
 
-    // After the NaN pre-check, GPU result is discarded and CPU CROWN runs.
-    // Final bounds should match the CPU oracle exactly.
-    assert_bounded_tensor_close(&gpu.bounds[2], cpu_final, 1e-6, "gpu partial vs cpu");
+        // After the NaN pre-check, GPU result is discarded and CPU CROWN runs.
+        // Final bounds should match the CPU oracle exactly.
+        assert_bounded_tensor_close(&gpu.bounds[2], cpu_final, 1e-6, "gpu partial vs cpu");
 
-    // Provenance should be Crown (from CPU CROWN, not GPU).
-    assert_eq!(
-        gpu.provenance_for_layer(2),
-        Some(BoundsProvenance::Crown),
-        "CPU fallback should produce Crown provenance"
-    );
+        // Provenance should be Crown (from CPU CROWN, not GPU).
+        assert_eq!(
+            gpu.provenance_for_layer(2),
+            Some(BoundsProvenance::Crown),
+            "CPU fallback should produce Crown provenance"
+        );
 
-    Ok(())
+        Ok(())
+    })
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn partial_gpu_wrong_shape_and_infinity_fall_back_to_cpu() -> Result<()> {
+    let _g = lock_gate();
+    tests::with_crown_dense_budget_mb("2048", || -> Result<()> {
+        let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
+        let b2 = arr1(&[0.0, 0.15]);
+        let (network, input) = build_parity_network(w2, b2)?;
+        let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+
+        for (lower, upper, label) in [
+            (vec![-1.0], vec![1.0, 1.0], "wrong lower row count"),
+            (
+                vec![-1.0, -1.0],
+                vec![1.0, 1.0, 1.0],
+                "wrong upper row count",
+            ),
+            (
+                vec![f32::NEG_INFINITY, -1.0],
+                vec![1.0, 1.0],
+                "non-finite endpoint",
+            ),
+        ] {
+            let scripted = ScriptedPartialGpuCrownEngine::new(vec![PartialGpuExpectation {
+                num_specs: 2,
+                layer_kinds: vec!["Linear", "Activation", "Linear"],
+                result: PartialGpuResult::Bounds { lower, upper },
+            }]);
+            let actual =
+                network.collect_crown_ibp_bounds_with_engine_and_status(&input, Some(&scripted))?;
+            assert_eq!(scripted.gpu_calls(), 1, "{label}: GPU attempt count");
+            scripted.assert_all_consumed();
+            assert_bounded_tensor_close(&actual.bounds[2], &cpu.bounds[2], 1e-6, label);
+            assert_eq!(
+                actual.provenance_for_layer(2),
+                Some(BoundsProvenance::Crown)
+            );
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Test G: RepairStrategy::Widen on inverted GPU bounds
+// Test G: inverted GPU bounds are a whole-result refusal
 // ---------------------------------------------------------------------------
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_crown_ibp_gpu_partial_repairs_inverted_bounds_before_intersection_3599() -> Result<()> {
+fn test_crown_ibp_gpu_partial_inversion_falls_back_to_cpu_3599() -> Result<()> {
     let _g = lock_gate();
     // Reuse the dense parity network.
     let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
@@ -563,7 +697,7 @@ fn test_crown_ibp_gpu_partial_repairs_inverted_bounds_before_intersection_3599()
     let cpu_final = &cpu.bounds[2];
 
     // Script GPU engine to return slightly inverted bounds for element 0.
-    // RepairStrategy::Widen should swap lower/upper to fix the inversion.
+    // Device validation must reject the whole result rather than repair it.
     let cpu_lower: Vec<f32> = cpu_final.lower().iter().copied().collect();
     let cpu_upper: Vec<f32> = cpu_final.upper().iter().copied().collect();
 
@@ -589,26 +723,8 @@ fn test_crown_ibp_gpu_partial_repairs_inverted_bounds_before_intersection_3599()
     );
     scripted.assert_all_consumed();
 
-    // The run should not error — RepairStrategy::Widen fixes the inversion.
-    // Verify bounds are valid (lower <= upper).
     let gpu_final = &gpu.bounds[2];
-    for i in 0..gpu_final.len() {
-        assert!(
-            gpu_final.lower()[[i]] <= gpu_final.upper()[[i]],
-            "output[{}]: repaired bounds should be valid: lower={} <= upper={}",
-            i,
-            gpu_final.lower()[[i]],
-            gpu_final.upper()[[i]],
-        );
-    }
-
-    // Element 1 (non-inverted) should still match CPU oracle.
-    let diff_l = (gpu_final.lower()[[1]] - cpu_lower[1]).abs();
-    let diff_u = (gpu_final.upper()[[1]] - cpu_upper[1]).abs();
-    assert!(
-        diff_l < 1e-5 && diff_u < 1e-5,
-        "non-inverted element should match CPU oracle"
-    );
+    assert_bounded_tensor_close(gpu_final, cpu_final, 1e-6, "inverted GPU fallback");
 
     Ok(())
 }
@@ -645,6 +761,17 @@ struct PartialSoundGpuEngine {
     poisoned_upper: Vec<f32>,
     unsound_calls: AtomicUsize,
     sound_calls: AtomicUsize,
+    honors_deadline: bool,
+    deadline_writes: Mutex<Vec<Option<Instant>>>,
+}
+
+impl PartialSoundGpuEngine {
+    fn deadline_writes(&self) -> Vec<Option<Instant>> {
+        self.deadline_writes
+            .lock()
+            .expect("deadline_writes mutex should not be poisoned")
+            .clone()
+    }
 }
 
 impl GemmEngine for PartialSoundGpuEngine {
@@ -689,6 +816,15 @@ impl GpuCrownBackward for PartialSoundGpuEngine {
     fn provides_sound_gpu_crown(&self) -> bool {
         true
     }
+    fn honors_crown_backward_deadline(&self) -> bool {
+        self.honors_deadline
+    }
+    fn set_crown_backward_deadline(&self, deadline: Option<Instant>) {
+        self.deadline_writes
+            .lock()
+            .expect("deadline_writes mutex should not be poisoned")
+            .push(deadline);
+    }
 }
 
 /// GATE ON: the per-node IBP partial path dispatches the verdict-relevant
@@ -728,6 +864,8 @@ fn crown_ibp_partial_gate_on_routes_to_sound_gpu_backward() -> Result<()> {
         poisoned_upper,
         unsound_calls: AtomicUsize::new(0),
         sound_calls: AtomicUsize::new(0),
+        honors_deadline: false,
+        deadline_writes: Mutex::new(Vec::new()),
     };
 
     set_sound_gpu_crown_required(true);
@@ -787,6 +925,8 @@ fn crown_ibp_partial_gate_off_keeps_fast_unsound_backward() -> Result<()> {
         poisoned_upper: bound_upper,
         unsound_calls: AtomicUsize::new(0),
         sound_calls: AtomicUsize::new(0),
+        honors_deadline: false,
+        deadline_writes: Mutex::new(Vec::new()),
     };
 
     assert!(!is_sound_gpu_crown_required());
@@ -801,6 +941,139 @@ fn crown_ibp_partial_gate_off_keeps_fast_unsound_backward() -> Result<()> {
         engine.sound_calls.load(Ordering::SeqCst),
         0,
         "the sound GPU backward must NOT be consulted when the gate is off"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_partial_crown_skips_noncooperative_gpu_backend() -> Result<()> {
+    let _g = lock_gate();
+    let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
+    let b2 = arr1(&[0.0, 0.15]);
+    let (network, input) = build_parity_network(w2, b2)?;
+    let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+    let cpu_final = &cpu.bounds[2];
+    // Bound but unused: the assertions below compare against `cpu`, not IBP.
+    // The CALL is kept because its `?` still asserts the IBP pass succeeds on
+    // this fixture before the GPU-skip path is exercised.
+    let _ibp = network.collect_ibp_bounds(&input)?;
+    let lower: Vec<f32> = cpu_final.lower().iter().copied().collect();
+    let upper: Vec<f32> = cpu_final.upper().iter().copied().collect();
+    let engine = PartialSoundGpuEngine {
+        sound_lower: lower.clone(),
+        sound_upper: upper.clone(),
+        poisoned_lower: lower,
+        poisoned_upper: upper,
+        unsound_calls: AtomicUsize::new(0),
+        sound_calls: AtomicUsize::new(0),
+        honors_deadline: false,
+        deadline_writes: Mutex::new(Vec::new()),
+    };
+
+    set_sound_gpu_crown_required(true);
+    let actual = network.collect_crown_ibp_bounds_with_engine_deadline_and_status_impl(
+        &input,
+        Some(&engine),
+        Some(Instant::now() + Duration::from_secs(30)),
+    )?;
+
+    assert_eq!(
+        engine.sound_calls.load(Ordering::SeqCst),
+        0,
+        "a noncooperative sound GPU backend must not launch under a finite deadline"
+    );
+    assert_eq!(engine.unsound_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        engine.deadline_writes().is_empty(),
+        "a declined backend must not receive a deadline lease"
+    );
+    // Expiry-only decline semantics (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md):
+    // a LIVE finite deadline no longer refuses the dense CPU step, so the final
+    // layer carries tight Crown provenance. The staging invariants above (zero
+    // GPU calls, no device lease) are unchanged and remain the real contract.
+    assert_eq!(
+        actual.provenance_for_layer(2),
+        Some(BoundsProvenance::Crown),
+        "a live (unexpired) deadline must keep the tight dense CPU path"
+    );
+    assert_encloses(
+        &actual.bounds[2],
+        cpu_final,
+        1e-6,
+        "tight CPU result under live deadline",
+    );
+    assert_encloses(
+        &actual.bounds[2],
+        cpu_final,
+        1e-6,
+        "noncooperative finite fallback enclosure",
+    );
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_partial_crown_skips_gpu_before_unpollable_host_setup() -> Result<()> {
+    let _g = lock_gate();
+    let w2 = arr2(&[[0.6, -0.4, 0.3], [-0.2, 0.5, 0.1]]);
+    let b2 = arr1(&[0.0, 0.15]);
+    let (network, input) = build_parity_network(w2, b2)?;
+    let cpu = network.collect_crown_ibp_bounds_with_status(&input)?;
+    let cpu_final = &cpu.bounds[2];
+    // Bound but unused, for the same reason as the sibling test above.
+    let _ibp = network.collect_ibp_bounds(&input)?;
+    let lower: Vec<f32> = cpu_final.lower().iter().copied().collect();
+    let upper: Vec<f32> = cpu_final.upper().iter().copied().collect();
+    let engine = PartialSoundGpuEngine {
+        sound_lower: lower.clone(),
+        sound_upper: upper.clone(),
+        poisoned_lower: lower,
+        poisoned_upper: upper,
+        unsound_calls: AtomicUsize::new(0),
+        sound_calls: AtomicUsize::new(0),
+        honors_deadline: true,
+        deadline_writes: Mutex::new(Vec::new()),
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    set_sound_gpu_crown_required(true);
+    let actual = network.collect_crown_ibp_bounds_with_engine_deadline_and_status_impl(
+        &input,
+        Some(&engine),
+        Some(deadline),
+    )?;
+
+    assert_eq!(
+        engine.sound_calls.load(Ordering::SeqCst),
+        0,
+        "finite authority must stay on the pollable CPU path before host GPU setup"
+    );
+    assert_eq!(engine.unsound_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        engine.deadline_writes().is_empty(),
+        "a GPU route declined before host preparation must not install a device lease"
+    );
+    // Expiry-only decline semantics (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md):
+    // a LIVE finite deadline no longer refuses the dense CPU step, so the final
+    // layer carries tight Crown provenance. The staging invariants above (zero
+    // GPU calls, no device lease) are unchanged and remain the real contract.
+    assert_eq!(
+        actual.provenance_for_layer(2),
+        Some(BoundsProvenance::Crown),
+        "a live (unexpired) deadline must keep the tight dense CPU path"
+    );
+    assert_encloses(
+        &actual.bounds[2],
+        cpu_final,
+        1e-6,
+        "tight CPU result under live deadline",
+    );
+    assert_encloses(
+        &actual.bounds[2],
+        cpu_final,
+        1e-6,
+        "cooperative finite fallback enclosure",
     );
     Ok(())
 }

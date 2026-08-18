@@ -65,14 +65,16 @@ impl BoundPropagation for CeluLayer {
                 alpha,
             )));
         }
-        // Guard: non-finite input bounds → NaN.exp() = NaN flows silently into
-        // output bounds. CROWN path rejects via non_finite_domain_guard.
-        // Pattern: SELU guard at selu.rs:47-53. (#3278)
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // Guard: NaN input bounds → NaN.exp() = NaN flows silently into output
+        // bounds. NaN ONLY — ±Inf is a legitimate input here. An upstream node
+        // that failed closed to an OpaqueSkip hands its consumers `[-inf, +inf]`
+        // (`OpaqueSkipLayer::unbounded_like` builds exactly that); rejecting it
+        // as `NumericalInstability` aborted the WHOLE graph-IBP pass, because
+        // that variant is not in `is_degradable_error`. Pattern: AddConstant
+        // (add_constant.rs:69-79). (#3278)
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "CELU IBP: non-finite input bounds".to_string(),
+                "CELU IBP: NaN input bounds".to_string(),
             ));
         }
         // Directed rounding: for x < 0, exp is a transcendental that can round
@@ -102,7 +104,18 @@ impl BoundPropagation for CeluLayer {
         // CELU is monotonically increasing, so bounds map directly
         let lower = input.lower().mapv(celu_lower);
         let upper = input.upper().mapv(celu_upper);
-        BoundedTensor::new(lower, upper)
+        // `new_allow_infinite`, not the strict `new`: with alpha guarded finite
+        // and > 0 above, ±Inf evaluates cleanly and no repair is needed.
+        //   x = +inf → the `x >= 0` identity branch → +inf (no exp call).
+        //   x = -inf → (-inf / alpha) = -inf, exp(-inf) = 0, alpha * (0 - 1)
+        //              = -alpha, CELU's exact infimum (the lower clamp then
+        //              pins next_down_f32(-alpha) back to -alpha).
+        // None of the NaN-producing inf patterns is reachable: no inf - inf
+        // (the subtraction is exp(..) - 1 with exp(..) in [0, inf)), no
+        // 0 * inf and no inf / inf (alpha is finite and non-zero). So NaN can
+        // only come from a NaN input, which the guard above already rejects,
+        // and NaN in the output still hard-errors here. (#3278)
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
     impl_elementwise_activation!(
         @trait_methods
@@ -628,15 +641,92 @@ mod tests {
         assert!(matches!(err, NyError::NumericalInstability(_)));
     }
 
+    /// #3278 originally rejected ±Inf here too. That was wrong: ±Inf is what an
+    /// upstream OpaqueSkip legitimately emits, and `NumericalInstability` is not
+    /// degradable, so one tainted element aborted the whole graph-IBP pass.
+    /// CELU must now widen instead — saturating to -alpha on the left.
     #[test]
-    fn test_ibp_inf_input_rejected_3278() {
-        let layer = CeluLayer::default_alpha();
-        let input = BoundedTensor::new_unchecked(
+    fn test_ibp_inf_input_propagates_widened_3278() {
+        let alpha = 1.0_f32;
+        let layer = CeluLayer::new(alpha);
+        let input = BoundedTensor::new_allow_infinite(
             ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NEG_INFINITY]).unwrap(),
             ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::INFINITY]).unwrap(),
         )
         .unwrap();
-        let err = layer.propagate_ibp(&input).expect_err("Inf input");
+        let out = layer
+            .propagate_ibp(&input)
+            .expect("a tainted element must widen, not abort the pass");
+        // CELU(x) ∈ (-alpha, +inf): the lower saturates at the exact infimum.
+        assert_eq!(out.lower()[[0]], -alpha);
+        assert_eq!(out.upper()[[0]], f32::INFINITY);
+    }
+
+    // ── OpaqueSkip taint propagation (#3278 follow-up) ─────────────────
+
+    /// Probe: a mixed tensor where one element carries an upstream OpaqueSkip's
+    /// `[-inf, +inf]` and the other is a normal finite interval. The tainted
+    /// element must widen; the finite element must keep its exact bounds.
+    #[test]
+    fn test_ibp_opaque_skip_taint_widens_only_tainted_element() {
+        let alpha = 1.5_f32;
+        let layer = CeluLayer::new(alpha);
+        let input = BoundedTensor::new_allow_infinite(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NEG_INFINITY, 1.0]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, 2.0]).unwrap(),
+        )
+        .unwrap();
+        let out = layer
+            .propagate_ibp(&input)
+            .expect("[-inf, +inf] is a sound enclosure, not an error");
+
+        assert_eq!(out.lower()[[0]], -alpha);
+        assert_eq!(out.upper()[[0]], f32::INFINITY);
+        // Identity branch is exact for x >= 0.
+        assert!((out.lower()[[1]] - 1.0).abs() < 1e-6);
+        assert!((out.upper()[[1]] - 2.0).abs() < 1e-6);
+    }
+
+    /// Soundness: the widened output must still enclose CELU over the whole
+    /// (unbounded) input interval, including the left saturation limit.
+    #[test]
+    fn test_ibp_inf_input_output_encloses_true_range() {
+        let alpha = 0.75_f32;
+        let layer = CeluLayer::new(alpha);
+        let input = BoundedTensor::new_allow_infinite(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NEG_INFINITY]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::INFINITY]).unwrap(),
+        )
+        .unwrap();
+        let out = layer.propagate_ibp(&input).unwrap();
+        for x in [-1e30f32, -100.0, -10.0, -1.0, 0.0, 1.0, 100.0, 1e30] {
+            let y = celu_eval(x, alpha);
+            assert!(
+                out.lower()[[0]] <= y,
+                "lower {} > CELU({x})={y}",
+                out.lower()[[0]]
+            );
+            assert!(
+                out.upper()[[0]] >= y,
+                "upper {} < CELU({x})={y}",
+                out.upper()[[0]]
+            );
+        }
+    }
+
+    /// The relaxation must NOT relax the NaN firewall: NaN from finite inputs
+    /// (or any NaN endpoint) is still a hard error.
+    #[test]
+    fn test_ibp_nan_still_rejected_after_inf_relaxation() {
+        let layer = CeluLayer::default_alpha();
+        let input = BoundedTensor::new_unchecked(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NEG_INFINITY, f32::NAN]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, 1.0]).unwrap(),
+        )
+        .unwrap();
+        let err = layer
+            .propagate_ibp(&input)
+            .expect_err("NaN must not be absorbed alongside a tainted element");
         assert!(matches!(err, NyError::NumericalInstability(_)));
     }
 

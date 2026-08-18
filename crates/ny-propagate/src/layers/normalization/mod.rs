@@ -20,9 +20,16 @@ mod rms_norm;
 pub(crate) mod trait_norm;
 pub(crate) mod validate;
 
+/// Smallest authored epsilon supported by the fused normalization layers.
+///
+/// Values below this threshold are rejected, never silently rounded upward:
+/// changing epsilon changes the represented function and can change a
+/// verification verdict at a tight property boundary.
+pub const NORMALIZATION_MIN_EPS: f32 = 1e-12;
+
 // Re-export all public types at module root for backward compatibility
 pub use adain::AdaIN1dLayer;
-pub use batch_norm::BatchNormLayer;
+pub use batch_norm::{BatchNormChannelAxisHint, BatchNormLayer};
 pub use group_norm::GroupNormLayer;
 pub use instance_norm::InstanceNorm1dLayer;
 pub use layer_norm::{LayerNormCrownMode, LayerNormLayer, LayerNormMode};

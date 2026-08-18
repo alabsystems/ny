@@ -5,22 +5,6 @@
 use super::*;
 use ny_tensor::next_down_f32;
 
-/// LP tightening solves on the in-process ay backend (docs/SOLVER_POLICY.md)
-/// since R3 — always available, never skipped. The probe remains only for
-/// builds that pin `MipBackend::AyProc`.
-fn require_ay() -> bool {
-    if !matches!(
-        MipConfig::default().backend,
-        crate::config::MipBackend::AyProc
-    ) || crate::tests::ay_available()
-    {
-        true
-    } else {
-        eprintln!("SKIP: no ay binary on $NY_AY/$PATH");
-        false
-    }
-}
-
 /// Helper: build a 2-input -> 3-hidden (ReLU) -> 2-output network.
 ///
 /// Layer 0: W = [[1, 0], [0, 1], [1, 1]], b = [0, 0, -1]
@@ -56,11 +40,54 @@ fn make_tightener(
 }
 
 #[test]
+fn hard_deadline_caps_lp_slices_and_expired_phase_is_noop() {
+    use std::time::{Duration, Instant};
+
+    let (weights, biases, layer_dims) = small_network();
+    let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
+    let current = vec![
+        Bound::new(0.0, 1.0),
+        Bound::new(0.0, 1.0),
+        Bound::new(-1.0, 1.0),
+    ];
+    let make = |deadline| {
+        LpTightener::new(
+            weights.clone(),
+            biases.clone(),
+            layer_dims.clone(),
+            input_bounds.clone(),
+            vec![current.clone()],
+            MipConfig {
+                timeout_secs: 100.0,
+                ay_hard_deadline: Some(deadline),
+                ..MipConfig::default()
+            },
+        )
+    };
+
+    let live = make(Instant::now() + Duration::from_secs(2));
+    assert!(
+        live.live_per_neuron_timeout_secs()
+            .is_some_and(|secs| secs <= 2.0),
+        "the per-neuron slice must stay inside the absolute phase deadline"
+    );
+
+    let expired = make(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond is representable"),
+    );
+    assert_eq!(expired.live_per_neuron_timeout_secs(), None);
+    let (unchanged, newly_stable) = expired
+        .tighten_layer(0, &current)
+        .expect("an expired tightening phase should decline cleanly");
+    assert_eq!(unchanged, current);
+    assert_eq!(newly_stable, 0);
+}
+
+#[test]
 #[ntest::timeout(30_000)]
 fn test_lp_tighten_layer_basic() {
-    if !require_ay() {
-        return;
-    }
     let (weights, biases, layer_dims) = small_network();
     let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
     let intermediate_bounds = vec![vec![
@@ -103,9 +130,6 @@ fn test_lp_tighten_layer_basic() {
 #[test]
 #[ntest::timeout(30_000)]
 fn test_lp_tighten_proves_stability() {
-    if !require_ay() {
-        return;
-    }
     // y = x + 2, input [0,1]. True bounds [2,3]. Give loose [-1,3].
     let tightener = make_tightener(
         vec![vec![1.0], vec![1.0]],
@@ -127,9 +151,6 @@ fn test_lp_tighten_proves_stability() {
 #[test]
 #[ntest::timeout(30_000)]
 fn test_lp_tighten_multi_layer() {
-    if !require_ay() {
-        return;
-    }
     // 2 -> 2 (ReLU) -> 2 (ReLU) -> 1. Tighten layer 1.
     let layer0_bounds = vec![Bound::new(-0.5, 0.5), Bound::new(0.0, 1.0)];
     let layer1_bounds = vec![Bound::new(-1.0, 2.0), Bound::new(-2.0, 1.0)];
@@ -190,9 +211,6 @@ fn test_lp_tighten_skips_stable_neurons() {
 #[test]
 #[ntest::timeout(30_000)]
 fn test_lp_tighten_respects_max_per_layer() {
-    if !require_ay() {
-        return;
-    }
     let (weights, biases, layer_dims) = small_network();
     let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
     let intermediate_bounds = vec![vec![
@@ -230,9 +248,6 @@ fn test_lp_tighten_respects_max_per_layer() {
 #[test]
 #[ntest::timeout(30_000)]
 fn test_bound_tightener_trait() {
-    if !require_ay() {
-        return;
-    }
     let tightener = make_tightener(
         vec![vec![1.0], vec![1.0]],
         vec![vec![2.0], vec![0.0]],
@@ -258,9 +273,6 @@ fn test_bound_tightener_trait() {
 #[test]
 #[ntest::timeout(30_000)]
 fn test_lp_tighten_directed_rounding_midpoint() {
-    if !require_ay() {
-        return;
-    }
     // Use negative adjacent f32 values so the LP optimum is negative.
     // This avoids the early exit (new_lb >= 0 → return) and exercises both paths.
     let neg_upper: f32 = -1.0000001;
@@ -314,9 +326,6 @@ fn test_lp_tighten_directed_rounding_midpoint() {
 #[test]
 #[ntest::timeout(30_000)]
 fn test_lp_tighten_obbt_path_is_sound() {
-    if !require_ay() {
-        return;
-    }
     let obbt_tightener = |rounds: usize| {
         LpTightener::new(
             vec![vec![1.0], vec![1.0]],
@@ -350,9 +359,6 @@ fn test_lp_tighten_obbt_path_is_sound() {
 #[test]
 #[ntest::timeout(30_000)]
 fn test_lp_tighten_obbt_at_least_as_tight() {
-    if !require_ay() {
-        return;
-    }
     let build = |rounds: usize| {
         let (weights, biases, layer_dims) = small_network();
         LpTightener::new(

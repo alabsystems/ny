@@ -221,6 +221,7 @@ fn point_vjp_forward_one(plan: &PointVjpBatchPlan, x: &[f32]) -> Result<(Vec<Vec
                     bias,
                     out_features,
                     in_features,
+                    ..
                 } = &plan.layers_backward[idx]
                 else {
                     return Err(NyError::InvalidSpec("point-vjp: op/layer mismatch".into()));
@@ -305,6 +306,7 @@ pub(in crate::network::graph_crown) fn conv2d_forward(
         out_w,
         in_h,
         in_w,
+        ..
     } = layer
     else {
         return Err(NyError::InvalidSpec("point-vjp: op/layer mismatch".into()));

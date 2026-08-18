@@ -56,15 +56,23 @@
 //! count ceilings below are not a substitute for either gate.
 
 use std::cmp::Ordering;
+use std::mem::size_of;
 
 use ndarray::Array2;
 use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
 use num_traits::{Signed, ToPrimitive, Zero};
 
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, ConstrainedZonotopeCallTracker,
+    ConstrainedZonotopePeakLiveBytes, InertConstrainedZonotopeCallGate,
+};
 use crate::{
     certified_auxiliary_bounds64::CertifiedAuxiliaryBounds64,
-    constrained_zonotope64::{ConstrainedZonotope64, ConstrainedZonotope64Error},
+    constrained_zonotope64::{
+        ConstrainedZonotope64, ConstrainedZonotope64CallGateError, ConstrainedZonotope64Error,
+    },
 };
 
 /// Absolute implementation ceilings for the unwired exact-rational prototype.
@@ -81,6 +89,54 @@ pub const RELU_HARD_MAX_GENERATOR_NNZ: usize = 16_777_216;
 pub const RELU_HARD_MAX_UNSTABLE: usize = 65_536;
 /// Absolute ceiling on conservative exact-rational contributor work.
 pub const RELU_HARD_MAX_EXACT_TERMS: usize = 40_000_000;
+
+// The exact dyadic radius at one coordinate spans at most the finite binary64
+// exponent range plus log2(RELU_HARD_MAX_GENERATOR_NNZ) carry bits. This wide
+// logical charge covers its BigUint payload and container.
+const RELU_DYADIC_RADIUS_LIVE_BYTES_PER_COORDINATE: usize = 1_024;
+// Each retained unstable plan owns several <=~10,000-bit rational/dyadic
+// payloads. This deliberately broad charge includes every numerator,
+// denominator, container, and transient clone retained across later phases.
+const RELU_UNSTABLE_PLAN_LIVE_BYTES: usize = 64 * 1_024;
+// One exact coordinate/coefficient is processed at a time. Keep its
+// BigInt/BigRational operands, cross-products, normalization scratch, and
+// allocator-independent container storage separate from retained plans. This
+// remains required when a caller proves `max_unstable == 0` but supplies
+// auxiliary bounds whose exact intersection still needs transient arithmetic.
+const RELU_EXACT_TRANSIENT_LIVE_BYTES: usize = 64 * 1_024;
+// Projected subtraction errors are exact dyadics with the same finite exponent
+// span as a coordinate radius.
+const RELU_PROJECTED_ERROR_LIVE_BYTES: usize = 1_024;
+
+// Every finite binary64 magnitude is below 2^1024 and is an integer multiple
+// of 2^-1074. At most RELU_HARD_MAX_GENERATOR_NNZ coefficients plus one box
+// remainder contribute to a coordinate, and that term count is below 2^25.
+// Therefore the aligned exact nonnegative sum has fewer than 2^2123 units of
+// 2^-1074 and needs at most 2,123 significant bits.
+const RELU_MAX_DYADIC_ACCUMULATOR_BITS: usize = 2_123;
+const RELU_MAX_LIVE_DYADIC_BIGUINTS: usize = 3;
+const _: () = assert!(RELU_HARD_MAX_GENERATOR_NNZ + 1 < (1_usize << 25));
+const _: () = assert!(RELU_MAX_DYADIC_ACCUMULATOR_BITS >= 1_024 + 1_074 + 25);
+
+// On the same grid a hull endpoint has at most 2,124 bits and its endpoint
+// difference at most 2,125. Every exact geometric denominator divides that
+// difference times a power no larger than 2^1075. The exact values themselves
+// stay below the hard term-count bound times the largest finite binary64
+// magnitude. Consequently even an LCM-scaled Ratio numerator stays below
+// 5,000 bits. Coefficient-error alignment spans at most the 2,045-bit
+// binary64 exponent range and also stays below 5,000 bits. Use twice that
+// derived ceiling. A source-level liveness inventory of the named operands,
+// Ratio results, LCM operands, and GCD/reduction scratch has fewer than 48
+// simultaneously live integer payloads; both constants deliberately round
+// upward.
+const RELU_MAX_UNSTABLE_INTEGER_BITS: usize = 10_000;
+const RELU_MAX_RETAINED_UNSTABLE_BIGINTS: usize = 5;
+const RELU_MAX_LIVE_EXACT_TRANSIENT_BIGINTS: usize = 48;
+
+const fn bigint_payload_bytes(bits: usize) -> usize {
+    let limb_bits = usize::BITS as usize;
+    bits.div_ceil(limb_bits) * size_of::<usize>()
+}
 
 /// Caller-tightenable resource limits for ReLU propagation.
 ///
@@ -186,9 +242,28 @@ pub enum ReluTransformError {
         operation: &'static str,
     },
 
+    /// The host flushes binary64 subnormals and cannot support this proof path.
+    #[error("unsupported floating-point environment: {requirement}")]
+    UnsupportedFloatingPoint {
+        /// Required IEEE behavior.
+        requirement: &'static str,
+    },
+
     /// Final validated-domain construction failed closed.
     #[error(transparent)]
     Domain(#[from] ConstrainedZonotope64Error),
+}
+
+/// Primitive or call-firewall refusal from a budgeted ReLU transform.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReluTransformBudgetError {
+    /// Limits, exact arithmetic, or domain construction failed.
+    #[error(transparent)]
+    Transform(#[from] ReluTransformError),
+
+    /// The caller's deadline or aggregate peak-memory ceiling refused work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -214,6 +289,39 @@ struct UnstablePlan {
     exact_error: BigRational,
     coefficient_error_numerator: ExactNonnegativeDyadic,
 }
+
+// Three full-size BigUints cover the retained accumulator, a shifted operand,
+// and the result/reallocation payload of the largest dyadic update. Container
+// headers are included; allocator metadata/capacity rounding remains in the
+// caller's documented moat.
+const _: () = assert!(
+    RELU_DYADIC_RADIUS_LIVE_BYTES_PER_COORDINATE
+        >= RELU_MAX_LIVE_DYADIC_BIGUINTS
+            * (bigint_payload_bytes(RELU_MAX_DYADIC_ACCUMULATOR_BITS) + size_of::<BigUint>())
+            + size_of::<ExactNonnegativeDyadic>()
+);
+const _: () = assert!(
+    RELU_PROJECTED_ERROR_LIVE_BYTES
+        >= RELU_MAX_LIVE_DYADIC_BIGUINTS
+            * (bigint_payload_bytes(RELU_MAX_DYADIC_ACCUMULATOR_BITS) + size_of::<BigUint>())
+            + size_of::<ExactNonnegativeDyadic>()
+);
+
+// A retained plan has two scale integers, two exact-error Ratio integers, and
+// one coefficient-error dyadic integer. Count each independently.
+const _: () = assert!(
+    RELU_UNSTABLE_PLAN_LIVE_BYTES
+        >= RELU_MAX_RETAINED_UNSTABLE_BIGINTS
+            * (bigint_payload_bytes(RELU_MAX_UNSTABLE_INTEGER_BITS) + size_of::<BigInt>())
+            + size_of::<UnstablePlan>()
+);
+// The independent transient charge covers every current exact operand plus
+// the largest operator scratch inventory while all retained plans remain live.
+const _: () = assert!(
+    RELU_EXACT_TRANSIENT_LIVE_BYTES
+        >= RELU_MAX_LIVE_EXACT_TRANSIENT_BIGINTS
+            * (bigint_payload_bytes(RELU_MAX_UNSTABLE_INTEGER_BITS) + size_of::<BigInt>())
+);
 
 #[derive(Clone, Copy, Debug)]
 struct ResourcePlan {
@@ -565,7 +673,7 @@ pub fn transform_relu_unwired(
     input: &ConstrainedZonotope64,
     limits: ReluTransformLimits,
 ) -> Result<ConstrainedZonotope64, ReluTransformError> {
-    transform_relu_impl(input, None, limits, PredicateMode::Preserve)
+    transform_relu_legacy(input, None, limits, PredicateMode::Preserve)
 }
 
 /// Propagate ReLU and append projected `y >= 0` and `y >= x` predicates.
@@ -601,7 +709,7 @@ pub fn transform_relu_projected_constraints_unwired(
     input: &ConstrainedZonotope64,
     limits: ReluTransformLimits,
 ) -> Result<ConstrainedZonotope64, ReluTransformError> {
-    transform_relu_impl(input, None, limits, PredicateMode::ProjectReluGeometry)
+    transform_relu_legacy(input, None, limits, PredicateMode::ProjectReluGeometry)
 }
 
 /// Propagate ReLU using independently certified auxiliary concrete bounds.
@@ -628,7 +736,7 @@ pub fn transform_relu_with_auxiliary_bounds_unwired(
     auxiliary: &CertifiedAuxiliaryBounds64,
     limits: ReluTransformLimits,
 ) -> Result<ConstrainedZonotope64, ReluTransformError> {
-    transform_relu_impl(input, Some(auxiliary), limits, PredicateMode::Preserve)
+    transform_relu_legacy(input, Some(auxiliary), limits, PredicateMode::Preserve)
 }
 
 /// Propagate ReLU with certified auxiliary bounds and projected ReLU rows.
@@ -651,7 +759,7 @@ pub fn transform_relu_projected_constraints_with_auxiliary_bounds_unwired(
     auxiliary: &CertifiedAuxiliaryBounds64,
     limits: ReluTransformLimits,
 ) -> Result<ConstrainedZonotope64, ReluTransformError> {
-    transform_relu_impl(
+    transform_relu_legacy(
         input,
         Some(auxiliary),
         limits,
@@ -659,13 +767,126 @@ pub fn transform_relu_projected_constraints_with_auxiliary_bounds_unwired(
     )
 }
 
-fn transform_relu_impl(
+fn transform_relu_legacy(
     input: &ConstrainedZonotope64,
     auxiliary: Option<&CertifiedAuxiliaryBounds64>,
     limits: ReluTransformLimits,
     predicate_mode: PredicateMode,
 ) -> Result<ConstrainedZonotope64, ReluTransformError> {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match transform_relu_impl(input, auxiliary, limits, predicate_mode, &mut gate) {
+        Ok(value) => Ok(value),
+        Err(ReluTransformBudgetError::Transform(error)) => Err(error),
+        Err(ReluTransformBudgetError::Budget(_)) => {
+            unreachable!("the inert ReLU call gate cannot refuse work")
+        }
+    }
+}
+
+/// Propagate ReLU behind a synchronous call-local execution firewall.
+///
+/// The preflight includes conservative charges for every retained exact
+/// dyadic/rational payload. `budget.baseline_live_bytes()` must include the
+/// input and all other caller-owned storage sharing the ceiling.
+pub fn transform_relu_unwired_with_budget(
+    input: &ConstrainedZonotope64,
+    limits: ReluTransformLimits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, ReluTransformBudgetError> {
+    transform_relu_with_budget_impl(input, None, limits, PredicateMode::Preserve, budget)
+}
+
+/// Budgeted ReLU with projected `y >= 0` and `y >= x` predicates.
+pub fn transform_relu_projected_constraints_unwired_with_budget(
+    input: &ConstrainedZonotope64,
+    limits: ReluTransformLimits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, ReluTransformBudgetError> {
+    transform_relu_with_budget_impl(
+        input,
+        None,
+        limits,
+        PredicateMode::ProjectReluGeometry,
+        budget,
+    )
+}
+
+/// Budgeted ReLU using caller-certified auxiliary concrete bounds.
+pub fn transform_relu_with_auxiliary_bounds_unwired_with_budget(
+    input: &ConstrainedZonotope64,
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    limits: ReluTransformLimits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, ReluTransformBudgetError> {
+    transform_relu_with_budget_impl(
+        input,
+        Some(auxiliary),
+        limits,
+        PredicateMode::Preserve,
+        budget,
+    )
+}
+
+/// Budgeted auxiliary-bound ReLU with projected ReLU predicates.
+pub fn transform_relu_projected_constraints_with_auxiliary_bounds_unwired_with_budget(
+    input: &ConstrainedZonotope64,
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    limits: ReluTransformLimits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, ReluTransformBudgetError> {
+    transform_relu_with_budget_impl(
+        input,
+        Some(auxiliary),
+        limits,
+        PredicateMode::ProjectReluGeometry,
+        budget,
+    )
+}
+
+fn transform_relu_with_budget_impl(
+    input: &ConstrainedZonotope64,
+    auxiliary: Option<&CertifiedAuxiliaryBounds64>,
+    limits: ReluTransformLimits,
+    predicate_mode: PredicateMode,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, ReluTransformBudgetError> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let value = transform_relu_impl(input, auxiliary, limits, predicate_mode, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+#[cfg(test)]
+fn transform_relu_with_clock<N>(
+    input: &ConstrainedZonotope64,
+    auxiliary: Option<&CertifiedAuxiliaryBounds64>,
+    limits: ReluTransformLimits,
+    predicate_mode: PredicateMode,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, ReluTransformBudgetError>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let value = transform_relu_impl(input, auxiliary, limits, predicate_mode, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+fn transform_relu_impl<G>(
+    input: &ConstrainedZonotope64,
+    auxiliary: Option<&CertifiedAuxiliaryBounds64>,
+    limits: ReluTransformLimits,
+    predicate_mode: PredicateMode,
+    gate: &mut G,
+) -> Result<ConstrainedZonotope64, ReluTransformBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     validate_limits(limits)?;
+    if gate.is_enforcing() {
+        require_relu_gradual_underflow()?;
+    }
+    gate.checkpoint("ReLU floating-point and limit preflight")?;
 
     let value_dim = input.value_dim();
     let input_alpha_dim = input.alpha_dim();
@@ -675,7 +896,8 @@ fn transform_relu_impl(
             return Err(ReluTransformError::AuxiliaryDimensionMismatch {
                 expected: value_dim,
                 got: auxiliary.value_dim(),
-            });
+            }
+            .into());
         }
     }
     check_limit("value dimension", value_dim, limits.max_value_dim)?;
@@ -686,16 +908,16 @@ fn transform_relu_impl(
     )?;
     check_limit("constraint count", constraint_count, limits.max_constraints)?;
 
-    let input_nnz = input
-        .generators()
-        .iter()
-        .try_fold(0_usize, |count, column| {
-            count
+    let mut input_nnz = 0_usize;
+    for column in input.generators() {
+        gate.charge_items(1, "ReLU input generator geometry")?;
+        input_nnz =
+            input_nnz
                 .checked_add(column.nnz())
                 .ok_or(ReluTransformError::ResourceOverflow {
                     operation: "input generator nonzeros",
-                })
-        })?;
+                })?;
+    }
     let mut resources = ResourcePlan::checked(
         value_dim,
         input_alpha_dim,
@@ -706,19 +928,44 @@ fn transform_relu_impl(
         auxiliary.is_some(),
         limits,
     )?;
+    let unstable_capacity_bound = relu_unstable_bound(
+        value_dim,
+        input_alpha_dim,
+        input_nnz,
+        constraint_count,
+        predicate_mode,
+        limits,
+    );
+    if gate.is_enforcing() {
+        gate.preflight_peak_live_bytes(relu_peak_live_bytes(
+            input,
+            value_dim,
+            input_alpha_dim,
+            input_nnz,
+            constraint_count,
+            predicate_mode,
+            auxiliary.is_some(),
+            limits,
+        )?)?;
+    }
+    gate.checkpoint("ReLU peak-memory preflight complete")?;
 
     // `r_i + sum_j |G_ij|` is accumulated exactly over the stored dyadics.
     // Do not use BigRational here: normalizing a denominator after every
     // sparse coefficient dominates large convolutional ReLU stages.
     let mut radii = Vec::new();
+    gate.checkpoint("ReLU exact-radius allocation")?;
     try_reserve(&mut radii, value_dim, "exact dyadic coordinate radii")?;
     for (coordinate, &remainder) in input.box_remainder().iter().enumerate() {
+        gate.charge_items(1, "ReLU exact-radius initialization")?;
         let mut radius = ExactNonnegativeDyadic::default();
         radius.add_abs_finite(remainder, coordinate, "input box remainder")?;
         radii.push(radius);
     }
     for generator in input.generators() {
+        gate.charge_items(1, "ReLU radius generator accumulation")?;
         for (coordinate, coefficient) in generator.entries() {
+            gate.charge_items(1, "ReLU radius coefficient accumulation")?;
             radii[coordinate].add_abs_finite(
                 coefficient,
                 coordinate,
@@ -726,12 +973,28 @@ fn transform_relu_impl(
             )?;
         }
     }
+    gate.checkpoint("ReLU exact-radius construction complete")?;
 
     let mut plans = Vec::new();
+    gate.checkpoint("ReLU coordinate-plan allocation")?;
     try_reserve(&mut plans, value_dim, "ReLU coordinate plans")?;
     let mut unstable_plans = Vec::new();
+    if gate.is_enforcing() && unstable_capacity_bound != 0 {
+        // Budgeted calls reserve their complete preflighted header capacity
+        // while the vector is empty. A later amortized growth could otherwise
+        // copy more than the hard per-poll item count in one uninterruptible
+        // reallocation. Preserve the historical growth path for inert legacy
+        // calls so their allocation behavior and error ordering stay intact.
+        gate.checkpoint("ReLU unstable-plan capacity allocation")?;
+        try_reserve(
+            &mut unstable_plans,
+            unstable_capacity_bound,
+            "unstable ReLU coordinate plans",
+        )?;
+    }
     let mut unstable_count = 0_usize;
     for coordinate in 0..value_dim {
+        gate.charge_items(1, "ReLU coordinate classification")?;
         let center_value = input.center()[coordinate];
         let auxiliary_intersection = match auxiliary {
             Some(auxiliary) => Some(intersect_auxiliary_coordinate_exact(
@@ -768,6 +1031,7 @@ fn transform_relu_impl(
                     auxiliary.is_some(),
                     limits,
                 )?;
+                debug_assert!(unstable_count <= unstable_capacity_bound);
 
                 // DeepZ parameters are needed only for unstable coordinates.
                 // Without auxiliary bounds, materialize the exact CZ hull only
@@ -815,7 +1079,19 @@ fn transform_relu_impl(
                 debug_assert!(!scale_numerator.is_zero());
                 debug_assert!(!scale_denominator.is_zero());
                 let unstable_index = unstable_plans.len();
-                try_reserve_amortized(&mut unstable_plans, 1, "unstable ReLU coordinate plans")?;
+                if !gate.is_enforcing() {
+                    gate.checkpoint("ReLU unstable-plan allocation")?;
+                    try_reserve_amortized(
+                        &mut unstable_plans,
+                        1,
+                        "unstable ReLU coordinate plans",
+                    )?;
+                }
+                debug_assert!(!gate.is_enforcing() || unstable_index < unstable_capacity_bound);
+                // All exact operands have a hard bit-size bound, but still
+                // poll after the nontrivial rational phase and before making
+                // its retained plan visible to later phases.
+                gate.checkpoint("ReLU unstable-plan publication")?;
                 unstable_plans.push(UnstablePlan {
                     scale_numerator,
                     scale_denominator,
@@ -828,6 +1104,7 @@ fn transform_relu_impl(
             }
         }
     }
+    gate.checkpoint("ReLU coordinate classification complete")?;
     drop(radii);
 
     let output_alpha_dim = resources.output_alpha_dim;
@@ -835,15 +1112,19 @@ fn transform_relu_impl(
     let output_constraint_elements = resources.output_constraint_elements;
 
     let mut output_generators = Vec::new();
+    gate.checkpoint("ReLU output generator-column allocation")?;
     try_reserve(
         &mut output_generators,
         output_alpha_dim,
         "output generator columns",
     )?;
     for generator in input.generators() {
+        gate.charge_items(1, "ReLU old generator transform")?;
         let mut entries = Vec::new();
+        gate.checkpoint("ReLU output generator-entry allocation")?;
         try_reserve(&mut entries, generator.nnz(), "output generator entries")?;
         for (coordinate, coefficient) in generator.entries() {
+            gate.charge_items(1, "ReLU old generator-entry transform")?;
             match plans[coordinate] {
                 CoordinatePlan::Inactive => {}
                 CoordinatePlan::Active => entries.push((coordinate, coefficient)),
@@ -864,11 +1145,13 @@ fn transform_relu_impl(
         }
         output_generators.push(entries);
     }
+    gate.checkpoint("ReLU old generator transform complete")?;
 
     // All coefficient discrepancies at an unstable coordinate share the
     // slope denominator.  Convert and divide their exact dyadic numerator
     // once, rather than normalizing one arbitrary rational per coefficient.
     for unstable in &mut unstable_plans {
+        gate.charge_items(1, "ReLU coefficient-error materialization")?;
         if !unstable.coefficient_error_numerator.significand.is_zero() {
             let numerator = unstable.coefficient_error_numerator.to_big_rational();
             let denominator =
@@ -881,22 +1164,28 @@ fn transform_relu_impl(
     // positive intercept may round to zero; the empty alpha column is retained
     // and the complete missing coefficient is already charged above.
     for (coordinate, plan) in plans.iter().enumerate() {
+        gate.charge_items(1, "ReLU beta generator construction")?;
         if let CoordinatePlan::Unstable(unstable_index) = plan {
             let nominal_noise = unstable_plans[*unstable_index].nominal_noise;
             let mut entries = Vec::new();
             if nominal_noise != 0.0 {
+                gate.checkpoint("ReLU beta generator-entry allocation")?;
                 try_reserve(&mut entries, 1, "new ReLU generator entry")?;
                 entries.push((coordinate, nominal_noise));
             }
             output_generators.push(entries);
         }
     }
+    gate.checkpoint("ReLU beta generator construction complete")?;
 
     let mut output_center = Vec::new();
     let mut output_remainder = Vec::new();
+    gate.checkpoint("ReLU output-center allocation")?;
     try_reserve(&mut output_center, value_dim, "output centers")?;
+    gate.checkpoint("ReLU output-remainder allocation")?;
     try_reserve(&mut output_remainder, value_dim, "output remainders")?;
     for (coordinate, plan) in plans.iter().enumerate() {
+        gate.charge_items(1, "ReLU output-coordinate materialization")?;
         match plan {
             CoordinatePlan::Inactive => {
                 output_center.push(0.0);
@@ -917,20 +1206,40 @@ fn transform_relu_impl(
             }
         }
     }
+    gate.checkpoint("ReLU output-coordinate materialization complete")?;
 
     let mut constraint_values = Vec::new();
+    gate.checkpoint("ReLU constraint-matrix allocation")?;
     try_reserve(
         &mut constraint_values,
         output_constraint_elements,
         "output constraint matrix",
     )?;
     for row in 0..constraint_count {
+        gate.charge_items(1, "ReLU retained constraint-row clone")?;
         for column in 0..input_alpha_dim {
+            gate.charge_items(1, "ReLU retained constraint-element clone")?;
             constraint_values.push(input.constraints()[[row, column]]);
         }
-        constraint_values.resize(constraint_values.len() + unstable_count, 0.0);
+        append_zeros_with_gate(
+            &mut constraint_values,
+            unstable_count,
+            gate,
+            "ReLU retained constraint zero-extension",
+        )?;
     }
-    constraint_values.resize(output_constraint_elements, 0.0);
+    let projected_constraint_elements = output_constraint_elements
+        .checked_sub(constraint_values.len())
+        .ok_or(ReluTransformError::ResourceOverflow {
+            operation: "projected ReLU constraint initialization",
+        })?;
+    append_zeros_with_gate(
+        &mut constraint_values,
+        projected_constraint_elements,
+        gate,
+        "ReLU projected constraint initialization",
+    )?;
+    debug_assert_eq!(constraint_values.len(), output_constraint_elements);
 
     // `y >= 0` and `y >= x` are projected onto the alpha symbols by
     // eliminating the independent output and input box errors.  Negating a
@@ -940,15 +1249,21 @@ fn transform_relu_impl(
     // binary64 dyadic, which is accumulated without rounding for the RHS.
     let mut projected_subtraction_errors = Vec::new();
     if predicate_mode == PredicateMode::ProjectReluGeometry {
+        gate.checkpoint("ReLU projected-error allocation")?;
         try_reserve(
             &mut projected_subtraction_errors,
             unstable_count,
             "projected ReLU subtraction errors",
         )?;
-        projected_subtraction_errors.resize_with(unstable_count, ExactNonnegativeDyadic::default);
+        for _ in 0..unstable_count {
+            gate.charge_items(1, "ReLU projected-error initialization")?;
+            projected_subtraction_errors.push(ExactNonnegativeDyadic::default());
+        }
 
         for (column, generator) in input.generators().iter().enumerate() {
+            gate.charge_items(1, "ReLU projected input generator walk")?;
             for (coordinate, coefficient) in generator.entries() {
+                gate.charge_items(1, "ReLU projected input generator-entry walk")?;
                 if let CoordinatePlan::Unstable(unstable_index) = plans[coordinate] {
                     let dominance_row = constraint_count + 2 * unstable_index + 1;
                     constraint_values[dominance_row * output_alpha_dim + column] = coefficient;
@@ -957,7 +1272,9 @@ fn transform_relu_impl(
         }
 
         for (column, generator) in output_generators.iter().enumerate() {
+            gate.charge_items(1, "ReLU projected output generator walk")?;
             for (coordinate, coefficient) in generator {
+                gate.charge_items(1, "ReLU projected output generator-entry walk")?;
                 let CoordinatePlan::Unstable(unstable_index) = plans[*coordinate] else {
                     continue;
                 };
@@ -984,7 +1301,9 @@ fn transform_relu_impl(
             }
         }
     }
+    gate.checkpoint("ReLU projected constraint construction complete")?;
 
+    gate.checkpoint("ReLU constraint-matrix shape materialization")?;
     let constraints = Array2::from_shape_vec(
         (output_constraint_count, output_alpha_dim),
         constraint_values,
@@ -994,10 +1313,15 @@ fn transform_relu_impl(
     })?;
 
     let mut rhs = Vec::new();
+    gate.checkpoint("ReLU constraint-right-hand-side allocation")?;
     try_reserve(&mut rhs, output_constraint_count, "output constraint rhs")?;
-    rhs.extend_from_slice(input.rhs());
+    for &value in input.rhs() {
+        gate.charge_items(1, "ReLU retained constraint-right-hand-side clone")?;
+        rhs.push(value);
+    }
     if predicate_mode == PredicateMode::ProjectReluGeometry {
         for (coordinate, plan) in plans.iter().enumerate() {
+            gate.charge_items(1, "ReLU projected constraint-right-hand-side construction")?;
             let CoordinatePlan::Unstable(unstable_index) = plan else {
                 continue;
             };
@@ -1040,14 +1364,187 @@ fn transform_relu_impl(
             )?);
         }
     }
+    gate.checkpoint("ReLU constraint-right-hand-side construction complete")?;
 
-    Ok(ConstrainedZonotope64::try_new(
+    gate.checkpoint("ReLU domain materialization")?;
+    let output = ConstrainedZonotope64::try_new_with_call_gate(
         output_center,
         output_generators,
         constraints,
         rhs,
         output_remainder,
-    )?)
+        gate,
+    )
+    .map_err(|error| match error {
+        ConstrainedZonotope64CallGateError::Domain(error) => {
+            ReluTransformBudgetError::Transform(ReluTransformError::Domain(error))
+        }
+        ConstrainedZonotope64CallGateError::Budget(error) => {
+            ReluTransformBudgetError::Budget(error)
+        }
+    })?;
+    gate.checkpoint("ReLU domain materialization complete")?;
+    gate.checkpoint("ReLU publication")?;
+    Ok(output)
+}
+
+/// Conservative transform-owned logical peak for every output that can pass
+/// the caller's structural limits. Retained exact-arithmetic payloads receive
+/// fixed wide charges derived from the hard binary64/exact-term ceilings.
+fn relu_peak_live_bytes(
+    input: &ConstrainedZonotope64,
+    value_dim: usize,
+    input_alpha_dim: usize,
+    input_nnz: usize,
+    input_constraint_count: usize,
+    predicate_mode: PredicateMode,
+    has_auxiliary_bounds: bool,
+    limits: ReluTransformLimits,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let unstable_bound = relu_unstable_bound(
+        value_dim,
+        input_alpha_dim,
+        input_nnz,
+        input_constraint_count,
+        predicate_mode,
+        limits,
+    );
+    let output_alpha_bound = input_alpha_dim.checked_add(unstable_bound).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "ReLU peak output alpha dimension",
+        },
+    )?;
+    let projected_rows = match predicate_mode {
+        PredicateMode::Preserve => 0,
+        PredicateMode::ProjectReluGeometry => unstable_bound.checked_mul(2).ok_or(
+            ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "ReLU peak projected row count",
+            },
+        )?,
+    };
+    let output_constraint_count = input_constraint_count
+        .checked_add(projected_rows)
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "ReLU peak output constraint count",
+        })?
+        .min(limits.max_constraints);
+    let output_constraint_elements = output_constraint_count
+        .checked_mul(output_alpha_bound)
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "ReLU peak constraint elements",
+        })?
+        .min(limits.max_constraint_elements);
+    // Every old candidate column reserves its complete input `nnz`, including
+    // coefficients later removed by inactive/zero classification. Each beta
+    // column reserves at most one more entry. The validated constructor can
+    // retain no more than the same total while both representations overlap.
+    let output_generator_nonzeros = input_nnz
+        .checked_add(unstable_bound)
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "ReLU peak output generator nonzeros",
+        })?
+        .min(limits.max_generator_nnz);
+
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_elements::<[u8; RELU_DYADIC_RADIUS_LIVE_BYTES_PER_COORDINATE]>(
+        value_dim,
+        "ReLU exact-radius live bytes",
+    )?;
+    peak.add_elements::<CoordinatePlan>(value_dim, "ReLU coordinate-plan bytes")?;
+    // During classification all radii and prior retained plans are live
+    // together. During later exact coefficient/RHS work all retained plans
+    // overlap one complete operator scratch inventory, so these are additive
+    // charges rather than alternative phase maxima.
+    peak.add_elements::<[u8; RELU_UNSTABLE_PLAN_LIVE_BYTES]>(
+        unstable_bound,
+        "ReLU unstable exact-plan live bytes",
+    )?;
+    if value_dim != 0 && (has_auxiliary_bounds || unstable_bound != 0) {
+        peak.add_bytes(
+            RELU_EXACT_TRANSIENT_LIVE_BYTES,
+            "ReLU exact-arithmetic transient bytes",
+        )?;
+    }
+    peak.add_elements::<f64>(value_dim, "ReLU output-center bytes")?;
+    peak.add_elements::<f64>(value_dim, "ReLU output-remainder bytes")?;
+
+    let doubled_alpha_headers = output_alpha_bound.checked_mul(2).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "ReLU doubled generator-column headers",
+        },
+    )?;
+    peak.add_elements::<Vec<(usize, f64)>>(
+        doubled_alpha_headers,
+        "ReLU candidate and validated generator-column bytes",
+    )?;
+    let doubled_generator_nonzeros = output_generator_nonzeros.checked_mul(2).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "ReLU doubled generator nonzeros",
+        },
+    )?;
+    peak.add_elements::<(usize, f64)>(
+        doubled_generator_nonzeros,
+        "ReLU candidate and validated generator-entry bytes",
+    )?;
+    peak.add_elements::<f64>(
+        output_constraint_elements,
+        "ReLU output constraint-matrix bytes",
+    )?;
+    peak.add_elements::<f64>(
+        output_constraint_count,
+        "ReLU output constraint-right-hand-side bytes",
+    )?;
+    if predicate_mode == PredicateMode::ProjectReluGeometry {
+        peak.add_elements::<[u8; RELU_PROJECTED_ERROR_LIVE_BYTES]>(
+            unstable_bound,
+            "ReLU projected exact-error live bytes",
+        )?;
+    }
+
+    // `input` is borrowed and therefore belongs in the caller baseline. Keep
+    // this assertion local to catch accidental accounting drift.
+    debug_assert_eq!(input.value_dim(), value_dim);
+    Ok(peak.finish())
+}
+
+fn relu_unstable_bound(
+    value_dim: usize,
+    input_alpha_dim: usize,
+    input_nnz: usize,
+    input_constraint_count: usize,
+    predicate_mode: PredicateMode,
+    limits: ReluTransformLimits,
+) -> usize {
+    let mut unstable_bound = value_dim
+        .min(limits.max_unstable)
+        .min(limits.max_output_alpha_dim.saturating_sub(input_alpha_dim))
+        .min(limits.max_generator_nnz.saturating_sub(input_nnz));
+    if predicate_mode == PredicateMode::ProjectReluGeometry {
+        unstable_bound = unstable_bound.min(
+            limits
+                .max_constraints
+                .saturating_sub(input_constraint_count)
+                / 2,
+        );
+    }
+    unstable_bound
+}
+
+/// Reject FTZ/DAZ before a budgeted proof path converts or rounds subnormals.
+fn require_relu_gradual_underflow() -> Result<(), ReluTransformError> {
+    let half = std::hint::black_box(0.5_f64);
+    let min_normal = std::hint::black_box(f64::MIN_POSITIVE);
+    let min_subnormal = std::hint::black_box(f64::from_bits(1));
+    let two_subnormals = std::hint::black_box(f64::from_bits(2));
+    if std::hint::black_box(min_normal * half).to_bits() != 0x0008_0000_0000_0000
+        || std::hint::black_box(two_subnormals * half).to_bits() != 1
+        || std::hint::black_box(min_subnormal + min_subnormal).to_bits() != 2
+    {
+        return Err(ReluTransformError::UnsupportedFloatingPoint {
+            requirement: "IEEE-754 binary64 gradual underflow (FTZ/DAZ disabled)",
+        });
+    }
+    Ok(())
 }
 
 fn validate_limits(limits: ReluTransformLimits) -> Result<(), ReluTransformError> {
@@ -1247,6 +1744,35 @@ fn try_reserve_amortized<T>(
         .map_err(|_| ReluTransformError::AllocationFailure { resource })
 }
 
+fn append_zeros_with_gate<G>(
+    values: &mut Vec<f64>,
+    mut additional: usize,
+    gate: &mut G,
+    checkpoint: &'static str,
+) -> Result<(), ReluTransformBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    while additional != 0 {
+        let chunk = additional.min(crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL);
+        let new_len =
+            values
+                .len()
+                .checked_add(chunk)
+                .ok_or(ReluTransformError::ResourceOverflow {
+                    operation: "ReLU constraint zero initialization",
+                })?;
+        gate.charge_items(chunk, checkpoint)?;
+        values.resize(new_len, 0.0);
+        // `charge_items` may poll before the physical bulk initialization.
+        // Poll after every hard-sized chunk as well, so a closed deadline is
+        // observed before another chunk begins.
+        gate.checkpoint(checkpoint)?;
+        additional -= chunk;
+    }
+    Ok(())
+}
+
 fn exact_finite(
     value: f64,
     coordinate: usize,
@@ -1381,6 +1907,10 @@ fn ceil_finite_nonnegative(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::mem::size_of;
+    use std::time::{Duration, Instant};
+
     use ndarray::{array, Array2};
     use proptest::prelude::*;
 
@@ -1406,6 +1936,20 @@ mod tests {
                 .unwrap();
         }
         radius
+    }
+
+    fn budget_input() -> ConstrainedZonotope64 {
+        ConstrainedZonotope64::try_new(
+            vec![-3.0, 4.0, 0.25],
+            vec![
+                vec![(0, 0.5), (1, 0.25), (2, 1.0)],
+                vec![(1, -0.5), (2, 0.5)],
+            ],
+            array![[1.0, -2.0], [-0.5, 0.25]],
+            vec![0.75, 1.0],
+            vec![0.125, 0.25, 0.125],
+        )
+        .unwrap()
     }
 
     fn rational_radius(values: &[f64]) -> BigRational {
@@ -1614,17 +2158,7 @@ mod tests {
 
     #[test]
     fn stable_coordinates_are_exact_and_constraints_are_preserved() {
-        let input = ConstrainedZonotope64::try_new(
-            vec![-3.0, 4.0, 0.25],
-            vec![
-                vec![(0, 0.5), (1, 0.25), (2, 1.0)],
-                vec![(1, -0.5), (2, 0.5)],
-            ],
-            array![[1.0, -2.0], [-0.5, 0.25]],
-            vec![0.75, 1.0],
-            vec![0.125, 0.25, 0.125],
-        )
-        .unwrap();
+        let input = budget_input();
         let output = transform_relu_unwired(&input, ReluTransformLimits::default()).unwrap();
 
         assert_eq!(output.center()[0].to_bits(), 0.0_f64.to_bits());
@@ -1667,6 +2201,654 @@ mod tests {
             .generators()
             .iter()
             .all(|generator| generator.entries().all(|(coordinate, _)| coordinate != 0)));
+    }
+
+    #[test]
+    fn budgeted_relu_is_bit_identical_and_peak_terms_are_independent() {
+        let input = budget_input();
+        let limits = ReluTransformLimits::default();
+        let legacy = transform_relu_unwired(&input, limits).unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let baseline = 13_usize;
+        let outcome = transform_relu_unwired_with_budget(
+            &input,
+            limits,
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(outcome.value(), &legacy);
+        assert!(outcome.report().charged_items() > 0);
+        assert!(outcome.report().deadline_polls() > 0);
+
+        // Independent expansion of `relu_peak_live_bytes` for this input.
+        let value_dim = 3_usize;
+        let input_alpha_dim = 2_usize;
+        let input_nnz = 5_usize;
+        let unstable_bound = 3_usize;
+        let output_alpha_bound = input_alpha_dim + unstable_bound;
+        let output_constraint_count = 2_usize;
+        let output_constraint_elements = output_constraint_count * output_alpha_bound;
+        let output_nnz_bound = input_nnz + unstable_bound;
+        let transform_peak = value_dim * RELU_DYADIC_RADIUS_LIVE_BYTES_PER_COORDINATE
+            + value_dim * size_of::<CoordinatePlan>()
+            + unstable_bound * RELU_UNSTABLE_PLAN_LIVE_BYTES
+            + RELU_EXACT_TRANSIENT_LIVE_BYTES
+            + 2 * value_dim * size_of::<f64>()
+            + 2 * output_alpha_bound * size_of::<Vec<(usize, f64)>>()
+            + 2 * output_nnz_bound * size_of::<(usize, f64)>()
+            + output_constraint_elements * size_of::<f64>()
+            + output_constraint_count * size_of::<f64>();
+        assert_eq!(
+            outcome.report().peak_live_bytes(),
+            baseline + transform_peak
+        );
+
+        transform_relu_unwired_with_budget(
+            &input,
+            limits,
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, baseline + transform_peak),
+        )
+        .unwrap();
+        assert!(matches!(
+            transform_relu_unwired_with_budget(
+                &input,
+                limits,
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    baseline,
+                    baseline + transform_peak - 1,
+                ),
+            ),
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. }
+            ))
+        ));
+
+        let legacy_projected =
+            transform_relu_projected_constraints_unwired(&input, limits).unwrap();
+        let budgeted_projected = transform_relu_projected_constraints_unwired_with_budget(
+            &input,
+            limits,
+            ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(budgeted_projected.value(), &legacy_projected);
+    }
+
+    #[test]
+    fn every_legacy_api_matches_its_budgeted_value_and_error_order() {
+        let input = budget_input();
+        let limits = ReluTransformLimits::default();
+        let auxiliary =
+            CertifiedAuxiliaryBounds64::try_new(vec![-4.0, 2.0, -2.0], vec![-2.0, 6.0, 2.0])
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let budget = || ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX);
+
+        assert_eq!(
+            transform_relu_unwired_with_budget(&input, limits, budget())
+                .unwrap()
+                .into_value(),
+            transform_relu_unwired(&input, limits).unwrap(),
+        );
+        assert_eq!(
+            transform_relu_projected_constraints_unwired_with_budget(&input, limits, budget())
+                .unwrap()
+                .into_value(),
+            transform_relu_projected_constraints_unwired(&input, limits).unwrap(),
+        );
+        assert_eq!(
+            transform_relu_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &auxiliary,
+                limits,
+                budget(),
+            )
+            .unwrap()
+            .into_value(),
+            transform_relu_with_auxiliary_bounds_unwired(&input, &auxiliary, limits).unwrap(),
+        );
+        assert_eq!(
+            transform_relu_projected_constraints_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &auxiliary,
+                limits,
+                budget(),
+            )
+            .unwrap()
+            .into_value(),
+            transform_relu_projected_constraints_with_auxiliary_bounds_unwired(
+                &input, &auxiliary, limits,
+            )
+            .unwrap(),
+        );
+
+        // Structural exhaustion must retain the exact legacy error payload in
+        // both non-auxiliary APIs.
+        let exhausted = ReluTransformLimits {
+            max_value_dim: input.value_dim() - 1,
+            ..limits
+        };
+        let legacy = transform_relu_unwired(&input, exhausted).unwrap_err();
+        assert_eq!(
+            transform_relu_unwired_with_budget(&input, exhausted, budget()).unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+        let legacy = transform_relu_projected_constraints_unwired(&input, exhausted).unwrap_err();
+        assert_eq!(
+            transform_relu_projected_constraints_unwired_with_budget(&input, exhausted, budget(),)
+                .unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+
+        // Limit validation historically precedes auxiliary-shape validation.
+        // Exercise that ordering and then the shape payload itself for both
+        // auxiliary APIs.
+        let wrong_shape = CertifiedAuxiliaryBounds64::try_new(vec![], vec![]).unwrap();
+        let malformed = ReluTransformLimits {
+            max_unstable: RELU_HARD_MAX_UNSTABLE + 1,
+            ..limits
+        };
+        let legacy = transform_relu_with_auxiliary_bounds_unwired(&input, &wrong_shape, malformed)
+            .unwrap_err();
+        assert!(matches!(legacy, ReluTransformError::InvalidLimit { .. }));
+        assert_eq!(
+            transform_relu_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &wrong_shape,
+                malformed,
+                budget(),
+            )
+            .unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+        let legacy = transform_relu_projected_constraints_with_auxiliary_bounds_unwired(
+            &input,
+            &wrong_shape,
+            malformed,
+        )
+        .unwrap_err();
+        assert!(matches!(legacy, ReluTransformError::InvalidLimit { .. }));
+        assert_eq!(
+            transform_relu_projected_constraints_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &wrong_shape,
+                malformed,
+                budget(),
+            )
+            .unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+
+        let legacy =
+            transform_relu_with_auxiliary_bounds_unwired(&input, &wrong_shape, limits).unwrap_err();
+        assert_eq!(
+            transform_relu_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &wrong_shape,
+                limits,
+                budget(),
+            )
+            .unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+        let legacy = transform_relu_projected_constraints_with_auxiliary_bounds_unwired(
+            &input,
+            &wrong_shape,
+            limits,
+        )
+        .unwrap_err();
+        assert_eq!(
+            transform_relu_projected_constraints_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &wrong_shape,
+                limits,
+                budget(),
+            )
+            .unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+
+        let disjoint =
+            CertifiedAuxiliaryBounds64::try_new(vec![0.0, 2.0, -2.0], vec![1.0, 6.0, 2.0]).unwrap();
+        let legacy =
+            transform_relu_with_auxiliary_bounds_unwired(&input, &disjoint, limits).unwrap_err();
+        assert_eq!(
+            transform_relu_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &disjoint,
+                limits,
+                budget(),
+            )
+            .unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+        let legacy = transform_relu_projected_constraints_with_auxiliary_bounds_unwired(
+            &input, &disjoint, limits,
+        )
+        .unwrap_err();
+        assert_eq!(
+            transform_relu_projected_constraints_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &disjoint,
+                limits,
+                budget(),
+            )
+            .unwrap_err(),
+            ReluTransformBudgetError::Transform(legacy),
+        );
+    }
+
+    #[test]
+    fn stable_auxiliary_exact_work_has_a_fixed_transient_charge() {
+        let input = ConstrainedZonotope64::try_new(
+            vec![1.0],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let auxiliary = CertifiedAuxiliaryBounds64::try_new(vec![0.5], vec![1.0]).unwrap();
+        let limits = ReluTransformLimits {
+            max_unstable: 0,
+            ..ReluTransformLimits::default()
+        };
+        let without_auxiliary =
+            relu_peak_live_bytes(&input, 1, 0, 0, 0, PredicateMode::Preserve, false, limits)
+                .unwrap();
+        let with_auxiliary =
+            relu_peak_live_bytes(&input, 1, 0, 0, 0, PredicateMode::Preserve, true, limits)
+                .unwrap();
+        assert_eq!(
+            with_auxiliary,
+            without_auxiliary + RELU_EXACT_TRANSIENT_LIVE_BYTES,
+        );
+
+        let baseline = 29;
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let outcome = transform_relu_with_auxiliary_bounds_unwired_with_budget(
+            &input,
+            &auxiliary,
+            limits,
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, baseline + with_auxiliary),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.value(),
+            &transform_relu_with_auxiliary_bounds_unwired(&input, &auxiliary, limits).unwrap(),
+        );
+        assert_eq!(
+            outcome.report().peak_live_bytes(),
+            baseline + with_auxiliary,
+        );
+        assert!(matches!(
+            transform_relu_with_auxiliary_bounds_unwired_with_budget(
+                &input,
+                &auxiliary,
+                limits,
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    baseline,
+                    baseline + with_auxiliary - 1,
+                ),
+            ),
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn candidate_generator_capacity_is_charged_even_when_output_nnz_is_zero() {
+        let input = ConstrainedZonotope64::try_new(
+            vec![-10.0],
+            vec![
+                vec![(0, 1.0)],
+                vec![(0, 1.0)],
+                vec![(0, 1.0)],
+                vec![(0, 1.0)],
+            ],
+            Array2::zeros((0, 4)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let limits = ReluTransformLimits {
+            max_unstable: 0,
+            ..ReluTransformLimits::default()
+        };
+        let transform_peak =
+            relu_peak_live_bytes(&input, 1, 4, 4, 0, PredicateMode::Preserve, false, limits)
+                .unwrap();
+        let independently_expanded = RELU_DYADIC_RADIUS_LIVE_BYTES_PER_COORDINATE
+            + size_of::<CoordinatePlan>()
+            + 2 * size_of::<f64>()
+            + 2 * 4 * size_of::<Vec<(usize, f64)>>()
+            + 2 * 4 * size_of::<(usize, f64)>();
+        assert_eq!(transform_peak, independently_expanded);
+
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let outcome = transform_relu_unwired_with_budget(
+            &input,
+            limits,
+            ConstrainedZonotopeCallBudget::new(deadline, 0, transform_peak),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome
+                .value()
+                .generators()
+                .iter()
+                .map(|column| column.nnz())
+                .sum::<usize>(),
+            0,
+        );
+        assert_eq!(outcome.report().peak_live_bytes(), transform_peak);
+        assert!(matches!(
+            transform_relu_unwired_with_budget(
+                &input,
+                limits,
+                ConstrainedZonotopeCallBudget::new(deadline, 0, transform_peak - 1),
+            ),
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn budget_refuses_admission_overflow_and_publication_seams() {
+        let input = budget_input();
+        let limits = ReluTransformLimits::default();
+        let start = Instant::now();
+        let reads = Cell::new(0_usize);
+        let baseline = transform_relu_with_clock(
+            &input,
+            None,
+            limits,
+            PredicateMode::Preserve,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 5, 4),
+            |_| {
+                reads.set(reads.get() + 1);
+                start
+            },
+        );
+        assert!(matches!(
+            baseline,
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required: 5,
+                    limit: 4
+                }
+            ))
+        ));
+        assert_eq!(reads.get(), 1);
+
+        assert!(matches!(
+            transform_relu_with_clock(
+                &input,
+                None,
+                limits,
+                PredicateMode::Preserve,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    usize::MAX,
+                    usize::MAX,
+                ),
+                |_| start,
+            ),
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "aggregate peak-live bytes"
+                }
+            ))
+        ));
+
+        for seam in [
+            "ReLU unstable-plan publication",
+            "ReLU coordinate classification complete",
+            "constrained-zonotope generator-column allocation",
+            "ReLU publication",
+        ] {
+            let expired = start + Duration::from_secs(2);
+            let result = transform_relu_with_clock(
+                &input,
+                None,
+                limits,
+                PredicateMode::Preserve,
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |checkpoint| if checkpoint == seam { expired } else { start },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ReluTransformBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == seam
+                ),
+                "deadline seam {seam} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_polls_inside_dense_relu_loops() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let input = ConstrainedZonotope64::try_new(
+            vec![-1.0; dimension],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0; dimension],
+        )
+        .unwrap();
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        let result = transform_relu_with_clock(
+            &input,
+            None,
+            ReluTransformLimits::default(),
+            PredicateMode::Preserve,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "ReLU exact-radius initialization" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "ReLU exact-radius initialization"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn physical_zero_initialization_is_interleaved_with_deadline_polls() {
+        const ITEMS: usize = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        for checkpoint in [
+            "ReLU retained constraint zero-extension",
+            "ReLU projected constraint initialization",
+        ] {
+            let start = Instant::now();
+            let expired = start + Duration::from_secs(2);
+            let checkpoint_reads = Cell::new(0_usize);
+            let mut gate = ConstrainedZonotopeCallTracker::with_clock(
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |seen| {
+                    if seen == checkpoint {
+                        let reads = checkpoint_reads.get() + 1;
+                        checkpoint_reads.set(reads);
+                        if reads == 2 {
+                            return expired;
+                        }
+                    }
+                    start
+                },
+            )
+            .unwrap();
+            let mut values = Vec::new();
+            values.try_reserve_exact(2 * ITEMS + 1).unwrap();
+            let result = append_zeros_with_gate(&mut values, 2 * ITEMS + 1, &mut gate, checkpoint);
+            assert!(matches!(
+                result,
+                Err(ReluTransformBudgetError::Budget(
+                    ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                        checkpoint: refused
+                    }
+                )) if refused == checkpoint
+            ));
+            assert_eq!(values.len(), ITEMS);
+            assert_eq!(checkpoint_reads.get(), 2);
+        }
+    }
+
+    #[test]
+    fn empty_generator_columns_and_zero_width_rows_are_charged() {
+        const ITEMS: usize = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+
+        let empty_columns = ConstrainedZonotope64::try_new(
+            vec![-1.0],
+            vec![Vec::new(); ITEMS],
+            Array2::zeros((0, ITEMS)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let result = transform_relu_with_clock(
+            &empty_columns,
+            None,
+            ReluTransformLimits::default(),
+            PredicateMode::Preserve,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "ReLU input generator geometry" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "ReLU input generator geometry"
+                }
+            ))
+        ));
+
+        let zero_width_rows = ConstrainedZonotope64::try_new(
+            vec![-1.0],
+            Vec::new(),
+            Array2::zeros((ITEMS, 0)),
+            vec![0.0; ITEMS],
+            vec![0.0],
+        )
+        .unwrap();
+        let result = transform_relu_with_clock(
+            &zero_width_rows,
+            None,
+            ReluTransformLimits::default(),
+            PredicateMode::Preserve,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "ReLU retained constraint-row clone" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ReluTransformBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "ReLU retained constraint-row clone"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn peak_and_plan_arithmetic_and_allocation_fail_closed() {
+        let input = budget_input();
+        assert!(matches!(
+            relu_peak_live_bytes(
+                &input,
+                input.value_dim(),
+                usize::MAX,
+                0,
+                0,
+                PredicateMode::Preserve,
+                false,
+                ReluTransformLimits::default(),
+            ),
+            Err(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "ReLU doubled generator-column headers"
+            })
+        ));
+
+        let unbounded = ReluTransformLimits {
+            max_value_dim: usize::MAX,
+            max_output_alpha_dim: usize::MAX,
+            max_constraints: usize::MAX,
+            max_constraint_elements: usize::MAX,
+            max_generator_nnz: usize::MAX,
+            max_unstable: usize::MAX,
+            max_exact_terms: usize::MAX,
+        };
+        assert!(matches!(
+            ResourcePlan::checked(
+                1,
+                usize::MAX,
+                0,
+                0,
+                1,
+                PredicateMode::Preserve,
+                false,
+                unbounded,
+            ),
+            Err(ReluTransformError::ResourceOverflow {
+                operation: "output alpha dimension"
+            })
+        ));
+
+        let mut exact = Vec::<u8>::new();
+        assert_eq!(
+            try_reserve(&mut exact, usize::MAX, "test exact allocation").unwrap_err(),
+            ReluTransformError::AllocationFailure {
+                resource: "test exact allocation"
+            },
+        );
+        let mut amortized = Vec::<u8>::new();
+        assert_eq!(
+            try_reserve_amortized(&mut amortized, usize::MAX, "test amortized allocation")
+                .unwrap_err(),
+            ReluTransformError::AllocationFailure {
+                resource: "test amortized allocation"
+            },
+        );
+    }
+
+    #[test]
+    fn host_gradual_underflow_probe_accepts_the_proof_environment() {
+        require_relu_gradual_underflow().unwrap();
+        assert_eq!(
+            ReluTransformError::UnsupportedFloatingPoint {
+                requirement: "IEEE-754 binary64 gradual underflow (FTZ/DAZ disabled)",
+            }
+            .to_string(),
+            "unsupported floating-point environment: IEEE-754 binary64 gradual underflow (FTZ/DAZ disabled)",
+        );
     }
 
     #[test]
@@ -2163,62 +3345,6 @@ mod tests {
                 })
             ));
         }
-    }
-
-    /// Manual diagnostic for the exact-radius hotspot.  This is ignored in
-    /// normal suites because wall-clock ratios are host/profile dependent; it
-    /// always checks every resulting radius against the old rational path.
-    #[test]
-    #[ignore = "manual exact-radius performance diagnostic"]
-    fn benchmark_dyadic_radius_against_rational_oracle() {
-        use std::time::Instant;
-
-        // The observed fourth Metaroom convolution feeds exactly this shape
-        // into ReLU: 28,672 coordinates and 1,739,328 sparse coefficients.
-        const COORDINATE_COUNT: usize = 28_672;
-        const TERM_COUNT: usize = 1_739_328;
-
-        // SplitMix64 supplies deterministic full mantissas and a broad range
-        // of exponents typical of coefficients after several affine stages.
-        let mut state = 0x243f_6a88_85a3_08d3_u64;
-        let values: Vec<_> = (0..TERM_COUNT)
-            .map(|_| {
-                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-                let mut mixed = state;
-                mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-                mixed ^= mixed >> 31;
-                let sign = mixed & (1_u64 << 63);
-                let biased_exponent = 930 + ((mixed >> 52) % 80);
-                let fraction = mixed & ((1_u64 << 52) - 1);
-                f64::from_bits(sign | (biased_exponent << 52) | fraction)
-            })
-            .collect();
-
-        let mut dyadic = vec![ExactNonnegativeDyadic::default(); COORDINATE_COUNT];
-        let dyadic_started = Instant::now();
-        for (index, &value) in values.iter().enumerate() {
-            dyadic[index % COORDINATE_COUNT]
-                .add_abs_finite(value, index % COORDINATE_COUNT, "dyadic benchmark")
-                .unwrap();
-        }
-        let dyadic_elapsed = dyadic_started.elapsed();
-
-        let mut rational = vec![BigRational::zero(); COORDINATE_COUNT];
-        let rational_started = Instant::now();
-        for (index, &value) in values.iter().enumerate() {
-            rational[index % COORDINATE_COUNT] += exact(value).abs();
-        }
-        let rational_elapsed = rational_started.elapsed();
-
-        for (dyadic, rational) in dyadic.iter().zip(&rational) {
-            assert_eq!(dyadic.to_big_rational(), *rational);
-        }
-        eprintln!(
-            "exact-radius diagnostic: {TERM_COUNT} terms over {COORDINATE_COUNT} coordinates: \
-             dyadic={dyadic_elapsed:?}, BigRational={rational_elapsed:?}, speedup={:.2}x",
-            rational_elapsed.as_secs_f64() / dyadic_elapsed.as_secs_f64()
-        );
     }
 
     #[test]

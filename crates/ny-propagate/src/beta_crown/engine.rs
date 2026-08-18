@@ -11,12 +11,16 @@ mod backward;
 mod bounds;
 mod branching;
 mod complete_clip_engine;
-mod complete_clip_intermediate;
+pub(in crate::beta_crown::engine) mod complete_clip_intermediate;
 mod complete_clip_precomputed;
 mod core;
 mod cut_gate;
 mod cuts;
-mod domain;
+// `pub(crate)` only so the crate root can re-export the sequential
+// clip-interm-domain CAPABILITY predicate (`domain::clip`) — the CLI's
+// preset/engine contract check must read the engine's own answer rather than
+// duplicate a constant that could drift. Nothing else here is public.
+pub(crate) mod domain;
 mod domain_results;
 pub(crate) mod graph;
 mod input_split;
@@ -71,10 +75,11 @@ pub struct BetaCrownVerifier {
     graph_mip_leaf_oracle: Option<Arc<dyn crate::beta_crown::graph_mip_leaf::GraphMipLeafOracle>>,
     /// Exact root intermediate-bound result shared by deterministic restarts of
     /// one top-level grouped-disjunctive verification call. The CLI attaches a
-    /// fresh cache only under `NY_DISJUNCTIVE_RESTART_ROOT_CACHE=1`; ordinary
-    /// verifiers keep `None`. `with_config_from` shares the same `Arc` so a
-    /// completed first restart can serve the second restart's configured graph
-    /// clone without escaping the top-level call.
+    /// fresh cache for explicitly typed cGAN roots and under the ordinary
+    /// `NY_DISJUNCTIVE_RESTART_ROOT_CACHE=1` opt-in; other verifiers keep
+    /// `None`. `with_config_from` shares the same `Arc` so a completed first
+    /// restart can serve the second restart's configured graph clone without
+    /// escaping the top-level call.
     disjunctive_restart_root_cache:
         Option<Arc<graph::input_split::root_bounds::InputSplitRootBoundsCache>>,
     /// #extract-skeleton increment 3: verifier-lifetime cross-batch cache of
@@ -85,17 +90,41 @@ pub struct BetaCrownVerifier {
     /// extraction (the fail-closed spine); the cache never changes what a
     /// fold produces.
     pub(crate) skeleton_cache: ResnetSkeletonCache,
+    /// Exact unconstrained root node bounds used to produce reusable
+    /// Complete-Clipping affine templates. One entry per verifier, keyed by
+    /// live graph scope and every input-box bit.
+    pub(crate) complete_clip_root_bounds_cache:
+        graph::propagation::batched::interm_refine::CompleteClipRootBoundsCache,
+    /// Dynamic outer-BaB deadline scopes.
+    ///
+    /// This was introduced for optional Complete Clipping work, but is also
+    /// the authoritative boundary for nested graph-BaB α/β optimization,
+    /// branch scoring, and dense child propagation. The root/config deadline
+    /// may be later than a caller's ledger-reserved BaB slice.
+    pub(crate) complete_clip_deadline_overrides:
+        graph::propagation::batched::interm_refine::CompleteClipDeadlineOverrides,
     /// #gather-score (boxlift charter Inc 4, DARK `NY_MO_GATHER_SCORE=1`):
     /// advisory per-domain branch scores harvested from the wide-β lane's
     /// already-paid A_lower gather, keyed by split-set fingerprint. Advisory
     /// only — a hit reorders branch candidates, a miss falls back to the
     /// shipped scorer; entries never affect bounds or verdicts.
     pub(crate) gather_score_cache: graph::propagation::batched::gather_score::GatherScoreCache,
-    /// Observation-only adaptive-depth kFSB shadow budget. The dark
-    /// `NY_MO_ADAPTIVE_DEPTH_SHADOW=1` hook is deliberately one-shot per
-    /// verifier: it may price one top-2/top-3 prefix tree, but it must never
-    /// turn every BaB wave into an unbounded diagnostic workload.
+    /// Bounded adaptive-depth kFSB evaluation budget. The dark SHADOW, SELECT,
+    /// and COMMIT hooks share one verifier-lifetime attempt: they may price one
+    /// top-three tree portfolio, but can never turn every BaB wave into an
+    /// unbounded diagnostic or commit workload.
     pub(crate) adaptive_depth_shadow_fired: std::sync::atomic::AtomicBool,
+    /// Observation-only precision-consistent kFSB shadow budget. The exact
+    /// `NY_MO_KFSB_F64_SHADOW=1` gate may re-score one wave's worst parent's
+    /// post-f32 top-three portfolio with the certified CPU-f64 lineage fold.
+    /// It is deliberately one-shot per verifier so diagnostic work cannot
+    /// become a per-wave tax.
+    pub(crate) kfsb_f64_shadow_fired: std::sync::atomic::AtomicBool,
+    /// Observation-only root-attribution portfolio comparison budget. The
+    /// diagnostic may claim at most one eligible wave over this verifier's
+    /// lifetime; descendant waves and later eligible waves remain on the
+    /// ordinary selector without minting another private deadline.
+    pub(crate) attribution_diag_fired: std::sync::atomic::AtomicBool,
 }
 
 /// #extract-skeleton increment 3: verifier-lifetime cache of

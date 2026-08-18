@@ -84,14 +84,19 @@ impl BoundPropagation for ShrinkLayer {
     /// - -lambd <= x <= lambd: y = 0 (slope 0)
     /// - x > lambd: y = x - bias (slope 1)
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
-        // Guard: non-finite input bounds → NaN comparisons silently fall into
-        // dead-zone branch, returning (0.0, 0.0) — unsound. CROWN path rejects
-        // via non_finite_domain_guard. Pattern: SELU guard at selu.rs:47-53.
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // Guard: NaN input bounds → NaN comparisons silently fall into the
+        // dead-zone branch, returning (0.0, 0.0) — unsound. NaN ONLY — ±Inf is
+        // a legitimate input here. An upstream node that failed closed to an
+        // OpaqueSkip hands its consumers `[-inf, +inf]`
+        // (`OpaqueSkipLayer::unbounded_like` builds exactly that); rejecting it
+        // as `NumericalInstability` aborted the WHOLE graph-IBP pass, because
+        // that variant is not in `is_degradable_error`. The ±Inf branch
+        // selection below is exact: `-inf < -lambd` and `+inf > lambd` hold for
+        // every finite lambd, so an infinite endpoint never lands in the
+        // dead-zone branch. Pattern: AddConstant (add_constant.rs:69-79).
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "Shrink IBP: non-finite input bounds".to_string(),
+                "Shrink IBP: NaN input bounds".to_string(),
             ));
         }
 
@@ -161,7 +166,18 @@ impl BoundPropagation for ShrinkLayer {
         let upper = ArrayD::from_shape_vec(IxDyn(&lower_shape), upper_data)
             .map_err(|e| NyError::InvalidSpec(format!("Shrink upper reshape: {}", e)))?;
 
-        BoundedTensor::new(lower, upper)
+        // `new_allow_infinite`, not the strict `new`: an infinite endpoint from
+        // an upstream OpaqueSkip flows through cleanly, so no repair is needed.
+        // `bias` and `lambd` are validated finite at construction, so the only
+        // arithmetic on an infinite input is `x - bias` / `x + bias` with a
+        // finite bias → ±inf, never inf - inf. The `candidates` folds are
+        // comparisons (nan_propagating_min/max), not arithmetic, and 0 * inf /
+        // inf / inf never appear. So an infinite endpoint yields either ±Inf or
+        // a finite bound (e.g. [-inf, 0] with lambd = 0.5 caps the upper at 0),
+        // and NaN can only come from a NaN input, which the guard above
+        // rejects; a NaN that reached here anyway still hard-errors in this
+        // constructor.
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
 
     impl_elementwise_activation!(
@@ -193,7 +209,7 @@ impl ShrinkLayer {
     /// structure with possible discontinuities at ±lambd.
     ///
     /// Reference: alpha-beta-CROWN auto_LiRPA/operators/activations.py BoundHardTanh
-    fn relaxation(&self, l: f32, u: f32) -> LinearRelaxation {
+    pub(super) fn relaxation(&self, l: f32, u: f32) -> LinearRelaxation {
         let bias = self.bias;
         let lambd = self.lambd;
 

@@ -14,11 +14,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ny_core::{GemmEngine, Result};
+use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::{debug, info};
 
 use crate::beta_crown::state::GraphDomainAlphaState;
+use crate::beta_crown::BetaCrownConfig;
 use crate::bounds::GraphAlphaState;
 use crate::AlphaCrownConfig;
 use crate::GraphNetwork;
@@ -147,6 +148,35 @@ pub(super) fn build_per_disjunct_alphas(
     engine: Option<&dyn GemmEngine>,
 ) -> Result<Vec<GraphDomainAlphaState>> {
     let num_disjuncts = objectives.len();
+    if num_disjuncts == 0
+        || thresholds.len() != num_disjuncts
+        || initial_obj_bounds.len() != num_disjuncts
+    {
+        return Err(NyError::InvalidSpec(format!(
+            "per-disjunct alpha layout mismatch: objectives={}, thresholds={}, bounds={}",
+            num_disjuncts,
+            thresholds.len(),
+            initial_obj_bounds.len()
+        )));
+    }
+    for (index, ((objective, &(lower, upper)), &threshold)) in objectives
+        .iter()
+        .zip(initial_obj_bounds)
+        .zip(thresholds)
+        .enumerate()
+    {
+        if objective.is_empty()
+            || objective.iter().any(|value| !value.is_finite())
+            || !lower.is_finite()
+            || !upper.is_finite()
+            || !threshold.is_finite()
+            || lower > upper
+        {
+            return Err(NyError::NumericalInstability(format!(
+                "per-disjunct alpha row {index} is malformed"
+            )));
+        }
+    }
     let mut per_disjunct = Vec::with_capacity(num_disjuncts);
 
     // Convert Arc bounds to plain BoundedTensor for the alpha optimizer.
@@ -168,9 +198,12 @@ pub(super) fn build_per_disjunct_alphas(
         .iter()
         .enumerate()
         .filter(|(idx, _)| {
-            !initial_obj_bounds
-                .get(*idx)
-                .is_some_and(|(lower, _)| *lower > thresholds[*idx])
+            !BetaCrownConfig::domain_is_verified_for_mode(
+                false,
+                initial_obj_bounds[*idx].0,
+                initial_obj_bounds[*idx].1,
+                thresholds[*idx],
+            )
         })
         .count();
 
@@ -208,9 +241,12 @@ pub(super) fn build_per_disjunct_alphas(
     let mut deadline_skipped_count = 0;
     let mut assigned_iterations = 0;
     for (idx, spec_row) in objectives.iter().enumerate() {
-        let already_verified = initial_obj_bounds
-            .get(idx)
-            .is_some_and(|(lower, _)| *lower > thresholds[idx]);
+        let already_verified = BetaCrownConfig::domain_is_verified_for_mode(
+            false,
+            initial_obj_bounds[idx].0,
+            initial_obj_bounds[idx].1,
+            thresholds[idx],
+        );
 
         if already_verified {
             per_disjunct.push(shared_domain_alpha.clone());

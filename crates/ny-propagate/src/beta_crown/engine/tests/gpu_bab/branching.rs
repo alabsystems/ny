@@ -506,7 +506,7 @@ fn test_gpu_bab_stable_neurons() {
     // Expected: PotentialViolation because lower bound violates the property
     assert_eq!(
         result.result,
-        BabVerificationStatus::PotentialViolation,
+        BabVerificationStatus::potential_violation(),
         "With output lower bound (0) >= threshold (-0.5), should detect potential violation, got {:?}",
         result.result
     );

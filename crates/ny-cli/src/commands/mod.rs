@@ -17,7 +17,10 @@
 //!   `.gt.json` sidecars and ground-truth VNN-LIB dual-network properties)
 //! - `vnncomp`: native VNN-COMP `run_instance.sh` flow (preset auto-load, timeout
 //!   tiering, β-CROWN invocation, verdict translation, RESULTS_FILE writing)
-//! - `vnncomp_benchmarks`: VNN-COMP benchmark acquisition and status
+//! - `vnncomp_benchmarks`: VNN-COMP benchmark workflow command routing
+//! - `vnncomp_sweep`: `ny benchmarks run` — sweep a corpus to an official-format results.csv
+//! - `vnncomp_score`: compare result banks and model separate 2025/2026 track scores
+//! - `vnncomp_reseed`: fail-closed path-rename metamorphic checks
 //! - `vnncomp_submit`: VNN-COMP harness validation and submission packaging
 
 // Command-handler modules.
@@ -27,15 +30,20 @@ pub(crate) mod bench;
 pub(crate) mod bench_acasxu;
 pub(crate) mod bench_vnncomp;
 pub(crate) mod beta_crown;
+pub(crate) mod cgan_status;
 pub(crate) mod coupled_delta;
-#[cfg(all(test, feature = "mip"))]
-mod coupled_relu_probe;
 pub(crate) mod coverage;
 // Qualification milestone: compiled and tested under `mip`, deliberately
 // unreachable from commands/verdicts until the full-network/replay gate lands.
 #[cfg(feature = "mip")]
 #[allow(dead_code)]
 pub(crate) mod cz_metaroom_unwired;
+// Default-dark real-model qualification machinery. Its public probe reports
+// remain verdict-neutral; the beta-crown cGAN input-leaf module is the sole
+// property-bound authority layer for the private scalar leaf-row API.
+#[cfg(feature = "mip")]
+#[allow(dead_code)]
+pub(crate) mod cz_cgan_sequential_unwired;
 pub(crate) mod gt;
 pub(crate) mod inspect;
 pub(crate) mod inspect_model;
@@ -43,16 +51,23 @@ pub(crate) mod json_error;
 pub(crate) mod lipschitz;
 pub(crate) mod margin_row_bab;
 pub(crate) mod relational_equiv;
+pub(crate) mod terminal_peel;
 #[cfg(test)]
 mod tests;
 pub(crate) mod tll_structure;
 pub(crate) mod tutorial;
 pub(crate) mod verify;
 pub(crate) mod vnncomp;
+pub(crate) mod vnncomp_2025_tracks;
+pub(crate) mod vnncomp_2026_tracks;
 pub(crate) mod vnncomp_benchmarks;
 pub(crate) mod vnncomp_late_submit;
 pub(crate) mod vnncomp_matrix;
+pub(crate) mod vnncomp_plan;
+pub(crate) mod vnncomp_reseed;
+pub(crate) mod vnncomp_score;
 pub(crate) mod vnncomp_submit;
+pub(crate) mod vnncomp_sweep;
 pub(crate) mod weights;
 pub(crate) mod whisper;
 

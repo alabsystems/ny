@@ -4,8 +4,8 @@
 
 //! Shared backward CROWN layer dispatch core.
 //!
-//! This module provides a single canonical dispatch function for backward
-//! CROWN propagation through individual graph nodes. All dispatch sites
+//! This module provides a canonical Dense dispatch function plus an explicit
+//! strict entry point for finite Patches-to-Dense boundaries. All dispatch sites
 //! (graph_crown::propagation, graph_alpha::backward, graph_alpha::bounds,
 //! constraints::backward, spec_propagation, batched::backward_core) should route their layer match
 //! through this module to eliminate the drift risk documented in #1949.
@@ -33,5 +33,5 @@ mod tests_engine;
 mod types;
 
 // Re-export public API items at the module level for unchanged import paths.
-pub(crate) use dispatch::dispatch_backward_layer;
+pub(crate) use dispatch::{dispatch_backward_layer, dispatch_backward_layer_finite_boundary};
 pub(crate) use types::{BackwardDispatchResult, DispatchContext};

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Initialization phase for GPU BaB: root bound computation and DomainList setup.
+//! Initialization phase for DomainList BaB: root bound computation and DomainList setup.
 //!
 //! Extracted from the first ~250 lines of `verify_graph_gpu_domain_list`.
 
@@ -118,7 +118,7 @@ pub(crate) fn compute_initial_bounds(
             config,
             engine,
             deadline,
-            "GPU BaB input split",
+            "DomainList BaB input split",
             None,
         )?;
         let fixed_node_bounds = if config.use_alpha_crown || config.use_forward_bounds {
@@ -133,7 +133,7 @@ pub(crate) fn compute_initial_bounds(
             engine,
             deadline,
             config.crown_backward_layers,
-            "GPU BaB input split",
+            "DomainList BaB input split",
         )?;
         let (root_bounds, root_linear_bounds) = compute_crown_or_ibp_bounds(
             graph,
@@ -156,7 +156,7 @@ pub(crate) fn compute_initial_bounds(
         let root_upper = root_bounds.upper()[[0]];
         if !root_lower.is_finite() || !root_upper.is_finite() {
             return Err(NyError::NumericalInstability(format!(
-                "GPU BaB init: non-finite root bounds from spec-guided CROWN \
+                "DomainList BaB init: non-finite root bounds from spec-guided CROWN \
                  (lower={root_lower}, upper={root_upper})"
             )));
         }
@@ -166,7 +166,7 @@ pub(crate) fn compute_initial_bounds(
             ndarray::arr1(&[root_upper]).into_dyn(),
         )?;
         info!(
-            "GPU BaB (DomainList): initial bounds [{:.4}, {:.4}], threshold: {:.4}",
+            "DomainList BaB: initial bounds [{:.4}, {:.4}], threshold: {:.4}",
             root_lower,
             root_upper,
             0.0 // threshold logged at call site
@@ -215,22 +215,26 @@ pub(crate) fn compute_initial_bounds(
 
     if !root_lower.is_finite() || !root_upper.is_finite() {
         return Err(NyError::NumericalInstability(format!(
-            "GPU BaB init: non-finite root bounds from spec-guided CROWN \
+            "DomainList BaB init: non-finite root bounds from spec-guided CROWN \
              (lower={root_lower}, upper={root_upper})"
         )));
     }
 
+    // Preserve any root-alpha cap that the bootstrap min-composed into its
+    // embedded config. The shared root-output helper treats its explicit
+    // deadline as phase authority; GPU BaB does not own the multi-objective
+    // checkpoint grace and therefore must not widen back to iterative_deadline.
     let initial_output = compute_graph_root_output_bounds(
         graph,
         input,
         config,
         engine,
         &bootstrap,
-        iterative_deadline,
+        bootstrap.alpha_config.deadline,
     )?;
 
     info!(
-        "GPU BaB (DomainList): initial bounds [{:.4}, {:.4}], threshold: {:.4}",
+        "DomainList BaB: initial bounds [{:.4}, {:.4}], threshold: {:.4}",
         root_lower,
         root_upper,
         0.0 // threshold logged at call site
@@ -304,6 +308,7 @@ pub(crate) fn create_domain_list(
     };
 
     let mut domain_list = DomainList::new(dl_config)?;
+    domain_list.configure_queue_eviction(config.max_queue_bytes, config.verify_upper_bound)?;
 
     // Add root domain, with root alpha initialized the same way as the heap paths:
     // optimized alpha-CROWN values when available, otherwise heuristic alpha

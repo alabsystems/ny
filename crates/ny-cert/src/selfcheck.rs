@@ -10,7 +10,7 @@
 //! is well formed *before* it is handed to Clean. Clean's kernel-side verifier
 //! remains the ground truth; this is a fast local pre-flight, not a substitute.
 
-use crate::rational::{Rat, RatError};
+use crate::rational::{poisoned, Rat, RatError};
 use crate::schema::{ConstraintKind, EntailmentCertificate, FarkasCertificate, LinearConstraint};
 use std::collections::BTreeMap;
 // Contracts are written as the BARE `#[ensures]`. Under tRustc with contract
@@ -200,6 +200,9 @@ fn combine(
 // returns ARE the proof shape (see the extract-then-guard comment).
 #[allow(clippy::question_mark)]
 pub fn check_entailment(cert: &EntailmentCertificate) -> Result<(Rat, Rat), CheckError> {
+    if poisoned() {
+        return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+    }
     // Extract-then-guard: makes the `#[ensures]` locally provable. The match
     // only EXTRACTS (the Err arm returns early), the ordering guard is
     // straight-line on the extracted pair, and the tail is a plain
@@ -216,10 +219,21 @@ pub fn check_entailment(cert: &EntailmentCertificate) -> Result<(Rat, Rat), Chec
         // `crate::err_barrier` (identity, `#[inline(never)]`): a fresh in-body
         // `Err` aggregate, not a whole-`Result` forward the return-grounding
         // lane cannot see (nor a const-promoted+merged unit variant).
-        Err(e) => return Err(crate::err_barrier(e)),
+        Err(e) => {
+            if poisoned() {
+                return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+            }
+            return Err(crate::err_barrier(e));
+        }
     };
     if d > c {
+        if poisoned() {
+            return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+        }
         return Err(crate::err_barrier(CheckError::NotEstablished));
+    }
+    if poisoned() {
+        return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
     }
     Ok((d, c))
 }
@@ -320,6 +334,9 @@ fn normalized_eq(a: &LinearConstraint, b: &LinearConstraint) -> bool {
 // returns ARE the proof shape (see the extract-then-guard comment).
 #[allow(clippy::question_mark)]
 pub fn check_chain(steps: &[EntailmentCertificate]) -> Result<(Rat, Rat), CheckError> {
+    if poisoned() {
+        return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+    }
     let mut last: Option<(Rat, Rat)> = None;
     let mut prev_conclusion: Option<&LinearConstraint> = None;
     for (idx, step) in steps.iter().enumerate() {
@@ -343,7 +360,13 @@ pub fn check_chain(steps: &[EntailmentCertificate]) -> Result<(Rat, Rat), CheckE
                 }
             }
             if !found_premise {
+                if poisoned() {
+                    return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+                }
                 return Err(crate::err_barrier(CheckError::ChainBreak(idx)));
+            }
+            if poisoned() {
+                return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
             }
         }
         prev_conclusion = Some(&step.conclusion);
@@ -361,7 +384,13 @@ pub fn check_chain(steps: &[EntailmentCertificate]) -> Result<(Rat, Rat), CheckE
         None => return Err(crate::err_barrier(CheckError::EmptyChain)),
     };
     if d > c {
+        if poisoned() {
+            return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+        }
         return Err(crate::err_barrier(CheckError::NotEstablished));
+    }
+    if poisoned() {
+        return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
     }
     Ok((d, c))
 }
@@ -389,6 +418,9 @@ pub fn check_chain(steps: &[EntailmentCertificate]) -> Result<(Rat, Rat), CheckE
 // returns ARE the proof shape (see the extract-then-guard comment).
 #[allow(clippy::question_mark)]
 pub fn check_farkas(cert: &FarkasCertificate) -> Result<Rat, CheckError> {
+    if poisoned() {
+        return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+    }
     // Extract-then-guard (probe-v10 shape): the match only EXTRACTS (the Err
     // arm returns early), the sign guard is straight-line on the extracted
     // constant, and the tail is a plain `Ok(c)` — so every return path
@@ -405,10 +437,21 @@ pub fn check_farkas(cert: &FarkasCertificate) -> Result<Rat, CheckError> {
         // `crate::err_barrier` (identity, `#[inline(never)]`): a fresh in-body
         // `Err` aggregate, not a whole-`Result` forward the return-grounding
         // lane cannot see (nor a const-promoted+merged unit variant).
-        Err(e) => return Err(crate::err_barrier(e)),
+        Err(e) => {
+            if poisoned() {
+                return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+            }
+            return Err(crate::err_barrier(e));
+        }
     };
     if c.is_positive() {
+        if poisoned() {
+            return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
+        }
         return Err(crate::err_barrier(CheckError::NotEstablished));
+    }
+    if poisoned() {
+        return Err(crate::err_barrier(CheckError::Rat(RatError::Poisoned)));
     }
     Ok(c)
 }
@@ -421,7 +464,14 @@ pub fn check_farkas(cert: &FarkasCertificate) -> Result<Rat, CheckError> {
 fn check_farkas_inner(cert: &FarkasCertificate) -> Result<Rat, CheckError> {
     let combined = combine(&cert.constraints, &cert.multipliers)?;
     if !combined.coeffs.is_empty() {
-        let mut vars: Vec<String> = combined.coeffs.keys().cloned().collect();
+        // Explicit loop (not `.keys().cloned().collect()`): the cloned/collect
+        // adapters are absent-callees for the panic-freedom checker; the loop
+        // yields the identical multiset (order is irrelevant — `vars.sort()`
+        // canonicalizes it immediately below).
+        let mut vars: Vec<String> = Vec::new();
+        for k in combined.coeffs.keys() {
+            vars.push(k.clone());
+        }
         vars.sort();
         return Err(CheckError::UncancelledVariables(vars));
     }
@@ -434,5 +484,39 @@ fn check_farkas_inner(cert: &FarkasCertificate) -> Result<Rat, CheckError> {
         Ok(combined.constant)
     } else {
         Err(CheckError::NotEstablished)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
+
+    #[test]
+    fn public_checkers_refuse_a_poisoned_arena_even_on_trivial_inputs() {
+        let premise = LinearConstraint::with_kind(ConstraintKind::Le, &[("x", Rat::ONE)], Rat::ONE);
+        let entailment = EntailmentCertificate {
+            premises: vec![premise.clone()],
+            multipliers: vec![Rat::ONE],
+            conclusion: premise,
+        };
+        let farkas = FarkasCertificate {
+            constraints: Vec::new(),
+            multipliers: Vec::new(),
+        };
+
+        crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+        let expected = CheckError::Rat(RatError::Poisoned);
+        assert_eq!(check_entailment(&entailment), Err(expected.clone()));
+        assert_eq!(check_chain(&[]), Err(expected.clone()));
+        assert_eq!(check_farkas(&farkas), Err(expected));
     }
 }

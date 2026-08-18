@@ -43,6 +43,10 @@
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
+/// Process-wide accounting for GPU buffer bytes (#gpu-pool-highwater).
+#[cfg(feature = "wgpu")]
+pub mod gpu_memory_ledger;
+
 /// GPU buffer management for batched linear constraints in Clip-and-Verify.
 #[cfg(feature = "wgpu")]
 pub mod constraint_buffers;
@@ -56,9 +60,21 @@ pub mod wgpu_device;
 /// GPU-side constraint buffer manager for batched Clip-and-Verify.
 #[cfg(feature = "wgpu")]
 pub use constraint_buffers::GpuConstraintBuffers;
+/// #batched-bab wide-lane publication counter (observability; see the fn doc).
+#[cfg(feature = "wgpu")]
+pub use wgpu_device::wide_resnet_batched_taken_count;
+/// Cheap adapter-probe result for host backend detection (#backend-detect).
+#[cfg(feature = "wgpu")]
+pub use wgpu_device::AdapterProbe;
 /// WebGPU device for cross-platform GPU-accelerated bound propagation.
 #[cfg(feature = "wgpu")]
 pub use wgpu_device::WgpuDevice;
+#[cfg(feature = "wgpu")]
+pub use wgpu_device::{
+    FlushChargePolicy, WgpuBabBoundQualificationError, WgpuBabBoundVerdictRequest,
+    WgpuChargedVerdictRequest, WgpuVerdictAuthority, WgpuVerdictQualificationError,
+    WgpuVerdictReport, WgpuVerdictRequest, WgpuVerdictRung, WgpuVerdictRungOutcome,
+};
 
 mod accelerated;
 mod backend;
@@ -97,5 +113,37 @@ pub use accelerated::{
 };
 /// Backend trait and compute device abstraction for GPU/CPU dispatch.
 pub use backend::{
-    shared_cpu_engine, wgpu_adapter_available, wgpu_backend_compiled, Backend, ComputeDevice,
+    shared_cpu_engine, wgpu_adapter_available, wgpu_adapter_provenance, wgpu_backend_compiled,
+    wgpu_charged_proof_authority, wgpu_proof_authority, Backend, ComputeDevice,
+    WgpuAdapterProvenance,
 };
+
+/// #attack-steering-unquarantine: live WGPU engine for falsification steering
+/// ONLY (candidates re-gated downstream; never verdict-bearing). See the
+/// module docs for the soundness argument and the routing contract.
+#[cfg(feature = "wgpu")]
+pub mod attack_steering;
+#[cfg(feature = "wgpu")]
+pub use attack_steering::AttackSteeringDevice;
+
+/// #alpha-steering-proposal: live WGPU joint-α adjoint for α-gradient
+/// PROPOSALS only (every proposal re-evaluated by the certified CPU fold;
+/// never verdict-bearing). See the module docs for the soundness argument and
+/// the routing contract.
+#[cfg(feature = "wgpu")]
+pub mod gradient_steering;
+#[cfg(feature = "wgpu")]
+pub use gradient_steering::GradientSteeringDevice;
+
+// #fl-value-gpu-tier: deadline-capable WGPU f32 GEMM for the forward-linear
+// VALUE seam only (the call site charges `gamma^f32·S` + FTZ for the values;
+// every other engine surface typed-refuses).
+//
+// RE-LANDED 2026-08-02: `fde664d8` shipped consumers without this producer
+// (the file was untracked — commit-partition miss); withdrawn by 0e8dfb7a,
+// restored here together with the implementation file, per that hotfix's
+// re-landing instructions.
+#[cfg(feature = "wgpu")]
+pub mod fl_value_gemm;
+#[cfg(feature = "wgpu")]
+pub use fl_value_gemm::FlValueGemmDevice;

@@ -2,69 +2,68 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared Whisper CLI arguments.
+//! Shared arguments for unavailable experimental Whisper compatibility commands.
 //!
 //! The WhisperSeq, WhisperSweep, and WhisperEpsSearch subcommands share
-//! ~14 identical fields. This struct is `#[command(flatten)]`-ed into each
-//! variant to eliminate the triplication.
+//! these fields to preserve their CLI shape. Their handlers fail closed before
+//! using the model, backend, or verification controls.
 
 use clap::Args;
 use std::path::PathBuf;
 
 use super::cli_types::BackendArg;
 
-/// Common arguments shared by WhisperSeq, WhisperSweep, and WhisperEpsSearch.
+/// Compatibility arguments for unavailable experimental Whisper commands.
 #[derive(Args, Clone, Debug)]
 pub(crate) struct WhisperCommonArgs {
-    /// Path to Whisper ONNX model
+    /// Retained model path argument; the unavailable command does not open it
     pub model: PathBuf,
 
-    /// First encoder block (0-indexed)
+    /// Retained start block; ignored while verification is unavailable
     #[arg(long, default_value_t = 0)]
     pub start_block: usize,
 
-    /// End encoder block (exclusive). Defaults to all blocks.
+    /// Retained end block; ignored while verification is unavailable
     #[arg(long)]
     pub end_block: Option<usize>,
 
-    /// Include encoder stem (mel -> hidden) before the first block
+    /// Retained stem flag; ignored while verification is unavailable
     #[arg(long, default_value_t = false)]
     pub include_stem: bool,
 
-    /// Include final encoder LayerNorm (ln_post) after the last block
+    /// Retained final-LayerNorm flag; ignored while verification is unavailable
     #[arg(long, default_value_t = false)]
     pub include_ln_post: bool,
 
-    /// Batch size for synthetic input (hidden states or mel)
+    /// Retained batch size; ignored while verification is unavailable
     #[arg(long, default_value_t = 1)]
     pub batch: usize,
 
-    /// Sequence length for synthetic hidden-state input (ignored if --include-stem)
+    /// Retained sequence length; ignored while verification is unavailable
     #[arg(long, default_value_t = 4)]
     pub seq_len: usize,
 
-    /// Mel bins for synthetic mel input (only used with --include-stem)
+    /// Retained mel-bin count; ignored while verification is unavailable
     #[arg(long, default_value_t = 80)]
     pub n_mels: usize,
 
-    /// Time dimension for synthetic mel input (only used with --include-stem)
+    /// Retained time dimension; ignored while verification is unavailable
     #[arg(long, default_value_t = 3000)]
     pub time: usize,
 
-    /// Compute backend (cpu, wgpu)
+    /// Retained backend selector; no backend is initialized
     #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
     pub backend: BackendArg,
 
-    /// Use wgpu GPU acceleration (deprecated, use --backend wgpu)
+    /// Retained deprecated GPU flag; no device is initialized
     #[arg(long, default_value_t = false, hide = true)]
     pub gpu: bool,
 
-    /// Override: maximum bound width threshold before early termination
+    /// Retained width limit; ignored while verification is unavailable
     #[arg(long)]
     pub max_bound_width: Option<f32>,
 
-    /// Override: reset zonotope correlations at block boundaries (true/false)
-    /// Normalizes input bounds and rescales output for deep transformers (28+ layers)
+    /// Retained zonotope reset flag; no zonotope lane executes
     #[arg(
         long,
         value_parser = clap::value_parser!(bool),
@@ -73,7 +72,7 @@ pub(crate) struct WhisperCommonArgs {
     )]
     pub reset_zonotope_blocks: Option<bool>,
 
-    /// Output as JSON
+    /// Retained compatibility flag; the fail-closed error uses normal CLI text
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }

@@ -18,7 +18,7 @@ use ny_api::graph::{GraphNetwork, GraphNode, NETWORK_INPUT};
 use ny_api::layers::{CumsumLayer, Layer, LinearLayer, ReLULayer};
 use ny_api::model::{
     AttributeValue, DataType, GraphModel, GraphModelBuilder, GraphNetworkOptions, LayerSpec,
-    LayerType, NetworkSpec, TensorSpec, WeightStore,
+    LayerType, NetworkSpec, TensorSpec, WeightStore, EXPAND_LIVE_SHAPE_REFERENCE_ATTR,
 };
 use ny_api::parallel::{
     verify_parallel, verify_parallel_with_engine, verify_parallel_with_method,
@@ -65,14 +65,26 @@ fn traced_shape_path_routes_expand_to_live_reference_node() {
 }
 
 fn traced_expand_graph_model(shape: &[i64]) -> GraphModel {
+    assert!(shape.len() >= 2 && shape.last().copied().is_some_and(|width| width > 0));
+    let mut summary_shape = shape.to_vec();
+    *summary_shape.last_mut().expect("non-empty shape") = 1;
     GraphModelBuilder::new("expand-like")
         .input("input", shape, DataType::Float32)
         .output("expanded_out", shape, DataType::Float32)
-        .layer(layer_spec(
+        .layer(attributed_layer_spec(
             "summary",
-            LayerType::ReLU,
+            LayerType::ReduceMean,
             &["input"],
             &["summary_out"],
+            HashMap::from([
+                (
+                    "axes".to_string(),
+                    AttributeValue::Ints(vec![
+                        i64::try_from(shape.len() - 1).expect("rank fits i64")
+                    ]),
+                ),
+                ("keepdims".to_string(), AttributeValue::Int(1)),
+            ]),
         ))
         .layer(layer_spec(
             "reference",
@@ -80,20 +92,20 @@ fn traced_expand_graph_model(shape: &[i64]) -> GraphModel {
             &["input"],
             &["reference_out"],
         ))
-        .layer(layer_spec(
+        .layer(attributed_layer_spec(
             "expand",
             LayerType::Expand,
-            &["summary_out", "shape_cast_out"],
+            &["summary_out", "reference_out"],
             &["expanded_out"],
+            HashMap::from([(
+                EXPAND_LIVE_SHAPE_REFERENCE_ATTR.to_string(),
+                AttributeValue::String("reference_out".to_string()),
+            )]),
         ))
-        .tensor_producer("shape_cast_out", "shape_gather_out")
-        .tensor_producer("shape_gather_out", "shape_of_reference")
-        .tensor_producer("shape_of_reference", "reference_out")
-        .constant_tensor("shape_of_reference")
-        .constant_tensor("shape_gather_out")
-        .constant_tensor("shape_cast_out")
+        .tensor_producer("summary_out", "input")
+        .tensor_producer("reference_out", "input")
         .tensor_shape("input", shape)
-        .tensor_shape("summary_out", shape)
+        .tensor_shape("summary_out", &summary_shape)
         .tensor_shape("reference_out", shape)
         .tensor_shape("expanded_out", shape)
         .build()

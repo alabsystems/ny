@@ -8,11 +8,13 @@ use std::time::Duration;
 
 use super::super::batching::bound_deferred_disjunctive_domains_batch;
 use super::super::grouped_semantics::disjunctive_domain_priority;
+use super::super::root_bounds::collect_input_split_root_node_bounds;
 use super::super::shared::extract_obj_bounds;
 use super::*;
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::beta_crown::result::BabVerificationStatus;
+use crate::bounds::AlphaCrownConfig;
 use crate::BranchingHeuristic;
 use ny_test_utils::CountingGemmEngine;
 
@@ -449,6 +451,257 @@ fn build_disjunctive_status_config_4354() -> BetaCrownConfig {
         reorder_bab: false,
         ..Default::default()
     }
+}
+
+/// Extend the shared branched dense-Concat fixture into a three-activation DAG,
+/// the minimum depth that selects LinearizeNN's dense-DAG CROWN-IBP reference
+/// collector:
+///
+/// ```text
+/// input(2) -> Linear/ReLU --┐
+///       \-> Linear/ReLU ----+-> Concat -> Linear/ReLU -> Linear(2)
+/// ```
+///
+/// Reusing `build_dag_concat_graph_4384` keeps this composition test focused;
+/// the larger exact `Slice -> Linear -> Concat` AllInOne-shaped fixture is
+/// already pinned by the graph-alpha collector regression.
+fn build_linearizenn_production_composition_graph() -> (GraphNetwork, BoundedTensor) {
+    let mut graph = build_dag_concat_graph_4384();
+    graph.add_node(GraphNode::new(
+        "relu_out",
+        Layer::ReLU(ReLULayer),
+        vec!["linear_out".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "output",
+        Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0_f32], [-0.7]]), Some(arr1(&[0.02, -0.03])))
+                .expect("valid final linear"),
+        ),
+        vec!["relu_out".to_string()],
+    ));
+    graph.set_output("output");
+    (graph, dag_concat_input_4384())
+}
+
+fn linearizenn_child_boxes(root: &BoundedTensor) -> [BoundedTensor; 2] {
+    let mut left_upper = root.upper().clone();
+    left_upper[[0]] = 0.0;
+    let mut right_lower = root.lower().clone();
+    right_lower[[0]] = 0.0;
+    [
+        BoundedTensor::new(root.lower().clone(), left_upper).expect("valid left child"),
+        BoundedTensor::new(right_lower, root.upper().clone()).expect("valid right child"),
+    ]
+}
+
+fn linearizenn_production_composition_config() -> BetaCrownConfig {
+    BetaCrownConfig {
+        branching_heuristic: BranchingHeuristic::InputSplit,
+        verify_upper_bound: false,
+        use_alpha_crown: true,
+        alpha_config: AlphaCrownConfig {
+            iterations: 0,
+            ..AlphaCrownConfig::default()
+        },
+        input_split_alpha_iteration: 0,
+        input_split_ibp_enhancement: true,
+        input_split_stacked_rebound: true,
+        reorder_bab: true,
+        enable_cuts: false,
+        enable_relaxed_clip: false,
+        max_domains: 64,
+        max_depth: 1,
+        batch_size: 4,
+        timeout: Duration::from_secs(10),
+        ..BetaCrownConfig::default()
+    }
+}
+
+fn total_spec_width(bounds: &[BoundedTensor]) -> f32 {
+    bounds
+        .iter()
+        .map(|bounds| {
+            bounds
+                .upper()
+                .iter()
+                .zip(bounds.lower())
+                .map(|(upper, lower)| upper - lower)
+                .sum::<f32>()
+        })
+        .sum()
+}
+
+/// Compose the LinearizeNN root collector, reordered child rebound, and grouped
+/// verifier. The smaller tests pin these pieces separately; this test asserts
+/// that the exact production knobs meet at the same seams.
+#[test]
+fn linearizenn_grouped_reorder_root_crown_child_stacked_ibp_matches_conservative_verdict() {
+    let (graph, input) = build_linearizenn_production_composition_graph();
+    let config = linearizenn_production_composition_config();
+    assert_eq!(config.alpha_config.iterations, 0);
+    assert_eq!(config.input_split_alpha_iteration, 0);
+    assert!(config.input_split_ibp_enhancement);
+    assert!(config.input_split_stacked_rebound);
+    assert!(config.reorder_bab);
+
+    let exec_order = graph.exec_order().expect("LinearizeNN DAG should sort");
+    assert!(
+        !graph.is_sequential_graph(exec_order),
+        "fixture must retain the LinearizeNN input-skip DAG"
+    );
+    let (reference, source) = graph
+        .collect_alpha_reference_bounds_with_engine_and_source(
+            &input,
+            &config.alpha_config,
+            None,
+            exec_order,
+        )
+        .expect("root alpha reference should collect");
+    assert!(
+        source.is_crown_ibp(),
+        "the production root must select the dense-DAG CROWN-IBP collector"
+    );
+
+    let (root_node_bounds, root_alpha_state) = collect_input_split_root_node_bounds(
+        &graph,
+        &input,
+        &config,
+        None,
+        None,
+        "LinearizeNN production-composition test",
+        None,
+    )
+    .expect("zero-iteration root alpha bootstrap should succeed");
+    let root_node_bounds =
+        root_node_bounds.expect("alpha-CROWN root should return its reusable reference map");
+    let root_alpha_state =
+        root_alpha_state.expect("zero root iterations must still initialize reusable alpha");
+    assert!(
+        root_alpha_state.num_unstable() > 0,
+        "zero iterations should initialize, not omit, unstable ReLU alpha state"
+    );
+    let expected = reference
+        .get("linear_out")
+        .expect("reference map missing linear_out");
+    let actual = root_node_bounds
+        .get("linear_out")
+        .expect("root bootstrap map missing linear_out");
+    assert_eq!(
+        (actual.lower(), actual.upper()),
+        (expected.lower(), expected.upper()),
+        "zero-iteration bootstrap must reuse the CROWN-IBP reference map"
+    );
+
+    let children = linearizenn_child_boxes(&input);
+    let child_refs: Vec<&BoundedTensor> = children.iter().collect();
+    let spec_matrix = arr2(&[[1.0_f32, -0.5], [-0.75, 1.0]]);
+    let rebound = |ibp_enhancement, stacked_rebound| {
+        compute_crown_or_ibp_bounds_batched_specs(
+            &graph,
+            &child_refs,
+            &spec_matrix,
+            None,
+            Some(&root_node_bounds),
+            Some(&root_alpha_state),
+            None,
+            None,
+            None,
+            ibp_enhancement,
+            stacked_rebound,
+        )
+        .expect("dense-spec child rebound should succeed")
+    };
+    let shared_only = rebound(false, false);
+    let refreshed = rebound(true, true);
+    assert_eq!(
+        shared_only.rebound_timing.mode,
+        crate::beta_crown::DenseSpecReboundMode::BatchedFastPath
+    );
+    assert_eq!(
+        refreshed.rebound_timing.mode,
+        crate::beta_crown::DenseSpecReboundMode::BatchedFastPath,
+        "production child rebound must stay on the dense-spec batched path"
+    );
+
+    // Fresh child IBP must contribute to the intersection, and that production
+    // adapter path must materially tighten the downstream spec enclosure.
+    for (child_idx, child) in children.iter().enumerate() {
+        let child_ibp = graph
+            .collect_node_bounds(child)
+            .expect("fresh child IBP should collect");
+        let has_strict_intersection = child_ibp.iter().any(|(node_name, child_bounds)| {
+            root_node_bounds.get(node_name).is_some_and(|root_bounds| {
+                root_bounds.shape() == child_bounds.shape()
+                    && (root_bounds
+                        .lower()
+                        .iter()
+                        .zip(child_bounds.lower())
+                        .any(|(root, child)| child > &(root + 1e-6))
+                        || root_bounds
+                            .upper()
+                            .iter()
+                            .zip(child_bounds.upper())
+                            .any(|(root, child)| child < &(root - 1e-6)))
+            })
+        });
+        assert!(
+            has_strict_intersection,
+            "child {child_idx} must contribute at least one strict fresh-IBP intersection"
+        );
+    }
+    let shared_width = total_spec_width(&shared_only.bounds);
+    let refreshed_width = total_spec_width(&refreshed.bounds);
+    assert!(
+        refreshed_width < shared_width,
+        "fresh child IBP must materially re-anchor the production rebound: refreshed={refreshed_width}, shared={shared_width}"
+    );
+
+    let objectives = vec![vec![1.0_f32, -0.5], vec![-0.75, 1.0]];
+    // Deliberately unreachable thresholds keep every sound implementation in
+    // the split/unknown lane, so an accidental false proof cannot hide behind
+    // a root-verifiable fixture.
+    let thresholds = vec![1_000.0_f32, 1_000.0_f32];
+    let clause_sizes = vec![1usize, 1usize];
+    let verify = |config| {
+        BetaCrownVerifier::new(config)
+            .verify_graph_input_split_multi_clause_disjunctive(
+                &graph,
+                &input,
+                &objectives,
+                &thresholds,
+                &clause_sizes,
+                None,
+                None,
+            )
+            .expect("grouped verifier should complete")
+    };
+    let production = verify(config.clone());
+    let conservative = verify(BetaCrownConfig {
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        input_split_ibp_enhancement: false,
+        input_split_stacked_rebound: false,
+        reorder_bab: false,
+        ..config
+    });
+
+    assert_eq!(
+        std::mem::discriminant(&production.result),
+        std::mem::discriminant(&conservative.result),
+        "LinearizeNN production composition changed the conservative verifier verdict: production={:?}, conservative={:?}",
+        production.result,
+        conservative.result
+    );
+    assert!(
+        !matches!(production.result, BabVerificationStatus::Verified),
+        "unreachable-threshold harness must not produce a false proof"
+    );
+    assert!(
+        production.domains_explored >= 2,
+        "production reordered verifier must exercise deferred child rebound, got {} explored",
+        production.domains_explored
+    );
 }
 
 #[test]

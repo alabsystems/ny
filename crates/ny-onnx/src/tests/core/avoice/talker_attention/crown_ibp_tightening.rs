@@ -180,8 +180,9 @@ fn crown_ibp_bisect(
 /// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md §Phase 3
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_crown_ibp_tightening_softmax_centroids_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let graph = full_talker_attention_graph_real_rope();
     let eps = TALKER_ATTENTION_EPSILON;
 
@@ -246,8 +247,9 @@ fn test_crown_ibp_tightening_softmax_centroids_3497() {
 /// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md §Phase 3
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_crown_ibp_tightening_epsilon_sweep_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let graph = full_talker_attention_graph_real_rope();
     let epsilons: Vec<f32> = vec![2e-6, 3e-6, 5e-6];
 

@@ -77,15 +77,15 @@ NY commits, and the pinned dependency supplies the same declarations.
 
 ## Retained NY-owned overlay
 
-The 67 modules under `NyProof/` are NY-origin and are not present in Clean at
+The 68 modules under `NyProof/` are NY-origin and are not present in Clean at
 the pin.
 
-Thirteen reusable proof modules are retained:
+Fourteen reusable proof modules are retained:
 
 - `AristotleLemmas`, `CersyveInduction`, `CertifiedDecision`,
   `FarkasInterval`, `FloatAdequacy`, `MeanValueChain`, `MeanValueForm`,
   `RupChecker`, `RupCheckerFast`, `SatReluCnf`, `SatReluGadget`,
-  `SatReluVerdict`, `SoftmaxFloatRange`
+  `SatReluVerdict`, `SignFusion`, `SoftmaxFloatRange`
 
 Fifty-four NY-specific audit, instance, and generated modules are retained:
 

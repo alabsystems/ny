@@ -4,6 +4,7 @@
 
 use ny_core::{checked_shape_product, NyError, Result};
 use ny_tensor::BoundedTensor;
+use std::time::Instant;
 
 use crate::bounds::LinearBounds;
 
@@ -28,8 +29,12 @@ impl GraphTargetShapeContract {
         self.flat_dim
     }
 
-    pub(crate) fn identity_linear_bounds(&self) -> LinearBounds {
-        LinearBounds::identity(self.flat_dim)
+    pub(crate) fn identity_linear_bounds_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+        retained_base_bytes: usize,
+    ) -> Result<LinearBounds> {
+        LinearBounds::try_identity_with_deadline(self.flat_dim, deadline, retained_base_bytes)
     }
 
     pub(crate) fn restore_concrete(
@@ -37,7 +42,16 @@ impl GraphTargetShapeContract {
         bounds: BoundedTensor,
         context: &'static str,
     ) -> Result<BoundedTensor> {
-        self.restore_to_shape(bounds, &self.tensor_shape, context)
+        self.restore_to_shape_legacy(bounds, &self.tensor_shape, context)
+    }
+
+    pub(crate) fn restore_concrete_with_deadline(
+        &self,
+        bounds: BoundedTensor,
+        context: &'static str,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedTensor> {
+        self.restore_to_shape_with_deadline(bounds, &self.tensor_shape, context, deadline)
     }
 
     pub(crate) fn reshape_for_forward_match(
@@ -46,7 +60,7 @@ impl GraphTargetShapeContract {
         forward: &BoundedTensor,
         context: &'static str,
     ) -> Result<BoundedTensor> {
-        self.restore_to_shape(candidate, forward.shape(), context)
+        self.restore_to_shape_legacy(candidate, forward.shape(), context)
     }
 
     pub(crate) fn validate_spec_cols(
@@ -64,7 +78,55 @@ impl GraphTargetShapeContract {
         }
     }
 
-    fn restore_to_shape(
+    fn restore_to_shape_with_deadline(
+        &self,
+        bounds: BoundedTensor,
+        expected_shape: &[usize],
+        context: &'static str,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedTensor> {
+        let poll = || {
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                Err(NyError::DeadlineExceeded(format!(
+                    "{context} for node '{}': deadline exceeded during shape restore",
+                    self.node_name
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        poll()?;
+        if bounds.shape() == expected_shape {
+            return Ok(bounds);
+        }
+        let expected_len = checked_shape_product(expected_shape).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "{context} for node '{}' expected shape product overflows: {:?}",
+                self.node_name, expected_shape
+            ))
+        })?;
+        if bounds.len() != expected_len {
+            return Err(NyError::shape_mismatch(
+                expected_shape.to_vec(),
+                bounds.shape().to_vec(),
+            ));
+        }
+        let got_shape = bounds.shape().to_vec();
+        match bounds.into_reshape_with_poll(expected_shape, poll) {
+            Ok(bounds) => Ok(bounds),
+            Err(error @ (NyError::DeadlineExceeded(_) | NyError::CpuMemoryExceeded { .. })) => {
+                Err(error)
+            }
+            Err(error) => Err(NyError::InvalidSpec(format!(
+                "{context} for node '{}' failed to reshape {:?} to {:?}: {error}",
+                self.node_name, got_shape, expected_shape
+            ))),
+        }
+    }
+
+    /// Exact historical shape restore for no-deadline callers. In particular,
+    /// non-standard layouts are made contiguous instead of being refused.
+    fn restore_to_shape_legacy(
         &self,
         bounds: BoundedTensor,
         expected_shape: &[usize],
@@ -86,9 +148,9 @@ impl GraphTargetShapeContract {
             ));
         }
         let got_shape = bounds.shape().to_vec();
-        bounds.reshape(expected_shape).map_err(|err| {
+        bounds.reshape(expected_shape).map_err(|error| {
             NyError::InvalidSpec(format!(
-                "{context} for node '{}' failed to reshape {:?} to {:?}: {err}",
+                "{context} for node '{}' failed to reshape {:?} to {:?}: {error}",
                 self.node_name, got_shape, expected_shape
             ))
         })
@@ -109,7 +171,7 @@ mod tests {
         .expect("valid bounds");
         let contract = GraphTargetShapeContract::from_bounds("overflow-node", &bounds);
         let err = contract
-            .restore_to_shape(bounds, &[2, (usize::MAX / 2) + 1], "restore")
+            .restore_to_shape_legacy(bounds, &[2, (usize::MAX / 2) + 1], "restore")
             .expect_err("overflowing expected shape should fail");
 
         assert!(

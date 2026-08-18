@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme.workspace = true
+autotests = false
 
 [lints]
 workspace = true
@@ -15,14 +16,21 @@ workspace = true
 default = ["wgpu"]
 # Cross-platform GPU backend via WebGPU. Downstream crates can opt out by
 # disabling default features and leaving `wgpu` off.
-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+wgpu = [
+    "dep:wgpu",
+    "dep:pollster",
+    "dep:bytemuck",
+    "dep:ny-gpu-passthrough",
+    "dep:sha2",
+]
 # Enable GPU integration tests. Without this feature, GPU tests are not compiled.
 # Run with: cargo test -p ny-gpu --features gpu-tests
-gpu-tests = []
+gpu-tests = ["wgpu"]
 
 [dependencies]
 ny-core = { path = "../ny-core" }
 ny-tensor = { path = "../ny-tensor" }
+ny-levers = { path = "../ny-levers" }
 ny-propagate = { path = "../ny-propagate" }
 ndarray.workspace = true
 rayon.workspace = true
@@ -30,8 +38,10 @@ tracing.workspace = true
 
 # GPU acceleration via wgpu (cross-platform)
 wgpu = { workspace = true, optional = true }
+ny-gpu-passthrough = { path = "../ny-gpu-passthrough", optional = true }
 pollster = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -39,6 +49,11 @@ ndarray = { workspace = true, features = ["blas"] }
 blas-src.workspace = true
 
 [dev-dependencies]
+# `#daz-flush-cover-v2` exact-rational oracle (wgpu_device/flush_charge_oracle.rs):
+# enclosure of an f32 certified radius cannot be decided in f32.
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
 # Metal-legality CI (T2.2): translate the sound WGSL shaders to MSL under Metal's
 # exact capability set (which excludes FLOAT64) without needing Apple hardware.
 # Pinned to wgpu 29's naga so no second naga version is pulled into the graph.
@@ -72,3 +87,13 @@ required-features = ["wgpu"]
 [[test]]
 name = "graph_benchmark_behavior"
 required-features = ["wgpu"]
+
+[[example]]
+name = "denorm-preserve-probe"
+path = "tests/denorm_preserve_probe.rs"
+required-features = ["wgpu", "gpu-tests"]
+test = false
+
+[[test]]
+name = "u1_tree_settling"
+required-features = ["wgpu", "gpu-tests"]

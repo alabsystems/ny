@@ -119,8 +119,9 @@ pub(in super::super) fn avoice_talker_attention_raw() -> &'static OnnxModel {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_talker_fixture_contract_matches_current_avoice_contract_4180() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let contract = talker_fixture_contract();
     assert_eq!(
         contract.canonical_seq_len, TALKER_ATTENTION_SEQ_LEN,

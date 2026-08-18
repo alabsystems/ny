@@ -2,6 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+// Under tRustc contract verification (`--cfg trust_verify`) the first-class
+// `core::contracts` attributes are unstable and need this gate; stable rustc
+// takes the no-op `trust` facade instead and never sees it. Same as ny-cert.
+#![cfg_attr(trust_verify, feature(contracts))]
 #![deny(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
 
@@ -57,7 +61,7 @@ pub mod composition;
 /// Certified sparse-input double-double zonotope forward pass (`#dd-zonotope`).
 pub mod dd_zonotope;
 pub mod domain_clip;
-pub(crate) mod faer_parallelism;
+pub mod faer_parallelism;
 pub(crate) mod invprop;
 pub(crate) mod l2_lever_gate;
 pub(crate) mod relaxed_clip;
@@ -68,6 +72,11 @@ pub mod shape;
 pub(crate) mod util;
 
 // --- Public modules (stable API surface) ---
+/// Process-global PROPOSAL channel for the DAG α-CROWN margin-gradient lane
+/// (#alpha-steering-proposal): a proposal-grade wgpu joint-α adjoint engine,
+/// consulted only when no verdict-authority resident backend exists. Never a
+/// bound source — the α-gradient sibling of `fast_f32_gemm`.
+pub mod alpha_gradient_steering;
 pub mod analysis;
 pub(crate) mod batched_domain;
 /// Public timing shim for the batched dense-spec CROWN backward (M2 throughput gate).
@@ -76,13 +85,25 @@ pub mod bench_batched;
 pub mod beta_crown;
 pub mod elimination;
 pub mod equivalence;
+/// Run-scoped observations of optional verification treatments.
+pub mod execution_telemetry;
 /// Process-global optional IEEE RN-f32 GEMM accelerator (e.g. cuBLAS Sgemm) that
 /// the backend `ComputeDevice` consults to offload its engine-routed `gemm_f32`
 /// traffic (IBP forward, PGD/attack, BaB) — the f32 sibling of `sound_f64_gemm`.
 pub mod fast_f32_gemm;
+/// Process-global optional deadline-bounded RN-f32 GEMM accelerator (wgpu
+/// `FlValueGemmDevice`) for the forward-linear VALUE seam under a finite
+/// deadline (#fl-value-gpu-tier) — the deadline-capable sibling of
+/// `fast_f32_gemm`; the call site charges `γ^f32·S` + FTZ for its results.
+pub mod fl_value_gemm;
 /// Input-Manifold Bound (IMB) root floor — seam-cut affine tail + prefix-BaB
 /// certified floor (`NY_IMB=1`, default-OFF; STAGE 1 is log-only).
 pub mod imb;
+/// Dark print-only per-node A-matrix telemetry (`NY_ITER0_PARITY_TRACE=1`,
+/// declared false default ⇒ no output) for localizing where the α
+/// loop's iteration-0 fold diverges from the pre-loop CROWN baseline fold
+/// (#iter0-alpha-parity).
+pub(crate) mod iter0_parity_trace;
 /// Layer implementations for IBP and CROWN bound propagation.
 pub mod layers;
 /// Margin-row twin-wall BaB lane (#twinwall): certified-outward sparse CROWN
@@ -96,11 +117,17 @@ pub mod network;
 /// OUTPUT-node CROWN backwards can seed only the k referenced identity rows
 /// and scatter them over sound IBP bounds (#margin-subset-seed).
 pub(crate) mod output_margin_seed;
+pub use output_margin_seed::SpecOutputSeedScope;
 /// Parallel verification across sequence positions for near-linear speedup.
 pub mod parallel;
+/// Dark print-only trace of where a CROWN carrier stops being
+/// `CrownBounds::Patches` (`NY_PATCHES_CARRIER_TRACE=1`, declared false default
+/// ⇒ no output), for naming the site that densifies a conv carrier under
+/// finite deadline authority (#patches-drop).
+pub(crate) mod patches_carrier_trace;
 pub(crate) mod pgd_attack;
-/// Dark print-only phase telemetry (`NY_PHASE_TELEMETRY=1`, default unset ⇒
-/// byte-identical, no output): stderr markers at root-pipeline phase
+/// Dark print-only phase telemetry (`NY_PHASE_TELEMETRY=1`, declared false
+/// default ⇒ no output): stderr markers at root-pipeline phase
 /// boundaries so lever pricing can use per-phase durations instead of the
 /// unpriceable single-row wall deltas (#phase-telemetry).
 pub(crate) mod phase_telemetry;
@@ -114,6 +141,13 @@ mod random;
 /// input-split rebound reduces temporary allocation churn. Retention is capped
 /// per worker; bit-identical and gated by `NY_REBOUND_SCRATCH` (#rebound-scratch).
 pub(crate) mod rebound_scratch;
+/// Versioned, backend-neutral retained-BaB graph topology wire contract.
+///
+/// This module is intentionally not a provider registration surface. It is
+/// consumed only after a separately qualified retained provider is installed.
+#[doc(hidden)]
+pub mod resident_bab_wire;
+pub(crate) mod spec_influence_cone;
 /// Deterministic multi-seed restart knob for the bound-optimization RNG (task
 /// #36). `set_rng_restart_offset(i)` makes the next `crate::random::rng()` seed
 /// `NY_RNG_SEED_base + i`; the returned guard restores offset 0 on drop.
@@ -142,10 +176,14 @@ pub use batched_constraint_store::BatchedConstraintBuffer;
 pub use beta_crown::{
     reset_bab_frontier_export, take_bab_frontier_seeds, BabFrontierSeed, BabVerificationStatus,
     BatchedSpecBackwardResult, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier,
-    BranchingHeuristic, ConvMode, DenseSpecReboundMode, DenseSpecStageTiming,
-    DomainSpecCrownResult, GraphDomainBatchCallerLane, GraphDomainBatchMetricsSink,
-    GraphDomainBatchRecord, GraphPrecomputedBounds, InputClipType, InputSplitBatchRecord,
-    InputSplitMetricsSink, JointMarginCloser, KfsbReduceOp, PhaseBudgetConfig,
+    BranchingHeuristic, ConjunctiveProofObjectiveProvenance, ConjunctiveProofObjectives, ConvMode,
+    DenseSpecReboundMode, DenseSpecStageTiming, DepthTwoBranchLookaheadConfig,
+    DepthTwoBranchLookaheadMode, DomainSpecCrownResult, GraphDomainBatchCallerLane,
+    GraphDomainBatchMetricsSink, GraphDomainBatchRecord, GraphPrecomputedBounds, InputClipType,
+    InputSplitBatchRecord, InputSplitMetricsSink, JointMarginCloser, KfsbReduceOp,
+    OwnedSignNormalizedObjectiveSet, PhaseBudgetConfig, ResidentObjectiveInvalidV1,
+    ResidentObjectiveObservationV1, ResidentObjectiveReceiptV1, ResidentObjectiveUnsupportedV1,
+    VerificationArtifactAuthority, ViolationWitness, ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS,
     BAB_FRONTIER_CORNER_BOXES,
 };
 
@@ -167,15 +205,39 @@ pub use bounds::{
     LinearBounds, MultiSpecKeep, Optimizer,
 };
 
+/// Forward-linear cold-build admission telemetry (#forward-linear-cost-gate,
+/// I7): the CLI flight recorder mirrors the last admit/refuse decision with
+/// its calibrated rate into the sidecar.
+pub use network::{
+    forward_linear_admission_record, forward_linear_measured_rate, ForwardLinearAdmissionRecord,
+    ForwardLinearRateObservation,
+};
+
+/// Collector walk-admission telemetry (#cprime-admission, I7): estimate-then-
+/// refuse decisions for CROWN-IBP collection walks, mirrored into the CLI
+/// flight sidecar the same way the forward-linear admission record is.
+pub use network::{collector_walk_admission_record, CollectorWalkAdmissionRecord};
+
 /// Network representations (sequential and graph) with bound propagation engines.
 ///
 /// `relu_crown_relaxation` is pub for Kani proof access but not called from production runtime.
 /// `relu_ibp` has been moved to `layers::activations::relu::ibp`.
 pub use network::{
-    point_vjp_forward_masks, point_vjp_resnet_forward_masks, BlockSpec, BlockSpecEntry,
-    BlockWiseCrownResult, GraphNetwork, GraphNode, Network, PointVjpBatchPlan, PointVjpResnetPlan,
+    compose_one_axis_dnf_observations, point_vjp_forward_masks, point_vjp_resnet_forward_masks,
+    BlockSpec, BlockSpecEntry, BlockWiseCrownResult, GraphNetwork, GraphNode, Network,
+    OneAxisAffineCertificate, OneAxisAlgebraClass, OneAxisAlgebraReport, OneAxisConstraintRelation,
+    OneAxisCoreGuard, OneAxisDecline, OneAxisDeclineReason, OneAxisExactProblem,
+    OneAxisGroupedContextCertificate, OneAxisGroupedMemberCertificate, OneAxisGroupedPhaseAttempt,
+    OneAxisGroupedPhaseCertificate, OneAxisGroupedPhaseLimits, OneAxisGroupedReplayResult,
+    OneAxisOutputConstraint, OneAxisPeeledConstraint, OneAxisPhaseAttempt,
+    OneAxisPhaseCellCertificate, OneAxisPhaseCertificate, OneAxisPhaseDecline,
+    OneAxisPhaseDeclineReason, OneAxisPhaseLimits, OneAxisPhaseObservation, OneAxisRational,
+    OneAxisReplayResult, OneAxisWrapperEnclosure, PointVjpBatchPlan, PointVjpResnetPlan,
     PointVjpWavePlan, SoftmaxComplexReport, VggMaxPoolRewriteMode, VggMaxPoolRewriteReport,
-    ZonotopePropagationOptions, ZonotopeSoftmaxMode, NETWORK_INPUT, SOFTMAX_COMPLEX_SHIFT_GUARD,
+    ZonotopePropagationOptions, ZonotopeSoftmaxMode, NETWORK_INPUT,
+    ONE_AXIS_GROUPED_PHASE_CERTIFICATE_VERSION, ONE_AXIS_MAX_EDGES, ONE_AXIS_MAX_NODES,
+    ONE_AXIS_MAX_RANK, ONE_AXIS_MAX_TENSOR_ELEMENTS, ONE_AXIS_MAX_TOTAL_ELEMENTS,
+    ONE_AXIS_PHASE_CERTIFICATE_VERSION, SOFTMAX_COMPLEX_SHIFT_GUARD,
 };
 
 /// ATTACK-only soft-sign surrogate sharpness (β) control for the point-gradient
@@ -184,7 +246,8 @@ pub use network::{
 /// β gets stuck on. Soundness-neutral — β only scales the non-certified attack
 /// direction and never feeds a verdict.
 pub use network::{
-    attack_sign_beta, set_attack_sign_beta, AttackSignBetaGuard, DEFAULT_ATTACK_SIGN_BETA,
+    attack_sign_beta, set_attack_sign_beta, smooth_sign_forward_enabled, AttackSignBetaGuard,
+    AttackSteWindowsGuard, DEFAULT_ATTACK_SIGN_BETA,
 };
 
 /// Double-precision (f64) propagation types for soundnessbench/sat_relu.
@@ -200,8 +263,11 @@ pub use network::graph_ibp_f64_cell::Interval64;
 /// Seed-axis count for the f64 first-order centered form (#f64-mvf): callers
 /// gating the centered pass on box shape MUST use this so the gate matches
 /// the walk's seeding rule.
-pub use network::graph_ibp_f64_mvf::centered_seed_axes_f32;
-pub use network::graph_ibp_f64_mvf::CenteredMono;
+pub use network::graph_ibp_f64_mvf::{
+    centered_seed_axes_f32, centered_seed_axis_indices_f32, CenteredMono,
+    MvfAffineDiagnosticBudget, MvfAffineEnclosure, PointPhaseEventDiagnostics,
+    ReluPhaseEventCandidate,
+};
 
 /// Kill-switch gate for the batched multi-box f64 forward
 /// (#f64-batch-boxes, `NY_F64_BATCH_BOXES=0` disables).
@@ -315,5 +381,29 @@ pub use composition::properties::{
     check_ducking_snr, check_priority_routing, check_spatial_ild, PropertyResult,
 };
 
+/// Can the SEQUENTIAL β-CROWN engine honour `BetaCrownConfig::enable_clip_interm_domain`?
+///
+/// `false` means a request for the feature is SKIPPED on that engine, not failed:
+/// the adapter hands the caller's already-valid enclosure straight back, so
+/// bounds are merely LOOSER (fewer proofs, more `unknown`) and never narrower.
+/// The graph engine reads `enable_clip_interm_domain` independently and is
+/// unaffected by this predicate, so a preset setting `bab.clip.interm_domain`
+/// is honoured on graph-routed instances and dropped on sequential-routed ones.
+///
+/// This is a re-export of the engine's own gate
+/// (`beta_crown::engine::domain::clip::sequential_clip_interm_domain_supported`)
+/// so that out-of-crate contract checks — notably the CLI's preset/engine
+/// validation — cannot drift from the value the engine actually branches on.
+#[must_use]
+pub const fn sequential_clip_interm_domain_supported() -> bool {
+    beta_crown::engine::domain::clip::sequential_clip_interm_domain_supported()
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod envelope_audit_expologpow;
+
+#[cfg(test)]
+mod envelope_audit_snakecompare;

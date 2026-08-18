@@ -31,6 +31,7 @@ pub(crate) enum InputSplitLoopBatchClampReason {
     None,
     ConfigCap,
     MemoryCap,
+    ConicQueueRefreshCap,
 }
 
 impl InputSplitLoopBatchClampReason {
@@ -39,6 +40,7 @@ impl InputSplitLoopBatchClampReason {
             Self::None => "none",
             Self::ConfigCap => "config_cap",
             Self::MemoryCap => "memory_cap",
+            Self::ConicQueueRefreshCap => "conic_queue_refresh_cap",
         }
     }
 }
@@ -48,6 +50,24 @@ pub(crate) struct InputSplitLoopBatchDecision {
     pub(crate) requested_batch_size: usize,
     pub(crate) effective_batch_size: usize,
     pub(crate) clamp_reason: InputSplitLoopBatchClampReason,
+}
+
+impl InputSplitLoopBatchDecision {
+    /// Apply the authenticated affine-conic queue-refresh cap after the shared
+    /// configuration and child-workset caps. Preserve an already tighter cap
+    /// and its reason so telemetry describes the actual binding constraint.
+    pub(crate) fn with_conic_queue_refresh_cap(mut self, cap: usize) -> Result<Self> {
+        if cap == 0 {
+            return Err(NyError::InvalidConfig(
+                "input_split_conic_queue_refresh_batch_size must be >= 1".to_string(),
+            ));
+        }
+        if cap < self.effective_batch_size {
+            self.effective_batch_size = cap;
+            self.clamp_reason = InputSplitLoopBatchClampReason::ConicQueueRefreshCap;
+        }
+        Ok(self)
+    }
 }
 
 #[inline]
@@ -158,5 +178,46 @@ mod tests {
             error.to_string().contains("overflowed"),
             "unexpected overflow error: {error}"
         );
+    }
+
+    #[test]
+    fn conic_queue_refresh_cap_reports_only_when_binding() {
+        let capped = input_split_loop_batch_size(513, 4)
+            .unwrap()
+            .with_conic_queue_refresh_cap(512)
+            .unwrap();
+        assert_eq!(capped.effective_batch_size, 512);
+        assert_eq!(
+            capped.clamp_reason,
+            InputSplitLoopBatchClampReason::ConicQueueRefreshCap
+        );
+
+        let boundary = input_split_loop_batch_size(512, 4)
+            .unwrap()
+            .with_conic_queue_refresh_cap(512)
+            .unwrap();
+        assert_eq!(boundary.effective_batch_size, 512);
+        assert_eq!(boundary.clamp_reason, InputSplitLoopBatchClampReason::None);
+
+        let memory_limited = input_split_loop_batch_size(500_000, 65_536)
+            .unwrap()
+            .with_conic_queue_refresh_cap(512)
+            .unwrap();
+        assert!(memory_limited.effective_batch_size < 512);
+        assert_eq!(
+            memory_limited.clamp_reason,
+            InputSplitLoopBatchClampReason::MemoryCap
+        );
+    }
+
+    #[test]
+    fn conic_queue_refresh_cap_rejects_zero() {
+        let error = input_split_loop_batch_size(1, 4)
+            .unwrap()
+            .with_conic_queue_refresh_cap(0)
+            .expect_err("zero cannot form a live BaB tranche");
+        assert!(error
+            .to_string()
+            .contains("input_split_conic_queue_refresh_batch_size"));
     }
 }

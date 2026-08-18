@@ -304,3 +304,49 @@ fn test_crown_elementwise_backward_batched_indexed_neuron_index() {
     assert_ne!(result.upper_a()[[0, 0]], result.upper_a()[[0, 1]]);
     assert_eq!(result.upper_b()[[0]], next_up_f32(9.75));
 }
+
+/// A first batched activation must create a coefficient-error carrier for its
+/// own f32 coefficient product; this cannot depend on an incoming carrier.
+#[test]
+fn test_crown_elementwise_backward_batched_carries_fresh_product_gap() {
+    let lower_coeff = 1.3_f32;
+    let upper_coeff = -1.7_f32;
+    let lower_slope = 0.7_f32;
+    let upper_slope = 0.9_f32;
+    let bounds = BatchedLinearBounds::new(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![lower_coeff]).unwrap(),
+        ArrayD::zeros(IxDyn(&[1])),
+        ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![upper_coeff]).unwrap(),
+        ArrayD::zeros(IxDyn(&[1])),
+        vec![1],
+        vec![1],
+    )
+    .unwrap();
+    assert!(!bounds.has_coeff_err());
+    let pre_activation = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![-2.0]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![3.0]).unwrap(),
+    )
+    .unwrap();
+
+    let result = crown_elementwise_backward_batched(&bounds, &pre_activation, |_l, _u| {
+        LinearRelaxation::new(lower_slope, 0.0, upper_slope, 0.0)
+    })
+    .unwrap();
+
+    assert!(result.has_coeff_err());
+    let lower_gap = (f64::from(lower_coeff) * f64::from(lower_slope)
+        - f64::from(result.lower_a()[[0, 0]]))
+    .abs();
+    let upper_gap = (f64::from(upper_coeff) * f64::from(lower_slope)
+        - f64::from(result.upper_a()[[0, 0]]))
+    .abs();
+    assert!(
+        f64::from(result.lower_a_err.as_ref().unwrap()[[0, 0]]) >= lower_gap,
+        "fresh lower product gap was not enclosed"
+    );
+    assert!(
+        f64::from(result.upper_a_err.as_ref().unwrap()[[0, 0]]) >= upper_gap,
+        "fresh upper product gap was not enclosed"
+    );
+}

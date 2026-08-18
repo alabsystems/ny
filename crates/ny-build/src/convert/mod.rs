@@ -178,6 +178,73 @@ impl ConvertContext<'_> {
             .or_else(|| self.evaluated_constants.get(name).cloned())
     }
 
+    /// Value of an integer-by-semantics constant without discarding an exact
+    /// integer payload retained by the ONNX loader.
+    ///
+    /// Structural ONNX tensors (axes, indices, shapes, pads, repeats, ...) are
+    /// often mirrored as f32 for compatibility.  Large i64 values can change in
+    /// that mirror, so prefer `WeightStore::integers`.  A float-only fallback is
+    /// accepted only when every element is finite, exactly integral, and within
+    /// the non-saturating f32-to-i64 cast range.
+    pub(crate) fn discrete_constant_i64(
+        &self,
+        name: &str,
+        context: &str,
+    ) -> Result<Option<ArrayD<i64>>> {
+        if let Some(integers) = self.weights.get_integers(name) {
+            if let Some(float_view) = self.weights.get(name) {
+                if integers.shape() != float_view.shape() {
+                    return Err(NyError::ModelLoad(format!(
+                        "{context}: exact integer tensor '{name}' has shape {:?}, but its float view has shape {:?}",
+                        integers.shape(),
+                        float_view.shape()
+                    )));
+                }
+            }
+            return Ok(Some(integers.clone()));
+        }
+
+        let Some(values) = self
+            .weights
+            .get(name)
+            .or_else(|| self.evaluated_constants.get(name))
+        else {
+            return Ok(None);
+        };
+        let parsed = values
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, value)| {
+                if !value.is_finite() {
+                    return Err(NyError::ModelLoad(format!(
+                        "{context}: tensor '{name}' has non-finite value {value} at index {index}"
+                    )));
+                }
+                if value.trunc() != value {
+                    return Err(NyError::ModelLoad(format!(
+                        "{context}: tensor '{name}' has non-integer value {value} at index {index}; discrete values must be integral integers"
+                    )));
+                }
+                // `i64::MAX as f32` rounds to +2^63, which would saturate to
+                // i64::MAX.  The lower endpoint -2^63 is exactly representable.
+                if value < i64::MIN as f32 || value >= i64::MAX as f32 {
+                    return Err(NyError::ModelLoad(format!(
+                        "{context}: tensor '{name}' value {value} at index {index} is outside the non-saturating i64 range"
+                    )));
+                }
+                Ok(value as i64)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ArrayD::from_shape_vec(values.raw_dim(), parsed)
+            .map(Some)
+            .map_err(|error| {
+                NyError::ModelLoad(format!(
+                    "{context}: could not preserve tensor '{name}' shape while parsing integers: {error}"
+                ))
+            })
+    }
+
     /// Recorded ONNX rank of a tensor.
     ///
     /// Source priority matters: `tensor_shapes` (the load-time ORT shape
@@ -251,7 +318,21 @@ impl ConvertContext<'_> {
     ) -> Result<i64> {
         if self.model_unbatched {
             // Unbatched model: no tensor ever carried a batch axis; ONNX axes
-            // describe the internal tensors verbatim.
+            // describe the internal tensors verbatim. They still must name a
+            // real dimension when the authored rank is known.
+            if let Some(rank) = self.recorded_onnx_rank(data_name) {
+                let rank_i = i64::try_from(rank).map_err(|_| {
+                    NyError::ModelLoad(format!(
+                        "{op} '{node_name}': recorded rank {rank} for input '{data_name}' does not fit i64"
+                    ))
+                })?;
+                if onnx_axis < -rank_i || onnx_axis >= rank_i {
+                    return Err(NyError::ModelLoad(format!(
+                        "{op} '{node_name}': ONNX axis {onnx_axis} out of range for input \
+                         '{data_name}' of recorded rank {rank}"
+                    )));
+                }
+            }
             return Ok(onnx_axis);
         }
         let rank = self.recorded_onnx_rank(data_name);

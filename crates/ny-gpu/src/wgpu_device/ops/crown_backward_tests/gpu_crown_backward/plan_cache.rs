@@ -39,6 +39,7 @@ fn crown_plan_cache_keeps_static_weight_arcs_alive() {
         bias: Some(bias.clone()),
         out_features: 2,
         in_features: 2,
+        cert_err: Default::default(),
     }];
     let spec = vec![1.0f32, 0.0, 0.0, 1.0];
     device
@@ -99,6 +100,7 @@ fn crown_plan_cache_no_stale_alias_across_models() {
             bias: Some(b.to_vec().into()),
             out_features: 2,
             in_features: 2,
+            cert_err: Default::default(),
         }]
     };
 

@@ -33,6 +33,21 @@ fn checked_u32(value: usize, field: &str) -> ny_core::Result<u32> {
     })
 }
 
+/// Validate the CPU representation before any adapter-dependent allocation.
+/// Keeping this boundary explicit lets malformed-input coverage remain
+/// hermetic on hosts without WGPU while `from_cpu_buffer` uses the exact same
+/// admission check.
+fn validate_cpu_buffer(cpu_buffer: &BatchedConstraintBuffer) -> ny_core::Result<()> {
+    cpu_buffer.validate_for_gpu()
+}
+
+fn logical_memory_bytes(batch_size: u32, total_constraints: u32, total_terms: u32) -> usize {
+    (total_constraints as usize) * 16
+        + (total_terms as usize) * 4
+        + (total_terms as usize) * 4
+        + ((batch_size + 1) as usize) * 4
+}
+
 /// GPU buffers for batched constraint processing.
 ///
 /// Holds wgpu storage buffers containing packed constraint data
@@ -105,7 +120,7 @@ impl GpuConstraintBuffers {
         device: &Device,
         cpu_buffer: &BatchedConstraintBuffer,
     ) -> ny_core::Result<Self> {
-        cpu_buffer.validate_for_gpu()?;
+        validate_cpu_buffer(cpu_buffer)?;
         // Handle empty case: wgpu requires non-zero buffer sizes
         // Create minimum 4-byte buffers for empty data
         let header_bytes: &[u8] = if cpu_buffer.headers.is_empty() {
@@ -181,18 +196,17 @@ impl GpuConstraintBuffers {
     /// which may be larger due to alignment requirements.
     pub fn memory_bytes(&self) -> usize {
         // 16 bytes per header + 4 bytes per coeff + 4 bytes per index + 4 bytes per offset
-        (self.total_constraints as usize) * 16
-            + (self.total_terms as usize) * 4
-            + (self.total_terms as usize) * 4
-            + ((self.batch_size + 1) as usize) * 4
+        logical_memory_bytes(self.batch_size, self.total_constraints, self.total_terms)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ny_propagate::beta_crown::constraint_store::ConstraintHeader;
+    #[cfg(feature = "gpu-tests")]
     use ny_propagate::beta_crown::constraint_store::{
-        ConstraintHeader, ConstraintOrigin, ConstraintSense, DomainConstraintStore,
+        ConstraintOrigin, ConstraintSense, DomainConstraintStore,
     };
     use std::mem::size_of;
 
@@ -221,6 +235,7 @@ mod tests {
         assert!(err.to_string().contains("exceeds u32::MAX"));
     }
 
+    #[cfg(feature = "gpu-tests")]
     fn create_test_device() -> Device {
         pollster::block_on(async {
             let instance = wgpu::Instance::default();
@@ -243,6 +258,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests")]
     fn test_empty_buffer() {
         let device = create_test_device();
         let cpu_buffer = BatchedConstraintBuffer::empty();
@@ -255,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests")]
     fn test_single_domain() {
         let device = create_test_device();
 
@@ -281,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests")]
     fn test_multiple_domains() {
         let device = create_test_device();
 
@@ -331,30 +349,13 @@ mod tests {
 
     #[test]
     fn test_memory_bytes() {
-        let device = create_test_device();
-
-        let mut store = DomainConstraintStore::new();
-        store
-            .delta_mut()
-            .add_constraint(
-                &[0, 1],
-                &[1.0, -1.0],
-                0.0,
-                ConstraintSense::Le,
-                ConstraintOrigin::Split,
-            )
-            .unwrap();
-
-        let stores = vec![&store];
-        let cpu_buffer = BatchedConstraintBuffer::from_domain_stores(&stores).unwrap();
-        let gpu_buffers = GpuConstraintBuffers::from_cpu_buffer(&device, &cpu_buffer).unwrap();
-
         // 1 header * 16 + 2 coeffs * 4 + 2 indices * 4 + 2 offsets * 4
         // = 16 + 8 + 8 + 8 = 40 bytes
-        assert_eq!(gpu_buffers.memory_bytes(), 40);
+        assert_eq!(logical_memory_bytes(1, 1, 2), 40);
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests")]
     fn test_bind_group_creation() {
         // Smoke test: verify GPU buffers can be bound to the expected layout
         use crate::constraint_shaders::CONSTRAINT_BUFFER_LAYOUT_ENTRIES;
@@ -411,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-tests")]
     fn test_upload_readback_round_trip() {
         // Smoke test: upload data to GPU and read it back to verify integrity.
         // This validates that:
@@ -548,6 +550,7 @@ mod tests {
             );
         }
     }
+    #[cfg(feature = "gpu-tests")]
     fn create_test_device_and_queue() -> (Device, wgpu::Queue) {
         // Device and queue must be created together in wgpu
         pollster::block_on(async {

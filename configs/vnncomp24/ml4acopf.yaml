@@ -11,7 +11,9 @@
 # - Benefits from high alpha-crown iterations with decay
 
 general:
-  root_path: ../../vnncomp2024_benchmarks/benchmarks/ml4acopf_2024
+  # Repointed 2026-07-29: see configs/vnncomp24/yolo.yaml — the pre-relocation
+  # `../../vnncomp2024_benchmarks/...` spelling resolves to nothing in this repo.
+  root_path: ../../benchmarks/vnncomp2024/benchmarks/ml4acopf_2024
   csv_name: instances.csv
 
 attack:

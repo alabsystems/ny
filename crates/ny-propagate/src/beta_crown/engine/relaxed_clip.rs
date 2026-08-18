@@ -438,7 +438,9 @@ impl BetaCrownVerifier {
         for b in 0..batch {
             let mut any = false;
             for s in 0..n_spec {
-                if dm_lb[[b, s]] > thresholds[[b, s]] {
+                let lower = dm_lb[[b, s]];
+                let threshold = thresholds[[b, s]];
+                if lower.is_finite() && threshold.is_finite() && lower > threshold {
                     any = true;
                     break;
                 }

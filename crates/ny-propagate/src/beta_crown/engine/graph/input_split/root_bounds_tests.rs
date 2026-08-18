@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::{Conv2dLayer, GraphNode, Layer, LinearLayer, ReLULayer};
+use crate::{
+    Conv2dLayer, ConvTranspose2dLayer, GraphNode, Layer, LinearLayer, ReLULayer, TanhLayer,
+};
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
 use ny_test_utils::{env::lock_env, CountingGemmEngine};
 use std::collections::BTreeMap;
@@ -41,6 +43,100 @@ fn restart_graph() -> (GraphNetwork, BoundedTensor) {
     )
     .expect("valid root box");
     (graph, input)
+}
+
+fn typed_cgan_restart_graph() -> (GraphNetwork, BoundedTensor) {
+    let transpose = ConvTranspose2dLayer::with_input_shape(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![1.0_f32, -0.5, 0.25, 0.75])
+            .expect("transpose kernel"),
+        Some(arr1(&[0.1_f32])),
+        (1, 1),
+        (0, 0),
+        2,
+        2,
+    )
+    .expect("conv transpose");
+    let conv = Conv2dLayer::with_input_shape(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![0.75_f32]).expect("conv kernel"),
+        Some(arr1(&[-0.2_f32])),
+        (1, 1),
+        (0, 0),
+        3,
+        3,
+    )
+    .expect("conv");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "convt",
+        Layer::ConvTranspose2d(transpose),
+    ));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer),
+        vec!["convt".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "conv",
+        Layer::Conv2d(conv),
+        vec!["relu".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "out",
+        Layer::ReLU(ReLULayer),
+        vec!["conv".to_string()],
+    ));
+    graph.set_output("out");
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), -1.0_f32),
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), 1.0_f32),
+    )
+    .expect("input");
+    (graph, input)
+}
+
+fn typed_cgan_tanh_restart_graph() -> (GraphNetwork, BoundedTensor) {
+    let (mut graph, input) = typed_cgan_restart_graph();
+    graph.add_node(GraphNode::new(
+        "tanh",
+        Layer::Tanh(TanhLayer),
+        vec!["conv".to_string()],
+    ));
+    let post = Conv2dLayer::with_input_shape(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![-0.75_f32]).expect("post-Tanh kernel"),
+        Some(arr1(&[0.05_f32])),
+        (1, 1),
+        (0, 0),
+        3,
+        3,
+    )
+    .expect("post-Tanh conv");
+    let output = graph.nodes.get_mut("out").expect("output node");
+    output.layer = Layer::Conv2d(post);
+    output.inputs = vec!["tanh".to_string()];
+    graph.set_output("out");
+    (graph, input)
+}
+
+fn tanh_alpha_bits(state: &GraphAlphaState) -> Vec<u32> {
+    let alpha = state
+        .monotone_s_shaped_alphas
+        .get("tanh")
+        .expect("Tanh alpha state");
+    [
+        &alpha.tp_pos,
+        &alpha.tp_neg,
+        &alpha.tp_both_lower,
+        &alpha.tp_both_upper,
+    ]
+    .into_iter()
+    .flat_map(|params| {
+        params
+            .lower_path
+            .iter()
+            .chain(params.upper_path.iter())
+            .map(|value| value.to_bits())
+    })
+    .collect()
 }
 
 fn deterministic_alpha_config() -> BetaCrownConfig {
@@ -248,6 +344,167 @@ fn second_restart_hits_and_skips_collection_bit_exact_20260721() {
     }
 }
 
+#[ntest::timeout(10000)]
+#[test]
+fn typed_cgan_complete_second_grouped_restart_reuses_single_transaction() {
+    use crate::network::CganCompleteCollectionEntryCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            "NY_RNG_SEED",
+        ] {
+            env.remove(key);
+        }
+        let (graph, input) = typed_cgan_restart_graph();
+        let mut config = BetaCrownConfig {
+            use_alpha_crown: true,
+            ..BetaCrownConfig::default()
+        };
+        config.alpha_config.iterations = 0;
+        config.alpha_config.gradient_method = GradientMethod::AnalyticChain;
+        config.alpha_config.fix_interm_bounds = true;
+        config.alpha_config.adaptive_skip = false;
+        config.alpha_config.cgan_complete_crown_ibp_root = true;
+
+        let cache = InputSplitRootBoundsCache::new(
+            disjunctive_spec_identity(&[vec![1.0; 9]], &[0.0], &[1]),
+            None,
+        );
+        let entries = CganCompleteCollectionEntryCounter::start();
+        let first = collect_input_split_root_node_bounds(
+            &graph,
+            &input,
+            &config,
+            None,
+            None,
+            "typed restart #1",
+            Some((&cache, None)),
+        )
+        .expect("first typed restart");
+        let second = collect_input_split_root_node_bounds(
+            &graph,
+            &input,
+            &config,
+            None,
+            None,
+            "typed restart #2",
+            Some((&cache, None)),
+        )
+        .expect("second typed restart");
+
+        assert_eq!(entries.entries(), 1);
+        assert_eq!(cache.collections(), 1);
+        assert_eq!(cache.hits(), 1);
+        assert_root_value_bits_eq(&first, &second);
+    });
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn typed_cgan_tanh_restarts_reuse_only_map_and_recompute_seeded_alpha() {
+    use crate::network::CganCompleteCollectionEntryCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            "NY_RNG_SEED",
+        ] {
+            env.remove(key);
+        }
+        let (graph, input) = typed_cgan_tanh_restart_graph();
+        let mut config = BetaCrownConfig {
+            use_alpha_crown: true,
+            ..BetaCrownConfig::default()
+        };
+        config.alpha_config.iterations = 3;
+        config.alpha_config.spsa_samples = 1;
+        config.alpha_config.early_stop_patience = usize::MAX;
+        config.alpha_config.gradient_method = GradientMethod::AnalyticChain;
+        config.alpha_config.fix_interm_bounds = true;
+        config.alpha_config.adaptive_skip = false;
+        config.alpha_config.adaptive_skip_pilot = false;
+        config.alpha_config.cgan_complete_crown_ibp_root = true;
+
+        let cache = InputSplitRootBoundsCache::new(
+            disjunctive_spec_identity(&[vec![1.0; 9]], &[0.0], &[1]),
+            None,
+        );
+        assert!(
+            root_bounds_cache_key(&cache, &graph, &input, &config, None).is_none(),
+            "an iteration-bearing Tanh root must not cache the whole alpha result"
+        );
+        assert!(
+            typed_reference_map_cache_key(&cache, &graph, &input, &config, None).is_some(),
+            "the deterministic typed reference map should remain cacheable"
+        );
+
+        let entries = CganCompleteCollectionEntryCounter::start();
+        let first = {
+            let _seed = crate::set_rng_restart_offset(0);
+            collect_input_split_root_node_bounds(
+                &graph,
+                &input,
+                &config,
+                None,
+                None,
+                "typed Tanh restart #1",
+                Some((&cache, None)),
+            )
+            .expect("first typed Tanh restart")
+        };
+        let ordinary_error = graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, None)
+            .expect_err("typed Tanh cache state must not expand an ordinary request");
+        assert!(matches!(
+            ordinary_error,
+            NyError::UnsupportedConfiguration(_)
+        ));
+        let second = {
+            let _seed = crate::set_rng_restart_offset(1);
+            collect_input_split_root_node_bounds(
+                &graph,
+                &input,
+                &config,
+                None,
+                None,
+                "typed Tanh restart #2",
+                Some((&cache, None)),
+            )
+            .expect("second typed Tanh restart")
+        };
+
+        assert_eq!(
+            entries.entries(),
+            1,
+            "both restarts must share one complete typed-map transaction"
+        );
+        assert_eq!(
+            cache.collections(),
+            0,
+            "the whole-result cache must remain disabled for seeded Tanh alpha"
+        );
+        assert_eq!(cache.typed_reference_collections(), 1);
+        assert_eq!(cache.typed_reference_hits(), 1);
+
+        let first_alpha = first.1.as_ref().expect("first Tanh alpha state");
+        let second_alpha = second.1.as_ref().expect("second Tanh alpha state");
+        assert_ne!(
+            tanh_alpha_bits(first_alpha),
+            tanh_alpha_bits(second_alpha),
+            "restart-specific Tanh alpha initialization must be recomputed"
+        );
+    });
+}
+
 #[test]
 fn exact_key_misses_on_ulp_option_input_engine_and_graph_identity_20260721() {
     let _env_lock = lock_env();
@@ -287,6 +544,39 @@ fn exact_key_misses_on_ulp_option_input_engine_and_graph_identity_20260721() {
         root_bounds_cache_key(&cache, &graph, &input, &option_ulp_config, Some(&engine_a))
             .expect("ULP option key");
     assert!(base != option_ulp, "one config ULP must miss");
+
+    let mut refresh_ulp_config = config.clone();
+    refresh_ulp_config.alpha_config.reference_refresh_fraction = f32::from_bits(
+        refresh_ulp_config
+            .alpha_config
+            .reference_refresh_fraction
+            .to_bits()
+            + 1,
+    );
+    let refresh_ulp =
+        root_bounds_cache_key(&cache, &graph, &input, &refresh_ulp_config, Some(&engine_a))
+            .expect("refresh-fraction ULP option key");
+    assert!(
+        base != refresh_ulp,
+        "one refresh-fraction config ULP must miss"
+    );
+
+    let mut deadline_fallback_config = config.clone();
+    deadline_fallback_config
+        .alpha_config
+        .forward_linear_deadline_fallback_to_ibp = true;
+    let deadline_fallback = root_bounds_cache_key(
+        &cache,
+        &graph,
+        &input,
+        &deadline_fallback_config,
+        Some(&engine_a),
+    )
+    .expect("forward-linear deadline-fallback option key");
+    assert!(
+        base != deadline_fallback,
+        "changing the forward-linear deadline-fallback policy must miss"
+    );
 
     let other_engine = root_bounds_cache_key(&cache, &graph, &input, &config, Some(&engine_b))
         .expect("other engine key");

@@ -217,19 +217,16 @@ fn test_cnn_with_flatten_crown_soundness_2613() {
     assert_concrete_within_crown(&out, &crown, "cnn_with_flatten");
 }
 
-/// Returns an optional VNN-COMP benchmark model, cleanly skipping qualification
-/// tests when the separately downloaded benchmark corpus is unavailable.
-fn optional_benchmark_model(relative_path: &str) -> Option<String> {
+/// Require a separately downloaded VNN-COMP benchmark model.
+fn require_external_benchmark_model(relative_path: &str) -> String {
     let path = workspace_root().join(relative_path);
-    if !path.exists() {
-        eprintln!(
-            "SKIP: optional benchmark model is unavailable at {}; download it with \
-             benchmarks/download_benchmarks.sh",
-            path.display()
-        );
-        return None;
-    }
-    Some(path.display().to_string())
+    assert!(
+        path.is_file(),
+        "external benchmark model fixture is missing at {}; \
+         run benchmarks/download_benchmarks.sh",
+        path.display()
+    );
+    path.display().to_string()
 }
 
 /// Gate test (#2613): CIFAR-10 ResNet 2-block loads and IBP verifies correctly.
@@ -242,12 +239,11 @@ fn optional_benchmark_model(relative_path: &str) -> Option<String> {
 /// Input: [3, 32, 32], Output: [10], eps: 0.008 (VNN-COMP standard)
 #[ntest::timeout(60000)]
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn test_cifar10_resnet_2b_ibp_gate_2613() {
-    let Some(path) = optional_benchmark_model(
+    let path = require_external_benchmark_model(
         "benchmarks/vnncomp2021/benchmarks/cifar10_resnet/onnx/resnet_2b.onnx",
-    ) else {
-        return;
-    };
+    );
     let model = load_onnx(&path).expect("Failed to load resnet_2b.onnx");
     let graph = model
         .to_graph_network()
@@ -293,12 +289,11 @@ fn test_cifar10_resnet_2b_ibp_gate_2613() {
 /// Use release mode for benchmarking. The timeout here allows debug builds.
 #[ntest::timeout(600000)]
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn test_cifar10_resnet_2b_crown_gate_2613() {
-    let Some(path) = optional_benchmark_model(
+    let path = require_external_benchmark_model(
         "benchmarks/vnncomp2021/benchmarks/cifar10_resnet/onnx/resnet_2b.onnx",
-    ) else {
-        return;
-    };
+    );
     let model = load_onnx(&path).expect("Failed to load resnet_2b.onnx");
     let graph = model
         .to_graph_network()

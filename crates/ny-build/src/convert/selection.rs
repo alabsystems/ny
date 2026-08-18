@@ -18,7 +18,7 @@ impl ConvertContext<'_> {
             )));
         }
 
-        let axis = resolve_unbatched_axis(spec, "Topk", self)?;
+        let axis = resolve_unbatched_axis(spec, "Topk", self, Some(-1))?;
         let k = read_positive_usize_attr(spec, "k", "Topk")?;
         let output = read_topk_output_kind(spec)?;
         Ok(Layer::Topk(TopkLayer::new(k, axis, output)))
@@ -34,10 +34,14 @@ impl ConvertContext<'_> {
         }
 
         let keepdims = read_keepdims_attr(spec, "Argmax")?;
-        Ok(Layer::ArgMax(ArgMaxLayer::new(
-            resolve_unbatched_axis(spec, "Argmax", self)?,
-            keepdims,
-        )))
+        let select_last_index = read_boolean_attr(spec, "select_last_index", false, "Argmax")?;
+        Ok(Layer::ArgMax(
+            ArgMaxLayer::new(
+                resolve_unbatched_axis(spec, "Argmax", self, Some(0))?,
+                keepdims,
+            )
+            .with_select_last_index(select_last_index),
+        ))
     }
 
     pub(crate) fn convert_argmin(&self, spec: &LayerSpec) -> Result<Layer> {
@@ -50,10 +54,14 @@ impl ConvertContext<'_> {
         }
 
         let keepdims = read_keepdims_attr(spec, "Argmin")?;
-        Ok(Layer::ArgMin(ArgMinLayer::new(
-            resolve_unbatched_axis(spec, "Argmin", self)?,
-            keepdims,
-        )))
+        let select_last_index = read_boolean_attr(spec, "select_last_index", false, "Argmin")?;
+        Ok(Layer::ArgMin(
+            ArgMinLayer::new(
+                resolve_unbatched_axis(spec, "Argmin", self, Some(0))?,
+                keepdims,
+            )
+            .with_select_last_index(select_last_index),
+        ))
     }
 
     pub(crate) fn convert_argsort(&self, spec: &LayerSpec) -> Result<Layer> {
@@ -77,13 +85,18 @@ impl ConvertContext<'_> {
         };
 
         Ok(Layer::ArgSort(ArgSortLayer::new(
-            resolve_unbatched_axis(spec, "ArgSort", self)?,
+            resolve_unbatched_axis(spec, "ArgSort", self, None)?,
             descending,
         )))
     }
 }
 
-fn resolve_unbatched_axis(spec: &LayerSpec, op: &str, ctx: &ConvertContext<'_>) -> Result<i64> {
+fn resolve_unbatched_axis(
+    spec: &LayerSpec,
+    op: &str,
+    ctx: &ConvertContext<'_>,
+    default_axis: Option<i64>,
+) -> Result<i64> {
     let raw_axis = match spec
         .attributes
         .get("axis")
@@ -96,12 +109,9 @@ fn resolve_unbatched_axis(spec: &LayerSpec, op: &str, ctx: &ConvertContext<'_>) 
                 spec.name, other
             )));
         }
-        None => {
-            return Err(NyError::ModelLoad(format!(
-                "{op} {} requires axis/dim attribute",
-                spec.name
-            )));
-        }
+        None => default_axis.ok_or_else(|| {
+            NyError::ModelLoad(format!("{op} {} requires axis/dim attribute", spec.name))
+        })?,
     };
 
     // Trailing-relative remap: correct under both internal runtime layouts
@@ -152,13 +162,17 @@ fn read_positive_usize_attr(spec: &LayerSpec, key: &str, op: &str) -> Result<usi
 }
 
 fn read_keepdims_attr(spec: &LayerSpec, op: &str) -> Result<bool> {
-    match spec.attributes.get("keepdims") {
+    read_boolean_attr(spec, "keepdims", true, op)
+}
+
+fn read_boolean_attr(spec: &LayerSpec, key: &str, default: bool, op: &str) -> Result<bool> {
+    match spec.attributes.get(key) {
         Some(AttributeValue::Int(value)) => Ok(*value != 0),
         Some(other) => Err(NyError::ModelLoad(format!(
-            "{op} {} attribute 'keepdims' must be Int, got {:?}",
+            "{op} {} attribute '{key}' must be Int, got {:?}",
             spec.name, other
         ))),
-        None => Ok(false),
+        None => Ok(default),
     }
 }
 
@@ -287,6 +301,35 @@ mod tests {
             panic!("expected ArgMax layer");
         };
         assert!(layer.keepdims);
+    }
+
+    #[test]
+    fn onnx_arg_extrema_defaults_and_tie_policy_are_preserved() {
+        // A rank-one ONNX model has no stripped leading batch axis, so the
+        // schema default axis=0 is a genuine runtime axis.
+        let ctx = make_ctx().with_model_unbatched(true);
+        let argmax = ctx
+            .convert_argmax(&spec(LayerType::Argmax, HashMap::new()))
+            .expect("ONNX defaults should canonicalize");
+        let Layer::ArgMax(argmax) = argmax else {
+            panic!("expected ArgMax layer");
+        };
+        assert_eq!(argmax.axis, 0);
+        assert!(argmax.keepdims);
+        assert!(!argmax.select_last_index);
+
+        let argmin = ctx
+            .convert_argmin(&spec(
+                LayerType::ArgMin,
+                HashMap::from([("select_last_index".to_string(), AttributeValue::Int(1))]),
+            ))
+            .expect("select_last_index should canonicalize");
+        let Layer::ArgMin(argmin) = argmin else {
+            panic!("expected ArgMin layer");
+        };
+        assert_eq!(argmin.axis, 0);
+        assert!(argmin.keepdims);
+        assert!(argmin.select_last_index);
     }
 
     #[test]

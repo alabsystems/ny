@@ -21,7 +21,9 @@ use tracing::{debug, trace};
 use crate::beta_crown::bab_cuts::CutPool;
 use crate::beta_crown::branching::{BranchingHeuristic, NeuronConstraint};
 use crate::beta_crown::config::KfsbReduceOp;
-use crate::beta_crown::domain::{BabDomain, GraphBabDomain, MultiObjectiveGraphBabDomain};
+use crate::beta_crown::domain::{
+    BabDomain, GraphBabDomain, MultiObjectiveGraphBabDomain, NodeBoundsView, ObjectiveAggregation,
+};
 use crate::beta_crown::nonlinear_branching::{BranchingDecision, NonlinearBranching};
 use crate::beta_crown::state::{BetaState, DomainAlphaState};
 use crate::layers::activations::RELU_RELAX_MIN_WIDTH;

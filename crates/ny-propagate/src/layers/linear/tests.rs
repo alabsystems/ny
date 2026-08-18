@@ -9,6 +9,7 @@ use crate::tests::assert_linear_bounds_close;
 use ndarray::{array, Array1, Array2, ArrayD, IxDyn};
 use ny_core::{GemmEngine, NyError, FALLBACK_BOUND};
 use ny_test_utils::CountingGemmEngine;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod spectral_regressions;
 
@@ -42,6 +43,117 @@ impl GemmEngine for AlwaysFailGemmEngine {
             "injected GEMM failure for linear CROWN fallback test".to_string(),
         ))
     }
+}
+
+struct FlushAllF32GemmEngine;
+
+impl GemmEngine for FlushAllF32GemmEngine {
+    fn gemm_f32(&self, m: usize, _k: usize, n: usize, _a: &[f32], _b: &[f32]) -> Result<Vec<f32>> {
+        Ok(vec![0.0; m * n])
+    }
+}
+
+struct PanicGemmEngine;
+
+impl GemmEngine for PanicGemmEngine {
+    fn gemm_f32(
+        &self,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _a: &[f32],
+        _b: &[f32],
+    ) -> Result<Vec<f32>> {
+        panic!("finite-deadline Linear IBP must not enter the opaque engine")
+    }
+}
+
+struct DeadlineOnGemmCallEngine {
+    fail_on_call: usize,
+    deadline_expired: bool,
+    calls: AtomicUsize,
+}
+
+impl DeadlineOnGemmCallEngine {
+    fn expired(fail_on_call: usize) -> Self {
+        Self {
+            fail_on_call,
+            deadline_expired: true,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn unscoped(fail_on_call: usize) -> Self {
+        Self {
+            fail_on_call,
+            deadline_expired: false,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl GemmEngine for DeadlineOnGemmCallEngine {
+    fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on_call {
+            return Err(NyError::DeadlineExceeded(format!(
+                "injected batched Linear CROWN deadline on GEMM call {call}"
+            )));
+        }
+        ny_core::NaiveCpuGemmEngine.gemm_f32(m, k, n, a, b)
+    }
+
+    fn poll_crown_backward_deadline(&self) -> Result<()> {
+        if self.deadline_expired {
+            Err(NyError::DeadlineExceeded(
+                "injected expired batched Linear CROWN proxy".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct BoundedMemoryRefusalEngine;
+
+impl GemmEngine for BoundedMemoryRefusalEngine {
+    fn gemm_f32(
+        &self,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _a: &[f32],
+        _b: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(NyError::CpuMemoryExceeded {
+            required_bytes: 2,
+            budget_bytes: 1,
+            site: "test bounded Linear CROWN engine",
+        })
+    }
+
+    fn forbids_unbounded_cpu_fallback(&self) -> bool {
+        true
+    }
+}
+
+fn batched_crown_2x2_bounds() -> BatchedLinearBounds {
+    BatchedLinearBounds::from_parts_unchecked(
+        ArrayD::from_shape_vec(
+            IxDyn(&[2, 2, 2]),
+            vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0],
+        )
+        .unwrap(),
+        ArrayD::zeros(IxDyn(&[2, 2])),
+        ArrayD::from_shape_vec(
+            IxDyn(&[2, 2, 2]),
+            vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0],
+        )
+        .unwrap(),
+        ArrayD::zeros(IxDyn(&[2, 2])),
+        vec![2],
+        vec![2],
+    )
 }
 
 fn assert_multi_position_matches_split_positions(
@@ -584,6 +696,23 @@ fn test_crown_single_engine_matches_cpu_2709() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_crown_single_engine_certificate_covers_daz_flushed_input() -> Result<()> {
+    let exact = 2.0_f64.powi(-29);
+    let layer = LinearLayer::new(array![[2.0_f32.powi(120)]], None)?;
+    let tiny = f32::from_bits(1);
+    let bounds = LinearBounds::new(array![[tiny]], array![0.0], array![[tiny]], array![0.0])?;
+
+    let result = layer
+        .propagate_linear_with_engine(&bounds, Some(&FlushAllF32GemmEngine))?
+        .into_owned();
+    assert_eq!(result.lower_a()[[0, 0]], 0.0);
+    assert_eq!(result.upper_a()[[0, 0]], 0.0);
+    assert!(f64::from(result.lower_a_err().expect("lower certificate")[[0, 0]]) >= exact);
+    assert!(f64::from(result.upper_a_err().expect("upper certificate")[[0, 0]]) >= exact);
+    Ok(())
+}
+
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_single_engine_nonfinite_row_fallback_matches_cpu_2709() -> Result<()> {
@@ -874,22 +1003,7 @@ fn test_batched_crown_with_batch_dim() -> Result<()> {
 #[test]
 fn test_batched_crown_engine_matches_cpu_3597() -> Result<()> {
     let layer = make_2x2_layer();
-    let bounds = BatchedLinearBounds::from_parts_unchecked(
-        ArrayD::from_shape_vec(
-            IxDyn(&[2, 2, 2]),
-            vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0],
-        )
-        .unwrap(),
-        ArrayD::zeros(IxDyn(&[2, 2])),
-        ArrayD::from_shape_vec(
-            IxDyn(&[2, 2, 2]),
-            vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0],
-        )
-        .unwrap(),
-        ArrayD::zeros(IxDyn(&[2, 2])),
-        vec![2],
-        vec![2],
-    );
+    let bounds = batched_crown_2x2_bounds();
 
     let expected = layer.propagate_linear_batched(&bounds)?;
     let engine = CountingGemmEngine::new();
@@ -947,6 +1061,100 @@ fn test_batched_crown_engine_matches_cpu_3597() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn batched_linear_crown_preserves_expired_proxy_deadline_from_either_gemm() -> Result<()> {
+    let layer = make_2x2_layer();
+    let bounds = batched_crown_2x2_bounds();
+
+    for fail_on_call in [1, 2] {
+        let engine = DeadlineOnGemmCallEngine::expired(fail_on_call);
+        let error = layer
+            .propagate_linear_batched_maybe_engine(&bounds, Some(&engine))
+            .expect_err("expired proxy deadline must be terminal");
+        assert!(
+            error.is_deadline_exceeded(),
+            "GEMM call {fail_on_call} returned the wrong error: {error}"
+        );
+        assert_eq!(
+            engine.calls.load(Ordering::SeqCst),
+            fail_on_call,
+            "batched Linear CROWN must stop immediately at the typed deadline"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn batched_linear_crown_none_authority_keeps_engine_error_cpu_fallback() -> Result<()> {
+    let layer = make_2x2_layer();
+    let bounds = batched_crown_2x2_bounds();
+    let expected = layer.propagate_linear_batched(&bounds)?;
+
+    let assert_exact_cpu = |actual: &BatchedLinearBounds| {
+        assert_eq!(actual.lower_a, expected.lower_a);
+        assert_eq!(actual.upper_a, expected.upper_a);
+        assert_eq!(actual.lower_b, expected.lower_b);
+        assert_eq!(actual.upper_b, expected.upper_b);
+        assert_eq!(actual.lower_a_err, expected.lower_a_err);
+        assert_eq!(actual.upper_a_err, expected.upper_a_err);
+    };
+
+    let ordinary =
+        layer.propagate_linear_batched_maybe_engine(&bounds, Some(&AlwaysFailGemmEngine))?;
+    assert_exact_cpu(&ordinary);
+
+    for fail_on_call in [1, 2] {
+        let engine = DeadlineOnGemmCallEngine::unscoped(fail_on_call);
+        let actual = layer.propagate_linear_batched_maybe_engine(&bounds, Some(&engine))?;
+        assert_exact_cpu(&actual);
+        assert_eq!(
+            engine.calls.load(Ordering::SeqCst),
+            fail_on_call,
+            "unscoped typed error must enter CPU fallback without retrying the engine"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn bounded_linear_engine_entries_fail_closed_without_pollable_implementation() {
+    let layer = make_2x2_layer();
+    let batched = batched_crown_2x2_bounds();
+    let scalar = LinearBounds::identity(2);
+    let input = BoundedTensor::concrete(array![0.0_f32, 0.0].into_dyn()).unwrap();
+
+    let error = layer
+        .propagate_linear_batched_maybe_engine(&batched, Some(&BoundedMemoryRefusalEngine))
+        .expect_err("bounded batched CROWN must fail before any opaque work");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
+
+    let error = layer
+        .propagate_linear_batched_with_engine(&[&scalar], &BoundedMemoryRefusalEngine)
+        .expect_err("bounded multi-domain CROWN must fail before any opaque work");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
+
+    let error = layer
+        .propagate_linear_with_engine(&scalar, Some(&BoundedMemoryRefusalEngine))
+        .expect_err("bounded unscoped scalar CROWN must not fall back to CPU");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
+
+    let error = layer
+        .propagate_linear_with_engine_and_deadline(
+            &scalar,
+            Some(&BoundedMemoryRefusalEngine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        )
+        .expect_err("a partial bounded scalar capability must fail closed");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
+
+    let error = layer
+        .propagate_ibp_with_engine(&input, Some(&BoundedMemoryRefusalEngine))
+        .expect_err("bounded unscoped Linear IBP must not fall back to CPU");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
 }
 
 #[ntest::timeout(10000)]
@@ -1794,11 +2002,50 @@ fn test_linear_new_normalizes_non_contiguous_weight() {
     assert_eq!(layer.weight[[2, 1]], 6.0);
 }
 
-// ===== #4321: deadline-aware Linear CROWN backward (row-chunked GEMM) =====
+#[test]
+fn parameter_replacement_rebuilds_all_cached_weight_views_atomically() {
+    use crate::layers::common::BoundPropagation;
+
+    let mut layer = LinearLayer::new(
+        array![[1.0_f32, -2.0], [3.0, 4.0]],
+        Some(array![0.5_f32, -0.5]),
+    )
+    .unwrap();
+
+    // Prime the lazy row-major transpose as well as exercising the eager
+    // positive/negative and faer caches before replacement.
+    assert_eq!(layer.weight_t_row_major(), &[1.0_f32, 3.0, -2.0, 4.0]);
+    let input =
+        BoundedTensor::new(array![1.0_f32, 2.0].into_dyn(), array![1.0, 2.0].into_dyn()).unwrap();
+    let before = layer.propagate_ibp(&input).unwrap();
+    for (actual, expected) in before.lower().iter().copied().zip([-2.5_f32, 10.5]) {
+        assert!((actual - expected).abs() <= 1.0e-5);
+    }
+
+    layer
+        .replace_parameters(
+            array![[-1.0_f32, 2.0], [0.5, -3.0]],
+            Some(array![1.0_f32, 2.0]),
+        )
+        .unwrap();
+
+    assert_eq!(layer.weight_t_row_major(), &[-1.0_f32, 0.5, 2.0, -3.0]);
+    let after = layer.propagate_ibp(&input).unwrap();
+    for (actual, expected) in after.lower().iter().copied().zip([4.0_f32, -3.5]) {
+        assert!((actual - expected).abs() <= 1.0e-5);
+    }
+
+    let snapshot_weight = layer.weight().clone();
+    let snapshot_bias = layer.bias().cloned();
+    assert!(layer.set_weight(array![[1.0_f32, 2.0, 3.0]]).is_err());
+    assert_eq!(layer.weight(), &snapshot_weight);
+    assert_eq!(layer.bias(), snapshot_bias.as_ref());
+}
+
+// ===== #4321: deadline-authoritative Linear CROWN backward =====
 
 /// Build a wide LinearLayer (`in_features` -> `out_features`) and a many-row
-/// CROWN frontier so the deadline-aware path takes its row-chunked branch
-/// (> DEADLINE_LINEAR_ROW_CHUNK output rows).
+/// CROWN frontier representative of a root spec-matrix backward.
 fn make_wide_layer_and_bounds(
     num_specs: usize,
     out_features: usize,
@@ -1820,48 +2067,44 @@ fn make_wide_layer_and_bounds(
     (layer, bounds)
 }
 
-/// The deadline-aware row-chunked path must be bit-identical to the plain path
-/// when the deadline is comfortably in the future. CROWN backward is row-wise
-/// independent, so chunking output rows changes nothing but abort granularity.
+/// The deadline-aware pollable CPU path must remain numerically equivalent to
+/// the ordinary path when the deadline is comfortably in the future.
 #[ntest::timeout(10000)]
 #[test]
-fn test_linear_deadline_chunked_matches_unbounded_4321() -> Result<()> {
-    // 200 spec rows > DEADLINE_LINEAR_ROW_CHUNK (64) forces the chunked branch.
+fn test_linear_deadline_pollable_matches_unbounded_4321() -> Result<()> {
     let (layer, bounds) = make_wide_layer_and_bounds(200, 48, 32);
     let far_deadline = Some(std::time::Instant::now() + std::time::Duration::from_hours(1));
 
     let expected = layer
         .propagate_linear_with_engine(&bounds, None)?
         .into_owned();
-    let chunked = layer
+    let deadline_bounded = layer
         .propagate_linear_with_engine_and_deadline(&bounds, None, far_deadline)?
         .into_owned();
     assert_linear_bounds_close(
-        &chunked,
+        &deadline_bounded,
         &expected,
-        0.0,
-        "#4321 chunked CPU == unbounded CPU",
+        1e-5,
+        "#4321 pollable CPU ~= unbounded CPU",
     );
 
-    // Same equivalence through the GEMM engine path.
+    // A finite authority must not enter the generic engine at all.
     let engine = CountingGemmEngine::new();
-    let expected_eng = layer
-        .propagate_linear_with_engine(&bounds, Some(&engine))?
-        .into_owned();
-    let chunked_eng = layer
+    let deadline_with_engine = layer
         .propagate_linear_with_engine_and_deadline(&bounds, Some(&engine), far_deadline)?
         .into_owned();
     assert_linear_bounds_close(
-        &chunked_eng,
-        &expected_eng,
+        &deadline_with_engine,
+        &deadline_bounded,
         0.0,
-        "#4321 chunked engine == unbounded engine",
+        "#4321 finite deadline ignores opaque engine",
     );
+    assert_eq!(engine.gemm_calls(), 0);
     Ok(())
 }
 
 /// An already-expired deadline must abort with `DeadlineExceeded` rather than
-/// run the GEMM, on both the large (chunked) and small (pre-op check) paths.
+/// run any GEMM, on both large and small workloads.
 #[ntest::timeout(10000)]
 #[test]
 fn test_linear_deadline_expired_aborts_4321() {
@@ -1871,17 +2114,15 @@ fn test_linear_deadline_expired_aborts_4321() {
             .expect("Instant supports subtracting 1ms"),
     );
 
-    // Large workload -> chunked branch -> inter-chunk check fires immediately.
     let (layer_big, bounds_big) = make_wide_layer_and_bounds(200, 48, 32);
     assert!(
         matches!(
             layer_big.propagate_linear_with_engine_and_deadline(&bounds_big, None, expired),
             Err(NyError::DeadlineExceeded(_))
         ),
-        "#4321 expired deadline must abort the chunked Linear backward"
+        "#4321 expired deadline must abort the large Linear backward"
     );
 
-    // Small workload (<= chunk threshold) -> pre-op check fires immediately.
     let (layer_small, bounds_small) = make_wide_layer_and_bounds(8, 8, 8);
     assert!(
         matches!(
@@ -1908,84 +2149,61 @@ fn test_linear_deadline_none_is_plain_path_4321() -> Result<()> {
     Ok(())
 }
 
-// ===== Spec-matrix root output-bound: engine-routed backward == CPU faer =====
+// ===== Spec-matrix root output-bound: finite authority excludes ordinary GEMM =====
 //
 // The deep-ResNet root OUTPUT bound is a spec-matrix CROWN backward with ~199
 // objective rows propagated through Linear/Conv layers; its wide `A @ W` GEMMs
-// are the dominant cost on tinyimagenet/cifar100/vit/traffic_signs. This is the
-// path the `--backend wgpu` (Metal) `GemmEngine` accelerates. These tests pin
-// the two soundness-critical invariants for that route on the realistic wide,
-// multi-chunk workload:
+// are the dominant cost on tinyimagenet/cifar100/vit/traffic_signs. A generic
+// caller-supplied GemmEngine is not proof that its ordinary methods satisfy the
+// bounded-dispatch contract. Large f64 `A @ W` may instead use the separately
+// installed process-global sound engine's explicit `gemm_f64_with_deadline`
+// method. These tests pin the remaining authority invariant on realistic wide
+// and narrow workloads:
 //
-//   1. The engine-routed result is numerically equal to the CPU faer baseline
-//      (round-to-nearest preserved; the engine computes the same C = A @ W and
-//      the W decomposition / f64 bias handling are unchanged).
-//   2. Every chunk's GEMM is actually dispatched to the engine (not silently
-//      executed on faer), so `--backend wgpu` truly offloads the big GEMMs.
+//   1. A future deadline returns the same pollable CPU result whether or not an
+//      ordinary caller engine was supplied.
+//   2. No ordinary caller-engine dispatch occurs under finite authority.
 //
 // `CountingGemmEngine` delegates to `NaiveCpuGemmEngine` (an in-crate CPU
 // `GemmEngine`) while counting `gemm_f32` calls — the engine-routed math is CPU
 // here, but the *dispatch* is exercised exactly as a GPU engine would be.
 
-/// Engine-routed spec-matrix Linear CROWN backward must equal the CPU faer
-/// baseline AND dispatch every chunk's GEMM through the engine.
-///
-/// 199 spec rows (the TinyImageNet ResNet root output-bound row count) exceed
-/// `DEADLINE_LINEAR_ROW_CHUNK` (64), forcing the row-chunked branch:
-/// `ceil(199 / 64) = 4` chunks. The layout is single-position (bounds_inputs ==
-/// out_features), so each chunk issues exactly two `gemm_f32` calls (lower and
-/// upper coefficient blocks) → `4 * 2 = 8` total engine dispatches.
+/// A wide spec-matrix Linear backward must not dispatch opaque engine work
+/// while carrying a finite deadline.
 #[ntest::timeout(10000)]
 #[test]
-fn test_linear_spec_root_engine_matches_faer_and_dispatches_all_chunks() -> Result<()> {
-    // 199 specs forces 4 chunks; 48->32 keeps a single position (48 / 48 == 1).
+fn test_linear_spec_root_finite_deadline_refuses_opaque_engine() -> Result<()> {
     let (layer, bounds) = make_wide_layer_and_bounds(199, 48, 32);
     let far_deadline = Some(std::time::Instant::now() + std::time::Duration::from_hours(1));
 
-    // CPU faer baseline (engine = None routes to `propagate_linear_cpu`, which
-    // uses faer `mat_mul`). Compare against the actual deadline-chunked path that
-    // the spec-matrix root output bound runs in production (#4321).
-    let faer_baseline = layer
+    let bounded_baseline = layer
         .propagate_linear_with_engine_and_deadline(&bounds, None, far_deadline)?
         .into_owned();
 
-    // Engine-routed: same chunked path, but each chunk's `A @ W` GEMM is
-    // dispatched through the injected engine (the `--backend wgpu` route).
     let engine = CountingGemmEngine::new();
-    let engine_routed = layer
+    let supplied_engine = layer
         .propagate_linear_with_engine_and_deadline(&bounds, Some(&engine), far_deadline)?
         .into_owned();
 
-    // (1) Numerical equivalence: the engine path is a faithful C = A @ W, so the
-    // result must match faer to within tight float tolerance (~1e-4 per mission;
-    // NaiveCpuGemmEngine vs faer differ only by accumulation order).
     assert_linear_bounds_close(
-        &engine_routed,
-        &faer_baseline,
-        1e-4,
-        "spec-root engine-routed Linear CROWN backward == CPU faer",
+        &supplied_engine,
+        &bounded_baseline,
+        0.0,
+        "spec-root finite-deadline result is engine-independent",
     );
-
-    // (2) Dispatch proof: 4 chunks * 2 directions (lower + upper) == 8 GEMMs,
-    // confirming the big spec-matrix GEMMs are offloaded to the engine on every
-    // chunk rather than silently staying on faer.
     assert_eq!(
         engine.gemm_calls(),
-        8,
-        "spec-root chunked backward must dispatch 2 GEMMs/chunk * 4 chunks to the engine"
+        0,
+        "finite-deadline root backward must not enter generic GEMM"
     );
 
     Ok(())
 }
 
-/// The non-chunked spec-matrix Linear backward (specs <= chunk threshold) must
-/// also route its `A @ W` through the engine and match faer. Guards the small /
-/// single-chunk root output bound (e.g. low-class-count heads) so neither the
-/// chunked nor the direct branch can regress to a CPU-only GEMM.
+/// The same authority rule applies to a small root objective set.
 #[ntest::timeout(10000)]
 #[test]
-fn test_linear_spec_root_single_chunk_engine_matches_faer() -> Result<()> {
-    // 32 specs (<= 64) takes the pre-op-check / single-GEMM branch, not chunking.
+fn test_linear_spec_root_small_finite_deadline_refuses_opaque_engine() -> Result<()> {
     let (layer, bounds) = make_wide_layer_and_bounds(32, 48, 32);
     let far_deadline = Some(std::time::Instant::now() + std::time::Duration::from_hours(1));
 
@@ -2001,15 +2219,155 @@ fn test_linear_spec_root_single_chunk_engine_matches_faer() -> Result<()> {
     assert_linear_bounds_close(
         &engine_routed,
         &faer_baseline,
-        1e-4,
-        "single-chunk spec-root engine-routed == CPU faer",
+        0.0,
+        "small spec-root finite-deadline result is engine-independent",
     );
-    // Single position, one chunk: lower + upper == 2 GEMM dispatches.
     assert_eq!(
         engine.gemm_calls(),
-        2,
-        "single-chunk spec-root backward must dispatch both coefficient GEMMs to the engine"
+        0,
+        "small finite-deadline root backward must not enter generic GEMM"
     );
 
+    Ok(())
+}
+
+// ===== Deadline-authoritative Linear IBP forward =====
+
+#[ntest::timeout(10000)]
+#[test]
+fn linear_ibp_finite_deadline_encloses_unbatched_and_batched_and_refuses_engine() -> Result<()> {
+    let layer = LinearLayer::new(
+        array![[2.0_f32, -3.0, 0.5], [-1.0, 4.0, 2.0]],
+        Some(array![0.25_f32, -0.5]),
+    )?;
+    let future = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+
+    let unbatched = BoundedTensor::new(
+        array![-1.0_f32, 2.0, -4.0].into_dyn(),
+        array![3.0_f32, 5.0, 1.0].into_dyn(),
+    )?;
+    let output =
+        layer.propagate_ibp_with_engine_and_deadline(&unbatched, Some(&PanicGemmEngine), future)?;
+    for (index, (exact_lower, exact_upper)) in [(-18.75_f32, 0.75_f32), (-3.5, 22.5)]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(output.lower()[index] <= exact_lower);
+        assert!(output.upper()[index] >= exact_upper);
+    }
+
+    let batched = BoundedTensor::new(
+        array![[-1.0_f32, 2.0, -4.0], [0.0, -2.0, 1.0]].into_dyn(),
+        array![[3.0_f32, 5.0, 1.0], [1.0, -1.0, 3.0]].into_dyn(),
+    )?;
+    let batched_output =
+        layer.propagate_ibp_with_engine_and_deadline(&batched, Some(&PanicGemmEngine), future)?;
+    let exact = [
+        [(-18.75_f32, 0.75_f32), (-3.5, 22.5)],
+        [(3.75, 9.75), (-7.5, 1.5)],
+    ];
+    for batch in 0..2 {
+        for output_index in 0..2 {
+            let (exact_lower, exact_upper) = exact[batch][output_index];
+            assert!(batched_output.lower()[[batch, output_index]] <= exact_lower);
+            assert!(batched_output.upper()[[batch, output_index]] >= exact_upper);
+        }
+    }
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn linear_ibp_deadline_none_is_exact_legacy_engine_path() -> Result<()> {
+    let layer = make_2x2_layer();
+    let input = BoundedTensor::new(
+        array![-1.0_f32, -2.0].into_dyn(),
+        array![1.0_f32, 2.0].into_dyn(),
+    )?;
+    let engine = CountingGemmEngine::new();
+    let expected = layer.propagate_ibp_with_engine(&input, Some(&engine))?;
+    let calls_after_expected = engine.gemm_calls();
+    let actual = layer.propagate_ibp_with_engine_and_deadline(&input, Some(&engine), None)?;
+    assert_eq!(actual.lower(), expected.lower());
+    assert_eq!(actual.upper(), expected.upper());
+    assert!(calls_after_expected > 0);
+    assert!(engine.gemm_calls() > calls_after_expected);
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn linear_ibp_expired_and_oversized_finite_deadlines_fail_typed_before_engine() -> Result<()> {
+    let layer = LinearLayer::new(array![[1.0_f32]], None)?;
+    let input = BoundedTensor::new(array![-1.0_f32].into_dyn(), array![1.0_f32].into_dyn())?;
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let error = layer
+        .propagate_ibp_with_engine_and_deadline(&input, Some(&PanicGemmEngine), Some(expired))
+        .expect_err("expired Linear IBP must fail before engine dispatch");
+    assert!(error.is_deadline_exceeded());
+
+    let oversized_shape = [4 * 1024 * 1024 + 1, 1];
+    let oversized = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&oversized_shape)),
+        ArrayD::ones(IxDyn(&oversized_shape)),
+    )?;
+    let error = layer
+        .propagate_ibp_with_engine_and_deadline(
+            &oversized,
+            Some(&PanicGemmEngine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect_err("oversized finite-deadline Linear IBP must trip the cap");
+    assert!(
+        matches!(error, NyError::CpuMemoryExceeded { .. }),
+        "live cap refusal must remain distinct from deadline expiry: {error}"
+    );
+
+    let mut oversized_rank = vec![1usize; 1_025];
+    oversized_rank[0] = 0;
+    let metadata_only = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&oversized_rank)),
+        ArrayD::zeros(IxDyn(&oversized_rank)),
+    )?;
+    let error = layer
+        .propagate_ibp_with_engine_and_deadline(
+            &metadata_only,
+            Some(&PanicGemmEngine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect_err("oversized rank must trip the finite metadata cap");
+    assert!(
+        matches!(error, NyError::CpuMemoryExceeded { .. }),
+        "metadata cap must remain distinct from deadline expiry: {error}"
+    );
+
+    let expected_none = layer.propagate_ibp_with_engine(&metadata_only, None)?;
+    let actual_none = layer.propagate_ibp_with_engine_and_deadline(&metadata_only, None, None)?;
+    assert_eq!(actual_none.lower(), expected_none.lower());
+    assert_eq!(actual_none.upper(), expected_none.upper());
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn linear_ibp_zero_contraction_finite_deadline_traverses_output_cells() -> Result<()> {
+    let output_features = 5_000;
+    let layer = LinearLayer::new(
+        Array2::zeros((output_features, 0)),
+        Some(Array1::from_shape_fn(output_features, |index| index as f32)),
+    )?;
+    let input = BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[0])))?;
+    let output = layer.propagate_ibp_with_engine_and_deadline(
+        &input,
+        Some(&PanicGemmEngine),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+    )?;
+    assert_eq!(output.shape(), &[output_features]);
+    for index in [0, 4_095, 4_999] {
+        assert!(output.lower()[index] <= index as f32);
+        assert!(output.upper()[index] >= index as f32);
+    }
     Ok(())
 }

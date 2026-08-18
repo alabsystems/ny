@@ -9,7 +9,8 @@
 
 use crate::bounds::MonotoneSShapedPathAlpha;
 use ndarray::Array2;
-use ny_core::{NyError, Result};
+use ny_core::dd::{next_down_f64, next_up_f64};
+use ny_core::{f64_to_f32_down, f64_to_f32_up, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use crate::layers::activations::LinearRelaxation;
@@ -24,7 +25,7 @@ const S_SHAPED_X_LIMIT: f32 = 500.0;
 pub(super) struct SShapedPrecomputeTables {
     step_pre: f32,
     pub(super) d_lower: Vec<f32>,
-    d_upper: Vec<f32>,
+    pub(super) d_upper: Vec<f32>,
 }
 
 impl SShapedPrecomputeTables {
@@ -61,7 +62,12 @@ impl SShapedPrecomputeTables {
                 }
             }
 
-            d_lower.push(l as f32);
+            // The loop invariant is `l` valid, `r` invalid.  A nearest-f32
+            // cast can round the final valid root toward `r` and therefore
+            // publish an invalid tangent point.  This is not hypothetical:
+            // tanh table entry 49_089 used to miss its defining endpoint
+            // inequality by about 4.75e-7.  Store toward the valid side.
+            d_lower.push(next_down_f32(l as f32));
         }
 
         let mut d_upper = Vec::with_capacity(num_points);
@@ -89,7 +95,9 @@ impl SShapedPrecomputeTables {
                 }
             }
 
-            d_upper.push(r as f32);
+            // Symmetric invariant: `l` is invalid and `r` is valid, so round
+            // the stored root upward, away from the invalid side.
+            d_upper.push(next_up_f32(r as f32));
         }
 
         Self {
@@ -137,27 +145,54 @@ pub(super) fn s_shaped_finalize(
     upper_slope: f64,
     upper_intercept: f64,
 ) -> LinearRelaxation {
-    // Compute max_abs_x in f64 so the error product stays in f64 (#2636).
+    if !l.is_finite()
+        || !u.is_finite()
+        || l > u
+        || !lower_slope.is_finite()
+        || !lower_intercept.is_finite()
+        || !upper_slope.is_finite()
+        || !upper_intercept.is_finite()
+    {
+        return LinearRelaxation::nan_fallback();
+    }
+
+    // Publish each f64 source line as one f32 slope plus a directionally
+    // corrected f32 intercept.  If L(x)=s*x+b and R(x)=s_r*x+b_r, then
     //
-    // Clamp to 1e20 to prevent the slope-rounding error adjustment from
-    // producing Inf/vacuous intercepts when inputs are near f32::MAX (#2625).
-    // For all s-shaped functions (tanh, sigmoid, arctan), the derivative is
-    // negligible for |x| > ~10, so the slope at saturation is ~0 and the
-    // rounding error adjustment should also be ~0. Clamping max_abs_x at 1e20
-    // preserves the adjustment for practical input ranges while preventing
-    // overflow: max slope error ~2^-23 * 1e20 = ~1.2e13, well within f32.
-    let max_abs_x = (l.abs().max(u.abs()) as f64).min(1e20);
+    //   R(x) <= L(x)  iff  b_r <= (s-s_r)*x+b,
+    //   R(x) >= L(x)  iff  b_r >= (s-s_r)*x+b.
+    //
+    // The right-hand side is affine, so its extrema on [l,u] occur at the two
+    // endpoints.  This is both tighter and actually complete for slope-cast
+    // error.  The former `min(max_abs_x, 1e20)` radius was not: on an extreme
+    // finite interval it could undercharge the cast error by eighteen orders
+    // of magnitude and fail to preserve the supplied affine line.
     let lower_slope_f = lower_slope as f32;
     let upper_slope_f = upper_slope as f32;
-    // Compute error entirely in f64 to avoid intermediate f32 rounding that can
-    // underestimate the true slope truncation error (#2636). next_up_f32 on the
-    // cast ensures the f32 error bound is >= the true f64 value.
-    let lower_err = next_up_f32(((lower_slope - lower_slope_f as f64).abs() * max_abs_x) as f32);
-    let upper_err = next_up_f32(((upper_slope - upper_slope_f as f64).abs() * max_abs_x) as f32);
+    if !lower_slope_f.is_finite() || !upper_slope_f.is_finite() {
+        return LinearRelaxation::nan_fallback();
+    }
 
-    let lower_intercept_f =
-        next_down_f32((lower_intercept as f32) - S_SHAPED_RELAX_EPS - lower_err);
-    let upper_intercept_f = next_up_f32((upper_intercept as f32) + S_SHAPED_RELAX_EPS + upper_err);
+    let l64 = f64::from(l);
+    let u64 = f64::from(u);
+    let lower_delta = lower_slope - f64::from(lower_slope_f);
+    let upper_delta = upper_slope - f64::from(upper_slope_f);
+
+    // Direct every f64 multiply and add outward as well.  This matters when
+    // `(s-s_r)*x` nearly cancels `b`: a plain f64 expression can lose far more
+    // than one f32 ULP of the small result before the final cast sees it.
+    let endpoint_down =
+        |delta: f64, x: f64, intercept: f64| next_down_f64(next_down_f64(delta * x) + intercept);
+    let endpoint_up =
+        |delta: f64, x: f64, intercept: f64| next_up_f64(next_up_f64(delta * x) + intercept);
+
+    let lower_at_l = endpoint_down(lower_delta, l64, lower_intercept);
+    let lower_at_u = endpoint_down(lower_delta, u64, lower_intercept);
+    let upper_at_l = endpoint_up(upper_delta, l64, upper_intercept);
+    let upper_at_u = endpoint_up(upper_delta, u64, upper_intercept);
+    let eps = f64::from(S_SHAPED_RELAX_EPS);
+    let lower_intercept_f = f64_to_f32_down(next_down_f64(lower_at_l.min(lower_at_u) - eps));
+    let upper_intercept_f = f64_to_f32_up(next_up_f64(upper_at_l.max(upper_at_u) + eps));
 
     LinearRelaxation::new(
         lower_slope_f,

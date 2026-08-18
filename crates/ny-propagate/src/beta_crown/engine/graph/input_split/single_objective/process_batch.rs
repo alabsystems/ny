@@ -34,7 +34,9 @@ struct PendingChild {
 }
 
 /// Pick the input-split dimensions for one domain: the Saturation-Escape
-/// ranking when the `NY_SAT_ESCAPE_BRANCH` gate is on AND the graph has a
+/// ranking when the SEB gate is armed (preset
+/// `bab.branching.input_split.sat_escape_branch`, env `NY_SAT_ESCAPE_BRANCH`
+/// override — `BetaCrownConfig::sat_escape_branch_armed`) AND the graph has a
 /// saturated smooth activation (else `None`), otherwise the baseline SB
 /// heuristic. Advisory only — either way the returned dims are midpoint-split
 /// into a child set that exactly covers the parent box, so the choice never
@@ -47,7 +49,7 @@ fn seb_or_sb_split_dims(
     thresholds: &[f32],
     engine: Option<&dyn GemmEngine>,
 ) -> Vec<usize> {
-    if super::super::sat_escape::enabled() {
+    if verifier.config.sat_escape_branch_armed() {
         if let Some(dims) = super::super::sat_escape::select_seb_dims(
             graph,
             domain.input_bounds.as_ref(),
@@ -173,7 +175,7 @@ where
             .domain_is_violation(domain.lower_bound, domain.upper_bound, threshold)
         {
             return Ok(Some(
-                lifecycle.build_result(BabVerificationStatus::PotentialViolation),
+                lifecycle.build_result(BabVerificationStatus::potential_violation()),
             ));
         }
         if domain.depth >= verifier.config.max_depth {
@@ -192,8 +194,10 @@ where
         // EXACTLY COVER the parent (completeness preserved). At depth 1 this returns
         // exactly the original left/right pair, so behaviour is unchanged.
         //
-        // Saturation-Escape Branching (advisory, gate `NY_SAT_ESCAPE_BRANCH=1`,
-        // default OFF): when the binding pre-activation is saturated the SB
+        // Saturation-Escape Branching (advisory, preset
+        // `bab.branching.input_split.sat_escape_branch` / env
+        // `NY_SAT_ESCAPE_BRANCH` override, default OFF): when the binding
+        // pre-activation is saturated the SB
         // objective coefficient vanishes and degenerates to width-only, so
         // reorder the split dims to the ones that de-saturate the logit. Purely
         // a reordering of `split_dims` — the box partition below is unchanged, so
@@ -418,7 +422,7 @@ where
             .domain_is_violation(domain.lower_bound, domain.upper_bound, threshold)
         {
             return Ok(Some(
-                lifecycle.build_result(BabVerificationStatus::PotentialViolation),
+                lifecycle.build_result(BabVerificationStatus::potential_violation()),
             ));
         }
         if domain.depth >= verifier.config.max_depth {
@@ -437,8 +441,10 @@ where
         // EXACTLY COVER the parent (completeness preserved). At depth 1 this returns
         // exactly the original left/right pair, so behaviour is unchanged.
         //
-        // Saturation-Escape Branching (advisory, gate `NY_SAT_ESCAPE_BRANCH=1`,
-        // default OFF): reorder the split dims toward the ones that de-saturate
+        // Saturation-Escape Branching (advisory, preset
+        // `bab.branching.input_split.sat_escape_branch` / env
+        // `NY_SAT_ESCAPE_BRANCH` override, default OFF): reorder the split
+        // dims toward the ones that de-saturate
         // the binding logit. Purely a reordering — the box partition below is
         // unchanged, so the union cover stays exact.
         let split_dims = seb_or_sb_split_dims(

@@ -42,7 +42,7 @@
 
 use super::super::WgpuDevice;
 use super::ibp_forward::create_buffer;
-use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
 
 /// 16-byte std140/std430-clean uniform params. Layout MUST match WGSL `struct Params`.
 #[repr(C)]
@@ -73,7 +73,14 @@ struct Params { n_prod: u32, n_sum: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(3) var<storage, read_write>  prod_dekker: array<vec2<f32>>;
 @group(0) @binding(4) var<storage, read_write>  prod_fma:    array<vec2<f32>>;
 @group(0) @binding(5) var<storage, read_write>  sum_out:     array<vec2<f32>>;
-@group(0) @binding(6) var<storage, read_write>  dot_out:     array<vec2<f32>>; // [0]=dekker dot, [1]=fma dot
+// dot_out lanes (each a double-single (hi, lo) accumulator result):
+//   [0] dekker-product, PLAIN ds_add        (legacy lane)
+//   [1] fma-product,    PLAIN ds_add        (legacy lane)
+//   [2] fma-product,    barrier TwoSum ONLY (plain FastTwoSum)   <- isolation
+//   [3] fma-product,    barrier FastTwoSum ONLY (plain TwoSum)   <- isolation
+//   [4] fma-product,    FULLY barrier ds_add                     <- THE composed test
+//   [5] dekker-product, FULLY barrier ds_add                     <- control
+@group(0) @binding(6) var<storage, read_write>  dot_out:     array<vec2<f32>>;
 @group(0) @binding(7) var<storage, read_write>  sum_bar:     array<vec2<f32>>; // fma-barrier TwoSum
 
 // Veltkamp splitter for f32: 2^12 + 1. f32 has 24 mantissa bits = 2*12.
@@ -136,11 +143,52 @@ fn two_prod_fma(a: f32, b: f32) -> vec2<f32> {
     return vec2<f32>(p, err);
 }
 
+// fma-barrier FastTwoSum: the Dekker renormalization step with its (algebraically
+// zero) error term routed through the fma intrinsic, exactly as two_sum_fma_barrier
+// does for Knuth. `fast_two_sum` above is PURE ADDS and was never probed per-lane —
+// it is the second reassociation-sensitive site inside ds_add.
+fn fast_two_sum_fma_barrier(a: f32, b: f32) -> vec2<f32> {
+    let s = a + b;
+    let t = fma(-1.0, a, s);    // s - a
+    let err = fma(-1.0, t, b);  // b - (s - a)
+    return vec2<f32>(s, err);
+}
+
 // Add a double-single y into a double-single x (two-sum accumulation + renormalize).
+//
+// NOTE (this is what the composed-dot corroboration line actually measured): BOTH
+// EFTs used here are the PLAIN forms. `two_sum` is measured FAILING on this adapter
+// (the compiler reassociates its compensation term to 0) and `fast_two_sum` is pure
+// adds and never probed at all. So both legacy dot lanes accumulate through broken
+// primitives regardless of which TwoProduct feeds them — which is why they printed
+// the identical plain-f32-grade number.
 fn ds_add(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
     let s = two_sum(x.x, y.x);
     let e = s.y + (x.y + y.y);
     return fast_two_sum(s.x, e);
+}
+
+// Isolation variant A: barrier TwoSum, PLAIN FastTwoSum.
+fn ds_add_bar_sum(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
+    let s = two_sum_fma_barrier(x.x, y.x);
+    let e = s.y + (x.y + y.y);
+    return fast_two_sum(s.x, e);
+}
+
+// Isolation variant B: PLAIN TwoSum, barrier FastTwoSum.
+fn ds_add_bar_fast(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
+    let s = two_sum(x.x, y.x);
+    let e = s.y + (x.y + y.y);
+    return fast_two_sum_fma_barrier(s.x, e);
+}
+
+// THE composed test: both EFTs in the fma-barrier form. The middle line is left
+// BYTE-IDENTICAL to `ds_add` on purpose — those are genuine (non-degenerate) adds,
+// so the ONLY difference between this and `ds_add` is the two EFT primitives.
+fn ds_add_barrier(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
+    let s = two_sum_fma_barrier(x.x, y.x);
+    let e = s.y + (x.y + y.y);
+    return fast_two_sum_fma_barrier(s.x, e);
 }
 
 @compute @workgroup_size(1)
@@ -150,6 +198,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Per-lane TwoProduct (both variants) + running double-single dot (both variants).
     var acc_d = vec2<f32>(0.0, 0.0);
     var acc_f = vec2<f32>(0.0, 0.0);
+    var acc_bs = vec2<f32>(0.0, 0.0);  // fma-product, barrier TwoSum only
+    var acc_bf = vec2<f32>(0.0, 0.0);  // fma-product, barrier FastTwoSum only
+    var acc_fb = vec2<f32>(0.0, 0.0);  // fma-product, FULLY barrier
+    var acc_db = vec2<f32>(0.0, 0.0);  // dekker-product, FULLY barrier
     for (var i: u32 = 0u; i < params.n_prod; i = i + 1u) {
         let ab = p_in[i];
         let pd = two_prod_dekker(ab.x, ab.y);
@@ -158,9 +210,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         prod_fma[i] = pf;
         acc_d = ds_add(acc_d, pd);
         acc_f = ds_add(acc_f, pf);
+        acc_bs = ds_add_bar_sum(acc_bs, pf);
+        acc_bf = ds_add_bar_fast(acc_bf, pf);
+        acc_fb = ds_add_barrier(acc_fb, pf);
+        acc_db = ds_add_barrier(acc_db, pd);
     }
     dot_out[0] = acc_d;
     dot_out[1] = acc_f;
+    dot_out[2] = acc_bs;
+    dot_out[3] = acc_bf;
+    dot_out[4] = acc_fb;
+    dot_out[5] = acc_db;
 
     // Per-lane TwoSum (plain Knuth + fma-barrier variant).
     for (var j: u32 = 0u; j < params.n_sum; j = j + 1u) {
@@ -408,7 +468,7 @@ impl EftVerdict {
 #[test]
 fn double_single_eft_viability_on_metal() {
     let _serial = gpu_test_serial_guard();
-    let device = require_device();
+    let device = require_verdict_device();
 
     let prod_pairs = build_product_inputs();
     let sum_pairs = build_sum_inputs();
@@ -450,6 +510,13 @@ fn double_single_eft_viability_on_metal() {
         oracle.add_prod(f64::from(a), f64::from(b));
     }
     let dot_ref = oracle.value();
+
+    // Calibration: the UNCOMPENSATED plain-f32 serial fold, same order. This is the
+    // "broken" level a double-single dot degrades to when its EFTs are folded away.
+    let mut plain_f32_fold = 0.0f32;
+    for &(a, b) in &prod_pairs {
+        plain_f32_fold += a * b;
+    }
 
     // Flatten the inputs to (a, b) pairs (WGSL vec2<f32>, tightly packed).
     let p_flat: Vec<f32> = prod_pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
@@ -493,7 +560,9 @@ fn double_single_eft_viability_on_metal() {
 
     let prod_bytes = (n_prod * 2 * size_of::<f32>()) as u64;
     let sum_bytes = (n_sum * 2 * size_of::<f32>()) as u64;
-    let dot_bytes = (2 * 2 * size_of::<f32>()) as u64;
+    // 6 double-single dot lanes (see the `dot_out` comment in the shader).
+    const N_DOT_LANES: usize = 6;
+    let dot_bytes = (N_DOT_LANES * 2 * size_of::<f32>()) as u64;
     let storage_usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
     let prod_dekker_buf = create_buffer(
@@ -598,8 +667,8 @@ fn double_single_eft_viability_on_metal() {
         .expect("read FMA product buffer");
     let sum_bits = WgpuDevice::read_u32_buffer(&device.device, &sum_staging, n_sum * 2)
         .expect("read TwoSum buffer");
-    let dot_bits =
-        WgpuDevice::read_u32_buffer(&device.device, &dot_staging, 4).expect("read dot buffer");
+    let dot_bits = WgpuDevice::read_u32_buffer(&device.device, &dot_staging, N_DOT_LANES * 2)
+        .expect("read dot buffer");
 
     let bar_bits = WgpuDevice::read_u32_buffer(&device.device, &sum_bar_staging, n_sum * 2)
         .expect("read fma-barrier TwoSum buffer");
@@ -609,10 +678,17 @@ fn double_single_eft_viability_on_metal() {
     let two_sum_v = evaluate_eft("Knuth TwoSum", &sum_refs, &sum_bits);
     let two_sum_bar = evaluate_eft("fma-barrier TwoSum", &sum_refs, &bar_bits);
 
-    let ds_dot_dekker =
-        f64::from(f32::from_bits(dot_bits[0])) + f64::from(f32::from_bits(dot_bits[1]));
-    let ds_dot_fma =
-        f64::from(f32::from_bits(dot_bits[2])) + f64::from(f32::from_bits(dot_bits[3]));
+    // Reconstruct each double-single lane as f64(hi) + f64(lo).
+    let ds_lane = |lane: usize| -> f64 {
+        f64::from(f32::from_bits(dot_bits[2 * lane]))
+            + f64::from(f32::from_bits(dot_bits[2 * lane + 1]))
+    };
+    let ds_dot_dekker = ds_lane(0);
+    let ds_dot_fma = ds_lane(1);
+    let ds_dot_bar_sum = ds_lane(2);
+    let ds_dot_bar_fast = ds_lane(3);
+    let ds_dot_barrier = ds_lane(4);
+    let ds_dot_barrier_dekker = ds_lane(5);
     let rel = |v: f64| {
         if dot_ref != 0.0 {
             (v - dot_ref).abs() / dot_ref.abs()
@@ -652,9 +728,31 @@ fn double_single_eft_viability_on_metal() {
     println!("{}", two_sum_bar.report());
     println!("-- Running double-single dot vs compensated Dot2 f64 oracle --");
     println!(
-        "    dekker-product dot rel-err: {:.3e} | fma-product dot rel-err: {:.3e}",
+        "    [PLAIN ds_add: two_sum + fast_two_sum]   dekker-product: {:.3e} | fma-product: {:.3e}",
         rel(ds_dot_dekker),
         rel(ds_dot_fma)
+    );
+    println!(
+        "    [barrier TwoSum ONLY  ]  fma-product: {:.3e}\n    \
+         [barrier FastTwoSum ONLY]  fma-product: {:.3e}",
+        rel(ds_dot_bar_sum),
+        rel(ds_dot_bar_fast),
+    );
+    println!(
+        "    [FULLY barrier ds_add ]  fma-product: {:.3e} | dekker-product: {:.3e}",
+        rel(ds_dot_barrier),
+        rel(ds_dot_barrier_dekker),
+    );
+    // Does the PLAIN lane's hi word bit-equal the uncompensated host fold? If yes, the
+    // legacy `ds_add` delivered LITERALLY zero compensation (both EFT terms folded away).
+    let plain_hi = f32::from_bits(dot_bits[2]);
+    let plain_lo = f32::from_bits(dot_bits[3]);
+    println!(
+        "    calibration: uncompensated host f32 serial fold rel-err: {:.3e} \
+         | plain-lane hi bit-equals host fold: {} | plain-lane lo = {:.6e}",
+        rel(f64::from(plain_f32_fold)),
+        plain_hi.to_bits() == plain_f32_fold.to_bits(),
+        plain_lo,
     );
     println!("    (working double-single ~2^-46 ≈ 1.4e-14; broken degrades to ~2^-24 ≈ 6e-8)");
     println!("--------------------------------------------------------------------------------");
@@ -703,22 +801,66 @@ fn double_single_eft_viability_on_metal() {
         fma.lo_mismatches, fma.lanes, fma.max_recon_abs
     );
 
-    // (2) The Dekker SPLIT product is broken by a*b+c CONTRACTION (measured today).
-    assert!(
-        !dekker.pass,
-        "TRIPWIRE (good news): the Dekker split TwoProduct is now bit-exact — the Metal \
-         compiler stopped contracting a*b + c. Re-open the split-based double-single path."
-    );
+    // (2) The Dekker SPLIT product is broken by a*b+c CONTRACTION (measured today)
+    // — a statement about the METAL shader compiler specifically, so it is only
+    // evidence when this adapter IS Metal. Tripwire (1) is a hardware property of
+    // `fma` and (3) was measured "GB10 Vulkan + Metal alike", but contraction of
+    // `a*b + c` is a per-compiler choice: on this Vulkan/AMD adapter the Dekker
+    // split IS bit-exact, which fired this tripwire and told the reader to
+    // "re-open the split-based double-single path" on the strength of a
+    // measurement from the wrong compiler. Report it everywhere, assert it only
+    // where its premise holds.
+    if device.adapter_info.backend == wgpu::Backend::Metal {
+        assert!(
+            !dekker.pass,
+            "TRIPWIRE (good news): the Dekker split TwoProduct is now bit-exact — the Metal \
+             compiler stopped contracting a*b + c. Re-open the split-based double-single path."
+        );
+    } else {
+        println!(
+            "NOTE: Dekker split TwoProduct {} on {:?} — the (2) tripwire is Metal-specific \
+             and is not asserted here.",
+            if dekker.pass {
+                "is BIT-EXACT"
+            } else {
+                "is broken by contraction"
+            },
+            device.adapter_info.backend
+        );
+    }
 
-    // (3) The PLAIN Knuth TwoSum is broken by fast-math REASSOCIATION (measured today,
-    // GB10 Vulkan + Metal alike): the compiler folds the algebraically-zero compensation
+    // (3) The PLAIN Knuth TwoSum is broken by fast-math REASSOCIATION (measured on
+    // GB10 Vulkan + Metal): the compiler folds the algebraically-zero compensation
     // term. Any EFT shader must therefore use the fma-barrier form, never the plain one.
-    assert!(
-        !two_sum_v.pass,
-        "TRIPWIRE: the PLAIN Knuth TwoSum EFT is now bit-exact on this adapter — the \
-         compiler no longer reassociates the compensation term to zero. The fma-barrier \
-         form is then no longer required (but remains sufficient); update the EFT design."
-    );
+    //
+    // Gated for the same reason as (2), and the same rule applies across this probe:
+    // a POSITIVE capability — (1) fma is a true fused op, (4) the fma-barrier form is
+    // exact — is asserted everywhere, because the EFT channel depends on it wherever
+    // it runs. A "this is BROKEN here" observation is a statement about one shader
+    // COMPILER and is asserted only where it was measured. AMD's Vulkan compiler does
+    // not reassociate this term, so on this adapter the plain form is exact and the
+    // tripwire fired for an adapter it never described. Nothing is unsound either
+    // way: the fma-barrier form stays required by construction and remains
+    // sufficient on every backend.
+    if device.adapter_info.backend == wgpu::Backend::Metal {
+        assert!(
+            !two_sum_v.pass,
+            "TRIPWIRE: the PLAIN Knuth TwoSum EFT is now bit-exact on this adapter — the \
+             compiler no longer reassociates the compensation term to zero. The fma-barrier \
+             form is then no longer required (but remains sufficient); update the EFT design."
+        );
+    } else {
+        println!(
+            "NOTE: plain Knuth TwoSum {} on {:?} — the (3) tripwire pins GB10-Vulkan/Metal \
+             compiler behavior and is not asserted here.",
+            if two_sum_v.pass {
+                "is BIT-EXACT"
+            } else {
+                "is broken by reassociation"
+            },
+            device.adapter_info.backend
+        );
+    }
 
     // (4) THE load-bearing POSITIVE result (measured 2026-07-23, GB10/Vulkan): the
     // fma-barrier TwoSum — every subtraction of the Knuth sequence routed through the
@@ -746,5 +888,56 @@ fn double_single_eft_viability_on_metal() {
         viable,
         "TRIPWIRE (bad news): double-single stopped being viable on this adapter \
          (product via {product_via}). Re-evaluate the whole EFT/double-single direction."
+    );
+
+    // (6) THE COMPOSED result (measured 2026-08-04, Apple M5 Max / Metal): with BOTH
+    // EFTs in the fma-barrier form, the 509-term double-single dot reaches df64 class
+    // (measured 3.493e-14 ≈ 2^-44.8) instead of the plain-f32 1.215e-7. This is the
+    // corroboration the per-lane verdict was missing: the EFTs survive not only in
+    // isolation but COMPOSED into a running accumulator, across 509 loop iterations,
+    // with the compiler free to reassociate the whole chain. The threshold is set two
+    // orders above the measured value and four below the broken level, so it cannot be
+    // satisfied by an accidentally-uncompensated fold.
+    let barrier_rel = rel(ds_dot_barrier);
+    assert!(
+        barrier_rel < 1e-12,
+        "TRIPWIRE (bad news): the FULLY fma-barrier double-single dot no longer composes \
+         on this adapter (rel-err {barrier_rel:.3e}, expected < 1e-12; plain-f32 level is \
+         {:.3e}). The compiler started folding the compensation ACROSS the accumulator \
+         even through fma intrinsics — double-single value arithmetic is dead here again.",
+        rel(f64::from(plain_f32_fold))
+    );
+
+    // (7) DISCRIMINATION, the other half of (6): the PLAIN `ds_add` lane must stay at the
+    // uncompensated level. If this ever tightens, the probe stopped discriminating and
+    // (6) would pass vacuously. Measured today: the plain lane is 1.215e-7, BIT-EQUAL to
+    // the host's uncompensated f32 serial fold — i.e. the legacy dot lanes deliver
+    // literally ZERO compensation, which is precisely why both of them printed the same
+    // number regardless of TwoProduct variant.
+    let plain_rel = rel(ds_dot_fma);
+    assert!(
+        plain_rel > 1e-9,
+        "TRIPWIRE (good news): the PLAIN-`ds_add` double-single dot now compensates \
+         (rel-err {plain_rel:.3e}) — the compiler stopped folding the pure-adds EFTs. \
+         Re-pin (6)'s discrimination and revisit whether the fma-barrier discipline is \
+         still required."
+    );
+
+    // (8) NEITHER barrier form ALONE is sufficient — the design constraint that both the
+    // Knuth TwoSum AND the Dekker FastTwoSum renormalization must be barriered. Measured:
+    // barrier-TwoSum-only 1.215e-7 (no gain at all), barrier-FastTwoSum-only 9.012e-8.
+    // `fast_two_sum` is pure adds and had never been probed; it is the second
+    // reassociation-sensitive site, and on its own it destroys the whole compensation.
+    // NOTE (checked 2026-08-04): no shipped shader contains a FastTwoSum — the production
+    // EFT channel accumulates residual MAGNITUDES (`r += |ep| + |es|`) and never
+    // renormalizes a double-single value, so this constraint binds the df64 VALUE
+    // direction only, not the certified-error channel already in tree.
+    assert!(
+        rel(ds_dot_bar_sum) > 1e-9 && rel(ds_dot_bar_fast) > 1e-9,
+        "TRIPWIRE (good news): a SINGLE barriered EFT now suffices for the composed dot \
+         (barrier-TwoSum-only {:.3e}, barrier-FastTwoSum-only {:.3e}) — the both-must-be-\
+         barriered constraint relaxed on this adapter; re-derive the df64 requirements.",
+        rel(ds_dot_bar_sum),
+        rel(ds_dot_bar_fast)
     );
 }

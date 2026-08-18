@@ -235,6 +235,7 @@ mod tests {
                 out_w: 64,
                 in_h: 64,
                 in_w: 64,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: vec![0.5; 24 * 64 * 64],
@@ -274,6 +275,7 @@ mod tests {
                 bias: Some(vec![0.0; 5].into()),
                 out_features: 5,
                 in_features: 50,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: vec![0.5; 50],
@@ -287,6 +289,7 @@ mod tests {
                 bias: Some(vec![0.0; 50].into()),
                 out_features: 50,
                 in_features: 50,
+                cert_err: Default::default(),
             },
         ];
         let est = estimate_crown_backward_memory(&layers, 5);
@@ -322,6 +325,7 @@ mod tests {
                 bias: Some(vec![0.0; 16].into()),
                 out_features: 16,
                 in_features: 16,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: vec![0.5; 16],

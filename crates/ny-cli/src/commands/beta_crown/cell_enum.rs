@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ndarray::{ArrayD, IxDyn};
+use ny_core::{f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up};
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_propagate::{
     BabVerificationStatus, BetaCrownResult, GraphNetwork, Interval64, Layer, NETWORK_INPUT,
@@ -83,7 +84,7 @@ pub(super) fn try_cell_enumeration(
     model_net: &BetaCrownModel,
     input_shape: &[usize],
     vnnlib: &VnnLibSpec,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Option<BetaCrownResult> {
     if std::env::var_os("NY_NO_CELL_ENUM").is_some_and(|v| v == "1") {
         return None;
@@ -113,7 +114,7 @@ pub(super) fn try_cell_enumeration(
             if stop.load(Ordering::Relaxed) {
                 return CellVerdict::Skipped;
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 deadline_hit.store(true, Ordering::Relaxed);
                 stop.store(true, Ordering::Relaxed);
                 return CellVerdict::Skipped;
@@ -154,16 +155,19 @@ pub(super) fn try_cell_enumeration(
     // claiming. The emitted witness is ALSO re-checked by the vnncomp
     // trusted-oracle ONNX-Runtime gate downstream.
     if let Some(idx) = violated_idx {
-        if let Some(result) = confirm_violation(model_net, &plan, &plan.cells[idx], vnnlib, start) {
-            return Some(result);
+        match confirm_violation(model_net, &plan, &plan.cells[idx], vnnlib, start) {
+            Ok(result) => return Some(result),
+            Err(refusal) => {
+                warn!(
+                    "Cell enumeration: interval-violating cell {:?} failed concrete \
+                     confirmation ({refusal}); treating as indeterminate",
+                    plan.cells[idx].reps
+                );
+                // Fall through as undecided — never claim SAT without a
+                // confirmed point.
+                return None;
+            }
         }
-        warn!(
-            "Cell enumeration: interval-violating cell {:?} failed concrete confirmation; \
-             treating as indeterminate",
-            plan.cells[idx].reps
-        );
-        // Fall through as undecided — never claim SAT without a confirmed point.
-        return None;
     }
 
     if deadline_hit.load(Ordering::Relaxed) || skipped > 0 {
@@ -507,6 +511,76 @@ fn unsafe_clauses(vnnlib: &VnnLibSpec) -> Vec<&[OutputConstraint]> {
     }
 }
 
+fn constraint_has_finite_constant(constraint: &OutputConstraint) -> bool {
+    match constraint {
+        OutputConstraint::LessEqConst(_, c)
+        | OutputConstraint::LessThanConst(_, c)
+        | OutputConstraint::GreaterEqConst(_, c)
+        | OutputConstraint::GreaterThanConst(_, c) => c.is_finite(),
+        _ => true,
+    }
+}
+
+/// Validate a verdict-authoritative output enclosure.
+fn valid_output_box(lower: &[f64], upper: &[f64], vnnlib: &VnnLibSpec) -> bool {
+    !lower.is_empty()
+        && lower.len() == upper.len()
+        && lower.len() == vnnlib.num_outputs
+        && lower
+            .iter()
+            .zip(upper)
+            .all(|(&lower, &upper)| lower.is_finite() && upper.is_finite() && lower <= upper)
+}
+
+/// Return whether raising a scalar box's lower bound or lowering its upper
+/// bound can structurally refute the unsafe region.
+///
+/// This is intentionally symbolic. The fractional-head verifier used to probe
+/// [`box_definitely_safe`] with infinite sentinel intervals; those malformed
+/// boxes could also be mistaken for real safety certificates.
+pub(super) fn scalar_box_safety_directions(vnnlib: &VnnLibSpec) -> (bool, bool) {
+    if vnnlib.num_outputs != 1 {
+        return (false, false);
+    }
+    let clauses = unsafe_clauses(vnnlib);
+    if clauses.is_empty()
+        || clauses.iter().any(|clause| clause.is_empty())
+        || clauses
+            .iter()
+            .flat_map(|clause| clause.iter())
+            .any(|constraint| !constraint_has_finite_constant(constraint))
+    {
+        return (false, false);
+    }
+
+    let constraint_directions = |constraint: &OutputConstraint| match constraint {
+        OutputConstraint::LessEqConst(0, _) | OutputConstraint::LessThanConst(0, _) => {
+            (true, false)
+        }
+        OutputConstraint::GreaterEqConst(0, _) | OutputConstraint::GreaterThanConst(0, _) => {
+            (false, true)
+        }
+        // A strict self-comparison is impossible for every finite scalar.
+        OutputConstraint::LessThan(0, 0) | OutputConstraint::GreaterThan(0, 0) => (true, true),
+        _ => (false, false),
+    };
+    let clause_directions = |clause: &&[OutputConstraint]| {
+        clause.iter().fold((false, false), |(raise, lower), c| {
+            let (c_raise, c_lower) = constraint_directions(c);
+            (raise || c_raise, lower || c_lower)
+        })
+    };
+    let combine = |select_raise: bool| {
+        let mut directions = clauses.iter().map(&clause_directions);
+        if vnnlib.is_disjunction {
+            directions.all(|(raise, lower)| if select_raise { raise } else { lower })
+        } else {
+            directions.any(|(raise, lower)| if select_raise { raise } else { lower })
+        }
+    };
+    (combine(true), combine(false))
+}
+
 /// A constraint DEFINITELY holds for every output in the box.
 fn constraint_definite(c: &OutputConstraint, lower: &[f64], upper: &[f64]) -> bool {
     let l = |i: usize| lower.get(i).copied();
@@ -547,8 +621,16 @@ fn constraint_impossible(c: &OutputConstraint, lower: &[f64], upper: &[f64]) -> 
 
 /// The whole output box avoids the unsafe region (cell proven safe).
 pub(super) fn box_definitely_safe(lower: &[f64], upper: &[f64], vnnlib: &VnnLibSpec) -> bool {
+    if !valid_output_box(lower, upper, vnnlib) {
+        return false;
+    }
     let clauses = unsafe_clauses(vnnlib);
-    if clauses.iter().any(|clause| clause.is_empty()) {
+    if clauses.iter().any(|clause| clause.is_empty())
+        || clauses
+            .iter()
+            .flat_map(|clause| clause.iter())
+            .any(|constraint| !constraint_has_finite_constant(constraint))
+    {
         return false; // an empty clause is trivially satisfiable: never safe
     }
     if vnnlib.is_disjunction {
@@ -570,8 +652,16 @@ pub(super) fn box_definitely_safe(lower: &[f64], upper: &[f64], vnnlib: &VnnLibS
 
 /// The whole output box lies inside the unsafe region (cell violates).
 fn box_definitely_violated(lower: &[f64], upper: &[f64], vnnlib: &VnnLibSpec) -> bool {
+    if !valid_output_box(lower, upper, vnnlib) {
+        return false;
+    }
     let clauses = unsafe_clauses(vnnlib);
-    if clauses.iter().any(|clause| clause.is_empty()) {
+    if clauses.iter().any(|clause| clause.is_empty())
+        || clauses
+            .iter()
+            .flat_map(|clause| clause.iter())
+            .any(|constraint| !constraint_has_finite_constant(constraint))
+    {
         return false;
     }
     let clause_definite =
@@ -598,6 +688,127 @@ pub(super) fn concrete_violates(output: &ArrayD<f32>, vnnlib: &VnnLibSpec) -> bo
     }
 }
 
+/// Why [`confirm_violation`] declined to build a witness for a cell the f64
+/// interval forward reported as definitely violating.
+///
+/// A lost SAT must never again be an anonymous `None`. The cctsdb_yolo_2023
+/// regression (44d9e46d) cost 28 rows and was mis-attributed for a full
+/// measurement wave to "the f32 concrete forward disagrees with the f64
+/// interval" — when the concrete forward was in fact never reached at all:
+/// the witness CONSTRUCTOR refused first. Only [`Self::ConcreteDeclines`]
+/// means what that story claimed.
+#[derive(Debug)]
+enum ConfirmRefusal {
+    /// The spec's input-bound count disagrees with the plan's.
+    SpecShape { bounds: usize, values: usize },
+    /// No f32 could represent a FIXED (declared-point) coordinate.
+    FixedCoord { dim: usize, lower: f64, upper: f64 },
+    /// No f32 could represent a FREE coordinate's cell representative.
+    FreeCoord {
+        dim: usize,
+        rep: f64,
+        lower: f64,
+        upper: f64,
+    },
+    /// The f32 witness for a free dim left the integer cell the f64 forward
+    /// certified — the piecewise-constant argument no longer covers it.
+    CellDrift { dim: usize, rep: f64, witness: f64 },
+    /// The witness vector did not reshape into the network input tensor.
+    WitnessShape,
+    /// The concrete f32 forward itself failed.
+    ConcreteForward(String),
+    /// The concrete f32 forward RAN and did not violate the spec.
+    ConcreteDeclines,
+}
+
+impl std::fmt::Display for ConfirmRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpecShape { bounds, values } => {
+                write!(f, "spec has {bounds} input bounds, plan has {values} dims")
+            }
+            Self::FixedCoord { dim, lower, upper } => write!(
+                f,
+                "no f32 lies inside the declared bounds of FIXED dim {dim} \
+                 [{lower:?}, {upper:?}] — witness never built, concrete forward NOT run"
+            ),
+            Self::FreeCoord {
+                dim,
+                rep,
+                lower,
+                upper,
+            } => write!(
+                f,
+                "no f32 lies inside the declared bounds of FREE dim {dim} \
+                 [{lower:?}, {upper:?}] for representative {rep:?}"
+            ),
+            Self::CellDrift { dim, rep, witness } => write!(
+                f,
+                "f32 witness {witness:?} for FREE dim {dim} left the integer cell of \
+                 representative {rep:?}"
+            ),
+            Self::WitnessShape => write!(f, "witness did not reshape to the network input"),
+            Self::ConcreteForward(e) => write!(f, "concrete f32 forward failed: {e}"),
+            Self::ConcreteDeclines => write!(
+                f,
+                "concrete f32 forward RAN and did not violate the spec \
+                 (genuine interval/concrete disagreement)"
+            ),
+        }
+    }
+}
+
+/// Restore the pre-44d9e46d refusal on declared-point coordinates. Diagnostic
+/// kill switch only — see [`witness_f32`] for why the strict rule is wrong.
+fn strict_declared_point_witness() -> bool {
+    std::env::var_os("NY_CELL_WITNESS_STRICT").is_some_and(|value| value == "1")
+}
+
+/// A bit-stable f32 representative of `value` for the SAT witness point.
+///
+/// Preferred: an f32 whose exact f64 decode lies inside `[lower, upper]`.
+///
+/// Fallback, for a DECLARED-POINT coordinate (`lower == upper`) whose exact
+/// decimal has no f32 preimage: the NEAREST f32. cctsdb_yolo_2023 pins all
+/// 12288 pixels with equality pairs on 8-digit `k/255` decimals — 45 of its
+/// 115 distinct literals have no f32 inside them — so a containment-only rule
+/// refuses 100% of its rows before any forward runs. That containment is also
+/// not the one the organizer checks: `SCORING-ZERO-TOL/counterexamples.py`
+/// evaluates the input asserts on the RAW parsed decimals and casts to f32
+/// only inside the ORT call, and `#witness-snap-declared` restores the
+/// declared f64 decimal verbatim before publication.
+///
+/// This is a witness CONSTRUCTOR, not a gate. Nothing here decides `sat`: the
+/// point it builds must still clear `concrete_violates` in-process, then the
+/// vnncomp trusted-ORT + true-f64 witness gate, then the bank's zero-tolerance
+/// ORT validator. Collapsing a declared point to its nearest f32 is the same
+/// collapse `vnncomp::inward_bound` already applies to a degenerate declared
+/// box, and matches what the whole pipeline feeds the f32 network anyway.
+fn witness_f32(value: f64, lower: f64, upper: f64) -> Option<f32> {
+    witness_f32_with(value, lower, upper, strict_declared_point_witness())
+}
+
+/// [`witness_f32`] with the kill switch passed explicitly, so tests pin both
+/// arms without mutating process-global environment.
+fn witness_f32_with(value: f64, lower: f64, upper: f64, strict: bool) -> Option<f32> {
+    if let Some(contained) = [f64_to_f32_down(value), f64_to_f32_up(value)]
+        .into_iter()
+        .find(|candidate| {
+            let decoded = f32_to_f64_exact(*candidate);
+            candidate.is_finite() && decoded >= lower && decoded <= upper
+        })
+    {
+        return Some(contained);
+    }
+    // Only a DECLARED POINT may collapse: a non-degenerate box that still
+    // admits no f32 is pathological and keeps failing closed.
+    if lower == upper && !strict {
+        let nearest = value as f32;
+        return nearest.is_finite().then_some(nearest);
+    }
+    None
+}
+
 /// Confirm an interval-violating cell with a concrete forward and build the
 /// `Violated` result whose witness the vnncomp ORT gate re-checks.
 fn confirm_violation(
@@ -606,27 +817,72 @@ fn confirm_violation(
     cell: &Cell,
     vnnlib: &VnnLibSpec,
     start: Instant,
-) -> Option<BetaCrownResult> {
+) -> Result<BetaCrownResult, ConfirmRefusal> {
     // f32 witness point: nearest-rounded per dim. The free-dim representative
     // v + 0.5 is exactly representable; fixed dims land within the widened
     // input box the rest of the pipeline uses.
-    let mut values_f32: Vec<f32> = plan.base_values.iter().map(|&v| v as f32).collect();
-    for (slot, &dim) in plan.free_dims.iter().enumerate() {
-        values_f32[dim] = cell.reps[slot] as f32;
+    if vnnlib.input_bounds.len() != plan.base_values.len() {
+        return Err(ConfirmRefusal::SpecShape {
+            bounds: vnnlib.input_bounds.len(),
+            values: plan.base_values.len(),
+        });
     }
-    let point = ArrayD::from_shape_vec(IxDyn(&plan.input_shape), values_f32.clone()).ok()?;
-    let input = ny_tensor::BoundedTensor::concrete(point).ok()?;
-    let output = match model_net {
-        BetaCrownModel::Sequential(network) => {
-            network.propagate_concrete_point(&input, None).ok()?
+    let mut values_f32: Vec<f32> = Vec::with_capacity(plan.base_values.len());
+    for (dim, (&value, &(lower, upper))) in plan
+        .base_values
+        .iter()
+        .zip(&vnnlib.input_bounds)
+        .enumerate()
+    {
+        values_f32.push(
+            witness_f32(value, lower, upper).ok_or(ConfirmRefusal::FixedCoord {
+                dim,
+                lower,
+                upper,
+            })?,
+        );
+    }
+    for (slot, &dim) in plan.free_dims.iter().enumerate() {
+        let (lower, upper) = vnnlib.input_bounds[dim];
+        let rep = cell.reps[slot];
+        let candidate = witness_f32(rep, lower, upper).ok_or(ConfirmRefusal::FreeCoord {
+            dim,
+            rep,
+            lower,
+            upper,
+        })?;
+        // Load-bearing: the f64 forward certified the integer cell of `rep`,
+        // so the f32 witness must land in that SAME cell for the
+        // piecewise-constant argument to transfer. Never relaxed.
+        let decoded = f32_to_f64_exact(candidate);
+        if decoded.trunc() != rep.trunc() {
+            return Err(ConfirmRefusal::CellDrift {
+                dim,
+                rep,
+                witness: decoded,
+            });
         }
-        BetaCrownModel::Graph(graph) => graph.propagate_concrete_point(&input, None, None).ok()?,
+        values_f32[dim] = candidate;
+    }
+    let point = ArrayD::from_shape_vec(IxDyn(&plan.input_shape), values_f32.clone())
+        .map_err(|_| ConfirmRefusal::WitnessShape)?;
+    let input =
+        ny_tensor::BoundedTensor::concrete(point).map_err(|_| ConfirmRefusal::WitnessShape)?;
+    let output = match model_net {
+        BetaCrownModel::Sequential(network) => network
+            .propagate_concrete_point(&input, None)
+            .map_err(|e| ConfirmRefusal::ConcreteForward(e.to_string()))?,
+        BetaCrownModel::Graph(graph) => graph
+            .propagate_concrete_point(&input, None, None)
+            .map_err(|e| ConfirmRefusal::ConcreteForward(e.to_string()))?,
     };
     let output_center = output.center();
+    // THE GATE. Unchanged, never optional: an unconfirmed cell can never
+    // become a `sat`.
     if !concrete_violates(&output_center, vnnlib) {
-        return None;
+        return Err(ConfirmRefusal::ConcreteDeclines);
     }
-    Some(BetaCrownResult {
+    Ok(BetaCrownResult {
         result: BabVerificationStatus::Violated {
             counterexample: values_f32,
             output: output_center.iter().copied().collect(),

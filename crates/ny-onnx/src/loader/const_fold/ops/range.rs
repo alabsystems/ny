@@ -22,7 +22,9 @@ use crate::WeightStore;
 use ndarray::{ArrayD, IxDyn};
 use tracing::{debug, warn};
 
-use super::super::common::read_tensor_i64s;
+use super::super::common::{
+    exact_f32_product, exact_f32_quotient, exact_f32_sum, read_tensor_i64s,
+};
 use super::super::FoldedTensor;
 
 /// Cap on the number of elements a folded `Range` may materialize. Mirrors the
@@ -34,15 +36,21 @@ pub(super) fn try_fold(
     node: &onnx_proto::NodeProto,
     weights: &WeightStore,
 ) -> Option<FoldedTensor> {
-    if node.op_type != "Range" || node.input.len() < 3 {
+    if node.op_type != "Range"
+        || node.input.len() != 3
+        || node.input.iter().any(String::is_empty)
+        || !node.attribute.is_empty()
+    {
         return None;
     }
 
-    // Try the exact integer path first: Range outputs are overwhelmingly index
-    // sequences, and integral start/limit/delta let us produce an exact i64
-    // payload with no f32 rounding.
-    if let Some(folded) = try_fold_integer(node, weights) {
-        return Some(folded);
+    let integer_evidence = node.input[..3].iter().any(|name| {
+        weights.get_integers(name).is_some() || weights.get_integer_range(name).is_some()
+    });
+    if integer_evidence {
+        // Once any operand carries integer provenance, failure must not fall
+        // through to its lossy f32 compatibility mirror.
+        return try_fold_integer(node, weights);
     }
 
     try_fold_float(node, weights)
@@ -68,6 +76,12 @@ fn read_scalar_i64(weights: &WeightStore, name: &str) -> Option<i64> {
 }
 
 fn try_fold_integer(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Option<FoldedTensor> {
+    let integer_range = weights.get_integer_range(&node.input[0])?;
+    if weights.get_integer_range(&node.input[1]) != Some(integer_range)
+        || weights.get_integer_range(&node.input[2]) != Some(integer_range)
+    {
+        return None;
+    }
     let start = read_scalar_i64(weights, &node.input[0])?;
     let limit = read_scalar_i64(weights, &node.input[1])?;
     let delta = read_scalar_i64(weights, &node.input[2])?;
@@ -105,7 +119,7 @@ fn try_fold_integer(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Opti
         return Some(FoldedTensor {
             float_data: empty_f32,
             integer_data: Some(empty_i64),
-            integer_range: None,
+            integer_range: Some(integer_range),
         });
     }
 
@@ -136,7 +150,7 @@ fn try_fold_integer(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Opti
     Some(FoldedTensor {
         float_data,
         integer_data: Some(integer_data),
-        integer_range: None,
+        integer_range: Some(integer_range),
     })
 }
 
@@ -154,15 +168,18 @@ fn try_fold_float(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Option
         return None;
     }
 
-    // ONNX: number_of_elements = max(ceil((limit - start) / delta), 0).
-    let ratio = ((limit - start) / delta) as f64;
+    // Authenticate the exact-real span and quotient before using them to
+    // decide sequence length. A rounded value on either side of an integer
+    // boundary can otherwise add or remove a Range element.
+    let span = exact_f32_sum(limit, -start)?;
+    let ratio = exact_f32_quotient(span, delta)?;
     let count_f = ratio.ceil();
     if !count_f.is_finite() || count_f <= 0.0 {
         debug!("Range constant fold: empty/degenerate float sequence; producing empty tensor");
         let empty = ArrayD::from_shape_vec(IxDyn(&[0]), Vec::<f32>::new()).ok()?;
         return Some(FoldedTensor::from_float(empty));
     }
-    if count_f > MAX_RANGE_ELEMENTS as f64 {
+    if count_f > MAX_RANGE_ELEMENTS as f32 {
         warn!(
             "Range constant fold: refusing to allocate {} elements (limit {})",
             count_f, MAX_RANGE_ELEMENTS
@@ -173,11 +190,11 @@ fn try_fold_float(node: &onnx_proto::NodeProto, weights: &WeightStore) -> Option
 
     let mut values = Vec::with_capacity(count);
     for i in 0..count {
-        // Compute each element as start + i*delta rather than accumulating, to
-        // avoid compounding floating-point round-off across the sequence. This
-        // matches the per-index formulation used by reference Range
-        // implementations.
-        values.push(start + (i as f32) * delta);
+        // MAX_RANGE_ELEMENTS is below 2^24, so i is exactly binary32. Require
+        // both the product and addition to be exactly representable before
+        // publishing the sequence as frozen point constants.
+        let offset = exact_f32_product(i as f32, delta)?;
+        values.push(exact_f32_sum(start, offset)?);
     }
     let float_data = ArrayD::from_shape_vec(IxDyn(&[count]), values).ok()?;
     debug!("Constant folded Range (float): {} elements", count);
@@ -206,6 +223,7 @@ mod tests {
             name.to_string(),
             ArrayD::from_shape_vec(IxDyn(&[]), vec![value]).unwrap(),
         );
+        weights.insert_integer_range(name.to_string(), i64::MIN, i64::MAX);
     }
 
     #[test]
@@ -216,6 +234,7 @@ mod tests {
         insert_i64_scalar(&mut weights, "delta", 1);
         let node = scalar_node("start", "limit", "delta");
         let folded = try_fold(&node, &weights).expect("integer Range should fold");
+        assert_eq!(folded.integer_range, Some((i64::MIN, i64::MAX)));
         let ints = folded.integer_data.expect("integer payload preserved");
         assert_eq!(ints.as_slice().unwrap(), &[0, 1, 2, 3, 4]);
         assert_eq!(
@@ -301,6 +320,19 @@ mod tests {
     }
 
     #[test]
+    fn range_float_rejects_inexact_sequence_arithmetic() {
+        let mut weights = WeightStore::new();
+        weights.insert("start".to_string(), arr0(0.1_f32).into_dyn());
+        weights.insert("limit".to_string(), arr0(0.5_f32).into_dyn());
+        weights.insert("delta".to_string(), arr0(0.1_f32).into_dyn());
+        let node = scalar_node("start", "limit", "delta");
+        assert!(
+            try_fold(&node, &weights).is_none(),
+            "rounded float Range arithmetic must remain explicit"
+        );
+    }
+
+    #[test]
     fn range_non_scalar_input_skipped() {
         let mut weights = WeightStore::new();
         weights.insert(
@@ -323,8 +355,8 @@ mod tests {
         assert!(try_fold(&node, &weights).is_none());
     }
 
-    // read_scalar_i64 reads through read_tensor_i64s' f32 fallback when no exact
-    // integer payload is stored; assert it still produces exact small integers.
+    // Integral FLOAT inputs still use the authenticated float path; they must
+    // not acquire integer provenance merely because their values look whole.
     #[test]
     fn range_integer_via_f32_fallback() {
         let mut weights = WeightStore::new();
@@ -335,6 +367,7 @@ mod tests {
         weights.insert("delta".to_string(), arr0(1.0_f32).into_dyn());
         let node = scalar_node("start", "limit", "delta");
         let folded = try_fold(&node, &weights).unwrap();
-        assert_eq!(folded.integer_data.unwrap().as_slice().unwrap(), &[0, 1, 2]);
+        assert!(folded.integer_data.is_none());
+        assert_eq!(folded.float_data.as_slice().unwrap(), &[0.0, 1.0, 2.0]);
     }
 }

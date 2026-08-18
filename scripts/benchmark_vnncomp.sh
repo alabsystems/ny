@@ -7,7 +7,7 @@
 # Reads instances.csv and runs beta-crown on each instance, reporting results.
 #
 # Usage:
-#   scripts/benchmark_vnncomp.sh <category> [--pgd] [--branching input] [--backend wgpu] [--compare-backends] [--domain-batch-metrics] [--no-preset] [--complete-verifier mip] [--start-at N] [--limit N]
+#   scripts/benchmark_vnncomp.sh <category> [--competition-wrapper] [--pgd] [--branching input] [--backend wgpu] [--compare-backends] [--domain-batch-metrics] [--no-preset] [--complete-verifier mip] [--start-at N] [--limit N]
 #
 # Examples:
 #   scripts/benchmark_vnncomp.sh malbeware --pgd
@@ -19,11 +19,11 @@
 
 set -euo pipefail
 
-CATEGORY="${1:?Usage: benchmark_vnncomp.sh <category> [--pgd] [--branching METHOD] [--backend BACKEND] [--compare-backends] [--domain-batch-metrics] [--no-preset] [--start-at N] [--limit N]}"
+CATEGORY="${1:?Usage: benchmark_vnncomp.sh <category> [--competition-wrapper] [--pgd] [--branching METHOD] [--backend BACKEND] [--compare-backends] [--domain-batch-metrics] [--no-preset] [--start-at N] [--limit N]}"
 shift
 
 BENCH_ROOT="${BENCH_ROOT:-benchmarks/vnncomp2025/benchmarks}"
-BENCH_DIR="$BENCH_ROOT/$CATEGORY"
+BENCH_DIR="${BENCH_DIR:-$BENCH_ROOT/$CATEGORY}"
 # Track whether the caller explicitly set NY_BIN for provenance tagging (#4346)
 NY_BIN_EXPLICIT=""
 if [[ -n "${NY_BIN:-}" ]]; then
@@ -31,7 +31,8 @@ if [[ -n "${NY_BIN:-}" ]]; then
 fi
 NY_BIN="${NY_BIN:-./target/release/ny}"
 PRESET_DIR="configs/vnncomp25"
-REPORT_DIR="reports/benchmarks"
+PRESET_PATH_OVERRIDE="${PRESET_PATH_OVERRIDE:-}"
+REPORT_DIR="${REPORT_DIR:-reports/benchmarks}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_SIGNAL_RETRIES="${MAX_SIGNAL_RETRIES:-1}"
 EXTERNAL_TIMEOUT_SLACK="${EXTERNAL_TIMEOUT_SLACK:-5}"
@@ -39,10 +40,12 @@ WATCHDOG_TERM_GRACE="${WATCHDOG_TERM_GRACE:-2}"
 NO_PRESET=false
 COMPARE_BACKENDS=false
 DOMAIN_BATCH_METRICS=false
+COMPETITION_WRAPPER=false
+STRATEGY_OVERRIDE_REQUESTED=false
 CATEGORY_EXTRA_FLAGS=""
 CATEGORY_DEFAULT_BRANCHING=""
 DOMAIN_BATCH_METRICS_ROOT=""
-DOMAIN_BATCH_METRICS_FLAG=""
+DOMAIN_BATCH_METRICS_ARGS=()
 LAST_DOMAIN_BATCH_METRICS_JSONL=""
 
 # Parse optional flags
@@ -54,14 +57,15 @@ START_AT=1
 LIMIT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --pgd) PGD_FLAG="--pgd-attack"; shift ;;
-        --branching) BRANCHING_FLAG="--branching $2"; shift 2 ;;
-        --backend) BACKEND_FLAG="--backend $2"; shift 2 ;;
+        --competition-wrapper) COMPETITION_WRAPPER=true; shift ;;
+        --pgd) PGD_FLAG="--pgd-attack"; STRATEGY_OVERRIDE_REQUESTED=true; shift ;;
+        --branching) BRANCHING_FLAG="--branching $2"; STRATEGY_OVERRIDE_REQUESTED=true; shift 2 ;;
+        --backend) BACKEND_FLAG="--backend $2"; STRATEGY_OVERRIDE_REQUESTED=true; shift 2 ;;
         --compare-backends) COMPARE_BACKENDS=true; shift ;;
         --domain-batch-metrics) DOMAIN_BATCH_METRICS=true; shift ;;
         --no-preset) NO_PRESET=true; shift ;;
-        --complete-verifier) VERIFIER_FLAG="--complete-verifier $2"; shift 2 ;;
-        --mip-solver) VERIFIER_FLAG="$VERIFIER_FLAG --mip-solver $2"; shift 2 ;;
+        --complete-verifier) VERIFIER_FLAG="--complete-verifier $2"; STRATEGY_OVERRIDE_REQUESTED=true; shift 2 ;;
+        --mip-solver) VERIFIER_FLAG="$VERIFIER_FLAG --mip-solver $2"; STRATEGY_OVERRIDE_REQUESTED=true; shift 2 ;;
         --start-at) START_AT="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -94,7 +98,7 @@ fi
 # --complete-verifier explicitly. (#3218, #2569)
 if [[ -z "$VERIFIER_FLAG" ]]; then
     case "$CATEGORY" in
-        sat_relu|malbeware|safenlp_2024|relusplitter)
+        sat_relu|malbeware|safenlp_2024|relusplitter|relusplitter_2026)
             VERIFIER_FLAG="--complete-verifier mip"
             ;;
     esac
@@ -137,13 +141,35 @@ if [[ "$COMPARE_BACKENDS" == "true" && -n "$BACKEND_FLAG" ]]; then
     echo "--compare-backends cannot be combined with --backend"
     exit 1
 fi
+if [[ "$COMPETITION_WRAPPER" == "true" ]]; then
+    if [[ "$COMPARE_BACKENDS" == "true" || "$DOMAIN_BATCH_METRICS" == "true" ]]; then
+        echo "--competition-wrapper cannot be combined with diagnostic compare/metrics modes"
+        exit 1
+    fi
+    if [[ "$STRATEGY_OVERRIDE_REQUESTED" == "true" || "$NO_PRESET" == "true" ]]; then
+        echo "--competition-wrapper owns preset/backend/branching/verifier/attack policy; diagnostic strategy overrides are not accepted"
+        exit 1
+    fi
+fi
 
 # Auto-detect preset unless explicitly disabled.
-PRESET=""
 PRESET_PATH=""
-if [[ "$NO_PRESET" == "false" && -f "$PRESET_DIR/$CATEGORY.yaml" ]]; then
+PRESET_ARGS=()
+WRAPPER_CONFIGS_ARGS=()
+if [[ "$NO_PRESET" == "false" && -n "$PRESET_PATH_OVERRIDE" ]]; then
+    if [[ ! -f "$PRESET_PATH_OVERRIDE" ]]; then
+        echo "Preset override not found: $PRESET_PATH_OVERRIDE"
+        exit 1
+    fi
+    PRESET_PATH="$PRESET_PATH_OVERRIDE"
+    PRESET_ARGS=(--preset "$PRESET_PATH")
+    WRAPPER_CONFIGS_ARGS=(
+        --configs-dir
+        "$(dirname "$(dirname "$PRESET_PATH")")"
+    )
+elif [[ "$NO_PRESET" == "false" && -f "$PRESET_DIR/$CATEGORY.yaml" ]]; then
     PRESET_PATH="$PRESET_DIR/$CATEGORY.yaml"
-    PRESET="--preset $PRESET_PATH"
+    PRESET_ARGS=(--preset "$PRESET_PATH")
 fi
 
 mkdir -p "$REPORT_DIR"
@@ -157,8 +183,18 @@ if [[ "$DOMAIN_BATCH_METRICS" == "true" ]]; then
     DOMAIN_BATCH_METRICS_ROOT="$REPORT_DIR/domain_batch_metrics/${CATEGORY}_${TIMESTAMP}"
     mkdir -p "$DOMAIN_BATCH_METRICS_ROOT"
 fi
-TMPOUT=$(mktemp)
-trap "rm -f $TMPOUT" EXIT
+BENCHMARK_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ny-benchmark-vnncomp.XXXXXX")
+TMPOUT="$BENCHMARK_TMP_DIR/ny.stdout"
+VNNCOMP_RESULTS_FILE="$BENCHMARK_TMP_DIR/vnncomp.results"
+: > "$TMPOUT"
+cleanup_benchmark_tmp() {
+    if [[ -n "${WATCHDOG_MARKER:-}" ]]; then
+        rm -f -- "$WATCHDOG_MARKER"
+    fi
+    rm -f -- "$TMPOUT" "$VNNCOMP_RESULTS_FILE"
+    rmdir -- "$BENCHMARK_TMP_DIR" 2>/dev/null || true
+}
+trap cleanup_benchmark_tmp EXIT
 
 WATCHDOG_TIMEOUT_HIT=0
 WATCHDOG_TIMEOUT_LIMIT=0
@@ -172,6 +208,13 @@ source "$SCRIPT_DIR/benchmark_vnncomp_helpers.sh"
 # Compute binary provenance once at startup (#4346)
 compute_ny_provenance "$NY_BIN" "$NY_BIN_EXPLICIT"
 PROVENANCE_NOTES=$(format_provenance_tags)
+if [[ "$COMPETITION_WRAPPER" == "true" ]]; then
+    EXECUTION_SURFACE="ny-vnncomp-competition-wrapper"
+    PROVENANCE_NOTES="${PROVENANCE_NOTES}; execution_surface=${EXECUTION_SURFACE}; score_projection=modeled-only; organizer_results=not-bound"
+else
+    EXECUTION_SURFACE="beta-crown-diagnostic"
+    PROVENANCE_NOTES="${PROVENANCE_NOTES}; execution_surface=${EXECUTION_SURFACE}; score_claim_eligible=false"
+fi
 # Stamp compare-backends invocations with a compare_run_id (#4383)
 if [[ "$COMPARE_BACKENDS" == "true" ]]; then
     COMPARE_RUN_ID="${CATEGORY}_${TIMESTAMP}"
@@ -185,14 +228,14 @@ prepare_domain_batch_metrics_for_run() {
     local backend_suffix="${backend_name:-default}"
 
     LAST_DOMAIN_BATCH_METRICS_JSONL=""
-    DOMAIN_BATCH_METRICS_FLAG=""
+    DOMAIN_BATCH_METRICS_ARGS=()
     if [[ "$DOMAIN_BATCH_METRICS" != "true" ]]; then
         return 0
     fi
 
     local metrics_path="$DOMAIN_BATCH_METRICS_ROOT/${CATEGORY}_row${source_index}_${backend_suffix}.jsonl"
     LAST_DOMAIN_BATCH_METRICS_JSONL=$(to_repo_relative_path "$metrics_path")
-    DOMAIN_BATCH_METRICS_FLAG="--domain-batch-metrics-jsonl $metrics_path"
+    DOMAIN_BATCH_METRICS_ARGS=(--domain-batch-metrics-jsonl "$metrics_path")
 }
 
 notes_with_domain_batch_metrics() {
@@ -255,16 +298,24 @@ if [[ "$NO_PRESET" == "true" ]]; then
 else
     echo "Preset: ${PRESET_PATH:-none}"
 fi
-echo "PGD: ${PGD_FLAG:-disabled}"
-echo "Branching: ${BRANCHING_FLAG:-default}"
-if [[ "$COMPARE_BACKENDS" == "true" ]]; then
-    echo "Backend: compare cpu vs wgpu"
+if [[ "$COMPETITION_WRAPPER" == "true" ]]; then
+    echo "Strategy: competition wrapper owns preset/backend/branching/verifier/attack policy"
+    echo "Backend: auto"
+    echo "Verifier: auto"
+    echo "Category flags: wrapper-owned"
 else
-    echo "Backend: ${BACKEND_FLAG:-default}"
+    echo "PGD: ${PGD_FLAG:-disabled}"
+    echo "Branching: ${BRANCHING_FLAG:-default}"
+    if [[ "$COMPARE_BACKENDS" == "true" ]]; then
+        echo "Backend: compare cpu vs wgpu"
+    else
+        echo "Backend: ${BACKEND_FLAG:-default}"
+    fi
+    echo "Verifier: ${VERIFIER_FLAG:-bab}"
+    echo "Category flags: ${CATEGORY_EXTRA_FLAGS:-none}"
 fi
-echo "Verifier: ${VERIFIER_FLAG:-bab}"
-echo "Category flags: ${CATEGORY_EXTRA_FLAGS:-none}"
 echo "Domain-batch metrics: ${DOMAIN_BATCH_METRICS}"
+echo "Execution surface: ${EXECUTION_SURFACE}"
 echo "Start at: $START_AT"
 echo "Limit: ${LIMIT:-0}"
 echo "Binary: $NY_BIN (source=$NY_SOURCE, sha256=${NY_SHA256:0:16}...)"
@@ -394,7 +445,9 @@ while IFS=',' read -r onnx vnnlib timeout; do
         DOMAINS="$LAST_DOMAINS"
         ACTUAL_METHOD="$LAST_ACTUAL_METHOD"
         BACKEND_NAME="${BACKEND_FLAG#--backend }"
-        if [[ -z "$BACKEND_NAME" ]]; then
+        if [[ "$COMPETITION_WRAPPER" == "true" ]]; then
+            BACKEND_NAME="auto"
+        elif [[ -z "$BACKEND_NAME" ]]; then
             BACKEND_NAME="cpu"
         fi
         NOTES=$(notes_with_domain_batch_metrics "$PROVENANCE_NOTES" "$LAST_DOMAIN_BATCH_METRICS_JSONL")

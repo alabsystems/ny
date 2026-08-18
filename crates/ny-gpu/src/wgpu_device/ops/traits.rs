@@ -119,6 +119,7 @@ impl AcceleratedBoundPropagation for WgpuDevice {
 }
 
 impl WgpuDevice {
+    #[cfg(all(test, feature = "gpu-tests"))]
     pub(crate) fn linear_ibp(
         &self,
         input: &BoundedTensor,
@@ -136,6 +137,7 @@ impl WgpuDevice {
         <Self as AcceleratedBoundPropagation>::matmul_ibp(self, input_a, input_b)
     }
 
+    #[cfg(all(test, feature = "gpu-tests"))]
     pub(crate) fn crown_per_position_parallel(
         &self,
         graph: &GraphNetwork,

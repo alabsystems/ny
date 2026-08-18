@@ -22,7 +22,7 @@ fn make_node(op: &str, inputs: &[&str], outputs: &[&str]) -> NodeProto {
 fn make_int_attr(name: &str, value: i64) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        i: value,
+        i: Some(value),
         ..Default::default()
     }
 }

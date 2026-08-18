@@ -10,7 +10,7 @@
 //! with the CPU sequential baseline (engine=None, batch_size=1).
 //!
 //! Part of #3397 (GPU CROWN backward).
-//! Part of #3872 (cuts-enabled GPU batched coverage).
+//! Part of #3872 (historical cuts-enabled GPU batched coverage, now quarantined).
 
 use super::prelude::*;
 use ny_core::NaiveCpuGemmEngine;
@@ -291,18 +291,11 @@ fn test_engine_with_batch_1_uses_sequential_path_3397() {
     );
 }
 
-/// GPU batched path with cuts-enabled must match CPU sequential with cuts-enabled.
-///
-/// Part of #3813: the GPU batched path now accepts a read-only cut pool and
-/// applies existing cuts during CROWN backward propagation. This test verifies
-/// that enabling cuts on the GPU batched path produces the same verification
-/// status as the CPU sequential path with cuts enabled.
-///
-/// Acceptance criterion 1 from #3872: exercises the multi-objective GPU batched
-/// path with an active GraphCutPool containing real cuts.
+/// Both sequential and batched multi-objective entry points must reject cut
+/// proof authority before any certificate-bearing bound is computed.
 #[ntest::timeout(60000)]
 #[test]
-fn test_gpu_batched_multi_objective_cuts_parity_3872() {
+fn test_multi_objective_cut_authority_is_quarantined_3872() {
     let (graph, input) = build_multi_relu_graph_for_gpu_parity();
 
     let objectives = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0_f32]];
@@ -314,7 +307,7 @@ fn test_gpu_batched_multi_objective_cuts_parity_3872() {
     let max_domains = 1000;
     let max_depth = 20;
 
-    // CPU sequential with cuts (baseline)
+    // CPU sequential with cuts.
     let cpu_config = BetaCrownConfig {
         timeout,
         max_domains,
@@ -323,7 +316,7 @@ fn test_gpu_batched_multi_objective_cuts_parity_3872() {
         enable_cuts: true,
         ..Default::default()
     };
-    let cpu_result = BetaCrownVerifier::new(cpu_config)
+    let cpu_error = BetaCrownVerifier::new(cpu_config)
         .verify_graph_relu_split_multi_objective_with_engine(
             &graph,
             &input,
@@ -332,7 +325,7 @@ fn test_gpu_batched_multi_objective_cuts_parity_3872() {
             None,
             None,
         )
-        .expect("CPU sequential+cuts should not error");
+        .expect_err("CPU sequential cut authority must be quarantined");
 
     // GPU batched with cuts
     let gpu_config = BetaCrownConfig {
@@ -344,7 +337,7 @@ fn test_gpu_batched_multi_objective_cuts_parity_3872() {
         ..Default::default()
     };
     let engine = NaiveCpuGemmEngine;
-    let gpu_result = BetaCrownVerifier::new(gpu_config)
+    let gpu_error = BetaCrownVerifier::new(gpu_config)
         .verify_graph_relu_split_multi_objective_with_engine(
             &graph,
             &input,
@@ -353,36 +346,27 @@ fn test_gpu_batched_multi_objective_cuts_parity_3872() {
             Some(&engine),
             None,
         )
-        .expect("GPU batched+cuts should not error");
+        .expect_err("GPU batched cut authority must be quarantined");
 
-    let cpu_status = status_category(&cpu_result.result);
-    let gpu_status = status_category(&gpu_result.result);
-    assert_eq!(
-        cpu_status,
-        gpu_status,
-        "GPU batched+cuts status ({:?}) must match CPU sequential+cuts ({:?}).\n\
-         CPU: cuts_generated={}, explored={}, verified={}\n\
-         GPU: cuts_generated={}, explored={}, verified={}",
-        gpu_result.result,
-        cpu_result.result,
-        cpu_result.cuts_generated,
-        cpu_result.domains_explored,
-        cpu_result.domains_verified,
-        gpu_result.cuts_generated,
-        gpu_result.domains_explored,
-        gpu_result.domains_verified,
-    );
+    for error in [cpu_error, gpu_error] {
+        assert!(
+            error
+                .to_string()
+                .contains("cut proof authority is quarantined"),
+            "unexpected validation error: {error}"
+        );
+    }
 }
 
 /// Run GPU batched multi-objective verification with given config overrides.
 ///
-/// Uses threshold -0.2 to force BaB exploration beyond the root domain,
-/// ensuring cuts are actually generated and applied when `enable_cuts=true`.
+/// Uses threshold -0.2 to force BaB exploration beyond the root domain when
+/// cuts are disabled. A cut-enabled request returns the quarantine error.
 fn run_gpu_batched_multi_objective(
     graph: &GraphNetwork,
     input: &BoundedTensor,
     enable_cuts: bool,
-) -> crate::beta_crown::result::BetaCrownResult {
+) -> ny_core::Result<crate::beta_crown::result::BetaCrownResult> {
     let objectives = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0_f32]];
     let thresholds = vec![-0.2_f32, -0.2];
     let config = BetaCrownConfig {
@@ -394,97 +378,48 @@ fn run_gpu_batched_multi_objective(
         ..Default::default()
     };
     let engine = NaiveCpuGemmEngine;
-    BetaCrownVerifier::new(config)
-        .verify_graph_relu_split_multi_objective_with_engine(
-            graph,
-            input,
-            &objectives,
-            &thresholds,
-            Some(&engine),
-            None,
-        )
-        .expect("GPU batched multi-objective should not error")
+    BetaCrownVerifier::new(config).verify_graph_relu_split_multi_objective_with_engine(
+        graph,
+        input,
+        &objectives,
+        &thresholds,
+        Some(&engine),
+        None,
+    )
 }
 
-/// Cuts-enabled GPU batched path must verify at least as well as cuts-disabled.
-///
-/// Cutting planes can only tighten CROWN relaxations, never loosen them.
-/// If the cuts-disabled path verifies, the cuts-enabled path must also verify.
-///
-/// Acceptance criterion 2 from #3872: bounds with cuts are at least as tight
-/// as bounds without cuts.
+/// The supported no-cuts lane remains available while the cut lane refuses
+/// proof authority.
 #[ntest::timeout(60000)]
 #[test]
-fn test_gpu_batched_multi_objective_cuts_tighten_3872() {
+fn test_gpu_batched_multi_objective_no_cuts_remains_available_3872() {
     let (graph, input) = build_multi_relu_graph_for_gpu_parity();
 
-    let no_cuts = run_gpu_batched_multi_objective(&graph, &input, false);
-    let with_cuts = run_gpu_batched_multi_objective(&graph, &input, true);
-
-    // Cuts can only tighten bounds, so the outcome must not degrade.
-    // BaB exploration order may differ due to cut-tightened bounds changing
-    // the priority queue ordering, so exact domain counts may vary.
-    // Use status_rank() instead of assert_eq! because cuts may *improve*
-    // the outcome (e.g., Unknown → Verified), which is correct behavior
-    // that a strict equality check would incorrectly reject.
+    run_gpu_batched_multi_objective(&graph, &input, false)
+        .expect("no-cuts multi-objective verification should remain available");
+    let error = run_gpu_batched_multi_objective(&graph, &input, true)
+        .expect_err("cut-enabled multi-objective verification must be quarantined");
     assert!(
-        status_rank(&with_cuts.result) >= status_rank(&no_cuts.result),
-        "Cuts-enabled should not degrade verification outcome.\n\
-         No-cuts: {:?} (rank={}), explored={}, verified={}\n\
-         Cuts:    {:?} (rank={}), explored={}, verified={}, cuts_generated={}",
-        no_cuts.result,
-        status_rank(&no_cuts.result),
-        no_cuts.domains_explored,
-        no_cuts.domains_verified,
-        with_cuts.result,
-        status_rank(&with_cuts.result),
-        with_cuts.domains_explored,
-        with_cuts.domains_verified,
-        with_cuts.cuts_generated,
+        error
+            .to_string()
+            .contains("cut proof authority is quarantined"),
+        "unexpected validation error: {error}"
     );
 }
 
-/// GPU batched path with cuts generates cuts from verified batch children.
-///
-/// The #3813 outer-loop code in verify.rs (lines 605-611) generates cuts from
-/// verified children returned by the batched GPU processing. This test
-/// verifies that code path is exercised: cuts_generated must be > 0 when
-/// the BaB loop produces verified domains at depth >= min_cut_depth (2).
-///
-/// Acceptance criterion 3 from #3872: cut generation from verified batch
-/// children in the outer loop.
+/// No cut generation may begin before the quarantine gate rejects the request.
 #[ntest::timeout(60000)]
 #[test]
-fn test_gpu_batched_multi_objective_cut_generation_3872() {
+fn test_gpu_batched_multi_objective_cut_generation_is_blocked_3872() {
     let (graph, input) = build_multi_relu_graph_for_gpu_parity();
 
-    // Uses the shared helper (threshold -0.2, batch_size=4, enable_cuts=true)
-    // which forces BaB exploration beyond the root domain. After 2+ splits,
-    // sub-domains verify at depth >= min_cut_depth (2), triggering
-    // GraphCutPool::add_from_verified_domain in the outer loop.
-    let result = run_gpu_batched_multi_objective(&graph, &input, true);
-
-    // The BaB loop should explore domains deep enough to generate cuts.
-    // With 8 ReLU neurons and thresholds -0.2, BaB must split several
-    // times before sub-domains verify, producing verified domains at
-    // depth >= 2 that feed into GraphCutPool::add_from_verified_domain.
+    let error = run_gpu_batched_multi_objective(&graph, &input, true)
+        .expect_err("cut generation must be blocked by validation");
     assert!(
-        result.cuts_generated > 0,
-        "GPU batched+cuts must generate cuts from verified domains.\n\
-         Status: {:?}, explored={}, verified={}, cuts_generated={}.\n\
-         If cuts_generated is 0, the outer-loop cut generation code \
-         (verify.rs #3813 change) was not exercised.",
-        result.result,
-        result.domains_explored,
-        result.domains_verified,
-        result.cuts_generated,
-    );
-
-    // Sanity: verify the property was actually explored (not trivially decided).
-    assert!(
-        result.domains_explored > 1,
-        "BaB should explore more than the root domain, got explored={}",
-        result.domains_explored,
+        error
+            .to_string()
+            .contains("cut proof authority is quarantined"),
+        "unexpected validation error: {error}"
     );
 }
 
@@ -498,23 +433,6 @@ fn status_category(status: &BabVerificationStatus) -> &'static str {
         BabVerificationStatus::Unknown { .. } => "Unknown",
         BabVerificationStatus::Timeout => "Timeout",
         BabVerificationStatus::Violated { .. } => "Violated",
-        BabVerificationStatus::PotentialViolation => "PotentialViolation",
-    }
-}
-
-/// Numeric rank for verification outcomes, higher = stronger result.
-///
-/// Used by `cuts_tighten` to assert that enabling cuts does not degrade
-/// the verification outcome. Cuts can only tighten CROWN relaxations, so
-/// the outcome with cuts should be at least as strong as without cuts.
-///
-/// Ranking: Verified (3) > Unknown/Timeout (2) > PotentialViolation (1) > Violated (0).
-/// Unknown and Timeout are both "inconclusive" and ranked equally.
-fn status_rank(status: &BabVerificationStatus) -> u8 {
-    match status {
-        BabVerificationStatus::Verified => 3,
-        BabVerificationStatus::Unknown { .. } | BabVerificationStatus::Timeout => 2,
-        BabVerificationStatus::PotentialViolation => 1,
-        BabVerificationStatus::Violated { .. } => 0,
+        BabVerificationStatus::PotentialViolation { .. } => "PotentialViolation",
     }
 }

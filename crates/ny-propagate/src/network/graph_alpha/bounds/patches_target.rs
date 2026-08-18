@@ -4,6 +4,52 @@
 
 use super::*;
 
+/// Fraction of the CPU dense budget above which a target's dense backward pair
+/// is treated as expensive enough to prefer the patches representation, even
+/// though it still fits (#conv-crown-residual).
+///
+/// At the 2 GiB default this puts the crossover at 128 MiB per pair — large
+/// enough that small conv targets (oval21, mnist_fc-scale) keep their existing
+/// dense route byte-for-byte, small enough to catch the mid-size ResNet conv
+/// targets that dominate the cifar100/tinyimagenet gap.
+const PATCHES_COST_ADMISSION_DIVISOR: usize = 16;
+
+/// Absolute byte threshold above which a target's dense backward pair is
+/// treated as expensive enough to prefer patches (#conv-crown-residual).
+///
+/// #threshold-vs-adaptive-budget: this is deliberately denominated against the
+/// FIXED `DEFAULT_CROWN_DENSE_BUDGET_MB`, not against the live
+/// `cpu_crown_dense_budget_bytes()`. The divisor was calibrated on 2026-07-27
+/// against a budget that was then a hard-coded 2 GiB, and its docstring pins the
+/// intended crossover at 128 MiB per pair. On 2026-07-29 the dense budget became
+/// HOST-ADAPTIVE (`clamp(observed/2, 2 GiB, 12 GiB)`), which silently dragged
+/// this crossover along with it: on a 24 GiB host the budget resolves to 6 GiB
+/// and the crossover moved 128 MiB -> 402 MiB, i.e. the admission got 3x LOOSER
+/// on exactly the machines with more memory to spend.
+///
+/// Measured consequence: CIFAR100_resnet_medium's largest demanded target
+/// (target_dim 14400 over conv_in_size 3072) has a dense pair of 353_894_400 B.
+/// Under the calibrated 128 MiB crossover it is admitted to patches; under the
+/// drifted 402 MiB one it is not — which is precisely the state this constant
+/// was added to fix (its own comment: "every target takes the slow dense path
+/// and the residual-Add patches route above is DEAD CODE on that whole
+/// benchmark"). A cost threshold must not move when an unrelated MEMORY budget
+/// learns to measure its host.
+pub(super) fn patches_cost_admission_threshold_bytes() -> usize {
+    (crate::network::crown_memory::DEFAULT_CROWN_DENSE_BUDGET_MB * 1024 * 1024)
+        / patches_cost_admission_divisor()
+}
+
+/// Experiment override for the cost-admission threshold
+/// (`NY_PATCHES_COST_DIVISOR`). Absent ⇒ the compiled default, byte-identical.
+fn patches_cost_admission_divisor() -> usize {
+    std::env::var("NY_PATCHES_COST_DIVISOR")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(PATCHES_COST_ADMISSION_DIVISOR)
+}
+
 pub(super) fn patches_dense_fallback_details(
     bounds: &CrownBounds,
     site: &'static str,
@@ -111,12 +157,60 @@ impl GraphNetwork {
             .map(|required| required > budget)
             .unwrap_or(false);
 
-        (dense_identity_exceeds_budget || dense_backward_exceeds_budget)
-            && bounds.shape().len() == 3
+        // COST admission (#conv-crown-residual). Both conditions above are
+        // *OOM* triggers: they admit patches only once the dense pair no longer
+        // FITS. But dense is the wrong choice long before it stops fitting —
+        // patches are 50-500x cheaper wherever the composed receptive field is
+        // still small, and the CPU dense conv backward is the measured
+        // bottleneck (the relusplitter preset records 257.56 s CPU vs 12.97 s
+        // GPU for exactly this GEMM).
+        //
+        // The consequence of admitting on OOM alone is stark: on
+        // `CIFAR100_resnet_medium` NOT ONE of the 11 demanded targets qualifies
+        // at the default 2 GiB budget (largest is target_dim 14400 → a 1.659 GB
+        // identity pair and a 0.354 GB backward pair), so every target takes the
+        // slow dense path and the residual-`Add` patches route above is dead
+        // code on that whole benchmark.
+        //
+        // So also admit when the dense backward pair is merely EXPENSIVE. This
+        // is safe in both directions:
+        // - Tightness: for many-row seeds the patches bound is bit-equivalent to
+        //   dense within 1e-5 (`crown_patches.rs:29`). The one case where dense
+        //   is genuinely tighter — thin seeds through overlapping receptive
+        //   fields (#cgan-alpha-on-tight-refs) — is excluded by the same
+        //   `patches_reentry_min_rows()` floor the Dense→Patches re-entry uses.
+        // - Cost: if patches stop paying off mid-walk, the per-step crossover
+        //   (`would_conv_compose_cover_input`, `patches_step.rs:327`) converts to
+        //   dense at exactly that point, so an early patches start is
+        //   self-correcting rather than a commitment.
+        //
+        // This is a pure widening: every target admitted before is still
+        // admitted.
+        let dense_backward_cost_prefers_patches = target_dim
+            >= crate::network::core::graph::backward_helpers::patches_reentry_min_rows()
             && self
-                .nodes
-                .get(node_name)
-                .is_some_and(|node| node.inputs.len() == 1)
+                .deepest_conv_ancestor_in_size(node_name)
+                .and_then(|conv_in_size| {
+                    crate::network::crown_memory::dense_pair_bytes(target_dim, conv_in_size)
+                })
+                .map(|required| required > patches_cost_admission_threshold_bytes())
+                .unwrap_or(false);
+
+        // The walk starts AT the target (`ancestors()` is inclusive, see
+        // `traversal.rs:60`), so its first backward step crosses the target
+        // node's own layer — the target must therefore be a node the patches
+        // step can consume. Historically that meant strictly single-input,
+        // which excluded every residual `Add` from ever seeding in patches. On a
+        // ResNet the demanded pre-activation targets frequently ARE the residual
+        // `Add`s, so that exclusion densified them unconditionally
+        // (#conv-crown-residual, docs/PATCHES_RESIDUAL_ADD_ROOT_CAUSE_2026-07-27.md).
+        (dense_identity_exceeds_budget
+            || dense_backward_exceeds_budget
+            || dense_backward_cost_prefers_patches)
+            && bounds.shape().len() == 3
+            && self.nodes.get(node_name).is_some_and(
+                crate::network::core::graph::backward_helpers::node_admits_patches_backward_step,
+            )
             && self
                 .ancestors(node_name)
                 .map(|relevant_nodes| {

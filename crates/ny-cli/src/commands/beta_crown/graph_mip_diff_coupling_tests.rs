@@ -12,19 +12,25 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
 use ny_core::Bound;
+#[cfg(test)]
 use ny_propagate::layers::{AddConstantLayer, LinearLayer, ReLULayer};
-use ny_propagate::{build_difference_network, GraphNetwork, GraphNode, Layer, NETWORK_INPUT};
+use ny_propagate::{build_difference_network, NETWORK_INPUT};
+#[cfg(test)]
+use ny_propagate::{GraphNetwork, GraphNode, Layer};
+#[cfg(test)]
 use ny_tensor::BoundedTensor;
 
-use super::{
-    apply_diff_coupling, attach_diff_coupling, compute_difference_bounds, detect_prefixes,
-};
+#[cfg(test)]
+use super::apply_diff_coupling;
+use super::{attach_diff_coupling, compute_difference_bounds, detect_prefixes};
 
 /// A tiny 2-input → 3-hidden(ReLU) → 2-output MLP with bias folded as a separate
 /// `AddConstant` node (mirrors the ACAS ONNX shape: Linear = matmul, AddConstant
 /// = bias). Weights/bias are caller-supplied so a partner net can perturb them.
+#[cfg(test)]
 fn mlp(w1: [[f32; 2]; 3], b1: [f32; 3], w2: [[f32; 3]; 2], b2: [f32; 2]) -> GraphNetwork {
     let mut g = GraphNetwork::new();
     g.try_add_node(GraphNode::from_input(
@@ -61,6 +67,7 @@ fn mlp(w1: [[f32; 2]; 3], b1: [f32; 3], w2: [[f32; 3]; 2], b2: [f32; 2]) -> Grap
     g
 }
 
+#[cfg(test)]
 fn base_f() -> GraphNetwork {
     mlp(
         [[0.7, -0.3], [0.2, 0.9], [-0.5, 0.4]],
@@ -71,6 +78,7 @@ fn base_f() -> GraphNetwork {
 }
 
 /// Near-equal partner (small per-weight perturbation) — the isomorphic case.
+#[cfg(test)]
 fn perturbed_g(eps: f32) -> GraphNetwork {
     mlp(
         [
@@ -87,11 +95,13 @@ fn perturbed_g(eps: f32) -> GraphNetwork {
     )
 }
 
+#[cfg(test)]
 fn input_box() -> Vec<Bound> {
     vec![Bound::new(-1.0, 1.0), Bound::new(-0.5, 1.5)]
 }
 
 /// Faithful concrete forward of a single point through a net.
+#[cfg(test)]
 fn forward_point(graph: &GraphNetwork, values: &[f32]) -> Vec<f32> {
     let arr = ArrayD::from_shape_vec(IxDyn(&[values.len()]), values.to_vec()).unwrap();
     let pt = BoundedTensor::concrete(arr).unwrap();
@@ -101,6 +111,7 @@ fn forward_point(graph: &GraphNetwork, values: &[f32]) -> Vec<f32> {
 
 /// Stamp 1-D declared shapes on every node from its box (mirrors the finisher,
 /// which the encoder requires for exact index/broadcast math).
+#[cfg(test)]
 fn stamp_shapes(diff: &mut GraphNetwork, flat: &HashMap<String, Vec<Bound>>) {
     for (name, v) in flat {
         if diff.declared_shape(name).is_none() {
@@ -111,6 +122,7 @@ fn stamp_shapes(diff: &mut GraphNetwork, flat: &HashMap<String, Vec<Bound>>) {
 
 /// CROWN-IBP per-node boxes over the input box, flattened — the boxes the
 /// finisher feeds the encoder (and the coupling's magnitude bounds).
+#[cfg(test)]
 fn flat_bounds_of(diff: &GraphNetwork, input_bounds: &[Bound]) -> HashMap<String, Vec<Bound>> {
     let input = ny_propagate::Verifier::bounds_to_tensor(input_bounds, None).unwrap();
     let nb = diff.collect_node_bounds(&input).unwrap();
@@ -337,26 +349,15 @@ fn coupling_rows_are_emitted_and_finite() {
     assert!(od.iter().all(|d| d.is_finite()));
 }
 
-/// #rel-diff-coupling MEASUREMENT (ignored by default — needs the benchmark
-/// ONNX; run with `--ignored --nocapture`). On the REAL instance_0 diff net,
+/// #rel-diff-coupling MEASUREMENT. On the REAL instance_0 diff net,
 /// compare the LP-relaxation (triangle) bound on `diff_output` WITHOUT vs WITH
 /// the difference-coupling rows, and against the ±band. This is the honest test
 /// of whether the coupling lets the output band propagate back through the
 /// relaxation — the box widths do NOT shrink (coupling adds rows, not tighter
 /// per-neuron boxes), so the lever must show up in the OUTPUT LP bound.
-#[cfg(feature = "mip")]
-#[test]
-#[ignore = "requires benchmark ONNX; run explicitly"]
-fn measure_output_lp_shrink_on_real_instance0() {
-    use std::path::PathBuf;
+pub(crate) fn measure_output_lp_shrink_on_real_instance0(base: &std::path::Path) {
     use std::time::{Duration, Instant};
 
-    let base = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-        .join("benchmarks/vnncomp2026/benchmarks/isomorphic_acasxu_2026/2.0");
-    if !base.is_dir() {
-        eprintln!("benchmarks absent; skipping");
-        return;
-    }
     let f = base.join("onnx/original/ACASXU_run2a_2_4_batch_2000.onnx");
     let g = base.join("onnx/perturbed/ACASXU_run2a_2_4_batch_2000_perturbed_0.onnx");
     let vnnlib = base.join("vnnlib/instance_0.vnnlib");

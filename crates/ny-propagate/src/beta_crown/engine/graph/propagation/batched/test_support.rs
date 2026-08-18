@@ -102,6 +102,10 @@ impl BetaCrownVerifier {
         // Extract beta_states for the internal backward pass
         let beta_states: Vec<Option<&GraphBetaState>> =
             domain_data.iter().map(|(_, _, bs, _)| *bs).collect();
+        let histories: Vec<&GraphSplitHistory> = domain_data
+            .iter()
+            .map(|(_, history, _, _)| *history)
+            .collect();
 
         // No alpha states in deprecated tuple API — use empty
         let alpha_states: Vec<Option<&GraphDomainAlphaState>> = vec![None; n_domains];
@@ -113,6 +117,7 @@ impl BetaCrownVerifier {
             plan,
             &bounds_caches,
             &constrained_inputs,
+            &histories,
             &beta_states,
             &alpha_states,
             objective,

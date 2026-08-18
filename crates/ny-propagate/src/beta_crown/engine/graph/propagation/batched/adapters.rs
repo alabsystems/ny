@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 use crate::batched_domain::BatchedDomains;
 use crate::beta_crown::domain::GraphBabDomain;
+use crate::beta_crown::engine::graph::adaptive_microbatch::MicrobatchRefusalReason;
 use crate::beta_crown::engine::graph::DomainCrownResult;
 use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::faer_parallelism::RayonTaskGuard;
@@ -168,17 +169,7 @@ impl BetaCrownVerifier {
                     bounds_caches.push(cache);
                     constrained_inputs.push(input);
                 }
-                Err(e) if e.is_infeasible_domain() => {
-                    // #2926: Propagate InfeasibleDomain without type erasure.
-                    // The caller's fallback path handles this correctly.
-                    return Err(e);
-                }
-                Err(e) => {
-                    return Err(NyError::InvalidSpec(format!(
-                        "Forward pass failed for domain {}: {}",
-                        i, e
-                    )));
-                }
+                Err(e) => return Err(contextualize_forward_domain_error(i, e)),
             }
         }
 
@@ -190,6 +181,7 @@ impl BetaCrownVerifier {
             plan,
             &bounds_caches,
             &constrained_inputs,
+            &ctx.histories,
             &ctx.beta_states,
             &ctx.alpha_states,
             objective,
@@ -277,5 +269,113 @@ impl BetaCrownVerifier {
         let timing = result.stage_timing;
         let results = result.results.into_iter().map(Some).collect();
         Ok((results, timing))
+    }
+}
+
+/// Contextualize a failed per-domain forward pass without erasing typed
+/// control-flow variants.
+///
+/// - `InfeasibleDomain` / `DeadlineExceeded` stay BARE: the caller prunes
+///   InfeasibleDomain and translates DeadlineExceeded into a graceful timeout,
+///   and neither `is_infeasible_domain` nor `is_deadline_exceeded` recurses
+///   through wrappers.
+/// - #oom-shrink-retry: refusals recognized by
+///   `MicrobatchRefusalReason::from_error` keep their typed variant inside a
+///   `LayerError` shell (which `from_error` recurses through), so the opted-in
+///   adaptive-microbatch lanes can shrink-retry the same ordered domains
+///   instead of taking the non-shrinking fallback. Delegating the guard to
+///   `from_error` itself pins the preserved set to exactly what the
+///   classifier acts on.
+/// - Everything else keeps the historical contextualized InvalidSpec.
+fn contextualize_forward_domain_error(domain_idx: usize, error: NyError) -> NyError {
+    if error.is_infeasible_domain() || error.is_deadline_exceeded() {
+        return error;
+    }
+    if MicrobatchRefusalReason::from_error(&error).is_some() {
+        return NyError::LayerError {
+            layer_index: domain_idx,
+            layer_type: format!("batched CROWN forward pass (domain {domain_idx})"),
+            source: Box::new(error),
+        };
+    }
+    NyError::InvalidSpec(format!(
+        "Forward pass failed for domain {domain_idx}: {error}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #oom-shrink-retry: the forward wrap used to stringify memory refusals
+    /// into InvalidSpec, so `MicrobatchRefusalReason::from_error` one frame up
+    /// never saw them and the opted-in controller lanes took the non-shrinking
+    /// fallback. No GPU exists on this box, so a runtime wgpu OOM cannot be
+    /// exercised; type preservation through the mapping the production forward
+    /// loop calls is what is testable.
+    #[test]
+    fn forward_domain_error_keeps_gpu_memory_refusal_classifiable() {
+        let error = contextualize_forward_domain_error(
+            3,
+            NyError::GpuMemoryExceeded {
+                required_bytes: 2,
+                budget_bytes: 1,
+            },
+        );
+        assert_eq!(
+            MicrobatchRefusalReason::from_error(&error),
+            Some(MicrobatchRefusalReason::DeviceAllocation),
+            "GpuMemoryExceeded must reach the shrink-retry classifier intact: {error:?}"
+        );
+        let NyError::LayerError {
+            layer_index,
+            layer_type,
+            source,
+        } = error
+        else {
+            panic!("preserved refusal should carry domain context via LayerError");
+        };
+        assert_eq!(layer_index, 3);
+        assert!(
+            layer_type.contains("domain 3"),
+            "missing domain context: {layer_type}"
+        );
+        assert!(matches!(*source, NyError::GpuMemoryExceeded { .. }));
+    }
+
+    /// Companion control: unrelated errors keep the historical InvalidSpec
+    /// contextualization, and bare control-flow variants stay bare.
+    #[test]
+    fn forward_domain_error_still_contextualizes_unrelated_errors() {
+        let error =
+            contextualize_forward_domain_error(0, NyError::InvalidConfig("bad alpha".into()));
+        assert!(
+            MicrobatchRefusalReason::from_error(&error).is_none(),
+            "unrelated errors must not become retryable refusals"
+        );
+        let NyError::InvalidSpec(message) = error else {
+            panic!("unrelated forward failures must still contextualize as InvalidSpec");
+        };
+        assert!(
+            message.contains("Forward pass failed for domain 0"),
+            "missing domain context: {message}"
+        );
+        assert!(
+            message.contains("bad alpha"),
+            "missing original diagnostic: {message}"
+        );
+
+        let error =
+            contextualize_forward_domain_error(1, NyError::InfeasibleDomain("empty".into()));
+        assert!(
+            error.is_infeasible_domain(),
+            "InfeasibleDomain must stay bare"
+        );
+
+        let error = contextualize_forward_domain_error(1, NyError::DeadlineExceeded("late".into()));
+        assert!(
+            error.is_deadline_exceeded(),
+            "DeadlineExceeded must stay bare"
+        );
     }
 }

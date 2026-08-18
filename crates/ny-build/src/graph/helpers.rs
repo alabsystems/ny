@@ -29,24 +29,6 @@ pub(super) fn resolve_tensor_node_name(
     }
 }
 
-pub(super) fn resolve_tensor_node_name_via_first_producer(
-    tensor_name: &str,
-    tensor_to_node: &HashMap<String, String>,
-    tensor_producer: &HashMap<String, String>,
-) -> Option<String> {
-    let mut current = tensor_producer.get(tensor_name)?.as_str();
-    let mut seen = HashSet::from([tensor_name.to_string()]);
-    loop {
-        if let Some(node_name) = tensor_to_node.get(current) {
-            return Some(node_name.clone());
-        }
-        if !seen.insert(current.to_string()) {
-            return None;
-        }
-        current = tensor_producer.get(current)?;
-    }
-}
-
 pub(super) fn find_activation_inputs(
     inputs: &[String],
     weights: &WeightStore,
@@ -252,6 +234,13 @@ pub(super) struct SplitBuildContext<'a> {
 }
 
 fn parse_constant_split_sizes(spec: &LayerSpec, split_tensor: &ArrayD<f32>) -> Result<Vec<usize>> {
+    if split_tensor.ndim() != 1 {
+        return Err(NyError::ModelLoad(format!(
+            "Split '{}' partition sizes must be a 1-D tensor, got shape {:?}",
+            spec.name,
+            split_tensor.shape()
+        )));
+    }
     split_tensor
         .iter()
         .map(|&value| {
@@ -262,9 +251,15 @@ fn parse_constant_split_sizes(spec: &LayerSpec, split_tensor: &ArrayD<f32>) -> R
                 )));
             }
             let rounded = value.round();
-            if (value - rounded).abs() > 1.0e-4 || rounded < 0.0 {
+            if value != rounded || rounded < 0.0 {
                 return Err(NyError::ModelLoad(format!(
                     "Split '{}' has invalid split size {value}",
+                    spec.name
+                )));
+            }
+            if rounded >= i64::MAX as f32 {
+                return Err(NyError::ModelLoad(format!(
+                    "Split '{}' split size {rounded} is outside the non-saturating i64 range",
                     spec.name
                 )));
             }
@@ -283,6 +278,13 @@ fn parse_integer_constant_split_sizes(
     spec: &LayerSpec,
     split_tensor: &ArrayD<i64>,
 ) -> Result<Vec<usize>> {
+    if split_tensor.ndim() != 1 {
+        return Err(NyError::ModelLoad(format!(
+            "Split '{}' partition sizes must be a 1-D tensor, got shape {:?}",
+            spec.name,
+            split_tensor.shape()
+        )));
+    }
     split_tensor
         .iter()
         .map(|&value| {
@@ -327,8 +329,19 @@ fn split_axis_from_spec(
     tensor_shapes: &HashMap<String, Vec<i64>>,
 ) -> Result<i32> {
     let onnx_axis = match spec.attributes.get("axis") {
-        Some(AttributeValue::Int(axis)) => *axis as i32,
-        _ => 0,
+        Some(AttributeValue::Int(axis)) => i32::try_from(*axis).map_err(|_| {
+            NyError::ModelLoad(format!(
+                "Split '{}': axis {} is outside the supported i32 range",
+                spec.name, axis
+            ))
+        })?,
+        None => 0,
+        Some(other) => {
+            return Err(NyError::ModelLoad(format!(
+                "Split '{}': invalid axis attribute {:?}",
+                spec.name, other
+            )))
+        }
     };
     // Recorded ONNX rank of the data input. Mirrors
     // `ConvertContext::recorded_onnx_rank`, including the source priority:
@@ -411,6 +424,13 @@ fn resolve_split_sizes(
     inputs: &[TensorSpec],
     tensor_shapes: &HashMap<String, Vec<i64>>,
 ) -> Result<Option<Vec<usize>>> {
+    let split_input_name = spec.inputs.get(1).filter(|name| !name.is_empty());
+    if spec.attributes.contains_key("split") && split_input_name.is_some() {
+        return Err(NyError::UnsupportedConfiguration(format!(
+            "Split '{}' supplies partition sizes as both an attribute and an input",
+            spec.name
+        )));
+    }
     // Try attribute-based form first (older opsets or early opset>=13 fallback)
     match spec.attributes.get("split") {
         Some(AttributeValue::Ints(splits)) => splits
@@ -425,11 +445,23 @@ fn resolve_split_sizes(
             })
             .collect::<Result<Vec<usize>>>()
             .map(Some),
-        _ => {
+        None => {
             // Try input-based form (opset>=13): split partition sizes are an input tensor
-            if let Some(split_input_name) = spec.inputs.get(1).filter(|name| !name.is_empty()) {
+            if let Some(split_input_name) = split_input_name {
                 // First try int64 integers store (opset>=13 Split uses int64)
                 if let Some(split_tensor) = weights.get_integers(split_input_name) {
+                    if weights
+                        .get(split_input_name)
+                        .is_some_and(|floats| floats.shape() != split_tensor.shape())
+                    {
+                        return Err(NyError::ModelLoad(format!(
+                            "Split '{}': exact integer partition tensor '{}' has shape {:?}, but its float view has shape {:?}",
+                            spec.name,
+                            split_input_name,
+                            split_tensor.shape(),
+                            weights.get(split_input_name).map(|tensor| tensor.shape()).unwrap_or(&[])
+                        )));
+                    }
                     return Ok(Some(parse_integer_constant_split_sizes(
                         spec,
                         split_tensor,
@@ -442,10 +474,10 @@ fn resolve_split_sizes(
                 if let Some(split_tensor) = evaluated_constants.get(split_input_name) {
                     return Ok(Some(parse_constant_split_sizes(spec, split_tensor)?));
                 }
-                warn!(
-                    "Split op '{}' missing constant split sizes, using equal splits",
-                    spec.name
-                );
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "Split '{}' requires partition-size input '{}' to be constant",
+                    spec.name, split_input_name
+                )));
             } else {
                 warn!(
                     "Split op '{}' missing 'split' attribute, using equal splits",
@@ -464,7 +496,22 @@ fn resolve_split_sizes(
                 tensor_shapes,
             ))
         }
+        Some(other) => Err(NyError::ModelLoad(format!(
+            "Split '{}': invalid split attribute {:?}",
+            spec.name, other
+        ))),
     }
+}
+
+fn checked_split_total(spec: &LayerSpec, split_sizes: &[usize]) -> Result<usize> {
+    split_sizes.iter().try_fold(0usize, |total, &size| {
+        total.checked_add(size).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "Split '{}': partition-size sum overflows usize",
+                spec.name
+            ))
+        })
+    })
 }
 
 pub(super) fn evaluate_constant_split_outputs(
@@ -514,7 +561,7 @@ pub(super) fn evaluate_constant_split_outputs(
     }
 
     let axis_len = input.shape()[resolved_axis];
-    let total_split: usize = split_sizes.iter().sum();
+    let total_split = checked_split_total(spec, &split_sizes)?;
     if total_split != axis_len {
         return Err(NyError::ModelLoad(format!(
             "Split '{}': split sizes {:?} sum to {}, expected axis length {}",
@@ -525,7 +572,12 @@ pub(super) fn evaluate_constant_split_outputs(
     let mut start = 0usize;
     let mut outputs = Vec::with_capacity(spec.outputs.len());
     for (output_name, &size) in spec.outputs.iter().zip(split_sizes.iter()) {
-        let end = start + size;
+        let end = start.checked_add(size).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "Split '{}': slice endpoint overflows usize",
+                spec.name
+            ))
+        })?;
         let slice = input
             .slice_axis(Axis(resolved_axis), Slice::from(start..end))
             .to_owned();
@@ -611,7 +663,7 @@ pub(super) fn handle_split_layer(
         split_ctx.inputs,
         split_ctx.tensor_shapes,
     )? {
-        let total_split: usize = split_sizes.iter().sum();
+        let total_split = checked_split_total(spec, &split_sizes)?;
         if total_split != axis_len {
             return Err(NyError::ModelLoad(format!(
                 "Split '{}': split sizes {:?} sum to {}, expected axis length {}",
@@ -641,7 +693,12 @@ pub(super) fn handle_split_layer(
 
     let mut start = 0usize;
     for (index, (output_name, &size)) in spec.outputs.iter().zip(split_sizes.iter()).enumerate() {
-        let end = start + size;
+        let end = start.checked_add(size).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "Split '{}': slice endpoint overflows usize",
+                spec.name
+            ))
+        })?;
         let slice_name = format!("{}_slice_{}", spec.name, index);
         let slice_layer = Layer::Slice(SliceLayer::new(axis, start, end));
         let node = GraphNode::new(slice_name.clone(), slice_layer, vec![input_node.clone()]);
@@ -791,6 +848,74 @@ mod split_axis0_tests {
                 ("split".to_string(), AttributeValue::Ints(splits)),
             ]),
         }
+    }
+
+    #[test]
+    fn split_rejects_adjacent_non_integer_size() {
+        let spec = split_spec(1, "x", vec![], vec!["a"]);
+        let value = f32::from_bits(1.0_f32.to_bits() + 1);
+        let sizes = ArrayD::from_shape_vec(IxDyn(&[1]), vec![value]).unwrap();
+        assert!(parse_constant_split_sizes(&spec, &sizes).is_err());
+    }
+
+    #[test]
+    fn split_rejects_float_size_that_would_saturate_to_i64_max() {
+        let spec = split_spec(1, "x", vec![], vec!["a"]);
+        let sizes = ArrayD::from_shape_vec(IxDyn(&[1]), vec![i64::MAX as f32]).unwrap();
+        assert!(parse_constant_split_sizes(&spec, &sizes).is_err());
+    }
+
+    #[test]
+    fn split_rejects_axis_that_would_wrap_to_i32() {
+        let spec = split_spec(4_294_967_297, "x", vec![1], vec!["a"]);
+        let weights = WeightStore::new();
+        let evaluated = HashMap::new();
+        let shapes = HashMap::from([("x".to_string(), vec![1, 1])]);
+        let err = split_axis_from_spec(&spec, &weights, &evaluated, &shapes).unwrap_err();
+        assert!(err.to_string().contains("i32 range"));
+    }
+
+    #[test]
+    fn split_rejects_dynamic_partition_input() {
+        let mut spec = split_spec(1, "x", vec![], vec!["a", "b"]);
+        spec.attributes.remove("split");
+        spec.inputs.push("runtime_sizes".to_string());
+        let weights = WeightStore::new();
+        let evaluated = HashMap::new();
+        let inputs = Vec::new();
+        let shapes = HashMap::from([("x".to_string(), vec![1, 6])]);
+        let err =
+            resolve_split_sizes(&spec, -1, &weights, &evaluated, &inputs, &shapes).unwrap_err();
+        assert!(err.to_string().contains("to be constant"));
+    }
+
+    #[test]
+    fn split_rejects_mismatched_exact_and_float_shapes() {
+        let mut spec = split_spec(1, "x", vec![], vec!["a", "b"]);
+        spec.attributes.remove("split");
+        spec.inputs.push("sizes".to_string());
+        let mut weights = WeightStore::new();
+        weights.insert(
+            "sizes".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![3.0]).unwrap(),
+        );
+        weights.insert_integers(
+            "sizes".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![3, 3]).unwrap(),
+        );
+        let evaluated = HashMap::new();
+        let inputs = Vec::new();
+        let shapes = HashMap::from([("x".to_string(), vec![1, 6])]);
+        let err =
+            resolve_split_sizes(&spec, -1, &weights, &evaluated, &inputs, &shapes).unwrap_err();
+        assert!(err.to_string().contains("float view"));
+    }
+
+    #[test]
+    fn split_rejects_partition_sum_overflow() {
+        let spec = split_spec(1, "x", vec![], vec!["a", "b"]);
+        let err = checked_split_total(&spec, &[usize::MAX, 1]).unwrap_err();
+        assert!(err.to_string().contains("sum overflows"));
     }
 
     /// A rank-1 (no batch axis) tensor `[6]` with axis=0 Split loads WITHOUT the

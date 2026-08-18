@@ -1,0 +1,20 @@
+{
+  "benchmark_git_head": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+  "benchmark_manifest_sha256": "6ddbe9fee725c98b458be9bfb0ec7d96c1dac7b64261f34a16adb75dc86d770b",
+  "canonical_selected_inputs_sha256": "8513cf63b600b05f306cc0732292f0eb8d1df135d1c5c60fa54e9e03bce0d9dc",
+  "official_git_head": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+  "official_results_manifest_sha256": "44892af2dc2577947791d58e0a8b2507a3b08c11a4705fb02c7d4ee489b1e345",
+  "schema": "ny_cifar100_attack_fast_kernels_canonical_inputs_v1",
+  "selected_model": {
+    "asset": "CIFAR100_resnet_large.onnx",
+    "logical_name": "CIFAR100_resnet_large.onnx",
+    "sha256": "5747c00f20d8458b60da85c6ae446b4689409307146ca02f439277fbb7d89f16",
+    "size": 15243961
+  },
+  "selected_vnnlib_count": 30,
+  "source": {
+    "benchmark_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+    "official_results_repository": "https://github.com/VNN-COMP/vnncomp2025_results.git"
+  },
+  "targets_csv_sha256": "fbdd383b5510fa76da2dcac6808737272d5b797b42a2df9a756a49c614b78225"
+}

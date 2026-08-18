@@ -5,19 +5,21 @@
 use super::apply::{apply_clip_preset, apply_preset, parse_reduce_op};
 use super::branching::parse_branching_method;
 use super::*;
-use ny_propagate::{BetaCrownConfig, BranchingHeuristic, InputClipType, KfsbReduceOp};
+use ny_propagate::{
+    BetaCrownConfig, BranchingHeuristic, DepthTwoBranchLookaheadConfig,
+    DepthTwoBranchLookaheadMode, InputClipType, KfsbReduceOp,
+};
 use std::path::Path;
 use tempfile::tempdir;
 
 /// Determine if PGD attack should be enabled based on preset.
 ///
-/// Returns `Some(false)` for "skip"/"none"/"disabled", `Some(true)` for "before"/"middle"/"after".
+/// Returns the enablement of a valid executable initial schedule.
 fn should_enable_pgd(preset: &PresetConfig) -> Option<bool> {
-    preset
-        .attack
-        .pgd_order
-        .as_ref()
-        .map(|order| !matches!(order.to_lowercase().as_str(), "skip" | "none" | "disabled"))
+    resolve_initial_pgd_schedule(preset)
+        .ok()
+        .flatten()
+        .map(|schedule| !matches!(schedule, ResolvedInitialPgdSchedule::Disabled))
 }
 
 #[test]
@@ -132,6 +134,82 @@ fn resolve_branching_uses_relu_split_from_preset() {
 }
 
 #[test]
+fn resolve_branching_nonlinear_method_selects_genbab_ml4acopf() {
+    // `method: nonlinear` (alpha-beta-CROWN's GenBaB token; alias `genbab`)
+    // must resolve to GenBaB on the graph ReLU-split route (#ml4acopf-genbab).
+    for method in ["nonlinear", "genbab", "NONLINEAR"] {
+        let preset = PresetConfig {
+            bab: BabPreset {
+                branching: BranchingPreset {
+                    method: Some(method.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let branching = resolve_branching(&preset)
+            .unwrap()
+            .expect("preset branching should resolve");
+        assert!(
+            matches!(branching.heuristic, BranchingHeuristic::GenBaB(_)),
+            "preset method '{method}' should resolve to GenBaB"
+        );
+        assert!(
+            branching.use_relu_split,
+            "GenBaB runs in the graph engine: use_relu_split must be true"
+        );
+    }
+}
+
+#[test]
+fn resolve_branching_explicit_method_wins_over_nonlinear_split_ml4acopf() {
+    // Documented precedence: an explicit `method` always wins over an implicit
+    // `nonlinear_split` section. `method: input` + populated nonlinear_split
+    // keeps input splitting — GenBaB must be named via `method: nonlinear`.
+    // (This was the ml4acopf silent-never-GenBaB trap: the preset carried both.)
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                method: Some("input".to_string()),
+                nonlinear_split: NonlinearSplitPreset {
+                    filter: Some(true),
+                    filter_beta: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let branching = resolve_branching(&preset)
+        .unwrap()
+        .expect("preset branching should resolve");
+    assert!(
+        matches!(branching.heuristic, BranchingHeuristic::InputSplit),
+        "explicit method: input must keep input splitting"
+    );
+}
+
+#[test]
+fn vnncomp25_ml4acopf_preset_selects_genbab() {
+    // The shipped ml4acopf_2024 preset must actually route to GenBaB — the
+    // 2026-07 regression was a preset that requested GenBaB via nonlinear_split
+    // but pinned `method: input`, so GenBaB was silently never selected.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let preset = load_preset(&repo_root.join("configs/vnncomp25/ml4acopf_2024.yaml")).unwrap();
+    let branching = resolve_branching(&preset)
+        .unwrap()
+        .expect("ml4acopf preset branching should resolve");
+    assert!(
+        matches!(branching.heuristic, BranchingHeuristic::GenBaB(_)),
+        "ml4acopf_2024.yaml must select GenBaB branching"
+    );
+    assert!(branching.use_relu_split);
+}
+
+#[test]
 fn apply_preset_sets_solver_build_batch_size_4354() {
     let preset = PresetConfig {
         solver: SolverPreset {
@@ -148,6 +226,31 @@ fn apply_preset_sets_solver_build_batch_size_4354() {
         config.build_batch_size,
         Some(128),
         "solver.build_batch_size should map onto BetaCrownConfig::build_batch_size"
+    );
+}
+
+/// #ml4acopf-bab-queue-mem: `bab.max_queue_bytes` arms the graph ReLU-split
+/// queue's byte budget, and a preset that omits it leaves the queue unlimited
+/// (0), i.e. byte-identical to today for every category that does not opt in.
+#[test]
+fn apply_preset_propagates_max_queue_bytes_and_defaults_to_unlimited() {
+    let armed = PresetConfig {
+        bab: BabPreset {
+            max_queue_bytes: Some(2 * 1024 * 1024 * 1024),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).expect("bab.max_queue_bytes should apply cleanly");
+    assert_eq!(config.max_queue_bytes, 2 * 1024 * 1024 * 1024);
+
+    let omitted = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &omitted).expect("omitted key should apply cleanly");
+    assert_eq!(
+        config.max_queue_bytes, 0,
+        "presets that omit bab.max_queue_bytes must keep the unlimited queue"
     );
 }
 
@@ -258,6 +361,90 @@ bab:
 }
 
 #[test]
+fn preset_yaml_rejects_unknown_keys_at_every_mapping_level() {
+    let cases = [
+        ("top level", "generall: {}\n", "generall"),
+        ("general", "general:\n  root_pat: ./data\n", "root_pat"),
+        (
+            "model",
+            "model:\n  onnx_optimisation_flags: merge_linear\n",
+            "onnx_optimisation_flags",
+        ),
+        ("attack", "attack:\n  pgd_orderr: before\n", "pgd_orderr"),
+        (
+            "margin row",
+            "margin_row:\n  reserve_second: 5\n",
+            "reserve_second",
+        ),
+        ("solver", "solver:\n  batch_sizes: 16\n", "batch_sizes"),
+        (
+            "solver mip",
+            "solver:\n  mip:\n    mip_sovler: ay\n",
+            "mip_sovler",
+        ),
+        ("bab", "bab:\n  max_domain: 10\n", "max_domain"),
+        (
+            "phase budget",
+            "bab:\n  phase_budget:\n    upfront_pgd_fracton: 0.2\n",
+            "upfront_pgd_fracton",
+        ),
+        (
+            "branching",
+            "bab:\n  branching:\n    canddiates: 5\n",
+            "canddiates",
+        ),
+        (
+            "depth-two lookahead",
+            "bab:\n  branching:\n    depth2_lookahead:\n      canddiates: 5\n",
+            "canddiates",
+        ),
+        (
+            "input split",
+            "bab:\n  branching:\n    input_split:\n      reorder_bba: true\n",
+            "reorder_bba",
+        ),
+        (
+            "nonlinear split",
+            "bab:\n  branching:\n    nonlinear_split:\n      filter_betta: true\n",
+            "filter_betta",
+        ),
+        (
+            "alpha crown",
+            "solver:\n  alpha_crown:\n    lr_alhpa: 0.1\n",
+            "lr_alhpa",
+        ),
+        (
+            "beta crown",
+            "solver:\n  beta_crown:\n    lr_betta: 0.1\n",
+            "lr_betta",
+        ),
+        ("cuts", "bab:\n  cuts:\n    max_cut: 10\n", "max_cut"),
+        (
+            "invprop",
+            "bab:\n  invprop:\n    share_gamma: true\n",
+            "share_gamma",
+        ),
+        (
+            "clip",
+            "bab:\n  clip:\n    interm_top_k: 4\n",
+            "interm_top_k",
+        ),
+    ];
+
+    for (location, yaml, misspelled_key) in cases {
+        let error = match serde_yaml::from_str::<PresetConfig>(yaml) {
+            Ok(_) => panic!("{location} typo {misspelled_key:?} must be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(misspelled_key),
+            "{location} error must identify {misspelled_key:?}: {message}"
+        );
+    }
+}
+
+#[test]
 fn model_onnx_optimization_flag_parses_single_string() {
     let preset: PresetConfig = serde_yaml::from_str(
         r#"
@@ -301,6 +488,116 @@ model:
     assert!(
         config.has_optimization_flag(ny_onnx::OnnxOptimizationFlag::MergeLinear),
         "merge_linear should be enabled on the loader config"
+    );
+}
+
+#[test]
+fn forward_linear_spec_alpha_requires_typed_authored_graph_policy() {
+    let unsafe_preset: PresetConfig = serde_yaml::from_str(
+        r#"
+model:
+  forward_linear_spec_alpha: true
+"#,
+    )
+    .expect("typed candidate key should parse");
+    let error = match build_onnx_load_config(&unsafe_preset) {
+        Ok(_) => panic!("candidate authority over the folded graph must be refused"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("require_authored_float32_initializers"),
+        "admission error must prescribe both typed authored-graph guards: {error:#}"
+    );
+
+    let admitted: PresetConfig = serde_yaml::from_str(
+        r#"
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  forward_linear_spec_alpha: true
+"#,
+    )
+    .expect("typed raw candidate preset should parse");
+    let config = build_onnx_load_config(&admitted).expect("raw candidate should be admitted");
+    assert_eq!(
+        config.batch_norm_folding_policy(),
+        ny_onnx::BatchNormFoldingPolicy::PreserveRaw
+    );
+    assert!(config.require_authored_float32_initializers());
+    assert!(config.raw_float32_initializer_provenance_enabled());
+    assert_eq!(admitted.model.forward_linear_spec_alpha, Some(true));
+}
+
+#[test]
+fn forward_linear_spec_alpha_is_default_off_and_legacy_loader_stays_unchanged() {
+    let preset = PresetConfig::default();
+    let config = build_onnx_load_config(&preset).expect("default loader config");
+    assert_eq!(preset.model.forward_linear_spec_alpha, None);
+    assert_eq!(
+        config.batch_norm_folding_policy(),
+        ny_onnx::BatchNormFoldingPolicy::LegacyEnvironment
+    );
+    assert!(!config.require_authored_float32_initializers());
+}
+
+#[test]
+fn legacy_cgan_alpha_surrogate_key_is_an_exact_alias() {
+    let generic: PresetConfig = serde_yaml::from_str(
+        r#"
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  forward_linear_spec_alpha: true
+"#,
+    )
+    .expect("generic key should parse");
+    let legacy: PresetConfig = serde_yaml::from_str(
+        r#"
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  cgan_forward_alpha_surrogate: true
+"#,
+    )
+    .expect("legacy key should remain accepted");
+
+    assert_eq!(generic.model.forward_linear_spec_alpha, Some(true));
+    assert_eq!(legacy.model.forward_linear_spec_alpha, Some(true));
+    build_onnx_load_config(&generic).expect("generic admission should pass loader guards");
+    build_onnx_load_config(&legacy).expect("legacy alias should pass the same loader guards");
+    assert_eq!(
+        serde_json::to_value(&generic).unwrap(),
+        serde_json::to_value(&legacy).unwrap(),
+        "the legacy spelling must not create a second policy bit"
+    );
+}
+
+#[test]
+fn forward_linear_spec_alpha_malformed_values_fail_closed() {
+    for malformed in [
+        r#"model: { forward_linear_spec_alpha: "1" }"#,
+        r#"model: { forward_linear_spec_alpha: enabled }"#,
+        r#"model: { cgan_forward_alpha_surrogate: "true" }"#,
+    ] {
+        let error = serde_yaml::from_str::<PresetConfig>(malformed)
+            .expect_err("non-boolean admission values must be rejected");
+        assert!(
+            format!("{error:#}").contains("boolean"),
+            "malformed admission should report its type error: {error:#}"
+        );
+    }
+
+    let duplicate = serde_yaml::from_str::<PresetConfig>(
+        r#"
+model:
+  forward_linear_spec_alpha: true
+  cgan_forward_alpha_surrogate: true
+"#,
+    )
+    .expect_err("generic and legacy spellings together must fail closed");
+    assert!(
+        format!("{duplicate:#}").contains("duplicate field"),
+        "two spellings must not create ambiguous precedence: {duplicate:#}"
     );
 }
 
@@ -365,9 +662,10 @@ fn relusplitter_rsplitter_gpu_bab_sidecar_stays_isolated_3862() {
     );
 }
 
-/// Regression: the #3813 cut-aware WGPU multi-objective sidecar must explicitly
-/// request a wgpu device, keep kfsb branching, and enable cuts. Without the
-/// explicit device field the benchmark runner silently falls back to CPU.
+/// Regression: the #3813 WGPU multi-objective sidecar must explicitly request a
+/// wgpu device, keep kfsb branching, preserve matrix Conv2d, and keep
+/// quarantined cut authority disabled. Without the explicit device field the
+/// benchmark runner silently falls back to CPU.
 #[test]
 fn relusplitter_multiobjective_wgpu_sidecar_requests_wgpu_device_3813() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -393,19 +691,21 @@ fn relusplitter_multiobjective_wgpu_sidecar_requests_wgpu_device_3813() {
         "sidecar must keep kfsb branching for shared multi-objective path"
     );
 
-    // Must enable cuts (the cuts-enabled lane is the only one that moved beyond
-    // domains=0).
+    // The legacy cut consumer adds a scalar after CROWN concretization, so it
+    // cannot carry proof authority.
     assert_eq!(
         sidecar.bab.cuts.enabled,
-        Some(true),
-        "sidecar must enable cuts"
+        Some(false),
+        "sidecar must keep quarantined cuts disabled"
     );
+    assert_eq!(sidecar.bab.cuts.near_miss, Some(false));
+    assert_eq!(sidecar.bab.cuts.proactive, Some(false));
 
-    // conv_mode: auto routes through matrix path when cuts enabled.
+    // Preserve the measured matrix path explicitly now that cuts are disabled.
     assert_eq!(
         sidecar.general.conv_mode,
-        Some(ny_propagate::ConvMode::Auto),
-        "sidecar must use conv_mode: auto"
+        Some(ny_propagate::ConvMode::Matrix),
+        "sidecar must explicitly use conv_mode: matrix"
     );
 }
 
@@ -446,7 +746,8 @@ fn apply_preset_to_config() {
 
 /// #kfsb-multi: `bab.branching.kfsb_multi` arms `use_kfsb_multi_branching`, and
 /// a preset that omits it leaves the field at its default (false). Guards the
-/// cifar100-scoped opt-in so no other preset can silently arm the wave lane.
+/// benchmark-scoped opt-in so no unrelated preset can silently arm the wave
+/// lane.
 #[test]
 fn apply_preset_propagates_kfsb_multi_arming() {
     // Opt-in preset arms the field.
@@ -491,6 +792,128 @@ fn apply_preset_propagates_kfsb_multi_arming() {
     );
 }
 
+#[test]
+fn apply_preset_propagates_kfsb_cert_reuse_policy() {
+    let armed = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                kfsb_cert_reuse: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).unwrap();
+    assert!(config.kfsb_cert_reuse);
+
+    let disarmed = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                kfsb_cert_reuse: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig {
+        kfsb_cert_reuse: true,
+        ..BetaCrownConfig::default()
+    };
+    apply_preset(&mut config, &disarmed).unwrap();
+    assert!(!config.kfsb_cert_reuse);
+
+    let mut omitted = BetaCrownConfig {
+        kfsb_cert_reuse: true,
+        ..BetaCrownConfig::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).unwrap();
+    assert!(
+        omitted.kfsb_cert_reuse,
+        "an omitted preset key must not overwrite an already-resolved policy"
+    );
+}
+
+/// Root-alpha phase checkpoints are preset-owned scheduling policy: an
+/// explicit value propagates in either direction, while omission preserves the
+/// default-dark verifier configuration.
+#[test]
+fn apply_preset_propagates_root_alpha_phase_checkpoint_policy() {
+    let armed = PresetConfig {
+        bab: BabPreset {
+            root_alpha_phase_checkpoint: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &armed).unwrap();
+    assert!(config.root_alpha_phase_checkpoint);
+
+    let disarmed = PresetConfig {
+        bab: BabPreset {
+            root_alpha_phase_checkpoint: Some(false),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig {
+        root_alpha_phase_checkpoint: true,
+        ..BetaCrownConfig::default()
+    };
+    apply_preset(&mut config, &disarmed).unwrap();
+    assert!(!config.root_alpha_phase_checkpoint);
+
+    let mut omitted = BetaCrownConfig {
+        root_alpha_phase_checkpoint: true,
+        ..BetaCrownConfig::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).unwrap();
+    assert!(
+        omitted.root_alpha_phase_checkpoint,
+        "an omitted preset key must not overwrite an already-resolved policy"
+    );
+}
+
+#[test]
+fn apply_preset_propagates_typed_depth_two_lookahead_without_arming_on_omission() {
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  branching:
+    depth2_lookahead:
+      mode: select
+      candidates: 15
+      top_rounds: 5
+      discount: 0.5
+"#,
+    )
+    .expect("typed depth-2 preset parses");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("typed depth-2 preset applies");
+    assert_eq!(
+        config.depth_two_branch_lookahead,
+        DepthTwoBranchLookaheadConfig {
+            mode: DepthTwoBranchLookaheadMode::Select,
+            candidates: 15,
+            top_rounds: 5,
+            discount: 0.5,
+        }
+    );
+    config.validate().expect("typed experiment validates");
+
+    let omitted: PresetConfig =
+        serde_yaml::from_str("bab: {}").expect("omitted depth-2 preset parses");
+    let mut default = BetaCrownConfig::default();
+    apply_preset(&mut default, &omitted).expect("omitted depth-2 preset applies");
+    assert_eq!(
+        default.depth_two_branch_lookahead.mode,
+        DepthTwoBranchLookaheadMode::Off
+    );
+}
+
 /// #cifar-head-crown: all three typed preset values must reach the verifier
 /// config, while omission leaves the pass off with bounded inert defaults.
 #[test]
@@ -515,6 +938,135 @@ fn apply_preset_propagates_root_crown_interm_dense_head_policy() {
     assert!(!omitted.root_crown_interm_dense_head);
     assert_eq!(omitted.root_crown_interm_max_secs, 2);
     assert_eq!(omitted.root_crown_interm_max_dim, 512);
+}
+
+#[test]
+fn apply_preset_propagates_bounded_atomic_root_c_margin_iterations() {
+    let preset: PresetConfig = serde_yaml::from_str("bab:\n  atomic_root_c_margin_iterations: 8\n")
+        .expect("typed exact-C iteration preset parses");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("the hard cap applies");
+    assert_eq!(config.atomic_root_c_margin_iterations, 8);
+    config.validate().expect("applied hard cap validates");
+
+    let mut omitted = BetaCrownConfig {
+        atomic_root_c_margin_iterations: 3,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).expect("omission is inert");
+    assert_eq!(
+        omitted.atomic_root_c_margin_iterations, 3,
+        "an omitted typed key must not overwrite an existing value"
+    );
+
+    let over: PresetConfig = serde_yaml::from_str("bab:\n  atomic_root_c_margin_iterations: 9\n")
+        .expect("the typed parser preserves the invalid value for a precise apply error");
+    let error = apply_preset(&mut BetaCrownConfig::default(), &over)
+        .expect_err("work above the hard cap must fail closed");
+    assert!(error
+        .to_string()
+        .contains("bab.atomic_root_c_margin_iterations"));
+}
+
+#[test]
+fn apply_preset_propagates_root_interm_cuda_factory_policy() {
+    for (preset_value, expected) in [(true, true), (false, false)] {
+        let preset = PresetConfig {
+            bab: BabPreset {
+                root_interm_cuda_factory: Some(preset_value),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = BetaCrownConfig {
+            root_interm_cuda_factory: !preset_value,
+            ..Default::default()
+        };
+        apply_preset(&mut config, &preset).expect("typed factory policy applies");
+        assert_eq!(config.root_interm_cuda_factory, expected);
+    }
+
+    let mut omitted = BetaCrownConfig {
+        root_interm_cuda_factory: true,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).expect("omitted policy applies");
+    assert!(
+        omitted.root_interm_cuda_factory,
+        "an omitted Option must not overwrite an existing typed value"
+    );
+
+    let parsed: PresetConfig = serde_yaml::from_str("bab:\n  root_interm_cuda_factory: true\n")
+        .expect("factory preset key is accepted");
+    assert_eq!(parsed.bab.root_interm_cuda_factory, Some(true));
+}
+
+#[test]
+fn apply_preset_propagates_mo_cuda_factory_engine_handoff_policy() {
+    for (preset_value, expected) in [(true, true), (false, false)] {
+        let preset = PresetConfig {
+            bab: BabPreset {
+                mo_cuda_factory_engine_handoff: Some(preset_value),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = BetaCrownConfig {
+            mo_cuda_factory_engine_handoff: !preset_value,
+            ..Default::default()
+        };
+        apply_preset(&mut config, &preset).expect("typed post-root handoff policy applies");
+        assert_eq!(config.mo_cuda_factory_engine_handoff, expected);
+    }
+
+    let mut omitted = BetaCrownConfig {
+        mo_cuda_factory_engine_handoff: true,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).expect("omitted policy applies");
+    assert!(
+        omitted.mo_cuda_factory_engine_handoff,
+        "an omitted Option must not overwrite an existing typed value"
+    );
+
+    let parsed: PresetConfig =
+        serde_yaml::from_str("bab:\n  mo_cuda_factory_engine_handoff: true\n")
+            .expect("post-root handoff preset key is accepted");
+    assert_eq!(parsed.bab.mo_cuda_factory_engine_handoff, Some(true));
+}
+
+#[test]
+fn apply_preset_propagates_mo_cuda_bounded_shared_executor_policy() {
+    for (preset_value, expected) in [(true, true), (false, false)] {
+        let preset = PresetConfig {
+            bab: BabPreset {
+                mo_cuda_bounded_shared_executor: Some(preset_value),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = BetaCrownConfig {
+            mo_cuda_bounded_shared_executor: !preset_value,
+            ..Default::default()
+        };
+        apply_preset(&mut config, &preset).expect("typed bounded shared-executor policy applies");
+        assert_eq!(config.mo_cuda_bounded_shared_executor, expected);
+    }
+
+    let mut omitted = BetaCrownConfig {
+        mo_cuda_bounded_shared_executor: true,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default()).expect("omitted policy applies");
+    assert!(
+        omitted.mo_cuda_bounded_shared_executor,
+        "an omitted Option must not overwrite an existing typed value"
+    );
+
+    let parsed: PresetConfig =
+        serde_yaml::from_str("bab:\n  mo_cuda_bounded_shared_executor: true\n")
+            .expect("bounded shared-executor preset key is accepted");
+    assert_eq!(parsed.bab.mo_cuda_bounded_shared_executor, Some(true));
 }
 
 #[test]
@@ -547,9 +1099,8 @@ fn apply_preset_propagates_root_sparse_interm_crown_policy() {
     assert_eq!(omitted.root_sparse_interm_crown_max_targets, 4);
 }
 
-/// #kfsb-multi: the SHIPPED cifar100 presets arm the wave-batched selector,
-/// while a representative non-cifar preset (acasxu) leaves it off. This is the
-/// cifar100-scoping guarantee: only these two presets flip the field.
+/// #kfsb-multi: the shipped CIFAR-100 presets arm the wave-batched selector,
+/// while a representative unrelated preset leaves it off.
 #[test]
 fn cifar100_presets_arm_kfsb_multi_others_do_not() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -582,7 +1133,7 @@ fn cifar100_presets_arm_kfsb_multi_others_do_not() {
     apply_preset(&mut config, &acasxu).unwrap();
     assert!(
         !config.use_kfsb_multi_branching,
-        "acasxu preset must leave use_kfsb_multi_branching off (cifar100-scoped)"
+        "acasxu preset must leave use_kfsb_multi_branching off"
     );
 }
 
@@ -769,6 +1320,44 @@ bab:
 }
 
 #[test]
+fn input_split_override_parallel_is_preset_scoped_and_defaults_off() {
+    let absent: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  branching:
+    method: input
+    input_split:
+      reorder_bab: true
+"#,
+    )
+    .unwrap();
+    let mut absent_config = BetaCrownConfig::default();
+    apply_preset(&mut absent_config, &absent).unwrap();
+    assert_eq!(absent.bab.branching.input_split.override_parallel, None);
+    assert!(!absent_config.input_split_override_parallel);
+
+    let enabled: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  branching:
+    method: input
+    input_split:
+      reorder_bab: true
+      override_parallel: true
+"#,
+    )
+    .unwrap();
+    let mut enabled_config = BetaCrownConfig::default();
+    apply_preset(&mut enabled_config, &enabled).unwrap();
+    assert_eq!(
+        enabled.bab.branching.input_split.override_parallel,
+        Some(true)
+    );
+    assert!(enabled_config.reorder_bab);
+    assert!(enabled_config.input_split_override_parallel);
+}
+
+#[test]
 fn pgd_order_parsing() {
     let preset_with_skip = PresetConfig {
         attack: AttackPreset {
@@ -789,10 +1378,8 @@ fn pgd_order_parsing() {
     assert_eq!(should_enable_pgd(&preset_with_before), Some(true));
 }
 
-/// attack.pgd_order decodes to enablement only: the skip family disables,
-/// before/input_bab/middle/after enable (middle/after warn — reference
-/// alpha-beta-CROWN scheduling is not implemented), and unknown values are
-/// rejected like attack_mode instead of silently enabling PGD.
+/// Implemented orders decode exactly. Reference middle/after require an
+/// explicit NY compatibility contract before they may use upfront placement.
 #[test]
 fn apply_preset_decodes_pgd_order_enablement() {
     for (order, expected) in [
@@ -801,8 +1388,6 @@ fn apply_preset_decodes_pgd_order_enablement() {
         ("disabled", false),
         ("before", true),
         ("input_bab", true),
-        ("middle", true),
-        ("after", true),
     ] {
         let preset = PresetConfig {
             attack: AttackPreset {
@@ -819,17 +1404,127 @@ fn apply_preset_decodes_pgd_order_enablement() {
         );
     }
 
-    let typo = PresetConfig {
-        attack: AttackPreset {
-            pgd_order: Some("skpi".to_string()),
+    // `after` is IMPLEMENTED now (#pgd-order-after): it resolves to the deferred schedule,
+    // which empties the upfront slice and hands it to the post-BaB stage. Only `middle`
+    // (attack interleaved with BaB) remains unimplemented and must still fail closed.
+    {
+        let deferred = PresetConfig {
+            attack: AttackPreset {
+                pgd_order: Some("after".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut config = BetaCrownConfig::default();
-    assert!(
-        apply_preset(&mut config, &typo).is_err(),
-        "unknown pgd_order values must be rejected, not silently treated as enabled"
+        };
+        let mut config = BetaCrownConfig::default();
+        apply_preset(&mut config, &deferred).expect("'after' is implemented");
+        assert!(
+            config.phase_budget.upfront_pgd_fraction.abs() < 1e-9,
+            "deferring must empty the upfront slice"
+        );
+    }
+
+    {
+        let order = "middle";
+        let missing_contract = PresetConfig {
+            attack: AttackPreset {
+                pgd_order: Some(order.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = BetaCrownConfig::default();
+        let before = serde_json::to_value(&config).unwrap();
+        let error = apply_preset(&mut config, &missing_contract)
+            .expect_err("unimplemented order without compatibility must fail closed");
+        assert!(error.to_string().contains("ny_pgd_order_compat"));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            before,
+            "schedule validation must happen before mutating verifier config"
+        );
+
+        let explicit_compatibility = PresetConfig {
+            attack: AttackPreset {
+                pgd_order: Some(order.to_string()),
+                ny_pgd_order_compat: Some(NyPgdOrderCompat::Upfront),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        apply_preset(&mut config, &explicit_compatibility).unwrap();
+        assert!(config.enable_pgd_attack);
+        assert_eq!(
+            resolve_initial_pgd_schedule(&explicit_compatibility).unwrap(),
+            Some(ResolvedInitialPgdSchedule::Upfront)
+        );
+    }
+
+    for invalid in ["skpi", " skip ", ""] {
+        let preset = PresetConfig {
+            attack: AttackPreset {
+                pgd_order: Some(invalid.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            apply_preset(&mut BetaCrownConfig::default(), &preset).is_err(),
+            "unknown/near-miss pgd_order {invalid:?} must not silently enable PGD"
+        );
+    }
+
+    for invalid_order in [None, Some("before"), Some("skip"), Some("input_bab")] {
+        let preset = PresetConfig {
+            attack: AttackPreset {
+                pgd_order: invalid_order.map(str::to_string),
+                ny_pgd_order_compat: Some(NyPgdOrderCompat::Upfront),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            apply_preset(&mut BetaCrownConfig::default(), &preset).is_err(),
+            "compatibility field must be rejected outside middle/after: {invalid_order:?}"
+        );
+    }
+}
+
+#[test]
+fn shipped_middle_after_presets_declare_upfront_compatibility() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut scheduled = 0usize;
+
+    for directory in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+        let directory = repo_root.join("configs").join(directory);
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+                continue;
+            }
+            let preset = load_preset(&path).unwrap();
+            if preset.attack.pgd_order.as_deref().is_some_and(|order| {
+                order.eq_ignore_ascii_case("middle") || order.eq_ignore_ascii_case("after")
+            }) {
+                scheduled += 1;
+                assert_eq!(
+                    preset.attack.ny_pgd_order_compat,
+                    Some(NyPgdOrderCompat::Upfront),
+                    "{} must explicitly preserve NY's initial/upfront compatibility behavior",
+                    path.display()
+                );
+                validate_preset(&preset).unwrap_or_else(|error| {
+                    panic!(
+                        "{} must remain semantically valid under the frozen-preset gate: {error:#}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    assert_eq!(
+        scheduled, 22,
+        "review every shipped middle/after preset when the compatibility set changes"
     );
 }
 
@@ -1128,6 +1823,112 @@ bab:
     assert_eq!(config.input_clip_type, InputClipType::Relaxed);
 }
 
+#[test]
+fn input_split_fresh_domain_clip_has_typed_default_dark_preset_ingress() {
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  branching:
+    method: input
+    input_split:
+      enable: true
+      reorder_bab: true
+      ibp_enhancement: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+    input_split_fresh_domain_clip: true
+"#,
+    )
+    .expect("typed fresh-domain clip preset parses");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("typed fresh-domain clip preset applies");
+    assert!(config.input_split_fresh_domain_clip);
+    config
+        .validate()
+        .expect("the production-shaped fresh-domain clip composition validates");
+
+    let mut omitted = BetaCrownConfig {
+        input_split_fresh_domain_clip: true,
+        ..Default::default()
+    };
+    apply_clip_preset(&mut omitted, &ClipPreset::default());
+    assert!(
+        omitted.input_split_fresh_domain_clip,
+        "omission must not overwrite an existing typed routing decision"
+    );
+
+    let disabled: PresetConfig =
+        serde_yaml::from_str("bab:\n  clip:\n    input_split_fresh_domain_clip: false\n")
+            .expect("an explicit false parses");
+    apply_clip_preset(&mut omitted, &disabled.bab.clip);
+    assert!(!omitted.input_split_fresh_domain_clip);
+}
+
+#[test]
+fn input_split_conic_objective_has_typed_default_dark_preset_ingress() {
+    let default = BetaCrownConfig::default();
+    assert!(!default.input_split_conic_objective);
+
+    let preset: PresetConfig = serde_yaml::from_str(
+        r#"
+bab:
+  branching:
+    method: input
+    input_split:
+      conic_objective: true
+      conic_queue_refresh_batch_size: 1024
+"#,
+    )
+    .expect("typed conic-objective preset parses");
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("typed conic-objective preset applies");
+    assert!(config.input_split_conic_objective);
+    assert_eq!(config.input_split_conic_queue_refresh_batch_size, 1024);
+
+    let mut omitted = BetaCrownConfig {
+        input_split_conic_objective: true,
+        input_split_conic_queue_refresh_batch_size: 2048,
+        ..Default::default()
+    };
+    apply_preset(&mut omitted, &PresetConfig::default())
+        .expect("an omitted conic-objective key applies as a no-op");
+    assert!(
+        omitted.input_split_conic_objective,
+        "omission must not overwrite an existing typed routing decision"
+    );
+    assert_eq!(omitted.input_split_conic_queue_refresh_batch_size, 2048);
+
+    let disabled: PresetConfig = serde_yaml::from_str(
+        "bab:\n  branching:\n    input_split:\n      conic_objective: false\n",
+    )
+    .expect("an explicit false parses");
+    apply_preset(&mut omitted, &disabled).expect("an explicit false applies");
+    assert!(!omitted.input_split_conic_objective);
+    assert_eq!(omitted.input_split_conic_queue_refresh_batch_size, 2048);
+}
+
+#[test]
+fn shipped_cersyve_preset_does_not_arm_conic_objective_yet() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let preset = load_preset(&repo_root.join("configs/vnncomp25/cersyve.yaml"))
+        .expect("shipped Cersyve preset loads");
+    assert_eq!(preset.bab.branching.input_split.conic_objective, None);
+    assert_eq!(
+        preset
+            .bab
+            .branching
+            .input_split
+            .conic_queue_refresh_batch_size,
+        None
+    );
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("shipped Cersyve preset applies");
+    assert!(!config.input_split_conic_objective);
+    assert_eq!(config.input_split_conic_queue_refresh_batch_size, 512);
+}
+
 // VNN-COMP benchmark preset loading tests moved to vnncomp_preset_tests.rs
 
 /// Test that acasxu_2023 preset loads and produces correct config.
@@ -1387,4 +2188,47 @@ fn soundnessbench_preset_wires_reference_pgd_knobs() {
     assert_eq!(config.pgd_steps, 1000);
     assert_eq!(config.pgd_lr_decay, 0.997);
     assert!(matches!(config.pgd_alpha_mode, PgdAlphaMode::Scalar(a) if a == 0.005));
+}
+
+/// #preset-strict: every preset shipped in configs/vnncomp*/ must load with
+/// ZERO unrecognized keys. `load_preset` errors on unknown paths, so this test
+/// is what guarantees an in-repo preset can only drift from the schema by
+/// failing CI — a typo'd key was previously dropped in silence, which is the
+/// structural enabler of the "configured but never fires" bug class.
+#[test]
+fn every_shipped_vnncomp_preset_loads_with_no_unknown_keys() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let configs_root = repo_root.join("configs");
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for entry in fs::read_dir(&configs_root).expect("list configs/") {
+        let dir = entry.expect("read configs/ entry").path();
+        let is_vnncomp_dir = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("vnncomp"));
+        if !is_vnncomp_dir || !dir.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(&dir).expect("list preset dir") {
+            let path = file.expect("read preset entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+                continue;
+            }
+            checked += 1;
+            if let Err(error) = load_preset(&path) {
+                failures.push(format!("{}: {error:#}", path.display()));
+            }
+        }
+    }
+    assert!(
+        checked > 20,
+        "expected to check every shipped vnncomp preset, found only {checked} — \
+         did the configs layout move?"
+    );
+    assert!(
+        failures.is_empty(),
+        "presets with unknown or invalid keys:\n{}",
+        failures.join("\n")
+    );
 }

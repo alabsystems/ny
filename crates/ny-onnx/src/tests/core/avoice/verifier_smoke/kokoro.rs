@@ -16,8 +16,9 @@ use super::shared::{
 /// Part of #4029.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_kokoro_prefix_energy_verifier_smoke_4029() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let (energy_graph, input) = kokoro_verifier::kokoro_prefix_energy_verifier_setup();
 
     let output_bounds = vec![ny_core::Bound::new_allow_infinite(0.0, f32::INFINITY)];
@@ -45,8 +46,9 @@ fn test_avoice_kokoro_prefix_energy_verifier_smoke_4029() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_kokoro_prefix_energy_graph_model_round_trip_verifier_smoke_4100() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let (energy_graph, input) =
         kokoro_verifier::kokoro_graph_model_round_trip_prefix_energy_verifier_setup();
 

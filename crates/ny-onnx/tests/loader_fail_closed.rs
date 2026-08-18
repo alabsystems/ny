@@ -6,7 +6,12 @@
 use ny_onnx::gguf::load_gguf;
 #[cfg(feature = "internal-test-utils")]
 use ny_onnx::native::test_support::directory_contains_extension_in_entries;
-use ny_onnx::native::{load_weights, NativeModel};
+use ny_onnx::native::NativeModel;
+// Only the two `#[cfg(unix)]` unreadable-directory tests call this; the mode
+// bits they rely on have no Windows equivalent, so the import is gated to match
+// its uses rather than warning off-Unix.
+#[cfg(unix)]
+use ny_onnx::native::load_weights;
 use safetensors::tensor::TensorView;
 use safetensors::{serialize, Dtype};
 use std::collections::BTreeMap;
@@ -127,18 +132,76 @@ fn test_load_weights_rejects_unreadable_directory_during_safetensors_detection()
     execute_only.set_mode(0o111);
     std::fs::set_permissions(dir.path(), execute_only).expect("Failed to make tempdir unreadable");
 
+    // A uid-0 process holds CAP_DAC_OVERRIDE, so the kernel skips the permission
+    // check entirely and this directory is still readable. The guarantee under
+    // test is real and must not be relaxed, but the PRECONDITION simply cannot be
+    // built as root — so confirm it actually holds before asserting on it, rather
+    // than reporting a failure that says nothing about the loader.
+    let precondition_holds = std::fs::read_dir(dir.path()).is_err();
+
     let result = load_weights(dir.path());
 
     std::fs::set_permissions(dir.path(), original_permissions)
         .expect("Failed to restore tempdir permissions");
 
+    if precondition_holds {
+        let msg = expect_error_message(
+            result,
+            "directory read failures during safetensors detection must fail",
+        );
+        assert!(
+            msg.contains("Failed to read directory"),
+            "expected directory read failure, got: {msg}"
+        );
+    } else {
+        // `/proc/self` is owned by the running process's uid, so this identifies
+        // root without pulling in a libc dependency.
+        let euid = std::fs::metadata("/proc/self")
+            .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+            .unwrap_or(u32::MAX);
+        assert_eq!(
+            euid, 0,
+            "an unprivileged process must not be able to read a 0o111 directory; \
+             the precondition failed for some reason other than CAP_DAC_OVERRIDE (uid {euid})"
+        );
+        eprintln!(
+            "note: running as uid 0, so CAP_DAC_OVERRIDE bypasses the permission bits and an \
+             unreadable directory cannot be constructed. The same fail-closed guarantee is \
+             covered permission-independently by \
+             test_load_weights_rejects_unreadable_directory_when_path_is_not_a_directory."
+        );
+    }
+}
+
+/// The same fail-closed guarantee as above, induced WITHOUT permissions so it holds
+/// in every environment — including as root, where `CAP_DAC_OVERRIDE` makes a
+/// `chmod 000` directory readable and the permission-based construction impossible.
+///
+/// Here the model path is a regular FILE where a directory is expected, so
+/// `read_dir` fails with `ENOTDIR` for every uid. The loader must still refuse
+/// rather than silently treating the model as having no safetensors shard.
+#[cfg(unix)]
+#[ntest::timeout(10000)]
+#[test]
+fn test_load_weights_rejects_unreadable_directory_when_path_is_not_a_directory() {
+    let dir = tempdir().expect("Failed to create tempdir");
+    let not_a_dir = dir.path().join("model_dir");
+    std::fs::write(&not_a_dir, b"this is a file, not a directory")
+        .expect("Failed to write the stand-in file");
+
+    // Confirm the precondition really holds for THIS uid before asserting.
+    assert!(
+        std::fs::read_dir(&not_a_dir).is_err(),
+        "reading a regular file as a directory must fail (ENOTDIR) for any uid"
+    );
+
     let msg = expect_error_message(
-        result,
-        "directory read failures during safetensors detection must fail",
+        load_weights(&not_a_dir),
+        "a non-directory model path must fail closed during safetensors detection",
     );
     assert!(
-        msg.contains("Failed to read directory"),
-        "expected directory read failure, got: {msg}"
+        !msg.is_empty(),
+        "the loader must report why it refused, got an empty message"
     );
 }
 

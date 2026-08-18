@@ -27,6 +27,7 @@ fn build_layers(
             bias: Some(b2.into()),
             out_features: out_dim,
             in_features: hidden,
+            cert_err: Default::default(),
         },
         GpuCrownLayer::Activation {
             lower_slope: ls,
@@ -40,6 +41,7 @@ fn build_layers(
             bias: Some(b1.into()),
             out_features: hidden,
             in_features: in_dim,
+            cert_err: Default::default(),
         },
     ]
 }
@@ -67,6 +69,7 @@ fn build_layers_general_activation(
             bias: Some(b2.into()),
             out_features: out_dim,
             in_features: hidden,
+            cert_err: Default::default(),
         },
         GpuCrownLayer::Activation {
             lower_slope,
@@ -80,6 +83,7 @@ fn build_layers_general_activation(
             bias: Some(b1.into()),
             out_features: hidden,
             in_features: in_dim,
+            cert_err: Default::default(),
         },
     ]
 }
@@ -254,10 +258,32 @@ proptest! {
         let w2: Vec<f32> = (0..out_dim * hidden_dim).map(|i| w2_seed[i % w2_seed.len()]).collect();
         let b1: Vec<f32> = (0..hidden_dim).map(|i| b1_seed[i % b1_seed.len()]).collect();
         let b2: Vec<f32> = (0..out_dim).map(|i| b2_seed[i % b2_seed.len()]).collect();
+        // `ls_seed`/`us_seed` are drawn INDEPENDENTLY from 0.0..1.0, which
+        // freely produces `lower_slope > upper_slope` — a degenerate relaxation
+        // (the lower envelope crossing above the upper) that production never
+        // supplies. The sound GPU walk is RIGHT to refuse it: random search
+        // found `ls=[0.969,0.943,0.485] us=[0.257,0.0,0.114]` and the device
+        // published the FALLBACK_BOUND degrade (a valid, useless lower bound)
+        // while the CPU returned a number, so the closeness assertion failed on
+        // input neither lane should be compared on. Order the pair instead of
+        // weakening the assertion: `us` now lands in `[ls, 1]`.
         let ls: Vec<f32> = (0..hidden_dim).map(|i| ls_seed[i % ls_seed.len()]).collect();
-        let us: Vec<f32> = (0..hidden_dim).map(|i| us_seed[i % us_seed.len()]).collect();
+        let us: Vec<f32> = (0..hidden_dim)
+            .map(|i| {
+                let l = ls[i];
+                l + (1.0 - l) * us_seed[i % us_seed.len()]
+            })
+            .collect();
+        // Same degeneracy in the intercept dimension: `li_seed`/`ui_seed` are
+        // independent, so the generator produces `lower_intercept >
+        // upper_intercept` (the recorded seed has li=[0.204,-0.359,-0.458] vs
+        // ui=[0.147,-0.407,-0.500]) — again a crossed envelope production never
+        // supplies, and again the device is right to publish the degrade.
+        // Order the pair: `ui` lands at or above `li`.
         let li: Vec<f32> = (0..hidden_dim).map(|i| li_seed[i % li_seed.len()]).collect();
-        let ui: Vec<f32> = (0..hidden_dim).map(|i| ui_seed[i % ui_seed.len()]).collect();
+        let ui: Vec<f32> = (0..hidden_dim)
+            .map(|i| li[i].max(ui_seed[i % ui_seed.len()]))
+            .collect();
         let inp_l: Vec<f32> = (0..in_dim).map(|i| inp_center[i % 6] - inp_radius[i % 6]).collect();
         let inp_u: Vec<f32> = (0..in_dim).map(|i| inp_center[i % 6] + inp_radius[i % 6]).collect();
 

@@ -2,14 +2,17 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use super::super::bounds::{run_with_m1_alpha_trace, M1AlphaBudgetOutcome, M1AlphaTraceEvent};
 use super::*;
 use crate::bounds::GraphAlphaState;
 use crate::layers::{
-    AddLayer, LinearLayer, NonZeroLayer, ReLULayer, SigmoidLayer, SqrtLayer, TanhLayer,
+    AddLayer, ConvTranspose1dLayer, LinearLayer, NonZeroLayer, ReLULayer, ReshapeLayer,
+    SigmoidLayer, SqrtLayer, TanhLayer,
 };
 use crate::network::core::GraphNode;
-use ndarray::{arr1, arr2, array};
+use ndarray::{arr1, arr2, array, ArrayD, IxDyn};
 use ny_test_utils::assert_bounds_do_not_loosen;
+use std::time::{Duration, Instant};
 
 fn tensor(lower: &[f32], upper: &[f32]) -> BoundedTensor {
     BoundedTensor::new_allow_infinite(arr1(lower).into_dyn(), arr1(upper).into_dyn())
@@ -145,6 +148,38 @@ fn make_refresh_graph() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
+fn make_chunk_aware_alpha_budget_graph() -> (GraphNetwork, BoundedTensor) {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "small_target",
+        Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0_f32]]), None).expect("small target should construct"),
+        ),
+    ));
+    graph.add_node(GraphNode::new(
+        "reshape",
+        Layer::Reshape(ReshapeLayer::new(vec![1, 1])),
+        vec!["small_target".to_string()],
+    ));
+    let conv_transpose = ConvTranspose1dLayer::with_input_length(
+        ArrayD::from_elem(IxDyn(&[1, 1, 384]), 0.25_f32),
+        None,
+        1,
+        0,
+        1,
+    )
+    .expect("wide ConvTranspose1d target should construct");
+    graph.add_node(GraphNode::new(
+        "wide_target",
+        Layer::ConvTranspose1d(conv_transpose),
+        vec!["reshape".to_string()],
+    ));
+    graph.set_output("wide_target");
+    let input = BoundedTensor::new(arr1(&[-0.5_f32]).into_dyn(), arr1(&[0.5_f32]).into_dyn())
+        .expect("input bounds should construct");
+    (graph, input)
+}
+
 fn make_relu_alpha_state(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -258,6 +293,93 @@ fn test_collect_selected_crown_bounds_with_alpha_uses_reference_fallback_3677() 
         baseline.upper(),
         "#3677 fallback should preserve upper bounds"
     );
+}
+
+#[ntest::timeout(30000)]
+#[test]
+fn chunk_aware_alpha_budget_falls_back_without_dispatch_and_keeps_fixed_waves() {
+    ny_test_utils::env::with_env_edits(|env| {
+        env.set("NY_CROWN_CHUNK_AWARE_BUDGET", "1");
+        env.set("NY_DENSE_BUDGET_MB", "1");
+        env.set("NY_CROWN_OBJ_CHUNK", "0");
+        for key in [
+            "NY_NO_CHUNK_ABORT",
+            "NY_NO_CHUNK_GROW",
+            "NY_NO_CHUNK_WAVE_PAR",
+            "NY_PER_NODE_CAP_SECS",
+            "NY_PER_NODE_FLOOR_SECS",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, input) = make_chunk_aware_alpha_budget_graph();
+        let reference = reference_bounds_with_input(&graph, &input);
+        let targets = vec!["small_target".to_string(), "wide_target".to_string()];
+        let (selected, trace) = run_with_m1_alpha_trace(|| {
+            graph.collect_selected_crown_bounds_with_alpha_mode(
+                &input,
+                &targets,
+                &reference,
+                &GraphAlphaState::new(),
+                None,
+                Some(Instant::now() + Duration::from_secs(30)),
+                false,
+            )
+        });
+        let selected = selected.expect("M1 alpha-bound collection should succeed");
+
+        let small = selected
+            .get("small_target")
+            .expect("small target should be selected");
+        let small_reference = reference
+            .get("small_target")
+            .expect("small target reference bounds should exist");
+        assert_eq!(small.lower(), small_reference.lower());
+        assert_eq!(small.upper(), small_reference.upper());
+        assert!(selected.contains_key("wide_target"));
+
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            M1AlphaTraceEvent::BudgetAdmission {
+                node,
+                outcome: M1AlphaBudgetOutcome::BelowFloor,
+                deadline_present: false,
+            } if node == "small_target"
+        )));
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            M1AlphaTraceEvent::BudgetAdmission {
+                node,
+                outcome: M1AlphaBudgetOutcome::NotAdmitted,
+                deadline_present: false,
+            } if node == "reshape"
+        )));
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            M1AlphaTraceEvent::BudgetAdmission {
+                node,
+                outcome: M1AlphaBudgetOutcome::Allocate,
+                deadline_present: true,
+            } if node == "wide_target"
+        )));
+        for fallback_node in ["small_target", "reshape"] {
+            assert!(
+                !trace.iter().any(|event| matches!(
+                    event,
+                    M1AlphaTraceEvent::BackwardDispatch { node, .. }
+                        if node == fallback_node
+                )),
+                "{fallback_node} must take its reference bound without backward dispatch"
+            );
+        }
+        assert!(trace.iter().any(|event| matches!(
+            event,
+            M1AlphaTraceEvent::BackwardDispatch {
+                node,
+                retained_fixed_wave: true,
+            } if node == "wide_target"
+        )));
+    });
 }
 
 fn collect_refresh_state(

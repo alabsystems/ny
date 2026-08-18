@@ -46,8 +46,6 @@ pub mod unfold;
 /// Zonotope tensor for correlation-aware bound propagation via shared error symbols.
 pub mod zonotope;
 
-/// Interval-bounded tensor type for representing input regions with lower/upper bounds.
-pub use bounded_tensor::BoundedTensor;
 /// Double-precision bounded tensor for f64 propagation (soundnessbench, sat_relu).
 pub use bounded_tensor::BoundedTensor64;
 /// Shared inverted-bounds repair strategy for propagation and readback code. Part of #3307.
@@ -59,6 +57,12 @@ pub use bounded_tensor::L2Constraint;
 pub use bounded_tensor::RepairStrategy;
 /// Shared inverted-bounds repair helpers. Part of #3307.
 pub use bounded_tensor::{repair_inverted_bounds, repair_inverted_bounds_nd};
+/// Interval-bounded tensor type for representing input regions with lower/upper bounds.
+pub use bounded_tensor::{
+    BoundedTensor, BoundedTensorHostAllocationEndpointV1, BoundedTensorHostAllocationInvalidV1,
+    BoundedTensorHostAllocationProvenanceV1, BoundedTensorHostAllocationReceiptV1,
+    BoundedTensorHostAllocationUnsupportedV1, BOUNDED_TENSOR_HOST_ALLOCATION_MAX_RANK_V1,
+};
 /// Compressed f16 bounds for 50% memory reduction vs f32 storage.
 pub use compressed::{CompressedBounds, CompressionStats};
 /// Generic scalar-type wrappers that adapt external types to internal f32 representation.
@@ -70,7 +74,11 @@ pub use pool::{PoolStats, PooledBuffer, TensorPool};
 /// Pooled ndarray storage that auto-returns backing buffers on drop.
 pub use pooled_array::PooledArray;
 /// Directed rounding utilities for sound floating-point bound arithmetic.
-pub use rounding::{next_down_f32, next_up_f32, shift_down_n_ulps, shift_up_n_ulps};
+pub use rounding::{
+    add_down_f32, add_up_f32, cast_f64_to_f32_down, cast_f64_to_f32_up, div_down_f32, div_up_f32,
+    mul_down_f32, mul_up_f32, next_down_f32, next_up_f32, shift_down_n_ulps, shift_up_n_ulps,
+    sub_down_f32, sub_up_f32,
+};
 /// Dynamic tensor storage for branch-and-bound domain management (LIFO/FIFO).
 pub use tensor_storage::{
     create_tensor_storage, QueueTensorStorage, StackTensorStorage, TensorStorage, TreeTraversal,

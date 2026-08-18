@@ -37,8 +37,8 @@
 //! [`concretize_row_directed`](crate::bounds::concretize_row_directed) then
 //! applies the identical directed cast + repair. The tap order emitted by the
 //! `UnfoldPlan` is `(ic, ki, kj)`-lexicographic, which is strictly increasing in
-//! the input flat index `ic·in_h·in_w + ih·in_w + iw` (stride ≥ 1), so no sort is
-//! needed. Result: **bit-for-bit** equal to
+//! the input flat index `ic·in_h·in_w + ih·in_w + iw` for either a fixed affine
+//! or anchored window origin, so no sort is needed. Result: **bit-for-bit** equal to
 //! `self.to_dense()?.concretize_sound(input)`, pinned by
 //! `sparse_concretize_matches_dense_bit_identical`.
 //!
@@ -54,69 +54,83 @@
 //!
 //! ## Scope
 //!
-//! Fast-pathed layouts: 6D dense patches (with or without a carried per-row
-//! `coeff_err`), 4D sparse patches (exact by scope guard), dense identity, and
-//! sparse identity. The 7D / 5D explicit-rows layouts (whose per-cell tap counts
+//! Fast-pathed layouts: affine or anchored 6D dense patches (with or without a
+//! carried per-row `coeff_err`), affine 4D sparse patches (exact by scope
+//! guard), dense identity, and affine sparse identity. Anchored sparse layouts
+//! are a typed refusal until their coefficient-error route exists. The 7D / 5D
+//! explicit-rows layouts (whose per-cell tap counts
 //! overlap and whose err accumulators are f64) return
 //! [`NyError::UnsupportedOp`](ny_core::NyError::UnsupportedOp) so the caller falls
 //! back to the certified dense-chunked path — sound, just not sped up.
 
-use std::time::Instant;
+use std::{mem::size_of, time::Instant};
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};
-use ny_tensor::{next_up_f32, BoundedTensor};
+use ny_tensor::BoundedTensor;
 
 use crate::bounds::concretize_row_directed;
-use crate::contiguous_flat_slice;
 use crate::layers::linear::crown_single_gamma_n_f32;
 
 use super::scatter::{
-    as_flat, build_unfold_plan, compute_unfold_index_map, validate_patches_shape,
+    build_unfold_plan, compute_unfold_index_map_with_deadline, try_as_flat_with_deadline,
+    validate_patches_shape,
 };
-use super::PatchesLinearBounds;
+use super::to_dense::{
+    f32_abs_exact, nonnegative_f32_error_or_infinity, publish_error_up_normal, try_filled_f32_vec,
+};
+use super::{PatchesLinearBounds, PatchesMaterializationDeadline, PatchesMemoryAdmission};
 
-/// Rows between deadline polls (cheap `Instant::now` amortization).
-const DEADLINE_CHECK_STRIDE: usize = 8192;
-
-/// Sanitize a certified per-column error EXACTLY as
-/// `LinearBounds::new_or_conservative_with_err` does before concretize consumes
-/// it: non-finite or negative → `+INF` (outward poison), otherwise kept.
-#[inline]
-fn sanitize_err(v: f32) -> f32 {
-    if v.is_finite() && v >= 0.0 {
-        v
-    } else {
-        f32::INFINITY
-    }
-}
-
-/// Poll `deadline` every [`DEADLINE_CHECK_STRIDE`] rows, matching
-/// `concretize_sound_chunked`'s between-block deadline handling: on expiry the
-/// caller receives `DeadlineExceeded` (never a partial result).
-#[inline]
-fn check_deadline(deadline: Option<Instant>, row: usize, total: usize) -> Result<()> {
-    if row.is_multiple_of(DEADLINE_CHECK_STRIDE) {
-        if let Some(d) = deadline {
-            if Instant::now() >= d {
-                return Err(NyError::DeadlineExceeded(format!(
-                    "patches sparse concretize: deadline exceeded at row {row} of {total}"
-                )));
-            }
-        }
+fn try_reserve_row_workspace(
+    vectors: &mut [&mut Vec<f32>],
+    elements_each: usize,
+    admission: &mut PatchesMemoryAdmission,
+    site: &'static str,
+    deadline: &mut PatchesMaterializationDeadline,
+) -> Result<()> {
+    for vector in vectors {
+        deadline.checkpoint(site)?;
+        vector
+            .try_reserve_exact(elements_each)
+            .map_err(|_| admission.allocation_error(site))?;
+        deadline.checkpoint(site)?;
+        admission.reconcile_vec_capacity::<f32>(elements_each, vector.capacity(), site)?;
     }
     Ok(())
 }
 
+#[inline]
+fn strided_scratch_bytes(array: &ArrayD<f32>) -> usize {
+    if array.as_slice().is_some() {
+        0
+    } else {
+        array.len().saturating_mul(size_of::<f32>())
+    }
+}
+
+fn check_sparse_memory(
+    required_bytes: usize,
+    site: &'static str,
+) -> Result<PatchesMemoryAdmission> {
+    PatchesMemoryAdmission::check(required_bytes, site)
+}
+
 /// Assemble the flat `[total]` concrete bounds (±inf rows are legal — the
 /// per-row kernel emits the sound `[-inf, +inf]` degrade for repaired rows).
-fn finalize(out_lower: Vec<f32>, out_upper: Vec<f32>) -> Result<BoundedTensor> {
+fn finalize(
+    out_lower: Vec<f32>,
+    out_upper: Vec<f32>,
+    deadline: &mut PatchesMaterializationDeadline,
+) -> Result<BoundedTensor> {
     let total = out_lower.len();
+    deadline.checkpoint("before patches sparse concretize output wrapping")?;
     let lower = ArrayD::from_shape_vec(IxDyn(&[total]), out_lower)
         .map_err(|e| NyError::InvalidSpec(format!("patches sparse concretize lower: {e}")))?;
     let upper = ArrayD::from_shape_vec(IxDyn(&[total]), out_upper)
         .map_err(|e| NyError::InvalidSpec(format!("patches sparse concretize upper: {e}")))?;
-    BoundedTensor::new_allow_infinite(lower, upper)
+    let bounded = BoundedTensor::new_allow_infinite(lower, upper)?;
+    deadline.checkpoint("after patches sparse concretize output wrapping")?;
+    Ok(bounded)
 }
 
 impl PatchesLinearBounds {
@@ -136,17 +150,37 @@ impl PatchesLinearBounds {
         input: &BoundedTensor,
         deadline: Option<Instant>,
     ) -> Result<BoundedTensor> {
+        let mut deadline = PatchesMaterializationDeadline::new(deadline);
+        deadline.checkpoint("before patches sparse concretization")?;
         let (in_c, in_h, in_w) = self.lower_a.input_shape;
         let in_dim = checked_shape_product(&[in_c, in_h, in_w]).ok_or_else(|| {
             NyError::InvalidSpec(format!(
                 "patches sparse concretize: input dims overflow: {in_c} * {in_h} * {in_w}"
             ))
         })?;
-        let input_flat = input.flatten();
-        let in_l_cow = contiguous_flat_slice(input_flat.lower());
-        let in_u_cow = contiguous_flat_slice(input_flat.upper());
-        let in_l = in_l_cow.as_ref();
-        let in_u = in_u_cow.as_ref();
+        let input_scratch_bytes = strided_scratch_bytes(input.lower())
+            .saturating_add(strided_scratch_bytes(input.upper()));
+        let source_bytes = self.memory_bytes();
+        let mut input_admission = PatchesMemoryAdmission::check(
+            source_bytes.saturating_add(input_scratch_bytes),
+            "patches sparse concretize input scratch pair",
+        )?;
+        let mut in_l_scratch = Vec::new();
+        let mut in_u_scratch = Vec::new();
+        let in_l = try_as_flat_with_deadline(
+            input.lower(),
+            &mut in_l_scratch,
+            "patches sparse concretize lower-input scratch",
+            &mut input_admission,
+            &mut deadline,
+        )?;
+        let in_u = try_as_flat_with_deadline(
+            input.upper(),
+            &mut in_u_scratch,
+            "patches sparse concretize upper-input scratch",
+            &mut input_admission,
+            &mut deadline,
+        )?;
         if in_l.len() != in_dim || in_u.len() != in_dim {
             return Err(NyError::ShapeMismatch {
                 expected: vec![in_dim],
@@ -154,25 +188,27 @@ impl PatchesLinearBounds {
             });
         }
 
-        // The upper side reuses the lower side's unfold geometry (exactly as
-        // `materialize_dense_patches_to_dense` requires); a divergence must fall
-        // back to the certified dense path rather than mis-scatter.
-        if self.lower_a.input_shape != self.upper_a.input_shape
-            || self.lower_a.output_shape != self.upper_a.output_shape
-            || self.lower_a.stride != self.upper_a.stride
-            || self.lower_a.padding != self.upper_a.padding
-        {
-            return Err(NyError::UnsupportedOp(
-                "patches sparse concretize: lower/upper geometry mismatch".into(),
-            ));
-        }
+        // Every paired path below reuses the lower-side map for upper
+        // coefficients, so authenticate their typed geometry first.
+        self.lower_a
+            .validate_common_geometry_with_poll(&self.upper_a, &mut deadline)?;
+        deadline.checkpoint("after patches sparse concretize validation")?;
+
+        let input_scratch_bytes =
+            input_scratch_bytes.saturating_add(input_admission.capacity_overage_bytes());
 
         if self.lower_a.unstable_idx.is_some() || self.upper_a.unstable_idx.is_some() {
-            self.sparse_concretize_sparse_layout(in_l, in_u, in_dim, deadline)
+            self.sparse_concretize_sparse_layout(
+                in_l,
+                in_u,
+                in_dim,
+                input_scratch_bytes,
+                &mut deadline,
+            )
         } else if self.lower_a.identity && self.upper_a.identity {
-            self.sparse_concretize_identity(in_l, in_u, in_dim, deadline)
+            self.sparse_concretize_identity(in_l, in_u, in_dim, input_scratch_bytes, &mut deadline)
         } else {
-            self.sparse_concretize_dense_6d(in_l, in_u, deadline)
+            self.sparse_concretize_dense_6d(in_l, in_u, input_scratch_bytes, &mut deadline)
         }
     }
 
@@ -182,7 +218,8 @@ impl PatchesLinearBounds {
         &self,
         in_l: &[f32],
         in_u: &[f32],
-        deadline: Option<Instant>,
+        input_scratch_bytes: usize,
+        deadline: &mut PatchesMaterializationDeadline,
     ) -> Result<BoundedTensor> {
         let (out_c, out_h, out_w) = self.lower_a.output_shape;
         let (in_c, _, _) = self.lower_a.input_shape;
@@ -218,26 +255,69 @@ impl PatchesLinearBounds {
                 "patches sparse concretize: lower/upper kernel mismatch".into(),
             ));
         }
-        let block = in_c * kh * kw;
-        let index_map = compute_unfold_index_map(&self.lower_a, kh, kw)?;
-        let plan = build_unfold_plan(&index_map, out_h, out_w, block);
+        let lower_err = self.lower_a.coeff_err.as_ref();
+        let upper_err = self.upper_a.coeff_err.as_ref();
+        for err in [lower_err, upper_err].into_iter().flatten() {
+            if err.len() != self.row_count {
+                return Err(NyError::ShapeMismatch {
+                    expected: vec![self.row_count],
+                    got: vec![err.len()],
+                });
+            }
+        }
+        let resident_before_map = self.memory_bytes().saturating_add(input_scratch_bytes);
+        let index_map = compute_unfold_index_map_with_deadline(
+            &self.lower_a,
+            kh,
+            kw,
+            resident_before_map,
+            deadline,
+        )?;
+        let plan = build_unfold_plan(&index_map);
+        let block = plan.block();
+
+        let need_err = lower_err.is_some() || upper_err.is_some();
+        let output_pair_bytes = out_dim.saturating_mul(2).saturating_mul(size_of::<f32>());
+        let workspace_vectors = if need_err { 6usize } else { 4usize };
+        let workspace_bytes = block
+            .saturating_mul(workspace_vectors)
+            .saturating_mul(size_of::<f32>());
+        let resident_bytes = self
+            .memory_bytes()
+            .saturating_add(input_scratch_bytes)
+            .saturating_add(index_map.memory_bytes())
+            .saturating_add(strided_scratch_bytes(lower_patches))
+            .saturating_add(strided_scratch_bytes(upper_patches));
+        let required_bytes = resident_bytes
+            .saturating_add(output_pair_bytes)
+            .saturating_add(workspace_bytes);
+        let mut admission = check_sparse_memory(
+            required_bytes,
+            "patches sparse concretize dense-6D materialization",
+        )?;
 
         let mut lscratch = Vec::new();
         let mut uscratch = Vec::new();
-        let lower_flat = as_flat(lower_patches, &mut lscratch);
-        let upper_flat = as_flat(upper_patches, &mut uscratch);
+        let lower_flat = try_as_flat_with_deadline(
+            lower_patches,
+            &mut lscratch,
+            "patches sparse concretize lower scratch",
+            &mut admission,
+            deadline,
+        )?;
+        let upper_flat = try_as_flat_with_deadline(
+            upper_patches,
+            &mut uscratch,
+            "patches sparse concretize upper scratch",
+            &mut admission,
+            deadline,
+        )?;
 
-        let lower_err = self.lower_a.coeff_err.as_ref();
-        let upper_err = self.upper_a.coeff_err.as_ref();
-        let need_err = lower_err.is_some() || upper_err.is_some();
         // 6D per-cell tap count is provably 1 (each output position touches each
         // input pixel at most once), so the accumulation-rounding term is γ(1)·|coeff|.
         let gamma1 = crown_single_gamma_n_f32(1);
 
-        let positions = out_h * out_w;
-        let mut out_lower = vec![0.0f32; out_dim];
-        let mut out_upper = vec![0.0f32; out_dim];
-
+        let positions = plan.positions();
         let mut la_c: Vec<f32> = Vec::new();
         let mut ua_c: Vec<f32> = Vec::new();
         let mut inl_c: Vec<f32> = Vec::new();
@@ -245,8 +325,44 @@ impl PatchesLinearBounds {
         let mut le_c: Vec<f32> = Vec::new();
         let mut ue_c: Vec<f32> = Vec::new();
 
+        let mut out_lower = try_filled_f32_vec(
+            out_dim,
+            0.0,
+            &mut admission,
+            "patches sparse concretize dense-6D lower output allocation",
+            deadline,
+        )?;
+        let mut out_upper = try_filled_f32_vec(
+            out_dim,
+            0.0,
+            &mut admission,
+            "patches sparse concretize dense-6D upper output allocation",
+            deadline,
+        )?;
+        if need_err {
+            let mut workspaces = [
+                &mut la_c, &mut ua_c, &mut inl_c, &mut inu_c, &mut le_c, &mut ue_c,
+            ];
+            try_reserve_row_workspace(
+                &mut workspaces,
+                block,
+                &mut admission,
+                "patches sparse concretize dense-6D row workspace",
+                deadline,
+            )?;
+        } else {
+            let mut workspaces = [&mut la_c, &mut ua_c, &mut inl_c, &mut inu_c];
+            try_reserve_row_workspace(
+                &mut workspaces,
+                block,
+                &mut admission,
+                "patches sparse concretize dense-6D row workspace",
+                deadline,
+            )?;
+        }
+
         for out_flat in 0..out_dim {
-            check_deadline(deadline, out_flat, out_dim)?;
+            deadline.work(1, "during patches sparse dense-6D row loop")?;
             let pos = out_flat % positions;
             let oh = pos / out_w;
             let ow = pos % out_w;
@@ -272,21 +388,22 @@ impl PatchesLinearBounds {
                     // no carried err materializes a zero err matrix (0.0 here).
                     let le_col = match lower_err {
                         Some(er) => {
-                            let erv = f64::from(er.get(out_flat).copied().unwrap_or(0.0)).max(0.0);
-                            sanitize_err(next_up_f32((erv + gamma1 * f64::from(lv.abs())) as f32))
+                            let erv = nonnegative_f32_error_or_infinity(er[out_flat]);
+                            publish_error_up_normal(erv + gamma1 * f32_abs_exact(lv))
                         }
                         None => 0.0,
                     };
                     let ue_col = match upper_err {
                         Some(er) => {
-                            let erv = f64::from(er.get(out_flat).copied().unwrap_or(0.0)).max(0.0);
-                            sanitize_err(next_up_f32((erv + gamma1 * f64::from(uv.abs())) as f32))
+                            let erv = nonnegative_f32_error_or_infinity(er[out_flat]);
+                            publish_error_up_normal(erv + gamma1 * f32_abs_exact(uv))
                         }
                         None => 0.0,
                     };
                     le_c.push(le_col);
                     ue_c.push(ue_col);
                 }
+                deadline.work(1, "during patches sparse dense-6D tap loop")?;
             }
 
             let lb = self.lower_b[out_flat];
@@ -302,7 +419,7 @@ impl PatchesLinearBounds {
             out_upper[out_flat] = u;
         }
 
-        finalize(out_lower, out_upper)
+        finalize(out_lower, out_upper, deadline)
     }
 
     /// Dense identity (`A = I`, exact): each output row `i` is a single column
@@ -312,8 +429,11 @@ impl PatchesLinearBounds {
         in_l: &[f32],
         in_u: &[f32],
         in_dim: usize,
-        deadline: Option<Instant>,
+        input_scratch_bytes: usize,
+        deadline: &mut PatchesMaterializationDeadline,
     ) -> Result<BoundedTensor> {
+        self.lower_a.validate_identity_geometry()?;
+        self.upper_a.validate_identity_geometry()?;
         let (out_c, out_h, out_w) = self.lower_a.output_shape;
         let out_dim = checked_shape_product(&[out_c, out_h, out_w]).ok_or_else(|| {
             NyError::InvalidSpec("patches sparse concretize: output dims overflow".into())
@@ -324,11 +444,37 @@ impl PatchesLinearBounds {
             ));
         }
         self.validate_row_count()?;
+        if self.lower_a.coeff_err.is_some() || self.upper_a.coeff_err.is_some() {
+            return Err(NyError::InternalError(
+                "patches sparse concretize: coeff_err carried on an exact identity path".into(),
+            ));
+        }
 
-        let mut out_lower = vec![0.0f32; out_dim];
-        let mut out_upper = vec![0.0f32; out_dim];
+        let required_bytes = out_dim
+            .saturating_mul(2)
+            .saturating_mul(size_of::<f32>())
+            .saturating_add(input_scratch_bytes)
+            .saturating_add(self.memory_bytes());
+        let mut admission = check_sparse_memory(
+            required_bytes,
+            "patches sparse concretize identity materialization",
+        )?;
+        let mut out_lower = try_filled_f32_vec(
+            out_dim,
+            0.0,
+            &mut admission,
+            "patches sparse concretize identity lower output allocation",
+            deadline,
+        )?;
+        let mut out_upper = try_filled_f32_vec(
+            out_dim,
+            0.0,
+            &mut admission,
+            "patches sparse concretize identity upper output allocation",
+            deadline,
+        )?;
         for out_flat in 0..out_dim {
-            check_deadline(deadline, out_flat, out_dim)?;
+            deadline.work(1, "during patches sparse identity row loop")?;
             let lb = self.lower_b[out_flat];
             let ub = self.upper_b[out_flat];
             let (l, u) = concretize_row_directed(
@@ -344,7 +490,7 @@ impl PatchesLinearBounds {
             out_lower[out_flat] = l;
             out_upper[out_flat] = u;
         }
-        finalize(out_lower, out_upper)
+        finalize(out_lower, out_upper, deadline)
     }
 
     /// 4D sparse patches and sparse identity (both exact — the sparse layout
@@ -357,8 +503,13 @@ impl PatchesLinearBounds {
         in_l: &[f32],
         in_u: &[f32],
         in_dim: usize,
-        deadline: Option<Instant>,
+        input_scratch_bytes: usize,
+        deadline: &mut PatchesMaterializationDeadline,
     ) -> Result<BoundedTensor> {
+        // Authenticate both indices, tensor prefixes, and bias contracts before
+        // allocating the full output vectors or reusing the lower unfold map.
+        let idx = self.validate_sparse_pair_with_poll(deadline)?;
+
         // Scope guard mirror (docs/PATCHES_7D_COEFF_ERR_CLOSURE.md I2/B6): the
         // sparse layout stays exact; a carried Some is a hard error here too.
         if self.lower_a.coeff_err.is_some() || self.upper_a.coeff_err.is_some() {
@@ -374,16 +525,8 @@ impl PatchesLinearBounds {
             NyError::InvalidSpec("patches sparse concretize: output dims overflow".into())
         })?;
 
-        let idx =
-            self.lower_a.unstable_idx.as_ref().ok_or_else(|| {
-                NyError::InternalError("sparse concretize: no unstable_idx".into())
-            })?;
-        idx.validate(out_c, out_h, out_w, None)?;
-
         // Non-sparse rows: all-zero coefficients, zero bias (expand_sparse_bias).
         let (empty_l, empty_u) = concretize_row_directed(0.0, 0.0, &[], &[], &[], &[], None, None);
-        let mut out_lower = vec![empty_l; out_dim];
-        let mut out_upper = vec![empty_u; out_dim];
 
         if self.lower_a.identity && self.upper_a.identity {
             if out_dim != in_dim {
@@ -391,10 +534,31 @@ impl PatchesLinearBounds {
                     "patches sparse concretize: sparse identity dim mismatch".into(),
                 ));
             }
-            idx.validate(out_c, out_h, out_w, Some(self.lower_b.len()))?;
-            idx.validate(out_c, out_h, out_w, Some(self.upper_b.len()))?;
+            let required_bytes = out_dim
+                .saturating_mul(2)
+                .saturating_mul(size_of::<f32>())
+                .saturating_add(input_scratch_bytes)
+                .saturating_add(self.memory_bytes());
+            let mut admission = check_sparse_memory(
+                required_bytes,
+                "patches sparse identity concretize materialization",
+            )?;
+            let mut out_lower = try_filled_f32_vec(
+                out_dim,
+                empty_l,
+                &mut admission,
+                "patches sparse identity lower output allocation",
+                deadline,
+            )?;
+            let mut out_upper = try_filled_f32_vec(
+                out_dim,
+                empty_u,
+                &mut admission,
+                "patches sparse identity upper output allocation",
+                deadline,
+            )?;
             for i in 0..idx.len() {
-                check_deadline(deadline, i, idx.len())?;
+                deadline.work(1, "during sparse identity concretize row loop")?;
                 let flat = idx.flat_index(i, out_h, out_w);
                 let lb = self.lower_b[i];
                 let ub = self.upper_b[i];
@@ -411,7 +575,7 @@ impl PatchesLinearBounds {
                 out_lower[flat] = l;
                 out_upper[flat] = u;
             }
-            return finalize(out_lower, out_upper);
+            return finalize(out_lower, out_upper, deadline);
         }
 
         let lower_patches = self.lower_a.patches.as_ref().ok_or_else(|| {
@@ -441,25 +605,79 @@ impl PatchesLinearBounds {
                 "patches sparse concretize: lower/upper sparse shape mismatch".into(),
             ));
         }
-        // expand_sparse_bias reads sparse_lower[i]/sparse_upper[i] per index.
-        idx.validate(out_c, out_h, out_w, Some(self.lower_b.len()))?;
-        idx.validate(out_c, out_h, out_w, Some(self.upper_b.len()))?;
 
-        let block = in_c * kh * kw;
-        let index_map = compute_unfold_index_map(&self.lower_a, kh, kw)?;
-        let plan = build_unfold_plan(&index_map, out_h, out_w, block);
+        let resident_before_map = self.memory_bytes().saturating_add(input_scratch_bytes);
+        let index_map = compute_unfold_index_map_with_deadline(
+            &self.lower_a,
+            kh,
+            kw,
+            resident_before_map,
+            deadline,
+        )?;
+        let plan = build_unfold_plan(&index_map);
+        let block = plan.block();
+        let output_pair_bytes = out_dim.saturating_mul(2).saturating_mul(size_of::<f32>());
+        let workspace_bytes = block.saturating_mul(4).saturating_mul(size_of::<f32>());
+        let resident_bytes = self
+            .memory_bytes()
+            .saturating_add(input_scratch_bytes)
+            .saturating_add(index_map.memory_bytes())
+            .saturating_add(strided_scratch_bytes(lower_patches))
+            .saturating_add(strided_scratch_bytes(upper_patches));
+        let required_bytes = resident_bytes
+            .saturating_add(output_pair_bytes)
+            .saturating_add(workspace_bytes);
+        let mut admission =
+            check_sparse_memory(required_bytes, "sparse patches concretize materialization")?;
         let mut lscratch = Vec::new();
         let mut uscratch = Vec::new();
-        let lower_flat = as_flat(lower_patches, &mut lscratch);
-        let upper_flat = as_flat(upper_patches, &mut uscratch);
+        let lower_flat = try_as_flat_with_deadline(
+            lower_patches,
+            &mut lscratch,
+            "sparse patches concretize lower scratch",
+            &mut admission,
+            deadline,
+        )?;
+        let upper_flat = try_as_flat_with_deadline(
+            upper_patches,
+            &mut uscratch,
+            "sparse patches concretize upper scratch",
+            &mut admission,
+            deadline,
+        )?;
 
         let mut la_c: Vec<f32> = Vec::new();
         let mut ua_c: Vec<f32> = Vec::new();
         let mut inl_c: Vec<f32> = Vec::new();
         let mut inu_c: Vec<f32> = Vec::new();
 
+        let mut out_lower = try_filled_f32_vec(
+            out_dim,
+            empty_l,
+            &mut admission,
+            "sparse patches concretize lower output allocation",
+            deadline,
+        )?;
+        let mut out_upper = try_filled_f32_vec(
+            out_dim,
+            empty_u,
+            &mut admission,
+            "sparse patches concretize upper output allocation",
+            deadline,
+        )?;
+        {
+            let mut workspaces = [&mut la_c, &mut ua_c, &mut inl_c, &mut inu_c];
+            try_reserve_row_workspace(
+                &mut workspaces,
+                block,
+                &mut admission,
+                "sparse patches concretize row workspace",
+                deadline,
+            )?;
+        }
+
         for i in 0..idx.len() {
-            check_deadline(deadline, i, idx.len())?;
+            deadline.work(1, "during sparse patches concretize row loop")?;
             let out_flat = idx.flat_index(i, out_h, out_w);
             let h = idx.heights[i];
             let w = idx.widths[i];
@@ -474,6 +692,7 @@ impl PatchesLinearBounds {
                 ua_c.push(upper_flat[pat_base + block_offset]);
                 inl_c.push(in_l[in_flat]);
                 inu_c.push(in_u[in_flat]);
+                deadline.work(1, "during sparse patches concretize tap loop")?;
             }
             let lb = self.lower_b[i];
             let ub = self.upper_b[i];
@@ -482,6 +701,6 @@ impl PatchesLinearBounds {
             out_upper[out_flat] = u;
         }
 
-        finalize(out_lower, out_upper)
+        finalize(out_lower, out_upper, deadline)
     }
 }

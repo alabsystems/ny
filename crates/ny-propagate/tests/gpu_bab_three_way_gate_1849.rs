@@ -121,7 +121,7 @@ fn result_kind(result: &BabVerificationStatus) -> &'static str {
     match result {
         BabVerificationStatus::Verified => "Verified",
         BabVerificationStatus::Violated { .. } => "Violated",
-        BabVerificationStatus::PotentialViolation => "PotentialViolation",
+        BabVerificationStatus::PotentialViolation { .. } => "PotentialViolation",
         BabVerificationStatus::Unknown { .. } => "Unknown",
         BabVerificationStatus::Timeout => "Timeout",
     }

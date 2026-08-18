@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 mod alpha;
 mod maxpool;
 
-pub(crate) use alpha::extract_relu_gpu_layer_with_alpha;
+pub(crate) use alpha::{
+    extract_relu_gpu_layer_with_alpha, gpu_relu_affine_cell, GpuReluAffineVariant,
+};
 use maxpool::extract_maxpool_gpu_layer;
 
 /// Build a `GpuCrownLayer::Activation` from per-neuron linear relaxation bounds.
@@ -219,6 +221,7 @@ pub(crate) fn try_extract_single_gpu_layer(
                     .and_then(|b| Some(b.as_slice()?.to_vec().into())),
                 out_features: linear.out_features(),
                 in_features: linear.in_features(),
+                cert_err: Default::default(),
             });
         }
         // Elementwise activations: compute per-neuron linear relaxation
@@ -316,6 +319,7 @@ pub(crate) fn try_extract_single_gpu_layer(
                 out_w: ow,
                 in_h,
                 in_w,
+                cert_err: Default::default(),
             });
         }
         Layer::Conv1d(c) => {
@@ -367,6 +371,7 @@ pub(crate) fn try_extract_single_gpu_layer(
                 out_w: out_len,
                 in_h: 1,
                 in_w: in_len,
+                cert_err: Default::default(),
             });
         }
         Layer::MaxPool2d(pool) => {
@@ -537,6 +542,7 @@ pub(crate) fn try_extract_batch_norm_conv1x1(
             out_w: epc,
             in_h: 1,
             in_w: epc,
+            cert_err: Default::default(),
         },
         werr_y,
     ))

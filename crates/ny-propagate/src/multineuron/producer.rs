@@ -38,6 +38,7 @@
 //! pre-activations → assert inside `P` and inside every emitted coupling facet).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ndarray::Array2;
 use ny_core::{GemmEngine, NyError, Result};
@@ -47,6 +48,69 @@ use super::Octahedron2;
 use crate::bounds::GraphAlphaState;
 use crate::network::SpecCrownRequest;
 use crate::GraphNetwork;
+
+/// Cooperative deadline checkpoints for joint-bound construction.
+///
+/// The typed stage is also the narrow deterministic test seam: tests inject a
+/// checker that fails at an exact boundary, while production checks the real
+/// request-local [`Instant`] at the same boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProducerDeadlineStage {
+    BeforeRequestConstruction,
+    AfterInputValidation,
+    AfterSpecConstruction,
+    AfterCrownBackward,
+    AfterBoundsValidation,
+    AfterLowerConversion,
+    AfterUpperConversion,
+    BeforeSinglePublish,
+    AfterBatchPairValidation(usize),
+    AfterBatchPairSpecConstruction(usize),
+    BeforeBatchPairConversion(usize),
+    AfterBatchPairConversion(usize),
+    BeforeBatchPublish,
+}
+
+impl std::fmt::Display for ProducerDeadlineStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeRequestConstruction => write!(formatter, "before request construction"),
+            Self::AfterInputValidation => write!(formatter, "after input validation"),
+            Self::AfterSpecConstruction => write!(formatter, "after spec construction"),
+            Self::AfterCrownBackward => write!(formatter, "after CROWN backward"),
+            Self::AfterBoundsValidation => write!(formatter, "after bounds validation"),
+            Self::AfterLowerConversion => write!(formatter, "after lower-bound conversion"),
+            Self::AfterUpperConversion => write!(formatter, "after upper-bound conversion"),
+            Self::BeforeSinglePublish => write!(formatter, "before publishing one octahedron"),
+            Self::AfterBatchPairValidation(pair) => {
+                write!(formatter, "after validating batch pair {pair}")
+            }
+            Self::AfterBatchPairSpecConstruction(pair) => {
+                write!(formatter, "after constructing spec for batch pair {pair}")
+            }
+            Self::BeforeBatchPairConversion(pair) => {
+                write!(formatter, "before converting batch pair {pair}")
+            }
+            Self::AfterBatchPairConversion(pair) => {
+                write!(formatter, "after converting batch pair {pair}")
+            }
+            Self::BeforeBatchPublish => write!(formatter, "before publishing batched octahedra"),
+        }
+    }
+}
+
+fn check_deadline(
+    deadline: Option<Instant>,
+    operation: &str,
+    stage: ProducerDeadlineStage,
+) -> Result<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(format!(
+            "{operation}: deadline exceeded {stage}"
+        )));
+    }
+    Ok(())
+}
 
 /// Sound octahedral `P ⊇ Z` for the both-unstable pair `(i, j)` at the ReLU
 /// pre-activation node `pre_node` (design §1.2, Invariant P1).
@@ -75,6 +139,69 @@ pub fn combined_row_octahedron(
     j: usize,
     engine: Option<&dyn GemmEngine>,
 ) -> Result<Octahedron2> {
+    combined_row_octahedron_with_deadline(
+        graph,
+        input,
+        alpha_state,
+        node_bounds,
+        pre_node,
+        i,
+        j,
+        engine,
+        None,
+    )
+}
+
+/// Deadline-bounded form of [`combined_row_octahedron`].
+///
+/// The same private deadline is forwarded into the CROWN request and polled
+/// through validation, spec construction, post-backward validation, conversion,
+/// and immediately before publication. An expired result is discarded rather
+/// than published as a cut-production candidate.
+#[allow(clippy::too_many_arguments)]
+pub fn combined_row_octahedron_with_deadline(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    alpha_state: &GraphAlphaState,
+    node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    pre_node: &str,
+    i: usize,
+    j: usize,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
+) -> Result<Octahedron2> {
+    let mut check = |stage| check_deadline(deadline, "combined_row_octahedron", stage);
+    combined_row_octahedron_with_checker(
+        graph,
+        input,
+        alpha_state,
+        node_bounds,
+        pre_node,
+        i,
+        j,
+        engine,
+        deadline,
+        &mut check,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combined_row_octahedron_with_checker<F>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    alpha_state: &GraphAlphaState,
+    node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    pre_node: &str,
+    i: usize,
+    j: usize,
+    engine: Option<&dyn GemmEngine>,
+    crown_deadline: Option<Instant>,
+    check: &mut F,
+) -> Result<Octahedron2>
+where
+    F: FnMut(ProducerDeadlineStage) -> Result<()>,
+{
+    check(ProducerDeadlineStage::BeforeRequestConstruction)?;
     if i == j {
         return Err(NyError::InvalidSpec(
             "combined_row_octahedron requires two distinct neurons".into(),
@@ -95,6 +222,7 @@ pub fn combined_row_octahedron(
             "combined_row_octahedron: neuron index out of range (i={i}, j={j}, n_pre={n_pre})"
         )));
     }
+    check(ProducerDeadlineStage::AfterInputValidation)?;
 
     // Retarget a graph clone at the pre-activation node (the backward starts
     // there); the four spec rows are the coupling directions. Downstream nodes
@@ -109,11 +237,14 @@ pub fn combined_row_octahedron(
     spec[[2, j]] = 1.0;
     spec[[3, i]] = 1.0; // x_i - x_j
     spec[[3, j]] = -1.0;
+    check(ProducerDeadlineStage::AfterSpecConstruction)?;
 
     let bounds = SpecCrownRequest::new(&probe, input, &spec, engine)
         .node_bounds_opt(node_bounds)
         .alpha_state_opt(Some(alpha_state))
+        .deadline_opt(crown_deadline)
         .run()?;
+    check(ProducerDeadlineStage::AfterCrownBackward)?;
 
     let lo = bounds.lower();
     let hi = bounds.upper();
@@ -123,8 +254,11 @@ pub fn combined_row_octahedron(
             lo.len()
         )));
     }
+    check(ProducerDeadlineStage::AfterBoundsValidation)?;
     let lo: Vec<f64> = lo.iter().map(|&x| x as f64).collect();
+    check(ProducerDeadlineStage::AfterLowerConversion)?;
     let hi: Vec<f64> = hi.iter().map(|&x| x as f64).collect();
+    check(ProducerDeadlineStage::AfterUpperConversion)?;
 
     // OUTWARD rounding (Invariant P1): uppers up, lowers down, in f32 (the
     // certified representation). The spec backward already produced a sound f32
@@ -133,7 +267,7 @@ pub fn combined_row_octahedron(
     let out_up = |x: f64| next_up_f32(x as f32) as f64;
     let out_dn = |x: f64| next_down_f32(x as f32) as f64;
 
-    Ok(Octahedron2::from_bounds(
+    let octahedron = Octahedron2::from_bounds(
         out_dn(lo[0]), // l1
         out_up(hi[0]), // u1
         out_dn(lo[1]), // l2
@@ -142,7 +276,39 @@ pub fn combined_row_octahedron(
         out_up(hi[2]), // s_hi
         out_dn(lo[3]), // d_lo
         out_up(hi[3]), // d_hi
-    ))
+    );
+    check(ProducerDeadlineStage::BeforeSinglePublish)?;
+    Ok(octahedron)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn combined_row_octahedron_with_checker_for_test<F>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    alpha_state: &GraphAlphaState,
+    node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    pre_node: &str,
+    i: usize,
+    j: usize,
+    engine: Option<&dyn GemmEngine>,
+    mut check: F,
+) -> Result<Octahedron2>
+where
+    F: FnMut(ProducerDeadlineStage) -> Result<()>,
+{
+    combined_row_octahedron_with_checker(
+        graph,
+        input,
+        alpha_state,
+        node_bounds,
+        pre_node,
+        i,
+        j,
+        engine,
+        None,
+        &mut check,
+    )
 }
 
 /// BATCHED sound octahedral producer (increment 3, §5.3 efficiency): assemble a
@@ -169,7 +335,68 @@ pub fn combined_rows_octahedra(
     pairs: &[(usize, usize)],
     engine: Option<&dyn GemmEngine>,
 ) -> Result<Vec<Octahedron2>> {
+    combined_rows_octahedra_with_deadline(
+        graph,
+        input,
+        alpha_state,
+        node_bounds,
+        pre_node,
+        pairs,
+        engine,
+        None,
+    )
+}
+
+/// Deadline-bounded form of [`combined_rows_octahedra`].
+///
+/// The deadline is checked before allocating the batched spec, forwarded into
+/// the underlying CROWN request, polled for every validated/spec-built/converted
+/// pair, and checked again immediately before the complete vector is returned.
+/// Therefore expiry returns [`NyError::DeadlineExceeded`] with no partial vector
+/// and cannot publish a carrier assembled after its request budget expired.
+#[allow(clippy::too_many_arguments)]
+pub fn combined_rows_octahedra_with_deadline(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    alpha_state: &GraphAlphaState,
+    node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    pre_node: &str,
+    pairs: &[(usize, usize)],
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
+) -> Result<Vec<Octahedron2>> {
+    let mut check = |stage| check_deadline(deadline, "combined_rows_octahedra", stage);
+    combined_rows_octahedra_with_checker(
+        graph,
+        input,
+        alpha_state,
+        node_bounds,
+        pre_node,
+        pairs,
+        engine,
+        deadline,
+        &mut check,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combined_rows_octahedra_with_checker<F>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    alpha_state: &GraphAlphaState,
+    node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    pre_node: &str,
+    pairs: &[(usize, usize)],
+    engine: Option<&dyn GemmEngine>,
+    crown_deadline: Option<Instant>,
+    check: &mut F,
+) -> Result<Vec<Octahedron2>>
+where
+    F: FnMut(ProducerDeadlineStage) -> Result<()>,
+{
+    check(ProducerDeadlineStage::BeforeRequestConstruction)?;
     if pairs.is_empty() {
+        check(ProducerDeadlineStage::BeforeBatchPublish)?;
         return Ok(Vec::new());
     }
     let n_pre = node_bounds
@@ -180,7 +407,7 @@ pub fn combined_rows_octahedra(
                 "combined_rows_octahedra: pre-activation bounds for '{pre_node}' not available"
             ))
         })?;
-    for &(i, j) in pairs {
+    for (pair, &(i, j)) in pairs.iter().enumerate() {
         if i == j {
             return Err(NyError::InvalidSpec(
                 "combined_rows_octahedra requires two distinct neurons per pair".into(),
@@ -191,7 +418,9 @@ pub fn combined_rows_octahedra(
                 "combined_rows_octahedra: neuron index out of range (i={i}, j={j}, n_pre={n_pre})"
             )));
         }
+        check(ProducerDeadlineStage::AfterBatchPairValidation(pair))?;
     }
+    check(ProducerDeadlineStage::AfterInputValidation)?;
 
     let mut probe = graph.clone();
     probe.set_output(pre_node);
@@ -206,12 +435,16 @@ pub fn combined_rows_octahedra(
         spec[[base + 2, j]] = 1.0;
         spec[[base + 3, i]] = 1.0; // x_i - x_j
         spec[[base + 3, j]] = -1.0;
+        check(ProducerDeadlineStage::AfterBatchPairSpecConstruction(p))?;
     }
+    check(ProducerDeadlineStage::AfterSpecConstruction)?;
 
     let bounds = SpecCrownRequest::new(&probe, input, &spec, engine)
         .node_bounds_opt(node_bounds)
         .alpha_state_opt(Some(alpha_state))
+        .deadline_opt(crown_deadline)
         .run()?;
+    check(ProducerDeadlineStage::AfterCrownBackward)?;
 
     let lo = bounds.lower();
     let hi = bounds.upper();
@@ -221,11 +454,13 @@ pub fn combined_rows_octahedra(
             lo.len()
         )));
     }
+    check(ProducerDeadlineStage::AfterBoundsValidation)?;
     let out_up = |x: f32| next_up_f32(x) as f64;
     let out_dn = |x: f32| next_down_f32(x) as f64;
 
     let mut result = Vec::with_capacity(pairs.len());
     for p in 0..pairs.len() {
+        check(ProducerDeadlineStage::BeforeBatchPairConversion(p))?;
         let base = 4 * p;
         result.push(Octahedron2::from_bounds(
             out_dn(lo[base]),     // l1
@@ -237,6 +472,36 @@ pub fn combined_rows_octahedra(
             out_dn(lo[base + 3]), // d_lo
             out_up(hi[base + 3]), // d_hi
         ));
+        check(ProducerDeadlineStage::AfterBatchPairConversion(p))?;
     }
+    check(ProducerDeadlineStage::BeforeBatchPublish)?;
     Ok(result)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn combined_rows_octahedra_with_checker_for_test<F>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    alpha_state: &GraphAlphaState,
+    node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    pre_node: &str,
+    pairs: &[(usize, usize)],
+    engine: Option<&dyn GemmEngine>,
+    mut check: F,
+) -> Result<Vec<Octahedron2>>
+where
+    F: FnMut(ProducerDeadlineStage) -> Result<()>,
+{
+    combined_rows_octahedra_with_checker(
+        graph,
+        input,
+        alpha_state,
+        node_bounds,
+        pre_node,
+        pairs,
+        engine,
+        None,
+        &mut check,
+    )
 }

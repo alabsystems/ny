@@ -31,6 +31,7 @@ general:
 # re-validated before emission), never a verdict — soundness is untouched.
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   # ~11x less raw attack work than the 200x50 default. SAT-side control probe:
   # spec_idx_144 / spec_idx_101 behave IDENTICALLY with the old and new config
   # on the current binary (internal sat found in ~1s either way, then the
@@ -93,5 +94,41 @@ bab:
 #
 # The `margin_row: { reserve_secs: N }` preset knob exists for categories that
 # need to differ from the default, guarded by
-# shipped_preset_reserves_never_threaten_a_measured_solve. No shipped preset
+# shipped_presets_do_not_claim_unmeasured_reserve_overrides. No shipped preset
 # currently sets it.
+
+# DD-ZONOTOPE ADMISSION (#metaroom-ddzono, 2026-08-12): make the certified
+# double-double zonotope lane reachable for this category from the scored
+# `ny vnncomp v1` entry point (which sets no env vars). Measured on
+# spec_idx_119 (6cnn_ry_39_6): input volume 5376 (< the built-in 50,000
+# image-category floor), k=161 perturbed coordinates (> the built-in 128 cap),
+# peak 3,344 live generator columns, full-pass wall ~8.7s. These knobs resize
+# only the fail-closed detector's admission/resource caps; every soundness
+# gate (self-policing precision gate — measured rounding_hw ~6e-9 on ~1e0-1e3
+# margins here, far inside the 0.1 ratio — the 2x rounding-channel safety
+# factor, dd_selfcheck, the FP-environment probe, and outward f64->f32
+# narrowing at the verdict) is untouched and not preset-reachable. Any refusal
+# falls through to the standard pipeline unchanged.
+#
+# MEASURED NEGATIVE (this host, CPU-only — wgpu refused at EFT qualification):
+# the ROOT dd margin alone does not clear spec_idx_119 (relax_hw ~5e2 across
+# all 19 objectives; DeepZ width amplifies 0.98 -> 989 through the 6-layer
+# stack), so the verdict-exit is not expected to fire; the value channel is
+# `interm_intersect` (certified per-node enclosures intersected into the
+# stored intermediate bounds ahead of BaB). COST: the pass runs in both root
+# hooks, ~9s each at the 210s budget — near-wall UNSAT rows (spec_idx_28 at
+# ~182-186s) must be re-A/B'd on the campaign host before this section ships
+# in a scored run.
+# DISARMED PENDING TWO MEASUREMENTS (the alpha-zero-yield discipline: a
+# category key needs evidence covering the population it reaches):
+#   1. near-wall A/B: spec_idx_28-class UNSAT rows with/without this section —
+#      the ~18s/row cost must not lose a banked near-wall proof;
+#   2. value test on the campaign GPU host: the interm-intersect channel is the
+#      conversion path and this CPU host cannot exercise it.
+# The preset plumbing is live and tested; uncomment ONLY together with both
+# measurements recorded in the ledger.
+# dd_zonotope:
+#   min_input_numel: 5000
+#   max_k: 192
+#   max_generators: 4096
+#   interm_intersect: true

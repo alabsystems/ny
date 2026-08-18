@@ -14,6 +14,7 @@ from tests.test_benchmark_vnncomp_script import REPO_ROOT, _benchmark_root, _wri
 
 
 PROFILE_SCRIPT_PATH = REPO_ROOT / "scripts" / "profile_vnncomp_row.sh"
+PROFILE_TMP_ROOT = Path(os.environ.get("TMPDIR", "/tmp"))
 
 
 def _write_profile_fixture(
@@ -150,8 +151,12 @@ def test_profile_vnncomp_row_emits_normalized_profile_row(tmp_path: Path) -> Non
     assert row["preset_path"] == "configs/vnncomp25/metaroom_2023.yaml", row
     assert row["profile_artifact_path"] == "reports/benchmarks/issue-4291-metaroom-host-profile-current.md", row
     assert row["notes"] == "samples=early,late; bounded sample", row
-    assert "early_sample=/tmp/profile_vnncomp_row_" in result.stdout, result.stdout
-    assert "late_sample=/tmp/profile_vnncomp_row_" in result.stdout, result.stdout
+    assert f"early_sample={PROFILE_TMP_ROOT}/profile_vnncomp_row_" in result.stdout, (
+        result.stdout
+    )
+    assert f"late_sample={PROFILE_TMP_ROOT}/profile_vnncomp_row_" in result.stdout, (
+        result.stdout
+    )
 
 
 def test_profile_vnncomp_row_accepts_benchmark_suite_and_source_index_alignment(
@@ -211,6 +216,59 @@ def test_profile_vnncomp_row_rejects_non_numeric_source_index(tmp_path: Path) ->
     assert "--source-index must be a positive integer" in result.stderr, result.stderr
 
 
+def test_profile_vnncomp_row_rejects_unsafe_time_values_before_starting_solver(
+    tmp_path: Path,
+) -> None:
+    started_marker = tmp_path / "solver-started"
+    ny_path = _write_fake_ny(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            touch "$(dirname "$0")/solver-started"
+            printf 'Status: VERIFIED\nDomains explored: 1\n'
+            """
+        ),
+    )
+
+    cases = [
+        (
+            "nan",
+            "1",
+            "--timeout must be a positive integer",
+        ),
+        (
+            "1.5",
+            "1",
+            "--timeout must be a positive integer",
+        ),
+        (
+            "1",
+            "inf",
+            "--sample-duration must be a finite positive decimal number",
+        ),
+        (
+            "1",
+            "1'); __import__('os').system('false'); #",
+            "--sample-duration must be a finite positive decimal number",
+        ),
+    ]
+    for timeout_seconds, sample_duration, expected in cases:
+        result, _ = _run_profile_wrapper(
+            tmp_path,
+            ny_path,
+            timeout_seconds=timeout_seconds,
+            sample_early_seconds="0",
+            sample_late_seconds="0",
+            sample_duration=sample_duration,
+            load_output=False,
+        )
+        assert result.returncode != 0, result
+        assert expected in result.stderr, result.stderr
+
+    assert not started_marker.exists(), "invalid timing input must stop before solver startup"
+
+
 def test_profile_vnncomp_row_rejects_exact_alignment_category_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -267,7 +325,9 @@ def test_profile_vnncomp_row_records_early_only_sample_when_process_finishes_fir
     assert row["status"] == "unknown", row
     assert row["domains_explored"] == "0", row
     assert row["notes"] == "samples=early-only", row
-    assert "early_sample=/tmp/profile_vnncomp_row_" in result.stdout, result.stdout
+    assert f"early_sample={PROFILE_TMP_ROOT}/profile_vnncomp_row_" in result.stdout, (
+        result.stdout
+    )
     assert "late_sample=\n" in result.stdout, result.stdout
 
 

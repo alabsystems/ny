@@ -102,7 +102,7 @@ pub struct LayerNormLayer {
 impl LayerNormLayer {
     /// Create a new LayerNorm layer.
     ///
-    /// Returns an error if eps is negative, NaN, or infinite.
+    /// Returns an error if eps is non-finite or below the supported minimum.
     pub fn new(ny: Array1<f32>, beta: Array1<f32>, eps: f32) -> Result<Self> {
         Ok(Self {
             ny,
@@ -116,7 +116,7 @@ impl LayerNormLayer {
 
     /// Create a LayerNorm layer with default ny=1 and beta=0.
     ///
-    /// Returns an error if eps is negative, NaN, or infinite.
+    /// Returns an error if eps is non-finite or below the supported minimum.
     pub fn new_default(size: usize, eps: f32) -> Result<Self> {
         Ok(Self {
             ny: Array1::ones(size),
@@ -130,7 +130,7 @@ impl LayerNormLayer {
 
     /// Create a LayerNorm layer with forward mode enabled (tighter but approximate bounds).
     ///
-    /// Returns an error if eps is negative, NaN, or infinite.
+    /// Returns an error if eps is non-finite or below the supported minimum.
     pub fn new_forward_mode(ny: Array1<f32>, beta: Array1<f32>, eps: f32) -> Result<Self> {
         Ok(Self {
             ny,

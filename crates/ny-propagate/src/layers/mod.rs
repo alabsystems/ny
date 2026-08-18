@@ -105,8 +105,8 @@ pub use misc::{
 };
 /// Normalization layer types (BatchNorm, InstanceNorm1d, LayerNorm, RmsNorm) and CROWN mode configuration.
 pub use normalization::{
-    AdaIN1dLayer, BatchNormLayer, GroupNormLayer, InstanceNorm1dLayer, LayerNormCrownMode,
-    LayerNormLayer, LayerNormMode, RmsNormLayer,
+    AdaIN1dLayer, BatchNormChannelAxisHint, BatchNormLayer, GroupNormLayer, InstanceNorm1dLayer,
+    LayerNormCrownMode, LayerNormLayer, LayerNormMode, RmsNormLayer, NORMALIZATION_MIN_EPS,
 };
 /// Pooling layer types (AveragePool, MaxPool2d).
 pub use pooling::{AveragePoolLayer, MaxPool2dLayer};
@@ -125,9 +125,9 @@ pub use transform::{
     IndexAddLayer, PadLayer, PadMode, ReshapeLayer, ResizeLayer, ScatterAddLayer, ScatterNdLayer,
     SliceLayer, SqueezeLayer, TileLayer, TransposeLayer, UnsqueezeLayer,
 };
-/// Trigonometric and S-shaped activation layer types (Arctan, Cos, Sigmoid, Sin, Softplus, Tan, Tanh).
+/// Trigonometric and S-shaped activation layer types (Arctan, Cos, Erf, Sigmoid, Sin, Softplus, Tan, Tanh).
 pub use trigonometric::{
-    ArctanLayer, CosLayer, SigmoidLayer, SinLayer, SoftplusLayer, TanLayer, TanhLayer,
+    ArctanLayer, CosLayer, ErfLayer, SigmoidLayer, SinLayer, SoftplusLayer, TanLayer, TanhLayer,
 };
 
 /// Unified [`Layer`] enum for dynamic dispatch across all layer types.

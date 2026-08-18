@@ -9,10 +9,13 @@
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/relusplitter
   csv_name: instances.csv
-  conv_mode: auto
+  # Preserve the measured dense-matrix Conv2d throughput while cut proof
+  # authority remains quarantined.
+  conv_mode: matrix
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 50
 
 bab:
@@ -20,10 +23,10 @@ bab:
   branching:
     method: babsr
   cuts:
-    enabled: true
-    near_miss: true
+    enabled: false
+    near_miss: false
     near_miss_margin: 0.01
-    proactive: true
+    proactive: false
   clip:
     relaxed: true
     relaxed_iterations: 20

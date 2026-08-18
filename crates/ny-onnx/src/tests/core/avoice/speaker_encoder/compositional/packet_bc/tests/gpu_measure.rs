@@ -7,6 +7,19 @@ use super::super::super::boundary::{
 };
 use super::*;
 
+fn require_wgpu_crown_device() -> ny_gpu::ComputeDevice {
+    let device = ny_gpu::ComputeDevice::new(ny_gpu::Backend::Wgpu)
+        .expect("live GPU comparison requires a usable WGPU device");
+    let engine: &dyn ny_core::GemmEngine = &device;
+    assert!(
+        engine
+            .as_gpu_crown_backward()
+            .is_some_and(|gpu| gpu.provides_sound_gpu_crown()),
+        "live GPU comparison requires a non-quarantined sound GPU CROWN backend"
+    );
+    device
+}
+
 struct StageMeasurement {
     tightened: usize,
     node_count: usize,
@@ -39,39 +52,35 @@ fn measure_stage_a_crown_ibp(
     }
 }
 
-fn report_gpu_vs_cpu(cpu: &StageMeasurement, gpu: Option<&StageMeasurement>, deadline_secs: u64) {
+fn report_gpu_vs_cpu(cpu: &StageMeasurement, gpu: &StageMeasurement, deadline_secs: u64) {
     eprintln!("Stage A GPU vs CPU measurement ({deadline_secs}s deadline):");
     eprintln!(
         "  CPU: tightened={}/{}, fallback={}, elapsed={:.1}s, output_width={:.6}",
         cpu.tightened, cpu.node_count, cpu.fallback, cpu.elapsed_secs, cpu.output_width,
     );
-    if let Some(gpu) = gpu {
-        eprintln!(
-            "  GPU: tightened={}/{}, fallback={}, elapsed={:.1}s, output_width={:.6}",
-            gpu.tightened, gpu.node_count, gpu.fallback, gpu.elapsed_secs, gpu.output_width,
-        );
-        match gpu.tightened.cmp(&cpu.tightened) {
-            std::cmp::Ordering::Greater => eprintln!(
-                "  GPU tightened {} more nodes ({} vs {})",
-                gpu.tightened - cpu.tightened,
-                gpu.tightened,
-                cpu.tightened,
-            ),
-            std::cmp::Ordering::Equal => {
-                eprintln!(
-                    "  GPU and CPU tightened the same number of nodes ({})",
-                    cpu.tightened
-                )
-            }
-            std::cmp::Ordering::Less => {
-                eprintln!(
-                    "  GPU tightened FEWER nodes ({} vs {}) — unexpected",
-                    gpu.tightened, cpu.tightened
-                )
-            }
+    eprintln!(
+        "  GPU: tightened={}/{}, fallback={}, elapsed={:.1}s, output_width={:.6}",
+        gpu.tightened, gpu.node_count, gpu.fallback, gpu.elapsed_secs, gpu.output_width,
+    );
+    match gpu.tightened.cmp(&cpu.tightened) {
+        std::cmp::Ordering::Greater => eprintln!(
+            "  GPU tightened {} more nodes ({} vs {})",
+            gpu.tightened - cpu.tightened,
+            gpu.tightened,
+            cpu.tightened,
+        ),
+        std::cmp::Ordering::Equal => {
+            eprintln!(
+                "  GPU and CPU tightened the same number of nodes ({})",
+                cpu.tightened
+            )
         }
-    } else {
-        eprintln!("  SKIP: wgpu device not available — GPU measurement unavailable");
+        std::cmp::Ordering::Less => {
+            eprintln!(
+                "  GPU tightened FEWER nodes ({} vs {}) — unexpected",
+                gpu.tightened, cpu.tightened
+            )
+        }
     }
 }
 
@@ -81,9 +90,9 @@ fn report_gpu_vs_cpu(cpu: &StageMeasurement, gpu: Option<&StageMeasurement>, dea
 /// Part of #3499 — GPU threading measurement lane.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(all(feature = "external-avoice", feature = "external-wgpu"))]
 fn test_ecapa_stage_a_gpu_vs_cpu_tightening_depth_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
-    use ny_gpu::{Backend, ComputeDevice};
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     const MEASUREMENT_DEADLINE_SECS: u64 = 60;
 
     let model = avoice_speaker_encoder();
@@ -105,8 +114,9 @@ fn test_ecapa_stage_a_gpu_vs_cpu_tightening_depth_3499() {
         MEASUREMENT_DEADLINE_SECS,
         None,
     );
-    let gpu_device = ComputeDevice::new(Backend::Wgpu).ok();
-    let gpu = gpu_device.as_ref().map(|device| {
+    let gpu_device = require_wgpu_crown_device();
+    let gpu = {
+        let device = &gpu_device;
         let engine: &dyn ny_core::GemmEngine = device;
         measure_stage_a_crown_ibp(
             &stage_a,
@@ -115,9 +125,9 @@ fn test_ecapa_stage_a_gpu_vs_cpu_tightening_depth_3499() {
             MEASUREMENT_DEADLINE_SECS,
             Some(engine),
         )
-    });
+    };
 
-    report_gpu_vs_cpu(&cpu, gpu.as_ref(), MEASUREMENT_DEADLINE_SECS);
+    report_gpu_vs_cpu(&cpu, &gpu, MEASUREMENT_DEADLINE_SECS);
     assert!(
         cpu.tightened > 0,
         "CPU baseline should tighten at least 1 node"
@@ -137,7 +147,7 @@ fn report_alpha_gpu_vs_cpu(
     ibp_bounds: &HashMap<String, BoundedTensor>,
     cpu: &EcapaStageResult,
     cpu_elapsed: f64,
-    gpu: Option<(&EcapaStageResult, f64)>,
+    gpu: (&EcapaStageResult, f64),
     deadline_secs: u64,
     iterations: usize,
 ) {
@@ -156,21 +166,15 @@ fn report_alpha_gpu_vs_cpu(
             "  {label}: IBP={ibp_w:.6e}, CPU={cpu_w:.6e} ({:.1}%)",
             width_reduction_pct(ibp_w, cpu_w),
         );
-        if let Some((gpu_r, _)) = &gpu {
-            let gpu_w = stage_max_width(gpu_r, label);
-            eprintln!(
-                "         GPU={gpu_w:.6e} ({:.1}% vs IBP, {:.1}% vs CPU)",
-                width_reduction_pct(ibp_w, gpu_w),
-                width_reduction_pct(cpu_w, gpu_w),
-            );
-        }
+        let gpu_w = stage_max_width(gpu.0, label);
+        eprintln!(
+            "         GPU={gpu_w:.6e} ({:.1}% vs IBP, {:.1}% vs CPU)",
+            width_reduction_pct(ibp_w, gpu_w),
+            width_reduction_pct(cpu_w, gpu_w),
+        );
     }
     eprintln!("  CPU runtime: {cpu_elapsed:.1}s");
-    if let Some((_, gpu_e)) = &gpu {
-        eprintln!("  GPU runtime: {gpu_e:.1}s");
-    } else {
-        eprintln!("  SKIP: wgpu device not available");
-    }
+    eprintln!("  GPU runtime: {:.1}s", gpu.1);
 }
 
 /// Level 0.5 measurement for #3499: alpha-CROWN GPU vs CPU stage widths.
@@ -178,9 +182,9 @@ fn report_alpha_gpu_vs_cpu(
 /// Reference: `designs/2026-03-13-issue-3499-res2net-bound-widening-root-cause.md`
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(all(feature = "external-avoice", feature = "external-wgpu"))]
 fn test_ecapa_alpha_crown_gpu_vs_cpu_stage_widths_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
-    use ny_gpu::{Backend, ComputeDevice};
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     const DEADLINE: u64 = 60;
     const ITERS: usize = 1;
 
@@ -203,8 +207,9 @@ fn test_ecapa_alpha_crown_gpu_vs_cpu_stage_widths_3499() {
         .expect("CPU alpha-CROWN should succeed");
     let cpu_e = cpu_t.elapsed().as_secs_f64();
 
-    let gpu_device = ComputeDevice::new(Backend::Wgpu).ok();
-    let gpu = gpu_device.as_ref().map(|device| {
+    let gpu_device = require_wgpu_crown_device();
+    let gpu = {
+        let device = &gpu_device;
         let engine: &dyn ny_core::GemmEngine = device;
         let mut gc = alpha_crown_config_for_stage(DEADLINE);
         gc.iterations = ITERS;
@@ -212,19 +217,17 @@ fn test_ecapa_alpha_crown_gpu_vs_cpu_stage_widths_3499() {
         let r = run_ecapa_stage_local_alpha_crown(graph, &input, &gc, Some(engine))
             .expect("GPU alpha-CROWN should succeed");
         (r, t.elapsed().as_secs_f64())
-    });
+    };
 
     report_alpha_gpu_vs_cpu(
         &boundary,
         &ibp,
         &cpu,
         cpu_e,
-        gpu.as_ref().map(|(r, e)| (r, *e)),
+        (&gpu.0, gpu.1),
         DEADLINE,
         ITERS,
     );
     assert_finite_and_ordered(&cpu.mfa_bounds, "CPU alpha MFA");
-    if let Some((ref g, _)) = gpu {
-        assert_finite_and_ordered(&g.mfa_bounds, "GPU alpha MFA");
-    }
+    assert_finite_and_ordered(&gpu.0.mfa_bounds, "GPU alpha MFA");
 }

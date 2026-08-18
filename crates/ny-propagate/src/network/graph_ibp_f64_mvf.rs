@@ -112,31 +112,38 @@
 //! error leaves the caller with the zeroth-order bound only.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
 use rayon::prelude::*;
 
+use crate::bounds::safe_math::f32_to_f64_exact_for_bounds;
 use crate::layers::Layer;
 
 use super::core::graph::{GraphNetwork, GraphNode, NETWORK_INPUT};
 use super::graph_ibp_f64_batch::{eval_linear_stacked_prepared, F64WeightCache};
+#[cfg(test)]
+use super::graph_ibp_f64_cell::stable_sigmoid_f64;
 use super::graph_ibp_f64_cell::{
-    broadcast_binary, eval_concat, eval_linear_with_bias, eval_matmul, eval_node, eval_reduce_sum,
-    interval_mul, stable_sigmoid_f64, widen1, widen_down_n, widen_up_n, Interval64,
-    TRANSCENDENTAL_ULPS,
+    broadcast_binary, certified_sigmoid_f64, eval_concat, eval_linear_with_bias, eval_matmul,
+    eval_node, eval_reduce_sum, interval_mul, require_f64_interval_proof_environment,
+    require_f64_interval_proof_environment_rayon, widen1, Interval64,
 };
 
-/// Maximum boxes per batched centered-form chunk (#f64-batch-boxes): the
-/// batched mean-value walk holds one `Channels` (value + k derivative
-/// tensors) per live node per box, so an unbounded wave of 2048-wide mscn
-/// boxes would hold GBs; 96 boxes keep the stacked Linear rows far above
-/// the fast-kernel gate at a bounded footprint (measured ~hundreds of MB
-/// live at the 2048-wide mscn dual shapes: ~(1+k)·2 row-tensors per box
-/// per ~4 live nodes) while amortizing the per-chunk walk overhead
-/// (HashMaps, rayon dispatch, weight-cache lookups) over 3x more boxes
-/// than the original 32.
-const MAX_CENTERED_BATCH: usize = 96;
+/// Maximum boxes per batched centered-form chunk (#f64-batch-boxes) for a
+/// graph with a million-parameter-or-larger Linear. The batched mean-value
+/// walk holds one `Channels` (value + k derivative tensors) per live node per
+/// box, so an unbounded wave of 2048-wide mscn boxes would hold GBs; 96 boxes
+/// keep that measured footprint to hundreds of MB.
+const MAX_CENTERED_BATCH_WIDE: usize = 96;
+
+/// Small centered graphs can amortize the same graph/node dispatch over more
+/// independent boxes without the wide model's memory multiplier. Restrict the
+/// larger chunk both to graphs below the existing fat-weight gate and to small
+/// input surfaces; the caller still owns its independent surface/RSS caps.
+const MAX_CENTERED_BATCH_SMALL: usize = 256;
+const SMALL_CENTERED_INPUT_ENTRIES: usize = 512;
 
 /// Boxes per batched MONO-CORNER cell walk (#mono-corner × #f64-batch-boxes):
 /// corner walks carry ONE value channel (no derivatives), so they afford a
@@ -150,6 +157,13 @@ const MONO_CORNER_CELL_BATCH: usize = 256;
 struct Channels {
     value: Interval64,
     derivs: Vec<Interval64>,
+}
+
+/// ReLU input channels captured during a verdict-neutral point-JVP walk.
+struct ReluPointSnapshot {
+    relu_node: String,
+    value: Interval64,
+    derivative: Interval64,
 }
 
 /// Axes at least this wide RELATIVE to their magnitude (`max(1, |lo|, |hi|)`)
@@ -201,6 +215,133 @@ pub struct CenteredMono {
     /// True when EVERY pair certified: the mono bound is the exact range up
     /// to corner-eval rounding and absorbed ulp-narrow-axis width.
     pub all_certified: bool,
+    /// Optional certified affine enclosure exposed only by the explicit
+    /// diagnostic entry point. Production entries leave this `None`, avoiding
+    /// every coefficient/remainder allocation when the diagnostic is dark.
+    ///
+    /// This payload is observational: it is never intersected into `value`,
+    /// `centered`, or `mono`.
+    pub affine_diagnostic: Option<MvfAffineEnclosure>,
+}
+
+/// Certified outward-f64 affine enclosure recovered from an MVF walk.
+///
+/// For every output element `j` and every input in the original box,
+///
+/// ```text
+/// output[j] ∈ remainder[j]
+///             + Σ_k coefficients[k][j] * (input[seed_axes[k]] - centers[k]).
+/// ```
+///
+/// `coefficients[k]` is the f64 midpoint of the already-certified derivative
+/// interval `D_k`. `remainder` contains the center-point interval plus
+/// `Σ_k max(|Dlo-a|, |Dhi-a|) * radius_k`, accumulated outward. Unseeded
+/// ulp-narrow axes remain enclosed by the center-point interval exactly as in
+/// the sectioned centered-form proof. Consumers may derive diagnostic cuts
+/// from this relation, but the MVF walk itself never applies one.
+pub struct MvfAffineEnclosure {
+    pub seed_axes: Vec<usize>,
+    pub centers: Vec<f64>,
+    pub coefficients: Vec<ArrayD<f64>>,
+    pub remainder: Interval64,
+}
+
+/// A single shared extra-work budget for an MVF affine diagnostic.
+///
+/// The window starts only after the first already-required derivative and
+/// center walks finish, so that first paid proof walk does not consume the
+/// diagnostic allowance. From then on the deadline is absolute across later
+/// qualifying calls. The allowance is additionally capped at 5% of the
+/// then-current outer-deadline remainder.
+///
+/// Callers must retain and reuse one instance across every qualifying batched
+/// call. Once initialized, `deadline` is an absolute instant and can never be
+/// reset by a later call.
+pub struct MvfAffineDiagnosticBudget {
+    outer_deadline: Option<Instant>,
+    hard_budget: Duration,
+    deadline: Option<Instant>,
+}
+
+impl MvfAffineDiagnosticBudget {
+    pub fn new(outer_deadline: Option<Instant>, hard_budget: Duration) -> Self {
+        Self {
+            outer_deadline,
+            hard_budget,
+            deadline: None,
+        }
+    }
+
+    /// Whether no later qualifying call should request an affine payload.
+    pub fn is_exhausted(&self) -> bool {
+        let now = Instant::now();
+        self.hard_budget.is_zero()
+            || self.outer_deadline.is_some_and(|outer| now >= outer)
+            || self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn deadline(&mut self) -> Instant {
+        *self.deadline.get_or_insert_with(|| {
+            let now = Instant::now();
+            let reserve_budget = self
+                .outer_deadline
+                .map(|outer| {
+                    outer
+                        .saturating_duration_since(now)
+                        .checked_div(20)
+                        .unwrap_or(Duration::ZERO)
+                })
+                .unwrap_or(self.hard_budget);
+            now.checked_add(self.hard_budget.min(reserve_budget))
+                .unwrap_or(now)
+        })
+    }
+}
+
+fn effective_affine_deadline(budget_deadline: Instant, outer_deadline: Option<Instant>) -> Instant {
+    outer_deadline.map_or(budget_deadline, |outer| outer.min(budget_deadline))
+}
+
+/// One advisory ReLU phase event proposed by a point-JVP diagnostic.
+///
+/// `root_lower..=root_upper` is an outward-padded estimate of where the
+/// ReLU's pre-activation crosses zero along `seed_axis`; `proposal` is its
+/// deterministic midpoint. These values are **diagnostic only**. They are not
+/// certified split points and must never feed a verification verdict without
+/// an independent, sound full-cover replay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReluPhaseEventCandidate {
+    pub relu_node: String,
+    pub element: usize,
+    pub input_value_lower: f64,
+    pub input_value_upper: f64,
+    pub input_slope_lower: f64,
+    pub input_slope_upper: f64,
+    pub root_lower: f64,
+    pub root_upper: f64,
+    pub proposal: f64,
+}
+
+/// Verdict-neutral telemetry from a one-dimensional point-JVP ReLU scan.
+///
+/// The collector observes the existing f64 forward-mode walk at an exact
+/// input point and records possible ReLU zero crossings inside a caller-owned
+/// scan interval. It has no proof authority: ambiguous/non-finite entries are
+/// counted and omitted, and consumers may use candidates only as proposals.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointPhaseEventDiagnostics {
+    pub seed_axis: usize,
+    pub point: f64,
+    pub scan_lower: f64,
+    pub scan_upper: f64,
+    pub relu_nodes: usize,
+    pub preactivations: usize,
+    pub at_point_kinks: usize,
+    pub stationary: usize,
+    pub slope_straddles_zero: usize,
+    pub non_finite: usize,
+    pub outside_scan: usize,
+    pub candidates: Vec<ReluPhaseEventCandidate>,
 }
 
 /// Number of axes the centered form would seed for this (f32) box — the
@@ -209,8 +350,32 @@ pub struct CenteredMono {
 pub fn centered_seed_axes_f32(lo: &[f32], hi: &[f32]) -> usize {
     lo.iter()
         .zip(hi.iter())
-        .filter(|(&l, &h)| axis_is_seeded(f64::from(l), f64::from(h)))
+        .filter(|(&l, &h)| {
+            axis_is_seeded(
+                f32_to_f64_exact_for_bounds(l),
+                f32_to_f64_exact_for_bounds(h),
+            )
+        })
         .count()
+}
+
+/// Flat input-axis indices the centered form would seed for this f32 box.
+///
+/// This is the index-returning companion to [`centered_seed_axes_f32`].
+/// Diagnostic partition proposers need the actual unique axis and must reuse
+/// the production absorption rule rather than duplicating its threshold.
+pub fn centered_seed_axis_indices_f32(lo: &[f32], hi: &[f32]) -> Vec<usize> {
+    lo.iter()
+        .zip(hi.iter())
+        .enumerate()
+        .filter_map(|(i, (&l, &h))| {
+            axis_is_seeded(
+                f32_to_f64_exact_for_bounds(l),
+                f32_to_f64_exact_for_bounds(h),
+            )
+            .then_some(i)
+        })
+        .collect()
 }
 
 /// Sound real interval quotient `[al, ah] / [bl, bh]`; errors (fail-closed)
@@ -231,6 +396,16 @@ fn interval_div(al: f64, ah: f64, bl: f64, bh: f64) -> Result<(f64, f64)> {
     Ok((lo, hi))
 }
 
+#[inline]
+fn check_phase_event_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(NyError::DeadlineExceeded(
+            "phase-event diagnostic wall-clock budget exhausted".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl GraphNetwork {
     /// Whether every output-ancestor node is in the op set supported by the
     /// centered-form walk ([`Self::propagate_ibp_f64_centered`]). KEEP IN
@@ -244,6 +419,294 @@ impl GraphNetwork {
             }),
             Err(_) => false,
         }
+    }
+
+    /// Whether the rigorous centered walk supports this graph and would seed
+    /// exactly `expected_axis` for `input`.
+    ///
+    /// Narrow non-seeded coordinates are not discarded: the sectioned
+    /// centered construction retains their complete intervals in the center
+    /// box, whose zeroth-order value channel encloses their contribution. This
+    /// predicate lets one-authored-axis callers distinguish those harmless
+    /// outward point enclosures from a genuinely second derivative axis while
+    /// sharing the walk's exact seed policy.
+    pub fn ibp_f64_centered_only_seeds_axis(
+        &self,
+        input: &Interval64,
+        expected_axis: usize,
+    ) -> bool {
+        self.ibp_f64_centered_only_seeds_axes(input, &[expected_axis])
+    }
+
+    /// Whether the rigorous centered walk supports this graph and would seed
+    /// exactly the strictly increasing `expected_axes` for `input`.
+    ///
+    /// This is the multi-axis companion to
+    /// [`Self::ibp_f64_centered_only_seeds_axis`]. Authenticated few-axis
+    /// complete-cover callers use it to retain outward point-coordinate
+    /// enclosures in the center box without accidentally granting an
+    /// unauthored derivative axis proof authority.
+    pub fn ibp_f64_centered_only_seeds_axes(
+        &self,
+        input: &Interval64,
+        expected_axes: &[usize],
+    ) -> bool {
+        if !self.supports_ibp_f64_centered()
+            || input.lower.shape() != input.upper.shape()
+            || input.lower.is_empty()
+            || expected_axes.is_empty()
+            || expected_axes.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return false;
+        }
+        let (Some(lower), Some(upper)) = (input.lower.as_slice(), input.upper.as_slice()) else {
+            return false;
+        };
+        if lower.len() != upper.len()
+            || expected_axes
+                .last()
+                .is_some_and(|&axis| axis >= lower.len())
+        {
+            return false;
+        }
+
+        let mut expected = expected_axes.iter().copied();
+        let mut next_expected = expected.next();
+        for (axis, (&lower, &upper)) in lower.iter().zip(upper).enumerate() {
+            if !(lower.is_finite() && upper.is_finite() && lower <= upper) {
+                return false;
+            }
+            if axis_is_seeded(lower, upper) {
+                if next_expected != Some(axis) {
+                    return false;
+                }
+                next_expected = expected.next();
+            }
+        }
+        next_expected.is_none()
+    }
+
+    /// Collect advisory ReLU zero-crossing events from an exact point-JVP.
+    ///
+    /// `input_point` must be a finite point box (`lower == upper` bit for bit)
+    /// and `seed_axis` is the single input coordinate varied over
+    /// `[scan_lower, scan_upper]`. The existing f64 forward-mode derivative
+    /// walk supplies each ReLU input's point value and local slope enclosure;
+    /// sign-definite slopes yield a zero-crossing bracket.
+    ///
+    /// This API is deliberately verdict-neutral. Returned roots are split
+    /// *proposals*, not certificates. In particular, rounding, a kink at the
+    /// probe point, or a slope interval containing zero may make the list
+    /// incomplete. A future partitioner must independently replay a complete
+    /// cover through a sound bound engine before changing any verdict.
+    pub fn diagnose_relu_phase_events_1d(
+        &self,
+        input_point: &Interval64,
+        seed_axis: usize,
+        scan_lower: f64,
+        scan_upper: f64,
+    ) -> Result<PointPhaseEventDiagnostics> {
+        self.diagnose_relu_phase_events_1d_with_deadline(
+            input_point,
+            seed_axis,
+            scan_lower,
+            scan_upper,
+            None,
+        )
+    }
+
+    /// Deadline-capped form of [`Self::diagnose_relu_phase_events_1d`].
+    ///
+    /// The deadline is checked before graph setup, before every executed node,
+    /// and while reducing snapshots into event proposals. An expiry discards
+    /// the partial advisory result and returns [`NyError::DeadlineExceeded`];
+    /// no verifier state is ever mutated.
+    pub fn diagnose_relu_phase_events_1d_until(
+        &self,
+        input_point: &Interval64,
+        seed_axis: usize,
+        scan_lower: f64,
+        scan_upper: f64,
+        deadline: Instant,
+    ) -> Result<PointPhaseEventDiagnostics> {
+        self.diagnose_relu_phase_events_1d_with_deadline(
+            input_point,
+            seed_axis,
+            scan_lower,
+            scan_upper,
+            Some(deadline),
+        )
+    }
+
+    fn diagnose_relu_phase_events_1d_with_deadline(
+        &self,
+        input_point: &Interval64,
+        seed_axis: usize,
+        scan_lower: f64,
+        scan_upper: f64,
+        deadline: Option<Instant>,
+    ) -> Result<PointPhaseEventDiagnostics> {
+        require_f64_interval_proof_environment()?;
+        check_phase_event_deadline(deadline)?;
+        if !(scan_lower.is_finite() && scan_upper.is_finite() && scan_lower <= scan_upper) {
+            return Err(NyError::InvalidSpec(
+                "phase-event diagnostic: scan interval must be finite and ordered".to_string(),
+            ));
+        }
+        if input_point.lower.shape() != input_point.upper.shape() {
+            return Err(NyError::InvalidSpec(
+                "phase-event diagnostic: point shapes differ".to_string(),
+            ));
+        }
+        let lo_std = input_point.lower.as_standard_layout();
+        let hi_std = input_point.upper.as_standard_layout();
+        let (lo, hi) = match (lo_std.as_slice(), hi_std.as_slice()) {
+            (Some(lo), Some(hi)) => (lo, hi),
+            _ => {
+                return Err(NyError::InvalidSpec(
+                    "phase-event diagnostic: point is not contiguous".to_string(),
+                ))
+            }
+        };
+        if seed_axis >= lo.len() {
+            return Err(NyError::InvalidSpec(format!(
+                "phase-event diagnostic: seed axis {seed_axis} out of range for {} inputs",
+                lo.len()
+            )));
+        }
+        for (&l, &h) in lo.iter().zip(hi) {
+            if !(l.is_finite() && h.is_finite() && l.to_bits() == h.to_bits()) {
+                return Err(NyError::InvalidSpec(
+                    "phase-event diagnostic: input must be an exact finite point".to_string(),
+                ));
+            }
+        }
+        let point = lo[seed_axis];
+        if point < scan_lower || point > scan_upper {
+            return Err(NyError::InvalidSpec(
+                "phase-event diagnostic: probe point is outside the scan interval".to_string(),
+            ));
+        }
+
+        let mut snapshots = Vec::new();
+        let _output = self.propagate_ibp_f64_mean_value_observed(
+            input_point,
+            &[seed_axis],
+            Some(&mut snapshots),
+            deadline,
+        )?;
+        let mut out = PointPhaseEventDiagnostics {
+            seed_axis,
+            point,
+            scan_lower,
+            scan_upper,
+            relu_nodes: snapshots.len(),
+            preactivations: 0,
+            at_point_kinks: 0,
+            stationary: 0,
+            slope_straddles_zero: 0,
+            non_finite: 0,
+            outside_scan: 0,
+            candidates: Vec::new(),
+        };
+
+        for snapshot in snapshots {
+            check_phase_event_deadline(deadline)?;
+            if snapshot.value.lower.shape() != snapshot.derivative.lower.shape()
+                || snapshot.value.lower.shape() != snapshot.value.upper.shape()
+                || snapshot.value.lower.shape() != snapshot.derivative.upper.shape()
+            {
+                return Err(NyError::InvalidSpec(format!(
+                    "phase-event diagnostic: channel shape mismatch at '{}'",
+                    snapshot.relu_node
+                )));
+            }
+            let z_lo_std = snapshot.value.lower.as_standard_layout();
+            let z_hi_std = snapshot.value.upper.as_standard_layout();
+            let d_lo_std = snapshot.derivative.lower.as_standard_layout();
+            let d_hi_std = snapshot.derivative.upper.as_standard_layout();
+            let (z_lo, z_hi, d_lo, d_hi) = match (
+                z_lo_std.as_slice(),
+                z_hi_std.as_slice(),
+                d_lo_std.as_slice(),
+                d_hi_std.as_slice(),
+            ) {
+                (Some(zl), Some(zh), Some(dl), Some(dh))
+                    if zl.len() == zh.len() && zl.len() == dl.len() && zl.len() == dh.len() =>
+                {
+                    (zl, zh, dl, dh)
+                }
+                _ => {
+                    return Err(NyError::InvalidSpec(format!(
+                        "phase-event diagnostic: non-contiguous channels at '{}'",
+                        snapshot.relu_node
+                    )))
+                }
+            };
+            out.preactivations += z_lo.len();
+            for element in 0..z_lo.len() {
+                if element % 1024 == 0 {
+                    check_phase_event_deadline(deadline)?;
+                }
+                let (zl, zh, dl, dh) = (z_lo[element], z_hi[element], d_lo[element], d_hi[element]);
+                if !(zl.is_finite() && zh.is_finite() && dl.is_finite() && dh.is_finite()) {
+                    out.non_finite += 1;
+                    continue;
+                }
+                if zl <= 0.0 && zh >= 0.0 {
+                    out.at_point_kinks += 1;
+                }
+                if dl <= 0.0 && dh >= 0.0 {
+                    out.slope_straddles_zero += 1;
+                    // The sound Linear rule outward-rounds an analytic zero
+                    // derivative to [-MIN_SUBNORMAL, +MIN_SUBNORMAL]. Treat
+                    // an enclosure made only of zero/subnormal endpoints as
+                    // numerically stationary telemetry; it remains omitted
+                    // from candidates exactly like every ambiguous slope.
+                    if (dl == 0.0 || dl.is_subnormal()) && (dh == 0.0 || dh.is_subnormal()) {
+                        out.stationary += 1;
+                    }
+                    continue;
+                }
+
+                // z(t) ~= z(point) + d·(t-point); solve t = point-z/d.
+                // Interval arithmetic plus one-ulp endpoint padding makes this
+                // a robust proposal bracket, but it remains non-authoritative
+                // by contract (the local phase may end before this root).
+                let (offset_lo, offset_hi) = interval_div(-zh, -zl, dl, dh)?;
+                let root_lower = (point + offset_lo).next_down();
+                let root_upper = (point + offset_hi).next_up();
+                if !(root_lower.is_finite() && root_upper.is_finite() && root_lower <= root_upper) {
+                    out.non_finite += 1;
+                    continue;
+                }
+                if root_upper < scan_lower || root_lower > scan_upper {
+                    out.outside_scan += 1;
+                    continue;
+                }
+                let root_lower = root_lower.max(scan_lower);
+                let root_upper = root_upper.min(scan_upper);
+                let proposal = f64::midpoint(root_lower, root_upper);
+                out.candidates.push(ReluPhaseEventCandidate {
+                    relu_node: snapshot.relu_node.clone(),
+                    element,
+                    input_value_lower: zl,
+                    input_value_upper: zh,
+                    input_slope_lower: dl,
+                    input_slope_upper: dh,
+                    root_lower,
+                    root_upper,
+                    proposal,
+                });
+            }
+        }
+        out.candidates.sort_by(|a, b| {
+            a.proposal
+                .total_cmp(&b.proposal)
+                .then_with(|| a.relu_node.cmp(&b.relu_node))
+                .then_with(|| a.element.cmp(&b.element))
+        });
+        Ok(out)
     }
 
     /// Sound f64 FIRST-ORDER output enclosure over the input box: the
@@ -332,6 +795,8 @@ impl GraphNetwork {
     /// Shared implementation of the centered walk, optionally extended with
     /// the monotonicity-corner refinement (#mono-corner).
     fn centered_walk_full(&self, input: &Interval64, want_mono: bool) -> Result<CenteredMono> {
+        require_f64_interval_proof_environment()?;
+
         let lo_std = input.lower.as_standard_layout();
         let hi_std = input.upper.as_standard_layout();
         let (lo, hi) = match (lo_std.as_slice(), hi_std.as_slice()) {
@@ -367,6 +832,7 @@ impl GraphNetwork {
                 certified_pairs: 0,
                 total_pairs: 0,
                 all_certified: false,
+                affine_diagnostic: None,
             });
         }
 
@@ -432,6 +898,7 @@ impl GraphNetwork {
             certified_pairs,
             total_pairs,
             all_certified,
+            affine_diagnostic: None,
         })
     }
 
@@ -495,10 +962,11 @@ impl GraphNetwork {
     ///
     /// Boxes are grouped by their (identical) seeded-axis set — the seeding
     /// rule is per box, so different boxes may legitimately seed different
-    /// axes — and each group is processed in chunks of
-    /// [`MAX_CENTERED_BATCH`] boxes (memory: one `Channels` per node per
-    /// box). Groups with NO seedable axis degenerate to the batched
-    /// zeroth-order forward, mirroring the per-box entry.
+    /// axes — and each group is processed in bounded chunks: 96 boxes for
+    /// wide graphs and up to 256 only for small-input graphs below the
+    /// existing fat-weight gate (memory: one `Channels` per node per box).
+    /// Groups with NO seedable axis degenerate to the batched zeroth-order
+    /// forward, mirroring the per-box entry.
     ///
     /// Per box, the result is bit-identical to the per-box entry whenever
     /// kernel selection agrees (thin stacks), and a sound containing
@@ -508,8 +976,10 @@ impl GraphNetwork {
     /// a refinement). Cross-box isolation is structural: stacked Linear
     /// rows never mix, everything else evaluates per box.
     ///
-    /// Fail-closed: ANY error fails the WHOLE call; callers must fall back
-    /// to per-box [`Self::propagate_ibp_f64_centered`] walks.
+    /// Fail-closed: ANY non-deadline error fails the WHOLE call; callers may
+    /// fall back to per-box [`Self::propagate_ibp_f64_centered`] walks.
+    /// Deadline expiry from a deadline-aware entry point requires a
+    /// conservative stop instead of fallback.
     pub fn propagate_ibp_f64_centered_cells(
         &self,
         inputs: &[Interval64],
@@ -558,24 +1028,126 @@ impl GraphNetwork {
     ///   whenever kernel selection agrees, and a sound containing superset
     ///   otherwise (gate `batched_mono_matches_per_box_when_kernels_agree`).
     ///
-    /// Fail-closed: ANY error fails the WHOLE call (callers fall back to
-    /// per-box walks); a failed/declined mono stage fails OPEN per box
-    /// (`mono: None`) exactly like the per-box lane.
+    /// Fail-closed: ANY non-deadline error fails the WHOLE call (callers may
+    /// fall back to per-box walks); deadline expiry from the deadline-aware
+    /// entry point requires a conservative stop. A failed/declined mono stage
+    /// fails OPEN per box (`mono: None`) exactly like the per-box lane.
     pub fn propagate_ibp_f64_centered_mono_cells_cached(
         &self,
         inputs: &[Interval64],
         want_mono: bool,
         weights: Option<&F64WeightCache>,
     ) -> Result<Vec<CenteredMono>> {
+        self.propagate_ibp_f64_centered_mono_cells_cached_with_deadline(
+            inputs, want_mono, weights, None,
+        )
+    }
+
+    /// Deadline-aware variant of
+    /// [`Self::propagate_ibp_f64_centered_mono_cells_cached`].
+    ///
+    /// Polls between seed groups, graph nodes, and the fused walk's major
+    /// phases.  Dense kernels remain atomic.  Deadline expiry returns
+    /// [`NyError::DeadlineExceeded`]; screen callers must stop conservatively
+    /// instead of repeating the same batch through an expensive per-box
+    /// fallback.
+    pub fn propagate_ibp_f64_centered_mono_cells_cached_with_deadline(
+        &self,
+        inputs: &[Interval64],
+        want_mono: bool,
+        weights: Option<&F64WeightCache>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<CenteredMono>> {
+        self.propagate_ibp_f64_centered_mono_cells_cached_impl(
+            inputs, want_mono, weights, deadline, None,
+        )
+    }
+
+    /// Diagnostic variant of
+    /// [`Self::propagate_ibp_f64_centered_mono_cells_cached`].
+    ///
+    /// Proof-producing channels are computed by the identical implementation.
+    /// After the already-paid batched derivative and center walks, the shared
+    /// `affine_budget` is spent converting derivative intervals into
+    /// [`MvfAffineEnclosure`] payloads. Reusing one budget across calls keeps
+    /// one absolute deadline: a later call cannot restart the allowance.
+    /// Expiry, malformed/non-finite channels, or any affine conversion error
+    /// simply leaves `affine_diagnostic=None`; it never fails or changes the
+    /// proof result.
+    pub fn propagate_ibp_f64_centered_mono_affine_diagnostic_cells_cached(
+        &self,
+        inputs: &[Interval64],
+        want_mono: bool,
+        weights: Option<&F64WeightCache>,
+        affine_budget: &mut MvfAffineDiagnosticBudget,
+    ) -> Result<Vec<CenteredMono>> {
+        self.propagate_ibp_f64_centered_mono_affine_diagnostic_cells_cached_with_deadline(
+            inputs,
+            want_mono,
+            weights,
+            affine_budget,
+            None,
+        )
+    }
+
+    /// Deadline-aware diagnostic variant.  The proof-producing fused walk
+    /// obeys `deadline`; the separate affine diagnostic retains its own
+    /// shared absolute budget, capped again by the outer proof deadline.
+    pub fn propagate_ibp_f64_centered_mono_affine_diagnostic_cells_cached_with_deadline(
+        &self,
+        inputs: &[Interval64],
+        want_mono: bool,
+        weights: Option<&F64WeightCache>,
+        affine_budget: &mut MvfAffineDiagnosticBudget,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<CenteredMono>> {
+        self.propagate_ibp_f64_centered_mono_cells_cached_impl(
+            inputs,
+            want_mono,
+            weights,
+            deadline,
+            Some(affine_budget),
+        )
+    }
+
+    fn propagate_ibp_f64_centered_mono_cells_cached_impl(
+        &self,
+        inputs: &[Interval64],
+        want_mono: bool,
+        weights: Option<&F64WeightCache>,
+        deadline: Option<Instant>,
+        mut affine_budget: Option<&mut MvfAffineDiagnosticBudget>,
+    ) -> Result<Vec<CenteredMono>> {
+        let check_deadline = |stage: &str| -> Result<()> {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                Err(NyError::DeadlineExceeded(format!(
+                    "f64 batched MVF deadline exceeded {stage}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+
+        check_deadline("before setup")?;
+        require_f64_interval_proof_environment_rayon()?;
+
         let w = inputs.len();
         if w == 0 {
             return Ok(Vec::new());
         }
         let in_shape = inputs[0].lower.shape().to_vec();
+        let input_entries = inputs[0].lower.len();
+        let max_centered_batch =
+            if input_entries <= SMALL_CENTERED_INPUT_ENTRIES && !self.f64_batch_worthwhile() {
+                MAX_CENTERED_BATCH_SMALL
+            } else {
+                MAX_CENTERED_BATCH_WIDE
+            };
         // Group boxes by identical seed set (order-insensitive by
         // construction: seeds are collected in ascending axis order).
         let mut groups: HashMap<Vec<usize>, Vec<usize>> = HashMap::new();
         for (b, x) in inputs.iter().enumerate() {
+            check_deadline("while grouping input boxes")?;
             if x.lower.shape() != in_shape.as_slice() || x.upper.shape() != in_shape.as_slice() {
                 return Err(NyError::InvalidSpec(
                     "f64 mvf batch: input boxes must share one shape".to_string(),
@@ -606,13 +1178,15 @@ impl GraphNetwork {
 
         let mut out: Vec<Option<CenteredMono>> = (0..w).map(|_| None).collect();
         for (seeds, idxs) in groups {
-            for chunk in idxs.chunks(MAX_CENTERED_BATCH) {
+            check_deadline("before seed group")?;
+            for chunk in idxs.chunks(max_centered_batch) {
+                check_deadline("before seed-group chunk")?;
                 let boxes: Vec<Interval64> = chunk.iter().map(|&b| inputs[b].clone()).collect();
                 let results = if seeds.is_empty() {
                     // No seedable axis: the zeroth-order forward is already
                     // (near-)point-tight — same degeneration as the per-box
                     // entry, batched.
-                    self.propagate_ibp_f64_cells_cached(&boxes, weights)?
+                    self.propagate_ibp_f64_cells_cached_with_deadline(&boxes, weights, deadline)?
                         .into_iter()
                         .map(|cell| CenteredMono {
                             value: cell.clone(),
@@ -622,11 +1196,20 @@ impl GraphNetwork {
                             certified_pairs: 0,
                             total_pairs: 0,
                             all_certified: false,
+                            affine_diagnostic: None,
                         })
                         .collect()
                 } else {
-                    self.centered_mono_cells_group(&boxes, &seeds, want_mono, weights)?
+                    self.centered_mono_cells_group(
+                        &boxes,
+                        &seeds,
+                        want_mono,
+                        weights,
+                        deadline,
+                        affine_budget.as_deref_mut(),
+                    )?
                 };
+                check_deadline("after seed-group chunk")?;
                 if results.len() != chunk.len() {
                     return Err(NyError::InvalidSpec(
                         "f64 mvf batch: group result count mismatch".to_string(),
@@ -657,8 +1240,22 @@ impl GraphNetwork {
         seeds: &[usize],
         want_mono: bool,
         weights: Option<&F64WeightCache>,
+        deadline: Option<Instant>,
+        affine_budget: Option<&mut MvfAffineDiagnosticBudget>,
     ) -> Result<Vec<CenteredMono>> {
-        let mv = self.propagate_mean_value_batched(boxes, seeds, weights)?;
+        let check_deadline = |stage: &str| -> Result<()> {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                Err(NyError::DeadlineExceeded(format!(
+                    "f64 batched MVF deadline exceeded {stage}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+
+        check_deadline("before mean-value walk")?;
+        let mv = self.propagate_mean_value_batched(boxes, seeds, weights, deadline)?;
+        check_deadline("after mean-value walk")?;
 
         // Per-box centers and center boxes (seeded axes pinned to the box's
         // OWN midpoint; unseeded axes keep their narrow intervals —
@@ -669,6 +1266,7 @@ impl GraphNetwork {
         let mut mids: Vec<Vec<f64>> = Vec::with_capacity(boxes.len());
         let mut center_boxes: Vec<Interval64> = Vec::with_capacity(boxes.len());
         for x in boxes {
+            check_deadline("while constructing center boxes")?;
             let lo_std = x.lower.as_standard_layout();
             let hi_std = x.upper.as_standard_layout();
             let (lo, hi) = match (lo_std.as_slice(), hi_std.as_slice()) {
@@ -706,11 +1304,41 @@ impl GraphNetwork {
             his.push(hi.to_vec());
             mids.push(mid);
         }
-        let points = self.propagate_ibp_f64_cells_cached(&center_boxes, weights)?;
+        let points =
+            self.propagate_ibp_f64_cells_cached_with_deadline(&center_boxes, weights, deadline)?;
+        check_deadline("after center-point walk")?;
 
         let centereds: Vec<Interval64> = (0..boxes.len())
             .map(|b| combine_centered(&los[b], &his[b], &mids[b], seeds, &mv[b], &points[b]))
             .collect::<Result<Vec<_>>>()?;
+        check_deadline("after centered combination")?;
+
+        // Dark diagnostic payload: construct only under the explicit
+        // diagnostic entry. Failure is per-box fail-open and cannot alter any
+        // proof-producing channel.
+        let mut affine_diagnostics: Vec<Option<MvfAffineEnclosure>> =
+            (0..boxes.len()).map(|_| None).collect();
+        if let Some(budget) = affine_budget {
+            let diagnostic_deadline = effective_affine_deadline(budget.deadline(), deadline);
+            for b in 0..boxes.len() {
+                if Instant::now() >= diagnostic_deadline {
+                    break;
+                }
+                affine_diagnostics[b] = build_mvf_affine_enclosure(
+                    &los[b],
+                    &his[b],
+                    &mids[b],
+                    seeds,
+                    &mv[b],
+                    &points[b],
+                    diagnostic_deadline,
+                )
+                .ok();
+            }
+            // A diagnostic-budget expiry is verdict-neutral. An outer proof
+            // deadline expiry is not: it must cancel the whole fused walk.
+            check_deadline("after affine diagnostic")?;
+        }
 
         // Mono-corner stage (#mono-corner × #f64-batch-boxes): classify per
         // box, stack every pattern's two corner boxes across the chunk, and
@@ -733,6 +1361,7 @@ impl GraphNetwork {
             let mut plans: Vec<BoxPlan> = Vec::new();
             let mut corner_boxes: Vec<Interval64> = Vec::new();
             for b in 0..boxes.len() {
+                check_deadline("while planning monotonicity corners")?;
                 let out_len = centereds[b].lower.len();
                 let Some(sg) = classify_sign_groups(&mv[b], seeds.len(), out_len) else {
                     continue; // fail open: this box keeps mono = None
@@ -757,16 +1386,22 @@ impl GraphNetwork {
 
             let mut walk_outs: Vec<Option<Interval64>> = vec![None; corner_boxes.len()];
             for (chunk_idx, chunk) in corner_boxes.chunks(MONO_CORNER_CELL_BATCH).enumerate() {
+                check_deadline("before monotonicity-corner chunk")?;
                 let base = chunk_idx * MONO_CORNER_CELL_BATCH;
-                if let Ok(outs) = self.propagate_ibp_f64_cells_cached(chunk, weights) {
-                    for (off, out) in outs.into_iter().enumerate() {
-                        walk_outs[base + off] = Some(out);
+                match self.propagate_ibp_f64_cells_cached_with_deadline(chunk, weights, deadline) {
+                    Ok(outs) => {
+                        for (off, out) in outs.into_iter().enumerate() {
+                            walk_outs[base + off] = Some(out);
+                        }
                     }
+                    Err(error) if error.is_deadline_exceeded() => return Err(error),
+                    Err(_) => {} // Corner failure remains per-box fail-open.
                 }
-                // Err: those corner walks stay None — their boxes fail open.
             }
 
+            check_deadline("after monotonicity-corner walks")?;
             for plan in plans {
+                check_deadline("while combining monotonicity corners")?;
                 let b = plan.box_idx;
                 let out_len = centereds[b].lower.len();
                 let mut m_lo = vec![f64::NEG_INFINITY; out_len];
@@ -802,6 +1437,7 @@ impl GraphNetwork {
 
         let mut results = Vec::with_capacity(boxes.len());
         for (b, (mv_b, centered)) in mv.into_iter().zip(centereds).enumerate() {
+            check_deadline("while finalizing fused outputs")?;
             let (certified_pairs, total_pairs) = stats[b];
             results.push(CenteredMono {
                 value: mv_b.value,
@@ -811,6 +1447,7 @@ impl GraphNetwork {
                 certified_pairs,
                 total_pairs,
                 all_certified: total_pairs > 0 && certified_pairs == total_pairs,
+                affine_diagnostic: affine_diagnostics[b].take(),
             });
         }
         Ok(results)
@@ -827,14 +1464,32 @@ impl GraphNetwork {
         inputs: &[Interval64],
         seeds: &[usize],
         weights: Option<&F64WeightCache>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<Channels>> {
+        let check_deadline = |stage: &str| -> Result<()> {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                Err(NyError::DeadlineExceeded(format!(
+                    "f64 batched MVF deadline exceeded {stage}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+
+        check_deadline("before derivative setup")?;
         let w = inputs.len();
         let n_seeds = seeds.len();
         let needed = self.output_ancestors()?;
         let input_entries: Vec<Channels> = inputs
             .iter()
-            .map(|x| build_input_entry(x, seeds))
+            .map(|x| {
+                check_deadline("while constructing derivative inputs")?;
+                let entry = build_input_entry(x, seeds)?;
+                check_deadline("after constructing derivative input")?;
+                Ok(entry)
+            })
             .collect::<Result<Vec<_>>>()?;
+        check_deadline("after derivative setup")?;
 
         // Consumer refcounts (with multiplicity) for eviction — W Channels
         // per live node is the walk's memory footprint.
@@ -856,6 +1511,7 @@ impl GraphNetwork {
             if !needed.contains(node_name.as_str()) {
                 continue;
             }
+            check_deadline("before derivative graph node")?;
             let node = self.node(node_name).ok_or_else(|| {
                 NyError::InvalidSpec(format!("f64 mvf batch: missing node '{node_name}'"))
             })?;
@@ -881,8 +1537,15 @@ impl GraphNetwork {
                     // Value channels: W stacked rows, bias included.
                     let value_inputs: Vec<Interval64> =
                         entries.iter().map(|e| e.value.clone()).collect();
-                    let values =
-                        eval_linear_stacked_prepared(linear, &value_inputs, true, prepared)?;
+                    check_deadline("before value Linear channel")?;
+                    let values = eval_linear_stacked_prepared(
+                        linear,
+                        &value_inputs,
+                        true,
+                        prepared,
+                        deadline,
+                    )?;
+                    check_deadline("between value and derivative Linear channels")?;
                     // Derivative channels: W·k stacked rows (box-major,
                     // channel-minor), bias EXCLUDED (constants have zero
                     // derivative).
@@ -895,10 +1558,17 @@ impl GraphNetwork {
                         }
                         deriv_inputs.extend(e.derivs.iter().cloned());
                     }
+                    check_deadline("before derivative Linear channel")?;
                     let mut deriv_outs = if deriv_inputs.is_empty() {
                         Vec::new()
                     } else {
-                        eval_linear_stacked_prepared(linear, &deriv_inputs, false, prepared)?
+                        eval_linear_stacked_prepared(
+                            linear,
+                            &deriv_inputs,
+                            false,
+                            prepared,
+                            deadline,
+                        )?
                     };
                     // Reassemble per box.
                     let mut outs = Vec::with_capacity(w);
@@ -920,6 +1590,7 @@ impl GraphNetwork {
                     (0..w)
                         .into_par_iter()
                         .map(|b| {
+                            check_deadline("before per-box derivative worker")?;
                             let resolve_value = |name: &str| -> Result<Interval64> {
                                 if name == NETWORK_INPUT {
                                     return Ok(inputs[b].clone());
@@ -935,6 +1606,7 @@ impl GraphNetwork {
                                     })
                             };
                             let value = eval_node(node.layer(), node, &resolve_value)?;
+                            check_deadline("between per-box value and derivatives")?;
                             let entry = |name: &str| -> Result<&Channels> {
                                 if name == NETWORK_INPUT {
                                     return Ok(&entries_ref[b]);
@@ -945,7 +1617,7 @@ impl GraphNetwork {
                                     ))
                                 })
                             };
-                            let derivs = eval_node_derivs(node, n_seeds, &entry)?;
+                            let derivs = eval_node_derivs(node, n_seeds, &entry, deadline)?;
                             Ok(Channels { value, derivs })
                         })
                         .collect::<Result<Vec<Channels>>>()?
@@ -980,6 +1652,7 @@ impl GraphNetwork {
                 }
             }
             cache.insert(node.name(), outs);
+            check_deadline("after derivative graph node")?;
         }
         cache.remove(self.output_name()).ok_or_else(|| {
             NyError::InvalidSpec("f64 mvf batch: output node not computed".to_string())
@@ -994,11 +1667,26 @@ impl GraphNetwork {
         input: &Interval64,
         seeds: &[usize],
     ) -> Result<Channels> {
+        self.propagate_ibp_f64_mean_value_observed(input, seeds, None, None)
+    }
+
+    /// The scalar-box mean-value walk with an optional, verdict-neutral
+    /// observer for ReLU input channels. `None` is the production path and
+    /// performs no diagnostic cloning.
+    fn propagate_ibp_f64_mean_value_observed(
+        &self,
+        input: &Interval64,
+        seeds: &[usize],
+        mut relu_inputs: Option<&mut Vec<ReluPointSnapshot>>,
+        deadline: Option<Instant>,
+    ) -> Result<Channels> {
+        check_phase_event_deadline(deadline)?;
         let needed = self.output_ancestors()?;
         let input_entry = build_input_entry(input, seeds)?;
 
         let mut cache: HashMap<&str, Channels> = HashMap::new();
         for node_name in self.exec_order()? {
+            check_phase_event_deadline(deadline)?;
             if !needed.contains(node_name.as_str()) {
                 continue;
             }
@@ -1024,7 +1712,28 @@ impl GraphNetwork {
                     .get(name)
                     .ok_or_else(|| NyError::InvalidSpec(format!("f64 mvf: '{name}' not computed")))
             };
-            let derivs = eval_node_derivs(node, seeds.len(), &entry)?;
+            if matches!(node.layer(), Layer::ReLU(_)) {
+                if let Some(snapshots) = relu_inputs.as_deref_mut() {
+                    let input_name = node.inputs().first().ok_or_else(|| {
+                        NyError::InvalidSpec(
+                            "phase-event diagnostic: ReLU missing its input".to_string(),
+                        )
+                    })?;
+                    let pre = entry(input_name)?;
+                    let derivative = pre.derivs.first().cloned().ok_or_else(|| {
+                        NyError::InvalidSpec(
+                            "phase-event diagnostic: ReLU input has no derivative channel"
+                                .to_string(),
+                        )
+                    })?;
+                    snapshots.push(ReluPointSnapshot {
+                        relu_node: node.name().to_string(),
+                        value: pre.value.clone(),
+                        derivative,
+                    });
+                }
+            }
+            let derivs = eval_node_derivs(node, seeds.len(), &entry, deadline)?;
             if derivs
                 .iter()
                 .any(|d| d.lower.shape() != value.lower.shape())
@@ -1228,6 +1937,157 @@ fn intersect_mono_with_centered(
     }))
 }
 
+/// Convert the already-computed MVF derivative channels into a certified
+/// affine relation. This is deliberately separate from [`combine_centered`]:
+/// the production centered interval remains bit-identical whether or not the
+/// diagnostic is requested.
+fn build_mvf_affine_enclosure(
+    lo: &[f64],
+    hi: &[f64],
+    mid: &[f64],
+    seeds: &[usize],
+    mv: &Channels,
+    point: &Interval64,
+    deadline: Instant,
+) -> Result<MvfAffineEnclosure> {
+    if Instant::now() >= deadline {
+        return Err(NyError::DeadlineExceeded(
+            "f64 mvf affine diagnostic budget exhausted".to_string(),
+        ));
+    }
+    if lo.len() != hi.len()
+        || lo.len() != mid.len()
+        || seeds.len() != mv.derivs.len()
+        || point.lower.shape() != point.upper.shape()
+        || point.lower.shape() != mv.value.lower.shape()
+    {
+        return Err(NyError::InvalidSpec(
+            "f64 mvf affine diagnostic shape mismatch".to_string(),
+        ));
+    }
+    let out_shape = point.lower.shape().to_vec();
+    let point_lo_std = point.lower.as_standard_layout();
+    let point_hi_std = point.upper.as_standard_layout();
+    let (point_lo, point_hi) = match (point_lo_std.as_slice(), point_hi_std.as_slice()) {
+        (Some(lo), Some(hi)) if lo.len() == hi.len() => (lo, hi),
+        _ => {
+            return Err(NyError::InvalidSpec(
+                "f64 mvf affine diagnostic point channel not contiguous".to_string(),
+            ))
+        }
+    };
+    let mut remainder_lo = point_lo.to_vec();
+    let mut remainder_hi = point_hi.to_vec();
+    for (&l, &h) in remainder_lo.iter().zip(&remainder_hi) {
+        if !(l.is_finite() && h.is_finite() && l <= h) {
+            return Err(NyError::InvalidSpec(
+                "f64 mvf affine diagnostic point interval malformed".to_string(),
+            ));
+        }
+    }
+
+    let mut centers = Vec::with_capacity(seeds.len());
+    let mut coefficients = Vec::with_capacity(seeds.len());
+    for (k, &seed) in seeds.iter().enumerate() {
+        if Instant::now() >= deadline {
+            return Err(NyError::DeadlineExceeded(
+                "f64 mvf affine diagnostic budget exhausted".to_string(),
+            ));
+        }
+        if seed >= lo.len()
+            || !(lo[seed].is_finite()
+                && hi[seed].is_finite()
+                && mid[seed].is_finite()
+                && lo[seed] <= mid[seed]
+                && mid[seed] <= hi[seed])
+        {
+            return Err(NyError::InvalidSpec(
+                "f64 mvf affine diagnostic input interval malformed".to_string(),
+            ));
+        }
+        let radius = (mid[seed] - lo[seed])
+            .next_up()
+            .max((hi[seed] - mid[seed]).next_up());
+        if !(radius.is_finite() && radius >= 0.0) {
+            return Err(NyError::InvalidSpec(
+                "f64 mvf affine diagnostic radius is non-finite".to_string(),
+            ));
+        }
+
+        let d_lo_std = mv.derivs[k].lower.as_standard_layout();
+        let d_hi_std = mv.derivs[k].upper.as_standard_layout();
+        let (d_lo, d_hi) = match (d_lo_std.as_slice(), d_hi_std.as_slice()) {
+            (Some(lo), Some(hi)) if lo.len() == point_lo.len() && lo.len() == hi.len() => (lo, hi),
+            _ => {
+                return Err(NyError::InvalidSpec(
+                    "f64 mvf affine diagnostic derivative channel malformed".to_string(),
+                ))
+            }
+        };
+        let mut axis_coefficients = Vec::with_capacity(d_lo.len());
+        for j in 0..d_lo.len() {
+            if j % 1024 == 0 && Instant::now() >= deadline {
+                return Err(NyError::DeadlineExceeded(
+                    "f64 mvf affine diagnostic budget exhausted".to_string(),
+                ));
+            }
+            let (dl, dh) = (d_lo[j], d_hi[j]);
+            if !(dl.is_finite() && dh.is_finite() && dl <= dh) {
+                return Err(NyError::InvalidSpec(
+                    "f64 mvf affine diagnostic derivative interval malformed".to_string(),
+                ));
+            }
+            // `a` is an exact f64 real selected inside the certified interval.
+            // Both deviations and their product with the input radius are
+            // rounded upward before widening the point interval.
+            let a = f64::midpoint(dl, dh).clamp(dl, dh);
+            let derivative_error = (a - dl).next_up().max((dh - a).next_up());
+            let error_radius = (derivative_error * radius).next_up();
+            if !(a.is_finite()
+                && derivative_error.is_finite()
+                && derivative_error >= 0.0
+                && error_radius.is_finite()
+                && error_radius >= 0.0)
+            {
+                return Err(NyError::InvalidSpec(
+                    "f64 mvf affine diagnostic remainder is non-finite".to_string(),
+                ));
+            }
+            remainder_lo[j] = (remainder_lo[j] - error_radius).next_down();
+            remainder_hi[j] = (remainder_hi[j] + error_radius).next_up();
+            if !(remainder_lo[j].is_finite()
+                && remainder_hi[j].is_finite()
+                && remainder_lo[j] <= remainder_hi[j])
+            {
+                return Err(NyError::InvalidSpec(
+                    "f64 mvf affine diagnostic widened remainder is malformed".to_string(),
+                ));
+            }
+            axis_coefficients.push(a);
+        }
+        centers.push(mid[seed]);
+        coefficients.push(
+            ArrayD::from_shape_vec(IxDyn(&out_shape), axis_coefficients).map_err(|e| {
+                NyError::InvalidSpec(format!("f64 mvf affine diagnostic coefficient tensor: {e}"))
+            })?,
+        );
+    }
+
+    Ok(MvfAffineEnclosure {
+        seed_axes: seeds.to_vec(),
+        centers,
+        coefficients,
+        remainder: Interval64 {
+            lower: ArrayD::from_shape_vec(IxDyn(&out_shape), remainder_lo).map_err(|e| {
+                NyError::InvalidSpec(format!("f64 mvf affine diagnostic remainder lower: {e}"))
+            })?,
+            upper: ArrayD::from_shape_vec(IxDyn(&out_shape), remainder_hi).map_err(|e| {
+                NyError::InvalidSpec(format!("f64 mvf affine diagnostic remainder upper: {e}"))
+            })?,
+        },
+    })
+}
+
 /// Final centered-form combination, shared BIT-FOR-BIT by the per-box entry
 /// and the batched multi-box entry: accumulate
 /// `point ⊕ Σ_i D_i · [lo_i − m_i, hi_i − m_i]` outward-rounded, then
@@ -1380,7 +2240,18 @@ fn eval_node_derivs<'c>(
     node: &GraphNode,
     n_seeds: usize,
     entry: &dyn Fn(&str) -> Result<&'c Channels>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<Interval64>> {
+    let check_deadline = |stage: &str| -> Result<()> {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            Err(NyError::DeadlineExceeded(format!(
+                "f64 MVF derivative deadline exceeded {stage}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline("before node rule")?;
     let unary = || -> Result<&Channels> {
         node.inputs()
             .first()
@@ -1494,11 +2365,10 @@ fn eval_node_derivs<'c>(
                         .and(vl)
                         .and(vu)
                         .for_each(|l, h, &v_lo, &v_hi| {
-                            // Sound σ(v) enclosure (same rule as the value channel).
-                            let s_lo = widen_down_n(stable_sigmoid_f64(v_lo), TRANSCENDENTAL_ULPS)
-                                .max(0.0);
-                            let s_hi =
-                                widen_up_n(stable_sigmoid_f64(v_hi), TRANSCENDENTAL_ULPS).min(1.0);
+                            // Sound σ(v) enclosure (same rigorous directed-series
+                            // rule as the value channel; no libm authority).
+                            let s_lo = certified_sigmoid_f64(v_lo).0;
+                            let s_hi = certified_sigmoid_f64(v_hi).1;
                             // 1 − σ, outward, clamped to its true range [0, 1].
                             let om_lo = (1.0 - s_hi).next_down().max(0.0);
                             let om_hi = (1.0 - s_lo).next_up().min(1.0);
@@ -1620,7 +2490,10 @@ fn eval_node_derivs<'c>(
             let x = unary()?;
             x.derivs
                 .iter()
-                .map(|d| eval_linear_with_bias(linear, d, false))
+                .map(|d| {
+                    check_deadline("before Linear seed")?;
+                    eval_linear_with_bias(linear, d, false)
+                })
                 .collect()
         }
         Layer::MatMul(matmul) => {
@@ -1629,7 +2502,9 @@ fn eval_node_derivs<'c>(
             // optional constant scale to each term, distributing correctly.
             (0..n_seeds)
                 .map(|s| {
+                    check_deadline("before first MatMul derivative term")?;
                     let da_b = eval_matmul(matmul, &a.derivs[s], &b.value)?;
+                    check_deadline("between MatMul derivative terms")?;
                     let a_db = eval_matmul(matmul, &a.value, &b.derivs[s])?;
                     broadcast_binary(&da_b, &a_db, false, |al, ah, bl, bh| Ok((al + bl, ah + bh)))
                 })
@@ -1666,6 +2541,307 @@ mod tests {
 
     fn box64(lo: &[f32], hi: &[f32]) -> Interval64 {
         Interval64::from_f32(&arr1(lo).into_dyn(), &arr1(hi).into_dyn())
+    }
+
+    fn point64(values: &[f64]) -> Interval64 {
+        Interval64::point(ArrayD::from_shape_vec(IxDyn(&[values.len()]), values.to_vec()).unwrap())
+    }
+
+    #[test]
+    fn expired_deadline_stops_batched_mvf_before_graph_walk() {
+        let g = build_phase_event_graph(1.0, 0.0);
+        let boxes = vec![box64(&[-1.0], &[1.0]), box64(&[-0.5], &[0.5])];
+        let error = match g.propagate_ibp_f64_centered_mono_cells_cached_with_deadline(
+            &boxes,
+            true,
+            None,
+            Some(Instant::now()),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expired deadline must cancel the batched MVF walk"),
+        };
+        assert!(error.is_deadline_exceeded());
+
+        let deadline_none = g
+            .propagate_ibp_f64_centered_mono_cells_cached_with_deadline(&boxes, true, None, None)
+            .expect("deadline=None batched MVF walk");
+        let interval_bits = |interval: &Interval64| {
+            (
+                interval
+                    .lower
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                interval
+                    .upper
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (index, (input, observed)) in boxes.iter().zip(&deadline_none).enumerate() {
+            let reference = g
+                .propagate_ibp_f64_centered_mono(input)
+                .expect("independent per-box MVF reference");
+            assert_eq!(
+                interval_bits(&reference.value),
+                interval_bits(&observed.value),
+                "box {index}: deadline=None changed MVF value bits versus the independent per-box walk"
+            );
+            assert_eq!(
+                interval_bits(&reference.centered),
+                interval_bits(&observed.centered),
+                "box {index}: deadline=None changed centered bits versus the independent per-box walk"
+            );
+            assert_eq!(
+                reference.mono.as_ref().map(&interval_bits),
+                observed.mono.as_ref().map(&interval_bits),
+                "box {index}: deadline=None changed mono bits versus the independent per-box walk"
+            );
+            assert_eq!(reference.seeded_axes, observed.seeded_axes);
+            assert_eq!(reference.certified_pairs, observed.certified_pairs);
+            assert_eq!(reference.total_pairs, observed.total_pairs);
+            assert_eq!(reference.all_certified, observed.all_certified);
+            assert!(reference.affine_diagnostic.is_none() && observed.affine_diagnostic.is_none());
+        }
+    }
+
+    fn build_phase_event_graph(weight: f32, bias: f32) -> GraphNetwork {
+        let mut g = GraphNetwork::new();
+        g.add_node(GraphNode::from_input(
+            "lin",
+            Layer::Linear(LinearLayer::new(arr2(&[[weight]]), Some(arr1(&[bias]))).unwrap()),
+        ));
+        g.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer),
+            vec!["lin".to_string()],
+        ));
+        g.set_output("relu");
+        g
+    }
+
+    #[test]
+    fn centered_seed_indices_share_the_production_absorption_rule() {
+        let lo = [0.0f32, 0.5, -2.0];
+        let hi = [f32::from_bits(1), 0.500_01, 1.0];
+        let axes = centered_seed_axis_indices_f32(&lo, &hi);
+        assert_eq!(axes, vec![1, 2]);
+        assert_eq!(centered_seed_axes_f32(&lo, &hi), axes.len());
+    }
+
+    #[test]
+    fn centered_seed_surface_authenticates_exactly_the_expected_axes() {
+        let graph = build_phase_event_graph(1.0, 0.0);
+        let input = box64(&[0.0, 0.5, -2.0], &[f32::from_bits(1), 0.500_01, 1.0]);
+        assert!(graph.ibp_f64_centered_only_seeds_axes(&input, &[1, 2]));
+        assert!(!graph.ibp_f64_centered_only_seeds_axes(&input, &[1]));
+        assert!(!graph.ibp_f64_centered_only_seeds_axes(&input, &[2, 1]));
+        assert!(!graph.ibp_f64_centered_only_seeds_axes(&input, &[1, 1]));
+        assert!(!graph.ibp_f64_centered_only_seeds_axes(&input, &[]));
+        assert!(!graph.ibp_f64_centered_only_seeds_axes(&input, &[1, 3]));
+        assert!(!graph.ibp_f64_centered_only_seeds_axis(&input, 1));
+    }
+
+    #[test]
+    fn point_jvp_phase_event_finds_affine_relu_crossing() {
+        // z = 2x - 1 has its only phase event at x=0.5.
+        let g = build_phase_event_graph(2.0, -1.0);
+        let diag = g
+            .diagnose_relu_phase_events_1d(&point64(&[0.75]), 0, 0.0, 1.0)
+            .expect("diagnostic");
+        assert_eq!(diag.relu_nodes, 1);
+        assert_eq!(diag.preactivations, 1);
+        assert_eq!(diag.candidates.len(), 1);
+        let event = &diag.candidates[0];
+        assert_eq!(event.relu_node, "relu");
+        assert_eq!(event.element, 0);
+        assert!(
+            event.root_lower <= 0.5 && event.root_upper >= 0.5,
+            "event bracket [{}, {}] must contain the analytic root",
+            event.root_lower,
+            event.root_upper
+        );
+        assert!((event.proposal - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn point_jvp_phase_event_counts_stationary_and_rejects_nonpoint_inputs() {
+        let g = build_phase_event_graph(0.0, 1.0);
+        let diag = g
+            .diagnose_relu_phase_events_1d(&point64(&[0.25]), 0, 0.0, 1.0)
+            .expect("diagnostic");
+        assert_eq!(diag.stationary, 1);
+        assert_eq!(diag.slope_straddles_zero, 1);
+        assert!(diag.candidates.is_empty());
+
+        let nonpoint = Interval64 {
+            lower: arr1(&[0.0]).into_dyn(),
+            upper: arr1(&[1.0]).into_dyn(),
+        };
+        assert!(
+            g.diagnose_relu_phase_events_1d(&nonpoint, 0, 0.0, 1.0)
+                .is_err(),
+            "diagnostic must fail closed unless every input is point-valued"
+        );
+    }
+
+    #[test]
+    fn point_jvp_phase_event_honors_expired_deadline() {
+        let g = build_phase_event_graph(2.0, -1.0);
+        let err = g
+            .diagnose_relu_phase_events_1d_until(&point64(&[0.75]), 0, 0.0, 1.0, Instant::now())
+            .expect_err("expired diagnostic must stop before graph work");
+        assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    }
+
+    fn affine_element_range_at(
+        affine: &MvfAffineEnclosure,
+        element: usize,
+        input: &[f64],
+    ) -> (f64, f64) {
+        let mut lo = affine.remainder.lower.iter().nth(element).copied().unwrap();
+        let mut hi = affine.remainder.upper.iter().nth(element).copied().unwrap();
+        for (k, &axis) in affine.seed_axes.iter().enumerate() {
+            let a = affine.coefficients[k].iter().nth(element).copied().unwrap();
+            let term = a * (input[axis] - affine.centers[k]);
+            lo += term;
+            hi += term;
+        }
+        (lo, hi)
+    }
+
+    #[test]
+    fn affine_diagnostic_budget_deadline_is_global_and_nonrenewing() {
+        let mut budget = MvfAffineDiagnosticBudget::new(None, Duration::from_millis(100));
+        let first_deadline = budget.deadline();
+        assert_eq!(budget.deadline(), first_deadline);
+        assert_eq!(budget.deadline(), first_deadline);
+
+        let zero_budget = MvfAffineDiagnosticBudget::new(None, Duration::ZERO);
+        assert!(zero_budget.is_exhausted());
+    }
+
+    #[test]
+    fn affine_diagnostic_deadline_is_capped_by_outer_proof_deadline() {
+        let now = Instant::now();
+        let budget_deadline = now + Duration::from_secs(2);
+        let outer_deadline = now + Duration::from_secs(1);
+        assert_eq!(
+            effective_affine_deadline(budget_deadline, Some(outer_deadline)),
+            outer_deadline
+        );
+        assert_eq!(
+            effective_affine_deadline(budget_deadline, None),
+            budget_deadline
+        );
+        assert_eq!(
+            effective_affine_deadline(outer_deadline, Some(budget_deadline)),
+            outer_deadline
+        );
+        assert_eq!(
+            effective_affine_deadline(outer_deadline, Some(outer_deadline)),
+            outer_deadline
+        );
+    }
+
+    #[test]
+    fn affine_diagnostic_encloses_exact_rational_linear_map() {
+        // Exact rational oracle: y = 2*x - 1 on x ∈ [-3/4, 5/4].
+        let mut g = GraphNetwork::new();
+        g.add_node(GraphNode::from_input(
+            "out",
+            Layer::Linear(LinearLayer::new(arr2(&[[2.0f32]]), Some(arr1(&[-1.0f32]))).unwrap()),
+        ));
+        g.set_output("out");
+        let input = box64(&[-0.75], &[1.25]);
+        let mut affine_budget = MvfAffineDiagnosticBudget::new(None, Duration::from_millis(10));
+        let mut outputs = g
+            .propagate_ibp_f64_centered_mono_affine_diagnostic_cells_cached(
+                &[input],
+                false,
+                None,
+                &mut affine_budget,
+            )
+            .expect("diagnostic walk");
+        let affine = outputs[0]
+            .affine_diagnostic
+            .take()
+            .expect("bounded affine payload");
+        assert_eq!(affine.seed_axes, vec![0]);
+        for numerator in -12..=20 {
+            let x = f64::from(numerator) / 16.0;
+            let exact = (2 * numerator - 16) as f64 / 16.0;
+            let (lo, hi) = affine_element_range_at(&affine, 0, &[x]);
+            assert!(
+                lo <= exact && exact <= hi,
+                "exact rational value {exact} at x={x} escapes [{lo}, {hi}]"
+            );
+        }
+    }
+
+    #[test]
+    fn affine_diagnostic_is_proof_identical_and_deadline_fail_open() {
+        let g = build_phase_event_graph(2.0, -1.0);
+        let input = box64(&[-0.75], &[1.25]);
+        let regular = g
+            .propagate_ibp_f64_centered_mono_cells_cached(std::slice::from_ref(&input), true, None)
+            .expect("regular walk")
+            .remove(0);
+        let mut live_budget = MvfAffineDiagnosticBudget::new(None, Duration::from_millis(100));
+        let live = g
+            .propagate_ibp_f64_centered_mono_affine_diagnostic_cells_cached(
+                std::slice::from_ref(&input),
+                true,
+                None,
+                &mut live_budget,
+            )
+            .expect("live diagnostic must retain proof result")
+            .remove(0);
+        let mut expired_budget =
+            MvfAffineDiagnosticBudget::new(Some(Instant::now()), Duration::from_millis(10));
+        let expired = g
+            .propagate_ibp_f64_centered_mono_affine_diagnostic_cells_cached(
+                std::slice::from_ref(&input),
+                true,
+                None,
+                &mut expired_budget,
+            )
+            .expect("expired diagnostic must retain proof result")
+            .remove(0);
+        let bits = |x: &Interval64| -> (Vec<u64>, Vec<u64>) {
+            (
+                x.lower.iter().map(|v| v.to_bits()).collect(),
+                x.upper.iter().map(|v| v.to_bits()).collect(),
+            )
+        };
+        let assert_proof_identity = |observed: &CenteredMono| {
+            assert_eq!(bits(&regular.value), bits(&observed.value));
+            assert_eq!(bits(&regular.centered), bits(&observed.centered));
+            assert_eq!(
+                regular.mono.as_ref().map(&bits),
+                observed.mono.as_ref().map(&bits)
+            );
+            assert_eq!(
+                (
+                    regular.seeded_axes,
+                    regular.certified_pairs,
+                    regular.total_pairs,
+                    regular.all_certified
+                ),
+                (
+                    observed.seeded_axes,
+                    observed.certified_pairs,
+                    observed.total_pairs,
+                    observed.all_certified
+                )
+            );
+        };
+        assert_proof_identity(&live);
+        assert_proof_identity(&expired);
+        assert!(regular.affine_diagnostic.is_none());
+        assert!(live.affine_diagnostic.is_some());
+        assert!(expired.affine_diagnostic.is_none());
     }
 
     /// mscn-shaped DAG (mirrors the cell-forward test DAG): input [4]
@@ -1759,6 +2935,39 @@ mod tests {
         }
         let div = sum / (2.5 + relu_sum);
         stable_sigmoid_f64(div)
+    }
+
+    #[test]
+    fn affine_diagnostic_encloses_random_mscn_like_samples() {
+        let g = build_mscn_like_graph();
+        let lo = [-0.6f32, -0.2, 0.1, -0.4];
+        let hi = [0.8f32, 0.9, 0.7, 0.5];
+        let input = box64(&lo, &hi);
+        let mut affine_budget = MvfAffineDiagnosticBudget::new(None, Duration::from_millis(10));
+        let mut outputs = g
+            .propagate_ibp_f64_centered_mono_affine_diagnostic_cells_cached(
+                &[input],
+                false,
+                None,
+                &mut affine_budget,
+            )
+            .expect("diagnostic walk");
+        let affine = outputs[0].affine_diagnostic.take().expect("affine payload");
+        assert_eq!(affine.seed_axes, vec![0, 1, 2, 3]);
+
+        let mut rng = Rng(0xAFF1_9E00_51D0_0001);
+        for _ in 0..2_000 {
+            let mut x = [0.0; 4];
+            for i in 0..4 {
+                x[i] = f64::from(lo[i]) + (f64::from(hi[i]) - f64::from(lo[i])) * rng.next_unit();
+            }
+            let exact = mscn_like_concrete(&x);
+            let (affine_lo, affine_hi) = affine_element_range_at(&affine, 0, &x);
+            assert!(
+                affine_lo <= exact && exact <= affine_hi,
+                "sample {exact} at {x:?} escapes affine [{affine_lo}, {affine_hi}]"
+            );
+        }
     }
 
     /// Task test (a) ENCLOSURE: on random boxes over the mscn-like DAG
@@ -2257,7 +3466,7 @@ mod tests {
     #[test]
     fn centered_fails_closed_on_discontinuous_op() {
         let mut g = GraphNetwork::new();
-        g.add_node(GraphNode::from_input("t", Layer::Trunc(TruncLayer)));
+        g.add_node(GraphNode::from_input("t", Layer::Trunc(TruncLayer::new())));
         g.set_output("t");
         assert!(!g.supports_ibp_f64_centered());
         let input = box64(&[0.0, 0.0], &[1.0, 1.0]);
@@ -2608,9 +3817,11 @@ mod tests {
                 x.upper.iter().map(|v| v.to_bits()).collect(),
             )
         };
-        for &w in &[3usize, 40] {
+        for &w in &[3usize, 40, 128] {
             // rows = 1 per box: m = W stacked rows; W = 3 stays on the scalar
-            // kernel, W = 40 promotes the Rump kernel (vol = 40·32·64 > 32768).
+            // kernel, W = 40 promotes the Rump kernel (vol = 40·32·64 > 32768),
+            // and W = 128 exercises the small-graph chunk above the wide
+            // graph's 96-box memory ceiling.
             let boxes: Vec<Interval64> = (0..w).map(|_| fat_mlp_box(&mut rng, 2)).collect();
             let fused = g
                 .propagate_ibp_f64_centered_mono_cells_cached(&boxes, true, Some(&cache))

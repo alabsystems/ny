@@ -7,15 +7,19 @@ use super::dequant::{
     dequantize_q5_0, dequantize_q5_1, dequantize_q5_k, dequantize_q6_k, dequantize_q8_0,
     dequantize_q8_1, get_block_elements, get_block_size,
 };
-use super::mmap::map_read_only_gguf;
-use super::parser::compute_data_section_offset;
+use super::file_data::{capture_file_stamp, ensure_file_unchanged};
+use super::parser::read_streamed_gguf_descriptor;
 use crate::safetensors::half_to_f32;
 use crate::WeightStore;
-use gguf::{GGMLType, GGUFFile, GGUFTensorInfo};
+use gguf::{GGMLType, GGUFTensorInfo};
 use ndarray::{ArrayD, IxDyn};
-use ny_core::{checked_shape_product, NyError, Result};
-use std::fs::File;
-use std::path::Path;
+use ny_core::{NyError, Result};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    mem::size_of,
+    path::Path,
+};
 use tracing::{debug, info, warn};
 
 /// Load weights from a GGUF file.
@@ -31,9 +35,12 @@ use tracing::{debug, info, warn};
 /// A `WeightStore` with all loadable tensors, with supported quantized tensors
 /// dequantized to `f32`.
 ///
-/// The GGUF file must remain immutable for the duration of the call. Like all
-/// file-backed memory maps, concurrent writes from this or another process
-/// while loading is in progress are outside the loader's safety contract.
+/// Metadata is streamed first, then each tensor payload is read into a
+/// short-lived buffer and decoded. The loader therefore does not retain a
+/// second full-file copy alongside the decoded weights; peak overhead is the
+/// largest encoded tensor plus its decoded output. The file must remain
+/// immutable for the duration of the call. Normal identity, size, or
+/// modification-time changes are detected and rejected.
 pub fn load_gguf<P: AsRef<Path>>(path: P) -> Result<WeightStore> {
     let path = path.as_ref();
     info!("Loading GGUF from: {}", path.display());
@@ -45,38 +52,42 @@ pub fn load_gguf<P: AsRef<Path>>(path: P) -> Result<WeightStore> {
         )));
     }
 
-    // Use memory-mapped I/O for efficient large file handling.
-    // This allows the OS to page in tensor data on-demand rather than
-    // loading the entire file (which can be 30GB+) into memory upfront.
-    let file = File::open(path)
+    let mut file = File::open(path)
         .map_err(|e| NyError::ModelLoad(format!("Failed to open GGUF file: {}", e)))?;
-
-    let mmap = map_read_only_gguf(&file, path)?;
-
-    let data: &[u8] = &mmap;
-
-    let gguf_file = GGUFFile::read(data)
-        .map_err(|e| NyError::ModelLoad(format!("Failed to parse GGUF: {}", e)))?
-        .ok_or_else(|| NyError::ModelLoad("Incomplete GGUF file".to_string()))?;
-
-    let data_section_offset = compute_data_section_offset(data)
-        .map_err(|e| NyError::ModelLoad(format!("Failed to compute GGUF data section: {}", e)))?;
+    let stamp = capture_file_stamp(&file, path)?;
+    let descriptor = read_streamed_gguf_descriptor(&mut file, path, stamp.len())?;
 
     let mut weights = WeightStore::new();
     let mut loaded_count = 0;
     let mut dequant_count = 0;
     let mut skipped_unsupported_count = 0;
 
-    for tensor in &gguf_file.tensors {
-        let shape: Vec<usize> = tensor.dimensions.iter().map(|&d| d as usize).collect();
-        let elements: usize = checked_shape_product(&shape).ok_or_else(|| {
+    for tensor in &descriptor.tensors {
+        if is_quantized_type(&tensor.tensor_type) && !is_dequantizable(&tensor.tensor_type) {
+            warn!(
+                "Skipping unsupported quantized tensor '{}' ({:?})",
+                tensor.name, tensor.tensor_type
+            );
+            skipped_unsupported_count += 1;
+            continue;
+        }
+
+        let (shape, elements) = checked_tensor_shape(tensor).map_err(|e| {
             NyError::ModelLoad(format!(
-                "Tensor '{}' shape {:?} overflows usize on product",
-                tensor.name, shape
+                "Invalid GGUF tensor '{}' shape {:?}: {e}",
+                tensor.name, tensor.dimensions
             ))
         })?;
 
-        match load_tensor_data(data, data_section_offset, tensor, elements) {
+        match load_tensor_from_file(
+            &mut file,
+            path,
+            stamp.len(),
+            descriptor.data_section_offset,
+            tensor,
+            elements,
+            &shape,
+        ) {
             Ok(arr) => {
                 if is_quantized_type(&tensor.tensor_type) {
                     debug!(
@@ -91,16 +102,6 @@ pub fn load_gguf<P: AsRef<Path>>(path: P) -> Result<WeightStore> {
                 loaded_count += 1;
             }
             Err(e) => {
-                if is_quantized_type(&tensor.tensor_type) && !is_dequantizable(&tensor.tensor_type)
-                {
-                    warn!(
-                        "Skipping unsupported quantized tensor '{}' ({:?}): {}",
-                        tensor.name, tensor.tensor_type, e
-                    );
-                    skipped_unsupported_count += 1;
-                    continue;
-                }
-
                 return Err(NyError::ModelLoad(format!(
                     "Failed to load GGUF tensor '{}' ({:?}): {}",
                     tensor.name, tensor.tensor_type, e
@@ -108,6 +109,8 @@ pub fn load_gguf<P: AsRef<Path>>(path: P) -> Result<WeightStore> {
             }
         }
     }
+
+    ensure_file_unchanged(&file, path, &stamp, "loading tensor data")?;
 
     if dequant_count > 0 {
         info!(
@@ -125,145 +128,191 @@ pub fn load_gguf<P: AsRef<Path>>(path: P) -> Result<WeightStore> {
     Ok(weights)
 }
 
-/// Load tensor data from the GGUF file.
+fn checked_tensor_shape(
+    tensor: &GGUFTensorInfo,
+) -> std::result::Result<(Vec<usize>, usize), String> {
+    let shape_bytes = tensor
+        .dimensions
+        .len()
+        .checked_mul(size_of::<usize>())
+        .ok_or("Tensor shape allocation overflow")?;
+    let mut shape = Vec::new();
+    shape
+        .try_reserve_exact(tensor.dimensions.len())
+        .map_err(|_| {
+            format!(
+                "Unable to allocate {shape_bytes} bytes for tensor shape {:?}",
+                tensor.dimensions
+            )
+        })?;
+
+    let mut elements = 1usize;
+    for &dimension in &tensor.dimensions {
+        let dimension = usize::try_from(dimension)
+            .map_err(|_| format!("Tensor dimension {dimension} does not fit usize"))?;
+        elements = elements
+            .checked_mul(dimension)
+            .ok_or("Tensor shape product overflows usize")?;
+        shape.push(dimension);
+    }
+    Ok((shape, elements))
+}
+
+fn tensor_payload_size(
+    tensor_type: &GGMLType,
+    elements: usize,
+) -> std::result::Result<usize, String> {
+    match tensor_type {
+        GGMLType::F32 => elements
+            .checked_mul(4)
+            .ok_or("F32 byte size overflow".into()),
+        GGMLType::F16 => elements
+            .checked_mul(2)
+            .ok_or("F16 byte size overflow".into()),
+        dtype if is_dequantizable(dtype) => {
+            let block_size =
+                get_block_size(dtype).ok_or_else(|| format!("Unknown block size for {dtype:?}"))?;
+            let block_elements = get_block_elements(dtype)
+                .ok_or_else(|| format!("Unknown block elements for {dtype:?}"))?;
+            if !elements.is_multiple_of(block_elements) {
+                return Err(format!(
+                    "Element count {elements} not divisible by block size {block_elements} for \
+                     {dtype:?}"
+                ));
+            }
+            (elements / block_elements)
+                .checked_mul(block_size)
+                .ok_or_else(|| "Quantized byte size overflow".into())
+        }
+        _ => Err(format!("Quantized type {tensor_type:?} not yet supported")),
+    }
+}
+
+fn decode_tensor_payload(
+    data: &[u8],
+    tensor: &GGUFTensorInfo,
+    elements: usize,
+    shape: &[usize],
+) -> std::result::Result<ArrayD<f32>, String> {
+    let expected_size = tensor_payload_size(&tensor.tensor_type, elements)?;
+    if data.len() != expected_size {
+        return Err(format!(
+            "Tensor payload size mismatch (got={}, expected={expected_size})",
+            data.len()
+        ));
+    }
+
+    let floats = match tensor.tensor_type {
+        GGMLType::F32 => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect(),
+        GGMLType::F16 => data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| half_to_f32(u16::from_le_bytes(*chunk)))
+            .collect(),
+        GGMLType::Q8_0 => dequantize_q8_0(data, elements)?,
+        GGMLType::Q4_0 => dequantize_q4_0(data, elements)?,
+        GGMLType::Q4_1 => dequantize_q4_1(data, elements)?,
+        GGMLType::Q5_0 => dequantize_q5_0(data, elements)?,
+        GGMLType::Q5_1 => dequantize_q5_1(data, elements)?,
+        GGMLType::Q8_1 => dequantize_q8_1(data, elements)?,
+        GGMLType::Q2K => dequantize_q2_k(data, elements)?,
+        GGMLType::Q3K => dequantize_q3_k(data, elements)?,
+        GGMLType::Q4K => dequantize_q4_k(data, elements)?,
+        GGMLType::Q5K => dequantize_q5_k(data, elements)?,
+        GGMLType::Q6K => dequantize_q6_k(data, elements)?,
+        _ => {
+            return Err(format!(
+                "Quantized type {:?} not yet supported",
+                tensor.tensor_type
+            ))
+        }
+    };
+
+    ArrayD::from_shape_vec(IxDyn(shape), floats).map_err(|e| format!("Shape mismatch: {e}"))
+}
+
+fn load_tensor_from_file(
+    file: &mut File,
+    path: &Path,
+    file_len: u64,
+    data_section_offset: u64,
+    tensor: &GGUFTensorInfo,
+    elements: usize,
+    shape: &[usize],
+) -> std::result::Result<ArrayD<f32>, String> {
+    let payload_size = tensor_payload_size(&tensor.tensor_type, elements)?;
+    let payload_size_u64 = u64::try_from(payload_size)
+        .map_err(|_| format!("Tensor payload size {payload_size} does not fit u64"))?;
+    let offset = data_section_offset
+        .checked_add(tensor.offset)
+        .ok_or("Tensor data offset overflows u64")?;
+    let end = offset
+        .checked_add(payload_size_u64)
+        .ok_or("Tensor data end offset overflows u64")?;
+    if offset > file_len || end > file_len {
+        return Err(format!(
+            "Tensor data out of bounds (offset={offset}, size={payload_size}, file_len={file_len})"
+        ));
+    }
+
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("Failed to seek tensor payload in '{}': {e}", path.display()))?;
+    let mut payload = Vec::new();
+    payload.try_reserve_exact(payload_size).map_err(|_| {
+        format!(
+            "Unable to allocate {payload_size} bytes for encoded tensor '{}'",
+            tensor.name
+        )
+    })?;
+    payload.resize(payload_size, 0);
+    file.read_exact(&mut payload).map_err(|e| {
+        format!(
+            "Failed to read complete tensor payload from '{}': {e}",
+            path.display()
+        )
+    })?;
+    decode_tensor_payload(&payload, tensor, elements, shape)
+}
+
+/// Load tensor data from an in-memory GGUF image.
+///
+/// Kept for focused decoder tests; production loading streams one encoded
+/// tensor at a time through `load_tensor_from_file`.
+#[cfg(test)]
 pub(super) fn load_tensor_data(
     file_data: &[u8],
     data_section_offset: usize,
     tensor: &GGUFTensorInfo,
     elements: usize,
 ) -> std::result::Result<ArrayD<f32>, String> {
+    let tensor_offset = usize::try_from(tensor.offset)
+        .map_err(|_| format!("Tensor offset {} does not fit usize", tensor.offset))?;
     let offset = data_section_offset
-        .checked_add(tensor.offset as usize)
+        .checked_add(tensor_offset)
         .ok_or("Tensor data offset overflow")?;
-    // Fail closed if the start offset is already past EOF. The per-type byte_size
-    // checks below cover offset+size, but a zero-byte tensor (some dimension == 0)
-    // skips that check, so `&file_data[offset..]` could otherwise panic when a
-    // crafted `general.alignment`/tensor offset pushes `offset` beyond the file.
-    if offset > file_data.len() {
+    let payload_size = tensor_payload_size(&tensor.tensor_type, elements)?;
+    let end = offset
+        .checked_add(payload_size)
+        .ok_or("Tensor data end offset overflow")?;
+    if offset > file_data.len() || end > file_data.len() {
         return Err(format!(
-            "Tensor data offset {} beyond file end {}",
-            offset,
+            "Tensor data out of bounds (offset={offset}, size={payload_size}, file_len={})",
             file_data.len()
         ));
     }
-    let shape: Vec<usize> = tensor.dimensions.iter().map(|&d| d as usize).collect();
-
-    match tensor.tensor_type {
-        GGMLType::F32 => {
-            let byte_size = elements.checked_mul(4).ok_or("F32 byte size overflow")?;
-            if file_data.len().saturating_sub(offset) < byte_size {
-                return Err(format!(
-                    "Tensor data out of bounds (offset={}, size={}, file_len={})",
-                    offset,
-                    byte_size,
-                    file_data.len()
-                ));
-            }
-
-            let data = &file_data[offset..][..byte_size];
-            let floats: Vec<f32> = data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect();
-
-            ArrayD::from_shape_vec(IxDyn(&shape), floats)
-                .map_err(|e| format!("Shape mismatch: {}", e))
-        }
-        GGMLType::F16 => {
-            let byte_size = elements.checked_mul(2).ok_or("F16 byte size overflow")?;
-            if file_data.len().saturating_sub(offset) < byte_size {
-                return Err(format!(
-                    "Tensor data out of bounds (offset={}, size={}, file_len={})",
-                    offset,
-                    byte_size,
-                    file_data.len()
-                ));
-            }
-
-            let data = &file_data[offset..][..byte_size];
-            let floats: Vec<f32> = data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| {
-                    let bits = u16::from_le_bytes(*chunk);
-                    half_to_f32(bits)
-                })
-                .collect();
-
-            ArrayD::from_shape_vec(IxDyn(&shape), floats)
-                .map_err(|e| format!("Shape mismatch: {}", e))
-        }
-        // Quantized types - dequantize to f32
-        GGMLType::Q8_0
-        | GGMLType::Q4_0
-        | GGMLType::Q4_1
-        | GGMLType::Q5_0
-        | GGMLType::Q5_1
-        | GGMLType::Q8_1
-        // K-quants (256 elements per super-block)
-        | GGMLType::Q2K
-        | GGMLType::Q3K
-        | GGMLType::Q4K
-        | GGMLType::Q5K
-        | GGMLType::Q6K => {
-            let block_size = get_block_size(&tensor.tensor_type)
-                .ok_or_else(|| format!("Unknown block size for {:?}", tensor.tensor_type))?;
-            let block_elements = get_block_elements(&tensor.tensor_type)
-                .ok_or_else(|| format!("Unknown block elements for {:?}", tensor.tensor_type))?;
-
-            if !elements.is_multiple_of(block_elements) {
-                return Err(format!(
-                    "Element count {} not divisible by block size {} for {:?}",
-                    elements, block_elements, tensor.tensor_type
-                ));
-            }
-
-            let num_blocks = elements / block_elements;
-            let byte_size = num_blocks.checked_mul(block_size).ok_or("Quantized byte size overflow")?;
-
-            if file_data.len().saturating_sub(offset) < byte_size {
-                return Err(format!(
-                    "Tensor data out of bounds (offset={}, size={}, file_len={})",
-                    offset,
-                    byte_size,
-                    file_data.len()
-                ));
-            }
-
-            let data = &file_data[offset..][..byte_size];
-            let floats = match tensor.tensor_type {
-                GGMLType::Q8_0 => dequantize_q8_0(data, elements)?,
-                GGMLType::Q4_0 => dequantize_q4_0(data, elements)?,
-                GGMLType::Q4_1 => dequantize_q4_1(data, elements)?,
-                GGMLType::Q5_0 => dequantize_q5_0(data, elements)?,
-                GGMLType::Q5_1 => dequantize_q5_1(data, elements)?,
-                GGMLType::Q8_1 => dequantize_q8_1(data, elements)?,
-                // K-quants
-                GGMLType::Q2K => dequantize_q2_k(data, elements)?,
-                GGMLType::Q3K => dequantize_q3_k(data, elements)?,
-                GGMLType::Q4K => dequantize_q4_k(data, elements)?,
-                GGMLType::Q5K => dequantize_q5_k(data, elements)?,
-                GGMLType::Q6K => dequantize_q6_k(data, elements)?,
-                _ => {
-                    return Err(format!(
-                        "Quantized type {:?} matched outer arm but not inner dequantize dispatch",
-                        tensor.tensor_type
-                    ))
-                }
-            };
-
-            ArrayD::from_shape_vec(IxDyn(&shape), floats)
-                .map_err(|e| format!("Shape mismatch: {}", e))
-        }
-        // Other quantization types not yet supported
-        _ => Err(format!(
-            "Quantized type {:?} not yet supported",
-            tensor.tensor_type
-        )),
+    let (shape, shape_elements) = checked_tensor_shape(tensor)?;
+    if shape_elements != elements {
+        return Err(format!(
+            "Tensor element count mismatch (shape={shape_elements}, supplied={elements})"
+        ));
     }
+    decode_tensor_payload(&file_data[offset..end], tensor, elements, shape.as_slice())
 }
 
 /// Check if a GGML type is quantized.

@@ -47,6 +47,7 @@ mod cached_linear_bounds;
 mod eviction;
 mod filter;
 mod grouped;
+mod memory;
 mod ordering;
 pub mod picked;
 pub mod processed;
@@ -80,6 +81,14 @@ use std::collections::HashMap;
 
 use types::DomainListConfig as Config;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct QueueEvictionPolicy {
+    /// Estimated live-frontier byte cap. Zero disables byte enforcement.
+    max_queue_bytes: usize,
+    /// Queue priority sense used to decide which domains survive eviction.
+    verify_upper_bound: bool,
+}
+
 /// Dynamic storage for branch-and-bound domains with pick_out/add pattern.
 pub struct DomainList {
     /// Configuration.
@@ -108,6 +117,8 @@ pub struct DomainList {
     /// Nonzero means the search space was truncated: the BaB loop must not
     /// report Verified on queue exhaustion (see `evict_excess_domains`).
     pub(crate) evicted: usize,
+    /// Private queue policy configured by the owning graph verifier.
+    queue_eviction_policy: QueueEvictionPolicy,
 }
 
 #[cfg(test)]

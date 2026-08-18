@@ -107,17 +107,17 @@ impl BetaCrownVerifier {
 
             match layer {
                 Layer::Linear(linear) => {
-                    let weight = &linear.weight;
+                    let weight = linear.weight();
                     let mut new_lower_a = lin_bounds.lower_a().dot(weight);
                     let mut new_upper_a = lin_bounds.upper_a().dot(weight);
 
-                    let mut new_lower_b = if let Some(bias) = &linear.bias {
+                    let mut new_lower_b = if let Some(bias) = linear.bias() {
                         lin_bounds.lower_b() + &lin_bounds.lower_a().dot(bias)
                     } else {
                         lin_bounds.lower_b().clone()
                     };
 
-                    let mut new_upper_b = if let Some(bias) = &linear.bias {
+                    let mut new_upper_b = if let Some(bias) = linear.bias() {
                         lin_bounds.upper_b() + &lin_bounds.upper_a().dot(bias)
                     } else {
                         lin_bounds.upper_b().clone()
@@ -195,6 +195,7 @@ impl BetaCrownVerifier {
                 | Layer::SiLU(_)
                 | Layer::Tanh(_)
                 | Layer::Sigmoid(_)
+                | Layer::Erf(_)
                 | Layer::Exp(_)
                 | Layer::Log(_)
                 | Layer::Sqrt(_)
@@ -314,8 +315,8 @@ impl BetaCrownVerifier {
 
             match layer {
                 Layer::Linear(linear) => {
-                    let in_dim = linear.weight.ncols();
-                    let out_dim = linear.weight.nrows();
+                    let in_dim = linear.weight().ncols();
+                    let out_dim = linear.weight().nrows();
                     if w.len() != in_dim + 1 {
                         return Err(ny_core::NyError::shape_mismatch(
                             vec![in_dim + 1],
@@ -325,8 +326,8 @@ impl BetaCrownVerifier {
 
                     let w_in = w.slice(ndarray::s![..in_dim]).to_owned();
                     let w_const = w[in_dim];
-                    let mut w_out = linear.weight.dot(&w_in);
-                    if let Some(bias) = &linear.bias {
+                    let mut w_out = linear.weight().dot(&w_in);
+                    if let Some(bias) = linear.bias() {
                         w_out = &w_out + &(bias * w_const);
                     }
 
@@ -388,6 +389,7 @@ impl BetaCrownVerifier {
                 | Layer::SiLU(_)
                 | Layer::Tanh(_)
                 | Layer::Sigmoid(_)
+                | Layer::Erf(_)
                 | Layer::Exp(_)
                 | Layer::Log(_)
                 | Layer::Sqrt(_)

@@ -34,6 +34,9 @@ use super::shared::{
     merge_pruned_cached_las, merge_pruned_objective_bounds, prune_verified_multi_objective_targets,
     PrunedMultiObjectiveTargets,
 };
+// #bab-monotone-inherit: shared monotone parent-bound merge + its dark gate,
+// re-exported at `multi_objective` module scope.
+use super::{bab_monotone_inherit_enabled, inherit_parent_lower_only};
 
 /// Outcome of processing a single BaB child domain via per-disjunct evaluation.
 ///
@@ -114,13 +117,60 @@ impl BetaCrownVerifier {
         // #cone-delta: the child inherited `node_bounds` verbatim from
         // `parent`, so its delta describes exactly the base map passed here
         // (dark, NY_CONE_REFRESH-gated).
-        let (bounds_cache, constrained_input) = self.compute_constrained_forward_bounds(
-            ctx.graph,
-            child.input_bounds.as_ref(),
+        let (mut bounds_cache, constrained_input) = self
+            .compute_constrained_forward_bounds_from_view(
+                ctx.graph,
+                child.input_bounds.as_ref(),
+                &child.history,
+                Some((&parent.node_bounds).into()),
+                Some(&child.delta_pre_nodes),
+            )?;
+        let per_domain_objectives: Vec<Vec<f32>> = pruned_targets.objectives.clone();
+        let output_dim = per_domain_objectives.first().map_or(0, Vec::len);
+        if output_dim == 0
+            || per_domain_objectives
+                .iter()
+                .any(|objective| objective.len() != output_dim)
+        {
+            return Err(ny_core::NyError::InvalidSpec(
+                "per-disjunct objectives must be a nonempty rectangular matrix".into(),
+            ));
+        }
+        let stacked_spec = ndarray::Array2::from_shape_vec(
+            (n_active, output_dim),
+            per_domain_objectives.iter().flatten().copied().collect(),
+        )
+        .map_err(|error| {
+            ny_core::NyError::InvalidSpec(format!(
+                "failed to stack per-disjunct objectives: {error}"
+            ))
+        })?;
+        let representative_alpha = pruned_targets
+            .active_indices
+            .first()
+            .and_then(|&full_idx| per_disjunct_alphas.get(full_idx))
+            .ok_or_else(|| {
+                ny_core::NyError::InternalError("active per-disjunct alpha state is missing".into())
+            })?;
+        let clip_context = GraphCrownContext::new_with_node_bounds_map(
             &child.history,
+            Some(ctx.cut_pool),
             Some(&parent.node_bounds),
-            Some(&child.delta_pre_nodes),
-        )?;
+            ctx.engine,
+        )
+        .with_alpha(representative_alpha)
+        .with_delta_seeds(&child.delta_pre_nodes);
+        let exec_order = ctx.graph.exec_order()?;
+        self.maybe_apply_complete_clip_root_bank(
+            ctx.graph,
+            &clip_context,
+            Some(&child.beta_state),
+            None,
+            Some(&stacked_spec),
+            &constrained_input,
+            exec_order,
+            &mut bounds_cache,
+        );
 
         // Build parallel arrays for N pseudo-domains (all share the same forward).
         // #cone-delta increment 2: per-pseudo-domain map clones are Arc-clones
@@ -140,8 +190,6 @@ impl BetaCrownVerifier {
             .iter()
             .map(|&full_idx| Some(&per_disjunct_alphas[full_idx]))
             .collect();
-        let per_domain_objectives: Vec<Vec<f32>> = pruned_targets.objectives.clone();
-
         let plan = ctx.graph.dispatch_plan()?;
         let engine: &dyn ny_core::GemmEngine = ctx.engine.unwrap_or(&ny_core::NaiveCpuGemmEngine);
 
@@ -270,7 +318,7 @@ impl BetaCrownVerifier {
         for (active_pos, &full_idx) in pruned_targets.active_indices.iter().enumerate() {
             let alpha = &per_disjunct_alphas[full_idx];
             // #cone-delta: same base/delta pairing as the batched arm above.
-            let crown_ctx = GraphCrownContext::new(
+            let crown_ctx = GraphCrownContext::new_with_node_bounds_map(
                 &child.history,
                 cut_pool_ref,
                 Some(&parent.node_bounds),
@@ -284,7 +332,9 @@ impl BetaCrownVerifier {
             let single_verified = [false];
             let targets = MultiObjectiveTargets::new(&single_obj, &single_thresh, &single_verified);
 
-            let seed_cache = [inherited_cached_las.get(full_idx).and_then(Option::as_ref)];
+            let seed_cache = [inherited_cached_las
+                .get(full_idx)
+                .and_then(Option::as_deref)];
 
             let result = self.propagate_multi_objective_with_beta_and_cache(
                 ctx.graph,
@@ -362,7 +412,7 @@ impl BetaCrownVerifier {
 fn apply_per_disjunct_results(
     child: &mut MultiObjectiveGraphBabDomain,
     pruned_targets: &PrunedMultiObjectiveTargets,
-    inherited_cached_las: &[Option<crate::batched_domain::CachedLinearBounds>],
+    inherited_cached_las: &[Option<Arc<crate::batched_domain::CachedLinearBounds>>],
     active_bounds: Vec<(f32, f32)>,
     active_cached_las: Vec<Option<crate::batched_domain::CachedLinearBounds>>,
     merged_node_bounds: Option<HashMap<String, Arc<BoundedTensor>>>,
@@ -372,9 +422,35 @@ fn apply_per_disjunct_results(
 ) -> Result<PerDisjunctChildOutcome> {
     let new_bounds =
         merge_pruned_objective_bounds(&child.objective_bounds, pruned_targets, active_bounds);
+    // #bab-monotone-inherit (dark, NY_BAB_MONOTONE_INHERIT=1): monotone
+    // parent-bound inheritance on the PER-DISJUNCT lane — the same merge the
+    // batched lane has always applied. This is the single install point shared
+    // by BOTH per-disjunct callers (`process_per_disjunct_batched` and
+    // `process_per_disjunct_serial`), so gating it here covers the whole lane.
+    //
+    // SOUND: `child` reaches this module only through
+    // `sequential::process_multi_objective_child`, whose child was produced by
+    // `domain.with_constraint(..)` — ONE extra ReLU/Sign split appended to the
+    // parent's history, with `input_bounds` only ever NARROWED. The child's
+    // region is therefore a SUBSET of the parent's, so any valid parent lower
+    // bound is a valid child lower bound: `max(parent_l, child_l)` is sound, and
+    // symmetrically `min(parent_u, child_u)`.
+    //
+    // `child.objective_bounds` still holds the verbatim clone of the parent's
+    // vector at this point: `with_constraint` copies it, nothing between there
+    // and here writes it, and the batched→serial fallback in
+    // `process_multi_objective_child_per_disjunct` only retries when the batched
+    // arm errored BEFORE reaching this function. Gate absent/malformed =>
+    // `new_bounds` passes through unchanged, byte-identical to today.
+    let new_bounds = if bab_monotone_inherit_enabled() {
+        inherit_parent_lower_only(&child.objective_bounds, new_bounds)
+    } else {
+        new_bounds
+    };
     if let Some(node_cache) = merged_node_bounds {
         // #cone-delta increment 2: already Arc-shared — install by move.
-        child.node_bounds = node_cache;
+        child.node_bounds =
+            crate::beta_crown::domain::NodeBoundsMap::from_shared_hash_map(node_cache);
         // #cone-delta: `node_bounds` was replaced post-bounding — the delta
         // restarts empty. (No replacement ⇒ the delta keeps describing the
         // inherited map, so it is NOT cleared in that case.)
@@ -396,7 +472,7 @@ fn apply_per_disjunct_results(
     } else {
         let merged_cached_las =
             merge_pruned_cached_las(inherited_cached_las, pruned_targets, active_cached_las);
-        if child.set_cached_las(merged_cached_las).is_err() {
+        if child.set_shared_cached_las(merged_cached_las).is_err() {
             return Ok(PerDisjunctChildOutcome::NaNCorruption);
         }
         Ok(PerDisjunctChildOutcome::Enqueued)
@@ -418,9 +494,17 @@ fn is_domain_dropped(
     thresholds: &[f32],
     conjunctive: bool,
 ) -> bool {
-    if conjunctive {
+    // #violdrop: same gate as the batched and sequential lanes — a BaB child's
+    // β-derived UPPER bound is not a certificate for its sub-region, so only the
+    // ROOT may be abandoned on a `upper < threshold` reading. See
+    // `shared::violation_drop_is_certified`.
+    let violated = if conjunctive {
         domain.all_violated(thresholds, false)
     } else {
         domain.any_violated(thresholds, false)
+    };
+    if violated {
+        super::shared::violdrop_site_probe("is_domain_dropped/per_disjunct", domain.depth);
     }
+    violated && super::shared::violation_drop_is_certified(domain.depth)
 }

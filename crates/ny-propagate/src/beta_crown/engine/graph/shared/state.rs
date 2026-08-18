@@ -48,6 +48,20 @@ pub(crate) struct GraphBabLifecycle {
 }
 
 impl GraphBabLifecycle {
+    /// Derive a deadline without allowing platform clock overflow.
+    ///
+    /// An unrepresentable budget is treated as already expired. This is
+    /// fail-closed and prevents a malformed low-level timeout from panicking
+    /// at graph-BaB deadline seams.
+    pub(crate) fn fail_closed_deadline(start_time: Instant, budget: Duration) -> Instant {
+        start_time.checked_add(budget).unwrap_or(start_time)
+    }
+
+    /// Derive a deadline from this lifecycle's start time.
+    pub(crate) fn deadline(&self, budget: Duration) -> Instant {
+        Self::fail_closed_deadline(self.start_time, budget)
+    }
+
     pub(crate) fn new(start_time: Instant) -> Self {
         Self {
             start_time,
@@ -165,7 +179,7 @@ impl GraphBabLifecycle {
         }
         if self.unresolved_due_to_eviction {
             parts.push(
-                "Queue cap (max_queue_size) evicted unverified domains before they were explored"
+                "Queue cap (max_queue_size / max_queue_bytes) evicted unverified domains before they were explored"
                     .to_string(),
             );
         }
@@ -199,6 +213,15 @@ mod tests {
         assert_eq!(lc.max_depth_reached, 0);
         assert_eq!(lc.cuts_generated, 0);
         assert!(!lc.has_unresolved());
+    }
+
+    #[test]
+    fn unrepresentable_deadline_fails_closed_at_start() {
+        let start = Instant::now();
+        assert_eq!(
+            GraphBabLifecycle::fail_closed_deadline(start, Duration::from_secs(u64::MAX)),
+            start
+        );
     }
 
     #[test]

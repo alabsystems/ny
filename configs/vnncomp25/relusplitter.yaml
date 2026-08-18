@@ -17,7 +17,7 @@
 # - Gap vs reference:
 #   * complete_verifier: auto (MIP fallback when BaB stalls) — not configured
 #   * attack_mode: diversed_PGD — implemented (#1449)
-#   * cplex_cuts: True, bab_cut: True — ny uses own cutting planes, not CPLEX
+#   * cplex_cuts: True, bab_cut: True — ny's legacy cut proof path is quarantined
 #   * reorder_bab: True — not implemented in ny
 #   * batch_size: 4 + auto_enlarge_batch_size: True — ny uses fixed 64
 #   * start_save_best: -1 — not implemented
@@ -45,14 +45,14 @@ general:
   # GPU CROWN backward for Conv2d-heavy biasfield models. Fused conv_transpose_2d
   # avoids the CPU 30s+ per-node bottleneck that caused #3813 timeouts.
   device: wgpu
-  # Reference-compatible: patches normally, matrix when cuts are enabled.
-  # With cuts.enabled=true below, this routes Conv2d CROWN backward through the
-  # dense matrix path instead of patches, eliminating per-node 30s+ bottlenecks.
-  # Reference: abcrown.py:228-231 (matrix if bab_args['cut']['enabled']).
-  conv_mode: auto
+  # Keep the measured dense-matrix Conv2d speedup independently of cuts.
+  # Cut proof authority is quarantined below, so `auto` would otherwise fall
+  # back to patches and reintroduce the per-node 30s+ bottleneck.
+  conv_mode: matrix
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   # Reference: alpha-beta-CROWN relusplitter.yaml uses diversed_PGD (#1449).
   # OSI initialization pushes restart seeds toward diverse output regions.
   attack_mode: diversed_PGD
@@ -75,10 +75,11 @@ bab:
     candidates: 10
     reduceop: max
   cuts:
-    enabled: true
-    near_miss: true
+    # Fail closed until proof-derived cuts are folded through backward CROWN.
+    enabled: false
+    near_miss: false
     near_miss_margin: 0.01
-    proactive: true
+    proactive: false
   clip:
     relaxed: true
     relaxed_iterations: 20
@@ -96,3 +97,53 @@ bab:
     lr_alpha: 0.1
     lr_beta: 0.01
     iterations: 15
+  phase_budget:
+    # #reclaim-pgd (measured 2026-08-01 at HEAD 533a3100, official budgets).
+    #
+    # The disjunctive PGD phase on this benchmark is RESTART-bound, not
+    # fraction-bound: `attack.pgd_restarts: 50` above pairs with the default
+    # `pgd_steps: 50` (never overridden here) across 9 clauses, and the lane stops
+    # on restart exhaustion WITHOUT ever reaching its fractional deadline. Measured
+    # phase duration vs the slice it was granted, on GT-unsat oval21 rows:
+    #   deep_kw img6995            @60s   22.72s used of 30.0s granted (37.9% of budget)
+    #   base_kw img2537            @60s   11.52s used of 30.0s granted (19.2%)
+    #   deep_kw_RSPLITTER img6995  @180s  27.49s used of 90.0s granted (15.3%)
+    #   base_kw_RSPLITTER img2537  @180s  17.63s used of 90.0s granted (9.8%)
+    # So `disjunctive_pgd_fraction` is INERT here — halving it to 0.25 would still
+    # grant 15s/45s, above three of the four measured costs — and the waste is
+    # roughly CONSTANT in absolute terms. That is exactly the shape an absolute cap
+    # is for; do NOT reach for the fraction instead.
+    #
+    # BaB re-bases on `PhaseBudgetLedger::remaining()`, so reclaimed seconds flow to
+    # the search. Indicative (single-arm, contended host — NOT a validated A/B):
+    # deep_kw img6995 @60s went 3511/3687 explored domains to 5287 under a 5s cap.
+    # It converted ZERO rows; these instances are held by Conv2d CROWN throughput,
+    # not falsification budget. Land this because it is free, then work the conv
+    # wall — cifar100_2024.yaml:124-126 records the same lesson.
+    #
+    # KNOWN COUPLING, not a soundness issue: verify/disjunctive.rs derives the
+    # concurrent forward-linear warmer's window as `min(pgd_deadline + 10s, overall)`,
+    # so a tighter cap also shrinks that window and may make
+    # `forward_linear_cold_build_admitted` decline on the conv rows (biasfield,
+    # oval21). The warmer is a fail-closed CACHE — on refusal nothing is cached and
+    # the verify phase recomputes the same certified bounds — so this can only trade
+    # concurrency for serial time, never a bound. It partly offsets the reclaim on
+    # conv rows, which is consistent with the measured domain gain being +43-51%
+    # rather than proportional to the ~25s reclaimed. mnist_fc is unaffected (no
+    # Conv2d, so no warmer) and 30s rows are unaffected entirely (see below).
+    #
+    # SAT COST: none measurable. All 20 GT-sat rows of the 220 are already ny-sat
+    # and land via the exact-gradient lane far inside the cap (wide_kw img773 0.07s,
+    # mnist-256x4_RSPLITTER prop_7 0.22s — a ~20x margin), and the 134-row
+    # addressable pool contains NO GT-sat rows, so no reachable point can be traded
+    # away. The cap bounds an ATTACK phase only: shortening falsification can lose a
+    # counterexample (sat -> unknown, a completeness cost) and can never mint a
+    # verdict, since no `unsat` is ever concluded from a failed attack.
+    #
+    # INERT ON THE 30s ROWS by design: the pre-existing small-budget attack cap
+    # already holds a <=30s budget's attack slice to 0.15 * 30 = 4.5s, below this
+    # ceiling, and a ceiling is a `min` — it can never LENGTHEN a phase. The budget
+    # census of instances.csv is 30s x40, 60s x70, 90s x40, 180s x70, so the 40
+    # base-mnist_fc rows at 30s are untouched; the cap binds only at 60/90/180s.
+    # Pinned by `relusplitter_pgd_cap_reclaims_at_official_budgets`.
+    disjunctive_pgd_max_secs: 5

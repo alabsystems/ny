@@ -7,6 +7,65 @@
 use super::*;
 
 #[test]
+fn directional_f32_steps_cross_the_opposite_infinity() {
+    assert_eq!(next_up_f32(f32::NEG_INFINITY), -f32::MAX);
+    assert_eq!(next_down_f32(f32::INFINITY), f32::MAX);
+    assert_eq!(next_up_f32(f32::INFINITY), f32::INFINITY);
+    assert_eq!(next_down_f32(f32::NEG_INFINITY), f32::NEG_INFINITY);
+}
+
+#[test]
+fn gemm_f64_with_deadline_default_never_delegates_to_ordinary_gemm() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct OrdinaryCallCounter {
+        ordinary_calls: AtomicUsize,
+    }
+
+    impl GemmEngine for OrdinaryCallCounter {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            unreachable!("deadline-f64 default must not call f32 GEMM")
+        }
+
+        fn gemm_f64(
+            &self,
+            m: usize,
+            _k: usize,
+            n: usize,
+            _a: &[f64],
+            _b: &[f64],
+        ) -> Result<Vec<f64>> {
+            self.ordinary_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0.0; m * n])
+        }
+    }
+
+    let engine = OrdinaryCallCounter::default();
+    let error = engine
+        .gemm_f64_with_deadline(
+            1,
+            1,
+            1,
+            &[2.0],
+            &[3.0],
+            Instant::now() + Duration::from_secs(1),
+            16,
+        )
+        .expect_err("default deadline GEMM must explicitly decline");
+    assert!(matches!(error, NyError::UnsupportedOp(_)));
+    assert_eq!(engine.ordinary_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn gemm_f64_pair_shared_rhs_default_is_two_ordered_fallback_calls() {
     use std::sync::Mutex;
 
@@ -210,6 +269,89 @@ fn test_gemm_k_zero() {
     assert_eq!(c, vec![0.0; 6]);
 }
 
+#[test]
+fn test_gemm_dimension_overflow_returns_error_instead_of_panicking() {
+    let engine = NaiveCpuGemmEngine;
+    assert!(
+        engine.gemm_f32(usize::MAX, 2, 0, &[], &[]).is_err(),
+        "f32 GEMM must reject an overflowing lhs shape"
+    );
+    assert!(
+        engine.gemm_f64(usize::MAX, 2, 0, &[], &[]).is_err(),
+        "f64 GEMM must reject an overflowing lhs shape"
+    );
+}
+
+#[test]
+fn test_sound_gemm_helpers_preserve_empty_contraction_shape() {
+    let engine = NaiveCpuGemmEngine;
+
+    let (lower, upper) = engine
+        .gemm_interval_sound(2, 0, 3, &[], &[], &[], &[])
+        .expect("empty interval contraction");
+    assert_eq!(lower, vec![0.0; 6]);
+    assert_eq!(upper, vec![0.0; 6]);
+
+    let (coeff, error) = engine
+        .crown_aw_error_step(2, 0, 3, &[], &[], &[])
+        .expect("empty CROWN contraction");
+    assert_eq!(coeff, vec![0.0; 6]);
+    assert_eq!(error, vec![0.0; 6]);
+}
+
+#[test]
+fn test_sound_gemm_helpers_reject_dimension_overflow() {
+    let engine = NaiveCpuGemmEngine;
+    assert!(
+        engine
+            .gemm_interval_sound(usize::MAX, 2, 0, &[], &[], &[], &[])
+            .is_err(),
+        "sound interval GEMM must reject an overflowing lhs shape"
+    );
+    assert!(
+        engine
+            .crown_aw_error_step(usize::MAX, 2, 0, &[], &[], &[])
+            .is_err(),
+        "CROWN error propagation must reject an overflowing lhs shape"
+    );
+    assert!(
+        crown_activation_error_step(usize::MAX, 2, &[], &[], &[], &[], &[], &[]).is_err(),
+        "activation error propagation must reject an overflowing coefficient shape"
+    );
+}
+
+#[test]
+fn test_sound_gemm_helpers_reject_short_backend_results() {
+    struct ShortOutputEngine;
+
+    impl GemmEngine for ShortOutputEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            Ok(vec![])
+        }
+    }
+
+    let engine = ShortOutputEngine;
+    assert!(
+        engine
+            .gemm_interval_sound(1, 1, 1, &[0.0], &[0.0], &[0.0], &[0.0])
+            .is_err(),
+        "interval helper must not index a malformed backend result"
+    );
+    assert!(
+        engine
+            .crown_aw_error_step(1, 1, 1, &[0.0], &[0.0], &[0.0])
+            .is_err(),
+        "CROWN helper must not index a malformed backend result"
+    );
+}
+
 /// Verify conv_transpose_2d for a 1-spec, 1-channel, 3x3 kernel, stride=1, pad=0 case.
 #[test]
 fn test_conv_transpose_2d_simple_3x3() {
@@ -315,8 +457,75 @@ fn test_conv_transpose_2d_dimension_mismatch() {
 }
 
 #[test]
+fn test_conv_transpose_2d_rejects_dimension_and_coordinate_overflow() {
+    let engine = NaiveCpuGemmEngine;
+    let dimension_overflow = ConvTranspose2dParams {
+        num_specs: usize::MAX,
+        out_channels: 2,
+        in_channels: 1,
+        out_h: 1,
+        out_w: 1,
+        in_h: 1,
+        in_w: 1,
+        kernel_h: 1,
+        kernel_w: 1,
+        stride_h: 1,
+        stride_w: 1,
+        pad_h: 0,
+        pad_w: 0,
+    };
+    assert!(engine
+        .conv_transpose_2d(&[], &[], &dimension_overflow)
+        .is_err());
+
+    let coordinate_overflow = ConvTranspose2dParams {
+        num_specs: 0,
+        out_channels: 0,
+        in_channels: 0,
+        out_h: 2,
+        out_w: 1,
+        in_h: 0,
+        in_w: 0,
+        kernel_h: 2,
+        kernel_w: 1,
+        stride_h: usize::MAX,
+        stride_w: 1,
+        pad_h: 0,
+        pad_w: 0,
+    };
+    assert!(engine
+        .conv_transpose_2d(&[], &[], &coordinate_overflow)
+        .is_err());
+}
+
+#[test]
+fn test_conv_transpose_2d_zero_volume_skips_large_scatter_loop() {
+    let engine = NaiveCpuGemmEngine;
+    let params = ConvTranspose2dParams {
+        num_specs: 1,
+        out_channels: 0,
+        in_channels: 0,
+        out_h: usize::MAX,
+        out_w: 1,
+        in_h: 0,
+        in_w: 0,
+        kernel_h: 1,
+        kernel_w: 1,
+        stride_h: 1,
+        stride_w: 1,
+        pad_h: 0,
+        pad_w: 0,
+    };
+
+    let result = engine
+        .conv_transpose_2d(&[], &[], &params)
+        .expect("zero-volume transpose convolution is empty");
+    assert!(result.is_empty());
+}
+
+#[test]
 fn test_is_crown_coeff_safe_normal_values() {
-    for value in [0.0, 1.0, -1.0, 1e9, -1e9, CROWN_COEFF_MAX, -CROWN_COEFF_MAX] {
+    for value in [0.0, 1.0, -1.0, 1e9, -1e9] {
         assert!(
             is_crown_coeff_safe(value),
             "value {value} should stay within the safe CROWN coefficient envelope"
@@ -327,6 +536,8 @@ fn test_is_crown_coeff_safe_normal_values() {
 #[test]
 fn test_is_crown_coeff_safe_overflow_values() {
     for value in [
+        CROWN_COEFF_MAX,
+        -CROWN_COEFF_MAX,
         CROWN_COEFF_MAX * 1.001,
         -CROWN_COEFF_MAX * 1.001,
         1e11,
@@ -343,6 +554,20 @@ fn test_is_crown_coeff_safe_overflow_values() {
 }
 
 // ===== gemm_interval_sound: enclosure soundness =====
+
+#[test]
+fn sound_dot_gamma_refuses_unrecoverable_contraction_lengths() {
+    let last_supported = (1usize << 23) - 1;
+    assert!(sound_dot_gamma(last_supported).is_ok());
+    assert!(matches!(
+        sound_dot_gamma(1usize << 23),
+        Err(NyError::UnsupportedConfiguration(_))
+    ));
+    assert!(matches!(
+        sound_dot_gamma(usize::MAX),
+        Err(NyError::UnsupportedConfiguration(_))
+    ));
+}
 
 /// Exact-ish reference enclosure of `{A@B : A∈[a_lo,a_hi], B∈[b_lo,b_hi]}`.
 ///
@@ -629,6 +854,55 @@ fn gemm_interval_sound_survives_adversarial_underflow_and_overflow() {
                 o_hi[idx]
             );
         }
+    }
+}
+
+/// A DAZ backend can erase a subnormal midpoint before multiplying it by a
+/// large normal operand. The amplified FLT_MIN floor must still contain the
+/// real product; an `8*k*ETA` floor is many orders of magnitude too small.
+#[test]
+fn gemm_interval_sound_survives_daz_operand_flush() {
+    struct MockDazGemmEngine;
+    impl GemmEngine for MockDazGemmEngine {
+        fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+            let z = |x: f32| {
+                if x != 0.0 && x.abs() < f32::MIN_POSITIVE {
+                    0.0
+                } else {
+                    x
+                }
+            };
+            let mut out = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f32;
+                    for l in 0..k {
+                        acc = z(acc + z(z(a[i * k + l]) * z(b[l * n + j])));
+                    }
+                    out[i * n + j] = acc;
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    let cases = [
+        (2.0f32.powi(-130), 2.0f32.powi(20)),
+        (2.0f32.powi(-130), -(2.0f32.powi(24))),
+        (f32::from_bits(1), 2.0f32.powi(120)),
+        (2.0f32.powi(-140), 2.0f32.powi(60)),
+    ];
+    for (a, b) in cases {
+        let (lo, hi) = MockDazGemmEngine
+            .gemm_interval_sound(1, 1, 1, &[a], &[a], &[b], &[b])
+            .expect("DAZ interval GEMM");
+        let exact = f64::from(a) * f64::from(b);
+        assert!(
+            f64::from(lo[0]) <= exact && exact <= f64::from(hi[0]),
+            "DAZ operand flush excluded {a:e}*{b:e}={exact:e} from [{:e}, {:e}]",
+            lo[0],
+            hi[0]
+        );
     }
 }
 
@@ -1058,4 +1332,116 @@ fn ftz_floor_over_bounds_flush_loss_and_prior_eta_floor() {
             "floor must dominate the prior 8·n·ETA floor for n={n}"
         );
     }
+}
+
+/// The DEFAULT declaration every engine inherits must be pointwise identical to
+/// the historical single-constant policy `m*k*p >= SOUND_F64_GEMM_DEFAULT_MIN_MACS`.
+/// If this drifts, arming the engine-aware floor silently changes cuBLAS.
+#[test]
+fn constant_floor_admission_is_exactly_the_historical_mac_product_test() {
+    let policy = |m: usize, k: usize, p: usize| {
+        m.saturating_mul(k).saturating_mul(p) >= SOUND_F64_GEMM_DEFAULT_MIN_MACS
+    };
+    let shapes: &[(usize, usize, usize)] = &[
+        (0, 0, 0),
+        (0, 4096, 4096),
+        (4096, 0, 4096),
+        (1, 1, 1),
+        (1, 1, SOUND_F64_GEMM_DEFAULT_MIN_MACS - 1),
+        (1, 1, SOUND_F64_GEMM_DEFAULT_MIN_MACS),
+        (1, 1, SOUND_F64_GEMM_DEFAULT_MIN_MACS + 1),
+        (4, 16, 16),
+        (9, 1, 9),
+        (64, 512, 512),
+        (63, 512, 512),
+        (1, 4096, 4096),
+        (usize::MAX, usize::MAX, usize::MAX),
+        (usize::MAX, 1, 1),
+    ];
+    for &(m, k, p) in shapes {
+        assert_eq!(
+            SoundF64GemmAdmission::CONSTANT_FLOOR.admits(m, k, p),
+            policy(m, k, p),
+            "{m}x{k}x{p}"
+        );
+        // `sanitized()` must not perturb the default either.
+        assert_eq!(
+            SoundF64GemmAdmission::CONSTANT_FLOOR
+                .sanitized()
+                .admits(m, k, p),
+            policy(m, k, p),
+            "{m}x{k}x{p} (sanitized)"
+        );
+    }
+}
+
+/// An engine that does not override the trait method gets the constant floor.
+#[test]
+fn undeclared_engine_inherits_the_constant_floor() {
+    struct Undeclared;
+    impl GemmEngine for Undeclared {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            Err(NyError::UnsupportedOp("test".into()))
+        }
+    }
+    assert_eq!(
+        Undeclared.sound_f64_deadline_admission(),
+        SoundF64GemmAdmission::CONSTANT_FLOOR
+    );
+    assert_eq!(
+        NaiveCpuGemmEngine.sound_f64_deadline_admission(),
+        SoundF64GemmAdmission::CONSTANT_FLOOR
+    );
+}
+
+/// A zeroed declaration must not become an "admit everything" declaration.
+#[test]
+fn sanitized_declaration_refuses_degenerate_operands() {
+    let zeroed = SoundF64GemmAdmission {
+        min_macs: 0,
+        min_rows: 0,
+        min_contraction: 0,
+        min_columns: 0,
+        small_contraction_below: 0,
+        small_contraction_max_output: usize::MAX,
+    }
+    .sanitized();
+    assert!(!zeroed.admits(0, 4, 4), "empty A rows");
+    assert!(!zeroed.admits(4, 0, 4), "empty contraction");
+    assert!(!zeroed.admits(4, 4, 0), "empty output columns");
+    assert!(zeroed.admits(1, 1, 1));
+}
+
+/// The shape rules are independent: each one alone can decline a product the
+/// MAC count alone would admit.
+#[test]
+fn shape_rules_decline_independently_of_the_mac_count() {
+    let declaration = SoundF64GemmAdmission {
+        min_macs: 1 << 10,
+        min_rows: 4,
+        min_contraction: 4,
+        min_columns: 1,
+        small_contraction_below: 16,
+        small_contraction_max_output: 1 << 16,
+    };
+    // 16.7M MACs — far above min_macs — declined for shape reasons alone.
+    assert!(!declaration.admits(4096, 1, 4096), "k==1");
+    assert!(!declaration.admits(131072, 2, 64), "k==2");
+    assert!(!declaration.admits(1, 4096, 4096), "m==1");
+    assert!(!declaration.admits(2048, 4, 2048), "small k, large output");
+    // The same small k is fine when the output is small.
+    assert!(declaration.admits(256, 4, 256));
+    assert!(declaration.admits(64, 4, 64));
+    // A large contraction is never subject to the small-k rule.
+    assert!(declaration.admits(4, 4194304, 1));
+    // Below the declared crossover.
+    assert!(!declaration.admits(9, 8, 8), "576 MACs < 1024");
+    assert!(declaration.admits(4, 16, 16), "1024 MACs");
 }

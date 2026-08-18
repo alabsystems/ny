@@ -18,8 +18,10 @@ use crate::LinearBounds;
 impl BoundPropagation for BatchNormLayer {
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
+        self.validate_affine_parameters()?;
         let input_shape = input.shape();
-        let layout = detect_input_layout(input_shape, self.num_channels, None)?;
+        let layout =
+            detect_input_layout(input_shape, self.num_channels, None, self.channel_axis_hint)?;
 
         // Create output arrays
         let mut out_lower = ArrayD::zeros(IxDyn(input_shape));

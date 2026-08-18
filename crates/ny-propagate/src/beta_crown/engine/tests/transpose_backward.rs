@@ -61,7 +61,6 @@ fn test_transpose_backward_permutes_coefficients_alpha_beta() {
         None, // no constraints
         &beta_state,
         &alpha_state,
-        None, // no arelu state
         0,    // layer index (doesn't matter for Transpose)
         None, // no GEMM engine
     );

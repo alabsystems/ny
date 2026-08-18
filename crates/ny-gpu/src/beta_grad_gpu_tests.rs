@@ -34,7 +34,7 @@ use ny_propagate::{
 };
 use ny_tensor::BoundedTensor;
 
-use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
 
 /// Deterministic LCG in [-1, 1).
 struct Lcg(u64);
@@ -240,7 +240,11 @@ fn assert_beta_grad_parity(
     rng: &mut Lcg,
     label: &str,
 ) {
-    let device = require_device();
+    let device = require_verdict_device();
+    assert!(
+        device.sound_gpu_authority(),
+        "gpu-tests requires a typed, verdict-qualified sound-CROWN device"
+    );
     let ibp_map = graph.collect_node_bounds(input).expect("IBP node bounds");
     let out_dim: usize = ibp_map[graph.output_name()].len();
     let spec = random_spec(rng, 3, out_dim);
@@ -297,7 +301,11 @@ fn assert_beta_opt_monotone_and_sound(
     rng: &mut Lcg,
     label: &str,
 ) {
-    let device = require_device();
+    let device = require_verdict_device();
+    assert!(
+        device.sound_gpu_authority(),
+        "gpu-tests requires a typed, verdict-qualified sound-CROWN device"
+    );
     let ibp_map = graph.collect_node_bounds(input).expect("IBP node bounds");
     let out_dim: usize = ibp_map[graph.output_name()].len();
     let num_specs = 3usize;
@@ -466,21 +474,25 @@ fn beta_opt_never_looser_stacked_blocks_w4() {
     assert_beta_opt_monotone_and_sound(&graph, &input, &splits, &mut rng, "stacked-blocks");
 }
 
-/// #seg-resident A/B: the device-resident segment stream (`NY_SEG_RESIDENT=1`)
-/// vs the legacy per-segment download/merge/re-upload, on the SAME β-folded
-/// sound resnet backward. Value lanes are bit-identical by construction (the
-/// f32 RN add of two f32s IS the correctly-rounded f64 sum the CPU merge
-/// computes); the on-device merge error lane carries an outward slack ≥ the
-/// CPU merge's — so the resident bound may only WIDEN, and by at most the tiny
-/// slack. Asserts: finite, enclosure (resident ⊇ legacy), and closeness.
-fn assert_seg_resident_ab(
+/// The qualified β route must keep using the worded legacy segment stream.
+/// `NY_SEG_RESIDENT=1` currently carries no taint-word buffers, so enabling it
+/// under the armed word gate is a typed, fail-closed refusal rather than a
+/// numerical A/B route.  The exact error is pinned by
+/// `taint_resnet_seg_resident_stream_refuses`; these graph-level fixtures pin
+/// that the public β optimizer propagates the refusal instead of silently
+/// dropping to the unworded stream.
+fn assert_seg_resident_refuses_wordless_beta_stream(
     graph: &GraphNetwork,
     input: &BoundedTensor,
     splits: &[DebugSplit],
     rng: &mut Lcg,
     label: &str,
 ) {
-    let device = require_device();
+    let device = require_verdict_device();
+    assert!(
+        device.sound_gpu_authority(),
+        "gpu-tests requires a typed, verdict-qualified sound-CROWN device"
+    );
     let ibp_map = graph.collect_node_bounds(input).expect("IBP node bounds");
     let out_dim: usize = ibp_map[graph.output_name()].len();
     let num_specs = 3usize;
@@ -488,76 +500,70 @@ fn assert_seg_resident_ab(
     let thresholds = vec![0.0f32; num_specs];
     let run = || {
         debug_gpu_beta_opt_vs_single(graph, input, &spec, splits, &thresholds, 2, device.as_ref())
-            .expect("GPU beta single lane (fixture must take the GPU path)")
     };
-    let ((leg_lo, leg_hi), (leg_opt_lo, leg_opt_hi)) =
-        ny_test_utils::env::with_env_edits(|e| {
-            e.remove("NY_SEG_RESIDENT");
-            run()
-        });
-    let ((res_lo, res_hi), (res_opt_lo, res_opt_hi)) =
-        ny_test_utils::env::with_env_edits(|e| {
-            e.set("NY_SEG_RESIDENT", "1");
-            run()
-        });
-    let check = |leg_lo: &[f32], leg_hi: &[f32], res_lo: &[f32], res_hi: &[f32], lane: &str| {
-        assert_eq!(res_lo.len(), leg_lo.len(), "{label}/{lane}: length mismatch");
-        for i in 0..leg_lo.len() {
-            assert!(
-                res_lo[i].is_finite() && res_hi[i].is_finite(),
-                "{label}/{lane}: non-finite resident bound at {i}"
-            );
-            // Enclosure: the resident error lane is ≥ the CPU merge's, so the
-            // concretized interval may only widen.
-            assert!(
-                res_lo[i] <= leg_lo[i] && res_hi[i] >= leg_hi[i],
-                "{label}/{lane}: resident bound TIGHTER than legacy at {i}: \
-                 [{}, {}] vs [{}, {}] — soundness ordering violated",
-                res_lo[i],
-                res_hi[i],
-                leg_lo[i],
-                leg_hi[i]
-            );
-            // Closeness: the widening is bounded by the tiny merge slack.
-            let tol = 1e-4f32 + 1e-4 * leg_lo[i].abs().max(leg_hi[i].abs());
-            assert!(
-                (res_lo[i] - leg_lo[i]).abs() <= tol && (res_hi[i] - leg_hi[i]).abs() <= tol,
-                "{label}/{lane}: resident bound drifted at {i}: [{}, {}] vs [{}, {}] (tol {tol})",
-                res_lo[i],
-                res_hi[i],
-                leg_lo[i],
-                leg_hi[i]
-            );
-        }
-    };
-    check(&leg_lo, &leg_hi, &res_lo, &res_hi, "single");
-    check(&leg_opt_lo, &leg_opt_hi, &res_opt_lo, &res_opt_hi, "opt");
+    let legacy = ny_test_utils::env::with_env_edits(|e| {
+        e.set("NY_GPU_TAINT_WORDS", "1");
+        e.remove("NY_SEG_RESIDENT");
+        run()
+    })
+    .expect("qualified worded beta lane must remain available");
+    for (lane, (lo, hi)) in [("single", legacy.0), ("optimized", legacy.1)] {
+        assert_eq!(lo.len(), hi.len(), "{label}/{lane}: length mismatch");
+        assert!(
+            lo.iter()
+                .zip(&hi)
+                .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u),
+            "{label}/{lane}: qualified legacy bounds must be finite and ordered"
+        );
+    }
+
+    let seg_resident = ny_test_utils::env::with_env_edits(|e| {
+        e.set("NY_GPU_TAINT_WORDS", "1");
+        e.set("NY_SEG_RESIDENT", "1");
+        run()
+    });
+    assert!(
+        seg_resident.is_none(),
+        "{label}: the qualified beta route must refuse the unworded seg-resident stream"
+    );
 }
 
 #[test]
-fn seg_resident_ab_identity_skip_w4() {
+fn seg_resident_refuses_wordless_identity_skip_w4() {
     let _g = gpu_test_serial_guard();
     let mut rng = Lcg(0x5E97_0001);
     let hw = 5;
     let graph = with_head(identity_skip_graph(hw, &mut rng), "add", 4, hw, &mut rng);
     let input = input_box(hw, &mut rng);
     let splits = pick_splits(&graph, &input, "relu1", "conv1", 3);
-    assert_seg_resident_ab(&graph, &input, &splits, &mut rng, "identity-skip+head");
+    assert_seg_resident_refuses_wordless_beta_stream(
+        &graph,
+        &input,
+        &splits,
+        &mut rng,
+        "identity-skip+head",
+    );
 }
 
 #[test]
-fn seg_resident_ab_projection_skip_w4() {
+fn seg_resident_refuses_wordless_projection_skip_w4() {
     let _g = gpu_test_serial_guard();
     let mut rng = Lcg(0x5E97_0002);
     let hw = 5;
     let graph = with_head(projection_skip_graph(hw, &mut rng), "add", 6, hw, &mut rng);
     let input = input_box(hw, &mut rng);
     let splits = pick_splits(&graph, &input, "relu1", "conv1", 3);
-    assert_seg_resident_ab(&graph, &input, &splits, &mut rng, "projection-skip+head");
+    assert_seg_resident_refuses_wordless_beta_stream(
+        &graph,
+        &input,
+        &splits,
+        &mut rng,
+        "projection-skip+head",
+    );
 }
 
 #[test]
-fn seg_resident_ab_stacked_blocks_w4() {
+fn seg_resident_refuses_wordless_stacked_blocks_w4() {
     let _g = gpu_test_serial_guard();
     let mut rng = Lcg(0x5E97_0003);
     let hw = 5;
@@ -565,5 +571,11 @@ fn seg_resident_ab_stacked_blocks_w4() {
     let input = input_box(hw, &mut rng);
     let mut splits = pick_splits(&graph, &input, "relu1", "conv0", 2);
     splits.extend(pick_splits(&graph, &input, "relu2", "add1", 2));
-    assert_seg_resident_ab(&graph, &input, &splits, &mut rng, "stacked-blocks+head");
+    assert_seg_resident_refuses_wordless_beta_stream(
+        &graph,
+        &input,
+        &splits,
+        &mut rng,
+        "stacked-blocks+head",
+    );
 }

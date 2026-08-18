@@ -18,6 +18,28 @@ use ny_tensor::BoundedTensor;
 use super::resolve_reduction_axes;
 use crate::{BoundPropagation, LinearBounds};
 
+/// Enclose an integer index in binary32 without assuming it is exactly
+/// representable (indices above 2^24 need two adjacent f32 endpoints).
+fn index_interval(index: usize) -> (f32, f32) {
+    let rounded = index as f32;
+    // Compare in a wider integer domain. Casting a rounded value just above
+    // `usize::MAX` back to usize saturates and can falsely look exact at the
+    // theoretical maximum index.
+    let represented = rounded as u128;
+    let exact = index as u128;
+    if represented < exact {
+        (rounded, ny_tensor::next_up_f32(rounded))
+    } else if represented > exact {
+        (ny_tensor::next_down_f32(rounded), rounded)
+    } else {
+        (rounded, rounded)
+    }
+}
+
+fn index_upper_bound(index: usize) -> f32 {
+    index_interval(index).1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopkOutputKind {
     Values,
@@ -72,26 +94,33 @@ impl TopkLayer {
         }
 
         let axis_obj = Axis(axis);
-        let mut lower_values = Vec::with_capacity(out_shape.iter().product());
-        let mut upper_values = Vec::with_capacity(out_shape.iter().product());
-        for (lower_lane, upper_lane) in input
-            .lower()
-            .lanes(axis_obj)
+        let mut lower = ArrayD::zeros(IxDyn(&out_shape));
+        let mut upper = ArrayD::zeros(IxDyn(&out_shape));
+        for (((mut out_lower, mut out_upper), lower_lane), upper_lane) in lower
+            .lanes_mut(axis_obj)
             .into_iter()
+            .zip(upper.lanes_mut(axis_obj))
+            .zip(input.lower().lanes(axis_obj))
             .zip(input.upper().lanes(axis_obj))
         {
             let mut lane_lower = lower_lane.iter().copied().collect::<Vec<_>>();
             let mut lane_upper = upper_lane.iter().copied().collect::<Vec<_>>();
             lane_lower.sort_unstable_by(|a, b| b.total_cmp(a));
             lane_upper.sort_unstable_by(|a, b| b.total_cmp(a));
-            lower_values.extend(lane_lower.into_iter().take(self.k));
-            upper_values.extend(lane_upper.into_iter().take(self.k));
+            for (slot, value) in out_lower
+                .iter_mut()
+                .zip(lane_lower.into_iter().take(self.k))
+            {
+                *slot = value;
+            }
+            for (slot, value) in out_upper
+                .iter_mut()
+                .zip(lane_upper.into_iter().take(self.k))
+            {
+                *slot = value;
+            }
         }
 
-        let lower = ArrayD::from_shape_vec(IxDyn(&out_shape), lower_values)
-            .map_err(|e| NyError::InvalidSpec(format!("Topk lower reshape failed: {e}")))?;
-        let upper = ArrayD::from_shape_vec(IxDyn(&out_shape), upper_values)
-            .map_err(|e| NyError::InvalidSpec(format!("Topk upper reshape failed: {e}")))?;
         BoundedTensor::new(lower, upper)
     }
 
@@ -101,7 +130,7 @@ impl TopkLayer {
         let upper_index = if axis_len <= 1 {
             0.0
         } else {
-            (axis_len - 1) as f32
+            index_upper_bound(axis_len - 1)
         };
         let lower = ArrayD::from_elem(IxDyn(&out_shape), 0.0_f32);
         let upper = ArrayD::from_elem(IxDyn(&out_shape), upper_index);
@@ -129,11 +158,21 @@ impl BoundPropagation for TopkLayer {
 pub struct ArgMaxLayer {
     pub axis: i64,
     pub keepdims: bool,
+    pub select_last_index: bool,
 }
 
 impl ArgMaxLayer {
     pub fn new(axis: i64, keepdims: bool) -> Self {
-        Self { axis, keepdims }
+        Self {
+            axis,
+            keepdims,
+            select_last_index: false,
+        }
+    }
+
+    pub fn with_select_last_index(mut self, select_last_index: bool) -> Self {
+        self.select_last_index = select_last_index;
+        self
     }
 
     fn resolve_axis(&self, ndim: usize) -> Result<usize> {
@@ -145,11 +184,21 @@ impl ArgMaxLayer {
 pub struct ArgMinLayer {
     pub axis: i64,
     pub keepdims: bool,
+    pub select_last_index: bool,
 }
 
 impl ArgMinLayer {
     pub fn new(axis: i64, keepdims: bool) -> Self {
-        Self { axis, keepdims }
+        Self {
+            axis,
+            keepdims,
+            select_last_index: false,
+        }
+    }
+
+    pub fn with_select_last_index(mut self, select_last_index: bool) -> Self {
+        self.select_last_index = select_last_index;
+        self
     }
 
     fn resolve_axis(&self, ndim: usize) -> Result<usize> {
@@ -183,7 +232,12 @@ fn argext_output_shape(input_shape: &[usize], axis: usize, keepdims: bool) -> Ve
     out_shape
 }
 
-fn exact_argext_index(lower_lane: &[f32], upper_lane: &[f32], use_argmax: bool) -> Option<usize> {
+fn exact_argext_index(
+    lower_lane: &[f32],
+    upper_lane: &[f32],
+    use_argmax: bool,
+    select_last_index: bool,
+) -> Option<usize> {
     for candidate in 0..lower_lane.len() {
         let cand_lower = lower_lane[candidate];
         let cand_upper = upper_lane[candidate];
@@ -200,10 +254,24 @@ fn exact_argext_index(lower_lane: &[f32], upper_lane: &[f32], use_argmax: bool) 
             if !other_lower.is_finite() || !other_upper.is_finite() {
                 return None;
             }
-            let dominates = if use_argmax {
-                cand_lower > other_upper
+            // ONNX breaks exact ties by source index. A competitor on the
+            // preferred side must be strictly dominated; one on the other
+            // side may tie because the candidate wins that tie.
+            let other_wins_tie = if select_last_index {
+                other > candidate
             } else {
+                other < candidate
+            };
+            let dominates = if use_argmax {
+                if other_wins_tie {
+                    cand_lower > other_upper
+                } else {
+                    cand_lower >= other_upper
+                }
+            } else if other_wins_tie {
                 cand_upper < other_lower
+            } else {
+                cand_upper <= other_lower
             };
             if !dominates {
                 exact = false;
@@ -229,7 +297,7 @@ fn exact_argsort_lane(
     lower_lane: &[f32],
     upper_lane: &[f32],
     descending: bool,
-) -> Option<Vec<f32>> {
+) -> Option<Vec<usize>> {
     let n = lower_lane.len();
     if n == 0 {
         return Some(Vec::new());
@@ -278,7 +346,7 @@ fn exact_argsort_lane(
     }
 
     // ArgSort output position p holds the source index that sorts into rank p.
-    Some(order.into_iter().map(|idx| idx as f32).collect())
+    Some(order)
 }
 
 fn propagate_argext_ibp(
@@ -286,6 +354,7 @@ fn propagate_argext_ibp(
     axis: usize,
     keepdims: bool,
     use_argmax: bool,
+    select_last_index: bool,
     layer_name: &str,
 ) -> Result<BoundedTensor> {
     let axis_len = input.shape()[axis];
@@ -305,7 +374,7 @@ fn propagate_argext_ibp(
     let uncertain_upper = if axis_len <= 1 {
         0.0
     } else {
-        (axis_len - 1) as f32
+        index_upper_bound(axis_len - 1)
     };
 
     for (lower_lane, upper_lane) in input
@@ -316,10 +385,12 @@ fn propagate_argext_ibp(
     {
         let lower_vec = lower_lane.iter().copied().collect::<Vec<_>>();
         let upper_vec = upper_lane.iter().copied().collect::<Vec<_>>();
-        if let Some(exact) = exact_argext_index(&lower_vec, &upper_vec, use_argmax) {
-            let exact = exact as f32;
-            out_lower.push(exact);
-            out_upper.push(exact);
+        if let Some(exact) =
+            exact_argext_index(&lower_vec, &upper_vec, use_argmax, select_last_index)
+        {
+            let (lower, upper) = index_interval(exact);
+            out_lower.push(lower);
+            out_upper.push(upper);
         } else {
             out_lower.push(0.0);
             out_upper.push(uncertain_upper);
@@ -336,7 +407,14 @@ fn propagate_argext_ibp(
 impl BoundPropagation for ArgMaxLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         let axis = self.resolve_axis(input.shape().len())?;
-        propagate_argext_ibp(input, axis, self.keepdims, true, "ArgMax")
+        propagate_argext_ibp(
+            input,
+            axis,
+            self.keepdims,
+            true,
+            self.select_last_index,
+            "ArgMax",
+        )
     }
 
     fn propagate_linear<'a>(&self, _bounds: &'a LinearBounds) -> Result<Cow<'a, LinearBounds>> {
@@ -349,7 +427,14 @@ impl BoundPropagation for ArgMaxLayer {
 impl BoundPropagation for ArgMinLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         let axis = self.resolve_axis(input.shape().len())?;
-        propagate_argext_ibp(input, axis, self.keepdims, false, "ArgMin")
+        propagate_argext_ibp(
+            input,
+            axis,
+            self.keepdims,
+            false,
+            self.select_last_index,
+            "ArgMin",
+        )
     }
 
     fn propagate_linear<'a>(&self, _bounds: &'a LinearBounds) -> Result<Cow<'a, LinearBounds>> {
@@ -372,7 +457,7 @@ impl BoundPropagation for ArgSortLayer {
         let uncertain_upper = if axis_len <= 1 {
             0.0
         } else {
-            (axis_len - 1) as f32
+            index_upper_bound(axis_len - 1)
         };
 
         // ArgSort output shape equals the input shape; the sorted indices live
@@ -394,11 +479,14 @@ impl BoundPropagation for ArgSortLayer {
             let lower_vec = lower_lane_in.iter().copied().collect::<Vec<_>>();
             let upper_vec = upper_lane_in.iter().copied().collect::<Vec<_>>();
             if let Some(exact) = exact_argsort_lane(&lower_vec, &upper_vec, self.descending) {
-                for (slot, value) in lower_lane_out.iter_mut().zip(exact.iter()) {
-                    *slot = *value;
-                }
-                for (slot, value) in upper_lane_out.iter_mut().zip(exact.iter()) {
-                    *slot = *value;
+                for ((lower_slot, upper_slot), index) in lower_lane_out
+                    .iter_mut()
+                    .zip(upper_lane_out.iter_mut())
+                    .zip(exact)
+                {
+                    let (lower, upper) = index_interval(index);
+                    *lower_slot = lower;
+                    *upper_slot = upper;
                 }
             }
             // else: keep the pre-filled sound uniform [0, axis_len - 1] range.
@@ -424,6 +512,18 @@ mod tests {
     }
 
     #[test]
+    fn integer_index_enclosure_is_outward_above_f32_exact_range() {
+        let index = 16_777_217_usize;
+        let (lower, upper) = index_interval(index);
+        assert!((lower as f64) <= index as f64);
+        assert!((upper as f64) >= index as f64);
+        assert!(
+            lower < upper,
+            "the nonrepresentable integer needs an interval"
+        );
+    }
+
+    #[test]
     fn test_topk_values_ibp_selects_top_k_bounds() {
         let layer = TopkLayer::values(2, 1);
         let input = bounded_2d(
@@ -434,6 +534,19 @@ mod tests {
         assert_eq!(out.shape(), &[2, 2]);
         assert_eq!(out.lower(), &arr2(&[[5.0, 4.0], [7.0, 6.0]]).into_dyn());
         assert_eq!(out.upper(), &arr2(&[[8.0, 6.0], [9.0, 8.0]]).into_dyn());
+    }
+
+    #[test]
+    fn topk_values_preserve_non_trailing_axis_layout() {
+        let layer = TopkLayer::values(2, 0);
+        let input = BoundedTensor::concrete(
+            arr2(&[[10.0_f32, 1.0, 7.0], [5.0, 9.0, 2.0], [8.0, 3.0, 6.0]]).into_dyn(),
+        )
+        .unwrap();
+        let output = layer.propagate_ibp(&input).unwrap();
+        let expected = arr2(&[[10.0_f32, 9.0, 7.0], [8.0, 3.0, 6.0]]).into_dyn();
+        assert_eq!(output.lower(), &expected);
+        assert_eq!(output.upper(), &expected);
     }
 
     #[test]
@@ -473,6 +586,33 @@ mod tests {
         assert_eq!(out.shape(), &[2, 1]);
         assert_eq!(out.lower(), &arr2(&[[0.0], [1.0]]).into_dyn());
         assert_eq!(out.upper(), &arr2(&[[0.0], [1.0]]).into_dyn());
+    }
+
+    #[test]
+    fn arg_extrema_exact_ties_obey_onnx_first_and_last_index() {
+        let input = BoundedTensor::concrete(arr1(&[4.0_f32, 4.0, 1.0]).into_dyn()).unwrap();
+
+        let first_max = ArgMaxLayer::new(0, false).propagate_ibp(&input).unwrap();
+        assert_eq!(first_max.lower()[[]], 0.0);
+        assert_eq!(first_max.upper()[[]], 0.0);
+
+        let last_max = ArgMaxLayer::new(0, false)
+            .with_select_last_index(true)
+            .propagate_ibp(&input)
+            .unwrap();
+        assert_eq!(last_max.lower()[[]], 1.0);
+        assert_eq!(last_max.upper()[[]], 1.0);
+
+        let min_input = BoundedTensor::concrete(arr1(&[-2.0_f32, 3.0, -2.0]).into_dyn()).unwrap();
+        let first_min = ArgMinLayer::new(0, false)
+            .propagate_ibp(&min_input)
+            .unwrap();
+        assert_eq!(first_min.lower()[[]], 0.0);
+        let last_min = ArgMinLayer::new(0, false)
+            .with_select_last_index(true)
+            .propagate_ibp(&min_input)
+            .unwrap();
+        assert_eq!(last_min.lower()[[]], 2.0);
     }
 
     #[test]

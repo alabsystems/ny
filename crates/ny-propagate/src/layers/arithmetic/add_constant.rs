@@ -6,7 +6,7 @@
 
 use ndarray::{s, Array1, ArrayD, Axis, IxDyn};
 use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_tensor::{add_down_f32, add_up_f32, next_down_f32, next_up_f32, BoundedTensor};
 use std::borrow::Cow;
 use tracing::debug;
 
@@ -58,9 +58,25 @@ impl BoundPropagation for AddConstantLayer {
 
         // If shapes match exactly, simple addition
         if input_shape == const_shape {
-            let out_lower = input.lower() + &self.constant;
-            let out_upper = input.upper() + &self.constant;
-            return BoundedTensor::new(out_lower, out_upper);
+            // DIRECTED: a plain f32 `+` rounds to nearest and can move an
+            // endpoint INWARD by up to half an ULP. See `AddLayer`.
+            let out_lower = ndarray::Zip::from(input.lower())
+                .and(&self.constant)
+                .map_collect(|&v, &c| add_down_f32(v, c));
+            let out_upper = ndarray::Zip::from(input.upper())
+                .and(&self.constant)
+                .map_collect(|&v, &c| add_up_f32(v, c));
+            // `new_allow_infinite`, not the strict `new`: an upstream node that
+            // failed closed to an OpaqueSkip legitimately hands this layer
+            // `[-inf, +inf]` (`OpaqueSkipLayer::unbounded_like` builds exactly
+            // that), and ±inf + finite constant is still a sound enclosure. The
+            // strict constructor rejected it as NumericalInstability, which is
+            // NOT in `is_degradable_error`, so the WHOLE IBP pass aborted at an
+            // already-tainted node instead of degrading — measured on lsnc_relu
+            // via `ny verify` ("BoundedTensor::new: lower bounds contain NaN or
+            // Inf"). NaN and inverted bounds are still rejected, so the NaN
+            // firewall is unchanged.
+            return BoundedTensor::new_allow_infinite(out_lower, out_upper);
         }
 
         // Handle CNN bias case: 1D bias [channels] added to 3D input [channels, height, width]
@@ -113,10 +129,17 @@ impl BoundPropagation for AddConstantLayer {
                 got: input_shape.to_vec(),
             })?;
 
-        let out_lower = &lower_in + &broadcast_const;
-        let out_upper = &upper_in + &broadcast_const;
+        let out_lower = ndarray::Zip::from(&lower_in)
+            .and(&broadcast_const)
+            .map_collect(|&v, &c| add_down_f32(v, c));
+        let out_upper = ndarray::Zip::from(&upper_in)
+            .and(&broadcast_const)
+            .map_collect(|&v, &c| add_up_f32(v, c));
 
-        BoundedTensor::new(out_lower, out_upper)
+        // See the exact-shape branch above: OpaqueSkip-tainted inputs are
+        // legitimately infinite, and rejecting them here aborts the whole IBP
+        // pass. NaN and inverted bounds are still rejected.
+        BoundedTensor::new_allow_infinite(out_lower, out_upper)
     }
 
     #[inline]
@@ -364,5 +387,72 @@ impl AddConstantLayer {
                 got: vec![const_len],
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod opaque_skip_taint_tests {
+    use super::AddConstantLayer;
+    use crate::layers::common::BoundPropagation;
+    use ndarray::array;
+    use ny_tensor::BoundedTensor;
+
+    /// An upstream node that failed closed to an OpaqueSkip hands its consumers
+    /// `[-inf, +inf]` (`OpaqueSkipLayer::unbounded_like`). Adding a finite
+    /// constant to that is still a sound enclosure, so `AddConstant` must
+    /// PROPAGATE it — not abort. The strict constructor rejected it as
+    /// `NumericalInstability`, which is not in `is_degradable_error`, so one
+    /// tainted element killed the entire IBP pass (measured on lsnc_relu via
+    /// `ny verify`).
+    #[test]
+    fn infinite_input_from_an_opaque_skip_propagates_instead_of_aborting() {
+        let layer = AddConstantLayer::new(array![1.5_f32, -2.0].into_dyn());
+        let input = BoundedTensor::new_allow_infinite(
+            array![f32::NEG_INFINITY, -1.0].into_dyn(),
+            array![f32::INFINITY, 1.0].into_dyn(),
+        )
+        .expect("[-inf, +inf] is a valid conservative enclosure");
+
+        let out = layer
+            .propagate_ibp(&input)
+            .expect("a tainted element must widen, not abort the pass");
+
+        // The tainted element stays unbounded; the finite element stays exact.
+        assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+        assert_eq!(out.upper()[[0]], f32::INFINITY);
+        assert_eq!(out.lower()[[1]], -1.0 + -2.0);
+        assert_eq!(out.upper()[[1]], 1.0 + -2.0);
+    }
+
+    /// Same guarantee on the broadcast path (constant shape != input shape).
+    #[test]
+    fn infinite_input_propagates_through_the_broadcast_path_too() {
+        // 1D bias [C] against 3D input [C, H, W]: the CNN-bias reshape branch.
+        let layer = AddConstantLayer::new(array![1.0_f32, 2.0].into_dyn());
+        let lower = ndarray::ArrayD::from_elem(ndarray::IxDyn(&[2, 1, 1]), f32::NEG_INFINITY);
+        let upper = ndarray::ArrayD::from_elem(ndarray::IxDyn(&[2, 1, 1]), f32::INFINITY);
+        let input = BoundedTensor::new_allow_infinite(lower, upper)
+            .expect("[-inf, +inf] is a valid conservative enclosure");
+
+        let out = layer
+            .propagate_ibp(&input)
+            .expect("broadcast path must also widen instead of aborting");
+        assert!(out.lower().iter().all(|&v| v == f32::NEG_INFINITY));
+        assert!(out.upper().iter().all(|&v| v == f32::INFINITY));
+    }
+
+    /// The relaxation must NOT relax the NaN firewall: a NaN input is still a
+    /// hard error, exactly as before.
+    #[test]
+    fn nan_input_is_still_rejected() {
+        let layer = AddConstantLayer::new(array![1.0_f32].into_dyn());
+        let input =
+            BoundedTensor::new_unchecked(array![f32::NAN].into_dyn(), array![1.0_f32].into_dyn())
+                .expect("shape-only constructor should accept NaN");
+
+        assert!(
+            layer.propagate_ibp(&input).is_err(),
+            "NaN must not be absorbed into AddConstant IBP bounds"
+        );
     }
 }

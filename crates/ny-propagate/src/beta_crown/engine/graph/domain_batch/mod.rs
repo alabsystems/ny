@@ -37,6 +37,7 @@ pub use self::metrics::{
 };
 pub(in crate::beta_crown::engine::graph) use self::plan::{
     GraphDomainBatchEmitTiming, GraphDomainBatchExecutionMode, GraphDomainBatchPlan,
+    ReluSplitBatchContext,
 };
 
 /// Request for single-objective graph BaB batch execution.
@@ -48,6 +49,9 @@ pub(in crate::beta_crown::engine::graph) struct SingleObjectiveBatchRequest<'a> 
     pub(in crate::beta_crown::engine::graph) threshold: f32,
     pub(in crate::beta_crown::engine::graph) engine: &'a dyn GemmEngine,
     pub(in crate::beta_crown::engine::graph) cut_pool: Option<&'a GraphCutPool>,
+    /// Requested adaptive ReLU split depth. The executor caps this separately
+    /// for every parent by its remaining configured depth budget.
+    pub(in crate::beta_crown::engine::graph) split_depth: usize,
     /// Surface retryable allocation/dispatch refusals to an adaptive caller.
     /// False preserves the historical internal sequential fallback.
     pub(in crate::beta_crown::engine::graph) retry_refusals: bool,
@@ -55,6 +59,8 @@ pub(in crate::beta_crown::engine::graph) struct SingleObjectiveBatchRequest<'a> 
 
 /// Request for multi-objective graph BaB batch execution.
 pub(in crate::beta_crown::engine::graph) struct MultiObjectiveBatchRequest<'a> {
+    /// Canonical zero-based outer BaB wave index.
+    pub(in crate::beta_crown::engine::graph) bab_round: usize,
     pub(in crate::beta_crown::engine::graph) graph: &'a GraphNetwork,
     pub(in crate::beta_crown::engine::graph) domains: &'a [&'a MultiObjectiveGraphBabDomain],
     pub(in crate::beta_crown::engine::graph) relu_nodes: &'a [String],
@@ -62,13 +68,12 @@ pub(in crate::beta_crown::engine::graph) struct MultiObjectiveBatchRequest<'a> {
     pub(in crate::beta_crown::engine::graph) thresholds: &'a [f32],
     pub(in crate::beta_crown::engine::graph) engine: &'a dyn GemmEngine,
     pub(in crate::beta_crown::engine::graph) cut_pool: Option<&'a GraphCutPool>,
-    /// #endgame-grace: this batch is the ENTIRE remaining BaB frontier (the
-    /// queue was empty after the pop). Under `NY_ENDGAME_GRACE_SECS>0` the
-    /// batched chunk loop may then finish its chunks within that bounded
-    /// overrun past the α-deadline instead of dropping them — the drop was
-    /// converting fully-verifying trees into Unknown via the tainted tail.
-    /// Sound: deadlines only schedule work.
-    pub(in crate::beta_crown::engine::graph) endgame: bool,
+    /// Default-dark, first-wave-only expanded warmup W. W contributes an
+    /// independently certified lower-bound certificate plus separate
+    /// cache-invalidated continuation state; H's certified upper endpoint
+    /// remains authoritative.
+    pub(in crate::beta_crown::engine::graph) selective_root_alpha_candidate:
+        Option<&'a crate::beta_crown::state::GraphDomainAlphaState>,
 }
 
 /// Request for dense-spec batch rebound over input-split domains.
@@ -109,6 +114,7 @@ impl GraphDomainBatchExecutor {
             request.threshold,
             request.engine,
             request.cut_pool,
+            request.split_depth,
             request.retry_refusals,
         )
     }
@@ -118,6 +124,7 @@ impl GraphDomainBatchExecutor {
         request: MultiObjectiveBatchRequest<'_>,
     ) -> Vec<MultiObjectiveGraphDomainResult> {
         verifier.process_graph_domains_batched_gpu_multi_objective(
+            request.bab_round,
             request.graph,
             request.domains,
             request.relu_nodes,
@@ -125,7 +132,7 @@ impl GraphDomainBatchExecutor {
             request.thresholds,
             request.engine,
             request.cut_pool,
-            request.endgame,
+            request.selective_root_alpha_candidate,
         )
     }
 

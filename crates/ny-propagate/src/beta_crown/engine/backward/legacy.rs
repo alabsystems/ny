@@ -4,8 +4,8 @@
 
 //! Legacy β-only backward propagation (test-only).
 //!
-//! These backward pass implementations use only β parameters (no α optimization
-//! or arelu cuts). They exist for gradient computation tests and as reference
+//! These backward pass implementations use only β parameters (no α
+//! optimization). They exist for gradient computation tests and as reference
 //! implementations for verifying the production α,β paths.
 
 use std::collections::HashMap;
@@ -187,14 +187,14 @@ impl BetaCrownVerifier {
     ) -> Result<LinearBounds> {
         match layer {
             Layer::Linear(linear) => {
-                let weight = &linear.weight;
+                let weight = linear.weight();
                 let new_lower_a = output_bounds.lower_a().dot(weight);
                 let new_upper_a = output_bounds.upper_a().dot(weight);
 
                 // #2423: Bias accumulation in f64 with directed rounding to prevent
                 // catastrophic cancellation. Matches crown_single.rs pattern.
                 // Reference: layers/linear/bias.rs accumulate_bias_f64.
-                let (new_lower_b, new_upper_b) = if let Some(bias) = &linear.bias {
+                let (new_lower_b, new_upper_b) = if let Some(bias) = linear.bias() {
                     use crate::layers::linear::bias::{
                         accumulate_bias_f64, finalize_bias_directed, BiasBlockParams,
                     };
@@ -274,7 +274,7 @@ impl BetaCrownVerifier {
             Layer::MaxPool2d(pool) => pool.propagate_linear_with_bounds(output_bounds, pre_bounds),
             Layer::Conv2d(conv) => {
                 let input_shape = pre_bounds.shape();
-                let in_c = conv.in_channels();
+                let in_c = conv.try_in_channels()?;
                 let (in_h, in_w) = Self::infer_conv2d_input_hw(input_shape, in_c, "Conv2d")?;
 
                 let mut conv_with_shape = conv.clone();
@@ -288,7 +288,7 @@ impl BetaCrownVerifier {
             }
             Layer::ConvTranspose2d(conv) => {
                 let input_shape = pre_bounds.shape();
-                let in_c = conv.in_channels();
+                let in_c = conv.try_in_channels()?;
                 let (in_h, in_w) =
                     Self::infer_conv2d_input_hw(input_shape, in_c, "ConvTranspose2d")?;
 
@@ -354,6 +354,7 @@ impl BetaCrownVerifier {
             | Layer::SiLU(_)
             | Layer::Tanh(_)
             | Layer::Sigmoid(_)
+            | Layer::Erf(_)
             | Layer::Exp(_)
             | Layer::Log(_)
             | Layer::Sqrt(_)

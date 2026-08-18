@@ -212,6 +212,11 @@ pub(super) fn try_graph_pgd_vjp_batched(
 ) -> Result<VjpBatchedOutcome> {
     use VjpBatchedOutcome::{Completed, FallbackToSequential};
 
+    // A deferred/zero slice must not pay the potentially large exact-VJP plan
+    // construction cost before discovering that no attack time exists.
+    if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
+        return Ok(Completed(None));
+    }
     if std::env::var("NY_PGD_VJP_BATCH").ok().as_deref() == Some("0") {
         return Ok(FallbackToSequential);
     }
@@ -781,4 +786,32 @@ pub(super) fn try_graph_pgd_vjp_batched(
         ),
     );
     Ok(Completed(None))
+}
+
+fn exact_vjp_slice_expired(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|limit| now >= limit)
+}
+
+#[cfg(test)]
+mod deadline_admission_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn expired_or_zero_slice_is_rejected_before_plan_construction() {
+        let now = Instant::now();
+        assert!(exact_vjp_slice_expired(Some(now), now));
+        assert!(exact_vjp_slice_expired(
+            Some(
+                now.checked_sub(Duration::from_nanos(1))
+                    .expect("an Instant one nanosecond earlier must be representable"),
+            ),
+            now
+        ));
+        assert!(!exact_vjp_slice_expired(None, now));
+        assert!(!exact_vjp_slice_expired(
+            Some(now + Duration::from_secs(1)),
+            now
+        ));
+    }
 }

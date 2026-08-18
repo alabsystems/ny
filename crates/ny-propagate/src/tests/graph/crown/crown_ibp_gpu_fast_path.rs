@@ -339,7 +339,11 @@ fn test_crown_ibp_dag_sequential_graph_uses_gpu_partial_fast_path_3599() {
         );
         let scripted = ScriptedGraphGpuEngine::new(vec![expectation]);
 
-        let with_engine = graph
+        // Clone resets the input-keyed collection cache so this assertion
+        // exercises the scripted GPU engine instead of serving the baseline.
+        #[allow(clippy::redundant_clone)]
+        let engine_graph = graph.clone();
+        let with_engine = engine_graph
             .collect_crown_ibp_bounds_dag_with_status_and_engine(&input, Some(&scripted))
             .unwrap();
 
@@ -486,8 +490,12 @@ fn test_crown_ibp_dag_diamond_fork_join_threads_engine_4023() {
             .expect("#4023 baseline diamond CROWN-IBP should succeed");
 
         // With CountingGemmEngine: verify engine is dispatched
+        // Clone resets the input-keyed collection cache so this assertion does
+        // not reuse the baseline's engine-agnostic entry.
+        #[allow(clippy::redundant_clone)]
+        let engine_graph = graph.clone();
         let engine = CountingGemmEngine::new();
-        let with_engine = graph
+        let with_engine = engine_graph
             .collect_crown_ibp_bounds_dag_with_status_and_engine(&input, Some(&engine))
             .expect("#4023 diamond CROWN-IBP with engine should succeed");
 

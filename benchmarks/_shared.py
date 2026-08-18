@@ -11,7 +11,7 @@
 These are intentionally *not* in `conftest.py` so test modules can import them
 without risking collisions with other `conftest.py` files in the repo.
 
-VNN-COMP 2021-2025 benchmark suite.
+VNN-COMP 2021-2026 benchmark suite.
 https://github.com/VNN-COMP/vnncomp2025_benchmarks
 """
 
@@ -56,22 +56,22 @@ def _list_benchmark_files(directory: Path, pattern: str) -> list[Path]:
 
 
 def require_benchmark_path(path: Path | None, message: str) -> Path:
-    """Skip the current test when an optional benchmark path is unavailable."""
-
-    import pytest
-
+    """Require a benchmark path for an explicitly requested diagnostic."""
     if path is None or not path.exists():
-        pytest.skip(message)
+        raise AssertionError(
+            f"{message}. Install the external corpus with "
+            "benchmarks/download_benchmarks.sh before running this diagnostic."
+        )
     return path
 
 
 def require_benchmark_items(items: list, message: str) -> list:
-    """Skip the current test when an optional benchmark file set is empty."""
-
-    import pytest
-
+    """Require benchmark items for an explicitly requested diagnostic."""
     if not items:
-        pytest.skip(message)
+        raise AssertionError(
+            f"{message}. Install the external corpus with "
+            "benchmarks/download_benchmarks.sh before running this diagnostic."
+        )
     return items
 
 # Benchmark directories
@@ -85,6 +85,7 @@ VNNCOMP_YEARS: dict[int, Path] = {
     2023: BENCHMARK_DIR / "vnncomp2023" / "benchmarks",
     2024: BENCHMARK_DIR / "vnncomp2024" / "benchmarks",
     2025: BENCHMARK_DIR / "vnncomp2025" / "benchmarks",
+    2026: BENCHMARK_DIR / "vnncomp2026" / "benchmarks",
 }
 
 # Legacy alias for backwards compatibility
@@ -105,6 +106,96 @@ class VerificationResult:
     cuts_generated: int | None = None
     max_depth_reached: int | None = None
     error_message: str | None = None
+
+
+_STATUS_ALIASES = {
+    "safe": "verified",
+    "verified": "verified",
+    "violated": "falsified",
+    "falsified": "falsified",
+    "unknown": "unknown",
+    "potential_violation": "unknown",
+    "potential violation": "unknown",
+    "timeout": "timeout",
+}
+_STATUS_EXIT_CODES = {
+    "verified": 0,
+    "falsified": 1,
+    "unknown": 2,
+    "timeout": 3,
+}
+
+
+def _canonical_status(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return _STATUS_ALIASES.get(value.strip().lower())
+
+
+def _text_status(stdout: str) -> str | None:
+    """Extract an exact status field from human-readable ny output."""
+    statuses = set()
+    for line in stdout.splitlines():
+        normalized = line.strip().lower()
+        for prefix in ("status:", "property status:"):
+            if normalized.startswith(prefix):
+                status = _canonical_status(normalized.removeprefix(prefix).strip())
+                if status is not None:
+                    statuses.add(status)
+                break
+    if len(statuses) == 1:
+        return statuses.pop()
+    return None
+
+
+def _error_result(
+    network_path: Path,
+    vnnlib_path: Path,
+    elapsed: float,
+    result: subprocess.CompletedProcess[str],
+    reason: str,
+) -> VerificationResult:
+    detail = result.stderr.strip()
+    message = f"{reason} (exit code {result.returncode})"
+    if detail:
+        message = f"{message}: {detail[:500]}"
+    return VerificationResult(
+        network=network_path.name,
+        property=vnnlib_path.name,
+        status="error",
+        time_seconds=elapsed,
+        error_message=message,
+    )
+
+
+def _validate_process_status(
+    network_path: Path,
+    vnnlib_path: Path,
+    elapsed: float,
+    result: subprocess.CompletedProcess[str],
+    status: str | None,
+) -> VerificationResult | None:
+    if status is None:
+        return _error_result(
+            network_path,
+            vnnlib_path,
+            elapsed,
+            result,
+            "ny output did not contain a recognized verification status",
+        )
+    expected_exit_code = _STATUS_EXIT_CODES[status]
+    if result.returncode != expected_exit_code:
+        return _error_result(
+            network_path,
+            vnnlib_path,
+            elapsed,
+            result,
+            (
+                f"ny reported {status!r}, which requires exit code "
+                f"{expected_exit_code}"
+            ),
+        )
+    return None
 
 
 def run_ny_verify(
@@ -167,21 +258,26 @@ def run_ny_verify(
 
         elapsed = time.time() - start
 
-        # The ny binary uses exit code 0 for verified, exit code 2 for
-        # unknown/not-verified. Parse JSON output regardless of exit code
-        # since the binary always produces valid JSON with --json flag.
         try:
             output = json.loads(result.stdout)
+            if not isinstance(output, dict):
+                return _error_result(
+                    network_path,
+                    vnnlib_path,
+                    elapsed,
+                    result,
+                    "ny JSON output was not an object",
+                )
             # Use property_status for actual verification result
             # (status = process status, property_status = verification result)
-            status = output.get(
-                "property_status", output.get("status", "unknown")
-            ).lower()
-            # Normalize status values: "safe" -> "verified", "violated" -> "falsified"
-            if status == "safe":
-                status = "verified"
-            elif status == "violated":
-                status = "falsified"
+            status = _canonical_status(
+                output.get("property_status", output.get("status"))
+            )
+            invalid = _validate_process_status(
+                network_path, vnnlib_path, elapsed, result, status
+            )
+            if invalid is not None:
+                return invalid
             bounds = output.get("output_bounds", output.get("bounds"))
             domains_explored = output.get("domains_explored")
             domains_verified = output.get("domains_verified")
@@ -199,22 +295,14 @@ def run_ny_verify(
                 max_depth_reached=max_depth_reached,
             )
         except json.JSONDecodeError:
-            # Try to parse non-JSON output
-            stdout = result.stdout.lower()
-            if "verified" in stdout:
-                status = "verified"
-            elif "falsified" in stdout or "violated" in stdout:
-                status = "falsified"
-            elif result.returncode != 0:
-                return VerificationResult(
-                    network=network_path.name,
-                    property=vnnlib_path.name,
-                    status="error",
-                    time_seconds=elapsed,
-                    error_message=result.stderr[:500],
-                )
-            else:
-                status = "unknown"
+            # Be strict if an older binary ignored --json: only accept an
+            # explicit status field, and require it to agree with the exit code.
+            status = _text_status(result.stdout)
+            invalid = _validate_process_status(
+                network_path, vnnlib_path, elapsed, result, status
+            )
+            if invalid is not None:
+                return invalid
             return VerificationResult(
                 network=network_path.name,
                 property=vnnlib_path.name,
@@ -284,11 +372,21 @@ def get_benchmark_dir(
 
 
 def get_benchmark_instances(
-    year: int, benchmark: str, benchmark_root: Path | None = None
+    year: int,
+    benchmark: str,
+    benchmark_root: Path | None = None,
+    *,
+    preserve_source_rows: bool = False,
 ) -> list[tuple[Path, Path, int]]:
     """Get (network, property, timeout) tuples from instances.csv.
 
-    Returns list of (network_path, property_path, timeout_seconds).
+    Returns list of (network_path, property_path, timeout_seconds).  By
+    default, rows whose materialized inputs are unavailable are omitted for
+    compatibility with the benchmark diagnostics.  With
+    ``preserve_source_rows=True``, every parsed data row is retained in source
+    order, using its expected path when an input is absent.  Index-based
+    harnesses must use that mode so an index always denotes the corresponding
+    unfiltered ``instances.csv`` row rather than a compacted local subset.
     """
     bench_dir = get_benchmark_dir(year, benchmark, benchmark_root)
     if not bench_dir:
@@ -299,6 +397,29 @@ def get_benchmark_instances(
         # Fallback: look for acasxu_instances.csv etc.
         instances_file = bench_dir / f"{benchmark}_instances.csv"
 
+    if year >= 2026 and not instances_file.exists():
+        # VNN-COMP 2026 publishes category payloads below version directories
+        # (`category/1.0`, optionally alongside `2.0`) while the benchmark root
+        # still resolves to `category`. Prefer the regular 1.0 manifest, then
+        # any other version directory in deterministic lexical order. This is
+        # deliberately based on an actual instances file rather than mere
+        # directory existence, so legacy unversioned layouts are unchanged.
+        version_dirs = sorted(
+            (path for path in bench_dir.iterdir() if path.is_dir()),
+            key=lambda path: (path.name != "1.0", path.name),
+        )
+        for version_dir in version_dirs:
+            for candidate in (
+                version_dir / "instances.csv",
+                version_dir / f"{benchmark}_instances.csv",
+            ):
+                if candidate.is_file():
+                    bench_dir = version_dir
+                    instances_file = candidate
+                    break
+            if instances_file.exists():
+                break
+
     if not instances_file.exists():
         return []
 
@@ -306,44 +427,113 @@ def get_benchmark_instances(
     with open(instances_file) as f:
         reader = csv.reader(f)
         for row in reader:
-            if len(row) < 2:
+            if not row:
                 continue
             if row[0].startswith("#") or row[0] == "network":
                 continue  # Skip comments and headers
+            if len(row) < 2:
+                if preserve_source_rows:
+                    raise ValueError(
+                        f"{instances_file} line {reader.line_num} is not a complete "
+                        "instances.csv data row"
+                    )
+                continue
 
             network_name = row[0]
             prop_name = row[1]
             try:
-                timeout = int(float(row[2])) if len(row) > 2 else 60
-            except (ValueError, IndexError):
+                raw_timeout = float(row[2]) if len(row) > 2 else 60.0
+                if not raw_timeout.is_integer() or raw_timeout <= 0:
+                    raise ValueError
+                timeout = int(raw_timeout)
+            except (ValueError, IndexError, OverflowError) as error:
+                if preserve_source_rows:
+                    raise ValueError(
+                        f"{instances_file} line {reader.line_num} has an invalid timeout"
+                    ) from error
                 timeout = 60
 
-            # Find files - may be in onnx/ subdir or root
-            # Also handle .gz files by trying without .gz extension
+            # Resolve to the logical decompressed input even when the manifest
+            # itself names an adjacent `.onnx.gz`/`.vnnlib.gz` archive.  The
+            # bounded runner stages archives; returning an existing archive as
+            # though it were a solver-ready ONNX/VNNLIB file would pass gzip
+            # bytes directly to NY.
+            logical_network_name = (
+                network_name[:-3]
+                if network_name.endswith(".onnx.gz")
+                else network_name
+            )
+            logical_prop_name = (
+                prop_name[:-3]
+                if prop_name.endswith(".vnnlib.gz")
+                else prop_name
+            )
+            logical_network_path = Path(logical_network_name)
+            logical_prop_path = Path(logical_prop_name)
+            invalid_logical_paths = (
+                logical_network_path.is_absolute()
+                or ".." in logical_network_path.parts
+                or logical_network_path.suffix != ".onnx"
+                or logical_prop_path.is_absolute()
+                or ".." in logical_prop_path.parts
+                or logical_prop_path.suffix != ".vnnlib"
+            )
+            if invalid_logical_paths:
+                if preserve_source_rows:
+                    raise ValueError(
+                        f"{instances_file} line {reader.line_num} has an invalid "
+                        "logical ONNX/VNNLIB path"
+                    )
+                continue
             network_candidates = [
-                bench_dir / network_name,
-                bench_dir / "onnx" / network_name,
+                bench_dir / logical_network_name,
+                bench_dir / "onnx" / logical_network_name,
             ]
-            # If network ends with .gz, also try without .gz
-            if network_name.endswith(".gz"):
-                network_nogz = network_name[:-3]
-                network_candidates.extend(
-                    [
-                        bench_dir / network_nogz,
-                        bench_dir / "onnx" / network_nogz,
-                    ]
-                )
-
             prop_candidates = [
-                bench_dir / prop_name,
-                bench_dir / "vnnlib" / prop_name,
+                bench_dir / logical_prop_name,
+                bench_dir / "vnnlib" / logical_prop_name,
             ]
 
-            network_path = next((p for p in network_candidates if p.exists()), None)
-            prop_path = next((p for p in prop_candidates if p.exists()), None)
+            # Official 2026 corpora commonly retain only an adjacent `.gz`
+            # archive while `instances.csv` names the logical decompressed
+            # path. Return that logical path only to staging-aware callers;
+            # legacy callers keep omitting archive-only rows rather than
+            # receiving a nonexistent path or gzip bytes as solver input.
+            network_path = next(
+                (
+                    path
+                    for path in network_candidates
+                    if path.is_file()
+                    or (
+                        preserve_source_rows
+                        and Path(f"{path}.gz").is_file()
+                    )
+                ),
+                None,
+            )
+            prop_path = next(
+                (
+                    path
+                    for path in prop_candidates
+                    if path.is_file()
+                    or (
+                        preserve_source_rows
+                        and Path(f"{path}.gz").is_file()
+                    )
+                ),
+                None,
+            )
 
             if network_path and prop_path:
                 instances.append((network_path, prop_path, timeout))
+            elif preserve_source_rows:
+                instances.append(
+                    (
+                        network_path or network_candidates[0],
+                        prop_path or prop_candidates[0],
+                        timeout,
+                    )
+                )
 
     return instances
 

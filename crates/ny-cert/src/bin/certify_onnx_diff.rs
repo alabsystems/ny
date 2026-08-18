@@ -10,6 +10,8 @@
 //
 // Usage: certify_onnx <model.onnx> <prop.vnnlib> <out_dir>
 
+#![forbid(unsafe_code)]
+
 use ny_cert::crown_deep::DeepReluProblem;
 use ny_cert::rational::{Rat, RatError};
 use ny_cert::schema::{
@@ -364,37 +366,9 @@ fn parse_onnx(data: &[u8]) -> OnnxGraph {
 // f32 -> exact Rat (n / 2^k), lossless.  f32 == m * 2^e with m an integer.
 // ---------------------------------------------------------------------------
 fn f32_to_rat(v: f32) -> Result<Rat, RatError> {
-    if v == 0.0 {
-        return Ok(Rat::ZERO);
-    }
-    assert!(v.is_finite(), "non-finite weight {v}");
     let bits = v.to_bits();
-    let sign = if bits >> 31 == 1 { -1i128 } else { 1i128 };
-    let exp_field = ((bits >> 23) & 0xff) as i32;
-    let mant_field = (bits & 0x7f_ffff) as i128;
-    // value = sign * mantissa * 2^exp
-    let (mantissa, exp) = if exp_field == 0 {
-        // subnormal: value = mant * 2^(-126-23)
-        (mant_field, -149)
-    } else {
-        // normal: implicit leading 1
-        (mant_field + (1i128 << 23), exp_field - 127 - 23)
-    };
-    let mantissa = sign * mantissa;
-    // value = mantissa * 2^exp, exactly, in arbitrary precision (no i128 cap:
-    // a large normal f32 has exp up to +104 and mantissa up to 2^24, whose
-    // product exceeds i128 — bignum makes this lossless for every f32).
-    use num_bigint::BigInt;
-    let m = BigInt::from(mantissa);
-    if exp >= 0 {
-        // n = mantissa * 2^exp, den = 1
-        let num = m << (exp as u32);
-        Rat::from_bigints(num, BigInt::from(1))
-    } else {
-        // n / 2^(-exp)
-        let den = BigInt::from(1) << ((-exp) as u32);
-        Rat::from_bigints(m, den)
-    }
+    assert!(bits & 0x7f80_0000 != 0x7f80_0000, "non-finite weight {v}");
+    Rat::from_f32_exact(v).ok_or(RatError::Poisoned)
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,7 +1266,12 @@ fn main() {
 /// entailment certificate (multipliers, premise coefficients/constants, and the
 /// conclusion). Demonstrates the certificate genuinely exceeds the i128 wall.
 fn cert_max_bits(cert: &EntailmentCertificate) -> u64 {
-    let bits = |r: &Rat| r.num().bits().max(r.den().bits());
+    let bits = |r: &Rat| {
+        let (num, den) = r
+            .checked_parts()
+            .expect("refusing to inspect a poisoned rational arena");
+        num.bits().max(den.bits())
+    };
     let mut m = 0u64;
     for mu in &cert.multipliers {
         m = m.max(bits(mu));
@@ -1311,17 +1290,12 @@ fn cert_max_bits(cert: &EntailmentCertificate) -> u64 {
 }
 
 fn fmt_rat(r: &Rat) -> String {
-    use num_traits::One;
-    if r.den().is_one() {
-        format!("{}", r.num())
-    } else {
-        format!("{}/{}", r.num(), r.den())
-    }
+    r.to_clean_string()
+        .expect("refusing to format a poisoned rational arena")
 }
 
 /// Approximate a (possibly huge) exact rational as `f64` for human-readable
 /// diagnostics only. Never used in a certificate or a soundness decision.
 fn rat_to_f64(r: &Rat) -> f64 {
-    use num_traits::ToPrimitive;
-    r.to_big().to_f64().unwrap_or(f64::NAN)
+    r.to_f64_approx()
 }

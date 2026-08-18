@@ -5,13 +5,26 @@
 //! Batched CROWN backward propagation for BatchNorm.
 
 use ndarray::{ArrayD, Axis, IxDyn};
-use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_core::{f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, NyError, Result};
+use ny_tensor::{next_up_f32, BoundedTensor};
 
-use super::math::detect_input_layout;
+use super::math::{detect_input_layout, nonnegative_add_up, nonnegative_mul_up};
 use super::types::BatchNormLayer;
-use crate::bounds::{safe_mul_for_bounds, safe_mul_for_bounds_f64};
+use crate::bounds::{
+    certified_affine_sum_f32, safe_mul_for_bounds, safe_mul_for_bounds_f64, OutwardDirection,
+};
+use crate::layers::linear::bias::{add_f64_down, add_f64_up};
 use crate::BatchedLinearBounds;
+
+/// Reduce the last-axis non-negative error terms with every binary64 addition
+/// rounded upward. `ndarray::sum_axis` is round-to-nearest and a final outward
+/// binary32 cast cannot repair cancellation/accumulation error already lost in
+/// binary64.
+fn sum_last_axis_nonnegative_up(values: &ArrayD<f64>, axis: usize) -> ArrayD<f64> {
+    values.map_axis(Axis(axis), |lane| {
+        lane.iter().copied().fold(0.0f64, nonnegative_add_up)
+    })
+}
 
 impl BatchNormLayer {
     /// Batched CROWN backward propagation through BatchNorm.
@@ -34,6 +47,7 @@ impl BatchNormLayer {
         bounds: &BatchedLinearBounds,
         pre_activation: &BoundedTensor,
     ) -> Result<BatchedLinearBounds> {
+        self.validate_affine_parameters()?;
         let shape = pre_activation.shape();
 
         let a_shape = bounds.lower_a.shape();
@@ -44,11 +58,16 @@ impl BatchNormLayer {
         }
 
         let in_dim = a_shape[a_shape.len() - 1];
-        let a_ndim = a_shape.len();
+        let last_axis = a_shape.len() - 1;
 
         // Build expanded scale and bias for the flattened in_dim, reusing
         // the same channel-axis heuristic as the scalar CROWN path.
-        let layout = detect_input_layout(shape, self.num_channels, Some(in_dim))?;
+        let layout = detect_input_layout(
+            shape,
+            self.num_channels,
+            Some(in_dim),
+            self.channel_axis_hint,
+        )?;
         let (expanded_scale, expanded_bias) = self.expand_scale_bias(&layout);
 
         // Column-wise scaling: new_A[.., :, i] = A[.., :, i] * scale[c(i)]
@@ -79,29 +98,27 @@ impl BatchNormLayer {
 
         // Bias contribution: new_b = b + sum_col(A * bias), accumulated in f64.
         // Compute A @ bias along the last axis (in_dim), producing shape [batch.., out_dim].
-        let bias_view =
-            ArrayD::from_shape_vec(IxDyn(&[in_dim]), expanded_bias.to_vec()).map_err(|_| {
-                NyError::InternalError("BatchNorm: cannot create bias broadcast".to_string())
-            })?;
-        let lower_a_f64 = bounds.lower_a.mapv(|x| x as f64);
-        let upper_a_f64 = bounds.upper_a.mapv(|x| x as f64);
-        let bias_f64 = bias_view.mapv(|x| x as f64);
-
-        // safe_mul_for_bounds_f64 (0*inf=0) so a degenerate Inf/NaN bias does not
-        // produce NaN from a zero coefficient. Mirrors the scale handling above.
-        let bias_b = bias_f64.broadcast(lower_a_f64.raw_dim()).ok_or_else(|| {
-            NyError::InternalError("BatchNorm: cannot broadcast bias to A shape".to_string())
-        })?;
-        let mut lower_bias_terms = lower_a_f64.clone();
-        let mut upper_bias_terms = upper_a_f64.clone();
-        ndarray::Zip::from(&mut lower_bias_terms)
-            .and(&bias_b)
-            .for_each(|a, &b| *a = safe_mul_for_bounds_f64(*a, b));
-        ndarray::Zip::from(&mut upper_bias_terms)
-            .and(&bias_b)
-            .for_each(|a, &b| *a = safe_mul_for_bounds_f64(*a, b));
-        let bias_contrib_lower = lower_bias_terms.sum_axis(Axis(a_ndim - 1));
-        let bias_contrib_upper = upper_bias_terms.sum_axis(Axis(a_ndim - 1));
+        // Finite binary32 products are exact in binary64, but a round-to-nearest
+        // f64 reduction can erase a tiny residual under catastrophic
+        // cancellation. Use the shared self-checked double-double reducer for
+        // every lane; it falls back to per-add directed arithmetic for any
+        // non-finite input.
+        let bias_contrib_lower = bounds.lower_a.map_axis(Axis(last_axis), |lane| {
+            certified_affine_sum_f32(
+                0.0,
+                lane.iter().copied().zip(expanded_bias.iter().copied()),
+                OutwardDirection::Lower,
+            )
+        });
+        let bias_contrib_upper = bounds.upper_a.map_axis(Axis(last_axis), |lane| {
+            certified_affine_sum_f32(
+                0.0,
+                lane.iter().copied().zip(expanded_bias.iter().copied()),
+                OutwardDirection::Upper,
+            )
+        });
+        let lower_a_f64 = bounds.lower_a.mapv(f32_to_f64_exact);
+        let upper_a_f64 = bounds.upper_a.mapv(f32_to_f64_exact);
 
         // INCOMING certified coefficient error (may be absent). The true incoming
         // coefficient at [.., j, i] lies in `[a − el, a + el]`. Materialize as f64
@@ -148,8 +165,13 @@ impl BatchNormLayer {
                     .unwrap_or(0.0)
                     .abs()
                     .max(pre_u.get(i).copied().unwrap_or(0.0).abs());
-                let scale_term = safe_mul_for_bounds_f64(xmag as f64, expanded_scale_err[i] as f64);
-                *w = scale_term + expanded_bias_err[i] as f64;
+                *w = nonnegative_add_up(
+                    nonnegative_mul_up(
+                        f32_to_f64_exact(xmag),
+                        f32_to_f64_exact(expanded_scale_err[i]),
+                    ),
+                    f32_to_f64_exact(expanded_bias_err[i]),
+                );
             }
         }
         let w_err_arr = ArrayD::from_shape_vec(IxDyn(&[in_dim]), w_err).map_err(|_| {
@@ -160,7 +182,7 @@ impl BatchNormLayer {
         })?;
         // `|bias_i|` broadcast on the last (in_dim) axis, for the `el·|bias_i|`
         // bias-contribution-uncertainty term (mirrors crown_scalar.rs `abs_bias`).
-        let abs_bias_arr = bias_f64.mapv(|b| b.abs());
+        let abs_bias_arr = expanded_bias.mapv(|b| f32_to_f64_exact(b).abs());
         let abs_bias_b = abs_bias_arr
             .broadcast(lower_a_f64.raw_dim())
             .ok_or_else(|| {
@@ -177,7 +199,10 @@ impl BatchNormLayer {
             .and(&el_lower)
             .and(&abs_bias_b)
             .for_each(|out, &a, &w, &el, &ab| {
-                *out = safe_mul_for_bounds_f64(a.abs() + el, w) + safe_mul_for_bounds_f64(el, ab);
+                *out = nonnegative_add_up(
+                    nonnegative_mul_up(nonnegative_add_up(a.abs(), el), w),
+                    nonnegative_mul_up(el, ab),
+                );
             });
         let mut widen_upper_terms = ArrayD::<f64>::zeros(upper_a_f64.raw_dim());
         ndarray::Zip::from(&mut widen_upper_terms)
@@ -186,15 +211,32 @@ impl BatchNormLayer {
             .and(&el_upper)
             .and(&abs_bias_b)
             .for_each(|out, &a, &w, &el, &ab| {
-                *out = safe_mul_for_bounds_f64(a.abs() + el, w) + safe_mul_for_bounds_f64(el, ab);
+                *out = nonnegative_add_up(
+                    nonnegative_mul_up(nonnegative_add_up(a.abs(), el), w),
+                    nonnegative_mul_up(el, ab),
+                );
             });
-        let widen_lower = widen_lower_terms.sum_axis(Axis(a_ndim - 1));
-        let widen_upper = widen_upper_terms.sum_axis(Axis(a_ndim - 1));
+        let widen_lower = sum_last_axis_nonnegative_up(&widen_lower_terms, last_axis);
+        let widen_upper = sum_last_axis_nonnegative_up(&widen_upper_terms, last_axis);
 
-        let new_lower_b = (&bounds.lower_b.mapv(|x| x as f64) + &bias_contrib_lower - &widen_lower)
-            .mapv(|x| next_down_f32(x as f32));
-        let new_upper_b = (&bounds.upper_b.mapv(|x| x as f64) + &bias_contrib_upper + &widen_upper)
-            .mapv(|x| next_up_f32(x as f32));
+        let mut new_lower_b = ArrayD::<f32>::zeros(bounds.lower_b.raw_dim());
+        ndarray::Zip::from(&mut new_lower_b)
+            .and(&bounds.lower_b)
+            .and(&bias_contrib_lower)
+            .and(&widen_lower)
+            .for_each(|out, &old, &bias, &widen| {
+                let with_bias = add_f64_down(f32_to_f64_exact(old), bias);
+                *out = f64_to_f32_down(add_f64_down(with_bias, -widen));
+            });
+        let mut new_upper_b = ArrayD::<f32>::zeros(bounds.upper_b.raw_dim());
+        ndarray::Zip::from(&mut new_upper_b)
+            .and(&bounds.upper_b)
+            .and(&bias_contrib_upper)
+            .and(&widen_upper)
+            .for_each(|out, &old, &bias, &widen| {
+                let with_bias = add_f64_up(f32_to_f64_exact(old), bias);
+                *out = f64_to_f32_up(add_f64_up(with_bias, widen));
+            });
 
         // SOUND BatchNorm coefficient error (#vnncomp-aw-soundness). Two ADDED
         // (never replaced) terms, rounded OUTWARD, mirroring crown_scalar.rs:

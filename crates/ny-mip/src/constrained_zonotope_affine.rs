@@ -19,6 +19,12 @@
 
 use ndarray::{Array2, ArrayView2};
 
+use crate::constrained_zonotope64::ConstrainedZonotope64CallGateError;
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, ConstrainedZonotopeCallTracker,
+    ConstrainedZonotopePeakLiveBytes, InertConstrainedZonotopeCallGate,
+};
 use crate::{ConstrainedZonotope64, ConstrainedZonotope64Error};
 
 /// Explicit resource limits for [`constrained_zonotope_affine_unwired`].
@@ -155,6 +161,18 @@ pub enum ConstrainedZonotopeAffineError {
     Domain(#[from] ConstrainedZonotope64Error),
 }
 
+/// Primitive or call-firewall refusal from a budgeted affine transform.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConstrainedZonotopeAffineBudgetError {
+    /// Geometry, resources, or outward arithmetic were invalid.
+    #[error(transparent)]
+    Transform(#[from] ConstrainedZonotopeAffineError),
+
+    /// The caller's deadline or aggregate peak-memory ceiling refused work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
+}
+
 /// Apply an exact-dyadic affine map while preserving sparse generator support
 /// and charging all floating-point width to the output box remainder.
 ///
@@ -168,36 +186,131 @@ pub fn constrained_zonotope_affine_unwired(
     limits: ConstrainedZonotopeAffineLimits,
 ) -> Result<(ConstrainedZonotope64, ConstrainedZonotopeAffinePlan), ConstrainedZonotopeAffineError>
 {
-    require_gradual_underflow()?;
-    let geometry = validate_geometry(input, weights, bias, limits)?;
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match constrained_zonotope_affine_impl(input, weights, bias, limits, &mut gate) {
+        Ok(value) => Ok(value),
+        Err(ConstrainedZonotopeAffineBudgetError::Transform(error)) => Err(error),
+        Err(ConstrainedZonotopeAffineBudgetError::Budget(_)) => {
+            unreachable!("the inert affine call gate cannot refuse work")
+        }
+    }
+}
 
-    let input_generator_nonzeros =
-        input
-            .generators()
-            .iter()
-            .try_fold(0_usize, |sum, generator| {
-                sum.checked_add(generator.nnz()).ok_or(
-                    ConstrainedZonotopeAffineError::ResourceOverflow {
-                        operation: "input generator nonzeros",
-                    },
-                )
+/// Apply an affine map behind a synchronous call-local execution firewall.
+///
+/// The complete transform-owned logical peak is preflighted before adjacency,
+/// scratch, or output allocation. `budget.baseline_live_bytes()` must include
+/// the input, weights, bias, and all other caller-retained storage sharing the
+/// ceiling. A completed domain remains private until the final checkpoint.
+pub fn constrained_zonotope_affine_unwired_with_budget(
+    input: &ConstrainedZonotope64,
+    weights: ArrayView2<'_, f64>,
+    bias: &[f64],
+    limits: ConstrainedZonotopeAffineLimits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<(ConstrainedZonotope64, ConstrainedZonotopeAffinePlan)>,
+    ConstrainedZonotopeAffineBudgetError,
+> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let value = constrained_zonotope_affine_impl(input, weights, bias, limits, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+#[cfg(test)]
+fn constrained_zonotope_affine_unwired_with_clock<N>(
+    input: &ConstrainedZonotope64,
+    weights: ArrayView2<'_, f64>,
+    bias: &[f64],
+    limits: ConstrainedZonotopeAffineLimits,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<(ConstrainedZonotope64, ConstrainedZonotopeAffinePlan)>,
+    ConstrainedZonotopeAffineBudgetError,
+>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let value = constrained_zonotope_affine_impl(input, weights, bias, limits, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+fn constrained_zonotope_affine_impl<G>(
+    input: &ConstrainedZonotope64,
+    weights: ArrayView2<'_, f64>,
+    bias: &[f64],
+    limits: ConstrainedZonotopeAffineLimits,
+    gate: &mut G,
+) -> Result<
+    (ConstrainedZonotope64, ConstrainedZonotopeAffinePlan),
+    ConstrainedZonotopeAffineBudgetError,
+>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    require_gradual_underflow()?;
+    gate.checkpoint("affine floating-point preflight")?;
+    let geometry = validate_geometry_with_gate(input, weights, bias, limits, gate)?;
+    gate.checkpoint("affine geometry validation complete")?;
+
+    let mut input_generator_nonzeros = 0_usize;
+    for generator in input.generators() {
+        gate.charge_items(1, "affine generator geometry validation")?;
+        input_generator_nonzeros = input_generator_nonzeros
+            .checked_add(generator.nnz())
+            .ok_or(ConstrainedZonotopeAffineError::ResourceOverflow {
+                operation: "input generator nonzeros",
             })?;
+    }
+    // Preserve the legacy API's observable error payload: it accumulated every
+    // column before reporting the full required count.
     check_limit(
         "input generator nonzeros",
         input_generator_nonzeros,
         limits.max_generator_nonzeros,
     )?;
+    if gate.is_enforcing() {
+        gate.preflight_peak_live_bytes(affine_peak_live_bytes(
+            input,
+            geometry,
+            input_generator_nonzeros,
+            limits,
+        )?)?;
+    }
+    gate.checkpoint("affine peak-memory preflight complete")?;
 
-    let adjacency = build_input_adjacency(input, input_generator_nonzeros)?;
+    let adjacency = build_input_adjacency(input, input_generator_nonzeros, gate)?;
+    gate.checkpoint("affine adjacency construction complete")?;
+    let expected_interval_products = if gate.is_enforcing() {
+        Some(preflight_interval_products_with_gate(
+            input,
+            weights,
+            geometry,
+            &adjacency,
+            limits.max_interval_products,
+            gate,
+        )?)
+    } else {
+        None
+    };
+    gate.checkpoint("affine interval-product preflight complete")?;
+
     let alpha_dim = input.alpha_dim();
     let mut generator_scratch: Vec<Option<OutwardInterval>> = Vec::new();
+    gate.checkpoint("affine generator-scratch allocation")?;
     try_reserve(
         &mut generator_scratch,
         alpha_dim,
         "generator interval scratch",
     )?;
-    generator_scratch.resize(alpha_dim, None);
+    for _ in 0..alpha_dim {
+        gate.charge_items(1, "affine generator-scratch initialization")?;
+        generator_scratch.push(None);
+    }
     let mut touched_generators = Vec::new();
+    gate.checkpoint("affine touched-generator allocation")?;
     try_reserve(
         &mut touched_generators,
         alpha_dim,
@@ -206,11 +319,13 @@ pub fn constrained_zonotope_affine_unwired(
 
     let mut output_center = Vec::new();
     let mut output_remainder = Vec::new();
+    gate.checkpoint("affine output-center allocation")?;
     try_reserve(
         &mut output_center,
         geometry.output_value_count,
         "output center",
     )?;
+    gate.checkpoint("affine output-remainder allocation")?;
     try_reserve(
         &mut output_remainder,
         geometry.output_value_count,
@@ -218,21 +333,27 @@ pub fn constrained_zonotope_affine_unwired(
     )?;
 
     let mut output_generators: Vec<Vec<(usize, f64)>> = Vec::new();
+    gate.checkpoint("affine generator-column allocation")?;
     try_reserve(
         &mut output_generators,
         alpha_dim,
         "output generator columns",
     )?;
-    output_generators.resize_with(alpha_dim, Vec::new);
+    for _ in 0..alpha_dim {
+        gate.charge_items(1, "affine generator-column initialization")?;
+        output_generators.push(Vec::new());
+    }
 
     let mut interval_products = 0_usize;
     let mut output_generator_nonzeros = 0_usize;
 
     for output_index in 0..geometry.output_value_count {
+        gate.charge_items(1, "affine output transform")?;
         let mut center_sum = OutwardInterval::exact(bias[output_index]);
         let mut remainder_sum = OutwardInterval::zero();
 
         for input_index in 0..geometry.input_value_count {
+            gate.charge_items(1, "affine matrix transform")?;
             let weight = weights[[output_index, input_index]];
             if weight == 0.0 {
                 continue;
@@ -249,6 +370,7 @@ pub fn constrained_zonotope_affine_unwired(
             }
 
             for &(generator_index, coefficient) in &adjacency[input_index] {
+                gate.charge_items(1, "affine generator accumulation")?;
                 consume_product(&mut interval_products, limits.max_interval_products)?;
                 let contribution = outward_product(weight, coefficient)?;
                 let slot = &mut generator_scratch[generator_index];
@@ -266,6 +388,7 @@ pub fn constrained_zonotope_affine_unwired(
         total_remainder = add_nonnegative_upper(total_remainder, center_error)?;
 
         for &generator_index in &touched_generators {
+            gate.charge_items(1, "affine generator publication staging")?;
             let interval = generator_scratch[generator_index].take().ok_or(
                 ConstrainedZonotopeAffineError::InvariantViolation {
                     message: "a touched generator has no accumulated interval",
@@ -284,6 +407,7 @@ pub fn constrained_zonotope_affine_unwired(
                     output_generator_nonzeros,
                     limits.max_generator_nonzeros,
                 )?;
+                gate.checkpoint("affine generator-entry allocation")?;
                 output_generators[generator_index]
                     .try_reserve(1)
                     .map_err(|_| ConstrainedZonotopeAffineError::AllocationFailure {
@@ -297,16 +421,36 @@ pub fn constrained_zonotope_affine_unwired(
         output_center.push(nominal_center);
         output_remainder.push(total_remainder);
     }
+    gate.checkpoint("affine numeric transform complete")?;
 
-    let constraints = clone_constraints(input)?;
-    let rhs = clone_slice(input.rhs(), "constraint right-hand side")?;
-    let output = ConstrainedZonotope64::try_new(
+    if let Some(expected) = expected_interval_products {
+        debug_assert_eq!(interval_products, expected);
+    }
+    let constraints = clone_constraints(input, gate)?;
+    gate.checkpoint("affine constraint clone complete")?;
+    gate.checkpoint("affine right-hand-side allocation")?;
+    let rhs = clone_slice_with_gate(input.rhs(), "constraint right-hand side", gate)?;
+    gate.checkpoint("affine right-hand-side clone complete")?;
+    gate.checkpoint("affine domain materialization")?;
+    let output = ConstrainedZonotope64::try_new_with_call_gate(
         output_center,
         output_generators,
         constraints,
         rhs,
         output_remainder,
-    )?;
+        gate,
+    )
+    .map_err(|error| match error {
+        ConstrainedZonotope64CallGateError::Domain(error) => {
+            ConstrainedZonotopeAffineBudgetError::Transform(ConstrainedZonotopeAffineError::Domain(
+                error,
+            ))
+        }
+        ConstrainedZonotope64CallGateError::Budget(error) => {
+            ConstrainedZonotopeAffineBudgetError::Budget(error)
+        }
+    })?;
+    gate.checkpoint("affine domain materialization complete")?;
     let plan = ConstrainedZonotopeAffinePlan {
         input_value_count: geometry.input_value_count,
         output_value_count: geometry.output_value_count,
@@ -319,6 +463,7 @@ pub fn constrained_zonotope_affine_unwired(
         output_generator_nonzeros,
         interval_products,
     };
+    gate.checkpoint("affine publication")?;
     Ok((output, plan))
 }
 
@@ -331,12 +476,74 @@ struct Geometry {
     matrix_visits: usize,
 }
 
-fn validate_geometry(
+/// Conservative transform-owned peak. Scratch from disjoint phases is summed
+/// deliberately. Two complete generator representations cover both candidate
+/// buffer relocation during growth and candidate/private overlap during final
+/// materialization; those phases do not overlap each other. Retained input,
+/// weights, and bias belong in the caller's baseline.
+fn affine_peak_live_bytes(
+    input: &ConstrainedZonotope64,
+    geometry: Geometry,
+    input_generator_nonzeros: usize,
+    limits: ConstrainedZonotopeAffineLimits,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let output_generator_slots = input
+        .alpha_dim()
+        .checked_mul(geometry.output_value_count)
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "affine output generator slots",
+        })?;
+    let output_generator_nonzeros = output_generator_slots
+        .min(limits.max_generator_nonzeros)
+        .min(limits.max_interval_products);
+
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_elements::<usize>(input.value_dim(), "affine adjacency-count bytes")?;
+    peak.add_elements::<Vec<(usize, f64)>>(input.value_dim(), "affine adjacency-column bytes")?;
+    peak.add_elements::<(usize, f64)>(input_generator_nonzeros, "affine adjacency-entry bytes")?;
+    peak.add_elements::<Option<OutwardInterval>>(
+        input.alpha_dim(),
+        "affine generator-scratch bytes",
+    )?;
+    peak.add_elements::<usize>(input.alpha_dim(), "affine touched-generator bytes")?;
+    peak.add_elements::<f64>(geometry.output_value_count, "affine output-center bytes")?;
+    peak.add_elements::<f64>(geometry.output_value_count, "affine output-remainder bytes")?;
+    let doubled_alpha_headers = input.alpha_dim().checked_mul(2).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "affine doubled generator-column headers",
+        },
+    )?;
+    peak.add_elements::<Vec<(usize, f64)>>(
+        doubled_alpha_headers,
+        "affine candidate and validated generator-column bytes",
+    )?;
+    let doubled_output_nonzeros = output_generator_nonzeros.checked_mul(2).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "affine doubled output generator nonzeros",
+        },
+    )?;
+    peak.add_elements::<(usize, f64)>(
+        doubled_output_nonzeros,
+        "affine candidate and validated generator-entry bytes",
+    )?;
+    peak.add_elements::<f64>(
+        geometry.constraint_elements,
+        "affine constraint-matrix bytes",
+    )?;
+    peak.add_elements::<f64>(input.constraint_count(), "affine right-hand-side bytes")?;
+    Ok(peak.finish())
+}
+
+fn validate_geometry_with_gate<G>(
     input: &ConstrainedZonotope64,
     weights: ArrayView2<'_, f64>,
     bias: &[f64],
     limits: ConstrainedZonotopeAffineLimits,
-) -> Result<Geometry, ConstrainedZonotopeAffineError> {
+    gate: &mut G,
+) -> Result<Geometry, ConstrainedZonotopeAffineBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let input_value_count = input.value_dim();
     let output_value_count = weights.nrows();
     if input_value_count == 0 || output_value_count == 0 {
@@ -344,21 +551,24 @@ fn validate_geometry(
             message: format!(
                 "input and output dimensions must be non-zero, got {input_value_count} and {output_value_count}"
             ),
-        });
+        }
+        .into());
     }
     if weights.ncols() != input_value_count {
         return Err(ConstrainedZonotopeAffineError::Shape {
             field: "weight input dimension",
             expected: vec![output_value_count, input_value_count],
             got: weights.shape().to_vec(),
-        });
+        }
+        .into());
     }
     if bias.len() != output_value_count {
         return Err(ConstrainedZonotopeAffineError::Shape {
             field: "bias",
             expected: vec![output_value_count],
             got: vec![bias.len()],
-        });
+        }
+        .into());
     }
     check_limit(
         "input value count",
@@ -401,8 +611,8 @@ fn validate_geometry(
     )?;
     let matrix_visits = weight_elements;
     check_limit("matrix visits", matrix_visits, limits.max_matrix_visits)?;
-    validate_finite("weights", weights.iter().copied())?;
-    validate_finite("bias", bias.iter().copied())?;
+    validate_finite_with_gate("weights", weights.iter().copied(), gate)?;
+    validate_finite_with_gate("bias", bias.iter().copied(), gate)?;
 
     Ok(Geometry {
         input_value_count,
@@ -413,15 +623,25 @@ fn validate_geometry(
     })
 }
 
-fn build_input_adjacency(
+fn build_input_adjacency<G>(
     input: &ConstrainedZonotope64,
     total_nonzeros: usize,
-) -> Result<Vec<Vec<(usize, f64)>>, ConstrainedZonotopeAffineError> {
+    gate: &mut G,
+) -> Result<Vec<Vec<(usize, f64)>>, ConstrainedZonotopeAffineBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let mut counts = Vec::new();
+    gate.checkpoint("affine adjacency-count allocation")?;
     try_reserve(&mut counts, input.value_dim(), "input adjacency counts")?;
-    counts.resize(input.value_dim(), 0_usize);
+    for _ in 0..input.value_dim() {
+        gate.charge_items(1, "affine adjacency-count initialization")?;
+        counts.push(0_usize);
+    }
     for generator in input.generators() {
+        gate.charge_items(1, "affine adjacency generator counting")?;
         for (value_index, _) in generator.entries() {
+            gate.charge_items(1, "affine adjacency entry counting")?;
             counts[value_index] = counts[value_index].checked_add(1).ok_or(
                 ConstrainedZonotopeAffineError::ResourceOverflow {
                     operation: "per-value generator adjacency",
@@ -431,31 +651,79 @@ fn build_input_adjacency(
     }
 
     let mut adjacency = Vec::new();
+    gate.checkpoint("affine adjacency-column allocation")?;
     try_reserve(
         &mut adjacency,
         input.value_dim(),
         "input generator adjacency",
     )?;
     for &count in &counts {
+        gate.charge_items(1, "affine adjacency-column construction")?;
         let mut entries = Vec::new();
+        gate.checkpoint("affine adjacency-entry allocation")?;
         try_reserve(&mut entries, count, "input generator adjacency entries")?;
         adjacency.push(entries);
     }
+    let mut filled_nonzeros = 0_usize;
     for (generator_index, generator) in input.generators().iter().enumerate() {
+        gate.charge_items(1, "affine adjacency generator fill")?;
         for (value_index, coefficient) in generator.entries() {
+            gate.charge_items(1, "affine adjacency entry fill")?;
             adjacency[value_index].push((generator_index, coefficient));
+            filled_nonzeros = filled_nonzeros.checked_add(1).ok_or(
+                ConstrainedZonotopeAffineError::ResourceOverflow {
+                    operation: "filled generator adjacency",
+                },
+            )?;
         }
     }
-    debug_assert_eq!(
-        adjacency.iter().map(Vec::len).sum::<usize>(),
-        total_nonzeros
-    );
+    debug_assert_eq!(filled_nonzeros, total_nonzeros);
     Ok(adjacency)
 }
 
-fn clone_constraints(
+fn preflight_interval_products_with_gate<G>(
     input: &ConstrainedZonotope64,
-) -> Result<Array2<f64>, ConstrainedZonotopeAffineError> {
+    weights: ArrayView2<'_, f64>,
+    geometry: Geometry,
+    adjacency: &[Vec<(usize, f64)>],
+    limit: usize,
+    gate: &mut G,
+) -> Result<usize, ConstrainedZonotopeAffineBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut products = 0_usize;
+    for output_index in 0..geometry.output_value_count {
+        gate.charge_items(1, "affine interval-product output preflight")?;
+        for input_index in 0..geometry.input_value_count {
+            gate.charge_items(1, "affine interval-product matrix preflight")?;
+            if weights[[output_index, input_index]] == 0.0 {
+                continue;
+            }
+            let products_here = 1_usize
+                .checked_add(usize::from(input.box_remainder()[input_index] != 0.0))
+                .and_then(|count| count.checked_add(adjacency[input_index].len()))
+                .ok_or(ConstrainedZonotopeAffineError::ResourceOverflow {
+                    operation: "interval product count",
+                })?;
+            products = products.checked_add(products_here).ok_or(
+                ConstrainedZonotopeAffineError::ResourceOverflow {
+                    operation: "interval product count",
+                },
+            )?;
+            check_limit("interval products", products, limit)?;
+        }
+    }
+    Ok(products)
+}
+
+fn clone_constraints<G>(
+    input: &ConstrainedZonotope64,
+    gate: &mut G,
+) -> Result<Array2<f64>, ConstrainedZonotopeAffineBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let shape = (input.constraint_count(), input.alpha_dim());
     let element_count =
         shape
@@ -466,36 +734,53 @@ fn clone_constraints(
             })?;
     let constraints = input.constraints();
     let mut values = Vec::new();
+    gate.checkpoint("affine constraint-matrix allocation")?;
     try_reserve(&mut values, element_count, "constraint matrix")?;
     for row in 0..shape.0 {
+        gate.charge_items(1, "affine constraint-row clone")?;
         for column in 0..shape.1 {
+            gate.charge_items(1, "affine constraint-element clone")?;
             values.push(constraints[[row, column]]);
         }
     }
     Array2::from_shape_vec(shape, values).map_err(|_| {
-        ConstrainedZonotopeAffineError::ResourceOverflow {
-            operation: "constraint matrix shape",
-        }
+        ConstrainedZonotopeAffineBudgetError::Transform(
+            ConstrainedZonotopeAffineError::ResourceOverflow {
+                operation: "constraint matrix shape",
+            },
+        )
     })
 }
 
-fn clone_slice<T: Copy>(
+fn clone_slice_with_gate<T: Copy, G>(
     source: &[T],
     resource: &'static str,
-) -> Result<Vec<T>, ConstrainedZonotopeAffineError> {
+    gate: &mut G,
+) -> Result<Vec<T>, ConstrainedZonotopeAffineBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let mut output = Vec::new();
     try_reserve(&mut output, source.len(), resource)?;
-    output.extend_from_slice(source);
+    for &value in source {
+        gate.charge_items(1, "affine right-hand-side clone")?;
+        output.push(value);
+    }
     Ok(output)
 }
 
-fn validate_finite(
+fn validate_finite_with_gate<G>(
     field: &'static str,
     values: impl IntoIterator<Item = f64>,
-) -> Result<(), ConstrainedZonotopeAffineError> {
+    gate: &mut G,
+) -> Result<(), ConstrainedZonotopeAffineBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     for (index, value) in values.into_iter().enumerate() {
+        gate.charge_items(1, "affine finite-parameter validation")?;
         if !value.is_finite() {
-            return Err(ConstrainedZonotopeAffineError::NonFinite { field, index });
+            return Err(ConstrainedZonotopeAffineError::NonFinite { field, index }.into());
         }
     }
     Ok(())
@@ -690,6 +975,10 @@ fn round_up(value: f64, operation: &'static str) -> Result<f64, ConstrainedZonot
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::mem::size_of;
+    use std::time::{Duration, Instant};
+
     use ndarray::{array, Array2};
     use num_rational::BigRational;
     use num_traits::{Signed, Zero};
@@ -805,6 +1094,230 @@ mod tests {
     }
 
     #[test]
+    fn budgeted_affine_is_bit_identical_and_reports_complete_peak() {
+        let input = simple_input();
+        let weights = array![[1.0, -2.0], [0.5, 3.0]];
+        let bias = [0.125, -0.5];
+        let legacy =
+            constrained_zonotope_affine_unwired(&input, weights.view(), &bias, limits()).unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let outcome = constrained_zonotope_affine_unwired_with_budget(
+            &input,
+            weights.view(),
+            &bias,
+            limits(),
+            ConstrainedZonotopeCallBudget::new(deadline, 13, usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(outcome.value(), &legacy);
+        // Independent inventory of the fixed case: adjacency count/touched
+        // indices, adjacency/candidate/validated column headers, adjacency plus
+        // doubled candidate/validated entries, interval scratch, and the
+        // center/remainder/constraint/rhs scalars.
+        let transform_owned_peak = 3 * size_of::<usize>()
+            + 4 * size_of::<Vec<(usize, f64)>>()
+            + 6 * size_of::<(usize, f64)>()
+            + size_of::<Option<OutwardInterval>>()
+            + 8 * size_of::<f64>();
+        assert_eq!(
+            outcome.report().peak_live_bytes(),
+            13 + transform_owned_peak
+        );
+        assert!(outcome.report().charged_items() > 0);
+        assert!(outcome.report().deadline_polls() > 0);
+
+        let exact_peak = outcome.report().peak_live_bytes();
+        constrained_zonotope_affine_unwired_with_budget(
+            &input,
+            weights.view(),
+            &bias,
+            limits(),
+            ConstrainedZonotopeCallBudget::new(deadline, 13, exact_peak),
+        )
+        .unwrap();
+        assert!(matches!(
+            constrained_zonotope_affine_unwired_with_budget(
+                &input,
+                weights.view(),
+                &bias,
+                limits(),
+                ConstrainedZonotopeCallBudget::new(deadline, 13, exact_peak - 1),
+            ),
+            Err(ConstrainedZonotopeAffineBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. }
+            ))
+        ));
+        assert!(matches!(
+            constrained_zonotope_affine_unwired_with_budget(
+                &input,
+                weights.view(),
+                &bias,
+                limits(),
+                ConstrainedZonotopeCallBudget::new(deadline, usize::MAX, usize::MAX),
+            ),
+            Err(ConstrainedZonotopeAffineBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "aggregate peak-live bytes"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn budget_refuses_baseline_at_admission_and_each_publication_seam() {
+        let input = simple_input();
+        let weights = Array2::ones((2, 2));
+        let start = Instant::now();
+        let reads = Cell::new(0_usize);
+        let baseline = constrained_zonotope_affine_unwired_with_clock(
+            &input,
+            weights.view(),
+            &[0.0, 0.0],
+            limits(),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 5, 4),
+            |_| {
+                reads.set(reads.get() + 1);
+                start
+            },
+        );
+        assert!(matches!(
+            baseline,
+            Err(ConstrainedZonotopeAffineBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required: 5,
+                    limit: 4
+                }
+            ))
+        ));
+        assert_eq!(reads.get(), 1);
+
+        for seam in [
+            "affine geometry validation complete",
+            "affine peak-memory preflight complete",
+            "affine adjacency construction complete",
+            "affine interval-product preflight complete",
+            "affine numeric transform complete",
+            "affine constraint clone complete",
+            "affine right-hand-side clone complete",
+            "constrained-zonotope generator-column allocation",
+            "affine domain materialization complete",
+            "affine publication",
+        ] {
+            let expired = start + Duration::from_secs(2);
+            let result = constrained_zonotope_affine_unwired_with_clock(
+                &input,
+                weights.view(),
+                &[0.0, 0.0],
+                limits(),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, 1 << 20),
+                |checkpoint| if checkpoint == seam { expired } else { start },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ConstrainedZonotopeAffineBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == seam
+                ),
+                "deadline seam {seam} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_polls_inside_product_preflight_and_dense_matrix_loop() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let input = ConstrainedZonotope64::try_new(
+            vec![1.0; dimension],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0; dimension],
+        )
+        .unwrap();
+        let weights = Array2::ones((1, dimension));
+        let mut large = limits();
+        large.max_input_value_count = dimension;
+        large.max_weight_elements = dimension;
+        large.max_matrix_visits = dimension;
+        large.max_interval_products = dimension;
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        for phase in [
+            "affine interval-product matrix preflight",
+            "affine matrix transform",
+        ] {
+            let result = constrained_zonotope_affine_unwired_with_clock(
+                &input,
+                weights.view(),
+                &[0.0],
+                large,
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, 1 << 20),
+                |checkpoint| {
+                    if checkpoint == phase {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ConstrainedZonotopeAffineBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == phase
+                ),
+                "deadline must be polled during {phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_polling_continues_through_final_domain_validation() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let input = ConstrainedZonotope64::try_new(
+            vec![1.0],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let weights = Array2::ones((dimension, 1));
+        let bias = vec![0.0; dimension];
+        let mut large = limits();
+        large.max_output_value_count = dimension;
+        large.max_weight_elements = dimension;
+        large.max_matrix_visits = dimension;
+        large.max_interval_products = dimension;
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        let result = constrained_zonotope_affine_unwired_with_clock(
+            &input,
+            weights.view(),
+            &bias,
+            large,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "constrained-zonotope finite-value validation" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ConstrainedZonotopeAffineBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "constrained-zonotope finite-value validation"
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn structural_zero_matrix_is_bounded_by_visits_not_products() {
         let input = ConstrainedZonotope64::try_new(
             vec![1.0, 2.0],
@@ -840,6 +1353,68 @@ mod tests {
             vec![0.125, 0.25],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_generator_limit_reports_the_full_required_count() {
+        let input = ConstrainedZonotope64::try_new(
+            vec![0.0, 0.0],
+            vec![vec![(0, 1.0)], vec![(1, 1.0)]],
+            Array2::zeros((0, 2)),
+            Vec::new(),
+            vec![0.0, 0.0],
+        )
+        .unwrap();
+        let mut capped = limits();
+        capped.max_generator_nonzeros = 0;
+        assert_eq!(
+            constrained_zonotope_affine_unwired(&input, array![[1.0, 1.0]].view(), &[0.0], capped,),
+            Err(ConstrainedZonotopeAffineError::ResourceLimit {
+                resource: "input generator nonzeros",
+                required: 2,
+                limit: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn interval_product_preflight_matches_sparse_zero_execution() {
+        let input = simple_input();
+        let weights = array![[0.0, -2.0], [0.0, 0.0]];
+        let bias = [0.25, -0.5];
+        let legacy =
+            constrained_zonotope_affine_unwired(&input, weights.view(), &bias, limits()).unwrap();
+        assert_eq!(legacy.1.interval_products, 3);
+
+        let start = Instant::now();
+        let budgeted = constrained_zonotope_affine_unwired_with_clock(
+            &input,
+            weights.view(),
+            &bias,
+            limits(),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_mins(1), 0, usize::MAX),
+            |_| start,
+        )
+        .unwrap();
+        assert_eq!(budgeted.value(), &legacy);
+
+        let mut capped = limits();
+        capped.max_interval_products = 2;
+        let legacy_error =
+            constrained_zonotope_affine_unwired(&input, weights.view(), &bias, capped).unwrap_err();
+        let budget_error = constrained_zonotope_affine_unwired_with_clock(
+            &input,
+            weights.view(),
+            &bias,
+            capped,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_mins(1), 0, usize::MAX),
+            |_| start,
+        )
+        .unwrap_err();
+        assert_eq!(
+            budget_error,
+            ConstrainedZonotopeAffineBudgetError::Transform(legacy_error)
+        );
     }
 
     fn assert_limit(

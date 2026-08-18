@@ -19,7 +19,7 @@
 use anyhow::Result;
 use ndarray::{ArrayD, IxDyn};
 use ny_onnx::vnnlib::VnnLibSpec;
-use ny_propagate::{BabVerificationStatus, BetaCrownConfig, BetaCrownResult};
+use ny_propagate::{BabVerificationStatus, BetaCrownConfig, BetaCrownResult, ViolationWitness};
 use ny_tensor::BoundedTensor;
 use std::time::Instant;
 
@@ -89,14 +89,42 @@ pub(in crate::commands::beta_crown) fn confirm_potential_violation(
     deadline: Option<Instant>,
     json: bool,
 ) -> Result<BetaCrownResult> {
-    if !matches!(result.result, BabVerificationStatus::PotentialViolation) {
+    let BabVerificationStatus::PotentialViolation { witness: carried } = &result.result else {
         return Ok(result);
-    }
+    };
+    // Detach the carried witness so `..result` can move the rest below.
+    let carried = carried.clone();
 
     let Some(vnnlib) = vnnlib else {
         // Propertyless mode — no constraints to check against.
         return Ok(result);
     };
+
+    // #advcheck-witness: BaB's adv_check probe already ran a TRUE concrete
+    // forward on a point of the sub-box it was searching and found a genuine
+    // violation — then dropped the point, leaving the confirmer below to
+    // re-SEARCH the whole ROOT box for it. That search routinely missed, and a
+    // validated counterexample downgraded to Unknown.
+    //
+    // VERIFY the carried point instead of re-searching for it. This is not a
+    // shortcut past any gate:
+    //   * the point is re-evaluated here through the same exact concrete
+    //     forward (`evaluate_model`) the re-search uses;
+    //   * acceptance is the same `check_unsafe_counterexample` over the same
+    //     full VNN-LIB constraint set the re-search uses;
+    //   * the resulting `Violated` is rendered as a witness and still has to
+    //     pass the unchanged trusted ONNX-Runtime gate
+    //     (`gate_sat_with_trusted_oracle` in commands/vnncomp.rs) before any
+    //     `sat` is scored.
+    // Anything short of a clean pass falls through to the pre-existing code
+    // below completely unchanged, so a bad witness can never cost a verdict.
+    //
+    // ORDERING: the deadline bail-out stays FIRST, exactly as before. Checking
+    // the carried witness after an exhausted deadline would be dead work —
+    // `gate_result_at_deadline` (dispatch.rs) rewrites ANY result, `Violated`
+    // included, to `Timeout` once the deadline has passed — and shipping a path
+    // whose stated benefit never reaches production is the very defect class
+    // this change exists to remove.
 
     // Deadline already exhausted — downgrade immediately.
     if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -106,6 +134,34 @@ pub(in crate::commands::beta_crown) fn confirm_potential_violation(
             },
             ..result
         });
+    }
+
+    if let Some(carried) = carried.as_deref() {
+        match verify_carried_witness(model_net, input, carried, &vnnlib.output_constraints) {
+            Ok(Some((point, output))) => {
+                if !json {
+                    println!(
+                        "  Potential violation CONFIRMED from the witness BaB already held \
+                         (verified in place, no re-search)."
+                    );
+                }
+                return Ok(BetaCrownResult {
+                    result: BabVerificationStatus::Violated {
+                        counterexample: point.iter().copied().collect(),
+                        output: output.iter().copied().collect(),
+                    },
+                    ..result
+                });
+            }
+            Ok(None) => tracing::info!(
+                "Carried BaB witness did not re-verify against the full property; \
+                 falling back to the unchanged confirmation search"
+            ),
+            Err(err) => tracing::info!(
+                "Carried BaB witness could not be evaluated ({err}); falling back to \
+                 the unchanged confirmation search"
+            ),
+        }
     }
 
     let constraints = &vnnlib.output_constraints;
@@ -165,6 +221,86 @@ pub(in crate::commands::beta_crown) fn confirm_potential_violation(
             })
         }
     }
+}
+
+/// Verify a carried BaB witness in place (#advcheck-witness).
+///
+/// Returns `Some((point, output))` only when the point is inside the DECLARED
+/// input box AND a fresh exact concrete forward at that point satisfies every
+/// VNN-LIB output constraint — the identical acceptance test
+/// [`try_confirm_attack`] applies to the points it samples. Every other
+/// outcome (shape mismatch, out-of-box coordinate, non-violating re-forward,
+/// evaluation error) returns `None`/`Err` so the caller falls through to the
+/// pre-existing search with no change in behaviour.
+///
+/// The witness's own recorded output is deliberately NOT trusted: it is only
+/// logged against the fresh forward, because a divergence there is exactly the
+/// class of bug (`cgan_2023`) the downstream ORT gate exists to catch.
+fn verify_carried_witness(
+    model_net: &BetaCrownModel,
+    input: &BoundedTensor,
+    witness: &ViolationWitness,
+    constraints: &[ny_onnx::vnnlib::OutputConstraint],
+) -> Result<Option<(ArrayD<f32>, ArrayD<f32>)>> {
+    if constraints.is_empty() {
+        return Ok(None);
+    }
+    if witness.input_shape.as_slice() != input.lower().shape()
+        || witness.input.len() != input.lower().len()
+    {
+        tracing::info!(
+            witness_shape = ?witness.input_shape,
+            declared_shape = ?input.lower().shape(),
+            "Carried BaB witness shape does not match the declared input; ignoring it"
+        );
+        return Ok(None);
+    }
+
+    let point = ArrayD::from_shape_vec(IxDyn(&witness.input_shape), witness.input.clone())?;
+
+    // Box membership. The sub-box adv_check searched is contained in the root
+    // box by construction, but the organizer checks membership against the
+    // DECLARED bounds, so re-check rather than assume. Reject (never clamp) —
+    // a clamped point is a different point and would need its own forward.
+    //
+    // The BOUNDS must be finite too, not just the coordinate. A degenerate
+    // declared box (an endpoint that is ±inf or NaN — e.g. from an
+    // OpaqueSkip-tainted or malformed spec) would otherwise vacuously admit a
+    // carried point that the pre-existing sampler could never have reached,
+    // making the accepted-point set LARGER than today's instead of a strict
+    // subset of it. `x < lo || x > hi` is already false against a NaN bound,
+    // so the comparison alone does not catch it.
+    let outside = point
+        .iter()
+        .zip(input.lower().iter().zip(input.upper().iter()))
+        .any(|(x, (lo, hi))| {
+            !x.is_finite() || !lo.is_finite() || !hi.is_finite() || x < lo || x > hi
+        });
+    if outside {
+        tracing::info!("Carried BaB witness lies outside the declared input box; ignoring it");
+        return Ok(None);
+    }
+
+    // Re-evaluate. The carried output is a hint, never the decision.
+    let output = evaluate_model(model_net, &point)?;
+    if witness.output.len() == output.len() {
+        let drift = witness
+            .output
+            .iter()
+            .zip(output.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        if drift > 0.0 {
+            tracing::debug!(
+                drift,
+                "Carried BaB witness output vs. fresh confirmation forward"
+            );
+        }
+    }
+    if !super::check_unsafe_counterexample(&output, constraints) {
+        return Ok(None);
+    }
+    Ok(Some((point, output)))
 }
 
 /// Run sampling + SPSA attack to confirm a potential violation.
@@ -326,7 +462,7 @@ fn try_confirm_attack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ny_propagate::BabVerificationStatus;
+    use ny_propagate::{BabVerificationStatus, ViolationWitness};
     use std::time::Duration;
 
     /// Helper: create a placeholder BetaCrownModel for tests that exit before
@@ -341,7 +477,7 @@ mod tests {
     #[test]
     fn expired_deadline_downgrades_to_unknown() {
         let result = BetaCrownResult {
-            result: BabVerificationStatus::PotentialViolation,
+            result: BabVerificationStatus::potential_violation(),
             domains_explored: 30,
             time_elapsed: Duration::from_millis(270),
             max_depth_reached: 5,
@@ -406,11 +542,203 @@ mod tests {
         assert_eq!(confirmed.domains_explored, 100);
     }
 
+    // -------------------------------------------------------------------
+    // #advcheck-witness: carrying the point BaB already validated.
+    // -------------------------------------------------------------------
+
+    /// y = x on one scalar input, as a sequential model.
+    fn identity_model() -> BetaCrownModel {
+        use ny_propagate::{layers::LinearLayer, Layer, Network};
+        let identity = LinearLayer::new(ndarray::arr2(&[[1.0_f32]]), None).expect("identity");
+        let mut net = Network::new();
+        net.add_layer(Layer::Linear(identity));
+        BetaCrownModel::Sequential(Box::new(net))
+    }
+
+    fn box_1d(lo: f32, hi: f32) -> BoundedTensor {
+        BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![lo]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![hi]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Unsafe iff `y_0 <= -0.5`.
+    fn unsafe_below_half() -> VnnLibSpec {
+        VnnLibSpec {
+            output_constraints: vec![ny_onnx::vnnlib::OutputConstraint::LessEqConst(0, -0.5)],
+            ..VnnLibSpec::default()
+        }
+    }
+
+    fn potential_violation(witness: Option<ViolationWitness>) -> BetaCrownResult {
+        BetaCrownResult {
+            result: match witness {
+                Some(w) => BabVerificationStatus::potential_violation_with(w),
+                None => BabVerificationStatus::potential_violation(),
+            },
+            domains_explored: 41,
+            time_elapsed: Duration::from_millis(123),
+            max_depth_reached: 7,
+            output_bounds: None,
+            cuts_generated: 0,
+            domains_verified: 0,
+        }
+    }
+
+    fn witness_at(x: f32) -> ViolationWitness {
+        ViolationWitness {
+            input: vec![x],
+            input_shape: vec![1],
+            output: vec![x],
+        }
+    }
+
+    /// THE FIX. A carried point that genuinely violates is confirmed IN PLACE:
+    /// the emitted counterexample is that exact point, not something the
+    /// confirmer re-found by attacking the root box.
+    #[test]
+    fn carried_witness_is_verified_in_place_advcheck_witness() {
+        let confirmed = confirm_potential_violation(
+            &identity_model(),
+            &box_1d(-1.0, 1.0),
+            Some(&unsafe_below_half()),
+            potential_violation(Some(witness_at(-0.875))),
+            &BetaCrownConfig::default(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        match confirmed.result {
+            BabVerificationStatus::Violated {
+                counterexample,
+                output,
+            } => {
+                assert_eq!(
+                    counterexample,
+                    vec![-0.875_f32],
+                    "the confirmer must emit the CARRIED point, not a re-searched one"
+                );
+                assert_eq!(output, vec![-0.875_f32]);
+            }
+            other => unreachable!("expected Violated from the carried witness, got {other:?}"),
+        }
+        // BaB metadata is preserved exactly as on the re-search path.
+        assert_eq!(confirmed.domains_explored, 41);
+        assert_eq!(confirmed.max_depth_reached, 7);
+    }
+
+    /// A carried point that does NOT satisfy the property must change nothing.
+    /// Asserted the only way that means anything: the outcome is bit-identical
+    /// to the payloadless run (same fixed-seed re-search, same verdict).
+    #[test]
+    fn non_violating_carried_witness_behaves_exactly_as_today_advcheck_witness() {
+        let run = |witness: Option<ViolationWitness>| {
+            confirm_potential_violation(
+                &identity_model(),
+                &box_1d(-1.0, 1.0),
+                Some(&unsafe_below_half()),
+                potential_violation(witness),
+                &BetaCrownConfig::default(),
+                None,
+                true,
+            )
+            .unwrap()
+            .result
+        };
+
+        let today = run(None);
+        // +0.9 is inside the box but SAFE (0.9 > -0.5).
+        assert_eq!(
+            run(Some(witness_at(0.9))),
+            today,
+            "a carried point that fails the property must leave the verdict untouched"
+        );
+    }
+
+    /// A carried point outside the DECLARED input box is ignored (never
+    /// clamped into one), so the run is again identical to today.
+    #[test]
+    fn out_of_box_carried_witness_is_ignored_advcheck_witness() {
+        let run = |witness: Option<ViolationWitness>| {
+            confirm_potential_violation(
+                &identity_model(),
+                &box_1d(-1.0, 1.0),
+                Some(&unsafe_below_half()),
+                potential_violation(witness),
+                &BetaCrownConfig::default(),
+                None,
+                true,
+            )
+            .unwrap()
+            .result
+        };
+
+        let today = run(None);
+        // -9.0 WOULD satisfy `y <= -0.5`, but it is not in [-1, 1]: the
+        // organizer checks membership on the declared bounds, so it is not a
+        // counterexample and must not be emitted as one.
+        assert_eq!(run(Some(witness_at(-9.0))), today);
+        // Wrong shape is likewise ignored rather than reinterpreted.
+        assert_eq!(
+            run(Some(ViolationWitness {
+                input: vec![-0.9, -0.9],
+                input_shape: vec![2],
+                output: vec![-0.9],
+            })),
+            today
+        );
+        // A non-finite coordinate can never be a witness.
+        assert_eq!(run(Some(witness_at(f32::NAN))), today);
+    }
+
+    /// An exhausted deadline downgrades to Unknown WHETHER OR NOT a witness is
+    /// carried — the deadline bail-out precedes the witness check, unchanged
+    /// from before this feature.
+    ///
+    /// This pins the ordering deliberately. An earlier draft ran the carried
+    /// witness first, so an expired deadline could still return `Violated`; but
+    /// `gate_result_at_deadline` rewrites that to `Timeout` one frame up, so the
+    /// behaviour never reached production and the code merely implied it did.
+    #[test]
+    fn an_expired_deadline_downgrades_with_or_without_a_carried_witness() {
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let run = |witness: Option<ViolationWitness>| {
+            confirm_potential_violation(
+                &identity_model(),
+                &box_1d(-1.0, 1.0),
+                Some(&unsafe_below_half()),
+                potential_violation(witness),
+                &BetaCrownConfig::default(),
+                Some(expired),
+                true,
+            )
+            .unwrap()
+            .result
+        };
+
+        // -0.75 is a genuine violating point; past the deadline it still must
+        // not become a verdict here.
+        assert_eq!(
+            run(Some(witness_at(-0.75))),
+            run(None),
+            "past the deadline a carried witness must downgrade exactly like no witness"
+        );
+        assert!(
+            matches!(
+                run(Some(witness_at(-0.75))),
+                BabVerificationStatus::Unknown { .. }
+            ),
+            "the expired-deadline path downgrades to Unknown"
+        );
+    }
+
     /// No-VnnLib PotentialViolation passes through unchanged.
     #[test]
     fn no_vnnlib_passes_through() {
         let result = BetaCrownResult {
-            result: BabVerificationStatus::PotentialViolation,
+            result: BabVerificationStatus::potential_violation(),
             domains_explored: 15,
             time_elapsed: Duration::from_millis(100),
             max_depth_reached: 3,
@@ -432,7 +760,10 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(confirmed.result, BabVerificationStatus::PotentialViolation),
+            matches!(
+                confirmed.result,
+                BabVerificationStatus::PotentialViolation { .. }
+            ),
             "Expected PotentialViolation (pass-through) but got {:?}",
             confirmed.result
         );

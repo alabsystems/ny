@@ -273,6 +273,7 @@ impl DomainList {
             grouped,
             metadata: Vec::with_capacity(initial_capacity),
             evicted: 0,
+            queue_eviction_policy: Default::default(),
         })
     }
 

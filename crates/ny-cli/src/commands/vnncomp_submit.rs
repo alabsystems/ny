@@ -29,8 +29,12 @@ const EXCLUDE_GLOBS: [&str; 2] = ["crates/*/corpus", "crates/*/proptest-regressi
 const PREBUILT_ARCHIVE: &str = "dist/bin/ny-x86_64-linux.xz";
 const PREBUILT_CHECKSUM: &str = "dist/bin/ny-x86_64-linux.xz.sha256";
 const PREBUILT_PROVENANCE: &str = "dist/bin/ny-x86_64-linux.provenance.txt";
+const PREBUILT_BUILDER: &str = "scripts/vnncomp_trust_linux_build.sh";
+const PREBUILT_VERIFIER: &str = "vnncomp_scripts/verify_prebuilt.py";
+const SOURCE_PROVENANCE: &str = ".ny-vnncomp-source.txt";
 const PREBUILT_FILES: [&str; 3] = [PREBUILT_ARCHIVE, PREBUILT_CHECKSUM, PREBUILT_PROVENANCE];
 const PREBUILT_SCHEMA: &str = "ny-vnncomp-prebuilt-v1";
+const SOURCE_PROVENANCE_SCHEMA: &str = "ny-vnncomp-source-v1";
 const PREBUILT_TARGET: &str = "x86_64-unknown-linux-gnu";
 const PREBUILT_FEATURES: &str = "mip,cuda";
 const BUILD_PROVENANCE_PREFIX: &str = "ny.vnncomp.build.v1|";
@@ -80,10 +84,28 @@ const PACKAGE_ROOTS: [&str; 18] = [
     "scripts/vnncomp_coverage.py",
     "vnncomp_scripts",
 ];
+/// Reviewed files that may be surfaced by the package-list audit before they
+/// have been added to the index. This intentionally remains a narrow
+/// allowlist: any other non-ignored untracked file under PACKAGE_ROOTS makes
+/// even the audit fail closed. `write_tarball` separately requires every
+/// packaged input to be committed before it emits commit-labelled provenance.
+const REVIEWED_WORKTREE_FILES: [&str; 10] = [
+    "crates/ny-cli/src/commands/vnncomp_benchmarks.rs",
+    "crates/ny-cli/src/commands/vnncomp_submit.rs",
+    "crates/ny-cli/src/commands/vnncomp_late_submit.rs",
+    "crates/ny-cli/src/commands/vnncomp_matrix.rs",
+    "crates/ny-cli/src/commands/vnncomp_2025_tracks.rs",
+    "crates/ny-cli/src/commands/vnncomp_2026_tracks.rs",
+    "crates/ny-cli/testdata/vnncomp2025_track_membership.csv",
+    "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/bounded_shared_executor.rs",
+    "crates/ny-propagate/src/beta_crown/engine/graph/objectives/cuda_beta_spsa.rs",
+    PREBUILT_VERIFIER,
+];
 
 #[derive(Debug)]
 struct ValidatedPrebuilt {
     files: BTreeMap<&'static str, Vec<u8>>,
+    source_commit: String,
 }
 
 impl ValidatedPrebuilt {
@@ -153,7 +175,7 @@ fn handle_vnncomp_submit_from_repo(
                 "dry_run": dry_run,
                 "built": !no_build && !dry_run,
                 "required_scripts": REQUIRED_SCRIPTS,
-                "included_file_count": included_paths.len(),
+                "included_file_count": included_paths.len() + 1,
                 "package_roots": PACKAGE_ROOTS,
                 "prebuilt_included": prebuilt_included,
                 "next_step": "Upload this tarball through the VNN-COMP evaluation website when tool submission opens."
@@ -185,7 +207,7 @@ fn handle_vnncomp_submit_from_repo(
         if dry_run {
             println!("  dry-run: no tarball written");
         }
-        println!("  files:  {}", included_paths.len());
+        println!("  files:  {}", included_paths.len() + 1);
         println!();
         println!("Upload the tarball through the VNN-COMP evaluation website when the tool submission window opens.");
     }
@@ -218,12 +240,17 @@ fn validate_harness(repo_root: &Path) -> Result<()> {
         "vnncomp_scripts/build_submission_binary.sh",
         "vnncomp_scripts/prepare_instance.sh",
         "vnncomp_scripts/run_instance.sh",
+        "vnncomp_scripts/submission_binary_receipt.sh",
     ] {
         let path = repo_root.join(script);
         if !path.is_file() {
             bail!("missing VNN-COMP helper script: {}", path.display());
         }
         require_executable(&path)?;
+    }
+    let verifier = repo_root.join(PREBUILT_VERIFIER);
+    if !verifier.is_file() {
+        bail!("missing VNN-COMP prebuilt verifier: {}", verifier.display());
     }
 
     Ok(())
@@ -245,6 +272,11 @@ fn require_executable(path: &Path) -> Result<()> {
             );
         }
     }
+    // Windows has no exec bit, so there is nothing to reject here. Packaging
+    // from Windows therefore cannot catch a missing mode bit — the check that
+    // matters runs on the Linux eval image, and on the Linux packaging host.
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -268,26 +300,41 @@ fn package_file_list(repo_root: &Path) -> Result<Vec<String>> {
     for required in REQUIRED_SCRIPTS {
         include_existing_file(repo_root, &mut files, required);
     }
-    include_existing_file(
-        repo_root,
-        &mut files,
-        "crates/ny-cli/src/commands/vnncomp_benchmarks.rs",
-    );
-    include_existing_file(
-        repo_root,
-        &mut files,
-        "crates/ny-cli/src/commands/vnncomp_submit.rs",
-    );
-    include_existing_file(
-        repo_root,
-        &mut files,
-        "crates/ny-cli/src/commands/vnncomp_late_submit.rs",
-    );
-    include_existing_file(
-        repo_root,
-        &mut files,
-        "crates/ny-cli/src/commands/vnncomp_matrix.rs",
-    );
+    for reviewed in REVIEWED_WORKTREE_FILES {
+        include_existing_file(repo_root, &mut files, reviewed);
+    }
+
+    // The package-list audit surfaces reviewed worktree additions, because
+    // silently omitting a newly-created source or compile-time input can yield
+    // an archive that cannot build. Archive creation later rejects every
+    // uncommitted package input: a Git commit label cannot honestly describe
+    // bytes that exist only in the worktree. Ignored `dist/` artifacts stay on
+    // their separate, strictly validated path below.
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+        .args(PACKAGE_ROOTS)
+        .current_dir(repo_root)
+        .output()?;
+    if !untracked.status.success() {
+        bail!(
+            "git ls-files for untracked package inputs failed with status {}",
+            untracked.status
+        );
+    }
+    let unexpected: Vec<String> = String::from_utf8(untracked.stdout)?
+        .split('\0')
+        .filter(|line| !line.is_empty())
+        .filter(|line| !files.iter().any(|included| included == line))
+        .map(str::to_string)
+        .collect();
+    if !unexpected.is_empty() {
+        bail!(
+            "refusing to omit unreviewed untracked file(s) under VNN-COMP package roots: {}. \
+             Commit them or explicitly review and add them to REVIEWED_WORKTREE_FILES",
+            unexpected.join(", ")
+        );
+    }
+
     // `dist/` is intentionally ignored. A completely absent prebuilt is a
     // supported source-build package, but any partial, stale, unproven, or
     // mislabelled prebuilt is a release error rather than a warning/fallback.
@@ -295,6 +342,10 @@ fn package_file_list(repo_root: &Path) -> Result<Vec<String>> {
     // x86_64 evaluation artifact without executing foreign code.
     if validate_optional_prebuilt(repo_root)?.is_some() {
         files.extend(PREBUILT_FILES.map(str::to_string));
+        // The installer independently authenticates the builder identity in
+        // the sealed manifest. Include it only for prebuilt packages so the
+        // source-only fallback's package surface remains unchanged.
+        include_existing_file(repo_root, &mut files, PREBUILT_BUILDER);
     }
 
     files.sort();
@@ -397,10 +448,9 @@ fn validate_optional_prebuilt(repo_root: &Path) -> Result<Option<ValidatedPrebui
     let receipt_sha256 = sha256_bytes(trust_gate_receipt_payload(&manifest)?.as_bytes());
     require_manifest_value(&manifest, "trust_gate_receipt_sha256", &receipt_sha256)?;
 
-    ensure_prebuilt_source_clean(repo_root)?;
-    let ny_commit = git_stdout(repo_root, &["rev-parse", "--verify", "HEAD"])?;
-    require_lower_hex(&ny_commit, 40, "current NY commit")?;
-    require_manifest_value(&manifest, "ny_commit", &ny_commit)?;
+    let ny_commit = manifest_value(&manifest, "ny_commit")?.to_string();
+    require_lower_hex(&ny_commit, 40, "ny_commit")?;
+    ensure_prebuilt_source_binding(repo_root, &ny_commit)?;
 
     let lock_path = repo_root.join("Cargo.lock");
     let lock_bytes = fs::read(&lock_path)?;
@@ -459,6 +509,7 @@ fn validate_optional_prebuilt(repo_root: &Path) -> Result<Option<ValidatedPrebui
             (PREBUILT_CHECKSUM, checksum_bytes),
             (PREBUILT_PROVENANCE, provenance_bytes),
         ]),
+        source_commit: ny_commit,
     }))
 }
 
@@ -654,18 +705,135 @@ fn require_lower_hex(value: &str, length: usize, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_prebuilt_source_clean(repo_root: &Path) -> Result<()> {
+/// Bind a sealed prebuilt to source commit `source_commit` without requiring a
+/// commit hash to contain itself.
+///
+/// A locally packaged ignored triplet is valid directly at the clean source
+/// commit. A Git-clone release may instead point at a descendant commit, but
+/// its complete tree delta from the sealed source must be exactly the three
+/// prebuilt members. Thus the artifact commit can carry its own bytes while
+/// every compiled/package input remains byte-identical to the reviewed source.
+fn ensure_prebuilt_source_binding(repo_root: &Path, source_commit: &str) -> Result<()> {
+    require_lower_hex(source_commit, 40, "prebuilt source commit")?;
     let status = Command::new("git")
         .args(["diff", "--quiet", "HEAD", "--"])
         .current_dir(repo_root)
         .status()?;
     match status.code() {
-        Some(0) => Ok(()),
+        Some(0) => {}
         Some(1) => {
-            bail!("refusing prebuilt built for HEAD while compiled/package inputs are dirty")
+            bail!("refusing a commit-labelled submission while tracked package inputs are dirty")
         }
-        _ => bail!("git diff failed while validating prebuilt source state: {status}"),
+        _ => bail!("git diff failed while validating packaged source state: {status}"),
     }
+
+    // Reviewed-untracked inputs are useful for source-only development
+    // packages, but can never match a binary sealed to a Git commit.
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+        .args(PACKAGE_ROOTS)
+        .current_dir(repo_root)
+        .output()?;
+    if !untracked.status.success() {
+        bail!(
+            "git ls-files failed while validating prebuilt source binding ({})",
+            untracked.status
+        );
+    }
+    let untracked = String::from_utf8(untracked.stdout)?;
+    let untracked: Vec<_> = untracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
+    if !untracked.is_empty() {
+        bail!(
+            "refusing prebuilt while package inputs are untracked: {}",
+            untracked.join(", ")
+        );
+    }
+
+    let head = git_stdout(repo_root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    require_lower_hex(&head, 40, "current NY commit")?;
+    if head == source_commit {
+        return Ok(());
+    }
+
+    let source_object = format!("{source_commit}^{{commit}}");
+    let source_exists = Command::new("git")
+        .args(["cat-file", "-e", &source_object])
+        .current_dir(repo_root)
+        .status()?;
+    if !source_exists.success() {
+        bail!("prebuilt source commit {source_commit} is unavailable from release HEAD {head}");
+    }
+    let ancestry = Command::new("git")
+        .args(["merge-base", "--is-ancestor", source_commit, &head])
+        .current_dir(repo_root)
+        .status()?;
+    if !ancestry.success() {
+        bail!("prebuilt source commit {source_commit} is not an ancestor of release HEAD {head}");
+    }
+
+    let changed = Command::new("git")
+        .args(["diff", "--name-only", "-z", source_commit, &head, "--"])
+        .current_dir(repo_root)
+        .output()?;
+    if !changed.status.success() {
+        bail!(
+            "git diff failed while validating artifact-only release commit ({})",
+            changed.status
+        );
+    }
+    let changed = String::from_utf8(changed.stdout)?;
+    let changed: BTreeSet<_> = changed
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
+    let expected: BTreeSet<_> = PREBUILT_FILES.into_iter().collect();
+    if changed != expected {
+        bail!(
+            "release HEAD differs from sealed source outside the exact prebuilt triplet: changed={changed:?}, expected={expected:?}"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_packaged_source_clean(repo_root: &Path) -> Result<()> {
+    let status = Command::new("git")
+        .args(["diff", "--quiet", "HEAD", "--"])
+        .current_dir(repo_root)
+        .status()?;
+    match status.code() {
+        Some(0) => {}
+        Some(1) => {
+            bail!("refusing a commit-labelled submission while tracked package inputs are dirty")
+        }
+        _ => bail!("git diff failed while validating packaged source state: {status}"),
+    }
+
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+        .args(PACKAGE_ROOTS)
+        .current_dir(repo_root)
+        .output()?;
+    if !untracked.status.success() {
+        bail!(
+            "git ls-files failed while validating commit-labelled package inputs ({})",
+            untracked.status
+        );
+    }
+    let untracked = String::from_utf8(untracked.stdout)?;
+    let untracked: Vec<_> = untracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
+    if !untracked.is_empty() {
+        bail!(
+            "refusing a commit-labelled submission while package inputs are untracked: {}",
+            untracked.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn git_stdout(repo_root: &Path, args: &[&str]) -> Result<String> {
@@ -819,6 +987,89 @@ fn run_build(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn packaged_source_provenance(repo_root: &Path) -> Result<Vec<u8>> {
+    ensure_packaged_source_clean(repo_root)?;
+    let ny_commit = git_stdout(repo_root, &["rev-parse", "--verify", "HEAD"])?;
+    require_lower_hex(&ny_commit, 40, "packaged NY commit")?;
+    let cargo_lock_sha256 = sha256_file(&repo_root.join("Cargo.lock"))?;
+    Ok(format!(
+        "schema={SOURCE_PROVENANCE_SCHEMA}\n\
+         ny_commit={ny_commit}\n\
+         cargo_lock_sha256={cargo_lock_sha256}\n"
+    )
+    .into_bytes())
+}
+
+/// The `gzip` executable to invoke.
+///
+/// On Linux — the host that builds the scored artifact — this is the bare name
+/// and resolution is PATH's job, exactly as before. Nothing about the packaging
+/// path changes there.
+///
+/// Windows has no system `gzip`. It ships with Git for Windows, whose
+/// `usr/bin` is deliberately kept off PATH by the standard installer, so
+/// packaging failed on a developer box that had the tool installed all along.
+/// PATH still WINS when it resolves — an explicitly chosen gzip must not be
+/// overridden — and these fallbacks are consulted only when it does not.
+#[cfg(windows)]
+fn gzip_program() -> std::ffi::OsString {
+    if path_has_executable("gzip.exe") {
+        return "gzip".into();
+    }
+    ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .flat_map(|root| {
+            let root = PathBuf::from(root);
+            [
+                root.join(r"Git\usr\bin\gzip.exe"),
+                root.join(r"Programs\Git\usr\bin\gzip.exe"),
+            ]
+        })
+        .find(|candidate| candidate.is_file())
+        .map_or_else(|| "gzip".into(), PathBuf::into_os_string)
+}
+
+/// Whether PATH already resolves `name`, so an explicit choice is respected.
+#[cfg(windows)]
+fn path_has_executable(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| directory.join(name).is_file())
+    })
+}
+
+#[cfg(not(windows))]
+fn gzip_program() -> std::ffi::OsString {
+    "gzip".into()
+}
+
+/// A path an external tool can actually open.
+///
+/// `fs::canonicalize` returns a VERBATIM path on Windows — `\\?\C:\...` — and
+/// the MSYS-built utilities this function shells out to do not understand that
+/// prefix. `gzip` from Git for Windows mangles it into `\?C:Users...` and then
+/// reports "No such file or directory", which is what made submission
+/// packaging unrunnable there. (Windows' own `tar.exe` is bsdtar and accepts
+/// the prefix, so only some of these calls ever failed.)
+///
+/// Stripped for ARGUMENT use only: the canonical form is still what the
+/// overwrite-safety comparison above comes from, so that check is unchanged.
+/// The prefix exists to exceed `MAX_PATH`, and dropping it reintroduces that
+/// limit — acceptable here because these are short temp paths beside the
+/// output, and because the scored artifact is packaged on Linux, where this is
+/// the identity function.
+#[cfg(windows)]
+fn external_tool_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\")
+        .map_or_else(|| path.to_path_buf(), PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn external_tool_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> Result<()> {
     let output_parent = output
         .parent()
@@ -847,25 +1098,35 @@ fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> 
         } else {
             None
         };
+    // A tarball has no .git directory. Inject the exact commit/lock identity so
+    // source fallback builds can issue the same runtime receipt as checkout
+    // builds, rather than relabelling archive bytes as an unknowable revision.
+    // Requiring a clean tracked and untracked package tree keeps that commit
+    // claim exact.
+    let source_provenance = packaged_source_provenance(repo_root)?;
+    let source_snapshot = tempfile::tempdir()?;
+    fs::write(
+        source_snapshot.path().join(SOURCE_PROVENANCE),
+        &source_provenance,
+    )?;
 
-    // Keep one archive root for BSD and GNU tar alike. BSD tar does not honor
-    // GNU tar's positional `-C` semantics around an earlier `-T`: a second
-    // `-C` for a prebuilt-only snapshot makes it resolve every list member
-    // against that snapshot. Archive the repository paths in one pass, then
-    // compare each captured prebuilt member with the already-validated bytes
-    // below; any concurrent drift therefore fails closed.
+    // Keep the repository capture in one archive root for BSD and GNU tar
+    // alike. BSD tar does not honor GNU tar's positional `-C` semantics around
+    // an earlier `-T`, so append the generated source marker to an uncompressed
+    // tar in a second pass, then gzip the completed stream.
     let mut list_file = tempfile::NamedTempFile::new()?;
     for path in included_paths {
         writeln!(list_file, "{path}")?;
     }
 
+    let raw_tar = tempfile::NamedTempFile::new_in(&canonical_output_parent)?;
     let staged_output = tempfile::NamedTempFile::new_in(&canonical_output_parent)?;
 
     // Excludes must precede -T on both BSD (macOS) and GNU tar.
     let mut command = Command::new("tar");
     command
-        .arg("-czf")
-        .arg(staged_output.path())
+        .arg("-cf")
+        .arg(external_tool_path(raw_tar.path()))
         .arg("-C")
         .arg(repo_root);
     for glob in EXCLUDE_GLOBS {
@@ -877,12 +1138,54 @@ fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> 
     if !status.success() {
         bail!("tar failed with status {status}");
     }
+    let append_status = Command::new("tar")
+        .arg("-rf")
+        .arg(external_tool_path(raw_tar.path()))
+        .arg("-C")
+        .arg(source_snapshot.path())
+        .arg(SOURCE_PROVENANCE)
+        .status()?;
+    if !append_status.success() {
+        bail!("tar failed while appending source provenance: {append_status}");
+    }
+    let gzip_output = staged_output.reopen()?;
+    // Name the tool on failure. A bare `?` here surfaced only "program not
+    // found", which says nothing about WHICH of the several programs this
+    // function shells out to (tar, gzip, git, xz) is missing — on a host
+    // without gzip that error cost a full bisect to attribute.
+    //
+    // stderr is CAPTURED rather than inherited so a non-zero exit reports what
+    // gzip actually said; `.status()` discarded it and left only the code.
+    let gzip_result = Command::new(gzip_program())
+        .arg("-c")
+        .arg(external_tool_path(raw_tar.path()))
+        .stdout(Stdio::from(gzip_output))
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| anyhow!("run `gzip` to compress the submission tarball: {error}"))?
+        .wait_with_output()
+        .map_err(|error| anyhow!("wait for `gzip` to compress the submission tarball: {error}"))?;
+    if !gzip_result.status.success() {
+        bail!(
+            "gzip failed with status {}: {}",
+            gzip_result.status,
+            String::from_utf8_lossy(&gzip_result.stderr).trim()
+        );
+    }
 
     // Backstop for externally vendored sources: a stray exclude glob (or any
     // other packaging path) that omits a checksummed file breaks Cargo's
     // directory-source build. Verify the ACTUAL archived bytes here.
     verify_vendor_checksums(staged_output.path())?;
 
+    let archived_source = Command::new("tar")
+        .args(["-xOzf"])
+        .arg(staged_output.path())
+        .arg(SOURCE_PROVENANCE)
+        .output()?;
+    if !archived_source.status.success() || archived_source.stdout != source_provenance {
+        bail!("captured archive source provenance is missing or changed");
+    }
     if let Some(prebuilt) = &validated_prebuilt {
         for relative in PREBUILT_FILES {
             let archived = Command::new("tar")
@@ -900,7 +1203,11 @@ fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> 
                 bail!("captured tar member changed during archiving: {relative}");
             }
         }
-        ensure_prebuilt_source_clean(repo_root)?;
+        ensure_prebuilt_source_binding(repo_root, &prebuilt.source_commit)?;
+    }
+    let final_source_provenance = packaged_source_provenance(repo_root)?;
+    if final_source_provenance != source_provenance {
+        bail!("NY commit or Cargo.lock changed during submission archiving");
     }
     staged_output
         .persist(&canonical_output)
@@ -1190,6 +1497,15 @@ mod tests {
         ] {
             write_executable(&root.join(relative), "#!/bin/bash\nexit 0\n");
         }
+        fs::write(
+            root.join(PREBUILT_VERIFIER),
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+        )
+        .expect("prebuilt verifier");
+        write_executable(
+            &root.join("vnncomp_scripts/submission_binary_receipt.sh"),
+            "#!/bin/bash\nexit 0\n",
+        );
         run_git(root, &["add", "."]);
         run_git(
             root,
@@ -1270,6 +1586,34 @@ mod tests {
         )
         .expect("provenance");
         temp
+    }
+
+    fn commit_prebuilt_triplet(root: &Path) -> (String, String) {
+        let manifest = parse_prebuilt_manifest(
+            &fs::read(root.join(PREBUILT_PROVENANCE)).expect("read provenance"),
+        )
+        .expect("parse provenance");
+        let source_commit = manifest_value(&manifest, "ny_commit")
+            .expect("source commit")
+            .to_string();
+        let mut add = vec!["add", "-f", "--"];
+        add.extend(PREBUILT_FILES);
+        run_git(root, &add);
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=NY Test",
+                "-c",
+                "user.email=ny@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "artifact-only release",
+            ],
+        );
+        let release_commit = run_git(root, &["rev-parse", "HEAD"]);
+        (source_commit, release_commit)
     }
 
     fn replace_manifest_value(root: &Path, key: &str, value: &str) {
@@ -1357,6 +1701,154 @@ mod tests {
     }
 
     #[test]
+    fn source_only_commit_label_rejects_reviewed_untracked_release_modules() {
+        let fixture = make_prebuilt_fixture(TEST_AY_COMMIT, 62);
+        for relative in PREBUILT_FILES {
+            fs::remove_file(fixture.path().join(relative)).expect("remove prebuilt member");
+        }
+        let release_modules: [(&str, &[u8]); 4] = [
+            (
+                "crates/ny-cli/src/commands/vnncomp_2025_tracks.rs",
+                b"pub const TRACKS_2025: &[&str] = &[];\n",
+            ),
+            (
+                "crates/ny-cli/src/commands/vnncomp_2026_tracks.rs",
+                b"pub const TRACKS_2026: &[&str] = &[];\n",
+            ),
+            (
+                "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/bounded_shared_executor.rs",
+                b"pub(crate) struct BoundedSharedExecutor;\n",
+            ),
+            (
+                "crates/ny-propagate/src/beta_crown/engine/graph/objectives/cuda_beta_spsa.rs",
+                b"pub(crate) struct CudaBetaSpsa;\n",
+            ),
+        ];
+        for (relative, contents) in release_modules {
+            let path = fixture.path().join(relative);
+            fs::create_dir_all(path.parent().expect("module parent"))
+                .expect("create module parent");
+            fs::write(path, contents).expect("write untracked release module");
+        }
+
+        let included = package_file_list(fixture.path()).expect("package reviewed dirty tree");
+        for (relative, _) in release_modules {
+            assert_eq!(
+                included
+                    .iter()
+                    .filter(|candidate| candidate.as_str() == relative)
+                    .count(),
+                1,
+                "{relative} must appear exactly once in the package list"
+            );
+        }
+
+        let output = fixture.path().join("submission.tar.gz");
+        let error = write_tarball(fixture.path(), &output, &included)
+            .expect_err("untracked source cannot be labelled as the current commit")
+            .to_string();
+        assert!(error.contains("package inputs are untracked"), "{error}");
+        for (relative, _) in release_modules {
+            assert!(error.contains(relative), "missing untracked path: {error}");
+        }
+        assert!(
+            !output.exists(),
+            "failed packaging must not publish an archive"
+        );
+    }
+
+    #[test]
+    fn prebuilt_rejects_even_reviewed_untracked_package_inputs() {
+        let fixture = make_prebuilt_fixture(TEST_AY_COMMIT, 62);
+        let relative = "crates/ny-cli/src/commands/vnncomp_2025_tracks.rs";
+        let path = fixture.path().join(relative);
+        fs::create_dir_all(path.parent().expect("module parent")).expect("create module parent");
+        fs::write(&path, "pub const TRACKS_2025: &[&str] = &[];\n")
+            .expect("write reviewed untracked module");
+
+        let error = validate_optional_prebuilt(fixture.path())
+            .expect_err("a commit-sealed prebuilt cannot cover untracked source")
+            .to_string();
+        assert!(error.contains("package inputs are untracked"), "{error}");
+        assert!(error.contains(relative), "{error}");
+    }
+
+    #[test]
+    fn artifact_only_descendant_commit_preserves_prebuilt_source_binding() {
+        let fixture = make_prebuilt_fixture(TEST_AY_COMMIT, 62);
+        let (source_commit, release_commit) = commit_prebuilt_triplet(fixture.path());
+        assert_ne!(source_commit, release_commit);
+
+        let validated = validate_optional_prebuilt(fixture.path())
+            .expect("artifact-only descendant should validate")
+            .expect("prebuilt should be present");
+        assert_eq!(validated.source_commit, source_commit);
+
+        let files = package_file_list(fixture.path()).expect("package artifact-only release");
+        assert!(files.iter().any(|path| path == PREBUILT_BUILDER));
+    }
+
+    #[test]
+    fn descendant_commit_with_source_drift_cannot_relabel_prebuilt() {
+        let fixture = make_prebuilt_fixture(TEST_AY_COMMIT, 62);
+        let (source_commit, _) = commit_prebuilt_triplet(fixture.path());
+        fs::write(
+            fixture.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"changed-after-build\"]\n",
+        )
+        .expect("change compiled source");
+        run_git(fixture.path(), &["add", "Cargo.toml"]);
+        run_git(
+            fixture.path(),
+            &[
+                "-c",
+                "user.name=NY Test",
+                "-c",
+                "user.email=ny@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "forbidden source drift",
+            ],
+        );
+
+        let error = validate_optional_prebuilt(fixture.path())
+            .expect_err("artifact descendant with source drift must fail")
+            .to_string();
+        assert!(
+            error.contains("outside the exact prebuilt triplet"),
+            "{error}"
+        );
+        assert!(error.contains("Cargo.toml"), "{error}");
+        assert_ne!(
+            run_git(fixture.path(), &["rev-parse", "HEAD"]),
+            source_commit
+        );
+    }
+
+    #[test]
+    fn unreviewed_untracked_package_input_fails_closed() {
+        let fixture = make_prebuilt_fixture(TEST_AY_COMMIT, 62);
+        let relative = "crates/ny-cli/src/unreviewed_release_input.rs";
+        fs::create_dir_all(
+            fixture
+                .path()
+                .join(relative)
+                .parent()
+                .expect("input parent"),
+        )
+        .expect("create input parent");
+        fs::write(fixture.path().join(relative), "pub struct Surprise;\n")
+            .expect("write unreviewed input");
+
+        let error = package_file_list(fixture.path())
+            .expect_err("unreviewed untracked package input must fail")
+            .to_string();
+        assert!(error.contains("unreviewed untracked file"));
+        assert!(error.contains(relative));
+    }
+
+    #[test]
     fn completely_absent_prebuilt_keeps_source_fallback() {
         let fixture = make_prebuilt_fixture(TEST_AY_COMMIT, 62);
         for relative in PREBUILT_FILES {
@@ -1365,6 +1857,31 @@ mod tests {
         assert!(validate_optional_prebuilt(fixture.path())
             .expect("absence is supported")
             .is_none());
+    }
+
+    #[test]
+    fn source_only_tarball_carries_exact_commit_and_lock_identity() {
+        let fixture = make_prebuilt_fixture(TEST_AY_COMMIT, 62);
+        for relative in PREBUILT_FILES {
+            fs::remove_file(fixture.path().join(relative)).expect("remove fixture member");
+        }
+        let included = package_file_list(fixture.path()).expect("source-only package list");
+        let output = fixture.path().join("source-only-submission.tar.gz");
+        write_tarball(fixture.path(), &output, &included).expect("write source-only tarball");
+
+        let archived = Command::new("tar")
+            .args(["-xOzf"])
+            .arg(&output)
+            .arg(SOURCE_PROVENANCE)
+            .output()
+            .expect("extract source provenance");
+        assert!(archived.status.success());
+        let expected = format!(
+            "schema={SOURCE_PROVENANCE_SCHEMA}\nny_commit={}\ncargo_lock_sha256={}\n",
+            run_git(fixture.path(), &["rev-parse", "HEAD"]),
+            sha256_file(&fixture.path().join("Cargo.lock")).expect("lock hash")
+        );
+        assert_eq!(archived.stdout, expected.as_bytes());
     }
 
     #[test]
@@ -1623,6 +2140,19 @@ mod tests {
             assert!(archived.status.success());
             assert_eq!(archived.stdout, expected[relative]);
         }
+        let source = Command::new("tar")
+            .args(["-xOzf"])
+            .arg(&output)
+            .arg(SOURCE_PROVENANCE)
+            .output()
+            .expect("extract source marker");
+        assert!(source.status.success());
+        assert!(String::from_utf8(source.stdout)
+            .expect("source marker UTF-8")
+            .contains(&format!(
+                "ny_commit={}\n",
+                run_git(fixture.path(), &["rev-parse", "HEAD"])
+            )));
     }
 
     #[test]

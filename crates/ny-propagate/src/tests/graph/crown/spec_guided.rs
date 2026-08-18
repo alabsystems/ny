@@ -119,9 +119,9 @@ fn test_spec_guided_crown_classification_at_least_as_tight() {
         let x = arr1(&[t0, t1]);
 
         // Forward pass
-        let h1: Array1<f32> = linear1_layer.weight.dot(&x) + linear1_layer.bias.as_ref().unwrap();
+        let h1: Array1<f32> = linear1_layer.weight().dot(&x) + linear1_layer.bias().unwrap();
         let h2 = h1.mapv(|v| v.max(0.0)); // ReLU
-        let y: Array1<f32> = linear2_layer.weight.dot(&h2) + linear2_layer.bias.as_ref().unwrap();
+        let y: Array1<f32> = linear2_layer.weight().dot(&h2) + linear2_layer.bias().unwrap();
 
         // Compute Y_0 - Y_1
         let spec_value = y[0] - y[1];
@@ -247,9 +247,9 @@ fn test_spec_guided_crown_multiclass_classification() {
         let t1 = (i * 31 % 100) as f32 / 100.0;
         let x = arr1(&[t0, t1]);
 
-        let h1: Array1<f32> = linear1_layer.weight.dot(&x) + linear1_layer.bias.as_ref().unwrap();
+        let h1: Array1<f32> = linear1_layer.weight().dot(&x) + linear1_layer.bias().unwrap();
         let h2 = h1.mapv(|v| v.max(0.0));
-        let y: Array1<f32> = linear2_layer.weight.dot(&h2) + linear2_layer.bias.as_ref().unwrap();
+        let y: Array1<f32> = linear2_layer.weight().dot(&h2) + linear2_layer.bias().unwrap();
 
         // Check both specs
         let spec_0 = y[0] - y[1]; // Y_0 - Y_1

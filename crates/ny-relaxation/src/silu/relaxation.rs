@@ -8,8 +8,8 @@
 //! Reference: designs/2026-02-08-silu-crown-relaxation.md
 
 use super::math::{
-    silu_chord, silu_critical_point, silu_derivative, silu_eval, silu_eval_f64,
-    silu_inflection_points, silu_min_max, silu_second_derivative, silu_tangent, silu_tangent_raw,
+    silu_chord, silu_critical_point, silu_derivative, silu_eval_f64, silu_inflection_points,
+    silu_min_max, silu_second_derivative, silu_tangent, silu_tangent_raw,
 };
 use crate::types::LinearRelaxation;
 use ny_core::{nan_propagating_max, nan_propagating_min};
@@ -23,26 +23,14 @@ pub fn silu_sound_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         return LinearRelaxation::nan_fallback();
     }
     if l == f32::NEG_INFINITY {
-        let fu = silu_eval(u);
-        let f_crit = silu_eval(silu_critical_point());
-        let min_val = nan_propagating_min(nan_propagating_min(f_crit, fu), 0.0);
-        let max_val = nan_propagating_max(fu, 0.0);
+        let (min_val, max_val) = silu_min_max(l, u);
         return LinearRelaxation::new(0.0, min_val, 0.0, max_val);
     }
 
     if (u - l).abs() < 1e-8 {
-        // Near-point interval: constant bounds from BOTH endpoints (plus the
-        // interior minimum when the critical point falls inside). A constant
-        // band at silu(l) alone is unsound by up to an ulp when u != l.
-        // Matches production (`ny_propagate::layers::activations::silu`).
-        let y_l = silu_eval(l);
-        let y_u = silu_eval(u);
-        let mut lo = nan_propagating_min(y_l, y_u);
-        let hi = nan_propagating_max(y_l, y_u);
-        let x_crit = silu_critical_point();
-        if l <= x_crit && x_crit <= u {
-            lo = nan_propagating_min(lo, silu_eval(x_crit));
-        }
+        // Constant bounds must be directed outward; nearest-f32 endpoint
+        // evaluations can miss the real SiLU value by half an output ULP.
+        let (lo, hi) = silu_min_max(l, u);
         return LinearRelaxation::new(0.0, lo, 0.0, hi);
     }
 

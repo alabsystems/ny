@@ -10,12 +10,16 @@ Conv2d + ReLU + MaxPool2d network.
 """
 
 import json
+import re
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Generate a simple CNN with MaxPool for testing
-def create_test_cnn_onnx():
+def create_test_cnn_onnx(output_dir: Path):
     """Create a test CNN ONNX model: Conv2d -> ReLU -> MaxPool2d -> Flatten -> Linear."""
     try:
         import onnx
@@ -44,8 +48,8 @@ def create_test_cnn_onnx():
         dummy_input = torch.randn(1, 1, 8, 8)
 
         # Save as TorchScript first
-        ts_path = "tests/models/test_cnn_maxpool.pt"
-        Path(ts_path).parent.mkdir(parents=True, exist_ok=True)
+        ts_path = output_dir / "test_cnn_maxpool.pt"
+        output_dir.mkdir(parents=True, exist_ok=True)
         with torch.no_grad():
             traced = torch.jit.trace(model, dummy_input)
             torch.jit.save(traced, ts_path)
@@ -116,7 +120,7 @@ def create_test_cnn_onnx():
         # Create model
         model_proto = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 11)])
 
-        onnx_path = "tests/models/test_cnn_maxpool.onnx"
+        onnx_path = output_dir / "test_cnn_maxpool.onnx"
         onnx.save(model_proto, onnx_path)
         onnx.checker.check_model(model_proto)
         print(f"Saved ONNX model to {onnx_path}")
@@ -128,11 +132,11 @@ def create_test_cnn_onnx():
         return None, None
 
 
-def test_maxpool_verification(onnx_path):
+def test_maxpool_verification(onnx_path: Path, output_dir: Path) -> bool:
     """Test verification of CNN with MaxPool."""
 
     # Create a simple VNN-LIB property
-    vnnlib_path = "tests/models/test_cnn_maxpool.vnnlib"
+    vnnlib_path = output_dir / "test_cnn_maxpool.vnnlib"
     with open(vnnlib_path, 'w') as f:
         # Input variables for 1x8x8 = 64 inputs
         for i in range(64):
@@ -158,10 +162,11 @@ def test_maxpool_verification(onnx_path):
          "verify", onnx_path,
          "--property", vnnlib_path,
          "--method", "ibp",
-         "--output-format", "json"],
+         "--json",
+         "--allow-unknown"],
         capture_output=True,
         text=True,
-        cwd="."
+        cwd=REPO_ROOT,
     )
 
     print("\n=== ny verify output ===")
@@ -169,15 +174,32 @@ def test_maxpool_verification(onnx_path):
     if result.stderr:
         print("stderr:", result.stderr)
 
-    # Parse result
+    if result.returncode != 0:
+        print(f"FAIL: ny verify exited with code {result.returncode}")
+        return False
+
     try:
         output = json.loads(result.stdout)
-        print(f"\nVerification status: {output.get('status', 'unknown')}")
-        print(f"Method: {output.get('method', 'unknown')}")
-        if 'bounds' in output:
-            print(f"Output bounds: {output['bounds']}")
-    except json.JSONDecodeError:
-        print("Could not parse JSON output")
+    except json.JSONDecodeError as exc:
+        print(f"FAIL: Could not parse JSON output: {exc}")
+        return False
+
+    status = output.get("status")
+    bounds = output.get("output_bounds")
+    print(f"\nVerification status: {status or 'missing'}")
+    print(f"Method: {output.get('method', 'missing')}")
+    if status not in {"verified", "violated", "unknown"}:
+        print("FAIL: JSON output did not contain a recognized status")
+        return False
+    if output.get("method") != "ibp":
+        print("FAIL: JSON output did not report the requested IBP method")
+        return False
+    if not isinstance(bounds, list) or not bounds:
+        print("FAIL: JSON output did not contain output bounds")
+        return False
+
+    print(f"Output bounds: {bounds}")
+    return True
 
 
 def test_maxpool_ibp():
@@ -189,7 +211,7 @@ def test_maxpool_ibp():
          "test_maxpool2d", "--nocapture"],
         capture_output=True,
         text=True,
-        cwd="."
+        cwd=REPO_ROOT,
     )
 
     print("=== MaxPool2d Unit Tests ===")
@@ -198,32 +220,56 @@ def test_maxpool_ibp():
         print("stderr:", result.stderr)
         return False
 
-    return "6 passed" in result.stdout
+    passed_counts = [
+        int(count)
+        for count in re.findall(r"test result: ok\. (\d+) passed", result.stdout)
+    ]
+    if not passed_counts or max(passed_counts) == 0:
+        print("FAIL: cargo succeeded without running a matching MaxPool2d test")
+        return False
+    return True
 
 
-def main():
+def main() -> int:
     print("Testing MaxPool2d verification support\n")
+    results: list[tuple[str, str]] = []
 
     # Test 1: Run unit tests
     print("1. Running MaxPool2d unit tests...")
     if test_maxpool_ibp():
         print("   PASS: All MaxPool2d unit tests passed\n")
+        results.append(("MaxPool2d Rust unit tests", "PASS"))
     else:
         print("   FAIL: Unit tests failed\n")
-        return
+        results.append(("MaxPool2d Rust unit tests", "FAIL"))
 
     # Test 2: Create and verify CNN with MaxPool
     print("2. Creating test CNN with MaxPool2d...")
-    onnx_path, ts_path = create_test_cnn_onnx()
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            onnx_path, _ = create_test_cnn_onnx(output_dir)
 
-    if onnx_path:
-        print("\n3. Testing verification with MaxPool2d...")
-        test_maxpool_verification(onnx_path)
-    else:
-        print("   Skipping ONNX verification test (PyTorch not available)")
+            if onnx_path:
+                print("\n3. Testing verification with MaxPool2d...")
+                passed = test_maxpool_verification(onnx_path, output_dir)
+                results.append(("MaxPool2d ONNX verification", "PASS" if passed else "FAIL"))
+            else:
+                print("   SKIP: PyTorch/ONNX not available")
+                results.append(("MaxPool2d ONNX verification", "SKIP"))
+    except Exception as exc:
+        print(f"   FAIL: Model writer or verification raised an exception: {exc}")
+        results.append(("MaxPool2d ONNX verification", "FAIL"))
 
-    print("\nDone!")
+    passed = sum(status == "PASS" for _, status in results)
+    failed = sum(status == "FAIL" for _, status in results)
+    skipped = sum(status == "SKIP" for _, status in results)
+    print("\nSummary:")
+    for name, status in results:
+        print(f"  {name}: {status}")
+    print(f"  Total: {passed} passed, {failed} failed, {skipped} skipped")
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

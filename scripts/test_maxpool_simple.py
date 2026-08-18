@@ -5,19 +5,26 @@
 
 """Simple test of MaxPool2d verification without Flatten complications."""
 
+import json
+import math
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
-def create_simple_maxpool_onnx():
+
+def create_simple_maxpool_onnx(output_dir: Path):
     """Create Conv -> ReLU -> MaxPool model (no flatten/linear)."""
     import onnx
     from onnx import TensorProto, helper, numpy_helper
 
     # Simple weights
-    conv_weight = np.random.randn(2, 1, 3, 3).astype(np.float32) * 0.1
+    rng = np.random.default_rng(0)
+    conv_weight = rng.standard_normal((2, 1, 3, 3)).astype(np.float32) * 0.1
     conv_bias = np.zeros(2).astype(np.float32)
 
     conv_w_init = numpy_helper.from_array(conv_weight, "conv_weight")
@@ -45,8 +52,7 @@ def create_simple_maxpool_onnx():
 
     model_proto = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 11)])
 
-    onnx_path = "tests/models/conv_relu_maxpool.onnx"
-    Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
+    onnx_path = output_dir / "conv_relu_maxpool.onnx"
     onnx.save(model_proto, onnx_path)
     onnx.checker.check_model(model_proto)
     print(f"Created {onnx_path}")
@@ -54,10 +60,10 @@ def create_simple_maxpool_onnx():
     return onnx_path, conv_weight
 
 
-def create_vnnlib(output_dim):
+def create_vnnlib(output_dim, output_dir: Path):
     """Create simple VNN-LIB property."""
     # 64 inputs (1*8*8), output_dim outputs
-    vnnlib_path = "tests/models/conv_relu_maxpool.vnnlib"
+    vnnlib_path = output_dir / "conv_relu_maxpool.vnnlib"
     with open(vnnlib_path, 'w') as f:
         for i in range(64):
             f.write(f"(declare-const X_{i} Real)\n")
@@ -76,12 +82,13 @@ def create_vnnlib(output_dim):
     return vnnlib_path
 
 
-def run_ny_verify(onnx_path, vnnlib_path, method="ibp"):
+def run_ny_verify(onnx_path, vnnlib_path, method="ibp", expected_outputs=32):
     """Run ny verify and parse output."""
     result = subprocess.run(
         ["cargo", "run", "--release", "-p", "ny-cli", "--",
-         "verify", onnx_path, "--property", vnnlib_path, "--method", method],
-        capture_output=True, text=True
+         "verify", onnx_path, "--property", vnnlib_path, "--method", method,
+         "--json", "--require-sound"],
+        capture_output=True, text=True, cwd=REPO_ROOT
     )
 
     print(f"\n=== ny verify ({method}) ===")
@@ -89,28 +96,90 @@ def run_ny_verify(onnx_path, vnnlib_path, method="ibp"):
     if result.stderr and "Compiling" not in result.stderr:
         print("stderr:", result.stderr[:500])
 
-    return result.returncode == 0
+    json_start = result.stdout.find("{")
+    try:
+        if json_start < 0:
+            raise json.JSONDecodeError("no JSON object", result.stdout, 0)
+        output = json.loads(result.stdout[json_start:])
+    except json.JSONDecodeError:
+        print("FAIL: ny did not return JSON")
+        return False
+
+    status = output.get("property_status", output.get("status"))
+    aliases = {"safe": "verified", "violated": "falsified"}
+    status = str(status).lower()
+    status = aliases.get(status, status)
+    expected_codes = {
+        "verified": 0,
+        "falsified": 1,
+        "unknown": 2,
+        "timeout": 3,
+    }
+    bounds = output.get("output_bounds")
+    soundness = output.get("soundness")
+    actual_method = (
+        str(output.get("actual_method", ""))
+        .lower()
+        .replace("-", "")
+        .replace("_", "")
+    )
+    allowed_actual_methods = {"ibp": {"ibp"}, "crown": {"crown", "ibp"}}
+    try:
+        bounds_valid = (
+            isinstance(bounds, list)
+            and len(bounds) == expected_outputs
+            and all(
+                math.isfinite(float(bound["lower"]))
+                and math.isfinite(float(bound["upper"]))
+                and float(bound["lower"]) <= float(bound["upper"])
+                for bound in bounds
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        bounds_valid = False
+    passed = (
+        status in expected_codes
+        and result.returncode == expected_codes[status]
+        and isinstance(soundness, dict)
+        and soundness.get("mode") == "sound"
+        and output.get("method") == method
+        and actual_method in allowed_actual_methods.get(method, set())
+        and bounds_valid
+    )
+    if not passed:
+        print(
+            f"FAIL: invalid ny result contract "
+            f"(code={result.returncode}, status={status!r}, "
+            f"bounds={len(bounds) if isinstance(bounds, list) else 'invalid'}/"
+            f"{expected_outputs})"
+        )
+    return passed
 
 
-def main():
+def main() -> int:
     print("Testing MaxPool2d verification (simple model)\n")
 
-    # Create model
-    onnx_path, conv_weight = create_simple_maxpool_onnx()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir)
 
-    # Create property (output is 2*4*4 = 32 elements)
-    vnnlib_path = create_vnnlib(32)
+        # Create model
+        onnx_path, _ = create_simple_maxpool_onnx(output_dir)
 
-    # Test IBP
-    print("\nRunning IBP verification...")
-    run_ny_verify(onnx_path, vnnlib_path, "ibp")
+        # Create property (output is 2*4*4 = 32 elements)
+        vnnlib_path = create_vnnlib(32, output_dir)
 
-    # Test CROWN (falls back to IBP for MaxPool)
-    print("\nRunning CROWN verification...")
-    run_ny_verify(onnx_path, vnnlib_path, "crown")
+        # Test IBP
+        print("\nRunning IBP verification...")
+        ibp_passed = run_ny_verify(onnx_path, vnnlib_path, "ibp")
 
-    print("\nDone!")
+        # Test CROWN (falls back to IBP for MaxPool)
+        print("\nRunning CROWN verification...")
+        crown_passed = run_ny_verify(onnx_path, vnnlib_path, "crown")
+
+    failed = int(not ibp_passed) + int(not crown_passed)
+    print(f"\nSummary: {2 - failed} passed, {failed} failed")
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

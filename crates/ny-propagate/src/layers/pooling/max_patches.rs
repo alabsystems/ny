@@ -23,7 +23,7 @@ use ny_core::{NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use crate::bounds::nan_propagating_max;
-use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
+use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds};
 use crate::bounds::patches_ops::nearest_neighbor_upsample_last2;
 use crate::layers::common::PatchesPropagation;
 
@@ -49,6 +49,17 @@ impl PatchesPropagation for MaxPool2dLayer {
                 "MaxPool Patches requires kernel_size == stride".into(),
             ));
         }
+        // This legacy pool kernel is affine-only. Reject Anchored in O(1)
+        // before common validation scans its origin axes.
+        let affine_geometry = bounds
+            .lower_a
+            .geometry
+            .require_affine("MaxPool Patches backward")?;
+        bounds
+            .upper_a
+            .geometry
+            .require_affine("MaxPool Patches backward")?;
+        bounds.lower_a.validate_common_geometry(&bounds.upper_a)?;
 
         let (pool_kh, pool_kw) = self.kernel_size;
         let (pool_sh, pool_sw) = self.stride;
@@ -171,8 +182,10 @@ impl PatchesPropagation for MaxPool2dLayer {
                                bias_vec: &ndarray::Array1<f32>,
                                is_lower: bool|
          -> Result<(PatchesData, ndarray::Array1<f32>)> {
+            let (in_sh, in_sw) = affine_geometry.stride();
+            let (in_pad_left, in_pad_right, in_pad_top, in_pad_bottom) = affine_geometry.padding();
             let materialized = if patches_data.identity {
-                patches_data.materialize_identity()
+                patches_data.try_materialize_identity()?
             } else {
                 patches_data.clone()
             };
@@ -267,10 +280,6 @@ impl PatchesPropagation for MaxPool2dLayer {
                     }
                 }
             }
-
-            // Geometry of the INCOMING patches (maps a tap to the MaxPool OUTPUT).
-            let (in_sh, in_sw) = patches_data.stride;
-            let (in_pad_left, _in_pad_right, in_pad_top, _in_pad_bottom) = patches_data.padding;
 
             // Crash guard (mirrors BatchNorm/Conv2d patches-bias fix): the loops below
             // index new_bias by 0..oc*oh_p*ow_p (6D: one slot per output position) or
@@ -525,15 +534,31 @@ impl PatchesPropagation for MaxPool2dLayer {
             let upsampled = nearest_neighbor_upsample_last2(patches_tensor, pool_kh, pool_kw)?;
 
             // Steps 4-5: Apply winner_d slope via unfolding and element-wise multiply.
-            let (sh, sw) = patches_data.stride;
-            let (pad_left, _pad_right, pad_top, _pad_bottom) = patches_data.padding;
-            let new_sh = sh * pool_sh;
-            let new_sw = sw * pool_sw;
-            let new_pad_top = pad_top * pool_sh + pool_ph;
-            let new_pad_left = pad_left * pool_sw + pool_pw;
+            let compose = |value: usize, scale: usize, add: usize, label: &str| {
+                value
+                    .checked_mul(scale)
+                    .and_then(|scaled| scaled.checked_add(add))
+                    .ok_or_else(|| {
+                        NyError::InvalidSpec(format!(
+                            "MaxPool Patches composed {label} overflows usize"
+                        ))
+                    })
+            };
+            let new_sh = compose(in_sh, pool_sh, 0, "height stride")?;
+            let new_sw = compose(in_sw, pool_sw, 0, "width stride")?;
+            let new_pad_left = compose(in_pad_left, pool_sw, pool_pw, "left padding")?;
+            let new_pad_right = compose(in_pad_right, pool_sw, pool_pw, "right padding")?;
+            let new_pad_top = compose(in_pad_top, pool_sh, pool_ph, "top padding")?;
+            let new_pad_bottom = compose(in_pad_bottom, pool_sh, pool_ph, "bottom padding")?;
 
-            let new_kh = kh * pool_kh;
-            let new_kw = kw * pool_kw;
+            let new_kh = kh.checked_mul(pool_kh).ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "MaxPool Patches composed kernel height overflows usize".into(),
+                )
+            })?;
+            let new_kw = kw.checked_mul(pool_kw).ok_or_else(|| {
+                NyError::InvalidSpec("MaxPool Patches composed kernel width overflows usize".into())
+            })?;
             let mut result_patches = if explicit_rows {
                 ArrayD::<f32>::zeros(IxDyn(&[spec_rows, oc, oh_p, ow_p, ic, new_kh, new_kw]))
             } else {
@@ -633,12 +658,9 @@ impl PatchesPropagation for MaxPool2dLayer {
                 // Sparse stays None via coeff_err_ok above.
                 coeff_err: old_err.cloned(),
                 patches: Some(result_patches),
-                stride: (new_sh, new_sw),
-                padding: (
-                    new_pad_left,
-                    patches_data.padding.1 * pool_sw + pool_pw, // right
-                    new_pad_top,
-                    patches_data.padding.3 * pool_sh + pool_ph, // bottom
+                geometry: PatchGeometry::affine(
+                    (new_sh, new_sw),
+                    (new_pad_left, new_pad_right, new_pad_top, new_pad_bottom),
                 ),
                 identity: false,
                 output_shape: patches_data.output_shape,
@@ -733,13 +755,43 @@ mod coeff_err_7d_tests {
         PatchesData {
             coeff_err: err.map(Array1::from_vec),
             patches: Some(ArrayD::from_shape_vec(IxDyn(&[2, 1, 1, 4, 1, 1, 1]), vals).unwrap()),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
             identity: false,
             output_shape: (1, 1, 4),
             input_shape: (1, 1, 4),
             unstable_idx: None,
         }
+    }
+
+    #[test]
+    fn maxpool_anchored_geometry_refuses_before_relaxation_arithmetic() {
+        let (maxpool, pre) = maxpool_fixture();
+        let mut bounds = PatchesLinearBounds {
+            row_count: 2,
+            lower_a: make_side_7d(vec![0.25, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0], None),
+            lower_b: Array1::from_vec(vec![0.125, -0.25]),
+            upper_a: make_side_7d(vec![-0.75, 0.5, -0.25, 1.0, -1.25, 1.5, -1.75, 2.0], None),
+            upper_b: Array1::from_vec(vec![-0.375, 0.5]),
+        };
+        let anchored = PatchGeometry::anchored(vec![0], vec![0, 1, 2, 3]).unwrap();
+        bounds.lower_a.geometry = anchored.clone();
+        bounds.upper_a.geometry = anchored;
+
+        let lower_patches_before = bounds.lower_a.patches.clone();
+        let upper_patches_before = bounds.upper_a.patches.clone();
+        let lower_bias_before = bounds.lower_b.clone();
+        let upper_bias_before = bounds.upper_b.clone();
+
+        let result = maxpool.propagate_patches_with_bounds(&bounds, &pre);
+        assert!(matches!(
+            result,
+            Err(NyError::UnsupportedConfiguration(message))
+                if message.contains("MaxPool Patches backward")
+        ));
+        assert_eq!(bounds.lower_a.patches, lower_patches_before);
+        assert_eq!(bounds.upper_a.patches, upper_patches_before);
+        assert_eq!(bounds.lower_b, lower_bias_before);
+        assert_eq!(bounds.upper_b, upper_bias_before);
     }
 
     /// Independent bitwise replica of the 7D bias fold + discharge for one spec
@@ -1018,8 +1070,7 @@ mod coeff_err_7d_tests {
             patches: Some(
                 ArrayD::from_shape_vec(IxDyn(&[3, 1, 1, 2, 1, 2, 2]), vals.clone()).unwrap(),
             ),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
             identity: false,
             output_shape: (1, 1, 2),
             input_shape: (1, 2, 3),
@@ -1060,8 +1111,7 @@ mod coeff_err_7d_tests {
         let make_sparse = || PatchesData {
             coeff_err: None,
             patches: Some(ArrayD::from_elem(IxDyn(&[2, 1, 1, 1]), 1.0f32)),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
             identity: false,
             output_shape: (1, 1, 4),
             input_shape: (1, 1, 4),
@@ -1226,8 +1276,7 @@ mod bitwise_regression_pins {
         let make_side = |vals: Vec<f32>, err: Vec<f32>| PatchesData {
             coeff_err: Some(Array1::from_vec(err)),
             patches: Some(ArrayD::from_shape_vec(IxDyn(&[1, 1, 4, 1, 1, 1]), vals).unwrap()),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
             identity: false,
             output_shape: (1, 1, 4),
             input_shape: (1, 1, 4),
@@ -1259,8 +1308,10 @@ mod bitwise_regression_pins {
 
         // Metadata composition (must not move either).
         assert_eq!(pb.row_count, 4);
-        assert_eq!(pb.lower_a.stride, (2, 2));
-        assert_eq!(pb.lower_a.padding, (0, 0, 0, 0));
+        assert_eq!(
+            pb.lower_a.geometry,
+            PatchGeometry::affine((2, 2), (0, 0, 0, 0))
+        );
         assert_eq!(pb.lower_a.output_shape, (1, 1, 4));
         assert_eq!(pb.lower_a.input_shape, (1, 2, 8));
         assert_eq!(

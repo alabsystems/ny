@@ -268,8 +268,8 @@ def create_conv_relu():
 
 
 def create_matmul_transpose_b_const():
-    """Create MatMul with constant weight and transpose_b attribute."""
-    # Input: (1, 3), Weight: (2, 3), transpose_b=1 => output: (1, 2)
+    """Create MatMul with an explicit standard-ONNX weight transpose."""
+    # Input: (1, 3), Transpose(Weight): (3, 2) => output: (1, 2)
     weight_data = np.array([
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0],
@@ -277,18 +277,23 @@ def create_matmul_transpose_b_const():
 
     weight_init = numpy_helper.from_array(weight_data, name="weight")
 
+    transpose_node = helper.make_node(
+        "Transpose",
+        inputs=["weight"],
+        outputs=["weight_t"],
+        perm=[1, 0],
+    )
     matmul_node = helper.make_node(
         "MatMul",
-        inputs=["input", "weight"],
+        inputs=["input", "weight_t"],
         outputs=["output"],
-        transpose_b=1,
     )
 
     input_tensor = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3])
     output_tensor = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2])
 
     graph = helper.make_graph(
-        [matmul_node],
+        [transpose_node, matmul_node],
         "matmul_transpose_b_const",
         [input_tensor],
         [output_tensor],
@@ -382,7 +387,8 @@ def create_minimal_attention_core():
     q_matmul = helper.make_node("MatMul", ["input", "wq"], ["q"])
     k_matmul = helper.make_node("MatMul", ["input", "wk"], ["k"])
     v_matmul = helper.make_node("MatMul", ["input", "wv"], ["v"])
-    scores = helper.make_node("MatMul", ["q", "k"], ["scores"], transpose_b=1)
+    k_transpose = helper.make_node("Transpose", ["k"], ["k_t"], perm=[1, 0])
+    scores = helper.make_node("MatMul", ["q", "k_t"], ["scores"])
     softmax = helper.make_node("Softmax", ["scores"], ["probs"])
     context = helper.make_node("MatMul", ["probs", "v"], ["output"])
 
@@ -390,7 +396,7 @@ def create_minimal_attention_core():
     output_tensor = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2])
 
     graph = helper.make_graph(
-        [q_matmul, k_matmul, v_matmul, scores, softmax, context],
+        [q_matmul, k_matmul, v_matmul, k_transpose, scores, softmax, context],
         "minimal_attention_core",
         [input_tensor],
         [output_tensor],

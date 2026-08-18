@@ -20,7 +20,7 @@ use crate::GraphNetwork;
 use super::super::shared::state::GraphBabLifecycle;
 use super::batching::{
     bound_deferred_domains_batch_with_metrics, input_split_loop_batch_size, pop_input_domain_batch,
-    should_run_adv_check_on_batch, try_adv_check_on_batch,
+    root_map_spec_obj_bounds, should_run_adv_check_on_batch, try_adv_check_on_batch,
 };
 use super::mul_binary::maybe_optimize_mul_binary_alphas;
 use super::root_bounds::collect_input_split_root_node_bounds;
@@ -36,6 +36,21 @@ mod process_batch;
 mod screen_child;
 
 use self::process_batch::process_single_objective_domain_batch;
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_SPEC_CROWN_ENTRY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_root_spec_crown_entry_count() {
+    ROOT_SPEC_CROWN_ENTRY_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn root_spec_crown_entry_count() -> usize {
+    ROOT_SPEC_CROWN_ENTRY_COUNT.get()
+}
 
 impl BetaCrownVerifier {
     pub fn verify_graph_input_split(
@@ -112,10 +127,13 @@ impl BetaCrownVerifier {
                 .phase_budget
                 .initial_bounds_fraction
                 .clamp(0.0, 1.0);
-            Some(now + bab_timeout.mul_f32(frac))
+            Some(GraphBabLifecycle::fail_closed_deadline(
+                now,
+                bab_timeout.mul_f32(frac),
+            ))
         };
         // Per-domain deadline for CROWN backward passes in the BaB loop.
-        let crown_deadline = Some(now + bab_timeout);
+        let crown_deadline = Some(GraphBabLifecycle::fail_closed_deadline(now, bab_timeout));
         let mut domains_verified_by_ibp = 0usize;
         let mut domains_screened_by_crown = 0usize;
         let warmup_start = Instant::now();
@@ -137,6 +155,44 @@ impl BetaCrownVerifier {
                 "Graph input split warmup: root intermediate bounds finished in {:.3}s",
                 warmup_start.elapsed().as_secs_f64()
             );
+        }
+
+        // The root collector has already paid for a certified output box. A
+        // direct outward-rounded projection can be decisive even when another
+        // spec-CROWN backward would be looser. Missing/malformed/non-decisive
+        // maps simply retain the historical warmup below.
+        if let Some((root_lower, root_upper)) = root_node_bounds
+            .as_ref()
+            .and_then(|root_map| root_map_spec_obj_bounds(graph, root_map, &spec_matrix))
+            .and_then(|bounds| bounds.into_iter().next())
+        {
+            if self
+                .config
+                .domain_is_verified(root_lower, root_upper, threshold)
+            {
+                info!(
+                    "Graph input split: certified root-map output box verifies the root; skipping fresh spec-CROWN and child bounding"
+                );
+                lifecycle.domains_explored = 1;
+                lifecycle.domains_verified = 1;
+                return Ok(lifecycle.build_result_with_bounds(
+                    BabVerificationStatus::Verified,
+                    scalar_output_bounds(root_lower, root_upper)?,
+                ));
+            }
+            if self
+                .config
+                .domain_is_violation(root_lower, root_upper, threshold)
+            {
+                info!(
+                    "Graph input split: certified root-map output box proves a root violation; skipping fresh spec-CROWN and child bounding"
+                );
+                lifecycle.domains_explored = 1;
+                return Ok(lifecycle.build_result_with_bounds(
+                    BabVerificationStatus::potential_violation(),
+                    scalar_output_bounds(root_lower, root_upper)?,
+                ));
+            }
         }
 
         // Phase 4 (#3439): MulBinary SPSA alpha optimization.
@@ -280,6 +336,8 @@ impl BetaCrownVerifier {
         }
 
         // Root domain bounds via shared CROWN-or-IBP dispatch (#3453).
+        #[cfg(test)]
+        ROOT_SPEC_CROWN_ENTRY_COUNT.set(ROOT_SPEC_CROWN_ENTRY_COUNT.get() + 1);
         let (root_lower, root_upper, root_linear) = {
             let (bounds, linear) = compute_crown_or_ibp_bounds(
                 graph,
@@ -353,7 +411,7 @@ impl BetaCrownVerifier {
         {
             lifecycle.domains_explored = 1;
             return Ok(lifecycle.build_result_with_bounds(
-                BabVerificationStatus::PotentialViolation,
+                BabVerificationStatus::potential_violation(),
                 scalar_output_bounds(root_lower, root_upper)?,
             ));
         }
@@ -438,8 +496,17 @@ impl BetaCrownVerifier {
 
             // adv_check: PGD probe for early SAT detection. Ref:
             // batch_branch_and_bound.py:81-90 and attack_in_input_split.py
-            if should_run_adv_check_on_batch(lifecycle.domains_explored, self.config.adv_check)
-                && try_adv_check_on_batch(
+            //
+            // #advcheck-witness: the probe ran a TRUE concrete forward on a
+            // point of the current SUB-box and found a genuine violation.
+            // Carry that point through the PotentialViolation so the post-BaB
+            // confirmer verifies IT, rather than re-searching the whole ROOT
+            // box for a point we already held (which routinely failed and
+            // downgraded a validated candidate to Unknown). The witness is a
+            // candidate only -- the confirmer re-evaluates it and the trusted
+            // ONNX-Runtime gate still decides every scored `sat`.
+            if should_run_adv_check_on_batch(lifecycle.domains_explored, self.config.adv_check) {
+                if let Some(witness) = try_adv_check_on_batch(
                     graph,
                     &domains,
                     objective,
@@ -448,13 +515,15 @@ impl BetaCrownVerifier {
                     crown_deadline,
                     lifecycle.domains_explored as u64,
                     engine,
-                )?
-            {
-                info!(
-                    "adv_check: PGD found counterexample from picked batch at domain {}",
-                    lifecycle.domains_explored,
-                );
-                return Ok(lifecycle.build_result(BabVerificationStatus::PotentialViolation));
+                )? {
+                    info!(
+                        "adv_check: PGD found counterexample from picked batch at domain {} \
+                         (carrying the concrete witness to the confirmer)",
+                        lifecycle.domains_explored,
+                    );
+                    return Ok(lifecycle
+                        .build_result(BabVerificationStatus::potential_violation_with(witness)));
+                }
             }
 
             if let Some(result) = process_single_objective_domain_batch(

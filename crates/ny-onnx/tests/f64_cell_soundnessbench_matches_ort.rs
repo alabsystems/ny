@@ -1,6 +1,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+
+#![cfg(feature = "external-vnncomp")]
 //
 // #sb-rebank lever 2 acceptance: the exact-f64 witness gate must be LIVE on the
 // soundnessbench net.
@@ -22,7 +24,6 @@
 //     allowance (ORT rounds each op to nearest f32; the enclosure bounds the
 //     REAL-arithmetic value, so they agree to f32 accumulation error ~1e-5,
 //     while a WRONG Flatten — any permutation/misindex — diverges at O(1)).
-
 #![cfg(feature = "ort")]
 
 use ndarray::{ArrayD, IxDyn};
@@ -45,11 +46,18 @@ impl Rng {
 }
 
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn f64_cell_gate_is_live_and_encloses_ort_on_soundnessbench() {
-    if !std::path::Path::new(MODEL).exists() {
-        eprintln!("soundnessbench model not present; skipping");
-        return;
-    }
+    assert!(
+        std::path::Path::new(MODEL).is_file(),
+        "soundnessbench model fixture is missing at {MODEL}; \
+         run benchmarks/download_benchmarks.sh"
+    );
+    assert!(
+        std::path::Path::new(VNNLIB).is_file(),
+        "soundnessbench VNN-LIB fixture is missing at {VNNLIB}; \
+         run benchmarks/download_benchmarks.sh"
+    );
 
     let spec = ny_onnx::vnnlib::load_vnnlib(VNNLIB).expect("vnnlib parses");
     let dim = spec.input_bounds.len();

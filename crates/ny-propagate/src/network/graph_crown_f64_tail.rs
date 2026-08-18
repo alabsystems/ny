@@ -358,6 +358,11 @@ pub(crate) fn repair_upper_plane(
 
 fn f64_tail_supports_layer(layer: &Layer) -> bool {
     match layer {
+        // #f64-tail-conv: Conv2d is the reason this walker could never run on the
+        // ResNet benchmarks (cifar100 / tinyimagenet / yolo) — every one of them
+        // is a conv DAG, so the walk declined at the first conv and the certified
+        // f64 replay was unreachable exactly where it is worth the most.
+        Layer::Conv2d(conv) => conv.dilation == (1, 1) && conv.input_shape.is_some(),
         Layer::Linear(_)
         | Layer::ReLU(_)
         | Layer::MulBinary(_)
@@ -1012,6 +1017,99 @@ fn backward_node_inner(
             }
             walk.push(ctx, parent, back_a, back_s)
         }
+        // #f64-tail-conv: one-row conv backward in f64. The signed row `a` is
+        // transposed through the kernel and the radius row `s` through |kernel|,
+        // exactly as the Linear arm does with `w` / `|w|` — a Conv2d IS a linear
+        // map, just with shared weights, so the same certified-envelope accounting
+        // applies verbatim.
+        //
+        // This replays ONE margin row end-to-end in f64, which is what makes it
+        // worth having: the patches route re-bounds its certified error at every
+        // layer and multiplies it by the kernel norm, so the error compounds
+        // geometrically (measured: 93-100% of the emitted error is that carry).
+        // A single end-to-end f64 replay has NO carry — its error is measured
+        // once, at the end.
+        Layer::Conv2d(conv) => {
+            let parent = unary()?;
+            let p_width = ctx.width_of(parent)?;
+            let (in_h, in_w) = conv.input_shape.ok_or(Decline)?;
+            if conv.dilation != (1, 1) {
+                return Err(Decline);
+            }
+            let ks = conv.kernel.shape();
+            if ks.len() != 4 {
+                return Err(Decline);
+            }
+            let (out_c, in_c_per_group, kh, kw) = (ks[0], ks[1], ks[2], ks[3]);
+            let groups = conv.groups;
+            if groups == 0 || !out_c.is_multiple_of(groups) {
+                return Err(Decline);
+            }
+            let (sh, sw) = conv.stride;
+            let (ph, pw) = conv.padding;
+            if sh == 0 || sw == 0 {
+                return Err(Decline);
+            }
+            let out_h = (in_h + 2 * ph).checked_sub(kh).ok_or(Decline)? / sh + 1;
+            let out_w = (in_w + 2 * pw).checked_sub(kw).ok_or(Decline)? / sw + 1;
+            let in_c = in_c_per_group * groups;
+            let ohw = out_h * out_w;
+            let ihw = in_h * in_w;
+            if width != out_c * ohw || p_width != in_c * ihw {
+                return Err(Decline);
+            }
+            let out_c_per_group = out_c / groups;
+
+            let mut back_a = vec![0.0f64; p_width];
+            let mut back_s = vec![0.0f64; p_width];
+            for g in 0..groups {
+                for oc_local in 0..out_c_per_group {
+                    let oc = g * out_c_per_group + oc_local;
+                    for oy in 0..out_h {
+                        for ox in 0..out_w {
+                            let o = oc * ohw + oy * out_w + ox;
+                            let (ai, si) = (a[o], s[o]);
+                            if ai == 0.0 && si == 0.0 {
+                                continue;
+                            }
+                            for ic_local in 0..in_c_per_group {
+                                let ic = g * in_c_per_group + ic_local;
+                                for ki in 0..kh {
+                                    let iy = (oy * sh + ki) as isize - ph as isize;
+                                    if iy < 0 || iy >= in_h as isize {
+                                        continue;
+                                    }
+                                    for kj in 0..kw {
+                                        let ix = (ox * sw + kj) as isize - pw as isize;
+                                        if ix < 0 || ix >= in_w as isize {
+                                            continue;
+                                        }
+                                        let w = f64::from(conv.kernel[[oc, ic_local, ki, kj]]);
+                                        if !w.is_finite() {
+                                            walk.poisoned = true;
+                                            return Ok(());
+                                        }
+                                        let idx = ic * ihw + iy as usize * in_w + ix as usize;
+                                        back_a[idx] += ai * w;
+                                        back_s[idx] += si * w.abs();
+                                    }
+                                }
+                            }
+                            if let Some(bias) = conv.bias.as_ref() {
+                                let bb = f64::from(bias[oc]);
+                                if !bb.is_finite() {
+                                    walk.poisoned = true;
+                                    return Ok(());
+                                }
+                                walk.add_bias(ai, si, bb);
+                            }
+                        }
+                    }
+                }
+            }
+            walk.push(ctx, parent, back_a, back_s)
+        }
+
         Layer::Linear(lin) => {
             let parent = unary()?;
             let (out_dim, in_dim) = lin.weight.dim();

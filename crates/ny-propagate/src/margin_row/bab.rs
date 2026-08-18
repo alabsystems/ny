@@ -452,18 +452,33 @@ fn closed(mode: RoundMode, b: f64) -> bool {
 }
 
 fn build_pack(eng: &BackwardEngine<'_>, dom: Option<&DomainGates>) -> Result<YPack> {
-    let (al, au) = eng.y_rows(dom)?;
+    // The identity-seeded y-row refresh is the seam's cleanest admission: the
+    // seed is f32-exact and carries no certified error, so no `y_abs` is
+    // needed, and one device walk publishes BOTH lanes. Dark + fail-closed:
+    // with `NY_MARGIN_ROW_GPU` unset this is the established `y_rows` call.
+    let (al, au) = eng.y_rows_seamed(dom, &super::gpu_seam::SeamCtx::default())?;
+    Ok(pack_from_rows(eng, al, au))
+}
+
+/// The y-pack's CPU tail: everything `build_pack` derives from the two
+/// identity-seeded passes.
+///
+/// Split out so the DOMAIN-BATCHED prefill (#margin-row-gpu-batch) can build a
+/// pack from rows a wide GPU call produced and get a BIT-IDENTICAL `YPack` for
+/// identical `(al, au)` — the batched lane changes WHERE the rows come from and
+/// nothing else about the pack.
+fn pack_from_rows(eng: &BackwardEngine<'_>, al: PassOut, au: PassOut) -> YPack {
     let ybox = YBox::from_rows(eng, &al, &au);
     let al_dots = row_dots(eng.root, &al);
     let au_dots = row_dots(eng.root, &au);
-    Ok(YPack {
+    YPack {
         ly0: ybox.ly,
         uy0: ybox.uy,
         al_dots,
         au_dots,
         al,
         au,
-    })
+    }
 }
 
 /// Root pass: mirrors `DirectBab.__init__` (via-y for all classes, direct for
@@ -489,6 +504,37 @@ fn root_eval_impl(
         ly: pack.ly0.clone(),
         uy: pack.uy0.clone(),
     };
+    // #twin-head-probe (NY_MARGIN_ROW_HEAD_PROBE=1, print-only, verdict-neutral,
+    // byte-identical when unset). Settles ONE question before anyone builds the
+    // certified-head routing described in docs/MARGIN_ROW_ROOT_JOINT_COUPLING.md:
+    // is this lane's OWN head box actually looser than the graph lane's tightened
+    // one? The margin-row `YBox` is the same semantic tensor the CIFAR100 parity
+    // oracle measures — `Flatten_55 -> Gemm_56 -> y -> Relu_57` — so these numbers
+    // are directly comparable to that doc's `327.9822 -> 160.4943` and its
+    // `unstable 44 -> 22`, and to the graph side's own
+    // `[root-crown-interm-tighten] ... intersected_width=` line.
+    //
+    // If this lane already reports ~164, routing the graph box here buys NOTHING
+    // and the patch must not be written. That is the whole point of measuring
+    // first: `run_margin_row_lane_with_head` currently does `drop(external_head)`
+    // (margin_row/mod.rs:135) as a deliberate quarantine, and lifting a quarantine
+    // to gain zero is pure risk on a lane that decides verdicts.
+    if std::env::var_os("NY_MARGIN_ROW_HEAD_PROBE").is_some() {
+        let width: f64 = ybox.ly.iter().zip(ybox.uy.iter()).map(|(l, u)| u - l).sum();
+        let unstable = ybox
+            .ly
+            .iter()
+            .zip(ybox.uy.iter())
+            .filter(|(l, u)| **l < 0.0 && **u > 0.0)
+            .count();
+        eprintln!(
+            "[twin-head] n_y={} width_sum={:.4} mean_width={:.5} unstable={}",
+            ybox.ly.len(),
+            width,
+            width / (ybox.ly.len().max(1) as f64),
+            unstable
+        );
+    }
     let mb_all = MarginBatch::new(net, t, adv)?;
     let gates = head_gates(&ybox, mode);
     let ms_all = margin_seed(&mb_all, &gates, &ybox, mode);
@@ -512,7 +558,21 @@ fn root_eval_impl(
         let fail_classes: Vec<usize> = fail.iter().map(|&k| adv[k]).collect();
         let mbf = MarginBatch::new(net, t, &fail_classes)?;
         let ms_f = margin_seed(&mbf, &gates, &ybox, mode);
-        let pass = eng.run(&ms_f.seed, None, super::engine::LaneDir::Lower, None, false)?;
+        // The root direct pass. Its seed DOES carry a certified error and is
+        // not f32-exact, so the seam needs the y-box magnitudes to concretize
+        // both discrepancies into the bias-error lane; without them it refuses
+        // and this is the established CPU call.
+        let y_abs: Vec<f64> = ybox
+            .ly
+            .iter()
+            .zip(&ybox.uy)
+            .map(|(l, u)| l.abs().max(u.abs()))
+            .collect();
+        let seam = super::gpu_seam::SeamCtx {
+            y_abs: Some(&y_abs),
+            deadline: None,
+        };
+        let pass = eng.run_seamed(&ms_f.seed, None, super::engine::LaneDir::Lower, &seam)?;
         let direct = per_class_direct(eng, &pass, &ms_f, 0..fail.len());
         for (fi, &k) in fail.iter().enumerate() {
             require_finite("direct root bound", &[direct[fi]])?;
@@ -627,6 +687,13 @@ pub(crate) fn classwise_conjunction_complete(
             .iter()
             .zip(class_runs)
             .all(|(class, run)| *class == run.class && run.verified)
+}
+
+/// #parallel-prebuild gate. Exact `"1"`, read once -- it selects a scheduling
+/// strategy, never a bound, and cannot change during a run.
+fn parallel_prebuild_enabled() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("NY_MARGIN_ROW_PARALLEL_PREBUILD").is_ok_and(|v| v == "1"))
 }
 
 impl<'a> MarginRowBab<'a> {
@@ -1314,6 +1381,68 @@ impl<'a> MarginRowBab<'a> {
             // A deadline check between (potentially expensive) builds bounds the
             // prebuild wall overshoot to one y-refresh; un-built entries are
             // returned to the heap so no work is lost.
+            // #parallel-prebuild (DARK, NY_MARGIN_ROW_PARALLEL_PREBUILD=1):
+            // fill the batch's LRU misses CONCURRENTLY before the serial loop
+            // below, which then hits on every entry.
+            //
+            // Why this is the batch-level barrier: the loop below builds up to
+            // `frontier` (= rayon::current_num_threads()) y-packs one at a time
+            // on the driver thread, each ~0.63 s measured
+            // (docs/EPOCH_BAB_DESIGN.md:189, 77 s over 123 expansions), against
+            // roughly 0.5-2 s of actual parallel expansion afterwards. So the
+            // batch spends most of its wall clock with one thread building
+            // packs while the rest of the pool idles.
+            //
+            // Bit-identical to the serial path by construction: `build_pack` is
+            // a pure function of `(eng, domain_gates(root, trunk))`, and the LRU
+            // is a pure cache -- a hit returns exactly what a miss would have
+            // rebuilt. The only observable difference is LRU EVICTION ORDER at
+            // the 64-entry cap, which can change later hit/miss timing but
+            // never a bound, because a miss recomputes the identical pack.
+            // #margin-row-gpu-batch (DARK, NY_MARGIN_ROW_GPU=1 AND
+            // NY_MARGIN_ROW_GPU_BATCH=1): fold the batch's LRU misses in
+            // chunked certified GPU calls instead of one per domain. This is
+            // the batching shape intended to attack the measured 32x workload
+            // gap — see `gpu_seam::batch` for what varies per domain and why
+            // the batch is expressible. It only POPULATES the cache: the serial
+            // `rows_for` loop below is unchanged and simply hits on every entry,
+            // so a refusal (or a dark gate) costs nothing and the established
+            // path rebuilds. Runs BEFORE the CPU parallel prebuild so the two
+            // never do the same work twice.
+            self.gpu_batch_prefill(&batch);
+            if parallel_prebuild_enabled() && batch.len() > 1 {
+                let mut missing: Vec<Vec<TrunkSplit>> = Vec::new();
+                for e in &batch {
+                    if self.lru.get(&e.trunk).is_none()
+                        && !missing.iter().any(|m| m.as_slice() == e.trunk.as_slice())
+                    {
+                        missing.push(e.trunk.clone());
+                    }
+                }
+                if !missing.is_empty() {
+                    // Attribute the prebuild to YRefresh. Building the packs
+                    // here bypasses `rows_for`, so without this the phase reads
+                    // "0.000s n=0" and the work becomes invisible rather than
+                    // free -- the exact failure mode this profiler was just
+                    // fixed for at the slice cap. Counted as one miss per pack
+                    // so lru_miss still reflects real rebuild work.
+                    let _t = super::prof::Timer::start(super::prof::Phase::YRefresh);
+                    super::prof::bump(super::prof::Counter::LruMiss, missing.len() as u64);
+                    let eng = &self.eng;
+                    let built_packs: Vec<Result<(Vec<TrunkSplit>, Arc<YPack>)>> = missing
+                        .into_par_iter()
+                        .map(|trunk| {
+                            let dom = domain_gates(eng.root, &trunk);
+                            let pack = Arc::new(build_pack(eng, Some(&dom))?);
+                            Ok((trunk, pack))
+                        })
+                        .collect();
+                    for entry in built_packs {
+                        let (trunk, pack) = entry?;
+                        self.lru.put(trunk, pack);
+                    }
+                }
+            }
             let mut packs: Vec<Arc<YPack>> = Vec::with_capacity(batch.len());
             let mut built = 0usize;
             while built < batch.len() {
@@ -1822,6 +1951,76 @@ impl<'a> MarginRowBab<'a> {
             }
         }
         out
+    }
+
+    /// DOMAIN-BATCHED y-pack prefill (#margin-row-gpu-batch).
+    ///
+    /// Collects the frontier batch's DISTINCT LRU-missing trunk-sets, folds
+    /// their identity-seeded y-row refreshes in chunked calls at a
+    /// device-admitted width, and puts the resulting packs in the LRU. The
+    /// established `rows_for` loop then hits on every entry.
+    ///
+    /// # Why this is the right seam
+    ///
+    /// `build_pack` is a pure function of `(eng, domain_gates(root, trunk))` and
+    /// the LRU is a pure cache — a hit returns exactly what a miss would have
+    /// rebuilt. So POPULATING the cache is the smallest possible blast radius:
+    /// no bound, no candidate, no heap order and no stats delta is computed
+    /// differently, and the only thing that changed is which arithmetic produced
+    /// `(al, au)`. That arithmetic is authoritative and is guarded per domain
+    /// (certified-error floor + realization probe against THAT domain's own
+    /// gates) inside `gpu_seam::batch`.
+    ///
+    /// # Fail-closed
+    ///
+    /// Returns no value or error to its caller: any terminal refusal simply
+    /// leaves the cache unpopulated, and the CPU path rebuilds. Counters and a
+    /// one-time profile diagnostic may still record the refusal. There is no
+    /// failure here that the established path does not already handle.
+    fn gpu_batch_prefill(&mut self, batch: &[DomainEntry]) {
+        if !super::gpu_seam::batch::enabled() || batch.len() < 2 {
+            return;
+        }
+        // DISTINCT misses, in pop order. Deduping matters for correctness of the
+        // accounting (two entries with the same trunk-set share one pack) and
+        // for width (a duplicated domain wastes a batch slot).
+        let mut missing: Vec<Vec<TrunkSplit>> = Vec::new();
+        for e in batch {
+            if self.lru.get(&e.trunk).is_none()
+                && !missing.iter().any(|m| m.as_slice() == e.trunk.as_slice())
+            {
+                missing.push(e.trunk.clone());
+            }
+        }
+        if missing.len() < 2 {
+            return;
+        }
+        let gates: Vec<DomainGates> = missing
+            .iter()
+            .map(|trunk| domain_gates(self.eng.root, trunk))
+            .collect();
+        let refs: Vec<&DomainGates> = gates.iter().collect();
+        // Attribute the batched refresh to YRefresh and count one miss per pack,
+        // exactly as the CPU prebuild does, so the profile stays comparable
+        // across an A/B of this gate.
+        let _t = super::prof::Timer::start(super::prof::Phase::YRefresh);
+        let Some(rows) = super::gpu_seam::batch::run_batch(&self.eng, &refs, self.cfg.deadline)
+        else {
+            return;
+        };
+        // The slot map, one last time: `run_batch` returns one pass pair per
+        // input gate, in input order. Re-pair by ZIP (no index) and refuse the
+        // whole prefill on any length drift rather than cache a pack under the
+        // wrong trunk-set — that would be a wrong bound for every domain that
+        // later hits it.
+        if rows.len() != missing.len() {
+            return;
+        }
+        super::prof::bump(super::prof::Counter::LruMiss, missing.len() as u64);
+        for (trunk, (al, au)) in missing.into_iter().zip(rows) {
+            let pack = Arc::new(pack_from_rows(&self.eng, al, au));
+            self.lru.put(trunk, pack);
+        }
     }
 
     fn rows_for(&mut self, trunk: &[TrunkSplit]) -> Result<Arc<YPack>> {
@@ -2783,5 +2982,98 @@ mod ledger_tests {
         let mut l = Ledger::default();
         l.leaf(500);
         assert!(!l.kraft_ok());
+    }
+}
+
+/// #margin-row-gpu-batch: the pack refactor's pin.
+///
+/// The batched prefill's whole safety story is "it only changes WHERE `(al,
+/// au)` came from". That is only true if the y-pack's CPU tail is genuinely
+/// shared, so this asserts `build_pack` is exactly `pack_from_rows` applied to
+/// the lane's own `y_rows` — BIT-for-bit, on both the root gates and a
+/// piece-fixed domain.
+#[cfg(test)]
+mod pack_from_rows_tests {
+    use super::{build_pack, domain_gates, pack_from_rows, BackwardEngine};
+    use crate::margin_row::net::TwinNet;
+    use crate::margin_row::root::RootGates;
+    use crate::margin_row::rounding::RoundMode;
+    use crate::margin_row::spec::{TwinOpSpec, TwinSpec};
+
+    /// Minimal VALID twin net: one trunk ReLU, then the head `Gemm -> Relu ->
+    /// Gemm` pair the compiler requires. Mirrors `no_conv_chain_spec` at
+    /// depth 1.
+    #[allow(clippy::cast_precision_loss)]
+    fn spec() -> TwinSpec {
+        let n_in = 6usize;
+        let (n_y, n_out) = (4usize, 3usize);
+        let wh: Vec<f64> = (0..(n_y * n_in))
+            .map(|i| ((i * 7) % 11) as f64 / 11.0 - 0.5)
+            .collect();
+        let wo: Vec<f64> = (0..(n_out * n_y))
+            .map(|i| ((i * 5) % 13) as f64 / 13.0 - 0.5)
+            .collect();
+        TwinSpec {
+            n_in,
+            ops: vec![
+                TwinOpSpec::Relu { input: 0 },    // t1, trunk relu 0
+                TwinOpSpec::Flatten { input: 1 }, // t2
+                TwinOpSpec::Gemm {
+                    input: 2,
+                    weight: wh,
+                    bias: vec![0.1, -0.1, 0.05, 0.0],
+                    shape: (n_y, n_in),
+                }, // t3 = y
+                TwinOpSpec::Relu { input: 3 },    // t4, head relu
+                TwinOpSpec::Gemm {
+                    input: 4,
+                    weight: wo,
+                    bias: vec![0.0, 0.1, -0.1],
+                    shape: (n_out, n_y),
+                }, // t5
+            ],
+        }
+    }
+
+    fn eq_rows(a: &[f64], b: &[f64], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: length moved");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{what}: row {i} moved");
+        }
+    }
+
+    #[test]
+    fn build_pack_is_pack_from_rows_of_the_lanes_own_y_rows() {
+        let spec = spec();
+        let net = TwinNet::compile(&spec).expect("compiles");
+        let lo = vec![-0.4; spec.n_in];
+        let hi = vec![0.4; spec.n_in];
+        let (root, _) =
+            RootGates::build_retaining(&net, &lo, &hi, RoundMode::Outward, None, None, &[])
+                .expect("root gates");
+        let eng = BackwardEngine::new(&net, &root);
+        let split = root
+            .layers
+            .iter()
+            .enumerate()
+            .find_map(|(li, rec)| (!rec.unst.is_empty()).then_some((li, 0usize, 1i8)));
+        for dom in [None, split.map(|s| domain_gates(&root, &[s]))] {
+            let dom_ref = dom.as_ref();
+            let want = build_pack(&eng, dom_ref).expect("build_pack");
+            let (al, au) = eng.y_rows(dom_ref).expect("y_rows");
+            let got = pack_from_rows(&eng, al, au);
+            eq_rows(&got.ly0, &want.ly0, "ly0");
+            eq_rows(&got.uy0, &want.uy0, "uy0");
+            eq_rows(
+                &eng.concretize_lower(&got.al),
+                &eng.concretize_lower(&want.al),
+                "al",
+            );
+            eq_rows(
+                &eng.concretize_upper(&got.au),
+                &eng.concretize_upper(&want.au),
+                "au",
+            );
+        }
     }
 }

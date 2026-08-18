@@ -112,6 +112,17 @@ pub(crate) trait NetworkIbpExt {
         deadline: Option<Instant>,
     ) -> Result<CrownIbpBoundsResult>;
 
+    /// Like
+    /// [`Self::collect_crown_ibp_bounds_with_engine_deadline_and_status_impl`],
+    /// with an explicit per-node time-budget policy.
+    fn collect_crown_ibp_bounds_with_engine_deadline_budget_and_status_impl(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+        per_node_time_budget: &crate::types::CrownIbpPerNodeTimeBudget,
+    ) -> Result<CrownIbpBoundsResult>;
+
     /// Run CROWN-IBP with pre-computed IBP bounds (#3397).
     ///
     /// When `precomputed_ibp` is `Some`, the internal IBP forward pass is skipped
@@ -131,9 +142,9 @@ pub(crate) trait NetworkIbpExt {
     /// Like [`Self::collect_crown_ibp_bounds_with_precomputed_ibp_impl`], with
     /// an explicit per-node time-budget policy (#4413, #cgan-bn11-budget).
     ///
-    /// Used by the graph collector's sequential fast path so a preset-raised
-    /// floor/cap survives the delegation. The default-budget wrappers keep the
-    /// built-in constants byte-identically.
+    /// Used by the graph collector's sequential fast path and by the native
+    /// sequential verifier so a preset floor/cap survives delegation. The
+    /// default-budget wrappers preserve the default policy.
     fn collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_impl(
         &self,
         input: &BoundedTensor,
@@ -269,6 +280,17 @@ impl NetworkIbpExt for Network {
         deadline: Option<Instant>,
     ) -> Result<CrownIbpBoundsResult> {
         self.collect_crown_ibp_bounds_core(input, None, engine, deadline)
+    }
+
+    #[inline]
+    fn collect_crown_ibp_bounds_with_engine_deadline_budget_and_status_impl(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+        per_node_time_budget: &crate::types::CrownIbpPerNodeTimeBudget,
+    ) -> Result<CrownIbpBoundsResult> {
+        crown_ibp::collect_core(self, input, None, engine, deadline, per_node_time_budget)
     }
 
     #[inline]

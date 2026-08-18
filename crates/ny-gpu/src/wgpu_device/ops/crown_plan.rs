@@ -54,7 +54,32 @@ pub(crate) struct PreparedCrownPlan {
     static_weight_arcs: Vec<Arc<[f32]>>,
 }
 
+impl PreparedCrownPlan {
+    fn retained_device_bytes(&self) -> Result<usize> {
+        let staging = usize::try_from(self.staging_buf.size()).map_err(|_| {
+            NyError::InternalError("CROWN plan staging buffer does not fit in usize".into())
+        })?;
+        staging
+            .checked_add(self.working.retained_device_bytes()?)
+            .ok_or_else(|| NyError::InternalError("CROWN plan byte count overflow".into()))
+    }
+}
+
 impl WgpuDevice {
+    /// Checked retained bytes across every cached static CROWN plan.
+    pub(crate) fn crown_plan_cache_bytes(&self) -> Result<usize> {
+        let cache = self.crown_plan_cache.lock().map_err(|err| {
+            NyError::InternalError(format!("crown plan cache lock poisoned: {err}"))
+        })?;
+        cache.values().try_fold(0usize, |total, plan| {
+            total
+                .checked_add(plan.retained_device_bytes()?)
+                .ok_or_else(|| {
+                    NyError::InternalError("CROWN plan cache byte count overflow".into())
+                })
+        })
+    }
+
     pub(super) fn get_or_prepare_crown_plan(
         &self,
         layers: &[GpuCrownLayer],

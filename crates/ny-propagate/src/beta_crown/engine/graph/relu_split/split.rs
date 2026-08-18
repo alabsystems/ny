@@ -136,7 +136,15 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         split_depth: usize,
     ) -> Result<Vec<GraphDomainResult>> {
-        let k = split_depth.min(unstable.len());
+        let k = super::super::cap_relu_split_depth_for_parent(
+            split_depth,
+            unstable.len(),
+            domain.depth,
+            self.config.max_depth,
+        );
+        if k == 0 {
+            return Ok(vec![GraphDomainResult::PropagationFailure]);
+        }
         let branches = match self.select_graph_branches(graph, domain, unstable, k) {
             Ok(branches) => branches,
             Err(e) => {
@@ -198,6 +206,9 @@ impl BetaCrownVerifier {
         cut_pool: &GraphCutPool,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<Vec<GraphDomainResult>> {
+        if domain.depth >= self.config.max_depth {
+            return Ok(vec![GraphDomainResult::PropagationFailure]);
+        }
         let (node_name, neuron_idx, score) = match self
             .select_graph_branch_or_propagation_failure_in_relu_split(graph, domain, unstable)
         {
@@ -239,5 +250,22 @@ impl BetaCrownVerifier {
             results.push(GraphDomainResult::PropagationFailure);
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sequential_fallback_caps_parent_at_max_depth_minus_one() {
+        assert_eq!(
+            super::super::super::cap_relu_split_depth_for_parent(4, 8, 3, 4),
+            1,
+            "sequential fallback must reduce a depth-four request to the last legal level"
+        );
+        assert_eq!(
+            super::super::super::cap_relu_split_depth_for_parent(4, 8, 4, 4),
+            0,
+            "a max-depth parent must not expand"
+        );
     }
 }

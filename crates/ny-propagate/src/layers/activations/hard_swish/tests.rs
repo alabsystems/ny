@@ -126,6 +126,57 @@ fn hardswish_relaxation_point_interval_soundness() {
     }
 }
 
+#[test]
+fn hardswish_relaxation_adjacent_float_interval_is_strictly_sound() {
+    for l in [-0.05_f32, -0.01, 0.01, 0.05] {
+        let u = next_up_f32(l);
+        assert!(u - l < 1e-8, "test interval must use the narrow path");
+        let relaxation = hardswish_linear_relaxation(l, u);
+        for x in [f64::from(l), f64::from(u)] {
+            let actual = hardswish_f64_reference(x);
+            let lower =
+                f64::from(relaxation.lower_slope) * x + f64::from(relaxation.lower_intercept);
+            let upper =
+                f64::from(relaxation.upper_slope) * x + f64::from(relaxation.upper_intercept);
+            assert!(lower <= actual, "{lower} > {actual} at {x}");
+            assert!(upper >= actual, "{upper} < {actual} at {x}");
+        }
+    }
+}
+
+#[test]
+fn onnx_authored_alpha_witness_differs_from_legacy_rational_evaluation() {
+    // Official ONNX HardSwish authors alpha as the f32 value 0x3e2aaaab,
+    // not as the exact real number 1/6. This input also distinguishes the old
+    // `(x + 3) / 6` f32 evaluation sequence from the exact-real coefficient
+    // semantics used by verification.
+    let x = f32::from_bits(0x4010_128c);
+    let alpha = f64::from(f32::from_bits(0x3e2a_aaab));
+    let x64 = f64::from(x);
+    let official = x64 * (alpha * x64 + 0.5).clamp(0.0, 1.0);
+    let exact_rational = x64 * ((x64 + 3.0) / 6.0).clamp(0.0, 1.0);
+
+    assert_ne!(official, exact_rational);
+    assert_eq!(HardSwishLayer::ALPHA.to_bits(), 0x3e2a_aaab);
+    assert_eq!(HardSwishLayer::new().eval(x).to_bits(), 0x3ffc_2e60);
+}
+
+#[test]
+fn onnx_authored_alpha_witness_ibp_point_is_outward() {
+    let x = f32::from_bits(0x4010_128c);
+    let x64 = f64::from(x);
+    let official = x64 * (f64::from(f32::from_bits(0x3e2a_aaab)) * x64 + 0.5).clamp(0.0, 1.0);
+    let input = BoundedTensor::new(arr1(&[x]).into_dyn(), arr1(&[x]).into_dyn()).unwrap();
+    let output = HardSwishLayer::new().propagate_ibp(&input).unwrap();
+    let lower = output.lower()[[0]];
+    let upper = output.upper()[[0]];
+
+    assert!(f64::from(lower) <= official, "{lower} > {official}");
+    assert!(f64::from(upper) >= official, "{upper} < {official}");
+    assert_eq!(lower.to_bits(), 0x3ffc_2e60);
+    assert_eq!(upper.to_bits(), 0x3ffc_2e61);
+}
+
 fn f32_any_with_specials() -> impl Strategy<Value = f32> {
     prop_oneof![
         Just(f32::NEG_INFINITY),
@@ -517,7 +568,9 @@ fn hardswish_f64_reference(x: f64) -> f64 {
         }
         return if x.is_sign_negative() { 0.0 } else { x };
     }
-    x * ((x + 3.0) / 6.0).clamp(0.0, 1.0)
+    let alpha = f64::from(f32::from_bits(0x3e2a_aaab));
+    let beta = f64::from(0.5_f32);
+    x * (alpha * x + beta).clamp(0.0, 1.0)
 }
 
 /// ULP distance between two f32 values, handling sign correctly.
@@ -576,6 +629,29 @@ proptest! {
             upper_intercept >= ref_intercept,
             "HardSwish chord upper_intercept {upper_intercept} < ref {ref_intercept} for [{l}, {u}]"
         );
+    }
+}
+
+#[test]
+fn hardswish_chord_deviation_includes_f32_endpoint_roundoff() {
+    for (l, u) in [(-2.75_f32, -2.5_f32), (-2.0, 1.25), (1.5, 2.75)] {
+        let (slope, lower_intercept, upper_intercept) = hardswish_chord(l, u);
+        #[allow(clippy::manual_midpoint)]
+        let nominal_intercept = (lower_intercept + upper_intercept) / 2.0;
+        let (max_above, max_below) = hardswish_chord_deviation(l, u, slope, nominal_intercept);
+
+        for x in [f64::from(l), f64::from(u)] {
+            let deviation =
+                hardswish_f64_reference(x) - (f64::from(slope) * x + f64::from(nominal_intercept));
+            assert!(
+                f64::from(max_above) >= deviation,
+                "max_above omitted endpoint deviation {deviation} for [{l}, {u}]"
+            );
+            assert!(
+                f64::from(max_below) >= -deviation,
+                "max_below omitted endpoint deviation {deviation} for [{l}, {u}]"
+            );
+        }
     }
 }
 

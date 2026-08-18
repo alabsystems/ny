@@ -1,0 +1,189 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# MODEL-LOAD WAIVERS — the record of every model a shipped preset points at that
+# this binary REFUSES TO LOAD, and therefore of every category that scores ZERO
+# at HEAD regardless of how good the verifier is.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# EIGHT separate commits have now silently zeroed a banked category by refusing
+# to load its model. Each was right about ONNX or float semantics. None had its
+# CAPABILITY COST measured, and each silently zeroed instances that were already
+# banked.
+#
+# HOW IT IS ENFORCED
+# ------------------
+# `crates/ny-cli/src/preset/model_load_smoke_tests.rs` loads every model a
+# shipped preset references (one per architecture family by default, all of them
+# under `NY_PRESET_LOAD_SMOKE=all`) plus EVERY model listed here, and:
+#
+#   * a load failure NOT listed here            -> test fails (new regression)
+#   * a load failure listed here                -> recorded debt, printed
+#   * a model listed here that LOADS again      -> test fails (stale waiver:
+#                                                  delete the entry and re-sweep
+#                                                  the ledger rows it covered)
+#   * a model listed here that is NOT ON DISK   -> test fails (a debt that
+#                                                  cannot be re-tested can never
+#                                                  be shown to be paid off)
+#
+# An entry here is a DEBT, not an exoneration. `cost` must state what it costs in
+# instances, banked rows, AND banked normalized points — the guard refuses a
+# `cost` that does not quote the word "normalized", because an instance count
+# alone is what let eight gates land unpriced. The per-benchmark stake comes from
+# `configs/preset_score_at_risk.yaml`.
+#
+# ===========================================================================
+# CURRENT STATE: 14 models, ONE responsible commit, 390.3 normalized at risk
+# ===========================================================================
+#
+# Inventoried 2026-08-07 at 5382ddb8 by
+# `NY_PRESET_LOAD_SMOKE=all cargo test --release -p ny-cli --bin ny
+#  preset::model_load_smoke_tests` with all three benchmark year-roots present:
+# 14 of 541 model files across 47 presets fail the loader's admission path.
+#
+# ALL FOURTEEN ARE 819b0554 ("feat: harden verifier soundness and expand NN4SYS
+# solves", 2026-08-04). Source-level bisect, decisive: the three refusal strings
+#
+#     "comparison operands"        -> crates/ny-onnx/.../reduction_schema.rs
+#     "cannot be erased at opset"  -> crates/ny-onnx/.../schema_preflight.rs
+#     "cannot authenticate rank"   -> crates/ny-onnx/.../structural_schema.rs
+#
+# do not exist ANYWHERE in crates/ at 819b0554^, and all three exist at
+# 819b0554, which also created all three files. No earlier commit can emit these
+# refusals. (What this does NOT establish: that these models loaded cleanly at
+# 819b0554^ — only that they did not fail THIS way. A runtime A/B at 819b0554^
+# is still owed before any of these entries is retired as "recovered".)
+#
+# MEASURED COST, per benchmark (banked normalized from
+# configs/preset_score_at_risk.yaml; blocked rows counted from reports/measured*
+# by exact model basename):
+#
+#   collins_rul_cnn_2022  REGULAR   62/62 instances, 54/55 banked solved rows
+#                                   87.1 -> 0.0    LOSS 87.1
+#   cctsdb_yolo_2023      extended  39/39 instances, 39/39 banked solved rows
+#                                   100.0 -> 0.0   LOSS 100.0
+#   vggnet16_2022         extended  18/18 instances, 14/14 banked solved rows
+#                                   77.8 -> 0.0    LOSS 77.8
+#   ml4acopf_2024         extended  23/69 instances, 17/43 banked solved rows
+#                                   68.3 -> 41.3   LOSS 27.0
+#   cgan_2023             REGULAR    2/21 instances,  2/13 banked solved rows
+#                                   57.1 -> 47.6   LOSS  9.5
+#   cgan2026              unscored   2/21 instances,  no ledger
+#                                   0.0 -> 0.0     LOSS  0.0
+#
+#   TOTAL MEASURED LOSS 301.4 normalized (REGULAR 96.6 + EXTENDED 204.8),
+#   against a 390.3 whole-benchmark stake. FULL-FIELD 1872.1 -> 1570.7.
+#
+# TWO OF THESE WERE UNKNOWN TO EVERY LANE BEFORE THIS SWEEP:
+#   * cgan_2023 is a REGULAR-track category and its Reshape refusal had not been
+#     recorded anywhere. The 2026-08-02 re-sweep note in the previous revision of
+#     this file explicitly certified cgan_2023 as "LOAD-OK at BOTH" — that note
+#     predates 819b0554 and is now stale.
+#   * ml4acopf_2024 loses 3 of its 9 models to the SAME Equal dtype-7 gate that
+#     was only ever attributed to cctsdb.
+#
+# OWNERSHIP
+#   Equal dtype-7  (cctsdb, ml4acopf)   -> lane 1, task #98 (narrow admission)
+#   opset-8 Dropout (vggnet16, collins) -> lane 1, task #98 (narrow admission)
+#   Reshape rank    (cgan_2023, cgan2026) -> UNOWNED as of 2026-08-07; opened by
+#                                          this sweep, no lane has it.
+#
+# Retiring an entry means: delete it, AND re-sweep the ledger rows it covered.
+# The rows are currently banked as if they still solve; they do not.
+
+# ===========================================================================
+# 2026-08-08 UPDATE
+# ===========================================================================
+#
+# PAID OFF: all six ml4acopf_2024 entries (three models x two year-roots) were
+# deleted because the models LOAD AGAIN at HEAD. `709f23b6` ("admit ml4acopf's
+# literal `Tensor.expand` cone — 819b0554 recovery") discharged the gate they
+# were waived for. The guard itself demanded the deletion ("STALE MODEL-LOAD
+# WAIVER — these models LOAD again, so the recorded debt is paid").
+#
+#   ml4acopf_2024  extended  LOSS 27.0 normalized  ->  RECOVERED
+#
+# STILL OWED, and the reason this note exists rather than a silent delete: the
+# rows those models cover are BANKED AS ZEROS from the period when they did not
+# load. Recovering the load does not recover the score until the category is
+# re-swept. `reports/` has not been re-run for ml4acopf_2024 at HEAD.
+#
+# REMAINING DEBT after this update: 4 models.
+#   cctsdb_yolo_2023  extended  LOSS 100.0  — NOT a gate defect. Verified
+#     2026-08-08 by tracing the shipped patch-1.onnx: Slice_34/38/59/70 take
+#     their starts/ends from Gather(GRAPH INPUT '0') -> Cast(->INT64), and ONNX
+#     Slice clamps, so the sliced length and every downstream shape depend on
+#     the runtime input. ny's graph is fixed-shape; admitting it would mean
+#     ASSUMING the patch coordinates are in range. See
+#     crates/ny-onnx/tests/cctsdb_cast_admission_loads.rs.
+#   cgan_2023         REGULAR   LOSS   9.5  — over-strict, retirable; the
+#     three-edit path is written out at the entry below.
+#   cgan2026          unscored  LOSS   0.0
+#
+waivers:
+  # ---- 819b0554: ONNX Equal schema requires FLOAT comparison operands --------
+  - model: benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023/onnx/patch-1.onnx
+    error_contains: "has comparison operands dtype 7"
+    gate: 819b0554
+    since: "2026-08-04"
+    cost: >-
+      cctsdb_yolo_2023 (extended): with patch-3.onnx this is 39/39 instances and
+      39/39 banked solved rows. 100.0 -> 0.0 banked normalized, LOSS 100.0.
+  - model: benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023/onnx/patch-3.onnx
+    error_contains: "has comparison operands dtype 7"
+    gate: 819b0554
+    since: "2026-08-04"
+    cost: >-
+      cctsdb_yolo_2023 (extended): the second of the category's two models; see
+      patch-1.onnx. Jointly 100.0 -> 0.0 banked normalized, LOSS 100.0.
+  # ---- 819b0554: INT64 shape arithmetic is not an authenticated static source -
+  #
+  # RE-POINTED 2026-08-08. These two entries were written on 2026-08-07 against
+  # "cannot authenticate rank of shape input". `709f23b6` ("admit ml4acopf's
+  # literal `Tensor.expand` cone — 819b0554 recovery") opened THAT gate, which
+  # exposed the NEXT refusal from the same file and the same gate commit:
+  #
+  #   raw ONNX INT64 structural value 'onnx::Cast_363' is produced by 'Div_59'
+  #   (Div), which is not an exact static shape-control producer
+  #
+  # Same model, same gate (819b0554), same measured cost — only the first
+  # refusal moved, so `error_contains` is re-pointed rather than the debt
+  # retired. `git log -S` confirms both strings were introduced by 819b0554.
+  #
+  # WHAT IT WOULD TAKE TO RETIRE THIS, established 2026-08-08. The refusal is
+  # over-strict for cgan specifically: `Div_59 = Gather(Shape(input.47), Const)
+  # / Const` where `input.47` is `[1, 256, 8, 8]` and the graph input is
+  # `[1, 5]` — every dimension concrete, so the value is a compile-time constant
+  # <= 256, far below the 2^24 point where distinct i64s share one f32 mirror.
+  # Admitting it needs THREE coordinated edits, not one:
+  #   1. `require_static_source` must accept Add/Sub/Mul/Div via
+  #      `require_all_inputs_static` (every leaf still an initializer/Constant/
+  #      Shape, so a runtime-rooted chain like cctsdb's stays refused);
+  #   2. `is_int64_layout_chain_input` must accept the same ops consumer-side;
+  #   3. `validate_arithmetic_float32_data_path` must consult the structural
+  #      authentication. Its existing `is_exact_integer_literal_node` escape
+  #      hatch does NOT apply: `literal_cone` deliberately excludes `Shape`
+  #      ("only as static as ny's shape inference"), routing Shape-rooted
+  #      programs to the structural machinery instead.
+  # Edits 1 and 2 were prototyped and verified inert on their own (the model
+  # still fails at 3), and were NOT landed: partial gate-opening carries the
+  # risk without the capability gain.
+  - model: benchmarks/vnncomp2025/benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx
+    error_contains: "is not an exact static shape-control producer"
+    gate: 819b0554
+    since: "2026-08-04"
+    cost: >-
+      cgan_2023 (REGULAR): 1 of the category's 8 models, 2/21 instances and 2/13
+      banked solved rows. 57.1 -> 47.6 banked normalized, LOSS 9.5. Previously
+      UNRECORDED — this file's own 2026-08-02 note certified cgan_2023 as
+      "LOAD-OK at BOTH", which 819b0554 invalidated two days later.
+  - model: benchmarks/vnncomp2026/benchmarks/cgan2026/1.0/onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx
+    error_contains: "is not an exact static shape-control producer"
+    gate: 819b0554
+    since: "2026-08-04"
+    cost: >-
+      cgan2026 (unscored 2026 benchmark, no ledger): 2/21 instances. 0.0 banked
+      normalized at risk TODAY, LOSS 0.0 — recorded so the category cannot be
+      swept for the first time against a model that silently does not load.

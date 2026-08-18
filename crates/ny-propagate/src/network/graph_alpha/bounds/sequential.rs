@@ -64,6 +64,16 @@ impl GraphNetwork {
             return Ok(None);
         };
 
+        // An already-expired graph deadline historically governs only CROWN
+        // tightening: the graph-native collector publishes the complete IBP
+        // map that its caller already owns.  Do not enter the sequential
+        // status collector, whose finite API correctly refuses to allocate and
+        // clone a new result after expiry.  Hard full-phase callers are stopped
+        // at the post-IBP checkpoint in the options entry point.
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return Ok(None);
+        }
+
         let precomputed_ibp = chain
             .node_names
             .iter()

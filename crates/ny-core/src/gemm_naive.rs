@@ -4,9 +4,20 @@
 
 //! Naive triple-loop CPU GEMM for testing and fallback.
 
-use crate::{NyError, Result};
+use crate::{checked_dim_product, NyError, Result};
 
 use super::{ConvTranspose2dParams, GemmEngine};
+
+fn zeroed_f32(elements: usize, context: &str) -> Result<Vec<f32>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(elements).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "{context}: allocation failed for {elements} elements: {error}"
+        ))
+    })?;
+    values.resize(elements, 0.0);
+    Ok(values)
+}
 
 /// Naive triple-loop CPU GEMM for testing and fallback.
 ///
@@ -17,6 +28,10 @@ use super::{ConvTranspose2dParams, GemmEngine};
 pub struct NaiveCpuGemmEngine;
 
 impl GemmEngine for NaiveCpuGemmEngine {
+    fn backend_provenance(&self) -> &'static str {
+        "naive-cpu"
+    }
+
     fn conv_transpose_2d(
         &self,
         a_reshaped: &[f32],
@@ -31,23 +46,53 @@ impl GemmEngine for NaiveCpuGemmEngine {
         let (kh, kw) = (params.kernel_h, params.kernel_w);
         let (sh, sw) = (params.stride_h, params.stride_w);
         let (ph, pw) = (params.pad_h, params.pad_w);
-        let spatial = oh * ow;
-        let total_rows = s * spatial;
-        let kernel_cols = ic * kh * kw;
+        let spatial = checked_dim_product(&[oh, ow], "conv_transpose_2d output spatial")?;
+        let total_rows = checked_dim_product(&[s, spatial], "conv_transpose_2d GEMM rows")?;
+        let kernel_cols = checked_dim_product(&[ic, kh, kw], "conv_transpose_2d kernel columns")?;
+        let a_len = checked_dim_product(&[total_rows, oc], "conv_transpose_2d a_reshaped")?;
+        let weight_len = checked_dim_product(&[oc, kernel_cols], "conv_transpose_2d weight_col")?;
 
-        if a_reshaped.len() != total_rows * oc {
+        if a_reshaped.len() != a_len {
             return Err(NyError::InvalidSpec(format!(
                 "conv_transpose_2d: a_reshaped.len()={} != S*OH*OW*OC={}",
                 a_reshaped.len(),
-                total_rows * oc,
+                a_len,
             )));
         }
-        if weight_col.len() != oc * kernel_cols {
+        if weight_col.len() != weight_len {
             return Err(NyError::InvalidSpec(format!(
                 "conv_transpose_2d: weight_col.len()={} != OC*IC*KH*KW={}",
                 weight_col.len(),
-                oc * kernel_cols,
+                weight_len,
             )));
+        }
+
+        let flat_input_dim = checked_dim_product(&[ic, ih, iw], "conv_transpose_2d flat input")?;
+        let result_len = checked_dim_product(&[s, flat_input_dim], "conv_transpose_2d output")?;
+
+        // Prove the loop's coordinate arithmetic cannot wrap before using plain
+        // multiplication/addition in the hot path.
+        let _max_y_padded = oh
+            .saturating_sub(1)
+            .checked_mul(sh)
+            .and_then(|v| v.checked_add(kh.saturating_sub(1)))
+            .ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "conv_transpose_2d: vertical stride/kernel coordinate overflow".to_string(),
+                )
+            })?;
+        let _max_x_padded = ow
+            .saturating_sub(1)
+            .checked_mul(sw)
+            .and_then(|v| v.checked_add(kw.saturating_sub(1)))
+            .ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "conv_transpose_2d: horizontal stride/kernel coordinate overflow".to_string(),
+                )
+            })?;
+
+        if total_rows == 0 || oc == 0 || kernel_cols == 0 {
+            return zeroed_f32(result_len, "conv_transpose_2d output");
         }
 
         // Step 1: GEMM — (S*OH*OW, OC) × (OC, IC*KH*KW) → (S*OH*OW, IC*KH*KW)
@@ -55,8 +100,7 @@ impl GemmEngine for NaiveCpuGemmEngine {
 
         // Step 2: col2im scatter → (S, IC*IH*IW)
         // Reference: ops_transpose_gemm.rs col2im loop (lines 226-250).
-        let flat_input_dim = ic * ih * iw;
-        let mut result = vec![0.0f32; s * flat_input_dim];
+        let mut result = zeroed_f32(result_len, "conv_transpose_2d output")?;
 
         for spec in 0..s {
             for gy in 0..oh {
@@ -65,14 +109,20 @@ impl GemmEngine for NaiveCpuGemmEngine {
                     for ic_idx in 0..ic {
                         for ki in 0..kh {
                             for kj in 0..kw {
-                                let iy = (gy * sh + ki) as isize - ph as isize;
-                                let ix = (gx * sw + kj) as isize - pw as isize;
-                                if iy >= 0 && iy < ih as isize && ix >= 0 && ix < iw as isize {
-                                    let col_idx = ic_idx * kh * kw + ki * kw + kj;
-                                    let out_idx = ic_idx * ih * iw + iy as usize * iw + ix as usize;
-                                    result[spec * flat_input_dim + out_idx] +=
-                                        gemm_out[gemm_row * kernel_cols + col_idx];
+                                let padded_y = gy * sh + ki;
+                                let padded_x = gx * sw + kj;
+                                if padded_y < ph || padded_x < pw {
+                                    continue;
                                 }
+                                let iy = padded_y - ph;
+                                let ix = padded_x - pw;
+                                if iy >= ih || ix >= iw {
+                                    continue;
+                                }
+                                let col_idx = ic_idx * kh * kw + ki * kw + kj;
+                                let out_idx = ic_idx * ih * iw + iy * iw + ix;
+                                result[spec * flat_input_dim + out_idx] +=
+                                    gemm_out[gemm_row * kernel_cols + col_idx];
                             }
                         }
                     }
@@ -84,26 +134,29 @@ impl GemmEngine for NaiveCpuGemmEngine {
     }
 
     fn gemm_f64(&self, m: usize, k: usize, n: usize, a: &[f64], b: &[f64]) -> Result<Vec<f64>> {
-        if a.len() != m * k {
+        let a_len = checked_dim_product(&[m, k], "GEMM f64 lhs")?;
+        let b_len = checked_dim_product(&[k, n], "GEMM f64 rhs")?;
+        let output_len = checked_dim_product(&[m, n], "GEMM f64 output")?;
+        if a.len() != a_len {
             return Err(NyError::InvalidSpec(format!(
                 "GEMM f64: a.len()={} != m*k={}*{}={}",
                 a.len(),
                 m,
                 k,
-                m * k
+                a_len
             )));
         }
-        if b.len() != k * n {
+        if b.len() != b_len {
             return Err(NyError::InvalidSpec(format!(
                 "GEMM f64: b.len()={} != k*n={}*{}={}",
                 b.len(),
                 k,
                 n,
-                k * n
+                b_len
             )));
         }
 
-        let mut c = vec![0.0f64; m * n];
+        let mut c = vec![0.0f64; output_len];
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f64;
@@ -117,26 +170,29 @@ impl GemmEngine for NaiveCpuGemmEngine {
     }
 
     fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
-        if a.len() != m * k {
+        let a_len = checked_dim_product(&[m, k], "GEMM lhs")?;
+        let b_len = checked_dim_product(&[k, n], "GEMM rhs")?;
+        let output_len = checked_dim_product(&[m, n], "GEMM output")?;
+        if a.len() != a_len {
             return Err(NyError::InvalidSpec(format!(
                 "GEMM: a.len()={} != m*k={}*{}={}",
                 a.len(),
                 m,
                 k,
-                m * k
+                a_len
             )));
         }
-        if b.len() != k * n {
+        if b.len() != b_len {
             return Err(NyError::InvalidSpec(format!(
                 "GEMM: b.len()={} != k*n={}*{}={}",
                 b.len(),
                 k,
                 n,
-                k * n
+                b_len
             )));
         }
 
-        let mut c = vec![0.0f32; m * n];
+        let mut c = vec![0.0f32; output_len];
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f32;

@@ -21,6 +21,18 @@ use crate::{GraphNetwork, GraphNode};
 /// The gate is a process-global atomic; serialize every test that forces it.
 static GATE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Restore both process-global test overrides even when an assertion unwinds.
+/// The mutex serializes the override window; this guard prevents one failing
+/// canary from poisoning every later gate test in the same test process.
+struct GateOverrideReset;
+
+impl Drop for GateOverrideReset {
+    fn drop(&mut self) {
+        force_f64_tail(None);
+        force_alpha_tail(None);
+    }
+}
+
 fn bt(lo: &[f32], hi: &[f32]) -> BoundedTensor {
     BoundedTensor::new(
         ArrayD::from_shape_vec(IxDyn(&[lo.len()]), lo.to_vec()).unwrap(),
@@ -148,6 +160,7 @@ fn fp_blocked_fixture() -> (GraphNetwork, BoundedTensor, Array2<f32>, f32, f32) 
 #[test]
 fn gate_off_is_byte_identical_and_gate_on_verifies() {
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     let (graph, input, spec, threshold, f32_lower) = fp_blocked_fixture();
     let thresholds = [threshold];
     let clause_sizes = [1usize];
@@ -250,6 +263,7 @@ fn gate_off_is_byte_identical_and_gate_on_verifies() {
 #[test]
 fn out_of_band_domain_is_not_escalated() {
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     let (graph, input, spec, _threshold, f32_lower) = fp_blocked_fixture();
     // Threshold far above the bound: gap way outside the band -> ineligible.
     let thresholds = [f32_lower + 1.0];
@@ -282,6 +296,7 @@ fn out_of_band_domain_is_not_escalated() {
 #[test]
 fn unsupported_net_declines_and_leaves_domain_untouched() {
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     // Sigmoid head: outside the f64-tail op class.
     let mut graph = GraphNetwork::new();
     graph.add_node(GraphNode::from_input(
@@ -349,6 +364,7 @@ fn unsupported_net_declines_and_leaves_domain_untouched() {
 #[test]
 fn mul_binary_alphas_are_threaded_through() {
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     // Smoke: passing a (well-formed) alpha map through both hooks must not
     // panic or alter behavior on a net without MulBinary nodes.
     let (graph, input, spec, threshold, f32_lower) = fp_blocked_fixture();
@@ -423,6 +439,7 @@ fn alpha_gate_off_is_byte_identical() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     let (graph, alphas) = build_square_net();
     let d = 0.02_f32;
     let input = bt(&[-d], &[d]);
@@ -476,6 +493,7 @@ fn alpha_tail_micro_bab_closes_relaxation_gap() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     let (graph, alphas) = build_square_net();
     let d = 0.02_f32;
     let input = bt(&[-d], &[d]);
@@ -539,6 +557,7 @@ fn alpha_tail_micro_bab_fails_closed_when_any_child_cannot_verify() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     let (graph, alphas) = build_square_net();
     let d = 0.02_f32;
     let input = bt(&[-d], &[d]);
@@ -585,6 +604,7 @@ fn alpha_tail_alone_arms_the_seam_for_fp_blocked_domains() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     // The landed fp-blocked LINEAR fixture (no MulBinary): the refreshed pass
     // degenerates to the plain certified baseline, and NY_ALPHA_TAIL alone
     // (NY_F64_TAIL off) must still arm the seam and verify it.
@@ -633,6 +653,7 @@ fn alpha_tail_declines_unsupported_net_and_leaves_domain_untouched() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
     // Sigmoid head: outside the f64-tail op class — the alpha path must fail
     // closed exactly like the landed path.
     let mut graph = GraphNetwork::new();

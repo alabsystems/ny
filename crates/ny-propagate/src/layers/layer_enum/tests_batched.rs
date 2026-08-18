@@ -10,6 +10,28 @@ use ny_tensor::BoundedTensor;
 use ny_test_utils::CountingGemmEngine;
 
 #[test]
+fn test_layer_erf_batched_crown_dispatch_matches_direct() -> Result<()> {
+    let layer = ErfLayer::new();
+    let pre_activation = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![-3.0, -1.0, -0.25, 0.0, 0.5, 2.0])
+            .expect("valid lower shape"),
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![-2.0, 0.5, 0.25, 1.0, 1.5, 3.0])
+            .expect("valid upper shape"),
+    )?;
+    let bounds = BatchedLinearBounds::identity(&[2, 3])?;
+
+    let expected = layer.propagate_linear_batched_with_bounds(&bounds, &pre_activation)?;
+    let actual =
+        Layer::Erf(layer).propagate_crown_backward_batched(&bounds, Some(&pre_activation), None)?;
+
+    assert_eq!(actual.lower_a(), expected.lower_a());
+    assert_eq!(actual.upper_a(), expected.upper_a());
+    assert_eq!(actual.lower_b(), expected.lower_b());
+    assert_eq!(actual.upper_b(), expected.upper_b());
+    Ok(())
+}
+
+#[test]
 fn test_layer_conv1d_batched_crown_dispatch_uses_engine_3622() -> Result<()> {
     let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 1]), vec![2.0_f32]).expect("kernel");
     let layer = Layer::Conv1d(Conv1dLayer::new(kernel, Some(arr1(&[0.5_f32])), 1, 0)?);

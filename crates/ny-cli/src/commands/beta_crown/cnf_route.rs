@@ -29,28 +29,67 @@
 //!
 //! Detect the gadget BIT-EXACTLY (all weights are small integers, exactly
 //! representable in f32 — any deviation falls through fail-closed), decompile
-//! to DIMACS, and hand the CNF to the `ay` CDCL SAT solver:
-//! - `s UNSATISFIABLE` ⇒ property holds ⇒ `Verified`; ay writes a DRAT proof
-//!   artifact next to the CNF by default (certificate-grade follow-up: check it
-//!   with ay's DRAT/LRAT checkers + the Lean gadget-equivalence theorem);
-//! - `s SATISFIABLE`  ⇒ boolean model ⇒ exact `{0,1}` witness, CONFIRMED
-//!   in-process by a concrete forward before claiming (and re-confirmed by the
-//!   vnncomp ONNX-Runtime trusted-oracle gate downstream);
-//! - anything else (timeout / UNKNOWN / missing binary / parse trouble)
-//!   ⇒ `None` ⇒ the normal pipeline continues unchanged.
+//! to a CNF, and decide it with the `ay-sat` CDCL solver **in process**:
+//! - UNSAT ⇒ property holds ⇒ `Verified`, but ONLY after ay's own refutation
+//!   has been re-derived as an in-memory resolution DAG and replayed by
+//!   [`ay_sat::ResolutionDag::validate`] (see the soundness contract below);
+//! - SAT   ⇒ boolean model ⇒ exact `{0,1}` witness, CONFIRMED in-process by a
+//!   concrete forward before claiming (and re-confirmed by the vnncomp
+//!   ONNX-Runtime trusted-oracle gate downstream);
+//! - anything else (deadline / UNKNOWN / certificate trouble) ⇒ `None` ⇒ the
+//!   caller continues the normal pipeline when budget remains; an exhausted
+//!   caller deadline may instead terminate as `Timeout`.
 //!
-//! Binary discovery: `$NY_AY` (path to the `ay` binary), then `ay` on `$PATH`,
-//! then the rustup-linked `trust` toolchain.
-//! SAT-variant pin: `--sat-variant probe` by default (`NY_AY_SAT_VARIANT`
-//! overrides; `default` omits the flag) — the default variant has a known
-//! `s UNKNOWN`-under-proof-logging completeness gap on some UNSAT instances.
+//! # Why in-process (and not a subprocess)
+//!
+//! This route used to shell out to an `ay` binary discovered at runtime via
+//! `$NY_AY`, then `ay` on `$PATH`, then the rustup `trust` toolchain. When none
+//! of the three resolved — the common case on a clean checkout, since nothing
+//! in `cargo build` or `vnncomp_scripts/` ever produces that binary — the route
+//! silently returned `None` and all 100 sat_relu instances timed out. The
+//! ledger's sat_relu row was therefore not reproducible from the repo: it
+//! depended on an artifact the build never emitted.
+//!
+//! `ay-sat` is now a direct rev-pinned dependency of `ny-cli` (the SAME ay
+//! commit `ny-mip` already pins for `ay-milp`, and already in the build graph
+//! transitively via ay-milp -> ay-dpll -> ay-sat). There is no environment
+//! seam left to misconfigure and no per-solve process spawn, DIMACS temp file,
+//! or stdout parsing. The old 8 GiB `--memory` envelope is moot in process:
+//! ay-sat sizes its arena from `num_vars` alone (no machine-memory probing),
+//! and a recovered sat_relu CNF is a few hundred clauses over a few dozen
+//! variables.
+//!
+//! # Soundness contract
+//!
+//! A wrong UNSAT is a false `Verified` and costs −150, so the solver's *status*
+//! is never trusted on its own:
+//!
+//! 1. **Detection** is bit-exact and fail-closed, and establishes the exact
+//!    equivalence above: the unsafe region is nonempty **iff** the recovered CNF
+//!    is satisfiable. It is a decompilation, not a relaxation.
+//! 2. **UNSAT ⇒ Verified** requires a *checked certificate*.
+//!    [`ay_sat::prove_cnf_unsat_dimacs`] re-solves the CNF with proof logging
+//!    and returns the solver's own refutation as an in-memory
+//!    [`ay_sat::ResolutionDag`] (original clauses + LRAT-style RUP steps ending
+//!    in the empty clause). We then re-run [`ay_sat::ResolutionDag::validate`]
+//!    ourselves — an independent, hint-driven RUP replay with CaDiCaL
+//!    `lratchecker.cpp` semantics — and, critically, confirm the DAG's
+//!    `original_clauses` are EXACTLY the clauses we handed in. A valid
+//!    refutation of some *other* clause set would prove nothing about ours.
+//! 3. **SAT ⇒ Violated** is confirmed by a concrete in-process forward through
+//!    the real network (`concrete_violates`), then re-confirmed downstream by
+//!    the vnncomp ORT trusted-oracle gate. The SAT direction cannot produce a
+//!    false `Verified` at all.
+//! 4. Every failure mode — deadline expiry, `Unknown`, a certificate that does
+//!    not replay, a certificate over the wrong clauses — returns `None`. The
+//!    route can decline to produce a verdict; it can never produce a wrong one.
+//!
 //! Disable the whole driver with `NY_NO_CNF_ROUTE=1` (batteries-included:
 //! default ON; detection costs microseconds and only fires on the exact gadget).
 
-use std::io::Write as _;
-use std::process::Command;
 use std::time::Instant;
 
+use ay_sat::{Literal, ResolutionDag, SatResult, Solver};
 use ndarray::{ArrayD, IxDyn};
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_propagate::{
@@ -62,6 +101,35 @@ use tracing::{debug, info, warn};
 use super::cell_enum::concrete_violates;
 use super::BetaCrownModel;
 
+/// Wall-clock headroom the certification pass must have before it is attempted.
+///
+/// The gate solve (which runs under the real deadline) has already refuted the
+/// formula by the time we get here, so certification re-treads a search we know
+/// terminates; but it re-solves with proof logging and is not itself
+/// deadline-interruptible, so we only start it with room to spare.
+/// Below this floor we decline rather than risk overrunning the harness
+/// watchdog. See [`certify_headroom`].
+const CERTIFY_MIN_REMAINING: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Multiple of the observed gate-solve cost the certification pass must have
+/// available before it is started. Certification re-treads the same search with
+/// preprocessing likewise disabled, so the gate's own cost is the natural scale;
+/// the multiple absorbs proof recording and the RUP replay.
+const CERTIFY_COST_MULTIPLE: u32 = 4;
+
+/// Wall-clock the certification pass must have before it is worth starting:
+/// the floor, or `CERTIFY_COST_MULTIPLE` times what the gate solve just cost,
+/// whichever is larger.
+///
+/// The gate runs under the real deadline and has already refuted the formula, so
+/// its elapsed time is a live, instance-specific measurement of how hard this
+/// search is — a far better bound than any fixed constant. A gadget that the
+/// gate cracked in 0.1s needs only the floor; one that took 20s is required to
+/// show 80s before we commit to re-solving it uninterruptibly.
+fn certify_headroom(gate_cost: std::time::Duration) -> std::time::Duration {
+    CERTIFY_MIN_REMAINING.max(gate_cost * CERTIFY_COST_MULTIPLE)
+}
+
 /// A recovered CNF: variables are `1..=n_vars` (DIMACS convention), each clause
 /// a list of nonzero literals (`+v` positive, `−v` negated).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,13 +138,14 @@ pub(super) struct RecoveredCnf {
     pub clauses: Vec<Vec<i64>>,
 }
 
-/// Try the CNF-recovery driver. `None` => not applicable / undecided: the
-/// caller MUST continue with the normal pipeline unchanged.
+/// Try the CNF-recovery driver. `None` means not applicable or undecided. The
+/// caller preserves normal fallthrough when budget remains; an exhausted
+/// caller deadline may terminate as `Timeout`.
 pub(super) fn try_cnf_recovery(
     model_net: &BetaCrownModel,
     input_shape: &[usize],
     vnnlib: &VnnLibSpec,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Option<BetaCrownResult> {
     if std::env::var_os("NY_NO_CNF_ROUTE").is_some_and(|v| v == "1") {
         return None;
@@ -90,66 +159,73 @@ pub(super) fn try_cnf_recovery(
         cnf.clauses.len()
     );
 
-    let ay = resolve_ay_binary()?;
-    let budget = deadline.checked_duration_since(Instant::now())?;
+    // DIMACS literals are `i32` at the ay-sat boundary; a formula that does not
+    // fit is not a sat_relu gadget. Fail closed.
+    let clauses = to_i32_clauses(&cnf)?;
 
-    // Write the DIMACS next to a unique temp stem so ay's default proof artifact
-    // (`<input>.drat`) lands somewhere predictable and loggable.
-    let dir = std::env::temp_dir();
-    let stem = format!(
-        "ny_cnf_{}_{}",
-        std::process::id(),
-        start.elapsed().as_nanos()
-    );
-    let cnf_path = dir.join(format!("{stem}.cnf"));
-    {
-        let mut f = std::fs::File::create(&cnf_path).ok()?;
-        write!(f, "{}", to_dimacs(&cnf)).ok()?;
-    }
-
-    let mut cmd = Command::new(&ay);
-    cmd.arg("solve").arg(&cnf_path);
-    // Leave ≥1s to write the verdict; ay's -t is milliseconds.
-    let ms = budget.as_millis().saturating_sub(1000).max(1000) as u64;
-    cmd.arg("-t").arg(ms.to_string());
-    let variant = std::env::var("NY_AY_SAT_VARIANT").unwrap_or_else(|_| "probe".to_string());
-    if variant != "default" {
-        cmd.arg("--sat-variant").arg(&variant);
-    }
-    debug!("CNF recovery: invoking {:?}", cmd);
-    let out = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("CNF recovery: failed to run ay ({e}); falling through");
-            return None;
-        }
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let status_line = stdout
-        .lines()
-        .find(|l| l.starts_with("s "))
-        .map(str::trim)
-        .unwrap_or("");
-
-    match status_line {
-        "s UNSATISFIABLE" => {
-            // Do NOT trust ay's UNSAT on faith: check the DRAT proof it just
-            // wrote with ay's own independent DRAT checker before concluding
-            // Verified. A wrong UNSAT would be a −150 false-VERIFIED; the proof
-            // check closes that gap (certificate-CHECKED, not verdict-grade).
-            let drat = cnf_path.with_extension("cnf.drat");
-            if !check_drat(&ay, &cnf_path, &drat) {
+    match solve_gate(&cnf, &clauses, deadline)? {
+        SatResult::Sat(model) => {
+            // `model[i]` is variable `i + 1` (ay-sat's DIMACS convention, the
+            // same one the old `v `-line parser used). Fail closed if the
+            // solver returned fewer assignments than we have variables.
+            if model.len() < cnf.n_vars {
                 warn!(
-                    "CNF recovery: ay reported UNSAT but its DRAT proof did not verify \
-                     (or is missing); falling through (sound — never Verified on an \
-                     unchecked refutation)"
+                    "CNF recovery: SAT model covers {} of {} variables; falling through (sound)",
+                    model.len(),
+                    cnf.n_vars
+                );
+                return None;
+            }
+            let result = confirm_boolean_witness(
+                model_net,
+                input_shape,
+                vnnlib,
+                &model[..cnf.n_vars],
+                start,
+            );
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                warn!(
+                    "CNF recovery: SAT witness confirmation finished after the caller's \
+                     deadline; falling through without publishing a verdict"
+                );
+                return None;
+            }
+            result
+        }
+        SatResult::Unsat(_) => {
+            // Do NOT conclude Verified from the solver's status. Re-derive the
+            // refutation as a certificate and CHECK it; a wrong UNSAT here is a
+            // −150 false-VERIFIED. See the module-level soundness contract.
+            let needed = certify_headroom(start.elapsed());
+            if let Some(deadline) = deadline {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                if remaining < needed {
+                    warn!(
+                        "CNF recovery: refuted but only {:.2}s left to certify (need {:.2}s); \
+                         falling through (sound — never Verified on an unchecked refutation)",
+                        remaining.as_secs_f64(),
+                        needed.as_secs_f64()
+                    );
+                    return None;
+                }
+            }
+            if !certify_refutation(&cnf, &clauses) {
+                return None;
+            }
+            // The proof API is not interruptible. The headroom gate above
+            // bounds the risk, and this second gate ensures a proof that
+            // nevertheless finishes late can never publish a verdict.
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                warn!(
+                    "CNF recovery: refutation certificate validated after the caller's \
+                     deadline; falling through without publishing a verdict"
                 );
                 return None;
             }
             info!(
-                "CNF recovery: ay UNSAT + DRAT VERIFIED in {:.1}s -> property VERIFIED ({})",
-                start.elapsed().as_secs_f64(),
-                drat.display()
+                "CNF recovery: ay UNSAT + resolution-DAG certificate VALIDATED in {:.2}s \
+                 -> property VERIFIED",
+                start.elapsed().as_secs_f64()
             );
             Some(BetaCrownResult {
                 result: BabVerificationStatus::Verified,
@@ -161,112 +237,139 @@ pub(super) fn try_cnf_recovery(
                 output_bounds: None,
             })
         }
-        "s SATISFIABLE" => {
-            let model = parse_dimacs_model(&stdout, cnf.n_vars)?;
-            confirm_boolean_witness(model_net, input_shape, vnnlib, &model, start)
-        }
-        other => {
-            debug!(
-                "CNF recovery: ay returned '{}' (not decisive); falling through",
-                other
+        // `SatResult` is `#[non_exhaustive]`, so this arm covers both today's
+        // `Unknown` and any status ay-sat adds later. Both decline: only the
+        // two arms above — each with its own confirmation — may yield a
+        // verdict, and an unrecognized future status must never acquire one by
+        // default.
+        _ => {
+            // Deadline expiry lands here; ay-sat's contract is that an expired
+            // deadline can only produce Unknown, never a verdict.
+            info!(
+                "CNF recovery: ay returned no decision after {:.2}s (deadline or \
+                 incompleteness); falling through to the normal pipeline",
+                start.elapsed().as_secs_f64()
             );
             None
         }
     }
 }
 
-/// Verify a DRAT refutation with ay's own checker: `ay check drat <cnf> <drat>`
-/// prints `s VERIFIED` / exit 0 on success. Returns `true` ONLY on a verified
-/// proof — a missing artifact, a checker error, or `s NOT VERIFIED` all return
-/// `false` (fail-closed: an unverified refutation is never trusted).
-fn check_drat(ay: &std::path::Path, cnf: &std::path::Path, drat: &std::path::Path) -> bool {
-    if !drat.is_file() {
+/// Narrow the recovered clauses to the `i32` DIMACS literals ay-sat consumes.
+///
+/// Also the panic guard for the ay-sat boundary: `Literal::from_dimacs` panics
+/// on literal `0` and on a variable outside the solver's range. `extract_cnf`
+/// cannot emit either, but a verifier must not be one refactor away from
+/// aborting mid-run, so every literal is range-checked here and anything
+/// unrepresentable declines the route instead.
+fn to_i32_clauses(cnf: &RecoveredCnf) -> Option<Vec<Vec<i32>>> {
+    let n_vars = i32::try_from(cnf.n_vars).ok()?;
+    cnf.clauses
+        .iter()
+        .map(|clause| {
+            clause
+                .iter()
+                .map(|&lit| {
+                    let lit = i32::try_from(lit).ok()?;
+                    // Nonzero, and |lit| names a variable we declared.
+                    (lit != 0 && lit.unsigned_abs() <= n_vars.unsigned_abs()).then_some(lit)
+                })
+                .collect::<Option<Vec<i32>>>()
+        })
+        .collect()
+}
+
+/// The deadline-bounded gate solve: decide the CNF within the caller's budget.
+///
+/// This is the only phase that can block for the whole budget, so it is the one
+/// that carries the deadline. Preprocessing is disabled to match the
+/// certification pass exactly (see [`certify_refutation`]), which makes this
+/// solve a faithful predictor of that pass's cost and avoids the
+/// `Unknown`-under-proof-logging gap that equisatisfiable preprocessing
+/// transforms can otherwise cause.
+fn solve_gate(
+    cnf: &RecoveredCnf,
+    clauses: &[Vec<i32>],
+    deadline: Option<Instant>,
+) -> Option<SatResult> {
+    // A deadline already in the past leaves nothing to spend.
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return None;
+    }
+
+    let mut solver = Solver::new(cnf.n_vars);
+    solver.set_preprocess_enabled(false);
+    solver.set_solve_deadline(deadline);
+    for clause in clauses {
+        solver.add_clause(clause.iter().copied().map(Literal::from_dimacs).collect());
+    }
+    Some(solver.solve().into_inner())
+}
+
+/// Produce and CHECK a refutation certificate for `cnf`.
+///
+/// [`ay_sat::prove_cnf_unsat_dimacs`] re-solves with LRAT proof logging and
+/// preprocessing disabled, returning the solver's own refutation as an
+/// in-memory [`ResolutionDag`]. Two independent checks must then pass:
+///
+/// * [`ResolutionDag::validate`] — a hint-driven RUP replay of every derived
+///   step, ending at the empty clause (CaDiCaL `lratchecker.cpp` semantics).
+///   `prove_cnf_unsat_dimacs` runs this too; we re-run it so the guarantee is
+///   enforced HERE and cannot be lost to an upstream refactor.
+/// * [`certificate_covers`] — the DAG's original clauses are exactly the ones
+///   we handed in. A perfectly valid refutation of a *different* clause set
+///   would prove nothing about this network.
+///
+/// Returns `false` on any failure; the caller then declines to produce a
+/// verdict.
+fn certify_refutation(cnf: &RecoveredCnf, clauses: &[Vec<i32>]) -> bool {
+    let dag = match ay_sat::prove_cnf_unsat_dimacs(cnf.n_vars, clauses) {
+        Ok(dag) => dag,
+        Err(e) => {
+            warn!(
+                "CNF recovery: ay reported UNSAT but no refutation certificate could be \
+                 produced ({e}); falling through (sound — never Verified on an unchecked \
+                 refutation)"
+            );
+            return false;
+        }
+    };
+    if let Err(e) = dag.validate() {
+        warn!(
+            "CNF recovery: refutation certificate did not replay ({e}); falling through \
+             (sound — never Verified on an unchecked refutation)"
+        );
         return false;
     }
-    match Command::new(ay)
-        .arg("check")
-        .arg("drat")
-        .arg(cnf)
-        .arg(drat)
-        .output()
-    {
-        Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).contains("s VERIFIED"),
-        Err(e) => {
-            warn!("CNF recovery: `ay check drat` failed to run ({e})");
-            false
-        }
+    if !certificate_covers(&dag, cnf.n_vars, clauses) {
+        warn!(
+            "CNF recovery: refutation certificate is over a different clause set than the \
+             recovered CNF; falling through (sound)"
+        );
+        return false;
     }
+    true
 }
 
-/// `$NY_AY` (explicit path), `ay` on PATH, then the rustup-linked `trust`
-/// toolchain. Returns `None` when no binary is resolvable (driver silently
-/// disabled).
-fn resolve_ay_binary() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("NY_AY") {
-        let p = std::path::PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-        warn!("NY_AY is set but not a file; ignoring");
+/// Confirm `dag` refutes EXACTLY the clause set we submitted: same variable
+/// count, same clause count, and every original clause identical (literal for
+/// literal, in order) with the canonical LRAT id `index + 1`.
+fn certificate_covers(dag: &ResolutionDag, n_vars: usize, clauses: &[Vec<i32>]) -> bool {
+    if dag.num_vars != n_vars || dag.original_clauses.len() != clauses.len() {
+        return false;
     }
-    // PATH probe: cheap `which`-alike.
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let cand = dir.join("ay");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    let rustup_home = std::env::var_os("RUSTUP_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".rustup"))
-        });
-    if let Some(candidate) = rustup_home.map(|root| root.join("toolchains/trust/bin/ay")) {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    debug!("CNF recovery: no ay binary (NY_AY, PATH, or rustup trust toolchain)");
-    None
-}
-
-/// Render DIMACS. Variables 1..=n, `0`-terminated clause lines.
-fn to_dimacs(cnf: &RecoveredCnf) -> String {
-    let mut s = format!("p cnf {} {}\n", cnf.n_vars, cnf.clauses.len());
-    for clause in &cnf.clauses {
-        for lit in clause {
-            s.push_str(&lit.to_string());
-            s.push(' ');
-        }
-        s.push_str("0\n");
-    }
-    s
-}
-
-/// Parse the `v `-line model (DIMACS conventions: signed ints, 0 terminator).
-/// Returns per-variable booleans indexed `0..n_vars`. Fails closed on any
-/// missing variable.
-fn parse_dimacs_model(stdout: &str, n_vars: usize) -> Option<Vec<bool>> {
-    let mut assigned: Vec<Option<bool>> = vec![None; n_vars];
-    for line in stdout.lines() {
-        let Some(rest) = line.strip_prefix("v ") else {
-            continue;
-        };
-        for tok in rest.split_whitespace() {
-            let lit: i64 = tok.parse().ok()?;
-            if lit == 0 {
-                continue;
-            }
-            let var = lit.unsigned_abs() as usize;
-            if var == 0 || var > n_vars {
-                return None; // out-of-range literal: fail closed
-            }
-            assigned[var - 1] = Some(lit > 0);
-        }
-    }
-    assigned.into_iter().collect()
+    dag.original_clauses
+        .iter()
+        .zip(clauses)
+        .enumerate()
+        .all(|(index, ((id, dag_clause), ours))| {
+            *id == index as u64 + 1
+                && dag_clause.len() == ours.len()
+                && dag_clause
+                    .iter()
+                    .zip(ours)
+                    .all(|(lit, &ours)| lit.to_dimacs() == ours)
+        })
 }
 
 /// Build the exact `{0,1}` witness from the boolean model, confirm it with a
@@ -384,15 +487,21 @@ fn detect(
         BetaCrownModel::Graph(graph) => graph_chain(graph)?,
     };
 
-    let Some(b1) = l1.bias.as_ref() else {
+    let Some(b1) = l1.bias() else {
         debug!("CNF route: L1 has no bias; falling through");
         return None;
     };
-    let Some(b2) = l2.bias.as_ref() else {
+    let Some(b2) = l2.bias() else {
         debug!("CNF route: L2 has no bias; falling through");
         return None;
     };
-    let cnf = extract_cnf(l1.weight.view(), b1.view(), l2.weight.view(), b2.view(), n);
+    let cnf = extract_cnf(
+        l1.weight().view(),
+        b1.view(),
+        l2.weight().view(),
+        b2.view(),
+        n,
+    );
     if cnf.is_none() {
         debug!("CNF route: chain matched but gadget extraction failed (bit-exact mismatch)");
     }
@@ -553,6 +662,131 @@ mod tests {
     use super::*;
     use ndarray::{arr1, arr2};
 
+    use std::time::Duration;
+
+    fn cnf(n_vars: usize, clauses: &[&[i64]]) -> RecoveredCnf {
+        RecoveredCnf {
+            n_vars,
+            clauses: clauses.iter().map(|c| c.to_vec()).collect(),
+        }
+    }
+
+    /// The in-process solver decides an UNSAT formula AND its refutation
+    /// certificate replays against exactly the clauses we submitted. This is
+    /// the whole UNSAT ⇒ `Verified` soundness path, minus the network layer.
+    #[test]
+    fn unsat_formula_is_refuted_and_certified() {
+        // (x1) ∧ (¬x1) — unsatisfiable.
+        let formula = cnf(1, &[&[1], &[-1]]);
+        let clauses = to_i32_clauses(&formula).expect("representable");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(matches!(
+            solve_gate(&formula, &clauses, Some(deadline)),
+            Some(SatResult::Unsat(_))
+        ));
+        assert!(certify_refutation(&formula, &clauses));
+    }
+
+    /// A satisfiable formula yields a model covering every variable, and is
+    /// never certified as refuted.
+    #[test]
+    fn sat_formula_yields_a_full_model_and_no_certificate() {
+        // (x1 ∨ x2) ∧ (¬x1) ⇒ x1=false, x2=true.
+        let formula = cnf(2, &[&[1, 2], &[-1]]);
+        let clauses = to_i32_clauses(&formula).expect("representable");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let Some(SatResult::Sat(model)) = solve_gate(&formula, &clauses, Some(deadline)) else {
+            panic!("expected SAT");
+        };
+        assert!(model.len() >= formula.n_vars);
+        assert!(!model[0], "x1 must be false");
+        assert!(model[1], "x2 must be true");
+        // No refutation exists, so certification must fail closed.
+        assert!(!certify_refutation(&formula, &clauses));
+    }
+
+    /// A certificate is only accepted for the EXACT clause set it refutes.
+    /// Re-pointing a valid refutation at a different formula must be rejected,
+    /// otherwise a verified proof of some other problem could admit a verdict.
+    #[test]
+    fn certificate_must_cover_the_submitted_clause_set() {
+        let refuted = cnf(1, &[&[1], &[-1]]);
+        let refuted_clauses = to_i32_clauses(&refuted).expect("representable");
+        let dag =
+            ay_sat::prove_cnf_unsat_dimacs(refuted.n_vars, &refuted_clauses).expect("refutable");
+        assert!(certificate_covers(&dag, refuted.n_vars, &refuted_clauses));
+
+        // Same shape, different literals.
+        let other = to_i32_clauses(&cnf(1, &[&[-1], &[1]])).expect("representable");
+        assert!(!certificate_covers(&dag, 1, &other));
+        // Fewer clauses than the DAG refutes.
+        let short = to_i32_clauses(&cnf(1, &[&[1]])).expect("representable");
+        assert!(!certificate_covers(&dag, 1, &short));
+        // Variable count mismatch.
+        assert!(!certificate_covers(&dag, 2, &refuted_clauses));
+    }
+
+    /// Certification is uninterruptible, so its go/no-go budget must scale with
+    /// how expensive the (deadline-bounded) gate solve just proved to be, never
+    /// sitting at a fixed constant.
+    #[test]
+    fn certify_headroom_scales_with_gate_cost() {
+        // A cheap gate only has to clear the floor.
+        assert_eq!(
+            certify_headroom(Duration::from_millis(10)),
+            CERTIFY_MIN_REMAINING
+        );
+        // An expensive gate demands a multiple of its own cost.
+        assert_eq!(
+            certify_headroom(Duration::from_secs(20)),
+            Duration::from_secs(80)
+        );
+        // Monotone: a harder gate never asks for less.
+        assert!(
+            certify_headroom(Duration::from_secs(5)) >= certify_headroom(Duration::from_secs(1))
+        );
+    }
+
+    /// An already-expired deadline must decline rather than start a solve.
+    #[test]
+    fn expired_deadline_declines() {
+        let formula = cnf(1, &[&[1], &[-1]]);
+        let clauses = to_i32_clauses(&formula).expect("representable");
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a one-second-old instant is representable");
+        assert!(solve_gate(&formula, &clauses, Some(expired)).is_none());
+    }
+
+    #[test]
+    fn unbounded_gate_solve_has_no_synthetic_deadline() {
+        let formula = cnf(1, &[&[1], &[-1]]);
+        let clauses = to_i32_clauses(&formula).expect("representable");
+        assert!(matches!(
+            solve_gate(&formula, &clauses, None),
+            Some(SatResult::Unsat(_))
+        ));
+    }
+
+    /// The ay-sat boundary panics on literal 0 / out-of-range variables, so the
+    /// conversion must reject them instead of handing them over.
+    #[test]
+    fn unrepresentable_literals_decline_instead_of_panicking() {
+        assert!(
+            to_i32_clauses(&cnf(2, &[&[1, 0]])).is_none(),
+            "zero literal"
+        );
+        assert!(
+            to_i32_clauses(&cnf(2, &[&[3]])).is_none(),
+            "variable above n_vars"
+        );
+        assert!(
+            to_i32_clauses(&cnf(2, &[&[i64::from(i32::MAX) + 1]])).is_none(),
+            "literal beyond i32"
+        );
+        assert!(to_i32_clauses(&cnf(2, &[&[1, -2]])).is_some(), "in range");
+    }
+
     /// Gadget for the 2-var CNF  (x1 ∨ ¬x2) ∧ (¬x1):
     ///   clause rows:  [−1, +1] b=0   (x1 ∨ ¬x2: −1@1 ⇒ x1, +1@2 ⇒ ¬x2, #neg=1)
     ///                 [+1,  0] b=0   (¬x1: #neg=1 ⇒ b=1−1=0)
@@ -584,10 +818,26 @@ mod tests {
     #[test]
     fn extracts_the_exact_cnf() {
         let (w1, b1, w2, b2) = gadget();
-        let cnf = extract_cnf(w1.view(), b1.view(), w2.view(), b2.view(), 2).expect("gadget");
-        assert_eq!(cnf.n_vars, 2);
-        assert_eq!(cnf.clauses, vec![vec![1, -2], vec![-1]]);
-        assert_eq!(to_dimacs(&cnf), "p cnf 2 2\n1 -2 0\n-1 0\n");
+        let recovered = extract_cnf(w1.view(), b1.view(), w2.view(), b2.view(), 2).expect("gadget");
+        assert_eq!(recovered.n_vars, 2);
+        assert_eq!(recovered.clauses, vec![vec![1, -2], vec![-1]]);
+        // Literal polarity survives the ay-sat round trip: −1 ⇒ x_j, +1 ⇒ ¬x_j.
+        let clauses = to_i32_clauses(&recovered).expect("representable");
+        assert_eq!(clauses, vec![vec![1, -2], vec![-1]]);
+    }
+
+    /// End-to-end on the decompiled gadget: (x1 ∨ ¬x2) ∧ (¬x1) is satisfiable
+    /// (x1=false, x2=false), so the route must find a model rather than refute.
+    #[test]
+    fn gadget_cnf_round_trips_through_the_solver() {
+        let (w1, b1, w2, b2) = gadget();
+        let recovered = extract_cnf(w1.view(), b1.view(), w2.view(), b2.view(), 2).expect("gadget");
+        let clauses = to_i32_clauses(&recovered).expect("representable");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let Some(SatResult::Sat(model)) = solve_gate(&recovered, &clauses, Some(deadline)) else {
+            panic!("expected SAT");
+        };
+        assert!(!model[0], "x1 must be false to satisfy (¬x1)");
     }
 
     /// FAIL-CLOSED: any single perturbed constant must abort extraction — the
@@ -621,13 +871,24 @@ mod tests {
         assert!(extract_cnf(w1.view(), b1.view(), w2.view(), b2.view(), 2).is_none());
     }
 
+    /// Deciding a formula must not require anything outside the built binary.
+    ///
+    /// This is the regression guard for the defect that made sat_relu score 0
+    /// from a clean build: the route used to shell out to an `ay` binary
+    /// discovered through `$NY_AY` / `$PATH` / the rustup `trust` toolchain, and
+    /// silently declined when none resolved. This test — like every other test
+    /// here — runs on machines where no such binary exists, so a return to any
+    /// out-of-process transport makes the suite fail rather than quietly
+    /// forfeit a category.
     #[test]
-    fn model_parse_roundtrip() {
-        let out = "c comment\ns SATISFIABLE\nv 1 -2 0\n";
-        assert_eq!(parse_dimacs_model(out, 2), Some(vec![true, false]));
-        // missing var 2 fails closed
-        assert_eq!(parse_dimacs_model("s SATISFIABLE\nv 1 0\n", 2), None);
-        // out-of-range literal fails closed
-        assert_eq!(parse_dimacs_model("v 3 0\n", 2), None);
+    fn deciding_needs_no_external_binary() {
+        let formula = cnf(3, &[&[1, 2], &[-1], &[-2, 3]]);
+        let clauses = to_i32_clauses(&formula).expect("representable");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let Some(SatResult::Sat(model)) = solve_gate(&formula, &clauses, Some(deadline)) else {
+            panic!("expected SAT");
+        };
+        // x1=false forces x2=true, which forces x3=true.
+        assert!(!model[0] && model[1] && model[2]);
     }
 }

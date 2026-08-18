@@ -168,9 +168,6 @@ pub(super) fn try_rewrite_instance_norm(
 
     let ny_name = spec.inputs.get(1)?;
     let beta_name = spec.inputs.get(2)?;
-    if weights.get(ny_name)?.ndim() != 1 || weights.get(beta_name)?.ndim() != 1 {
-        return None;
-    }
 
     let input_name = spec.inputs.first()?.clone();
     let input_shape = tensor_shapes.get(&input_name)?.clone();
@@ -178,6 +175,47 @@ pub(super) fn try_rewrite_instance_norm(
     if input_shape.len() < 3 {
         return None;
     }
+    let num_channels = usize::try_from(*input_shape.get(1)?).ok()?;
+    if num_channels == 0 {
+        return None;
+    }
+
+    // ONNX stores InstanceNormalization affine parameters as `[C]`, but the
+    // graph builder strips the leading batch dimension from activations.  A
+    // raw `[N,C,H,W]` activation therefore becomes internal `[C,H,W]`; using
+    // `[C]` directly would right-align it with W (and silently scale width when
+    // `W == C`).  Materialize exact-bit reshaped copies `[C,1,...]` at the
+    // internal activation rank so generic elementwise broadcasting applies
+    // parameters by channel for every supported spatial rank.
+    let ny = weights.get(ny_name)?;
+    let beta = weights.get(beta_name)?;
+    if ny.shape() != [num_channels] || beta.shape() != [num_channels] {
+        return None;
+    }
+    let mut affine_shape = vec![num_channels];
+    affine_shape.resize(input_shape.len() - 1, 1);
+    let reshaped_ny =
+        ArrayD::from_shape_vec(IxDyn(&affine_shape), ny.iter().copied().collect()).ok()?;
+    let reshaped_beta =
+        ArrayD::from_shape_vec(IxDyn(&affine_shape), beta.iter().copied().collect()).ok()?;
+    let reshaped_ny_name = unique_tensor_name(
+        &format!("{}__channel_scale", spec.name),
+        reserved_tensor_names,
+        weights,
+    );
+    let reshaped_beta_name = unique_tensor_name(
+        &format!("{}__channel_bias", spec.name),
+        reserved_tensor_names,
+        weights,
+    );
+    weights.insert(reshaped_ny_name.clone(), reshaped_ny);
+    weights.insert(reshaped_beta_name.clone(), reshaped_beta);
+    let affine_shape_i64 = affine_shape
+        .iter()
+        .map(|&dimension| i64::try_from(dimension).ok())
+        .collect::<Option<Vec<_>>>()?;
+    tensor_shapes.insert(reshaped_ny_name.clone(), affine_shape_i64.clone());
+    tensor_shapes.insert(reshaped_beta_name.clone(), affine_shape_i64);
     // Reduced shape: keep batch and channel dims, reduce spatial to 1
     let reduced_shape = reduce_keepdims_spatial(&input_shape)?;
     let spatial_axes: Vec<i64> = (2..input_shape.len() as i64).collect();
@@ -283,7 +321,7 @@ pub(super) fn try_rewrite_instance_norm(
         &spec.name,
         "scaled",
         LayerType::Mul,
-        vec![normalized.output.clone(), ny_name.clone()],
+        vec![normalized.output.clone(), reshaped_ny_name],
         GENERATED_INSTANCENORM_MARKER,
         input_shape.clone(),
         &mut state,
@@ -296,7 +334,7 @@ pub(super) fn try_rewrite_instance_norm(
     let final_add = LayerSpec {
         name: spec.name.clone(),
         layer_type: LayerType::Add,
-        inputs: vec![scaled.output, beta_name.clone()],
+        inputs: vec![scaled.output, reshaped_beta_name],
         outputs: spec.outputs.clone(),
         weights: None,
         attributes: generated_attributes_for(GENERATED_INSTANCENORM_MARKER),

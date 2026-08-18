@@ -34,7 +34,7 @@ mod star;
 pub use core::ZonotopeTensor;
 /// Star-set affine form (zonotope + generator-constraint polytope) for reachability.
 /// New, default-off, and unwired into any verdict path (S1-2 foundation).
-pub use star::{Star, StarConv2dBlockLimits, StarConv2dBlockPlan};
+pub use star::{Star, StarConv2dBlockLimits, StarConv2dBlockPlan, StarReluSplit};
 
 #[cfg(test)]
 mod tests;

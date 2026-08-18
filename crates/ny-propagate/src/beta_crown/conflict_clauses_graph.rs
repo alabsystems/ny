@@ -66,10 +66,12 @@
 //! points). Cap: `NY_BAB_CLAUSE_CAP` (default 10_000).
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use tracing::trace;
 
 use super::branching::GraphSplitHistory;
+use super::conflict_clause_replay::{GraphClauseReplayRunFingerprint, ReplayVerifiedGraphClause};
 use super::conflict_clauses::gate_enabled;
 
 /// One graph activation literal: (relu node name, neuron_idx, phase).
@@ -85,6 +87,38 @@ pub(crate) type GraphActLit = (String, usize, bool);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GraphConflictClause {
     lits: Box<[GraphActLit]>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredGraphConflictClause {
+    clause: GraphConflictClause,
+    provenance: GraphClauseBcpShadowProvenance,
+}
+
+/// Authority carried by the exact clause that produced a shadow implication.
+///
+/// An ordinary clause is the full history of a bound-certified close. A
+/// generalized clause reached the store only after the existing exact replay
+/// boundary minted and consumed a [`ReplayVerifiedGraphClause`]. Keeping these
+/// variants explicit prevents Stage-0 ranking from being mistaken for proof
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum GraphClauseBcpShadowProvenance {
+    VerifiedClose,
+    ReplayVerifiedGeneralized,
+}
+
+/// One exact NeuralSAT-style Boolean unit implication observed in shadow mode.
+///
+/// This value is diagnostic only. It owns no domain, bound, queue, store, or
+/// verdict handle and therefore cannot publish the phase it names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct GraphClauseBcpShadowImplication {
+    pub(super) node_name: String,
+    pub(super) neuron_idx: usize,
+    pub(super) is_active: bool,
+    pub(super) provenance: GraphClauseBcpShadowProvenance,
+    pub(super) source_clause_len: usize,
 }
 
 impl GraphConflictClause {
@@ -155,9 +189,80 @@ impl GraphConflictClause {
             .iter()
             .all(|(node, idx, phase)| history.is_constrained(node, *idx) == Some(*phase))
     }
+
+    /// Return the exact SAT unit implied by this forbidden conjunction.
+    ///
+    /// A stored verified history `(l1 ∧ ... ∧ ln)` represents the learned SAT
+    /// clause `(¬l1 ∨ ... ∨ ¬ln)`. When every stored literal except one matches
+    /// the current history, the missing literal is therefore forced to the
+    /// OPPOSITE phase. An already-opposite assignment satisfies the learned
+    /// clause and suppresses unit propagation, even if it appears after two
+    /// unassigned literals in canonical order.
+    fn unit_implication(&self, history: &GraphSplitHistory) -> Option<GraphActLit> {
+        let mut missing = None;
+        let mut missing_count = 0usize;
+        for (node, idx, stored_phase) in self.lits.iter() {
+            match history.is_constrained(node, *idx) {
+                Some(actual_phase) if actual_phase == *stored_phase => {}
+                Some(_) => return None,
+                None => {
+                    missing_count = missing_count.saturating_add(1);
+                    if missing_count == 1 {
+                        missing = Some((node, *idx, *stored_phase));
+                    }
+                }
+            }
+        }
+        match (missing_count, missing) {
+            (1, Some((node, idx, stored_phase))) => Some((node.clone(), idx, !stored_phase)),
+            _ => None,
+        }
+    }
 }
 
 const DEFAULT_CLAUSE_CAP: usize = 10_000;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STORE_MUTATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static TEST_RECORD_ATTEMPTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_store_mutations() {
+    TEST_STORE_MUTATIONS.with(|mutations| mutations.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_store_mutations() -> usize {
+    TEST_STORE_MUTATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_record_attempts() {
+    TEST_RECORD_ATTEMPTS.with(|attempts| attempts.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_record_attempts() -> usize {
+    TEST_RECORD_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_test_record_attempt() {
+    TEST_RECORD_ATTEMPTS.with(|attempts| {
+        attempts.set(attempts.get().saturating_add(1));
+    });
+}
+
+#[cfg(test)]
+fn record_test_store_mutation() {
+    TEST_STORE_MUTATIONS.with(|mutations| {
+        mutations.set(mutations.get().saturating_add(1));
+    });
+}
 
 /// Per-run graph conflict clause store with subsumption and a FIFO cap.
 ///
@@ -168,10 +273,19 @@ const DEFAULT_CLAUSE_CAP: usize = 10_000;
 pub(crate) struct GraphClauseStore {
     enabled: bool,
     cap: usize,
-    clauses: VecDeque<GraphConflictClause>,
+    /// Immutable exact run binding for replay-generalized insertions.
+    ///
+    /// Every ordinary constructor leaves this `None`, so the dormant replay
+    /// seam fails closed. The sole bound constructor initializes it once;
+    /// there is deliberately no setter or mutable rebind API.
+    replay_run: Option<GraphClauseReplayRunFingerprint>,
+    clauses: VecDeque<StoredGraphConflictClause>,
     /// Domains closed as verified via clause subsumption WITHOUT a bound
     /// computation (observability; logged by the owning loop).
     pruned: usize,
+    /// Prunes uniquely attributable to a replay-generalized clause (no
+    /// ordinary clause also matched the same domain).
+    replay_pruned: usize,
 }
 
 impl GraphClauseStore {
@@ -180,8 +294,10 @@ impl GraphClauseStore {
         Self {
             enabled: false,
             cap: 0,
+            replay_run: None,
             clauses: VecDeque::new(),
             pruned: 0,
+            replay_pruned: 0,
         }
     }
 
@@ -190,8 +306,30 @@ impl GraphClauseStore {
         Self {
             enabled,
             cap: cap.max(1),
+            replay_run: None,
             clauses: VecDeque::new(),
             pruned: 0,
+            replay_pruned: 0,
+        }
+    }
+
+    /// Construct a store whose replay insertion seam is permanently bound to
+    /// one exact objective/root run identity.
+    ///
+    /// This is intentionally a constructor rather than a setter or builder:
+    /// once the store exists, safe code has no way to replace its binding.
+    pub(super) fn with_capacity_and_replay_run(
+        enabled: bool,
+        cap: usize,
+        replay_run: GraphClauseReplayRunFingerprint,
+    ) -> Self {
+        Self {
+            enabled,
+            cap: cap.max(1),
+            replay_run: Some(replay_run),
+            clauses: VecDeque::new(),
+            pruned: 0,
+            replay_pruned: 0,
         }
     }
 
@@ -220,6 +358,17 @@ impl GraphClauseStore {
         self.pruned
     }
 
+    /// Domains pruned only because a replay-generalized clause matched.
+    pub(crate) fn replay_pruned_count(&self) -> usize {
+        self.replay_pruned
+    }
+
+    /// Preserve the already-resolved ordinary environment capacity when the
+    /// empty per-run store is replaced by its immutable replay-bound form.
+    pub(super) fn capacity_for_replay_binding(&self) -> Option<usize> {
+        self.enabled.then_some(self.cap)
+    }
+
     /// Number of stored clauses (test observability).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -235,27 +384,122 @@ impl GraphClauseStore {
     /// the literal set does not determine the region and the certificate would
     /// over-claim. Also no-ops when disabled and for empty histories.
     pub(crate) fn record_verified_close(&mut self, history: &GraphSplitHistory) {
+        #[cfg(test)]
+        record_test_record_attempt();
         if !self.enabled || !history.is_pure_relu_at_zero() {
             return;
         }
         let Some(clause) = GraphConflictClause::from_pure_history(history) else {
             return;
         };
+        self.insert_clause(clause, GraphClauseBcpShadowProvenance::VerifiedClose);
+    }
+
+    /// Insert a strict-subset clause carrying replay-verification authority.
+    ///
+    /// The token is non-cloneable and consumed by value. Its private
+    /// constructor lives at the trusted replay boundary; a raw planner
+    /// proposal cannot call this API. The store, not the caller, owns the
+    /// immutable run identity used to validate the token. An ordinary
+    /// (unbound) store refuses every replay token.
+    pub(super) fn insert_replay_verified(
+        &mut self,
+        token: ReplayVerifiedGraphClause,
+        current_source_history: &GraphSplitHistory,
+    ) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some(replay_run) = self.replay_run.as_ref() else {
+            return false;
+        };
+        let Some((history, deadline)) = token.into_history_for(replay_run, current_source_history)
+        else {
+            return false;
+        };
+        let Some(clause) = GraphConflictClause::from_pure_history(&history) else {
+            return false;
+        };
+        self.insert_replay_clause_before_deadline(clause, deadline)
+    }
+
+    fn insert_clause(
+        &mut self,
+        clause: GraphConflictClause,
+        provenance: GraphClauseBcpShadowProvenance,
+    ) -> bool {
         // (a) If an existing clause is a subset of the new one, the new clause
         // is redundant: anything it would prune, the existing clause already
         // prunes.
-        if self.clauses.iter().any(|c0| c0.is_subset_of(&clause)) {
-            return;
+        if self
+            .clauses
+            .iter()
+            .any(|c0| c0.clause.is_subset_of(&clause))
+        {
+            return false;
         }
         // (b) Remove existing clauses that are supersets of the new one — they
         // prune strictly less than the new clause.
-        self.clauses.retain(|c0| !clause.is_subset_of(c0));
+        self.clauses.retain(|c0| !clause.is_subset_of(&c0.clause));
         // FIFO cap: evict oldest. Eviction only loses pruning power, never
         // soundness.
         while self.clauses.len() >= self.cap {
             self.clauses.pop_front();
         }
-        self.clauses.push_back(clause);
+        self.clauses
+            .push_back(StoredGraphConflictClause { clause, provenance });
+        #[cfg(test)]
+        record_test_store_mutation();
+        true
+    }
+
+    /// Prepare replay insertion without mutating the store, then publish it
+    /// only while the token's private attempt deadline still holds.
+    ///
+    /// Ordinary clauses retain the allocation-free in-place path above. Replay
+    /// is capped at 16 attempts, so copy-on-commit is an acceptable fail-closed
+    /// price for preventing a late proof/token from mutating the live store.
+    fn insert_replay_clause_before_deadline(
+        &mut self,
+        clause: GraphConflictClause,
+        deadline: Instant,
+    ) -> bool {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        for existing in &self.clauses {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if existing.clause.is_subset_of(&clause) {
+                return false;
+            }
+        }
+
+        let retained_capacity = self.clauses.len().saturating_add(1).min(self.cap);
+        let mut retained = VecDeque::with_capacity(retained_capacity);
+        for existing in &self.clauses {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if !clause.is_subset_of(&existing.clause) {
+                retained.push_back(existing.clone());
+            }
+        }
+        while retained.len() >= self.cap {
+            retained.pop_front();
+        }
+        retained.push_back(StoredGraphConflictClause {
+            clause,
+            provenance: GraphClauseBcpShadowProvenance::ReplayVerifiedGeneralized,
+        });
+        if Instant::now() >= deadline {
+            return false;
+        }
+        self.clauses = retained;
+        #[cfg(test)]
+        record_test_store_mutation();
+        true
     }
 
     /// True iff a popped domain may be closed as verified without computing
@@ -274,9 +518,28 @@ impl GraphClauseStore {
         if !self.enabled || self.clauses.is_empty() || !history.is_pure_relu_at_zero() {
             return false;
         }
-        let hit = self.clauses.iter().any(|c| c.is_satisfied_by(history));
+        let mut ordinary_hit = false;
+        let mut replay_hit = false;
+        for stored in &self.clauses {
+            if !stored.clause.is_satisfied_by(history) {
+                continue;
+            }
+            match stored.provenance {
+                GraphClauseBcpShadowProvenance::VerifiedClose => ordinary_hit = true,
+                GraphClauseBcpShadowProvenance::ReplayVerifiedGeneralized => replay_hit = true,
+            }
+        }
+        let hit = ordinary_hit || replay_hit;
         if hit {
             self.pruned += 1;
+            if replay_hit && !ordinary_hit {
+                self.replay_pruned = self.replay_pruned.saturating_add(1);
+                tracing::info!(
+                    replay_cross_prunes = self.replay_pruned,
+                    depth = history.depth(),
+                    "Graph clause replay cross-pruned a domain"
+                );
+            }
             trace!(
                 depth = history.depth(),
                 "Graph domain clause-pruned: subsumed by recorded conflict clause"
@@ -284,11 +547,56 @@ impl GraphClauseStore {
         }
         hit
     }
+
+    /// Return the canonical first exact unit implication without mutating any
+    /// production state.
+    ///
+    /// This shadow seam is deliberately narrower than ordinary subset pruning:
+    ///
+    /// * `shadow_enabled` must come from the exact default-off runtime gate;
+    /// * the store must carry an immutable replay-run binding;
+    /// * `observed_run` must exactly match graph scope, root box, objective rows,
+    ///   thresholds, aggregation mode, and lower-bound property sense;
+    /// * both the stored clause and queried history must be pure ReLU-at-zero.
+    ///
+    /// Candidates are ordered by their owned semantic fields, not clause
+    /// insertion order, so repeated scans expose the same first implication.
+    /// The result has no mutation capability and is never fed back into BaB.
+    pub(super) fn bcp_shadow_first_implication(
+        &self,
+        shadow_enabled: bool,
+        observed_run: &GraphClauseReplayRunFingerprint,
+        history: &GraphSplitHistory,
+    ) -> Option<GraphClauseBcpShadowImplication> {
+        if !shadow_enabled
+            || !self.enabled
+            || self.replay_run.as_ref() != Some(observed_run)
+            || self.clauses.is_empty()
+            || !history.is_pure_relu_at_zero()
+        {
+            return None;
+        }
+
+        self.clauses
+            .iter()
+            .filter_map(|stored| {
+                let (node_name, neuron_idx, is_active) = stored.clause.unit_implication(history)?;
+                Some(GraphClauseBcpShadowImplication {
+                    node_name,
+                    neuron_idx,
+                    is_active,
+                    provenance: stored.provenance,
+                    source_clause_len: stored.clause.lits.len(),
+                })
+            })
+            .min()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beta_crown::bab_cuts::CutFoldScope;
     use crate::beta_crown::branching::{
         GenBabConstraint, GraphNeuronConstraint, NormInvRmsConstraint,
     };
@@ -322,6 +630,20 @@ mod tests {
     fn norm_constraint() -> NormInvRmsConstraint {
         NormInvRmsConstraint::new("rms1".to_string(), 0, 0.5, 2.0, 1.0)
             .expect("valid norm inv_rms constraint")
+    }
+
+    fn run_fingerprint(
+        graph_scope: CutFoldScope,
+        objective_and_property: &[u8],
+        root: &[u8],
+    ) -> GraphClauseReplayRunFingerprint {
+        GraphClauseReplayRunFingerprint::from_exact_identities(
+            graph_scope,
+            objective_and_property,
+            root,
+            64 * 1024,
+        )
+        .expect("valid exact test run fingerprint")
     }
 
     // ── ORACLE 1: purity guard ─────────────────────────────────────
@@ -450,6 +772,20 @@ mod tests {
         set_test_gate_override(Some(false));
         let mut store = GraphClauseStore::from_env();
         assert!(!store.is_enabled(), "gate off must yield a disabled store");
+        assert!(
+            store.replay_run.is_none(),
+            "from_env gate-off store must be replay-unbound"
+        );
+        assert!(
+            GraphClauseStore::disabled().replay_run.is_none(),
+            "disabled constructor must be replay-unbound"
+        );
+        assert!(
+            GraphClauseStore::with_capacity(true, 1)
+                .replay_run
+                .is_none(),
+            "ordinary explicit constructor must be replay-unbound"
+        );
         store.record_verified_close(&history_of(&[("relu1", 0, true)]));
         assert_eq!(store.len(), 0, "gate off: nothing recorded");
         assert!(
@@ -459,7 +795,12 @@ mod tests {
         assert_eq!(store.pruned_count(), 0);
 
         set_test_gate_override(Some(true));
-        assert!(GraphClauseStore::from_env().is_enabled());
+        let enabled = GraphClauseStore::from_env();
+        assert!(enabled.is_enabled());
+        assert!(
+            enabled.replay_run.is_none(),
+            "from_env gate-on store must still be replay-unbound"
+        );
         set_test_gate_override(None);
     }
 
@@ -565,5 +906,169 @@ mod tests {
         store.record_verified_close(&GraphSplitHistory::new());
         assert_eq!(store.len(), 0, "empty clause must be refused");
         assert!(!store.should_prune(&history_of(&[("relu1", 0, true)])));
+    }
+
+    // ── NeuralSAT-inspired exact BCP shadow ────────────────────────
+
+    #[test]
+    fn bcp_shadow_has_negated_clause_boolean_polarity() {
+        let run = run_fingerprint(
+            CutFoldScope::fresh(),
+            b"objective-threshold-conjunctive-lower",
+            b"root-box",
+        );
+        let mut store = GraphClauseStore::with_capacity_and_replay_run(true, 16, run.clone());
+        // The certified forbidden conjunction is
+        //   a=active AND b=inactive.
+        // Its learned SAT clause is
+        //   a=inactive OR b=active.
+        store.record_verified_close(&history_of(&[("relu/a", 7, true), ("relu/b", 2, false)]));
+
+        assert!(
+            store
+                .bcp_shadow_first_implication(false, &run, &history_of(&[("relu/a", 7, true)]),)
+                .is_none(),
+            "the independent exact-1 gate is default-dark"
+        );
+        assert_eq!(
+            store.bcp_shadow_first_implication(true, &run, &history_of(&[("relu/a", 7, true)]),),
+            Some(GraphClauseBcpShadowImplication {
+                node_name: "relu/b".to_string(),
+                neuron_idx: 2,
+                is_active: true,
+                provenance: GraphClauseBcpShadowProvenance::VerifiedClose,
+                source_clause_len: 2,
+            }),
+            "matching stored inactive must force active"
+        );
+        assert_eq!(
+            store.bcp_shadow_first_implication(true, &run, &history_of(&[("relu/b", 2, false)]),),
+            Some(GraphClauseBcpShadowImplication {
+                node_name: "relu/a".to_string(),
+                neuron_idx: 7,
+                is_active: false,
+                provenance: GraphClauseBcpShadowProvenance::VerifiedClose,
+                source_clause_len: 2,
+            }),
+            "matching stored active must force inactive"
+        );
+        assert!(
+            store
+                .bcp_shadow_first_implication(true, &run, &history_of(&[("relu/a", 7, false)]),)
+                .is_none(),
+            "an opposite assignment already satisfies the learned SAT clause"
+        );
+    }
+
+    #[test]
+    fn bcp_shadow_refuses_unbound_or_foreign_run_fingerprints() {
+        let graph = CutFoldScope::fresh();
+        let run = run_fingerprint(graph, b"objective-A-threshold-A-lower", b"root-A");
+        let foreign_graph = run_fingerprint(
+            CutFoldScope::fresh(),
+            b"objective-A-threshold-A-lower",
+            b"root-A",
+        );
+        let foreign_objective = run_fingerprint(graph, b"objective-B-threshold-B-lower", b"root-A");
+        let foreign_root = run_fingerprint(graph, b"objective-A-threshold-A-lower", b"root-B");
+        let clause = history_of(&[("relu/a", 0, true), ("relu/b", 1, true)]);
+        let partial = history_of(&[("relu/a", 0, true)]);
+
+        let mut bound = GraphClauseStore::with_capacity_and_replay_run(true, 16, run.clone());
+        bound.record_verified_close(&clause);
+        assert!(
+            bound
+                .bcp_shadow_first_implication(true, &run, &partial)
+                .is_some(),
+            "the exact owning graph/root/objective/property fingerprint is admitted"
+        );
+        for stale in [&foreign_graph, &foreign_objective, &foreign_root] {
+            assert!(
+                bound
+                    .bcp_shadow_first_implication(true, stale, &partial)
+                    .is_none(),
+                "any exact run-fingerprint mismatch must fail closed"
+            );
+        }
+
+        let mut unbound = GraphClauseStore::with_capacity(true, 16);
+        unbound.record_verified_close(&clause);
+        assert!(
+            unbound
+                .bcp_shadow_first_implication(true, &run, &partial)
+                .is_none(),
+            "implicit same-run lifetime is insufficient for the shadow seam"
+        );
+    }
+
+    #[test]
+    fn bcp_shadow_first_implication_is_canonical_not_insertion_order() {
+        let run = run_fingerprint(
+            CutFoldScope::fresh(),
+            b"objective-threshold-conjunctive-lower",
+            b"root-box",
+        );
+        let z_clause = history_of(&[("relu/shared", 0, true), ("relu/z", 9, true)]);
+        let a_clause = history_of(&[("relu/a", 3, false), ("relu/shared", 0, true)]);
+        let partial = history_of(&[("relu/shared", 0, true)]);
+
+        let mut forward = GraphClauseStore::with_capacity_and_replay_run(true, 16, run.clone());
+        forward.record_verified_close(&z_clause);
+        forward.record_verified_close(&a_clause);
+        let mut reverse = GraphClauseStore::with_capacity_and_replay_run(true, 16, run.clone());
+        reverse.record_verified_close(&a_clause);
+        reverse.record_verified_close(&z_clause);
+
+        let expected = Some(GraphClauseBcpShadowImplication {
+            node_name: "relu/a".to_string(),
+            neuron_idx: 3,
+            is_active: true,
+            provenance: GraphClauseBcpShadowProvenance::VerifiedClose,
+            source_clause_len: 2,
+        });
+        assert_eq!(
+            forward.bcp_shadow_first_implication(true, &run, &partial),
+            expected
+        );
+        assert_eq!(
+            reverse.bcp_shadow_first_implication(true, &run, &partial),
+            expected
+        );
+    }
+
+    #[test]
+    fn bcp_shadow_exposes_literal_without_production_mutation() {
+        let run = run_fingerprint(
+            CutFoldScope::fresh(),
+            b"objective-threshold-conjunctive-lower",
+            b"root-box",
+        );
+        let mut store = GraphClauseStore::with_capacity_and_replay_run(true, 16, run.clone());
+        store.record_verified_close(&history_of(&[("relu/a", 0, true), ("relu/b", 1, false)]));
+        let history = history_of(&[("relu/a", 0, true)]);
+        let history_before = history
+            .exact_provenance_identity()
+            .expect("bounded pure history identity");
+        let len_before = store.len();
+        let pruned_before = store.pruned_count();
+        let replay_pruned_before = store.replay_pruned_count();
+        reset_test_store_mutations();
+
+        let implication = store.bcp_shadow_first_implication(true, &run, &history);
+
+        assert!(implication.is_some());
+        assert_eq!(
+            history.exact_provenance_identity().as_deref(),
+            Some(history_before.as_slice()),
+            "the queried domain history must remain byte-identical"
+        );
+        assert_eq!(store.len(), len_before);
+        assert_eq!(store.pruned_count(), pruned_before);
+        assert_eq!(store.replay_pruned_count(), replay_pruned_before);
+        assert_eq!(
+            test_store_mutations(),
+            0,
+            "shadow observation cannot insert, evict, subsume, or prune"
+        );
     }
 }

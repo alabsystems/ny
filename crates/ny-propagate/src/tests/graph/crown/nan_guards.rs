@@ -623,14 +623,10 @@ proptest! {
 // ---------------------------------------------------------------------------
 // #2439: End-to-end test: NaN in A-matrix → conservative output bounds
 // ---------------------------------------------------------------------------
-// Validates the concretize path correctly detects NaN coefficients and falls
-// back to conservative (maximally loose) bounds.
-//
-// Sensitivity: this test MUST fail if `nan_propagating_max_zero` (in
-// concretize_f64_inner) is replaced with `f32::max`. The NaN is in column 0
-// where in_u=0, so `safe_mul_for_bounds(min_zero(NaN), 0.0)=0` masks the
-// min_zero path. Only max_zero's NaN-propagation detects the corruption.
-// Reference: ny-core/src/nan_math.rs, issue #2415.
+// Validates the concretize proof boundary correctly detects a directly-built,
+// malformed carrier and falls back to conservative (maximally loose) bounds
+// for the whole object. No row from a carrier that bypassed the validated
+// constructor is independently trusted.
 
 /// Assert that row `i` of `result` is fully conservative: [-inf, +inf].
 fn assert_conservative_row(result: &BoundedTensor, i: usize, label: &str) {
@@ -644,15 +640,13 @@ fn test_nan_in_a_matrix_produces_conservative_bounds_2439() {
     use ndarray::{arr2, array};
 
     // Input bounds: dim 0 = [-1, 0], dim 1 = [-1, 1].
-    // in_u[0]=0 is deliberate: safe_mul_for_bounds(NaN, 0.0)=0, so the
-    // min_zero path cannot detect NaN in column 0. Only max_zero catches it.
     let input = BoundedTensor::new(
         arr1(&[-1.0_f32, -1.0]).into_dyn(),
         arr1(&[0.0_f32, 1.0]).into_dyn(),
     )
     .unwrap();
 
-    // Row 0: clean, Row 1: NaN in lower_a col 0, Row 2: NaN in upper_a col 0.
+    // Row 0 looks clean, Row 1 has NaN in lower_a, and Row 2 has NaN in upper_a.
     // Direct field init bypasses LinearBounds::new() which rejects NaN.
     let bounds = LinearBounds {
         lower_a: arr2(&[[0.5_f32, -0.3], [f32::NAN, 0.7], [0.4, 0.6]]),
@@ -664,21 +658,8 @@ fn test_nan_in_a_matrix_produces_conservative_bounds_2439() {
     };
     let result = bounds.concretize_sound(&input);
 
-    // Row 0: clean — finite, non-inverted, contains true outputs.
-    assert!(result.lower()[[0]].is_finite(), "row 0 lower not finite");
-    assert!(result.upper()[[0]].is_finite(), "row 0 upper not finite");
-    assert!(result.lower()[[0]] <= result.upper()[[0]], "row 0 inverted");
-    // Soundness: sample y = 0.5*x1 - 0.3*x2 for x in input bounds.
-    for &x1 in &[-1.0_f32, -0.5, 0.0] {
-        for &x2 in &[-1.0, 0.0, 1.0] {
-            let y = 0.5 * x1 - 0.3 * x2;
-            assert!(y >= result.lower()[[0]] - 1e-5, "row 0: {y} < lower");
-            assert!(y <= result.upper()[[0]] + 1e-5, "row 0: {y} > upper");
-        }
-    }
-
-    // Row 1: NaN in lower_a col 0 → [-inf, +inf].
+    // Whole-object validation refuses to trust even the apparently clean row.
+    assert_conservative_row(&result, 0, "Row 0 (same malformed carrier)");
     assert_conservative_row(&result, 1, "Row 1 (NaN in lower_a)");
-    // Row 2: NaN in upper_a col 0 → [-inf, +inf].
     assert_conservative_row(&result, 2, "Row 2 (NaN in upper_a)");
 }

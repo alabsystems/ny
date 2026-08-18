@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+#[cfg(feature = "onnx-value-info")]
 use crate::onnx_proto::{self, GraphProto, ModelProto, NodeProto, ValueInfoProto};
+#[cfg(feature = "onnx-value-info")]
 use onnx_proto::tensor_shape_proto::{dimension::Value, Dimension};
 
 const TALKER_CONTRACT_JSON: &str = r#"{
@@ -70,18 +72,21 @@ fn expected_talker_contract() -> AvoiceFixtureContract {
     }
 }
 
+#[cfg(feature = "onnx-value-info")]
 fn dim_param(symbol: &str) -> Dimension {
     Dimension {
         value: Some(Value::DimParam(symbol.to_string())),
     }
 }
 
+#[cfg(feature = "onnx-value-info")]
 fn dim_value(value: i64) -> Dimension {
     Dimension {
         value: Some(Value::DimValue(value)),
     }
 }
 
+#[cfg(feature = "onnx-value-info")]
 fn tensor_value_info(name: &str, dims: &[Dimension]) -> ValueInfoProto {
     ValueInfoProto {
         name: name.to_string(),
@@ -94,6 +99,7 @@ fn tensor_value_info(name: &str, dims: &[Dimension]) -> ValueInfoProto {
     }
 }
 
+#[cfg(feature = "onnx-value-info")]
 fn node(name: &str, op_type: &str, inputs: &[&str], outputs: &[&str]) -> NodeProto {
     NodeProto {
         input: inputs.iter().map(|value| (*value).to_string()).collect(),
@@ -105,6 +111,7 @@ fn node(name: &str, op_type: &str, inputs: &[&str], outputs: &[&str]) -> NodePro
     }
 }
 
+#[cfg(feature = "onnx-value-info")]
 fn kokoro_duration_proto(existing_transpose_value_info: bool) -> ModelProto {
     let mut value_info = vec![tensor_value_info(
         "logit_states",
@@ -186,6 +193,7 @@ fn kokoro_duration_proto(existing_transpose_value_info: bool) -> ModelProto {
     }
 }
 
+#[cfg(feature = "onnx-value-info")]
 fn dims(info: &ValueInfoProto) -> Vec<i64> {
     info.r#type
         .as_ref()
@@ -258,6 +266,96 @@ fn test_load_avoice_contract_directory_errors_as_read_3595() {
 }
 
 #[test]
+fn missing_required_fixture_is_an_actionable_failure() {
+    // Use a deliberately untracked name in the normal fixture directory.
+    // Mutating NY_TEST_MODELS_DIR here would race every parallel fixture
+    // reader in this test binary; the environment lock serializes writers,
+    // not unrelated readers.
+    let panic = std::panic::catch_unwind(|| {
+        require_test_model_with_hint(
+            "definitely_missing_required_fixture.onnx",
+            "Generate the required fixture.",
+        );
+    })
+    .expect_err("a missing first-party fixture must fail, never skip");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("panic should carry an actionable string");
+
+    assert!(message.contains("definitely_missing_required_fixture.onnx"));
+    assert!(message.contains("Generate the required fixture."));
+    assert!(message.contains(TEST_MODELS_ENV));
+}
+
+#[test]
+fn identifies_only_external_avoice_exports() {
+    for name in AVOICE_EXPORT_FILES {
+        assert!(is_avoice_export(name));
+    }
+    assert!(!is_avoice_export("whisper_tiny_encoder.onnx"));
+    assert!(!is_avoice_export("transformer_block.onnx"));
+}
+
+#[test]
+fn concurrent_fixture_publication_never_exposes_partial_bytes() {
+    use std::io::ErrorKind;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
+    };
+
+    const WRITERS: usize = 8;
+    const READERS: usize = 4;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = Arc::new(temp.path().join("fixture.onnx"));
+    let expected = Arc::new(vec![0xA5; 512 * 1024]);
+    let start = Arc::new(Barrier::new(WRITERS + READERS + 1));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let mut writers = Vec::new();
+    for _ in 0..WRITERS {
+        let path = Arc::clone(&path);
+        let expected = Arc::clone(&expected);
+        let start = Arc::clone(&start);
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            assert!(publish_test_model_atomically(&path, &expected));
+        }));
+    }
+
+    let mut readers = Vec::new();
+    for _ in 0..READERS {
+        let path = Arc::clone(&path);
+        let expected = Arc::clone(&expected);
+        let start = Arc::clone(&start);
+        let running = Arc::clone(&running);
+        readers.push(std::thread::spawn(move || {
+            start.wait();
+            while running.load(Ordering::Acquire) {
+                match std::fs::read(path.as_ref()) {
+                    Ok(bytes) => assert_eq!(bytes, *expected),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => panic!("fixture read failed: {error}"),
+                }
+            }
+        }));
+    }
+
+    start.wait();
+    for writer in writers {
+        writer.join().expect("fixture publisher");
+    }
+    running.store(false, Ordering::Release);
+    for reader in readers {
+        reader.join().expect("fixture reader");
+    }
+    assert_eq!(std::fs::read(path.as_ref()).expect("fixture"), *expected);
+}
+
+#[test]
+#[cfg(feature = "onnx-value-info")]
 fn test_specialize_kokoro_duration_predictor_for_lstm_unroll_rewrites_packet_contract_3601() {
     let mut proto = kokoro_duration_proto(false);
 
@@ -308,6 +406,7 @@ fn test_specialize_kokoro_duration_predictor_for_lstm_unroll_rewrites_packet_con
 }
 
 #[test]
+#[cfg(feature = "onnx-value-info")]
 fn test_specialize_kokoro_duration_predictor_for_lstm_unroll_avoids_duplicate_value_info_3601() {
     let mut proto = kokoro_duration_proto(true);
 

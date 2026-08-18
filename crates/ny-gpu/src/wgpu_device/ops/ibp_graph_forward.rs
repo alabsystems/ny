@@ -24,14 +24,10 @@ impl GpuDagIbpForwardExt for WgpuDevice {
         Ok(Some(Box::new(self.prepare_dag_model_plan_internal(plan)?)))
     }
 
-    /// wgpu preserves subnormals and every sound DAG op is a certified enclosure
-    /// (directed widening, NORMAL-range floors, Metal FTZ-safe by construction), so
-    /// this backend advertises a verdict-legal sound DAG path — but ONLY on an adapter
-    /// that passed the one-time IEEE-754 f32-model self-check (`ops/f32_selfcheck.rs`).
-    /// An adapter with covert reduced precision / broken bitcast reports `false` here,
-    /// so its verdicts fall back to the CPU sound graph loop (fail-safe). Cached.
+    /// WGPU resident DAG IBP is temporarily excluded from verdict authority
+    /// until overflow-sentinel taint is sticky across every supported DAG op.
     fn provides_sound_gpu_dag_ibp(&self) -> bool {
-        self.verify_ieee_f32_model()
+        false
     }
 
     fn prepare_sound_dag_model_plan(

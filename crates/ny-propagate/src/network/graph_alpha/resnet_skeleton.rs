@@ -775,12 +775,14 @@ pub(crate) mod test_support {
                     bias: ba,
                     out_features: oa,
                     in_features: ia,
+                    cert_err: cea,
                 },
                 L::Linear {
                     weight: wb,
                     bias: bb,
                     out_features: ob,
                     in_features: ib,
+                    cert_err: ceb,
                 },
             ) => {
                 assert_eq!(bits(wa), bits(wb), "{ctx}: Linear weight bits");
@@ -790,6 +792,10 @@ pub(crate) mod test_support {
                     "{ctx}: Linear bias bits"
                 );
                 assert_eq!((oa, ia), (ob, ib), "{ctx}: Linear dims");
+                // #cert-err: a rebuild that DROPPED the declared BN-fold error
+                // would silently produce a looser-weight/tighter-bound skeleton,
+                // so it is part of the bit-equality contract, not an extra.
+                assert_eq!(cea, ceb, "{ctx}: Linear cert_err");
             }
             (
                 L::Activation {
@@ -851,6 +857,7 @@ pub(crate) mod test_support {
                     out_w: owa,
                     in_h: iha,
                     in_w: iwa,
+                    cert_err: cea,
                 },
                 L::Conv2d {
                     weight_col: wb,
@@ -867,6 +874,7 @@ pub(crate) mod test_support {
                     out_w: owb,
                     in_h: ihb,
                     in_w: iwb,
+                    cert_err: ceb,
                 },
             ) => {
                 assert_eq!(bits(wa), bits(wb), "{ctx}: Conv2d weight_col bits");
@@ -880,6 +888,8 @@ pub(crate) mod test_support {
                     (ocb, icb, khb, kwb, shb, swb, phb, pwb, ohb, owb, ihb, iwb),
                     "{ctx}: Conv2d geometry"
                 );
+                // #cert-err: see the Linear arm — part of the bit contract.
+                assert_eq!(cea, ceb, "{ctx}: Conv2d cert_err");
             }
             (
                 L::MaxPool2d {

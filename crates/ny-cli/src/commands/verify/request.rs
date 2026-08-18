@@ -20,6 +20,7 @@ pub(crate) struct VerificationConfig {
     pub(crate) tolerance: f32,
     pub(crate) timeout: u64,
     pub(crate) backend: BackendArg,
+    pub(crate) backend_automatic: bool,
     pub(crate) gpu: bool,
     pub(crate) native: bool,
     pub(crate) conservative_layernorm: bool,
@@ -58,6 +59,7 @@ impl VerificationConfig {
             tolerance: 1e-4,
             timeout: 60,
             backend: BackendArg::Cpu,
+            backend_automatic: false,
             gpu: false,
             native: false,
             conservative_layernorm: false,
@@ -97,6 +99,7 @@ pub(crate) struct VerificationConfigBuilder {
     tolerance: f32,
     timeout: u64,
     backend: BackendArg,
+    backend_automatic: bool,
     gpu: bool,
     native: bool,
     conservative_layernorm: bool,
@@ -139,8 +142,15 @@ impl VerificationConfigBuilder {
         self
     }
 
-    pub(crate) fn backend(mut self, backend: BackendArg, gpu: bool) -> Self {
+    /// Preserve whether config resolution saw no explicit backend source.
+    pub(crate) fn backend_request(
+        mut self,
+        backend: BackendArg,
+        gpu: bool,
+        automatic: bool,
+    ) -> Self {
         self.backend = backend;
+        self.backend_automatic = automatic && !gpu;
         self.gpu = gpu;
         self
     }
@@ -223,6 +233,7 @@ impl VerificationConfigBuilder {
             tolerance: self.tolerance,
             timeout: self.timeout,
             backend: self.backend,
+            backend_automatic: self.backend_automatic,
             gpu: self.gpu,
             native: self.native,
             conservative_layernorm: self.conservative_layernorm,

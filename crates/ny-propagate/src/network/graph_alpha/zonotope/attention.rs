@@ -181,10 +181,10 @@ impl GraphNetwork {
         );
 
         // Apply Q projection
-        let q_z = base_z.linear(&q_linear.weight, q_linear.bias.as_ref())?;
+        let q_z = base_z.linear(q_linear.weight(), q_linear.bias())?;
 
         // Apply K projection then propagate through reshape/tile operations
-        let mut k_z = base_z.linear(&k_linear.weight, k_linear.bias.as_ref())?;
+        let mut k_z = base_z.linear(k_linear.weight(), k_linear.bias())?;
 
         // Apply operations in order (k_ops is in forward order: reshape1, tile, reshape2)
         for op_name in k_ops.iter().rev() {

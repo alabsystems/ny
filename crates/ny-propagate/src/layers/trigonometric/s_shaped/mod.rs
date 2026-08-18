@@ -10,6 +10,7 @@
 //! - Use precomputed tangent point tables for tight linear relaxations
 
 mod arctan;
+mod erf;
 mod shared;
 mod sigmoid;
 mod tanh;
@@ -18,6 +19,7 @@ mod tanh;
 mod tests;
 
 pub use arctan::ArctanLayer;
+pub use erf::ErfLayer;
 pub use sigmoid::SigmoidLayer;
 pub use tanh::TanhLayer;
 

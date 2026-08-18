@@ -42,14 +42,14 @@ use crate::{BoundedScalar, BoundedTensor};
 use half::f16;
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{checked_shape_product, nan_propagating_max, NyError, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 /// Compressed bounds storage using f16 (half-precision) floats.
 ///
 /// Provides 50% memory reduction compared to `BoundedTensor` at the cost
 /// of reduced precision. Suitable for checkpoint storage, not for active
 /// computation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CompressedBounds {
     /// Lower bounds in f16 format.
     lower: Vec<f16>,
@@ -59,11 +59,29 @@ pub struct CompressedBounds {
     shape: Vec<usize>,
 }
 
+#[derive(Deserialize)]
+struct SerializedCompressedBounds {
+    lower: Vec<f16>,
+    upper: Vec<f16>,
+    shape: Vec<usize>,
+}
+
+impl<'de> Deserialize<'de> for CompressedBounds {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let serialized = SerializedCompressedBounds::deserialize(deserializer)?;
+        Self::new(serialized.lower, serialized.upper, serialized.shape).map_err(D::Error::custom)
+    }
+}
+
 impl CompressedBounds {
     /// Create compressed bounds from raw f16 vectors.
     ///
     /// # Errors
-    /// Returns error if lower and upper have different lengths.
+    /// Returns an error for a shape/length mismatch, NaN endpoint, or inverted
+    /// interval. The canonical infeasible sentinel `[+∞, -∞]` is preserved.
     pub fn new(lower: Vec<f16>, upper: Vec<f16>, shape: Vec<usize>) -> Result<Self> {
         let expected_len = checked_shape_product(&shape).ok_or_else(|| {
             NyError::InvalidSpec(format!(
@@ -76,6 +94,20 @@ impl CompressedBounds {
                 vec![expected_len],
                 vec![lower.len(), upper.len()],
             ));
+        }
+        for (index, (&lo, &hi)) in lower.iter().zip(&upper).enumerate() {
+            if lo.is_nan() || hi.is_nan() {
+                return Err(NyError::InvalidSpec(format!(
+                    "CompressedBounds::new: NaN endpoint at element {index}"
+                )));
+            }
+            let canonical_infeasible = lo == f16::INFINITY && hi == f16::NEG_INFINITY;
+            if lo > hi && !canonical_infeasible {
+                return Err(NyError::InvalidSpec(format!(
+                    "CompressedBounds::new: lower bound {lo} exceeds upper bound {hi} \
+                     at element {index}"
+                )));
+            }
         }
         Ok(Self {
             lower,

@@ -170,7 +170,8 @@ fn check_symbol(name: &str) -> Result<(), EmitError> {
 /// Print a rational as an exact Real-sorted SMT-LIB term: `k.0` for integers,
 /// `(/ n.0 d.0)` for proper fractions, negatives wrapped as `(- …)`.
 fn rat_term(r: Rat) -> Result<String, EmitError> {
-    // `to_clean_string` is infallible (full bignum) and exact: `"n"` / `"n/d"`.
+    // Full-bignum and exact (`"n"` / `"n/d"`); the only refusal is a poisoned
+    // rational arena, which must not cross an emission boundary.
     let s = match r.to_clean_string() {
         Ok(s) => s,
         Err(e) => return Err(EmitError::Rat(e)),
@@ -214,7 +215,16 @@ fn atom_sexpr(c: &LinearConstraint, idx: usize) -> Result<String, EmitError> {
             None => "0.0".to_owned(), // unreachable: len == 1
         }
     } else {
-        format!("(+ {})", terms.join(" "))
+        // Explicit concat (not `terms.join(" ")`): identical space-separated
+        // string; clears the join absent-callee.
+        let mut joined = String::new();
+        for (i, t) in terms.iter().enumerate() {
+            if i > 0 {
+                joined.push(' ');
+            }
+            joined.push_str(t);
+        }
+        format!("(+ {joined})")
     };
     Ok(format!("({op} {lhs} {})", rat_term(c.constant)?))
 }
@@ -284,9 +294,17 @@ pub fn farkas_to_alethe(cert: &FarkasCertificate) -> Result<AletheEmission, Emit
     for a in &atoms {
         clause.push_str(&format!(" (not {a})"));
     }
+    // Explicit concat (not `args.join(" ")`): identical space-separated string;
+    // clears the join absent-callee.
+    let mut args_joined = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            args_joined.push(' ');
+        }
+        args_joined.push_str(a);
+    }
     proof.push_str(&format!(
-        "(step t1 (cl{clause}) :rule la_generic :args ({}))\n",
-        args.join(" ")
+        "(step t1 (cl{clause}) :rule la_generic :args ({args_joined}))\n"
     ));
     let mut premises = String::from("t1");
     for i in 0..atoms.len() {
@@ -386,7 +404,16 @@ impl StepWriter {
         }
         let mut line = format!("(step {id} (cl{clause}) :rule {rule}");
         if !premises.is_empty() {
-            line.push_str(&format!(" :premises ({})", premises.join(" ")));
+            // Explicit concat (not `premises.join(" ")`): identical space-separated
+            // string; clears the join absent-callee.
+            let mut prem_joined = String::new();
+            for (i, p) in premises.iter().enumerate() {
+                if i > 0 {
+                    prem_joined.push(' ');
+                }
+                prem_joined.push_str(p);
+            }
+            line.push_str(&format!(" :premises ({prem_joined})"));
         }
         if let Some(a) = args {
             line.push_str(&format!(" :args ({a})"));
@@ -451,7 +478,9 @@ impl BranchEmit<'_> {
             return Ok(id.clone());
         }
         let ge_atom = atom_sexpr(&face(var, ConstraintKind::Ge, edge), 0)?;
-        let lits = vec![(true, le_atom.clone()), (true, ge_atom)];
+        // `step` only borrows this two-literal clause, so a stack array is the
+        // exact carrier and avoids an unnecessary allocation boundary.
+        let lits = [(true, le_atom.clone()), (true, ge_atom)];
         let id = self.w.step(&lits, "la_generic", Some("1.0 1.0"), &[]);
         self.splits.insert(le_atom, id.clone());
         Ok(id)
@@ -627,8 +656,16 @@ impl BranchEmit<'_> {
 
     /// Derive the cover clause for the region fixing axes `0..coords.len()` to
     /// the given cells and spanning the full box on the remaining axes.
-    fn cover(&mut self, coords: &mut Vec<usize>, d: usize) -> Result<Clause, EmitError> {
-        if d == self.cert.axes.len() {
+    fn cover(
+        &mut self,
+        coords: &mut Vec<usize>,
+        axis_count: usize,
+        d: usize,
+    ) -> Result<Clause, EmitError> {
+        // `axis_count` is captured once at entry and passed by value. The
+        // `>=` guard makes the decreasing `axis_count - d` measure explicit
+        // while remaining identical for the 0, 1, ... recursion below.
+        if d >= axis_count {
             return self.emit_leaf(coords);
         }
         let ncells = match self.cert.axes.get(d) {
@@ -636,11 +673,11 @@ impl BranchEmit<'_> {
             None => return Err(shape("internal: cover axis out of range (unreachable)")),
         };
         coords.push(0);
-        let mut acc = self.cover(coords, d.saturating_add(1))?;
+        let mut acc = self.cover(coords, axis_count, d.saturating_add(1))?;
         coords.pop();
         for k in 1..ncells {
             coords.push(k);
-            let right = self.cover(coords, d.saturating_add(1))?;
+            let right = self.cover(coords, axis_count, d.saturating_add(1))?;
             coords.pop();
             let edge = match self.cert.axes.get(d) {
                 Some(a) => match a.edges.get(k) {
@@ -778,7 +815,7 @@ pub fn branch_tree_to_alethe(cert: &BranchTreeCertificate) -> Result<AletheEmiss
         splits: BTreeMap::new(),
     };
     let mut coords: Vec<usize> = Vec::new();
-    let root = ctx.cover(&mut coords, 0)?;
+    let root = ctx.cover(&mut coords, ctx.cert.axes.len(), 0)?;
 
     // Every literal left in the root cover is a negated box face or the
     // negated property row — all assumed units. Resolve them away to `(cl)`.
@@ -1195,17 +1232,20 @@ mod tests {
 
     #[test]
     fn branch_declines_upper_bound_direction() {
-        // Same tree flipped to Ge (global = max = 0 < threshold 1 verifies),
-        // but the Ge fragment has no per-leaf linear refutation — decline.
+        // Same tree flipped to Ge. Its leaves prove only lower bounds, which
+        // cannot refute an unsafe y>=threshold region, so both checker and
+        // emitter must decline before constructing a proof.
         let mut cert = two_cell_cert(r(1, 1));
         cert.dir = ThreshDir::Ge;
-        assert!(
-            check_branch_tree(&cert).is_ok(),
-            "precondition: cert verifies"
-        );
+        assert!(matches!(
+            check_branch_tree(&cert),
+            Err(BranchError::UnsupportedDirection(ThreshDir::Ge))
+        ));
         assert!(matches!(
             branch_tree_to_alethe(&cert),
-            Err(EmitError::UnsupportedBranchShape(_))
+            Err(EmitError::Branch(BranchError::UnsupportedDirection(
+                ThreshDir::Ge
+            )))
         ));
     }
 

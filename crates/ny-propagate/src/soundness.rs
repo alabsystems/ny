@@ -309,6 +309,7 @@ where
             | Layer::ArgSort(_)
             | Layer::Tanh(_)
             | Layer::Sigmoid(_)
+            | Layer::Erf(_)
             | Layer::Softplus(_)
             | Layer::Tan(_)
             | Layer::Arctan(_)

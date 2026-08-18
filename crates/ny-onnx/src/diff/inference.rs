@@ -302,6 +302,12 @@ pub fn run_inference_bytes(
 /// (or no shape is declared), a flat `[expected_len]` shape is returned so the
 /// witness can still be presented to ORT, which derives its tensor shape from the
 /// `ArrayD` shape and will reject a genuinely incompatible layout.
+fn declared_shape_element_count(shape: &[usize]) -> Option<usize> {
+    shape.iter().try_fold(1usize, |elements, &dimension| {
+        elements.checked_mul(dimension)
+    })
+}
+
 pub fn read_input_shape_maybe_gzip(
     path: impl AsRef<Path>,
     expected_len: usize,
@@ -346,11 +352,22 @@ pub fn read_input_shape_maybe_gzip(
         })
         .unwrap_or_default();
 
-    let declared: usize = shape.iter().product();
-    if shape.is_empty() || declared != expected_len {
+    let declared = declared_shape_element_count(&shape);
+    if shape.is_empty() || declared != Some(expected_len) {
         return Ok((model_bytes, vec![expected_len]));
     }
     Ok((model_bytes, shape))
+}
+
+#[cfg(test)]
+mod input_shape_tests {
+    use super::declared_shape_element_count;
+
+    #[test]
+    fn declared_element_count_overflow_falls_back() {
+        assert_eq!(declared_shape_element_count(&[usize::MAX, 2]), None);
+        assert_eq!(declared_shape_element_count(&[2, 3, 4]), Some(24));
+    }
 }
 
 /// Create a modified ONNX model with all intermediate tensors exposed as outputs.

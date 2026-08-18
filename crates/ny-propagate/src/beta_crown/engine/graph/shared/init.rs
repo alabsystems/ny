@@ -20,7 +20,7 @@ use tracing::info;
 
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::bounds::GraphAlphaState;
-use crate::network::{GraphNetworkCrownExt, SpecCrownRequest};
+use crate::network::{GraphAlphaCollectionOutcome, GraphNetworkCrownExt, SpecCrownRequest};
 use crate::{AlphaCrownConfig, GraphNetwork, MulBinaryRelaxationMode};
 
 /// Shared graph-BaB bootstrap state produced before root objective evaluation.
@@ -29,6 +29,16 @@ pub(crate) struct GraphBabBootstrap {
     pub(crate) initial_node_bounds: HashMap<String, BoundedTensor>,
     pub(crate) root_alpha_state: Option<GraphAlphaState>,
     pub(crate) alpha_config: AlphaCrownConfig,
+    /// The explicit typed cGAN request matched the same exact forward-linear
+    /// predicate used by Graph-CROWN Step 1. Its returned map/state can be
+    /// evaluated directly; running alpha initialization again would only
+    /// repeat the root transaction.
+    typed_cgan_root_reusable: bool,
+    /// Exact number of optimizer updates represented by the alpha state when a
+    /// multi-objective caller retained a DAG-alpha phase checkpoint. `None`
+    /// means the bootstrap completed normally. This is scheduling/telemetry
+    /// state, never verdict authority.
+    pub(crate) phase_cap_optimizer_updates: Option<usize>,
 }
 
 fn resolve_graph_output_bounds<'a>(
@@ -57,24 +67,24 @@ fn is_deadline_exceeded(err: &NyError) -> bool {
     matches!(err, NyError::DeadlineExceeded(_))
 }
 
-/// Deadline-free plain-IBP intermediate bounds: the cheapest sound fallback when
-/// a non-alpha warmup collection (CROWN-IBP / forward-linear / deadline-checked
-/// IBP) exhausts the warmup budget (#4260). Plain IBP is O(L) and always sound
-/// (looser, never unsound), so these root-fallback paths can always make forward
-/// progress without an external timeout kill.
-///
-/// Deliberately NOT used by:
-///   * the large-conv path — there IBP itself is the expensive sweep that must
-///     hard-bail to emit a verdict (#4321);
-///   * the α-CROWN path — its DeadlineExceeded is translated by the BaB alpha
-///     entry points into an explicit warmup-cap Unknown (#4413).
-fn ibp_fallback_node_bounds(
-    graph: &GraphNetwork,
-    input: &BoundedTensor,
-    engine: Option<&dyn GemmEngine>,
-) -> Result<HashMap<String, BoundedTensor>> {
-    info!("Warmup deadline exceeded; falling back to plain-IBP intermediate bounds (#4260).");
-    graph.collect_node_bounds_with_engine(input, engine)
+/// A local phase checkpoint may continue only under an explicit, strictly
+/// live outer verifier deadline.  `None` is not authority to extend work: the
+/// multi-objective caller always owns a concrete effective deadline and any
+/// future caller must do the same deliberately.
+fn phase_checkpoint_authority_live(authority: Option<Instant>, now: Instant) -> bool {
+    authority.is_some_and(|deadline| now < deadline)
+}
+
+/// Tighten a scheduling deadline with a local alpha cap and report whether the
+/// cap, rather than an equal/earlier caller boundary, is the actual limiter.
+fn apply_local_phase_cap(
+    prior_deadline: Option<Instant>,
+    capped_deadline: Instant,
+) -> (Option<Instant>, bool) {
+    (
+        Some(prior_deadline.map_or(capped_deadline, |prior| prior.min(capped_deadline))),
+        prior_deadline.is_none_or(|prior| capped_deadline < prior),
+    )
 }
 
 /// Compute the shared intermediate-bounds bootstrap for graph BaB engines.
@@ -85,12 +95,52 @@ pub(crate) fn compute_graph_bab_bootstrap(
     engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
 ) -> Result<GraphBabBootstrap> {
+    compute_graph_bab_bootstrap_with_policy(graph, input, config, engine, deadline, None, false)
+}
+
+/// Multi-objective-only bootstrap seam for the dark phase-cap checkpoint
+/// policy.  Scalar/GPU callers retain the exact legacy error mapping through
+/// [`compute_graph_bab_bootstrap`].
+pub(crate) fn compute_graph_bab_bootstrap_with_phase_cap_checkpoint(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    config: &BetaCrownConfig,
+    engine: Option<&dyn GemmEngine>,
+    bootstrap_deadline: Option<Instant>,
+    checkpoint_authority_deadline: Option<Instant>,
+) -> Result<GraphBabBootstrap> {
+    compute_graph_bab_bootstrap_with_policy(
+        graph,
+        input,
+        config,
+        engine,
+        bootstrap_deadline,
+        checkpoint_authority_deadline,
+        true,
+    )
+}
+
+fn compute_graph_bab_bootstrap_with_policy(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    config: &BetaCrownConfig,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
+    checkpoint_authority_deadline: Option<Instant>,
+    allow_phase_cap_checkpoint: bool,
+) -> Result<GraphBabBootstrap> {
     // #phase-telemetry (dark, NY_PHASE_TELEMETRY=1, print-only): bracket the
     // whole warmup + intermediate-bounds collection so the phase is priceable
     // from a log. Gate-off is a cached-bool load — byte-identical output.
     crate::phase_telemetry::phase_marker("graph-bab-bootstrap start");
     config.validate()?;
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "graph BaB bootstrap: deadline exceeded before graph setup".to_string(),
+        ));
+    }
 
+    let mut local_phase_cap_applied = false;
     let alpha_config = {
         let mut alpha_config = config.alpha_config.clone();
         alpha_config.deadline = deadline;
@@ -132,14 +182,78 @@ pub(crate) fn compute_graph_bab_bootstrap(
         // root pipeline against the ~50s an official 100s budget allows; this
         // knob is what the tightness-vs-cost affordability curve is measured
         // with.
-        if let Some(cap_secs) = std::env::var("NY_ROOT_ALPHA_CAP_SECS")
+        // Config-driven default (`bab.root_alpha_cap_secs`); the env var below
+        // still overrides it. See BetaCrownConfig::root_alpha_cap_secs for the
+        // measurement that motivates capping the root on deep conv DAGs.
+        //
+        // The env override REPLACES the config cap rather than min-composing
+        // with it. Both used to min-compose, which made the doc comment above
+        // ("the env var below still overrides it") false: `NY_ROOT_ALPHA_CAP_SECS`
+        // could only ever TIGHTEN, never widen, so every experiment that raised
+        // it silently ran the config's window anyway. Measured on cifar100_2024,
+        // whose preset pins `root_alpha_cap_secs: 40`: setting the env to 400
+        // still produced a 40 s warmup.
+        //
+        // The resolved cap is still min-composed with the ledger deadline
+        // below, so widening can borrow from the phase budget but never from
+        // time the instance does not have.
+        let resolved_cap_secs = std::env::var("NY_ROOT_ALPHA_CAP_SECS")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            let capped = Instant::now() + std::time::Duration::from_secs(cap_secs);
-            alpha_config.deadline = Some(alpha_config.deadline.map_or(capped, |d| d.min(capped)));
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .or(config.root_alpha_cap_secs);
+        // #root-alpha-tail-reserve: TRIED AND REFUTED (2026-08-06), knob removed.
+        //
+        // Hypothesis: the cap must cover the alpha ASCENT plus the post-ascent
+        // work in the same bootstrap, so stamping the whole cap on the ascent
+        // leaves the tail already expired -- and reserving a fraction for the
+        // tail would let the bootstrap COMPLETE and thereby reach the dense-head
+        // tightener at root.rs:1966.
+        //
+        // Measured on cifar100_2024 prop_7500 at the official 100 s budget,
+        // reserving 0%, 30% and 45% of the window:
+        //
+        //     frac   alpha loop-exit   bootstrap completed   global remaining
+        //     0.00   t=40.0s           no                    46.4s
+        //     0.30   t=28.1s           no                    58.3s
+        //     0.45   t=22.4s           no                    63.9s
+        //
+        // The bootstrap fails ~4.6 s after loop-exit in EVERY case, with up to
+        // 64 s of global budget still live. So the failure is not a shortage of
+        // time for the tail -- the tail is gated on the CAP deadline itself,
+        // which the ascent leaves expired by construction because it runs until
+        // its deadline. Shortening the ascent cannot help; the tail has to be
+        // re-based onto the global deadline instead.
+        //
+        // (The one configuration where the bootstrap does complete is a cap wide
+        // enough that the ascent stops for its OWN reason before the deadline --
+        // NY_ROOT_ALPHA_CAP_SECS=120 exits at t=63.2 s with the cap still live.)
+        if let Some(cap_secs) = resolved_cap_secs {
+            if cap_secs.is_finite() && cap_secs > 0.0 {
+                let now = Instant::now();
+                let capped = now
+                    .checked_add(std::time::Duration::from_secs_f64(cap_secs))
+                    .unwrap_or(now);
+                (alpha_config.deadline, local_phase_cap_applied) =
+                    apply_local_phase_cap(alpha_config.deadline, capped);
+            }
         }
+        // A fixed-intermediate root bootstrap keeps the reference node map and
+        // only consumes the initialized alpha state. With zero requested
+        // updates, the DAG optimizer's separate initial output CROWN pass is
+        // therefore dead work. Arm the narrow collection-only hint here,
+        // after iteration env overrides, rather than changing the public
+        // `iterations == 0` bounds-only contract.
+        alpha_config.skip_zero_iteration_collection_initial_bound =
+            alpha_config.iterations == 0 && alpha_config.fix_interm_bounds;
         alpha_config
+    };
+    let typed_cgan_root_reusable = if config.use_alpha_crown {
+        let exec_order = graph.exec_order()?;
+        graph.cgan_complete_crown_ibp_root_eligible(&alpha_config, exec_order)
+            || graph.cgan_sparse_target_complete_root_eligible(&alpha_config, exec_order)
+    } else {
+        false
     };
 
     // Large convolutional graphs: per-node CROWN-IBP / α-CROWN intermediate-bound
@@ -158,17 +272,17 @@ pub(crate) fn compute_graph_bab_bootstrap(
     // the deep spatial conv targets in the memory-light PATCHES representation,
     // so the dense OOM the gate protects against never materializes for the
     // patches-eligible nodes (the rest degrade to sound IBP per node). This
-    // default-OFF env lifts the gate for conv graphs so those spatial targets
+    // default-ON feature lifts the gate for conv graphs so those spatial targets
     // tighten via patches-mode conv CROWN instead of staying pure-IBP loose.
-    // Env-UNSET is byte-identical (the extra `&& !...` cannot change the bool).
+    // `NY_CONV_PATCHES_COLLECT=0` restores the pre-feature behavior exactly.
     // Sound either way: the collector INTERSECTS CROWN with IBP per node and
     // any per-node patches failure falls back to that node's IBP bound.
-    let force_conv_patches_collect =
-        std::env::var_os("NY_CONV_PATCHES_COLLECT").is_some_and(|v| v != "0" && !v.is_empty());
+    let force_conv_patches_collect = crate::util::conv_patches_collect_enabled();
     let large_conv_graph = graph.has_conv_layers()
         && input.len() > LARGE_CONV_INPUT_NUMEL
         && !force_conv_patches_collect;
 
+    let mut phase_cap_optimizer_updates = None;
     let (initial_node_bounds, root_alpha_state) = if force_conv_patches_collect
         && graph.has_conv_layers()
         && input.len() > LARGE_CONV_INPUT_NUMEL
@@ -178,10 +292,18 @@ pub(crate) fn compute_graph_bab_bootstrap(
              running CROWN-IBP intermediate collection with patches-start conv targets.",
             input.len()
         );
-        match graph.collect_crown_ibp_bounds_dag_with_deadline_and_engine(input, deadline, engine) {
+        match graph
+            .collect_crown_ibp_bounds_dag_with_hard_deadline_and_engine(input, deadline, engine)
+        {
             Ok(bounds) => (bounds, None),
             Err(e) if is_deadline_exceeded(&e) => {
-                (ibp_fallback_node_bounds(graph, input, engine)?, None)
+                // This branch is itself the large-conv path. Falling back to a
+                // deadline-free plain-IBP sweep here can strand the verifier
+                // long after its authoritative wall-clock budget expires
+                // (#4321), exactly like the pre-deadline implementation. Let
+                // the root coordinator translate expiry into a sound Timeout
+                // verdict instead.
+                return Err(e);
             }
             Err(e) => return Err(e),
         }
@@ -210,38 +332,65 @@ pub(crate) fn compute_graph_bab_bootstrap(
         // alpha entry points translate it into an explicit "warmup exceeded its
         // deadline cap" Unknown (#4413) so per-domain budget is preserved. Do NOT
         // swallow it into an IBP fallback here.
-        let (bounds, alpha) =
-            graph.collect_alpha_crown_bounds_dag_with_engine(input, &alpha_config, engine)?;
+        let outcome = if allow_phase_cap_checkpoint && local_phase_cap_applied {
+            graph.collect_alpha_crown_bounds_dag_with_engine_phase_cap_checkpoint(
+                input,
+                &alpha_config,
+                engine,
+            )?
+        } else {
+            let result =
+                graph.collect_alpha_crown_bounds_dag_with_engine(input, &alpha_config, engine)?;
+            GraphAlphaCollectionOutcome::Complete(result)
+        };
+        let (bounds, alpha) = match outcome {
+            GraphAlphaCollectionOutcome::Complete(result) => result,
+            GraphAlphaCollectionOutcome::PhaseCapCheckpoint {
+                result,
+                completed_iterations,
+                optimizer_updates_completed,
+            } => {
+                if !phase_checkpoint_authority_live(checkpoint_authority_deadline, Instant::now()) {
+                    return Err(NyError::DeadlineExceeded(
+                        "DAG alpha phase checkpoint has no live outer verifier authority"
+                            .to_string(),
+                    ));
+                }
+                phase_cap_optimizer_updates = Some(optimizer_updates_completed);
+                info!(
+                    completed_iterations,
+                    optimizer_updates_completed,
+                    verdict_authority = false,
+                    "#root-alpha-phase-checkpoint: consumed completed DAG-alpha artifact; \
+                     skipping expired post-loop reference recollection"
+                );
+                crate::phase_telemetry::phase_marker(
+                    "graph-bab-bootstrap phase-cap-checkpoint consumed",
+                );
+                result
+            }
+        };
         (bounds, Some(alpha))
     } else if config.use_forward_bounds {
         info!("Computing forward-linear initial bounds...");
-        match graph
-            .collect_forward_linear_bounds_dag_with_engine_and_deadline(input, engine, deadline)
-        {
-            Ok(bounds) => (bounds, None),
-            Err(e) if is_deadline_exceeded(&e) => {
-                (ibp_fallback_node_bounds(graph, input, engine)?, None)
-            }
-            Err(e) => return Err(e),
-        }
+        (
+            graph.collect_forward_linear_bounds_dag_with_engine_and_deadline(
+                input, engine, deadline,
+            )?,
+            None,
+        )
     } else if config.alpha_config.fix_interm_bounds {
         info!("Computing IBP initial bounds...");
-        match graph.collect_node_bounds_with_engine_and_deadline(input, engine, deadline) {
-            Ok(bounds) => (bounds, None),
-            Err(e) if is_deadline_exceeded(&e) => {
-                (ibp_fallback_node_bounds(graph, input, engine)?, None)
-            }
-            Err(e) => return Err(e),
-        }
+        (
+            graph.collect_node_bounds_with_engine_and_deadline(input, engine, deadline)?,
+            None,
+        )
     } else {
         info!("Computing CROWN-IBP initial bounds...");
-        match graph.collect_crown_ibp_bounds_dag_with_deadline_and_engine(input, deadline, engine) {
-            Ok(bounds) => (bounds, None),
-            Err(e) if is_deadline_exceeded(&e) => {
-                (ibp_fallback_node_bounds(graph, input, engine)?, None)
-            }
-            Err(e) => return Err(e),
-        }
+        (
+            graph.collect_crown_ibp_bounds_dag_with_deadline_and_engine(input, deadline, engine)?,
+            None,
+        )
     };
 
     // #phase-telemetry: end of the warmup+collect phase (error exits above
@@ -252,6 +401,8 @@ pub(crate) fn compute_graph_bab_bootstrap(
         initial_node_bounds,
         root_alpha_state,
         alpha_config,
+        typed_cgan_root_reusable,
+        phase_cap_optimizer_updates,
     })
 }
 
@@ -269,11 +420,35 @@ pub(crate) fn compute_graph_root_output_bounds(
     deadline: Option<Instant>,
 ) -> Result<BoundedTensor> {
     if config.use_alpha_crown {
-        return graph.propagate_alpha_crown_with_config_and_engine(
-            input,
-            &bootstrap.alpha_config,
-            engine,
-        );
+        if bootstrap.typed_cgan_root_reusable {
+            if let Some(alpha_state) = bootstrap.root_alpha_state.as_ref() {
+                let output_bounds =
+                    resolve_graph_output_bounds(graph, &bootstrap.initial_node_bounds)?;
+                let output_shape = output_bounds.shape().to_vec();
+                let identity_spec = ndarray::Array2::<f32>::eye(output_bounds.len());
+                let output = SpecCrownRequest::new(graph, input, &identity_spec, engine)
+                    .node_bounds(&bootstrap.initial_node_bounds)
+                    .alpha_state_opt(Some(alpha_state))
+                    .deadline_opt(deadline)
+                    .truncate_after_opt(config.crown_backward_layers)
+                    .run()?;
+                return output.reshape(&output_shape);
+            }
+        }
+        // The caller's explicit root-objective deadline owns this phase. A
+        // retained root-alpha checkpoint necessarily embeds its expired LOCAL
+        // warmup cap; feeding that stale config directly into the ordinary
+        // alpha path would make the certified fallback refuse immediately even
+        // while the outer verifier deadline remains live. Borrow on the common
+        // equal-deadline path and clone only when rebasing is required.
+        let alpha_config = if bootstrap.alpha_config.deadline == deadline {
+            std::borrow::Cow::Borrowed(&bootstrap.alpha_config)
+        } else {
+            let mut rebased = bootstrap.alpha_config.clone();
+            rebased.deadline = deadline;
+            std::borrow::Cow::Owned(rebased)
+        };
+        return graph.propagate_alpha_crown_with_config_and_engine(input, &alpha_config, engine);
     }
 
     if config.use_forward_bounds {
@@ -301,15 +476,47 @@ pub(crate) fn compute_graph_root_output_bounds(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
 
-    use ndarray::{arr1, arr2, ArrayD, IxDyn};
+    use ndarray::{arr1, arr2, Array1, Array2, ArrayD, IxDyn};
 
     use super::*;
     use crate::beta_crown::config::BetaCrownConfig;
-    use crate::layers::{AddLayer, Conv2dLayer, Layer, LinearLayer, ReLULayer, ReduceSumLayer};
+    use crate::layers::{
+        AddLayer, Conv2dLayer, ConvTranspose2dLayer, Layer, LinearLayer, ReLULayer, ReduceSumLayer,
+    };
     use crate::network::GraphNode;
+
+    #[test]
+    fn phase_checkpoint_requires_explicit_strictly_live_outer_authority() {
+        let now = Instant::now();
+        assert!(!phase_checkpoint_authority_live(None, now));
+        assert!(!phase_checkpoint_authority_live(Some(now), now));
+        assert!(!phase_checkpoint_authority_live(
+            now.checked_sub(Duration::from_nanos(1)),
+            now,
+        ));
+        assert!(phase_checkpoint_authority_live(
+            now.checked_add(Duration::from_nanos(1)),
+            now,
+        ));
+    }
+
+    #[test]
+    fn only_a_strictly_earlier_local_cap_authorizes_checkpoint_recovery() {
+        let now = Instant::now();
+        let earlier = now.checked_sub(Duration::from_secs(1)).expect("earlier");
+        let later = now.checked_add(Duration::from_secs(1)).expect("later");
+
+        assert_eq!(apply_local_phase_cap(None, now), (Some(now), true));
+        assert_eq!(apply_local_phase_cap(Some(later), now), (Some(now), true));
+        assert_eq!(apply_local_phase_cap(Some(now), now), (Some(now), false));
+        assert_eq!(
+            apply_local_phase_cap(Some(earlier), now),
+            (Some(earlier), false)
+        );
+    }
 
     fn build_test_graph() -> (GraphNetwork, BoundedTensor) {
         let mut graph = GraphNetwork::new();
@@ -341,6 +548,102 @@ mod tests {
         .expect("test input bounds should be valid");
 
         (graph, input)
+    }
+
+    fn build_typed_cgan_bootstrap_graph() -> (GraphNetwork, BoundedTensor) {
+        let transpose_kernel =
+            ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![1.0_f32, -0.5, 0.25, 0.75])
+                .expect("transpose kernel");
+        let transpose = ConvTranspose2dLayer::with_input_shape(
+            transpose_kernel,
+            Some(arr1(&[0.1_f32])),
+            (1, 1),
+            (0, 0),
+            2,
+            2,
+        )
+        .expect("conv transpose");
+        let conv = Conv2dLayer::with_input_shape(
+            ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![0.75_f32]).expect("conv kernel"),
+            Some(arr1(&[-0.2_f32])),
+            (1, 1),
+            (0, 0),
+            3,
+            3,
+        )
+        .expect("conv");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "convt",
+            Layer::ConvTranspose2d(transpose),
+        ));
+        graph.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer),
+            vec!["convt".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "conv",
+            Layer::Conv2d(conv),
+            vec!["relu".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "out",
+            Layer::ReLU(ReLULayer),
+            vec!["conv".to_string()],
+        ));
+        graph.set_output("out");
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[1, 2, 2]), -1.0_f32),
+            ArrayD::from_elem(IxDyn(&[1, 2, 2]), 1.0_f32),
+        )
+        .expect("input");
+        (graph, input)
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn typed_cgan_bootstrap_root_output_reuses_map_and_state_without_recollection() {
+        use crate::network::CganCompleteCollectionEntryCounter;
+
+        ny_test_utils::env::with_env_edits(|env| {
+            for key in [
+                "NY_NO_FORWARD_LINEAR_REF",
+                "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+                "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+                "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+                "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            ] {
+                env.remove(key);
+            }
+            let (graph, input) = build_typed_cgan_bootstrap_graph();
+            let mut config = BetaCrownConfig {
+                use_alpha_crown: true,
+                ..BetaCrownConfig::default()
+            };
+            config.alpha_config.iterations = 0;
+            config.alpha_config.gradient_method = crate::bounds::GradientMethod::AnalyticChain;
+            config.alpha_config.fix_interm_bounds = true;
+            config.alpha_config.adaptive_skip = false;
+            config.alpha_config.cgan_complete_crown_ibp_root = true;
+
+            let entries = CganCompleteCollectionEntryCounter::start();
+            let bootstrap = compute_graph_bab_bootstrap(&graph, &input, &config, None, None)
+                .expect("typed bootstrap");
+            assert!(
+                bootstrap.phase_cap_optimizer_updates.is_none(),
+                "the legacy bootstrap wrapper must never mint a phase checkpoint"
+            );
+            let output =
+                compute_graph_root_output_bounds(&graph, &input, &config, None, &bootstrap, None)
+                    .expect("root output from bootstrap map/state");
+            assert_eq!(output.len(), 9);
+            assert_eq!(
+                entries.entries(),
+                1,
+                "root output evaluation must not start the typed transaction again"
+            );
+        });
     }
 
     fn build_residual_dag_4404() -> (GraphNetwork, BoundedTensor) {
@@ -420,7 +723,7 @@ mod tests {
             .zip(expected_bounds.lower().iter())
         {
             assert!(
-                (actual_value - expected_value).abs() <= 1e-6,
+                (actual_value - expected_value).abs() <= 1e-6 * (1.0 + expected_value.abs()),
                 "{label}: node '{node_name}' lower mismatch actual={actual_value}, expected={expected_value}"
             );
         }
@@ -430,10 +733,211 @@ mod tests {
             .zip(expected_bounds.upper().iter())
         {
             assert!(
-                (actual_value - expected_value).abs() <= 1e-6,
+                // Scale-aware: the certified-f64 deadline conv IBP (2026-08-11)
+                // is ulp-tighter than the None-arm reference at magnitude ~12;
+                // the pin's purpose (bounds REUSED, not recomputed from a
+                // different source) survives at relative closeness.
+                (actual_value - expected_value).abs() <= 1e-6 * (1.0 + expected_value.abs()),
                 "{label}: node '{node_name}' upper mismatch actual={actual_value}, expected={expected_value}"
             );
         }
+    }
+
+    fn bound_map_bits(
+        map: &HashMap<String, BoundedTensor>,
+    ) -> BTreeMap<String, (Vec<u32>, Vec<u32>)> {
+        map.iter()
+            .map(|(name, bound)| {
+                (
+                    name.clone(),
+                    (
+                        bound.lower().iter().map(|value| value.to_bits()).collect(),
+                        bound.upper().iter().map(|value| value.to_bits()).collect(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn alpha_vector_map_bits(map: &BTreeMap<String, Array1<f32>>) -> BTreeMap<String, Vec<u32>> {
+        map.iter()
+            .map(|(name, values)| {
+                (
+                    name.clone(),
+                    values.iter().map(|value| value.to_bits()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn alpha_matrix_map_bits(
+        map: &BTreeMap<String, Array2<f32>>,
+    ) -> BTreeMap<String, (Vec<usize>, Vec<u32>)> {
+        map.iter()
+            .map(|(name, values)| {
+                (
+                    name.clone(),
+                    (
+                        values.shape().to_vec(),
+                        values.iter().map(|value| value.to_bits()).collect(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_alpha_state_bits_equal(actual: &GraphAlphaState, expected: &GraphAlphaState) {
+        for (label, actual_bits, expected_bits) in [
+            (
+                "alphas",
+                alpha_vector_map_bits(&actual.alphas),
+                alpha_vector_map_bits(&expected.alphas),
+            ),
+            (
+                "alphas_upper",
+                alpha_vector_map_bits(&actual.alphas_upper),
+                alpha_vector_map_bits(&expected.alphas_upper),
+            ),
+            (
+                "velocity",
+                alpha_vector_map_bits(&actual.velocity),
+                alpha_vector_map_bits(&expected.velocity),
+            ),
+            (
+                "adam_m",
+                alpha_vector_map_bits(&actual.adam_m),
+                alpha_vector_map_bits(&expected.adam_m),
+            ),
+            (
+                "adam_v",
+                alpha_vector_map_bits(&actual.adam_v),
+                alpha_vector_map_bits(&expected.adam_v),
+            ),
+            (
+                "velocity_upper",
+                alpha_vector_map_bits(&actual.velocity_upper),
+                alpha_vector_map_bits(&expected.velocity_upper),
+            ),
+            (
+                "adam_m_upper",
+                alpha_vector_map_bits(&actual.adam_m_upper),
+                alpha_vector_map_bits(&expected.adam_m_upper),
+            ),
+            (
+                "adam_v_upper",
+                alpha_vector_map_bits(&actual.adam_v_upper),
+                alpha_vector_map_bits(&expected.adam_v_upper),
+            ),
+        ] {
+            assert_eq!(
+                actual_bits, expected_bits,
+                "{label} must remain bit-identical"
+            );
+        }
+        assert_eq!(actual.unstable_mask, expected.unstable_mask);
+        assert_eq!(actual.spatial_shapes, expected.spatial_shapes);
+        assert_eq!(actual.spec_slot_rows, expected.spec_slot_rows);
+        assert_eq!(
+            alpha_matrix_map_bits(&actual.spec_deltas),
+            alpha_matrix_map_bits(&expected.spec_deltas)
+        );
+        assert_eq!(
+            alpha_matrix_map_bits(&actual.spec_adam_m),
+            alpha_matrix_map_bits(&expected.spec_adam_m)
+        );
+        assert_eq!(
+            alpha_matrix_map_bits(&actual.spec_adam_v),
+            alpha_matrix_map_bits(&expected.spec_adam_v)
+        );
+        assert!(actual.monotone_s_shaped_alphas.is_empty());
+        assert!(expected.monotone_s_shaped_alphas.is_empty());
+        assert!(actual.sqrt_alphas.is_empty());
+        assert!(expected.sqrt_alphas.is_empty());
+        assert!(actual.reciprocal_alphas.is_empty());
+        assert!(expected.reciprocal_alphas.is_empty());
+        assert_eq!(
+            *actual.gpu_suffix_ineligible.read().expect("actual cache"),
+            *expected
+                .gpu_suffix_ineligible
+                .read()
+                .expect("expected cache")
+        );
+    }
+
+    #[ntest::timeout(30000)]
+    #[test]
+    fn checkpoint_policy_normal_completion_matches_legacy_bootstrap_bits() {
+        let (graph, input) = build_residual_dag_4404();
+        let mut config = BetaCrownConfig {
+            use_alpha_crown: true,
+            root_alpha_cap_secs: Some(10.0),
+            ..BetaCrownConfig::default()
+        };
+        config.alpha_config.iterations = 1;
+        config.alpha_config.gradient_method = crate::bounds::GradientMethod::AnalyticChain;
+        config.alpha_config.fix_interm_bounds = true;
+        config.alpha_config.adaptive_skip = false;
+        config.alpha_config.adaptive_skip_pilot = false;
+
+        let now = Instant::now();
+        let bootstrap_deadline = now.checked_add(Duration::from_secs(30));
+        let authority_deadline = now.checked_add(Duration::from_mins(1));
+        let legacy = compute_graph_bab_bootstrap(&graph, &input, &config, None, bootstrap_deadline)
+            .expect("legacy bootstrap completes before the local cap");
+        let enabled = compute_graph_bab_bootstrap_with_phase_cap_checkpoint(
+            &graph,
+            &input,
+            &config,
+            None,
+            bootstrap_deadline,
+            authority_deadline,
+        )
+        .expect("checkpoint-policy bootstrap completes before the local cap");
+
+        assert!(legacy.phase_cap_optimizer_updates.is_none());
+        assert!(enabled.phase_cap_optimizer_updates.is_none());
+        assert_eq!(
+            bound_map_bits(&enabled.initial_node_bounds),
+            bound_map_bits(&legacy.initial_node_bounds),
+            "enabled-policy normal completion must preserve every certified node bound bit"
+        );
+        assert_alpha_state_bits_equal(
+            enabled
+                .root_alpha_state
+                .as_ref()
+                .expect("enabled alpha state"),
+            legacy
+                .root_alpha_state
+                .as_ref()
+                .expect("legacy alpha state"),
+        );
+    }
+
+    #[ntest::timeout(30000)]
+    #[test]
+    fn root_output_alpha_path_honors_explicit_rebased_deadline() {
+        let (graph, input) = build_test_graph();
+        let mut config = BetaCrownConfig {
+            use_alpha_crown: true,
+            ..BetaCrownConfig::default()
+        };
+        config.alpha_config.iterations = 0;
+        config.alpha_config.fix_interm_bounds = true;
+        config.alpha_config.adaptive_skip = false;
+        config.alpha_config.adaptive_skip_pilot = false;
+
+        let mut bootstrap = compute_graph_bab_bootstrap(&graph, &input, &config, None, None)
+            .expect("bootstrap without a deadline");
+        bootstrap.alpha_config.deadline = Instant::now().checked_sub(Duration::from_secs(1));
+        let live = Instant::now().checked_add(Duration::from_secs(10));
+        let output =
+            compute_graph_root_output_bounds(&graph, &input, &config, None, &bootstrap, live)
+                .expect("explicit live root deadline must replace the expired warmup cap");
+        assert!(output
+            .lower()
+            .iter()
+            .chain(output.upper().iter())
+            .all(|value| value.is_finite()));
     }
 
     #[test]
@@ -449,6 +953,7 @@ mod tests {
             .expect("IBP bootstrap should succeed on the toy graph");
 
         assert!(bootstrap.root_alpha_state.is_none());
+        assert!(bootstrap.phase_cap_optimizer_updates.is_none());
         assert_eq!(bootstrap.alpha_config.deadline, deadline);
         assert!(
             bootstrap.initial_node_bounds.contains_key("relu"),
@@ -472,6 +977,10 @@ mod tests {
             .expect("α-CROWN bootstrap should succeed on the toy graph");
 
         assert!(bootstrap.root_alpha_state.is_some());
+        assert!(
+            bootstrap.phase_cap_optimizer_updates.is_none(),
+            "legacy alpha bootstrap behavior must remain complete-only"
+        );
         assert_eq!(bootstrap.alpha_config.deadline, deadline);
         assert!(
             bootstrap.initial_node_bounds.contains_key("linear2"),
@@ -520,16 +1029,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_graph_bab_bootstrap_forward_path_falls_back_to_ibp_on_expired_deadline_4260() {
-        // Contract change (#4260): a forward-linear warmup that exhausts its
-        // deadline no longer aborts the whole bootstrap with DeadlineExceeded.
-        // Instead it falls back to plain-IBP intermediate bounds — the cheapest
-        // SOUND collector (looser, never unsound) — so a non-alpha root can still
-        // make forward progress instead of being killed externally with no
-        // verdict. Plain IBP over-approximates the forward-linear bounds, so the
-        // fallback can only make the verifier MORE conservative, never wrongly
-        // "verified". This supersedes the obsolete hard-fail contract that the
-        // pre-#4260 test pinned.
+    fn test_compute_graph_bab_bootstrap_forward_path_preserves_expired_deadline_4260() {
+        // The bootstrap has no precollected output map at entry. Once its
+        // authority is already expired, starting a fresh plain-IBP sweep would
+        // violate the same hard wall-clock contract as continuing forward
+        // linear propagation.
         let (graph, input) = build_test_graph();
         let config = BetaCrownConfig {
             use_alpha_crown: false,
@@ -542,27 +1046,12 @@ mod tests {
                 .unwrap(),
         );
 
-        let bootstrap =
-            compute_graph_bab_bootstrap(&graph, &input, &config, None, expired_deadline)
-                .expect("expired forward-linear warmup should fall back to plain IBP, not abort");
-
-        assert!(
-            bootstrap.root_alpha_state.is_none(),
-            "IBP fallback bootstrap carries no alpha state"
-        );
-
-        // The fallback must reproduce the plain-IBP intermediate bounds exactly.
-        let ibp_reference = graph
-            .collect_node_bounds_with_engine(&input, None)
-            .expect("plain IBP reference should succeed on the toy graph");
-        for node in ["relu", "linear2"] {
-            assert_node_bounds_match_4404(
-                &bootstrap.initial_node_bounds,
-                &ibp_reference,
-                node,
-                "forward-deadline IBP fallback",
-            );
-        }
+        let error =
+            match compute_graph_bab_bootstrap(&graph, &input, &config, None, expired_deadline) {
+                Err(error) => error,
+                Ok(_) => panic!("expired bootstrap must not launch a fresh IBP fallback"),
+            };
+        assert!(matches!(error, NyError::DeadlineExceeded(_)));
     }
 
     #[test]
@@ -609,6 +1098,12 @@ mod tests {
             .expect("alpha bootstrap should succeed on the residual DAG");
 
         assert!(bootstrap.root_alpha_state.is_some());
+        assert!(
+            bootstrap
+                .alpha_config
+                .skip_zero_iteration_collection_initial_bound,
+            "zero-update fixed-intermediate root bootstrap must arm the narrow collection skip"
+        );
         assert_node_bounds_match_4404(
             &bootstrap.initial_node_bounds,
             &ibp_bounds,

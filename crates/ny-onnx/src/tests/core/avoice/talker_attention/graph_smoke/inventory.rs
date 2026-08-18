@@ -53,8 +53,9 @@ fn assert_talker_attention_layer_inventory(model: &OnnxModel) {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(60000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_load_avoice_talker_attention_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let model = avoice_talker_attention_raw();
     assert_talker_attention_io_shapes(model);
     assert_talker_attention_layer_inventory(model);

@@ -13,6 +13,9 @@ use super::subprocess::{
 use crate::loader::{load_onnx_bytes_with_config, OnnxLoadConfig, ShapeInferBackend};
 use crate::onnx_proto;
 use prost::Message;
+// Used only by the `#[cfg(unix)]` tests below (they build executable shell
+// scripts, which needs Unix mode bits); gated to match its uses.
+#[cfg(unix)]
 use std::path::PathBuf;
 
 fn tensor_value_info(name: &str, shape: &[i64]) -> onnx_proto::ValueInfoProto {

@@ -16,6 +16,25 @@ workspace = true
 default = ["core", "tensor"]
 core = ["dep:ny-core"]
 tensor = ["dep:ny-tensor"]
+# Cargo owns these black-box contracts, but they execute repository Python
+# tools and therefore belong to an explicit interpreter-selected lane rather
+# than the hermetic default workspace suite.
+python-tools = []
+
+[[test]]
+name = "python_replay_black_box"
+path = "tests/python_replay_black_box.rs"
+required-features = ["python-tools"]
+
+[[test]]
+name = "python_tooling_black_box"
+path = "tests/python_tooling_black_box.rs"
+required-features = ["python-tools"]
+
+[[test]]
+name = "repository_policy_black_box"
+path = "tests/repository_policy_black_box.rs"
+required-features = ["python-tools"]
 
 [dependencies]
 ny-core = { path = "../ny-core", optional = true }

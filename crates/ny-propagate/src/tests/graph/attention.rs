@@ -329,32 +329,18 @@ fn test_self_attention_decomposition_crown() {
     let input = bounded_nd(&[2, 2], vec![0.5, 0.0, 0.0, 0.5], vec![1.5, 1.0, 1.0, 1.5]);
 
     // CROWN backward should succeed (not return UnsupportedOp)
-    let crown_output = graph.propagate_crown_batched(&input);
-
-    match crown_output {
-        Ok(output) => {
-            assert_eq!(output.shape(), &[2, 2]);
-            // Bounds should be valid
-            for (l, u) in output.lower().iter().zip(output.upper().iter()) {
-                assert!(l <= u, "CROWN bounds invalid: lower={l} > upper={u}");
-            }
-            // CROWN bounds should be finite
-            for l in output.lower().iter() {
-                assert!(l.is_finite(), "CROWN lower bound is not finite: {l}");
-            }
-            for u in output.upper().iter() {
-                assert!(u.is_finite(), "CROWN upper bound is not finite: {u}");
-            }
-        }
-        Err(e) => {
-            // Partial CROWN fallback is acceptable (returns IBP bounds).
-            // The key improvement is that we don't get UnsupportedOp anymore.
-            let msg = format!("{e}");
-            assert!(
-                !msg.contains("SelfAttention CROWN propagation not implemented"),
-                "Decomposed graph should not hit monolithic SelfAttention CROWN error: {msg}"
-            );
-        }
+    let output = graph
+        .propagate_crown_batched(&input)
+        .expect("decomposed SelfAttention CROWN must publish bounds");
+    assert_eq!(output.shape(), &[2, 2]);
+    for (l, u) in output.lower().iter().zip(output.upper().iter()) {
+        assert!(l <= u, "CROWN bounds invalid: lower={l} > upper={u}");
+    }
+    for l in output.lower().iter() {
+        assert!(l.is_finite(), "CROWN lower bound is not finite: {l}");
+    }
+    for u in output.upper().iter() {
+        assert!(u.is_finite(), "CROWN upper bound is not finite: {u}");
     }
 }
 

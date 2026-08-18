@@ -6,10 +6,18 @@ use super::super::common::{normalize_axis, parse_scalar_i64, parse_shape_i64};
 use ndarray::{ArrayD, IxDyn};
 
 #[test]
-fn test_parse_scalar_i64_rounding() {
+fn test_parse_scalar_i64_requires_exact_integrality() {
     assert_eq!(parse_scalar_i64(3.0), Some(3));
     assert_eq!(parse_scalar_i64(-2.0), Some(-2));
-    assert_eq!(parse_scalar_i64(1.00001), Some(1));
+    assert_eq!(parse_scalar_i64(1.00001), None);
+    assert_eq!(
+        parse_scalar_i64(f32::from_bits(1.0_f32.to_bits() - 1)),
+        None
+    );
+    assert_eq!(
+        parse_scalar_i64(f32::from_bits(1.0_f32.to_bits() + 1)),
+        None
+    );
     assert_eq!(parse_scalar_i64(1.25), None);
     assert_eq!(parse_scalar_i64(1.0e20), None);
     assert_eq!(parse_scalar_i64(f32::NAN), None);
@@ -40,11 +48,11 @@ fn test_parse_shape_i64_rejects_non_finite() {
 }
 
 #[test]
-fn test_parse_shape_i64_rounding_tolerance() {
+fn test_parse_shape_i64_rejects_nearby_non_integers() {
     let arr = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.00009, 2.0002]).unwrap();
     assert_eq!(parse_shape_i64(&arr), None);
     let arr = ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.00009]).unwrap();
-    assert_eq!(parse_shape_i64(&arr), Some(vec![1]));
+    assert_eq!(parse_shape_i64(&arr), None);
 }
 
 #[test]

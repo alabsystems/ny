@@ -187,6 +187,39 @@ fn test_graph_multi_objective_expired_deadline_stops_before_branching_4321() {
 
 #[ntest::timeout(10000)]
 #[test]
+fn test_graph_single_objective_expired_deadline_stops_before_branching() {
+    let (graph, input) = multi_objective_timeout_graph();
+    let config = BetaCrownConfig {
+        use_alpha_crown: false,
+        enable_cuts: false,
+        enable_pgd_attack: false,
+        timeout: Duration::from_mins(5),
+        max_domains: 100_000,
+        max_depth: 100,
+        batch_size: 64,
+        ..Default::default()
+    };
+
+    let start = Instant::now();
+    let result = BetaCrownVerifier::new(config)
+        .verify_graph_relu_split_with_engine_gpu(
+            &graph,
+            &input,
+            &[1.0_f32, 0.0_f32],
+            100.0,
+            None,
+            expired_deadline(),
+        )
+        .expect("expired-deadline single-objective graph verify should return cleanly");
+    assert_expired_deadline_halts_before_branching(
+        "graph single-objective ReLU split",
+        &result,
+        start.elapsed(),
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
 fn test_graph_input_split_expired_deadline_stops_before_branching_4321() {
     let graph = single_output_identity_graph();
     let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())

@@ -64,7 +64,7 @@ pub(super) fn screen_child_domain(
                 picked_idx,
                 split_dim,
                 error = %err,
-                "GPU BaB input split: invalid child input bounds"
+                "DomainList BaB input split: invalid child input bounds"
             );
             state.unresolved_due_to_propagation_failure = true;
             return Ok(ChildDomainAction::Skip);
@@ -129,7 +129,7 @@ pub(super) fn screen_child_domain(
                                 picked_idx,
                                 split_dim,
                                 error = %err,
-                                "GPU BaB input split: precomputed linear bounds unavailable, falling back to direct complete clip"
+                                "DomainList BaB input split: precomputed linear bounds unavailable, falling back to direct complete clip"
                             );
                             None
                         }
@@ -166,7 +166,7 @@ pub(super) fn screen_child_domain(
                                     picked_idx,
                                     split_dim,
                                     error = %err,
-                                    "GPU BaB input split: skipping hidden-layer tightening after fallback complete clip"
+                                    "DomainList BaB input split: skipping hidden-layer tightening after fallback complete clip"
                                 ),
                             }
                         }
@@ -199,7 +199,7 @@ pub(super) fn screen_child_domain(
 
     let Some(meta) = child_processed.metadata.first_mut() else {
         return Err(NyError::InvalidSpec(
-            "GPU BaB input split: child metadata missing".to_string(),
+            "DomainList BaB input split: child metadata missing".to_string(),
         ));
     };
 
@@ -246,7 +246,7 @@ pub(super) fn screen_child_domain(
                 picked_idx,
                 split_dim,
                 error = %err,
-                "GPU BaB input split: CROWN/IBP child bound computation failed"
+                "DomainList BaB input split: CROWN/IBP child bound computation failed"
             );
             state.unresolved_due_to_propagation_failure = true;
             return Ok(ChildDomainAction::Skip);
@@ -260,7 +260,7 @@ pub(super) fn screen_child_domain(
             split_dim,
             lower = child_lower_bound,
             upper = child_upper_bound,
-            "GPU BaB input split: non-finite child bounds after CROWN/IBP"
+            "DomainList BaB input split: non-finite child bounds after CROWN/IBP"
         );
         state.unresolved_due_to_propagation_failure = true;
         return Ok(ChildDomainAction::Skip);

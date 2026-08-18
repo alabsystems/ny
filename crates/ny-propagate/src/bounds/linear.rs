@@ -3,10 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ndarray::{Array, Array1, Array2, Dimension};
-use ny_core::{NyError, Result};
+use ny_core::{
+    dd::{next_down_f64, next_up_f64, two_sum},
+    f32_to_f64_exact, NyError, Result,
+};
 use ny_tensor::RepairStrategy;
-use std::mem::size_of;
+use std::{mem::size_of, time::Instant};
 use tracing::{debug, warn};
+
+use super::{certified_affine_sum_f32, certified_affine_sum_f32_with_poll, OutwardDirection};
 
 // ---- NY_SLACK_PROBE (dark, print-only): total accumulated f32 soundness slack ----
 //
@@ -66,6 +71,68 @@ fn any_non_finite<D: Dimension>(arr: &Array<f32, D>) -> bool {
     }
 }
 
+/// Upward sum of non-negative binary64 values. The extra ulp covers the exact
+/// add even when a much smaller addend disappears from the hardware result.
+#[inline]
+fn nonnegative_add_f64_up(left: f64, right: f64) -> f64 {
+    if !left.is_finite() || !right.is_finite() || left < 0.0 || right < 0.0 {
+        return f64::INFINITY;
+    }
+    if right == 0.0 {
+        return left;
+    }
+    let sum = left + right;
+    if sum.is_finite() {
+        next_up_f64(sum)
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Certified absolute gap between a stored f32 addition and the exact-real sum
+/// of the two f32 bit patterns. Bit-exact widening avoids DAZ erasing a
+/// subnormal operand before it reaches the proof arithmetic.
+#[inline]
+fn f32_addition_gap_up(old: f32, increment: f32, stored: f32) -> f32 {
+    let old64 = f32_to_f64_exact(old);
+    let increment64 = f32_to_f64_exact(increment);
+    let stored64 = f32_to_f64_exact(stored);
+    let (sum_hi, sum_lo) = two_sum(old64, increment64);
+    let (difference_hi, difference_lo) = two_sum(stored64, -sum_hi);
+    let mut magnitude = nonnegative_add_f64_up(difference_hi.abs(), difference_lo.abs());
+    magnitude = nonnegative_add_f64_up(magnitude, sum_lo.abs());
+    ny_core::f64_to_f32_up(magnitude)
+}
+
+/// Upward accumulation of existing coefficient error, one f32-addition gap,
+/// and an optional source-coefficient residual.
+#[inline]
+fn accumulated_lower_error_up(old_error: f32, addition_gap: f32, extra_error: f32) -> f32 {
+    let mut total = f32_to_f64_exact(old_error);
+    total = nonnegative_add_f64_up(total, f32_to_f64_exact(addition_gap));
+    total = nonnegative_add_f64_up(total, f32_to_f64_exact(extra_error));
+    ny_core::f64_to_f32_up(total)
+}
+
+/// Lower endpoint of the exact-real sum of two f32 bit patterns.
+#[inline]
+fn f32_sum_f64_down(left: f32, right: f32) -> f64 {
+    let left64 = f32_to_f64_exact(left);
+    let right64 = f32_to_f64_exact(right);
+    if left64.is_nan() || right64.is_nan() {
+        return f64::NEG_INFINITY;
+    }
+    if !left64.is_finite() || !right64.is_finite() {
+        return left64 + right64;
+    }
+    let (sum, residual) = two_sum(left64, right64);
+    if residual < 0.0 {
+        next_down_f64(sum)
+    } else {
+        sum
+    }
+}
+
 /// Fast scan for any NaN element in an `f32` array.
 ///
 /// Behaviourally equivalent to `arr.iter().any(|v| v.is_nan())`, with the same
@@ -77,6 +144,134 @@ fn any_nan<D: Dimension>(arr: &Array<f32, D>) -> bool {
         Some(slice) => slice.iter().any(|v| v.is_nan()),
         None => arr.iter().any(|v| v.is_nan()),
     }
+}
+
+/// One transactional allocation receipt for a deadline-aware `LinearBounds`
+/// copy. Retained arrays are charged by logical payload, matching the CROWN
+/// dense-memory contract; every `Vec` allocated here reconciles any allocator
+/// capacity overage before its elements are touched.
+struct LinearCloneAdmission {
+    nominal_required_bytes: usize,
+    capacity_overage_bytes: usize,
+    budget_bytes: usize,
+}
+
+impl LinearCloneAdmission {
+    fn new(nominal_required_bytes: usize, site: &'static str) -> Result<Self> {
+        let budget_bytes = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
+        if nominal_required_bytes > budget_bytes {
+            return Err(NyError::CpuMemoryExceeded {
+                required_bytes: nominal_required_bytes,
+                budget_bytes,
+                site,
+            });
+        }
+        Ok(Self {
+            nominal_required_bytes,
+            capacity_overage_bytes: 0,
+            budget_bytes,
+        })
+    }
+
+    fn allocation_error(&self, site: &'static str) -> NyError {
+        NyError::CpuMemoryExceeded {
+            required_bytes: self
+                .nominal_required_bytes
+                .saturating_add(self.capacity_overage_bytes),
+            budget_bytes: self.budget_bytes,
+            site,
+        }
+    }
+
+    fn reconcile_f32_capacity(
+        &mut self,
+        requested_elements: usize,
+        actual_capacity: usize,
+        site: &'static str,
+    ) -> Result<()> {
+        let requested_bytes = requested_elements.saturating_mul(size_of::<f32>());
+        let actual_bytes = actual_capacity.saturating_mul(size_of::<f32>());
+        self.capacity_overage_bytes = self
+            .capacity_overage_bytes
+            .saturating_add(actual_bytes.saturating_sub(requested_bytes));
+        let required_bytes = self
+            .nominal_required_bytes
+            .saturating_add(self.capacity_overage_bytes);
+        if required_bytes > self.budget_bytes {
+            return Err(self.allocation_error(site));
+        }
+        Ok(())
+    }
+}
+
+fn try_copy_array2_with_deadline(
+    source: &Array2<f32>,
+    deadline: &mut super::patches::PatchesMaterializationDeadline,
+    admission: &mut LinearCloneAdmission,
+    site: &'static str,
+) -> Result<Array2<f32>> {
+    deadline.checkpoint(site)?;
+    let len = source.len();
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| admission.allocation_error(site))?;
+    admission.reconcile_f32_capacity(len, values.capacity(), site)?;
+    deadline.checkpoint(site)?;
+    for &value in source {
+        values.push(value);
+        deadline.work(1, site)?;
+    }
+    deadline.checkpoint(site)?;
+    Array2::from_shape_vec(source.raw_dim(), values).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "{site}: copied coefficient shape could not be reconstructed: {error}"
+        ))
+    })
+}
+
+fn try_copy_array1_with_deadline(
+    source: &Array1<f32>,
+    deadline: &mut super::patches::PatchesMaterializationDeadline,
+    admission: &mut LinearCloneAdmission,
+    site: &'static str,
+) -> Result<Array1<f32>> {
+    deadline.checkpoint(site)?;
+    let len = source.len();
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| admission.allocation_error(site))?;
+    admission.reconcile_f32_capacity(len, values.capacity(), site)?;
+    deadline.checkpoint(site)?;
+    for &value in source {
+        values.push(value);
+        deadline.work(1, site)?;
+    }
+    deadline.checkpoint(site)?;
+    Ok(Array1::from_vec(values))
+}
+
+fn try_generate_f32_vec_with_deadline(
+    len: usize,
+    deadline: &mut super::patches::PatchesMaterializationDeadline,
+    admission: &mut LinearCloneAdmission,
+    site: &'static str,
+    mut value_at: impl FnMut(usize) -> f32,
+) -> Result<Vec<f32>> {
+    deadline.checkpoint(site)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| admission.allocation_error(site))?;
+    admission.reconcile_f32_capacity(len, values.capacity(), site)?;
+    deadline.checkpoint(site)?;
+    for index in 0..len {
+        values.push(value_at(index));
+        deadline.work(1, site)?;
+    }
+    deadline.checkpoint(site)?;
+    Ok(values)
 }
 
 /// Linear bounds representation for CROWN-style propagation.
@@ -218,6 +413,17 @@ impl LinearBounds {
                 "LinearBounds upper_b bias contains NaN".into(),
             ));
         }
+        if self
+            .lower_a_err
+            .iter()
+            .chain(self.upper_a_err.iter())
+            .flat_map(|error| error.iter())
+            .any(|&value| value.is_nan() || value < 0.0)
+        {
+            return Err(NyError::NumericalInstability(
+                "LinearBounds coefficient error must be non-negative and non-NaN".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -237,6 +443,82 @@ impl LinearBounds {
             lower_a_err: None,
             upper_a_err: None,
         }
+    }
+
+    /// Fallibly construct an identity relation under one absolute deadline.
+    ///
+    /// The finite path charges the retained request payload plus both identity
+    /// matrices and both zero biases, reconciles every backing `Vec` capacity,
+    /// and polls all fills at most every 4096 elements. Nothing is published
+    /// until all four buffers are complete. `None` preserves the historical
+    /// [`Self::identity`] implementation exactly.
+    pub(crate) fn try_identity_with_deadline(
+        dim: usize,
+        deadline: Option<Instant>,
+        retained_base_bytes: usize,
+    ) -> Result<Self> {
+        const SITE: &str = "LinearBounds::try_identity_with_deadline";
+        let Some(limit) = deadline else {
+            return Ok(Self::identity(dim));
+        };
+        let mut poll = super::patches::PatchesMaterializationDeadline::new(Some(limit));
+        poll.checkpoint(SITE)?;
+        let coefficient_elements = dim.saturating_mul(dim);
+        let total_elements = coefficient_elements
+            .checked_mul(2)
+            .and_then(|elements| {
+                dim.checked_mul(2)
+                    .and_then(|bias| elements.checked_add(bias))
+            })
+            .unwrap_or(usize::MAX);
+        let required_bytes =
+            retained_base_bytes.saturating_add(total_elements.saturating_mul(size_of::<f32>()));
+        let mut admission = LinearCloneAdmission::new(required_bytes, SITE)?;
+
+        let lower_a = try_generate_f32_vec_with_deadline(
+            coefficient_elements,
+            &mut poll,
+            &mut admission,
+            SITE,
+            |index| {
+                if index / dim == index % dim {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+        )?;
+        let lower_b =
+            try_generate_f32_vec_with_deadline(dim, &mut poll, &mut admission, SITE, |_| 0.0)?;
+        let upper_a = try_generate_f32_vec_with_deadline(
+            coefficient_elements,
+            &mut poll,
+            &mut admission,
+            SITE,
+            |index| {
+                if index / dim == index % dim {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+        )?;
+        let upper_b =
+            try_generate_f32_vec_with_deadline(dim, &mut poll, &mut admission, SITE, |_| 0.0)?;
+        poll.checkpoint(SITE)?;
+
+        let lower_a = Array2::from_shape_vec((dim, dim), lower_a).map_err(|error| {
+            NyError::InternalError(format!("{SITE}: lower identity shape failed: {error}"))
+        })?;
+        let upper_a = Array2::from_shape_vec((dim, dim), upper_a).map_err(|error| {
+            NyError::InternalError(format!("{SITE}: upper identity shape failed: {error}"))
+        })?;
+        Self::from_prevalidated_parts(
+            lower_a,
+            Array1::from_vec(lower_b),
+            upper_a,
+            Array1::from_vec(upper_b),
+        )
     }
 
     /// Heap bytes needed for the lower/upper identity coefficient pair.
@@ -465,11 +747,106 @@ impl LinearBounds {
 
     /// Total heap memory used by this bounds struct, in bytes.
     ///
-    /// Includes both A-matrices (coefficient matrices) and bias vectors.
-    /// For N outputs and M inputs: `2 * N * M * 4 + 2 * N * 4` bytes.
+    /// Includes all owned `f32` buffers: both A-matrices (coefficient matrices),
+    /// both bias vectors, and each present certified coefficient-error matrix.
+    /// For N outputs and M inputs, the base storage is
+    /// `2 * N * M * 4 + 2 * N * 4` bytes, plus `N * M * 4` bytes for each
+    /// present error matrix.
+    ///
+    /// Returns [`usize::MAX`] if the total is not representable as a `usize`.
     pub fn memory_bytes(&self) -> usize {
-        (self.lower_a.len() + self.upper_a.len() + self.lower_b.len() + self.upper_b.len())
-            * size_of::<f32>()
+        [
+            self.lower_a.len(),
+            self.upper_a.len(),
+            self.lower_b.len(),
+            self.upper_b.len(),
+            self.lower_a_err.as_ref().map_or(0, Array2::len),
+            self.upper_a_err.as_ref().map_or(0, Array2::len),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
+        .saturating_mul(size_of::<f32>())
+    }
+
+    /// Fallibly clone this complete proof carrier under one absolute deadline.
+    ///
+    /// `retained_base_bytes` is the logical payload of other request-owned
+    /// state that remains live throughout the copy. This method additionally
+    /// charges both `self` and the staged clone, reconciles every newly reserved
+    /// `Vec` capacity, polls all element copies, and returns no partial object on
+    /// deadline or memory refusal.
+    pub(crate) fn try_clone_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+        retained_base_bytes: usize,
+    ) -> Result<Self> {
+        const SITE: &str = "LinearBounds::try_clone_with_deadline";
+        let mut deadline = super::patches::PatchesMaterializationDeadline::new(deadline);
+        deadline.checkpoint(SITE)?;
+        let source_bytes = self.memory_bytes();
+        let nominal_required_bytes = retained_base_bytes
+            .saturating_add(source_bytes)
+            .saturating_add(source_bytes);
+        let mut admission = LinearCloneAdmission::new(nominal_required_bytes, SITE)?;
+
+        let lower_a =
+            try_copy_array2_with_deadline(&self.lower_a, &mut deadline, &mut admission, SITE)?;
+        let lower_b =
+            try_copy_array1_with_deadline(&self.lower_b, &mut deadline, &mut admission, SITE)?;
+        let upper_a =
+            try_copy_array2_with_deadline(&self.upper_a, &mut deadline, &mut admission, SITE)?;
+        let upper_b =
+            try_copy_array1_with_deadline(&self.upper_b, &mut deadline, &mut admission, SITE)?;
+        let lower_a_err = self
+            .lower_a_err
+            .as_ref()
+            .map(|source| {
+                try_copy_array2_with_deadline(source, &mut deadline, &mut admission, SITE)
+            })
+            .transpose()?;
+        let upper_a_err = self
+            .upper_a_err
+            .as_ref()
+            .map(|source| {
+                try_copy_array2_with_deadline(source, &mut deadline, &mut admission, SITE)
+            })
+            .transpose()?;
+        deadline.checkpoint(SITE)?;
+
+        let cloned = Self::from_prevalidated_parts_with_optional_err(
+            lower_a,
+            lower_b,
+            upper_a,
+            upper_b,
+            lower_a_err,
+            upper_a_err,
+        )?;
+        deadline.checkpoint(SITE)?;
+        Ok(cloned)
+    }
+
+    /// Fallibly copy only the lower coefficient matrix under one absolute
+    /// deadline. This is the narrow capture seam used by α-CROWN intermediates;
+    /// it avoids allocating an otherwise-discarded upper relation and biases.
+    /// `retained_base_bytes` has the same meaning as in
+    /// [`Self::try_clone_with_deadline`].
+    pub(crate) fn try_clone_lower_a_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+        retained_base_bytes: usize,
+    ) -> Result<Array2<f32>> {
+        const SITE: &str = "LinearBounds::try_clone_lower_a_with_deadline";
+        let mut deadline = super::patches::PatchesMaterializationDeadline::new(deadline);
+        deadline.checkpoint(SITE)?;
+        let clone_bytes = self.lower_a.len().saturating_mul(size_of::<f32>());
+        let nominal_required_bytes = retained_base_bytes
+            .saturating_add(self.memory_bytes())
+            .saturating_add(clone_bytes);
+        let mut admission = LinearCloneAdmission::new(nominal_required_bytes, SITE)?;
+        let copy =
+            try_copy_array2_with_deadline(&self.lower_a, &mut deadline, &mut admission, SITE)?;
+        deadline.checkpoint(SITE)?;
+        Ok(copy)
     }
 
     // --- Read-only accessors ---
@@ -561,14 +938,24 @@ impl LinearBounds {
     /// Attach certified coefficient-error matrices to this bounds object.
     ///
     /// REQUIRES the error matrices to be element-wise `>= 0`, finite, and the
-    /// same shape as `lower_a`/`upper_a`. Entries are clamped to non-negative
-    /// and any non-finite is treated as conservatively large (handled at
+    /// same shape as `lower_a`/`upper_a`. A negative or non-finite entry is
+    /// replaced by `+inf` (handled at
     /// concretize, which degrades the row to `[-inf, +inf]`).
     pub(crate) fn set_coeff_err(&mut self, lower_err: Array2<f32>, upper_err: Array2<f32>) {
-        debug_assert_eq!(lower_err.shape(), self.lower_a.shape());
-        debug_assert_eq!(upper_err.shape(), self.upper_a.shape());
-        self.lower_a_err = Some(lower_err);
-        self.upper_a_err = Some(upper_err);
+        if lower_err.shape() != self.lower_a.shape() || upper_err.shape() != self.upper_a.shape() {
+            let (n_out, n_in) = (self.lower_a.nrows(), self.lower_a.ncols());
+            *self = Self::conservative(n_out, n_in);
+            return;
+        }
+        let sanitize = |v: f32| {
+            if v.is_finite() && v >= 0.0 {
+                v
+            } else {
+                f32::INFINITY
+            }
+        };
+        self.lower_a_err = Some(lower_err.mapv(sanitize));
+        self.upper_a_err = Some(upper_err.mapv(sanitize));
     }
 
     /// Apply a β-CROWN split contribution to neuron column `neuron_idx`,
@@ -626,6 +1013,90 @@ impl LinearBounds {
         }
     }
 
+    /// Deadline-aware, atomic counterpart of [`Self::apply_beta_split_to_column`].
+    ///
+    /// A finite request stages the complete carrier with the ordinary dense
+    /// memory receipt, applies and polls the column mutation only on that staged
+    /// value, and publishes it with one move after a final deadline check. Thus
+    /// an allocation refusal or expiry at any row leaves `self` bit-for-bit
+    /// unchanged. `None` delegates exactly to the historical in-place method.
+    #[cfg(test)]
+    pub(crate) fn apply_beta_split_to_column_with_deadline(
+        &mut self,
+        neuron_idx: usize,
+        signed_beta: f32,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        self.apply_beta_splits_to_columns_with_deadline(
+            std::iter::once((neuron_idx, signed_beta)),
+            deadline,
+        )
+    }
+
+    /// Apply a sequence of beta-column mutations as one finite transaction.
+    /// The input carrier is published only after every row of every requested
+    /// column has completed within the same absolute deadline.
+    pub(crate) fn apply_beta_splits_to_columns_with_deadline(
+        &mut self,
+        splits: impl IntoIterator<Item = (usize, f32)>,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        const SITE: &str = "LinearBounds::apply_beta_splits_to_columns_with_deadline";
+        let Some(limit) = deadline else {
+            for (neuron_idx, signed_beta) in splits {
+                self.apply_beta_split_to_column(neuron_idx, signed_beta);
+            }
+            return Ok(());
+        };
+        let mut poll = super::patches::PatchesMaterializationDeadline::new(Some(limit));
+        poll.checkpoint(SITE)?;
+        self.validate_internal_shapes()?;
+
+        // `try_clone_with_deadline` charges retained source + complete staged
+        // carrier and copies every buffer fallibly with cooperative polling.
+        let mut staged = self.try_clone_with_deadline(Some(limit), 0)?;
+        let track_err = staged.has_coeff_err();
+        for (neuron_idx, signed_beta) in splits {
+            poll.checkpoint(SITE)?;
+            if neuron_idx >= staged.num_inputs() {
+                return Err(NyError::InvalidSpec(format!(
+                    "{SITE}: neuron column {neuron_idx} is outside width {}",
+                    staged.num_inputs()
+                )));
+            }
+            if !signed_beta.is_finite() {
+                return Err(NyError::InvalidSpec(format!(
+                    "{SITE}: signed beta must be finite"
+                )));
+            }
+            let beta64 = signed_beta as f64;
+            for row in 0..staged.num_outputs() {
+                let lo = staged.lower_a[[row, neuron_idx]];
+                let hi = staged.upper_a[[row, neuron_idx]];
+                let new_lo = lo - signed_beta;
+                let new_hi = hi + signed_beta;
+                if track_err {
+                    let lo_gap = ((new_lo as f64) - (lo as f64 - beta64)).abs() as f32;
+                    let hi_gap = ((new_hi as f64) - (hi as f64 + beta64)).abs() as f32;
+                    if let Some(error) = staged.lower_a_err.as_mut() {
+                        error[[row, neuron_idx]] =
+                            ny_tensor::next_up_f32(error[[row, neuron_idx]] + lo_gap);
+                    }
+                    if let Some(error) = staged.upper_a_err.as_mut() {
+                        error[[row, neuron_idx]] =
+                            ny_tensor::next_up_f32(error[[row, neuron_idx]] + hi_gap);
+                    }
+                }
+                staged.lower_a[[row, neuron_idx]] = new_lo;
+                staged.upper_a[[row, neuron_idx]] = new_hi;
+                poll.work(1, SITE)?;
+            }
+        }
+        poll.checkpoint(SITE)?;
+        *self = staged;
+        Ok(())
+    }
+
     /// Inject a multi-neuron group facet's per-variable contribution `+coeff`
     /// into the **lower** backward coefficient column `col` (all output rows),
     /// folding the f32 rounding of each mutation into the certified coefficient
@@ -651,38 +1122,125 @@ impl LinearBounds {
     /// conv-stack group producer.
     #[allow(dead_code)]
     pub(crate) fn add_to_lower_column(&mut self, col: usize, coeff: f32) {
-        debug_assert!(coeff.is_finite());
-        if col >= self.lower_a.ncols() {
-            return;
+        let _ = self.add_to_lower_column_with_err(col, coeff, 0.0);
+    }
+
+    /// Materialize an all-zero lower coefficient-error matrix before an
+    /// in-place lower-coefficient mutation.
+    ///
+    /// `lower_a_err == None` means that every stored lower coefficient is
+    /// exact. A later f32 addition generally introduces a rounding gap, so a
+    /// mutating caller must make that gap representable before its first
+    /// write. Installing zeros preserves the existing certificate while
+    /// enabling [`add_to_lower_column_with_err`](Self::add_to_lower_column_with_err)
+    /// to account for the mutation.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_lower_coeff_err_tracking(&mut self) {
+        if self.lower_a_err.is_none() {
+            self.lower_a_err = Some(Array2::zeros(self.lower_a.raw_dim()));
+        }
+    }
+
+    /// Add `coeff` to a lower coefficient column and certify both the f32
+    /// addition and a caller-supplied coefficient residual.
+    ///
+    /// `extra_err` must be a finite non-negative upper bound on the difference
+    /// between `coeff` and the exact real coefficient the caller intended. The
+    /// method rejects invalid inputs before mutation. A non-zero residual also
+    /// requires the caller to have enabled lower coefficient-error tracking.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn add_to_lower_column_with_err(
+        &mut self,
+        col: usize,
+        coeff: f32,
+        extra_err: f32,
+    ) -> bool {
+        if col >= self.lower_a.ncols()
+            || !coeff.is_finite()
+            || !extra_err.is_finite()
+            || extra_err < 0.0
+        {
+            return false;
         }
         let track_err = self.lower_a_err.is_some();
-        let coeff64 = coeff as f64;
+        if extra_err > 0.0 && !track_err {
+            return false;
+        }
+        debug_assert!(coeff.is_finite());
+        debug_assert!(extra_err.is_finite() && extra_err >= 0.0);
+        debug_assert!(track_err || extra_err == 0.0);
         let n_out = self.num_outputs();
+
+        // Preflight the whole column. `LinearBounds` permits intermediate
+        // infinities, but subtracting infinities while measuring an addition
+        // gap would create NaN error entries. More importantly, a group term is
+        // atomic: no earlier output row may be left mutated if a later row
+        // cannot carry the same certified coefficient.
+        for i in 0..n_out {
+            let old = self.lower_a[[i, col]];
+            let new = old + coeff;
+            if !old.is_finite() || !new.is_finite() {
+                return false;
+            }
+            if let Some(lower_err) = self.lower_a_err.as_ref() {
+                let old_err = lower_err[[i, col]];
+                let gap = f32_addition_gap_up(old, coeff, new);
+                if !old_err.is_finite() || old_err < 0.0 || !gap.is_finite() {
+                    return false;
+                }
+                let total = accumulated_lower_error_up(old_err, gap, extra_err);
+                if !total.is_finite() {
+                    return false;
+                }
+            }
+        }
+
         for i in 0..n_out {
             let old = self.lower_a[[i, col]];
             let new = old + coeff;
             if track_err {
-                let gap = ((new as f64) - (old as f64 + coeff64)).abs() as f32;
+                let gap = f32_addition_gap_up(old, coeff, new);
                 if let Some(le) = self.lower_a_err.as_mut() {
-                    le[[i, col]] = ny_tensor::next_up_f32(le[[i, col]] + gap);
+                    le[[i, col]] = accumulated_lower_error_up(le[[i, col]], gap, extra_err);
                 }
             }
             self.lower_a[[i, col]] = new;
         }
+        true
     }
 
-    /// Add a constant `delta` to every output row's **lower** bias, rounded
-    /// OUTWARD (`next_down_f32`), for a group facet's `−β_c·b_c` term (§2.2 step
-    /// 3). Rounding the added constant DOWN can only lower the lower bound, so it
-    /// never overstates it — sound regardless of the sign of `delta`.
+    /// Fail closed by replacing the lower relaxation with `-inf` while leaving
+    /// the upper relaxation untouched.
+    ///
+    /// This is used when a multi-neuron Lagrangian term has partially entered a
+    /// carrier but cannot be completed. Zero coefficients plus a `-inf` bias
+    /// lower-bound every real function, so no incomplete term can authorize a
+    /// verdict.
+    #[allow(dead_code)]
+    pub(crate) fn degrade_lower_to_vacuous(&mut self) {
+        self.lower_a.fill(0.0);
+        self.lower_b.fill(f32::NEG_INFINITY);
+        if let Some(lower_err) = self.lower_a_err.as_mut() {
+            lower_err.fill(0.0);
+        }
+    }
+
+    /// Add a constant `delta` to every output row's **lower** bias, rounding the
+    /// f64 sum toward negative infinity, for a group facet's `−β_c·b_c` term
+    /// (§2.2 step 3). The directed conversion maps positive f32 overflow to
+    /// `f32::MAX` instead of `+inf`, while remaining no greater than the exact
+    /// real sum for either sign of `delta`.
     #[allow(dead_code)]
     pub(crate) fn add_lower_bias_outward(&mut self, delta: f32) {
-        if delta == 0.0 {
+        // DAZ can classify a non-zero subnormal as zero in a floating-point
+        // comparison.  Keep the helper's generic directed-add contract even
+        // for callers that supply such a delta.
+        if delta.to_bits() & 0x7fff_ffff == 0 {
             return;
         }
         for i in 0..self.lower_b.len() {
-            self.lower_b[i] =
-                ny_tensor::next_down_f32((self.lower_b[i] as f64 + delta as f64) as f32);
+            self.lower_b[i] = ny_core::f64_to_f32_down(f32_sum_f64_down(self.lower_b[i], delta));
         }
     }
 
@@ -797,6 +1355,11 @@ impl LinearBounds {
         if !self.has_coeff_err() {
             return;
         }
+        if self.validate_internal_shapes().is_err() || self.validate_no_nan().is_err() {
+            let (n_out, n_in) = (self.lower_a.nrows(), self.lower_a.ncols());
+            *self = Self::conservative(n_out, n_in);
+            return;
+        }
         let n_in = self.lower_a.ncols();
         if in_l.len() != n_in || in_u.len() != n_in {
             // Cannot map the box onto the columns; fall back to the conservative
@@ -805,21 +1368,23 @@ impl LinearBounds {
             return;
         }
         let n_out = self.lower_a.nrows();
-        // Worst-case input magnitude per column, in f64.
-        let mut mag = vec![0.0f64; n_in];
+        let mut mag = vec![0.0f32; n_in];
         for j in 0..n_in {
-            mag[j] = (in_l[j] as f64).abs().max((in_u[j] as f64).abs());
+            mag[j] = in_l[j].abs().max(in_u[j].abs());
         }
         if let Some(le) = self.lower_a_err.take() {
             for i in 0..n_out {
-                let mut p = 0.0f64;
-                for j in 0..n_in {
-                    p += le[[i, j]] as f64 * mag[j];
-                }
+                let p = certified_affine_sum_f32(
+                    0.0,
+                    (0..n_in).map(|j| (le[[i, j]], mag[j])),
+                    OutwardDirection::Upper,
+                );
                 if p != 0.0 {
                     if p.is_finite() {
-                        self.lower_b[i] =
-                            ny_tensor::next_down_f32((self.lower_b[i] as f64 - p) as f32);
+                        self.lower_b[i] = ny_tensor::next_down_f32(next_down_f64(
+                            self.lower_b[i] as f64 - p,
+                        )
+                            as f32);
                     } else {
                         self.lower_b[i] = f32::NEG_INFINITY;
                     }
@@ -828,14 +1393,15 @@ impl LinearBounds {
         }
         if let Some(ue) = self.upper_a_err.take() {
             for i in 0..n_out {
-                let mut p = 0.0f64;
-                for j in 0..n_in {
-                    p += ue[[i, j]] as f64 * mag[j];
-                }
+                let p = certified_affine_sum_f32(
+                    0.0,
+                    (0..n_in).map(|j| (ue[[i, j]], mag[j])),
+                    OutwardDirection::Upper,
+                );
                 if p != 0.0 {
                     if p.is_finite() {
                         self.upper_b[i] =
-                            ny_tensor::next_up_f32((self.upper_b[i] as f64 + p) as f32);
+                            ny_tensor::next_up_f32(next_up_f64(self.upper_b[i] as f64 + p) as f32);
                     } else {
                         self.upper_b[i] = f32::INFINITY;
                     }
@@ -872,6 +1438,11 @@ impl LinearBounds {
         if !self.has_coeff_err() {
             return;
         }
+        if self.validate_internal_shapes().is_err() || self.validate_no_nan().is_err() {
+            let (n_out, n_in) = (self.lower_a.nrows(), self.lower_a.ncols());
+            *self = Self::conservative(n_out, n_in);
+            return;
+        }
         let n_in = self.lower_a.ncols();
         let flat = input_box.flatten();
         let (Some(in_l), Some(in_u)) = (flat.lower().as_slice(), flat.upper().as_slice()) else {
@@ -881,47 +1452,138 @@ impl LinearBounds {
             return; // cannot map the box onto the columns: keep carrying
         }
         let n_out = self.lower_a.nrows();
-        let mut mag = vec![0.0f64; n_in];
+        let mut mag = vec![0.0f32; n_in];
         for j in 0..n_in {
-            mag[j] = (in_l[j] as f64).abs().max((in_u[j] as f64).abs());
+            mag[j] = in_l[j].abs().max(in_u[j].abs());
         }
         let probe_on = slack_probe_enabled();
-        let fold_side =
-            |err: &mut Option<Array2<f32>>, bias: &mut Array1<f32>, lower_side: bool| {
-                let Some(e) = err.as_mut() else { return };
-                let mut any_kept = false;
-                for i in 0..n_out {
-                    let mut p = 0.0f64;
-                    for j in 0..n_in {
-                        p += e[[i, j]] as f64 * mag[j];
-                    }
-                    if p.is_finite() {
-                        if p != 0.0 {
-                            if lower_side {
-                                // NY_SLACK_PROBE: record the margin-units this fold
-                                // subtracts from objective row `i`'s lower bound.
-                                if probe_on {
-                                    slack_probe_add(i, p);
-                                }
-                                bias[i] = ny_tensor::next_down_f32((bias[i] as f64 - p) as f32);
-                            } else {
-                                bias[i] = ny_tensor::next_up_f32((bias[i] as f64 + p) as f32);
+        let fold_side = |err: &mut Option<Array2<f32>>,
+                         bias: &mut Array1<f32>,
+                         lower_side: bool| {
+            let Some(e) = err.as_mut() else { return };
+            let mut any_kept = false;
+            for i in 0..n_out {
+                let p = certified_affine_sum_f32(
+                    0.0,
+                    (0..n_in).map(|j| (e[[i, j]], mag[j])),
+                    OutwardDirection::Upper,
+                );
+                if p.is_finite() {
+                    if p != 0.0 {
+                        if lower_side {
+                            // NY_SLACK_PROBE: record the margin-units this fold
+                            // subtracts from objective row `i`'s lower bound.
+                            if probe_on {
+                                slack_probe_add(i, p);
                             }
+                            bias[i] =
+                                ny_tensor::next_down_f32(next_down_f64(bias[i] as f64 - p) as f32);
+                        } else {
+                            bias[i] =
+                                ny_tensor::next_up_f32(next_up_f64(bias[i] as f64 + p) as f32);
                         }
-                        for j in 0..n_in {
-                            e[[i, j]] = 0.0;
-                        }
-                    } else {
-                        any_kept = true;
                     }
+                    for j in 0..n_in {
+                        e[[i, j]] = 0.0;
+                    }
+                } else {
+                    any_kept = true;
                 }
-                if !any_kept {
-                    *err = None;
-                }
-            };
+            }
+            if !any_kept {
+                *err = None;
+            }
+        };
         let (lower_a_err, upper_a_err) = (&mut self.lower_a_err, &mut self.upper_a_err);
         fold_side(lower_a_err, &mut self.lower_b, true);
         fold_side(upper_a_err, &mut self.upper_b, false);
+    }
+
+    /// Cooperative counterpart to [`Self::fold_coeff_err_over_box_eager`] for
+    /// finite proof-artifact capture. The receiver is expected to be a private
+    /// staged clone: a deadline refusal may leave it partially folded, but no
+    /// mutation is published by the caller until this method returns `Ok`.
+    pub(crate) fn fold_coeff_err_over_box_eager_with_deadline(
+        &mut self,
+        input_box: &ny_tensor::BoundedTensor,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let Some(deadline) = deadline else {
+            self.fold_coeff_err_over_box_eager(input_box);
+            return Ok(());
+        };
+        let mut authority = super::patches::PatchesMaterializationDeadline::new(Some(deadline));
+        authority.checkpoint("before finite coefficient-error cache fold")?;
+        if !self.has_coeff_err() {
+            return Ok(());
+        }
+        self.validate_internal_shapes()?;
+        let n_in = self.lower_a.ncols();
+        if input_box.len() != n_in {
+            return Err(NyError::UnsupportedConfiguration(format!(
+                "finite coefficient-error cache fold expected {n_in} box elements, got {}",
+                input_box.len()
+            )));
+        }
+        let n_out = self.lower_a.nrows();
+        let input_lower = input_box.lower();
+        let input_upper = input_box.upper();
+        let mut fold_side = |err: &mut Option<Array2<f32>>,
+                             bias: &mut Array1<f32>,
+                             lower_side: bool|
+         -> Result<()> {
+            let Some(error) = err.as_mut() else {
+                return Ok(());
+            };
+            let mut any_kept = false;
+            for row_index in 0..n_out {
+                authority.checkpoint("before finite coefficient-error cache row")?;
+                let error_row = error.row(row_index);
+                let terms = error_row
+                    .iter()
+                    .copied()
+                    .zip(input_lower.iter().copied().zip(input_upper.iter().copied()))
+                    .map(|(coefficient_error, (lower, upper))| {
+                        (coefficient_error, lower.abs().max(upper.abs()))
+                    });
+                let penalty = certified_affine_sum_f32_with_poll(
+                    0.0,
+                    terms,
+                    OutwardDirection::Upper,
+                    |units| {
+                        authority.work(units, "during finite coefficient-error cache reduction")
+                    },
+                )?;
+                if penalty.is_finite() {
+                    if penalty != 0.0 {
+                        if lower_side {
+                            bias[row_index] = ny_tensor::next_down_f32(next_down_f64(
+                                bias[row_index] as f64 - penalty,
+                            )
+                                as f32);
+                        } else {
+                            bias[row_index] = ny_tensor::next_up_f32(next_up_f64(
+                                bias[row_index] as f64 + penalty,
+                            )
+                                as f32);
+                        }
+                    }
+                    for value in error.row_mut(row_index) {
+                        *value = 0.0;
+                        authority.work(1, "while clearing finite coefficient-error cache row")?;
+                    }
+                } else {
+                    any_kept = true;
+                }
+            }
+            if !any_kept {
+                *err = None;
+            }
+            Ok(())
+        };
+        fold_side(&mut self.lower_a_err, &mut self.lower_b, true)?;
+        fold_side(&mut self.upper_a_err, &mut self.upper_b, false)?;
+        authority.checkpoint("after finite coefficient-error cache fold")
     }
 
     /// Soundly discharge any certified coefficient error by degrading every
@@ -941,6 +1603,10 @@ impl LinearBounds {
             return;
         }
         let (n_out, n_in) = (self.lower_a.nrows(), self.lower_a.ncols());
+        if self.validate_internal_shapes().is_err() || self.validate_no_nan().is_err() {
+            *self = Self::conservative(n_out, n_in);
+            return;
+        }
         if let Some(le) = self.lower_a_err.take() {
             for i in 0..n_out {
                 let row_has_err = (0..n_in).any(|j| le[[i, j]] != 0.0);
@@ -1034,6 +1700,67 @@ impl LinearBounds {
         }
     }
 
+    /// Construct from parts whose numeric contents were already validated by
+    /// a bounded, deadline-aware producer.
+    ///
+    /// Unlike [`Self::from_parts_unchecked`], this does not rescan every
+    /// coefficient in debug builds. That distinction is required by producers
+    /// which promise bounded cancellation latency: repeating an
+    /// `O(num_outputs * num_inputs)` debug validation after their final
+    /// deadline poll would reopen an uninterruptible tail.
+    ///
+    /// # Contract
+    ///
+    /// The caller must have established, before this call, that coefficient
+    /// matrices contain only CROWN-safe finite values and bias vectors contain
+    /// no NaN. Shape consistency is still checked here.
+    pub(crate) fn from_prevalidated_parts(
+        lower_a: Array2<f32>,
+        lower_b: Array1<f32>,
+        upper_a: Array2<f32>,
+        upper_b: Array1<f32>,
+    ) -> Result<Self> {
+        let bounds = Self {
+            lower_a,
+            lower_b,
+            upper_a,
+            upper_b,
+            lower_a_err: None,
+            upper_a_err: None,
+        };
+        bounds.validate_internal_shapes()?;
+        Ok(bounds)
+    }
+
+    /// Construct from already-validated owned parts and optional certified
+    /// coefficient-error matrices without copying or rescanning their values.
+    ///
+    /// This is the bounded-allocation counterpart of
+    /// [`Self::new_or_conservative_with_err`]. Producers which use it must have
+    /// applied that constructor's numeric firewall in place before this call:
+    /// coefficients are finite, biases are not NaN, and every carried error is
+    /// non-negative and non-NaN (non-finite/negative source errors are normally
+    /// replaced by `+INF`). Shape consistency is still authenticated here.
+    pub(crate) fn from_prevalidated_parts_with_optional_err(
+        lower_a: Array2<f32>,
+        lower_b: Array1<f32>,
+        upper_a: Array2<f32>,
+        upper_b: Array1<f32>,
+        lower_a_err: Option<Array2<f32>>,
+        upper_a_err: Option<Array2<f32>>,
+    ) -> Result<Self> {
+        let bounds = Self {
+            lower_a,
+            lower_b,
+            upper_a,
+            upper_b,
+            lower_a_err,
+            upper_a_err,
+        };
+        bounds.validate_internal_shapes()?;
+        Ok(bounds)
+    }
+
     /// Construct a `LinearBounds` from parts plus certified coefficient error.
     ///
     /// Internal constructor used by the linear CROWN-backward step to carry the
@@ -1067,6 +1794,12 @@ impl LinearBounds {
         {
             base.lower_a_err = Some(sanitize(lower_a_err));
             base.upper_a_err = Some(sanitize(upper_a_err));
+        } else {
+            // The error matrices are part of the proof object, not optional
+            // metadata.  Silently dropping a malformed carrier would publish the
+            // precise coefficients as exact.  Degrade the entire object instead.
+            let (n_out, n_in) = (base.lower_a.nrows(), base.lower_a.ncols());
+            base = Self::conservative(n_out, n_in);
         }
         Ok(base)
     }

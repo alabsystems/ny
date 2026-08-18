@@ -123,8 +123,8 @@ impl Network {
         for (i, layer) in self.layers.iter().enumerate() {
             match layer {
                 Layer::Linear(l) => {
-                    let mut next = l.weight.dot(&center);
-                    if let Some(b) = &l.bias {
+                    let mut next = l.weight().dot(&center);
+                    if let Some(b) = l.bias() {
                         next += b;
                     }
                     if next.iter().any(|v| !v.is_finite()) {

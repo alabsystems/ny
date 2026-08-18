@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod batch_norm_fold;
+mod bn_fold_interval;
 mod causal_softmax;
 mod gelu;
 mod gelu_tanh;

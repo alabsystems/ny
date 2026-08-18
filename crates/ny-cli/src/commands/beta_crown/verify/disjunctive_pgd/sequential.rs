@@ -19,7 +19,10 @@ use ny_tensor::BoundedTensor;
 #[cfg(test)]
 use std::time::Instant;
 
-use super::{constraint_margin, find_satisfied_clause, make_violated_result};
+use super::{
+    candidate_in_attack_box, candidate_output_is_finite, constraint_margin, find_satisfied_clause,
+    make_violated_result,
+};
 
 /// A confirmed PGD counterexample: `(counterexample_input, model_output, satisfied_clause_index)`.
 type PgdCounterexample = (ArrayD<f32>, ArrayD<f32>, usize);
@@ -100,6 +103,7 @@ fn confirm_disjunctive_pgd_candidate(
     found_counterexample: bool,
     counterexample: Option<ArrayD<f32>>,
     output: Option<ArrayD<f32>>,
+    input: &BoundedTensor,
     clauses: &[Vec<OutputConstraint>],
     per_clause_input_bounds: &[std::collections::BTreeMap<usize, (f64, f64)>],
     attack_desc: &str,
@@ -119,6 +123,28 @@ fn confirm_disjunctive_pgd_candidate(
             "disjunctive PGD reported found_counterexample=true but did not return an output tensor"
         )
     })?;
+
+    // This direct sequential lane owns its own confirmation funnel instead of
+    // calling the generic `re_evaluate_and_confirm`, so it must apply the same
+    // wrong-buffer/shape/non-finite input gate explicitly.
+    if !candidate_in_attack_box(&counterexample, input) {
+        tracing::warn!(
+            "Rejected sequential disjunctive PGD candidate outside the attack box \
+             (wrong-buffer guard, #witness-box-audit): attack={}",
+            attack_desc,
+        );
+        return Ok(None);
+    }
+    // A constraint may ignore some model outputs. Rust's f32::max semantics can
+    // otherwise hide a lone NaN while the serialized Y assignment remains
+    // organizer-invalid. Refuse the entire output vector fail-closed.
+    if !candidate_output_is_finite(&output) {
+        tracing::warn!(
+            "Rejected sequential disjunctive PGD candidate with non-finite model output: attack={}",
+            attack_desc,
+        );
+        return Ok(None);
+    }
 
     // Epsilon margin guard: reject borderline counterexamples where f32
     // accumulation-order divergence could cause sign flips between our
@@ -251,6 +277,7 @@ pub(super) fn try_sequential_disjunctive_pgd_attack_with_config(
         found_counterexample,
         counterexample,
         output,
+        input,
         clauses,
         per_clause_input_bounds,
         &attack_desc,
@@ -274,4 +301,81 @@ pub(super) fn try_sequential_disjunctive_pgd_attack_with_config(
         );
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+    use ndarray::arr1;
+
+    fn unit_box() -> BoundedTensor {
+        BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+            .expect("valid unit box")
+    }
+
+    fn always_satisfied_clause() -> Vec<Vec<OutputConstraint>> {
+        vec![vec![OutputConstraint::GreaterEq(1, 0)]]
+    }
+
+    #[test]
+    fn sequential_confirmation_rejects_out_of_attack_box_candidate() {
+        let confirmed = confirm_disjunctive_pgd_candidate(
+            true,
+            Some(arr1(&[5.0_f32]).into_dyn()),
+            Some(arr1(&[0.0_f32, 1.0_f32]).into_dyn()),
+            &unit_box(),
+            &always_satisfied_clause(),
+            &[],
+            "unit-test",
+            1.0,
+        )
+        .expect("confirmation is fail-closed, not fallible");
+        assert!(
+            confirmed.is_none(),
+            "the sequential fast path must not bypass the shared attack-box gate"
+        );
+    }
+
+    #[test]
+    fn sequential_confirmation_rejects_unused_non_finite_output() {
+        let confirmed = confirm_disjunctive_pgd_candidate(
+            true,
+            Some(arr1(&[0.5_f32]).into_dyn()),
+            // The first two outputs strongly satisfy the only clause; Y_2 is
+            // deliberately unused so this pins the whole-vector finite gate.
+            Some(arr1(&[0.0_f32, 1.0_f32, f32::NAN]).into_dyn()),
+            &unit_box(),
+            &always_satisfied_clause(),
+            &[],
+            "unit-test",
+            1.0,
+        )
+        .expect("confirmation is fail-closed, not fallible");
+        assert!(
+            confirmed.is_none(),
+            "an organizer-invalid NaN Y assignment must never be published"
+        );
+    }
+
+    #[test]
+    fn sequential_confirmation_preserves_genuine_in_box_candidate() {
+        let candidate = arr1(&[0.5_f32]).into_dyn();
+        let confirmed = confirm_disjunctive_pgd_candidate(
+            true,
+            Some(candidate.clone()),
+            Some(arr1(&[0.0_f32, 1.0_f32]).into_dyn()),
+            &unit_box(),
+            &always_satisfied_clause(),
+            &[],
+            "unit-test",
+            1.0,
+        )
+        .expect("confirmation succeeds")
+        .expect("genuine candidate remains accepted");
+        assert_eq!(
+            confirmed.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            candidate.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(confirmed.2, 0);
+    }
 }

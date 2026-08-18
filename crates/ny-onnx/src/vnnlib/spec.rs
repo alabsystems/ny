@@ -256,6 +256,24 @@ impl OutputConstraint {
             | OutputConstraint::GreaterThanConst(i, _) => *i,
         }
     }
+
+    /// Every output index this constraint reads (one for the `*Const` forms,
+    /// two for the relational forms).
+    pub fn referenced_output_indices(&self, out: &mut Vec<usize>) {
+        match self {
+            OutputConstraint::LessEq(i, j)
+            | OutputConstraint::GreaterEq(i, j)
+            | OutputConstraint::LessThan(i, j)
+            | OutputConstraint::GreaterThan(i, j) => {
+                out.push(*i);
+                out.push(*j);
+            }
+            OutputConstraint::LessEqConst(i, _)
+            | OutputConstraint::GreaterEqConst(i, _)
+            | OutputConstraint::LessThanConst(i, _)
+            | OutputConstraint::GreaterThanConst(i, _) => out.push(*i),
+        }
+    }
 }
 
 /// A parsed VNN-LIB specification.
@@ -296,14 +314,15 @@ pub struct VnnLibSpec {
     pub dual_network: Option<DualNetworkSpec>,
 }
 
-/// Round an f32 rhs value UP (toward +inf) for sound overapproximation,
-/// guarding against f64→f32 overflow. See #2360, #2658.
-fn rhs_with_overflow_guard(v: f32) -> f32 {
-    if v.is_finite() {
-        ny_tensor::next_up_f32(v)
-    } else {
-        ny_core::FALLBACK_BOUND
-    }
+/// Convert an f64 rhs value UP for a sound, tight binary32 overapproximation.
+///
+/// This must classify finite overflow before hardware narrowing: positive
+/// overflow widens to `+inf`, while negative overflow has the tighter valid
+/// upper endpoint `f32::MIN`. A finite sentinel chosen without regard to sign
+/// can shrink `A*y <= rhs` and manufacture an empty candidate-violation region.
+/// See #2360, #2658.
+fn rhs_with_overflow_guard(v: f64) -> f32 {
+    ny_core::f64_to_f32_up(v)
 }
 
 impl VnnLibSpec {
@@ -329,6 +348,31 @@ impl VnnLibSpec {
     /// that is >= `num_outputs`. This catches malformed VNN-LIB specs at parse
     /// time, preventing downstream `InvalidSpec` errors (in `to_output_constraints`) or
     /// silently weakened objectives (in `build_relational_objective`).
+    /// Every OUTPUT index this specification reads, sorted and deduplicated.
+    ///
+    /// The union spans the flat constraint list AND every disjunctive clause,
+    /// because a single bound collection serves all of them: a row any clause
+    /// reads must be tightened, whichever clause ends up deciding the verdict.
+    ///
+    /// This is what `#margin-subset-seed` needs to seed only the rows the
+    /// verdict can read. On TinyYOLO (yolo_2023) the spec constrains 5 of
+    /// 21,125 outputs, so the full `[21125 x 21125]` identity seed the OUTPUT
+    /// node would otherwise take is 4,225x larger than required.
+    pub fn referenced_output_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for constraint in &self.output_constraints {
+            constraint.referenced_output_indices(&mut indices);
+        }
+        for clause in &self.output_constraint_clauses {
+            for constraint in clause {
+                constraint.referenced_output_indices(&mut indices);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
     pub fn validate_output_indices(&self) -> ny_core::Result<()> {
         let num = self.num_outputs;
         let check = |constraint: &OutputConstraint| -> ny_core::Result<()> {
@@ -636,6 +680,11 @@ impl VnnLibSpec {
                 "Cannot convert to OutputConstraints: num_outputs is 0".to_string(),
             ));
         }
+        // `VnnLibSpec` is public and can be constructed programmatically without
+        // passing through the parser's validation. Preserve this Result API at
+        // the matrix-construction boundary instead of indexing a malformed Y_i
+        // and panicking.
+        self.validate_output_indices()?;
         let clauses: Vec<&[OutputConstraint]> = if self.output_constraint_clauses.is_empty() {
             if self.output_constraints.is_empty() {
                 Vec::new()
@@ -684,13 +733,13 @@ impl VnnLibSpec {
                 OutputConstraint::LessEqConst(i, c) | OutputConstraint::LessThanConst(i, c) => {
                     // Y_i <= c — round rhs UP to widen (sound). See #2658.
                     a_matrix[[row, *i]] = 1.0;
-                    rhs[row] = rhs_with_overflow_guard(*c as f32);
+                    rhs[row] = rhs_with_overflow_guard(*c);
                 }
                 OutputConstraint::GreaterEqConst(i, c)
                 | OutputConstraint::GreaterThanConst(i, c) => {
                     // -Y_i <= -c — round rhs UP (i.e., -c toward +inf). See #2658.
                     a_matrix[[row, *i]] = -1.0;
-                    rhs[row] = rhs_with_overflow_guard(-(*c as f32));
+                    rhs[row] = rhs_with_overflow_guard(-*c);
                 }
             }
         }
@@ -753,5 +802,62 @@ impl VnnLibSpec {
 impl Default for VnnLibSpec {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod referenced_output_indices_tests {
+    use super::{OutputConstraint, VnnLibSpec};
+
+    /// The union must span BOTH the flat constraint list and every disjunctive
+    /// clause: one bound collection serves all clauses, so a row any clause
+    /// reads must be tightened. Missing a clause would leave that row on its
+    /// looser IBP bound — still sound, but it silently gives up the tightening
+    /// this seed exists to provide.
+    #[test]
+    fn union_spans_clauses_and_relational_forms_and_dedupes() {
+        let mut spec = VnnLibSpec::new();
+        spec.num_outputs = 21_125;
+        spec.output_constraints = vec![
+            OutputConstraint::LessEqConst(776, -1.0),
+            OutputConstraint::LessEqConst(100, -1.0),
+            // Duplicate: must collapse.
+            OutputConstraint::LessEqConst(100, -2.0),
+        ];
+        spec.output_constraint_clauses = vec![
+            vec![OutputConstraint::GreaterEq(269, 438)],
+            vec![OutputConstraint::LessThan(607, 100)],
+        ];
+
+        // Sorted, deduplicated, and BOTH operands of each relational form.
+        assert_eq!(
+            spec.referenced_output_indices(),
+            vec![100, 269, 438, 607, 776]
+        );
+    }
+
+    /// A spec with no output constraints publishes nothing, which disengages
+    /// subset seeding and keeps the historical full-width path byte-identical.
+    #[test]
+    fn empty_spec_references_nothing() {
+        let spec = VnnLibSpec::new();
+        assert!(spec.referenced_output_indices().is_empty());
+    }
+
+    /// The TinyYOLO (yolo_2023) shape this was built for: 5 of 21,125 outputs.
+    /// The full identity seed the OUTPUT node would otherwise take is
+    /// 8 * 21125^2 = 3.57 GB, which the Conv2d scratch cap refuses.
+    #[test]
+    fn tinyyolo_spec_reads_five_of_21125_outputs() {
+        let mut spec = VnnLibSpec::new();
+        spec.num_outputs = 21_125;
+        spec.output_constraints = [100, 269, 438, 607, 776]
+            .into_iter()
+            .map(|i| OutputConstraint::LessEqConst(i, -1.0))
+            .collect();
+        let referenced = spec.referenced_output_indices();
+        assert_eq!(referenced.len(), 5);
+        assert_eq!(referenced.last(), Some(&776));
+        assert!(referenced.len() < spec.num_outputs);
     }
 }

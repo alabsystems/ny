@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# BACKEND CAPABILITY WAIVERS — the record of every place where a shipped preset
+# asks for a backend this build cannot even attempt to qualify for proof use.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# 1ede1d30 (2026-07-26) quarantined the WGPU proof adapter. Sixteen shipped
+# presets declare `general.device: wgpu`; from that commit on, every one of them
+# silently ran the CPU verifier behind a single `tracing::warn`. RUST_LOG is
+# ignored on the scored path, so no sweep log carried the warn, and TWO BANKED
+# CATEGORIES zeroed unnoticed for months — including soundnessbench, whose 3/3
+# `sat` gate is the repo's mandated soundness gate.
+#
+# The quarantine itself was right. What was missing was any record that its
+# CAPABILITY COST had been looked at. A silent WARN was not such a record.
+#
+# HOW IT IS ENFORCED
+# ------------------
+# `crates/ny-cli/src/preset/backend_capability_tests.rs` walks every shipped
+# preset under `configs/vnncomp*/`, pushes its declared `general.device` through
+# `commands::backend::honour_requested_backend` (the build-capability seam), and
+# FAILS unless each static mismatch is listed here.
+# The check is symmetric on purpose:
+#
+#   * a preset that declares a device the binary refuses to run, and is NOT
+#     listed here            -> test fails ("undeclared capability cost")
+#   * a preset listed here whose device IS now statically honoured
+#                            -> test fails ("stale waiver — delete the entry")
+#
+# Live WGPU qualification is deliberately separate. A statically honoured WGPU
+# request consumes `WgpuVerdictRequest` on one exact device and may still fall
+# back to CPU when any live rung refuses. That transition is authenticated by
+# the runtime proof-backend receipt and unconditional
+# `NY-HARNESS: BACKEND-OVERRIDE`, not by a preset-wide static waiver.
+#
+# EVERY entry must carry: declared/effective device, the commit and date that
+# introduced the substitution, and the MEASURED capability cost. "Unmeasured" is
+# not an acceptable value — measure it or do not land the gate.
+
+overrides: []

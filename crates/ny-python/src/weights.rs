@@ -4,6 +4,7 @@
 
 use crate::repr::repr_string;
 use crate::utils::validate_tolerance;
+use ny_core::nan_propagating_max;
 #[cfg(feature = "coreml")]
 use ny_onnx::coreml::load_coreml;
 #[cfg(feature = "gguf")]
@@ -501,6 +502,14 @@ fn load_weights_from_file(path: &str) -> ny_core::Result<WeightStore> {
     }
 }
 
+/// Treat non-finite arithmetic as a difference, never as a match.
+///
+/// In particular, `NaN > tolerance` is false, so a plain comparison would
+/// otherwise fail open for tensors containing NaN (including `inf - inf`).
+fn difference_exceeds_tolerance(diff: f32, tolerance: f32) -> bool {
+    !diff.is_finite() || diff > tolerance
+}
+
 /// Compare weights between two files.
 ///
 /// Supports ONNX (.onnx), SafeTensors (.safetensors), PyTorch (.pt, .pth, .bin),
@@ -558,11 +567,11 @@ pub fn weights_diff(
                     .iter()
                     .zip(tensor_b.iter())
                     .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, ny_core::nan_propagating_max);
+                    .fold(0.0f32, nan_propagating_max);
 
-                max_diff = max_diff.max(diff);
+                max_diff = nan_propagating_max(max_diff, diff);
 
-                if diff > tolerance {
+                if difference_exceeds_tolerance(diff, tolerance) {
                     differing_count += 1;
                     comparisons.push(TensorComparison {
                         name: name.to_string(),
@@ -625,8 +634,164 @@ pub fn weights_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{weights_diff, TensorComparisonStatus};
+    #[cfg(feature = "pytorch")]
+    use super::weights_info;
+    use super::{difference_exceeds_tolerance, weights_diff, TensorComparisonStatus};
     use pyo3::Python;
+
+    #[cfg(feature = "pytorch")]
+    use std::path::{Path, PathBuf};
+    #[cfg(feature = "pytorch")]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A tiny `torch.save(OrderedDict(test=tensor([[1, ..., 8]])))` archive.
+    ///
+    /// Keeping the 1.2 KiB fixture as hex makes fixture generation Cargo-owned
+    /// and hermetic: neither torch nor Python-side setup is needed to assert
+    /// checkpoint-directory behavior through the PyO3 surface.
+    #[cfg(feature = "pytorch")]
+    const PYTORCH_TEST_PT_HEX: &str = concat!(
+        "504b0304000008080000000000000000000000000000000000000d001500746573742f646174612e706b6c464211005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "800263636f6c6c656374696f6e730a4f726465726564446963740a710029527101580400000074657374710263746f7263682e5f7574696c730a5f7265627569",
+        "6c645f74656e736f725f76320a71032828580700000073746f72616765710463746f7263680a4c6f6e6753746f726167650a7105580100000030710658030000",
+        "0063707571074b08747108514b004b024b048671094b044b0186710a8968002952710b74710c52710d732e504b07083e6a9759ab000000ab000000504b030400",
+        "0008080000000000000000000000000000000000000e001900746573742f627974656f72646572464215005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "6c6974746c65504b0708853de3190600000006000000504b0304000008080000000000000000000000000000000000000b004100746573742f646174612f3046",
+        "423d005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a",
+        "01000000000000000200000000000000030000000000000004000000000000000500000000000000060000000000000007000000000000000800000000000000",
+        "504b0708a6b1b0494000000040000000504b0304000008080000000000000000000000000000000000000c000600746573742f76657273696f6e464202005a5a",
+        "330a504b0708d19e67550200000002000000504b0304000008080000000000000000000000000000000000001b003500746573742f2e646174612f7365726961",
+        "6c697a6174696f6e5f6964464231005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "31313436343432373233383439333535303431353030303031303932373032323034353532313731504b0708b2d616d22800000028000000504b010200000000",
+        "08080000000000003e6a9759ab000000ab0000000d0000000000000000000000000000000000746573742f646174612e706b6c504b0102000000000808000000",
+        "000000853de31906000000060000000e00000000000000000000000000fb000000746573742f627974656f72646572504b0102000000000808000000000000a6",
+        "b1b04940000000400000000b0000000000000000000000000056010000746573742f646174612f30504b0102000000000808000000000000d19e675502000000",
+        "020000000c0000000000000000000000000010020000746573742f76657273696f6e504b0102000000000808000000000000b2d616d228000000280000001b00",
+        "00000000000000000000000052020000746573742f2e646174612f73657269616c697a6174696f6e5f6964504b06062c000000000000001e032d000000000000",
+        "000000050000000000000005000000000000003301000000000000f802000000000000504b0607000000002b0400000000000001000000504b05060000000005",
+        "00050033010000f80200000000",
+    );
+
+    #[cfg(feature = "pytorch")]
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(feature = "pytorch")]
+    struct TestDir(PathBuf);
+
+    #[cfg(feature = "pytorch")]
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let serial = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("ny-python-{label}-{}-{serial}", std::process::id()));
+            std::fs::create_dir(&path).expect("create hermetic PyTorch test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(feature = "pytorch")]
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove hermetic PyTorch test directory");
+        }
+    }
+
+    #[cfg(feature = "pytorch")]
+    fn decode_pytorch_fixture() -> Vec<u8> {
+        fn nibble(byte: u8) -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => panic!("invalid hex byte in embedded PyTorch fixture"),
+            }
+        }
+
+        let hex = PYTORCH_TEST_PT_HEX.as_bytes();
+        assert_eq!(hex.len() % 2, 0, "fixture hex length must be even");
+        hex.chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
+    #[cfg(feature = "pytorch")]
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let low_bit_mask = 0u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & low_bit_mask);
+            }
+        }
+        !crc
+    }
+
+    #[cfg(feature = "pytorch")]
+    fn pytorch_fixture_with_name(name: &[u8; 4]) -> Vec<u8> {
+        let mut archive = decode_pytorch_fixture();
+        if name == b"test" {
+            return archive;
+        }
+
+        // Change only the four-byte state-dict key in data.pkl. The ZIP stores
+        // this entry uncompressed, so updating its data-descriptor and central
+        // directory CRC is sufficient; sizes and every subsequent offset stay
+        // identical. This yields a genuinely distinct second shard without
+        // invoking torch during a Cargo test.
+        let pickle_key = b"X\x04\0\0\0testq\x02";
+        let key_offsets: Vec<usize> = archive
+            .windows(pickle_key.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == pickle_key).then_some(offset))
+            .collect();
+        assert_eq!(key_offsets.len(), 1, "fixture has one state-dict key");
+        let key_start = key_offsets[0] + 5;
+        archive[key_start..key_start + 4].copy_from_slice(name);
+
+        assert_eq!(&archive[..4], b"PK\x03\x04");
+        let file_name_len = usize::from(u16::from_le_bytes([archive[26], archive[27]]));
+        let extra_len = usize::from(u16::from_le_bytes([archive[28], archive[29]]));
+        let data_start = 30 + file_name_len + extra_len;
+        let descriptor = data_start
+            + archive[data_start..]
+                .windows(4)
+                .position(|window| window == b"PK\x07\x08")
+                .expect("fixture data descriptor");
+        let checksum = crc32(&archive[data_start..descriptor]).to_le_bytes();
+        archive[descriptor + 4..descriptor + 8].copy_from_slice(&checksum);
+
+        let central = descriptor
+            + archive[descriptor..]
+                .windows(4)
+                .position(|window| window == b"PK\x01\x02")
+                .expect("fixture central directory");
+        archive[central + 16..central + 20].copy_from_slice(&checksum);
+        archive
+    }
+
+    #[cfg(feature = "pytorch")]
+    fn write_pytorch_fixture(path: &Path, name: &[u8; 4]) {
+        std::fs::write(path, pytorch_fixture_with_name(name))
+            .expect("write embedded PyTorch fixture");
+    }
+
+    #[cfg(feature = "pytorch")]
+    fn write_sharded_pytorch_fixture(dir: &Path) {
+        let first = "pytorch_model-00001-of-00002.bin";
+        let second = "pytorch_model-00002-of-00002.bin";
+        write_pytorch_fixture(&dir.join(first), b"test");
+        write_pytorch_fixture(&dir.join(second), b"tes2");
+        std::fs::write(
+            dir.join("pytorch_model.bin.index.json"),
+            format!(r#"{{"weight_map":{{"test":"{first}","tes2":"{second}"}}}}"#),
+        )
+        .expect("write hermetic PyTorch shard index");
+    }
 
     fn simple_mlp_path() -> String {
         format!(
@@ -648,6 +813,14 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_weight_differences_fail_closed() {
+        assert!(difference_exceeds_tolerance(f32::NAN, 1e-6));
+        assert!(difference_exceeds_tolerance(f32::INFINITY, 1e-6));
+        assert!(difference_exceeds_tolerance(f32::NEG_INFINITY, 1e-6));
+        assert!(!difference_exceeds_tolerance(1e-7, 1e-6));
+    }
+
+    #[test]
     fn test_weights_diff_returns_typed_status_3942() {
         Python::initialize();
         Python::attach(|py| {
@@ -661,6 +834,61 @@ mod tests {
                     .all(|comparison| comparison.status == TensorComparisonStatus::Match),
                 "same-file weights diff should only emit typed Match statuses"
             );
+        });
+    }
+
+    #[cfg(feature = "pytorch")]
+    #[test]
+    fn pytorch_checkpoint_directory_info_is_cargo_owned() {
+        let dir = TestDir::new("checkpoint-directory");
+        write_pytorch_fixture(&dir.path().join("pytorch_model.bin"), b"test");
+
+        Python::initialize();
+        Python::attach(|py| {
+            let info = weights_info(py, dir.path().to_str().expect("UTF-8 temporary path"))
+                .expect("load hermetic PyTorch checkpoint directory");
+            assert_eq!(info.format, "PyTorch (checkpoint)");
+            assert_eq!(info.tensor_count, 1);
+            assert_eq!(info.total_params, 8);
+            assert_eq!(info.tensors[0].name, "test");
+            assert_eq!(info.tensors[0].shape, [2, 4]);
+        });
+    }
+
+    #[cfg(feature = "pytorch")]
+    #[test]
+    fn pytorch_sharded_directory_info_and_diff_are_cargo_owned() {
+        let dir = TestDir::new("sharded-directory");
+        let mirror = TestDir::new("sharded-directory-mirror");
+        write_sharded_pytorch_fixture(dir.path());
+        write_sharded_pytorch_fixture(mirror.path());
+
+        Python::initialize();
+        Python::attach(|py| {
+            let info = weights_info(py, dir.path().to_str().expect("UTF-8 temporary path"))
+                .expect("load hermetic sharded PyTorch directory");
+            assert_eq!(info.format, "PyTorch (sharded)");
+            assert_eq!(info.tensor_count, 2);
+            assert_eq!(info.total_params, 16);
+            assert_eq!(
+                info.tensors
+                    .iter()
+                    .map(|tensor| tensor.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["tes2", "test"]
+            );
+
+            let result = weights_diff(
+                py,
+                dir.path().to_str().expect("UTF-8 temporary path"),
+                mirror.path().to_str().expect("UTF-8 temporary path"),
+                1e-6,
+            )
+            .expect("compare independently loaded sharded PyTorch checkpoints");
+            assert!(result.is_match);
+            assert_eq!(result.max_diff, 0.0);
+            assert_eq!(result.total_tensors_a, 2);
+            assert_eq!(result.total_tensors_b, 2);
         });
     }
 }

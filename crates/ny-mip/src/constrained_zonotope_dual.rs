@@ -62,6 +62,16 @@ use ndarray::{ArrayView1, ArrayView2};
 
 use crate::constrained_zonotope64::ConstrainedZonotope64;
 
+// Successful replay is allocation-free. Shape errors retain at most two
+// two-element `Vec<usize>` payloads; charge a wide fixed allowance before any
+// validation so even fail-closed diagnostics stay inside the call ceiling.
+pub(crate) const DUAL_SHAPE_ERROR_LIVE_BYTES: usize = 64;
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, ConstrainedZonotopeCallTracker,
+    InertConstrainedZonotopeCallGate,
+};
+
 /// A pair of finite, outward directional certificates.
 ///
 /// Subject to the documented exact-IEEE input interpretation, every feasible
@@ -131,6 +141,18 @@ pub enum ConstrainedZonotopeDualError {
     },
 }
 
+/// Evaluator or call-firewall refusal from a budgeted dual replay.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConstrainedZonotopeDualBudgetError {
+    /// Shapes, inputs, or outward arithmetic were invalid.
+    #[error(transparent)]
+    Evaluation(#[from] ConstrainedZonotopeDualError),
+
+    /// The caller's deadline or aggregate peak-memory ceiling refused work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
+}
+
 /// Evaluate one constrained-zonotope direction with rigorous outward `f64`
 /// arithmetic.
 ///
@@ -155,7 +177,7 @@ pub fn evaluate_constrained_zonotope_dual(
     direction: ArrayView1<'_, f64>,
     multipliers: ArrayView1<'_, f64>,
 ) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualError> {
-    evaluate_dense_constrained_zonotope_dual(
+    evaluate_dense_constrained_zonotope_dual_legacy(
         center,
         generators,
         constraints,
@@ -163,6 +185,35 @@ pub fn evaluate_constrained_zonotope_dual(
         None,
         direction,
         multipliers,
+    )
+}
+
+/// Budgeted dense dual replay with an implicit zero box remainder.
+///
+/// Successful evaluation allocates no heap storage. The aggregate peak adds
+/// only a fixed 64-byte allowance for shape-error vector payloads. All dense
+/// walks still poll the absolute deadline at the shared bounded cadence.
+pub fn evaluate_constrained_zonotope_dual_with_budget(
+    center: ArrayView1<'_, f64>,
+    generators: ArrayView2<'_, f64>,
+    constraints: ArrayView2<'_, f64>,
+    rhs: ArrayView1<'_, f64>,
+    direction: ArrayView1<'_, f64>,
+    multipliers: ArrayView1<'_, f64>,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+    ConstrainedZonotopeDualBudgetError,
+> {
+    evaluate_dense_constrained_zonotope_dual_with_budget_impl(
+        center,
+        generators,
+        constraints,
+        rhs,
+        None,
+        direction,
+        multipliers,
+        budget,
     )
 }
 
@@ -181,7 +232,7 @@ pub fn evaluate_constrained_zonotope_dual_with_box_remainder(
     direction: ArrayView1<'_, f64>,
     multipliers: ArrayView1<'_, f64>,
 ) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualError> {
-    evaluate_dense_constrained_zonotope_dual(
+    evaluate_dense_constrained_zonotope_dual_legacy(
         center,
         generators,
         constraints,
@@ -192,7 +243,35 @@ pub fn evaluate_constrained_zonotope_dual_with_box_remainder(
     )
 }
 
-fn evaluate_dense_constrained_zonotope_dual(
+/// Budgeted dense dual replay with an explicit independent box remainder.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_constrained_zonotope_dual_with_box_remainder_and_budget(
+    center: ArrayView1<'_, f64>,
+    generators: ArrayView2<'_, f64>,
+    constraints: ArrayView2<'_, f64>,
+    rhs: ArrayView1<'_, f64>,
+    box_remainder: ArrayView1<'_, f64>,
+    direction: ArrayView1<'_, f64>,
+    multipliers: ArrayView1<'_, f64>,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+    ConstrainedZonotopeDualBudgetError,
+> {
+    evaluate_dense_constrained_zonotope_dual_with_budget_impl(
+        center,
+        generators,
+        constraints,
+        rhs,
+        Some(box_remainder),
+        direction,
+        multipliers,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_dense_constrained_zonotope_dual_legacy(
     center: ArrayView1<'_, f64>,
     generators: ArrayView2<'_, f64>,
     constraints: ArrayView2<'_, f64>,
@@ -201,6 +280,102 @@ fn evaluate_dense_constrained_zonotope_dual(
     direction: ArrayView1<'_, f64>,
     multipliers: ArrayView1<'_, f64>,
 ) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualError> {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match evaluate_dense_constrained_zonotope_dual_impl(
+        center,
+        generators,
+        constraints,
+        rhs,
+        box_remainder,
+        direction,
+        multipliers,
+        &mut gate,
+    ) {
+        Ok(bounds) => Ok(bounds),
+        Err(ConstrainedZonotopeDualBudgetError::Evaluation(error)) => Err(error),
+        Err(ConstrainedZonotopeDualBudgetError::Budget(_)) => {
+            unreachable!("the inert dual-evaluation call gate cannot refuse work")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_dense_constrained_zonotope_dual_with_budget_impl(
+    center: ArrayView1<'_, f64>,
+    generators: ArrayView2<'_, f64>,
+    constraints: ArrayView2<'_, f64>,
+    rhs: ArrayView1<'_, f64>,
+    box_remainder: Option<ArrayView1<'_, f64>>,
+    direction: ArrayView1<'_, f64>,
+    multipliers: ArrayView1<'_, f64>,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+    ConstrainedZonotopeDualBudgetError,
+> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let bounds = evaluate_dense_constrained_zonotope_dual_impl(
+        center,
+        generators,
+        constraints,
+        rhs,
+        box_remainder,
+        direction,
+        multipliers,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(bounds, gate.report()))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn evaluate_dense_constrained_zonotope_dual_with_clock<N>(
+    center: ArrayView1<'_, f64>,
+    generators: ArrayView2<'_, f64>,
+    constraints: ArrayView2<'_, f64>,
+    rhs: ArrayView1<'_, f64>,
+    box_remainder: Option<ArrayView1<'_, f64>>,
+    direction: ArrayView1<'_, f64>,
+    multipliers: ArrayView1<'_, f64>,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+    ConstrainedZonotopeDualBudgetError,
+>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let bounds = evaluate_dense_constrained_zonotope_dual_impl(
+        center,
+        generators,
+        constraints,
+        rhs,
+        box_remainder,
+        direction,
+        multipliers,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(bounds, gate.report()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_dense_constrained_zonotope_dual_impl<G>(
+    center: ArrayView1<'_, f64>,
+    generators: ArrayView2<'_, f64>,
+    constraints: ArrayView2<'_, f64>,
+    rhs: ArrayView1<'_, f64>,
+    box_remainder: Option<ArrayView1<'_, f64>>,
+    direction: ArrayView1<'_, f64>,
+    multipliers: ArrayView1<'_, f64>,
+    gate: &mut G,
+) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.preflight_peak_live_bytes(DUAL_SHAPE_ERROR_LIVE_BYTES)?;
+    gate.checkpoint("dual input validation")?;
     validate_shapes(center, generators, constraints, rhs, direction, multipliers)?;
     if let Some(remainder) = box_remainder {
         if remainder.len() != center.len() {
@@ -208,43 +383,49 @@ fn evaluate_dense_constrained_zonotope_dual(
                 field: "box_remainder",
                 expected: vec![center.len()],
                 got: vec![remainder.len()],
-            });
+            }
+            .into());
         }
     }
-    validate_finite("center", center.iter().copied())?;
-    validate_finite("generators", generators.iter().copied())?;
-    validate_finite("constraints", constraints.iter().copied())?;
-    validate_finite("rhs", rhs.iter().copied())?;
-    validate_finite("direction", direction.iter().copied())?;
-    validate_finite("multipliers", multipliers.iter().copied())?;
+    validate_finite_with_gate("center", center.iter().copied(), gate)?;
+    validate_finite_with_gate("generators", generators.iter().copied(), gate)?;
+    validate_finite_with_gate("constraints", constraints.iter().copied(), gate)?;
+    validate_finite_with_gate("rhs", rhs.iter().copied(), gate)?;
+    validate_finite_with_gate("direction", direction.iter().copied(), gate)?;
+    validate_finite_with_gate("multipliers", multipliers.iter().copied(), gate)?;
     if let Some(remainder) = box_remainder {
-        validate_finite("box_remainder", remainder.iter().copied())?;
+        validate_finite_with_gate("box_remainder", remainder.iter().copied(), gate)?;
         for (index, &radius) in remainder.iter().enumerate() {
+            gate.charge_items(1, "dual box-remainder sign validation")?;
             if radius < 0.0 {
-                return Err(ConstrainedZonotopeDualError::NegativeBoxRemainder { index });
+                return Err(ConstrainedZonotopeDualError::NegativeBoxRemainder { index }.into());
             }
         }
     }
-    validate_nonnegative_multipliers(multipliers.iter().copied())?;
+    validate_nonnegative_multipliers_with_gate(multipliers.iter().copied(), gate)?;
     require_gradual_underflow()?;
+    gate.checkpoint("dual input validation complete")?;
 
     let value_dim = center.len();
     let alpha_dim = generators.ncols();
     let constraint_count = constraints.nrows();
 
-    let projected_center = outward_dot(
+    let projected_center = outward_dot_with_gate(
         (0..value_dim).map(|index| (direction[index], center[index])),
         "q dot center",
+        gate,
     )?;
-    let multiplier_rhs = outward_dot(
+    let multiplier_rhs = outward_dot_with_gate(
         (0..constraint_count).map(|row| (multipliers[row], rhs[row])),
         "lambda dot rhs",
+        gate,
     )?;
 
     let box_projection = if let Some(remainder) = box_remainder {
-        outward_dot(
+        outward_dot_with_gate(
             (0..value_dim).map(|index| (direction[index].abs(), remainder[index])),
             "direction times box remainder",
+            gate,
         )?
     } else {
         OutwardInterval::zero()
@@ -256,13 +437,15 @@ fn evaluate_dense_constrained_zonotope_dual(
         alpha_dim,
         constraints,
         multipliers,
-        |column| {
-            outward_dot(
+        |column, gate| {
+            outward_dot_with_gate(
                 (0..value_dim).map(|row| (direction[row], generators[[row, column]])),
                 "G transpose times q",
+                gate,
             )
         },
         box_projection,
+        gate,
     )
 }
 
@@ -278,6 +461,79 @@ pub fn evaluate_constrained_zonotope64_dual(
     direction: &[f64],
     multipliers: &[f64],
 ) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualError> {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match evaluate_constrained_zonotope64_dual_impl(domain, direction, multipliers, &mut gate) {
+        Ok(bounds) => Ok(bounds),
+        Err(ConstrainedZonotopeDualBudgetError::Evaluation(error)) => Err(error),
+        Err(ConstrainedZonotopeDualBudgetError::Budget(_)) => {
+            unreachable!("the inert sparse dual-evaluation call gate cannot refuse work")
+        }
+    }
+}
+
+/// Budgeted sparse-domain dual replay.
+///
+/// All transform inputs are borrowed and successful replay allocates no heap
+/// storage. The report adds only the fixed shape-error payload allowance.
+pub fn evaluate_constrained_zonotope64_dual_with_budget(
+    domain: &ConstrainedZonotope64,
+    direction: &[f64],
+    multipliers: &[f64],
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+    ConstrainedZonotopeDualBudgetError,
+> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let bounds =
+        evaluate_constrained_zonotope64_dual_impl(domain, direction, multipliers, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(bounds, gate.report()))
+}
+
+/// Replay through a caller-owned outer transform gate.
+pub(crate) fn evaluate_constrained_zonotope64_dual_with_call_gate<G>(
+    domain: &ConstrainedZonotope64,
+    direction: &[f64],
+    multipliers: &[f64],
+    gate: &mut G,
+) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    evaluate_constrained_zonotope64_dual_impl(domain, direction, multipliers, gate)
+}
+
+#[cfg(test)]
+fn evaluate_constrained_zonotope64_dual_with_clock<N>(
+    domain: &ConstrainedZonotope64,
+    direction: &[f64],
+    multipliers: &[f64],
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+    ConstrainedZonotopeDualBudgetError,
+>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let bounds =
+        evaluate_constrained_zonotope64_dual_impl(domain, direction, multipliers, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(bounds, gate.report()))
+}
+
+fn evaluate_constrained_zonotope64_dual_impl<G>(
+    domain: &ConstrainedZonotope64,
+    direction: &[f64],
+    multipliers: &[f64],
+    gate: &mut G,
+) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.preflight_peak_live_bytes(DUAL_SHAPE_ERROR_LIVE_BYTES)?;
+    gate.checkpoint("sparse dual input validation")?;
     let value_dim = domain.value_dim();
     let alpha_dim = domain.alpha_dim();
     let constraint_count = domain.constraint_count();
@@ -286,31 +542,37 @@ pub fn evaluate_constrained_zonotope64_dual(
             field: "direction",
             expected: vec![value_dim],
             got: vec![direction.len()],
-        });
+        }
+        .into());
     }
     if multipliers.len() != constraint_count {
         return Err(ConstrainedZonotopeDualError::Shape {
             field: "multipliers",
             expected: vec![constraint_count],
             got: vec![multipliers.len()],
-        });
+        }
+        .into());
     }
-    validate_finite("direction", direction.iter().copied())?;
-    validate_finite("multipliers", multipliers.iter().copied())?;
-    validate_nonnegative_multipliers(multipliers.iter().copied())?;
+    validate_finite_with_gate("direction", direction.iter().copied(), gate)?;
+    validate_finite_with_gate("multipliers", multipliers.iter().copied(), gate)?;
+    validate_nonnegative_multipliers_with_gate(multipliers.iter().copied(), gate)?;
     require_gradual_underflow()?;
+    gate.checkpoint("sparse dual input validation complete")?;
 
-    let projected_center = outward_dot(
+    let projected_center = outward_dot_with_gate(
         (0..value_dim).map(|index| (direction[index], domain.center()[index])),
         "q dot center",
+        gate,
     )?;
-    let multiplier_rhs = outward_dot(
+    let multiplier_rhs = outward_dot_with_gate(
         (0..constraint_count).map(|row| (multipliers[row], domain.rhs()[row])),
         "lambda dot rhs",
+        gate,
     )?;
-    let box_projection = outward_dot(
+    let box_projection = outward_dot_with_gate(
         (0..value_dim).map(|index| (direction[index].abs(), domain.box_remainder()[index])),
         "direction times box remainder",
+        gate,
     )?;
 
     evaluate_projected_dual(
@@ -319,36 +581,45 @@ pub fn evaluate_constrained_zonotope64_dual(
         alpha_dim,
         domain.constraints_ref().view(),
         ArrayView1::from(multipliers),
-        |column| {
-            outward_dot(
+        |column, gate| {
+            outward_dot_with_gate(
                 domain.generators()[column]
                     .raw_entries()
                     .map(|(row, coefficient)| (direction[row], coefficient)),
                 "sparse G transpose times q",
+                gate,
             )
         },
         box_projection,
+        gate,
     )
 }
 
-fn evaluate_projected_dual(
+fn evaluate_projected_dual<G, F>(
     projected_center: OutwardInterval,
     multiplier_rhs: OutwardInterval,
     alpha_dim: usize,
     constraints: ArrayView2<'_, f64>,
     multipliers: ArrayView1<'_, f64>,
-    mut projected_generator: impl FnMut(usize) -> Result<OutwardInterval, ConstrainedZonotopeDualError>,
+    mut projected_generator: F,
     box_projection: OutwardInterval,
-) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualError> {
+    gate: &mut G,
+) -> Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+    F: FnMut(usize, &mut G) -> Result<OutwardInterval, ConstrainedZonotopeDualBudgetError>,
+{
     let constraint_count = constraints.nrows();
 
     let mut norm_plus = OutwardInterval::zero();
     let mut norm_minus = OutwardInterval::zero();
     for column in 0..alpha_dim {
-        let projected_generator = projected_generator(column)?;
-        let constraint_projection = outward_dot(
+        gate.charge_items(1, "dual alpha-column replay")?;
+        let projected_generator = projected_generator(column, gate)?;
+        let constraint_projection = outward_dot_with_gate(
             (0..constraint_count).map(|row| (constraints[[row, column]], multipliers[row])),
             "C transpose times lambda",
+            gate,
         )?;
 
         let plus = projected_generator
@@ -378,17 +649,24 @@ fn evaluate_projected_dual(
     if !lower.is_finite() || !upper.is_finite() {
         return Err(ConstrainedZonotopeDualError::NonFiniteArithmetic {
             operation: "final certificates",
-        });
+        }
+        .into());
     }
+    gate.checkpoint("dual certificate publication")?;
     Ok(ConstrainedZonotopeDualBounds { lower, upper })
 }
 
-fn validate_nonnegative_multipliers(
+fn validate_nonnegative_multipliers_with_gate<G>(
     multipliers: impl IntoIterator<Item = f64>,
-) -> Result<(), ConstrainedZonotopeDualError> {
+    gate: &mut G,
+) -> Result<(), ConstrainedZonotopeDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     for (index, multiplier) in multipliers.into_iter().enumerate() {
+        gate.charge_items(1, "dual multiplier sign validation")?;
         if multiplier < 0.0 {
-            return Err(ConstrainedZonotopeDualError::NegativeMultiplier { index });
+            return Err(ConstrainedZonotopeDualError::NegativeMultiplier { index }.into());
         }
     }
     Ok(())
@@ -445,13 +723,18 @@ fn validate_shapes(
     Ok(())
 }
 
-fn validate_finite(
+fn validate_finite_with_gate<G>(
     field: &'static str,
     values: impl IntoIterator<Item = f64>,
-) -> Result<(), ConstrainedZonotopeDualError> {
+    gate: &mut G,
+) -> Result<(), ConstrainedZonotopeDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     for (index, value) in values.into_iter().enumerate() {
+        gate.charge_items(1, "dual finite-input validation")?;
         if !value.is_finite() {
-            return Err(ConstrainedZonotopeDualError::NonFiniteInput { field, index });
+            return Err(ConstrainedZonotopeDualError::NonFiniteInput { field, index }.into());
         }
     }
     Ok(())
@@ -544,16 +827,36 @@ impl OutwardInterval {
     }
 }
 
-fn outward_dot(
+fn outward_dot_with_gate<G>(
     pairs: impl IntoIterator<Item = (f64, f64)>,
     operation: &'static str,
-) -> Result<OutwardInterval, ConstrainedZonotopeDualError> {
+    gate: &mut G,
+) -> Result<OutwardInterval, ConstrainedZonotopeDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let mut sum = OutwardInterval::zero();
     for (left, right) in pairs {
+        gate.charge_items(1, operation)?;
         let product = outward_product(left, right, operation)?;
         sum = sum.add(product, operation)?;
     }
     Ok(sum)
+}
+
+#[cfg(test)]
+fn outward_dot(
+    pairs: impl IntoIterator<Item = (f64, f64)>,
+    operation: &'static str,
+) -> Result<OutwardInterval, ConstrainedZonotopeDualError> {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match outward_dot_with_gate(pairs, operation, &mut gate) {
+        Ok(value) => Ok(value),
+        Err(ConstrainedZonotopeDualBudgetError::Evaluation(error)) => Err(error),
+        Err(ConstrainedZonotopeDualBudgetError::Budget(_)) => {
+            unreachable!("the inert dot-product gate cannot refuse work")
+        }
+    }
 }
 
 fn outward_product(
@@ -609,6 +912,10 @@ fn round_up(value: f64, operation: &'static str) -> Result<f64, ConstrainedZonot
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::mem::size_of;
+    use std::time::{Duration, Instant};
+
     use ndarray::{array, Array1, Array2};
     use num_rational::BigRational;
     use num_traits::Zero;
@@ -618,6 +925,27 @@ mod tests {
 
     fn rat(value: f64) -> BigRational {
         BigRational::from_float(value).expect("test inputs and outputs are finite")
+    }
+
+    fn assert_bounds_bit_identical(
+        actual: &ConstrainedZonotopeDualBounds,
+        expected: &ConstrainedZonotopeDualBounds,
+    ) {
+        assert_eq!(actual.lower.to_bits(), expected.lower.to_bits());
+        assert_eq!(actual.upper.to_bits(), expected.upper.to_bits());
+    }
+
+    fn assert_budget_error_identical(
+        legacy: Result<ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualError>,
+        budgeted: Result<
+            ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+            ConstrainedZonotopeDualBudgetError,
+        >,
+    ) {
+        assert_eq!(
+            budgeted.unwrap_err(),
+            ConstrainedZonotopeDualBudgetError::Evaluation(legacy.unwrap_err())
+        );
     }
 
     fn exact_bounds(
@@ -694,6 +1022,587 @@ mod tests {
         let fraction = raw & ((1_u64 << 52) - 1);
         let biased_exponent = u64::try_from(exponent + 1_023).unwrap();
         f64::from_bits(sign | (biased_exponent << 52) | fraction)
+    }
+
+    #[test]
+    fn budgeted_dense_and_sparse_replays_are_bit_identical() {
+        assert!(
+            4 * size_of::<usize>() <= DUAL_SHAPE_ERROR_LIVE_BYTES,
+            "two two-element shape vectors must fit in the fixed allowance"
+        );
+        let center = array![1.5];
+        let generators = array![[2.0, -0.25]];
+        let constraints = array![[-1.0, 0.0], [0.0, 1.0]];
+        let rhs = array![0.0, 0.5];
+        let remainder = array![0.125];
+        let direction = array![1.0];
+        let multipliers = array![1.0, 0.25];
+        let legacy = evaluate_constrained_zonotope_dual_with_box_remainder(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            rhs.view(),
+            remainder.view(),
+            direction.view(),
+            multipliers.view(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let baseline = 17_usize;
+        let budgeted = evaluate_constrained_zonotope_dual_with_box_remainder_and_budget(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            rhs.view(),
+            remainder.view(),
+            direction.view(),
+            multipliers.view(),
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+        )
+        .unwrap();
+        assert_bounds_bit_identical(budgeted.value(), &legacy);
+        assert_eq!(
+            budgeted.report().peak_live_bytes(),
+            baseline + DUAL_SHAPE_ERROR_LIVE_BYTES
+        );
+        assert!(budgeted.report().charged_items() > 0);
+        assert!(budgeted.report().deadline_polls() > 0);
+
+        let implicit_legacy = evaluate_constrained_zonotope_dual(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            rhs.view(),
+            direction.view(),
+            multipliers.view(),
+        )
+        .unwrap();
+        let implicit_budgeted = evaluate_constrained_zonotope_dual_with_budget(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            rhs.view(),
+            direction.view(),
+            multipliers.view(),
+            ConstrainedZonotopeCallBudget::new(
+                deadline,
+                baseline,
+                baseline + DUAL_SHAPE_ERROR_LIVE_BYTES,
+            ),
+        )
+        .unwrap();
+        assert_bounds_bit_identical(implicit_budgeted.value(), &implicit_legacy);
+        assert!(matches!(
+            evaluate_constrained_zonotope_dual_with_budget(
+                center.view(),
+                generators.view(),
+                constraints.view(),
+                rhs.view(),
+                direction.view(),
+                multipliers.view(),
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    baseline,
+                    baseline + DUAL_SHAPE_ERROR_LIVE_BYTES - 1,
+                ),
+            ),
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. }
+            ))
+        ));
+
+        let domain = ConstrainedZonotope64::try_new(
+            center.to_vec(),
+            vec![vec![(0, 2.0)], vec![(0, -0.25)]],
+            constraints,
+            rhs.to_vec(),
+            remainder.to_vec(),
+        )
+        .unwrap();
+        let direction = direction.to_vec();
+        let multipliers = multipliers.to_vec();
+        let sparse_legacy =
+            evaluate_constrained_zonotope64_dual(&domain, &direction, &multipliers).unwrap();
+        let sparse_budgeted = evaluate_constrained_zonotope64_dual_with_budget(
+            &domain,
+            &direction,
+            &multipliers,
+            ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+        )
+        .unwrap();
+        assert_bounds_bit_identical(sparse_budgeted.value(), &sparse_legacy);
+        assert_eq!(
+            sparse_budgeted.report().peak_live_bytes(),
+            DUAL_SHAPE_ERROR_LIVE_BYTES
+        );
+
+        let method_legacy = domain.evaluate_dual(&direction, &multipliers).unwrap();
+        let method_budgeted = domain
+            .evaluate_dual_with_budget(
+                &direction,
+                &multipliers,
+                ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+            )
+            .unwrap();
+        assert_bounds_bit_identical(&method_legacy, &sparse_legacy);
+        assert_bounds_bit_identical(method_budgeted.value(), &sparse_legacy);
+    }
+
+    #[test]
+    fn budget_refuses_admission_errors_and_publication_seam() {
+        let center = array![1.5];
+        let generators = array![[2.0]];
+        let constraints = Array2::zeros((0, 1));
+        let empty = Array1::zeros(0);
+        let direction = array![1.0];
+        let start = Instant::now();
+        let reads = Cell::new(0_usize);
+        let baseline = evaluate_dense_constrained_zonotope_dual_with_clock(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            empty.view(),
+            None,
+            direction.view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 5, 4),
+            |_| {
+                reads.set(reads.get() + 1);
+                start
+            },
+        );
+        assert!(matches!(
+            baseline,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required: 5,
+                    limit: 4
+                }
+            ))
+        ));
+        assert_eq!(reads.get(), 1);
+
+        let expired_admission = evaluate_dense_constrained_zonotope_dual_with_clock(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            empty.view(),
+            None,
+            direction.view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(start, 5, 4),
+            |_| start,
+        );
+        assert!(matches!(
+            expired_admission,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "admission"
+                }
+            ))
+        ));
+
+        let aggregate_overflow = evaluate_dense_constrained_zonotope_dual_with_clock(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            empty.view(),
+            None,
+            direction.view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(
+                start + Duration::from_secs(1),
+                usize::MAX,
+                usize::MAX,
+            ),
+            |_| start,
+        );
+        assert!(matches!(
+            aggregate_overflow,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "aggregate peak-live bytes"
+                }
+            ))
+        ));
+
+        let bad_generators = Array2::zeros((2, 1));
+        let allowed_shape_error = evaluate_dense_constrained_zonotope_dual_with_clock(
+            center.view(),
+            bad_generators.view(),
+            constraints.view(),
+            empty.view(),
+            None,
+            direction.view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(
+                start + Duration::from_secs(1),
+                0,
+                DUAL_SHAPE_ERROR_LIVE_BYTES,
+            ),
+            |_| start,
+        )
+        .unwrap_err();
+        match allowed_shape_error {
+            ConstrainedZonotopeDualBudgetError::Evaluation(
+                ConstrainedZonotopeDualError::Shape {
+                    field: "generators",
+                    expected,
+                    got,
+                },
+            ) => {
+                assert_eq!(expected.len(), 2);
+                assert_eq!(got.len(), 2);
+                assert!(
+                    (expected.len() + got.len()) * size_of::<usize>()
+                        <= DUAL_SHAPE_ERROR_LIVE_BYTES
+                );
+            }
+            other => panic!("unexpected max-payload shape result: {other:?}"),
+        }
+        let refused_shape_error = evaluate_dense_constrained_zonotope_dual_with_clock(
+            center.view(),
+            bad_generators.view(),
+            constraints.view(),
+            empty.view(),
+            None,
+            direction.view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(
+                start + Duration::from_secs(1),
+                0,
+                DUAL_SHAPE_ERROR_LIVE_BYTES - 1,
+            ),
+            |_| start,
+        );
+        assert!(matches!(
+            refused_shape_error,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required: DUAL_SHAPE_ERROR_LIVE_BYTES,
+                    limit
+                }
+            )) if limit == DUAL_SHAPE_ERROR_LIVE_BYTES - 1
+        ));
+
+        let malformed_legacy = evaluate_constrained_zonotope_dual(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            empty.view(),
+            Array1::zeros(0).view(),
+            empty.view(),
+        )
+        .unwrap_err();
+        let malformed_budgeted = evaluate_constrained_zonotope_dual_with_budget(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            empty.view(),
+            Array1::zeros(0).view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+        )
+        .unwrap_err();
+        assert_eq!(
+            malformed_budgeted,
+            ConstrainedZonotopeDualBudgetError::Evaluation(malformed_legacy)
+        );
+
+        let expired = start + Duration::from_secs(2);
+        let publication = evaluate_dense_constrained_zonotope_dual_with_clock(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            empty.view(),
+            None,
+            direction.view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "dual certificate publication" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            publication,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "dual certificate publication"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn budgeted_dense_and_sparse_errors_preserve_legacy_order_and_payloads() {
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let budget = || ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX);
+
+        let nan_center = array![f64::NAN];
+        let generators = array![[1.0]];
+        let constraints = array![[1.0]];
+        let rhs = array![0.0];
+        let empty = Array1::zeros(0);
+        let negative_multiplier = array![-1.0];
+        assert_budget_error_identical(
+            evaluate_constrained_zonotope_dual(
+                nan_center.view(),
+                generators.view(),
+                constraints.view(),
+                rhs.view(),
+                empty.view(),
+                negative_multiplier.view(),
+            ),
+            evaluate_constrained_zonotope_dual_with_budget(
+                nan_center.view(),
+                generators.view(),
+                constraints.view(),
+                rhs.view(),
+                empty.view(),
+                negative_multiplier.view(),
+                budget(),
+            ),
+        );
+
+        let center = array![0.0];
+        let direction = array![1.0];
+        let negative_remainder = array![-1.0];
+        assert_budget_error_identical(
+            evaluate_constrained_zonotope_dual_with_box_remainder(
+                center.view(),
+                generators.view(),
+                constraints.view(),
+                rhs.view(),
+                negative_remainder.view(),
+                direction.view(),
+                negative_multiplier.view(),
+            ),
+            evaluate_constrained_zonotope_dual_with_box_remainder_and_budget(
+                center.view(),
+                generators.view(),
+                constraints.view(),
+                rhs.view(),
+                negative_remainder.view(),
+                direction.view(),
+                negative_multiplier.view(),
+                budget(),
+            ),
+        );
+
+        let overflowing_center = array![f64::MAX];
+        let no_generators = Array2::zeros((1, 0));
+        let no_constraints = Array2::zeros((0, 0));
+        let double = array![2.0];
+        assert_budget_error_identical(
+            evaluate_constrained_zonotope_dual(
+                overflowing_center.view(),
+                no_generators.view(),
+                no_constraints.view(),
+                empty.view(),
+                double.view(),
+                empty.view(),
+            ),
+            evaluate_constrained_zonotope_dual_with_budget(
+                overflowing_center.view(),
+                no_generators.view(),
+                no_constraints.view(),
+                empty.view(),
+                double.view(),
+                empty.view(),
+                budget(),
+            ),
+        );
+
+        let domain = ConstrainedZonotope64::try_new(
+            vec![0.0],
+            vec![vec![(0, 1.0)]],
+            array![[1.0]],
+            vec![0.0],
+            vec![0.0],
+        )
+        .unwrap();
+        assert_budget_error_identical(
+            evaluate_constrained_zonotope64_dual(&domain, &[], &[]),
+            evaluate_constrained_zonotope64_dual_with_budget(&domain, &[], &[], budget()),
+        );
+        assert_budget_error_identical(
+            evaluate_constrained_zonotope64_dual(&domain, &[f64::NAN], &[-1.0]),
+            evaluate_constrained_zonotope64_dual_with_budget(
+                &domain,
+                &[f64::NAN],
+                &[-1.0],
+                budget(),
+            ),
+        );
+
+        let overflowing_domain = ConstrainedZonotope64::try_new(
+            vec![f64::MAX],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        assert_budget_error_identical(
+            evaluate_constrained_zonotope64_dual(&overflowing_domain, &[2.0], &[]),
+            evaluate_constrained_zonotope64_dual_with_budget(
+                &overflowing_domain,
+                &[2.0],
+                &[],
+                budget(),
+            ),
+        );
+    }
+
+    #[test]
+    fn deadlines_poll_dense_values_and_empty_sparse_columns() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let center = Array1::zeros(dimension);
+        let generators = Array2::zeros((dimension, 0));
+        let constraints = Array2::zeros((0, 0));
+        let empty = Array1::zeros(0);
+        let direction = Array1::zeros(dimension);
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        let dense = evaluate_dense_constrained_zonotope_dual_with_clock(
+            center.view(),
+            generators.view(),
+            constraints.view(),
+            empty.view(),
+            None,
+            direction.view(),
+            empty.view(),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "dual finite-input validation" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            dense,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "dual finite-input validation"
+                }
+            ))
+        ));
+
+        let domain = ConstrainedZonotope64::try_new(
+            vec![0.0],
+            vec![Vec::new(); dimension],
+            Array2::zeros((0, dimension)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let sparse = evaluate_constrained_zonotope64_dual_with_clock(
+            &domain,
+            &[0.0],
+            &[],
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "dual alpha-column replay" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            sparse,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "dual alpha-column replay"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn deadlines_poll_every_dense_dot_and_sparse_generator_entry() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let center = Array1::zeros(dimension);
+        let generators = Array2::zeros((dimension, 1));
+        let constraints = Array2::zeros((dimension, 1));
+        let rhs = Array1::zeros(dimension);
+        let remainder = Array1::zeros(dimension);
+        let direction = Array1::zeros(dimension);
+        let multipliers = Array1::zeros(dimension);
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        for phase in [
+            "q dot center",
+            "lambda dot rhs",
+            "direction times box remainder",
+            "G transpose times q",
+            "C transpose times lambda",
+        ] {
+            let result = evaluate_dense_constrained_zonotope_dual_with_clock(
+                center.view(),
+                generators.view(),
+                constraints.view(),
+                rhs.view(),
+                Some(remainder.view()),
+                direction.view(),
+                multipliers.view(),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |checkpoint| {
+                    if checkpoint == phase {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ConstrainedZonotopeDualBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == phase
+                ),
+                "deadline must be polled during {phase}"
+            );
+        }
+
+        let entries = (0..dimension).map(|index| (index, 1.0)).collect();
+        let domain = ConstrainedZonotope64::try_new(
+            vec![0.0; dimension],
+            vec![entries],
+            Array2::zeros((0, 1)),
+            Vec::new(),
+            vec![0.0; dimension],
+        )
+        .unwrap();
+        let sparse_direction = vec![0.0; dimension];
+        let sparse = evaluate_constrained_zonotope64_dual_with_clock(
+            &domain,
+            &sparse_direction,
+            &[],
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "sparse G transpose times q" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            sparse,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "sparse G transpose times q"
+                }
+            ))
+        ));
     }
 
     #[test]

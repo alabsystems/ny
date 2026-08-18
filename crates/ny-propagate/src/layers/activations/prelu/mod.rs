@@ -91,7 +91,7 @@ impl PReluLayer {
 ///
 /// When alpha <= 1 the function is convex at origin (chord is upper bound);
 /// when alpha > 1 it is concave (chord is lower bound). Part of #3313.
-fn prelu_crossing_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
+pub(super) fn prelu_crossing_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     let l_f64 = l as f64;
     let u_f64 = u as f64;
     let alpha_f64 = alpha as f64;
@@ -129,7 +129,7 @@ fn prelu_crossing_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
 /// Reference: LeakyReLU relaxation generalized to per-neuron alpha.
 /// See `leaky_relu.rs:leaky_relu_linear_relaxation` for the fixed-alpha variant.
 #[inline]
-fn prelu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
+pub(super) fn prelu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     if l.is_nan() || u.is_nan() || !alpha.is_finite() {
         // NaN bounds: ±inf intercepts so CROWN drives bounds to ±inf.
         LinearRelaxation::nan_fallback()

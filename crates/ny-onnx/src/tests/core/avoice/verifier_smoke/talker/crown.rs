@@ -22,8 +22,9 @@ use std::sync::Arc;
 /// Part of #3701.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_talker_softmax_range_crown_verifier_smoke_3701() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (softmax_graph, softmax_name, input, output_size) =
         talker_verifier::talker_softmax_verifier_setup();
 
@@ -126,8 +127,9 @@ fn diagnose_certify_vs_verify(verify_result: &VerificationResult, cert: &BoundCe
 /// regression. Permanent regression pin. Part of #4219.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_talker_crown_certify_vs_verify_regression_4219() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (softmax_graph, _softmax_name, input, output_size) =
         talker_verifier::talker_softmax_verifier_setup();
 

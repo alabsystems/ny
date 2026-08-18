@@ -15,7 +15,7 @@
 //! Keep enough scheduler headroom for the 500-case properties when unrelated
 //! crate suites are saturating a shared builder.
 
-use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
+use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds};
 use crate::layers::activations::ReLULayer;
 use crate::layers::common::{BoundPropagation, PatchesPropagation};
 use crate::layers::convolution::conv2d::Conv2dLayer;
@@ -83,8 +83,10 @@ proptest! {
         out_c in 1usize..=4,
         kh in 1usize..=3,
         kw in 1usize..=3,
-        in_h in 3usize..=8,
-        in_w in 3usize..=8,
+        // A 3x3 kernel over a 3x3 input intentionally routes to Dense. Keep
+        // this patches-equivalence property wholly below that area crossover.
+        in_h in 4usize..=8,
+        in_w in 4usize..=8,
         stride_h in 1usize..=2,
         stride_w in 1usize..=2,
         pad_h in 0usize..=1,
@@ -92,13 +94,11 @@ proptest! {
         use_bias in proptest::bool::ANY,
         seed in any::<u64>(),
     ) {
-        // 1. Compute output spatial size, skip if invalid
+        // 1. Compute output spatial size. The generator guarantees validity.
         let padded_h = in_h + 2 * pad_h;
         let padded_w = in_w + 2 * pad_w;
-        prop_assume!(padded_h >= kh && padded_w >= kw);
         let out_h = (padded_h - kh) / stride_h + 1;
         let out_w = (padded_w - kw) / stride_w + 1;
-        prop_assume!(out_h >= 1 && out_w >= 1);
 
         let out_dim = out_c * out_h * out_w;
 
@@ -122,8 +122,7 @@ proptest! {
             lower_a: PatchesData {
                 coeff_err: None,
                 patches: None,
-                stride: (1, 1),
-                padding: (0, 0, 0, 0),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: true,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (out_c, out_h, out_w),
@@ -133,8 +132,7 @@ proptest! {
             upper_a: PatchesData {
                 coeff_err: None,
                 patches: None,
-                stride: (1, 1),
-                padding: (0, 0, 0, 0),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: true,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (out_c, out_h, out_w),
@@ -145,6 +143,10 @@ proptest! {
 
         let patches_result = conv.propagate_patches(&patches_identity)
             .map_err(|e| TestCaseError::fail(format!("Patches propagate_patches failed: {e}")))?;
+        prop_assert!(
+            matches!(&patches_result, CrownBounds::Patches(_)),
+            "generated below-crossover Conv2d unexpectedly returned Dense"
+        );
         let patches_dense = patches_result.into_dense()
             .map_err(|e| TestCaseError::fail(format!("Patches to_dense failed: {e}")))?;
 
@@ -223,8 +225,8 @@ proptest! {
         out_c in 1usize..=3,
         kh in 1usize..=3,
         kw in 1usize..=3,
-        in_h in 3usize..=6,
-        in_w in 3usize..=6,
+        in_h in 4usize..=6,
+        in_w in 4usize..=6,
         stride_h in 1usize..=2,
         stride_w in 1usize..=2,
         pad_h in 0usize..=1,
@@ -233,10 +235,8 @@ proptest! {
     ) {
         let padded_h = in_h + 2 * pad_h;
         let padded_w = in_w + 2 * pad_w;
-        prop_assume!(padded_h >= kh && padded_w >= kw);
         let out_h = (padded_h - kh) / stride_h + 1;
         let out_w = (padded_w - kw) / stride_w + 1;
-        prop_assume!(out_h >= 1 && out_w >= 1);
 
         let out_dim = out_c * out_h * out_w;
         let in_dim = in_c * in_h * in_w;
@@ -274,7 +274,7 @@ proptest! {
             row_count: out_dim,
             lower_a: PatchesData {
                 coeff_err: None,
-                patches: None, stride: (1, 1), padding: (0, 0, 0, 0),
+                patches: None, geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: true,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (out_c, out_h, out_w),
@@ -283,7 +283,7 @@ proptest! {
             lower_b: Array1::zeros(out_dim),
             upper_a: PatchesData {
                 coeff_err: None,
-                patches: None, stride: (1, 1), padding: (0, 0, 0, 0),
+                patches: None, geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: true,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (out_c, out_h, out_w),
@@ -293,6 +293,10 @@ proptest! {
         };
         let patches_result = conv.propagate_patches(&patches_identity)
             .map_err(|e| TestCaseError::fail(format!("Patches propagate_patches failed: {e}")))?;
+        prop_assert!(
+            matches!(&patches_result, CrownBounds::Patches(_)),
+            "generated below-crossover Conv2d unexpectedly returned Dense"
+        );
         let patches_lb = patches_result.into_dense()
             .map_err(|e| TestCaseError::fail(format!("Patches to_dense failed: {e}")))?;
         let patches_bounds = patches_lb.concretize(&dense_flat_input);
@@ -377,19 +381,15 @@ proptest! {
         seed in any::<u64>(),
     ) {
         // Compute conv1 output shape (stride=1, padding=0 for simplicity)
-        prop_assume!(in_h1 >= kh1 && in_w1 >= kw1);
         let out_h1 = in_h1 - kh1 + 1;
         let out_w1 = in_w1 - kw1 + 1;
-        prop_assume!(out_h1 >= 1 && out_w1 >= 1);
 
         // Conv2 input shape = conv1 output shape
         let in_c2 = out_c1;
         let in_h2 = out_h1;
         let in_w2 = out_w1;
-        prop_assume!(in_h2 >= kh2 && in_w2 >= kw2);
         let out_h2 = in_h2 - kh2 + 1;
         let out_w2 = in_w2 - kw2 + 1;
-        prop_assume!(out_h2 >= 1 && out_w2 >= 1);
 
         let conv2_out_dim = out_c2 * out_h2 * out_w2;
 
@@ -418,7 +418,7 @@ proptest! {
             row_count: conv2_out_dim,
             lower_a: PatchesData {
                 coeff_err: None,
-                patches: None, stride: (1, 1), padding: (0, 0, 0, 0),
+                patches: None, geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: true,
                 output_shape: (out_c2, out_h2, out_w2),
                 input_shape: (out_c2, out_h2, out_w2),
@@ -427,7 +427,7 @@ proptest! {
             lower_b: Array1::zeros(conv2_out_dim),
             upper_a: PatchesData {
                 coeff_err: None,
-                patches: None, stride: (1, 1), padding: (0, 0, 0, 0),
+                patches: None, geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: true,
                 output_shape: (out_c2, out_h2, out_w2),
                 input_shape: (out_c2, out_h2, out_w2),
@@ -438,6 +438,10 @@ proptest! {
 
         let after_conv2_patches = conv2.propagate_patches(&patches_id)
             .map_err(|e| TestCaseError::fail(format!("Patches conv2 failed: {e}")))?;
+        prop_assert!(
+            matches!(&after_conv2_patches, CrownBounds::Patches(_)),
+            "generated Conv2 path unexpectedly returned Dense before ensure_dense"
+        );
         // Simulate activation forcing Dense (ensure_dense)
         let after_conv2_lb = after_conv2_patches.into_dense()
             .map_err(|e| TestCaseError::fail(format!("ensure_dense failed: {e}")))?;
@@ -528,8 +532,8 @@ proptest! {
         out_c in 1usize..=3,
         kh in 1usize..=3,
         kw in 1usize..=3,
-        in_h in 3usize..=7,
-        in_w in 3usize..=7,
+        in_h in 4usize..=7,
+        in_w in 4usize..=7,
         stride_h in 1usize..=2,
         stride_w in 1usize..=2,
         pad_h in 0usize..=1,
@@ -539,10 +543,8 @@ proptest! {
         // Compute conv output shape
         let padded_h = in_h + 2 * pad_h;
         let padded_w = in_w + 2 * pad_w;
-        prop_assume!(padded_h >= kh && padded_w >= kw);
         let out_h = (padded_h - kh) / stride_h + 1;
         let out_w = (padded_w - kw) / stride_w + 1;
-        prop_assume!(out_h >= 1 && out_w >= 1);
 
         let out_dim = out_c * out_h * out_w;
         let in_dim = in_c * in_h * in_w;
@@ -597,10 +599,9 @@ proptest! {
                 relu.propagate_patches_with_bounds(pb, &pre_conv_bt)
                     .map_err(|e| TestCaseError::fail(format!("Patches ReLU backward failed: {e}")))?
             }
-            CrownBounds::Dense(_) => {
-                // Conv2d may fall back to Dense if kernel covers entire input
-                return Ok(());
-            }
+            CrownBounds::Dense(_) => return Err(TestCaseError::fail(
+                "generated below-crossover Conv2d unexpectedly returned Dense before ReLU",
+            )),
         };
 
         // Convert Patches result to Dense for comparison
@@ -698,8 +699,8 @@ proptest! {
         out_c in 1usize..=3,
         kh in 1usize..=3,
         kw in 1usize..=3,
-        in_h in 3usize..=7,
-        in_w in 3usize..=7,
+        in_h in 4usize..=7,
+        in_w in 4usize..=7,
         stride_h in 1usize..=2,
         stride_w in 1usize..=2,
         pad_h in 0usize..=1,
@@ -712,10 +713,8 @@ proptest! {
         // Compute conv output shape
         let padded_h = in_h + 2 * pad_h;
         let padded_w = in_w + 2 * pad_w;
-        prop_assume!(padded_h >= kh && padded_w >= kw);
         let out_h = (padded_h - kh) / stride_h + 1;
         let out_w = (padded_w - kw) / stride_w + 1;
-        prop_assume!(out_h >= 1 && out_w >= 1);
 
         let out_dim = out_c * out_h * out_w;
         let in_dim = in_c * in_h * in_w;
@@ -787,10 +786,9 @@ proptest! {
                 bn.propagate_patches(pb)
                     .map_err(|e| TestCaseError::fail(format!("Patches BN backward failed: {e}")))?
             }
-            CrownBounds::Dense(_) => {
-                // Conv2d may fall back to Dense; skip this case
-                return Ok(());
-            }
+            CrownBounds::Dense(_) => return Err(TestCaseError::fail(
+                "generated below-crossover Conv2d unexpectedly returned Dense before BatchNorm",
+            )),
         };
 
         // Convert Patches result to Dense for comparison
@@ -882,11 +880,13 @@ proptest! {
     #[test]
     fn proptest_sparse_patches_vs_dense_equivalence(
         in_c in 1usize..=3,
-        out_c in 1usize..=3,
+        // At least two output rows lets every case select a nonempty proper
+        // unstable subset without a runtime rejection.
+        out_c in 2usize..=3,
         kh in 1usize..=3,
         kw in 1usize..=3,
-        in_h in 3usize..=6,
-        in_w in 3usize..=6,
+        in_h in 4usize..=6,
+        in_w in 4usize..=6,
         stride_h in 1usize..=2,
         stride_w in 1usize..=2,
         pad_h in 0usize..=1,
@@ -894,9 +894,8 @@ proptest! {
         seed in any::<u64>(),
         unstable_frac in 0.1f32..0.8f32,
     ) {
-        let out_h = (in_h + 2 * pad_h).checked_sub(kh).map(|v| v / stride_h + 1).unwrap_or(0);
-        let out_w = (in_w + 2 * pad_w).checked_sub(kw).map(|v| v / stride_w + 1).unwrap_or(0);
-        prop_assume!(out_h >= 1 && out_w >= 1);
+        let out_h = (in_h + 2 * pad_h - kh) / stride_h + 1;
+        let out_w = (in_w + 2 * pad_w - kw) / stride_w + 1;
 
         let out_dim = out_c * out_h * out_w;
         let in_dim = in_c * in_h * in_w;
@@ -905,31 +904,31 @@ proptest! {
         let bias = make_bias(out_c, seed);
         let conv = Conv2dLayer::with_input_shape(
             kernel, Some(bias), (stride_h, stride_w), (pad_h, pad_w), in_h, in_w,
-        );
-        prop_assume!(conv.is_ok());
-        let conv = conv.unwrap();
+        ).map_err(|e| TestCaseError::fail(format!(
+            "generated valid Conv2d configuration was rejected: {e}"
+        )))?;
 
         // Full Patches path
         let identity = PatchesLinearBounds::identity(
-            (out_c, out_h, out_w), (in_c, in_h, in_w),
+            (out_c, out_h, out_w), (out_c, out_h, out_w),
         );
-        let patches_result = conv.propagate_patches(&identity);
-        prop_assume!(patches_result.is_ok());
-        let patches_result = patches_result.unwrap();
+        let patches_result = conv.propagate_patches(&identity)
+            .map_err(|e| TestCaseError::fail(format!("Patches propagation failed: {e}")))?;
 
         let full_plb = match patches_result {
             CrownBounds::Patches(pb) => *pb,
-            CrownBounds::Dense(_) => return Ok(()),
+            CrownBounds::Dense(_) => return Err(TestCaseError::fail(
+                "generated below-crossover Conv2d unexpectedly returned Dense",
+            )),
         };
 
-        let full_dense = full_plb.to_dense();
-        prop_assume!(full_dense.is_ok());
-        let full_dense = full_dense.unwrap();
+        let full_dense = full_plb.to_dense()
+            .map_err(|e| TestCaseError::fail(format!("full Patches to_dense failed: {e}")))?;
 
         // Generate random unstable mask
         let mut rng = seed.wrapping_mul(7);
         let mut mask = ndarray::Array3::<bool>::from_elem((out_c, out_h, out_w), false);
-        let target = ((out_dim as f32) * unstable_frac).ceil() as usize;
+        let target = (((out_dim as f32) * unstable_frac).ceil() as usize).clamp(1, out_dim - 1);
         let mut count = 0;
         for c in 0..out_c {
             for h in 0..out_h {
@@ -944,16 +943,16 @@ proptest! {
                 }
             }
         }
-        prop_assume!(count > 0 && count < out_dim);
+        prop_assert_eq!(count, target, "mask must contain the requested unstable rows");
 
         // Filter to unstable — min_sparsity=1.0 to always filter
-        let sparse_plb = full_plb.filter_to_unstable(&mask, 1.0);
-        prop_assume!(sparse_plb.is_some());
-        let sparse_plb = sparse_plb.unwrap();
+        let sparse_plb = full_plb.filter_to_unstable(&mask, 1.0)
+            .ok_or_else(|| TestCaseError::fail(
+                "nonempty proper unstable mask unexpectedly refused sparse conversion",
+            ))?;
 
-        let sparse_dense = sparse_plb.to_dense();
-        prop_assume!(sparse_dense.is_ok());
-        let sparse_dense = sparse_dense.unwrap();
+        let sparse_dense = sparse_plb.to_dense()
+            .map_err(|e| TestCaseError::fail(format!("sparse Patches to_dense failed: {e}")))?;
 
         prop_assert_eq!(sparse_dense.num_outputs(), out_dim);
         prop_assert_eq!(sparse_dense.num_inputs(), in_dim);
@@ -1056,8 +1055,6 @@ proptest! {
     fn prop_patches_activation_7d_err_covers_sampled_true(
         row_count in 1usize..=3,
         out_c in 1usize..=2,
-        out_h in 1usize..=2,
-        out_w in 1usize..=2,
         in_c in 1usize..=2,
         kh in 1usize..=2,
         kw in 1usize..=2,
@@ -1072,6 +1069,14 @@ proptest! {
         use crate::layers::activations::relu::relu_linear_relaxation;
         use crate::layers::common::crown_elementwise_backward_patches;
 
+        // Generate a complete affine grid rather than an arbitrary prefix of
+        // one. Add only the trailing padding needed to keep tiny inputs valid;
+        // trailing padding does not change the tap-to-input mapping exercised
+        // by the oracle below.
+        let pad_bottom = kh.saturating_sub(in_h + pad_top);
+        let pad_right = kw.saturating_sub(in_w + pad_left);
+        let out_h = (in_h + pad_top + pad_bottom - kh) / stride_h + 1;
+        let out_w = (in_w + pad_left + pad_right - kw) / stride_w + 1;
         let shape = [row_count, out_c, out_h, out_w, in_c, kh, kw];
         let n: usize = shape.iter().product();
         let in_dim = in_c * in_h * in_w;
@@ -1108,8 +1113,10 @@ proptest! {
             lower_a: PatchesData {
                 coeff_err: Some(Array1::from_vec(lower_errs.clone())),
                 patches: Some(ArrayD::from_shape_vec(IxDyn(&shape), fill(3)).unwrap()),
-                stride: (stride_h, stride_w),
-                padding: (pad_left, 0, pad_top, 0),
+                geometry: PatchGeometry::affine(
+                    (stride_h, stride_w),
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                ),
                 identity: false,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (in_c, in_h, in_w),
@@ -1119,8 +1126,10 @@ proptest! {
             upper_a: PatchesData {
                 coeff_err: Some(Array1::from_vec(upper_errs.clone())),
                 patches: Some(ArrayD::from_shape_vec(IxDyn(&shape), fill(4)).unwrap()),
-                stride: (stride_h, stride_w),
-                padding: (pad_left, 0, pad_top, 0),
+                geometry: PatchGeometry::affine(
+                    (stride_h, stride_w),
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                ),
                 identity: false,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (in_c, in_h, in_w),

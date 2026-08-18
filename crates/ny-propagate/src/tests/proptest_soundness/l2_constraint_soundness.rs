@@ -137,7 +137,10 @@ proptest! {
         let ny = Array1::ones(4);
         let norm = RmsNormLayer::new(ny.clone(), eps).unwrap();
         let normed = norm.propagate_ibp(&input).unwrap();
-        prop_assume!(normed.l2_constraint().is_some());
+        prop_assert!(
+            normed.l2_constraint().is_some(),
+            "RMSNorm IBP must attach the L2 constraint exercised by this property"
+        );
 
         let weight = Array2::from_shape_vec((3, 4), w.to_vec()).unwrap();
         let bias = Array1::from_vec(b.to_vec());
@@ -205,19 +208,25 @@ proptest! {
         p3 in (-2.5f32..-0.3).prop_flat_map(|a| (a..-0.1).prop_map(move |b| (a, b))),
         w in proptest::array::uniform12(-1.0f32..1.0),
         b in proptest::array::uniform3(-0.5f32..0.5),
-        g in proptest::array::uniform4(-2.0f32..2.0),
+        // Make the first, strictly-positive coordinate nonzero constructively;
+        // this guarantees a genuinely off-centre RMSNorm output box.
+        g0 in prop_oneof![-2.0f32..=-0.1, 0.1f32..=2.0],
+        g1 in -2.0f32..2.0,
+        g2 in -2.0f32..2.0,
+        g3 in -2.0f32..2.0,
         eps in 1e-6f32..1e-2,
     ) {
         let pairs = [p0, p1, p2, p3];
         let input = box_from_pairs(&pairs);
-        let ny = Array1::from_vec(g.to_vec());
+        let ny = Array1::from_vec(vec![g0, g1, g2, g3]);
         let norm = RmsNormLayer::new(ny.clone(), eps).unwrap();
         let normed = norm.propagate_ibp(&input).unwrap();
-        prop_assume!(normed.l2_constraint().is_some());
 
         // Confirm the box really is asymmetric about the origin (center): the
         // recentring margin d must be non-trivial for this test to be meaningful.
-        let c = normed.l2_constraint().unwrap();
+        let c = normed.l2_constraint().ok_or_else(|| TestCaseError::fail(
+            "RMSNorm IBP must attach the L2 constraint exercised by the cheap-path property",
+        ))?;
         let (zl, zu) = normed.lower_upper();
         let mut d_sq = 0.0f64;
         for ((zlv, zuv), cv) in zl.iter().zip(zu.iter()).zip(c.center().iter()) {
@@ -225,7 +234,10 @@ proptest! {
             let diff = z_mid - (*cv as f64);
             d_sq += diff * diff;
         }
-        prop_assume!(d_sq.sqrt() > 1e-3); // require a genuinely off-centre box
+        prop_assert!(
+            d_sq.sqrt() > 1e-3,
+            "constructively asymmetric generator produced a centred RMSNorm box"
+        );
 
         let weight = Array2::from_shape_vec((3, 4), w.to_vec()).unwrap();
         let bias = Array1::from_vec(b.to_vec());

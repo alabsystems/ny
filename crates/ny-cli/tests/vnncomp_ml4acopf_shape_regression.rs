@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "external-vnncomp")]
+
 //! Regression tests for the real `ml4acopf_2024` graph BaB path.
 //!
 //! These cover the historical `#3602` shape mismatch on disjunctive DAG

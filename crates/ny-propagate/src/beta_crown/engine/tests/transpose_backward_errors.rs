@@ -38,7 +38,6 @@ fn test_transpose_backward_alpha_beta_propagates_transpose_error() {
         None,
         &beta_state,
         &alpha_state,
-        None,
         0,
         None,
     );

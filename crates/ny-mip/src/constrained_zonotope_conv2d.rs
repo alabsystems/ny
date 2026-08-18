@@ -19,6 +19,12 @@
 
 use ndarray::{Array2, ArrayView4};
 
+use crate::constrained_zonotope64::ConstrainedZonotope64CallGateError;
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, ConstrainedZonotopeCallTracker,
+    ConstrainedZonotopePeakLiveBytes, InertConstrainedZonotopeCallGate,
+};
 use crate::{ConstrainedZonotope64, ConstrainedZonotope64Error};
 
 /// NCHW-without-batch convolution parameters.
@@ -166,6 +172,18 @@ pub enum ConstrainedZonotopeConv2dError {
     Domain(#[from] ConstrainedZonotope64Error),
 }
 
+/// Primitive or call-firewall refusal from budgeted convolution.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConstrainedZonotopeConv2dBudgetError {
+    /// Geometry, resources, or outward arithmetic were invalid.
+    #[error(transparent)]
+    Transform(#[from] ConstrainedZonotopeConv2dError),
+
+    /// The caller's deadline or aggregate peak-memory ceiling refused work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
+}
+
 /// Apply an exact-dyadic grouped 2-D convolution while preserving sparse local
 /// generator support and charging all floating-point width to the box
 /// remainder.
@@ -183,47 +201,175 @@ pub fn constrained_zonotope_conv2d_unwired(
     limits: ConstrainedZonotopeConv2dLimits,
 ) -> Result<(ConstrainedZonotope64, ConstrainedZonotopeConv2dPlan), ConstrainedZonotopeConv2dError>
 {
-    require_gradual_underflow()?;
-    let geometry = validate_geometry(input, input_shape, weights, bias, spec, limits)?;
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match constrained_zonotope_conv2d_impl(
+        input,
+        input_shape,
+        weights,
+        bias,
+        spec,
+        limits,
+        &mut gate,
+    ) {
+        Ok(value) => Ok(value),
+        Err(ConstrainedZonotopeConv2dBudgetError::Transform(error)) => Err(error),
+        Err(ConstrainedZonotopeConv2dBudgetError::Budget(_)) => {
+            unreachable!("the inert Conv2d call gate cannot refuse work")
+        }
+    }
+}
 
-    let input_generator_nonzeros = input.generators().iter().try_fold(
-        0_usize,
-        |sum, generator| -> Result<_, ConstrainedZonotopeConv2dError> {
-            let required = sum.checked_add(generator.nnz()).ok_or(
-                ConstrainedZonotopeConv2dError::ResourceOverflow {
-                    operation: "input generator nonzeros",
-                },
-            )?;
-            check_limit(
-                "input generator nonzeros",
-                required,
-                limits.max_generator_nonzeros,
-            )?;
-            Ok(required)
-        },
+/// Apply convolution behind a synchronous call-local execution firewall.
+///
+/// The complete transform-owned logical peak is preflighted before adjacency,
+/// scratch, or output allocation. `budget.baseline_live_bytes()` must include
+/// the input, weights, bias, and any other caller-retained storage sharing the
+/// ceiling. A completed domain remains private until the final checkpoint.
+pub fn constrained_zonotope_conv2d_unwired_with_budget(
+    input: &ConstrainedZonotope64,
+    input_shape: [usize; 3],
+    weights: ArrayView4<'_, f64>,
+    bias: &[f64],
+    spec: ConstrainedZonotopeConv2dSpec,
+    limits: ConstrainedZonotopeConv2dLimits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<(ConstrainedZonotope64, ConstrainedZonotopeConv2dPlan)>,
+    ConstrainedZonotopeConv2dBudgetError,
+> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let value = constrained_zonotope_conv2d_impl(
+        input,
+        input_shape,
+        weights,
+        bias,
+        spec,
+        limits,
+        &mut gate,
     )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
 
-    let adjacency = build_input_adjacency(input, input_generator_nonzeros)?;
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn constrained_zonotope_conv2d_unwired_with_clock<N>(
+    input: &ConstrainedZonotope64,
+    input_shape: [usize; 3],
+    weights: ArrayView4<'_, f64>,
+    bias: &[f64],
+    spec: ConstrainedZonotopeConv2dSpec,
+    limits: ConstrainedZonotopeConv2dLimits,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<(ConstrainedZonotope64, ConstrainedZonotopeConv2dPlan)>,
+    ConstrainedZonotopeConv2dBudgetError,
+>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let value = constrained_zonotope_conv2d_impl(
+        input,
+        input_shape,
+        weights,
+        bias,
+        spec,
+        limits,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constrained_zonotope_conv2d_impl<G>(
+    input: &ConstrainedZonotope64,
+    input_shape: [usize; 3],
+    weights: ArrayView4<'_, f64>,
+    bias: &[f64],
+    spec: ConstrainedZonotopeConv2dSpec,
+    limits: ConstrainedZonotopeConv2dLimits,
+    gate: &mut G,
+) -> Result<
+    (ConstrainedZonotope64, ConstrainedZonotopeConv2dPlan),
+    ConstrainedZonotopeConv2dBudgetError,
+>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    require_gradual_underflow()?;
+    gate.checkpoint("Conv2d floating-point preflight")?;
+    let geometry =
+        validate_geometry_with_gate(input, input_shape, weights, bias, spec, limits, gate)?;
+    gate.checkpoint("Conv2d geometry validation complete")?;
+
+    let mut input_generator_nonzeros = 0_usize;
+    for generator in input.generators() {
+        gate.charge_items(1, "Conv2d generator geometry validation")?;
+        input_generator_nonzeros = input_generator_nonzeros
+            .checked_add(generator.nnz())
+            .ok_or(ConstrainedZonotopeConv2dError::ResourceOverflow {
+                operation: "input generator nonzeros",
+            })?;
+        check_limit(
+            "input generator nonzeros",
+            input_generator_nonzeros,
+            limits.max_generator_nonzeros,
+        )?;
+    }
+    if gate.is_enforcing() {
+        gate.preflight_peak_live_bytes(conv2d_peak_live_bytes(
+            input,
+            geometry,
+            input_generator_nonzeros,
+            limits,
+        )?)?;
+    }
+    gate.checkpoint("Conv2d peak-memory preflight complete")?;
+
+    let adjacency = build_input_adjacency(input, input_generator_nonzeros, gate)?;
+    gate.checkpoint("Conv2d adjacency construction complete")?;
+    let expected_interval_products = if gate.is_enforcing() {
+        Some(preflight_interval_products_with_gate(
+            input,
+            input_shape,
+            weights,
+            spec,
+            geometry,
+            &adjacency,
+            limits.max_interval_products,
+            gate,
+        )?)
+    } else {
+        None
+    };
+    gate.checkpoint("Conv2d interval-product preflight complete")?;
     let alpha_dim = input.alpha_dim();
     let mut generator_scratch: Vec<Option<OutwardInterval>> = Vec::new();
+    gate.checkpoint("Conv2d generator-scratch allocation")?;
     try_reserve(
         &mut generator_scratch,
         alpha_dim,
         "generator interval scratch",
     )?;
-    generator_scratch.resize(alpha_dim, None);
+    for _ in 0..alpha_dim {
+        gate.charge_items(1, "Conv2d generator-scratch initialization")?;
+        generator_scratch.push(None);
+    }
     let mut touched_generators = Vec::new();
+    gate.checkpoint("Conv2d touched-generator allocation")?;
     try_reserve(
         &mut touched_generators,
         alpha_dim,
         "touched-generator scratch",
     )?;
 
-    let output_value_count =
-        checked_product(&geometry.output_shape, "convolution output value count")?;
+    let output_value_count = geometry.output_value_count;
     let mut output_center = Vec::new();
     let mut output_remainder = Vec::new();
+    gate.checkpoint("Conv2d output-center allocation")?;
     try_reserve(&mut output_center, output_value_count, "output center")?;
+    gate.checkpoint("Conv2d output-remainder allocation")?;
     try_reserve(
         &mut output_remainder,
         output_value_count,
@@ -231,12 +377,16 @@ pub fn constrained_zonotope_conv2d_unwired(
     )?;
 
     let mut output_generators: Vec<Vec<(usize, f64)>> = Vec::new();
+    gate.checkpoint("Conv2d generator-column allocation")?;
     try_reserve(
         &mut output_generators,
         alpha_dim,
         "output generator columns",
     )?;
-    output_generators.resize_with(alpha_dim, Vec::new);
+    for _ in 0..alpha_dim {
+        gate.charge_items(1, "Conv2d generator-column initialization")?;
+        output_generators.push(Vec::new());
+    }
 
     let [input_channels, input_height, input_width] = input_shape;
     let [output_channels, kernel_input_channels, kernel_height, kernel_width] =
@@ -254,6 +404,7 @@ pub fn constrained_zonotope_conv2d_unwired(
         let input_channel_base = group * input_channels_per_group;
         for output_y in 0..output_height {
             for output_x in 0..output_width {
+                gate.charge_items(1, "Conv2d output transform")?;
                 let output_index = output_center.len();
                 let mut center_sum = OutwardInterval::exact(bias[output_channel]);
                 let mut remainder_sum = OutwardInterval::zero();
@@ -261,6 +412,7 @@ pub fn constrained_zonotope_conv2d_unwired(
                 for kernel_input_channel in 0..kernel_input_channels {
                     let input_channel = input_channel_base + kernel_input_channel;
                     for kernel_y in 0..kernel_height {
+                        gate.charge_items(1, "Conv2d kernel transform")?;
                         let Some(input_y) = input_coordinate(
                             output_y,
                             spec.stride[0],
@@ -273,6 +425,7 @@ pub fn constrained_zonotope_conv2d_unwired(
                             continue;
                         };
                         for kernel_x in 0..kernel_width {
+                            gate.charge_items(1, "Conv2d kernel transform")?;
                             let Some(input_x) = input_coordinate(
                                 output_x,
                                 spec.stride[1],
@@ -307,6 +460,7 @@ pub fn constrained_zonotope_conv2d_unwired(
                             }
 
                             for &(generator_index, coefficient) in &adjacency[input_index] {
+                                gate.charge_items(1, "Conv2d generator accumulation")?;
                                 consume_product(
                                     &mut interval_products,
                                     limits.max_interval_products,
@@ -329,6 +483,7 @@ pub fn constrained_zonotope_conv2d_unwired(
                 total_remainder = add_nonnegative_upper(total_remainder, center_error)?;
 
                 for &generator_index in &touched_generators {
+                    gate.charge_items(1, "Conv2d generator publication staging")?;
                     let interval = generator_scratch[generator_index].take().ok_or(
                         ConstrainedZonotopeConv2dError::InvariantViolation {
                             message: "a touched generator has no accumulated interval",
@@ -347,12 +502,25 @@ pub fn constrained_zonotope_conv2d_unwired(
                             output_generator_nonzeros,
                             limits.max_generator_nonzeros,
                         )?;
-                        output_generators[generator_index]
-                            .try_reserve(1)
-                            .map_err(|_| ConstrainedZonotopeConv2dError::AllocationFailure {
+                        gate.checkpoint("Conv2d generator-entry allocation")?;
+                        let generator = &mut output_generators[generator_index];
+                        // The peak preflight charges one candidate slot plus
+                        // one validated-constructor slot per retained
+                        // coefficient. Amortized growth may request additional
+                        // speculative candidate capacity, so the enforcing path
+                        // must request exactly the one charged slot. Preserve
+                        // the legacy API's allocation policy verbatim.
+                        let reservation = if gate.is_enforcing() {
+                            generator.try_reserve_exact(1)
+                        } else {
+                            generator.try_reserve(1)
+                        };
+                        reservation.map_err(|_| {
+                            ConstrainedZonotopeConv2dError::AllocationFailure {
                                 resource: "output generator coefficients",
-                            })?;
-                        output_generators[generator_index].push((output_index, coefficient));
+                            }
+                        })?;
+                        generator.push((output_index, coefficient));
                     }
                 }
                 touched_generators.clear();
@@ -362,17 +530,37 @@ pub fn constrained_zonotope_conv2d_unwired(
             }
         }
     }
+    gate.checkpoint("Conv2d numeric transform complete")?;
 
     debug_assert_eq!(output_center.len(), output_value_count);
-    let constraints = clone_constraints(input)?;
-    let rhs = clone_slice(input.rhs(), "constraint right-hand side")?;
-    let output = ConstrainedZonotope64::try_new(
+    if let Some(expected) = expected_interval_products {
+        debug_assert_eq!(interval_products, expected);
+    }
+    let constraints = clone_constraints(input, gate)?;
+    gate.checkpoint("Conv2d constraint clone complete")?;
+    gate.checkpoint("Conv2d right-hand-side allocation")?;
+    let rhs = clone_slice_with_gate(input.rhs(), "constraint right-hand side", gate)?;
+    gate.checkpoint("Conv2d right-hand-side clone complete")?;
+    gate.checkpoint("Conv2d domain materialization")?;
+    let output = ConstrainedZonotope64::try_new_with_call_gate(
         output_center,
         output_generators,
         constraints,
         rhs,
         output_remainder,
-    )?;
+        gate,
+    )
+    .map_err(|error| match error {
+        ConstrainedZonotope64CallGateError::Domain(error) => {
+            ConstrainedZonotopeConv2dBudgetError::Transform(ConstrainedZonotopeConv2dError::Domain(
+                error,
+            ))
+        }
+        ConstrainedZonotope64CallGateError::Budget(error) => {
+            ConstrainedZonotopeConv2dBudgetError::Budget(error)
+        }
+    })?;
+    gate.checkpoint("Conv2d domain materialization complete")?;
     let plan = ConstrainedZonotopeConv2dPlan {
         input_shape,
         output_shape: geometry.output_shape,
@@ -385,6 +573,7 @@ pub fn constrained_zonotope_conv2d_unwired(
         output_generator_nonzeros,
         interval_products,
     };
+    gate.checkpoint("Conv2d publication")?;
     Ok((output, plan))
 }
 
@@ -392,25 +581,94 @@ pub fn constrained_zonotope_conv2d_unwired(
 struct Geometry {
     output_shape: [usize; 3],
     weight_shape: [usize; 4],
+    output_value_count: usize,
+    constraint_elements: usize,
     weight_elements: usize,
     kernel_visits: usize,
 }
 
-fn validate_geometry(
+/// Conservative transform-owned peak. Scratch from disjoint phases is summed
+/// deliberately. Two complete generator representations cover both exact
+/// candidate-buffer relocation during growth and candidate/private overlap
+/// during final materialization; those phases do not overlap each other.
+/// Retained input, weights, and bias belong in the caller's baseline.
+fn conv2d_peak_live_bytes(
+    input: &ConstrainedZonotope64,
+    geometry: Geometry,
+    input_generator_nonzeros: usize,
+    limits: ConstrainedZonotopeConv2dLimits,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let output_generator_slots = input
+        .alpha_dim()
+        .checked_mul(geometry.output_value_count)
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "Conv2d output generator slots",
+        })?;
+    let output_generator_nonzeros = output_generator_slots
+        .min(limits.max_generator_nonzeros)
+        .min(limits.max_interval_products);
+
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_elements::<usize>(input.value_dim(), "Conv2d adjacency-count bytes")?;
+    peak.add_elements::<Vec<(usize, f64)>>(input.value_dim(), "Conv2d adjacency-column bytes")?;
+    peak.add_elements::<(usize, f64)>(input_generator_nonzeros, "Conv2d adjacency-entry bytes")?;
+    peak.add_elements::<Option<OutwardInterval>>(
+        input.alpha_dim(),
+        "Conv2d generator-scratch bytes",
+    )?;
+    peak.add_elements::<usize>(input.alpha_dim(), "Conv2d touched-generator bytes")?;
+    peak.add_elements::<f64>(geometry.output_value_count, "Conv2d output-center bytes")?;
+    peak.add_elements::<f64>(geometry.output_value_count, "Conv2d output-remainder bytes")?;
+    let doubled_alpha_headers = input.alpha_dim().checked_mul(2).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "Conv2d doubled generator-column headers",
+        },
+    )?;
+    peak.add_elements::<Vec<(usize, f64)>>(
+        doubled_alpha_headers,
+        "Conv2d candidate and validated generator-column bytes",
+    )?;
+    let doubled_output_nonzeros = output_generator_nonzeros.checked_mul(2).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "Conv2d doubled output generator nonzeros",
+        },
+    )?;
+    peak.add_elements::<(usize, f64)>(
+        doubled_output_nonzeros,
+        "Conv2d candidate and validated generator-entry bytes",
+    )?;
+    peak.add_elements::<f64>(
+        geometry.constraint_elements,
+        "Conv2d constraint-matrix bytes",
+    )?;
+    peak.add_elements::<f64>(
+        input.constraint_count(),
+        "Conv2d constraint right-hand-side bytes",
+    )?;
+    Ok(peak.finish())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_geometry_with_gate<G>(
     input: &ConstrainedZonotope64,
     input_shape: [usize; 3],
     weights: ArrayView4<'_, f64>,
     bias: &[f64],
     spec: ConstrainedZonotopeConv2dSpec,
     limits: ConstrainedZonotopeConv2dLimits,
-) -> Result<Geometry, ConstrainedZonotopeConv2dError> {
+    gate: &mut G,
+) -> Result<Geometry, ConstrainedZonotopeConv2dBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let input_value_count = checked_product(&input_shape, "convolution input value count")?;
     if input.value_dim() != input_value_count {
         return Err(ConstrainedZonotopeConv2dError::Shape {
             field: "input domain",
             expected: vec![input_value_count],
             got: vec![input.value_dim()],
-        });
+        }
+        .into());
     }
     check_limit(
         "input value count",
@@ -440,12 +698,14 @@ fn validate_geometry(
     if input_channels == 0 || input_height == 0 || input_width == 0 {
         return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
             message: format!("input shape must be non-empty, got {input_shape:?}"),
-        });
+        }
+        .into());
     }
     if spec.groups == 0 {
         return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
             message: "groups must be non-zero".to_string(),
-        });
+        }
+        .into());
     }
     if spec.stride.contains(&0) || spec.dilation.contains(&0) {
         return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
@@ -453,7 +713,8 @@ fn validate_geometry(
                 "stride and dilation must be non-zero, got {:?} and {:?}",
                 spec.stride, spec.dilation
             ),
-        });
+        }
+        .into());
     }
 
     let weight_shape_slice = weights.shape();
@@ -468,7 +729,8 @@ fn validate_geometry(
     {
         return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
             message: format!("weight shape must be non-empty, got {weight_shape:?}"),
-        });
+        }
+        .into());
     }
     if input_channels % spec.groups != 0 || output_channels % spec.groups != 0 {
         return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
@@ -476,7 +738,8 @@ fn validate_geometry(
                 "input/output channels {input_channels}/{output_channels} must be divisible by groups {}",
                 spec.groups
             ),
-        });
+        }
+        .into());
     }
     let expected_kernel_input_channels = input_channels / spec.groups;
     if kernel_input_channels != expected_kernel_input_channels {
@@ -484,14 +747,16 @@ fn validate_geometry(
             field: "weight input channels per group",
             expected: vec![expected_kernel_input_channels],
             got: vec![kernel_input_channels],
-        });
+        }
+        .into());
     }
     if bias.len() != output_channels {
         return Err(ConstrainedZonotopeConv2dError::Shape {
             field: "bias",
             expected: vec![output_channels],
             got: vec![bias.len()],
-        });
+        }
+        .into());
     }
     let weight_elements = checked_product(&weight_shape, "convolution weight elements")?;
     check_limit(
@@ -499,8 +764,8 @@ fn validate_geometry(
         weight_elements,
         limits.max_weight_elements,
     )?;
-    validate_finite("weights", weights.iter().copied())?;
-    validate_finite("bias", bias.iter().copied())?;
+    validate_finite_with_gate("weights", weights.iter().copied(), gate)?;
+    validate_finite_with_gate("bias", bias.iter().copied(), gate)?;
 
     let output_height = output_dimension(
         input_height,
@@ -541,12 +806,14 @@ fn validate_geometry(
     Ok(Geometry {
         output_shape,
         weight_shape,
+        output_value_count,
+        constraint_elements,
         weight_elements,
         kernel_visits,
     })
 }
 
-fn output_dimension(
+pub(crate) fn output_dimension(
     input: usize,
     padding_before: usize,
     padding_after: usize,
@@ -574,7 +841,7 @@ fn output_dimension(
     Ok((padded - effective_kernel) / stride + 1)
 }
 
-fn input_coordinate(
+pub(crate) fn input_coordinate(
     output: usize,
     stride: usize,
     kernel: usize,
@@ -599,15 +866,106 @@ fn input_coordinate(
     Ok((coordinate < input_size).then_some(coordinate))
 }
 
-fn build_input_adjacency(
+/// Count every interval product before output allocation or floating-point
+/// contraction. This makes the caller's work cap a true preflight boundary.
+#[allow(clippy::too_many_arguments)]
+fn preflight_interval_products_with_gate<G>(
+    input: &ConstrainedZonotope64,
+    input_shape: [usize; 3],
+    weights: ArrayView4<'_, f64>,
+    spec: ConstrainedZonotopeConv2dSpec,
+    geometry: Geometry,
+    adjacency: &[Vec<(usize, f64)>],
+    limit: usize,
+    gate: &mut G,
+) -> Result<usize, ConstrainedZonotopeConv2dBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let [input_channels, input_height, input_width] = input_shape;
+    let [output_channels, kernel_input_channels, kernel_height, kernel_width] =
+        geometry.weight_shape;
+    let [_output_channels, output_height, output_width] = geometry.output_shape;
+    let input_channels_per_group = input_channels / spec.groups;
+    let output_channels_per_group = output_channels / spec.groups;
+    let mut products = 0_usize;
+
+    for output_channel in 0..output_channels {
+        let group = output_channel / output_channels_per_group;
+        let input_channel_base = group * input_channels_per_group;
+        for output_y in 0..output_height {
+            for output_x in 0..output_width {
+                gate.charge_items(1, "Conv2d interval-product output preflight")?;
+                for kernel_input_channel in 0..kernel_input_channels {
+                    let input_channel = input_channel_base + kernel_input_channel;
+                    for kernel_y in 0..kernel_height {
+                        gate.charge_items(1, "Conv2d interval-product kernel preflight")?;
+                        let Some(input_y) = input_coordinate(
+                            output_y,
+                            spec.stride[0],
+                            kernel_y,
+                            spec.dilation[0],
+                            spec.padding[0],
+                            input_height,
+                        )?
+                        else {
+                            continue;
+                        };
+                        for kernel_x in 0..kernel_width {
+                            gate.charge_items(1, "Conv2d interval-product kernel preflight")?;
+                            let Some(input_x) = input_coordinate(
+                                output_x,
+                                spec.stride[1],
+                                kernel_x,
+                                spec.dilation[1],
+                                spec.padding[1],
+                                input_width,
+                            )?
+                            else {
+                                continue;
+                            };
+                            let weight =
+                                weights[[output_channel, kernel_input_channel, kernel_y, kernel_x]];
+                            if weight == 0.0 {
+                                continue;
+                            }
+                            let input_index =
+                                (input_channel * input_height + input_y) * input_width + input_x;
+                            let products_here = 1_usize
+                                .checked_add(usize::from(input.box_remainder()[input_index] != 0.0))
+                                .and_then(|count| count.checked_add(adjacency[input_index].len()))
+                                .ok_or(ConstrainedZonotopeConv2dError::ResourceOverflow {
+                                    operation: "interval product count",
+                                })?;
+                            consume_product_batch_equivalent(&mut products, products_here, limit)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(products)
+}
+
+fn build_input_adjacency<G>(
     input: &ConstrainedZonotope64,
     total_nonzeros: usize,
-) -> Result<Vec<Vec<(usize, f64)>>, ConstrainedZonotopeConv2dError> {
+    gate: &mut G,
+) -> Result<Vec<Vec<(usize, f64)>>, ConstrainedZonotopeConv2dBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let mut counts = Vec::new();
+    gate.checkpoint("Conv2d adjacency-count allocation")?;
     try_reserve(&mut counts, input.value_dim(), "input adjacency counts")?;
-    counts.resize(input.value_dim(), 0_usize);
+    for _ in 0..input.value_dim() {
+        gate.charge_items(1, "Conv2d adjacency-count initialization")?;
+        counts.push(0_usize);
+    }
     for generator in input.generators() {
+        gate.charge_items(1, "Conv2d adjacency generator counting")?;
         for (value_index, _) in generator.entries() {
+            gate.charge_items(1, "Conv2d adjacency entry counting")?;
             counts[value_index] = counts[value_index].checked_add(1).ok_or(
                 ConstrainedZonotopeConv2dError::ResourceOverflow {
                     operation: "per-value generator adjacency",
@@ -617,31 +975,43 @@ fn build_input_adjacency(
     }
 
     let mut adjacency = Vec::new();
+    gate.checkpoint("Conv2d adjacency-column allocation")?;
     try_reserve(
         &mut adjacency,
         input.value_dim(),
         "input generator adjacency",
     )?;
     for &count in &counts {
+        gate.charge_items(1, "Conv2d adjacency-column construction")?;
         let mut entries = Vec::new();
+        gate.checkpoint("Conv2d adjacency-entry allocation")?;
         try_reserve(&mut entries, count, "input generator adjacency entries")?;
         adjacency.push(entries);
     }
+    let mut filled_nonzeros = 0_usize;
     for (generator_index, generator) in input.generators().iter().enumerate() {
+        gate.charge_items(1, "Conv2d adjacency generator fill")?;
         for (value_index, coefficient) in generator.entries() {
+            gate.charge_items(1, "Conv2d adjacency entry fill")?;
             adjacency[value_index].push((generator_index, coefficient));
+            filled_nonzeros = filled_nonzeros.checked_add(1).ok_or(
+                ConstrainedZonotopeConv2dError::ResourceOverflow {
+                    operation: "filled input generator adjacency",
+                },
+            )?;
         }
     }
-    debug_assert_eq!(
-        adjacency.iter().map(Vec::len).sum::<usize>(),
-        total_nonzeros
-    );
+    debug_assert_eq!(filled_nonzeros, total_nonzeros);
     Ok(adjacency)
 }
 
-fn clone_constraints(
+fn clone_constraints<G>(
     input: &ConstrainedZonotope64,
-) -> Result<Array2<f64>, ConstrainedZonotopeConv2dError> {
+    gate: &mut G,
+) -> Result<Array2<f64>, ConstrainedZonotopeConv2dBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let shape = (input.constraint_count(), input.alpha_dim());
     let element_count =
         shape
@@ -652,36 +1022,53 @@ fn clone_constraints(
             })?;
     let constraints = input.constraints();
     let mut values = Vec::new();
+    gate.checkpoint("Conv2d constraint-matrix allocation")?;
     try_reserve(&mut values, element_count, "constraint matrix")?;
     for row in 0..shape.0 {
+        gate.charge_items(1, "Conv2d constraint-row clone")?;
         for column in 0..shape.1 {
+            gate.charge_items(1, "Conv2d constraint-element clone")?;
             values.push(constraints[[row, column]]);
         }
     }
     Array2::from_shape_vec(shape, values).map_err(|_| {
-        ConstrainedZonotopeConv2dError::ResourceOverflow {
-            operation: "constraint matrix shape",
-        }
+        ConstrainedZonotopeConv2dBudgetError::Transform(
+            ConstrainedZonotopeConv2dError::ResourceOverflow {
+                operation: "constraint matrix shape",
+            },
+        )
     })
 }
 
-fn clone_slice<T: Copy>(
+fn clone_slice_with_gate<T: Copy, G>(
     source: &[T],
     resource: &'static str,
-) -> Result<Vec<T>, ConstrainedZonotopeConv2dError> {
+    gate: &mut G,
+) -> Result<Vec<T>, ConstrainedZonotopeConv2dBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let mut output = Vec::new();
     try_reserve(&mut output, source.len(), resource)?;
-    output.extend_from_slice(source);
+    for &value in source {
+        gate.charge_items(1, "Conv2d right-hand-side clone")?;
+        output.push(value);
+    }
     Ok(output)
 }
 
-fn validate_finite(
+fn validate_finite_with_gate<G>(
     field: &'static str,
     values: impl IntoIterator<Item = f64>,
-) -> Result<(), ConstrainedZonotopeConv2dError> {
+    gate: &mut G,
+) -> Result<(), ConstrainedZonotopeConv2dBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     for (index, value) in values.into_iter().enumerate() {
+        gate.charge_items(1, "Conv2d finite-parameter validation")?;
         if !value.is_finite() {
-            return Err(ConstrainedZonotopeConv2dError::NonFinite { field, index });
+            return Err(ConstrainedZonotopeConv2dError::NonFinite { field, index }.into());
         }
     }
     Ok(())
@@ -720,6 +1107,41 @@ fn consume_product(count: &mut usize, limit: usize) -> Result<(), ConstrainedZon
             operation: "interval product count",
         })?;
     check_limit("interval products", *count, limit)
+}
+
+/// Advance a preflight count in constant time while preserving the exact
+/// failure that repeated [`consume_product`] calls would expose.
+///
+/// In particular, a batch that crosses a finite limit reports the first
+/// refused item (`limit + 1`), not the end of the batch. If the limit is
+/// `usize::MAX`, arithmetic overflow remains the first possible refusal.
+fn consume_product_batch_equivalent(
+    count: &mut usize,
+    additional: usize,
+    limit: usize,
+) -> Result<(), ConstrainedZonotopeConv2dError> {
+    let Some(required) = count.checked_add(additional) else {
+        if limit < usize::MAX {
+            return Err(ConstrainedZonotopeConv2dError::ResourceLimit {
+                resource: "interval products",
+                required: limit + 1,
+                limit,
+            });
+        }
+        return Err(ConstrainedZonotopeConv2dError::ResourceOverflow {
+            operation: "interval product count",
+        });
+    };
+    if required > limit {
+        debug_assert!(limit < usize::MAX);
+        return Err(ConstrainedZonotopeConv2dError::ResourceLimit {
+            resource: "interval products",
+            required: limit + 1,
+            limit,
+        });
+    }
+    *count = required;
+    Ok(())
 }
 
 fn try_reserve<T>(
@@ -887,6 +1309,10 @@ fn round_up(value: f64, operation: &'static str) -> Result<f64, ConstrainedZonot
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::mem::size_of;
+    use std::time::{Duration, Instant};
+
     use ndarray::{array, Array2, Array4};
     use num_rational::BigRational;
     use num_traits::{Signed, Zero};
@@ -916,6 +1342,17 @@ mod tests {
         }
     }
 
+    fn simple_input() -> ConstrainedZonotope64 {
+        ConstrainedZonotope64::try_new(
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![vec![(0, 0.25), (3, -0.5)], vec![(1, 0.75)]],
+            array![[1.0, -0.25]],
+            vec![0.5],
+            vec![0.1, 0.2, 0.3, 0.4],
+        )
+        .unwrap()
+    }
+
     fn rat(value: f64) -> BigRational {
         BigRational::from_float(value).expect("finite test value")
     }
@@ -937,14 +1374,7 @@ mod tests {
 
     #[test]
     fn exact_dyadic_convolution_preserves_constraints_and_contains_transform() {
-        let input = ConstrainedZonotope64::try_new(
-            vec![1.0, 2.0, 3.0, 4.0],
-            vec![vec![(0, 0.25), (3, -0.5)], vec![(1, 0.75)]],
-            array![[1.0, -0.25]],
-            vec![0.5],
-            vec![0.1, 0.2, 0.3, 0.4],
-        )
-        .unwrap();
+        let input = simple_input();
         let weights = Array4::from_shape_vec((1, 1, 2, 2), vec![1.0, -2.0, 0.5, 3.0]).unwrap();
         let (output, plan) = constrained_zonotope_conv2d_unwired(
             &input,
@@ -977,6 +1407,288 @@ mod tests {
     }
 
     #[test]
+    fn budgeted_conv2d_is_bit_identical_and_reports_complete_peak() {
+        let input = simple_input();
+        let weights = Array4::from_shape_vec((1, 1, 2, 2), vec![1.0, -2.0, 0.5, 3.0]).unwrap();
+        let legacy = constrained_zonotope_conv2d_unwired(
+            &input,
+            [1, 2, 2],
+            weights.view(),
+            &[0.125],
+            spec(),
+            limits(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let outcome = constrained_zonotope_conv2d_unwired_with_budget(
+            &input,
+            [1, 2, 2],
+            weights.view(),
+            &[0.125],
+            spec(),
+            limits(),
+            ConstrainedZonotopeCallBudget::new(deadline, 13, usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(outcome.value(), &legacy);
+        // Independent inventory of the fixed case: adjacency count/touched
+        // indices, adjacency/candidate/validated column headers, adjacency plus
+        // candidate/validated entries, interval scratch, and the
+        // center/remainder/constraint/rhs scalars.
+        let transform_owned_peak = 6 * size_of::<usize>()
+            + 8 * size_of::<Vec<(usize, f64)>>()
+            + 7 * size_of::<(usize, f64)>()
+            + 2 * size_of::<Option<OutwardInterval>>()
+            + 5 * size_of::<f64>();
+        assert_eq!(
+            outcome.report().peak_live_bytes(),
+            13 + transform_owned_peak
+        );
+        assert!(outcome.report().charged_items() > 0);
+        assert!(outcome.report().deadline_polls() > 0);
+
+        let exact_peak = outcome.report().peak_live_bytes();
+        constrained_zonotope_conv2d_unwired_with_budget(
+            &input,
+            [1, 2, 2],
+            weights.view(),
+            &[0.125],
+            spec(),
+            limits(),
+            ConstrainedZonotopeCallBudget::new(deadline, 13, exact_peak),
+        )
+        .unwrap();
+        assert!(matches!(
+            constrained_zonotope_conv2d_unwired_with_budget(
+                &input,
+                [1, 2, 2],
+                weights.view(),
+                &[0.125],
+                spec(),
+                limits(),
+                ConstrainedZonotopeCallBudget::new(deadline, 13, exact_peak - 1),
+            ),
+            Err(ConstrainedZonotopeConv2dBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. }
+            ))
+        ));
+        assert!(matches!(
+            constrained_zonotope_conv2d_unwired_with_budget(
+                &input,
+                [1, 2, 2],
+                weights.view(),
+                &[0.125],
+                spec(),
+                limits(),
+                ConstrainedZonotopeCallBudget::new(deadline, usize::MAX, usize::MAX),
+            ),
+            Err(ConstrainedZonotopeConv2dBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "aggregate peak-live bytes"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn budget_refuses_baseline_at_admission_and_each_publication_seam() {
+        let input = simple_input();
+        let weights = Array4::ones((1, 1, 2, 2));
+        let start = Instant::now();
+        let reads = Cell::new(0_usize);
+        let baseline = constrained_zonotope_conv2d_unwired_with_clock(
+            &input,
+            [1, 2, 2],
+            weights.view(),
+            &[0.0],
+            spec(),
+            limits(),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 5, 4),
+            |_| {
+                reads.set(reads.get() + 1);
+                start
+            },
+        );
+        assert!(matches!(
+            baseline,
+            Err(ConstrainedZonotopeConv2dBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required: 5,
+                    limit: 4
+                }
+            ))
+        ));
+        assert_eq!(reads.get(), 1);
+
+        for seam in [
+            "Conv2d geometry validation complete",
+            "Conv2d peak-memory preflight complete",
+            "Conv2d adjacency construction complete",
+            "Conv2d interval-product preflight complete",
+            "Conv2d numeric transform complete",
+            "Conv2d constraint clone complete",
+            "Conv2d right-hand-side clone complete",
+            "constrained-zonotope generator-column allocation",
+            "Conv2d domain materialization complete",
+            "Conv2d publication",
+        ] {
+            let expired = start + Duration::from_secs(2);
+            let result = constrained_zonotope_conv2d_unwired_with_clock(
+                &input,
+                [1, 2, 2],
+                weights.view(),
+                &[0.0],
+                spec(),
+                limits(),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, 1 << 20),
+                |checkpoint| if checkpoint == seam { expired } else { start },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ConstrainedZonotopeConv2dBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == seam
+                ),
+                "deadline seam {seam} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_polls_inside_product_preflight_and_dense_kernel_loop() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let input = ConstrainedZonotope64::try_new(
+            vec![1.0; dimension],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0; dimension],
+        )
+        .unwrap();
+        let weights = Array4::ones((1, 1, 1, dimension));
+        let mut large = limits();
+        large.max_value_count = dimension;
+        large.max_weight_elements = dimension;
+        large.max_kernel_visits = dimension;
+        large.max_interval_products = dimension;
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        for phase in [
+            "Conv2d interval-product kernel preflight",
+            "Conv2d kernel transform",
+        ] {
+            let result = constrained_zonotope_conv2d_unwired_with_clock(
+                &input,
+                [1, 1, dimension],
+                weights.view(),
+                &[0.0],
+                spec(),
+                large,
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, 1 << 20),
+                |checkpoint| if checkpoint == phase { expired } else { start },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ConstrainedZonotopeConv2dBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == phase
+                ),
+                "deadline must be polled during {phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_polling_continues_through_final_domain_validation() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let input = ConstrainedZonotope64::try_new(
+            vec![1.0],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let weights = Array4::ones((dimension, 1, 1, 1));
+        let bias = vec![0.0; dimension];
+        let mut large = limits();
+        large.max_value_count = dimension;
+        large.max_weight_elements = dimension;
+        large.max_kernel_visits = dimension;
+        large.max_interval_products = dimension;
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        let result = constrained_zonotope_conv2d_unwired_with_clock(
+            &input,
+            [1, 1, 1],
+            weights.view(),
+            &bias,
+            spec(),
+            large,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "constrained-zonotope finite-value validation" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ConstrainedZonotopeConv2dBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "constrained-zonotope finite-value validation"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn deadline_polls_while_cloning_many_zero_width_constraint_rows() {
+        let row_count = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let input = ConstrainedZonotope64::try_new(
+            vec![1.0],
+            Vec::new(),
+            Array2::zeros((row_count, 0)),
+            vec![0.0; row_count],
+            vec![0.0],
+        )
+        .unwrap();
+        let weights = Array4::ones((1, 1, 1, 1));
+        let mut large = limits();
+        large.max_constraint_count = row_count;
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        let result = constrained_zonotope_conv2d_unwired_with_clock(
+            &input,
+            [1, 1, 1],
+            weights.view(),
+            &[0.0],
+            spec(),
+            large,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "Conv2d constraint-row clone" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ConstrainedZonotopeConv2dBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "Conv2d constraint-row clone"
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn grouped_dilated_padding_uses_onnx_channel_geometry() {
         let input = ConstrainedZonotope64::from_certified_bounds(
             &(0..18).map(f64::from).collect::<Vec<_>>(),
@@ -1006,6 +1718,83 @@ mod tests {
         assert_eq!(output.center()[3], 16.0);
         // The same site in group 1 reads the second input channel.
         assert_eq!(output.center()[7], 52.0);
+    }
+
+    #[test]
+    fn grouped_strided_asymmetric_padding_and_dilation_match_dense_oracle() {
+        let input_shape = [4, 4, 5];
+        let input_values = (1..=80).map(f64::from).collect::<Vec<_>>();
+        let input =
+            ConstrainedZonotope64::from_certified_bounds(&input_values, &input_values, &[true; 80])
+                .unwrap();
+        let weights = Array4::ones((4, 2, 2, 2));
+        let bias = [0.0, 100.0, 200.0, 300.0];
+        let grouped = ConstrainedZonotopeConv2dSpec {
+            stride: [2, 1],
+            padding: [1, 2, 0, 1],
+            dilation: [2, 2],
+            groups: 2,
+        };
+        let legacy = constrained_zonotope_conv2d_unwired(
+            &input,
+            input_shape,
+            weights.view(),
+            &bias,
+            grouped,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(legacy.1.output_shape, [4, 2, 6]);
+
+        let mut valid_products = 0_usize;
+        for output_channel in 0..4 {
+            let input_channel_base = (output_channel / 2) * 2;
+            for output_y in 0..2 {
+                for output_x in 0..6 {
+                    let output_index = (output_channel * 2 + output_y) * 6 + output_x;
+                    let mut exact = rat(bias[output_channel]);
+                    for kernel_input_channel in 0..2 {
+                        for kernel_y in 0..2 {
+                            let input_y = isize::try_from(output_y * 2 + kernel_y * 2).unwrap() - 1;
+                            if !(0..4).contains(&input_y) {
+                                continue;
+                            }
+                            for kernel_x in 0..2 {
+                                let input_x = isize::try_from(output_x + kernel_x * 2).unwrap() - 2;
+                                if !(0..5).contains(&input_x) {
+                                    continue;
+                                }
+                                let input_channel = input_channel_base + kernel_input_channel;
+                                let input_index =
+                                    (input_channel * 4 + usize::try_from(input_y).unwrap()) * 5
+                                        + usize::try_from(input_x).unwrap();
+                                exact += rat(input_values[input_index]);
+                                valid_products += 1;
+                            }
+                        }
+                    }
+                    let represented_error = (exact - rat(legacy.0.center()[output_index])).abs();
+                    assert!(
+                        rat(legacy.0.box_remainder()[output_index]) >= represented_error,
+                        "output {output_index} does not contain the independent dense oracle"
+                    );
+                }
+            }
+        }
+        assert_eq!(legacy.1.interval_products, valid_products);
+
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let budgeted = constrained_zonotope_conv2d_unwired_with_budget(
+            &input,
+            input_shape,
+            weights.view(),
+            &bias,
+            grouped,
+            limits(),
+            ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(budgeted.value(), &legacy);
     }
 
     #[test]
@@ -1140,6 +1929,135 @@ mod tests {
                 limit: 1,
             })
         ));
+    }
+
+    #[test]
+    fn interval_product_preflight_preserves_first_excess_payload() {
+        let input = ConstrainedZonotope64::try_new(
+            vec![1.0],
+            vec![vec![(0, 0.25)], vec![(0, -0.5)]],
+            Array2::zeros((0, 2)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let weights = Array4::ones((1, 1, 1, 1));
+        let start = Instant::now();
+
+        for limit in 0..3 {
+            let mut capped = limits();
+            capped.max_interval_products = limit;
+            let legacy = constrained_zonotope_conv2d_unwired(
+                &input,
+                [1, 1, 1],
+                weights.view(),
+                &[0.0],
+                spec(),
+                capped,
+            )
+            .unwrap_err();
+            assert_eq!(
+                legacy,
+                ConstrainedZonotopeConv2dError::ResourceLimit {
+                    resource: "interval products",
+                    required: limit + 1,
+                    limit,
+                }
+            );
+            let budgeted = constrained_zonotope_conv2d_unwired_with_clock(
+                &input,
+                [1, 1, 1],
+                weights.view(),
+                &[0.0],
+                spec(),
+                capped,
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_mins(1), 0, usize::MAX),
+                |_| start,
+            )
+            .unwrap_err();
+            assert_eq!(
+                budgeted,
+                ConstrainedZonotopeConv2dBudgetError::Transform(legacy)
+            );
+        }
+
+        let mut unlimited_count = usize::MAX - 1;
+        assert_eq!(
+            consume_product_batch_equivalent(&mut unlimited_count, 2, usize::MAX),
+            Err(ConstrainedZonotopeConv2dError::ResourceOverflow {
+                operation: "interval product count"
+            })
+        );
+        let mut finitely_capped_count = usize::MAX - 1;
+        assert_eq!(
+            consume_product_batch_equivalent(&mut finitely_capped_count, 2, usize::MAX - 1,),
+            Err(ConstrainedZonotopeConv2dError::ResourceLimit {
+                resource: "interval products",
+                required: usize::MAX,
+                limit: usize::MAX - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_validation_order_and_error_payloads_remain_exact() {
+        let input = ConstrainedZonotope64::try_new(
+            vec![0.0],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0],
+        )
+        .unwrap();
+        let weights = Array4::ones((1, 1, 1, 1));
+        let mut invalid_groups = spec();
+        invalid_groups.groups = 0;
+        assert_eq!(
+            constrained_zonotope_conv2d_unwired(
+                &input,
+                [1, 1, 2],
+                weights.view(),
+                &[0.0],
+                invalid_groups,
+                limits(),
+            ),
+            Err(ConstrainedZonotopeConv2dError::Shape {
+                field: "input domain",
+                expected: vec![2],
+                got: vec![1],
+            })
+        );
+
+        let mut no_input_values = limits();
+        no_input_values.max_value_count = 0;
+        assert_eq!(
+            constrained_zonotope_conv2d_unwired(
+                &input,
+                [1, 1, 1],
+                weights.view(),
+                &[0.0],
+                invalid_groups,
+                no_input_values,
+            ),
+            Err(ConstrainedZonotopeConv2dError::ResourceLimit {
+                resource: "input value count",
+                required: 1,
+                limit: 0,
+            })
+        );
+        assert_eq!(
+            constrained_zonotope_conv2d_unwired(
+                &input,
+                [1, 1, 1],
+                weights.view(),
+                &[0.0],
+                invalid_groups,
+                limits(),
+            ),
+            Err(ConstrainedZonotopeConv2dError::InvalidSpec {
+                message: "groups must be non-zero".to_owned(),
+            })
+        );
     }
 
     proptest! {

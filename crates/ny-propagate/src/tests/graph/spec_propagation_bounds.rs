@@ -963,16 +963,12 @@ fn test_spec_crown_extracted_graph_target_shape_3680() {
     }
 }
 
-/// An already-expired deadline must surface `ForwardFallback(DeadlineExceeded)`
-/// through the provenance-carrying public API.
-///
-/// Part of #3520 Packet C Step 2: proves the provenance seam works at the
-/// `GraphNetwork` dispatch level, not just the internal spec_propagation helper.
+/// An already-expired request cannot run the O(spec rows × output width)
+/// forward projection needed to publish fallback bounds. It therefore remains
+/// a typed deadline refusal at the provenance-carrying public API.
 #[ntest::timeout(10000)]
 #[test]
-fn test_spec_guided_provenance_deadline_fallback_3520() {
-    use crate::types::{BoundsProvenance, CrownIbpFallbackReason};
-
+fn test_spec_guided_provenance_expired_deadline_refuses_before_projection_3520() {
     let graph = build_relu_graph();
     let input = BoundedTensor::new(
         arr1(&[-0.5_f32, -0.5]).into_dyn(),
@@ -982,12 +978,12 @@ fn test_spec_guided_provenance_deadline_fallback_3520() {
     let spec_matrix = arr2(&[[1.0_f32, -1.0]]);
     let node_bounds = graph.collect_node_bounds(&input).unwrap();
 
-    // Already-expired deadline forces immediate IBP fallback.
+    // Already-expired authority refuses before any fallback projection.
     let expired = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap();
 
-    let result = graph
+    let error = graph
         .propagate_crown_with_specs_and_provenance_and_engine_with_node_bounds_and_deadline(
             &input,
             &spec_matrix,
@@ -995,37 +991,9 @@ fn test_spec_guided_provenance_deadline_fallback_3520() {
             &node_bounds,
             Some(expired),
         )
-        .expect("provenance API should succeed even on deadline fallback");
-
-    // Provenance must record the fallback reason.
-    assert_eq!(
-        result.provenance,
-        BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::DeadlineExceeded),
-        "expired deadline should produce ForwardFallback(DeadlineExceeded)"
-    );
-
-    // Bounds must still be finite and sound (IBP fallback, not failure).
-    assert!(result.bounds.lower().iter().all(|v| v.is_finite()));
-    assert!(result.bounds.upper().iter().all(|v| v.is_finite()));
-    assert!(result.bounds.lower()[[0]] <= result.bounds.upper()[[0]]);
-
-    // Compare against a no-deadline call to verify the fallback bounds are
-    // at least as wide (IBP is looser than CROWN).
-    let crown_result = graph
-        .propagate_crown_with_specs_and_provenance_and_engine_with_node_bounds_and_deadline(
-            &input,
-            &spec_matrix,
-            None,
-            &node_bounds,
-            None, // no deadline
-        )
-        .expect("no-deadline should succeed");
-    assert_eq!(crown_result.provenance, BoundsProvenance::Crown);
-
-    let fallback_width = result.bounds.upper()[[0]] - result.bounds.lower()[[0]];
-    let crown_width = crown_result.bounds.upper()[[0]] - crown_result.bounds.lower()[[0]];
+        .expect_err("expired spec request must refuse before fallback projection");
     assert!(
-        fallback_width >= crown_width - 1e-4,
-        "IBP fallback bounds ({fallback_width}) should be at least as wide as CROWN ({crown_width})"
+        matches!(error, NyError::DeadlineExceeded(_)),
+        "expected typed deadline refusal, got {error:?}"
     );
 }

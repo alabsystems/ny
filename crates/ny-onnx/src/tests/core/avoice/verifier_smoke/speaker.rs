@@ -15,8 +15,9 @@ use super::shared::{
 /// Part of #3654.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_speaker_norm_sq_verifier_smoke_3654() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let (norm_sq_graph, input) = speaker_verifier::speaker_norm_sq_verifier_setup();
 
     let output_bounds = vec![ny_core::Bound::new_allow_infinite(0.0, f32::INFINITY)];
@@ -50,8 +51,9 @@ fn test_avoice_speaker_norm_sq_verifier_smoke_3654() {
 /// Part of #4179.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_speaker_norm_sq_graph_model_round_trip_verifier_smoke_4179() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let (norm_sq_graph, input) =
         speaker_verifier::speaker_graph_model_round_trip_norm_sq_verifier_setup();
 

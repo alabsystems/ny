@@ -71,8 +71,9 @@ const CROWN_BOUNDARY_BEYOND_EPSILON: f32 = 3e-6;
 // unchanged and all pass.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_centroid_monotonicity_real_rope_crown_boundary_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, softmax_name) = talker_attention_softmax_output_graph_real_rope();
 
     let baseline = crown_boundary_point(

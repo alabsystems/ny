@@ -5,6 +5,7 @@
 //! Safe interval arithmetic for bound computation.
 
 use crate::rounding::{next_down_f32, next_up_f32};
+use ny_core::{f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up};
 
 /// Safe multiplication for bound computation.
 ///
@@ -58,6 +59,19 @@ pub fn safe_mul_pair_for_bounds(a: f32, b: f32) -> f32 {
     }
 }
 
+/// Multiply binary32 bit patterns exactly in binary64, preserving subnormals
+/// even on hosts that enable denormals-are-zero for binary32 arithmetic.
+#[inline]
+fn safe_mul_pair_f64_exact_for_bounds(a: f32, b: f32) -> f64 {
+    let a_is_zero = a.to_bits() & 0x7fff_ffff == 0;
+    let b_is_zero = b.to_bits() & 0x7fff_ffff == 0;
+    if a_is_zero || b_is_zero {
+        0.0
+    } else {
+        f32_to_f64_exact(a) * f32_to_f64_exact(b)
+    }
+}
+
 /// Interval multiplication: compute [a_l, a_u] * [b_l, b_u].
 #[inline]
 pub fn interval_mul_for_bounds(a_l: f32, a_u: f32, b_l: f32, b_u: f32) -> (f32, f32) {
@@ -66,10 +80,10 @@ pub fn interval_mul_for_bounds(a_l: f32, a_u: f32, b_l: f32, b_u: f32) -> (f32, 
     }
 
     let products = [
-        safe_mul_pair_for_bounds(a_l, b_l),
-        safe_mul_pair_for_bounds(a_l, b_u),
-        safe_mul_pair_for_bounds(a_u, b_l),
-        safe_mul_pair_for_bounds(a_u, b_u),
+        safe_mul_pair_f64_exact_for_bounds(a_l, b_l),
+        safe_mul_pair_f64_exact_for_bounds(a_l, b_u),
+        safe_mul_pair_f64_exact_for_bounds(a_u, b_l),
+        safe_mul_pair_f64_exact_for_bounds(a_u, b_u),
     ];
 
     if products.iter().all(|p| p.is_infinite()) {
@@ -92,12 +106,13 @@ pub fn interval_mul_for_bounds(a_l: f32, a_u: f32, b_l: f32, b_u: f32) -> (f32, 
         return (f32::NEG_INFINITY, f32::INFINITY);
     }
 
-    // Directed OUTWARD rounding on the final endpoints: each corner product is
-    // rounded to nearest (up to 0.5 ULP inward), so min/max of the corners
-    // alone is not a sound enclosure. One ULP outward covers it. Matches the
-    // production hardening in `ny_propagate::bounds::safe_math`
-    // (#concretize-soundness-hardening); next_*_f32 are no-ops on ±inf.
-    (next_down_f32(lower), next_up_f32(upper))
+    // Convert the exact binary64 products outward before the historical
+    // additional ULP widening. This mirrors the production verdict path and
+    // avoids losing a binary32 subnormal before it reaches the conversion.
+    (
+        next_down_f32(f64_to_f32_down(lower)),
+        next_up_f32(f64_to_f32_up(upper)),
+    )
 }
 
 /// Safe addition for lower bounds: NaN → -inf (sound lower).
@@ -119,5 +134,21 @@ pub fn safe_add_upper_for_bounds(a: f32, b: f32) -> f32 {
         f32::INFINITY
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_mul_preserves_subnormal_operands() {
+        let tiny = f32::from_bits(1);
+        let large = 2.0_f32.powi(120);
+        let exact_product = 2.0_f64.powi(-29);
+
+        let (lower, upper) = interval_mul_for_bounds(tiny, tiny, large, large);
+        assert!(f32_to_f64_exact(lower) <= exact_product);
+        assert!(f32_to_f64_exact(upper) >= exact_product);
     }
 }

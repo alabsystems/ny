@@ -14,7 +14,21 @@ use crate::bounds::LinearBounds;
 use crate::layers::{Layer, LinearLayer};
 use crate::{GraphNetwork, GraphNode};
 
+use super::gpu_objective_intervals_valid;
 use super::indexed_pending::IndexedPendingLinearBounds;
+
+#[test]
+fn gpu_objective_interval_gate_rejects_malformed_passes() {
+    assert!(gpu_objective_intervals_valid(&[-1.0], &[1.0], 1));
+    assert!(!gpu_objective_intervals_valid(&[], &[], 0));
+    assert!(!gpu_objective_intervals_valid(&[-1.0], &[1.0, 2.0], 1));
+    assert!(!gpu_objective_intervals_valid(
+        &[f32::NEG_INFINITY],
+        &[1.0],
+        1
+    ));
+    assert!(!gpu_objective_intervals_valid(&[2.0], &[1.0], 1));
+}
 
 fn make_pending(node_name: &str, n_domains: usize) -> IndexedPendingLinearBounds {
     let mut graph = GraphNetwork::new();

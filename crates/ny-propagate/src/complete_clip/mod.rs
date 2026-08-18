@@ -31,10 +31,15 @@ mod objective;
 mod rearrange;
 mod validate;
 
-#[cfg(test)]
-pub(crate) use affine_provenance::{test_certified_affine_fixture, TestSoundCrownAffineParts};
 pub(crate) use affine_provenance::{
-    CertifiedAffineEnclosure, CrownPassStamp, ValidatedAffineEnclosure,
+    bind_root_sound_crown_rows_to_history, capture_exact_root_input_rows,
+    capture_sound_crown_root_rows_at_node, mint_certified_affine_enclosure,
+    CertifiedAffineEnclosure, CrownPassStamp, SoundCrownRootAffineRows, ValidatedAffineEnclosure,
+};
+#[cfg(test)]
+pub(crate) use affine_provenance::{
+    capture_host_sound_crown_root_rows, check_root_affine_dominance_and_seal,
+    test_certified_affine_fixture, TestSoundCrownAffineParts, UntrustedCrownAffineRows,
 };
 
 #[cfg(test)]

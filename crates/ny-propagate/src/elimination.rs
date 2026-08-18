@@ -331,8 +331,8 @@ fn select_rows(layer: &LinearLayer, indices: &[usize]) -> Result<LinearLayer> {
         ));
     }
 
-    let new_weight = layer.weight.select(Axis(0), indices);
-    let new_bias = layer.bias.as_ref().map(|b| b.select(Axis(0), indices));
+    let new_weight = layer.weight().select(Axis(0), indices);
+    let new_bias = layer.bias().map(|b| b.select(Axis(0), indices));
     LinearLayer::new(new_weight, new_bias)
 }
 
@@ -345,13 +345,13 @@ fn apply_column_ops(layer: &LinearLayer, ops: &PendingColumnOps) -> Result<Linea
 
     // Step 1: absorb constants into bias.
     let mut bias = layer
-        .bias
-        .clone()
+        .bias()
+        .cloned()
         .unwrap_or_else(|| Array1::zeros(out_features));
     for &(col, val) in &ops.bias_absorb {
         if col < layer.in_features() {
             for k in 0..out_features {
-                bias[k] += layer.weight[[k, col]] * val;
+                bias[k] += layer.weight()[[k, col]] * val;
             }
         }
     }
@@ -363,7 +363,7 @@ fn apply_column_ops(layer: &LinearLayer, ops: &PendingColumnOps) -> Result<Linea
         ));
     }
 
-    let new_weight = layer.weight.select(Axis(1), &ops.keep_cols);
+    let new_weight = layer.weight().select(Axis(1), &ops.keep_cols);
     LinearLayer::new(new_weight, Some(bias))
 }
 

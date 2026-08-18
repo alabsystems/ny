@@ -18,14 +18,18 @@
 //!   else route the lower row iff `la>0`, upper iff `ua<0`; per-coefficient error
 //!   `3·γ_k·S·slack + additive` (coefficient-1 accumulation, NORMAL FTZ-safe floor).
 //! - The BIAS (the `la<0`→`la·max_upper` / `ua>0`→`ua·max_upper` CONSTANT arms over
-//!   non-definite windows) is folded on the host in f64, then directed-rounded
-//!   OUTWARD (`next_down`/`next_up`) — BIT-IDENTICAL to the CPU bias (same f64 order),
-//!   so only the GPU coefficients differ from the CPU (and they strictly enclose).
+//!   non-definite windows) is folded on the host with exact bit-level f32→f64 lifts
+//!   and a directed f64 step after every addition, then published with a DAZ-safe
+//!   directed f64→f32 conversion. This encloses the exact host sum even when many
+//!   additions round in the same direction.
 //!
 //! Any wgpu error → `Err` (the shared `run_gpu_checked`) so a verdict is never
 //! decided by a failed op — the caller keeps the proven-sound CPU relaxation.
 
-use ny_core::{ftz_safe_underflow_floor, nan_propagating_max, NyError, Result};
+use ny_core::dd::{next_down_f64, next_up_f64};
+use ny_core::{
+    f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, ftz_safe_underflow_floor, NyError, Result,
+};
 
 use crate::wgpu_device::params::MaxpoolCrownSoundParams;
 use crate::wgpu_device::sound_consts::{combine_slack_f32, gamma_k_f32};
@@ -34,31 +38,39 @@ use crate::wgpu_device::WgpuDevice;
 use super::gpu_checked_u32;
 use super::ibp_forward::create_buffer;
 
-/// Smallest f32 strictly `> x` (1-ULP up) — BIT-IDENTICAL to `ny_core`'s private
-/// `next_up_f32` so the host bias matches the CPU relaxation exactly. Used to round a
-/// directed upper bias OUTWARD (toward +∞).
-fn next_up_f32(x: f32) -> f32 {
-    if x.is_nan() || x == f32::INFINITY {
-        return x;
+fn accumulate_lower_bias_outward(accumulator: f64, coefficient: f32, max_upper: f32) -> f64 {
+    let coefficient = f32_to_f64_exact(coefficient);
+    if coefficient < 0.0 {
+        // A product of two finite binary32 values is exact in binary64: at most
+        // 48 significand bits. Only the addition needs a directed rounding step.
+        next_down_f64(accumulator + coefficient * f32_to_f64_exact(max_upper))
+    } else {
+        accumulator
     }
-    if x == 0.0 {
-        return f32::from_bits(1);
-    }
-    let bits = x.to_bits();
-    f32::from_bits(if x > 0.0 { bits + 1 } else { bits - 1 })
 }
 
-/// Largest f32 strictly `< x` (1-ULP down) — BIT-IDENTICAL to `ny_core`'s
-/// `next_down_f32`. Rounds a directed lower bias OUTWARD (toward −∞).
-fn next_down_f32(x: f32) -> f32 {
-    if x.is_nan() || x == f32::NEG_INFINITY {
-        return x;
+fn accumulate_upper_bias_outward(accumulator: f64, coefficient: f32, max_upper: f32) -> f64 {
+    let coefficient = f32_to_f64_exact(coefficient);
+    if coefficient > 0.0 {
+        next_up_f64(accumulator + coefficient * f32_to_f64_exact(max_upper))
+    } else {
+        accumulator
     }
-    if x == 0.0 {
-        return -f32::from_bits(1);
+}
+
+fn max_f32_by_exact_lift(lhs: f32, rhs: f32) -> f32 {
+    let lhs_bits = lhs.to_bits();
+    let rhs_bits = rhs.to_bits();
+    let lhs_nan = lhs_bits & 0x7f80_0000 == 0x7f80_0000 && lhs_bits & 0x007f_ffff != 0;
+    let rhs_nan = rhs_bits & 0x7f80_0000 == 0x7f80_0000 && rhs_bits & 0x007f_ffff != 0;
+    if lhs_nan || rhs_nan {
+        return f32::NAN;
     }
-    let bits = x.to_bits();
-    f32::from_bits(if x > 0.0 { bits - 1 } else { bits + 1 })
+    if f32_to_f64_exact(rhs) > f32_to_f64_exact(lhs) {
+        rhs
+    } else {
+        lhs
+    }
 }
 
 /// Result of a sound MaxPool2d CROWN backward: the transposed frontier on the maxpool
@@ -133,6 +145,19 @@ impl WgpuDevice {
                 vec![pre_lower.len()],
             ));
         }
+        for (index, (&lower, &upper)) in pre_lower.iter().zip(pre_upper).enumerate() {
+            let lower_bits = lower.to_bits();
+            let upper_bits = upper.to_bits();
+            if lower_bits & 0x7f80_0000 == 0x7f80_0000
+                || upper_bits & 0x7f80_0000 == 0x7f80_0000
+                || f32_to_f64_exact(lower) > f32_to_f64_exact(upper)
+            {
+                return Err(NyError::InvalidSpec(format!(
+                    "maxpool crown: invalid pre-activation interval at {index}: \
+                     [{lower}, {upper}]"
+                )));
+            }
+        }
 
         // --- Host: per-window i*+definite metadata (packed) + max_upper. ---
         let num_windows = output_size;
@@ -182,20 +207,21 @@ impl WgpuDevice {
                     let mut istar_lower = taps[0].1;
                     let mut mu = f32::NEG_INFINITY;
                     for &(flat, l, u) in &taps {
-                        if l > istar_lower {
+                        if f32_to_f64_exact(l) > f32_to_f64_exact(istar_lower) {
                             istar = flat;
                             istar_lower = l;
                         }
-                        mu = nan_propagating_max(mu, u);
+                        mu = max_f32_by_exact_lift(mu, u);
                     }
                     // is_definite: l_{i*} ≥ max over taps≠i* of u.
                     let mut max_upper_excl = f32::NEG_INFINITY;
                     for &(flat, _l, u) in &taps {
                         if flat != istar {
-                            max_upper_excl = nan_propagating_max(max_upper_excl, u);
+                            max_upper_excl = max_f32_by_exact_lift(max_upper_excl, u);
                         }
                     }
-                    let is_definite = istar_lower >= max_upper_excl;
+                    let is_definite =
+                        f32_to_f64_exact(istar_lower) >= f32_to_f64_exact(max_upper_excl);
                     let packed = (istar as u32) | (u32::from(is_definite) << 31);
                     window_meta[w] = packed;
                     win_max_upper[w] = mu;
@@ -205,10 +231,17 @@ impl WgpuDevice {
 
         // --- GPU: coefficient gather. ---
         // k = max windows that can route to one input + 3 (conservative γ count).
-        let max_cover = kh.div_ceil(sh) * kw.div_ceil(sw);
-        let k = max_cover + 3;
+        let max_cover = kh
+            .div_ceil(sh)
+            .checked_mul(kw.div_ceil(sw))
+            .ok_or_else(|| NyError::InvalidSpec("maxpool crown cover overflow".into()))?;
+        let k = max_cover.checked_add(3).ok_or_else(|| {
+            NyError::InvalidSpec("maxpool crown reduction length overflow".into())
+        })?;
         let k_u32 = gpu_checked_u32(k, "maxpool crown k")?;
-        let total = num_outputs * input_size;
+        let total = num_outputs
+            .checked_mul(input_size)
+            .ok_or_else(|| NyError::InvalidSpec("maxpool crown output overflow".into()))?;
         let params = MaxpoolCrownSoundParams {
             num_outputs: gpu_checked_u32(num_outputs, "mp num_outputs")?,
             input_size: gpu_checked_u32(input_size, "mp input_size")?,
@@ -224,8 +257,8 @@ impl WgpuDevice {
             sw: gpu_checked_u32(sw, "mp sw")?,
             ph: gpu_checked_u32(ph, "mp ph")?,
             pw: gpu_checked_u32(pw, "mp pw")?,
-            gamma_k: gamma_k_f32(k),
-            slack: combine_slack_f32(k),
+            gamma_k: gamma_k_f32(k)?,
+            slack: combine_slack_f32(k)?,
             additive: ftz_safe_underflow_floor(k_u32),
             total: gpu_checked_u32(total, "mp total")?,
             _p0: 0,
@@ -236,9 +269,15 @@ impl WgpuDevice {
             self.run_maxpool_crown_gather(&params, lower_a, upper_a, &window_meta, total)?;
         let (lower_a_err, upper_a_err) = err_comb.split_at(total);
 
-        // --- Host: directed bias (f64, BIT-IDENTICAL to the CPU order). ---
-        let mut nlb: Vec<f64> = lower_b.iter().map(|&x| f64::from(x)).collect();
-        let mut nub: Vec<f64> = upper_b.iter().map(|&x| f64::from(x)).collect();
+        // --- Host: directed bias (bit-exact lifts + outward f64 accumulation). ---
+        let mut nlb: Vec<f64> = lower_b
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        let mut nub: Vec<f64> = upper_b
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
         for c in 0..channels {
             for oh in 0..out_h {
                 for ow in 0..out_w {
@@ -247,22 +286,24 @@ impl WgpuDevice {
                     if meta == 0xFFFF_FFFF || (meta >> 31) & 1 == 1 {
                         continue; // empty or definite-winner window ⇒ no bias
                     }
-                    let mu = f64::from(win_max_upper[w]);
                     for out in 0..num_outputs {
-                        let la = f64::from(lower_a[out * output_size + w]);
-                        if la < 0.0 {
-                            nlb[out] += la * mu;
-                        }
-                        let ua = f64::from(upper_a[out * output_size + w]);
-                        if ua > 0.0 {
-                            nub[out] += ua * mu;
-                        }
+                        let index = out * output_size + w;
+                        nlb[out] = accumulate_lower_bias_outward(
+                            nlb[out],
+                            lower_a[index],
+                            win_max_upper[w],
+                        );
+                        nub[out] = accumulate_upper_bias_outward(
+                            nub[out],
+                            upper_a[index],
+                            win_max_upper[w],
+                        );
                     }
                 }
             }
         }
-        let lower_b_out: Vec<f32> = nlb.iter().map(|&x| next_down_f32(x as f32)).collect();
-        let upper_b_out: Vec<f32> = nub.iter().map(|&x| next_up_f32(x as f32)).collect();
+        let lower_b_out: Vec<f32> = nlb.iter().map(|&value| f64_to_f32_down(value)).collect();
+        let upper_b_out: Vec<f32> = nub.iter().map(|&value| f64_to_f32_up(value)).collect();
 
         Ok(MaxpoolCrownResult {
             lower_a: new_lower_a,
@@ -410,5 +451,48 @@ impl WgpuDevice {
             let nla = out.pop().expect("3 readbacks");
             Ok((nla, nua, err))
         })
+    }
+}
+
+#[cfg(test)]
+mod directed_bias_tests {
+    use ny_core::{f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up};
+
+    use super::{
+        accumulate_lower_bias_outward, accumulate_upper_bias_outward, max_f32_by_exact_lift,
+    };
+
+    #[test]
+    fn directed_bias_accumulation_preserves_subnormal_terms_lost_by_nearest_add() {
+        let positive_tiny = f32::from_bits(1);
+        let negative_tiny = f32::from_bits(0x8000_0001);
+        assert!(f32_to_f64_exact(positive_tiny) > 0.0);
+        assert!(f32_to_f64_exact(negative_tiny) < 0.0);
+
+        let lower = accumulate_lower_bias_outward(1.0, negative_tiny, 1.0);
+        let upper = accumulate_upper_bias_outward(-1.0, positive_tiny, 1.0);
+        assert!(lower < 1.0, "lower step must not lose a negative term");
+        assert!(upper > -1.0, "upper step must not lose a positive term");
+        assert!(f64_to_f32_down(lower) <= 1.0);
+        assert!(f64_to_f32_up(upper) >= -1.0);
+    }
+
+    #[test]
+    fn directed_publication_never_emits_subnormal_endpoints() {
+        let tiny = f32_to_f64_exact(f32::from_bits(1));
+        assert_eq!(f64_to_f32_down(tiny).to_bits(), 0);
+        assert_eq!(f64_to_f32_up(tiny), f32::MIN_POSITIVE);
+        assert_eq!(f64_to_f32_down(-tiny), -f32::MIN_POSITIVE);
+        assert_eq!(f64_to_f32_up(-tiny).to_bits(), 0x8000_0000);
+    }
+
+    #[test]
+    fn metadata_ordering_does_not_treat_negative_subnormal_as_zero() {
+        let negative_tiny = f32::from_bits(0x8000_0001);
+        assert_eq!(max_f32_by_exact_lift(negative_tiny, 0.0).to_bits(), 0);
+        assert!(
+            f32_to_f64_exact(negative_tiny) < f32_to_f64_exact(0.0),
+            "definite-winner comparisons must preserve this ordering under DAZ"
+        );
     }
 }

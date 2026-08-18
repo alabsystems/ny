@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::{AttributeValue, CompoundNodePolicy, DataType, TensorSpec, WeightStore};
+use crate::{
+    AttributeValue, CompoundNodePolicy, DataType, TensorSpec, WeightStore,
+    EXPAND_LIVE_SHAPE_REFERENCE_ATTR,
+};
 use ndarray::{arr1, ArrayD, IxDyn};
 use ny_core::LayerType;
 use ny_propagate::GraphNetwork;
@@ -228,6 +231,90 @@ fn decompose_layernorm_policy_skips_missing_affine_layernorm_4172() {
     );
 }
 
+#[test]
+fn decompose_instance_norm_rank4_broadcasts_affines_by_channel() {
+    let layers = vec![LayerSpec {
+        name: "instancenorm".to_string(),
+        layer_type: LayerType::InstanceNorm,
+        inputs: vec!["input".to_string(), "scale".to_string(), "bias".to_string()],
+        outputs: vec!["out".to_string()],
+        weights: None,
+        attributes: HashMap::new(),
+    }];
+    let inputs = vec![tensor_spec("input", &[1, 2, 3, 2])];
+    let outputs = vec![tensor_spec("out", &[1, 2, 3, 2])];
+    let mut weights = WeightStore::new();
+    weights.insert("scale".to_string(), arr1(&[2.0, 3.0]).into_dyn());
+    weights.insert("bias".to_string(), arr1(&[10.0, -10.0]).into_dyn());
+    let tensor_shapes = HashMap::from([
+        ("input".to_string(), vec![1, 2, 3, 2]),
+        ("out".to_string(), vec![1, 2, 3, 2]),
+        ("scale".to_string(), vec![2]),
+        ("bias".to_string(), vec![2]),
+    ]);
+    let tensor_producer = HashMap::new();
+    let constant_tensors = HashSet::new();
+    let data = GraphBuildInputs {
+        layers: &layers,
+        inputs: &inputs,
+        outputs: &outputs,
+        weights: &weights,
+        tensor_producer: &tensor_producer,
+        constant_tensors: &constant_tensors,
+        tensor_shapes: &tensor_shapes,
+    };
+    let graph = build_graph_network(
+        &data,
+        GraphNetworkOptions {
+            compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
+            ..GraphNetworkOptions::default()
+        },
+    )
+    .expect("rank-4 InstanceNormalization should decompose");
+
+    let values = vec![
+        1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0,
+    ];
+    let point = ArrayD::from_shape_vec(IxDyn(&[2, 3, 2]), values.clone()).unwrap();
+    let output = graph
+        .propagate_ibp(&BoundedTensor::new(point.clone(), point).unwrap())
+        .expect("decomposed rank-4 InstanceNormalization IBP should succeed");
+    assert_eq!(output.shape(), &[2, 3, 2]);
+
+    let eps = 1e-5_f32 as f64;
+    for channel in 0..2 {
+        let start = channel * 6;
+        let channel_values = &values[start..start + 6];
+        let mean = channel_values
+            .iter()
+            .map(|&value| value as f64)
+            .sum::<f64>()
+            / 6.0;
+        let variance = channel_values
+            .iter()
+            .map(|&value| {
+                let centered = value as f64 - mean;
+                centered * centered
+            })
+            .sum::<f64>()
+            / 6.0;
+        let scale = [2.0_f64, 3.0][channel];
+        let bias = [10.0_f64, -10.0][channel];
+        for spatial in 0..6 {
+            let h = spatial / 2;
+            let w = spatial % 2;
+            let expected =
+                scale * (channel_values[spatial] as f64 - mean) / (variance + eps).sqrt() + bias;
+            let lower = output.lower()[[channel, h, w]] as f64;
+            let upper = output.upper()[[channel, h, w]] as f64;
+            assert!(
+                lower <= expected && expected <= upper,
+                "channel {channel}, ({h},{w}): expected {expected} outside [{lower}, {upper}]"
+            );
+        }
+    }
+}
+
 /// #2685: Unresolvable tensor references must produce an error, not silently
 /// fall back to the _input node.
 #[test]
@@ -395,7 +482,7 @@ fn test_scatter_nd_with_constant_data_uses_graph_inputs_for_indices_and_updates(
 }
 
 #[test]
-fn test_expand_like_last_axis_keeps_shape_path_reference_input() {
+fn dynamic_expand_rejects_unauthenticated_first_producer_shape_trace() {
     let weights = WeightStore::new();
     let layers = vec![
         layer_spec("summary", LayerType::ReLU, &["input"], &["summary_out"]),
@@ -425,7 +512,10 @@ fn test_expand_like_last_axis_keeps_shape_path_reference_input() {
         "shape_gather_out".to_string(),
         "shape_cast_out".to_string(),
     ]);
-    let tensor_shapes = HashMap::new();
+    let tensor_shapes = HashMap::from([
+        ("summary_out".to_string(), vec![1, 1]),
+        ("reference_out".to_string(), vec![1, 4]),
+    ]);
 
     let data = GraphBuildInputs {
         layers: &layers,
@@ -437,39 +527,57 @@ fn test_expand_like_last_axis_keeps_shape_path_reference_input() {
         tensor_shapes: &tensor_shapes,
     };
 
-    let graph = build_graph_network(&data, GraphNetworkOptions::default()).unwrap();
-    let expand = graph.node("expand").expect("expand node should exist");
-    assert_eq!(
-        expand.inputs(),
-        &["summary".to_string(), "reference".to_string()],
-        "ExpandLikeLastAxis should trace its shape input back to the live reference tensor"
+    let error = build_graph_network(&data, GraphNetworkOptions::default())
+        .expect_err("a generic first-producer chain must not authenticate Expand target values");
+    assert!(
+        error
+            .to_string()
+            .contains("lacks an authenticated full Shape(reference) source"),
+        "unexpected error: {error}"
     );
 }
 
 #[test]
-fn test_expand_like_last_axis_keeps_pre_evaluated_shape_reference_input() {
+fn authenticated_dynamic_expand_uses_exact_live_reference_input() {
     let weights = WeightStore::new();
     let layers = vec![
-        layer_spec("summary", LayerType::ReLU, &["input"], &["summary_out"]),
+        LayerSpec {
+            name: "summary".to_string(),
+            layer_type: LayerType::ReduceMean,
+            inputs: vec!["input".to_string()],
+            outputs: vec!["summary_out".to_string()],
+            weights: None,
+            attributes: HashMap::from([
+                ("axes".to_string(), AttributeValue::Ints(vec![1])),
+                ("keepdims".to_string(), AttributeValue::Int(1)),
+            ]),
+        },
         layer_spec("reference", LayerType::ReLU, &["input"], &["reference_out"]),
-        layer_spec(
-            "shape_of_reference",
-            LayerType::Shape,
-            &["reference_out"],
-            &["shape_out"],
-        ),
-        layer_spec(
-            "expand",
-            LayerType::Expand,
-            &["summary_out", "shape_out"],
-            &["expanded_out"],
-        ),
+        LayerSpec {
+            name: "expand".to_string(),
+            layer_type: LayerType::Expand,
+            inputs: vec!["summary_out".to_string(), "reference_out".to_string()],
+            outputs: vec!["expanded_out".to_string()],
+            weights: None,
+            attributes: HashMap::from([(
+                EXPAND_LIVE_SHAPE_REFERENCE_ATTR.to_string(),
+                AttributeValue::String("reference_out".to_string()),
+            )]),
+        },
     ];
     let inputs = vec![tensor_spec("input", &[1, 4])];
     let outputs = vec![tensor_spec("expanded_out", &[1, 4])];
-    let tensor_producer = HashMap::from([("shape_out".to_string(), "reference_out".to_string())]);
-    let constant_tensors = HashSet::from(["shape_out".to_string()]);
-    let tensor_shapes = HashMap::from([("reference_out".to_string(), vec![1, 4])]);
+    let tensor_producer = HashMap::from([
+        ("summary_out".to_string(), "input".to_string()),
+        ("reference_out".to_string(), "input".to_string()),
+    ]);
+    let constant_tensors = HashSet::new();
+    let tensor_shapes = HashMap::from([
+        ("input".to_string(), vec![1, 4]),
+        ("summary_out".to_string(), vec![1, 1]),
+        ("reference_out".to_string(), vec![1, 4]),
+        ("expanded_out".to_string(), vec![1, 4]),
+    ]);
 
     let data = GraphBuildInputs {
         layers: &layers,
@@ -485,13 +593,22 @@ fn test_expand_like_last_axis_keeps_pre_evaluated_shape_reference_input() {
     let expand = graph.node("expand").expect("expand node should exist");
     assert!(
         matches!(expand.layer(), Layer::ExpandLikeLastAxis(_)),
-        "pre-evaluated Shape(reference) Expand should keep runtime ExpandLikeLastAxis"
+        "authenticated Shape(reference) Expand should use runtime ExpandLikeLastAxis"
     );
     assert_eq!(
         expand.inputs(),
         &["summary".to_string(), "reference".to_string()],
-        "pre-evaluated Shape(reference) should still resolve to the live reference tensor"
+        "the authenticated normalized reference should route directly to its live node"
     );
+
+    let input = BoundedTensor::new(
+        arr1(&[1.0, 2.0, 3.0, 4.0]).into_dyn(),
+        arr1(&[1.0, 2.0, 3.0, 4.0]).into_dyn(),
+    )
+    .unwrap();
+    let output = graph.propagate_ibp(&input).unwrap();
+    assert!(output.lower().iter().all(|&value| value <= 2.5));
+    assert!(output.upper().iter().all(|&value| value >= 2.5));
 }
 
 fn build_split_graph_with_constant_sizes() -> GraphNetwork {

@@ -18,6 +18,7 @@
 //! Source: alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) auto_LiRPA/auto_LiRPA/operators/
 
 use crate::layers::attention::{AttentionMask, SelfAttentionLayer};
+use crate::types::BoundsProvenance;
 use crate::{GraphNetwork, GraphNode, Layer, ReLULayer};
 use ndarray::{Array2, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
@@ -385,13 +386,6 @@ proptest! {
 //   QK -> Softmax
 //   Softmax, V -> BilinearCrown (probs @ V)
 //
-// Note: `propagate_crown_batched` currently falls back to IBP for attention
-// graphs due to a ShapeMismatch in BilinearCrown batched backward (the Q@K^T
-// intermediate has shape [seq, seq] but batched CROWN expects the flattened
-// input dimension). These tests gracefully handle the fallback: if CROWN fails,
-// they verify the IBP result is sound. When BilinearCrown batched CROWN shape
-// handling is extended, these tests will automatically verify CROWN bounds.
-//
 // Since the graph routes a single input to all three attention inputs through
 // ReLU passthrough, Q=K=V=input for positive inputs. This is a valid soundness
 // test: for any concrete input x within bounds, attention(x, x, x) must lie
@@ -418,6 +412,25 @@ fn build_attention_graph(mask: AttentionMask, scale: f32) -> GraphNetwork {
     graph.try_add_node(attn_node).expect("decompose attention");
     graph.set_output("attn");
     graph
+}
+
+/// Run the advertised CROWN path and reject both errors and successful-looking
+/// forward substitutions. Plain `propagate_crown_batched` discards provenance,
+/// which previously let these CROWN properties pass on IBP bounds.
+fn crown_without_fallback(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+) -> Result<BoundedTensor, TestCaseError> {
+    let result = graph
+        .propagate_crown_batched_with_provenance(input)
+        .map_err(|e| TestCaseError::fail(format!("decomposed attention CROWN failed: {e}")))?;
+    if result.provenance != BoundsProvenance::Crown {
+        return Err(TestCaseError::fail(format!(
+            "decomposed attention used non-CROWN provenance: {:?}",
+            result.provenance
+        )));
+    }
+    Ok(result.bounds)
 }
 
 /// Generate a pair (lower, upper) vecs of length `n` with positive values only.
@@ -464,17 +477,7 @@ proptest! {
 
         let input = bounded_nd(&[2, 2], in_lo.clone(), in_hi.clone());
 
-        let crown_result = graph.propagate_crown_batched(&input);
-        let result = match crown_result {
-            Ok(output) => output,
-            Err(_) => {
-                // CROWN may fall back to IBP for some configurations.
-                // If CROWN fails, verify IBP is still sound.
-                let ibp_result = graph.propagate_ibp(&input)
-                    .map_err(|e| TestCaseError::fail(format!("Both CROWN and IBP failed: {e}")))?;
-                ibp_result
-            }
-        };
+        let result = crown_without_fallback(&graph, &input)?;
 
         prop_assert_eq!(result.shape(), &[2, 2], "Output shape mismatch");
 
@@ -559,15 +562,7 @@ proptest! {
 
         let input = bounded_nd(&[2, 2], in_lo.clone(), in_hi.clone());
 
-        let crown_result = graph.propagate_crown_batched(&input);
-        let result = match crown_result {
-            Ok(output) => output,
-            Err(_) => {
-                let ibp_result = graph.propagate_ibp(&input)
-                    .map_err(|e| TestCaseError::fail(format!("Both CROWN and IBP failed: {e}")))?;
-                ibp_result
-            }
-        };
+        let result = crown_without_fallback(&graph, &input)?;
 
         prop_assert_eq!(result.shape(), &[2, 2], "Output shape mismatch");
 
@@ -635,11 +630,14 @@ proptest! {
     // CROWN vs IBP comparison: decomposed attention
     // ========================================================================
 
-    /// CROWN bounds through decomposed attention should be at least as tight
-    /// as IBP bounds (or equal when CROWN falls back to IBP).
+    /// CROWN and IBP bounds through decomposed attention are both sound.
+    ///
+    /// Bilinear McCormick CROWN is not pointwise guaranteed tighter than IBP,
+    /// so this property compares both independent enclosures against the same
+    /// concrete oracle while requiring genuine CROWN provenance.
     #[ntest::timeout(60000)]
     #[test]
-    fn soundness_self_attention_decomposed_crown_tighter_than_ibp(
+    fn soundness_self_attention_decomposed_crown_and_ibp(
         (in_lo, in_hi) in valid_positive_interval_vec(4, 0.1, 2.0),
     ) {
         let scale = 1.0 / 2.0_f32.sqrt();
@@ -650,41 +648,7 @@ proptest! {
         let ibp_result = graph.propagate_ibp(&input)
             .map_err(|e| TestCaseError::fail(format!("IBP failed: {e}")))?;
 
-        let crown_result = graph.propagate_crown_batched(&input);
-        let crown_output = match crown_result {
-            Ok(output) => output,
-            Err(_) => {
-                // CROWN not yet supported for attention graphs — verify IBP
-                // soundness so this test is not vacuous. When CROWN support
-                // lands, this branch will stop being taken and the tightness
-                // comparison below will run.
-                let to_mat = |vals: &[f32]| -> Array2<f32> {
-                    Array2::from_shape_vec((2, 2), vals.to_vec()).unwrap()
-                };
-                let in_lo_v: Vec<f32> = input.lower().iter().copied().collect();
-                let in_hi_v: Vec<f32> = input.upper().iter().copied().collect();
-                let mid: Vec<f32> = in_lo_v.iter().zip(in_hi_v.iter())
-                    .map(|(&l, &u)| f32::midpoint(l, u)).collect();
-                for vals in [&in_lo_v, &in_hi_v, &mid] {
-                    let mat = to_mat(vals);
-                    let true_out = eval_standard_attention(&mat, &mat, &mat, scale);
-                    for i in 0..2_usize {
-                        for j in 0..2_usize {
-                            let lo = ibp_result.lower()[[i, j]];
-                            let hi = ibp_result.upper()[[i, j]];
-                            let tv = true_out[[i, j]];
-                            let tol = FP_TOLERANCE * tv.abs().max(lo.abs()).max(hi.abs()).max(1.0);
-                            prop_assert!(
-                                lo - tol <= tv && tv <= hi + tol,
-                                "IBP fallback unsound at [{i},{j}]: \
-                                 lo={lo}, true={tv}, hi={hi} (tol={tol})"
-                            );
-                        }
-                    }
-                }
-                return Ok(());
-            }
-        };
+        let crown_output = crown_without_fallback(&graph, &input)?;
 
         // Verify CROWN bounds are sound (contain true output at corners/midpoint).
         // McCormick-based bilinear CROWN may produce bounds wider than IBP for some
@@ -710,20 +674,22 @@ proptest! {
             let true_out = eval_standard_attention(&mat, &mat, &mat, scale);
             for i in 0..2_usize {
                 for j in 0..2_usize {
-                    let crown_lo = crown_output.lower()[[i, j]];
-                    let crown_hi = crown_output.upper()[[i, j]];
                     let tv = true_out[[i, j]];
-                    let tol = FP_TOLERANCE * tv.abs().max(crown_lo.abs()).max(crown_hi.abs()).max(1.0);
-                    prop_assert!(
-                        crown_lo - tol <= tv,
-                        "CROWN lower unsound at [{i},{j}] ({label}): \
-                         lo={crown_lo} > true={tv} (tol={tol})"
-                    );
-                    prop_assert!(
-                        tv <= crown_hi + tol,
-                        "CROWN upper unsound at [{i},{j}] ({label}): \
-                         true={tv} > hi={crown_hi} (tol={tol})"
-                    );
+                    for (method, bounds) in [("CROWN", &crown_output), ("IBP", &ibp_result)] {
+                        let lo = bounds.lower()[[i, j]];
+                        let hi = bounds.upper()[[i, j]];
+                        let tol = FP_TOLERANCE * tv.abs().max(lo.abs()).max(hi.abs()).max(1.0);
+                        prop_assert!(
+                            lo - tol <= tv,
+                            "{method} lower unsound at [{i},{j}] ({label}): \
+                             lo={lo} > true={tv} (tol={tol})"
+                        );
+                        prop_assert!(
+                            tv <= hi + tol,
+                            "{method} upper unsound at [{i},{j}] ({label}): \
+                             true={tv} > hi={hi} (tol={tol})"
+                        );
+                    }
                 }
             }
             Ok(())
@@ -754,17 +720,7 @@ proptest! {
 
         let input = bounded_nd(&[2, 2], vals.clone(), vals.clone());
 
-        let crown_result = graph.propagate_crown_batched(&input);
-        let result = match crown_result {
-            Ok(output) => output,
-            Err(_) => {
-                // CROWN not yet supported for attention graphs — fall back to
-                // IBP so this test is not vacuous. Concrete IBP should still
-                // produce tight bounds.
-                graph.propagate_ibp(&input)
-                    .map_err(|e| TestCaseError::fail(format!("Both CROWN and IBP failed: {e}")))?
-            }
-        };
+        let result = crown_without_fallback(&graph, &input)?;
 
         let mat = Array2::from_shape_vec((2, 2), vals).unwrap();
         let true_out = eval_standard_attention(&mat, &mat, &mat, scale);

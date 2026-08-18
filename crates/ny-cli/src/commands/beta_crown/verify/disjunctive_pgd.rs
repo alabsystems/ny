@@ -21,6 +21,7 @@ use ny_tensor::BoundedTensor;
 use std::time::{Duration, Instant};
 
 use super::attack_budget::direct_disjunctive_classification_budget;
+use super::attack_stall::AttackStallPolicy;
 use super::BetaCrownModel;
 pub(in crate::commands::beta_crown::verify) use config::beta_crown_pgd_config;
 use rng::SimpleRng;
@@ -205,20 +206,71 @@ fn point_in_clause_box(
     })
 }
 
+/// ATTACK-box membership (#witness-box-audit, defense in depth). Every
+/// candidate the attack lanes hand up was produced by box-projected ascent
+/// inside `input`, so a conforming candidate passes this check EXACTLY (the
+/// projection clamps to these very f32 bounds). A failure therefore means the
+/// candidate came from the WRONG BUFFER — a pre-projection iterate, a foreign
+/// instance's point, or a shape mixup. Exact shape matters: equal-length tensors
+/// with different ranks can have different model semantics even though witness
+/// serialization later flattens both.
+///
+/// `input` is the deliberately outward-rounded f32 ATTACK box, not the exact
+/// organizer VNN-LIB box. The standalone JSON publication seam separately
+/// checks the exact decimal that it emits; the in-process VNN-COMP path keeps
+/// the candidate available for its trusted-ORT/pinned-input refinement gate.
+/// Zero tolerance is the sound direction (refuse => no sat). Non-finite values,
+/// shape mismatches, and bound violations all refuse.
+pub(super) fn candidate_in_attack_box(point: &ArrayD<f32>, input: &BoundedTensor) -> bool {
+    let lower = input.lower();
+    let upper = input.upper();
+    point.shape() == input.shape()
+        && point
+            .iter()
+            .zip(lower.iter().zip(upper.iter()))
+            .all(|(&v, (&lo, &hi))| v.is_finite() && v >= lo && v <= hi)
+}
+
+/// Whole-vector finite-output gate shared by both disjunctive confirmation
+/// funnels. A clause may ignore some outputs, but witness serialization emits
+/// every Y assignment; one unused NaN/Inf still invalidates the witness.
+pub(super) fn candidate_output_is_finite(output: &ArrayD<f32>) -> bool {
+    output.iter().all(|value| value.is_finite())
+}
+
 /// Independent re-evaluation: run the model fresh on the counterexample and
 /// re-check constraints with an epsilon margin guard, requiring the witness to lie
-/// in a satisfied clause's per-clause input box. Rejects borderline counterexamples
-/// (f32 accumulation-order sign flips) and input-box-mismatched false CEs (#4375,
-/// nn4sys per-clause-box fix). Wrong answers carry a VNN-COMP penalty; timeouts do
-/// not — so rejecting borderline/mismatched SAT claims is the safe choice.
+/// inside the GLOBAL attack box AND in a satisfied clause's per-clause input box.
+/// Rejects borderline counterexamples (f32 accumulation-order sign flips),
+/// input-box-mismatched false CEs (#4375, nn4sys per-clause-box fix), and
+/// wrong-buffer candidates whose input never went through this attack's box
+/// projection (#witness-box-audit). Wrong answers carry a VNN-COMP penalty;
+/// timeouts do not — so rejecting borderline/mismatched SAT claims is the safe
+/// choice. The confirmed tensor is returned BIT-IDENTICAL to the candidate: the
+/// stored witness is exactly the vector this check validated.
 fn re_evaluate_and_confirm(
     model_net: &BetaCrownModel,
     counterexample: &ArrayD<f32>,
     clauses: &[Vec<OutputConstraint>],
     per_clause_input_bounds: &[std::collections::BTreeMap<usize, (f64, f64)>],
+    input: &BoundedTensor,
     gemm_engine: Option<&dyn GemmEngine>,
 ) -> Result<Option<(ArrayD<f32>, ArrayD<f32>)>> {
+    if !candidate_in_attack_box(counterexample, input) {
+        tracing::warn!(
+            "Disjunctive attack candidate rejected: input lies outside the global attack \
+             box (wrong-buffer guard, #witness-box-audit); refusing to store it as a witness"
+        );
+        return Ok(None);
+    }
     let output = evaluate_model(model_net, counterexample, gemm_engine)?;
+    if !candidate_output_is_finite(&output) {
+        tracing::warn!(
+            "Disjunctive attack candidate rejected: fresh model output contains a non-finite \
+             value; refusing to store an organizer-invalid witness"
+        );
+        return Ok(None);
+    }
     // Reject borderline counterexamples: require margin >= epsilon on ALL
     // constraints in at least one clause AND the witness to lie in that clause's
     // per-clause input box (so a stripped output band is paired with its own input
@@ -263,6 +315,13 @@ pub(super) struct DisjunctiveAttackFeedback {
     pub best_margin: Option<f32>,
     /// True when an attack lane stopped on its phase deadline (budget-bound).
     pub hit_deadline: bool,
+    /// True when the adaptive stall cutoff (#attack-stall) ended an attack lane
+    /// because its margin stopped improving. Never set together with
+    /// `hit_deadline` by the same stop, and never an input to a verdict: the
+    /// only consumers are the attack-extension gate (which DECLINES on it —
+    /// extending an ascent already judged flat would undo the reclaim) and the
+    /// flight note.
+    pub stalled_out: bool,
     /// Extension-fire diagnostics: restarts started / PGD steps taken.
     pub restarts_started: usize,
     pub steps_taken: usize,
@@ -277,6 +336,7 @@ impl DisjunctiveAttackFeedback {
             );
         }
         self.hit_deadline |= outcome.hit_deadline;
+        self.stalled_out |= outcome.stalled_out;
         self.restarts_started += outcome.restarts_started;
         self.steps_taken += outcome.steps_taken;
     }
@@ -412,10 +472,16 @@ pub(super) fn try_disjunctive_sampling_attack(
         ),
         gemm_engine,
         json,
+        AttackStallPolicy::disabled(),
         None,
     )
 }
 
+/// `stall` (#attack-stall) is the adaptive attack-cutoff policy for this phase.
+/// [`AttackStallPolicy::disabled`] — the default, and what every caller outside
+/// the global disjunctive PGD phase passes — keeps the historical behavior
+/// exactly. It can only stop candidate GENERATION early; confirmation and every
+/// verdict path are untouched.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_disjunctive_sampling_attack_with_config(
     model_net: &BetaCrownModel,
@@ -425,6 +491,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
     pgd_config: PgdConfig,
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
+    stall: AttackStallPolicy,
     mut feedback: Option<&mut DisjunctiveAttackFeedback>,
 ) -> Result<Option<BetaCrownResult>> {
     if clauses.is_empty() {
@@ -455,6 +522,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                         &pgd_config,
                         gemm_engine,
                         json,
+                        stall,
                     )?;
                     if let Some(fb) = feedback.as_deref_mut() {
                         fb.absorb(&outcome);
@@ -465,6 +533,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                             &candidate,
                             clauses,
                             per_clause_input_bounds,
+                            input,
                             gemm_engine,
                         )? {
                             if !json {
@@ -474,6 +543,15 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                             }
                             return Ok(Some(make_violated_result(cx, out)));
                         }
+                    }
+                    if outcome.stalled_out {
+                        // #attack-stall: the cut ends the whole attack PHASE,
+                        // not just this lane. The classification/SPSA/sampling
+                        // fallbacks below are deadline-bound, so letting them
+                        // run would spend exactly the slice the cut reclaimed
+                        // and the cutoff would be a no-op. Same return as
+                        // "attack found nothing": no verdict is implied.
+                        return Ok(None);
                     }
                 }
                 // Outside the exact-gradient fragment: skip (no SPSA duplication);
@@ -521,6 +599,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
             &pgd_config,
             gemm_engine,
             json,
+            stall,
         )?;
         if let Some(fb) = feedback {
             fb.absorb(&outcome);
@@ -531,6 +610,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                 &candidate,
                 clauses,
                 per_clause_input_bounds,
+                input,
                 gemm_engine,
             )? {
                 if !json {
@@ -540,6 +620,15 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                 }
                 return Ok(Some(make_violated_result(cx, out)));
             }
+        }
+        if outcome.stalled_out {
+            // #attack-stall: end the attack PHASE here. The random-sampling +
+            // SPSA fallback below runs to the same deadline, so without this
+            // return the cut would reclaim nothing — and on a conv net at small
+            // eps that fallback is the lane the gradient attack replaced
+            // precisely because it finds nothing. Returning `None` is the same
+            // "no counterexample" the caller sees from a finished attack.
+            return Ok(None);
         }
     }
 
@@ -595,6 +684,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                 &x,
                 clauses,
                 per_clause_input_bounds,
+                input,
                 gemm_engine,
             )? {
                 if !json {
@@ -647,6 +737,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                 &x,
                 clauses,
                 per_clause_input_bounds,
+                input,
                 gemm_engine,
             )? {
                 if !json {
@@ -705,6 +796,7 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
                     &x,
                     clauses,
                     per_clause_input_bounds,
+                    input,
                     gemm_engine,
                 )? {
                     if !json {
@@ -723,4 +815,133 @@ pub(super) fn try_disjunctive_sampling_attack_with_config(
         println!("  Disjunctive attack: no counterexample found.");
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{arr1, arr2, Array1, Array2};
+    use ny_propagate::{layers::LinearLayer, Layer, Network};
+
+    /// 1-input -> 2-output net: y0 = x0, y1 = x0 + 1. The disjunct
+    /// `Y_1 >= Y_0` holds EVERYWHERE with margin 1.0 (far above the
+    /// noise-scaled epsilon), so confirmation depends only on the input-box
+    /// membership gates under test.
+    fn always_violating_model() -> BetaCrownModel {
+        let weight = Array2::from_shape_vec((2, 1), vec![1.0f32, 1.0]).unwrap();
+        let bias = Array1::from_vec(vec![0.0f32, 1.0]);
+        let mut network = Network::new();
+        network.add_layer(Layer::Linear(LinearLayer::new(weight, Some(bias)).unwrap()));
+        BetaCrownModel::Sequential(Box::new(network))
+    }
+
+    fn unit_box() -> BoundedTensor {
+        BoundedTensor::new(arr1(&[0.0f32]).into_dyn(), arr1(&[1.0f32]).into_dyn()).unwrap()
+    }
+
+    fn ge_clauses() -> Vec<Vec<OutputConstraint>> {
+        vec![vec![OutputConstraint::GreaterEq(1, 0)]]
+    }
+
+    /// #witness-box-audit: an out-of-box candidate is REFUSED even though its
+    /// OUTPUT satisfies the disjunction — the wrong-buffer guard. Without the
+    /// global-box gate this candidate confirms (the output condition of an
+    /// adversarial disjunction is satisfiable almost anywhere in input space),
+    /// and the stored witness would be an input the organizer's box asserts
+    /// reject.
+    #[test]
+    fn out_of_box_candidate_is_refused_despite_violating_output() {
+        let model = always_violating_model();
+        let out_of_box = arr1(&[5.0f32]).into_dyn();
+        let confirmed =
+            re_evaluate_and_confirm(&model, &out_of_box, &ge_clauses(), &[], &unit_box(), None)
+                .expect("evaluation runs");
+        assert!(
+            confirmed.is_none(),
+            "an input outside the attack box must never be stored as a witness"
+        );
+    }
+
+    /// The confirmed witness is the EXACT vector the check validated —
+    /// bit-identical to the candidate — and an in-box candidate still
+    /// confirms (the guard cannot eat genuine counterexamples: projected
+    /// ascent points satisfy the box check exactly).
+    #[test]
+    fn in_box_candidate_confirms_and_is_stored_bit_identical() {
+        let model = always_violating_model();
+        let candidate = arr1(&[0.25f32]).into_dyn();
+        let (cx, out) =
+            re_evaluate_and_confirm(&model, &candidate, &ge_clauses(), &[], &unit_box(), None)
+                .expect("evaluation runs")
+                .expect("in-box violating candidate must confirm");
+        assert_eq!(
+            cx.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            candidate.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "stored witness must be bit-identical to the validated candidate"
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn candidate_output_finite_gate_edges() {
+        assert!(candidate_output_is_finite(
+            &arr1(&[0.0_f32, 1.0]).into_dyn()
+        ));
+        assert!(!candidate_output_is_finite(
+            &arr1(&[0.0_f32, 1.0, f32::NAN]).into_dyn()
+        ));
+        assert!(!candidate_output_is_finite(
+            &arr1(&[0.0_f32, f32::INFINITY]).into_dyn()
+        ));
+        assert!(!candidate_output_is_finite(
+            &arr1(&[f32::NEG_INFINITY, 1.0]).into_dyn()
+        ));
+    }
+
+    /// Box-face candidates (the projection clamps EXACTLY to the f32 bounds)
+    /// pass the zero-tolerance guard; NaN and arity mismatches refuse.
+    #[test]
+    fn global_box_guard_edges() {
+        let boxx = unit_box();
+        assert!(candidate_in_attack_box(&arr1(&[0.0f32]).into_dyn(), &boxx));
+        assert!(candidate_in_attack_box(&arr1(&[1.0f32]).into_dyn(), &boxx));
+        assert!(!candidate_in_attack_box(
+            &arr1(&[1.0000001f32]).into_dyn(),
+            &boxx
+        ));
+        assert!(!candidate_in_attack_box(
+            &arr1(&[f32::NAN]).into_dyn(),
+            &boxx
+        ));
+        assert!(!candidate_in_attack_box(
+            &arr1(&[f32::INFINITY]).into_dyn(),
+            &boxx
+        ));
+        assert!(!candidate_in_attack_box(
+            &arr1(&[f32::NEG_INFINITY]).into_dyn(),
+            &boxx
+        ));
+        assert!(!candidate_in_attack_box(
+            &arr1(&[0.5f32, 0.5]).into_dyn(),
+            &boxx
+        ));
+        // Equal-length wrong-rank buffers are refused before evaluation.
+        let flat2 = BoundedTensor::new(
+            arr2(&[[0.0f32, 0.0]]).into_dyn(),
+            arr2(&[[1.0f32, 1.0]]).into_dyn(),
+        )
+        .unwrap();
+        assert!(!candidate_in_attack_box(
+            &arr1(&[0.3f32, 0.9]).into_dyn(),
+            &flat2
+        ));
+        assert!(candidate_in_attack_box(
+            &arr2(&[[0.3f32, 0.9]]).into_dyn(),
+            &flat2
+        ));
+        assert!(!candidate_in_attack_box(
+            &arr2(&[[0.3f32, 1.1]]).into_dyn(),
+            &flat2
+        ));
+    }
 }

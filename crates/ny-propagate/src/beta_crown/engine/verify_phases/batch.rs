@@ -221,7 +221,7 @@ impl BetaCrownVerifier {
                     verified_in_batch,
                     batch_domain_count: 0,
                     violation: Some(BetaCrownResult {
-                        result: BabVerificationStatus::PotentialViolation,
+                        result: BabVerificationStatus::potential_violation(),
                         domains_explored: state.domains_explored,
                         time_elapsed: start_time.elapsed(),
                         max_depth_reached: state.max_depth,

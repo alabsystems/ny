@@ -451,102 +451,24 @@ fn test_batchnorm_crown_negative_scale() {
     }
 }
 
-/// Regression: a BatchNorm channel with var + eps == 0 yields an Inf scale
-/// (`ny / sqrt(0) = inf`). The CROWN backward then composes that Inf scale with
-/// the spec/identity coefficient matrix. Before the fix, a zero coefficient
-/// times the Inf scale produced `0 * inf = NaN`, which poisoned the linear
-/// bounds and aborted intermediate-bound construction at `BoundedTensor::new`
-/// (NaN/Inf rejection) — the failure that scored cifar100_2024 at 0 in graph
-/// beta-CROWN.
-///
-/// After the fix, the BatchNorm CROWN backward uses `safe_mul_for_bounds`
-/// (0 * inf = 0): the zero-coefficient term composes to exactly 0, and any
-/// genuine Inf coefficient (nonzero coeff * inf scale) is widened to ±inf by
-/// concretize's CROWN_COEFF_MAX/Inf short-circuit. Propagation must therefore
-/// (a) not panic, (b) never emit NaN, and (c) produce sound bounds
-/// (lower <= upper, with any non-finiteness being a conservative ±inf widening
-/// rather than a finite-but-wrong value).
+/// A zero BatchNorm denominator has no finite exact-real affine
+/// representation. Refuse it at construction instead of relying on later
+/// `0 * inf` special cases, which cannot make nonzero coefficient paths sound.
 #[ntest::timeout(10000)]
 #[test]
-fn test_batchnorm_zero_variance_inf_scale_no_nan_abort_4xxx() {
-    // var = -eps so var + eps == 0 -> sqrt = 0 -> scale = ny / 0 = +inf for ch 0.
-    // The other channels have well-behaved variance.
+fn test_batchnorm_zero_variance_is_rejected_before_propagation_4xxx() {
     let eps = 1e-5_f32;
     let ny = arr1(&[1.0_f32, 1.0, 1.0]).into_dyn();
     let beta = arr1(&[0.0_f32, 0.5, -0.5]).into_dyn();
     let mean = arr1(&[0.0_f32, 0.0, 0.0]).into_dyn();
     let var = arr1(&[-eps, 1.0, 2.0]).into_dyn();
 
-    let bn = BatchNormLayer::new(&ny, &beta, &mean, &var, eps)
-        .expect("BatchNorm::new should construct (guard only rejects var+eps < 0)");
-    // Confirm we actually exercise the degenerate-Inf-scale path.
+    let error = BatchNormLayer::new(&ny, &beta, &mean, &var, eps)
+        .expect_err("variance + epsilon == 0 must fail closed");
     assert!(
-        !bn.scale[[0]].is_finite(),
-        "expected channel-0 scale to be non-finite (inf), got {}",
-        bn.scale[[0]]
+        error
+            .to_string()
+            .contains("variance + epsilon must be finite and strictly positive"),
+        "unexpected error: {error}"
     );
-
-    let mut graph = GraphNetwork::new();
-    graph.add_node(GraphNode::from_input("bn", Layer::BatchNorm(bn)));
-    // ReLU after BatchNorm (CNN-style Conv/BN/ReLU pattern).
-    graph.add_node(GraphNode::new(
-        "relu",
-        Layer::ReLU(ReLULayer),
-        vec!["bn".to_string()],
-    ));
-    // Flatten (C=3, H=2, W=2) -> 12 then Linear to a single output.
-    let reshape = ReshapeLayer::new(vec![12]);
-    graph.add_node(GraphNode::new(
-        "flatten",
-        Layer::Reshape(reshape),
-        vec!["relu".to_string()],
-    ));
-    let w = Array2::ones((1, 12));
-    let linear = LinearLayer::new(w, None).unwrap();
-    graph.add_node(GraphNode::new(
-        "linear",
-        Layer::Linear(linear),
-        vec!["flatten".to_string()],
-    ));
-    graph.set_output("linear");
-
-    // 4D NCHW input (N=1, C=3, H=2, W=2), values in [-1, 1].
-    let lower = ArrayD::from_shape_vec(IxDyn(&[1, 3, 2, 2]), vec![-1.0; 12]).unwrap();
-    let upper = ArrayD::from_shape_vec(IxDyn(&[1, 3, 2, 2]), vec![1.0; 12]).unwrap();
-    let input = BoundedTensor::new(lower, upper).unwrap();
-
-    // Sanity check that the helper assertions below see a meaningful output.
-    let check_sound = |label: &str, out: &BoundedTensor| {
-        for (l, u) in out.lower().iter().zip(out.upper().iter()) {
-            // No NaN is ever sound. A non-finite (+/-inf) endpoint is the sound
-            // conservative widening we expect from the degenerate channel.
-            assert!(
-                !l.is_nan(),
-                "{label}: lower bound is NaN (unsound abort cause)"
-            );
-            assert!(
-                !u.is_nan(),
-                "{label}: upper bound is NaN (unsound abort cause)"
-            );
-            assert!(l <= u, "{label}: inverted bound lower {l} > upper {u}");
-        }
-    };
-
-    // Scalar CROWN backward path (crown_scalar.rs).
-    let crown = graph
-        .propagate_crown(&input)
-        .expect("graph CROWN must not abort on Inf-scale BatchNorm");
-    check_sound("scalar-CROWN", &crown);
-
-    // Batched CROWN backward path (crown_batched.rs) — the graph beta-CROWN lane.
-    let crown_batched = graph
-        .propagate_crown_batched(&input)
-        .expect("graph batched CROWN must not abort on Inf-scale BatchNorm");
-    check_sound("batched-CROWN", &crown_batched);
-
-    // IBP must also remain sound (no NaN) as the fallback path.
-    let ibp = graph
-        .propagate_ibp(&input)
-        .expect("graph IBP must not abort on Inf-scale BatchNorm");
-    check_sound("IBP", &ibp);
 }

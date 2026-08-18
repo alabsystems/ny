@@ -113,6 +113,9 @@ struct SequentialBackwardPassContext<'a> {
     relu_name_to_idx: &'a HashMap<String, usize>,
     alpha_state: &'a AlphaState,
     engine: Option<&'a dyn GemmEngine>,
+    /// Literal authority for this backward pass. In particular, a Linear node
+    /// must not fall back to the unbounded process-global certified-f64 GEMM.
+    deadline: Option<Instant>,
 }
 
 struct SequentialBackwardPassRequest<'a> {

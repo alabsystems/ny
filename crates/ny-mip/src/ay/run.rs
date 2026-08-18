@@ -4,9 +4,8 @@
 //
 // External `ay` process driver: STREAM an SMT-LIB script to stdin from a
 // writer thread (so a slow incremental parse can never stall the caller
-// past its budget), enforce the
-// wall-clock budget by polling + kill (ay is a sibling-repo binary; we do not
-// assume any timeout flag), and hand back the collected stdout.
+// past its budget), enforce the wall-clock budget by polling + kill and AY's
+// process memory budget through `--memory`, then hand back the collected stdout.
 
 use crate::error::MipError;
 use std::io::Write as _;
@@ -14,6 +13,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, MipError>;
+
+/// Per-child AY memory envelope. Each invocation starts one AY worker, whose
+/// sibling-blind default may otherwise claim most host RAM. Eight GiB keeps
+/// expensive exact solves viable while bounding large-host use and leaving the
+/// NY verifier and its model resident.
+const AY_MEMORY_LIMIT_MIB: u64 = 8 * 1024;
 
 /// Outcome of one ay invocation.
 pub(super) enum AyRun {
@@ -34,6 +39,10 @@ fn ay_command() -> Command {
 
 /// Run ay over `script`, waiting at most `timeout_secs` of wall clock.
 pub(super) fn run_ay(script: &str, timeout_secs: f64) -> Result<AyRun> {
+    tracing::debug!(
+        ay_memory_limit_mib = AY_MEMORY_LIMIT_MIB,
+        "launching AY with an explicit per-child memory envelope"
+    );
     let mut child = spawn()?;
 
     // Stream the script from a thread. ay parses stdin INCREMENTALLY, so a
@@ -110,8 +119,8 @@ pub(super) fn run_ay(script: &str, timeout_secs: f64) -> Result<AyRun> {
 
 fn spawn() -> Result<Child> {
     let mut cmd = ay_command();
-    cmd.arg("-in")
-        .stdin(Stdio::piped())
+    configure_ay_command(&mut cmd);
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // Run the child in its OWN process group. The ay CLI RE-EXECS itself at
@@ -128,6 +137,12 @@ fn spawn() -> Result<Child> {
             "ay: failed to launch (set $NY_AY or put `ay` on $PATH): {e}"
         ))
     })
+}
+
+fn configure_ay_command(cmd: &mut Command) {
+    cmd.arg("--memory")
+        .arg(AY_MEMORY_LIMIT_MIB.to_string())
+        .arg("-in");
 }
 
 /// Kill the child AND every descendant (ay re-execs itself; see [`spawn`]),
@@ -147,4 +162,27 @@ fn kill_tree(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ay_child_has_explicit_memory_envelope() {
+        let mut command = Command::new("ay");
+        configure_ay_command(&mut command);
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            arguments,
+            vec![
+                "--memory".to_owned(),
+                AY_MEMORY_LIMIT_MIB.to_string(),
+                "-in".to_owned(),
+            ]
+        );
+    }
 }

@@ -4,7 +4,9 @@
 
 use ndarray::{ArrayD, Axis};
 use ny_core::{NyError, Result, VerificationSoundnessMode};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    next_down_f32, next_up_f32, sub_down_f32, sub_up_f32, BoundedTensor, RepairStrategy,
+};
 use std::borrow::Cow;
 
 use super::super::common::BoundPropagation;
@@ -141,7 +143,31 @@ impl LogSoftmaxLayer {
         // logsoftmax_i = x_i - logsumexp(x)
         // Lower: x_i^L - logsumexp(x^U) → round DOWN
         // Upper: x_i^U - logsumexp(x^L) → round UP
-        let lower = (input.lower() - &lse_upper_expanded).mapv(next_down_f32);
+        // `sub_down_f32` rather than `(a - b).mapv(next_down_f32)`: the latter
+        // is a plain round-to-nearest subtract followed by an UNCONDITIONAL ULP
+        // step, so it gives away a full ULP even when the subtraction was
+        // exact. The directed form steps only when it must.
+        // NOTE: `lse_*_expanded` carries a size-1 axis at `axis`, which the `-`
+        // operator used to broadcast implicitly. `Zip` does NOT broadcast, so
+        // the views must be widened explicitly first.
+        let target = input.lower().raw_dim();
+        let lse_upper_b = lse_upper_expanded
+            .broadcast(target.clone())
+            .ok_or_else(|| NyError::ShapeMismatch {
+                expected: input.lower().shape().to_vec(),
+                got: lse_upper_expanded.shape().to_vec(),
+            })?;
+        let lse_lower_b =
+            lse_lower_expanded
+                .broadcast(target)
+                .ok_or_else(|| NyError::ShapeMismatch {
+                    expected: input.lower().shape().to_vec(),
+                    got: lse_lower_expanded.shape().to_vec(),
+                })?;
+
+        let lower = ndarray::Zip::from(input.lower())
+            .and(&lse_upper_b)
+            .map_collect(|&x, &l| sub_down_f32(x, l));
         // Soundness tightening: log_softmax(x)_i = x_i - logsumexp(x) <= 0 for ALL
         // inputs, since logsumexp(x) >= max_j x_j >= x_i. Hence 0 is an exact,
         // input-independent upper bound on every output. The interval upper above
@@ -150,7 +176,9 @@ impl LogSoftmaxLayer {
         // TIGHTENS and never drops a reachable value. This preserves lower <= upper:
         // lower <= true_value <= 0, so lower <= min(upper, 0). The lower bound is
         // left untouched.
-        let upper = (input.upper() - &lse_lower_expanded).mapv(|x| next_up_f32(x).min(0.0));
+        let upper = ndarray::Zip::from(input.upper())
+            .and(&lse_lower_b)
+            .map_collect(|&x, &l| sub_up_f32(x, l).min(0.0));
 
         // Repair non-finite outputs: logsumexp subtraction can produce Inf/NaN
         // from large finite inputs. Clamp to FALLBACK_BOUND for consistency

@@ -218,3 +218,8 @@ impl HardSigmoidLayer {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn audit_hard_sigmoid_relax(l: f32, u: f32, alpha: f32, beta: f32) -> LinearRelaxation {
+    hard_sigmoid_linear_relaxation(l, u, alpha, beta)
+}

@@ -47,7 +47,7 @@ pub(super) fn make_node_variadic(
 pub(super) fn make_int_attr(name: &str, value: i64) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
-        i: value,
+        i: Some(value),
         r#type: onnx_proto::attribute_type::INT,
         ..Default::default()
     }

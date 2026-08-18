@@ -202,9 +202,10 @@ fn extract_single_input_subgraph(
 /// affine suffix widens beyond a pure-IBP suffix rooted at the same context
 /// bounds.
 #[ntest::timeout(60000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_attention_softmax_cut_context_rezonotization_boundary_318() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let case = load_context_fallback_case();
     let options =
         ZonotopePropagationOptions::new().with_softmax_mode(ZonotopeSoftmaxMode::IntervalFallback);

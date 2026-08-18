@@ -1078,7 +1078,5 @@ mod round_three;
 #[path = "tests_graph_pgd_round_four.rs"]
 mod round_four;
 
-// TODO(W1): round_six has unresolved imports (make_tensor_interval_input, graph_pgd super path).
-// Disabled to unblock ny-cli test compilation. Re-enable when helpers are added.
-// #[path = "tests_graph_pgd_round_six.rs"]
-// mod round_six;
+#[path = "tests_graph_pgd_round_six.rs"]
+mod round_six;

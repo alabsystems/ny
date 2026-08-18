@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gpu_crown_backward_regression_lib import (
@@ -32,6 +32,7 @@ from gpu_crown_backward_regression_lib import (
 DEFAULT_POLICY = Path("configs/benchmark_regressions/gpu_crown_backward.json")
 DEFAULT_OUTPUT = Path("reports/benchmarks/gpu_crown_backward_regression_latest.json")
 LOG = logging.getLogger(__name__)
+UTC = timezone.utc
 
 
 def _iso_now() -> str:

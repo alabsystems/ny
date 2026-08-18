@@ -268,6 +268,22 @@ pub fn normalize_output_constraints(
 
     let clauses = to_dnf(&combined, &options)?;
 
+    // Invariant backstop: per-clause boxes contain only inclusive `(lo, hi)`
+    // endpoints. A strict input atom must never reach extraction and have its
+    // openness silently erased, even if a future parser path bypasses the
+    // leaf-level checks.
+    if clauses
+        .iter()
+        .flatten()
+        .any(|constraint| constraint.is_strict && is_input_only(constraint))
+    {
+        return Err(NyError::InvalidSpec(
+            "Strict input constraints are unsupported: affine input boxes cannot represent \
+             exclusive endpoints"
+                .to_string(),
+        ));
+    }
+
     // Extract per-clause input bounds from mixed and clauses, then strip
     // input-only constraints so they don't reach the output constraint converter.
     let per_clause_input_bounds = extract_per_clause_input_bounds(&clauses);
@@ -376,7 +392,24 @@ fn convert_linear_relation(
                 "Output constraint has zero coefficient".to_string(),
             ));
         }
+        // Canonicalize the sign of zero. For a `0` / `0.0` literal, `LinearExpr::sub`
+        // leaves `constant = 0.0 - 0.0 = +0.0`, so the unary negation below yields
+        // IEEE -0.0. That is numerically identical to +0.0 — `-0.0 == 0.0`, and the
+        // half-spaces {y : y <= -0.0} and {y : y <= +0.0} are the same set — but it
+        // is NOT bit-identical, and a downstream consumer compares these thresholds
+        // bit-exactly (`beta_crown/verify/graph.rs`, `first.to_bits() ==
+        // 0.0f64.to_bits()`).
+        //
+        // The effect was that the Cersyve conic-proof gate, whose doc says it
+        // "deliberately recognizes the parser-real, non-strict Cersyve form", could
+        // never match anything the PARSER produced: every real Cersyve property
+        // normalizes to a -0.0 threshold (measured on
+        // benchmarks/cersyve/1.0/vnnlib/prop_unicycle.vnnlib, bits
+        // 0x8000000000000000). The lane only ever matched a hand-built test fixture.
+        //
+        // Sound either way: this changes a bit pattern, never a constraint's meaning.
         let rhs = -constant / coeff;
+        let rhs = if rhs == 0.0 { 0.0 } else { rhs };
         let (direction, strict) = match relation {
             Relation::LessEq => (coeff > 0.0, is_strict),
             Relation::GreaterEq => (coeff < 0.0, is_strict),

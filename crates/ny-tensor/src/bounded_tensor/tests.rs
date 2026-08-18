@@ -2132,3 +2132,359 @@ fn test_new_repaired_shape_mismatch() {
     let result = BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative);
     assert!(result.is_err(), "Shape mismatch should error");
 }
+
+#[test]
+fn test_new_repaired_with_poll_matches_conservative_semantics() {
+    use crate::RepairStrategy;
+
+    let lower = arr1(&[5.0, f32::NAN, f32::NEG_INFINITY, 1.0]).into_dyn();
+    let upper = arr1(&[1.0, f32::NAN, 2.0, f32::INFINITY]).into_dyn();
+    let expected =
+        BoundedTensor::new_repaired(lower.clone(), upper.clone(), RepairStrategy::Conservative)
+            .expect("ordinary conservative repair");
+    let mut polls = 0usize;
+    let actual =
+        BoundedTensor::new_repaired_with_poll(lower, upper, RepairStrategy::Conservative, || {
+            polls += 1;
+            Ok(())
+        })
+        .expect("polling conservative repair");
+
+    assert_eq!(actual.lower(), expected.lower());
+    assert_eq!(actual.upper(), expected.upper());
+    assert!(
+        polls >= 5,
+        "entry, three semantic passes, and publication must all poll"
+    );
+}
+
+#[test]
+fn test_new_repaired_with_poll_matches_strict_rejections() {
+    use crate::RepairStrategy;
+
+    let cases = [
+        (arr1(&[f32::NAN]).into_dyn(), arr1(&[1.0]).into_dyn()),
+        (arr1(&[0.0]).into_dyn(), arr1(&[f32::INFINITY]).into_dyn()),
+        (arr1(&[2.0]).into_dyn(), arr1(&[1.0]).into_dyn()),
+        (
+            arr1(&[2.0, 0.0]).into_dyn(),
+            arr1(&[1.0, f32::INFINITY]).into_dyn(),
+        ),
+    ];
+    for (lower, upper) in cases {
+        let expected =
+            BoundedTensor::new_repaired(lower.clone(), upper.clone(), RepairStrategy::Strict)
+                .expect_err("ordinary Strict must reject");
+        let actual =
+            BoundedTensor::new_repaired_with_poll(lower, upper, RepairStrategy::Strict, || Ok(()))
+                .expect_err("polling Strict must reject");
+        assert_eq!(
+            std::mem::discriminant(&actual),
+            std::mem::discriminant(&expected),
+            "polling Strict must preserve the error category"
+        );
+    }
+}
+
+#[test]
+fn test_new_repaired_with_poll_checks_every_bounded_chunk() {
+    use crate::RepairStrategy;
+
+    let lower = ndarray::ArrayD::zeros(IxDyn(&[8_193]));
+    let upper = ndarray::ArrayD::ones(IxDyn(&[8_193]));
+    let mut polls = 0usize;
+    BoundedTensor::new_repaired_with_poll(lower, upper, RepairStrategy::Conservative, || {
+        polls += 1;
+        Ok(())
+    })
+    .expect("polling repair");
+    assert_eq!(
+        polls, 11,
+        "expected entry, three offsets in each semantic pass, and publication"
+    );
+}
+
+#[test]
+fn test_new_repaired_with_poll_returns_final_poll_error_before_publication() {
+    use crate::RepairStrategy;
+
+    let mut polls = 0usize;
+    let error = BoundedTensor::new_repaired_with_poll(
+        arr1(&[0.0, 1.0]).into_dyn(),
+        arr1(&[2.0, 3.0]).into_dyn(),
+        RepairStrategy::Conservative,
+        || {
+            polls += 1;
+            if polls == 5 {
+                Err(NyError::DeadlineExceeded(
+                    "injected final publication poll".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .expect_err("final poll error must prevent publication");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+    assert_eq!(polls, 5);
+}
+
+#[test]
+fn test_pollable_sound_rounding_matches_and_polls_8193_elements() {
+    let lower = ndarray::ArrayD::from_shape_fn(IxDyn(&[8_193]), |index| {
+        -2.0_f32 + index[0] as f32 * 0.0001
+    });
+    let upper =
+        ndarray::ArrayD::from_shape_fn(IxDyn(&[8_193]), |index| 3.0_f32 + index[0] as f32 * 0.0001);
+
+    let mut expected_one =
+        BoundedTensor::new(lower.clone(), upper.clone()).expect("ordinary input");
+    expected_one.round_for_soundness_inplace();
+    let mut actual_one = BoundedTensor::new(lower.clone(), upper.clone()).expect("pollable input");
+    let mut one_polls = 0usize;
+    actual_one
+        .round_for_soundness_inplace_with_poll(|| {
+            one_polls += 1;
+            Ok(())
+        })
+        .expect("pollable one-ULP widening");
+    assert_eq!(actual_one.lower(), expected_one.lower());
+    assert_eq!(actual_one.upper(), expected_one.upper());
+    assert_eq!(one_polls, 8);
+
+    let mut expected_n = BoundedTensor::new(lower.clone(), upper.clone()).expect("ordinary input");
+    expected_n.round_for_soundness_n_ulps_inplace(17);
+    let mut actual_n = BoundedTensor::new(lower, upper).expect("pollable input");
+    let mut n_polls = 0usize;
+    actual_n
+        .round_for_soundness_n_ulps_inplace_with_poll(17, || {
+            n_polls += 1;
+            Ok(())
+        })
+        .expect("pollable n-ULP widening");
+    assert_eq!(actual_n.lower(), expected_n.lower());
+    assert_eq!(actual_n.upper(), expected_n.upper());
+    assert_eq!(n_polls, 8);
+
+    let mut cancelled = actual_n;
+    let mut injected_polls = 0usize;
+    let error = cancelled
+        .round_for_soundness_inplace_with_poll(|| {
+            injected_polls += 1;
+            if injected_polls == 8 {
+                Err(NyError::DeadlineExceeded(
+                    "injected rounding publication poll".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("final poll must return the injected error");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+    assert_eq!(injected_polls, 8);
+}
+
+#[test]
+fn test_pollable_center_and_concrete_match_and_poll_8193_elements() {
+    let lower = ndarray::ArrayD::from_shape_fn(IxDyn(&[8_193]), |index| {
+        -4.0_f32 + index[0] as f32 * 0.0001
+    });
+    let upper =
+        ndarray::ArrayD::from_shape_fn(IxDyn(&[8_193]), |index| 6.0_f32 + index[0] as f32 * 0.0001);
+    let bounds = BoundedTensor::new(lower, upper).expect("bounds");
+    let expected_center = bounds.center();
+    let mut center_polls = 0usize;
+    let actual_center = bounds
+        .center_with_poll(|| {
+            center_polls += 1;
+            Ok(())
+        })
+        .expect("pollable center");
+    assert_eq!(actual_center, expected_center);
+    assert_eq!(center_polls, 7);
+
+    let mut injected_center_polls = 0usize;
+    let center_error = bounds
+        .center_with_poll(|| {
+            injected_center_polls += 1;
+            if injected_center_polls == 7 {
+                Err(NyError::DeadlineExceeded(
+                    "injected center publication poll".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("final center poll must prevent publication");
+    assert!(matches!(center_error, NyError::DeadlineExceeded(_)));
+    assert_eq!(injected_center_polls, 7);
+
+    let expected_concrete =
+        BoundedTensor::concrete(expected_center.clone()).expect("ordinary concrete");
+    let mut concrete_polls = 0usize;
+    let actual_concrete = BoundedTensor::concrete_with_poll(actual_center, || {
+        concrete_polls += 1;
+        Ok(())
+    })
+    .expect("pollable concrete");
+    assert_eq!(actual_concrete.lower(), expected_concrete.lower());
+    assert_eq!(actual_concrete.upper(), expected_concrete.upper());
+    assert_eq!(concrete_polls, 9);
+
+    let mut injected_concrete_polls = 0usize;
+    let concrete_error = BoundedTensor::concrete_with_poll(expected_center, || {
+        injected_concrete_polls += 1;
+        if injected_concrete_polls == 9 {
+            Err(NyError::DeadlineExceeded(
+                "injected concrete publication poll".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("final concrete poll must prevent publication");
+    assert!(matches!(concrete_error, NyError::DeadlineExceeded(_)));
+    assert_eq!(injected_concrete_polls, 9);
+}
+
+#[test]
+fn test_pollable_intersection_matches_and_cancels_before_publication_8193_elements() {
+    let a = BoundedTensor::new(
+        ndarray::ArrayD::from_elem(IxDyn(&[8_193]), -2.0),
+        ndarray::ArrayD::from_elem(IxDyn(&[8_193]), 3.0),
+    )
+    .expect("a");
+    let b = BoundedTensor::new(
+        ndarray::ArrayD::from_elem(IxDyn(&[8_193]), -1.0),
+        ndarray::ArrayD::from_elem(IxDyn(&[8_193]), 4.0),
+    )
+    .expect("b");
+    let expected = a
+        .intersection_per_element(&b)
+        .expect("ordinary intersection");
+    let mut polls = 0usize;
+    let actual = a
+        .intersection_per_element_with_poll(&b, || {
+            polls += 1;
+            Ok(())
+        })
+        .expect("pollable intersection")
+        .expect("matching shapes");
+    assert_eq!(actual.0.lower(), expected.0.lower());
+    assert_eq!(actual.0.upper(), expected.0.upper());
+    assert_eq!(actual.1, expected.1);
+    assert_eq!(polls, 20);
+
+    let mut injected_polls = 0usize;
+    let error = a
+        .intersection_per_element_with_poll(&b, || {
+            injected_polls += 1;
+            if injected_polls == 20 {
+                Err(NyError::DeadlineExceeded(
+                    "injected publication poll".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("final poll must prevent publication");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+    assert_eq!(injected_polls, 20);
+}
+
+#[test]
+fn test_pollable_conservative_fill_matches_and_polls_8193_elements() {
+    let expected = BoundedTensor::new_conservative(&[8_193]);
+    let mut polls = 0usize;
+    let actual = BoundedTensor::new_conservative_with_poll(&[8_193], || {
+        polls += 1;
+        Ok(())
+    })
+    .expect("pollable conservative bounds");
+    assert_eq!(actual.lower(), expected.lower());
+    assert_eq!(actual.upper(), expected.upper());
+    assert_eq!(polls, 10);
+
+    let mut injected_polls = 0usize;
+    let error = BoundedTensor::new_conservative_with_poll(&[8_193], || {
+        injected_polls += 1;
+        if injected_polls == 10 {
+            Err(NyError::DeadlineExceeded(
+                "injected conservative publication poll".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("final poll must prevent publication");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+    assert_eq!(injected_polls, 10);
+}
+
+#[test]
+fn test_new_allow_infinite_with_poll_is_atomic_and_matches_legacy() {
+    let lower = arr1(&[f32::NEG_INFINITY, -1.0, 0.0]).into_dyn();
+    let upper = arr1(&[1.0, f32::INFINITY, 0.0]).into_dyn();
+    let expected = BoundedTensor::new_allow_infinite(lower.clone(), upper.clone()).unwrap();
+
+    let mut polls = 0usize;
+    let actual = BoundedTensor::new_allow_infinite_with_poll(lower.clone(), upper.clone(), || {
+        polls += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(actual.lower(), expected.lower());
+    assert_eq!(actual.upper(), expected.upper());
+    assert_eq!(polls, 5);
+
+    let mut injected_polls = 0usize;
+    let error = BoundedTensor::new_allow_infinite_with_poll(lower, upper, || {
+        injected_polls += 1;
+        if injected_polls == 5 {
+            Err(NyError::DeadlineExceeded(
+                "injected final constructor poll".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("final poll must prevent publication");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+    assert_eq!(injected_polls, 5);
+}
+
+#[test]
+fn test_into_reshape_with_poll_moves_standard_buffers_and_refuses_hidden_copy() {
+    let tensor = BoundedTensor::new(
+        arr2(&[[1.0_f32, 2.0], [3.0, 4.0]]).into_dyn(),
+        arr2(&[[5.0_f32, 6.0], [7.0, 8.0]]).into_dyn(),
+    )
+    .unwrap();
+    let lower_ptr = tensor.lower().as_ptr();
+    let upper_ptr = tensor.upper().as_ptr();
+    let mut polls = 0usize;
+    let reshaped = tensor
+        .into_reshape_with_poll(&[4], || {
+            polls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(polls, 3);
+    assert_eq!(reshaped.shape(), &[4]);
+    assert_eq!(reshaped.lower().as_ptr(), lower_ptr);
+    assert_eq!(reshaped.upper().as_ptr(), upper_ptr);
+
+    let nonstandard = BoundedTensor::new(
+        arr2(&[[1.0_f32, 2.0], [3.0, 4.0]])
+            .reversed_axes()
+            .into_dyn(),
+        arr2(&[[5.0_f32, 6.0], [7.0, 8.0]])
+            .reversed_axes()
+            .into_dyn(),
+    )
+    .unwrap();
+    assert!(matches!(
+        nonstandard.into_reshape_with_poll(&[4], || Ok(())),
+        Err(NyError::UnsupportedConfiguration(_))
+    ));
+}

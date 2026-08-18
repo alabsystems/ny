@@ -11,6 +11,7 @@ use tracing::{debug, info};
 
 use super::stats::{difficulty_score, make_unit_variance_input, median};
 use super::types::{BoundStatus, LayerProfile, ProfileConfig, ProfileError, ProfileResult};
+use crate::analysis_error::validate_analysis_epsilon;
 
 /// Analyze a model's bound profile using the normalized `analyze_*` verb
 /// family.
@@ -46,6 +47,8 @@ pub fn profile_bounds_model(
     model: &OnnxModel,
     config: &ProfileConfig,
 ) -> Result<ProfileResult, ProfileError> {
+    validate_analysis_epsilon("profile", config.epsilon)?;
+
     // Convert to propagate network
     let network = model
         .to_propagate_network()
@@ -89,6 +92,11 @@ pub fn profile_bounds_model(
     let mut max_growth_ratio: f32 = 1.0;
     let mut max_growth_layer: Option<usize> = None;
     let mut overflow_at_layer: Option<usize> = None;
+    // Once continuation substitutes a layer's input after a propagation error,
+    // every later sequential result is based on a graph state that never
+    // existed. Keep that diagnostic taint sticky instead of reporting a
+    // downstream layer as tight/stable.
+    let mut propagation_failed = false;
 
     for (i, (layer, spec)) in network
         .layers()
@@ -109,6 +117,7 @@ pub fn profile_bounds_model(
                 if overflow_at_layer.is_none() {
                     overflow_at_layer = Some(i);
                 }
+                propagation_failed = true;
                 current.clone()
             }
         };
@@ -139,7 +148,7 @@ pub fn profile_bounds_model(
         };
 
         // Determine status
-        let has_overflow = !output_width.is_finite();
+        let has_overflow = propagation_failed || !output_width.is_finite();
         let status = if has_overflow {
             if overflow_at_layer.is_none() {
                 overflow_at_layer = Some(i);

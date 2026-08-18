@@ -8,7 +8,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ny_core::{GemmEngine, Result};
+use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::{info, instrument};
 
@@ -34,7 +34,28 @@ impl BetaCrownVerifier {
         graph_domain_batch_metrics_sink: Option<Arc<dyn GraphDomainBatchMetricsSink>>,
     ) -> Self {
         let mut config = config;
-        config.alpha_config.deadline = Some(Instant::now() + config.timeout);
+        // `BetaCrownConfig::timeout` is the verifier's concrete engine budget:
+        // zero therefore means an immediately expired verifier. The CLI maps
+        // its user-facing zero/unbounded sentinel to a representable long
+        // engine horizon before construction. Use checked arithmetic so a
+        // direct caller's platform-unrepresentable duration cannot panic.
+        let now = Instant::now();
+        // CONSEQUENCE WORTH KNOWING (documented 2026-08-17, behavior unchanged):
+        // this is unconditional, so EVERY engine-driven run carries
+        // `alpha_config.deadline == Some(..)`. That silently disables
+        // `GradientMethod::AnalyticChain` on the DAG lane, which refuses under
+        // `deadline.is_some()` (propagate_dag/gradients/mod.rs, #chain-grad gate)
+        // — and the chain pass is the ONLY route to the `#envelope-grad` rule on
+        // that lane. So arming NY_ALPHA_ENVELOPE_GRAD on a DAG graph through any
+        // BetaCrownVerifier is INERT: the flag reads as set, no envelope code
+        // runs, and the null looks like a measured negative.
+        //
+        // This landed AFTER every CPU-envelope measurement in the tree, so those
+        // numbers are not reproducible on the current binary through that lane.
+        // The fix is to make the replay cooperative (a private finite sub-budget
+        // with all-or-nothing consumption), not to weaken the deadline here — an
+        // engine without a deadline is the actual defect.
+        config.alpha_config.deadline = Some(now.checked_add(config.timeout).unwrap_or(now));
         Self {
             config,
             engine,
@@ -47,8 +68,12 @@ impl BetaCrownVerifier {
             // entries are built lazily by the prep call sites and re-validated
             // against the current graph on every hit.
             skeleton_cache: ResnetSkeletonCache::default(),
+            complete_clip_root_bounds_cache: Default::default(),
+            complete_clip_deadline_overrides: Default::default(),
             gather_score_cache: Default::default(),
             adaptive_depth_shadow_fired: std::sync::atomic::AtomicBool::new(false),
+            kfsb_f64_shadow_fired: std::sync::atomic::AtomicBool::new(false),
+            attribution_diag_fired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -99,6 +124,25 @@ impl BetaCrownVerifier {
         v.graph_mip_leaf_oracle = self.graph_mip_leaf_oracle.clone();
         v.disjunctive_restart_root_cache = self.disjunctive_restart_root_cache.clone();
         v
+    }
+
+    /// Effective deadline for graph-BaB work in the current call.
+    ///
+    /// `alpha_config.deadline` is anchored when the verifier is constructed.
+    /// A caller-supplied graph-BaB deadline can be earlier because the CLI
+    /// ledger has already reserved time for post-BaB phases. Graph-BaB entry
+    /// points install that earlier boundary in the shared override scope; every
+    /// nested branch-selection, propagation, and Complete Clipping path must
+    /// observe the minimum of the two.
+    pub(crate) fn effective_graph_bab_deadline(&self) -> Option<Instant> {
+        self.complete_clip_deadline_overrides
+            .effective(self.config.alpha_config.deadline)
+    }
+
+    /// Whether the effective graph-BaB deadline has expired.
+    pub(crate) fn past_effective_graph_bab_deadline(&self) -> bool {
+        self.effective_graph_bab_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// Attach a fresh, call-local exact root-map cache for deterministic
@@ -231,6 +275,11 @@ impl BetaCrownVerifier {
         // All-None (every preset that doesn't set the knobs) is byte-identical
         // to the historical constants.
         configured.set_crown_ibp_per_node_time_budget(self.config.crown_ibp_per_node_time_budget());
+        configured.set_forward_linear_deadline_fallback_to_ibp(
+            self.config
+                .alpha_config
+                .forward_linear_deadline_fallback_to_ibp,
+        );
         // Carry the source's certified forward-linear reference map into the
         // clone (#w5-bab-throughput): `Clone` resets it and `set_use_patches_mode`
         // invalidates it, so every verify entry repaid the full O(L) certified
@@ -248,6 +297,11 @@ impl BetaCrownVerifier {
         // includes `use_patches_mode`, so if the conv-mode stamp above changed
         // it, the adopted entry simply misses.
         configured.adopt_crown_ibp_collection_cache_from(graph);
+        // One fresh lock-free diagnostic stream per top-level configured graph.
+        // Replacing the clone's Arc (rather than zeroing shared atomics) keeps
+        // concurrent verifier calls independent; all later BaB domain clones
+        // share this newly installed scope.
+        configured.begin_crown_degradation_log_scope();
         configured
     }
 
@@ -336,7 +390,12 @@ impl BetaCrownVerifier {
             Some(dl) => dl.saturating_duration_since(start_time),
             None => self.config.timeout,
         };
-        let crown_deadline = Some(start_time + effective_total);
+        let crown_deadline = Some(start_time.checked_add(effective_total).ok_or_else(|| {
+            NyError::InvalidConfig(format!(
+                "effective timeout {:?} is too large for the platform monotonic clock",
+                effective_total
+            ))
+        })?);
         let mut cut_gate = CutGateState::new(&self.config);
         let mut state = BabLoopState::new(self.config.enable_cuts);
         // Conflict-clause learning (win-plan arc C, v1): per-run store, gated
@@ -373,7 +432,7 @@ impl BetaCrownVerifier {
                 start_time,
                 &cut_gate,
                 &mut cut_pool,
-                deadline,
+                crown_deadline,
             )? {
                 InitialPhaseOutcome::Early(result) => return Ok(result),
                 InitialPhaseOutcome::Proceed {
@@ -538,7 +597,23 @@ impl BetaCrownVerifier {
                 });
             }
 
-            let batch = pop_domain_batch(&mut queue, batch_size);
+            // Clamp the batch to the REMAINING domain budget.
+            //
+            // `prefilter_domain_batch` counts every domain in the batch, but the
+            // `max_domains` check above only runs BETWEEN batches, so a full
+            // batch could carry `domains_explored` past the cap by up to
+            // `batch_size - 1`. With `--max-domains 2` and a 2-child split that
+            // reported 3 domains explored against a cap of 2.
+            //
+            // Overshooting explores MORE than asked, so it was never a soundness
+            // problem — it is a resource-discipline one, and `--max-domains` is
+            // the knob operators use to bound work. A cap that silently admits
+            // `cap + batch_size - 1` is not a cap.
+            let remaining_domains = self
+                .config
+                .max_domains
+                .saturating_sub(state.domains_explored);
+            let batch = pop_domain_batch(&mut queue, batch_size.min(remaining_domains).max(1));
             if batch.is_empty() {
                 break;
             }
@@ -700,6 +775,101 @@ mod tests {
             .expect("deadline must be set");
         assert!(deadline >= before + Duration::from_secs(30));
         assert!(deadline <= after + Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_new_zero_timeout_sets_immediate_deadline() {
+        let before = Instant::now();
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            timeout: Duration::ZERO,
+            ..Default::default()
+        });
+        let after = Instant::now();
+        let deadline = verifier
+            .config
+            .alpha_config
+            .deadline
+            .expect("zero is a concrete, immediately expired engine budget");
+        assert!(deadline >= before);
+        assert!(deadline <= after);
+        assert!(verifier.past_effective_graph_bab_deadline());
+    }
+
+    #[test]
+    fn test_new_unrepresentable_timeout_fails_closed_at_construction() {
+        let before = Instant::now();
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            timeout: Duration::from_secs(u64::MAX),
+            ..Default::default()
+        });
+        let after = Instant::now();
+        let deadline = verifier
+            .config
+            .alpha_config
+            .deadline
+            .expect("constructor must retain a fail-closed deadline");
+        assert!(deadline >= before);
+        assert!(deadline <= after);
+        assert!(verifier.past_effective_graph_bab_deadline());
+    }
+
+    #[test]
+    fn test_verify_rejects_unrepresentable_timeout_without_panicking() {
+        let w = ndarray::arr2(&[[1.0]]);
+        let linear = crate::LinearLayer::new(w, None).expect("valid linear");
+        let mut network = Network::new();
+        network.add_layer(crate::Layer::Linear(linear));
+        let input = BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+            .expect("valid input");
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            timeout: Duration::from_secs(u64::MAX),
+            ..Default::default()
+        });
+
+        match verifier.verify(&network, &input, 0.0) {
+            Err(NyError::InvalidConfig(message)) => {
+                assert!(message.contains("too large for the platform monotonic clock"));
+            }
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("an unrepresentable timeout must fail before verification"),
+        }
+    }
+
+    #[test]
+    fn effective_graph_bab_deadline_uses_earliest_active_scope_and_restores() {
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        });
+        let configured = verifier
+            .config
+            .alpha_config
+            .deadline
+            .expect("constructor deadline");
+        let reserved_bab_deadline = Instant::now() + Duration::from_secs(5);
+
+        assert_eq!(verifier.effective_graph_bab_deadline(), Some(configured));
+        {
+            let _scope = verifier
+                .complete_clip_deadline_overrides
+                .scoped(Some(reserved_bab_deadline));
+            assert_eq!(
+                verifier.effective_graph_bab_deadline(),
+                Some(reserved_bab_deadline)
+            );
+        }
+        assert_eq!(verifier.effective_graph_bab_deadline(), Some(configured));
+
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired test deadline");
+        {
+            let _scope = verifier
+                .complete_clip_deadline_overrides
+                .scoped(Some(expired));
+            assert!(verifier.past_effective_graph_bab_deadline());
+        }
+        assert!(!verifier.past_effective_graph_bab_deadline());
     }
 
     #[test]
@@ -977,7 +1147,7 @@ mod tests {
         let result = verifier
             .verify(&network, &input, 0.0)
             .expect("verify should succeed");
-        assert_eq!(result.result, BabVerificationStatus::PotentialViolation);
+        assert_eq!(result.result, BabVerificationStatus::potential_violation());
         assert_eq!(result.domains_explored, 1);
         assert_eq!(result.domains_verified, 0);
     }

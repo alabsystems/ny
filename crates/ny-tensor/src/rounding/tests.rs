@@ -24,6 +24,20 @@ fn test_next_up_down_basic() {
     );
 }
 
+#[test]
+fn test_directed_steps_preserve_subnormal_bit_order() {
+    let positive = f32::from_bits(7);
+    let negative = f32::from_bits(0x8000_0007);
+    assert_eq!(next_up_f32(positive).to_bits(), 8);
+    assert_eq!(next_down_f32(positive).to_bits(), 6);
+    assert_eq!(next_up_f32(negative).to_bits(), 0x8000_0006);
+    assert_eq!(next_down_f32(negative).to_bits(), 0x8000_0008);
+    assert_eq!(shift_up_n_ulps(positive, 3).to_bits(), 10);
+    assert_eq!(shift_down_n_ulps(positive, 3).to_bits(), 4);
+    assert_eq!(shift_up_n_ulps(negative, 3).to_bits(), 0x8000_0004);
+    assert_eq!(shift_down_n_ulps(negative, 3).to_bits(), 0x8000_000a);
+}
+
 /// Regression test for #3149: infinity sentinels must be preserved.
 /// `mark_infeasible_all()` uses (+inf, -inf) to mark infeasible neurons.
 /// Directed rounding must not convert these into finite bounds.
@@ -399,4 +413,571 @@ fn test_shift_small_n_unchanged_2788() {
     let x = f32::from_bits(0x8000_0001); // smallest negative subnormal
     let r = shift_up_n_ulps(x, 5);
     assert_eq!(r.to_bits(), 4, "small cross-zero remainder should be exact");
+}
+
+// ---------------------------------------------------------------------------
+// Directed f64 -> f32 narrowing casts.
+//
+// The invariant that matters for soundness is the ENCLOSURE one:
+//   cast_f64_to_f32_down(x) <= x <= cast_f64_to_f32_up(x)
+// The invariant that matters for TIGHTNESS is that neither is ever worse than
+// the `next_down_f32(x as f32)` idiom they replace, and that both are exact
+// whenever `x` is representable.
+// ---------------------------------------------------------------------------
+
+/// A spread of f64 values that exercises exact-representable, mid-ULP,
+/// subnormal, huge, and boundary inputs.
+fn directed_cast_probe_values() -> Vec<f64> {
+    let mut xs = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.5,
+        -0.5,
+        // Exactly representable in f32 (they came FROM f32).
+        f64::from(0.1_f32),
+        f64::from(-0.1_f32),
+        f64::from(0.3_f32),
+        f64::from(1e-10_f32),
+        f64::from(f32::MAX),
+        f64::from(f32::MIN),
+        f64::from(f32::MIN_POSITIVE),
+        // NOT representable in f32: the f64 nearest to the decimal literal.
+        0.1,
+        -0.1,
+        0.3,
+        1.0 / 3.0,
+        -1.0 / 3.0,
+        // Beyond the f32 range in both directions.
+        1e300,
+        -1e300,
+        f64::from(f32::MAX) * 1.5,
+        f64::from(f32::MIN) * 1.5,
+        // Below the smallest f32 subnormal but nonzero.
+        1e-60,
+        -1e-60,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    // A deterministic sweep just above and below each f32 grid point near 1.0.
+    let first_bits = 1.0_f32.to_bits();
+    for bits in first_bits..first_bits + 64 {
+        let g = f64::from(f32::from_bits(bits));
+        xs.push(g);
+        xs.push(g * (1.0 + 1e-9));
+        xs.push(g * (1.0 - 1e-9));
+    }
+    xs
+}
+
+#[test]
+fn directed_casts_enclose_the_f64_value() {
+    for x in directed_cast_probe_values() {
+        let lo = cast_f64_to_f32_down(x);
+        let hi = cast_f64_to_f32_up(x);
+        assert!(
+            f64::from(lo) <= x,
+            "cast_f64_to_f32_down({x:e}) = {lo:e} must not exceed x"
+        );
+        assert!(
+            f64::from(hi) >= x,
+            "cast_f64_to_f32_up({x:e}) = {hi:e} must not fall below x"
+        );
+    }
+}
+
+#[test]
+fn directed_casts_are_the_tightest_such_f32() {
+    for x in directed_cast_probe_values() {
+        let lo = cast_f64_to_f32_down(x);
+        if lo.is_finite() {
+            let tighter = next_up_f32(lo);
+            assert!(
+                f64::from(tighter) > x,
+                "cast_f64_to_f32_down({x:e}) = {lo:e} is not maximal: {tighter:e} also fits"
+            );
+        }
+        let hi = cast_f64_to_f32_up(x);
+        if hi.is_finite() {
+            let tighter = next_down_f32(hi);
+            assert!(
+                f64::from(tighter) < x,
+                "cast_f64_to_f32_up({x:e}) = {hi:e} is not minimal: {tighter:e} also fits"
+            );
+        }
+    }
+}
+
+#[test]
+fn directed_casts_are_never_looser_than_the_idiom_they_replace() {
+    for x in directed_cast_probe_values() {
+        if x.is_nan() {
+            continue;
+        }
+        let idiom_lo = next_down_f32(x as f32);
+        // Only meaningful where the idiom is itself a valid lower bound; see
+        // `the_idiom_is_unsound_on_overflow_which_is_why_this_primitive_exists`.
+        if f64::from(idiom_lo) <= x {
+            assert!(
+                cast_f64_to_f32_down(x) >= idiom_lo,
+                "down-cast of {x:e} must not be below the next_down_f32 idiom"
+            );
+        }
+        let idiom_hi = next_up_f32(x as f32);
+        if f64::from(idiom_hi) >= x {
+            assert!(
+                cast_f64_to_f32_up(x) <= idiom_hi,
+                "up-cast of {x:e} must not be above the next_up_f32 idiom"
+            );
+        }
+    }
+}
+
+/// The `next_down_f32(x as f32)` idiom is sound for every f64 that lands inside
+/// the f32 range, and UNSOUND for every one that does not.
+///
+/// `next_down_f32` documents `+-inf -> +-inf` as deliberate: it preserves the
+/// infeasible-interval sentinel. That is right for a value already at infinity
+/// and wrong for a cast that *overflowed to* infinity, because the composed
+/// idiom then returns `+inf` as a LOWER bound on a large finite number. A bound
+/// pair of `[+inf, +inf]` reads as an infeasible interval downstream, which is
+/// the false-proof direction.
+///
+/// This test pins the defect rather than the fix, so it stays honest if
+/// `next_down_f32`'s own sentinel contract is ever revisited.
+#[test]
+fn the_idiom_is_unsound_on_overflow_which_is_why_this_primitive_exists() {
+    // A finite f64 above the f32 range. Reachable wherever two near-max f32
+    // bounds are widened to f64, added, and narrowed back.
+    let over = f64::from(f32::MAX) + f64::from(f32::MAX);
+    assert!(over.is_finite(), "the probe value must be a finite f64");
+
+    let idiom_lo = next_down_f32(over as f32);
+    assert_eq!(
+        idiom_lo,
+        f32::INFINITY,
+        "the idiom returns +inf here, which is the defect"
+    );
+    assert!(
+        f64::from(idiom_lo) > over,
+        "and +inf is strictly ABOVE the value it is supposed to lower-bound"
+    );
+
+    // The directed cast returns the tightest f32 that is genuinely below it.
+    let fixed = cast_f64_to_f32_down(over);
+    assert_eq!(fixed, f32::MAX);
+    assert!(f64::from(fixed) <= over);
+
+    // Mirror for the upper bound.
+    let under = -over;
+    let idiom_hi = next_up_f32(under as f32);
+    assert_eq!(idiom_hi, f32::NEG_INFINITY);
+    assert!(f64::from(idiom_hi) < under);
+    assert_eq!(cast_f64_to_f32_up(under), f32::MIN);
+}
+
+#[test]
+fn directed_casts_are_exact_on_values_that_came_from_f32() {
+    // This is the case the idiom gives away a full ULP on, and it is the common
+    // one: any bound widened to f64 for accumulation and narrowed straight back.
+    let mut bits = 0_u32;
+    let mut checked = 0_usize;
+    while bits < 0x7f80_0000 {
+        let v = f32::from_bits(bits);
+        let x = f64::from(v);
+        assert_eq!(
+            cast_f64_to_f32_down(x).to_bits(),
+            v.to_bits(),
+            "down-cast must be exact on the f32 grid point {v:e}"
+        );
+        assert_eq!(
+            cast_f64_to_f32_up(x).to_bits(),
+            v.to_bits(),
+            "up-cast must be exact on the f32 grid point {v:e}"
+        );
+        // Same for the negative twin.
+        let n = f32::from_bits(bits | 0x8000_0000);
+        let nx = f64::from(n);
+        assert_eq!(cast_f64_to_f32_down(nx).to_bits(), n.to_bits());
+        assert_eq!(cast_f64_to_f32_up(nx).to_bits(), n.to_bits());
+        checked += 1;
+        // Stride the exponent/mantissa space rather than all 2^31 patterns.
+        bits += 0x0001_0001;
+    }
+    assert!(
+        checked > 30_000,
+        "the sweep should cover the f32 grid widely"
+    );
+}
+
+#[test]
+fn directed_casts_saturate_correctly_outside_the_f32_range() {
+    // A value above f32::MAX: the tightest f32 lower bound is f32::MAX, and the
+    // only correct upper bound is +inf.
+    let huge = f64::from(f32::MAX) * 2.0;
+    assert_eq!(cast_f64_to_f32_down(huge), f32::MAX);
+    assert_eq!(cast_f64_to_f32_up(huge), f32::INFINITY);
+
+    let tiny = f64::from(f32::MIN) * 2.0;
+    assert_eq!(cast_f64_to_f32_up(tiny), f32::MIN);
+    assert_eq!(cast_f64_to_f32_down(tiny), f32::NEG_INFINITY);
+
+    assert_eq!(cast_f64_to_f32_down(f64::INFINITY), f32::INFINITY);
+    assert_eq!(cast_f64_to_f32_up(f64::NEG_INFINITY), f32::NEG_INFINITY);
+}
+
+#[test]
+fn directed_casts_pass_nan_through() {
+    assert!(cast_f64_to_f32_down(f64::NAN).is_nan());
+    assert!(cast_f64_to_f32_up(f64::NAN).is_nan());
+}
+
+// ---------------------------------------------------------------------------
+// Directed interval addition.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn directed_adds_bracket_the_exact_sum() {
+    // Reference the exact sum in f64, which is exact for any two f32 operands
+    // (f64 has more than twice f32's significand, so no f32+f32 can round).
+    // The long probe below is a decimal transcription of a specific f32 bit
+    // pattern; shortening it is a change to the value being probed, so the
+    // digits stay and the lint is accepted here.
+    #[allow(clippy::excessive_precision)]
+    let probes = [
+        0.0_f32,
+        -0.0,
+        1.0,
+        -1.0,
+        10.0,
+        -0.5855390429496765,
+        0.1,
+        -0.1,
+        1e-30,
+        -1e-30,
+        f32::MIN_POSITIVE,
+        f32::MAX,
+        f32::MIN,
+        16_777_216.0, // 2^24: adding 1 is not representable
+        1.0 / 3.0,
+    ];
+    for &a in &probes {
+        for &b in &probes {
+            let exact = f64::from(a) + f64::from(b);
+            let lo = add_down_f32(a, b);
+            let hi = add_up_f32(a, b);
+            if exact.is_finite() {
+                assert!(
+                    f64::from(lo) <= exact,
+                    "add_down_f32({a:e}, {b:e}) = {lo:e} exceeds the exact sum {exact:e}"
+                );
+                assert!(
+                    f64::from(hi) >= exact,
+                    "add_up_f32({a:e}, {b:e}) = {hi:e} is below the exact sum {exact:e}"
+                );
+            }
+            assert!(
+                lo <= hi,
+                "directed adds must stay ordered for {a:e} + {b:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn directed_adds_are_exact_when_the_addition_is_exact() {
+    // No slack is given away when nothing was rounded — this is what keeps the
+    // soundness fix from costing tightness on the overwhelmingly common case.
+    for (a, b, want) in [
+        (1.0_f32, 2.0_f32, 3.0_f32),
+        (0.5, 0.25, 0.75),
+        (-10.0, 10.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (1e10, 0.0, 1e10),
+    ] {
+        assert_eq!(add_down_f32(a, b), want, "{a} + {b} is exact");
+        assert_eq!(add_up_f32(a, b), want, "{a} + {b} is exact");
+    }
+}
+
+#[test]
+fn directed_adds_separate_when_the_addition_rounds() {
+    // 2^24 + 1 is not representable: round-to-nearest gives 2^24, which is
+    // BELOW the true sum, so a plain add would publish an upper bound that
+    // excludes the truth.
+    let a = 16_777_216.0_f32; // 2^24
+    let b = 1.0_f32;
+    assert_eq!(a + b, a, "the plain add absorbs the operand");
+
+    let hi = add_up_f32(a, b);
+    assert!(
+        f64::from(hi) >= f64::from(a) + f64::from(b),
+        "the up-add must clear the absorbed operand, got {hi}"
+    );
+    assert!(hi > a, "and it must actually move");
+
+    let lo = add_down_f32(a, b);
+    assert_eq!(lo, a, "the down-add is already correct and must not move");
+}
+
+#[test]
+fn directed_subs_bracket_the_exact_difference() {
+    // The case that broke InstanceNorm: 10 - 0.5855390429496765 rounds up by
+    // 0.19 ULP under round-to-nearest, lifting a LOWER bound above the truth.
+    let a = 10.0_f32;
+    let b = 0.585_539_04_f32;
+    let exact = f64::from(a) - f64::from(b);
+    let plain = a - b;
+    assert!(
+        f64::from(plain) > exact,
+        "the plain subtract rounds UP here, which is why a lower bound needs sub_down_f32"
+    );
+    assert!(f64::from(sub_down_f32(a, b)) <= exact);
+    assert!(f64::from(sub_up_f32(a, b)) >= exact);
+}
+
+#[test]
+fn directed_adds_saturate_correctly_on_overflow() {
+    // f32::MAX + f32::MAX is a FINITE real above the f32 range. The plain add
+    // gives +inf, and `next_down_f32` would preserve it as a sentinel, so the
+    // naive spelling returns +inf as a LOWER bound. Same defect class as
+    // `the_idiom_is_unsound_on_overflow_which_is_why_this_primitive_exists`.
+    let m = f32::MAX;
+    assert_eq!(m + m, f32::INFINITY, "the plain add overflows");
+    assert_eq!(
+        add_down_f32(m, m),
+        f32::MAX,
+        "the lower bound must stay finite"
+    );
+    assert_eq!(
+        add_up_f32(m, m),
+        f32::INFINITY,
+        "and +inf is the only upper bound"
+    );
+
+    assert_eq!(add_up_f32(-m, -m), f32::MIN);
+    assert_eq!(add_down_f32(-m, -m), f32::NEG_INFINITY);
+}
+
+#[test]
+fn directed_adds_pass_nan_and_saturate_at_infinity() {
+    assert!(add_down_f32(f32::NAN, 1.0).is_nan());
+    assert!(add_up_f32(1.0, f32::NAN).is_nan());
+    assert_eq!(add_up_f32(f32::INFINITY, 1.0), f32::INFINITY);
+    assert_eq!(add_down_f32(f32::NEG_INFINITY, -1.0), f32::NEG_INFINITY);
+}
+
+// ---------------------------------------------------------------------------
+// Directed interval multiplication and division.
+// ---------------------------------------------------------------------------
+
+fn mul_div_probe_values() -> Vec<f32> {
+    vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        2.0,
+        0.5,
+        -0.5,
+        3.0,
+        -7.0,
+        0.1,
+        -0.1,
+        1.0 / 3.0,
+        1e-20,
+        -1e-20,
+        1e20,
+        -1e20,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::from_bits(1), // smallest subnormal
+        f32::MAX,
+        f32::MIN,
+        16_777_217.0, // not representable; becomes 2^24
+        0.585_539_04,
+        1.707_828,
+    ]
+}
+
+#[test]
+fn the_f64_product_of_two_f32s_is_exact() {
+    // The premise `mul_down_f32` rests on: 24 + 24 <= 53 significand bits and
+    // the exponent range stays far inside f64's, so no rounding occurs.
+    for &a in &mul_div_probe_values() {
+        for &b in &mul_div_probe_values() {
+            let product = f64::from(a) * f64::from(b);
+            if !product.is_finite() {
+                continue;
+            }
+            // Re-derive the product with exact integer significand arithmetic:
+            // if the f64 multiply had rounded, splitting it back out would not
+            // reproduce it bit-for-bit.
+            let back = product / f64::from(b);
+            if b != 0.0 && f64::from(a) != 0.0 && back.is_finite() {
+                assert_eq!(
+                    back,
+                    f64::from(a),
+                    "f64 product of {a:e} and {b:e} was not exact"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn directed_muls_bracket_the_exact_product() {
+    for &a in &mul_div_probe_values() {
+        for &b in &mul_div_probe_values() {
+            let exact = f64::from(a) * f64::from(b); // exact, per the test above
+            let lo = mul_down_f32(a, b);
+            let hi = mul_up_f32(a, b);
+            if exact.is_finite() {
+                assert!(
+                    f64::from(lo) <= exact,
+                    "mul_down_f32({a:e}, {b:e}) = {lo:e} exceeds the exact product {exact:e}"
+                );
+                assert!(
+                    f64::from(hi) >= exact,
+                    "mul_up_f32({a:e}, {b:e}) = {hi:e} is below the exact product {exact:e}"
+                );
+            }
+            assert!(
+                lo <= hi,
+                "directed muls must stay ordered for {a:e} * {b:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn directed_muls_are_exact_when_the_product_is_representable() {
+    // Scaling by a power of two, multiplying by 1 or 0, and small integer
+    // products all round nowhere — the overwhelmingly common case in a network.
+    for (a, b, want) in [
+        (3.0_f32, 4.0_f32, 12.0_f32),
+        (1.5, 2.0, 3.0),
+        (0.1, 1.0, 0.1),
+        (-2.5, 4.0, -10.0),
+        (7.0, 0.0, 0.0),
+        // NOT `(1e20, 1e-20, 1.0)`: neither f32 literal is the exact decimal,
+        // so their product is genuinely just below 1 and the down-cast
+        // correctly returns 0.99999994. Reciprocal-looking pairs are only exact
+        // when both factors are powers of two.
+        (1024.0, 1.0 / 1024.0, 1.0),
+    ] {
+        assert_eq!(
+            mul_down_f32(a, b),
+            want,
+            "{a} * {b} is exactly representable"
+        );
+        assert_eq!(mul_up_f32(a, b), want, "{a} * {b} is exactly representable");
+    }
+}
+
+#[test]
+fn directed_muls_separate_when_the_product_is_not_representable() {
+    // 0.1 * 0.1 is not representable in f32; the interval must straddle it.
+    let lo = mul_down_f32(0.1, 0.1);
+    let hi = mul_up_f32(0.1, 0.1);
+    let exact = f64::from(0.1_f32) * f64::from(0.1_f32);
+    assert!(lo < hi, "an inexact product must report nonzero width");
+    assert!(f64::from(lo) <= exact && exact <= f64::from(hi));
+    assert_eq!(
+        next_up_f32(lo),
+        hi,
+        "and the straddle must be tight: exactly one ULP"
+    );
+}
+
+#[test]
+fn directed_muls_saturate_correctly_on_overflow() {
+    let m = f32::MAX;
+    assert_eq!(m * m, f32::INFINITY, "the plain multiply overflows");
+    assert_eq!(
+        mul_down_f32(m, m),
+        f32::MAX,
+        "the lower bound must stay finite"
+    );
+    assert_eq!(mul_up_f32(m, m), f32::INFINITY);
+    assert_eq!(mul_up_f32(m, -m), f32::MIN);
+    assert_eq!(mul_down_f32(m, -m), f32::NEG_INFINITY);
+}
+
+#[test]
+fn directed_divs_bracket_the_exact_quotient() {
+    for &a in &mul_div_probe_values() {
+        for &b in &mul_div_probe_values() {
+            if b == 0.0 {
+                continue;
+            }
+            let lo = div_down_f32(a, b);
+            let hi = div_up_f32(a, b);
+            assert!(
+                lo <= hi,
+                "directed divs must stay ordered for {a:e} / {b:e}"
+            );
+            // Verify against the exact rational: lo <= a/b  <=>  lo*b <= a
+            // (comparison done in f64 where lo*b is exact).
+            if lo.is_finite() && b.is_finite() {
+                let scaled = f64::from(lo) * f64::from(b);
+                if b > 0.0 {
+                    assert!(
+                        scaled <= f64::from(a) || !scaled.is_finite(),
+                        "div_down_f32({a:e}, {b:e}) = {lo:e} is above the true quotient"
+                    );
+                } else {
+                    assert!(
+                        scaled >= f64::from(a) || !scaled.is_finite(),
+                        "div_down_f32({a:e}, {b:e}) = {lo:e} is above the true quotient"
+                    );
+                }
+            }
+            if hi.is_finite() && b.is_finite() {
+                let scaled = f64::from(hi) * f64::from(b);
+                if b > 0.0 {
+                    assert!(
+                        scaled >= f64::from(a) || !scaled.is_finite(),
+                        "div_up_f32({a:e}, {b:e}) = {hi:e} is below the true quotient"
+                    );
+                } else {
+                    assert!(
+                        scaled <= f64::from(a) || !scaled.is_finite(),
+                        "div_up_f32({a:e}, {b:e}) = {hi:e} is below the true quotient"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn directed_divs_are_exact_when_the_quotient_is_representable() {
+    for (a, b, want) in [
+        (12.0_f32, 4.0_f32, 3.0_f32),
+        (1.0, 2.0, 0.5),
+        (-10.0, 4.0, -2.5),
+        (0.1, 1.0, 0.1),
+        (0.0, 5.0, 0.0),
+    ] {
+        assert_eq!(
+            div_down_f32(a, b),
+            want,
+            "{a} / {b} is exactly representable"
+        );
+        assert_eq!(div_up_f32(a, b), want, "{a} / {b} is exactly representable");
+    }
+}
+
+#[test]
+fn directed_divs_straddle_an_irrational_quotient_by_one_ulp() {
+    let lo = div_down_f32(1.0, 3.0);
+    let hi = div_up_f32(1.0, 3.0);
+    assert!(lo < hi);
+    assert_eq!(next_up_f32(lo), hi, "the straddle must be exactly one ULP");
+    assert!(f64::from(lo) * 3.0 <= 1.0);
+    assert!(f64::from(hi) * 3.0 >= 1.0);
 }

@@ -212,6 +212,7 @@ pub(super) fn build_dispatch_plan(
                 bias,
                 out_features,
                 in_features,
+                ..
             } => {
                 if let Some(layer_bias) = bias {
                     let bias_params = CrownBiasAccumParams {
@@ -305,6 +306,7 @@ pub(super) fn build_dispatch_plan(
                 out_w,
                 in_h,
                 in_w,
+                ..
             } => {
                 let spatial = out_h * out_w;
                 let total_spatial = num_specs * spatial;

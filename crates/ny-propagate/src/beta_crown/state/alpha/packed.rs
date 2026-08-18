@@ -21,9 +21,10 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 use ny_core::{NyError, Result};
+use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
-use super::graph_init::GraphDomainAlphaState;
+use super::graph_init::{AlphaNeuronMaps, GraphDomainAlphaState};
 use super::neuron::AlphaNeuronState;
 
 /// In-memory format version for packed graph alpha queue state.
@@ -182,7 +183,7 @@ struct PackedGraphAlphaSide {
 }
 
 impl PackedGraphAlphaSide {
-    fn pack(maps: &HashMap<String, HashMap<usize, AlphaNeuronState>>, side: &str) -> Result<Self> {
+    fn pack(maps: &AlphaNeuronMaps, side: &str) -> Result<Self> {
         let entry_count = maps.values().try_fold(0usize, |total, neurons| {
             total
                 .checked_add(neurons.len())
@@ -305,12 +306,13 @@ impl PackedGraphAlphaSide {
         }
     }
 
-    fn unpack(&self) -> HashMap<String, HashMap<usize, AlphaNeuronState>> {
-        let mut maps = HashMap::with_capacity(self.node_names.len());
+    fn unpack(&self) -> AlphaNeuronMaps {
+        let mut maps =
+            AlphaNeuronMaps::with_capacity_and_hasher(self.node_names.len(), Default::default());
         for (node_idx, node_name) in self.node_names.iter().enumerate() {
             let start = self.node_offsets[node_idx] as usize;
             let end = self.node_offsets[node_idx + 1] as usize;
-            let mut neurons = HashMap::with_capacity(end - start);
+            let mut neurons = FxHashMap::with_capacity_and_hasher(end - start, Default::default());
             for packed_idx in start..end {
                 neurons.insert(
                     self.neuron_indices[packed_idx] as usize,
@@ -585,7 +587,7 @@ mod tests {
             .insert(7, neuron(0.5));
         state
             .upper_neurons
-            .insert("empty-node".to_string(), HashMap::new());
+            .insert("empty-node".to_string(), Default::default());
 
         let packed = PackedGraphDomainAlphaState::pack(&state, QUEUE_ID).unwrap();
         let packed_again = PackedGraphDomainAlphaState::pack(&state, QUEUE_ID).unwrap();

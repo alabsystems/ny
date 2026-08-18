@@ -92,6 +92,7 @@ fn build_conv_stack(
             out_w,
             in_h,
             in_w,
+            cert_err: Default::default(),
         });
     }
 }
@@ -113,6 +114,7 @@ fn push_linear(
         bias: Some(b.into()),
         out_features: out_f,
         in_features: in_f,
+        cert_err: Default::default(),
     });
 }
 
@@ -339,9 +341,10 @@ fn test_crown_backward_gpu_soundnessbench_spec_batching_matches_manual_chunks() 
 fn test_crown_backward_gpu_soundnessbench_timestamp_profile_reports_gemm_3599() {
     let _gpu_serial = gpu_test_serial_guard();
     let device = require_device();
-    if !device.supports_timestamp_queries() {
-        return;
-    }
+    assert!(
+        device.supports_timestamp_queries(),
+        "gpu-tests timestamp conformance requires an adapter with timestamp queries"
+    );
 
     let (layers, input_dim, num_specs) = build_soundnessbench_like_layers();
     check_memory_budget(SOUNDNESSBENCH_CASE_NAME, &layers, num_specs);

@@ -41,7 +41,9 @@ fn verify_decomposed_rmsnorm_soundness(
     let shape = x_ibp.shape();
     let n = *shape.last().unwrap_or(&0);
     if n == 0 {
-        return Ok(());
+        return Err(TestCaseError::fail(
+            "decomposed RmsNorm soundness oracle requires a nonempty normalized axis",
+        ));
     }
 
     // Identity incoming A (output = input passthrough)

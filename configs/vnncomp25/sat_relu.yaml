@@ -6,18 +6,21 @@
 #
 # Benchmark characteristics:
 # - NeuroCodeBench 2.0: SAT/UNSAT ReLU instances
-# - Small feedforward networks (30-65 variables, 38-187 clauses)
+# - Small feedforward networks (6-100 variables, 9-485 clauses)
 # - 100 instances, mix of SAT (violated) and UNSAT (verified)
 # - #3277 (ORT shape merge) FIXED — models now load correctly
 # - #3283 (MIP false counterexamples) FIXED 2026-03-04
-# - STATUS: Routed through HiGHS MIP via run_instance.sh (#3454).
-#   BaB with CROWN relaxation is fundamentally too loose for SAT-encoded networks
+# - STATUS: Exact gadget-shaped instances first use the in-process ay-sat CNF
+#   recovery route; non-qualifying cases, and undecided cases with budget
+#   remaining, fall through to the configured verifier.
+# - BaB with CROWN relaxation is fundamentally too loose for SAT-encoded networks
 #   (0/100 instances with 100K domains). Reference uses MIP exclusively.
 # - alpha-beta-CROWN reference: uses Gurobi MIP with 1000 PGD restarts, pgd_alpha=10
-# - ny uses HiGHS MIP (#1763). BaB config below is fallback only.
+# - ny's fallback MIP uses the first-party in-process ay backend. BaB config
+#   below is fallback only.
 
 general:
-  # Route the whole budget to the HiGHS MIP complete verifier (winner parity:
+  # Route non-CNF fallthrough to the ay MIP complete verifier (winner parity:
   # alpha-beta-CROWN uses complete_verifier: mip for this category). CROWN/BaB
   # relaxation is fundamentally too loose for SAT-encoded nets (0/100 at 100K
   # domains) and the auto post-BaB escalation never fired in-budget: the
@@ -33,13 +36,14 @@ general:
 solver:
   mip:
     # ay backend (SOLVER POLICY: all solving on ay). CDCL(T) conflict analysis prunes the
-    # SAT-encoded large-UNSAT instances that HiGHS serial B&B enumerates
-    # node-by-node (6 unsat timeouts + a cliff at 80-110s with HiGHS).
-    # Requires a build with --features mip and an ay binary ($NY_AY/$PATH).
+    # SAT-encoded large-UNSAT instances that the retired HiGHS serial B&B lane
+    # enumerated node-by-node (6 unsat timeouts + a cliff at 80-110s).
+    # Requires a build with --features mip; ay-milp is linked in-process.
     mip_solver: ay
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 1000
 
 bab:

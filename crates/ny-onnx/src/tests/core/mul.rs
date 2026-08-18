@@ -641,7 +641,12 @@ fn test_graph_network_mul_binary_broadcastable_inputs() {
 #[test]
 fn test_mul_binary_incompatible_inputs_error() {
     let data = mul_model_bytes("mul_incompatible", &[1, 2], &[3, 4], &[1, 2]);
-    let model = load_onnx_bytes("mul_incompatible", &data).expect("Failed to load model bytes");
+    // This deliberately invalid broadcast probes ny's conversion error. ORT
+    // is not required to accept the malformed graph for shape inference.
+    let config = crate::OnnxLoadConfig::default()
+        .with_shape_inference_policy(crate::ShapeInferencePolicy::Skip);
+    let model = crate::load_onnx_bytes_with_config("mul_incompatible", &data, &config)
+        .expect("Failed to load model bytes");
     let err = model
         .to_propagate_network()
         .expect_err("Expected incompatible broadcast to error");
@@ -688,6 +693,7 @@ fn mul_model_bytes(name: &str, shape_a: &[i64], shape_b: &[i64], shape_out: &[i6
         node: vec![node("mul", "Mul", &["a", "b"], &["out"])],
         name: name.to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![
             tensor_value_info("a", shape_a),
             tensor_value_info("b", shape_b),

@@ -150,6 +150,31 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// True when `name` is a citation identifier accepted by the Rust
+/// `crownproof::<name>` attribute form and by this Lean declaration scanner.
+///
+/// NY citations intentionally use one unqualified ASCII identifier. Rejecting
+/// empty, numeric-leading, qualified, quoted, or punctuation-bearing names
+/// keeps the textual resolver fail-closed instead of letting an empty/subtoken
+/// search accidentally bind to unrelated source text.
+fn is_valid_citation_name(name: &[u8]) -> bool {
+    let Some(&first) = name.first() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    if name.len() == 1 && first == b'_' {
+        return false;
+    }
+    for &b in name.iter().skip(1) {
+        if !is_ident_byte(b) {
+            return false;
+        }
+    }
+    true
+}
+
 /// First index at which `word` occurs as a contiguous subslice of `hay` — the
 /// byte analogue of `str::find` (used only on ASCII needles here). On valid
 /// UTF-8 with a valid-UTF-8 needle this returns exactly the same offsets as
@@ -279,14 +304,44 @@ fn is_decl_boundary(line: &[u8]) -> bool {
     starts_with_bytes(t, b"@[")
 }
 
-/// True when `line` starts a `theorem`/`lemma` declaration for `name`.
+/// True when `line` starts a `theorem`/`lemma` declaration for exactly `name`.
+///
+/// The cited name must be a supported, non-empty citation identifier and must
+/// occur immediately after the declaration keyword (allowing ordinary
+/// whitespace). Requiring a declaration separator after it prevents `foo` from
+/// matching `foo_suffix`, `foo.bar`, or `foo'`; in particular, a theorem name
+/// can no longer match a token that merely occurs in the result type or proof.
 ///
 /// A named free fn with `name` threaded as a parameter (the old `decl` closure
 /// captured it): direct calls resolve to this bundled, verified body.
 fn is_decl_for(line: &[u8], name: &[u8]) -> bool {
+    if !is_valid_citation_name(name) {
+        return false;
+    }
     let t = trim_start_bytes(line);
-    (starts_with_bytes(t, b"theorem ") || starts_with_bytes(t, b"lemma "))
-        && contains_token(t, name)
+    let after_keyword = if starts_with_bytes(t, b"theorem") {
+        t.get(b"theorem".len()..)
+    } else if starts_with_bytes(t, b"lemma") {
+        t.get(b"lemma".len()..)
+    } else {
+        None
+    };
+    let Some(after_keyword) = after_keyword else {
+        return false;
+    };
+    let Some(&separator) = after_keyword.first() else {
+        return false;
+    };
+    if !separator.is_ascii_whitespace() {
+        return false;
+    }
+    let declaration = trim_start_bytes(after_keyword);
+    if !starts_with_bytes(declaration, name) {
+        return false;
+    }
+    declaration
+        .get(name.len())
+        .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b':' | b'(' | b'{' | b'['))
 }
 
 /// Byte analogue of `str::lines()`: split `src` on `b'\n'`, strip a single
@@ -388,6 +443,12 @@ fn theorem_body<'a>(stripped: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 /// # Errors
 /// Propagates I/O errors reading the corpus directory.
 pub fn citation_status(corpus_root: &Path, theorem: &str) -> std::io::Result<CitationStatus> {
+    // Invalid names are not filesystem lookups. Besides avoiding ambiguous
+    // textual matching, this guarantees that empty/invalid input cannot turn a
+    // missing or unreadable corpus into apparent citation evidence.
+    if !is_valid_citation_name(theorem.as_bytes()) {
+        return Ok(CitationStatus::NotFound);
+    }
     let mut found = false;
     for entry in std::fs::read_dir(corpus_root)? {
         let path = entry?.path();
@@ -486,11 +547,18 @@ fn cited_theorem_on_attribute_line(line: &str) -> Option<String> {
     }
     let end = trimmed.find(']')?;
     let attribute = trimmed.get(..=end)?;
-    let compact: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
+    // Spell the stable filtering operation directly so verification does not
+    // depend on resolving the generic Filter/collect adapter chain.
+    let mut compact = String::new();
+    for c in attribute.chars() {
+        if !c.is_whitespace() {
+            compact.push(c);
+        }
+    }
     let theorem = compact
         .strip_prefix("#[trust::cite(crownproof::")?
         .strip_suffix(")]")?;
-    if theorem.is_empty() || !theorem.chars().all(is_ident_char) {
+    if !is_valid_citation_name(theorem.as_bytes()) {
         return None;
     }
     Some(theorem.to_owned())
@@ -508,8 +576,14 @@ fn function_name_on_line(line: &str) -> Option<String> {
     let mut words = trimmed.split_whitespace();
     while let Some(word) = words.next() {
         if word == "fn" {
-            let name = words.next()?;
-            let name: String = name.chars().take_while(|&c| is_ident_char(c)).collect();
+            let word = words.next()?;
+            let mut name = String::new();
+            for c in word.chars() {
+                if !is_ident_char(c) {
+                    break;
+                }
+                name.push(c);
+            }
             return (!name.is_empty()).then_some(name);
         }
     }
@@ -968,6 +1042,80 @@ mod tests {
         // is exactly why citations are checked on COMMENT-STRIPPED source, since prose
         // like "we prove it sorry-free" lives in comments (Bridge.lean does this).
         assert!(contains_token(b"sorry-free", b"sorry"));
+    }
+
+    #[test]
+    fn declaration_match_requires_exact_identifier_after_keyword() {
+        assert!(is_decl_for(
+            b"  theorem exact_name : True := by trivial",
+            b"exact_name"
+        ));
+        assert!(is_decl_for(
+            b"\tlemma   exact_name(x : Nat) : True := by trivial",
+            b"exact_name"
+        ));
+
+        assert!(!is_decl_for(
+            b"theorem carrier : exact_name := by trivial",
+            b"exact_name"
+        ));
+        assert!(!is_decl_for(
+            b"theorem carrier : True := by exact exact_name",
+            b"exact_name"
+        ));
+        assert!(!is_decl_for(
+            b"theorem exact_name_suffix : True := by trivial",
+            b"exact_name"
+        ));
+        assert!(!is_decl_for(
+            b"theorem exact_name.child : True := by trivial",
+            b"exact_name"
+        ));
+        assert!(!is_decl_for(
+            b"theorem exact_name' : True := by trivial",
+            b"exact_name"
+        ));
+    }
+
+    #[test]
+    fn citation_resolution_rejects_empty_and_invalid_names() {
+        let missing = Path::new("/definitely/not/a/ny-clean-corpus");
+        for name in [
+            "",
+            "_",
+            "1name",
+            "qualified.name",
+            "hyphen-name",
+            "two names",
+        ] {
+            assert_eq!(
+                citation_status(missing, name).unwrap(),
+                CitationStatus::NotFound,
+                "invalid citation {name:?} must be rejected before corpus I/O"
+            );
+        }
+    }
+
+    #[test]
+    fn citation_resolution_does_not_bind_type_or_proof_tokens() {
+        let corpus = tempfile::tempdir().unwrap();
+        std::fs::write(
+            corpus.path().join("Exact.lean"),
+            "theorem carrier : True := by exact True.intro\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            citation_status(corpus.path(), "carrier").unwrap(),
+            CitationStatus::Grounded
+        );
+        for name in ["True", "exact"] {
+            assert_eq!(
+                citation_status(corpus.path(), name).unwrap(),
+                CitationStatus::NotFound,
+                "non-declaration token {name:?} must not resolve as a theorem"
+            );
+        }
     }
 
     #[test]

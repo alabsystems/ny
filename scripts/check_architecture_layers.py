@@ -42,8 +42,8 @@ def load_policy(path: Path) -> dict:
         return tomllib.load(f)
 
 
-def get_workspace_deps() -> list[dict]:
-    """Run cargo metadata and extract workspace-internal dependency edges."""
+def get_workspace_graph() -> tuple[set[str], list[dict]]:
+    """Return workspace package names and workspace-internal dependency edges."""
     result = subprocess.run(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"],
         capture_output=True,
@@ -55,9 +55,8 @@ def get_workspace_deps() -> list[dict]:
         sys.exit(2)
 
     meta = json.loads(result.stdout)
-    workspace_packages = [
-        p for p in meta["packages"] if "ny" in p["manifest_path"]
-    ]
+    workspace_ids = set(meta["workspace_members"])
+    workspace_packages = [p for p in meta["packages"] if p["id"] in workspace_ids]
     workspace_names = {p["name"] for p in workspace_packages}
 
     edges = []
@@ -71,7 +70,12 @@ def get_workspace_deps() -> list[dict]:
                         "kind": dep.get("kind") or "normal",
                     }
                 )
-    return edges
+    return workspace_names, edges
+
+
+def get_workspace_deps() -> list[dict]:
+    """Return workspace-internal dependency edges."""
+    return get_workspace_graph()[1]
 
 
 def build_layer_map(policy: dict) -> dict[str, str]:
@@ -95,6 +99,54 @@ def layer_order(layer: str) -> int:
 def build_exception_set(policy: dict) -> set[tuple[str, str, str]]:
     """Build set of (from, to, kind) tuples from policy exceptions."""
     return {(exc["from"], exc["to"], exc["kind"]) for exc in policy.get("exceptions", [])}
+
+
+def validate_policy_assignments(
+    policy: dict, workspace_names: set[str]
+) -> list[dict]:
+    """Require every workspace crate to have exactly one valid assignment."""
+    violations = []
+    assignments: dict[str, str] = {}
+
+    for layer_name, crates in policy.get("layers", {}).items():
+        for crate in crates:
+            if not isinstance(crate, str) or not crate.strip():
+                violations.append(
+                    {
+                        "reason": f"{layer_name} contains an empty or invalid crate name",
+                        "severity": "error",
+                    }
+                )
+                continue
+            if crate in assignments:
+                violations.append(
+                    {
+                        "reason": (
+                            f"{crate} is assigned to both {assignments[crate]} "
+                            f"and {layer_name}"
+                        ),
+                        "severity": "error",
+                    }
+                )
+                continue
+            assignments[crate] = layer_name
+
+    for crate in sorted(workspace_names - assignments.keys()):
+        violations.append(
+            {
+                "reason": f"{crate} is not assigned to any layer",
+                "severity": "error",
+            }
+        )
+    for crate in sorted(assignments.keys() - workspace_names):
+        violations.append(
+            {
+                "reason": f"{crate} is assigned in policy but is not a workspace crate",
+                "severity": "error",
+            }
+        )
+
+    return violations
 
 
 def _check_edge(
@@ -121,6 +173,58 @@ def _check_edge(
             "severity": "error",
         }
     return None
+
+
+def validate_exceptions(
+    policy: dict,
+    edges: list[dict],
+    layer_map: dict[str, str],
+) -> list[dict]:
+    """Reject stale exceptions and exceptions for edges allowed by the policy."""
+    violations = []
+    edge_keys = {(edge["from"], edge["to"], edge["kind"]) for edge in edges}
+    seen: set[tuple[str, str, str]] = set()
+
+    for exception in policy.get("exceptions", []):
+        key = (exception["from"], exception["to"], exception["kind"])
+        if key in seen:
+            violations.append(
+                {
+                    "reason": (
+                        f"duplicate exception for {key[0]} -> {key[1]} "
+                        f"({key[2]})"
+                    ),
+                    "severity": "error",
+                }
+            )
+            continue
+        seen.add(key)
+
+        if key not in edge_keys:
+            violations.append(
+                {
+                    "reason": (
+                        f"stale exception for nonexistent edge "
+                        f"{key[0]} -> {key[1]} ({key[2]})"
+                    ),
+                    "severity": "error",
+                }
+            )
+            continue
+
+        edge = {"from": key[0], "to": key[1], "kind": key[2]}
+        if _check_edge(edge, layer_map, set()) is None:
+            violations.append(
+                {
+                    "reason": (
+                        f"unnecessary exception for allowed edge "
+                        f"{key[0]} -> {key[1]} ({key[2]})"
+                    ),
+                    "severity": "error",
+                }
+            )
+
+    return violations
 
 
 def validate(
@@ -189,6 +293,12 @@ def _scc_has_unexcepted_violation(
                         cycle_edges.append((s, t, edge["kind"]))
 
     for s, t, k in cycle_edges:
+        if layer_map.get(s) == "sidecar":
+            continue
+        if layer_map.get(t) == "sidecar":
+            if k == "normal" and (s, t, k) not in exceptions:
+                return True, cycle_edges
+            continue
         s_ord = layer_order(layer_map.get(s, "sidecar"))
         t_ord = layer_order(layer_map.get(t, "sidecar"))
         if s_ord < t_ord and (s, t, k) not in exceptions:
@@ -287,9 +397,14 @@ def main() -> int:
     policy = load_policy(args.policy)
     layer_map = build_layer_map(policy)
     exceptions = build_exception_set(policy)
-    edges = get_workspace_deps()
+    workspace_names, edges = get_workspace_graph()
 
-    all_violations = validate(edges, layer_map, exceptions) + check_cycles(edges, layer_map, exceptions)
+    all_violations = (
+        validate_policy_assignments(policy, workspace_names)
+        + validate_exceptions(policy, edges, layer_map)
+        + validate(edges, layer_map, exceptions)
+        + check_cycles(edges, layer_map, exceptions)
+    )
 
     if args.json:
         sys.stdout.write(json.dumps(

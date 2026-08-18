@@ -305,7 +305,6 @@ fn propagate_gather_backward_fixture(
             None,
             &beta_state,
             &alpha_state,
-            None,
             0,
             None,
         )

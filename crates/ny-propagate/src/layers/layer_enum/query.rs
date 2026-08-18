@@ -79,6 +79,7 @@ impl Layer {
             Layer::CumSum(_) => "CumSum",
             Layer::Tanh(_) => "Tanh",
             Layer::Sigmoid(_) => "Sigmoid",
+            Layer::Erf(_) => "Erf",
             Layer::Softplus(_) => "Softplus",
             Layer::Sin(_) => "Sin",
             Layer::Cos(_) => "Cos",

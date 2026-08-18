@@ -8,6 +8,7 @@ use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
 
 use super::{BoundedTensor, RepairStrategy};
+use crate::rounding::{add_down_f32, add_up_f32, mul_down_f32, mul_up_f32};
 
 /// NaN-safe extrema for interval endpoint products.
 ///
@@ -43,8 +44,17 @@ impl BoundedTensor {
                 other.shape().to_vec(),
             ));
         }
-        let lower = self.lower() + other.lower();
-        let upper = self.upper() + other.upper();
+        // DIRECTED: a plain f32 `+` is round-to-NEAREST, so `a_lo + b_lo` can
+        // land up to half an ULP ABOVE the true sum — a lower bound that
+        // excludes the value it bounds. Each endpoint must move outward.
+        // `add_down_f32`/`add_up_f32` step only when the addition was inexact,
+        // so exactly-representable sums (the common case) cost nothing.
+        let lower = ndarray::Zip::from(self.lower())
+            .and(other.lower())
+            .map_collect(|&x, &y| add_down_f32(x, y));
+        let upper = ndarray::Zip::from(self.upper())
+            .and(other.upper())
+            .map_collect(|&x, &y| add_up_f32(x, y));
         // Repair NaN from inf + (-inf) etc. at the type boundary (#3423).
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
     }
@@ -81,7 +91,24 @@ impl BoundedTensor {
             .and(c)
             .and(d)
             .for_each(|l, u, &a, &b, &c, &d| {
-                let (min_val, max_val) = nan_safe_product_extrema(a * c, a * d, b * c, b * d);
+                // DIRECTED: the min over the four endpoint products must round
+                // DOWN and the max must round UP. A plain f32 `*` rounds to
+                // nearest, which moves both inward. Computing each corner twice
+                // (once each way) is what keeps the enclosure valid; the two
+                // agree whenever the product is representable, which is most of
+                // the time, so this is not two intervals' worth of slack.
+                let (min_val, _) = nan_safe_product_extrema(
+                    mul_down_f32(a, c),
+                    mul_down_f32(a, d),
+                    mul_down_f32(b, c),
+                    mul_down_f32(b, d),
+                );
+                let (_, max_val) = nan_safe_product_extrema(
+                    mul_up_f32(a, c),
+                    mul_up_f32(a, d),
+                    mul_up_f32(b, c),
+                    mul_up_f32(b, d),
+                );
                 *l = min_val;
                 *u = max_val;
             });
@@ -100,16 +127,19 @@ impl BoundedTensor {
         if !scalar.is_finite() {
             return BoundedTensor::new_conservative(self.shape());
         }
+        // DIRECTED, and the direction follows the OUTPUT endpoint, not the
+        // input one: after a negative scalar swaps them, the array that becomes
+        // the lower bound must round down.
         let (lower, upper) = if scalar >= 0.0 {
             (
-                self.lower().mapv(|v| v * scalar),
-                self.upper().mapv(|v| v * scalar),
+                self.lower().mapv(|v| mul_down_f32(v, scalar)),
+                self.upper().mapv(|v| mul_up_f32(v, scalar)),
             )
         } else {
             // Negative scalar swaps bounds
             (
-                self.upper().mapv(|v| v * scalar),
-                self.lower().mapv(|v| v * scalar),
+                self.upper().mapv(|v| mul_down_f32(v, scalar)),
+                self.lower().mapv(|v| mul_up_f32(v, scalar)),
             )
         };
         // SAFETY: new_repaired() repairs NaN from edge cases like 0 * inf (#3423).
@@ -124,8 +154,9 @@ impl BoundedTensor {
 
     /// Scalar addition.
     pub fn shift(&self, scalar: f32) -> BoundedTensor {
-        let lower = self.lower().mapv(|v| v + scalar);
-        let upper = self.upper().mapv(|v| v + scalar);
+        // DIRECTED, same reasoning as `add`.
+        let lower = self.lower().mapv(|v| add_down_f32(v, scalar));
+        let upper = self.upper().mapv(|v| add_up_f32(v, scalar));
         // SAFETY: new_repaired() repairs NaN from inf + (-inf) etc. (#3423).
         // The .expect() can only fail on shape mismatch, which is impossible here
         // because both arrays derive from the same BoundedTensor via mapv().

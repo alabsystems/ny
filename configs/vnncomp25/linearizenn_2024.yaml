@@ -14,17 +14,29 @@ general:
   csv_name: instances.csv
 
 solver:
-  # Bounded per-iteration batch for the reordered input-split BaB below. The
-  # reorder loop pops up to `batch_size` domains per iteration and bounds them
-  # with one batched CROWN backward; 512 keeps the transient workset small while
-  # still saturating the CPU cores. (alpha-crown is NOT usable here: the
-  # disjunctive multi-clause batched bounding path produces garbage bounds under
-  # alpha — gap frozen at ~-1345 — so plain `crown` is the correct, tight source.)
+  # Bounded per-iteration batch for the reordered input-split BaB below. A
+  # zero-iteration alpha-CROWN setup computes one sound root CROWN-IBP reference
+  # map and shares it across every child. Fresh child IBP is then intersected
+  # with that map by `stacked_rebound`, avoiding the old per-domain intermediate
+  # CROWN collection (11,374 collections in a 180s timeout). On the formerly
+  # open AllInOne_120_120 / prop_120_120_0 row this path proved UNSAT in 5.88s,
+  # exploring 2,963 domains at ~970 domains/s. The old plain-CROWN path timed out
+  # after 180s at ~72 domains/s. 512 keeps the transient workset bounded while
+  # saturating the CPU cores. (#linearizenn-shared-root-ibp)
   batch_size: 512
-  bound_prop_method: crown
+  bound_prop_method: alpha-crown
+  alpha_crown:
+    # Zero deliberately means "initialize the shared CROWN reference" without
+    # spending time optimizing root alphas. Child tightening comes from fresh
+    # per-domain IBP below, not from stale or per-domain alpha refinement.
+    iterations: 0
 
 attack:
+  # NY does not implement reference after placement. The explicit compatibility
+  # field preserves its measured initial/upfront schedule without claiming
+  # scheduler parity; independent post-BaB policy remains separately owned.
   pgd_order: after
+  ny_pgd_order_compat: upfront
   # linearizenn is 59/60 unsat; the single sat instance (prop_10_10) is caught
   # by the first PGD restart in <0.02s. The upfront graph-PGD attack is FIXED
   # work (independent of the wall-clock budget) and at 10000 restarts it burned
@@ -52,6 +64,11 @@ bab:
     reduceop: max
     input_split:
       enable: true
+      # #linearizenn-singleton-domainlist: only this production category opts
+      # into decomposing a canonical two-singleton OR into two sequential
+      # DomainList proofs. The same AST occurs in cGAN/ml4acopf, so omission is
+      # intentionally false everywhere else.
+      independent_singleton_disjunction: true
       # THE lever for AllInOne_120_120 (#linearizenn-bab-reorder). Default-OFF
       # input-split BaB pops ONE domain per iteration and screens split children
       # against the PARENT's stale linear bounds — the best-domain gap plateaus at
@@ -63,6 +80,15 @@ bab:
       # SOUND: CROWN is a sound over-approximation; a tighter sound bound only ever
       # verifies fewer/more domains, never emits a wrong verdict.
       reorder_bab: true
+      # Intersect every child's fresh IBP enclosure with the single shared root
+      # CROWN-IBP map. Both operands are sound enclosures, so their intersection
+      # remains sound. The stacked batched path is the measured 13x throughput
+      # improvement on the formerly open 120x120 row.
+      ibp_enhancement: true
+      stacked_rebound: true
+      # Keep sub-domain alpha optimization disabled. The useful composition is
+      # shared root CROWN plus fresh child IBP; warm alpha work only adds cost.
+      alpha_iteration: 0
   beta_crown:
     lr_alpha: 0.1
     lr_beta: 0.15

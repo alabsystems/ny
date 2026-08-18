@@ -8,17 +8,20 @@
 //! configured gradient method is not SPSA, so the DAG optimizer's full
 //! gradient dispatch (SPSA, FD, Analytic, AnalyticChain) is used.
 
-use crate::bounds::{AlphaCrownConfig, GraphAlphaState};
+use crate::bounds::AlphaCrownConfig;
+#[cfg(test)]
+use crate::bounds::GraphAlphaState;
 use crate::network::core::GraphNetwork;
 use ny_core::{GemmEngine, Result};
 use ny_tensor::BoundedTensor;
 
 use super::init::DagAlphaInitResult;
-use super::{final_alpha_bound_only_enabled, DagAlphaLoopResultUse};
+use super::{final_alpha_bound_only_enabled, DagAlphaCollectionArtifact, DagAlphaLoopResultUse};
 
 impl GraphNetwork {
-    /// α-CROWN for DAG graphs, returning both optimized bounds and the
-    /// `GraphAlphaState` for warm-starting BaB per-domain optimization.
+    /// α-CROWN for DAG graphs, returning optimized bounds, the
+    /// `GraphAlphaState` for warm-starting BaB per-domain optimization, and the
+    /// optimizer's final sound reference map.
     ///
     /// Uses the same gradient dispatch as `propagate_dag_alpha_crown_with_config_and_engine`
     /// (SPSA, FD, Analytic, or AnalyticChain depending on `config.gradient_method`).
@@ -27,12 +30,54 @@ impl GraphNetwork {
         input: &BoundedTensor,
         config: &AlphaCrownConfig,
         engine: Option<&dyn GemmEngine>,
-    ) -> Result<Option<(BoundedTensor, GraphAlphaState)>> {
+    ) -> Result<Option<DagAlphaCollectionArtifact>> {
         self.propagate_dag_alpha_crown_collect_with_engine_and_gate(
             input,
             config,
             engine,
             final_alpha_bound_only_enabled(),
+            false,
+            None,
+        )
+    }
+
+    /// Multi-objective-root-only collection seam.  Once at least one finite
+    /// bound fold has completed, a deadline raised by later optimizer work may
+    /// return that owned artifact instead of discarding it.  The caller must
+    /// still re-evaluate the returned relaxation state before any verdict.
+    pub(in crate::network::graph_alpha) fn propagate_dag_alpha_crown_collect_with_engine_phase_cap_checkpoint(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn GemmEngine>,
+    ) -> Result<Option<DagAlphaCollectionArtifact>> {
+        self.propagate_dag_alpha_crown_collect_with_engine_and_gate(
+            input,
+            config,
+            engine,
+            final_alpha_bound_only_enabled(),
+            true,
+            None,
+        )
+    }
+
+    /// Typed root-cache variant: initialize and optimize a fresh alpha state
+    /// from an exact caller-supplied certified reference map. Only the map is
+    /// reused; every optimizer/RNG state remains restart-local.
+    pub(in crate::network::graph_alpha) fn propagate_dag_alpha_crown_collect_with_engine_and_reference(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn GemmEngine>,
+        reference: crate::network::graph_alpha::PrecomputedAlphaReferenceBounds,
+    ) -> Result<Option<DagAlphaCollectionArtifact>> {
+        self.propagate_dag_alpha_crown_collect_with_engine_and_gate(
+            input,
+            config,
+            engine,
+            final_alpha_bound_only_enabled(),
+            false,
+            Some(reference),
         )
     }
 
@@ -46,9 +91,14 @@ impl GraphNetwork {
         config: &AlphaCrownConfig,
         engine: Option<&dyn GemmEngine>,
         final_bound_only_gate: bool,
-    ) -> Result<Option<(BoundedTensor, GraphAlphaState)>> {
-        let init = match self.init_dag_alpha_state(input, config, engine)? {
-            DagAlphaInitResult::EarlyReturn(_bounds) => return Ok(None),
+        retain_completed_on_deadline: bool,
+        precomputed_reference: Option<crate::network::graph_alpha::PrecomputedAlphaReferenceBounds>,
+    ) -> Result<Option<DagAlphaCollectionArtifact>> {
+        let init = match self.init_dag_alpha_state(input, config, engine, precomputed_reference)? {
+            DagAlphaInitResult::EarlyReturn {
+                collection_artifact,
+                ..
+            } => return Ok(collection_artifact),
             DagAlphaInitResult::Ready(state) => *state,
         };
         self.dag_alpha_optimize_loop(
@@ -58,6 +108,7 @@ impl GraphNetwork {
             init,
             final_bound_only_gate,
             DagAlphaLoopResultUse::BoundsAndState,
+            retain_completed_on_deadline,
         )
         .map(Some)
     }
@@ -267,15 +318,19 @@ mod tests {
     fn run_collection(iterations: usize, gate_enabled: bool) -> CollectionRun {
         let (graph, input) = build_collection_state_escape_dag();
         let config = collection_config(iterations);
-        let (output_bounds, alpha_state) = graph
+        let artifact = graph
             .propagate_dag_alpha_crown_collect_with_engine_and_gate(
                 &input,
                 &config,
                 None,
                 gate_enabled,
+                false,
+                None,
             )
             .expect("DAG alpha collection should succeed")
             .expect("unstable ReLU fixture should enter the DAG optimizer");
+        let output_bounds = artifact.output_bounds;
+        let alpha_state = artifact.alpha_state;
 
         // Mirror `try_dag_gradient_dispatch`: the state returned by collection
         // is immediately consumed by a fresh all-node alpha-CROWN evaluation.
@@ -346,5 +401,50 @@ mod tests {
                 "iterations={iterations}: collection must retain the terminal optimizer update"
             );
         }
+    }
+
+    #[ntest::timeout(30000)]
+    #[test]
+    fn zero_iterations_returns_reference_output_and_initialized_alpha_state() {
+        let (graph, input) = build_collection_state_escape_dag();
+        let mut config = collection_config(0);
+        config.fix_interm_bounds = true;
+        config.skip_zero_iteration_collection_initial_bound = true;
+        let exec_order = graph.exec_order().expect("test graph should sort");
+        let reference = graph
+            .collect_alpha_reference_bounds_with_engine(&input, &config, None, exec_order)
+            .expect("reference bounds should collect");
+        let expected_output = reference
+            .get("output")
+            .expect("fixture output reference should exist");
+
+        let artifact = graph
+            .propagate_dag_alpha_crown_collect_with_engine(&input, &config, None)
+            .expect("zero-iteration collection should succeed")
+            .expect("unstable ReLU fixture should initialize alpha state");
+        let output = artifact.output_bounds;
+        let alpha_state = artifact.alpha_state;
+
+        assert_bound_bits_eq(
+            &output,
+            expected_output,
+            "zero-iteration reference output",
+            0,
+        );
+        assert!(
+            alpha_state
+                .adam_m
+                .values()
+                .chain(alpha_state.adam_v.values())
+                .chain(alpha_state.adam_m_upper.values())
+                .chain(alpha_state.adam_v_upper.values())
+                .flat_map(|values| values.iter())
+                .all(|value| *value == 0.0),
+            "zero iterations must return initialized, never-updated optimizer state"
+        );
+        assert!(
+            !alpha_state.alphas.is_empty(),
+            "zero iterations must still initialize reusable ReLU alpha state"
+        );
     }
 }

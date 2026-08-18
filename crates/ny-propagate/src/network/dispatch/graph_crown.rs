@@ -154,6 +154,36 @@ impl GraphNetwork {
             deadline,
             None,
             node_bounds,
+            None,
+        )
+    }
+
+    /// Like [`Self::propagate_crown_with_engine_and_deadline_and_node_bounds`],
+    /// with an optional caller-local wall cap for Graph-CROWN Step 1's
+    /// CROWN-IBP tightening sweep.
+    ///
+    /// This is deliberately crate-local: DAG alpha uses it to reserve time for
+    /// its optimizer after a forward-linear reference refusal. Other CROWN and
+    /// BaB callers retain the historical uncapped policy.
+    #[inline]
+    #[instrument(skip(self, input, engine, deadline, node_bounds), fields(num_nodes = self.nodes.len(), input_shape = ?input.shape()))]
+    pub(crate) fn propagate_crown_with_engine_and_deadline_and_node_bounds_and_crown_ibp_cap(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<std::time::Instant>,
+        node_bounds: Option<&std::collections::HashMap<String, BoundedTensor>>,
+        crown_ibp_tightening_cap: Option<std::time::Duration>,
+    ) -> Result<CrownBackwardResult> {
+        GraphNetworkCrownExt::crown_backward_with_relaxation_and_deadline_and_truncation_with_node_bounds(
+            self,
+            input,
+            engine,
+            MulBinaryRelaxationMode::default(),
+            deadline,
+            None,
+            node_bounds,
+            crown_ibp_tightening_cap,
         )
     }
 

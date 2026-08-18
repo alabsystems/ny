@@ -7,7 +7,7 @@ use crate::{TensorSpec, WeightStore};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
-use super::super::shape_infer::DEFAULT_OPSET_VERSION;
+use super::super::const_fold::is_standard_onnx_domain;
 use super::super::tensor::value_info_to_tensor_spec;
 
 pub(super) struct ParseMetadata {
@@ -83,8 +83,72 @@ pub(super) fn build_tensor_shapes(
         }
     }
 
+    // ValueInfo and ORT are both optional. Recover a Flatten output only when
+    // its immediate authored input shape is already known and the complete
+    // local Flatten schema can be authenticated. Do not promote the broader
+    // constant-fold shape recursion to conversion authority: rules for ops
+    // such as Conv are deliberately partial and are unsafe as general model
+    // metadata (for example, they need not model auto_pad).
+    for node in &graph.node {
+        if !is_standard_onnx_domain(&node.domain)
+            || node.op_type != "Flatten"
+            || node.input.len() != 1
+            || node.input[0].is_empty()
+            || node.output.len() != 1
+            || node.output[0].is_empty()
+            || tensor_shapes.contains_key(&node.output[0])
+        {
+            continue;
+        }
+        let Some(input_shape) = tensor_shapes.get(&node.input[0]) else {
+            continue;
+        };
+        if let Some(output_shape) = infer_authenticated_flatten_shape(node, input_shape) {
+            tensor_shapes.insert(node.output[0].clone(), output_shape);
+        }
+    }
+
     validate_matmul_shapes(&graph.node, weights, &mut tensor_shapes);
     tensor_shapes
+}
+
+fn infer_authenticated_flatten_shape(
+    node: &onnx_proto::NodeProto,
+    input_shape: &[i64],
+) -> Option<Vec<i64>> {
+    if input_shape.iter().any(|&dimension| dimension < 0) {
+        return None;
+    }
+    let axis = match node.attribute.as_slice() {
+        [] => 1,
+        [attribute]
+            if attribute.name == "axis" && attribute.r#type == onnx_proto::attribute_type::INT =>
+        {
+            attribute.i_value()
+        }
+        _ => return None,
+    };
+    let rank = i64::try_from(input_shape.len()).ok()?;
+    let axis = if axis < 0 {
+        axis.checked_add(rank)?
+    } else {
+        axis
+    };
+    if !(0..=rank).contains(&axis) {
+        return None;
+    }
+    let axis = usize::try_from(axis).ok()?;
+    let product = |dimensions: &[i64]| {
+        dimensions
+            .iter()
+            .try_fold(1_i64, |accumulator, &dimension| {
+                accumulator.checked_mul(dimension)
+            })
+    };
+    Some(vec![
+        product(&input_shape[..axis])?,
+        product(&input_shape[axis..])?,
+    ])
 }
 
 pub(super) fn build_parse_metadata(
@@ -154,7 +218,9 @@ fn build_constant_tensors(
         .node
         .iter()
         .filter_map(|node| {
-            if node.op_type == "Reshape" && node.input.len() >= 2 {
+            if !is_standard_onnx_domain(&node.domain) {
+                None
+            } else if node.op_type == "Reshape" && node.input.len() >= 2 {
                 Some(node.input[1].as_str())
             } else if node.op_type == "ConstantOfShape" && !node.input.is_empty() {
                 Some(node.input[0].as_str())
@@ -166,7 +232,9 @@ fn build_constant_tensors(
 
     let mut constant_tensors = HashSet::new();
     for node in &graph.node {
-        if constant_producing_ops.contains(&node.op_type.as_str()) {
+        if is_standard_onnx_domain(&node.domain)
+            && constant_producing_ops.contains(&node.op_type.as_str())
+        {
             for output in &node.output {
                 if !output.is_empty() {
                     if node.op_type == "Concat" && !shape_input_tensors.contains(output.as_str()) {
@@ -182,7 +250,8 @@ fn build_constant_tensors(
     while changed {
         changed = false;
         for node in &graph.node {
-            if !node.input.is_empty()
+            if is_standard_onnx_domain(&node.domain)
+                && !node.input.is_empty()
                 && node.input.iter().all(|input| {
                     input.is_empty()
                         || weights.contains_key(input)
@@ -255,52 +324,93 @@ fn value_info_has_declared_shape(info: &onnx_proto::ValueInfoProto) -> bool {
         .is_some()
 }
 
-pub(super) fn collect_opset_imports(model: &onnx_proto::ModelProto) -> HashMap<String, i64> {
+pub(super) fn collect_opset_imports(
+    model: &onnx_proto::ModelProto,
+) -> ny_core::Result<HashMap<String, i64>> {
     let mut opset_imports = HashMap::new();
-    let mut has_default_domain = false;
+    let mut standard_opset = None;
+    let mut custom_opset_authorities = HashMap::new();
 
     for opset in &model.opset_import {
         let domain = opset.domain.clone();
-        let version = if opset.version > 0 {
-            opset.version
-        } else if domain.is_empty() || domain == "ai.onnx" {
-            DEFAULT_OPSET_VERSION
-        } else {
-            warn!(
-                "Skipping opset import with invalid version {} for domain \"{}\"",
-                opset.version, domain
-            );
-            continue;
-        };
-        if domain.is_empty() {
-            has_default_domain = true;
+        let is_standard = is_standard_onnx_domain(&domain);
+        if is_standard && opset.version <= 0 {
+            return Err(ny_core::NyError::ModelLoad(format!(
+                "standard ONNX opset import for domain '{}' must have a positive version, got {}",
+                domain, opset.version
+            )));
         }
-        if let Some(previous) = opset_imports.insert(domain.clone(), version) {
-            if previous != version {
-                warn!(
-                    "Duplicate opset import for domain \"{}\": {} -> {}",
-                    domain, previous, version
-                );
+        if !is_standard {
+            if let Some(previous) = custom_opset_authorities.insert(domain.clone(), opset.version) {
+                let kind = if previous == opset.version {
+                    "duplicate"
+                } else {
+                    "conflicting"
+                };
+                return Err(ny_core::NyError::ModelLoad(format!(
+                    "{kind} custom ONNX opset imports for domain '{domain}' (versions {previous} and {})",
+                    opset.version
+                )));
             }
         }
-
-        if domain.is_empty() && !opset_imports.contains_key("ai.onnx") {
-            opset_imports.insert("ai.onnx".to_string(), version);
-        } else if domain == "ai.onnx" && !opset_imports.contains_key("") {
-            opset_imports.insert(String::new(), version);
+        if !is_standard && opset.version <= 0 {
+            warn!(
+                "Skipping opset import with invalid version {} for domain \"{}\"",
+                opset.version, domain,
+            );
+            continue;
         }
+
+        if is_standard {
+            if let Some(previous) = standard_opset {
+                // The empty domain and 'ai.onnx' are the SAME domain per the ONNX
+                // spec, so a model may legally list both. Only DISAGREEING versions
+                // are ambiguous — there we still fail closed, because picking either
+                // one silently changes operator semantics.
+                //
+                // Listing both at the SAME version is redundant but perfectly
+                // well-defined: every operator resolves to one core opset either
+                // way. Rejecting it blocked the entire dist_shift_2023 benchmark
+                // (72/72 rows, "versions 11 and 11"), which is a guaranteed 0 for a
+                // model ny can otherwise handle.
+                if previous != opset.version {
+                    return Err(ny_core::NyError::ModelLoad(format!(
+                        "conflicting standard ONNX opset imports: the empty and 'ai.onnx' domains are aliases for one core operator set (versions {previous} and {})",
+                        opset.version
+                    )));
+                }
+                debug!(
+                    "Model declares the standard ONNX opset twice at the same version ({previous}); \
+                     the empty and 'ai.onnx' domains are aliases, so this is redundant but unambiguous"
+                );
+                continue;
+            }
+            standard_opset = Some(opset.version);
+            continue;
+        }
+
+        opset_imports.insert(domain, opset.version);
     }
 
-    if !has_default_domain {
-        opset_imports
-            .entry(String::new())
-            .or_insert(DEFAULT_OPSET_VERSION);
-        opset_imports
-            .entry("ai.onnx".to_string())
-            .or_insert(DEFAULT_OPSET_VERSION);
+    let uses_standard_domain = model.graph.as_ref().is_some_and(|graph| {
+        graph
+            .node
+            .iter()
+            .any(|node| is_standard_onnx_domain(&node.domain))
+    });
+    if uses_standard_domain && standard_opset.is_none() {
+        return Err(ny_core::NyError::ModelLoad(
+            "model uses standard ONNX operators but has no standard-domain opset import; refusing to guess an operator-set version"
+                .to_string(),
+        ));
     }
 
-    opset_imports
+    if let Some(version) = standard_opset {
+        opset_imports.insert(String::new(), version);
+        opset_imports.insert("ai.onnx".to_string(), version);
+    }
+
+    Ok(opset_imports)
 }
 
 pub(super) fn merge_tensor_shape(name: &str, existing: &mut Vec<i64>, inferred: &[i64]) {
@@ -354,6 +464,9 @@ pub(super) fn validate_matmul_shapes(
     tensor_shapes: &mut HashMap<String, Vec<i64>>,
 ) {
     for node in nodes {
+        if !is_standard_onnx_domain(&node.domain) {
+            continue;
+        }
         let (b_idx, is_gemm) = match node.op_type.as_str() {
             "MatMul" => (1, false),
             "Gemm" => (1, true),
@@ -386,7 +499,7 @@ pub(super) fn validate_matmul_shapes(
                 .attribute
                 .iter()
                 .find(|attr| attr.name == "transB")
-                .is_some_and(|attr| attr.i != 0);
+                .is_some_and(|attr| attr.i_value() != 0);
             if trans_b {
                 b_shape[0] as i64
             } else {
@@ -437,6 +550,7 @@ mod tests {
             ],
             name: "constant_unary_chain".to_string(),
             initializer: Vec::new(),
+            sparse_initializer: Vec::new(),
             input: Vec::new(),
             output: Vec::new(),
             #[cfg(feature = "onnx-value-info")]
@@ -449,5 +563,66 @@ mod tests {
 
         assert!(constant_tensors.contains("sqrt_x"));
         assert!(constant_tensors.contains("inv_sqrt_x"));
+    }
+
+    #[test]
+    fn metadata_does_not_apply_standard_constant_semantics_to_custom_lookalikes() {
+        let mut custom_shape = node("custom_shape", "Shape", &["runtime"], &["custom_shape_out"]);
+        custom_shape.domain = "vendor.example".to_string();
+        let mut custom_add = node("custom_add", "Add", &["lhs", "rhs"], &["custom_add_out"]);
+        custom_add.domain = "vendor.example".to_string();
+        let mut explicit_standard_shape = node(
+            "explicit_standard_shape",
+            "Shape",
+            &["runtime"],
+            &["explicit_standard_shape_out"],
+        );
+        explicit_standard_shape.domain = "ai.onnx".to_string();
+        let graph = onnx_proto::GraphProto {
+            node: vec![
+                custom_shape,
+                custom_add,
+                node(
+                    "default_shape",
+                    "Shape",
+                    &["runtime"],
+                    &["default_shape_out"],
+                ),
+                explicit_standard_shape,
+            ],
+            ..Default::default()
+        };
+        let mut weights = WeightStore::new();
+        weights.insert("lhs".to_string(), ArrayD::zeros(IxDyn(&[1])));
+        weights.insert("rhs".to_string(), ArrayD::zeros(IxDyn(&[1])));
+
+        let constants = build_constant_tensors(&graph, &weights);
+
+        assert!(!constants.contains("custom_shape_out"));
+        assert!(!constants.contains("custom_add_out"));
+        assert!(constants.contains("default_shape_out"));
+        assert!(constants.contains("explicit_standard_shape_out"));
+    }
+
+    #[test]
+    fn matmul_shape_correction_ignores_custom_domain_lookalikes() {
+        let standard = node("standard", "MatMul", &["x", "weight"], &["standard_out"]);
+        let mut custom = node("custom", "MatMul", &["x", "weight"], &["custom_out"]);
+        custom.domain = "vendor.example".to_string();
+        let mut weights = WeightStore::new();
+        weights.insert("weight".to_string(), ArrayD::zeros(IxDyn(&[2, 4])));
+        let mut shapes = HashMap::from([
+            ("standard_out".to_string(), vec![1, 9]),
+            ("custom_out".to_string(), vec![1, 9]),
+        ]);
+
+        validate_matmul_shapes(&[standard, custom], &weights, &mut shapes);
+
+        assert_eq!(shapes.get("standard_out"), Some(&vec![1, 4]));
+        assert_eq!(
+            shapes.get("custom_out"),
+            Some(&vec![1, 9]),
+            "a custom handler owns its output-shape semantics"
+        );
     }
 }

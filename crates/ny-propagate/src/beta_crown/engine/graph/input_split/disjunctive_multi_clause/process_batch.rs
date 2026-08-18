@@ -4,7 +4,7 @@
 
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as FreshClipInstant};
 
 use ndarray::{Array2, ArrayD};
 use ny_core::{GemmEngine, NyError, Result};
@@ -18,7 +18,11 @@ use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
 use crate::bounds::LinearBounds;
 use crate::GraphNetwork;
 
-use super::super::grouped_semantics::disjunctive_domain_verified;
+use super::super::fresh_domain_clip::{
+    clip_with_fresh_exact_domain_planes, FreshDomainClipResult, FreshDomainClipStatus,
+    FreshDomainClipTelemetry,
+};
+use super::super::grouped_semantics::{disjunctive_domain_verified, valid_disjunctive_layout};
 use super::super::ibp_prescreen_flat::batched_ibp_prescreen_from_flat;
 use super::super::shared::{build_child_input, MultiObjBounds, MultiObjInputDomain};
 use super::push_survivors::{push_batched_relaxed_survivors, push_fallback_survivors};
@@ -54,6 +58,101 @@ pub(super) struct FlatPendingChild {
     pub(super) inherited_alpha_state: Option<Arc<crate::bounds::GraphAlphaState>>,
 }
 
+/// Revoke a clip result completed at or after the BaB deadline.
+///
+/// The affine proof remains mathematically sound, but strict budget semantics
+/// give it no dispatcher authority. Returning the exact source as `Skipped`
+/// also ensures telemetry cannot report a late terminal refutation.
+fn decline_fresh_clip_after_deadline(
+    source: &BoundedTensor,
+    outcome: FreshDomainClipResult,
+    deadline: FreshClipInstant,
+    completed_at: FreshClipInstant,
+) -> FreshDomainClipResult {
+    if completed_at >= deadline {
+        FreshDomainClipResult {
+            bounds: source.clone(),
+            status: FreshDomainClipStatus::Skipped,
+        }
+    } else {
+        outcome
+    }
+}
+
+/// Apply the default-dark fresh exact-domain clip to THIS popped domain.
+///
+/// The callback is invoked inside `clip_with_fresh_exact_domain_planes` with the
+/// exact source box. Its planes are private to that primitive and are dropped
+/// before this helper returns. The caller has already discarded the domain's
+/// pre-existing batch rebound plane: this batch-stack-unsafe route gives that
+/// plane no proof or split-scoring authority. The reordered child constructors
+/// below also explicitly store `None`, so no old or fresh planes reach a child
+/// clip, heuristic, or verdict path.
+fn fresh_clip_current_domain<F>(
+    verifier: &BetaCrownVerifier,
+    domain: &mut MultiObjInputDomain,
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+    compute_bounds: &F,
+    telemetry: &FreshDomainClipTelemetry,
+    deadline: FreshClipInstant,
+) -> bool
+where
+    F: Fn(&BoundedTensor, Option<&HashMap<String, BoundedTensor>>) -> Result<MultiObjBounds>,
+{
+    if !telemetry.enabled() {
+        return false;
+    }
+    debug_assert!(verifier.config.reorder_bab);
+    debug_assert!(verifier.config.input_split_ibp_enhancement);
+    debug_assert!(
+        !verifier.config.enable_relaxed_clip,
+        "fresh current-domain clip must coexist with the legacy child clip disabled"
+    );
+
+    let source = Arc::clone(&domain.input_bounds);
+    let outcome = clip_with_fresh_exact_domain_planes(
+        source.as_ref(),
+        thresholds,
+        clause_sizes,
+        verifier.config.verify_upper_bound,
+        verifier.config.relaxed_clip_iterations,
+        |exact_domain| {
+            if FreshClipInstant::now() >= deadline {
+                return Err(NyError::DeadlineExceeded(
+                    "fresh exact-domain full-spec CROWN deadline expired before bounding".into(),
+                ));
+            }
+            let (_objective_bounds, linear) = compute_bounds(exact_domain, None)?;
+            if FreshClipInstant::now() >= deadline {
+                return Err(NyError::DeadlineExceeded(
+                    "fresh exact-domain full-spec CROWN deadline expired after bounding".into(),
+                ));
+            }
+            linear.ok_or_else(|| {
+                NyError::UnsupportedConfiguration(
+                    "fresh exact-domain full-spec CROWN returned no affine planes".into(),
+                )
+            })
+        },
+    );
+    let outcome = decline_fresh_clip_after_deadline(
+        source.as_ref(),
+        outcome,
+        deadline,
+        FreshClipInstant::now(),
+    );
+    telemetry.record(source.as_ref(), &outcome);
+    match outcome.status {
+        FreshDomainClipStatus::Applied => {
+            domain.input_bounds = Arc::new(outcome.bounds);
+            false
+        }
+        FreshDomainClipStatus::AllClausesRefuted => true,
+        FreshDomainClipStatus::Skipped => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_disjunctive_domain_batch<F>(
     verifier: &BetaCrownVerifier,
@@ -66,6 +165,7 @@ pub(super) fn process_disjunctive_domain_batch<F>(
     compute_bounds: &F,
     warm_compute_bounds: Option<&WarmDisjunctiveComputeBoundsFn<'_>>,
     warm_alpha_telemetry: &WarmAlphaTelemetry,
+    fresh_domain_clip_telemetry: &FreshDomainClipTelemetry,
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
     bab_timeout: Duration,
     queue: &mut BinaryHeap<MultiObjInputDomain>,
@@ -88,6 +188,8 @@ where
             thresholds,
             clause_sizes,
             engine,
+            compute_bounds,
+            fresh_domain_clip_telemetry,
             mul_binary_alphas,
             bab_timeout,
             queue,
@@ -116,7 +218,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_reorder_prescreen_batch(
+fn process_reorder_prescreen_batch<F>(
     verifier: &BetaCrownVerifier,
     graph: &GraphNetwork,
     domains: Vec<MultiObjInputDomain>,
@@ -124,12 +226,21 @@ fn process_reorder_prescreen_batch(
     thresholds: &[f32],
     clause_sizes: &[usize],
     engine: Option<&dyn GemmEngine>,
+    compute_bounds: &F,
+    fresh_domain_clip_telemetry: &FreshDomainClipTelemetry,
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
     bab_timeout: Duration,
     queue: &mut BinaryHeap<MultiObjInputDomain>,
     lifecycle: &mut GraphBabLifecycle,
     domains_verified_by_clip: &mut usize,
-) -> Result<Option<BetaCrownResult>> {
+) -> Result<Option<BetaCrownResult>>
+where
+    F: Fn(&BoundedTensor, Option<&HashMap<String, BoundedTensor>>) -> Result<MultiObjBounds>,
+{
+    debug_assert!(
+        !fresh_domain_clip_telemetry.enabled() || !verifier.config.enable_relaxed_clip,
+        "fresh current-domain clipping requires the legacy child clip to stay disabled"
+    );
     // #lsnc-child-batch (S1): the consolidated child pipeline replaces the
     // per-child FlatPendingChild clone chain (split -> prescreen -> clip ->
     // push) for the batched-relaxed-clip lane. Bit-parity class; the body
@@ -182,6 +293,16 @@ fn process_reorder_prescreen_batch(
         lifecycle.domains_explored += 1;
         lifecycle.max_depth_reached = lifecycle.max_depth_reached.max(domain.depth);
 
+        if fresh_domain_clip_telemetry.enabled() {
+            // This route exists precisely because the graph's domain-stacked
+            // rebound planes are not trusted. Drop the old carrier before any
+            // edge helper or branch heuristic can consume it. The fresh
+            // non-domain-stacked full-spec planes remain private to the clip
+            // primitive and are dropped there as well, so SB intentionally
+            // takes its documented width-only fallback below.
+            domain.linear_bounds = None;
+        }
+
         if lifecycle.domains_explored.is_multiple_of(1000) || lifecycle.domains_explored <= 5 {
             trace!(
                 "[disjunctive-multi-clause] explored={} verified={} clipped={} depth={} queue={} pri={:.4}",
@@ -221,7 +342,7 @@ fn process_reorder_prescreen_batch(
                     spec_matrix,
                     &row_indices,
                     engine,
-                    lifecycle.start_time + bab_timeout,
+                    lifecycle.deadline(bab_timeout),
                 ) {
                     domain.obj_bounds =
                         super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
@@ -246,10 +367,33 @@ fn process_reorder_prescreen_batch(
             thresholds,
             clause_sizes,
             engine,
-            lifecycle.start_time + bab_timeout,
+            lifecycle.deadline(bab_timeout),
         ) {
             lifecycle.domains_verified += 1;
             continue;
+        }
+        if fresh_domain_clip_telemetry.enabled() {
+            let fresh_clip_deadline = lifecycle.deadline(bab_timeout);
+            if fresh_clip_current_domain(
+                verifier,
+                &mut domain,
+                thresholds,
+                clause_sizes,
+                compute_bounds,
+                fresh_domain_clip_telemetry,
+                fresh_clip_deadline,
+            ) {
+                *domains_verified_by_clip += 1;
+                lifecycle.domains_verified += 1;
+                continue;
+            }
+            // A late full-spec bound is converted to `Skipped` inside the
+            // callback. Return through the ordinary timeout result before
+            // spending more time splitting or prescreening that unchanged
+            // domain.
+            if FreshClipInstant::now() >= fresh_clip_deadline {
+                return Ok(Some(lifecycle.timeout_result()));
+            }
         }
         if domain.depth >= verifier.config.max_depth {
             lifecycle.unresolved_due_to_depth = true;
@@ -293,7 +437,7 @@ fn process_reorder_prescreen_batch(
                 clause_sizes,
                 mul_binary_alphas,
                 engine,
-                lifecycle.start_time + bab_timeout,
+                lifecycle.deadline(bab_timeout),
             ) {
                 lifecycle.domains_verified += 1;
                 continue;
@@ -320,7 +464,15 @@ fn process_reorder_prescreen_batch(
             flat_lower: child_lower.clone(),
             flat_upper: child_upper.clone(),
             obj_bounds: domain.obj_bounds.clone(),
-            linear_bounds: domain.linear_bounds.clone(),
+            // The fresh exact-domain planes have already been dropped. Also refuse to
+            // carry the current rebound plane into a child while this route is
+            // armed: every child must earn its own exact-domain plane when it is
+            // later popped.
+            linear_bounds: if fresh_domain_clip_telemetry.enabled() {
+                None
+            } else {
+                domain.linear_bounds.clone()
+            },
             depth: domain.depth + 1,
             priority: domain.priority,
             inherited_alpha_state: domain.inherited_alpha_state.clone(),
@@ -333,7 +485,11 @@ fn process_reorder_prescreen_batch(
             flat_lower: child_lower,
             flat_upper: child_upper,
             obj_bounds: domain.obj_bounds.clone(),
-            linear_bounds: domain.linear_bounds.clone(),
+            linear_bounds: if fresh_domain_clip_telemetry.enabled() {
+                None
+            } else {
+                domain.linear_bounds.clone()
+            },
             depth: domain.depth + 1,
             priority: domain.priority,
             inherited_alpha_state: domain.inherited_alpha_state.clone(),
@@ -510,7 +666,7 @@ where
                     spec_matrix,
                     &row_indices,
                     engine,
-                    lifecycle.start_time + bab_timeout,
+                    lifecycle.deadline(bab_timeout),
                 ) {
                     domain.obj_bounds =
                         super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
@@ -531,7 +687,7 @@ where
             thresholds,
             clause_sizes,
             engine,
-            lifecycle.start_time + bab_timeout,
+            lifecycle.deadline(bab_timeout),
         ) {
             lifecycle.domains_verified += 1;
             continue;
@@ -583,7 +739,7 @@ where
                     clause_sizes,
                     mul_binary_alphas,
                     engine,
-                    lifecycle.start_time + bab_timeout,
+                    lifecycle.deadline(bab_timeout),
                 ) {
                     lifecycle.domains_verified += 1;
                     continue;
@@ -639,7 +795,7 @@ where
                 clause_sizes,
                 mul_binary_alphas,
                 engine,
-                lifecycle.start_time + bab_timeout,
+                lifecycle.deadline(bab_timeout),
             ) {
                 lifecycle.domains_verified += 1;
                 continue;
@@ -720,9 +876,9 @@ pub(super) fn edge_domain_rows(
         return None;
     }
     let mut rows = Vec::new();
-    for (j, (lower, _)) in domain.obj_bounds.iter().enumerate() {
+    for (j, (lower, upper)) in domain.obj_bounds.iter().enumerate() {
         let threshold = thresholds[j];
-        if *lower > threshold {
+        if super::super::grouped_semantics::objective_interval_verified(*lower, *upper, threshold) {
             continue;
         }
         let shortfall = threshold - *lower;
@@ -763,16 +919,16 @@ pub(super) fn try_edge_alpha_pass(
     // per-row SPSA below starts AT the plain-CROWN baseline and keeps its
     // best, so the pass can only meet-or-beat plain (a state pre-optimized
     // for another objective starts BELOW baseline and often stays there).
-    let mut init_config = verifier.config.alpha_config.clone();
-    init_config.iterations = 0;
-    init_config.deadline = Some(deadline);
+    let init_config = edge_alpha_child_config(&verifier.config.alpha_config, 0, deadline);
     let (_, init_alpha) = graph
         .collect_alpha_crown_bounds_dag_with_engine(input, &init_config, engine)
         .ok()?;
 
-    let mut row_config = verifier.config.alpha_config.clone();
-    row_config.iterations = verifier.config.input_split_edge_alpha_iters.max(1);
-    row_config.deadline = Some(deadline);
+    let row_config = edge_alpha_child_config(
+        &verifier.config.alpha_config,
+        verifier.config.input_split_edge_alpha_iters.max(1),
+        deadline,
+    );
 
     let num_specs = spec_matrix.nrows();
     let mut fresh = vec![(f32::NEG_INFINITY, f32::INFINITY); num_specs];
@@ -812,14 +968,127 @@ pub(super) fn try_edge_alpha_pass(
     Some(fresh)
 }
 
-/// #relational-bab edge escalation: offer a NEAR-VERIFIED deep domain to the
-/// attached Graph-MIP leaf oracle with NO split premises (an input-split
-/// subdomain is fully described by its input box). Returns `true` ONLY on
-/// [`GraphMipLeafVerdict::VerifiedAllRows`] — the certified-UNSAT contract —
-/// so the caller counts the domain verified instead of splitting it. Every
-/// other outcome (gates unmet, collection failure, `Undecided`, advisory
-/// `Violated`) returns `false` and the domain proceeds through the unchanged
-/// split path.
+/// Derive α settings for a child-domain edge pass without leaking root-only
+/// collection authority.
+///
+/// The cGAN atomic collector is a root transaction. An edge-alpha experiment
+/// can be enabled independently, so cloning the root config verbatim would let
+/// that optional child path re-enter the root collector when both canaries are
+/// combined. Preserve every ordinary edge setting, including the caller's
+/// intermediate-bound policy, while clearing only the root-only flag.
+fn edge_alpha_child_config(
+    root: &crate::bounds::AlphaCrownConfig,
+    iterations: usize,
+    deadline: std::time::Instant,
+) -> crate::bounds::AlphaCrownConfig {
+    let mut child = root.clone();
+    child.iterations = iterations;
+    child.deadline = Some(deadline);
+    child.cgan_sparse_target_complete_root = false;
+    child.cgan_complete_crown_ibp_root = false;
+    child
+}
+
+/// Offer one still-undecided domain to the default-dark input-box-only oracle.
+///
+/// This deliberately runs before the edge-MIP path collects intermediate
+/// node bounds. Returns `true` only for a `VerifiedAllRows` result completed
+/// strictly before `deadline`; every other outcome preserves the caller's
+/// historical edge-MIP/split path.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn try_input_leaf_escalation(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    domain: &MultiObjInputDomain,
+    spec_matrix: &Array2<f32>,
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+    deadline: std::time::Instant,
+) -> bool {
+    try_input_leaf_escalation_with_clock(
+        verifier,
+        graph,
+        domain,
+        spec_matrix,
+        thresholds,
+        clause_sizes,
+        deadline,
+        FreshClipInstant::now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_input_leaf_escalation_with_clock<N>(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    domain: &MultiObjInputDomain,
+    spec_matrix: &Array2<f32>,
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+    deadline: std::time::Instant,
+    mut now: N,
+) -> bool
+where
+    N: FnMut() -> std::time::Instant,
+{
+    use crate::beta_crown::graph_mip_leaf::{GraphInputLeafRequest, GraphMipLeafVerdict};
+
+    if !verifier.config.input_split_input_leaf_oracle {
+        return false;
+    }
+    let Some(oracle) = verifier.graph_mip_leaf_oracle() else {
+        return false;
+    };
+    if !valid_disjunctive_layout(spec_matrix.nrows(), thresholds.len(), clause_sizes)
+        || domain.obj_bounds.len() != spec_matrix.nrows()
+        || spec_matrix
+            .iter()
+            .any(|coefficient| !coefficient.is_finite())
+        || thresholds.iter().any(|threshold| !threshold.is_finite())
+        || now() >= deadline
+    {
+        return false;
+    }
+
+    let request = GraphInputLeafRequest {
+        graph,
+        input_bounds: domain.input_bounds.as_ref(),
+        objectives: spec_matrix,
+        advisory_objective_bounds: &domain.obj_bounds,
+        thresholds,
+        clause_sizes,
+        depth: domain.depth,
+        deadline: Some(deadline),
+    };
+    let verdict = oracle.solve_input_leaf(&request);
+    if now() >= deadline {
+        trace!("input-leaf oracle completed at or after the BaB deadline; result declined");
+        return false;
+    }
+    match verdict {
+        GraphMipLeafVerdict::VerifiedAllRows => true,
+        GraphMipLeafVerdict::Violated { .. } => {
+            // Advisory per the shared oracle contract: sat reporting stays
+            // with the attack lanes and this domain follows the old path.
+            trace!("input-leaf oracle reported an advisory violation; domain requeued");
+            false
+        }
+        GraphMipLeafVerdict::Undecided => false,
+    }
+}
+
+/// Run the two independent leaf escalations in cheapest-first order.
+///
+/// The input-box-only oracle above is tried first whenever its separate gate
+/// is armed. If it declines, #relational-bab offers a NEAR-VERIFIED deep
+/// domain to the attached Graph-MIP leaf oracle with NO split premises (an
+/// input-split subdomain is fully described by its input box). Returns `true`
+/// ONLY on [`GraphMipLeafVerdict::VerifiedAllRows`] — the certified-UNSAT
+/// contract — so the caller counts the domain verified instead of splitting
+/// it. Every other outcome (gates unmet, collection failure, `Undecided`,
+/// advisory `Violated`) returns `false` and the domain proceeds through the
+/// unchanged split path.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_edge_milp_escalation(
     verifier: &BetaCrownVerifier,
@@ -831,9 +1100,53 @@ pub(super) fn try_edge_milp_escalation(
     engine: Option<&dyn GemmEngine>,
     deadline: std::time::Instant,
 ) -> bool {
+    try_edge_milp_escalation_with_clock(
+        verifier,
+        graph,
+        domain,
+        spec_matrix,
+        thresholds,
+        clause_sizes,
+        engine,
+        deadline,
+        FreshClipInstant::now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_edge_milp_escalation_with_clock<N>(
+    verifier: &BetaCrownVerifier,
+    graph: &GraphNetwork,
+    domain: &MultiObjInputDomain,
+    spec_matrix: &Array2<f32>,
+    thresholds: &[f32],
+    clause_sizes: &[usize],
+    engine: Option<&dyn GemmEngine>,
+    deadline: std::time::Instant,
+    mut now: N,
+) -> bool
+where
+    N: FnMut() -> std::time::Instant,
+{
     use crate::beta_crown::graph_mip_leaf::{GraphMipLeafRequest, GraphMipLeafVerdict};
 
+    if try_input_leaf_escalation_with_clock(
+        verifier,
+        graph,
+        domain,
+        spec_matrix,
+        thresholds,
+        clause_sizes,
+        deadline,
+        &mut now,
+    ) {
+        return true;
+    }
     if !verifier.config.input_split_edge_milp {
+        return false;
+    }
+    if now() >= deadline {
+        trace!("edge-MILP deadline expired before eligibility/collection; escalation declined");
         return false;
     }
     let Some(oracle) = verifier.graph_mip_leaf_oracle() else {
@@ -863,6 +1176,12 @@ pub(super) fn try_edge_milp_escalation(
     ) else {
         return false;
     };
+    if now() >= deadline {
+        trace!(
+            "edge-MILP intermediate bounds completed at or after the BaB deadline; solve declined"
+        );
+        return false;
+    }
     let node_bounds: HashMap<String, Arc<BoundedTensor>> = collected
         .into_iter()
         .map(|(name, bounds)| (name, Arc::new(bounds)))
@@ -876,7 +1195,12 @@ pub(super) fn try_edge_milp_escalation(
         depth: domain.depth,
         deadline: Some(deadline),
     };
-    match oracle.solve_leaf(&request) {
+    let verdict = oracle.solve_leaf(&request);
+    if now() >= deadline {
+        trace!("edge-MILP oracle completed at or after the BaB deadline; result declined");
+        return false;
+    }
+    match verdict {
         GraphMipLeafVerdict::VerifiedAllRows => true,
         GraphMipLeafVerdict::Violated { .. } => {
             // Advisory per the oracle contract: sat reporting stays with the

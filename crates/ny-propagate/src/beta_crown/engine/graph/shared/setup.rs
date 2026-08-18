@@ -74,6 +74,24 @@ pub(crate) fn build_graph_bab_setup(
     }
 }
 
+/// Build graph-BaB setup by moving finalized node bounds into shared storage.
+///
+/// Unlike [`build_graph_bab_setup`], this path does not clone the tensor
+/// buffers. It is intended for the final ownership handoff after no remaining
+/// root phase needs the unshared bounds map.
+pub(crate) fn build_graph_bab_setup_owned(
+    graph: &GraphNetwork,
+    initial_node_bounds: HashMap<String, BoundedTensor>,
+) -> GraphBabSetup {
+    GraphBabSetup {
+        relu_nodes: build_sorted_relu_nodes(graph),
+        initial_node_bounds_arc: initial_node_bounds
+            .into_iter()
+            .map(|(name, bounds)| (name, Arc::new(bounds)))
+            .collect(),
+    }
+}
+
 /// Build root-domain alpha state by transferring optimized root alpha values.
 pub(crate) fn build_root_alpha_state_from_root_alpha(
     root_alpha: &GraphAlphaState,
@@ -191,6 +209,45 @@ mod tests {
 
         assert_eq!(shared.lower(), &arr1(&[-1.0_f32, 0.25]).into_dyn());
         assert_eq!(shared.upper(), &arr1(&[1.5_f32, 2.0]).into_dyn());
+        assert_eq!(
+            setup.relu_nodes,
+            vec!["relu_a".to_string(), "relu_z".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_graph_bab_setup_owned_preserves_tensor_storage() {
+        let bounds = BoundedTensor::new(
+            arr1(&[-1.0_f32, 0.25]).into_dyn(),
+            arr1(&[1.5_f32, 2.0]).into_dyn(),
+        )
+        .expect("bounds should be valid");
+        let lower_ptr = bounds.lower().as_ptr();
+        let upper_ptr = bounds.upper().as_ptr();
+        let initial_node_bounds = HashMap::from([("relu_b".to_string(), bounds)]);
+
+        let linear = LinearLayer::new(arr2(&[[1.0_f32]]), None).expect("valid linear layer");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("relu_z", Layer::ReLU(ReLULayer)));
+        graph.add_node(GraphNode::from_input("linear", Layer::Linear(linear)));
+        graph.add_node(GraphNode::from_input("relu_a", Layer::ReLU(ReLULayer)));
+
+        let setup = build_graph_bab_setup_owned(&graph, initial_node_bounds);
+        let shared = setup
+            .initial_node_bounds_arc
+            .get("relu_b")
+            .expect("moved bounds should preserve the original key");
+
+        assert_eq!(
+            shared.lower().as_ptr(),
+            lower_ptr,
+            "owned setup must move, not clone, the lower tensor buffer"
+        );
+        assert_eq!(
+            shared.upper().as_ptr(),
+            upper_ptr,
+            "owned setup must move, not clone, the upper tensor buffer"
+        );
         assert_eq!(
             setup.relu_nodes,
             vec!["relu_a".to_string(), "relu_z".to_string()]

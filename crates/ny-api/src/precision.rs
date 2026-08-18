@@ -12,10 +12,12 @@
 //! 1. [`verify_with_precision_policy`] — **representation-only, HEURISTIC.** It
 //!    widens the verifier's OUTPUT bounds onto the deployed-precision grid. This
 //!    is a heuristic *sanity* pass, NOT a sound deployed-precision verdict.
-//! 2. [`verify_with_sound_precision`] — **layer-aware, SOUND.** It accounts for
-//!    accumulation rounding inside each reduction/Linear/Conv/MatMul layer using
-//!    [`ny_core::summation_error_bound`] before re-checking. A `Verified` from it
-//!    is sound for the deployed precision (see that function's docs).
+//! 2. [`verify_with_sound_precision`] — the fail-closed sound entry point.
+//!    All-F32 delegates to the ordinary sound verifier. Non-F32 execution is
+//!    currently refused with `UnsupportedConfiguration`: the experimental
+//!    layer-aware model does not yet cover every inter-layer store, graph
+//!    provenance source, or reduction-rounding recurrence rigorously enough to
+//!    issue a deployed-precision proof.
 //!
 //! # What [`verify_with_precision_policy`] models — and what it does NOT
 //!
@@ -37,7 +39,8 @@
 //! provenance ([`ny_core::VerificationSoundnessMode::Heuristic`]); it never
 //! returns a result labeled `Sound` "verified at deployed precision". Use
 //! [`verify_with_sound_precision`] when a sound deployed-precision verdict is
-//! required.
+//! required. At present that entry point deliberately refuses non-F32 policies
+//! rather than overclaiming a proof.
 //!
 //! (There is no dedicated [`ny_core::HeuristicUsed`] enum variant for precision
 //! widening today — a documented gap, see the crate integration notes. The
@@ -311,18 +314,19 @@ pub fn verify_with_precision_policy(
     Ok(widen_result_for_policy(result, spec, policy))
 }
 
-// ===========================================================================
-// PART D — Genuinely-sound, layer-aware deployed-precision verification.
-//
-// Unlike `verify_with_precision_policy` (representation-only / Heuristic), this
-// path accounts for ACCUMULATION rounding inside reduction/Linear layers using
-// `ny_core::summation_error_bound`. When it returns `Verified` with `Sound`
-// provenance, the verdict is sound for the deployed precision.
-// ===========================================================================
+use ny_propagate::GraphNetwork;
 
+// The former non-F32 implementation remains test-only below as research
+// scaffolding. It must not be wired back into the public entry point without a
+// rigorous treatment of every inter-layer store, reduction recurrence, graph
+// soundness provenance, and deadline.
+#[cfg(test)]
 use ny_core::FloatPrecision as FP;
+#[cfg(test)]
 use ny_propagate::layers::{BoundPropagation, Layer};
-use ny_propagate::{GraphNetwork, GraphNode, NETWORK_INPUT};
+#[cfg(test)]
+use ny_propagate::{GraphNode, NETWORK_INPUT};
+#[cfg(test)]
 use ny_tensor::BoundedTensor;
 
 /// Tracks whether every accumulating layer's error was exactly accounted for.
@@ -332,6 +336,7 @@ use ny_tensor::BoundedTensor;
 /// widened conservatively to `[-inf, +inf]` (still sound) but cannot be reported
 /// as exactly accounted, so the run is downgraded to `Heuristic` with a recorded
 /// reason rather than claiming a `Sound` deployed-precision verdict for them.
+#[cfg(test)]
 struct AccountingState {
     /// `true` while every accumulating layer encountered so far was modeled
     /// exactly. Becomes `false` (with a reason) the first time an accumulating
@@ -341,6 +346,7 @@ struct AccountingState {
     reason: Option<String>,
 }
 
+#[cfg(test)]
 impl AccountingState {
     fn new() -> Self {
         Self {
@@ -357,67 +363,16 @@ impl AccountingState {
     }
 }
 
-/// Verify `graph` against `spec` at `policy`'s deployed precision, accounting for
-/// per-layer ACCUMULATION rounding so a `Verified` verdict is SOUND for the
-/// deployed f16/bf16 compute.
+/// Verify `graph` under a precision policy without issuing an unsupported proof.
 ///
-/// # What is modeled
-///
-/// The pass runs a self-contained forward IBP over the graph in topological
-/// order, reusing NY's own per-layer IBP (which is inclusion-monotone and
-/// directed-rounded). For `Linear` layers it then RECOMPUTES each output's
-/// deployed interval by DIRECT INTERVAL ARITHMETIC AT DEPLOYED PRECISION,
-/// rounding OUTWARD to the actual grid at every step (see [`sound_widen_linear`]).
-/// This is sound BY CONSTRUCTION rather than by an error budget:
-///
-/// - Inputs and weights are rounded OUTWARD to the compute grid before use (via
-///   [`ny_core::round_to_precision_outward`]).
-/// - Each per-term product is the interval hull of the four corner products,
-///   narrowed to f32 outward, then rounded OUTWARD to the compute grid — so a
-///   per-product overflow into compute precision becomes `±inf` automatically.
-/// - Products are accumulated left-to-right with each partial-sum store rounded
-///   OUTWARD to the accumulate grid — so a running-sum overflow becomes `±inf`
-///   automatically, and the single-store rounding of a one-term reduction is
-///   modeled like any other.
-/// - The bias is folded in as one extra accumulated term with its own
-///   accumulate-grid store.
-/// - The final accumulator is rounded OUTWARD to the output store grid (the
-///   COARSER of compute/accumulate) for the output store rounding.
-///
-/// Because interval arithmetic with directed outward rounding contains every
-/// real execution, the recomputed interval over-approximates every value the
-/// deployed-precision Linear can produce — no `gamma_N` accumulation estimate and
-/// no per-source error budget that could under-charge. Subnormals, bias, n=1
-/// stores, compute-vs-accumulate coarseness, and overflow are all handled by the
-/// grid-rounding operator itself.
-///
-/// # Exactly-accounted vs. conservatively-bounded layers
-///
-/// - `Linear` accumulating layers are modeled **soundly by construction** with
-///   direct outward-rounded interval arithmetic (weights/bias and fan-in =
-///   `in_features` are available, so the per-output reduction is reconstructible).
-/// - Convolution / `MatMul` accumulating layers are widened **conservatively** to
-///   `[-inf, +inf]` (sound but coarse) because their weight/fan-in product is not
-///   reachable through this facade. The run is then labeled `Heuristic` with a
-///   recorded reason rather than claiming a `Sound` deployed-precision verdict.
-/// - `ReduceSum` / `ReduceMean` are likewise widened to `[-inf, +inf]` +
-///   `Heuristic`: the per-output fan-in (reduced-axis -> output mapping) and the
-///   mean's 1/N scaling are not reachable here, and a single full-set fold cannot
-///   soundly stand in for arbitrary mixed-sign subset sums.
-/// - All non-accumulating layers (activations, reshapes, element-wise ops) are
-///   propagated by NY's existing sound IBP; their soundness comes for free from
-///   inclusion-monotonicity applied to the already-widened inputs.
-///
-/// # Provenance
-///
-/// `Sound` iff the policy is non-trivial **and** every accumulating layer was
-/// accounted for exactly; otherwise `Heuristic`. The default (all-F32) policy is
-/// a strict no-op that delegates to [`Verifier::verify_graph`] and returns its
-/// verdict unchanged (so `F32` is exactly the normal verdict, provenance and
-/// all).
+/// The idealized all-F32 policy delegates unchanged to the ordinary sound graph
+/// verifier. Non-F32 policies are currently refused: the experimental widening
+/// path does not yet model every deployed store and reduction rigorously and
+/// must never emit `Verified` with sound provenance.
 ///
 /// # Errors
-/// Propagates layer/propagation errors and shape errors from the underlying IBP.
+/// Returns [`ny_core::NyError::UnsupportedConfiguration`] for every non-F32
+/// policy. All-F32 propagates errors from the ordinary verifier.
 pub fn verify_with_sound_precision(
     net: &GraphNetwork,
     spec: &VerificationSpec,
@@ -429,36 +384,12 @@ pub fn verify_with_sound_precision(
         let verifier = crate::verify::Verifier::new(crate::verify::PropagationConfig::default());
         return verifier.verify_graph(net, spec);
     }
-
-    // Precisions: `compute` rounds per-element products/activations; `accumulate`
-    // is the reduction running-sum precision. Use each where it applies.
-    let compute_p = policy.compute;
-    let accumulate_p = policy.accumulate;
-
-    // Build the input bounded tensor from the spec (same contract the verifier
-    // uses), then run our layer-aware forward IBP.
-    let input = crate::verify::Verifier::bounds_to_tensor(spec.input_bounds(), spec.input_shape())?;
-
-    let mut accounting = AccountingState::new();
-    let output_tensor = sound_forward_ibp(net, &input, compute_p, accumulate_p, &mut accounting)?;
-
-    // Flatten the deployed output bounds to a per-element Vec<Bound>.
-    let computed = bounded_tensor_to_bounds(&output_tensor);
-
-    // Provenance: Sound only if every accumulating layer was accounted for.
-    let provenance = if accounting.all_accounted {
-        SoundnessProvenance::sound()
-    } else {
-        // Record the gap explicitly; never silently claim Sound.
-        SoundnessProvenance::heuristic()
-    };
-
-    Ok(decide_against_required(
-        computed,
-        spec.output_bounds(),
-        provenance,
-        Some(ny_core::MethodUsed::Ibp),
-    ))
+    Err(ny_core::NyError::UnsupportedConfiguration(format!(
+        "sound deployed-precision verification is not yet implemented for \
+         compute={:?}, accumulate={:?}; use the all-F32 sound verifier or the \
+         explicitly heuristic representation-only precision API",
+        policy.compute, policy.accumulate
+    )))
 }
 
 /// Run a self-contained, SOUND, layer-aware forward IBP over `net`.
@@ -466,6 +397,7 @@ pub fn verify_with_sound_precision(
 /// Returns the deployed-precision output [`BoundedTensor`]. Per accumulating
 /// layer, the output is additively widened by the accumulation + representation
 /// error so the result over-approximates the deployed computation.
+#[cfg(test)]
 fn sound_forward_ibp(
     net: &GraphNetwork,
     input: &BoundedTensor,
@@ -563,6 +495,7 @@ fn sound_forward_ibp(
 ///
 /// `in_tensor` is the (deployed) input interval to the layer; `out` is the
 /// idealized output interval already computed by the layer's IBP.
+#[cfg(test)]
 fn widen_accumulating_layer_output(
     layer: &Layer,
     in_tensor: &BoundedTensor,
@@ -661,6 +594,7 @@ fn widen_accumulating_layer_output(
 /// `NaN`; a NaN sum can only arise from `+inf + -inf` corners and is widened to
 /// the appropriate infinity by the callers' overflow handling).
 #[inline]
+#[cfg(test)]
 fn f64_to_f32_outward(x: f64, up: bool) -> f32 {
     if x.is_nan() {
         return f32::NAN;
@@ -748,6 +682,7 @@ fn f64_to_f32_outward(x: f64, up: bool) -> f32 {
 /// than silently finite. The product step itself contains every real product of
 /// operands in the rounded input/weight intervals, and the final store contains
 /// the written output. `out` is used only as a shape/length reference.
+#[cfg(test)]
 fn sound_widen_linear(
     lin: &ny_propagate::layers::LinearLayer,
     in_tensor: &BoundedTensor,
@@ -755,7 +690,7 @@ fn sound_widen_linear(
     compute_p: FP,
     accumulate_p: FP,
 ) -> ny_core::Result<BoundedTensor> {
-    let weight = &lin.weight; // shape [out_features, in_features]
+    let weight = lin.weight(); // shape [out_features, in_features]
     let in_features = lin.in_features();
     let out_features = lin.out_features().max(1);
 
@@ -875,7 +810,7 @@ fn sound_widen_linear(
 
         // Bias: one extra term, bracketed on the compute grid (no product). A NaN
         // bias bracket (from an overflow corner) is unconstrained too.
-        if let Some(bias) = lin.bias.as_ref() {
+        if let Some(bias) = lin.bias() {
             if let Some(&b) = bias.get(j) {
                 let (bl, bu) = ny_core::round_to_precision_outward(b, b, compute_p);
                 if bl.is_nan() || bu.is_nan() {
@@ -967,6 +902,7 @@ fn sound_widen_linear(
 }
 
 /// Maximum |v| over the union of `lower` and `upper` arrays (sound, rounded up).
+#[cfg(test)]
 fn max_abs_over(lower: &ndarray::ArrayD<f32>, upper: &ndarray::ArrayD<f32>) -> f32 {
     let mut m = 0.0_f32;
     for &v in lower.iter() {
@@ -983,6 +919,7 @@ fn max_abs_over(lower: &ndarray::ArrayD<f32>, upper: &ndarray::ArrayD<f32>) -> f
 }
 
 /// Flatten a [`BoundedTensor`] to a row-major `Vec<Bound>` (infinity-admitting).
+#[cfg(test)]
 fn bounded_tensor_to_bounds(t: &BoundedTensor) -> Vec<Bound> {
     let lower = t.lower();
     let upper = t.upper();
@@ -1269,8 +1206,7 @@ mod tests {
 
     use half::{bf16, f16};
     use ndarray::{Array1, Array2};
-    use ny_propagate::layers::Layer;
-    use ny_propagate::layers::LinearLayer;
+    use ny_propagate::layers::{Layer, LinearLayer, ReLULayer};
 
     /// Round a single f32 to precision `p` (round-to-nearest), as the deployed
     /// hardware stores/uses a value.
@@ -1324,31 +1260,45 @@ mod tests {
         g
     }
 
-    /// Run verify_with_sound_precision and return the computed (deployed) output
-    /// bounds, regardless of Verified/Unknown verdict. Uses a permissive output
-    /// requirement so the verdict re-check never masks the bounds we want to check.
+    #[test]
+    fn f16_relu_policy_is_refused_before_store_rounding_can_be_mislabeled_sound() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer::new())));
+        graph.set_output("relu");
+        // 1.0004 rounds to 1.0 in f16. The quarantined implementation used to
+        // leave this non-accumulating singleton unchanged and label it Sound.
+        let spec =
+            VerificationSpec::new(vec![Bound::new(1.0004, 1.0004)], vec![Bound::new(0.0, 2.0)])
+                .unwrap();
+        let policy = MixedPrecisionPolicy::uniform(FloatPrecision::F16);
+        assert!(matches!(
+            verify_with_sound_precision(&graph, &spec, &policy),
+            Err(ny_core::NyError::UnsupportedConfiguration(_))
+        ));
+    }
+
+    /// Exercise the quarantined experimental interval model directly. These
+    /// containment tests are research checks only; the public sound API refuses
+    /// non-F32 policies until the model's missing proof obligations are closed.
     fn sound_output_bounds(
         weight: Array2<f32>,
         bias: Option<Array1<f32>>,
         input: Vec<Bound>,
         policy: &MixedPrecisionPolicy,
     ) -> Vec<Bound> {
-        let out_features = weight.nrows();
         let graph = single_linear_graph(weight, bias);
-        // Permissive requirement: one [-inf, +inf] per output so decide_against_required
-        // returns the computed bounds whatever they are. (We assert containment on the
-        // returned bounds directly.)
-        let required: Vec<Bound> = (0..out_features)
-            .map(|_| Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY))
-            .collect();
-        let spec = VerificationSpec::new(input, required).expect("valid spec");
-        let result =
-            verify_with_sound_precision(&graph, &spec, policy).expect("sound precision run");
-        match result {
-            VerificationResult::Verified { output_bounds, .. } => output_bounds,
-            VerificationResult::Unknown { bounds, .. } => bounds,
-            other => panic!("expected Verified/Unknown with bounds, got {other:?}"),
-        }
+        let input =
+            crate::verify::Verifier::bounds_to_tensor(&input, None).expect("valid test input");
+        let mut accounting = AccountingState::new();
+        let output = sound_forward_ibp(
+            &graph,
+            &input,
+            policy.compute,
+            policy.accumulate,
+            &mut accounting,
+        )
+        .expect("experimental interval run");
+        bounded_tensor_to_bounds(&output)
     }
 
     /// Assert that `bounds[j]` contains `deployed` (with -inf/+inf admitted).
@@ -1670,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_sound_path_never_false_verifies_coarse_case() {
+    fn non_f32_sound_entry_point_refuses_coarse_case() {
         // Soundness contract: a coarse deployed case whose deployed output violates
         // a tight property must yield Unknown (or be contained), NEVER a false
         // Verify. We use the 5000-ones f16 case with a TIGHT requirement [4990, 5010]
@@ -1682,23 +1632,16 @@ mod tests {
         let input = vec![Bound::new(1.0, 1.0); n];
         let spec = VerificationSpec::new(input, vec![Bound::new(4990.0, 5010.0)]).unwrap();
         let policy = MixedPrecisionPolicy::uniform(FloatPrecision::F16);
-        let result = verify_with_sound_precision(&graph, &spec, &policy).unwrap();
-        assert!(
-            !result.is_verified(),
-            "sound path must NOT Verify a tight property the deployed net violates: {result:?}"
-        );
-        assert!(
-            matches!(result, VerificationResult::Unknown { .. }),
-            "expected Unknown for the coarse f16 case, got {result:?}"
-        );
+        assert!(matches!(
+            verify_with_sound_precision(&graph, &spec, &policy),
+            Err(ny_core::NyError::UnsupportedConfiguration(_))
+        ));
     }
 
     #[test]
-    fn acceptance_sound_path_verifies_with_real_margin() {
-        // The sound path CAN Verify when the requirement is loose enough to survive
-        // the (real, large) deployed widening. 5000-ones f16 with a generous
-        // requirement [-inf, +inf] stays Verified AND is labeled Sound (single
-        // Linear, fully accounted).
+    fn non_f32_sound_entry_point_never_verifies_even_with_vacuous_bounds() {
+        // A permissive output property must not turn an incomplete precision
+        // model into a proof.
         let n = 5000usize;
         let weight = Array2::from_shape_vec((1, n), vec![1.0_f32; n]).unwrap();
         let graph = single_linear_graph(weight, None);
@@ -1709,17 +1652,10 @@ mod tests {
         )
         .unwrap();
         let policy = MixedPrecisionPolicy::uniform(FloatPrecision::F16);
-        let result = verify_with_sound_precision(&graph, &spec, &policy).unwrap();
-        match result {
-            VerificationResult::Verified { provenance, .. } => {
-                assert_eq!(
-                    provenance.mode(),
-                    VerificationSoundnessMode::Sound,
-                    "single fully-accounted Linear should be labeled Sound"
-                );
-            }
-            other => panic!("expected Verified with Sound provenance, got {other:?}"),
-        }
+        assert!(matches!(
+            verify_with_sound_precision(&graph, &spec, &policy),
+            Err(ny_core::NyError::UnsupportedConfiguration(_))
+        ));
     }
 
     // =====================================================================

@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use ny_core::LayerType;
 
 use super::layer_metadata::{
-    activation_input_bytes, activation_input_names, activation_input_shapes, parameter_input_bytes,
-    parameter_input_tensors, timing_family,
+    activation_input_bytes, activation_input_names, activation_input_shapes, is_runtime_tensor,
+    parameter_input_bytes, parameter_input_tensors, timing_family,
 };
 use super::lookup::ShapeLookup;
 use super::{CostError, CostResult, LayerCost};
@@ -74,13 +74,25 @@ fn analyze_layers(
     let mut peak_activation_bytes = *live_bytes;
 
     for layer in &model.network.layers {
+        // The ONNX importer retains producer topology after constant folding,
+        // so a folded MatMul/Add/etc. may still have a LayerSpec even though
+        // every output is already in WeightStore.  Such a node performs no
+        // runtime work and has no activation input; trying to cost it as an
+        // ordinary MatMul both over-counts and fails on the missing activation.
+        if !layer
+            .outputs
+            .iter()
+            .any(|name| is_runtime_tensor(model, name))
+        {
+            continue;
+        }
         let output_shapes = collect_runtime_output_shapes(model, lookup, layer)?;
         // Register computed output shapes so subsequent layers can find shapes
         // of intermediate tensors produced by decomposed ops (ReduceL2, LSTM).
         for (name, shape) in layer
             .outputs
             .iter()
-            .filter(|name| !model.constant_tensors().contains(*name))
+            .filter(|name| is_runtime_tensor(model, name))
             .zip(output_shapes.iter())
         {
             lookup.register_shape(name.clone(), shape.clone());
@@ -163,7 +175,7 @@ fn collect_runtime_output_shapes(
     layer
         .outputs
         .iter()
-        .filter(|name| !model.constant_tensors().contains(*name))
+        .filter(|name| is_runtime_tensor(model, name))
         .map(|name| {
             lookup.tensor_shape(name).or_else(|_| {
                 // Fallback only for audited decomposed intermediates that
@@ -199,7 +211,7 @@ fn insert_runtime_outputs(
     for (name, shape) in layer
         .outputs
         .iter()
-        .filter(|name| !model.constant_tensors().contains(*name))
+        .filter(|name| is_runtime_tensor(model, name))
         .zip(output_shapes.iter())
     {
         live_tensors.insert(name.clone(), bytes_for_shape(shape)?);
@@ -320,6 +332,7 @@ fn estimate_layer_flops(
         | LayerType::Cos
         | LayerType::Tan
         | LayerType::Arctan
+        | LayerType::Erf
         | LayerType::Mish
         | LayerType::GELU => output_elements.checked_mul(6).ok_or_else(|| {
             CostError::propagation_msg("static cost estimate", "transcendental FLOPs overflow")

@@ -918,13 +918,11 @@ fn test_crown_ibp_tighter_than_ibp_linear_relu_linear_2990() {
 // DEADLINE ENFORCEMENT REGRESSION TESTS (#3328)
 // ============================================================
 
-/// #3328: CROWN backward pass with an already-elapsed deadline falls back to IBP.
-///
-/// Verifies that propagate_crown_with_engine_and_deadline returns IBP bounds
-/// (not an error or hang) when the deadline is already in the past. The output
-/// must be sound (IBP bounds contain all reachable outputs).
+/// An already-elapsed fresh CROWN request cannot start a new IBP sweep merely
+/// to manufacture a fallback result. It must preserve hard authority as a
+/// typed deadline refusal.
 #[test]
-fn test_crown_deadline_already_elapsed_falls_back_to_ibp_3328() {
+fn test_crown_deadline_already_elapsed_refuses_before_fresh_ibp_3328() {
     use std::time::{Duration, Instant};
 
     // Build a simple 2-layer network: Linear(2→3) + ReLU + Linear(3→1)
@@ -947,35 +945,20 @@ fn test_crown_deadline_already_elapsed_falls_back_to_ibp_3328() {
         .propagate_crown_with_engine_and_deadline(&input, None, None)
         .unwrap();
 
-    // CROWN with deadline already in the past — should fall back to IBP.
+    // CROWN with a deadline already in the past has no precollected output to
+    // publish and therefore must refuse before doing O(N) fallback work.
     let past_deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
-    let deadline_bounds = network
+    let error = network
         .propagate_crown_with_engine_and_deadline(&input, None, past_deadline)
-        .unwrap();
+        .expect_err("expired fresh CROWN must preserve hard deadline authority");
+    assert!(
+        matches!(error, NyError::DeadlineExceeded(_)),
+        "expected typed deadline refusal, got {error:?}"
+    );
 
     // IBP bounds for reference.
     let ibp_bounds = network.propagate_ibp(&input).unwrap();
-
-    // Deadline fallback should produce exactly IBP bounds.
     let tol = 1e-6;
-    for i in 0..ibp_bounds.len() {
-        assert!(
-            (deadline_bounds.lower().as_slice().unwrap()[i]
-                - ibp_bounds.lower().as_slice().unwrap()[i])
-                .abs()
-                < tol,
-            "Deadline fallback lower[{}] should match IBP",
-            i
-        );
-        assert!(
-            (deadline_bounds.upper().as_slice().unwrap()[i]
-                - ibp_bounds.upper().as_slice().unwrap()[i])
-                .abs()
-                < tol,
-            "Deadline fallback upper[{}] should match IBP",
-            i
-        );
-    }
 
     // CROWN bounds should be at least as tight as IBP (CROWN ⊆ IBP).
     for i in 0..crown_bounds.len() {
@@ -994,9 +977,10 @@ fn test_crown_deadline_already_elapsed_falls_back_to_ibp_3328() {
     }
 }
 
-/// #3328: CROWN-IBP collection with elapsed deadline falls back to IBP per layer.
+/// A fresh CROWN-IBP collection cannot start its full forward sweep after the
+/// deadline has already elapsed.
 #[test]
-fn test_crown_ibp_deadline_falls_back_per_layer_3328() {
+fn test_crown_ibp_elapsed_deadline_refuses_before_forward_sweep_3328() {
     use std::time::{Duration, Instant};
 
     // 2-layer network: Linear(2→3) + ReLU + Linear(3→1)
@@ -1016,34 +1000,8 @@ fn test_crown_ibp_deadline_falls_back_per_layer_3328() {
 
     // Collect CROWN-IBP with elapsed deadline.
     let past_deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
-    let deadline_bounds = network
+    let error = network
         .collect_crown_ibp_bounds_with_engine_and_deadline(&input, None, past_deadline)
-        .unwrap();
-
-    // Collect pure IBP bounds.
-    let ibp_bounds = network.collect_ibp_bounds(&input).unwrap();
-
-    // With elapsed deadline, all layers should have fallen back to IBP.
-    assert_eq!(deadline_bounds.len(), ibp_bounds.len());
-    let tol = 1e-6;
-    for (k, (deadline_b, ibp_b)) in deadline_bounds.iter().zip(ibp_bounds.iter()).enumerate() {
-        for i in 0..ibp_b.len() {
-            assert!(
-                (deadline_b.lower().as_slice().unwrap()[i] - ibp_b.lower().as_slice().unwrap()[i])
-                    .abs()
-                    < tol,
-                "Layer {} deadline fallback lower[{}] should match IBP",
-                k,
-                i
-            );
-            assert!(
-                (deadline_b.upper().as_slice().unwrap()[i] - ibp_b.upper().as_slice().unwrap()[i])
-                    .abs()
-                    < tol,
-                "Layer {} deadline fallback upper[{}] should match IBP",
-                k,
-                i
-            );
-        }
-    }
+        .expect_err("expired collection must refuse before fresh IBP work");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
 }

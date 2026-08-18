@@ -18,7 +18,7 @@ import json
 import socket
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ from typing import Any
 DEFAULT_NY_PATH = Path("target/release/ny")
 REPORTS_DIR = Path("reports/benchmarks")
 METRICS_DIR = Path("metrics/benchmarks")
+UTC = timezone.utc
 
 
 def _iso_now() -> str:

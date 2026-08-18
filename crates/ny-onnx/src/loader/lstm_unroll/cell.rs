@@ -351,6 +351,7 @@ fn wire_final_states(
 ) {
     let base = &config.base;
     let domain = &config.domain;
+    let direction_axis = if config.layout == 0 { 0 } else { 1 };
 
     if let Some(ref y_h_out) = config.y_h_name {
         nodes.push(make_node(
@@ -359,7 +360,7 @@ fn wire_final_states(
             &[y_h_out],
             &format!("{base}__lstm_unsqueeze_yh"),
             domain,
-            vec![make_ints_attr("axes", &[0])],
+            vec![make_ints_attr("axes", &[direction_axis])],
         ));
     }
 
@@ -370,7 +371,7 @@ fn wire_final_states(
             &[y_c_out],
             &format!("{base}__lstm_unsqueeze_yc"),
             domain,
-            vec![make_ints_attr("axes", &[0])],
+            vec![make_ints_attr("axes", &[direction_axis])],
         ));
     }
 }

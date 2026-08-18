@@ -340,19 +340,67 @@ pub(super) fn parse_bool_expr(
                         ));
                     };
                     if child_items.is_empty() {
-                        continue;
+                        return Err(NyError::InvalidSpec(
+                            "Empty expression in mixed input/output 'and' clause".to_string(),
+                        ));
                     }
                     let Some(Expr::Symbol(child_op)) = child_items.first() else {
-                        continue;
+                        return Err(NyError::InvalidSpec(
+                            "Invalid expression in mixed input/output 'and' clause".to_string(),
+                        ));
                     };
-                    if matches!(child_op.as_str(), "<=" | ">=" | "<" | ">" | "=") {
+                    if matches!(child_op.as_str(), "<=" | ">=" | "<" | ">" | "=" | "==") {
                         let lc = parse_linear_constraint(child, input_declared, output_declared)?;
+                        // FAIL CLOSED on an input atom the per-clause box cannot
+                        // represent (#mixed-and-drop). `extract_single_input_bound`
+                        // returns None for multi-variable atoms and for `=`, and
+                        // `strip_input_constraints` then removes EVERY input-only
+                        // constraint regardless of whether a bound was captured — so
+                        // the atom vanishes from the spec entirely. That is wrong in
+                        // BOTH directions: the clause's per-clause map is left empty
+                        // so `property_violated_f64` applies no input gate to it
+                        // (false SAT, the nn4sys-71 class), and the union widening
+                        // contributes nothing for that clause so its true region can
+                        // fall outside the searched domain (false UNSAT).
+                        //
+                        // This assertion also contains an output condition, so
+                        // declining with `Ok(None)` would drop the WHOLE unsafe
+                        // clause. Fail closed with a hard parse error instead.
+                        let is_input_only =
+                            matches!(constraint_scope(&lc), ConstraintScope::InputOnly);
+                        if is_input_only
+                            && (lc.is_strict
+                                || lc.expr.terms().count() != 1
+                                || matches!(lc.relation, Relation::Equal))
+                        {
+                            return Err(NyError::InvalidSpec(if lc.is_strict {
+                                "Strict input constraints are unsupported: affine input boxes \
+                                     cannot represent exclusive endpoints"
+                                    .to_string()
+                            } else {
+                                "Input constraint in mixed input/output 'and' clause cannot be \
+                                     represented as one per-clause bound"
+                                    .to_string()
+                            }));
+                        }
                         all_children.push(BoolExpr::Atom(lc));
                     } else {
-                        // Nested boolean expression
+                        // A nested output/mixed boolean tree is parsed normally.
+                        // A nested pure-input tree must be retained too; silently
+                        // skipping it widens the unsafe clause and can certify a
+                        // false SAT witness.
                         if let Some(expr) = parse_bool_expr(child, input_declared, output_declared)?
                         {
                             all_children.push(expr);
+                        } else if let Some(input_expr) =
+                            parse_input_only_bool_tree(child, input_declared, output_declared)?
+                        {
+                            all_children.push(input_expr);
+                        } else {
+                            return Err(NyError::InvalidSpec(
+                                "Unsupported input expression in mixed input/output 'and' clause"
+                                    .to_string(),
+                            ));
                         }
                     }
                 }
@@ -368,8 +416,25 @@ pub(super) fn parse_bool_expr(
                 _ => BoolExpr::Or(flattened),
             }))
         }
-        "<=" | ">=" | "<" | ">" | "=" => {
+        "<=" | ">=" | "<" | ">" | "=" | "==" => {
             if !expr_contains_output(expr, output_declared) {
+                // Pure input atoms are normally omitted from the output
+                // expression. Inspect strict affine leaves before doing so:
+                // omitting their openness and later retaining an inclusive
+                // endpoint would make boundary witnesses falsely valid.
+                if matches!(op.as_str(), "<" | ">") {
+                    if let Ok(constraint) =
+                        parse_linear_constraint(expr, input_declared, output_declared)
+                    {
+                        if matches!(constraint_scope(&constraint), ConstraintScope::InputOnly) {
+                            return Err(NyError::InvalidSpec(
+                                "Strict input constraints are unsupported: affine input boxes \
+                                 cannot represent exclusive endpoints"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
                 return Ok(None);
             }
             let constraint = parse_linear_constraint(expr, input_declared, output_declared)?;
@@ -461,7 +526,7 @@ fn parse_input_only_bool_tree(
                 BoolExpr::Or(flattened)
             }))
         }
-        "<=" | ">=" | "<" | ">" | "=" => {
+        "<=" | ">=" | "<" | ">" | "=" | "==" => {
             // A leaf that fails to linearize (unknown symbol, non-linear term)
             // declines the whole assert instead of erroring: ignoring an
             // input-only assert widens the domain (sound), while erroring
@@ -470,6 +535,15 @@ fn parse_input_only_bool_tree(
             else {
                 return Ok(None);
             };
+            if constraint.is_strict
+                && matches!(constraint_scope(&constraint), ConstraintScope::InputOnly)
+            {
+                return Err(NyError::InvalidSpec(
+                    "Strict input constraints are unsupported: affine input boxes cannot \
+                     represent exclusive endpoints"
+                        .to_string(),
+                ));
+            }
             // Only single-variable, non-equality atoms:
             // `extract_single_input_bound` is what ultimately consumes these,
             // and it can only turn one-variable `<=`/`>=` constraints into

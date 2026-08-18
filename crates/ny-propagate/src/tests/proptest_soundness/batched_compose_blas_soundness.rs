@@ -37,27 +37,7 @@ use ny_cert::rational::Rat;
 // =============================================================================
 
 fn f32_to_rat(x: f32) -> Rat {
-    use num_bigint::BigInt;
-    assert!(x.is_finite(), "f32_to_rat: non-finite {x}");
-    if x == 0.0 {
-        return Rat::ZERO;
-    }
-    let bits = x.to_bits();
-    let sign = if bits >> 31 == 1 { -1i64 } else { 1i64 };
-    let exp_field = ((bits >> 23) & 0xff) as i64;
-    let mant_field = (bits & 0x7f_ffff) as i64;
-    let (mantissa, exp2) = if exp_field == 0 {
-        (mant_field, -126 - 23)
-    } else {
-        ((1i64 << 23) | mant_field, exp_field - 127 - 23)
-    };
-    let num_i = BigInt::from(sign * mantissa);
-    let (num, den) = if exp2 >= 0 {
-        (num_i * (BigInt::from(1) << (exp2 as u32)), BigInt::from(1))
-    } else {
-        (num_i, BigInt::from(1) << ((-exp2) as u32))
-    };
-    Rat::from_bigints(num, den).expect("exact f32 rational is well-formed")
+    Rat::from_f32_exact(x).unwrap_or_else(|| panic!("f32_to_rat: non-finite {x}"))
 }
 
 // =============================================================================

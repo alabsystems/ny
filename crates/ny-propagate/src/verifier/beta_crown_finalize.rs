@@ -29,7 +29,8 @@ impl Verifier {
         // Prefer beta-CROWN's reported bounds, falling back to conservative bounds.
         let fallback_bound = match &result.result {
             BabVerificationStatus::Verified => Bound::new_allow_infinite(threshold, f32::INFINITY),
-            BabVerificationStatus::Violated { .. } | BabVerificationStatus::PotentialViolation => {
+            BabVerificationStatus::Violated { .. }
+            | BabVerificationStatus::PotentialViolation { .. } => {
                 Bound::new_allow_infinite(f32::NEG_INFINITY, threshold)
             }
             BabVerificationStatus::Unknown { .. } | BabVerificationStatus::Timeout => {
@@ -157,7 +158,7 @@ impl Verifier {
                     }
                 }
             }
-            BabVerificationStatus::PotentialViolation => Ok(VerificationResult::Unknown {
+            BabVerificationStatus::PotentialViolation { .. } => Ok(VerificationResult::Unknown {
                 provenance,
                 bounds: output_bounds,
                 reason: ny_core::UnknownReason::PotentialViolation,

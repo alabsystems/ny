@@ -27,6 +27,9 @@ use tracing::debug;
 use super::super::runtime_state::DagAlphaRuntimeState;
 use crate::network::alpha_crown_loop::finite_lower_sum;
 use crate::network::core::GraphNetwork;
+// #alpha-envelope-domain: the finite-difference probes write alpha too, so they
+// share the single contracted write site rather than re-implementing its clamp.
+use super::alpha_update::clamp_alpha_to_envelope_domain;
 
 impl GraphNetwork {
     /// Compute SPSA supplements for all non-ReLU node types.
@@ -203,7 +206,7 @@ impl GraphNetwork {
                 ndarray::Zip::from(alpha.view_mut())
                     .and(orig.view())
                     .and(pert.view())
-                    .for_each(|a, &o, &p| *a = (o + eps * p).clamp(0.0, 1.0));
+                    .for_each(|a, &o, &p| *a = clamp_alpha_to_envelope_domain(o + eps * p));
             }
             scratch_mb.iter_mut().for_each(|g| g.fill(0.0));
             scratch_mb_upper.iter_mut().for_each(|g| g.fill(0.0));
@@ -238,7 +241,7 @@ impl GraphNetwork {
                 ndarray::Zip::from(alpha.view_mut())
                     .and(orig.view())
                     .and(pert.view())
-                    .for_each(|a, &o, &p| *a = (o - eps * p).clamp(0.0, 1.0));
+                    .for_each(|a, &o, &p| *a = clamp_alpha_to_envelope_domain(o - eps * p));
             }
             scratch_mb.iter_mut().for_each(|g| g.fill(0.0));
             scratch_mb_upper.iter_mut().for_each(|g| g.fill(0.0));

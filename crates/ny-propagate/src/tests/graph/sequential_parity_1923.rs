@@ -196,6 +196,59 @@ fn bound_width(bounds: &BoundedTensor) -> Vec<f32> {
         .collect()
 }
 
+/// Assert that a published bound is a usable finite enclosure.
+fn assert_finite_ordered_bounds(label: &str, bounds: &BoundedTensor) {
+    assert!(!bounds.is_empty(), "{label} returned an empty bound");
+    for (idx, (&lower, &upper)) in bounds.lower().iter().zip(bounds.upper().iter()).enumerate() {
+        assert!(
+            lower.is_finite() && upper.is_finite(),
+            "{label}[{idx}] is non-finite: [{lower}, {upper}]"
+        );
+        assert!(
+            lower <= upper,
+            "{label}[{idx}] is inverted: [{lower}, {upper}]"
+        );
+    }
+}
+
+/// Assert `candidate` is contained in (therefore no looser than) `baseline`,
+/// allowing only floating-point accumulation noise.
+fn assert_no_loosening(baseline: &BoundedTensor, candidate: &BoundedTensor, context: &str) {
+    assert_eq!(
+        baseline.shape(),
+        candidate.shape(),
+        "{context}: shape mismatch"
+    );
+    assert_finite_ordered_bounds(&format!("{context} baseline"), baseline);
+    assert_finite_ordered_bounds(&format!("{context} candidate"), candidate);
+
+    for (idx, ((&base_lower, &base_upper), (&candidate_lower, &candidate_upper))) in baseline
+        .lower()
+        .iter()
+        .zip(baseline.upper().iter())
+        .zip(candidate.lower().iter().zip(candidate.upper().iter()))
+        .enumerate()
+    {
+        let scale = base_lower
+            .abs()
+            .max(base_upper.abs())
+            .max(candidate_lower.abs())
+            .max(candidate_upper.abs())
+            .max(1.0);
+        let tol = 1e-3_f32.max(scale * 1e-4);
+        assert!(
+            candidate_lower >= base_lower - tol,
+            "{context}[{idx}] loosened lower bound: baseline={base_lower}, \
+             candidate={candidate_lower}, tol={tol}"
+        );
+        assert!(
+            candidate_upper <= base_upper + tol,
+            "{context}[{idx}] loosened upper bound: baseline={base_upper}, \
+             candidate={candidate_upper}, tol={tol}"
+        );
+    }
+}
+
 /// Summary statistics for bound comparison.
 struct BoundComparison {
     /// Whether graph bounds are always at least as tight as sequential.
@@ -375,14 +428,22 @@ fn test_1923_alpha_crown_bound_gap_diagnostic() {
         ..AlphaCrownConfig::default()
     };
 
-    let seq_alpha = network
-        .propagate_alpha_crown_with_config(&input, &config)
-        .unwrap();
-    let graph_alpha = graph
-        .propagate_alpha_crown_with_config(&input, &config)
-        .unwrap();
+    let (seq_alpha, graph_alpha) = tests::with_crown_dense_budget_mb("2048", || {
+        let seq_alpha = network
+            .propagate_alpha_crown_with_config(&input, &config)
+            .unwrap();
+        let graph_alpha = graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .unwrap();
+        (seq_alpha, graph_alpha)
+    });
 
     assert_eq!(seq_alpha.shape(), graph_alpha.shape());
+    assert_no_loosening(
+        &seq_alpha,
+        &graph_alpha,
+        "Graph alpha-CROWN vs sequential alpha-CROWN",
+    );
 
     let cmp = compare_bounds(&seq_alpha, &graph_alpha);
     eprintln!("--- Alpha-CROWN bound gap diagnostic (#1923) ---");
@@ -415,12 +476,13 @@ fn test_1923_alpha_crown_bound_gap_diagnostic() {
         );
     }
 
-    if cmp.max_graph_excess > 0.1 {
-        eprintln!(
-            "WARNING: Graph alpha-CROWN looser by {:.6}",
-            cmp.max_graph_excess
-        );
-    }
+    assert!(
+        cmp.max_graph_excess <= 1e-3_f32.max(cmp.mean_seq_width.abs() * 1e-4),
+        "Graph alpha-CROWN width regressed against sequential alpha-CROWN: \
+         max excess={}, sequential mean width={}",
+        cmp.max_graph_excess,
+        cmp.mean_seq_width
+    );
 }
 
 /// Phase 3b: Bound tightening progression across all methods.
@@ -437,15 +499,32 @@ fn test_1923_bound_tightening_progression() {
         iterations: 20,
         ..AlphaCrownConfig::default()
     };
-    let seq_ibp = network.propagate_ibp(&input).unwrap();
-    let seq_crown = network.propagate_crown(&input).unwrap();
-    let graph_fixed = graph.propagate_crown_fixed_slope(&input).unwrap();
-    let seq_alpha = network
-        .propagate_alpha_crown_with_config(&input, &config)
-        .unwrap();
-    let graph_alpha = graph
-        .propagate_alpha_crown_with_config(&input, &config)
-        .unwrap();
+    let (seq_ibp, seq_crown, graph_fixed, seq_alpha, graph_alpha) =
+        tests::with_crown_dense_budget_mb("2048", || {
+            let seq_ibp = network.propagate_ibp(&input).unwrap();
+            let seq_crown = network.propagate_crown(&input).unwrap();
+            let graph_fixed = graph.propagate_crown_fixed_slope(&input).unwrap();
+            let seq_alpha = network
+                .propagate_alpha_crown_with_config(&input, &config)
+                .unwrap();
+            let graph_alpha = graph
+                .propagate_alpha_crown_with_config(&input, &config)
+                .unwrap();
+            (seq_ibp, seq_crown, graph_fixed, seq_alpha, graph_alpha)
+        });
+
+    assert_no_loosening(&seq_ibp, &seq_crown, "sequential CROWN vs IBP");
+    assert_no_loosening(&seq_ibp, &graph_fixed, "graph fixed-slope CROWN vs IBP");
+    assert_no_loosening(
+        &seq_crown,
+        &seq_alpha,
+        "sequential alpha-CROWN vs fixed-slope CROWN",
+    );
+    assert_no_loosening(
+        &graph_fixed,
+        &graph_alpha,
+        "graph alpha-CROWN vs fixed-slope CROWN",
+    );
 
     let ibp_w = bound_width(&seq_ibp);
     let crown_w = bound_width(&seq_crown);
@@ -456,8 +535,9 @@ fn test_1923_bound_tightening_progression() {
     eprintln!("--- Bound tightening progression (#1923) ---");
     for idx in 0..ibp_w.len() {
         eprintln!(
-            "  [{}]: IBP={:.4} > SeqCROWN={:.4} > GFixed={:.4} > SeqAlpha={:.4} > GAlpha={:.4}",
-            idx, ibp_w[idx], crown_w[idx], gfixed_w[idx], salpha_w[idx], galpha_w[idx]
+            "  [{}]: IBP={:.4} -> SeqCROWN={:.4} -> SeqAlpha={:.4}; \
+             IBP={:.4} -> GFixed={:.4} -> GAlpha={:.4}",
+            idx, ibp_w[idx], crown_w[idx], salpha_w[idx], ibp_w[idx], gfixed_w[idx], galpha_w[idx]
         );
     }
 }
@@ -585,12 +665,20 @@ fn test_1923_public_crown_entrypoint_gap() {
     let graph = GraphNetwork::from_sequential(&network).unwrap();
     let input = build_acasxu_input();
 
-    // Network.propagate_crown uses fixed-slope CROWN
-    let seq_crown = network.propagate_crown(&input).unwrap();
-    // GraphNetwork.propagate_crown tries alpha-CROWN first, then fixed-slope fallback
-    let graph_crown = graph.propagate_crown(&input).unwrap();
+    let (seq_crown, graph_crown) = tests::with_crown_dense_budget_mb("2048", || {
+        // Network.propagate_crown uses fixed-slope CROWN.
+        let seq_crown = network.propagate_crown(&input).unwrap();
+        // GraphNetwork.propagate_crown tries alpha-CROWN first, then fixed-slope fallback.
+        let graph_crown = graph.propagate_crown(&input).unwrap();
+        (seq_crown, graph_crown)
+    });
 
     assert_eq!(seq_crown.shape(), graph_crown.shape());
+    assert_no_loosening(
+        &seq_crown,
+        &graph_crown,
+        "public GraphNetwork CROWN vs sequential fixed-slope CROWN",
+    );
 
     let cmp = compare_bounds(&seq_crown, &graph_crown);
     eprintln!("--- Public CROWN entrypoint comparison (#1923) ---");
@@ -614,17 +702,15 @@ fn test_1923_public_crown_entrypoint_gap() {
         );
     }
 
-    // The graph path's alpha-CROWN should produce bounds at least as tight as
-    // the sequential fixed-slope CROWN. If it doesn't, that's the bug.
-    if cmp.max_graph_excess > 0.01 {
-        eprintln!(
-            "\nBUG DETECTED: GraphNetwork.propagate_crown() is LOOSER than \
-             Network.propagate_crown() by up to {:.6} width. \
-             Alpha-CROWN either failed silently or the graph CROWN backward \
-             computes weaker linear relaxations than the sequential path.",
-            cmp.max_graph_excess
-        );
-    }
+    // The public graph path must never publish a bound looser than its
+    // fixed-slope fallback baseline.
+    assert!(
+        cmp.max_graph_excess <= 1e-3_f32.max(cmp.mean_seq_width.abs() * 1e-4),
+        "GraphNetwork::propagate_crown regressed against sequential fixed-slope CROWN: \
+         max excess={}, sequential mean width={}",
+        cmp.max_graph_excess,
+        cmp.mean_seq_width
+    );
 }
 
 /// Phase 6: Graph-vs-sequential child domain parity.

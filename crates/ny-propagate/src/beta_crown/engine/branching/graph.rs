@@ -65,6 +65,103 @@ impl BetaCrownVerifier {
         unstable
     }
 
+    /// Deadline-polled unstable discovery for the bounded shared executor.
+    ///
+    /// Unlike the historical helper, this reads already-owned arrays directly
+    /// instead of flattening/cloning each producer tensor. The admission gate
+    /// bounds the total candidate metadata; fallible reservation keeps an
+    /// allocator refusal structured.
+    pub(in crate::beta_crown::engine) fn find_unstable_graph_neurons_multi_bounded(
+        &self,
+        graph: &GraphNetwork,
+        domain: &MultiObjectiveGraphBabDomain,
+        relu_nodes: &[String],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<(String, usize)>> {
+        const METADATA_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+        let mut unstable = Vec::new();
+        for node_name in relu_nodes {
+            if deadline.is_some_and(|authority| std::time::Instant::now() >= authority) {
+                return Err(ny_core::NyError::DeadlineExceeded(
+                    "bounded unstable discovery exceeded its deadline".into(),
+                ));
+            }
+            let Some(relu_node) = graph.nodes.get(node_name) else {
+                continue;
+            };
+            if !is_zero_threshold_binary_activation(&relu_node.layer) {
+                continue;
+            }
+            let Some(pre_name) = relu_node.inputs.first() else {
+                continue;
+            };
+            let pre_bounds = if pre_name == NETWORK_INPUT {
+                domain.input_bounds.as_ref()
+            } else {
+                let Some(bounds) = domain.node_bounds.get(pre_name) else {
+                    continue;
+                };
+                bounds.as_ref()
+            };
+            let entry_bytes = size_of::<(String, usize)>()
+                .checked_add(node_name.len())
+                .ok_or_else(|| {
+                    ny_core::NyError::InvalidSpec(
+                        "bounded unstable metadata byte size overflow".into(),
+                    )
+                })?;
+            let required_bytes = pre_bounds.len().checked_mul(entry_bytes).ok_or_else(|| {
+                ny_core::NyError::InvalidSpec("bounded unstable metadata size overflow".into())
+            })?;
+            if required_bytes > METADATA_BUDGET_BYTES {
+                return Err(ny_core::NyError::CpuMemoryExceeded {
+                    required_bytes,
+                    budget_bytes: METADATA_BUDGET_BYTES,
+                    site: "bounded unstable discovery",
+                });
+            }
+            unstable.try_reserve(pre_bounds.len()).map_err(|_| {
+                ny_core::NyError::CpuMemoryExceeded {
+                    required_bytes,
+                    budget_bytes: METADATA_BUDGET_BYTES,
+                    site: "bounded unstable discovery",
+                }
+            })?;
+
+            for (neuron_idx, (&lower, &upper)) in pre_bounds
+                .lower()
+                .iter()
+                .zip(pre_bounds.upper().iter())
+                .enumerate()
+            {
+                if neuron_idx % 1_024 == 0
+                    && deadline.is_some_and(|authority| std::time::Instant::now() >= authority)
+                {
+                    return Err(ny_core::NyError::DeadlineExceeded(
+                        "bounded unstable discovery exceeded its deadline".into(),
+                    ));
+                }
+                if domain
+                    .history
+                    .is_constrained(node_name, neuron_idx)
+                    .is_some()
+                {
+                    continue;
+                }
+                if lower < 0.0 && upper > 0.0 {
+                    unstable.push((node_name.clone(), neuron_idx));
+                }
+            }
+        }
+        if deadline.is_some_and(|authority| std::time::Instant::now() >= authority) {
+            return Err(ny_core::NyError::DeadlineExceeded(
+                "bounded unstable discovery exceeded its deadline".into(),
+            ));
+        }
+        Ok(unstable)
+    }
+
     /// Select branch point for multi-objective domain.
     ///
     /// When `BranchingHeuristic::BoundImpact` is configured, uses the shared
@@ -79,9 +176,12 @@ impl BetaCrownVerifier {
         domain: &MultiObjectiveGraphBabDomain,
         unstable: &[(String, usize)],
         // #branching-la: the multi-objective margin rows `c` (one per objective), so the
-        // scorer can seed with the WORST-straggler objective (objective-directed BaBSR).
+        // scorer can seed with the aggregation-critical objective (objective-directed BaBSR).
         // Empty (tests / callers without objectives) → legacy intercept-only behavior.
         objectives: &[Vec<f32>],
+        // Thresholds are required because criticality is defined by proof
+        // margin, not by the raw lower/upper bound.
+        thresholds: &[f32],
         // #mo-scorer-fix: engine for the kFSB-family child-bound evaluation.
         // `None` skips child evaluation inside the kFSB machinery gracefully.
         engine: Option<&dyn ny_core::GemmEngine>,
@@ -92,6 +192,22 @@ impl BetaCrownVerifier {
                 "select_graph_branch_multi: no unstable neurons to branch on".into(),
             ));
         }
+
+        // One aggregation- and direction-aware row from the domain drives
+        // every objective-directed advisory scorer below. A malformed
+        // scheduling view fails open to legacy
+        // objective-agnostic scoring: branch choice must never become a proof
+        // authority or erase a domain.
+        let critical_objective_idx = match domain.critical_objective_index(thresholds) {
+            Ok(index) => index,
+            Err(error) => {
+                tracing::warn!(
+                    "multi-objective critical-row selection failed; \
+                         using objective-agnostic branch scoring: {error}"
+                );
+                None
+            }
+        };
 
         // #gather-score (boxlift charter Inc 4 — DARK, NY_MO_GATHER_SCORE=1):
         // advisory candidate choice from the wide-β lane's harvested
@@ -162,7 +278,7 @@ impl BetaCrownVerifier {
         // scorer: width → largest pre-activation width (mirrors
         // `select_largest_width_neuron`), kFSB family → the graph kFSB
         // machinery (BaBSR/intercept prescore + child-bound evaluation) seeded
-        // with the WORST unverified objective row. The dark experiment gates
+        // with the aggregation-critical unverified objective row. The dark experiment gates
         // (NY_BRANCH_LA / NY_BRANCH_STEM) keep the legacy flow so their
         // measurements stay comparable; `NY_MO_SCORER_FIX=1` enables the fixed
         // scorers. Advisory-only (the pick only chooses WHICH ReLU to
@@ -199,12 +315,18 @@ impl BetaCrownVerifier {
         // converted to a within-budget solve. Default stays OFF; re-open only
         // with a solved-count win on competition hardware.
         let scorer_fix = matches!(std::env::var("NY_MO_SCORER_FIX").ok().as_deref(), Some("1"));
+        let typed_critical_kfsb = self.config.use_multi_objective_critical_kfsb
+            && domain.aggregation() == ObjectiveAggregation::Conjunctive
+            && matches!(
+                self.config.branching_heuristic,
+                BranchingHeuristic::Kfsb | BranchingHeuristic::KfsbInterceptOnly
+            );
         let experiments_active = std::env::var("NY_BRANCH_LA").ok().as_deref() == Some("1")
             || std::env::var("NY_BRANCH_LA_PROBE").ok().as_deref() == Some("1")
             || std::env::var("NY_BRANCH_STEM").ok().as_deref() == Some("1");
-        if scorer_fix && !experiments_active {
+        if !experiments_active {
             match self.config.branching_heuristic {
-                BranchingHeuristic::LargestBoundWidth => {
+                BranchingHeuristic::LargestBoundWidth if scorer_fix => {
                     // FAIL-OPEN: no scorable width (all-NaN bounds) falls
                     // through to the historical intercept ranking.
                     if let Some(pick) =
@@ -215,15 +337,22 @@ impl BetaCrownVerifier {
                 }
                 BranchingHeuristic::Kfsb
                 | BranchingHeuristic::KfsbInterceptOnly
-                | BranchingHeuristic::FilteredSmartBranching => {
+                | BranchingHeuristic::FilteredSmartBranching
+                    if scorer_fix || typed_critical_kfsb =>
+                {
                     // FAIL-OPEN: a scoring/child-eval error must degrade to the
                     // historical intercept ranking, not propagate — callers
                     // treat a branch-selection Err as a PropagationFailure
                     // (unresolved parent), which would be a regression for a
                     // merely-advisory scorer.
-                    match self
-                        .select_graph_branch_multi_kfsb(graph, domain, unstable, objectives, engine)
-                    {
+                    match self.select_graph_branch_multi_kfsb(
+                        graph,
+                        domain,
+                        unstable,
+                        objectives,
+                        critical_objective_idx,
+                        engine,
+                    ) {
                         Ok(Some(pick)) => return Ok(pick),
                         // No unverified objective row (legacy/test callers) —
                         // fall through to the historical intercept ranking.
@@ -240,9 +369,9 @@ impl BetaCrownVerifier {
         }
 
         // #branching-la: OBJECTIVE-DIRECTED, CONV-CORRECT BaBSR scores (INC1/INC2). Seed
-        // the coefficient backward with the WORST unverified straggler's objective margin
-        // row `c`, so scores measure each candidate ReLU's signed influence on the
-        // straggler (not a 100-way-diluted average). Computed under legacy BoundImpact, or
+        // the coefficient backward with the aggregation-critical unverified objective
+        // margin row `c`, so scores measure each candidate ReLU's signed influence on the
+        // relevant row (not a 100-way-diluted average). Computed under legacy BoundImpact, or
         // when the lA branch (NY_BRANCH_LA) / its differential probe (NY_BRANCH_LA_PROBE)
         // is on. Advisory-only (the score only RANKS candidates, never read by any verdict)
         // ⇒ soundness-free.
@@ -332,19 +461,8 @@ impl BetaCrownVerifier {
                 BranchingHeuristic::BoundImpact
             );
         let babsr_scores = if want_babsr {
-            // Worst straggler = the unverified objective with the most-negative lower.
-            let mut worst: Option<(usize, f32)> = None;
-            for (i, (lo, _)) in domain.objective_bounds.iter().enumerate() {
-                if domain.verified.get(i).copied().unwrap_or(false) {
-                    continue;
-                }
-                let lo = if lo.is_nan() { f32::NEG_INFINITY } else { *lo };
-                if worst.is_none_or(|(_, w)| lo < w) {
-                    worst = Some((i, lo));
-                }
-            }
-            let seed_row: Option<&[f32]> = worst
-                .and_then(|(i, _)| objectives.get(i))
+            let seed_row: Option<&[f32]> = critical_objective_idx
+                .and_then(|i| objectives.get(i))
                 .map(|v| v.as_slice());
             // #branching-la stop-early: only the UNSTABLE ReLU nodes need a score, so stop
             // the backward once all are reached — skips the input-side (large-spatial) convs.
@@ -555,6 +673,112 @@ impl BetaCrownVerifier {
         }
     }
 
+    /// Allocation-free, deadline-polled advisory selector for the bounded
+    /// shared executor.
+    ///
+    /// Objective-directed BaBSR and kFSB retain coefficient maps or simulated
+    /// children before the bounded GEMM facade can poll. Intercept ranking uses
+    /// only the already-owned pre-activation arrays and chooses an equally
+    /// exhaustive ReLU partition, so proof semantics are unchanged.
+    pub(in crate::beta_crown::engine) fn select_graph_branch_multi_bounded_intercept(
+        &self,
+        graph: &GraphNetwork,
+        domain: &MultiObjectiveGraphBabDomain,
+        unstable: &[(String, usize)],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(String, usize, f32)> {
+        if unstable.is_empty() {
+            return Err(ny_core::NyError::InternalError(
+                "bounded multi-objective branch selector has no unstable neurons".into(),
+            ));
+        }
+
+        let mut best: Option<(String, usize, f32)> = None;
+        let mut group_start = 0usize;
+        while group_start < unstable.len() {
+            if deadline.is_some_and(|authority| std::time::Instant::now() >= authority) {
+                return Err(ny_core::NyError::DeadlineExceeded(
+                    "bounded multi-objective intercept selection exceeded its deadline".into(),
+                ));
+            }
+            let node_name = &unstable[group_start].0;
+            let group_end = unstable[group_start..]
+                .iter()
+                .position(|(candidate, _)| candidate != node_name)
+                .map_or(unstable.len(), |offset| group_start + offset);
+            let Some(relu_node) = graph.nodes.get(node_name) else {
+                group_start = group_end;
+                continue;
+            };
+            if !is_zero_threshold_binary_activation(&relu_node.layer) {
+                group_start = group_end;
+                continue;
+            }
+            let Some(pre_name) = relu_node.inputs.first() else {
+                group_start = group_end;
+                continue;
+            };
+            let pre_bounds = if pre_name == NETWORK_INPUT {
+                domain.input_bounds.as_ref()
+            } else {
+                let Some(bounds) = domain.node_bounds.get(pre_name) else {
+                    group_start = group_end;
+                    continue;
+                };
+                bounds.as_ref()
+            };
+
+            let mut candidates = unstable[group_start..group_end].iter().peekable();
+            for (neuron_idx, (&lower, &upper)) in pre_bounds
+                .lower()
+                .iter()
+                .zip(pre_bounds.upper().iter())
+                .enumerate()
+            {
+                if neuron_idx % 1_024 == 0
+                    && deadline.is_some_and(|authority| std::time::Instant::now() >= authority)
+                {
+                    return Err(ny_core::NyError::DeadlineExceeded(
+                        "bounded multi-objective intercept selection exceeded its deadline".into(),
+                    ));
+                }
+                while candidates
+                    .peek()
+                    .is_some_and(|(_, candidate_idx)| *candidate_idx < neuron_idx)
+                {
+                    candidates.next();
+                }
+                let Some((_, candidate_idx)) = candidates.peek() else {
+                    break;
+                };
+                if *candidate_idx != neuron_idx {
+                    continue;
+                }
+                candidates.next();
+                if lower < 0.0 && upper > 0.0 {
+                    let score = relu_intercept_score(lower, upper);
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, _, incumbent)| score > *incumbent)
+                    {
+                        best = Some((node_name.clone(), neuron_idx, score));
+                    }
+                }
+            }
+            group_start = group_end;
+        }
+        if deadline.is_some_and(|authority| std::time::Instant::now() >= authority) {
+            return Err(ny_core::NyError::DeadlineExceeded(
+                "bounded multi-objective intercept selection exceeded its deadline".into(),
+            ));
+        }
+        best.ok_or_else(|| {
+            ny_core::NyError::InternalError(
+                "bounded multi-objective branch selector found no scorable neuron".into(),
+            )
+        })
+    }
+
     /// #mo-scorer-fix: real `LargestBoundWidth` scoring for the multi-objective
     /// selector — the neuron with the widest pre-activation interval (u - l),
     /// mirroring the sequential lane's `select_largest_width_neuron`. NaN
@@ -615,8 +839,8 @@ impl BetaCrownVerifier {
     ///
     /// Seeds the graph kFSB machinery (`select_graph_branch_kfsb_in_gpu_batched`:
     /// BaBSR/intercept prescore, top-k candidate filtering, per-candidate child
-    /// bound evaluation with the configured `kfsb_reduce_op`) with the WORST
-    /// unverified objective's margin row — the same straggler rule the
+    /// bound evaluation with the configured `kfsb_reduce_op`) with the
+    /// aggregation-critical objective's margin row — the same rule the
     /// objective-directed BaBSR seed uses. Returns `Ok(None)` when no
     /// unverified objective row exists (legacy/test callers without
     /// objectives), letting the caller fall back to intercept ranking.
@@ -624,7 +848,7 @@ impl BetaCrownVerifier {
     /// The `GraphBabDomain` shim mirrors `graph_bab_domain_shim`
     /// (batched_dense_specs.rs): identical history / node_bounds / input /
     /// β / α; `cached_la = None` (no warm start — fine for scoring);
-    /// lower/upper seeded from the straggler objective's bounds (accounting
+    /// lower/upper seeded from the critical objective's bounds (accounting
     /// metadata for child-bound evaluation pruning, not a verdict source).
     /// Advisory-only (branch choice) ⇒ soundness-free.
     fn select_graph_branch_multi_kfsb(
@@ -633,33 +857,23 @@ impl BetaCrownVerifier {
         domain: &MultiObjectiveGraphBabDomain,
         unstable: &[(String, usize)],
         objectives: &[Vec<f32>],
+        critical_objective_idx: Option<usize>,
         engine: Option<&dyn ny_core::GemmEngine>,
     ) -> Result<Option<(String, usize, f32)>> {
-        // Worst straggler = the unverified objective with the most-negative lower.
-        let mut worst: Option<(usize, f32)> = None;
-        for (i, (lo, _)) in domain.objective_bounds.iter().enumerate() {
-            if domain.verified.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let lo = if lo.is_nan() { f32::NEG_INFINITY } else { *lo };
-            if worst.is_none_or(|(_, w)| lo < w) {
-                worst = Some((i, lo));
-            }
-        }
-        let Some((worst_idx, _)) = worst else {
+        let Some(critical_idx) = critical_objective_idx else {
             return Ok(None);
         };
-        let Some(objective_row) = objectives.get(worst_idx) else {
+        let Some(objective_row) = objectives.get(critical_idx) else {
             return Ok(None);
         };
         let (lower_bound, upper_bound) = domain
             .objective_bounds
-            .get(worst_idx)
+            .get(critical_idx)
             .copied()
             .unwrap_or((0.0, 0.0));
         let shim = GraphBabDomain {
             history: domain.history.clone(),
-            node_bounds: domain.node_bounds.clone(),
+            node_bounds: domain.node_bounds.to_shared_hash_map(),
             lower_bound,
             upper_bound,
             depth: domain.depth,

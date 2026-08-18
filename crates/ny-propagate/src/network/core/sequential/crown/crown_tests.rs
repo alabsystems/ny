@@ -7,11 +7,75 @@
 //! Extracted from `crown.rs` inline tests as part of #4233 Packet A.
 
 use super::bounds_validation::has_nan_bounds;
-use super::{has_degraded_bounds, tighten_crown_output, try_extract_single_gpu_layer, Network};
+use super::{
+    has_degraded_bounds, materialize_terminal_crown_bounds,
+    materialize_terminal_crown_bounds_with_deadline, tighten_crown_output,
+    try_extract_single_gpu_layer, Network,
+};
+use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds};
 use crate::layers::{Conv1dLayer, Layer, LinearLayer, ReLULayer, SkipMergeLayer};
-use ndarray::{arr1, arr2, ArrayD, IxDyn};
+use ndarray::{arr1, arr2, Array1, ArrayD, IxDyn};
 use ny_core::{GpuCrownLayer, Result};
 use ny_tensor::BoundedTensor;
+use std::time::{Duration, Instant};
+
+#[test]
+fn terminal_materialization_maps_full_peak_memory_only_after_pair_gate_admits() {
+    crate::tests::with_crown_dense_budget_mb("1", || {
+        let origins: Vec<i128> = (0..16).map(i128::from).collect();
+        let geometry =
+            PatchGeometry::anchored(origins.clone(), origins).expect("fixture axes are non-empty");
+        let side = |fill| PatchesData {
+            coeff_err: None,
+            patches: Some(ArrayD::from_elem(IxDyn(&[1, 16, 16, 1, 1, 1]), fill)),
+            geometry: geometry.clone(),
+            identity: false,
+            output_shape: (1, 16, 16),
+            input_shape: (1, 16, 32),
+            unstable_idx: None,
+        };
+        let patches = PatchesLinearBounds {
+            row_count: 256,
+            lower_a: side(0.25),
+            lower_b: Array1::zeros(256),
+            upper_a: side(0.75),
+            upper_b: Array1::zeros(256),
+        };
+        assert_eq!(
+            patches.dense_pair_bytes().unwrap(),
+            1024 * 1024,
+            "logical lower/upper pair must fit exactly at the 1 MiB gate"
+        );
+        let carrier = CrownBounds::Patches(Box::new(patches));
+        assert!(
+            super::dense_materialization_budget_estimate(&carrier, "test")
+                .unwrap()
+                .is_none(),
+            "the legacy pair-only gate must admit equality"
+        );
+        assert!(
+            materialize_terminal_crown_bounds(carrier)
+                .expect("memory is the only classified fallback")
+                .is_none(),
+            "the complete map/scatter/error peak must refuse and map to forward fallback"
+        );
+    });
+}
+
+#[test]
+fn terminal_materialization_honors_expired_absolute_deadline() {
+    let carrier = CrownBounds::Patches(Box::new(PatchesLinearBounds::identity(
+        (1, 2, 2),
+        (1, 2, 2),
+    )));
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("system uptime exceeds one millisecond");
+
+    let error = materialize_terminal_crown_bounds_with_deadline(carrier, Some(expired))
+        .expect_err("terminal materialization must preserve deadline authority");
+    assert!(matches!(error, ny_core::NyError::DeadlineExceeded(_)));
+}
 
 #[test]
 fn propagate_crown_skip_merge_identity() -> Result<()> {
@@ -636,6 +700,7 @@ fn try_extract_single_gpu_layer_conv1d_maps_to_conv2d_descriptor() -> Result<()>
             out_w,
             in_h,
             in_w,
+            ..
         } => {
             assert_eq!(weight_col.as_ref(), &[0.25, -0.5, 0.75, -1.0, 0.5, 0.125]);
             assert_eq!(

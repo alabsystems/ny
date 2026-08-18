@@ -283,17 +283,33 @@ fn select_neurons_by_uncertainty(
 /// Returns `LinearBounds` of shape `(n_selected, x_dim)` expressing each
 /// selected neuron as a linear function of the network input.
 ///
+/// This is THE input-relative provenance primitive for the sequential engine:
+/// `layer_bounds[target_layer]` is the box of `h_target_layer`, and the returned
+/// rows bound that same quantity as an affine function of the network input.
+/// `domain::clip_provenance` reuses it (over `Arc`-shared boxes, hence the
+/// `Borrow` bound) rather than growing a second copy of this composition.
+///
 /// Reference: This is equivalent to `propagate_crown_partial_with_engine` but
 /// starting from an intermediate identity rather than the output identity.
-fn crown_backward_for_neurons(
+pub(in crate::beta_crown::engine) fn crown_backward_for_neurons<
+    B: std::borrow::Borrow<BoundedTensor>,
+>(
     network: &Network,
     input: &BoundedTensor,
-    layer_bounds: &[BoundedTensor],
+    layer_bounds: &[B],
     target_layer: usize,
     selected_neurons: &[usize],
 ) -> Result<LinearBounds> {
     let n_selected = selected_neurons.len();
-    let target_dim = layer_bounds[target_layer].len();
+    if target_layer >= layer_bounds.len() || target_layer >= network.layers.len() {
+        return Err(ny_core::NyError::InternalError(format!(
+            "crown_backward_for_neurons: target layer {} out of range (bounds={}, layers={})",
+            target_layer,
+            layer_bounds.len(),
+            network.layers.len()
+        )));
+    }
+    let target_dim = layer_bounds[target_layer].borrow().len();
 
     // Create seed: each row selects one neuron at the target layer
     let mut lower_a = Array2::zeros((n_selected, target_dim));
@@ -321,7 +337,7 @@ fn crown_backward_for_neurons(
         let pre_activation = if layer_idx == 0 {
             input
         } else if layer_idx - 1 < layer_bounds.len() {
-            &layer_bounds[layer_idx - 1]
+            layer_bounds[layer_idx - 1].borrow()
         } else {
             return Err(ny_core::NyError::InternalError(format!(
                 "crown_backward_for_neurons: missing bounds for layer {}",

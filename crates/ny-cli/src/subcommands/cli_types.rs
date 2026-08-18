@@ -19,7 +19,7 @@ pub(crate) enum BackendArg {
     /// CPU with Rayon parallelization (default, always available)
     #[default]
     Cpu,
-    /// wgpu GPU compute (cross-platform: Metal on macOS, Vulkan on Linux, DX12 on Windows)
+    /// wgpu compute request; verdict-bearing proof routes currently fall back to CPU
     Wgpu,
 }
 
@@ -189,7 +189,7 @@ pub(crate) enum CompleteVerifierArg {
     Auto,
     /// Branch-and-bound with beta-CROWN bounds only (never escalates to MIP).
     Bab,
-    /// Direct SMT encoding with Big-M ReLUs
+    /// Exact Big-M encoding solved by ay.
     Mip,
 }
 

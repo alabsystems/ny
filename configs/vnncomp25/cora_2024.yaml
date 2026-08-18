@@ -24,6 +24,7 @@ general:
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 10
 
 bab:

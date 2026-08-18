@@ -143,3 +143,14 @@ fn test_analyze_quantization_model_routes_binary_graph_to_graph_path() {
     assert!((routed_add.max_bound - direct_add.max_bound).abs() < 1e-6);
     assert!((routed_add.max_bound - 4.0).abs() < 1e-6);
 }
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_quantization_graph_rejects_invalid_epsilon_with_custom_input() {
+    let mut config = branching_add_config();
+    config.epsilon = f32::NEG_INFINITY;
+
+    let err = analyze_quantization_graph(&ny_propagate::GraphNetwork::new(), &config, &[1])
+        .expect_err("invalid epsilon must fail before graph analysis");
+    assert!(err.to_string().contains("epsilon"), "err = {err}");
+}

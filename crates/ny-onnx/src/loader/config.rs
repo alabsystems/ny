@@ -12,6 +12,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShapeInferencePolicy {
     /// Run ONNX Runtime shape inference before graph conversion.
+    ///
+    /// File models with external tensor data use model-authored shapes instead:
+    /// ONNX Runtime cannot consume NY's capability-scoped file handles and
+    /// must not reopen untrusted sidecar paths through ambient authority.
     #[default]
     Ort,
     /// Skip ONNX Runtime shape inference and rely on proto-declared shapes only.
@@ -55,6 +59,23 @@ pub enum OnnxOptimizationFlag {
     MergeLinear,
 }
 
+/// BatchNormalization rewrite policy for ONNX graph conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchNormFoldingPolicy {
+    /// Preserve the historical loader behavior.
+    ///
+    /// Conv/Gemm folds are enabled and the extended ConvTranspose/cGAN folds
+    /// remain governed by the `NY_BN_FOLD_EXT` process environment variable.
+    #[default]
+    LegacyEnvironment,
+    /// Preserve every authored BatchNormalization node.
+    ///
+    /// This is a call-local override. It dominates `NY_BN_FOLD_EXT` and the
+    /// loader does not consult or mutate that variable for this decision.
+    PreserveRaw,
+}
+
 /// Configuration for ONNX model loading.
 #[derive(Clone, Default)]
 pub struct OnnxLoadConfig {
@@ -62,7 +83,9 @@ pub struct OnnxLoadConfig {
     shape_inference: ShapeInferencePolicy,
     shape_infer_backend: ShapeInferBackend,
     optimization_flags: HashSet<OnnxOptimizationFlag>,
+    batch_norm_folding: BatchNormFoldingPolicy,
     capture_raw_float32_initializer_provenance: bool,
+    require_authored_float32_initializers: bool,
 }
 
 impl OnnxLoadConfig {
@@ -73,7 +96,9 @@ impl OnnxLoadConfig {
             shape_inference: ShapeInferencePolicy::default(),
             shape_infer_backend: ShapeInferBackend::default(),
             optimization_flags: HashSet::new(),
+            batch_norm_folding: BatchNormFoldingPolicy::default(),
             capture_raw_float32_initializer_provenance: false,
+            require_authored_float32_initializers: false,
         }
     }
 
@@ -129,6 +154,20 @@ impl OnnxLoadConfig {
         self.optimization_flags.contains(&flag)
     }
 
+    /// Returns a copy of this config with the requested BatchNormalization
+    /// rewrite policy.
+    #[must_use]
+    pub fn with_batch_norm_folding_policy(mut self, policy: BatchNormFoldingPolicy) -> Self {
+        self.batch_norm_folding = policy;
+        self
+    }
+
+    /// Returns the configured BatchNormalization rewrite policy.
+    #[must_use]
+    pub fn batch_norm_folding_policy(&self) -> BatchNormFoldingPolicy {
+        self.batch_norm_folding
+    }
+
     /// Returns a copy of this config with loader-sealed raw ONNX FLOAT
     /// initializer and finalized-network provenance enabled or disabled.
     ///
@@ -145,6 +184,27 @@ impl OnnxLoadConfig {
     #[must_use]
     pub fn raw_float32_initializer_provenance_enabled(&self) -> bool {
         self.capture_raw_float32_initializer_provenance
+    }
+
+    /// Require every raw ONNX FLOAT initializer to survive loading unchanged.
+    ///
+    /// Enabling the admission guard also enables loader-private provenance
+    /// capture. A mismatch or an empty/absent provenance set fails the load
+    /// before any verifier can consume the model.
+    #[must_use]
+    pub fn with_require_authored_float32_initializers(mut self, required: bool) -> Self {
+        self.require_authored_float32_initializers = required;
+        if required {
+            self.capture_raw_float32_initializer_provenance = true;
+        }
+        self
+    }
+
+    /// Whether unchanged authored FLOAT initializers are a load-time
+    /// requirement.
+    #[must_use]
+    pub fn require_authored_float32_initializers(&self) -> bool {
+        self.require_authored_float32_initializers
     }
 }
 
@@ -276,7 +336,12 @@ mod tests {
     fn config_defaults_to_ort_shape_inference() {
         let config = OnnxLoadConfig::default();
         assert_eq!(config.shape_inference_policy(), ShapeInferencePolicy::Ort);
+        assert_eq!(
+            config.batch_norm_folding_policy(),
+            BatchNormFoldingPolicy::LegacyEnvironment
+        );
         assert!(!config.raw_float32_initializer_provenance_enabled());
+        assert!(!config.require_authored_float32_initializers());
     }
 
     #[test]
@@ -318,12 +383,18 @@ mod tests {
         let registry = CustomOpRegistry::from_handlers(vec![Arc::new(FirstHandler)]);
         let config = OnnxLoadConfig::new(registry)
             .with_shape_inference_policy(ShapeInferencePolicy::Skip)
-            .with_raw_float32_initializer_provenance(true)
+            .with_batch_norm_folding_policy(BatchNormFoldingPolicy::PreserveRaw)
+            .with_require_authored_float32_initializers(true)
             .with_optimization_flags([OnnxOptimizationFlag::MergeLinear]);
 
         assert_eq!(config.shape_inference_policy(), ShapeInferencePolicy::Skip);
+        assert_eq!(
+            config.batch_norm_folding_policy(),
+            BatchNormFoldingPolicy::PreserveRaw
+        );
         assert_eq!(config.merged_registry().handlers().len(), 1);
         assert!(config.has_optimization_flag(OnnxOptimizationFlag::MergeLinear));
         assert!(config.raw_float32_initializer_provenance_enabled());
+        assert!(config.require_authored_float32_initializers());
     }
 }

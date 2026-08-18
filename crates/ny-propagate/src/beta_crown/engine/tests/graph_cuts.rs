@@ -218,15 +218,8 @@ fn test_graph_cut_paths_skip_relu_with_empty_inputs_2098() {
     };
 
     // If relu_bad incorrectly fell back to _input with unstable [-1, 1], this
-    // term would contribute -2.0 (negative coeff picks z_max=1) and yield
-    // contribution = lambda * (bias - constraint_min) = 2.0.
-    let contribution =
-        verifier.compute_graph_cut_contribution_arc(&graph, &[&cut], &node_bounds, &input_bounds);
-    assert!(
-        contribution.abs() < 1e-6,
-        "malformed ReLU cut terms must be skipped, expected 0 contribution, got {contribution}"
-    );
-
+    // term would contribute -2.0 (negative coeff picks z_max=1) and yield a
+    // non-zero gradient.
     let mut cut_pool = GraphCutPool::new(8);
     assert!(cut_pool.add_cut(cut), "cut should be inserted");
     verifier.compute_graph_cut_gradients(&graph, &mut cut_pool, &node_bounds, &input_bounds);
@@ -784,8 +777,10 @@ fn test_graph_beta_warmup_inherits_parent_values() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_graph_cut_contribution_not_broadcast_without_objective() {
-    // #2400: cut contributions must not broadcast to multi-output (identity) mode.
+fn test_graph_cut_authority_quarantine_with_objective() {
+    // Defense in depth: bypass public validation and supply an objective plus a
+    // non-empty cut pool. The graph finalizer must still leave proof bounds
+    // unchanged.
     use crate::beta_crown::domain::GraphCrownContext;
 
     let (graph, _) = build_two_relu_graph_with_bounds();
@@ -826,34 +821,47 @@ fn test_graph_cut_contribution_not_broadcast_without_objective() {
         ..Default::default()
     });
 
-    // Compute bounds WITHOUT objective (multi-output / identity mode)
+    let objective = vec![1.0_f32, 0.0];
+
+    // Compute objective bounds with a cut pool. The fixture's cut IS relevant
+    // to the empty history (non-empty `relevant_cuts_for`), so any surviving
+    // cut→bound path would show up in the comparison below.
     let empty_history = GraphSplitHistory::new();
+    assert!(
+        !pool.relevant_cuts_for(&empty_history).is_empty(),
+        "fixture must expose a relevant cut so the authority gate is exercised"
+    );
     let context_with_cuts =
         GraphCrownContext::new(&empty_history, Some(&pool), Some(&node_bounds), None);
-    let (bounds_no_obj, _) = verifier
+    let (bounds_with_quarantined_cuts, _) = verifier
         .propagate_crown_with_graph_constraints(
             &graph,
             &input_bounds,
             &context_with_cuts,
             None,
-            None, // no objective → multi-output
+            Some(&objective),
         )
         .unwrap();
 
-    // Compute bounds without any cuts for comparison
+    // Compute the same objective bounds without any cuts for comparison.
     let empty_history2 = GraphSplitHistory::new();
     let context_no_cuts = GraphCrownContext::new(&empty_history2, None, Some(&node_bounds), None);
     let (bounds_no_cuts, _) = verifier
-        .propagate_crown_with_graph_constraints(&graph, &input_bounds, &context_no_cuts, None, None)
+        .propagate_crown_with_graph_constraints(
+            &graph,
+            &input_bounds,
+            &context_no_cuts,
+            None,
+            Some(&objective),
+        )
         .unwrap();
 
-    // Without objective, cuts should NOT be applied — bounds should match
-    let lower_with = bounds_no_obj.lower().as_slice().unwrap();
+    let lower_with = bounds_with_quarantined_cuts.lower().as_slice().unwrap();
     let lower_without = bounds_no_cuts.lower().as_slice().unwrap();
     for (i, (&with, &without)) in lower_with.iter().zip(lower_without.iter()).enumerate() {
-        assert!(
-            (with - without).abs() < 1e-6,
-            "Dim {i}: lower bound differs ({with} vs {without}) — cut was broadcast to multi-output"
+        assert_eq!(
+            with, without,
+            "objective lower[{i}] changed despite the cut-authority quarantine"
         );
     }
 }

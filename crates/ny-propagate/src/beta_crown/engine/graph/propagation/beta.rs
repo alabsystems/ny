@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use ny_core::{nan_propagating_max, GemmEngine, Result};
+use ny_core::{nan_propagating_max, GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::{debug, info, trace, warn};
 
@@ -189,7 +189,7 @@ impl BetaCrownVerifier {
         for iter in 0..self.config.beta_iterations {
             // Deadline check (#3109): bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 info!(
                     "Graph β-SPSA: deadline exceeded at iteration {}/{}, returning best bounds",
                     iter, self.config.beta_iterations
@@ -379,7 +379,7 @@ impl BetaCrownVerifier {
         for iter in 0..self.config.beta_iterations {
             // Deadline check (#3109): bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 info!(
                     "Graph αβ-analytical: deadline exceeded at iteration {}/{}, returning best bounds",
                     iter, self.config.beta_iterations
@@ -580,7 +580,7 @@ impl BetaCrownVerifier {
         let mut best_decision = if verify_upper_bound { base_u } else { base_l };
 
         for iter in 0..iterations {
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 break;
             }
 
@@ -792,6 +792,12 @@ impl BetaCrownVerifier {
             // sound, CPU fallback) — replaces the ~60 s/domain CPU dense backward.
             Ok((l, u, cache))
         } else {
+            if self.past_effective_graph_bab_deadline() {
+                return Err(NyError::DeadlineExceeded(
+                    "graph beta per-domain propagation: deadline exceeded before CPU fallback"
+                        .to_string(),
+                ));
+            }
             // No optimization — single pass with inherited β and α
             let ctx_with_alpha = if !child.alpha_state.is_empty() {
                 GraphCrownContext {
@@ -881,10 +887,17 @@ impl BetaCrownVerifier {
         if !crate::network::resnet_beta_gpu_enabled() {
             return None;
         }
+        let authority_deadline = self.effective_graph_bab_deadline();
+        if authority_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return None;
+        }
         let probe = std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1");
         let gpu = engine
             .and_then(|e| e.as_gpu_crown_backward())
-            .filter(|g| g.provides_sound_gpu_crown())?;
+            .filter(|g| g.provides_sound_gpu_crown())
+            .filter(|g| {
+                crate::sound_gpu_gate::gpu_crown_backend_honors_deadline(*g, authority_deadline)
+            })?;
         // ReLU-only splits: the additive ±β term implements the ReLU (split_point=0)
         // dual. GenBaB / non-zero split points need different semantics → CPU.
         if !child.history.genbab_constraints.is_empty() {
@@ -905,7 +918,7 @@ impl BetaCrownVerifier {
         // Constrained forward bounds (the domain's ReLU splits as tightened pre-acts).
         // #cone-delta: the child's delta describes exactly `parent_node_bounds`
         // (inherited verbatim at split time); dark, NY_CONE_REFRESH-gated.
-        let (bounds_cache, constrained_input) = self
+        let (mut bounds_cache, constrained_input) = self
             .compute_constrained_forward_bounds(
                 graph,
                 child.input_bounds.as_ref(),
@@ -914,6 +927,24 @@ impl BetaCrownVerifier {
                 Some(&child.delta_pre_nodes),
             )
             .ok()?;
+        let clip_context =
+            GraphCrownContext::new(&child.history, None, Some(parent_node_bounds), engine)
+                .with_alpha(&child.alpha_state)
+                .with_delta_seeds(&child.delta_pre_nodes);
+        let exec_order = graph.exec_order().ok()?;
+        self.maybe_apply_complete_clip_root_bank(
+            graph,
+            &clip_context,
+            Some(&child.beta_state),
+            Some(objective),
+            None,
+            &constrained_input,
+            exec_order,
+            &mut bounds_cache,
+        );
+        if authority_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return None;
+        }
         // Decompose the output suffix with alpha=None: default ReLU slopes derived from
         // the CONSTRAINED bounds already reflect the splits; the β dual enforces them too.
         let (segments, relu_names, frontier_abs, node_abs) =
@@ -951,6 +982,14 @@ impl BetaCrownVerifier {
         };
         let in_lo: Vec<f32> = constrained_input.lower().iter().copied().collect();
         let in_hi: Vec<f32> = constrained_input.upper().iter().copied().collect();
+        // Segment extraction and Complete Clip are host/device preparation for
+        // the final proof. Do not admit a new resident launch if that optional
+        // work consumed the literal authority budget.
+        if authority_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return None;
+        }
+        let _gpu_deadline_scope =
+            crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, authority_deadline);
         let result = gpu
             .crown_backward_gpu_resnet_sound_beta(
                 &segments,
@@ -962,11 +1001,14 @@ impl BetaCrownVerifier {
                 &node_abs,
             )
             .ok()?;
-        let l = *result.lower_bounds.first()?;
-        let u = *result.upper_bounds.first()?;
-        if !l.is_finite() || !u.is_finite() {
+        if authority_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return None;
         }
+        if !crate::sound_gpu_gate::gpu_crown_result_is_publishable(&result, 1) {
+            return None;
+        }
+        let l = *result.lower_bounds.first()?;
+        let u = *result.upper_bounds.first()?;
         if probe {
             eprintln!(
                 "[beta-gpu] SUCCESS relus={} num_specs(obj)=1 od={od} l={l:.4} u={u:.4}",

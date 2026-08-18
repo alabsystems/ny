@@ -64,20 +64,23 @@ fn sigmoid_d_f64(x: f64) -> f64 {
     s * (1.0 - s)
 }
 
+fn sigmoid_tables() -> &'static SShapedPrecomputeTables {
+    static TABLES: OnceLock<SShapedPrecomputeTables> = OnceLock::new();
+    TABLES.get_or_init(|| SShapedPrecomputeTables::new(sigmoid_f64, sigmoid_d_f64))
+}
+
 fn sigmoid_constant_relaxation() -> LinearRelaxation {
     LinearRelaxation::constant(-S_SHAPED_RELAX_EPS, 1.0 + S_SHAPED_RELAX_EPS)
 }
 
 pub(crate) fn sigmoid_crossing_default_tangents(l: f32, u: f32) -> (f32, f32) {
-    static TABLES: OnceLock<SShapedPrecomputeTables> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| SShapedPrecomputeTables::new(sigmoid_f64, sigmoid_d_f64));
+    let tables = sigmoid_tables();
     (tables.lower_tangent(u, l), tables.upper_tangent(l, u))
 }
 
 /// Linear relaxation for sigmoid on interval [l, u].
 pub(crate) fn sigmoid_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
-    static TABLES: OnceLock<SShapedPrecomputeTables> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| SShapedPrecomputeTables::new(sigmoid_f64, sigmoid_d_f64));
+    let tables = sigmoid_tables();
     s_shaped_linear_relaxation(
         l,
         u,

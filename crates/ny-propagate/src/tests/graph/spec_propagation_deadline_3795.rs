@@ -2,21 +2,17 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::types::{BoundsProvenance, CrownBackwardResult, CrownIbpFallbackReason};
+use crate::types::{BoundsProvenance, CrownBackwardResult};
 use crate::*;
 use ndarray::{arr1, Array2, ArrayD, IxDyn};
-use ny_core::{GemmEngine, NaiveCpuGemmEngine, Result};
-use std::thread;
+use ny_core::{GemmEngine, Result};
 use std::time::{Duration, Instant};
 
-struct SleepingGemmEngine {
-    sleep_per_call: Duration,
-}
+struct OpaqueGemmEngine;
 
-impl GemmEngine for SleepingGemmEngine {
-    fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
-        thread::sleep(self.sleep_per_call);
-        NaiveCpuGemmEngine.gemm_f32(m, k, n, a, b)
+impl GemmEngine for OpaqueGemmEngine {
+    fn gemm_f32(&self, _: usize, _: usize, _: usize, _: &[f32], _: &[f32]) -> Result<Vec<f32>> {
+        panic!("finite spec fallback entered an opaque GEMM kernel")
     }
 }
 
@@ -61,16 +57,14 @@ fn run_spec_guided_conv2d_deadline_probe(
     spec_matrix: &Array2<f32>,
     engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
-) -> CrownBackwardResult {
-    graph
-        .propagate_crown_with_specs_and_provenance_and_engine_with_node_bounds_and_deadline(
-            input,
-            spec_matrix,
-            engine,
-            node_bounds,
-            deadline,
-        )
-        .expect("deadline-aware Conv2d spec CROWN should fall back cleanly")
+) -> Result<CrownBackwardResult> {
+    graph.propagate_crown_with_specs_and_provenance_and_engine_with_node_bounds_and_deadline(
+        input,
+        spec_matrix,
+        engine,
+        node_bounds,
+        deadline,
+    )
 }
 
 /// Regression for #3795/#3881: a single large Conv2d node must honor the verifier
@@ -85,34 +79,35 @@ fn test_spec_guided_conv2d_per_node_deadline_fallback_3795() {
     tests::with_serialized_env_vars(&[("NY_CONV_SKIP_DEAD_F32", "0")], || {
         let (graph, input, node_bounds, spec_matrix) = build_large_conv_case();
 
-        // Case 1: deadline already expired → immediate IBP fallback (DeadlineExceeded)
-        let expired = run_spec_guided_conv2d_deadline_probe(
+        // Case 1: an already-expired request cannot launch the specification
+        // projection needed for a fresh IBP fallback.
+        let expired_error = run_spec_guided_conv2d_deadline_probe(
             &graph,
             &input,
             &node_bounds,
             &spec_matrix,
             None,
             Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap()),
-        );
-        assert_eq!(
-            expired.provenance,
-            BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::DeadlineExceeded)
+        )
+        .expect_err("expired spec request must refuse before fallback projection");
+        assert!(
+            matches!(expired_error, NyError::DeadlineExceeded(_)),
+            "expected typed deadline refusal, got {expired_error:?}"
         );
 
-        // Case 2: sub-floor per-node budget with remaining time → CROWN backward
-        // proceeds with global deadline instead of falling back to IBP (#3881).
-        // This preserves LinearBounds for split scoring on short-budget tiny graphs.
-        let slow_engine = SleepingGemmEngine {
-            sleep_per_call: Duration::from_millis(5),
-        };
+        // Case 2: while the global deadline remains live, the finite dense
+        // Conv2d kernel may decline and the coordinator can still publish its
+        // sound per-node concretization under that same authority.
+        let opaque_engine = OpaqueGemmEngine;
         let result = run_spec_guided_conv2d_deadline_probe(
             &graph,
             &input,
             &node_bounds,
             &spec_matrix,
-            Some(&slow_engine),
+            Some(&opaque_engine),
             Some(Instant::now() + Duration::from_millis(100)),
-        );
+        )
+        .expect("live finite Conv2d request should preserve a sound bounded result");
         assert_eq!(
             result.provenance,
             BoundsProvenance::Crown,

@@ -13,8 +13,44 @@ use crate::layers::Layer;
 use crate::network::core::try_extract_single_gpu_layer;
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{GpuCrownBackward, NyError, Result};
-use ny_tensor::{BoundedTensor, RepairStrategy};
+use ny_tensor::BoundedTensor;
+use std::time::Instant;
 use tracing::{debug, info};
+
+/// Build a full or unstable-row identity seed without allowing an optional GPU
+/// allocation to abort the process. Any overflow, invalid sparse index, or
+/// allocator refusal selects the caller's CPU partial-CROWN path.
+fn try_gpu_partial_spec(
+    unstable_indices: Option<&[usize]>,
+    n_specs: usize,
+    output_dim: usize,
+) -> Option<Vec<f32>> {
+    let elements = n_specs.checked_mul(output_dim)?;
+    let mut spec = Vec::new();
+    spec.try_reserve_exact(elements).ok()?;
+    spec.resize(elements, 0.0);
+    if let Some(indices) = unstable_indices {
+        if indices.len() != n_specs {
+            return None;
+        }
+        for (row, &column) in indices.iter().enumerate() {
+            if column >= output_dim {
+                return None;
+            }
+            let offset = row.checked_mul(output_dim)?.checked_add(column)?;
+            spec[offset] = 1.0;
+        }
+    } else {
+        if n_specs != output_dim {
+            return None;
+        }
+        for row in 0..output_dim {
+            let offset = row.checked_mul(output_dim)?.checked_add(row)?;
+            spec[offset] = 1.0;
+        }
+    }
+    Some(spec)
+}
 
 /// Attempt GPU-accelerated CROWN backward for a partial sub-network.
 ///
@@ -48,7 +84,13 @@ pub(super) fn try_gpu_crown_partial_backward(
     output_dim: usize,
     output_shape: &[usize],
     output_bounds: &BoundedTensor,
+    deadline: Option<Instant>,
 ) -> Result<Option<PartialCrownPropagationResult>> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP GPU partial: deadline exceeded before setup".to_string(),
+        ));
+    }
     // Skip GPU dispatch for very small sub-networks — the identity spec
     // construction and GPU upload/download overhead exceeds the CPU backward
     // cost for ≤2 layers.
@@ -93,6 +135,11 @@ pub(super) fn try_gpu_crown_partial_backward(
     // Each layer needs the pre-activation bounds for activation relaxation slopes.
     let mut gpu_layers = Vec::with_capacity(layers.len());
     for (i, layer) in layers.iter().enumerate().rev() {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(format!(
+                "CROWN-IBP GPU partial: deadline exceeded while extracting layer {i}"
+            )));
+        }
         let pre_activation = if i == 0 { input } else { &prior_bounds[i - 1] };
         if try_extract_single_gpu_layer(layer, pre_activation, &mut gpu_layers).is_none() {
             debug!(
@@ -109,23 +156,23 @@ pub(super) fn try_gpu_crown_partial_backward(
     // (n_unstable × output_dim) spec instead of the full (output_dim × output_dim)
     // identity. Each row selects one unstable output neuron.
     let spec = if let Some(ref idx) = unstable_indices {
-        let mut s = vec![0.0f32; n_specs * output_dim];
-        for (row, &col) in idx.iter().enumerate() {
-            s[row * output_dim + col] = 1.0;
-        }
         debug!(
             "CROWN-IBP GPU partial: sparse spec {}/{} unstable ({:.1}% reduction)",
             n_specs,
             output_dim,
             (1.0 - n_specs as f64 / output_dim as f64) * 100.0,
         );
-        s
+        let Some(spec) = try_gpu_partial_spec(Some(idx), n_specs, output_dim) else {
+            info!("CROWN-IBP GPU partial: sparse seed allocation refused, falling back to CPU");
+            return Ok(None);
+        };
+        spec
     } else {
-        let mut s = vec![0.0f32; output_dim * output_dim];
-        for i in 0..output_dim {
-            s[i * output_dim + i] = 1.0;
-        }
-        s
+        let Some(spec) = try_gpu_partial_spec(None, n_specs, output_dim) else {
+            info!("CROWN-IBP GPU partial: identity seed allocation refused, falling back to CPU");
+            return Ok(None);
+        };
+        spec
     };
 
     // Step 3: Get contiguous input bounds for concretization.
@@ -138,6 +185,11 @@ pub(super) fn try_gpu_crown_partial_backward(
     // `γ_n·S` coefficient-error term is carried through every on-device AW GEMM,
     // validated against the host reference in
     // `crown_backward_sound_resident::tests`). Otherwise the fast unsound path.
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP GPU partial: deadline exceeded before launch".to_string(),
+        ));
+    }
     let dispatch = if use_sound {
         gpu.crown_backward_gpu_sound(&gpu_layers, &spec, n_specs, &input_lower, &input_upper)
     } else {
@@ -146,6 +198,11 @@ pub(super) fn try_gpu_crown_partial_backward(
     let gpu_result = match dispatch {
         Ok(r) => r,
         Err(e) => {
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return Err(NyError::DeadlineExceeded(
+                    "CROWN-IBP GPU partial: deadline exceeded during launch".to_string(),
+                ));
+            }
             info!(
                 "CROWN-IBP GPU partial: backward failed ({}), falling back to CPU",
                 e
@@ -153,19 +210,17 @@ pub(super) fn try_gpu_crown_partial_backward(
             return Ok(None);
         }
     };
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP GPU partial: deadline exceeded after launch".to_string(),
+        ));
+    }
 
-    // Step 4b: NaN pre-check on raw GPU results (#3752).
-    // If the GPU returns NaN for *any* element, discard the entire result and
-    // fall back to CPU. This must run before RepairStrategy::Widen (which
-    // converts NaN → ±inf), because Widen would mask the NaN signal and let
-    // incorrect non-NaN siblings through into the intersection.
-    let has_nan = gpu_result
-        .lower_bounds
-        .iter()
-        .chain(gpu_result.upper_bounds.iter())
-        .any(|v| v.is_nan());
-    if has_nan {
-        info!("CROWN-IBP GPU partial: NaN in raw GPU bounds, falling back to CPU");
+    // Step 4b: validate the complete raw device payload before any reshape,
+    // repair, scatter, or intersection. Wrong shape, NaN/Inf, and inversion
+    // all refuse the GPU result as a unit and preserve the CPU oracle.
+    if !crate::sound_gpu_gate::gpu_crown_result_is_publishable(&gpu_result, n_specs) {
+        info!("CROWN-IBP GPU partial: malformed raw GPU bounds, falling back to CPU");
         return Ok(None);
     }
 
@@ -173,19 +228,31 @@ pub(super) fn try_gpu_crown_partial_backward(
     // Phase 2 (#3599): sparse mode returns n_unstable bounds — scatter into
     // full output_dim using IBP for stable positions before intersection.
     let crown_result = if let Some(ref idx) = unstable_indices {
-        scatter_sparse_crown_into_ibp(
+        let scattered = scatter_sparse_crown_into_ibp(
             &gpu_result.lower_bounds,
             &gpu_result.upper_bounds,
             output_bounds,
             idx,
             output_shape,
-        )?
+        );
+        let Ok(scattered) = scattered else {
+            info!("CROWN-IBP GPU partial: sparse result validation refused, falling back to CPU");
+            return Ok(None);
+        };
+        scattered
     } else {
-        let lower = ArrayD::from_shape_vec(IxDyn(output_shape), gpu_result.lower_bounds)
-            .map_err(|e| NyError::InvalidSpec(format!("GPU CROWN partial reshape: {e}")))?;
-        let upper = ArrayD::from_shape_vec(IxDyn(output_shape), gpu_result.upper_bounds)
-            .map_err(|e| NyError::InvalidSpec(format!("GPU CROWN partial reshape: {e}")))?;
-        BoundedTensor::new_repaired(lower, upper, RepairStrategy::Widen)?
+        let (Ok(lower), Ok(upper)) = (
+            ArrayD::from_shape_vec(IxDyn(output_shape), gpu_result.lower_bounds),
+            ArrayD::from_shape_vec(IxDyn(output_shape), gpu_result.upper_bounds),
+        ) else {
+            info!("CROWN-IBP GPU partial: result reshape refused, falling back to CPU");
+            return Ok(None);
+        };
+        let Ok(bounds) = BoundedTensor::new(lower, upper) else {
+            info!("CROWN-IBP GPU partial: result validation refused, falling back to CPU");
+            return Ok(None);
+        };
+        bounds
     };
 
     // Step 6: Intersect GPU-computed CROWN bounds with IBP bounds for tightening.
@@ -218,6 +285,11 @@ pub(super) fn try_gpu_crown_partial_backward(
         output_dim,
     );
 
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP GPU partial: deadline exceeded before publish".to_string(),
+        ));
+    }
     Ok(Some(PartialCrownPropagationResult::Crown(Box::new(
         tightened,
     ))))

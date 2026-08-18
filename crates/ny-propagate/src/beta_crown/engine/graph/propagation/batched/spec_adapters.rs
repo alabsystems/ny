@@ -217,7 +217,7 @@ impl BetaCrownVerifier {
                     match graph.collect_node_bounds_with_engine_and_deadline(
                         &input,
                         Some(engine),
-                        self.config.alpha_config.deadline,
+                        self.effective_graph_bab_deadline(),
                     ) {
                         Ok(fresh_ibp) => {
                             // Materialize a plain view for the shared merge
@@ -263,7 +263,7 @@ impl BetaCrownVerifier {
             let collected_bounds = collect_intermediate_bounds(
                 graph,
                 &input,
-                self.config.alpha_config.deadline,
+                self.effective_graph_bab_deadline(),
                 Some(engine),
             )?
             .into_iter()
@@ -291,15 +291,39 @@ impl BetaCrownVerifier {
         engine: &dyn GemmEngine,
     ) -> Result<Vec<DomainSpecCrownResult>> {
         Ok(self
-            .propagate_crown_with_batched_domains_full_specs_beta_opt(
+            .propagate_crown_with_batched_domains_full_specs_timed(
                 graph,
                 domains,
                 batched,
                 spec_matrix,
                 engine,
-                None,
             )?
             .results)
+    }
+
+    /// Stage-timed form of [`propagate_crown_with_batched_domains_full_specs`]:
+    /// returns the full [`BatchedSpecBackwardResult`] so a caller can read the
+    /// `stage_timing` (forward / backward / materialize) the primitive already
+    /// computes. The untimed entry above drops that field with the rest of the
+    /// result, which left the kFSB simulation backward unable to report the
+    /// same split `mo-wave-stage` prints for the main child pass. Same call as
+    /// before (`beta_opt = None`) ⇒ byte-identical bounds.
+    pub(in crate::beta_crown::engine::graph) fn propagate_crown_with_batched_domains_full_specs_timed(
+        &self,
+        graph: &GraphNetwork,
+        domains: &[&GraphBabDomain],
+        batched: &BatchedDomains,
+        spec_matrix: &Array2<f32>,
+        engine: &dyn GemmEngine,
+    ) -> Result<BatchedSpecBackwardResult> {
+        self.propagate_crown_with_batched_domains_full_specs_beta_opt(
+            graph,
+            domains,
+            batched,
+            spec_matrix,
+            engine,
+            None,
+        )
     }
 
     /// β-optimizing form of [`propagate_crown_with_batched_domains_full_specs`]
@@ -566,7 +590,7 @@ impl BetaCrownVerifier {
                         .collect_node_bounds_batched(
                             &inputs,
                             Some(engine),
-                            self.config.alpha_config.deadline,
+                            self.effective_graph_bab_deadline(),
                         )
                         .map(|maps| {
                             #[cfg(test)]
@@ -625,7 +649,9 @@ impl BetaCrownVerifier {
                         per_domain_caches.push(cache);
                         inputs.push(input);
                     }
-                    Err(e) if e.is_infeasible_domain() => {
+                    Err(e) if e.is_infeasible_domain() || e.is_deadline_exceeded() => {
+                        // Preserve control-flow errors for the caller's
+                        // infeasible-domain pruning / timeout translation.
                         return Err(e);
                     }
                     Err(e) => {
@@ -655,6 +681,7 @@ impl BetaCrownVerifier {
             plan,
             &cache_refs,
             &constrained_inputs,
+            &ctx.histories,
             &ctx.beta_states,
             &ctx.alpha_states,
             spec_matrix,

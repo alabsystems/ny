@@ -52,10 +52,9 @@
 #   deletion and does not describe the current ay backend.
 #
 # Tuning: keep the reference's strong PGD sweep for the SAT instances. NOTE:
-# ny does not implement the reference's after-BaB ordering — pgd_order=after
-# only ENABLES PGD, which then runs on the default UPFRONT schedule
-# (apply_preset warns about exactly this; the VERIFIED block above records the
-# up-front behavior). 10000 restarts matches the reference.
+# NY does not implement the reference's after-BaB ordering. The explicit
+# ny_pgd_order_compat contract below preserves the measured UPFRONT placement
+# without claiming scheduler parity. 10000 restarts matches the reference.
 #
 # PHASE BUDGET + max_domains (2026-07 gap probe, official budget = 20s/instance,
 # internal ny timeout = 15s after the runner's grace tier):
@@ -87,7 +86,15 @@ general:
   csv_name: instances.csv
 
 attack:
+  # Force the upfront falsification lane (#upfront-preset). safenlp specs are
+  # single-constraint, so the auto multi-clause-disjunction rule skips them. This
+  # used to live ONLY as `NY_UPFRONT_ATTACK=1` in run_instance.sh, so every
+  # measurement path disagreed with the submission path. MEASURED:
+  # medical/hyperrectangle_2096 is `sat` at the official 20s budget with the lane
+  # and `timeout` without it.
+  upfront_attack: true
   pgd_order: after
+  ny_pgd_order_compat: upfront
   pgd_restarts: 10000
 
 bab:
@@ -103,7 +110,20 @@ bab:
   # upfront gradient lane wins the razor-thin SATs in its ~1.6s slice BEFORE
   # BaB, so the full budget stays with the UNSAT proof. Combined config
   # measured 6/6 on the discriminating rows (3 unsat + 3 sat).
-  max_domains: 50000
+  # RAISED 50000 -> 400000 (MEASURED 2026-08-03). The 50000 pin cut off
+  # proofs that need MORE than 50k domains: those rows exited
+  # `Unknown { reason: "Domain limit 50000 reached" }` with budget still
+  # UNSPENT (7s of 20s on ruarobot/hyperrectangle_3465). The zero-sum the
+  # original sweep measured no longer binds — `mip_min_fraction: 0.65`
+  # guarantees the MIP escalation its floor no matter how long BaB runs, and
+  # `upfront_attack` wins the razor-thin SATs before BaB starts.
+  #
+  # Regression A/B on the EXACT rows this comment block names, official 20s:
+  #   9 banked unsat (proofs at 35k-50k): 9/9 still unsat
+  #   8 razor-thin sat (upfront lane):    8/8 still sat
+  #   6 unknown-pool rows:                2 CONVERTED to unsat (3241, 3203)
+  # Zero regressions, two new solves.
+  max_domains: 400000
   phase_budget:
     # Guarantee MIP the dominant share of the 20s budget: floor at
     # max(0.65*total, 8s) (ceiling stays at the 30s default).
@@ -111,3 +131,43 @@ bab:
     mip_min_secs: 8
     # Modest upfront attack cap; PGD finds SAT witnesses in <0.1s here.
     upfront_pgd_fraction: 0.10
+    # #mip-handoff — THE RESERVATION ABOVE IS INERT, AND ARMING IT DOES NOT PAY.
+    #
+    # `mip_min_fraction`/`mip_min_secs` size a slice that
+    # `PhaseBudgetLedger::bab_deadline` carves out of the scored budget for the
+    # exact-MIP escalation. On THIS category that carve-out is only a plan: the
+    # same-LHS relational reduction (verify/sequential.rs
+    # `try_reduced_verification`) is handed `None` for its absolute deadline and
+    # owns the whole remaining wall clock (ACAS-Xu prop_2 needs that). So the
+    # handoff is planned and never made, and the preset's declared strategy — the
+    # exact-MIP complete verifier, the reference config's `complete_verifier:
+    # mip` — has never executed once on any row of this category.
+    #
+    # MEASURED 2026-08-06 (release cuda,mip; NY_PHASE_TELEMETRY=1;
+    # ruarobot/hyperrectangle_3558; official 20s budget; internal tier 15s):
+    #   [budget] bab-dispatch ... bab_end_s=7.500 mip_reserved_s=9.000
+    #   [budget] post-bab     ... elapsed_s=15.312 remaining_s=0.000
+    #   MIP escalation gate: ... mip_timeout=0s remaining=0s   -> gate refuses
+    # BaB overran its own reserved handoff by 7.8s. Corollary: the 2026-08-03
+    # "mip_min_fraction 0.65 -> 0.85 converts nothing" experiment was toggling a
+    # dead knob and proved nothing about MIP share.
+    #
+    # `phase_budget.enforce_mip_handoff: true` (ny_propagate::PhaseBudgetConfig)
+    # makes the handoff bind: bab_end_s=4.497, BaB returns at 4.843s, the
+    # escalation runs with a 10s grant. IT IS DELIBERATELY NOT SET HERE — the
+    # A/B says it does not pay on this hardware:
+    #   * 6 lost-row candidates, 3 arms (off / on / on+NY_SAFENLP_SHORT_GRACE),
+    #     18 runs: 0 recovered in ANY arm.
+    #   * Reachability probe at a 60s budget (not bankable, diagnostic only),
+    #     3 rows x 2 arms: 0 decided either way. The escalation's phase-split
+    #     race reports `certified_unsat=2 ... timeout=14 total=16` with a 10s
+    #     grant and the IDENTICAL `certified_unsat=2 ... timeout=14` with a 35s
+    #     grant — 3.5x the wall buys ZERO extra certified subproblems. Across 9
+    #     escalations the best seen is 4/16. The wall is the ay backend's ability
+    #     to certify these subproblems at all, not the budget split.
+    #   * 10 changed rows re-run 2x per arm at loadavg 19-55: the 8 razor-thin
+    #     SAT rows are `sat` in BOTH arms (the "+8" seen at loadavg ~85 was
+    #     contention, not the knob), medical/2648 is `unsat` in both, and
+    #     ruarobot/4847 goes 1/2 unsat OFF -> 0/2 ON. Net: neutral to -1.
+    # Re-test the knob if the ay backend's per-subproblem certification improves;
+    # the budget half of the repair is already in place and verdict-neutral.

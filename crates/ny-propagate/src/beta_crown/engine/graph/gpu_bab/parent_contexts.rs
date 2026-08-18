@@ -43,7 +43,7 @@ fn materialize_picked_input_bounds(
     let input_batch = picked.input_lowers.shape().first().copied().unwrap_or(0);
     if picked_idx >= input_batch {
         return Err(NyError::InvalidSpec(format!(
-            "GPU BaB input split: picked_idx {} >= input batch size {}",
+            "DomainList BaB input split: picked_idx {} >= input batch size {}",
             picked_idx, input_batch
         )));
     }
@@ -82,7 +82,7 @@ pub(super) fn build_parent_contexts(
     {
         let meta = picked.metadata.get(picked_idx).ok_or_else(|| {
             NyError::InvalidSpec(format!(
-                "GPU BaB input split: metadata missing for picked_idx {}",
+                "DomainList BaB input split: metadata missing for picked_idx {}",
                 picked_idx
             ))
         })?;
@@ -159,7 +159,7 @@ pub(super) fn build_parent_contexts(
         let picked_idx = picked_indices[position];
         let meta = picked.metadata.get(picked_idx).ok_or_else(|| {
             NyError::InvalidSpec(format!(
-                "GPU BaB input split: metadata missing for picked_idx {}",
+                "DomainList BaB input split: metadata missing for picked_idx {}",
                 picked_idx
             ))
         })?;
@@ -188,7 +188,7 @@ pub(super) fn build_parent_contexts(
     {
         let meta = picked.metadata.get(picked_idx).ok_or_else(|| {
             NyError::InvalidSpec(format!(
-                "GPU BaB input split: metadata missing for picked_idx {}",
+                "DomainList BaB input split: metadata missing for picked_idx {}",
                 picked_idx
             ))
         })?;

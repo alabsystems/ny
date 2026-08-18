@@ -6,6 +6,7 @@ use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
 
 use super::BatchNormLayer;
+use crate::bounds::patches::PatchGeometry;
 use crate::layers::common::BoundPropagation;
 use crate::{BatchedLinearBounds, LinearBounds};
 
@@ -148,6 +149,30 @@ fn test_ibp_2d_nchw() {
     assert!((out.upper()[[0, 1]] - (-2.0)).abs() < 1e-5);
     assert!((out.lower()[[1, 1]] - (-8.0)).abs() < 1e-5);
     assert!((out.upper()[[1, 1]] - (-4.0)).abs() < 1e-5);
+}
+
+#[test]
+fn authenticated_unbatched_axis_zero_wins_ambiguous_c_equals_l_shape() {
+    let scale = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 10.0]).unwrap();
+    let bias = ArrayD::zeros(IxDyn(&[2]));
+    let layer = BatchNormLayer::from_scale_bias(scale, bias)
+        .unwrap()
+        .with_channel_axis(0)
+        .unwrap();
+    let point = ArrayD::ones(IxDyn(&[2, 2]));
+    let output = layer
+        .propagate_ibp(&BoundedTensor::new(point.clone(), point).unwrap())
+        .unwrap();
+
+    // Loaded raw `[N,C,L]` is propagated as internal `[C,L]`.  When C == L,
+    // provenance must make each whole row use its channel coefficient; the
+    // legacy shape-only heuristic (kept for manual layers above) uses axis 1.
+    for position in 0..2 {
+        assert!((output.lower()[[0, position]] - 1.0).abs() < 1e-5);
+        assert!((output.upper()[[0, position]] - 1.0).abs() < 1e-5);
+        assert!((output.lower()[[1, position]] - 10.0).abs() < 1e-5);
+        assert!((output.upper()[[1, position]] - 10.0).abs() < 1e-5);
+    }
 }
 
 #[test]
@@ -471,6 +496,133 @@ fn test_crown_batched_1d_matches_ibp() {
     }
 }
 
+fn cancellation_batch_norm() -> (BatchNormLayer, BoundedTensor) {
+    // The exact affine bias reduction is 2^60 + 1 - 2^60 = 1. A plain f64
+    // left-to-right sum loses the unit residual, and one final outward f32 ULP
+    // around zero cannot recover it.
+    let large = 2.0_f32.powi(60);
+    let layer = BatchNormLayer::from_scale_bias(
+        ArrayD::ones(IxDyn(&[3])),
+        ArrayD::from_shape_vec(IxDyn(&[3]), vec![large, 1.0, -large]).unwrap(),
+    )
+    .unwrap();
+    let point = ArrayD::zeros(IxDyn(&[3]));
+    let input = BoundedTensor::new(point.clone(), point).unwrap();
+    (layer, input)
+}
+
+fn assert_cancellation_residual_is_tight_and_enclosed(lower: f32, upper: f32) {
+    assert!(
+        lower <= 1.0 && upper >= 1.0,
+        "exact residual 1 is not enclosed by [{lower:e}, {upper:e}]"
+    );
+    assert!(
+        lower > 0.99 && upper < 1.01,
+        "certified cancellation enclosure is unexpectedly loose: [{lower:e}, {upper:e}]"
+    );
+}
+
+#[test]
+fn scalar_crown_bias_fold_certifies_catastrophic_cancellation() {
+    let (layer, input) = cancellation_batch_norm();
+    let a = Array2::from_shape_vec((1, 3), vec![1.0; 3]).unwrap();
+    let bounds = LinearBounds::new(a.clone(), Array1::zeros(1), a, Array1::zeros(1)).unwrap();
+    let output = layer.propagate_linear_with_bounds(&bounds, &input).unwrap();
+    assert_cancellation_residual_is_tight_and_enclosed(output.lower_b()[0], output.upper_b()[0]);
+}
+
+#[test]
+fn batched_crown_bias_fold_certifies_catastrophic_cancellation() {
+    let (layer, input) = cancellation_batch_norm();
+    let a = ArrayD::from_shape_vec(IxDyn(&[1, 3]), vec![1.0; 3]).unwrap();
+    let bounds = BatchedLinearBounds::new(
+        a.clone(),
+        ArrayD::zeros(IxDyn(&[1])),
+        a,
+        ArrayD::zeros(IxDyn(&[1])),
+        vec![3],
+        vec![1],
+    )
+    .unwrap();
+    let output = layer
+        .propagate_linear_batched_with_bounds(&bounds, &input)
+        .unwrap();
+    assert_cancellation_residual_is_tight_and_enclosed(
+        output.lower_b()[[0]],
+        output.upper_b()[[0]],
+    );
+}
+
+#[test]
+fn patches_6d_bias_fold_certifies_catastrophic_cancellation() {
+    use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
+    use crate::layers::common::PatchesPropagation;
+
+    let (layer, _) = cancellation_batch_norm();
+    let make_side = || PatchesData {
+        coeff_err: None,
+        patches: Some(ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 3, 1, 1]), vec![1.0; 3]).unwrap()),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+        identity: false,
+        output_shape: (1, 1, 1),
+        input_shape: (3, 1, 1),
+        unstable_idx: None,
+    };
+    let bounds = PatchesLinearBounds {
+        row_count: 1,
+        lower_a: make_side(),
+        lower_b: Array1::zeros(1),
+        upper_a: make_side(),
+        upper_b: Array1::zeros(1),
+    };
+    let output = match layer.propagate_patches(&bounds).unwrap() {
+        CrownBounds::Patches(output) => output,
+        CrownBounds::Dense(_) => panic!("expected 6-D patches output"),
+    };
+    assert_cancellation_residual_is_tight_and_enclosed(output.lower_b[0], output.upper_b[0]);
+}
+
+#[test]
+fn patches_6d_bias_widen_includes_coeff_error_times_bias_error_cross_term() {
+    use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
+    use crate::layers::common::PatchesPropagation;
+
+    // Stored a=bias=0, but the certified real values may independently be
+    // a_true in [-1,1] and bias_real in [-1,1]. Their product reaches +/-1.
+    // Omitting the |alpha*beta| = coeff_err*bias_err cross term emits zero and
+    // is unsound.
+    let layer = BatchNormLayer {
+        scale: ArrayD::ones(IxDyn(&[1])),
+        bias: ArrayD::zeros(IxDyn(&[1])),
+        scale_err: ArrayD::zeros(IxDyn(&[1])),
+        bias_err: ArrayD::ones(IxDyn(&[1])),
+        num_channels: 1,
+        channel_axis_hint: None,
+    };
+    let make_side = || PatchesData {
+        coeff_err: Some(Array1::ones(1)),
+        patches: Some(ArrayD::zeros(IxDyn(&[1, 1, 1, 1, 1, 1]))),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+        identity: false,
+        output_shape: (1, 1, 1),
+        input_shape: (1, 1, 1),
+        unstable_idx: None,
+    };
+    let bounds = PatchesLinearBounds {
+        row_count: 1,
+        lower_a: make_side(),
+        lower_b: Array1::zeros(1),
+        upper_a: make_side(),
+        upper_b: Array1::zeros(1),
+    };
+    let output = match layer.propagate_patches(&bounds).unwrap() {
+        CrownBounds::Patches(output) => output,
+        CrownBounds::Dense(_) => panic!("expected 6-D patches output"),
+    };
+    assert!(output.lower_b[0] <= -1.0, "lower={}", output.lower_b[0]);
+    assert!(output.upper_b[0] >= 1.0, "upper={}", output.upper_b[0]);
+}
+
 #[test]
 fn test_new_with_epsilon() {
     // With epsilon, sqrt(var+eps) changes
@@ -537,9 +689,36 @@ fn test_new_rejects_negative_variance() {
     assert!(result.is_err(), "Expected error for negative variance");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
-        err_msg.contains("negative"),
-        "Expected negative-variance error, got: {err_msg}"
+        err_msg.contains("strictly positive"),
+        "Expected positive-denominator refusal, got: {err_msg}"
     );
+}
+
+#[test]
+fn test_new_rejects_nonfinite_raw_parameters_and_epsilon() {
+    let one = ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap();
+    let zero = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap();
+    let nan = ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NAN]).unwrap();
+    let inf = ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::INFINITY]).unwrap();
+
+    assert!(BatchNormLayer::new(&nan, &zero, &zero, &one, 1e-5).is_err());
+    assert!(BatchNormLayer::new(&one, &inf, &zero, &one, 1e-5).is_err());
+    assert!(BatchNormLayer::new(&one, &zero, &nan, &one, 1e-5).is_err());
+    assert!(BatchNormLayer::new(&one, &zero, &zero, &inf, 1e-5).is_err());
+    assert!(BatchNormLayer::new(&one, &zero, &zero, &one, f32::NAN).is_err());
+}
+
+#[test]
+fn test_new_rejects_malformed_parameter_shapes() {
+    let one = ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap();
+    let zero = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap();
+    let two = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0, 0.0]).unwrap();
+    let matrix = ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0]).unwrap();
+    let empty = ArrayD::from_shape_vec(IxDyn(&[0]), Vec::new()).unwrap();
+
+    assert!(BatchNormLayer::new(&one, &two, &zero, &one, 1e-5).is_err());
+    assert!(BatchNormLayer::new(&matrix, &zero, &zero, &one, 1e-5).is_err());
+    assert!(BatchNormLayer::new(&empty, &empty, &empty, &empty, 1e-5).is_err());
 }
 
 /// Valid variance with sufficient epsilon should still succeed.
@@ -660,20 +839,27 @@ fn test_from_scale_bias_rejects_neg_inf_bias() {
     assert!(result.is_err(), "Neg Inf in bias should return Err");
 }
 
-// --- 7D explicit-rows coeff_err closure: 6D byte-identity pin ---
-// (docs/PATCHES_7D_COEFF_ERR_CLOSURE.md §8.4 T2; validation gate §13 item 1)
+#[test]
+fn test_from_scale_bias_rejects_non_vector_or_empty_parameters() {
+    let matrix = ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0]).unwrap();
+    assert!(BatchNormLayer::from_scale_bias(matrix.clone(), matrix).is_err());
 
-/// BYTE-IDENTITY PIN: the 6D dense (non-identity, `unstable_idx: None`)
-/// BatchNorm patches backward with NONZERO incoming `coeff_err` on both sides
-/// and NONZERO layer `scale_err`/`bias_err` must stay bit-for-bit unchanged by
-/// the 7D explicit-rows coeff_err closure (which adds a NEW 7D arm beside the
-/// 6D arm without touching it — spec §8.3 step 2 keeps the 6D block textually
-/// byte-identical).
+    let empty = ArrayD::from_shape_vec(IxDyn(&[0]), Vec::new()).unwrap();
+    assert!(BatchNormLayer::from_scale_bias(empty.clone(), empty).is_err());
+}
+
+// --- 6D directed-reduction regression + legacy 7D-closure pins ---
+
+/// Regression pin for the ordinary 6D dense (non-identity,
+/// `unstable_idx: None`) BatchNorm patches fixture with nonzero incoming
+/// coefficient and affine-parameter errors.
 ///
-/// Committed and verified green against the UNMODIFIED (pre-closure) tree; the
-/// bit literals below were captured from a run of that tree
-/// (`RUSTFLAGS="-C target-cpu=native" cargo test -p ny-propagate --release`).
-/// Must pass unmodified after the closure lands.
+/// The coefficient pins remain the byte-identity guard from the 7D closure.
+/// Bias/error reductions are now explicitly certified; the bias pins below
+/// capture the resulting outward endpoints, while
+/// `patches_6d_bias_fold_certifies_catastrophic_cancellation` above is the
+/// adversarial proof that distinguishes the new reduction from the old final-
+/// cast-only implementation.
 ///
 /// Fixture notes (spec §8.4): 6D layout [oc=2, oh=1, ow=2, ic=2, kh=2, kw=1],
 /// non-dyadic values (products must round), pad_top=1 so half the taps are
@@ -692,6 +878,7 @@ fn test_bn_patches_6d_coeff_err_byte_identical_regression() {
         scale_err: ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.5e-4_f32, 3.0e-5]).unwrap(),
         bias_err: ArrayD::from_shape_vec(IxDyn(&[2]), vec![2.0e-4_f32, 7.0e-6]).unwrap(),
         num_channels: 2,
+        channel_axis_hint: None,
     };
 
     // 6D patches [oc=2, oh=1, ow=2, ic=2, kh=2, kw=1]; out-neuron count 4.
@@ -706,9 +893,8 @@ fn test_bn_patches_6d_coeff_err_byte_identical_regression() {
     let make_side = |vals: Vec<f32>, err: Vec<f32>| PatchesData {
         coeff_err: Some(Array1::from_vec(err)),
         patches: Some(ArrayD::from_shape_vec(IxDyn(&[2, 1, 2, 2, 2, 1]), vals).unwrap()),
-        stride: (1, 1),
         // pad_top = 1: ki=0 taps are padding (invalid), ki=1 taps valid.
-        padding: (0, 0, 1, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 1, 0)),
         identity: false,
         output_shape: (2, 1, 2),
         input_shape: (2, 1, 2),
@@ -731,14 +917,17 @@ fn test_bn_patches_6d_coeff_err_byte_identical_regression() {
     };
 
     assert_eq!(pb.row_count, 4);
-    assert_eq!(pb.lower_a.stride, (1, 1));
-    assert_eq!(pb.lower_a.padding, (0, 0, 1, 0));
+    assert_eq!(
+        pb.lower_a.geometry,
+        PatchGeometry::affine((1, 1), (0, 0, 1, 0))
+    );
     assert_eq!(pb.lower_a.output_shape, (2, 1, 2));
     assert_eq!(pb.lower_a.input_shape, (2, 1, 2));
     assert!(!pb.lower_a.identity && !pb.upper_a.identity);
     assert!(pb.lower_a.unstable_idx.is_none() && pb.upper_a.unstable_idx.is_none());
 
-    // Bit literals captured from pre-change HEAD (see doc comment).
+    // Coefficient literals predate the directed-reduction change. Bias/error
+    // literals pin the currently certified implementation.
     const EXP_LOWER_PATCHES: [u32; 16] = [
         0x3F451EB8, 0xBFB70A3D, 0xBEC51EB8, 0xBFD70A3E, 0xBEC51EB8, 0x3F6F5C2A, 0xBF4E147A,
         0x3EE8F5C2, 0x3D6147AF, 0xBF85C28F, 0xBF9851EC, 0x3FC51EB8, 0x3EFD70A4, 0x3F7D70A4,
@@ -749,8 +938,8 @@ fn test_bn_patches_6d_coeff_err_byte_identical_regression() {
         0xBF81EB85, 0xBFBE147B, 0x3F533334, 0x3E333333, 0xBF3C28F5, 0xBF0CCCCD, 0x40175C2A,
         0xBEE8F5C2, 0x3F9CCCCD,
     ];
-    const EXP_LOWER_B: [u32; 4] = [0xC01CE500, 0x3F23A446, 0x3FFF556D, 0xBF2BA4DB];
-    const EXP_UPPER_B: [u32; 4] = [0x3CB99A8B, 0xBF5EB071, 0xBFB59FE8, 0x404150E5];
+    const EXP_LOWER_B: [u32; 4] = [0xC01CE501, 0x3F23A444, 0x3FFF556D, 0xBF2BA4DC];
+    const EXP_UPPER_B: [u32; 4] = [0x3CB99B6A, 0xBF5EB071, 0xBFB59FE7, 0x404150E6];
     const EXP_LOWER_ERR: [u32; 4] = [0x3AA9C4E4, 0x3A31A309, 0x39157CC7, 0x39D7023A];
     const EXP_UPPER_ERR: [u32; 4] = [0x3B1C7E05, 0x39A149FF, 0x3A86B3EE, 0x39E2D61C];
 
@@ -821,114 +1010,37 @@ fn check_bit_pins(pins: &[(&str, &[f32], &[u32])]) {
     }
 }
 
-/// Root-cause regression for the cifar100_2024 graph beta-CROWN abort.
-///
-/// `BatchNormLayer::new`'s guard only rejects `var + eps < 0`; a channel with
-/// `var + eps == 0` (e.g. `var = -eps`) yields `scale = ny / sqrt(0) = +inf`.
-/// In CROWN backward the column coefficients are scaled by `scale`. A zero
-/// incoming coefficient times the Inf scale is `0 * inf`, which with a plain
-/// multiply is `NaN`. That NaN poisoned the linear bounds and ultimately
-/// aborted intermediate-bound construction at `BoundedTensor::new` (NaN/Inf
-/// rejection) in the graph beta-CROWN BaB clip path.
-///
-/// After the fix the BatchNorm CROWN backward uses `safe_mul_for_bounds`
-/// (`0 * inf = 0`): a zero coefficient composes to exactly 0, so no NaN is
-/// produced. A nonzero coefficient times the Inf scale yields a ±Inf
-/// coefficient, which `new_or_conservative` / concretize handle soundly.
-/// This test asserts the backward output contains NO NaN.
+/// `var + epsilon == 0` is not a conservative affine BatchNorm: at the point
+/// `x == mean` the ONNX real expression is `0 / 0`, while every nonzero
+/// neighbourhood is unbounded. It must be refused before `0 * Inf` helpers can
+/// turn that undefined expression into a finite proof value.
 #[test]
-fn test_crown_backward_inf_scale_no_nan_from_zero_coeff_4xxx() {
-    // var = -eps -> var + eps == 0 -> scale[0] = inf; channel 1 well-behaved.
+fn test_new_rejects_zero_denominator_instead_of_constructing_inf_scale() {
     let eps = 1e-5_f32;
     let ny = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 1.0]).unwrap();
     let beta = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0, 0.0]).unwrap();
     let mean = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0, 0.0]).unwrap();
     let var = ArrayD::from_shape_vec(IxDyn(&[2]), vec![-eps, 1.0]).unwrap();
-    let layer = BatchNormLayer::new(&ny, &beta, &mean, &var, eps).unwrap();
+    let error = BatchNormLayer::new(&ny, &beta, &mean, &var, eps).unwrap_err();
     assert!(
-        !layer.scale[[0]].is_finite(),
-        "test precondition: channel-0 scale must be inf, got {}",
-        layer.scale[[0]]
+        format!("{error}").contains("strictly positive"),
+        "unexpected refusal: {error}"
     );
+}
 
-    // pre-activation shape [2] -> channel axis 0, one element per channel.
-    let pre_act = BoundedTensor::new(
-        ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0, -1.0]).unwrap(),
-        ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 1.0]).unwrap(),
-    )
-    .unwrap();
-
-    // Incoming bounds whose first column coefficient is 0 (so column 0 hits the
-    // 0 * inf case) and second is 1.
-    let lower_a = Array2::from_shape_vec((1, 2), vec![0.0, 1.0]).unwrap();
-    let upper_a = Array2::from_shape_vec((1, 2), vec![0.0, 1.0]).unwrap();
-    let bounds = LinearBounds::new(lower_a, Array1::zeros(1), upper_a, Array1::zeros(1)).unwrap();
-
-    // Scalar backward must not produce NaN coefficients or NaN bias.
-    let out = layer
-        .propagate_linear_with_bounds(&bounds, &pre_act)
-        .expect("scalar CROWN backward must not error on inf-scale BatchNorm");
-    assert!(
-        out.lower_a().iter().all(|v| !v.is_nan()) && out.upper_a().iter().all(|v| !v.is_nan()),
-        "scalar backward produced NaN coefficient (0 * inf): lower_a={:?} upper_a={:?}",
-        out.lower_a(),
-        out.upper_a()
-    );
-    assert!(
-        out.lower_b().iter().all(|v| !v.is_nan()) && out.upper_b().iter().all(|v| !v.is_nan()),
-        "scalar backward produced NaN bias"
-    );
-    // Precision: without the 0*inf=0 fix the whole matrix would have NaN'd and
-    // collapsed to the conservative firewall (A=0, b=±inf). With the fix the
-    // degenerate column composes to exactly 0 while the well-behaved channel-1
-    // column keeps its finite coefficient (~scale[1] = 1/sqrt(1+eps) ~= 1) and
-    // the bias stays finite. Assert that to prove no whole-matrix degradation.
-    assert!(
-        out.lower_a()[[0, 0]] == 0.0 && out.upper_a()[[0, 0]] == 0.0,
-        "degenerate column should compose to exactly 0, got [{}, {}]",
-        out.lower_a()[[0, 0]],
-        out.upper_a()[[0, 0]]
-    );
-    assert!(
-        (out.lower_a()[[0, 1]] - layer.scale[[1]]).abs() < 1e-4,
-        "well-behaved column coefficient should be preserved (~{}), got {} \
-         (whole-matrix conservative fallback would zero it)",
-        layer.scale[[1]],
-        out.lower_a()[[0, 1]]
-    );
-    assert!(
-        out.lower_b().iter().all(|v| v.is_finite()) && out.upper_b().iter().all(|v| v.is_finite()),
-        "bias should stay finite (conservative fallback would set ±inf): lower_b={:?} upper_b={:?}",
-        out.lower_b(),
-        out.upper_b()
-    );
-
-    // Batched backward must likewise stay NaN-free and avoid whole-matrix
-    // degradation. Identity incoming has off-diagonal zeros in the channel-0
-    // (Inf-scale) column, which is exactly the 0*inf case.
-    let incoming = BatchedLinearBounds::identity(&[2]).unwrap();
-    let out_b = layer
-        .propagate_linear_batched_with_bounds(&incoming, &pre_act)
-        .expect("batched CROWN backward must not error on inf-scale BatchNorm");
-    assert!(
-        out_b.lower_a.iter().all(|v| !v.is_nan()) && out_b.upper_a.iter().all(|v| !v.is_nan()),
-        "batched backward produced NaN coefficient (0 * inf)"
-    );
-    assert!(
-        out_b.lower_b.iter().all(|v| !v.is_nan()) && out_b.upper_b.iter().all(|v| !v.is_nan()),
-        "batched backward produced NaN bias"
-    );
-    // Channel-1 diagonal coefficient preserved (no conservative collapse).
-    assert!(
-        (out_b.lower_a[[1, 1]] - layer.scale[[1]]).abs() < 1e-4,
-        "batched well-behaved column coefficient should be preserved (~{}), got {}",
-        layer.scale[[1]],
-        out_b.lower_a[[1, 1]]
-    );
-    assert!(
-        out_b.lower_b.iter().all(|v| v.is_finite()) && out_b.upper_b.iter().all(|v| v.is_finite()),
-        "batched bias should stay finite (conservative fallback would set ±inf)"
-    );
+#[test]
+fn public_literal_with_nonfinite_affine_is_refused_by_propagation() {
+    let layer = BatchNormLayer {
+        scale: ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::INFINITY]).unwrap(),
+        bias: ArrayD::zeros(IxDyn(&[1])),
+        scale_err: ArrayD::zeros(IxDyn(&[1])),
+        bias_err: ArrayD::zeros(IxDyn(&[1])),
+        num_channels: 1,
+        channel_axis_hint: None,
+    };
+    let point = ArrayD::zeros(IxDyn(&[1]));
+    let input = BoundedTensor::new(point.clone(), point).unwrap();
+    assert!(layer.propagate_ibp(&input).is_err());
 }
 
 // --- 7D explicit-rows coeff_err closure: Site 5 (BatchNorm) tests ---
@@ -971,17 +1083,17 @@ fn make_bn_7d_fixture(
         scale_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![1.5e-4_f32, 3.0e-5, 8.0e-5]).unwrap(),
         bias_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![2.0e-4_f32, 7.0e-6, 4.5e-5]).unwrap(),
         num_channels: 3,
+        channel_axis_hint: None,
     };
     let shape = [2usize, 2, 2, 2, 3, 2, 2];
     let n: usize = shape.iter().product();
     let make_side = |seed: u64, err: Option<Vec<f32>>| PatchesData {
         coeff_err: err.map(Array1::from_vec),
         patches: Some(ArrayD::from_shape_vec(IxDyn(&shape), lcg_vals(seed, n)).unwrap()),
-        stride: (1, 1),
         // pad_left = 1, pad_top = 1: the (oh=0, ki=0) rows / (ow=0, kj=0) cols
         // map outside the 2x2 input (padding, excluded from the bias fold);
         // every other tap is valid — both predicate arms exercised.
-        padding: (1, 0, 1, 0),
+        geometry: PatchGeometry::affine((1, 1), (1, 0, 1, 0)),
         identity: false,
         output_shape: (2, 2, 2),
         input_shape: (3, 2, 2),
@@ -995,6 +1107,261 @@ fn make_bn_7d_fixture(
         upper_b: Array1::from_vec(vec![0.57_f32, 0.29]),
     };
     (layer, bounds)
+}
+
+#[test]
+fn test_bn_patches_preserves_anchored_geometry_without_densifying() {
+    use crate::bounds::patches::{
+        patches_to_dense_call_sites, reset_patches_to_dense_call_count, CrownBounds, PatchesData,
+    };
+    use crate::layers::common::PatchesPropagation;
+
+    let (layer, affine_bounds) = make_bn_7d_fixture(None, None);
+    let affine = match layer.propagate_patches(&affine_bounds).unwrap() {
+        CrownBounds::Patches(bounds) => bounds,
+        CrownBounds::Dense(_) => panic!("BatchNorm Patches must stay structured"),
+    };
+    let mut bounds = affine_bounds;
+    // Same mapping as stride=1, pad_top=pad_left=1 in the affine oracle.
+    let anchored = PatchGeometry::anchored(vec![-1, 0], vec![-1, 0]).unwrap();
+    bounds.lower_a.geometry = anchored.clone();
+    bounds.upper_a.geometry = anchored;
+
+    reset_patches_to_dense_call_count();
+    let actual = match layer
+        .propagate_patches(&bounds)
+        .expect("Anchored BatchNorm propagation")
+    {
+        CrownBounds::Patches(bounds) => bounds,
+        CrownBounds::Dense(_) => panic!("Anchored BatchNorm must not densify"),
+    };
+    assert!(matches!(
+        &actual.lower_a.geometry,
+        PatchGeometry::Anchored(_)
+    ));
+    assert_eq!(actual.lower_a.geometry, actual.upper_a.geometry);
+    assert_eq!(actual.lower_a.patches, affine.lower_a.patches);
+    assert_eq!(actual.upper_a.patches, affine.upper_a.patches);
+
+    // Cross-algorithm dominance is not an invariant: the affine path and the
+    // Anchored path use different certified reduction orders, so either may be
+    // the tighter f32 endpoint. Instead, independently enclose the exact-real
+    // nominal bias fold plus the BatchNorm bias-error radius from exact f32
+    // bit decodes. No tolerance is involved.
+    let exact_bias_oracle =
+        |side: &PatchesData, input_bias: &Array1<f32>, row: usize| -> (f64, f64) {
+            use crate::layers::linear::bias::{add_f64_down, add_f64_up};
+
+            let patches = side.patches.as_ref().unwrap();
+            let mut nominal_lower = ny_core::f32_to_f64_exact(input_bias[row]);
+            let mut nominal_upper = nominal_lower;
+            let mut radius_upper = 0.0f64;
+            for oc in 0..2 {
+                for oh in 0..2 {
+                    for ow in 0..2 {
+                        for ic in 0..3 {
+                            for ki in 0..2 {
+                                for kj in 0..2 {
+                                    if !bn_7d_tap_valid(oh, ow, ki, kj) {
+                                        continue;
+                                    }
+                                    let coeff = ny_core::f32_to_f64_exact(
+                                        patches[[row, oc, oh, ow, ic, ki, kj]],
+                                    );
+                                    let term = coeff * ny_core::f32_to_f64_exact(layer.bias[[ic]]);
+                                    nominal_lower = add_f64_down(nominal_lower, term);
+                                    nominal_upper = add_f64_up(nominal_upper, term);
+
+                                    let radius_term = coeff.abs()
+                                        * ny_core::f32_to_f64_exact(layer.bias_err[[ic]]);
+                                    if radius_term != 0.0 {
+                                        radius_upper =
+                                            ny_core::dd::next_up_f64(radius_upper + radius_term);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (
+                add_f64_down(nominal_lower, -radius_upper),
+                add_f64_up(nominal_upper, radius_upper),
+            )
+        };
+    for row in 0..actual.row_count {
+        let (exact_lower, _) = exact_bias_oracle(&bounds.lower_a, &bounds.lower_b, row);
+        let (_, exact_upper) = exact_bias_oracle(&bounds.upper_a, &bounds.upper_b, row);
+        assert!(
+            ny_core::f32_to_f64_exact(actual.lower_b[row]) <= exact_lower,
+            "Anchored lower bias row {row} does not enclose exact-real BN fold"
+        );
+        assert!(
+            ny_core::f32_to_f64_exact(actual.upper_b[row]) >= exact_upper,
+            "Anchored upper bias row {row} does not enclose exact-real BN fold"
+        );
+    }
+    assert!(
+        patches_to_dense_call_sites().is_empty(),
+        "native Anchored BatchNorm called to_dense"
+    );
+}
+
+#[test]
+fn test_bn_anchored_charges_both_subnormal_center_flushes() {
+    use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
+
+    let layer = BatchNormLayer {
+        scale: ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap(),
+        bias: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
+        scale_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
+        bias_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
+        num_channels: 1,
+        channel_axis_hint: None,
+    };
+    let min_subnormal = f32::from_bits(1);
+    let geometry = PatchGeometry::anchored(vec![0], vec![0]).unwrap();
+    let make_side = || PatchesData {
+        coeff_err: None,
+        patches: Some(
+            ArrayD::from_shape_vec(
+                IxDyn(&[1, 1, 1, 1, 1, 2]),
+                vec![min_subnormal, -min_subnormal],
+            )
+            .unwrap(),
+        ),
+        geometry: geometry.clone(),
+        identity: false,
+        output_shape: (1, 1, 1),
+        input_shape: (1, 1, 2),
+        unstable_idx: None,
+    };
+    let bounds = PatchesLinearBounds {
+        row_count: 1,
+        lower_a: make_side(),
+        lower_b: Array1::from_vec(vec![0.0]),
+        upper_a: make_side(),
+        upper_b: Array1::from_vec(vec![0.0]),
+    };
+    let lower_before = bounds.lower_a.patches.as_ref().unwrap().clone();
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .unwrap();
+    let error = layer
+        .propagate_patches_with_deadline(&bounds, expired)
+        .expect_err("expired Anchored BatchNorm must refuse atomically");
+    assert!(error.is_deadline_exceeded(), "{error:?}");
+    assert_eq!(bounds.lower_a.patches.as_ref().unwrap(), &lower_before);
+
+    let result = match layer
+        .propagate_patches_with_deadline(
+            &bounds,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect("Anchored BatchNorm")
+    {
+        CrownBounds::Patches(bounds) => bounds,
+        CrownBounds::Dense(_) => panic!("Anchored BatchNorm must stay Patches"),
+    };
+    for side in [&result.lower_a, &result.upper_a] {
+        let stored = side.patches.as_ref().unwrap().as_slice().unwrap();
+        assert_eq!(stored[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(stored[1].to_bits(), (-0.0f32).to_bits());
+        let error = side.coeff_err.as_ref().unwrap()[0];
+        let magnitude = error.to_bits() & 0x7fff_ffff;
+        assert!(
+            magnitude == 0 || magnitude >= 0x0080_0000,
+            "published coefficient error must be zero or normal, got {error:e}"
+        );
+        for exact in [
+            ny_core::f32_to_f64_exact(min_subnormal),
+            ny_core::f32_to_f64_exact(-min_subnormal),
+        ] {
+            assert!(
+                exact.abs() <= ny_core::f32_to_f64_exact(error),
+                "coeff_err must cover a later DAZ/FTZ read of either stored sign"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_bn_anchored_rejects_6d_row_count_mismatch_and_overflow_atomically() {
+    use crate::bounds::patches::{PatchesData, PatchesLinearBounds};
+
+    let layer = BatchNormLayer {
+        scale: ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap(),
+        bias: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
+        scale_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
+        bias_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
+        num_channels: 1,
+        channel_axis_hint: None,
+    };
+    let geometry = PatchGeometry::anchored(vec![0], vec![0]).unwrap();
+    let make_side = |geometry: PatchGeometry, output_shape| PatchesData {
+        coeff_err: None,
+        patches: Some(ArrayD::from_elem(IxDyn(&[1, 1, 1, 1, 1, 1]), 0.5)),
+        geometry,
+        identity: false,
+        output_shape,
+        input_shape: (1, 1, 1),
+        unstable_idx: None,
+    };
+
+    let row_mismatch = PatchesLinearBounds {
+        row_count: 2,
+        lower_a: make_side(geometry.clone(), (1, 1, 1)),
+        lower_b: Array1::from_vec(vec![0.0]),
+        upper_a: make_side(geometry, (1, 1, 1)),
+        upper_b: Array1::from_vec(vec![0.0]),
+    };
+    let lower_before = row_mismatch.lower_a.patches.as_ref().unwrap().clone();
+    let upper_before = row_mismatch.upper_a.patches.as_ref().unwrap().clone();
+    let error = layer
+        .propagate_patches_with_deadline(
+            &row_mismatch,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect_err("6D row_count must equal output positions");
+    assert!(
+        matches!(error, ny_core::NyError::ShapeMismatch { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        row_mismatch.lower_a.patches.as_ref().unwrap(),
+        &lower_before
+    );
+    assert_eq!(
+        row_mismatch.upper_a.patches.as_ref().unwrap(),
+        &upper_before
+    );
+
+    let overflow_geometry = PatchGeometry::anchored(vec![0], vec![0, 0]).unwrap();
+    let overflow = PatchesLinearBounds {
+        row_count: 1,
+        lower_a: make_side(overflow_geometry.clone(), (usize::MAX, 1, 2)),
+        lower_b: Array1::from_vec(vec![0.0]),
+        upper_a: make_side(overflow_geometry, (usize::MAX, 1, 2)),
+        upper_b: Array1::from_vec(vec![0.0]),
+    };
+    let lower_before = overflow.lower_a.patches.as_ref().unwrap().clone();
+    let upper_before = overflow.upper_a.patches.as_ref().unwrap().clone();
+    let lower_bias_before = overflow.lower_b.clone();
+    let upper_bias_before = overflow.upper_b.clone();
+    let error = layer
+        .propagate_patches_with_deadline(
+            &overflow,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect_err("overflowing Anchored metadata must refuse before allocation");
+    assert!(
+        matches!(error, ny_core::NyError::InvalidSpec(_)),
+        "{error:?}"
+    );
+    assert_eq!(overflow.lower_a.patches.as_ref().unwrap(), &lower_before);
+    assert_eq!(overflow.upper_a.patches.as_ref().unwrap(), &upper_before);
+    assert_eq!(overflow.lower_b, lower_bias_before);
+    assert_eq!(overflow.upper_b, upper_bias_before);
 }
 
 /// Fixture valid-tap predicate replica (sh = sw = 1, pad_top = pad_left = 1,
@@ -1018,11 +1385,15 @@ fn bn_7d_tap_valid(oh: usize, ow: usize, ki: usize, kj: usize) -> bool {
 /// magnitude), so a verbatim-6D widen (`|a|·be + oe·bb`, missing `oe·be`)
 /// FAILS this oracle — pins the R5 cross-term fix.
 #[test]
-fn test_bn_patches_7d_coeff_err_covers_f64_oracle() {
+fn test_bn_anchored_patches_7d_coeff_err_covers_f64_oracle() {
     use crate::bounds::patches::{CrownBounds, PatchesData};
     use crate::layers::common::PatchesPropagation;
 
-    let (layer, bounds) = make_bn_7d_fixture(Some(vec![1.0e-3, 5.0e-4]), Some(vec![2.0e-3, 0.0]));
+    let (layer, mut bounds) =
+        make_bn_7d_fixture(Some(vec![1.0e-3, 5.0e-4]), Some(vec![2.0e-3, 0.0]));
+    let anchored = PatchGeometry::anchored(vec![-1, 0], vec![-1, 0]).unwrap();
+    bounds.lower_a.geometry = anchored.clone();
+    bounds.upper_a.geometry = anchored;
     let result = layer.propagate_patches(&bounds).expect("bn 7d backward");
     let pb = match result {
         CrownBounds::Patches(pb) => pb,
@@ -1164,6 +1535,7 @@ fn test_bn_patches_7d_nonfinite_err_poisons_row_no_nan() {
         scale_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![1.5e-4_f32, 3.0e-5, 8.0e-5]).unwrap(),
         bias_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0_f32, 0.0, 0.0]).unwrap(),
         num_channels: 3,
+        channel_axis_hint: None,
     };
 
     let run = |bounds: &PatchesLinearBounds| {
@@ -1249,6 +1621,7 @@ fn test_bn_patches_7d_err_channel_does_not_perturb_values() {
         scale_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0_f32, 0.0, 0.0]).unwrap(),
         bias_err: ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0_f32, 0.0, 0.0]).unwrap(),
         num_channels: 3,
+        channel_axis_hint: None,
     };
 
     let run = |layer: &BatchNormLayer, bounds| match layer.propagate_patches(bounds) {
@@ -1294,7 +1667,9 @@ fn test_bn_patches_7d_err_channel_does_not_perturb_values() {
 /// `propagate_linear_with_bounds_scalar_reference`. This test drives BOTH over
 /// random shapes/layouts — including nonzero layer `scale_err`/`bias_err`,
 /// incoming certified coeff-err on both sides, exact zeros in the coefficient
-/// matrices, and a degenerate Inf-scale/Inf-bias channel — and asserts:
+/// matrices, plus malformed public literals with non-finite affine data — and
+/// asserts:
+///   (0) identical fail-closed rejection of malformed literals,
 ///   (1) BIT-IDENTITY of the coefficient matrices AND the emitted coeff-err
 ///       (the vectorization must not perturb any value), and
 ///   (2) the task-specified numeric criteria: main (coefficient) terms match to
@@ -1363,6 +1738,7 @@ fn test_propagate_linear_vectorized_matches_scalar_reference() {
                     scale_err: ArrayD::from_shape_vec(IxDyn(&[num_channels]), scale_err_v).unwrap(),
                     bias_err: ArrayD::from_shape_vec(IxDyn(&[num_channels]), bias_err_v).unwrap(),
                     num_channels,
+                    channel_axis_hint: None,
                 };
 
                 // Incoming linear bounds: finite A (with ~20% exact zeros to
@@ -1407,14 +1783,24 @@ fn test_propagate_linear_vectorized_matches_scalar_reference() {
                 };
                 let pre_act = BoundedTensor::new(pre_lo, pre_hi).unwrap();
 
-                let vec_res = layer
-                    .propagate_linear_with_bounds(&bounds, &pre_act)
-                    .expect("vectorized path");
-                let ref_res = layer
-                    .propagate_linear_with_bounds_scalar_reference(&bounds, &pre_act)
-                    .expect("scalar reference path");
-
                 let tag = format!("shape={shape:?} coeff_err={with_coeff_err} inf={inf_channel}");
+                let vec_result = layer.propagate_linear_with_bounds(&bounds, &pre_act);
+                let ref_result =
+                    layer.propagate_linear_with_bounds_scalar_reference(&bounds, &pre_act);
+                if inf_channel {
+                    assert!(
+                        vec_result.is_err() && ref_result.is_err(),
+                        "{tag}: malformed affine literal must be rejected by both paths"
+                    );
+                    assert_eq!(
+                        format!("{}", vec_result.unwrap_err()),
+                        format!("{}", ref_result.unwrap_err()),
+                        "{tag}: production/reference rejection must agree"
+                    );
+                    continue;
+                }
+                let vec_res = vec_result.expect("vectorized path");
+                let ref_res = ref_result.expect("scalar reference path");
 
                 // (1) BIT-IDENTITY on the coefficient matrices.
                 let bits_eq = |a: &Array2<f32>, b: &Array2<f32>| {

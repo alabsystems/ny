@@ -6,6 +6,7 @@
 
 use crate::rounding::{next_down_f32, next_up_f32};
 use crate::types::LinearRelaxation;
+use ny_core::{f32_affine_eval_error, f64_to_f32_down, f64_to_f32_up};
 
 const SQRT_ALPHA_MIN_MID: f32 = 1e-6;
 
@@ -57,15 +58,12 @@ pub fn sqrt_linear_relaxation_with_alpha(l: f32, u: f32, mid: f32) -> LinearRela
     let chord_slope = (sqrt_u - sqrt_l) / (u64 - l64);
     let chord_intercept = sqrt_l - chord_slope * l64;
 
-    let max_abs_x = l.abs().max(u.abs()) as f64;
+    let max_abs_x = l.abs().max(u.abs());
 
     let lower_slope = chord_slope as f32;
-    let lower_slope_err =
-        next_up_f32(((chord_slope - lower_slope as f64).abs() * max_abs_x) as f32);
-    // Account for f32 multiplication rounding: `slope * x` has error up to
-    // |slope| * |x| * f32::EPSILON. For the lower bound we round DOWN.
-    let lower_mul_err = next_up_f32((lower_slope.abs() * max_abs_x as f32) * f32::EPSILON);
-    let lower_intercept = next_down_f32((chord_intercept as f32) - lower_slope_err - lower_mul_err);
+    let lower_eval_err =
+        f32_affine_eval_error(chord_slope, lower_slope, chord_intercept, max_abs_x);
+    let lower_intercept = next_down_f32(f64_to_f32_down(chord_intercept - lower_eval_err));
 
     let mid = if u > 0.0 {
         mid.clamp(l.max(SQRT_ALPHA_MIN_MID.min(u)), u)
@@ -78,18 +76,23 @@ pub fn sqrt_linear_relaxation_with_alpha(l: f32, u: f32, mid: f32) -> LinearRela
     let tangent_slope_f64 = 0.5 / sqrt_mid;
     let tangent_intercept_f64 = sqrt_mid - tangent_slope_f64 * mid64;
     let tangent_slope = tangent_slope_f64 as f32;
-    let tangent_slope_err =
-        next_up_f32(((tangent_slope_f64 - tangent_slope as f64).abs() * max_abs_x) as f32);
-    // Also account for f32 multiplication rounding: evaluating `slope * x` in f32
-    // has error up to |slope| * |x| * f32::EPSILON. Without this, the upper bound
-    // is unsound when mid is near lower (large slope, large multiplication error).
-    // Discovered by Kani proof `sqrt_alpha_upper_sound_mid_at_lower`.
-    let mul_rounding_err = next_up_f32((tangent_slope.abs() * max_abs_x as f32) * f32::EPSILON);
-    let tangent_intercept =
-        next_up_f32((tangent_intercept_f64 as f32) + tangent_slope_err + mul_rounding_err);
+    let tangent_eval_err = f32_affine_eval_error(
+        tangent_slope_f64,
+        tangent_slope,
+        tangent_intercept_f64,
+        max_abs_x,
+    );
+    let tangent_intercept = next_up_f32(f64_to_f32_up(tangent_intercept_f64 + tangent_eval_err));
     let upper_slope = tangent_slope;
     let min_intercept = if original_l < 0.0 {
-        next_up_f32(-tangent_slope * original_l)
+        let zero_intercept = -(tangent_slope as f64) * original_l as f64;
+        let zero_eval_err = f32_affine_eval_error(
+            tangent_slope as f64,
+            tangent_slope,
+            zero_intercept,
+            original_l.abs(),
+        );
+        next_up_f32(f64_to_f32_up(zero_intercept + zero_eval_err))
     } else {
         tangent_intercept
     };

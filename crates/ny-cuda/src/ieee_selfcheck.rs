@@ -40,7 +40,8 @@
 //!   emulation with any effective mantissa below 52 bits.
 //!
 //! The probes run on the CONSTRUCTED engine's real `gemm_f32`/`gemm_f64`
-//! dispatch (ATS zero-copy or unified-buffer, whichever this device will use).
+//! dispatch (ATS zero-copy, unified buffer, or explicitly selected cached
+//! device-copy transport, whichever this engine will use).
 //! `gemm_f32_fast` is deliberately NOT probed: reduced precision is its
 //! documented contract (attack-only traffic; it can never decide a verdict).
 //! On ANY bit deviation (a NaN never bit-matches) construction fails closed:
@@ -231,27 +232,20 @@ mod tests {
     /// ON-DEVICE: this box's cuBLAS `CUBLAS_DEFAULT_MATH` Sgemm/Dgemm must be
     /// bit-exact IEEE — the physical GB10 verification `docs/F32_ABSSUM_SEAM.md`
     /// §5 asks for. Construction itself runs the probes, so a reduced-precision
-    /// device cannot construct an engine at all; that refusal must FAIL this
-    /// test (not skip it). Self-skips only when no device is present.
+    /// device cannot construct an engine at all. On hardware-free CI the shared
+    /// capability seam proves why no device dispatch is admitted; on a host
+    /// advertising CUDA, construction or probe failure fails this test.
     #[test]
-    fn cuda_ieee_known_answer_probes_bit_exact_on_device() {
-        let engine = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) if e.to_string().contains("probe") => {
-                panic!("device present but the IEEE known-answer probe refused it: {e}")
-            }
-            Err(e) => {
-                eprintln!("skipping CUDA IEEE self-check test (no device): {e}");
-                return;
-            }
-        };
-        engine
-            .assert_ieee_bit_exact()
-            .expect("IEEE known-answer probes must be bit-exact on this device");
-        eprintln!(
-            "CUDA device {:?}: Sgemm+Dgemm known-answer probes BIT-EXACT \
-             (IEEE f32/f64 confirmed; no TF32/BF16x9/fixed-point emulation)",
-            engine.device_name()
-        );
+    fn cuda_ieee_known_answer_probes_are_exact_when_hardware_is_capable() {
+        crate::with_capable_cuda(|engine| {
+            engine
+                .assert_ieee_bit_exact()
+                .expect("IEEE known-answer probes must be bit-exact on this device");
+            eprintln!(
+                "CUDA device {:?}: Sgemm+Dgemm known-answer probes BIT-EXACT \
+                 (IEEE f32/f64 confirmed; no TF32/BF16x9/fixed-point emulation)",
+                engine.device_name()
+            );
+        });
     }
 }

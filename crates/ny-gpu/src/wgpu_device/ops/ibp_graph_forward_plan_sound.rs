@@ -335,8 +335,8 @@ impl WgpuDevice {
                         pad_h: gpu_checked_u32(*pad_h, "sound dag avgpool ph")?,
                         pad_w: gpu_checked_u32(*pad_w, "sound dag avgpool pw")?,
                         count_include_pad: u32::from(*count_include_pad),
-                        gamma_k: gamma_k_f32(kk),
-                        slack: combine_slack_f32(kk),
+                        gamma_k: gamma_k_f32(kk)?,
+                        slack: combine_slack_f32(kk)?,
                         additive: ftz_safe_underflow_floor(kk_u32),
                     };
                     let bg = self.build_sound_dag_avgpool_bg(

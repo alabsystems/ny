@@ -12,13 +12,107 @@ use ndarray::{Array1, Array2};
 use ny_core::{is_crown_coeff_safe, GemmEngine, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32};
 use std::borrow::Cow;
+use std::time::Instant;
 use tracing::debug;
 
-use super::bias::{accumulate_bias_f64, finalize_bias_directed, BiasBlockParams};
+use super::bias::{
+    accumulate_bias_f64, add_coeff_err_bias_product_up, add_f64_down, add_f64_up, f32_to_f64_exact,
+    finalize_bias_directed, nonnegative_f32_error_or_infinity, publish_error_up_normal,
+    BiasBlockParams,
+};
 use super::layout::resolve_backward_layout;
 use super::LinearLayer;
 use crate::faer_parallelism::{mat_mul, mat_mul_f64};
 use crate::{contiguous_flat_slice_mut, LinearBounds};
+
+/// Measured CPU/GPU crossover for verdict-grade f64 `A·W`.
+///
+/// Keep deadline-bearing calls behind the same size gate as unbounded calls:
+/// cold accelerator admission and host-image construction are not worthwhile
+/// for smaller products, whose existing pollable CPU reduction is faster.
+const SOUND_F64_GEMM_MIN_MACS: usize = 1 << 24;
+
+/// The shared verdict-path constant above and the engine-facing default in
+/// `ny-core` describe the SAME historical policy. Pin them together so neither
+/// can drift: `SoundF64GemmAdmission::CONSTANT_FLOOR` must reproduce
+/// `deadline_f64_accelerator_eligible` exactly for every engine that does not
+/// override its declaration.
+const _: () = assert!(SOUND_F64_GEMM_MIN_MACS == ny_core::SOUND_F64_GEMM_DEFAULT_MIN_MACS);
+
+/// Engine-independent hard floor for the gated engine-aware admission path.
+///
+/// No engine declaration may open admission below this, whatever it claims. The
+/// measured faer crossover is bracketed `512 < x <= 1,024` MACs, so 512 sits
+/// strictly below every measured win and exists purely so a malformed or
+/// over-eager declaration cannot route trivially small products through an
+/// accelerator.
+const ENGINE_AWARE_ABSOLUTE_MIN_MACS: usize = 512;
+
+/// Environment gate for the engine-aware admission floor
+/// (#b4-engine-aware-macs-floor).
+///
+/// UNSET (the default) ⇒ [`deadline_f64_accelerator_eligible`] is the whole
+/// policy, exactly as before: one CUDA-tuned constant, no engine consulted, no
+/// extra work beyond one relaxed atomic load. `NY_ENGINE_AWARE_MACS_FLOOR=1`
+/// (also `true`/`yes`/`on`) additionally lets an ALREADY-MATERIALIZED engine
+/// declare its own, measured crossover for sub-threshold shapes.
+///
+/// WHY GATED. `SOUND_F64_GEMM_MIN_MACS` is a shared verdict-path constant four
+/// arcs depend on; this ships the mechanism and the measurement without
+/// unilaterally moving the default.
+const ENGINE_AWARE_MACS_FLOOR_ENV: &str = "NY_ENGINE_AWARE_MACS_FLOOR";
+
+/// Tri-state cache for [`ENGINE_AWARE_MACS_FLOOR_ENV`]: `0` off, `1` on, `2`
+/// unread.
+static ENGINE_AWARE_MACS_FLOOR_GATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(2);
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread override; `None` keeps the process-global cache. Tests
+    /// never mutate the production gate.
+    static ENGINE_AWARE_MACS_FLOOR_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the gate for the current test thread only; `None` restores the
+/// production cache. Never touches the process-global atomic.
+#[cfg(test)]
+fn set_engine_aware_macs_floor_for_test(value: Option<bool>) {
+    ENGINE_AWARE_MACS_FLOOR_OVERRIDE.with(|cell| cell.set(value));
+}
+
+/// Whether the engine-aware admission floor is armed. Fails closed: anything
+/// other than an explicit affirmative value leaves the historical policy.
+#[inline]
+fn engine_aware_macs_floor_armed() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = ENGINE_AWARE_MACS_FLOOR_OVERRIDE.with(std::cell::Cell::get) {
+            return forced;
+        }
+    }
+    use std::sync::atomic::Ordering;
+    match ENGINE_AWARE_MACS_FLOOR_GATE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let armed = std::env::var(ENGINE_AWARE_MACS_FLOOR_ENV).is_ok_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+            ENGINE_AWARE_MACS_FLOOR_GATE.store(u8::from(armed), Ordering::Relaxed);
+            armed
+        }
+    }
+}
+
+/// Maximum MACs in one non-interruptible accelerator dispatch while a verifier
+/// deadline is authoritative. The engine may impose a smaller cap, but it must
+/// tile only the output axes and retain the complete `k` contraction.
+const DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS: usize = 1 << 24;
 
 /// Relative growth factor `γ_n = n·2^-53 / (1 - n·2^-53)` for an f64 dot product
 /// of `n` terms (Higham, Accuracy and Stability, Thm 3.1). Multiplied by the
@@ -74,6 +168,152 @@ fn use_naive_f64_aw() -> bool {
 ///
 /// `a` is `(num_outputs, contraction)` and `w` is `(contraction, out)`.
 pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64>, Array2<f64>) {
+    aw_f64_with_abssum_unbounded(a_block, w)
+}
+
+/// Deadline-aware twin of [`aw_f64_with_abssum`].
+///
+/// A sufficiently large deadline-scoped call may use the process-global sound
+/// f64 engine, but only through
+/// [`GemmEngine::gemm_f64_with_deadline`]. Both `A·W` and `|A|·|W|` stay f64,
+/// retain the full `k` contraction, and are independently validated before
+/// either result is published. Unsupported, ordinary, malformed, or non-finite
+/// engine outcomes fall back to the pollable chunked-faer CPU reduction
+/// (scalar for over-quantum rows; see
+/// [`aw_f64_with_abssum_cpu_deadline`]); an engine
+/// [`NyError::DeadlineExceeded`] or any post-deadline completion is terminal.
+/// The ordinary `gemm_f64`/`gemm_f32` methods are never called under finite
+/// deadline authority. With `None`, preserve the existing acceleration policy
+/// and arithmetic unchanged.
+pub(crate) fn aw_f64_with_abssum_and_deadline(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Option<Instant>,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    let Some(deadline) = deadline else {
+        return Ok(aw_f64_with_abssum_unbounded(a_block, w));
+    };
+
+    // A comprehensive host sweep installs this call-local authority on every
+    // worker in its private Rayon pool. It must never consult (or lazily start)
+    // the process-global CUDA/WGPU slot: use the already-audited pollable faer
+    // route directly. Ordinary callers do not install the guard and retain the
+    // historical global admission byte-for-byte.
+    if crate::sound_f64_gemm::cpu_only_f64_active() {
+        return aw_f64_with_abssum_cpu_deadline(a_block, w, deadline);
+    }
+
+    let m = a_block.nrows();
+    let k = a_block.ncols();
+    let p = w.ncols();
+    if w.nrows() != k {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![k, p],
+            got: vec![w.nrows(), p],
+        });
+    }
+
+    if deadline_f64_accelerator_eligible(m, k, p) {
+        // Deadline-safe admission never waits on OnceLock/factory construction
+        // on this verifier thread. Once admitted, the closure uses only the
+        // engine's explicit bounded method; its ordinary methods are not a
+        // fallback. If no engine is ready, retain the pollable CPU path below.
+        //
+        // The inner `deadline_f64_engine_admits` is UNCONDITIONALLY true when
+        // the engine-aware gate is unset, so this branch is byte-identical to
+        // its historical form. Armed, it additionally lets an engine decline a
+        // large product its own measurements say it loses on (`k == 1` and
+        // `m == 1` at 16.7 M MACs are 0.13× and 0.77× on faer).
+        if let Some(result) = crate::sound_f64_gemm::with_engine_deadline(deadline, |engine| {
+            if deadline_f64_engine_admits(engine, m, k, p) {
+                aw_f64_with_abssum_deadline_via_engine_or_cpu(engine, a_block, w, deadline)
+            } else {
+                aw_f64_with_abssum_cpu_deadline(a_block, w, deadline)
+            }
+        })? {
+            return result;
+        }
+    } else if engine_aware_macs_floor_armed() && engine_aware_admission_candidate(m, k, p) {
+        // GATED, sub-threshold engine-aware admission (#b4-engine-aware-macs-floor).
+        //
+        // The constant above is the GPU launch-latency crossover; a CPU-resident
+        // engine's is ~16,000× lower, and on THIS path the fall-through it must
+        // beat is a single-threaded pollable scalar triple loop, not faer. So a
+        // large band where the engine wins 3×–17× is gated out by a number that
+        // was never about this engine. `deadline_f64_engine_admits` asks the
+        // engine for its own measured crossover instead.
+        //
+        // FAIL CLOSED, and deliberately weaker than the branch above: this
+        // consults ONLY an already-materialized engine. It never enters the
+        // factory, never waits, and cannot mark initialization abandoned — so it
+        // can neither stall this verifier thread nor disable the accelerator for
+        // the products that DO cross the constant floor. Materialization is only
+        // kicked off in the background; until it completes these calls take the
+        // historical CPU path.
+        crate::sound_f64_gemm::start_background_initialization();
+        let admitted = crate::sound_f64_gemm::with_preinitialized_engine(|engine| {
+            deadline_f64_engine_admits(engine, m, k, p).then(|| {
+                aw_f64_with_abssum_deadline_via_engine_or_cpu(engine, a_block, w, deadline)
+            })
+        })
+        .flatten();
+        if let Some(result) = admitted {
+            return result;
+        }
+    }
+
+    aw_f64_with_abssum_cpu_deadline(a_block, w, deadline)
+}
+
+#[inline]
+fn deadline_f64_accelerator_eligible(m: usize, k: usize, p: usize) -> bool {
+    m.saturating_mul(k).saturating_mul(p) >= SOUND_F64_GEMM_MIN_MACS
+}
+
+/// Cheap, engine-FREE pre-check for the gated engine-aware path.
+///
+/// Runs before any engine is consulted so the gate-off cost is a single relaxed
+/// atomic load and the gate-on cost for an obviously-tiny product is three
+/// comparisons. It is a necessary condition only; the engine's own declaration
+/// still decides.
+#[inline]
+fn engine_aware_admission_candidate(m: usize, k: usize, p: usize) -> bool {
+    m.saturating_mul(k).saturating_mul(p) >= ENGINE_AWARE_ABSOLUTE_MIN_MACS
+}
+
+/// The full deadline-path admission predicate, engine included.
+///
+/// Gate OFF ⇒ identically [`deadline_f64_accelerator_eligible`]: the engine's
+/// declaration is not even read, and every engine — including cuBLAS — behaves
+/// exactly as before.
+///
+/// Gate ON ⇒ the engine's own declaration is authoritative in BOTH directions,
+/// subject to the engine-independent hard floor:
+///   * it may OPEN products below the historical constant (faer's measured
+///     crossover is ~16,000× lower than the GPU-tuned one); and
+///   * it may DECLINE products above it. That direction is not cosmetic: at
+///     `4096x1x4096` — 16,777,216 MACs, i.e. admitted by the constant today —
+///     the measured engine result is 0.13×, a 7.6× SLOWDOWN, and the same holds
+///     for every `k == 1` and `m == 1` shape at that size.
+///
+/// An engine that does not override its declaration gets
+/// [`ny_core::SoundF64GemmAdmission::CONSTANT_FLOOR`], which reproduces the
+/// constant pointwise, so arming the gate changes nothing for it — in either
+/// direction.
+#[inline]
+fn deadline_f64_engine_admits(engine: &dyn GemmEngine, m: usize, k: usize, p: usize) -> bool {
+    if !engine_aware_macs_floor_armed() {
+        return deadline_f64_accelerator_eligible(m, k, p);
+    }
+    engine_aware_admission_candidate(m, k, p)
+        && engine
+            .sound_f64_deadline_admission()
+            .sanitized()
+            .admits(m, k, p)
+}
+
+/// Historical unbounded implementation, including its optional global f64 GEMM.
+fn aw_f64_with_abssum_unbounded(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f64>, Array2<f64>) {
     let m = a_block.nrows();
     let k = a_block.ncols();
     let p = w.ncols();
@@ -94,7 +334,6 @@ pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f6
     // wins and offloading only adds overhead (and triggers lazy GPU init on light
     // instances). Above it the GPU's f64 throughput dominates (measured 2.46×
     // end-to-end on mnist_concat --method alpha, where large A·W dominate).
-    const SOUND_F64_GEMM_MIN_MACS: usize = 1 << 24;
     if m.saturating_mul(k).saturating_mul(p) >= SOUND_F64_GEMM_MIN_MACS {
         if let Some(Some(res)) =
             crate::sound_f64_gemm::with_engine(|eng| aw_via_engine(eng, a_block, w, m, k, p))
@@ -135,8 +374,8 @@ pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f6
                 k,
                 p,
                 par,
-                |i, j| f64::from(a_block[(i, j)]),
-                |i, j| f64::from(w[(i, j)]),
+                |i, j| f32_to_f64_exact(a_block[(i, j)]),
+                |i, j| f32_to_f64_exact(w[(i, j)]),
             );
             // Column-major product → row-major ndarray (element (i,j) at
             // `j*m + i`), identical values to reading the owned faer `Mat`.
@@ -146,12 +385,12 @@ pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f6
             crate::rebound_scratch::recycle_f64(s_cm);
             return (a64, s);
         }
-        let a_f = Mat::<f64>::from_fn(m, k, |i, j| f64::from(a_block[(i, j)]));
-        let w_f = Mat::<f64>::from_fn(k, p, |i, j| f64::from(w[(i, j)]));
+        let a_f = Mat::<f64>::from_fn(m, k, |i, j| f32_to_f64_exact(a_block[(i, j)]));
+        let w_f = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]));
         // |A|, |W| are exact in f64 (abs of an exactly-widened f32 clears the
         // sign bit only), so the abs-sum GEMM sums the exact |a|·|w| products.
-        let a_abs = Mat::<f64>::from_fn(m, k, |i, j| f64::from(a_block[(i, j)]).abs());
-        let w_abs = Mat::<f64>::from_fn(k, p, |i, j| f64::from(w[(i, j)]).abs());
+        let a_abs = Mat::<f64>::from_fn(m, k, |i, j| f32_to_f64_exact(a_block[(i, j)]).abs());
+        let w_abs = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs());
         let c = mat_mul_f64(&a_f, &w_f);
         let s_mat = mat_mul_f64(&a_abs, &w_abs);
         let a64 = Array2::from_shape_fn((m, p), |(i, j)| c[(i, j)]);
@@ -183,19 +422,766 @@ pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f6
         let a64_row = &mut a64_buf[i * p..i * p + p];
         let s_row = &mut s_buf[i * p..i * p + p];
         for kk in 0..k {
-            let av = a_block[(i, kk)] as f64;
+            let av = f32_to_f64_exact(a_block[(i, kk)]);
             if av == 0.0 {
                 continue;
             }
             let av_abs = av.abs();
             for j in 0..p {
-                let wv = w[(kk, j)] as f64;
+                let wv = f32_to_f64_exact(w[(kk, j)]);
                 a64_row[j] += av * wv;
                 s_row[j] += av_abs * wv.abs();
             }
         }
     }
     (a64, s)
+}
+
+/// Try the explicit deadline-bounded f64 engine and retain the existing
+/// pollable CPU implementation as the only fallback.
+///
+/// Kept separate from process-global admission so unit tests can inject fake
+/// engines and prove that ordinary GEMM methods remain unreachable.
+fn aw_f64_with_abssum_deadline_via_engine_or_cpu(
+    engine: &dyn GemmEngine,
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Instant,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    if let Some(result) = aw_via_engine_deadline(engine, a_block, w, deadline)? {
+        return Ok(result);
+    }
+    aw_f64_with_abssum_cpu_deadline(a_block, w, deadline)
+}
+
+/// Poll the Linear-CROWN f64 deadline with a phase-specific diagnostic.
+#[inline]
+fn check_aw_deadline(deadline: Instant, phase: &'static str) -> Result<()> {
+    if Instant::now() >= deadline {
+        Err(NyError::DeadlineExceeded(format!(
+            "Linear CROWN backward: deadline exceeded {phase}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Run one full-`k` IEEE-f64 product through an engine's explicit bounded
+/// contract and validate it before publication.
+///
+/// Deadline errors are terminal. Any other engine error, a malformed length, or
+/// a non-finite coefficient declines to the caller's pollable CPU fallback,
+/// provided the deadline is still live.
+fn deadline_f64_gemm_try_engine(
+    engine: &dyn GemmEngine,
+    m: usize,
+    k: usize,
+    p: usize,
+    a: &[f64],
+    w: &[f64],
+    deadline: Instant,
+    require_nonnegative: bool,
+) -> Result<Option<Vec<f64>>> {
+    const VALIDATION_POLL_ELEMENTS: usize = 1 << 12;
+
+    check_aw_deadline(deadline, "before bounded f64 GEMM")?;
+    let expected_len = m.checked_mul(p).ok_or_else(|| {
+        NyError::InvalidSpec("Linear CROWN bounded f64 GEMM output size overflow".into())
+    })?;
+
+    match engine.gemm_f64_with_deadline(
+        m,
+        k,
+        p,
+        a,
+        w,
+        deadline,
+        DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS,
+    ) {
+        Ok(result) if result.len() == expected_len => {
+            for chunk in result.chunks(VALIDATION_POLL_ELEMENTS) {
+                if chunk.iter().any(|value| {
+                    !value.is_finite() || (require_nonnegative && value.is_sign_negative())
+                }) {
+                    check_aw_deadline(deadline, "while rejecting invalid bounded f64 GEMM")?;
+                    return Ok(None);
+                }
+                check_aw_deadline(deadline, "while validating bounded f64 GEMM")?;
+            }
+            check_aw_deadline(deadline, "after bounded f64 GEMM")?;
+            Ok(Some(result))
+        }
+        Ok(_) => {
+            check_aw_deadline(deadline, "while rejecting malformed bounded f64 GEMM")?;
+            Ok(None)
+        }
+        Err(error) if error.is_deadline_exceeded() => Err(error),
+        Err(_) => {
+            check_aw_deadline(deadline, "after failed bounded f64 GEMM")?;
+            Ok(None)
+        }
+    }
+}
+
+/// Compute `(A·W, |A|·|W|)` with two explicit deadline-bounded IEEE-f64
+/// products.
+///
+/// The same exactly widened row-major operands are used for the first product
+/// and then changed in place to their exact absolute values for the second.
+/// Each engine call receives the original, complete `k` contraction. Thus the
+/// caller's existing summation-order-independent `γ_k·S` certificate applies
+/// unchanged even when the engine tiles the output `m`/`p` axes.
+///
+/// Returns `Ok(None)` for safe CPU-fallback outcomes. No partial result from
+/// either product is observable.
+fn aw_via_engine_deadline(
+    engine: &dyn GemmEngine,
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Instant,
+) -> Result<Option<(Array2<f64>, Array2<f64>)>> {
+    const CONVERSION_POLL_ELEMENTS: usize = 1 << 12;
+
+    check_aw_deadline(deadline, "before bounded f64 A·W preparation")?;
+    let m = a_block.nrows();
+    let k = a_block.ncols();
+    let p = w.ncols();
+    if w.nrows() != k {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![k, p],
+            got: vec![w.nrows(), p],
+        });
+    }
+    let a_len = m.checked_mul(k).ok_or_else(|| {
+        NyError::InvalidSpec("Linear CROWN bounded f64 left operand size overflow".into())
+    })?;
+    let w_len = k.checked_mul(p).ok_or_else(|| {
+        NyError::InvalidSpec("Linear CROWN bounded f64 right operand size overflow".into())
+    })?;
+
+    let mut a64 = Vec::with_capacity(a_len);
+    for i in 0..m {
+        for kk in 0..k {
+            let value = a_block[(i, kk)];
+            if !value.is_finite() {
+                check_aw_deadline(deadline, "while rejecting non-finite f64 GEMM input")?;
+                return Ok(None);
+            }
+            a64.push(f32_to_f64_exact(value));
+            if a64.len().is_multiple_of(CONVERSION_POLL_ELEMENTS) {
+                check_aw_deadline(deadline, "while preparing bounded f64 GEMM input")?;
+            }
+        }
+    }
+
+    let mut w64 = Vec::with_capacity(w_len);
+    for kk in 0..k {
+        for j in 0..p {
+            let value = w[(kk, j)];
+            if !value.is_finite() {
+                check_aw_deadline(deadline, "while rejecting non-finite f64 GEMM input")?;
+                return Ok(None);
+            }
+            w64.push(f32_to_f64_exact(value));
+            if w64.len().is_multiple_of(CONVERSION_POLL_ELEMENTS) {
+                check_aw_deadline(deadline, "while preparing bounded f64 GEMM input")?;
+            }
+        }
+    }
+    check_aw_deadline(deadline, "after bounded f64 GEMM input preparation")?;
+
+    let Some(aw) = deadline_f64_gemm_try_engine(engine, m, k, p, &a64, &w64, deadline, false)?
+    else {
+        return Ok(None);
+    };
+
+    // f32→f64 widening and f64 abs are exact. Mutating only after the first
+    // synchronous contract returns keeps peak host memory to two input images.
+    for chunk in a64.chunks_mut(CONVERSION_POLL_ELEMENTS) {
+        for value in chunk {
+            *value = value.abs();
+        }
+        check_aw_deadline(deadline, "while preparing bounded f64 absolute input")?;
+    }
+    for chunk in w64.chunks_mut(CONVERSION_POLL_ELEMENTS) {
+        for value in chunk {
+            *value = value.abs();
+        }
+        check_aw_deadline(deadline, "while preparing bounded f64 absolute input")?;
+    }
+
+    let Some(abs_sum) = deadline_f64_gemm_try_engine(engine, m, k, p, &a64, &w64, deadline, true)?
+    else {
+        return Ok(None);
+    };
+    check_aw_deadline(deadline, "before publishing bounded f64 A·W")?;
+
+    let aw = Array2::from_shape_vec((m, p), aw).map_err(|_| {
+        NyError::InternalError("validated Linear CROWN A·W shape became malformed".into())
+    })?;
+    let abs_sum = Array2::from_shape_vec((m, p), abs_sum).map_err(|_| {
+        NyError::InternalError("validated Linear CROWN |A|·|W| shape became malformed".into())
+    })?;
+    check_aw_deadline(deadline, "after publishing bounded f64 A·W")?;
+    Ok(Some((aw, abs_sum)))
+}
+
+/// Quantum bounding one uninterrupted faer dispatch on the deadline-scoped
+/// CPU `A·W` path: the same non-pollable-stretch budget the bounded engine
+/// contract grants a single accelerator dispatch
+/// ([`DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS`]). One chunk is
+/// `rows_per_chunk·k·p ≤ 2·`this many MACs of GEMM work (`A·W` plus
+/// `|A|·|W|`), a few milliseconds on faer — polls run between chunks and
+/// between the two products of each chunk.
+const DEADLINE_AW_FAER_CHUNK_MACS: usize = 1 << 24;
+// Review defect 6: the doc above ASSERTS these are the same budget — bind it,
+// so a future edit to either constant fails the build instead of the contract.
+const _: () = assert!(
+    DEADLINE_AW_FAER_CHUNK_MACS == DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS,
+    "the deadline A·W chunk quantum must equal the bounded-dispatch MAC budget"
+);
+
+/// Byte ceiling on the f64 scratch one chunked deadline `A·W` may materialise
+/// (review defect 5). The chunk predicate bounds MACs, which does NOT bound
+/// MEMORY: at `k·p ≈ 2^24` the widened `W` + `|W|` pair alone is 268 MB of
+/// f64, and this box's 121 GiB is SHARED between CPU and GPU — a documented
+/// global-OOM vector. Above this ceiling the scalar loop (which allocates
+/// nothing beyond its outputs) remains the pollable form.
+const DEADLINE_AW_FAER_MAX_SCRATCH_BYTES: usize = 64 << 20;
+
+/// faer 0.24 aligns owned plain-number matrix allocations to 64 bytes and
+/// rounds the row capacity up to that alignment. `Mat<f64>` therefore owns a
+/// multiple of eight rows even when its logical matrix has fewer.
+const FAER_F64_ROW_CAPACITY_GRANULARITY: usize = 64 / size_of::<f64>();
+const _: () = assert!(64 % size_of::<f64>() == 0);
+
+fn faer_f64_padded_row_capacity(rows: usize) -> Option<usize> {
+    let remainder = rows % FAER_F64_ROW_CAPACITY_GRANULARITY;
+    if remainder == 0 {
+        Some(rows)
+    } else {
+        rows.checked_add(FAER_F64_ROW_CAPACITY_GRANULARITY - remainder)
+    }
+}
+
+/// Exact user-owned faer allocation footprint at the peak of one chunk.
+///
+/// `w_f` and `w_abs` are `k×p`; `a_f` and `a_abs` are `rows×k`; and the
+/// two products are `rows×p`. All six matrices are live when the second
+/// product is materialised, and every owned faer matrix uses its padded row
+/// capacity rather than its logical row count.
+fn deadline_aw_faer_owned_scratch_bytes(k: usize, p: usize, rows: usize) -> Option<usize> {
+    let padded_k = faer_f64_padded_row_capacity(k)?;
+    let padded_rows = faer_f64_padded_row_capacity(rows)?;
+
+    let one_weight_elements = padded_k.checked_mul(p)?;
+    let one_chunk_pair_elements = padded_rows.checked_mul(k.checked_add(p)?)?;
+    one_weight_elements
+        .checked_add(one_chunk_pair_elements)?
+        .checked_mul(2)?
+        .checked_mul(size_of::<f64>())
+}
+
+/// Admit a deadline-scoped faer chunk only when both widened weights and at
+/// least one complete row of operands/results fit under the scratch ceiling.
+///
+/// Returning `None` is important when integer division yields zero rows: a
+/// full contraction cannot be split across calls, so forcing that zero back
+/// to one would exceed [`DEADLINE_AW_FAER_MAX_SCRATCH_BYTES`].
+fn deadline_aw_faer_rows_per_chunk(k: usize, p: usize, chunk_macs: usize) -> Option<usize> {
+    let row_macs = k.checked_mul(p)?;
+    if row_macs == 0 || row_macs > chunk_macs {
+        return None;
+    }
+
+    let rows_by_macs = chunk_macs / row_macs;
+    if deadline_aw_faer_owned_scratch_bytes(k, p, 1)? > DEADLINE_AW_FAER_MAX_SCRATCH_BYTES {
+        return None;
+    }
+
+    // The scratch predicate is monotone but advances in eight-row plateaus.
+    // First accept the MAC-limited maximum when possible; otherwise binary
+    // search between the known-good one-row chunk and that known-bad maximum.
+    if deadline_aw_faer_owned_scratch_bytes(k, p, rows_by_macs)
+        .is_some_and(|bytes| bytes <= DEADLINE_AW_FAER_MAX_SCRATCH_BYTES)
+    {
+        return Some(rows_by_macs);
+    }
+
+    let mut accepted = 1usize;
+    let mut rejected = rows_by_macs;
+    while rejected - accepted > 1 {
+        let candidate = accepted.midpoint(rejected);
+        if deadline_aw_faer_owned_scratch_bytes(k, p, candidate)
+            .is_some_and(|bytes| bytes <= DEADLINE_AW_FAER_MAX_SCRATCH_BYTES)
+        {
+            accepted = candidate;
+        } else {
+            rejected = candidate;
+        }
+    }
+    Some(accepted)
+}
+
+/// Pollable CPU-only `A·W` + `|A|·|W|` for deadline-scoped replay work.
+///
+/// # Rounding discipline + certificate (#cgan-row7-h4, b90a9fbf mirror)
+///
+/// 6f49a660 replaced the deadline arm's faer GEMMs with a scalar per-MAC
+/// triple loop (the audit contract: no unpollable engine/kernel entry under a
+/// deadline). The ROUNDING discipline of that loop was already the tight
+/// accumulate-then-charge form — plain round-to-nearest f64 dual accumulators
+/// (`a64`, `S`) with the CALLER charging `γ_k^{f64}·S` (`gamma_n_f64` over the
+/// full contraction) — so no per-operation outward stepping ever existed here;
+/// what 6f49a660 cost this lane was THROUGHPUT, not tightness (the sibling
+/// ConvTranspose lanes measured a ~60× scalar tax, b90a9fbf). This restores
+/// row-chunked faer `mat_mul_f64` GEMMs under the b90a9fbf argument:
+///
+/// * f32→f64 widening and f64 `abs` are EXACT, so both GEMMs sum the SAME
+///   exact-in-f64 products as the scalar loop, only in faer's blocked order;
+/// * the caller's certificate `γ_k·S` (Higham, Accuracy & Stability Thm 3.1)
+///   is summation-order-INDEPENDENT — exactly the certificate the no-deadline
+///   faer twin (#linearizenn-faer-f64-aw), the unbounded engine offload
+///   (`aw_via_engine`), and the bounded engine seam (`aw_via_engine_deadline`)
+///   already rely on;
+/// * each chunk keeps every row's FULL `k` contraction inside one
+///   `mat_mul_f64` call (chunking splits only the output row axis), so no
+///   extra cross-call partial-sum roundings are introduced.
+///
+/// When the whole product fits one chunk (every sub-threshold Linear CROWN
+/// shape in practice), the operands and the single `mat_mul_f64` pair are
+/// IDENTICAL to the no-deadline faer twin's, so the deadline arm is
+/// BIT-IDENTICAL to it — the same convergence property b90a9fbf pinned for
+/// the ConvTranspose lanes. Multi-chunk results may differ bitwise from the
+/// single-call twin (faer may block differently per shape); the enclosure is
+/// certified either way by order-independence.
+///
+/// The audit contract stays closed: `mat_mul_f64` is the plain faer CPU
+/// kernel (never the process-global engine; `current_par()` forces `Par::Seq`
+/// inside rayon domain workers, #4392), a single dispatch is bounded by
+/// [`DEADLINE_AW_FAER_CHUNK_MACS`], and the deadline is polled between chunks
+/// and between the two GEMMs of a chunk. Shapes whose single-row dispatch
+/// `k·p` exceeds the quantum — where chunking cannot bound the stretch —
+/// fall back to the historical per-MAC scalar loop
+/// ([`aw_f64_with_abssum_cpu_deadline_scalar`]), as does the
+/// `NY_NAIVE_F64_AW` parity kill-switch.
+fn aw_f64_with_abssum_cpu_deadline(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Instant,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
+        a_block,
+        w,
+        deadline,
+        DEADLINE_AW_FAER_CHUNK_MACS,
+    )
+}
+
+/// Testable core of [`aw_f64_with_abssum_cpu_deadline`]. Production always
+/// passes [`DEADLINE_AW_FAER_CHUNK_MACS`]; tests pass a tiny quantum to force
+/// one row per chunk and pin the BETWEEN-chunk typed-deadline abort (the
+/// `ops_gemm.rs` between-blocks pattern).
+fn aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Instant,
+    chunk_macs: usize,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    let m = a_block.nrows();
+    let k = a_block.ncols();
+    let p = w.ncols();
+    if w.nrows() != k {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![k, p],
+            got: vec![w.nrows(), p],
+        });
+    }
+
+    // A single row's dispatch is `k·p` MACs and must stay whole (full-`k`
+    // contraction per call); if even that exceeds the quantum, chunking cannot
+    // bound the non-pollable stretch and the scalar per-MAC loop remains the
+    // only pollable form. Degenerate shapes and the parity kill-switch take
+    // the same historical path.
+    let Some(rows_per_chunk) = deadline_aw_faer_rows_per_chunk(k, p, chunk_macs) else {
+        return aw_f64_with_abssum_cpu_deadline_scalar(a_block, w, deadline);
+    };
+    if use_naive_f64_aw() {
+        return aw_f64_with_abssum_cpu_deadline_scalar(a_block, w, deadline);
+    }
+
+    // Widen W (and |W|) once — exact conversions, O(k·p) ≤ one quantum of
+    // work per matrix, with a poll after each.
+    let w_f = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]));
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    let w_abs = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs());
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+
+    let mut a64 = Array2::<f64>::zeros((m, p));
+    let mut s = Array2::<f64>::zeros((m, p));
+    // Large zero-fills may themselves consume the remaining budget.
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+
+    let mut row_start = 0usize;
+    while row_start < m {
+        let row_end = row_start.saturating_add(rows_per_chunk).min(m);
+        let rows = row_end - row_start;
+        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        let a_f = Mat::<f64>::from_fn(rows, k, |i, j| {
+            f32_to_f64_exact(a_block[(row_start + i, j)])
+        });
+        let a_abs = Mat::<f64>::from_fn(rows, k, |i, j| {
+            f32_to_f64_exact(a_block[(row_start + i, j)]).abs()
+        });
+        let c = mat_mul_f64(&a_f, &w_f);
+        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        let s_mat = mat_mul_f64(&a_abs, &w_abs);
+        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        for i in 0..rows {
+            for j in 0..p {
+                a64[[row_start + i, j]] = c[(i, j)];
+                s[[row_start + i, j]] = s_mat[(i, j)];
+            }
+        }
+        row_start = row_end;
+    }
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    Ok((a64, s))
+}
+
+/// Historical scalar per-MAC pollable loop, byte-identical to the 6f49a660
+/// form — retained as the over-quantum / degenerate-shape / kill-switch
+/// fallback of [`aw_f64_with_abssum_cpu_deadline`] and as the bitwise parity
+/// reference against the naive reduction.
+///
+/// The loop order is the historical `i → kk → j` order. Splitting the innermost
+/// `j` traversal only inserts deadline checks and therefore leaves every
+/// per-entry f64 reduction sequence unchanged. Each product is exact after
+/// f32→f64 widening, and the caller's existing `γ_k·S` enclosure remains valid.
+fn aw_f64_with_abssum_cpu_deadline_scalar(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Instant,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    const DEADLINE_POLL_MACS: usize = 1 << 12;
+    const DEADLINE_POLL_SKIPPED_K: usize = 1 << 12;
+
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    let m = a_block.nrows();
+    let k = a_block.ncols();
+    let p = w.ncols();
+    if w.nrows() != k {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![k, p],
+            got: vec![w.nrows(), p],
+        });
+    }
+
+    let mut a64 = Array2::<f64>::zeros((m, p));
+    let mut s = Array2::<f64>::zeros((m, p));
+    // Large zero-fills may themselves consume the remaining budget.
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+
+    let a64_buf = a64
+        .as_slice_mut()
+        .expect("a64 is freshly allocated row-major contiguous");
+    let s_buf = s
+        .as_slice_mut()
+        .expect("s is freshly allocated row-major contiguous");
+    let mut skipped_k_since_poll = 0usize;
+    for i in 0..m {
+        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        let a64_row = &mut a64_buf[i * p..i * p + p];
+        let s_row = &mut s_buf[i * p..i * p + p];
+        for kk in 0..k {
+            let av = f32_to_f64_exact(a_block[(i, kk)]);
+            if av == 0.0 || p == 0 {
+                skipped_k_since_poll += 1;
+                if skipped_k_since_poll >= DEADLINE_POLL_SKIPPED_K {
+                    check_aw_deadline(deadline, "during certified f64 A·W")?;
+                    skipped_k_since_poll = 0;
+                }
+                continue;
+            }
+
+            let av_abs = av.abs();
+            let mut j_start = 0usize;
+            while j_start < p {
+                let j_end = (j_start + DEADLINE_POLL_MACS).min(p);
+                for j in j_start..j_end {
+                    let wv = f32_to_f64_exact(w[(kk, j)]);
+                    a64_row[j] += av * wv;
+                    s_row[j] += av_abs * wv.abs();
+                }
+                check_aw_deadline(deadline, "during certified f64 A·W")?;
+                j_start = j_end;
+            }
+        }
+    }
+    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    Ok((a64, s))
+}
+
+/// Propagate one non-negative incoming coefficient-error matrix through
+/// `|W|` without entering an opaque GEMM under finite deadline authority.
+///
+/// Every product of two f32 values is exact after widening to f64. The
+/// deadline arm publishes the same historical per-add outward-stepped bound
+/// as the unbounded arm; its only semantic addition is bounded polling and a
+/// typed deadline abort. A previously authored dual-accumulator candidate was
+/// withdrawn because the final f32 publication made its f64 tightening inert
+/// (see [`incoming_error_product`]).
+fn incoming_error_product_deadline(
+    error: &Array2<f32>,
+    column_offset: usize,
+    contraction: usize,
+    w_abs: &Mat<f32>,
+    deadline: Instant,
+) -> Result<Array2<f32>> {
+    incoming_error_product(error, column_offset, contraction, w_abs, Some(deadline))
+}
+
+/// Deadline poll cadence for the incoming-error composition: at most this many
+/// MACs run between two deadline observations.
+const INCOMING_ERROR_POLL_MACS: usize = 1 << 12;
+
+/// Test-only multiplicative outward slack for the withdrawn dual-accumulator
+/// candidate's error term
+/// `err = γ_{n+1}·(acc·abs_inflate)` — the exact mirror of the Conv2d IBP
+/// kernel's `ERR_PRODUCT_SLACK_F64` (#cgan-conv-ibp-magnitude-floor,
+/// `ops_ibp_fwd.rs`). Counting every round-to-nearest f64 operation that could
+/// make the computed `err` under-shoot its exact real-arithmetic value: the 3
+/// multiplications of the `err` expression, plus the subtract+divide inside
+/// `γ = (n+1)·u/(1−(n+1)·u)` (`(n+1)·u` itself is exact: an integer < 2^53
+/// scaled by a power of two), plus the subtract+divide inside
+/// `abs_inflate = 1/(1−γ)` — ≤ 7 roundings.
+///
+/// CORRECTED 2026-08-12 (review defect 2): the naive "(1−u)^7 under-shoot, the
+/// residue is O(u²)" reading is WRONG IN FORM. γ's own ≤2-rounding error is
+/// AMPLIFIED when it passes through `abs_inflate = 1/(1−γ)`; the resulting
+/// deficit is `≈ 2u·d/(1−2d)` with `d = (n+1)·2^-53` — not `O(u²)`, and
+/// unbounded as `d → ½`. What actually carries the bound is the γ-INDEX
+/// MARGIN: `γ_{n+1}` is charged where the fold performs at most `n−1`
+/// roundings, a two-index spare of `≈ 4u/(1−2d)`, and `1 + 3d − 4d² > 0` for
+/// every `d ∈ [0, ½)` — so the margin dominates the amplified deficit at every
+/// reachable width. The `1 + 4·EPSILON` factor is belt-and-braces on top.
+/// DO NOT "simplify" `contraction + 1` to `contraction` on the strength of the
+/// old text: that removes the margin the proof rests on.
+#[cfg(test)]
+const INCOMING_ERROR_SLACK_F64: f64 = 1.0 + 4.0 * f64::EPSILON;
+
+/// Test-only `(γ_{n+1}^{f64}, abs_inflate)` factors for the withdrawn
+/// dual-accumulator candidate over a width-`n` incoming-error contraction.
+/// `abs_inflate = 1/(1−γ)` covers the accumulator's own round-to-nearest
+/// deficit (`acc ≥ T·(1−γ)` ⇒ `T ≤ acc·abs_inflate`); `+inf` when γ saturates
+/// (`(n+1)·u64 ≥ 1`), which makes the candidate conservatively unusable.
+#[inline]
+#[cfg(test)]
+pub(crate) fn incoming_error_dual_factors(contraction: usize) -> (f64, f64) {
+    let gamma = gamma_n_f64(contraction.saturating_add(1));
+    let abs_inflate = if gamma < 1.0 {
+        1.0 / (1.0 - gamma)
+    } else {
+        f64::INFINITY
+    };
+    (gamma, abs_inflate)
+}
+
+/// Test-only dual-accumulator candidate upper bound on the exact non-negative
+/// sum `T` whose round-to-nearest f64 fold produced `acc`:
+///
+/// ```text
+/// acc + γ_{n+1}·(acc·abs_inflate)·INCOMING_ERROR_SLACK_F64  ≥  T
+/// ```
+///
+/// Proof sketch (the fc5e569c derivation, specialized to same-sign terms):
+/// every term is an exact-in-f64 product of two f32 values and non-negative,
+/// so `Σ|t_k| = T` and Higham's summation bound (Accuracy and Stability,
+/// Thm 3.1) gives `|acc − T| ≤ γ_n·T`, hence `T ≤ acc/(1−γ_n) =
+/// acc·abs_inflate = acc + γ_n·(acc·abs_inflate)`. Charging index `n+1` and
+/// the closed-form slack covers the ≤ 7 roundings of the factor computation
+/// itself. Degenerate inputs stay conservative: `acc = +inf` ⇒ `+inf`;
+/// `acc = 0` with a saturated `abs_inflate` yields NaN, which makes the
+/// candidate unusable.
+#[inline]
+#[cfg(test)]
+pub(crate) fn incoming_error_dual_upper(acc: f64, gamma: f64, abs_inflate: f64) -> f64 {
+    // PRECONDITION (review defect 1): `acc` must be a round-to-nearest fold of
+    // EXACT f32xf32 products, so it is either 0.0 or a NORMAL f64. On a
+    // SUBNORMAL `acc` the `gamma * (acc * abs_inflate)` charge underflows and
+    // the result collapses to `acc` itself — measured up to 1.2e-4 BELOW the
+    // true sum at n = 2^40. Unreachable from `incoming_error_product`
+    // (min |f32xf32| = 2^-298, a normal f64), but this helper is pub(crate),
+    // so fail CLOSED rather than trust a future caller's term provenance.
+    if acc != 0.0 && acc.abs() < f64::MIN_POSITIVE {
+        return f64::INFINITY;
+    }
+    acc + gamma * (acc * abs_inflate) * INCOMING_ERROR_SLACK_F64
+}
+
+/// Compose an incoming certified error matrix through `|W|`:
+/// `P[i,j] = Σ_k err[i, offset+k]·|W[k,j]|`, published as a certified f32
+/// UPPER bound per entry (the pre-6f49a660 round-to-nearest f32 faer
+/// `mat_mul` could round inward, which is why this is a self-certifying
+/// scalar loop and not a GEMM).
+///
+/// # Rounding discipline (#cgan-row7-h4)
+///
+/// One pass over the terms maintains `stepped`, the historical per-add outward
+/// fold (`next_up_nonnegative_f64` after every round-to-nearest addition).
+/// This is an inductive upper bound on the exact sum `T`. Both finite-deadline
+/// and unbounded calls publish that same accumulator, preserving byte parity;
+/// a finite deadline only inserts the polling cadence below.
+///
+/// The test-only `incoming_error_dual_upper` helper documents and checks a
+/// withdrawn alternative that charges one round-to-nearest accumulator at the
+/// end. It is deliberately not wired into this production function: its f64
+/// improvement is erased by `publish_error_up_normal` at practical widths.
+///
+/// The scalar loop is retained deliberately: the per-term sanitization
+/// (`nonnegative_f32_error_or_infinity` poisoning, and the `err·0 → 0`
+/// domination rule for a poisoned `+inf` error against a zero weight) has no
+/// GEMM equivalent (`inf·0 = NaN` inside an opaque kernel), and the audit
+/// contract from 6f49a660 (no unpollable engine entry under a deadline)
+/// requires the [`INCOMING_ERROR_POLL_MACS`] cadence. The rounding discipline
+/// itself remains the historical stepped form.
+///
+/// Casting the final stepped value to f32 could round inward;
+/// `publish_error_up_normal` prevents that with a directed up-cast plus an
+/// explicit `next_up_f32`.
+/// Temporary probe accumulators for the incoming-error composition share
+/// (read by the collection summary when `NY_DUMP_NODE_BOUNDS=1`).
+pub(crate) static INCOMING_ERR_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INCOMING_ERR_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn incoming_error_product(
+    error: &Array2<f32>,
+    column_offset: usize,
+    contraction: usize,
+    w_abs: &Mat<f32>,
+    deadline: Option<Instant>,
+) -> Result<Array2<f32>> {
+    let probe_start = Instant::now();
+    let result = incoming_error_product_with_poll_quantum(
+        error,
+        column_offset,
+        contraction,
+        w_abs,
+        deadline,
+        INCOMING_ERROR_POLL_MACS,
+    );
+    INCOMING_ERR_NANOS.fetch_add(
+        u64::try_from(probe_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    INCOMING_ERR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
+/// Testable core of [`incoming_error_product`]. Production always passes
+/// [`INCOMING_ERROR_POLL_MACS`]; tests pass `poll_quantum = 1` to pin the
+/// mid-loop typed-deadline abort without waiting on a full-size quantum
+/// (the `ops_gemm.rs` between-blocks pattern).
+fn incoming_error_product_with_poll_quantum(
+    error: &Array2<f32>,
+    column_offset: usize,
+    contraction: usize,
+    w_abs: &Mat<f32>,
+    deadline: Option<Instant>,
+    poll_quantum: usize,
+) -> Result<Array2<f32>> {
+    let poll_quantum = poll_quantum.max(1);
+
+    let check = || {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            Err(NyError::DeadlineExceeded(
+                "Linear CROWN backward: deadline exceeded during incoming-error composition"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    check()?;
+    let rows = error.nrows();
+    let output_columns = w_abs.ncols();
+    if error.ncols() < column_offset.saturating_add(contraction) || w_abs.nrows() != contraction {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![rows, column_offset.saturating_add(contraction)],
+            got: vec![error.nrows(), error.ncols()],
+        });
+    }
+    // #cgan-row7-h4, WITHDRAWN 2026-08-12 after adversarial review: a
+    // `min(stepped, dual)` form was authored here to remove the per-add
+    // next_up inflation (~n·u64 relative). It was CERTIFIED (validated
+    // against an exact-rational oracle) but provably INERT: this value is
+    // published through `publish_error_up_normal`, whose directed cast plus
+    // unconditional `next_up_f32` widen by 2^-24..2^-23 — five orders ABOVE
+    // the gap the dual arm closes (4.5e-13 relative at n=4096; the crossover
+    // needs n > 2^29), and it cannot compound across layers because every
+    // layer re-publishes through the same f32 step. Certified-arithmetic
+    // surface that cannot move a verdict is a bad trade under the moat rule,
+    // so the historical stepped fold stands. The tightening lever that WOULD
+    // pay lives at the f32 publication step / the `l_cast_err + γ·S + l_prop`
+    // aggregation, not here. (`incoming_error_dual_*` are retained as
+    // test-only, reviewed oracle helpers that such a lever would reuse.)
+    let mut product = Array2::<f32>::zeros((rows, output_columns));
+    check()?;
+    let mut operations = 0usize;
+    for i in 0..rows {
+        for j in 0..output_columns {
+            let mut stepped = 0.0f64;
+            for kk in 0..contraction {
+                if operations.is_multiple_of(poll_quantum) {
+                    check()?;
+                }
+                operations = operations.wrapping_add(1);
+                let error_value = nonnegative_f32_error_or_infinity(error[[i, column_offset + kk]]);
+                let weight_abs = nonnegative_f32_error_or_infinity(w_abs[(kk, j)]);
+                let term = if error_value == 0.0 || weight_abs == 0.0 {
+                    0.0
+                } else {
+                    error_value * weight_abs
+                };
+                // Certified coefficient errors and |W| are non-negative. A
+                // negative or NaN term violates that invariant; +inf is the
+                // conservative error enclosure. The stepped arm takes one
+                // successor after every RN addition, which dominates its exact
+                // real sum without any contraction-width assumption.
+                if term == 0.0 {
+                    continue;
+                }
+                if term > 0.0 {
+                    stepped = next_up_nonnegative_f64(stepped + term);
+                } else {
+                    stepped = f64::INFINITY;
+                }
+            }
+            product[[i, j]] = publish_error_up_normal(stepped);
+        }
+    }
+    check()?;
+    Ok(product)
+}
+
+#[inline]
+fn next_up_nonnegative_f64(value: f64) -> f64 {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > 0x7ff0_0000_0000_0000 || bits >> 63 != 0 {
+        return f64::INFINITY;
+    }
+    if magnitude == 0 {
+        return f64::from_bits(1);
+    }
+    if magnitude == 0x7ff0_0000_0000_0000 {
+        return value;
+    }
+    f64::from_bits(bits + 1)
 }
 
 /// Provably-sound f64 inflation factor for an f32-accumulated abs-sum `S`
@@ -208,6 +1194,28 @@ pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f6
 /// `gamma_n_f32`'s own `k < 2^24` clamp: for `k ∈ [2^23, 2^24)` the factor
 /// `1/(1 − γ_k)` is finite but NEGATIVE (a stored negative error → false
 /// VERIFIED), which this guard rejects.
+/// NUMERICAL REPAIR (2026-08-08, #f32-abssum-inflation-conditioning). The old
+/// body evaluated `1.0 / (1.0 - g)` with `g = γ_k^f32`. As `k → 2^23`, `g → 1`
+/// and `1 - g` is CATASTROPHICALLY CANCELLING, so the quotient could land BELOW
+/// the exact `1/(1 - γ_k)` — i.e. the checked-in claim "`F_hat` over-bounds the
+/// tight factor" was FALSE at large `k`. Measured at `k = 8_388_582`: the old
+/// form gave `161319.8846141918` against an exact `161319.8846153846`, an
+/// under-round of `7.39e-12` relative.
+///
+/// (That defect never produced an unsound `S`: the universal factor
+/// `(1 - 2^-24)^-k` is under `1.649` in that regime, so the returned value still
+/// dominated the real requirement by a wide margin. The PROOF was wrong, not the
+/// bound — and a proof this seam depends on must not be wrong.)
+///
+/// The repair evaluates the algebraically identical but well-conditioned form.
+/// With `u = 2^-24` and `d = k·u`, `γ_k = d/(1-d)`, so
+/// `1 - γ_k = (1 - 2d)/(1 - d)` and therefore
+/// `1/(1 - γ_k) = (1 - d)/(1 - 2d)` — no subtraction of nearly-equal quantities.
+/// The result is then pushed OUTWARD one ulp before the `(1 + 2^-40)` margin, so
+/// the return value dominates the exact factor by construction rather than by
+/// the accident of a rounding direction.
+///
+/// Credit: the conditioning defect was found by an independent Codex CLI review.
 #[inline]
 fn f32_abssum_inflation(k: usize) -> Option<f64> {
     let g = gamma_n_f32(k);
@@ -217,7 +1225,18 @@ fn f32_abssum_inflation(k: usize) -> Option<f64> {
     if !(g < 1.0) {
         return None;
     }
-    Some((1.0 / (1.0 - g)) * (1.0 + 2f64.powi(-40)))
+    let d = (k as f64) * 2f64.powi(-24);
+    // `g < 1.0` already implies `d < 0.5`, hence `1 - 2d > 0`; assert the
+    // load-bearing consequence rather than trusting the implication silently.
+    let denom = 1.0 - 2.0 * d;
+    if !denom.is_finite() || denom <= 0.0 {
+        return None;
+    }
+    let tight = (1.0 - d) / denom;
+    if !tight.is_finite() || tight < 1.0 {
+        return None;
+    }
+    Some(next_up_nonnegative_f64(tight) * (1.0 + 2f64.powi(-40)))
 }
 
 /// Compute `(A·W, S)` via a sound external GEMM engine (cuBLAS). `A·W` stays
@@ -251,7 +1270,7 @@ pub(crate) fn aw_via_engine(
     for i in 0..m {
         for kk in 0..k {
             let x = a_block[(i, kk)];
-            a64[i * k + kk] = f64::from(x);
+            a64[i * k + kk] = f32_to_f64_exact(x);
             absa[i * k + kk] = x.abs();
         }
     }
@@ -260,7 +1279,7 @@ pub(crate) fn aw_via_engine(
     for kk in 0..k {
         for j in 0..p {
             let y = w[(kk, j)];
-            w64[kk * p + j] = f64::from(y);
+            w64[kk * p + j] = f32_to_f64_exact(y);
             absw[kk * p + j] = y.abs();
         }
     }
@@ -275,15 +1294,31 @@ pub(crate) fn aw_via_engine(
             // FTZ-safe underflow guard: ≤ 2k−1 f32 roundings, each losing < 2^-126
             // under flush-to-zero (design §2 step 5); placed INSIDE the F multiply.
             let g = 2.0f64 * (k as f64) * 2f64.powi(-126);
+            let daz = daz_operand_flush_floor(a_block, w, m, k, p);
             Array2::from_shape_fn((m, p), |(i, j)| {
-                let r = f64::from(s32[i * p + j]); // exact widen (f32 ⊂ f64)
-                (r + g) * f_hat // ≥ true_S (design §2)
+                let r = f32_to_f64_exact(s32[i * p + j]);
+                (r + g + daz[[i, j]]) * f_hat
             })
         }
         None => {
-            // k ≥ 2^23: the f32 factor degenerates; use the exact f64 S path.
-            let absa64: Vec<f64> = absa.iter().map(|&v| f64::from(v)).collect();
-            let absw64: Vec<f64> = absw.iter().map(|&v| f64::from(v)).collect();
+            // k ≥ 2^23: the f32 factor degenerates; use the f64 S path.
+            //
+            // HONEST SCOPE NOTE (2026-08-08, from an independent Codex review).
+            // This branch is a RAW round-to-nearest f64 GEMM, and RN summation is
+            // NOT guaranteed to be an elementwise UPPER bound on `Σ|a||w|` — it
+            // can round down. So the blanket claim "S is always an over-bound",
+            // which appears in several places in this tree and in the commit
+            // history, is FALSE for this branch. The `γ_n^f64·S` term the caller
+            // adds absorbs it in practice (the shortfall is ≤ γ_k^f64·S, which is
+            // exactly what that term charges), so this is a PROOF-STATEMENT
+            // defect rather than a demonstrated unsoundness — and it is
+            // PRE-EXISTING: the historical second-f64-GEMM fall-through at
+            // `aw_f64_with_abssum_unbounded` has the identical property. It is
+            // recorded here rather than silently inherited. The f32 branch above
+            // does not share it: its inflation + FTZ + DAZ machinery makes the
+            // over-bound explicit and provable.
+            let absa64: Vec<f64> = absa.iter().map(|&v| f32_to_f64_exact(v)).collect();
+            let absw64: Vec<f64> = absw.iter().map(|&v| f32_to_f64_exact(v)).collect();
             Array2::from_shape_vec((m, p), eng.gemm_f64(m, k, p, &absa64, &absw64).ok()?).ok()?
         }
     };
@@ -343,10 +1378,10 @@ fn daz_operand_flush_floor(
 ) -> Array2<f64> {
     let flt_min = f64::from(f32::MIN_POSITIVE);
     let row: Vec<f64> = (0..m)
-        .map(|i| (0..k).map(|l| f64::from(a[(i, l)].abs())).sum())
+        .map(|i| (0..k).map(|l| f32_to_f64_exact(a[(i, l)]).abs()).sum())
         .collect();
     let col: Vec<f64> = (0..p)
-        .map(|j| (0..k).map(|l| f64::from(w[(l, j)].abs())).sum())
+        .map(|j| (0..k).map(|l| f32_to_f64_exact(w[(l, j)]).abs()).sum())
         .collect();
     Array2::from_shape_fn((m, p), |(i, j)| (row[i] + col[j]) * flt_min)
 }
@@ -406,7 +1441,7 @@ fn sound_abs_product_upper(
             // returned S is `≥ P` even under input-flush.
             let daz = daz_operand_flush_floor(a, w, m, k, p);
             Array2::from_shape_fn((m, p), |(i, j)| {
-                (f64::from(r[[i, j]]) + g + daz[[i, j]]) * f_hat * contain_margin
+                (f32_to_f64_exact(r[[i, j]]) + g + daz[[i, j]]) * f_hat * contain_margin
             })
         }
         None => {
@@ -463,6 +1498,18 @@ fn sound_abs_product_upper(
 /// its own shader term (`CROWN_AW_ERROR_COMBINE_SHADER`, validated by
 /// `crown_backward_sound_resident_daz_subnormal_*`).
 ///
+/// # S2 — the EFT-compensated arm (`NY_EFT_ERR=1`, DARK by default)
+///
+/// The `γ_n^f32·S` charge above is A-PRIORI: it is the worst case over all sign
+/// patterns, and in the CROWN regime (mixed-sign coefficients, `Σ|a·w|` ≫ the
+/// running sum) it over-states the ACTUAL rounding error of the executed fold by
+/// orders of magnitude. Under the gate this function additionally computes an
+/// A-POSTERIORI enclosure whose radius is the exactly-measured EFT residual of
+/// its own fold, and INTERSECTS the two — `max` on the lower endpoints, `min` on
+/// the upper, which is the design doc's `max(lb_higham, lb_eft)` verbatim.
+/// See [`aw_eft_sound_bound`] for why intersection (rather than replacement) is
+/// what makes the downgrade-only property structural.
+///
 /// Default-off / experimental: standalone, UNWIRED into any live call site.
 #[allow(dead_code)] // unwired by design until the differential oracle + wiring land.
 pub(crate) fn aw_f32_sound_bound(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f32>, Array2<f32>) {
@@ -491,7 +1538,7 @@ pub(crate) fn aw_f32_sound_bound(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f3
     let mut upper = Array2::<f32>::zeros((m, p));
     for i in 0..m {
         for j in 0..p {
-            let c = f64::from(c_hat[[i, j]]);
+            let c = f32_to_f64_exact(c_hat[[i, j]]);
             let penalty = gamma * s[[i, j]] + ftz + daz[[i, j]];
             if !c.is_finite() || !penalty.is_finite() {
                 // Overflowed coefficient or degenerate (k >= 2^24) γ: sound but
@@ -507,7 +1554,164 @@ pub(crate) fn aw_f32_sound_bound(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f3
             }
         }
     }
+
+    // S2: intersect with the a-posteriori enclosure. Dark by default; when the
+    // arm refuses (gate off, EFT preconditions unmet, size overflow, non-finite
+    // fold) NOTHING below runs and the incumbent stands byte-identically.
+    if eft_err_channel_enabled() {
+        if let Some((eft_lower, eft_upper)) = aw_eft_sound_bound(a_block, w, m, k, p) {
+            intersect_enclosure_downgrade_only(&mut lower, &mut upper, &eft_lower, &eft_upper);
+        }
+    }
     (lower, upper)
+}
+
+/// #eft-err process gate (`NY_EFT_ERR=1`), DARK by default.
+///
+/// Deliberately UNCACHED and named/valued identically to the GPU twin's gate
+/// (`ny-gpu`'s `crown_backward_sound_resident::eft_err_env_enabled`) so one
+/// switch arms the whole S2 channel and scoped-env tests can flip it. Read once
+/// per GEMM, never per element.
+#[allow(dead_code)] // reached via `aw_f32_sound_bound`, itself unwired by design.
+fn eft_err_channel_enabled() -> bool {
+    std::env::var("NY_EFT_ERR").ok().as_deref() == Some("1")
+}
+
+/// A-POSTERIORI certified enclosure of `A·W`: the plain left-to-right f32 fold's
+/// value, widened by the EFT-MEASURED rounding error of *that* fold rather than
+/// by the a-priori `γ_n^f32·S` worst case.
+///
+/// # Soundness
+///
+/// The channel owns BOTH halves of every entry. `eft_dot_f32_downgrade_only`
+/// returns the value of the fold it just executed together with
+/// `min(γ_{k+1}·Σ|a·w|, Σ|e_prod| + Σ|e_sum|)` for that same fold — the residual
+/// sum is an EXACT measurement (TwoProdFMA + Knuth TwoSum telescope to an
+/// identity), and the `min` is `ny_core::eft`'s single downgrade-only
+/// chokepoint. Computing the radius for a value produced by a DIFFERENT
+/// reduction order would be unsound, which is precisely why this function does
+/// not certify `f32_gemm_rn`'s output: the accelerator's summation order is
+/// unknown, and only an order-independent bound like `γ_n·S` may be applied to
+/// it. Here the order is ours.
+///
+/// The `ftz` and `daz` floors are carried over UNCHANGED from the a-priori arm.
+/// They bound subnormal result-flush and operand-flush, which the EFT identity
+/// (a theorem about gradual underflow) does not cover; `ny_core::eft`'s
+/// self-check verifies this target does not flush, so on it they are pure
+/// widening.
+///
+/// Returns `None` — leaving the caller's a-priori enclosure untouched — when the
+/// EFT preconditions do not hold on this target, an index overflows, or any fold
+/// goes non-finite. `None` is never "zero error".
+#[allow(dead_code)] // reached via `aw_f32_sound_bound`, itself unwired by design.
+fn aw_eft_sound_bound(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    m: usize,
+    k: usize,
+    p: usize,
+) -> Option<(Array2<f32>, Array2<f32>)> {
+    // Fail-closed on the target's EFT preconditions (fused FMA, RN, no FTZ).
+    if !ny_core::eft::eft_available() {
+        return None;
+    }
+
+    // A row-major, W column-major, so each dot reads two contiguous slices and
+    // `[(i, j)]` layout-agnostic indexing is paid once instead of per fold.
+    let mut a_rows = vec![0.0f32; m.checked_mul(k)?];
+    for i in 0..m {
+        for kk in 0..k {
+            a_rows[i * k + kk] = a_block[(i, kk)];
+        }
+    }
+    let mut w_cols = vec![0.0f32; k.checked_mul(p)?];
+    for j in 0..p {
+        for kk in 0..k {
+            w_cols[j * k + kk] = w[(kk, j)];
+        }
+    }
+
+    // Same floors, same expression, as the a-priori arm above.
+    let ftz = 4.0 * (k as f64) * 2f64.powi(-126);
+    let daz = daz_operand_flush_floor(a_block, w, m, k, p);
+
+    let mut lower = Array2::<f32>::zeros((m, p));
+    let mut upper = Array2::<f32>::zeros((m, p));
+    for i in 0..m {
+        let a_row = &a_rows[i * k..i * k + k];
+        for j in 0..p {
+            let w_col = &w_cols[j * k..j * k + k];
+            let certified = ny_core::eft::eft_dot_f32_downgrade_only(a_row, w_col)?;
+            let c = f32_to_f64_exact(certified.value);
+            let penalty = f32_to_f64_exact(certified.err) + ftz + daz[[i, j]];
+            if !c.is_finite() || !penalty.is_finite() {
+                lower[[i, j]] = f32::NEG_INFINITY;
+                upper[[i, j]] = f32::INFINITY;
+            } else {
+                lower[[i, j]] = next_down_f32((c - penalty) as f32);
+                upper[[i, j]] = next_up_f32((c + penalty) as f32);
+            }
+        }
+    }
+    Some((lower, upper))
+}
+
+/// Intersect a candidate certified enclosure into an incumbent one, IN PLACE.
+///
+/// This is the structural form of `max(lb_higham, lb_eft)`: both arguments are
+/// sound enclosures of the SAME exact `A·W` entry, so their intersection is
+/// also one, and it is by construction never WIDER than the incumbent. An entry
+/// only moves when it strictly improves; a NaN candidate endpoint fails every
+/// comparison and is discarded; and a candidate that would INVERT the interval
+/// (which can only happen if one of the two arms is unsound) is rejected
+/// wholesale for that entry, leaving the a-priori channel in charge.
+///
+/// The function cannot WIDEN a bound: it never writes a lower endpoint smaller
+/// than the incumbent's, nor an upper endpoint larger. Note carefully what that
+/// does and does not buy.
+///
+/// It buys termination and monotonicity — the interval only ever shrinks, so no
+/// sequence of applications can drift outward.
+///
+/// It does NOT make the result independent of the candidate. This is an
+/// INTERSECTION, and intersecting narrows; a narrowed interval is a valid
+/// enclosure only if the candidate was itself a valid enclosure of the same
+/// quantity. A candidate that wrongly excludes part of the true range yields a
+/// bound that is too tight — a FALSE PROOF, the one direction that matters. The
+/// `l <= u` guard below rejects only a candidate that inverts the interval
+/// outright, i.e. one that is grossly and detectably disjoint; it cannot detect
+/// a candidate that is merely slightly wrong on one side.
+///
+/// So the caller's obligation is exactly the one this comment used to disclaim:
+/// the candidate must be a proven enclosure before it is passed here. That is
+/// why this function is unwired by design — see the `dead_code` note below.
+#[allow(dead_code)] // reached via `aw_f32_sound_bound`, itself unwired by design.
+fn intersect_enclosure_downgrade_only(
+    lower: &mut Array2<f32>,
+    upper: &mut Array2<f32>,
+    candidate_lower: &Array2<f32>,
+    candidate_upper: &Array2<f32>,
+) {
+    if candidate_lower.dim() != lower.dim() || candidate_upper.dim() != upper.dim() {
+        return;
+    }
+    for i in 0..lower.nrows() {
+        for j in 0..lower.ncols() {
+            let mut l = lower[[i, j]];
+            let mut u = upper[[i, j]];
+            if candidate_lower[[i, j]] > l {
+                l = candidate_lower[[i, j]];
+            }
+            if candidate_upper[[i, j]] < u {
+                u = candidate_upper[[i, j]];
+            }
+            // Disjoint arms mean one of them is unsound; keep the proven one.
+            if l <= u {
+                lower[[i, j]] = l;
+                upper[[i, j]] = u;
+            }
+        }
+    }
 }
 
 /// CPU CROWN backward propagation using faer matrix multiply.
@@ -535,7 +1739,22 @@ pub(crate) fn propagate_linear_cpu<'a>(
     layer: &LinearLayer,
     bounds: &'a LinearBounds,
 ) -> Result<Cow<'a, LinearBounds>> {
+    propagate_linear_cpu_with_deadline(layer, bounds, None, true)
+}
+
+fn propagate_linear_cpu_with_deadline<'a>(
+    layer: &LinearLayer,
+    bounds: &'a LinearBounds,
+    deadline: Option<Instant>,
+    allow_global_f64_engine: bool,
+) -> Result<Cow<'a, LinearBounds>> {
     debug!("Linear layer CROWN backward propagation");
+
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(NyError::DeadlineExceeded(
+            "Linear CROWN backward: deadline exceeded before CPU propagation".to_string(),
+        ));
+    }
 
     let (num_outputs, bounds_inputs) = (bounds.lower_a().nrows(), bounds.lower_a().ncols());
     let weight_rows = layer.weight_faer().nrows();
@@ -591,8 +1810,10 @@ pub(crate) fn propagate_linear_cpu<'a>(
         // — the round-to-nearest f32 faer GEMM with no error accounting — so the
         // strict soundness proptest can confirm it CATCHES the bug. Never set in
         // production.
-        let legacy_f32 = cfg!(debug_assertions) && std::env::var("NY_AW_LEGACY_F32").is_ok();
-        let (lower_a64, lower_s, upper_a64, upper_s) = if legacy_f32 {
+        let legacy_f32 = allow_global_f64_engine
+            && cfg!(debug_assertions)
+            && std::env::var("NY_AW_LEGACY_F32").is_ok();
+        let (stacked_a64, stacked_s) = if legacy_f32 {
             let lower_block = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
                 bounds.lower_a()[[i, in_start + j]]
             });
@@ -601,10 +1822,15 @@ pub(crate) fn propagate_linear_cpu<'a>(
             });
             let ml = mat_mul(&lower_block, layer.weight_faer());
             let mu = mat_mul(&upper_block, layer.weight_faer());
-            let la = Array2::from_shape_fn((num_outputs, in_features), |(i, j)| ml[(i, j)] as f64);
-            let ua = Array2::from_shape_fn((num_outputs, in_features), |(i, j)| mu[(i, j)] as f64);
-            let z = Array2::<f64>::zeros((num_outputs, in_features));
-            (la, z.clone(), ua, z)
+            let a64 = Array2::from_shape_fn((2 * num_outputs, in_features), |(i, j)| {
+                if i < num_outputs {
+                    f32_to_f64_exact(ml[(i, j)])
+                } else {
+                    f32_to_f64_exact(mu[(i - num_outputs, j)])
+                }
+            });
+            let s = Array2::<f64>::zeros((2 * num_outputs, in_features));
+            (a64, s)
         } else {
             // Stack lower OVER upper into one (2·num_outputs × out_features) block:
             // both sides multiply the SAME weight, so the f64 A·W + abs-sum runs as
@@ -620,44 +1846,77 @@ pub(crate) fn propagate_linear_cpu<'a>(
                     bounds.upper_a()[[i - num_outputs, in_start + j]]
                 }
             });
-            let (a64, s) = aw_f64_with_abssum(&stacked, layer.weight_faer());
-            let lower_a64 = a64.slice(ndarray::s![0..num_outputs, ..]).to_owned();
-            let upper_a64 = a64.slice(ndarray::s![num_outputs.., ..]).to_owned();
-            let lower_s = s.slice(ndarray::s![0..num_outputs, ..]).to_owned();
-            let upper_s = s.slice(ndarray::s![num_outputs.., ..]).to_owned();
-            (lower_a64, lower_s, upper_a64, upper_s)
+            if allow_global_f64_engine {
+                aw_f64_with_abssum_and_deadline(&stacked, layer.weight_faer(), deadline)?
+            } else {
+                let deadline = deadline.ok_or_else(|| {
+                    NyError::UnsupportedOp(
+                        "bounded Linear CROWN requires a finite host deadline".into(),
+                    )
+                })?;
+                aw_f64_with_abssum_cpu_deadline(&stacked, layer.weight_faer(), deadline)?
+            }
         };
 
         // Propagated incoming error: P[i,j] = Σ_k err_in[i,in_start+k]·|W[k,j]|.
-        let prop_lower = in_lower_err.map(|e| {
-            let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, k| {
-                e[[i, in_start + k]]
-            });
-            mat_mul(&blk, &w_abs)
-        });
-        let prop_upper = in_upper_err.map(|e| {
-            let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, k| {
-                e[[i, in_start + k]]
-            });
-            mat_mul(&blk, &w_abs)
-        });
+        let prop_lower = match (in_lower_err, deadline) {
+            (Some(error), Some(limit)) => Some(incoming_error_product_deadline(
+                error,
+                in_start,
+                layout.out_features,
+                &w_abs,
+                limit,
+            )?),
+            (Some(error), None) => Some(incoming_error_product(
+                error,
+                in_start,
+                layout.out_features,
+                &w_abs,
+                None,
+            )?),
+            (None, _) => None,
+        };
+        let prop_upper = match (in_upper_err, deadline) {
+            (Some(error), Some(limit)) => Some(incoming_error_product_deadline(
+                error,
+                in_start,
+                layout.out_features,
+                &w_abs,
+                limit,
+            )?),
+            (Some(error), None) => Some(incoming_error_product(
+                error,
+                in_start,
+                layout.out_features,
+                &w_abs,
+                None,
+            )?),
+            (None, _) => None,
+        };
 
         // Place result in output, tracking non-finite or near-overflow coefficients
         // per row (#2681, #1932). The magnitude check catches coefficients approaching
         // f32 overflow before they actually reach Inf, preventing NaN from subsequent
         // multiplications. See CROWN_COEFF_MAX documentation.
         for i in 0..num_outputs {
+            let upper_i = num_outputs + i;
             for j in 0..in_features {
-                let l = lower_a64[[i, j]] as f32;
-                let u = upper_a64[[i, j]] as f32;
+                let l = stacked_a64[[i, j]] as f32;
+                let u = stacked_a64[[upper_i, j]] as f32;
                 // Certified error: cast rounding |a64 - stored| + γ_n·S + propagated
                 // incoming error, rounded UP to a sound f32.
-                let l_cast_err = (lower_a64[[i, j]] - l as f64).abs();
-                let u_cast_err = (upper_a64[[i, j]] - u as f64).abs();
-                let l_prop = prop_lower.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                let u_prop = prop_upper.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                let l_err = next_up_f32((l_cast_err + gamma * lower_s[[i, j]] + l_prop) as f32);
-                let u_err = next_up_f32((u_cast_err + gamma * upper_s[[i, j]] + u_prop) as f32);
+                let l_cast_err = (stacked_a64[[i, j]] - f32_to_f64_exact(l)).abs();
+                let u_cast_err = (stacked_a64[[upper_i, j]] - f32_to_f64_exact(u)).abs();
+                let l_prop = prop_lower
+                    .as_ref()
+                    .map_or(0.0, |p| f32_to_f64_exact(p[[i, j]]));
+                let u_prop = prop_upper
+                    .as_ref()
+                    .map_or(0.0, |p| f32_to_f64_exact(p[[i, j]]));
+                let l_err =
+                    publish_error_up_normal(l_cast_err + gamma * stacked_s[[i, j]] + l_prop);
+                let u_err =
+                    publish_error_up_normal(u_cast_err + gamma * stacked_s[[upper_i, j]] + u_prop);
                 // The stored coefficient is sound iff BOTH endpoints stay finite
                 // and within the magnitude guard; otherwise degrade the row.
                 if is_crown_coeff_safe(l) && l_err.is_finite() {
@@ -704,18 +1963,18 @@ pub(crate) fn propagate_linear_cpu<'a>(
             for i in 0..num_outputs {
                 let mut e = 0.0f64;
                 for j in 0..bias.len() {
-                    e += le[[i, j]] as f64 * (bias[j] as f64).abs();
+                    e = add_coeff_err_bias_product_up(e, le[[i, j]], bias[j]);
                 }
-                lower_bias_contrib[i] -= e;
+                lower_bias_contrib[i] = add_f64_down(lower_bias_contrib[i], -e);
             }
         }
         if let Some(ue) = in_upper_err {
             for i in 0..num_outputs {
                 let mut e = 0.0f64;
                 for j in 0..bias.len() {
-                    e += ue[[i, j]] as f64 * (bias[j] as f64).abs();
+                    e = add_coeff_err_bias_product_up(e, ue[[i, j]], bias[j]);
                 }
-                upper_bias_contrib[i] += e;
+                upper_bias_contrib[i] = add_f64_up(upper_bias_contrib[i], e);
             }
         }
     }
@@ -788,25 +2047,38 @@ pub(crate) fn propagate_linear_with_engine<'a>(
     bounds: &'a LinearBounds,
     engine: Option<&dyn GemmEngine>,
 ) -> Result<Cow<'a, LinearBounds>> {
-    let Some(engine) = engine else {
-        return propagate_linear_cpu(layer, bounds);
-    };
+    propagate_linear_with_engine_and_f64_deadline(layer, bounds, engine, None)
+}
 
-    match propagate_linear_via_gemm(layer, bounds, engine) {
+/// Shared engine/CPU dispatch carrying the certified-f64 offload policy.
+///
+/// This helper is retained for the unbounded public entry and tests of the
+/// engine fallback. Finite-deadline authority bypasses it entirely because the
+/// generic `GemmEngine` API has no cancellation capability.
+fn propagate_linear_with_engine_and_f64_deadline<'a>(
+    layer: &LinearLayer,
+    bounds: &'a LinearBounds,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
+) -> Result<Cow<'a, LinearBounds>> {
+    let Some(engine) = engine else {
+        return propagate_linear_cpu_with_deadline(layer, bounds, deadline, true);
+    };
+    if engine.forbids_unbounded_cpu_fallback() {
+        return Err(NyError::UnsupportedOp(
+            "bounded Linear CROWN requires the explicit deadline-aware entry".into(),
+        ));
+    }
+
+    match propagate_linear_via_gemm(layer, bounds, engine, deadline) {
         Ok(lb) => Ok(Cow::Owned(lb)),
+        Err(e) if e.is_deadline_exceeded() => Err(e),
         Err(e) => {
             debug!("GEMM engine failed for Linear CROWN backward, falling back to CPU: {e}");
-            propagate_linear_cpu(layer, bounds)
+            propagate_linear_cpu_with_deadline(layer, bounds, deadline, true)
         }
     }
 }
-
-/// Minimum output-row count before a deadline triggers row-chunked backward.
-///
-/// Below this, the single dense `A @ W` GEMM is cheap enough that per-row
-/// deadline granularity is unnecessary; chunking would only add overhead.
-/// Matches the spirit of `DEADLINE_GEMM_ROW_CHUNK` in the Conv2d backward.
-const DEADLINE_LINEAR_ROW_CHUNK: usize = 64;
 
 /// Deadline-aware CROWN backward propagation through a linear layer (#4321).
 ///
@@ -816,146 +2088,49 @@ const DEADLINE_LINEAR_ROW_CHUNK: usize = 64;
 /// seconds with no internal deadline checkpoint, overrunning the verifier's own
 /// `--timeout` and getting killed externally with no JSON verdict.
 ///
-/// When a `deadline` is present and the workload has enough output rows to
-/// matter, the spec rows are processed in bounded chunks. CROWN backward is
-/// row-independent (`new_A[i] = A[i] @ W`, `new_b[i] = A[i] @ bias + b[i]`),
-/// so chunking the output rows and concatenating is **bit-identical** to the
-/// single-pass result — only the abort granularity changes. Between chunks we
-/// check the wall clock and return [`NyError::DeadlineExceeded`] once it passes,
-/// which the graph-CROWN dispatch converts to a graceful per-node IBP fallback
-/// (sound: a timeout never claims Verified).
-///
-/// With no deadline, or for small workloads, this is exactly
-/// [`propagate_linear_with_engine`].
+/// A finite deadline never enters the caller's generic f32 engine or the
+/// process-global engine's ordinary `gemm_f64` method: neither API advertises
+/// bounded dispatch. The certified f64 coefficient path remains CPU-pollable,
+/// but sufficiently large `A @ W` products may use the process-global engine's
+/// explicit [`GemmEngine::gemm_f64_with_deadline`] contract, which retains the
+/// full contraction and bounds each output-tile dispatch. Incoming coefficient
+/// errors are still composed on the separately pollable, outward-rounded CPU
+/// path. With no deadline this is exactly [`propagate_linear_with_engine`].
 pub(crate) fn propagate_linear_with_engine_and_deadline<'a>(
     layer: &LinearLayer,
     bounds: &'a LinearBounds,
     engine: Option<&dyn GemmEngine>,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<Instant>,
 ) -> Result<Cow<'a, LinearBounds>> {
+    let bounded_marker = engine.is_some_and(|engine| engine.forbids_unbounded_cpu_fallback());
+    let bounded_host_engine = bounded_marker
+        && engine.is_some_and(|engine| engine.provides_deadline_pollable_host_gemm());
+    if bounded_marker && !bounded_host_engine {
+        return Err(NyError::UnsupportedOp(
+            "bounded Linear CROWN requires a pollable capped host engine".into(),
+        ));
+    }
     let Some(d) = deadline else {
+        if bounded_host_engine {
+            return Err(NyError::UnsupportedOp(
+                "bounded Linear CROWN requires an explicit finite deadline".into(),
+            ));
+        }
         return propagate_linear_with_engine(layer, bounds, engine);
     };
-
-    let num_outputs = bounds.lower_a().nrows();
-    if num_outputs <= DEADLINE_LINEAR_ROW_CHUNK {
-        // Cheap enough: a single pre-op deadline check suffices. If we are
-        // already past the deadline, bail before launching the GEMM at all.
-        if std::time::Instant::now() >= d {
-            return Err(NyError::DeadlineExceeded(
-                "Linear CROWN backward: per-node deadline exceeded before GEMM".to_string(),
-            ));
-        }
-        return propagate_linear_with_engine(layer, bounds, engine);
+    if Instant::now() >= d {
+        return Err(NyError::DeadlineExceeded(
+            "Linear CROWN backward: deadline exceeded before pollable CPU propagation".to_string(),
+        ));
     }
-
-    // Row-chunked backward: each chunk is an independent slice of output rows.
-    let lower_a = bounds.lower_a();
-    let upper_a = bounds.upper_a();
-    let lower_b = bounds.lower_b();
-    let upper_b = bounds.upper_b();
-    // Certified coefficient-error must be sliced alongside the coefficients so it
-    // is propagated per chunk (#vnncomp-aw-soundness); dropping it would lose the
-    // concretization penalty for those rows.
-    let lower_err = bounds.lower_a_err();
-    let upper_err = bounds.upper_a_err();
-
-    let mut chunks: Vec<LinearBounds> = Vec::new();
-    let mut row_start = 0usize;
-    while row_start < num_outputs {
-        if std::time::Instant::now() >= d {
-            return Err(NyError::DeadlineExceeded(
-                "Linear CROWN backward: per-node deadline exceeded (inter-chunk check)".to_string(),
-            ));
-        }
-        let row_end = (row_start + DEADLINE_LINEAR_ROW_CHUNK).min(num_outputs);
-        let mut chunk_bounds = LinearBounds::new(
-            lower_a
-                .slice(ndarray::s![row_start..row_end, ..])
-                .to_owned(),
-            lower_b.slice(ndarray::s![row_start..row_end]).to_owned(),
-            upper_a
-                .slice(ndarray::s![row_start..row_end, ..])
-                .to_owned(),
-            upper_b.slice(ndarray::s![row_start..row_end]).to_owned(),
-        )?;
-        if let (Some(le), Some(ue)) = (lower_err, upper_err) {
-            chunk_bounds.set_coeff_err(
-                le.slice(ndarray::s![row_start..row_end, ..]).to_owned(),
-                ue.slice(ndarray::s![row_start..row_end, ..]).to_owned(),
-            );
-        }
-        // Each chunk runs the identical engine/CPU GEMM, just on fewer rows.
-        let out = propagate_linear_with_engine(layer, &chunk_bounds, engine)?.into_owned();
-        chunks.push(out);
-        row_start = row_end;
+    let result = propagate_linear_cpu_with_deadline(layer, bounds, Some(d), !bounded_host_engine)?;
+    if Instant::now() >= d {
+        return Err(NyError::DeadlineExceeded(
+            "Linear CROWN backward: deadline exceeded before returning pollable CPU result"
+                .to_string(),
+        ));
     }
-
-    Ok(Cow::Owned(concat_linear_bounds_rows(&chunks)?))
-}
-
-/// Concatenate row-chunked [`LinearBounds`] back into a single result.
-///
-/// All chunks share the same input dimension (column count); only the
-/// output-row count differs. Concatenation along the row axis reproduces the
-/// single-pass layout exactly.
-fn concat_linear_bounds_rows(chunks: &[LinearBounds]) -> Result<LinearBounds> {
-    let first = chunks.first().ok_or_else(|| {
-        NyError::InternalError("concat_linear_bounds_rows: no chunks to concatenate".to_string())
-    })?;
-    let in_features = first.lower_a().ncols();
-    let total_rows: usize = chunks.iter().map(|c| c.lower_a().nrows()).sum();
-
-    let mut lower_a = Array2::<f32>::zeros((total_rows, in_features));
-    let mut upper_a = Array2::<f32>::zeros((total_rows, in_features));
-    let mut lower_b = Array1::<f32>::zeros(total_rows);
-    let mut upper_b = Array1::<f32>::zeros(total_rows);
-    // Certified coefficient-error: concat along rows iff every chunk carries it
-    // (the linear backward always produces it, so this holds on the verdict path).
-    let any_err = chunks.iter().any(|c| c.has_coeff_err());
-    let mut lower_err = Array2::<f32>::zeros((total_rows, in_features));
-    let mut upper_err = Array2::<f32>::zeros((total_rows, in_features));
-
-    let mut row = 0usize;
-    for chunk in chunks {
-        let rows = chunk.lower_a().nrows();
-        lower_a
-            .slice_mut(ndarray::s![row..row + rows, ..])
-            .assign(chunk.lower_a());
-        upper_a
-            .slice_mut(ndarray::s![row..row + rows, ..])
-            .assign(chunk.upper_a());
-        lower_b
-            .slice_mut(ndarray::s![row..row + rows])
-            .assign(chunk.lower_b());
-        upper_b
-            .slice_mut(ndarray::s![row..row + rows])
-            .assign(chunk.upper_b());
-        if any_err {
-            // A chunk without err is exact (err 0); leave its rows zeroed.
-            if let Some(le) = chunk.lower_a_err() {
-                lower_err
-                    .slice_mut(ndarray::s![row..row + rows, ..])
-                    .assign(le);
-            }
-            if let Some(ue) = chunk.upper_a_err() {
-                upper_err
-                    .slice_mut(ndarray::s![row..row + rows, ..])
-                    .assign(ue);
-            }
-        }
-        row += rows;
-    }
-
-    // Chunks may legitimately carry ±Inf bias rows (non-finite #2681 handling);
-    // use new_or_conservative which tolerates that, matching the single-pass path.
-    if any_err {
-        LinearBounds::new_or_conservative_with_err(
-            lower_a, lower_b, upper_a, upper_b, lower_err, upper_err,
-        )
-    } else {
-        LinearBounds::new_or_conservative(lower_a, lower_b, upper_a, upper_b)
-    }
+    Ok(result)
 }
 
 /// GEMM-engine CROWN backward propagation.
@@ -982,6 +2157,7 @@ fn propagate_linear_via_gemm(
     layer: &LinearLayer,
     bounds: &LinearBounds,
     engine: &dyn GemmEngine,
+    deadline: Option<Instant>,
 ) -> Result<LinearBounds> {
     let (num_outputs, bounds_inputs) = (bounds.lower_a().nrows(), bounds.lower_a().ncols());
     let weight_rows = layer.weight.nrows();
@@ -1050,31 +2226,50 @@ fn propagate_linear_via_gemm(
         let upper_faer = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
             bounds.upper_a()[[i, in_start + j]]
         });
-        let (_, lower_s) = aw_f64_with_abssum(&lower_faer, weight_faer);
-        let (_, upper_s) = aw_f64_with_abssum(&upper_faer, weight_faer);
-        let prop_lower = in_lower_err.map(|e| {
-            let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, k| {
-                e[[i, in_start + k]]
-            });
-            mat_mul(&blk, &w_abs)
-        });
-        let prop_upper = in_upper_err.map(|e| {
-            let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, k| {
-                e[[i, in_start + k]]
-            });
-            mat_mul(&blk, &w_abs)
-        });
+        let (lower_reference, lower_s) =
+            aw_f64_with_abssum_and_deadline(&lower_faer, weight_faer, deadline)?;
+        let (upper_reference, upper_s) =
+            aw_f64_with_abssum_and_deadline(&upper_faer, weight_faer, deadline)?;
+        let prop_lower = match in_lower_err {
+            Some(error) => Some(incoming_error_product(
+                error,
+                in_start,
+                layout.out_features,
+                &w_abs,
+                deadline,
+            )?),
+            None => None,
+        };
+        let prop_upper = match in_upper_err {
+            Some(error) => Some(incoming_error_product(
+                error,
+                in_start,
+                layout.out_features,
+                &w_abs,
+                deadline,
+            )?),
+            None => None,
+        };
 
         for i in 0..num_outputs {
             let src_off = i * in_features;
             for j in 0..in_features {
                 let l = new_lower_block[src_off + j];
                 let u = new_upper_block[src_off + j];
-                let l_prop = prop_lower.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                let u_prop = prop_upper.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                // γ_n·S covers BOTH the engine↔a64 and a64↔true gaps (S-scaled).
-                let l_err = next_up_f32((gamma * lower_s[[i, j]] + l_prop) as f32);
-                let u_err = next_up_f32((gamma * upper_s[[i, j]] + u_prop) as f32);
+                let l_prop = prop_lower
+                    .as_ref()
+                    .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
+                let u_prop = prop_upper
+                    .as_ref()
+                    .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
+                // Measure the opaque engine's result against the bit-exact f64
+                // reference. This closes DAZ as well as ordinary accumulation
+                // error; a relative γ·S term alone cannot cover an input
+                // subnormal that the engine flushes before a large multiply.
+                let l_gap = (f32_to_f64_exact(l) - lower_reference[[i, j]]).abs();
+                let u_gap = (f32_to_f64_exact(u) - upper_reference[[i, j]]).abs();
+                let l_err = publish_error_up_normal(l_gap + gamma * lower_s[[i, j]] + l_prop);
+                let u_err = publish_error_up_normal(u_gap + gamma * upper_s[[i, j]] + u_prop);
                 if is_crown_coeff_safe(l) && l_err.is_finite() {
                     new_lower_a[[i, out_start + j]] = l;
                     new_lower_a_err[[i, out_start + j]] = l_err;
@@ -1115,18 +2310,18 @@ fn propagate_linear_via_gemm(
             for i in 0..num_outputs {
                 let mut e = 0.0f64;
                 for j in 0..bias.len() {
-                    e += le[[i, j]] as f64 * (bias[j] as f64).abs();
+                    e = add_coeff_err_bias_product_up(e, le[[i, j]], bias[j]);
                 }
-                lower_bias_contrib[i] -= e;
+                lower_bias_contrib[i] = add_f64_down(lower_bias_contrib[i], -e);
             }
         }
         if let Some(ue) = in_upper_err {
             for i in 0..num_outputs {
                 let mut e = 0.0f64;
                 for j in 0..bias.len() {
-                    e += ue[[i, j]] as f64 * (bias[j] as f64).abs();
+                    e = add_coeff_err_bias_product_up(e, ue[[i, j]], bias[j]);
                 }
-                upper_bias_contrib[i] += e;
+                upper_bias_contrib[i] = add_f64_up(upper_bias_contrib[i], e);
             }
         }
     }
@@ -1376,6 +2571,190 @@ mod aw_f32_sound_tests {
              on a large-k cancellation case (confirms γ_n^f32 is actually applied)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // S2 — the EFT-compensated arm (docs/CONV_CROWN_WALL_DESIGN_2026-07-27.md)
+    // -----------------------------------------------------------------------
+
+    use super::{aw_eft_sound_bound, intersect_enclosure_downgrade_only};
+    use ndarray::arr2;
+
+    /// The f64 reference enclosure `[c64 − γ64·S, c64 + γ64·S]` provably
+    /// contains the exact `A·W`, so a sound enclosure that is orders WIDER —
+    /// the a-posteriori radius runs ~1e7× the f64 half-width on these shapes —
+    /// must contain it too.
+    ///
+    /// SCOPE, stated honestly: this tolerance exceeds `2·half`, so what the
+    /// assertions below actually decide is "the enclosure contains the exact
+    /// `A·W`", not "it contains the f64 interval with room to spare". That is
+    /// the containment property that matters, and it is the same idiom
+    /// `aw_f32_sound_bound_contains_f64_bound` above uses. The *tight*
+    /// statement — `|Σ a·w − value| ≤ err` decided in exact rationals, with
+    /// mutation testing to prove the oracle has teeth — lives in
+    /// `ny-core/tests/eft_certified_error_exact_rational_oracle.rs`, which
+    /// governs the radius this function's arm publishes.
+    fn containment_tol(c64: f64, half: f64) -> f64 {
+        1.0e-9 * (1.0 + c64.abs() + half)
+    }
+
+    /// The intersection is the whole downgrade-only argument. It must never
+    /// widen an endpoint, must ignore a NaN candidate, and must reject —
+    /// wholesale, per entry — a candidate that would invert the interval (which
+    /// can only happen if one arm is unsound; the proven one keeps the entry).
+    #[test]
+    fn intersection_never_widens_and_rejects_broken_candidates() {
+        let base_l = arr2(&[[-1.0f32, -1.0, -1.0, -1.0]]);
+        let base_u = arr2(&[[1.0f32, 1.0, 1.0, 1.0]]);
+
+        // col 0: candidate strictly tighter        -> adopted
+        // col 1: candidate strictly WIDER          -> incumbent kept
+        // col 2: candidate NaN                     -> incumbent kept
+        // col 3: candidate disjoint (would invert) -> incumbent kept
+        let cand_l = arr2(&[[-0.5f32, -9.0, f32::NAN, 5.0]]);
+        let cand_u = arr2(&[[0.5f32, 9.0, f32::NAN, 6.0]]);
+
+        let mut lower = base_l.clone();
+        let mut upper = base_u.clone();
+        intersect_enclosure_downgrade_only(&mut lower, &mut upper, &cand_l, &cand_u);
+
+        assert_eq!((lower[[0, 0]], upper[[0, 0]]), (-0.5, 0.5), "tighter arm");
+        assert_eq!((lower[[0, 1]], upper[[0, 1]]), (-1.0, 1.0), "wider arm");
+        assert_eq!((lower[[0, 2]], upper[[0, 2]]), (-1.0, 1.0), "NaN arm");
+        assert_eq!((lower[[0, 3]], upper[[0, 3]]), (-1.0, 1.0), "disjoint arm");
+
+        // Universal statement: no endpoint ever moved outward.
+        for j in 0..4 {
+            assert!(lower[[0, j]] >= base_l[[0, j]], "lower widened at {j}");
+            assert!(upper[[0, j]] <= base_u[[0, j]], "upper widened at {j}");
+        }
+    }
+
+    /// A shape-mismatched candidate is a refusal, not a panic and not a partial
+    /// application.
+    #[test]
+    fn intersection_ignores_a_shape_mismatched_candidate() {
+        let mut lower = arr2(&[[-1.0f32, -1.0]]);
+        let mut upper = arr2(&[[1.0f32, 1.0]]);
+        let cand_l = arr2(&[[0.0f32]]);
+        let cand_u = arr2(&[[0.0f32]]);
+        intersect_enclosure_downgrade_only(&mut lower, &mut upper, &cand_l, &cand_u);
+        assert_eq!(lower, arr2(&[[-1.0f32, -1.0]]));
+        assert_eq!(upper, arr2(&[[1.0f32, 1.0]]));
+    }
+
+    /// The a-posteriori arm must itself be a SOUND enclosure: it has to contain
+    /// the f64-computed `A·W` (whose own error is `γ_n^f64·S`, subtracted here)
+    /// on the cancellation-heavy regime S2 targets.
+    #[test]
+    fn eft_arm_encloses_the_f64_reference_product() {
+        let cases: &[(usize, usize, usize, f32)] = &[
+            (4, 8, 4, 1.0),
+            (3, 256, 5, 2.0),
+            (2, 1000, 3, 1.0),
+            (4, 300, 4, 1.0e-3),
+            (6, 50, 6, 1.0e3),
+        ];
+        for (idx, &(m, k, p, scale)) in cases.iter().enumerate() {
+            let mut rng = SplitMix64(0x0EF7_0000_0000_0001_u64.wrapping_add(idx as u64));
+            let a = Mat::<f32>::from_fn(m, k, |_, _| rng.signed(scale));
+            let w = Mat::<f32>::from_fn(k, p, |_, _| rng.signed(1.0));
+
+            let (lo, hi) = aw_eft_sound_bound(&a, &w, m, k, p)
+                .expect("the EFT preconditions hold on this target");
+            let (c64, s64) = aw_f64_with_abssum(&a, &w);
+            let g64 = gamma_n_f64(k);
+
+            for i in 0..m {
+                for j in 0..p {
+                    // The exact A·W lies in [c64 − γ64·S, c64 + γ64·S].
+                    let half = g64 * s64[[i, j]];
+                    let tol = containment_tol(c64[[i, j]], half);
+                    let exact_lo = c64[[i, j]] - half;
+                    let exact_hi = c64[[i, j]] + half;
+                    assert!(
+                        f64::from(lo[[i, j]]) <= exact_lo + tol,
+                        "case {idx} [{i},{j}]: EFT lower {} does not enclose {exact_lo:e}",
+                        lo[[i, j]]
+                    );
+                    assert!(
+                        f64::from(hi[[i, j]]) >= exact_hi - tol,
+                        "case {idx} [{i},{j}]: EFT upper {} does not enclose {exact_hi:e}",
+                        hi[[i, j]]
+                    );
+                    assert!(lo[[i, j]] <= hi[[i, j]], "case {idx} [{i},{j}]: inverted");
+                }
+            }
+        }
+    }
+
+    /// End-to-end on the shipped entry point: the gate is DARK by default, and
+    /// arming it can only ever narrow the published enclosure — never widen it,
+    /// never break containment of the f64-proven interval.
+    #[test]
+    fn eft_gate_is_dark_by_default_and_only_ever_narrows() {
+        let _lock = ny_test_utils::env::lock_env();
+        let (m, k, p) = (4usize, 512usize, 4usize);
+        let mut rng = SplitMix64(0xC0FF_EE00_0000_0001);
+        let a = Mat::<f32>::from_fn(m, k, |_, _| rng.signed(1.0));
+        let w = Mat::<f32>::from_fn(k, p, |_, _| rng.signed(1.0));
+
+        let (dark_lo, dark_hi) = {
+            let _off = ny_test_utils::env::ScopedEnvVar::unset("NY_EFT_ERR");
+            aw_f32_sound_bound(&a, &w)
+        };
+        let (armed_lo, armed_hi) = {
+            let _on = ny_test_utils::env::ScopedEnvVar::set("NY_EFT_ERR", "1");
+            aw_f32_sound_bound(&a, &w)
+        };
+
+        let (c64, s64) = aw_f64_with_abssum(&a, &w);
+        let g64 = gamma_n_f64(k);
+        let mut narrowed = 0usize;
+        for i in 0..m {
+            for j in 0..p {
+                // (a) downgrade-only: never wider than dark.
+                assert!(
+                    armed_lo[[i, j]] >= dark_lo[[i, j]] && armed_hi[[i, j]] <= dark_hi[[i, j]],
+                    "[{i},{j}]: arming the gate WIDENED the enclosure"
+                );
+                // (b) still sound: contains the f64-proven interval.
+                let half = g64 * s64[[i, j]];
+                let tol = containment_tol(c64[[i, j]], half);
+                assert!(
+                    f64::from(armed_lo[[i, j]]) <= c64[[i, j]] - half + tol
+                        && f64::from(armed_hi[[i, j]]) >= c64[[i, j]] + half - tol,
+                    "[{i},{j}]: armed enclosure lost containment of the f64 bound"
+                );
+                assert!(
+                    armed_lo[[i, j]] <= armed_hi[[i, j]],
+                    "[{i},{j}]: armed enclosure inverted"
+                );
+                if armed_hi[[i, j]] - armed_lo[[i, j]] < dark_hi[[i, j]] - dark_lo[[i, j]] {
+                    narrowed += 1;
+                }
+            }
+        }
+        // (c) anti-vacuity: on the mixed-sign k=512 regime the a-posteriori arm
+        // must actually be the binding one somewhere, or the channel is inert
+        // and this test proves nothing.
+        assert!(
+            narrowed > 0,
+            "the EFT arm never bound: the channel is inert on its own target regime"
+        );
+    }
+
+    /// The refusal path: a fold that overflows f32 must make the a-posteriori
+    /// arm decline entirely rather than publish a finite radius around a
+    /// non-finite value. `aw_f32_sound_bound` then stands on its a-priori arm.
+    #[test]
+    fn eft_arm_refuses_a_non_finite_fold() {
+        let a = Mat::<f32>::from_fn(1, 2, |_, _| f32::MAX);
+        let w = Mat::<f32>::from_fn(2, 1, |_, _| f32::MAX);
+        assert!(
+            aw_eft_sound_bound(&a, &w, 1, 2, 1).is_none(),
+            "an overflowing fold must fail closed, not publish a radius"
+        );
+    }
 }
 
 /// Parity + soundness for the faer f64 SIMD sub-threshold `aw_f64_with_abssum`
@@ -1384,9 +2763,20 @@ mod aw_f32_sound_tests {
 /// resulting enclosure `est ± γ_n·S` must still contain the exact real `A·W`.
 #[cfg(test)]
 mod faer_f64_aw_tests {
-    use super::{aw_f64_with_abssum, gamma_n_f64};
+    use super::{
+        aw_f64_with_abssum, aw_f64_with_abssum_and_deadline,
+        aw_f64_with_abssum_cpu_deadline_scalar, aw_f64_with_abssum_deadline_via_engine_or_cpu,
+        aw_via_engine_deadline, deadline_f64_accelerator_eligible, f32_to_f64_exact, gamma_n_f64,
+        incoming_error_product, incoming_error_product_deadline, next_up_nonnegative_f64,
+        DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS, SOUND_F64_GEMM_MIN_MACS,
+    };
     use faer::Mat;
+    use ndarray::arr2;
+    use ny_core::{GemmEngine, NyError, Result};
     use ny_tensor::next_up_f32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     /// Dependency-free deterministic PRNG (SplitMix64) — same generator as the
     /// f32-seam oracle so cases reproduce bit-for-bit without a `rand` dev-dep.
@@ -1427,6 +2817,526 @@ mod faer_f64_aw_tests {
             }
         }
         (a64, s)
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct BoundedCall {
+        m: usize,
+        k: usize,
+        p: usize,
+        max_dispatch_macs: usize,
+        a: Vec<f64>,
+        w: Vec<f64>,
+    }
+
+    fn exact_engine_product(m: usize, k: usize, p: usize, a: &[f64], w: &[f64]) -> Vec<f64> {
+        let mut output = vec![0.0; m * p];
+        for i in 0..m {
+            for kk in 0..k {
+                for j in 0..p {
+                    output[i * p + j] += a[i * k + kk] * w[kk * p + j];
+                }
+            }
+        }
+        output
+    }
+
+    #[derive(Default)]
+    struct RecordingDeadlineEngine {
+        calls: Mutex<Vec<BoundedCall>>,
+    }
+
+    impl GemmEngine for RecordingDeadlineEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            panic!("finite-deadline Linear CROWN entered ordinary f32 GEMM")
+        }
+
+        fn gemm_f64(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f64],
+            _b: &[f64],
+        ) -> Result<Vec<f64>> {
+            panic!("finite-deadline Linear CROWN entered ordinary f64 GEMM")
+        }
+
+        fn gemm_f64_with_deadline(
+            &self,
+            m: usize,
+            k: usize,
+            p: usize,
+            a: &[f64],
+            w: &[f64],
+            _deadline: Instant,
+            max_dispatch_macs: usize,
+        ) -> Result<Vec<f64>> {
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .push(BoundedCall {
+                    m,
+                    k,
+                    p,
+                    max_dispatch_macs,
+                    a: a.to_vec(),
+                    w: w.to_vec(),
+                });
+            Ok(exact_engine_product(m, k, p, a, w))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ScriptedOutcome {
+        UnsupportedFirst,
+        OrdinaryFailureFirst,
+        MalformedSecond,
+        NonfiniteSecond,
+        NegativeAbsSumSecond,
+        DeadlineSecond,
+    }
+
+    struct ScriptedDeadlineEngine {
+        outcome: ScriptedOutcome,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedDeadlineEngine {
+        fn new(outcome: ScriptedOutcome) -> Self {
+            Self {
+                outcome,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl GemmEngine for ScriptedDeadlineEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            panic!("deadline fallback entered ordinary f32 GEMM")
+        }
+
+        fn gemm_f64(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f64],
+            _b: &[f64],
+        ) -> Result<Vec<f64>> {
+            panic!("deadline fallback entered ordinary f64 GEMM")
+        }
+
+        fn gemm_f64_with_deadline(
+            &self,
+            m: usize,
+            k: usize,
+            p: usize,
+            a: &[f64],
+            w: &[f64],
+            _deadline: Instant,
+            _max_dispatch_macs: usize,
+        ) -> Result<Vec<f64>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            match (self.outcome, call) {
+                (ScriptedOutcome::UnsupportedFirst, 0) => Err(NyError::UnsupportedOp(
+                    "injected bounded-f64 unsupported".into(),
+                )),
+                (ScriptedOutcome::OrdinaryFailureFirst, 0) => Err(NyError::NumericalInstability(
+                    "injected ordinary engine failure".into(),
+                )),
+                (ScriptedOutcome::MalformedSecond, 1) => {
+                    Ok(vec![0.0; m.saturating_mul(p).saturating_sub(1)])
+                }
+                (ScriptedOutcome::NonfiniteSecond, 1) => Ok(vec![f64::NAN; m * p]),
+                (ScriptedOutcome::NegativeAbsSumSecond, 1) => Ok(vec![-1.0; m * p]),
+                (ScriptedOutcome::DeadlineSecond, 1) => Err(NyError::DeadlineExceeded(
+                    "injected terminal second-product deadline".into(),
+                )),
+                _ => Ok(exact_engine_product(m, k, p, a, w)),
+            }
+        }
+    }
+
+    struct SleepPastDeadlineEngine {
+        calls: AtomicUsize,
+    }
+
+    impl GemmEngine for SleepPastDeadlineEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            panic!("post-deadline test entered ordinary f32 GEMM")
+        }
+
+        fn gemm_f64(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f64],
+            _b: &[f64],
+        ) -> Result<Vec<f64>> {
+            panic!("post-deadline test entered ordinary f64 GEMM")
+        }
+
+        fn gemm_f64_with_deadline(
+            &self,
+            m: usize,
+            _k: usize,
+            p: usize,
+            _a: &[f64],
+            _b: &[f64],
+            _deadline: Instant,
+            _max_dispatch_macs: usize,
+        ) -> Result<Vec<f64>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(vec![0.0; m * p])
+        }
+    }
+
+    fn deadline_engine_fixture() -> (Mat<f32>, Mat<f32>) {
+        let a_vals = [[1.0f32, -2.0, 3.5], [-0.5, 8.0, -16.0]];
+        let w_vals = [[2.0f32, -3.0], [-4.0, 5.0], [6.0, -7.0]];
+        (
+            Mat::<f32>::from_fn(2, 3, |i, j| a_vals[i][j]),
+            Mat::<f32>::from_fn(3, 2, |i, j| w_vals[i][j]),
+        )
+    }
+
+    #[test]
+    fn deadline_f64_aw_policy_offloads_only_large_products() {
+        assert!(!deadline_f64_accelerator_eligible(
+            1,
+            1,
+            SOUND_F64_GEMM_MIN_MACS - 1
+        ));
+        assert!(deadline_f64_accelerator_eligible(
+            1,
+            1,
+            SOUND_F64_GEMM_MIN_MACS
+        ));
+    }
+
+    #[test]
+    fn deadline_engine_uses_two_full_k_bounded_f64_products() {
+        let (a, w) = deadline_engine_fixture();
+        let engine = RecordingDeadlineEngine::default();
+        let (actual_a, actual_s) =
+            aw_via_engine_deadline(&engine, &a, &w, Instant::now() + Duration::from_mins(1))
+                .expect("live bounded engine call")
+                .expect("recording engine should be accepted");
+        let (expected_a, expected_s) = naive_aw(&a, &w);
+
+        assert_eq!(
+            actual_a.as_slice().expect("contiguous A·W"),
+            expected_a.as_slice()
+        );
+        assert_eq!(
+            actual_s.as_slice().expect("contiguous abs sum"),
+            expected_s.as_slice()
+        );
+
+        let calls = engine.calls.lock().expect("recording lock");
+        assert_eq!(calls.len(), 2);
+        for call in calls.iter() {
+            assert_eq!(
+                (call.m, call.k, call.p, call.max_dispatch_macs),
+                (2, 3, 2, DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS)
+            );
+        }
+        assert_eq!(calls[0].a, vec![1.0, -2.0, 3.5, -0.5, 8.0, -16.0]);
+        assert_eq!(calls[0].w, vec![2.0, -3.0, -4.0, 5.0, 6.0, -7.0]);
+        assert_eq!(calls[1].a, vec![1.0, 2.0, 3.5, 0.5, 8.0, 16.0]);
+        assert_eq!(calls[1].w, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn bounded_engine_ordinary_and_malformed_failures_use_pollable_cpu() {
+        let (a, w) = deadline_engine_fixture();
+        // The pollable CPU fallback is single-chunk here, hence bit-identical
+        // to the no-deadline faer twin (see
+        // `deadline_f64_aw_cpu_path_is_bit_identical_to_the_unbounded_faer_twin`).
+        // Any ordinary engine method reached instead of it panics via the fake.
+        let (twin_a, twin_s) = aw_f64_with_abssum(&a, &w);
+        for outcome in [
+            ScriptedOutcome::UnsupportedFirst,
+            ScriptedOutcome::OrdinaryFailureFirst,
+            ScriptedOutcome::MalformedSecond,
+            ScriptedOutcome::NonfiniteSecond,
+            ScriptedOutcome::NegativeAbsSumSecond,
+        ] {
+            let engine = ScriptedDeadlineEngine::new(outcome);
+            let (actual_a, actual_s) = aw_f64_with_abssum_deadline_via_engine_or_cpu(
+                &engine,
+                &a,
+                &w,
+                Instant::now() + Duration::from_mins(1),
+            )
+            .unwrap_or_else(|error| panic!("{outcome:?} should fall back to CPU: {error}"));
+
+            assert_eq!(
+                actual_a.as_slice().expect("contiguous A·W"),
+                twin_a.as_slice().expect("contiguous twin A·W"),
+                "{outcome:?} changed A·W"
+            );
+            assert_eq!(
+                actual_s.as_slice().expect("contiguous abs sum"),
+                twin_s.as_slice().expect("contiguous twin abs sum"),
+                "{outcome:?} changed abs sum"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_engine_deadline_is_terminal_even_after_first_product() {
+        let (a, w) = deadline_engine_fixture();
+        let engine = ScriptedDeadlineEngine::new(ScriptedOutcome::DeadlineSecond);
+        let error = aw_f64_with_abssum_deadline_via_engine_or_cpu(
+            &engine,
+            &a,
+            &w,
+            Instant::now() + Duration::from_mins(1),
+        )
+        .expect_err("second-product deadline must be terminal");
+
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+        assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn bounded_engine_post_deadline_result_is_never_published() {
+        let (a, w) = deadline_engine_fixture();
+        let engine = SleepPastDeadlineEngine {
+            calls: AtomicUsize::new(0),
+        };
+        let error =
+            aw_via_engine_deadline(&engine, &a, &w, Instant::now() + Duration::from_millis(10))
+                .expect_err("post-deadline result must be rejected");
+
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+        assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn expired_or_nonfinite_input_never_launches_bounded_engine() {
+        let (a, w) = deadline_engine_fixture();
+        let engine = RecordingDeadlineEngine::default();
+        let error = aw_via_engine_deadline(
+            &engine,
+            &a,
+            &w,
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("one millisecond fits before now"),
+        )
+        .expect_err("expired deadline must refuse");
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+        assert!(engine.calls.lock().expect("recording lock").is_empty());
+
+        let nonfinite = Mat::<f32>::from_fn(2, 3, |i, j| {
+            if i == 0 && j == 1 {
+                f32::NAN
+            } else {
+                a[(i, j)]
+            }
+        });
+        assert!(aw_via_engine_deadline(
+            &engine,
+            &nonfinite,
+            &w,
+            Instant::now() + Duration::from_mins(1)
+        )
+        .expect("non-finite input should safely decline")
+        .is_none());
+        assert!(engine.calls.lock().expect("recording lock").is_empty());
+    }
+
+    /// The single-chunk deadline arm must be BIT-IDENTICAL to the no-deadline
+    /// faer twin (the b90a9fbf convergence property: same exactly-widened
+    /// operands, same single `mat_mul_f64` pair), and the retained scalar core
+    /// keeps its byte-for-byte pin against the historical naive reduction.
+    #[test]
+    fn deadline_f64_aw_cpu_path_is_bit_identical_to_the_unbounded_faer_twin() {
+        let a_vals = [
+            [1.0f32, -2.0, 3.5, -4.25, 0.0],
+            [-0.5, 8.0, -16.0, 0.25, 2.0],
+        ];
+        let w_vals = [
+            [2.0f32, -3.0, 0.5],
+            [-4.0, 5.0, 0.25],
+            [6.0, -7.0, -0.5],
+            [-8.0, 9.0, 0.75],
+            [10.0, -11.0, -1.0],
+        ];
+        let a = Mat::<f32>::from_fn(2, 5, |i, j| a_vals[i][j]);
+        let w = Mat::<f32>::from_fn(5, 3, |i, j| w_vals[i][j]);
+
+        let (actual_a, actual_s) =
+            aw_f64_with_abssum_and_deadline(&a, &w, Some(Instant::now() + Duration::from_mins(1)))
+                .expect("live deadline should complete");
+        let (twin_a, twin_s) = aw_f64_with_abssum(&a, &w);
+        for i in 0..2 {
+            for j in 0..3 {
+                assert_eq!(
+                    actual_a[[i, j]].to_bits(),
+                    twin_a[[i, j]].to_bits(),
+                    "deadline arm diverged from the no-deadline faer twin at [{i},{j}]"
+                );
+                assert_eq!(
+                    actual_s[[i, j]].to_bits(),
+                    twin_s[[i, j]].to_bits(),
+                    "deadline |A|·|W| diverged from the no-deadline faer twin at [{i},{j}]"
+                );
+            }
+        }
+
+        // The scalar fallback core is the byte-for-byte 6f49a660 loop.
+        let (scalar_a, scalar_s) =
+            aw_f64_with_abssum_cpu_deadline_scalar(&a, &w, Instant::now() + Duration::from_mins(1))
+                .expect("live scalar core");
+        let (expected_a, expected_s) = naive_aw(&a, &w);
+        for i in 0..2 {
+            for j in 0..3 {
+                assert_eq!(
+                    scalar_a[[i, j]].to_bits(),
+                    expected_a[i * 3 + j].to_bits(),
+                    "scalar core A·W reduction order changed at [{i},{j}]"
+                );
+                assert_eq!(
+                    scalar_s[[i, j]].to_bits(),
+                    expected_s[i * 3 + j].to_bits(),
+                    "scalar core |A|·|W| reduction order changed at [{i},{j}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_f64_aw_expired_fails_closed() {
+        let a = Mat::<f32>::from_fn(2, 3, |i, j| (i * 3 + j + 1) as f32);
+        let w = Mat::<f32>::from_fn(3, 2, |i, j| (i * 2 + j + 1) as f32);
+        let error = aw_f64_with_abssum_and_deadline(
+            &a,
+            &w,
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("one second fits before the current instant"),
+            ),
+        )
+        .expect_err("expired deadline must refuse certified f64 work");
+        assert!(
+            matches!(error, NyError::DeadlineExceeded(_)),
+            "expected DeadlineExceeded, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn incoming_error_accumulator_rounds_every_addition_upward() {
+        // 2^-54 is below half an f64 ULP at 1.0, so round-to-nearest drops it.
+        // The per-add successor must nevertheless enclose the exact real sum.
+        let term = 2f64.powi(-54);
+        assert_eq!(1.0 + term, 1.0);
+        let enclosed = next_up_nonnegative_f64(1.0 + term);
+        assert!(enclosed > 1.0 + term);
+        assert_eq!(enclosed, f64::from_bits(1.0f64.to_bits() + 1));
+        assert_eq!(next_up_nonnegative_f64(f64::NAN), f64::INFINITY);
+        assert_eq!(
+            next_up_nonnegative_f64(f64::from_bits(7)).to_bits(),
+            8,
+            "subnormal classification must not depend on DAZ"
+        );
+        assert_eq!(
+            next_up_nonnegative_f64(-f64::from_bits(1)),
+            f64::INFINITY,
+            "invalid negative errors must fail closed"
+        );
+    }
+
+    #[test]
+    fn incoming_error_deadline_product_is_outward_and_pollable() {
+        let tiny = 2f32.powi(-27);
+        let error = arr2(&[[99.0f32, 1.0, tiny, tiny]]);
+        let weights = Mat::<f32>::from_fn(3, 2, |k, j| {
+            if j == 1 {
+                0.0
+            } else if k == 0 {
+                1.0
+            } else {
+                tiny
+            }
+        });
+        let result = incoming_error_product_deadline(
+            &error,
+            1,
+            3,
+            &weights,
+            Instant::now() + Duration::from_mins(1),
+        )
+        .expect("live finite-deadline incoming-error product");
+
+        assert!(
+            f64::from(result[[0, 0]]) >= 1.0 + f64::EPSILON,
+            "the outward result must cover terms lost by an ordinary f64 left fold"
+        );
+        assert_eq!(result[[0, 1]], 0.0);
+
+        let error = incoming_error_product_deadline(
+            &error,
+            1,
+            3,
+            &weights,
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("one millisecond fits before the current instant"),
+        )
+        .expect_err("expired incoming-error composition must refuse");
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn incoming_error_product_rejects_negative_subnormal_and_preserves_positive_one() {
+        let weights = Mat::<f32>::from_fn(1, 1, |_i, _j| 2.0_f32.powi(120));
+
+        let invalid = arr2(&[[f32::from_bits(0x8000_0001)]]);
+        let poisoned =
+            incoming_error_product(&invalid, 0, 1, &weights, None).expect("valid product geometry");
+        assert_eq!(poisoned[[0, 0]], f32::INFINITY);
+
+        let positive = arr2(&[[f32::from_bits(1)]]);
+        let preserved = incoming_error_product(&positive, 0, 1, &weights, None)
+            .expect("valid product geometry");
+        assert!(
+            f32_to_f64_exact(preserved[[0, 0]]) >= 2.0_f64.powi(-29),
+            "positive subnormal error was lost: {}",
+            preserved[[0, 0]]
+        );
+
+        let coefficient = Mat::<f32>::from_fn(1, 1, |_i, _j| f32::from_bits(1));
+        let (product, absolute_sum) = aw_f64_with_abssum(&coefficient, &weights);
+        assert_eq!(product[[0, 0]], 2.0_f64.powi(-29));
+        assert_eq!(absolute_sum[[0, 0]], 2.0_f64.powi(-29));
     }
 
     /// Kahan–Babuška–Neumaier compensated sum — a high-precision reference whose
@@ -1585,5 +3495,1154 @@ mod faer_f64_aw_tests {
             "a zero-width enclosure must exclude the exact A·W somewhere (confirms the \
              enclosure width is load-bearing, i.e. the containment check is non-vacuous)"
         );
+    }
+}
+
+#[cfg(test)]
+mod f32_abssum_inflation_conditioning_tests {
+    use super::{f32_abssum_inflation, gamma_n_f32};
+    use num_rational::BigRational;
+    use num_traits::One;
+
+    /// EXACT `1/(1 - γ_k^f32)` as a rational, with no float in the oracle.
+    /// `γ_k = d/(1-d)`, `d = k·2^-24`, so `1/(1-γ_k) = (1-d)/(1-2d)`.
+    fn exact_tight_factor(k: usize) -> BigRational {
+        let u = BigRational::new(1.into(), (1u64 << 24).into());
+        let d = BigRational::from_integer(k.into()) * u;
+        let one = BigRational::one();
+        (one.clone() - d.clone()) / (one - BigRational::from_integer(2.into()) * d)
+    }
+
+    /// The OLD body — kept verbatim so the regression it caused stays visible.
+    fn old_form(k: usize) -> f64 {
+        (1.0 / (1.0 - gamma_n_f32(k))) * (1.0 + 2f64.powi(-40))
+    }
+
+    /// #f32-abssum-inflation-conditioning: the shipped factor must DOMINATE the
+    /// exact tight factor at every admissible k, including the ill-conditioned
+    /// region just under 2^23 where the old `1/(1-γ)` form cancelled.
+    #[test]
+    fn inflation_dominates_the_exact_factor_including_near_two_pow_23() {
+        let mut checked = 0usize;
+        for k in [
+            1usize,
+            2,
+            7,
+            47,
+            1024,
+            65_536,
+            1_000_000,
+            8_000_000,
+            8_300_000,
+            8_388_000,
+            8_388_582,
+            8_388_600,
+            (1 << 23) - 1,
+        ] {
+            let Some(f_hat) = f32_abssum_inflation(k) else {
+                continue;
+            };
+            let exact = exact_tight_factor(k);
+            let got = BigRational::from_float(f_hat).expect("finite factor");
+            assert!(
+                got >= exact,
+                "k={k}: shipped F_hat {f_hat} is BELOW the exact tight factor — \
+                 an under-bound here under-charges S and can publish a wrongly tight bound"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 10,
+            "coverage: only {checked} admissible k values"
+        );
+    }
+
+    /// The defect this repair fixes was real: the old form lands BELOW the exact
+    /// factor at k = 8_388_582 (measured under-round 7.39e-12 relative). Pinning
+    /// it stops anyone "simplifying" the stable form back to the cancelling one.
+    #[test]
+    fn the_old_cancelling_form_was_measurably_below_the_exact_factor() {
+        let k = 8_388_582usize;
+        let exact = exact_tight_factor(k);
+        let old = BigRational::from_float(old_form(k)).expect("finite");
+        assert!(
+            old < exact,
+            "the old 1/(1-gamma) form is expected to UNDER-round here; if this \
+             now passes, the conditioning premise changed and the repair needs review"
+        );
+        let new =
+            BigRational::from_float(f32_abssum_inflation(k).expect("admissible")).expect("finite");
+        assert!(
+            new >= exact,
+            "the repaired form must dominate where the old one did not"
+        );
+    }
+
+    /// The k >= 2^23 guard still refuses rather than returning a negative or
+    /// non-finite factor (a negative stored error would be a false VERIFIED).
+    #[test]
+    fn guard_refuses_at_and_above_two_pow_23() {
+        for k in [1usize << 23, (1 << 23) + 1, 1 << 24, usize::MAX / 2] {
+            assert!(
+                f32_abssum_inflation(k).is_none(),
+                "k={k} must be refused so the caller takes the exact f64 abs-sum path"
+            );
+        }
+    }
+}
+
+/// Engine-aware sound-f64 admission floor (#b4-engine-aware-macs-floor).
+///
+/// Three obligations, in order of importance:
+///   1. GATE OFF ⇒ byte-identical admission for EVERY engine (the shared
+///      `SOUND_F64_GEMM_MIN_MACS` policy is untouched, four arcs depend on it);
+///   2. GATE ON ⇒ the faer override is what decides, including its measured
+///      pathological declines, and an engine WITHOUT an override still gets the
+///      historical constant;
+///   3. the band the gate newly opens is still a valid enclosure — checked
+///      against an EXACT rational oracle, not by eyeballing widths.
+#[cfg(test)]
+mod engine_aware_macs_floor_tests {
+    use super::{
+        aw_f64_with_abssum_cpu_deadline_scalar, aw_f64_with_abssum_deadline_via_engine_or_cpu,
+        aw_via_engine_deadline, deadline_f64_accelerator_eligible, deadline_f64_engine_admits,
+        engine_aware_macs_floor_armed, gamma_n_f64, set_engine_aware_macs_floor_for_test,
+        ENGINE_AWARE_ABSOLUTE_MIN_MACS, SOUND_F64_GEMM_MIN_MACS,
+    };
+    use crate::faer_parallelism::FaerCpuGemmEngine;
+    use faer::Mat;
+    use num_rational::BigRational;
+    use num_traits::Signed;
+    use ny_core::{GemmEngine, NyError, Result, SoundF64GemmAdmission};
+    use ny_tensor::next_up_f32;
+    use std::time::{Duration, Instant};
+
+    /// An engine that overrides NOTHING relevant — the stand-in for cuBLAS and
+    /// every other existing backend. Its admission must stay the constant.
+    struct UndeclaredEngine;
+    impl GemmEngine for UndeclaredEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            Err(NyError::UnsupportedOp("test engine".into()))
+        }
+    }
+
+    /// Counts bounded-f64 dispatches while delegating to the real faer engine —
+    /// the non-vacuity witness that the engine path was actually taken.
+    #[derive(Default)]
+    struct CountingFaerEngine {
+        bounded_f64_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl GemmEngine for CountingFaerEngine {
+        fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+            FaerCpuGemmEngine.gemm_f32(m, k, n, a, b)
+        }
+        fn gemm_f64_with_deadline(
+            &self,
+            m: usize,
+            k: usize,
+            n: usize,
+            a: &[f64],
+            b: &[f64],
+            deadline: Instant,
+            max_dispatch_macs: usize,
+        ) -> Result<Vec<f64>> {
+            self.bounded_f64_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            FaerCpuGemmEngine.gemm_f64_with_deadline(m, k, n, a, b, deadline, max_dispatch_macs)
+        }
+        fn sound_f64_deadline_admission(&self) -> SoundF64GemmAdmission {
+            FaerCpuGemmEngine.sound_f64_deadline_admission()
+        }
+    }
+
+    /// A deliberately over-eager declaration: it asks for everything. The
+    /// engine-independent hard floor must still refuse trivially small products.
+    struct GreedyEngine;
+    impl GemmEngine for GreedyEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            Err(NyError::UnsupportedOp("test engine".into()))
+        }
+        fn sound_f64_deadline_admission(&self) -> SoundF64GemmAdmission {
+            SoundF64GemmAdmission {
+                min_macs: 0,
+                min_rows: 0,
+                min_contraction: 0,
+                min_columns: 0,
+                small_contraction_below: 0,
+                small_contraction_max_output: usize::MAX,
+            }
+        }
+    }
+
+    /// Every shape in the B4 crossover + guard tables, plus the historical
+    /// boundary. `(m, k, p)`.
+    const SHAPE_GRID: &[(usize, usize, usize)] = &[
+        // sub-crossover / thin
+        (1, 16, 16),
+        (2, 16, 16),
+        (9, 8, 8),
+        (4, 16, 16),
+        (18, 8, 8),
+        (2, 32, 32),
+        (1, 64, 64),
+        // measured engine wins, all currently gated out
+        (9, 16, 16),
+        (9, 32, 32),
+        (18, 32, 32),
+        (9, 64, 64),
+        (18, 64, 64),
+        (9, 128, 128),
+        (18, 128, 128),
+        (9, 256, 256),
+        (64, 256, 256),
+        (128, 256, 256),
+        (200, 256, 256),
+        (63, 512, 512),
+        // the historical floor itself
+        (64, 512, 512),
+        (1, 4096, 4096),
+        (512, 256, 256),
+        (2048, 512, 512),
+        // measured pathologies
+        (4, 1, 4),
+        (9, 1, 9),
+        (64, 1, 64),
+        (4096, 1, 4096),
+        (64, 2, 64),
+        (256, 2, 256),
+        (1024, 2, 1024),
+        (131072, 2, 64),
+        (256, 4, 256),
+        (64, 4, 64),
+        (1024, 4, 1024),
+        (2048, 4, 2048),
+        (1, 512, 512),
+        (1, 1048576, 16),
+        // huge-k, NOT pathological on faer
+        (4, 4194304, 1),
+        (16, 1048576, 1),
+        (4096, 4096, 1),
+    ];
+
+    fn constant_policy(m: usize, k: usize, p: usize) -> bool {
+        m.saturating_mul(k).saturating_mul(p) >= SOUND_F64_GEMM_MIN_MACS
+    }
+
+    /// OBLIGATION 1. With the gate unset, the engine is irrelevant: the faer
+    /// engine, an undeclared engine, and a greedy engine all reproduce the
+    /// historical constant on every shape.
+    #[test]
+    fn gate_off_admission_is_byte_identical_to_the_shared_constant() {
+        set_engine_aware_macs_floor_for_test(Some(false));
+        assert!(!engine_aware_macs_floor_armed());
+        for &(m, k, p) in SHAPE_GRID {
+            let want = constant_policy(m, k, p);
+            assert_eq!(
+                deadline_f64_accelerator_eligible(m, k, p),
+                want,
+                "{m}x{k}x{p}: the shared constant predicate itself moved"
+            );
+            for (name, engine) in [
+                ("faer", &FaerCpuGemmEngine as &dyn GemmEngine),
+                ("undeclared", &UndeclaredEngine as &dyn GemmEngine),
+                ("greedy", &GreedyEngine as &dyn GemmEngine),
+            ] {
+                assert_eq!(
+                    deadline_f64_engine_admits(engine, m, k, p),
+                    want,
+                    "gate OFF, engine={name}, {m}x{k}x{p}: admission diverged from the constant"
+                );
+            }
+        }
+        set_engine_aware_macs_floor_for_test(None);
+    }
+
+    /// OBLIGATION 1 (end to end). Gate off, a sub-threshold product must be
+    /// BIT-IDENTICAL to the pollable CPU reduction — i.e. no engine was even
+    /// consulted, whatever is installed process-globally.
+    #[test]
+    fn gate_off_subthreshold_result_is_bit_identical_to_the_cpu_reduction() {
+        set_engine_aware_macs_floor_for_test(Some(false));
+        let (a, w) = random_operands(9, 64, 64, 0x51D2_A77E);
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let (gated_a, gated_s) = super::aw_f64_with_abssum_and_deadline(&a, &w, Some(deadline))
+            .expect("sub-threshold deadline product");
+        let (cpu_a, cpu_s) =
+            // Review defect 7: compare against the SCALAR core, not the faer
+            // path. Once the deadline arm became faer-backed, a faer-backed
+            // engine being consulted produced IDENTICAL bits and this oracle
+            // silently stopped being able to detect it; the scalar fallback is
+            // retained precisely to keep this check independent.
+            aw_f64_with_abssum_cpu_deadline_scalar(&a, &w, deadline).expect("cpu reduction");
+        for (lhs, rhs, label) in [(&gated_a, &cpu_a, "A·W"), (&gated_s, &cpu_s, "S")] {
+            for (i, (x, y)) in lhs.iter().zip(rhs.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "gate OFF {label}[{i}]: {x:e} != {y:e} — an engine was consulted"
+                );
+            }
+        }
+        set_engine_aware_macs_floor_for_test(None);
+    }
+
+    /// OBLIGATION 2a. Armed, the FAER declaration decides — and it opens
+    /// exactly the measured-win band while declining every measured pathology.
+    #[test]
+    fn armed_gate_uses_the_measured_faer_declaration() {
+        set_engine_aware_macs_floor_for_test(Some(true));
+        let faer = &FaerCpuGemmEngine as &dyn GemmEngine;
+
+        // Newly opened: measured engine WINS that the 1<<24 constant gated out.
+        for &(m, k, p, speedup) in &[
+            (4usize, 16usize, 16usize, 1.29f64),
+            (9, 16, 16, 1.83),
+            (9, 32, 32, 2.71),
+            (18, 32, 32, 3.70),
+            (9, 64, 64, 3.17),
+            (18, 128, 128, 4.96),
+            (64, 256, 256, 7.13),
+            (128, 256, 256, 12.72),
+            (200, 256, 256, 17.18),
+            (63, 512, 512, 16.49),
+            (256, 4, 256, 1.789),
+            (64, 4, 64, 1.704),
+            (4, 4194304, 1, 7.450),
+            (16, 1048576, 1, 9.386),
+        ] {
+            assert!(
+                !constant_policy(m, k, p) || m * k * p >= SOUND_F64_GEMM_MIN_MACS,
+                "{m}x{k}x{p}: grid bookkeeping"
+            );
+            assert!(
+                deadline_f64_engine_admits(faer, m, k, p),
+                "{m}x{k}x{p} (measured {speedup}x engine win) must be admitted when armed"
+            );
+        }
+
+        // Declined: every measured LOSS, whatever its MAC count.
+        for &(m, k, p, speedup, why) in &[
+            (4usize, 1usize, 4usize, 0.001f64, "k==1 catastrophic"),
+            (9, 1, 9, 0.003, "k==1 catastrophic"),
+            (64, 1, 64, 0.027, "k==1 catastrophic"),
+            (1024, 1, 1024, 0.236, "k==1 catastrophic"),
+            (64, 2, 64, 0.780, "k==2"),
+            (256, 2, 256, 0.656, "k==2"),
+            (1024, 2, 1024, 0.437, "k==2"),
+            (131072, 2, 64, 0.428, "k==2, large output"),
+            (1024, 4, 1024, 0.812, "small k, large output"),
+            (2048, 4, 2048, 0.599, "small k, large output"),
+            (1, 32, 32, 0.535, "m==1"),
+            (1, 512, 512, 0.555, "m==1"),
+            (1, 1048576, 16, 0.630, "m==1"),
+            (2, 16, 16, 0.79, "thin m"),
+            (1, 64, 64, 0.55, "m==1"),
+            (9, 8, 8, 1.71, "below the 1024-MAC crossover bracket"),
+        ] {
+            assert!(
+                !deadline_f64_engine_admits(faer, m, k, p),
+                "{m}x{k}x{p} ({why}, measured {speedup}x) must stay on the CPU path"
+            );
+        }
+
+        // Large products the engine WINS stay admitted.
+        for &(m, k, p, speedup) in &[
+            (64usize, 512usize, 512usize, 15.36f64),
+            (512, 256, 256, 20.07),
+            (2048, 512, 512, 22.43),
+            (4096, 4096, 1, 2.865),
+        ] {
+            assert!(constant_policy(m, k, p), "{m}x{k}x{p}: grid bookkeeping");
+            assert!(
+                deadline_f64_engine_admits(faer, m, k, p),
+                "{m}x{k}x{p} (measured {speedup}x) must remain admitted"
+            );
+        }
+
+        // THE OTHER DIRECTION. These are AT OR ABOVE the shared constant — so
+        // they are dispatched to the engine TODAY — and every one of them is a
+        // measured LOSS. Armed, the declaration declines them; unset, they are
+        // untouched (asserted below).
+        for &(m, k, p, speedup, why) in &[
+            (4096usize, 1usize, 4096usize, 0.132f64, "k==1 at 16.7M MACs"),
+            (65536, 1, 256, 0.182, "k==1 at 16.7M MACs"),
+            (4194304, 1, 4, 0.426, "k==1, unbounded-arm analogue"),
+            (131072, 2, 64, 0.428, "k==2 at 16.7M MACs"),
+            (2048, 4, 2048, 0.599, "small k, large output, 16.7M MACs"),
+            (1, 4096, 4096, 0.765, "m==1 at 16.7M MACs"),
+            (1, 262144, 64, 0.712, "m==1 at 16.7M MACs"),
+            (1, 1048576, 16, 0.630, "m==1 at 16.7M MACs"),
+            (1, 8192, 8192, 0.83, "m==1 at 67M MACs"),
+        ] {
+            assert!(
+                constant_policy(m, k, p),
+                "{m}x{k}x{p}: this case only means something if the constant admits it"
+            );
+            assert!(
+                !deadline_f64_engine_admits(faer, m, k, p),
+                "{m}x{k}x{p} ({why}, measured {speedup}x) must be declined when armed"
+            );
+            set_engine_aware_macs_floor_for_test(Some(false));
+            assert!(
+                deadline_f64_engine_admits(faer, m, k, p),
+                "{m}x{k}x{p} must stay admitted with the gate unset — the default is preserved"
+            );
+            set_engine_aware_macs_floor_for_test(Some(true));
+        }
+        set_engine_aware_macs_floor_for_test(None);
+    }
+
+    /// OBLIGATION 2b. Armed, an engine that does not override its declaration
+    /// (cuBLAS and friends) keeps the 1<<24 constant exactly.
+    #[test]
+    fn armed_gate_keeps_the_constant_for_engines_without_a_declaration() {
+        set_engine_aware_macs_floor_for_test(Some(true));
+        let undeclared = &UndeclaredEngine as &dyn GemmEngine;
+        assert_eq!(
+            UndeclaredEngine.sound_f64_deadline_admission(),
+            SoundF64GemmAdmission::CONSTANT_FLOOR
+        );
+        for &(m, k, p) in SHAPE_GRID {
+            assert_eq!(
+                deadline_f64_engine_admits(undeclared, m, k, p),
+                constant_policy(m, k, p),
+                "armed, undeclared engine, {m}x{k}x{p}: the default declaration must be the constant"
+            );
+        }
+        set_engine_aware_macs_floor_for_test(None);
+    }
+
+    /// OBLIGATION 2c (fail closed). No declaration, however greedy, may open
+    /// admission below the engine-independent hard floor.
+    #[test]
+    fn no_declaration_opens_below_the_engine_independent_hard_floor() {
+        set_engine_aware_macs_floor_for_test(Some(true));
+        let greedy = &GreedyEngine as &dyn GemmEngine;
+        for &(m, k, p) in &[
+            (1usize, 1usize, 1usize),
+            (2, 2, 2),
+            (4, 4, 4),
+            (8, 8, 7),
+            (1, 511, 1),
+        ] {
+            assert!(
+                m * k * p < ENGINE_AWARE_ABSOLUTE_MIN_MACS,
+                "{m}x{k}x{p}: grid bookkeeping"
+            );
+            assert!(
+                !deadline_f64_engine_admits(greedy, m, k, p),
+                "{m}x{k}x{p} is below the hard floor and must be refused despite the declaration"
+            );
+        }
+        // A zeroed declaration must not admit a degenerate operand either.
+        assert!(!deadline_f64_engine_admits(greedy, 0, 4096, 4096));
+        assert!(!deadline_f64_engine_admits(greedy, 4096, 0, 4096));
+        set_engine_aware_macs_floor_for_test(None);
+    }
+
+    /// The `ny-core` default declaration and the shared `ny-propagate` constant
+    /// are the same policy, pointwise.
+    #[test]
+    fn constant_floor_declaration_reproduces_the_shared_constant() {
+        assert_eq!(
+            SOUND_F64_GEMM_MIN_MACS,
+            ny_core::SOUND_F64_GEMM_DEFAULT_MIN_MACS
+        );
+        for &(m, k, p) in SHAPE_GRID {
+            assert_eq!(
+                SoundF64GemmAdmission::CONSTANT_FLOOR.admits(m, k, p),
+                constant_policy(m, k, p),
+                "{m}x{k}x{p}"
+            );
+        }
+    }
+
+    fn random_operands(m: usize, k: usize, p: usize, seed: u64) -> (Mat<f32>, Mat<f32>) {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let z = z ^ (z >> 31);
+            let u = (z >> 40) as f32 / (1u64 << 24) as f32;
+            (u * 2.0 - 1.0) * 1.5
+        };
+        let a: Vec<f32> = (0..m * k).map(|_| next()).collect();
+        let w: Vec<f32> = (0..k * p).map(|_| next()).collect();
+        (
+            Mat::<f32>::from_fn(m, k, |i, j| a[i * k + j]),
+            Mat::<f32>::from_fn(k, p, |i, j| w[i * p + j]),
+        )
+    }
+
+    /// EXACT rational reference for one output entry: `f32 × f32` is exact in
+    /// f64 (24+24 = 48 < 53 significand bits), so each product converts to a
+    /// BigRational with no loss and the sum is the true real value.
+    fn exact_entry(a: &Mat<f32>, w: &Mat<f32>, i: usize, j: usize) -> (BigRational, BigRational) {
+        let k = a.ncols();
+        let mut sum = BigRational::from_integer(0.into());
+        let mut abs_sum = BigRational::from_integer(0.into());
+        for kk in 0..k {
+            let product = f64::from(a[(i, kk)]) * f64::from(w[(kk, j)]);
+            let exact = BigRational::from_float(product).expect("finite exact product");
+            abs_sum += exact.clone().abs();
+            sum += exact;
+        }
+        (sum, abs_sum)
+    }
+
+    /// OBLIGATION 3 — THE MOAT. For shapes the armed gate NEWLY admits, the
+    /// engine path's published enclosure must contain the exact real `A·W`
+    /// (exact-rational oracle), its `S` must remain a valid certificate basis,
+    /// and its half-width must not collapse relative to the CPU path's.
+    #[test]
+    fn newly_admitted_band_encloses_the_exact_product() {
+        set_engine_aware_macs_floor_for_test(Some(true));
+        let counting = CountingFaerEngine::default();
+        let faer = &counting as &dyn GemmEngine;
+        let deadline = Instant::now() + Duration::from_mins(2);
+        let mut checked = 0usize;
+        let mut reordered = 0usize;
+
+        for (case, &(m, k, p)) in [
+            (4usize, 16usize, 16usize),
+            (9, 64, 64),
+            (18, 128, 128),
+            (256, 4, 256),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !constant_policy(m, k, p),
+                "{m}x{k}x{p} must be BELOW the historical constant for this test to mean anything"
+            );
+            assert!(
+                deadline_f64_engine_admits(faer, m, k, p),
+                "{m}x{k}x{p} must be newly admitted when armed"
+            );
+
+            let (a, w) = random_operands(m, k, p, 0x2026_0810 ^ (case as u64) << 17);
+            let (engine_aw, engine_s) = aw_via_engine_deadline(faer, &a, &w, deadline)
+                .expect("bounded engine call")
+                .expect("faer engine accepts this shape");
+            let (cpu_aw, cpu_s) =
+                // Review defect 7: compare against the SCALAR core, not the faer
+            // path. Once the deadline arm became faer-backed, a faer-backed
+            // engine being consulted produced IDENTICAL bits and this oracle
+            // silently stopped being able to detect it; the scalar fallback is
+            // retained precisely to keep this check independent.
+            aw_f64_with_abssum_cpu_deadline_scalar(&a, &w, deadline).expect("cpu reduction");
+            // What production would actually run for this shape when armed.
+            let (routed_aw, routed_s) =
+                aw_f64_with_abssum_deadline_via_engine_or_cpu(faer, &a, &w, deadline)
+                    .expect("routed product");
+
+            let gamma = gamma_n_f64(k);
+            assert!(gamma.is_finite() && gamma > 0.0);
+            let tiny = 8.0 * f64::from(f32::MIN_POSITIVE);
+
+            for i in 0..m {
+                for j in 0..p {
+                    let ea = engine_aw[[i, j]];
+                    let es = engine_s[[i, j]];
+                    assert_eq!(ea.to_bits(), routed_aw[[i, j]].to_bits());
+                    assert_eq!(es.to_bits(), routed_s[[i, j]].to_bits());
+                    if ea.to_bits() != cpu_aw[[i, j]].to_bits() {
+                        reordered += 1;
+                    }
+
+                    let (exact_c, exact_p) = exact_entry(&a, &w, i, j);
+                    let exact_c_f = rational_to_f64(&exact_c);
+                    let exact_p_f = rational_to_f64(&exact_p);
+
+                    // (1) the certificate the caller charges actually covers the
+                    // engine's accumulation error against the EXACT sum.
+                    assert!(
+                        (ea - exact_c_f).abs() <= gamma * es + tiny,
+                        "case {case} [{i},{j}]: engine A·W={ea:e} exact={exact_c_f:e} \
+                         err={:e} > gamma*S={:e}",
+                        (ea - exact_c_f).abs(),
+                        gamma * es
+                    );
+                    // (2) S is a valid basis — it never under-counts the exact
+                    // abs-sum by more than its own f64 accumulation error.
+                    assert!(
+                        es >= exact_p_f * (1.0 - gamma) - tiny,
+                        "case {case} [{i},{j}]: engine S={es:e} under-counts P={exact_p_f:e}"
+                    );
+                    // (3) the PUBLISHED enclosure contains the exact real value.
+                    let stored = ea as f32;
+                    let cast_err = (ea - f64::from(stored)).abs();
+                    let err = f64::from(next_up_f32((cast_err + gamma * es) as f32));
+                    let lo = f64::from(stored) - err;
+                    let hi = f64::from(stored) + err;
+                    assert!(
+                        lo <= exact_c_f && exact_c_f <= hi,
+                        "case {case} [{i},{j}]: published [{lo:e},{hi:e}] excludes exact \
+                         {exact_c_f:e}"
+                    );
+                    // (4) NO NARROWING. Bit-equal widths are unsatisfiable for a
+                    // reordering accelerator, so the provable statement is that
+                    // the engine's half-width cannot fall outside the shared
+                    // certificate envelope of the CPU path's.
+                    let cpu_es = cpu_s[[i, j]];
+                    assert!(
+                        (es - cpu_es).abs() <= gamma * (es + cpu_es) + tiny,
+                        "case {case} [{i},{j}]: engine S={es:e} collapsed vs cpu S={cpu_es:e}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+        // NON-VACUITY: 4 shapes × 2 products (A·W and |A|·|W|) × 2 routes
+        // exercised (`aw_via_engine_deadline` directly, then the production
+        // router) — the engine really ran, this is not a silent CPU fallback.
+        let dispatches = counting
+            .bounded_f64_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            dispatches, 16,
+            "expected 16 bounded f64 engine dispatches, got {dispatches}"
+        );
+        // How often faer's blocked accumulation differs bitwise from the scalar
+        // loop. NOT asserted non-zero: at these contraction widths faer's
+        // micro-kernel can accumulate in the same k order, so bit-equality is a
+        // legitimate (and stronger) outcome. Reported for the record.
+        println!(
+            "engine-vs-cpu bitwise differences: {reordered} of {checked} entries \
+             across {dispatches} engine dispatches"
+        );
+        set_engine_aware_macs_floor_for_test(None);
+    }
+
+    fn rational_to_f64(value: &BigRational) -> f64 {
+        use num_traits::ToPrimitive;
+        value.to_f64().expect("exact reference fits f64 range")
+    }
+}
+
+/// Deadline-scoped rounding-discipline tests. They pin:
+///   (a) the production stepped enclosure and finite/unbounded BIT-PARITY;
+///   (b) the withdrawn dual candidate's standalone certificate and its
+///       quantization to the same production f32 value at n = 4096;
+///   (c) the chunked-faer `A·W` certificate and scratch admission boundary;
+///   (d) the mid-loop typed-deadline aborts.
+#[cfg(test)]
+mod deadline_rounding_discipline_tests {
+    use super::{
+        aw_f64_with_abssum, aw_f64_with_abssum_and_deadline,
+        aw_f64_with_abssum_cpu_deadline_with_chunk_macs, deadline_aw_faer_owned_scratch_bytes,
+        deadline_aw_faer_rows_per_chunk, f32_to_f64_exact, faer_f64_padded_row_capacity,
+        gamma_n_f64, incoming_error_dual_factors, incoming_error_dual_upper,
+        incoming_error_product, incoming_error_product_with_poll_quantum, next_up_nonnegative_f64,
+        nonnegative_f32_error_or_infinity, publish_error_up_normal, DEADLINE_AW_FAER_CHUNK_MACS,
+        DEADLINE_AW_FAER_MAX_SCRATCH_BYTES,
+    };
+    use faer::Mat;
+    use ndarray::Array2;
+    use num_rational::BigRational;
+    use num_traits::{Signed, ToPrimitive};
+    use ny_core::NyError;
+    use ny_tensor::next_up_f32;
+    use std::time::{Duration, Instant};
+
+    /// Dependency-free deterministic PRNG (SplitMix64) — the same generator as
+    /// the sibling oracle modules so cases reproduce bit-for-bit.
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        /// Uniform f32 in `[-scale, scale]`.
+        fn signed(&mut self, scale: f32) -> f32 {
+            let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
+            (u * 2.0 - 1.0) * scale
+        }
+        /// Non-negative f32 with a MIXED exponent in `[2^-40, 2^31)` — the
+        /// adversarial band for the incoming-error terms — with occasional
+        /// exact zeros so the skip rule is exercised.
+        fn nonneg_band(&mut self) -> f32 {
+            if self.next_u64().is_multiple_of(11) {
+                return 0.0;
+            }
+            let exponent = (self.next_u64() % 71) as i32 - 40;
+            let mantissa = 1.0 + (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
+            mantissa * 2f32.powi(exponent)
+        }
+    }
+
+    fn rational(value: f64) -> BigRational {
+        BigRational::from_float(value).expect("finite exact value")
+    }
+
+    /// Exact real `Σ_k err[i, offset+k]·|W[k,j]|` with the production
+    /// sanitization semantics (`x·0 → 0`); every f32×f32 product is exact in
+    /// f64, so each term converts to a rational losslessly.
+    fn exact_incoming_entry(
+        error: &Array2<f32>,
+        offset: usize,
+        contraction: usize,
+        w_abs: &Mat<f32>,
+        i: usize,
+        j: usize,
+    ) -> BigRational {
+        let mut sum = BigRational::from_integer(0.into());
+        for kk in 0..contraction {
+            let e = f32_to_f64_exact(error[[i, offset + kk]]);
+            let w = f32_to_f64_exact(w_abs[(kk, j)]);
+            if e == 0.0 || w == 0.0 {
+                continue;
+            }
+            sum += rational(e * w);
+        }
+        sum
+    }
+
+    /// Byte-for-byte replica of the historical per-add stepped fold + publish
+    /// for one entry — the reference for both finite and unbounded production
+    /// calls.
+    fn historical_stepped_entry(
+        error: &Array2<f32>,
+        offset: usize,
+        contraction: usize,
+        w_abs: &Mat<f32>,
+        i: usize,
+        j: usize,
+    ) -> f32 {
+        let mut sum = 0.0f64;
+        for kk in 0..contraction {
+            let error_value = nonnegative_f32_error_or_infinity(error[[i, offset + kk]]);
+            let weight_abs = nonnegative_f32_error_or_infinity(w_abs[(kk, j)]);
+            let term = if error_value == 0.0 || weight_abs == 0.0 {
+                0.0
+            } else {
+                error_value * weight_abs
+            };
+            sum = if term == 0.0 {
+                sum
+            } else if term > 0.0 {
+                next_up_nonnegative_f64(sum + term)
+            } else {
+                f64::INFINITY
+            };
+        }
+        publish_error_up_normal(sum)
+    }
+
+    fn incoming_fixture(n: usize, rows: usize, cols: usize, seed: u64) -> (Array2<f32>, Mat<f32>) {
+        let mut rng = SplitMix64(seed);
+        // column_offset = 1 is exercised: column 0 is a decoy the product
+        // must ignore.
+        let error = Array2::from_shape_fn((rows, n + 1), |_| rng.nonneg_band());
+        let w_abs = Mat::<f32>::from_fn(n, cols, |_, _| rng.nonneg_band());
+        (error, w_abs)
+    }
+
+    /// (a): on mixed-exponent adversarial bands at n ∈ {3, 64, 4096}, both
+    /// deadline modes must ENCLOSE the exact real sum and reproduce the
+    /// historical per-add stepped publication bit-for-bit.
+    #[test]
+    fn incoming_error_stepped_bound_encloses_exact_and_matches_historical() {
+        for &(n, seed) in &[
+            (3usize, 0x0C6A_0001u64),
+            (64, 0x0C6A_0002),
+            (4096, 0x0C6A_0003),
+        ] {
+            let (rows, cols) = (3usize, 2usize);
+            let (error, w_abs) = incoming_fixture(n, rows, cols, seed);
+            let live = Instant::now() + Duration::from_mins(2);
+            let deadline_bound = incoming_error_product(&error, 1, n, &w_abs, Some(live))
+                .expect("live deadline-arm product");
+            let unbounded =
+                incoming_error_product(&error, 1, n, &w_abs, None).expect("unbounded product");
+
+            for i in 0..rows {
+                for j in 0..cols {
+                    let exact = exact_incoming_entry(&error, 1, n, &w_abs, i, j);
+                    for (label, published) in [
+                        ("deadline", deadline_bound[[i, j]]),
+                        ("unbounded", unbounded[[i, j]]),
+                    ] {
+                        assert!(
+                            published.is_finite() && published >= 0.0,
+                            "n={n} [{i},{j}]: {label} bound not a finite error: {published}"
+                        );
+                        assert!(
+                            rational(f64::from(published)) >= exact,
+                            "n={n} [{i},{j}]: {label} bound {published:e} EXCLUDES the exact \
+                             sum {:e} — a tighter-than-truth error term",
+                            rational_to_f64(&exact)
+                        );
+                    }
+                    let old = historical_stepped_entry(&error, 1, n, &w_abs, i, j);
+                    assert_eq!(
+                        deadline_bound[[i, j]].to_bits(),
+                        old.to_bits(),
+                        "n={n} [{i},{j}]: deadline call drifted from stepped production"
+                    );
+                    assert_eq!(
+                        unbounded[[i, j]].to_bits(),
+                        old.to_bits(),
+                        "n={n} [{i},{j}]: unbounded call drifted from stepped production"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (b, test-only candidate): one exactly-representable large term followed by
+    /// 4095 terms each just below half an ulp of the running sum. Round to
+    /// nearest drops every small term, so the dual arm's `γ_{n+1}` charge is
+    /// nearly TIGHT against the dropped mass, while the historical fold still
+    /// pays a FULL ulp step per add — its excess over the exact sum is ~n·u
+    /// against the dual arm's ~1–2·u (measured ratio ~2·10³, asserted ≥ 10).
+    /// f32 publication quantizes both to the same value at this width, so the
+    /// excess is compared on the pre-publish f64 bounds, using the test-only
+    /// candidate helpers on a fold replicated term-for-term. The final check
+    /// pins why this candidate remains withdrawn: both f64 bounds publish to
+    /// the same f32, while production explicitly publishes `stepped`.
+    #[test]
+    fn test_only_dual_candidate_is_tighter_but_f32_publication_is_inert() {
+        let n = 4096usize;
+        let big_err = 1.0f32;
+        let big_w = 1.0f32;
+        let tiny_err = 1.0 - 2f32.powi(-23); // exactly representable, just below 1
+        let tiny_w = 2f32.powi(-53); // normal f32; product exact in f64
+
+        // Production term order: the big term first, then the tiny band.
+        let mut terms = Vec::with_capacity(n);
+        terms.push(f32_to_f64_exact(big_err) * f32_to_f64_exact(big_w));
+        for _ in 1..n {
+            terms.push(f32_to_f64_exact(tiny_err) * f32_to_f64_exact(tiny_w));
+        }
+
+        let mut exact = BigRational::from_integer(0.into());
+        let mut stepped = 0.0f64;
+        let mut acc = 0.0f64;
+        for &term in &terms {
+            exact += rational(term);
+            stepped = next_up_nonnegative_f64(stepped + term);
+            acc += term;
+        }
+        let (gamma, abs_inflate) = incoming_error_dual_factors(n);
+        let dual = incoming_error_dual_upper(acc, gamma, abs_inflate);
+
+        // Both bounds enclose the exact sum...
+        assert!(rational(stepped) >= exact, "stepped fold lost enclosure");
+        assert!(rational(dual) >= exact, "dual bound lost enclosure");
+        // ...and the dual arm's excess is at least 10x smaller.
+        let stepped_excess = rational(stepped) - exact.clone();
+        let dual_excess = rational(dual) - exact;
+        assert!(
+            dual_excess.is_positive(),
+            "dual bound must strictly enclose (its excess prices the charge)"
+        );
+        let ratio = rational_to_f64(&(stepped_excess / dual_excess));
+        assert!(
+            ratio >= 10.0,
+            "excess ratio {ratio:.1} < 10x — the test-only dual candidate \
+             lost its expected f64 improvement"
+        );
+
+        // Production remains the stepped fold under a finite deadline.
+        let error =
+            Array2::from_shape_fn((1, n), |(_, kk)| if kk == 0 { big_err } else { tiny_err });
+        let w_abs = Mat::<f32>::from_fn(n, 1, |kk, _| if kk == 0 { big_w } else { tiny_w });
+        let live = Instant::now() + Duration::from_mins(2);
+        let published = incoming_error_product(&error, 0, n, &w_abs, Some(live))
+            .expect("live deadline-arm product");
+        let stepped_published = publish_error_up_normal(stepped);
+        assert_eq!(
+            published[[0, 0]].to_bits(),
+            stepped_published.to_bits(),
+            "finite-deadline production must publish the stepped fold"
+        );
+        assert_eq!(
+            publish_error_up_normal(dual).to_bits(),
+            stepped_published.to_bits(),
+            "the test-only f64 improvement should remain inert after f32 publication"
+        );
+    }
+
+    /// The accounting model must remain coupled to faer's actual owned-matrix
+    /// layout. This samples both sides of its eight-row padding boundaries and
+    /// counts all six matrices simultaneously live at peak.
+    #[test]
+    fn aw_deadline_faer_scratch_estimator_matches_owned_layout() {
+        fn allocated_bytes(matrix: &Mat<f64>) -> usize {
+            usize::try_from(matrix.col_stride())
+                .expect("owned faer column stride is nonnegative")
+                .checked_mul(matrix.ncols())
+                .and_then(|elements| elements.checked_mul(size_of::<f64>()))
+                .expect("small test matrix allocation size fits usize")
+        }
+
+        for &(k, p, rows) in &[(1, 3, 1), (7, 5, 8), (8, 2, 9), (17, 4, 15)] {
+            let w_f = Mat::<f64>::zeros(k, p);
+            let w_abs = Mat::<f64>::zeros(k, p);
+            let a_f = Mat::<f64>::zeros(rows, k);
+            let a_abs = Mat::<f64>::zeros(rows, k);
+            let product = Mat::<f64>::zeros(rows, p);
+            let abs_product = Mat::<f64>::zeros(rows, p);
+
+            assert_eq!(
+                usize::try_from(w_f.col_stride()).expect("nonnegative stride"),
+                faer_f64_padded_row_capacity(k).expect("small row count")
+            );
+            assert_eq!(
+                usize::try_from(a_f.col_stride()).expect("nonnegative stride"),
+                faer_f64_padded_row_capacity(rows).expect("small row count")
+            );
+
+            let actual_bytes = [&w_f, &w_abs, &a_f, &a_abs, &product, &abs_product]
+                .into_iter()
+                .map(allocated_bytes)
+                .try_fold(0usize, usize::checked_add)
+                .expect("small aggregate allocation fits usize");
+            assert_eq!(
+                deadline_aw_faer_owned_scratch_bytes(k, p, rows),
+                Some(actual_bytes),
+                "scratch estimator diverged at k={k}, p={p}, rows={rows}"
+            );
+        }
+    }
+
+    /// (c, scratch boundary): one logical row still allocates eight faer rows
+    /// for every owned matrix. At k=1, p=2^18−1 is 128 bytes below the
+    /// 64 MiB ceiling and permits the full eight-row padding plateau; adding
+    /// one output column is 128 bytes over and must decline faer entirely.
+    #[test]
+    fn aw_deadline_faer_admission_requires_one_complete_row_of_scratch() {
+        let last_fitting_p = (1usize << 18) - 1;
+        assert_eq!(
+            deadline_aw_faer_owned_scratch_bytes(1, last_fitting_p, 1),
+            Some(DEADLINE_AW_FAER_MAX_SCRATCH_BYTES - 128)
+        );
+        assert_eq!(
+            deadline_aw_faer_owned_scratch_bytes(1, last_fitting_p + 1, 1),
+            Some(DEADLINE_AW_FAER_MAX_SCRATCH_BYTES + 128)
+        );
+        assert_eq!(
+            deadline_aw_faer_rows_per_chunk(1, last_fitting_p, DEADLINE_AW_FAER_CHUNK_MACS),
+            Some(8),
+            "all eight logical rows in the first padded block fit"
+        );
+        assert_eq!(
+            deadline_aw_faer_rows_per_chunk(1, last_fitting_p + 1, DEADLINE_AW_FAER_CHUNK_MACS),
+            None,
+            "faer must decline when the remaining scratch cannot hold one complete row"
+        );
+        assert_eq!(
+            deadline_aw_faer_owned_scratch_bytes(usize::MAX, 1, 1),
+            None,
+            "row-capacity rounding overflow must fail closed"
+        );
+        assert_eq!(
+            deadline_aw_faer_rows_per_chunk(usize::MAX, 2, usize::MAX),
+            None,
+            "MAC-count overflow must fail closed"
+        );
+    }
+
+    /// (c): the deadline=None arms are byte-identical to their historical
+    /// forms — the incoming-error unbounded lane reproduces the per-add
+    /// stepped publish bit-for-bit (including the poisoned-negative → +inf
+    /// path), and the unbounded `A·W` entry is the untouched faer twin.
+    #[test]
+    fn deadline_none_arms_are_bit_identical_to_the_historical_forms() {
+        let n = 64usize;
+        let (rows, cols) = (4usize, 3usize);
+        let (mut error, _) = incoming_fixture(n, rows, cols, 0x0C6A_00C0);
+        // Strictly positive weights so the poisoned term below cannot be
+        // silenced by the `err·0 → 0` domination rule.
+        let mut rng = SplitMix64(0x0C6A_00C2);
+        let w_abs = Mat::<f32>::from_fn(n, cols, |_, _| {
+            let v = rng.nonneg_band();
+            if v == 0.0 {
+                1.0
+            } else {
+                v
+            }
+        });
+        // Poison one entry with a negative payload: the invariant-violation
+        // lane must still publish +inf identically.
+        error[[2, 17]] = f32::from_bits(0x8000_0001);
+
+        let got = incoming_error_product(&error, 1, n, &w_abs, None).expect("unbounded product");
+        for i in 0..rows {
+            for j in 0..cols {
+                let want = historical_stepped_entry(&error, 1, n, &w_abs, i, j);
+                assert_eq!(
+                    got[[i, j]].to_bits(),
+                    want.to_bits(),
+                    "[{i},{j}]: unbounded incoming-error lane drifted from the \
+                     historical stepped publish"
+                );
+            }
+        }
+        assert_eq!(got[[2, 0]], f32::INFINITY, "poisoned row must stay +inf");
+
+        let mut rng = SplitMix64(0x0C6A_00C1);
+        let a = Mat::<f32>::from_fn(4, 96, |_, _| rng.signed(2.0));
+        let w = Mat::<f32>::from_fn(96, 5, |_, _| rng.signed(1.0));
+        let (da, ds) = aw_f64_with_abssum_and_deadline(&a, &w, None).expect("unbounded A·W");
+        let (ua, us) = aw_f64_with_abssum(&a, &w);
+        for i in 0..4 {
+            for j in 0..5 {
+                assert_eq!(da[[i, j]].to_bits(), ua[[i, j]].to_bits(), "A·W [{i},{j}]");
+                assert_eq!(ds[[i, j]].to_bits(), us[[i, j]].to_bits(), "S [{i},{j}]");
+            }
+        }
+    }
+
+    /// (a, `A·W`): the chunked-faer deadline path must keep the caller's
+    /// order-independent `γ_k·S` certificate valid ACROSS CHUNK SEAMS
+    /// (quantum forced to two rows per chunk) on cancellation-heavy,
+    /// mixed-magnitude operands at k ∈ {3, 64, 4096}, against an
+    /// exact-rational oracle — and stay inside the shared certificate
+    /// envelope of the no-deadline faer twin.
+    #[test]
+    fn aw_deadline_chunked_path_encloses_the_exact_product_across_chunk_seams() {
+        for &(k, scale, seed) in &[
+            (3usize, 1.0f32, 0x0C6A_A001u64),
+            (64, 1.0e3, 0x0C6A_A002),
+            (4096, 1.0e-3, 0x0C6A_A003),
+        ] {
+            let (m, p) = (5usize, 3usize);
+            let mut rng = SplitMix64(seed);
+            let a = Mat::<f32>::from_fn(m, k, |_, _| rng.signed(scale));
+            let w = Mat::<f32>::from_fn(k, p, |_, _| rng.signed(1.0));
+            let deadline = Instant::now() + Duration::from_mins(2);
+            // Two rows per chunk → three chunks over m = 5: seams exercised.
+            let chunk_macs = k * p * 2;
+            let (a64, s) =
+                aw_f64_with_abssum_cpu_deadline_with_chunk_macs(&a, &w, deadline, chunk_macs)
+                    .expect("live chunked product");
+            let (twin_a, twin_s) = aw_f64_with_abssum(&a, &w);
+
+            let gamma = gamma_n_f64(k);
+            assert!(gamma.is_finite() && gamma > 0.0, "k={k}: bad gamma");
+            let tiny = 8.0 * f64::from(f32::MIN_POSITIVE);
+
+            for i in 0..m {
+                for j in 0..p {
+                    let mut exact_c = BigRational::from_integer(0.into());
+                    let mut exact_p = BigRational::from_integer(0.into());
+                    for kk in 0..k {
+                        let term = f32_to_f64_exact(a[(i, kk)]) * f32_to_f64_exact(w[(kk, j)]);
+                        exact_p += rational(term).abs();
+                        exact_c += rational(term);
+                    }
+                    let exact_c_f = rational_to_f64(&exact_c);
+                    let exact_p_f = rational_to_f64(&exact_p);
+
+                    // (1) the caller's γ_k·S charge covers the chunked
+                    // accumulation against the EXACT sum.
+                    assert!(
+                        (a64[[i, j]] - exact_c_f).abs() <= gamma * s[[i, j]] + tiny,
+                        "k={k} [{i},{j}]: chunked A·W={:e} exact={exact_c_f:e} escapes γ·S={:e}",
+                        a64[[i, j]],
+                        gamma * s[[i, j]]
+                    );
+                    // (2) S stays a valid certificate basis.
+                    assert!(
+                        s[[i, j]] >= exact_p_f * (1.0 - gamma) - tiny,
+                        "k={k} [{i},{j}]: chunked S={:e} under-counts P={exact_p_f:e}",
+                        s[[i, j]]
+                    );
+                    // (3) the enclosure production publishes contains exact.
+                    let stored = a64[[i, j]] as f32;
+                    let cast_err = (a64[[i, j]] - f64::from(stored)).abs();
+                    let err = f64::from(next_up_f32((cast_err + gamma * s[[i, j]]) as f32));
+                    assert!(
+                        f64::from(stored) - err <= exact_c_f
+                            && exact_c_f <= f64::from(stored) + err,
+                        "k={k} [{i},{j}]: published enclosure excludes the exact A·W"
+                    );
+                    // (4) shared-envelope agreement with the no-deadline twin.
+                    assert!(
+                        (a64[[i, j]] - twin_a[[i, j]]).abs()
+                            <= gamma * (s[[i, j]] + twin_s[[i, j]]) + tiny,
+                        "k={k} [{i},{j}]: chunked A·W left the twin's certificate envelope"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (d, incoming): with the poll quantum forced to one MAC, a deadline that
+    /// expires while the composition loop is in flight must surface as the
+    /// TYPED deadline error at a mid-loop poll — never a partial result, never
+    /// a panic. Determinism: entry is verified live, and the workload is
+    /// ~1M polled MACs (an `Instant::now()` each) — orders of magnitude more
+    /// than the 1 ms budget on any host.
+    #[ntest::timeout(60_000)]
+    #[test]
+    fn incoming_error_deadline_poll_fires_mid_loop_with_typed_error() {
+        let (rows, n) = (256usize, 4096usize);
+        let error = Array2::<f32>::from_elem((rows, n), 1.0);
+        let w_abs = Mat::<f32>::from_fn(n, 1, |_, _| 1.0);
+        let deadline = Instant::now() + Duration::from_millis(1);
+        assert!(
+            Instant::now() < deadline,
+            "deadline must be live at entry so the abort is mid-run"
+        );
+        let abort =
+            incoming_error_product_with_poll_quantum(&error, 0, n, &w_abs, Some(deadline), 1)
+                .expect_err("expiry across ~1M forced polls must abort");
+        assert!(
+            matches!(abort, NyError::DeadlineExceeded(_)),
+            "expected the typed DeadlineExceeded, got {abort:?}"
+        );
+    }
+
+    /// (d, `A·W`): with the chunk quantum forced to one row per chunk, expiry
+    /// while the chunk loop is in flight must surface as the TYPED deadline
+    /// error at a between-chunk poll (the `ops_gemm.rs` between-blocks
+    /// pattern). 16384 chunks, each allocating two faer matrices and running
+    /// two GEMMs — orders of magnitude more than the 1 ms budget.
+    #[ntest::timeout(60_000)]
+    #[test]
+    fn aw_deadline_chunk_loop_aborts_between_chunks_with_typed_error() {
+        let (m, k, p) = (16_384usize, 8usize, 8usize);
+        let a = Mat::<f32>::from_fn(m, k, |i, j| (((i * 37 + j * 13) % 29) as f32 - 14.0) / 7.0);
+        let w = Mat::<f32>::from_fn(k, p, |i, j| (((i * 17 + j * 11) % 23) as f32 - 11.0) / 5.0);
+        let deadline = Instant::now() + Duration::from_millis(1);
+        assert!(
+            Instant::now() < deadline,
+            "deadline must be live at entry so the abort is mid-run"
+        );
+        // k·p = 64 == chunk quantum → exactly one row per chunk.
+        let abort = aw_f64_with_abssum_cpu_deadline_with_chunk_macs(&a, &w, deadline, 64)
+            .expect_err("expiry across 16384 forced chunks must abort");
+        assert!(
+            matches!(abort, NyError::DeadlineExceeded(_)),
+            "expected the typed DeadlineExceeded, got {abort:?}"
+        );
+    }
+
+    fn rational_to_f64(value: &BigRational) -> f64 {
+        value.to_f64().expect("exact reference fits f64 range")
     }
 }

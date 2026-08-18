@@ -17,10 +17,98 @@
 //!    each input coordinate, with a forward/backward-agreement gate that skips
 //!    coordinates whose perturbation crosses a ReLU kink. Matches to ~1e-2.
 
-use crate::layers::{AddLayer, Conv2dLayer, FlattenLayer, Layer, LinearLayer, ReLULayer};
+use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
+use crate::bounds::LinearBounds;
+use crate::layers::{
+    AddLayer, Conv2dLayer, FlattenLayer, Layer, LinearLayer, ReLULayer, SoftmaxLayer,
+};
 use crate::network::{GraphNetwork, GraphNode};
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
+use ny_core::NyError;
 use ny_tensor::BoundedTensor;
+
+#[test]
+fn point_vjp_dense_boundary_refuses_patches_without_materialization() {
+    let patches = CrownBounds::Patches(Box::new(PatchesLinearBounds::identity(
+        (1, 1, 1),
+        (1, 1, 1),
+    )));
+    assert!(
+        super::take_attack_dense_carrier(patches).is_none(),
+        "point-VJP must stay typed-closed instead of opening a raw Patches densify"
+    );
+
+    let dense = LinearBounds::identity(1);
+    let accepted = super::take_attack_dense_carrier(CrownBounds::Dense(dense))
+        .expect("the seeded Dense route remains accepted");
+    assert_eq!(accepted.num_outputs(), 1);
+    assert_eq!(accepted.num_inputs(), 1);
+}
+
+#[test]
+fn point_vjp_resource_refusals_decline_while_semantic_errors_survive() {
+    let deadline = super::attack_step_or_decline::<()>(Err(NyError::DeadlineExceeded(
+        "expired point-VJP merge".to_string(),
+    )))
+    .expect("deadline is a typed attack fallback");
+    assert!(deadline.is_none());
+
+    let memory = super::attack_step_or_decline::<()>(Err(NyError::CpuMemoryExceeded {
+        required_bytes: 2,
+        budget_bytes: 1,
+        site: "point-VJP test",
+    }))
+    .expect("memory refusal is a typed attack fallback");
+    assert!(memory.is_none());
+
+    let semantic = super::attack_step_or_decline::<()>(Err(NyError::InvalidSpec(
+        "malformed point-VJP route".to_string(),
+    )));
+    assert!(semantic.is_err(), "structural errors must not be swallowed");
+}
+
+#[test]
+fn pre_softmax_logit_view_honors_the_absolute_deadline() {
+    let weights = Array2::from_shape_vec((2, 2), vec![1.0f32, 0.0, 0.0, 1.0]).unwrap();
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "logits",
+        Layer::Linear(LinearLayer::new(weights, None).unwrap()),
+    ));
+    graph.add_node(GraphNode::new(
+        "probabilities",
+        Layer::Softmax(SoftmaxLayer::new(-1)),
+        vec!["logits".to_string()],
+    ));
+    graph.set_output("probabilities");
+    let input = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0f32, -2.0]).unwrap();
+
+    assert_eq!(
+        graph.attack_pre_softmax_logits(&input, None),
+        Some(vec![1.0, -2.0])
+    );
+    assert_eq!(
+        graph.attack_pre_softmax_logits(
+            &input,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        ),
+        Some(vec![1.0, -2.0]),
+        "a live authority must preserve the historical logit view"
+    );
+    assert_eq!(
+        graph.attack_pre_softmax_logits(&input, Some(std::time::Instant::now())),
+        None,
+        "an expired authority must decline before entering the node walk"
+    );
+    let spec_row = Array2::from_shape_vec((1, 2), vec![1.0_f32, -1.0]).unwrap();
+    assert!(
+        graph
+            .attack_point_gradient(&input, &spec_row, None, Some(std::time::Instant::now()),)
+            .expect("an expired attack authority is a typed fallback")
+            .is_none(),
+        "point-VJP must decline before its first allocation under expired authority"
+    );
+}
 
 /// Deterministic SplitMix64-style generator (no rand dependency in the fixture),
 /// mirroring `forward_linear/tests_image.rs`.
@@ -341,5 +429,210 @@ fn attack_point_gradient_exact_through_div_and_add_constant() {
     assert!(
         (g[0] - (-3.0)).abs() < 1e-4 && (g[1] - 1.0).abs() < 1e-4,
         "expected exact gradient [-3, 1], got {g:?}"
+    );
+}
+
+/// #traffic-input-linear-window: [`GraphNetwork::input_linear_sign_windows`] must
+/// emit the EXACT per-unit reachability radius for a `Sign` reached from the
+/// network input along a unary-affine chain, and must emit NOTHING for a `Sign`
+/// whose cone contains a non-affine layer or a reconverging binary join (where
+/// interval propagation is no longer exact).
+#[test]
+fn input_linear_sign_windows_are_exact_and_conservatively_scoped() {
+    use crate::layers::SignLayer;
+
+    // W = diag(1, 2), no bias. Input box [-1, 1]^2 -> pre-activation box
+    // [-1, 1] x [-2, 2] -> per-unit reachability radius [1, 2].
+    let w = Array2::from_shape_vec((2, 2), vec![1.0f32, 0.0, 0.0, 2.0]).unwrap();
+    let lo = ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0f32, -1.0]).unwrap();
+    let hi = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0f32, 1.0]).unwrap();
+    let bounds = BoundedTensor::new(lo, hi).unwrap();
+
+    // (a) Input -> Linear -> Sign: qualifies, exact radius.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "lin1",
+        Layer::Linear(LinearLayer::new(w.clone(), None).unwrap()),
+    ));
+    graph.add_node(GraphNode::new(
+        "sgn",
+        Layer::Sign(SignLayer),
+        vec!["lin1".to_string()],
+    ));
+    graph.set_output("sgn");
+    let windows = graph.input_linear_sign_windows(&bounds);
+    assert_eq!(windows.len(), 1, "the input-linear Sign must be windowed");
+    let w_sgn = &windows["sgn"];
+    assert_eq!(w_sgn.len(), 2);
+    assert!(
+        (w_sgn[0] - 1.0).abs() < 1e-5 && (w_sgn[1] - 2.0).abs() < 1e-5,
+        "expected exact per-unit radii [1, 2], got {w_sgn:?}"
+    );
+
+    // (b) A non-affine layer in the cone (ReLU) disqualifies it: interval
+    // propagation past a nonlinearity is no longer exact, so the node keeps the
+    // flat masked-STE default.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "lin1",
+        Layer::Linear(LinearLayer::new(w.clone(), None).unwrap()),
+    ));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer),
+        vec!["lin1".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "sgn",
+        Layer::Sign(SignLayer),
+        vec!["relu".to_string()],
+    ));
+    graph.set_output("sgn");
+    assert!(
+        graph.input_linear_sign_windows(&bounds).is_empty(),
+        "a Sign behind a non-affine layer must NOT be windowed"
+    );
+
+    // (c) A reconverging binary join (Add of two affine branches) also
+    // disqualifies it — interval propagation double-counts the shared input.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "lin1",
+        Layer::Linear(LinearLayer::new(w.clone(), None).unwrap()),
+    ));
+    graph.add_node(GraphNode::from_input(
+        "lin2",
+        Layer::Linear(LinearLayer::new(w, None).unwrap()),
+    ));
+    graph.add_node(GraphNode::new(
+        "join",
+        Layer::Add(AddLayer),
+        vec!["lin1".to_string(), "lin2".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "sgn",
+        Layer::Sign(SignLayer),
+        vec!["join".to_string()],
+    ));
+    graph.set_output("sgn");
+    assert!(
+        graph.input_linear_sign_windows(&bounds).is_empty(),
+        "a Sign behind a reconverging binary join must NOT be windowed"
+    );
+}
+
+/// #traffic-pool-window: a `Sign` reached through a monotone `MaxPool2d` IS
+/// windowed, and the emitted radius ENCLOSES the true reachable radius.
+///
+/// traffic net-2/net-3 are `Conv -> MaxPool -> BN -> Sign`, so excluding pooling
+/// left their first `Sign` on the flat `t = 6` default — which, after the BN
+/// rescales the pre-activation to `O(1)`, holds EVERY unit and stops being a
+/// mask at all (measured 15488/15488 and 28800/28800 at eps 1).
+#[test]
+fn sign_behind_a_maxpool_is_windowed_and_the_radius_encloses() {
+    use crate::layers::{MaxPool2dLayer, SignLayer};
+
+    // 1x2x2 input box; MaxPool 2x2 stride 2 -> a single output unit whose true
+    // range is [max(lo), max(hi)] = [0, 4] over this box (max is monotone), i.e.
+    // a true radius of 2.
+    let lo = ArrayD::from_shape_vec(IxDyn(&[1, 2, 2]), vec![-4.0f32, -1.0, 0.0, -2.0]).unwrap();
+    let hi = ArrayD::from_shape_vec(IxDyn(&[1, 2, 2]), vec![1.0f32, 2.0, 4.0, 3.0]).unwrap();
+    let bounds = BoundedTensor::new(lo, hi).unwrap();
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "pool",
+        Layer::MaxPool2d(MaxPool2dLayer::new((2, 2), (2, 2), (0, 0))),
+    ));
+    graph.add_node(GraphNode::new(
+        "sgn",
+        Layer::Sign(SignLayer),
+        vec!["pool".to_string()],
+    ));
+    graph.set_output("sgn");
+
+    let windows = graph.input_linear_sign_windows(&bounds);
+    assert_eq!(
+        windows.len(),
+        1,
+        "a Sign behind a monotone MaxPool must be windowed, got {windows:?}"
+    );
+    let w_sgn = &windows["sgn"];
+    assert_eq!(w_sgn.len(), 1);
+    // Enclosure, not exactness: the interval is [max lo, max hi] = [0, 4].
+    assert!(
+        (w_sgn[0] - 2.0).abs() < 1e-5,
+        "expected the enclosing radius 2.0, got {w_sgn:?}"
+    );
+    // The window must never UNDER-state reachability — that is the direction
+    // that kills the ascent gradient.
+    assert!(
+        w_sgn[0] >= 2.0 - 1e-5,
+        "the pooled window must enclose the true reachable radius"
+    );
+}
+
+/// #traffic-depth-scale-window: the depth-relative window must fire ONLY where
+/// the flat window is provably inert (holds every unit), must never override an
+/// installed per-unit window, and must leave a still-discriminating flat window
+/// byte-identical.
+///
+/// This is the priority order that makes the lever safe to ship default-on:
+/// traffic net-1's `Sign` layers (14.0% and 45.3% held under `t = 6`) can never
+/// reach the fallback, while net-2/net-3's deeper layers (100% held) always do.
+#[test]
+fn depth_scale_window_fires_only_where_the_flat_window_is_inert() {
+    use super::masked_ste_slopes;
+
+    let flat = 6.0f32;
+    let c = 0.25f32;
+
+    // (a) INERT flat window: every |z| <= 6, so the mask is the identity and the
+    // fallback takes over at t = 0.25 * median|z| = 0.25 * 0.8 = 0.2.
+    let z = [0.1f32, 0.3, 0.8, 2.0, 5.0];
+    let held: Vec<f32> = masked_ste_slopes(&z, flat, None, None);
+    assert_eq!(held, vec![1.0; 5], "the flat window here holds EVERY unit");
+    let scaled = masked_ste_slopes(&z, flat, None, Some(c));
+    assert_eq!(
+        scaled,
+        vec![1.0, 0.0, 0.0, 0.0, 0.0],
+        "only |z| <= 0.25*median(0.8) = 0.2 survives, got {scaled:?}"
+    );
+
+    // (b) DISCRIMINATING flat window: one unit is outside it, so the node is
+    // byte-identical with and without the depth scale.
+    let z = [0.1f32, 0.3, 0.8, 2.0, 50.0];
+    assert_eq!(
+        masked_ste_slopes(&z, flat, None, Some(c)),
+        masked_ste_slopes(&z, flat, None, None),
+        "a flat window that still discriminates must NOT be rescaled"
+    );
+
+    // (c) An installed per-unit window always wins, inert flat window or not.
+    let z = [0.1f32, 0.3, 0.8];
+    let per_unit = [0.05f32, 1.0, 0.5];
+    assert_eq!(
+        masked_ste_slopes(&z, flat, Some(&per_unit), Some(c)),
+        vec![0.0, 1.0, 0.0],
+        "the per-unit reachability window must take priority"
+    );
+
+    // (d) A degenerate all-zero layer has no scale; it must fall back to the flat
+    // window rather than collapse to an all-zero (dead) gradient.
+    let z = [0.0f32, 0.0, 0.0];
+    assert_eq!(
+        masked_ste_slopes(&z, flat, None, Some(c)),
+        vec![1.0, 1.0, 1.0],
+        "median|z| == 0 carries no scale information; keep the flat window"
+    );
+
+    // (e) A mismatched per-unit window is ignored (partial map / deadline), and
+    // the node falls through to the flat-or-scaled path rather than panicking.
+    let z = [0.1f32, 0.3, 0.8, 2.0, 5.0];
+    let short = [0.05f32];
+    assert_eq!(
+        masked_ste_slopes(&z, flat, Some(&short), Some(c)),
+        masked_ste_slopes(&z, flat, None, Some(c)),
+        "a length-mismatched per-unit window must be ignored, not indexed"
     );
 }

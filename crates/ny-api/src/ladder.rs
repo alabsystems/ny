@@ -39,7 +39,8 @@
 //! ```
 
 use ny_core::{
-    Bound, MethodUsed, Result, SoundnessProvenance, VerificationResult, VerificationSpec,
+    nan_propagating_max, Bound, MethodUsed, NyError, Result, SoundnessProvenance,
+    VerificationResult, VerificationSpec,
 };
 
 use crate::graph::GraphNetwork;
@@ -122,10 +123,9 @@ fn max_bound_width(bounds: &[Bound]) -> Option<f32> {
     bounds
         .iter()
         .map(Bound::width)
-        .fold(None, |acc, w| match acc {
-            // NaN-safe max: keep the larger finite value, prefer non-None.
-            Some(prev) if prev >= w => Some(prev),
-            _ => Some(w),
+        .fold(None, |acc, width| match acc {
+            Some(previous) => Some(nan_propagating_max(previous, width)),
+            None => Some(width),
         })
 }
 
@@ -241,6 +241,32 @@ fn should_escalate(max_width: Option<f32>, threshold: f32) -> bool {
     }
 }
 
+fn validate_config(cfg: &LadderConfig) -> Result<()> {
+    if cfg.escalation_width_threshold.is_nan() || cfg.escalation_width_threshold < 0.0 {
+        return Err(NyError::InvalidSpec(format!(
+            "escalation_width_threshold must be non-negative and not NaN, got {}",
+            cfg.escalation_width_threshold
+        )));
+    }
+    Ok(())
+}
+
+/// The complete terminal is a true next rung: it is eligible only after every
+/// propagation rung ran and beta-CROWN's remaining width still justifies
+/// escalation under the same threshold policy.
+fn should_run_complete(
+    cfg: &LadderConfig,
+    rungs: &[RungOutcome],
+    propagation_rung_count: usize,
+) -> bool {
+    cfg.use_complete
+        && rungs.len() == propagation_rung_count
+        && should_escalate(
+            rungs.last().and_then(|rung| rung.max_width),
+            cfg.escalation_width_threshold,
+        )
+}
+
 /// Run the laddered verification driver on a single graph network.
 ///
 /// Starts at IBP. If a rung verifies the property, the ladder returns
@@ -256,11 +282,17 @@ fn should_escalate(max_width: Option<f32>, threshold: f32) -> bool {
 /// - The returned [`LadderedResult::result`] is never `Verified` unless some rung
 ///   actually proved the property.
 /// - [`LadderedResult::rungs`] is non-empty (IBP always runs first).
+///
+/// # Errors
+/// Returns [`NyError::InvalidSpec`] when
+/// [`LadderConfig::escalation_width_threshold`] is NaN or negative, and
+/// propagates specification/verification errors from an attempted rung.
 pub fn verify_model(
     net: &GraphNetwork,
     spec: &VerificationSpec,
     cfg: &LadderConfig,
 ) -> Result<LadderedResult> {
+    validate_config(cfg)?;
     let spec = rung_spec(spec, cfg)?;
     let mut rungs: Vec<RungOutcome> = Vec::new();
     let mut combined_provenance = SoundnessProvenance::sound();
@@ -332,7 +364,7 @@ pub fn verify_model(
     }
 
     // Optional complete MIP terminal (only when feature + flag are both on).
-    if cfg.use_complete {
+    if should_run_complete(cfg, &rungs, ladder.len()) {
         if let Some((result, method, outcome)) = run_complete_terminal(net, &spec, cfg)? {
             combined_provenance = combined_provenance.combine(result.provenance());
             let verified = outcome.verified;
@@ -374,8 +406,17 @@ pub fn verify_model(
 /// Tightness comparison for fallback selection: smaller widths win; a present
 /// width beats an absent one; ties keep the existing choice.
 fn fallback_is_tighter(candidate: Option<f32>, current: Option<f32>) -> bool {
+    if candidate.is_some_and(f32::is_nan) {
+        return false;
+    }
     match (candidate, current) {
-        (Some(c), Some(p)) => c < p,
+        (Some(candidate), Some(current)) => {
+            if current.is_nan() {
+                true
+            } else {
+                candidate < current
+            }
+        }
         (Some(_), None) => true,
         (None, Some(_)) => false,
         (None, None) => false,
@@ -615,6 +656,17 @@ mod tests {
         ];
         assert_eq!(max_bound_width(&bounds), Some(5.0));
         assert_eq!(max_bound_width(&[]), None);
+
+        let nan_width_then_finite = [
+            Bound::new_allow_infinite(f32::INFINITY, f32::INFINITY),
+            Bound::new(0.0, 1.0),
+        ];
+        assert!(
+            max_bound_width(&nan_width_then_finite)
+                .expect("non-empty bounds")
+                .is_nan(),
+            "a later finite width must not absorb an earlier NaN width"
+        );
     }
 
     #[test]
@@ -631,9 +683,60 @@ mod tests {
     }
 
     #[test]
+    fn invalid_thresholds_are_rejected() {
+        for threshold in [f32::NAN, -1.0, f32::NEG_INFINITY] {
+            let cfg = LadderConfig {
+                escalation_width_threshold: threshold,
+                ..LadderConfig::default()
+            };
+            assert!(
+                validate_config(&cfg).is_err(),
+                "{threshold} must be invalid"
+            );
+        }
+        let cfg = LadderConfig {
+            escalation_width_threshold: f32::INFINITY,
+            ..LadderConfig::default()
+        };
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "+infinity is a valid 'never escalate for finite widths' policy"
+        );
+    }
+
+    #[test]
+    fn complete_terminal_obeys_ladder_progress_and_threshold() {
+        let cfg = LadderConfig {
+            use_complete: true,
+            escalation_width_threshold: 1.0,
+            ..LadderConfig::default()
+        };
+        let rung = |max_width| RungOutcome {
+            method: MethodUsed::Ibp,
+            verified: false,
+            max_width,
+            note: String::new(),
+        };
+
+        let all_wide = vec![rung(Some(2.0)); 4];
+        assert!(should_run_complete(&cfg, &all_wide, 4));
+        assert!(!should_run_complete(&cfg, &all_wide[..3], 4));
+
+        let mut beta_tight = all_wide;
+        beta_tight[3].max_width = Some(0.5);
+        assert!(!should_run_complete(&cfg, &beta_tight, 4));
+    }
+
+    #[test]
     fn fallback_tightness_prefers_smaller_width() {
         assert!(fallback_is_tighter(Some(1.0), Some(2.0)));
         assert!(!fallback_is_tighter(Some(2.0), Some(1.0)));
+        assert!(fallback_is_tighter(Some(1.0), Some(f32::NAN)));
+        assert!(!fallback_is_tighter(Some(f32::NAN), Some(1.0)));
+        assert!(
+            !fallback_is_tighter(Some(f32::NAN), None),
+            "a corrupt width must not replace a no-bounds timeout"
+        );
         assert!(fallback_is_tighter(Some(1.0), None));
         assert!(!fallback_is_tighter(None, Some(1.0)));
         assert!(!fallback_is_tighter(None, None));

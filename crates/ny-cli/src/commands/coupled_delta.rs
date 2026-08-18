@@ -67,7 +67,7 @@ static COUPLED_VERIFIED: AtomicUsize = AtomicUsize::new(0);
 
 use ny_core::Bound;
 use ny_propagate::beta_crown::graph_mip_leaf::{
-    GraphMipLeafOracle, GraphMipLeafRequest, GraphMipLeafVerdict,
+    GraphInputLeafRequest, GraphMipLeafOracle, GraphMipLeafRequest, GraphMipLeafVerdict,
 };
 use ny_propagate::{GraphNetwork, Layer, Verifier, NETWORK_INPUT};
 
@@ -155,23 +155,19 @@ fn extract_affine_chain(graph: &GraphNetwork, input_dim: usize) -> Option<Vec<Af
         match node.layer() {
             Layer::Flatten(_) | Layer::Reshape(_) => {}
             Layer::Linear(lin) => {
-                let lw = lin.weight.mapv(f64::from);
+                let lw = lin.weight().mapv(f64::from);
                 if lw.ncols() != w.nrows()
-                    || lin
-                        .bias
-                        .as_ref()
-                        .is_some_and(|bias| bias.len() != lw.nrows())
+                    || lin.bias().is_some_and(|bias| bias.len() != lw.nrows())
                     || !lw.iter().all(|v| v.is_finite())
                     || lin
-                        .bias
-                        .as_ref()
+                        .bias()
                         .is_some_and(|bias| bias.iter().any(|v| !v.is_finite()))
                 {
                     return None;
                 }
                 w = lw.dot(&w);
                 let mut nb = lw.dot(&b);
-                if let Some(bias) = &lin.bias {
+                if let Some(bias) = lin.bias() {
                     nb = nb + bias.mapv(f64::from);
                 }
                 b = nb;
@@ -258,8 +254,10 @@ fn forward_chain(layers: &[Affine], x: &Array1<f64>) -> Array1<f64> {
 /// next round's `cap`) and, for each supplied objective over the diff output, a
 /// sound LOWER bound on `obj·(f-g)` over the box.
 ///
-/// This is the validated probe backward (coupled_relu_probe.rs) with the output
-/// stage generalized from `max|h|` to arbitrary output objectives.
+/// This is the validated coupled-ReLU prototype backward, promoted to
+/// production with the output stage generalized from `max|h|` to arbitrary
+/// output objectives. The superseded offline probe was removed once this path
+/// gained its own hermetic soundness coverage below.
 fn coupled_pass(
     f: &[Affine],
     g: &[Affine],
@@ -723,10 +721,17 @@ impl GraphMipLeafOracle for CoupledDeltaOracle {
     }
 }
 
-/// A composite leaf oracle: consults each inner oracle in order and returns the
-/// first non-`Undecided` verdict. Used to stack the cheap coupled-δ bound BEFORE
-/// the exact Graph-MIP edge solver (coupled-δ verifies most edge domains without
-/// a MIP solve; the MIP handles the residual).
+/// A composite leaf oracle: on either oracle surface, consults each inner oracle
+/// in order and returns the first authoritative verdict. Used to stack the cheap
+/// coupled-δ bound BEFORE the exact Graph-MIP edge solver (coupled-δ verifies
+/// most edge domains without a MIP solve; the MIP handles the residual).
+///
+/// `Violated` authority belongs to the inner oracle that produced that exact
+/// witness. An advisory violation from one inner must not borrow publication
+/// authority from a different sibling. The loops below therefore filter every
+/// unauthorized `Violated` before it crosses the composite boundary. As a
+/// result, any `Violated` returned by the composite is publishable by
+/// construction, while `VerifiedAllRows` retains its existing proof authority.
 pub(crate) struct CompositeLeafOracle {
     oracles: Vec<Arc<dyn GraphMipLeafOracle>>,
 }
@@ -738,14 +743,37 @@ impl CompositeLeafOracle {
 }
 
 impl GraphMipLeafOracle for CompositeLeafOracle {
-    fn solve_leaf(&self, req: &GraphMipLeafRequest<'_>) -> GraphMipLeafVerdict {
+    fn solve_input_leaf(&self, req: &GraphInputLeafRequest<'_>) -> GraphMipLeafVerdict {
         for oracle in &self.oracles {
-            match oracle.solve_leaf(req) {
+            match oracle.solve_input_leaf(req) {
                 GraphMipLeafVerdict::Undecided => continue,
+                GraphMipLeafVerdict::Violated { .. } if !oracle.may_publish_violation_witness() => {
+                    continue;
+                }
                 other => return other,
             }
         }
         GraphMipLeafVerdict::Undecided
+    }
+
+    fn solve_leaf(&self, req: &GraphMipLeafRequest<'_>) -> GraphMipLeafVerdict {
+        for oracle in &self.oracles {
+            match oracle.solve_leaf(req) {
+                GraphMipLeafVerdict::Undecided => continue,
+                GraphMipLeafVerdict::Violated { .. } if !oracle.may_publish_violation_witness() => {
+                    continue;
+                }
+                other => return other,
+            }
+        }
+        GraphMipLeafVerdict::Undecided
+    }
+
+    fn may_publish_violation_witness(&self) -> bool {
+        // This does not aggregate sibling permissions. It describes the
+        // composite's own output contract: both solve surfaces above suppress
+        // every unauthorized inner violation before returning.
+        true
     }
 }
 
@@ -808,6 +836,7 @@ mod extraction_tests {
     use ny_propagate::GraphNode;
     use ny_tensor::BoundedTensor;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn relu(name: &str, input: &str) -> GraphNode {
         GraphNode::new(name, Layer::ReLU(ReLULayer::new()), vec![input.to_string()])
@@ -845,6 +874,175 @@ mod extraction_tests {
         graph.add_node(GraphNode::from_input(name, Layer::Linear(linear)));
         graph.set_output(name);
         graph
+    }
+
+    struct CompositeInputProbe {
+        consults: Arc<AtomicUsize>,
+        verifies: bool,
+    }
+
+    impl GraphMipLeafOracle for CompositeInputProbe {
+        fn solve_input_leaf(&self, _req: &GraphInputLeafRequest<'_>) -> GraphMipLeafVerdict {
+            self.consults.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.verifies {
+                GraphMipLeafVerdict::VerifiedAllRows
+            } else {
+                GraphMipLeafVerdict::Undecided
+            }
+        }
+
+        fn solve_leaf(&self, _req: &GraphMipLeafRequest<'_>) -> GraphMipLeafVerdict {
+            panic!("input-leaf composite forwarding must not call the legacy surface")
+        }
+    }
+
+    #[test]
+    fn composite_forwards_input_leaf_until_first_authoritative_verdict() {
+        let first_consults = Arc::new(AtomicUsize::new(0));
+        let second_consults = Arc::new(AtomicUsize::new(0));
+        let third_consults = Arc::new(AtomicUsize::new(0));
+        let composite = CompositeLeafOracle::new(vec![
+            Arc::new(CompositeInputProbe {
+                consults: first_consults.clone(),
+                verifies: false,
+            }),
+            Arc::new(CompositeInputProbe {
+                consults: second_consults.clone(),
+                verifies: true,
+            }),
+            Arc::new(CompositeInputProbe {
+                consults: third_consults.clone(),
+                verifies: true,
+            }),
+        ]);
+        let graph = scalar_linear_graph("out", 1.0);
+        let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+            .expect("valid input box");
+        let objectives = arr2(&[[1.0_f32]]);
+        let thresholds = [-0.1_f32];
+        let advisory_objective_bounds = [(-1.0_f32, 1.0_f32)];
+        let clause_sizes = [1usize];
+        let request = GraphInputLeafRequest {
+            graph: &graph,
+            input_bounds: &input,
+            objectives: &objectives,
+            thresholds: &thresholds,
+            advisory_objective_bounds: &advisory_objective_bounds,
+            clause_sizes: &clause_sizes,
+            depth: 0,
+            deadline: None,
+        };
+
+        assert!(matches!(
+            composite.solve_input_leaf(&request),
+            GraphMipLeafVerdict::VerifiedAllRows
+        ));
+        assert_eq!(first_consults.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(second_consults.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(third_consults.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    struct CompositeViolationProbe {
+        consults: Arc<AtomicUsize>,
+        marker: Option<f32>,
+        may_publish: bool,
+    }
+
+    impl GraphMipLeafOracle for CompositeViolationProbe {
+        fn solve_leaf(&self, _req: &GraphMipLeafRequest<'_>) -> GraphMipLeafVerdict {
+            self.consults.fetch_add(1, AtomicOrdering::SeqCst);
+            match self.marker {
+                Some(marker) => GraphMipLeafVerdict::Violated {
+                    witness: vec![marker],
+                    output: vec![marker],
+                },
+                None => GraphMipLeafVerdict::Undecided,
+            }
+        }
+
+        fn may_publish_violation_witness(&self) -> bool {
+            self.may_publish
+        }
+    }
+
+    #[test]
+    fn composite_binds_violation_authority_to_the_producing_oracle() {
+        let advisory_consults = Arc::new(AtomicUsize::new(0));
+        let publishing_consults = Arc::new(AtomicUsize::new(0));
+        let composite = CompositeLeafOracle::new(vec![
+            Arc::new(CompositeViolationProbe {
+                consults: advisory_consults.clone(),
+                marker: Some(1.0),
+                may_publish: false,
+            }),
+            Arc::new(CompositeViolationProbe {
+                consults: publishing_consults.clone(),
+                marker: Some(2.0),
+                may_publish: true,
+            }),
+        ]);
+        let graph = scalar_linear_graph("out", 1.0);
+        let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+            .expect("valid input box");
+        let node_bounds = HashMap::new();
+        let request = GraphMipLeafRequest {
+            graph: &graph,
+            input_bounds: &input,
+            node_bounds: &node_bounds,
+            splits: Vec::new(),
+            rows: vec![(vec![1.0], 0.0)],
+            depth: 1,
+            deadline: None,
+        };
+
+        match composite.solve_leaf(&request) {
+            GraphMipLeafVerdict::Violated { witness, output } => {
+                assert_eq!(witness, vec![2.0]);
+                assert_eq!(output, vec![2.0]);
+            }
+            other => panic!("expected the publishing sibling's violation, got {other:?}"),
+        }
+        assert!(composite.may_publish_violation_witness());
+        assert_eq!(advisory_consults.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(publishing_consults.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn composite_does_not_export_an_advisory_only_violation() {
+        let advisory_consults = Arc::new(AtomicUsize::new(0));
+        let fallback_consults = Arc::new(AtomicUsize::new(0));
+        let composite = CompositeLeafOracle::new(vec![
+            Arc::new(CompositeViolationProbe {
+                consults: advisory_consults.clone(),
+                marker: Some(3.0),
+                may_publish: false,
+            }),
+            Arc::new(CompositeViolationProbe {
+                consults: fallback_consults.clone(),
+                marker: None,
+                may_publish: true,
+            }),
+        ]);
+        let graph = scalar_linear_graph("out", 1.0);
+        let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+            .expect("valid input box");
+        let node_bounds = HashMap::new();
+        let request = GraphMipLeafRequest {
+            graph: &graph,
+            input_bounds: &input,
+            node_bounds: &node_bounds,
+            splits: Vec::new(),
+            rows: vec![(vec![1.0], 0.0)],
+            depth: 1,
+            deadline: None,
+        };
+
+        assert!(matches!(
+            composite.solve_leaf(&request),
+            GraphMipLeafVerdict::Undecided
+        ));
+        assert_eq!(advisory_consults.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(fallback_consults.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]
@@ -1002,22 +1200,29 @@ mod tests {
     /// must be a valid LOWER bound on `min obj·(f-g)` for EVERY band objective at
     /// EVERY box scale — otherwise the oracle could certify a violated domain.
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn coupled_row_lower_is_sound() {
         let base = std::path::PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
         ));
-        if !base.is_dir() {
-            eprintln!("benchmarks absent; skipping");
-            return;
-        }
+        assert!(
+            base.is_dir(),
+            "external VNN-COMP 2026 relational fixtures missing at {}; run \
+             benchmarks/vnncomp2026_benchmarks/setup.sh",
+            base.display()
+        );
         let mut checked = 0usize;
         for (stem, f_name, g_name) in PAIRS {
             let fp = base.join("onnx/original").join(f_name);
             let gp = base.join("onnx/perturbed").join(g_name);
-            if !fp.is_file() || !gp.is_file() {
-                continue;
-            }
+            assert!(
+                fp.is_file() && gp.is_file(),
+                "{stem}: external ONNX fixtures missing (f={}, g={}); run \
+                 benchmarks/vnncomp2026_benchmarks/setup.sh",
+                fp.display(),
+                gp.display()
+            );
             let graph_f = super::super::vnncomp::load_graph_network(&fp).expect("load f");
             let graph_g = super::super::vnncomp::load_graph_network(&gp).expect("load g");
             let vnnlib = base.join("vnnlib").join(format!("{stem}.vnnlib"));

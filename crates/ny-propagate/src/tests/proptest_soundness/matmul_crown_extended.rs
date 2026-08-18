@@ -50,7 +50,9 @@ proptest! {
 
         let result = matmul.propagate_linear_batched_binary(&identity, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick batched CROWN rejected generated finite scalar inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 // Concretize each path against its input interval and sum
                 let concrete_a = bounds_a.concretize(&a_bounds)
@@ -113,7 +115,9 @@ proptest! {
 
         let result = matmul.propagate_linear_batched_binary(&identity, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick batched CROWN rejected generated finite 2x1 inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 let concrete_a = bounds_a.concretize(&a_bounds)
                     .map_err(|e| TestCaseError::fail(format!("concretize_a: {e}")))?;
@@ -200,7 +204,9 @@ proptest! {
 
         let result = matmul.propagate_linear_binary(&incoming, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick CROWN rejected generated finite nonidentity inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 let a_samples = super::sample_points(a_l, a_u, 10);
                 let b_samples = super::sample_points(b_l, b_u, 10);
@@ -274,7 +280,9 @@ proptest! {
 
         let result = matmul.propagate_linear_binary(&incoming, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick CROWN rejected generated finite asymmetric inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 let a_samples = super::sample_points(a_l, a_u, 10);
                 let b_samples = super::sample_points(b_l, b_u, 10);
@@ -341,7 +349,9 @@ proptest! {
         let identity = LinearBounds::identity(1);
         let result = matmul.propagate_linear_binary(&identity, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick CROWN rejected generated finite transpose_b inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 // Concretize and verify soundness at corners
                 let concrete_a: BoundedTensor = bounds_a.concretize(&a_bounds);
@@ -398,7 +408,9 @@ proptest! {
         let identity = LinearBounds::identity(1);
         let result = matmul.propagate_linear_binary(&identity, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick CROWN rejected generated finite scaled inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 let a_samples = super::sample_points(a_l, a_u, 10);
                 let b_samples = super::sample_points(b_l, b_u, 10);

@@ -33,6 +33,33 @@ use tracing::{debug, instrument, warn};
 
 use super::core::Network;
 
+/// Cheap pre-collection admission for the native output-seed INVPROP route.
+///
+/// The exact output dimension is only available after intermediate-bound
+/// collection. This rejects every statically unsupported constraint form so a
+/// pure-linear network pays for collection only when it can reach the checked
+/// post-collection route.
+fn native_invprop_route_candidate(config: &AlphaCrownConfig) -> bool {
+    config.iterations > 0
+        && config.invprop.enabled
+        && config.invprop.optimize_gammas
+        && config
+            .output_constraints
+            .as_ref()
+            .is_some_and(|constraints| {
+                constraints.is_conjunction
+                    && constraints.clause_indices.is_none()
+                    && constraints.num_constraints() > 0
+                    && constraints.output_dim() > 0
+                    && constraints.rhs.len() == constraints.num_constraints()
+                    && constraints
+                        .a_matrix
+                        .iter()
+                        .chain(constraints.rhs.iter())
+                        .all(|value| value.is_finite())
+            })
+}
+
 /// Extension trait for alpha-CROWN propagation on sequential networks.
 pub(crate) trait NetworkAlphaCrownExt {
     /// Alpha-CROWN entry point implementation.
@@ -151,7 +178,11 @@ impl NetworkAlphaCrownExt for Network {
                 debug!(
                     "Alpha-CROWN: Conv2d/ConvTranspose2d/MaxPool2d detected, falling back to CROWN"
                 );
-                return self.propagate_crown_with_engine(input, engine);
+                return self.propagate_crown_with_engine_and_deadline(
+                    input,
+                    engine,
+                    config.deadline,
+                );
             }
         }
 
@@ -162,8 +193,9 @@ impl NetworkAlphaCrownExt for Network {
             .filter(|l| matches!(l, Layer::ReLU(_)))
             .count();
 
-        if relu_count == 0 {
-            return self.propagate_crown_with_engine(input, engine);
+        let invprop_route_candidate = native_invprop_route_candidate(config);
+        if relu_count == 0 && !invprop_route_candidate {
+            return self.propagate_crown_with_engine_and_deadline(input, engine, config.deadline);
         }
 
         // Adaptive skip: for deep models, alpha-CROWN optimization provides
@@ -178,7 +210,7 @@ impl NetworkAlphaCrownExt for Network {
                  falling back to CROWN",
                 relu_count, config.adaptive_skip_depth_threshold
             );
-            return self.propagate_crown_with_engine(input, engine);
+            return self.propagate_crown_with_engine_and_deadline(input, engine, config.deadline);
         }
 
         // Deadline guard (#4321 / VNN-COMP no-JSON fix): the intermediate-bound
@@ -240,10 +272,15 @@ impl NetworkAlphaCrownExt for Network {
         )?;
 
         let num_unstable = alpha_state.num_unstable();
-        if num_unstable == 0 {
+        let invprop_seed_treatment_eligible = config.invprop.optimize_gammas
+            && crate::network::alpha_crown_loop::native_invprop_seed_treatment_eligible(
+                &alpha_state,
+                output_dim,
+            );
+        if num_unstable == 0 && !invprop_seed_treatment_eligible {
             // No unstable neurons, alpha-CROWN won't help
             debug!("Alpha-CROWN: No unstable neurons, using CROWN");
-            return self.propagate_crown_with_engine(input, engine);
+            return self.propagate_crown_with_engine_and_deadline(input, engine, config.deadline);
         }
 
         debug!(
@@ -284,21 +321,13 @@ impl NetworkAlphaCrownExt for Network {
         alpha_state: &AlphaState,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
-        let bp_output = match run_simple_backward_pass(
-            &self.layers,
+        self.propagate_alpha_crown_single_pass_with_deadline(
             input,
             layer_bounds,
             alpha_state,
             engine,
-            false,
-            "single pass",
-        )? {
-            BackwardPassResult::Success(output) => *output,
-            BackwardPassResult::Fallback => {
-                return self.propagate_crown_with_engine(input, engine);
-            }
-        };
-        Ok(bp_output.linear_bounds.concretize_sound(input))
+            None,
+        )
     }
 
     fn propagate_alpha_crown_with_intermediates_impl(
@@ -308,19 +337,74 @@ impl NetworkAlphaCrownExt for Network {
         alpha_state: &AlphaState,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<AlphaCrownIntermediate> {
+        self.propagate_alpha_crown_with_intermediates_and_deadline(
+            input,
+            layer_bounds,
+            alpha_state,
+            engine,
+            None,
+        )
+    }
+
+    fn compute_chain_rule_gradients_impl(
+        &self,
+        alpha_state: &AlphaState,
+        intermediate: &AlphaCrownIntermediate,
+    ) -> Vec<Array1<f32>> {
+        compute_chain_rule_gradients(alpha_state, intermediate)
+    }
+}
+
+impl Network {
+    fn propagate_alpha_crown_single_pass_with_deadline(
+        &self,
+        input: &BoundedTensor,
+        layer_bounds: &[BoundedTensor],
+        alpha_state: &AlphaState,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<BoundedTensor> {
         let bp_output = match run_simple_backward_pass(
             &self.layers,
             input,
             layer_bounds,
             alpha_state,
             engine,
+            deadline,
+            false,
+            "single pass",
+        )? {
+            BackwardPassResult::Success(output) => *output,
+            BackwardPassResult::Fallback => {
+                return self.propagate_crown_with_engine_and_deadline(input, engine, deadline);
+            }
+        };
+        Ok(bp_output.linear_bounds.concretize_sound(input))
+    }
+
+    fn propagate_alpha_crown_with_intermediates_and_deadline(
+        &self,
+        input: &BoundedTensor,
+        layer_bounds: &[BoundedTensor],
+        alpha_state: &AlphaState,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<AlphaCrownIntermediate> {
+        let bp_output = match run_simple_backward_pass(
+            &self.layers,
+            input,
+            layer_bounds,
+            alpha_state,
+            engine,
+            deadline,
             true,
             "intermediates pass",
         )? {
             BackwardPassResult::Success(output) => *output,
             BackwardPassResult::Fallback => {
                 // Unsupported layer: return constant LinearBounds from CROWN fallback.
-                let crown_bounds = self.propagate_crown_with_engine(input, engine)?;
+                let crown_bounds =
+                    self.propagate_crown_with_engine_and_deadline(input, engine, deadline)?;
                 let crown_flat = crown_bounds.flatten();
                 let num_outputs = crown_flat.len();
                 // `len()` == `flatten().len()` (flatten preserves element count) with no allocation.
@@ -349,14 +433,6 @@ impl NetworkAlphaCrownExt for Network {
             pre_relu_bounds,
             final_bounds: bp_output.linear_bounds,
         })
-    }
-
-    fn compute_chain_rule_gradients_impl(
-        &self,
-        alpha_state: &AlphaState,
-        intermediate: &AlphaCrownIntermediate,
-    ) -> Vec<Array1<f32>> {
-        compute_chain_rule_gradients(alpha_state, intermediate)
     }
 }
 
@@ -388,6 +464,7 @@ impl AlphaCrownBackend for SequentialAlphaCrownBackend<'_> {
             store_intermediates: false,
             best_of_oc: self.config.invprop.best_of_oc_and_no_oc && invprop_enabled,
             engine: self.engine,
+            deadline: self.config.deadline,
             layer_to_relu_idx: &self.layer_to_relu_idx,
             relu_layer_indices: &self.relu_layer_indices,
         };
@@ -426,24 +503,46 @@ impl AlphaCrownBackend for SequentialAlphaCrownBackend<'_> {
             GradientMethod::Spsa => {
                 let grads =
                     compute_spsa_gradients(alpha_state, eps, config.spsa_samples, |state| {
-                        self.network.propagate_alpha_crown_single_pass_impl(
-                            input,
-                            self.layer_bounds,
-                            state,
-                            self.engine,
-                        )
+                        if config.deadline.is_some() {
+                            self.network
+                                .propagate_alpha_crown_single_pass_with_deadline(
+                                    input,
+                                    self.layer_bounds,
+                                    state,
+                                    self.engine,
+                                    config.deadline,
+                                )
+                        } else {
+                            self.network.propagate_alpha_crown_single_pass_impl(
+                                input,
+                                self.layer_bounds,
+                                state,
+                                self.engine,
+                            )
+                        }
                     })?;
                 let upper = grads.clone();
                 Ok((grads, upper))
             }
             GradientMethod::FiniteDifferences => {
                 let grads = compute_finite_difference_gradients(alpha_state, eps, |state| {
-                    self.network.propagate_alpha_crown_single_pass_impl(
-                        input,
-                        self.layer_bounds,
-                        state,
-                        self.engine,
-                    )
+                    if config.deadline.is_some() {
+                        self.network
+                            .propagate_alpha_crown_single_pass_with_deadline(
+                                input,
+                                self.layer_bounds,
+                                state,
+                                self.engine,
+                                config.deadline,
+                            )
+                    } else {
+                        self.network.propagate_alpha_crown_single_pass_impl(
+                            input,
+                            self.layer_bounds,
+                            state,
+                            self.engine,
+                        )
+                    }
                 })?;
                 let upper = grads.clone();
                 Ok((grads, upper))
@@ -453,12 +552,23 @@ impl AlphaCrownBackend for SequentialAlphaCrownBackend<'_> {
             // AnalyticChain: chain-rule only computes lower gradients; use same for upper.
             // Follow-up: extend chain-rule to produce separate upper gradients.
             GradientMethod::AnalyticChain => {
-                let intermediate = self.network.propagate_alpha_crown_with_intermediates_impl(
-                    input,
-                    self.layer_bounds,
-                    alpha_state,
-                    self.engine,
-                )?;
+                let intermediate = if config.deadline.is_some() {
+                    self.network
+                        .propagate_alpha_crown_with_intermediates_and_deadline(
+                            input,
+                            self.layer_bounds,
+                            alpha_state,
+                            self.engine,
+                            config.deadline,
+                        )?
+                } else {
+                    self.network.propagate_alpha_crown_with_intermediates_impl(
+                        input,
+                        self.layer_bounds,
+                        alpha_state,
+                        self.engine,
+                    )?
+                };
 
                 if intermediate.a_at_relu.is_empty() {
                     warn!("AnalyticChain: unsupported layer in backward pass, falling back to local gradients");
@@ -475,7 +585,11 @@ impl AlphaCrownBackend for SequentialAlphaCrownBackend<'_> {
     }
 
     fn crown_fallback(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
-        self.network.propagate_crown_with_engine(input, self.engine)
+        self.network.propagate_crown_with_engine_and_deadline(
+            input,
+            self.engine,
+            self.config.deadline,
+        )
     }
 
     fn log_label(&self) -> &str {

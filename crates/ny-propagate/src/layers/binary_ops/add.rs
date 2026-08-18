@@ -4,7 +4,9 @@
 
 use ndarray::IxDyn;
 use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    add_down_f32, add_up_f32, next_down_f32, next_up_f32, BoundedTensor, RepairStrategy,
+};
 
 use crate::shape::broadcast_shapes;
 use crate::{BatchedLinearBounds, LinearBounds};
@@ -19,6 +21,18 @@ impl AddLayer {
     /// For C = A + B where A ∈ [A_l, A_u] and B ∈ [B_l, B_u]:
     /// C ∈ [A_l + B_l, A_u + B_u]
     ///
+    /// Both endpoint additions are DIRECTED (`add_down_f32` / `add_up_f32`).
+    /// A plain f32 `+` is round-to-nearest, so `A_l + B_l` can land up to half
+    /// an ULP ABOVE the true sum — a lower bound that excludes the value it is
+    /// supposed to bound. This surfaced as a decomposed `InstanceNorm` chain
+    /// whose final bias add (`10 - 0.5855390429496765`) rounded up by 0.19 ULP
+    /// and lifted the whole interval off the true output. It had been masked by
+    /// slack donated from an upstream `ReduceMean` that widened by a full ULP
+    /// unconditionally; once that reduction became exact, the gap was live.
+    ///
+    /// The directed adds are exact when the addition is exact, so residual
+    /// connections over exactly-representable values cost nothing.
+    ///
     /// Supports full NumPy/ONNX broadcasting (e.g., [1, 3] + [3, 1] → [3, 3],
     /// [5, 1, 48] + [5, 48] → [5, 1, 48]). Matches SubLayer behavior.
     pub fn propagate_ibp_binary(
@@ -29,8 +43,12 @@ impl AddLayer {
         let (out_lower, out_upper) = if input_a.shape() == input_b.shape() {
             // Fast path: shapes match exactly, no broadcasting needed.
             (
-                input_a.lower() + input_b.lower(),
-                input_a.upper() + input_b.upper(),
+                ndarray::Zip::from(input_a.lower())
+                    .and(input_b.lower())
+                    .map_collect(|&x, &y| add_down_f32(x, y)),
+                ndarray::Zip::from(input_a.upper())
+                    .and(input_b.upper())
+                    .map_collect(|&x, &y| add_up_f32(x, y)),
             )
         } else {
             // Full NumPy/ONNX broadcasting (matches SubLayer behavior).
@@ -71,7 +89,14 @@ impl AddLayer {
                     got: input_b.shape().to_vec(),
                 })?;
 
-            (&a_lower + &b_lower, &a_upper + &b_upper)
+            (
+                ndarray::Zip::from(&a_lower)
+                    .and(&b_lower)
+                    .map_collect(|&x, &y| add_down_f32(x, y)),
+                ndarray::Zip::from(&a_upper)
+                    .and(&b_upper)
+                    .map_collect(|&x, &y| add_up_f32(x, y)),
+            )
         };
 
         // Centralized NaN/Inf repair at constructor (#3423, replaces ad-hoc #2549).

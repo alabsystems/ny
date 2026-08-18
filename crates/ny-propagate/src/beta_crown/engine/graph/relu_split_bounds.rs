@@ -33,6 +33,7 @@ use super::super::domain_results::GraphDomainResult;
 use super::super::tensor_ext::BoundedTensorExt;
 use super::super::BetaCrownVerifier;
 use super::objectives::objective_bounds;
+use super::relu_split::queue_budget::{enforce_graph_queue_budget, GraphBabQueueBudget};
 
 fn drop_non_finite_domain_in_relu_split_bounds(
     domain: &GraphBabDomain,
@@ -137,6 +138,10 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
+        // This path accepts caller-supplied root bounds and can return a verdict
+        // before the ordinary graph bootstrap.  Validate at the shared ingress
+        // so neither public wrapper can bypass proof-authority quarantine.
+        self.config.validate()?;
         let graph = self.configured_graph_for_crown(graph);
         let graph = &graph;
         let now = Instant::now();
@@ -165,7 +170,7 @@ impl BetaCrownVerifier {
             .config
             .domain_is_violation(root_lower, root_upper, threshold)
         {
-            Some((BabVerificationStatus::PotentialViolation, 0))
+            Some((BabVerificationStatus::potential_violation(), 0))
         } else {
             None
         };
@@ -205,8 +210,17 @@ impl BetaCrownVerifier {
             None, // no root alpha optimization in pre-computed bounds path
             self.config.beta_iterations > 0,
         );
+        if self.config.enable_clip_interm_domain {
+            self.complete_clip_root_bounds_cache.store_finalized(
+                graph,
+                input,
+                &setup.initial_node_bounds_arc,
+            );
+        }
 
-        // Branch-and-bound queue
+        // Branch-and-bound queue. The byte budget is shared with the ordinary
+        // ReLU-split heap; zero preserves the historical unlimited route.
+        let queue_budget = GraphBabQueueBudget::from_config(&self.config);
         let mut queue: BinaryHeap<GraphBabDomain> = BinaryHeap::new();
         queue.push(root_domain);
 
@@ -248,11 +262,15 @@ impl BetaCrownVerifier {
             .phase_budget
             .post_bab_pgd_fraction
             .clamp(0.0, 0.5);
-        let effective_total = match deadline {
+        let bab_timeout = match deadline {
+            // An explicit deadline is already the caller ledger's BaB slice.
             Some(dl) => dl.saturating_duration_since(now),
-            None => self.config.timeout,
+            None => self.config.timeout.mul_f32(1.0 - pgd_frac),
         };
-        let bab_timeout = effective_total.mul_f32(1.0 - pgd_frac);
+        let _complete_clip_deadline = self.complete_clip_deadline_overrides.scoped(Some(
+            GraphBabLifecycle::fail_closed_deadline(now, bab_timeout),
+        ));
+        let mut bab_iteration = 0usize;
 
         while let Some(domain) = queue.pop() {
             // Check timeout and domain limit (#1860 Packet A shared lifecycle, #4095)
@@ -365,7 +383,7 @@ impl BetaCrownVerifier {
                 .domain_is_violation(domain.lower_bound, domain.upper_bound, threshold)
             {
                 lifecycle.cuts_generated = cut_pool.total_generated;
-                return Ok(lifecycle.build_result(BabVerificationStatus::PotentialViolation));
+                return Ok(lifecycle.build_result(BabVerificationStatus::potential_violation()));
             }
 
             // Near-miss cut generation: generate cuts from domains close to verification
@@ -432,9 +450,8 @@ impl BetaCrownVerifier {
 
                         if self.config.domain_is_violation(l, u, threshold) {
                             lifecycle.cuts_generated = cut_pool.total_generated;
-                            return Ok(
-                                lifecycle.build_result(BabVerificationStatus::PotentialViolation)
-                            );
+                            return Ok(lifecycle
+                                .build_result(BabVerificationStatus::potential_violation()));
                         }
                     }
                     Err(ref e) if e.is_infeasible_domain() => {
@@ -456,6 +473,18 @@ impl BetaCrownVerifier {
                 }
                 lifecycle.unresolved_due_to_no_branch = true;
                 continue;
+            }
+
+            // This sequential entry point processes one splittable parent per
+            // outer BaB round. One stamp covers branch scoring and both child
+            // propagations; terminal/no-work pops do not consume a round.
+            if self.config.enable_clip_interm_domain {
+                bab_iteration = bab_iteration.saturating_add(1);
+                let _ = self.complete_clip_root_bounds_cache.set_bab_iteration(
+                    graph,
+                    input,
+                    bab_iteration,
+                );
             }
 
             // Select neuron to split using branching heuristic.
@@ -668,6 +697,12 @@ impl BetaCrownVerifier {
                     }
                 }
             }
+            enforce_graph_queue_budget(
+                queue_budget,
+                &mut queue,
+                &mut lifecycle,
+                "relu-split-precomputed",
+            );
         }
 
         // Queue exhaustion: shared lifecycle handles unresolved vs verified logic

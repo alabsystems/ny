@@ -7,7 +7,21 @@
 # 2026-07-11: + CersyveInstance_{Pendulum,Unicycle}.{sys}_safe_forever{,_full} — the
 #   graph->ClampedSystem binding for all 3 machine-checked safe-forever systems
 #   (residual trust named as explicit hypotheses) — 90 theorems total.
-
+# 2026-07-30: + SignFusion.* — L1 (Sign->Add(c)->Sign fusion is EXACTLY a two-valued
+#   step for 0 < |c| < 1, both polarities, with the guards that make the side condition
+#   necessary and a rounding-robust form) and L2 (value-branch coverage for the fused
+#   node, incl. FOUR machine-checked REFUTATIONS: the informal three-clause split
+#   argument, the same split on the raw three-valued ONNX Sign, off-breakpoint value
+#   splits, and the u <= 0 stability shortcut) — 118 theorems total.
+# 2026-07-31: + IntegerInterval.* — exact INTEGER/LATTICE interval reasoning for the
+#   binarized traffic nets.  Integrality is MEASURED on the three artifacts, not assumed:
+#   layer 1 is NOT integral over the continuous `Real` input box (box_contains_nonintegral),
+#   everything from the first Sign onward IS (post_sign_layer_even).  Covers the three
+#   claims the integer route rests on — tightening [l,u] to [ceil l, floor u] is sound AND
+#   a contraction AND optimal; stability on integers is exact and ASYMMETRIC (with
+#   hs_stable_neg_int_unsound refuting the symmetric form ny currently ships); and integer
+#   interval arithmetic for +/- and +-1-weighted sums is exact, not merely sound — plus the
+#   margin lever (lattice_lower_forces_nonneg) and its sharpness.  164 theorems total.
 'Crownproof.farkas_premise_combination' depends on axioms: [propext, Classical.choice, Quot.sound]
 'Crownproof.crown_bridge' depends on axioms: [propext, Classical.choice, Quot.sound]
 'Crownproof.crown_bridge_deepK' depends on axioms: [propext, Classical.choice, Quot.sound]
@@ -108,3 +122,85 @@
 'Crownproof.CersyveInstance_Unicycle.unicycle_safe_forever_full' depends on axioms: [propext,
  Classical.choice,
  Quot.sound]
+'Crownproof.SignFusion.sgn_three_valued' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs_two_valued' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs'_two_valued' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sign_pair_fusion' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sign_pair_fusion_neg' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sign_pair_fusion_rewrite' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sign_pair_fusion_of_signFaithful' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sign_pair_fusion_fails_of_one_le' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sign_pair_fusion_fails_of_zero_const' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sign_pair_fusion_fails_of_le_neg_one' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.branch_sound_of_agreement_cover' does not depend on any axioms
+'Crownproof.SignFusion.branch_sound_two' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.three_clause_split_unsound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.twoValued_closed_split_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs_closed_split_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs'_closed_split_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.sgn_closed_split_unsound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.offcenter_closed_split_unsound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.plus_child_must_contain_breakpoint' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs_fix_pos_on_closed_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs_fix_neg_on_open_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs_fix_neg_on_closed_unsound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs'_fix_neg_on_closed_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.hs'_fix_pos_on_closed_unsound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.SignFusion.frontierSound_root' does not depend on any axioms
+'Crownproof.SignFusion.frontierSound_verdict' does not depend on any axioms
+'Crownproof.SignFusion.frontierSound_refine' does not depend on any axioms
+'Crownproof.SignFusion.frontierSound_refine_sign' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_intCast' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_zero' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_one' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_neg_one' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.OnLattice.isIntegral' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.onLattice_one' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.OnLattice.add' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.OnLattice.sub' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.OnLattice.neg' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.intTighten_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.intTighten_contracts' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.intTighten_set_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.intTighten_optimal' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.intTighten_infeasible' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.intTighten_idem' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.lattice_tighten_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.lattice_lower_forces_nonneg' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.lattice_lower_forces_nonneg_sharp' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+'Crownproof.IntegerInterval.lattice_upper_forces_nonpos' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_add' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_sub' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_neg' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_mul' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.isIntegral_max' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.onLattice_max' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.int_interval_add_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.int_interval_add_exact' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.int_interval_sub_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.pm1_mul' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.pm1_weighted_sum' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.pm1_weighted_sum_even' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.pm1_range_exact' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs_stable_pos_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs_stable_neg_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs_stable_neg_int_unsound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs_stable_neg_int_sharp' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs_stable_pos_int_sharp' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs_stable_int_complete' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs'_stable_pos_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs'_stable_neg_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs'_stable_pos_int_unsound' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.affine_sign_iff_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.hs_affine_int' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.affine_ne_zero_of_threshold_not_int' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+'Crownproof.IntegerInterval.affine_strictMono' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.box_contains_nonintegral' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.post_sign_layer_integral' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.post_sign_layer_even' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.softmax_cmp_iff' depends on axioms: [propext, Classical.choice, Quot.sound]
+'Crownproof.IntegerInterval.straddling_bound_pins_zero' depends on axioms: [propext, Classical.choice, Quot.sound]

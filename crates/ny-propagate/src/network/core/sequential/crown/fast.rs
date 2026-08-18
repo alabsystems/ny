@@ -12,7 +12,9 @@ use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::{debug, instrument, warn};
 
-use super::{crown_backward_step_patches, CrownStepResult, Network};
+use super::{
+    crown_backward_step_patches, materialize_terminal_crown_bounds, CrownStepResult, Network,
+};
 
 fn initialize_fast_crown_bounds(
     has_conv2d: bool,
@@ -148,7 +150,9 @@ impl Network {
             super::log_dense_materialization_budget_fallback("CROWN-fast", estimate, None, None);
             return self.propagate_ibp(input);
         }
-        let linear_bounds = crown_bounds.into_dense()?;
+        let Some(linear_bounds) = materialize_terminal_crown_bounds(crown_bounds)? else {
+            return self.propagate_ibp(input);
+        };
         let concrete_bounds = linear_bounds.concretize_sound(input);
         let concrete_bounds = concrete_bounds.reshape(&output_shape)?;
         // Step 5+6: Degrade check + forward-bound tightening (#3043 dedup).
@@ -241,7 +245,9 @@ impl Network {
             );
             return self.ibp_fallback_with_constant_linear(input);
         }
-        let linear_bounds = crown_bounds.into_dense()?;
+        let Some(linear_bounds) = materialize_terminal_crown_bounds(crown_bounds)? else {
+            return self.ibp_fallback_with_constant_linear(input);
+        };
         let concrete = linear_bounds
             .concretize_sound(input)
             .reshape(&output_shape)?;

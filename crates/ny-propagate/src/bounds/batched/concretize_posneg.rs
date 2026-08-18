@@ -8,27 +8,15 @@
 //! Part of #2220 Packet B.
 
 use super::BatchedLinearBounds;
-use crate::bounds::safe_math::{
-    nan_propagating_max_zero, nan_propagating_min_zero, safe_mul_for_bounds_f64,
-};
+use crate::bounds::{certified_affine_sum_f32, OutwardDirection};
 use ndarray::{Array2, ArrayD, IxDyn};
-use ny_core::{checked_shape_product, NyError, Result, CROWN_COEFF_MAX};
+use ny_core::{
+    checked_shape_product,
+    dd::{gamma_n_f64, next_down_f64, next_up_f64},
+    is_crown_coeff_safe, NyError, Result,
+};
 use ny_tensor::{next_down_f32, next_up_f32};
 
-/// Directed-round one f64-accumulated concrete bound at the final f32 cast.
-///
-/// The BLAS path accumulates the CROWN dot product entirely in f64 (operands
-/// cast f32→f64, so each product `a_j * x_j` is EXACT, and the running sum has
-/// only sub-f64-ULP error over `n` terms — utterly negligible against an f32
-/// ULP). The ONLY rounding that can move the bound the wrong way is the single
-/// final f64→f32 cast. We absorb it with one directed step: `next_down_f32` for
-/// a lower bound (toward −∞), `next_up_f32` for an upper bound (toward +∞).
-///
-/// This is the SAME soundness basis as the f64-scalar fallback
-/// (`concretize_scalar_posneg`): f64 accumulation + a single 1-ULP directed
-/// cast. It is sound AND tight — no absolute-envelope over-widening is needed,
-/// because there is no f32 accumulation error to cover.
-///
 /// `signed_sum` is the f64 dot result plus the (f64) bias. A NaN accumulator
 /// (only reachable if an Inf coefficient × 0 input leaked through, which the
 /// `all_finite_for_blas` gate already excludes) is degraded to the sound ±∞
@@ -45,6 +33,49 @@ fn round_blas_element(signed_sum: f64, round_down: bool) -> f32 {
         f32::INFINITY
     } else {
         next_up_f32(signed_sum as f32)
+    }
+}
+
+fn enclose_blas_affine<I>(
+    dot: f64,
+    bias: f32,
+    terms: I,
+    term_count: usize,
+    direction: OutwardDirection,
+) -> f64
+where
+    I: Clone + IntoIterator<Item = (f32, f32)>,
+{
+    let mut abs_sum = f64::from(bias).abs();
+    for (coefficient, endpoint) in terms.clone() {
+        abs_sum = next_up_f64(abs_sum + (f64::from(coefficient) * f64::from(endpoint)).abs());
+    }
+    // Two DGEMV reductions (positive and negative lanes), their merge, and
+    // the bias add. `gamma_{2n+2}` safely covers every parenthesization/FMA
+    // choice of a conforming binary64 BLAS reduction.
+    let gamma = gamma_n_f64(term_count.saturating_mul(2).saturating_add(2));
+    let error = if gamma == 0.0 || abs_sum == 0.0 {
+        0.0
+    } else {
+        next_up_f64(gamma * abs_sum)
+    };
+    let represented = dot + f64::from(bias);
+    // The complete BLAS envelope can become useless under catastrophic
+    // cancellation: gamma_n * sum|term| may dwarf the small result. In that
+    // case recompute this row with the self-checked DD reducer. Ordinary rows
+    // retain the BLAS result whenever its whole f64 error fits inside the one
+    // f32 ULP that publication already spends.
+    let cast = represented as f32;
+    let publication_ulp = match direction {
+        OutwardDirection::Lower => (f64::from(cast) - f64::from(next_down_f32(cast))).abs(),
+        OutwardDirection::Upper => (f64::from(next_up_f32(cast)) - f64::from(cast)).abs(),
+    };
+    if !represented.is_finite() || error > publication_ulp {
+        return certified_affine_sum_f32(bias, terms, direction);
+    }
+    match direction {
+        OutwardDirection::Lower => next_down_f64(represented - error),
+        OutwardDirection::Upper => next_up_f64(represented + error),
     }
 }
 
@@ -119,10 +150,10 @@ impl BatchedLinearBounds {
             .map_err(|e| NyError::InternalError(format!("err penalty in_upper reshape: {e}")))?;
 
         // Worst-case magnitude per column, per input batch position.
-        let mut mag = Array2::<f64>::zeros((x_batch_elems, x_n));
+        let mut mag = Array2::<f32>::zeros((x_batch_elems, x_n));
         for b in 0..x_batch_elems {
             for j in 0..x_n {
-                mag[[b, j]] = (xl[[b, j]] as f64).abs().max((xu[[b, j]] as f64).abs());
+                mag[[b, j]] = xl[[b, j]].abs().max(xu[[b, j]].abs());
             }
         }
 
@@ -153,22 +184,25 @@ impl BatchedLinearBounds {
             };
             let eb = if coeff_broadcast { 0 } else { b };
             for i in 0..m {
-                let mut pen_l = 0.0f64;
-                let mut pen_u = 0.0f64;
-                for j in 0..n {
-                    let mg = mag[[xb, j]];
-                    if let Some(ref l) = le_flat {
-                        pen_l += l[[eb, i, j]] as f64 * mg;
-                    }
-                    if let Some(ref u) = ue_flat {
-                        pen_u += u[[eb, i, j]] as f64 * mg;
-                    }
-                }
+                let pen_l = le_flat.as_ref().map_or(0.0, |l| {
+                    certified_affine_sum_f32(
+                        0.0,
+                        (0..n).map(|j| (l[[eb, i, j]], mag[[xb, j]])),
+                        OutwardDirection::Upper,
+                    )
+                });
+                let pen_u = ue_flat.as_ref().map_or(0.0, |u| {
+                    certified_affine_sum_f32(
+                        0.0,
+                        (0..n).map(|j| (u[[eb, i, j]], mag[[xb, j]])),
+                        OutwardDirection::Upper,
+                    )
+                });
                 if pen_l != 0.0 {
                     let lo = lower2d[[b, i]];
                     if lo.is_finite() {
                         lower2d[[b, i]] = if pen_l.is_finite() {
-                            next_down_f32((lo as f64 - pen_l) as f32)
+                            next_down_f32(next_down_f64(lo as f64 - pen_l) as f32)
                         } else {
                             f32::NEG_INFINITY
                         };
@@ -178,7 +212,7 @@ impl BatchedLinearBounds {
                     let hi = upper2d[[b, i]];
                     if hi.is_finite() {
                         upper2d[[b, i]] = if pen_u.is_finite() {
-                            next_up_f32((hi as f64 + pen_u) as f32)
+                            next_up_f32(next_up_f64(hi as f64 + pen_u) as f32)
                         } else {
                             f32::INFINITY
                         };
@@ -208,7 +242,7 @@ impl BatchedLinearBounds {
         in_lower: &ArrayD<f32>,
         in_upper: &ArrayD<f32>,
     ) -> bool {
-        let coeff_ok = |v: &f32| v.is_finite() && v.abs() <= CROWN_COEFF_MAX;
+        let coeff_ok = |v: &f32| is_crown_coeff_safe(*v);
         in_lower.iter().all(|v| v.is_finite())
             && in_upper.iter().all(|v| v.is_finite())
             && lower_b.iter().all(|v| v.is_finite())
@@ -230,32 +264,15 @@ impl BatchedLinearBounds {
     /// (Accelerate on macOS). When all batches share the same input (broadcast),
     /// fuses into a single DGEMV over [batch*m, n].
     ///
-    /// SOUNDNESS / TIGHTNESS: the dot products are accumulated entirely in f64.
-    /// Each operand is an exact f32 value widened to f64, so every product
-    /// `a_j * x_j` is EXACT (f32 × f32 fits in f64 with room to spare), and the
-    /// f64 running sum over `n` terms has only sub-f64-ULP relative error
-    /// (~`n * 2^-53`) — utterly negligible against an f32 ULP. The result is
-    /// therefore EXACT up to a single f64→f32 cast. We absorb only that one cast
-    /// with a directed `next_down_f32` (lower) / `next_up_f32` (upper) in
-    /// [`round_blas_element`].
-    ///
-    /// This is the SAME soundness basis as the f64-scalar fallback
-    /// ([`Self::concretize_scalar_posneg`]) — exact f64 products, f64
-    /// accumulation, one directed f32-cast ULP — so the two paths are equally
-    /// sound and agree to within the summation order, which is sub-f64-ULP and
-    /// vanishes under the f32 cast. Forming the products in f64 is load-bearing
-    /// on BOTH paths, not a tightness nicety: an f32 product rounds to nearest,
-    /// i.e. INWARD by up to 0.5 f32-ULP at the *term* magnitude, and under
-    /// cancellation (|term| ≫ |result|) that bias is unbounded relative to the
-    /// 1-ULP widening applied at the *result* magnitude. No absolute-envelope
-    /// over-widening is needed, because f64 accumulation leaves no
-    /// f32-accumulation error to cover — replacing the conservative
-    /// `gamma_{2n+2} * sum|term|` envelope of the previous f32-BLAS path, which
-    /// loosened bounds under cancellation.
+    /// SOUNDNESS / TIGHTNESS: every binary32 product is exact in binary64, but
+    /// the BLAS reduction is not exact under cancellation. Publication therefore
+    /// attaches a complete `gamma_{2n+2} * sum|term|` binary64 error envelope.
+    /// If that envelope is larger than the f32 publication ULP, the row is
+    /// recomputed by the self-checked DD reducer, which keeps cancellation-heavy
+    /// rows useful. The final cast is then directed outward.
     ///
     /// Reference: alpha-beta-CROWN bound_general.py:1140-1160 for the pos/neg
-    /// split; the f64-accumulate + single directed-cast rounding is ny's sound,
-    /// tight concretization (matching the trusted scalar path).
+    /// split.
     pub(super) fn concretize_blas_posneg(
         lower_a: &ArrayD<f32>,
         upper_a: &ArrayD<f32>,
@@ -298,6 +315,22 @@ impl BatchedLinearBounds {
 
         let x_n = *x_shape.last().unwrap_or(&0);
         let x_batch_elems = in_lower.len() / x_n.max(1);
+        let la_source = lower_a
+            .view()
+            .into_shape_with_order((total_batch, m, n))
+            .map_err(|e| NyError::InternalError(format!("lower_a source reshape: {e}")))?;
+        let ua_source = upper_a
+            .view()
+            .into_shape_with_order((total_batch, m, n))
+            .map_err(|e| NyError::InternalError(format!("upper_a source reshape: {e}")))?;
+        let xl_source = in_lower
+            .view()
+            .into_shape_with_order((x_batch_elems, x_n))
+            .map_err(|e| NyError::InternalError(format!("in_lower source reshape: {e}")))?;
+        let xu_source = in_upper
+            .view()
+            .into_shape_with_order((x_batch_elems, x_n))
+            .map_err(|e| NyError::InternalError(format!("in_upper source reshape: {e}")))?;
 
         let expected_b_elems = total_batch * m;
         if lower_b.len() != expected_b_elems || upper_b.len() != expected_b_elems {
@@ -367,8 +400,36 @@ impl BatchedLinearBounds {
 
             for b in 0..total_batch {
                 for i in 0..m {
-                    let sum_l = lower_2d[[b, i]] + lb_flat[[b, i]] as f64;
-                    let sum_u = upper_2d[[b, i]] + ub_flat[[b, i]] as f64;
+                    let sum_l = enclose_blas_affine(
+                        lower_2d[[b, i]],
+                        lb_flat[[b, i]],
+                        (0..n).map(|j| {
+                            let coefficient = la_source[[b, i, j]];
+                            let endpoint = if coefficient >= 0.0 {
+                                xl_source[[0, j]]
+                            } else {
+                                xu_source[[0, j]]
+                            };
+                            (coefficient, endpoint)
+                        }),
+                        n,
+                        OutwardDirection::Lower,
+                    );
+                    let sum_u = enclose_blas_affine(
+                        upper_2d[[b, i]],
+                        ub_flat[[b, i]],
+                        (0..n).map(|j| {
+                            let coefficient = ua_source[[b, i, j]];
+                            let endpoint = if coefficient >= 0.0 {
+                                xu_source[[0, j]]
+                            } else {
+                                xl_source[[0, j]]
+                            };
+                            (coefficient, endpoint)
+                        }),
+                        n,
+                        OutwardDirection::Upper,
+                    );
                     result_lower[[b, i]] = round_blas_element(sum_l, true);
                     result_upper[[b, i]] = round_blas_element(sum_u, false);
                 }
@@ -413,8 +474,36 @@ impl BatchedLinearBounds {
 
                 // Add (f64) bias, then a SINGLE directed f64→f32 cast.
                 for i in 0..m {
-                    let sum_l = lower_dot[i] + lb_flat[[b, i]] as f64;
-                    let sum_u = upper_dot[i] + ub_flat[[b, i]] as f64;
+                    let sum_l = enclose_blas_affine(
+                        lower_dot[i],
+                        lb_flat[[b, i]],
+                        (0..n).map(|j| {
+                            let coefficient = la_source[[b, i, j]];
+                            let endpoint = if coefficient >= 0.0 {
+                                xl_source[[b, j]]
+                            } else {
+                                xu_source[[b, j]]
+                            };
+                            (coefficient, endpoint)
+                        }),
+                        n,
+                        OutwardDirection::Lower,
+                    );
+                    let sum_u = enclose_blas_affine(
+                        upper_dot[i],
+                        ub_flat[[b, i]],
+                        (0..n).map(|j| {
+                            let coefficient = ua_source[[b, i, j]];
+                            let endpoint = if coefficient >= 0.0 {
+                                xu_source[[b, j]]
+                            } else {
+                                xl_source[[b, j]]
+                            };
+                            (coefficient, endpoint)
+                        }),
+                        n,
+                        OutwardDirection::Upper,
+                    );
                     result_lower[[b, i]] = round_blas_element(sum_l, true);
                     result_upper[[b, i]] = round_blas_element(sum_u, false);
                 }
@@ -433,10 +522,9 @@ impl BatchedLinearBounds {
 
     /// Scalar fallback for concretize with per-element NaN/Inf/overflow handling.
     ///
-    /// Uses the same pos/neg coefficient split but with `safe_mul_for_bounds_f64`
-    /// (0*inf=0) and NaN-propagating max/min to handle edge cases soundly. Both
-    /// operands are promoted to f64 before the product, so — exactly as on the BLAS
-    /// path — every term is exact and only the final directed f32 cast rounds.
+    /// Uses the same pos/neg coefficient split and the shared certified affine
+    /// reducer. Finite rows take its self-checked DD path; non-finite rows use the
+    /// directed-per-add fallback with the `0*inf=0` bounds convention.
     ///
     /// Rows whose bias is already at ±inf, or whose coefficients exceed
     /// `CROWN_COEFF_MAX` (including the ±Inf conservative NaN guards `compose`
@@ -531,7 +619,8 @@ impl BatchedLinearBounds {
 
                 // Per-direction row degradation (mirrors
                 // `LinearBounds::concretize_scalar_f64`, #1932): a bias already at
-                // ±inf, or any coefficient with |a| > CROWN_COEFF_MAX — which
+                // ±inf, or any coefficient outside the strict
+                // `is_crown_coeff_safe` envelope — which
                 // includes the ±Inf conservative NaN guards `compose` emits —
                 // degrades that direction to its sound saturating bound. The guard
                 // is load-bearing here, not defense-in-depth: the pos/neg split
@@ -546,10 +635,10 @@ impl BatchedLinearBounds {
                     if lower_degraded && upper_degraded {
                         break;
                     }
-                    if !lower_degraded && la_flat[[b, i, j]].abs() > CROWN_COEFF_MAX {
+                    if !lower_degraded && !is_crown_coeff_safe(la_flat[[b, i, j]]) {
                         lower_degraded = true;
                     }
-                    if !upper_degraded && ua_flat[[b, i, j]].abs() > CROWN_COEFF_MAX {
+                    if !upper_degraded && !is_crown_coeff_safe(ua_flat[[b, i, j]]) {
                         upper_degraded = true;
                     }
                 }
@@ -563,39 +652,32 @@ impl BatchedLinearBounds {
                     continue;
                 }
 
-                let mut sum_l = lb as f64;
-                let mut sum_u = ub as f64;
-
-                for j in 0..n {
-                    let xl = xl_flat[[x_b, j]];
-                    let xu = xu_flat[[x_b, j]];
-                    let la = la_flat[[b, i, j]];
-                    let ua = ua_flat[[b, i, j]];
-
-                    // Pos/neg coefficient split with safe 0*inf=0 handling.
-                    // NaN-propagating max/min preserves NaN so it poisons the accumulator.
-                    //
-                    // SOUNDNESS (#concretize-soundness-hardening): the per-term product is
-                    // formed in **f64** (`safe_mul_for_bounds_f64` after promoting both
-                    // operands), NOT in f32. A f32 product rounds to nearest and can land
-                    // up to 0.5 f32-ULP *inside* the true product; with cancellation
-                    // between large positive and negative products (|product| ≫ |result|),
-                    // the inward bias accumulated over the `n` terms can exceed the final
-                    // `next_*_f32` 1-ULP widening at the result's (small) magnitude —
-                    // making the caller's `concretize_sound` itself unsound. f32×f32
-                    // promoted to f64 is EXACT (48 < 53 significand bits), so the only
-                    // residual error is the (negligible) f64 sum, which the final directed
-                    // cast covers. The split itself (max/min with 0) is exact in f32 and
-                    // preserved.
-                    let (la_pos, la_neg) =
-                        (nan_propagating_max_zero(la), nan_propagating_min_zero(la));
-                    let (ua_pos, ua_neg) =
-                        (nan_propagating_max_zero(ua), nan_propagating_min_zero(ua));
-                    sum_l += safe_mul_for_bounds_f64(la_pos as f64, xl as f64)
-                        + safe_mul_for_bounds_f64(la_neg as f64, xu as f64);
-                    sum_u += safe_mul_for_bounds_f64(ua_pos as f64, xu as f64)
-                        + safe_mul_for_bounds_f64(ua_neg as f64, xl as f64);
-                }
+                let sum_l = certified_affine_sum_f32(
+                    lb,
+                    (0..n).map(|j| {
+                        let coefficient = la_flat[[b, i, j]];
+                        let endpoint = if coefficient >= 0.0 {
+                            xl_flat[[x_b, j]]
+                        } else {
+                            xu_flat[[x_b, j]]
+                        };
+                        (coefficient, endpoint)
+                    }),
+                    OutwardDirection::Lower,
+                );
+                let sum_u = certified_affine_sum_f32(
+                    ub,
+                    (0..n).map(|j| {
+                        let coefficient = ua_flat[[b, i, j]];
+                        let endpoint = if coefficient >= 0.0 {
+                            xu_flat[[x_b, j]]
+                        } else {
+                            xl_flat[[x_b, j]]
+                        };
+                        (coefficient, endpoint)
+                    }),
+                    OutwardDirection::Upper,
+                );
 
                 // Only write back non-degraded directions: overwriting would
                 // silently defeat the row guard above (#3202).

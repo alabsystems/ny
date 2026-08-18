@@ -17,7 +17,7 @@ use ndarray::{ArrayD, IxDyn};
 use ny_core::GemmEngine;
 use ny_gpu::{Backend, ComputeDevice};
 use ny_propagate::Network;
-use ny_test_utils::{require_external_model, workspace_root, GPU_REGRESSION_NEAR_EXACT_EPSILON};
+use ny_test_utils::{require_external_model, workspace_root};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -146,7 +146,9 @@ fn print_timing_report(
 ///
 /// ACAS-Xu is small (5 inputs, 6x50 hidden, 5 outputs, 22 layers with
 /// AddConstant/SubConstant). CPU CROWN is fast (<300ms), so this benchmark
-/// validates GPU extraction correctness rather than speedup.
+/// validates GPU extraction correctness rather than speedup. CPU and GPU use
+/// different sound relaxation slopes, so their raw bounds are reported but are
+/// not expected to agree to floating-point noise.
 #[ntest::timeout(120000)]
 #[test]
 fn test_gpu_crown_acasxu_timing_benchmark_3460() {
@@ -190,8 +192,19 @@ fn test_gpu_crown_acasxu_timing_benchmark_3460() {
         diff,
     );
 
-    assert!(
-        diff < GPU_REGRESSION_NEAR_EXACT_EPSILON,
-        "GPU vs CPU bounds differ by {diff:.2e}, expected near-exact match",
+    // CPU f64-certified and GPU directed-f32 CROWN collect their own IBP
+    // intermediates and can legitimately select different ReLU slopes. Exact
+    // parity is therefore the wrong correctness criterion (the canonical ACAS
+    // regression documents a stable ~4.7e-2 delta). Require the timed GPU result
+    // to satisfy the actual soundness gates instead: finite ordered bounds, no
+    // looser than IBP, and enclosure of concrete outputs over the input box.
+    let ibp = network.propagate_ibp(&input).expect("IBP");
+    gpu_crown::assert_crown_finite_within_ibp(&gpu_crown, &ibp, "ACAS-Xu 1_1 timed GPU");
+    gpu_crown::assert_crown_encloses_acas_samples(
+        &network,
+        &input,
+        &gpu_crown,
+        512,
+        "ACAS-Xu 1_1 timed GPU",
     );
 }

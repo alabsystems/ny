@@ -767,155 +767,24 @@ fn scatter_nd_updates_variable_crown_equals_dense_transpose() {
     }
 }
 
-// ── 5. Degenerate BatchNorm NaN/Inf handling (zero-variance channels) ────────
-
-/// True value `y = x*scale + bias` for a 1-D-per-channel BatchNorm, computed in
-/// f64 from the layer's stored (possibly Inf) coefficients. Returns NaN only if
-/// the affine genuinely evaluates to NaN (e.g. `0*Inf`), which the soundness
-/// check treats as "must be covered by an Inf-widened interval".
-fn bn_true_value(scale: f32, bias: f32, x: f32) -> f64 {
-    scale as f64 * x as f64 + bias as f64
-}
-
-/// Saturation threshold for treating a bound as "effectively unbounded".
-/// `new_repaired` preserves `±Inf` endpoints and widens NaN to `±Inf` (a
-/// non-finite endpoint carries no proven bound, so no finite substitute is
-/// sound), while the explicit `new_sanitized(clamp)` path used by
-/// `continue_after_overflow` still saturates to `±FALLBACK_BOUND` (see
-/// `bounded_tensor::core::constructors` and `test_new_sanitized_with_infinity`).
-/// A degenerate (zero-variance) BatchNorm channel produces an Inf scale and
-/// hence an ±Inf-magnitude true output; the sound enclosure is unbounded on
-/// that side — at least this threshold, NOT a tighter finite interval.
-const FALLBACK_BOUND: f32 = 1e10;
-
-/// Soundness for a (possibly degenerate) interval `[lo, hi]` enclosing true `y`.
-///
-/// A non-finite endpoint (`±Inf`) or a saturated one (at or beyond
-/// `±FALLBACK_BOUND`) is the conservative widening and contains any
-/// finite/infinite true value on that side. When the true value is an honest
-/// `±Inf` (Inf scale times a nonzero x), the interval must reach at least the
-/// saturation threshold on that side — i.e. it must NOT pretend a finite
-/// tighter-than-threshold bound.
-fn interval_contains(lo: f32, hi: f32, y: f64) -> bool {
-    // If y itself is NaN (0*Inf indeterminate), require maximal widening: the
-    // interval must be saturated on BOTH sides (threshold or Inf).
-    if y.is_nan() {
-        let lo_sat = lo <= -FALLBACK_BOUND;
-        let hi_sat = hi >= FALLBACK_BOUND;
-        return lo_sat && hi_sat;
-    }
-    // Honest ±Inf true value: the bound on that side must reach the saturation
-    // threshold (or be Inf), never a finite value tighter than the threshold.
-    if y == f64::NEG_INFINITY {
-        return lo <= -FALLBACK_BOUND;
-    }
-    if y == f64::INFINITY {
-        return hi >= FALLBACK_BOUND;
-    }
-    // Finite true value: ordinary sandwich, with saturated/Inf endpoints always
-    // accepted as conservative.
-    let lo_ok = lo <= -FALLBACK_BOUND || (lo as f64) <= y + 1e-3 * (1.0 + y.abs());
-    let hi_ok = hi >= FALLBACK_BOUND || (hi as f64) >= y - 1e-3 * (1.0 + y.abs());
-    lo_ok && hi_ok
-}
+// ── 5. Degenerate BatchNorm is refused before propagation ────────────────────
 
 #[test]
-fn batchnorm_degenerate_zero_variance_is_sound() {
-    // Channels:
-    //   0: normal (var large)         -> finite scale
-    //   1: zero variance (var+eps==0) -> scale = ny/0 = +Inf (degenerate)
-    //   2: zero variance, nonzero mean -> scale = +Inf, bias = beta - mean*Inf = -Inf
-    //   3: ny == 0 with zero variance -> scale = 0/0 = NaN? new() => 0*? Actually
-    //      ny=0 / sqrt(0)=0/0 = NaN scale; the layer keeps it (sound via widening).
-    let eps = 1e-5f32;
+fn batchnorm_degenerate_zero_variance_is_refused() {
+    // A zero denominator cannot be represented by a conservative finite
+    // affine. At x==mean the ONNX real expression is 0/sqrt(0), while every
+    // nonzero neighbourhood is unbounded, so admission must fail closed.
+    let eps = 1e-5_f32;
     let ny = ArrayD::from_shape_vec(IxDyn(&[4]), vec![2.0, 1.0, 1.5, 0.0]).unwrap();
     let beta = ArrayD::from_shape_vec(IxDyn(&[4]), vec![0.5, -0.25, 1.0, 0.3]).unwrap();
     let mean = ArrayD::from_shape_vec(IxDyn(&[4]), vec![0.0, 0.0, 2.0, 1.0]).unwrap();
-    // var+eps: channel0 large, channels 1..3 exactly -eps so var+eps == 0.
     let var = ArrayD::from_shape_vec(IxDyn(&[4]), vec![4.0, -eps, -eps, -eps]).unwrap();
-    let layer = BatchNormLayer::new(&ny, &beta, &mean, &var, eps).expect("degenerate BN builds");
 
-    // Confirm the degenerate channels really produced non-finite coefficients,
-    // otherwise this test isn't exercising the firewall it claims to.
-    let any_nonfinite_scale = layer.scale.iter().any(|v| !v.is_finite());
+    let error = BatchNormLayer::new(&ny, &beta, &mean, &var, eps).unwrap_err();
     assert!(
-        any_nonfinite_scale,
-        "expected an Inf/NaN scale to audit the firewall"
+        format!("{error}").contains("strictly positive"),
+        "unexpected refusal: {error}"
     );
-
-    // Input box: shape [1, 4] (NCHW-ish, channel axis = 1). Sample densely.
-    let mut rng = Rng::new(0xB47C_0444);
-    for _ in 0..200 {
-        let mut xl = vec![0.0f32; 4];
-        let mut xu = vec![0.0f32; 4];
-        for k in 0..4 {
-            let (l, u) = rng.interval(-3.0, 3.0);
-            xl[k] = l;
-            xu[k] = u;
-        }
-        let x_bt = BoundedTensor::new(
-            ArrayD::from_shape_vec(IxDyn(&[1, 4]), xl.clone()).unwrap(),
-            ArrayD::from_shape_vec(IxDyn(&[1, 4]), xu.clone()).unwrap(),
-        )
-        .unwrap();
-
-        // 5a. IBP soundness.
-        let ibp = layer.propagate_ibp(&x_bt).expect("BN IBP must not abort");
-        let il = ibp.lower();
-        let iu = ibp.upper();
-        for c in 0..4 {
-            let s = layer.scale[[c]];
-            let b = layer.bias[[c]];
-            let lo = il[[0, c]];
-            let hi = iu[[0, c]];
-            assert!(
-                !lo.is_nan() && !hi.is_nan(),
-                "BN IBP produced NaN bound at channel {c}: [{lo}, {hi}]"
-            );
-            // Sample the channel box.
-            for t in 0..=20 {
-                let x = xl[c] + (xu[c] - xl[c]) * (t as f32 / 20.0);
-                let y = bn_true_value(s, b, x);
-                assert!(
-                    interval_contains(lo, hi, y),
-                    "BN IBP UNSOUND ch {c}: y={y} not in [{lo},{hi}] (scale={s}, bias={b}, x={x})"
-                );
-            }
-        }
-
-        // 5b. CROWN-backward soundness via identity spec, then concretize.
-        let ident = LinearBounds::identity(4);
-        let crown = layer
-            .propagate_linear_with_bounds(&ident, &x_bt)
-            .expect("BN CROWN must not abort");
-        // Concretize over the input box (flattened to 4 inputs).
-        let x_flat = BoundedTensor::new(
-            ArrayD::from_shape_vec(IxDyn(&[4]), xl.clone()).unwrap(),
-            ArrayD::from_shape_vec(IxDyn(&[4]), xu.clone()).unwrap(),
-        )
-        .unwrap();
-        let conc = crown.concretize_sound(&x_flat);
-        let cl = conc.lower();
-        let cu = conc.upper();
-        for c in 0..4 {
-            let s = layer.scale[[c]];
-            let b = layer.bias[[c]];
-            let lo = cl[c];
-            let hi = cu[c];
-            assert!(
-                !lo.is_nan() && !hi.is_nan(),
-                "BN CROWN concretize produced NaN bound at channel {c}: [{lo}, {hi}]"
-            );
-            for t in 0..=20 {
-                let x = xl[c] + (xu[c] - xl[c]) * (t as f32 / 20.0);
-                let y = bn_true_value(s, b, x);
-                assert!(
-                    interval_contains(lo, hi, y),
-                    "BN CROWN UNSOUND ch {c}: y={y} not in [{lo},{hi}] (scale={s}, bias={b}, x={x})"
-                );
-            }
-        }
-    }
 }
 
 // ── 6. gpu_bab "tighter of two sound bounds" merge invariant ──────────────────

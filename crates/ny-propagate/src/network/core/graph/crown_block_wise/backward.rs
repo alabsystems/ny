@@ -25,11 +25,58 @@ use crate::layers::normalization::decomposed::{
 };
 use crate::layers::Layer;
 use crate::network::crown_memory::check_batched_identity_budget;
-use crate::network::tighten_crown_output_with_provenance;
+use crate::network::tighten_crown_output_with_provenance_and_deadline;
 use crate::types::{BoundsProvenance, CrownBackwardResult, CrownIbpFallbackReason};
 
 use super::{BlockAlphaState, LayerNormValidationStats};
 use crate::network::core::graph::GraphNetwork;
+
+fn has_non_finite_block_bounds_with_deadline(
+    bounds: &BatchedLinearBounds,
+    deadline: Option<Instant>,
+) -> Result<bool> {
+    let Some(limit) = deadline else {
+        return Ok(GraphNetwork::has_non_finite_coefficients(bounds));
+    };
+    if Instant::now() >= limit {
+        return Err(NyError::DeadlineExceeded(
+            "block CROWN: deadline exceeded before final coefficient scan".into(),
+        ));
+    }
+    let mut work = 0usize;
+    for values in [
+        bounds.lower_a(),
+        bounds.lower_b(),
+        bounds.upper_a(),
+        bounds.upper_b(),
+    ] {
+        for &value in values {
+            if !value.is_finite() {
+                if Instant::now() >= limit {
+                    return Err(NyError::DeadlineExceeded(
+                        "block CROWN: deadline exceeded during final coefficient scan".into(),
+                    ));
+                }
+                return Ok(true);
+            }
+            work += 1;
+            if work >= 4096 {
+                work = 0;
+                if Instant::now() >= limit {
+                    return Err(NyError::DeadlineExceeded(
+                        "block CROWN: deadline exceeded during final coefficient scan".into(),
+                    ));
+                }
+            }
+        }
+    }
+    if Instant::now() >= limit {
+        return Err(NyError::DeadlineExceeded(
+            "block CROWN: deadline exceeded after final coefficient scan".into(),
+        ));
+    }
+    Ok(false)
+}
 
 /// Constant context for the block-wise CROWN backward loop.
 ///
@@ -51,12 +98,19 @@ struct BlockBackwardCtx<'a> {
 /// checked Dense merge path without reimplementing the f64 sidecar logic.
 struct BlockIndexedPendingBounds {
     bounds_by_idx: Vec<Option<BatchedCrownBounds>>,
+    deadline: Option<Instant>,
 }
 
 impl BlockIndexedPendingBounds {
+    #[cfg(test)]
     fn new(slot_count: usize) -> Self {
+        Self::new_with_deadline(slot_count, None)
+    }
+
+    fn new_with_deadline(slot_count: usize, deadline: Option<Instant>) -> Self {
         Self {
             bounds_by_idx: std::iter::repeat_with(|| None).take(slot_count).collect(),
+            deadline,
         }
     }
 
@@ -78,9 +132,15 @@ impl BlockIndexedPendingBounds {
 
     fn accumulate(&mut self, idx: usize, new_bounds: BatchedCrownBounds) -> Result<()> {
         if let Some(existing) = self.bounds_by_idx[idx].as_mut() {
-            let new_blb =
-                new_bounds.into_batched_dense_checked("crown_block_wise:indexed_pending:new")?;
-            existing.merge_dense_checked(new_blb, "crown_block_wise:indexed_pending:existing")?;
+            let new_blb = new_bounds.into_batched_dense_checked_with_deadline(
+                "crown_block_wise:indexed_pending:new",
+                self.deadline,
+            )?;
+            existing.merge_dense_checked_with_deadline(
+                new_blb,
+                "crown_block_wise:indexed_pending:existing",
+                self.deadline,
+            )?;
         } else {
             self.bounds_by_idx[idx] = Some(new_bounds);
         }
@@ -113,8 +173,20 @@ impl GraphNetwork {
         block_input: &BoundedTensor,
         output_bounds: &BoundedTensor,
         label: &str,
+        deadline: Option<Instant>,
     ) -> Result<CrownBackwardResult> {
-        if Self::has_non_finite_coefficients(&final_lb) {
+        let deadline_fallback = || CrownBackwardResult {
+            bounds: output_bounds.clone(),
+            provenance: BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::DeadlineExceeded),
+        };
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Ok(deadline_fallback());
+        }
+        let has_non_finite = match has_non_finite_block_bounds_with_deadline(&final_lb, deadline) {
+            Err(error) if error.is_deadline_exceeded() => return Ok(deadline_fallback()),
+            result => result?,
+        };
+        if has_non_finite {
             debug!(
                 "Per-block {}: non-finite coefficients in final bounds, using IBP fallback",
                 label
@@ -126,12 +198,21 @@ impl GraphNetwork {
                 ),
             });
         }
-
-        let result = final_lb.concretize_sound(block_input)?;
+        let result = match final_lb.concretize_sound_with_deadline(block_input, deadline) {
+            Err(error) if error.is_deadline_exceeded() => return Ok(deadline_fallback()),
+            result => result?,
+        };
         // #4242: upgrade to provenance-aware tightening for consistency with all
         // other CROWN orchestrators. Detects inverted bounds in addition to NaN.
-        let (tightened, provenance) =
-            tighten_crown_output_with_provenance(result, output_bounds, label)?;
+        let (tightened, provenance) = match tighten_crown_output_with_provenance_and_deadline(
+            result,
+            output_bounds,
+            label,
+            deadline,
+        ) {
+            Err(error) if error.is_deadline_exceeded() => return Ok(deadline_fallback()),
+            result => result?,
+        };
         debug!(
             "Per-block {}: tightening provenance = {:?}",
             label, provenance
@@ -263,7 +344,8 @@ impl GraphNetwork {
         // Initialize identity bounds at block output.
         // Guard: check CPU dense budget before allocating (#3550).
         check_batched_identity_budget(budget_label, &output_shape)?;
-        let mut linear_bounds = BlockIndexedPendingBounds::new(block_input_idx + 1);
+        let mut linear_bounds =
+            BlockIndexedPendingBounds::new_with_deadline(block_input_idx + 1, deadline);
         let output_node_idx = *block_name_to_idx.get(output_node_name).ok_or_else(|| {
             NyError::InvalidSpec(format!(
                 "Per-block {}: output node '{}' missing from block-local index",
@@ -297,7 +379,8 @@ impl GraphNetwork {
             let node = nodes_by_idx[node_idx];
 
             // Convert to Dense for dispatch.
-            let node_lb = node_bcb.into_batched_dense_checked(dispatch_label)?;
+            let node_lb =
+                node_bcb.into_batched_dense_checked_with_deadline(dispatch_label, deadline)?;
 
             // Get first input name, mapping outside-block references to the sentinel.
             let first_input_idx = Self::resolve_block_input_idx(
@@ -656,10 +739,15 @@ impl GraphNetwork {
             ))
         })?;
 
-        let final_lb = final_bcb.into_batched_dense_checked(final_label)?;
+        let final_lb = final_bcb.into_batched_dense_checked_with_deadline(final_label, deadline)?;
 
-        let result =
-            Self::finalize_block_crown_output(final_lb, block_input, output_bounds, label)?;
+        let result = Self::finalize_block_crown_output(
+            final_lb,
+            block_input,
+            output_bounds,
+            label,
+            deadline,
+        )?;
         Ok((result.bounds, norm_stats, result.provenance))
     }
 
@@ -697,6 +785,7 @@ impl GraphNetwork {
 mod tests {
     use ndarray::{arr1, array, ArrayD, IxDyn};
     use ny_tensor::{next_down_f32, BoundedTensor};
+    use std::time::{Duration, Instant};
 
     use crate::bounds::BatchedLinearBounds;
     use crate::types::{BoundsProvenance, CrownIbpFallbackReason};
@@ -738,6 +827,7 @@ mod tests {
             &block_input,
             &output_bounds,
             "CROWN",
+            None,
         )
         .expect("non-finite final coefficients should fall back, not error");
 
@@ -756,6 +846,36 @@ mod tests {
             output_bounds.upper(),
             "fallback upper bounds should reuse the provided forward output"
         );
+    }
+
+    #[test]
+    fn test_finalize_block_crown_output_expired_deadline_is_terminal_forward_fallback() {
+        let final_lb = scalar_batched_linear_bounds(1.0);
+        let block_input =
+            BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+                .expect("block input should construct");
+        let output_bounds =
+            BoundedTensor::new(arr1(&[-0.25_f32]).into_dyn(), arr1(&[0.75_f32]).into_dyn())
+                .expect("output bounds should construct");
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("one-second deadline subtraction");
+
+        let result = GraphNetwork::finalize_block_crown_output(
+            final_lb,
+            &block_input,
+            &output_bounds,
+            "CROWN",
+            Some(expired),
+        )
+        .expect("expired block finalization should use established forward fallback");
+
+        assert_eq!(
+            result.provenance,
+            BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::DeadlineExceeded)
+        );
+        assert_eq!(result.bounds.lower(), output_bounds.lower());
+        assert_eq!(result.bounds.upper(), output_bounds.upper());
     }
 
     #[test]

@@ -658,3 +658,72 @@ mod tests {
         assert_driver_sound_negated(&a, &b, false);
     }
 }
+
+#[cfg(test)]
+mod cancellation_audit_tests {
+    use super::*;
+
+    /// Audit for the failure mode that broke the McCormick planes
+    /// (`docs/MULBINARY_MCCORMICK_F32_CANCELLATION_2026-07-28.md`): an interval
+    /// whose endpoints differ by more than 2^24 in magnitude, so that an f32
+    /// `(l - u) + u` round-trip loses `l` entirely.
+    ///
+    /// `minmax_envelope_random_boxes_tight_ulp` draws BOTH endpoints from one
+    /// scale, so it does not target within-interval asymmetry. This does: `|l|`
+    /// is driven far below `ulp(u)` on one or both operands.
+    ///
+    /// Expected to PASS — `max_corner_residual` derives the constant in f64 from
+    /// the ALREADY-f32-rounded coefficients and rounds outward, which is exactly
+    /// the certification the McCormick constructor lacked. This test records that
+    /// as measured rather than assumed.
+    #[test]
+    fn minmax_envelopes_enclose_under_extreme_within_interval_asymmetry() {
+        let cases: &[(f32, f32, f32, f32)] = &[
+            (-1.0, 16_777_216.0, 1.0, 100.0),
+            (-1.0, 1.6e9, -1.0, 1.6e9),
+            (-1e-6, 1e6, -1e-6, 1e6),
+            (-0.026_068_168, 1_153_335.9, 7_220.358, 148_963.05),
+            (-1e-30, 1e30, -1e-30, 1e30),
+            (1e-20, 3.4e38, -3.4e38, -1e-20),
+            (-3.4e38, 3.4e38, -1.0, 1.0),
+        ];
+        for &(lx, ux, ly, uy) in cases {
+            let Some(env) = max_envelope(lx, ux, ly, uy) else {
+                continue; // degenerate/decided box: no envelope needed
+            };
+            for &(x, y) in &[(lx, ly), (lx, uy), (ux, ly), (ux, uy)] {
+                let truth = f64::from(x.max(y));
+                let lo = env.lower.eval(x, y);
+                let hi = env.upper.eval(x, y);
+                assert!(
+                    lo <= truth,
+                    "max LOWER plane above truth: x=[{lx:e},{ux:e}] y=[{ly:e},{uy:e}] \
+                     at ({x:e},{y:e}): {lo:e} > {truth:e}"
+                );
+                assert!(
+                    hi >= truth,
+                    "max UPPER plane below truth: x=[{lx:e},{ux:e}] y=[{ly:e},{uy:e}] \
+                     at ({x:e},{y:e}): {hi:e} < {truth:e}"
+                );
+            }
+            let Some(menv) = min_envelope(lx, ux, ly, uy) else {
+                continue;
+            };
+            for &(x, y) in &[(lx, ly), (lx, uy), (ux, ly), (ux, uy)] {
+                let truth = f64::from(x.min(y));
+                let lo = menv.lower.eval(x, y);
+                let hi = menv.upper.eval(x, y);
+                assert!(
+                    lo <= truth,
+                    "min LOWER plane above truth: x=[{lx:e},{ux:e}] y=[{ly:e},{uy:e}] \
+                     at ({x:e},{y:e}): {lo:e} > {truth:e}"
+                );
+                assert!(
+                    hi >= truth,
+                    "min UPPER plane below truth: x=[{lx:e},{ux:e}] y=[{ly:e},{uy:e}] \
+                     at ({x:e},{y:e}): {hi:e} < {truth:e}"
+                );
+            }
+        }
+    }
+}

@@ -143,6 +143,46 @@ def test_vnncomp_resolution_binds_row_and_content_identity(tmp_path: Path) -> No
     assert resolved["files"]["preset"]["sha256"]
 
 
+def test_vnncomp_source_identity_is_strict_and_paired(tmp_path: Path) -> None:
+    entry = _fixture_vnncomp_entry(tmp_path / "repo", tmp_path / "benchmarks")
+    entry["source_repository"] = "https://github.com/VNN-COMP/vnncomp2025_benchmarks"
+    entry["source_commit"] = "a" * 40
+
+    validated = baseline._validate_entry(entry, 0)
+    assert validated["source_repository"] == entry["source_repository"]
+    assert validated["source_commit"] == entry["source_commit"]
+
+    missing_commit = dict(entry)
+    missing_commit.pop("source_commit")
+    with pytest.raises(baseline.BaselineError, match="must be provided together"):
+        baseline._validate_entry(missing_commit, 0)
+
+    wrong_scheme = dict(entry)
+    wrong_scheme["source_repository"] = "http://github.com/VNN-COMP/benchmarks"
+    with pytest.raises(baseline.BaselineError, match="canonical HTTPS"):
+        baseline._validate_entry(wrong_scheme, 0)
+
+    abbreviated_commit = dict(entry)
+    abbreviated_commit["source_commit"] = "a" * 12
+    with pytest.raises(baseline.BaselineError, match="lowercase 40-hex"):
+        baseline._validate_entry(abbreviated_commit, 0)
+
+
+def test_expected_verdict_is_closed_and_preserved(tmp_path: Path) -> None:
+    entry = _fixture_vnncomp_entry(tmp_path / "repo", tmp_path / "benchmarks")
+    expected = dict(entry["expected"])
+    expected["expected_result"] = "falsified"
+    entry["expected"] = expected
+
+    validated = baseline._validate_entry(entry, 0)
+    assert validated["expected"]["expected_result"] == "falsified"
+
+    invalid = dict(entry)
+    invalid["expected"] = {**expected, "expected_result": "unknown"}
+    with pytest.raises(baseline.BaselineError, match="expected_result"):
+        baseline._validate_entry(invalid, 0)
+
+
 def test_vnncomp_resolution_rejects_source_row_drift(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     benchmark_root = tmp_path / "benchmarks"
@@ -166,15 +206,11 @@ def test_vnncomp_resolution_rejects_source_row_drift(tmp_path: Path) -> None:
 
 def test_parse_telemetry_preserves_phase_and_frontier_frames() -> None:
     parsed = baseline.parse_telemetry(
-        "\n".join(
-            [
-                "unrelated solver output",
-                "[phase] root start t=0.0s",
-                "[phase] root end t=1.5s",
-                "[frontier] d=3 worst=-0.12500 domains=64 t=2.0s",
-                "[frontier] d=4 worst=-1.2e-2 domains=96 t=2.5s",
-            ]
-        )
+        "unrelated solver output\n"
+        "[phase] root start t=0.0s\n"
+        "[phase] root end t=1.5s\n"
+        "[frontier] d=3 worst=-0.12500 domains=64 t=2.0s\n"
+        "[frontier] d=4 worst=-1.2e-2 domains=96 t=2.5s"
     )
 
     assert parsed["phase"]["events"] == [

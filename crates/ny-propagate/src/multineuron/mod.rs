@@ -36,15 +36,36 @@
 
 use crate::beta_crown::bab_cuts::{CutKind, CutMetadata};
 use crate::bounds::LinearBounds;
+use ny_core::{NyError, Result as NyResult};
 use ny_tensor::{next_down_f32, next_up_f32};
+use std::time::Instant;
 
 pub mod producer;
-pub use producer::{combined_row_octahedron, combined_rows_octahedra};
+pub use producer::{
+    combined_row_octahedron, combined_row_octahedron_with_deadline, combined_rows_octahedra,
+    combined_rows_octahedra_with_deadline,
+};
+
+// The historical authority entry stays hard-disabled. M1 exposes only the
+// private, call-local observation orchestrator below; the evidence-bearing
+// carrier remains private and cannot become an ambient/raw-facet API or verdict
+// surface.
+#[allow(dead_code)]
+mod certified_cut_authority;
+#[allow(dead_code)]
+mod certified_cut_m2_shadow;
+#[allow(dead_code)]
+mod certified_cut_shadow;
+pub(crate) use certified_cut_m2_shadow::production_resident_cut_m2_projected_enabled;
+pub(crate) use certified_cut_shadow::{
+    production_resident_cut_shadow_enabled, run_production_resident_cut_shadow,
+    ProductionResidentCutShadowRequest,
+};
 
 pub mod root_inject;
 
 mod support_exact;
-pub use support_exact::ExactRelu2Support;
+pub use support_exact::{ExactRelu2FacetCertificate, ExactRelu2Support};
 
 /// Row-major (C-order) flat index of the neuron at `(c, h, w)` in a conv output
 /// tensor of shape `[C, H, W]` — SOUNDNESS-CRITICAL for conv-group facets
@@ -324,6 +345,15 @@ pub struct Facet {
     pub b: f32,
 }
 
+fn check_exact_facet_deadline(deadline: Option<Instant>, stage: &str) -> NyResult<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(format!(
+            "exact k=2 facet production: deadline exceeded {stage}"
+        )));
+    }
+    Ok(())
+}
+
 impl Facet {
     /// Residual `a·w − b` at a point `w = (x_1,x_2,y_1,y_2)` (≤ 0 ⇔ satisfied),
     /// evaluated in f64 for a well-scaled test.
@@ -378,12 +408,27 @@ fn normal4(d1: &[f64; 4], d2: &[f64; 4], d3: &[f64; 4]) -> [f64; 4] {
 /// valid support half-space without trusting this vertex set, its feasibility
 /// slack, or its deduplication.
 pub fn proposed_hull_normals(verts: &[[f64; 4]]) -> Vec<[f32; 4]> {
+    proposed_hull_normals_with_deadline(verts, None)
+        .expect("an unbounded facet proposal cannot exceed a deadline")
+}
+
+/// Deadline-aware form of [`proposed_hull_normals`].
+///
+/// Geometry remains proposal-only. The deadline is polled through the
+/// combinatorial four-vertex enumeration so a cut request cannot spend past its
+/// private budget before reaching the exact checker.
+pub fn proposed_hull_normals_with_deadline(
+    verts: &[[f64; 4]],
+    deadline: Option<Instant>,
+) -> NyResult<Vec<[f32; 4]>> {
+    check_exact_facet_deadline(deadline, "before normal enumeration")?;
     let n = verts.len();
     if n < 5 {
         // Lower-dimensional lifted set (weakly-correlated / degenerate pair):
         // no full-dimensional hull, so emit no coupling facet. Sound: fewer
         // half-spaces only enlarges the relaxation (design R7).
-        return Vec::new();
+        check_exact_facet_deadline(deadline, "before publishing empty normal list")?;
+        return Ok(Vec::new());
     }
     let scale = verts
         .iter()
@@ -397,6 +442,7 @@ pub fn proposed_hull_normals(verts: &[[f64; 4]]) -> Vec<[f32; 4]> {
         for i1 in (i0 + 1)..n {
             for i2 in (i1 + 1)..n {
                 for i3 in (i2 + 1)..n {
+                    check_exact_facet_deadline(deadline, "during normal enumeration")?;
                     let p0 = verts[i0];
                     let d1 = sub4(&verts[i1], &p0);
                     let d2 = sub4(&verts[i2], &p0);
@@ -439,15 +485,16 @@ pub fn proposed_hull_normals(verts: &[[f64; 4]]) -> Vec<[f32; 4]> {
 
     // The f64 geometry chooses directions only.  Casting fixes the exact normal
     // that a separate checker must certify.
-    dirs.into_iter()
-        .filter_map(|(a64, _)| {
-            let a32 = [a64[0] as f32, a64[1] as f32, a64[2] as f32, a64[3] as f32];
-            if a32.iter().any(|c| !c.is_finite()) {
-                return None;
-            }
-            Some(a32)
-        })
-        .collect()
+    let mut normals = Vec::with_capacity(dirs.len());
+    for (a64, _) in dirs {
+        check_exact_facet_deadline(deadline, "during stored-normal conversion")?;
+        let a32 = [a64[0] as f32, a64[1] as f32, a64[2] as f32, a64[3] as f32];
+        if a32.iter().all(|c| c.is_finite()) {
+            normals.push(a32);
+        }
+    }
+    check_exact_facet_deadline(deadline, "after normal enumeration")?;
+    Ok(normals)
 }
 
 /// Legacy research facet producer over a supplied lifted vertex set.
@@ -504,24 +551,70 @@ pub fn coupling_facets(p: &Octahedron2) -> Vec<Facet> {
         .collect()
 }
 
-/// Default-unused exact-support repair path for k=2 coupling facets.
+/// Default-unused exact-support repair path for k=2 coupling facets that
+/// preserves exact-checker evidence and its support domain.
 ///
 /// Floating geometry supplies only stored-`f32` normal proposals.  Every RHS is
 /// rebuilt by exact maximization over `P` intersected with all four ReLU
 /// orthants.  A failed proposal is dropped, which can only weaken the relaxation.
 /// This function is intentionally not wired to any production authority gate.
-pub fn certified_coupling_facets_exact(p: &Octahedron2) -> Vec<Facet> {
+pub fn certified_coupling_facet_certificates_exact(
+    p: &Octahedron2,
+) -> Vec<ExactRelu2FacetCertificate> {
+    certified_coupling_facet_certificates_exact_with_deadline(p, None)
+        .expect("an unbounded exact facet check cannot exceed a deadline")
+}
+
+/// Deadline-aware form of
+/// [`certified_coupling_facet_certificates_exact`].
+///
+/// The same request-local deadline covers proposal enumeration and the
+/// per-normal exact-support checks. Expiration publishes no partial certificate
+/// list: the caller receives [`NyError::DeadlineExceeded`] and must skip the
+/// candidate.
+pub fn certified_coupling_facet_certificates_exact_with_deadline(
+    p: &Octahedron2,
+    deadline: Option<Instant>,
+) -> NyResult<Vec<ExactRelu2FacetCertificate>> {
+    check_exact_facet_deadline(deadline, "before support construction")?;
     if !p.both_unstable() {
-        return Vec::new();
+        check_exact_facet_deadline(deadline, "before publishing empty certificate list")?;
+        return Ok(Vec::new());
     }
-    let Some(checker) = ExactRelu2Support::new(p) else {
-        return Vec::new();
+    let checker = ExactRelu2Support::new(p);
+    check_exact_facet_deadline(deadline, "after support construction")?;
+    let Some(checker) = checker else {
+        check_exact_facet_deadline(deadline, "before publishing empty certificate list")?;
+        return Ok(Vec::new());
     };
     let verts = arrangement_lifted_vertices(p);
-    proposed_hull_normals(&verts)
+    check_exact_facet_deadline(deadline, "after lifted-vertex construction")?;
+    let normals = proposed_hull_normals_with_deadline(&verts, deadline)?;
+    let mut certificates = Vec::with_capacity(normals.len());
+    for normal in normals {
+        check_exact_facet_deadline(deadline, "before exact support check")?;
+        if let Some(certificate) = checker.certify_normal_certificate(normal) {
+            if certificate.facet().is_coupling() {
+                certificates.push(certificate);
+            }
+        }
+        check_exact_facet_deadline(deadline, "after exact support check")?;
+    }
+    check_exact_facet_deadline(deadline, "after exact support checks")?;
+    Ok(certificates)
+}
+
+/// Compatibility projection of
+/// [`certified_coupling_facet_certificates_exact`] into raw facets.
+///
+/// Raw [`Facet`] values deliberately carry no proof identity and remain
+/// unsuitable as inputs to a verdict-bearing carrier. Existing dark research
+/// callers retain this view; new authority work must consume the certificate
+/// function and bind each certificate's support domain to its request.
+pub fn certified_coupling_facets_exact(p: &Octahedron2) -> Vec<Facet> {
+    certified_coupling_facet_certificates_exact(p)
         .into_iter()
-        .filter_map(|a| checker.certify_normal(a))
-        .filter(Facet::is_coupling)
+        .map(|certificate| certificate.facet())
         .collect()
 }
 
@@ -536,6 +629,19 @@ pub fn certified_coupling_facets_exact(p: &Octahedron2) -> Vec<Facet> {
 pub enum MnVar {
     PreActivation,
     PostActivation,
+}
+
+/// Outcome of the pre-relaxation half of one multi-neuron Lagrangian term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MnInjectOutcome {
+    /// This group is inactive at the current node; no mutation or completion is
+    /// required.
+    Inert,
+    /// The group committed its post-activation half. The caller must complete
+    /// the pre-activation and price half after the ReLU relaxation.
+    Injected,
+    /// Validation failed before mutation, so the entire group was omitted.
+    Skipped,
 }
 
 /// A single term of a multi-neuron group facet — a real coefficient on one
@@ -581,6 +687,12 @@ impl MultiNeuronConstraint {
     /// Create a validated group constraint. `beta` must be `≥ 0` and finite;
     /// `bias` and every term coefficient must be finite (mirrors
     /// `GraphCuttingPlane::new`). Optimizer state initialized to zero.
+    ///
+    /// SOUNDNESS: additionally enforces the SINGLE-ANCHOR invariant — `terms`
+    /// must be non-empty and every term must name the SAME ReLU node. That node
+    /// is the group's [`anchor`](MultiNeuronConstraint::anchor), the one place
+    /// its `−β_c·b_c` price may be charged (see
+    /// [`inject_pre_terms_after_relu`](MultiNeuronConstraint::inject_pre_terms_after_relu)).
     pub fn new(terms: Vec<MnTerm>, bias: f32, beta: f32) -> Result<Self, String> {
         if !bias.is_finite() {
             return Err(format!(
@@ -599,6 +711,32 @@ impl MultiNeuronConstraint {
                     t.coefficient
                 ));
             }
+        }
+        // SOUNDNESS — SINGLE-ANCHOR invariant (guards the §2.2 step-3 price).
+        //
+        // The Lagrangian embedding adds ONE constant `−β_c·b_c` per group to the
+        // margin whose LOWER bound is computed, and `inject_pre_terms_after_relu`
+        // is where that constant is folded. The backward sweep visits every ReLU
+        // node once and offers EVERY pooled group at EVERY node, so the fold must
+        // be pinned to a single, unambiguous node — the group's ANCHOR.
+        //
+        // A group with NO terms has no anchor; a group whose terms straddle two
+        // ReLU nodes has two. Either way the "once per group" contract is not
+        // expressible, and paying the price more than once with `b_c < 0` RAISES
+        // the lower bound above what the Lagrangian justifies — a strict FALSE
+        // TIGHTENING (a false VERIFIED). Reject both here so `anchor()` is
+        // total and the price is provably once-per-group.
+        let Some(anchor) = terms.first().map(|t| t.node_name.clone()) else {
+            return Err(
+                "MultiNeuronConstraint must carry at least one term (no anchor node)".to_string(),
+            );
+        };
+        if let Some(t) = terms.iter().find(|t| t.node_name != anchor) {
+            return Err(format!(
+                "MultiNeuronConstraint terms must all live on ONE ReLU node (the group anchor); \
+                 got '{anchor}' and '{}'",
+                t.node_name
+            ));
         }
         Ok(Self {
             terms,
@@ -641,6 +779,20 @@ impl MultiNeuronConstraint {
         Self::new(terms, facet.b, 0.0)
     }
 
+    /// The single ReLU node every term of this group lives on — the group's
+    /// ANCHOR, and the ONLY node at which its `−β_c·b_c` price may be charged.
+    ///
+    /// Total by construction: [`MultiNeuronConstraint::new`] rejects a term-less
+    /// group and a group whose terms straddle two nodes, so the first term's
+    /// `node_name` IS the anchor. The `""` arm is unreachable and fails closed
+    /// (no real graph node is named `""`, so nothing would ever be charged).
+    pub fn anchor(&self) -> &str {
+        self.terms
+            .first()
+            .map(|t| t.node_name.as_str())
+            .unwrap_or("")
+    }
+
     pub fn beta(&self) -> f32 {
         self.beta
     }
@@ -675,30 +827,80 @@ impl MultiNeuronConstraint {
     // mutation folds its f32 rounding into the certified coeff-err (R4) via the
     // inc1 primitives `add_to_lower_column` / `add_lower_bias_outward`.
     //
-    // Convention: for a group at ReLU node `R`, every term carries
-    // `node_name == R` and `neuron_idx` = the neuron's flat column in `R` (ReLU
-    // is elementwise, so the input and output columns share the index).
+    // Convention (ENFORCED by `new`'s single-anchor invariant): for a group at
+    // ReLU node `R`, every term carries `node_name == R` and `neuron_idx` = the
+    // neuron's flat column in `R` (ReLU is elementwise, so the input and output
+    // columns share the index). `R` is the group's ANCHOR — step 3's constant is
+    // charged there and NOWHERE else, because the sweep offers every pooled
+    // group at every ReLU node.
 
-    /// §2.2 step 1 — inject the post-activation terms `+β_c·g_i` on the
-    /// ReLU-OUTPUT columns of `node_lb` BEFORE the ReLU relaxation. Call at the
-    /// ReLU node's backward step with the incoming (pre-relaxation) carrier.
-    pub fn inject_post_terms_before_relu(
+    /// Validate all terms at the anchor before either half of the Lagrangian
+    /// contribution mutates a carrier.
+    ///
+    /// The coefficient mass and the `−β_c·b_c` price form one indivisible
+    /// contribution. An out-of-range term must therefore suppress the whole
+    /// group, not silently drop one coefficient while still paying its price.
+    fn injectable_at(&self, relu_node: &str, ncols: usize) -> bool {
+        self.bias.is_finite()
+            && self.anchor() == relu_node
+            && self
+                .terms
+                .iter()
+                .all(|term| term.neuron_idx < ncols && term.coefficient.is_finite())
+    }
+
+    /// §2.2 step 1 — inject post-activation terms `+β_c·g_i` on the ReLU
+    /// output columns before relaxation.
+    ///
+    /// The product is computed in f64 and rounded down. Since every ReLU output
+    /// is non-negative, this is the conservative coefficient direction. The
+    /// f32 carrier-addition gap is retained in its certified coefficient-error
+    /// matrix. [`MnInjectOutcome::Injected`] obligates the caller to invoke
+    /// [`inject_pre_terms_after_relu`](Self::inject_pre_terms_after_relu) after
+    /// relaxation; a failed completion degrades the lower carrier before it is
+    /// returned to the caller.
+    #[must_use]
+    pub(crate) fn inject_post_terms_before_relu(
         &self,
         node_lb: &mut LinearBounds,
         relu_node: &str,
         beta: f32,
-    ) {
-        if beta == 0.0 || !beta.is_finite() {
-            return;
+    ) -> MnInjectOutcome {
+        if !beta.is_finite() || beta <= 0.0 || self.anchor() != relu_node {
+            return MnInjectOutcome::Inert;
         }
-        for t in &self.terms {
-            if t.var == MnVar::PostActivation && t.node_name == relu_node {
-                let c = beta * t.coefficient;
-                if c.is_finite() && c != 0.0 {
-                    node_lb.add_to_lower_column(t.neuron_idx, c);
-                }
+        if !self.injectable_at(relu_node, node_lb.num_inputs()) {
+            return MnInjectOutcome::Skipped;
+        }
+        let has_post = self
+            .terms
+            .iter()
+            .any(|term| term.var == MnVar::PostActivation);
+        if has_post {
+            node_lb.ensure_lower_coeff_err_tracking();
+        }
+        for term in &self.terms {
+            if term.var != MnVar::PostActivation {
+                continue;
+            }
+            let coeff = ny_core::f64_to_f32_down(
+                ny_core::f32_to_f64_exact(beta) * ny_core::f32_to_f64_exact(term.coefficient),
+            );
+            // A floating-point comparison may classify a subnormal as zero
+            // when DAZ is enabled.  In particular, silently dropping a
+            // negative post coefficient would increase a lower functional on
+            // y >= 0.  Inspect the representation instead.
+            if coeff.to_bits() & 0x7fff_ffff == 0 {
+                continue;
+            }
+            if !coeff.is_finite()
+                || !node_lb.add_to_lower_column_with_err(term.neuron_idx, coeff, 0.0)
+            {
+                node_lb.degrade_lower_to_vacuous();
+                return MnInjectOutcome::Injected;
             }
         }
+        MnInjectOutcome::Injected
     }
 
     /// §2.2 steps 2+3 — inject the pre-activation terms `+β_c·a_i` on the
@@ -707,30 +909,75 @@ impl MultiNeuronConstraint {
     /// (outward). Call at the ReLU node's backward step AFTER the relaxation,
     /// before accumulating `new_lb` into the input.
     ///
-    /// The bias is folded exactly once per call, so a caller must invoke this
-    /// once per group per ReLU node (mirrors how the facet contributes a single
-    /// `−β_c·b_c` constant to the margin).
-    pub fn inject_pre_terms_after_relu(
+    /// Call this only to complete an [`MnInjectOutcome::Injected`] result from
+    /// the same group, node, and bit-identical `beta`. The pre-activation
+    /// product is sign-indefinite, so its f64-to-f32 residual is explicitly
+    /// carried as coefficient error. The price `β_c·b_c` is rounded up before
+    /// subtraction, ensuring the lower relaxation never pays less than the
+    /// certificate requires.
+    ///
+    /// Returns `false` when completion is impossible and replaces the lower
+    /// relaxation with a vacuous one before returning. This internal fail-closed
+    /// action keeps direct callers sound even if they only honor `#[must_use]`
+    /// diagnostically; the production coordinator repeats it defensively.
+    #[must_use]
+    pub(crate) fn inject_pre_terms_after_relu(
         &self,
         new_lb: &mut LinearBounds,
         relu_node: &str,
         beta: f32,
-    ) {
-        if beta == 0.0 || !beta.is_finite() {
-            return;
+    ) -> bool {
+        if !beta.is_finite() || beta <= 0.0 || self.anchor() != relu_node {
+            return true;
         }
-        for t in &self.terms {
-            if t.var == MnVar::PreActivation && t.node_name == relu_node {
-                let c = beta * t.coefficient;
-                if c.is_finite() && c != 0.0 {
-                    new_lb.add_to_lower_column(t.neuron_idx, c);
-                }
+        if !self.injectable_at(relu_node, new_lb.num_inputs()) {
+            new_lb.degrade_lower_to_vacuous();
+            return false;
+        }
+        let has_pre = self
+            .terms
+            .iter()
+            .any(|term| term.var == MnVar::PreActivation);
+        if has_pre {
+            new_lb.ensure_lower_coeff_err_tracking();
+        }
+        for term in &self.terms {
+            if term.var != MnVar::PreActivation {
+                continue;
+            }
+            let exact =
+                ny_core::f32_to_f64_exact(beta) * ny_core::f32_to_f64_exact(term.coefficient);
+            let coeff = exact as f32;
+            if !coeff.is_finite() {
+                new_lb.degrade_lower_to_vacuous();
+                return false;
+            }
+            let residual = ny_core::f64_to_f32_up((ny_core::f32_to_f64_exact(coeff) - exact).abs());
+            if !residual.is_finite() {
+                new_lb.degrade_lower_to_vacuous();
+                return false;
+            }
+            // DAZ may make an arithmetic comparison erase a non-zero
+            // subnormal coefficient or residual before the certified column
+            // mutation sees it.  Bitwise zero classification preserves the
+            // exact binary32 operands in every floating-point environment.
+            if coeff.to_bits() & 0x7fff_ffff == 0 && residual.to_bits() & 0x7fff_ffff == 0 {
+                continue;
+            }
+            if !new_lb.add_to_lower_column_with_err(term.neuron_idx, coeff, residual) {
+                new_lb.degrade_lower_to_vacuous();
+                return false;
             }
         }
-        let bias_delta = -beta * self.bias;
-        if bias_delta.is_finite() {
-            new_lb.add_lower_bias_outward(bias_delta);
+        let price = ny_core::f64_to_f32_up(
+            ny_core::f32_to_f64_exact(beta) * ny_core::f32_to_f64_exact(self.bias),
+        );
+        if !price.is_finite() {
+            new_lb.degrade_lower_to_vacuous();
+            return false;
         }
+        new_lb.add_lower_bias_outward(-price);
+        true
     }
 
     pub fn terms(&self) -> &[MnTerm] {

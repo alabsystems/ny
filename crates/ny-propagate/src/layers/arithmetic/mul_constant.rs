@@ -6,7 +6,7 @@
 
 use ndarray::{Array1, ArrayD, Axis, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};
-use ny_tensor::{BoundedTensor, RepairStrategy};
+use ny_tensor::{mul_down_f32, mul_up_f32, BoundedTensor, RepairStrategy};
 use std::borrow::Cow;
 use tracing::debug;
 
@@ -136,11 +136,16 @@ impl BoundPropagation for MulConstantLayer {
                 out_lower[idx.clone()] = 0.0;
                 out_upper[idx] = 0.0;
             } else if c_val > 0.0 {
-                out_lower[idx.clone()] = l * c_val;
-                out_upper[idx] = u * c_val;
+                // DIRECTED: the f64 product of two f32s is exact, so
+                // `mul_down_f32`/`mul_up_f32` give the tightest correct
+                // endpoints and are exact whenever the product is
+                // representable. A plain f32 `*` rounds to nearest, i.e.
+                // inward, which is unsound.
+                out_lower[idx.clone()] = mul_down_f32(l, c_val);
+                out_upper[idx] = mul_up_f32(u, c_val);
             } else {
-                out_lower[idx.clone()] = u * c_val;
-                out_upper[idx] = l * c_val;
+                out_lower[idx.clone()] = mul_down_f32(u, c_val);
+                out_upper[idx] = mul_up_f32(l, c_val);
             }
         }
 

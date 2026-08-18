@@ -20,12 +20,13 @@
 //! values. Interning deduplicates structurally-equal values, so handle equality
 //! coincides exactly with value equality — making the derived `PartialEq`/`Eq`/
 //! `Hash` semantically correct. All arithmetic is performed in true bignum; the
-//! former `i64` emission guard is gone, so `to_clean_string` always succeeds and
-//! emits the full (possibly very large) `n/d` string.
+//! former `i64` emission guard is gone, so `to_clean_string` emits the full
+//! (possibly very large) `n/d` string. The only remaining refusal is the
+//! fail-closed arena-poison guard described below.
 
 use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
-use num_traits::{CheckedDiv, One, Signed, ToPrimitive, Zero};
+use num_traits::{CheckedDiv, CheckedSub, One, Signed, ToPrimitive, Zero};
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -36,11 +37,16 @@ use trust as _;
 
 /// Errors that can arise during exact rational arithmetic or emission.
 ///
-/// The `Overflow` and `NotI64` variants are retained for API compatibility with
-/// the i128-era callers (so existing `match`/`?` sites keep compiling), but with
-/// arbitrary-precision arithmetic they are no longer produced by this module.
+/// The `Overflow` and `NotI64` variants are retained as legacy named variants
+/// for callers that still reference them, but arbitrary-precision arithmetic
+/// no longer produces either one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RatError {
+    /// An impossible arena fallback was reached. A fallback substitutes `0/1`
+    /// to keep the low-level accessor total, so no value from this thread may
+    /// cross a proof/check/emission boundary after the flag is set.
+    #[error("rational arena is poisoned; refusing a potentially substituted value")]
+    Poisoned,
     /// A denominator of zero was requested.
     #[error("rational denominator cannot be zero")]
     ZeroDenominator,
@@ -174,6 +180,18 @@ pub fn poisoned() -> bool {
     POISONED.with(|p| p.get())
 }
 
+/// Refuse use of a thread whose arena has taken a totalizing fallback.
+///
+/// Kept as a small named function so every checked arithmetic and emission path
+/// applies the same entry/exit policy.
+pub(crate) fn ensure_healthy() -> Result<(), RatError> {
+    if poisoned() {
+        Err(RatError::Poisoned)
+    } else {
+        Ok(())
+    }
+}
+
 /// Test-only override of the poison flag, to exercise the fail-closed paths
 /// (the real fallback arms are unreachable by construction and cannot be
 /// forced from safe code).
@@ -221,6 +239,17 @@ fn intern(v: BigRational) -> u32 {
         a.dedup.insert(key, id);
         id
     })
+}
+
+/// Checked wrapper around [`intern`]. The second gate is essential: `intern`
+/// remains total by returning slot zero on an impossible borrow/capacity
+/// failure, and that substitution must never be reported as a successful
+/// construction.
+fn checked_intern(v: BigRational) -> Result<u32, RatError> {
+    ensure_healthy()?;
+    let id = intern(v);
+    ensure_healthy()?;
+    Ok(id)
 }
 
 /// Fetch a clone of the `BigRational` value behind a handle.
@@ -304,15 +333,17 @@ impl Rat {
     /// Construct a reduced rational `num/den` from machine integers.
     ///
     /// # Errors
-    /// Returns [`RatError::ZeroDenominator`] when `den == 0`.
+    /// Returns [`RatError::ZeroDenominator`] when `den == 0`, or
+    /// [`RatError::Poisoned`] after an arena fallback.
     pub fn new(num: i128, den: i128) -> Result<Self, RatError> {
+        ensure_healthy()?;
         if den == 0 {
             return Err(RatError::ZeroDenominator);
         }
         // BigRational::new reduces and normalises the sign of the denominator.
         let r = BigRational::new(BigInt::from(num), BigInt::from(den));
         Ok(Rat {
-            id: intern(r),
+            id: checked_intern(r)?,
             _not_send: PhantomData,
         })
     }
@@ -320,14 +351,35 @@ impl Rat {
     /// Construct a reduced rational from arbitrary-precision integers.
     ///
     /// # Errors
-    /// Returns [`RatError::ZeroDenominator`] when `den` is zero.
+    /// Returns [`RatError::ZeroDenominator`] when `den` is zero, or
+    /// [`RatError::Poisoned`] after an arena fallback.
     pub fn from_bigints(num: BigInt, den: BigInt) -> Result<Self, RatError> {
+        ensure_healthy()?;
         if den.is_zero() {
             return Err(RatError::ZeroDenominator);
         }
         let r = BigRational::new(num, den);
         Ok(Rat {
-            id: intern(r),
+            id: checked_intern(r)?,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Construct a reduced rational from arbitrary-precision integers for an
+    /// `Option`-returning caller.
+    ///
+    /// This is exactly [`Rat::from_bigints`] with its error mapped to `None`,
+    /// expressed without a generic `Result::ok` boundary so the certificate
+    /// verifier can follow the complete construction path.
+    #[must_use]
+    pub fn from_bigints_opt(num: BigInt, den: BigInt) -> Option<Self> {
+        ensure_healthy().ok()?;
+        if den.is_zero() {
+            return None;
+        }
+        let r = BigRational::new(num, den);
+        Some(Rat {
+            id: checked_intern(r).ok()?,
             _not_send: PhantomData,
         })
     }
@@ -335,10 +387,22 @@ impl Rat {
     /// Construct a rational from an integer.
     #[must_use]
     pub fn from_int(n: i128) -> Self {
+        // This legacy convenience API cannot return an error. Preserve its
+        // signature, but never clear the poison: every checked consumer will
+        // refuse the returned handle. Returning ZERO while already poisoned
+        // also avoids presenting a newly interned value as trustworthy.
+        if poisoned() {
+            return Rat::ZERO;
+        }
         let r = BigRational::from_integer(BigInt::from(n));
-        Rat {
+        let result = Rat {
             id: intern(r),
             _not_send: PhantomData,
+        };
+        if poisoned() {
+            Rat::ZERO
+        } else {
+            result
         }
     }
 
@@ -350,13 +414,19 @@ impl Rat {
     /// non-finite constant should fail (certificate producers fail closed).
     #[must_use]
     pub fn from_f32_exact(f: f32) -> Option<Self> {
-        if !f.is_finite() {
+        ensure_healthy().ok()?;
+        // Classify entirely from the representation. A floating comparison
+        // (`f == 0.0`) can treat a subnormal operand as zero when DAZ is live;
+        // exact certificate lifting must remain independent of MXCSR state.
+        let bits = f.to_bits();
+        let magnitude = bits & 0x7fff_ffff;
+        let exp_bits = bits.wrapping_shr(23) & 0xff;
+        if exp_bits == 0xff {
             return None;
         }
-        if f == 0.0 {
+        if magnitude == 0 {
             return Some(Rat::ZERO);
         }
-        let bits = f.to_bits();
         // behavior-identical: `bits` is u32 and 31 < 32, so `wrapping_shr(31)`
         // equals `>> 31`; it drops the spurious shift-overflow VC.
         let sign: i128 = if bits.wrapping_shr(31) == 0 { 1 } else { -1 };
@@ -368,7 +438,7 @@ impl Rat {
         // for the model's phantom values, and it emits no overflow VC.
         // behavior-identical: `bits` is u32 and 23 < 32, so `wrapping_shr(23)`
         // equals `>> 23`; it drops the spurious shift-overflow VC.
-        let exp_field = i64::from(bits.wrapping_shr(23) as u8);
+        let exp_field = i64::from(exp_bits as u8);
         let frac = i128::from(bits & 0x007f_ffff);
         let (mantissa, e2) = if exp_field == 0 {
             (frac, -149) // = -126 - 23: subnormal f32 base-2 exponent; literal avoids a Sub overflow VC on a compile-time constant
@@ -385,15 +455,57 @@ impl Rat {
             mantissa
         });
         if e2 >= 0 {
-            // Finite f32 exponents keep the shift far below BigInt limits.
-            let num = signed << u32::try_from(e2).ok()?;
-            Rat::from_bigints(num, BigInt::from(1)).ok()
+            // On this branch e2 = exp_field - 150 is in 0..=105, so the cast
+            // is exact for every finite binary32 input.
+            let num = signed << (e2 as u32);
+            Rat::from_bigints_opt(num, BigInt::from(1))
         } else {
             // e2 < 0 on this branch, so `unsigned_abs` equals -e2 exactly;
             // unlike `-e2` it is total (no Neg-overflow VC). e2 is in
             // [-149, -1] here, so the u64 shift amount is tiny.
             let den = BigInt::from(1) << e2.unsigned_abs();
-            Rat::from_bigints(signed, den).ok()
+            Rat::from_bigints_opt(signed, den)
+        }
+    }
+
+    /// The EXACT dyadic rational value of a finite `f64` (no rounding).
+    ///
+    /// Classification and zero detection use the representation bits rather
+    /// than floating-point comparisons, so subnormal inputs remain exact even
+    /// when the host floating-point environment enables DAZ/FTZ behavior.
+    /// Returns `None` for NaN/±∞ or a poisoned arena.
+    #[must_use]
+    pub fn from_f64_exact(f: f64) -> Option<Self> {
+        ensure_healthy().ok()?;
+        let bits = f.to_bits();
+        let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+        let exp_bits = bits.wrapping_shr(52) & 0x7ff;
+        if exp_bits == 0x7ff {
+            return None;
+        }
+        if magnitude == 0 {
+            return Some(Rat::ZERO);
+        }
+
+        let mantissa_field = bits & 0x000f_ffff_ffff_ffff;
+        let (mantissa, exponent) = if exp_bits == 0 {
+            (mantissa_field, -1074_i64)
+        } else {
+            (
+                mantissa_field | 0x0010_0000_0000_0000,
+                i64::try_from(exp_bits).ok()?.wrapping_sub(1075),
+            )
+        };
+        let magnitude = BigInt::from(mantissa);
+        let signed = if bits.wrapping_shr(63) == 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
+        if exponent >= 0 {
+            Rat::from_bigints(signed << u32::try_from(exponent).ok()?, BigInt::from(1)).ok()
+        } else {
+            Rat::from_bigints(signed, BigInt::from(1) << exponent.unsigned_abs()).ok()
         }
     }
 
@@ -413,6 +525,30 @@ impl Rat {
     #[must_use]
     pub fn to_big(self) -> BigRational {
         val(self.id)
+    }
+
+    /// Read both canonical components with one arena lookup and fail closed if
+    /// that lookup took a totalizing fallback.
+    ///
+    /// This is the authoritative extraction API for arithmetic and certificate
+    /// emission. The legacy [`Self::num`]/[`Self::den`] accessors remain for
+    /// diagnostics and source compatibility.
+    /// # Errors
+    ///
+    /// Returns [`RatError::Poisoned`] if the arena has taken a totalizing
+    /// fallback before or during the lookup.
+    pub fn checked_parts(self) -> Result<(BigInt, BigInt), RatError> {
+        ensure_healthy()?;
+        let (num, den) = val(self.id).into_raw();
+        ensure_healthy()?;
+        if !den.is_positive() {
+            // Canonical BigRational denominators are positive. Treat a broken
+            // invariant exactly like an arena fallback rather than allowing a
+            // zero/negative denominator into a certificate.
+            poison();
+            return Err(RatError::Poisoned);
+        }
+        Ok((num, den))
     }
 
     /// True when the value is exactly zero. (Slot 0 by interning invariant.)
@@ -436,75 +572,129 @@ impl Rat {
     /// Exact arbitrary-precision addition. Never overflows.
     ///
     /// # Errors
-    /// Infallible; the `Result` is kept for source compatibility.
-    #[allow(clippy::should_implement_trait, clippy::unnecessary_wraps)]
+    /// Returns [`RatError::Poisoned`] after an arena fallback.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: Self) -> Result<Self, RatError> {
-        let r = val(self.id) + val(other.id);
-        Ok(Rat {
-            id: intern(r),
-            _not_send: PhantomData,
-        })
+        ensure_healthy()?;
+        if self.id == 0 {
+            ensure_healthy()?;
+            return Ok(other);
+        }
+        if other.id == 0 {
+            ensure_healthy()?;
+            return Ok(self);
+        }
+        let (a, b) = self.checked_parts()?;
+        let (c, d) = other.checked_parts()?;
+        // Equal denominators are common for exact f32 dyadics. Avoiding the
+        // general cross-product also prevents a large transient denominator.
+        if b == d {
+            return Rat::from_bigints(a + c, b);
+        }
+        // a/b + c/d = (a*d + c*b)/(b*d). BigInt arithmetic itself is total;
+        // from_bigints guards the sole Ratio panic boundary (zero denominator).
+        Rat::from_bigints(&a * &d + &c * &b, &b * &d)
     }
 
     /// Exact arbitrary-precision subtraction. Never overflows.
     ///
     /// # Errors
-    /// Infallible; the `Result` is kept for source compatibility.
-    #[allow(clippy::should_implement_trait, clippy::unnecessary_wraps)]
+    /// Returns [`RatError::Poisoned`] after an arena fallback.
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, other: Self) -> Result<Self, RatError> {
-        let r = val(self.id) - val(other.id);
-        Ok(Rat {
-            id: intern(r),
-            _not_send: PhantomData,
-        })
+        ensure_healthy()?;
+        if self.id == other.id {
+            ensure_healthy()?;
+            return Ok(Rat::ZERO);
+        }
+        if other.id == 0 {
+            ensure_healthy()?;
+            return Ok(self);
+        }
+        let (a, b) = self.checked_parts()?;
+        let (c, d) = other.checked_parts()?;
+        if b == d {
+            return Rat::from_bigints(a - c, b);
+        }
+        Rat::from_bigints(&a * &d - &c * &b, &b * &d)
     }
 
     /// Exact arbitrary-precision multiplication. Never overflows.
     ///
     /// # Errors
-    /// Infallible; the `Result` is kept for source compatibility.
-    #[allow(clippy::should_implement_trait, clippy::unnecessary_wraps)]
+    /// Returns [`RatError::Poisoned`] after an arena fallback.
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: Self) -> Result<Self, RatError> {
-        let r = val(self.id) * val(other.id);
-        Ok(Rat {
-            id: intern(r),
-            _not_send: PhantomData,
-        })
+        ensure_healthy()?;
+        if self.id == 0 || other.id == 0 {
+            ensure_healthy()?;
+            return Ok(Rat::ZERO);
+        }
+        if self.id == 1 {
+            ensure_healthy()?;
+            return Ok(other);
+        }
+        if other.id == 1 {
+            ensure_healthy()?;
+            return Ok(self);
+        }
+        let (a, b) = self.checked_parts()?;
+        let (c, d) = other.checked_parts()?;
+        // Trust's RC-C proof deliberately avoids opaque gcd/division callees.
+        // Still cancel the frequent exact reciprocal factors without division.
+        if a == d {
+            return Rat::from_bigints(c, b);
+        }
+        if c == b {
+            return Rat::from_bigints(a, d);
+        }
+        if a == -&d {
+            return Rat::from_bigints(-c, b);
+        }
+        if c == -&b {
+            return Rat::from_bigints(-a, d);
+        }
+        Rat::from_bigints(a * c, b * d)
     }
 
     /// Negation.
     #[allow(clippy::should_implement_trait)]
     #[must_use]
     pub fn neg(self) -> Self {
-        let r = -val(self.id);
-        Rat {
-            id: intern(r),
-            _not_send: PhantomData,
+        if poisoned() {
+            return self;
         }
+        if self.id == 0 {
+            return self;
+        }
+        // -(a/b) = (-a)/b. `BigInt` Neg is total; b>0 by the arena invariant so
+        // `from_bigints` never Errs on a healthy arena. If that invariant ever
+        // breaks, retain totality but poison the thread before returning.
+        let parts = self.checked_parts();
+        if let Ok((num, den)) = parts {
+            if let Ok(r) = Rat::from_bigints(-num, den) {
+                return r;
+            }
+        }
+        poison();
+        self
     }
 
     /// Multiplicative inverse.
     ///
     /// # Errors
-    /// Returns [`RatError::ZeroDenominator`] when the value is zero.
+    /// Returns [`RatError::ZeroDenominator`] when the value is zero, or
+    /// [`RatError::Poisoned`] after an arena fallback.
     pub fn inv(self) -> Result<Self, RatError> {
-        // Value-local zero guard: test the SAME `BigRational` that `recip`
-        // runs on, in one monomorphic body, so the nonzero fact is
-        // intraprocedural and the verifier's `is_zero(x) == (x == 0)` axiom
-        // discharges the `Ratio::recip` may-panic obligation. (The old shape
-        // guarded on the handle — `self.id == 0` — which is equivalent by the
-        // interning invariant but opaque to the verifier.) `val` releases its
-        // arena borrow on return, so the later `intern` (which takes a fresh
-        // borrow) cannot reentrant-conflict.
-        let v = val(self.id);
-        let r = if v.is_zero() { None } else { Some(v.recip()) };
-        match r {
-            None => Err(RatError::ZeroDenominator),
-            Some(r) => Ok(Rat {
-                id: intern(r),
-                _not_send: PhantomData,
-            }),
+        ensure_healthy()?;
+        if self.id == 0 {
+            return Err(RatError::ZeroDenominator);
         }
+        if self.id == 1 {
+            return Ok(Rat::ONE);
+        }
+        let (num, den) = self.checked_parts()?;
+        Rat::from_bigints(den, num)
     }
 
     /// Absolute value.
@@ -533,22 +723,28 @@ impl Rat {
     /// `r − √self ≤ 1/(d·2^k)`.
     #[must_use]
     pub fn sqrt_upper(self, precision_bits: u32) -> Option<Self> {
+        ensure_healthy().ok()?;
         if self.is_negative() {
             return None;
         }
         if self.is_zero() {
+            ensure_healthy().ok()?;
             return Some(Rat::ZERO);
         }
         // Positive by the checks above; BigRational keeps the denominator
         // positive, so both magnitudes convert losslessly.
-        let n = self.num().to_biguint()?;
-        let d = self.den().to_biguint()?;
+        let (num, den) = self.checked_parts().ok()?;
+        let n = num.to_biguint()?;
+        let d = den.to_biguint()?;
         let scaled = (&n * &d) << (precision_bits as usize).saturating_mul(2);
         let t = isqrt_floor(&scaled);
         let num = if &t * &t == scaled { t } else { t + 1_u32 };
         let den = &d << (precision_bits as usize);
-        let r = Rat::from_bigints(BigInt::from(num), BigInt::from(den)).ok()?;
+        // `d` is the positive denominator of a nonzero rational, so this
+        // shifted denominator is nonzero by construction.
+        let r = Rat::from_bigints_opt(BigInt::from(num), BigInt::from(den))?;
         debug_assert!(r.mul(r).is_ok_and(|sq| sq >= self));
+        ensure_healthy().ok()?;
         Some(r)
     }
 
@@ -557,22 +753,28 @@ impl Rat {
     /// beyond `f64` range saturate to ±∞.
     #[must_use]
     pub fn to_f64_approx(self) -> f64 {
-        val(self.id).to_f64().unwrap_or(f64::NAN)
+        if poisoned() {
+            return f64::NAN;
+        }
+        let value = val(self.id).to_f64().unwrap_or(f64::NAN);
+        if poisoned() {
+            f64::NAN
+        } else {
+            value
+        }
     }
 
     /// Emit the canonical certificate string (`"n"` or `"n/d"`) with the full
-    /// arbitrary-precision numerator and denominator. Always succeeds.
+    /// arbitrary-precision numerator and denominator.
     ///
     /// # Errors
-    /// Infallible; the `Result` is kept for source compatibility with the
-    /// i64-era schema code.
-    #[allow(clippy::unnecessary_wraps)]
+    /// Returns [`RatError::Poisoned`] after an arena fallback.
     pub fn to_clean_string(self) -> Result<String, RatError> {
-        let r = val(self.id);
-        if r.denom().is_one() {
-            Ok(r.numer().to_string())
+        let (num, den) = self.checked_parts()?;
+        if den.is_one() {
+            Ok(num.to_string())
         } else {
-            Ok(format!("{}/{}", r.numer(), r.denom()))
+            Ok(format!("{num}/{den}"))
         }
     }
 }
@@ -601,7 +803,7 @@ fn isqrt_floor(n: &BigUint) -> BigUint {
         // is UNREACHABLE and fails safe to `0` (ny-cert's fail-soft idiom).
         // Removes the div-by-zero panic boundary the verifier cannot discharge
         // across the loop structure; quotient identical for every real input.
-        let q = n.checked_div(&x).unwrap_or_else(BigUint::zero);
+        let q = n.checked_div(&x).unwrap_or(BigUint::zero());
         let y = (&x + q) >> 1;
         if y >= x {
             break;
@@ -609,7 +811,10 @@ fn isqrt_floor(n: &BigUint) -> BigUint {
         x = y;
     }
     while &x * &x > *n {
-        x -= 1_u32;
+        // The loop invariant gives x >= 2 here. Use a checked operation so
+        // the implementation remains total even when that invariant is not
+        // available to a local verifier.
+        x = x.checked_sub(&BigUint::one()).unwrap_or(BigUint::zero());
     }
     while (&x + 1_u32) * (&x + 1_u32) <= *n {
         x += 1_u32;
@@ -666,6 +871,15 @@ impl Ord for Rat {
 mod tests {
     use super::*;
 
+    /// Keep the thread-local poison flag from leaking when an assertion panics.
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            set_poisoned_for_test(false);
+        }
+    }
+
     #[test]
     fn reduces_on_construction() {
         let r = Rat::new(2, 4).unwrap();
@@ -706,6 +920,22 @@ mod tests {
     #[test]
     fn rejects_zero_denominator() {
         assert_eq!(Rat::new(1, 0), Err(RatError::ZeroDenominator));
+        assert_eq!(
+            Rat::from_bigints_opt(BigInt::from(1), BigInt::from(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn bigint_option_constructor_matches_checked_constructor() {
+        for (num, den) in [(6_i32, 8_i32), (-9, 12), (0, 7), (5, -11)] {
+            let num = BigInt::from(num);
+            let den = BigInt::from(den);
+            assert_eq!(
+                Rat::from_bigints_opt(num.clone(), den.clone()),
+                Rat::from_bigints(num, den).ok()
+            );
+        }
     }
 
     #[test]
@@ -724,6 +954,33 @@ mod tests {
         assert_eq!(s.den(), BigInt::from(3));
         // numerator has > 128 bits
         assert!(s.num().bits() > 128);
+    }
+
+    #[test]
+    fn huge_arithmetic_matches_big_rational() {
+        let pow = BigInt::from(2u8).pow(4096);
+        let shared_den = pow.clone();
+        let a_big = BigRational::new(BigInt::from(3), shared_den.clone());
+        let b_big = BigRational::new(BigInt::from(5), shared_den);
+        let a = Rat::from_bigints(a_big.numer().clone(), a_big.denom().clone()).unwrap();
+        let b = Rat::from_bigints(b_big.numer().clone(), b_big.denom().clone()).unwrap();
+
+        assert_eq!(a.add(b).unwrap().to_big(), &a_big + &b_big);
+        assert_eq!(a.sub(b).unwrap().to_big(), &a_big - &b_big);
+
+        let u_big = BigRational::new(&pow + 1_u8, &pow + 3_u8);
+        let v_big = BigRational::new(&pow + 5_u8, &pow + 7_u8);
+        let u = Rat::from_bigints(u_big.numer().clone(), u_big.denom().clone()).unwrap();
+        let v = Rat::from_bigints(v_big.numer().clone(), v_big.denom().clone()).unwrap();
+        assert_eq!(u.add(v).unwrap().to_big(), &u_big + &v_big);
+        assert_eq!(u.sub(v).unwrap().to_big(), &u_big - &v_big);
+        assert_eq!(u.mul(v).unwrap().to_big(), &u_big * &v_big);
+
+        let reciprocal = u.inv().unwrap();
+        assert_eq!(reciprocal.to_big(), u_big.recip());
+        assert_eq!(u.mul(reciprocal).unwrap(), Rat::ONE);
+        assert_eq!(u.neg().mul(reciprocal).unwrap(), Rat::from_int(-1));
+        assert_eq!(Rat::ZERO.inv(), Err(RatError::ZeroDenominator));
     }
 
     #[test]
@@ -811,13 +1068,45 @@ mod tests {
     fn poison_flag_mechanics_set_and_clear() {
         // The real fallback arms cannot be forced from safe code (the arena is
         // non-reentrant by construction), so exercise the flag mechanics
-        // directly through the test-only setter. Thread-local: this cannot
-        // leak into tests on other threads, and we clear it before returning.
+        // directly through the test-only setter. Thread-local: this cannot leak
+        // into tests on other threads, and the guard clears it even on panic.
         assert!(!poisoned());
         set_poisoned_for_test(true);
+        let _reset = PoisonReset;
         assert!(poisoned());
-        set_poisoned_for_test(false);
-        assert!(!poisoned());
+    }
+
+    #[test]
+    fn checked_operations_fail_closed_after_poison() {
+        let a = Rat::new(1, 3).unwrap();
+        let b = Rat::new(1, 6).unwrap();
+        set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+
+        assert_eq!(Rat::new(1, 2), Err(RatError::Poisoned));
+        assert_eq!(
+            Rat::from_bigints(BigInt::from(1), BigInt::from(2)),
+            Err(RatError::Poisoned)
+        );
+        assert_eq!(
+            Rat::from_bigints_opt(BigInt::from(1), BigInt::from(2)),
+            None
+        );
+        assert_eq!(Rat::from_f32_exact(0.5), None);
+        assert_eq!(a.checked_parts(), Err(RatError::Poisoned));
+        assert_eq!(a.add(b), Err(RatError::Poisoned));
+        assert_eq!(a.sub(b), Err(RatError::Poisoned));
+        assert_eq!(a.mul(b), Err(RatError::Poisoned));
+        assert_eq!(a.inv(), Err(RatError::Poisoned));
+        assert_eq!(a.to_clean_string(), Err(RatError::Poisoned));
+        assert_eq!(a.sqrt_upper(32), None);
+        assert!(a.to_f64_approx().is_nan());
+
+        // The infallible legacy operations remain total, but can neither clear
+        // poison nor make their results cross a checked boundary.
+        assert_eq!(Rat::from_int(7), Rat::ZERO);
+        assert_eq!(a.neg(), a);
+        assert!(poisoned());
     }
 
     #[test]
@@ -832,15 +1121,63 @@ mod tests {
             Rat::from_f32_exact(0.1),
             Some(Rat::new(13_421_773, 1 << 27).unwrap())
         );
-        // Extremes stay exact: f32::MAX and the smallest positive subnormal.
+        // Extremes stay exact: f32::MAX and boundary normal/subnormal values.
         let max = Rat::from_f32_exact(f32::MAX).unwrap();
         assert_eq!(max.den(), BigInt::from(1));
-        let sub = Rat::from_f32_exact(f32::from_bits(1)).unwrap();
-        assert_eq!(sub.num(), BigInt::from(1));
-        assert_eq!(sub.den(), BigInt::from(2u8).pow(149));
+        let min_sub = Rat::from_f32_exact(f32::from_bits(0x0000_0001)).unwrap();
+        let neg_min_sub = Rat::from_f32_exact(f32::from_bits(0x8000_0001)).unwrap();
+        assert_eq!(min_sub.num(), BigInt::from(1));
+        assert_eq!(neg_min_sub.num(), BigInt::from(-1));
+        assert_eq!(min_sub.den(), BigInt::from(2u8).pow(149));
+        assert_eq!(neg_min_sub.den(), BigInt::from(2u8).pow(149));
+
+        let max_sub = Rat::from_f32_exact(f32::from_bits(0x007f_ffff)).unwrap();
+        let neg_max_sub = Rat::from_f32_exact(f32::from_bits(0x807f_ffff)).unwrap();
+        let max_sub_num = BigInt::from((1_u32 << 23) - 1);
+        assert_eq!(max_sub.num(), max_sub_num);
+        assert_eq!(neg_max_sub.num(), -max_sub_num);
+        assert_eq!(max_sub.den(), BigInt::from(2u8).pow(149));
+        assert_eq!(neg_max_sub.den(), BigInt::from(2u8).pow(149));
+
+        let min_normal = Rat::from_f32_exact(f32::from_bits(0x0080_0000)).unwrap();
+        assert_eq!(min_normal.num(), BigInt::from(1));
+        assert_eq!(min_normal.den(), BigInt::from(2u8).pow(126));
         // Non-finite fails closed.
         assert_eq!(Rat::from_f32_exact(f32::NAN), None);
         assert_eq!(Rat::from_f32_exact(f32::INFINITY), None);
         assert_eq!(Rat::from_f32_exact(f32::NEG_INFINITY), None);
+    }
+
+    #[test]
+    fn from_f64_exact_is_lossless_and_fails_closed() {
+        assert_eq!(Rat::from_f64_exact(0.0), Some(Rat::ZERO));
+        assert_eq!(Rat::from_f64_exact(-0.0), Some(Rat::ZERO));
+        assert_eq!(Rat::from_f64_exact(0.5), Some(Rat::new(1, 2).unwrap()));
+        assert_eq!(Rat::from_f64_exact(-2.75), Some(Rat::new(-11, 4).unwrap()));
+
+        let min_sub = Rat::from_f64_exact(f64::from_bits(0x0000_0000_0000_0001)).unwrap();
+        let neg_min_sub = Rat::from_f64_exact(f64::from_bits(0x8000_0000_0000_0001)).unwrap();
+        assert_eq!(min_sub.num(), BigInt::from(1));
+        assert_eq!(neg_min_sub.num(), BigInt::from(-1));
+        assert_eq!(min_sub.den(), BigInt::from(2_u8).pow(1074));
+        assert_eq!(neg_min_sub.den(), BigInt::from(2_u8).pow(1074));
+
+        let max_sub = Rat::from_f64_exact(f64::from_bits(0x000f_ffff_ffff_ffff)).unwrap();
+        let neg_max_sub = Rat::from_f64_exact(f64::from_bits(0x800f_ffff_ffff_ffff)).unwrap();
+        let max_sub_num = BigInt::from((1_u64 << 52) - 1);
+        assert_eq!(max_sub.num(), max_sub_num);
+        assert_eq!(neg_max_sub.num(), -max_sub_num);
+        assert_eq!(max_sub.den(), BigInt::from(2_u8).pow(1074));
+        assert_eq!(neg_max_sub.den(), BigInt::from(2_u8).pow(1074));
+
+        let min_normal = Rat::from_f64_exact(f64::from_bits(0x0010_0000_0000_0000)).unwrap();
+        assert_eq!(min_normal.num(), BigInt::from(1));
+        assert_eq!(min_normal.den(), BigInt::from(2_u8).pow(1022));
+        let max = Rat::from_f64_exact(f64::MAX).unwrap();
+        assert_eq!(max.den(), BigInt::from(1));
+
+        assert_eq!(Rat::from_f64_exact(f64::NAN), None);
+        assert_eq!(Rat::from_f64_exact(f64::INFINITY), None);
+        assert_eq!(Rat::from_f64_exact(f64::NEG_INFINITY), None);
     }
 }

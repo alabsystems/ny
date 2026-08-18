@@ -45,6 +45,8 @@ import NyProof.SatReluSweep.V90C449
 import NyProof.CersyveInstance_DoubleIntegrator
 import NyProof.CersyveInstance_Pendulum
 import NyProof.CersyveInstance_Unicycle
+import NyProof.SignFusion
+import NyProof.IntegerInterval
 
 -- The 6 cite-map grounding theorems (every CertifiedModuloCite rests on these):
 #print axioms Crownproof.farkas_premise_combination
@@ -205,3 +207,101 @@ import NyProof.CersyveInstance_Unicycle
 #print axioms Crownproof.CersyveInstance_Pendulum.pendulum_safe_forever_full
 #print axioms Crownproof.CersyveInstance_Unicycle.unicycle_safe_forever
 #print axioms Crownproof.CersyveInstance_Unicycle.unicycle_safe_forever_full
+
+-- Sign-pair fusion (L1) + value-branch coverage (L2) — the two lemmas under the
+-- fused-`Sign` / binarized-net BaB route (NyProof/SignFusion.lean;
+-- docs/SIGN_COMPOSITE_FUSION_DESIGN_2026-07-27.md).  L1: `Sign→Add(c)→Sign` with
+-- `0 < |c| < 1` is EXACTLY a two-valued step (both polarities, plus the guards that
+-- make `0 < |c| < 1` necessary and a rounding-robust form).  L2: the closed/closed
+-- value-fixing split is sound iff the children's AGREEMENT sets cover — the regions
+-- covering is NOT enough (`three_clause_split_unsound` is the machine-checked
+-- refutation of the informal argument), and the same split on the RAW three-valued
+-- ONNX `Sign` is unsound (`sgn_closed_split_unsound`):
+#print axioms Crownproof.SignFusion.sgn_three_valued
+#print axioms Crownproof.SignFusion.hs_two_valued
+#print axioms Crownproof.SignFusion.hs'_two_valued
+#print axioms Crownproof.SignFusion.sign_pair_fusion
+#print axioms Crownproof.SignFusion.sign_pair_fusion_neg
+#print axioms Crownproof.SignFusion.sign_pair_fusion_rewrite
+#print axioms Crownproof.SignFusion.sign_pair_fusion_of_signFaithful
+#print axioms Crownproof.SignFusion.sign_pair_fusion_fails_of_one_le
+#print axioms Crownproof.SignFusion.sign_pair_fusion_fails_of_zero_const
+#print axioms Crownproof.SignFusion.sign_pair_fusion_fails_of_le_neg_one
+#print axioms Crownproof.SignFusion.branch_sound_of_agreement_cover
+#print axioms Crownproof.SignFusion.branch_sound_two
+#print axioms Crownproof.SignFusion.three_clause_split_unsound
+#print axioms Crownproof.SignFusion.twoValued_closed_split_sound
+#print axioms Crownproof.SignFusion.hs_closed_split_sound
+#print axioms Crownproof.SignFusion.hs'_closed_split_sound
+#print axioms Crownproof.SignFusion.sgn_closed_split_unsound
+#print axioms Crownproof.SignFusion.offcenter_closed_split_unsound
+#print axioms Crownproof.SignFusion.plus_child_must_contain_breakpoint
+#print axioms Crownproof.SignFusion.hs_fix_pos_on_closed_sound
+#print axioms Crownproof.SignFusion.hs_fix_neg_on_open_sound
+#print axioms Crownproof.SignFusion.hs_fix_neg_on_closed_unsound
+#print axioms Crownproof.SignFusion.hs'_fix_neg_on_closed_sound
+#print axioms Crownproof.SignFusion.hs'_fix_pos_on_closed_unsound
+#print axioms Crownproof.SignFusion.frontierSound_root
+#print axioms Crownproof.SignFusion.frontierSound_verdict
+#print axioms Crownproof.SignFusion.frontierSound_refine
+#print axioms Crownproof.SignFusion.frontierSound_refine_sign
+
+-- exact INTEGER / LATTICE interval reasoning for binarized nets
+-- (NyProof/IntegerInterval.lean).  Integrality is MEASURED on the three
+-- traffic_signs_recognition_2023 artifacts, not assumed: layer 1 is NOT integral over the
+-- continuous `Real` input box (`box_contains_nonintegral`), everything from the first
+-- `Sign` onward IS (`post_sign_layer_even`).  The three claims the integer route rests on:
+-- tightening `[l,u]` to `[ceil l, floor u]` is sound AND a contraction AND optimal;
+-- stability on integers is exact and ASYMMETRIC (matching `hs_fix_neg_on_closed_unsound`,
+-- with `hs_stable_neg_int_unsound` refuting the symmetric form ny currently ships); and
+-- integer interval arithmetic for +/- and +-1-weighted sums is exact, not merely sound:
+#print axioms Crownproof.IntegerInterval.isIntegral_intCast
+#print axioms Crownproof.IntegerInterval.isIntegral_zero
+#print axioms Crownproof.IntegerInterval.isIntegral_one
+#print axioms Crownproof.IntegerInterval.isIntegral_neg_one
+#print axioms Crownproof.IntegerInterval.OnLattice.isIntegral
+#print axioms Crownproof.IntegerInterval.onLattice_one
+#print axioms Crownproof.IntegerInterval.OnLattice.add
+#print axioms Crownproof.IntegerInterval.OnLattice.sub
+#print axioms Crownproof.IntegerInterval.OnLattice.neg
+#print axioms Crownproof.IntegerInterval.intTighten_sound
+#print axioms Crownproof.IntegerInterval.intTighten_contracts
+#print axioms Crownproof.IntegerInterval.intTighten_set_eq
+#print axioms Crownproof.IntegerInterval.intTighten_optimal
+#print axioms Crownproof.IntegerInterval.intTighten_infeasible
+#print axioms Crownproof.IntegerInterval.intTighten_idem
+#print axioms Crownproof.IntegerInterval.lattice_tighten_sound
+#print axioms Crownproof.IntegerInterval.lattice_lower_forces_nonneg
+#print axioms Crownproof.IntegerInterval.lattice_lower_forces_nonneg_sharp
+#print axioms Crownproof.IntegerInterval.lattice_upper_forces_nonpos
+#print axioms Crownproof.IntegerInterval.isIntegral_add
+#print axioms Crownproof.IntegerInterval.isIntegral_sub
+#print axioms Crownproof.IntegerInterval.isIntegral_neg
+#print axioms Crownproof.IntegerInterval.isIntegral_mul
+#print axioms Crownproof.IntegerInterval.isIntegral_max
+#print axioms Crownproof.IntegerInterval.onLattice_max
+#print axioms Crownproof.IntegerInterval.int_interval_add_sound
+#print axioms Crownproof.IntegerInterval.int_interval_add_exact
+#print axioms Crownproof.IntegerInterval.int_interval_sub_sound
+#print axioms Crownproof.IntegerInterval.pm1_mul
+#print axioms Crownproof.IntegerInterval.pm1_weighted_sum
+#print axioms Crownproof.IntegerInterval.pm1_weighted_sum_even
+#print axioms Crownproof.IntegerInterval.pm1_range_exact
+#print axioms Crownproof.IntegerInterval.hs_stable_pos_int
+#print axioms Crownproof.IntegerInterval.hs_stable_neg_int
+#print axioms Crownproof.IntegerInterval.hs_stable_neg_int_unsound
+#print axioms Crownproof.IntegerInterval.hs_stable_neg_int_sharp
+#print axioms Crownproof.IntegerInterval.hs_stable_pos_int_sharp
+#print axioms Crownproof.IntegerInterval.hs_stable_int_complete
+#print axioms Crownproof.IntegerInterval.hs'_stable_pos_int
+#print axioms Crownproof.IntegerInterval.hs'_stable_neg_int
+#print axioms Crownproof.IntegerInterval.hs'_stable_pos_int_unsound
+#print axioms Crownproof.IntegerInterval.affine_sign_iff_int
+#print axioms Crownproof.IntegerInterval.hs_affine_int
+#print axioms Crownproof.IntegerInterval.affine_ne_zero_of_threshold_not_int
+#print axioms Crownproof.IntegerInterval.affine_strictMono
+#print axioms Crownproof.IntegerInterval.box_contains_nonintegral
+#print axioms Crownproof.IntegerInterval.post_sign_layer_integral
+#print axioms Crownproof.IntegerInterval.post_sign_layer_even
+#print axioms Crownproof.IntegerInterval.softmax_cmp_iff
+#print axioms Crownproof.IntegerInterval.straddling_bound_pins_zero

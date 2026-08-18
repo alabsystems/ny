@@ -5,8 +5,9 @@
 //! Runtime-oriented host-side contract tests for WGPU pipeline/shader invariants.
 
 use super::{
-    ADD_IBP_SHADER, CONV2D_IBP_IM2COL_SHADER, CONV_COL2IM_SHADER, CONV_RESHAPE_SHADER,
-    GEMM_F32_SHADER, GEMM_F32_SMALL_K_SHADER, LINEAR_IBP_SHADER, MATMUL_IBP_SHADER,
+    ADD_IBP_SHADER, CONV2D_IBP_IM2COL_SHADER, CONV_COL2IM_SHADER, CONV_COL2IM_TAINT_SHADER,
+    CONV_RESHAPE_SHADER, CONV_RESHAPE_TAINT_SHADER, CROWN_STRIDED_GATHER_SHADER, GEMM_F32_SHADER,
+    GEMM_F32_SMALL_K_SHADER, GEMM_F32_SMALL_K_TAINT_SHADER, LINEAR_IBP_SHADER, MATMUL_IBP_SHADER,
     RELU_IBP_SHADER, SCALE_IBP_SHADER, SOFTMAX_APPLY_SHADER, SOFTMAX_REDUCE_SHADER,
     TRANSPOSE_IBP_SHADER,
 };
@@ -15,9 +16,11 @@ use std::mem::size_of;
 // ============================================================================
 // WGSL compilation smoke tests
 // ============================================================================
-// Compile each shader through wgpu's WGSL parser on the host adapter.
-// This catches syntax errors and type mismatches without running on GPU hardware.
+// Compile every shader through the same Naga WGSL front-end used by wgpu.
+// This catches syntax and type errors hermetically: adapter absence is not a
+// reason to leave shader source unvalidated.
 
+#[cfg(feature = "gpu-tests")]
 fn with_wgpu_device(f: impl FnOnce(&wgpu::Device)) {
     pollster::block_on(async {
         let instance = wgpu::Instance::default();
@@ -45,6 +48,7 @@ fn test_wgpu_all_shaders_compile() {
         ("linear_ibp", LINEAR_IBP_SHADER),
         ("gemm_f32", GEMM_F32_SHADER),
         ("gemm_f32_small_k", GEMM_F32_SMALL_K_SHADER),
+        ("gemm_f32_small_k_taint", GEMM_F32_SMALL_K_TAINT_SHADER),
         ("matmul_ibp", MATMUL_IBP_SHADER),
         ("softmax_reduce", SOFTMAX_REDUCE_SHADER),
         ("softmax_apply", SOFTMAX_APPLY_SHADER),
@@ -52,21 +56,18 @@ fn test_wgpu_all_shaders_compile() {
         ("scale_ibp", SCALE_IBP_SHADER),
         ("conv2d_ibp_im2col", CONV2D_IBP_IM2COL_SHADER),
         ("conv_reshape", CONV_RESHAPE_SHADER),
+        ("conv_reshape_taint", CONV_RESHAPE_TAINT_SHADER),
         ("conv_col2im", CONV_COL2IM_SHADER),
+        ("conv_col2im_taint", CONV_COL2IM_TAINT_SHADER),
         ("relu_ibp", RELU_IBP_SHADER),
         ("add_ibp", ADD_IBP_SHADER),
+        ("crown_strided_gather", CROWN_STRIDED_GATHER_SHADER),
     ];
 
-    with_wgpu_device(|device| {
-        for (label, source) in shaders {
-            let _module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
-            });
-            // create_shader_module validates WGSL syntax and typing.
-            // If we reach here without panic, the shader compiled.
-        }
-    });
+    for (label, source) in shaders {
+        naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("{label} must parse as WGSL: {error}"));
+    }
 }
 
 // ============================================================================
@@ -77,24 +78,27 @@ fn test_wgpu_all_shaders_compile() {
 // layout mismatches between shader bindings and Rust-side bind group layouts.
 
 #[test]
+#[cfg(feature = "gpu-tests")]
 fn test_wgpu_all_pipelines_create_successfully() {
     with_wgpu_device(|device| {
         // Each of these calls create_shader_module + bind_group_layout + pipeline.
         // Panics on any mismatch between shader bindings and layout entries.
-        let (_p, _l) = super::super::WgpuDevice::create_linear_ibp_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_matmul_ibp_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_softmax_reduce_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_softmax_apply_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_transpose_ibp_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_scale_ibp_pipeline(device);
-        let (_p, layout) = super::super::WgpuDevice::create_gemm_f32_pipeline(device);
+        // Plain-WGSL loading path (denorm_preserve = false): this smoke test
+        // checks shader/layout compatibility, not the DenormPreserve seam.
+        let (_p, _l) = super::super::WgpuDevice::create_linear_ibp_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_matmul_ibp_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_softmax_reduce_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_softmax_apply_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_transpose_ibp_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_scale_ibp_pipeline(device, false);
+        let (_p, layout) = super::super::WgpuDevice::create_gemm_f32_pipeline(device, false);
         // Small-K pipeline shares the GEMM bind group layout (#3599)
-        let _p = super::super::WgpuDevice::create_gemm_f32_small_k_pipeline(device, &layout);
-        let (_p, _l) = super::super::WgpuDevice::create_conv2d_ibp_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_conv_reshape_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_conv_col2im_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_relu_ibp_pipeline(device);
-        let (_p, _l) = super::super::WgpuDevice::create_add_ibp_pipeline(device);
+        let _p = super::super::WgpuDevice::create_gemm_f32_small_k_pipeline(device, false, &layout);
+        let (_p, _l) = super::super::WgpuDevice::create_conv2d_ibp_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_conv_reshape_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_conv_col2im_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_relu_ibp_pipeline(device, false);
+        let (_p, _l) = super::super::WgpuDevice::create_add_ibp_pipeline(device, false);
     });
 }
 
@@ -109,6 +113,10 @@ fn test_all_shaders_declare_params_struct() {
         ("LINEAR_IBP_SHADER", LINEAR_IBP_SHADER),
         ("GEMM_F32_SHADER", GEMM_F32_SHADER),
         ("GEMM_F32_SMALL_K_SHADER", GEMM_F32_SMALL_K_SHADER),
+        (
+            "GEMM_F32_SMALL_K_TAINT_SHADER",
+            GEMM_F32_SMALL_K_TAINT_SHADER,
+        ),
         ("MATMUL_IBP_SHADER", MATMUL_IBP_SHADER),
         ("SOFTMAX_REDUCE_SHADER", SOFTMAX_REDUCE_SHADER),
         ("SOFTMAX_APPLY_SHADER", SOFTMAX_APPLY_SHADER),
@@ -116,9 +124,12 @@ fn test_all_shaders_declare_params_struct() {
         ("SCALE_IBP_SHADER", SCALE_IBP_SHADER),
         ("CONV2D_IBP_IM2COL_SHADER", CONV2D_IBP_IM2COL_SHADER),
         ("CONV_RESHAPE_SHADER", CONV_RESHAPE_SHADER),
+        ("CONV_RESHAPE_TAINT_SHADER", CONV_RESHAPE_TAINT_SHADER),
         ("CONV_COL2IM_SHADER", CONV_COL2IM_SHADER),
+        ("CONV_COL2IM_TAINT_SHADER", CONV_COL2IM_TAINT_SHADER),
         ("RELU_IBP_SHADER", RELU_IBP_SHADER),
         ("ADD_IBP_SHADER", ADD_IBP_SHADER),
+        ("CROWN_STRIDED_GATHER_SHADER", CROWN_STRIDED_GATHER_SHADER),
     ];
     for (name, source) in shaders {
         assert!(
@@ -160,6 +171,10 @@ fn test_gemm_shaders_use_workgroup_size_16x16() {
     for (name, source) in [
         ("GEMM_F32_SHADER", GEMM_F32_SHADER),
         ("GEMM_F32_SMALL_K_SHADER", GEMM_F32_SMALL_K_SHADER),
+        (
+            "GEMM_F32_SMALL_K_TAINT_SHADER",
+            GEMM_F32_SMALL_K_TAINT_SHADER,
+        ),
     ] {
         assert!(
             source.contains("@workgroup_size(16, 16)"),
@@ -172,7 +187,9 @@ fn test_gemm_shaders_use_workgroup_size_16x16() {
 fn test_conv_shaders_use_workgroup_size_256() {
     for (name, source) in [
         ("CONV_RESHAPE_SHADER", CONV_RESHAPE_SHADER),
+        ("CONV_RESHAPE_TAINT_SHADER", CONV_RESHAPE_TAINT_SHADER),
         ("CONV_COL2IM_SHADER", CONV_COL2IM_SHADER),
+        ("CONV_COL2IM_TAINT_SHADER", CONV_COL2IM_TAINT_SHADER),
     ] {
         assert!(
             source.contains("@workgroup_size(256)"),

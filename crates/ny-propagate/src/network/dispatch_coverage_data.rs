@@ -194,10 +194,18 @@ pub(super) const MATCH_BASED_SITES: &[DispatchSiteExpectation] = &[
     // Tracked in DELEGATING_SITES instead.
     //
     // Patches-aware wrapper: exhaustive — no catch-all since #3424.
+    //
+    // The marker points at `crown_backward_step_patches_impl`, not at
+    // `crown_backward_step_patches`. The latter is now a thin wrapper that
+    // forwards to the impl and maps `SpecPatchesStepError` back to `NyError`;
+    // the `match layer` dispatch this site exists to police lives in the impl.
+    // Pointing the parser at the wrapper made it panic with "dispatch match
+    // index 0 missing (found 0 candidates)" — a coverage site that cannot see
+    // its dispatch polices nothing.
     DispatchSiteExpectation {
-        name: "network::crown::crown_backward_step_patches",
+        name: "network::crown::crown_backward_step_patches_impl",
         source: SourceText::Static(CROWN_NETWORK_SRC),
-        fn_marker: "pub(crate) fn crown_backward_step_patches(",
+        fn_marker: "fn crown_backward_step_patches_impl(",
         match_index: 0,
         expected_explicit: &[],
         exhaustive: true,
@@ -318,13 +326,14 @@ pub(super) const MATCH_BASED_SITES: &[DispatchSiteExpectation] = &[
 // Sites that delegate to `dispatch_backward_layer` and only override specific
 // layer handling in the caller.
 pub(super) const DELEGATING_SITES: &[DelegatingSiteExpectation] = &[
-    // crown_backward_step pre-filters ReLU (alpha/beta not available in sequential
+    // crown_backward_step is now a thin ordinary-Dense wrapper. Its boundary-aware
+    // implementation pre-filters ReLU (alpha/beta not available in sequential
     // CROWN), multi-input ops (no graph edges), and SkipMerge (identity pass-through).
-    // Everything else delegates to dispatch_backward_layer (commit 920096df1, #3079).
+    // Everything else delegates to the ordinary or strict canonical dispatcher.
     DelegatingSiteExpectation {
-        name: "network::crown::crown_backward_step",
+        name: "network::crown::crown_backward_step_with_dispatch_boundary",
         source: SourceText::Static(CROWN_NETWORK_SRC),
-        fn_marker: "fn crown_backward_step(",
+        fn_marker: "fn crown_backward_step_with_dispatch_boundary(",
         expected_site_specific: &[
             "Add",
             "Atan2",
@@ -378,11 +387,11 @@ pub(super) const DELEGATING_SITES: &[DelegatingSiteExpectation] = &[
     // graph_alpha/bounds keeps alpha/non-alpha ReLU logic, MulBinary relaxation
     // site-specific (#2094, #3396), deterministic/mixed Where handling (#3676),
     // and Sigmoid/Sqrt/Tanh alpha path overrides. The backward loop carrying
-    // these site-specific `Layer::*` arms was extracted from
+    // these site-specific `Layer::*` arms were extracted from
     // `propagate_crown_to_node_core` into the shared per-seed helper
-    // `run_target_backward_pass_core` so the concrete and input-linear wrappers,
-    // plus the objective-chunking (#patches-obj-chunk) path, drive one identical
-    // loop body.
+    // `run_target_backward_pass_core`. It is now the one exhaustive-dispatch
+    // owner used by the concrete and input-linear wrappers, and by the
+    // objective-chunking (#patches-obj-chunk) path.
     DelegatingSiteExpectation {
         name: "graph_alpha::bounds::run_target_backward_pass_core",
         source: SourceText::Static(GRAPH_ALPHA_BOUNDS_SRC),

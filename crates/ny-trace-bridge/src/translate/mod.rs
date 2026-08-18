@@ -61,10 +61,11 @@
 //!
 //! ## Dtype-cast modeling
 //!
-//! [`TraceOp::ToDtype`] downcasts to F16/BF16 are modeled as a Clip to the
-//! target dtype's representable range and counted in
-//! [`Translation::dtype_cast_count`]; upcasts / same-width casts are identity
-//! (`Add + 0.0`). Clamp values mirror NN's exactly.
+//! Every [`TraceOp::ToDtype`] is refused. The wire format records only the
+//! target dtype, so even F32/F64 may be a precision-losing cast; the bridge
+//! cannot prove that any target is an identity. Translation also rejects every
+//! reachable node whose declared output dtype is not F32, because the emitted
+//! graph contract is F32.
 //!
 //! ## Constant folding
 //!
@@ -95,10 +96,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use ndarray::{ArrayD, IxDyn};
 use ny_build::{AttributeValue, DataType, GraphModel, GraphModelBuilder, LayerSpec, WeightStore};
-use ny_core::{LayerType, NyError, Result};
+use ny_core::{checked_shape_product, LayerType, NyError, Result};
 
 use crate::schema::{
-    ComputationGraph, NodeId, SegmentedGraph, TraceNode, TraceOp, WeightData, WeightPayload,
+    ComputationGraph, DType, NodeId, SegmentedGraph, TraceNode, TraceOp, WeightData, WeightPayload,
 };
 
 // Name of the stacked 1-D input tensor emitted by [`translate_multi_input`].
@@ -108,17 +109,15 @@ const MULTI_INPUT_TENSOR: &str = "multi_in";
 /// Result of translating a computation graph: the lowered model plus
 /// translation metadata.
 ///
-/// Mirrors the metadata NN's `TraceTranslateResult` carries alongside its
-/// network. Consumers that record precision provenance (NN auto-populates
-/// certificate dtype metadata from the cast count) read
-/// [`Self::dtype_cast_count`]; callers that only need the model can use
-/// [`translate`] directly.
+/// Callers that only need the model can use [`translate`] directly.
 #[derive(Debug)]
 pub struct Translation {
     /// The lowered `ny_build::GraphModel` producer contract.
     pub model: GraphModel,
-    /// Number of F16/BF16 downcast points modeled as Clip layers. Zero means
-    /// the graph is pure F32 (no precision-loss points).
+    /// Compatibility metadata, always zero for successful translations.
+    ///
+    /// Precision-changing casts are refused because the bridge has no sound
+    /// lowering for them.
     pub dtype_cast_count: usize,
 }
 
@@ -144,20 +143,15 @@ pub fn translate(graph: &ComputationGraph) -> Result<GraphModel> {
     translate_with_metadata(graph).map(|t| t.model)
 }
 
-/// Like [`translate`], but also returns translation metadata
-/// ([`Translation::dtype_cast_count`]).
-///
-/// This is the full single-input contract mirroring NN's
-/// `trace_to_graph_model`: consumers that surface precision provenance (NN
-/// populates certificate metadata from the cast count) should call this rather
-/// than [`translate`].
+/// Like [`translate`], but also returns compatibility metadata.
 ///
 /// # Errors
 ///
 /// Same conditions as [`translate`].
 pub fn translate_with_metadata(graph: &ComputationGraph) -> Result<Translation> {
-    validate_single_input_mode(graph)?;
-    translate_impl(graph, false)
+    let analysis = analyze_graph(graph)?;
+    validate_single_input_mode(&analysis)?;
+    translate_impl(graph, false, &analysis)
 }
 
 /// Multi-input variant: each distinct reachable variable [`TraceOp::Input`]
@@ -178,25 +172,103 @@ pub fn translate_with_metadata(graph: &ComputationGraph) -> Result<Translation> 
 ///
 /// Same conditions as [`translate`], minus the variable-input guard.
 pub fn translate_multi_input(graph: &ComputationGraph) -> Result<Translation> {
-    translate_impl(graph, true)
+    let analysis = analyze_graph(graph)?;
+    translate_impl(graph, true, &analysis)
 }
 
-/// Shared implementation for single-input and multi-input translation.
-fn translate_impl(graph: &ComputationGraph, enable_multi_input: bool) -> Result<Translation> {
+/// Indexed graph facts shared by validation and translation.
+struct GraphAnalysis {
+    node_indices: HashMap<NodeId, usize>,
+    reachable: HashSet<NodeId>,
+    variable_inputs: HashSet<NodeId>,
+}
+
+/// Validate invariants required by every translation mode at the wire boundary
+/// and build the graph indexes used by reachability and consumer analysis.
+///
+/// `ComputationGraph` is serde-deserializable and its public fields can also be
+/// assembled directly, so source-tracer invariants cannot be assumed here.
+fn analyze_graph(graph: &ComputationGraph) -> Result<GraphAnalysis> {
     if graph.is_empty() {
         return Err(NyError::InternalError(
             "computation graph is empty (no nodes)".to_string(),
         ));
     }
 
-    // Validate topology before translation — catches forward references and
-    // dangling node IDs that would silently produce a wrong graph.
+    let mut node_indices = HashMap::with_capacity(graph.nodes.len());
+    for (index, node) in graph.nodes.iter().enumerate() {
+        if node_indices.insert(node.id, index).is_some() {
+            return Err(NyError::InternalError(format!(
+                "duplicate trace node id {} at index {index}",
+                node.id.get()
+            )));
+        }
+    }
+
     graph
         .validate_topology()
         .map_err(|e| NyError::InternalError(format!("topology validation failed: {e}")))?;
 
-    let reachable = reachable_node_ids(graph);
+    for output_id in &graph.output_nodes {
+        if !node_indices.contains_key(output_id) {
+            return Err(NyError::InternalError(format!(
+                "marked output node {} is not present in the computation graph",
+                output_id.get()
+            )));
+        }
+    }
 
+    let reachable = reachable_node_ids(graph, &node_indices);
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|node| reachable.contains(&node.id))
+    {
+        if node.output_dtype != DType::F32 {
+            return Err(NyError::UnsupportedOp(format!(
+                "trace node {} ({}) has output dtype {:?}; the bridge only soundly supports F32 tensors",
+                node.id.get(),
+                node.name,
+                node.output_dtype
+            )));
+        }
+    }
+
+    let mut variable_inputs = HashSet::new();
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|node| reachable.contains(&node.id))
+    {
+        let variable_edges = if is_composite_op(&node.op) {
+            node.inputs.get(..1).unwrap_or(&[])
+        } else {
+            node.inputs.as_slice()
+        };
+        for input_id in variable_edges {
+            if node_indices
+                .get(input_id)
+                .is_some_and(|&index| matches!(&graph.nodes[index].op, TraceOp::Input))
+            {
+                variable_inputs.insert(*input_id);
+            }
+        }
+    }
+
+    Ok(GraphAnalysis {
+        node_indices,
+        reachable,
+        variable_inputs,
+    })
+}
+
+/// Shared implementation for single-input and multi-input translation.
+fn translate_impl(
+    graph: &ComputationGraph,
+    enable_multi_input: bool,
+    analysis: &GraphAnalysis,
+) -> Result<Translation> {
+    let reachable = &analysis.reachable;
     // Batch convention: hardcoded false, matching NN's driver. The +1 axis
     // convention works for all current traces.
     let mut ctx = Ctx::new(false);
@@ -216,7 +288,7 @@ fn translate_impl(graph: &ComputationGraph, enable_multi_input: bool) -> Result<
             .nodes
             .iter()
             .filter(|n| reachable.contains(&n.id) && matches!(n.op, TraceOp::Input))
-            .filter(|n| is_variable_input(graph, n.id, &reachable))
+            .filter(|n| analysis.variable_inputs.contains(&n.id))
             .map(|n| (n.id, n.output_shape.clone()))
             .collect()
     } else {
@@ -230,7 +302,12 @@ fn translate_impl(graph: &ComputationGraph, enable_multi_input: bool) -> Result<
         let mut offsets = HashMap::new();
         let mut total_flat: usize = 0;
         for (id, shape) in &input_node_data {
-            let flat: usize = shape.iter().product();
+            let flat = checked_shape_product(shape).ok_or_else(|| {
+                NyError::InternalError(format!(
+                    "multi-input: shape product overflows for node {}",
+                    id.get()
+                ))
+            })?;
             offsets.insert(*id, (total_flat, flat));
             total_flat = total_flat.checked_add(flat).ok_or_else(|| {
                 NyError::InternalError("multi-input: total flat size overflow".to_string())
@@ -354,10 +431,15 @@ fn translate_impl(graph: &ComputationGraph, enable_multi_input: bool) -> Result<
     }
 
     // Determine the output tensor spec.
-    let output_node = graph
-        .output_node()
-        .or_else(|| graph.nodes.last())
-        .ok_or_else(|| NyError::InternalError("no output node in computation graph".to_string()))?;
+    let output_node = if let Some(output_id) = graph.output_nodes.last() {
+        analysis
+            .node_indices
+            .get(output_id)
+            .and_then(|&index| graph.nodes.get(index))
+    } else {
+        graph.nodes.last()
+    }
+    .ok_or_else(|| NyError::InternalError("no output node in computation graph".to_string()))?;
     let output_name = node_names.get(&output_node.id.get()).ok_or_else(|| {
         NyError::InternalError("output node not found in translated graph".to_string())
     })?;
@@ -389,7 +471,7 @@ fn translate_impl(graph: &ComputationGraph, enable_multi_input: bool) -> Result<
 
     Ok(Translation {
         model: builder.build(),
-        dtype_cast_count: ctx.dtype_cast_count,
+        dtype_cast_count: 0,
     })
 }
 
@@ -426,8 +508,6 @@ struct Ctx {
     tensor_shapes: HashMap<String, Vec<i64>>,
     /// Whether the trace uses the batched convention (batch=1 at dim 0).
     is_batched: bool,
-    /// Number of F16/BF16 downcast points modeled as Clip layers.
-    dtype_cast_count: usize,
 }
 
 impl Ctx {
@@ -437,7 +517,6 @@ impl Ctx {
             constant_tensors: HashSet::new(),
             tensor_shapes: HashMap::new(),
             is_batched,
-            dtype_cast_count: 0,
         }
     }
 
@@ -563,17 +642,59 @@ fn resolve_input(input_id: u64, node_names: &HashMap<u64, String>) -> Result<Str
 
 /// Extract a finite `Vec<f32>` from a [`WeightPayload`], dequantizing as needed.
 ///
-/// Mirrors NN's `insert_nn_weight` validation: rejects shape-only placeholders
-/// (no captured data) and non-finite elements. F16/Bf16/F64/integer payloads
-/// are widened to f32 (NY stores all weights as f32).
+/// Rejects shape-only placeholders and non-finite elements. F16/Bf16 values
+/// widen exactly to f32. F64/integer payloads are accepted only when every
+/// element round-trips through f32 exactly; silently rounding a deployed
+/// parameter would verify a different model.
 fn weight_f32(payload: &WeightPayload, context: &str) -> Result<Vec<f32>> {
     let data: Vec<f32> = match &payload.data {
         WeightData::F32(v) => v.clone(),
-        WeightData::F64(v) => v.iter().map(|&x| x as f32).collect(),
+        WeightData::F64(v) => v
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                if !value.is_finite() {
+                    return Err(NyError::NumericalInstability(format!(
+                        "{context}: F64 weight contains non-finite value ({value}) at index {index}"
+                    )));
+                }
+                let narrowed = value as f32;
+                if narrowed as f64 != value {
+                    return Err(NyError::ModelLoad(format!(
+                        "{context}: F64 weight value {value} at index {index} is not exactly representable as f32"
+                    )));
+                }
+                Ok(narrowed)
+            })
+            .collect::<Result<Vec<_>>>()?,
         WeightData::F16(v) => v.iter().map(|&x| x.to_f32()).collect(),
         WeightData::Bf16(v) => v.iter().map(|&x| x.to_f32()).collect(),
-        WeightData::I32(v) => v.iter().map(|&x| x as f32).collect(),
-        WeightData::I64(v) => v.iter().map(|&x| x as f32).collect(),
+        WeightData::I32(v) => v
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let narrowed = value as f32;
+                if narrowed as i64 != i64::from(value) {
+                    return Err(NyError::ModelLoad(format!(
+                        "{context}: I32 weight value {value} at index {index} is not exactly representable as f32"
+                    )));
+                }
+                Ok(narrowed)
+            })
+            .collect::<Result<Vec<_>>>()?,
+        WeightData::I64(v) => v
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let narrowed = value as f32;
+                if narrowed as i128 != i128::from(value) {
+                    return Err(NyError::ModelLoad(format!(
+                        "{context}: I64 weight value {value} at index {index} is not exactly representable as f32"
+                    )));
+                }
+                Ok(narrowed)
+            })
+            .collect::<Result<Vec<_>>>()?,
         WeightData::Placeholder => {
             return Err(NyError::ModelLoad(format!(
                 "{context}: weight data is shape-only (placeholder). \
@@ -641,14 +762,8 @@ fn is_norm_boundary(op: &TraceOp) -> bool {
 /// input, which produces unsound bounds (possible false "holds") when the
 /// inputs are genuinely independent. Mirrors NN's `validate_single_input_mode`
 /// / `MultipleVariableInputs` hard error.
-fn validate_single_input_mode(graph: &ComputationGraph) -> Result<()> {
-    let reachable = reachable_node_ids(graph);
-    let variable_input_count = graph
-        .nodes
-        .iter()
-        .filter(|n| reachable.contains(&n.id) && matches!(n.op, TraceOp::Input))
-        .filter(|n| is_variable_input(graph, n.id, &reachable))
-        .count();
+fn validate_single_input_mode(analysis: &GraphAnalysis) -> Result<()> {
+    let variable_input_count = analysis.variable_inputs.len();
     if variable_input_count > 1 {
         return Err(NyError::UnsupportedConfiguration(format!(
             "translate() found {variable_input_count} variable inputs but expects exactly 1; \
@@ -668,7 +783,10 @@ fn validate_single_input_mode(graph: &ComputationGraph) -> Result<()> {
 /// seeds the walk (a superset — keeping more nodes can only surface more
 /// errors, never weaken bounds). With no marked outputs, the last node seeds,
 /// matching the output-selection fallback in [`translate`].
-fn reachable_node_ids(graph: &ComputationGraph) -> HashSet<NodeId> {
+fn reachable_node_ids(
+    graph: &ComputationGraph,
+    node_indices: &HashMap<NodeId, usize>,
+) -> HashSet<NodeId> {
     let mut reachable: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<NodeId> = VecDeque::new();
 
@@ -684,7 +802,10 @@ fn reachable_node_ids(graph: &ComputationGraph) -> HashSet<NodeId> {
     }
 
     while let Some(id) = queue.pop_front() {
-        if let Some(node) = graph.node(id) {
+        if let Some(node) = node_indices
+            .get(&id)
+            .and_then(|&index| graph.nodes.get(index))
+        {
             for &input_id in &node.inputs {
                 if reachable.insert(input_id) {
                     queue.push_back(input_id);
@@ -694,44 +815,6 @@ fn reachable_node_ids(graph: &ComputationGraph) -> HashSet<NodeId> {
     }
 
     reachable
-}
-
-/// Check whether a reachable Input node is a "variable input" (data that flows
-/// through the model) vs a "weight input" (parameter consumed only by
-/// composite ops that embed their own weights).
-///
-/// Composite ops (Conv1d, Linear, LSTM, …) carry weight tensors inside their
-/// [`TraceOp`] variant. The trace records ALL input tensor IDs (data +
-/// weight), but the translator only references `inputs[0]` (data) and takes
-/// weights from the variant, so `inputs[1..]` are phantom edges. An Input node
-/// is "variable" if ANY reachable consumer uses it as `inputs[0]` of a
-/// composite op, or at ANY input position of a non-composite op.
-fn is_variable_input(
-    graph: &ComputationGraph,
-    input_id: NodeId,
-    reachable: &HashSet<NodeId>,
-) -> bool {
-    for node in &graph.nodes {
-        if !reachable.contains(&node.id) || node.id == input_id {
-            continue;
-        }
-        if !node.inputs.contains(&input_id) {
-            continue;
-        }
-        // This node consumes our Input node.
-        if is_composite_op(&node.op) {
-            // Composite op: only inputs[0] is the data input; inputs[1..] are
-            // weight params embedded in the TraceOp → not variable.
-            if node.inputs.first() == Some(&input_id) {
-                return true;
-            }
-        } else {
-            // Non-composite op: all input positions are variable.
-            return true;
-        }
-    }
-    // No consumer makes this a variable input — it's weight-only.
-    false
 }
 
 /// Returns `true` for composite ops that embed weight tensors in their
@@ -1065,9 +1148,9 @@ fn translate_node(
         // -- Dropout (identity at inference) --
         TraceOp::Dropout => ops_core::translate_dropout(name, &input_tensors, &output_tensor, ctx),
 
-        // -- Dtype cast (Clip at F16/BF16 downcasts, identity otherwise) --
+        // -- Dtype cast (source dtype absent, so every target fails closed) --
         TraceOp::ToDtype { target_dtype } => {
-            ops_core::translate_to_dtype(name, *target_dtype, &input_tensors, &output_tensor, ctx)
+            ops_core::translate_to_dtype(*target_dtype, &input_tensors)
         }
 
         // -- Parameterized activations --
@@ -1087,17 +1170,17 @@ fn translate_node(
         // -- Named activation fallback --
         //
         // Mish note (reconciled at INC-FINAL): the bridge accepts
-        // `Activation { kind: Mish }`, lowering it to the exact
-        // Clip(-88, 88) + LayerType::Mish emission used for the dedicated
-        // `TraceOp::Mish` variant. Verified sound: ny-propagate's `MishLayer`
-        // is a first-class sound relaxation (critical-point-aware IBP for the
-        // non-monotonic minimum, directed rounding on every intermediate, f64
-        // chord slopes with slope-error widening). Unlike the Elu/LeakyRelu
-        // named-path refusals (which exist because a PARAMETER would be
-        // silently defaulted), Mish is parameterless, so nothing can be lost
-        // through the named path. NN's direct `translate_named_activation`
-        // was taught the same Mish arm at INC-FINAL, so both translators
-        // agree; Elu/LeakyRelu remain refused on both.
+        // `Activation { kind: Mish }`, lowering it to the same unmodified
+        // LayerType::Mish emission used for the dedicated `TraceOp::Mish`
+        // variant. Verified sound: ny-propagate's `MishLayer` is a first-class
+        // sound relaxation (critical-point-aware IBP for the non-monotonic
+        // minimum, directed rounding on every intermediate, f64 chord slopes
+        // with slope-error widening). Unlike the Elu/LeakyRelu named-path
+        // refusals (which exist because a PARAMETER would be silently
+        // defaulted), Mish is parameterless, so nothing can be lost through
+        // the named path. NN's direct `translate_named_activation` was taught
+        // the same Mish arm at INC-FINAL, so both translators agree;
+        // Elu/LeakyRelu remain refused on both.
         TraceOp::Activation { kind } => {
             ops_core::translate_named_activation(name, *kind, &input_tensors, &output_tensor)
         }
@@ -1544,6 +1627,36 @@ mod tests {
             .expect("conv GraphModel builds a graph network");
     }
 
+    #[test]
+    fn dilated_conv1d_materialization_cap_fails_before_allocation() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 2]),
+            node(
+                1,
+                "conv",
+                TraceOp::Conv1d {
+                    weight: WeightPayload::f32(vec![1.0, 1.0], vec![1, 1, 2]),
+                    bias: None,
+                    padding: 0,
+                    stride: 1,
+                    dilation: 10_000_001,
+                    groups: 1,
+                },
+                &[0],
+                &[1, 1],
+            ),
+        ]);
+
+        let err = translate(&graph)
+            .expect_err("oversized dilated Conv1d expansion must fail before allocation");
+        assert!(
+            matches!(err, NyError::ModelLoad(ref message)
+                if message.contains("Conv1d dilation expansion")
+                    && message.contains("materialization limit")),
+            "got {err:?}"
+        );
+    }
+
     /// Conv2d translates with 2D pads/strides/dilations.
     #[test]
     fn translates_conv2d() {
@@ -1690,16 +1803,65 @@ mod tests {
         }
     }
 
-    /// Exp injects a domain-clip layer before the Exp.
     #[test]
-    fn exp_injects_domain_clip() {
+    fn exp_above_f32_threshold_fails_closed_without_clipping() {
         let graph = ComputationGraph::from_nodes(vec![
-            node(0, "x", TraceOp::Input, &[], &[4]),
-            node(1, "e", TraceOp::Exp, &[0], &[4]),
+            node(0, "x", TraceOp::Input, &[], &[1]),
+            node(1, "e", TraceOp::Exp, &[0], &[1]),
         ]);
         let model = translate(&graph).expect("exp translates");
-        assert_eq!(count(&model, &LayerType::Clip), 1, "domain clip injected");
+        assert_eq!(count(&model, &LayerType::Clip), 0, "input is not altered");
         assert_eq!(count(&model, &LayerType::Exp), 1, "exp present");
+
+        let network = model
+            .build_graph_network(ny_build::GraphNetworkOptions::default())
+            .expect("Exp model builds");
+        let input = ny_tensor::BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[1]), 100.0),
+            ArrayD::from_elem(IxDyn(&[1]), 100.0),
+        )
+        .expect("valid point bounds");
+        let err = network
+            .propagate_ibp(&input)
+            .expect_err("Exp(100) must fail closed instead of becoming Exp(88)");
+        assert!(
+            matches!(err, NyError::NumericalInstability(ref message)
+                if message.contains("Exp IBP") && message.contains("overflow threshold")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn softplus_and_mish_above_88_preserve_large_values() {
+        for (op, layer_type) in [
+            (TraceOp::Softplus, LayerType::Softplus),
+            (TraceOp::Mish, LayerType::Mish),
+        ] {
+            let graph = ComputationGraph::from_nodes(vec![
+                node(0, "x", TraceOp::Input, &[], &[1]),
+                node(1, "act", op, &[0], &[1]),
+            ]);
+            let model = translate(&graph).expect("activation translates");
+            assert_eq!(count(&model, &LayerType::Clip), 0, "input is not altered");
+            assert_eq!(count(&model, &layer_type), 1);
+
+            let network = model
+                .build_graph_network(ny_build::GraphNetworkOptions::default())
+                .expect("activation model builds");
+            let input = ny_tensor::BoundedTensor::new(
+                ArrayD::from_elem(IxDyn(&[1]), 100.0),
+                ArrayD::from_elem(IxDyn(&[1]), 100.0),
+            )
+            .expect("valid point bounds");
+            let output = network
+                .propagate_ibp(&input)
+                .expect("large finite activation propagates");
+            assert!(
+                output.lower()[[0]] > 99.0,
+                "{layer_type:?}(100) must not be truncated to 88: {:?}",
+                output.lower()
+            );
+        }
     }
 
     /// LeakyRelu decomposes into Mul/ReLU/Mul/Add.
@@ -1796,6 +1958,53 @@ mod tests {
         assert_eq!(count(&model, &LayerType::Mul), 1);
     }
 
+    #[test]
+    fn synthetic_norm_parameters_obey_materialization_cap() {
+        let channels = 10_000_001;
+        let instance_graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, channels, 1]),
+            node(
+                1,
+                "instance_norm",
+                TraceOp::InstanceNorm { eps: 1e-5 },
+                &[0],
+                &[1, channels, 1],
+            ),
+        ]);
+        let err = translate(&instance_graph)
+            .expect_err("oversized InstanceNorm parameters must fail before allocation");
+        assert!(
+            matches!(err, NyError::ModelLoad(ref message)
+                if message.contains("InstanceNorm gamma")
+                    && message.contains("materialization limit")),
+            "got {err:?}"
+        );
+
+        let group_graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, channels, 1]),
+            node(
+                1,
+                "group_norm",
+                TraceOp::GroupNorm {
+                    num_groups: 1,
+                    eps: 1e-5,
+                    weight: WeightPayload::f32(vec![1.0], vec![channels]),
+                    bias: WeightPayload::f32(vec![0.0], vec![channels]),
+                },
+                &[0],
+                &[1, channels, 1],
+            ),
+        ]);
+        let err = translate(&group_graph)
+            .expect_err("oversized GroupNorm parameters must fail before allocation");
+        assert!(
+            matches!(err, NyError::ModelLoad(ref message)
+                if message.contains("GroupNorm synthetic InstanceNorm gamma")
+                    && message.contains("materialization limit")),
+            "got {err:?}"
+        );
+    }
+
     /// Shape ops: Reshape, Transpose, Permute, Squeeze, Unsqueeze, Cat.
     #[test]
     fn shape_ops_map() {
@@ -1850,6 +2059,38 @@ mod tests {
     fn empty_graph_rejected() {
         let graph = ComputationGraph::from_nodes(vec![]);
         assert!(matches!(translate(&graph), Err(NyError::InternalError(_))));
+    }
+
+    /// Duplicate node ids make id-based edge/output resolution ambiguous and
+    /// therefore must be rejected at the wire boundary.
+    #[test]
+    fn duplicate_node_ids_are_rejected() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1]),
+            node(0, "duplicate", TraceOp::Relu, &[0], &[1]),
+        ]);
+        let err = translate(&graph).expect_err("duplicate ids must be refused");
+        assert!(
+            matches!(err, NyError::InternalError(ref m) if m.contains("duplicate trace node id 0")),
+            "got {err:?}"
+        );
+    }
+
+    /// A malformed explicit output list must not silently fall back to the
+    /// physical last node when its primary (last-marked) output is dangling.
+    #[test]
+    fn dangling_marked_output_is_rejected_without_fallback() {
+        let mut graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1]),
+            node(1, "relu", TraceOp::Relu, &[0], &[1]),
+        ]);
+        graph.output_nodes = vec![NodeId(1), NodeId(999)];
+        let err = translate(&graph).expect_err("dangling marked output must be refused");
+        assert!(
+            matches!(err, NyError::InternalError(ref m)
+                if m.contains("marked output node 999")),
+            "got {err:?}"
+        );
     }
 
     /// A shape-only placeholder weight is rejected (no silent vacuous layer).
@@ -2051,6 +2292,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn multi_input_shape_product_overflow_is_an_error_not_a_panic() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "a", TraceOp::Input, &[], &[usize::MAX, 2]),
+            node(1, "b", TraceOp::Input, &[], &[1]),
+            node(2, "sum", TraceOp::Add, &[0, 1], &[1]),
+        ]);
+        let err = translate_multi_input(&graph).expect_err("shape overflow must be refused");
+        assert!(
+            matches!(err, NyError::InternalError(ref m)
+                if m.contains("shape product overflows")),
+            "got {err:?}"
+        );
+    }
+
     /// With one variable input, the multi-input entry degrades to exactly the
     /// single-input translation (no stacked tensor, no Slice/Reshape).
     #[test]
@@ -2071,103 +2327,156 @@ mod tests {
         );
     }
 
-    /// An F16 downcast injects a Clip to ±65504 and increments the cast count.
     #[test]
-    fn f16_downcast_injects_clip_and_counts() {
-        let graph = ComputationGraph::from_nodes(vec![
-            node(0, "x", TraceOp::Input, &[], &[4]),
-            node(
-                1,
-                "cast",
-                TraceOp::ToDtype {
-                    target_dtype: DType::F16,
-                },
-                &[0],
-                &[4],
-            ),
-        ]);
-        let translation = translate_with_metadata(&graph).expect("F16 cast translates");
-        assert_eq!(translation.dtype_cast_count, 1);
-        let clip = translation
-            .model
-            .network
-            .layers
-            .iter()
-            .find(|l| l.layer_type == LayerType::Clip)
-            .expect("downcast Clip present");
-        assert_eq!(
-            clip.attributes.get("min"),
-            Some(&AttributeValue::Float(-65504.0))
-        );
-        assert_eq!(
-            clip.attributes.get("max"),
-            Some(&AttributeValue::Float(65504.0))
-        );
-        translation
-            .model
-            .build_graph_network(ny_build::GraphNetworkOptions::default())
-            .expect("F16-cast GraphModel builds a graph network");
-    }
-
-    /// BF16 uses its own representable range; each downcast counts once.
-    #[test]
-    fn bf16_downcast_uses_bf16_range_and_counts() {
-        let graph = ComputationGraph::from_nodes(vec![
-            node(0, "x", TraceOp::Input, &[], &[4]),
-            node(
-                1,
-                "cast16",
-                TraceOp::ToDtype {
-                    target_dtype: DType::F16,
-                },
-                &[0],
-                &[4],
-            ),
-            node(
-                2,
-                "castb",
-                TraceOp::ToDtype {
-                    target_dtype: DType::Bf16,
-                },
-                &[1],
-                &[4],
-            ),
-        ]);
-        let translation = translate_with_metadata(&graph).expect("BF16 cast translates");
-        assert_eq!(translation.dtype_cast_count, 2, "both downcasts counted");
-        let bf16_clip = translation
-            .model
-            .network
-            .layers
-            .iter()
-            .filter(|l| l.layer_type == LayerType::Clip)
-            .nth(1)
-            .expect("second (BF16) Clip present");
-        let bf16_max = 3.389e38_f64 as f32;
-        assert_eq!(
-            bf16_clip.attributes.get("min"),
-            Some(&AttributeValue::Float(-bf16_max))
-        );
-        assert_eq!(
-            bf16_clip.attributes.get("max"),
-            Some(&AttributeValue::Float(bf16_max))
-        );
-    }
-
-    /// Upcasts / same-width casts are `Add + 0.0` identities and do not count.
-    #[test]
-    fn upcast_is_identity_and_uncounted() {
-        for target_dtype in [DType::F32, DType::F64] {
+    fn every_dtype_cast_is_refused_when_source_dtype_is_unknown() {
+        for target_dtype in [
+            DType::F32,
+            DType::F64,
+            DType::F16,
+            DType::Bf16,
+            DType::I32,
+            DType::I64,
+            DType::U32,
+            DType::U8,
+            DType::Bool,
+        ] {
             let graph = ComputationGraph::from_nodes(vec![
                 node(0, "x", TraceOp::Input, &[], &[4]),
                 node(1, "cast", TraceOp::ToDtype { target_dtype }, &[0], &[4]),
             ]);
-            let translation = translate_with_metadata(&graph).expect("upcast translates");
-            assert_eq!(translation.dtype_cast_count, 0, "{target_dtype:?}");
-            assert_eq!(count(&translation.model, &LayerType::Clip), 0);
-            // Input identity + cast identity.
-            assert_eq!(count(&translation.model, &LayerType::Add), 2);
+            let err = translate_with_metadata(&graph)
+                .expect_err("cast with unknown source dtype must fail closed");
+            assert!(
+                matches!(err, NyError::UnsupportedOp(ref m)
+                    if m.contains("ToDtype") && m.contains("source dtype")),
+                "{target_dtype:?}: got {err:?}"
+            );
         }
+    }
+
+    #[test]
+    fn reachable_non_f32_node_is_refused_before_lowering() {
+        let mut input = node(0, "x", TraceOp::Input, &[], &[1]);
+        input.output_dtype = DType::F64;
+        let graph =
+            ComputationGraph::from_nodes(vec![input, node(1, "relu", TraceOp::Relu, &[0], &[1])]);
+        let err = translate(&graph).expect_err("non-F32 trace must fail closed");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref message)
+                if message.contains("output dtype F64")
+                    && message.contains("only soundly supports F32")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lossy_wide_weight_values_are_refused() {
+        for data in [
+            WeightData::F64(vec![16_777_217.0]),
+            WeightData::I32(vec![16_777_217]),
+            WeightData::I64(vec![16_777_217]),
+        ] {
+            let graph = ComputationGraph::from_nodes(vec![node(
+                0,
+                "weight",
+                TraceOp::ConstantWeight {
+                    weight: WeightPayload {
+                        shape: vec![1],
+                        data,
+                    },
+                },
+                &[],
+                &[1],
+            )]);
+            let err = translate(&graph).expect_err("lossy f32 weight cast must be refused");
+            assert!(
+                matches!(err, NyError::ModelLoad(ref message)
+                    if message.contains("not exactly representable as f32")),
+                "got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_representable_wide_weight_values_are_accepted() {
+        let graph = ComputationGraph::from_nodes(vec![node(
+            0,
+            "weight",
+            TraceOp::ConstantWeight {
+                weight: WeightPayload {
+                    shape: vec![3],
+                    data: WeightData::F64(vec![0.5, -2.0, 16_777_216.0]),
+                },
+            },
+            &[],
+            &[3],
+        )]);
+        let model = translate(&graph).expect("exact F64-to-F32 weights translate");
+        assert_eq!(
+            model
+                .weights
+                .get("layer0_trace_0_out")
+                .expect("weight stored")
+                .as_slice()
+                .expect("contiguous"),
+            &[0.5, -2.0, 16_777_216.0]
+        );
+    }
+
+    #[test]
+    fn constant_shape_overflow_and_resource_exhaustion_are_refused() {
+        for shape in [vec![usize::MAX, 2], vec![10_000_001]] {
+            let graph = ComputationGraph::from_nodes(vec![node(
+                0,
+                "constant",
+                TraceOp::Constant { value: 1.0 },
+                &[],
+                &shape,
+            )]);
+            let err = translate(&graph).expect_err("unsafe Constant allocation must be refused");
+            assert!(
+                matches!(err, NyError::ModelLoad(ref message)
+                    if message.contains("Constant")
+                        && (message.contains("overflows")
+                            || message.contains("materialization limit"))),
+                "{shape:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_matmul_output_obeys_materialization_cap() {
+        let side = 4_000;
+        let graph = ComputationGraph::from_nodes(vec![
+            node(
+                0,
+                "lhs",
+                TraceOp::ConstantWeight {
+                    weight: WeightPayload::f32(vec![1.0; side], vec![side, 1]),
+                },
+                &[],
+                &[side, 1],
+            ),
+            node(
+                1,
+                "rhs",
+                TraceOp::ConstantWeight {
+                    weight: WeightPayload::f32(vec![1.0; side], vec![1, side]),
+                },
+                &[],
+                &[1, side],
+            ),
+            node(2, "matmul", TraceOp::MatMul, &[0, 1], &[side, side]),
+        ]);
+
+        let err =
+            translate(&graph).expect_err("oversized constant MatMul must fail before allocation");
+        assert!(
+            matches!(err, NyError::ModelLoad(ref message)
+                if message.contains("constant fold of MatMul output")
+                    && message.contains("materialization limit")),
+            "got {err:?}"
+        );
     }
 
     /// Constant-only chains fold away (no emitted layer, output is a weight).
@@ -2193,5 +2502,53 @@ mod tests {
             .get("layer0_trace_1_out")
             .expect("folded constant is stored as a weight");
         assert_eq!(folded.as_slice().unwrap(), &[0.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn constant_softplus_uses_stable_large_positive_formula() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(
+                0,
+                "c",
+                TraceOp::ConstantWeight {
+                    weight: WeightPayload::f32(vec![100.0], vec![1]),
+                },
+                &[],
+                &[1],
+            ),
+            node(1, "softplus", TraceOp::Softplus, &[0], &[1]),
+        ]);
+        let model = translate(&graph).expect("stable Softplus constant fold");
+        let value = model
+            .weights
+            .get("layer0_trace_1_out")
+            .expect("folded weight")
+            .as_slice()
+            .expect("contiguous")[0];
+        assert!(value.is_finite());
+        assert!(value > 99.0, "Softplus(100) was truncated: {value}");
+    }
+
+    #[test]
+    fn non_finite_constant_fold_result_is_refused() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(
+                0,
+                "c",
+                TraceOp::ConstantWeight {
+                    weight: WeightPayload::f32(vec![100.0], vec![1]),
+                },
+                &[],
+                &[1],
+            ),
+            node(1, "exp", TraceOp::Exp, &[0], &[1]),
+        ]);
+        let err = translate(&graph).expect_err("non-finite constant fold must fail closed");
+        assert!(
+            matches!(err, NyError::NumericalInstability(ref message)
+                if message.contains("constant fold of Exp")
+                    && message.contains("non-finite")),
+            "got {err:?}"
+        );
     }
 }

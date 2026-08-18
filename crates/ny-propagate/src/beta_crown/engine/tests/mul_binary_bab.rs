@@ -46,16 +46,17 @@ fn swiglu_mul_graph() -> GraphNetwork {
     graph
 }
 
-/// GenBaB BaB must descend past depth 0 on a SwiGLU-like `Mul(SiLU(x), x)` graph
-/// and verify sub-domains — the McCormick gap that IBP/CROWN leaves at the root is
-/// closed by splitting the MulBinary node's input intervals.
+/// Engine-backed GenBaB must descend past depth 0 on a SwiGLU-like
+/// `Mul(SiLU(x), x)` graph and verify sub-domains. The shared single-objective
+/// batch executor is ReLU-only, so GenBaB must retain the per-domain route that
+/// can split MulBinary input intervals and close the root McCormick gap.
 ///
 /// Regression for the GenBaB MulBinary blocker (#mul-genbab): GenBaB splits the
 /// MulBinary node, the split constraint tightens the correct input's
 /// pre-activation node, and child propagation succeeds so BaB can descend.
 #[ntest::timeout(30000)]
 #[test]
-fn test_genbab_mul_binary_swiglu_descends_past_depth0() {
+fn test_engine_genbab_mul_binary_swiglu_descends_past_depth0() {
     use crate::beta_crown::nonlinear_branching::NonlinearBranchingConfig;
 
     let graph = swiglu_mul_graph();
@@ -71,20 +72,29 @@ fn test_genbab_mul_binary_swiglu_descends_past_depth0() {
             ..Default::default()
         }),
         use_alpha_crown: false,
+        batch_size: 8,
         max_domains: 500,
         timeout: Duration::from_secs(20),
         ..Default::default()
     };
 
     let result = BetaCrownVerifier::new(config)
-        .verify_graph_relu_split(&graph, &input, &[1.0_f32], -0.5)
+        .verify_graph_relu_split_with_engine_gpu(
+            &graph,
+            &input,
+            &[1.0_f32],
+            -0.5,
+            Some(&NaiveCpuGemmEngine),
+            None,
+        )
         .expect("verify should not hard-error");
 
     // Must not falsely claim violation (true min ≈ -0.16 > -0.5).
     assert!(
         !matches!(
             result.result,
-            BabVerificationStatus::Violated { .. } | BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::Violated { .. }
+                | BabVerificationStatus::PotentialViolation { .. }
         ),
         "SiLU(x)*x >= -0.5 holds: {:?}",
         result.result

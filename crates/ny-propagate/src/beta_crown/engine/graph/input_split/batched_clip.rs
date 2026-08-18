@@ -13,7 +13,7 @@
 use ndarray::{Array2, Array3, ArrayD, IxDyn};
 use ny_core::{NyError, Result};
 
-use crate::bounds::LinearBounds;
+use crate::bounds::{certified_affine_sum_f32, LinearBounds, OutwardDirection};
 use crate::relaxed_clip::{
     relaxed_clip_single_spec_row_fast, relaxed_clip_with_infeasible_mask, SingleSpecRowClipScratch,
 };
@@ -688,7 +688,7 @@ fn clip_planes_rows(
 }
 
 /// #lsnc-clip-planes (S5): planes-based post-clip concretize for ONE child —
-/// the same per-row f64 accumulation, directed `next_down_f32` round, and
+/// the same per-row directed-f64 accumulation, directed `next_down_f32` round, and
 /// NaN→`-inf` degrade as `concretize_postclip_lower_bounds`
 /// (`push_survivors.rs`), reading the parent plane rows (already in the clip
 /// sign convention) + the child's folded used-side biases instead of a
@@ -712,15 +712,19 @@ pub(super) fn concretize_postclip_lower_bounds_planes(
     out.clear();
     for row_idx in 0..n_rows {
         let row = &plane.coeffs[row_idx * x_dim..(row_idx + 1) * x_dim];
-        let mut lb_val: f64 = bias_row[row_idx] as f64;
-        for d in 0..x_dim {
-            let a = row[d] as f64;
-            if a >= 0.0 {
-                lb_val += a * (clip_l_row[d] as f64);
-            } else {
-                lb_val += a * (clip_u_row[d] as f64);
-            }
-        }
+        let lb_val = certified_affine_sum_f32(
+            bias_row[row_idx],
+            (0..x_dim).map(|d| {
+                let a = row[d];
+                let endpoint = if a >= 0.0 {
+                    clip_l_row[d]
+                } else {
+                    clip_u_row[d]
+                };
+                (a, endpoint)
+            }),
+            OutwardDirection::Lower,
+        );
         let lb_f32 = if lb_val.is_nan() {
             f32::NEG_INFINITY
         } else {

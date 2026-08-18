@@ -13,6 +13,12 @@ workspace = true
 
 [features]
 default = []
+# Independent external proof-checker conformance lanes. Each lane is absent
+# from the hermetic default suite and fails fast on a missing/mismatched tool
+# when explicitly selected.
+external-ay = []
+external-carcara = []
+external-lean = []
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }

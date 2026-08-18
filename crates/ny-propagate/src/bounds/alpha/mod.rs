@@ -14,8 +14,8 @@ mod shared;
 
 // Re-export config types so existing `crate::bounds::alpha::X` paths continue to work.
 pub use super::alpha_config::{
-    AdamParams, AlphaCrownConfig, AlphaCrownIntermediate, AlphaSpecEarlyExit, GradientMethod,
-    GraphAlphaCrownIntermediate, MultiSpecKeep, Optimizer,
+    AdamParams, AlphaCrownConfig, AlphaCrownIntermediate, AlphaSpecAscent, AlphaSpecEarlyExit,
+    GradientMethod, GraphAlphaCrownIntermediate, MultiSpecKeep, Optimizer,
 };
 pub use graph::GraphAlphaState;
 pub use sequential::AlphaState;

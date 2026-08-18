@@ -73,6 +73,7 @@ pub(super) fn build_conv_layers(
             bias: Some(linear_bias.into()),
             out_features: out_dim,
             in_features: conv_flat,
+            cert_err: Default::default(),
         },
         GpuCrownLayer::Activation {
             lower_slope: relu_ls,
@@ -96,6 +97,7 @@ pub(super) fn build_conv_layers(
             out_w,
             in_h,
             in_w,
+            cert_err: Default::default(),
         },
     ]
 }

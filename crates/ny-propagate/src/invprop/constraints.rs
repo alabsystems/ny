@@ -2,18 +2,25 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Output specification constraints in matrix form for INVPROP.
+//! Linear output regions in matrix form for INVPROP.
 
 use ndarray::{Array1, Array2};
 use ny_core::NyError;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-/// Output specification constraints in matrix form: `A*y <= rhs`
+/// Linear output region in matrix form: `A*y <= rhs`
 ///
-/// Represents the output constraint as a system of linear inequalities.
-/// For verification, we check if the network output satisfies these constraints
-/// for all inputs in the perturbation region.
+/// This type is polarity-neutral: it represents a region of output space, and
+/// [`Self::is_satisfied`] tests membership in that region. It does not by itself
+/// say whether the region means that a property holds or is violated.
+///
+/// The verifier-facing [`crate::bounds::AlphaCrownConfig::output_constraints`]
+/// contract gives it a specific polarity: the supplied conjunctive region is
+/// the candidate **violation** region. INVPROP conditions its backward bound on
+/// that region; certifying the conditioned region infeasible proves that the
+/// original property holds. Callers must therefore not supply the desired
+/// property-holding region to that config field.
 ///
 /// # Constraint Mapping
 ///
@@ -39,8 +46,10 @@ pub struct OutputConstraints {
     /// - `true` (conjunction): ALL constraints must be satisfied
     /// - `false` (disjunction): AT LEAST ONE constraint must be satisfied
     ///
-    /// Note: Initial INVPROP implementation only supports conjunction.
-    /// Disjunction requires additional handling (tracked in #360).
+    /// The generic representation and concrete membership check support both
+    /// forms. The verifier's output-seed INVPROP route admits only a conjunction
+    /// representing one candidate violation region; disjunctive properties are
+    /// handled by clause extraction/rebinding before reaching that route.
     pub is_conjunction: bool,
 
     /// Optional clause grouping for disjunctive properties.
@@ -94,7 +103,8 @@ impl OutputConstraints {
 
     /// Create constraints for a simple threshold: `output[target] >= threshold`
     ///
-    /// This represents verifying that a specific output neuron exceeds a threshold.
+    /// This represents the output region where a specific neuron exceeds a
+    /// threshold. Its verifier meaning depends on the caller-assigned polarity.
     /// Converted to `A*y <= rhs` form as: `-output[target] <= -threshold`
     pub fn ge_threshold(output_dim: usize, target: usize, threshold: f32) -> Result<Self, NyError> {
         Self::validate_target(output_dim, target, "ge_threshold")?;
@@ -115,13 +125,15 @@ impl OutputConstraints {
         Self::new(a_matrix, rhs, true)
     }
 
-    /// Create constraints for argmax verification: `output[target] >= output[other]` for all other.
+    /// Create the argmax region: `output[target] >= output[other]` for all other.
     ///
-    /// This verifies that `target` has the highest (or tied highest) output value.
+    /// This region contains outputs where `target` has the highest (or tied
+    /// highest) value. Its verifier meaning depends on the caller-assigned
+    /// polarity.
     /// Converted to `A*y <= rhs` form as: `output[other] - output[target] <= 0` for all other.
     ///
     /// Note: Uses non-strict inequality (`>=`) so ties with target are considered satisfied.
-    /// For strict argmax (no ties), use a small positive `rhs` via custom constraints.
+    /// For strict argmax (no ties), use a small negative `rhs` via custom constraints.
     pub fn argmax(output_dim: usize, target: usize) -> Result<Self, NyError> {
         Self::validate_target(output_dim, target, "argmax")?;
         let num_constraints = output_dim - 1;
@@ -156,7 +168,8 @@ impl OutputConstraints {
     /// * `output` - Concrete output vector of shape `[output_dim]`
     ///
     /// # Returns
-    /// `true` if constraints are satisfied (considering conjunction/disjunction)
+    /// `true` if `output` belongs to the represented region (considering
+    /// conjunction/disjunction). This is not itself a verifier HOLD verdict.
     #[must_use]
     pub fn is_satisfied(&self, output: &Array1<f32>) -> bool {
         if self.num_constraints() == 0 {

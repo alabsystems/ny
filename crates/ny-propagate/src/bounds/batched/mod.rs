@@ -3,8 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ndarray::{Array2, ArrayD, IxDyn};
-use ny_core::{checked_shape_product, NyError, Result};
+use ny_core::{
+    checked_shape_product,
+    dd::{next_down_f64, next_up_f64},
+    NyError, Result,
+};
 use tracing::warn;
+
+use super::{certified_affine_sum_f32, OutwardDirection};
 
 /// Fast scan for any NaN element in an `f32` array.
 ///
@@ -98,8 +104,10 @@ impl BatchedLinearBounds {
     ///   ±Inf coefficients as conservative NaN guards)
     ///
     /// # Errors
-    /// Returns `NyError::InvalidSpec` on shape violations,
-    /// `NyError::NumericalInstability` on NaN detection.
+    /// - Returns `NyError::InvalidSpec` when the coefficient rank is invalid.
+    /// - Returns `NyError::ShapeMismatch` when paired coefficient, bias, or
+    ///   error-carrier shapes disagree.
+    /// - Returns `NyError::NumericalInstability` on NaN detection.
     pub fn new(
         lower_a: ArrayD<f32>,
         lower_b: ArrayD<f32>,
@@ -132,27 +140,44 @@ impl BatchedLinearBounds {
             )));
         }
         if self.lower_a.shape() != self.upper_a.shape() {
-            return Err(NyError::InvalidSpec(format!(
-                "BatchedLinearBounds: lower_a shape {:?} != upper_a shape {:?}",
-                self.lower_a.shape(),
-                self.upper_a.shape()
-            )));
+            return Err(NyError::shape_mismatch(
+                self.lower_a.shape().to_vec(),
+                self.upper_a.shape().to_vec(),
+            ));
         }
         if self.lower_b.shape() != self.upper_b.shape() {
-            return Err(NyError::InvalidSpec(format!(
-                "BatchedLinearBounds: lower_b shape {:?} != upper_b shape {:?}",
-                self.lower_b.shape(),
-                self.upper_b.shape()
-            )));
+            return Err(NyError::shape_mismatch(
+                self.lower_b.shape().to_vec(),
+                self.upper_b.shape().to_vec(),
+            ));
         }
         // bias shape = A shape without last dimension
         let expected_b_shape: Vec<usize> = self.lower_a.shape()[..self.lower_a.ndim() - 1].to_vec();
         if self.lower_b.shape() != expected_b_shape.as_slice() {
-            return Err(NyError::InvalidSpec(format!(
-                "BatchedLinearBounds: lower_b shape {:?} != expected {:?} (A shape without last dim)",
-                self.lower_b.shape(),
-                expected_b_shape
-            )));
+            return Err(NyError::shape_mismatch(
+                expected_b_shape,
+                self.lower_b.shape().to_vec(),
+            ));
+        }
+        if let Some(error) = self
+            .lower_a_err
+            .as_ref()
+            .filter(|error| error.shape() != self.lower_a.shape())
+        {
+            return Err(NyError::shape_mismatch(
+                self.lower_a.shape().to_vec(),
+                error.shape().to_vec(),
+            ));
+        }
+        if let Some(error) = self
+            .upper_a_err
+            .as_ref()
+            .filter(|error| error.shape() != self.upper_a.shape())
+        {
+            return Err(NyError::shape_mismatch(
+                self.upper_a.shape().to_vec(),
+                error.shape().to_vec(),
+            ));
         }
         Ok(())
     }
@@ -184,6 +209,17 @@ impl BatchedLinearBounds {
         if any_nan(&self.upper_b) {
             return Err(NyError::NumericalInstability(
                 "BatchedLinearBounds upper_b contains NaN".into(),
+            ));
+        }
+        if self
+            .lower_a_err
+            .iter()
+            .chain(self.upper_a_err.iter())
+            .flat_map(|error| error.iter())
+            .any(|&value| value.is_nan() || value < 0.0)
+        {
+            return Err(NyError::NumericalInstability(
+                "BatchedLinearBounds coefficient error must be non-negative and non-NaN".into(),
             ));
         }
         Ok(())
@@ -296,14 +332,23 @@ impl BatchedLinearBounds {
 
     /// Attach certified coefficient-error matrices (#vnncomp-aw-soundness).
     ///
-    /// Shapes must match `lower_a`/`upper_a`; otherwise the error is dropped
-    /// (the caller is expected to pass matching shapes). Non-finite or negative
-    /// entries are sanitized at concretize.
+    /// Shapes must match `lower_a`/`upper_a`; a mismatch degrades the whole
+    /// carrier conservatively. Negative or non-finite entries become `+inf`,
+    /// which degrades affected rows when the error is discharged.
     pub(crate) fn set_coeff_err(&mut self, lower_err: ArrayD<f32>, upper_err: ArrayD<f32>) {
-        if lower_err.shape() == self.lower_a.shape() && upper_err.shape() == self.upper_a.shape() {
-            self.lower_a_err = Some(lower_err);
-            self.upper_a_err = Some(upper_err);
+        if lower_err.shape() != self.lower_a.shape() || upper_err.shape() != self.upper_a.shape() {
+            *self = Self::conservative(self.input_shape.clone(), self.output_shape.clone());
+            return;
         }
+        let sanitize = |value: f32| {
+            if value.is_finite() && value >= 0.0 {
+                value
+            } else {
+                f32::INFINITY
+            }
+        };
+        self.lower_a_err = Some(lower_err.mapv(sanitize));
+        self.upper_a_err = Some(upper_err.mapv(sanitize));
     }
 
     /// Build a "carrier" whose coefficient matrices ARE this object's certified
@@ -345,12 +390,19 @@ impl BatchedLinearBounds {
     /// OUTWARD. Shapes must match `self`; on mismatch the error is dropped after a
     /// conservative degrade (so no tightness is claimed without the penalty).
     pub(crate) fn attach_err_from_carried(&mut self, carried: &BatchedLinearBounds) {
-        if carried.lower_a.shape() != self.lower_a.shape()
+        if self.validate_internal_shapes().is_err()
+            || self.validate_no_nan().is_err()
+            || carried.validate_internal_shapes().is_err()
+            || carried.validate_no_nan().is_err()
+            || carried.lower_a.shape() != self.lower_a.shape()
             || carried.upper_a.shape() != self.upper_a.shape()
             || carried.lower_b.shape() != self.lower_b.shape()
             || carried.upper_b.shape() != self.upper_b.shape()
         {
-            self.discharge_coeff_err_to_conservative();
+            // The real result may not itself carry a fresh error.  Calling
+            // `discharge_coeff_err_to_conservative` in that case is a no-op and
+            // would silently lose the incoming carrier.  Degrade explicitly.
+            *self = Self::conservative(self.input_shape.clone(), self.output_shape.clone());
             return;
         }
         // ADD the carried error to any error the op already attached on its plain
@@ -377,29 +429,20 @@ impl BatchedLinearBounds {
         self.lower_a_err = Some(new_lower);
         self.upper_a_err = Some(new_upper);
         // Fold the carried bias magnitude OUTWARD into self's bias.
-        if let (Some(lb), Some(ub), Some(cl), Some(cu)) = (
-            self.lower_b.as_slice_mut().map(|s| s.to_vec()),
-            self.upper_b.as_slice_mut().map(|s| s.to_vec()),
-            carried.lower_b.as_slice(),
-            carried.upper_b.as_slice(),
-        ) {
-            let mut lb = lb;
-            let mut ub = ub;
-            for i in 0..lb.len() {
-                let mag = cl[i].abs().max(cu[i].abs());
-                if mag != 0.0 && mag.is_finite() {
-                    lb[i] = ny_tensor::next_down_f32(lb[i] - mag);
-                    ub[i] = ny_tensor::next_up_f32(ub[i] + mag);
-                } else if !mag.is_finite() {
-                    lb[i] = f32::NEG_INFINITY;
-                    ub[i] = f32::INFINITY;
-                }
-            }
-            if let Some(s) = self.lower_b.as_slice_mut() {
-                s.copy_from_slice(&lb);
-            }
-            if let Some(s) = self.upper_b.as_slice_mut() {
-                s.copy_from_slice(&ub);
+        for (((lb, ub), cl), cu) in self
+            .lower_b
+            .iter_mut()
+            .zip(self.upper_b.iter_mut())
+            .zip(carried.lower_b.iter())
+            .zip(carried.upper_b.iter())
+        {
+            let mag = cl.abs().max(cu.abs());
+            if mag != 0.0 && mag.is_finite() {
+                *lb = ny_tensor::next_down_f32(*lb - mag);
+                *ub = ny_tensor::next_up_f32(*ub + mag);
+            } else if !mag.is_finite() {
+                *lb = f32::NEG_INFINITY;
+                *ub = f32::INFINITY;
             }
         }
     }
@@ -424,6 +467,10 @@ impl BatchedLinearBounds {
         if !self.has_coeff_err() {
             return;
         }
+        if self.validate_internal_shapes().is_err() || self.validate_no_nan().is_err() {
+            *self = Self::conservative(self.input_shape.clone(), self.output_shape.clone());
+            return;
+        }
         let a_shape = self.lower_a.shape().to_vec();
         if a_shape.len() < 2 {
             return; // keep carrying
@@ -433,15 +480,17 @@ impl BatchedLinearBounds {
             return; // keep carrying
         }
         let total_pos: usize = self.lower_b.len();
-        let mut mag = vec![0.0f64; n];
+        let mut mag = vec![0.0f32; n];
         for j in 0..n {
-            mag[j] = (in_l[j] as f64).abs().max((in_u[j] as f64).abs());
+            mag[j] = in_l[j].abs().max(in_u[j].abs());
         }
         let fold_side =
             |err_opt: &mut Option<ArrayD<f32>>, bias: &mut ArrayD<f32>, lower_side: bool| {
                 // Pre-check both views before taking anything, so a failure keeps
                 // the error carried instead of silently dropping it.
-                let ok = err_opt.as_ref().is_some_and(|e| e.len() == total_pos * n)
+                let ok = err_opt
+                    .as_ref()
+                    .is_some_and(|e| e.len() == total_pos * n && e.as_slice().is_some())
                     && bias.as_slice_mut().is_some();
                 if !ok {
                     return;
@@ -455,16 +504,17 @@ impl BatchedLinearBounds {
                 let b = bias.as_slice_mut().expect("checked above");
                 let mut any_kept = false;
                 for p in 0..total_pos {
-                    let mut pen = 0.0f64;
-                    for j in 0..n {
-                        pen += e2d[[p, j]] as f64 * mag[j];
-                    }
+                    let pen = certified_affine_sum_f32(
+                        0.0,
+                        (0..n).map(|j| (e2d[[p, j]], mag[j])),
+                        OutwardDirection::Upper,
+                    );
                     if pen.is_finite() {
                         if pen != 0.0 {
                             b[p] = if lower_side {
-                                ny_tensor::next_down_f32((b[p] as f64 - pen) as f32)
+                                ny_tensor::next_down_f32(next_down_f64(b[p] as f64 - pen) as f32)
                             } else {
-                                ny_tensor::next_up_f32((b[p] as f64 + pen) as f32)
+                                ny_tensor::next_up_f32(next_up_f64(b[p] as f64 + pen) as f32)
                             };
                         }
                         for j in 0..n {
@@ -515,6 +565,27 @@ impl BatchedLinearBounds {
         if !self.has_coeff_err() {
             return;
         }
+        if self.validate_internal_shapes().is_err() || self.validate_no_nan().is_err() {
+            *self = Self::conservative(self.input_shape.clone(), self.output_shape.clone());
+            return;
+        }
+        let fold_storage_is_contiguous = self.lower_b.as_slice().is_some()
+            && self.upper_b.as_slice().is_some()
+            && self
+                .lower_a_err
+                .as_ref()
+                .is_none_or(|error| error.as_slice().is_some())
+            && self
+                .upper_a_err
+                .as_ref()
+                .is_none_or(|error| error.as_slice().is_some());
+        if !fold_storage_is_contiguous {
+            // The implementation below consumes the carrier before reshaping it.
+            // A strided owned array can be shape-valid yet non-reshapeable; do
+            // not let that exceptional layout silently discard the proof error.
+            *self = Self::conservative(self.input_shape.clone(), self.output_shape.clone());
+            return;
+        }
         let a_shape = self.lower_a.shape().to_vec();
         if a_shape.len() < 2 {
             self.discharge_coeff_err_to_conservative();
@@ -526,9 +597,9 @@ impl BatchedLinearBounds {
             return;
         }
         let total_pos: usize = self.lower_b.len();
-        let mut mag = vec![0.0f64; n];
+        let mut mag = vec![0.0f32; n];
         for j in 0..n {
-            mag[j] = (in_l[j] as f64).abs().max((in_u[j] as f64).abs());
+            mag[j] = in_l[j].abs().max(in_u[j].abs());
         }
         if let Some(le) = self.lower_a_err.take() {
             if let (Ok(e2d), Some(lb)) = (
@@ -536,13 +607,14 @@ impl BatchedLinearBounds {
                 self.lower_b.as_slice_mut(),
             ) {
                 for p in 0..total_pos {
-                    let mut pen = 0.0f64;
-                    for j in 0..n {
-                        pen += e2d[[p, j]] as f64 * mag[j];
-                    }
+                    let pen = certified_affine_sum_f32(
+                        0.0,
+                        (0..n).map(|j| (e2d[[p, j]], mag[j])),
+                        OutwardDirection::Upper,
+                    );
                     if pen != 0.0 {
                         lb[p] = if pen.is_finite() {
-                            ny_tensor::next_down_f32((lb[p] as f64 - pen) as f32)
+                            ny_tensor::next_down_f32(next_down_f64(lb[p] as f64 - pen) as f32)
                         } else {
                             f32::NEG_INFINITY
                         };
@@ -556,13 +628,14 @@ impl BatchedLinearBounds {
                 self.upper_b.as_slice_mut(),
             ) {
                 for p in 0..total_pos {
-                    let mut pen = 0.0f64;
-                    for j in 0..n {
-                        pen += e2d[[p, j]] as f64 * mag[j];
-                    }
+                    let pen = certified_affine_sum_f32(
+                        0.0,
+                        (0..n).map(|j| (e2d[[p, j]], mag[j])),
+                        OutwardDirection::Upper,
+                    );
                     if pen != 0.0 {
                         ub[p] = if pen.is_finite() {
-                            ny_tensor::next_up_f32((ub[p] as f64 + pen) as f32)
+                            ny_tensor::next_up_f32(next_up_f64(ub[p] as f64 + pen) as f32)
                         } else {
                             f32::INFINITY
                         };
@@ -586,6 +659,26 @@ impl BatchedLinearBounds {
     /// `-inf` (resp. `+inf`). Positions with zero error stay fully precise.
     pub(crate) fn discharge_coeff_err_to_conservative(&mut self) {
         if !self.has_coeff_err() {
+            return;
+        }
+        if self.validate_internal_shapes().is_err() || self.validate_no_nan().is_err() {
+            *self = Self::conservative(self.input_shape.clone(), self.output_shape.clone());
+            return;
+        }
+        let discharge_storage_is_contiguous = self.lower_a.as_slice().is_some()
+            && self.upper_a.as_slice().is_some()
+            && self.lower_b.as_slice().is_some()
+            && self.upper_b.as_slice().is_some()
+            && self
+                .lower_a_err
+                .as_ref()
+                .is_none_or(|error| error.as_slice().is_some())
+            && self
+                .upper_a_err
+                .as_ref()
+                .is_none_or(|error| error.as_slice().is_some());
+        if !discharge_storage_is_contiguous {
+            *self = Self::conservative(self.input_shape.clone(), self.output_shape.clone());
             return;
         }
         let a_shape = self.lower_a.shape().to_vec();
@@ -969,18 +1062,114 @@ mod tests {
         // ±Inf is allowed in BatchedLinearBounds, should pass through
         assert_eq!(result.lower_a(), &la);
     }
+
+    #[test]
+    fn malformed_coefficient_error_fails_closed() {
+        let mut bounds = BatchedLinearBounds::new(
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            ArrayD::zeros(IxDyn(&[1])),
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            ArrayD::zeros(IxDyn(&[1])),
+            vec![2],
+            vec![1],
+        )
+        .unwrap();
+        bounds.set_coeff_err(
+            ArrayD::from_shape_vec(IxDyn(&[1, 2]), vec![-1.0, 0.0]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1, 2]), vec![f32::NAN, 0.0]).unwrap(),
+        );
+        assert_eq!(bounds.lower_a_err.as_ref().unwrap()[[0, 0]], f32::INFINITY);
+        assert_eq!(bounds.upper_a_err.as_ref().unwrap()[[0, 0]], f32::INFINITY);
+
+        bounds.set_coeff_err(ArrayD::zeros(IxDyn(&[2, 2])), ArrayD::zeros(IxDyn(&[2, 2])));
+        assert!(bounds.lower_b().iter().all(|&v| v == f32::NEG_INFINITY));
+        assert!(bounds.upper_b().iter().all(|&v| v == f32::INFINITY));
+
+        let mut directly_malformed = BatchedLinearBounds::new(
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            ArrayD::zeros(IxDyn(&[1])),
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            ArrayD::zeros(IxDyn(&[1])),
+            vec![2],
+            vec![1],
+        )
+        .unwrap();
+        directly_malformed.lower_a_err = Some(ArrayD::from_elem(IxDyn(&[1, 2]), -1.0));
+        assert!(directly_malformed.validate_no_nan().is_err());
+        directly_malformed.fold_coeff_err_into_bias(&[1.0, 1.0], &[1.0, 1.0]);
+        assert!(directly_malformed
+            .lower_b()
+            .iter()
+            .all(|&value| value == f32::NEG_INFINITY));
+        assert!(directly_malformed
+            .upper_b()
+            .iter()
+            .all(|&value| value == f32::INFINITY));
+
+        // A carrier-layout mismatch must also degrade when the real result has
+        // no fresh coefficient error of its own; the old discharge helper was a
+        // no-op in precisely that case.
+        let mut real = BatchedLinearBounds::new(
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            ArrayD::zeros(IxDyn(&[1])),
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            ArrayD::zeros(IxDyn(&[1])),
+            vec![2],
+            vec![1],
+        )
+        .unwrap();
+        let carried = BatchedLinearBounds::new(
+            ArrayD::zeros(IxDyn(&[1, 1])),
+            ArrayD::zeros(IxDyn(&[1])),
+            ArrayD::zeros(IxDyn(&[1, 1])),
+            ArrayD::zeros(IxDyn(&[1])),
+            vec![1],
+            vec![1],
+        )
+        .unwrap();
+        real.attach_err_from_carried(&carried);
+        assert!(real
+            .lower_b()
+            .iter()
+            .all(|&value| value == f32::NEG_INFINITY));
+        assert!(real.upper_b().iter().all(|&value| value == f32::INFINITY));
+
+        let mut strided_error = BatchedLinearBounds::new(
+            ArrayD::zeros(IxDyn(&[2, 2])),
+            ArrayD::zeros(IxDyn(&[2])),
+            ArrayD::zeros(IxDyn(&[2, 2])),
+            ArrayD::zeros(IxDyn(&[2])),
+            vec![2],
+            vec![2],
+        )
+        .unwrap();
+        strided_error.lower_a_err =
+            Some(ArrayD::from_elem(IxDyn(&[2, 2]), 1.0).permuted_axes(IxDyn(&[1, 0])));
+        strided_error.upper_a_err = Some(ArrayD::zeros(IxDyn(&[2, 2])));
+        assert!(strided_error
+            .lower_a_err
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .is_none());
+        strided_error.fold_coeff_err_into_bias(&[1.0, 1.0], &[1.0, 1.0]);
+        assert!(strided_error
+            .lower_b()
+            .iter()
+            .all(|&value| value == f32::NEG_INFINITY));
+        assert!(strided_error
+            .upper_b()
+            .iter()
+            .all(|&value| value == f32::INFINITY));
+    }
 }
 
-/// Soundness AND tightness tests for the f64-accumulate BLAS concretize path.
+/// Soundness and tightness tests for certified BLAS concretization.
 ///
-/// The fast `concretize_blas_posneg` path casts the CROWN coefficients/inputs to
-/// f64 and accumulates each dot product entirely in f64 (BLAS DGEMV). Because
-/// every product `a_j * x_j` of two f32 values is EXACT in f64 and the f64
-/// running sum has only sub-f64-ULP error over `n` terms, the result is exact up
-/// to a SINGLE directed f64→f32 cast (`next_down_f32` lower / `next_up_f32`
-/// upper). This is the SAME soundness basis as the f64-scalar fallback, so the
-/// path is both SOUND (lower ≤ true ≤ upper) and TIGHT (as tight as the scalar
-/// path — no absolute-envelope over-widening).
+/// The fast path attaches a complete binary64 BLAS error envelope and switches
+/// cancellation-heavy rows to the shared self-checked DD reducer. These tests
+/// require both routes to bracket exact-product references without making the
+/// former absolute envelope vacuous.
 ///
 /// These tests build f64 ground truth and assert (a) the BLAS bounds always
 /// bracket it (soundness) and (b) the BLAS path matches the trusted f64-scalar
@@ -990,6 +1179,7 @@ mod tests {
 #[cfg(test)]
 mod blas_accum_widening_soundness {
     use super::*;
+    use ny_tensor::BoundedTensor;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
@@ -1016,7 +1206,7 @@ mod blas_accum_widening_soundness {
 
     /// Run the f64-accumulate BLAS path for a single output row (m=1) over a
     /// shared input box of width `n`, returning the (lower, upper) concrete
-    /// bounds after the single directed f64→f32 cast.
+    /// bounds after certified BLAS-error enclosure and directed publication.
     fn blas_row(la: &[f32], ua: &[f32], xl: &[f32], xu: &[f32], lb: f32, ub: f32) -> (f32, f32) {
         let n = la.len();
         let lower_a = ArrayD::from_shape_vec(IxDyn(&[1, n]), la.to_vec()).unwrap();
@@ -1049,6 +1239,76 @@ mod blas_accum_widening_soundness {
         (lo[[0]], hi[[0]])
     }
 
+    #[test]
+    fn three_term_binary64_cancellation_is_tight_on_blas_and_scalar_seams() {
+        let large = 2.0_f32.powi(30);
+        let coefficients = [large, 1.0, -large];
+        let point = [large, 1.0, large];
+
+        for (name, (lower, upper)) in [
+            (
+                "blas",
+                blas_row(&coefficients, &coefficients, &point, &point, 0.0, 0.0),
+            ),
+            (
+                "scalar",
+                scalar_row(&coefficients, &coefficients, &point, &point, 0.0, 0.0),
+            ),
+        ] {
+            assert!(
+                lower <= 1.0 && upper >= 1.0,
+                "{name}: [{lower:e}, {upper:e}]"
+            );
+            assert!(
+                lower > 0.99 && upper < 1.01,
+                "{name}: [{lower:e}, {upper:e}]"
+            );
+        }
+    }
+
+    #[test]
+    fn public_concretize_sound_is_tight_on_blas_and_scalar_dispatches() {
+        let large = 2.0_f32.powi(30);
+        let cancellation = [large, 1.0, -large];
+        let point_values = [large, 1.0, large];
+        let point = ArrayD::from_shape_vec(IxDyn(&[3]), point_values.to_vec()).unwrap();
+        let input = BoundedTensor::new(point.clone(), point).unwrap();
+
+        for (name, rows) in [
+            ("blas", vec![cancellation.to_vec()]),
+            (
+                "scalar fallback",
+                vec![cancellation.to_vec(), vec![f32::INFINITY, 0.0, 0.0]],
+            ),
+        ] {
+            let m = rows.len();
+            let coefficients =
+                ArrayD::from_shape_vec(IxDyn(&[m, 3]), rows.into_iter().flatten().collect())
+                    .unwrap();
+            let biases = ArrayD::zeros(IxDyn(&[m]));
+            let bounds = BatchedLinearBounds::new(
+                coefficients.clone(),
+                biases.clone(),
+                coefficients,
+                biases,
+                vec![3],
+                vec![m],
+            )
+            .unwrap();
+            let result = bounds.concretize_sound(&input).unwrap();
+            let lower = result.lower()[[0]];
+            let upper = result.upper()[[0]];
+            assert!(
+                lower <= 1.0 && upper >= 1.0,
+                "{name}: [{lower:e}, {upper:e}]"
+            );
+            assert!(
+                lower > 0.99 && upper < 1.01,
+                "{name}: [{lower:e}, {upper:e}]"
+            );
+        }
+    }
+
     /// Assert both concretization paths are SOUND against the exact-product f64
     /// truth (gap to truth >= 0), and that the f64-BLAS bound is additionally
     /// TIGHT (gap <= `budget`, i.e. no absolute-envelope over-widening).
@@ -1056,8 +1316,8 @@ mod blas_accum_widening_soundness {
     /// bound (bound - truth).
     ///
     /// SOUNDNESS is required of BOTH paths, including under the heavy-cancellation
-    /// regime below. They share one basis — exact f64 products, f64 accumulation,
-    /// a single directed f32 cast — so neither may f32-round a product before
+    /// regime below. They share exact binary32 products and a complete reduction
+    /// error channel, so neither may f32-round a product before
     /// summing: round-to-nearest biases each term INWARD at the TERM magnitude,
     /// whereas the compensating widening is one ULP at the (under cancellation,
     /// far smaller) RESULT magnitude, which cannot cover it.

@@ -103,6 +103,7 @@ use super::transform::TransposeLayer;
 use super::transform::UnsqueezeLayer;
 use super::trigonometric::ArctanLayer;
 use super::trigonometric::CosLayer;
+use super::trigonometric::ErfLayer;
 use super::trigonometric::SigmoidLayer;
 use super::trigonometric::SinLayer;
 use super::trigonometric::SoftplusLayer;
@@ -124,6 +125,7 @@ macro_rules! for_each_elementwise_activation {
             SiLU,
             Tanh,
             Sigmoid,
+            Erf,
             Exp,
             Log,
             Sqrt,
@@ -192,6 +194,7 @@ macro_rules! for_each_patches_capable_activation {
             GELU,
             Tanh,
             Sigmoid,
+            Erf,
             Softplus,
             HardSwish,
             Mish,
@@ -377,6 +380,8 @@ pub enum Layer {
     Tanh(TanhLayer),
     /// Unary: sigmoid activation
     Sigmoid(SigmoidLayer),
+    /// Unary: Gaussian error function
+    Erf(ErfLayer),
     /// Unary: softplus activation (smooth ReLU)
     Softplus(SoftplusLayer),
     /// Unary: sine function (for positional encodings)

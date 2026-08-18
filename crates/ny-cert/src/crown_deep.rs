@@ -232,59 +232,7 @@ struct QuadPremises {
 
 /// Lossless `f64 -> Rat` (every finite f64 is the dyadic `m · 2^e`).
 fn f64_to_rat_exact(v: f64) -> Option<Rat> {
-    use num_bigint::BigInt;
-    if v == 0.0 {
-        return Some(Rat::ZERO);
-    }
-    if !v.is_finite() {
-        return None;
-    }
-    let bits = v.to_bits();
-    // behavior-identical: `bits` is u64 and the shift amounts (63, 52) are
-    // literals < 64, so `wrapping_shr` equals `>>` on every input (they diverge
-    // only when the shift ≥ bit-width, which is impossible here); it drops the
-    // spurious shift-overflow VC the verifier would otherwise havoc.
-    let sign = if bits.wrapping_shr(63) == 1 {
-        -1i64
-    } else {
-        1i64
-    };
-    let exp_field = (bits.wrapping_shr(52) & 0x7ff) as i64;
-    let mant_field = (bits & 0xf_ffff_ffff_ffff) as i64;
-    let (mantissa, exp) = if exp_field == 0 {
-        (mant_field, -1074i64)
-    } else {
-        // `1i64 << 52` const-folded (= 2^52) and the exponent-bias subtraction
-        // uses `wrapping_sub`: `exp_field` is a masked 11-bit value (`& 0x7ff`,
-        // range 0..=2047) so `exp_field - 1075` never underflows for a real
-        // input, but the `as i64` cast havocs the value for the verifier —
-        // `wrapping_sub` is exact here and emits no overflow VC.
-        // behavior-identical: `mant_field` is the masked low 52 bits, so
-        // `mant_field ∈ [0, 2^52)`, and `+ 2^52` gives a sum `< 2^53` — nowhere
-        // near i64::MAX, so `wrapping_add` equals `+` here; it drops the cast-
-        // havoced overflow VC.
-        (
-            mant_field.wrapping_add(4_503_599_627_370_496i64),
-            exp_field.wrapping_sub(1023).wrapping_sub(52),
-        )
-    };
-    // behavior-identical: `sign ∈ {−1,+1}` and `mantissa ∈ [0, 2^53)` (a 52- or
-    // 53-bit magnitude), so `sign * mantissa` is a conditional negate whose
-    // operand is never i64::MIN; `wrapping_neg` therefore equals `-mantissa`
-    // exactly. This models a width-64 Neg instead of an Unsupported width>64 Mul.
-    let m = BigInt::from(if sign < 0 {
-        mantissa.wrapping_neg()
-    } else {
-        mantissa
-    });
-    if exp >= 0 {
-        Rat::from_bigints(m << (exp as u32), BigInt::from(1)).ok()
-    } else {
-        // total: on this branch `exp < 0`, so `exp.unsigned_abs()` equals `-exp`
-        // exactly, but is total (no Neg-overflow VC) — same idiom as
-        // `rational.rs:from_f32_exact`.
-        Rat::from_bigints(m, BigInt::from(1) << exp.unsigned_abs()).ok()
-    }
+    Rat::from_f64_exact(v)
 }
 
 /// Next `f64` strictly above `v` (finite `v`; bit-level `nextafter`, avoiding
@@ -475,8 +423,9 @@ impl DeepReluProblem {
     /// layer.
     ///
     /// # Errors
-    /// Propagates exact-arithmetic overflow.
+    /// Propagates exact-rational arena failures.
     pub fn preact_bounds(&self) -> Result<PreactBounds, DeepCrownError> {
+        crate::rational::ensure_healthy()?;
         self.validate()?;
         let k = self.depth();
         // `Vec::new()` (not `with_capacity(k)`): the capacity hint on the
@@ -529,6 +478,7 @@ impl DeepReluProblem {
             lower.push(zl);
             upper.push(zu);
         }
+        crate::rational::ensure_healthy()?;
         Ok(PreactBounds { lower, upper })
     }
 
@@ -636,7 +586,12 @@ impl DeepReluProblem {
             }
             return Ok(const_acc);
         }
-        for li in (0..li0).rev() {
+        // Forward index (not `(0..li0).rev()`): the `Rev<Range>` adapter is an
+        // absent-callee for the panic-freedom checker; `li = li0-1-idx` reverses
+        // the walk exactly. Saturating subs match the file idiom and are exact
+        // here (li0 >= 1 in-body, idx <= li0-1).
+        for idx in 0..li0 {
+            let li = li0.saturating_sub(1).saturating_sub(idx);
             budget_check()?;
             let width = match self.weights.get(li) {
                 Some(w) => w.len(),
@@ -749,8 +704,9 @@ impl DeepReluProblem {
     /// [`interm_round`]: DeepReluProblem::interm_round
     ///
     /// # Errors
-    /// Propagates exact-arithmetic overflow.
+    /// Propagates exact-rational arena failures.
     pub fn preact_bounds_crown(&self) -> Result<PreactBounds, DeepCrownError> {
+        crate::rational::ensure_healthy()?;
         self.validate()?;
         let round = self.interm_round;
         let k = self.depth();
@@ -850,6 +806,7 @@ impl DeepReluProblem {
             lower.push(zl);
             upper.push(zu);
         }
+        crate::rational::ensure_healthy()?;
         Ok(PreactBounds { lower, upper })
     }
 
@@ -896,7 +853,8 @@ impl DeepReluProblem {
     ///
     /// # Errors
     /// Returns [`DeepCrownError`] on a dimension mismatch, an out-of-range α, an
-    /// infeasible threshold, or exact-arithmetic overflow.
+    /// infeasible threshold, an expired certificate budget, or an
+    /// exact-rational arena failure.
     ///
     /// The `#[ensures]` states the locally-provable producer well-formedness
     /// invariant (on `Ok` the emitted multi-layer entailment certificate has one
@@ -1823,7 +1781,12 @@ impl DeepReluProblem {
         // activations a⁽ᴸ⁾. Initialized to the read-out weights on a⁽ᵏ⁾.
         let mut a_coeff: Vec<Rat> = self.out_weight.clone();
 
-        for li in (0..k).rev() {
+        // Forward index (not `(0..k).rev()`): the `Rev<Range>` adapter is an
+        // absent-callee for the panic-freedom checker; `li = k-1-idx` reverses the
+        // walk exactly. Saturating subs match the file idiom and are exact here
+        // (k >= 1 in-body, idx <= k-1).
+        for idx in 0..k {
+            let li = k.saturating_sub(1).saturating_sub(idx);
             // total: `saturating_add` (not `+ 1`): `li < k <= isize::MAX`, so
             // the add never saturates — identical 1-indexed layer tag.
             let layer1 = li.saturating_add(1);
@@ -2133,8 +2096,9 @@ impl DeepReluProblem {
     ///
     /// # Errors
     /// [`RatError::Dimension`] for a wrong-length point; propagates
-    /// exact-arithmetic overflow.
+    /// exact-rational arena failures.
     pub fn eval(&self, x: &[Rat]) -> Result<Rat, RatError> {
+        crate::rational::ensure_healthy()?;
         // Fail-CLOSED dimension guard (was a fail-loud `assert_eq!`): returns a
         // sound `Err` on a mis-sized point instead of panicking, so the strict
         // verifier sees a total function (no unprovable `x.len() == input_dim`
@@ -2164,6 +2128,7 @@ impl DeepReluProblem {
         for (wj, aj) in self.out_weight.iter().zip(&act) {
             y = y.add(wj.mul(*aj)?)?;
         }
+        crate::rational::ensure_healthy()?;
         Ok(y)
     }
 }
@@ -2173,6 +2138,14 @@ mod tests {
     use super::*;
     use crate::schema::{entailment_to_json, farkas_to_json};
     use crate::selfcheck::{check_entailment, check_farkas};
+
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
 
     fn r(n: i128, d: i128) -> Rat {
         Rat::new(n, d).unwrap()
@@ -2358,6 +2331,16 @@ mod tests {
         // Poison the (thread-local) arena via the test-only setter: certify
         // must refuse at the entry gate with ArenaPoisoned, not emit.
         crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+        assert!(matches!(
+            net.preact_bounds(),
+            Err(DeepCrownError::Rat(RatError::Poisoned))
+        ));
+        assert!(matches!(
+            net.preact_bounds_crown(),
+            Err(DeepCrownError::Rat(RatError::Poisoned))
+        ));
+        assert_eq!(net.eval(&[Rat::ZERO]), Err(RatError::Poisoned));
         assert!(
             matches!(net.certify(Rat::ZERO), Err(DeepCrownError::ArenaPoisoned)),
             "certify must fail CLOSED while the arena is poisoned"

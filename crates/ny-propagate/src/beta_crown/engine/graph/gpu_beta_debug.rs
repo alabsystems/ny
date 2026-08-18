@@ -262,6 +262,7 @@ pub fn debug_interm_refine_last_relu(
     let inherited = pairs(bounds_cache.get(&seed_node)?);
     let caches = [bounds_cache];
     let inputs = [constrained_input];
+    let histories = [&history];
     let betas: [Option<&GraphBetaState>; 1] = [Some(&beta)];
     let alphas: [Option<&crate::beta_crown::state::GraphDomainAlphaState>; 1] = [None];
     // Empty spec matrix: this debug harness does not exercise the joint
@@ -273,6 +274,7 @@ pub fn debug_interm_refine_last_relu(
         1,
         &caches,
         &inputs,
+        &histories,
         &betas,
         &alphas,
         engine,

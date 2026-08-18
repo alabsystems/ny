@@ -35,6 +35,15 @@ use crate::{GraphNetwork, Layer, LinearBounds, NETWORK_INPUT};
 /// Batch linear bounds: (lower_A, lower_b, upper_A, upper_b).
 type BatchLinearParts = (Array2<f32>, Array1<f32>, Array2<f32>, Array1<f32>);
 
+/// Legacy forward-affine clipping is not authorized to tighten verdict-bearing
+/// bounds. Its f32 forward accumulation does not carry a coefficient-error
+/// envelope through every Linear/ReLU/Add operation. The certified Complete
+/// Clip root-bank path is separate and remains production-enabled.
+#[inline]
+pub(in crate::beta_crown::engine::graph) fn legacy_forward_affine_clipping_authorized() -> bool {
+    false
+}
+
 /// Compute forward linear bounds for each node: `node(x) ∈ [lA*x + lb, uA*x + ub]`.
 ///
 /// Traverses the graph in topological order, accumulating linear relaxations:
@@ -98,7 +107,7 @@ pub(in crate::beta_crown::engine::graph) fn compute_forward_linear_bounds<
 
         let node_bounds = match &node.layer {
             Layer::Linear(linear) => {
-                compose_linear_forward(&pred_bounds, &linear.weight, linear.bias.as_ref())
+                compose_linear_forward(&pred_bounds, linear.weight(), linear.bias())
             }
             Layer::ReLU(_) => compose_relu_forward(
                 &pred_bounds,

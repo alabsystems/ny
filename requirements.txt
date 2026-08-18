@@ -3,8 +3,14 @@ pytest>=7.0
 pytest-timeout>=2.0
 numpy>=1.24
 PyYAML>=6.0
+onnx>=1.14
+onnxruntime>=1.16.3
 tomli>=1.1; python_version < "3.11"
+# The official VNN-COMP SCORING checker (imported by the tol=0 replay gate in
+# scripts/canonicalize_vnncomp_ce_y.py) memoizes via cachier; the scorer
+# harness pins 2.2.2 (scripts/replay_vnncomp2025_counterexample.py).
+cachier==2.2.2
 
-# Optional: torch, onnx, and onnxruntime are needed only by some benchmark and
-# export scripts under benchmarks/ and scripts/ (install as needed).
+# Optional: torch is needed only by some benchmark and export scripts under
+# benchmarks/ and scripts/ (install as needed).
 # Building the Python bindings (crates/ny-python) requires maturin.

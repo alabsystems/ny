@@ -6,7 +6,8 @@ use crate::layers::common::BoundPropagation;
 use crate::layers::BatchNormLayer;
 use crate::{BatchedLinearBounds, LinearBounds};
 use ndarray::{arr1, Array1, Array2, ArrayD, Axis, IxDyn};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_core::{f64_to_f32_down, f64_to_f32_up};
+use ny_tensor::BoundedTensor;
 use proptest::prelude::*;
 
 use super::{batchnorm, valid_interval};
@@ -124,8 +125,8 @@ fn directed_rounding_batchnorm_crown_bias_2183() {
         .expect("BatchNorm CROWN failed");
 
     let true_f64: f64 = (0..channels).map(|_| 0.1_f32 as f64).sum();
-    let expected_lower = next_down_f32(true_f64 as f32);
-    let expected_upper = next_up_f32(true_f64 as f32);
+    let expected_lower = f64_to_f32_down(true_f64);
+    let expected_upper = f64_to_f32_up(true_f64);
 
     let mut f32_sum = 0.0_f32;
     for _ in 0..channels {
@@ -140,12 +141,12 @@ fn directed_rounding_batchnorm_crown_bias_2183() {
     assert_eq!(
         result.lower_b[0].to_bits(),
         expected_lower.to_bits(),
-        "BatchNorm lower_b must use next_down_f32 on f64 accumulation",
+        "BatchNorm lower_b must convert the certified f64 endpoint downward",
     );
     assert_eq!(
         result.upper_b[0].to_bits(),
         expected_upper.to_bits(),
-        "BatchNorm upper_b must use next_up_f32 on f64 accumulation",
+        "BatchNorm upper_b must convert the certified f64 endpoint upward",
     );
     assert!(
         (result.lower_b[0] as f64) <= true_f64,

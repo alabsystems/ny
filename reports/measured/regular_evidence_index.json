@@ -1,0 +1,3912 @@
+{
+  "entries": {
+    "[\"acasxu_2023\",\"onnx/ACASXU_run2a_5_3_batch_2000.onnx\",\"vnnlib/prop_2.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-acas-row84-clean01b9-2025-20260731T092559Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "0c46a64d1c105df6207d53327f0be16fa9e38fba6f15813a1146972639477e77",
+            "compressed_size_bytes": 51063,
+            "compression": "gzip",
+            "declared_name": "onnx/ACASXU_run2a_5_3_batch_2000.onnx",
+            "git_blob": "0c32e2e0c449cbfc8fa8743c31854e44e3e11545",
+            "git_path": "benchmarks/acasxu_2023/onnx/ACASXU_run2a_5_3_batch_2000.onnx.gz",
+            "sha256": "554f08a8e04567562164e3e1a0f742d5212c4f4f93b9134aea728b3a28c713a9",
+            "size_bytes": 55889,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "9a6cdd3a843e7f046b1e8826f6e2bde1cb0467c4c56f05a089d1f804cc963fcb",
+            "compressed_size_bytes": 290,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_2.vnnlib",
+            "git_blob": "36a79b2a22efd9c0b346e98ff88d723bbcef983e",
+            "git_path": "benchmarks/acasxu_2023/vnnlib/prop_2.vnnlib.gz",
+            "sha256": "ad309a9574d796b1e1772681185f780a277cf2f140300b676625324c158f42a0",
+            "size_bytes": 848,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 84,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/acasxu_2023/instances.csv",
+        "instances_csv_git_blob": "a9e0dbe560765026570b294c02489c57e8e71099",
+        "instances_csv_git_path": "benchmarks/acasxu_2023/instances.csv",
+        "instances_csv_sha256": "741436aeaaa2c4f0d8673218d656b49af7f4e9e2fb57f31f867d4a1c8aa39fab",
+        "official_timeout_seconds": "116",
+        "onnx": "onnx/ACASXU_run2a_5_3_batch_2000.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "496c0bb1fa61221bd24f3ec7f42567c2013366b44c6ac30ff21f8e29751bd247",
+        "vnnlib": "vnnlib/prop_2.vnnlib"
+      },
+      "category": "acasxu_2023",
+      "completion": {
+        "artifact": "runs/acas-row84-clean01b9-2025-20260731T092559Z/completion.json",
+        "sha256": "9d483fd00794d46fa81291b2355125b86d44b3e857b8c4eb77fed8ca517dea85",
+        "size_bytes": 48019
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v5",
+      "exact_commit": "01b9f0a4a31ed5c66733b9be659fc17d083cb4de",
+      "measured_csv": {
+        "path": "<home>/ny/reports/measured/acasxu_2023.csv",
+        "row_after": [
+          "acasxu_2023",
+          "onnx/ACASXU_run2a_5_3_batch_2000.onnx",
+          "vnnlib/prop_2.vnnlib",
+          "prepared",
+          "sat",
+          "0",
+          "acas-row84-clean01b9-2025-20260731T092559Z"
+        ],
+        "row_after_sha256": "d3878ad45b61f0f709fd0edf6c0941cc986eb4b2c966cf3eb7fee4058a6651ea",
+        "row_before": [
+          "acasxu_2023",
+          "onnx/ACASXU_run2a_5_3_batch_2000.onnx",
+          "vnnlib/prop_2.vnnlib",
+          "prepared",
+          "timeout",
+          "116"
+        ],
+        "row_before_sha256": "eee3e6bf7a609eab156e7d2a9de638d160c891a6eb8142b3ede9f2abb9f9c8f4",
+        "sha256_after": "b5b2120afa4a1a9842a26d6fa1073cd9f64263cfc8840062cd151419ec7bef3e",
+        "sha256_before": "5cb5e303884281f23ab72315114745474cca4be1c6fd771cd2c077db7b52f5cd"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "organizer_rescore": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/counterexamples.py": {
+            "sha256": "4df1208bb08c1b589dc3f2ac098add44467cf538f7141a7641e7d13001e94e3b",
+            "size_bytes": 10918
+          },
+          "SCORING-ZERO-TOL/process_results.py": {
+            "sha256": "5fac024bd7a4a8e67f0983b400b1747a5462457d32ea640efd7d86aa0c89341c",
+            "size_bytes": 52105
+          },
+          "SCORING-ZERO-TOL/results.txt": {
+            "sha256": "2686e1365738a92b6e10302bebb38f93a5c05a53a0c9fd0fa92409e0256178a2",
+            "size_bytes": 7699538
+          },
+          "SCORING-ZERO-TOL/settings.py": {
+            "sha256": "ceeefbd2498cb0a943ee2950440e40a517697cfa899f15a61092f846936256f1",
+            "size_bytes": 9352
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          },
+          "cora/results.csv": {
+            "sha256": "5052cb20458d1b48314c14bf67eee7b21288bf6b22a57f0c356e82ebdddad9f2",
+            "size_bytes": 605797
+          },
+          "neuralsat/results.csv": {
+            "sha256": "ad6e852758ff7d1495f4337abea10cce493fa18ea4093a2189a0dd54bfe2e4a7",
+            "size_bytes": 630806
+          },
+          "nnenum/results.csv": {
+            "sha256": "e87503beb63f5f0dcacb4f7c55a2f68ebe6cbefe8c8dcc5fcf77ff0a3c58ebfe",
+            "size_bytes": 518395
+          },
+          "nnv/results.csv": {
+            "sha256": "bdecf3bbede8f284be5acf41230280170960c493e142b94e8949a174ba1d0ed2",
+            "size_bytes": 714551
+          },
+          "pyrat/results.csv": {
+            "sha256": "fed23601fda086e6a58b7d35b1c5ddbdf87715dc3f6618832e57d77696cdfc30",
+            "size_bytes": 751885
+          },
+          "sobolbox/results.csv": {
+            "sha256": "07d5ed1d025bbf31c50bb39513a5c07e6ecf670ebef520ba925c1df9a785e073",
+            "size_bytes": 379785
+          }
+        },
+        "candidate": {
+          "counterexample_classification": "correct",
+          "instance_outcome": "correct",
+          "instance_points": 10
+        },
+        "category": "acasxu_2023",
+        "denominator": {
+          "candidate_instance_points": 10,
+          "published_official_points": 1860,
+          "rescored_official_points": 1860
+        },
+        "occurrence": [
+          "onnx/ACASXU_run2a_5_3_batch_2000.onnx",
+          "vnnlib/prop_2.vnnlib",
+          0
+        ],
+        "official_results_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "official_results_repository": {
+          "commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+          "origin": "https://github.com/VNN-COMP/vnncomp2025_results",
+          "tree": "a9a7157d900124da491ea57c5b8066276b7cf864"
+        },
+        "organizer_score_id": 83,
+        "participant_order": [
+          "alpha_beta_crown",
+          "cora",
+          "neuralsat",
+          "nnenum",
+          "nnv",
+          "pyrat",
+          "sobolbox"
+        ],
+        "participants": {
+          "alpha_beta_crown": {
+            "artifact": "alpha_beta_crown/results.csv",
+            "canonical_result": "violated",
+            "counterexample_classification": "correct_up_to_tolerance",
+            "physical_row": 84,
+            "published_category": {
+              "falsified": 47,
+              "fastest": 0,
+              "penalties": 0,
+              "points": 1860,
+              "verified": 139
+            },
+            "published_instance_outcome": "correct",
+            "published_instance_points": 10,
+            "raw_result": "sat",
+            "rescored_category_penalties": 0,
+            "rescored_category_points": 1860,
+            "rescored_instance_outcome": "correct",
+            "rescored_instance_points": 10,
+            "row_sha256": "093613d4b62d0ee32872c1fcf11f5fb85ee01bce230f4646e20ca9edce2e8545",
+            "score_delta": 0
+          },
+          "cora": {
+            "artifact": "cora/results.csv",
+            "canonical_result": "violated",
+            "counterexample_classification": "correct_up_to_tolerance",
+            "physical_row": 84,
+            "published_category": {
+              "falsified": 46,
+              "fastest": 0,
+              "penalties": 0,
+              "points": 1830,
+              "verified": 137
+            },
+            "published_instance_outcome": "correct",
+            "published_instance_points": 10,
+            "raw_result": "sat",
+            "rescored_category_penalties": 0,
+            "rescored_category_points": 1830,
+            "rescored_instance_outcome": "correct",
+            "rescored_instance_points": 10,
+            "row_sha256": "937e26af79245b6b9cf2f876b741eb8bc08c0159009cee6010c0d5ade75cdf87",
+            "score_delta": 0
+          },
+          "neuralsat": {
+            "artifact": "neuralsat/results.csv",
+            "canonical_result": "violated",
+            "counterexample_classification": "correct_up_to_tolerance",
+            "physical_row": 84,
+            "published_category": {
+              "falsified": 47,
+              "fastest": 0,
+              "penalties": 0,
+              "points": 1860,
+              "verified": 139
+            },
+            "published_instance_outcome": "correct",
+            "published_instance_points": 10,
+            "raw_result": "sat",
+            "rescored_category_penalties": 0,
+            "rescored_category_points": 1860,
+            "rescored_instance_outcome": "correct",
+            "rescored_instance_points": 10,
+            "row_sha256": "9af69e1a547cc565429e1323a988fb27b3cbc7a2515a16360c4fb1582705120f",
+            "score_delta": 0
+          },
+          "nnenum": {
+            "artifact": "nnenum/results.csv",
+            "canonical_result": "violated",
+            "counterexample_classification": "correct_up_to_tolerance",
+            "physical_row": 84,
+            "published_category": {
+              "falsified": 47,
+              "fastest": 0,
+              "penalties": 0,
+              "points": 1860,
+              "verified": 139
+            },
+            "published_instance_outcome": "correct",
+            "published_instance_points": 10,
+            "raw_result": "sat",
+            "rescored_category_penalties": 0,
+            "rescored_category_points": 1860,
+            "rescored_instance_outcome": "correct",
+            "rescored_instance_points": 10,
+            "row_sha256": "f67ff6f22ea77712c30d4b3ee7bec9a4bb23887a412112646f0f50ea9c52e2eb",
+            "score_delta": 0
+          },
+          "nnv": {
+            "artifact": "nnv/results.csv",
+            "canonical_result": "timeout",
+            "counterexample_classification": null,
+            "physical_row": 84,
+            "published_category": {
+              "falsified": 39,
+              "fastest": 0,
+              "penalties": 0,
+              "points": 1100,
+              "verified": 71
+            },
+            "published_instance_outcome": "no_credit",
+            "published_instance_points": 0,
+            "raw_result": "timeout",
+            "rescored_category_penalties": 0,
+            "rescored_category_points": 1100,
+            "rescored_instance_outcome": "no_credit",
+            "rescored_instance_points": 0,
+            "row_sha256": "b8afb833bc773f713bf97f4ea94707b9abf7832786d5b3548a013c533b9f4095",
+            "score_delta": 0
+          },
+          "pyrat": {
+            "artifact": "pyrat/results.csv",
+            "canonical_result": "violated",
+            "counterexample_classification": "correct_up_to_tolerance",
+            "physical_row": 84,
+            "published_category": {
+              "falsified": 46,
+              "fastest": 0,
+              "penalties": 0,
+              "points": 1850,
+              "verified": 139
+            },
+            "published_instance_outcome": "correct",
+            "published_instance_points": 10,
+            "raw_result": "sat",
+            "rescored_category_penalties": 0,
+            "rescored_category_points": 1850,
+            "rescored_instance_outcome": "correct",
+            "rescored_instance_points": 10,
+            "row_sha256": "37af60caa22b30c8a0a053bba290f15e3b25ffc31d382342112c822e476d36c1",
+            "score_delta": 0
+          },
+          "sobolbox": {
+            "artifact": "sobolbox/results.csv",
+            "canonical_result": "unknown",
+            "counterexample_classification": null,
+            "physical_row": 84,
+            "published_category": {
+              "falsified": 43,
+              "fastest": 0,
+              "penalties": 1,
+              "points": 1460,
+              "verified": 118
+            },
+            "published_instance_outcome": "no_credit",
+            "published_instance_points": 0,
+            "raw_result": "unknown",
+            "rescored_category_penalties": 1,
+            "rescored_category_points": 1460,
+            "rescored_instance_outcome": "no_credit",
+            "rescored_instance_points": 0,
+            "row_sha256": "de79428c3b45b2527d93d09941af18f35109d45a8f4d15c2d3990a0567fc124f",
+            "score_delta": 0
+          }
+        },
+        "schema": "ny_vnncomp2025_dynamic_organizer_rescore_v1",
+        "scoring_semantics": {
+          "correct_points": 10,
+          "incorrect_penalty": -150,
+          "normalized_percent_floor": 0,
+          "time_bonus_enabled": false
+        },
+        "truth": {
+          "cause": "ny_strictly_correct_exact_2025_counterexample",
+          "published": "holds",
+          "rescored": "violated"
+        }
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_dynamic_rescore_v1",
+      "published_truth": "holds",
+      "run_id": "acas-row84-clean01b9-2025-20260731T092559Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "acasxu_2023/00084-79da9279b5567aa0/acas-row84-clean01b9-2025-20260731T092559Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "4f307db5ac01556e3beba08b67b4c98e145492ff2f36cd19c994facc53b48900",
+        "size_bytes": 12086
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-acas-row84-clean01b9-2025-20260731T092559Z/acasxu_2023.csv",
+        "row_sha256": "8e4dcdddcaae5cf3720b910a79729fb39395325ae3772f291aefaaab37561073",
+        "sha256": "442e5dededbad5e2070039bc3ba60341a1f4c953cf3b5182c3e8cd0d3f97fa64"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-measure-acas-cgan-20260731T091334Z.full-source.tar.gz",
+        "archive_sha256": "0184f744a5079685bc440e48165c36f3de1824c1ace8e3bea0464957ee00db4c",
+        "archive_size_bytes": 135219767,
+        "commit": "01b9f0a4a31ed5c66733b9be659fc17d083cb4de",
+        "repository_root": "<home>/ny-clean-measure-acas-cgan-20260731T091334Z",
+        "tree": "92ae47075161c8b1e0254fd81cb54c667f551590"
+      },
+      "start_manifest": {
+        "artifact": "runs/acas-row84-clean01b9-2025-20260731T092559Z/start.json",
+        "sha256": "96ed6b0c29e232b328efc78f49fe2452c7004dde5872d0f5ba1586ebc5a46b2e",
+        "size_bytes": 109491
+      },
+      "verdict": "sat"
+    },
+    "[\"cersyve\",\"onnx/lane_keep_finetune_con.onnx\",\"vnnlib/prop_lane_keep.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r03-10c06d2a-20260731T160554Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "a151c7a4c783da8a352b0fc69efeb71c0fe5c27136ddf763150a014a909afa4e",
+            "compressed_size_bytes": 5669,
+            "compression": "gzip",
+            "declared_name": "onnx/lane_keep_finetune_con.onnx",
+            "git_blob": "b2930cdfd644c97b584288a3a449eebeea59e950",
+            "git_path": "benchmarks/cersyve/onnx/lane_keep_finetune_con.onnx.gz",
+            "sha256": "1f8372d6bbf503e5be29d93aeaf85c4e80dcf2cc825630933b32f2935ca6c07b",
+            "size_bytes": 7708,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "6d4225f657bff5dc1902ab27d0fab0060ad257cae5231c62272dd5c20a67553b",
+            "compressed_size_bytes": 198,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_lane_keep.vnnlib",
+            "git_blob": "4befd69909e7f97a4437fa9c096499011733a52c",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib.gz",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407",
+            "size_bytes": 423,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 3,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/lane_keep_finetune_con.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "00ef2098169cb907f799a0eb7b610f555bd95887501f71bb7d46fdd4f2887d03",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r03-10c06d2a-20260731T160554Z/completion.json",
+        "sha256": "3c52f2852ba4ec289b9b981ea8adadd67b00bc45ec15fd462caed808d5cd0d04",
+        "size_bytes": 48304
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/lane_keep_finetune_con.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "unsat",
+          "1",
+          "cersyve-r03-10c06d2a-20260731T160554Z"
+        ],
+        "row_after_sha256": "2cb74e8c94e03e243691c98dbee9e47cd5aca4f02190f6f37ada4417837ceddc",
+        "row_before": [
+          "cersyve",
+          "onnx/lane_keep_finetune_con.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "unsat",
+          "0"
+        ],
+        "row_before_sha256": "4bccd46e6a71a88a90a8a3c368c0d03f9005aa6fa9b683317368c17e4ff7e5c2",
+        "sha256_after": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256",
+        "sha256_before": "8c22ec367c6eb47d9631a7cb24bf1642cdffe4b6e0741210acaee8f31c944f30"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "cersyve-r03-10c06d2a-20260731T160554Z",
+      "runtime_seconds": "1",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r03-10c06d2a-20260731T160554Z/cersyve.csv",
+        "row_sha256": "e845b425a3be3911d3ad2dd910b88d57033b42ee933f5269db7bf241f2c0598e",
+        "sha256": "c493595b97349da7c338a0e6cf4ba98c9015c5ced4bc48e57b478626baea9b03"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r03-10c06d2a-20260731T160554Z/start.json",
+        "sha256": "a99a5199cfc3217c7acb503d9dac812a75d6e0b3fce41b545228be1ba7ab4814",
+        "size_bytes": 120961
+      },
+      "verdict": "unsat"
+    },
+    "[\"cersyve\",\"onnx/lane_keep_finetune_inv.onnx\",\"vnnlib/prop_lane_keep.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r04-10c06d2a-20260731T161207Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "fa370e58d0a661c71882363b817c8f20edd656545ae092169317dc47631d409d",
+            "compressed_size_bytes": 5889,
+            "compression": "gzip",
+            "declared_name": "onnx/lane_keep_finetune_inv.onnx",
+            "git_blob": "48cb0464e1f32112ba818c895068fb0dbaf187ea",
+            "git_path": "benchmarks/cersyve/onnx/lane_keep_finetune_inv.onnx.gz",
+            "sha256": "b86901d81172ef1403541b078e44c941b80b1f9d792f39920f1e5eae9dcb07d6",
+            "size_bytes": 13392,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "6d4225f657bff5dc1902ab27d0fab0060ad257cae5231c62272dd5c20a67553b",
+            "compressed_size_bytes": 198,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_lane_keep.vnnlib",
+            "git_blob": "4befd69909e7f97a4437fa9c096499011733a52c",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib.gz",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407",
+            "size_bytes": 423,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 4,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/lane_keep_finetune_inv.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "58e2bd1a33621ec975b878a52d93bcd945605a70a3394c0f32a6207d5b392be1",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r04-10c06d2a-20260731T161207Z/completion.json",
+        "sha256": "6c195e34e543f2f4022de605ddad1f7349f202cd15bf7bc1d6fc4e626716cd3e",
+        "size_bytes": 48247
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/lane_keep_finetune_inv.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "unsat",
+          "24",
+          "cersyve-r04-10c06d2a-20260731T161207Z"
+        ],
+        "row_after_sha256": "f024fb5ab76a7aeb674aa3c00109da879b33281bd2f6d6d64f80ee3798614da7",
+        "row_before": [
+          "cersyve",
+          "onnx/lane_keep_finetune_inv.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "unsat",
+          "17"
+        ],
+        "row_before_sha256": "c496c5425d1cee464a9ad33919040ac9d5b19411a403aaa6eacc591fd3c0133d",
+        "sha256_after": "db466cf4614b0309f4eeeb885a8bf496d454098c5793353094ba0ad97f4b8aa0",
+        "sha256_before": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "cersyve-r04-10c06d2a-20260731T161207Z",
+      "runtime_seconds": "24",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r04-10c06d2a-20260731T161207Z/cersyve.csv",
+        "row_sha256": "47d57ed4ffd10a2fa711ad33fe4ace95ca2b6a531a2db7ee01759b89a81d30e4",
+        "sha256": "d7925c53196420614c013c00609afad56b1e036a643e7dd2f658ab1c0ff044a8"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r04-10c06d2a-20260731T161207Z/start.json",
+        "sha256": "8e3103e3524cc33e974380a529332d91ea74ab9fcf9c0a6faefc6a15231e3ede",
+        "size_bytes": 121565
+      },
+      "verdict": "unsat"
+    },
+    "[\"cersyve\",\"onnx/lane_keep_pretrain_con.onnx\",\"vnnlib/prop_lane_keep.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r01-10c06d2a-20260731T160700Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "54969a5da318699bf556da612ccf4953f800f19b64fa4e1660c497f5a5d66adc",
+            "compressed_size_bytes": 5676,
+            "compression": "gzip",
+            "declared_name": "onnx/lane_keep_pretrain_con.onnx",
+            "git_blob": "a4cd0a0763756e6be21ac7728fba937a265707ec",
+            "git_path": "benchmarks/cersyve/onnx/lane_keep_pretrain_con.onnx.gz",
+            "sha256": "2779a2dbc867092adc70c41c9fd23d539edd4b689e208e626e4d2d05dea9ef15",
+            "size_bytes": 7708,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "6d4225f657bff5dc1902ab27d0fab0060ad257cae5231c62272dd5c20a67553b",
+            "compressed_size_bytes": 198,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_lane_keep.vnnlib",
+            "git_blob": "4befd69909e7f97a4437fa9c096499011733a52c",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib.gz",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407",
+            "size_bytes": 423,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 1,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/lane_keep_pretrain_con.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "f939d04a8a8aaa25f1202c9a749e0386c8ea651b279df21b0852a3479eca8e24",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r01-10c06d2a-20260731T160700Z/completion.json",
+        "sha256": "5a39e27e7e2fcc6a81c9572b4edad4c41ad52b42b02efea160d5be6adb3614ec",
+        "size_bytes": 48320
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/lane_keep_pretrain_con.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "sat",
+          "1",
+          "cersyve-r01-10c06d2a-20260731T160700Z"
+        ],
+        "row_after_sha256": "60ee1af7594873b5f3804af201b1fe1468a40814c092f83ab458cd04072ee70b",
+        "row_before": [
+          "cersyve",
+          "onnx/lane_keep_pretrain_con.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "sat",
+          "0.08"
+        ],
+        "row_before_sha256": "f19c78128931d4047ae29e18af245b66ce0c530206a0c1982aa2c7d4fddd7689",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cersyve-r01-10c06d2a-20260731T160700Z",
+      "runtime_seconds": "1",
+      "sat_replay": {
+        "artifact": "cersyve/00001-2531bd9f4c1f0e13/cersyve-r01-10c06d2a-20260731T160700Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "1b2ecc03bc6ebf42c292ec71d94e7579a8f29c5339576826c5a448601747093e",
+        "size_bytes": 11966
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r01-10c06d2a-20260731T160700Z/cersyve.csv",
+        "row_sha256": "267297c01a6a674cfbcd9f4717e715c290fb030181e5b59030e448bc025794f1",
+        "sha256": "6caae0d9fc6a40be0f003f88a822766901286d33d48d8452c50f6555f8c10c2b"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r01-10c06d2a-20260731T160700Z/start.json",
+        "sha256": "f5e9720ffe23328ebcb3f900a0def0d77d2b4493852f6393b39d8c8828176c6a",
+        "size_bytes": 120988
+      },
+      "verdict": "sat"
+    },
+    "[\"cersyve\",\"onnx/lane_keep_pretrain_inv.onnx\",\"vnnlib/prop_lane_keep.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r02-10c06d2a-20260731T160700Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "ccd262c711e5d789cf6b29f03363c7389b24d8860c50e0c8d1448840db9fb922",
+            "compressed_size_bytes": 5892,
+            "compression": "gzip",
+            "declared_name": "onnx/lane_keep_pretrain_inv.onnx",
+            "git_blob": "b33fe944a0ebc29bbccdfcb9fc46ccc3d59d2b8e",
+            "git_path": "benchmarks/cersyve/onnx/lane_keep_pretrain_inv.onnx.gz",
+            "sha256": "4169a61ce6fbcfcd99894fdc8ff6d41bd6bd65d00576ff0cb7f4610ad0788d57",
+            "size_bytes": 13392,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "6d4225f657bff5dc1902ab27d0fab0060ad257cae5231c62272dd5c20a67553b",
+            "compressed_size_bytes": 198,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_lane_keep.vnnlib",
+            "git_blob": "4befd69909e7f97a4437fa9c096499011733a52c",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_lane_keep.vnnlib.gz",
+            "sha256": "f6800819bf324d74d6d67d360911f3cbd972011b5dc28ab2dd36ab4771410407",
+            "size_bytes": 423,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 2,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/lane_keep_pretrain_inv.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "9d0753d5bfb0d19b5ae775357a933e6c55baacff689b7b79d37b45357b860531",
+        "vnnlib": "vnnlib/prop_lane_keep.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r02-10c06d2a-20260731T160700Z/completion.json",
+        "sha256": "df8ff126d89ad668b9723d3e525ef8de677623f27ce73a8c9ccefaddaedab66d",
+        "size_bytes": 48242
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/lane_keep_pretrain_inv.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "sat",
+          "0",
+          "cersyve-r02-10c06d2a-20260731T160700Z"
+        ],
+        "row_after_sha256": "c9392a69a3df28d5cc4ec2aeddecfbfcbb14fbbd6972783b6ac20c229bc613a2",
+        "row_before": [
+          "cersyve",
+          "onnx/lane_keep_pretrain_inv.onnx",
+          "vnnlib/prop_lane_keep.vnnlib",
+          "prepared",
+          "sat",
+          "0.08"
+        ],
+        "row_before_sha256": "cf714d0d58113ebb81ba683eea61604f363634d7292d2a85703b818656537359",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cersyve-r02-10c06d2a-20260731T160700Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cersyve/00002-6448041e5b8aefc5/cersyve-r02-10c06d2a-20260731T160700Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "670175c395a349e74e0c39db621fcba1074827465951e4053f066997b67a17a2",
+        "size_bytes": 11968
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r02-10c06d2a-20260731T160700Z/cersyve.csv",
+        "row_sha256": "66a972adfc10b0a9e005f399bf4d8cf974efe5de5a200adda5eb4588398efc36",
+        "sha256": "eac064ab1579e048068353a64795030f203dab6497aab974965bf7feb5d427f9"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r02-10c06d2a-20260731T160700Z/start.json",
+        "sha256": "aceb40b31921a47f7c75b892ca51950933dd1dbfca91d292d48017a4f1cbe819",
+        "size_bytes": 120976
+      },
+      "verdict": "sat"
+    },
+    "[\"cersyve\",\"onnx/pendulum_finetune_con.onnx\",\"vnnlib/prop_pendulum.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r07-10c06d2a-20260731T160736Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "1a7d408756c069f4373f9d9b134bf780a800911e2e2fac550c059bded81e1846",
+            "compressed_size_bytes": 5085,
+            "compression": "gzip",
+            "declared_name": "onnx/pendulum_finetune_con.onnx",
+            "git_blob": "d68f2feda9c2ee00d0bd5656466088ba116a97e3",
+            "git_path": "benchmarks/cersyve/onnx/pendulum_finetune_con.onnx.gz",
+            "sha256": "6cb46e1027828d70149a794875aa6a3b00f6412f7a1473ab945372fa9740c64d",
+            "size_bytes": 6106,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "39bda8ec5b4468ccc96d6bd5fe7f99eda4e5c51b0401ee2b9267af182886ccd3",
+            "compressed_size_bytes": 172,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_pendulum.vnnlib",
+            "git_blob": "cf926afbb1831aa9ec8f71f319b2c995b97b03a0",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib.gz",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2",
+            "size_bytes": 290,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 7,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/pendulum_finetune_con.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "6982da2dd2ac1259f5f63029db7d0c02a3cfd3cf782ae19c7b9c204d82169cf0",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r07-10c06d2a-20260731T160736Z/completion.json",
+        "sha256": "24ab2370e5bbcb0788a61308093812f42812ecd5f9649f756597a7c7e8a5f186",
+        "size_bytes": 48242
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/pendulum_finetune_con.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "unsat",
+          "1",
+          "cersyve-r07-10c06d2a-20260731T160736Z"
+        ],
+        "row_after_sha256": "bde5ea71dcfdcb86c52e52dc54dece4dbffdc54ef3cd33e65875b90064d07852",
+        "row_before": [
+          "cersyve",
+          "onnx/pendulum_finetune_con.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "unsat",
+          "1"
+        ],
+        "row_before_sha256": "6076b67b8a0351b2ec02188abbfb7704bc4d723a63ed1e85c045b6d5cd970843",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "cersyve-r07-10c06d2a-20260731T160736Z",
+      "runtime_seconds": "1",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r07-10c06d2a-20260731T160736Z/cersyve.csv",
+        "row_sha256": "7b1f58632ec0839b846cadbbc682ed5b53b5d4b75d871d6cf324ccdc835cad7a",
+        "sha256": "64107163f94061c22f6ba5e51bacfa1c0185ec393f25d119ae458b83c975e7d5"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r07-10c06d2a-20260731T160736Z/start.json",
+        "sha256": "7d305f948d750c1b0f6dc4b14ae76b1ee03421ffae7a01c186d25f624cea754f",
+        "size_bytes": 120974
+      },
+      "verdict": "unsat"
+    },
+    "[\"cersyve\",\"onnx/pendulum_finetune_inv.onnx\",\"vnnlib/prop_pendulum.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r08-10c06d2a-20260731T160736Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "fe4869093be54de9fc4bc1e80726d0bd69c9103afce7c43ede98261fb7645390",
+            "compressed_size_bytes": 10647,
+            "compression": "gzip",
+            "declared_name": "onnx/pendulum_finetune_inv.onnx",
+            "git_blob": "b15ec4632885cb5f9aaa039f05365a48bb69f210",
+            "git_path": "benchmarks/cersyve/onnx/pendulum_finetune_inv.onnx.gz",
+            "sha256": "d12f9ebc01e0056a74ca4f5dd546552421e6f1b607fb0095719a57ad4c1f9f9d",
+            "size_bytes": 18671,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "39bda8ec5b4468ccc96d6bd5fe7f99eda4e5c51b0401ee2b9267af182886ccd3",
+            "compressed_size_bytes": 172,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_pendulum.vnnlib",
+            "git_blob": "cf926afbb1831aa9ec8f71f319b2c995b97b03a0",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib.gz",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2",
+            "size_bytes": 290,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 8,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/pendulum_finetune_inv.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "7dd0a0fd44c13c882491bb8992592aec8e3f55be3a9d9fad9d594e20683ebcf1",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r08-10c06d2a-20260731T160736Z/completion.json",
+        "sha256": "6811bda139e9d58281f8b42669304bc886bc0658adc410e8382bc73d8162a9d2",
+        "size_bytes": 48229
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/pendulum_finetune_inv.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "unsat",
+          "2",
+          "cersyve-r08-10c06d2a-20260731T160736Z"
+        ],
+        "row_after_sha256": "da99719c5a763e67e2bc72da772ae2ec28fc53abae0bdf737c06218e8bea0ce9",
+        "row_before": [
+          "cersyve",
+          "onnx/pendulum_finetune_inv.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "unsat",
+          "1"
+        ],
+        "row_before_sha256": "518835ff83a8081004bd01839329d46e44d980368c0a4c58cf82cc36b236e630",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "cersyve-r08-10c06d2a-20260731T160736Z",
+      "runtime_seconds": "2",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r08-10c06d2a-20260731T160736Z/cersyve.csv",
+        "row_sha256": "7a92e905a788eff56be306063de1f60406b2c05f917a04e268b112bc43d60b64",
+        "sha256": "9ab37c3eb78e60f96fad3746b316e4c8b5b996e6d0277b6fcb4f7e7f6172a274"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r08-10c06d2a-20260731T160736Z/start.json",
+        "sha256": "1a6962e2c0819dd7ecc1261e01e8305e7f7c32ba7be8bf1e5f639a22252be8d7",
+        "size_bytes": 120964
+      },
+      "verdict": "unsat"
+    },
+    "[\"cersyve\",\"onnx/pendulum_pretrain_con.onnx\",\"vnnlib/prop_pendulum.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r05-10c06d2a-20260731T160736Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "faa94b21e44d976935e242948060f0b166244908c8ab1fb11ef4e15bc0a85947",
+            "compressed_size_bytes": 5080,
+            "compression": "gzip",
+            "declared_name": "onnx/pendulum_pretrain_con.onnx",
+            "git_blob": "076ea6dcab9c51292256bbbb2cc468ebb86024da",
+            "git_path": "benchmarks/cersyve/onnx/pendulum_pretrain_con.onnx.gz",
+            "sha256": "838e831026762f6163fae57255dcf441707d0e02de25fc85f3fddb1915f3bb77",
+            "size_bytes": 6106,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "39bda8ec5b4468ccc96d6bd5fe7f99eda4e5c51b0401ee2b9267af182886ccd3",
+            "compressed_size_bytes": 172,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_pendulum.vnnlib",
+            "git_blob": "cf926afbb1831aa9ec8f71f319b2c995b97b03a0",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib.gz",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2",
+            "size_bytes": 290,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 5,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/pendulum_pretrain_con.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "479e0eef9313d51ec0cfe5220263ec18d8c43d59a60e035dd34253197fb3219c",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r05-10c06d2a-20260731T160736Z/completion.json",
+        "sha256": "b323f460ee631da95ba7cffccaaae9abce50f67fafd8cfaa490051b934fbee35",
+        "size_bytes": 48237
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/pendulum_pretrain_con.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "sat",
+          "1",
+          "cersyve-r05-10c06d2a-20260731T160736Z"
+        ],
+        "row_after_sha256": "2a19e9c20318b86951708b5b96d8fca8dc627b1a42b09e12f3ba66169bc8af8c",
+        "row_before": [
+          "cersyve",
+          "onnx/pendulum_pretrain_con.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "sat",
+          "0.08"
+        ],
+        "row_before_sha256": "a77887d964e7d74e8e23546229f583cd2894d33ed4bc3356f04220f23589b042",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cersyve-r05-10c06d2a-20260731T160736Z",
+      "runtime_seconds": "1",
+      "sat_replay": {
+        "artifact": "cersyve/00005-fbbdc8c0cbcbab5e/cersyve-r05-10c06d2a-20260731T160736Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "dbc889fe29eeda1136c184cff6d4c545621b83e14191c4b5ca71488932c928b6",
+        "size_bytes": 11980
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r05-10c06d2a-20260731T160736Z/cersyve.csv",
+        "row_sha256": "5a407bdfbc8bd9de65a42c52adf12adf15b5f3a69c9445f08c96c841dd16e119",
+        "sha256": "0e67d5a6a4ebb37f98db2b1c14436d1a75ad46b088d89cd28371ce1a3364eabe"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r05-10c06d2a-20260731T160736Z/start.json",
+        "sha256": "1ccddcb1fefc6d698e0484c5fd04b32403da38f80ce42adc6397568961111fe0",
+        "size_bytes": 120986
+      },
+      "verdict": "sat"
+    },
+    "[\"cersyve\",\"onnx/pendulum_pretrain_inv.onnx\",\"vnnlib/prop_pendulum.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r06-10c06d2a-20260731T160736Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "962d6f60879ed3f6d81dfbebbf74d853361034eb24583951d61ad2762805a0f7",
+            "compressed_size_bytes": 10643,
+            "compression": "gzip",
+            "declared_name": "onnx/pendulum_pretrain_inv.onnx",
+            "git_blob": "4e2983d228ec66b1b00de9b494b8c2d8697f1fd1",
+            "git_path": "benchmarks/cersyve/onnx/pendulum_pretrain_inv.onnx.gz",
+            "sha256": "ee7d4c9d847a2634da37be2e2439e7c90bf971f586386f5c745f6adc8f6c1837",
+            "size_bytes": 18671,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "39bda8ec5b4468ccc96d6bd5fe7f99eda4e5c51b0401ee2b9267af182886ccd3",
+            "compressed_size_bytes": 172,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_pendulum.vnnlib",
+            "git_blob": "cf926afbb1831aa9ec8f71f319b2c995b97b03a0",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_pendulum.vnnlib.gz",
+            "sha256": "9d5ad329c788628544e203aefe9eaeece6f321599cdd3601965312a9624b7be2",
+            "size_bytes": 290,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 6,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/pendulum_pretrain_inv.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "d440142b0ecb07133a4d42c818406e622f06596d058324c5c3d233071ba2fab4",
+        "vnnlib": "vnnlib/prop_pendulum.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r06-10c06d2a-20260731T160736Z/completion.json",
+        "sha256": "1354325d6502827c4bd45eadd451e5bc2010643a282e94ed6923c44ad874d7bf",
+        "size_bytes": 48321
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/pendulum_pretrain_inv.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "sat",
+          "0",
+          "cersyve-r06-10c06d2a-20260731T160736Z"
+        ],
+        "row_after_sha256": "6b2e064ba8f239949470aab7e76f4dde8d9b8497d3fc606fa30786dfaf03beb7",
+        "row_before": [
+          "cersyve",
+          "onnx/pendulum_pretrain_inv.onnx",
+          "vnnlib/prop_pendulum.vnnlib",
+          "prepared",
+          "sat",
+          "0.04"
+        ],
+        "row_before_sha256": "29812c873edbf80bc78963afd377965b1da1605d63d8c1c1f3ca05a97d8cef9a",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cersyve-r06-10c06d2a-20260731T160736Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cersyve/00006-01fb09ee2a2f8149/cersyve-r06-10c06d2a-20260731T160736Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "ee2875ef94fed37433e884d3235fbaf446d0be532bf28335a16a1d3e72c5439e",
+        "size_bytes": 11963
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r06-10c06d2a-20260731T160736Z/cersyve.csv",
+        "row_sha256": "7bf9272a4032c76ecc9be7b8ec032085320a22b84a80ab9f1f26e06597629941",
+        "sha256": "7e984d91c480c9db163b0765d28e2dc722e11deb8abd40f4e2b913d1c7bc509f"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r06-10c06d2a-20260731T160736Z/start.json",
+        "sha256": "7553e8fbd96959e4623655176420ddee4d6052024d654fa3d0500010c97e830a",
+        "size_bytes": 120986
+      },
+      "verdict": "sat"
+    },
+    "[\"cersyve\",\"onnx/point_mass_finetune_con.onnx\",\"vnnlib/prop_point_mass.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r11-10c06d2a-20260731T160736Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "b17806efc44b0e8e3fa27670c2c3e13168432c8e3cb25facd1972f8b331f7436",
+            "compressed_size_bytes": 5677,
+            "compression": "gzip",
+            "declared_name": "onnx/point_mass_finetune_con.onnx",
+            "git_blob": "5df7dce4ebd21dd613c21a0f66b8965a01d3a4f9",
+            "git_path": "benchmarks/cersyve/onnx/point_mass_finetune_con.onnx.gz",
+            "sha256": "529719a4bbd34f405683461e2a096504a0b8ba2ea0a283fd9b9683b0d3e04e14",
+            "size_bytes": 6576,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "e964572fed25fd9bc27e32cca9b66640ec86528458437cda333c50d37e21e979",
+            "compressed_size_bytes": 176,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_point_mass.vnnlib",
+            "git_blob": "6252610cb0e01886af2f949f3eeb3f9393a552a4",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib.gz",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778",
+            "size_bytes": 390,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 11,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/point_mass_finetune_con.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "0e76e5e8979b53b98cbee6d8e8179e8d70c714f35680b45fb29e96ef90ecae7f",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r11-10c06d2a-20260731T160736Z/completion.json",
+        "sha256": "c4534b798d529946610d775859fd81b7794438d1fdc057cfca2ca340f29b736f",
+        "size_bytes": 48254
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/point_mass_finetune_con.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "unsat",
+          "1",
+          "cersyve-r11-10c06d2a-20260731T160736Z"
+        ],
+        "row_after_sha256": "376ed9d6c8c841f92ed6e5784a345fca5adcebf86c1efa52694187edae761387",
+        "row_before": [
+          "cersyve",
+          "onnx/point_mass_finetune_con.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "unsat",
+          "0"
+        ],
+        "row_before_sha256": "16a2ea09b7d14d0399f609fda304d7ff101a19f7c0794578d0d7a783a1d3f5c7",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "cersyve-r11-10c06d2a-20260731T160736Z",
+      "runtime_seconds": "1",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r11-10c06d2a-20260731T160736Z/cersyve.csv",
+        "row_sha256": "bbf6877939f2858281c5293f64faeb7384cda0284168039f1f0e0248b8761112",
+        "sha256": "d8c1276a0918bdf879644a7e55ace61653c9515c4f8a34620326a4f06527bab4"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r11-10c06d2a-20260731T160736Z/start.json",
+        "sha256": "4f7274d19d0d05623dac6d617a9b108afbb7337d07c53273611e9727a3b9f148",
+        "size_bytes": 120984
+      },
+      "verdict": "unsat"
+    },
+    "[\"cersyve\",\"onnx/point_mass_finetune_inv.onnx\",\"vnnlib/prop_point_mass.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r12-proofonly-10c06d2a-20260731T163515Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "655618a4d6241909555a87c90c535f88370d8beb7321701cf2eda4f01eb421bb",
+            "compressed_size_bytes": 11444,
+            "compression": "gzip",
+            "declared_name": "onnx/point_mass_finetune_inv.onnx",
+            "git_blob": "679d7b9abe894012e2a3c853c6b999b783ece73a",
+            "git_path": "benchmarks/cersyve/onnx/point_mass_finetune_inv.onnx.gz",
+            "sha256": "b38d357172fe31258f52cde68ab3ccdfa6f3a590976930ae031d622f0e059b98",
+            "size_bytes": 19786,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "e964572fed25fd9bc27e32cca9b66640ec86528458437cda333c50d37e21e979",
+            "compressed_size_bytes": 176,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_point_mass.vnnlib",
+            "git_blob": "6252610cb0e01886af2f949f3eeb3f9393a552a4",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib.gz",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778",
+            "size_bytes": 390,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 12,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/point_mass_finetune_inv.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "ff7e23f621e3acd9456cb185979d25f5bd976f3038af8464dc92c8ab0ec8bb11",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r12-proofonly-10c06d2a-20260731T163515Z/completion.json",
+        "sha256": "6821c441a2d1235110a676795c08e256d5d804acd57c980fd14abf0a02e501f2",
+        "size_bytes": 48001
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/point_mass_finetune_inv.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "unsat",
+          "71",
+          "cersyve-r12-proofonly-10c06d2a-20260731T163515Z"
+        ],
+        "row_after_sha256": "d8ae098da0996ffc79802ae78990034cb49294ee81390a773455b4a937fd53e1",
+        "row_before": [
+          "cersyve",
+          "onnx/point_mass_finetune_inv.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "unsat",
+          "27"
+        ],
+        "row_before_sha256": "b5f28ade4012f9fe7a40b0e1f85f48548f748ad6ecd1ddb7bb7baa1e93372bbc",
+        "sha256_after": "766497ff9fc42390be0ee71181a2d71af23238b342be55bf50b94e5dab31b18c",
+        "sha256_before": "db466cf4614b0309f4eeeb885a8bf496d454098c5793353094ba0ad97f4b8aa0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "cersyve-r12-proofonly-10c06d2a-20260731T163515Z",
+      "runtime_seconds": "71",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r12-proofonly-10c06d2a-20260731T163515Z/cersyve.csv",
+        "row_sha256": "b10e854931f3ae72a973bfa9b43f47b863353a160d6929639028d9552587f917",
+        "sha256": "885d07383644f93de2dfa7de6d140f0fd3df8b950e63df9962d9239e391dd655"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r12-proofonly-10c06d2a-20260731T163515Z/start.json",
+        "sha256": "205c2fad3c5094cfdfd7054861012d419118f1d11c998217e1e2b560bcc9a4e0",
+        "size_bytes": 98492
+      },
+      "verdict": "unsat"
+    },
+    "[\"cersyve\",\"onnx/point_mass_pretrain_con.onnx\",\"vnnlib/prop_point_mass.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r09-10c06d2a-20260731T160736Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "a173ffff079388d6a9d02fd74c56a7db2a11f05dc531e5b2ecba9c6e5b38039e",
+            "compressed_size_bytes": 5684,
+            "compression": "gzip",
+            "declared_name": "onnx/point_mass_pretrain_con.onnx",
+            "git_blob": "81d1b09b548094c08a933ccac17711c48aa18abd",
+            "git_path": "benchmarks/cersyve/onnx/point_mass_pretrain_con.onnx.gz",
+            "sha256": "31f9c9632ad399a0533a6b4301243ab14ea4aae1e74465591fd65313c118f271",
+            "size_bytes": 6576,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "e964572fed25fd9bc27e32cca9b66640ec86528458437cda333c50d37e21e979",
+            "compressed_size_bytes": 176,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_point_mass.vnnlib",
+            "git_blob": "6252610cb0e01886af2f949f3eeb3f9393a552a4",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib.gz",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778",
+            "size_bytes": 390,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 9,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/point_mass_pretrain_con.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "20d37aae2c61180e21552ba00fd53bdf2ae78049534d459be275be499ebbc190",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r09-10c06d2a-20260731T160736Z/completion.json",
+        "sha256": "129092bde63810aba0891a7f0e06dc27d2758945e9d4f4e0ea32b95296a8e87d",
+        "size_bytes": 48246
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/point_mass_pretrain_con.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "sat",
+          "1",
+          "cersyve-r09-10c06d2a-20260731T160736Z"
+        ],
+        "row_after_sha256": "1431d39a858b5998742fc78cf4c2263804c9fdeef732548e115bf6b59b203aa0",
+        "row_before": [
+          "cersyve",
+          "onnx/point_mass_pretrain_con.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "sat",
+          "0.08"
+        ],
+        "row_before_sha256": "3e2ef5ff31069029ec95c3454ca4e12e8571048d1152ff1fee3e89056ec49c17",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cersyve-r09-10c06d2a-20260731T160736Z",
+      "runtime_seconds": "1",
+      "sat_replay": {
+        "artifact": "cersyve/00009-f1aae3880e8109b4/cersyve-r09-10c06d2a-20260731T160736Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "0fc394b1f287becc1867219c09111affc29d771aa54d2a466fe9ebb3fa5c36ee",
+        "size_bytes": 11968
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r09-10c06d2a-20260731T160736Z/cersyve.csv",
+        "row_sha256": "44ac88b9d5af6f35a3dc0a0f11f13981b861381b0daaf99cb3ccc882818dd154",
+        "sha256": "97835a686e7fe72f4fc6ccde188e9b05ee5bb82889b4bebc9ca79b4dcbc89594"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r09-10c06d2a-20260731T160736Z/start.json",
+        "sha256": "ad78a05c7b3889aa206b7108943888edc06b9f581ed4f21b620be2e02ad92b16",
+        "size_bytes": 120973
+      },
+      "verdict": "sat"
+    },
+    "[\"cersyve\",\"onnx/point_mass_pretrain_inv.onnx\",\"vnnlib/prop_point_mass.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cersyve-r10-10c06d2a-20260731T160736Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "e130e21e674f04aeb91b0610399f46d5d39bb791def0b3305940536af299e5a1",
+            "compressed_size_bytes": 11450,
+            "compression": "gzip",
+            "declared_name": "onnx/point_mass_pretrain_inv.onnx",
+            "git_blob": "f0de22c2fe91dafdfa4f3f029b7dc97d1e62992f",
+            "git_path": "benchmarks/cersyve/onnx/point_mass_pretrain_inv.onnx.gz",
+            "sha256": "dca154acb16b6aaf373ee328e93b940b762bb2ea64190b1753b727fb7e5a7463",
+            "size_bytes": 19786,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "e964572fed25fd9bc27e32cca9b66640ec86528458437cda333c50d37e21e979",
+            "compressed_size_bytes": 176,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_point_mass.vnnlib",
+            "git_blob": "6252610cb0e01886af2f949f3eeb3f9393a552a4",
+            "git_path": "benchmarks/cersyve/vnnlib/prop_point_mass.vnnlib.gz",
+            "sha256": "5359f91e2d81efed36344746ada0b6ef636d3f4d9dafe7429bee2410b707f778",
+            "size_bytes": 390,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 10,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cersyve/instances.csv",
+        "instances_csv_git_blob": "5d2da1705a8ba5af2e070b092643e2d3714b7669",
+        "instances_csv_git_path": "benchmarks/cersyve/instances.csv",
+        "instances_csv_sha256": "cfeec4f50ebdf30226b336d6e818b8378dd61914dd989d296f97e5355dc02c4f",
+        "official_timeout_seconds": "100",
+        "onnx": "onnx/point_mass_pretrain_inv.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "669b7e1bfb9e2c94b9b9b8a88c85583f6bd5812998d63f8fee7c4b5728f450a7",
+        "vnnlib": "vnnlib/prop_point_mass.vnnlib"
+      },
+      "category": "cersyve",
+      "completion": {
+        "artifact": "runs/cersyve-r10-10c06d2a-20260731T160736Z/completion.json",
+        "sha256": "7b5dc12563699906bcbd62a07ca282bc5d43e675676e8b171e8c2b225efdc7d2",
+        "size_bytes": 48322
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cersyve.csv",
+        "row_after": [
+          "cersyve",
+          "onnx/point_mass_pretrain_inv.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "sat",
+          "0",
+          "cersyve-r10-10c06d2a-20260731T160736Z"
+        ],
+        "row_after_sha256": "1ead39b7cd661e67568c9c6057cf1d49478ee73e73f338520f2c0eab1d03340e",
+        "row_before": [
+          "cersyve",
+          "onnx/point_mass_pretrain_inv.onnx",
+          "vnnlib/prop_point_mass.vnnlib",
+          "prepared",
+          "sat",
+          "0.04"
+        ],
+        "row_before_sha256": "ab17d71d4481e5d0b2536256c874b26fed0428c86ae815fb2522322d7371c8cf",
+        "sha256_after": "dd8715d35dc4151672e9388a487a5df00228ab0c8c535a9edc29a95efff34f37",
+        "sha256_before": "62109a820682b092c9d9988ebee26e3eedf9be3c07b674bafaeb043190458256"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cersyve-r10-10c06d2a-20260731T160736Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cersyve/00010-821adb6b180dadb9/cersyve-r10-10c06d2a-20260731T160736Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "87f4524014e9331eb60000e84d6d456b64b283f657216cf9ec7b18fd7446d778",
+        "size_bytes": 11971
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cersyve-r10-10c06d2a-20260731T160736Z/cersyve.csv",
+        "row_sha256": "7b0c7f362b89ec5cb30208c0aa620c26f3fc231c361a06809651bf49b219bd00",
+        "sha256": "4c0d641bd998c40e43df4f16369231e562d3557b957fc200fd9d887e93b456af"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cersyve-r10-10c06d2a-20260731T160736Z/start.json",
+        "sha256": "c985df1cff1c04f4c8b8fdf1e8c8c16d91d4244439b30a0a44ad97f928d94e7e",
+        "size_bytes": 120975
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz32_nCh_1.onnx\",\"vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r01-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "c2e29572902df97b3e81ede22aabd0c7bc538a0240d02ab142a9ee0f823ed484",
+            "compressed_size_bytes": 1969964,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz32_nCh_1.onnx",
+            "git_blob": "e767c867029ad30362806b6bf61bbe0e6ce77985",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_1.onnx.gz",
+            "sha256": "3a8b7a57cec0ca576ed873fe93734ce800a7b27a0b0fb707f95eb2c3db1497f0",
+            "size_bytes": 2187864,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "9c7ec4b11b224205e090bb8f1a182cc1211bad41e939c7e98684e7d64899fb47",
+            "compressed_size_bytes": 297,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib",
+            "git_blob": "2eee453a6e18c8381bbb0bf722ce9144e8c56624",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib.gz",
+            "sha256": "9ed547db5dd45a300e6e5e8b62439ad6f0a2268c0b27f6e654f43faea00154a8",
+            "size_bytes": 606,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 1,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/cGAN_imgSz32_nCh_1.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "c361d03ac5523da1dec7c601efef9a1e7757d7d070c11fd861897c02a21df920",
+        "vnnlib": "vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r01-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "7d7608a7524665feb18b7ebfe3e5e0db8c51021201b4235e871900d5e1626ba7",
+        "size_bytes": 48327
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib",
+          "0",
+          "sat",
+          "1",
+          "cgan-r01-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "958d75afd15a745e999782445b4eea232992f443ac226601cddf4150251583d5",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib",
+          "0",
+          "sat",
+          "0"
+        ],
+        "row_before_sha256": "f5a89877df2c8e36bca99ae0d25bcb732ad3e4c879bcef57f6277974cd98edae",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r01-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "1",
+      "sat_replay": {
+        "artifact": "cgan_2023/00001-dc45afb45dbd2206/cgan-r01-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "cad0b546fc10ba7aaf15d517c3a1f741c5b3b112b9a1ddc689794574476af4c4",
+        "size_bytes": 11986
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r01-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "958d75afd15a745e999782445b4eea232992f443ac226601cddf4150251583d5",
+        "sha256": "34ea813928135654974cfb79d49bca0e8554418a3a01adc54f734629c758c2ec"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r01-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "055d7e1d7b7b816a2853741426f150ea2d14ff2abb7f7b051ecd4dd0760bd4e6",
+        "size_bytes": 121502
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz32_nCh_1.onnx\",\"vnnlib/cGAN_imgSz32_nCh_1_prop_2_input_eps_0.020_output_eps_0.025.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r03-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "c2e29572902df97b3e81ede22aabd0c7bc538a0240d02ab142a9ee0f823ed484",
+            "compressed_size_bytes": 1969964,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz32_nCh_1.onnx",
+            "git_blob": "e767c867029ad30362806b6bf61bbe0e6ce77985",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_1.onnx.gz",
+            "sha256": "3a8b7a57cec0ca576ed873fe93734ce800a7b27a0b0fb707f95eb2c3db1497f0",
+            "size_bytes": 2187864,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "252cc1f72363567348d92c06654ea1e2b53df12a8dd4ae7af1622d3b299b9d87",
+            "compressed_size_bytes": 339,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz32_nCh_1_prop_2_input_eps_0.020_output_eps_0.025.vnnlib",
+            "git_blob": "a5e7b6197cbea9fe71cbd172b5162e54e9a4c48d",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz32_nCh_1_prop_2_input_eps_0.020_output_eps_0.025.vnnlib.gz",
+            "sha256": "c8d593b9ee66d0cf522dbab6323d1fd8d2c56488310ef0b70fef302c6298ce77",
+            "size_bytes": 654,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 3,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/cGAN_imgSz32_nCh_1.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "ddc057760b48aa6818c81813c3e5d4600e511b4c8f8380dc3266190b54cbbb19",
+        "vnnlib": "vnnlib/cGAN_imgSz32_nCh_1_prop_2_input_eps_0.020_output_eps_0.025.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r03-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "c8ded502f9950850144b29fb05baa58e6c1afd4f16a2abfd29e79ea5fbbd3d51",
+        "size_bytes": 48331
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_1_prop_2_input_eps_0.020_output_eps_0.025.vnnlib",
+          "0",
+          "sat",
+          "0",
+          "cgan-r03-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "e688c62bf05cc9cd9a319ba8e20a90b5e264d97a4a1d83fa3544eac7df0ea8d6",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_1_prop_2_input_eps_0.020_output_eps_0.025.vnnlib",
+          "0",
+          "sat",
+          "0"
+        ],
+        "row_before_sha256": "61ae66ccfcaa68cf5fd5c54715c2d494758eed3b267404a4ac5b8c575a0e2b3d",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_up_to_tolerance_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r03-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cgan_2023/00003-fef998ffb3d03dd6/cgan-r03-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct_up_to_tolerance",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "47d23e13a4702867d827b6d908bdf6fed161596f03a47cf75d39a3c4394ebf86",
+        "size_bytes": 12313
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r03-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "e688c62bf05cc9cd9a319ba8e20a90b5e264d97a4a1d83fa3544eac7df0ea8d6",
+        "sha256": "ec111b51065b51a7b15d4b02e67eab3f2e51bbc9df1084657256e559cfd3b6c2"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r03-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "906297683afa049d58c27eac63dd29b782b4dbbe7e177127472e2b77356b450c",
+        "size_bytes": 121509
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz32_nCh_1_transposedConvPadding_1.onnx\",\"vnnlib/cGAN_imgSz32_nCh_1_transposedConvPadding_1_prop_0_input_eps_0.015_output_eps_0.020.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r18-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "8c6604df28c9566df9f72338042a71d34a92ec2dd580785ad7f7bdfda61ab2e1",
+            "compressed_size_bytes": 2003890,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz32_nCh_1_transposedConvPadding_1.onnx",
+            "git_blob": "4b43fe0c0a70f79c9ba0acb8f262eb832c357ccf",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_1_transposedConvPadding_1.onnx.gz",
+            "sha256": "236744e12be3aaa8374809abfa904302ce3ff483e57a1bfa085f894f08ced5f2",
+            "size_bytes": 2224758,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "6cf8e6597dbc22ba57816d5952d43f02fe035c1ed6716398039438e8e256bad9",
+            "compressed_size_bytes": 357,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz32_nCh_1_transposedConvPadding_1_prop_0_input_eps_0.015_output_eps_0.020.vnnlib",
+            "git_blob": "1cdb6e573364e2c8132bc635c4e55cec7bb249dd",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz32_nCh_1_transposedConvPadding_1_prop_0_input_eps_0.015_output_eps_0.020.vnnlib.gz",
+            "sha256": "808518558e99426776518da437030b3e90086759073a10ae849a4d8f92b84936",
+            "size_bytes": 651,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 18,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "1200",
+        "onnx": "onnx/cGAN_imgSz32_nCh_1_transposedConvPadding_1.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "a3ca202f35752bfd7690911359fca6f01968740c38e7ffaaf9b12b1bcf2dc072",
+        "vnnlib": "vnnlib/cGAN_imgSz32_nCh_1_transposedConvPadding_1_prop_0_input_eps_0.015_output_eps_0.020.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r18-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "94f05515f715e1287ac42049b194f55a9d7c5d3c82211dc8af34b52f740b6634",
+        "size_bytes": 48446
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_1_transposedConvPadding_1.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_1_transposedConvPadding_1_prop_0_input_eps_0.015_output_eps_0.020.vnnlib",
+          "0",
+          "sat",
+          "0",
+          "cgan-r18-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "4cf39ffb262a2ad54a44cb5a6a1eb96dcc11cb098f0c101210a5e0c38dafdc51",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_1_transposedConvPadding_1.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_1_transposedConvPadding_1_prop_0_input_eps_0.015_output_eps_0.020.vnnlib",
+          "0",
+          "sat",
+          "0"
+        ],
+        "row_before_sha256": "89741ab7de3a872a31e0285ae2a18c426b2b14b8b95abfb3357a0c6ba6fcbbd3",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_up_to_tolerance_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r18-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cgan_2023/00018-b23ef1dfab150769/cgan-r18-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct_up_to_tolerance",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "e078d2301e59d063dc6269f1f2cd9cb0aa8a0bb036a7b8d76a7b779d0886dddd",
+        "size_bytes": 12362
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r18-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "4cf39ffb262a2ad54a44cb5a6a1eb96dcc11cb098f0c101210a5e0c38dafdc51",
+        "sha256": "b449767815e1f4da088a18e684a626497d7ab3d3d902f601f17dbed04a4cc538"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r18-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "a974366b1e90e1f157f384e0e9c64fc0d7f22aaf2b6c487b79d4f3b5e743bce9",
+        "size_bytes": 121528
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz32_nCh_3.onnx\",\"vnnlib/cGAN_imgSz32_nCh_3_prop_3_input_eps_0.015_output_eps_0.020.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r08-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "207f4cf3b7d510b57ed6f558886b65f3e9c4f9b7a01fc7112ea75ad6faea85a8",
+            "compressed_size_bytes": 1974054,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz32_nCh_3.onnx",
+            "git_blob": "abfbe9e424e2a57ae82575d65407bb9219548e8a",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_3.onnx.gz",
+            "sha256": "ba3dedf10023ec6ecd90ef91c99be9ca52812306b8d10230ade3f718160df200",
+            "size_bytes": 2191328,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "d8e467fb86542c98bc4b3a3c4d8c2bb9cec606060ab67957a8ec3c69a96145ac",
+            "compressed_size_bytes": 319,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz32_nCh_3_prop_3_input_eps_0.015_output_eps_0.020.vnnlib",
+            "git_blob": "f1461e7f1669edf2cd7f0f9cfefb9897e38a4ec8",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz32_nCh_3_prop_3_input_eps_0.015_output_eps_0.020.vnnlib.gz",
+            "sha256": "ac33daa643074089d88095b5441ae3710937a1b261838b271062c21327bca5e5",
+            "size_bytes": 635,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 8,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/cGAN_imgSz32_nCh_3.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "8a57fe4b18b42cdaac7d8bebaf5a274be7f9a206b02a8dfb12d4190aba2dc337",
+        "vnnlib": "vnnlib/cGAN_imgSz32_nCh_3_prop_3_input_eps_0.015_output_eps_0.020.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r08-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "988c5128456fd0669aec324f0249610c5545eba6ade379bb9915bc2de5433b32",
+        "size_bytes": 48328
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_3.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_3_prop_3_input_eps_0.015_output_eps_0.020.vnnlib",
+          "0",
+          "sat",
+          "0",
+          "cgan-r08-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "f81365b90fa47d56659e16698691fa3a9a561beab3a9bca72cad0445565c8824",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz32_nCh_3.onnx",
+          "vnnlib/cGAN_imgSz32_nCh_3_prop_3_input_eps_0.015_output_eps_0.020.vnnlib",
+          "0",
+          "sat",
+          "0"
+        ],
+        "row_before_sha256": "43a6c3adf8298f35aa5757c8b21382c312a649d26784582c4f887592f5cb5672",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_up_to_tolerance_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r08-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cgan_2023/00008-1264e4591c47127e/cgan-r08-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct_up_to_tolerance",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "2d64c0367c832004e00dbee6d6109306dc2635c676ba2bc4873fa885adbfccfe",
+        "size_bytes": 12313
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r08-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "f81365b90fa47d56659e16698691fa3a9a561beab3a9bca72cad0445565c8824",
+        "sha256": "d24e9011b9c2d3c4c9cc41081481ccc6b5492b5aeb7928c02a521c3b0ae3c505"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r08-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "3bae2e431e80ebee5c11422f1817728e6ddc2316c6e8660a564622cacecd904c",
+        "size_bytes": 121505
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz64_nCh_1.onnx\",\"vnnlib/cGAN_imgSz64_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r09-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "f3a8bfd05f2de2699c7db7adab09199d55d2be366a16924e95311c67d72ea8c1",
+            "compressed_size_bytes": 2552951,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz64_nCh_1.onnx",
+            "git_blob": "b1697af944a82fe5fa4cce833cb3f77ea1f7bfa1",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz64_nCh_1.onnx.gz",
+            "sha256": "f42b7f8bf92acda6ed31191cf69a1dcf727aca7b71b0ab720f7613741304a683",
+            "size_bytes": 2828092,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "4623ed8792828e643aac1cb2b4327eb60eb19a559af9fc018758740a7ddc0bd0",
+            "compressed_size_bytes": 332,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz64_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib",
+            "git_blob": "941c98c335c1d7db5c9d49d3c1adf2948f204355",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz64_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib.gz",
+            "sha256": "a7f33abd591353bb8d9066baa1c2bbc4390e2b6ff3162358d94ce1c8f9751447",
+            "size_bytes": 657,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 9,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/cGAN_imgSz64_nCh_1.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "84000abb542d5e9bb96c9d5a4cd8f7392e26515542e3266854f773ed8121d357",
+        "vnnlib": "vnnlib/cGAN_imgSz64_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r09-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "b368f9b69d63308269ce98c09167936aa4fa988e1244460303566dbd33427434",
+        "size_bytes": 48394
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib",
+          "0",
+          "sat",
+          "1",
+          "cgan-r09-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "967b8a5a5603b1e6fc21751734383574503aff9aab62999d9c658de2212a1c2c",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib",
+          "0",
+          "sat",
+          "1"
+        ],
+        "row_before_sha256": "18a83f60b33c694b1437169a0524646f77a5d85734072f3232b5dd5e2167439a",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r09-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "1",
+      "sat_replay": {
+        "artifact": "cgan_2023/00009-9924f386004f1018/cgan-r09-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "4a8b7a168ca2bd4784071e57f9b90d05e6dec380bc0ba66d579ead70386f4935",
+        "size_bytes": 11986
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r09-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "967b8a5a5603b1e6fc21751734383574503aff9aab62999d9c658de2212a1c2c",
+        "sha256": "1ac6a4fdaca5152a49682016e636fd40345446746883aaf847aebc8b42ad1ad8"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r09-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "fa412ea82de15c1c0d83944160d5d0ed81287eabb8c3304abca8a4404e30693d",
+        "size_bytes": 121514
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz64_nCh_1.onnx\",\"vnnlib/cGAN_imgSz64_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r10-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "f3a8bfd05f2de2699c7db7adab09199d55d2be366a16924e95311c67d72ea8c1",
+            "compressed_size_bytes": 2552951,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz64_nCh_1.onnx",
+            "git_blob": "b1697af944a82fe5fa4cce833cb3f77ea1f7bfa1",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz64_nCh_1.onnx.gz",
+            "sha256": "f42b7f8bf92acda6ed31191cf69a1dcf727aca7b71b0ab720f7613741304a683",
+            "size_bytes": 2828092,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "dc3ea6ef404178ec5d59678411e34ede19fdecac8362ed01cb2f76744206cff7",
+            "compressed_size_bytes": 332,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz64_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib",
+            "git_blob": "61ca8a5a0199a07f4f1099e0e4a01a5abfca4555",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz64_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib.gz",
+            "sha256": "fe893705a1e8c1fb4f627c296074a3efc79e6b9fb4fc60d064d748cdd179dfd2",
+            "size_bytes": 672,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 10,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/cGAN_imgSz64_nCh_1.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "8771d324133db4e2ebf2414641f3cfecb35166ba20371fd7601dbe87bd75fdaa",
+        "vnnlib": "vnnlib/cGAN_imgSz64_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r10-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "34acb566e8f8571496209768b56e2e83ef9bd31823cf9973f12212d35e819000",
+        "size_bytes": 48330
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib",
+          "0",
+          "sat",
+          "0",
+          "cgan-r10-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "c5e1fb40f963e34d6e7900d4276fca0658100fc3cee75f61802d36e0e5770c4a",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib",
+          "0",
+          "sat",
+          "0"
+        ],
+        "row_before_sha256": "fd80da8789ab8533f14f07efd576d440b6d66b3b38241f302bf0a3311df6802f",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r10-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cgan_2023/00010-399efb0d45323ca7/cgan-r10-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "2da14c505123726ad23bfa29904a8b662f6b525147dc0a704ed0171d13220dad",
+        "size_bytes": 11983
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r10-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "c5e1fb40f963e34d6e7900d4276fca0658100fc3cee75f61802d36e0e5770c4a",
+        "sha256": "50a13ea855680146313b9b404615ad4b466867aa31faec82a912dfa91fd0d775"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r10-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "595cbecef5b50797b163d70e6a4a49b473642ca26e73179f8e808adf0544767b",
+        "size_bytes": 121516
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz64_nCh_1.onnx\",\"vnnlib/cGAN_imgSz64_nCh_1_prop_2_input_eps_0.005_output_eps_0.010.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r11-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "f3a8bfd05f2de2699c7db7adab09199d55d2be366a16924e95311c67d72ea8c1",
+            "compressed_size_bytes": 2552951,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz64_nCh_1.onnx",
+            "git_blob": "b1697af944a82fe5fa4cce833cb3f77ea1f7bfa1",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz64_nCh_1.onnx.gz",
+            "sha256": "f42b7f8bf92acda6ed31191cf69a1dcf727aca7b71b0ab720f7613741304a683",
+            "size_bytes": 2828092,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "5e139bc04397ae1529d39dc0c0859f49fd29ca3f12ac1422ab568ab23c4db10b",
+            "compressed_size_bytes": 327,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz64_nCh_1_prop_2_input_eps_0.005_output_eps_0.010.vnnlib",
+            "git_blob": "b56d4eb637e070b3c1ea4e1e8f4795d28a69adc9",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz64_nCh_1_prop_2_input_eps_0.005_output_eps_0.010.vnnlib.gz",
+            "sha256": "30d7937db6a26ff4edcc1eb4c08a7e2db1b036b538810dd3b227a16701f99a81",
+            "size_bytes": 642,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 11,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/cGAN_imgSz64_nCh_1.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "4e4278accb7a78dc2348aa0ed4db1eb049b10ceae5141ffea6d172b436673e17",
+        "vnnlib": "vnnlib/cGAN_imgSz64_nCh_1_prop_2_input_eps_0.005_output_eps_0.010.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r11-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "46f5f58cec4743addf6cf15bd96fa8b05cef319007a2954e903d548f3895181e",
+        "size_bytes": 48350
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_1_prop_2_input_eps_0.005_output_eps_0.010.vnnlib",
+          "0",
+          "sat",
+          "0",
+          "cgan-r11-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "9c7765949e50caabd113be87b0bc1676672a8ddda5e8090b108ce9d397211d80",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_1.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_1_prop_2_input_eps_0.005_output_eps_0.010.vnnlib",
+          "0",
+          "sat",
+          "0"
+        ],
+        "row_before_sha256": "34e522d41ed88109d9bb77689beff44295d42009a1abcbe233c728d1aaa93b19",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r11-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cgan_2023/00011-f3014d570afac776/cgan-r11-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "327ff42f0b297b4770f1014ac8510bb92d2e87eca54177d83fd2ab6317c9752d",
+        "size_bytes": 11987
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r11-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "9c7765949e50caabd113be87b0bc1676672a8ddda5e8090b108ce9d397211d80",
+        "sha256": "f08c1c7d4539845bac80e365a8ede9f1e54eb94e3f314f10d6b9eea380ddfdd7"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r11-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "3d56e5179df3e6d41f6598390a3b717de726d193679064666866cafab0ec4043",
+        "size_bytes": 121505
+      },
+      "verdict": "sat"
+    },
+    "[\"cgan_2023\",\"onnx/cGAN_imgSz64_nCh_3.onnx\",\"vnnlib/cGAN_imgSz64_nCh_3_prop_0_input_eps_0.005_output_eps_0.010.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cgan-r13-10c06d2a-20260731T161835Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "47ad03e5195b1c0dc87593ae3211503d9c78648d1cfd6bdc0d3ba415eaed9e28",
+            "compressed_size_bytes": 2553854,
+            "compression": "gzip",
+            "declared_name": "onnx/cGAN_imgSz64_nCh_3.onnx",
+            "git_blob": "e330a81d3f52f89a29384d3502b9a2263402b6c9",
+            "git_path": "benchmarks/cgan_2023/onnx/cGAN_imgSz64_nCh_3.onnx.gz",
+            "sha256": "d6a6930252d7d7442f181cd3822864387686b218caa53133ce14c9433f35b5a5",
+            "size_bytes": 2830436,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "ae1d24617d1ed717bc8ad11dc387ed4e7784b125e4943d245d9e4d0821ce6544",
+            "compressed_size_bytes": 336,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cGAN_imgSz64_nCh_3_prop_0_input_eps_0.005_output_eps_0.010.vnnlib",
+            "git_blob": "9e147ef2456b39a4de90d3c0f6531ad950c58648",
+            "git_path": "benchmarks/cgan_2023/vnnlib/cGAN_imgSz64_nCh_3_prop_0_input_eps_0.005_output_eps_0.010.vnnlib.gz",
+            "sha256": "f07aca8d4d14d2fa0459b9876a37effd3d739b42a6a3b570cc280c9c6eb75461",
+            "size_bytes": 652,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 13,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cgan_2023/instances.csv",
+        "instances_csv_git_blob": "cf04440dc93532c2cd43fa1e860d56d6369d6895",
+        "instances_csv_git_path": "benchmarks/cgan_2023/instances.csv",
+        "instances_csv_sha256": "80dc39ac24fbaf6a01c3deb5c80459592bb5e4e7dcd48f0c70314f9f2b69ae7c",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/cGAN_imgSz64_nCh_3.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "bd7923cffc2999c5839d6b087153a259a41965e786db77179ab4d77868e74827",
+        "vnnlib": "vnnlib/cGAN_imgSz64_nCh_3_prop_0_input_eps_0.005_output_eps_0.010.vnnlib"
+      },
+      "category": "cgan_2023",
+      "completion": {
+        "artifact": "runs/cgan-r13-10c06d2a-20260731T161835Z/completion.json",
+        "sha256": "023d0bfaa367cf10456ec3f7c520a0a4f468c2d759f29deb6c5919e183ed0605",
+        "size_bytes": 48335
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/cgan_2023.csv",
+        "row_after": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_3.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_3_prop_0_input_eps_0.005_output_eps_0.010.vnnlib",
+          "0",
+          "sat",
+          "0",
+          "cgan-r13-10c06d2a-20260731T161835Z"
+        ],
+        "row_after_sha256": "838123a897e82a606a51b33e725d5b930cb1ec84ee3e7b5ea262252932eac6ef",
+        "row_before": [
+          "cgan_2023",
+          "onnx/cGAN_imgSz64_nCh_3.onnx",
+          "vnnlib/cGAN_imgSz64_nCh_3_prop_0_input_eps_0.005_output_eps_0.010.vnnlib",
+          "0",
+          "sat",
+          "0"
+        ],
+        "row_before_sha256": "ff7e7223cd0061481ac5e38aabc084484b862160662bb6b1abaf1e5f4d270264",
+        "sha256_after": "a1b3ecd63e607f063fbcf81910baca2dc2fffbe7d035b415433a7dee618aa746",
+        "sha256_before": "3848121a8a948a2a4c92f81e84e89275164c4952016aeca41161882c7fed8cc0"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "cgan-r13-10c06d2a-20260731T161835Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "cgan_2023/00013-ea7365af8c926319/cgan-r13-10c06d2a-20260731T161835Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "cd314647958adaa64d69616b04dbc7bd803e0d25ac8ec81cd33a8af2869781b6",
+        "size_bytes": 11987
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-cgan-r13-10c06d2a-20260731T161835Z/cgan_2023.csv",
+        "row_sha256": "838123a897e82a606a51b33e725d5b930cb1ec84ee3e7b5ea262252932eac6ef",
+        "sha256": "d1dd372cc522ff2328921d717f9f2e7a20453d6f14a2d21482c23f9358159a63"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/cgan-r13-10c06d2a-20260731T161835Z/start.json",
+        "sha256": "d4c368808da559000be563c4ee9200cb8868f1566711be49f06759365accf1c4",
+        "size_bytes": 121503
+      },
+      "verdict": "sat"
+    },
+    "[\"cora_2024\",\"onnx/cifar10-set.onnx\",\"vnnlib/cifar10-img398.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-cora-row174-clean86eb-r1-20260731T064355Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "3b11eac90cda86ef26e617fc86b3c6623a4252107f9bbcf4a18813b5df774431",
+            "compressed_size_bytes": 4352781,
+            "compression": "gzip",
+            "declared_name": "./onnx/cifar10-set.onnx",
+            "git_blob": "cfbe82deeb22a825e02144cdf5e86cb2be9941ee",
+            "git_path": "benchmarks/cora_2024/onnx/cifar10-set.onnx.gz",
+            "sha256": "0fcc30f516cdb88f3f1f84056d38d05accc039996195e459865f409540faf9f1",
+            "size_bytes": 4591474,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "c004fd587b4ad9d9b2fa5457fbb0599d8a37ef769b12e4248038710a87525d85",
+            "compressed_size_bytes": 38871,
+            "compression": "gzip",
+            "declared_name": "vnnlib/cifar10-img398.vnnlib",
+            "git_blob": "3b10da5b4779c6a81cade58381245329d0aaef19",
+            "git_path": "benchmarks/cora_2024/vnnlib/cifar10-img398.vnnlib.gz",
+            "sha256": "5e50ccf717139c4288708d8c88964a8188bde40517ba915af4c7a5e760273839",
+            "size_bytes": 329933,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 174,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/cora_2024/instances.csv",
+        "instances_csv_git_blob": "4dbd12b727f4947224f1062f9c6576094934a502",
+        "instances_csv_git_path": "benchmarks/cora_2024/instances.csv",
+        "instances_csv_sha256": "06703d1fcfa0bc42f3fa8a5118b792f2219e38c89ddd47a6dd6692a4e8624645",
+        "official_timeout_seconds": "30",
+        "onnx": "./onnx/cifar10-set.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "8fbb982cedeb547dc9783cee5c67aa674dd94ec9ccecb543360e54605373e407",
+        "vnnlib": "vnnlib/cifar10-img398.vnnlib"
+      },
+      "category": "cora_2024",
+      "completion": {
+        "artifact": "runs/cora-row174-clean86eb-r1-20260731T064355Z/completion.json",
+        "sha256": "74a727ac45d5a287bf85ce5de4e1242a73284b2a1940c9e959117006071fcf43",
+        "size_bytes": 48060
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "86eb26db53960483dce758901fbdb18911fa4f17",
+      "measured_csv": {
+        "path": "<home>/ny/reports/measured/cora_2024.csv",
+        "row_after": [
+          "cora_2024",
+          "./onnx/cifar10-set.onnx",
+          "vnnlib/cifar10-img398.vnnlib",
+          "prepared",
+          "unsat",
+          "14",
+          "cora-row174-clean86eb-r1-20260731T064355Z"
+        ],
+        "row_after_sha256": "ba2c6b45a669ccdb26bc5aedb49f81116bdfc27e7b0e5838edefa9992ca3750a",
+        "row_before": [
+          "cora_2024",
+          "./onnx/cifar10-set.onnx",
+          "vnnlib/cifar10-img398.vnnlib",
+          "prepared",
+          "timeout",
+          "84.61"
+        ],
+        "row_before_sha256": "e1f0ef89cf9afbeeb0185bf3781ff8803dc1a2dfe0cd9f898ea501ddbd9b0449",
+        "sha256_after": "f47f6755de9a801d1baaef348b3daf193fc81516eddccaf3aa0e75dd9c3d0e8d",
+        "sha256_before": "304c1b45a554dee217bec8020268e0297f2ff1e36c575a6af0f9ce99177bff12"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "cora-row174-clean86eb-r1-20260731T064355Z",
+      "runtime_seconds": "14",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-cora-row174-clean86eb-r1-20260731T064355Z/cora_2024.csv",
+        "row_sha256": "27ff97fc2f1b97196633cdb991e51dd17f524dda3b68a20464d4ec8605f83454",
+        "sha256": "8863168e4be9e2a8b954ccb9c72e9f4245d3c108e89c1eb8d464aa07f230b752"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-measure-row56-20260731T061000Z.full-source.tar.gz",
+        "archive_sha256": "2664a360afe6e6a93de339eeda54a45322b20b9b53696a92a529df827adb0cd2",
+        "archive_size_bytes": 11338425,
+        "commit": "86eb26db53960483dce758901fbdb18911fa4f17",
+        "repository_root": "<home>/ny-clean-measure-row56-20260731T061000Z",
+        "tree": "2d873ad84db26dec614360df87b339dba259a120"
+      },
+      "start_manifest": {
+        "artifact": "runs/cora-row174-clean86eb-r1-20260731T064355Z/start.json",
+        "sha256": "42edb657d72d576e5e8e223159410059e8ee77694252e97deedd9258a0bf19a9",
+        "size_bytes": 108446
+      },
+      "verdict": "unsat"
+    },
+    "[\"linearizenn_2024\",\"onnx/AllInOne_10_10.onnx\",\"vnnlib/prop_10_10.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-linearizenn-r01-10c06d2a-20260731T161801Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "8906cfec9775f4499cb508cf0942217d0cc3ea53a6fb688871d6ef4afd12d2ff",
+            "compressed_size_bytes": 763749,
+            "compression": "gzip",
+            "declared_name": "onnx/AllInOne_10_10.onnx",
+            "git_blob": "2ac84ac753f76f5a194bf776c6186f00a57ed4f8",
+            "git_path": "benchmarks/linearizenn_2024/onnx/AllInOne_10_10.onnx.gz",
+            "sha256": "fedc1ccaa66d31dcac3d5bffe51dbca60f82104935d56ff18ce8d491434dc6d2",
+            "size_bytes": 815272,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "067d8ba420b237371e33dd3a6e121d2c31b28fc1fecfce44fa33401f8d6af298",
+            "compressed_size_bytes": 263,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_10_10.vnnlib",
+            "git_blob": "61a7789b35dd592906a7b39e01f0885acc061d1b",
+            "git_path": "benchmarks/linearizenn_2024/vnnlib/prop_10_10.vnnlib.gz",
+            "sha256": "901cf8ea15861efa5a6178112833afdc1389b50c9daf9f2ef5d9d3f0aab411c0",
+            "size_bytes": 590,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 1,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/linearizenn_2024/instances.csv",
+        "instances_csv_git_blob": "bb69e6ae8c85e3d3e6d2b5c69b85e5b3edd50125",
+        "instances_csv_git_path": "benchmarks/linearizenn_2024/instances.csv",
+        "instances_csv_sha256": "3db2928f7545df8ef276670f448c93cf692a0742a4a4223aeaf617a4ce20caf9",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/AllInOne_10_10.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "0472743ba053af9e38301390c069fe5c84f5f2b4d74098303406fceb82619cfd",
+        "vnnlib": "vnnlib/prop_10_10.vnnlib"
+      },
+      "category": "linearizenn_2024",
+      "completion": {
+        "artifact": "runs/linearizenn-r01-10c06d2a-20260731T161801Z/completion.json",
+        "sha256": "adefdc45737c7bc84344da56a5ac6945297b71ac30adc1f1d05dca12abd97a4e",
+        "size_bytes": 48378
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/linearizenn_2024.csv",
+        "row_after": [
+          "linearizenn_2024",
+          "onnx/AllInOne_10_10.onnx",
+          "vnnlib/prop_10_10.vnnlib",
+          "prepared",
+          "sat",
+          "0",
+          "linearizenn-r01-10c06d2a-20260731T161801Z"
+        ],
+        "row_after_sha256": "396005ca6baefb8008373abad1e5f26d250623622015330fd8d0742b9c4e10d7",
+        "row_before": [
+          "linearizenn_2024",
+          "onnx/AllInOne_10_10.onnx",
+          "vnnlib/prop_10_10.vnnlib",
+          "prepared",
+          "sat",
+          "0.30"
+        ],
+        "row_before_sha256": "2efaac95db9822409cb43ae6fa233663f5e1dcdde885264e8714e9ac8f0db8fe",
+        "sha256_after": "b46d05b17b00cadd804a76dafaa696259eab6a0ddda558c86ac1b90c26016823",
+        "sha256_before": "abc1bc6ca44c24bf88876da3f3d3135bc472c2bf28666467a3f1261656c2da1a"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "linearizenn-r01-10c06d2a-20260731T161801Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "linearizenn_2024/00001-85bbce69c33aa62b/linearizenn-r01-10c06d2a-20260731T161801Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "6482be764908d3d28a67a48b2cc02ca6d75d25d1c1fe45bb632ffdc51bafca08",
+        "size_bytes": 11993
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-linearizenn-r01-10c06d2a-20260731T161801Z/linearizenn_2024.csv",
+        "row_sha256": "f45bb03748da8baf86dbd6316ee94b6a3276339c4be5ce5e1331e80056a14d8f",
+        "sha256": "af29f185a69976ec90a4977d7486e9d27441ef04d6c4cd30c0c298692de679ea"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/linearizenn-r01-10c06d2a-20260731T161801Z/start.json",
+        "sha256": "fab64edbf231206e66c0e019a595ae6418adc198d2ca9b808269a6f66c152654",
+        "size_bytes": 121727
+      },
+      "verdict": "sat"
+    },
+    "[\"linearizenn_2024\",\"onnx/AllInOne_120_120.onnx\",\"vnnlib/prop_120_120_0.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-linearizenn-row56-clean-86eb26db-r2-20260731T062243Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "ca576adcd6454fc79927bc384c9ad67acc3e10708c5104fea87ebbcaa2a8da98",
+            "compressed_size_bytes": 763751,
+            "compression": "gzip",
+            "declared_name": "onnx/AllInOne_120_120.onnx",
+            "git_blob": "534158fbf117f834e67c9b172f21a3610dbc581d",
+            "git_path": "benchmarks/linearizenn_2024/onnx/AllInOne_120_120.onnx.gz",
+            "sha256": "fa90404bd205ef2a5ccd87dd6975a7a1f0fe4cc8f7f9b98cc986b935c9405d6a",
+            "size_bytes": 815272,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "ecdd6fb3c4b9d24d9627077aa30f845ce13c0b03bfd5f1a4714378125296b124",
+            "compressed_size_bytes": 293,
+            "compression": "gzip",
+            "declared_name": "vnnlib/prop_120_120_0.vnnlib",
+            "git_blob": "4332f1c2172274dd8c09c9b0d7259be32c12efe0",
+            "git_path": "benchmarks/linearizenn_2024/vnnlib/prop_120_120_0.vnnlib.gz",
+            "sha256": "ceb98a290a2304fcba1d53eef3b289b5f8140b2b724b6562e355bdbb21e59845",
+            "size_bytes": 589,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 56,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/linearizenn_2024/instances.csv",
+        "instances_csv_git_blob": "bb69e6ae8c85e3d3e6d2b5c69b85e5b3edd50125",
+        "instances_csv_git_path": "benchmarks/linearizenn_2024/instances.csv",
+        "instances_csv_sha256": "3db2928f7545df8ef276670f448c93cf692a0742a4a4223aeaf617a4ce20caf9",
+        "official_timeout_seconds": "900",
+        "onnx": "onnx/AllInOne_120_120.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "48229b5a0c0bcaeb8ee421b619758d88f0e5fa08219bf5cc592cb996c3c0c106",
+        "vnnlib": "vnnlib/prop_120_120_0.vnnlib"
+      },
+      "category": "linearizenn_2024",
+      "completion": {
+        "artifact": "runs/linearizenn-row56-clean-86eb26db-r2-20260731T062243Z/completion.json",
+        "sha256": "32c1fadde387e803b67030d452945fc76dddf29304be662992e597e416a55d69",
+        "size_bytes": 48294
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "86eb26db53960483dce758901fbdb18911fa4f17",
+      "measured_csv": {
+        "path": "<home>/ny/reports/measured/linearizenn_2024.csv",
+        "row_after": [
+          "linearizenn_2024",
+          "onnx/AllInOne_120_120.onnx",
+          "vnnlib/prop_120_120_0.vnnlib",
+          "prepared",
+          "unsat",
+          "7",
+          "linearizenn-row56-clean-86eb26db-r2-20260731T062243Z"
+        ],
+        "row_after_sha256": "d607fc37898754d54c5a7a9f868a8f250718e18f1abeefb2d28e0042faa3314b",
+        "sha256_after": "abc1bc6ca44c24bf88876da3f3d3135bc472c2bf28666467a3f1261656c2da1a",
+        "sha256_before": "d440b752037be3cd45e5b5c47c54bc80b75b1c9b9acd21e59a01befa18b64657"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "linearizenn-row56-clean-86eb26db-r2-20260731T062243Z",
+      "runtime_seconds": "7",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-linearizenn-row56-clean-86eb26db-r2-20260731T062243Z/linearizenn_2024.csv",
+        "row_sha256": "bd135a20a37ad3be8e951d80f7da42a1eb5a8234173ec004763122786a575c48",
+        "sha256": "54df6ed30382a3bae7214fba9b9df1d337145718e3c6c5d77e02d022ab37936c"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-measure-row56-20260731T061000Z.full-source.tar.gz",
+        "archive_sha256": "2664a360afe6e6a93de339eeda54a45322b20b9b53696a92a529df827adb0cd2",
+        "archive_size_bytes": 11338425,
+        "commit": "86eb26db53960483dce758901fbdb18911fa4f17",
+        "repository_root": "<home>/ny-clean-measure-row56-20260731T061000Z",
+        "tree": "2d873ad84db26dec614360df87b339dba259a120"
+      },
+      "start_manifest": {
+        "artifact": "runs/linearizenn-row56-clean-86eb26db-r2-20260731T062243Z/start.json",
+        "sha256": "8eed7a2c1cb6e71091e275416638c55552ce26354134a15e1f914c30eb1a46b5",
+        "size_bytes": 107652
+      },
+      "verdict": "unsat"
+    },
+    "[\"tllverifybench_2023\",\"onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx\",\"vnnlib/property_N=8_0.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-tll-r01-10c06d2a-20260731T161718Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "5651523643cc653a05c5fa593d1ff7522d4fad754d8fc98aa9c6bf1a64fa2d28",
+            "compressed_size_bytes": 2535,
+            "compression": "gzip",
+            "declared_name": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx",
+            "git_blob": "2f57301c287801016ca6620f73d09e23d3db9fc7",
+            "git_path": "benchmarks/tllverifybench_2023/onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx.gz",
+            "sha256": "9b4d68e296ae69bd46b08a6139a1a4b6f08027e1305d62d1c4f3b3a0224f46ec",
+            "size_bytes": 74221,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "ef9ad5b5a0ffaf660d929ecc4649ca5c344b1ef40d2286aace1ad95953ec88ac",
+            "compressed_size_bytes": 217,
+            "compression": "gzip",
+            "declared_name": "vnnlib/property_N=8_0.vnnlib",
+            "git_blob": "ec4885cc00943c58bcd23d880a4398d0af9dd621",
+            "git_path": "benchmarks/tllverifybench_2023/vnnlib/property_N=8_0.vnnlib.gz",
+            "sha256": "cdaf93b7835aa96469b2ead05b1d4447241dbb05a0605a110d48d500b25ca0bf",
+            "size_bytes": 313,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 1,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_git_blob": "a0d91a933ea432e5d474ba118a7b05e43549aea6",
+        "instances_csv_git_path": "benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_sha256": "61e2d6104d99240cb2a3314be2ca79111863fcce9765cffa139856f64c30ca41",
+        "official_timeout_seconds": "600",
+        "onnx": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "b730962a371a760e86a9caf1c993c9fbd78e31a96cce47ef9c0c612f674f2db5",
+        "vnnlib": "vnnlib/property_N=8_0.vnnlib"
+      },
+      "category": "tllverifybench_2023",
+      "completion": {
+        "artifact": "runs/tll-r01-10c06d2a-20260731T161718Z/completion.json",
+        "sha256": "40fdef45821de9c008cd70e90225b5003600f8164fe01c475a9e046098897359",
+        "size_bytes": 48301
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/tllverifybench_2023.csv",
+        "row_after": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx",
+          "vnnlib/property_N=8_0.vnnlib",
+          "prepared",
+          "unsat",
+          "0",
+          "tll-r01-10c06d2a-20260731T161718Z"
+        ],
+        "row_after_sha256": "7a21366652d8ce717f82133425187f59f529730d5690ee97f8c4d6a3f7364995",
+        "row_before": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx",
+          "vnnlib/property_N=8_0.vnnlib",
+          "prepared",
+          "unsat",
+          "0.62"
+        ],
+        "row_before_sha256": "68b40a8474830ac9189e8bbffe7b8849cbb29a07f547c917beb9dd7e3e29288c",
+        "sha256_after": "f122900d4779d76ee0a7e7ebdcef4bfde4d25e36b218601738f70cf678b98864",
+        "sha256_before": "f947a8cd6ab338e4a48b7bd1e9a43d3e26b056a8d7247ed466f7318615e1d350"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "tll-r01-10c06d2a-20260731T161718Z",
+      "runtime_seconds": "0",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-tll-r01-10c06d2a-20260731T161718Z/tllverifybench_2023.csv",
+        "row_sha256": "b7d04eb02229e588dd684debdec08267834eb0dff0e45a931e76b09eea98ab41",
+        "sha256": "fb723c45cbe9df9ca19289842770bb5d36dcb75d7952e3ac75291ea2a0e8f32f"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/tll-r01-10c06d2a-20260731T161718Z/start.json",
+        "sha256": "1c486067d662e4ca68fc5e91782ff9e2802045e00bcfc5d2d7884b5cba036ec7",
+        "size_bytes": 121451
+      },
+      "verdict": "unsat"
+    },
+    "[\"tllverifybench_2023\",\"onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx\",\"vnnlib/property_N=8_1.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-tll-r02-10c06d2a-20260731T161718Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "a3d0460582cae8f3587831cb54d9340f5a9ff81d4ee0ecd8542e20abd5584633",
+            "compressed_size_bytes": 2570,
+            "compression": "gzip",
+            "declared_name": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx",
+            "git_blob": "5d3073acf049bbf51f7ee1ef3398ce5752ad7fd3",
+            "git_path": "benchmarks/tllverifybench_2023/onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx.gz",
+            "sha256": "fb71b61e46bd86c4938f3200c944ef9384ed0b1885ea5999742766fa15cde2ee",
+            "size_bytes": 74545,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "9934bf75a72eea3860fa7097bc430df8be9e8156dad438d40cad75c747e85bef",
+            "compressed_size_bytes": 216,
+            "compression": "gzip",
+            "declared_name": "vnnlib/property_N=8_1.vnnlib",
+            "git_blob": "82d8d42c5d6afa170a2147ef0409ae7ed1b36361",
+            "git_path": "benchmarks/tllverifybench_2023/vnnlib/property_N=8_1.vnnlib.gz",
+            "sha256": "e860e461a7add47b1dea5b9df1de9ff264d3103300341da4385f912f67cdb9dd",
+            "size_bytes": 313,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 2,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_git_blob": "a0d91a933ea432e5d474ba118a7b05e43549aea6",
+        "instances_csv_git_path": "benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_sha256": "61e2d6104d99240cb2a3314be2ca79111863fcce9765cffa139856f64c30ca41",
+        "official_timeout_seconds": "600",
+        "onnx": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "3bd78e2097a3329d470321990758a3aefbcd354131f347a7b877e047ccc096ed",
+        "vnnlib": "vnnlib/property_N=8_1.vnnlib"
+      },
+      "category": "tllverifybench_2023",
+      "completion": {
+        "artifact": "runs/tll-r02-10c06d2a-20260731T161718Z/completion.json",
+        "sha256": "7cace915d72a3b31e8ee7bd70f0a499cc7a5672a8f0adfa63c8400412744c0db",
+        "size_bytes": 48305
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/tllverifybench_2023.csv",
+        "row_after": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx",
+          "vnnlib/property_N=8_1.vnnlib",
+          "prepared",
+          "unsat",
+          "0",
+          "tll-r02-10c06d2a-20260731T161718Z"
+        ],
+        "row_after_sha256": "9812c576fe1528bab4c5b91ce1a1644555179f20529ac39984c8500345e7778f",
+        "row_before": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx",
+          "vnnlib/property_N=8_1.vnnlib",
+          "prepared",
+          "unsat",
+          "0.67"
+        ],
+        "row_before_sha256": "8dd5c351e6f6372f1e96a9e20141a08c141f4ca5bdae6f035a3fc3c3053bd181",
+        "sha256_after": "f122900d4779d76ee0a7e7ebdcef4bfde4d25e36b218601738f70cf678b98864",
+        "sha256_before": "f947a8cd6ab338e4a48b7bd1e9a43d3e26b056a8d7247ed466f7318615e1d350"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "tll-r02-10c06d2a-20260731T161718Z",
+      "runtime_seconds": "0",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-tll-r02-10c06d2a-20260731T161718Z/tllverifybench_2023.csv",
+        "row_sha256": "12313d1e139597f89a46a2df7862188fd0a83bca4c2560e3db3d43a6144bde09",
+        "sha256": "44b5825df2188f136e4d11d6c4cc21922a9a2813e262b30cda5779411afba221"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/tll-r02-10c06d2a-20260731T161718Z/start.json",
+        "sha256": "d197a7bf832b40661f65d534089324662fad7fac91eacc8dd595d00a31807df3",
+        "size_bytes": 121468
+      },
+      "verdict": "unsat"
+    },
+    "[\"tllverifybench_2023\",\"onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx\",\"vnnlib/property_N=8_2.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-tll-r03-10c06d2a-20260731T161718Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "3f692767b0b7dedc9faefca2540df624146f64878338ddf63830a14d22084b61",
+            "compressed_size_bytes": 2570,
+            "compression": "gzip",
+            "declared_name": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx",
+            "git_blob": "5e59cb4f11c03dad0c985a34cd6fe3784b454729",
+            "git_path": "benchmarks/tllverifybench_2023/onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx.gz",
+            "sha256": "c3a2e597cb652097fb57eb83205c89166dc33ebfd7235dd32843db4335ec4f34",
+            "size_bytes": 74533,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "b7f52ca2c55221454fe7a85b76fdc4ed29980e0eb207a470498be6d260494b19",
+            "compressed_size_bytes": 215,
+            "compression": "gzip",
+            "declared_name": "vnnlib/property_N=8_2.vnnlib",
+            "git_blob": "4ced6b0a22c0abee9cb055eb2a97349b41c99a9b",
+            "git_path": "benchmarks/tllverifybench_2023/vnnlib/property_N=8_2.vnnlib.gz",
+            "sha256": "fefe9d326f2b5ddf2fe1201a24b7ee5ec9f3777857dbbcbc6685cfd77dce5cc9",
+            "size_bytes": 314,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 3,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_git_blob": "a0d91a933ea432e5d474ba118a7b05e43549aea6",
+        "instances_csv_git_path": "benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_sha256": "61e2d6104d99240cb2a3314be2ca79111863fcce9765cffa139856f64c30ca41",
+        "official_timeout_seconds": "600",
+        "onnx": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "b9208c0197cf10e710a57e337b40fff36b732084a86635a0f9ea3bccce58d9f3",
+        "vnnlib": "vnnlib/property_N=8_2.vnnlib"
+      },
+      "category": "tllverifybench_2023",
+      "completion": {
+        "artifact": "runs/tll-r03-10c06d2a-20260731T161718Z/completion.json",
+        "sha256": "c6e6a6d918bcf5c884f86d4e48ddf4320c40fb3040f74bea44c52ebc57ba3a94",
+        "size_bytes": 48304
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/tllverifybench_2023.csv",
+        "row_after": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx",
+          "vnnlib/property_N=8_2.vnnlib",
+          "prepared",
+          "unsat",
+          "1",
+          "tll-r03-10c06d2a-20260731T161718Z"
+        ],
+        "row_after_sha256": "d1253a89973ef681f65e7eaa76a286cfd2e0b33a9c7649fb86ef19ea01aac5f2",
+        "row_before": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx",
+          "vnnlib/property_N=8_2.vnnlib",
+          "prepared",
+          "unsat",
+          "0.56"
+        ],
+        "row_before_sha256": "5bef006787937e8f3733350183f46d1f86f3fddf44972d43398a40834abecb72",
+        "sha256_after": "f122900d4779d76ee0a7e7ebdcef4bfde4d25e36b218601738f70cf678b98864",
+        "sha256_before": "f947a8cd6ab338e4a48b7bd1e9a43d3e26b056a8d7247ed466f7318615e1d350"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "sealed_unsat_plus_published_holds_v1",
+      "published_truth": "holds",
+      "run_id": "tll-r03-10c06d2a-20260731T161718Z",
+      "runtime_seconds": "1",
+      "sat_replay": null,
+      "source_csv": {
+        "path": "<home>/ny-measured-tll-r03-10c06d2a-20260731T161718Z/tllverifybench_2023.csv",
+        "row_sha256": "ad6b834ee69c51c62f5787fcad444590f3c866579765b4659fd8e3d8894992a7",
+        "sha256": "a880921960b36d6905f1249bc1a6224329c586b2109ad71c857e188723d371bb"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/tll-r03-10c06d2a-20260731T161718Z/start.json",
+        "sha256": "2704d252c1766edae67c9ed6d18a2c1785677f41292f1cf9dc2f2be9761889af",
+        "size_bytes": 121469
+      },
+      "verdict": "unsat"
+    },
+    "[\"tllverifybench_2023\",\"onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx\",\"vnnlib/property_N=8_3.vnnlib\",0]": {
+      "artifact_root": "<home>/ny-measured-tll-r04-10c06d2a-20260731T161718Z/artifacts",
+      "benchmark": {
+        "inputs": {
+          "onnx": {
+            "compressed_sha256": "b6471a199a6b4ba659dd606ff043189a47f5e9eb37d1079477623585c8da4253",
+            "compressed_size_bytes": 2550,
+            "compression": "gzip",
+            "declared_name": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx",
+            "git_blob": "0750a34b0083f7a5a968b741fcae31115e4fdb5e",
+            "git_path": "benchmarks/tllverifybench_2023/onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx.gz",
+            "sha256": "83abfb854fd8b37ce89fa1854e507fc9f9a0d6d8f9708065c35096b860b6c8ef",
+            "size_bytes": 74545,
+            "source_kind": "git_blob"
+          },
+          "vnnlib": {
+            "compressed_sha256": "ebbde0f4971e0ef7be2f857ff4afcce016a19b3f4c07bd3dd27a7cff7f188a08",
+            "compressed_size_bytes": 217,
+            "compression": "gzip",
+            "declared_name": "vnnlib/property_N=8_3.vnnlib",
+            "git_blob": "5d684a15025a7bec7d2a9e8b49ba18576648c8a2",
+            "git_path": "benchmarks/tllverifybench_2023/vnnlib/property_N=8_3.vnnlib.gz",
+            "sha256": "2e61a1a1d966b0107738f8cd968030157b521fd5cecb22afc0816b745b101ed2",
+            "size_bytes": 316,
+            "source_kind": "git_blob"
+          }
+        },
+        "instance_index": 4,
+        "instances_csv": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_git_blob": "a0d91a933ea432e5d474ba118a7b05e43549aea6",
+        "instances_csv_git_path": "benchmarks/tllverifybench_2023/instances.csv",
+        "instances_csv_sha256": "61e2d6104d99240cb2a3314be2ca79111863fcce9765cffa139856f64c30ca41",
+        "official_timeout_seconds": "600",
+        "onnx": "onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx",
+        "pair_occurrence": 0,
+        "row_sha256": "732218b52353b58662a6fd9258d6840a2d36a20ffc19864010d43e6c5ea451ea",
+        "vnnlib": "vnnlib/property_N=8_3.vnnlib"
+      },
+      "category": "tllverifybench_2023",
+      "completion": {
+        "artifact": "runs/tll-r04-10c06d2a-20260731T161718Z/completion.json",
+        "sha256": "f9f79fd057ff00e8c3075b65e5a76a6dee1e887156bfd101b62ade203a1e0c3c",
+        "size_bytes": 48303
+      },
+      "entry_schema": "ny_regular_bank_evidence_entry_v4",
+      "exact_commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+      "measured_csv": {
+        "migration": "ny_regular_bank_legacy_decided_row_migration_v1",
+        "path": "<home>/ny/reports/measured/tllverifybench_2023.csv",
+        "row_after": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx",
+          "vnnlib/property_N=8_3.vnnlib",
+          "prepared",
+          "sat",
+          "0",
+          "tll-r04-10c06d2a-20260731T161718Z"
+        ],
+        "row_after_sha256": "56513b8731989c0149c82c739a1bbfd0787d8d32ead73611364f89c500b3ed11",
+        "row_before": [
+          "tllverifybench_2023",
+          "onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx",
+          "vnnlib/property_N=8_3.vnnlib",
+          "prepared",
+          "sat",
+          "0.56"
+        ],
+        "row_before_sha256": "21b2c84100915a74aae5d37f1d789931592759d37c8368ba55d67cd224c9d160",
+        "sha256_after": "f122900d4779d76ee0a7e7ebdcef4bfde4d25e36b218601738f70cf678b98864",
+        "sha256_before": "f947a8cd6ab338e4a48b7bd1e9a43d3e26b056a8d7247ed466f7318615e1d350"
+      },
+      "official_benchmark": {
+        "benchmarks_tree": "db116a77d44618c0883b623a9d79914783e46d28",
+        "commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+        "origin": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+        "repository_root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/benchmarks/benchmarks",
+        "tree": "29097e0fe614a7a9290e5f1ed98edb75671c8d21"
+      },
+      "official_results": {
+        "artifacts": {
+          "SCORING-ZERO-TOL/latex/longtable.tex": {
+            "sha256": "c8e58f37d8d88e6bcb3af123a8946a229e4b3649b44b96bddebd7cfdfed7284f",
+            "size_bytes": 524417
+          },
+          "SCORING-ZERO-TOL/latex/scored.tex": {
+            "sha256": "3af6bc118a944eb9041d51d0b030c848eafc3029b375918859ab865a51aa84b8",
+            "size_bytes": 15961
+          },
+          "alpha_beta_crown/results.csv": {
+            "sha256": "ae0d8c11d6012ea3e560af332a0182e1b244dceab63c5f58f6d106223cef9a73",
+            "size_bytes": 752100
+          }
+        },
+        "release_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "root": "<home>/ay/benchmarks/vnncomp/2025/results"
+      },
+      "policy": "exact_2025_zero_tol_replay_correct_v1",
+      "published_truth": "violated",
+      "run_id": "tll-r04-10c06d2a-20260731T161718Z",
+      "runtime_seconds": "0",
+      "sat_replay": {
+        "artifact": "tllverifybench_2023/00004-13c21113a29b26e1/tll-r04-10c06d2a-20260731T161718Z.vnncomp2025-zero-tol-validation.json",
+        "checker_commit": "ea89fbc2518b6729f17c96eeec22c56c88e496a9",
+        "classification": "valid",
+        "official_result": "correct",
+        "schema": "ny_vnncomp2025_zero_tol_counterexample_validation_v2",
+        "score_credit": true,
+        "settings": {
+          "counterexample_atol": 0.0001,
+          "counterexample_rtol": 0.001,
+          "ignore_ce_y": false,
+          "scoring_zero_tolerance": true
+        },
+        "sha256": "0013b3240f67f92e154dcd8d36284ec496d100d0fd230e174610f9fa5c803e5e",
+        "size_bytes": 11996
+      },
+      "source_csv": {
+        "path": "<home>/ny-measured-tll-r04-10c06d2a-20260731T161718Z/tllverifybench_2023.csv",
+        "row_sha256": "d7db3385bcbe9fd4685dd1b2e92314339a3d63b2d25984f93c797dfb94648b04",
+        "sha256": "4f9b38eb86c7d52b7b45cba90eba2f16b4156bf9e37461f6d90878b647af7d45"
+      },
+      "source_snapshot": {
+        "archive": "<home>/ny-clean-final-20260731T155312Z.full-source.tar.gz",
+        "archive_sha256": "3a8d55c66842fc5c8d4ae13aebc1d0b6f077ccbb05e6ff4b6fb1c205699f9ae4",
+        "archive_size_bytes": 130452774,
+        "commit": "10c06d2a5de448efa3267970c111f108cc86a4ef",
+        "repository_root": "<home>/ny-clean-final-20260731T155312Z",
+        "tree": "94c77ba5c0730fa99320687edee251d368074fbb"
+      },
+      "start_manifest": {
+        "artifact": "runs/tll-r04-10c06d2a-20260731T161718Z/start.json",
+        "sha256": "bf0365409b335c8ce4185c255a86344074420893245e31f112ee5a7ea081cecc",
+        "size_bytes": 121468
+      },
+      "verdict": "sat"
+    }
+  },
+  "schema": "ny_regular_bank_evidence_index_v1"
+}

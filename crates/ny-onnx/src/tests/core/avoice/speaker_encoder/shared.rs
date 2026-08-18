@@ -228,8 +228,9 @@ pub(super) fn assert_crown_tighter_than_ibp(
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_speaker_encoder_graph_model_round_trip_matches_direct_bounds_3923() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let _guard = common::lock_heavy_avoice_round_trip();
     let path = require_test_model_with_hint(SPEAKER_ENCODER_FILE, AVOICE_TEST_MODEL_HINT);
     let direct_model = avoice_speaker_encoder();

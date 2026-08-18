@@ -1,7 +1,7 @@
-tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx,vnnlib/property_N=8_0.vnnlib,prepared,unsat,0.62
-tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx,vnnlib/property_N=8_1.vnnlib,prepared,unsat,0.67
-tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx,vnnlib/property_N=8_2.vnnlib,prepared,unsat,0.56
-tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx,vnnlib/property_N=8_3.vnnlib,prepared,sat,0.56
+tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_0.onnx,vnnlib/property_N=8_0.vnnlib,prepared,unsat,0,tll-r01-10c06d2a-20260731T161718Z
+tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_1.onnx,vnnlib/property_N=8_1.vnnlib,prepared,unsat,0,tll-r02-10c06d2a-20260731T161718Z
+tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_2.onnx,vnnlib/property_N=8_2.vnnlib,prepared,unsat,1,tll-r03-10c06d2a-20260731T161718Z
+tllverifybench_2023,onnx/tllBench_n=2_N=M=8_m=1_instance_0_3.onnx,vnnlib/property_N=8_3.vnnlib,prepared,sat,0,tll-r04-10c06d2a-20260731T161718Z
 tllverifybench_2023,onnx/tllBench_n=2_N=M=16_m=1_instance_1_0.onnx,vnnlib/property_N=16_0.vnnlib,prepared,unsat,19.58
 tllverifybench_2023,onnx/tllBench_n=2_N=M=16_m=1_instance_1_1.onnx,vnnlib/property_N=16_1.vnnlib,prepared,sat,21.67
 tllverifybench_2023,onnx/tllBench_n=2_N=M=16_m=1_instance_1_2.onnx,vnnlib/property_N=16_2.vnnlib,prepared,unsat,23.08

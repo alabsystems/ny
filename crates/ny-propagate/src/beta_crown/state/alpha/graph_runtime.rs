@@ -2,17 +2,16 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-
 use ny_core::nan_propagating_max;
 use ny_tensor::BoundedTensor;
+use rustc_hash::FxHashMap;
 
-use super::graph_init::GraphDomainAlphaState;
+use super::graph_init::{AlphaNeuronMaps, GraphDomainAlphaState};
 use super::neuron::AlphaNeuronState;
 use crate::beta_crown::config::AdaptiveOptConfig;
 
 fn step_graph_alpha_neuron_maps_adam(
-    neuron_maps: &mut HashMap<String, HashMap<usize, AlphaNeuronState>>,
+    neuron_maps: &mut AlphaNeuronMaps,
     config: &AdaptiveOptConfig,
     t: usize,
 ) -> f32 {
@@ -87,7 +86,7 @@ impl GraphDomainAlphaState {
     }
 
     fn build_alpha_array_from_node_map(
-        node_neurons: Option<&HashMap<usize, AlphaNeuronState>>,
+        node_neurons: Option<&FxHashMap<usize, AlphaNeuronState>>,
         pre_activation: &BoundedTensor,
     ) -> ndarray::Array1<f32> {
         let pre_flat = pre_activation.flatten();
@@ -203,22 +202,22 @@ impl GraphDomainAlphaState {
     }
 
     /// Get read-only access to the nested per-neuron state map.
-    pub fn neurons(&self) -> &HashMap<String, HashMap<usize, AlphaNeuronState>> {
+    pub fn neurons(&self) -> &AlphaNeuronMaps {
         &self.neurons
     }
 
     /// Get read-only access to the nested upper-path per-neuron state map.
-    pub fn upper_neurons(&self) -> &HashMap<String, HashMap<usize, AlphaNeuronState>> {
+    pub fn upper_neurons(&self) -> &AlphaNeuronMaps {
         &self.upper_neurons
     }
 
     /// Get mutable access to the nested lower-path per-neuron state map.
-    pub fn neurons_mut(&mut self) -> &mut HashMap<String, HashMap<usize, AlphaNeuronState>> {
+    pub fn neurons_mut(&mut self) -> &mut AlphaNeuronMaps {
         &mut self.neurons
     }
 
     /// Get mutable access to the nested upper-path per-neuron state map.
-    pub fn upper_neurons_mut(&mut self) -> &mut HashMap<String, HashMap<usize, AlphaNeuronState>> {
+    pub fn upper_neurons_mut(&mut self) -> &mut AlphaNeuronMaps {
         &mut self.upper_neurons
     }
 

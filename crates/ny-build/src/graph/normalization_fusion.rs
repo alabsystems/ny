@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use ndarray::ArrayD;
 use ny_core::{LayerType, Result};
-use ny_propagate::layers::InstanceNorm1dLayer;
+use ny_propagate::layers::{InstanceNorm1dLayer, NORMALIZATION_MIN_EPS};
 use ny_propagate::Layer;
 use tracing::debug;
 
@@ -144,7 +144,7 @@ fn build_fused_instance_norm(
     ) else {
         return Ok(None);
     };
-    if !eps.is_finite() || eps <= 0.0 {
+    if !eps.is_finite() || eps < NORMALIZATION_MIN_EPS {
         return Ok(None);
     }
 
@@ -233,7 +233,10 @@ fn extract_squared_centered_input_tensor(
         }
         LayerType::Pow if square_spec.inputs.len() == 2 => {
             let exponent = context.constant_value(&square_spec.inputs[1])?;
-            if (scalar_tensor_value(&exponent)? - 2.0).abs() > f32::EPSILON {
+            // The fused layer computes an exact square.  A nearby exponent is
+            // a different function and cannot be discarded by pattern
+            // matching, even when it is only one f32 ULP from 2.
+            if scalar_tensor_value(&exponent)? != 2.0 {
                 return None;
             }
             let centered_spec =
@@ -310,31 +313,23 @@ fn read_reduce_axes(spec: &LayerSpec, context: &ConvertContext<'_>) -> Option<Ve
     }
 
     let axes_name = spec.inputs.get(1)?;
-    let axes_tensor = context.constant_value(axes_name)?;
-    axes_tensor
-        .iter()
-        .map(|value| {
-            if !value.is_finite() {
-                return None;
-            }
-            // #2360: Reject non-integer axis values. Without this check,
-            // values like 2.7 silently round to 3, which may fuse the
-            // wrong axis in normalization patterns.
-            if value.trunc() != *value {
-                return None;
-            }
-            Some(*value as i64)
-        })
-        .collect()
+    let axes = context
+        .discrete_constant_i64(axes_name, &format!("{} reduction axes", spec.name))
+        .ok()??;
+    Some(axes.iter().copied().collect())
 }
 
 fn infer_channel_count(source_tensor: &str, context: &ConvertContext<'_>) -> Option<usize> {
     let shape = context.tensor_shapes.get(source_tensor)?;
-    match shape.as_slice() {
-        [_, channels, ..] if *channels > 0 => Some(*channels as usize),
-        [channels, ..] if *channels > 0 => Some(*channels as usize),
-        _ => None,
+    // TensorSpec shapes still include the fixed ONNX batch dimension, while
+    // GraphNetwork strips it. InstanceNorm1d therefore needs at least one
+    // spatial dimension after the channel axis: authored rank must be >= 3.
+    // A rank-2 [B,F] last-axis normalization becomes an internal [F] tensor
+    // and must remain the primitive (LayerNorm-like) chain.
+    if shape.len() < 3 || shape[1] <= 0 {
+        return None;
     }
+    usize::try_from(shape[1]).ok()
 }
 
 #[cfg(test)]

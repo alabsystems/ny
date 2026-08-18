@@ -87,7 +87,15 @@ impl WhereLayer {
             .and(y.upper())
             .map_collect(|&xu, &yu| nan_propagating_max(xu, yu));
 
-        BoundedTensor::new(out_lower, out_upper)
+        // OpaqueSkip taint (#opaque-skip-six-sites): an upstream OpaqueSkip
+        // legitimately emits ±Inf endpoints on either branch. The union is
+        // pure min/max selection — Where here is NOT computed as the masked
+        // sum cond*x + (1-cond)*y, so the 0*inf / inf-inf NaN patterns cannot
+        // arise — and min/max of non-NaN operands is never NaN. Clean ±Inf
+        // widens the union soundly; a NaN output implies a NaN INPUT (the
+        // nan_propagating_min/max above preserve it) — a real bug — which
+        // `new_allow_infinite` still rejects as a hard error (#2853 tests).
+        BoundedTensor::new_allow_infinite(out_lower, out_upper)
     }
 
     /// Propagate IBP with the condition input and embedded constants.
@@ -425,6 +433,50 @@ mod tests {
             result.is_err(),
             "NaN in y upper should propagate through nan_propagating_max \
              and be rejected by BoundedTensor::new, but got Ok"
+        );
+    }
+
+    // ── OpaqueSkip taint probes (#opaque-skip-six-sites) ──────────────
+
+    /// A ±Inf branch (upstream OpaqueSkip) must propagate through the Where
+    /// union as widened bounds — the union is pure min/max selection, so no
+    /// 0*inf / inf-inf NaN pattern exists — instead of aborting graph IBP
+    /// with NumericalInstability.
+    #[test]
+    fn test_where_ibp_opaque_skip_inf_branch_flows() {
+        let layer = WhereLayer::new();
+        let cond = make_bounds(&[0.0, 0.0], &[1.0, 1.0]);
+        let x = BoundedTensor::new_allow_infinite(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NEG_INFINITY, f32::NEG_INFINITY])
+                .unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, f32::INFINITY]).unwrap(),
+        )
+        .unwrap();
+        let y = make_bounds(&[0.0, 1.0], &[2.0, 3.0]);
+
+        let out = layer
+            .propagate_ibp_ternary(&cond, &x, &y)
+            .expect("±inf branch must propagate through the Where union");
+        // Union widens to the tainted branch: [-inf, +inf].
+        assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+        assert_eq!(out.upper()[[1]], f32::INFINITY);
+    }
+
+    /// NaN input (a real bug, not OpaqueSkip taint) must still hard-error:
+    /// `new_allow_infinite` rejects NaN. Complements the #2853 tests above.
+    #[test]
+    fn test_where_ibp_nan_input_still_errors_after_inf_migration() {
+        let layer = WhereLayer::new();
+        let cond = make_bounds(&[0.0], &[1.0]);
+        let x = BoundedTensor::new_unchecked(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NAN]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap(),
+        )
+        .unwrap();
+        let y = make_bounds(&[0.0], &[2.0]);
+        assert!(
+            layer.propagate_ibp_ternary(&cond, &x, &y).is_err(),
+            "NaN input must remain a hard error after the ±inf migration"
         );
     }
 

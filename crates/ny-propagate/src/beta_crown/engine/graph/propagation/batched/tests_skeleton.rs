@@ -221,7 +221,7 @@ fn fixture_domains() -> (
                 .filter(|&j| bt.lower()[[j]] < 0.0 && bt.upper()[[j]] > 0.0)
                 .take(4)
                 .map(|j| (j, AlphaNeuronState::new(0.3)))
-                .collect::<HashMap<_, _>>()
+                .collect::<rustc_hash::FxHashMap<_, _>>()
         };
         alpha_child
             .alpha_state
@@ -277,6 +277,7 @@ fn push_layer_sig(sig: &mut Vec<u64>, layer: &GpuCrownLayer) {
             bias,
             out_features,
             in_features,
+            ..
         } => {
             sig.push(1);
             push_slice_bits(sig, weight);
@@ -311,6 +312,7 @@ fn push_layer_sig(sig: &mut Vec<u64>, layer: &GpuCrownLayer) {
             out_w,
             in_h,
             in_w,
+            ..
         } => {
             sig.push(3);
             push_slice_bits(sig, weight_col);

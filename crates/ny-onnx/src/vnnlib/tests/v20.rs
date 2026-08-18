@@ -116,6 +116,23 @@ fn test_parse_vnnlib_v2_linear_input_constraints() {
 
 #[ntest::timeout(10000)]
 #[test]
+fn test_parse_vnnlib_v2_rejects_strict_scaled_input_constraint() {
+    let content = r#"
+(vnnlib-version 2.0)
+(declare-input X Float32 [1])
+(declare-output Y Float32 [1])
+
+(assert (< (+ (* 2 X[0]) 1) 3))
+(assert (> Y[0] 0))
+"#;
+
+    let err =
+        parse_vnnlib(content).expect_err("a scaled affine strict input endpoint must fail closed");
+    assert_invalid_spec_contains(err, "Strict input constraints");
+}
+
+#[ntest::timeout(10000)]
+#[test]
 fn test_parse_vnnlib_v2_rejects_multi_var_input_constraint() {
     let content = r#"
 (vnnlib-version 2.0)

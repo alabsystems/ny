@@ -1,0 +1,60 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Apple Accelerate (vecLib BLAS) GEMM engine for ny. Isolated in its own crate
+# because it holds the only `unsafe` FFI surface of the CPU stack (`cblas_dgemm`
+# / `cblas_sgemm` are unsafe C entry points); `ny-core` keeps
+# `#![forbid(unsafe_code)]` and `ny-propagate` keeps `#![deny(unsafe_code)]`.
+# Mirrors the `ny-cuda` precedent exactly.
+#
+# The crate compiles to an inert stub off macOS/aarch64: every entry point is
+# still present, `AccelerateGemmEngine::new()` simply returns `None`.
+[package]
+name = "ny-accelerate"
+description = "Apple Accelerate (vecLib BLAS) sound f64 / fast f32 GEMM engine for ny"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+# f32 fallback engine: when the (default-off) sgemm free-rider is not armed,
+# `gemm_f32` keeps the incumbent faer blocked-SIMD RN-f32 kernel, so installing
+# this engine never changes f32 arithmetic unless explicitly asked to.
+faer.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Reachability test only: proves the CROWN backward actually consults this
+# engine through the real process-global `sound_f64_gemm` slot. `ny-propagate`
+# does NOT depend on `ny-accelerate`, so this introduces no cycle.
+ny-propagate = { path = "../ny-propagate" }
+ndarray.workspace = true
+# Exact-rational oracle for the CI half of the conformance obligation: the
+# double-double reference used elsewhere is itself validated against this.
+num-rational.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+
+# Wall-clock audits are explicit examples, not ignored tests. They fail with a
+# non-zero status off macOS/aarch64 and require `--release` for useful numbers.
+[[example]]
+name = "audit_speedup"
+path = "examples/audit_speedup.rs"
+test = false
+
+[[example]]
+name = "audit_attribution"
+path = "examples/audit_attribution.rs"
+test = false

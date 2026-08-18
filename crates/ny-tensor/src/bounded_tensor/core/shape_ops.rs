@@ -28,13 +28,13 @@ impl BoundedTensor {
 
         // Check if shapes are identical - no reshape needed
         if current_shape == shape {
-            return Ok(Self {
-                lower: self.lower.clone(),
-                upper: self.upper.clone(),
+            return Ok(Self::from_parts_with_l2(
+                self.lower.as_array().clone(),
+                self.upper.as_array().clone(),
                 // Drop the L2 annotation: reshape produces a fresh tensor whose
                 // sphere is not re-derived. Sound (only forgoes tightening).
-                l2: None,
-            });
+                None,
+            ));
         }
 
         // Check element count before attempting reshape
@@ -47,12 +47,12 @@ impl BoundedTensor {
 
         // Make arrays contiguous before reshaping to avoid layout issues
         let lower_contiguous = if self.lower.is_standard_layout() {
-            self.lower.clone()
+            self.lower.as_array().clone()
         } else {
             self.lower.as_standard_layout().to_owned()
         };
         let upper_contiguous = if self.upper.is_standard_layout() {
-            self.upper.clone()
+            self.upper.as_array().clone()
         } else {
             self.upper.as_standard_layout().to_owned()
         };
@@ -63,11 +63,62 @@ impl BoundedTensor {
         let upper = upper_contiguous
             .into_shape_with_order(IxDyn(shape))
             .map_err(|_| NyError::shape_mismatch(shape.to_vec(), current_shape.to_vec()))?;
-        Ok(Self {
-            lower,
-            upper,
-            l2: None,
-        })
+        Ok(Self::from_parts_with_l2(lower, upper, None))
+    }
+
+    /// Consume and reshape a standard-layout tensor without cloning either
+    /// endpoint, with caller-supplied authority checkpoints.
+    ///
+    /// This is the finite-deadline publication seam for proof paths whose
+    /// freshly constructed bounds are already contiguous. A non-standard
+    /// layout is refused rather than hidden behind an unbounded allocation;
+    /// callers may select their established fallback. As with [`Self::reshape`],
+    /// the optional L2 annotation is dropped because it is not re-derived.
+    pub fn into_reshape_with_poll<F>(self, shape: &[usize], mut poll: F) -> Result<Self>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        poll()?;
+        let current_shape = self.lower.shape().to_vec();
+        let current_size = checked_shape_product(&current_shape).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::into_reshape_with_poll: current shape product overflows: {current_shape:?}"
+            ))
+        })?;
+        let target_size = checked_shape_product(shape).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::into_reshape_with_poll: target shape product overflows: {shape:?}"
+            ))
+        })?;
+        if current_size != target_size {
+            return Err(NyError::shape_mismatch(shape.to_vec(), current_shape));
+        }
+        if current_shape == shape {
+            poll()?;
+            return Ok(Self::from_parts_with_l2(
+                self.lower.into_array(),
+                self.upper.into_array(),
+                None,
+            ));
+        }
+        if !self.lower.is_standard_layout() || !self.upper.is_standard_layout() {
+            return Err(NyError::UnsupportedConfiguration(
+                "deadline-aware BoundedTensor reshape requires standard-layout endpoints".into(),
+            ));
+        }
+        poll()?;
+        let lower = self
+            .lower
+            .into_array()
+            .into_shape_with_order(IxDyn(shape))
+            .map_err(|_| NyError::shape_mismatch(shape.to_vec(), current_shape.clone()))?;
+        let upper = self
+            .upper
+            .into_array()
+            .into_shape_with_order(IxDyn(shape))
+            .map_err(|_| NyError::shape_mismatch(shape.to_vec(), current_shape))?;
+        poll()?;
+        Ok(Self::from_parts_with_l2(lower, upper, None))
     }
 
     /// Flatten the tensor to 1D.
@@ -79,11 +130,11 @@ impl BoundedTensor {
     pub fn flatten(&self) -> Self {
         let lower_vec: Vec<f32> = self.lower.iter().copied().collect();
         let upper_vec: Vec<f32> = self.upper.iter().copied().collect();
-        Self {
-            lower: ndarray::Array1::from_vec(lower_vec).into_dyn(),
-            upper: ndarray::Array1::from_vec(upper_vec).into_dyn(),
-            l2: None,
-        }
+        Self::from_parts_with_l2(
+            ndarray::Array1::from_vec(lower_vec).into_dyn(),
+            ndarray::Array1::from_vec(upper_vec).into_dyn(),
+            None,
+        )
     }
 
     /// Flatten and extract lower/upper bounds as `Array1<f32>`.
@@ -103,6 +154,7 @@ impl BoundedTensor {
         let flat = self.flatten();
         let lower = flat
             .lower
+            .into_array()
             .into_dimensionality::<ndarray::Ix1>()
             .map_err(|e| {
                 NyError::InternalError(format!(
@@ -115,6 +167,7 @@ impl BoundedTensor {
             })?;
         let upper = flat
             .upper
+            .into_array()
             .into_dimensionality::<ndarray::Ix1>()
             .map_err(|e| {
                 NyError::InternalError(format!(
@@ -237,8 +290,8 @@ impl BoundedTensor {
             )));
         }
 
-        let lower = self.lower.clone().insert_axis(Axis(axis));
-        let upper = self.upper.clone().insert_axis(Axis(axis));
+        let lower = self.lower.as_array().clone().insert_axis(Axis(axis));
+        let upper = self.upper.as_array().clone().insert_axis(Axis(axis));
 
         BoundedTensor::new(lower, upper)
     }

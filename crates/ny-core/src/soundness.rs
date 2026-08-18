@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Soundness interpretation for a verification run.
 ///
@@ -53,11 +53,35 @@ pub enum HeuristicUsed {
 }
 
 /// Machine-readable provenance for verification soundness semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SoundnessProvenance {
     pub(crate) mode: VerificationSoundnessMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) heuristics_used: Vec<HeuristicUsed>,
+}
+
+/// Deserialize provenance fail-closed: an explicit heuristic entry can never be
+/// under-labeled as [`VerificationSoundnessMode::Sound`] by inconsistent input.
+impl<'de> Deserialize<'de> for SoundnessProvenance {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct SoundnessProvenanceRaw {
+            mode: VerificationSoundnessMode,
+            #[serde(default)]
+            heuristics_used: Vec<HeuristicUsed>,
+        }
+
+        let raw = SoundnessProvenanceRaw::deserialize(deserializer)?;
+        let mode = if raw.heuristics_used.is_empty() {
+            raw.mode
+        } else {
+            VerificationSoundnessMode::Heuristic
+        };
+        Ok(Self {
+            mode,
+            heuristics_used: raw.heuristics_used,
+        })
+    }
 }
 
 impl SoundnessProvenance {
@@ -231,5 +255,28 @@ mod tests {
         let combined = SoundnessProvenance::combine_all(std::iter::empty());
         assert_eq!(combined.mode(), VerificationSoundnessMode::Sound);
         assert!(combined.heuristics_used().is_empty());
+    }
+
+    #[test]
+    fn deserialize_cannot_underlabel_explicit_heuristics_as_sound() {
+        let json = r#"{
+            "mode": "sound",
+            "heuristics_used": [
+                {"type": "layer_norm_forward_mode", "num_nodes": 1}
+            ]
+        }"#;
+        let provenance: SoundnessProvenance =
+            serde_json::from_str(json).expect("valid provenance JSON");
+        assert_eq!(provenance.mode(), VerificationSoundnessMode::Heuristic);
+        assert_eq!(provenance.heuristics_used().len(), 1);
+    }
+
+    #[test]
+    fn deserialize_preserves_explicit_empty_heuristic_marker() {
+        let json = r#"{"mode":"heuristic"}"#;
+        let provenance: SoundnessProvenance =
+            serde_json::from_str(json).expect("valid provenance JSON");
+        assert_eq!(provenance.mode(), VerificationSoundnessMode::Heuristic);
+        assert!(provenance.heuristics_used().is_empty());
     }
 }

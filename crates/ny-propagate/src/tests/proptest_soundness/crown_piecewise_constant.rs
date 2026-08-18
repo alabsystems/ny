@@ -341,7 +341,7 @@ proptest! {
         )?;
     }
 
-    /// Round(x) = round-half-away-from-zero. Piecewise constant, monotonically non-decreasing.
+    /// Round(x) = round-half-to-even. Piecewise constant, monotonically non-decreasing.
     /// CROWN relaxation: slope=0, lower_intercept=round(l), upper_intercept=round(u).
     /// Part of #40.
     #[ntest::timeout(10000)]
@@ -362,7 +362,7 @@ proptest! {
 
         assert_crown_backward_sound(
             l, u,
-            |x| x.round(),
+            |x| x.round_ties_even(),
             &result,
             "Round",
             CROWN_TOLERANCE,
@@ -396,7 +396,7 @@ proptest! {
 
         assert_constant_crown_negative_coeff_sound(
             &RoundLayer::new(),
-            |x| x.round(),
+            |x| x.round_ties_even(),
             [l0, l1],
             [u0, u1],
             &incoming,
@@ -689,7 +689,7 @@ proptest! {
 
         assert_constant_crown_negative_coeff_sound(
             &RoundLayer::new(),
-            |x| x.round(),
+            |x| x.round_ties_even(),
             [l0, l1],
             [u0, u1],
             &incoming,

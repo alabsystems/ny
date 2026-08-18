@@ -23,6 +23,13 @@ attack:
 
 bab:
   batch_size: 128
+  # Pinned 2026 prop_000001 CPU measurement: the useful Conv_1, Conv_5, and
+  # Add_8 targets completed in 3.466s, 8.715s, and 6.448s, while the 10,816-
+  # and 5,408-row Conv_12/Conv_20 targets consumed 51.772s and 31.142s before
+  # reverting to their sound IBP bounds. Pin the base cap at 12s to stop those
+  # doomed targets from consuming the warmup slice. Wider targets retain the
+  # collector's dimension scaling; exceeding the effective cap selects IBP.
+  crown_ibp_per_node_cap_secs: 12
   # Phase budget overrides (#4207).
   # Evidence: alpha-CROWN warmup (50 SPSA iterations on 31-node DAG)
   # consumed the entire timeout with 0 domains explored.
@@ -35,6 +42,9 @@ bab:
     # Must be set explicitly — the engine default is 0.10. (If PGD is ever
     # re-enabled here against the reference's skip, restore ~0.10.)
     post_bab_pgd_fraction: 0.0
+    # The outer VNN-COMP falsifier is a separate lane; opt it out explicitly to
+    # preserve the reference's skip policy and assign the historical tail to proof.
+    vnncomp_post_bab_attack: false
   branching:
     # method removed: auto-branching selects ReLU-split (graph engine) for this
     # high-dim conv DAG — input-splitting an 8112-elem box is hopeless (0 domains),

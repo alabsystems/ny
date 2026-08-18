@@ -11,6 +11,7 @@
 //! Part of #4297.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ny_core::{NyError, Result};
 use tracing::error;
@@ -31,17 +32,26 @@ use super::dispatch_plan::CrownDispatchPlan;
 pub(crate) struct BatchedCrownAccumulator {
     storage: Vec<Option<BatchedCrownBounds>>,
     name_to_idx: HashMap<String, usize>,
+    deadline: Option<Instant>,
 }
 
 impl BatchedCrownAccumulator {
     /// Build a new accumulator from a dispatch plan.
     ///
     /// Allocates `node_count + 1` slots (nodes + NETWORK_INPUT sentinel).
+    #[cfg(test)]
     pub(crate) fn new(plan: &CrownDispatchPlan) -> Self {
+        Self::new_with_deadline(plan, None)
+    }
+
+    /// Build an accumulator whose merge materializations inherit the caller's
+    /// one absolute deadline.
+    pub(crate) fn new_with_deadline(plan: &CrownDispatchPlan, deadline: Option<Instant>) -> Self {
         let capacity = plan.node_count() + 1; // +1 for NETWORK_INPUT
         Self {
             storage: (0..capacity).map(|_| None).collect(),
             name_to_idx: plan.name_to_idx.clone(),
+            deadline,
         }
     }
 
@@ -115,6 +125,11 @@ impl BatchedCrownAccumulator {
         input_name: &str,
         new_bounds: BatchedCrownBounds,
     ) -> Result<()> {
+        if self.deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(
+                "BatchedCrownAccumulator: deadline exceeded before accumulation".into(),
+            ));
+        }
         let idx = self.name_to_idx.get(input_name).copied().ok_or_else(|| {
             NyError::InvalidSpec(format!(
                 "BatchedCrownAccumulator: unknown input '{}'",
@@ -127,11 +142,16 @@ impl BatchedCrownAccumulator {
             self.storage[idx] = Some(new_bounds);
         } else {
             // Merge point: convert new to Dense, then safe_add (#3550: checked).
-            let new_blb =
-                new_bounds.into_batched_dense_checked("batched_accumulator:accumulate:new")?;
+            let new_blb = new_bounds.into_batched_dense_checked_with_deadline(
+                "batched_accumulator:accumulate:new",
+                self.deadline,
+            )?;
             if let Some(ref mut existing_bcb) = self.storage[idx] {
-                existing_bcb
-                    .merge_dense_checked(new_blb, "batched_accumulator:accumulate:existing")?;
+                existing_bcb.merge_dense_checked_with_deadline(
+                    new_blb,
+                    "batched_accumulator:accumulate:existing",
+                    self.deadline,
+                )?;
             } else {
                 error!(
                     "BatchedCrownAccumulator: merge expected but {} missing — bounds dropped",

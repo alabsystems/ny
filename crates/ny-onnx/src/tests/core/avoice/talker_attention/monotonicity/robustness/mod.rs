@@ -7,7 +7,7 @@ use super::super::fixtures::{
     bounded_hidden_states_input, bounded_hidden_states_input_centered,
     configure_sound_softmax_modes, first_talker_attention_softmax_node,
     load_talker_attention_with_real_rope_seq_len, talker_attention_softmax_output_graph,
-    talker_attention_softmax_output_graph_real_rope, TALKER_ATTENTION_SEQ_LEN,
+    TALKER_ATTENTION_SEQ_LEN,
 };
 use super::*;
 

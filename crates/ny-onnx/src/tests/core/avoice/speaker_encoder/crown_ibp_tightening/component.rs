@@ -150,22 +150,58 @@ fn log_crown_backward_gaps(graph: &GraphNetwork, layer_type_counts: &HashMap<Str
     }
 }
 
-/// Diagnostic: dump layer types in the dot component graph to identify which
-/// nodes cause per-node IBP concretization in spec-guided CROWN backward. #3499
+/// The real speaker dot-component graph must retain the explicit three-node
+/// cosine head after ONNX lowering. The inventory and backward-gap log remain
+/// useful diagnostics, while the topology assertions prevent an empty or
+/// miswired graph from passing as coverage. #3499
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
-fn test_speaker_dot_graph_node_layer_inventory_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+#[cfg(feature = "external-avoice")]
+fn test_speaker_dot_graph_inventory_covers_cosine_head_3499() {
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let (dot_graph, _, _) = cosine_head::build_speaker_cosine_component_graphs();
     let layer_type_counts = collect_layer_type_counts(&dot_graph);
+    assert_eq!(
+        layer_type_counts.values().sum::<usize>(),
+        dot_graph.num_nodes(),
+        "every dot-graph node must contribute exactly once to the layer inventory"
+    );
+    assert_eq!(dot_graph.output_name(), "cosine_dot");
+    for (name, expected_type, expected_input) in [
+        ("cosine_embed_scaled", "MulConstant", None),
+        (
+            "cosine_dot_terms",
+            "MulConstant",
+            Some("cosine_embed_scaled"),
+        ),
+        ("cosine_dot", "ReduceSum", Some("cosine_dot_terms")),
+    ] {
+        let node = dot_graph
+            .node(name)
+            .unwrap_or_else(|| panic!("dot graph missing required cosine-head node {name}"));
+        assert_eq!(
+            node.layer().layer_type(),
+            expected_type,
+            "cosine-head node {name} changed layer type"
+        );
+        assert_eq!(
+            node.inputs().len(),
+            1,
+            "cosine-head node {name} must remain unary"
+        );
+        if let Some(expected_input) = expected_input {
+            assert_eq!(node.inputs()[0], expected_input);
+        }
+    }
     log_layer_inventory(&dot_graph, &layer_type_counts);
     log_crown_backward_gaps(&dot_graph, &layer_type_counts);
 }
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_speaker_cosine_components_use_tighter_crown_ibp_intermediates_3596() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let (dot_graph, norm_sq_graph, _) = cosine_head::build_speaker_cosine_component_graphs();
     let model = shared::avoice_speaker_encoder();
     let input = shared::bounded_speaker_encoder_cosine_input(

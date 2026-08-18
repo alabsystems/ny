@@ -1,0 +1,67 @@
+{
+  "schema": "ny_biccos_mts_factorial_plan_v1",
+  "diagnostic_only": true,
+  "execution_allowed": false,
+  "abcrown": {
+    "commit": "e5c7e17bf0488843acb77b7519f59876717a49f4",
+    "auto_lirpa_commit": "5a098e8f9fb5786a428a024981d833d303921f2d",
+    "entrypoint": "complete_verifier/abcrown.py"
+  },
+  "corpus_manifest": "benchmarks/abcrown_transfer_corpus_v1.json",
+  "targets": [
+    "cifar100-medium-1761",
+    "cifar100-medium-2477",
+    "tinyimagenet-medium-1126",
+    "tinyimagenet-medium-7943"
+  ],
+  "category_config_directories": {
+    "cifar100_2024": "complete_verifier/exp_configs/BICCOS/cifar100",
+    "tinyimagenet_2024": "complete_verifier/exp_configs/BICCOS/tinyimagenet"
+  },
+  "arms": [
+    {
+      "id": "baseline",
+      "config": "beta.yaml",
+      "config_sha256": {
+        "cifar100_2024": "500bd93b9d4e838228adcab0d28374db1165fe401cb38ad1c404ff746daba6c5",
+        "tinyimagenet_2024": "354c4998d1de36961f666486ec7d34565ec466f8df2cda7a41a442c4e7bfa2bd"
+      },
+      "biccos": false,
+      "multi_tree": false,
+      "constraint_strengthening": false
+    },
+    {
+      "id": "mts-only",
+      "config": "biccos_only_mts.yaml",
+      "config_sha256": {
+        "cifar100_2024": "4cd69d5188c941f5f6f6b752c16d87af250e2b92473457f4210b54eaad97fb12",
+        "tinyimagenet_2024": "7ac574fcc0e84cb586e2497cdeb927a63176ae3974d00cbb30d3c617d268120b"
+      },
+      "biccos": true,
+      "multi_tree": true,
+      "constraint_strengthening": false
+    },
+    {
+      "id": "cs-only",
+      "config": "biccos_only_cs.yaml",
+      "config_sha256": {
+        "cifar100_2024": "0936b17e8e81852b6d80931d890a785e0f058b0f7c03b1db75a442ae7954fbb0",
+        "tinyimagenet_2024": "46c8dac3c85739c64abed0ec602eca7299152e888bb4b6ee0e7cee9f2f7bda2e"
+      },
+      "biccos": true,
+      "multi_tree": false,
+      "constraint_strengthening": true
+    },
+    {
+      "id": "all",
+      "config": "biccos_all.yaml",
+      "config_sha256": {
+        "cifar100_2024": "f4ce02e1cba18295381f02c588a5d9d16a39d42b6cf015b58457a76d37910eb5",
+        "tinyimagenet_2024": "c5710215866247fdac4036efa81e9be65f0806a72b35b77ebf4a3453fc8dab78"
+      },
+      "biccos": true,
+      "multi_tree": true,
+      "constraint_strengthening": true
+    }
+  ]
+}

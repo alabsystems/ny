@@ -401,11 +401,9 @@ fn test_zonotope_swiglu_ffn_tightening() {
     };
 
     // Propagate through up and gate
-    let up_z = base_z
-        .linear(&up_linear.weight, up_linear.bias.as_ref())
-        .unwrap();
+    let up_z = base_z.linear(up_linear.weight(), up_linear.bias()).unwrap();
     let gate_z = base_z
-        .linear(&gate_linear.weight, gate_linear.bias.as_ref())
+        .linear(gate_linear.weight(), gate_linear.bias())
         .unwrap();
 
     // Apply SiLU to gate

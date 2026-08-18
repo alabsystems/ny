@@ -4,15 +4,16 @@
 
 //! Subtract constant layer: y = x - c or y = c - x (element-wise).
 
-use ndarray::{Array1, ArrayD, Axis, IxDyn};
-use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ndarray::{Array1, Array2, ArrayD, Axis, IxDyn};
+use ny_core::{checked_shape_product, NyError, Result};
+use ny_tensor::{next_down_f32, next_up_f32, sub_down_f32, sub_up_f32, BoundedTensor};
 use std::borrow::Cow;
 use tracing::debug;
 
 use super::common::{dot_bias_f64, extract_scalar_constant_for_batched, scalar_row_sum_f64};
 use super::validate::validate_finite_array;
 use crate::layers::common::BoundPropagation;
+use crate::shape::{broadcast_flat_index_map, broadcast_shapes};
 use crate::{BatchedLinearBounds, LinearBounds};
 
 /// Subtract constant layer: y = x - c or y = c - x (element-wise).
@@ -63,6 +64,154 @@ impl SubConstantLayer {
     pub fn constant(&self) -> &ArrayD<f32> {
         &self.constant
     }
+
+    /// CROWN backward through a BROADCASTING SubConstant (#ml4acopf-genbab).
+    ///
+    /// Handles `y = broadcast(x) - broadcast(c)` (or `c - x` when `reverse`)
+    /// where the output shape is the ONNX broadcast of the input and constant
+    /// shapes. The ml4acopf trigonometric threshold banks are the motivating
+    /// pattern: `Sub(x[1,P,1], thresholds[K]) -> [1,P,K]` — the input expands
+    /// along the last axis AND the constant broadcasts across the leading axes.
+    ///
+    /// Backward substitution: with `A` over the output (columns = flat output),
+    /// `A @ y = A @ (B_x x - B_c c)` where `B_x`/`B_c` are the implicit
+    /// broadcast operators, so:
+    /// - new `A' = A @ B_x` — column `i` of the input receives the SUM of the
+    ///   `A` columns of every output position that reads `x[i]`;
+    /// - new bias `b' = b - A @ (B_c c)` (`+` when `reverse`, which also
+    ///   negates `A'`; no lower/upper swap — CROWN composes by substitution).
+    ///
+    /// Soundness (#vnncomp-aw-soundness): the column reduction sums `fan_in`
+    /// f32 coefficients per input cell in round-to-nearest — the same
+    /// scatter-add class as `ExpandLikeLastAxisLayer::propagate_linear_binary`
+    /// — so it carries the certified `gamma_{fan_in} * S + prop` coefficient
+    /// error outward via `new_or_conservative_with_err`. The bias dot product
+    /// accumulates in f64 with directed rounding on the f32 cast (#3157).
+    fn propagate_linear_broadcast_backward(
+        &self,
+        bounds: &LinearBounds,
+        input_shape: &[usize],
+    ) -> Result<LinearBounds> {
+        let layer_dim = bounds.lower_a().ncols();
+        let const_shape = self.constant.shape();
+        let out_shape =
+            broadcast_shapes(input_shape, const_shape).ok_or_else(|| NyError::ShapeMismatch {
+                expected: input_shape.to_vec(),
+                got: const_shape.to_vec(),
+            })?;
+        let out_len = checked_shape_product(&out_shape).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "SubConstant broadcast: output shape {:?} overflows usize",
+                out_shape
+            ))
+        })?;
+        if out_len != layer_dim {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![layer_dim],
+                got: vec![out_len],
+            });
+        }
+        let input_len = checked_shape_product(input_shape)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                    "SubConstant broadcast: input shape {:?} overflows usize",
+                    input_shape
+                ))
+            })?
+            .max(1);
+
+        // Bias contribution: A @ broadcast(c), f64 accumulation (#3157).
+        let c_broadcast: Array1<f32> = self
+            .constant
+            .broadcast(IxDyn(&out_shape))
+            .ok_or_else(|| NyError::ShapeMismatch {
+                expected: out_shape.clone(),
+                got: const_shape.to_vec(),
+            })?
+            .iter()
+            .copied()
+            .collect();
+        let (lower_c_f64, upper_c_f64) =
+            dot_bias_f64(bounds.lower_a(), bounds.upper_a(), &c_broadcast);
+
+        // Column reduction through the implicit input broadcast: every output
+        // flat index maps to the input flat index it reads (row-major).
+        let index_map = broadcast_flat_index_map(&out_shape, input_shape);
+        let num_outputs = bounds.num_outputs();
+        // Uniform fan-in: broadcasting replicates each input cell the same
+        // number of times (product of the broadcast axis widths).
+        let fan_in = layer_dim / input_len;
+        let mut lower_a = Array2::<f32>::zeros((num_outputs, input_len));
+        let mut upper_a = Array2::<f32>::zeros((num_outputs, input_len));
+        let in_lower_err = bounds.lower_a_err();
+        let in_upper_err = bounds.upper_a_err();
+        let mut s_lower = Array2::<f64>::zeros((num_outputs, input_len));
+        let mut s_upper = Array2::<f64>::zeros((num_outputs, input_len));
+        let mut p_lower = Array2::<f64>::zeros((num_outputs, input_len));
+        let mut p_upper = Array2::<f64>::zeros((num_outputs, input_len));
+        for row in 0..num_outputs {
+            for (out_idx, &in_idx) in index_map.iter().enumerate() {
+                let wl = bounds.lower_a()[[row, out_idx]];
+                let wu = bounds.upper_a()[[row, out_idx]];
+                lower_a[[row, in_idx]] += wl;
+                upper_a[[row, in_idx]] += wu;
+                s_lower[[row, in_idx]] += (wl as f64).abs();
+                s_upper[[row, in_idx]] += (wu as f64).abs();
+                if let Some(e) = in_lower_err {
+                    p_lower[[row, in_idx]] += (e[[row, out_idx]] as f64).abs();
+                }
+                if let Some(e) = in_upper_err {
+                    p_upper[[row, in_idx]] += (e[[row, out_idx]] as f64).abs();
+                }
+            }
+        }
+
+        // Bias with directed rounding; A negated for reverse (substitution,
+        // no lower/upper swap — same convention as `propagate_linear`).
+        let (new_lower_b, new_upper_b) = if self.reverse {
+            let lb_f64 = bounds.lower_b().mapv(|x| x as f64) + &lower_c_f64;
+            let ub_f64 = bounds.upper_b().mapv(|x| x as f64) + &upper_c_f64;
+            (
+                lb_f64.mapv(|x| next_down_f32(x as f32)),
+                ub_f64.mapv(|x| next_up_f32(x as f32)),
+            )
+        } else {
+            let lb_f64 = bounds.lower_b().mapv(|x| x as f64) - &lower_c_f64;
+            let ub_f64 = bounds.upper_b().mapv(|x| x as f64) - &upper_c_f64;
+            (
+                lb_f64.mapv(|x| next_down_f32(x as f32)),
+                ub_f64.mapv(|x| next_up_f32(x as f32)),
+            )
+        };
+        if self.reverse {
+            lower_a.mapv_inplace(|v| -v);
+            upper_a.mapv_inplace(|v| -v);
+        }
+
+        if fan_in >= 2 || in_lower_err.is_some() || in_upper_err.is_some() {
+            let gamma = if fan_in >= 2 {
+                crate::layers::linear::crown_single_gamma_n_f32(fan_in)
+            } else {
+                0.0
+            };
+            let lower_err = ndarray::Zip::from(&s_lower)
+                .and(&p_lower)
+                .map_collect(|&s, &p| next_up_f32((gamma * s + p) as f32));
+            let upper_err = ndarray::Zip::from(&s_upper)
+                .and(&p_upper)
+                .map_collect(|&s, &p| next_up_f32((gamma * s + p) as f32));
+            LinearBounds::new_or_conservative_with_err(
+                lower_a,
+                new_lower_b,
+                upper_a,
+                new_upper_b,
+                lower_err,
+                upper_err,
+            )
+        } else {
+            LinearBounds::new_or_conservative(lower_a, new_lower_b, upper_a, new_upper_b)
+        }
+    }
 }
 
 impl BoundPropagation for SubConstantLayer {
@@ -74,11 +223,9 @@ impl BoundPropagation for SubConstantLayer {
         // Compute broadcast output shape (ONNX semantics).
         // Handles both constant→input and input→constant broadcast.
         let output_shape =
-            crate::shape::broadcast_shapes(input_shape, const_shape).ok_or_else(|| {
-                NyError::ShapeMismatch {
-                    expected: input_shape.to_vec(),
-                    got: const_shape.to_vec(),
-                }
+            broadcast_shapes(input_shape, const_shape).ok_or_else(|| NyError::ShapeMismatch {
+                expected: input_shape.to_vec(),
+                got: const_shape.to_vec(),
             })?;
 
         // Broadcast constant and input bounds to output shape.
@@ -115,10 +262,10 @@ impl BoundPropagation for SubConstantLayer {
             // y_upper = c - x_lower
             let lower = ndarray::Zip::from(&c)
                 .and(&upper_in)
-                .map_collect(|&ci, &ui| next_down_f32((ci as f64 - ui as f64) as f32));
+                .map_collect(|&ci, &ui| sub_down_f32(ci, ui));
             let upper = ndarray::Zip::from(&c)
                 .and(&lower_in)
-                .map_collect(|&ci, &li| next_up_f32((ci as f64 - li as f64) as f32));
+                .map_collect(|&ci, &li| sub_up_f32(ci, li));
             (lower, upper)
         } else {
             // y = x - c: subtraction preserves order
@@ -126,14 +273,49 @@ impl BoundPropagation for SubConstantLayer {
             // y_upper = x_upper - c
             let lower = ndarray::Zip::from(&lower_in)
                 .and(&c)
-                .map_collect(|&li, &ci| next_down_f32((li as f64 - ci as f64) as f32));
+                .map_collect(|&li, &ci| sub_down_f32(li, ci));
             let upper = ndarray::Zip::from(&upper_in)
                 .and(&c)
-                .map_collect(|&ui, &ci| next_up_f32((ui as f64 - ci as f64) as f32));
+                .map_collect(|&ui, &ci| sub_up_f32(ui, ci));
             (lower, upper)
         };
 
-        BoundedTensor::new(out_lower, out_upper)
+        // OpaqueSkip taint (#opaque-skip-six-sites): an upstream OpaqueSkip
+        // legitimately emits ±Inf endpoints. The constant is validated finite
+        // at construction (`validate_finite_array`), so `±inf ∓ c` and
+        // `c - (±inf)` stay clean ±Inf and the only NaN-producing pattern for
+        // subtraction (inf - inf) is unreachable. A NaN here therefore implies
+        // a NaN INPUT — a real bug — which `new_allow_infinite` still rejects
+        // as a hard error. (Contrast binary Sub, where both operands can be
+        // ±Inf and inf - inf forces `new_repaired(Conservative)`.)
+        BoundedTensor::new_allow_infinite(out_lower, out_upper)
+    }
+
+    /// Unified CROWN backward. Non-broadcast cases (constant matches the layer
+    /// dim, or scalar constant, with an un-broadcast input) delegate to
+    /// `propagate_linear` — byte-identical to the previous behavior. Broadcast
+    /// cases (ml4acopf threshold banks: `Sub(x[1,P,1], c[K]) -> [1,P,K]`)
+    /// route to `propagate_linear_broadcast_backward`, which previously
+    /// hard-errored with `ShapeMismatch` and killed GenBaB child propagation
+    /// (#ml4acopf-genbab).
+    fn propagate_crown_backward(
+        &self,
+        bounds: &LinearBounds,
+        pre_activation: Option<&BoundedTensor>,
+    ) -> Result<LinearBounds> {
+        let layer_dim = bounds.lower_a().ncols();
+        let c_len = self.constant.len();
+        let elementwise_const = c_len == layer_dim || c_len == 1;
+        let input_matches = pre_activation.is_none_or(|p| p.len() == layer_dim);
+        if elementwise_const && input_matches {
+            return self.propagate_linear(bounds).map(Cow::into_owned);
+        }
+        match pre_activation {
+            Some(pre) => self.propagate_linear_broadcast_backward(bounds, pre.shape()),
+            // Without the input shape the broadcast column reduction is
+            // ill-posed; keep the legacy behavior (errors preserved).
+            None => self.propagate_linear(bounds).map(Cow::into_owned),
+        }
     }
 
     #[inline]
@@ -334,5 +516,57 @@ impl SubConstantLayer {
                 bounds.output_shape.clone(),
             )
         }
+    }
+}
+
+/// OpaqueSkip taint probes (#opaque-skip-six-sites): the IBP output
+/// constructor must let the legitimate ±Inf an upstream OpaqueSkip emits flow
+/// through as widened bounds, while NaN inputs remain a hard error.
+#[cfg(test)]
+mod opaque_skip_taint_tests {
+    use super::*;
+
+    fn opaque_input() -> BoundedTensor {
+        BoundedTensor::new_allow_infinite(
+            ArrayD::from_elem(IxDyn(&[2]), f32::NEG_INFINITY),
+            ArrayD::from_elem(IxDyn(&[2]), f32::INFINITY),
+        )
+        .unwrap()
+    }
+
+    /// [-inf, +inf] - c (and c - [-inf, +inf]) must propagate as [-inf, +inf],
+    /// not abort with NumericalInstability. The constant is finite, so no
+    /// inf - inf NaN pattern exists.
+    #[test]
+    fn test_ibp_opaque_skip_inf_input_flows() {
+        let forward = SubConstantLayer::new(ArrayD::from_elem(IxDyn(&[2]), 1.5_f32));
+        let out = forward
+            .propagate_ibp(&opaque_input())
+            .expect("±inf input must propagate through x - c");
+        assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+        assert_eq!(out.upper()[[1]], f32::INFINITY);
+
+        let reverse = SubConstantLayer::new_reverse(ArrayD::from_elem(IxDyn(&[2]), 1.5_f32));
+        let out = reverse
+            .propagate_ibp(&opaque_input())
+            .expect("±inf input must propagate through c - x");
+        assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+        assert_eq!(out.upper()[[1]], f32::INFINITY);
+    }
+
+    /// NaN input (a real bug, not OpaqueSkip taint) must still hard-error:
+    /// `new_allow_infinite` rejects NaN.
+    #[test]
+    fn test_ibp_nan_input_still_errors() {
+        let layer = SubConstantLayer::new(ArrayD::from_elem(IxDyn(&[1]), 1.0_f32));
+        let input = BoundedTensor::new_unchecked(
+            ArrayD::from_elem(IxDyn(&[1]), f32::NAN),
+            ArrayD::from_elem(IxDyn(&[1]), 1.0_f32),
+        )
+        .unwrap();
+        assert!(
+            layer.propagate_ibp(&input).is_err(),
+            "NaN input must remain a hard error"
+        );
     }
 }

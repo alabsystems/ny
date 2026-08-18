@@ -24,7 +24,7 @@
 use crate::error::MipError;
 use crate::ir::MilpProblem;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 type Result<T> = std::result::Result<T, MipError>;
@@ -161,20 +161,31 @@ fn parse_hex_f64(token: Option<&str>) -> std::result::Result<f64, String> {
         .map_err(|_| format!("bad f64 hex {token:?}"))
 }
 
+/// Whether bit-exact MILP capture was explicitly requested.
+///
+/// Large callers use this as a lazy guard so the default-off path does not
+/// clone a model solely for diagnostics.
+pub(crate) fn enabled() -> bool {
+    std::env::var_os("NY_MIP_DUMP").is_some()
+}
+
 /// Write `problem` into the `NY_MIP_DUMP` directory if the env var is set.
 ///
-/// Never fails the solve: capture problems are logged and dropped.
-pub(crate) fn maybe_dump(problem: &MilpProblem) {
+/// Never fails the solve: capture problems are logged and dropped. Returns
+/// the exact artifact path only after a successful write so callers and tests
+/// do not have to infer ownership by scanning a process-wide dump directory.
+pub(crate) fn maybe_dump(problem: &MilpProblem) -> Option<PathBuf> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let Some(dir) = std::env::var_os("NY_MIP_DUMP") else {
-        return;
-    };
+    let dir = std::env::var_os("NY_MIP_DUMP")?;
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = Path::new(&dir).join(format!("mip-{}-{n:06}.milp", std::process::id()));
-    if let Err(e) =
-        std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, to_milp_text(problem)))
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, to_milp_text(problem)))
     {
-        tracing::warn!("NY_MIP_DUMP: failed to write {}: {e}", path.display());
+        Ok(()) => Some(path),
+        Err(e) => {
+            tracing::warn!("NY_MIP_DUMP: failed to write {}: {e}", path.display());
+            None
+        }
     }
 }
 

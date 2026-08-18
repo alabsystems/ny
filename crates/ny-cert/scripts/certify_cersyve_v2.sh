@@ -9,13 +9,16 @@
 # For each of the 10 con/inv queries this runs certify_onnx's DAG-aware exact
 # pipeline (NYCERT_CONJ=1): a complete exact branch-and-bound over the vnnlib
 # box where every leaf refutes one conjunct of the unsafe region
-# {Y_0 <= 0 AND Y_1 >= 0} with an exact-rational Farkas certificate,
-# self-checked by ny-cert's in-tree mirror of Clean's verifier and emitted as
-# Clean external-certificate JSON (leaf_<id>.farkas.json + tree.json).
+# {Y_0 <= 0 AND Y_1 >= 0} with an exact-rational Farkas certificate. Each
+# leaf_<id>.farkas.json is self-checked by ny-cert's in-tree mirror and emitted
+# as Clean external-certificate JSON. tree.json is NY's orchestration manifest,
+# not a Clean external certificate.
 #
 # It first runs the exact-forward PARITY gate (loader correctness) per net,
-# then certifies, then — if CLEAN_DIR is set — re-checks every emitted leaf
-# certificate with Clean's exact pinned CLI. No Clean source is copied.
+# then certifies, then — if CLEAN_DIR is set — asks Clean's exact pinned CLI to
+# re-check the leaf-local scalar contradictions. Clean does not consume
+# tree.json, so it does NOT check tree coverage or source-target composition.
+# No Clean source is copied.
 #
 # Usage:
 #   BENCH=/path/to/vnncomp2025_benchmarks/cersyve \
@@ -57,7 +60,7 @@ for s in "${SYSTEMS[@]}"; do for l in con inv; do
 done; done
 
 if [[ -n "${CLEAN_DIR:-}" ]]; then
-  echo "=== Re-check with Clean's real external-cert verifier ==="
+  echo "=== Re-check leaf-local contradictions with Clean's external-cert verifier ==="
   CLEAN_WORK="$(mktemp -d)"
   trap 'rm -rf "$CLEAN_WORK"' EXIT
   source "$(dirname "${BASH_SOURCE[0]}")/_clean_pinned.sh"

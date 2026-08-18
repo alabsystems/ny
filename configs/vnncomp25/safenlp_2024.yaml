@@ -18,5 +18,13 @@ general:
   csv_name: instances.csv
 
 attack:
+  # Force the upfront falsification lane (#upfront-preset). safenlp specs are
+  # single-constraint, so the auto multi-clause-disjunction rule skips them.
+  # This used to live only as `NY_UPFRONT_ATTACK=1` in run_instance.sh, which
+  # made every measurement path disagree with the submission path. MEASURED:
+  # medical/hyperrectangle_2096 is `sat` at the official 20s budget with the
+  # lane and `timeout` without it.
+  upfront_attack: true
   pgd_order: after
+  ny_pgd_order_compat: upfront
   pgd_restarts: 10000

@@ -33,25 +33,25 @@ def pytest_addoption(parser: Parser) -> None:
     group.addoption(
         "--ny-timeout",
         action="store",
-        default=60,
+        default=None,
         type=int,
-        help="Timeout for verification in seconds (default: 60)",
+        help="Override the configured verification timeout in seconds",
     )
 
     group.addoption(
         "--ny-epsilon",
         action="store",
-        default=0.01,
+        default=None,
         type=float,
-        help="Default perturbation epsilon (default: 0.01)",
+        help="Override the configured perturbation epsilon",
     )
 
     group.addoption(
         "--ny-method",
         action="store",
-        default="crown",
+        default=None,
         choices=["ibp", "crown", "alpha", "beta"],
-        help="Verification method (default: crown)",
+        help="Override the configured verification method",
     )
 
     # Register ini options for pyproject.toml / pytest.ini

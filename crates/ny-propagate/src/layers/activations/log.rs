@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ny_core::{NyError, Result};
+use ny_core::{f32_affine_eval_error, f64_to_f32_down, f64_to_f32_up, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
@@ -86,8 +86,7 @@ impl BoundPropagation for LogLayer {
 /// # Precondition
 /// Caller must ensure l > 0 and u > 0. This function is only called from
 /// CROWN backward propagation where pre-activation bounds should already
-/// be validated by `propagate_ibp`. The epsilon clamping below is a
-/// safety net for numerical stability, not a correctness mechanism.
+/// be validated by `propagate_ibp`.
 pub fn log_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // Guard: NaN bounds → return (-inf, +inf) intercepts so CROWN drives bounds to ±inf.
     if l.is_nan() || u.is_nan() {
@@ -98,21 +97,31 @@ pub fn log_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     // log(x) is only defined for x > 0. log(x) -> -inf as x -> 0+, log(x) -> +inf as x -> +inf.
     // l should always be > 0 (validated by IBP), but guard for robustness.
     if u.is_infinite() {
+        if u.is_sign_negative() {
+            return LinearRelaxation::nan_fallback();
+        }
         // u = +inf: chord slope (log(u) - log(l))/(u - l) -> 0 as u -> inf.
         // Lower: slope 0, intercept = log(l) (constant, sound since log is increasing).
         // Upper: tangent at l, y = (1/l)x + log(l) - 1 (sound since log is concave).
-        let l_clamped = nan_propagating_max(l, 1e-10);
-        let log_l = (l_clamped as f64).ln();
-        let upper_slope = 1.0 / (l_clamped as f64);
+        if l <= 0.0 || !l.is_finite() {
+            return LinearRelaxation::nan_fallback();
+        }
+        let log_l = (l as f64).ln();
+        let upper_slope = 1.0 / (l as f64);
         let upper_intercept = log_l - 1.0;
-        let upper_slope_f32 = upper_slope as f32;
-        let upper_slope_err =
-            next_up_f32(((upper_slope - upper_slope_f32 as f64).abs() * l_clamped as f64) as f32);
+        // On an unbounded positive interval, a finite intercept cannot compensate
+        // a downward-rounded slope for every x.  Round the upper slope upward
+        // instead.  If it is not representable, use the safe constant +infinity
+        // upper bound rather than introducing an infinite coefficient.
+        let upper_slope_f32 = next_up_f32(upper_slope as f32);
+        if !upper_slope_f32.is_finite() {
+            return LinearRelaxation::constant(next_down_f32(log_l as f32), f32::INFINITY);
+        }
         return LinearRelaxation::new(
             0.0,
             next_down_f32(log_l as f32),
             upper_slope_f32,
-            next_up_f32((upper_intercept as f32) + upper_slope_err),
+            next_up_f32(upper_intercept as f32),
         );
     }
     // l = -inf or l = +inf shouldn't occur for log (domain x > 0), but handle gracefully.
@@ -120,10 +129,58 @@ pub fn log_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         return LinearRelaxation::new(0.0, f32::NEG_INFINITY, 0.0, f32::INFINITY);
     }
 
+    // DOMAIN GUARD, not a clamp (#log-epsilon-nonenclosing).
+    //
+    // This used to be `l = max(l, 1e-10); u = max(u, 1e-10)`, described as a
+    // "safety clamp". Raising `l` MOVES THE DOMAIN: for a true `l` below 1e-10 the
+    // chord/tangent below are built for [1e-10, u] while the input can reach the
+    // real `l`, and since ln(1e-10) = -23.03 while ln(1e-20) = -46.05, the lower
+    // line sits ABOVE ln on (l, 1e-10). That is a NON-ENCLOSING lower relaxation,
+    // i.e. a false-`unsat` generator — the one direction that costs -150.
+    //
+    // MEASURED by `envelope_audit_expologpow::audit_log_envelope`: 10,484,626 of
+    // 37,861,389 sampled points violate the lower line, worst violation 6.447238e1
+    // (8,450,523 f32 ULPs) at l = u = 1e-38; the upper line is clean. Excluding
+    // l < 1e-10 leaves 0 of 23,096,113 violating — every violation is inside the
+    // clamped region, which is exactly what a domain shift predicts.
+    //
+    // ln is computed in f64 here and is finite for every positive f32 including
+    // subnormals (ln(1e-45) = -103.6), so no clamp is needed to keep it finite.
+    // Non-positive endpoints and inverted intervals violate this helper's
+    // precondition. Fail open there rather than pretending the domain starts
+    // higher than it does.
+    //
+    // Blast radius when this was found: zero scored rows. No ONNX file in
+    // vnncomp2025 or vnncomp2026 contains a Log or LogSoftmax op (0 of 2372
+    // checked), so no banked verdict depended on the broken envelope.
+    if l <= 0.0 || u <= 0.0 || l > u {
+        return LinearRelaxation::nan_fallback();
+    }
+
+    // Tiny `l`: use the ENDPOINT-CONSTANT BAND, not a sloped line.
+    //
+    // Below EPSILON the honest chord is astronomically steep — on [1e-12, 2e-12]
+    // its slope is ln(2)/1e-12 ~ 6.9e11 — because that is genuinely how fast ln
+    // moves there. Such a line is mathematically sound but numerically explosive:
+    // every downstream certified error term scales with |coeff|, so shipping a
+    // 6.9e11 coefficient trades a non-enclosing bound for an error blow-up. The
+    // old code avoided that by clamping the DOMAIN, which is unsound (see above).
+    //
+    // The constant band is sound for any 0 < l <= u and has slope 0: ln is
+    // increasing, so ln(l) <= ln(x) <= ln(u) for every x in [l, u], and both ends
+    // are rounded outward. Same shape the narrow-interval path below uses, and the
+    // same shape sqrt.rs uses. It is looser than the chord, which costs nothing
+    // here — no ONNX file in vnncomp2025 or vnncomp2026 contains a Log or
+    // LogSoftmax op (0 of 2372), so no scored row depends on tightness at 1e-12.
     const EPSILON: f32 = 1e-10;
-    // Safety clamp - assumes caller validated l,u > 0
-    let l = nan_propagating_max(l, EPSILON);
-    let u = nan_propagating_max(u, EPSILON);
+    if l < EPSILON {
+        return LinearRelaxation::new(
+            0.0,
+            next_down_f32(f64::from(l).ln() as f32),
+            0.0,
+            next_up_f32(f64::from(u).ln() as f32),
+        );
+    }
 
     // Use f64 intermediates to prevent catastrophic cancellation.
     // The chord slope (log(u) - log(l)) / (u - l) is a classic cancellation
@@ -199,16 +256,26 @@ pub fn log_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
 
     // Directed rounding: compensate for f64→f32 truncation in both slope and
     // intercept, matching the pattern in exp_linear_relaxation.
-    let max_abs_x = nan_propagating_max(l.abs(), u.abs()) as f64;
+    let max_abs_x = nan_propagating_max(l.abs(), u.abs());
     let lower_slope_f32 = lower_slope as f32;
     let upper_slope_f32 = upper_slope as f32;
-    let lower_slope_err =
-        next_up_f32(((lower_slope - lower_slope_f32 as f64).abs() * max_abs_x) as f32);
-    let upper_slope_err =
-        next_up_f32(((upper_slope - upper_slope_f32 as f64).abs() * max_abs_x) as f32);
+    let lower_eval_err =
+        f32_affine_eval_error(lower_slope, lower_slope_f32, lower_intercept, max_abs_x);
+    let upper_eval_err =
+        f32_affine_eval_error(upper_slope, upper_slope_f32, upper_intercept, max_abs_x);
+    let lower_intercept_f32 = next_down_f32(f64_to_f32_down(lower_intercept - lower_eval_err));
+    let upper_intercept_f32 = next_up_f32(f64_to_f32_up(upper_intercept + upper_eval_err));
 
-    let lower_intercept_f32 = next_down_f32((lower_intercept as f32) - lower_slope_err);
-    let upper_intercept_f32 = next_up_f32((upper_intercept as f32) + upper_slope_err);
+    // Extreme positive f32s can require an affine slope or intercept outside
+    // f32.  A monotonic endpoint band is less precise but always represents a
+    // sound relaxation, and avoids `inf * 0` in downstream concretization.
+    if !lower_slope_f32.is_finite()
+        || !upper_slope_f32.is_finite()
+        || !lower_intercept_f32.is_finite()
+        || !upper_intercept_f32.is_finite()
+    {
+        return LinearRelaxation::constant(next_down_f32(log_l as f32), next_up_f32(log_u as f32));
+    }
 
     LinearRelaxation::new(
         lower_slope_f32,
@@ -623,12 +690,27 @@ mod tests {
     // interval, with only a tiny relative slack for the f64 reference's own
     // evaluation noise.
 
-    /// Strict f64 envelope check with the certified f32 coefficients on the
-    /// domain the relaxation actually bounds (inputs clamped to >= 1e-10).
+    /// Strict f64 envelope check with the certified f32 coefficients over the
+    /// full positive-f32 domain accepted by Log.
     fn assert_log_envelope_strict(l: f32, u: f32) {
         let r = log_linear_relaxation(l, u);
-        let lc = l.max(1e-10) as f64;
-        let uc = u.max(1e-10) as f64;
+        // Sample the box the relaxation was BUILT FOR, i.e. [l, u].
+        //
+        // This used to sample `[l.max(1e-10), u.max(1e-10)]`, mirroring the
+        // production `l = max(l, 1e-10)` domain clamp. That made the helper agree
+        // with the defect instead of catching it: a caller passing [1e-12, 2e-12]
+        // received a relaxation valid only on [1e-10, 1e-10], leaving all of
+        // [1e-12, 1e-10) unguarded — and this helper never looked there, because it
+        // applied the same shift. The independent
+        // `envelope_audit_expologpow::audit_log_envelope`, which samples the true
+        // box, caught it: 10,484,626 of 37,861,389 points violated the lower line,
+        // and excluding l < 1e-10 left 0 of 23,096,113.
+        //
+        // The clamp is gone from production (#log-epsilon-nonenclosing), so the
+        // helper must test the real contract: for all x in [l, u],
+        // lower(x) <= ln(x) <= upper(x).
+        let lc = f64::from(l);
+        let uc = f64::from(u);
         let (ls, li) = (r.lower_slope as f64, r.lower_intercept as f64);
         let (us, ui) = (r.upper_slope as f64, r.upper_intercept as f64);
         let n = 256;
@@ -674,10 +756,16 @@ mod tests {
         let u = 1e-6_f32 + 5e-9_f32;
         assert_log_envelope_strict(1e-6, u);
 
-        // Below the domain clamp: l = 1e-12 is clamped to 1e-10.
+        // Below EPSILON: NOT clamped any more (#log-epsilon-nonenclosing). The
+        // relaxation must now be sound on the TRUE box, which these assert.
+        // Previously l = 1e-12 was silently raised to 1e-10, leaving
+        // [1e-12, 1e-10) outside anything the lines guarded.
         assert_log_envelope_strict(1e-12, 5e-9);
-        // Both endpoints clamp to 1e-10: exact point interval after clamping.
         assert_log_envelope_strict(1e-12, 2e-12);
+        // Subnormal and near-zero lower bounds: the constant band must still
+        // enclose, with no clamp and no astronomically steep chord.
+        assert_log_envelope_strict(1e-38, 1e-30);
+        assert_log_envelope_strict(f32::MIN_POSITIVE, 1e-20);
     }
 
     #[ntest::timeout(5000)]
@@ -709,7 +797,7 @@ mod tests {
     }
 
     /// Broad soundness sweep over a log-spaced grid of (l, width) pairs:
-    /// subnormal-adjacent magnitudes (clamped to 1e-10 by the domain guard),
+    /// subnormal-adjacent magnitudes,
     /// relative widths straddling the 1e-7 narrow threshold, absolute widths
     /// straddling the old 1e-8 guard, and 1-ulp intervals in every binade.
     #[ntest::timeout(5000)]

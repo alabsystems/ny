@@ -11,6 +11,12 @@ readme.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exact nonlinear-SMT conformance through the revision-pinned external `ay`
+# executable. Tests in this lane fail fast if that executable is unavailable.
+external-ay = []
+
 [dependencies]
 ny-cert = { path = "../ny-cert" }
 ny-core = { path = "../ny-core" }

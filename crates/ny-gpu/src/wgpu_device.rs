@@ -36,12 +36,23 @@ mod device;
 mod error_scope;
 #[path = "wgpu_device/ops/mod.rs"]
 mod ops;
+#[path = "wgpu_device/shader_loading.rs"]
+pub(crate) mod shader_loading;
+/// #batched-bab wide-lane publication counter, surfaced for the CLI's dark
+/// `[wide-lane]` readout (observability only).
+pub use ops::wide_resnet_batched_taken_count;
+/// Buffer-budget constant shared with the FL value tier (#fl-value-gpu-tier).
+pub(crate) use ops::MAX_BINDING_ELEMS;
 #[path = "wgpu_device/params.rs"]
 mod params;
 #[path = "wgpu_device/pipelines.rs"]
 mod pipelines;
 #[path = "wgpu_device/shaders.rs"]
 mod shaders;
+#[path = "wgpu_device/shaders_intermediate_sweep.rs"]
+mod shaders_intermediate_sweep;
+#[path = "wgpu_device/shaders_taint.rs"]
+mod shaders_taint;
 #[path = "wgpu_device/sound_consts.rs"]
 mod sound_consts;
 #[path = "wgpu_device/utils.rs"]
@@ -50,12 +61,30 @@ mod utils;
 #[cfg(test)]
 #[path = "wgpu_device/contract_tests.rs"]
 mod contract_tests;
+/// `#daz-flush-cover-v2` soundness artifact: exact-rational oracle deciding
+/// whether subnormal flushing can be CHARGED by the shipped `flush` floor.
+#[cfg(test)]
+#[path = "wgpu_device/flush_charge_oracle.rs"]
+mod flush_charge_oracle;
 #[cfg(all(test, feature = "gpu-tests"))]
 #[path = "wgpu_device/test_support.rs"]
 pub(crate) mod test_support;
 
+/// #flush-charge Lane B: end-to-end ENCLOSURE-PARITY acceptance harness on the
+/// TEST-SCOPED charged device (real adapter; the last OPEN row on the charged
+/// gate's audit ledger). Compiled only under `gpu-tests`.
+#[cfg(all(test, feature = "gpu-tests"))]
+#[path = "wgpu_device/flush_charge_acceptance_gpu_tests.rs"]
+mod flush_charge_acceptance_gpu_tests;
+
+pub use self::device::AdapterProbe;
+
 use self::buffers::BufferPool;
 use self::error_scope::UncapturedErrorState;
+use self::ops::bab_bound_authority::WgpuBabBoundProvider;
+pub use self::ops::bab_bound_authority::{
+    WgpuBabBoundQualificationError, WgpuBabBoundVerdictRequest,
+};
 use self::ops::conv_transpose_plan::{ConvTransposePlanKey, PreparedConvTransposePlan};
 use self::ops::crown_host_profile::CrownHostTimingProfileState;
 pub use self::ops::crown_host_profile::{
@@ -72,6 +101,14 @@ pub use self::ops::crown_timestamps::{
 };
 use self::ops::point_vjp_resident::PointVjpResidentPlans;
 use self::ops::resident_weights::{ResidentWeightEntry, ResidentWeightKey};
+pub use self::ops::sound_authority::{
+    FlushChargePolicy, WgpuChargedVerdictRequest, WgpuVerdictAuthority,
+    WgpuVerdictQualificationError, WgpuVerdictReport, WgpuVerdictRequest, WgpuVerdictRung,
+    WgpuVerdictRungOutcome,
+};
+pub(crate) use self::ops::sound_authority::{
+    PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED, PRODUCTION_WGPU_VERDICT_AUTHORITY_ENABLED,
+};
 // Certified Cut-CROWN C2 resident-lane dark hook (`NY_CUT_FOLD_RESIDENT`):
 // registry surface for experiment harnesses (default OFF; empty ⇒ zero-cost).
 pub use self::ops::cut_fold_resident::{
@@ -94,9 +131,10 @@ pub(crate) struct ResidentBackwardPipelines {
     pub act: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     pub act_bias: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     /// #eft-err (dark, `NY_EFT_ERR=1` + `verify_eft_primitives`): the EFT twin
-    /// GEMM (deterministic barrier-fma value + exact residual sum) and the
-    /// min-combine that tightens the Higham certified error with the measured
-    /// bound. Built unconditionally (pipeline creation carries no numerical
+    /// GEMM (qualified core-multiply/add value sequence plus measured or
+    /// conservatively charged FMA residuals) and the min-combine that tightens
+    /// the Higham certified error with that bound. Built unconditionally
+    /// (pipeline creation carries no numerical
     /// state); DISPATCHED only under the gate ⇒ gate off is byte-identical.
     pub eft_twin: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     pub eft_min_combine: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
@@ -104,6 +142,71 @@ pub(crate) struct ResidentBackwardPipelines {
     /// #seg-resident: the on-device lane-pair merge for residual skips /
     /// projection merges (`RESIDENT_SEG_MERGE_SHADER`).
     pub seg_merge: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+    /// Conv fold pipelines + the α-gradient capture pipeline. These are
+    /// shader-constant (no shape specialization) but were historically created
+    /// FRESH ON EVERY FOLD CALL — thousands of identical driver-side pipeline
+    /// compiles per BaB run, and the NVIDIA driver segfaulted inside
+    /// `create_compute_pipeline` under the seg-resident call rate. Cached here
+    /// once; value-identical (same WGSL, same bind layout).
+    pub conv_reshape: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+    pub conv_col2im: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+    pub conv_err: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+    pub alpha_grad: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+    /// #u4 taint twins: the out-of-band `u32` taint-word channel of
+    /// TAINT_GUARD_AUDIT.md §4. The production gate is AUTO/default-on when
+    /// these twins are available; `NY_GPU_TAINT_WORDS=0` explicitly opts out,
+    /// while `=1` requires them and turns unavailability into a typed refusal.
+    /// `None` when the device's
+    /// granted `max_storage_buffers_per_shader_stage` cannot host the widest
+    /// twin (11 bindings — e.g. the wgpu default of 8 under
+    /// `NY_GPU_BIG_BINDINGS=0`): building them anyway would raise a BGL
+    /// validation error inside the shared `OnceCell` cache and poison EVERY
+    /// later walk. DISPATCHED only when the resolved word gate is armed; AUTO
+    /// stays unavailable on such a device and explicit `=1` refuses at walk
+    /// entry. The twins recompute the base values
+    /// byte-for-byte (drift-pinned by
+    /// `sentinel_taint_selfcheck::gpu_tests::random_wide_twin_drift_pin`), so
+    /// swapping a base dispatch for its twin changes no value bits.
+    pub gemm_taint: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub gemm_small_k_taint: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub conv_reshape_taint: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub conv_col2im_taint: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub act_taint: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub combine_taint: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub eft_min_combine_taint: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// #u4 on-device word helper: the AUTO/default route uses the per-spec-row
+    /// word fold (`TAINT_ROW_OR_SHADER`, atomicOr with an optional
+    /// clean multiplicative-partner annihilation conjunct). Conv uses exact-
+    /// value reshape/GEMM/col2im twins; the dormant G13 value→word shader is
+    /// retained only as a reference and is not used as a lossy substitute for
+    /// internal transport. The row fold replaced
+    /// the walk's per-layer blocking word readbacks (the measured 2.3–3.1× tax).
+    /// Unlike the 11-binding twins they need at most 3 storage bindings —
+    /// under every granted limit — so they are built UNCONDITIONALLY (no
+    /// Option or BGL-validation poisoning risk). The row fold dispatches only
+    /// when the resolved word gate is armed, which still requires the twins.
+    pub taint_row_or: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
+}
+
+impl WgpuDevice {
+    /// Submit + periodic NON-BLOCKING maintain: every 64th submit through this
+    /// helper runs `device.poll(PollType::Poll)` so completed submissions are
+    /// reclaimed even on long stretches with no blocking readback. The NVIDIA
+    /// 580.159 Vulkan ICD on the GB10 segfaults (NULL jump inside
+    /// vkQueueSubmit) after sustained high-rate submits with no maintenance —
+    /// reproduced under the seg-resident + no-merge fold rate, where keep-mode
+    /// skips the per-fold readback (and its implicit `poll(Wait)`) entirely.
+    /// Value-neutral: `Poll` is non-blocking resource reclamation; results and
+    /// submission order are unchanged.
+    pub(crate) fn submit_ticked(&self, cmd: wgpu::CommandBuffer) {
+        use std::sync::atomic::Ordering;
+        self.queue.submit(Some(cmd));
+        ops::intermediate_sweep::note_submits(1);
+        let n = self.submit_tick.fetch_add(1, Ordering::Relaxed);
+        if n % 64 == 63 {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
+    }
 }
 
 /// The ON-DEVICE joint α-gradient adjoint pipelines (design doc §3), cached on
@@ -123,12 +226,11 @@ pub(crate) struct JointAdjointPipelines {
     pub conv_adj: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
 }
 
-/// Lazily-built compute pipelines for the SOUND (verdict-legal) GPU-resident IBP
-/// forward (`docs/SOUND_GPU_IBP_PLAN.md` §3). Cached on [`WgpuDevice`] so the sound
-/// shaders compile once (on first verdict use) and are reused, never touching the
-/// FAST/unsound speed pipelines. These hold no numerical data — caching only removes
-/// redundant shader compilation. Each is the `(ComputePipeline, BindGroupLayout)`
-/// pair from `create_simple_pipeline` (binding 0 = uniform params, 1.. = storage).
+/// Lazily-built candidate certified GPU-resident IBP pipelines.
+///
+/// These are retained for diagnostics and future requalification, but WGPU
+/// currently has no verdict authority. They hold no numerical data; each entry
+/// is the `(ComputePipeline, BindGroupLayout)` pair from `create_simple_pipeline`.
 pub(crate) struct IbpSoundPipelines {
     /// §3.1 keystone: `LINEAR_IBP_SOUND` — 7 storage (in_l, in_u, wp, wn, bias, out_l, out_u).
     pub linear: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
@@ -170,6 +272,11 @@ pub(crate) struct IbpSoundPipelines {
 /// - `attention_ibp()`: Q @ K^T -> scale -> softmax -> probs @ V in a single call
 pub struct WgpuDevice {
     adapter_info: wgpu::AdapterInfo,
+    /// Capability-driven shader loading profile selected before any module was
+    /// created on this device. Verdict authority still comes only from the
+    /// complete live ladder stored in `verdict_report`.
+    denorm_preserve_policy: shader_loading::DenormPreservePolicy,
+    denorm_preserve_enabled: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     // Linear IBP pipeline
@@ -211,6 +318,15 @@ pub struct WgpuDevice {
     crown_bias_accumulate_bind_group_layout: wgpu::BindGroupLayout,
     crown_concretize_pipeline: wgpu::ComputePipeline,
     crown_concretize_bind_group_layout: wgpu::BindGroupLayout,
+    /// Lazily initialized for ordinary callers, but eagerly materialized by
+    /// verdict qualification so an accepted authoritative sweep performs no
+    /// synchronous shader compilation.
+    sound_concretize_pipeline: std::sync::OnceLock<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// Full-IEEE Add/Sub intermediate-sweep pipelines. The full verdict
+    /// constructor materializes these before publishing authority; charged
+    /// adapters never do because their DAG route deliberately declines.
+    intermediate_sweep_dag_pipelines:
+        std::sync::OnceLock<shaders_intermediate_sweep::SweepDagPipelines>,
     // Conv2d CROWN backward pipelines (#3397)
     conv_reshape_pipeline: wgpu::ComputePipeline,
     conv_reshape_bind_group_layout: wgpu::BindGroupLayout,
@@ -232,6 +348,11 @@ pub struct WgpuDevice {
     /// deep-resnet hot path without touching any FP math. Filled under the
     /// `gpu_serialize` lock on first use. See `crown_backward_sound_resident.rs`.
     resident_pipelines: std::sync::OnceLock<ResidentBackwardPipelines>,
+    /// Lazily-built strided coefficient-gather pipeline used when a CROWN caller
+    /// requests enough `(row, column)` values that emitting one copy command per
+    /// value would overwhelm command encoding. Kept separate from
+    /// `resident_pipelines` so bound-only calls never pay to compile it.
+    resident_gather_pipeline: std::sync::OnceLock<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     /// Lazily-built, reused-forever ON-DEVICE joint α-gradient adjoint pipelines
     /// (design doc §3). Built under the `gpu_serialize` lock on first use; hold no
     /// numerical data (non-soundness-critical gradient path). See
@@ -264,6 +385,11 @@ pub struct WgpuDevice {
     /// `crown_plan_cache` via `clear_crown_working_set`.
     resident_weight_buffers:
         std::sync::Mutex<std::collections::HashMap<ResidentWeightKey, ResidentWeightEntry>>,
+    /// Transactional live-byte reservations for accepted typed intermediate
+    /// sweeps. A request reserves before its first dispatch and releases by
+    /// RAII on every exit, so concurrent callers cannot each pass an isolated
+    /// cap preflight against the same retained device.
+    intermediate_sweep_reserved_bytes: std::sync::Mutex<usize>,
     /// Count of resident-weight uploads (cache misses); test introspection for
     /// the no-re-upload guarantee.
     resident_weight_uploads: std::sync::atomic::AtomicUsize,
@@ -306,14 +432,11 @@ pub struct WgpuDevice {
     /// folds, where stopping is safe (an expired check returns
     /// `DeadlineExceeded`, and every CROWN caller falls back soundly).
     crown_backward_deadline: std::sync::Mutex<Option<std::time::Instant>>,
-    /// Cached result of the one-time per-adapter IEEE-754 f32-model self-check
-    /// (`verify_ieee_f32_model`, see `ops/f32_selfcheck.rs`). `Some(true)` ⇒ this
-    /// adapter provably executes WGSL f32 at true `u = 2^-24` with bit-exact
-    /// `bitcast` directed rounding, so the authoritative sound-GPU verdict path is
-    /// offered; `Some(false)` ⇒ a probe mismatched/faulted (covert reduced precision,
-    /// broken bitcast, or a readback error) and the sound-GPU path is DISABLED
-    /// (fail-safe to the CPU f64+γ·S sound fallback). Populated lazily on the first
-    /// `provides_sound_gpu_*` query; the probe runs exactly once per device.
+    /// Cached one-time IEEE-754 f32 diagnostic (`ops/f32_selfcheck.rs`).
+    ///
+    /// A passing result proves only this rung. Raw CROWN authority additionally
+    /// requires the reviewed source gate, an explicit request, and every other
+    /// ladder rung. Populated lazily; the probe runs at most once per device.
     f32_selfcheck: std::sync::OnceLock<bool>,
     /// Cached result of the one-time per-adapter EFT-primitive self-check
     /// (`verify_eft_primitives`, see `ops/eft_selfcheck.rs`): whether fma
@@ -322,6 +445,63 @@ pub struct WgpuDevice {
     /// refuses that optional tightening (Higham charge ships unchanged) —
     /// never the sound path itself.
     eft_selfcheck: std::sync::OnceLock<bool>,
+    /// Cached result of the one-time per-adapter GRADUAL-UNDERFLOW self-check
+    /// (`verify_gradual_underflow`, see `ops/subnormal_selfcheck.rs`): whether
+    /// this adapter honours subnormal operands (no DAZ) and subnormal results
+    /// (no FTZ). This is a PRECONDITION of the EFT residual identity — under
+    /// flush-to-zero every subnormal `ep`/`es` residual is silently dropped and
+    /// the measured radius UNDER-counts. Fail-closed: uninitialized ⇒ `false`.
+    subnormal_selfcheck: std::sync::OnceLock<bool>,
+    /// Cached result of the one-time per-adapter `#u4` SENTINEL-TAINT
+    /// STICKINESS self-check (`verify_sentinel_taint_sticky`, see
+    /// `ops/sentinel_taint_selfcheck.rs`): does the finite ±FALLBACK_BOUND
+    /// overflow sentinel survive nonzero fused resident CROWN ops, while clean
+    /// exact-zero partners annihilate it? The armed production predicate consults the
+    /// out-of-band word because the magnitude-only controls can be laundered by
+    /// a small weight or activation slope. This discharges U4; the independently
+    /// reviewed B0 source gate is now open, but authority still requires the
+    /// immutable successful per-device report. Fail-closed: uninitialized ⇒ `false`.
+    sentinel_taint_selfcheck: std::sync::OnceLock<bool>,
+    /// #flush-charge §H: cached result of the one-time per-adapter RUNG-5
+    /// SUBNORMAL-MULTIPLIER probe (`verify_subnormal_mult_taint`, see the §H
+    /// section of `ops/sentinel_taint_selfcheck.rs`): is the taint-word
+    /// annihilation domain of this adapter's DAZ compares confined to the
+    /// STRICTLY-SUBNORMAL multipliers the charged walk guard refuses (or is
+    /// the word path structurally immune)? Any word loss at/above the
+    /// `2^-126` normal boundary, or beside a non-flushed value, is HAZARDOUS
+    /// and closes charged-flush authority. Consulted only by
+    /// `charged_flush_authority_cached` (primed eagerly by the charged
+    /// constructor); no uncharged rung reads it. Fail-closed: uninitialized ⇒
+    /// `false`.
+    subnormal_mult_taint_selfcheck: std::sync::OnceLock<bool>,
+    /// Cached result of the one-time pinned RESIDENT CUT-APPLY selfcheck
+    /// (`ops/cut_shadow_resident.rs::verify_resident_cut_apply`): whether the
+    /// audited cut-apply kernel reproduces its host transcription bit-exactly
+    /// and encloses the exact channel demand on the pinned all-normal fixture.
+    /// Gates ONLY the observation-only resident Cut-CROWN shadow capability
+    /// (`provides_resident_cut_shadow`); no verdict rung reads it. Prewarmed by
+    /// both verdict constructors. Fail-closed: uninitialized ⇒ probe runs
+    /// lazily; any GPU error ⇒ `false`.
+    resident_cut_selfcheck: std::sync::OnceLock<bool>,
+    /// Successful typed verdict-qualification report for this exact device.
+    /// `None` for every device built through [`WgpuDevice::new`]. The field is
+    /// written only after the explicit constructor has eagerly passed all five
+    /// live rungs — or, for the charged-flush constructor, its complete
+    /// admission predicate — then remains immutable for the device lifetime.
+    verdict_report: Option<WgpuVerdictReport>,
+    /// Private, default-closed retained-BaB provider foundation. Its optional
+    /// core registration is authority-free; only a private qualification token
+    /// bound to this exact registration epoch could expose the numerical TCB.
+    bab_bound_provider: WgpuBabBoundProvider,
+    /// #flush-charge: the armed charge policy for a device built through
+    /// [`WgpuDevice::new_for_verdict_flush_charged`]. `None` for every other
+    /// device (including fully qualified ones — the two authority states are
+    /// mutually exclusive by construction). Immutable for the device lifetime;
+    /// read only through `charged_flush_authority_cached`, which composes the
+    /// forced-fail hooks and the loading-path contract on every call.
+    charged_policy: Option<FlushChargePolicy>,
+    /// Submit counter for [`Self::submit_ticked`]'s periodic maintain poll.
+    submit_tick: std::sync::atomic::AtomicU64,
 }
 
 impl WgpuDevice {
@@ -330,6 +510,27 @@ impl WgpuDevice {
     /// This drops only the CROWN-specific pooled buffers and cached staging
     /// plans, preserving the shared device and compiled pipelines.
     pub fn clear_crown_working_set(&self) -> Result<()> {
+        // Use the same lock order as an accepted intermediate sweep: first the
+        // whole-device transaction lock, then its reservation ledger. Holding
+        // both guards through every cache clear prevents a reserve-after-check
+        // race from dropping buffers underneath an in-flight sweep.
+        let _gpu_transaction = self
+            .gpu_serialize
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reservation = self
+            .intermediate_sweep_reserved_bytes
+            .lock()
+            .map_err(|err| {
+                NyError::InternalError(format!(
+                    "intermediate sweep reservation lock poisoned: {err}"
+                ))
+            })?;
+        if *reservation != 0 {
+            return Err(NyError::UnsupportedOp(
+                "cannot clear the CROWN working set while an intermediate sweep is reserved".into(),
+            ));
+        }
         {
             let mut pool = self.buffer_pool.lock().map_err(|err| {
                 NyError::InternalError(format!("crown working-set lock poisoned: {err}"))
@@ -438,11 +639,73 @@ impl WgpuDevice {
     /// Whether the cooperative CROWN backward deadline has passed. `false` when
     /// unset or on a poisoned lock (fail-open: work runs to completion, the
     /// pre-existing behavior).
+    ///
+    /// Two independent sources compose here (earliest wins by OR):
+    /// - the backend-global slot written through `set_crown_backward_deadline`
+    ///   (exclusively owned by ny-propagate's deadline-lease registry while a
+    ///   lease is live); and
+    /// - the thread-local CALL-LOCAL deadline armed by
+    ///   [`CallLocalCrownDeadlineScope`] for the deadline-bounded ResNet trait
+    ///   entries. Keeping the call-local deadline out of the shared slot means
+    ///   these entries can honor an explicit per-call deadline WITHOUT touching
+    ///   the lease-owned backend slot (whose foreign writes the lease registry
+    ///   cannot detect or compose).
     pub(crate) fn crown_backward_deadline_expired(&self) -> bool {
-        self.crown_backward_deadline
+        let now = std::time::Instant::now();
+        let backend_expired = self
+            .crown_backward_deadline
             .lock()
             .ok()
             .and_then(|slot| *slot)
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            .is_some_and(|deadline| now >= deadline);
+        backend_expired
+            || CALL_LOCAL_CROWN_DEADLINE
+                .with(|slot| slot.get())
+                .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Effective call-local deadline for deadline-aware GPU serialization.
+    /// Kept separate from the backend-global lease-owned deadline.
+    pub(crate) fn call_local_crown_deadline(&self) -> Option<std::time::Instant> {
+        CALL_LOCAL_CROWN_DEADLINE.with(|slot| slot.get())
+    }
+}
+
+thread_local! {
+    /// Call-local CROWN deadline for the deadline-bounded ResNet sound entries
+    /// (`crown_backward_gpu_resnet_sound_{single_row,bounded_rows}_with_deadline`).
+    ///
+    /// Thread-local by design: the resident sound fold polls
+    /// `crown_backward_deadline_expired` between layers ON THE CALLING THREAD,
+    /// so a scope armed here bounds exactly the call that armed it and can
+    /// never race a concurrent lease on the shared backend slot.
+    static CALL_LOCAL_CROWN_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII scope arming the thread-local call-local CROWN deadline.
+///
+/// Nested scopes compose by retaining the EARLIEST active deadline; drop
+/// restores the previous value exactly (LIFO — matching scope nesting).
+#[must_use = "the call-local CROWN deadline is armed only while this scope is alive"]
+pub(crate) struct CallLocalCrownDeadlineScope {
+    previous: Option<std::time::Instant>,
+}
+
+impl CallLocalCrownDeadlineScope {
+    pub(crate) fn arm(deadline: std::time::Instant) -> Self {
+        let previous = CALL_LOCAL_CROWN_DEADLINE.with(|slot| {
+            let previous = slot.get();
+            let effective = previous.map_or(deadline, |active| active.min(deadline));
+            slot.set(Some(effective));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for CallLocalCrownDeadlineScope {
+    fn drop(&mut self) {
+        CALL_LOCAL_CROWN_DEADLINE.with(|slot| slot.set(self.previous));
     }
 }

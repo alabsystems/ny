@@ -17,12 +17,10 @@
 //! 2. **Feed-forward surrogate pipeline** — load `kokoro_duration_predictor_surrogate.onnx`,
 //!    convert to graph, run IBP, apply the proof head, verify positive
 //!    expected durations, then check the production count surface.
-//! 3. **BiLSTM integration pipeline** — build a BiLSTM ONNX model matching the
-//!    real Kokoro architecture (BiLSTM → linear → logits), load through the ONNX
-//!    loader with LSTM unrolling, run IBP, apply the external proof head,
-//!    verify positive expected durations, then check the production count
-//!    surface. This matches the real `kokoro_duration_predictor.onnx`
-//!    interval head once the export is available.
+//! 3. **BiLSTM sequence-output admission** — preserve refusal for the real
+//!    Kokoro-style full-sequence path until lowering implements ONNX's exact
+//!    four-dimensional bidirectional Y layout. Final-state Y_h/Y_c lowering is
+//!    exercised separately by the loader tests.
 //!
 //! Sources:
 //! - designs/2026-03-11-avoice-phase1-onnx-execution.md (section 4)

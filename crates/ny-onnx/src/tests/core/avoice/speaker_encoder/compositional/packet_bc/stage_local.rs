@@ -18,19 +18,56 @@ pub(crate) fn collect_ecapa_stage_local_crown_ibp(
     per_stage_deadline_secs: u64,
     engine: Option<&dyn ny_core::GemmEngine>,
 ) -> Result<GraphCrownIbpBoundsResult, String> {
+    collect_ecapa_stage_local_crown_ibp_with_deadline_policy(
+        stage,
+        input,
+        label,
+        Some(per_stage_deadline_secs),
+        engine,
+    )
+}
+
+/// Explicitly unbounded engine-wiring probe.
+///
+/// A generic [`ny_core::GemmEngine`] has no cooperative deadline contract, so
+/// finite-deadline production propagation correctly refuses it. This entry is
+/// limited to tests that need to prove the stage adapter still threads the
+/// stored engine into an otherwise unbounded CROWN traversal.
+pub(crate) fn collect_ecapa_stage_local_crown_ibp_with_unbounded_engine(
+    stage: &GraphNetwork,
+    input: &BoundedTensor,
+    label: &str,
+    engine: &dyn ny_core::GemmEngine,
+) -> Result<GraphCrownIbpBoundsResult, String> {
+    collect_ecapa_stage_local_crown_ibp_with_deadline_policy(
+        stage,
+        input,
+        label,
+        None,
+        Some(engine),
+    )
+}
+
+fn collect_ecapa_stage_local_crown_ibp_with_deadline_policy(
+    stage: &GraphNetwork,
+    input: &BoundedTensor,
+    label: &str,
+    per_stage_deadline_secs: Option<u64>,
+    engine: Option<&dyn ny_core::GemmEngine>,
+) -> Result<GraphCrownIbpBoundsResult, String> {
     let output_name = stage.output_name().to_string();
     let ibp_bounds = stage
         .collect_node_bounds(input)
         .map_err(|e| format!("{label}: IBP node-bound collection failed: {e}"))?;
     let stage_total_ibp_width: f32 = ibp_bounds.values().map(total_bound_width).sum();
     let ibp_output = output_bounds_from_map(&ibp_bounds, &output_name, label)?;
-    let deadline = Instant::now() + Duration::from_secs(per_stage_deadline_secs);
+    // Preserve the existing policy that each finite budget begins only after
+    // the baseline IBP collection has completed.
+    let deadline =
+        per_stage_deadline_secs.map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let crown_result = stage
         .collect_crown_ibp_bounds_dag_with_precomputed_ibp_and_engine(
-            input,
-            ibp_bounds,
-            Some(deadline),
-            engine,
+            input, ibp_bounds, deadline, engine,
         )
         .map_err(|e| format!("{label}: CROWN-IBP collection failed: {e}"))?;
     let stage_total_tightened_width: f32 =

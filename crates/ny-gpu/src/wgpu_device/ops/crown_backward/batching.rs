@@ -124,7 +124,9 @@ impl WgpuDevice {
 
 #[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
-    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+    use crate::wgpu_device::test_support::{
+        gpu_test_serial_guard, require_device, require_verdict_device,
+    };
     use ny_core::{GpuCrownBackward, GpuCrownLayer, GpuCrownSeed, NyError};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -137,6 +139,7 @@ mod tests {
             bias: None,
             out_features: 2,
             in_features: 2,
+            cert_err: Default::default(),
         }]
     }
 
@@ -192,7 +195,7 @@ mod tests {
     #[test]
     fn sound_resident_walk_honors_cooperative_deadline() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let layers = tiny_linear_layers();
         let seed = identity_seed();
         let (lo, hi) = (vec![-1.0f32, -1.0], vec![1.0f32, 1.0]);

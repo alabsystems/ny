@@ -1,7 +1,9 @@
 # ny Makefile
 # Build, test, benchmark, and profile commands
 
-.PHONY: all build test bench bench-html profile flamegraph clean clean-debug disk-usage test-python test-python-plugin lint lint-tippy lint-clippy fmt fmt-fix deny proofs-check gate gate-fast
+PYTHON ?= python3
+
+.PHONY: all build test bench bench-html profile flamegraph clean clean-debug disk-usage test-python test-python-plugin test-python-tooling lint lint-tippy lint-clippy fmt fmt-fix deny proofs-check gate gate-fast
 
 # Default target
 all: build test
@@ -23,18 +25,24 @@ test-verbose:
 # Python tests (ny-python package)
 # Requires: pip install maturin pytest (or: pip install ".[dev]" from crates/ny-python)
 test-python:
-	@command -v pytest >/dev/null 2>&1 || { echo "pytest not found. Install with: pip install pytest"; exit 1; }
+	@$(PYTHON) -c 'import pytest' >/dev/null 2>&1 || { echo "pytest not importable by $(PYTHON). Install with: $(PYTHON) -m pip install pytest"; exit 1; }
 	@command -v maturin >/dev/null 2>&1 || { echo "maturin not found. Install with: pip install maturin"; exit 1; }
 	@echo "Building ny-python extension with maturin..."
 	cd crates/ny-python && maturin develop --release
 	@echo "Running Python tests..."
-	cd crates/ny-python && python -m pytest tests/ -v
+	cd crates/ny-python && $(PYTHON) -m pytest tests/ -v
 
 # Python plugin tests only (no Rust build needed, pure Python)
 test-python-plugin:
-	@command -v pytest >/dev/null 2>&1 || { echo "pytest not found. Install with: pip install pytest"; exit 1; }
+	@$(PYTHON) -c 'import pytest' >/dev/null 2>&1 || { echo "pytest not importable by $(PYTHON). Install with: $(PYTHON) -m pip install pytest"; exit 1; }
 	@echo "Running ny pytest plugin tests..."
-	cd crates/ny-python && python -m pytest ny_pytest/tests/ -v
+	cd crates/ny-python && $(PYTHON) -m pytest ny_pytest/tests/ -v
+
+# Repository Python/shell tooling tests (no extension build needed).
+test-python-tooling:
+	@env -u PYTHONPATH -u PYTHONHOME PYTHONNOUSERSITE=1 $(PYTHON) -s -c 'import numpy, onnx, onnxruntime, pytest, sys, yaml; __import__("tomllib" if sys.version_info >= (3, 11) else "tomli")' >/dev/null 2>&1 || { echo "Python tooling dependencies are not importable in isolated mode by $(PYTHON). Use the README virtualenv setup, install requirements.txt there, and invoke make with PYTHON set to that interpreter."; exit 1; }
+	env -u PYTHONPATH -u PYTHONHOME PYTHONNOUSERSITE=1 $(PYTHON) -s -m pytest tests/ -q
+	NY_TEST_PYTHON="$(PYTHON)" cargo test --locked -p ny-test-utils --features python-tools --tests
 
 # Benchmarking with Criterion
 bench:
@@ -86,12 +94,12 @@ perf-check:
 	cargo build --release --example profile -p ny-propagate
 	./target/release/examples/profile
 
-# Lint gate (default: stock clippy).
+# Lint gate (formatting + stock clippy).
 #   lint-tippy  - tippy, the Trust toolchain's lint tool (newer clippy base than
 #                 the pinned stock toolchain, so it sees lints stock clippy doesn't);
 #                 optional — run separately, skips when the toolchain is absent
 #   lint-clippy - stock cargo clippy on the pinned toolchain (rust-toolchain.toml)
-lint: lint-clippy
+lint: fmt lint-clippy
 
 lint-clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
@@ -128,21 +136,23 @@ lint-tippy:
 # checks the audits keep re-zeroing by hand; this is the one local command
 # that runs them all). Per-check PASS/FAIL scoreboard, nonzero exit on any
 # FAIL. See scripts/gate.sh --help for the check list and --only <letter>.
-#   gate      - full gate: clippy drift + ny-cert/ny-cli/ny-propagate test
-#               slices + harness pytest + submission-packaging invariants
-#   gate-fast - clippy drift + ny-cert + packer unit tests only
+#   gate      - full gate: Rust hygiene + ny-cert/ny-cli/ny-propagate test
+#               slices + harness/package pytest + submission-packaging invariants
+#   gate-fast - Rust hygiene + ny-cert + packer unit tests only
 gate:
 	scripts/gate.sh
 
 gate-fast:
 	scripts/gate.sh --fast
 
-# RUSTSEC advisory + license gate (see deny.toml)
+# RUSTSEC advisory, dependency-ban/source, and license gate (see deny.toml)
 # Install: cargo install cargo-deny
 deny:
 	@command -v cargo-deny >/dev/null 2>&1 || { echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }
 	cargo deny check advisories
+	cargo deny check bans
 	cargo deny check licenses
+	cargo deny check sources
 
 # Type-check the Kani proof harness. It is workspace-excluded and carries its own
 # manifest, so no workspace command reaches it and it rots silently otherwise.
@@ -208,6 +218,7 @@ help:
 	@echo "  make test-verbose      - Run Rust tests with output"
 	@echo "  make test-python       - Build ny-python and run Python tests"
 	@echo "  make test-python-plugin - Run pytest plugin tests (no build)"
+	@echo "  make test-python-tooling - Run repository Python/shell tooling tests"
 	@echo ""
 	@echo "Benchmarking:"
 	@echo "  make bench        - Run all Criterion benchmarks"
@@ -227,11 +238,11 @@ help:
 	@echo ""
 	@echo "Tools:"
 	@echo "  make install-tools - Install samply, flamegraph, criterion"
-	@echo "  make gate         - First-party drift gate: clippy + test slices + submission invariants (scoreboard)"
-	@echo "  make gate-fast    - Fast drift gate: clippy + ny-cert + packer unit tests"
-	@echo "  make lint         - Lint gate (stock clippy)"
+	@echo "  make gate         - First-party drift gate: Rust/Python hygiene + test slices + submission invariants"
+	@echo "  make gate-fast    - Fast drift gate: formatting + clippy + ny-cert + packer unit tests"
+	@echo "  make lint         - Rust formatting + stock clippy gate"
 	@echo "  make lint-tippy   - Trust toolchain tippy gate (requires stage2; set TRUST_STAGE2 if needed)"
 	@echo "  make lint-clippy  - Stock cargo clippy only"
 	@echo "  make fmt          - Check formatting"
-	@echo "  make deny         - RUSTSEC advisory + license gate (cargo-deny)"
+	@echo "  make deny         - Advisory, dependency/source, and license gate (cargo-deny)"
 	@echo "  make proofs-check - Type-check the Kani proof harness"

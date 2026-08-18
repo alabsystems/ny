@@ -97,6 +97,62 @@ fn dfl_linear_envelope_tightens_lower_bound() {
 }
 
 #[test]
+fn dfl_deadline_none_is_exact_legacy_envelope_path() {
+    let (graph, input) = dfl_linear_graph(16, -2.0, 2.0);
+    let expected = graph
+        .propagate_ibp_with_engine(&input, None)
+        .expect("legacy DFL IBP");
+    let actual = graph
+        .propagate_ibp_with_engine_and_deadline(&input, None, None)
+        .expect("deadline=None DFL IBP");
+
+    assert_eq!(actual.lower(), expected.lower());
+    assert_eq!(actual.upper(), expected.upper());
+    assert!(
+        actual.upper()[[0]] <= 15.0 + 1e-3,
+        "deadline=None must retain the historical DFL tightening"
+    );
+}
+
+#[test]
+fn dfl_finite_deadline_refuses_optional_unpolled_envelope() {
+    let k = 16;
+    let (graph, input) = dfl_linear_graph(k, -2.0, 2.0);
+    let legacy = graph.propagate_ibp(&input).expect("legacy DFL IBP");
+    let finite = graph
+        .propagate_ibp_with_engine_and_deadline(
+            &input,
+            None,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect("live finite-deadline DFL IBP");
+
+    assert!(
+        legacy.upper()[[0]] <= (k - 1) as f32 + 1e-3,
+        "legacy path should establish that the DFL envelope is applicable"
+    );
+    assert!(
+        finite.upper()[[0]] > (k - 1) as f32 + 1e-3,
+        "finite authority must return the untightened box instead of entering \
+         unpolled DFL postprocessing"
+    );
+    let feasible_equal_logits_decode = (k - 1) as f32 / 2.0;
+    assert!(
+        finite.lower()[[0]] <= feasible_equal_logits_decode
+            && finite.upper()[[0]] >= feasible_equal_logits_decode,
+        "refusing an optional tightening must retain a sound box"
+    );
+
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let error = graph
+        .propagate_ibp_with_engine_and_deadline(&input, None, Some(expired))
+        .expect_err("expired finite DFL graph propagation must fail");
+    assert!(error.is_deadline_exceeded());
+}
+
+#[test]
 fn dfl_linear_envelope_is_sound_vs_sampled_simplex() {
     // Soundness: every feasible decode value (over the full simplex of softmax
     // outputs, since with wide logits softmax can approach any vertex) must lie

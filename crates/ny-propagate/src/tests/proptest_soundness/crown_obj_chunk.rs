@@ -154,8 +154,10 @@ proptest! {
         out_c in 1usize..=3,
         kh in 1usize..=3,
         kw in 1usize..=3,
-        in_h in 4usize..=8,
-        in_w in 4usize..=8,
+        // Keep every generated output at least 2x2, so C=1 actually streams
+        // more than one objective without rejecting cases at runtime.
+        in_h in 5usize..=8,
+        in_w in 5usize..=8,
         stride_h in 1usize..=2,
         stride_w in 1usize..=2,
         pad_h in 0usize..=1,
@@ -166,24 +168,19 @@ proptest! {
     ) {
         let padded_h = in_h + 2 * pad_h;
         let padded_w = in_w + 2 * pad_w;
-        prop_assume!(padded_h >= kh && padded_w >= kw);
         let out_h = (padded_h - kh) / stride_h + 1;
         let out_w = (padded_w - kw) / stride_w + 1;
-        prop_assume!(out_h >= 1 && out_w >= 1);
 
         let in_dim = in_c * in_h * in_w;
-        let out_dim = out_c * out_h * out_w;
-        // Need more than one chunk to actually stream.
-        prop_assume!(out_dim >= 2);
+        debug_assert!(out_c * out_h * out_w >= 4);
 
         let kernel = make_kernel(out_c, in_c, kh, kw, seed);
         let bias = if use_bias { Some(make_bias(out_c, seed)) } else { None };
-        let conv = match Conv2dLayer::with_input_shape(
+        let conv = Conv2dLayer::with_input_shape(
             kernel, bias, (stride_h, stride_w), (pad_h, pad_w), in_h, in_w,
-        ) {
-            Ok(c) => c,
-            Err(_) => return Ok(()),
-        };
+        ).map_err(|e| TestCaseError::fail(format!(
+            "generated valid Conv2d configuration was rejected: {e}"
+        )))?;
         let graph = build_conv_relu_graph(conv, use_patches);
 
         let in_shape = [in_c, in_h, in_w];

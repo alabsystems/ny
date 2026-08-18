@@ -385,3 +385,8 @@ impl SoftsignLayer {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn audit_softsign_relax(l: f32, u: f32) -> LinearRelaxation {
+    softsign_linear_relaxation(l, u)
+}

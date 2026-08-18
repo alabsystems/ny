@@ -9,6 +9,16 @@ use ny_tensor::{next_down_f32, next_up_f32};
 use super::compose;
 use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
 
+/// Sparse 4D/5D activation composition is not authoritative until it emits a
+/// coefficient-error receipt for its own rounded products.
+#[inline]
+fn require_sparse_coeff_error_transport() -> Result<()> {
+    Err(NyError::UnsupportedConfiguration(
+        "sparse Patches activation requires the unimplemented 4D/5D coefficient-error channel"
+            .into(),
+    ))
+}
+
 /// Sparse patches backward for element-wise activations.
 ///
 /// Iterates only over unstable output positions (from `unstable_idx`)
@@ -30,9 +40,36 @@ pub(super) fn backward_patches_sparse(
         .unstable_idx
         .as_ref()
         .ok_or_else(|| NyError::InternalError("backward_patches_sparse: no unstable_idx".into()))?;
+    let upper_idx = upper_a_data.unstable_idx.as_ref().ok_or_else(|| {
+        NyError::InvalidSpec("sparse Patches requires an upper unstable-index map".into())
+    })?;
+    lower_a_data.validate_common_geometry(upper_a_data)?;
+    let affine_geometry = lower_a_data
+        .geometry
+        .require_affine("sparse activation Patches backward")?;
+    if idx.channels != upper_idx.channels
+        || idx.heights != upper_idx.heights
+        || idx.widths != upper_idx.widths
+    {
+        return Err(NyError::InvalidSpec(
+            "sparse Patches requires one authenticated lower/upper unstable-index map".into(),
+        ));
+    }
     let (_, in_h, in_w) = input_shape;
     let n = idx.len();
     let shape = lower_patches.shape();
+    if upper_patches.shape() != shape {
+        return Err(NyError::ShapeMismatch {
+            expected: shape.to_vec(),
+            got: upper_patches.shape().to_vec(),
+        });
+    }
+    // `compose_lower`/`compose_upper` below round every stored product. Even an
+    // exact incoming carrier therefore needs a new intrinsic error receipt;
+    // emitting `coeff_err: None` would be a false-proof gap. Keep the reviewed
+    // implementation body available for the eventual error-channel work, but
+    // refuse before arithmetic today.
+    require_sparse_coeff_error_transport()?;
     let explicit_rows = match shape.len() {
         4 => {
             if shape[0] != n {
@@ -65,8 +102,8 @@ pub(super) fn backward_patches_sparse(
         (shape[1], shape[2], shape[3])
     };
 
-    let (sh, sw) = lower_a_data.stride;
-    let (pad_left, _pad_right, pad_top, _pad_bottom) = lower_a_data.padding;
+    let (sh, sw) = affine_geometry.stride();
+    let (pad_left, _pad_right, pad_top, _pad_bottom) = affine_geometry.padding();
 
     let mut new_lower_patches = ArrayD::<f32>::zeros(lower_patches.raw_dim());
     let mut new_upper_patches = ArrayD::<f32>::zeros(upper_patches.raw_dim());
@@ -219,8 +256,7 @@ pub(super) fn backward_patches_sparse(
         lower_a: PatchesData {
             coeff_err: None,
             patches: Some(new_lower_patches),
-            stride: lower_a_data.stride,
-            padding: lower_a_data.padding,
+            geometry: lower_a_data.geometry.clone(),
             identity: false,
             output_shape: lower_a_data.output_shape,
             input_shape: lower_a_data.input_shape,
@@ -230,8 +266,7 @@ pub(super) fn backward_patches_sparse(
         upper_a: PatchesData {
             coeff_err: None,
             patches: Some(new_upper_patches),
-            stride: upper_a_data.stride,
-            padding: upper_a_data.padding,
+            geometry: upper_a_data.geometry.clone(),
             identity: false,
             output_shape: upper_a_data.output_shape,
             input_shape: upper_a_data.input_shape,

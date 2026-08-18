@@ -5,7 +5,6 @@
 //! Helper utilities for α-CROWN propagation.
 //!
 //! Contains:
-//! - [`bounds_infeasible`]: Check for NaN/Inf/invalid bounds
 //! - [`clamp_inverted_best_bounds`]: Fix cross-iteration elementwise merge inversions
 //! - [`GraphNetwork::relu_preactivation_bounds`]: Typed pre-activation lookup (no input fallback)
 
@@ -17,15 +16,6 @@ use ny_tensor::{repair_inverted_bounds_nd, BoundedTensor, InversionRepair};
 use tracing::{error, warn};
 
 use crate::network::core::{GraphNetwork, NETWORK_INPUT};
-
-/// Check if bounds contain any infeasible elements (NaN, Inf, or lower > upper).
-pub(crate) fn bounds_infeasible(bounds: &BoundedTensor) -> bool {
-    bounds
-        .lower()
-        .iter()
-        .zip(bounds.upper().iter())
-        .any(|(&l, &u)| !l.is_finite() || !u.is_finite() || l > u)
-}
 
 /// Widen inverted intervals to `[-inf, +inf]` in elementwise best-bound arrays.
 ///

@@ -4,6 +4,7 @@
 
 //! Sequential/model-level quantization analysis.
 
+use crate::analysis_error::validate_analysis_epsilon;
 use crate::{load_onnx, OnnxModel};
 use ny_propagate::{BoundPropagation, GraphNetwork};
 use ny_tensor::BoundedTensor;
@@ -31,6 +32,8 @@ pub fn analyze_quantization_model(
     model: &OnnxModel,
     config: &QuantizeConfig,
 ) -> Result<QuantizeResult, QuantizeError> {
+    validate_analysis_epsilon("quantize", config.epsilon)?;
+
     let input = if let Some(ref inp) = config.input {
         inp.clone()
     } else {

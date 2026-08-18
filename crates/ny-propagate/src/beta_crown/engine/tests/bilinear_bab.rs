@@ -112,7 +112,8 @@ fn test_bilinear_crown_bab_splitting_integration() {
     assert!(
         !matches!(
             result.result,
-            BabVerificationStatus::Violated { .. } | BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::Violated { .. }
+                | BabVerificationStatus::PotentialViolation { .. }
         ),
         "sum(QK^T) >= -0.5 should hold (true min 0): {:?}",
         result.result

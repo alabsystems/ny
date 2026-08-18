@@ -89,11 +89,8 @@ const VALID_STATUSES: [&str; 5] = [
 /// All are legitimate verification outcomes, not errors.
 const VALID_EXIT_CODES: [i32; 4] = [0, 1, 2, 3];
 
-/// Run `ny beta-crown` with the given args and return parsed JSON output.
-///
-/// Accepts exit codes 0-3 as valid verification outcomes (verified, violated,
-/// unknown, timeout). Only truly unexpected exit codes (signal kills, crashes)
-/// are treated as failures.
+/// Run `ny beta-crown` with the given args and return parsed JSON output,
+/// asserting that the process code agrees with the machine-readable verdict.
 fn run_beta_crown_json(args: &[&str]) -> serde_json::Value {
     run_beta_crown_json_env(args, &[])
 }
@@ -116,9 +113,24 @@ fn run_beta_crown_json_env(args: &[&str], envs: &[(&str, &str)]) -> serde_json::
         "ny beta-crown exited with unexpected code {exit_code}.\nstdout: {stdout}\nstderr: {stderr}"
     );
 
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!("failed to parse JSON output: {e}\nstdout: {stdout}\nstderr: {stderr}")
-    })
+    });
+    let status = json["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("JSON outcome lacks status: {json}"));
+    let expected_exit_code = match status {
+        "verified" => 0,
+        "violated" => 1,
+        "potential_violation" | "unknown" => 2,
+        "timeout" => 3,
+        other => panic!("unexpected beta-crown status {other:?}: {json}"),
+    };
+    assert_eq!(
+        exit_code, expected_exit_code,
+        "beta-crown status/exit mismatch.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    json
 }
 
 /// Assert the JSON contains a valid status and core numeric fields.
@@ -145,7 +157,12 @@ fn assert_core_json_fields(json: &serde_json::Value) {
 /// Uses acasxu_1_1.nnet (5 inputs, 5 outputs, 6 hidden layers) with property 2
 /// (relational constraints: Y_1..Y_4 <= Y_0). This is the standard VNN-COMP
 /// verification task.
-#[ntest::timeout(60000)]
+///
+/// Keep the domain cap well below the wall-clock timeout: this is a functional
+/// CLI/JSON contract test, not a throughput benchmark. A cap of two still
+/// exercises a real BaB split, while the former cap of 200 raced the 30-second
+/// deadline and nondeterministically returned either `unknown` or `timeout`.
+#[ntest::timeout(90000)]
 #[test]
 fn test_beta_crown_nnet_with_vnnlib_json() {
     let model_path = test_models_dir().join("acasxu_1_1.nnet");
@@ -159,9 +176,9 @@ fn test_beta_crown_nnet_with_vnnlib_json() {
         "--property",
         property_path.to_str().expect("property path is UTF-8"),
         "--timeout",
-        "30",
+        "45",
         "--max-domains",
-        "200",
+        "2",
         "--no-alpha",
         "--complete-verifier",
         "bab",
@@ -174,7 +191,24 @@ fn test_beta_crown_nnet_with_vnnlib_json() {
             .as_str()
             .expect("JSON output must contain 'status' string field"),
         "unknown",
-        "known ACAS Xu integration case (1_1 + prop2) should remain unknown under max-domains=200 and timeout=30"
+        "the bounded ACAS Xu run should stop inconclusively at its domain cap"
+    );
+    assert!(
+        json["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("Domain limit 2")),
+        "the functional test must finish through the domain-limit path, not hide a timeout: {json}"
+    );
+    assert_eq!(
+        json["domains_explored"].as_u64(),
+        Some(2),
+        "the bounded run must consume exactly its two-domain cap: {json}"
+    );
+    assert!(
+        json["max_depth_reached"]
+            .as_u64()
+            .is_some_and(|depth| depth >= 1),
+        "the capped run must exercise at least one real BaB split: {json}"
     );
     assert!(
         json["threshold"].is_number(),

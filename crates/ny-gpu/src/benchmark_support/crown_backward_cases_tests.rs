@@ -18,12 +18,12 @@ use std::sync::{
     Arc, Mutex, MutexGuard,
 };
 
-fn require_device() -> Arc<crate::WgpuDevice> {
-    match crate::WgpuDevice::new() {
+fn require_verdict_device() -> Arc<crate::WgpuDevice> {
+    match crate::WgpuDevice::new_for_verdict(crate::WgpuVerdictRequest::new()) {
         Ok(device) => Arc::new(device),
         Err(error) => panic!(
-            "GPU required but not available: {error}. \
-             Run this #3813 parity regression on a GPU-capable host."
+            "verdict-qualified GPU required but qualification failed: {error}. \
+             Run this #3813 parity regression on a conformant GPU host."
         ),
     }
 }
@@ -32,19 +32,26 @@ fn gpu_test_serial_guard() -> MutexGuard<'static, ()> {
     static GPU_TEST_MUTEX: Mutex<()> = Mutex::new(());
     GPU_TEST_MUTEX
         .lock()
-        .expect("GPU test serialization lock should not be poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Clone)]
 struct CountingWgpuEngine {
     device: Arc<crate::WgpuDevice>,
-    /// Fused `conv_transpose_2d` (GEMM + col2im) GPU calls.
+    /// Successful fused `conv_transpose_2d` (GEMM + col2im) GPU calls.
     fused_calls: Arc<AtomicUsize>,
-    /// Seeded GPU CROWN backward suffix calls (`crown_backward_gpu_seeded`).
+    /// Successful, production-accepted fast GPU CROWN backward calls whose
+    /// extracted layer list contains a Conv2d.
     /// The graph planner may route a GPU-extractable unary conv chain through
     /// the GPU suffix instead of per-node `conv_transpose_2d`; both are valid
     /// GPU conv acceleration paths for the #3813 regression.
     suffix_calls: Arc<AtomicUsize>,
+    /// Successful, production-accepted sound GPU CROWN backward calls whose
+    /// extracted layer list contains a Conv2d.
+    sound_calls: Arc<AtomicUsize>,
+    /// Successful, production-accepted sound seeded GPU CROWN backward calls
+    /// whose extracted layer list contains a Conv2d.
+    sound_seeded_calls: Arc<AtomicUsize>,
 }
 
 impl CountingWgpuEngine {
@@ -53,6 +60,8 @@ impl CountingWgpuEngine {
             device,
             fused_calls: Arc::new(AtomicUsize::new(0)),
             suffix_calls: Arc::new(AtomicUsize::new(0)),
+            sound_calls: Arc::new(AtomicUsize::new(0)),
+            sound_seeded_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -60,11 +69,27 @@ impl CountingWgpuEngine {
         self.fused_calls.load(Ordering::SeqCst)
     }
 
-    /// Total GPU conv-acceleration calls: fused `conv_transpose_2d` plus
-    /// seeded GPU CROWN suffix dispatches. Either path means the conv-bearing
-    /// backward chain ran on the GPU rather than the CPU fallback.
+    fn sound_crown_calls(&self) -> usize {
+        self.sound_calls.load(Ordering::SeqCst) + self.sound_seeded_calls.load(Ordering::SeqCst)
+    }
+
+    fn production_accepts_conv_crown(layers: &[GpuCrownLayer], result: &GpuCrownResult) -> bool {
+        layers
+            .iter()
+            .any(|layer| matches!(layer, GpuCrownLayer::Conv2d { .. }))
+            && !result
+                .lower_bounds
+                .iter()
+                .chain(result.upper_bounds.iter())
+                .any(|value| value.is_nan())
+    }
+
+    /// Total successful GPU conv-acceleration calls: fused `conv_transpose_2d`
+    /// plus fast or sound GPU CROWN suffix dispatches. Either path means the
+    /// conv-bearing backward chain completed on the GPU rather than falling
+    /// back to the CPU.
     fn gpu_conv_calls(&self) -> usize {
-        self.fused_calls() + self.suffix_calls.load(Ordering::SeqCst)
+        self.fused_calls() + self.suffix_calls.load(Ordering::SeqCst) + self.sound_crown_calls()
     }
 }
 
@@ -86,19 +111,32 @@ impl GemmEngine for CountingWgpuEngine {
         weight_col: &[f32],
         params: &ConvTranspose2dParams,
     ) -> ny_core::Result<Vec<f32>> {
+        let result = self
+            .device
+            .conv_transpose_2d(a_reshaped, weight_col, params)?;
         self.fused_calls.fetch_add(1, Ordering::SeqCst);
-        self.device
-            .conv_transpose_2d(a_reshaped, weight_col, params)
+        Ok(result)
     }
 
     fn as_gpu_crown_backward(&self) -> Option<&dyn GpuCrownBackward> {
-        // Expose `self` so seeded GPU CROWN suffix dispatches are counted,
+        // Expose `self` so fast and sound GPU CROWN dispatches are counted,
         // then delegate the actual work to the device.
         self.device.as_gpu_crown_backward().map(|_| self as _)
     }
 }
 
 impl GpuCrownBackward for CountingWgpuEngine {
+    fn honors_crown_backward_deadline(&self) -> bool {
+        true
+    }
+
+    fn set_crown_backward_deadline(&self, deadline: Option<std::time::Instant>) {
+        self.device
+            .as_gpu_crown_backward()
+            .expect("device exposes GpuCrownBackward")
+            .set_crown_backward_deadline(deadline);
+    }
+
     fn crown_backward_gpu(
         &self,
         layers: &[GpuCrownLayer],
@@ -107,12 +145,15 @@ impl GpuCrownBackward for CountingWgpuEngine {
         input_lower: &[f32],
         input_upper: &[f32],
     ) -> ny_core::Result<GpuCrownResult> {
-        self.suffix_calls.fetch_add(1, Ordering::SeqCst);
         let gpu = self
             .device
             .as_gpu_crown_backward()
             .expect("device exposes GpuCrownBackward");
-        gpu.crown_backward_gpu(layers, spec, num_specs, input_lower, input_upper)
+        let result = gpu.crown_backward_gpu(layers, spec, num_specs, input_lower, input_upper)?;
+        if Self::production_accepts_conv_crown(layers, &result) {
+            self.suffix_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(result)
     }
 
     fn crown_backward_gpu_seeded(
@@ -122,12 +163,59 @@ impl GpuCrownBackward for CountingWgpuEngine {
         input_lower: &[f32],
         input_upper: &[f32],
     ) -> ny_core::Result<GpuCrownResult> {
-        self.suffix_calls.fetch_add(1, Ordering::SeqCst);
         let gpu = self
             .device
             .as_gpu_crown_backward()
             .expect("device exposes GpuCrownBackward");
-        gpu.crown_backward_gpu_seeded(layers, seed, input_lower, input_upper)
+        let result = gpu.crown_backward_gpu_seeded(layers, seed, input_lower, input_upper)?;
+        if Self::production_accepts_conv_crown(layers, &result) {
+            self.suffix_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+
+    fn crown_backward_gpu_sound(
+        &self,
+        layers: &[GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> ny_core::Result<GpuCrownResult> {
+        let gpu = self
+            .device
+            .as_gpu_crown_backward()
+            .expect("device exposes GpuCrownBackward");
+        let result =
+            gpu.crown_backward_gpu_sound(layers, spec, num_specs, input_lower, input_upper)?;
+        if Self::production_accepts_conv_crown(layers, &result) {
+            self.sound_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+
+    fn provides_sound_gpu_crown(&self) -> bool {
+        self.device
+            .as_gpu_crown_backward()
+            .is_some_and(|gpu| gpu.provides_sound_gpu_crown())
+    }
+
+    fn crown_backward_gpu_seeded_sound(
+        &self,
+        layers: &[GpuCrownLayer],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> ny_core::Result<GpuCrownResult> {
+        let gpu = self
+            .device
+            .as_gpu_crown_backward()
+            .expect("device exposes GpuCrownBackward");
+        let result = gpu.crown_backward_gpu_seeded_sound(layers, seed, input_lower, input_upper)?;
+        if Self::production_accepts_conv_crown(layers, &result) {
+            self.sound_seeded_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(result)
     }
 }
 
@@ -331,10 +419,14 @@ fn test_graph_crown_with_naive_engine_matches_sequential_bounds_for_small_case()
 }
 
 #[test]
-fn test_graph_crown_with_wgpu_engine_uses_fused_conv_transpose_and_matches_cpu_bounds() {
+fn test_graph_crown_qualified_wgpu_resident_conv_runs_soundly() {
     let _gpu_serial = gpu_test_serial_guard();
-    let device = require_device();
+    let device = require_verdict_device();
     let engine = CountingWgpuEngine::new(device);
+    assert!(
+        engine.provides_sound_gpu_crown() && engine.as_gpu_crown_backward().is_some(),
+        "gpu-tests requires an explicitly qualified WGPU authority ladder"
+    );
     let (mut graph, input) = build_small_conv_graph_case();
     graph.set_use_patches_mode(false);
 
@@ -350,13 +442,18 @@ fn test_graph_crown_with_wgpu_engine_uses_fused_conv_transpose_and_matches_cpu_b
         1e-2,
         "small_conv_graph_crown_wgpu_vs_cpu_graph",
     );
-    // GPU conv must be accelerated: either the fused conv_transpose_2d op or the
-    // seeded GPU CROWN suffix (which runs the conv chain on GPU). Both are valid
-    // for this GPU-backed conv category (#3813); the planner may select either.
+    // The reviewed resident route now carries its taint word through Conv2d,
+    // so a qualified device must do non-vacuous sound GPU work. This assertion
+    // deliberately excludes an accidental all-CPU result that merely matches
+    // the baseline. Host-side Conv and segment-resident streams remain separate
+    // typed refusals; this graph uses the admitted whole-resident fold.
+    assert!(
+        engine.sound_crown_calls() > 0,
+        "qualified graph CROWN did not exercise the admitted resident Conv route"
+    );
     assert!(
         engine.gpu_conv_calls() > 0,
-        "#3813 regression: graph CROWN small conv case never used a GPU conv path \
-         (fused conv_transpose_2d or seeded GPU CROWN suffix)"
+        "qualified graph CROWN completed without any GPU Conv work"
     );
     // Soundness: the GPU bound must enclose the true network output everywhere
     // in the input box — never tighter than the concrete minimum/maximum.
@@ -370,10 +467,14 @@ fn test_graph_crown_with_wgpu_engine_uses_fused_conv_transpose_and_matches_cpu_b
 }
 
 #[test]
-fn test_graph_crown_ibp_collection_with_wgpu_engine_uses_fused_conv_transpose() {
+fn test_graph_crown_ibp_qualified_wgpu_resident_conv_runs_soundly() {
     let _gpu_serial = gpu_test_serial_guard();
-    let device = require_device();
+    let device = require_verdict_device();
     let engine = CountingWgpuEngine::new(device);
+    assert!(
+        engine.provides_sound_gpu_crown() && engine.as_gpu_crown_backward().is_some(),
+        "gpu-tests requires an explicitly qualified WGPU authority ladder"
+    );
     let (mut graph, input) = build_small_conv_graph_case();
     graph.set_use_patches_mode(false);
     let ibp_bounds = graph
@@ -398,13 +499,15 @@ fn test_graph_crown_ibp_collection_with_wgpu_engine_uses_fused_conv_transpose() 
         )
         .expect("wgpu graph CROWN-IBP collection should succeed on the small conv case");
     assert_node_bounds_close(&with_engine.bounds, &baseline.bounds, 1e-2);
-    // GPU conv must be accelerated via the fused conv_transpose_2d op or the
-    // seeded GPU CROWN suffix; the CROWN-IBP collector may route the conv chain
-    // through either (#3813).
+    // As above, equality with CPU is not enough: the qualified CROWN-IBP lane
+    // must actually enter the reviewed resident Conv route.
+    assert!(
+        engine.sound_crown_calls() > 0,
+        "qualified graph CROWN-IBP did not exercise the admitted resident Conv route"
+    );
     assert!(
         engine.gpu_conv_calls() > 0,
-        "#3813 regression: graph CROWN-IBP small conv case never used a GPU conv path \
-         (fused conv_transpose_2d or seeded GPU CROWN suffix)"
+        "qualified graph CROWN-IBP completed without any GPU Conv work"
     );
     // Soundness: every collected node bound must enclose the true node output
     // sampled densely across the input box.

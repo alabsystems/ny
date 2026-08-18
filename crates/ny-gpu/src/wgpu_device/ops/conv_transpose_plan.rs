@@ -2,6 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+// Retained for crate-internal `gpu-tests` diagnostics while WGPU is quarantined
+// from the public verdict-bearing engine seam.
+#![allow(dead_code)]
+
 //! GPU-resident plan cache for the fused conv_transpose_2d op (#perf dispatch wall).
 //!
 //! The fused `conv_transpose_2d` (GEMM + col2im, see `conv_transpose.rs`) is
@@ -183,7 +187,46 @@ pub(crate) struct PreparedConvTransposePlan {
     a_len: usize,
 }
 
+impl PreparedConvTransposePlan {
+    fn retained_device_bytes(&self) -> Result<usize> {
+        let mut total = 0usize;
+        for (label, buffer) in [
+            ("weight", &self.w_buf),
+            ("gemm_params", &self.gemm_params_buf),
+            ("col2im_params", &self.col2im_params_buf),
+            ("input", &self.a_buf),
+            ("gemm_output", &self.gemm_out_buf),
+            ("destination", &self.dst_buf),
+            ("staging", &self.staging_buf),
+        ] {
+            let bytes = usize::try_from(buffer.size()).map_err(|_| {
+                NyError::InternalError(format!(
+                    "conv_transpose plan buffer `{label}` does not fit in usize"
+                ))
+            })?;
+            total = total.checked_add(bytes).ok_or_else(|| {
+                NyError::InternalError("conv_transpose plan byte count overflow".into())
+            })?;
+        }
+        Ok(total)
+    }
+}
+
 impl WgpuDevice {
+    /// Checked retained bytes across every cached fused conv-transpose plan.
+    pub(crate) fn conv_transpose_plan_cache_bytes(&self) -> Result<usize> {
+        let cache = self.conv_transpose_plan_cache.lock().map_err(|err| {
+            NyError::InternalError(format!("conv_transpose plan cache lock poisoned: {err}"))
+        })?;
+        cache.values().try_fold(0usize, |total, plan| {
+            total
+                .checked_add(plan.retained_device_bytes()?)
+                .ok_or_else(|| {
+                    NyError::InternalError("conv_transpose plan cache byte count overflow".into())
+                })
+        })
+    }
+
     /// Clear the conv_transpose plan cache, freeing GPU-resident weight buffers
     /// and the retained weight `Arc`s.
     ///

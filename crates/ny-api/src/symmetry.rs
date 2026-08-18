@@ -36,7 +36,9 @@
 //! the concrete witness point.
 
 use ndarray::{Array1, Array2};
-use ny_core::{Bound, NyError, Result, VerificationResult, VerificationSpec};
+use ny_core::{
+    Bound, NyError, Result, VerificationResult, VerificationSoundnessMode, VerificationSpec,
+};
 use ny_propagate::layers::LinearLayer;
 use ny_propagate::{
     build_difference_network, GraphNetwork, GraphNode, Layer, PropagationConfig, PropagationMethod,
@@ -131,8 +133,45 @@ impl FiniteRotationOutcome {
 /// ny-groundtruth witness search).
 const MAX_WITNESS_POINTS: usize = 20_000;
 
+/// Resource ceiling for the dense wiring matrix (64 MiB of `f32` values).
+/// Permutations and block rotations are sparse conceptually; until the graph
+/// has a sparse wiring layer, reject dimensions that would amplify a compact
+/// request into an unbounded quadratic allocation.
+const MAX_DENSE_WIRING_ELEMENTS: usize = 16 * 1024 * 1024;
+
 /// Name of the prepended wiring node inside the transformed copy of `f`.
 const WIRE_NODE: &str = "sym_wire";
+
+fn dense_wiring_elements(dimension: usize) -> Result<usize> {
+    let elements = dimension.checked_mul(dimension).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "dense symmetry wiring size overflows usize: {dimension} × {dimension}"
+        ))
+    })?;
+    if elements > MAX_DENSE_WIRING_ELEMENTS {
+        return Err(NyError::InvalidSpec(format!(
+            "dense symmetry wiring requires {elements} elements, exceeding the \
+             {MAX_DENSE_WIRING_ELEMENTS}-element resource limit"
+        )));
+    }
+    Ok(elements)
+}
+
+fn zeroed_square_wiring(dimension: usize) -> Result<Array2<f32>> {
+    let elements = dense_wiring_elements(dimension)?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(elements).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "dense symmetry wiring with {elements} elements cannot be allocated: {error}"
+        ))
+    })?;
+    values.resize(elements, 0.0);
+    Array2::from_shape_vec((dimension, dimension), values).map_err(|error| {
+        NyError::InternalError(format!(
+            "validated dense symmetry wiring shape was rejected: {error}"
+        ))
+    })
+}
 
 /// Lift a permutation of **points** to the flat input-coordinate permutation
 /// for a point cloud stored as `n` consecutive blocks of `point_dim`
@@ -141,7 +180,8 @@ const WIRE_NODE: &str = "sym_wire";
 ///
 /// # Errors
 ///
-/// Rejects `point_dim == 0` and slices that are not permutations.
+/// Rejects `point_dim == 0`, slices that are not permutations, and flattened
+/// sizes that overflow or cannot be represented by a `Vec`.
 pub fn block_permutation(point_permutation: &[usize], point_dim: usize) -> Result<Vec<usize>> {
     if point_dim == 0 {
         return Err(NyError::InvalidSpec(
@@ -149,10 +189,27 @@ pub fn block_permutation(point_permutation: &[usize], point_dim: usize) -> Resul
         ));
     }
     validate_permutation(point_permutation)?;
-    let mut flat = Vec::with_capacity(point_permutation.len() * point_dim);
+    let flat_len = point_permutation
+        .len()
+        .checked_mul(point_dim)
+        .ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "flattened permutation size overflows usize: {} points × {point_dim} coordinates",
+                point_permutation.len()
+            ))
+        })?;
+    let mut flat = Vec::new();
+    flat.try_reserve_exact(flat_len).map_err(|e| {
+        NyError::InvalidSpec(format!(
+            "flattened permutation with {flat_len} entries cannot be represented: {e}"
+        ))
+    })?;
     for &src_point in point_permutation {
+        let base = src_point.checked_mul(point_dim).ok_or_else(|| {
+            NyError::InvalidSpec("flattened permutation index overflows usize".to_string())
+        })?;
         for c in 0..point_dim {
-            flat.push(src_point * point_dim + c);
+            flat.push(base + c);
         }
     }
     Ok(flat)
@@ -234,6 +291,9 @@ pub fn verify_permutation_invariance_with(
     epsilon: f64,
     options: &SymmetryOptions,
 ) -> Result<SymmetryOutcome> {
+    // Enforce the quadratic resource budget before validation allocates even
+    // its linear-size bookkeeping for a caller-controlled dimension.
+    dense_wiring_elements(permutation.len())?;
     validate_permutation(permutation)?;
     if permutation.len() != input_bounds.len() {
         return Err(NyError::InvalidSpec(format!(
@@ -260,7 +320,7 @@ pub fn verify_permutation_invariance_with(
     }
 
     let n = permutation.len();
-    let mut weight = Array2::<f32>::zeros((n, n));
+    let mut weight = zeroed_square_wiring(n)?;
     for (j, &src) in permutation.iter().enumerate() {
         weight[[j, src]] = 1.0;
     }
@@ -311,7 +371,15 @@ pub fn verify_rotation_invariance_finite_with(
             "rotation set must not be empty".to_string(),
         ));
     }
-    let mut per_rotation = Vec::with_capacity(rotations.len());
+    let mut per_rotation = Vec::new();
+    per_rotation
+        .try_reserve_exact(rotations.len())
+        .map_err(|error| {
+            NyError::InvalidSpec(format!(
+                "rotation result set with {} entries cannot be allocated: {error}",
+                rotations.len()
+            ))
+        })?;
     for (r_idx, rotation) in rotations.iter().enumerate() {
         let signed = validate_signed_permutation_rotation(rotation, r_idx)?;
         let d = signed.len();
@@ -349,7 +417,7 @@ pub fn verify_rotation_invariance_finite_with(
 
         // Block-diagonal wiring Iₙ ⊗ R (exact: entries are 0/±1).
         let n = input_bounds.len();
-        let mut weight = Array2::<f32>::zeros((n, n));
+        let mut weight = zeroed_square_wiring(n)?;
         for p in 0..num_blocks {
             for (row, &(col, sign)) in signed.iter().enumerate() {
                 weight[[p * d + row, p * d + col]] = sign;
@@ -536,7 +604,7 @@ fn verify_wired_difference(
     // Cheap probe: determines the output dimension and catches shape
     // mismatches up front (same approach as verify_equivalence).
     let input_tensor = Verifier::bounds_to_tensor(input_bounds, None)?;
-    let probe = h.propagate_ibp(&input_tensor)?;
+    let probe = h.propagate_ibp_sound(&input_tensor)?;
     let num_outputs = probe.lower().len();
 
     let spec = VerificationSpec::new(
@@ -546,12 +614,15 @@ fn verify_wired_difference(
     let verifier = Verifier::new(options.config.clone());
     let result = verifier.verify_graph(&h, &spec)?;
 
+    if let Some(output_bounds) = sound_verified_bounds(&result) {
+        return Ok(SymmetryOutcome::Verified {
+            difference_bounds: output_bounds.to_vec(),
+        });
+    }
     let best_bounds = match result {
-        VerificationResult::Verified { output_bounds, .. } => {
-            return Ok(SymmetryOutcome::Verified {
-                difference_bounds: output_bounds,
-            });
-        }
+        // Heuristic provenance cannot establish a universal symmetry. Retain
+        // its bounds as a best effort and continue with sound witness search.
+        VerificationResult::Verified { output_bounds, .. } => output_bounds,
         VerificationResult::Violated { counterexample, .. } => {
             // Trust but verify: only report Falsified when a sound concrete
             // evaluation confirms the violation.
@@ -574,6 +645,17 @@ fn verify_wired_difference(
     Ok(SymmetryOutcome::Unknown {
         difference_bounds: best_bounds,
     })
+}
+
+fn sound_verified_bounds(result: &VerificationResult) -> Option<&[Bound]> {
+    match result {
+        VerificationResult::Verified {
+            provenance,
+            output_bounds,
+            ..
+        } if provenance.mode() == VerificationSoundnessMode::Sound => Some(output_bounds),
+        _ => None,
+    }
 }
 
 /// Validate ε and round it down to `f32` (sound direction: the checked
@@ -610,7 +692,7 @@ fn certain_violation_at(
 ) -> Result<Option<SymmetryOutcome>> {
     let arr = Array1::from(point.to_vec()).into_dyn();
     let tensor = BoundedTensor::new(arr.clone(), arr)?;
-    let enclosure = h.propagate_ibp(&tensor)?;
+    let enclosure = h.propagate_ibp_sound(&tensor)?;
     for (&lo, &hi) in enclosure.lower().iter().zip(enclosure.upper().iter()) {
         if certainly_violates(eps, lo, hi) {
             return Ok(Some(SymmetryOutcome::Falsified {
@@ -640,6 +722,47 @@ fn enclosure_bounds(enclosure: &BoundedTensor) -> Vec<Bound> {
         .collect()
 }
 
+/// Number of grid points to evaluate, capped even when the Cartesian product
+/// overflows `usize` or the minimum two-point resolution is already too large.
+fn grid_point_budget(counts: &[usize]) -> usize {
+    counts
+        .iter()
+        .try_fold(1_usize, |acc, &count| acc.checked_mul(count))
+        .unwrap_or(MAX_WITNESS_POINTS)
+        .min(MAX_WITNESS_POINTS)
+}
+
+fn capped_grid_resolution(requested: usize, varying_dimensions: usize) -> usize {
+    let requested = requested.clamp(2, MAX_WITNESS_POINTS);
+    let fits = |resolution: usize| {
+        (0..varying_dimensions)
+            .try_fold(1_usize, |product, _| {
+                product
+                    .checked_mul(resolution)
+                    .filter(|&next| next <= MAX_WITNESS_POINTS)
+            })
+            .is_some()
+    };
+    if varying_dimensions <= 1 || !fits(2) {
+        return if varying_dimensions <= 1 {
+            requested
+        } else {
+            2
+        };
+    }
+
+    let (mut low, mut high) = (2, requested);
+    while low < high {
+        let midpoint = low + (high - low).div_ceil(2);
+        if fits(midpoint) {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    low
+}
+
 /// Grid witness search over the input box (ny-groundtruth pattern): evaluate
 /// `h` at evenly spaced points (endpoints included) and return the first
 /// point whose sound enclosure certainly violates the tolerance.
@@ -660,30 +783,24 @@ fn grid_witness(
 
     // Per-dimension point counts: degenerate dimensions get one point;
     // shrink the resolution until the total fits the cap.
-    let mut resolution = grid.max(2);
-    let counts = loop {
-        let counts: Vec<usize> = input_bounds
-            .iter()
-            .map(|b| {
-                if b.lower() == b.upper() {
-                    1
-                } else {
-                    resolution
-                }
-            })
-            .collect();
-        let total = counts
-            .iter()
-            .try_fold(1_usize, |acc, &c| acc.checked_mul(c))
-            .unwrap_or(usize::MAX);
-        if total <= MAX_WITNESS_POINTS || resolution == 2 {
-            break counts;
-        }
-        resolution -= 1;
-    };
+    let varying_dimensions = input_bounds
+        .iter()
+        .filter(|bound| bound.lower() != bound.upper())
+        .count();
+    let resolution = capped_grid_resolution(grid, varying_dimensions);
+    let counts: Vec<usize> = input_bounds
+        .iter()
+        .map(|bound| {
+            if bound.lower() == bound.upper() {
+                1
+            } else {
+                resolution
+            }
+        })
+        .collect();
 
     let mut index = vec![0_usize; dim];
-    loop {
+    for _ in 0..grid_point_budget(&counts) {
         let point: Vec<f32> = index
             .iter()
             .zip(input_bounds.iter())
@@ -693,7 +810,8 @@ fn grid_witness(
                     b.lower()
                 } else {
                     let t = i as f64 / (n - 1) as f64;
-                    let x = f64::from(b.lower()) + t * f64::from(b.upper() - b.lower());
+                    let width = f64::from(b.upper()) - f64::from(b.lower());
+                    let x = f64::from(b.lower()) + t * width;
                     // Clamp so FP rounding cannot push the sample outside the box.
                     (x as f32).clamp(b.lower(), b.upper())
                 }
@@ -717,11 +835,31 @@ fn grid_witness(
             return Ok(None);
         }
     }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ny_core::SoundnessProvenance;
+
+    fn verified_with(provenance: SoundnessProvenance) -> VerificationResult {
+        VerificationResult::Verified {
+            provenance,
+            output_bounds: vec![Bound::new(-1.0, 1.0)],
+            proof: None,
+            actual_method: None,
+        }
+    }
+
+    #[test]
+    fn only_sound_verified_results_are_treated_as_proofs() {
+        assert!(sound_verified_bounds(&verified_with(SoundnessProvenance::sound())).is_some());
+        assert!(
+            sound_verified_bounds(&verified_with(SoundnessProvenance::heuristic())).is_none(),
+            "heuristic bounds must not become an unqualified Verified outcome"
+        );
+    }
 
     #[test]
     fn block_permutation_expands_point_blocks() {
@@ -732,6 +870,45 @@ mod tests {
         assert!(block_permutation(&[1, 1], 2).is_err());
         assert!(block_permutation(&[0, 1], 0).is_err());
         assert!(block_permutation(&[], 3).is_err());
+        assert!(
+            block_permutation(&[1, 0], usize::MAX).is_err(),
+            "flattened-size overflow must be returned, not panic"
+        );
+        assert!(
+            block_permutation(&[0], usize::MAX).is_err(),
+            "unrepresentable Vec capacity must be returned, not panic"
+        );
+    }
+
+    #[test]
+    fn dense_wiring_rejects_quadratic_resource_amplification() {
+        assert!(zeroed_square_wiring(usize::MAX).is_err());
+        let over_limit_dimension = (MAX_DENSE_WIRING_ELEMENTS as f64).sqrt() as usize + 1;
+        assert!(
+            zeroed_square_wiring(over_limit_dimension).is_err(),
+            "oversized dimensions must reject before ndarray allocation"
+        );
+    }
+
+    #[test]
+    fn witness_grid_budget_is_hard_capped() {
+        assert_eq!(grid_point_budget(&[2, 3, 4]), 24);
+        assert_eq!(
+            grid_point_budget(&vec![2; usize::BITS as usize]),
+            MAX_WITNESS_POINTS,
+            "overflowing Cartesian products must still honor the cap"
+        );
+        assert_eq!(
+            grid_point_budget(&[MAX_WITNESS_POINTS, 2]),
+            MAX_WITNESS_POINTS
+        );
+        let two_dimensional = capped_grid_resolution(usize::MAX, 2);
+        assert!(
+            two_dimensional * two_dimensional <= MAX_WITNESS_POINTS
+                && (two_dimensional + 1) * (two_dimensional + 1) > MAX_WITNESS_POINTS,
+            "resolution must be the largest square grid within the hard cap"
+        );
+        assert_eq!(capped_grid_resolution(usize::MAX, 20), 2);
     }
 
     #[test]

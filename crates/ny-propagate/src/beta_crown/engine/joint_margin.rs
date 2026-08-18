@@ -50,7 +50,10 @@
 use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
-use ny_core::GemmEngine;
+use ny_core::{
+    dd::{next_down_f64, next_up_f64, two_prod, two_sum},
+    GemmEngine,
+};
 use ny_tensor::{next_down_f32, BoundedTensor};
 
 use crate::Network;
@@ -140,6 +143,20 @@ impl JointMarginCloser {
         let lo_f: Vec<f32> = flat.lower().iter().copied().collect();
         let hi_f: Vec<f32> = flat.upper().iter().copied().collect();
         if lo_f.len() != d || hi_f.len() != d {
+            return None;
+        }
+        // The fixed-λ certificate below performs directed products at all four
+        // coefficient/box endpoints.  In particular, `0 * ±inf` is undefined in
+        // IEEE arithmetic and must not be allowed to turn an unbounded dimension
+        // into a spuriously positive finite certificate.  VNN-LIB benchmark boxes
+        // are finite, so reject anything else rather than attempting a special
+        // extended-real convention here.
+        if lo_f
+            .iter()
+            .zip(&hi_f)
+            .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+        {
+            diag_record(DiagKind::NonFinite, crown_lb, threshold);
             return None;
         }
         lin.fold_coeff_err_into_bias(&lo_f, &hi_f);
@@ -425,36 +442,136 @@ fn certified_box_min(a: &Array2<f32>, b: &Array1<f32>, lo: &[f64], hi: &[f64], l
     let k = lam.len();
     let d = lo.len();
 
-    let mut c = vec![0.0f64; d];
+    // Keep this helper independently fail-closed: callers should preflight the
+    // proof box, but a malformed shape, non-finite endpoint, or inverted interval
+    // must never reach the directed `two_prod` arithmetic below.  Returning -inf
+    // simply disables the optional closer.
+    if k == 0
+        || a.nrows() != k
+        || b.len() != k
+        || a.ncols() != d
+        || hi.len() != d
+        || a.iter().any(|value| !value.is_finite())
+        || b.iter().any(|value| !value.is_finite())
+        || lo
+            .iter()
+            .zip(hi)
+            .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+    {
+        return f32::NEG_INFINITY;
+    }
+
+    // Quantize the search weights to dyadics whose integer numerators sum
+    // exactly to the denominator. This restores the load-bearing simplex
+    // identity in real arithmetic; normalizing arbitrary f64 weights only makes
+    // their rounded sum approximately one.
+    const DENOMINATOR: u64 = 1 << 40;
+    let mut numerators = vec![0_u64; k];
+    let total: f64 = lam
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum();
+    if !total.is_finite() || total <= 0.0 || k == 0 {
+        return f32::NEG_INFINITY;
+    }
+    let mut remainders = Vec::with_capacity(k);
+    let mut used = 0_u64;
+    for (index, &weight) in lam.iter().enumerate() {
+        let scaled = if weight.is_finite() && weight > 0.0 {
+            weight / total * DENOMINATOR as f64
+        } else {
+            0.0
+        };
+        let floor = scaled.floor().clamp(0.0, DENOMINATOR as f64) as u64;
+        numerators[index] = floor;
+        used = used.saturating_add(floor);
+        remainders.push((scaled - floor as f64, index));
+    }
+    remainders.sort_by(|left, right| right.0.total_cmp(&left.0));
+    while used > DENOMINATOR {
+        let Some((_, index)) = remainders
+            .iter()
+            .rev()
+            .find(|(_, index)| numerators[*index] > 0)
+        else {
+            return f32::NEG_INFINITY;
+        };
+        numerators[*index] -= 1;
+        used -= 1;
+    }
+    for offset in 0..DENOMINATOR.saturating_sub(used) {
+        numerators[remainders[offset as usize % k].1] += 1;
+    }
+
+    let add_down = |left: f64, right: f64| {
+        let (sum, residual) = two_sum(left, right);
+        if residual < 0.0 {
+            next_down_f64(sum)
+        } else {
+            sum
+        }
+    };
+    let add_up = |left: f64, right: f64| {
+        let (sum, residual) = two_sum(left, right);
+        if residual > 0.0 {
+            next_up_f64(sum)
+        } else {
+            sum
+        }
+    };
+    let mul_down = |left: f64, right: f64| {
+        let (product, residual) = two_prod(left, right);
+        if residual < 0.0 {
+            next_down_f64(product)
+        } else {
+            product
+        }
+    };
+    let mul_up = |left: f64, right: f64| {
+        let (product, residual) = two_prod(left, right);
+        if residual > 0.0 {
+            next_up_f64(product)
+        } else {
+            product
+        }
+    };
+
+    let weights: Vec<f64> = numerators
+        .into_iter()
+        .map(|numerator| numerator as f64 / DENOMINATOR as f64)
+        .collect();
+    let mut coefficient_lower = vec![0.0; d];
+    let mut coefficient_upper = vec![0.0; d];
     for j in 0..k {
-        let lj = lam[j];
         for i in 0..d {
-            c[i] += lj * a[[j, i]] as f64;
+            coefficient_lower[i] = add_down(
+                coefficient_lower[i],
+                mul_down(weights[j], f64::from(a[[j, i]])),
+            );
+            coefficient_upper[i] = add_up(
+                coefficient_upper[i],
+                mul_up(weights[j], f64::from(a[[j, i]])),
+            );
         }
     }
 
-    // Aggregate affine box minimum + running magnitude for the error slack.
-    let mut val = 0.0f64;
-    let mut mag = 0.0f64;
+    let mut value_lower = 0.0;
     for i in 0..d {
-        let t_lo = c[i] * lo[i];
-        let t_hi = c[i] * hi[i];
-        let t = t_lo.min(t_hi);
-        val += t;
-        mag += t_lo.abs().max(t_hi.abs());
+        let term_lower = [
+            mul_down(coefficient_lower[i], lo[i]),
+            mul_down(coefficient_lower[i], hi[i]),
+            mul_down(coefficient_upper[i], lo[i]),
+            mul_down(coefficient_upper[i], hi[i]),
+        ]
+        .into_iter()
+        .fold(f64::INFINITY, f64::min);
+        value_lower = add_down(value_lower, term_lower);
     }
     for j in 0..k {
-        let term = lam[j] * b[j] as f64;
-        val += term;
-        mag += term.abs();
+        value_lower = add_down(value_lower, mul_down(weights[j], f64::from(b[j])));
     }
-
-    // Conservative f64-accumulation slack: the aggregate uses O(k·d) additions,
-    // each with relative error <= 2^-53. `1e-12·(|val| + mag)` dominates that by
-    // several orders of magnitude while staying astronomically below the f32
-    // joint-margin scale (~1e-4..1e-5) it must not falsely clear.
-    let slack = 1e-12 * (val.abs() + mag) + 1e-30;
-    next_down_f32((val - slack) as f32)
+    next_down_f32(value_lower as f32)
 }
 
 #[cfg(test)]
@@ -573,6 +690,26 @@ mod tests {
         assert!(
             cert <= true_min + 1e-6,
             "certified {cert} exceeded true min {true_min}"
+        );
+    }
+
+    #[test]
+    fn certified_box_min_rejects_unbounded_inverted_and_malformed_boxes() {
+        let a = array![[0.0f32]];
+        let b = array![1.0f32];
+
+        // `0 * inf` must not collapse to a positive certificate.
+        assert_eq!(
+            certified_box_min(&a, &b, &[f64::NEG_INFINITY], &[f64::INFINITY], &[1.0]),
+            f32::NEG_INFINITY
+        );
+        assert_eq!(
+            certified_box_min(&a, &b, &[1.0], &[-1.0], &[1.0]),
+            f32::NEG_INFINITY
+        );
+        assert_eq!(
+            certified_box_min(&a, &b, &[0.0, 0.0], &[1.0, 1.0], &[1.0]),
+            f32::NEG_INFINITY
         );
     }
 }

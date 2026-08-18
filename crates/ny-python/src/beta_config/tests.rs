@@ -3,18 +3,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{BetaCrownConfig, PyBranchingHeuristic, PyKfsbReduceOp};
+use pyo3::{exceptions::PyValueError, Python};
 
-/// Round-trip all 44 Python-surface fields through to_rust() + from_rust().
+/// Round-trip all Python-surface fields through to_rust() + from_rust().
 ///
-/// Every field is set to a non-default value so that a silently-dropped field
-/// produces a mismatch. PartialEq on BetaCrownConfig catches any field
-/// difference, including fields added in the future (they will cause a compile
-/// error in this struct literal until the test is updated).
+/// Every field except the quarantined cut-authority toggles is set to a
+/// non-default value so that a silently-dropped field produces a mismatch.
+/// PartialEq on BetaCrownConfig catches any field difference, including fields
+/// added in the future (they will cause a compile error in this struct literal
+/// until the test is updated).
 #[test]
 fn test_beta_crown_config_round_trip_preserves_python_surface() {
-    // Construct with ALL fields explicitly non-default.
+    // Construct with all non-quarantined fields explicitly non-default.
     let config = BetaCrownConfig {
         max_domains: 777,
+        max_queue_bytes: 123_456_789,
         timeout_secs: 42,
         max_depth: 13,
         use_alpha_crown: false,
@@ -28,9 +31,9 @@ fn test_beta_crown_config_round_trip_preserves_python_surface() {
         beta_tolerance: 0.5,
         alpha_lr: 0.25,
         batch_size: 7,
-        enable_cuts: true,
+        enable_cuts: false,
         max_cuts: 555,
-        enable_proactive_cuts: true,
+        enable_proactive_cuts: false,
         max_proactive_cuts: 77,
         enable_biccos_constraint_strengthening: true,
         biccos_drop_ratio: 0.75,
@@ -56,13 +59,70 @@ fn test_beta_crown_config_round_trip_preserves_python_surface() {
         enable_clip_interm_domain: true,
         clip_interm_topk: 5,
         clip_in_alpha_crown: true,
-        clip_interm_prune: true,
+        clip_interm_prune: false,
         clip_interm_use_final_layer: true,
     };
 
     let round_trip = BetaCrownConfig::from_rust(&config.to_rust().unwrap());
 
     assert_eq!(config, round_trip);
+}
+
+#[test]
+fn test_beta_crown_queue_byte_cap_defaults_unlimited_and_round_trips() {
+    let default = BetaCrownConfig::new();
+    assert_eq!(default.max_queue_bytes, 0);
+
+    let mut capped = default;
+    capped.max_queue_bytes = 2usize * 1024 * 1024 * 1024;
+
+    let rust = capped.to_rust().unwrap();
+    assert_eq!(rust.max_queue_bytes, capped.max_queue_bytes);
+    assert_eq!(
+        BetaCrownConfig::from_rust(&rust).max_queue_bytes,
+        capped.max_queue_bytes
+    );
+}
+
+#[test]
+fn test_beta_crown_config_rejects_quarantined_cut_authority() {
+    Python::initialize();
+    Python::attach(|py| {
+        let mut config = BetaCrownConfig::new();
+        config.enable_cuts = true;
+
+        let error = config
+            .to_rust()
+            .expect_err("Python conversion must reject cut proof authority");
+        assert!(error.is_instance_of::<PyValueError>(py));
+        assert!(
+            error
+                .to_string()
+                .contains("cut proof authority is quarantined"),
+            "unexpected validation error: {error}"
+        );
+    });
+}
+
+#[test]
+fn test_beta_crown_config_rejects_quarantined_complete_clip_pruning() {
+    Python::initialize();
+    Python::attach(|py| {
+        let mut config = BetaCrownConfig::new();
+        config.enable_clip_interm_domain = true;
+        config.clip_interm_prune = true;
+
+        let error = config
+            .to_rust()
+            .expect_err("Python conversion must reject uncertified pruning authority");
+        assert!(error.is_instance_of::<PyValueError>(py));
+        assert!(
+            error
+                .to_string()
+                .contains("pruning authority is not implemented"),
+            "unexpected validation error: {error}"
+        );
+    });
 }
 
 /// validate_inner() rejects NaN in each float field without needing pyo3. (#2899, #3305)

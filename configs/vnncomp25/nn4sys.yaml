@@ -24,6 +24,13 @@ attack:
 
 bab:
   batch_size: 64
+  # NN4SYS is a proof-only suite (all 195 published 2025 rows are UNSAT).
+  # `attack.pgd_order: skip` disables the engine attacker; make both independent
+  # tail consumers explicit as well so no proof time is reserved for disabled
+  # PGD and the VNN-COMP wrapper does not reload the 151 MB dual model.
+  phase_budget:
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
   clip:
     relaxed: true
   branching:
@@ -34,6 +41,38 @@ bab:
       enable: true
       sb_coeff_thresh: 0.1
       reorder_bab: true
+      # Saturation-Escape Branching (#nn4sys-seb-dark, B8): arm the dual-pool
+      # input brancher AND the precheck budget cap that lets the per-clause
+      # input-split BaB loop run at all (without it the box-refinement screen
+      # holds a 0.95 fraction and the loop is reached with ~0 budget, returning
+      # unknown without ever branching).
+      # MEASURED (decision probe, scratchpad/invprop_ab/
+      # mscn_dual_SEB_probe_RESULTS_2026-07-20.txt): 1-D mscn dual disjuncts
+      # close in 7-20 leaves, 2-D in 57-369 with SEB vs 697/timeout blind;
+      # CROWN-per-box flips 0/1200 (companion probe, same date) — branching is
+      # the only lever on this pool. HYP: transfer from the probe's simulated
+      # bisection to full-instance scored wall time is unpriced until the
+      # Measure phase runs the category. Env NY_SAT_ESCAPE_BRANCH still
+      # overrides (0 kills, 1 forces).
+      # MEASURED ON SCORED WALL TIME, 2026-08-01 — and the hypothesis above is
+      # REFUTED. The probe's simulated bisection did not transfer. A/B over the
+      # first 12 `_dual` rows at their official budgets (RTX 5080, 10-CPU cgroup,
+      # NY_SAT_ESCAPE_BRANCH forcing each arm):
+      #
+      #   armed  (sat_escape_branch: true)   unsat  1 / 12
+      #   unarmed                            unsat  8 / 12
+      #
+      # Arming SEB LOSES 7 of 12 rows it previously proved. The mechanism is in
+      # this file's own budget note above and at
+      # ny-cli/src/commands/beta_crown/verify/disjunctive.rs:549-558: arming caps
+      # the per-clause precheck slice at `.min(0.5)` where the unarmed path takes
+      # `.max(0.95)`. On the mscn dual band the precheck lane is what actually
+      # closes the disjuncts, so halving it costs far more than the SEB brancher
+      # returns. At ~0.5155 nn4sys points per row this band is ~11.9 points.
+      #
+      # Left OFF until an A/B on scored wall time — not a bisection probe —
+      # shows a gain. NY_SAT_ESCAPE_BRANCH=1 still forces it for experiments.
+      sat_escape_branch: false
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

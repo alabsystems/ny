@@ -44,6 +44,7 @@ mod convert;
 mod crown;
 mod crown_batched;
 pub mod crown_block_wise;
+mod crown_degradation_log;
 pub(crate) mod dispatch_plan;
 mod fallback_reason;
 mod forward_linear;
@@ -51,11 +52,15 @@ pub(crate) mod ibp;
 mod maxpool_relu;
 pub(crate) mod merge_accumulator;
 mod node;
+mod one_axis_algebra;
+mod one_axis_directed;
+mod one_axis_phase;
 mod shape_contract;
 mod softmax_complex;
+mod structural_map;
 mod traversal;
 
-use std::{collections::HashMap, sync::OnceLock};
+use std::{collections::HashMap, fmt, sync::OnceLock};
 
 use ny_core::{NyError, Result};
 use tracing::debug;
@@ -64,14 +69,41 @@ use crate::layers::attention::{AttentionMask, SelfAttentionLayer};
 use crate::layers::binary_ops::BilinearCrownLayer;
 use crate::layers::softmax::{CausalSoftmaxLayer, SoftmaxLayer};
 use crate::layers::Layer;
+pub(crate) use structural_map::{
+    TrackedStringMap, TrackedStringMapAllocationFactV1, TRACKED_STRING_MAP_ALLOCATION_MODEL_V1,
+};
 
 pub(crate) use backward_helpers::{
-    apply_dense_backward_dispatch_result, try_dense_spatial_patches_reentry,
+    apply_dense_backward_dispatch_result_with_deadline,
+    try_dense_spatial_patches_reentry_with_deadline,
 };
+pub(crate) use crown_degradation_log::CrownDegradationLogReceipt;
+use crown_degradation_log::CrownDegradationLogScope;
 pub(crate) use fallback_reason::graph_crown_dispatch_fallback_reason;
+#[cfg(test)]
+pub(crate) use forward_linear::ForwardLinearCollectionRequestCounter;
+pub use forward_linear::{
+    forward_linear_admission_record, forward_linear_measured_rate, ForwardLinearAdmissionRecord,
+    ForwardLinearRateObservation,
+};
 pub use ibp::{ZonotopePropagationOptions, ZonotopeSoftmaxMode};
 pub use maxpool_relu::{VggMaxPoolRewriteMode, VggMaxPoolRewriteReport};
 pub use node::{GraphNode, NETWORK_INPUT};
+pub use one_axis_algebra::{
+    OneAxisAlgebraClass, OneAxisAlgebraReport, OneAxisDecline, OneAxisDeclineReason,
+    ONE_AXIS_MAX_EDGES, ONE_AXIS_MAX_NODES, ONE_AXIS_MAX_RANK, ONE_AXIS_MAX_TENSOR_ELEMENTS,
+    ONE_AXIS_MAX_TOTAL_ELEMENTS,
+};
+pub use one_axis_phase::{
+    compose_one_axis_dnf_observations, OneAxisAffineCertificate, OneAxisConstraintRelation,
+    OneAxisCoreGuard, OneAxisExactProblem, OneAxisGroupedContextCertificate,
+    OneAxisGroupedMemberCertificate, OneAxisGroupedPhaseAttempt, OneAxisGroupedPhaseCertificate,
+    OneAxisGroupedPhaseLimits, OneAxisGroupedReplayResult, OneAxisOutputConstraint,
+    OneAxisPeeledConstraint, OneAxisPhaseAttempt, OneAxisPhaseCellCertificate,
+    OneAxisPhaseCertificate, OneAxisPhaseDecline, OneAxisPhaseDeclineReason, OneAxisPhaseLimits,
+    OneAxisPhaseObservation, OneAxisRational, OneAxisReplayResult, OneAxisWrapperEnclosure,
+    ONE_AXIS_GROUPED_PHASE_CERTIFICATE_VERSION, ONE_AXIS_PHASE_CERTIFICATE_VERSION,
+};
 pub(crate) use shape_contract::GraphTargetShapeContract;
 pub use softmax_complex::{SoftmaxComplexReport, SOFTMAX_COMPLEX_SHIFT_GUARD};
 
@@ -93,23 +125,25 @@ pub use softmax_complex::{SoftmaxComplexReport, SOFTMAX_COMPLEX_SHIFT_GUARD};
 /// must call [`GraphNetwork::invalidate_forward_linear_cache`].
 ///
 /// Two independent single-entry slots (#w4-root-alpha): `fixed` holds the
-/// adaptive-slope map (key = input-bits hash) and `alpha` holds the
-/// alpha-fed map (key = input-bits hash combined with a fingerprint of the
-/// per-node alpha vectors). Separate slots prevent the two passes from
-/// thrashing each other's entry when both run on the same root input.
+/// adaptive-slope map and `alpha` holds the alpha-fed map. Every entry stores
+/// both a hash accelerator and the exact canonical request fingerprint; a hash
+/// match alone never authorizes reuse. The canonical policy bytes include the
+/// exact operator surface (including typed Tanh and ConvTranspose eligibility)
+/// as well as any per-node alpha vectors. Separate slots prevent the two passes
+/// from thrashing each other's entry when both run on the same root input.
 #[derive(Debug, Default)]
 pub(crate) struct ForwardLinearMapCache {
     pub(crate) fixed: std::sync::RwLock<Option<ForwardLinearCacheEntry>>,
     pub(crate) alpha: std::sync::RwLock<Option<ForwardLinearCacheEntry>>,
     /// Memo for the forward-map alpha OPTIMIZER (#w4-root-alpha-opt), keyed by
-    /// (input bits, spec-matrix bits): the optimized per-node alphas plus the
-    /// run's stats, or `None` when the optimizer declined (no straggler rows /
-    /// no predicted improvement). Prevents re-paying the sweeps when the same
-    /// root spec request is re-bounded.
+    /// an exact canonical fingerprint of input shape/endpoints, spec bits,
+    /// incumbent bounds, and policy. Stores the optimized per-node alphas plus
+    /// stats, or `None` for a budget-independent decline. Prevents re-paying
+    /// sweeps when the exact same root request is re-bounded.
     #[allow(clippy::type_complexity)]
     pub(crate) alpha_opt: std::sync::RwLock<
         Option<(
-            u64,
+            MarginOptMemoFingerprint,
             Option<(
                 std::sync::Arc<std::collections::BTreeMap<String, ndarray::Array1<f32>>>,
                 forward_linear::alpha_opt::AlphaOptStats,
@@ -118,18 +152,64 @@ pub(crate) struct ForwardLinearMapCache {
     >,
 }
 
-/// One cached forward-linear result: (key, concretized node-bounds map,
-/// retained OUTPUT-node `LinearBounds` when produced, FRESH build duration).
+/// Collision-proof identity for the optional forward-map alpha optimizer.
+///
+/// Unlike the map-cache fingerprint below, this buffer is deliberately owned
+/// rather than reference counted: construction is fallible via `try_reserve`,
+/// and the completed allocation moves into the single-entry memo without a
+/// second canonical-byte allocation. Its retained bytes are charged to the
+/// alpha surrogate's aggregate resource plan before optimizer work begins.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MarginOptMemoFingerprint {
+    pub(crate) hash: u64,
+    pub(crate) canonical: Vec<u8>,
+}
+
+impl MarginOptMemoFingerprint {
+    #[inline]
+    pub(crate) fn exact_match(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.canonical == other.canonical
+    }
+
+    #[inline]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.canonical.capacity()
+    }
+}
+
+/// Collision-proof identity for a forward-linear cache request.
+///
+/// `hash` is only an accelerator. Every hit must also compare `canonical`
+/// byte-for-byte. The canonical encoding is produced centrally in
+/// `forward_linear.rs` and includes tensor shape, endpoint bits, operator
+/// policy, and (for alpha-fed maps) sorted length-delimited alpha names/bits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardLinearCacheFingerprint {
+    pub(crate) hash: u64,
+    pub(crate) canonical: std::sync::Arc<[u8]>,
+}
+
+impl ForwardLinearCacheFingerprint {
+    #[inline]
+    pub(crate) fn exact_match(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.canonical.as_ref() == other.canonical.as_ref()
+    }
+}
+
+/// One cached forward-linear result: exact request fingerprint, concretized
+/// node-bounds map, retained OUTPUT-node `LinearBounds` when produced, and
+/// FRESH build duration.
 /// The duration is the measured wall cost of the O(L) certified pass that
 /// produced the entry — the alpha-fed rebuild consults it to decide whether
 /// a second pass fits the remaining deadline (#w4-root-alpha) instead of
 /// burning BaB budget on a doomed attempt.
-pub(crate) type ForwardLinearCacheEntry = (
-    u64,
-    std::sync::Arc<HashMap<String, ny_tensor::BoundedTensor>>,
-    Option<std::sync::Arc<crate::bounds::LinearBounds>>,
-    std::time::Duration,
-);
+#[derive(Debug, Clone)]
+pub(crate) struct ForwardLinearCacheEntry {
+    pub(crate) fingerprint: ForwardLinearCacheFingerprint,
+    pub(crate) map: std::sync::Arc<HashMap<String, ny_tensor::BoundedTensor>>,
+    pub(crate) output_lb: Option<std::sync::Arc<crate::bounds::LinearBounds>>,
+    pub(crate) build_cost: std::time::Duration,
+}
 
 impl Clone for ForwardLinearMapCache {
     fn clone(&self) -> Self {
@@ -200,6 +280,88 @@ pub(crate) struct CrownIbpCollectionCache {
     /// Number of times a collection was served from this cache (diagnostics
     /// and the integration-test hook proving the backward ran once).
     pub(crate) hits: std::sync::atomic::AtomicUsize,
+    /// Subset of `hits` that served an explicitly truncated collection under
+    /// the default-dark cGAN reuse policy. Kept separate so telemetry/tests
+    /// cannot mistake a partial-map serve for the historical complete-map
+    /// fast path.
+    pub(crate) truncated_hits: std::sync::atomic::AtomicUsize,
+}
+
+/// Exact scheduling/resource scope under which a truncated CROWN-IBP map was
+/// produced.
+///
+/// Unlike a complete collection, a deadline-truncated collection may leave
+/// different targets at IBP quality when any of these policy inputs changes.
+/// The bounds remain sound across such changes, but serving them would be a
+/// stale quality decision. The dark truncated-cache lane therefore requires
+/// exact equality of the static policy in addition to the ordinary graph/input
+/// fingerprint, and refuses a consumer with more tightening authority than the
+/// producer. Objective-subset and cut-segment collections are refused before
+/// this descriptor is constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrownIbpTruncatedReuseScope {
+    /// Static scheduling/numerical policy. Exact equality is required.
+    pub(crate) policy: CrownIbpTruncatedReusePolicy,
+    /// Tightening time available to the producer (or prospective consumer)
+    /// immediately before the graph-native tightening sweep.
+    pub(crate) tightening_budget: std::time::Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrownIbpTruncatedReusePolicy {
+    pub(crate) deadline_bearing: bool,
+    // `dense_budget_bytes` was REMOVED from this identity (2026-08-03,
+    // #cgan-scope-memory-probe). It is `cpu_crown_dense_budget_bytes()`, which
+    // on a host without an explicit override is a LIVE MEASUREMENT of free
+    // memory (crown_memory.rs:114 -> adaptive_…). Two collections of the SAME
+    // box on the SAME network therefore produced different scopes purely
+    // because memory moved between them — MEASURED on cgan_2023 as
+    // `scope_match=false` on all 7 truncated-reuse attempts, which is why the
+    // collection cache never served once and 403s of an 851s budget went to
+    // recollecting a bit-identical box.
+    //
+    // Removing it is sound. The budget decides WHICH representation a walk
+    // takes (dense materialisation vs the patches fallback); both produce valid
+    // enclosures of the same (network, box), so a result computed under one
+    // budget remains a valid enclosure for a caller with another. What the
+    // budget can change is TIGHTNESS, not validity — and the serve path
+    // intersects the caller's own IBP map into whatever it is handed
+    // (`intersect_served_collection_with_ibp`), so a served result is monotone:
+    // never weaker than what that caller would otherwise publish.
+    //
+    // A live host measurement never belonged in a cache identity: it makes
+    // reuse a function of machine weather rather than of the problem. The
+    // resolved scheduling budgets below remain exact policy identity.
+    pub(crate) effective_per_node_floor_bits: u64,
+    pub(crate) effective_per_node_cap_bits: u64,
+    /// Distinguishes the fixed explicit cap from the adaptive default even
+    /// when both resolve to the same 12 s base value.
+    pub(crate) per_node_cap_is_explicit: bool,
+    pub(crate) patches_budget_bits: u64,
+    /// Distinguishes a fixed explicit patches budget from the adaptive policy
+    /// when both have the same numeric floor.
+    pub(crate) patches_budget_is_explicit: bool,
+    pub(crate) dim_cap_scale_enabled: bool,
+    pub(crate) conv_patches_collect_enabled: bool,
+    pub(crate) crown_mem_cap_env: Option<std::ffi::OsString>,
+    pub(crate) patches_gpu_env: Option<std::ffi::OsString>,
+    pub(crate) conv_skip_dead_f32_env: Option<std::ffi::OsString>,
+    pub(crate) convtranspose_sound_f64_gpu_env: Option<std::ffi::OsString>,
+    pub(crate) patches_reentry_min_rows_env: Option<std::ffi::OsString>,
+    pub(crate) fast_f32_gemm_installed: bool,
+    pub(crate) sound_f64_gemm_installed: bool,
+    pub(crate) objective_chunk_rows: usize,
+    pub(crate) chunk_aware_budget_enabled: bool,
+    pub(crate) chunk_wave_parallel_enabled: bool,
+    pub(crate) chunk_wave_workers: usize,
+    pub(crate) chunk_abort_enabled: bool,
+    pub(crate) chunk_grow_enabled: bool,
+    pub(crate) no_chunk_wave_parallel_env: Option<std::ffi::OsString>,
+    pub(crate) patches_deadline_flat_bias_env: Option<std::ffi::OsString>,
+    pub(crate) patches_deadline_parallel_scatter_env: Option<std::ffi::OsString>,
+    pub(crate) crown_honest_provenance_env: Option<std::ffi::OsString>,
+    pub(crate) hopeless_class_skip_enabled: bool,
+    pub(crate) prefix_cost_admission_enabled: bool,
 }
 
 /// One cached CROWN-IBP collection result.
@@ -221,6 +383,10 @@ pub(crate) struct CrownIbpCollectionCacheEntry {
     /// Number of nodes with `BoundsProvenance::Crown` — the completeness
     /// order used when comparing two truncated collections.
     pub(crate) crown_count: usize,
+    /// Exact policy scope for the default-dark truncated-map reuse path.
+    /// `None` means this entry can only be served by the historical
+    /// complete-map lookup.
+    pub(crate) truncated_reuse_scope: Option<CrownIbpTruncatedReuseScope>,
 }
 
 impl Clone for CrownIbpCollectionCache {
@@ -236,7 +402,7 @@ impl Clone for CrownIbpCollectionCache {
 #[derive(Debug, Clone)]
 pub struct GraphNetwork {
     /// All nodes in the graph, keyed by name.
-    pub(crate) nodes: HashMap<String, GraphNode>,
+    pub(crate) nodes: TrackedStringMap<GraphNode>,
     /// Order of node names for iteration.
     pub(crate) node_order: Vec<String>,
     /// Name of the output node.
@@ -247,12 +413,27 @@ pub struct GraphNetwork {
     /// Default: `true` (existing behavior — Patches for spatial Conv2d).
     /// Reference: alpha-beta-CROWN `general.conv_mode` (`abcrown.py:228-231`).
     pub(crate) use_patches_mode: bool,
+    /// Typed, default-off admission for the forward-linear spec-alpha
+    /// surrogate.
+    ///
+    /// This is graph-local so clones and cache users cannot observe a
+    /// process-global environment change halfway through verification.
+    pub(crate) forward_linear_spec_alpha: bool,
     /// Per-node CROWN-IBP time-budget policy overrides (#4413, #cgan-bn11-budget).
     /// Set from `BetaCrownConfig::crown_ibp_per_node_time_budget()` by the
     /// verifier (same plumbing pattern as `use_patches_mode`); carried by
     /// `Clone` so every configured graph copy inherits it. Default: all-`None`
-    /// (the built-in 2 s floor / 12 s cap constants).
+    /// (a 2 s floor and an adaptive cap equal to one quarter of the remaining
+    /// collection budget, clamped to 12..=600 s).
     pub(crate) crown_ibp_per_node_time_budget: crate::types::CrownIbpPerNodeTimeBudget,
+    /// Scheduling-only mirror of
+    /// `AlphaCrownConfig::forward_linear_deadline_fallback_to_ibp`.
+    ///
+    /// When enabled, a deadline refusal from the preferred forward-linear
+    /// intermediate collector selects plain IBP directly instead of entering
+    /// the historical CROWN-IBP fallback. Both routes return certified
+    /// enclosures; this flag controls only endgame cost versus tightness.
+    pub(crate) forward_linear_deadline_fallback_to_ibp: bool,
     /// Cached topological execution order for hot CROWN backward paths.
     pub(crate) cached_exec_order: OnceLock<Vec<String>>,
     /// Cached pre-compiled dispatch plan for CROWN backward loops.
@@ -266,22 +447,103 @@ pub struct GraphNetwork {
     pub(crate) cached_forward_linear_map: ForwardLinearMapCache,
     /// See [`CrownIbpCollectionCache`] (#cgan-collection-cache).
     pub(crate) cached_crown_ibp_collection: CrownIbpCollectionCache,
+    /// Verification/model-scoped, lock-free rate limiter for CROWN-IBP
+    /// degradation diagnostics. Ordinary graph clones share the `Arc`, so all
+    /// BaB domain descendants contribute to one logarithmic stream. A verifier
+    /// ingress installs a fresh scope on its configured clone, so a later or
+    /// concurrent top-level verification cannot inherit another call's count.
+    pub(crate) crown_degradation_log_scope: std::sync::Arc<CrownDegradationLogScope>,
     /// Declared per-node output shapes from load-time shape inference
     /// (internal, unbatched convention), keyed by node name. Metadata only:
     /// used to shape the conservative `[-inf, +inf]` substitution when the
     /// taint-gated IBP degrade path recovers from a propagation error at a
     /// node downstream of an OpaqueSkip (cctsdb_yolo_2023). Never read for
     /// finite bound values.
-    pub(crate) declared_shapes: HashMap<String, Vec<usize>>,
-    /// Process-unique identity of this graph instance for the dark cut-fold
-    /// registry (`NY_CUT_FOLD`, Certified Cut-CROWN C2). Minted per
+    pub(crate) declared_shapes: TrackedStringMap<Vec<usize>>,
+    /// Process-unique identity of this graph instance. Minted per
     /// [`GraphNetwork::new`]; copied by `Clone` while the clone remains
     /// semantically identical, and refreshed by every structural mutation or
-    /// output retarget. Keying registrations and exact bound caches by this
+    /// output retarget. Keying scoped state and exact bound caches by this
     /// token means data derived for one model can never reach a same-shaped but
     /// different graph in the same process — that would be unsound, not just
     /// noisy. See `bab_cuts::CutFoldScope`.
     pub(crate) cut_fold_scope: crate::beta_crown::bab_cuts::CutFoldScope,
+}
+
+/// Borrow-bound, non-authorizing receipt for the configured graph's two
+/// structural hash-table allocation carriers.
+///
+/// Keeping the source borrowed prevents safe mutation of either table while a
+/// caller uses these facts. The receipt is deliberately not `Clone` or `Copy`
+/// and remains only one ingredient of a future finalized-root baseline: it
+/// excludes all allocations owned inside keys, nodes, shapes, layers, and lazy
+/// caches, as well as allocator bookkeeping and RSS.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct GraphStructuralMapAllocationReceiptV1<'a> {
+    source: &'a GraphNetwork,
+    nodes: TrackedStringMapAllocationFactV1,
+    declared_shapes: TrackedStringMapAllocationFactV1,
+}
+
+impl fmt::Debug for GraphStructuralMapAllocationReceiptV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphStructuralMapAllocationReceiptV1")
+            .field("nodes", &self.nodes)
+            .field("declared_shapes", &self.declared_shapes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a> GraphStructuralMapAllocationReceiptV1<'a> {
+    pub(crate) fn source(&self) -> &'a GraphNetwork {
+        self.source
+    }
+
+    pub(crate) fn matches_source(&self, candidate: &GraphNetwork) -> bool {
+        std::ptr::eq(self.source, candidate)
+    }
+
+    pub(crate) fn model_version(&self) -> u32 {
+        debug_assert_eq!(
+            self.nodes.model_version(),
+            self.declared_shapes.model_version()
+        );
+        self.nodes.model_version()
+    }
+
+    pub(crate) fn nodes(&self) -> &TrackedStringMapAllocationFactV1 {
+        &self.nodes
+    }
+
+    pub(crate) fn declared_shapes(&self) -> &TrackedStringMapAllocationFactV1 {
+        &self.declared_shapes
+    }
+
+    /// Sum of the two conservative table high-water charges, excluding the
+    /// wrappers' inline bytes. Use this when `size_of::<GraphNetwork>()` is
+    /// already part of the containing owner charge.
+    pub(crate) fn conservative_table_accounting_charge_bytes(&self) -> Option<usize> {
+        self.nodes
+            .conservative_table_high_water_charge_bytes()
+            .checked_add(
+                self.declared_shapes
+                    .conservative_table_high_water_charge_bytes(),
+            )
+    }
+
+    /// Conservative table high-water charges plus both wrapper inline owners.
+    /// This accounting envelope may exceed the current live table allocations
+    /// after a shrink.
+    pub(crate) fn conservative_accounting_charge_bytes_including_inline(&self) -> Option<usize> {
+        self.nodes
+            .conservative_accounting_charge_bytes_including_inline()?
+            .checked_add(
+                self.declared_shapes
+                    .conservative_accounting_charge_bytes_including_inline()?,
+            )
+    }
 }
 
 /// Deep CNN DAGs use plain IBP intermediates for the final CROWN pass once the
@@ -291,6 +553,39 @@ pub struct GraphNetwork {
 /// plus a single backward pass, rather than tightening every intermediate node
 /// with an O(N^2) loop. See `auto_LiRPA/bound_general.py:1283-1284,1480-1526`.
 pub(crate) const CROWN_IBP_PER_NODE_THRESHOLD: usize = 50;
+
+/// Effective per-node CROWN-IBP node cap (`NY_CROWN_IBP_NODE_CAP` overrides).
+///
+/// #crown-ibp-node-cliff. This constant is a RAW NODE COUNT, so it silently
+/// re-tunes itself whenever the ONNX loader changes how many nodes survive
+/// conversion — and on 2026-08-04 it did. MEASURED on cifar100_2024, official
+/// 100s budget, identical script and instances, only the binary differing:
+///
+///   pre-`819b0554`   CIFAR100_resnet_large   collector ran 32/32 runs   15 unsat
+///   post-`819b0554`  CIFAR100_resnet_large   collector ran  0/40 runs    0 unsat
+///
+/// `819b0554` ("stricter ONNX schemas ... exact constant folding") leaves ~10
+/// more nodes alive, which put BOTH cifar100 resnets over the cliff — `-v` now
+/// reports "61 nodes exceeds per-node CROWN-IBP threshold 50" for large and 59
+/// for medium. Past the cliff `spec_propagation/setup.rs:80-91` falls back to
+/// PLAIN IBP intermediates, whose widths compound through 20 convs, and the
+/// decline is logged at `info!` while scored runs default to WARN — so the whole
+/// proof lane vanished without printing anything.
+///
+/// The cap's own doc says its purpose is avoiding an unbounded O(N^2) pass on
+/// huge graphs. That job is now done properly by the deadline and the weighted
+/// per-node budget, both of which degrade per node instead of per graph. A raw
+/// count is the wrong instrument once a real cost model exists, and it is one
+/// loader change away from deleting a verdict lane again.
+fn crown_ibp_per_node_threshold() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("NY_CROWN_IBP_NODE_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(CROWN_IBP_PER_NODE_THRESHOLD)
+    })
+}
 
 /// #binary-relax-crown-ibp (DARK): read once, so a mid-run env change cannot
 /// make two collectors on the same graph disagree about the arm.
@@ -304,6 +599,25 @@ pub(crate) fn crown_ibp_binary_relax_enabled() -> bool {
 }
 
 impl GraphNetwork {
+    /// Borrow the two structural hash-table allocation carriers.
+    ///
+    /// This is non-authorizing provenance for the pinned V1 model, not a
+    /// finalized-root admission receipt. The facts include each
+    /// wrapper's inline bytes separately from its current and conservative
+    /// high-water table allocation. They exclude nested `String`, `GraphNode`,
+    /// and shape-vector allocations, allocator bookkeeping, and RSS.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn structural_map_allocation_receipt_v1(
+        &self,
+    ) -> GraphStructuralMapAllocationReceiptV1<'_> {
+        debug_assert_eq!(TRACKED_STRING_MAP_ALLOCATION_MODEL_V1, 1);
+        GraphStructuralMapAllocationReceiptV1 {
+            source: self,
+            nodes: self.nodes.allocation_fact_v1(),
+            declared_shapes: self.declared_shapes.allocation_fact_v1(),
+        }
+    }
+
     /// Decide whether to use the expensive O(N²) CROWN-IBP intermediate tightening pass.
     ///
     /// For CNN-style DAGs (e.g., ResNets), CROWN-IBP intermediates dramatically improve
@@ -363,8 +677,29 @@ impl GraphNetwork {
         // (their width does not come from the intermediate relaxations this
         // collector repairs). Turning the gate on only spends ~22% of the
         // domain throughput for bounds the objective does not read.
+        // #vit-interm-floor: the dark lane's scope test reads the ENV-OVERRIDABLE
+        // threshold, not the raw constant. Two separate gates were both spelled
+        // `CROWN_IBP_PER_NODE_THRESHOLD` before, so `NY_CROWN_IBP_NODE_CAP` could
+        // widen the collection gate below while this one stayed pinned at 50 —
+        // which made the dark lane UNREACHABLE for every graph big enough to
+        // want it. vit_2023 is exactly that case: `pgd_2_3_16` converts to 74
+        // nodes and `ibp_3_3_8` to 107, so `74 <= 50` is false and no env
+        // setting could ever admit them.
+        //
+        // MEASURED (2026-08-08, GB10, zero-width oracle ablation,
+        // `crates/ny-onnx/examples/vit_zero_width_node_bisect.rs`): on
+        // `pgd_2_3_16_2446` at a ZERO-WIDTH input box, where the true output is
+        // a POINT, the plain-IBP intermediate map is 7.06e4 wide and ny's CROWN
+        // root output width is 1.39e4; substituting EXACT (pointwise) node
+        // bounds for the same graph and the same CROWN code makes it 4.77e-7 —
+        // 2.9e10x tighter. Zero-width slack is pure abstraction error, so this
+        // localises the whole box-independent floor to the INTERMEDIATE-BOUND
+        // SOURCE, not to any relaxation's shape.
+        //
+        // Default (env unset) is byte-identical: `crown_ibp_binary_relax_enabled`
+        // still gates everything, and the default cap is still 50.
         self.crown_ibp_intermediates_allowed(
-            crown_ibp_binary_relax_enabled() && self.nodes.len() <= CROWN_IBP_PER_NODE_THRESHOLD,
+            crown_ibp_binary_relax_enabled() && self.nodes.len() <= crown_ibp_per_node_threshold(),
         )
     }
 
@@ -398,7 +733,7 @@ impl GraphNetwork {
     /// pass used for deep CNN DAGs.
     pub(crate) fn should_collect_per_node_crown_ibp_intermediates(&self) -> bool {
         self.should_use_crown_ibp_intermediates()
-            && self.nodes.len() <= CROWN_IBP_PER_NODE_THRESHOLD
+            && self.nodes.len() <= crown_ibp_per_node_threshold()
     }
 
     /// Whether this graph contains convolution layers (Conv/ConvTranspose, 1d/2d).
@@ -491,13 +826,17 @@ impl GraphNetwork {
                     | Layer::LogSoftmax(_)
                     | Layer::LogSumExp(_)
                     | Layer::SelfAttention(_)
-                    // BatchNorm's rank-3 layout is resolved by VALUE
-                    // ([C, H, W] vs [N, C, L] decided by `shape[0] ==
-                    // num_channels`), so stacking rank-2 feature maps prepends
-                    // a batch axis that is mistaken for the channel axis
-                    // whenever the child-domain count equals the channel count
-                    // — every element of domain n is then silently scaled by
-                    // channel n's affine. The sibling normalization layers
+                    // BatchNorm's rank-3 layout is ambiguous by SHAPE
+                    // ([C, H, W] vs [N, C, L]). Stacking rank-2 [C,L] feature
+                    // maps prepends a domain axis and produces [N,C,L]; when
+                    // N == C the squeezed-layout rule must choose axis 0, so
+                    // every element of domain n is silently scaled by channel
+                    // n's affine. Rank-3 [C,H,W] -> rank-4 [N,C,H,W] (the CGAN
+                    // case) is unambiguous and passes the diagnostic enclosure
+                    // oracle in `ibp_prescreen`, but this graph-level predicate
+                    // has no input-rank provenance and relaxed clipping has
+                    // additional parent-plane obligations. Keep the blanket
+                    // deny-list until both are discharged. The sibling layers
                     // (LayerNorm/RmsNorm/GroupNorm/InstanceNorm1d/AdaIN1d)
                     // resolve their axes relative to the TRAILING dimension,
                     // which is invariant under a prepended batch axis, so they
@@ -514,27 +853,49 @@ impl GraphNetwork {
     /// Create a new empty graph network.
     pub fn new() -> Self {
         Self {
-            nodes: HashMap::new(),
+            nodes: TrackedStringMap::new(),
             node_order: Vec::new(),
             output_node: String::new(),
             use_patches_mode: true,
+            forward_linear_spec_alpha: false,
             crown_ibp_per_node_time_budget: crate::types::CrownIbpPerNodeTimeBudget::default(),
+            forward_linear_deadline_fallback_to_ibp: false,
             cached_exec_order: OnceLock::new(),
             cached_dispatch_plan: OnceLock::new(),
             cached_ancestors: OnceLock::new(),
             cached_forward_linear_map: ForwardLinearMapCache::default(),
             cached_crown_ibp_collection: CrownIbpCollectionCache::default(),
-            declared_shapes: HashMap::new(),
+            crown_degradation_log_scope: std::sync::Arc::new(CrownDegradationLogScope::default()),
+            declared_shapes: TrackedStringMap::new(),
             cut_fold_scope: crate::beta_crown::bab_cuts::CutFoldScope::fresh(),
         }
     }
 
-    /// This graph instance's identity token for the dark cut-fold registry
-    /// (`NY_CUT_FOLD`, Certified Cut-CROWN C2). Pass it to
-    /// `bab_cuts::set_cut_fold` when registering cuts derived FOR THIS graph;
-    /// the fold site only applies entries registered under this token.
+    /// This graph instance's identity token. Scope-keyed consumers
+    /// (conflict-clause replay, the MIP leaf run scope, the resident root-patch
+    /// cache key) compare it to refuse state derived for a DIFFERENT graph.
+    /// (Named for the deleted Cut-CROWN C2 fold registry that first needed it.)
     pub fn cut_fold_scope(&self) -> crate::beta_crown::bab_cuts::CutFoldScope {
         self.cut_fold_scope
+    }
+
+    /// Start an independent diagnostic stream for one top-level verification.
+    ///
+    /// Replacing the `Arc` instead of resetting shared atomics is essential:
+    /// concurrent calls using the same source model must not reset or merge one
+    /// another's domain counts. Clones made after this call share the new scope.
+    pub(crate) fn begin_crown_degradation_log_scope(&mut self) {
+        self.crown_degradation_log_scope = std::sync::Arc::new(CrownDegradationLogScope::default());
+    }
+
+    pub(crate) fn crown_degradation_warning_log_receipt(
+        &self,
+    ) -> Option<CrownDegradationLogReceipt> {
+        self.crown_degradation_log_scope.warning_receipt()
+    }
+
+    pub(crate) fn crown_degradation_info_log_receipt(&self) -> Option<CrownDegradationLogReceipt> {
+        self.crown_degradation_log_scope.info_receipt()
     }
 
     /// Drop the cached forward-linear reference map AND the cached CROWN-IBP
@@ -550,6 +911,11 @@ impl GraphNetwork {
         *self
             .cached_forward_linear_map
             .alpha
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .cached_forward_linear_map
+            .alpha_opt
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.cached_crown_ibp_collection
@@ -568,12 +934,19 @@ impl GraphNetwork {
     /// anything the forward-linear pass reads may adopt the source's cache.
     ///
     /// # Soundness
-    /// The map is a pure function of (graph structure + weights, input-bits key).
+    /// The map is a pure function of (graph structure + weights, exact input
+    /// fingerprint and operator policy).
     /// It is only valid to call this when `self` and `source` are structurally
     /// identical up to state the forward-linear collection never reads
     /// (`use_patches_mode` is CROWN-backward-only). Any later `&mut self`
     /// mutation still invalidates via `invalidate_forward_linear_cache`.
     pub(crate) fn adopt_forward_linear_cache_from(&mut self, source: &GraphNetwork) {
+        if self.cut_fold_scope != source.cut_fold_scope {
+            // Separately loaded/built graphs may have identical shapes while
+            // carrying different loader rewrites. Only a semantic clone shares
+            // this process-unique identity and may adopt proof caches.
+            return;
+        }
         let fixed = source
             .cached_forward_linear_map
             .fixed
@@ -616,6 +989,12 @@ impl GraphNetwork {
     /// Any later `&mut self` mutation still invalidates via
     /// [`Self::invalidate_forward_linear_cache`].
     pub(crate) fn adopt_crown_ibp_collection_cache_from(&mut self, source: &GraphNetwork) {
+        if self.cut_fold_scope != source.cut_fold_scope {
+            // CROWN entries contain certified bounds for the source weights.
+            // Topology/input fingerprints cannot distinguish separately built
+            // same-shaped graphs, so only a semantic clone may adopt them.
+            return;
+        }
         // Carry EVERY per-key entry (#cgan-collection-multislot): the precheck's
         // complete root-box map plus any other retained boxes. Each is a valid
         // enclosure for its own bit-exact box; adoption is a pure copy.
@@ -643,6 +1022,11 @@ impl GraphNetwork {
     /// a smaller phase budget. See the per-cache adopt methods for the
     /// soundness contracts.
     pub fn adopt_bound_caches_from(&mut self, source: &GraphNetwork) {
+        if self.cut_fold_scope != source.cut_fold_scope {
+            // Keep the public combined seam fail-closed even if a future
+            // per-cache adopter accidentally weakens its own guard.
+            return;
+        }
         self.adopt_forward_linear_cache_from(source);
         self.adopt_crown_ibp_collection_cache_from(source);
     }
@@ -652,6 +1036,14 @@ impl GraphNetwork {
     pub fn crown_ibp_collection_cache_hits(&self) -> usize {
         self.cached_crown_ibp_collection
             .hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of explicitly truncated CROWN-IBP maps served by the
+    /// `NY_CROWN_SERVE_TRUNCATED_CACHE=1` research lane.
+    pub fn crown_ibp_collection_truncated_cache_hits(&self) -> usize {
+        self.cached_crown_ibp_collection
+            .truncated_hits
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -680,6 +1072,9 @@ impl GraphNetwork {
     /// or exact bound caches.
     fn invalidate_exec_order_cache(&mut self) {
         self.cut_fold_scope = crate::beta_crown::bab_cuts::CutFoldScope::fresh();
+        // A structural mutation makes this clone a different model. Detach its
+        // diagnostics just as we detach its soundness-critical scope/caches.
+        self.begin_crown_degradation_log_scope();
         let _ = self.cached_exec_order.take();
         let _ = self.cached_ancestors.take();
         self.invalidate_dispatch_plan_cache();
@@ -718,6 +1113,13 @@ impl GraphNetwork {
         budget: crate::types::CrownIbpPerNodeTimeBudget,
     ) {
         self.crown_ibp_per_node_time_budget = budget;
+    }
+
+    /// Set the typed forward-linear deadline fallback policy. This never
+    /// invalidates a bound cache: cached forward-linear maps remain certified,
+    /// and the policy is consulted only after a cache miss/refusal.
+    pub fn set_forward_linear_deadline_fallback_to_ibp(&mut self, enabled: bool) {
+        self.forward_linear_deadline_fallback_to_ibp = enabled;
     }
 
     /// Add a node to the graph.
@@ -878,6 +1280,7 @@ impl GraphNetwork {
         self.invalidate_forward_linear_cache();
         self.output_node = name.into();
         self.cut_fold_scope = crate::beta_crown::bab_cuts::CutFoldScope::fresh();
+        self.begin_crown_degradation_log_scope();
         self.invalidate_dispatch_plan_cache();
     }
 
@@ -954,6 +1357,49 @@ mod tests {
     }
 
     #[test]
+    fn structural_map_receipt_is_source_bound_and_separates_inline_charge() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+        graph.set_declared_shape("relu", vec![3, 4]);
+        let other = graph.clone();
+
+        {
+            let receipt = graph.structural_map_allocation_receipt_v1();
+            assert_eq!(receipt.model_version(), 1);
+            assert_eq!(receipt.source().num_nodes(), graph.num_nodes());
+            assert!(receipt.matches_source(&graph));
+            assert!(!receipt.matches_source(&other));
+            assert!(receipt.nodes().current_table_allocation_bytes() > 0);
+            assert!(receipt.declared_shapes().current_table_allocation_bytes() > 0);
+            assert!(
+                receipt.nodes().conservative_table_high_water_charge_bytes()
+                    >= receipt.nodes().current_table_allocation_bytes()
+            );
+            assert_eq!(
+                receipt.conservative_table_accounting_charge_bytes(),
+                receipt
+                    .nodes()
+                    .conservative_table_high_water_charge_bytes()
+                    .checked_add(
+                        receipt
+                            .declared_shapes()
+                            .conservative_table_high_water_charge_bytes()
+                    )
+            );
+            assert_eq!(
+                receipt.conservative_accounting_charge_bytes_including_inline(),
+                receipt
+                    .conservative_table_accounting_charge_bytes()
+                    .and_then(|tables| { tables.checked_add(receipt.nodes().inline_owner_bytes()) })
+                    .and_then(|total| {
+                        total.checked_add(receipt.declared_shapes().inline_owner_bytes())
+                    })
+            );
+        }
+        graph.set_declared_shape("later", vec![1]);
+    }
+
+    #[test]
     fn test_elementwise_graph_is_batch_stack_safe() {
         // Pure element-wise / last-axis graph (ReLU-only stand-in for Gemm+ReLU
         // nets like ACAS-Xu): stacking domains on a leading axis is transparent,
@@ -1004,10 +1450,10 @@ mod tests {
 
     #[test]
     fn test_batchnorm_graph_is_not_batch_stack_safe() {
-        // BatchNorm resolves its channel axis by value, so a prepended batch
-        // axis whose extent equals the channel count would be scaled per-DOMAIN
-        // instead of per-channel (the cgan ConvTranspose->BatchNorm shape):
-        // the prescreen must be skipped.
+        // The graph-level gate has no shape provenance with which to distinguish
+        // safe rank3 CHW -> rank4 NCHW (CGAN) from ambiguous rank2 CL -> rank3
+        // NCL. The dedicated oracle covers both witnesses; until the predicate
+        // becomes shape-aware, every BatchNorm graph must remain denied.
         use crate::layers::BatchNormLayer;
         use ndarray::arr1;
         let bn = BatchNormLayer::from_scale_bias(
@@ -1024,7 +1470,7 @@ mod tests {
         ));
         assert!(
             !graph.is_input_split_batch_stack_safe(),
-            "graph with a value-resolved-axis BatchNorm must NOT be batch-stack safe"
+            "shape-unqualified BatchNorm graph must NOT be batch-stack safe"
         );
     }
 }

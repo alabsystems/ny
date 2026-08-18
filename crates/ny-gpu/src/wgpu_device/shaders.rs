@@ -2,6 +2,16 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+// #u4: the combine and EFT-min-combine taint twins plus the live on-device
+// row-OR fold live in `shaders_taint.rs`
+// (this file is past comfortable editing size); re-exported here so `ops/`
+// keeps its one `use super::super::shaders as sh;` import path.
+#[allow(unused_imports)] // consumed by the #u4 taint device probes
+pub(super) use super::shaders_taint::{
+    CONV_COL2IM_TAINT_SHADER, CONV_RESHAPE_TAINT_SHADER, CROWN_AW_ERROR_COMBINE_TAINT_SHADER,
+    CROWN_EFT_MIN_COMBINE_TAINT_SHADER, GEMM_F32_SMALL_K_TAINT_SHADER, TAINT_ROW_OR_SHADER,
+};
+
 /// Shared WGSL prelude concatenated (NOT re-pasted) into every SOUND-IBP shader
 /// (`docs/SOUND_GPU_IBP_PLAN.md` §2.2). Defines the one `round_up_pos`,
 /// `is_non_finite`, the elementwise coefficient-≤1 outward widen (`widen_lo`/
@@ -32,11 +42,19 @@ const FALLBACK_BOUND: f32 = 1e10;            // == crate::FALLBACK_BOUND (gemm.r
 const U: f32            = 5.9604645e-8;      // 2^-24 exact f32 unit roundoff
 const EPS_REL: f32      = 4.7683716e-7;      // 8*U: op-round + store-round + >=1-ULP CPU parity (elementwise)
 const F32_MIN_NORMAL: f32 = 1.1754944e-38;   // 2^-126 smallest NORMAL — survives FTZ, base of the flush floor
+const TWO_PROD_EXACT_FLOOR_F32: f32 = 3.9443045e-31; // 2^-101 == ny_core::eft::TWO_PROD_EXACT_FLOOR_F32 (from_bits 0x0D000000)
 const ADDITIVE1: f32   = 1.8807910e-37;      // ftz_safe_underflow_floor(1) = 2^-122 (coefficient-<=1 kinds)
 fn is_non_finite(x: f32) -> bool { return (bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u; }
-// smallest f32 >= x for x >= 0 (the +1-ULP bitcast). Applied ONLY to a NON-NEGATIVE radius —
-// never to a signed endpoint (that would need next_up(0)=subnormal, which Metal FTZ flushes).
-fn round_up_pos(x: f32) -> f32 { if (x <= 0.0) { return 0.0; } return bitcast<f32>(bitcast<u32>(x) + 1u); }
+// Smallest FTZ-safe f32 >= x for x >= 0. Classification is integer-only: a DAZ
+// float comparison must not turn a positive subnormal radius into zero.
+fn round_up_pos(x: f32) -> f32 {
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
+}
 // elementwise coefficient-<=1 outward widen (Add/Transpose/ReLU):
 fn widen_lo(x: f32) -> f32 { return x - round_up_pos(EPS_REL * abs(x) + ADDITIVE1); }
 fn widen_hi(x: f32) -> f32 { return x + round_up_pos(EPS_REL * abs(x) + ADDITIVE1); }
@@ -44,7 +62,8 @@ fn widen_hi(x: f32) -> f32 { return x + round_up_pos(EPS_REL * abs(x) + ADDITIVE
 
 /// Body of the SOUND linear-layer IBP shader (`docs/SOUND_GPU_IBP_PLAN.md` §3.1),
 /// concatenated AFTER [`IBP_SOUND_PRELUDE`] (which supplies `FALLBACK_BOUND`, `U`,
-/// `F32_MIN_NORMAL`, `is_non_finite`, `round_up_pos`). Transcribed verbatim from the
+/// `F32_MIN_NORMAL`, `TWO_PROD_EXACT_FLOOR_F32`, `is_non_finite`, `round_up_pos`).
+/// Transcribed verbatim from the
 /// verified spec: the `weight_pos`/`weight_neg` split, the §0 amplified-flush
 /// accumulator `flushacc`, the strict `3γ·S + 4N·U·|endpoint| + flush` radius, the
 /// `is_non_finite` product guards, and the `FALLBACK_BOUND` degrade. NO f64 in the
@@ -848,6 +867,152 @@ fn main(
 
     if (row < params.m && col < params.n) {
         out[row * params.n + col] = nan_safe_clamp(sum);
+    }
+}
+"#;
+
+/// `#u4` — GEMM with an OUT-OF-BAND STICKY TAINT CHANNEL.
+///
+/// Same math as [`GEMM_F32_SHADER`], plus two `u32` buffers carrying "this
+/// coefficient's true magnitude is UNKNOWN and strictly larger than what the
+/// f32 holds". Bindings 4/5/6 are additive; the shared GEMM's four bindings are
+/// untouched, so no other caller is affected.
+///
+/// # Why a separate channel at all
+///
+/// The value channel saturates a finite overflow to `±FALLBACK_BOUND` (`1e10`)
+/// and both downstream consumers test that MAGNITUDE. A magnitude is destroyed
+/// by arithmetic: `ops/sentinel_taint_selfcheck.rs` measures one weight of
+/// `1e-20` turning the sentinel into `1e-10` with a `5e-17` error budget, and
+/// one activation slope of `1e-25` turning the `1e30` degrade marker into an
+/// ordinary `2.0e5` charge — below every guard. The stored `1e10` stands for a
+/// true coefficient up to `~3.4e38`, so the chain then publishes a CONFIDENT
+/// number up to 28 orders of magnitude too small. No finite float can survive
+/// arbitrary downscaling, so stickiness cannot live in the value.
+///
+/// # Why not saturate to ±inf instead
+///
+/// Infinity IS sticky under multiplication and is what the CPU reference does,
+/// which is why it looks like the cheaper fix. It is not, and the reason is
+/// `inf * 0 = NaN`: a DEAD RELU (slope exactly 0) is the most common event in a
+/// deep network, and today it annihilates a tainted coefficient EXACTLY and
+/// correctly — `R * 0 == 0` for every finite real `R`, and the sentinel always
+/// stands for a finite real. Under ±inf every such annihilation would instead
+/// produce NaN and degrade the whole row. That trades a laundering bug for a
+/// tightness collapse on the hot path. The bitmask keeps annihilation exact.
+///
+/// # The propagation rule
+///
+/// ```text
+/// taint_out[row, col] = OR over k of
+///       (taint_a[row, k] AND (b[k, col] != 0 OR taint_b[k, col]))
+///    OR (taint_b[k, col] AND (a[row, k] != 0 OR taint_a[row, k]))
+///    OR  the output itself saturated
+/// ```
+///
+/// A stored zero annihilates only when its word is clean. A tainted partner's
+/// real value is unknown, so its stored zero cannot justify clearing the other
+/// word. These conjuncts make the probe lanes come out right:
+///
+/// * a tainted coefficient times a NONZERO weight keeps the taint however small
+///   the weight is — closes lanes 2 and 5, the two that launder today;
+/// * a tainted coefficient times a CLEAN EXACT ZERO drops it — keeps lanes 1
+///   and 4, where `R * 0 == 0` makes dropping it arithmetically justified;
+/// * saturation at this op seeds the taint — keeps lane 3, the armed control.
+///
+/// Taint is only ever OR'd, never multiplied; only an authenticated clean-zero
+/// multiplier can clear it. `1u` means tainted; the buffer is zero-initialized.
+pub(super) const GEMM_F32_TAINT_SHADER: &str = r#"
+struct Params {
+    m: u32,
+    k: u32,
+    n: u32,
+    _padding: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read> taint_a: array<u32>;
+@group(0) @binding(5) var<storage, read> taint_b: array<u32>;
+@group(0) @binding(6) var<storage, read_write> taint_out: array<u32>;
+
+const FALLBACK_BOUND: f32 = 1e10;  // Must match crate::FALLBACK_BOUND (#2258)
+const TILE: u32 = 16u;
+
+fn nan_safe_clamp(x: f32) -> f32 {
+    if (x != x) {
+        return x;
+    }
+    return clamp(x, -FALLBACK_BOUND, FALLBACK_BOUND);
+}
+
+var<workgroup> tile_a: array<f32, 256>;
+var<workgroup> tile_b: array<f32, 256>;
+var<workgroup> tile_ta: array<u32, 256>;
+var<workgroup> tile_tb: array<u32, 256>;
+
+@compute @workgroup_size(16, 16)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let col = gid.x;
+    let row = gid.y;
+    let lc = lid.x;
+    let lr = lid.y;
+
+    var sum: f32 = 0.0;
+    var taint: u32 = 0u;
+    let num_tiles = (params.k + TILE - 1u) / TILE;
+
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+        let a_col = t * TILE + lc;
+        if (row < params.m && a_col < params.k) {
+            tile_a[lr * TILE + lc] = a[row * params.k + a_col];
+            tile_ta[lr * TILE + lc] = taint_a[row * params.k + a_col];
+        } else {
+            // Zero-padded tail: neutral for the sum AND untainted, so a padded
+            // tap can never invent taint.
+            tile_a[lr * TILE + lc] = 0.0;
+            tile_ta[lr * TILE + lc] = 0u;
+        }
+
+        let b_row = t * TILE + lr;
+        if (b_row < params.k && col < params.n) {
+            tile_b[lr * TILE + lc] = b[b_row * params.n + col];
+            tile_tb[lr * TILE + lc] = taint_b[b_row * params.n + col];
+        } else {
+            tile_b[lr * TILE + lc] = 0.0;
+            tile_tb[lr * TILE + lc] = 0u;
+        }
+
+        workgroupBarrier();
+
+        for (var kk: u32 = 0u; kk < TILE; kk = kk + 1u) {
+            let av = tile_a[lr * TILE + kk];
+            let bv = tile_b[kk * TILE + lc];
+            sum = sum + av * bv;
+            // OR, never multiply. A clean exact-zero partner annihilates; a
+            // TAINTED stored zero is not known to be real zero and therefore
+            // cannot clear the other operand's word.
+            let taw = tile_ta[lr * TILE + kk];
+            let tbw = tile_tb[kk * TILE + lc];
+            if (taw != 0u && (bv != 0.0 || tbw != 0u)) { taint = 1u; }
+            if (tbw != 0u && (av != 0.0 || taw != 0u)) { taint = 1u; }
+        }
+
+        workgroupBarrier();
+    }
+
+    if (row < params.m && col < params.n) {
+        let guarded = nan_safe_clamp(sum);
+        // Saturation HERE seeds the taint: the stored value is a sentinel, not
+        // the magnitude. NaN counts too — it is the other "unknown" marker.
+        if (guarded != guarded || abs(guarded) >= FALLBACK_BOUND) { taint = 1u; }
+        out[row * params.n + col] = guarded;
+        taint_out[row * params.n + col] = taint;
     }
 }
 "#;
@@ -2033,6 +2198,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Batched, strided capture of selected columns from the resident lower-A
+/// coefficient matrix. One invocation writes one `(spec row, requested column)`
+/// output, replacing the legacy host encoder loop that emitted one four-byte
+/// `copy_buffer_to_buffer` command per output. This channel is advisory (β and
+/// Complete Clip decision scoring only) and does not write the coefficient or
+/// certified bound state.
+///
+/// Invalid requested columns retain the historical gather behavior: write
+/// exactly `+0.0`. The host validates all dimensions and dispatch limits before
+/// launching the kernel.
+pub(super) const CROWN_STRIDED_GATHER_SHADER: &str = r#"
+struct Params { num_specs: u32, num_neurons: u32, num_indices: u32, _p1: u32 }
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> a_lower: array<f32>;
+@group(0) @binding(2) var<storage, read> indices: array<u32>;
+@group(0) @binding(3) var<storage, read_write> gathered: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    let total = p.num_specs * p.num_indices;
+    if (t < total) {
+        let row = t / p.num_indices;
+        let slot = t % p.num_indices;
+        let col = indices[slot];
+        if (col < p.num_neurons) {
+            gathered[t] = a_lower[row * p.num_neurons + col];
+        } else {
+            gathered[t] = 0.0;
+        }
+    }
+}
+"#;
+
 /// Combine the two error GEMM products into the new certified coefficient error:
 /// `err_new[i] = round_up((γ_k·S[i] + prop[i])·slack + additive)`, mirroring
 /// `GemmEngine::crown_aw_error_step` (gemm.rs). CRITICAL (soundness): both `S` and
@@ -2044,8 +2242,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// the GEMM error for wide `k` → false proofs), and the result is rounded UP. Plus
 /// `additive` (subnormal underflow floor). All keep `err_new` an OUTWARD (≥ true)
 /// bound — the soundness requirement. `slack`, `γ_k`, `additive` are passed via the
-/// uniform; non-finite collapses to a large finite sentinel that the downstream
-/// sound concretize degrades to ±FALLBACK_BOUND.
+/// uniform; non-finite collapses to a large finite taint. Before the downstream
+/// concretize dispatch, its host preflight proves the complete affine radius is
+/// strictly below `FALLBACK_BOUND`; the taint therefore causes refusal rather
+/// than authorizing a finite sentinel as an enclosure.
 ///
 /// # Weight-amplified DAZ floor (#gpu-metal-daz — CLOSED)
 /// `additive` is only the weight-INDEPENDENT `ftz_safe_underflow_floor(k)`. `A·W` is
@@ -2058,9 +2258,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// over-bound `flushacc = 1 + k + ‖a_i‖₁ + max_j‖w_j‖₁` — `row_abs_a[i/out_cols]` is
 /// the per-spec-row `‖a_i‖₁` (host/GPU-reduced `|A|@ones`) and `w_l1_max` a scalar
 /// host bound on `max_j‖w_j‖₁` (`≥ ‖w_col‖₁` for every column, keeping the term
-/// OUTWARD). Metal-only (Vulkan/NVIDIA preserve subnormals ⇒ F32_MIN_NORMAL·(…) is a
-/// no-op change to the bound there ⇒ zero VNN-COMP impact); Vulkan validates the
-/// bind-group + non-regression, the FTZ behavior is by-construction.
+/// OUTWARD). The term is universally widening; whether it pays a real hardware
+/// loss is adapter/loading-path specific. Plain GB10 WGSL flushes, while its
+/// DenormPreserve core multiply is conformant; Apple and the remaining paths
+/// retain separate measured/refusal evidence.
 pub(super) const CROWN_AW_ERROR_COMBINE_SHADER: &str = r#"
 struct Params { n: u32, slack: f32, gamma_k: f32, additive: f32,
                 k: u32, out_cols: u32, w_l1_max: f32, _pad: u32 }
@@ -2074,8 +2275,12 @@ const FALLBACK_BOUND: f32 = 1e10;            // == crate::FALLBACK_BOUND (the GE
 fn is_nonfinite(x: f32) -> bool { let b = bitcast<u32>(x); return (b & 0x7f800000u) == 0x7f800000u; }
 // smallest f32 >= x (for x >= 0): the successor covers the final f32 op rounding DOWN.
 fn round_up_pos(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
-    return bitcast<f32>(bitcast<u32>(x) + 1u);
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
 }
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -2106,21 +2311,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// EFT twin GEMM (#eft-err, `docs/EFT_COMPENSATED_CERTIFIED_ERROR_DESIGN.md`):
 /// recompute `V = fl(A@W)` with a DETERMINISTIC, compiler-immune op sequence
-/// while measuring the EXACT rounding residual of that sequence per output
-/// element. Every arithmetic step is routed through the `fma` intrinsic (the
-/// only ops the shader compiler provably neither contracts nor reassociates on
-/// this adapter — probe-pinned bit-exact in `ops/double_single_probe.rs` and
-/// gated per-adapter by `verify_eft_primitives`):
+/// while measuring or conservatively charging the rounding residual of that
+/// sequence per output element. Primary products/adds use the separately
+/// qualified core operations; residual recovery uses explicit `fma` barriers
+/// (probe-pinned and gated per adapter by `verify_eft_primitives`):
 ///
-/// * product: `p = fma(a, w, 0)` = RN(a·w); residual `ep = fma(a, w, −p)` EXACT
-///   (product-underflow taps charge `F32_MIN_NORMAL` instead — the TwoProdFMA
-///   theorem does not apply below the normal range);
+/// * product: `p = a * w` = RN(a·w), deliberately using the rung-3-qualified
+///   core multiply rather than `fma(a,w,0)` (the measured GB10 FMA path
+///   DAZ-zeroes subnormal multiplicands even under DenormPreserve); residual
+///   `ep = fma(a, w, −p)` is EXACT when the FMA honors its operands and `|p| >=
+///   TWO_PROD_EXACT_FLOOR_F32`. If that residual FMA DAZ-zeroes a subnormal
+///   multiplicand while `p` is normal, it returns `−p`, whose magnitude is a
+///   conservative over-charge. Smaller products use `F32_MIN_NORMAL` instead;
 /// * accumulate: `s = acc + p` (single RN add) with the fma-barrier TwoSum
-///   residual `es` EXACT.
+///   residual `es`; it is exact on a conforming FMA, while the admitted
+///   subnormal-result zero-flush is covered by the scaled rung-3 floor.
 ///
-/// Telescoping identity: `Σ a·w = V + Σ ep + Σ es`, so
-/// `R = Σ|ep| + Σ|es| (+floors)` bounds `|exact − V|` for THIS sequence. `R`'s
-/// own f32 accumulation is charged on the host via `eft_r_slack_f32`. The twin
+/// On a conforming FMA the terms telescope exactly:
+/// `Σ a·w = V + Σ ep + Σ es`. Under the admitted measured FMA behavior,
+/// conservative residuals and explicit floors replace that identity with the
+/// needed outward inequality. Thus `R = Σ|ep| + Σ|es| (+floors)` bounds
+/// `|exact − V|` for THIS sequence. `R`'s own f32 accumulation is charged on
+/// the host via `eft_r_slack_f32`. The twin
 /// value `V` is NOT the shipped coefficient — the min-combine below measures
 /// `d = |V − value_kernel_output|` on device and charges it, so NO assumption
 /// about the value kernel's compilation is needed (sound for any fusion).
@@ -2132,6 +2344,7 @@ struct Params { m: u32, k: u32, n: u32, pad: u32 }
 @group(0) @binding(3) var<storage, read_write> v_out: array<f32>; // m x n twin value
 @group(0) @binding(4) var<storage, read_write> r_out: array<f32>; // m x n residual sum
 const F32_MIN_NORMAL: f32 = 1.1754944e-38;
+const TWO_PROD_EXACT_FLOOR_F32: f32 = 3.9443045e-31; // 2^-101 == ny_core::eft::TWO_PROD_EXACT_FLOOR_F32
 const TILE: u32 = 16u;
 var<workgroup> tile_a: array<f32, 256>;
 var<workgroup> tile_b: array<f32, 256>;
@@ -2168,12 +2381,19 @@ fn main(
         for (var kk: u32 = 0u; kk < TILE; kk = kk + 1u) {
             let a = tile_a[lr * TILE + kk];
             let w = tile_b[kk * TILE + lc];
-            // Product via fma (RN, barrier) + exact residual.
-            let prod = fma(a, w, 0.0);
+            // Primary product via the rung-3-qualified core multiply. The
+            // residual alone uses FMA; see the host doc above for why FMA DAZ
+            // then over-charges or enters the explicit small-product floor.
+            let prod = a * w;
             let ep = fma(a, w, -prod);
             var eterm = abs(ep);
-            if (a != 0.0 && w != 0.0 && abs(prod) < F32_MIN_NORMAL) {
-                // Underflow range: the residual may be unrepresentable — floor it.
+            if (a != 0.0 && w != 0.0 && abs(prod) < TWO_PROD_EXACT_FLOOR_F32) {
+                // Below the TwoProdFMA exactness range the residual may itself
+                // round; replace it with a sound normal-range charge.
+                // Guard at 2^-101, NOT 2^-126: throughout [2^-126, 2^-101) the
+                // residual `ep` is ITSELF rounded (often to 0), so trusting it
+                // publishes a radius that does not enclose. Charging 2^-126 there
+                // is sound because |a·w − prod| <= ½·ulp(prod) <= 2^-126.
                 eterm = F32_MIN_NORMAL;
             }
             // fma-barrier TwoSum: s = RN(acc + prod), es exact.
@@ -2215,12 +2435,17 @@ struct Params { n: u32, r_slack: f32, slack: f32, additive: f32,
 @group(0) @binding(4) var<storage, read> prop: array<f32>;    // fl(err@|W|)
 @group(0) @binding(5) var<storage, read_write> err_out: array<f32>;
 @group(0) @binding(6) var<storage, read> row_abs_a: array<f32>;
+@group(0) @binding(7) var<storage, read> s_prod: array<f32>;  // fl(|A|@|W|)
 const F32_MIN_NORMAL: f32 = 1.1754944e-38;
 const FALLBACK_BOUND: f32 = 1e10;
 fn is_nonfinite(x: f32) -> bool { let b = bitcast<u32>(x); return (b & 0x7f800000u) == 0x7f800000u; }
 fn round_up_pos(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
-    return bitcast<f32>(bitcast<u32>(x) + 1u);
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
 }
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -2234,6 +2459,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the (already sound) Higham value.
     if (is_nonfinite(v) || is_nonfinite(val) || is_nonfinite(r) || is_nonfinite(pr)) { return; }
     if (pr >= FALLBACK_BOUND) { return; }
+    // SENTINEL STICKINESS (#gpu-typed-authority). The Higham combine
+    // DELIBERATELY degrades to `e = 1e30` when EITHER `s_prod = fl(|A|@|W|)` or
+    // `prop` saturates at FALLBACK_BOUND, because past saturation the true
+    // reduction is unknown and strictly larger. This min-combine previously
+    // observed only `prop` — it had no `s_prod` binding at all — so on a row
+    // where `s_prod` saturated but `prop` did not, `min(err_out, e_eft)` would
+    // silently LOWER that deliberately-degraded 1e30 charge back to a measured
+    // one, erasing the finite overflow transport sentinel. Whether the EFT
+    // identity happens to survive there is exactly the kind of unwritten
+    // argument the quarantine exists to demand, so we refuse instead: the
+    // sentinel is now STICKY across this arm. Strictly a WIDENING (the Higham
+    // charge ships unchanged), never a tightening.
+    if (s_prod[i] >= FALLBACK_BOUND) { return; }
     // d = |V - value|: RN of an exact-difference class; r_slack (host, outward)
     // carries headroom for this op and R's own f32 accumulation.
     let d = abs(v - val);
@@ -2252,14 +2490,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// its certified error, on-device (one workgroup per spec row, tree reduction).
 /// For row s over the layer's `k` outputs:
 ///   bias_out[s]     += Σ_k a[s,k]·bias[k]
-///   bias_err_out[s] += round_up( γ_k·Σ_k|a[s,k]·bias[k]| + Σ_k err[s,k]·|bias[k]| )
+///   bias_err_out[s] = add_up(
+///       bias_err_out[s],
+///       round_up(γ_k·Σ_k|a[s,k]·bias[k]| + Σ_k err[s,k]·|bias[k]|),
+///       flush,
+///   )
 /// The `γ_k·Σ|a·bias|` term covers the f32 reduction's own rounding (the host
 /// accumulates in f64, so the GPU bound is at most this term looser — still
 /// sound). `+=` is a read-modify-write of one element by thread 0 (no race).
 pub(super) const CROWN_BIAS_ERR_ACCUMULATE_SHADER: &str = r#"
 // #eft-err (former padding _pad0/_pad1): eft_mode=1 ⇒ the a·bias reduction's
-// rounding is MEASURED exactly (fma TwoProduct + fma-barrier TwoSum residuals,
-// through the tree and the final running-sum add) and charged ·eft_r_slack,
+// rounding is charged from a core-RN product plus an FMA residual (exact on a
+// conforming FMA; conservative/floored under the measured FMA-operand DAZ),
+// with barrier-TwoSum residuals through the tree and final running-sum add,
+// all charged ·eft_r_slack,
 // replacing the a-priori γ_k·Σ|a·bias| term (k = 10^4–10^5 on conv layers).
 // The propagated Σ err·|bias| stays. 0 ⇒ byte-identical legacy.
 struct Params { num_specs: u32, k: u32, gamma_k: f32, additive: f32, slack: f32, eft_mode: u32, eft_r_slack: f32, _pad2: u32 }
@@ -2271,6 +2515,7 @@ struct Params { num_specs: u32, k: u32, gamma_k: f32, additive: f32, slack: f32,
 @group(0) @binding(5) var<storage, read_write> bias_err_out: array<f32>;
 
 const F32_MIN_NORMAL: f32 = 1.1754944e-38;   // 2^-126 smallest NORMAL — survives Metal FTZ
+const TWO_PROD_EXACT_FLOOR_F32: f32 = 3.9443045e-31; // 2^-101 == ny_core::eft::TWO_PROD_EXACT_FLOOR_F32
 
 var<workgroup> sv: array<f32, 256>;   // Σ a·bias
 var<workgroup> sa: array<f32, 256>;   // Σ |a·bias|
@@ -2279,10 +2524,12 @@ var<workgroup> sf: array<f32, 256>;   // §0 amplified-flush accumulator
 var<workgroup> sr: array<f32, 256>;   // #eft-err measured residuals
 
 fn round_up_pos(x: f32) -> f32 {
-    // x >= 0; smallest f32 >= x via the successor (round-to-nearest may go down).
-    if (x <= 0.0) { return 0.0; }
-    let b = bitcast<u32>(x);
-    return bitcast<f32>(b + 1u);
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
 }
 
 @compute @workgroup_size(256)
@@ -2304,10 +2551,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             v = v + aj * bj;
             av = av + abs(aj * bj);
         } else {
-            // Measured product + add residuals (exact; underflow-floored).
-            let prod = fma(aj, bj, 0.0);
+            // Measured product + add residuals (exact; small products use the
+            // TwoProdFMA exactness guard and a normal-range charge).
+            let prod = aj * bj;
             var ep = abs(fma(aj, bj, -prod));
-            if (aj != 0.0 && bj != 0.0 && abs(prod) < F32_MIN_NORMAL) { ep = F32_MIN_NORMAL; }
+            if (aj != 0.0 && bj != 0.0 && abs(prod) < TWO_PROD_EXACT_FLOOR_F32) { ep = F32_MIN_NORMAL; }
             let s2 = v + prod;
             let bb = fma(-1.0, v, s2);
             let sb = fma(-1.0, bb, s2);
@@ -2347,16 +2595,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let old = bias_out[s];
         let sum = old + sv[0];
         bias_out[s] = sum;
-        let flush = p.additive + sf[0] * p.slack * F32_MIN_NORMAL;
+        // Every non-negative term is a certified radius. Assemble the flush
+        // and the update outward; ordinary RN addition can otherwise absorb a
+        // tiny but real floor into an existing O(1) bias error.
+        let flush_scaled = round_up_pos(round_up_pos(sf[0] * p.slack) * F32_MIN_NORMAL);
+        let flush = round_up_pos(p.additive + flush_scaled);
+        let old_err = bias_err_out[s];
         if (!eft) {
-            bias_err_out[s] = bias_err_out[s] + round_up_pos(p.gamma_k * sa[0] + se[0]) + flush;
+            // `sa` and `se` are non-negative f32 reductions. Recover their
+            // possible k-term undercount before publishing the local radius.
+            let reduced_err = round_up_pos(p.gamma_k * sa[0] + se[0]);
+            let local_err = round_up_pos(reduced_err * p.slack);
+            bias_err_out[s] = round_up_pos(round_up_pos(old_err + local_err) + flush);
         } else {
             // Final running-sum add's residual, measured like the rest.
             let bbf = fma(-1.0, old, sum);
             let sbf = fma(-1.0, bbf, sum);
             let rf = abs(fma(-1.0, sbf, old) + fma(-1.0, bbf, sv[0]));
-            bias_err_out[s] = bias_err_out[s]
-                + round_up_pos((sr[0] + rf) * p.eft_r_slack + se[0]) + flush;
+            let residual_err = round_up_pos((sr[0] + rf) * p.eft_r_slack);
+            let propagated_err = round_up_pos(se[0] * p.slack);
+            let local_err = round_up_pos(residual_err + propagated_err);
+            bias_err_out[s] = round_up_pos(round_up_pos(old_err + local_err) + flush);
         }
     }
 }
@@ -2388,8 +2647,9 @@ pub(super) const CROWN_ACTIVATION_RESIDENT_SHADER: &str = r#"
 // domain, n_domains=1) `dom` is always 0 → `[i]`, BYTE-IDENTICAL to the pre-batch
 // path (buffers stay num_neurons wide).
 // #eft-err (former padding `_p0` → `eft_mode`): 1 ⇒ (a) the a·sel and ∓β rounding
-// is MEASURED exactly (fma TwoProduct residual + fma-barrier TwoSum residual —
-// zero for the stable sel∈{0,1} majority where the ops are exact) instead of the
+// is charged by an FMA product residual + fma-barrier TwoSum residual (exact on
+// a conforming FMA; conservative/floored under measured FMA-operand DAZ — zero
+// for the stable sel∈{0,1} majority where the ops are exact) instead of the
 // a-priori U·|coeff| charge, and (b) the propagated error uses the LIPSCHITZ
 // factor of the piecewise-linear activation map v ↦ v·sel(v)∓β — `|sel|` when
 // the coefficient's sign is certain (|a| > err), `max(|ls|,|us|)` otherwise —
@@ -2407,6 +2667,7 @@ struct Params { num_specs: u32, num_neurons: u32, is_upper: u32, additive: f32, 
 const U: f32 = 0.00000005960464477539063; // 2^-24
 const SLACK: f32 = 1.000001;
 const F32_MIN_NORMAL_ACT: f32 = 1.1754944e-38;
+const TWO_PROD_EXACT_FLOOR_F32: f32 = 3.9443045e-31; // 2^-101 == ny_core::eft::TWO_PROD_EXACT_FLOOR_F32
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -2436,11 +2697,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gap = abs(coeff) * U + extra;
         err_out[idx] = (e_in * slope_sum + gap + p.additive) * SLACK;
     } else {
-        // Measured gap: e_prod = fma(a,sel,−base) is the EXACT product residual
-        // (0 for the stable sel∈{0,1} majority); the β step's residual via the
-        // fma-barrier TwoSum (exact; 0 when β=0). Product underflow floors.
+        // Measured gap: e_prod = fma(a,sel,−base) is the exact product residual
+        // on a conforming FMA and a conservative over-charge (or explicit
+        // small-product floor) under measured FMA-operand DAZ. It is 0 for the
+        // stable sel∈{0,1} majority; the β step's residual via the
+        // fma-barrier TwoSum (exact; 0 when β=0). Small products use the
+        // TwoProdFMA exactness floor, while the charged radius stays FLT_MIN.
         var e_prod = abs(fma(a, sel, -base));
-        if (a != 0.0 && sel != 0.0 && abs(base) < F32_MIN_NORMAL_ACT) { e_prod = F32_MIN_NORMAL_ACT; }
+        if (a != 0.0 && sel != 0.0 && abs(base) < TWO_PROD_EXACT_FLOOR_F32) { e_prod = F32_MIN_NORMAL_ACT; }
         let sb2 = select(bv, -bv, p.is_upper == 0u); // coeff = base + sb2
         let bb = fma(-1.0, base, coeff);
         let sbb = fma(-1.0, bb, coeff);
@@ -2454,10 +2718,97 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// #u4 taint twin of [`CROWN_ACTIVATION_RESIDENT_SHADER`]: same arithmetic,
+/// same bindings 0-7, plus four additive `u32` taint buffers (8-11). The value
+/// and error taints follow the GEMM taint channel's propagation rule, adapted
+/// to this op's two multiplications (`a * sel` on the value channel and
+/// `e_in * slope-factor` on the error channel):
+///
+/// ```text
+/// slopes_live = lower_slope != 0 OR upper_slope != 0
+/// taint_a_out = taint_a_in AND slopes_live
+/// taint_e_out = (taint_e_in OR taint_a_in) AND slopes_live
+/// ```
+///
+/// A set coefficient/error word makes the observed sign and sign-selected
+/// slope untrustworthy, so a selected zero cannot annihilate while the other
+/// slope is nonzero. Only a stable zero map (`ls == us == 0`) clears the word.
+/// This keeps dead-ReLU annihilation exact, makes value taint flow into error
+/// taint, and closes both the asymmetric-sign case and lane 5's tiny-slope
+/// laundering case.
+pub(super) const CROWN_ACTIVATION_RESIDENT_TAINT_SHADER: &str = r#"
+struct Params { num_specs: u32, num_neurons: u32, is_upper: u32, additive: f32, num_specs_per_dom: u32, eft_mode: u32, _p1: u32, _p2: u32 }
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> a_in: array<f32>;
+@group(0) @binding(2) var<storage, read> err_in: array<f32>;
+@group(0) @binding(3) var<storage, read> ls: array<f32>;
+@group(0) @binding(4) var<storage, read> us: array<f32>;
+@group(0) @binding(5) var<storage, read_write> a_out: array<f32>;
+@group(0) @binding(6) var<storage, read_write> err_out: array<f32>;
+@group(0) @binding(7) var<storage, read> beta_signed: array<f32>;
+@group(0) @binding(8) var<storage, read> taint_a_in: array<u32>;
+@group(0) @binding(9) var<storage, read> taint_e_in: array<u32>;
+@group(0) @binding(10) var<storage, read_write> taint_a_out: array<u32>;
+@group(0) @binding(11) var<storage, read_write> taint_e_out: array<u32>;
+const U: f32 = 0.00000005960464477539063; // 2^-24
+const SLACK: f32 = 1.000001;
+const F32_MIN_NORMAL_ACT: f32 = 1.1754944e-38;
+const TWO_PROD_EXACT_FLOOR_F32: f32 = 3.9443045e-31; // 2^-101 == ny_core::eft::TWO_PROD_EXACT_FLOOR_F32
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = p.num_specs * p.num_neurons;
+    if (idx >= total) { return; }
+    let i = idx % p.num_neurons;
+    let dom = (idx / p.num_neurons) / p.num_specs_per_dom;
+    let sbase = dom * p.num_neurons;
+    let a = a_in[idx];
+    let lsv = ls[sbase + i];
+    let usv = us[sbase + i];
+    var sel: f32;
+    if (p.is_upper == 0u) { sel = select(usv, lsv, a >= 0.0); }
+    else { sel = select(lsv, usv, a >= 0.0); }
+    let base = a * sel;
+    let bv = beta_signed[sbase + i];
+    var coeff: f32;
+    if (p.is_upper == 0u) { coeff = base - bv; } else { coeff = base + bv; }
+    a_out[idx] = coeff;
+    let e_in = err_in[idx];
+    if (p.eft_mode == 0u) {
+        let slope_sum = abs(lsv) + abs(usv);
+        let extra = select(0.0, abs(base) * U, bv != 0.0);
+        let gap = abs(coeff) * U + extra;
+        err_out[idx] = (e_in * slope_sum + gap + p.additive) * SLACK;
+    } else {
+        var e_prod = abs(fma(a, sel, -base));
+        if (a != 0.0 && sel != 0.0 && abs(base) < TWO_PROD_EXACT_FLOOR_F32) { e_prod = F32_MIN_NORMAL_ACT; }
+        let sb2 = select(bv, -bv, p.is_upper == 0u);
+        let bb = fma(-1.0, base, coeff);
+        let sbb = fma(-1.0, bb, coeff);
+        let e_sub = abs(fma(-1.0, sbb, base) + fma(-1.0, bb, sb2));
+        let prop = select(max(abs(lsv), abs(usv)), abs(sel), abs(a) > e_in);
+        err_out[idx] = (e_in * prop + e_prod + e_sub + p.additive) * SLACK;
+    }
+    // #u4: out-of-band taint transport. A tainted coefficient/error has no
+    // authenticated sign, so the observed sign-selected slope cannot justify
+    // annihilation. Only BOTH exact-zero slopes define the stable zero map.
+    let ta = taint_a_in[idx];
+    let te = taint_e_in[idx];
+    let slopes_live = lsv != 0.0 || usv != 0.0;
+    let ta_kept = select(0u, ta, slopes_live);
+    taint_a_out[idx] = ta_kept;
+    taint_e_out[idx] = select(0u, te, slopes_live) | ta_kept;
+}
+"#;
+
 /// Resident activation INTERCEPT -> running bias (reduction per spec row), the
 /// piece the host folds during the activation layer. For row s (one side):
 ///   bias_out[s]     += sum_i a[s,i]*sel_int(i)
-///   bias_err_out[s] += round_up( gamma*sum_i|a[s,i]*sel_int(i)| + sum_i err[s,i]*(|li|+|ui|) )
+///   bias_err_out[s] = add_up(
+///       bias_err_out[s],
+///       round_up(gamma*sum_i|a[s,i]*sel_int(i)| + sum_i err[s,i]*(|li|+|ui|)),
+///       flush,
+///   )
 /// sel_int = lower: a>=0?lower_int:upper_int ; upper: a>=0?upper_int:lower_int. The
 /// `gamma*sum|a*sel_int|` term certifies the f32 reduction rounding (host uses f64).
 pub(super) const CROWN_ACTIVATION_INTERCEPT_BIAS_SHADER: &str = r#"
@@ -2466,7 +2817,8 @@ pub(super) const CROWN_ACTIVATION_INTERCEPT_BIAS_SHADER: &str = r#"
 // `s/num_specs_per_dom`, so its intercepts live at `dom*num_neurons + j`. Single
 // domain (num_specs_per_dom == num_specs) → dom 0 → `[j]`, byte-identical.
 // #eft-err (former padding _p2 → eft_mode): 1 ⇒ the a·sel_int reduction's
-// rounding is MEASURED (fma residuals through taps, tree, and the final add),
+// rounding is charged (core products plus conservative/floored FMA residuals
+// through taps, tree, and the final add),
 // charged ·r_slack — carried in the OTHERWISE-UNUSED gamma_k field — replacing
 // the a-priori γ_k·Σ|a·sel_int|; and the propagated err uses the Lipschitz
 // factor of v ↦ v·int(v) (piecewise-linear through 0): |sel_int| when the
@@ -2481,14 +2833,19 @@ struct Params { num_specs: u32, num_neurons: u32, is_upper: u32, gamma_k: f32, a
 @group(0) @binding(5) var<storage, read_write> bias_out: array<f32>;
 @group(0) @binding(6) var<storage, read_write> bias_err_out: array<f32>;
 const F32_MIN_NORMAL: f32 = 1.1754944e-38;   // 2^-126 smallest NORMAL — survives Metal FTZ
+const TWO_PROD_EXACT_FLOOR_F32: f32 = 3.9443045e-31; // 2^-101 == ny_core::eft::TWO_PROD_EXACT_FLOOR_F32
 var<workgroup> sv: array<f32, 256>;
 var<workgroup> sa: array<f32, 256>;
 var<workgroup> se: array<f32, 256>;
 var<workgroup> sf: array<f32, 256>;   // §0 amplified-flush accumulator
 var<workgroup> sr: array<f32, 256>;   // #eft-err measured residuals
 fn round_up_pos(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
-    return bitcast<f32>(bitcast<u32>(x) + 1u);
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
 }
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -2514,9 +2871,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             av = av + abs(a_v * sel);
             ev = ev + err[idx] * (abs(li) + abs(ui));
         } else {
-            let prod = fma(a_v, sel, 0.0);
+            let prod = a_v * sel;
             var ep = abs(fma(a_v, sel, -prod));
-            if (a_v != 0.0 && sel != 0.0 && abs(prod) < F32_MIN_NORMAL) { ep = F32_MIN_NORMAL; }
+            if (a_v != 0.0 && sel != 0.0 && abs(prod) < TWO_PROD_EXACT_FLOOR_F32) { ep = F32_MIN_NORMAL; }
             let s2 = v + prod;
             let bb = fma(-1.0, v, s2);
             let sb = fma(-1.0, bb, s2);
@@ -2559,16 +2916,26 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let old = bias_out[s];
         let sum = old + sv[0];
         bias_out[s] = sum;
-        let flush = p.additive + sf[0] * p.slack * F32_MIN_NORMAL;
+        // Preserve every non-negative certified term. Without directed
+        // assembly an existing O(1) radius can swallow the tiny rung-3 floor.
+        let flush_scaled = round_up_pos(round_up_pos(sf[0] * p.slack) * F32_MIN_NORMAL);
+        let flush = round_up_pos(p.additive + flush_scaled);
+        let old_err = bias_err_out[s];
         if (!eft) {
-            bias_err_out[s] = bias_err_out[s] + round_up_pos(p.gamma_k * sa[0] + se[0]) + flush;
+            // Both non-negative reduction lanes need the k-scaled recovery;
+            // one final ULP cannot recover trailing terms swallowed by `se`.
+            let reduced_err = round_up_pos(p.gamma_k * sa[0] + se[0]);
+            let local_err = round_up_pos(reduced_err * p.slack);
+            bias_err_out[s] = round_up_pos(round_up_pos(old_err + local_err) + flush);
         } else {
             // In EFT mode `gamma_k` carries r_slack (the γ term is unused).
             let bbf = fma(-1.0, old, sum);
             let sbf = fma(-1.0, bbf, sum);
             let rf = abs(fma(-1.0, sbf, old) + fma(-1.0, bbf, sv[0]));
-            bias_err_out[s] = bias_err_out[s]
-                + round_up_pos((sr[0] + rf) * p.gamma_k + se[0]) + flush;
+            let residual_err = round_up_pos((sr[0] + rf) * p.gamma_k);
+            let propagated_err = round_up_pos(se[0] * p.slack);
+            let local_err = round_up_pos(residual_err + propagated_err);
+            bias_err_out[s] = round_up_pos(round_up_pos(old_err + local_err) + flush);
         }
     }
 }
@@ -2589,9 +2956,14 @@ struct Params { num_specs: u32, out_dim: u32, new_dim: u32, _p0: u32, gamma: f32
 @group(0) @binding(3) var<storage, read_write> err_out: array<f32>;
 var<workgroup> rma: array<f32, 256>;
 var<workgroup> rme: array<f32, 256>;
+const F32_MIN_NORMAL: f32 = 1.1754944e-38;
 fn round_up_pos(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
-    return bitcast<f32>(bitcast<u32>(x) + 1u);
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
 }
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -2679,10 +3051,58 @@ var<workgroup> sh_ru: array<f32, 256>;
 
 const FALLBACK_BOUND: f32 = 1e10;
 const F32_MIN_NORMAL: f32 = 1.1754944e-38;   // 2^-126 smallest NORMAL — survives Metal FTZ
+const TWO_PROD_EXACT_FLOOR_F32: f32 = 3.9443045e-31; // 2^-101 == ny_core::eft::TWO_PROD_EXACT_FLOOR_F32
 
 fn is_non_finite(x: f32) -> bool {
     let bits = bitcast<u32>(x);
     return (bits & 0x7f800000u) == 0x7f800000u;
+}
+
+// Outward helpers for the verdict-deciding final assembly.  The normal floor is
+// intentional: a subnormal one-ULP step can be flushed back to zero on Metal.
+fn round_up_pos(x: f32) -> f32 {
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
+}
+
+fn next_down_f32_normal(x: f32) -> f32 {
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    let negative = (bits & 0x80000000u) != 0u;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if (magnitude == 0u) { return -F32_MIN_NORMAL; }
+    // Toward -Inf: zero is a valid outward replacement for a positive
+    // subnormal; a negative subnormal needs the negative normal floor.
+    if (magnitude < 0x00800000u) {
+        return select(0.0, -F32_MIN_NORMAL, negative);
+    }
+    let y_bits = select(bits - 1u, bits + 1u, negative);
+    if ((y_bits & 0x7fffffffu) < 0x00800000u) {
+        return select(0.0, -F32_MIN_NORMAL, negative);
+    }
+    return bitcast<f32>(y_bits);
+}
+
+fn next_up_f32_normal(x: f32) -> f32 {
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    let negative = (bits & 0x80000000u) != 0u;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if (magnitude == 0u) { return F32_MIN_NORMAL; }
+    // Toward +Inf: zero is a valid outward replacement for a negative
+    // subnormal; a positive subnormal needs the positive normal floor.
+    if (magnitude < 0x00800000u) {
+        return select(F32_MIN_NORMAL, bitcast<f32>(0x80000000u), negative);
+    }
+    let y_bits = select(bits + 1u, bits - 1u, negative);
+    if ((y_bits & 0x7fffffffu) < 0x00800000u) {
+        return select(F32_MIN_NORMAL, bitcast<f32>(0x80000000u), negative);
+    }
+    return bitcast<f32>(y_bits);
 }
 
 @compute @workgroup_size(256)
@@ -2733,41 +3153,43 @@ fn main(
                 pen_l = pen_l + (e_l + params.gamma_n * abs(a_l)) * xmax;
                 pen_u = pen_u + (e_u + params.gamma_n * abs(a_u)) * xmax;
             } else {
-                // #eft-err: barrier-fma value sequence with EXACT per-op residuals
-                // (product via fma + TwoProdFMA residual, underflow-floored; add via
-                // plain RN + fma-barrier TwoSum residual). The MEASURED residual sum
+                // #eft-err: qualified core value sequence with measured or
+                // conservatively charged FMA residuals
+                // (core RN product + FMA residual, conservative/floored under
+                // measured FMA-operand DAZ; add via plain RN + fma-barrier
+                // TwoSum residual). The measured/conservative residual sum
                 // replaces the a-priori γ_n·|a| charge; the propagated coefficient
                 // error e·xmax stays. Sound for THIS executed sequence — the final
                 // penalty applies eft_r_slack (covers the residual lanes' own f32
                 // accumulation + final-assembly ops, host-computed outward).
-                var p = fma(a_l_pos, x_l, 0.0);
+                var p = a_l_pos * x_l;
                 var ep = abs(fma(a_l_pos, x_l, -p));
-                if (a_l_pos != 0.0 && x_l != 0.0 && abs(p) < F32_MIN_NORMAL) { ep = F32_MIN_NORMAL; }
+                if (a_l_pos != 0.0 && x_l != 0.0 && abs(p) < TWO_PROD_EXACT_FLOOR_F32) { ep = F32_MIN_NORMAL; }
                 var s = local_lb + p;
                 var bb = fma(-1.0, local_lb, s);
                 var sb = fma(-1.0, bb, s);
                 r_l = r_l + ep + abs(fma(-1.0, sb, local_lb) + fma(-1.0, bb, p));
                 local_lb = s;
-                p = fma(a_l_neg, x_u, 0.0);
+                p = a_l_neg * x_u;
                 ep = abs(fma(a_l_neg, x_u, -p));
-                if (a_l_neg != 0.0 && x_u != 0.0 && abs(p) < F32_MIN_NORMAL) { ep = F32_MIN_NORMAL; }
+                if (a_l_neg != 0.0 && x_u != 0.0 && abs(p) < TWO_PROD_EXACT_FLOOR_F32) { ep = F32_MIN_NORMAL; }
                 s = local_lb + p;
                 bb = fma(-1.0, local_lb, s);
                 sb = fma(-1.0, bb, s);
                 r_l = r_l + ep + abs(fma(-1.0, sb, local_lb) + fma(-1.0, bb, p));
                 local_lb = s;
 
-                p = fma(a_u_pos, x_u, 0.0);
+                p = a_u_pos * x_u;
                 ep = abs(fma(a_u_pos, x_u, -p));
-                if (a_u_pos != 0.0 && x_u != 0.0 && abs(p) < F32_MIN_NORMAL) { ep = F32_MIN_NORMAL; }
+                if (a_u_pos != 0.0 && x_u != 0.0 && abs(p) < TWO_PROD_EXACT_FLOOR_F32) { ep = F32_MIN_NORMAL; }
                 s = local_ub + p;
                 bb = fma(-1.0, local_ub, s);
                 sb = fma(-1.0, bb, s);
                 r_u = r_u + ep + abs(fma(-1.0, sb, local_ub) + fma(-1.0, bb, p));
                 local_ub = s;
-                p = fma(a_u_neg, x_l, 0.0);
+                p = a_u_neg * x_l;
                 ep = abs(fma(a_u_neg, x_l, -p));
-                if (a_u_neg != 0.0 && x_l != 0.0 && abs(p) < F32_MIN_NORMAL) { ep = F32_MIN_NORMAL; }
+                if (a_u_neg != 0.0 && x_l != 0.0 && abs(p) < TWO_PROD_EXACT_FLOOR_F32) { ep = F32_MIN_NORMAL; }
                 s = local_ub + p;
                 bb = fma(-1.0, local_ub, s);
                 sb = fma(-1.0, bb, s);
@@ -2783,8 +3205,8 @@ fn main(
             // |a|) loses up to max(|a|,|x|)·FLT_MIN — NOT covered by `pen` (which also
             // reads the flushed |a| as 0) nor a weight-independent floor. Accumulate
             // max(|a|,|x|,1) per tap; whichever operand FTZ zeroed, the survivor
-            // dominates the lost product. Vulkan keeps subnormals so this is exact
-            // here and validated by-construction (tests) + Metal CI.
+            // dominates the lost product. The live gradual-underflow gate, not a
+            // backend-name assumption, decides whether core subnormals are preserved.
             flushacc = flushacc + max(max(max(abs(a_l), abs(a_u)), xmax), 1.0);
         }
         j = j + 256u;
@@ -2835,15 +3257,35 @@ fn main(
     }
 
     if (local_id == 0u) {
-        // Widen OUTWARD by the penalty + amplified underflow floor; clamp non-finite
-        // to ±FALLBACK_BOUND (sound: a looser bound never excludes a real value).
+        // Widen OUTWARD by the penalty + amplified underflow floor. The host has
+        // already proved the complete exact affine radius is strictly below
+        // FALLBACK_BOUND, which is the necessary precondition making the
+        // non-finite repair to ±FALLBACK_BOUND an enclosure.
         // `flush` = weight-independent floor + §0 amplified operand-flush term.
         // #eft-err: `rs` = 0 in legacy mode (adding literal 0.0 to the non-negative
         // penalty is value-identical), else the measured-residual slack.
         let rs = select(0.0, params.eft_r_slack, params.eft_mode == 1u);
-        let flush = params.additive + sh_fa[0] * params.slack * F32_MIN_NORMAL;
-        var lb = sh_lb[0] + bias[spec_row] - (sh_pl[0] + sh_rl[0] * rs) - flush;
-        var ub = sh_ub[0] + bias[params.num_specs + spec_row] + (sh_pu[0] + sh_ru[0] * rs) + flush;
+        let flush_scaled = round_up_pos(round_up_pos(sh_fa[0] * params.slack) * F32_MIN_NORMAL);
+        let flush = round_up_pos(params.additive + flush_scaled);
+        // #concretize-assembly-round: assemble every verdict-facing operation in
+        // its safe direction.  In particular, the dominant penalty itself must
+        // participate in the final-subtraction rounding charge: charging only
+        // |endpoint|+|bias| is unsound when a small endpoint subtracts a large
+        // propagated-error penalty.
+        //
+        // `params.slack` recovers positive accumulation/multiply under-reporting
+        // in sh_pl/sh_pu (and is explicitly part of the EFT prop-error contract).
+        // The residual lane has its independent `rs` recovery factor.
+        let prop_l = round_up_pos(sh_pl[0] * params.slack);
+        let prop_u = round_up_pos(sh_pu[0] * params.slack);
+        let resid_l = round_up_pos(sh_rl[0] * rs);
+        let resid_u = round_up_pos(sh_ru[0] * rs);
+        let pen_l = round_up_pos(round_up_pos(prop_l + resid_l) + flush);
+        let pen_u = round_up_pos(round_up_pos(prop_u + resid_u) + flush);
+        let cl = next_down_f32_normal(sh_lb[0] + bias[spec_row]);
+        let cu = next_up_f32_normal(sh_ub[0] + bias[params.num_specs + spec_row]);
+        var lb = next_down_f32_normal(cl - pen_l);
+        var ub = next_up_f32_normal(cu + pen_u);
         if (is_non_finite(lb)) { lb = -FALLBACK_BOUND; }
         if (is_non_finite(ub)) { ub = FALLBACK_BOUND; }
         if (lb > ub) {
@@ -3009,9 +3451,14 @@ struct Params { n: u32, slack: f32, stride: u32, _p1: u32 }
 @group(0) @binding(3) var<storage, read> b: array<f32>;
 @group(0) @binding(4) var<storage, read> err_b: array<f32>;
 const U: f32 = 0.00000005960464477539063; // 2^-24
+const F32_MIN_NORMAL: f32 = 1.1754944e-38;
 fn round_up_pos(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
-    return bitcast<f32>(bitcast<u32>(x) + 1u);
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return F32_MIN_NORMAL; }
+    return bitcast<f32>(bits + 1u);
 }
 // Grid-stride over n (stride = total dispatched threads): a wide frontier
 // (num_specs*dim > 65535*256) exceeds the per-dim workgroup limit, so the

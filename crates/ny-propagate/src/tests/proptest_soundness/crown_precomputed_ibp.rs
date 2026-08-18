@@ -79,42 +79,25 @@ fn build_elapsed_deadline_crown_ibp_network_3397() -> (Network, BoundedTensor) {
     (network, input)
 }
 
-fn assert_deadline_layer_bounds_match(
-    plain_deadline_bounds: &[BoundedTensor],
+fn assert_owned_deadline_layer_bounds_match(
     precomputed_deadline_bounds: &[BoundedTensor],
     ibp_layer_bounds: &[BoundedTensor],
 ) {
-    assert_eq!(
-        plain_deadline_bounds.len(),
-        ibp_layer_bounds.len(),
-        "plain deadline bounds length should match IBP layer count"
-    );
     assert_eq!(
         precomputed_deadline_bounds.len(),
         ibp_layer_bounds.len(),
         "precomputed deadline bounds length should match IBP layer count"
     );
 
-    for (layer_idx, ((plain_layer, precomputed_layer), ibp_layer)) in plain_deadline_bounds
+    for (layer_idx, (precomputed_layer, ibp_layer)) in precomputed_deadline_bounds
         .iter()
-        .zip(precomputed_deadline_bounds.iter())
         .zip(ibp_layer_bounds.iter())
         .enumerate()
     {
         assert_tensor_matches(
-            plain_layer,
-            ibp_layer,
-            &format!("plain deadline layer {layer_idx} vs IBP"),
-        );
-        assert_tensor_matches(
             precomputed_layer,
             ibp_layer,
             &format!("precomputed deadline layer {layer_idx} vs IBP"),
-        );
-        assert_tensor_matches(
-            precomputed_layer,
-            plain_layer,
-            &format!("precomputed deadline layer {layer_idx} vs plain deadline"),
         );
     }
 }
@@ -307,14 +290,18 @@ proptest! {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_precomputed_ibp_elapsed_deadline_matches_plain_elapsed_deadline_3397() {
+fn test_precomputed_ibp_elapsed_deadline_moves_owned_output_without_fresh_work_3397() {
     let (network, input) = build_elapsed_deadline_output_network_3397();
 
     let expired_deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
 
-    let plain_deadline_output = network
+    let plain_error = network
         .propagate_crown_with_engine_and_deadline(&input, None, expired_deadline)
-        .unwrap();
+        .expect_err("fresh expired CROWN has no precollected output to publish");
+    assert!(
+        matches!(plain_error, ny_core::NyError::DeadlineExceeded(_)),
+        "expected typed deadline refusal, got {plain_error:?}"
+    );
     let ibp_layer_bounds = network.collect_ibp_bounds(&input).unwrap();
     let precomputed_deadline_output = network
         .propagate_crown_with_precomputed_ibp(&input, ibp_layer_bounds, None, expired_deadline)
@@ -322,33 +309,24 @@ fn test_precomputed_ibp_elapsed_deadline_matches_plain_elapsed_deadline_3397() {
     let ibp_output = network.propagate_ibp(&input).unwrap();
 
     assert_tensor_matches(
-        &plain_deadline_output,
-        &ibp_output,
-        "plain deadline fallback vs IBP",
-    );
-    assert_tensor_matches(
         &precomputed_deadline_output,
         &ibp_output,
-        "precomputed deadline fallback vs IBP",
-    );
-    assert_tensor_matches(
-        &precomputed_deadline_output,
-        &plain_deadline_output,
-        "precomputed deadline fallback vs plain deadline fallback",
+        "owned precomputed deadline fallback vs IBP",
     );
 }
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_precomputed_crown_ibp_elapsed_deadline_matches_plain_crown_ibp_3397() {
+fn test_precomputed_crown_ibp_elapsed_deadline_moves_owned_vector_3397() {
     let (network, input) = build_elapsed_deadline_crown_ibp_network_3397();
 
     let ibp_layer_bounds = network.collect_ibp_bounds(&input).unwrap();
     let expired_deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
 
-    let plain_deadline_bounds = network
+    let plain_error = network
         .collect_crown_ibp_bounds_with_engine_and_deadline(&input, None, expired_deadline)
-        .unwrap();
+        .expect_err("fresh expired collection must refuse before its IBP sweep");
+    assert!(matches!(plain_error, ny_core::NyError::DeadlineExceeded(_)));
     let precomputed_deadline_bounds = network
         .collect_crown_ibp_bounds_with_precomputed_ibp(
             &input,
@@ -357,9 +335,5 @@ fn test_precomputed_crown_ibp_elapsed_deadline_matches_plain_crown_ibp_3397() {
             expired_deadline,
         )
         .unwrap();
-    assert_deadline_layer_bounds_match(
-        &plain_deadline_bounds,
-        &precomputed_deadline_bounds,
-        &ibp_layer_bounds,
-    );
+    assert_owned_deadline_layer_bounds_match(&precomputed_deadline_bounds, &ibp_layer_bounds);
 }

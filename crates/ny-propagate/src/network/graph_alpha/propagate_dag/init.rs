@@ -28,8 +28,14 @@ use crate::network::core::GraphNetwork;
 /// needed by the optimization loop.
 #[allow(clippy::large_enum_variant)] // EarlyReturn (224B) vs Ready (8B boxed) — boxing both is unnecessary overhead
 pub(super) enum DagAlphaInitResult {
-    /// No optimizable activations found — return these bounds directly.
-    EarlyReturn(BoundedTensor),
+    /// No optimizable activations found — return these bounds directly. A
+    /// typed cGAN route also carries the already-paid-for collection artifact
+    /// so collection callers do not interpret the handled exit as "not
+    /// delegated" and start the typed transaction again.
+    EarlyReturn {
+        bounds: BoundedTensor,
+        collection_artifact: Option<super::DagAlphaCollectionArtifact>,
+    },
     /// Full initialized state for the optimization loop.
     Ready(Box<DagAlphaInitState>),
 }
@@ -81,15 +87,18 @@ impl GraphNetwork {
         input: &BoundedTensor,
         config: &AlphaCrownConfig,
         engine: Option<&dyn GemmEngine>,
+        precomputed_reference: Option<crate::network::graph_alpha::PrecomputedAlphaReferenceBounds>,
     ) -> Result<DagAlphaInitResult> {
         // Step 1: Collect the shared alpha reference bounds. With
         // `fix_interm_bounds=true`, DAG warmup now follows the same IBP contract
         // as the root bootstrap instead of forcing CROWN-IBP (#4404).
         let exec_order = self.exec_order()?;
-        let (mut node_bounds, node_bounds_source) = self
-            .collect_alpha_reference_bounds_with_engine_and_source(
+        let (mut node_bounds, node_bounds_source) = match precomputed_reference {
+            Some(reference) => (reference.bounds, reference.source),
+            None => self.collect_alpha_reference_bounds_with_engine_and_source(
                 input, config, engine, exec_order,
-            )?;
+            )?,
+        };
         node_bounds.insert(NETWORK_INPUT.to_string(), input.clone());
 
         // Determine output dimension
@@ -140,7 +149,15 @@ impl GraphNetwork {
             .cloned()
             .collect();
 
-        if relu_nodes.is_empty() && s_shaped_nodes.is_empty() && sqrt_nodes.is_empty() {
+        let gamma_only_invprop = config.invprop.optimize_gammas
+            && super::invprop_output_seed_treatment_eligible(config, output_dim)
+            && !super::uses_patches_output_seed(self, output_bounds);
+
+        if relu_nodes.is_empty()
+            && s_shaped_nodes.is_empty()
+            && sqrt_nodes.is_empty()
+            && !gamma_only_invprop
+        {
             // No optimizable activation nodes — optimize BilinearCrown alphas if present,
             // else fall back to the existing CROWN/Batched alpha dispatch.
             // Pure attention graphs (no ReLUs) benefit from McCormick face selection
@@ -150,9 +167,34 @@ impl GraphNetwork {
             debug!(
                 "DAG α-CROWN: No optimizable activation nodes, trying BilinearCrown alpha optimization"
             );
-            return Ok(DagAlphaInitResult::EarlyReturn(
-                self.propagate_alpha_crown_batched(input, config, engine)?,
-            ));
+            let has_bilinear = self
+                .nodes
+                .values()
+                .any(|node| matches!(node.layer, Layer::BilinearCrown(_)));
+            if node_bounds_source.is_typed_cgan() && !has_bilinear {
+                // The typed transaction already published a certified output
+                // enclosure. With no alpha-bearing activation or bilinear
+                // state there is nothing for the fallback optimizer to change;
+                // carrying this handled artifact prevents the outer collector
+                // from entering the typed transaction a second time.
+                let bounds = output_bounds.clone();
+                let alpha_state = GraphAlphaState::new();
+                return Ok(DagAlphaInitResult::EarlyReturn {
+                    bounds: bounds.clone(),
+                    collection_artifact: Some(super::DagAlphaCollectionArtifact {
+                        output_bounds: bounds,
+                        alpha_state,
+                        reference_bounds: node_bounds,
+                        reference_bounds_source: node_bounds_source,
+                        completed_iterations: 0,
+                        optimizer_updates_completed: 0,
+                    }),
+                });
+            }
+            return Ok(DagAlphaInitResult::EarlyReturn {
+                bounds: self.propagate_alpha_crown_batched(input, config, engine)?,
+                collection_artifact: None,
+            });
         }
 
         let mut graph_alpha_state = GraphAlphaState::new();
@@ -372,6 +414,7 @@ impl GraphNetwork {
                     state.layer_gammas.len()
                 );
                 invprop_state = Some(state);
+                crate::execution_telemetry::record_invprop_alpha_initialization();
             } else {
                 tracing::warn!(
                     "DAG α-CROWN: INVPROP enabled in config but no output_constraints provided"
@@ -385,12 +428,41 @@ impl GraphNetwork {
             relu_nodes.iter().map(|(name, _)| name.clone()).collect(),
         );
 
-        if runtime.graph().num_unstable() == 0 && !has_s_shaped && !has_sqrt && !has_reciprocal {
+        if runtime.graph().num_unstable() == 0
+            && !has_s_shaped
+            && !has_sqrt
+            && !has_reciprocal
+            && !gamma_only_invprop
+        {
             debug!("DAG α-CROWN: No optimizable activation state, using CROWN");
-            return Ok(DagAlphaInitResult::EarlyReturn(
-                self.propagate_crown_with_engine_and_deadline(input, engine, config.deadline)?
+            if node_bounds_source.is_typed_cgan() && !has_bilinear && !has_mul_binary {
+                let bounds = self
+                    .propagate_crown_with_engine_and_deadline_and_node_bounds(
+                        input,
+                        engine,
+                        config.deadline,
+                        Some(&node_bounds),
+                    )?
+                    .bounds;
+                let alpha_state = runtime.into_graph_alpha_state();
+                return Ok(DagAlphaInitResult::EarlyReturn {
+                    bounds: bounds.clone(),
+                    collection_artifact: Some(super::DagAlphaCollectionArtifact {
+                        output_bounds: bounds,
+                        alpha_state,
+                        reference_bounds: node_bounds,
+                        reference_bounds_source: node_bounds_source,
+                        completed_iterations: 0,
+                        optimizer_updates_completed: 0,
+                    }),
+                });
+            }
+            return Ok(DagAlphaInitResult::EarlyReturn {
+                bounds: self
+                    .propagate_crown_with_engine_and_deadline(input, engine, config.deadline)?
                     .bounds,
-            ));
+                collection_artifact: None,
+            });
         }
 
         Ok(DagAlphaInitResult::Ready(Box::new(DagAlphaInitState {

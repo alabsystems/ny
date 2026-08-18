@@ -11,18 +11,29 @@ readme.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Differential compatibility against the frozen external `ay` subprocess.
+# The production solver is the in-process `ay-milp` dependency, so this lane is
+# conformance coverage rather than a prerequisite for ordinary correctness.
+external-ay = []
+
 [dependencies]
 ny-core = { path = "../ny-core" }
 ny-tensor = { path = "../ny-tensor" }
 ny-cert = { path = "../ny-cert" }
+ny-levers = { path = "../ny-levers" }
 
 # ay-milp is the in-process MILP/LP backend, rev-pinned to a commit SHA
 # (never a floating branch); see docs/SOLVER_POLICY.md. Engine-dependent lanes
 # must verify that the revision contains the features their budget model uses.
-ay-milp = { git = "https://github.com/alabsystems/ay.git", rev = "d766b0365d2cf614428bfea6debb8c02a815f384" }
+ay-milp = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60" }
 num-bigint.workspace = true
 num-rational = "0.4"
 num-traits = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true
@@ -46,3 +57,9 @@ proptest.workspace = true
 [[bin]]
 name = "mip-diff"
 path = "src/bin/mip-diff.rs"
+
+# Offline, verdict-neutral audit of a captured root MILP and the fixed-prefix
+# family emitted by NY's phase-split race.
+[[bin]]
+name = "mip-shared-tree-profile"
+path = "src/bin/mip-shared-tree-profile.rs"

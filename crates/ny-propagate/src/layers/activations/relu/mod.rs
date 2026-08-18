@@ -132,6 +132,32 @@ pub(crate) fn relu_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     LinearRelaxation::new(alpha, 0.0, lambda, lambda_intercept)
 }
 
+/// Per-carrier-row spec-α lookup for the dense α backward
+/// (#spec-axis-alpha, design §5.2).
+///
+/// `slot_of_row[j]` names the materialized-α slot serving carrier row `j`
+/// (rows beyond the table, and `None` entries, read the shared vector).
+/// Built once per ReLU node by the walk — the row→slot resolution must never
+/// sit inside the `j × i` loop (external review: K=8 over 100×8k would pay
+/// ~6.4M scans per node).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpecRowAlphas<'a> {
+    pub(crate) slot_of_row: &'a [Option<usize>],
+    pub(crate) slot_alphas: &'a [Array1<f32>],
+}
+
+impl SpecRowAlphas<'_> {
+    /// The materialized lower-α for carrier row `j`, if row `j` is active
+    /// and its slot index is in range (out-of-range ⇒ shared, fail-closed).
+    fn lower_alpha_for_carrier_row(&self, carrier_row: usize) -> Option<&Array1<f32>> {
+        self.slot_of_row
+            .get(carrier_row)
+            .copied()
+            .flatten()
+            .and_then(|slot| self.slot_alphas.get(slot))
+    }
+}
+
 /// A ReLU activation layer.
 #[derive(Debug, Clone, Default)]
 pub struct ReLULayer;
@@ -548,7 +574,15 @@ impl ReLULayer {
         alpha: &Array1<f32>,
         alpha_upper: Option<&Array1<f32>>,
     ) -> Result<(LinearBounds, Array1<f32>, Array1<f32>)> {
-        self.propagate_linear_with_alpha_impl(bounds, pre_activation, alpha, alpha_upper, true)
+        self.propagate_linear_with_alpha_impl(
+            bounds,
+            pre_activation,
+            alpha,
+            alpha_upper,
+            None,
+            None,
+            true,
+        )
     }
 
     /// Bound-only counterpart of [`Self::propagate_linear_with_alpha`].
@@ -563,8 +597,52 @@ impl ReLULayer {
         alpha: &Array1<f32>,
         alpha_upper: Option<&Array1<f32>>,
     ) -> Result<LinearBounds> {
-        self.propagate_linear_with_alpha_impl(bounds, pre_activation, alpha, alpha_upper, false)
-            .map(|(bounds, _, _)| bounds)
+        self.propagate_linear_with_alpha_impl(
+            bounds,
+            pre_activation,
+            alpha,
+            alpha_upper,
+            None,
+            None,
+            false,
+        )
+        .map(|(bounds, _, _)| bounds)
+    }
+
+    /// Spec-row-aware variant (#spec-axis-alpha, design §5.2): active carrier
+    /// rows read their materialized per-spec LOWER α; every other row — and
+    /// the upper path unconditionally (design: upper stays shared until a
+    /// spec-upper δ is deliberately implemented) — reads the shared vectors.
+    /// `slot_of_row[j]` indexes into `slot_alphas`; rows beyond the table's
+    /// length are shared. Both entry points funnel here so a δ optimized
+    /// under the gradient pass and a bound published by the bound-only pass
+    /// see identical geometry.
+    ///
+    /// `spec_gradients` (slice 2b): when `Some`, receives the PER-SLOT
+    /// compose-local lower gradient — row `slot`'s own `∂bound/∂α` at
+    /// EXPANDED width (`K × num_neurons`), i.e. exactly the contribution the
+    /// shared `gradient_lower` sums away across rows. The shared gradient is
+    /// still accumulated over ALL rows (base α remains jointly steered; δ is
+    /// the per-row correction on top — design §3).
+    pub(crate) fn propagate_linear_with_alpha_spec_rows(
+        &self,
+        bounds: &LinearBounds,
+        pre_activation: &BoundedTensor,
+        alpha: &Array1<f32>,
+        alpha_upper: Option<&Array1<f32>>,
+        spec_rows: SpecRowAlphas<'_>,
+        spec_gradients: Option<&mut Array2<f32>>,
+        track_gradients: bool,
+    ) -> Result<(LinearBounds, Array1<f32>, Array1<f32>)> {
+        self.propagate_linear_with_alpha_impl(
+            bounds,
+            pre_activation,
+            alpha,
+            alpha_upper,
+            Some(spec_rows),
+            spec_gradients,
+            track_gradients,
+        )
     }
 
     fn propagate_linear_with_alpha_impl(
@@ -573,6 +651,8 @@ impl ReLULayer {
         pre_activation: &BoundedTensor,
         alpha: &Array1<f32>,
         alpha_upper: Option<&Array1<f32>>,
+        spec_rows: Option<SpecRowAlphas<'_>>,
+        mut spec_gradients: Option<&mut Array2<f32>>,
         track_gradients: bool,
     ) -> Result<(LinearBounds, Array1<f32>, Array1<f32>)> {
         debug!("ReLU layer α-CROWN backward propagation");
@@ -753,6 +833,20 @@ impl ReLULayer {
         };
 
         for j in 0..num_outputs {
+            // #spec-axis-alpha: an active carrier row reads its materialized
+            // per-spec LOWER α; every other row binds the SAME shared slice
+            // the non-spec path uses (bit-identical fallback — same reads,
+            // same arithmetic, same order). Resolved once per row, outside
+            // the neuron loop, so the inactive-row cost is one bounds check.
+            let row_alpha: &Array1<f32> = spec_rows
+                .as_ref()
+                .and_then(|table| table.lower_alpha_for_carrier_row(j))
+                .unwrap_or(alpha);
+            // Slot id for this row's per-slot gradient (slice 2b), resolved
+            // once per row like the α itself — never inside the neuron loop.
+            let row_slot: Option<usize> = spec_rows
+                .as_ref()
+                .and_then(|table| table.slot_of_row.get(j).copied().flatten());
             for i in 0..num_neurons {
                 let la = bounds.lower_a()[[j, i]];
                 let ua = bounds.upper_a()[[j, i]];
@@ -763,14 +857,21 @@ impl ReLULayer {
                 // alpha_lower_i: used when la > 0 (maximizes lower bound)
                 // alpha_upper_i: used when ua < 0 (minimizes upper bound)
                 // Reference: auto_LiRPA/operators/relu.py selected_alpha[0] vs [1]
+                // Upper path stays SHARED under #spec-axis-alpha (design:
+                // lower δ must never leak into `ua < 0` behavior).
                 let (alpha_lower_i, alpha_upper_i) = if l >= 0.0 {
                     (1.0, 1.0) // Always active
                 } else if u <= 0.0 {
                     (0.0, 0.0) // Always inactive
                 } else {
-                    // Crossing: use provided alphas
-                    let al = alpha[i];
-                    let au = alpha_upper.map_or(al, |a| a[i]);
+                    // Crossing: use provided alphas.
+                    // The single-alpha fallback for `au` reads the SHARED
+                    // vector, not `row_alpha`: lower δ must not leak into the
+                    // upper path through the map_or default (#spec-axis-alpha
+                    // upper-isolation; identical bytes when no spec rows are
+                    // active, since row_alpha IS alpha then).
+                    let al = row_alpha[i];
+                    let au = alpha_upper.map_or(alpha[i], |a| a[i]);
                     (al, au)
                 };
 
@@ -807,6 +908,13 @@ impl ReLULayer {
                         // The l_i < 0 factor is essential for correct sign.
                         // Reference: backward.rs AnalyticChain gradient. Fix: #3294
                         gradient_lower[i] += la * pre_lower[i];
+                        // #spec-axis-alpha slice 2b: the SAME contribution,
+                        // un-summed — row `slot`'s own ∂bound/∂α, feeding its
+                        // δ row instead of vanishing into the shared sum.
+                        if let (Some(spec_grads), Some(slot)) = (spec_gradients.as_mut(), row_slot)
+                        {
+                            spec_grads[[slot, i]] += la * pre_lower[i];
+                        }
                     }
                 } else if la < 0.0 {
                     let product = la * lambda[i];
@@ -1614,6 +1722,30 @@ impl BoundPropagation for ReLULayer {
 }
 
 impl ReLULayer {
+    /// Cooperative finite-deadline Patches backward for materialized 7D
+    /// explicit rows.
+    ///
+    /// This is intentionally an inherent, ReLU-only face rather than a change
+    /// to [`crate::layers::common::PatchesPropagation`]: the default-dark
+    /// Spec-CROWN call site is the sole production caller, while every other
+    /// activation and every no-deadline ReLU keeps the historical trait path.
+    pub(crate) fn propagate_patches_with_bounds_and_deadline(
+        &self,
+        bounds: &crate::bounds::patches::PatchesLinearBounds,
+        pre_activation: &BoundedTensor,
+        deadline: std::time::Instant,
+    ) -> Result<crate::bounds::patches::CrownBounds> {
+        // NaN-only guard (see the trait implementation below): the patches
+        // path uses the same proven relu_linear_relaxation infinite branches.
+        nan_only_domain_guard("ReLU", pre_activation)?;
+        crate::layers::common::crown_elementwise_backward_patches_with_deadline(
+            bounds,
+            pre_activation,
+            deadline,
+            relu_linear_relaxation,
+        )
+    }
+
     /// CROWN backward through ReLU in Patches mode with optimizable alpha.
     ///
     /// This is the Patches-mode counterpart of [`Self::propagate_linear_with_alpha`].
@@ -1645,6 +1777,43 @@ impl ReLULayer {
             bounds,
             pre_activation,
             alpha,
+        )
+    }
+
+    /// Prevalidate the narrowly admitted owned, in-place alpha-ReLU Patches route.
+    ///
+    /// This must run while the carrier is still borrowed. A successful plan
+    /// certifies that every fallible layout/shape/alpha/error invariant was
+    /// checked before the caller transfers ownership.
+    pub(crate) fn prepare_patches_with_alpha_in_place(
+        &self,
+        bounds: &crate::bounds::patches::PatchesLinearBounds,
+        pre_activation: &BoundedTensor,
+        alpha: &Array1<f32>,
+        deadline: std::time::Instant,
+    ) -> Result<crate::layers::common::PreparedAlphaPatchesReluInPlace> {
+        crate::layers::common::prepare_crown_relu_backward_patches_with_alpha_in_place(
+            bounds,
+            pre_activation,
+            alpha,
+            deadline,
+        )
+    }
+
+    /// Execute a prepared owned alpha-ReLU transform in place.
+    ///
+    /// On deadline expiry the owned carrier is dropped. The caller must
+    /// propagate the error upward and must not enter a Dense/Patches fallback.
+    pub(crate) fn propagate_prepared_patches_with_alpha_in_place(
+        &self,
+        bounds: Box<crate::bounds::patches::PatchesLinearBounds>,
+        prepared: crate::layers::common::PreparedAlphaPatchesReluInPlace,
+        pre_activation: &BoundedTensor,
+    ) -> Result<crate::bounds::patches::CrownBounds> {
+        crate::layers::common::crown_relu_backward_patches_with_alpha_in_place(
+            bounds,
+            prepared,
+            pre_activation,
         )
     }
 }

@@ -13,14 +13,18 @@ use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 use super::super::types::{LayerNormLayer, LayerNormMode};
 use super::slices;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
+use crate::layers::normalization::math_common::outward_midpoint_radius;
 
 impl LayerNormLayer {
     /// Forward-mode IBP for LayerNorm using Jacobian-based propagation.
     ///
     /// Computes the Jacobian at the center point (midpoint of bounds), then
-    /// propagates input radii through the absolute Jacobian to get sound
-    /// first-order output radii. A second-order remainder term is added to
-    /// account for curvature (the Jacobian varies across the input interval).
+    /// propagates input radii through the absolute Jacobian, and adds a
+    /// second-order remainder term for curvature.
+    ///
+    /// This implementation is admitted only as heuristic analysis, not as
+    /// proof authority. The outward arithmetic below hardens its enclosure
+    /// behavior but does not change that provenance classification.
     ///
     /// ## Math (LayerNorm Standard)
     ///
@@ -56,16 +60,9 @@ impl LayerNormLayer {
 
         // Non-finite inputs already rejected by propagate_ibp() caller.
 
-        // Compute center point (midpoint of bounds)
-        let center = (input.lower() + input.upper()) * 0.5;
-
-        // Compute half-width (radius) of input bounds
-        let radius = (input.upper() - input.lower()) * 0.5;
-
-        let has_nonfinite_center = center.iter().chain(radius.iter()).any(|&v| !v.is_finite());
-        if has_nonfinite_center {
+        let Some((center, radius)) = outward_midpoint_radius(input.lower(), input.upper()) else {
             return self.fallback_output_bounds(shape);
-        }
+        };
 
         match self.mode {
             LayerNormMode::Standard => {

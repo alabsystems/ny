@@ -29,7 +29,7 @@ pub(crate) use whisper_args::WhisperCommonArgs;
 #[derive(Parser)]
 #[command(name = "ny")]
 #[command(author = "ny Team")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Neural network verification and analysis CLI", long_about = None)]
 pub(crate) struct Cli {
     /// Verbosity level (-v info, -vv debug, -vvv trace)
@@ -55,7 +55,7 @@ impl Cli {
 
 #[derive(clap::Args)]
 pub(crate) struct VerifyArgs {
-    /// Path to model (ONNX, SafeTensors, PyTorch, GGUF, NNet)
+    /// Path to model (ONNX, NNet, PyTorch, SafeTensors, CoreML, or GGUF)
     #[arg(value_name = "MODEL")]
     pub(crate) model: Option<PathBuf>,
 
@@ -67,7 +67,7 @@ pub(crate) struct VerifyArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) config: Option<PathBuf>,
 
-    /// Root path for config inference (uses <root>/config.yaml if --config is omitted)
+    /// Root path for config inference (uses `<root>/config.yaml` if --config is omitted)
     #[arg(long, value_name = "PATH")]
     pub(crate) root_path: Option<PathBuf>,
 
@@ -85,7 +85,8 @@ pub(crate) struct VerifyArgs {
     #[arg(long, value_parser = clap::value_parser!(bool))]
     pub(crate) peel_off_last_softmax_layer: Option<bool>,
 
-    /// Verification method (ibp, crown, alpha, sdp, beta; default: alpha)
+    /// Verification method (ibp, crown, alpha, or beta; default: alpha).
+    /// Beta is sequential-only; use `beta-crown` for ONNX graph branch-and-bound.
     #[arg(long)]
     pub(crate) method: Option<String>,
 
@@ -97,16 +98,17 @@ pub(crate) struct VerifyArgs {
     #[arg(short, long)]
     pub(crate) timeout: Option<u64>,
 
-    /// Compute backend (cpu, wgpu; fallback: cpu when config does not
-    /// set general.device or solver.propagation.use_gpu)
+    /// Compute backend request (cpu, wgpu). WGPU constructs one proof device and
+    /// admits it only after every live verdict-qualification rung passes; any
+    /// initialization or rung failure emits a backend-override receipt and uses CPU.
     #[arg(long, value_enum)]
     pub(crate) backend: Option<BackendArg>,
 
     /// Use GPU acceleration (deprecated, use --backend wgpu instead)
-    #[arg(long, default_value_t = false, hide = true)]
+    #[arg(long, default_value_t = false, hide = true, conflicts_with = "backend")]
     pub(crate) gpu: bool,
 
-    /// Load as native format (PyTorch/SafeTensors/GGUF) instead of ONNX
+    /// Load with the native importer (PyTorch, SafeTensors, CoreML, or GGUF)
     #[arg(long, default_value_t = false)]
     pub(crate) native: bool,
 
@@ -182,8 +184,9 @@ pub(crate) struct VerifyArgs {
     pub(crate) allow_heuristic_softmax: bool,
 
     /// Treat Unknown results as success (exit code 0).
-    /// By default, Unknown returns exit code 2.
-    /// Use this for CI on problems that may timeout or be undecidable.
+    /// By default, Unknown returns exit code 2. Timeout remains exit code 3.
+    /// Use this only for CI workflows that explicitly accept an unresolved
+    /// (but completed) verification result.
     #[arg(long, default_value_t = false)]
     pub(crate) allow_unknown: bool,
 
@@ -193,8 +196,9 @@ pub(crate) struct VerifyArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) double_fp: bool,
 
-    /// Shrink VNN-LIB input bounds inward by this epsilon (soundness defense).
+    /// Shrink VNN-LIB input bounds inward by this epsilon.
     /// Each dimension's lower bound increases by eps and upper bound decreases by eps.
+    /// WARNING: this verifies a smaller property domain, not the original VNN-LIB domain.
     /// Required for soundnessbench (`shrink_eps: 1e-10`).
     /// Reference: alpha-beta-CROWN `shrink_vnnlib` (`specifications.py:535-540`).
     #[arg(long, value_name = "EPS")]
@@ -293,13 +297,13 @@ pub(crate) struct BenchArgs {
 
     /// Use wgpu GPU acceleration (deprecated, use --backend wgpu).
     /// Honored only by the full-suite CROWN microbenchmark.
-    #[arg(long, default_value_t = false, hide = true)]
+    #[arg(long, default_value_t = false, hide = true, conflicts_with = "backend")]
     pub(crate) gpu: bool,
 }
 
 #[derive(clap::Args)]
 pub(crate) struct BetaCrownArgs {
-    /// Path to ONNX model
+    /// Path to model (ONNX or NNet)
     pub(crate) model: PathBuf,
 
     /// VNN-LIB property file (.vnnlib) specifying input bounds and output constraints
@@ -333,11 +337,23 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) allow_heuristic_softmax: bool,
 
-    /// Maximum number of domains to explore (default: 10000, or preset value)
+    /// Maximum number of domains to explore (default: 100000, or preset value)
     #[arg(long)]
     pub(crate) max_domains: Option<usize>,
 
-    /// Timeout in seconds (default: 300, or preset value)
+    /// Estimated graph BaB queue-payload budget in bytes.
+    ///
+    /// Zero means unlimited. The highest-priority domain is retained even if it
+    /// alone exceeds the budget. If the cap evicts any unverified domain, the
+    /// verifier returns unknown rather than claiming a proof from an
+    /// incomplete search.
+    #[arg(long)]
+    pub(crate) max_queue_bytes: Option<usize>,
+
+    /// Timeout in seconds (default: 300, or preset value).
+    ///
+    /// Zero is unbounded for BaB. MIP-only verification requires a positive
+    /// timeout so solver and certificate phases have an authority deadline.
     #[arg(long)]
     pub(crate) timeout: Option<u64>,
 
@@ -402,7 +418,9 @@ pub(crate) struct BetaCrownArgs {
     /// Use CROWN-IBP bounds for intermediate nodes (O(N²) but tighter).
     /// By default, uses IBP bounds (O(N), faster but looser - 3000x+ expansion).
     /// This matches α,β-CROWN's fix_interm_bounds=False setting.
-    /// WARNING: Can be slow for deep networks (ResNet-4b: ~80s init vs <5s with IBP).
+    /// WARNING: Time and memory can be extreme on large graphs; a measured
+    /// ml4acopf case exceeded 100 GiB RSS. Use only on small graphs under
+    /// externally enforced resource limits.
     #[arg(long, default_value_t = false)]
     pub(crate) crown_ibp_intermediates: bool,
 
@@ -493,10 +511,13 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) sequential_children: bool,
 
-    /// Enable GCP-CROWN cutting planes (improves verification even without generating cuts)
+    /// Request experimental GCP-CROWN cutting planes.
+    ///
+    /// Certificate-bearing cut authority is currently quarantined, so this
+    /// request is rejected during verifier configuration validation.
     #[arg(
         long,
-        default_value_t = true,
+        default_value_t = false,
         value_parser = clap::value_parser!(bool),
         num_args = 0..=1,
         default_missing_value = "true"
@@ -516,8 +537,7 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long)]
     pub(crate) min_cut_depth: Option<usize>,
 
-    /// Enable near-miss cut generation (experimental)
-    /// Generates cuts from domains close to verification but not quite verified.
+    /// Request near-miss cut generation (quarantined; not proof-derived).
     #[arg(long, default_value_t = false)]
     pub(crate) enable_near_miss_cuts: bool,
 
@@ -526,9 +546,7 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long)]
     pub(crate) near_miss_margin: Option<f32>,
 
-    /// Enable proactive cut generation (BICCOS-lite).
-    /// Generates cuts for unstable ReLUs BEFORE BaB starts.
-    /// Helps on hard instances where initial bounds are loose.
+    /// Request proactive cut generation (quarantined; not proof-derived).
     #[arg(long, default_value_t = false)]
     pub(crate) proactive_cuts: bool,
 
@@ -566,11 +584,12 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) clip_in_alpha_crown: bool,
 
-    /// Prune infeasible domains during activation-space clipping.
+    /// Reserved pruning authority. Rejected with --clip-interm-domain until
+    /// certificate-backed pruning is implemented.
     #[arg(long, default_value_t = false)]
     pub(crate) clip_interm_prune: bool,
 
-    /// Use final-layer constraints when pruning clipped domains.
+    /// Reserved final-layer pruning extension; no effect while pruning is quarantined.
     #[arg(long, default_value_t = false)]
     pub(crate) clip_interm_use_final_layer: bool,
 
@@ -612,7 +631,10 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long)]
     pub(crate) pgd_steps: Option<usize>,
 
-    /// Compute backend (cpu, wgpu). Falls back to preset general.device, then CPU.
+    /// Compute backend request (cpu, wgpu). Falls back to preset general.device,
+    /// then the size-aware automatic choice. A selected WGPU route retains the
+    /// exact device only after live proof qualification; refusal is reported and
+    /// falls back to CPU.
     #[arg(long, value_enum)]
     pub(crate) backend: Option<BackendArg>,
 
@@ -633,8 +655,8 @@ pub(crate) struct BetaCrownArgs {
     pub(crate) json: bool,
 
     /// Use GPU-accelerated BaB with DomainList storage.
-    /// Enables verify_graph_gpu_domain_list for efficient batched GPU processing.
-    /// Requires --branching relu (ReLU splitting for graph models).
+    /// Routes graph verification through the batched DomainList engine;
+    /// input and ReLU splitting are both supported.
     #[arg(long, default_value_t = false)]
     pub(crate) gpu_bab: bool,
 
@@ -653,7 +675,7 @@ pub(crate) struct BetaCrownArgs {
     ///   Without it, auto behaves like bab and mip falls back to
     ///   branch-and-bound.
     /// - bab: Branch-and-bound with β-CROWN bounds only (never escalates).
-    /// - mip: Direct SMT encoding with Big-M ReLUs (VNN-COMP compatibility)
+    /// - mip: Exact Big-M encoding solved by ay (VNN-COMP compatibility).
     ///   For small networks, "mip" may be faster than BaB.
     #[arg(long, value_enum, default_value_t = CompleteVerifierArg::Auto)]
     pub(crate) complete_verifier: CompleteVerifierArg,
@@ -679,24 +701,18 @@ pub(crate) struct BetaCrownArgs {
     pub(crate) competition_mode: bool,
 
     /// Force-disable certificate emission even outside competition mode.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "emit_certificate")]
     pub(crate) no_certificate: bool,
 
     /// Emit the proof-carrying certificate sidecar to this path (forces
     /// emission ON regardless of --competition-mode). When omitted and
-    /// certificates are enabled, the default path is `<model>.cert.json`.
+    /// certificates are enabled, the default path is `<model-stem>.cert.json`.
     #[arg(long)]
     pub(crate) emit_certificate: Option<PathBuf>,
 
-    /// Speed override: ALLOW the UNSOUND fast f32 GPU CROWN backward to decide
-    /// verdicts. By DEFAULT the soundness gate is ENGAGED so every verdict-
-    /// deciding CROWN bound takes a PROVEN-SOUND path (the sound GPU-resident
-    /// backward — still GPU-accelerated — or the CPU f64+γ_n·S fallback). The
-    /// unsound fast path can be *tighter than the true range* and flip a
-    /// genuinely-violated instance to `Verified`/`unsat`, so this trades
-    /// correctness for speed — DO NOT use it when the verdict must be trusted.
-    /// No effect on CPU-only runs. Ignored under `--competition-mode` (always sound).
-    #[arg(long, default_value_t = false)]
+    /// Removed compatibility flag. Passing it is an error; unsound GPU bounds
+    /// are never admitted to a verdict.
+    #[arg(long, default_value_t = false, hide = true)]
     pub(crate) allow_unsound_gpu_crown: bool,
 }
 
@@ -708,10 +724,10 @@ pub(crate) enum Commands {
 
     /// Load and inspect a model
     Inspect {
-        /// Path to model (ONNX, PyTorch .pt/.pth, SafeTensors)
+        /// Path to model (ONNX, PyTorch, SafeTensors, CoreML, or GGUF)
         model: PathBuf,
 
-        /// Load as native format (PyTorch/SafeTensors) instead of ONNX
+        /// Load with the native importer (PyTorch, SafeTensors, CoreML, or GGUF)
         #[arg(long, default_value_t = false)]
         native: bool,
 
@@ -779,7 +795,7 @@ pub(crate) enum Commands {
         backend: BackendArg,
 
         /// Use wgpu GPU acceleration (deprecated, use --backend wgpu)
-        #[arg(long, default_value_t = false, hide = true)]
+        #[arg(long, default_value_t = false, hide = true, conflicts_with = "backend")]
         gpu: bool,
 
         /// Print per-element comparison details
@@ -893,7 +909,7 @@ pub(crate) enum Commands {
 
     /// Profile bound width growth through the network
     ProfileBounds {
-        /// Path to model (ONNX, SafeTensors, PyTorch, GGUF)
+        /// Path to model (ONNX, PyTorch, SafeTensors, CoreML, or GGUF)
         model: PathBuf,
 
         /// Input perturbation epsilon
@@ -914,7 +930,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         threshold: Option<f32>,
 
-        /// Load as native format (PyTorch/SafeTensors/GGUF) instead of ONNX
+        /// Load with the native importer (PyTorch, SafeTensors, CoreML, or GGUF)
         #[arg(long, default_value_t = false)]
         native: bool,
 
@@ -928,125 +944,130 @@ pub(crate) enum Commands {
         center_zeros: bool,
     },
 
-    /// Verify a Whisper model component
+    /// Unavailable Whisper verification compatibility command (fails closed)
     Whisper {
-        /// Path to Whisper ONNX model
+        /// Retained model path argument; the unavailable command does not open it
         model: PathBuf,
 
-        /// Component to verify (encoder, attention)
+        /// Retained component selector; ignored while verification is unavailable
         #[arg(short, long, default_value = "encoder")]
         component: String,
 
-        /// Specific layer index (optional)
+        /// Retained layer selector; ignored while verification is unavailable
         #[arg(short, long)]
         layer: Option<usize>,
 
-        /// Input perturbation epsilon
+        /// Retained perturbation value; ignored while verification is unavailable
         #[arg(short, long, default_value = "0.01")]
         epsilon: f32,
 
-        /// Output as JSON
+        /// Retained compatibility flag; the fail-closed error uses normal CLI text
         #[arg(long, default_value_t = false)]
         json: bool,
     },
 
-    /// Verify multiple Whisper encoder blocks sequentially (diagnostic tool)
+    /// Unavailable experimental Whisper sequential command (fails closed)
     #[command(hide = true)]
     WhisperSeq {
         #[command(flatten)]
         common: WhisperCommonArgs,
 
-        /// Input perturbation epsilon
+        /// Retained perturbation value; ignored while verification is unavailable
         #[arg(short, long, default_value = "0.01")]
         epsilon: f32,
 
-        /// Multi-block config preset: default, strict, diagnostic, sound-tight
+        /// Retained configuration preset; ignored while verification is unavailable
         #[arg(long, default_value = "default")]
         mode: String,
 
-        /// Override: terminate on NaN/Infinity (true/false)
+        /// Retained overflow option; ignored while verification is unavailable
         #[arg(long, value_parser = clap::value_parser!(bool))]
         terminate_on_overflow: Option<bool>,
 
-        /// Override: continue after overflow by clamping (true/false)
+        /// Retained overflow option; ignored while verification is unavailable
         #[arg(long, value_parser = clap::value_parser!(bool))]
         continue_after_overflow: Option<bool>,
 
-        /// Override: clamp value used when continuing after overflow
+        /// Retained clamp value; ignored while verification is unavailable
         #[arg(long)]
         overflow_clamp_value: Option<f32>,
     },
 
-    /// Sweep epsilon for sequential verification (find stable ranges)
+    /// Unavailable experimental Whisper epsilon-sweep command (fails closed)
     #[command(hide = true)]
     WhisperSweep {
         #[command(flatten)]
         common: WhisperCommonArgs,
 
-        /// Minimum epsilon (inclusive)
+        /// Retained sweep minimum; ignored while verification is unavailable
         #[arg(long, default_value = "0.000001")]
         epsilon_min: f32,
 
-        /// Maximum epsilon (inclusive)
+        /// Retained sweep maximum; ignored while verification is unavailable
         #[arg(long, default_value = "0.01")]
         epsilon_max: f32,
 
-        /// Number of sweep points
+        /// Retained sweep size; ignored while verification is unavailable
         #[arg(long, default_value_t = 10)]
         steps: usize,
 
-        /// Sweep linearly instead of logarithmically
+        /// Retained sweep-spacing flag; ignored while verification is unavailable
         #[arg(long, default_value_t = false)]
         linear: bool,
 
-        /// Multi-block config preset: default, strict, diagnostic, sound-tight (default: strict)
+        /// Retained configuration preset; ignored while verification is unavailable
         #[arg(long, default_value = "strict")]
         mode: String,
 
-        /// Print per-block width details for each epsilon point
+        /// Retained reporting flag; ignored while verification is unavailable
         #[arg(long, default_value_t = false)]
         per_block: bool,
     },
 
-    /// Binary-search for maximum epsilon that completes N blocks
+    /// Unavailable experimental Whisper epsilon-search command (fails closed)
     #[command(hide = true)]
     WhisperEpsSearch {
         #[command(flatten)]
         common: WhisperCommonArgs,
 
-        /// Target number of blocks to complete without overflow/early termination
+        /// Retained target block count; ignored while verification is unavailable
         #[arg(long)]
         target_blocks: Option<usize>,
 
-        /// Minimum epsilon (inclusive, search lower bound)
+        /// Retained search minimum; ignored while verification is unavailable
         #[arg(long, default_value = "0.000001")]
         epsilon_min: f32,
 
-        /// Maximum epsilon (inclusive, search upper bound)
+        /// Retained search maximum; ignored while verification is unavailable
         #[arg(long, default_value = "0.01")]
         epsilon_max: f32,
 
-        /// Number of binary search iterations (default: 20 for ~1e-6 precision ratio)
+        /// Retained iteration count; ignored while verification is unavailable
         #[arg(long, default_value_t = 20)]
         iterations: usize,
 
-        /// Multi-block config preset: default, strict, diagnostic, sound-tight (default: strict)
+        /// Retained configuration preset; ignored while verification is unavailable
         #[arg(long, default_value = "strict")]
         mode: String,
 
-        /// Show progress for each iteration
+        /// Retained progress flag; ignored while verification is unavailable
         #[arg(long, default_value_t = false)]
         verbose_search: bool,
     },
 
-    /// Generate export script for PyTorch models
+    /// Generate a Whisper encoder export script for loading and block analysis
     Export {
-        /// Model type (whisper, custom)
-        #[arg(short, long, default_value = "whisper")]
+        /// Model type
+        #[arg(short, long, default_value = "whisper", value_parser = ["whisper"])]
         model_type: String,
 
-        /// Model size (tiny, base, small, medium, large)
-        #[arg(short, long, default_value = "tiny")]
+        /// Whisper model size
+        #[arg(
+            short,
+            long,
+            default_value = "tiny",
+            value_parser = ["tiny", "base", "small", "medium", "large"]
+        )]
         size: String,
 
         /// Output script path
@@ -1081,7 +1102,7 @@ pub(crate) enum Commands {
         category: Option<String>,
     },
 
-    /// Download and inspect benchmark assets.
+    /// Acquire, inspect, run, score, and metamorphically check benchmarks.
     Benchmarks {
         #[command(subcommand)]
         action: commands::vnncomp_benchmarks::BenchmarkAssetsAction,
@@ -1173,6 +1194,46 @@ pub(crate) enum Commands {
     /// Run β-CROWN branch-and-bound complete verification
     BetaCrown(Box<BetaCrownArgs>),
 
+    /// VNN-COMP competition entry point (`v1`) and its explicit-plan printer (`plan`).
+    Vnncomp {
+        #[command(subcommand)]
+        action: VnncompAction,
+    },
+
+    /// Run explicit, non-verdict VNN-COMP research probes.
+    #[command(hide = true)]
+    VnncompResearch {
+        #[command(subcommand)]
+        action: commands::vnncomp::VnncompResearchAction,
+    },
+
+    /// Inspect and compare model weights (ONNX, SafeTensors, PyTorch, CoreML, or GGUF)
+    Weights {
+        #[command(subcommand)]
+        action: commands::weights::WeightsAction,
+    },
+
+    /// Geometric ground-truth utilities: evaluate .gt.json specs and verify
+    /// networks against analytic geometry (docs/GEOMETRIC_GROUND_TRUTH_PLAN.md)
+    Gt {
+        #[command(subcommand)]
+        action: commands::gt::GtAction,
+    },
+
+    /// Learn to verify neural networks, interactively (start with no argument)
+    Tutorial {
+        #[command(subcommand)]
+        topic: Option<commands::tutorial::TutorialTopic>,
+    },
+}
+
+/// VNN-COMP subcommands. `v1` is the scored protocol; `plan` is the I2
+/// explicit-plan printer over the same inputs. Both spell their argv exactly
+/// as the competition harness does, so `ny vnncomp v1 CATEGORY ONNX VNNLIB
+/// RESULTS_FILE TIMEOUT [--configs-dir DIR]` is byte-identical to the
+/// pre-subcommand CLI (the wrapper and sweep invocations never change).
+#[derive(Subcommand)]
+pub(crate) enum VnncompAction {
     /// Run a single VNN-COMP benchmark instance end-to-end (competition entry point).
     ///
     /// This is the native implementation of the `run_instance.sh` protocol: it
@@ -1182,11 +1243,13 @@ pub(crate) enum Commands {
     /// VNN-COMP result string (unsat/sat/timeout/unknown/error), and writes RESULTS_FILE
     /// (first line = result; for `sat`, the SMT-LIB counterexample witness is appended).
     ///
+    /// Experimental cGAN note: `NY_CGAN_INPUT_LEAF=1` requires an `mip` build and
+    /// only arms the authenticated `cgan_2023` input-leaf route. Its depth-two
+    /// replay is production-disabled and reported as `disabled_not_requested`;
+    /// dormant APIs do not run.
+    ///
     /// Protocol: `ny vnncomp v1 CATEGORY ONNX VNNLIB RESULTS_FILE TIMEOUT`.
-    Vnncomp {
-        /// Protocol version string; must be exactly "v1".
-        version: String,
-
+    V1 {
         /// Benchmark category (e.g. `acasxu_2023`, `cifar100_2024`). Drives preset auto-loading.
         category: String,
 
@@ -1212,23 +1275,37 @@ pub(crate) enum Commands {
         configs_dir: Option<PathBuf>,
     },
 
-    /// Inspect and compare model weights (SafeTensors, ONNX)
-    Weights {
-        #[command(subcommand)]
-        action: commands::weights::WeightsAction,
-    },
+    /// Print the resolved run plan for one instance WITHOUT running it (I2).
+    ///
+    /// Shows the detected backend/host, the loaded-model facts, every resolved
+    /// setting as `name = value  [source]` (default / preset override /
+    /// measured rule with its evidence citation / backend detect), and the
+    /// budget-ledger snapshot (scored budget, internal tier, attack slice,
+    /// alpha cap). See docs/PLAN_RESOLVER_V1_2026-08-01.md.
+    Plan {
+        /// Benchmark category (e.g. `cifar100_2024`). Drives preset auto-loading.
+        category: String,
 
-    /// Geometric ground-truth utilities: evaluate .gt.json specs and verify
-    /// networks against analytic geometry (docs/GEOMETRIC_GROUND_TRUTH_PLAN.md)
-    Gt {
-        #[command(subcommand)]
-        action: commands::gt::GtAction,
-    },
+        /// Path to the ONNX model for this instance (model facts are derived
+        /// from the LOADED model, never from the filename).
+        onnx: PathBuf,
 
-    /// Learn to verify neural networks, interactively (start with no argument)
-    Tutorial {
-        #[command(subcommand)]
-        topic: Option<commands::tutorial::TutorialTopic>,
+        /// Path to the VNN-LIB property file for this instance.
+        vnnlib: PathBuf,
+
+        /// Scored competition budget, in seconds (fractional accepted, floored).
+        #[arg(value_parser = parse_budget_secs)]
+        budget_secs: u64,
+
+        /// Directory containing the `vnncomp*/{category}.yaml` presets.
+        /// Defaults to auto-derivation from the binary/ONNX path (nearest ancestor
+        /// `configs/` directory).
+        #[arg(long)]
+        configs_dir: Option<PathBuf>,
+
+        /// Output as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 

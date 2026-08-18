@@ -108,6 +108,20 @@ fn test_multi_depth_parallel_creates_more_children_2767() {
     );
 }
 
+#[test]
+fn parallel_fallback_caps_parent_at_max_depth_minus_one() {
+    assert_eq!(
+        super::super::cap_relu_split_depth_for_parent(4, 8, 3, 4),
+        1,
+        "parallel fallback must reduce a depth-four request to the last legal level"
+    );
+    assert_eq!(
+        super::super::cap_relu_split_depth_for_parent(4, 8, 4, 4),
+        0,
+        "a max-depth parent must not expand"
+    );
+}
+
 /// Regression test for #1915: if graph branch selection fails in the parallel
 /// path, domain processing must return `PropagationFailure` instead of silently
 /// continuing with stale state.

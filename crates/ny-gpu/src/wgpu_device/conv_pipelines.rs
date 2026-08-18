@@ -6,8 +6,6 @@
 //!
 //! Split from crown_pipelines.rs for file size compliance.
 
-use std::borrow::Cow;
-
 use super::shaders::{CONV_COL2IM_SHADER, CONV_RESHAPE_SHADER};
 use super::WgpuDevice;
 
@@ -16,11 +14,14 @@ impl WgpuDevice {
     /// 3 bindings: params (uniform), src (read), dst (write).
     pub(super) fn create_conv_reshape_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("conv_reshape_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CONV_RESHAPE_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "conv_reshape_shader",
+            CONV_RESHAPE_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("conv_reshape_bind_group_layout"),
@@ -83,11 +84,14 @@ impl WgpuDevice {
     /// 3 bindings: params (uniform), gemm_out (read), dst (write).
     pub(super) fn create_conv_col2im_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("conv_col2im_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CONV_COL2IM_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "conv_col2im_shader",
+            CONV_COL2IM_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("conv_col2im_bind_group_layout"),

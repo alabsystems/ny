@@ -10,14 +10,57 @@ use clap::{Command, CommandFactory, Parser};
 #[test]
 fn cli_beta_crown_default_mip_solver_is_preset_driven() {
     // No `--mip-solver` parses as None: the handler then applies the preset's
-    // `solver.mip.mip_solver`, falling back to HiGHS (the working backend, so
-    // `--complete-verifier mip` still works without an explicit `--mip-solver`;
-    // the AY stub bails and would surface as a competition `error`).
+    // `solver.mip.mip_solver`, with ay as the only selectable solver.
     let cli = Cli::parse_from(["ny", "beta-crown", "model.onnx"]);
     let (_, _, command) = cli.into_parts();
     match command {
         Commands::BetaCrown(args) => {
             assert_eq!(args.mip_solver, None);
+        }
+        _ => panic!("expected beta-crown command"),
+    }
+}
+
+#[test]
+fn cli_beta_crown_cut_authority_defaults_off() {
+    let cli = Cli::parse_from(["ny", "beta-crown", "model.onnx"]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::BetaCrown(args) => {
+            assert!(
+                !args.enable_cuts,
+                "standalone beta-crown must not request quarantined cut authority by default"
+            );
+            assert!(!args.enable_near_miss_cuts);
+            assert!(!args.proactive_cuts);
+        }
+        _ => panic!("expected beta-crown command"),
+    }
+
+    let cli = Cli::parse_from(["ny", "beta-crown", "model.onnx", "--enable-cuts"]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::BetaCrown(args) => assert!(
+            args.enable_cuts,
+            "an explicit research request should parse before validation rejects it"
+        ),
+        _ => panic!("expected beta-crown command"),
+    }
+}
+
+#[test]
+fn cli_beta_crown_parses_queue_memory_cap() {
+    let cli = Cli::parse_from([
+        "ny",
+        "beta-crown",
+        "model.onnx",
+        "--max-queue-bytes",
+        "2147483648",
+    ]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::BetaCrown(args) => {
+            assert_eq!(args.max_queue_bytes, Some(2 * 1024 * 1024 * 1024));
         }
         _ => panic!("expected beta-crown command"),
     }
@@ -83,8 +126,8 @@ fn cli_parses_inspect_timing_profile_flag() {
 }
 
 #[test]
-fn cli_parses_compare_backend_flags() {
-    let cli = Cli::parse_from([
+fn cli_rejects_compare_backend_and_legacy_gpu_together() {
+    let result = Cli::try_parse_from([
         "ny",
         "compare",
         "reference.onnx",
@@ -93,15 +136,10 @@ fn cli_parses_compare_backend_flags() {
         "wgpu",
         "--gpu",
     ]);
-    let (_, _, command) = cli.into_parts();
-
-    match command {
-        Commands::Compare { backend, gpu, .. } => {
-            assert_eq!(backend, BackendArg::Wgpu);
-            assert!(gpu);
-        }
-        _ => panic!("expected compare command"),
-    }
+    assert!(
+        result.is_err(),
+        "the legacy --gpu flag must not override an explicit --backend"
+    );
 }
 
 fn subcommand_arg_help(command: &Command, arg_id: &str) -> String {
@@ -155,8 +193,8 @@ fn cli_help_keeps_compare_and_diff_onnx_contracts() {
 }
 
 #[test]
-fn cli_parses_bench_backend_flags() {
-    let cli = Cli::parse_from([
+fn cli_rejects_bench_backend_and_legacy_gpu_together() {
+    let result = Cli::try_parse_from([
         "ny",
         "bench",
         "--benchmark",
@@ -165,15 +203,10 @@ fn cli_parses_bench_backend_flags() {
         "wgpu",
         "--gpu",
     ]);
-    let (_, _, command) = cli.into_parts();
-
-    match command {
-        Commands::Bench(args) => {
-            assert_eq!(args.backend, BackendArg::Wgpu);
-            assert!(args.gpu);
-        }
-        _ => panic!("expected bench command"),
-    }
+    assert!(
+        result.is_err(),
+        "the legacy --gpu flag must not override an explicit --backend"
+    );
 }
 
 #[test]
@@ -374,4 +407,124 @@ fn cli_top_level_about_matches_repo_scope() {
         about.contains("verification"),
         "top-level about should mention verification: {about}"
     );
+}
+
+#[test]
+fn cli_version_comes_from_package_metadata() {
+    let cmd = Cli::command();
+    assert_eq!(
+        cmd.get_version(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "Clap version must track the package version"
+    );
+}
+
+#[test]
+fn cli_rejects_conflicting_certificate_flags() {
+    let result = Cli::try_parse_from([
+        "ny",
+        "beta-crown",
+        "model.onnx",
+        "--no-certificate",
+        "--emit-certificate",
+        "model.cert.json",
+    ]);
+    assert!(
+        result.is_err(),
+        "contradictory certificate flags must not depend on argument precedence"
+    );
+}
+
+#[test]
+fn cli_vnncomp_v1_protocol_argv_is_unchanged() {
+    // PROTOCOL PIN: run_instance.sh and vnncomp_sweep.rs both spell exactly
+    // `ny vnncomp v1 CATEGORY ONNX VNNLIB RESULTS TIMEOUT [--configs-dir D]`.
+    // Converting `v1` from a positional to a subcommand must be argv-invisible.
+    let cli = Cli::parse_from([
+        "ny",
+        "vnncomp",
+        "v1",
+        "cifar100_2024",
+        "model.onnx",
+        "prop.vnnlib",
+        "out/results.txt",
+        "210.0",
+        "--configs-dir",
+        "configs",
+    ]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::Vnncomp {
+            action:
+                super::VnncompAction::V1 {
+                    category,
+                    timeout_secs,
+                    configs_dir,
+                    ..
+                },
+        } => {
+            assert_eq!(category, "cifar100_2024");
+            assert_eq!(timeout_secs, 210, "fractional budget must floor to 210");
+            assert_eq!(
+                configs_dir.as_deref(),
+                Some(std::path::Path::new("configs"))
+            );
+        }
+        _ => panic!("expected vnncomp v1 command"),
+    }
+}
+
+#[test]
+fn cli_vnncomp_v1_help_marks_cgan_depth_two_production_disabled() {
+    let command = Cli::command();
+    let vnncomp = command
+        .find_subcommand("vnncomp")
+        .expect("vnncomp subcommand should exist");
+    let v1 = vnncomp
+        .find_subcommand("v1")
+        .expect("vnncomp v1 subcommand should exist");
+    let help = v1
+        .get_long_about()
+        .or_else(|| v1.get_about())
+        .expect("vnncomp v1 help should exist")
+        .to_string();
+    assert!(help.contains("NY_CGAN_INPUT_LEAF=1"));
+    assert!(help.contains("requires an `mip` build"));
+    assert!(help.contains("depth-two replay is production-disabled"));
+    assert!(help.contains("disabled_not_requested"));
+}
+
+#[test]
+fn cli_vnncomp_plan_parses_instance_shape() {
+    // I2: the plan printer takes the same instance quadruple as the scored
+    // path, minus RESULTS_FILE, plus --json.
+    let cli = Cli::parse_from([
+        "ny",
+        "vnncomp",
+        "plan",
+        "cifar100_2024",
+        "model.onnx",
+        "prop.vnnlib",
+        "100",
+        "--json",
+    ]);
+    let (_, _, command) = cli.into_parts();
+    match command {
+        Commands::Vnncomp {
+            action:
+                super::VnncompAction::Plan {
+                    category,
+                    budget_secs,
+                    configs_dir,
+                    json,
+                    ..
+                },
+        } => {
+            assert_eq!(category, "cifar100_2024");
+            assert_eq!(budget_secs, 100);
+            assert_eq!(configs_dir, None);
+            assert!(json);
+        }
+        _ => panic!("expected vnncomp plan command"),
+    }
 }

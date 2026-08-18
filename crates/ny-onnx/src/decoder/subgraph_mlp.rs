@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! MLP subgraph extraction for decoder compositional verification.
+//! MLP subgraph extraction for decoder structural analysis.
 //!
 //! Supports multiple MLP variants:
 //! - GELU: fc1 → GELU → fc2 (GPT-2, Whisper)
@@ -18,13 +18,18 @@ use tracing::info;
 use super::DecoderModel;
 
 impl DecoderModel {
-    /// Extract the MLP subgraph for compositional verification.
+    /// Extract an MLP graph artifact for structural analysis.
     ///
     /// Dispatches to variant-specific extraction based on detected MLP topology:
     /// - GELU MLP: norm2 → fc1 → GELU → fc2 (GPT-2, Whisper)
     /// - SwiGLU MLP: norm2 → gate_proj → SiLU → up_proj → Mul → down_proj (Qwen3, LLaMA, Mistral)
     /// - Structural fallback: all layers under mlp_prefix
+    ///
+    /// The artifact is not proof-equivalent to the loaded ONNX graph and must
+    /// not authorize a verification verdict.
     pub fn mlp_subgraph(&self, block_index: usize) -> Result<GraphNetwork> {
+        self.block_info(block_index)?;
+
         // Determine block prefix. For single-block models without block-indexed naming,
         // use empty prefix. Check all supported MLP variants (GELU, SwiGLU HuggingFace,
         // SwiGLU alternative) to avoid falling through to structural fallback when

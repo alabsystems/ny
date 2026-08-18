@@ -38,17 +38,19 @@
 //! full-pipeline gate test in `tests_soundness.rs`.
 
 use faer::Mat;
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use ny_core::{is_crown_coeff_safe, GemmEngine, NyError, Result};
-use ny_tensor::next_up_f32;
 use rayon::prelude::*;
 use tracing::debug;
 
-use super::bias::{accumulate_bias_f64, finalize_bias_directed, BiasBlockParams};
-use super::crown_single::{aw_f64_with_abssum, gamma_n_f32};
+use super::bias::{
+    accumulate_bias_f64, add_coeff_err_bias_product_up, add_f64_down, add_f64_up, f32_to_f64_exact,
+    finalize_bias_directed, publish_error_up_normal, BiasBlockParams,
+};
+use super::crown_single::{aw_f64_with_abssum, gamma_n_f32, incoming_error_product};
 use super::layout::resolve_backward_layout;
 use super::LinearLayer;
-use crate::faer_parallelism::{mat_mul, NestedFaerParGuard};
+use crate::faer_parallelism::NestedFaerParGuard;
 
 /// Borrowed SoA view of the per-node pending linear bounds for a batch of
 /// domains. Planes are domain-major row-major: domain `d`'s coefficient block
@@ -260,22 +262,22 @@ pub(crate) fn propagate_linear_batched_soa(
                         Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
                             in_upper_a[i * bounds_inputs + in_start + j]
                         });
-                    let (_, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
-                    let (_, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
+                    let (lower_reference, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
+                    let (upper_reference, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
 
                     // Propagated incoming error: P[i,j] = Σ_k err_in[i,in_start+k]·|W[k,j]|.
-                    let prop_lower = in_lower_err.map(|e| {
-                        let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, kk| {
-                            e[i * bounds_inputs + in_start + kk]
-                        });
-                        mat_mul(&blk, &w_abs)
-                    });
-                    let prop_upper = in_upper_err.map(|e| {
-                        let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, kk| {
-                            e[i * bounds_inputs + in_start + kk]
-                        });
-                        mat_mul(&blk, &w_abs)
-                    });
+                    let propagate_error = |error: &[f32]| {
+                        let block =
+                            Array2::from_shape_fn((num_outputs, layout.out_features), |(i, kk)| {
+                                error[i * bounds_inputs + in_start + kk]
+                            });
+                        match incoming_error_product(&block, 0, layout.out_features, &w_abs, None) {
+                            Ok(product) => product,
+                            Err(_) => Array2::from_elem((num_outputs, in_features), f32::INFINITY),
+                        }
+                    };
+                    let prop_lower = in_lower_err.map(propagate_error);
+                    let prop_upper = in_upper_err.map(propagate_error);
 
                     let g_lower = &gemm_lower[pos];
                     let g_upper = &gemm_upper[pos];
@@ -284,10 +286,22 @@ pub(crate) fn propagate_linear_batched_soa(
                         for j in 0..in_features {
                             let lower = g_lower[src_row * in_features + j];
                             let upper = g_upper[src_row * in_features + j];
-                            let l_prop = prop_lower.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                            let u_prop = prop_upper.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                            let l_err = next_up_f32((gamma * lower_s[[i, j]] + l_prop) as f32);
-                            let u_err = next_up_f32((gamma * upper_s[[i, j]] + u_prop) as f32);
+                            let lower_gap =
+                                (f32_to_f64_exact(lower) - lower_reference[[i, j]]).abs();
+                            let upper_gap =
+                                (f32_to_f64_exact(upper) - upper_reference[[i, j]]).abs();
+                            let l_prop = prop_lower
+                                .as_ref()
+                                .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
+                            let u_prop = prop_upper
+                                .as_ref()
+                                .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
+                            let l_err = publish_error_up_normal(
+                                lower_gap + gamma * lower_s[[i, j]] + l_prop,
+                            );
+                            let u_err = publish_error_up_normal(
+                                upper_gap + gamma * upper_s[[i, j]] + u_prop,
+                            );
                             // A stored coefficient is sound iff BOTH the
                             // coefficient and its certified error stay finite/in-
                             // range; otherwise the row degrades to ±inf bias.
@@ -331,18 +345,26 @@ pub(crate) fn propagate_linear_batched_soa(
                         for i in 0..num_outputs {
                             let mut e = 0.0f64;
                             for j in 0..bias.len() {
-                                e += le[i * bounds_inputs + j] as f64 * (bias[j] as f64).abs();
+                                e = add_coeff_err_bias_product_up(
+                                    e,
+                                    le[i * bounds_inputs + j],
+                                    bias[j],
+                                );
                             }
-                            bias_lower_acc[i] -= e;
+                            bias_lower_acc[i] = add_f64_down(bias_lower_acc[i], -e);
                         }
                     }
                     if let Some(ue) = in_upper_err {
                         for i in 0..num_outputs {
                             let mut e = 0.0f64;
                             for j in 0..bias.len() {
-                                e += ue[i * bounds_inputs + j] as f64 * (bias[j] as f64).abs();
+                                e = add_coeff_err_bias_product_up(
+                                    e,
+                                    ue[i * bounds_inputs + j],
+                                    bias[j],
+                                );
                             }
-                            bias_upper_acc[i] += e;
+                            bias_upper_acc[i] = add_f64_up(bias_upper_acc[i], e);
                         }
                     }
                 }

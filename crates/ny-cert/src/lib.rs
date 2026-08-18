@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! `ny-cert` — proof-carrying neural-network verification.
 //!
 //! This crate is the constructive core of NY's *Proof-Carrying Verification*
@@ -52,6 +54,7 @@ pub mod crown;
 pub mod crown_deep;
 pub mod eval;
 pub mod exact;
+pub mod fp_margin;
 pub mod generate;
 pub mod invprop_cert;
 pub mod proof_carrying;
@@ -70,6 +73,7 @@ pub use branch::{
 };
 pub use certz::{entailment_to_certz_json, entailment_to_certz_lean, CertZError};
 pub use crown::{CertifiedRelu1, CrownError, Relu1Problem};
+pub use fp_margin::{deployed_fp_margin, deployed_fp_output_margin, FpMargin, FpMarginError};
 pub use invprop_cert::{InvpropAugmentedCertificate, OutputDualRow};
 pub use rational::{Rat, RatError};
 pub use schema::{

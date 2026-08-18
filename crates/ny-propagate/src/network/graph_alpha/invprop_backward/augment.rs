@@ -5,8 +5,33 @@
 use crate::bounds::LinearBounds;
 use crate::invprop::OutputConstraints;
 use ndarray::Array2;
-use ny_tensor::{next_down_f32, next_up_f32};
+use ny_core::dd::{next_down_f64, next_up_f64};
+use ny_core::{f64_to_f32_down, f64_to_f32_up};
 use tracing::trace;
+
+/// Add one exact binary32-product term to an outward binary64 interval.
+///
+/// Both operands have already been promoted from binary32, so their product is
+/// exact in binary64 (at most 48 significant bits). Only the reduction add can
+/// round; one binary64 step on each side encloses it even under cancellation.
+fn add_exact_product_interval(lower: &mut f64, upper: &mut f64, term: f64) {
+    *lower = next_down_f64(*lower + term);
+    *upper = next_up_f64(*upper + term);
+}
+
+/// Store a useful nearest binary32 center plus a symmetric outward error that
+/// encloses the complete binary64 interval. Overflow degrades to zero center
+/// with infinite error, which the downstream concretizer handles conservatively.
+fn coefficient_center_and_error(center: f64, lower: f64, upper: f64) -> (f32, f32) {
+    let stored = center as f32;
+    if !stored.is_finite() || lower.is_nan() || upper.is_nan() {
+        return (0.0, f32::INFINITY);
+    }
+    let represented = f64::from(stored);
+    let lower_gap = next_up_f64((represented - lower).abs());
+    let upper_gap = next_up_f64((upper - represented).abs());
+    (stored, f64_to_f32_up(next_up_f64(lower_gap.max(upper_gap))))
+}
 
 /// Look up gamma `[constraint_idx, output_idx]`, honoring the `share_gammas`
 /// (single-column broadcast) layout.
@@ -112,7 +137,28 @@ pub(crate) fn augment_bounds_with_constraints(
         return bounds.clone();
     }
 
-    if gammas_lower.nrows() != num_constraints || gammas_upper.nrows() != num_constraints {
+    // Empty, malformed, or non-finite constraint systems are not valid dual
+    // premises. Public fields and serde construction can bypass `new`, so the
+    // proof boundary validates the complete matrix here before indexing it.
+    if num_constraints == 0
+        || output_dim == 0
+        || constraints.rhs.len() != num_constraints
+        || constraints
+            .a_matrix
+            .iter()
+            .chain(constraints.rhs.iter())
+            .any(|value| !value.is_finite())
+    {
+        trace!("INVPROP augment: invalid constraint system, returning original bounds");
+        return bounds.clone();
+    }
+
+    let valid_gamma_columns = |columns: usize| columns == 1 || columns == output_dim;
+    if gammas_lower.nrows() != num_constraints
+        || gammas_upper.nrows() != num_constraints
+        || !valid_gamma_columns(gammas_lower.ncols())
+        || !valid_gamma_columns(gammas_upper.ncols())
+    {
         trace!(
             "INVPROP augment: gamma dimension mismatch (lower {:?}, upper {:?}, constraints {}), \
              returning original bounds",
@@ -120,6 +166,31 @@ pub(crate) fn augment_bounds_with_constraints(
             gammas_upper.dim(),
             num_constraints
         );
+        return bounds.clone();
+    }
+
+    // Dual validity gate. The assume-violation derivation requires gamma >= 0;
+    // accepting a malformed negative or non-finite internal value could invert
+    // a constraint and manufacture a too-tight bound. Keep the original seed
+    // byte-for-byte on any invalid entry.
+    if gammas_lower
+        .iter()
+        .chain(gammas_upper.iter())
+        .any(|gamma| !gamma.is_finite() || *gamma < 0.0)
+    {
+        trace!("INVPROP augment: invalid gamma value, returning original bounds");
+        return bounds.clone();
+    }
+
+    // Exact-zero gamma (including IEEE -0.0) is mathematically the identity
+    // treatment. Return before checking/cloning the identity matrices or
+    // entering the O(outputs * constraints * outputs) fold loops. This keeps
+    // default-dark INVPROP metadata byte-identical and effectively free.
+    if gammas_lower
+        .iter()
+        .chain(gammas_upper.iter())
+        .all(|gamma| *gamma == 0.0)
+    {
         return bounds.clone();
     }
 
@@ -142,17 +213,19 @@ pub(crate) fn augment_bounds_with_constraints(
     let mut lower_a_err = Array2::<f32>::zeros((num_outputs, output_dim));
     let mut upper_a_err = Array2::<f32>::zeros((num_outputs, output_dim));
     let mut any_err = false;
-
-    let orig_lower_b = bounds.lower_b();
-    let orig_upper_b = bounds.upper_b();
+    let mut any_fold_delta = false;
 
     for i in 0..num_outputs {
         // ---- A-matrix term: w_L = e_i + C^T gamma_l, w_U = e_i - C^T gamma_u ----
         for k in 0..output_dim {
             let mut delta_l = 0.0f64;
             let mut delta_u = 0.0f64;
-            let mut abs_l = 0.0f64;
-            let mut abs_u = 0.0f64;
+            let original_l = f64::from(lower_a[[i, k]]);
+            let original_u = f64::from(upper_a[[i, k]]);
+            let (mut interval_l_lo, mut interval_l_hi) = (original_l, original_l);
+            let (mut interval_u_lo, mut interval_u_hi) = (original_u, original_u);
+            let mut lower_has_product = false;
+            let mut upper_has_product = false;
             for c in 0..num_constraints {
                 let ck = constraints.a_matrix[[c, k]] as f64;
                 if ck == 0.0 {
@@ -163,59 +236,70 @@ pub(crate) fn augment_bounds_with_constraints(
                 let pu = ck * gamma_at(gammas_upper, c, i) as f64;
                 delta_l += pl;
                 delta_u -= pu; // upper uses -C^T gamma_u
-                abs_l += pl.abs();
-                abs_u += pu.abs();
+                if pl != 0.0 {
+                    lower_has_product = true;
+                    add_exact_product_interval(&mut interval_l_lo, &mut interval_l_hi, pl);
+                }
+                if pu != 0.0 {
+                    upper_has_product = true;
+                    add_exact_product_interval(&mut interval_u_lo, &mut interval_u_hi, -pu);
+                }
             }
-            if delta_l != 0.0 {
-                let exact = lower_a[[i, k]] as f64 + delta_l;
-                let stored = exact as f32;
-                let round_gap = (exact - stored as f64).abs();
-                // Certified bound on the f64 accumulation error of `delta_l`
-                // (products are exact, so only the sum rounds). Covers arbitrary,
-                // possibly-cancelling constraint rows.
-                let sum_err = (num_constraints as f64) * f64::EPSILON * abs_l;
+            if lower_has_product {
+                any_fold_delta = true;
+                let (stored, error) = coefficient_center_and_error(
+                    original_l + delta_l,
+                    interval_l_lo,
+                    interval_l_hi,
+                );
                 lower_a[[i, k]] = stored;
-                lower_a_err[[i, k]] = next_up_f32((round_gap + sum_err) as f32);
+                lower_a_err[[i, k]] = error;
                 any_err = true;
             }
-            if delta_u != 0.0 {
-                let exact = upper_a[[i, k]] as f64 + delta_u;
-                let stored = exact as f32;
-                let round_gap = (exact - stored as f64).abs();
-                let sum_err = (num_constraints as f64) * f64::EPSILON * abs_u;
+            if upper_has_product {
+                any_fold_delta = true;
+                let (stored, error) = coefficient_center_and_error(
+                    original_u + delta_u,
+                    interval_u_lo,
+                    interval_u_hi,
+                );
                 upper_a[[i, k]] = stored;
-                upper_a_err[[i, k]] = next_up_f32((round_gap + sum_err) as f32);
+                upper_a_err[[i, k]] = error;
                 any_err = true;
             }
         }
 
         // ---- bias term: lower -= gamma_l.(rhs - C b_L); upper += gamma_u.(rhs - C b_U)
-        // `C b_*` is 0 at the identity seed but is computed generally (from the
-        // ORIGINAL biases, to avoid aliasing already-mutated rows) so the fold stays
-        // correct if this helper is ever reused off-seed.
-        let mut lower_bias_delta = 0.0f64;
-        let mut upper_bias_delta = 0.0f64;
+        // The identity admission gate proves b_L == b_U == 0, so C*b is exactly
+        // zero. Accumulate the exact f32 products into an outward f64 interval;
+        // using only the rounded reduction plus one f32 ULP is not sound under
+        // large-small-large cancellation.
+        let (mut lower_bias_lo, mut lower_bias_hi) = (0.0f64, 0.0f64);
+        let (mut upper_bias_lo, mut upper_bias_hi) = (0.0f64, 0.0f64);
+        let mut lower_has_product = false;
+        let mut upper_has_product = false;
         for c in 0..num_constraints {
-            let mut cb_l = 0.0f64;
-            let mut cb_u = 0.0f64;
-            for k in 0..output_dim {
-                let ck = constraints.a_matrix[[c, k]] as f64;
-                if ck != 0.0 {
-                    cb_l += ck * orig_lower_b[k] as f64;
-                    cb_u += ck * orig_upper_b[k] as f64;
-                }
-            }
             let rhs = constraints.rhs[c] as f64;
-            lower_bias_delta += gamma_at(gammas_lower, c, i) as f64 * (cb_l - rhs);
-            upper_bias_delta += gamma_at(gammas_upper, c, i) as f64 * (rhs - cb_u);
+            let lower_term = -(gamma_at(gammas_lower, c, i) as f64 * rhs);
+            let upper_term = gamma_at(gammas_upper, c, i) as f64 * rhs;
+            if lower_term != 0.0 {
+                lower_has_product = true;
+                add_exact_product_interval(&mut lower_bias_lo, &mut lower_bias_hi, lower_term);
+            }
+            if upper_term != 0.0 {
+                upper_has_product = true;
+                add_exact_product_interval(&mut upper_bias_lo, &mut upper_bias_hi, upper_term);
+            }
         }
-        // Directed casts: lower rounds DOWN, upper rounds UP (outward). Skip a zero
-        // delta so the f64->f32 round trip cannot nudge an untouched bias by 1 ULP.
-        if lower_bias_delta != 0.0 {
-            lower_b[i] = next_down_f32((lower_b[i] as f64 + lower_bias_delta) as f32);
+        // Publish the proof-facing endpoints, never the rounded central sum.
+        // The directional converters handle finite binary32 overflow correctly.
+        if lower_has_product {
+            any_fold_delta = true;
+            lower_b[i] = f64_to_f32_down(lower_bias_lo);
         }
-        if upper_bias_delta != 0.0 {
-            upper_b[i] = next_up_f32((upper_b[i] as f64 + upper_bias_delta) as f32);
+        if upper_has_product {
+            any_fold_delta = true;
+            upper_b[i] = f64_to_f32_up(upper_bias_hi);
         }
     }
 
@@ -229,13 +313,21 @@ pub(crate) fn augment_bounds_with_constraints(
             upper_a_err,
         )
     } else {
-        // gamma == 0 everywhere: no coefficient delta was stored, so leave the seed
-        // exact (no err) — byte-identical to the un-augmented seed.
+        // Nonzero gamma produced no effective C/rhs delta (for example, an all-zero
+        // constraint row), so leave the seed exact with no attached error.
         LinearBounds::new_or_conservative(lower_a, lower_b, upper_a, upper_b)
     };
 
-    result.unwrap_or_else(|_| {
-        let (n_out, n_in) = (bounds.num_outputs(), bounds.num_inputs());
-        LinearBounds::conservative(n_out, n_in)
-    })
+    match result {
+        Ok(augmented) => {
+            if any_fold_delta {
+                crate::execution_telemetry::record_invprop_nonzero_output_seed_fold();
+            }
+            augmented
+        }
+        Err(_) => {
+            let (n_out, n_in) = (bounds.num_outputs(), bounds.num_inputs());
+            LinearBounds::conservative(n_out, n_in)
+        }
+    }
 }

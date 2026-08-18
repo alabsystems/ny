@@ -19,5 +19,5 @@ pub(crate) use s_shaped::{
     sigmoid_crossing_default_tangents, sigmoid_linear_relaxation, tanh_crossing_default_tangents,
     tanh_linear_relaxation,
 };
-pub use s_shaped::{ArctanLayer, SigmoidLayer, TanhLayer};
+pub use s_shaped::{ArctanLayer, ErfLayer, SigmoidLayer, TanhLayer};
 pub use softplus::SoftplusLayer;

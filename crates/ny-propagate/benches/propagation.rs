@@ -13,7 +13,9 @@ use ny_propagate::layers::{
     Conv1dLayer, Conv2dLayer, GELULayer, LayerNormLayer, LinearLayer, MatMulLayer, ReLULayer,
     SoftmaxLayer,
 };
-use ny_propagate::{BoundPropagation, GraphNetwork, GraphNode, Layer, Network};
+use ny_propagate::{
+    BoundPropagation, GraphNetwork, GraphNode, Interval64, Layer, Network, NETWORK_INPUT,
+};
 use ny_tensor::BoundedTensor;
 
 /// Create a BoundedTensor with specified shape
@@ -130,6 +132,54 @@ fn bench_conv2d_ibp(c: &mut Criterion) {
             |b, (layer, input)| b.iter(|| layer.propagate_ibp(black_box(input))),
         );
     }
+    group.finish();
+}
+
+/// Exercise the production f64 graph path at the nn4sys `mscn_2048d`
+/// dimensions that motivated its scalar, GEMM, and batched timing probes.
+///
+/// Keeping this in Criterion makes the measurement lane explicit and gives it
+/// warmup, sampling, and historical reports without turning a unit test into a
+/// host-dependent performance assertion.
+fn bench_graph_ibp_f64(c: &mut Criterion) {
+    const ROWS: usize = 6;
+    const WIDTH: usize = 2048;
+    const BATCH: usize = 16;
+
+    let weight = Array2::from_shape_fn((WIDTH, WIDTH), |(row, col)| {
+        (((row * 13 + col * 7) % 17) as f32 - 8.0) * 0.001
+    });
+    let linear = LinearLayer::new(weight, Some(Array1::zeros(WIDTH))).unwrap();
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::new(
+        "linear",
+        Layer::Linear(linear),
+        vec![NETWORK_INPUT.to_owned()],
+    ));
+    graph.set_output("linear");
+
+    let center = ArrayD::from_shape_fn(IxDyn(&[ROWS, WIDTH]), |index| {
+        ((index[0] * WIDTH + index[1]) % 31) as f64 / 31.0 - 0.5
+    });
+    let input = Interval64 {
+        lower: center.mapv(|value| value - 1e-6),
+        upper: center.mapv(|value| value + 1e-6),
+    };
+    let batch = vec![input.clone(); BATCH];
+
+    let mut group = c.benchmark_group("IBP/f64_graph");
+    group.sample_size(10);
+
+    group.throughput(Throughput::Elements((ROWS * WIDTH * WIDTH) as u64));
+    group.bench_function("cell_6x2048", |b| {
+        b.iter(|| graph.propagate_ibp_f64_cell(black_box(&input)))
+    });
+
+    group.throughput(Throughput::Elements((BATCH * ROWS * WIDTH * WIDTH) as u64));
+    group.bench_function("batch_16x6x2048", |b| {
+        b.iter(|| graph.propagate_ibp_f64_cells(black_box(&batch)))
+    });
+
     group.finish();
 }
 
@@ -259,6 +309,73 @@ fn bench_per_position_crown(c: &mut Criterion) {
             |b, (graph, input)| b.iter(|| graph.propagate_crown_per_position(black_box(input))),
         );
     }
+    group.finish();
+}
+
+/// Measure the production shared-spec batched backward lane directly. This
+/// replaces ad-hoc `#[ignore]` timing tests that mixed benchmarking controls
+/// into the unit-test harness.
+fn bench_batched_dense_spec_crown(c: &mut Criterion) {
+    use ny_propagate::bench_batched::bench_batched_dense_spec_backward;
+
+    const DOMAINS: usize = 512;
+
+    let linear1 = LinearLayer::new(
+        Array2::from_shape_fn((8, 4), |(row, col)| {
+            (((row * 5 + col * 3) % 11) as f32 - 5.0) * 0.1
+        }),
+        Some(Array1::zeros(8)),
+    )
+    .unwrap();
+    let linear2 = LinearLayer::new(
+        Array2::from_shape_fn((4, 8), |(row, col)| {
+            (((row * 7 + col * 2) % 13) as f32 - 6.0) * 0.1
+        }),
+        Some(Array1::zeros(4)),
+    )
+    .unwrap();
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("linear1", Layer::Linear(linear1)));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer),
+        vec!["linear1".to_owned()],
+    ));
+    graph.add_node(GraphNode::new(
+        "linear2",
+        Layer::Linear(linear2),
+        vec!["relu".to_owned()],
+    ));
+    graph.set_output("linear2");
+
+    let boxes: Vec<_> = (0..DOMAINS)
+        .map(|domain| {
+            let t = domain as f32 / DOMAINS as f32;
+            BoundedTensor::new(
+                Array1::from_vec(vec![-1.0 + t, -1.0, -1.0 + 0.5 * t, -1.0]).into_dyn(),
+                Array1::from_vec(vec![1.0, 1.0 - 0.5 * t, 1.0, 1.0 - t]).into_dyn(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let spec_matrix =
+        Array2::from_shape_vec((2, 4), vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap();
+
+    let mut group = c.benchmark_group("CROWN/batched_dense_spec");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(DOMAINS as u64));
+    group.bench_function("relu_512_domains", |b| {
+        b.iter(|| {
+            bench_batched_dense_spec_backward(
+                black_box(&graph),
+                black_box(&boxes),
+                black_box(&spec_matrix),
+                None,
+                None,
+            )
+        })
+    });
     group.finish();
 }
 
@@ -452,11 +569,17 @@ criterion_group!(
     bench_layernorm_ibp,
     bench_conv1d_ibp,
     bench_conv2d_ibp,
+    bench_graph_ibp_f64,
 );
 
 criterion_group!(attention_benches, bench_matmul_ibp, bench_softmax_ibp,);
 
-criterion_group!(crown_benches, bench_mlp_crown, bench_per_position_crown,);
+criterion_group!(
+    crown_benches,
+    bench_mlp_crown,
+    bench_per_position_crown,
+    bench_batched_dense_spec_crown,
+);
 
 criterion_group!(pipeline_benches, bench_encoder_block_ibp, bench_scaling,);
 

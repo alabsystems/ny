@@ -126,11 +126,7 @@ impl GraphBabDomain {
         input: &BoundedTensor,
         verify_upper: bool,
     ) -> Result<Self> {
-        if !lower_bound.is_finite() || !upper_bound.is_finite() {
-            return Err(NyError::NumericalInstability(format!(
-                "GraphBaB root domain bounds are non-finite: lower={lower_bound}, upper={upper_bound}"
-            )));
-        }
+        super::validate_domain_interval("GraphBaB root domain", lower_bound, upper_bound)?;
         let node_bounds = node_bounds
             .into_iter()
             .map(|(k, v)| (k, Arc::new(v)))
@@ -212,6 +208,12 @@ impl GraphBabDomain {
         if !l.is_finite() || !u.is_finite() {
             return Err(NyError::NumericalInstability(format!(
                 "with_constraint: non-finite neuron bounds for {node_name}[{neuron_idx}] \
+                 (l={l}, u={u})"
+            )));
+        }
+        if l > u {
+            return Err(NyError::NumericalInstability(format!(
+                "with_constraint: inverted neuron bounds for {node_name}[{neuron_idx}] \
                  (l={l}, u={u})"
             )));
         }
@@ -394,9 +396,22 @@ impl GraphBabDomain {
         let current_l = flat.lower()[[neuron_idx]];
         let current_u = flat.upper()[[neuron_idx]];
 
+        if !current_l.is_finite() || !current_u.is_finite() || current_l > current_u {
+            return Err(NyError::NumericalInstability(format!(
+                "with_general_split: malformed current bounds for {node_name}[{neuron_idx}] \
+                 (lower={current_l}, upper={current_u})"
+            )));
+        }
+
         // Compute effective bounds after applying the split
         let new_lower = split.lower_bound.unwrap_or(current_l);
         let new_upper = split.upper_bound.unwrap_or(current_u);
+        if !new_lower.is_finite() || !new_upper.is_finite() {
+            return Err(NyError::NumericalInstability(format!(
+                "with_general_split: non-finite split bounds for {node_name}[{neuron_idx}] \
+                 (lower={new_lower}, upper={new_upper})"
+            )));
+        }
 
         // Feasibility check: new bounds must intersect with current bounds.
         // Use NaN-propagating ops so NaN bounds are not silently absorbed (#2954).
@@ -739,10 +754,10 @@ impl GraphBabDomain {
         alpha_state: GraphDomainAlphaState,
         cached_la: Option<Arc<CachedLinearBounds>>,
     ) -> Result<Self> {
-        if !lower_bound.is_finite() || !upper_bound.is_finite() || !priority.is_finite() {
+        super::validate_domain_interval("GraphBaB domain from metadata", lower_bound, upper_bound)?;
+        if !priority.is_finite() {
             return Err(NyError::NumericalInstability(format!(
-                "GraphBaB domain from metadata non-finite: lower={lower_bound}, \
-                 upper={upper_bound}, priority={priority}"
+                "GraphBaB domain from metadata priority is non-finite: {priority}"
             )));
         }
         Ok(Self {
@@ -781,10 +796,10 @@ impl GraphBabDomain {
         alpha_state: GraphDomainAlphaState,
         cached_la: Option<Arc<CachedLinearBounds>>,
     ) -> Result<Self> {
-        if !lower_bound.is_finite() || !upper_bound.is_finite() || !priority.is_finite() {
+        super::validate_domain_interval("GraphBaB child domain", lower_bound, upper_bound)?;
+        if !priority.is_finite() {
             return Err(NyError::NumericalInstability(format!(
-                "GraphBaB child domain non-finite: lower={lower_bound}, \
-                 upper={upper_bound}, priority={priority}"
+                "GraphBaB child domain priority is non-finite: {priority}"
             )));
         }
         Ok(Self {
@@ -806,9 +821,10 @@ impl GraphBabDomain {
 
     /// Update bounds and priority atomically. Rejects non-finite values (#2982, #3125).
     pub(crate) fn update_bounds(&mut self, lower: f32, upper: f32, priority: f32) -> Result<()> {
-        if !lower.is_finite() || !upper.is_finite() || !priority.is_finite() {
+        super::validate_domain_interval("GraphBaB domain update", lower, upper)?;
+        if !priority.is_finite() {
             return Err(NyError::NumericalInstability(format!(
-                "GraphBaB domain update non-finite: lower={lower}, upper={upper}, priority={priority}"
+                "GraphBaB domain update priority is non-finite: {priority}"
             )));
         }
         self.lower_bound = lower;
@@ -885,6 +901,79 @@ mod tests {
 
         let popped = heap.pop().expect("heap should contain two domains");
         assert!(popped.priority.is_nan());
+    }
+
+    #[test]
+    fn graph_domain_constructors_and_updates_reject_inverted_objective_bounds() {
+        let (_, domain) = simple_graph_and_domain();
+        assert!(GraphBabDomain::root(
+            std::collections::HashMap::new(),
+            1.0,
+            0.0,
+            domain.input_bounds(),
+            false,
+        )
+        .is_err());
+
+        let metadata = GraphBabDomain::from_metadata(
+            domain.history.clone(),
+            domain.node_bounds.clone(),
+            1.0,
+            0.0,
+            domain.depth,
+            domain.priority,
+            domain.input_bounds.clone(),
+            domain.beta_state.clone(),
+            domain.alpha_state.clone(),
+            domain.cached_la.clone(),
+        );
+        assert!(metadata.is_err());
+
+        let child = GraphBabDomain::child_from_metadata(
+            domain.history.clone(),
+            domain.node_bounds.clone(),
+            1.0,
+            0.0,
+            domain.depth,
+            domain.priority,
+            domain.input_bounds.clone(),
+            domain.beta_state.clone(),
+            domain.alpha_state.clone(),
+            domain.cached_la.clone(),
+        );
+        assert!(child.is_err());
+
+        let mut updated = domain;
+        let before = (updated.lower_bound, updated.upper_bound, updated.priority);
+        assert!(updated.update_bounds(1.0, 0.0, 0.0).is_err());
+        assert_eq!(
+            (updated.lower_bound, updated.upper_bound, updated.priority),
+            before,
+            "failed update must be transactional"
+        );
+    }
+
+    #[test]
+    fn graph_with_constraint_rejects_inverted_preactivation_bounds() {
+        let (graph, mut domain) = simple_graph_and_domain();
+        let inverted = BoundedTensor::new_unchecked(
+            ndarray::arr1(&[1.0_f32, -0.5]).into_dyn(),
+            ndarray::arr1(&[0.5_f32, 1.0]).into_dyn(),
+        )
+        .unwrap();
+        domain
+            .node_bounds
+            .insert("linear1".to_string(), Arc::new(inverted));
+        let constraint = GraphNeuronConstraint {
+            node_name: "relu1".to_string(),
+            neuron_idx: 0,
+            is_active: true,
+            score: 1.0,
+        };
+        let error = domain
+            .with_constraint(&graph, constraint, false)
+            .expect_err("inverted preactivation bounds must be rejected");
+        assert!(error.to_string().contains("inverted"));
     }
 
     /// Regression test for #2599: with_constraint must reject NaN neuron bounds.

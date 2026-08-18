@@ -2,13 +2,15 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ny_core::{NyError, Result};
+use ny_core::{
+    f64_to_f32_down, f64_to_f32_up, nan_propagating_max_f64, nan_propagating_min_f64, NyError,
+    Result,
+};
 use ny_tensor::BoundedTensor;
 use std::borrow::Cow;
 use tracing::debug;
 
 use super::LinearRelaxation;
-use crate::bounds::{nan_propagating_max, nan_propagating_min};
 use crate::layers::common::{
     crown_elementwise_backward, crown_elementwise_backward_batched,
     crown_elementwise_backward_patches, non_finite_domain_guard, BoundPropagation,
@@ -19,22 +21,31 @@ use ny_tensor::{next_down_f32, next_up_f32};
 /// HardSwish layer: y = x * HardSigmoid(x)
 ///
 /// Used in MobileNetV3 as a more efficient alternative to Swish (SiLU).
-/// y = x * max(0, min(1, (x + 3) / 6))
+/// ONNX authors `alpha` as the FLOAT32 value nearest 1/6 and `beta` as 0.5:
+/// y = x * max(0, min(1, alpha * x + beta)).
 #[derive(Debug, Clone, Default)]
 pub struct HardSwishLayer;
 
 impl HardSwishLayer {
+    /// The exact FLOAT32 coefficient authored by the ONNX HardSwish function.
+    ///
+    /// This dyadic value is slightly larger than the real number 1/6.
+    pub const ALPHA: f32 = f32::from_bits(0x3e2a_aaab);
+
+    /// The exact FLOAT32 offset authored by the ONNX HardSwish function.
+    pub const BETA: f32 = 0.5;
+
     /// Create a new HardSwish layer.
     pub fn new() -> Self {
         Self
     }
 
-    /// Evaluate HardSwish at a point: x * max(0, min(1, (x + 3) / 6))
+    /// Evaluate the exact-real ONNX HardSwish function, rounded once to f32.
     #[inline]
     pub fn eval(&self, x: f32) -> f32 {
         // Guard against 0 * inf = NaN when x = -inf.
-        // HardSwish(x) = x * clamp((x+3)/6, 0, 1). At x = -inf: (-inf)*0 = NaN.
-        // Correct limits: HardSwish(x) = 0 for x <= -3, HardSwish(x) = x for x >= 3.
+        // A direct formula would compute (-inf)*0 at the negative limit.
+        // The exact limiting values are 0 at -inf and +inf at +inf.
         // Ref: SiLU guard pattern (silu.rs:100-105), fix for #1836.
         if !x.is_finite() {
             if x.is_nan() {
@@ -42,19 +53,19 @@ impl HardSwishLayer {
             }
             return if x.is_sign_negative() { 0.0 } else { x };
         }
-        x * ((x + 3.0) / 6.0).clamp(0.0, 1.0)
+        hardswish_eval_f64(f64::from(x)) as f32
     }
 }
 
 impl BoundPropagation for HardSwishLayer {
-    /// IBP for HardSwish: y = x * max(0, min(1, (x + 3) / 6))
+    /// IBP for the exact-real ONNX HardSwish function.
     ///
     /// Three regions:
-    /// - y = 0 when x <= -3 (HardSigmoid = 0)
-    /// - y = x * (x + 3) / 6 when -3 < x < 3 (quadratic)
-    /// - y = x when x >= 3 (HardSigmoid = 1)
+    /// - y = 0 when alpha*x + beta <= 0
+    /// - y = x * (alpha*x + beta) when 0 < alpha*x + beta < 1
+    /// - y = x when alpha*x + beta >= 1
     ///
-    /// The quadratic region has derivative (2x + 3) / 6, zero at x = -1.5
+    /// The quadratic region has derivative `2*alpha*x + beta`.
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         let mut lower_vals = input.lower().clone();
@@ -71,22 +82,27 @@ impl BoundPropagation for HardSwishLayer {
                     *out_l = f32::NEG_INFINITY;
                     *out_u = f32::INFINITY;
                 } else {
-                    // Evaluate at bounds
-                    let y_l = self.eval(in_l);
-                    let y_u = self.eval(in_u);
+                    // Evaluate the exact-real function in f64. Nearest-rounding
+                    // an endpoint to one f32 would make a point interval exclude
+                    // the authored dyadic function whenever it lies between two
+                    // adjacent f32 values.
+                    let in_l64 = f64::from(in_l);
+                    let in_u64 = f64::from(in_u);
+                    let y_l = hardswish_eval_f64(in_l64);
+                    let y_u = hardswish_eval_f64(in_u64);
 
-                    // In the quadratic region (-3 < x < 3), the minimum is at x = -1.5
-                    // where y = -1.5 * (-1.5 + 3) / 6 = -1.5 * 1.5 / 6 = -0.375
-                    // Check if interval contains -1.5 (the critical point is in quadratic region
-                    // which spans -3 to 3, so if interval contains -1.5, it overlaps the region)
-                    let min_at_critical = if in_l < -1.5 && in_u > -1.5 {
-                        self.eval(-1.5) // = -0.375
+                    // The quadratic region's unique minimum is at
+                    // -beta/(2*alpha). Endpoints cover every maximum, including
+                    // the constant/quadratic boundary at value zero.
+                    let critical = hardswish_critical_f64();
+                    let min_at_critical = if in_l64 <= critical && critical <= in_u64 {
+                        hardswish_eval_f64(critical)
                     } else {
-                        f32::INFINITY
+                        f64::INFINITY
                     };
 
-                    *out_l = nan_propagating_min(nan_propagating_min(y_l, y_u), min_at_critical);
-                    *out_u = nan_propagating_max(y_l, y_u);
+                    *out_l = f64_to_f32_down(y_l.min(y_u).min(min_at_critical));
+                    *out_u = f64_to_f32_up(y_l.max(y_u));
                 }
             });
 
@@ -118,11 +134,12 @@ impl BoundPropagation for HardSwishLayer {
     }
 }
 
-/// Evaluate HardSwish: x * HardSigmoid(x) = x * max(0, min(1, (x + 3) / 6))
+/// Evaluate the exact-real HardSwish function and round once to f32.
 ///
 /// Note: caller `hardswish_linear_relaxation` guards for inf/NaN at entry,
 /// so this is only called with finite inputs. The guard here is defense-in-depth.
 #[inline]
+#[cfg(test)]
 fn hardswish_eval(x: f32) -> f32 {
     // Guard against 0 * inf = NaN at x = -inf (defense-in-depth, #1836).
     if !x.is_finite() {
@@ -131,11 +148,12 @@ fn hardswish_eval(x: f32) -> f32 {
         }
         return if x.is_sign_negative() { 0.0 } else { x };
     }
-    x * ((x + 3.0) / 6.0).clamp(0.0, 1.0)
+    hardswish_eval_f64(f64::from(x)) as f32
 }
 
 /// Evaluate HardSwish in f64 to avoid catastrophic cancellation in chord slope.
-/// HardSwish(x) = x * clamp((x + 3) / 6, 0, 1).
+/// HardSwish(x) = x * clamp(alpha*x + beta, 0, 1), where both
+/// coefficients are promoted exactly from their authored f32 values.
 /// Same pattern as silu_eval_f64 (silu/math.rs), exp_eval_f64 (#1745).
 #[inline]
 fn hardswish_eval_f64(x: f64) -> f64 {
@@ -145,23 +163,24 @@ fn hardswish_eval_f64(x: f64) -> f64 {
         }
         return if x.is_sign_negative() { 0.0 } else { x };
     }
-    x * ((x + 3.0) / 6.0).clamp(0.0, 1.0)
+    let alpha = f64::from(HardSwishLayer::ALPHA);
+    let beta = f64::from(HardSwishLayer::BETA);
+    x * (alpha * x + beta).clamp(0.0, 1.0)
 }
 
-/// HardSwish derivative in f64.
-///
-/// HardSwish'(x) = 0 for x ≤ -3, (2x + 3)/6 for -3 < x < 3, 1 for x ≥ 3.
-/// Used by the point-interval directed rounding path to avoid f32 precision loss.
-/// Fixes: #3190 — point-interval path used f32-only computation.
 #[inline]
-fn hardswish_derivative_f64(x: f64) -> f64 {
-    if x <= -3.0 {
-        0.0
-    } else if x >= 3.0 {
-        1.0
-    } else {
-        (2.0 * x + 3.0) / 6.0
-    }
+fn hardswish_lower_kink_f64() -> f64 {
+    -f64::from(HardSwishLayer::BETA) / f64::from(HardSwishLayer::ALPHA)
+}
+
+#[inline]
+fn hardswish_upper_kink_f64() -> f64 {
+    (1.0 - f64::from(HardSwishLayer::BETA)) / f64::from(HardSwishLayer::ALPHA)
+}
+
+#[inline]
+fn hardswish_critical_f64() -> f64 {
+    -f64::from(HardSwishLayer::BETA) / (2.0 * f64::from(HardSwishLayer::ALPHA))
 }
 
 /// Compute HardSwish chord slope and intercept using f64 intermediates.
@@ -198,39 +217,55 @@ fn hardswish_chord(l: f32, u: f32) -> (f32, f32, f32) {
 /// Returns (max_above, max_below) where max_above is the largest positive
 /// deviation (function above chord) and max_below is the largest negative.
 fn hardswish_chord_deviation(l: f32, u: f32, chord_slope: f32, chord_intercept: f32) -> (f32, f32) {
-    let mut max_above: f32 = 0.0;
-    let mut max_below: f32 = 0.0;
-    let mut check = |x: f32| {
-        let dev = hardswish_eval(x) - (chord_slope * x + chord_intercept);
-        max_above = nan_propagating_max(max_above, dev);
-        max_below = nan_propagating_max(max_below, -dev);
+    let l64 = f64::from(l);
+    let u64 = f64::from(u);
+    let slope64 = f64::from(chord_slope);
+    let intercept64 = f64::from(chord_intercept);
+    let mut max_above = 0.0_f64;
+    let mut max_below = 0.0_f64;
+    let mut check = |x: f64| {
+        let dev = hardswish_eval_f64(x) - (slope64 * x + intercept64);
+        max_above = nan_propagating_max_f64(max_above, dev);
+        max_below = nan_propagating_max_f64(max_below, -dev);
     };
 
-    // Region boundaries -3, 3 and critical point -1.5 (if interior to [l, u])
-    if l < -3.0 && -3.0 < u {
-        check(-3.0);
+    // The exact chord meets the function at both endpoints, but the f32
+    // slope/nominal intercept can move either endpoint to either side. Check
+    // them explicitly instead of relying on a fixed downstream epsilon to
+    // absorb that scale-dependent rounding gap.
+    check(l64);
+    check(u64);
+
+    // Region boundaries and the function's stationary point (when interior).
+    let lower_kink = hardswish_lower_kink_f64();
+    let upper_kink = hardswish_upper_kink_f64();
+    let critical = hardswish_critical_f64();
+    if l64 < lower_kink && lower_kink < u64 {
+        check(lower_kink);
     }
-    if l < 3.0 && 3.0 < u {
-        check(3.0);
+    if l64 < upper_kink && upper_kink < u64 {
+        check(upper_kink);
     }
-    if l < -1.5 && -1.5 < u {
-        check(-1.5);
+    if l64 < critical && critical < u64 {
+        check(critical);
     }
 
-    // Quadratic region [-3, 3] ∩ [l, u]: analytical extremum of deviation.
-    // dev'(x) = (2x + 3)/6 - chord_slope = 0 → x_ext = 3*chord_slope - 1.5
-    let q_lo = nan_propagating_max(l, -3.0);
-    let q_hi = nan_propagating_min(u, 3.0);
+    // In the quadratic region, the deviation extremum solves
+    // 2*alpha*x + beta - chord_slope = 0.
+    let q_lo = nan_propagating_max_f64(l64, lower_kink);
+    let q_hi = nan_propagating_min_f64(u64, upper_kink);
     if q_lo < q_hi {
-        check(((3.0 * chord_slope) - 1.5).clamp(q_lo, q_hi));
-        if q_lo > l {
+        let x_ext =
+            (slope64 - f64::from(HardSwishLayer::BETA)) / (2.0 * f64::from(HardSwishLayer::ALPHA));
+        check(x_ext.clamp(q_lo, q_hi));
+        if q_lo > l64 {
             check(q_lo);
         }
-        if q_hi < u {
+        if q_hi < u64 {
             check(q_hi);
         }
     }
-    (max_above, max_below)
+    (f64_to_f32_up(max_above), f64_to_f32_up(max_below))
 }
 
 /// Analytical linear relaxation for HardSwish on interval [l, u].
@@ -242,25 +277,25 @@ fn hardswish_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     if l.is_nan() || u.is_nan() || l.is_infinite() || u.is_infinite() {
         return LinearRelaxation::nan_fallback();
     }
-    // Handle degenerate point interval with directed rounding.
-    // Uses f64 intermediates to avoid catastrophic cancellation in f(l) - f'(l)*l.
-    // Ref: Exp point-interval (exp.rs:114-124), SiLU tangent (silu/math.rs:216-231).
-    // Fixes: #3190 — previously used pure f32 without directed rounding.
+    // A tangent evaluated only at `l` does not enclose a non-degenerate narrow
+    // interval: in the convex half of the quadratic region it is a lower bound,
+    // not an upper bound.  Cover the full endpoint/critical-value range with a
+    // constant relaxation.  This also avoids cancellation in the chord when
+    // adjacent f32 endpoints are less than 1e-8 apart.
     if (u - l).abs() < 1e-8 {
-        let l64 = l as f64;
-        let y64 = hardswish_eval_f64(l64);
-        let slope64 = hardswish_derivative_f64(l64);
-        let intercept64 = y64 - slope64 * l64;
-        let slope_f32 = slope64 as f32;
-        let max_abs_x = (l.abs().max(u.abs())) as f64;
-        let slope_err = next_up_f32(((slope64 - slope_f32 as f64).abs() * max_abs_x) as f32);
-        let intercept_f32 = intercept64 as f32;
-        return LinearRelaxation::new(
-            slope_f32,
-            next_down_f32(intercept_f32 - slope_err),
-            slope_f32,
-            next_up_f32(intercept_f32 + slope_err),
-        );
+        let l64 = f64::from(l);
+        let u64 = f64::from(u);
+        let y_l = hardswish_eval_f64(l64);
+        let y_u = hardswish_eval_f64(u64);
+        let critical = hardswish_critical_f64();
+        let y_critical = if l64 <= critical && critical <= u64 {
+            hardswish_eval_f64(critical)
+        } else {
+            f64::INFINITY
+        };
+        let lower = f64_to_f32_down(y_l.min(y_u).min(y_critical));
+        let upper = f64_to_f32_up(y_l.max(y_u));
+        return LinearRelaxation::new(0.0, lower, 0.0, upper);
     }
 
     let (chord_slope, lower_intercept, upper_intercept) = hardswish_chord(l, u);
@@ -270,15 +305,12 @@ fn hardswish_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     #[allow(clippy::manual_midpoint)]
     let nominal_intercept = (lower_intercept + upper_intercept) / 2.0;
     let (max_above, max_below) = hardswish_chord_deviation(l, u, chord_slope, nominal_intercept);
-    let margin = 4.0 * f32::EPSILON;
+    let margin64 = 4.0 * f64::from(f32::EPSILON);
+    let lower_final = f64_to_f32_down(f64::from(lower_intercept) - f64::from(max_below) - margin64);
+    let upper_final = f64_to_f32_up(f64::from(upper_intercept) + f64::from(max_above) + margin64);
     // Lower bound: lower_intercept (sound below true chord) shifted down by max_below.
     // Upper bound: upper_intercept (sound above true chord) shifted up by max_above.
-    LinearRelaxation::new(
-        chord_slope,
-        lower_intercept - max_below - margin,
-        chord_slope,
-        upper_intercept + max_above + margin,
-    )
+    LinearRelaxation::new(chord_slope, lower_final, chord_slope, upper_final)
 }
 
 impl HardSwishLayer {
@@ -318,3 +350,8 @@ impl HardSwishLayer {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn audit_hardswish_relax(l: f32, u: f32) -> LinearRelaxation {
+    hardswish_linear_relaxation(l, u)
+}

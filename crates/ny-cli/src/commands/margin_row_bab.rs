@@ -58,6 +58,146 @@ impl MarginRowReserveDecision {
             MarginRowReserveRoute::AdaptiveReleasedAlphaBetaTier
         )
     }
+
+    /// Apply the dark budget-proportional ceiling to an already-resolved
+    /// decision. `route` is deliberately UNCHANGED: the sealed adaptive route
+    /// is the only thing authorized to arm scored sparse root CROWN
+    /// ([`Self::enables_scored_sparse_crown`]), and a scheduling ceiling must
+    /// not smuggle that in.
+    pub(crate) fn capped_to_internal_budget(
+        mut self,
+        internal_budget_secs: u64,
+        preset: Option<&Path>,
+    ) -> Self {
+        // Nothing to cap: skip the preset load entirely. `min` against any
+        // ceiling would return 0 anyway, so this is byte-identical and keeps
+        // the non-reserving categories off the filesystem.
+        if self.reserve_secs == 0 {
+            return self;
+        }
+        self.reserve_secs = capped_reserve_secs(
+            self.reserve_secs,
+            internal_budget_secs,
+            margin_row_reserve_max_frac(preset),
+        );
+        self
+    }
+}
+
+/// Dark opt-in: cap the margin-row reserve at this fraction of the INTERNAL
+/// budget. Absent or invalid ⇒ no ceiling ⇒ byte-identical to the shipped
+/// fixed-seconds policy.
+pub(crate) const RESERVE_MAX_FRAC_ENV: &str = "NY_MARGIN_ROW_RESERVE_MAX_FRAC";
+
+/// Accept a ceiling fraction only if it is finite and strictly inside
+/// `(0, 1)`. `1.0` is rejected on purpose — it is a no-op ceiling and
+/// accepting it would invite "0 means release" confusion with
+/// `NY_MARGIN_ROW_RESERVE_SECS`, which is the existing full-release knob.
+fn valid_reserve_fraction(fraction: f64) -> Option<f64> {
+    (fraction.is_finite() && fraction > 0.0 && fraction < 1.0).then_some(fraction)
+}
+
+/// Parse the ceiling fraction from its environment form. Everything the
+/// parser or [`valid_reserve_fraction`] rejects (absent, malformed, `0`,
+/// `>= 1`, non-finite) declines the ceiling and keeps the shipped policy.
+fn reserve_max_fraction(raw: Option<&str>) -> Option<f64> {
+    raw.and_then(|value| value.parse::<f64>().ok())
+        .and_then(valid_reserve_fraction)
+}
+
+/// Resolve the reserve ceiling: `NY_MARGIN_ROW_RESERVE_MAX_FRAC` > per-category
+/// `margin_row.reserve_max_frac` in the preset > no ceiling.
+///
+/// The environment wins wherever it is PRESENT, and a present-but-declined
+/// value resolves to "no ceiling" WITHOUT consulting the preset. That is
+/// deliberate: it keeps `NY_MARGIN_ROW_RESERVE_MAX_FRAC=0` usable as an exact
+/// kill switch for a ceiling a shipped preset asked for, which is what the
+/// dark-gate discipline requires of a scheduling knob. (It differs from
+/// `margin_row_reserve_secs`, where an unparseable env value falls through —
+/// there the fallback is a nonzero default, so falling through is the
+/// conservative direction; here the fallback IS the shipped policy.)
+///
+/// Sound by construction: same argument as [`capped_reserve_secs`] — this only
+/// schedules wall time between two independently sound lanes, so it is
+/// verdict-neutral and can at worst make a lane fail to prove.
+pub(crate) fn margin_row_reserve_max_frac(preset: Option<&Path>) -> Option<f64> {
+    resolve_reserve_max_frac(
+        std::env::var(RESERVE_MAX_FRAC_ENV).ok().as_deref(),
+        preset
+            .and_then(|p| crate::preset::load_preset(p).ok())
+            .and_then(|c| c.margin_row.reserve_max_frac),
+    )
+}
+
+/// The pure half of [`margin_row_reserve_max_frac`], kept separate so the
+/// precedence rules are testable without mutating process-global environment.
+fn resolve_reserve_max_frac(env_raw: Option<&str>, typed: Option<f32>) -> Option<f64> {
+    match env_raw {
+        // PRESENT (even if declined) ⇒ the environment decides, full stop.
+        Some(raw) => reserve_max_fraction(Some(raw)),
+        None => typed.and_then(|fraction| valid_reserve_fraction(f64::from(fraction))),
+    }
+}
+
+/// Clamp a fixed-seconds reserve to a fraction of the internal budget.
+///
+/// WHY (measured 2026-07-26, cifar100_2024 `prop_idx_9502_sidx_7197` — a
+/// winnable-60 row — via `NY_PHASE_TELEMETRY=1`): the reserve is a FIXED
+/// number of seconds, so its share of the budget GROWS as the budget shrinks.
+///
+/// | scored budget | internal tier | ledger after reserve | effective BaB |
+/// |---|---|---|---|
+/// | 100 s | 95 s | 46 s | **34.2 s** |
+/// | 200 s | 190 s | 141 s | **90.0 s** |
+///
+/// Doubling the scored budget yields 2.63x the BaB time, because the fixed
+/// 45 s is 47% of the 95 s internal tier but only 24% of the 190 s one. That
+/// non-proportionality — not per-domain GPU throughput — is why a scored 100 s
+/// run behaves nothing like the first 100 s of a 200 s run. On that same run
+/// the lane the reserve paid for reported `inline worker exceeded its 51.1s
+/// hard slice cap; abandoning the detached worker`: 45 s bought nothing, while
+/// the verifier that might have closed the row was left unable to finish its
+/// root bootstrap.
+///
+/// Scope: 53 of the 60 cifar100 rows alpha-beta-CROWN proves and NY does not
+/// pay the full fixed reserve.
+///
+/// The second half of this paragraph used to read "the shipped
+/// `adaptive_reserve` release covers exactly 7 hard-coded rows (and none of
+/// NY's 41 banked unsats)". That has been FALSE since #6569bfdc replaced the
+/// seven-filename allowlist with pure budget arithmetic
+/// ([`adaptive_release_target`]). On the scored cifar100 path every input is
+/// fixed — reserve 45 s ([`margin_row_reserve_secs`], the preset sets no
+/// `reserve_secs`), internal tier 95 s (`100 - max(5, 100/20)`), release_frac
+/// 0.40 ([`DEFAULT_ADAPTIVE_RELEASE_FRAC`], not overridden) — so `45 >= 38`
+/// holds for EVERY structurally admissible row, not seven. The banked-unsat
+/// carve-out is therefore no longer true by construction; it can only be
+/// established by measurement, and #6569bfdc's own message asks for exactly
+/// that A/B ("must be A/B'd on the GB10 before the next bank of that
+/// category") before the category is banked again.
+///
+/// Sound by construction: this only schedules wall time between two lanes that
+/// are each independently sound. Shrinking the margin-row slice can only make
+/// that lane fail to prove (fail-closed, verdict-neutral); it can never
+/// produce a wrong verdict. Same argument as the surrounding reserve logic.
+fn capped_reserve_secs(
+    reserve_secs: u64,
+    internal_budget_secs: u64,
+    max_fraction: Option<f64>,
+) -> u64 {
+    let Some(fraction) = max_fraction else {
+        return reserve_secs;
+    };
+    // f64 -> u64 via a saturating floor: the product is bounded by
+    // `internal_budget_secs` for any accepted fraction (< 1.0), so this cannot
+    // exceed u64, but keep the conversion total rather than relying on that.
+    let ceiling = (internal_budget_secs as f64 * fraction).floor();
+    let ceiling = if ceiling.is_finite() && ceiling >= 0.0 {
+        ceiling as u64
+    } else {
+        return reserve_secs;
+    };
+    reserve_secs.min(ceiling)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,28 +228,72 @@ fn adaptive_reserve_enabled(typed_enabled: bool, gate: AdaptiveReserveGateEnv<'_
     }
 }
 
-/// The seven still-open CIFAR100 medium rows isolated by the 2026-07-19
-/// barrier-1 campaign. On these exact rows the margin-row root was observed to
-/// be noncompetitive while the verifier did not reach useful BaB airtime after
-/// paying the fixed reserve. This list is intentionally exact and narrow: an
-/// unknown row, a renamed file, or the same property index on another model
-/// keeps the reserve (fail-open toward the historically established lane).
-const ADAPTIVE_RELEASE_CIFAR100_MEDIUM: &[&str] = &[
-    "CIFAR100_resnet_medium_prop_idx_815_sidx_1902_eps_0.0039.vnnlib",
-    "CIFAR100_resnet_medium_prop_idx_966_sidx_2330_eps_0.0039.vnnlib",
-    "CIFAR100_resnet_medium_prop_idx_1190_sidx_8846_eps_0.0039.vnnlib",
-    "CIFAR100_resnet_medium_prop_idx_1761_sidx_3933_eps_0.0039.vnnlib",
-    "CIFAR100_resnet_medium_prop_idx_1798_sidx_1061_eps_0.0039.vnnlib",
-    "CIFAR100_resnet_medium_prop_idx_2050_sidx_8228_eps_0.0039.vnnlib",
-    "CIFAR100_resnet_medium_prop_idx_2477_sidx_388_eps_0.0039.vnnlib",
-];
+/// Dark opt-in: the reserve share of the INTERNAL budget at or above which the
+/// adaptive route releases the reserve entirely. Absent or invalid ⇒
+/// [`DEFAULT_ADAPTIVE_RELEASE_FRAC`].
+pub(crate) const RELEASE_FRAC_ENV: &str = "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC";
 
-fn adaptive_release_target(onnx: &Path, vnnlib: &Path) -> bool {
-    onnx.file_name().and_then(|name| name.to_str()) == Some("CIFAR100_resnet_medium.onnx")
-        && vnnlib
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| ADAPTIVE_RELEASE_CIFAR100_MEDIUM.contains(&name))
+/// Release when the fixed reserve would take >= 40% of the internal budget.
+///
+/// Chosen to sit between the two measured regimes rather than to hit a row
+/// list: the shipped 45 s reserve is 47.4% of the 95 s internal tier at a
+/// scored 100 s (release) and 23.7% of the 190 s tier at a scored 200 s
+/// (preserve). See [`capped_reserve_secs`] for the measurement.
+const DEFAULT_ADAPTIVE_RELEASE_FRAC: f64 = 0.40;
+
+/// Resolve the release threshold: `NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC` >
+/// per-category `margin_row.release_frac` > [`DEFAULT_ADAPTIVE_RELEASE_FRAC`].
+///
+/// Shares [`valid_reserve_fraction`]'s admission rule, so a malformed or
+/// out-of-range value in either source falls back to the shipped default
+/// rather than silently disabling or universalizing the release.
+pub(crate) fn margin_row_release_frac(preset: Option<&Path>) -> f64 {
+    resolve_release_frac(
+        std::env::var(RELEASE_FRAC_ENV).ok().as_deref(),
+        preset
+            .and_then(|p| crate::preset::load_preset(p).ok())
+            .and_then(|c| c.margin_row.release_frac),
+    )
+}
+
+/// The pure half of [`margin_row_release_frac`].
+fn resolve_release_frac(env_raw: Option<&str>, typed: Option<f32>) -> f64 {
+    env_raw
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .and_then(valid_reserve_fraction)
+        .or_else(|| typed.map(f64::from).and_then(valid_reserve_fraction))
+        .unwrap_or(DEFAULT_ADAPTIVE_RELEASE_FRAC)
+}
+
+/// Should the adaptive route hand the internal verifier its whole window?
+///
+/// STRUCTURAL, not identity-based. The predicate is pure budget arithmetic:
+/// release exactly when the configured fixed reserve would consume at least
+/// `release_frac` of the internal budget. It therefore generalizes to every
+/// category, model, and instance — including ones never measured — and depends
+/// on nothing but the two numbers the scheduler already has.
+///
+/// This replaces a hardcoded seven-filename CIFAR100 allowlist. That list
+/// encoded a real measurement (those rows paid a reserve that bought nothing
+/// while the verifier missed its root bootstrap) but keyed it to the identity
+/// of specific public benchmark files, so it could not fire on an unseen
+/// instance with the same pathology and would silently stop firing if a file
+/// were renamed. The share-of-budget condition is the actual mechanism behind
+/// that measurement, expressed directly.
+///
+/// Sound by construction: this only schedules wall time between two
+/// independently sound lanes, so it is verdict-neutral — at worst a lane fails
+/// to prove. Same argument as [`capped_reserve_secs`].
+fn adaptive_release_target(
+    configured_secs: u64,
+    internal_budget_secs: u64,
+    release_frac: f64,
+) -> bool {
+    if internal_budget_secs == 0 {
+        // No budget to take a share of; keep the established fixed lane.
+        return false;
+    }
+    configured_secs as f64 >= internal_budget_secs as f64 * release_frac
 }
 
 fn reserve_policy(
@@ -149,13 +333,15 @@ fn reserve_policy(
 /// Resolve the per-instance reserve after structural admission.
 ///
 /// A typed category preset or exact `NY_MARGIN_ROW_ADAPTIVE_RESERVE=1` enables
-/// release on the exact open αβ-tier rows above. All parse, extraction,
-/// environment, and identity uncertainty retains the fixed policy. No verifier
-/// or margin-row bound/verdict code is changed by this decision.
+/// the adaptive route; within it, [`adaptive_release_target`] decides purely
+/// from budget arithmetic. All parse, extraction, and environment uncertainty
+/// retains the fixed policy. No verifier or margin-row bound/verdict code is
+/// changed by this decision.
 pub(crate) fn margin_row_reserve_decision(
     onnx: &Path,
     vnnlib: &Path,
     preset: Option<&Path>,
+    internal_budget_secs: u64,
 ) -> MarginRowReserveDecision {
     let configured_secs = margin_row_reserve_secs(preset);
     // No reserve unless this category opted in: skip the expensive
@@ -179,7 +365,11 @@ pub(crate) fn margin_row_reserve_decision(
     reserve_policy(
         configured_secs,
         adaptive_reserve_enabled(typed_adaptive, adaptive_reserve_gate_env(gate.as_deref())),
-        adaptive_release_target(onnx, vnnlib),
+        adaptive_release_target(
+            configured_secs,
+            internal_budget_secs,
+            margin_row_release_frac(preset),
+        ),
     )
 }
 
@@ -205,19 +395,6 @@ pub(crate) fn margin_row_reserve_decision(
 ///     to use the 45 s default, but it is not a sealed A/B and therefore does
 ///     not establish the reserve's net production effect.
 ///
-/// Mirror of `vnncomp::internal_timeout_secs`: the internal verifier's budget
-/// is the scored budget minus a grace tier. A reserve comes out of THAT, not
-/// the scored budget — getting this wrong once made a 25s reserve look safe
-/// against 28s of headroom when the real tail was 18s.
-#[cfg(test)]
-pub(crate) fn internal_timeout_tier(timeout_secs: u64) -> u64 {
-    let grace = (timeout_secs / 20).max(5);
-    timeout_secs
-        .checked_sub(grace)
-        .filter(|&t| t >= 1)
-        .unwrap_or(timeout_secs)
-}
-
 pub(crate) fn margin_row_reserve_secs(preset: Option<&Path>) -> u64 {
     if let Ok(v) = std::env::var("NY_MARGIN_ROW_RESERVE_SECS") {
         if let Ok(n) = v.parse() {
@@ -263,73 +440,120 @@ fn log_classwise_stats(stats: &BabStats) {
     }
 }
 
-/// Run `work` on a DETACHED worker thread and bound the join at `cap`
-/// (#twinwall watchdog-kill class, banked 99ed4d42) — the same posture as
-/// ny-mip's `run_with_hard_deadline` slice enforcement.
+#[derive(Debug, PartialEq, Eq)]
+enum DetachedTake<T> {
+    Finished(T),
+    StillRunning,
+    Failed,
+}
+
+/// Run `work` on a detached worker and bound how long the caller waits at
+/// `cap` (#twinwall watchdog-kill class, banked 99ed4d42).
+///
+/// Distinguishes a cap expiry from a completed/failed worker.  The abandoned
+/// worker keeps running until its own cooperative deadline fires or process
+/// teardown; callers must not start another graph-heavy tail in that state.
 ///
 /// WHY: `run_margin_row_lane`'s internal deadline checks are cooperative and
 /// can be arbitrarily coarse between expensive tableau builds (measured on
 /// metaroom: 113.1s against a 45s slice; one run overran until the process
 /// watchdog killed it at budget+grace — the error-scoring risk class). The
 /// only sound external enforcement is to abandon the work at the boundary.
-///
-/// Returns `None` when the cap expires, the worker cannot be spawned, or the
-/// worker panics — all VERDICT-NEUTRAL, fail-closed outcomes. The abandoned
-/// worker keeps running until its own cooperative deadline fires or process
-/// teardown (accepted cost, identical to the MIP lane's detached workers).
 fn run_capped_detached<T: Send + 'static>(
     cap: Duration,
     label: &'static str,
     work: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
+) -> DetachedTake<T> {
     // Capacity-1 channel: the send never blocks, and a receiver gone after
     // the cap makes it fail — the expected abandoned-worker case.
     let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
-    if std::thread::Builder::new()
+    let handle = match std::thread::Builder::new()
         .name(format!("margin-row-{label}"))
         .spawn(move || {
-            let _ = tx.send(work());
-        })
-        .is_err()
-    {
-        eprintln!("margin-row BaB: could not spawn {label} worker; skipping lane (fail-closed)");
-        return None;
-    }
+            // Evaluate the consumed FnOnce before publishing. Its captured
+            // graph state is consequently dropped before `recv_timeout`
+            // observes completion; joining below only waits for this bounded
+            // send/epilogue, not for another proof phase.
+            let out = work();
+            let _ = tx.send(out);
+        }) {
+        Ok(handle) => handle,
+        Err(_) => {
+            eprintln!(
+                "margin-row BaB: could not spawn {label} worker; skipping lane (fail-closed)"
+            );
+            return DetachedTake::Failed;
+        }
+    };
     match rx.recv_timeout(cap) {
-        Ok(out) => Some(out),
+        Ok(out) => match handle.join() {
+            Ok(()) => DetachedTake::Finished(out),
+            Err(_) => {
+                eprintln!(
+                    "margin-row BaB: {label} worker panicked after producing a result; \
+                     discarding it fail-closed"
+                );
+                DetachedTake::Failed
+            }
+        },
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             eprintln!(
                 "margin-row BaB: {label} worker exceeded its {:.1}s hard slice cap; abandoning \
                  the detached worker and returning in-budget (fail-closed, verdict-neutral)",
                 cap.as_secs_f64()
             );
-            None
+            // #margin-row-profile-on-abandon: dump the phase profile HERE.
+            //
+            // `prof::dump()` normally runs at the end of `lane_impl`, but an
+            // abandoned worker never returns, so the profiler could not report
+            // on the one run you actually need to profile -- the overrun. The
+            // counters are process-global atomics, so the abandoning thread can
+            // read them while the detached worker is still going; the numbers
+            // are a snapshot at the cap, which is exactly the question ("where
+            // did the slice go?").
+            if ny_propagate::margin_row::prof::enabled() {
+                eprint!(
+                    "margin-row profile AT SLICE CAP ({label}, {:.1}s, worker still running):\n{}",
+                    cap.as_secs_f64(),
+                    ny_propagate::margin_row::prof::dump()
+                );
+            }
+            // Dropping the JoinHandle detaches the still-running worker.
+            DetachedTake::StillRunning
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
             eprintln!(
                 "margin-row BaB: {label} worker exited without a result (panicked); fail-closed"
             );
-            None
+            DetachedTake::Failed
         }
     }
 }
 
+pub(crate) enum MarginRowTry {
+    Verdict(VnncompResult),
+    FinishedWithoutVerdict,
+    StillRunning,
+}
+
 /// Strictly-additive vnncomp hook: only ever turns unknown/timeout into
-/// `Unsat`. Returns `None` on any mismatch, budget shortfall, or non-verdict.
+/// `Unsat`. The caller can distinguish an abandoned worker so it never starts
+/// another graph-heavy optional tail while that worker remains live.
 pub(crate) fn try_margin_row_unsat(
     onnx: &Path,
     vnnlib: &Path,
     instance_deadline: Option<Instant>,
-) -> Option<VnncompResult> {
+) -> MarginRowTry {
     if !ny_propagate::margin_row::margin_row_bab_enabled() {
-        return None;
+        return MarginRowTry::FinishedWithoutVerdict;
     }
     // No scored deadline (interactive runs): cap the lane at 10 min.
     let instance_deadline =
         instance_deadline.unwrap_or_else(|| Instant::now() + Duration::from_mins(10));
     let remaining = instance_deadline.saturating_duration_since(Instant::now());
     if remaining < Duration::from_secs(10) {
-        return None; // not enough budget for root gates + a useful tree
+        return MarginRowTry::FinishedWithoutVerdict; // not enough budget for root gates + a useful tree
     }
     let deadline = instance_deadline
         .checked_sub(Duration::from_secs(3))
@@ -341,7 +565,7 @@ pub(crate) fn try_margin_row_unsat(
             if dbg {
                 eprintln!("margin-row: extract_twin_spec returned None (structural mismatch)");
             }
-            return None;
+            return MarginRowTry::FinishedWithoutVerdict;
         }
     };
     let (lo, hi, t, adv) = match parse_vnnlib_robustness(vnnlib) {
@@ -350,7 +574,7 @@ pub(crate) fn try_margin_row_unsat(
             if dbg {
                 eprintln!("margin-row: parse_vnnlib_robustness returned None");
             }
-            return None;
+            return MarginRowTry::FinishedWithoutVerdict;
         }
     };
     if lo.len() != spec.n_in {
@@ -361,7 +585,7 @@ pub(crate) fn try_margin_row_unsat(
                 spec.n_in
             );
         }
-        return None;
+        return MarginRowTry::FinishedWithoutVerdict;
     }
     if dbg {
         eprintln!(
@@ -374,14 +598,18 @@ pub(crate) fn try_margin_row_unsat(
     // HARD SLICE ENFORCEMENT (banked 99ed4d42): the lane's cooperative
     // deadline checks are too coarse to trust with the caller's tail (they
     // overran a 45s slice to 113.1s on metaroom and once ran to the watchdog
-    // kill). Detached worker + bounded join: on expiry the lane returns
-    // `None` in-budget and the caller's post-BaB reserve stays intact. The
-    // worker still gets `Some(deadline)` so it normally stops cooperatively
-    // well before the external cap fires.
+    // kill). Detached worker + bounded join: on expiry the lane returns a
+    // distinct `StillRunning` state in-budget, and the caller suppresses its
+    // post-BaB graph tail. The worker still gets `Some(deadline)` so it normally
+    // stops cooperatively well before the external cap fires.
     let cap = deadline.saturating_duration_since(t0);
-    let out = run_capped_detached(cap, "inline", move || {
+    let out = match run_capped_detached(cap, "inline", move || {
         run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000)
-    })?;
+    }) {
+        DetachedTake::Finished(out) => out,
+        DetachedTake::StillRunning => return MarginRowTry::StillRunning,
+        DetachedTake::Failed => return MarginRowTry::FinishedWithoutVerdict,
+    };
     match out {
         MarginRowOutcome::Unsat(stats) => {
             eprintln!(
@@ -396,7 +624,7 @@ pub(crate) fn try_margin_row_unsat(
                 stats.mono_raw_dips,
             );
             log_classwise_stats(&stats);
-            Some(VnncompResult::Unsat)
+            MarginRowTry::Verdict(VnncompResult::Unsat)
         }
         MarginRowOutcome::Unknown { reason, stats } => {
             eprintln!(
@@ -413,7 +641,7 @@ pub(crate) fn try_margin_row_unsat(
             if let Some(stats) = &stats {
                 log_classwise_stats(stats);
             }
-            None
+            MarginRowTry::FinishedWithoutVerdict
         }
     }
 }
@@ -422,15 +650,88 @@ pub(crate) fn try_margin_row_unsat(
 /// verifier (#epoch-bab).
 pub(crate) struct ConcurrentLane {
     rx: std::sync::mpsc::Receiver<Option<VnncompResult>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+pub(crate) enum ConcurrentLaneTake {
+    Verdict(VnncompResult),
+    FinishedWithoutVerdict,
+    StillRunning,
 }
 
 impl ConcurrentLane {
     /// Collect the concurrent lane's verdict, waiting up to `grace` for it to
-    /// land. `None` = no verdict (still running, failed, or not decided): the
-    /// caller keeps whatever it had.
-    pub(crate) fn take(self, grace: Duration) -> Option<VnncompResult> {
-        self.rx.recv_timeout(grace).unwrap_or_default()
+    /// Peek for a verdict WITHOUT consuming the handle (#twinwall-join).
+    /// The same lane is consulted twice per instance: once on the short grace
+    /// right after the internal verifier returns, and once at the very end of
+    /// the post-BaB tail. A message the first call did not wait long enough
+    /// for stays queued and is still there for the second — the receiver is
+    /// only drained by an actual `recv`. Moving the handle at the first
+    /// consult is what silently discarded a certified proof on cifar100_2024.
+    ///
+    /// Because it borrows, this CANNOT join, so unlike [`Self::take`] it makes
+    /// no promise that worker-owned graph memory is released. Callers needing
+    /// that guarantee must still reach the consuming `take`.
+    pub(crate) fn peek(&self, grace: Duration) -> ConcurrentLaneTake {
+        match self.rx.recv_timeout(grace) {
+            Ok(Some(verdict)) => ConcurrentLaneTake::Verdict(verdict),
+            Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                ConcurrentLaneTake::FinishedWithoutVerdict
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ConcurrentLaneTake::StillRunning,
+        }
     }
+
+    /// land.  Keep timeout distinct from a completed no-verdict worker: only
+    /// the former can still own/allocate graph memory after this handle drops.
+    pub(crate) fn take(self, grace: Duration) -> ConcurrentLaneTake {
+        match self.rx.recv_timeout(grace) {
+            Ok(verdict) => {
+                // The message is sent before the closure's captured model is
+                // destroyed. Join on every completed path so `Finished*`
+                // literally means all worker-owned graph memory is gone.
+                if self.handle.join().is_err() {
+                    return ConcurrentLaneTake::FinishedWithoutVerdict;
+                }
+                match verdict {
+                    Some(verdict) => ConcurrentLaneTake::Verdict(verdict),
+                    None => ConcurrentLaneTake::FinishedWithoutVerdict,
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = self.handle.join();
+                ConcurrentLaneTake::FinishedWithoutVerdict
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Dropping the handle detaches the worker; the caller must
+                // suppress every later graph-heavy tail for this instance.
+                ConcurrentLaneTake::StillRunning
+            }
+        }
+    }
+}
+
+/// Resolve the concurrent-lane gate: exact `NY_MARGIN_ROW_CONCURRENT=1|0`
+/// wins wherever the variable is PRESENT (so it stays a kill switch for a
+/// preset that asks for the lane); otherwise the typed
+/// `margin_row.concurrent` preset key decides; absent from both ⇒ OFF, i.e.
+/// byte-identical to the shipped reserve-only path.
+pub(crate) fn concurrent_lane_armed(preset: Option<&Path>) -> bool {
+    if let Ok(raw) = std::env::var("NY_MARGIN_ROW_CONCURRENT") {
+        return raw.trim() == "1";
+    }
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.concurrent)
+        .unwrap_or(false)
+}
+
+/// Resolve the typed f32-root-tableau gate. Returns `None` when the preset
+/// stays silent, so the caller leaves the propagate-side flag untouched.
+pub(crate) fn root_f32_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.root_f32)
 }
 
 /// Start the margin-row lane on a BACKGROUND THREAD, concurrently with the
@@ -468,7 +769,27 @@ pub(crate) fn spawn_concurrent_lane(
     // CIFAR100 +23 appears to use 45s, while the TinyImageNet +67 commit bodies
     // explicitly record 82s. Flip this on only with a sealed A/B that watches
     // the retained rows.
-    if std::env::var("NY_MARGIN_ROW_CONCURRENT").ok().as_deref() != Some("1") {
+    //
+    // MEASURED on cifar100_2024, 2026-08-02 (RTX 5080 + WSL2, 10-CPU cgroup,
+    // rows 1..12 at the official 100 s budget, same binary, arms interleaved):
+    //
+    //   stock       solved 2/12 (sat 1, unsat 1)  timeout 10
+    //   concurrent  solved 2/12 (sat 1, unsat 1)  timeout 10
+    //
+    // Identical -- no conversion and no regression. The premise below HELD, so
+    // this is a fair test of the mechanism rather than a premise failure: the
+    // verifier's sound f64 A.W GEMMs run on cuBLAS while the collector/alpha
+    // work is CPU-bound. It simply does not pay on this category. Default OFF.
+    //
+    // TYPED ROUTE (#twinwall-provenance, 2026-08-03): `margin_row.concurrent`
+    // in the category preset arms the same lane. tinyimagenet_2024 needs it,
+    // because its whole +67 UNSAT bank was gathered through `sweep_targets`,
+    // which hands the lane the FULL per-instance budget — a budget the
+    // reserve-only route cannot reproduce at ANY reserve value (every banked
+    // row recorded >= 50 s of lane time against a 45 s shipped reserve, and
+    // the reserve slice only starts after the internal verifier returns).
+    // The env var still wins wherever it is present, in both directions.
+    if !concurrent_lane_armed(preset) {
         return None;
     }
     // THE PREMISE MUST HOLD. Running concurrently is ~free only because the
@@ -524,7 +845,7 @@ pub(crate) fn spawn_concurrent_lane(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("margin-row-concurrent".into())
         .spawn(move || {
             let t0 = Instant::now();
@@ -568,7 +889,7 @@ pub(crate) fn spawn_concurrent_lane(
         })
         .ok()?;
     eprintln!("margin-row BaB: started CONCURRENT lane alongside the internal verifier");
-    Some(ConcurrentLane { rx })
+    Some(ConcurrentLane { rx, handle })
 }
 
 // --------------------------------------------------------------------------
@@ -631,14 +952,14 @@ fn attr_f(n: &NodeProto, name: &str, default: f64) -> f64 {
     n.attribute
         .iter()
         .find(|a| a.name == name)
-        .map_or(default, |a| f64::from(a.f))
+        .map_or(default, |a| f64::from(a.f_value()))
 }
 
 fn attr_i(n: &NodeProto, name: &str, default: i64) -> i64 {
     n.attribute
         .iter()
         .find(|a| a.name == name)
-        .map_or(default, |a| a.i)
+        .map_or(default, |a| a.i_value())
 }
 
 /// Extract the twin-wall family net; `None` on ANY structural deviation.
@@ -1364,13 +1685,11 @@ pub(crate) fn parse_vnnlib_robustness(
 
 // --------------------------------------------------------------------------
 //  Differential gates vs the verified Python reference (#twinwall INC2a/b/c).
-//  All #[ignore]: they need benchmarks/vnncomp2025 locally and real minutes.
-//  Run explicitly, serially:
-//    cargo test -p ny-cli margin_row_bab -- --ignored --test-threads=1
+//  Real-corpus measurements are exposed through the explicit
+//  `ny vnncomp-research margin-row` lane and must run serially.
 // --------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
+pub(crate) mod research {
     use super::*;
     use ny_propagate::margin_row::bab::{BabConfig, MarginRowBab};
     use ny_propagate::margin_row::bounds::{
@@ -1395,7 +1714,7 @@ mod tests {
         let elapsed = t0.elapsed();
         // Fail-closed abandon: no value, and the caller got control back at
         // the cap (generous 5s bound for CI schedulers), NOT after 30s.
-        assert_eq!(out, None);
+        assert_eq!(out, DetachedTake::StillRunning);
         assert!(
             elapsed < Duration::from_secs(5),
             "cap not enforced: returned after {elapsed:?}"
@@ -1405,7 +1724,7 @@ mod tests {
     #[test]
     fn capped_detached_passes_through_fast_work() {
         let out = run_capped_detached(Duration::from_secs(30), "test-fast", || 7_u32);
-        assert_eq!(out, Some(7));
+        assert_eq!(out, DetachedTake::Finished(7));
     }
 
     #[test]
@@ -1413,7 +1732,53 @@ mod tests {
         let out = run_capped_detached(Duration::from_secs(30), "test-panic", || -> u32 {
             panic!("worker panic must map to None, never a verdict")
         });
-        assert_eq!(out, None);
+        assert_eq!(out, DetachedTake::Failed);
+    }
+
+    #[test]
+    fn concurrent_lane_joins_completed_worker_before_reporting_finished() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let epilogue_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_flag = std::sync::Arc::clone(&epilogue_finished);
+        let handle = std::thread::spawn(move || {
+            tx.send(Some(VnncompResult::Unsat)).expect("receiver alive");
+            std::thread::sleep(Duration::from_millis(20));
+            worker_flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let lane = ConcurrentLane { rx, handle };
+        assert!(matches!(
+            lane.take(Duration::from_secs(1)),
+            ConcurrentLaneTake::Verdict(VnncompResult::Unsat)
+        ));
+        assert!(
+            epilogue_finished.load(std::sync::atomic::Ordering::Acquire),
+            "a finished result must mean the worker and its captured graph are gone"
+        );
+    }
+
+    #[test]
+    fn concurrent_lane_joins_disconnected_worker_fail_closed() {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<VnncompResult>>();
+        let handle = std::thread::spawn(move || drop(tx));
+        let lane = ConcurrentLane { rx, handle };
+        assert!(matches!(
+            lane.take(Duration::from_secs(1)),
+            ConcurrentLaneTake::FinishedWithoutVerdict
+        ));
+    }
+
+    #[test]
+    fn concurrent_lane_timeout_remains_distinct_from_completion() {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<VnncompResult>>();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = tx.send(None);
+        });
+        let lane = ConcurrentLane { rx, handle };
+        assert!(matches!(
+            lane.take(Duration::from_millis(5)),
+            ConcurrentLaneTake::StillRunning
+        ));
     }
 
     // --- Bracket/flat VNNLIB index mapping (self-contained, no external files) ---
@@ -1545,9 +1910,7 @@ mod tests {
     ///   NY_PROBE_ONNX  = onnx basename (default per category)
     ///   NY_PROBE_VNNLIB= vnnlib basename (required)
     ///   NY_PROBE_SECS  = wall budget (default 100)
-    #[test]
-    #[ignore = "measurement harness; drive via NY_PROBE_* env; run solo"]
-    fn probe_env_instance() {
+    pub(crate) fn probe_env_instance() {
         let cat = std::env::var("NY_PROBE_CAT").unwrap_or_else(|_| "cifar100_2024".into());
         let default_onnx = if cat.starts_with("tiny") {
             "TinyImageNet_resnet_medium.onnx"
@@ -1591,13 +1954,11 @@ mod tests {
     /// frozen gate array (mid/rad/xabs + per-layer l/u/alpha/s/c/ms/unst) plus
     /// the verdict-feeding root_bound. Compare the digest across code versions:
     /// EQUAL => the entire downstream is bit-identical (strongest oracle). Set
-    /// NY_ROOT_DUMP=<path> to also write every (l,u) as LE f64 for an
+    /// `NY_ROOT_DUMP=<path>` to also write every (l,u) as LE f64 for an
     /// outward-enclosure check (BLAS path). NY_ROOT_BLAS=1 selects the DGEMM
     /// forward-conv (provably-outward, not bit-identical).
     ///   NY_PROBE_CAT / NY_PROBE_ONNX / NY_PROBE_VNNLIB, NY_ROOT_REPS
-    #[test]
-    #[ignore = "root-build profile+oracle; NY_PROBE_VNNLIB=<inst>; run solo"]
-    fn probe_root_build() {
+    pub(crate) fn probe_root_build() {
         use ny_propagate::margin_row::bab::root_eval;
         let cat = std::env::var("NY_PROBE_CAT").unwrap_or_else(|_| "cifar100_2024".into());
         let default_onnx = if cat.starts_with("tiny") {
@@ -1722,9 +2083,7 @@ mod tests {
     /// Pass-cost scaling: is a backward pass cost proportional to column count
     /// R (batching only fills cores) or dominated by a fixed per-pass constant
     /// (batching amortizes real work)? Times single Lower passes at several R.
-    #[test]
-    #[ignore = "measurement; NY_PROBE_VNNLIB=<inst>; run solo"]
-    fn probe_pass_scaling() {
+    pub(crate) fn probe_pass_scaling() {
         use ndarray::Array2;
         let vnnlib_base = std::env::var("NY_PROBE_VNNLIB").expect("set NY_PROBE_VNNLIB");
         let cat = std::env::var("NY_PROBE_CAT").unwrap_or_else(|_| "cifar100_2024".into());
@@ -1776,9 +2135,7 @@ mod tests {
     /// and parallel (frontier=N) from the SAME root and assert the root_bound
     /// is BIT-IDENTICAL and the verdict matches. Drive via NY_PROBE_VNNLIB /
     /// NY_ORACLE_FRONTIER / NY_PROBE_SECS.
-    #[test]
-    #[ignore = "oracle diff; NY_PROBE_VNNLIB=<inst>; run solo"]
-    fn oracle_serial_vs_parallel() {
+    pub(crate) fn oracle_serial_vs_parallel() {
         let cat = std::env::var("NY_PROBE_CAT").unwrap_or_else(|_| "cifar100_2024".into());
         let default_onnx = if cat.starts_with("tiny") {
             "TinyImageNet_resnet_medium.onnx"
@@ -1962,9 +2319,7 @@ mod tests {
 
     /// INC2a gate (i): parity-mode root direct bound on prop_1498 must
     /// reproduce the Python reference to <= 1e-9.
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025 + ~1 min; run serially"]
-    fn inc2a_root_parity_1498() {
+    pub(crate) fn inc2a_root_parity_1498() {
         let (spec, lo, hi, t, adv) = instance(P1498);
         let net = TwinNet::compile(&spec).expect("compile");
         let t0 = Instant::now();
@@ -1990,12 +2345,8 @@ mod tests {
     /// INC2a gates (ii)+(iii): outward bound <= parity bound, within 1e-3;
     /// enclosure vs 200 sampled in-box margins (membership-filtered form is
     /// exercised in the INC2b replay; the root has no splits).
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025 + ~2 min; run serially"]
-    fn inc2a_outward_bound_and_enclosure_1498() {
+    pub(crate) fn inc2a_outward_bound_and_enclosure_1498() {
         use ndarray::Array2;
-        use rand::rngs::StdRng;
-        use rand::{RngExt, SeedableRng};
         let (spec, lo, hi, t, adv) = instance(P1498);
         let net = TwinNet::compile(&spec).expect("compile");
         let root_p = RootGates::build(&net, &lo, &hi, RoundMode::Parity, None).expect("root");
@@ -2015,13 +2366,19 @@ mod tests {
             b_par - b_out
         );
         // Enclosure: min sampled margin over the fail set >= outward bound.
-        let mut rng = StdRng::seed_from_u64(271_828_182);
+        let mut state = 271_828_182_u64;
+        let mut next_unit = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
+        };
         let n_in = net.n_in;
         let bsz = 200;
         let mut x = Array2::<f64>::zeros((n_in, bsz));
         for i in 0..n_in {
             for b in 0..bsz {
-                let u: f64 = rng.random_range(0.0..1.0);
+                let u = next_unit();
                 x[[i, b]] = lo[i] + u * (hi[i] - lo[i]);
             }
         }
@@ -2049,9 +2406,7 @@ mod tests {
 
     /// INC2b gate: replay the RECORDED 1498 worst path. Parity mode must match
     /// every depth to <= 1e-9; outward mode must still cross 0 at the end.
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025 + ~5 min; run serially"]
-    fn inc2b_trajectory_replay_1498() {
+    pub(crate) fn inc2b_trajectory_replay_1498() {
         let (spec, lo, hi, t, adv) = instance(P1498);
         let net = TwinNet::compile(&spec).expect("compile");
         for mode in [RoundMode::Parity, RoundMode::Outward] {
@@ -2116,9 +2471,7 @@ mod tests {
     /// Recorded positions are into the PARITY unstable list; the outward
     /// replay above relies on the unstable sets agreeing at those positions.
     /// This cross-checks that the (layer 5) ids match between modes.
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025 + ~1 min; run serially"]
-    fn inc2b_unstable_position_parity_l5() {
+    pub(crate) fn inc2b_unstable_position_parity_l5() {
         let (spec, lo, hi, _, _) = instance(P1498);
         let net = TwinNet::compile(&spec).expect("compile");
         let par = RootGates::build(&net, &lo, &hi, RoundMode::Parity, None).expect("root");
@@ -2134,28 +2487,20 @@ mod tests {
 
     /// INC2c gate: end-to-end certified closures on the three probed
     /// pyrat-easy instances, and the MOAT gate on a known-SAT instance.
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025; ~100s per instance; run solo at the END"]
-    fn inc2c_closes_4429() {
+    pub(crate) fn inc2c_closes_4429() {
         assert_closes(P4429, 100);
     }
 
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025; ~100s; run solo at the END"]
-    fn inc2c_closes_1498() {
+    pub(crate) fn inc2c_closes_1498() {
         assert_closes(P1498, 100);
     }
 
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025; ~100s; run solo at the END"]
-    fn inc2c_closes_2551() {
+    pub(crate) fn inc2c_closes_2551() {
         assert_closes(P2551, 100);
     }
 
     /// MOAT: a banked-SAT instance must NEVER verify.
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025; ~100s; run solo at the END"]
-    fn inc2c_moat_sat_6232_not_verified() {
+    pub(crate) fn inc2c_moat_sat_6232_not_verified() {
         let (spec, lo, hi, t, adv) = instance(P6232_SAT);
         let deadline = Instant::now() + Duration::from_secs(100);
         match run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000) {
@@ -2205,9 +2550,7 @@ mod tests {
 
     /// Extractor + parser smoke on the real files (fast; not ignored gating
     /// logic — still needs the benchmark checkout).
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025"]
-    fn extractor_and_parser_smoke() {
+    pub(crate) fn extractor_and_parser_smoke() {
         let (spec, lo, hi, t, adv) = instance(P1498);
         assert_eq!(spec.n_in, 3072);
         assert_eq!(spec.ops.len(), 19 + 9 + 8 + 1 + 2 + 1); // conv+relu+add+flat+gemms+head relu
@@ -2439,9 +2782,7 @@ mod tests {
 
     /// THE MOAT: every GT-sat row must return NON-Unsat. A single Unsat is
     /// catastrophic (a false-unsat where a real counterexample exists).
-    #[test]
-    #[ignore = "moat scan: 14 GT-sat instances; run solo, NY_MOAT_SECS=60"]
-    fn moat_gt_sat_never_unsat() {
+    pub(crate) fn moat_gt_sat_never_unsat() {
         let secs = moat_deadline_secs();
         let mut violations = Vec::new();
         for (name, kind) in GT_SAT {
@@ -2471,9 +2812,7 @@ mod tests {
 
     /// Closure + cross-check contingency over GT-unsat tiers. Records how many
     /// each tier closes; every UNSAT here is GT-correct (all rows are GT-unsat).
-    #[test]
-    #[ignore = "closure scan: GT-unsat tiers; run solo, NY_MOAT_SECS=100"]
-    fn closure_gt_unsat_contingency() {
+    pub(crate) fn closure_gt_unsat_contingency() {
         let secs = moat_deadline_secs();
         let mut tally: std::collections::BTreeMap<&str, (usize, usize, usize)> = Default::default(); // tier -> (unsat, unknown, total)
         for (name, tier) in GT_UNSAT {
@@ -2502,9 +2841,7 @@ mod tests {
     /// a GT-sat row on those models can never be falsely closed because the
     /// vnncomp hook only runs the lane when extraction succeeds AND the verdict
     /// is unknown/timeout. Reports which models extract.
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025"]
-    fn extraction_safety_other_models() {
+    pub(crate) fn extraction_safety_other_models() {
         let base = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../benchmarks/vnncomp2025/benchmarks"
@@ -2534,9 +2871,7 @@ mod tests {
     /// compare the rebuilt-root domain bound against the frozen-gates
     /// domain-override bound for the SAME splits. Env:
     ///   NY_PROBE_VNNLIB, NY_GAIN_K (default 4), NY_GAIN_LAYERS (e.g. "0,2,4").
-    #[test]
-    #[ignore = "measurement; needs benchmarks/vnncomp2025; run solo"]
-    fn epoch_gain_probe_real() {
+    pub(crate) fn epoch_gain_probe_real() {
         use ny_propagate::margin_row::root::RetainCfg;
         let vnnlib_base = std::env::var("NY_PROBE_VNNLIB").expect("set NY_PROBE_VNNLIB");
         let k: usize = std::env::var("NY_GAIN_K")
@@ -2645,9 +2980,7 @@ mod tests {
 
     /// The 5 banked metaroom gains still close (regression gate for the
     /// extractor + lane). Each is GT-unsat by >=6 official tools.
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025 metaroom; ~1 min; run solo"]
-    fn metaroom_banked_gains_still_close() {
+    pub(crate) fn metaroom_banked_gains_still_close() {
         let mut failures = Vec::new();
         for (onnx_base, vnnlib_base) in METAROOM_PROD_TIMEOUT_GAINS {
             let onnx = format!("{BENCH_ROOT}/metaroom_2023/onnx/{onnx_base}");
@@ -2677,9 +3010,7 @@ mod tests {
 
     /// MOAT on the metaroom class: every GT-SAT metaroom row must return
     /// NON-Unsat. (Official 2025: 5 sat rows on this benchmark.)
-    #[test]
-    #[ignore = "needs benchmarks/vnncomp2025 metaroom; run solo"]
-    fn metaroom_moat_gt_sat_never_unsat() {
+    pub(crate) fn metaroom_moat_gt_sat_never_unsat() {
         const GT_SAT: &[(&str, &str)] = &[
             (
                 "4cnn_ry_99_16_no_custom_OP.onnx",
@@ -2729,6 +3060,218 @@ mod tests {
             "MOAT BROKEN on metaroom GT-sat rows: {violations:?}"
         );
     }
+    /// The ceiling declines for every input that is not a finite fraction
+    /// strictly inside `(0, 1)`, so an unset/typo'd/hostile value can never
+    /// silently change the shipped scheduling policy.
+    #[test]
+    fn reserve_max_fraction_accepts_only_proper_fractions() {
+        assert_eq!(reserve_max_fraction(Some("0.25")), Some(0.25));
+        assert_eq!(reserve_max_fraction(Some("0.5")), Some(0.5));
+        for declined in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("0.0"),
+            Some("1"),
+            Some("1.0"),
+            Some("1.5"),
+            Some("-0.25"),
+            Some("nan"),
+            Some("inf"),
+            Some("25%"),
+            Some("a quarter"),
+        ] {
+            assert_eq!(
+                reserve_max_fraction(declined),
+                None,
+                "{declined:?} must decline the ceiling"
+            );
+        }
+    }
+
+    /// No ceiling ⇒ the reserve is returned untouched. This is the shipped
+    /// default path and it must stay byte-identical.
+    #[test]
+    fn capped_reserve_without_a_fraction_is_the_identity() {
+        for budget in [0, 10, 95, 190, 600] {
+            assert_eq!(capped_reserve_secs(45, budget, None), 45);
+        }
+    }
+
+    /// The ceiling binds only when it is BELOW the configured reserve — it can
+    /// never hand the lane MORE time than the fixed policy asked for.
+    #[test]
+    fn capped_reserve_only_ever_shrinks_the_reserve() {
+        // The measured cifar100 case: 45 s of a 95 s internal tier is 47%.
+        assert_eq!(capped_reserve_secs(45, 95, Some(0.25)), 23);
+        // Same fixed reserve, double the budget: the ceiling stops binding.
+        assert_eq!(capped_reserve_secs(45, 190, Some(0.25)), 45);
+        // A generous ceiling is inert at either budget.
+        assert_eq!(capped_reserve_secs(45, 95, Some(0.9)), 45);
+        // Already-released reserves stay released.
+        assert_eq!(capped_reserve_secs(0, 95, Some(0.25)), 0);
+        // Degenerate budgets floor to zero rather than panicking.
+        assert_eq!(capped_reserve_secs(45, 0, Some(0.25)), 0);
+    }
+
+    /// The typed `margin_row.reserve_max_frac` key arms the ceiling only for
+    /// proper fractions, exactly like the environment form. A malformed or
+    /// out-of-range typed value must NOT arm the gate — it declines and the
+    /// shipped fixed-seconds policy stands.
+    #[test]
+    fn typed_reserve_max_frac_arms_only_on_proper_fractions() {
+        assert_eq!(resolve_reserve_max_frac(None, Some(0.25)), Some(0.25));
+        assert_eq!(resolve_reserve_max_frac(None, Some(0.5)), Some(0.5));
+        for declined in [
+            None,
+            Some(0.0f32),
+            Some(-0.0),
+            Some(-0.25),
+            Some(1.0),
+            Some(1.5),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+            Some(f32::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                resolve_reserve_max_frac(None, declined),
+                None,
+                "typed {declined:?} must decline the ceiling"
+            );
+        }
+    }
+
+    /// Precedence: the environment wins wherever it is PRESENT, and a present
+    /// value the parser declines resolves to "no ceiling" WITHOUT falling back
+    /// to the preset — that is the exact kill switch for a shipped preset key.
+    #[test]
+    fn reserve_max_frac_env_overrides_and_kills_the_typed_key() {
+        // Env absent ⇒ the typed key decides.
+        assert_eq!(resolve_reserve_max_frac(None, Some(0.25)), Some(0.25));
+        // Env present and valid ⇒ env wins over the typed key.
+        assert_eq!(resolve_reserve_max_frac(Some("0.5"), Some(0.25)), Some(0.5));
+        // Env present but declined ⇒ NO ceiling, typed key is not consulted.
+        for kill in ["0", "0.0", "1", "1.0", "-0.25", "nan", "", "a quarter"] {
+            assert_eq!(
+                resolve_reserve_max_frac(Some(kill), Some(0.25)),
+                None,
+                "{kill:?} must kill the typed ceiling rather than fall through"
+            );
+        }
+    }
+
+    /// End-to-end through a real preset file: absent key ⇒ no ceiling and the
+    /// reserve is untouched; a proper fraction ⇒ the ceiling binds. Reads the
+    /// environment, which is unset in the test process (nothing here sets it).
+    #[test]
+    fn typed_reserve_max_frac_round_trips_through_a_preset_file() {
+        let dir = std::env::temp_dir().join(format!("ny_mr_frac_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+
+        // No preset at all ⇒ no ceiling.
+        assert_eq!(margin_row_reserve_max_frac(None), None);
+
+        // A preset without the key ⇒ still no ceiling (byte-identical path).
+        let plain = dir.join("plain.yaml");
+        std::fs::write(&plain, "margin_row:\n  reserve_secs: 45\n").expect("write");
+        assert_eq!(margin_row_reserve_max_frac(Some(&plain)), None);
+        let decision = MarginRowReserveDecision {
+            configured_secs: 45,
+            reserve_secs: 45,
+            route: MarginRowReserveRoute::Fixed,
+        };
+        assert_eq!(
+            decision
+                .capped_to_internal_budget(95, Some(&plain))
+                .reserve_secs,
+            45,
+            "an absent reserve_max_frac must leave the shipped reserve alone"
+        );
+
+        // A preset naming the key ⇒ the ceiling binds, route untouched.
+        let capped = dir.join("capped.yaml");
+        std::fs::write(
+            &capped,
+            "margin_row:\n  reserve_secs: 45\n  reserve_max_frac: 0.25\n",
+        )
+        .expect("write");
+        assert_eq!(margin_row_reserve_max_frac(Some(&capped)), Some(0.25));
+        let applied = decision.capped_to_internal_budget(95, Some(&capped));
+        assert_eq!(applied.reserve_secs, 23);
+        assert_eq!(applied.configured_secs, 45);
+        assert_eq!(applied.route, MarginRowReserveRoute::Fixed);
+
+        // A malformed typed value declines rather than arming anything.
+        let bogus = dir.join("bogus.yaml");
+        std::fs::write(&bogus, "margin_row:\n  reserve_max_frac: 1.0\n").expect("write");
+        assert_eq!(margin_row_reserve_max_frac(Some(&bogus)), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Landing the KEY is the deliverable; ARMING it needs a measured A/B we
+    /// have not run. No shipped preset may name `margin_row.reserve_max_frac`
+    /// until that exists, so every shipped category stays byte-identical.
+    #[test]
+    fn no_shipped_preset_arms_the_reserve_ceiling() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let mut armed: Vec<String> = Vec::new();
+        for year in ["vnncomp24", "vnncomp25", "vnncomp26"] {
+            let dir = root.join(year);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("readable preset");
+                let preset: crate::preset::PresetConfig = serde_yaml::from_str(&text)
+                    .unwrap_or_else(|e| panic!("preset {} must parse: {e}", path.display()));
+                if preset.margin_row.reserve_max_frac.is_some() {
+                    armed.push(format!("{year}/{}", path.display()));
+                }
+            }
+        }
+        assert!(
+            armed.is_empty(),
+            "shipped presets must not arm the reserve ceiling without a measured A/B: {armed:?}"
+        );
+    }
+
+    /// An already-released reserve skips the ceiling path entirely (and with it
+    /// the preset load) and stays released.
+    #[test]
+    fn capped_to_internal_budget_is_inert_on_a_released_reserve() {
+        let released = MarginRowReserveDecision {
+            configured_secs: 45,
+            reserve_secs: 0,
+            route: MarginRowReserveRoute::AdaptiveReleasedAlphaBetaTier,
+        };
+        let capped = released.capped_to_internal_budget(95, Some(Path::new("/nonexistent.yaml")));
+        assert_eq!(capped.reserve_secs, 0);
+        assert!(capped.enables_scored_sparse_crown());
+    }
+
+    /// The ceiling is a SCHEDULING knob: it must not alter the route, because
+    /// the route is what authorizes scored sparse root CROWN.
+    #[test]
+    fn capped_reserve_preserves_the_route_and_configured_seconds() {
+        let decision = MarginRowReserveDecision {
+            configured_secs: 45,
+            reserve_secs: 45,
+            route: MarginRowReserveRoute::AdaptivePreserved,
+        };
+        let capped = decision.capped_to_internal_budget(95, None);
+        assert_eq!(capped.route, MarginRowReserveRoute::AdaptivePreserved);
+        assert_eq!(capped.configured_secs, 45);
+        assert!(!capped.enables_scored_sparse_crown());
+        // With the env unset (the default in the test process) the ceiling
+        // declines, so this is also an identity check on the shipped path.
+        assert_eq!(capped.reserve_secs, 45);
+    }
+
     /// The reserve resolves to the shipped 45 s default when neither the
     /// environment nor a category preset overrides it. This pins that
     /// resolution behavior (#epoch-bab); it does not establish score impact.
@@ -2783,26 +3326,73 @@ mod tests {
         );
     }
 
+    /// The release predicate is budget arithmetic, so it must reproduce the
+    /// two MEASURED regimes that motivated it and must not depend on the
+    /// identity of any model or property file.
     #[test]
-    fn adaptive_reserve_targets_exactly_the_open_alpha_beta_tier() {
-        let model = Path::new("/bench/onnx/CIFAR100_resnet_medium.onnx");
-        assert_eq!(ADAPTIVE_RELEASE_CIFAR100_MEDIUM.len(), 7);
-        for name in ADAPTIVE_RELEASE_CIFAR100_MEDIUM {
-            assert!(
-                adaptive_release_target(model, Path::new(name)),
-                "open tier row must engage: {name}"
+    fn adaptive_release_is_structural_budget_share_not_instance_identity() {
+        let frac = DEFAULT_ADAPTIVE_RELEASE_FRAC;
+
+        // Measured 2026-07-26 (cifar100_2024 prop_idx_9502_sidx_7197):
+        // scored 100 s -> 95 s internal tier, 45 s reserve = 47.4% -> RELEASE.
+        assert!(
+            adaptive_release_target(45, 95, frac),
+            "45s of a 95s internal tier is 47% — the regime where the reserve bought nothing"
+        );
+        // scored 200 s -> 190 s internal tier, 45 s reserve = 23.7% -> PRESERVE.
+        assert!(
+            !adaptive_release_target(45, 190, frac),
+            "45s of a 190s internal tier is 24% — the regime where the lane had airtime"
+        );
+
+        // Exactly at the threshold releases; a hair under preserves.
+        assert!(adaptive_release_target(40, 100, frac));
+        assert!(!adaptive_release_target(39, 100, frac));
+
+        // Degenerate budgets keep the established fixed lane.
+        assert!(!adaptive_release_target(45, 0, frac));
+        // A zero reserve is never a release target (the caller short-circuits
+        // it to NotApplicable, but the predicate must agree).
+        assert!(!adaptive_release_target(0, 95, frac));
+
+        // Threshold resolution: env > preset > default, each fail-safe.
+        assert_eq!(resolve_release_frac(None, None), frac);
+        assert_eq!(resolve_release_frac(Some("0.25"), None), 0.25);
+        assert_eq!(resolve_release_frac(None, Some(0.25)), 0.25);
+        assert_eq!(resolve_release_frac(Some("0.25"), Some(0.9)), 0.25);
+        for bad in ["", "abc", "0", "1", "1.5", "-0.2", "NaN", "inf"] {
+            assert_eq!(
+                resolve_release_frac(Some(bad), None),
+                frac,
+                "malformed threshold {bad:?} must fall back to the shipped default"
             );
+        }
+        for bad in [0.0f32, 1.0, 1.5, -0.2, f32::NAN, f32::INFINITY] {
+            assert_eq!(resolve_release_frac(None, Some(bad)), frac);
+        }
+    }
+
+    /// The removed allowlist keyed on `CIFAR100_resnet_medium.onnx` plus seven
+    /// exact property basenames. Nothing in the reserve path may consult a
+    /// model or property NAME again — the decision is budget-only.
+    #[test]
+    fn reserve_path_carries_no_instance_name_literals() {
+        let src = include_str!("margin_row_bab.rs");
+        let reserve_region = src
+            .split_once("pub(crate) const RELEASE_FRAC_ENV")
+            .expect("release threshold block present")
+            .1
+            .split_once("pub(crate) fn margin_row_reserve_secs")
+            .expect("fixed-reserve resolver boundary present")
+            .0;
+        for needle in [
+            "CIFAR100_resnet_medium.onnx",
+            "prop_idx_",
+            "ADAPTIVE_RELEASE_CIFAR100_MEDIUM",
+        ] {
             assert!(
-                !adaptive_release_target(
-                    Path::new("TinyImageNet_resnet_medium.onnx"),
-                    Path::new(name)
-                ),
-                "the same property basename on another model must retain its reserve"
-            );
-            let renamed = format!("copy-{name}");
-            assert!(
-                !adaptive_release_target(model, Path::new(&renamed)),
-                "renamed/unknown evidence must fail open to the fixed reserve"
+                !reserve_region.contains(needle),
+                "instance-identity literal {needle:?} reintroduced on the reserve path"
             );
         }
     }
@@ -2847,140 +3437,190 @@ mod tests {
             }
         );
 
-        // Representative historical margin-row closures across the affected
-        // families. Exact model+property matching keeps every one on the fixed
-        // route; similarly numbered TinyImageNet rows cannot collide.
-        const CLOSURE_SENTINELS: &[(&str, &str)] = &[
-            (
-                "CIFAR100_resnet_medium.onnx",
-                "CIFAR100_resnet_medium_prop_idx_54_sidx_9735_eps_0.0039.vnnlib",
-            ),
-            (
-                "CIFAR100_resnet_medium.onnx",
-                "CIFAR100_resnet_medium_prop_idx_1498_sidx_792_eps_0.0039.vnnlib",
-            ),
-            (
-                "CIFAR100_resnet_medium.onnx",
-                "CIFAR100_resnet_medium_prop_idx_1588_sidx_6654_eps_0.0039.vnnlib",
-            ),
-            (
-                "CIFAR100_resnet_medium.onnx",
-                "CIFAR100_resnet_medium_prop_idx_4605_sidx_6225_eps_0.0039.vnnlib",
-            ),
-            (
-                "CIFAR100_resnet_medium.onnx",
-                "CIFAR100_resnet_medium_prop_idx_7176_sidx_1522_eps_0.0039.vnnlib",
-            ),
-            (
-                "CIFAR100_resnet_large.onnx",
-                "CIFAR100_resnet_large_prop_idx_5308_sidx_1650_eps_0.0039.vnnlib",
-            ),
-            (
-                "TinyImageNet_resnet_medium.onnx",
-                "TinyImageNet_resnet_medium_prop_idx_1126_sidx_4974_eps_0.0039.vnnlib",
-            ),
-            (
-                "TinyImageNet_resnet_medium.onnx",
-                "CIFAR100_resnet_medium_prop_idx_815_sidx_1902_eps_0.0039.vnnlib",
-            ),
-            (
-                "6cnn_ry_64_10_no_custom_OP.onnx",
-                "spec_idx_132_eps_0.00000436.vnnlib",
-            ),
-        ];
-        for (model, property) in CLOSURE_SENTINELS {
+        // The historical margin-row closures were all measured at LONG scored
+        // budgets, where the reserve is a small share of the internal tier and
+        // the lane demonstrably had airtime. The structural predicate must
+        // leave that whole regime on the fixed route, whatever the instance is
+        // called. cifar100/tinyimagenet run a 200 s scored budget (190 s
+        // internal) and metaroom 210 s (199 s internal).
+        for internal_budget in [190u64, 199, 300, 600] {
             assert!(
-                !adaptive_release_target(Path::new(model), Path::new(property)),
-                "historical closure sentinel must retain reserve: {model}/{property}"
+                !adaptive_release_target(45, internal_budget, DEFAULT_ADAPTIVE_RELEASE_FRAC),
+                "long-budget closure regime must retain the reserve ({internal_budget}s internal)"
             );
         }
     }
 
-    /// Legacy-scorecard tripwire for explicit future preset reserves. It
-    /// cross-checks each preset's declared `reserve_secs` against historical
-    /// solve rows; it does not validate the global default or constitute
-    /// sealed production evidence.
+    /// The concurrent-lane gate: env wins in BOTH directions wherever present,
+    /// the typed preset key decides when it is absent, and absent-from-both is
+    /// OFF (byte-identical to the shipped reserve-only path).
     #[test]
-    fn shipped_preset_reserves_never_threaten_a_measured_solve() {
-        // (preset, legacy scorecard, official per-instance budget)
-        const CATS: &[(&str, &str, u64)] = &[
-            (
-                "configs/vnncomp25/metaroom_2023.yaml",
-                "reports/measured/metaroom_2023.csv",
-                210,
-            ),
-            (
-                "configs/vnncomp25/sat_relu.yaml",
-                "reports/measured/sat_relu.csv",
-                100,
-            ),
-            (
-                "configs/vnncomp25/cifar100_2024.yaml",
-                "reports/measured/cifar100_2024.csv",
-                100,
-            ),
+    fn concurrent_lane_gate_resolution_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let on = dir.path().join("on.yaml");
+        std::fs::write(&on, "margin_row:\n  concurrent: true\n").expect("write");
+        let off = dir.path().join("off.yaml");
+        std::fs::write(&off, "margin_row:\n  concurrent: false\n").expect("write");
+        let silent = dir.path().join("silent.yaml");
+        std::fs::write(&silent, "margin_row:\n  reserve_secs: 45\n").expect("write");
+
+        // Env absent: the preset decides; a preset that never mentions the key
+        // keeps the shipped OFF behaviour.
+        assert!(concurrent_lane_armed(Some(&on)));
+        assert!(!concurrent_lane_armed(Some(&off)));
+        assert!(!concurrent_lane_armed(Some(&silent)));
+        assert!(!concurrent_lane_armed(None));
+    }
+
+    /// The typed f32 route must never be able to TIGHTEN anything: it only
+    /// selects a tableau precision whose rounding is charged into a certified
+    /// additive slack. Here we only pin the plumbing — that the preset key is
+    /// read, and that a preset which stays silent leaves the flag alone.
+    #[test]
+    fn root_f32_preset_key_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let on = dir.path().join("on.yaml");
+        std::fs::write(&on, "margin_row:\n  root_f32: true\n").expect("write");
+        let off = dir.path().join("off.yaml");
+        std::fs::write(&off, "margin_row:\n  root_f32: false\n").expect("write");
+        let silent = dir.path().join("silent.yaml");
+        std::fs::write(&silent, "margin_row:\n  reserve_secs: 0\n").expect("write");
+
+        assert_eq!(root_f32_from_preset(Some(&on)), Some(true));
+        assert_eq!(root_f32_from_preset(Some(&off)), Some(false));
+        assert_eq!(root_f32_from_preset(Some(&silent)), None);
+        assert_eq!(root_f32_from_preset(None), None);
+    }
+
+    /// A preset that arms the concurrent lane must not ALSO bill the internal
+    /// verifier for a reserve: it would lose the reserved slice AND contend
+    /// with the lane, the untested combination 31949bcc refused.
+    ///
+    /// This checks the EFFECTIVE reserve at the category's official scored
+    /// budget, through the real [`reserve_policy`] — not one preset key — so
+    /// both shipped ways of satisfying the invariant are covered and neither
+    /// can drift:
+    ///   * `reserve_secs: 0` (tinyimagenet_2024) never takes a reserve at all;
+    ///   * `adaptive_reserve: true` (cifar100_2024) RELEASES the whole reserve
+    ///     whenever the configured seconds reach `release_frac` of the internal
+    ///     budget — for the shipped 45 s / 0.40 pair that is every internal
+    ///     tier up to 112 s, and a scored 100 s budget is a 95 s tier.
+    ///
+    /// Requiring the budget to be listed here is deliberate: a new concurrent
+    /// preset must state the budget its evidence was gathered at, because the
+    /// adaptive release is budget-dependent and silently stops firing on long
+    /// tiers.
+    #[test]
+    fn concurrent_presets_never_also_hold_a_reserve() {
+        // Official scored per-instance budget from each category's
+        // instances.csv (uniform within these categories).
+        const OFFICIAL_SCORED_SECS: &[(&str, u64)] =
+            &[("cifar100_2024", 100), ("tinyimagenet_2024", 100)];
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let dir = root.join("configs/vnncomp25");
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|error| {
+            panic!("read shipped preset directory {}: {error}", dir.display())
+        });
+        let mut concurrent_presets_checked = 0usize;
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|error| panic!("read entry under {}: {error}", dir.display()));
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "yaml") {
+                continue;
+            }
+            let cfg = crate::preset::load_preset(&path)
+                .unwrap_or_else(|error| panic!("load shipped preset {}: {error}", path.display()));
+            if cfg.margin_row.concurrent != Some(true) {
+                continue;
+            }
+            concurrent_presets_checked += 1;
+            let category = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("preset file stem");
+            let scored = OFFICIAL_SCORED_SECS
+                .iter()
+                .find(|(name, _)| *name == category)
+                .map(|(_, secs)| *secs)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} arms the concurrent lane but has no official scored budget \
+                         recorded here; the adaptive reserve release is budget-dependent, \
+                         so the budget the evidence was gathered at must be stated",
+                        path.display()
+                    )
+                });
+            // Bind to the PRODUCTION tier, not a local mirror. This test used to
+            // call a `#[cfg(test)] internal_timeout_tier` copy that main deleted;
+            // the copy was a drift hazard anyway (its own doc called it a "mirror
+            // of vnncomp::internal_timeout_secs"), and a stale mirror would let
+            // this reserve assertion pass against a rule production no longer uses.
+            let internal = crate::commands::vnncomp::internal_timeout_secs(scored);
+            let configured = cfg.margin_row.reserve_secs.unwrap_or(45);
+            let decision = reserve_policy(
+                configured,
+                cfg.margin_row.adaptive_reserve.unwrap_or(false),
+                adaptive_release_target(
+                    configured,
+                    internal,
+                    resolve_release_frac(None, cfg.margin_row.release_frac),
+                ),
+            );
+            assert_eq!(
+                decision.reserve_secs,
+                0,
+                "{} arms the concurrent lane but still holds {}s of the {internal}s \
+                 internal tier (scored {scored}s, route={:?}); the pair taxes the \
+                 internal verifier twice",
+                path.display(),
+                decision.reserve_secs,
+                decision.route,
+            );
+        }
+        assert_eq!(
+            concurrent_presets_checked,
+            OFFICIAL_SCORED_SECS.len(),
+            "the concurrent-preset invariant checked {concurrent_presets_checked} shipped \
+             preset(s), but the sealed budget registry names {}; a missing/unreadable preset or \
+             stale registry must not turn the test into a vacuous pass",
+            OFFICIAL_SCORED_SECS.len()
+        );
+    }
+
+    /// Shipped presets must retain the global reserve until a sealed A/B
+    /// justifies a category override. Historical scorecards are not sealed
+    /// production evidence, so merely fitting an override beneath an old
+    /// solve time is not authority to ship it.
+    #[test]
+    fn shipped_presets_do_not_claim_unmeasured_reserve_overrides() {
+        const PRESETS: &[&str] = &[
+            "configs/vnncomp25/metaroom_2023.yaml",
+            "configs/vnncomp25/sat_relu.yaml",
+            "configs/vnncomp25/cifar100_2024.yaml",
         ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .expect("workspace root")
             .to_path_buf();
-        for (preset_rel, csv_rel, budget) in CATS {
+        for preset_rel in PRESETS {
             let preset = root.join(preset_rel);
-            let csv = root.join(csv_rel);
-            if !preset.exists() || !csv.exists() {
-                continue; // category not present in this checkout
-            }
-            // Only PRESET-DECLARED reserves are checked here. This invariant
-            // does not validate the global 45s default: historical CIFAR100
-            // +23 bookkeeping appears to use 45s, but the TinyImageNet +67
-            // commit bodies explicitly record an 82s override, and neither is
-            // sealed production evidence. Re-litigating the default from
-            // per-row solve times would also trip on stale rows — e.g.
-            // metaroom's 182.0s `spec_idx_28`,
-            // which on the current binary times out with a 45s reserve, a 5s
-            // reserve, and NO reserve alike.
-            let declared = crate::preset::load_preset(&preset)
-                .ok()
-                .and_then(|c| c.margin_row.reserve_secs);
-            let Some(reserve) = declared else {
-                continue; // takes the shipped default; outside this preset-only invariant
-            };
-            if reserve == 0 {
-                continue; // explicitly opted out
-            }
-            let text = std::fs::read_to_string(&csv).expect("scorecard");
-            let mut worst = 0.0f64;
-            for line in text.lines() {
-                let f: Vec<&str> = line.split(',').collect();
-                if f.len() < 6 {
-                    continue;
-                }
-                let verdict = f[4].trim();
-                if verdict != "sat" && verdict != "unsat" {
-                    continue;
-                }
-                if let Ok(t) = f[5].trim().parse::<f64>() {
-                    worst = worst.max(t);
-                }
-            }
-            // The internal verifier never gets the raw budget — it gets
-            // `internal_timeout_secs(budget)` (budget minus a grace tier of
-            // budget/20, min 5s). The reserve comes out of THAT, so the true
-            // unused tail is measured against the internal tier. Getting this
-            // wrong once cost metaroom its 182.0s solve on paper (25s reserve
-            // vs 18.0s of real headroom).
-            let internal = internal_timeout_tier(*budget);
-            #[allow(clippy::cast_precision_loss)]
-            let headroom = internal as f64 - worst;
-            #[allow(clippy::cast_precision_loss)]
-            let reserve_f = reserve as f64;
             assert!(
-                reserve_f <= headroom,
-                "{preset_rel} reserves {reserve}s but the slowest MEASURED solve on \
-                 {csv_rel} takes {worst:.1}s and the internal verifier only gets \
-                 {internal}s of the {budget}s budget (just {headroom:.1}s of unused \
-                 tail) — this reserve would forfeit a solve NY currently lands"
+                preset.is_file(),
+                "required shipped preset is missing: {}",
+                preset.display()
+            );
+            let config = crate::preset::load_preset(&preset).unwrap_or_else(|error| {
+                panic!("load shipped preset {}: {error}", preset.display())
+            });
+            assert_eq!(
+                config.margin_row.reserve_secs, None,
+                "{preset_rel} claims a category reserve override without a sealed A/B"
             );
         }
     }
@@ -2990,9 +3630,7 @@ mod tests {
     ///   NY_SWEEP_CAT     = benchmark category dir (default cifar100_2024)
     ///   NY_SWEEP_SECS    = per-instance budget (default 100)
     ///   NY_SWEEP_SKIP/NY_SWEEP_TAKE = shard the list
-    #[test]
-    #[ignore = "measurement sweep; needs benchmarks/vnncomp2025; run solo"]
-    fn sweep_targets() {
+    pub(crate) fn sweep_targets() {
         let targets = std::env::var("NY_SWEEP_TARGETS").expect("set NY_SWEEP_TARGETS");
         let cat = std::env::var("NY_SWEEP_CAT").unwrap_or_else(|_| "cifar100_2024".into());
         let secs: u64 = std::env::var("NY_SWEEP_SECS")
@@ -3059,5 +3697,96 @@ mod tests {
             "[sweep] SUMMARY cat={cat} budget={secs}s rows={} UNSAT={unsat} unknown={unknown} skipped={skipped}",
             rows.len()
         );
+    }
+
+    fn require_probe_instance() -> anyhow::Result<()> {
+        let category = std::env::var("NY_PROBE_CAT").unwrap_or_else(|_| "cifar100_2024".to_owned());
+        let default_onnx = if category.starts_with("tiny") {
+            "TinyImageNet_resnet_medium.onnx"
+        } else {
+            "CIFAR100_resnet_medium.onnx"
+        };
+        let onnx = std::env::var("NY_PROBE_ONNX").unwrap_or_else(|_| default_onnx.to_owned());
+        let vnnlib = std::env::var("NY_PROBE_VNNLIB")
+            .map_err(|_| anyhow::anyhow!("this probe requires NY_PROBE_VNNLIB"))?;
+        for path in [
+            Path::new(BENCH_ROOT)
+                .join(&category)
+                .join("onnx")
+                .join(onnx),
+            Path::new(BENCH_ROOT)
+                .join(category)
+                .join("vnnlib")
+                .join(vnnlib),
+        ] {
+            anyhow::ensure!(
+                path.is_file(),
+                "missing margin-row prerequisite {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Execute one explicit, serial real-corpus margin-row measurement.
+    pub(crate) fn run(probe: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Path::new(BENCH_ROOT).is_dir(),
+            "missing VNN-COMP benchmark root {BENCH_ROOT}"
+        );
+        match probe {
+            "instance" => {
+                require_probe_instance()?;
+                probe_env_instance();
+            }
+            "root-build" => {
+                require_probe_instance()?;
+                probe_root_build();
+            }
+            "pass-scaling" => {
+                require_probe_instance()?;
+                probe_pass_scaling();
+            }
+            "serial-parallel-oracle" => {
+                require_probe_instance()?;
+                oracle_serial_vs_parallel();
+            }
+            "inc2a-root-parity-1498" => inc2a_root_parity_1498(),
+            "inc2a-enclosure-1498" => inc2a_outward_bound_and_enclosure_1498(),
+            "inc2b-trajectory-1498" => inc2b_trajectory_replay_1498(),
+            "inc2b-l5-parity" => inc2b_unstable_position_parity_l5(),
+            "inc2c-close-4429" => inc2c_closes_4429(),
+            "inc2c-close-1498" => inc2c_closes_1498(),
+            "inc2c-close-2551" => inc2c_closes_2551(),
+            "inc2c-moat-6232" => inc2c_moat_sat_6232_not_verified(),
+            "extractor-smoke" => extractor_and_parser_smoke(),
+            "cifar-moat" => moat_gt_sat_never_unsat(),
+            "cifar-closure" => closure_gt_unsat_contingency(),
+            "extraction-safety" => extraction_safety_other_models(),
+            "epoch-gain" => {
+                require_probe_instance()?;
+                epoch_gain_probe_real();
+            }
+            "metaroom-gains" => metaroom_banked_gains_still_close(),
+            "metaroom-moat" => metaroom_moat_gt_sat_never_unsat(),
+            "sweep" => {
+                let targets = std::env::var("NY_SWEEP_TARGETS")
+                    .map_err(|_| anyhow::anyhow!("sweep requires NY_SWEEP_TARGETS"))?;
+                anyhow::ensure!(
+                    Path::new(&targets).is_file(),
+                    "missing sweep target list {targets}"
+                );
+                sweep_targets();
+            }
+            _ => anyhow::bail!(
+                "unknown margin-row probe {probe:?}; expected instance, root-build, \
+                 pass-scaling, serial-parallel-oracle, inc2a-root-parity-1498, \
+                 inc2a-enclosure-1498, inc2b-trajectory-1498, inc2b-l5-parity, \
+                 inc2c-close-4429, inc2c-close-1498, inc2c-close-2551, \
+                 inc2c-moat-6232, extractor-smoke, cifar-moat, cifar-closure, \
+                 extraction-safety, epoch-gain, metaroom-gains, metaroom-moat, or sweep"
+            ),
+        }
+        Ok(())
     }
 }

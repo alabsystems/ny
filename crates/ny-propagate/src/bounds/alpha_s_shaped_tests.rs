@@ -73,6 +73,27 @@ fn test_monotone_s_shaped_alpha_initializes_midpoint_and_cross_defaults() {
 }
 
 #[test]
+fn test_monotone_s_shaped_alpha_extreme_finite_midpoints_stay_finite_and_in_domain() {
+    let half_max = f32::MAX / 2.0;
+    let bounds = checked_bounds(arr1(&[half_max, -f32::MAX]), arr1(&[f32::MAX, -half_max]));
+    let alpha = MonotoneSShapedAlpha::from_bounds(&bounds, fake_cross_tangents).unwrap();
+
+    for value in [
+        alpha.tp_pos.lower_path[0],
+        alpha.tp_pos.upper_path[0],
+        alpha.tp_neg.lower_path[1],
+        alpha.tp_neg.upper_path[1],
+    ] {
+        assert!(
+            value.is_finite(),
+            "finite bounds produced non-finite alpha midpoint {value}"
+        );
+    }
+    assert!(alpha.tp_pos.lower_path[0] >= half_max && alpha.tp_pos.lower_path[0] <= f32::MAX);
+    assert!(alpha.tp_neg.lower_path[1] >= -f32::MAX && alpha.tp_neg.lower_path[1] <= -half_max);
+}
+
+#[test]
 fn test_monotone_s_shaped_alpha_clamps_crossing_domains() {
     let bounds = checked_bounds(arr1(&[-1.0]), arr1(&[2.0]));
     let mut alpha = MonotoneSShapedAlpha::from_bounds(&bounds, fake_cross_tangents).unwrap();

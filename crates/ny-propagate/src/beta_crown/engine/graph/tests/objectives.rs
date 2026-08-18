@@ -23,7 +23,11 @@ use crate::beta_crown::domain::{GraphCrownContext, MultiObjectiveTargets};
 use crate::beta_crown::engine::graph::multi_objective::{
     merge_pruned_objective_bounds, prune_verified_multi_objective_targets,
 };
-use crate::beta_crown::engine::graph::objectives::objective_bounds;
+use crate::beta_crown::engine::graph::objectives::{
+    mo_beta_completed_spec_pass_count_for_test, mo_beta_gradient_pass_count_for_test,
+    objective_bounds, reset_mo_beta_completed_spec_pass_count_for_test,
+    reset_mo_beta_gradient_pass_count_for_test,
+};
 use crate::beta_crown::engine::tensor_ext::BoundedTensorExt;
 use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::beta_crown::state::GraphBetaState;
@@ -163,6 +167,54 @@ fn test_objective_bounds_nan_with_negative_coefficients() {
         "NaN with neg coeff must produce -inf"
     );
     assert_eq!(hi, f32::INFINITY, "NaN with neg coeff must produce +inf");
+}
+
+#[test]
+fn test_objective_bounds_nonfinite_coefficient_produces_conservative_bounds() {
+    let bt = BoundedTensor::new(
+        arr1(&[1.0_f32, 2.0]).into_dyn(),
+        arr1(&[3.0_f32, 4.0]).into_dyn(),
+    )
+    .unwrap();
+    for coefficient in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+        let (lo, hi) = objective_bounds(&bt, &[coefficient, 1.0]).unwrap();
+        assert_eq!(lo, f32::NEG_INFINITY, "coefficient={coefficient}");
+        assert_eq!(hi, f32::INFINITY, "coefficient={coefficient}");
+    }
+}
+
+#[test]
+fn test_objective_bounds_inverted_unchecked_box_produces_conservative_bounds() {
+    let lower = arr1(&[3.0_f32, 1.0]).into_dyn();
+    let upper = arr1(&[2.0_f32, 4.0]).into_dyn();
+    let bt = BoundedTensor::new_unchecked(lower, upper).unwrap();
+    let (lo, hi) = objective_bounds(&bt, &[1.0, 1.0]).unwrap();
+    assert_eq!(lo, f32::NEG_INFINITY);
+    assert_eq!(hi, f32::INFINITY);
+}
+
+#[test]
+fn test_objective_bounds_impossible_infinite_endpoint_produces_conservative_bounds() {
+    for (lower, upper) in [
+        (f32::INFINITY, f32::INFINITY),
+        (f32::NEG_INFINITY, f32::NEG_INFINITY),
+    ] {
+        let bt = BoundedTensor::new_unchecked(arr1(&[lower]).into_dyn(), arr1(&[upper]).into_dyn())
+            .unwrap();
+        let (lo, hi) = objective_bounds(&bt, &[1.0]).unwrap();
+        assert_eq!(lo, f32::NEG_INFINITY, "source=[{lower},{upper}]");
+        assert_eq!(hi, f32::INFINITY, "source=[{lower},{upper}]");
+    }
+}
+
+#[test]
+fn test_objective_bounds_zero_coefficient_ignores_unbounded_endpoint() {
+    let lower = arr1(&[f32::NEG_INFINITY, 1.0]).into_dyn();
+    let upper = arr1(&[f32::INFINITY, 2.0]).into_dyn();
+    let bt = BoundedTensor::new_unchecked(lower, upper).unwrap();
+    let (lo, hi) = objective_bounds(&bt, &[0.0, 1.0]).unwrap();
+    assert!(lo.is_finite() && lo <= 1.0, "lower={lo}");
+    assert!(hi.is_finite() && hi >= 2.0, "upper={hi}");
 }
 
 // ============================================================
@@ -811,7 +863,12 @@ fn test_multi_objective_all_verified_mask() {
 }
 
 /// Regression for #3813: child-domain multi-objective propagation should prune
-/// already-verified OR-specs before spending the remaining deadline budget.
+/// already-verified OR-specs while preserving a live finite authority.
+///
+/// An already-expired authority is now terminal before any spec row starts, so
+/// it cannot grant the formerly described "one allowed" pass.  This exercises
+/// the real bounded fallback instead: finite Dense-ReLU propagation declines,
+/// and the active row is projected from the inherited certified output.
 #[ntest::timeout(5000)]
 #[test]
 fn test_multi_objective_pruned_targets_skip_verified_deadline_slot_3813() {
@@ -820,13 +877,8 @@ fn test_multi_objective_pruned_targets_skip_verified_deadline_slot_3813() {
     let beta_state = GraphBetaState::from_history(&history).unwrap();
     let context = GraphCrownContext::new(&history, None, Some(&node_bounds), None);
 
-    let mut config = BetaCrownConfig::default();
-    config.alpha_config.deadline = Some(
-        Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .unwrap(),
-    );
-    let verifier = BetaCrownVerifier::new(config);
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    verifier.config.alpha_config.deadline = Some(Instant::now() + Duration::from_secs(5));
 
     let objectives = vec![vec![1.0], vec![1.0]];
     let thresholds = vec![0.0, 0.0];
@@ -836,10 +888,6 @@ fn test_multi_objective_pruned_targets_skip_verified_deadline_slot_3813() {
     let (unpruned_bounds, _) = verifier
         .propagate_multi_objective_with_beta(&graph, &input, &context, &beta_state, &full_targets)
         .unwrap();
-    // The implementation may compute bounds for all objectives in a single pass
-    // before checking the deadline, so the unpruned result can be finite even
-    // with an expired deadline. The key invariant tested below is that pruning +
-    // merge produce valid, finite bounds for the active objective.
     assert_eq!(
         unpruned_bounds.len(),
         2,
@@ -859,7 +907,7 @@ fn test_multi_objective_pruned_targets_skip_verified_deadline_slot_3813() {
     assert_eq!(active_bounds.len(), 1);
     assert!(
         active_bounds[0].0.is_finite() && active_bounds[0].1.is_finite(),
-        "the pruned target set should spend its one allowed spec pass on the only unverified objective"
+        "the bounded inherited-output fallback must preserve the only unverified objective"
     );
 
     let merged_bounds =
@@ -983,16 +1031,15 @@ fn test_multi_objective_beta_opt_deadline_during_loop_returns_best_so_far_3109()
         ..Default::default()
     };
     let mut verifier = BetaCrownVerifier::new(config);
-    // Generous future window so many iterations complete (capturing
-    // best_loop_result) before the deadline fires. Set AFTER construction.
-    verifier.config.alpha_config.deadline = Some(Instant::now() + Duration::from_millis(50));
+    verifier.config.alpha_config.deadline = None;
 
     let mut beta_state = GraphBetaState::from_history(&history).unwrap();
     let seed_caches: Vec<Option<&CachedLinearBounds>> = vec![None];
 
+    reset_mo_beta_completed_spec_pass_count_for_test();
     let start = Instant::now();
     let (obj_bounds, node_cache, caches) = verifier
-        .optimize_graph_beta_analytical_multi_objective_with_cache(
+        .optimize_graph_beta_analytical_multi_objective_with_cache_forced_deadline_after_first_pass(
             &graph,
             &input,
             &context,
@@ -1004,6 +1051,11 @@ fn test_multi_objective_beta_opt_deadline_during_loop_returns_best_so_far_3109()
         )
         .expect("deadline-during-loop must return best completed bounds, not an error");
     let elapsed = start.elapsed();
+    assert_eq!(
+        mo_beta_completed_spec_pass_count_for_test(),
+        1,
+        "the seam must stop only after one fully completed certified pass"
+    );
 
     // Returned promptly after the deadline rather than running 200k iterations.
     assert!(
@@ -1024,4 +1076,226 @@ fn test_multi_objective_beta_opt_deadline_during_loop_returns_best_so_far_3109()
         objectives.len(),
         "one cache slot per objective"
     );
+}
+
+/// M5 regression: the default-dark baseline-first lane must preserve the real
+/// Standard spec-guided result when the analytical pass has no time to begin.
+///
+/// The test-only seam injects the deadline at the exact between-iteration guard
+/// immediately before iteration zero. The baseline itself is real graph CROWN,
+/// so equality with a direct Standard call proves that the rescue path neither
+/// loosens nor fabricates a bound.
+#[ntest::timeout(10000)]
+#[test]
+fn test_multi_objective_beta_baseline_survives_injected_iteration_zero_deadline() {
+    let (graph, input, node_bounds) = setup_graph_with_bounds();
+    let history = single_relu_history();
+    let context = GraphCrownContext::new(&history, None, Some(&node_bounds), None);
+
+    let objectives = vec![vec![1.0]];
+    let thresholds = vec![0.0];
+    let verified_mask = vec![false];
+    let targets = MultiObjectiveTargets::new(&objectives, &thresholds, &verified_mask);
+    let seed_caches: Vec<Option<&CachedLinearBounds>> = vec![None];
+
+    let config = BetaCrownConfig {
+        beta_iterations: 15,
+        beta_lr: 0.1,
+        beta_tolerance: 1e-12,
+        ..Default::default()
+    };
+    let mut verifier = BetaCrownVerifier::new(config);
+    verifier.config.alpha_config.deadline = Some(Instant::now() + Duration::from_secs(5));
+
+    let baseline_beta = GraphBetaState::from_history(&history).unwrap();
+    let (baseline_bounds, baseline_node_cache, _) = verifier
+        .propagate_multi_objective_with_beta_and_cache(
+            &graph,
+            &input,
+            &context,
+            &baseline_beta,
+            &targets,
+            &seed_caches,
+            false,
+        )
+        .expect("direct Standard baseline must complete");
+
+    let mut returned_beta = baseline_beta.clone();
+    let (returned_bounds, returned_node_cache, returned_caches) = verifier
+        .optimize_graph_beta_analytical_multi_objective_with_cache_forced_baseline_deadline(
+            &graph,
+            &input,
+            &context,
+            &mut returned_beta,
+            &targets,
+            false,
+            &seed_caches,
+            true,
+        )
+        .expect("iteration-zero deadline must return the completed Standard baseline");
+
+    assert_eq!(
+        returned_bounds, baseline_bounds,
+        "deadline rescue must return the exact Standard bounds without loosening"
+    );
+    assert_eq!(
+        returned_node_cache.len(),
+        baseline_node_cache.len(),
+        "deadline rescue must retain the baseline node-bound map"
+    );
+    for key in baseline_node_cache.keys() {
+        assert!(
+            returned_node_cache.contains_key(key),
+            "deadline rescue dropped baseline node bound {key}"
+        );
+    }
+    assert!(
+        returned_caches.iter().all(Option::is_none),
+        "deadline short-circuit intentionally returns no lA warm-start caches"
+    );
+    assert_eq!(
+        returned_beta
+            .entry("relu1", 0)
+            .expect("returned beta entry")
+            .value(),
+        baseline_beta
+            .entry("relu1", 0)
+            .expect("baseline beta entry")
+            .value(),
+        "returned beta state must match the snapshot that certified the baseline"
+    );
+}
+
+/// The exact-gated bounded baseline-only lane must execute the real Standard
+/// optimizer entry once and return before the gradient-producing
+/// `StoringIntermediates` pass.
+#[ntest::timeout(10000)]
+#[test]
+fn test_multi_objective_beta_baseline_only_returns_standard_and_skips_gradient_pass() {
+    let (graph, input, node_bounds) = setup_graph_with_bounds();
+    let history = single_relu_history();
+    let context = GraphCrownContext::new(&history, None, Some(&node_bounds), None);
+
+    let objectives = vec![vec![1.0]];
+    let thresholds = vec![0.0];
+    let verified_mask = vec![false];
+    let targets = MultiObjectiveTargets::new(&objectives, &thresholds, &verified_mask);
+    let seed_caches: Vec<Option<&CachedLinearBounds>> = vec![None];
+
+    let config = BetaCrownConfig {
+        beta_iterations: 2,
+        beta_lr: 0.1,
+        beta_tolerance: 0.0,
+        ..Default::default()
+    };
+    let mut verifier = BetaCrownVerifier::new(config);
+    verifier.config.alpha_config.deadline = Some(Instant::now() + Duration::from_secs(5));
+
+    let baseline_beta = GraphBetaState::from_history(&history).unwrap();
+    let (baseline_bounds, baseline_node_bounds, _) = verifier
+        .propagate_multi_objective_with_beta_and_cache(
+            &graph,
+            &input,
+            &context,
+            &baseline_beta,
+            &targets,
+            &seed_caches,
+            false,
+        )
+        .expect("direct Standard baseline must complete");
+
+    crate::tests::with_env_edits(|env| {
+        env.remove("NY_MO_BETA_BASELINE_FIRST");
+        env.set("NY_MO_BETA_BASELINE_ONLY", "1");
+        reset_mo_beta_gradient_pass_count_for_test();
+
+        let mut returned_beta = baseline_beta.clone();
+        let (returned_bounds, returned_node_bounds, returned_caches) = verifier
+            .optimize_graph_beta_analytical_multi_objective_with_cache(
+                &graph,
+                &input,
+                &context,
+                &mut returned_beta,
+                &targets,
+                false,
+                &seed_caches,
+                true,
+            )
+            .expect("baseline-only optimizer must return its Standard pass");
+
+        assert_eq!(
+            mo_beta_gradient_pass_count_for_test(),
+            0,
+            "baseline-only must bypass the intermediate-capturing gradient pass"
+        );
+        assert_eq!(
+            returned_bounds, baseline_bounds,
+            "baseline-only must publish the exact Standard objective bounds"
+        );
+        assert_eq!(
+            returned_node_bounds.len(),
+            baseline_node_bounds.len(),
+            "baseline-only must retain the Standard node-bound map"
+        );
+        for (name, expected) in &baseline_node_bounds {
+            let actual = returned_node_bounds
+                .get(name)
+                .unwrap_or_else(|| panic!("baseline-only dropped node bound {name}"));
+            assert_bounded_tensor_close_4306(
+                actual,
+                expected,
+                &format!("baseline_only_node_bounds[{name}]"),
+            );
+        }
+        assert_eq!(returned_caches.len(), objectives.len());
+        assert!(
+            returned_caches.iter().all(Option::is_none),
+            "bounded baseline-only intentionally returns sound empty cache slots"
+        );
+
+        let returned_entry = returned_beta
+            .entry("relu1", 0)
+            .expect("returned beta entry");
+        let baseline_entry = baseline_beta
+            .entry("relu1", 0)
+            .expect("baseline beta entry");
+        assert_eq!(
+            returned_entry.value().to_bits(),
+            baseline_entry.value().to_bits()
+        );
+        assert_eq!(
+            returned_entry.grad().to_bits(),
+            baseline_entry.grad().to_bits()
+        );
+        assert_eq!(returned_entry.m.to_bits(), baseline_entry.m.to_bits());
+        assert_eq!(returned_entry.v.to_bits(), baseline_entry.v.to_bits());
+        assert_eq!(
+            returned_entry.v_max.to_bits(),
+            baseline_entry.v_max.to_bits()
+        );
+
+        // Control: with the new gate absent, the same real optimizer must reach
+        // the counted gradient pass. This proves the zero count above measures a
+        // bypass rather than a dead observer.
+        env.remove("NY_MO_BETA_BASELINE_ONLY");
+        env.remove("NY_MO_CUDA_BETA_SPSA");
+        reset_mo_beta_gradient_pass_count_for_test();
+        let mut control_beta = baseline_beta.clone();
+        verifier
+            .optimize_graph_beta_analytical_multi_objective_with_cache(
+                &graph,
+                &input,
+                &context,
+                &mut control_beta,
+                &targets,
+                false,
+                &seed_caches,
+                false,
+            )
+            .expect("legacy analytical optimizer control must complete");
+        assert!(
+            mo_beta_gradient_pass_count_for_test() > 0,
+            "legacy control must exercise the gradient-pass observer"
+        );
+    });
 }

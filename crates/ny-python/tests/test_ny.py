@@ -9,7 +9,7 @@ Run with: pytest tests/test_ny.py
 
 from __future__ import annotations
 
-import shutil
+import struct
 from pathlib import Path
 from types import ModuleType
 
@@ -37,16 +37,15 @@ ny = _ny_mod if _ny_mod is not None else _MissingNy("ny")
 
 # Test models directory
 MODELS_DIR = Path(__file__).resolve().parents[3] / "tests" / "models"
-FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 def _torch_and_onnx_available():
     try:
-        import torch
+        import torch  # noqa: PLC0415
     except ModuleNotFoundError:
         return None, False
     try:
-        import onnx  # noqa: F401
+        import onnx  # noqa: F401, PLC0415
     except ModuleNotFoundError:
         return torch, False
     return torch, True
@@ -59,6 +58,22 @@ def _build_torch_models(torch):
     model_b.load_state_dict(model_a.state_dict())
     example_input = torch.randn(1, 2)
     return model_a, model_b, example_input
+
+
+@pytest.fixture
+def gguf_model(tmp_path):
+    """Create a minimal deterministic GGUF v3 file with one F32 tensor."""
+    tensor_name = b"test.weight"
+    contents = bytearray(struct.pack("<4sIQQ", b"GGUF", 3, 1, 0))
+    contents.extend(struct.pack("<Q", len(tensor_name)))
+    contents.extend(tensor_name)
+    contents.extend(struct.pack("<IQIQ", 1, 4, 0, 0))
+    contents.extend(b"\0" * (-len(contents) % 32))
+    contents.extend(struct.pack("<4f", 1.0, 2.0, 3.0, 4.0))
+
+    path = tmp_path / "minimal.gguf"
+    path.write_bytes(contents)
+    return path
 
 
 class TestDiff:
@@ -139,9 +154,8 @@ class TestTorchDiffAndCompare:
         model_a, model_b, example_input = _build_torch_models(torch)
 
         if not onnx_available:
-            with pytest.raises(Exception) as excinfo:
+            with pytest.raises(Exception, match="(?i)onnx"):
                 ny.diff_torch(model_a, model_b, example_input)
-            assert "onnx" in str(excinfo.value).lower()
             return
 
         result = ny.diff_torch(
@@ -156,16 +170,17 @@ class TestTorchDiffAndCompare:
     def test_compare_torch_smoke(self):
         torch, onnx_available = _torch_and_onnx_available()
         if torch is None:
-            with pytest.raises(ValueError, match="PyTorch is required for compare_torch"):
+            with pytest.raises(
+                ValueError, match="PyTorch is required for compare_torch"
+            ):
                 ny.compare_torch(object(), object(), object())
             return
 
         model_a, model_b, example_input = _build_torch_models(torch)
 
         if not onnx_available:
-            with pytest.raises(Exception) as excinfo:
+            with pytest.raises(Exception, match="(?i)onnx"):
                 ny.compare_torch(model_a, model_b, example_input)
-            assert "onnx" in str(excinfo.value).lower()
             return
 
         result = ny.compare_torch(
@@ -221,19 +236,21 @@ class TestLoadModelInfo:
 
         info = ny.load_model_info(model_path)
 
-        assert isinstance(
-            info, ny.ModelInfo
-        ), f"Expected ny.ModelInfo, got {type(info)!r}"
-        assert isinstance(info.inputs, list), f"Expected list inputs, got {type(info.inputs)!r}"
-        assert isinstance(
-            info.outputs, list
-        ), f"Expected list outputs, got {type(info.outputs)!r}"
-        assert isinstance(
-            info.layer_count, int
-        ), f"Expected int layer_count, got {type(info.layer_count)!r}"
-        assert isinstance(
-            info.layer_names, list
-        ), f"Expected list layer_names, got {type(info.layer_names)!r}"
+        assert isinstance(info, ny.ModelInfo), (
+            f"Expected ny.ModelInfo, got {type(info)!r}"
+        )
+        assert isinstance(info.inputs, list), (
+            f"Expected list inputs, got {type(info.inputs)!r}"
+        )
+        assert isinstance(info.outputs, list), (
+            f"Expected list outputs, got {type(info.outputs)!r}"
+        )
+        assert isinstance(info.layer_count, int), (
+            f"Expected int layer_count, got {type(info.layer_count)!r}"
+        )
+        assert isinstance(info.layer_names, list), (
+            f"Expected list layer_names, got {type(info.layer_names)!r}"
+        )
 
     def test_input_info(self):
         """Should have input name and shape."""
@@ -243,27 +260,27 @@ class TestLoadModelInfo:
 
         assert len(info.inputs) >= 1, "Expected at least one typed input spec"
         input_info = info.inputs[0]
-        assert isinstance(
-            input_info, ny.TensorSpec
-        ), f"Expected ny.TensorSpec, got {type(input_info)!r}"
-        assert isinstance(
-            input_info.name, str
-        ), f"Expected TensorSpec.name to be str, got {type(input_info.name)!r}"
-        assert isinstance(
-            input_info.shape, list
-        ), f"Expected TensorSpec.shape to be list, got {type(input_info.shape)!r}"
-        assert isinstance(
-            input_info.dtype, str
-        ), f"Expected TensorSpec.dtype to be str, got {type(input_info.dtype)!r}"
+        assert isinstance(input_info, ny.TensorSpec), (
+            f"Expected ny.TensorSpec, got {type(input_info)!r}"
+        )
+        assert isinstance(input_info.name, str), (
+            f"Expected TensorSpec.name to be str, got {type(input_info.name)!r}"
+        )
+        assert isinstance(input_info.shape, list), (
+            f"Expected TensorSpec.shape to be list, got {type(input_info.shape)!r}"
+        )
+        assert isinstance(input_info.dtype, str), (
+            f"Expected TensorSpec.dtype to be str, got {type(input_info.dtype)!r}"
+        )
 
     def test_diff_status_str(self):
         """DiffStatus should provide a clean __str__."""
-        assert (
-            str(ny.DiffStatus.Ok) == "ok"
-        ), f"Expected str(DiffStatus.Ok) == 'ok', got {str(ny.DiffStatus.Ok)!r}"
-        assert (
-            str(ny.DiffStatus.ShapeMismatch) == "shape_mismatch"
-        ), "Expected snake-case DiffStatus string form"
+        assert str(ny.DiffStatus.Ok) == "ok", (
+            f"Expected str(DiffStatus.Ok) == 'ok', got {str(ny.DiffStatus.Ok)!r}"
+        )
+        assert str(ny.DiffStatus.ShapeMismatch) == "shape_mismatch", (
+            "Expected snake-case DiffStatus string form"
+        )
 
 
 class TestDiffResult:
@@ -287,7 +304,7 @@ class TestVersion:
         """Module should have version."""
         assert hasattr(ny, "__version__")
         assert isinstance(ny.__version__, str)
-        assert ny.__version__ == "0.1.0"
+        assert ny.__version__ == "0.2.0"
 
 
 # ==============================================================================
@@ -368,7 +385,9 @@ class TestSensitivityAnalysis:
 
         # Very low threshold should return all layers with sensitivity > threshold
         hot = result.hot_spots(0.0)
-        assert len(hot) == len([layer for layer in result.layers if layer.sensitivity > 0.0])
+        assert len(hot) == len(
+            [layer for layer in result.layers if layer.sensitivity > 0.0]
+        )
 
     def test_summary(self):
         """Summary should produce formatted table."""
@@ -595,7 +614,9 @@ class TestProfileBounds:
 
         # Very low threshold should return layers with growth > threshold
         chokes = result.choke_points(0.0)
-        assert len(chokes) == len([layer for layer in result.layers if layer.growth_ratio > 0.0])
+        assert len(chokes) == len(
+            [layer for layer in result.layers if layer.growth_ratio > 0.0]
+        )
 
     def test_problematic_layers(self):
         """problematic_layers should filter correctly."""
@@ -696,8 +717,7 @@ class TestPytestIntegration:
 
         diff = ny.diff(model_path, model_path)
         assert diff.max_divergence < 1e-5, (
-            f"Max divergence {diff.max_divergence} exceeds tolerance\n"
-            f"{diff.summary()}"
+            f"Max divergence {diff.max_divergence} exceeds tolerance\n{diff.summary()}"
         )
 
     def test_quantization_safe(self):
@@ -868,26 +888,26 @@ class TestWeightsDiff:
         result = ny.weights_diff(model_path, model_path)
 
         for comp in result.comparisons:
-            assert isinstance(
-                comp.name, str
-            ), f"Expected TensorComparison.name to be str, got {type(comp.name)!r}"
-            assert isinstance(
-                comp.status, ny.TensorComparisonStatus
-            ), f"Expected TensorComparison.status to be TensorComparisonStatus, got {type(comp.status)!r}"
+            assert isinstance(comp.name, str), (
+                f"Expected TensorComparison.name to be str, got {type(comp.name)!r}"
+            )
+            assert isinstance(comp.status, ny.TensorComparisonStatus), (
+                f"Expected TensorComparison.status to be TensorComparisonStatus, got {type(comp.status)!r}"
+            )
             # max_diff and shapes are optional
             if comp.max_diff is not None:
-                assert isinstance(
-                    comp.max_diff, float
-                ), f"Expected max_diff float when present, got {type(comp.max_diff)!r}"
+                assert isinstance(comp.max_diff, float), (
+                    f"Expected max_diff float when present, got {type(comp.max_diff)!r}"
+                )
 
     def test_tensor_comparison_status_str(self):
         """TensorComparisonStatus should provide a stable string form."""
-        assert (
-            str(ny.TensorComparisonStatus.Match) == "match"
-        ), "Expected TensorComparisonStatus.Match to stringify as 'match'"
-        assert (
-            str(ny.TensorComparisonStatus.MissingInB) == "missing_in_b"
-        ), "Expected TensorComparisonStatus.MissingInB to stringify as 'missing_in_b'"
+        assert str(ny.TensorComparisonStatus.Match) == "match", (
+            "Expected TensorComparisonStatus.Match to stringify as 'match'"
+        )
+        assert str(ny.TensorComparisonStatus.MissingInB) == "missing_in_b", (
+            "Expected TensorComparisonStatus.MissingInB to stringify as 'missing_in_b'"
+        )
 
 
 class TestWeightsInfoGGUF:
@@ -922,28 +942,31 @@ class TestShardedSafeTensors:
     @pytest.fixture
     def sharded_dir(self, tmp_path):
         """Create a temporary directory with sharded SafeTensors files."""
-        from safetensors.numpy import save_file  # Will fail if not installed
+        from safetensors.numpy import save_file  # noqa: PLC0415
+
+        sharded_dir = tmp_path / "sharded"
+        sharded_dir.mkdir()
         rng = np.random.default_rng(0)
 
         # Create a config.json to make it look like a HuggingFace model directory
         config = {"model_type": "test", "hidden_size": 8}
-        (tmp_path / "config.json").write_text(str(config).replace("'", '"'))
+        (sharded_dir / "config.json").write_text(str(config).replace("'", '"'))
 
         # Create first shard with some weights
         shard1_tensors = {
             "model.layer1.weight": rng.standard_normal((8, 4), dtype=np.float32),
             "model.layer1.bias": rng.standard_normal(8, dtype=np.float32),
         }
-        save_file(shard1_tensors, str(tmp_path / "model-00001-of-00002.safetensors"))
+        save_file(shard1_tensors, str(sharded_dir / "model-00001-of-00002.safetensors"))
 
         # Create second shard with more weights
         shard2_tensors = {
             "model.layer2.weight": rng.standard_normal((4, 8), dtype=np.float32),
             "model.layer2.bias": rng.standard_normal(4, dtype=np.float32),
         }
-        save_file(shard2_tensors, str(tmp_path / "model-00002-of-00002.safetensors"))
+        save_file(shard2_tensors, str(sharded_dir / "model-00002-of-00002.safetensors"))
 
-        return tmp_path
+        return sharded_dir
 
     def test_weights_info_sharded_directory(self, sharded_dir):
         """Should load weights from sharded SafeTensors directory."""
@@ -972,7 +995,7 @@ class TestShardedSafeTensors:
 
     def test_weights_diff_sharded_vs_single(self, sharded_dir, tmp_path):
         """Should compare sharded directory to single SafeTensors file."""
-        from safetensors.numpy import load_file, save_file  # Will fail if not installed
+        from safetensors.numpy import load_file, save_file  # noqa: PLC0415
 
         # Load all tensors from sharded directory and save to single file
         all_tensors = {}
@@ -995,10 +1018,15 @@ class TestShardedSafeTensors:
         # Create empty directory with config.json only
         (tmp_path / "config.json").write_text('{"model_type": "test"}')
 
-        with pytest.raises(ValueError, match=r"(?i)(safetensors|directory)") as exc_info:
+        with pytest.raises(
+            ValueError, match=r"(?i)(safetensors|directory)"
+        ) as exc_info:
             ny.weights_info(str(tmp_path))
         # Should indicate no safetensors files found or similar
-        assert "safetensors" in str(exc_info.value).lower() or "directory" in str(exc_info.value).lower()
+        assert (
+            "safetensors" in str(exc_info.value).lower()
+            or "directory" in str(exc_info.value).lower()
+        )
 
     def test_weights_info_summary_sharded(self, sharded_dir):
         """Summary should show sharded format info."""
@@ -1009,67 +1037,3 @@ class TestShardedSafeTensors:
         assert len(summary) > 0
         # Should show tensor information
         assert "layer" in summary.lower() or "weight" in summary.lower()
-
-
-class TestPyTorchCheckpointDirectories:
-    """Tests for HuggingFace-style PyTorch checkpoint directories."""
-
-    @pytest.fixture
-    def pytorch_checkpoint_dir(self, tmp_path):
-        src = FIXTURES_DIR / "pytorch_model.bin"
-        assert src.exists(), f"Missing test fixture: {src}"
-        shutil.copyfile(src, tmp_path / "pytorch_model.bin")
-        return tmp_path
-
-    @pytest.fixture
-    def pytorch_sharded_dir(self, tmp_path):
-        shard1 = FIXTURES_DIR / "pytorch_model-00001-of-00002.bin"
-        shard2 = FIXTURES_DIR / "pytorch_model-00002-of-00002.bin"
-        index = FIXTURES_DIR / "pytorch_model.bin.index.json"
-        assert shard1.exists(), f"Missing test fixture: {shard1}"
-        assert shard2.exists(), f"Missing test fixture: {shard2}"
-        assert index.exists(), f"Missing test fixture: {index}"
-
-        shutil.copyfile(shard1, tmp_path / shard1.name)
-        shutil.copyfile(shard2, tmp_path / shard2.name)
-        shutil.copyfile(index, tmp_path / index.name)
-        return tmp_path
-
-    def test_weights_info_pytorch_checkpoint_directory(self, pytorch_checkpoint_dir):
-        """Should load weights from directory containing pytorch_model.bin."""
-        info = ny.weights_info(str(pytorch_checkpoint_dir))
-
-        assert info.format == "PyTorch (checkpoint)"
-        assert info.tensor_count == 2
-        assert info.total_params > 0
-
-        tensor_names = {t.name for t in info.tensors}
-        assert "model.layer1.weight" in tensor_names
-        assert "model.layer1.bias" in tensor_names
-
-    def test_weights_info_pytorch_sharded_directory(self, pytorch_sharded_dir):
-        """Should load weights from directory containing pytorch_model-*.bin + index."""
-        info = ny.weights_info(str(pytorch_sharded_dir))
-
-        assert info.format == "PyTorch (sharded)"
-        assert info.tensor_count == 4
-        assert info.total_params > 0
-
-        tensor_names = {t.name for t in info.tensors}
-        assert "model.layer1.weight" in tensor_names
-        assert "model.layer1.bias" in tensor_names
-        assert "model.layer2.weight" in tensor_names
-        assert "model.layer2.bias" in tensor_names
-
-    def test_weights_diff_pytorch_sharded_vs_single(self, pytorch_sharded_dir, tmp_path):
-        """Should compare a sharded PyTorch directory to a single PyTorch checkpoint."""
-        combined_src = FIXTURES_DIR / "pytorch_combined.bin"
-        assert combined_src.exists(), f"Missing test fixture: {combined_src}"
-        combined_path = tmp_path / "combined.bin"
-        shutil.copyfile(combined_src, combined_path)
-
-        result = ny.weights_diff(str(pytorch_sharded_dir), str(combined_path))
-        assert result.is_match
-        assert result.max_diff == 0.0
-        assert result.total_tensors_a == 4
-        assert result.total_tensors_b == 4

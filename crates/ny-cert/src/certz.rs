@@ -36,9 +36,11 @@
 //!
 //! ## Precondition discharge by construction
 //!
-//! [`Rat::den`] is always *positive* (the reduced-`BigRational` invariant), so
-//! the checker's `allDenPos` precondition (every denominator `> 0`) holds by
-//! construction for everything this module emits. Numerators and denominators
+//! [`Rat`] values are always reduced with a positive denominator, so the
+//! checker's `allDenPos` precondition (every denominator `> 0`) holds by
+//! construction for everything this module emits. Each pair is extracted with
+//! the arena's checked one-read API, so a poisoned arena is rejected instead
+//! of serializing a potentially substituted value. Numerators and denominators
 //! are emitted as full decimal strings, preserving arbitrary precision (the
 //! whole point of the integer-pair backend).
 //!
@@ -52,7 +54,7 @@
 //!   `CertRealZ_node10.lean` style, ready to elaborate against the pinned checker and
 //!   discharge with `by decide`.
 
-use crate::rational::Rat;
+use crate::rational::{Rat, RatError};
 use crate::schema::{ConstraintKind, EntailmentCertificate, LinearConstraint};
 
 /// Why a certificate cannot be emitted as a kernel-checkable `CertZ`.
@@ -68,6 +70,34 @@ pub enum CertZError {
     /// `checkEntailmentZ` would reject it).
     #[error("conclusion kind must be le|ge for CertZ (got eq)")]
     EqConclusion,
+    /// The requested Lean declaration name was empty or outside the
+    /// injection-safe ASCII subset. Valid names are emitted with Lean's escaped
+    /// identifier syntax, so keywords are accepted safely.
+    #[error("invalid Lean declaration name: {0}")]
+    InvalidLeanName(String),
+    /// Exact rational extraction failed (including a poisoned arena).
+    #[error(transparent)]
+    Rat(#[from] RatError),
+}
+
+/// Validate the conservative ASCII subset of Lean identifiers accepted by the
+/// emitter. This keeps source generation injection-safe while covering ordinary
+/// generated declaration names.
+fn validate_lean_name(name: &str) -> Result<(), CertZError> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(CertZError::InvalidLeanName(name.to_owned()));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+    {
+        return Err(CertZError::InvalidLeanName(name.to_owned()));
+    }
+
+    if name == "_" {
+        return Err(CertZError::InvalidLeanName(name.to_owned()));
+    }
+    Ok(())
 }
 
 /// Map an ny [`ConstraintKind`] to the Lean `Kind` token (`"le"`/`"ge"`/`"eq"`).
@@ -87,14 +117,15 @@ fn certz_kind(kind: ConstraintKind) -> Result<&'static str, CertZError> {
 /// precision). `den` is always positive, discharging `allDenPos` by
 /// construction.
 #[allow(clippy::vec_init_then_push)] // deliberate: avoids the vec! macro (see below)
-fn qpair_json(r: Rat) -> serde_json::Value {
+fn qpair_json(r: Rat) -> Result<serde_json::Value, CertZError> {
     // `Vec::new()` + push (not a `vec![…]` literal): the macro's internal
     // boxed-slice `into_vec` inlines hardened alloc/arith obligations into this
     // fn; the pushes build the identical `[num, den]` pair.
+    let (num, den) = r.checked_parts()?;
     let mut pair = Vec::new();
-    pair.push(serde_json::Value::String(r.num().to_string()));
-    pair.push(serde_json::Value::String(r.den().to_string()));
-    serde_json::Value::Array(pair)
+    pair.push(serde_json::Value::String(num.to_string()));
+    pair.push(serde_json::Value::String(den.to_string()));
+    Ok(serde_json::Value::Array(pair))
 }
 
 /// Emit one [`LinearConstraint`] as a `LinConZ` JSON object.
@@ -103,25 +134,22 @@ fn qpair_json(r: Rat) -> serde_json::Value {
 /// order, which is deterministic (lexicographic by variable name).
 #[allow(clippy::vec_init_then_push)] // deliberate: avoids the vec! macro (see qpair_json)
 fn lincon_json(c: &LinearConstraint) -> Result<serde_json::Value, CertZError> {
-    let coeffs = c
-        .coefficients
-        .iter()
-        .map(|(name, coeff)| {
-            // `Vec::new()` + push (not a `vec![…]` literal): same macro-internal
-            // alloc/arith rationale as `qpair_json`; identical `[name, qpair]`.
-            let mut pair = Vec::new();
-            pair.push(serde_json::Value::String(name.clone()));
-            pair.push(qpair_json(*coeff));
-            serde_json::Value::Array(pair)
-        })
-        .collect::<Vec<_>>();
+    let mut coeffs = Vec::new();
+    for (name, coeff) in &c.coefficients {
+        // `Vec::new()` + push (not a `vec![…]` literal): same macro-internal
+        // alloc/arith rationale as `qpair_json`; identical `[name, qpair]`.
+        let mut pair = Vec::new();
+        pair.push(serde_json::Value::String(name.clone()));
+        pair.push(qpair_json(*coeff)?);
+        coeffs.push(serde_json::Value::Array(pair));
+    }
     let mut lincon = serde_json::Map::new();
     lincon.insert("coeffs".to_owned(), serde_json::Value::Array(coeffs));
     lincon.insert(
         "kind".to_owned(),
         serde_json::Value::String(certz_kind(c.kind)?.to_owned()),
     );
-    lincon.insert("const".to_owned(), qpair_json(c.constant));
+    lincon.insert("const".to_owned(), qpair_json(c.constant)?);
     Ok(serde_json::Value::Object(lincon))
 }
 
@@ -139,7 +167,7 @@ fn lincon_json(c: &LinearConstraint) -> Result<serde_json::Value, CertZError> {
 /// ```
 ///
 /// All numerators/denominators are full decimal strings (arbitrary precision);
-/// every denominator is positive because [`Rat::den`] is, so the `allDenPos`
+/// every denominator is positive by the [`Rat`] invariant, so the `allDenPos`
 /// precondition holds by construction.
 ///
 /// Because this is a faithful transcription, a verdict the Rust
@@ -150,8 +178,9 @@ fn lincon_json(c: &LinearConstraint) -> Result<serde_json::Value, CertZError> {
 ///
 /// # Errors
 /// Returns [`CertZError::StrictRelation`] if any premise/conclusion uses `<`/`>`
-/// (the proven `Kind` is `le|ge|eq` only), or [`CertZError::EqConclusion`] if the
-/// conclusion is `eq` (the checker requires a `le`/`ge` conclusion).
+/// (the proven `Kind` is `le|ge|eq` only), [`CertZError::EqConclusion`] if the
+/// conclusion is `eq` (the checker requires a `le`/`ge` conclusion), or
+/// [`CertZError::Rat`] when rational extraction fails.
 pub fn entailment_to_certz_json(
     cert: &EntailmentCertificate,
 ) -> Result<serde_json::Value, CertZError> {
@@ -166,11 +195,10 @@ pub fn entailment_to_certz_json(
     for p in cert.premises.iter() {
         premises.push(lincon_json(p)?);
     }
-    let multipliers = cert
-        .multipliers
-        .iter()
-        .map(|m| qpair_json(*m))
-        .collect::<Vec<_>>();
+    let mut multipliers = Vec::new();
+    for m in &cert.multipliers {
+        multipliers.push(qpair_json(*m)?);
+    }
     let mut certz = serde_json::Map::new();
     certz.insert("premises".to_owned(), serde_json::Value::Array(premises));
     certz.insert(
@@ -182,23 +210,30 @@ pub fn entailment_to_certz_json(
 }
 
 /// Emit a [`Rat`] as the Lean `QPair` literal `(num, den)`.
-fn qpair_lean(r: Rat) -> String {
-    format!("({}, {})", r.num(), r.den())
+fn qpair_lean(r: Rat) -> Result<String, CertZError> {
+    let (num, den) = r.checked_parts()?;
+    Ok(format!("({num}, {den})"))
 }
 
 /// Emit one [`LinearConstraint`] as a Lean `LinConZ` literal
 /// `⟨[("name", (num, den)), …], .le, (num, den)⟩`.
 fn lincon_lean(c: &LinearConstraint) -> Result<String, CertZError> {
-    let coeffs = c
-        .coefficients
-        .iter()
-        .map(|(name, coeff)| format!("({name:?}, {})", qpair_lean(*coeff)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Explicit loop (not `.map(..).collect::<Vec<_>>().join(", ")`): the
+    // map/collect/join adapters are absent-callees for the panic-freedom checker;
+    // the manual concat produces the byte-identical `", "`-separated string.
+    let mut coeffs = String::new();
+    for (i, (name, coeff)) in c.coefficients.iter().enumerate() {
+        if i > 0 {
+            coeffs.push_str(", ");
+        }
+        let qpair = qpair_lean(*coeff)?;
+        coeffs.push_str(&format!("({name:?}, {qpair})"));
+    }
+    let constant = qpair_lean(c.constant)?;
     Ok(format!(
         "⟨[{coeffs}], .{}, {}⟩",
         certz_kind(c.kind)?,
-        qpair_lean(c.constant)
+        constant
     ))
 }
 
@@ -216,11 +251,14 @@ fn lincon_lean(c: &LinearConstraint) -> Result<String, CertZError> {
 ///
 /// # Errors
 /// Returns [`CertZError::StrictRelation`] for any `<`/`>` constraint, or
-/// [`CertZError::EqConclusion`] if the conclusion is `eq`.
+/// [`CertZError::EqConclusion`] if the conclusion is `eq`. Returns
+/// [`CertZError::InvalidLeanName`] when `name` is not an injection-safe Lean
+/// identifier, or [`CertZError::Rat`] when rational extraction fails.
 pub fn entailment_to_certz_lean(
     cert: &EntailmentCertificate,
     name: &str,
 ) -> Result<String, CertZError> {
+    validate_lean_name(name)?;
     if cert.conclusion.kind == ConstraintKind::Eq {
         return Err(CertZError::EqConclusion);
     }
@@ -233,30 +271,58 @@ pub fn entailment_to_certz_lean(
     for p in &cert.premises {
         premise_lines.push(format!("  {},", lincon_lean(p)?));
     }
-    let premises = premise_lines.join("\n");
+    // Explicit concat (not `.join("\n")`): identical newline-separated string;
+    // clears the join absent-callee.
+    let mut premises = String::new();
+    for (i, line) in premise_lines.iter().enumerate() {
+        if i > 0 {
+            premises.push('\n');
+        }
+        premises.push_str(line);
+    }
     let mut mult_strs: Vec<String> = Vec::new();
     for m in &cert.multipliers {
-        mult_strs.push(qpair_lean(*m));
+        mult_strs.push(qpair_lean(*m)?);
     }
-    let mults = mult_strs.join(", ");
+    // Explicit concat (not `.join(", ")`): identical `", "`-separated string;
+    // clears the join absent-callee.
+    let mut mults = String::new();
+    for (i, m) in mult_strs.iter().enumerate() {
+        if i > 0 {
+            mults.push_str(", ");
+        }
+        mults.push_str(m);
+    }
     let concl = lincon_lean(&cert.conclusion)?;
+    // Escape every complete generated identifier. Lean's keyword set evolves,
+    // and concatenating an otherwise-valid caller name into raw source would
+    // make names such as `by` or `section` produce invalid code. The ASCII
+    // validator above excludes the closing guillemet, so these escapes cannot
+    // be broken out of.
+    let premises_name = format!("«{name}PremisesZ»");
+    let mults_name = format!("«{name}MultsZ»");
+    let concl_name = format!("«{name}ConclZ»");
+    let cert_name = format!("«{name}»");
+    let checks_name = format!("«{name}_checks»");
+    let safe_name = format!("«{name}_safe»");
     Ok(format!(
         "import Crownproof.CertCheckerZ\n\
          set_option maxHeartbeats 10000000\n\
          set_option maxRecDepth 10000000\n\
          namespace Crownproof.CertCheckerZ\n\
-         open Crownproof\n\n\
-         def {name}PremisesZ : List LinConZ := [\n{premises}\n]\n\n\
-         def {name}MultsZ : List QPair := [{mults}]\n\n\
-         def {name}ConclZ : LinConZ := {concl}\n\n\
-         def {name} : CertZ :=\n  \
-         {{ premises := {name}PremisesZ, multipliers := {name}MultsZ, conclusion := {name}ConclZ }}\n\n\
-         theorem {name}_checks : checkEntailmentZ {name} = true := by decide\n\n\
-         theorem {name}_safe :\n    \
+         open Crownproof\n\
+         open Crownproof.CertChecker\n\n\
+         def {premises_name} : List LinConZ := [\n{premises}\n]\n\n\
+         def {mults_name} : List QPair := [{mults}]\n\n\
+         def {concl_name} : LinConZ := {concl}\n\n\
+         def {cert_name} : CertZ :=\n  \
+         {{ premises := {premises_name}, multipliers := {mults_name}, conclusion := {concl_name} }}\n\n\
+         theorem {checks_name} : checkEntailmentZ {cert_name} = true := by decide\n\n\
+         theorem {safe_name} :\n    \
          ∀ σ : Assignment,\n      \
-         (∀ lc ∈ (liftCert {name}).premises, lc.satisfies σ) →\n      \
-         (liftCert {name}).conclusion.satisfies σ :=\n  \
-         checkEntailmentZ_sound {name} {name}_checks\n\n\
+         (∀ lc ∈ (liftCert {cert_name}).premises, lc.satisfies σ) →\n      \
+         (liftCert {cert_name}).conclusion.satisfies σ :=\n  \
+         checkEntailmentZ_sound {cert_name} {checks_name}\n\n\
          end Crownproof.CertCheckerZ\n"
     ))
 }
@@ -266,6 +332,14 @@ mod tests {
     use super::*;
     use crate::crown::Relu1Problem;
     use crate::selfcheck::check_entailment;
+
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
 
     /// Build the small ReLU entailment certificate from the crate doc example.
     fn relu_cert() -> EntailmentCertificate {
@@ -360,15 +434,89 @@ mod tests {
         let src = entailment_to_certz_lean(&cert, "nyLeaf")
             .map_err(|e| format!("emit CertZ lean: {e}"))?;
         // Mirrors the CertRunZ_node10.lean structure.
-        assert!(src.contains("def nyLeafPremisesZ : List LinConZ := ["));
-        assert!(src.contains("def nyLeafMultsZ : List QPair := ["));
-        assert!(src.contains("def nyLeafConclZ : LinConZ := "));
-        assert!(src.contains("def nyLeaf : CertZ :="));
-        assert!(src.contains("theorem nyLeaf_checks : checkEntailmentZ nyLeaf = true := by decide"));
-        assert!(src.contains("checkEntailmentZ_sound nyLeaf nyLeaf_checks"));
+        assert!(src.contains("def «nyLeafPremisesZ» : List LinConZ := ["));
+        assert!(src.contains("def «nyLeafMultsZ» : List QPair := ["));
+        assert!(src.contains("def «nyLeafConclZ» : LinConZ := "));
+        assert!(src.contains("def «nyLeaf» : CertZ :="));
+        assert!(src.contains("open Crownproof.CertChecker"));
+        assert!(
+            src.contains("theorem «nyLeaf_checks» : checkEntailmentZ «nyLeaf» = true := by decide")
+        );
+        assert!(src.contains("checkEntailmentZ_sound «nyLeaf» «nyLeaf_checks»"));
         // The conclusion is a `ge` on the single output variable `y`.
-        assert!(src.contains("def nyLeafConclZ : LinConZ := ⟨[(\"y\", (1, 1))], .ge,"));
+        assert!(src.contains("def «nyLeafConclZ» : LinConZ := ⟨[(\"y\", (1, 1))], .ge,"));
         Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "external-lean")]
+    fn generated_certz_lean_elaborates_with_pinned_checker() -> Result<(), String> {
+        use std::io::Write as _;
+        use std::process::Command;
+
+        let cert = relu_cert();
+        let source = entailment_to_certz_lean(&cert, "nyGeneratedSmoke")
+            .map_err(|e| format!("emit CertZ Lean: {e}"))?;
+        let lean_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("proofs")
+            .join("lean");
+
+        let build = Command::new("lake")
+            .args(["build", "Crownproof.CertCheckerZ"])
+            .current_dir(&lean_root)
+            .output()
+            .map_err(|e| format!("run pinned Lake build: {e}"))?;
+        if !build.status.success() {
+            return Err(format!(
+                "pinned CertCheckerZ build failed:\n{}{}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr)
+            ));
+        }
+
+        let mut file = tempfile::Builder::new()
+            .prefix("ny-generated-certz-")
+            .suffix(".lean")
+            .tempfile()
+            .map_err(|e| format!("create generated Lean tempfile: {e}"))?;
+        file.write_all(source.as_bytes())
+            .map_err(|e| format!("write generated Lean tempfile: {e}"))?;
+        file.flush()
+            .map_err(|e| format!("flush generated Lean tempfile: {e}"))?;
+
+        let elaboration = Command::new("lake")
+            .args(["env", "lean"])
+            .arg(file.path())
+            .current_dir(&lean_root)
+            .output()
+            .map_err(|e| format!("run Lean elaborator: {e}"))?;
+        if !elaboration.status.success() {
+            return Err(format!(
+                "generated CertZ Lean failed to elaborate:\n{}{}",
+                String::from_utf8_lossy(&elaboration.stdout),
+                String::from_utf8_lossy(&elaboration.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn certz_lean_rejects_unsafe_or_reserved_declaration_names() {
+        let cert = relu_cert();
+        for name in ["", "_", "2bad", "bad-name", "bad\naxiom forged : False"] {
+            assert!(
+                matches!(
+                    entailment_to_certz_lean(&cert, name),
+                    Err(CertZError::InvalidLeanName(_))
+                ),
+                "unsafe name was accepted: {name:?}"
+            );
+        }
+        entailment_to_certz_lean(&cert, "nyLeaf_2'")
+            .expect("ordinary generated Lean identifier is accepted");
+        let keyword = entailment_to_certz_lean(&cert, "by")
+            .expect("Lean keywords are safe when emitted as escaped identifiers");
+        assert!(keyword.contains("def «by» : CertZ :="));
     }
 
     #[test]
@@ -406,6 +554,22 @@ mod tests {
         assert_eq!(
             entailment_to_certz_json(&cert),
             Err(CertZError::EqConclusion)
+        );
+    }
+
+    #[test]
+    fn certz_emitters_refuse_a_poisoned_arena() {
+        let cert = relu_cert();
+        crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+
+        assert_eq!(
+            entailment_to_certz_json(&cert),
+            Err(CertZError::Rat(RatError::Poisoned))
+        );
+        assert_eq!(
+            entailment_to_certz_lean(&cert, "nyPoison"),
+            Err(CertZError::Rat(RatError::Poisoned))
         );
     }
 }

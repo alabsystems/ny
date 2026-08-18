@@ -8,8 +8,20 @@ set -euo pipefail
 TOOL_DIR=$(dirname "$(dirname "$(realpath "$0")")")
 STABLE_TARGET_DIR="${TOOL_DIR}/target/release"
 STABLE_SUBMISSION_BIN="${STABLE_TARGET_DIR}/ny"
+STABLE_SUBMISSION_RECEIPT="${STABLE_SUBMISSION_BIN}.receipt"
+RECEIPT_HELPER="${TOOL_DIR}/vnncomp_scripts/submission_binary_receipt.sh"
 
 cd "${TOOL_DIR}"
+
+if [ -L "${RECEIPT_HELPER}" ] || [ ! -f "${RECEIPT_HELPER}" ]; then
+    echo "ERROR: submission receipt helper is missing or is a symlink: ${RECEIPT_HELPER}" >&2
+    exit 1
+fi
+# Capture before Cargo starts and compare again after it finishes.  The helper
+# binds HEAD plus the complete tracked diff (or the packager's archive marker),
+# Cargo.lock, and AY, so a source/lock update during a long build cannot receive
+# a receipt for the wrong bytes.
+SOURCE_IDENTITY_BEFORE="$(bash "${RECEIPT_HELPER}" identity "${TOOL_DIR}")"
 
 # Canonicalize a path whose final components may not exist yet. GNU
 # `realpath -m` provides that operation on Linux but is unavailable in the
@@ -124,86 +136,104 @@ echo "Building ny release binary..."
 
 # --- Build prerequisite diagnostics (fail loudly, never silently) ---
 # The `mip` feature is pure Rust (ay-milp); no CMake/libclang needed. A C
-# compiler is still required for cc-built dep crates (psm/stacker, zstd-sys,
-# onig_sys, liblzma-sys), and ort-sys needs pkg-config + OpenSSL headers on
-# Linux plus network access to fetch its static onnxruntime archive.
+# compiler and pkg-config are still used by native dep crates (psm/stacker,
+# zstd-sys, onig_sys, liblzma-sys). ort-sys fetches its static ONNX Runtime
+# archive over rustls, so a source build needs network access but no system
+# OpenSSL headers.
 missing=""
 for tool in cargo cc pkg-config python3; do
     command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
 done
 if [ -n "${missing}" ]; then
     echo "WARNING: build prerequisites appear missing:${missing}" >&2
-    echo "  (cargo=Rust toolchain; cc=C compiler; pkg-config+libssl-dev=ort-sys; python3=Cargo artifact authentication)" >&2
+    echo "  (cargo=Rust toolchain; cc=C compiler; pkg-config=native dependency discovery; python3=Cargo artifact authentication)" >&2
 fi
 if ! command -v python3 >/dev/null 2>&1; then
     echo "ERROR: Python 3 is required to authenticate Cargo's emitted ny artifact." >&2
     exit 1
 fi
 
-# Ensure OpenSSL dev headers: ort-sys downloads the ONNX Runtime at build time
-# via ureq -> native-tls -> openssl-sys, which needs libssl-dev + pkg-config.
-# Some competition hosts cannot install packages but already have a relocated
-# libssl-dev tree. Discover NY's ordinary user-local layout before attempting a
-# package-manager mutation. OPENSSL_{DIR,LIB_DIR,INCLUDE_DIR} are the canonical
-# openssl-sys overrides; CFLAGS also covers its compile-time header probe.
-openssl_ready=0
-if [ -n "${OPENSSL_DIR:-}" ] || { [ -n "${OPENSSL_LIB_DIR:-}" ] && [ -n "${OPENSSL_INCLUDE_DIR:-}" ]; }; then
-    # Explicit openssl-sys overrides are authoritative. If they are malformed,
-    # let the build fail with the exact path diagnostic instead of mutating the
-    # host or silently substituting a different installation.
-    openssl_ready=1
-elif pkg-config --exists openssl 2>/dev/null; then
-    openssl_ready=1
+# Do not bake one developer host's memory ceiling into the repository-wide
+# Cargo configuration: that silently throttles organizer builds too.  The
+# sealed release builder is the memory-heavy path, so derive a process-local
+# default here unless the operator already selected CARGO_BUILD_JOBS.  Release
+# rustc/LTO workers have measured near 8 GiB each; reserve 8 GiB for the OS and
+# cap by the online CPU count.  Explicit CARGO_BUILD_JOBS remains authoritative.
+if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+    CARGO_BUILD_JOBS="$(python3 -I - <<'PY'
+import os
+import resource
+from pathlib import Path
+
+gib = 1024 ** 3
+cpus = max(1, os.cpu_count() or 1)
+memory_limits = []
+try:
+    memory_limits.append(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+except (AttributeError, OSError, TypeError, ValueError):
+    pass
+
+try:
+    soft_as, hard_as = resource.getrlimit(resource.RLIMIT_AS)
+    memory_limits.extend(
+        limit
+        for limit in (soft_as, hard_as)
+        if limit > 0 and limit != resource.RLIM_INFINITY
+    )
+except (AttributeError, OSError, ValueError):
+    pass
+
+# The common cgroup-v2 namespace layout exposes the effective process limit at
+# /sys/fs/cgroup/<membership>/memory.max. Scan its ancestors too: a parent may
+# be tighter than the immediate service. Failure to resolve this optional host
+# interface falls back to physical/RLIMIT memory, never to zero workers.
+try:
+    membership = next(
+        line.split("::", 1)[1].strip()
+        for line in Path("/proc/self/cgroup").read_text().splitlines()
+        if line.startswith("0::")
+    )
+    current = (Path("/sys/fs/cgroup") / membership.lstrip("/")).resolve()
+    cgroup_root = Path("/sys/fs/cgroup").resolve()
+    while current == cgroup_root or cgroup_root in current.parents:
+        raw = (current / "memory.max").read_text().strip()
+        if raw != "max":
+            memory_limits.append(int(raw))
+        if current == cgroup_root:
+            break
+        current = current.parent
+except (OSError, StopIteration, ValueError):
+    pass
+
+positive_limits = [limit for limit in memory_limits if limit > 0]
+if positive_limits:
+    memory_jobs = max(1, (min(positive_limits) - 8 * gib) // (8 * gib))
+    cpus = min(cpus, memory_jobs)
+print(max(1, cpus))
+PY
+)"
+    export CARGO_BUILD_JOBS
+    echo "Cargo release build jobs: ${CARGO_BUILD_JOBS} (CPU/memory-derived default)"
 else
-    local_openssl_bundle="${NY_OPENSSL_BUNDLE_ROOT:-${HOME:-}/.local/opt/libssl-dev}"
-    compiler_triple="$(cc -dumpmachine 2>/dev/null || true)"
-    local_openssl_root="${local_openssl_bundle}/usr"
-    local_openssl_lib="${local_openssl_root}/lib/${compiler_triple}"
-    local_openssl_include="${local_openssl_root}/include"
-    local_openssl_arch_include="${local_openssl_include}/${compiler_triple}"
-    local_openssl_config_include=""
-    if [ -f "${local_openssl_include}/openssl/opensslconf.h" ]; then
-        local_openssl_config_include="${local_openssl_include}"
-    elif [ -f "${local_openssl_arch_include}/openssl/opensslconf.h" ]; then
-        local_openssl_config_include="${local_openssl_arch_include}"
-    fi
-    if [ -n "${compiler_triple}" ] \
-        && [ -n "${local_openssl_config_include}" ] \
-        && [ -d "${local_openssl_include}/openssl" ] \
-        && { [ -f "${local_openssl_lib}/libssl.so" ] || [ -f "${local_openssl_lib}/libssl.a" ]; } \
-        && { [ -f "${local_openssl_lib}/libcrypto.so" ] || [ -f "${local_openssl_lib}/libcrypto.a" ]; }; then
-        export OPENSSL_DIR="${OPENSSL_DIR:-${local_openssl_root}}"
-        export OPENSSL_LIB_DIR="${OPENSSL_LIB_DIR:-${local_openssl_lib}}"
-        export OPENSSL_INCLUDE_DIR="${OPENSSL_INCLUDE_DIR:-${local_openssl_include}}"
-        openssl_cflags="${CFLAGS:-}"
-        for include_dir in "${OPENSSL_INCLUDE_DIR}" "${local_openssl_config_include}"; do
-            case " ${openssl_cflags} " in
-                *" -I${include_dir} "*) ;;
-                *) openssl_cflags="-I${include_dir}${openssl_cflags:+ ${openssl_cflags}}" ;;
-            esac
-        done
-        export CFLAGS="${openssl_cflags}"
-        openssl_ready=1
-        echo "Using relocated OpenSSL development bundle: ${local_openssl_bundle}"
-    fi
+    echo "Cargo release build jobs: ${CARGO_BUILD_JOBS} (operator override)"
 fi
 
-# Missing headers fail the build on every instance. Try to auto-install only
-# after both the system package metadata and the relocatable bundle are absent;
-# warn but continue if the host does not authorize package installation.
-if [ "${openssl_ready}" != "1" ]; then
-    echo "OpenSSL dev headers not found; attempting to install libssl-dev + pkg-config..."
-    SUDO=""
-    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
-    if command -v apt-get >/dev/null 2>&1; then
-        ${SUDO} apt-get update -y \
-            && ${SUDO} apt-get install -y --no-install-recommends libssl-dev pkg-config \
-            || echo "WARNING: could not auto-install libssl-dev; the ort build may fail. Install libssl-dev + pkg-config." >&2
-    elif command -v dnf >/dev/null 2>&1; then
-        ${SUDO} dnf install -y openssl-devel pkgconf-pkg-config \
-            || echo "WARNING: could not auto-install openssl-devel; the ort build may fail." >&2
-    else
-        echo "WARNING: OpenSSL dev headers missing and no apt-get/dnf found; install libssl-dev/openssl-devel + pkg-config." >&2
+# Toolchain-era check: ort-sys downloads a prebuilt static ONNX Runtime archive
+# built with a newer GCC than Ubuntu 22.04 ships. On gcc-11/binutils 2.38 era
+# hosts (glibc < 2.39) the FINAL link fails with undefined references to
+# onnxruntime internals (e.g. MLTypeCallDispatcher<...Float8E4M3FN...>) —
+# after the entire workspace has compiled. Known good: Ubuntu 24.04 and 26.04
+# (the VNN-COMP 2026 eval AMI is Ubuntu Server 24.04). Warn-only: the build
+# below remains the authoritative fail-closed gate.
+if [ "$(uname -s)" = "Linux" ]; then
+    glibc_ver=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || glibc_ver=""
+    if [[ "${glibc_ver}" =~ ^([0-9]+)\.([0-9]+)$ ]] \
+        && ((10#${BASH_REMATCH[1]} < 2 || (10#${BASH_REMATCH[1]} == 2 && 10#${BASH_REMATCH[2]} < 39))); then
+        ld_ver=$(ld --version 2>/dev/null | head -n 1) || ld_ver=""
+        echo "WARNING: glibc ${glibc_ver} host (< 2.39 — pre-Ubuntu-24.04 toolchain era; ld: ${ld_ver:-unknown})." >&2
+        echo "  The release link is expected to FAIL with undefined onnxruntime symbols" >&2
+        echo "  from libort_sys-*.rlib on this toolchain. Build on Ubuntu >= 24.04, or" >&2
+        echo "  set ORT_LIB_LOCATION to a locally built ONNX Runtime." >&2
     fi
 fi
 
@@ -692,6 +722,29 @@ then
     exit 1
 fi
 
+SOURCE_IDENTITY_AFTER="$(bash "${RECEIPT_HELPER}" identity "${TOOL_DIR}")"
+if [ "${SOURCE_IDENTITY_AFTER}" != "${SOURCE_IDENTITY_BEFORE}" ]; then
+    echo "ERROR: NY source identity changed during the submission build." >&2
+    echo "  The binary was published without a new receipt and will fail closed." >&2
+    exit 1
+fi
+receipt_features="${built}"
+if [ "${receipt_features}" = "(none)" ]; then
+    receipt_features="none"
+fi
+# Receipt publication is the final readiness sentinel.  If this step is
+# interrupted, a prior receipt either remains and mismatches the new binary or
+# is absent; run_instance.sh rejects both states.
+if ! bash "${RECEIPT_HELPER}" create-local \
+    "${STABLE_SUBMISSION_BIN}" \
+    "${TOOL_DIR}" \
+    "${receipt_features}" \
+    "${STABLE_SUBMISSION_RECEIPT}"; then
+    echo "ERROR: submission binary was published but its freshness receipt was not." >&2
+    exit 1
+fi
+
 echo "Built submission binary:"
 echo "  source: ${SOURCE_BIN}"
 echo "  alias:  ${STABLE_SUBMISSION_BIN}"
+echo "  receipt: ${STABLE_SUBMISSION_RECEIPT}"

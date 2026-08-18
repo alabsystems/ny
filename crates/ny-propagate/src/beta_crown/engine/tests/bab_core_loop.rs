@@ -347,7 +347,7 @@ fn test_verify_timeout_returns_timeout_status() {
     let is_terminal = matches!(
         result.result,
         BabVerificationStatus::Verified
-            | BabVerificationStatus::PotentialViolation
+            | BabVerificationStatus::PotentialViolation { .. }
             | BabVerificationStatus::Timeout
             | BabVerificationStatus::Unknown { .. }
     );

@@ -7,7 +7,10 @@
 use super::{checked_bounds, unchecked_bounds};
 use crate::bounds::LinearBounds;
 use ndarray::{array, Array1, Array2, ArrayD, IxDyn};
+use ny_core::NyError;
 use ny_tensor::{next_down_f32, next_up_f32};
+use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 #[ntest::timeout(5000)]
 #[test]
@@ -32,6 +35,49 @@ fn test_linear_bounds_identity() {
 
 #[ntest::timeout(5000)]
 #[test]
+fn deadline_aware_identity_matches_legacy_and_refuses_atomically() {
+    let expected = LinearBounds::identity(3);
+    let live = crate::tests::with_crown_dense_budget_mb("2048", || {
+        LinearBounds::try_identity_with_deadline(
+            3,
+            Some(Instant::now() + Duration::from_secs(30)),
+            137,
+        )
+        .expect("live finite identity seed")
+    });
+    assert_linear_bounds_exact(&live, &expected);
+
+    let expired = LinearBounds::try_identity_with_deadline(
+        3,
+        Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("one second fits before now"),
+        ),
+        0,
+    )
+    .expect_err("expired identity seed must be terminal before allocation");
+    assert!(expired.is_deadline_exceeded());
+
+    let memory = crate::tests::with_crown_dense_budget_mb("0", || {
+        LinearBounds::try_identity_with_deadline(
+            3,
+            Some(Instant::now() + Duration::from_secs(30)),
+            0,
+        )
+        .expect_err("finite identity seed must obey the dense budget")
+    });
+    assert!(matches!(memory, NyError::CpuMemoryExceeded { .. }));
+
+    let legacy = crate::tests::with_crown_dense_budget_mb("0", || {
+        LinearBounds::try_identity_with_deadline(3, None, usize::MAX)
+            .expect("None must delegate exactly to legacy identity")
+    });
+    assert_linear_bounds_exact(&legacy, &expected);
+}
+
+#[ntest::timeout(5000)]
+#[test]
 fn test_linear_bounds_num_outputs_inputs() {
     let bounds = LinearBounds {
         lower_a: Array2::zeros((5, 3)),
@@ -43,6 +89,169 @@ fn test_linear_bounds_num_outputs_inputs() {
     };
     assert_eq!(bounds.num_outputs(), 5);
     assert_eq!(bounds.num_inputs(), 3);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_linear_bounds_memory_bytes_includes_coefficient_errors() {
+    let mut bounds = LinearBounds {
+        lower_a: Array2::zeros((2, 3)),
+        lower_b: Array1::zeros(2),
+        upper_a: Array2::zeros((2, 3)),
+        upper_b: Array1::zeros(2),
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+
+    // 12 coefficients plus 4 biases, all f32.
+    assert_eq!(bounds.memory_bytes(), 16 * size_of::<f32>());
+
+    bounds.lower_a_err = Some(Array2::zeros((2, 3)));
+    assert_eq!(
+        bounds.memory_bytes(),
+        22 * size_of::<f32>(),
+        "the lower coefficient-error allocation must be counted"
+    );
+
+    bounds.lower_a_err = None;
+    bounds.upper_a_err = Some(Array2::zeros((2, 3)));
+    assert_eq!(
+        bounds.memory_bytes(),
+        22 * size_of::<f32>(),
+        "the upper coefficient-error allocation must be counted independently"
+    );
+
+    bounds.lower_a_err = Some(Array2::zeros((2, 3)));
+    assert_eq!(
+        bounds.memory_bytes(),
+        28 * size_of::<f32>(),
+        "both coefficient-error allocations must be counted"
+    );
+}
+
+fn beta_split_deadline_fixture() -> LinearBounds {
+    LinearBounds {
+        lower_a: array![[0.25, -1.0], [3.5, 0.125], [-2.0, 4.0]],
+        lower_b: array![0.5, -0.25, 1.0],
+        upper_a: array![[0.75, 2.0], [-1.5, 0.5], [3.0, -4.0]],
+        upper_b: array![1.5, 0.25, -1.0],
+        lower_a_err: Some(Array2::from_elem((3, 2), 1.0e-6)),
+        upper_a_err: Some(Array2::from_elem((3, 2), 2.0e-6)),
+    }
+}
+
+fn assert_linear_bounds_exact(actual: &LinearBounds, expected: &LinearBounds) {
+    assert_eq!(actual.lower_a, expected.lower_a);
+    assert_eq!(actual.lower_b, expected.lower_b);
+    assert_eq!(actual.upper_a, expected.upper_a);
+    assert_eq!(actual.upper_b, expected.upper_b);
+    assert_eq!(actual.lower_a_err, expected.lower_a_err);
+    assert_eq!(actual.upper_a_err, expected.upper_a_err);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn beta_split_live_deadline_matches_legacy_exactly() {
+    let mut expected = beta_split_deadline_fixture();
+    let mut actual = expected.clone();
+    expected.apply_beta_split_to_column(1, 0.375);
+
+    actual
+        .apply_beta_split_to_column_with_deadline(
+            1,
+            0.375,
+            Some(Instant::now() + Duration::from_secs(30)),
+        )
+        .expect("live deadline beta mutation");
+
+    assert_linear_bounds_exact(&actual, &expected);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn beta_split_expired_deadline_is_atomic() {
+    let mut actual = beta_split_deadline_fixture();
+    let expected = actual.clone();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("one-second deadline subtraction");
+
+    let error = actual
+        .apply_beta_split_to_column_with_deadline(1, 0.375, Some(expired))
+        .expect_err("expired beta mutation must be terminal");
+
+    assert!(error.is_deadline_exceeded());
+    assert_linear_bounds_exact(&actual, &expected);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn beta_split_none_keeps_the_in_place_legacy_path() {
+    let mut actual = beta_split_deadline_fixture();
+    let mut expected = actual.clone();
+    let lower_ptr = actual.lower_a.as_ptr();
+    let upper_ptr = actual.upper_a.as_ptr();
+    expected.apply_beta_split_to_column(0, -0.25);
+
+    actual
+        .apply_beta_split_to_column_with_deadline(0, -0.25, None)
+        .expect("no-deadline beta mutation");
+
+    assert_eq!(actual.lower_a.as_ptr(), lower_ptr);
+    assert_eq!(actual.upper_a.as_ptr(), upper_ptr);
+    assert_linear_bounds_exact(&actual, &expected);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn deadline_aware_linear_clone_is_exact_atomic_and_memory_bounded() {
+    let mut bounds = LinearBounds {
+        lower_a: array![[1.0_f32, -2.0], [3.0, -4.0]],
+        lower_b: array![0.25_f32, -0.5],
+        upper_a: array![[5.0_f32, -6.0], [7.0, -8.0]],
+        upper_b: array![0.75_f32, -1.0],
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+    bounds.lower_a_err = Some(array![[0.0_f32, 0.125], [0.25, 0.5]]);
+    bounds.upper_a_err = Some(array![[0.75_f32, 1.0], [1.25, 1.5]]);
+
+    let cloned = crate::tests::with_crown_dense_budget_mb("2048", || {
+        bounds
+            .try_clone_with_deadline(Some(Instant::now() + Duration::from_secs(1)), 137)
+            .unwrap()
+    });
+    assert_eq!(cloned.lower_a, bounds.lower_a);
+    assert_eq!(cloned.lower_b, bounds.lower_b);
+    assert_eq!(cloned.upper_a, bounds.upper_a);
+    assert_eq!(cloned.upper_b, bounds.upper_b);
+    assert_eq!(cloned.lower_a_err, bounds.lower_a_err);
+    assert_eq!(cloned.upper_a_err, bounds.upper_a_err);
+
+    let lower_only = crate::tests::with_crown_dense_budget_mb("2048", || {
+        bounds.try_clone_lower_a_with_deadline(None, 137).unwrap()
+    });
+    assert_eq!(lower_only, bounds.lower_a);
+
+    let before = format!("{bounds:?}");
+    let expired = bounds
+        .try_clone_with_deadline(
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond fits before now"),
+            ),
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(expired, NyError::DeadlineExceeded(_)));
+    assert_eq!(format!("{bounds:?}"), before);
+
+    let memory = crate::tests::with_crown_dense_budget_mb("0", || {
+        bounds.try_clone_with_deadline(None, 0).unwrap_err()
+    });
+    assert!(matches!(memory, NyError::CpuMemoryExceeded { .. }));
+    assert_eq!(format!("{bounds:?}"), before);
 }
 
 #[ntest::timeout(5000)]
@@ -429,35 +638,29 @@ fn test_concretize_sound_widens_bounds() {
 #[ntest::timeout(5000)]
 #[test]
 fn test_concretize_l2_ball_directed_rounding() {
-    // concretize_l2_ball should apply directed rounding on f64->f32 casts
-    use ny_tensor::{next_down_f32, next_up_f32};
-
     let bounds = LinearBounds::identity(2);
     let x_hat = array![0.5_f32, -0.3];
     let rho = 0.1_f32;
 
     let result = bounds.concretize_l2_ball(&x_hat, rho).unwrap();
 
-    // For identity bounds: lower[i] = x_hat[i] - rho, upper[i] = x_hat[i] + rho
-    // (computed in f64, then rounded toward -inf for lower, +inf for upper)
+    // For identity bounds the mathematical extrema are x_hat[i] ± rho. Check
+    // against those exact binary64 sums, not against a fixed ULP count: the
+    // certified dot/norm reductions may already have moved their binary64
+    // enclosure outward before the final directed binary32 conversion.
     for i in 0..2 {
-        let exact_lower = (x_hat[i] as f64 - rho as f64) as f32;
-        let exact_upper = (x_hat[i] as f64 + rho as f64) as f32;
+        let exact_lower = f64::from(x_hat[i]) - f64::from(rho);
+        let exact_upper = f64::from(x_hat[i]) + f64::from(rho);
         assert!(
-            result.lower()[[i]] <= exact_lower,
-            "l2 lower[{i}]={} should be <= exact cast {}",
+            f64::from(result.lower()[[i]]) <= exact_lower,
+            "l2 lower[{i}]={} should enclose exact {exact_lower:e}",
             result.lower()[[i]],
-            exact_lower,
         );
         assert!(
-            result.upper()[[i]] >= exact_upper,
-            "l2 upper[{i}]={} should be >= exact cast {}",
+            f64::from(result.upper()[[i]]) >= exact_upper,
+            "l2 upper[{i}]={} should enclose exact {exact_upper:e}",
             result.upper()[[i]],
-            exact_upper,
         );
-        // Should be exactly 1 ULP away (not more)
-        assert_eq!(result.lower()[[i]], next_down_f32(exact_lower));
-        assert_eq!(result.upper()[[i]], next_up_f32(exact_upper));
     }
 }
 
@@ -491,17 +694,12 @@ fn test_concretize_l2_ball_repairs_inverted_bounds() {
     assert_eq!(result.upper()[[0]], f32::INFINITY);
 }
 
-/// concretize_l2_ball should handle NaN coefficients by producing conservative bounds.
-/// NaN in the coefficient matrix causes NaN in the dot product and norm, which
-/// the NaN guard (linear.rs:416-421) replaces with ±Inf. The unaffected bound
-/// dimension remains finite — only the NaN-affected dimension degrades.
+/// A malformed linear proof object must fail closed before L2 concretization.
+/// Returning a partially finite result for a NaN coefficient would make it too
+/// easy for a caller to treat corrupted proof state as an ordinary enclosure.
 #[ntest::timeout(5000)]
 #[test]
-fn test_concretize_l2_ball_nan_coefficients_produce_conservative_bounds() {
-    // NaN in lower_a causes NaN in dot_l and norm_l2_l, so l_val will be NaN.
-    // The NaN guard replaces it with NEG_INFINITY.
-    // upper_a is normal, so u_val will be finite.
-    // After NaN guard: lower=NEG_INFINITY, upper=finite → valid conservative bound.
+fn test_concretize_l2_ball_nan_coefficients_fail_closed() {
     let bounds = LinearBounds {
         lower_a: array![[f32::NAN]],
         lower_b: array![0.0_f32],
@@ -513,10 +711,7 @@ fn test_concretize_l2_ball_nan_coefficients_produce_conservative_bounds() {
     let x_hat = array![1.0_f32];
     let rho = 0.5_f32;
 
-    let result = bounds.concretize_l2_ball(&x_hat, rho).unwrap();
-    // Lower should be -inf (from NaN guard), upper should be finite
-    assert_eq!(result.lower()[[0]], f32::NEG_INFINITY);
-    assert!(result.upper()[[0]].is_finite());
+    assert!(bounds.concretize_l2_ball(&x_hat, rho).is_err());
 }
 
 /// concretize_checked should return Ok with sound results when dimensions match.
@@ -955,6 +1150,102 @@ fn test_concretize_sound_repairs_inversions() {
     assert!(ub1 >= 4.0, "upper bound should be at least 4.0");
 }
 
+#[ntest::timeout(5000)]
+#[test]
+fn test_concretize_sound_preserves_certified_finite_inversion_provenance() {
+    let bounds = LinearBounds {
+        lower_a: Array2::zeros((1, 1)),
+        lower_b: array![1.0],
+        upper_a: Array2::zeros((1, 1)),
+        upper_b: array![0.0],
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+    let input = checked_bounds(array![0.0].into_dyn(), array![0.0].into_dyn());
+
+    let ordinary = bounds.concretize_sound(&input);
+    let result = bounds.concretize_sound_with_infeasibility(&input);
+
+    assert!(result.certified_finite_inversion);
+    let gap = result.row_finite_gaps[0].expect("finite singleton gap");
+    assert!((gap - 1.0).abs() <= 2.0 * f64::EPSILON);
+    assert_eq!(result.max_finite_gap, Some(gap));
+    assert_eq!(result.bounds.lower()[[0]], f32::NEG_INFINITY);
+    assert_eq!(result.bounds.upper()[[0]], f32::INFINITY);
+    assert_eq!(ordinary.lower(), result.bounds.lower());
+    assert_eq!(ordinary.upper(), result.bounds.upper());
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_concretize_sound_preserves_ordered_mixed_row_gap_provenance() {
+    let bounds = LinearBounds {
+        lower_a: Array2::zeros((3, 1)),
+        lower_b: array![1.0, -2.0, f32::NEG_INFINITY],
+        upper_a: Array2::zeros((3, 1)),
+        upper_b: array![0.0, 3.0, f32::INFINITY],
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+    let input = checked_bounds(array![0.0].into_dyn(), array![0.0].into_dyn());
+
+    let ordinary = bounds.concretize_sound(&input);
+    let result = bounds.concretize_sound_with_infeasibility(&input);
+
+    assert_eq!(result.row_finite_gaps.len(), 3);
+    let positive_gap = result.row_finite_gaps[0].expect("finite inverted-row gap");
+    let negative_gap = result.row_finite_gaps[1].expect("finite ordered-row gap");
+    assert!((positive_gap - 1.0).abs() <= 2.0 * f64::EPSILON);
+    assert!((negative_gap + 5.0).abs() <= 8.0 * f64::EPSILON * 5.0);
+    assert_eq!(result.row_finite_gaps[2], None);
+    assert_eq!(result.max_finite_gap, Some(positive_gap));
+    assert!(result.certified_finite_inversion);
+    assert_eq!(ordinary.lower(), result.bounds.lower());
+    assert_eq!(ordinary.upper(), result.bounds.upper());
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_concretize_sound_fallbacks_never_claim_infeasibility() {
+    let input = checked_bounds(array![0.0].into_dyn(), array![1.0].into_dyn());
+
+    let conservative = LinearBounds {
+        lower_a: Array2::zeros((1, 1)),
+        lower_b: array![f32::NEG_INFINITY],
+        upper_a: Array2::zeros((1, 1)),
+        upper_b: array![f32::INFINITY],
+        lower_a_err: None,
+        upper_a_err: None,
+    }
+    .concretize_sound_with_infeasibility(&input);
+    assert!(!conservative.certified_finite_inversion);
+    assert_eq!(conservative.row_finite_gaps, vec![None]);
+
+    let nan = LinearBounds {
+        lower_a: Array2::zeros((1, 1)),
+        lower_b: array![f32::NAN],
+        upper_a: Array2::zeros((1, 1)),
+        upper_b: array![0.0],
+        lower_a_err: None,
+        upper_a_err: None,
+    }
+    .concretize_sound_with_infeasibility(&input);
+    assert!(!nan.certified_finite_inversion);
+    assert_eq!(nan.row_finite_gaps, vec![None]);
+
+    let overflow = LinearBounds {
+        lower_a: Array2::from_elem((1, 1), f32::MAX),
+        lower_b: array![0.0],
+        upper_a: Array2::from_elem((1, 1), -f32::MAX),
+        upper_b: array![0.0],
+        lower_a_err: None,
+        upper_a_err: None,
+    }
+    .concretize_sound_with_infeasibility(&input);
+    assert!(!overflow.certified_finite_inversion);
+    assert_eq!(overflow.row_finite_gaps, vec![None]);
+}
+
 /// NaN in A-matrix coefficients must produce conservative bounds, not silently zero.
 ///
 /// Regression test for #2415: Rust's `f32::max(NaN, 0.0) = 0.0` (IEEE 754-2008)
@@ -1032,12 +1323,13 @@ fn test_concretize_nan_upper_a_coefficient_returns_conservative() {
     );
 }
 
-/// Multiple outputs with NaN in one coefficient row: only the poisoned row should be conservative.
+/// A NaN anywhere in a directly-constructed proof carrier invalidates the whole object.
 ///
-/// Regression test for #2415 — verifies that NaN doesn't contaminate unrelated rows.
+/// Regression test for the proof-boundary firewall: rows from a malformed
+/// `LinearBounds` cannot be trusted independently, even when some look finite.
 #[ntest::timeout(5000)]
 #[test]
-fn test_concretize_nan_coefficient_isolated_to_affected_row() {
+fn test_concretize_nan_coefficient_invalidates_entire_proof_object() {
     // Two outputs: row 0 has NaN in lower_a, row 1 is clean.
     let bounds = LinearBounds {
         lower_a: Array2::from_shape_vec((2, 2), vec![f32::NAN, 1.0, 1.0, 1.0]).unwrap(),
@@ -1053,22 +1345,11 @@ fn test_concretize_nan_coefficient_isolated_to_affected_row() {
     );
 
     let result = bounds.concretize_sound(&input);
-    // Row 0: NaN coefficient → conservative [-inf, +inf]
+    // Whole-object validation fails closed for both rows.
     assert_eq!(result.lower()[[0]], f32::NEG_INFINITY);
     assert_eq!(result.upper()[[0]], f32::INFINITY);
-    // Row 1: clean coefficients → finite bounds
-    let lb1 = result.lower()[[1]];
-    let ub1 = result.upper()[[1]];
-    assert!(
-        lb1.is_finite(),
-        "clean row 1 lower should be finite, got {lb1}"
-    );
-    assert!(
-        ub1.is_finite(),
-        "clean row 1 upper should be finite, got {ub1}"
-    );
-    // lower = la.max(0)*in_l + la.min(0)*in_u = 1*1 + 0*2 = 1 (+ 1*1 + 0*2 = 1) = 2
-    assert!(lb1 <= 2.0, "lower bound should be at most 2.0, got {lb1}");
+    assert_eq!(result.lower()[[1]], f32::NEG_INFINITY);
+    assert_eq!(result.upper()[[1]], f32::INFINITY);
 }
 /// #1932: concretize defense-in-depth — coefficients exceeding CROWN_COEFF_MAX
 /// but below f32::MAX must produce conservative bounds for the affected row.
@@ -1230,6 +1511,27 @@ fn test_concretize_sound_large_coeff_defense_1932() {
         f32::INFINITY,
         "concretize_sound: upper_a > CROWN_COEFF_MAX must degrade to +inf"
     );
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_exact_crown_transport_sentinel_is_never_a_coefficient() {
+    use ny_core::CROWN_COEFF_MAX;
+
+    let bounds = LinearBounds {
+        lower_a: Array2::from_shape_vec((1, 1), vec![CROWN_COEFF_MAX]).unwrap(),
+        lower_b: array![0.0],
+        upper_a: Array2::from_shape_vec((1, 1), vec![-CROWN_COEFF_MAX]).unwrap(),
+        upper_b: array![0.0],
+        lower_a_err: None,
+        upper_a_err: None,
+    };
+    let input = checked_bounds(array![0.0_f32].into_dyn(), array![0.0_f32].into_dyn());
+
+    for result in [bounds.concretize(&input), bounds.concretize_sound(&input)] {
+        assert_eq!(result.lower()[[0]], f32::NEG_INFINITY);
+        assert_eq!(result.upper()[[0]], f32::INFINITY);
+    }
 }
 
 // #2907 concretize panic-cliff tests moved to panic_cliff.rs

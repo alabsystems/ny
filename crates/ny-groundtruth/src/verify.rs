@@ -25,7 +25,7 @@
 //! so the falsified direction needs a concrete evaluation pass).
 
 use ndarray::Array1;
-use ny_core::{Bound, VerificationResult, VerificationSpec};
+use ny_core::{Bound, VerificationResult, VerificationSoundnessMode, VerificationSpec};
 use ny_propagate::{
     build_difference_network, GraphNetwork, PropagationConfig, PropagationMethod, Verifier,
 };
@@ -139,12 +139,15 @@ pub fn verify_against_ground_truth_with(
     let verifier = Verifier::new(options.config.clone());
     let result = verifier.verify_graph(&h, &spec)?;
 
+    if let Some(output_bounds) = sound_verified_bounds(&result) {
+        return Ok(GroundTruthOutcome::Verified {
+            difference_bounds: output_bounds.to_vec(),
+        });
+    }
     let best_bounds = match result {
-        VerificationResult::Verified { output_bounds, .. } => {
-            return Ok(GroundTruthOutcome::Verified {
-                difference_bounds: output_bounds,
-            });
-        }
+        // Heuristic provenance cannot prove the universal relation. Keep the
+        // candidate bounds, then continue with the sound witness search.
+        VerificationResult::Verified { output_bounds, .. } => output_bounds,
         VerificationResult::Violated { counterexample, .. } => {
             // Trust but verify: only report Falsified if a sound concrete
             // evaluation confirms the violation.
@@ -169,6 +172,17 @@ pub fn verify_against_ground_truth_with(
     Ok(GroundTruthOutcome::Unknown {
         difference_bounds: best_bounds,
     })
+}
+
+fn sound_verified_bounds(result: &VerificationResult) -> Option<&[Bound]> {
+    match result {
+        VerificationResult::Verified {
+            provenance,
+            output_bounds,
+            ..
+        } if provenance.mode() == VerificationSoundnessMode::Sound => Some(output_bounds),
+        _ => None,
+    }
 }
 
 /// Validate the relation's ε and round it down to f32 (sound direction:
@@ -249,6 +263,47 @@ fn enclosure_bounds(enclosure: &BoundedTensor) -> Vec<Bound> {
         .collect()
 }
 
+/// Number of grid points to evaluate, capped even when the Cartesian product
+/// overflows `usize` or the minimum two-point resolution is already too large.
+fn grid_point_budget(counts: &[usize]) -> usize {
+    counts
+        .iter()
+        .try_fold(1_usize, |acc, &count| acc.checked_mul(count))
+        .unwrap_or(MAX_WITNESS_POINTS)
+        .min(MAX_WITNESS_POINTS)
+}
+
+fn capped_grid_resolution(requested: usize, varying_dimensions: usize) -> usize {
+    let requested = requested.clamp(2, MAX_WITNESS_POINTS);
+    let fits = |resolution: usize| {
+        (0..varying_dimensions)
+            .try_fold(1_usize, |product, _| {
+                product
+                    .checked_mul(resolution)
+                    .filter(|&next| next <= MAX_WITNESS_POINTS)
+            })
+            .is_some()
+    };
+    if varying_dimensions <= 1 || !fits(2) {
+        return if varying_dimensions <= 1 {
+            requested
+        } else {
+            2
+        };
+    }
+
+    let (mut low, mut high) = (2, requested);
+    while low < high {
+        let midpoint = low + (high - low).div_ceil(2);
+        if fits(midpoint) {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    low
+}
+
 /// Grid witness search over the input box (M0 finding (b)): evaluate `h` at
 /// evenly spaced points (endpoints included) and return the first point whose
 /// sound enclosure certainly violates the relation.
@@ -269,30 +324,24 @@ fn grid_witness(
 
     // Per-dimension point counts: degenerate dimensions get one point;
     // shrink the resolution until the total fits the cap.
-    let mut resolution = grid.max(2);
-    let counts = loop {
-        let counts: Vec<usize> = input_bounds
-            .iter()
-            .map(|b| {
-                if b.lower() == b.upper() {
-                    1
-                } else {
-                    resolution
-                }
-            })
-            .collect();
-        let total = counts
-            .iter()
-            .try_fold(1_usize, |acc, &c| acc.checked_mul(c))
-            .unwrap_or(usize::MAX);
-        if total <= MAX_WITNESS_POINTS || resolution == 2 {
-            break counts;
-        }
-        resolution -= 1;
-    };
+    let varying_dimensions = input_bounds
+        .iter()
+        .filter(|bound| bound.lower() != bound.upper())
+        .count();
+    let resolution = capped_grid_resolution(grid, varying_dimensions);
+    let counts: Vec<usize> = input_bounds
+        .iter()
+        .map(|bound| {
+            if bound.lower() == bound.upper() {
+                1
+            } else {
+                resolution
+            }
+        })
+        .collect();
 
     let mut index = vec![0_usize; dim];
-    loop {
+    for _ in 0..grid_point_budget(&counts) {
         let point: Vec<f32> = index
             .iter()
             .zip(input_bounds.iter())
@@ -302,7 +351,8 @@ fn grid_witness(
                     b.lower()
                 } else {
                     let t = i as f64 / (n - 1) as f64;
-                    let x = f64::from(b.lower()) + t * f64::from(b.upper() - b.lower());
+                    let width = f64::from(b.upper()) - f64::from(b.lower());
+                    let x = f64::from(b.lower()) + t * width;
                     // Clamp so FP rounding cannot push the sample outside the box.
                     (x as f32).clamp(b.lower(), b.upper())
                 }
@@ -326,11 +376,31 @@ fn grid_witness(
             return Ok(None);
         }
     }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ny_core::SoundnessProvenance;
+
+    fn verified_with(provenance: SoundnessProvenance) -> VerificationResult {
+        VerificationResult::Verified {
+            provenance,
+            output_bounds: vec![Bound::new(-1.0, 1.0)],
+            proof: None,
+            actual_method: None,
+        }
+    }
+
+    #[test]
+    fn only_sound_verified_results_are_treated_as_proofs() {
+        assert!(sound_verified_bounds(&verified_with(SoundnessProvenance::sound())).is_some());
+        assert!(
+            sound_verified_bounds(&verified_with(SoundnessProvenance::heuristic())).is_none(),
+            "heuristic bounds must not become an unqualified Verified outcome"
+        );
+    }
 
     #[test]
     fn epsilon_is_rounded_toward_zero() {
@@ -351,6 +421,27 @@ mod tests {
             Err(GroundTruthError::NonFiniteParameter { .. })
         ));
         assert!(validated_epsilon(Relation::Dominates).unwrap().is_none());
+    }
+
+    #[test]
+    fn witness_grid_budget_is_hard_capped() {
+        assert_eq!(grid_point_budget(&[2, 3, 4]), 24);
+        assert_eq!(
+            grid_point_budget(&vec![2; usize::BITS as usize]),
+            MAX_WITNESS_POINTS,
+            "overflowing Cartesian products must still honor the cap"
+        );
+        assert_eq!(
+            grid_point_budget(&[MAX_WITNESS_POINTS, 2]),
+            MAX_WITNESS_POINTS
+        );
+        let two_dimensional = capped_grid_resolution(usize::MAX, 2);
+        assert!(
+            two_dimensional * two_dimensional <= MAX_WITNESS_POINTS
+                && (two_dimensional + 1) * (two_dimensional + 1) > MAX_WITNESS_POINTS,
+            "resolution must be the largest square grid within the hard cap"
+        );
+        assert_eq!(capped_grid_resolution(usize::MAX, 20), 2);
     }
 
     #[test]

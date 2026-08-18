@@ -2,34 +2,207 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// HiGHS MIP verification path for FC+ReLU networks. Part of #1763.
-// Parallel to smt.rs (ay path); HiGHS is open-source (MIT) with LP tightening.
+// MIP verification path for FC+ReLU networks. Part of #1763.
+// The historical module name is retained for API/source stability; the solver
+// policy now uses the linked AY backend by default, with ay-proc explicit.
 
 use anyhow::Result;
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{Bound, VerificationResult};
 use ny_mip::{
-    encode_feedforward, LpTightener, MipBackend, MipConfig, MipResult, MipSolver, SplitUnsatCache,
+    certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_until_unwired, encode_feedforward,
+    CertifiedLinearLowerBound, CertifiedLinearLowerProofRoute, LpTightener, MipBackend, MipConfig,
+    MipFeasibilityIngress, MipResult, MipSolver, OneSidedSatProbe, SplitUnsatCache,
 };
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
-use ny_propagate::{Network, PhaseBudgetConfig};
+use ny_propagate::layers::{AddConstantLayer, LinearLayer};
+use ny_propagate::{Layer, Network, PhaseBudgetConfig};
 use ny_tensor::BoundedTensor;
 use std::path::Path;
 
 use super::mip_preprocess::{
     bounded_tensor_to_bounds, convert_intermediate_bounds, extract_linear_relu_params,
     fold_constant_layers, strip_shape_layers, unfold_conv2d_to_linear,
-    validate_mip_feedforward_topology,
+    validate_mip_feedforward_topology, FoldedMipNetwork,
 };
 use super::mip_single_hidden::{
     collect_exact_single_hidden_intermediate_bounds, is_single_hidden_linear_relu_linear,
 };
-use super::output::{format_verification_result_json, verification_result_exit_code};
+use super::output::{
+    format_verification_result_json_for_publication, verification_result_exit_code,
+    EffectiveTreatmentProjection,
+};
 use super::BetaCrownModel;
-use intermediate_bounds::collect_mip_intermediate_bounds;
-#[cfg(test)]
 use intermediate_bounds::collect_mip_intermediate_bounds_with_deadline;
 use warm_start::build_warm_start_vector;
+
+/// Apply the exact structural preprocessing consumed by the feed-forward MIP
+/// encoder.
+///
+/// Keep this as the single topology authority for both route admission and
+/// execution: ONNX MatMul+Add commonly reloads as separate
+/// `Linear -> AddConstant` layers, so inspecting the raw sequential network
+/// would reject a model that this pipeline soundly folds and encodes.
+fn canonicalize_mip_feedforward_network(
+    network: &Network,
+    input_shape: &[usize],
+) -> Result<FoldedMipNetwork> {
+    let mip_network = unfold_conv2d_to_linear(network, input_shape)?;
+    let mip_network = strip_shape_layers(&mip_network);
+    let mip_network = fold_constant_layers(&mip_network)?;
+    validate_mip_feedforward_topology(&mip_network)?;
+    Ok(mip_network)
+}
+
+const SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM: usize = 128;
+const SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM: usize = 128;
+const SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM: usize = 128;
+const SAFENLP_DIRECT_MIP_FIRST_MAX_SOURCE_ELEMENTS: usize = SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM
+    * SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM
+    + SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM * SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM
+    + 2 * (SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM + SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SafeNlpRawAdmissionSize {
+    input_dim: usize,
+    hidden_dim: usize,
+    last_input_dim: usize,
+    output_dim: usize,
+    source_elements: Option<usize>,
+}
+
+/// Pure no-allocation size gate applied before the canonicalization clone.
+fn safenlp_raw_size_within_guard(
+    size: SafeNlpRawAdmissionSize,
+    observed_input_dim: usize,
+    spec_input_dim: usize,
+    spec_output_dim: usize,
+) -> bool {
+    size.input_dim > 0
+        && size.input_dim <= SAFENLP_DIRECT_MIP_FIRST_MAX_INPUT_DIM
+        && size.hidden_dim > 0
+        && size.hidden_dim <= SAFENLP_DIRECT_MIP_FIRST_MAX_HIDDEN_DIM
+        && size.output_dim > 0
+        && size.output_dim <= SAFENLP_DIRECT_MIP_FIRST_MAX_OUTPUT_DIM
+        && size.last_input_dim == size.hidden_dim
+        && size.input_dim == observed_input_dim
+        && size.input_dim == spec_input_dim
+        && size.output_dim == spec_output_dim
+        && size
+            .source_elements
+            .is_some_and(|count| count <= SAFENLP_DIRECT_MIP_FIRST_MAX_SOURCE_ELEMENTS)
+}
+
+/// Cheap allocation guard for the deliberately narrow SafeNLP route.
+///
+/// The official ONNX loader leaves either affine bias independently optional,
+/// yielding two Linears, one ReLU, and zero to two post-Linear AddConstant
+/// layers. Refuse every wider raw topology before the general MIP Conv2d
+/// unfolding code can allocate; canonical preprocessing below remains the
+/// final topology and dimension authority.
+fn safenlp_raw_affine_bias_candidate(
+    network: &Network,
+    input: &BoundedTensor,
+    spec: &VnnLibSpec,
+) -> bool {
+    let (first, first_bias, last, last_bias): (
+        &LinearLayer,
+        Option<&AddConstantLayer>,
+        &LinearLayer,
+        Option<&AddConstantLayer>,
+    ) = match network.layers() {
+        [Layer::Linear(first), Layer::ReLU(_), Layer::Linear(last)] => (first, None, last, None),
+        [Layer::Linear(first), Layer::AddConstant(first_bias), Layer::ReLU(_), Layer::Linear(last)] => {
+            (first, Some(first_bias), last, None)
+        }
+        [Layer::Linear(first), Layer::ReLU(_), Layer::Linear(last), Layer::AddConstant(last_bias)] => {
+            (first, None, last, Some(last_bias))
+        }
+        [Layer::Linear(first), Layer::AddConstant(first_bias), Layer::ReLU(_), Layer::Linear(last), Layer::AddConstant(last_bias)] => {
+            (first, Some(first_bias), last, Some(last_bias))
+        }
+        _ => return false,
+    };
+
+    let (hidden_dim, input_dim) = first.weight().dim();
+    let (output_dim, last_input_dim) = last.weight().dim();
+    let bias_shape_matches = |bias: Option<&AddConstantLayer>, feature_dim: usize| {
+        bias.is_none_or(|bias| {
+            let constant = bias.constant();
+            constant.len() == 1
+                || (constant.len() == feature_dim
+                    && constant.shape().last().copied() == Some(feature_dim)
+                    && constant.shape()[..constant.ndim().saturating_sub(1)]
+                        .iter()
+                        .all(|&dim| dim == 1))
+        })
+    };
+    let source_elements = [
+        first.weight().len(),
+        first.bias().map_or(0, |bias| bias.len()),
+        first_bias.map_or(0, |bias| bias.constant().len()),
+        last.weight().len(),
+        last.bias().map_or(0, |bias| bias.len()),
+        last_bias.map_or(0, |bias| bias.constant().len()),
+    ]
+    .into_iter()
+    .try_fold(0usize, |count, elements| count.checked_add(elements));
+    let size = SafeNlpRawAdmissionSize {
+        input_dim,
+        hidden_dim,
+        last_input_dim,
+        output_dim,
+        source_elements,
+    };
+
+    safenlp_raw_size_within_guard(size, input.lower().len(), spec.num_inputs, spec.num_outputs)
+        && first.bias().is_none_or(|bias| bias.len() == hidden_dim)
+        && last.bias().is_none_or(|bias| bias.len() == output_dim)
+        && bias_shape_matches(first_bias, hidden_dim)
+        && bias_shape_matches(last_bias, output_dim)
+}
+
+/// Return the hidden width when the authoritative MIP preprocessing pipeline
+/// canonicalizes this model to the narrow SafeNLP direct-first topology.
+///
+/// An error or `None` is a pre-route decline. The caller still passes the
+/// original reloaded model to [`verify_with_mip_inner`], which repeats this
+/// authoritative preprocessing and retains the exact folded-bias sidecar for
+/// the certified solve.
+pub(super) fn safenlp_canonical_single_hidden_shape(
+    model_net: &BetaCrownModel,
+    input: &BoundedTensor,
+    spec: &VnnLibSpec,
+) -> Result<Option<usize>> {
+    let BetaCrownModel::Sequential(network) = model_net else {
+        return Ok(None);
+    };
+    if !safenlp_raw_affine_bias_candidate(network, input, spec) {
+        return Ok(None);
+    }
+    let mip_network = canonicalize_mip_feedforward_network(network, input.shape())?;
+    if !is_single_hidden_linear_relu_linear(&mip_network) {
+        return Ok(None);
+    }
+
+    let (_weights, _structural_biases, layer_dims) = extract_linear_relu_params(&mip_network)?;
+    let [input_dim, hidden_dim, output_dim] = layer_dims.as_slice() else {
+        return Ok(None);
+    };
+    let [Layer::Linear(_first), Layer::ReLU(_), Layer::Linear(last)] = mip_network.layers() else {
+        return Ok(None);
+    };
+    let last_input_dim = last.weight().ncols();
+    Ok((*input_dim > 0
+        && *hidden_dim > 0
+        && *hidden_dim <= 128
+        && *output_dim > 0
+        && last_input_dim == *hidden_dim
+        && *input_dim == input.lower().len()
+        && *input_dim == spec.num_inputs
+        && *output_dim == spec.num_outputs)
+        .then_some(*hidden_dim))
+}
 
 /// Human-readable solver name for a MIP backend (verdict output/diagnostics).
 fn backend_name(backend: MipBackend) -> &'static str {
@@ -37,6 +210,444 @@ fn backend_name(backend: MipBackend) -> &'static str {
         MipBackend::Ay => "ay",
         MipBackend::AyProc => "ay-proc",
     }
+}
+
+/// Exact default-off gate for AY's verdict-preserving margin reframe.
+///
+/// Graph-MIP already uses this provenance-recorded research gate.  The direct
+/// FC MIP path deliberately shares its semantics: only exact `1` marks one
+/// caller-identified unsafe row, while every other spelling leaves the
+/// historical objective-zero feasibility model byte-identical.
+fn ay_margin_reframe_enabled_from_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn ay_margin_reframe_enabled() -> bool {
+    ay_margin_reframe_enabled_from_value(std::env::var("NY_AY_MARGIN_REFRAME").ok().as_deref())
+}
+
+/// Select the typed direct-first shared-prefix ingress from the third gate.
+///
+/// Dispatch has already required exact direct-first and shared-prefix intent.
+/// Only the existing exact margin value `1` composes those gates with AY's
+/// marked-margin API; every other spelling retains required plain feasibility.
+fn required_safenlp_shared_prefix_ingress_from_margin_value(
+    value: Option<&str>,
+) -> MipFeasibilityIngress {
+    if ay_margin_reframe_enabled_from_value(value) {
+        MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix
+    } else {
+        MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix
+    }
+}
+
+fn required_safenlp_shared_prefix_ingress() -> MipFeasibilityIngress {
+    required_safenlp_shared_prefix_ingress_from_margin_value(
+        std::env::var("NY_AY_MARGIN_REFRAME").ok().as_deref(),
+    )
+}
+
+/// Preserve terminal ownership across the in-process competition capture seam.
+///
+/// This consumes the already-selected typed ingress; it must never re-read the
+/// environment or infer ownership from category/log strings.
+fn capture_terminal_safenlp_ingress(feasibility_ingress: MipFeasibilityIngress) {
+    if feasibility_ingress == MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix {
+        super::output::mark_captured_safenlp_marked_margin_terminal();
+    }
+}
+
+/// Exact default-off gate for a certificate-authoritative four-ReLU tree.
+///
+/// This is a caller-side research canary, not an AY search override. Only the
+/// literal `1` can retain an unmodified base model and ask the existing
+/// fixed-assignment-tree API for an independently replayed safety proof.
+fn mip_certified_shared_tree_enabled_from_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn mip_certified_shared_tree_enabled() -> bool {
+    mip_certified_shared_tree_enabled_from_value(
+        std::env::var("NY_MIP_CERTIFIED_SHARED_TREE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CertifiedSharedTreePlan {
+    /// Sparse lower-bound objective whose strict positivity excludes the one
+    /// admitted unsafe row.
+    objective: [(ny_mip::ir::Col, f64); 2],
+    /// Exactly four unfixed ReLU binaries, in historical widest-first order.
+    splits: [ny_mip::ir::Col; 4],
+}
+
+/// Recover the unique pairwise unsafe constraint without changing its sense.
+///
+/// The fixed-tree API proves `objective > 0`: for `yi <= yj` the excluding
+/// objective is `yi - yj`; for `yi >= yj` it is `yj - yi`. Strict and
+/// non-strict unsafe rows share the same sufficient strict-safe complement.
+fn certified_shared_tree_pairwise_indices(spec: &VnnLibSpec) -> Option<(usize, usize, bool)> {
+    if spec.is_disjunction {
+        return None;
+    }
+    let constraints = conjunctive_constraints_owned(spec);
+    let constraint = constraints.first()?;
+    if constraints.len() != 1 {
+        return None;
+    }
+    let (first, second, reverse) = match constraint {
+        OutputConstraint::LessEq(i, j) | OutputConstraint::LessThan(i, j) => (*i, *j, false),
+        OutputConstraint::GreaterEq(i, j) | OutputConstraint::GreaterThan(i, j) => (*i, *j, true),
+        OutputConstraint::LessEqConst(..)
+        | OutputConstraint::LessThanConst(..)
+        | OutputConstraint::GreaterEqConst(..)
+        | OutputConstraint::GreaterThanConst(..) => return None,
+        _ => return None,
+    };
+    if first == second || first >= spec.num_outputs || second >= spec.num_outputs {
+        return None;
+    }
+    Some((first, second, reverse))
+}
+
+/// Cheap admission checked before cloning the encoded base problem.
+///
+/// In particular, the margin reframe and certified tree are mutually
+/// exclusive. If both exact gates are requested, the tree refuses and the
+/// ordinary fallback is still allowed to mark and solve its unsafe row.
+fn certified_shared_tree_preclone_eligible(
+    enabled: bool,
+    margin_reframe_enabled: bool,
+    backend: MipBackend,
+    exact_single_hidden_fast_path: bool,
+    spec: &VnnLibSpec,
+    deadline: std::time::Instant,
+) -> bool {
+    enabled
+        && !margin_reframe_enabled
+        && backend == MipBackend::Ay
+        && exact_single_hidden_fast_path
+        && certified_shared_tree_pairwise_indices(spec).is_some()
+        && std::time::Instant::now() < deadline
+}
+
+/// Build the proof request from an unmodified encoded base problem.
+///
+/// The width ordering intentionally duplicates `MipSolver`'s historical
+/// default comparator: descending width, then encoder insertion index. The
+/// canary does not inherit `NY_MIP_STABILITY_HINTS`; its four-way topology is
+/// stable across unrelated search-advice experiments.
+fn certified_shared_tree_plan(
+    preclone_eligible: bool,
+    spec: &VnnLibSpec,
+    base: &ny_mip::MipParts,
+) -> Option<CertifiedSharedTreePlan> {
+    if !preclone_eligible
+        || base.problem.margin_row().is_some()
+        || base.num_cols != base.problem.num_cols()
+        || base.output_vars.len() != spec.num_outputs
+        || base.binary_vars.len() != base.binary_widths.len()
+    {
+        return None;
+    }
+
+    let (i, j, reverse) = certified_shared_tree_pairwise_indices(spec)?;
+    let yi = *base.output_vars.get(i)?;
+    let yj = *base.output_vars.get(j)?;
+    if yi == yj || base.problem.cols().get(yi.0)?.integer || base.problem.cols().get(yj.0)?.integer
+    {
+        return None;
+    }
+    let objective = if reverse {
+        [(yj, 1.0), (yi, -1.0)]
+    } else {
+        [(yi, 1.0), (yj, -1.0)]
+    };
+
+    let mut order = Vec::with_capacity(base.binary_vars.len());
+    let mut seen = vec![false; base.problem.num_cols()];
+    for (index, (&col, &width)) in base.binary_vars.iter().zip(&base.binary_widths).enumerate() {
+        let col_spec = base.problem.cols().get(col.0)?;
+        if !col_spec.integer || !width.is_finite() || width <= 0.0 {
+            return None;
+        }
+        if std::mem::replace(seen.get_mut(col.0)?, true) {
+            return None;
+        }
+        if col_spec.lb == 0.0 && col_spec.ub == 1.0 {
+            order.push(index);
+        } else if !(col_spec.lb == col_spec.ub && (col_spec.lb == 0.0 || col_spec.lb == 1.0)) {
+            return None;
+        }
+    }
+    if order.len() < 4 {
+        return None;
+    }
+    order.sort_by(|&a, &b| {
+        let wa = base.binary_widths.get(a).copied().unwrap_or(0.0);
+        let wb = base.binary_widths.get(b).copied().unwrap_or(0.0);
+        wb.partial_cmp(&wa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let splits = std::array::from_fn(|index| base.binary_vars[order[index]]);
+    Some(CertifiedSharedTreePlan { objective, splits })
+}
+
+/// Ask the existing certificate API for the complete root/four-split proof.
+///
+/// Every decline and error is verdict-neutral. Even a returned certificate is
+/// discarded if it arrives after the caller's absolute deadline or reports a
+/// shape outside the API's root-or-complete-16-leaf contract.
+fn try_certified_shared_tree(
+    base: &ny_mip::MipParts,
+    plan: &CertifiedSharedTreePlan,
+    deadline: std::time::Instant,
+) -> Option<CertifiedLinearLowerBound> {
+    let started = std::time::Instant::now();
+    let proof_deadline = started
+        .checked_add(std::time::Duration::from_mins(5))
+        .map_or(deadline, |cap| deadline.min(cap));
+    if proof_deadline <= started {
+        return None;
+    }
+    let certified = match certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_until_unwired(
+        &base.problem,
+        &plan.objective,
+        0.0,
+        &plan.splits,
+        proof_deadline,
+        16,
+    ) {
+        Ok(Some(certified)) => certified,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "certified shared-tree canary declined after a proof-API error"
+            );
+            return None;
+        }
+    };
+    if std::time::Instant::now() >= proof_deadline || certified.lower.to_bits() != 0.0_f32.to_bits()
+    {
+        return None;
+    }
+    let expected_shape = match certified.proof_route {
+        CertifiedLinearLowerProofRoute::RelaxationEntailment
+        | CertifiedLinearLowerProofRoute::RootFarkas => {
+            certified.ay_tree_leaves == 0 && certified.ny_cert_farkas_replays == 1
+        }
+        CertifiedLinearLowerProofRoute::TreeFarkas => {
+            certified.ay_tree_leaves == 16 && certified.ny_cert_farkas_replays == 16
+        }
+    };
+    expected_shape.then_some(certified)
+}
+
+/// Mark one explicitly identified unsafe row for AY's equivalent margin solve.
+///
+/// This helper owns no verdict logic.  It only transports the row identity
+/// through `MilpProblem` to the pinned AY backend, whose reframe relaxes that
+/// row, optimizes its sparse form, maps the result back to the ORIGINAL
+/// feasibility model, and passes every witness/Farkas result through the
+/// original-model replay gate.  Multi-row conjunctions need a max-min
+/// construction and are deliberately left on plain feasibility.
+fn maybe_mark_unique_ay_margin(
+    enabled: bool,
+    backend: MipBackend,
+    parts: &mut ny_mip::MipParts,
+    unsafe_rows: &[ny_mip::ir::Row],
+) -> Result<bool> {
+    if !enabled || backend != MipBackend::Ay || unsafe_rows.len() != 1 {
+        return Ok(false);
+    }
+    parts
+        .problem
+        .mark_margin_row(unsafe_rows[0])
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cannot mark direct-MIP unsafe row {} as AY's unique decision margin: {error}",
+                unsafe_rows[0].0
+            )
+        })?;
+    Ok(true)
+}
+
+fn timeout_verification_result(num_outputs: usize) -> VerificationResult {
+    VerificationResult::Timeout {
+        provenance: Default::default(),
+        partial_bounds: Some(vec![
+            Bound::new_allow_infinite(
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+            );
+            num_outputs
+        ]),
+        actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+    }
+}
+
+/// Exact default-off gate for the AY objective-first SAT candidate lane.
+///
+/// This is intentionally distinct from `NY_AY_MARGIN_REFRAME`: the latter can
+/// map an optimum to either feasibility or infeasibility, while this lane has
+/// no UNSAT surface and keeps the unsafe row constrained.
+fn ay_objective_first_sat_enabled_from_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn ay_objective_first_sat_enabled() -> bool {
+    ay_objective_first_sat_enabled_from_value(
+        std::env::var("NY_AY_OBJECTIVE_FIRST_SAT").ok().as_deref(),
+    )
+}
+
+/// Exact default-off canary for running the sequential-network MIP as one
+/// full-model solve instead of the default phase-split race.
+///
+/// This is deliberately separate from `NY_GRAPH_MIP_SERIAL`: graph-MIP and
+/// this sequential complete-verifier path have different callers, budgets,
+/// and score evidence.  Malformed values fail closed to the historical
+/// auto-split policy; the measurement launcher independently rejects them.
+fn sequential_mip_parallel_split_from_value(value: Option<&str>) -> usize {
+    if value == Some("1") {
+        1
+    } else {
+        MipConfig::default().parallel_split
+    }
+}
+
+fn sequential_mip_parallel_split() -> usize {
+    sequential_mip_parallel_split_from_value(std::env::var("NY_MIP_SERIAL").ok().as_deref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ObjectiveFirstSatBudget {
+    probe_secs: f64,
+    /// Exact historical off-path wall slice, after any window floor,
+    /// phase-split outer cap, and backend hard clamp.
+    envelope_secs: f64,
+}
+
+impl ObjectiveFirstSatBudget {
+    const MIN_FALLBACK_SECS: f64 = 0.001;
+
+    /// Deterministic mirror of the absolute-deadline remainder calculation.
+    ///
+    /// This charges probe setup, model lowering, detached-worker wait, and
+    /// concrete replay by subtracting ACTUAL elapsed wall time, rather than
+    /// blindly granting a fresh nominal fallback slice.
+    fn fallback_secs_after_elapsed(self, elapsed_secs: f64) -> Option<f64> {
+        if !elapsed_secs.is_finite() || elapsed_secs < 0.0 {
+            return None;
+        }
+        let remaining = self.envelope_secs - elapsed_secs;
+        (remaining >= Self::MIN_FALLBACK_SECS).then_some(remaining)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectiveFirstSatLedger {
+    deadline: std::time::Instant,
+}
+
+impl ObjectiveFirstSatLedger {
+    fn start(
+        budget: ObjectiveFirstSatBudget,
+        outer_deadline: Option<std::time::Instant>,
+    ) -> Option<Self> {
+        let now = std::time::Instant::now();
+        let nominal_deadline =
+            now.checked_add(std::time::Duration::from_secs_f64(budget.envelope_secs))?;
+        let deadline = outer_deadline.map_or(nominal_deadline, |outer| outer.min(nominal_deadline));
+        if deadline <= now {
+            return None;
+        }
+        Some(Self { deadline })
+    }
+
+    fn expired(self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
+    fn probe_secs(self, budget: ObjectiveFirstSatBudget) -> Option<f64> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(std::time::Instant::now())?
+            .as_secs_f64();
+        let probe_secs = budget.probe_secs.min(remaining);
+        (probe_secs >= ObjectiveFirstSatBudget::MIN_FALLBACK_SECS).then_some(probe_secs)
+    }
+}
+
+/// Reserve a bounded probe inside the exact historical MIP wall envelope.
+///
+/// Only one explicitly identified one-sided row is admitted.  Multi-row
+/// conjunctions need a separate max-min objective construction and are
+/// deliberately refused rather than guessed.  `requested_secs` sizes the
+/// probe, preserving the canary policy. `historical_envelope_secs` is the
+/// actual objective-off wall slice reported by [`MipSolver`], including a
+/// window floor, phase-split outer deadline, and the backend's 24-hour clamp.
+fn objective_first_sat_budget(
+    enabled: bool,
+    backend: MipBackend,
+    one_sided_rows: usize,
+    requested_secs: f64,
+    historical_envelope_secs: f64,
+) -> Option<ObjectiveFirstSatBudget> {
+    if !enabled
+        || backend != MipBackend::Ay
+        || one_sided_rows != 1
+        || !requested_secs.is_finite()
+        || requested_secs < 0.1
+        || !historical_envelope_secs.is_finite()
+    {
+        return None;
+    }
+    const PROBE_FRACTION: f64 = 0.20;
+    const PROBE_CAP_SECS: f64 = 10.0;
+    let probe_secs = (requested_secs * PROBE_FRACTION).min(PROBE_CAP_SECS);
+    (probe_secs > 0.0
+        && historical_envelope_secs - probe_secs >= ObjectiveFirstSatBudget::MIN_FALLBACK_SECS)
+        .then_some(ObjectiveFirstSatBudget {
+            probe_secs,
+            envelope_secs: historical_envelope_secs,
+        })
+}
+
+fn objective_first_sat_fallback_config(
+    config: MipConfig,
+    budget: ObjectiveFirstSatBudget,
+    ledger: ObjectiveFirstSatLedger,
+) -> MipConfig {
+    MipConfig {
+        // The relative slice is the full historical envelope so an early
+        // decline can reclaim unused probe time.  The original absolute
+        // deadline—not this relative number—is the controlling wall cap.
+        timeout_secs: budget.envelope_secs,
+        ay_hard_deadline: Some(ledger.deadline),
+        ..config
+    }
+}
+
+/// Whether an unconfirmed feasibility witness may launch the historical
+/// robustness retry.
+///
+/// Required shared-prefix ingress owns exactly one feasibility session.  A
+/// SAT point that fails concrete replay is already demoted to Unknown and may
+/// not be shopped to a second solver, even if a future relational constraint
+/// becomes shiftable.
+fn unconfirmed_sat_retry_allowed(
+    feasibility_ingress: MipFeasibilityIngress,
+    solver_returned_sat: bool,
+    witness_confirmed: bool,
+) -> bool {
+    feasibility_ingress == MipFeasibilityIngress::Historical
+        && solver_returned_sat
+        && !witness_confirmed
 }
 
 /// Verify a sequential FC+ReLU network with the MILP pipeline on the ay
@@ -51,19 +662,119 @@ pub(super) fn verify_with_mip(
     input: &BoundedTensor,
     vnnlib: Option<&VnnLibSpec>,
     property: Option<&Path>,
+    model: Option<&Path>,
     epsilon: f32,
     threshold: f32,
-    timeout: u64,
+    deadline: std::time::Instant,
     warm_start_candidate: Option<&ArrayD<f32>>,
     mip_solver: crate::MipSolverArg,
+    reporting_start: std::time::Instant,
+    effective_treatment: &EffectiveTreatmentProjection,
     json: bool,
 ) -> Result<()> {
+    verify_with_mip_inner(
+        model_net,
+        input,
+        vnnlib,
+        property,
+        model,
+        epsilon,
+        threshold,
+        deadline,
+        warm_start_candidate,
+        mip_solver,
+        reporting_start,
+        effective_treatment,
+        json,
+        MipFeasibilityIngress::Historical,
+    )
+}
+
+/// Typed ingress for the narrowly admitted SafeNLP direct-first experiment.
+///
+/// This differs from [`verify_with_mip`] only in final feasibility routing:
+/// the in-process AY shared-binary-prefix session must be admitted, or the
+/// attempt fails closed without launching another MIP solver route.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_with_mip_requiring_safenlp_shared_prefix(
+    model_net: &BetaCrownModel,
+    input: &BoundedTensor,
+    vnnlib: Option<&VnnLibSpec>,
+    property: Option<&Path>,
+    model: Option<&Path>,
+    epsilon: f32,
+    threshold: f32,
+    deadline: std::time::Instant,
+    warm_start_candidate: Option<&ArrayD<f32>>,
+    mip_solver: crate::MipSolverArg,
+    reporting_start: std::time::Instant,
+    effective_treatment: &EffectiveTreatmentProjection,
+    json: bool,
+) -> Result<()> {
+    // Snapshot the third exact gate into typed caller-local state before any
+    // preprocessing or detached backend work. No later environment read can
+    // change this admitted session's solver entry.
+    let feasibility_ingress = required_safenlp_shared_prefix_ingress();
+    verify_with_mip_inner(
+        model_net,
+        input,
+        vnnlib,
+        property,
+        model,
+        epsilon,
+        threshold,
+        deadline,
+        warm_start_candidate,
+        mip_solver,
+        reporting_start,
+        effective_treatment,
+        json,
+        feasibility_ingress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_with_mip_inner(
+    model_net: &BetaCrownModel,
+    input: &BoundedTensor,
+    vnnlib: Option<&VnnLibSpec>,
+    property: Option<&Path>,
+    model: Option<&Path>,
+    epsilon: f32,
+    threshold: f32,
+    deadline: std::time::Instant,
+    warm_start_candidate: Option<&ArrayD<f32>>,
+    mip_solver: crate::MipSolverArg,
+    reporting_start: std::time::Instant,
+    effective_treatment: &EffectiveTreatmentProjection,
+    json: bool,
+    feasibility_ingress: MipFeasibilityIngress,
+) -> Result<()> {
     let backend = mip_solver.mip_backend();
+    let requires_safenlp_marked_margin_shared_prefix =
+        feasibility_ingress == MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
+    let requires_safenlp_shared_prefix = feasibility_ingress != MipFeasibilityIngress::Historical;
+    if requires_safenlp_shared_prefix {
+        anyhow::ensure!(
+            backend == MipBackend::Ay,
+            "required SafeNLP shared-prefix ingress needs the in-process AY backend"
+        );
+        anyhow::ensure!(
+            warm_start_candidate.is_none(),
+            "required SafeNLP shared-prefix ingress owns a cold session"
+        );
+    }
+    // A marked route owns the terminal answer even when that answer is
+    // timeout/unknown; the vnncomp caller must not reinterpret spare
+    // wall-clock as permission for APGD, a fallback, or a second solve.
+    capture_terminal_safenlp_ingress(feasibility_ingress);
     // MIP verification only supports sequential networks
     let network = match model_net {
         BetaCrownModel::Sequential(net) => net,
         BetaCrownModel::Graph(_) => {
-            anyhow::bail!("MIP verification only supports sequential networks (no residual/attention). Use --complete-verifier bab for DAG models.");
+            anyhow::bail!(
+                "MIP verification only supports sequential networks (no residual/attention). Use --complete-verifier bab for DAG models."
+            );
         }
     };
 
@@ -74,26 +785,23 @@ pub(super) fn verify_with_mip(
         );
     }
 
+    let initial_timeout_secs = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs_f64();
     let config = MipConfig {
         backend,
-        timeout_secs: timeout as f64,
+        parallel_split: sequential_mip_parallel_split(),
+        timeout_secs: initial_timeout_secs,
         lp_tighten: true, // Tighten CROWN-IBP bounds via LP relaxation before MIP (#3218)
+        ay_hard_deadline: (backend == MipBackend::Ay).then_some(deadline),
         ..Default::default()
     };
 
-    let start = std::time::Instant::now();
-
-    // Unfold Conv2d into an equivalent Linear layer before stripping shape ops;
-    // once unfolded, the following Flatten is a no-op. (#3218)
-    let mip_network = unfold_conv2d_to_linear(network, input.shape())?;
-    // Strip shape-only layers and fold constants for the flat MIP encoding.
-    let mip_network = strip_shape_layers(&mip_network);
-    let mip_network = fold_constant_layers(&mip_network)?;
-
-    // The encoder inserts ReLU after every non-final Linear.  Validate the
-    // original sequence exactly before erasing it into affine parameters; a
-    // membership-only Linear/ReLU check can certify a different network.
-    validate_mip_feedforward_topology(&mip_network)?;
+    // Canonicalize with the same authority used by pre-route admission.
+    // Conv2d is unfolded before shape-only layers are stripped, constants are
+    // folded with an exact-f64 bias sidecar, and the activation topology is
+    // validated before it is erased into affine parameters.
+    let mip_network = canonicalize_mip_feedforward_network(network, input.shape())?;
     let use_exact_single_hidden_fast_path = is_single_hidden_linear_relu_linear(&mip_network);
 
     // Keep original layer indices for `convert_intermediate_bounds()`. #3864
@@ -102,13 +810,17 @@ pub(super) fn verify_with_mip(
         collect_exact_single_hidden_intermediate_bounds(network, input)?
     } else {
         // General path: budgeted CROWN-IBP falls back to plain IBP after a
-        // short preprocessing deadline so HiGHS keeps most of the budget.
-        collect_mip_intermediate_bounds(
-            network,
-            input,
-            config.timeout_secs,
-            &PhaseBudgetConfig::default(),
-        )?
+        // short preprocessing deadline so the complete solver keeps most of
+        // the budget.
+        let policy = PhaseBudgetConfig::default();
+        let crown_budget =
+            intermediate_bounds::mip_crown_ibp_budget_secs(config.timeout_secs, &policy);
+        let now = std::time::Instant::now();
+        let crown_deadline = now
+            .checked_add(std::time::Duration::from_secs_f64(crown_budget))
+            .unwrap_or(deadline)
+            .min(deadline);
+        collect_mip_intermediate_bounds_with_deadline(network, input, Some(crown_deadline))?
     };
 
     // Extract weights/dimensions from the structural folded network, but use
@@ -134,15 +846,27 @@ pub(super) fn verify_with_mip(
     // LP tightening: tighter Big-M → faster B&B. Ref: α-β-CROWN bounds_core.py:37-92
     let intermediate_bounds_vec = if config.lp_tighten && !use_exact_single_hidden_fast_path {
         let tighten_start = std::time::Instant::now();
-        let tighten_config = MipConfig {
-            timeout_secs: config.timeout_secs * 0.1, // 10% of budget for LP
-            ..config
-        };
+        let lp_budget_secs = config.timeout_secs * 0.1;
+        let lp_deadline = tighten_start
+            .checked_add(std::time::Duration::from_secs_f64(lp_budget_secs))
+            .unwrap_or(deadline)
+            .min(deadline);
         let mut tightened = intermediate_bounds_vec;
         let mut total_stable = 0usize;
         let mut total_unstable = 0usize;
         // Progressive: rebuild tightener each layer so layer N uses tightened 0..N-1
         for layer_idx in 0..tightened.len() {
+            let live_remaining = lp_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs_f64();
+            if live_remaining <= 0.0 {
+                break;
+            }
+            let tighten_config = MipConfig {
+                timeout_secs: lp_budget_secs.min(live_remaining),
+                ay_hard_deadline: (backend == MipBackend::Ay).then_some(lp_deadline),
+                ..config
+            };
             let tightener = LpTightener::new(
                 weights.clone(),
                 biases.clone(),
@@ -174,17 +898,31 @@ pub(super) fn verify_with_mip(
         intermediate_bounds_vec
     };
 
-    // Subtract preprocessing time from MIP budget to stay within VNN-COMP deadline.
-    let preprocessing_elapsed = start.elapsed().as_secs_f64();
-    let mip_timeout_secs = (config.timeout_secs - preprocessing_elapsed).max(1.0);
+    // Derive the solve grant from the authoritative deadline *after*
+    // preprocessing. Never add a one-second floor: that used to overdraw a
+    // deadline already consumed by model conversion or bound tightening.
+    let mip_timeout_secs = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs_f64();
     let mip_config = MipConfig {
         timeout_secs: mip_timeout_secs,
+        feasibility_ingress,
         ..config
     };
 
     // Solve: handle disjunctive vs conjunctive properties
     let num_outputs = vnnlib.map(|s| s.num_outputs).unwrap_or(1);
-    let result = if let Some(spec) = vnnlib {
+    if requires_safenlp_shared_prefix {
+        anyhow::ensure!(
+            vnnlib
+                .and_then(certified_shared_tree_pairwise_indices)
+                .is_some(),
+            "required SafeNLP shared-prefix ingress needs one conjunctive relational unsafe row"
+        );
+    }
+    let result = if mip_timeout_secs <= 0.0 {
+        timeout_verification_result(num_outputs)
+    } else if let Some(spec) = vnnlib {
         if spec.is_disjunction && spec.output_constraint_clauses.len() > 1 {
             // Disjunctive property: solve each clause independently.
             // SAT on ANY clause → Violated. UNSAT on ALL → Verified.
@@ -198,6 +936,7 @@ pub(super) fn verify_with_mip(
                 &intermediate_bounds_vec,
                 spec,
                 mip_config,
+                deadline,
                 num_outputs,
                 json,
             )?
@@ -211,52 +950,200 @@ pub(super) fn verify_with_mip(
                 &intermediate_bounds_vec,
             )
             .map_err(|e| anyhow::anyhow!("MIP encoding failed: {}", e))?;
-            add_vnnlib_constraints(&mut encoder, spec)?;
-            let parts = encoder.into_parts();
-            let warm_start_cols = warm_start_candidate.and_then(|candidate| {
-                build_warm_start_vector(
-                    candidate,
-                    &weights,
-                    &biases,
-                    &layer_dims,
-                    &intermediate_bounds_vec,
-                    parts.num_cols,
-                )
-            });
-            let solver = MipSolver::new(parts, mip_config);
-            let mip_result = solver
-                .check_feasibility_with_warm_start(warm_start_cols.as_deref())
-                .map_err(|e| anyhow::anyhow!("MIP solve failed: {}", e))?;
-            // Soundness gate: clamp + independent forward revalidation before
-            // claiming Violated. Constraints are the same conjunction fed to the
-            // encoder by add_vnnlib_constraints.
-            let conjunctive_constraints = conjunctive_constraints_owned(spec);
-            let was_sat = matches!(&mip_result, MipResult::Sat { .. });
-            let revalidated = map_mip_result_revalidated(
-                mip_result,
-                network,
-                input,
-                &conjunctive_constraints,
-                num_outputs,
+            // Required ingress owns this final feasibility attempt. Plain
+            // required ingress forbids a marker; marked required ingress
+            // requires the unique unsafe row marker. Historical callers retain
+            // the existing environment-gated margin behavior.
+            let margin_reframe_enabled = match feasibility_ingress {
+                MipFeasibilityIngress::Historical => ay_margin_reframe_enabled(),
+                MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix => false,
+                MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix => true,
+            };
+            let shared_tree_preclone_eligible = certified_shared_tree_preclone_eligible(
+                !requires_safenlp_shared_prefix && mip_certified_shared_tree_enabled(),
+                margin_reframe_enabled,
+                backend,
+                use_exact_single_hidden_fast_path,
+                spec,
+                deadline,
             );
-            if was_sat && !matches!(revalidated, VerificationResult::Violated { .. }) {
-                // Solver-tolerance witness: re-solve with a violation slack for
-                // a robust one (see retry_with_violation_slack).
-                retry_with_violation_slack(
-                    network,
-                    input,
-                    &weights,
-                    &biases,
-                    &layer_dims,
-                    &input_bounds,
-                    &intermediate_bounds_vec,
-                    &conjunctive_constraints,
-                    mip_config,
-                    num_outputs,
-                )
-                .unwrap_or(revalidated)
+            // The proof model must not contain the unsafe row: retain this
+            // exact clone before `add_vnnlib_constraints` stamps it.
+            let certified_shared_tree_base =
+                shared_tree_preclone_eligible.then(|| encoder.clone().into_parts());
+            let unsafe_rows = add_vnnlib_constraints(&mut encoder, spec)?;
+            let mut parts = encoder.into_parts();
+            let marked_margin = maybe_mark_unique_ay_margin(
+                margin_reframe_enabled,
+                backend,
+                &mut parts,
+                &unsafe_rows,
+            )?;
+            if requires_safenlp_marked_margin_shared_prefix {
+                anyhow::ensure!(
+                    marked_margin
+                        && unsafe_rows.len() == 1
+                        && parts.problem.margin_row() == Some(unsafe_rows[0]),
+                    "required SafeNLP marked-margin ingress lost the unique unsafe row identity"
+                );
+            }
+            if marked_margin {
+                tracing::info!(
+                    row = unsafe_rows[0].0,
+                    shared_prefix_required = requires_safenlp_marked_margin_shared_prefix,
+                    "AY direct-MIP margin reframe armed for the unique unsafe row"
+                );
+            }
+            let certified_shared_tree = certified_shared_tree_base.as_ref().and_then(|base| {
+                let plan = certified_shared_tree_plan(shared_tree_preclone_eligible, spec, base)?;
+                try_certified_shared_tree(base, &plan, deadline)
+            });
+            if let Some(certified) = certified_shared_tree {
+                tracing::info!(
+                    proof_route = ?certified.proof_route,
+                    ay_tree_leaves = certified.ay_tree_leaves,
+                    ny_cert_replays = certified.ny_cert_farkas_replays,
+                    "certified shared-tree canary excluded the unique pairwise unsafe region"
+                );
+                VerificationResult::Verified {
+                    provenance: Default::default(),
+                    output_bounds: vec![
+                        Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY,);
+                        num_outputs
+                    ],
+                    proof: None,
+                    actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+                }
+            } else if std::time::Instant::now() >= deadline {
+                // The proof attempt consumed the original caller-owned
+                // envelope. Do not construct or launch the historical
+                // unsafe-row solve after that deadline.
+                timeout_verification_result(num_outputs)
             } else {
-                revalidated
+                let warm_start_cols = warm_start_candidate.and_then(|candidate| {
+                    build_warm_start_vector(
+                        candidate,
+                        &weights,
+                        &biases,
+                        &layer_dims,
+                        &intermediate_bounds_vec,
+                        parts.num_cols,
+                    )
+                });
+                // Soundness gate: clamp + independent forward revalidation
+                // before claiming Violated. The fallback receives only time
+                // still remaining under the original absolute deadline.
+                let conjunctive_constraints = conjunctive_constraints_owned(spec);
+                let live_timeout = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f64();
+                let mip_config = MipConfig {
+                    timeout_secs: mip_config.timeout_secs.min(live_timeout),
+                    ..mip_config
+                };
+                let mut solver = MipSolver::new(parts, mip_config);
+                let objective_schedule =
+                    if !requires_safenlp_shared_prefix && ay_objective_first_sat_enabled() {
+                        objective_first_sat_budget(
+                            true,
+                            backend,
+                            unsafe_rows.len(),
+                            mip_config.timeout_secs,
+                            solver.effective_feasibility_timeout_secs(),
+                        )
+                        .and_then(|budget| {
+                            ObjectiveFirstSatLedger::start(budget, mip_config.ay_hard_deadline)
+                                .map(|ledger| (budget, ledger))
+                        })
+                    } else {
+                        None
+                    };
+                let objective_hit = objective_schedule.and_then(|(budget, ledger)| {
+                    let probe_secs = ledger.probe_secs(budget)?;
+                    tracing::info!(
+                        probe_secs,
+                        historical_envelope_secs = budget.envelope_secs,
+                        nominal_fallback_secs = budget
+                            .fallback_secs_after_elapsed(budget.probe_secs)
+                            .unwrap_or(0.0),
+                        "AY objective-first SAT lane: probing inside the historical wall envelope"
+                    );
+                    let hit = revalidate_objective_first_sat_probe(
+                        solver.probe_one_sided_sat_until(
+                            unsafe_rows[0],
+                            probe_secs,
+                            ledger.deadline,
+                        ),
+                        network,
+                        input,
+                        &conjunctive_constraints,
+                        num_outputs,
+                    );
+                    if ledger.expired() {
+                        None
+                    } else {
+                        hit
+                    }
+                });
+                if let Some(hit) = objective_hit {
+                    hit
+                } else {
+                    let fallback_config = match objective_schedule {
+                        Some((budget, ledger)) => {
+                            solver
+                                .set_ay_hard_deadline(budget.envelope_secs, ledger.deadline)
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "invalid objective-first fallback deadline: {e}"
+                                    )
+                                })?;
+                            objective_first_sat_fallback_config(mip_config, budget, ledger)
+                        }
+                        None => mip_config,
+                    };
+                    let mip_result = solver
+                        .check_feasibility_with_warm_start(warm_start_cols.as_deref())
+                        .map_err(|e| anyhow::anyhow!("MIP solve failed: {}", e))?;
+                    let was_sat = matches!(&mip_result, MipResult::Sat { .. });
+                    let revalidated = map_mip_result_revalidated(
+                        mip_result,
+                        network,
+                        input,
+                        &conjunctive_constraints,
+                        num_outputs,
+                    );
+                    if unconfirmed_sat_retry_allowed(
+                        feasibility_ingress,
+                        was_sat,
+                        matches!(revalidated, VerificationResult::Violated { .. }),
+                    ) {
+                        // Solver-tolerance witness: re-solve with a violation
+                        // slack for a robust one.
+                        let retry_config = MipConfig {
+                            timeout_secs: fallback_config.timeout_secs.min(
+                                deadline
+                                    .saturating_duration_since(std::time::Instant::now())
+                                    .as_secs_f64(),
+                            ),
+                            ..fallback_config
+                        };
+                        retry_with_violation_slack(
+                            network,
+                            input,
+                            &weights,
+                            &biases,
+                            &layer_dims,
+                            &input_bounds,
+                            &intermediate_bounds_vec,
+                            &conjunctive_constraints,
+                            retry_config,
+                            num_outputs,
+                        )
+                        .unwrap_or(revalidated)
+                    } else {
+                        revalidated
+                    }
+                }
             }
         }
     } else {
@@ -274,7 +1161,16 @@ pub(super) fn verify_with_mip(
             .constrain_output_leq_const(0, threshold as f64)
             .map_err(|e| anyhow::anyhow!("constraint failed: {}", e))?;
         let parts = encoder.into_parts();
-        let solver = MipSolver::new(parts, mip_config);
+        let live_timeout = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64();
+        let solver = MipSolver::new(
+            parts,
+            MipConfig {
+                timeout_secs: mip_config.timeout_secs.min(live_timeout),
+                ..mip_config
+            },
+        );
         // Non-VNNLIB path: no PGD candidate available, warm-start not applicable.
         let mip_result = solver
             .check_feasibility_with_warm_start(None)
@@ -291,14 +1187,34 @@ pub(super) fn verify_with_mip(
             num_outputs,
         )
     };
-    let elapsed = start.elapsed();
+    // Solver/forward APIs are synchronous and may return a fraction after
+    // their requested timeout. A late mathematical decision is not admissible
+    // for this bounded attempt.
+    let result = if std::time::Instant::now() >= deadline {
+        timeout_verification_result(num_outputs)
+    } else {
+        result
+    };
+    let elapsed = reporting_start.elapsed();
 
     // Output results
-    print_result(
-        &result, property, epsilon, threshold, elapsed, backend, json,
+    let publication_refused = print_result(
+        &result,
+        property,
+        model,
+        epsilon,
+        threshold,
+        elapsed,
+        backend,
+        Some(effective_treatment),
+        json,
     )?;
 
-    let exit_code = verification_result_exit_code(&result);
+    let exit_code = if publication_refused {
+        crate::commands::verify::exit_codes::UNKNOWN
+    } else {
+        verification_result_exit_code(&result)
+    };
     if exit_code != crate::commands::verify::exit_codes::VERIFIED && !super::output::is_capturing()
     {
         std::process::exit(exit_code);
@@ -328,7 +1244,10 @@ fn conjunctive_constraints_owned(spec: &VnnLibSpec) -> Vec<OutputConstraint> {
 /// Add VNNLIB output constraints to the MIP encoder (conjunctive only).
 ///
 /// Disjunctive specs are handled by `solve_disjunctive` upstream.
-fn add_vnnlib_constraints(encoder: &mut ny_mip::MipEncoder, spec: &VnnLibSpec) -> Result<()> {
+fn add_vnnlib_constraints(
+    encoder: &mut ny_mip::MipEncoder,
+    spec: &VnnLibSpec,
+) -> Result<Vec<ny_mip::ir::Row>> {
     let constraints = if !spec.output_constraint_clauses.is_empty() {
         spec.output_constraint_clauses
             .iter()
@@ -338,10 +1257,11 @@ fn add_vnnlib_constraints(encoder: &mut ny_mip::MipEncoder, spec: &VnnLibSpec) -
         spec.output_constraints.iter().collect::<Vec<_>>()
     };
 
+    let mut rows = Vec::with_capacity(constraints.len());
     for constraint in constraints {
-        encode_output_constraint(encoder, constraint)?;
+        rows.push(encode_output_constraint(encoder, constraint)?);
     }
-    Ok(())
+    Ok(rows)
 }
 
 /// Solve disjunctive VNNLIB property by solving each clause independently.
@@ -364,6 +1284,7 @@ fn solve_disjunctive(
     intermediate_bounds: &[Vec<Bound>],
     spec: &VnnLibSpec,
     config: MipConfig,
+    deadline: std::time::Instant,
     num_outputs: usize,
     json: bool,
 ) -> Result<VerificationResult> {
@@ -385,9 +1306,6 @@ fn solve_disjunctive(
     // failed in-box revalidation. The clause's unsafe region IS reachable, so we
     // must NOT conclude Verified — only the concrete witness is unconfirmed.
     let mut had_unconfirmed_sat = false;
-    let overall_start = std::time::Instant::now();
-    let overall_budget = std::time::Duration::from_secs_f64(config.timeout_secs);
-
     // Progressive multi-round schedule (#malbeware-mip-budget): the first pass
     // gives every clause `remaining / remaining_clauses`; clauses that hit that
     // slice (Timeout/Error) are RETRIED while overall budget remains, with the
@@ -434,7 +1352,7 @@ fn solve_disjunctive(
             break;
         }
         if round > 0 {
-            let remaining = overall_budget.saturating_sub(overall_start.elapsed());
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             // A retry round needs a meaningful slice to make progress; stop
             // once the tail budget is exhausted (< 1s per pending clause).
             if remaining.as_secs_f64() < pending.len() as f64 {
@@ -456,16 +1374,13 @@ fn solve_disjunctive(
             let clause = &spec.output_constraint_clauses[clause_idx];
             // Adaptive per-clause timeout: remaining budget / remaining clauses
             // in this round. Prevents early clauses from consuming the budget.
-            let elapsed = overall_start.elapsed();
-            if elapsed >= overall_budget {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 // Out of budget: everything not yet decided stays pending.
                 pending.extend(round_pending[pos..].iter().copied());
                 break 'rounds;
             }
-            let remaining_secs = overall_budget
-                .checked_sub(elapsed)
-                .expect("guarded above: elapsed < overall_budget")
-                .as_secs_f64();
+            let remaining_secs = deadline.duration_since(now).as_secs_f64();
             let remaining_clauses = (round_total - pos).max(1) as f64;
             let clause_timeout = remaining_secs / remaining_clauses;
             let clause_config = MipConfig {
@@ -475,12 +1390,99 @@ fn solve_disjunctive(
 
             let mut encoder = base_encoder.clone();
 
+            let mut unsafe_rows = Vec::with_capacity(clause.len());
             for constraint in clause {
-                encode_output_constraint(&mut encoder, constraint)?;
+                unsafe_rows.push(encode_output_constraint(&mut encoder, constraint)?);
             }
+            let clause_config = MipConfig {
+                timeout_secs: clause_config.timeout_secs.min(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs_f64(),
+                ),
+                ..clause_config
+            };
 
-            let parts = encoder.into_parts();
-            let solver = MipSolver::new(parts, clause_config);
+            // Probe each clause at most once.  Retry rounds spend all of their
+            // enlarged tail slice on the historical feasibility/certificate
+            // solve.
+            let mut parts = encoder.into_parts();
+            if maybe_mark_unique_ay_margin(
+                ay_margin_reframe_enabled(),
+                config.backend,
+                &mut parts,
+                &unsafe_rows,
+            )? {
+                tracing::info!(
+                    clause = clause_idx,
+                    row = unsafe_rows[0].0,
+                    "AY direct-MIP margin reframe armed for one disjunctive unsafe row"
+                );
+            }
+            let mut solver = MipSolver::new(parts, clause_config);
+            let objective_schedule = if round == 0 && ay_objective_first_sat_enabled() {
+                objective_first_sat_budget(
+                    true,
+                    config.backend,
+                    unsafe_rows.len(),
+                    clause_timeout,
+                    solver.effective_feasibility_timeout_secs(),
+                )
+                .and_then(|budget| {
+                    ObjectiveFirstSatLedger::start(budget, clause_config.ay_hard_deadline)
+                        .map(|ledger| (budget, ledger))
+                })
+            } else {
+                None
+            };
+            if let Some((budget, ledger)) = objective_schedule {
+                if let Some(probe_secs) = ledger.probe_secs(budget) {
+                    tracing::info!(
+                        clause = clause_idx,
+                        probe_secs,
+                        historical_envelope_secs = budget.envelope_secs,
+                        nominal_fallback_secs = budget
+                            .fallback_secs_after_elapsed(budget.probe_secs)
+                            .unwrap_or(0.0),
+                        "AY objective-first SAT lane: probing one disjunctive unsafe row inside \
+                         the historical wall envelope"
+                    );
+                    let hit = revalidate_objective_first_sat_probe(
+                        solver.probe_one_sided_sat_until(
+                            unsafe_rows[0],
+                            probe_secs,
+                            ledger.deadline,
+                        ),
+                        network,
+                        input,
+                        clause,
+                        num_outputs,
+                    );
+                    if !ledger.expired() {
+                        if let Some(hit) = hit {
+                            if !json {
+                                println!(
+                                    "  Clause {}/{}: SAT (AY objective-first candidate replayed)",
+                                    clause_idx + 1,
+                                    num_clauses
+                                );
+                            }
+                            return Ok(hit);
+                        }
+                    }
+                }
+            }
+            let fallback_config = match objective_schedule {
+                Some((budget, ledger)) => {
+                    solver
+                        .set_ay_hard_deadline(budget.envelope_secs, ledger.deadline)
+                        .map_err(|e| {
+                            anyhow::anyhow!("invalid objective-first clause fallback deadline: {e}")
+                        })?;
+                    objective_first_sat_fallback_config(clause_config, budget, ledger)
+                }
+                None => clause_config,
+            };
             let mip_result = solver
                 .check_feasibility_cached(None, &mut split_caches[clause_idx])
                 .map_err(|e| anyhow::anyhow!("MIP solve failed on clause {}: {}", clause_idx, e))?;
@@ -508,6 +1510,14 @@ fn solve_disjunctive(
                         _ => {
                             // Solver-tolerance witness: re-solve this clause with a
                             // violation slack for a robust one.
+                            let retry_config = MipConfig {
+                                timeout_secs: fallback_config.timeout_secs.min(
+                                    deadline
+                                        .saturating_duration_since(std::time::Instant::now())
+                                        .as_secs_f64(),
+                                ),
+                                ..fallback_config
+                            };
                             if let Some(v) = retry_with_violation_slack(
                                 network,
                                 input,
@@ -517,7 +1527,7 @@ fn solve_disjunctive(
                                 input_bounds,
                                 intermediate_bounds,
                                 clause,
-                                clause_config,
+                                retry_config,
                                 num_outputs,
                             ) {
                                 if !json {
@@ -645,19 +1655,19 @@ fn disjunctive_proof_status(
 fn encode_output_constraint(
     encoder: &mut ny_mip::MipEncoder,
     constraint: &OutputConstraint,
-) -> Result<()> {
+) -> Result<ny_mip::ir::Row> {
     let r = match constraint {
         OutputConstraint::LessEq(i, j) | OutputConstraint::LessThan(i, j) => {
-            encoder.constrain_output_leq(*i, *j)
+            encoder.constrain_output_leq_row(*i, *j)
         }
         OutputConstraint::GreaterEq(i, j) | OutputConstraint::GreaterThan(i, j) => {
-            encoder.constrain_output_geq(*i, *j)
+            encoder.constrain_output_geq_row(*i, *j)
         }
         OutputConstraint::LessEqConst(i, c) | OutputConstraint::LessThanConst(i, c) => {
-            encoder.constrain_output_leq_const(*i, *c)
+            encoder.constrain_output_leq_const_row(*i, *c)
         }
         OutputConstraint::GreaterEqConst(i, c) | OutputConstraint::GreaterThanConst(i, c) => {
-            encoder.constrain_output_geq_const(*i, *c)
+            encoder.constrain_output_geq_const_row(*i, *c)
         }
         _ => return Err(anyhow::anyhow!("unsupported OutputConstraint variant")),
     };
@@ -665,24 +1675,35 @@ fn encode_output_constraint(
 }
 
 /// Print verification result in human-readable or JSON format.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn print_result(
     result: &VerificationResult,
     property: Option<&Path>,
+    model: Option<&Path>,
     epsilon: f32,
     threshold: f32,
     elapsed: std::time::Duration,
     backend: MipBackend,
+    effective_treatment: Option<&EffectiveTreatmentProjection>,
     json: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if json {
         let method = match backend {
             MipBackend::Ay => "mip-ay",
             MipBackend::AyProc => "mip-ay-proc",
         };
-        let rendered =
-            format_verification_result_json(result, property, epsilon, threshold, elapsed, method)?;
+        let (rendered, publication_refused) = format_verification_result_json_for_publication(
+            result,
+            property,
+            model,
+            epsilon,
+            threshold,
+            elapsed,
+            method,
+            effective_treatment,
+        )?;
         super::output::emit_competition_json(&rendered);
-        return Ok(());
+        return Ok(publication_refused);
     }
     match result {
         VerificationResult::Verified { .. } => println!("Status: VERIFIED (safe)"),
@@ -693,8 +1714,12 @@ pub(super) fn print_result(
         } => {
             println!("Status: VIOLATED (unsafe)");
             println!("Counterexample input: {:?}", counterexample);
-            if let Some(out) = output.first() {
-                println!("Counterexample output: {}", out);
+            let applied_terminal_peel = effective_treatment
+                .map(EffectiveTreatmentProjection::terminal_peel_activation)
+                .unwrap_or_default();
+            let (label, displayed_output) = applied_terminal_peel.human_witness_output(output);
+            if let Some(out) = displayed_output.first() {
+                println!("{label}: {out}");
             }
         }
         VerificationResult::Timeout { .. } => println!("Status: TIMEOUT"),
@@ -705,7 +1730,7 @@ pub(super) fn print_result(
     }
     println!("Method: MIP ({} solver)", backend_name(backend));
     println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
-    Ok(())
+    Ok(false)
 }
 
 /// Map a non-SAT MIP result (Unsat / Timeout / Error) to a `VerificationResult`.
@@ -857,7 +1882,24 @@ fn retry_with_violation_slack(
         return None; // nothing shiftable — no robustness to gain
     }
 
+    let hard_remaining = || {
+        config.ay_hard_deadline.and_then(|deadline| {
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| {
+                    remaining.as_secs_f64() >= ObjectiveFirstSatBudget::MIN_FALLBACK_SECS
+                })
+                .map(|remaining| remaining.as_secs_f64())
+        })
+    };
+    if config.ay_hard_deadline.is_some() && hard_remaining().is_none() {
+        return None;
+    }
+
     let solve = |cs: &[OC], secs: f64| -> Option<MipResult> {
+        if config.ay_hard_deadline.is_some() && hard_remaining().is_none() {
+            return None;
+        }
         let mut enc = encode_feedforward(
             weights,
             biases,
@@ -869,6 +1911,11 @@ fn retry_with_violation_slack(
         for c in cs {
             encode_output_constraint(&mut enc, c).ok()?;
         }
+        // Encoding is outside AY's worker, but inside the caller's absolute
+        // ledger. Recheck after it so setup can never buy a fresh solve slice.
+        if config.ay_hard_deadline.is_some() && hard_remaining().is_none() {
+            return None;
+        }
         let cfg = MipConfig {
             timeout_secs: secs,
             ..config
@@ -878,10 +1925,17 @@ fn retry_with_violation_slack(
             .ok()
     };
 
-    // Budget: half the remaining time, split across an initial diagnostic solve plus
-    // the delta sweep, so the retry can never overrun the wall clock.
-    let budget = (config.timeout_secs * 0.5).max(4.0);
-    let per_try = (budget / (VIOLATION_SLACKS.len() + 1) as f64).max(1.0);
+    // Budget: half the caller's live remaining time, split across an initial
+    // diagnostic solve plus the delta sweep. Do not impose a minimum floor:
+    // doing so can turn a sub-second tail into several seconds beyond the
+    // authoritative deadline.
+    let retry_budget = config.timeout_secs.max(0.0) * 0.5;
+    let retry_budget =
+        hard_remaining().map_or(retry_budget, |remaining| retry_budget.min(remaining));
+    let per_try = retry_budget / (VIOLATION_SLACKS.len() + 1) as f64;
+    if !per_try.is_finite() || per_try < ObjectiveFirstSatBudget::MIN_FALLBACK_SECS {
+        return None;
+    }
 
     // Diagnose WHICH constraints miss the independent real forward. Strengthening a
     // constraint that already holds with margin only shrinks the feasible set on that
@@ -891,6 +1945,9 @@ fn retry_with_violation_slack(
     // constraints the witness missed; leave the satisfied ones at their thresholds.
     let mut failing = vec![false; constraints.len()];
     if let Some(MipResult::Sat { input_values, .. }) = solve(constraints, per_try) {
+        if config.ay_hard_deadline.is_some() && hard_remaining().is_none() {
+            return None;
+        }
         let clamped = clamp_witness_to_box(&input_values, input);
         if let Ok(out) = independent_mip_forward(network, &clamped) {
             for (idx, c) in constraints.iter().enumerate() {
@@ -924,6 +1981,9 @@ fn retry_with_violation_slack(
     };
 
     for &delta in &VIOLATION_SLACKS {
+        if config.ay_hard_deadline.is_some() && hard_remaining().is_none() {
+            return None;
+        }
         let strengthened = strengthen(delta);
         if strengthened == constraints {
             continue; // this delta shifted nothing (shouldn't happen post-guard)
@@ -939,6 +1999,9 @@ fn retry_with_violation_slack(
         if let v @ VerificationResult::Violated { .. } =
             map_mip_result_revalidated(mip_result, network, input, constraints, num_outputs)
         {
+            if config.ay_hard_deadline.is_some() && hard_remaining().is_none() {
+                return None;
+            }
             tracing::warn!("violation-slack retry recovered a robust witness (delta {delta:.0e})");
             return Some(v);
         }
@@ -1189,7 +2252,47 @@ fn map_mip_result_revalidated(
     }
 }
 
-// #3865: Warm-start vector builder for the sequential PGD→HiGHS path.
+/// Replay a witness-only AY objective probe through the unchanged concrete
+/// network/property gate.
+///
+/// A rejected point and every declined probe return `None`, which tells the
+/// caller to run the historical feasibility path.  The enclosing VNN-COMP
+/// command subsequently subjects any returned `Violated` to its trusted-ORT
+/// replay before emitting `sat`.
+fn revalidate_objective_first_sat_probe(
+    probe: OneSidedSatProbe,
+    network: &Network,
+    input: &BoundedTensor,
+    constraints: &[OutputConstraint],
+    num_outputs: usize,
+) -> Option<VerificationResult> {
+    let OneSidedSatProbe::Witness(witness) = probe else {
+        tracing::debug!("AY objective-first SAT probe declined: {probe:?}");
+        return None;
+    };
+    let candidate = MipResult::Sat {
+        objective: witness.objective,
+        output_values: witness.output_values,
+        input_values: witness.input_values,
+        dual_bound: None,
+    };
+    let replayed = map_mip_result_revalidated(candidate, network, input, constraints, num_outputs);
+    if matches!(replayed, VerificationResult::Violated { .. }) {
+        tracing::info!(
+            "AY objective-first SAT candidate passed concrete forward/spec replay; \
+             trusted-ORT replay remains authoritative at the VNN-COMP seam"
+        );
+        Some(replayed)
+    } else {
+        tracing::debug!(
+            "AY objective-first SAT candidate failed concrete replay; falling back to \
+             historical feasibility"
+        );
+        None
+    }
+}
+
+// #3865: Warm-start vector builder for the sequential PGD→MIP path.
 #[path = "mip_highs_warm_start.rs"]
 pub(super) mod warm_start;
 

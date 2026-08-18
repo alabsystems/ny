@@ -26,6 +26,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::vnncomp_2026_tracks::{EXTENDED_TRACK_2026, REGULAR_TRACK_2026};
+
 /// Live evaluation platform (the pre-2025 vnncomp.christopher-brix.de host
 /// 307-redirects here; GETs follow redirects so either URL works).
 const DEFAULT_PLATFORM_URL: &str = "https://vnn.repeatability.cps.cit.tum.de";
@@ -33,46 +35,6 @@ const DEFAULT_PLATFORM_URL: &str = "https://vnn.repeatability.cps.cit.tum.de";
 /// Environment variable consulted for the platform password before the
 /// credentials file.
 const PASSWORD_ENV: &str = "NY_VNNCOMP_PASSWORD";
-
-/// Regular-track benchmark ids as hardcoded in the platform SPA bundle
-/// (constant year '2026') and announced in vnncomp2026 issue #6 (2026-06-07
-/// benchmark-voting results: >=50% of the 8 tool-author votes).
-const REGULAR_TRACK_2026: [&str; 24] = [
-    "acasxu_2023",
-    "cersyve",
-    "cgan2026",
-    "challenging_certified_training_2026",
-    "cifar100_2024",
-    "collins_rul_cnn_2022",
-    "cora_2024",
-    "dist_shift_2023",
-    "linearizenn_2024",
-    "lsnc_relu",
-    "malbeware",
-    "metaroom_2023",
-    "ml4acopf_2024",
-    "nn4sys",
-    "relusplitter_2026",
-    "safenlp_2024",
-    "sat_relu",
-    "soundnessbench_2026",
-    "tinyimagenet_2024",
-    "tllverifybench_2023",
-    "traffic_signs_recognition_2023",
-    "vggnet16_2022",
-    "vit_2023",
-    "yolo_2023",
-];
-
-/// Extended-track benchmark ids (>=1 vote, not regular; same sources).
-const EXTENDED_TRACK_2026: [&str; 6] = [
-    "adaptive_cruise_control_non_linear_2026",
-    "cctsdb_yolo_2023",
-    "collins_aerospace_benchmark",
-    "isomorphic_acasxu_2026",
-    "monotonic_acasxu_2026",
-    "smart_turn_multimodal_2026",
-];
 
 /// Evaluation-chair contacts listed on the platform landing page.
 const EVALUATION_CHAIRS: [(&str, &str); 2] = [
@@ -259,11 +221,13 @@ pub(crate) struct SubmitArgs {
     #[arg(long, default_value = "NY")]
     name: String,
 
-    /// Git clone URL (default: this repo's `origin` remote).
+    /// Git clone URL. Supply this together with --commit to explicitly
+    /// override the clean, live-upstream-verified current branch.
     #[arg(long)]
     repository: Option<String>,
 
-    /// Commit hash to submit (default: current HEAD).
+    /// Commit hash. Supply this together with --repository to explicitly
+    /// override the clean, live-upstream-verified current branch.
     #[arg(long)]
     commit: Option<String>,
 
@@ -275,7 +239,9 @@ pub(crate) struct SubmitArgs {
     #[arg(long)]
     email: Option<String>,
 
-    /// Print gates + payload without POSTing (works offline).
+    /// Print gates + payload without POSTing. For fully offline use, explicitly
+    /// supply both --repository and --commit; implicit source selection queries
+    /// the configured live upstream.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
@@ -314,11 +280,13 @@ pub(crate) struct RequestEmailArgs {
     #[arg(long, value_enum, default_value_t = InstanceType::Cpu)]
     instance_type: InstanceType,
 
-    /// Git clone URL (default: this repo's `origin` remote).
+    /// Git clone URL. Supply this together with --commit to explicitly
+    /// override the clean, live-upstream-verified current branch.
     #[arg(long)]
     repository: Option<String>,
 
-    /// Commit hash quoted in the draft (default: current HEAD).
+    /// Commit hash quoted in the draft. Supply this together with --repository
+    /// to explicitly override the clean, live-upstream-verified current branch.
     #[arg(long)]
     commit: Option<String>,
 
@@ -354,7 +322,7 @@ fn handle_task(id: u64, platform: &PlatformOpts) -> Result<()> {
         bail!(
             "task-status for {id} returned HTTP {}: {}",
             resp.status,
-            resp.body.trim()
+            diagnostic_body(&resp.body)
         );
     }
     let status = resp.json().unwrap_or(Value::Null);
@@ -373,21 +341,155 @@ fn handle_task(id: u64, platform: &PlatformOpts) -> Result<()> {
             done.map_or_else(|| "?".to_string(), |flag| flag.to_string())
         );
         if let Some(output) = status.get("output").and_then(Value::as_str) {
-            println!("  output: {output}");
+            println!("  output: {}", diagnostic_body(output));
         }
-        println!("  web:    {}/toolkit/submission/{id}", client.base);
+        println!(
+            "  web:    {}/toolkit/submission/{id}",
+            redact_url(&client.base)
+        );
     }
     Ok(())
 }
 
 fn emit_json(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    println!("{}", serde_json::to_string_pretty(&redact_value(value))?);
     Ok(())
 }
 
 /// Parse a response body as JSON, falling back to the trimmed raw string.
 fn body_value(body: &str) -> Value {
-    serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.trim().to_string()))
+    let parsed =
+        serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.trim().to_string()));
+    redact_value(&parsed)
+}
+
+fn diagnostic_body(body: &str) -> String {
+    serde_json::from_str::<Value>(body).map_or_else(
+        |_| redact_text(body.trim()),
+        |value| {
+            serde_json::to_string(&redact_value(&value))
+                .unwrap_or_else(|_| "<unprintable response>".to_string())
+        },
+    )
+}
+
+const REDACTED: &str = "[REDACTED]";
+
+fn sensitive_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "cookie",
+        "csrf",
+        "authorization",
+        "credential",
+        "apikey",
+        "accesskey",
+        "signature",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+/// Remove userinfo and query/fragment values from a URL before it reaches any
+/// human- or machine-readable output. The unredacted URL remains available
+/// internally for the actual git/curl operation.
+fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+    let authority = &url[authority_start..authority_end];
+    let safe_authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    let mut redacted = String::with_capacity(url.len());
+    redacted.push_str(&url[..authority_start]);
+    redacted.push_str(safe_authority);
+
+    let suffix = &url[authority_end..];
+    let (before_fragment, has_fragment) = suffix
+        .split_once('#')
+        .map_or((suffix, false), |(before, _)| (before, true));
+    if let Some((path, query)) = before_fragment.split_once('?') {
+        redacted.push_str(path);
+        redacted.push('?');
+        for (index, part) in query.split('&').enumerate() {
+            if index != 0 {
+                redacted.push('&');
+            }
+            if let Some((key, _)) = part.split_once('=') {
+                redacted.push_str(key);
+                redacted.push('=');
+                redacted.push_str(REDACTED);
+            } else if !part.is_empty() {
+                redacted.push_str(REDACTED);
+            }
+        }
+    } else {
+        redacted.push_str(before_fragment);
+    }
+    if has_fragment {
+        redacted.push('#');
+        redacted.push_str(REDACTED);
+    }
+    redacted
+}
+
+/// Redact URL credentials even when a diagnostic embeds a URL in prose.
+fn redact_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative_scheme) = text[cursor..].find("://") {
+        let scheme_mark = cursor + relative_scheme;
+        let start = text[cursor..scheme_mark]
+            .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')))
+            .map_or(cursor, |index| cursor + index + 1);
+        output.push_str(&text[cursor..start]);
+
+        let end = text[scheme_mark + 3..]
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '<' | '>'))
+            .map_or(text.len(), |offset| scheme_mark + 3 + offset);
+        output.push_str(&redact_url(&text[start..end]));
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn redact_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if sensitive_key(key) {
+                        Value::String(REDACTED.to_string())
+                    } else {
+                        redact_value(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_value).collect()),
+        Value::String(text) => Value::String(redact_text(text)),
+        other => other.clone(),
+    }
+}
+
+fn diagnostic_path(path: &Path) -> String {
+    redact_text(&path.display().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +521,19 @@ struct PlatformClient {
     jar: PathBuf,
 }
 
+fn curl_command() -> Command {
+    let mut command = Command::new("curl");
+    // curl only honors -q/--disable when it is the first argument.
+    command.arg("-q");
+    command
+}
+
+fn apply_redirect_policy(command: &mut Command, allow_redirects: bool) {
+    if allow_redirects {
+        command.arg("-L").arg("--max-redirs").arg("5");
+    }
+}
+
 impl PlatformClient {
     fn new(opts: &PlatformOpts) -> Result<Self> {
         let jar = match &opts.cookie_jar {
@@ -426,11 +541,16 @@ impl PlatformClient {
             None => state_dir()?.join("vnncomp2026.cookies"),
         };
         if let Some(parent) = jar.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", diagnostic_path(parent)))?;
         }
         let base = opts.platform_url.trim_end_matches('/').to_string();
-        let host = url_host(&base)
-            .ok_or_else(|| anyhow!("cannot extract a host from platform url '{base}'"))?;
+        let host = url_host(&base).ok_or_else(|| {
+            anyhow!(
+                "cannot extract a host from platform url '{}'",
+                redact_url(&base)
+            )
+        })?;
         Ok(Self { base, host, jar })
     }
 
@@ -441,15 +561,19 @@ impl PlatformClient {
         body: Option<(&Value, &str)>,
     ) -> Result<HttpResponse> {
         let body_file = tempfile::NamedTempFile::new()?;
+        let staged_jar = stage_private_file(&self.jar, "cookie jar")?;
 
-        let mut cmd = Command::new("curl");
+        let mut cmd = curl_command();
+        // This
+        // prevents a user or system curlrc from enabling redirects, verbose
+        // credential logging, proxying, or other unsafe request mutations.
         cmd.arg("-sS")
             .arg("--max-time")
             .arg("60")
             .arg("-c")
-            .arg(&self.jar)
+            .arg(staged_jar.path())
             .arg("-b")
-            .arg(&self.jar)
+            .arg(staged_jar.path())
             .arg("-o")
             .arg(body_file.path())
             .arg("-w")
@@ -478,9 +602,9 @@ impl PlatformClient {
                 .arg(format!("@{}", file.path().display()));
             Some(file)
         } else {
-            cmd.arg("-L").arg("--max-redirs").arg("5");
             None
         };
+        apply_redirect_policy(&mut cmd, payload_file.is_none());
 
         cmd.arg(format!("{}{path}", self.base));
 
@@ -491,10 +615,10 @@ impl PlatformClient {
         if !output.status.success() {
             bail!(
                 "curl {method} {path} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                redact_text(String::from_utf8_lossy(&output.stderr).trim())
             );
         }
-        restrict_permissions(&self.jar);
+        persist_private_file(staged_jar, &self.jar, "cookie jar")?;
 
         let status: u16 = String::from_utf8_lossy(&output.stdout)
             .trim()
@@ -518,22 +642,25 @@ impl PlatformClient {
     }
 
     /// Read one cookie value scoped to this platform's host from the jar.
-    fn cookie(&self, name: &str) -> Option<String> {
-        let text = fs::read_to_string(&self.jar).ok()?;
-        parse_cookie_jar(&text, name, &self.host)
+    fn cookie(&self, name: &str) -> Result<Option<String>> {
+        let Some(bytes) = read_private_file(&self.jar, "cookie jar")? else {
+            return Ok(None);
+        };
+        let text = String::from_utf8(bytes).context("cookie jar is not valid UTF-8")?;
+        Ok(parse_cookie_jar(&text, name, &self.host))
     }
 
     /// Make sure the jar holds a csrftoken (Django sets it on GET).
     fn ensure_csrf(&self) -> Result<String> {
-        if let Some(token) = self.cookie("csrftoken") {
+        if let Some(token) = self.cookie("csrftoken")? {
             return Ok(token);
         }
         let _ = self.get("/")?;
-        if let Some(token) = self.cookie("csrftoken") {
+        if let Some(token) = self.cookie("csrftoken")? {
             return Ok(token);
         }
         let _ = self.get("/api/user/")?;
-        self.cookie("csrftoken")
+        self.cookie("csrftoken")?
             .ok_or_else(|| anyhow!("platform did not set a csrftoken cookie; cannot POST safely"))
     }
 
@@ -549,9 +676,11 @@ impl PlatformClient {
 
     /// Best-effort session user: no network call without a session cookie,
     /// and transport failures degrade to `None` (offline-friendly).
-    fn session_user_if_any(&self) -> Option<Value> {
-        self.cookie("sessionid")?;
-        self.whoami().ok().flatten()
+    fn session_user_if_any(&self) -> Result<Option<Value>> {
+        if self.cookie("sessionid")?.is_none() {
+            return Ok(None);
+        }
+        Ok(self.whoami().ok().flatten())
     }
 
     /// Submission gates + option lists (requires an authenticated session).
@@ -567,8 +696,15 @@ impl PlatformClient {
 
 fn url_host(base: &str) -> Option<String> {
     let after_scheme = base.split_once("://").map_or(base, |(_, rest)| rest);
-    let host_port = after_scheme.split(['/', '?']).next()?;
-    let host = host_port.split(':').next()?;
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split_once(']')?.0
+    } else {
+        host_port.split(':').next()?
+    };
     if host.is_empty() {
         None
     } else {
@@ -596,16 +732,129 @@ fn parse_cookie_jar(text: &str, name: &str, host: &str) -> Option<String> {
     None
 }
 
-fn restrict_permissions(path: &Path) {
+fn private_temp_file(path: &Path, label: &str) -> Result<tempfile::NamedTempFile> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", diagnostic_path(parent)))?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".vnncomp-private-")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating staged {label} in {}", diagnostic_path(parent)))?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = fs::set_permissions(path, perms);
+        // NamedTempFile is already created O_EXCL with 0600 on Unix. Set and
+        // verify the mode before any sensitive bytes are written, and
+        // propagate every failure instead of relying on a write-then-chmod.
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting staged {label} permissions"))?;
+    }
+    Ok(temporary)
+}
+
+fn open_private_file(path: &Path, label: &str) -> Result<Option<fs::File>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "opening {label} {} without following links",
+                    diagnostic_path(path)
+                )
+            })
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting {label} {}", diagnostic_path(path)))?;
+    if !metadata.is_file() {
+        bail!("{label} {} is not a regular file", diagnostic_path(path));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            bail!(
+                "{label} {} must have mode 0600 (found {:04o})",
+                diagnostic_path(path),
+                metadata.permissions().mode() & 0o777
+            );
         }
     }
+    Ok(Some(file))
+}
+
+fn read_private_file(path: &Path, label: &str) -> Result<Option<Vec<u8>>> {
+    let Some(mut file) = open_private_file(path, label)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label} {}", diagnostic_path(path)))?;
+    Ok(Some(bytes))
+}
+
+fn stage_private_file(path: &Path, label: &str) -> Result<tempfile::NamedTempFile> {
+    let mut staged = private_temp_file(path, label)?;
+    if let Some(bytes) = read_private_file(path, label)? {
+        staged
+            .write_all(&bytes)
+            .with_context(|| format!("staging {label} {}", diagnostic_path(path)))?;
+        staged
+            .flush()
+            .with_context(|| format!("flushing staged {label}"))?;
+    }
+    Ok(staged)
+}
+
+fn persist_private_file(staged: tempfile::NamedTempFile, path: &Path, label: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = staged
+            .as_file()
+            .metadata()
+            .with_context(|| format!("inspecting staged {label}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o600 {
+            bail!("staged {label} mode changed from 0600 to {mode:04o}; refusing to persist it");
+        }
+    }
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing staged {label}"))?;
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically replacing {label} {}", diagnostic_path(path)))?;
+    Ok(())
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let mut staged = private_temp_file(path, label)?;
+    staged
+        .write_all(bytes)
+        .with_context(|| format!("writing staged {label}"))?;
+    staged
+        .flush()
+        .with_context(|| format!("flushing staged {label}"))?;
+    persist_private_file(staged, path, label)
 }
 
 // ---------------------------------------------------------------------------
@@ -626,11 +875,11 @@ fn credentials_path() -> Result<PathBuf> {
 
 fn load_credentials() -> Result<Option<(String, String)>> {
     let path = credentials_path()?;
-    if !path.is_file() {
+    let Some(bytes) = read_private_file(&path, "credentials file")? else {
         return Ok(None);
-    }
-    let value: Value = serde_json::from_str(&fs::read_to_string(&path)?)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    };
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", diagnostic_path(&path)))?;
     let email = value.get("email").and_then(Value::as_str);
     let password = value.get("password").and_then(Value::as_str);
     match (email, password) {
@@ -641,14 +890,8 @@ fn load_credentials() -> Result<Option<(String, String)>> {
 
 fn store_credentials(email: &str, password: &str) -> Result<PathBuf> {
     let path = credentials_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&json!({"email": email, "password": password}))?,
-    )?;
-    restrict_permissions(&path);
+    let contents = serde_json::to_vec_pretty(&json!({"email": email, "password": password}))?;
+    atomic_write_private(&path, &contents, "credentials file")?;
     Ok(path)
 }
 
@@ -706,27 +949,235 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-fn default_repository(root: &Path) -> Option<String> {
-    git_stdout(root, &["config", "--get", "remote.origin.url"])
-}
-
-fn default_commit(root: &Path) -> Option<String> {
-    git_stdout(root, &["rev-parse", "HEAD"])
-}
-
-/// `Some(false)` when git succeeds with empty output — the commit exists but
-/// is on no remote branch. (`git_stdout` can't express that: it folds empty
-/// output into `None`.)
-fn commit_on_remote(root: &Path, commit: &str) -> Option<bool> {
+fn checked_git_stdout(root: &Path, args: &[&str], operation: &str) -> Result<String> {
     let output = Command::new("git")
         .current_dir(root)
-        .args(["branch", "-r", "--contains", commit])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
         .output()
-        .ok()?;
+        .with_context(|| format!("running git for {operation}"))?;
     if !output.status.success() {
-        return None;
+        let diagnostic = redact_text(String::from_utf8_lossy(&output.stderr).trim());
+        if diagnostic.is_empty() {
+            bail!("git failed while {operation} ({})", output.status);
+        }
+        bail!("git failed while {operation}: {diagnostic}");
     }
-    Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    String::from_utf8(output.stdout)
+        .context("git emitted non-UTF-8 output")
+        .map(|text| text.trim().to_string())
+}
+
+#[derive(Debug)]
+struct SubmissionSource {
+    repository: String,
+    commit: String,
+    /// Present only for the implicit path after querying the live remote.
+    verified_remote_branch: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrebuiltState {
+    /// All three tracked members are present. The installer still validates
+    /// their checksum and provenance before use.
+    Present,
+    /// The locally verified commit exists but contains no complete triplet.
+    Absent,
+    /// Explicit source override: the selected remote commit was not inspected.
+    Unverified,
+}
+
+fn prebuilt_state(root: &Path, source: &SubmissionSource) -> PrebuiltState {
+    if source.verified_remote_branch.is_none() {
+        return PrebuiltState::Unverified;
+    }
+    let members = [
+        "dist/bin/ny-x86_64-linux.xz",
+        "dist/bin/ny-x86_64-linux.xz.sha256",
+        "dist/bin/ny-x86_64-linux.provenance.txt",
+    ];
+    let all_present = members.iter().all(|path| {
+        let object = format!("{}:{path}", source.commit);
+        Command::new("git")
+            .current_dir(root)
+            .args(["cat-file", "-e", &object])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    });
+    if all_present {
+        PrebuiltState::Present
+    } else {
+        PrebuiltState::Absent
+    }
+}
+
+fn validate_explicit_source_field(value: &str, flag: &str) -> Result<()> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        bail!("{flag} must be non-empty and contain no control characters");
+    }
+    Ok(())
+}
+
+/// Resolve the source selected for a platform clone. An explicit override is
+/// deliberately all-or-nothing. The implicit path is stricter: it accepts only
+/// a clean attached branch whose HEAD exactly matches that branch on the live
+/// configured upstream, queried with `ls-remote` rather than a stale local
+/// remote-tracking ref.
+fn resolve_submission_source(
+    root: &Path,
+    repository: Option<&str>,
+    commit: Option<&str>,
+) -> Result<SubmissionSource> {
+    match (repository, commit) {
+        (Some(repository), Some(commit)) => {
+            validate_explicit_source_field(repository, "--repository")?;
+            validate_explicit_source_field(commit, "--commit")?;
+            return Ok(SubmissionSource {
+                repository: repository.to_string(),
+                commit: commit.to_string(),
+                verified_remote_branch: None,
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            bail!(
+                "--repository and --commit are an explicit source override and \
+                 must be supplied together"
+            );
+        }
+        (None, None) => {}
+    }
+
+    let status = checked_git_stdout(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
+        "checking whether the implicit submission worktree is clean",
+    )?;
+    if !status.is_empty() {
+        bail!(
+            "refusing implicit repository/commit selection from a dirty worktree; \
+             commit and push the intended source, or explicitly provide both \
+             --repository and --commit"
+        );
+    }
+
+    let branch = checked_git_stdout(
+        root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        "resolving the current submission branch",
+    )?;
+    if branch.is_empty() {
+        bail!("implicit submission requires an attached branch");
+    }
+    let remote_key = format!("branch.{branch}.remote");
+    let merge_key = format!("branch.{branch}.merge");
+    let remote = checked_git_stdout(
+        root,
+        &["config", "--get", &remote_key],
+        "resolving the current branch's upstream remote",
+    )?;
+    if remote.is_empty() || remote == "." {
+        bail!("implicit submission requires a configured non-local upstream remote");
+    }
+    let remote_ref = checked_git_stdout(
+        root,
+        &["config", "--get", &merge_key],
+        "resolving the current branch's upstream branch",
+    )?;
+    let Some(remote_branch) = remote_ref.strip_prefix("refs/heads/") else {
+        bail!("implicit submission upstream is not a branch under refs/heads/");
+    };
+    if remote_branch.is_empty() {
+        bail!("implicit submission upstream branch is empty");
+    }
+
+    let repository = checked_git_stdout(
+        root,
+        &["remote", "get-url", &remote],
+        "resolving the selected upstream repository",
+    )?;
+    if repository.is_empty() {
+        bail!("selected upstream remote has no clone URL");
+    }
+    let head_commit_object = ["HEAD^", "{", "commit", "}"].concat();
+    let commit = checked_git_stdout(
+        root,
+        &["rev-parse", "--verify", &head_commit_object],
+        "resolving the implicit submission commit",
+    )?;
+
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["ls-remote", "--exit-code", "--refs", &remote, &remote_ref])
+        .output()
+        .with_context(|| {
+            redact_text(&format!("querying live upstream {remote}/{remote_branch}"))
+        })?;
+    let safe_upstream = redact_text(&format!("{remote}/{remote_branch}"));
+    if !output.status.success() {
+        let diagnostic = redact_text(String::from_utf8_lossy(&output.stderr).trim());
+        if diagnostic.is_empty() {
+            bail!(
+                "could not verify live upstream {safe_upstream} ({})",
+                output.status
+            );
+        }
+        bail!("could not verify live upstream {safe_upstream}: {diagnostic}");
+    }
+    let live =
+        String::from_utf8(output.stdout).context("git ls-remote emitted non-UTF-8 output")?;
+    let mut matching = live.lines().filter_map(|line| {
+        let (hash, found_ref) = line.split_once(char::is_whitespace)?;
+        (found_ref.trim() == remote_ref).then_some(hash)
+    });
+    let live_commit = matching
+        .next()
+        .ok_or_else(|| anyhow!("live upstream branch {safe_upstream} was not found"))?;
+    if matching.next().is_some() {
+        bail!("live upstream returned duplicate records for {safe_upstream}");
+    }
+    if !live_commit.eq_ignore_ascii_case(&commit) {
+        bail!(
+            "implicit HEAD {commit} does not match live upstream \
+             {safe_upstream} at {live_commit}; push the selected commit \
+             or explicitly provide both --repository and --commit"
+        );
+    }
+
+    // Close the local check/query race: neither the checked-out commit nor
+    // tracked/untracked contents may have changed while ls-remote was running.
+    let final_commit = checked_git_stdout(
+        root,
+        &["rev-parse", "--verify", &head_commit_object],
+        "rechecking the implicit submission commit",
+    )?;
+    let final_status = checked_git_stdout(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
+        "rechecking the implicit submission worktree",
+    )?;
+    if final_commit != commit || !final_status.is_empty() {
+        bail!(
+            "repository state changed while verifying the implicit submission \
+             source; retry from a stable clean worktree"
+        );
+    }
+
+    Ok(SubmissionSource {
+        repository,
+        commit,
+        verified_remote_branch: Some(format!("{remote}/{remote_branch}")),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +1273,7 @@ fn find_choice(choices: &[ResolvedChoice], hints: &[&str]) -> Option<ResolvedCho
 fn labels(choices: &[ResolvedChoice]) -> String {
     choices
         .iter()
-        .map(|choice| choice.label.as_str())
+        .map(|choice| redact_text(&choice.label))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -841,7 +1292,7 @@ fn handle_status(platform: &PlatformOpts) -> Result<()> {
     // any HTTP response => reachable (2xx JSON => authenticated).
     let (reachable, user, transport_error) = match client.whoami() {
         Ok(user) => (true, user, None),
-        Err(err) => (false, None, Some(err.to_string())),
+        Err(err) => (false, None, Some(redact_text(&err.to_string()))),
     };
     let form = if user.is_some() {
         client.form_data()?
@@ -873,7 +1324,7 @@ fn handle_status(platform: &PlatformOpts) -> Result<()> {
     }
 
     println!("VNN-COMP 2026 evaluation platform status");
-    println!("  url:            {}", client.base);
+    println!("  url:            {}", redact_url(&client.base));
     match transport_error {
         None => println!("  reachable:      yes"),
         Some(err) => println!("  reachable:      NO ({err})"),
@@ -886,7 +1337,7 @@ fn handle_status(platform: &PlatformOpts) -> Result<()> {
         )
     );
     if let Some(email) = credentials_email {
-        println!("  stored account: {email}");
+        println!("  stored account: {}", redact_text(&email));
     }
     println!(
         "  can_submit:     {}",
@@ -913,7 +1364,7 @@ fn user_display(user: &Value) -> String {
     ["email", "username", "name"]
         .iter()
         .find_map(|key| user.get(*key).and_then(Value::as_str))
-        .map_or_else(|| user.to_string(), ToString::to_string)
+        .map_or_else(|| redact_value(user).to_string(), redact_text)
 }
 
 fn describe_flag(flag: Option<bool>, authenticated: bool) -> String {
@@ -939,16 +1390,18 @@ fn chair_list() -> String {
 
 fn handle_signup(name: &str, email: &str, platform: &PlatformOpts) -> Result<()> {
     let client = PlatformClient::new(platform)?;
+    let safe_email = redact_text(email);
 
     // The credentials file is single-slot; never clobber another account's
     // (possibly auto-generated and otherwise unrecoverable) password.
     if let Some((stored_email, _)) = load_credentials()? {
         if stored_email != email {
+            let safe_stored_email = redact_text(&stored_email);
             bail!(
-                "{} already holds credentials for {stored_email}; refusing to \
-                 overwrite them for {email}. Move the file aside first, or log \
+                "{} already holds credentials for {safe_stored_email}; refusing to \
+                 overwrite them for {safe_email}. Move the file aside first, or log \
                  in to the old account with `ny vnncomp-late-submit login`.",
-                credentials_path()?.display()
+                diagnostic_path(&credentials_path()?)
             );
         }
     }
@@ -982,15 +1435,25 @@ fn handle_signup(name: &str, email: &str, platform: &PlatformOpts) -> Result<()>
             "next_step": "Ask the organizers to activate the account (vnncomp2026 issue #9 precedent).",
         }))?;
     } else if created {
-        println!("Account created for {email}.");
-        println!("  credentials saved: {}", credentials_file.display());
+        println!("Account created for {safe_email}.");
+        println!(
+            "  credentials saved: {}",
+            diagnostic_path(&credentials_file)
+        );
         println!(
             "  NOTE: organizers must activate the account before submission ({}).",
             chair_list()
         );
     } else {
-        println!("Signup returned HTTP {}: {}", resp.status, resp.body.trim());
-        println!("  credentials kept at: {}", credentials_file.display());
+        println!(
+            "Signup returned HTTP {}: {}",
+            resp.status,
+            diagnostic_body(&resp.body)
+        );
+        println!(
+            "  credentials kept at: {}",
+            diagnostic_path(&credentials_file)
+        );
     }
     if !created {
         bail!("signup was not accepted (HTTP {})", resp.status);
@@ -1010,7 +1473,10 @@ fn resolve_login_email(explicit: Option<&str>) -> Result<String> {
 
 fn login(client: &PlatformClient, email: &str) -> Result<Value> {
     let Some(password) = resolve_password(email)? else {
-        bail!("no password for {email}: set {PASSWORD_ENV} or store credentials via `signup`")
+        bail!(
+            "no password for {}: set {PASSWORD_ENV} or store credentials via `signup`",
+            redact_text(email)
+        )
     };
     let resp = client.post(
         "/api/login/",
@@ -1018,9 +1484,10 @@ fn login(client: &PlatformClient, email: &str) -> Result<Value> {
     )?;
     if !resp.ok() {
         bail!(
-            "login failed for {email} (HTTP {}): {}",
+            "login failed for {} (HTTP {}): {}",
+            redact_text(email),
             resp.status,
-            resp.body.trim()
+            diagnostic_body(&resp.body)
         );
     }
     Ok(resp.json().unwrap_or(Value::Null))
@@ -1039,8 +1506,9 @@ fn handle_login(email: Option<&str>, platform: &PlatformOpts) -> Result<()> {
         }))?;
     } else {
         println!(
-            "Logged in as {email} (session stored in {}).",
-            client.jar.display()
+            "Logged in as {} (session stored in {}).",
+            redact_text(&email),
+            diagnostic_path(&client.jar)
         );
     }
     Ok(())
@@ -1054,7 +1522,7 @@ fn handle_login(email: Option<&str>, platform: &PlatformOpts) -> Result<()> {
 struct SubmissionPlan {
     repository: String,
     commit: String,
-    commit_on_origin: Option<bool>,
+    verified_remote_branch: Option<String>,
     benchmarks: Vec<String>,
     instance: Option<ResolvedChoice>,
     ami: Option<ResolvedChoice>,
@@ -1065,21 +1533,33 @@ struct SubmissionPlan {
 
 impl SubmissionPlan {
     /// The `POST /api/toolkit/submit/` body (exact SPA key parity). `strict`
-    /// refuses to build without a form-data-resolved instance type; the
-    /// lenient form substitutes placeholders for dry-run display.
+    /// refuses to build without form-data-resolved instance and AMI choices;
+    /// the lenient form substitutes placeholders for dry-run display.
     fn payload(&self, strict: bool) -> Result<Value> {
         let aws_instance_type = match (&self.instance, strict) {
-            (Some(choice), _) => choice.value.clone(),
-            (None, true) => bail!(
+            (Some(choice), _) if !choice.value.is_null() => choice.value.clone(),
+            (Some(_), true) | (None, true) => bail!(
                 "instance type could not be resolved from the platform form-data; \
-                 refusing to POST a guessed value"
+                 refusing to POST a null or guessed value"
             ),
-            (None, false) => Value::String("<resolved from form-data at submit time>".to_string()),
+            (Some(_), false) | (None, false) => {
+                Value::String("<resolved from form-data at submit time>".to_string())
+            }
+        };
+        let ami = match (&self.ami, strict) {
+            (Some(choice), _) if !choice.value.is_null() => choice.value.clone(),
+            (Some(_), true) | (None, true) => bail!(
+                "AMI could not be resolved from the platform form-data; \
+                 refusing to POST a null or guessed value"
+            ),
+            (Some(_), false) | (None, false) => {
+                Value::String("<resolved from form-data at submit time>".to_string())
+            }
         };
         Ok(json!({
             "aws_instance_type": aws_instance_type,
             "name": self.name,
-            "ami": self.ami.as_ref().map(|choice| choice.value.clone()),
+            "ami": ami,
             "repository": self.repository,
             "hash": self.commit,
             "scripts_dir": ".",
@@ -1097,17 +1577,8 @@ impl SubmissionPlan {
 
 fn build_submission_plan(args: &SubmitArgs, form: Option<&Value>) -> Result<SubmissionPlan> {
     let root = repo_root()?;
-    let repository = args
-        .repository
-        .clone()
-        .or_else(|| default_repository(&root))
-        .ok_or_else(|| anyhow!("no --repository given and no git origin remote found"))?;
-    let commit = args
-        .commit
-        .clone()
-        .or_else(|| default_commit(&root))
-        .ok_or_else(|| anyhow!("no --commit given and git rev-parse HEAD failed"))?;
-    let commit_on_origin = commit_on_remote(&root, &commit);
+    let source =
+        resolve_submission_source(&root, args.repository.as_deref(), args.commit.as_deref())?;
 
     let benchmarks = track_benchmarks(args.tracks, &args.benchmarks, args.skip_test);
 
@@ -1126,8 +1597,9 @@ fn build_submission_plan(args: &SubmitArgs, form: Option<&Value>) -> Result<Subm
         Some(hint) => {
             let found = find_choice(&ami_choices, &[hint]);
             if found.is_none() && !ami_choices.is_empty() {
+                let safe_hint = redact_text(hint);
                 bail!(
-                    "no AMI option matches '{hint}'; platform offers: {}",
+                    "no AMI option matches '{safe_hint}'; platform offers: {}",
                     labels(&ami_choices)
                 );
             }
@@ -1145,7 +1617,7 @@ fn build_submission_plan(args: &SubmitArgs, form: Option<&Value>) -> Result<Subm
                 if let Some(choice) = &fallback {
                     eprintln!(
                         "warning: no Ubuntu AMI option found; falling back to '{}'",
-                        choice.label
+                        redact_text(&choice.label)
                     );
                 }
                 fallback
@@ -1156,9 +1628,9 @@ fn build_submission_plan(args: &SubmitArgs, form: Option<&Value>) -> Result<Subm
     };
 
     Ok(SubmissionPlan {
-        repository,
-        commit,
-        commit_on_origin,
+        repository: source.repository,
+        commit: source.commit,
+        verified_remote_branch: source.verified_remote_branch,
         benchmarks,
         instance,
         ami,
@@ -1178,6 +1650,15 @@ struct SubmitOutcome {
     submission_url: Option<String>,
 }
 
+fn post_is_authorized(
+    dry_run: bool,
+    force: bool,
+    can_submit: Option<bool>,
+    scheduler_enabled: Option<bool>,
+) -> bool {
+    !dry_run && (force || (can_submit == Some(true) && scheduler_enabled != Some(false)))
+}
+
 fn handle_submit(args: &SubmitArgs) -> Result<()> {
     if args.mode == RunMode::All && !args.yes {
         bail!(
@@ -1191,10 +1672,11 @@ fn handle_submit(args: &SubmitArgs) -> Result<()> {
 
     let client = PlatformClient::new(&args.platform)?;
 
-    // Dry runs work offline: probe the session only best-effort. Real
-    // submissions authenticate for real.
+    // Dry runs probe the session only best-effort. They are fully offline when
+    // paired with an explicit repository+commit; implicit source selection
+    // intentionally queries the live upstream. Real submissions authenticate.
     let user = if args.dry_run {
-        client.session_user_if_any()
+        client.session_user_if_any()?
     } else {
         match client.whoami()? {
             Some(user) => Some(user),
@@ -1218,16 +1700,10 @@ fn handle_submit(args: &SubmitArgs) -> Result<()> {
     let scheduler_enabled = gate_flag(form.as_ref(), "scheduler_enabled");
     let plan = build_submission_plan(args, form.as_ref())?;
 
-    if plan.commit_on_origin == Some(false) {
-        eprintln!(
-            "warning: commit {} is not on any remote branch; the platform clones \
-             from the remote and will not see it",
-            plan.commit
-        );
-    }
-
     let window_closed = can_submit == Some(false) || scheduler_enabled == Some(false);
-    let attempted = !args.dry_run && (!window_closed || args.force);
+    // A missing/unknown can_submit field is not permission. Only an explicit
+    // true authorizes a real POST, unless the caller supplied --force.
+    let attempted = post_is_authorized(args.dry_run, args.force, can_submit, scheduler_enabled);
     let mut outcome = SubmitOutcome {
         can_submit,
         scheduler_enabled,
@@ -1291,7 +1767,9 @@ fn handle_submit(args: &SubmitArgs) -> Result<()> {
         }
         None if !args.dry_run && !attempted => {
             bail!(
-                "submission window is closed server-side; not POSTing without --force. \
+                "platform did not explicitly authorize submission \
+                 (can_submit must be true and scheduler_enabled must not be false); \
+                 not POSTing without --force. \
                  Draft the chair request with `ny vnncomp-late-submit request-email`."
             )
         }
@@ -1310,33 +1788,34 @@ fn print_submit_report(
     println!(
         "  benchmarks:    {} ({})",
         plan.benchmarks.len(),
-        plan.benchmarks.join(", ")
+        redact_text(&plan.benchmarks.join(", "))
     );
     println!(
         "  instance type: {} -> {}",
         args.instance_type.describe(),
-        plan.instance
-            .as_ref()
-            .map_or("(unresolved: needs form-data)", |choice| &choice.label)
+        plan.instance.as_ref().map_or_else(
+            || "(unresolved: needs form-data)".to_string(),
+            |choice| redact_text(&choice.label),
+        )
     );
     println!(
         "  ami:           {}",
-        plan.ami
-            .as_ref()
-            .map_or("(unresolved: needs form-data)", |choice| &choice.label)
+        plan.ami.as_ref().map_or_else(
+            || "(unresolved: needs form-data)".to_string(),
+            |choice| redact_text(&choice.label),
+        )
     );
-    println!("  repository:    {}", plan.repository);
+    println!("  repository:    {}", redact_url(&plan.repository));
     println!(
         "  commit:        {}{}",
-        plan.commit,
-        match plan.commit_on_origin {
-            Some(true) => " (on origin)",
-            Some(false) => " (NOT on origin!)",
-            None => "",
-        }
+        redact_text(&plan.commit),
+        plan.verified_remote_branch.as_ref().map_or_else(
+            || " (explicit source override)".to_string(),
+            |branch| format!(" (live-verified at {})", redact_text(branch))
+        )
     );
     println!("  mode:          {}", plan.mode.as_str());
-    println!("  vnnlib:        {}", plan.vnnlib_version);
+    println!("  vnnlib:        {}", redact_text(&plan.vnnlib_version));
     println!(
         "  gates:         can_submit={} scheduler_enabled={}",
         describe_flag(outcome.can_submit, outcome.authenticated),
@@ -1344,7 +1823,7 @@ fn print_submit_report(
     );
     if args.dry_run {
         println!("  dry-run:       payload built, nothing POSTed");
-        if let Ok(pretty) = serde_json::to_string_pretty(display_payload) {
+        if let Ok(pretty) = serde_json::to_string_pretty(&redact_value(display_payload)) {
             println!("{pretty}");
         }
     } else if outcome.attempted {
@@ -1356,15 +1835,19 @@ fn print_submit_report(
                 .map_or_else(|| "?".to_string(), |resp| resp.status.to_string())
         );
         if let Some(url) = &outcome.submission_url {
-            println!("  submission:    {url}");
+            println!("  submission:    {}", redact_url(url));
         } else if let Some(resp) = &outcome.response {
-            let trimmed = resp.body.trim();
+            let safe_body = diagnostic_body(&resp.body);
+            let trimmed = safe_body.trim();
             if !trimmed.is_empty() {
                 println!("  response:      {trimmed}");
             }
         }
     } else {
-        println!("  POST:          skipped (window closed; use --force to attempt anyway)");
+        println!(
+            "  POST:          skipped (can_submit was not true or scheduler was disabled; \
+             use --force to attempt anyway)"
+        );
         println!(
             "  next:          `ny vnncomp-late-submit request-email` and contact {}",
             chair_list()
@@ -1388,16 +1871,9 @@ fn handle_request_email(args: &RequestEmailArgs) -> Result<()> {
         .clone()
         .or_else(|| git_stdout(&root, &["config", "--get", "user.email"]))
         .unwrap_or_else(|| "unknown@example.invalid".to_string());
-    let repository = args
-        .repository
-        .clone()
-        .or_else(|| default_repository(&root))
-        .unwrap_or_else(|| "https://github.com/alabsystems/ny".to_string());
-    let commit = args
-        .commit
-        .clone()
-        .or_else(|| default_commit(&root))
-        .unwrap_or_else(|| "HEAD".to_string());
+    let source =
+        resolve_submission_source(&root, args.repository.as_deref(), args.commit.as_deref())?;
+    let artifact_state = prebuilt_state(&root, &source);
     let account_email = match &args.account_email {
         Some(email) => Some(email.clone()),
         None => load_credentials()?.map(|(email, _)| email),
@@ -1406,11 +1882,12 @@ fn handle_request_email(args: &RequestEmailArgs) -> Result<()> {
     let eml = render_request_email(
         &from_name,
         &from_email,
-        &repository,
-        &commit,
+        &source.repository,
+        &source.commit,
         args.tracks,
         args.instance_type,
         account_email.as_deref(),
+        artifact_state,
     );
 
     // Match vnncomp-submit's convention: relative outputs land in the repo.
@@ -1439,7 +1916,7 @@ fn handle_request_email(args: &RequestEmailArgs) -> Result<()> {
         println!("---");
         println!(
             "Draft written to {}. Review and send it from your mail client.",
-            output.display()
+            diagnostic_path(&output)
         );
     }
     Ok(())
@@ -1453,14 +1930,36 @@ fn render_request_email(
     tracks: TrackSelection,
     instance_type: InstanceType,
     account_email: Option<&str>,
+    prebuilt_state: PrebuiltState,
 ) -> String {
     let benchmarks = track_benchmarks(tracks, &[], true);
     let account_line = account_email.map_or_else(
         || "- Platform account: (to be created via the signup form)".to_string(),
         |email| format!("- Platform account: {email} (self-registered, pending activation)"),
     );
+    let install_lines = match prebuilt_state {
+        PrebuiltState::Present => {
+            "- Install artifact: the selected commit contains a prebuilt triplet; the\n\
+             installer verifies its checksum and provenance before using it.\n\
+             - Fallback: if that artifact is rejected, installation is a networked source\n\
+             build requiring crates.io/ORT access and authenticated read access to the\n\
+             exact Git-pinned AY revision."
+        }
+        PrebuiltState::Absent => {
+            "- Install artifact: no prebuilt/offline binary is present in the selected\n\
+             commit. Installation therefore uses the networked source fallback, which\n\
+             requires crates.io/ORT access and authenticated read access to the exact\n\
+             Git-pinned AY revision."
+        }
+        PrebuiltState::Unverified => {
+            "- Install artifact: the explicitly selected remote commit was not inspected\n\
+             locally; please do not assume offline installation. Unless it contains a\n\
+             valid prebuilt triplet, installation uses a networked source build requiring\n\
+             crates.io/ORT and authenticated access to the exact Git-pinned AY revision."
+        }
+    };
 
-    format!(
+    redact_text(&format!(
         "From: {from_name} <{from_email}>\n\
          To: {to_header}\n\
          Subject: VNN-COMP 2026: late tool-submission request - NY ({subject_tracks})\n\
@@ -1476,16 +1975,16 @@ fn render_request_email(
          ranking are all perfectly fine outcomes for us.\n\
          \n\
          The tool is NY, a Rust neural-network verifier implementing the standard\n\
-         v1 script contract. Everything is prepared so that an evaluation requires\n\
-         no manual effort on your side:\n\
+         v1 script contract. The harness entry points are prepared; installation is\n\
+         automated but has the artifact/network requirements stated below:\n\
          \n\
          {account_line}\n\
          - Repository: {repository}\n\
          - Commit: {commit}\n\
          - Scripts: install_tool.sh / prepare_instance.sh / run_instance.sh in the\n\
            repository root (scripts_dir = \".\")\n\
-         - Install: single offline cargo build; no external solver licenses\n\
-           (no Gurobi/MATLAB), no manual installation steps\n\
+         {install_lines}\n\
+         - Solver licenses: no external Gurobi/MATLAB license is required\n\
          - AWS platform: {instance}\n\
          - AMI: any Ubuntu 24.04 image\n\
          - Preferred VNN-LIB version: 1.0 (the 2.0-only benchmarks, including the\n\
@@ -1512,7 +2011,7 @@ fn render_request_email(
         track_label = track_label(tracks),
         count = benchmarks.len(),
         benchmark_list = benchmarks.join(", "),
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,6 +2195,283 @@ mod tests {
     }
 
     #[test]
+    fn strict_payload_refuses_a_null_ami() {
+        let form = json!({
+            "instance_types": [{"value": 1, "label": "CPU: m5.16xlarge"}],
+            "ami_options": [],
+        });
+        let plan = build_submission_plan(&submit_args(), Some(&form)).expect("plan");
+        assert!(plan.instance.is_some());
+        assert!(plan.ami.is_none());
+        let error = plan.payload(true).expect_err("strict payload needs AMI");
+        assert!(error.to_string().contains("AMI"));
+        assert!(plan
+            .payload(false)
+            .expect("display payload")
+            .get("ami")
+            .is_some_and(Value::is_string));
+
+        let null_form = json!({
+            "instance_types": [{"value": 1, "label": "CPU: m5.16xlarge"}],
+            "ami_options": [{"value": null, "label": "Ubuntu 24.04"}],
+        });
+        let null_plan =
+            build_submission_plan(&submit_args(), Some(&null_form)).expect("null AMI plan");
+        assert!(null_plan.ami.is_some());
+        let error = null_plan
+            .payload(true)
+            .expect_err("null-valued AMI must fail");
+        assert!(error.to_string().contains("AMI"));
+        assert!(null_plan
+            .payload(false)
+            .expect("null AMI display payload")
+            .get("ami")
+            .is_some_and(Value::is_string));
+    }
+
+    #[test]
+    fn post_requires_an_explicit_true_gate_unless_forced() {
+        for can_submit in [None, Some(false)] {
+            assert!(!post_is_authorized(false, false, can_submit, Some(true)));
+        }
+        assert!(post_is_authorized(false, false, Some(true), Some(true)));
+        assert!(post_is_authorized(false, false, Some(true), None));
+        assert!(!post_is_authorized(false, false, Some(true), Some(false)));
+        assert!(post_is_authorized(false, true, None, Some(false)));
+        assert!(!post_is_authorized(true, true, Some(true), Some(true)));
+    }
+
+    #[test]
+    fn curl_disables_curlrc_first_and_pins_post_redirects() {
+        let mut post = curl_command();
+        apply_redirect_policy(&mut post, false);
+        let post_args: Vec<_> = post
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(post_args.first().map(String::as_str), Some("-q"));
+        assert!(!post_args.iter().any(|arg| arg == "-L"));
+
+        let mut get = curl_command();
+        apply_redirect_policy(&mut get, true);
+        let get_args: Vec<_> = get
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(get_args.first().map(String::as_str), Some("-q"));
+        assert!(get_args.iter().any(|arg| arg == "-L"));
+        assert!(get_args.iter().any(|arg| arg == "--max-redirs"));
+    }
+
+    #[test]
+    fn urls_and_secret_json_fields_are_redacted_everywhere() {
+        let text = "first https://alice:hunter2@example.test/repo?token=abc#raw \
+                    second https://bob:secret@other.test/x?password=pw";
+        let safe = redact_text(text);
+        for secret in ["alice", "hunter2", "abc", "bob", "secret", "pw", "#raw"] {
+            assert!(!safe.contains(secret), "leaked {secret:?}: {safe}");
+        }
+        assert!(safe.contains("example.test"));
+        assert!(safe.contains("other.test"));
+
+        let safe_json = redact_value(&json!({
+            "password": "cleartext",
+            "csrf_token": "csrf-value",
+            "repository": "https://git-user:git-pass@example.test/ny?key=value",
+            "nested": [{"authorization": "Bearer value"}],
+        }));
+        let rendered = safe_json.to_string();
+        for secret in [
+            "cleartext",
+            "csrf-value",
+            "git-user",
+            "git-pass",
+            "value\"",
+            "Bearer",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret:?}: {rendered}");
+        }
+
+        let response = diagnostic_body(
+            r#"{"password":"server-echo","url":"https://u:p@example.test/?token=raw"}"#,
+        );
+        assert!(!response.contains("server-echo"));
+        assert!(!response.contains("u:p"));
+        assert!(!response.contains("raw"));
+    }
+
+    #[test]
+    fn email_redacts_repository_credentials_and_states_source_build_requirements() {
+        let eml = render_request_email(
+            "Test Person",
+            "test@example.com",
+            "https://git-user:git-password@example.test/ny?token=raw#secret",
+            "abc123",
+            TrackSelection::Regular,
+            InstanceType::Cpu,
+            None,
+            PrebuiltState::Absent,
+        );
+        for secret in ["git-user", "git-password", "raw", "#secret"] {
+            assert!(!eml.contains(secret), "email leaked {secret:?}");
+        }
+        assert!(eml.contains("no prebuilt/offline binary is present"));
+        assert!(eml.contains("networked source fallback"));
+        assert!(eml.contains("authenticated read access"));
+        assert!(!eml.contains("single offline cargo build"));
+        assert!(!eml.contains("no manual effort"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_atomic_nofollow_and_mode_0600() {
+        use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let victim = directory.path().join("victim");
+        fs::write(&victim, b"do not overwrite").expect("victim");
+        let destination = directory.path().join("credentials");
+        symlink(&victim, &destination).expect("destination symlink");
+
+        atomic_write_private(&destination, b"private", "test credentials").expect("atomic write");
+        assert_eq!(fs::read(&victim).expect("victim read"), b"do not overwrite");
+        assert_eq!(
+            read_private_file(&destination, "test credentials")
+                .expect("private read")
+                .expect("present"),
+            b"private"
+        );
+        let metadata = fs::symlink_metadata(&destination).expect("metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+
+        let malicious_link = directory.path().join("linked-cookie");
+        symlink(&victim, &malicious_link).expect("read symlink");
+        assert!(read_private_file(&malicious_link, "test cookie jar").is_err());
+
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).expect("permissions");
+        assert!(read_private_file(&victim, "unsafe credentials").is_err());
+    }
+
+    #[test]
+    fn private_file_failures_are_propagated() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let not_a_directory = directory.path().join("plain-file");
+        fs::write(&not_a_directory, b"x").expect("plain file");
+        let impossible = not_a_directory.join("credentials");
+        assert!(atomic_write_private(&impossible, b"secret", "test credentials").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_cookie_jar_is_replaced_atomically_with_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let jar = directory.path().join("cookies");
+        atomic_write_private(&jar, b"old-cookie", "test cookie jar").expect("old jar");
+
+        let staged = stage_private_file(&jar, "test cookie jar").expect("stage jar");
+        assert_eq!(fs::read(staged.path()).expect("staged read"), b"old-cookie");
+        fs::write(staged.path(), b"new-cookie").expect("simulate curl write");
+        persist_private_file(staged, &jar, "test cookie jar").expect("persist jar");
+
+        assert_eq!(fs::read(&jar).expect("jar read"), b"new-cookie");
+        assert_eq!(
+            fs::metadata(&jar)
+                .expect("jar metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn upstream_fixture() -> (tempfile::TempDir, PathBuf) {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let remote = fixture.path().join("remote.git");
+        let work = fixture.path().join("work");
+        fs::create_dir(&remote).expect("remote dir");
+        fs::create_dir(&work).expect("work dir");
+        run_git(&remote, &["init", "--bare", "--quiet"]);
+        run_git(&work, &["init", "--quiet"]);
+        run_git(&work, &["config", "user.name", "Test"]);
+        run_git(&work, &["config", "user.email", "test@example.com"]);
+        fs::write(work.join("tracked"), b"one").expect("tracked");
+        run_git(&work, &["add", "tracked"]);
+        run_git(&work, &["commit", "--quiet", "-m", "initial"]);
+        run_git(&work, &["branch", "-M", "main"]);
+        run_git(
+            &work,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        run_git(&work, &["push", "--quiet", "-u", "origin", "main"]);
+        (fixture, work)
+    }
+
+    #[test]
+    fn implicit_source_requires_clean_live_upstream_tip() {
+        let (_fixture, work) = upstream_fixture();
+        let source =
+            resolve_submission_source(&work, None, None).expect("verified implicit source");
+        assert_eq!(
+            source.verified_remote_branch.as_deref(),
+            Some("origin/main")
+        );
+
+        fs::write(work.join("untracked"), b"dirty").expect("untracked");
+        let dirty = resolve_submission_source(&work, None, None).expect_err("dirty must fail");
+        assert!(dirty.to_string().contains("dirty worktree"));
+        fs::remove_file(work.join("untracked")).expect("remove untracked");
+
+        fs::write(work.join("tracked"), b"two").expect("modify");
+        run_git(&work, &["add", "tracked"]);
+        run_git(&work, &["commit", "--quiet", "-m", "not pushed"]);
+        // Simulate a stale/forged local remote-tracking tip. A check based on
+        // `git branch -r --contains` would now accept HEAD even though the live
+        // remote still points at the previous commit.
+        run_git(&work, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let stale =
+            resolve_submission_source(&work, None, None).expect_err("unpushed tip must fail");
+        assert!(stale.to_string().contains("does not match live upstream"));
+    }
+
+    #[test]
+    fn explicit_source_override_is_all_or_nothing_and_bypasses_local_state() {
+        let (_fixture, work) = upstream_fixture();
+        fs::write(work.join("dirty"), b"intentional").expect("dirty");
+        assert!(resolve_submission_source(&work, Some("https://example.test/ny"), None).is_err());
+        assert!(resolve_submission_source(&work, None, Some("abc123")).is_err());
+        let source = resolve_submission_source(
+            &work,
+            Some("https://user:password@example.test/ny"),
+            Some("abc123"),
+        )
+        .expect("explicit pair");
+        assert!(source.verified_remote_branch.is_none());
+        assert_eq!(redact_url(&source.repository), "https://example.test/ny");
+    }
+
+    #[test]
     fn unknown_explicit_ami_hint_is_an_error() {
         let mut args = submit_args();
         args.ami = Some("no-such-ami".to_string());
@@ -1717,6 +2493,7 @@ mod tests {
             TrackSelection::All,
             InstanceType::Cpu,
             Some("account@example.com"),
+            PrebuiltState::Absent,
         );
         for id in REGULAR_TRACK_2026.iter().chain(EXTENDED_TRACK_2026.iter()) {
             assert!(eml.contains(id), "email draft missing benchmark {id}");
@@ -1738,6 +2515,7 @@ mod tests {
             TrackSelection::Regular,
             InstanceType::Cpu,
             None,
+            PrebuiltState::Unverified,
         );
         assert!(eml
             .contains("Subject: VNN-COMP 2026: late tool-submission request - NY (Regular track)"));

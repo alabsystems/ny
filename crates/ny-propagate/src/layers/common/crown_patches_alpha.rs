@@ -10,9 +10,90 @@
 use ndarray::{Array1, ArrayD};
 use ny_core::{checked_shape_product, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use rayon::prelude::*;
+use std::mem::size_of;
 
 use super::compose;
 use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
+
+/// Contiguous flat views + chunk geometry for the parallel patch compose
+/// (#alpha-patches-par). See the call site for the disjointness argument.
+struct PatchesParState<'a> {
+    lp: &'a [f32],
+    up: &'a [f32],
+    nlp: &'a mut [f32],
+    nup: &'a mut [f32],
+    /// Number of chunks = length of the outermost patch axis.
+    outer: usize,
+    /// Coefficients per chunk.
+    chunk: usize,
+    /// Bias / non-finite slots per chunk (1 for 7D rows, `out_h*out_w` for 6D).
+    bias_per_chunk: usize,
+}
+
+/// Admit the parallel compose, or `None` to keep the sequential loops.
+///
+/// Declines on any non-standard layout (non-contiguous arrays, an outer axis
+/// that does not divide the buffer) and on a single chunk, where parallelism
+/// cannot pay. Also declines when per-chunk gradient partials would not fit a
+/// 512 MiB budget — the sequential path has no such allocation, so a very wide
+/// outer axis must not turn into an OOM.
+#[allow(clippy::too_many_arguments)]
+fn patches_par_state<'a>(
+    lower_patches: &'a ArrayD<f32>,
+    upper_patches: &'a ArrayD<f32>,
+    new_lower_patches: &'a mut ArrayD<f32>,
+    new_upper_patches: &'a mut ArrayD<f32>,
+    explicit_rows: bool,
+    row_count: usize,
+    out_c: usize,
+    out_h: usize,
+    out_w: usize,
+    track_gradients: bool,
+    num_input_neurons: usize,
+) -> Option<PatchesParState<'a>> {
+    let outer = if explicit_rows { row_count } else { out_c };
+    if outer < 2 {
+        return None;
+    }
+    if track_gradients {
+        const GRAD_PARTIAL_BUDGET_BYTES: usize = 512 << 20;
+        let bytes = outer
+            .checked_mul(num_input_neurons)?
+            .checked_mul(size_of::<f32>())?;
+        if bytes > GRAD_PARTIAL_BUDGET_BYTES {
+            return None;
+        }
+    }
+    let lp = lower_patches.as_slice()?;
+    let up = upper_patches.as_slice()?;
+    let total = lp.len();
+    if up.len() != total || total == 0 || !total.is_multiple_of(outer) {
+        return None;
+    }
+    let bias_per_chunk = if explicit_rows { 1 } else { out_h * out_w };
+    if bias_per_chunk == 0 {
+        return None;
+    }
+    let chunk = total / outer;
+    let nlp = new_lower_patches.as_slice_mut()?;
+    if nlp.len() != total {
+        return None;
+    }
+    let nup = new_upper_patches.as_slice_mut()?;
+    if nup.len() != total {
+        return None;
+    }
+    Some(PatchesParState {
+        lp,
+        up,
+        nlp,
+        nup,
+        outer,
+        chunk,
+        bias_per_chunk,
+    })
+}
 
 /// CROWN backward for ReLU in Patches mode with optimizable alpha parameters.
 ///
@@ -55,6 +136,18 @@ fn crown_relu_backward_patches_with_alpha_impl(
     track_gradients: bool,
 ) -> Result<(CrownBounds, Array1<f32>)> {
     use crate::layers::activations::{relu_crossing_upper_chord, LinearRelaxation};
+
+    // Alpha-ReLU is still affine-only. Refuse Anchored in O(1) before paired
+    // common validation walks every origin under a finite graph deadline.
+    let affine_geometry = bounds
+        .lower_a
+        .geometry
+        .require_affine("alpha-ReLU Patches backward")?;
+    bounds
+        .upper_a
+        .geometry
+        .require_affine("alpha-ReLU Patches backward")?;
+    bounds.lower_a.validate_common_geometry(&bounds.upper_a)?;
 
     let pre_flat = pre_activation.flatten();
     let pre_lower_nd = pre_flat
@@ -150,11 +243,11 @@ fn crown_relu_backward_patches_with_alpha_impl(
     // Materialize identity patches only when needed; otherwise borrow the
     // existing patches tensor to avoid an O(patch_size) deep clone (perf #3293).
     // `Cow` keeps the owned materialized tensor alive when identity, and borrows
-    // the input tensor directly otherwise. Metadata (stride/padding/shapes) is
-    // `Copy` and read straight from `bounds`, so no struct clone is needed.
+    // the input tensor directly otherwise. Geometry is validated up front and
+    // cloned only into the returned carrier, so no tensor clone is needed.
     let lower_owned;
     let lower_patches: &ArrayD<f32> = if bounds.lower_a.identity {
-        lower_owned = bounds.lower_a.materialize_identity();
+        lower_owned = bounds.lower_a.try_materialize_identity()?;
         lower_owned.patches.as_ref().ok_or_else(|| {
             NyError::InternalError("Materialized identity PatchesData has no patches tensor".into())
         })?
@@ -165,7 +258,7 @@ fn crown_relu_backward_patches_with_alpha_impl(
     };
     let upper_owned;
     let upper_patches: &ArrayD<f32> = if bounds.upper_a.identity {
-        upper_owned = bounds.upper_a.materialize_identity();
+        upper_owned = bounds.upper_a.try_materialize_identity()?;
         upper_owned.patches.as_ref().ok_or_else(|| {
             NyError::InternalError("Materialized identity PatchesData has no patches tensor".into())
         })?
@@ -174,14 +267,17 @@ fn crown_relu_backward_patches_with_alpha_impl(
             NyError::InternalError("Non-identity PatchesData has no patches tensor".into())
         })?
     };
+    if upper_patches.shape() != lower_patches.shape() {
+        return Err(NyError::ShapeMismatch {
+            expected: lower_patches.shape().to_vec(),
+            got: upper_patches.shape().to_vec(),
+        });
+    }
 
-    // Metadata for the output bounds (Copy tuples — read directly from `bounds`).
-    let lower_stride = bounds.lower_a.stride;
-    let lower_padding = bounds.lower_a.padding;
+    // Metadata for the output bounds. Anchored layouts are refused above until
+    // this coordinate transform is generalized to per-position origins.
     let lower_output_shape = bounds.lower_a.output_shape;
     let lower_input_shape = bounds.lower_a.input_shape;
-    let upper_stride = bounds.upper_a.stride;
-    let upper_padding = bounds.upper_a.padding;
     let upper_output_shape = bounds.upper_a.output_shape;
     let upper_input_shape = bounds.upper_a.input_shape;
 
@@ -224,40 +320,52 @@ fn crown_relu_backward_patches_with_alpha_impl(
             });
         }
     };
-    // Mixed-layout guard (docs/PATCHES_7D_COEFF_ERR_CLOSURE.md §14 D3): the
-    // compose and error loops below index BOTH patch tensors with the same
-    // arity derived from the LOWER side, so a 6D-lower/7D-upper pair (or vice
-    // versa) would panic deep inside the loop. Reject it cleanly instead.
-    if upper_patches.ndim() != shape.len() {
-        return Err(NyError::ShapeMismatch {
-            expected: vec![shape.len()],
-            got: vec![upper_patches.ndim()],
-        });
-    }
     let (in_c, kh, kw) = if explicit_rows {
         (shape[4], shape[5], shape[6])
     } else {
         (shape[3], shape[4], shape[5])
     };
+    let expected_shape = if explicit_rows {
+        vec![bounds.row_count, out_c, out_h, out_w, in_c_shape, kh, kw]
+    } else {
+        vec![out_c, out_h, out_w, in_c_shape, kh, kw]
+    };
+    if shape != expected_shape.as_slice() {
+        return Err(NyError::ShapeMismatch {
+            expected: expected_shape,
+            got: shape.to_vec(),
+        });
+    }
     let logical_rows = if explicit_rows {
         bounds.row_count
     } else {
         num_outputs
     };
+    if bounds.lower_b.len() != logical_rows || bounds.upper_b.len() != logical_rows {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![logical_rows, logical_rows],
+            got: vec![bounds.lower_b.len(), bounds.upper_b.len()],
+        });
+    }
 
-    // Both the compose loops and the error block below apply the LOWER side's
-    // geometry to the UPPER patches' relaxation lookups (parity with
-    // crown_patches.rs) — assert the sides agree.
-    debug_assert_eq!(
-        lower_stride, upper_stride,
-        "Patches stride mismatch between lower ({lower_stride:?}) and upper ({upper_stride:?})",
-    );
-    debug_assert_eq!(
-        lower_padding, upper_padding,
-        "Patches padding mismatch between lower ({lower_padding:?}) and upper ({upper_padding:?})",
-    );
-    let (sh, sw) = lower_stride;
-    let (pad_left, _pad_right, pad_top, _pad_bottom) = lower_padding;
+    for err in [
+        bounds.lower_a.coeff_err.as_ref(),
+        bounds.upper_a.coeff_err.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if err.len() != logical_rows {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![logical_rows],
+                got: vec![err.len()],
+            });
+        }
+    }
+
+    // Both compose sides use the geometry validated before materialization.
+    let (sh, sw) = affine_geometry.stride();
+    let (pad_left, _pad_right, pad_top, _pad_bottom) = affine_geometry.padding();
 
     let mut new_lower_patches = ArrayD::<f32>::zeros(lower_patches.raw_dim());
     let mut new_upper_patches = ArrayD::<f32>::zeros(upper_patches.raw_dim());
@@ -272,7 +380,182 @@ fn crown_relu_backward_patches_with_alpha_impl(
     };
     let mut gradient = Array1::<f32>::zeros(gradient_len);
 
-    if explicit_rows {
+    // #alpha-patches-par: parallel compose over the outermost patch axis.
+    //
+    // This module had ZERO parallel constructs while its non-alpha twin
+    // (`crown_patches.rs`) had thirty, so every root alpha-CROWN iteration ran
+    // this 7-deep nest on one thread. Measured on CIFAR100_resnet_medium: one
+    // alpha iteration cost ~96s with `crown_backward_step_patches` busy on ~2
+    // threads out of 32 and ~87% of all samples parked in rayon's idle path.
+    //
+    // The outer axis (`row` for 7D explicit rows, `oc` for 6D) partitions the
+    // coefficient, bias and non-finite writes into DISJOINT slices, so those
+    // stay bit-identical: each output element is still produced by the same
+    // `compose_lower`/`compose_upper` call on the same inputs, and each bias
+    // accumulates over its own chunk in the same inner order as before.
+    //
+    // The one cross-chunk quantity is `gradient`, which scatters into shared
+    // input-neuron slots. Each chunk accumulates a private partial that is then
+    // summed in ASCENDING CHUNK ORDER, so the result is deterministic and
+    // run-to-run reproducible, though not bit-identical to the old fully
+    // sequential accumulation (a partial restarts its running sum at 0 rather
+    // than continuing the global one). That is sound: the gradient only steers
+    // the alpha ascent's search direction and never enters a bound — any
+    // alpha in [0,1] the ascent visits is a valid relaxation.
+    let par_state = patches_par_state(
+        lower_patches,
+        upper_patches,
+        &mut new_lower_patches,
+        &mut new_upper_patches,
+        explicit_rows,
+        bounds.row_count,
+        out_c,
+        out_h,
+        out_w,
+        track_gradients,
+        num_input_neurons,
+    );
+    let composed_in_parallel = if let Some(st) = par_state {
+        let PatchesParState {
+            lp,
+            up,
+            nlp,
+            nup,
+            outer,
+            chunk,
+            bias_per_chunk,
+        } = st;
+        let lp_all: &[f32] = lp;
+        let _: Vec<()> = nlp
+            .par_chunks_mut(chunk)
+            .zip(nup.par_chunks_mut(chunk))
+            .zip(lp.par_chunks(chunk))
+            .zip(up.par_chunks(chunk))
+            .zip(
+                new_lower_b_f64.as_slice_mut().expect("contiguous lower_b")
+                    [..outer * bias_per_chunk]
+                    .par_chunks_mut(bias_per_chunk),
+            )
+            .zip(
+                new_upper_b_f64.as_slice_mut().expect("contiguous upper_b")
+                    [..outer * bias_per_chunk]
+                    .par_chunks_mut(bias_per_chunk),
+            )
+            .zip(lower_nonfinite[..outer * bias_per_chunk].par_chunks_mut(bias_per_chunk))
+            .zip(upper_nonfinite[..outer * bias_per_chunk].par_chunks_mut(bias_per_chunk))
+            .enumerate()
+            .map(|(outer_idx, item)| {
+                let (((((((nlp_c, nup_c), lp_c), up_c), nlb_c), nub_c), lnf_c), unf_c) = item;
+                // Reproduce the original iteration order exactly within the chunk.
+                let (oc_lo, oc_hi) = if explicit_rows {
+                    (0, out_c)
+                } else {
+                    (outer_idx, outer_idx + 1)
+                };
+                let mut flat = 0usize;
+                for oc in oc_lo..oc_hi {
+                    for oh in 0..out_h {
+                        for ow in 0..out_w {
+                            // Bias/non-finite slot within this chunk: the whole
+                            // row for 7D, the (oh,ow) cell of this `oc` for 6D.
+                            let slot = if explicit_rows { 0 } else { oh * out_w + ow };
+                            let _ = oc;
+                            for ic in 0..in_c {
+                                for ki in 0..kh {
+                                    for kj in 0..kw {
+                                        let idx = flat;
+                                        flat += 1;
+                                        let ih_raw = (oh * sh + ki) as isize - pad_top as isize;
+                                        let iw_raw = (ow * sw + kj) as isize - pad_left as isize;
+                                        if ih_raw < 0
+                                            || (ih_raw as usize) >= in_h_shape
+                                            || iw_raw < 0
+                                            || (iw_raw as usize) >= in_w_shape
+                                        {
+                                            continue;
+                                        }
+                                        let ih = ih_raw as usize;
+                                        let iw = iw_raw as usize;
+                                        let input_flat =
+                                            ic * in_h_shape * in_w_shape + ih * in_w_shape + iw;
+                                        let relax = &relaxations[input_flat];
+
+                                        let la = lp_c[idx];
+                                        let lr = compose::compose_lower(la, relax);
+                                        nlp_c[idx] = lr.new_coeff;
+                                        nlb_c[slot] += lr.intercept_contrib;
+                                        lnf_c[slot] |= lr.nonfinite;
+
+                                        let ua = up_c[idx];
+                                        let ur = compose::compose_upper(ua, relax);
+                                        nup_c[idx] = ur.new_coeff;
+                                        nub_c[slot] += ur.intercept_contrib;
+                                        unf_c[slot] |= ur.nonfinite;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
+        // GRADIENT stays sequential, in the original global order.
+        //
+        // Floating-point addition is not associative, so no parallel reduction
+        // of a scatter-accumulate can be bit-identical to the sequential one:
+        // a per-chunk partial restarts its running sum at 0 instead of
+        // continuing the global prefix, which measurably moved `gradient` by
+        // 1 ULP and broke the optimized-vs-reference bit-identity pins. The
+        // gradient is one predicated FMA per coefficient against two
+        // `compose_*` calls plus four writes in the loop above, so keeping it
+        // sequential costs a small fraction of the pass while preserving exact
+        // equality with the pre-parallel behavior for EVERY output.
+        if track_gradients {
+            let mut flat = 0usize;
+            let outer_span = if explicit_rows { outer } else { 1 };
+            for _ in 0..outer_span {
+                for oc in 0..out_c {
+                    let _ = oc;
+                    for oh in 0..out_h {
+                        for ow in 0..out_w {
+                            for ic in 0..in_c {
+                                for ki in 0..kh {
+                                    for kj in 0..kw {
+                                        let idx = flat;
+                                        flat += 1;
+                                        let ih_raw = (oh * sh + ki) as isize - pad_top as isize;
+                                        let iw_raw = (ow * sw + kj) as isize - pad_left as isize;
+                                        if ih_raw < 0
+                                            || (ih_raw as usize) >= in_h_shape
+                                            || iw_raw < 0
+                                            || (iw_raw as usize) >= in_w_shape
+                                        {
+                                            continue;
+                                        }
+                                        let input_flat = ic * in_h_shape * in_w_shape
+                                            + (ih_raw as usize) * in_w_shape
+                                            + iw_raw as usize;
+                                        let la = lp_all[idx];
+                                        if la > 0.0 && is_crossing[input_flat] {
+                                            gradient[input_flat] +=
+                                                la * pre_lower_slice[input_flat];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    } else {
+        false
+    };
+
+    if composed_in_parallel {
+        // handled above
+    } else if explicit_rows {
         for row in 0..bounds.row_count {
             for oc in 0..out_c {
                 for oh in 0..out_h {
@@ -404,10 +687,9 @@ fn crown_relu_backward_patches_with_alpha_impl(
         let old_lower_err = bounds.lower_a.coeff_err.as_ref();
         let old_upper_err = bounds.upper_a.coeff_err.as_ref();
         // Hard length checks (spec I6): a `Some` err whose length differs
-        // from the spec-row count is a construction bug; the 6D-style silent
-        // `.get(i).unwrap_or(0.0)` would under-count — the false-proof
-        // direction. The hard error routes the caller to its sound dense
-        // fallback.
+        // from the spec-row count is a construction bug. The shared preflight
+        // already enforces this for both 6D and 7D; retain these local checks
+        // beside the direct row indexing as defense in depth.
         if let Some(e) = old_lower_err {
             if e.len() != bounds.row_count {
                 return Err(NyError::ShapeMismatch {
@@ -472,153 +754,211 @@ fn crown_relu_backward_patches_with_alpha_impl(
         // gradient `+=` in the compose loop accumulates across rows — and the
         // err pass mirrors that (read-only over the coefficient tensors, so
         // coefficient/bias VALUE accumulation order is untouched; I3).
-        for row in 0..bounds.row_count {
-            let oe_l = old_lower_err.map_or(0.0, |e| sanitize(e[row]));
-            let oe_u = old_upper_err.map_or(0.0, |e| sanitize(e[row]));
+        // #alpha-err-hoist: `max_slope_sum` and `int_sum` are ROW-INVARIANT.
+        //
+        // Inside the tap nest below, `input_flat` is
+        // `ic*in_h*in_w + ih*in_w + iw` with `ih`/`iw` derived only from
+        // `(oh,ow,ki,kj)` — it does not depend on `row` or on any coefficient.
+        // So `relax`, and therefore `ss` and the intercept term, are identical
+        // for every one of `row_count` rows, and this pass was recomputing the
+        // same two f64 scalars `row_count` times over the whole tap volume.
+        // Hoisted here and computed once.
+        //
+        // BIT-IDENTICAL: `max_slope_sum` is a max (order-free), and `int_sum`
+        // accumulates over exactly the same non-padding taps in exactly the
+        // same order as each row's copy did, so it reproduces that copy's
+        // value bit for bit.
+        let mut max_slope_sum = 0.0f64;
+        let mut int_sum = 0.0f64;
+        for oc in 0..out_c {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let _ = oc;
+                    for ic in 0..in_c {
+                        for ki in 0..kh {
+                            for kj in 0..kw {
+                                let ih_raw = (oh * sh + ki) as isize - pad_top as isize;
+                                let iw_raw = (ow * sw + kj) as isize - pad_left as isize;
+                                if ih_raw < 0
+                                    || (ih_raw as usize) >= in_h_shape
+                                    || iw_raw < 0
+                                    || (iw_raw as usize) >= in_w_shape
+                                {
+                                    continue;
+                                }
+                                let input_flat = ic * in_h_shape * in_w_shape
+                                    + (ih_raw as usize) * in_w_shape
+                                    + iw_raw as usize;
+                                let relax = &relaxations[input_flat];
+                                let ss = f64::from(relax.lower_slope).abs()
+                                    + f64::from(relax.upper_slope).abs();
+                                if ss > max_slope_sum {
+                                    max_slope_sum = ss;
+                                }
+                                int_sum += f64::from(relax.lower_intercept).abs()
+                                    + f64::from(relax.upper_intercept).abs();
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-            let mut max_slope_sum = 0.0f64;
-            let mut int_sum = 0.0f64;
-            let mut max_lower_gap = 0.0f64;
-            let mut max_upper_gap = 0.0f64;
-            // ABS_σ initialized with |b_σ[r]| — the compose fold accumulates
-            // starting from the incoming bias, so Higham's γ_n·ABS bound
-            // must include it (spec §6.2 (2b)).
-            let mut abs_lower_sum = f64::from(bounds.lower_b[row]).abs();
-            let mut abs_upper_sum = f64::from(bounds.upper_b[row]).abs();
-            for oc in 0..out_c {
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        for ic in 0..in_c {
-                            for ki in 0..kh {
-                                for kj in 0..kw {
-                                    let ih_raw = (oh * sh + ki) as isize - pad_top as isize;
-                                    let iw_raw = (ow * sw + kj) as isize - pad_left as isize;
-                                    if ih_raw < 0
-                                        || (ih_raw as usize) >= in_h_shape
-                                        || iw_raw < 0
-                                        || (iw_raw as usize) >= in_w_shape
-                                    {
-                                        continue;
-                                    }
-                                    let ih = ih_raw as usize;
-                                    let iw = iw_raw as usize;
-                                    let input_flat =
-                                        ic * in_h_shape * in_w_shape + ih * in_w_shape + iw;
-                                    let relax = &relaxations[input_flat];
+        // #alpha-err-par: each row reads only its own coefficient slice and
+        // writes only its own `[row]` bias/err slots, so the rows are a pure
+        // independent map — the last fully serial pass in this function after
+        // #alpha-patches-par parallelized the compose. Per-row f64
+        // accumulation order is untouched (each row still folds its own taps
+        // in the original nest order), so every emitted value is bit-identical.
+        let new_lower_patches_ro = &new_lower_patches;
+        let new_upper_patches_ro = &new_upper_patches;
+        let row_terms: Vec<(f64, f64, f64, f64)> = (0..bounds.row_count)
+            .into_par_iter()
+            .map(|row| {
+                let oe_l = old_lower_err.map_or(0.0, |e| sanitize(e[row]));
+                let oe_u = old_upper_err.map_or(0.0, |e| sanitize(e[row]));
 
-                                    let ss = f64::from(relax.lower_slope).abs()
-                                        + f64::from(relax.upper_slope).abs();
-                                    if ss > max_slope_sum {
-                                        max_slope_sum = ss;
-                                    }
-                                    int_sum += f64::from(relax.lower_intercept).abs()
-                                        + f64::from(relax.upper_intercept).abs();
-
-                                    // EXACT directed-rounding gap per side
-                                    // (mirror compose_*): compose_lower uses
-                                    // the lower slope/intercept for a>0 else
-                                    // the upper pair; compose_upper the
-                                    // reverse.
-                                    let la = lower_patches[[row, oc, oh, ow, ic, ki, kj]];
-                                    if la != 0.0 {
-                                        let (slope_used, intercept_used) = if la > 0.0 {
-                                            (
-                                                f64::from(relax.lower_slope),
-                                                f64::from(relax.lower_intercept),
-                                            )
-                                        } else {
-                                            (
-                                                f64::from(relax.upper_slope),
-                                                f64::from(relax.upper_intercept),
-                                            )
-                                        };
-                                        let stored = f64::from(
-                                            new_lower_patches[[row, oc, oh, ow, ic, ki, kj]],
-                                        );
-                                        let gap = (f64::from(la) * slope_used - stored).abs();
-                                        if gap > max_lower_gap {
-                                            max_lower_gap = gap;
+                let mut max_lower_gap = 0.0f64;
+                let mut max_upper_gap = 0.0f64;
+                // ABS_σ initialized with |b_σ[r]| — the compose fold accumulates
+                // starting from the incoming bias, so Higham's γ_n·ABS bound
+                // must include it (spec §6.2 (2b)).
+                let mut abs_lower_sum = f64::from(bounds.lower_b[row]).abs();
+                let mut abs_upper_sum = f64::from(bounds.upper_b[row]).abs();
+                for oc in 0..out_c {
+                    for oh in 0..out_h {
+                        for ow in 0..out_w {
+                            for ic in 0..in_c {
+                                for ki in 0..kh {
+                                    for kj in 0..kw {
+                                        let ih_raw = (oh * sh + ki) as isize - pad_top as isize;
+                                        let iw_raw = (ow * sw + kj) as isize - pad_left as isize;
+                                        if ih_raw < 0
+                                            || (ih_raw as usize) >= in_h_shape
+                                            || iw_raw < 0
+                                            || (iw_raw as usize) >= in_w_shape
+                                        {
+                                            continue;
                                         }
-                                        abs_lower_sum += (f64::from(la) * intercept_used).abs();
-                                    }
-                                    let ua = upper_patches[[row, oc, oh, ow, ic, ki, kj]];
-                                    if ua != 0.0 {
-                                        let (slope_used, intercept_used) = if ua > 0.0 {
-                                            (
-                                                f64::from(relax.upper_slope),
-                                                f64::from(relax.upper_intercept),
-                                            )
-                                        } else {
-                                            (
-                                                f64::from(relax.lower_slope),
-                                                f64::from(relax.lower_intercept),
-                                            )
-                                        };
-                                        let stored = f64::from(
-                                            new_upper_patches[[row, oc, oh, ow, ic, ki, kj]],
-                                        );
-                                        let gap = (f64::from(ua) * slope_used - stored).abs();
-                                        if gap > max_upper_gap {
-                                            max_upper_gap = gap;
+                                        let ih = ih_raw as usize;
+                                        let iw = iw_raw as usize;
+                                        let input_flat =
+                                            ic * in_h_shape * in_w_shape + ih * in_w_shape + iw;
+                                        let relax = &relaxations[input_flat];
+
+                                        // EXACT directed-rounding gap per side
+                                        // (mirror compose_*): compose_lower uses
+                                        // the lower slope/intercept for a>0 else
+                                        // the upper pair; compose_upper the
+                                        // reverse.
+                                        let la = lower_patches[[row, oc, oh, ow, ic, ki, kj]];
+                                        if la != 0.0 {
+                                            let (slope_used, intercept_used) = if la > 0.0 {
+                                                (
+                                                    f64::from(relax.lower_slope),
+                                                    f64::from(relax.lower_intercept),
+                                                )
+                                            } else {
+                                                (
+                                                    f64::from(relax.upper_slope),
+                                                    f64::from(relax.upper_intercept),
+                                                )
+                                            };
+                                            let stored = f64::from(
+                                                new_lower_patches_ro[[row, oc, oh, ow, ic, ki, kj]],
+                                            );
+                                            let gap = (f64::from(la) * slope_used - stored).abs();
+                                            if gap > max_lower_gap {
+                                                max_lower_gap = gap;
+                                            }
+                                            abs_lower_sum += (f64::from(la) * intercept_used).abs();
                                         }
-                                        abs_upper_sum += (f64::from(ua) * intercept_used).abs();
+                                        let ua = upper_patches[[row, oc, oh, ow, ic, ki, kj]];
+                                        if ua != 0.0 {
+                                            let (slope_used, intercept_used) = if ua > 0.0 {
+                                                (
+                                                    f64::from(relax.upper_slope),
+                                                    f64::from(relax.upper_intercept),
+                                                )
+                                            } else {
+                                                (
+                                                    f64::from(relax.lower_slope),
+                                                    f64::from(relax.lower_intercept),
+                                                )
+                                            };
+                                            let stored = f64::from(
+                                                new_upper_patches_ro[[row, oc, oh, ow, ic, ki, kj]],
+                                            );
+                                            let gap = (f64::from(ua) * slope_used - stored).abs();
+                                            if gap > max_upper_gap {
+                                                max_upper_gap = gap;
+                                            }
+                                            abs_upper_sum += (f64::from(ua) * intercept_used).abs();
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            // Bias discharge D_σ into the f64 accumulator BEFORE the directed
-            // cast (spec I4). `oe == 0` short-circuits `0·∞ = NaN` for
-            // degenerate ±∞ relaxation intercepts (spec I5); any non-finite D
-            // (∞ from a poisoned carried err or a degenerate intercept in the
-            // receptive field, or NaN from ∞·0) poisons the bias OUTWARD —
-            // skipping would emit a finite bound the true range can escape
-            // (false-VERIFIED class; spec §14 A2).
-            let disc_l = gamma_bar * abs_lower_sum
-                + if oe_l != 0.0 {
-                    oe_l * (int_sum * (1.0 + gamma_bar))
+                // Bias discharge D_σ into the f64 accumulator BEFORE the directed
+                // cast (spec I4). `oe == 0` short-circuits `0·∞ = NaN` for
+                // degenerate ±∞ relaxation intercepts (spec I5); any non-finite D
+                // (∞ from a poisoned carried err or a degenerate intercept in the
+                // receptive field, or NaN from ∞·0) poisons the bias OUTWARD —
+                // skipping would emit a finite bound the true range can escape
+                // (false-VERIFIED class; spec §14 A2).
+                let disc_l = gamma_bar * abs_lower_sum
+                    + if oe_l != 0.0 {
+                        oe_l * (int_sum * (1.0 + gamma_bar))
+                    } else {
+                        0.0
+                    };
+
+                let disc_u = gamma_bar * abs_upper_sum
+                    + if oe_u != 0.0 {
+                        oe_u * (int_sum * (1.0 + gamma_bar))
+                    } else {
+                        0.0
+                    };
+
+                // Err emission: slope envelope (row-wide MAX — one scalar covers
+                // every coefficient of the row) + exact gap; f64 compute, one
+                // outward next_up_f32 at the f32 cast (spec I4). Non-finite (a
+                // poisoned +INF carried err, or NaN from `∞·0` on an all-padding
+                // row) emits +INF — the degrade poison — NEVER NaN (spec I5).
+                // Nonfinite rows are zeroed + bias-poisoned by the fallback
+                // below, so err 0.0 is exact there (vacuous certificate).
+                let lterm = if oe_l != 0.0 {
+                    oe_l * max_slope_sum
                 } else {
                     0.0
                 };
+                let uterm = if oe_u != 0.0 {
+                    oe_u * max_slope_sum
+                } else {
+                    0.0
+                };
+                let lv = lterm + max_lower_gap;
+                let uv = uterm + max_upper_gap;
+                (disc_l, disc_u, lv, uv)
+            })
+            .collect();
+
+        // Apply serially (O(row_count)); identical branch structure to the
+        // pre-parallel code, just fed from the collected per-row terms.
+        for (row, (disc_l, disc_u, lv, uv)) in row_terms.into_iter().enumerate() {
             if disc_l.is_finite() {
                 new_lower_b_f64[row] -= disc_l;
             } else {
                 new_lower_b_f64[row] = f64::NEG_INFINITY;
             }
-            let disc_u = gamma_bar * abs_upper_sum
-                + if oe_u != 0.0 {
-                    oe_u * (int_sum * (1.0 + gamma_bar))
-                } else {
-                    0.0
-                };
             if disc_u.is_finite() {
                 new_upper_b_f64[row] += disc_u;
             } else {
                 new_upper_b_f64[row] = f64::INFINITY;
             }
-
-            // Err emission: slope envelope (row-wide MAX — one scalar covers
-            // every coefficient of the row) + exact gap; f64 compute, one
-            // outward next_up_f32 at the f32 cast (spec I4). Non-finite (a
-            // poisoned +INF carried err, or NaN from `∞·0` on an all-padding
-            // row) emits +INF — the degrade poison — NEVER NaN (spec I5).
-            // Nonfinite rows are zeroed + bias-poisoned by the fallback
-            // below, so err 0.0 is exact there (vacuous certificate).
-            let lterm = if oe_l != 0.0 {
-                oe_l * max_slope_sum
-            } else {
-                0.0
-            };
-            let uterm = if oe_u != 0.0 {
-                oe_u * max_slope_sum
-            } else {
-                0.0
-            };
-            let lv = lterm + max_lower_gap;
-            let uv = uterm + max_upper_gap;
             new_lower_err[row] = if lower_nonfinite[row] {
                 0.0
             } else if !lv.is_finite() {
@@ -640,14 +980,19 @@ fn crown_relu_backward_patches_with_alpha_impl(
         let old_upper_err = bounds.upper_a.coeff_err.as_ref();
         let mut new_lower_err = Array1::<f32>::zeros(logical_rows);
         let mut new_upper_err = Array1::<f32>::zeros(logical_rows);
+        let sanitize = |value: f32| -> f64 {
+            if value.is_finite() && value >= 0.0 {
+                f64::from(value)
+            } else {
+                f64::INFINITY
+            }
+        };
         for oc in 0..out_c {
             for oh in 0..out_h {
                 for ow in 0..out_w {
                     let j = oc * out_h * out_w + oh * out_w + ow;
-                    let oe_l =
-                        old_lower_err.map_or(0.0, |e| f64::from(e.get(j).copied().unwrap_or(0.0)));
-                    let oe_u =
-                        old_upper_err.map_or(0.0, |e| f64::from(e.get(j).copied().unwrap_or(0.0)));
+                    let oe_l = old_lower_err.map_or(0.0, |e| sanitize(e[j]));
+                    let oe_u = old_upper_err.map_or(0.0, |e| sanitize(e[j]));
 
                     let mut max_slope_sum = 0.0f64;
                     let mut int_sum = 0.0f64;
@@ -751,15 +1096,21 @@ fn crown_relu_backward_patches_with_alpha_impl(
                     } else {
                         0.0
                     };
+                    let lower_total = lterm + max_lower_gap;
+                    let upper_total = uterm + max_upper_gap;
                     new_lower_err[j] = if lower_nonfinite[j] {
                         0.0
+                    } else if !lower_total.is_finite() {
+                        f32::INFINITY
                     } else {
-                        next_up_f32((lterm + max_lower_gap) as f32)
+                        next_up_f32(lower_total as f32)
                     };
                     new_upper_err[j] = if upper_nonfinite[j] {
                         0.0
+                    } else if !upper_total.is_finite() {
+                        f32::INFINITY
                     } else {
-                        next_up_f32((uterm + max_upper_gap) as f32)
+                        next_up_f32(upper_total as f32)
                     };
                 }
             }
@@ -833,13 +1184,12 @@ fn crown_relu_backward_patches_with_alpha_impl(
         }
     }
 
-    let result = CrownBounds::Patches(Box::new(PatchesLinearBounds {
+    let mut folded = PatchesLinearBounds {
         row_count: bounds.row_count,
         lower_a: PatchesData {
             coeff_err: lower_coeff_err,
             patches: Some(new_lower_patches),
-            stride: lower_stride,
-            padding: lower_padding,
+            geometry: bounds.lower_a.geometry.clone(),
             identity: false,
             output_shape: lower_output_shape,
             input_shape: lower_input_shape,
@@ -849,15 +1199,29 @@ fn crown_relu_backward_patches_with_alpha_impl(
         upper_a: PatchesData {
             coeff_err: upper_coeff_err,
             patches: Some(new_upper_patches),
-            stride: upper_stride,
-            padding: upper_padding,
+            geometry: bounds.upper_a.geometry.clone(),
             identity: false,
             output_shape: upper_output_shape,
             input_shape: upper_input_shape,
             unstable_idx: None,
         },
         upper_b: new_upper_b,
-    }));
+    };
+
+    // #patches-eager-err: discharge the carried coefficient error HERE, against
+    // the pre-activation cut these columns multiply — the same policy the dense
+    // path applies at every activation backward step
+    // (`LinearBounds::fold_coeff_err_over_box_eager`, dispatched at
+    // layers/layer_enum/dispatch.rs). Without it a conv stack carries the error
+    // to the network input and pays for it after ABS-composition through every
+    // remaining layer, which grows at IBP scale with depth. Rows with a
+    // non-finite penalty, and layouts the fold does not model exactly, keep
+    // carrying — never a new degrade. See bounds/patches/eager_err.rs.
+    if crate::bounds::patches::eager_err_enabled() {
+        folded.fold_coeff_err_over_box_eager(pre_activation);
+    }
+
+    let result = CrownBounds::Patches(Box::new(folded));
 
     Ok((result, gradient))
 }

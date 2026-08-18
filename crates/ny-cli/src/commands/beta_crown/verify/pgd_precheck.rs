@@ -4,7 +4,7 @@
 
 //! PGD precheck types and wrappers for the sequential MIP path.
 //!
-//! Part of #3865: PGD-to-HiGHS warm start.
+//! Part of #3865: PGD-to-MIP warm start.
 
 use anyhow::Result;
 use ndarray::ArrayD;
@@ -23,14 +23,14 @@ pub(in crate::commands::beta_crown) struct PgdMipPrecheck {
     /// When present, the caller should return `Violated` immediately.
     pub confirmed_counterexample: Option<(ArrayD<f32>, ArrayD<f32>)>,
     /// The best PGD candidate input, even when it did not prove a full counterexample.
-    /// Used to warm-start the HiGHS MIP solver.
+    /// Used to warm-start the MIP solver.
     pub warm_start_candidate: Option<ArrayD<f32>>,
 }
 
 /// PGD upfront check for the sequential MIP path.
 ///
 /// Returns the richer `PgdMipPrecheck` so callers can preserve the best PGD
-/// candidate for HiGHS warm-starting when no confirmed counterexample exists.
+/// candidate for MIP warm-starting when no confirmed counterexample exists.
 // Justification: the wrapper deliberately preserves the full attack context at
 // the callsite because the MIP path chooses deadline and engine externally.
 #[allow(clippy::too_many_arguments)]

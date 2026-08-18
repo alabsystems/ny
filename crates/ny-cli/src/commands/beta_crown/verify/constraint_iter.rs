@@ -265,7 +265,7 @@ fn format_status(status: &BabVerificationStatus) -> &'static str {
     match status {
         BabVerificationStatus::Verified => "VIOLATED (safe)",
         BabVerificationStatus::Violated { .. } => "VIOLATED (counterexample found)",
-        BabVerificationStatus::PotentialViolation => "MAY HOLD",
+        BabVerificationStatus::PotentialViolation { .. } => "MAY HOLD",
         BabVerificationStatus::Unknown { .. } => "UNKNOWN",
         BabVerificationStatus::Timeout => "TIMEOUT",
     }

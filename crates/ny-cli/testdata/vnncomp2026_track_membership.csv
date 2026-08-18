@@ -1,0 +1,33 @@
+# Snapshot of the official VNN-COMP 2026 benchmark-voting result
+# https://github.com/VNN-COMP/vnncomp2026/issues/6#issuecomment-4643430287
+# Benchmark corpus commit 303f2327a8e8411efc4457da03d2016ce42733cf
+regular,acasxu_2023
+regular,cersyve
+regular,cgan2026
+regular,challenging_certified_training_2026
+regular,cifar100_2024
+regular,collins_rul_cnn_2022
+regular,cora_2024
+regular,dist_shift_2023
+regular,linearizenn_2024
+regular,lsnc_relu
+regular,malbeware
+regular,metaroom_2023
+regular,ml4acopf_2024
+regular,nn4sys
+regular,relusplitter_2026
+regular,safenlp_2024
+regular,sat_relu
+regular,soundnessbench_2026
+regular,tinyimagenet_2024
+regular,tllverifybench_2023
+regular,traffic_signs_recognition_2023
+regular,vggnet16_2022
+regular,vit_2023
+regular,yolo_2023
+extended,adaptive_cruise_control_non_linear_2026
+extended,cctsdb_yolo_2023
+extended,collins_aerospace_benchmark
+extended,isomorphic_acasxu_2026
+extended,monotonic_acasxu_2026
+extended,smart_turn_multimodal_2026

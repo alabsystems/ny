@@ -14,13 +14,44 @@
 //! Built incrementally: R1 = single Linear layer (no bias). Activation, bias,
 //! multi-layer and Conv2d follow, each gated behind a Metal soundness test
 //! against the host reference.
+//!
+//! # Charged-authority guard coverage (#flush-charge Lane A, audited 2026-08-13)
+//!
+//! Under CHARGED-flush authority (`QualifiedWithFlushCharge`,
+//! `ops/sound_authority.rs`) every route that can reach GPU arithmetic must
+//! either (a) pass [`charged_walk_guard`] and the audited charge sites, or
+//! (b) be structurally unreachable / verdict-dead, with a PIN that fails the
+//! moment that stops being true. One row per route; "pin" names the test(s)
+//! that break if the row's claim drifts. Routes GA1/GA2 are the only two
+//! chokepoints that carry charged arithmetic; everything else must reduce to
+//! them or be refused/dead.
+//!
+//! | # | Route (entry points) | Guard / immunity | Pin |
+//! |---|---|---|---|
+//! | GA1 | THE walk body `crown_backward_sound_resident_coeff_seeded_err_gather` — every bounds/coefficients entry funnels its fold arithmetic here: `crown_backward_sound_resident{,_seeded}`, `..._coeff_seeded{,_err}`, both certified-coeffs egresses, `..._residual`, `backward_branch_fine`/`backward_branch_cut_fold`, every resnet branch sub-walk (flat, batched wide, beta/grad/vjp inners) | GUARDED: authority recheck (typed refusal when neither authority holds) → `charged_walk_guard(layers, policy, eft_requested)` → armed charge sites (`charged_bias_slack_or`, `charged_act_bias_slack_or`, `daz_cover_armed` GEMM flush cover) — ALL before the walk's single `run_gpu_checked` GPU section | `charged_walk_guard_tests::*`; `charged_route_coverage_tests::charged_route_funnels_and_guard_ordering_are_pinned` |
+//! | GA2 | Concretize funnel `concretize_sound_gpu_batched` (crown_concretize_sound.rs; reached via `concretize_resident_coeff{,_batched}`, the resnet concretize, and the host driver) | GUARDED: charged consult (EFT arm refused, subnormal input-box endpoints refused, `charged_concretize_slack` widening) + armed #u4 C1 row-word consult, all pre-dispatch | `flush_charge_oracle` §F oracles; `taint_consult_is_fail_closed_on_every_arm`; ordering row in `charged_route_funnels_and_guard_ordering_are_pinned` |
+//! | GA3 | #seg-resident device stream (`NY_SEG_RESIDENT=1` seed/keep + `seg_merge_dispatch` f32 error lanes) | STRUCTURALLY VERDICT-DEAD under BOTH authorities: worded ⇒ typed refusal at the sub-walk entry (no word channel across device-resident segment boundaries); unworded ⇒ `taint_rows: None` (the merge shell and `download_resident_coeff`) and the armed C1 consult / coeffs firewall refuses absent words. The un-audited on-device merge error lanes can therefore never feed a verdict | `taint_resnet_seg_resident_stream_refuses` (worded); `unworded_frontier_is_verdict_dead_at_the_concretize_funnel` (unworded); `taint_word_gate_is_armed_per_the_2026_08_11_review` (C1 const) |
+//! | GA4 | Host f64 seams: the residual skip merge (`crown_backward_sound_resident_residual` loop), `merge_streams`, `add_skip_stream`, `concretize_error_into_bias` | IMMUNE: host IEEE-754 f64 with gradual underflow (ladder rung 4 attests the host reference); a flushing GPU adapter cannot touch this arithmetic, and its outputs re-enter GA1/GA2 | `charged_route_coverage_tests::host_merge_seams_preserve_subnormal_error_mass` (fails if this arithmetic is moved onto a flushing device or starts dropping subnormal error mass) |
+//! | GA5 | `crown_backward_sound_host` (host driver dispatching the raw diagnostic GEMM) | REFUSED under charged authority: typed refusal at entry — its Higham/γ charges are not audited against the flush model. It also has no production caller (`#[allow(dead_code)]`, tests only) | host-driver row in `charged_route_funnels_and_guard_ordering_are_pinned` |
+//! | GA6 | Fast unsound path (`crown_backward_gpu`, `crown_backward_gpu_seeded`) | NO verdict authority in ANY mode (diagnostics tier, TAINT_GUARD_AUDIT.md §3); the routing seam consumes only the `*_sound` entries behind `provides_sound_gpu_crown` | `sound_authority::gpu_tests::ordinary_device_is_unconditionally_unarmed`; ny-propagate sound_gpu_gate routing tests |
+//! | GA7 | Raw `GemmEngine` surface (ops/gemm.rs) | Quarantined typed `Err` on every raw op; the ONLY authority-bearing accessor is `as_gpu_crown_backward`, gated on the same two cached predicates as `provides_sound_gpu_crown` | `ordinary_device_is_unconditionally_unarmed`; `explicit_constructor_is_typed_and_fail_closed` |
+//! | GA8 | Cut-fold kernels (`cut_fold_resident`) | UNREACHABLE: ny-core `resident_cut_fold_proof_authority_enabled()` is compile-time `false`, so `active_resident_cut_fold()` is always `None` and the cut-fold branch never arms | ny-core `resident_cut_fold_registry_cannot_acquire_proof_authority` |
+//! | GA9 | MaxPool2d / dual-alpha kernels | UNREACHABLE in the sound walk: `resident_fold_plan` rejects the layer kinds, and `charged_walk_guard` refuses them independently (selection/comparison under DAZ is un-audited) | `charged_walk_guard_admits_clean_layers_and_refuses_each_channel`; the `resident_preflight_*` rejection tests |
+//! | GA10 | EFT channel (min-combine, concretize EFT arm) | REFUSED: `eft_forbidden` at the walk guard AND the concretize consult; `eft_primitives_cached()` is additionally false on a flushing adapter by the #u2b entailment | guard EFT arm in `charged_walk_guard_admits_clean_layers_and_refuses_each_channel`; `report_ladder_and_pin_conjunction` (#u2b) |
+//! | GA11 | `FlValueGemmDevice` (fl_value_gemm.rs) | SEPARATE, never-charged device: consults no charged policy; its single-kernel magnitude refusal (audit G10) is exact by construction and unchanged by charged mode | fl_value_gemm refusal tests |
+//! | GA12 | Steering channels (joint-alpha, alpha-gradient, point-VJP, attack/gradient steering) | NO bound state published (gradients/captures only steer optimization; any α ≥ relaxation-valid / β ≥ 0 stays sound); bounds still funnel through GA1+GA2 | — (soundness does not depend on these values) |
 
 use std::sync::Arc;
 
-use ny_core::{GpuCrownLayer, GpuCrownSeed, GpuResnetSegment, NyError, Result};
+use ny_core::dd::next_up_f64;
+use ny_core::{
+    f32_to_f64_exact, f64_to_f32_down, CertifiedWeightError, GpuCrownLayer, GpuCrownSeed,
+    GpuResnetSegment, NyError, Result,
+};
 
 use super::super::WgpuDevice;
 use super::gemm::select_gemm_dispatch;
+use super::intermediate_sweep_carrier::{DeviceSweepCarrier, SweepCarrierLayout};
 use super::resident_weights::WeightForm;
 use crate::wgpu_device::params::{ConvCol2imParams, ConvReshapeParams, GemmParams};
 // `gamma_k_f32`, `combine_slack_f32`, `up_f32` now live in the shared sound-consts
@@ -95,8 +126,30 @@ struct SegMergeParams {
 /// the gate (`verify_eft_primitives`) is checked at the dispatch site.
 /// Deliberately NOT OnceLock-cached: read once per FOLD (not per layer), so
 /// the differential A/B tests can flip it under `with_env_edits`.
+///
+/// NOTE the flag BUNDLES two claims beyond residual MEASUREMENT, both now
+/// discharged by dedicated oracles (sound_authority.rs ledger, 2026-08-10):
+/// * U5, the a-priori Lipschitz propagation swap (`|sel|` / `max(|ls|,|us|)`
+///   instead of `|ls|+|us|`, coefficients and intercepts) — validated against
+///   the exact worst-realization sup in `u5_activation_lipschitz::{
+///   act_eft_err_encloses_worst_realization,
+///   act_intercept_bias_eft_err_encloses_worst_realization}`;
+/// * U6, concretize is NOT value-neutral in EFT mode (by design; both modes
+///   enclose, refusal is bit-identical) — validated in
+///   `crown_concretize_sound::tests::
+///   u6_concretize_eft_vs_legacy_enclose_and_fail_closed_identity`.
 fn eft_err_env_enabled() -> bool {
     std::env::var("NY_EFT_ERR").ok().as_deref() == Some("1")
+}
+
+/// Governed live read for the resident segment-composition diagnostics.
+///
+/// This deliberately remains uncached: scoped diagnostic tests toggle the
+/// probe within one process, and every historical reader sampled it live.
+fn seg_probe_armed() -> bool {
+    ny_levers::read(&ny_levers::decls::telemetry::SEG_PROBE)
+        .value
+        .as_bool()
 }
 
 /// #seg-resident: device-side twin of [`ResidentCoeff`] — the coefficient
@@ -131,17 +184,86 @@ pub(crate) struct ResidentIoState {
     pub(crate) zero_bias_seed: bool,
     pub(crate) keep: bool,
     pub(crate) out: Option<ResidentCoeffBufs>,
+    /// Authoritative intermediate-sweep seed/keep transport. Unlike the
+    /// legacy segment stream above, this owns all four word twins and the
+    /// sticky row accumulator, so it may cross a resident fold without
+    /// laundering C1 taint state.
+    sweep_seed: Option<DeviceSweepCarrier>,
+    sweep_keep: bool,
+    sweep_out: Option<DeviceSweepCarrier>,
 }
 
 thread_local! {
-    /// #seg-resident: THREAD-LOCAL by design, NOT a device field — under
-    /// `NY_BAB_RESNET_PARALLEL=1` concurrent Rayon workers each run their own
+    /// #seg-resident: THREAD-LOCAL by design, NOT a device field — the
+    /// per-domain BaB fan-out (`NY_BAB_RESNET_PARALLEL=1`, default-off) runs
+    /// concurrent Rayon workers that each perform their own
     /// resnet gather; a shared slot would let worker A's fold consume worker
     /// B's armed seed (same network ⇒ same dims ⇒ the shape check passes ⇒
     /// WRONG frontier ⇒ false-VERIFIED risk). Arm and consume always happen on
     /// the same thread (the gather calls the fold synchronously).
+    ///
+    /// This isolation is load-bearing whenever the fan-out is armed, so it must
+    /// survive any future attempt to enable it by default. Do not hoist this into
+    /// `WgpuDevice`.
     static RESIDENT_IO: std::cell::RefCell<ResidentIoState> =
         std::cell::RefCell::new(ResidentIoState::default());
+}
+
+/// Panic/error-safe ownership of the worded resident seed/keep TLS seam.
+/// The fold synchronously consumes the seed and deposits exactly one output;
+/// every other exit clears the slot so a later unrelated walk cannot inherit
+/// stale device buffers.
+struct SweepResidentIoGuard {
+    armed: bool,
+}
+
+impl SweepResidentIoGuard {
+    fn arm(seed: DeviceSweepCarrier) -> Result<Self> {
+        RESIDENT_IO.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.seed.is_some()
+                || slot.zero_bias_seed
+                || slot.keep
+                || slot.out.is_some()
+                || slot.sweep_seed.is_some()
+                || slot.sweep_keep
+                || slot.sweep_out.is_some()
+            {
+                return Err(NyError::InternalError(
+                    "nested resident seed/keep carrier scope".into(),
+                ));
+            }
+            slot.sweep_seed = Some(seed);
+            slot.sweep_keep = true;
+            Ok(Self { armed: true })
+        })
+    }
+
+    fn take_output(mut self) -> Result<DeviceSweepCarrier> {
+        let output = RESIDENT_IO.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            slot.sweep_seed = None;
+            slot.sweep_keep = false;
+            slot.sweep_out.take()
+        });
+        self.armed = false;
+        output.ok_or_else(|| {
+            NyError::InternalError("worded resident fold produced no sweep carrier".into())
+        })
+    }
+}
+
+impl Drop for SweepResidentIoGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            RESIDENT_IO.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                slot.sweep_seed = None;
+                slot.sweep_keep = false;
+                slot.sweep_out = None;
+            });
+        }
+    }
 }
 
 /// #seg-resident process gate (dark, `NY_SEG_RESIDENT=1`, default OFF ⇒ the
@@ -165,8 +287,137 @@ const SEG_MERGE_SLACK: f32 = 1.000_000_5;
 /// encoder-ordered copies from [`FoldStagingArena`] instead of
 /// `queue.write_buffer` (which is submission-ordered and would collapse every
 /// layer's write to the last value under a single submit).
-fn fold_coalesce_enabled() -> bool {
+pub(super) fn fold_coalesce_enabled() -> bool {
     std::env::var("NY_FOLD_COALESCE").ok().as_deref() == Some("1")
+}
+
+/// #u4 process gate: carry the out-of-band `u32` taint words through the MAIN
+/// resident walk by dispatching the taint-twin shaders
+/// (TAINT_GUARD_AUDIT.md §4). Read ONCE per walk entry (beside the walk's
+/// other env reads, `eft_err_env_enabled` / `NY_CONV_ERR_ROWMAX`), deliberately
+/// NOT OnceLock-cached so differential A/B tests can flip it under a scoped env
+/// guard.
+///
+/// Gate ON changes NO value bits on Linear/Activation/Conv chains (the twins are
+/// drift-pinned bit-identical to the base kernels); the only value-visible
+/// difference is a strictly WIDENING refusal: the EFT min-combine consult can
+/// skip a tightening (audit C2).
+/// #u4 gate state from the environment. ARMED BY DEFAULT (2026-08-11 UTC arming
+/// review): `None` = AUTO — the worded walk runs whenever the taint twins are
+/// available on this device (measured tax 1.09x after the on-device row-OR,
+/// `taint_gate_overhead_report`). `Some(false)` (`NY_GPU_TAINT_WORDS=0`) is
+/// the explicit opt-out; `Some(true)` (`=1`) demands words and turns
+/// twin-unavailability into a typed refusal instead of a silent un-worded
+/// walk.
+fn gpu_taint_words_env() -> Option<bool> {
+    match std::env::var("NY_GPU_TAINT_WORDS").ok().as_deref() {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        _ => None,
+    }
+}
+
+impl WgpuDevice {
+    /// Resolve the #u4 gate for this device: explicit env wins; AUTO arms
+    /// exactly when the twins can be built (storage-buffer limit >= 11). Use
+    /// the same cheap capability predicate as `resident_backward_pipelines`
+    /// rather than constructing that large cache here: unsupported worded
+    /// routes must be able to refuse during preflight without allocating it.
+    pub(super) fn taint_words_armed(&self) -> bool {
+        match gpu_taint_words_env() {
+            Some(v) => v,
+            None => self.device.limits().max_storage_buffers_per_shader_stage >= 11,
+        }
+    }
+}
+
+/// Arming boundary for the worded resident route. Conv2d is admitted because
+/// reshape, both GEMM schedules, and col2im have exact-value word twins.
+/// Keeping this predicate explicit makes a future Conv sub-route opt in to the
+/// same transport contract rather than silently relying on boundary reseeding.
+const fn taint_walk_conv_route_admitted(_taint_on: bool, _has_conv: bool) -> bool {
+    true
+}
+
+/// #u4 G13 seeding rule (TAINT_GUARD_AUDIT.md §2c): a seed coefficient at
+/// `|a| >= CROWN_COEFF_MAX` is the CPU-side transport sentinel shipped to the
+/// GPU as if it were a legitimate value — it enters the walk PRE-TAINTED.
+/// `CROWN_COEFF_MAX == FALLBACK_BOUND` is pinned by
+/// `sentinel_taint_selfcheck::cpu_tests::sentinel_matches_core`, so this is the
+/// same threshold the GEMM twin self-seeds at (G7). NaN/Inf count too — they
+/// are the other "magnitude unknown" markers.
+fn taint_seed_word(value: f32) -> u32 {
+    u32::from(!value.is_finite() || value.abs() >= ny_core::CROWN_COEFF_MAX)
+}
+
+/// #u4: OR an `[rows × cols]` word buffer down to its per-spec-row
+/// accumulator (`rows[i / cols] |= word[i]`). The unconditional form of the
+/// fail-closed no-twin transport: never drops a word (annihilation conjuncts,
+/// where sound, are applied by the specialized companions instead —
+/// `bias_fold_taint` / `intercept_fold_taint` in crown_backward_sound_host.rs).
+///
+/// TEST-REFERENCE STATUS (2026-08-10): the walk no longer calls this — every
+/// transport row-OR now runs ON-DEVICE (`TAINT_ROW_OR_SHADER`, use_partner=0
+/// is this exact rule, with the word VALUE OR'd) into `TaintWalkState::
+/// rows_dev`, read back once at walk end. Kept as the committed CPU statement
+/// of the row-OR semantics the shader mirrors.
+#[allow(dead_code)]
+fn or_taint_words_into_rows(words: &[u32], cols: usize, rows: &mut [u32]) {
+    let cols = cols.max(1);
+    for (i, &word) in words.iter().enumerate() {
+        if word != 0 {
+            if let Some(slot) = rows.get_mut(i / cols) {
+                *slot |= word;
+            }
+        }
+    }
+}
+
+/// #u4 uniform of [`super::super::shaders_taint::TAINT_ROW_OR_SHADER`] (the
+/// on-device word→row transport). `use_partner`: 0 = unconditional, 1 =
+/// per-COLUMN partner (`partner[i % cols]`), 2 = per-ELEMENT partner
+/// (`partner[i]`) — see the shader doc for the annihilation contract.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TaintRowOrParams {
+    rows: u32,
+    cols: u32,
+    use_partner: u32,
+    _pad: u32,
+}
+
+/// #u4 walk state (allocated only when the worded route is armed, either AUTO
+/// or explicit `NY_GPU_TAINT_WORDS=1`): the out-of-band `u32` word channel
+/// riding beside the resident value buffers. The four
+/// ping-pong pairs mirror `la`/`ua`/`le`/`ue` exactly (same element counts,
+/// rotated with the same `ping`); `ws`/`wprop` mirror the `s_scratch`/
+/// `prop_scratch` reductions; `w_rowabs_*` mirror the §0 row-L1 output per
+/// side; `w_conv_reshaped`/`w_conv_gemm` mirror Conv's internal value
+/// scratches and are reused in encoder order for A, S, and prop; `zw` is the
+/// all-zero word buffer bound as `taint_b` for every weight
+/// operand — host weights are exact data, NEVER tainted (audit §2, G7 row:
+/// taint is born only at saturation or shipped in a seed). `rows_dev` is the
+/// ON-DEVICE per-spec-row accumulator (`u32 [num_specs]`, zero-init by wgpu)
+/// every transport `TAINT_ROW_OR_SHADER` dispatch atomicOrs into — the walk
+/// performs ZERO mid-walk word readbacks and reads `rows_dev` ONCE at walk
+/// end. `rows` is the small host-side companion holding only the WALK-BOUNDARY
+/// contributions (the G13 seed-BIAS row words, folded at walk entry where the
+/// seed biases are host data anyway); the final readback ORs `rows_dev` into
+/// it.
+struct TaintWalkState {
+    wla: [wgpu::Buffer; 2],
+    wua: [wgpu::Buffer; 2],
+    wle: [wgpu::Buffer; 2],
+    wue: [wgpu::Buffer; 2],
+    ws: wgpu::Buffer,
+    wprop: wgpu::Buffer,
+    w_rowabs_lo: wgpu::Buffer,
+    w_rowabs_hi: wgpu::Buffer,
+    w_conv_reshaped: wgpu::Buffer,
+    w_conv_gemm: wgpu::Buffer,
+    zw: wgpu::Buffer,
+    rows_dev: wgpu::Buffer,
+    rows: Vec<u32>,
 }
 
 /// #fold-coalesce: bump-allocated, mapped-at-creation staging arena for the
@@ -281,6 +532,11 @@ struct ActBiasParams {
     additive: f32,
     /// §0 amplified-flush combine slack (≥ 1); see [`BiasParams::slack`]. Here the
     /// reduction `Σ a·sel_int` drops `|intercept|·FLT_MIN` on a flushed subnormal `a`.
+    /// #flush-charge §E: under charged authority this uniform is widened by
+    /// `FlushChargePolicy::act_bias_slack_factor` (the double-DAZ demand of the
+    /// value + propagated channels; oracle
+    /// `charged_act_bias_factor_covers_the_double_daz_demand`), identity when
+    /// unarmed.
     slack: f32,
     /// #batched-bab: per-domain spec-row count (`== num_specs` single-domain →
     /// domain index 0 → byte-identical). Reuses a former padding slot.
@@ -303,6 +559,20 @@ struct GradAlphaParams {
     num_specs_per_dom: u32,
     _p1: u32,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(in crate::wgpu_device) struct StridedGatherParams {
+    num_specs: u32,
+    num_neurons: u32,
+    num_indices: u32,
+    _p1: u32,
+}
+
+/// Preserve the legacy four-byte-copy implementation for genuinely small β
+/// gathers. Besides avoiding a compute dispatch for a handful of values, this
+/// keeps the established small-gather caller path byte-for-byte untouched.
+const LEGACY_BETA_GATHER_MAX_COPIES: usize = 4096;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -389,6 +659,1589 @@ pub(crate) struct ResidentCoeff {
     /// the CPU `a_at_relu`). Non-soundness-critical (values only steer β; any
     /// β ≥ 0 is a valid Lagrangian dual).
     pub beta_gather: Vec<Vec<f32>>,
+    /// #u4: per-SPEC-ROW OR of every out-of-band taint word that fed this
+    /// frontier — the final coefficient/error word buffers of the taint-twin
+    /// chain plus every admitted fail-closed no-twin transport (bias/intercept
+    /// folds and the row-L1 flush term). Conv walks are not admitted until
+    /// their internal operations have real twins. `Some(rows)`
+    /// (len `num_specs`, nonzero = tainted) only when the walk — or a
+    /// composition of walks: the resnet segment path ORs its sub-walks' rows
+    /// across every merge/skip-add/re-seed seam, see
+    /// `resnet_seeded_compose_coeff` — ran with the gate ON; `None` when the
+    /// gate is off OR the frontier came through a path that genuinely cannot
+    /// carry words (seg-resident device streams, which REFUSE under the gate
+    /// at walk entry). `concretize_resident_coeff_batched` forwards this slice to
+    /// the armed C1 consult of `concretize_sound_gpu_batched`; `None`, a wrong
+    /// row count, or any nonzero word is the fail-closed refusal value
+    /// (TAINT_GUARD_AUDIT.md §4 C1).
+    pub taint_rows: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResidentFoldPlan {
+    pub(super) num_specs_u32: u32,
+    pub(super) num_specs_per_dom_u32: u32,
+    pub(super) n_domains: usize,
+    pub(super) seed_elems: usize,
+    pub(super) final_dim: usize,
+    pub(super) max_dim: usize,
+    pub(super) max_gemm_out: usize,
+    pub(super) a_elems: usize,
+    pub(super) slope_dim: usize,
+    pub(super) max_wg: usize,
+}
+
+fn resident_checked_product(parts: &[usize], label: &str) -> Result<usize> {
+    parts.iter().try_fold(1usize, |product, &part| {
+        product.checked_mul(part).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "crown_backward_sound_resident: {label} overflows usize"
+            ))
+        })
+    })
+}
+
+fn resident_checked_u32(value: usize, label: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        NyError::InvalidSpec(format!(
+            "crown_backward_sound_resident: {label}={value} exceeds u32"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// #cert-err — charging a caller-declared `CertifiedWeightError` into the walk
+// ---------------------------------------------------------------------------
+//
+// The walk's per-layer coefficient step ships `A_new = fl(A @ W)` with the
+// certified radius the AW-error combine writes:
+//
+//     err_new = round_up( (gamma·S + P)·slack + flush ),
+//         S = fl(|A| @ |W|),   P = fl(err @ |W|)
+//
+// That is an enclosure of `A* @ W` — the exact predecessor coefficient folded
+// through the SUPPLIED weight. When the caller declares
+// `weight_rel_err = w` (`|W* − W| <= w·|W|` elementwise), the quantity that must
+// be enclosed is `A* @ W*`, and (see `CertifiedWeightError::charged_gamma` for
+// the full derivation)
+//
+//     |A*@W* − fl(A@W)|  <=  ( (gamma + w)·|A| + (1 + w)·err ) @ |W|.
+//
+// Two host-only uniform substitutions realise exactly that, with NO shader
+// change (so the kernels stay drift-pinned and the zero-`cert_err` walk stays
+// byte-identical):
+//
+//   1. `gamma_k := g = gamma + w + gamma·w`  — `g >= gamma + w`, so `g·S`
+//      dominates the `(gamma + w)·|A| @ |W|` term (the `gamma·w` cross term
+//      absorbs the rounding of forming `g` itself);
+//   2. `slack := slack·(1 + w)`  — the combine multiplies the WHOLE
+//      `(g·S + P)` sum by `slack`, so scaling `slack` by `(1 + w)` yields
+//      `>= g·S·slack + (1+w)·P·slack`, which dominates the bound above term by
+//      term (`slack >= 1`). The base `slack` already carries `1/(1-gamma_k)`
+//      for the two GEMMs' undercount plus `(1+u)^4` for the combine's own four
+//      f32 ops, and multiplying it scales that coverage with the charge.
+//
+// BOTH substitutions are the IDENTITY at `w = 0`: `charged_gamma(gamma)` returns
+// `gamma`'s exact bits, and `up_f32(slack · 1.0)` returns `slack`'s exact bits.
+// That is what makes the default (exact-weight) walk byte-identical — pinned by
+// `zero_cert_err_charges_are_byte_identical`.
+//
+// The bias side is charged by a SECOND dispatch of the unmodified bias kernel
+// (see `cert_bias_charge_slack`), not by a uniform substitution.
+
+/// The `CertifiedWeightError` a layer declares (`Default` = exact for every
+/// variant that cannot carry one).
+fn layer_cert_err(layer: &GpuCrownLayer) -> CertifiedWeightError {
+    match layer {
+        GpuCrownLayer::Linear { cert_err, .. } | GpuCrownLayer::Conv2d { cert_err, .. } => {
+            *cert_err
+        }
+        _ => CertifiedWeightError::default(),
+    }
+}
+
+/// Whether ANY layer declares a nonzero absolute bias error, i.e. whether this
+/// walk must allocate and dispatch the extra bias-error charge below. `false`
+/// (the default for every existing caller) allocates nothing and dispatches
+/// nothing, so the walk is byte-identical to the pre-`cert_err` build.
+fn cert_bias_charge_required(layers: &[GpuCrownLayer]) -> bool {
+    layers
+        .iter()
+        .any(|layer| layer_cert_err(layer).bias_abs_err != 0.0)
+}
+
+/// #flush-charge: any nonzero value below the smallest normal f32.
+fn slice_has_subnormal(values: &[f32]) -> bool {
+    values
+        .iter()
+        .any(|v| *v != 0.0 && v.abs() < f32::MIN_POSITIVE)
+}
+
+/// #flush-charge: walk-entry admission guard for a CHARGED-flush device
+/// (`FlushChargePolicy`, `ops/sound_authority.rs`). Every refusal here is a
+/// typed fail-closed error, never a silent downgrade:
+///
+/// * the EFT compensated channel is FORBIDDEN (`eft_primitives_cached()` is
+///   already false on a flushing adapter; this pins the intent against a
+///   future gate edit);
+/// * only Linear / Activation / Conv2d layers are admitted — every other kind
+///   (maxpool selection logic, dual-alpha routing, ...) carries un-audited
+///   comparison/selection behavior under DAZ;
+/// * `cert_err` layers are refused (the certified weight-error charge is not
+///   audited against the flush model);
+/// * subnormal BIAS entries are refused — the bias combine's `err·|b|` channel
+///   loses `err·2^-126` when `b` is DAZ-zeroed and no uniform scales with err;
+/// * subnormal SLOPES and INTERCEPTS are refused — the elementwise `μ·|a|`
+///   amplification channel and the rung-5 `b != 0` annihilation consult under
+///   a DAZ compare (`shaders_taint`) are both closed by this one predicate.
+///   For INTERCEPTS the refusal is PERMANENT: the §E oracle proves the
+///   subnormal-intercept channel unchargeable — the loss scales with the
+///   runtime radius `err`, which no intercept-bias uniform carries
+///   (`flush_charge_oracle::charged_act_bias_cannot_cover_subnormal_intercepts`).
+///   Nonzero NORMAL intercepts are ADMITTED: their double-DAZ demand is paid
+///   by the charged `ActBiasParams.slack` widening
+///   (`FlushChargePolicy::act_bias_slack_factor`, oracle
+///   `charged_act_bias_factor_covers_the_double_daz_demand`).
+///
+/// Unreachable on every non-charged device (the caller only invokes it when
+/// `charged_flush_authority_cached()` returned a policy).
+fn charged_walk_guard(
+    layers: &[GpuCrownLayer],
+    policy: &super::sound_authority::FlushChargePolicy,
+    eft_requested: bool,
+) -> Result<()> {
+    if policy.eft_forbidden && eft_requested {
+        return Err(NyError::UnsupportedOp(
+            "#flush-charge: NY_EFT_ERR=1 is refused under charged-flush \
+             authority — the compensated channel measures the residuals this \
+             adapter flushes (fail-closed)"
+                .into(),
+        ));
+    }
+    for (index, layer) in layers.iter().enumerate() {
+        if !layer_cert_err(layer).is_exact() {
+            return Err(NyError::UnsupportedOp(format!(
+                "#flush-charge: layer {index} declares a CertifiedWeightError, \
+                 which is not audited against the flush-charge model — \
+                 refusing (fail-closed)"
+            )));
+        }
+        match layer {
+            GpuCrownLayer::Linear { bias, .. } => {
+                if policy.refuse_subnormal_bias {
+                    if let Some(b) = bias {
+                        if slice_has_subnormal(b) {
+                            return Err(NyError::UnsupportedOp(format!(
+                                "#flush-charge: layer {index} has a SUBNORMAL \
+                                 bias entry; on a DAZ adapter its loss in the \
+                                 bias combine is bounded only by err·2^-126, \
+                                 which no uniform carries — refusing"
+                            )));
+                        }
+                    }
+                }
+            }
+            GpuCrownLayer::Conv2d { bias_expanded, .. } => {
+                if policy.refuse_subnormal_bias {
+                    if let Some(b) = bias_expanded {
+                        if slice_has_subnormal(b) {
+                            return Err(NyError::UnsupportedOp(format!(
+                                "#flush-charge: layer {index} has a SUBNORMAL \
+                                 expanded conv bias entry — refusing \
+                                 (see the bias-combine flush audit)"
+                            )));
+                        }
+                    }
+                }
+            }
+            GpuCrownLayer::Activation {
+                lower_slope,
+                upper_slope,
+                lower_intercept,
+                upper_intercept,
+                ..
+            } => {
+                if policy.refuse_subnormal_slopes
+                    && (slice_has_subnormal(lower_slope)
+                        || slice_has_subnormal(upper_slope)
+                        || slice_has_subnormal(lower_intercept)
+                        || slice_has_subnormal(upper_intercept))
+                {
+                    return Err(NyError::UnsupportedOp(format!(
+                        "#flush-charge: layer {index} has a SUBNORMAL \
+                         activation slope/intercept; the DAZ amplification and \
+                         taint-annihilation channels for it are refused, not \
+                         charged — refusing (fail-closed)"
+                    )));
+                }
+                // #flush-charge §E (landed 2026-08-13): nonzero NORMAL
+                // intercepts are ADMITTED under the charge — the double-DAZ
+                // shape (a runtime coefficient and a runtime err, neither
+                // host-refusable, against a NORMAL intercept) is paid by the
+                // widened `ActBiasParams.slack`
+                // (`FlushChargePolicy::act_bias_slack_factor`, oracle
+                // `charged_act_bias_factor_covers_the_double_daz_demand`).
+                // SUBNORMAL intercepts stay refused by the predicate above:
+                // that channel's loss scales with the runtime radius `err`,
+                // which no intercept-bias uniform carries — proven
+                // unchargeable by
+                // `charged_act_bias_cannot_cover_subnormal_intercepts`.
+            }
+            _ => {
+                return Err(NyError::UnsupportedOp(format!(
+                    "#flush-charge: layer {index} is not an admitted \
+                     charged-mode layer kind (Linear/Activation/Conv2d only); \
+                     its selection/comparison behavior under DAZ is un-audited \
+                     — refusing (fail-closed)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #flush-charge: widen a bias-combine `slack` uniform under an armed charge
+/// policy; the identity everywhere else (byte-identical dark path).
+fn charged_bias_slack_or(
+    policy: Option<&super::sound_authority::FlushChargePolicy>,
+    slack: f32,
+) -> Result<f32> {
+    match policy {
+        Some(p) => {
+            crate::wgpu_device::sound_consts::charged_bias_slack(slack, p.bias_combine_factor)
+        }
+        None => Ok(slack),
+    }
+}
+
+/// #flush-charge §E: widen the activation intercept-bias `slack` uniform
+/// (`ActBiasParams.slack`) under an armed charge policy; the identity
+/// everywhere else (byte-identical dark path — pinned by
+/// `charged_act_bias_slack_is_identity_when_unarmed_and_outward_when_armed`).
+fn charged_act_bias_slack_or(
+    policy: Option<&super::sound_authority::FlushChargePolicy>,
+    slack: f32,
+) -> Result<f32> {
+    match policy {
+        Some(p) => {
+            crate::wgpu_device::sound_consts::charged_act_bias_slack(slack, p.act_bias_slack_factor)
+        }
+        None => Ok(slack),
+    }
+}
+
+/// The combine `slack` charged by a layer's declared relative weight error
+/// (substitution 2 above): `slack · (1 + weight_rel_err)`.
+///
+/// It is the `(1 + w)` on the PROPAGATED error term — NOT `(1 + g)`. The `gamma`
+/// part of `g` is already carried by `gamma_k·S`; multiplying it in here as well
+/// would (harmlessly but pointlessly) widen every exact-weight walk and destroy
+/// the byte-identity pin.
+///
+/// `base` and `w` are f32, so `base·(1+w)` is computed exactly in f64 and only
+/// the f32 narrowing rounds — UPWARD, keeping the factor `>= base·(1+w)`. At
+/// `w = 0` the product is exactly `base`, which round-trips to `base`'s own
+/// bits. An invalid declaration or a non-finite product is a refusal, never a
+/// saturated (finite, under-charging) substitute.
+fn cert_charged_slack(base: f32, cert_err: CertifiedWeightError, index: usize) -> Result<f32> {
+    if !base.is_finite() || base < 0.0 || !cert_err.is_valid() {
+        return Err(NyError::UnsupportedOp(format!(
+            "#cert-err: layer {index} has no finite charged combine slack \
+             (base={base:e}, weight_rel_err={:e}) — refusing (fail-closed)",
+            cert_err.weight_rel_err
+        )));
+    }
+    // Review defect 1 (sibling of ny-core's charged_gamma): `1 + w` needs up
+    // to 47 significand bits and the product up to ~71, so the f64 multiply
+    // rounds to NEAREST and can land below `base·(1+w)`; if it lands on the
+    // f32 grid, `up_f32` does not bump and the shipped slack is too small.
+    // For `w < 2^-53` the `1.0 + w` itself collapses to 1.0 and the charge
+    // vanishes silently. Exact weights return `base` untouched (byte-identity
+    // contract); otherwise every step rounds OUTWARD.
+    let charged = if cert_err.is_exact() {
+        base
+    } else {
+        let factor = next_up_f64(1.0 + f64::from(cert_err.weight_rel_err));
+        up_f32(next_up_f64(f64::from(base) * factor))
+    };
+    if !charged.is_finite() {
+        return Err(NyError::UnsupportedOp(format!(
+            "#cert-err: layer {index} charged combine slack overflows f32 \
+             (base={base:e}, weight_rel_err={:e}) — refusing (fail-closed)",
+            cert_err.weight_rel_err
+        )));
+    }
+    Ok(charged)
+}
+
+/// The `slack` for the EXTRA bias-error dispatch that charges `bias_abs_err`.
+///
+/// # What that dispatch computes and why it is exactly the missing term
+///
+/// The layer's bias fold ships `b_new = b_old + fl(Σ_j a_j·bias_j)` with the
+/// radius `round_up(round_up(gamma_k·Σ|a_j·bias_j| + Σ err_j·|bias_j|)·slack)`.
+/// That encloses the fold of the SUPPLIED bias. For the exact bias `b*` with
+/// `|b*_j − bias_j| <= d` (`d = bias_abs_err`) the missing term is
+///
+/// ```text
+/// |Σ a*_j·b*_j − Σ a_j·bias_j|  −  (already charged)
+///     <=  d · ( Σ|a_j| + Σ err_j ).
+/// ```
+///
+/// Re-dispatching the SAME kernel with `bias := [d; k]` and `gamma_k := 1`
+/// computes `round_up(round_up(1·Σ|a_j·d| + Σ err_j·d)·slack)`, i.e. exactly
+/// `d·(Σ|a_j| + Σ err_j)` recovered outward — and accumulates it into the same
+/// `bias_err_out`, which the kernel updates with `+=`. Its `bias_out` binding is
+/// pointed at a throwaway sink so the CENTER bias is untouched.
+///
+/// # Why the slack must be widened here
+///
+/// In the ordinary dispatch `gamma_k·Σ|a·bias|` is a SECOND-order correction, so
+/// `combine_slack_f32(k)`'s recovery of the reduction's own undercount is ample.
+/// Here the same reduction carries the FIRST-order term, and it absorbs `k`
+/// product roundings plus `k−1` tree adds on each of the two lanes. Charging
+/// `combine_slack_f32(2k + 4) >= 1/(1 − gamma_{2k+4})` dominates every one of
+/// those roundings with room to spare; the factor is `1 + O(k·u)` so the cost is
+/// nil, and an over-long reduction fails closed inside `combine_slack_f32`.
+fn cert_bias_charge_slack(k: usize) -> Result<f32> {
+    let terms = k
+        .checked_mul(2)
+        .and_then(|t| t.checked_add(4))
+        .ok_or_else(|| {
+            NyError::UnsupportedOp(format!(
+                "#cert-err: bias charge reduction length 2*{k}+4 overflows — refusing"
+            ))
+        })?;
+    combine_slack_f32(terms)
+}
+
+/// Operands for one [`WgpuDevice::cert_bias_charge_pass`] dispatch pair
+/// (lower + upper side). Grouped into a struct only to keep the call under the
+/// argument-count lint.
+struct CertBiasChargeArgs<'a> {
+    /// The layer's declaration; only `bias_abs_err` is read here.
+    cert_err: CertifiedWeightError,
+    /// Reduction length `k` of the bias fold (`out_features`, or the conv's
+    /// expanded `in_d`).
+    reduction: usize,
+    num_specs: usize,
+    /// Index of the layer in the walk, for refusal messages only.
+    layer_index: usize,
+    /// The dedicated `BiasParams` uniform; `None` when the walk allocated no
+    /// charge buffers (which is a refusal if a charge is actually due).
+    params: Option<&'a wgpu::Buffer>,
+    /// The constant `[bias_abs_err; k]` operand buffer.
+    operand: Option<&'a wgpu::Buffer>,
+    /// Throwaway centre-bias output; nothing reads it.
+    sink: Option<&'a wgpu::Buffer>,
+    /// `[lower, upper]` incoming coefficient buffers.
+    a: [&'a wgpu::Buffer; 2],
+    /// `[lower, upper]` incoming coefficient-error buffers.
+    a_err: [&'a wgpu::Buffer; 2],
+    /// `[lower, upper]` bias-error accumulators to charge into.
+    bias_err_out: [&'a wgpu::Buffer; 2],
+}
+
+fn resident_f32_bytes(elements: usize, label: &str) -> Result<u64> {
+    elements
+        .checked_mul(size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "crown_backward_sound_resident: {label} byte count overflows"
+            ))
+        })
+}
+
+fn resident_check_gemm_dispatch(
+    m: usize,
+    k: usize,
+    n: usize,
+    max_wg: usize,
+    label: &str,
+    batched_domains: bool,
+) -> Result<()> {
+    let dispatch = select_gemm_dispatch(
+        resident_checked_u32(m, &format!("{label} m"))?,
+        resident_checked_u32(k, &format!("{label} k"))?,
+        resident_checked_u32(n, &format!("{label} n"))?,
+    );
+    if dispatch.wg_x as usize > max_wg || dispatch.wg_y as usize > max_wg {
+        if batched_domains {
+            return Err(NyError::GpuBatchCapacityExceeded {
+                requested: (dispatch.wg_x as usize).max(dispatch.wg_y as usize),
+                capacity: max_wg,
+                unit: "workgroups",
+                site: "resident GEMM preflight",
+            });
+        }
+        return Err(NyError::UnsupportedOp(format!(
+            "crown_backward_sound_resident: {label} dispatch ({}, {}) exceeds \
+             max_compute_workgroups_per_dimension {max_wg}",
+            dispatch.wg_x, dispatch.wg_y
+        )));
+    }
+    Ok(())
+}
+
+fn resident_conv_output_extent(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    pad: usize,
+    axis: &str,
+    layer_index: usize,
+) -> Result<usize> {
+    if stride == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "crown_backward_sound_resident: conv layer {layer_index} has zero {axis} stride"
+        )));
+    }
+    let double_pad = pad.checked_mul(2).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "crown_backward_sound_resident: conv layer {layer_index} padded {axis} overflows"
+        ))
+    })?;
+    let padded = input.checked_add(double_pad).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "crown_backward_sound_resident: conv layer {layer_index} padded {axis} overflows"
+        ))
+    })?;
+    let available = padded.checked_sub(kernel).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "crown_backward_sound_resident: conv layer {layer_index} {axis} kernel {kernel} \
+             exceeds padded input {padded}"
+        ))
+    })?;
+    available
+        .checked_div(stride)
+        .and_then(|steps| steps.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "crown_backward_sound_resident: conv layer {layer_index} output {axis} overflows"
+            ))
+        })
+}
+
+/// Validate every dimension that is later multiplied, cast into a WGSL `u32`,
+/// used as a storage binding, or used to size a dispatch. This runs before the
+/// first allocation/submission, so malformed metadata cannot wrap into a small
+/// apparently-valid shader uniform.
+pub(super) fn resident_fold_plan(
+    layers: &[GpuCrownLayer],
+    num_specs: usize,
+    num_specs_per_dom: usize,
+    output_dim: usize,
+    max_compute_workgroups_per_dimension: u32,
+    max_buffer_size: u64,
+    max_storage_buffer_binding_size: u64,
+) -> Result<ResidentFoldPlan> {
+    if num_specs == 0 {
+        return Err(NyError::InvalidSpec(
+            "crown_backward_sound_resident: num_specs must be nonzero".into(),
+        ));
+    }
+    if output_dim == 0 {
+        return Err(NyError::InvalidSpec(
+            "crown_backward_sound_resident: output_dim must be nonzero".into(),
+        ));
+    }
+    if num_specs_per_dom == 0
+        || num_specs_per_dom > num_specs
+        || !num_specs.is_multiple_of(num_specs_per_dom)
+    {
+        return Err(NyError::InvalidSpec(format!(
+            "crown_backward_sound_resident: num_specs_per_dom={num_specs_per_dom} \
+             must be nonzero and divide num_specs={num_specs}"
+        )));
+    }
+
+    let num_specs_u32 = resident_checked_u32(num_specs, "num_specs")?;
+    let num_specs_per_dom_u32 = resident_checked_u32(num_specs_per_dom, "num_specs_per_dom")?;
+    let n_domains = num_specs / num_specs_per_dom;
+    let seed_elems =
+        resident_checked_product(&[num_specs, output_dim], "seed coefficient elements")?;
+    resident_checked_u32(seed_elems, "seed coefficient elements")?;
+
+    if max_compute_workgroups_per_dimension == 0 {
+        return Err(NyError::UnsupportedOp(
+            "crown_backward_sound_resident: device reports zero \
+             max_compute_workgroups_per_dimension"
+                .into(),
+        ));
+    }
+    let max_wg = max_compute_workgroups_per_dimension as usize;
+    let mut cur = output_dim;
+    let mut max_dim = output_dim;
+    let mut max_gemm_out = 1usize;
+    let mut max_storage_elems = seed_elems.max(num_specs).max(output_dim);
+
+    resident_checked_u32(output_dim, "output_dim")?;
+
+    for (layer_index, layer) in layers.iter().enumerate() {
+        match layer {
+            GpuCrownLayer::Linear {
+                weight,
+                bias,
+                out_features,
+                in_features,
+                ..
+            } => {
+                if *out_features == 0 || *in_features == 0 {
+                    return Err(NyError::InvalidSpec(format!(
+                        "crown_backward_sound_resident: linear layer {layer_index} has a \
+                         zero dimension ({out_features}x{in_features})"
+                    )));
+                }
+                if *out_features != cur {
+                    return Err(NyError::shape_mismatch(vec![cur], vec![*out_features]));
+                }
+                resident_checked_u32(*out_features, "linear out_features")?;
+                resident_checked_u32(*in_features, "linear in_features")?;
+                let weight_elems = resident_checked_product(
+                    &[*out_features, *in_features],
+                    "linear weight elements",
+                )?;
+                if weight.len() != weight_elems {
+                    return Err(NyError::shape_mismatch(
+                        vec![*out_features, *in_features],
+                        vec![weight.len()],
+                    ));
+                }
+                if let Some(values) = bias {
+                    if values.len() != *out_features {
+                        return Err(NyError::shape_mismatch(
+                            vec![*out_features],
+                            vec![values.len()],
+                        ));
+                    }
+                }
+                let incoming =
+                    resident_checked_product(&[num_specs, *out_features], "linear input rows")?;
+                let outgoing =
+                    resident_checked_product(&[num_specs, *in_features], "linear output rows")?;
+                resident_checked_u32(incoming, "linear input elements")?;
+                resident_checked_u32(outgoing, "linear output elements")?;
+                resident_check_gemm_dispatch(
+                    num_specs,
+                    *out_features,
+                    *in_features,
+                    max_wg,
+                    "linear GEMM",
+                    n_domains > 1,
+                )?;
+                resident_check_gemm_dispatch(
+                    num_specs,
+                    *out_features,
+                    1,
+                    max_wg,
+                    "linear row-L1 GEMM",
+                    n_domains > 1,
+                )?;
+                max_dim = max_dim.max(*in_features);
+                max_storage_elems = max_storage_elems
+                    .max(weight_elems)
+                    .max(incoming)
+                    .max(outgoing);
+                cur = *in_features;
+            }
+            GpuCrownLayer::Activation {
+                lower_slope,
+                upper_slope,
+                lower_intercept,
+                upper_intercept,
+                num_neurons,
+            } => {
+                if *num_neurons == 0 {
+                    return Err(NyError::InvalidSpec(format!(
+                        "crown_backward_sound_resident: activation layer {layer_index} has \
+                         zero neurons"
+                    )));
+                }
+                if *num_neurons != cur {
+                    return Err(NyError::shape_mismatch(vec![cur], vec![*num_neurons]));
+                }
+                resident_checked_u32(*num_neurons, "activation num_neurons")?;
+                let state_elems = resident_checked_product(
+                    &[n_domains, *num_neurons],
+                    "activation domain-state elements",
+                )?;
+                for (name, actual) in [
+                    ("lower_slope", lower_slope.len()),
+                    ("upper_slope", upper_slope.len()),
+                    ("lower_intercept", lower_intercept.len()),
+                    ("upper_intercept", upper_intercept.len()),
+                ] {
+                    if actual != state_elems {
+                        return Err(NyError::InvalidSpec(format!(
+                            "crown_backward_sound_resident: activation layer {layer_index} \
+                             {name}.len()={actual} != n_domains*num_neurons={state_elems}"
+                        )));
+                    }
+                }
+                let coefficient_elems = resident_checked_product(
+                    &[num_specs, *num_neurons],
+                    "activation coefficient elements",
+                )?;
+                resident_checked_u32(coefficient_elems, "activation coefficient elements")?;
+                max_storage_elems = max_storage_elems.max(state_elems).max(coefficient_elems);
+            }
+            GpuCrownLayer::Conv2d {
+                weight_col,
+                bias_expanded,
+                out_channels,
+                in_channels,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+                out_h,
+                out_w,
+                in_h,
+                in_w,
+                ..
+            } => {
+                if [
+                    *out_channels,
+                    *in_channels,
+                    *kernel_h,
+                    *kernel_w,
+                    *stride_h,
+                    *stride_w,
+                    *out_h,
+                    *out_w,
+                    *in_h,
+                    *in_w,
+                ]
+                .contains(&0)
+                {
+                    return Err(NyError::InvalidSpec(format!(
+                        "crown_backward_sound_resident: conv layer {layer_index} has a \
+                         zero channel/kernel/stride/spatial dimension"
+                    )));
+                }
+                for (name, value) in [
+                    ("out_channels", *out_channels),
+                    ("in_channels", *in_channels),
+                    ("kernel_h", *kernel_h),
+                    ("kernel_w", *kernel_w),
+                    ("stride_h", *stride_h),
+                    ("stride_w", *stride_w),
+                    ("pad_h", *pad_h),
+                    ("pad_w", *pad_w),
+                    ("out_h", *out_h),
+                    ("out_w", *out_w),
+                    ("in_h", *in_h),
+                    ("in_w", *in_w),
+                ] {
+                    resident_checked_u32(value, &format!("conv {name}"))?;
+                }
+                let expected_out_h = resident_conv_output_extent(
+                    *in_h,
+                    *kernel_h,
+                    *stride_h,
+                    *pad_h,
+                    "height",
+                    layer_index,
+                )?;
+                let expected_out_w = resident_conv_output_extent(
+                    *in_w,
+                    *kernel_w,
+                    *stride_w,
+                    *pad_w,
+                    "width",
+                    layer_index,
+                )?;
+                if (*out_h, *out_w) != (expected_out_h, expected_out_w) {
+                    return Err(NyError::InvalidSpec(format!(
+                        "crown_backward_sound_resident: conv layer {layer_index} output \
+                         geometry ({out_h},{out_w}) != expected \
+                         ({expected_out_h},{expected_out_w}) for input ({in_h},{in_w}), \
+                         kernel ({kernel_h},{kernel_w}), stride ({stride_h},{stride_w}), \
+                         padding ({pad_h},{pad_w})"
+                    )));
+                }
+                let spatial = resident_checked_product(&[*out_h, *out_w], "conv output spatial")?;
+                let in_d = resident_checked_product(
+                    &[*out_channels, spatial],
+                    "conv entering coefficient dimension",
+                )?;
+                let out_d = resident_checked_product(
+                    &[*in_channels, *in_h, *in_w],
+                    "conv exiting coefficient dimension",
+                )?;
+                if in_d != cur {
+                    return Err(NyError::shape_mismatch(vec![cur], vec![in_d]));
+                }
+                let kernel_cols = resident_checked_product(
+                    &[*in_channels, *kernel_h, *kernel_w],
+                    "conv kernel columns",
+                )?;
+                let weight_elems = resident_checked_product(
+                    &[*out_channels, kernel_cols],
+                    "conv weight elements",
+                )?;
+                if weight_col.len() != weight_elems {
+                    return Err(NyError::shape_mismatch(
+                        vec![*out_channels, kernel_cols],
+                        vec![weight_col.len()],
+                    ));
+                }
+                if let Some(values) = bias_expanded {
+                    if values.len() != in_d {
+                        return Err(NyError::shape_mismatch(vec![in_d], vec![values.len()]));
+                    }
+                }
+                let gemm_rows = resident_checked_product(&[num_specs, spatial], "conv GEMM rows")?;
+                let gemm_out =
+                    resident_checked_product(&[gemm_rows, kernel_cols], "conv GEMM output")?;
+                let incoming = resident_checked_product(&[num_specs, in_d], "conv input elements")?;
+                let outgoing =
+                    resident_checked_product(&[num_specs, out_d], "conv output elements")?;
+                for (name, value) in [
+                    ("conv entering dimension", in_d),
+                    ("conv exiting dimension", out_d),
+                    ("conv spatial", spatial),
+                    ("conv kernel columns", kernel_cols),
+                    ("conv GEMM rows", gemm_rows),
+                    ("conv GEMM output elements", gemm_out),
+                    ("conv input elements", incoming),
+                    ("conv output elements", outgoing),
+                ] {
+                    resident_checked_u32(value, name)?;
+                }
+                resident_check_gemm_dispatch(
+                    gemm_rows,
+                    *out_channels,
+                    kernel_cols,
+                    max_wg,
+                    "conv GEMM",
+                    n_domains > 1,
+                )?;
+                resident_check_gemm_dispatch(
+                    num_specs,
+                    in_d,
+                    1,
+                    max_wg,
+                    "conv row-L1 GEMM",
+                    n_domains > 1,
+                )?;
+                max_dim = max_dim.max(out_d);
+                max_gemm_out = max_gemm_out.max(gemm_out);
+                max_storage_elems = max_storage_elems
+                    .max(weight_elems)
+                    .max(incoming)
+                    .max(outgoing)
+                    .max(gemm_out);
+                cur = out_d;
+            }
+            _ => {
+                return Err(NyError::UnsupportedOp(
+                    "crown_backward_sound_resident R4: Linear/Activation/Conv2d only".into(),
+                ));
+            }
+        }
+    }
+
+    let final_dim = cur;
+    let a_elems =
+        resident_checked_product(&[num_specs, max_dim], "coefficient workspace elements")?;
+    let slope_dim =
+        resident_checked_product(&[n_domains, max_dim], "activation workspace elements")?;
+    resident_checked_u32(a_elems, "coefficient workspace elements")?;
+    resident_checked_u32(slope_dim, "activation workspace elements")?;
+    max_storage_elems = max_storage_elems
+        .max(a_elems)
+        .max(slope_dim)
+        .max(max_gemm_out);
+
+    let worst_1d = num_specs.max(a_elems.div_ceil(256));
+    if worst_1d > max_wg {
+        if n_domains > 1 {
+            return Err(NyError::GpuBatchCapacityExceeded {
+                requested: worst_1d,
+                capacity: max_wg,
+                unit: "workgroups",
+                site: "resident 1-D dispatch preflight",
+            });
+        }
+        return Err(NyError::UnsupportedOp(format!(
+            "crown_backward_sound_resident: 1-D dispatch {worst_1d} exceeds \
+             max_compute_workgroups_per_dimension {max_wg} (num_specs={num_specs}, \
+             width={max_dim}) — sub-chunk the batch"
+        )));
+    }
+
+    let storage_bytes = resident_f32_bytes(max_storage_elems.max(1), "largest storage buffer")?;
+    if storage_bytes > max_buffer_size || storage_bytes > max_storage_buffer_binding_size {
+        if n_domains > 1 {
+            let capacity = max_buffer_size.min(max_storage_buffer_binding_size);
+            return Err(NyError::GpuBatchCapacityExceeded {
+                requested: usize::try_from(storage_bytes).unwrap_or(usize::MAX),
+                capacity: usize::try_from(capacity).unwrap_or(usize::MAX),
+                unit: "bytes",
+                site: "resident storage-binding preflight",
+            });
+        }
+        return Err(NyError::UnsupportedOp(format!(
+            "crown_backward_sound_resident: largest storage binding needs {storage_bytes} \
+             bytes, but max_buffer_size={max_buffer_size} and \
+             max_storage_buffer_binding_size={max_storage_buffer_binding_size}"
+        )));
+    }
+
+    Ok(ResidentFoldPlan {
+        num_specs_u32,
+        num_specs_per_dom_u32,
+        n_domains,
+        seed_elems,
+        final_dim,
+        max_dim,
+        max_gemm_out,
+        a_elems,
+        slope_dim,
+        max_wg,
+    })
+}
+
+/// Conservative sum of every per-layer upload that can remain queued before
+/// the resident walk's final readback drains the device.
+pub(super) fn resident_fold_staging_capacity(
+    layers: &[GpuCrownLayer],
+    n_domains: usize,
+) -> Result<u64> {
+    let mut capacity = 4096u64;
+    for layer in layers {
+        let upload_elems = match layer {
+            GpuCrownLayer::Activation { num_neurons, .. } => resident_checked_product(
+                &[6, n_domains, *num_neurons],
+                "fold staging activation elements",
+            )?,
+            GpuCrownLayer::Linear {
+                bias,
+                out_features,
+                cert_err,
+                ..
+            } => bias
+                .as_ref()
+                .map_or(0, |values| values.len())
+                .checked_add(if cert_err.bias_abs_err != 0.0 {
+                    (*out_features).max(1)
+                } else {
+                    0
+                })
+                .ok_or_else(|| {
+                    NyError::InvalidSpec(
+                        "crown_backward_sound_resident: linear fold staging overflows".into(),
+                    )
+                })?,
+            GpuCrownLayer::Conv2d {
+                bias_expanded,
+                out_channels,
+                out_h,
+                out_w,
+                cert_err,
+                ..
+            } => {
+                let cert_bias_elems = if cert_err.bias_abs_err != 0.0 {
+                    resident_checked_product(
+                        &[*out_channels, *out_h, *out_w],
+                        "conv certified-bias staging elements",
+                    )?
+                    .max(1)
+                } else {
+                    0
+                };
+                bias_expanded
+                    .as_ref()
+                    .map_or(0, |values| values.len())
+                    .checked_add(cert_bias_elems)
+                    .ok_or_else(|| {
+                        NyError::InvalidSpec(
+                            "crown_backward_sound_resident: conv fold staging overflows".into(),
+                        )
+                    })?
+            }
+            _ => 0,
+        };
+        let upload_bytes = resident_f32_bytes(upload_elems, "fold staging layer upload")?;
+        capacity = capacity
+            .checked_add(1024)
+            .and_then(|value| value.checked_add(upload_bytes))
+            .ok_or_else(|| {
+                NyError::InvalidSpec(
+                    "crown_backward_sound_resident: fold staging capacity overflows".into(),
+                )
+            })?;
+    }
+    Ok(capacity)
+}
+
+fn joint_segment_preflight(
+    segments: &[GpuResnetSegment],
+    num_specs: usize,
+    output_dim: usize,
+    max_compute_workgroups_per_dimension: u32,
+    max_buffer_size: u64,
+    max_storage_buffer_binding_size: u64,
+) -> Result<usize> {
+    let chain = |layers: &[GpuCrownLayer], start_dim: usize| {
+        resident_fold_plan(
+            layers,
+            num_specs,
+            num_specs,
+            start_dim,
+            max_compute_workgroups_per_dimension,
+            max_buffer_size,
+            max_storage_buffer_binding_size,
+        )
+        .map(|plan| plan.final_dim)
+    };
+
+    let mut dim = output_dim;
+    for segment in segments {
+        dim = match segment {
+            GpuResnetSegment::Chain(layers) => chain(layers, dim)?,
+            GpuResnetSegment::Residual(branch) => {
+                let branch_dim = chain(branch, dim)?;
+                if branch_dim != dim {
+                    return Err(NyError::shape_mismatch(vec![dim], vec![branch_dim]));
+                }
+                dim
+            }
+            GpuResnetSegment::ResidualProj(branch, projection) => {
+                let branch_dim = chain(branch, dim)?;
+                let projection_dim = chain(projection, dim)?;
+                if branch_dim != projection_dim {
+                    return Err(NyError::shape_mismatch(
+                        vec![branch_dim],
+                        vec![projection_dim],
+                    ));
+                }
+                branch_dim
+            }
+        };
+    }
+    Ok(dim)
+}
+
+/// Validate every resident fold in a multi-domain coefficient request before
+/// the first GPU submission. A later segment can require a larger workspace
+/// than the first; discovering that capacity failure inside the composition
+/// loop would make narrowing retry re-issue already-completed GPU work.
+fn batched_coefficient_segment_preflight(
+    segments: &[GpuResnetSegment],
+    num_specs: usize,
+    num_specs_per_dom: usize,
+    output_dim: usize,
+    max_compute_workgroups_per_dimension: u32,
+    max_buffer_size: u64,
+    max_storage_buffer_binding_size: u64,
+) -> Result<usize> {
+    let chain = |layers: &[GpuCrownLayer], start_dim: usize| {
+        resident_fold_plan(
+            layers,
+            num_specs,
+            num_specs_per_dom,
+            start_dim,
+            max_compute_workgroups_per_dimension,
+            max_buffer_size,
+            max_storage_buffer_binding_size,
+        )
+        .map(|plan| plan.final_dim)
+    };
+
+    let mut dim = output_dim;
+    for segment in segments {
+        dim = match segment {
+            GpuResnetSegment::Chain(layers) => chain(layers, dim)?,
+            GpuResnetSegment::Residual(branch) => {
+                let branch_dim = chain(branch, dim)?;
+                if branch_dim != dim {
+                    return Err(NyError::shape_mismatch(vec![dim], vec![branch_dim]));
+                }
+                dim
+            }
+            GpuResnetSegment::ResidualProj(branch, projection) => {
+                let branch_dim = chain(branch, dim)?;
+                let projection_dim = chain(projection, dim)?;
+                if branch_dim != projection_dim {
+                    return Err(NyError::shape_mismatch(
+                        vec![branch_dim],
+                        vec![projection_dim],
+                    ));
+                }
+                branch_dim
+            }
+        };
+    }
+    Ok(dim)
+}
+
+#[cfg(test)]
+mod charged_walk_guard_tests {
+    use ny_core::{CertifiedWeightError, GpuCrownLayer};
+
+    use super::super::sound_authority::FlushChargePolicy;
+    use super::{charged_act_bias_slack_or, charged_bias_slack_or, charged_walk_guard};
+
+    const SUBNORMAL: f32 = 1.0e-45;
+
+    fn linear(bias: Option<Vec<f32>>, cert_err: CertifiedWeightError) -> GpuCrownLayer {
+        GpuCrownLayer::Linear {
+            weight: vec![1.0f32; 4].into(),
+            bias: bias.map(Into::into),
+            out_features: 2,
+            in_features: 2,
+            cert_err,
+        }
+    }
+
+    fn activation(lower_slope: Vec<f32>) -> GpuCrownLayer {
+        GpuCrownLayer::Activation {
+            lower_slope,
+            upper_slope: vec![1.0; 2],
+            lower_intercept: vec![0.0; 2],
+            upper_intercept: vec![0.0; 2],
+            num_neurons: 2,
+        }
+    }
+
+    #[test]
+    fn charged_walk_guard_admits_clean_layers_and_refuses_each_channel() {
+        let policy = FlushChargePolicy::production();
+        let clean = [
+            linear(Some(vec![1.0, 0.0]), CertifiedWeightError::default()),
+            activation(vec![0.5, 1.0]),
+        ];
+        assert!(charged_walk_guard(&clean, &policy, false).is_ok());
+
+        // The EFT compensated channel is forbidden outright.
+        assert!(charged_walk_guard(&clean, &policy, true).is_err());
+        // A subnormal bias entry refuses (the err·|b| channel has no cover).
+        let sub_bias = [linear(
+            Some(vec![1.0, SUBNORMAL]),
+            CertifiedWeightError::default(),
+        )];
+        assert!(charged_walk_guard(&sub_bias, &policy, false).is_err());
+        // A subnormal slope refuses (amplification + rung-5 annihilation).
+        let sub_slope = [activation(vec![SUBNORMAL, 1.0])];
+        assert!(charged_walk_guard(&sub_slope, &policy, false).is_err());
+        // #flush-charge §E (landed): a nonzero NORMAL intercept is ADMITTED —
+        // its double-DAZ demand is paid by the charged `ActBiasParams.slack`
+        // widening (`charged_act_bias_factor_covers_the_double_daz_demand`).
+        let nonzero_intercept = [GpuCrownLayer::Activation {
+            lower_slope: vec![0.5, 1.0],
+            upper_slope: vec![1.0; 2],
+            lower_intercept: vec![0.0; 2],
+            upper_intercept: vec![0.5, 0.0],
+            num_neurons: 2,
+        }];
+        assert!(charged_walk_guard(&nonzero_intercept, &policy, false).is_ok());
+        // A SUBNORMAL intercept stays refused PERMANENTLY: the §E oracle
+        // proves that channel unchargeable (the loss scales with the runtime
+        // radius `err`, which no intercept-bias uniform carries —
+        // `charged_act_bias_cannot_cover_subnormal_intercepts`).
+        let subnormal_intercept = [GpuCrownLayer::Activation {
+            lower_slope: vec![0.5, 1.0],
+            upper_slope: vec![1.0; 2],
+            lower_intercept: vec![0.0; 2],
+            upper_intercept: vec![SUBNORMAL, 0.0],
+            num_neurons: 2,
+        }];
+        assert!(charged_walk_guard(&subnormal_intercept, &policy, false).is_err());
+        // A declared CertifiedWeightError is un-audited under the flush model.
+        let cert = [linear(
+            None,
+            CertifiedWeightError {
+                weight_rel_err: 1.0e-6,
+                bias_abs_err: 0.0,
+            },
+        )];
+        assert!(charged_walk_guard(&cert, &policy, false).is_err());
+        // A non-admitted layer kind refuses.
+        let dual_alpha = [GpuCrownLayer::ActivationReluDualAlpha {
+            lower_pos_slope: vec![1.0; 2],
+            cross_slope: vec![0.5; 2],
+            upper_neg_slope: vec![1.0; 2],
+            cross_intercept: vec![0.0; 2],
+            num_neurons: 2,
+        }];
+        assert!(charged_walk_guard(&dual_alpha, &policy, false).is_err());
+    }
+
+    #[test]
+    fn charged_bias_slack_is_identity_when_unarmed_and_outward_when_armed() {
+        let policy = FlushChargePolicy::production();
+        for slack in [1.0f32, 1.000_001, 2.5] {
+            assert_eq!(
+                charged_bias_slack_or(None, slack).unwrap().to_bits(),
+                slack.to_bits(),
+                "the dark path must be byte-identical"
+            );
+            let widened = charged_bias_slack_or(Some(&policy), slack).unwrap();
+            assert!(
+                f64::from(widened) >= f64::from(slack) * f64::from(policy.bias_combine_factor),
+                "armed widening must be outward"
+            );
+        }
+    }
+
+    /// #flush-charge §E: the act-bias widening is the identity on every
+    /// uncharged device (byte-identity pin — production charged authority is
+    /// compile-time closed, so every shipped `ActBiasParams.slack` byte is
+    /// unchanged) and outward by the audited factor when armed.
+    #[test]
+    fn charged_act_bias_slack_is_identity_when_unarmed_and_outward_when_armed() {
+        let policy = FlushChargePolicy::production();
+        for slack in [1.0f32, 1.000_001, 2.5] {
+            assert_eq!(
+                charged_act_bias_slack_or(None, slack).unwrap().to_bits(),
+                slack.to_bits(),
+                "the dark path must be byte-identical"
+            );
+            let widened = charged_act_bias_slack_or(Some(&policy), slack).unwrap();
+            assert!(
+                f64::from(widened) >= f64::from(slack) * f64::from(policy.act_bias_slack_factor),
+                "armed widening must be outward"
+            );
+        }
+    }
+}
+
+/// #flush-charge Lane A: pins for the module-doc "Charged-authority guard
+/// coverage" table (routes GA1–GA5). Every row claiming "guarded" or
+/// "structurally unreachable / immune" gets a test here (or is named where its
+/// pin already lives) so a future edit cannot silently open an uncharged route.
+#[cfg(test)]
+mod charged_route_coverage_tests {
+    use super::{add_skip_stream, merge_streams, ResidentCoeff, WgpuDevice};
+
+    /// A minimal clean 1×1 frontier for the host-seam arithmetic pins.
+    fn tiny_frontier(err: f32, taint_rows: Option<Vec<u32>>) -> ResidentCoeff {
+        ResidentCoeff {
+            lower_a: vec![0.5],
+            upper_a: vec![0.75],
+            lower_err: vec![err],
+            upper_err: vec![err],
+            lower_b: vec![0.0],
+            upper_b: vec![0.0],
+            lower_b_err: vec![err],
+            upper_b_err: vec![err],
+            dim: 1,
+            relu_grads: Vec::new(),
+            beta_gather: Vec::new(),
+            taint_rows,
+        }
+    }
+
+    /// GA1/GA2/GA5 SOURCE PINS. Charged coverage lives at exactly two
+    /// arithmetic chokepoints plus one explicit host-driver refusal; this test
+    /// fails if any of the following drifts:
+    ///
+    /// * GA1 — the walk body has exactly ONE production `charged_walk_guard`
+    ///   call site, ordered AFTER the authority recheck and BEFORE the walk's
+    ///   deadline-aware checked GPU section, so no dispatch can precede the guard;
+    /// * GA2 — the concretize funnel consults the charged policy (EFT +
+    ///   subnormal-input refusals + widened slack) and the armed C1 word
+    ///   consult BEFORE its own GPU section
+    ///   (`run_gpu_checked_with_crown_deadline("concretize_sound_gpu"`);
+    /// * GA5 — the host driver refuses charged authority at entry, BEFORE
+    ///   constructing its raw diagnostic GEMM adapter.
+    #[test]
+    fn charged_route_funnels_and_guard_ordering_are_pinned() {
+        // ---- GA1: the resident walk ----------------------------------------
+        // WALK includes THIS test's own source, so every searched literal is
+        // split with concat! (the escaped-quote GPU-section marker is
+        // self-immune: its raw source text carries backslashes).
+        const WALK: &str = include_str!("crown_backward_sound_resident.rs");
+        let guard_call = concat!("charged_walk_guard(layers, ", "policy, eft_requested)?");
+        assert_eq!(
+            WALK.matches(guard_call).count(),
+            1,
+            "the walk must have exactly ONE production charged_walk_guard call \
+             site (a second one means a second, separately-audited walk; zero \
+             means the charged admission guard was dropped)"
+        );
+        let authority_recheck = concat!(
+            "WGPU verdict authority closed while ",
+            "materializing resident shaders"
+        );
+        let walk_gpu_section =
+            "run_gpu_checked_with_crown_deadline(\"crown_backward_sound_resident\"";
+        let at_recheck = WALK
+            .find(authority_recheck)
+            .expect("the walk's authority recheck refusal is gone");
+        let at_guard = WALK
+            .find(guard_call)
+            .expect("guard call found above by count");
+        let at_gpu = WALK
+            .find(walk_gpu_section)
+            .expect("the walk's GPU section marker is gone");
+        assert!(
+            at_recheck < at_guard && at_guard < at_gpu,
+            "GA1 ordering broken: authority recheck ({at_recheck}) -> \
+             charged_walk_guard ({at_guard}) -> GPU section ({at_gpu}) must be \
+             strictly ordered so no dispatch precedes the charged admission"
+        );
+
+        // ---- GA2: the concretize funnel ------------------------------------
+        const CONC: &str = include_str!("crown_concretize_sound.rs");
+        let conc_consult = "self.charged_flush_authority_cached()";
+        let conc_c1 = "consult_spec_row_taint(taint, num_specs)?";
+        let conc_gpu_section = "run_gpu_checked_with_crown_deadline(\"concretize_sound_gpu\"";
+        let at_conc_consult = CONC
+            .find(conc_consult)
+            .expect("the concretize charged consult is gone");
+        let at_conc_c1 = CONC.find(conc_c1).expect("the armed C1 consult is gone");
+        let at_conc_gpu = CONC
+            .find(conc_gpu_section)
+            .expect("the concretize GPU section marker is gone");
+        assert!(
+            at_conc_c1 < at_conc_gpu && at_conc_consult < at_conc_gpu,
+            "GA2 ordering broken: the C1 consult ({at_conc_c1}) and the \
+             charged consult ({at_conc_consult}) must both precede the \
+             concretize GPU section ({at_conc_gpu})"
+        );
+        for refusal in [
+            "the EFT concretize arm is refused under",
+            "the input box contains a SUBNORMAL",
+            "charged_concretize_slack(",
+        ] {
+            assert!(
+                CONC.contains(refusal),
+                "GA2 charged arm missing from the concretize funnel: {refusal}"
+            );
+        }
+
+        // ---- GA5: the host driver ------------------------------------------
+        // The refusal string is line-wrapped in the source, so anchor on its
+        // two halves in order rather than the exact concatenation.
+        const HOST: &str = include_str!("crown_backward_sound_host.rs");
+        let at_host_refusal = HOST
+            .find("is not audited")
+            .and_then(|i| HOST[i..].find("charged flush model").map(|j| i + j))
+            .expect("the host driver's charged refusal is gone");
+        let at_host_gemm = HOST
+            .find("WgpuDiagnosticGemm::new(self)")
+            .expect("the host driver's diagnostic GEMM adapter is gone");
+        assert!(
+            at_host_refusal < at_host_gemm,
+            "GA5 ordering broken: the charged refusal ({at_host_refusal}) must \
+             precede the raw diagnostic GEMM adapter ({at_host_gemm})"
+        );
+    }
+
+    /// GA4 BEHAVIORAL PIN: the host-side merge seams (`merge_streams`,
+    /// `add_skip_stream`) and the error→bias fold
+    /// (`concretize_error_into_bias`) preserve SUBNORMAL error mass exactly as
+    /// IEEE-754 host f64 arithmetic must. This is what makes them immune to
+    /// the charged flush model: they never run on the adapter. If a future
+    /// edit moves any of them onto a DAZ/FTZ device (or truncates through a
+    /// flushing f32 path), the subnormal contributions below flush to zero and
+    /// this test fails.
+    #[test]
+    fn host_merge_seams_preserve_subnormal_error_mass() {
+        // Smallest positive f32 subnormal: the exact value a DAZ path zeroes.
+        let sub = f32::from_bits(1);
+        assert!(sub > 0.0 && sub < f32::MIN_POSITIVE);
+
+        // merge_streams: both streams carry a subnormal err; the merged err
+        // must keep at least their (outward-rounded) sum — never zero.
+        let merged = merge_streams(tiny_frontier(sub, None), &tiny_frontier(sub, None));
+        assert!(
+            merged.lower_err[0] >= 2.0 * sub && merged.upper_err[0] >= 2.0 * sub,
+            "merge_streams dropped subnormal error mass: {:e}",
+            merged.lower_err[0]
+        );
+        assert!(
+            merged.lower_b_err[0] >= 2.0 * sub,
+            "merge_streams dropped subnormal bias-error mass"
+        );
+
+        // add_skip_stream: a subnormal err on the skip stream must survive
+        // into the summed stream.
+        let skipped = add_skip_stream(tiny_frontier(0.0, None), &tiny_frontier(sub, None));
+        assert!(
+            skipped.lower_err[0] >= sub && skipped.upper_err[0] >= sub,
+            "add_skip_stream dropped the skip stream's subnormal error"
+        );
+
+        // concretize_error_into_bias: a subnormal coefficient err against a
+        // normal node bound must fold a strictly positive bias-error charge
+        // (f64 host arithmetic: subnormal-f32 × normal-f32 never underflows).
+        let mut coeff = tiny_frontier(sub, None);
+        WgpuDevice::concretize_error_into_bias(&mut coeff, 1, 1, &[1.0]);
+        assert_eq!(
+            coeff.lower_err[0], 0.0,
+            "the fold must reset the coefficient error"
+        );
+        assert!(
+            coeff.lower_b_err[0] >= 2.0 * sub && coeff.upper_b_err[0] >= 2.0 * sub,
+            "concretize_error_into_bias dropped subnormal error mass \
+             (bias err {:e}); has this fold moved onto a flushing device?",
+            coeff.lower_b_err[0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod resident_preflight_tests {
+    use std::sync::Arc;
+
+    use ny_core::{GpuCrownLayer, GpuResnetSegment};
+
+    use super::{
+        batched_coefficient_segment_preflight, resident_fold_plan, taint_walk_conv_route_admitted,
+    };
+    use crate::wgpu_device::shaders::{
+        CONV_COL2IM_TAINT_SHADER, CONV_RESHAPE_TAINT_SHADER, GEMM_F32_SMALL_K_TAINT_SHADER,
+    };
+
+    const MAX_WG: u32 = 65_535;
+    const MAX_BYTES: u64 = u64::MAX;
+
+    #[test]
+    fn batched_coeff_preflight_types_a_later_segment_capacity_refusal() {
+        let linear = |out_features: usize, in_features: usize| GpuCrownLayer::Linear {
+            weight: vec![0.0; out_features * in_features].into(),
+            bias: None,
+            out_features,
+            in_features,
+            cert_err: ny_core::CertifiedWeightError::default(),
+        };
+        let segments = vec![
+            GpuResnetSegment::Chain(vec![linear(1, 8)]),
+            GpuResnetSegment::Chain(vec![linear(8, 100)]),
+        ];
+        let error = batched_coefficient_segment_preflight(&segments, 2, 1, 1, MAX_WG, 128, 128)
+            .expect_err("the second segment exceeds the storage-binding cap");
+        assert!(error.is_gpu_batch_capacity_exceeded(), "{error}");
+    }
+
+    #[test]
+    fn worded_conv_route_is_admitted_with_internal_transport() {
+        assert!(taint_walk_conv_route_admitted(false, false));
+        assert!(taint_walk_conv_route_admitted(false, true));
+        assert!(taint_walk_conv_route_admitted(true, false));
+        assert!(taint_walk_conv_route_admitted(true, true));
+    }
+
+    #[test]
+    fn conv_taint_twins_pin_exact_value_statements_and_word_bindings() {
+        assert!(CONV_RESHAPE_TAINT_SHADER.contains("dst[idx] = src[src_idx];"));
+        assert!(CONV_RESHAPE_TAINT_SHADER.contains("taint_dst[idx] = taint_src[src_idx];"));
+        assert!(CONV_COL2IM_TAINT_SHADER.contains("sum = sum + gemm_out[src];"));
+        assert!(CONV_COL2IM_TAINT_SHADER.contains("taint = taint | taint_gemm[src];"));
+        assert!(CONV_COL2IM_TAINT_SHADER.contains("sum != sum || abs(sum) >= FALLBACK_BOUND"));
+        assert!(GEMM_F32_SMALL_K_TAINT_SHADER.contains("const ROWS_PER_THREAD: u32 = 4u;"));
+        assert!(GEMM_F32_SMALL_K_TAINT_SHADER.contains("sum = sum + av * bv;"));
+        assert!(GEMM_F32_SMALL_K_TAINT_SHADER.contains("out[row * params.n + col] = guarded;"));
+    }
+
+    #[test]
+    fn conv_reshape_word_mapping_is_asymmetric_and_identical_to_value_mapping() {
+        let (specs, channels, spatial) = (2usize, 3usize, 2usize);
+        let src: Vec<u32> = (0..specs * channels * spatial)
+            .map(|i| 100 + i as u32)
+            .collect();
+        let mut dst = vec![0u32; src.len()];
+        for (idx, slot) in dst.iter_mut().enumerate() {
+            let flat_row = idx / channels;
+            let channel = idx % channels;
+            let spec = flat_row / spatial;
+            let pos = flat_row % spatial;
+            let src_idx = spec * channels * spatial + channel * spatial + pos;
+            *slot = src[src_idx];
+        }
+        assert_eq!(
+            dst,
+            vec![100, 102, 104, 101, 103, 105, 106, 108, 110, 107, 109, 111]
+        );
+    }
+
+    #[test]
+    fn conv_col2im_word_survives_internal_saturation_then_cancellation() {
+        // OC=IC=1, KH=1, KW=2, OW=2, IW=3. For input x=1 the
+        // gather visits (row=1,col=0) then (row=0,col=1). Those two
+        // GEMM outputs cancel in the value channel, while either word must
+        // survive. This is the exact hole a boundary-only scan missed.
+        let gemm = [0.0f32, 1.0e10, -1.0e10, 0.0];
+        let words = [0u32, 1, 1, 0];
+        let mut sum = 0.0f32;
+        let mut word = 0u32;
+        for src in [2usize, 1usize] {
+            sum += gemm[src];
+            word |= words[src];
+            if !sum.is_finite() || sum.abs() >= ny_core::CROWN_COEFF_MAX {
+                word |= 1;
+            }
+        }
+        assert_eq!(sum.to_bits(), 0.0f32.to_bits());
+        assert_eq!(
+            word, 1,
+            "cancelled value must retain its internal Conv word"
+        );
+    }
+
+    fn activation(state_len: usize, neurons: usize) -> GpuCrownLayer {
+        GpuCrownLayer::Activation {
+            lower_slope: vec![1.0; state_len],
+            upper_slope: vec![1.0; state_len],
+            lower_intercept: vec![0.0; state_len],
+            upper_intercept: vec![0.0; state_len],
+            num_neurons: neurons,
+        }
+    }
+
+    fn conv(
+        in_h: usize,
+        in_w: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+        out_h: usize,
+        out_w: usize,
+    ) -> GpuCrownLayer {
+        GpuCrownLayer::Conv2d {
+            weight_col: Arc::from(vec![1.0; kernel_h.saturating_mul(kernel_w)]),
+            bias_expanded: None,
+            out_channels: 1,
+            in_channels: 1,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+            out_h,
+            out_w,
+            in_h,
+            in_w,
+            cert_err: Default::default(),
+        }
+    }
+
+    #[test]
+    fn resident_preflight_requires_a_real_domain_partition() {
+        for (num_specs, per_domain) in [(0, 0), (4, 0), (4, 3), (4, 5)] {
+            assert!(
+                resident_fold_plan(&[], num_specs, per_domain, 1, MAX_WG, MAX_BYTES, MAX_BYTES,)
+                    .is_err(),
+                "partition ({num_specs}, {per_domain}) must fail closed"
+            );
+        }
+
+        let layer = activation(2, 1);
+        let plan = resident_fold_plan(&[layer], 2, 1, 1, MAX_WG, MAX_BYTES, MAX_BYTES)
+            .expect("two one-row domains are valid");
+        assert_eq!(plan.n_domains, 2);
+        assert_eq!(plan.a_elems, 2);
+        assert_eq!(plan.slope_dim, 2);
+    }
+
+    #[test]
+    fn resident_preflight_rejects_wrapping_or_truncated_dimensions() {
+        if usize::BITS > 32 {
+            let too_wide = (u32::MAX as usize) + 1;
+            let layer = activation(0, too_wide);
+            assert!(
+                resident_fold_plan(&[layer], 1, 1, too_wide, MAX_WG, MAX_BYTES, MAX_BYTES,)
+                    .is_err()
+            );
+        }
+
+        let overflowing_conv = GpuCrownLayer::Conv2d {
+            weight_col: Arc::from([]),
+            bias_expanded: None,
+            out_channels: u32::MAX as usize,
+            in_channels: 1,
+            kernel_h: 1,
+            kernel_w: 1,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            out_h: u32::MAX as usize,
+            out_w: 2,
+            in_h: 1,
+            in_w: 1,
+            cert_err: Default::default(),
+        };
+        assert!(
+            resident_fold_plan(&[overflowing_conv], 1, 1, 1, MAX_WG, MAX_BYTES, MAX_BYTES,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resident_preflight_enforces_state_buffer_and_dispatch_limits() {
+        assert!(
+            resident_fold_plan(&[activation(1, 1)], 1, 1, 1, 0, MAX_BYTES, MAX_BYTES).is_err(),
+            "a zero device workgroup limit must fail closed"
+        );
+        assert!(
+            resident_fold_plan(&[activation(1, 1)], 2, 2, 1, MAX_WG, 4, 4).is_err(),
+            "two f32 coefficient elements do not fit a four-byte binding"
+        );
+        assert!(
+            resident_fold_plan(&[activation(1, 1)], 257, 257, 1, 256, MAX_BYTES, MAX_BYTES,)
+                .is_err(),
+            "257 one-row bias workgroups exceed a 256-workgroup device limit"
+        );
+        assert!(
+            resident_fold_plan(&[activation(0, 1)], 1, 1, 1, MAX_WG, MAX_BYTES, MAX_BYTES,)
+                .is_err(),
+            "short activation state must not leave stale GPU buffer contents"
+        );
+    }
+
+    #[test]
+    fn resident_preflight_validates_conv_geometry_exactly() {
+        resident_fold_plan(
+            &[conv(5, 7, 3, 3, 2, 2, 1, 1, 3, 4)],
+            1,
+            1,
+            12,
+            MAX_WG,
+            MAX_BYTES,
+            MAX_BYTES,
+        )
+        .expect("checked convolution geometry is valid");
+
+        for malformed in [
+            conv(5, 7, 3, 3, 2, 2, 1, 1, 2, 4),
+            conv(5, 7, 3, 3, 2, 2, 1, 1, 3, 3),
+            conv(2, 7, 5, 3, 1, 1, 0, 0, 1, 5),
+        ] {
+            assert!(
+                resident_fold_plan(&[malformed], 1, 1, 12, MAX_WG, MAX_BYTES, MAX_BYTES,).is_err(),
+                "malformed convolution geometry must fail closed"
+            );
+        }
+
+        if usize::BITS > 32 {
+            let overflowing_pad = (usize::MAX / 2) + 1;
+            assert!(
+                resident_fold_plan(
+                    &[conv(1, 1, 1, 1, 1, 1, overflowing_pad, 0, 1, 1)],
+                    1,
+                    1,
+                    1,
+                    MAX_WG,
+                    MAX_BYTES,
+                    MAX_BYTES,
+                )
+                .is_err(),
+                "padding arithmetic must be checked"
+            );
+        }
+    }
 }
 
 /// A resnet decomposed into backward-order segments for the resident backward.
@@ -405,45 +2258,645 @@ pub(crate) enum ResnetSegment<'a> {
     ResidualProj(&'a [GpuCrownLayer], &'a [GpuCrownLayer]),
 }
 
+/// THE #cert-coeffs FIREWALL: turn a resident coefficient frontier into a
+/// publishable [`ny_core::CertifiedCoeffs`], or refuse.
+///
+/// There is exactly ONE copy of these screens, shared by BOTH coefficient
+/// egresses — the flat chain
+/// ([`WgpuDevice::crown_backward_sound_resident_certified_coeffs`]) and the
+/// resnet segment composition
+/// ([`WgpuDevice::crown_backward_gpu_resnet_sound_certified_coeffs`]) — so the
+/// segment path can never drift into a weaker contract than the flat one.
+/// Pinned by `both_coefficient_egresses_share_one_firewall`.
+///
+/// In order:
+///
+/// 1. `#u4` C1 per-spec-row taint consult (absent / wrong-length / nonzero
+///    words ⇒ typed refusal, never a publication);
+/// 2. NON-FINITE screen — a NaN/inf coefficient, bias or radius is not an
+///    enclosure and the coefficient consumer has no downstream preflight;
+/// 3. `FALLBACK_BOUND` SATURATION-SENTINEL screen — the BOUNDS entry reaches
+///    `concretize_sound_gpu_batched`, whose host preflight proves in f64 that
+///    the outward affine radius is enclosed by `FALLBACK_BOUND`; the value
+///    GEMM's `nan_safe_clamp` writes exactly ±1e10, which is FINITE and sails
+///    past screen 2. Without this the egress would be strictly WEAKER than the
+///    entry whose affine-radius proof it claims parity with;
+/// 4. NEGATIVE-RADIUS screen — the error arrays are RADII; a negative entry is
+///    a tightening, so it is refused rather than clamped.
+///
+/// Every refusal is fail-closed: the frontier is discarded, never repaired.
+pub(crate) fn certified_coeffs_from_resident(
+    c: ResidentCoeff,
+    num_specs: usize,
+) -> Result<ny_core::CertifiedCoeffs> {
+    if super::sentinel_taint_selfcheck::PRODUCTION_GUARDS_CONSULT_TAINT_WORD {
+        super::crown_concretize_sound::consult_spec_row_taint(c.taint_rows.as_deref(), num_specs)?;
+    }
+    // Fail-closed firewall: a non-finite coefficient, bias, or radius is
+    // never an enclosure, and the coefficient consumer has no downstream
+    // `FALLBACK_BOUND` preflight of its own to catch it.
+    for (label, values) in [
+        ("lower_a", &c.lower_a),
+        ("upper_a", &c.upper_a),
+        ("lower_a_err", &c.lower_err),
+        ("upper_a_err", &c.upper_err),
+        ("lower_b", &c.lower_b),
+        ("upper_b", &c.upper_b),
+        ("lower_b_err", &c.lower_b_err),
+        ("upper_b_err", &c.upper_b_err),
+    ] {
+        if let Some(bad) = values.iter().copied().find(|v| !v.is_finite()) {
+            return Err(NyError::NumericalInstability(format!(
+                "#cert-coeffs: {label} carries a non-finite entry ({bad:e}) — \
+                 refusing to publish the frontier (fail-closed)"
+            )));
+        }
+    }
+    // Review defect 2: the BOUNDS entry reaches `concretize_sound_gpu_batched`,
+    // whose host preflight PROVES in f64 that the outward affine radius is
+    // enclosed by FALLBACK_BOUND — the documented catcher for the resident
+    // value GEMM's saturation sentinel (`nan_safe_clamp` writes exactly
+    // ±1e10, which is FINITE and sails past the non-finite screen above).
+    // The coefficient egress has no downstream preflight at all, so
+    // publishing without this check made it strictly WEAKER than the entry
+    // whose contract parity it claims. Refuse any saturated magnitude.
+    for (label, values) in [
+        ("lower_a", &c.lower_a),
+        ("upper_a", &c.upper_a),
+        ("lower_a_err", &c.lower_err),
+        ("upper_a_err", &c.upper_err),
+        ("lower_b", &c.lower_b),
+        ("upper_b", &c.upper_b),
+        ("lower_b_err", &c.lower_b_err),
+        ("upper_b_err", &c.upper_b_err),
+    ] {
+        if let Some(bad) = values
+            .iter()
+            .copied()
+            .find(|v| v.abs() >= ny_core::FALLBACK_BOUND)
+        {
+            return Err(NyError::NumericalInstability(format!(
+                "#cert-coeffs: {label} carries a saturation-sentinel \
+                 magnitude ({bad:e} >= FALLBACK_BOUND) — the value GEMM \
+                 clamped, so this frontier is not an enclosure; refusing \
+                 (fail-closed, matching the bounds entry's affine-radius \
+                 proof)"
+            )));
+        }
+    }
+    // The error arrays are RADII: negative entries would be a tightening.
+    for (label, values) in [
+        ("lower_a_err", &c.lower_err),
+        ("upper_a_err", &c.upper_err),
+        ("lower_b_err", &c.lower_b_err),
+        ("upper_b_err", &c.upper_b_err),
+    ] {
+        if values.iter().copied().any(|v| v < 0.0) {
+            return Err(NyError::NumericalInstability(format!(
+                "#cert-coeffs: {label} carries a NEGATIVE radius — refusing \
+                 to publish the frontier (fail-closed)"
+            )));
+        }
+    }
+    Ok(ny_core::CertifiedCoeffs {
+        lower_a: c.lower_a,
+        upper_a: c.upper_a,
+        lower_a_err: c.lower_err,
+        upper_a_err: c.upper_err,
+        lower_b: c.lower_b,
+        upper_b: c.upper_b,
+        lower_b_err: c.lower_b_err,
+        upper_b_err: c.upper_b_err,
+        num_specs,
+        dim: c.dim,
+    })
+}
+
+/// THE #margin-row-gpu-batch SLOT MAP: split ONE wide, domain-major
+/// [`ny_core::CertifiedCoeffs`] into `n_domains` per-domain payloads.
+///
+/// `resnet_seeded_compose_coeff` stacks the batch DOMAIN-MAJOR — row `s`
+/// belongs to domain `s / num_specs_per_dom`, which is precisely the
+/// `dom = row/num_specs_per_dom` rule its shaders use to index each domain's
+/// own Activation block and input box. So domain `d` owns the CONTIGUOUS row
+/// range `[d*nsp, (d+1)*nsp)` and this split is a pure reshape of that layout.
+///
+/// # Why this is written the way it is
+///
+/// A slot/permutation error here is the killer defect of the whole batched
+/// lane: it would publish, for domain A, a bound computed for domain B's gates.
+/// So:
+///
+/// * the total row count is checked against `n_domains * nsp` BEFORE any
+///   slicing, and every array's length is checked against the row count, so a
+///   short or long payload REFUSES instead of silently shifting the mapping;
+/// * the walk is a single ordered `chunks_exact` zip with NO free index
+///   arithmetic — there is nowhere to type a wrong subscript;
+/// * the coefficient and bias lanes are advanced by the SAME iterator step, so
+///   they cannot drift relative to one another.
+///
+/// Every returned payload reports `num_specs == nsp` (the per-domain count) and
+/// the unchanged `dim`: the wide stack is an implementation detail and must not
+/// leak into what the lane concretizes.
+pub(crate) fn split_batched_certified_coeffs(
+    wide: &ny_core::CertifiedCoeffs,
+    num_specs_per_dom: usize,
+    n_domains: usize,
+) -> Result<Vec<ny_core::CertifiedCoeffs>> {
+    let dim = wide.dim;
+    let expected_rows = num_specs_per_dom
+        .checked_mul(n_domains)
+        .ok_or_else(|| NyError::InvalidSpec("#cert-coeffs batch: row count overflow".into()))?;
+    if num_specs_per_dom == 0 || n_domains == 0 || dim == 0 {
+        return Err(NyError::InvalidSpec(
+            "#cert-coeffs batch: zero-sized split requested".into(),
+        ));
+    }
+    if wide.num_specs != expected_rows {
+        return Err(NyError::shape_mismatch(
+            vec![expected_rows],
+            vec![wide.num_specs],
+        ));
+    }
+    let a_len = expected_rows
+        .checked_mul(dim)
+        .ok_or_else(|| NyError::InvalidSpec("#cert-coeffs batch: element count overflow".into()))?;
+    for (label, len) in [
+        ("lower_a", wide.lower_a.len()),
+        ("upper_a", wide.upper_a.len()),
+        ("lower_a_err", wide.lower_a_err.len()),
+        ("upper_a_err", wide.upper_a_err.len()),
+    ] {
+        if len != a_len {
+            return Err(NyError::InvalidSpec(format!(
+                "#cert-coeffs batch: {label} has {len} elements, expected {a_len} — refusing to \
+                 split (a mis-sized payload would re-associate domains)"
+            )));
+        }
+    }
+    for (label, len) in [
+        ("lower_b", wide.lower_b.len()),
+        ("upper_b", wide.upper_b.len()),
+        ("lower_b_err", wide.lower_b_err.len()),
+        ("upper_b_err", wide.upper_b_err.len()),
+    ] {
+        if len != expected_rows {
+            return Err(NyError::InvalidSpec(format!(
+                "#cert-coeffs batch: {label} has {len} rows, expected {expected_rows} — refusing \
+                 to split (a mis-sized payload would re-associate domains)"
+            )));
+        }
+    }
+    let block = num_specs_per_dom * dim;
+    let out: Vec<ny_core::CertifiedCoeffs> = wide
+        .lower_a
+        .chunks_exact(block)
+        .zip(wide.upper_a.chunks_exact(block))
+        .zip(wide.lower_a_err.chunks_exact(block))
+        .zip(wide.upper_a_err.chunks_exact(block))
+        .zip(wide.lower_b.chunks_exact(num_specs_per_dom))
+        .zip(wide.upper_b.chunks_exact(num_specs_per_dom))
+        .zip(wide.lower_b_err.chunks_exact(num_specs_per_dom))
+        .zip(wide.upper_b_err.chunks_exact(num_specs_per_dom))
+        .map(
+            |(((((((la, ua), lae), uae), lb), ub), lbe), ube)| ny_core::CertifiedCoeffs {
+                lower_a: la.to_vec(),
+                upper_a: ua.to_vec(),
+                lower_a_err: lae.to_vec(),
+                upper_a_err: uae.to_vec(),
+                lower_b: lb.to_vec(),
+                upper_b: ub.to_vec(),
+                lower_b_err: lbe.to_vec(),
+                upper_b_err: ube.to_vec(),
+                num_specs: num_specs_per_dom,
+                dim,
+            },
+        )
+        .collect();
+    // Defensive: the zip above is length-driven, so a silent short-circuit
+    // would hand back FEWER domains than asked for and the caller would index
+    // the wrong ones. Refuse instead.
+    if out.len() != n_domains {
+        return Err(NyError::InvalidSpec(format!(
+            "#cert-coeffs batch: split produced {} domains, expected {n_domains}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// HOST-ONLY pins for the batched slot map. Pure host arithmetic on a payload
+/// the caller supplies, so these are falsifiable on every build.
+#[cfg(test)]
+mod cert_coeffs_batch_split_tests {
+    use super::*;
+
+    /// A wide payload whose every entry ENCODES its own (row, coordinate), so a
+    /// permutation or an off-by-one block is visible in the values themselves.
+    #[allow(clippy::cast_precision_loss)]
+    fn wide(n_domains: usize, nsp: usize, dim: usize) -> ny_core::CertifiedCoeffs {
+        let rows = n_domains * nsp;
+        let a: Vec<f32> = (0..rows * dim).map(|k| k as f32).collect();
+        let b: Vec<f32> = (0..rows).map(|s| 1000.0 + s as f32).collect();
+        ny_core::CertifiedCoeffs {
+            lower_a: a.clone(),
+            upper_a: a.iter().map(|v| v + 0.5).collect(),
+            lower_a_err: vec![1e-6; rows * dim],
+            upper_a_err: vec![2e-6; rows * dim],
+            lower_b: b.clone(),
+            upper_b: b.iter().map(|v| v + 0.5).collect(),
+            lower_b_err: vec![1e-7; rows],
+            upper_b_err: vec![2e-7; rows],
+            num_specs: rows,
+            dim,
+        }
+    }
+
+    /// THE SLOT-MAPPING PIN. Domain `d` must receive rows `[d*nsp, (d+1)*nsp)`
+    /// of the domain-major wide payload — not `d`'s rows shifted, interleaved,
+    /// or another domain's. The fixture encodes the global row index in every
+    /// value, so this asserts the mapping, not merely the shape.
+    #[test]
+    fn batched_split_is_domain_major_and_contiguous() {
+        let (n_domains, nsp, dim) = (3usize, 2usize, 4usize);
+        let w = wide(n_domains, nsp, dim);
+        let parts = split_batched_certified_coeffs(&w, nsp, n_domains).expect("split");
+        assert_eq!(parts.len(), n_domains);
+        for (d, part) in parts.iter().enumerate() {
+            assert_eq!(part.num_specs, nsp, "per-domain row count must be nsp");
+            assert_eq!(part.dim, dim);
+            for r in 0..nsp {
+                let global = d * nsp + r;
+                #[allow(clippy::cast_precision_loss)]
+                let want_b = 1000.0 + global as f32;
+                assert_eq!(part.lower_b[r], want_b, "domain {d} row {r} bias slot");
+                for j in 0..dim {
+                    #[allow(clippy::cast_precision_loss)]
+                    let want_a = (global * dim + j) as f32;
+                    assert_eq!(
+                        part.lower_a[r * dim + j],
+                        want_a,
+                        "domain {d} row {r} coord {j} coefficient slot"
+                    );
+                }
+            }
+        }
+        // An INTERLEAVED (row-major-by-spec) reading is a different answer:
+        // this is the permutation the pin exists to exclude.
+        assert_ne!(
+            parts[1].lower_b[0], w.lower_b[1],
+            "domain 1 must own row nsp, not row 1 — an interleaved map would pass here"
+        );
+    }
+
+    /// Every mis-sized payload REFUSES; none is repaired by truncation, which
+    /// would shift the mapping by whole domains.
+    #[test]
+    fn batched_split_refuses_every_mis_sized_payload() {
+        let (n_domains, nsp, dim) = (2usize, 3usize, 2usize);
+        assert!(split_batched_certified_coeffs(&wide(n_domains, nsp, dim), nsp, n_domains).is_ok());
+
+        // Wrong declared row count.
+        let mut w = wide(n_domains, nsp, dim);
+        w.num_specs += 1;
+        assert!(split_batched_certified_coeffs(&w, nsp, n_domains).is_err());
+
+        // Truncated coefficient lane.
+        let mut w = wide(n_domains, nsp, dim);
+        w.lower_a.pop();
+        assert!(split_batched_certified_coeffs(&w, nsp, n_domains).is_err());
+
+        // Truncated bias lane.
+        let mut w = wide(n_domains, nsp, dim);
+        w.upper_b_err.pop();
+        assert!(split_batched_certified_coeffs(&w, nsp, n_domains).is_err());
+
+        // Asking for a different partition of the SAME payload must refuse
+        // rather than silently re-cut the domains.
+        let w = wide(n_domains, nsp, dim);
+        assert!(split_batched_certified_coeffs(&w, nsp, n_domains + 1).is_err());
+        assert!(split_batched_certified_coeffs(&w, nsp + 1, n_domains).is_err());
+        assert!(split_batched_certified_coeffs(&w, 0, n_domains).is_err());
+        assert!(split_batched_certified_coeffs(&w, nsp, 0).is_err());
+    }
+
+    /// A single-domain batch must reproduce the payload unchanged: the batched
+    /// entry degenerates to the single-domain egress.
+    #[test]
+    fn batched_split_of_one_domain_is_the_identity() {
+        let w = wide(1, 5, 3);
+        let parts = split_batched_certified_coeffs(&w, 5, 1).expect("split");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].lower_a, w.lower_a);
+        assert_eq!(parts[0].upper_a, w.upper_a);
+        assert_eq!(parts[0].lower_a_err, w.lower_a_err);
+        assert_eq!(parts[0].upper_a_err, w.upper_a_err);
+        assert_eq!(parts[0].lower_b, w.lower_b);
+        assert_eq!(parts[0].upper_b, w.upper_b);
+        // Review defect D2: the BIAS-ERROR lanes were the only ones no host or
+        // device test touched. A lower_b_err <-> upper_b_err swap in the zip
+        // would hand the lower lane the SMALLER radius in convert_and_check
+        // (eb = next_up(bev + pen_seed[r])) — a bound tighter than certified,
+        // i.e. a false VERIFIED — and every other assertion here would still
+        // pass. The fixture's 1e-7 / 2e-7 values are distinguishable.
+        assert_eq!(parts[0].lower_b_err, w.lower_b_err);
+        assert_eq!(parts[0].upper_b_err, w.upper_b_err);
+        assert_eq!(parts[0].num_specs, w.num_specs);
+        assert_eq!(parts[0].dim, w.dim);
+    }
+}
+
+/// HOST-ONLY pins for the shared #cert-coeffs firewall.
+///
+/// Deliberately NOT under `feature = "gpu-tests"`: the screens are pure host
+/// arithmetic on a frontier the caller supplies, so they must be falsifiable on
+/// every build, not only on a conformant GPU host.
+#[cfg(test)]
+mod cert_coeffs_firewall_tests {
+    use super::*;
+
+    /// A clean frontier for the firewall pins: `num_specs x dim`, zero taint.
+    fn clean_frontier(num_specs: usize, dim: usize) -> ResidentCoeff {
+        ResidentCoeff {
+            lower_a: vec![0.5; num_specs * dim],
+            upper_a: vec![0.75; num_specs * dim],
+            lower_err: vec![1e-6; num_specs * dim],
+            upper_err: vec![1e-6; num_specs * dim],
+            lower_b: vec![-0.25; num_specs],
+            upper_b: vec![0.25; num_specs],
+            lower_b_err: vec![1e-7; num_specs],
+            upper_b_err: vec![1e-7; num_specs],
+            dim,
+            relu_grads: Vec::new(),
+            beta_gather: Vec::new(),
+            taint_rows: Some(vec![0u32; num_specs]),
+        }
+    }
+
+    /// The fail-closed firewall, pinned on the SHARED helper both egresses call
+    /// — so the segment path is covered by construction, not by a second copy of
+    /// the screens (`both_coefficient_egresses_share_one_firewall`).
+    ///
+    /// Every screen is a REFUSAL, never a repair: a non-finite entry, a value
+    /// GEMM saturation sentinel (`|v| >= FALLBACK_BOUND`, finite and therefore
+    /// invisible to the non-finite screen), a NEGATIVE radius (a tightening),
+    /// and the `#u4` C1 taint consult.
+    #[test]
+    fn certified_coeffs_firewall_refuses_every_poisoned_frontier() {
+        let (rows, dim) = (2usize, 3usize);
+        // Baseline: a clean frontier publishes unchanged.
+        let ok = certified_coeffs_from_resident(clean_frontier(rows, dim), rows)
+            .expect("a clean frontier must publish");
+        assert_eq!((ok.num_specs, ok.dim), (rows, dim));
+
+        // (1) NON-FINITE, on every lane in turn.
+        for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for lane in 0..8usize {
+                let mut c = clean_frontier(rows, dim);
+                match lane {
+                    0 => c.lower_a[1] = poison,
+                    1 => c.upper_a[1] = poison,
+                    2 => c.lower_err[1] = poison,
+                    3 => c.upper_err[1] = poison,
+                    4 => c.lower_b[0] = poison,
+                    5 => c.upper_b[0] = poison,
+                    6 => c.lower_b_err[0] = poison,
+                    _ => c.upper_b_err[0] = poison,
+                }
+                assert!(
+                    certified_coeffs_from_resident(c, rows).is_err(),
+                    "lane {lane} published a non-finite ({poison}) frontier"
+                );
+            }
+        }
+
+        // (2) SATURATION SENTINEL: finite, so screen (1) cannot see it. This is
+        // the value GEMM's `nan_safe_clamp` output and the documented catcher
+        // the bounds entry gets from its concretize preflight.
+        for sign in [1.0f32, -1.0] {
+            let mut c = clean_frontier(rows, dim);
+            c.upper_a[2] = sign * ny_core::FALLBACK_BOUND;
+            assert!(
+                c.upper_a[2].is_finite(),
+                "the sentinel must be FINITE for this pin to mean anything"
+            );
+            assert!(
+                certified_coeffs_from_resident(c, rows).is_err(),
+                "a {sign}x FALLBACK_BOUND saturation sentinel was published"
+            );
+        }
+        // Just under the sentinel still publishes (the screen is not a blanket
+        // magnitude cap that would make the egress useless).
+        let mut near = clean_frontier(rows, dim);
+        near.upper_a[2] = ny_core::FALLBACK_BOUND * 0.5;
+        assert!(certified_coeffs_from_resident(near, rows).is_ok());
+
+        // (3) NEGATIVE RADIUS — a signed correction masquerading as a radius
+        // would TIGHTEN the consumer's concretization.
+        for lane in 0..4usize {
+            let mut c = clean_frontier(rows, dim);
+            match lane {
+                0 => c.lower_err[0] = -1e-9,
+                1 => c.upper_err[0] = -1e-9,
+                2 => c.lower_b_err[0] = -1e-9,
+                _ => c.upper_b_err[0] = -1e-9,
+            }
+            assert!(
+                certified_coeffs_from_resident(c, rows).is_err(),
+                "radius lane {lane} published a NEGATIVE radius"
+            );
+        }
+
+        // (4) The #u4 C1 taint consult: absent, wrong-length, or nonzero words.
+        if crate::wgpu_device::ops::sentinel_taint_selfcheck::PRODUCTION_GUARDS_CONSULT_TAINT_WORD {
+            let mut absent = clean_frontier(rows, dim);
+            absent.taint_rows = None;
+            assert!(certified_coeffs_from_resident(absent, rows).is_err());
+            let mut short = clean_frontier(rows, dim);
+            short.taint_rows = Some(vec![0u32; rows - 1]);
+            assert!(certified_coeffs_from_resident(short, rows).is_err());
+            let mut tainted = clean_frontier(rows, dim);
+            tainted.taint_rows = Some(vec![0u32, 1u32]);
+            assert!(certified_coeffs_from_resident(tainted, rows).is_err());
+        }
+    }
+
+    /// There must be exactly ONE firewall. The flat egress and the segment
+    /// egress publish the same type with the same authority, so a second copy of
+    /// the screens is a drift hazard: the review defect that made the FIRST
+    /// egress weaker than its bounds entry (the missing saturation screen) is
+    /// exactly the kind of divergence a duplicate re-introduces.
+    ///
+    /// Pinned structurally: `ny_core::CertifiedCoeffs` is PUBLISHED in exactly
+    /// one place in this module — inside `certified_coeffs_from_resident` — and
+    /// every egress entry reaches it.
+    ///
+    /// The flat egress calls the firewall directly; the resnet single-domain and
+    /// BATCHED egresses both go through
+    /// `resnet_certified_coeffs_unconcretized`, which is the one transcription
+    /// of their box-independent composition and ends in the same firewall. That
+    /// indirection is checked here rather than assumed, because a batched path
+    /// that grew its own copy could silently become weaker than the
+    /// single-domain one.
+    #[test]
+    fn both_coefficient_egresses_share_one_firewall() {
+        const SRC: &str = include_str!("crown_backward_sound_resident.rs");
+        // Split so this assertion's own text is not a match.
+        let ctor = concat!("Ok(ny_core::Certified", "Coeffs {");
+        assert_eq!(
+            SRC.matches(ctor).count(),
+            1,
+            "CertifiedCoeffs is published outside the shared firewall"
+        );
+        // Direct callers of the firewall: the flat egress and the ONE shared
+        // resnet un-concretized helper. Nothing else.
+        for entry in [
+            "crown_backward_sound_resident_certified_coeffs",
+            "resnet_certified_coeffs_unconcretized",
+        ] {
+            // Anchor on the DEFINITION, not the first textual match: the
+            // first occurrence of `fn {entry}(` in this file is this test's
+            // own search-string literal, so the scan was reading unrelated
+            // code and failing on a correct implementation.
+            let at = ["\n    pub(crate) fn ", "\n    pub fn ", "\n    fn "]
+                .iter()
+                .find_map(|vis| SRC.find(&format!("{vis}{entry}(")))
+                .unwrap_or_else(|| panic!("{entry} definition not found"));
+            // A fixed window from the definition, deliberately simple: the
+            // earlier "stop at the next item" heuristics kept mis-bounding
+            // (a nested block closing at method indent; a doc comment inside
+            // the body) and failed this pin on CORRECT code twice. Both
+            // egresses are well under this size.
+            let body = &SRC[at..];
+            // Stop at the NEXT item (its doc comment counts as the boundary):
+            // a fixed window spilled into the shared two-pass helper, whose
+            // doc legitimately names the recovery rule these entries must not
+            // re-implement.
+            let end = [
+                "\n    /// ",
+                "\n    pub(crate) fn ",
+                "\n    pub fn ",
+                "\n    fn ",
+            ]
+            .iter()
+            .filter_map(|marker| body[1..].find(marker).map(|i| i + 1))
+            .min()
+            .unwrap_or(body.len());
+            assert!(
+                body[..end].contains("certified_coeffs_from_resident("),
+                "{entry} does not publish through the shared firewall"
+            );
+        }
+    }
+
+    /// THE BATCHED CONTRACT CANNOT DRIFT: the multi-domain coefficient egress
+    /// must reuse the single-domain un-concretized helper, not a second copy.
+    /// The helper is the authority boundary that ensures neither entry can fold
+    /// coefficient radii against a domain box or abs-max table before publishing
+    /// [`ny_core::CertifiedCoeffs`].
+    #[test]
+    fn batched_certified_coeffs_share_the_single_domain_unconcretized_walk() {
+        const SRC: &str = include_str!("crown_backward_sound_resident.rs");
+        for entry in [
+            "crown_backward_gpu_resnet_sound_certified_coeffs",
+            "crown_backward_gpu_resnet_sound_batched_certified_coeffs",
+        ] {
+            // Anchor on the DEFINITION with its visibility+indent: the first
+            // textual `fn {entry}(` in this file is this test's own search
+            // string, so the scan read unrelated code. Then take a fixed
+            // window rather than guessing where the body ends (a nested block
+            // closing at method indent, or a doc comment inside the body, each
+            // mis-bounded it and failed this pin on CORRECT code).
+            let at = ["\n    pub(crate) fn ", "\n    pub fn ", "\n    fn "]
+                .iter()
+                .find_map(|vis| SRC.find(&format!("{vis}{entry}(")))
+                .unwrap_or_else(|| panic!("{entry} definition not found"));
+            let body = &SRC[at..];
+            let end = body.len().min(6000);
+            assert!(
+                body[..end].contains("resnet_certified_coeffs_unconcretized("),
+                "{entry} does not go through the shared un-concretized composition"
+            );
+        }
+        // The batched egress must also SPLIT through the pinned slot map rather
+        // than slicing rows itself.
+        let at = SRC
+            .find("fn crown_backward_gpu_resnet_sound_batched_certified_coeffs(")
+            .expect("batched egress not found");
+        let body = &SRC[at..];
+        let end = body.find("\n    }\n").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("split_batched_certified_coeffs("),
+            "the batched egress does not use the pinned domain-major slot map"
+        );
+    }
+}
+
 /// Merge two coefficient streams `cf` and `other` summing BOTH the coefficient and
 /// the bias (with the two errors + certified f32-add terms). Used for projection
 /// residuals, where each branch carries its own bias. `other` must be seeded with
 /// ZERO bias so the incoming bias is counted once (it is already in `cf`).
 fn merge_streams(mut cf: ResidentCoeff, other: &ResidentCoeff) -> ResidentCoeff {
-    const U: f64 = f64::from_bits(0x3E70_0000_0000_0000); // 2^-24
     for i in 0..cf.lower_a.len() {
-        let sl = f64::from(cf.lower_a[i]) + f64::from(other.lower_a[i]);
+        let sl = f32_to_f64_exact(cf.lower_a[i]) + f32_to_f64_exact(other.lower_a[i]);
         let fl_l = sl as f32;
-        cf.lower_err[i] = up_f32(
-            f64::from(cf.lower_err[i]) + f64::from(other.lower_err[i]) + f64::from(fl_l).abs() * U,
+        let lower_err = add_nonnegative_f64_up(
+            f32_to_f64_exact(cf.lower_err[i]),
+            f32_to_f64_exact(other.lower_err[i]),
         );
+        let lower_gap = (f32_to_f64_exact(fl_l) - sl).abs();
+        cf.lower_err[i] = up_f32(add_nonnegative_f64_up(lower_err, lower_gap));
         cf.lower_a[i] = fl_l;
-        let su = f64::from(cf.upper_a[i]) + f64::from(other.upper_a[i]);
+        let su = f32_to_f64_exact(cf.upper_a[i]) + f32_to_f64_exact(other.upper_a[i]);
         let fl_u = su as f32;
-        cf.upper_err[i] = up_f32(
-            f64::from(cf.upper_err[i]) + f64::from(other.upper_err[i]) + f64::from(fl_u).abs() * U,
+        let upper_err = add_nonnegative_f64_up(
+            f32_to_f64_exact(cf.upper_err[i]),
+            f32_to_f64_exact(other.upper_err[i]),
         );
+        let upper_gap = (f32_to_f64_exact(fl_u) - su).abs();
+        cf.upper_err[i] = up_f32(add_nonnegative_f64_up(upper_err, upper_gap));
         cf.upper_a[i] = fl_u;
     }
     for s in 0..cf.lower_b.len() {
-        let sl = f64::from(cf.lower_b[s]) + f64::from(other.lower_b[s]);
+        let sl = f32_to_f64_exact(cf.lower_b[s]) + f32_to_f64_exact(other.lower_b[s]);
         let fl_l = sl as f32;
-        cf.lower_b_err[s] = up_f32(
-            f64::from(cf.lower_b_err[s])
-                + f64::from(other.lower_b_err[s])
-                + f64::from(fl_l).abs() * U,
+        let lower_err = add_nonnegative_f64_up(
+            f32_to_f64_exact(cf.lower_b_err[s]),
+            f32_to_f64_exact(other.lower_b_err[s]),
         );
+        let lower_gap = (f32_to_f64_exact(fl_l) - sl).abs();
+        cf.lower_b_err[s] = up_f32(add_nonnegative_f64_up(lower_err, lower_gap));
         cf.lower_b[s] = fl_l;
-        let su = f64::from(cf.upper_b[s]) + f64::from(other.upper_b[s]);
+        let su = f32_to_f64_exact(cf.upper_b[s]) + f32_to_f64_exact(other.upper_b[s]);
         let fl_u = su as f32;
-        cf.upper_b_err[s] = up_f32(
-            f64::from(cf.upper_b_err[s])
-                + f64::from(other.upper_b_err[s])
-                + f64::from(fl_u).abs() * U,
+        let upper_err = add_nonnegative_f64_up(
+            f32_to_f64_exact(cf.upper_b_err[s]),
+            f32_to_f64_exact(other.upper_b_err[s]),
         );
+        let upper_gap = (f32_to_f64_exact(fl_u) - su).abs();
+        cf.upper_b_err[s] = up_f32(add_nonnegative_f64_up(upper_err, upper_gap));
         cf.upper_b[s] = fl_u;
     }
+    cf.taint_rows = merge_taint_rows(cf.taint_rows.take(), other.taint_rows.as_deref());
     cf
+}
+
+/// #u4: merge two streams' per-spec-row taint words. Both `Some` ⇒ element-wise
+/// OR (a row tainted in EITHER stream is tainted in the sum — the merge is an
+/// ADD, so every input's word survives with a trivially-nonzero partner).
+/// Either side `None` ⇒ `None`: a stream that carried no words cannot vouch for
+/// its rows, and once the C1 consult arms, `None` is the value that REFUSES
+/// verdict use — strictly fail-closed, never a silent "clean".
+fn merge_taint_rows(mine: Option<Vec<u32>>, other: Option<&[u32]>) -> Option<Vec<u32>> {
+    match (mine, other) {
+        (Some(mut a), Some(b)) if a.len() == b.len() => {
+            for (dst, &src) in a.iter_mut().zip(b) {
+                *dst |= src;
+            }
+            Some(a)
+        }
+        _ => None,
+    }
 }
 
 /// Add the identity-skip coefficient stream `skip` into the branch result `cf`:
@@ -451,22 +2904,30 @@ fn merge_streams(mut cf: ResidentCoeff, other: &ResidentCoeff) -> ResidentCoeff 
 /// f32-add rounding term `u·|sum|`. The bias is the branch's (the identity skip
 /// contributes no bias). Both must be over the same dim.
 fn add_skip_stream(mut cf: ResidentCoeff, skip: &ResidentCoeff) -> ResidentCoeff {
-    const U: f64 = f64::from_bits(0x3E70_0000_0000_0000); // 2^-24
     let n = cf.lower_a.len();
     for i in 0..n {
-        let sl = f64::from(cf.lower_a[i]) + f64::from(skip.lower_a[i]);
+        let sl = f32_to_f64_exact(cf.lower_a[i]) + f32_to_f64_exact(skip.lower_a[i]);
         let fl_l = sl as f32;
-        cf.lower_err[i] = up_f32(
-            f64::from(cf.lower_err[i]) + f64::from(skip.lower_err[i]) + f64::from(fl_l).abs() * U,
+        let lower_err = add_nonnegative_f64_up(
+            f32_to_f64_exact(cf.lower_err[i]),
+            f32_to_f64_exact(skip.lower_err[i]),
         );
+        let lower_gap = (f32_to_f64_exact(fl_l) - sl).abs();
+        cf.lower_err[i] = up_f32(add_nonnegative_f64_up(lower_err, lower_gap));
         cf.lower_a[i] = fl_l;
-        let su = f64::from(cf.upper_a[i]) + f64::from(skip.upper_a[i]);
+        let su = f32_to_f64_exact(cf.upper_a[i]) + f32_to_f64_exact(skip.upper_a[i]);
         let fl_u = su as f32;
-        cf.upper_err[i] = up_f32(
-            f64::from(cf.upper_err[i]) + f64::from(skip.upper_err[i]) + f64::from(fl_u).abs() * U,
+        let upper_err = add_nonnegative_f64_up(
+            f32_to_f64_exact(cf.upper_err[i]),
+            f32_to_f64_exact(skip.upper_err[i]),
         );
+        let upper_gap = (f32_to_f64_exact(fl_u) - su).abs();
+        cf.upper_err[i] = up_f32(add_nonnegative_f64_up(upper_err, upper_gap));
         cf.upper_a[i] = fl_u;
     }
+    // #u4: identical fail-closed rule as `merge_streams` (the skip add is also
+    // an ADD — words OR; a word-less side poisons to `None`).
+    cf.taint_rows = merge_taint_rows(cf.taint_rows.take(), skip.taint_rows.as_deref());
     cf
 }
 
@@ -474,16 +2935,20 @@ fn add_skip_stream(mut cf: ResidentCoeff, skip: &ResidentCoeff) -> ResidentCoeff
 /// UP counterpart (`up_f32`) and the error-sizing helpers (`gamma_k_f32`,
 /// `combine_slack_f32`) now live in `crate::wgpu_device::sound_consts`.
 fn down_f32(x: f64) -> f32 {
-    let n = x as f32;
-    if n.is_finite() && f64::from(n) > x {
-        f32::from_bits(if n > 0.0 {
-            n.to_bits() - 1
-        } else {
-            n.to_bits() + 1
-        })
-    } else {
-        n
+    f64_to_f32_down(x)
+}
+
+fn add_nonnegative_f64_up(lhs: f64, rhs: f64) -> f64 {
+    if !lhs.is_finite() || !rhs.is_finite() || lhs < 0.0 || rhs < 0.0 {
+        return f64::INFINITY;
     }
+    if rhs == 0.0 {
+        return lhs;
+    }
+    if lhs == 0.0 {
+        return rhs;
+    }
+    next_up_f64(lhs + rhs)
 }
 
 /// Certified Cut-CROWN stem fold (`NY_MULTINEURON_STEM`, `sound_round=true`):
@@ -495,11 +2960,11 @@ fn down_f32(x: f64) -> f32 {
 /// realized bound never exceeds the exact linear form. Mirrors the CPU-lane
 /// `LinearBounds::add_to_lower_column` discipline (`linear.rs`).
 fn fold_add_lower_coeff_outward(a: &mut [f32], err: &mut [f32], idx: usize, add: f32) {
-    let exact = f64::from(a[idx]) + f64::from(add);
+    let exact = f32_to_f64_exact(a[idx]) + f32_to_f64_exact(add);
     let nearest = exact as f32;
     a[idx] = nearest;
-    let gap = (f64::from(nearest) - exact).abs();
-    err[idx] = up_f32(f64::from(err[idx]) + gap);
+    let gap = (f32_to_f64_exact(nearest) - exact).abs();
+    err[idx] = up_f32(f32_to_f64_exact(err[idx]) + gap);
 }
 
 /// Certified Cut-CROWN stem fold: add `add` to a spec row's LOWER bias, rounding
@@ -508,11 +2973,11 @@ fn fold_add_lower_coeff_outward(a: &mut [f32], err: &mut [f32], idx: usize, add:
 /// non-negative rounding gap. The final bound is `down_f32(b − b_err)`, so both
 /// a smaller `b` and a larger `b_err` can only lower it. Sound over-approx.
 fn fold_add_lower_bias_outward(b: &mut f32, b_err: &mut f32, add: f32) {
-    let exact = f64::from(*b) + f64::from(add);
+    let exact = f32_to_f64_exact(*b) + f32_to_f64_exact(add);
     let rounded = down_f32(exact);
     *b = rounded;
-    let gap = (exact - f64::from(rounded)).max(0.0);
-    *b_err = up_f32(f64::from(*b_err) + gap);
+    let gap = (exact - f32_to_f64_exact(rounded)).max(0.0);
+    *b_err = up_f32(f32_to_f64_exact(*b_err) + gap);
 }
 
 /// Validate a resident cut fold against the exact `Activation` it would modify.
@@ -536,6 +3001,79 @@ fn resident_cut_fold_valid_for_activation(
 }
 
 impl WgpuDevice {
+    /// Fold one maximal unary DAG run from an owned, fully worded device
+    /// carrier into a new owned carrier. The internal resident scratch remains
+    /// unchanged; this seam only replaces host seed uploads and final readback
+    /// with encoder-ordered device copies. The DAG driver applies its bounded
+    /// completion fence after any destination merge, so this fold's scratch and
+    /// the unit-local transform buffers share one explicitly charged lifetime.
+    pub(super) fn crown_backward_sound_resident_sweep_carrier(
+        &self,
+        layers: &[GpuCrownLayer],
+        seed: DeviceSweepCarrier,
+    ) -> Result<DeviceSweepCarrier> {
+        if !self.sound_gpu_authority_cached() {
+            return Err(NyError::UnsupportedOp(
+                "worded DAG resident carrier requires full-IEEE authority".into(),
+            ));
+        }
+        if !self.taint_words_armed() {
+            return Err(NyError::UnsupportedOp(
+                "worded DAG resident carrier requires the taint-word route".into(),
+            ));
+        }
+        let rows = seed.layout.rows;
+        let output_dim = seed.layout.dim;
+        let limits = self.device.limits();
+        let fold = resident_fold_plan(
+            layers,
+            rows,
+            rows,
+            output_dim,
+            limits.max_compute_workgroups_per_dimension,
+            limits.max_buffer_size,
+            limits.max_storage_buffer_binding_size,
+        )?;
+        // Host-seeded callers count these two direct queue writes in their
+        // transaction seed receipt. The worded device-seed route skips that
+        // host seed, so count only the still-live ones vector and beta-zero
+        // initialization here.
+        let setup_bytes = fold
+            .max_dim
+            .max(1)
+            .checked_add(fold.slope_dim)
+            .and_then(|elements| elements.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| {
+                NyError::InvalidSpec("worded DAG resident setup transfer overflow".into())
+            })?;
+        super::intermediate_sweep::note_host_to_device(setup_bytes);
+        let scope = SweepResidentIoGuard::arm(seed)?;
+        let empty_f32: &[f32] = &[];
+        let _empty_result = self.crown_backward_sound_resident_coeff_seeded_err(
+            layers,
+            empty_f32,
+            empty_f32,
+            empty_f32,
+            empty_f32,
+            empty_f32,
+            empty_f32,
+            empty_f32,
+            empty_f32,
+            rows,
+            output_dim,
+            &[],
+            &[],
+        )?;
+        let output = scope.take_output()?;
+        output.validate_owned_sizes()?;
+        if !self.sound_gpu_authority_cached() {
+            return Err(NyError::UnsupportedOp(
+                "full-IEEE authority was lost after a worded DAG resident fold".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     /// Sound resident CROWN backward over Linear layers (R1: single Linear, no
     /// bias). Returns `(lower, upper)` per spec row, matching
     /// `crown_backward_sound_host` but with the layer GEMMs kept on-device.
@@ -617,10 +3155,10 @@ impl WgpuDevice {
         input_upper: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let bias_lower: Vec<f32> = (0..num_specs)
-            .map(|s| down_f32(f64::from(c.lower_b[s]) - f64::from(c.lower_b_err[s])))
+            .map(|s| down_f32(f32_to_f64_exact(c.lower_b[s]) - f32_to_f64_exact(c.lower_b_err[s])))
             .collect();
         let bias_upper: Vec<f32> = (0..num_specs)
-            .map(|s| up_f32(f64::from(c.upper_b[s]) + f64::from(c.upper_b_err[s])))
+            .map(|s| up_f32(f32_to_f64_exact(c.upper_b[s]) + f32_to_f64_exact(c.upper_b_err[s])))
             .collect();
         self.concretize_sound_gpu_batched(
             num_specs,
@@ -634,7 +3172,264 @@ impl WgpuDevice {
             input_upper,
             &bias_lower,
             &bias_upper,
+            // #u4 C1 (TAINT_GUARD_AUDIT.md §4): the per-spec-row word slice the
+            // MAIN resident walk — or the resnet segment composition, which
+            // ORs its sub-walks' rows across every seam
+            // (`resnet_seeded_compose_coeff`) — pre-OR'd under
+            // the worded route (AUTO or explicit NY_GPU_TAINT_WORDS=1; final
+            // coefficient/error words + every fail-closed no-twin transport).
+            // The bias-err → bias outward fold above is per-spec-row and so
+            // word-invariant. Explicit gate-off carries `None`, as do genuinely
+            // unwordable segment-resident device streams; the armed C1 consult
+            // treats either case as a typed fail-closed refusal.
+            c.taint_rows.as_deref(),
         )
+    }
+
+    /// COEFFICIENT EGRESS (#cert-coeffs): the seeded sound resident walk's
+    /// certified affine frontier, published across the `GpuCrownBackward`
+    /// boundary as [`ny_core::CertifiedCoeffs`] INSTEAD of being concretized.
+    ///
+    /// This exists because the lane that actually proves the deep cifar100 rows
+    /// consumes COEFFICIENTS (it folds them onward itself). Every pre-existing
+    /// certified GPU entry concretizes on device, which makes it structurally
+    /// unseamable there; whole-pass-and-concretize is the only shape it can
+    /// express, and that is not the shape the lane needs.
+    ///
+    /// # Authority
+    ///
+    /// Publishing coefficients is strictly MORE authority than publishing the
+    /// bound derived from them (the caller can concretize them over any box), so
+    /// this runs the identical `#u4` C1 per-spec-row taint consult the
+    /// concretize entry runs before it lets a row decide anything: absent,
+    /// wrong-length, or nonzero words are a typed refusal, never a publication.
+    /// The trait-level gate (`provides_sound_gpu_crown`) is enforced by the
+    /// caller in `ops/crown_backward.rs`.
+    pub(crate) fn crown_backward_sound_resident_certified_coeffs(
+        &self,
+        layers: &[GpuCrownLayer],
+        seed: &GpuCrownSeed,
+    ) -> Result<ny_core::CertifiedCoeffs> {
+        let num_specs = seed.num_specs;
+        let c = self.crown_backward_sound_resident_coeff_seeded(
+            layers,
+            &seed.lower_a,
+            &seed.upper_a,
+            &seed.lower_b,
+            &seed.upper_b,
+            num_specs,
+            seed.current_dim,
+        )?;
+        // ONE copy of the taint consult + fail-closed screens, shared with the
+        // SEGMENT egress (`crown_backward_gpu_resnet_sound_certified_coeffs`).
+        certified_coeffs_from_resident(c, num_specs)
+    }
+
+    /// SEGMENT COEFFICIENT EGRESS (#cert-coeffs-resnet): the resnet segment
+    /// composition's COMPOSED certified frontier, published across the
+    /// `GpuCrownBackward` boundary as [`ny_core::CertifiedCoeffs`] INSTEAD of
+    /// being concretized.
+    ///
+    /// This is the residual twin of
+    /// [`Self::crown_backward_sound_resident_certified_coeffs`]. It exists
+    /// because EVERY cifar100/tinyimagenet net the margin-row lane must
+    /// accelerate is a resnet: the flat egress refuses the moment the lane's op
+    /// walk meets a residual `Add`, so the lane's seam measured
+    /// `gpu_seam_ok=0 / gpu_seam_refused=2` — the seam never ran.
+    ///
+    /// # What is published
+    ///
+    /// The single `ResidentCoeff` returned by
+    /// [`Self::resnet_seeded_compose_coeff`] AFTER the whole segment loop — i.e.
+    /// the frontier COMPOSED ACROSS every segment (each `Chain` folded, each
+    /// `Residual` merged with `add_skip_stream`, and each `ResidualProj` merged
+    /// with `merge_streams`), at `coeff.dim == ` the network input width. It is
+    /// never a single segment's intermediate frontier: the loop replaces
+    /// `coeff` on every merge and only the final value is returned.
+    ///
+    /// # Coefficient authority
+    ///
+    /// A [`ny_core::CertifiedCoeffs`] radius bounds the exact coefficient itself,
+    /// independently of any input box. Therefore this entry deliberately passes
+    /// EMPTY per-segment and per-ReLU abs tables to the composition and disables
+    /// both forced folds. Moving `err_a[j] * abs(z[j])` into bias and zeroing
+    /// `err_a[j]` is sound for a functional on that supplied domain, but it is
+    /// not a coefficient-wise enclosure and must never cross this API boundary.
+    /// Environment gates cannot override the empty-table prerequisite.
+    ///
+    /// The one un-concretized frontier goes through the SAME firewall as the
+    /// flat egress ([`certified_coeffs_from_resident`]): taint consult,
+    /// non-finite screen, `FALLBACK_BOUND` saturation-sentinel screen, and
+    /// negative-radius screen. A refusal propagates and the caller runs its CPU
+    /// path; there is no domain-concretized recovery pass.
+    ///
+    /// # Authority
+    ///
+    /// Same as the flat egress: publishing coefficients is strictly more
+    /// authority than publishing a bound derived from them, so the trait-level
+    /// `provides_sound_gpu_crown` gate is enforced by the caller in
+    /// `ops/crown_backward.rs`, and the `#u4` C1 per-spec-row taint consult runs
+    /// inside the shared firewall.
+    pub(crate) fn crown_backward_gpu_resnet_sound_certified_coeffs(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed: &GpuCrownSeed,
+    ) -> Result<ny_core::CertifiedCoeffs> {
+        if segments.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "crown_backward_gpu_resnet_sound_coeffs: empty segment list".into(),
+            ));
+        }
+        // Same borrowed translation the bounds entry performs.
+        let internal: Vec<ResnetSegment> = segments
+            .iter()
+            .map(|s| match s {
+                GpuResnetSegment::Chain(l) => ResnetSegment::Chain(l.as_slice()),
+                GpuResnetSegment::Residual(l) => ResnetSegment::Residual(l.as_slice()),
+                GpuResnetSegment::ResidualProj(f, p) => {
+                    ResnetSegment::ResidualProj(f.as_slice(), p.as_slice())
+                }
+            })
+            .collect();
+        let num_specs = seed.num_specs;
+        // #batched-bab: single-domain caller (per-dom == total), matching
+        // `crown_backward_sound_resident_resnet_seeded`.
+        self.resnet_certified_coeffs_unconcretized(&internal, seed, num_specs, num_specs)
+    }
+
+    /// The SHARED un-concretized composition + firewall behind BOTH resnet
+    /// coefficient egresses — the single-domain one above and the multi-domain
+    /// [`Self::crown_backward_gpu_resnet_sound_batched_certified_coeffs`].
+    ///
+    /// `num_specs` is the TOTAL stacked-row count `N`; `num_specs_per_dom` is
+    /// the shared per-domain spec-row count (`N / n_domains`). With one domain
+    /// they are equal and this is byte-identical to what the single-domain
+    /// egress did before the batched sibling existed.
+    ///
+    /// Keeping ONE copy is deliberate: empty abs tables plus disabled forced
+    /// folds preserve true coefficient errors, and the fail-closed
+    /// [`certified_coeffs_from_resident`] firewall screens the result. A second
+    /// transcription is a place for the batched path to silently weaken. Pinned
+    /// by `batched_certified_coeffs_share_the_single_domain_unconcretized_walk`.
+    fn resnet_certified_coeffs_unconcretized(
+        &self,
+        internal: &[ResnetSegment],
+        seed: &GpuCrownSeed,
+        num_specs: usize,
+        num_specs_per_dom: usize,
+    ) -> Result<ny_core::CertifiedCoeffs> {
+        let (coeff, _grads, _gathers) = self.resnet_seeded_compose_coeff(
+            internal,
+            &seed.lower_a,
+            &seed.upper_a,
+            &seed.lower_b,
+            &seed.upper_b,
+            num_specs,
+            num_specs_per_dom,
+            seed.current_dim,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            false,
+        )?;
+        certified_coeffs_from_resident(coeff, num_specs)
+    }
+
+    /// BATCHED SEGMENT COEFFICIENT EGRESS (#margin-row-gpu-batch): fold `N`
+    /// domains' backward in ONE wide resident pass and publish `N` COMPOSED
+    /// certified frontiers, one per domain, un-concretized.
+    ///
+    /// The caller (`ops/crown_backward.rs`) has already run the authority gate,
+    /// the HOLE-7 homogeneity gate, the HOLE-8 unbatchable-layer gate and the
+    /// device dispatch-limit check, and has stacked the per-domain relaxation
+    /// blocks onto ONE shared skeleton (`stack_wide_segments`) with the shared
+    /// spec seed tiled `n_domains` times. This function is the resident half:
+    /// it runs the SAME un-concretized composition + firewall as the single-domain
+    /// egress over the `N = n_domains * num_specs_per_dom` stacked rows, then
+    /// SPLITS the wide frontier back into per-domain payloads.
+    ///
+    /// # The slot mapping (the killer defect)
+    ///
+    /// `resnet_seeded_compose_coeff` lays the wide frontier out DOMAIN-MAJOR:
+    /// row `s` belongs to domain `s / num_specs_per_dom`, which is exactly the
+    /// layout its own `dom = row/num_specs_per_dom` indexing of the per-domain
+    /// Activation blocks assumes. The coefficient path supplies no domain box
+    /// or abs-max data to this composition. Domain `d` owns the CONTIGUOUS row
+    /// range `[d*nsp, (d+1)*nsp)`, so the split is a pure reshape. The split
+    /// below is written as a single ordered `chunks_exact` walk with no free
+    /// index, and the row count is checked against `n_domains * nsp` BEFORE any
+    /// slicing, so a short or long payload refuses instead of associating one
+    /// domain's coefficients with another domain's relaxation.
+    ///
+    /// # Fail-closed
+    ///
+    /// The firewall runs ONCE over the WHOLE wide payload. A poisoned row
+    /// anywhere refuses the ENTIRE batch — never a partial answer, never a
+    /// per-domain rescue. The caller then runs its one-at-a-time path.
+    pub(crate) fn crown_backward_gpu_resnet_sound_batched_certified_coeffs(
+        &self,
+        wide_segments: &[GpuResnetSegment],
+        wide_seed: &GpuCrownSeed,
+        num_specs_per_dom: usize,
+        n_domains: usize,
+    ) -> Result<Vec<ny_core::CertifiedCoeffs>> {
+        if wide_segments.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "crown_backward_gpu_resnet_sound_batched_coeffs: empty segment list".into(),
+            ));
+        }
+        if n_domains == 0 || num_specs_per_dom == 0 {
+            return Err(NyError::InvalidSpec(
+                "crown_backward_gpu_resnet_sound_batched_coeffs: empty batch".into(),
+            ));
+        }
+        let expected = num_specs_per_dom
+            .checked_mul(n_domains)
+            .ok_or_else(|| NyError::InvalidSpec("batched coeffs: row count overflow".into()))?;
+        if wide_seed.num_specs != expected {
+            return Err(NyError::shape_mismatch(
+                vec![expected],
+                vec![wide_seed.num_specs],
+            ));
+        }
+        // Capacity MUST be known before segment one submits. Only the typed
+        // capacity variant may drive the caller's narrowing ladder; every
+        // validation/firewall/deadline/device error remains terminal.
+        let limits = self.device.limits();
+        let final_dim = batched_coefficient_segment_preflight(
+            wide_segments,
+            expected,
+            num_specs_per_dom,
+            wide_seed.current_dim,
+            limits.max_compute_workgroups_per_dimension,
+            limits.max_buffer_size,
+            limits.max_storage_buffer_binding_size,
+        )?;
+        if final_dim == 0 {
+            return Err(NyError::InvalidSpec(
+                "batched coeffs: preflight produced a zero-width frontier".into(),
+            ));
+        }
+        let internal: Vec<ResnetSegment> = wide_segments
+            .iter()
+            .map(|s| match s {
+                GpuResnetSegment::Chain(l) => ResnetSegment::Chain(l.as_slice()),
+                GpuResnetSegment::Residual(l) => ResnetSegment::Residual(l.as_slice()),
+                GpuResnetSegment::ResidualProj(f, p) => {
+                    ResnetSegment::ResidualProj(f.as_slice(), p.as_slice())
+                }
+            })
+            .collect();
+        let wide = self.resnet_certified_coeffs_unconcretized(
+            &internal,
+            wide_seed,
+            expected,
+            num_specs_per_dom,
+        )?;
+        split_batched_certified_coeffs(&wide, num_specs_per_dom, n_domains)
     }
 
     /// Run the (seeded) resident backward and return the raw coefficient frontier
@@ -650,8 +3445,17 @@ impl WgpuDevice {
         num_specs: usize,
         output_dim: usize,
     ) -> Result<ResidentCoeff> {
-        let n = num_specs * output_dim;
-        let za = vec![0.0f32; n];
+        let limits = self.device.limits();
+        let plan = resident_fold_plan(
+            layers,
+            num_specs,
+            num_specs,
+            output_dim,
+            limits.max_compute_workgroups_per_dimension,
+            limits.max_buffer_size,
+            limits.max_storage_buffer_binding_size,
+        )?;
+        let za = vec![0.0f32; plan.seed_elems];
         let zb2 = vec![0.0f32; num_specs];
         self.crown_backward_sound_resident_coeff_seeded_err(
             layers,
@@ -759,134 +3563,466 @@ impl WgpuDevice {
         // shape checks below are skipped (the device seed carries its own
         // dim/num_specs, validated at the copy site). TAKEN (reset) so a stale
         // state can never leak into an unrelated later fold call.
-        let (dev_seed, dev_zero_bias, dev_keep) = RESIDENT_IO.with(|io| {
+        let (dev_seed, dev_zero_bias, dev_keep, sweep_seed, sweep_keep) = RESIDENT_IO.with(|io| {
             let mut io = io.borrow_mut();
             (
                 io.seed.take(),
                 std::mem::take(&mut io.zero_bias_seed),
                 std::mem::take(&mut io.keep),
+                io.sweep_seed.take(),
+                std::mem::take(&mut io.sweep_keep),
             )
         });
-        if dev_seed.is_none()
-            && (lower_a.len() != num_specs * output_dim
-                || upper_a.len() != num_specs * output_dim)
-        {
-            return Err(NyError::shape_mismatch(
-                vec![num_specs, output_dim],
-                vec![lower_a.len()],
+        let device_limits = self.device.limits();
+        let plan = resident_fold_plan(
+            layers,
+            num_specs,
+            num_specs_per_dom,
+            output_dim,
+            device_limits.max_compute_workgroups_per_dimension,
+            device_limits.max_buffer_size,
+            device_limits.max_storage_buffer_binding_size,
+        )?;
+        let ResidentFoldPlan {
+            num_specs_u32,
+            num_specs_per_dom_u32,
+            n_domains,
+            seed_elems,
+            final_dim,
+            max_dim,
+            max_gemm_out,
+            a_elems,
+            slope_dim,
+            max_wg,
+        } = plan;
+
+        if dev_seed.is_some() && sweep_seed.is_some() {
+            return Err(NyError::InternalError(
+                "resident fold received both legacy and worded device seeds".into(),
             ));
         }
-        if dev_seed.is_none() && (lower_b.len() != num_specs || upper_b.len() != num_specs) {
-            return Err(NyError::shape_mismatch(
-                vec![num_specs],
-                vec![lower_b.len()],
+        if dev_keep && sweep_keep {
+            return Err(NyError::InternalError(
+                "resident fold received both legacy and worded keep requests".into(),
             ));
         }
-        // R2 scope: a chain of Linear layers (each with optional bias). The
-        // coefficient width entering layer i must equal that layer's out_features
-        // (out_features → in_features as we walk the chain back to the input).
-        let mut cur = output_dim;
-        let mut max_dim = output_dim;
-        let mut max_gemm_out = 1usize; // conv: S·OH·OW·IC·KH·KW
-        let mut has_conv = false;
-        for l in layers {
-            match l {
-                GpuCrownLayer::Linear {
-                    out_features,
-                    in_features,
-                    ..
-                } => {
-                    if *out_features != cur {
-                        return Err(NyError::shape_mismatch(vec![cur], vec![*out_features]));
-                    }
-                    max_dim = max_dim.max(*in_features);
-                    cur = *in_features;
+        if let Some(seed) = sweep_seed.as_ref() {
+            if seed.layout.dim != output_dim || seed.layout.rows != num_specs {
+                return Err(NyError::shape_mismatch(
+                    vec![num_specs, output_dim],
+                    vec![seed.layout.rows, seed.layout.dim],
+                ));
+            }
+            seed.validate_owned_sizes()?;
+        } else if let Some(seed) = dev_seed.as_ref() {
+            if seed.dim != output_dim || seed.num_specs != num_specs {
+                return Err(NyError::shape_mismatch(
+                    vec![num_specs, output_dim],
+                    vec![seed.num_specs, seed.dim],
+                ));
+            }
+            let coefficient_bytes = resident_f32_bytes(seed_elems, "device seed coefficient")?;
+            let bias_bytes = resident_f32_bytes(num_specs, "device seed bias")?;
+            for (name, actual, required) in [
+                ("la", seed.la.size(), coefficient_bytes),
+                ("ua", seed.ua.size(), coefficient_bytes),
+                ("le", seed.le.size(), coefficient_bytes),
+                ("ue", seed.ue.size(), coefficient_bytes),
+                ("blo", seed.blo.size(), bias_bytes),
+                ("buo", seed.buo.size(), bias_bytes),
+                ("ble", seed.ble.size(), bias_bytes),
+                ("bue", seed.bue.size(), bias_bytes),
+            ] {
+                if actual < required {
+                    return Err(NyError::InvalidSpec(format!(
+                        "crown_backward_sound_resident: device seed buffer {name} has \
+                         {actual} bytes, needs {required}"
+                    )));
                 }
-                GpuCrownLayer::Activation { num_neurons, .. } => {
-                    if *num_neurons != cur {
-                        return Err(NyError::shape_mismatch(vec![cur], vec![*num_neurons]));
+            }
+        } else {
+            for (name, actual, expected) in [
+                ("lower_a", lower_a.len(), seed_elems),
+                ("upper_a", upper_a.len(), seed_elems),
+                ("lower_a_err", lower_a_err.len(), seed_elems),
+                ("upper_a_err", upper_a_err.len(), seed_elems),
+                ("lower_b", lower_b.len(), num_specs),
+                ("upper_b", upper_b.len(), num_specs),
+                ("lower_b_err", lower_b_err.len(), num_specs),
+                ("upper_b_err", upper_b_err.len(), num_specs),
+            ] {
+                if actual != expected {
+                    return Err(NyError::InvalidSpec(format!(
+                        "crown_backward_sound_resident: {name}.len()={actual} != {expected}"
+                    )));
+                }
+            }
+        }
+        if (dev_keep || sweep_keep) && (!relu_pre_lower.is_empty() || !beta_gather_idx.is_empty()) {
+            return Err(NyError::UnsupportedOp(
+                "seg-resident keep mode with capture channels armed".into(),
+            ));
+        }
+
+        let activation_dims: Vec<usize> = layers
+            .iter()
+            .filter_map(|layer| match layer {
+                GpuCrownLayer::Activation { num_neurons, .. } => Some(*num_neurons),
+                _ => None,
+            })
+            .collect();
+        for (channel, values) in [
+            ("relu_pre_lower", relu_pre_lower),
+            ("beta_signed", beta_signed),
+        ] {
+            if values.len() > activation_dims.len() {
+                return Err(NyError::InvalidSpec(format!(
+                    "crown_backward_sound_resident: {channel} has {} entries for {} \
+                     activation layers",
+                    values.len(),
+                    activation_dims.len()
+                )));
+            }
+            for (activation, (values, &neurons)) in values.iter().zip(&activation_dims).enumerate()
+            {
+                let expected = resident_checked_product(
+                    &[n_domains, neurons],
+                    "capture domain-state elements",
+                )?;
+                if values.len() != expected {
+                    return Err(NyError::InvalidSpec(format!(
+                        "crown_backward_sound_resident: {channel}[{activation}].len()={} \
+                         != n_domains*num_neurons={expected}",
+                        values.len()
+                    )));
+                }
+            }
+        }
+        if beta_gather_idx.len() > activation_dims.len() {
+            return Err(NyError::InvalidSpec(format!(
+                "crown_backward_sound_resident: beta_gather_idx has {} entries for {} \
+                 activation layers",
+                beta_gather_idx.len(),
+                activation_dims.len()
+            )));
+        }
+        for (activation, indices) in beta_gather_idx.iter().enumerate() {
+            resident_checked_u32(indices.len(), "gather index count")?;
+            let gather_elems =
+                resident_checked_product(&[num_specs, indices.len()], "gather output elements")?;
+            resident_checked_u32(gather_elems, "gather output elements")?;
+            let gather_bytes = resident_f32_bytes(gather_elems.max(1), "gather output")?;
+            if gather_bytes > device_limits.max_buffer_size {
+                return Err(NyError::UnsupportedOp(format!(
+                    "crown_backward_sound_resident: beta_gather_idx[{activation}] needs \
+                     {gather_bytes} bytes, max_buffer_size={}",
+                    device_limits.max_buffer_size
+                )));
+            }
+            if gather_elems > LEGACY_BETA_GATHER_MAX_COPIES {
+                let index_bytes = resident_f32_bytes(indices.len().max(1), "gather index storage")?;
+                let max_storage = device_limits.max_storage_buffer_binding_size;
+                if gather_bytes > max_storage || index_bytes > max_storage {
+                    return Err(NyError::UnsupportedOp(format!(
+                        "crown_backward_sound_resident: beta gather storage exceeds \
+                         max_storage_buffer_binding_size={max_storage}"
+                    )));
+                }
+                let dispatch = gather_elems.div_ceil(256);
+                if dispatch > max_wg {
+                    return Err(NyError::UnsupportedOp(format!(
+                        "crown_backward_sound_resident: beta gather dispatch {dispatch} \
+                         exceeds max_compute_workgroups_per_dimension {max_wg}"
+                    )));
+                }
+            }
+        }
+
+        // Resolve all verdict-sensitive arithmetic certificates before the first
+        // GPU allocation. A later layer cannot partially run and then discover
+        // that its reduction has no finite Higham/recovery bound.
+        //
+        // #u4: resolve AUTO / explicit opt-in / explicit opt-out ONCE per walk
+        // entry; see `gpu_taint_words_env` for the contract.
+        let taint_on = self.taint_words_armed();
+        if taint_on && (dev_seed.is_some() || dev_keep) {
+            // #u4 fail-closed: the #seg-resident device streams (seed-in /
+            // keep-out) carry NO word channel — half-wiring them would launder
+            // every word at the segment boundary. Refuse loudly; the resnet
+            // orchestrator's un-worded path still works with the gate off.
+            return Err(NyError::UnsupportedOp(
+                "the worded resident route (AUTO or NY_GPU_TAINT_WORDS=1) is \
+                 not wired for seg-resident device \
+                 seed/keep streams (no word channel across device-resident \
+                 segment boundaries yet) — refusing (fail-closed)"
+                    .into(),
+            ));
+        }
+        if (sweep_seed.is_some() || sweep_keep) && !taint_on {
+            return Err(NyError::UnsupportedOp(
+                "worded intermediate-sweep carrier requires the armed taint-word route".into(),
+            ));
+        }
+        let has_conv = layers
+            .iter()
+            .any(|layer| matches!(layer, GpuCrownLayer::Conv2d { .. }));
+        debug_assert!(taint_walk_conv_route_admitted(taint_on, has_conv));
+
+        // #rung3-denorm-uniformity: resident pipelines are lazy. Build every
+        // resident/EFT module BEFORE accepting the cached adapter probes so a
+        // requested DenormPreserve passthrough failure can poison the cache
+        // read. Otherwise the probe could pass first and a later production
+        // module could silently fall back to plain WGSL in this same walk.
+        let eft_requested = eft_err_env_enabled();
+        // Every authoritative resident walk consumes this lazy pipeline set,
+        // including its taint twins even when EFT tightening is disabled. Build
+        // it before re-reading authority so a passthrough failure permanently
+        // closes the exact device before any verdict-bearing dispatch.
+        let _ = self.resident_backward_pipelines();
+        if !self.sound_gpu_authority_cached() && self.charged_flush_authority_cached().is_none() {
+            return Err(NyError::UnsupportedConfiguration(
+                "WGPU verdict authority closed while materializing resident shaders; \
+                 refusing the GPU walk (fail-closed)"
+                    .to_string(),
+            ));
+        }
+        let eft_on = eft_requested && self.eft_primitives_cached();
+        // #flush-charge: charged-flush authority guard + arming. On a charged
+        // device (rung 3 refused, PURE-FLUSH class, typed constructor) every
+        // un-audited or un-chargeable channel is refused at walk entry and the
+        // audited DAZ covers are armed. `None` on every other device — then
+        // `charged_walk_guard` never runs and `daz_cover_armed` reduces to the
+        // dark env gate, so every uniform below is byte-identical.
+        let charged_policy = self.charged_flush_authority_cached().copied();
+        if let Some(policy) = charged_policy.as_ref() {
+            charged_walk_guard(layers, policy, eft_requested)?;
+        }
+        let daz_cover_armed = crate::wgpu_device::sound_consts::daz_flush_cover_v2_enabled()
+            || charged_policy.is_some();
+        let conv_err_rowmax = std::env::var("NY_CONV_ERR_ROWMAX").ok().as_deref() == Some("1");
+        if taint_on && has_conv && conv_err_rowmax {
+            // The legacy diagnostic broadcasts a row-max error without an
+            // elementwise word output. The default per-entry Conv path is fully
+            // worded; keep this opt-in comparison mode fail-closed rather than
+            // pretending its coarser error kernel transports words.
+            return Err(NyError::UnsupportedOp(
+                "NY_CONV_ERR_ROWMAX=1 is a legacy unworded Conv diagnostic and \
+                 cannot run with the armed taint-word authority; unset it or set \
+                 NY_GPU_TAINT_WORDS=0"
+                    .into(),
+            ));
+        }
+        if taint_on && self.resident_backward_pipelines().gemm_taint.is_none() {
+            // #u4 fail-closed: the twins were not built because the granted
+            // storage-buffer limit cannot host the 11-binding activation twin
+            // (e.g. NY_GPU_BIG_BINDINGS=0 ⇒ wgpu default 8). Refuse the worded
+            // walk; the caller falls back to the un-worded/CPU path.
+            return Err(NyError::UnsupportedOp(format!(
+                "NY_GPU_TAINT_WORDS=1 needs 11 storage buffers per stage; this \
+                 device granted {} — taint twins unavailable, refusing the \
+                 worded walk (fail-closed)",
+                self.device.limits().max_storage_buffers_per_shader_stage
+            )));
+        }
+        // ---- #cert-err preflight (fail-closed) ----------------------------
+        // Prove, BEFORE any dispatch, that every declared `CertifiedWeightError`
+        // is usable and that this walk is in a mode that actually charges it.
+        // Layers declaring the exact-weight default skip the whole block, so
+        // the pre-`cert_err` behaviour is untouched.
+        let cert_bias_charge = cert_bias_charge_required(layers);
+        for (index, layer) in layers.iter().enumerate() {
+            let cert_err = layer_cert_err(layer);
+            if cert_err.is_exact() {
+                continue;
+            }
+            if !cert_err.is_valid() {
+                return Err(NyError::UnsupportedOp(format!(
+                    "#cert-err: layer {index} declares an unusable \
+                     CertifiedWeightError (weight_rel_err={:e}, \
+                     bias_abs_err={:e}); both must be finite and >= 0 — \
+                     refusing (fail-closed)",
+                    cert_err.weight_rel_err, cert_err.bias_abs_err
+                )));
+            }
+            if conv_err_rowmax {
+                // The legacy row-max conv error multiplies by ‖W‖₁ instead of
+                // running the per-entry combine this charge is derived for.
+                return Err(NyError::UnsupportedOp(
+                    "#cert-err: NY_CONV_ERR_ROWMAX=1 selects the legacy row-max \
+                     conv error, which is not the per-entry combine the \
+                     certified weight-error charge is derived for; unset it — \
+                     refusing (fail-closed)"
+                        .into(),
+                ));
+            }
+            if eft_on {
+                // The EFT min-combine MEASURES the rounding of `A@W` for the
+                // SUPPLIED weights. Its a-posteriori bound therefore contains no
+                // `weight_rel_err` term at all, and `min(higham_charged, eft)`
+                // would hand back exactly the charge we just added.
+                return Err(NyError::UnsupportedOp(
+                    "#cert-err: the EFT residual channel (NY_EFT_ERR=1) bounds \
+                     only the rounding of A@W for the SUPPLIED weights, so \
+                     min(higham, eft) would erase the certified weight-error \
+                     charge; refusing the combination (fail-closed)"
+                        .into(),
+                ));
+            }
+            match layer {
+                GpuCrownLayer::Linear { out_features, .. } => {
+                    let g = cert_err.charged_gamma(gamma_k_f32(*out_features)?);
+                    if !g.is_finite() {
+                        return Err(NyError::UnsupportedOp(format!(
+                            "#cert-err: layer {index} has no finite charged gamma                              — refusing (fail-closed)"
+                        )));
                     }
-                    // dim unchanged (elementwise).
+                    cert_charged_slack(combine_slack_f32(*out_features)?, cert_err, index)?;
                 }
                 GpuCrownLayer::Conv2d {
                     out_channels,
-                    in_channels,
+                    kernel_h,
+                    kernel_w,
+                    ..
+                } => {
+                    let conv_reduction = resident_checked_product(
+                        &[*out_channels, *kernel_h, *kernel_w],
+                        "conv reduction length",
+                    )?;
+                    let g = cert_err.charged_gamma(gamma_k_f32(conv_reduction)?);
+                    if !g.is_finite() {
+                        return Err(NyError::UnsupportedOp(format!(
+                            "#cert-err: layer {index} has no finite charged gamma                              — refusing (fail-closed)"
+                        )));
+                    }
+                    cert_charged_slack(combine_slack_f32(conv_reduction)?, cert_err, index)?;
+                }
+                _ => {}
+            }
+        }
+        for layer in layers {
+            match layer {
+                GpuCrownLayer::Activation { num_neurons, .. } => {
+                    gamma_k_f32(*num_neurons)?;
+                    combine_slack_f32(*num_neurons)?;
+                    if eft_on {
+                        eft_r_slack_f32(*num_neurons)?;
+                    }
+                }
+                GpuCrownLayer::Linear { out_features, .. } => {
+                    gamma_k_f32(*out_features)?;
+                    combine_slack_f32(*out_features)?;
+                    if eft_on {
+                        eft_r_slack_f32(*out_features)?;
+                    }
+                }
+                GpuCrownLayer::Conv2d {
+                    bias_expanded,
+                    out_channels,
                     kernel_h,
                     kernel_w,
                     out_h,
                     out_w,
-                    in_h,
-                    in_w,
                     ..
                 } => {
-                    let in_d = out_channels * out_h * out_w; // coeff entering
-                    let out_d = in_channels * in_h * in_w; // coeff exiting
-                    if in_d != cur {
-                        return Err(NyError::shape_mismatch(vec![cur], vec![in_d]));
+                    let conv_reduction = resident_checked_product(
+                        &[*out_channels, *kernel_h, *kernel_w],
+                        "conv reduction length",
+                    )?;
+                    gamma_k_f32(conv_reduction)?;
+                    if !conv_err_rowmax {
+                        combine_slack_f32(conv_reduction)?;
+                        if eft_on {
+                            eft_r_slack_f32(conv_reduction)?;
+                        }
                     }
-                    max_dim = max_dim.max(out_d);
-                    max_gemm_out = max_gemm_out
-                        .max(num_specs * out_h * out_w * in_channels * kernel_h * kernel_w);
-                    has_conv = true;
-                    cur = out_d;
+                    if bias_expanded.is_some() {
+                        let bias_reduction = resident_checked_product(
+                            &[*out_channels, *out_h, *out_w],
+                            "conv bias reduction length",
+                        )?;
+                        gamma_k_f32(bias_reduction)?;
+                        combine_slack_f32(bias_reduction)?;
+                        if eft_on {
+                            eft_r_slack_f32(bias_reduction)?;
+                        }
+                    }
                 }
-                _ => {
-                    return Err(NyError::UnsupportedOp(
-                        "crown_backward_sound_resident R4: Linear/Activation/Conv2d only".into(),
-                    ));
-                }
+                _ => unreachable!("resident_fold_plan rejected unsupported layers"),
             }
         }
-        let final_dim = cur;
-        let a_elems = num_specs * max_dim;
-        // #wg-limit-guard (SOUNDNESS, fail-closed): the resident fold issues 1-D
-        // elementwise dispatches of `ceil(num_specs * W / 256)` workgroups (W = widest
-        // layer coeff width, INCLUDING a conv's im2col reshape width oc*oh*ow and
-        // col2im width ic*ih*iw) plus `num_specs`-wide bias passes, and the downstream
-        // sound concretize dispatches `num_specs`. wgpu caps every dispatch dimension at
-        // `max_compute_workgroups_per_dimension` — kept at the wgpu default (65535) even
-        // under `NY_GPU_BIG_BINDINGS`, which only raises the binding SIZE limit. On the
-        // GB10 Vulkan stack an over-limit dispatch is not reliably caught → a silently
-        // OVER-TIGHT (unsound) bound and/or a crash. Fail closed here so the caller
-        // sub-chunks the domain batch (try_wide_resnet_batched_grad) or falls back to
-        // the sound serial/CPU path — NEVER a corrupt bound. Value-neutral: this only
-        // adds an early Err for over-limit batches; every in-range call is unchanged.
-        let dispatch_width = {
-            let mut w = max_dim;
-            for l in layers {
-                if let GpuCrownLayer::Conv2d {
-                    out_channels,
-                    out_h,
-                    out_w,
-                    ..
-                } = l
-                {
-                    w = w.max(out_channels.saturating_mul(*out_h).saturating_mul(*out_w));
+
+        let coalesce = fold_coalesce_enabled();
+        if cert_bias_charge && coalesce {
+            // #cert-err fail-closed: the bias-error charge writes its constant
+            // `[d; k]` operand and its own uniform with plain queue writes, which
+            // are submission-ordered. Under NY_FOLD_COALESCE=1 the whole fold is
+            // one deferred submission whose uploads must be encoder-ordered arena
+            // copies, and the arena is sized from the pre-`cert_err` per-layer
+            // budget. Refuse rather than risk an ordering/sizing hazard.
+            return Err(NyError::UnsupportedOp(
+                "#cert-err: the certified bias-error charge is incompatible with \
+                 NY_FOLD_COALESCE=1 (its operand uploads are submission-ordered, \
+                 not arena copies); unset it — refusing (fail-closed)"
+                    .into(),
+            ));
+        }
+        if taint_on && coalesce {
+            // #u4 fail-closed: kept even though the transports are now fully
+            // on-device (encoder-ordered dispatches, no mid-walk readbacks —
+            // in principle single-submission-safe). The per-dispatch taint
+            // uniforms are mapped-at-creation (submission-order independent),
+            // but the worded walk has only ever been validated on the
+            // per-layer-submit path; lifting this refusal needs its own
+            // differential session, not a drive-by.
+            return Err(NyError::UnsupportedOp(
+                "the worded resident route (AUTO or NY_GPU_TAINT_WORDS=1) is \
+                 incompatible with NY_FOLD_COALESCE=1 \
+                 (the worded walk is validated only on the per-layer-submit \
+                 path) — refusing (fail-closed)"
+                    .into(),
+            ));
+        }
+        // #u4: the all-zero `taint_b` word buffer must span every weight-shaped
+        // GEMM operand the twins bind (Linear weights and the row-L1 `ones`
+        // vector and every Linear/Conv weight operand).
+        let taint_zw_elems = if taint_on {
+            let mut span = max_dim.max(1);
+            for layer in layers {
+                match layer {
+                    GpuCrownLayer::Linear {
+                        out_features,
+                        in_features,
+                        ..
+                    } => {
+                        span = span.max(resident_checked_product(
+                            &[*out_features, *in_features],
+                            "taint zero-word span",
+                        )?);
+                    }
+                    GpuCrownLayer::Conv2d { weight_col, .. } => {
+                        span = span.max(weight_col.len());
+                    }
+                    GpuCrownLayer::Activation { .. } => {}
+                    _ => {}
                 }
             }
-            w.max(1)
+            span
+        } else {
+            0
         };
-        let max_wg = self
-            .device
-            .limits()
-            .max_compute_workgroups_per_dimension
-            .max(1) as usize;
-        let worst_1d = num_specs.max(num_specs.saturating_mul(dispatch_width).div_ceil(256));
-        if worst_1d > max_wg {
-            return Err(NyError::UnsupportedOp(format!(
-                "crown_backward_sound_resident: 1-D dispatch {worst_1d} exceeds \
-                 max_compute_workgroups_per_dimension {max_wg} (num_specs={num_specs}, \
-                 width={dispatch_width}) — sub-chunk the batch"
-            )));
-        }
-        // #batched-bab: the per-domain Activation state buffers (slopes/intercepts/β)
-        // are stacked in `n_domains` blocks of `max_dim`; the resident shaders read
-        // block `dom = row/num_specs_per_dom` at `dom*num_neurons`. Single domain
-        // (`num_specs_per_dom == num_specs`) → `n_domains == 1` → `slope_dim == max_dim`
-        // → byte-identical. (The coeff/err ping-pong `a_elems = num_specs*max_dim`
-        // already carries the full N rows, so it auto-scales — HOLE 5.)
-        let n_domains = num_specs.checked_div(num_specs_per_dom).unwrap_or(1);
-        let slope_dim = n_domains * max_dim;
+        let fold_staging_cap = if coalesce {
+            let capacity = resident_fold_staging_capacity(layers, n_domains)?;
+            if capacity > device_limits.max_buffer_size {
+                return Err(NyError::UnsupportedOp(format!(
+                    "crown_backward_sound_resident: fold staging needs {capacity} bytes, \
+                     max_buffer_size={}",
+                    device_limits.max_buffer_size
+                )));
+            }
+            capacity
+        } else {
+            0
+        };
         // (#lever1 weight residency) The former shared `max_w`-sized weight
         // scratch (`res_w`/`res_abs_w`, re-written per layer per call) is gone:
         // each Linear/Conv2d layer now binds its own GPU-resident buffer from
@@ -897,7 +4033,7 @@ impl WgpuDevice {
         // The sound concretize runs OUTSIDE this closure: it re-locks the same
         // (non-reentrant) gpu_serialize mutex, so calling it here would deadlock.
         #[allow(clippy::type_complexity)]
-        let (fla, fua, fle, fue, fblo, fbuo, fble, fbue, f_relu_grads, f_beta_gather): (
+        let (fla, fua, fle, fue, fblo, fbuo, fble, fbue, f_relu_grads, f_beta_gather, f_taint_rows): (
             Vec<f32>,
             Vec<f32>,
             Vec<f32>,
@@ -908,7 +4044,9 @@ impl WgpuDevice {
             Vec<f32>,
             Vec<Vec<f32>>,
             Vec<Vec<f32>>,
-        ) = self.run_gpu_checked("crown_backward_sound_resident", || {
+            // #u4: Some(per-spec-row words) iff taint_on; None ⇒ gate off.
+            Option<Vec<u32>>,
+        ) = self.run_gpu_checked_with_crown_deadline("crown_backward_sound_resident", || {
             // #NY_WIDE_PROBE: per-resident-call phase breakdown so STEP-1 profiling can
             // attribute the wide-node chunk overhead (setup / CPU weight-prep / gpu
             // submit / readback). Inert unless the probe env is set.
@@ -925,28 +4063,14 @@ impl WgpuDevice {
             let bias_pipe = &res_pipes.bias;
             let act_pipe = &res_pipes.act;
             let act_bias_pipe = &res_pipes.act_bias;
-            // Conv pipelines (only built when a conv layer is present).
-            let conv_pipes = if has_conv {
-                Some((
-                    self.create_simple_pipeline(
-                        super::super::shaders::CONV_RESHAPE_SHADER,
-                        "conv_reshape",
-                        &[false, true], // src (ro); dst (rw)
-                    ),
-                    self.create_simple_pipeline(
-                        super::super::shaders::CONV_COL2IM_SHADER,
-                        "conv_col2im",
-                        &[false, true], // gemm_out (ro); dst (rw)
-                    ),
-                    self.create_simple_pipeline(
-                        super::super::shaders::CROWN_CONV_ERROR_ROWMAX_SHADER,
-                        "conv_err",
-                        &[false, false, true], // a, err (ro); err_out (rw)
-                    ),
-                ))
-            } else {
-                None
-            };
+            // Conv pipelines (cached on the device — see the
+            // `ResidentBackwardPipelines` field docs for the per-call-creation
+            // driver-crash history).
+            let conv_pipes = has_conv.then_some((
+                &res_pipes.conv_reshape,
+                &res_pipes.conv_col2im,
+                &res_pipes.conv_err,
+            ));
 
             let storage = |label: &str, n: usize| -> wgpu::Buffer {
                 self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -974,17 +4098,63 @@ impl WgpuDevice {
             // #seg-resident: the armed device seed/keep state was TAKEN (reset)
             // at fn entry (before the host shape checks) so a stale state can
             // never leak into an unrelated later fold call.
-            if let Some(sd) = &dev_seed {
-                // Device-resident seed: encoder-ordered buffer copies replace the
-                // host-slice uploads. Sizes must match the declared frontier.
-                if sd.dim != output_dim || sd.num_specs != num_specs {
-                    return Err(NyError::shape_mismatch(
-                        vec![num_specs, output_dim],
-                        vec![sd.num_specs, sd.dim],
-                    ));
+            if let Some(sd) = &sweep_seed {
+                // Authoritative worded sweep seed: copy all value/error lanes
+                // on-device. Its word twins and row accumulator are copied
+                // after the taint scratch set has been allocated below.
+                let seed_bytes = resident_f32_bytes(seed_elems, "worded sweep device seed")?;
+                let bias_bytes = resident_f32_bytes(num_specs, "worded sweep bias seed")?;
+                let mut se = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("res_sweep_seed_values"),
+                    });
+                se.copy_buffer_to_buffer(
+                    &sd.matrix.lower_center,
+                    0,
+                    &la[0],
+                    0,
+                    seed_bytes,
+                );
+                se.copy_buffer_to_buffer(
+                    &sd.matrix.upper_center,
+                    0,
+                    &ua[0],
+                    0,
+                    seed_bytes,
+                );
+                se.copy_buffer_to_buffer(
+                    &sd.matrix.lower_radius,
+                    0,
+                    &le[0],
+                    0,
+                    seed_bytes,
+                );
+                se.copy_buffer_to_buffer(
+                    &sd.matrix.upper_radius,
+                    0,
+                    &ue[0],
+                    0,
+                    seed_bytes,
+                );
+                if seed_elems < a_elems {
+                    se.clear_buffer(&le[0], seed_bytes, None);
+                    se.clear_buffer(&ue[0], seed_bytes, None);
                 }
-                let seed_bytes = (num_specs * output_dim * size_of::<f32>()) as u64;
-                let bias_bytes = (num_specs * size_of::<f32>()) as u64;
+                for (source, destination) in [
+                    (&sd.row.lower_bias, &blo),
+                    (&sd.row.upper_bias, &buo),
+                    (&sd.row.lower_bias_radius, &ble),
+                    (&sd.row.upper_bias_radius, &bue),
+                ] {
+                    se.copy_buffer_to_buffer(source, 0, destination, 0, bias_bytes);
+                }
+                self.submit_ticked(se.finish());
+            } else if let Some(sd) = &dev_seed {
+                // Device-resident seed: encoder-ordered buffer copies replace the
+                // host-slice uploads. Dimensions were checked before allocation.
+                let seed_bytes = resident_f32_bytes(seed_elems, "device seed")?;
+                let bias_bytes = resident_f32_bytes(num_specs, "device bias seed")?;
                 let mut se = self
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -995,7 +4165,7 @@ impl WgpuDevice {
                 se.copy_buffer_to_buffer(&sd.le, 0, &le[0], 0, seed_bytes);
                 se.copy_buffer_to_buffer(&sd.ue, 0, &ue[0], 0, seed_bytes);
                 // Zero the err lanes' unused tail (mirrors the host path).
-                if (num_specs * output_dim) < a_elems {
+                if seed_elems < a_elems {
                     se.clear_buffer(&le[0], seed_bytes, None);
                     se.clear_buffer(&ue[0], seed_bytes, None);
                 }
@@ -1065,6 +4235,13 @@ impl WgpuDevice {
                 bytemuck::cast_slice(&vec![1.0f32; max_dim.max(1)]),
             );
             let bias_buf = storage("res_bias", max_dim);
+            // #cert-err: the constant `[bias_abs_err; k]` operand and the
+            // throwaway centre-bias sink for the extra bias-error dispatch.
+            // Allocated ONLY when some layer declares a nonzero `bias_abs_err`,
+            // so the default (exact-weight) walk allocates nothing new.
+            let cert_bias_buf = cert_bias_charge.then(|| storage("res_cert_bias", max_dim));
+            let cert_bias_sink =
+                cert_bias_charge.then(|| storage("res_cert_bias_sink", num_specs.max(1)));
             // Activation slope/intercept buffers (reused per activation layer).
             // #batched-bab: `slope_dim = n_domains*max_dim` — one block per domain, so a
             // wide row reads its OWN domain's relaxation (single domain → max_dim, same).
@@ -1072,6 +4249,131 @@ impl WgpuDevice {
             let us_buf = storage("res_us", slope_dim);
             let lint_buf = storage("res_lint", slope_dim);
             let uint_buf = storage("res_uint", slope_dim);
+
+            // #u4 (gate ON only — gate off allocates NOTHING here): the word
+            // channel. u32 words are the same width as the f32 values, so each
+            // buffer mirrors its value twin's element count exactly. Seeding:
+            // coefficient AND composed coefficient-error words from the host
+            // seed under the G13 rule (`taint_seed_word`); sentinel-magnitude
+            // bias/bias-error seeds condemn their spec rows below. The `[1]`
+            // slots and scratches need no init — every twin dispatch fully
+            // overwrites its word output before anything reads it. `zw` stays
+            // all-zero for the walk lifetime (wgpu zero-initializes; nothing
+            // ever writes it).
+            let mut taint: Option<TaintWalkState> = if taint_on {
+                let u32_storage = |label: &str, n: usize| -> wgpu::Buffer {
+                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: (n.max(1) * size_of::<u32>()) as u64,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST
+                            | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    })
+                };
+                let tb = TaintWalkState {
+                    wla: [u32_storage("res_w_la0", a_elems), u32_storage("res_w_la1", a_elems)],
+                    wua: [u32_storage("res_w_ua0", a_elems), u32_storage("res_w_ua1", a_elems)],
+                    wle: [u32_storage("res_w_le0", a_elems), u32_storage("res_w_le1", a_elems)],
+                    wue: [u32_storage("res_w_ue0", a_elems), u32_storage("res_w_ue1", a_elems)],
+                    ws: u32_storage("res_w_s", a_elems),
+                    wprop: u32_storage("res_w_prop", a_elems),
+                    w_rowabs_lo: u32_storage("res_w_rowabs_lo", num_specs.max(1)),
+                    w_rowabs_hi: u32_storage("res_w_rowabs_hi", num_specs.max(1)),
+                    // Conv permutation/GEMM scratch words mirror the two value
+                    // scratches and are overwritten for coefficient, S, and
+                    // propagated-error subchains in encoder order.
+                    w_conv_reshaped: u32_storage("res_w_conv_reshaped", a_elems),
+                    w_conv_gemm: u32_storage("res_w_conv_gemm", max_gemm_out),
+                    zw: u32_storage("res_w_zero", taint_zw_elems),
+                    // The on-device row accumulator: zero-init (wgpu
+                    // zero-initializes storage buffers), monotone (atomicOr is
+                    // its only writer), read back ONCE at walk end.
+                    rows_dev: u32_storage("res_w_rows", num_specs.max(1)),
+                    rows: vec![0u32; num_specs],
+                };
+                let mut tb = tb;
+                if let Some(sd) = &sweep_seed {
+                    // The sweep carrier already owns the exact word state.
+                    // Copy its active head and sticky row accumulator; newly
+                    // allocated tails are WebGPU-zeroed and never contribute
+                    // before a layer overwrites them.
+                    let coefficient_bytes =
+                        resident_f32_bytes(seed_elems, "worded sweep word seed")?;
+                    let row_bytes = resident_f32_bytes(num_specs, "worded sweep row seed")?;
+                    let mut encoder = self.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("res_sweep_seed_words"),
+                        },
+                    );
+                    for (source, destination) in [
+                        (&sd.matrix.lower_center_word, &tb.wla[0]),
+                        (&sd.matrix.upper_center_word, &tb.wua[0]),
+                        (&sd.matrix.lower_radius_word, &tb.wle[0]),
+                        (&sd.matrix.upper_radius_word, &tb.wue[0]),
+                    ] {
+                        encoder.copy_buffer_to_buffer(
+                            source,
+                            0,
+                            destination,
+                            0,
+                            coefficient_bytes,
+                        );
+                    }
+                    encoder.copy_buffer_to_buffer(
+                        &sd.row.taint_rows,
+                        0,
+                        &tb.rows_dev,
+                        0,
+                        row_bytes,
+                    );
+                    self.submit_ticked(encoder.finish());
+                } else {
+                    // Host-seed route. One reusable scratch vec, head = seed
+                    // words, tail = 0 (the seed head is `seed_elems`, the
+                    // buffer `a_elems`; the tail mirrors the value buffers'
+                    // zeroed tail).
+                    let mut word_scratch = vec![0u32; a_elems];
+                    for (dst, &v) in word_scratch.iter_mut().zip(lower_a.iter()) {
+                        *dst = taint_seed_word(v);
+                    }
+                    self.queue
+                        .write_buffer(&tb.wla[0], 0, bytemuck::cast_slice(&word_scratch));
+                    word_scratch.fill(0);
+                    for (dst, &v) in word_scratch.iter_mut().zip(upper_a.iter()) {
+                        *dst = taint_seed_word(v);
+                    }
+                    self.queue
+                        .write_buffer(&tb.wua[0], 0, bytemuck::cast_slice(&word_scratch));
+                    // Error words: G13 over the COMPOSED seed errors too — a
+                    // `1e30`/`1e10` marker shipped in an error seed must enter
+                    // worded, exactly like a coefficient marker.
+                    word_scratch.fill(0);
+                    for (dst, &v) in word_scratch.iter_mut().zip(lower_a_err.iter()) {
+                        *dst = taint_seed_word(v);
+                    }
+                    self.queue
+                        .write_buffer(&tb.wle[0], 0, bytemuck::cast_slice(&word_scratch));
+                    word_scratch.fill(0);
+                    for (dst, &v) in word_scratch.iter_mut().zip(upper_a_err.iter()) {
+                        *dst = taint_seed_word(v);
+                    }
+                    self.queue
+                        .write_buffer(&tb.wue[0], 0, bytemuck::cast_slice(&word_scratch));
+                    // Seed biases fold straight into the per-spec-row host
+                    // companion because they are host data on this route.
+                    for seed in [lower_b, upper_b, lower_b_err, upper_b_err] {
+                        for (row, &v) in seed.iter().enumerate() {
+                            if row < tb.rows.len() && taint_seed_word(v) != 0 {
+                                tb.rows[row] |= 1;
+                            }
+                        }
+                    }
+                }
+                Some(tb)
+            } else {
+                None
+            };
 
             let uniform = |label: &str, bytes: usize| -> wgpu::Buffer {
                 self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1097,7 +4399,6 @@ impl WgpuDevice {
             // the GPU-checked section; first-initializing the probe here would
             // self-deadlock. The cache is populated eagerly at device creation
             // when NY_EFT_ERR=1 (device.rs); uninitialized ⇒ Higham unchanged.
-            let eft_on = eft_err_env_enabled() && self.eft_primitives_cached();
             let (eft_v_buf, eft_r_buf, eft_cp_buf) = if eft_on {
                 (
                     Some(storage("res_eft_v", a_elems)),
@@ -1123,35 +4424,17 @@ impl WgpuDevice {
             // correct because their uploads go through the staging arena as
             // encoder-ordered copies (see FoldStagingArena). Sizing: exact
             // per-layer upload bytes + generous per-layer uniform slack.
-            let coalesce = fold_coalesce_enabled();
             let mut fold_cmds: Vec<wgpu::CommandBuffer> = Vec::new();
             let mut arena = if coalesce {
-                let mut cap: u64 = 4096;
-                for l in layers {
-                    cap += 1024 // uniform slack per layer (≤ ~12 × 64 B structs)
-                        + match l {
-                            GpuCrownLayer::Activation { num_neurons, .. } => {
-                                // 4 slope/intercept arrays + per-domain β + the
-                                // (optional) α-grad capture's pre-lower upload.
-                                (((4 + 2 * n_domains) * num_neurons) * 4) as u64
-                            }
-                            GpuCrownLayer::Linear { bias, .. } => {
-                                bias.as_ref().map_or(0, |b| (b.len() * 4) as u64)
-                            }
-                            GpuCrownLayer::Conv2d {
-                                out_channels,
-                                out_h,
-                                out_w,
-                                ..
-                            } => ((out_channels * out_h * out_w) * 4) as u64,
-                            _ => 0,
-                        };
-                }
-                Some(FoldStagingArena::new(&self.device, cap))
+                Some(FoldStagingArena::new(&self.device, fold_staging_cap))
             } else {
                 None
             };
             let bp_buf = uniform("res_bp", size_of::<BiasParams>());
+            // #cert-err: a SECOND `BiasParams` uniform so the bias-error charge
+            // (gamma_k = 1, widened slack) coexists with the ordinary bias fold
+            // inside one encoder. `None` unless a layer declares a bias error.
+            let cert_bp_buf = cert_bias_charge.then(|| uniform("res_cert_bp", size_of::<BiasParams>()));
             // Separate lower/upper uniforms: within one submit, queue.write_buffer
             // is ordered BEFORE all encoder passes, so reusing one buffer for both
             // sides would make every pass see only the last-written (upper) value.
@@ -1173,15 +4456,7 @@ impl WgpuDevice {
             // kernel on the PRE-transform lower coefficient (la[ping]); this is
             // purely additive (writes only its own grad buffers, never the bound
             // buffers) so the verdict path with empty `relu_pre_lower` is unchanged.
-            let grad_pipe = if relu_pre_lower.is_empty() {
-                None
-            } else {
-                Some(self.create_simple_pipeline(
-                    super::super::shaders::CROWN_ALPHA_GRADIENT_SHADER,
-                    "crown_alpha_grad_capture",
-                    &[false, false, true],
-                ))
-            };
+            let grad_pipe = (!relu_pre_lower.is_empty()).then_some(&res_pipes.alpha_grad);
             // #w4 wide α+β ascent: `slope_dim`-wide so the wide lane can stage each
             // domain's stacked pre-activation block (dom*nn + i); single domain
             // (`slope_dim == max_dim`) is byte-identical.
@@ -1223,10 +4498,10 @@ impl WgpuDevice {
             // receptive column and (b) a dim× factor at every discharge — the
             // measured ~25× root-bound gap vs the certified forward pass on deep
             // conv resnets (#w4). Opt out with NY_CONV_ERR_ROWMAX=1 for A/B.
-            let conv_err_rowmax = std::env::var("NY_CONV_ERR_ROWMAX").ok().as_deref() == Some("1");
-
             let mut ping = 0usize;
-            for layer in layers {
+            // `li` is the layer's index in `layers`, used only to name the layer
+            // in `#cert-err` refusal messages.
+            for (li, layer) in layers.iter().enumerate() {
                 // Cooperative cancellation (#w4-refresh-deadline): a deep resnet
                 // walk is a long sequence of per-layer submits; between layers is
                 // a safe stop point. Callers treat DeadlineExceeded as a sound
@@ -1247,7 +4522,9 @@ impl WgpuDevice {
                 } = layer
                 {
                     let nn = *num_neurons;
-                    let g = gamma_k_f32(nn);
+                    let g = gamma_k_f32(nn)?;
+                    let slack = combine_slack_f32(nn)?;
+                    let eft_slack = if eft_on { eft_r_slack_f32(nn)? } else { 0.0 };
                     // FTZ-SAFE additive underflow floors (#gpu-metal): Metal MSL
                     // flushes subnormals to zero, so the old `8·ETA` / `8n·ETA`
                     // (ETA = 2^-149, subnormal) floors would vanish on Apple GPUs →
@@ -1263,10 +4540,18 @@ impl WgpuDevice {
                     // scaled by a large intercept loses up to |sel|·FLT_MIN. This
                     // completes the Metal FTZ fix for the reduction path.
                     // See docs/SOUND_GPU_IBP_PLAN.md §0.
-                    let add_e = ny_core::ftz_safe_underflow_floor(1); // elementwise: complete
-                                                                      // Reduction: base of additive + amplified flushacc term.
-                    let add_b =
-                        ny_core::ftz_safe_underflow_floor(u32::try_from(nn).unwrap_or(u32::MAX));
+                    let add_e = super::super::sound_consts::rung3_flush_safe_additive(1)?; // elementwise: complete
+                    // Reduction: the admitted fma-residual flush happens before
+                    // the EFT recovery multiply, so scale its base floor by the
+                    // same outward r_slack. Legacy mode keeps the unscaled base.
+                    let nn_u32 = u32::try_from(nn).unwrap_or(u32::MAX);
+                    let add_b = if eft_on {
+                        super::super::sound_consts::rung3_flush_safe_additive_scaled(
+                            nn_u32, eft_slack,
+                        )?
+                    } else {
+                        super::super::sound_consts::rung3_flush_safe_additive(nn_u32)?
+                    };
                     // #fold-coalesce: the encoder exists BEFORE the uploads so
                     // they can be arena-copies ordered ahead of this layer's
                     // passes (legacy mode keeps write_buffer semantics).
@@ -1322,26 +4607,32 @@ impl WgpuDevice {
                     }
                     let elem_wg = ((num_specs * nn) as u32).div_ceil(256);
 
+                    // #flush-charge §E: under charged authority the intercept-bias
+                    // reduction's slack is widened by the audited act-bias factor
+                    // (double-DAZ demand, oracle
+                    // `charged_act_bias_factor_covers_the_double_daz_demand`);
+                    // identity (byte-identical) on every uncharged device.
+                    let act_bias_slack = charged_act_bias_slack_or(charged_policy.as_ref(), slack)?;
                     // Write the four lower/upper uniforms ONCE each (distinct buffers).
                     let mk_actbp = |is_up: u32| ActBiasParams {
-                        num_specs: num_specs as u32,
+                        num_specs: num_specs_u32,
                         num_neurons: nn as u32,
                         is_upper: is_up,
                         // #eft-err: in EFT mode the γ field carries r_slack (the
                         // shader's γ term is unused there).
-                        gamma_k: if eft_on { eft_r_slack_f32(nn) } else { g },
+                        gamma_k: if eft_on { eft_slack } else { g },
                         additive: add_b,
-                        slack: combine_slack_f32(nn),
-                        num_specs_per_dom: num_specs_per_dom as u32,
+                        slack: act_bias_slack,
+                        num_specs_per_dom: num_specs_per_dom_u32,
                         eft_mode: u32::from(eft_on),
                     };
                     let mk_actp = |is_up: u32| ActParams {
-                        num_specs: num_specs as u32,
+                        num_specs: num_specs_u32,
                         num_neurons: nn as u32,
                         is_upper: is_up,
                         additive: add_e,
                         // #batched-bab: dom = row/num_specs_per_dom; single domain → 0.
-                        num_specs_per_dom: num_specs_per_dom as u32,
+                        num_specs_per_dom: num_specs_per_dom_u32,
                         eft_mode: u32::from(eft_on),
                         _p: [0; 2],
                     };
@@ -1376,50 +4667,94 @@ impl WgpuDevice {
                         act_bias_pipe,
                         &actbp_lo,
                         &[&la[ping], &le[ping], &lint_buf, &uint_buf, &blo, &ble],
-                        num_specs as u32,
+                        num_specs_u32,
                     );
                     self.pass_simple(
                         &mut encoder,
                         act_bias_pipe,
                         &actbp_hi,
                         &[&ua[ping], &ue[ping], &lint_buf, &uint_buf, &buo, &bue],
-                        num_specs as u32,
+                        num_specs_u32,
                     );
                     // coefficient + error (elementwise, lower then upper); beta_buf (binding 7)
                     // folds the β-CROWN dual post-slope (shader: lower −=, upper += beta_signed).
-                    self.pass_simple(
-                        &mut encoder,
-                        act_pipe,
-                        &actp_lo,
-                        &[
-                            &la[ping],
-                            &le[ping],
-                            &ls_buf,
-                            &us_buf,
-                            &la[1 - ping],
-                            &le[1 - ping],
-                            &beta_buf,
-                        ],
-                        elem_wg,
-                    );
-                    self.pass_simple(
-                        &mut encoder,
-                        act_pipe,
-                        &actp_hi,
-                        &[
-                            &ua[ping],
-                            &ue[ping],
-                            &ls_buf,
-                            &us_buf,
-                            &ua[1 - ping],
-                            &ue[1 - ping],
-                            &beta_buf,
-                        ],
-                        elem_wg,
-                    );
+                    // #u4 gate ON: the SAME dispatch through the activation
+                    // taint twin (values bit-identical, drift-pinned) with the
+                    // word pair rotated alongside the value pair.
+                    if let Some(tb) = taint.as_ref() {
+                        self.pass_simple(
+                            &mut encoder,
+                            res_pipes.act_taint.as_ref().expect("#u4: availability checked at walk entry"),
+                            &actp_lo,
+                            &[
+                                &la[ping],
+                                &le[ping],
+                                &ls_buf,
+                                &us_buf,
+                                &la[1 - ping],
+                                &le[1 - ping],
+                                &beta_buf,
+                                &tb.wla[ping],
+                                &tb.wle[ping],
+                                &tb.wla[1 - ping],
+                                &tb.wle[1 - ping],
+                            ],
+                            elem_wg,
+                        );
+                        self.pass_simple(
+                            &mut encoder,
+                            res_pipes.act_taint.as_ref().expect("#u4: availability checked at walk entry"),
+                            &actp_hi,
+                            &[
+                                &ua[ping],
+                                &ue[ping],
+                                &ls_buf,
+                                &us_buf,
+                                &ua[1 - ping],
+                                &ue[1 - ping],
+                                &beta_buf,
+                                &tb.wua[ping],
+                                &tb.wue[ping],
+                                &tb.wua[1 - ping],
+                                &tb.wue[1 - ping],
+                            ],
+                            elem_wg,
+                        );
+                    } else {
+                        self.pass_simple(
+                            &mut encoder,
+                            act_pipe,
+                            &actp_lo,
+                            &[
+                                &la[ping],
+                                &le[ping],
+                                &ls_buf,
+                                &us_buf,
+                                &la[1 - ping],
+                                &le[1 - ping],
+                                &beta_buf,
+                            ],
+                            elem_wg,
+                        );
+                        self.pass_simple(
+                            &mut encoder,
+                            act_pipe,
+                            &actp_hi,
+                            &[
+                                &ua[ping],
+                                &ue[ping],
+                                &ls_buf,
+                                &us_buf,
+                                &ua[1 - ping],
+                                &ue[1 - ping],
+                                &beta_buf,
+                            ],
+                            elem_wg,
+                        );
+                    }
                     // Per-ReLU alpha gradient from the PRE-transform lower coefficient
                     // la[ping] (read-only here; the transform writes la[1-ping]).
-                    if let Some(gp) = &grad_pipe {
+                    if let Some(gp) = grad_pipe {
                         if act_capture_idx < relu_pre_lower.len() {
                             // #w4 wide α+β ascent: the wide lane stages each domain's
                             // pre-activation block stacked (`n_domains*nn`, dom*nn + i)
@@ -1440,9 +4775,9 @@ impl WgpuDevice {
                                 &mut encoder,
                                 &grad_params,
                                 bytemuck::bytes_of(&GradAlphaParams {
-                                    num_specs: num_specs as u32,
+                                    num_specs: num_specs_u32,
                                     num_neurons: nn as u32,
-                                    num_specs_per_dom: num_specs_per_dom as u32,
+                                    num_specs_per_dom: num_specs_per_dom_u32,
                                     _p1: 0,
                                 }),
                             )?;
@@ -1458,49 +4793,225 @@ impl WgpuDevice {
                             act_capture_idx += 1;
                         }
                     }
-                    // Beta-gradient A-value gather (#w4-split-tightening): stage the
-                    // requested la[ping] entries (PRE-transform lower coefficient —
-                    // this layer's passes only WRITE la[1-ping], so la[ping] is
-                    // stable within this encoder). Per-element 4-byte copies keep
-                    // this shader-free and byte-exact; the volume is tiny
-                    // (num_specs × ≤~10 split neurons per ReLU).
+                    // Beta-gradient / Complete Clip A-value gather
+                    // (#w4-split-tightening): stage the requested la[ping] entries
+                    // (PRE-transform lower coefficient — this layer's passes only
+                    // WRITE la[1-ping], so la[ping] is stable within this encoder).
+                    //
+                    // A small β gather retains the historical per-element byte-copy
+                    // path exactly. Dense Complete Clip requests can contain hundreds
+                    // of columns across thousands of wide rows; encoding one command
+                    // per value is catastrophic, so those use one strided compute
+                    // dispatch plus one contiguous readback copy per ReLU.
                     if act_gather_idx < beta_gather_idx.len() {
                         let idxs = beta_gather_idx[act_gather_idx];
                         if idxs.is_empty() {
                             gather_bufs.push(None);
                         } else {
                             let n_idx = idxs.len();
+                            let gather_elems = num_specs.checked_mul(n_idx).ok_or_else(|| {
+                                NyError::InvalidSpec(
+                                    "resident gather element-count overflow".into(),
+                                )
+                            })?;
+                            let gather_bytes = gather_elems
+                                .checked_mul(size_of::<f32>())
+                                .and_then(|n| u64::try_from(n).ok())
+                                .ok_or_else(|| {
+                                    NyError::InvalidSpec(
+                                        "resident gather byte-count overflow".into(),
+                                    )
+                                })?;
+                            if gather_bytes > self.device.limits().max_buffer_size {
+                                return Err(NyError::UnsupportedOp(format!(
+                                    "resident gather buffer needs {gather_bytes} bytes, device \
+                                     max_buffer_size is {}",
+                                    self.device.limits().max_buffer_size
+                                )));
+                            }
                             let gbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
                                 label: Some("res_beta_gather"),
-                                size: ((num_specs * n_idx).max(1) * size_of::<f32>()) as u64,
+                                size: gather_bytes.max(size_of::<f32>() as u64),
                                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                                 mapped_at_creation: false,
                             });
-                            for s in 0..num_specs {
-                                for (i, &idx) in idxs.iter().enumerate() {
-                                    let idx = idx as usize;
-                                    if idx >= nn {
-                                        continue; // out-of-range stays 0 (zero-init buffer)
+                            if gather_elems <= LEGACY_BETA_GATHER_MAX_COPIES {
+                                for s in 0..num_specs {
+                                    for (i, &idx) in idxs.iter().enumerate() {
+                                        let idx = idx as usize;
+                                        if idx >= nn {
+                                            continue; // out-of-range stays 0 (zero-init buffer)
+                                        }
+                                        encoder.copy_buffer_to_buffer(
+                                            &la[ping],
+                                            ((s * nn + idx) * size_of::<f32>()) as u64,
+                                            &gbuf,
+                                            ((s * n_idx + i) * size_of::<f32>()) as u64,
+                                            size_of::<f32>() as u64,
+                                        );
                                     }
-                                    encoder.copy_buffer_to_buffer(
-                                        &la[ping],
-                                        ((s * nn + idx) * size_of::<f32>()) as u64,
-                                        &gbuf,
-                                        ((s * n_idx + i) * size_of::<f32>()) as u64,
-                                        size_of::<f32>() as u64,
+                                }
+                            } else {
+                                let num_specs_u32 = u32::try_from(num_specs).map_err(|_| {
+                                    NyError::InvalidSpec(
+                                        "resident gather num_specs exceeds u32".into(),
+                                    )
+                                })?;
+                                let nn_u32 = u32::try_from(nn).map_err(|_| {
+                                    NyError::InvalidSpec(
+                                        "resident gather num_neurons exceeds u32".into(),
+                                    )
+                                })?;
+                                let n_idx_u32 = u32::try_from(n_idx).map_err(|_| {
+                                    NyError::InvalidSpec(
+                                        "resident gather index count exceeds u32".into(),
+                                    )
+                                })?;
+                                let _gather_elems_u32 =
+                                    u32::try_from(gather_elems).map_err(|_| {
+                                        NyError::InvalidSpec(
+                                            "resident gather element count exceeds u32".into(),
+                                        )
+                                    })?;
+                                let idx_bytes = n_idx
+                                    .checked_mul(size_of::<u32>())
+                                    .and_then(|n| u64::try_from(n).ok())
+                                    .ok_or_else(|| {
+                                        NyError::InvalidSpec(
+                                            "resident gather index byte-count overflow".into(),
+                                        )
+                                    })?;
+                                let max_storage =
+                                    self.device.limits().max_storage_buffer_binding_size;
+                                if gather_bytes > max_storage || idx_bytes > max_storage {
+                                    return Err(NyError::UnsupportedOp(format!(
+                                        "resident gather storage binding exceeds device limit \
+                                         {max_storage} bytes (output={gather_bytes}, \
+                                         indices={idx_bytes})"
+                                    )));
+                                }
+                                let dispatch = gather_elems.checked_add(255).ok_or_else(|| {
+                                    NyError::InvalidSpec("resident gather dispatch overflow".into())
+                                })? / 256;
+                                if dispatch > max_wg {
+                                    return Err(NyError::UnsupportedOp(format!(
+                                        "resident gather dispatch {dispatch} exceeds \
+                                         max_compute_workgroups_per_dimension {max_wg}"
+                                    )));
+                                }
+                                let dispatch_u32 = u32::try_from(dispatch).map_err(|_| {
+                                    NyError::InvalidSpec(
+                                        "resident gather dispatch exceeds u32".into(),
+                                    )
+                                })?;
+                                let idx_buf = storage("res_beta_gather_idx", n_idx);
+                                self.queue
+                                    .write_buffer(&idx_buf, 0, bytemuck::cast_slice(idxs));
+                                let params = uniform(
+                                    "res_beta_gather_params",
+                                    size_of::<StridedGatherParams>(),
+                                );
+                                self.queue.write_buffer(
+                                    &params,
+                                    0,
+                                    bytemuck::bytes_of(&StridedGatherParams {
+                                        num_specs: num_specs_u32,
+                                        num_neurons: nn_u32,
+                                        num_indices: n_idx_u32,
+                                        _p1: 0,
+                                    }),
+                                );
+                                let dense = storage("res_beta_gather_dense", gather_elems);
+                                self.pass_simple(
+                                    &mut encoder,
+                                    self.resident_strided_gather_pipeline(),
+                                    &params,
+                                    &[&la[ping], &idx_buf, &dense],
+                                    dispatch_u32,
+                                );
+                                encoder.copy_buffer_to_buffer(&dense, 0, &gbuf, 0, gather_bytes);
+                                if __probe {
+                                    eprintln!(
+                                        "[wide-gather] mode=strided rows={num_specs} \
+                                         columns={n_idx} values={gather_elems} commands=2"
                                     );
                                 }
                             }
-                            gather_bufs.push(Some((gbuf, num_specs * n_idx)));
+                            gather_bufs.push(Some((gbuf, gather_elems)));
                         }
                         act_gather_idx += 1;
+                    }
+                    // #u4 fail-closed transport, ON-DEVICE — the intercept→bias
+                    // fold (CROWN_ACTIVATION_INTERCEPT_BIAS_SHADER) has NO
+                    // taint twin: its per-spec bias contribution consumes the
+                    // PRE-transform coefficient AND error, so their words must
+                    // reach the row accumulator (audit §4 C1, intercept fold).
+                    // Encoded HERE, no host readback: the `[ping]` word buffers
+                    // are stable within this encoder (this layer's twins write
+                    // only `[1 - ping]`), and `lint_buf`/`uint_buf` were
+                    // uploaded above for the value fold. Single-domain walks
+                    // express the committed `li != 0 || ui != 0` annihilation
+                    // conjunct as TWO per-column-partner row-OR dispatches per
+                    // word buffer (a word survives iff EITHER intercept
+                    // dispatch keeps it ≡ the disjunction — the CPU reference
+                    // is `intercept_fold_taint`, crown_backward_sound_host.rs,
+                    // now test-reference only); batched-domain walks keep the
+                    // unconditional row-OR fallback (strictly more
+                    // conservative — refusal-only risk; per-domain conjunct is
+                    // a TODO).
+                    // (The α-grad / β-gather captures also read la[ping] but
+                    // are non-soundness-critical steering data — no words.)
+                    if let Some(tb) = taint.as_ref() {
+                        for wb in [&tb.wla[ping], &tb.wua[ping], &tb.wle[ping], &tb.wue[ping]] {
+                            if n_domains == 1 {
+                                self.taint_row_or_dispatch(
+                                    &mut encoder,
+                                    wb,
+                                    Some((&lint_buf, false)),
+                                    num_specs,
+                                    nn,
+                                    &tb.rows_dev,
+                                );
+                                self.taint_row_or_dispatch(
+                                    &mut encoder,
+                                    wb,
+                                    Some((&uint_buf, false)),
+                                    num_specs,
+                                    nn,
+                                    &tb.rows_dev,
+                                );
+                            } else {
+                                self.taint_row_or_dispatch(
+                                    &mut encoder,
+                                    wb,
+                                    None,
+                                    num_specs,
+                                    nn,
+                                    &tb.rows_dev,
+                                );
+                            }
+                        }
                     }
                     if coalesce {
                         fold_cmds.push(encoder.finish());
                     } else {
-                        self.queue.submit(Some(encoder.finish()));
+                        self.submit_ticked(encoder.finish());
                     }
                     ping = 1 - ping;
+                    self.apply_intermediate_sweep_boundary(
+                        li + 1,
+                        nn,
+                        num_specs,
+                        &la[ping],
+                        &ua[ping],
+                        &le[ping],
+                        &ue[ping],
+                        &blo,
+                        &buo,
+                        &ble,
+                        &bue,
+                        taint.as_mut(),
+                    )?;
                     continue;
                 }
 
@@ -1520,19 +5031,71 @@ impl WgpuDevice {
                     out_w,
                     in_h,
                     in_w,
+                    cert_err,
                 } = layer
                 {
                     let (oc, ic, kh, kw) = (*out_channels, *in_channels, *kernel_h, *kernel_w);
                     let (oh, ow, ih, iw) = (*out_h, *out_w, *in_h, *in_w);
-                    let in_d = oc * oh * ow; // coeff entering
-                    let out_d = ic * ih * iw; // coeff exiting
-                    let spatial = oh * ow;
-                    let kernel_cols = ic * kh * kw;
-                    let (m, k, n) = (num_specs * spatial, oc, kernel_cols);
-                    let g_conv = gamma_k_f32(oc * kh * kw);
-                    let add_b =
-                        ny_core::ftz_safe_underflow_floor(u32::try_from(in_d).unwrap_or(u32::MAX)); // FTZ-safe (#gpu-metal)
-                    let (rp, cp, ep) = conv_pipes.as_ref().expect("conv pipes present");
+                    let in_d = oc
+                        .checked_mul(oh)
+                        .and_then(|value| value.checked_mul(ow))
+                        .ok_or_else(|| {
+                            NyError::InvalidSpec(
+                                "resident CROWN conv input dimension overflow".into(),
+                            )
+                        })?; // coeff entering
+                    let out_d = ic
+                        .checked_mul(ih)
+                        .and_then(|value| value.checked_mul(iw))
+                        .ok_or_else(|| {
+                            NyError::InvalidSpec(
+                                "resident CROWN conv output dimension overflow".into(),
+                            )
+                        })?; // coeff exiting
+                    let spatial = oh.checked_mul(ow).ok_or_else(|| {
+                        NyError::InvalidSpec("resident CROWN conv spatial overflow".into())
+                    })?;
+                    let kernel_cols = ic
+                        .checked_mul(kh)
+                        .and_then(|value| value.checked_mul(kw))
+                        .ok_or_else(|| {
+                            NyError::InvalidSpec(
+                                "resident CROWN conv kernel columns overflow".into(),
+                            )
+                        })?;
+                    let m = num_specs.checked_mul(spatial).ok_or_else(|| {
+                        NyError::InvalidSpec("resident CROWN conv GEMM rows overflow".into())
+                    })?;
+                    let (k, n) = (oc, kernel_cols);
+                    let conv_reduction = oc
+                        .checked_mul(kh)
+                        .and_then(|value| value.checked_mul(kw))
+                        .ok_or_else(|| {
+                            NyError::InvalidSpec(
+                                "resident CROWN conv reduction length overflow".into(),
+                            )
+                        })?;
+                    // #cert-err: identical substitution to the Linear arm — the
+                    // conv per-entry error runs the SAME `slack·(gamma·S + P)`
+                    // combine, so charging `g = gamma + w_rel + gamma·w_rel` in
+                    // `gamma_k` and the matching `(1 + w_rel)` in `slack` dominates
+                    // `((gamma+w_rel)·|A| + (1+w_rel)·err) ⊛ |W|`. `conv_err_rowmax` (the legacy
+                    // broadcast) is refused with a nonzero `cert_err` in the
+                    // walk preflight, so `conv_slack == 0.0` never carries a
+                    // charge.
+                    let g_conv_exact = gamma_k_f32(conv_reduction)?;
+                    let g_conv = cert_err.charged_gamma(g_conv_exact);
+                    let conv_slack = if conv_err_rowmax {
+                        0.0
+                    } else {
+                        cert_charged_slack(combine_slack_f32(conv_reduction)?, *cert_err, li)?
+                    };
+                    let conv_eft_slack = if !conv_err_rowmax && eft_on {
+                        eft_r_slack_f32(conv_reduction)?
+                    } else {
+                        0.0
+                    };
+                    let (rp, cp, ep) = conv_pipes.expect("conv pipes present");
                     // #fold-coalesce: encoder BEFORE the uploads (arena copies
                     // must be encoder-ordered ahead of this layer's passes).
                     let mut enc =
@@ -1560,14 +5123,17 @@ impl WgpuDevice {
                         // under-counts → false proof. Accumulate in f64 (f32→f64 widen +
                         // |·| are exact, only the f64 sum rounds) and round the f32 cast
                         // OUTWARD (up). Mirrors the proven conv fix (becc501).
-                        let kl1_f64: f64 = weight_col.iter().map(|v| f64::from(*v).abs()).sum();
+                        let kl1_f64: f64 = weight_col
+                            .iter()
+                            .map(|&value| f32_to_f64_exact(value).abs())
+                            .sum();
                         let kl1: f32 = up_f32(kl1_f64);
                         self.fold_upload(
                             arena.as_mut(),
                             &mut enc,
                             &cep_buf,
                             bytemuck::bytes_of(&ConvErrParams {
-                                num_specs: num_specs as u32,
+                                num_specs: num_specs_u32,
                                 out_dim: in_d as u32,
                                 new_dim: out_d as u32,
                                 _p0: 0,
@@ -1596,17 +5162,47 @@ impl WgpuDevice {
                         // taps ≤ the TOTAL weight L1 `‖W_col‖₁,₁` — a scalar OUTWARD
                         // over-bound (#gpu-metal-daz). `n=1` row-L1 reduction of the
                         // incoming coeff `|A|[num_specs × in_d] @ ones` gives `‖a_i‖₁`.
-                        // Computed from `weight_col` directly: `f64::from(w).abs()` ==
-                        // `f64::from(w.abs())` (|·| and the f32→f64 widen are both
-                        // exact), so this is bit-identical to the old sum over absw_col.
+                        // Compute from `weight_col` with a bit-exact lift so DAZ
+                        // cannot erase a subnormal weight.
+                        // #daz-flush-cover-v2 (dark, default OFF ⇒ byte-identical):
+                        // the shipped `flushacc` carries `‖w_j‖₁` once but a DAZ
+                        // adapter has TWO `μ‖w‖₁` operand-flush channels per output
+                        // (the coefficient GEMM and the propagated-error GEMM), and a
+                        // third `μ‖err_i‖₁` channel with no term at all. See
+                        // `sound_consts::daz_flush_cover_w_l1`.
+                        crate::wgpu_device::sound_consts::refuse_subnormal_weight_under_daz_cover(
+                            weight_col,
+                            "conv-transpose weight_col",
+                            daz_cover_armed,
+                        )?;
                         let w_l1_max_conv: f32 =
-                            up_f32(weight_col.iter().map(|v| f64::from(*v).abs()).sum());
+                            crate::wgpu_device::sound_consts::daz_flush_cover_w_l1(
+                                up_f32(
+                                    weight_col
+                                        .iter()
+                                        .map(|&value| f32_to_f64_exact(value).abs())
+                                        .sum(),
+                                ),
+                                daz_cover_armed,
+                            )?;
+                        let conv_reduction_u32 =
+                            u32::try_from(conv_reduction).unwrap_or(u32::MAX);
+                        let conv_additive = if eft_on {
+                            super::super::sound_consts::rung3_flush_safe_additive_scaled(
+                                conv_reduction_u32,
+                                conv_eft_slack,
+                            )?
+                        } else {
+                            super::super::sound_consts::rung3_flush_safe_additive(
+                                conv_reduction_u32,
+                            )?
+                        };
                         self.fold_upload(
                             arena.as_mut(),
                             &mut enc,
                             &gp1_buf,
                             bytemuck::bytes_of(&GemmParams {
-                                m: num_specs as u32,
+                                m: num_specs_u32,
                                 k: in_d as u32,
                                 n: 1,
                                 _padding: 0,
@@ -1618,12 +5214,10 @@ impl WgpuDevice {
                             &cp_buf,
                             bytemuck::bytes_of(&CombineParams {
                                 n: (num_specs * out_d) as u32,
-                                slack: combine_slack_f32(oc * kh * kw),
+                                slack: conv_slack,
                                 gamma_k: g_conv,
-                                additive: ny_core::ftz_safe_underflow_floor(
-                                    u32::try_from(oc * kh * kw).unwrap_or(u32::MAX),
-                                ),
-                                k: (oc * kh * kw) as u32,
+                                additive: conv_additive,
+                                k: conv_reduction as u32,
                                 out_cols: out_d as u32,
                                 w_l1_max: w_l1_max_conv,
                                 _pad: 0,
@@ -1639,12 +5233,10 @@ impl WgpuDevice {
                                 eft_cp,
                                 bytemuck::bytes_of(&EftCombineParams {
                                     n: (num_specs * out_d) as u32,
-                                    r_slack: eft_r_slack_f32(oc * kh * kw),
-                                    slack: combine_slack_f32(oc * kh * kw),
-                                    additive: ny_core::ftz_safe_underflow_floor(
-                                        u32::try_from(oc * kh * kw).unwrap_or(u32::MAX),
-                                    ),
-                                    k: (oc * kh * kw) as u32,
+                                    r_slack: conv_eft_slack,
+                                    slack: conv_slack,
+                                    additive: conv_additive,
+                                    k: conv_reduction as u32,
                                     out_cols: out_d as u32,
                                     w_l1_max: w_l1_max_conv,
                                     _pad: 0,
@@ -1662,6 +5254,23 @@ impl WgpuDevice {
                         )?;
                     }
                     if let Some(b) = bias_expanded {
+                        let bias_gamma = gamma_k_f32(in_d)?;
+                        // #flush-charge: identity unless charged authority is
+                        // armed (then the oracle-derived bias factor widens it).
+                        let bias_slack =
+                            charged_bias_slack_or(charged_policy.as_ref(), combine_slack_f32(in_d)?)?;
+                        let bias_eft_slack = if eft_on { eft_r_slack_f32(in_d)? } else { 0.0 };
+                        let bias_reduction_u32 = u32::try_from(in_d).unwrap_or(u32::MAX);
+                        let bias_additive = if eft_on {
+                            super::super::sound_consts::rung3_flush_safe_additive_scaled(
+                                bias_reduction_u32,
+                                bias_eft_slack,
+                            )?
+                        } else {
+                            super::super::sound_consts::rung3_flush_safe_additive(
+                                bias_reduction_u32,
+                            )?
+                        };
                         self.fold_upload(
                             arena.as_mut(),
                             &mut enc,
@@ -1673,13 +5282,13 @@ impl WgpuDevice {
                             &mut enc,
                             &bp_buf,
                             bytemuck::bytes_of(&BiasParams {
-                                num_specs: num_specs as u32,
+                                num_specs: num_specs_u32,
                                 k: in_d as u32,
-                                gamma_k: gamma_k_f32(in_d),
-                                additive: add_b,
-                                slack: combine_slack_f32(in_d),
+                                gamma_k: bias_gamma,
+                                additive: bias_additive,
+                                slack: bias_slack,
                                 eft_mode: u32::from(eft_on),
-                                eft_r_slack: if eft_on { eft_r_slack_f32(in_d) } else { 0.0 },
+                                eft_r_slack: bias_eft_slack,
                                 _p: 0,
                             }),
                         )?;
@@ -1689,7 +5298,7 @@ impl WgpuDevice {
                         &mut enc,
                         &crp_buf,
                         bytemuck::bytes_of(&ConvReshapeParams {
-                            num_specs: num_specs as u32,
+                            num_specs: num_specs_u32,
                             out_channels: oc as u32,
                             spatial: spatial as u32,
                             _padding: 0,
@@ -1711,7 +5320,7 @@ impl WgpuDevice {
                         &mut enc,
                         &ccp_buf,
                         bytemuck::bytes_of(&ConvCol2imParams {
-                            num_specs: num_specs as u32,
+                            num_specs: num_specs_u32,
                             flat_input_dim: out_d as u32,
                             out_h: oh as u32,
                             out_w: ow as u32,
@@ -1736,7 +5345,7 @@ impl WgpuDevice {
                     };
                     // n=1 dispatch for the §0 DAZ row-L1 reduction `|A|@ones → row_abs_a`
                     // (incoming coeff `[num_specs × in_d]`).
-                    let disp1 = select_gemm_dispatch(num_specs as u32, in_d as u32, 1);
+                    let disp1 = select_gemm_dispatch(num_specs_u32, in_d as u32, 1);
                     let gemm_pipe1 = if disp1.use_small_k {
                         &self.gemm_f32_small_k_pipeline
                     } else {
@@ -1751,53 +5360,181 @@ impl WgpuDevice {
                             bias_pipe,
                             &bp_buf,
                             &[&la[ping], &le[ping], &bias_buf, &blo, &ble],
-                            num_specs as u32,
+                            num_specs_u32,
                         );
                         self.pass_simple(
                             &mut enc,
                             bias_pipe,
                             &bp_buf,
                             &[&ua[ping], &ue[ping], &bias_buf, &buo, &bue],
-                            num_specs as u32,
+                            num_specs_u32,
                         );
+                        // The bias fold consumes the incoming coefficient and
+                        // error streams. Preserve their words at row granularity
+                        // under the same exact-zero bias annihilation rule as
+                        // Linear, before any Conv twin overwrites the next ping.
+                        if let Some(tb) = taint.as_ref() {
+                            for wb in
+                                [&tb.wla[ping], &tb.wua[ping], &tb.wle[ping], &tb.wue[ping]]
+                            {
+                                self.taint_row_or_dispatch(
+                                    &mut enc,
+                                    wb,
+                                    Some((&bias_buf, false)),
+                                    num_specs,
+                                    in_d,
+                                    &tb.rows_dev,
+                                );
+                            }
+                        }
+                    }
+                    // #cert-err bias charge — same construction as the Linear
+                    // arm; the conv bias fold reduces over the EXPANDED bias
+                    // (`in_d = oc·oh·ow`), so that is the reduction length.
+                    self.cert_bias_charge_pass(
+                        &mut enc,
+                        bias_pipe,
+                        CertBiasChargeArgs {
+                            cert_err: *cert_err,
+                            reduction: in_d,
+                            num_specs,
+                            layer_index: li,
+                            params: cert_bp_buf.as_ref(),
+                            operand: cert_bias_buf.as_ref(),
+                            sink: cert_bias_sink.as_ref(),
+                            a: [&la[ping], &ua[ping]],
+                            a_err: [&le[ping], &ue[ping]],
+                            bias_err_out: [&ble, &bue],
+                        },
+                    )?;
+                    if let (Some(tb), true) = (taint.as_ref(), cert_err.bias_abs_err != 0.0) {
+                        // #u4: unconditional row-OR — the charge dispatch reads
+                        // the coefficient/error streams with no word twin and its
+                        // constant operand is nonzero, so no annihilation applies.
+                        for wb in [&tb.wla[ping], &tb.wua[ping], &tb.wle[ping], &tb.wue[ping]] {
+                            self.taint_row_or_dispatch(
+                                &mut enc,
+                                wb,
+                                None,
+                                num_specs,
+                                in_d,
+                                &tb.rows_dev,
+                            );
+                        }
                     }
                     // #eft-err conv fit: the tiled twin's 16×16 grid must respect
-                    // the 65535 dispatch limit; past it, BOTH conv EFT blocks are
-                    // skipped together (fail-closed to Higham — never a stale-
-                    // buffer min-combine without its twin GEMM).
-                    let conv_eft_fits =
-                        (n as u32).div_ceil(16) <= 65535 && (m as u32).div_ceil(16) <= 65535;
+                    // the device dispatch limit; past it, BOTH conv EFT blocks
+                    // are skipped together (fail-closed to Higham — never a
+                    // stale-buffer min-combine without its twin GEMM).
+                    let conv_eft_fits = (n as u32).div_ceil(16) as usize <= max_wg
+                        && (m as u32).div_ceil(16) as usize <= max_wg;
                     // Per side: coeff (reshape → GEMM → col2im), then — per-entry mode —
                     // the certified error through the SAME structure: S = |A|⊛|W| (abs of
                     // the already-reshaped coeff, so the reshape is not repeated), prop =
                     // err⊛|W|, combined per entry into the post-transform error buffer.
-                    for &(src_a, src_e, dst_a, dst_e) in &[
-                        (&la[ping], &le[ping], &la[1 - ping], &le[1 - ping]),
-                        (&ua[ping], &ue[ping], &ua[1 - ping], &ue[1 - ping]),
+                    for &(side, src_a, src_e, dst_a, dst_e) in &[
+                        (0usize, &la[ping], &le[ping], &la[1 - ping], &le[1 - ping]),
+                        (1usize, &ua[ping], &ue[ping], &ua[1 - ping], &ue[1 - ping]),
                     ] {
-                        self.pass_simple(
-                            &mut enc,
-                            rp,
-                            &crp_buf,
-                            &[src_a, &conv_reshaped],
-                            reshape_wg,
-                        );
-                        self.pass_gemm(
-                            &mut enc,
-                            gemm_pipe,
-                            &gp_buf,
-                            &conv_reshaped,
-                            &w_buf,
-                            &conv_gemm,
-                            disp.wg_x,
-                            disp.wg_y,
-                        );
-                        self.pass_simple(&mut enc, cp, &ccp_buf, &[&conv_gemm, dst_a], col2im_wg);
+                        let word_side = taint.as_ref().map(|tb| {
+                            if side == 0 {
+                                (
+                                    &tb.wla[ping],
+                                    &tb.wle[ping],
+                                    &tb.wla[1 - ping],
+                                    &tb.wle[1 - ping],
+                                    &tb.w_rowabs_lo,
+                                )
+                            } else {
+                                (
+                                    &tb.wua[ping],
+                                    &tb.wue[ping],
+                                    &tb.wua[1 - ping],
+                                    &tb.wue[1 - ping],
+                                    &tb.w_rowabs_hi,
+                                )
+                            }
+                        });
+                        if let (Some(tb), Some((src_wa, _, dst_wa, _, _))) =
+                            (taint.as_ref(), word_side)
+                        {
+                            let gemm_taint_pipe = if disp.use_small_k {
+                                res_pipes.gemm_small_k_taint.as_ref().expect(
+                                    "#u4: small-K twin availability checked at walk entry",
+                                )
+                            } else {
+                                res_pipes.gemm_taint.as_ref().expect(
+                                    "#u4: tiled twin availability checked at walk entry",
+                                )
+                            };
+                            self.pass_simple(
+                                &mut enc,
+                                res_pipes.conv_reshape_taint.as_ref().expect(
+                                    "#u4: Conv reshape twin availability checked at walk entry",
+                                ),
+                                &crp_buf,
+                                &[src_a, &conv_reshaped, src_wa, &tb.w_conv_reshaped],
+                                reshape_wg,
+                            );
+                            self.pass_simple_2d(
+                                &mut enc,
+                                gemm_taint_pipe,
+                                &gp_buf,
+                                &[
+                                    &conv_reshaped,
+                                    &w_buf,
+                                    &conv_gemm,
+                                    &tb.w_conv_reshaped,
+                                    &tb.zw,
+                                    &tb.w_conv_gemm,
+                                ],
+                                disp.wg_x,
+                                disp.wg_y,
+                            );
+                            self.pass_simple(
+                                &mut enc,
+                                res_pipes.conv_col2im_taint.as_ref().expect(
+                                    "#u4: Conv col2im twin availability checked at walk entry",
+                                ),
+                                &ccp_buf,
+                                &[&conv_gemm, dst_a, &tb.w_conv_gemm, dst_wa],
+                                col2im_wg,
+                            );
+                        } else {
+                            self.pass_simple(
+                                &mut enc,
+                                rp,
+                                &crp_buf,
+                                &[src_a, &conv_reshaped],
+                                reshape_wg,
+                            );
+                            self.pass_gemm(
+                                &mut enc,
+                                gemm_pipe,
+                                &gp_buf,
+                                &conv_reshaped,
+                                &w_buf,
+                                &conv_gemm,
+                                disp.wg_x,
+                                disp.wg_y,
+                            );
+                            self.pass_simple(
+                                &mut enc,
+                                cp,
+                                &ccp_buf,
+                                &[&conv_gemm, dst_a],
+                                col2im_wg,
+                            );
+                        }
                         // #eft-err conv twin GEMM: recompute the conv GEMM with the
                         // barrier-fma sequence + exact residuals while
                         // `conv_reshaped` still holds the reshaped VALUE coeff (the
                         // error path overwrites it below). Per-entry mode only (the
                         // rowmax legacy path has no per-entry prop stream to keep).
+                        // The word gate does not change the EFT value/residual
+                        // calculation. Its later min-combine switches to the C2
+                        // consult twin and reads the fully col2im-transported
+                        // S/prop words.
                         if !conv_err_rowmax && conv_eft_fits {
                             if let (Some(evg), Some(erg)) =
                                 (eft_vg_buf.as_ref(), eft_rg_buf.as_ref())
@@ -1824,10 +5561,38 @@ impl WgpuDevice {
                                 &[src_a, &abs_a],
                                 reshape_wg,
                             );
-                            self.pass_gemm(
-                                &mut enc, gemm_pipe1, &gp1_buf, &abs_a, &ones_buf, &row_abs_a,
-                                disp1.wg_x, disp1.wg_y,
-                            );
+                            if let Some(tb) = taint.as_ref() {
+                                let (src_wa, _, _, _, w_rowabs) =
+                                    word_side.expect("word side iff taint is armed");
+                                let row_taint_pipe = if disp1.use_small_k {
+                                    res_pipes.gemm_small_k_taint.as_ref().expect(
+                                        "#u4: small-K twin availability checked at walk entry",
+                                    )
+                                } else {
+                                    res_pipes.gemm_taint.as_ref().expect(
+                                        "#u4: tiled twin availability checked at walk entry",
+                                    )
+                                };
+                                self.pass_simple_2d(
+                                    &mut enc,
+                                    row_taint_pipe,
+                                    &gp1_buf,
+                                    &[&abs_a, &ones_buf, &row_abs_a, src_wa, &tb.zw, w_rowabs],
+                                    disp1.wg_x,
+                                    disp1.wg_y,
+                                );
+                            } else {
+                                self.pass_gemm(
+                                    &mut enc,
+                                    gemm_pipe1,
+                                    &gp1_buf,
+                                    &abs_a,
+                                    &ones_buf,
+                                    &row_abs_a,
+                                    disp1.wg_x,
+                                    disp1.wg_y,
+                                );
+                            }
                             self.pass_simple(
                                 &mut enc,
                                 abs_pipe,
@@ -1835,53 +5600,151 @@ impl WgpuDevice {
                                 &[&conv_reshaped, &abs_a],
                                 reshape_wg,
                             );
-                            self.pass_gemm(
-                                &mut enc, gemm_pipe, &gp_buf, &abs_a, abs_w, &conv_gemm, disp.wg_x,
-                                disp.wg_y,
-                            );
-                            self.pass_simple(
-                                &mut enc,
-                                cp,
-                                &ccp_buf,
-                                &[&conv_gemm, &s_scratch],
-                                col2im_wg,
-                            );
-                            self.pass_simple(
-                                &mut enc,
-                                rp,
-                                &crp_buf,
-                                &[src_e, &conv_reshaped],
-                                reshape_wg,
-                            );
-                            self.pass_gemm(
-                                &mut enc,
-                                gemm_pipe,
-                                &gp_buf,
-                                &conv_reshaped,
-                                abs_w,
-                                &conv_gemm,
-                                disp.wg_x,
-                                disp.wg_y,
-                            );
-                            self.pass_simple(
-                                &mut enc,
-                                cp,
-                                &ccp_buf,
-                                &[&conv_gemm, &prop_scratch],
-                                col2im_wg,
-                            );
-                            self.pass_simple(
-                                &mut enc,
-                                combine_pipe,
-                                &cp_buf,
-                                &[&s_scratch, &prop_scratch, dst_e, &row_abs_a],
-                                col2im_wg,
-                            );
+                            if let Some(tb) = taint.as_ref() {
+                                let (_, src_we, _, dst_we, _) =
+                                    word_side.expect("word side iff taint is armed");
+                                let gemm_taint_pipe = if disp.use_small_k {
+                                    res_pipes.gemm_small_k_taint.as_ref().expect(
+                                        "#u4: small-K twin availability checked at walk entry",
+                                    )
+                                } else {
+                                    res_pipes.gemm_taint.as_ref().expect(
+                                        "#u4: tiled twin availability checked at walk entry",
+                                    )
+                                };
+                                let reshape_taint = res_pipes.conv_reshape_taint.as_ref().expect(
+                                    "#u4: Conv reshape twin availability checked at walk entry",
+                                );
+                                let col2im_taint = res_pipes.conv_col2im_taint.as_ref().expect(
+                                    "#u4: Conv col2im twin availability checked at walk entry",
+                                );
+                                // S = col2im(|reshape(A)| @ |W|). Abs preserves
+                                // the coefficient word exactly.
+                                self.pass_simple_2d(
+                                    &mut enc,
+                                    gemm_taint_pipe,
+                                    &gp_buf,
+                                    &[
+                                        &abs_a,
+                                        abs_w,
+                                        &conv_gemm,
+                                        &tb.w_conv_reshaped,
+                                        &tb.zw,
+                                        &tb.w_conv_gemm,
+                                    ],
+                                    disp.wg_x,
+                                    disp.wg_y,
+                                );
+                                self.pass_simple(
+                                    &mut enc,
+                                    col2im_taint,
+                                    &ccp_buf,
+                                    &[&conv_gemm, &s_scratch, &tb.w_conv_gemm, &tb.ws],
+                                    col2im_wg,
+                                );
+                                // prop = col2im(reshape(err) @ |W|).
+                                self.pass_simple(
+                                    &mut enc,
+                                    reshape_taint,
+                                    &crp_buf,
+                                    &[src_e, &conv_reshaped, src_we, &tb.w_conv_reshaped],
+                                    reshape_wg,
+                                );
+                                self.pass_simple_2d(
+                                    &mut enc,
+                                    gemm_taint_pipe,
+                                    &gp_buf,
+                                    &[
+                                        &conv_reshaped,
+                                        abs_w,
+                                        &conv_gemm,
+                                        &tb.w_conv_reshaped,
+                                        &tb.zw,
+                                        &tb.w_conv_gemm,
+                                    ],
+                                    disp.wg_x,
+                                    disp.wg_y,
+                                );
+                                self.pass_simple(
+                                    &mut enc,
+                                    col2im_taint,
+                                    &ccp_buf,
+                                    &[&conv_gemm, &prop_scratch, &tb.w_conv_gemm, &tb.wprop],
+                                    col2im_wg,
+                                );
+                                self.pass_simple(
+                                    &mut enc,
+                                    res_pipes.combine_taint.as_ref().expect(
+                                        "#u4: combine twin availability checked at walk entry",
+                                    ),
+                                    &cp_buf,
+                                    &[
+                                        &s_scratch,
+                                        &prop_scratch,
+                                        dst_e,
+                                        &row_abs_a,
+                                        &tb.ws,
+                                        &tb.wprop,
+                                        dst_we,
+                                    ],
+                                    col2im_wg,
+                                );
+                            } else {
+                                self.pass_gemm(
+                                    &mut enc,
+                                    gemm_pipe,
+                                    &gp_buf,
+                                    &abs_a,
+                                    abs_w,
+                                    &conv_gemm,
+                                    disp.wg_x,
+                                    disp.wg_y,
+                                );
+                                self.pass_simple(
+                                    &mut enc,
+                                    cp,
+                                    &ccp_buf,
+                                    &[&conv_gemm, &s_scratch],
+                                    col2im_wg,
+                                );
+                                self.pass_simple(
+                                    &mut enc,
+                                    rp,
+                                    &crp_buf,
+                                    &[src_e, &conv_reshaped],
+                                    reshape_wg,
+                                );
+                                self.pass_gemm(
+                                    &mut enc,
+                                    gemm_pipe,
+                                    &gp_buf,
+                                    &conv_reshaped,
+                                    abs_w,
+                                    &conv_gemm,
+                                    disp.wg_x,
+                                    disp.wg_y,
+                                );
+                                self.pass_simple(
+                                    &mut enc,
+                                    cp,
+                                    &ccp_buf,
+                                    &[&conv_gemm, &prop_scratch],
+                                    col2im_wg,
+                                );
+                                self.pass_simple(
+                                    &mut enc,
+                                    combine_pipe,
+                                    &cp_buf,
+                                    &[&s_scratch, &prop_scratch, dst_e, &row_abs_a],
+                                    col2im_wg,
+                                );
+                            }
                             // #eft-err conv: gather the twin (value, residual)
                             // streams through col2im, then min-tighten the conv
                             // combine's per-entry error with the measured bound.
                             // Same fits-guard as the twin GEMM above — the two
-                            // blocks fire together or not at all.
+                            // blocks fire together or not at all. Under #u4 the
+                            // C2 twin consults the post-col2im S/prop words.
                             if let (true, Some(evg), Some(erg), Some(ev), Some(er), Some(ecp)) = (
                                 conv_eft_fits,
                                 eft_vg_buf.as_ref(),
@@ -1898,13 +5761,43 @@ impl WgpuDevice {
                                     &[evg, erg, ev, er],
                                     col2im_wg,
                                 );
-                                self.pass_simple(
-                                    &mut enc,
-                                    &pipes.eft_min_combine,
-                                    ecp,
-                                    &[ev, er, dst_a, &prop_scratch, dst_e, &row_abs_a],
-                                    col2im_wg,
-                                );
+                                if let Some(tb) = taint.as_ref() {
+                                    self.pass_simple(
+                                        &mut enc,
+                                        pipes.eft_min_combine_taint.as_ref().expect(
+                                            "#u4: C2 twin availability checked at walk entry",
+                                        ),
+                                        ecp,
+                                        &[
+                                            ev,
+                                            er,
+                                            dst_a,
+                                            &prop_scratch,
+                                            dst_e,
+                                            &row_abs_a,
+                                            &s_scratch,
+                                            &tb.ws,
+                                            &tb.wprop,
+                                        ],
+                                        col2im_wg,
+                                    );
+                                } else {
+                                    self.pass_simple(
+                                        &mut enc,
+                                        &pipes.eft_min_combine,
+                                        ecp,
+                                        &[
+                                            ev,
+                                            er,
+                                            dst_a,
+                                            &prop_scratch,
+                                            dst_e,
+                                            &row_abs_a,
+                                            &s_scratch,
+                                        ],
+                                        col2im_wg,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1915,22 +5808,57 @@ impl WgpuDevice {
                             ep,
                             &cep_buf,
                             &[&la[ping], &le[ping], &le[1 - ping]],
-                            num_specs as u32,
+                            num_specs_u32,
                         );
                         self.pass_simple(
                             &mut enc,
                             ep,
                             &cep_buf,
                             &[&ua[ping], &ue[ping], &ue[1 - ping]],
-                            num_specs as u32,
+                            num_specs_u32,
+                        );
+                    }
+                    if let Some(tb) = taint.as_ref() {
+                        // The combine has no row-L1 word input. Preserve a
+                        // saturation in that DAZ-cover reduction directly in
+                        // the per-spec receipt, after both sides wrote it.
+                        self.taint_row_or_dispatch(
+                            &mut enc,
+                            &tb.w_rowabs_lo,
+                            None,
+                            num_specs,
+                            1,
+                            &tb.rows_dev,
+                        );
+                        self.taint_row_or_dispatch(
+                            &mut enc,
+                            &tb.w_rowabs_hi,
+                            None,
+                            num_specs,
+                            1,
+                            &tb.rows_dev,
                         );
                     }
                     if coalesce {
                         fold_cmds.push(enc.finish());
                     } else {
-                        self.queue.submit(Some(enc.finish()));
+                        self.submit_ticked(enc.finish());
                     }
                     ping = 1 - ping;
+                    self.apply_intermediate_sweep_boundary(
+                        li + 1,
+                        out_d,
+                        num_specs,
+                        &la[ping],
+                        &ua[ping],
+                        &le[ping],
+                        &ue[ping],
+                        &blo,
+                        &buo,
+                        &ble,
+                        &bue,
+                        taint.as_mut(),
+                    )?;
                     continue;
                 }
 
@@ -1940,14 +5868,33 @@ impl WgpuDevice {
                     bias,
                     out_features,
                     in_features,
+                    cert_err,
                 } = layer
                 else {
                     unreachable!("validated above");
                 };
                 let (of, if_) = (*out_features, *in_features);
-                let g = gamma_k_f32(of);
-                let additive =
-                    ny_core::ftz_safe_underflow_floor(u32::try_from(of).unwrap_or(u32::MAX)); // FTZ-safe (#gpu-metal)
+                // #cert-err: `g` becomes `gamma + w_rel + gamma·w_rel` and the
+                // combine `slack` picks up the matching `(1 + w_rel)` factor;
+                // together they dominate `((gamma+w_rel)·|A| + (1+w_rel)·err) @ |W|`,
+                // the same composition the CPU margin-row lane uses. `cert_err`
+                // all-zero ⇒ `charged_gamma` returns `gamma`'s bits and the slack
+                // factor is exactly 1, so both uniforms are bit-identical to the
+                // pre-`cert_err` build.
+                let g_exact = gamma_k_f32(of)?;
+                let slack_exact = combine_slack_f32(of)?;
+                let g = cert_err.charged_gamma(g_exact);
+                let slack = cert_charged_slack(slack_exact, *cert_err, li)?;
+                let eft_slack = if eft_on { eft_r_slack_f32(of)? } else { 0.0 };
+                let reduction_u32 = u32::try_from(of).unwrap_or(u32::MAX);
+                let additive = if eft_on {
+                    super::super::sound_consts::rung3_flush_safe_additive_scaled(
+                        reduction_u32,
+                        eft_slack,
+                    )?
+                } else {
+                    super::super::sound_consts::rung3_flush_safe_additive(reduction_u32)?
+                }; // FTZ+rung3-fma-safe
 
                 let __t_wp = std::time::Instant::now();
                 // #lever1 weight residency: constant W and |W| are GPU-resident
@@ -1961,14 +5908,26 @@ impl WgpuDevice {
                 // (each output column j sums `of` weight rows). A scalar OUTWARD bound
                 // on every column's L1 (#gpu-metal-daz). Summing `weight[..].abs()` is
                 // bit-identical to summing the old CPU `absw` vector (|·| is exact).
+                // #daz-flush-cover-v2 (dark, default OFF ⇒ byte-identical): see
+                // `sound_consts::daz_flush_cover_w_l1` for the derivation of why
+                // `‖w_j‖₁` must be carried more than once on a DAZ adapter, and why
+                // a subnormal weight has to fail closed instead.
+                crate::wgpu_device::sound_consts::refuse_subnormal_weight_under_daz_cover(
+                    weight,
+                    "linear weight",
+                    daz_cover_armed,
+                )?;
                 let mut w_l1_max = 0.0f32;
                 for c in 0..if_ {
-                    let mut s = 0.0f32;
-                    for r in 0..of {
-                        s += weight[r * if_ + c].abs();
-                    }
-                    w_l1_max = w_l1_max.max(s);
+                    let s = (0..of)
+                        .map(|r| f32_to_f64_exact(weight[r * if_ + c]).abs())
+                        .sum();
+                    w_l1_max = w_l1_max.max(up_f32(s));
                 }
+                let w_l1_max = crate::wgpu_device::sound_consts::daz_flush_cover_w_l1(
+                    w_l1_max,
+                    daz_cover_armed,
+                )?;
                 __cpu_wprep += __t_wp.elapsed();
                 // #fold-coalesce: encoder BEFORE the uploads (arena copies must
                 // be encoder-ordered ahead of this layer's passes).
@@ -1982,7 +5941,7 @@ impl WgpuDevice {
                     &mut encoder,
                     &gp_buf,
                     bytemuck::bytes_of(&GemmParams {
-                        m: num_specs as u32,
+                        m: num_specs_u32,
                         k: of as u32,
                         n: if_ as u32,
                         _padding: 0,
@@ -1994,7 +5953,7 @@ impl WgpuDevice {
                     &mut encoder,
                     &gp1_buf,
                     bytemuck::bytes_of(&GemmParams {
-                        m: num_specs as u32,
+                        m: num_specs_u32,
                         k: of as u32,
                         n: 1,
                         _padding: 0,
@@ -2006,7 +5965,7 @@ impl WgpuDevice {
                     &cp_buf,
                     bytemuck::bytes_of(&CombineParams {
                         n: (num_specs * if_) as u32,
-                        slack: combine_slack_f32(of),
+                        slack,
                         gamma_k: g,
                         additive,
                         k: of as u32,
@@ -2022,8 +5981,8 @@ impl WgpuDevice {
                         eft_cp,
                         bytemuck::bytes_of(&EftCombineParams {
                             n: (num_specs * if_) as u32,
-                            r_slack: eft_r_slack_f32(of),
-                            slack: combine_slack_f32(of),
+                            r_slack: eft_slack,
+                            slack,
                             additive,
                             k: of as u32,
                             out_cols: if_ as u32,
@@ -2053,31 +6012,64 @@ impl WgpuDevice {
                         &mut encoder,
                         &bp_buf,
                         bytemuck::bytes_of(&BiasParams {
-                            num_specs: num_specs as u32,
+                            num_specs: num_specs_u32,
                             k: of as u32,
                             gamma_k: g,
                             additive,
-                            slack: combine_slack_f32(of),
+                            // #flush-charge: identity unless charged authority
+                            // is armed (oracle-derived bias factor widening).
+                            slack: charged_bias_slack_or(charged_policy.as_ref(), slack)?,
                             eft_mode: u32::from(eft_on),
-                            eft_r_slack: if eft_on { eft_r_slack_f32(of) } else { 0.0 },
+                            eft_r_slack: eft_slack,
                             _p: 0,
                         }),
                     )?;
                 }
 
-                let disp = select_gemm_dispatch(num_specs as u32, of as u32, if_ as u32);
+                let disp = select_gemm_dispatch(num_specs_u32, of as u32, if_ as u32);
                 let gemm_pipe = if disp.use_small_k {
                     &self.gemm_f32_small_k_pipeline
                 } else {
                     &self.gemm_f32_pipeline
                 };
                 // n=1 dispatch for the row-L1 reduction `|A|@ones → row_abs_a`.
-                let disp1 = select_gemm_dispatch(num_specs as u32, of as u32, 1);
+                let disp1 = select_gemm_dispatch(num_specs_u32, of as u32, 1);
                 let gemm_pipe1 = if disp1.use_small_k {
                     &self.gemm_f32_small_k_pipeline
                 } else {
                     &self.gemm_f32_pipeline
                 };
+                // #u4 gate ON: match the base scheduler exactly. Both tiled
+                // and large-M/small-K schedules have exact-value word twins,
+                // so no shape-specific refusal or reduction-order drift remains.
+                let taint_dims = taint.as_ref().map(|_| {
+                    (
+                        (disp.wg_x, disp.wg_y),
+                        (disp1.wg_x, disp1.wg_y),
+                    )
+                });
+                let taint_gemm_pipe = taint.as_ref().map(|_| {
+                    if disp.use_small_k {
+                        res_pipes.gemm_small_k_taint.as_ref().expect(
+                            "#u4: small-K twin availability checked at walk entry",
+                        )
+                    } else {
+                        res_pipes.gemm_taint.as_ref().expect(
+                            "#u4: tiled twin availability checked at walk entry",
+                        )
+                    }
+                });
+                let taint_row_gemm_pipe = taint.as_ref().map(|_| {
+                    if disp1.use_small_k {
+                        res_pipes.gemm_small_k_taint.as_ref().expect(
+                            "#u4: small-K twin availability checked at walk entry",
+                        )
+                    } else {
+                        res_pipes.gemm_taint.as_ref().expect(
+                            "#u4: tiled twin availability checked at walk entry",
+                        )
+                    }
+                });
                 let abs_wg = ((num_specs * of) as u32).div_ceil(256);
                 let mn = ((num_specs * if_) as u32).div_ceil(256);
 
@@ -2088,37 +6080,108 @@ impl WgpuDevice {
                         bias_pipe,
                         &bp_buf,
                         &[&la[ping], &le[ping], &bias_buf, &blo, &ble],
-                        num_specs as u32,
+                        num_specs_u32,
                     );
                     self.pass_simple(
                         &mut encoder,
                         bias_pipe,
                         &bp_buf,
                         &[&ua[ping], &ue[ping], &bias_buf, &buo, &bue],
-                        num_specs as u32,
+                        num_specs_u32,
                     );
                 }
+                // #cert-err bias charge: `d·(Σ|a_j| + Σ err_j)` via a second
+                // dispatch of the SAME kernel with the constant `[d; of]` operand
+                // and `gamma_k = 1`; its centre-bias output goes to the sink so
+                // only `ble`/`bue` (which the kernel accumulates into) change.
+                // Runs even when `bias` is None: the declared error says the
+                // EXACT fold has a bias this close to the supplied (absent, i.e.
+                // zero) one, and that discrepancy still folds into the bound.
+                self.cert_bias_charge_pass(
+                    &mut encoder,
+                    bias_pipe,
+                    CertBiasChargeArgs {
+                        cert_err: *cert_err,
+                        reduction: of,
+                        num_specs,
+                        layer_index: li,
+                        params: cert_bp_buf.as_ref(),
+                        operand: cert_bias_buf.as_ref(),
+                        sink: cert_bias_sink.as_ref(),
+                        a: [&la[ping], &ua[ping]],
+                        a_err: [&le[ping], &ue[ping]],
+                        bias_err_out: [&ble, &bue],
+                    },
+                )?;
+                if let (Some(tb), true) = (taint.as_ref(), cert_err.bias_abs_err != 0.0) {
+                    // #u4: the charge dispatch consumes the coefficient AND error
+                    // streams with no word twin. Transport their words to the row
+                    // accumulator UNCONDITIONALLY (no annihilation exception —
+                    // the constant operand `d` is nonzero by construction here).
+                    for wb in [&tb.wla[ping], &tb.wua[ping], &tb.wle[ping], &tb.wue[ping]] {
+                        self.taint_row_or_dispatch(&mut encoder, wb, None, num_specs, of, &tb.rows_dev);
+                    }
+                }
                 // A_new = A @ W.
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe,
-                    &gp_buf,
-                    &la[ping],
-                    &w_buf,
-                    &la[1 - ping],
-                    disp.wg_x,
-                    disp.wg_y,
-                );
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe,
-                    &gp_buf,
-                    &ua[ping],
-                    &w_buf,
-                    &ua[1 - ping],
-                    disp.wg_x,
-                    disp.wg_y,
-                );
+                // #u4 gate ON: the CROWN-path linear GEMM through the taint
+                // twin — value bits identical (drift-pinned), coefficient words
+                // rotated `[ping] → [1 - ping]`; the weight word is the all-zero
+                // `zw` (host weights are exact data, never tainted — G7).
+                if let (Some(tb), Some(((twx, twy), _)), Some(tg)) =
+                    (taint.as_ref(), taint_dims, taint_gemm_pipe)
+                {
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg,
+                        &gp_buf,
+                        &[
+                            &la[ping],
+                            &w_buf,
+                            &la[1 - ping],
+                            &tb.wla[ping],
+                            &tb.zw,
+                            &tb.wla[1 - ping],
+                        ],
+                        twx,
+                        twy,
+                    );
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg,
+                        &gp_buf,
+                        &[
+                            &ua[ping],
+                            &w_buf,
+                            &ua[1 - ping],
+                            &tb.wua[ping],
+                            &tb.zw,
+                            &tb.wua[1 - ping],
+                        ],
+                        twx,
+                        twy,
+                    );
+                } else {
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe,
+                        &gp_buf,
+                        &la[ping],
+                        &w_buf,
+                        &la[1 - ping],
+                        disp.wg_x,
+                        disp.wg_y,
+                    );
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe,
+                        &gp_buf,
+                        &ua[ping],
+                        &w_buf,
+                        &ua[1 - ping],
+                        disp.wg_x,
+                        disp.wg_y,
+                    );
+                }
                 // err_new = combine(γ_k·|A|@|W|, err@|W|). `row_abs_a = |A|@ones` (the
                 // §0 DAZ per-spec ‖a_i‖₁) is reduced from the SAME |A| the combine
                 // reads, in-order before its combine consumes it (#gpu-metal-daz).
@@ -2129,52 +6192,128 @@ impl WgpuDevice {
                     &[&la[ping], &abs_a],
                     abs_wg,
                 );
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe,
-                    &gp_buf,
-                    &abs_a,
-                    &abs_w_buf,
-                    &s_scratch,
-                    disp.wg_x,
-                    disp.wg_y,
-                );
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe,
-                    &gp_buf,
-                    &le[ping],
-                    &abs_w_buf,
-                    &prop_scratch,
-                    disp.wg_x,
-                    disp.wg_y,
-                );
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe1,
-                    &gp1_buf,
-                    &abs_a,
-                    &ones_buf,
-                    &row_abs_a,
-                    disp1.wg_x,
-                    disp1.wg_y,
-                );
-                self.pass_simple(
-                    &mut encoder,
-                    combine_pipe,
-                    &cp_buf,
-                    &[&s_scratch, &prop_scratch, &le[1 - ping], &row_abs_a],
-                    mn,
-                );
+                // #u4 gate ON (lower err chain): the row-L1 + S + prop GEMMs go
+                // through the taint twin (`word(|A|) == word(A)` — abs is
+                // magnitude-preserving, so the S/row-L1 twins bind wla[ping]
+                // directly) and the combine goes through its twin, ORing
+                // word(S)|word(P) plus its own degrade seeds into wle[1-ping].
+                if let (
+                    Some(tb),
+                    Some(((twx, twy), (twx1, twy1))),
+                    Some(tg),
+                    Some(tg1),
+                ) = (
+                    taint.as_ref(),
+                    taint_dims,
+                    taint_gemm_pipe,
+                    taint_row_gemm_pipe,
+                )
+                {
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg,
+                        &gp_buf,
+                        &[&abs_a, &abs_w_buf, &s_scratch, &tb.wla[ping], &tb.zw, &tb.ws],
+                        twx,
+                        twy,
+                    );
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg,
+                        &gp_buf,
+                        &[
+                            &le[ping],
+                            &abs_w_buf,
+                            &prop_scratch,
+                            &tb.wle[ping],
+                            &tb.zw,
+                            &tb.wprop,
+                        ],
+                        twx,
+                        twy,
+                    );
+                    // §0 row-L1 word: the combine twin has no `row_abs_a` word
+                    // binding, so `‖a_i‖₁`'s own saturation word rides to the
+                    // row accumulator directly (on-device row-OR at the end of
+                    // this layer's encoder).
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg1,
+                        &gp1_buf,
+                        &[
+                            &abs_a,
+                            &ones_buf,
+                            &row_abs_a,
+                            &tb.wla[ping],
+                            &tb.zw,
+                            &tb.w_rowabs_lo,
+                        ],
+                        twx1,
+                        twy1,
+                    );
+                    self.pass_simple(
+                        &mut encoder,
+                        res_pipes.combine_taint.as_ref().expect("#u4: availability checked at walk entry"),
+                        &cp_buf,
+                        &[
+                            &s_scratch,
+                            &prop_scratch,
+                            &le[1 - ping],
+                            &row_abs_a,
+                            &tb.ws,
+                            &tb.wprop,
+                            &tb.wle[1 - ping],
+                        ],
+                        mn,
+                    );
+                } else {
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe,
+                        &gp_buf,
+                        &abs_a,
+                        &abs_w_buf,
+                        &s_scratch,
+                        disp.wg_x,
+                        disp.wg_y,
+                    );
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe,
+                        &gp_buf,
+                        &le[ping],
+                        &abs_w_buf,
+                        &prop_scratch,
+                        disp.wg_x,
+                        disp.wg_y,
+                    );
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe1,
+                        &gp1_buf,
+                        &abs_a,
+                        &ones_buf,
+                        &row_abs_a,
+                        disp1.wg_x,
+                        disp1.wg_y,
+                    );
+                    self.pass_simple(
+                        &mut encoder,
+                        combine_pipe,
+                        &cp_buf,
+                        &[&s_scratch, &prop_scratch, &le[1 - ping], &row_abs_a],
+                        mn,
+                    );
+                }
                 // #eft-err (LOWER side): recompute A@W with the deterministic
                 // barrier-fma twin (value + exact residual sum), then tighten the
                 // just-written Higham error via min. Sequenced BEFORE the upper
                 // side reuses prop_scratch/row_abs_a. Gate off ⇒ no dispatches.
                 // Tiled-twin grid (16×16); y over rows. Fail-closed past the
-                // 65535 dispatch limit: skip the tightening, keep Higham.
+                // device dispatch limit: skip the tightening, keep Higham.
                 let eft_wg_x = (if_ as u32).div_ceil(16);
-                let eft_wg_y = (num_specs as u32).div_ceil(16);
-                let eft_fits = eft_wg_x <= 65535 && eft_wg_y <= 65535;
+                let eft_wg_y = num_specs_u32.div_ceil(16);
+                let eft_fits = eft_wg_x as usize <= max_wg && eft_wg_y as usize <= max_wg;
                 if let (true, Some(ev), Some(er), Some(ecp)) = (
                     eft_fits,
                     eft_v_buf.as_ref(),
@@ -2190,20 +6329,45 @@ impl WgpuDevice {
                         eft_wg_x,
                         eft_wg_y,
                     );
-                    self.pass_simple(
-                        &mut encoder,
-                        &pipes.eft_min_combine,
-                        ecp,
-                        &[
-                            ev,
-                            er,
-                            &la[1 - ping],
-                            &prop_scratch,
-                            &le[1 - ping],
-                            &row_abs_a,
-                        ],
-                        mn,
-                    );
+                    // #u4 gate ON: the min-combine CONSULT twin (audit C2) —
+                    // words in (S/P words of this side's GEMM twins); a set
+                    // word refuses the tightening IN-SHADER, keeping the
+                    // Higham charge (strictly widening, never tighter).
+                    if let Some(tb) = taint.as_ref() {
+                        self.pass_simple(
+                            &mut encoder,
+                            res_pipes.eft_min_combine_taint.as_ref().expect("#u4: availability checked at walk entry"),
+                            ecp,
+                            &[
+                                ev,
+                                er,
+                                &la[1 - ping],
+                                &prop_scratch,
+                                &le[1 - ping],
+                                &row_abs_a,
+                                &s_scratch,
+                                &tb.ws,
+                                &tb.wprop,
+                            ],
+                            mn,
+                        );
+                    } else {
+                        self.pass_simple(
+                            &mut encoder,
+                            &pipes.eft_min_combine,
+                            ecp,
+                            &[
+                                ev,
+                                er,
+                                &la[1 - ping],
+                                &prop_scratch,
+                                &le[1 - ping],
+                                &row_abs_a,
+                                &s_scratch,
+                            ],
+                            mn,
+                        );
+                    }
                 }
                 self.pass_simple(
                     &mut encoder,
@@ -2212,43 +6376,112 @@ impl WgpuDevice {
                     &[&ua[ping], &abs_a],
                     abs_wg,
                 );
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe,
-                    &gp_buf,
-                    &abs_a,
-                    &abs_w_buf,
-                    &s_scratch,
-                    disp.wg_x,
-                    disp.wg_y,
-                );
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe,
-                    &gp_buf,
-                    &ue[ping],
-                    &abs_w_buf,
-                    &prop_scratch,
-                    disp.wg_x,
-                    disp.wg_y,
-                );
-                self.pass_gemm(
-                    &mut encoder,
-                    gemm_pipe1,
-                    &gp1_buf,
-                    &abs_a,
-                    &ones_buf,
-                    &row_abs_a,
-                    disp1.wg_x,
-                    disp1.wg_y,
-                );
-                self.pass_simple(
-                    &mut encoder,
-                    combine_pipe,
-                    &cp_buf,
-                    &[&s_scratch, &prop_scratch, &ue[1 - ping], &row_abs_a],
-                    mn,
-                );
+                // #u4 gate ON (upper err chain): mirror of the lower chain with
+                // wua/wue and the upper row-L1 word buffer.
+                if let (
+                    Some(tb),
+                    Some(((twx, twy), (twx1, twy1))),
+                    Some(tg),
+                    Some(tg1),
+                ) = (
+                    taint.as_ref(),
+                    taint_dims,
+                    taint_gemm_pipe,
+                    taint_row_gemm_pipe,
+                )
+                {
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg,
+                        &gp_buf,
+                        &[&abs_a, &abs_w_buf, &s_scratch, &tb.wua[ping], &tb.zw, &tb.ws],
+                        twx,
+                        twy,
+                    );
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg,
+                        &gp_buf,
+                        &[
+                            &ue[ping],
+                            &abs_w_buf,
+                            &prop_scratch,
+                            &tb.wue[ping],
+                            &tb.zw,
+                            &tb.wprop,
+                        ],
+                        twx,
+                        twy,
+                    );
+                    self.pass_simple_2d(
+                        &mut encoder,
+                        tg1,
+                        &gp1_buf,
+                        &[
+                            &abs_a,
+                            &ones_buf,
+                            &row_abs_a,
+                            &tb.wua[ping],
+                            &tb.zw,
+                            &tb.w_rowabs_hi,
+                        ],
+                        twx1,
+                        twy1,
+                    );
+                    self.pass_simple(
+                        &mut encoder,
+                        res_pipes.combine_taint.as_ref().expect("#u4: availability checked at walk entry"),
+                        &cp_buf,
+                        &[
+                            &s_scratch,
+                            &prop_scratch,
+                            &ue[1 - ping],
+                            &row_abs_a,
+                            &tb.ws,
+                            &tb.wprop,
+                            &tb.wue[1 - ping],
+                        ],
+                        mn,
+                    );
+                } else {
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe,
+                        &gp_buf,
+                        &abs_a,
+                        &abs_w_buf,
+                        &s_scratch,
+                        disp.wg_x,
+                        disp.wg_y,
+                    );
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe,
+                        &gp_buf,
+                        &ue[ping],
+                        &abs_w_buf,
+                        &prop_scratch,
+                        disp.wg_x,
+                        disp.wg_y,
+                    );
+                    self.pass_gemm(
+                        &mut encoder,
+                        gemm_pipe1,
+                        &gp1_buf,
+                        &abs_a,
+                        &ones_buf,
+                        &row_abs_a,
+                        disp1.wg_x,
+                        disp1.wg_y,
+                    );
+                    self.pass_simple(
+                        &mut encoder,
+                        combine_pipe,
+                        &cp_buf,
+                        &[&s_scratch, &prop_scratch, &ue[1 - ping], &row_abs_a],
+                        mn,
+                    );
+                }
                 // #eft-err (UPPER side): same twin + min tightening on ue.
                 if let (true, Some(ev), Some(er), Some(ecp)) = (
                     eft_fits,
@@ -2265,28 +6498,116 @@ impl WgpuDevice {
                         eft_wg_x,
                         eft_wg_y,
                     );
-                    self.pass_simple(
-                        &mut encoder,
-                        &pipes.eft_min_combine,
-                        ecp,
-                        &[
-                            ev,
-                            er,
-                            &ua[1 - ping],
-                            &prop_scratch,
-                            &ue[1 - ping],
-                            &row_abs_a,
-                        ],
-                        mn,
-                    );
+                    // #u4 gate ON: upper-side C2 consult (see the lower block).
+                    if let Some(tb) = taint.as_ref() {
+                        self.pass_simple(
+                            &mut encoder,
+                            res_pipes.eft_min_combine_taint.as_ref().expect("#u4: availability checked at walk entry"),
+                            ecp,
+                            &[
+                                ev,
+                                er,
+                                &ua[1 - ping],
+                                &prop_scratch,
+                                &ue[1 - ping],
+                                &row_abs_a,
+                                &s_scratch,
+                                &tb.ws,
+                                &tb.wprop,
+                            ],
+                            mn,
+                        );
+                    } else {
+                        self.pass_simple(
+                            &mut encoder,
+                            &pipes.eft_min_combine,
+                            ecp,
+                            &[
+                                ev,
+                                er,
+                                &ua[1 - ping],
+                                &prop_scratch,
+                                &ue[1 - ping],
+                                &row_abs_a,
+                                &s_scratch,
+                            ],
+                            mn,
+                        );
+                    }
                 }
 
+                if let Some(tb) = taint.as_ref() {
+                    // #u4 fail-closed transport, ON-DEVICE — the Linear bias
+                    // fold (CROWN_BIAS_ERR_ACCUMULATE_SHADER) has NO taint
+                    // twin: it consumes the PRE-GEMM coefficient AND error per
+                    // spec row, so their words row-OR into `rows_dev` under
+                    // the committed `bias[k] != 0` annihilation conjunct
+                    // (audit §4 C1, bias_fold_f64 analogue) — expressed as a
+                    // per-COLUMN partner read of `bias_buf` (uploaded above
+                    // for the value fold; only its first `of` entries are
+                    // indexed). The CPU reference is `bias_fold_taint`
+                    // (crown_backward_sound_host.rs, now test-reference only).
+                    // `[ping]` words are stable within this encoder (this
+                    // layer's twins write only `[1 - ping]` and the
+                    // scratches).
+                    if bias.is_some() {
+                        for wb in [&tb.wla[ping], &tb.wua[ping], &tb.wle[ping], &tb.wue[ping]] {
+                            self.taint_row_or_dispatch(
+                                &mut encoder,
+                                wb,
+                                Some((&bias_buf, false)),
+                                num_specs,
+                                of,
+                                &tb.rows_dev,
+                            );
+                        }
+                    }
+                    // #u4 fail-closed transport, ON-DEVICE — the combine twin
+                    // carries no `row_abs_a` word binding, so the §0 row-L1
+                    // reduction's own saturation word (an under-covering flush
+                    // term) ORs straight into its spec row — encoded AFTER
+                    // both sides' twin GEMMs wrote `w_rowabs_lo`/`w_rowabs_hi`
+                    // above. NOTE (tightness, not soundness): this per-LAYER
+                    // row-OR condemns the spec row even when a later dead-ReLU
+                    // would have annihilated the per-element word —
+                    // refusal-only conservatism, fine while dark.
+                    self.taint_row_or_dispatch(
+                        &mut encoder,
+                        &tb.w_rowabs_lo,
+                        None,
+                        num_specs,
+                        1,
+                        &tb.rows_dev,
+                    );
+                    self.taint_row_or_dispatch(
+                        &mut encoder,
+                        &tb.w_rowabs_hi,
+                        None,
+                        num_specs,
+                        1,
+                        &tb.rows_dev,
+                    );
+                }
                 if coalesce {
                     fold_cmds.push(encoder.finish());
                 } else {
-                    self.queue.submit(Some(encoder.finish()));
+                    self.submit_ticked(encoder.finish());
                 }
                 ping = 1 - ping;
+                self.apply_intermediate_sweep_boundary(
+                    li + 1,
+                    if_,
+                    num_specs,
+                    &la[ping],
+                    &ua[ping],
+                    &le[ping],
+                    &ue[ping],
+                    &blo,
+                    &buo,
+                    &ble,
+                    &bue,
+                    taint.as_mut(),
+                )?;
             }
 
             // #fold-coalesce: ONE submission for the whole chain. The arena must
@@ -2298,6 +6619,87 @@ impl WgpuDevice {
             }
 
             let __t_loop = __t_loop_start.elapsed();
+
+            // Authoritative intermediate-sweep keep-out. Copy the active
+            // value/error frontier, all four word twins, and the sticky row
+            // accumulator into one exact-sized, independently owned carrier.
+            // No word is folded to host and no coefficient crosses PCIe.
+            if sweep_keep {
+                if !grad_bufs.is_empty() || !gather_bufs.is_empty() {
+                    return Err(NyError::UnsupportedOp(
+                        "worded sweep keep mode with capture channels armed".into(),
+                    ));
+                }
+                let tb = taint.as_ref().ok_or_else(|| {
+                    NyError::UnsupportedOp(
+                        "worded sweep keep mode lost the taint-word route".into(),
+                    )
+                })?;
+                let limits = self.device.limits();
+                let layout = SweepCarrierLayout::new(num_specs, final_dim)?
+                    .validate_device_limits(
+                        limits.max_buffer_size,
+                        limits.max_storage_buffer_binding_size,
+                    )?;
+                let out = DeviceSweepCarrier::allocate_zero_initialized(
+                    &self.device,
+                    layout,
+                    "res_sweep_out",
+                )?;
+                let mut encoder = self.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("res_sweep_keep"),
+                    },
+                );
+                for (source, destination) in [
+                    (&la[ping], &out.matrix.lower_center),
+                    (&ua[ping], &out.matrix.upper_center),
+                    (&le[ping], &out.matrix.lower_radius),
+                    (&ue[ping], &out.matrix.upper_radius),
+                    (&tb.wla[ping], &out.matrix.lower_center_word),
+                    (&tb.wua[ping], &out.matrix.upper_center_word),
+                    (&tb.wle[ping], &out.matrix.lower_radius_word),
+                    (&tb.wue[ping], &out.matrix.upper_radius_word),
+                ] {
+                    encoder.copy_buffer_to_buffer(
+                        source,
+                        0,
+                        destination,
+                        0,
+                        layout.matrix_bytes,
+                    );
+                }
+                for (source, destination) in [
+                    (&blo, &out.row.lower_bias),
+                    (&buo, &out.row.upper_bias),
+                    (&ble, &out.row.lower_bias_radius),
+                    (&bue, &out.row.upper_bias_radius),
+                    (&tb.rows_dev, &out.row.taint_rows),
+                ] {
+                    encoder.copy_buffer_to_buffer(
+                        source,
+                        0,
+                        destination,
+                        0,
+                        layout.row_bytes,
+                    );
+                }
+                self.submit_ticked(encoder.finish());
+                RESIDENT_IO.with(|io| io.borrow_mut().sweep_out = Some(out));
+                return Ok((
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                ));
+            }
 
             // #seg-resident keep-out: deposit handle-clones of the final stream
             // and SKIP the readback entirely — the caller (the resnet segment
@@ -2325,6 +6727,7 @@ impl WgpuDevice {
                 RESIDENT_IO.with(|io| io.borrow_mut().out = Some(out));
                 // Match the checked-closure's tuple shape with EMPTY host data;
                 // the outer ResidentCoeff construction flows through unchanged.
+                // (#u4: taint_on + keep-mode was refused at fn entry ⇒ None.)
                 return Ok((
                     Vec::new(),
                     Vec::new(),
@@ -2336,6 +6739,7 @@ impl WgpuDevice {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    None,
                 ));
             }
 
@@ -2374,7 +6778,42 @@ impl WgpuDevice {
             enc.copy_buffer_to_buffer(&buo, 0, &st_buo, 0, bbytes);
             enc.copy_buffer_to_buffer(&ble, 0, &st_ble, 0, bbytes);
             enc.copy_buffer_to_buffer(&bue, 0, &st_bue, 0, bbytes);
+            // #u4 final word fold, ON-DEVICE (audit §4 C1 "plumbed from"):
+            // row-OR the FINAL coefficient/error word buffers into `rows_dev`
+            // (unconditional — the frontier ships as-is, nothing multiplies
+            // it here), then stage the per-spec-row accumulator for the
+            // walk's ONE word readback below — the only word transport that
+            // ever touches the host.
+            let taint_rows_stage = if let Some(tb) = taint.as_ref() {
+                for wb in [&tb.wla[ping], &tb.wua[ping], &tb.wle[ping], &tb.wue[ping]] {
+                    self.taint_row_or_dispatch(
+                        &mut enc,
+                        wb,
+                        None,
+                        num_specs,
+                        final_dim,
+                        &tb.rows_dev,
+                    );
+                }
+                let st = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("st_taint_rows"),
+                    size: (num_specs.max(1) * size_of::<u32>()) as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                enc.copy_buffer_to_buffer(
+                    &tb.rows_dev,
+                    0,
+                    &st,
+                    0,
+                    (num_specs * size_of::<u32>()) as u64,
+                );
+                Some(st)
+            } else {
+                None
+            };
             self.queue.submit(Some(enc.finish()));
+            super::intermediate_sweep::note_submits(1);
 
             // Download per-ReLU alpha gradients (small; empty unless capturing).
             let mut relu_grads: Vec<Vec<f32>> = Vec::with_capacity(grad_bufs.len());
@@ -2441,6 +6880,26 @@ impl WgpuDevice {
             let fle_v = dl.pop().expect("8 readbacks");
             let fua_v = dl.pop().expect("8 readbacks");
             let fla_v = dl.pop().expect("8 readbacks");
+            // #u4: the walk's single word readback. `rows_dev` (staged into
+            // the `res_dl` submit above, AFTER the on-device final fold)
+            // already holds EVERY admitted transport — the intercept/bias
+            // conjunct folds, the row-L1 words and the final
+            // coefficient/error fold. OR it into the host accumulator
+            // that carried the walk-boundary G13 seed-BIAS rows, then hand
+            // the rows out for `concretize_resident_coeff_batched` to pass to
+            // the consult.
+            let taint_rows_out = if let Some(mut tb) = taint.take() {
+                let rows_stage = taint_rows_stage
+                    .as_ref()
+                    .expect("#u4: gate on staged the row words in the res_dl submit");
+                let dev_rows = Self::read_u32_buffer(&self.device, rows_stage, num_specs)?;
+                for (slot, w) in tb.rows.iter_mut().zip(dev_rows) {
+                    *slot |= w;
+                }
+                Some(tb.rows)
+            } else {
+                None
+            };
             Ok((
                 fla_v,
                 fua_v,
@@ -2452,6 +6911,7 @@ impl WgpuDevice {
                 fbue_v,
                 relu_grads,
                 beta_gather_v,
+                taint_rows_out,
             ))
         })?;
 
@@ -2467,6 +6927,9 @@ impl WgpuDevice {
             dim: final_dim,
             relu_grads: f_relu_grads,
             beta_gather: f_beta_gather,
+            // #u4: Some(per-spec-row words) iff the AUTO/explicit worded route
+            // ran the twin chain above; None ⇒ byte-identical opt-out walk.
+            taint_rows: f_taint_rows,
         })
     }
 
@@ -2500,18 +6963,42 @@ impl WgpuDevice {
             // Identity skip requires F: block_dim → block_dim.
             return Err(NyError::shape_mismatch(vec![block_dim], vec![cf.dim]));
         }
-        const U: f64 = f64::from_bits(0x3E70_0000_0000_0000); // 2^-24
-        let n = num_specs * block_dim;
+        let n = resident_checked_product(&[num_specs, block_dim], "residual coefficient elements")?;
+        if lower_a.len() != n || upper_a.len() != n {
+            return Err(NyError::shape_mismatch(
+                vec![num_specs, block_dim],
+                vec![lower_a.len()],
+            ));
+        }
         for i in 0..n {
-            let sum_l = f64::from(cf.lower_a[i]) + f64::from(lower_a[i]);
+            let sum_l = f32_to_f64_exact(cf.lower_a[i]) + f32_to_f64_exact(lower_a[i]);
             let fl_l = sum_l as f32;
-            cf.lower_err[i] = up_f32(f64::from(cf.lower_err[i]) + f64::from(fl_l).abs() * U);
+            let lower_gap = (f32_to_f64_exact(fl_l) - sum_l).abs();
+            cf.lower_err[i] = up_f32(add_nonnegative_f64_up(
+                f32_to_f64_exact(cf.lower_err[i]),
+                lower_gap,
+            ));
             cf.lower_a[i] = fl_l;
-            let sum_u = f64::from(cf.upper_a[i]) + f64::from(upper_a[i]);
+            let sum_u = f32_to_f64_exact(cf.upper_a[i]) + f32_to_f64_exact(upper_a[i]);
             let fl_u = sum_u as f32;
-            cf.upper_err[i] = up_f32(f64::from(cf.upper_err[i]) + f64::from(fl_u).abs() * U);
+            let upper_gap = (f32_to_f64_exact(fl_u) - sum_u).abs();
+            cf.upper_err[i] = up_f32(add_nonnegative_f64_up(
+                f32_to_f64_exact(cf.upper_err[i]),
+                upper_gap,
+            ));
             cf.upper_a[i] = fl_u;
         }
+        // #u4 WIRED: the branch walk's `taint_rows` already cover BOTH streams
+        // of the host merge above. The identity-skip stream is the very seed
+        // (`lower_a`/`upper_a`) the branch walk G13-worded at its entry, and
+        // the walk ORs those words (plus every transport) into its per-spec
+        // rows at exit — so a sentinel-magnitude skip coefficient is already
+        // in `cf.taint_rows`, double-covered exactly like the segment-loop
+        // seam (G13 per-coefficient + row OR; both only ADD words ⇒ sound, not
+        // a launder). The f32-add rounding gaps folded into `*_err` are
+        // computed non-negative magnitudes, not sentinels — nothing to word;
+        // a host add that overflows to ±inf is caught by the concretize
+        // preflight's bit tests (G5), independent of the word channel.
         self.concretize_resident_coeff(&cf, num_specs, input_lower, input_upper)
     }
 
@@ -2582,6 +7069,10 @@ impl WgpuDevice {
             dim: seed.dim,
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
+            // #u4: the fine-split walk starts from the seed's row words — the
+            // per-ReLU sub-chains below re-seed from VALUES only, so laundered
+            // history must ride the rows (see the seam OR in the loop).
+            taint_rows: seed.taint_rows.clone(),
         };
         let mut all_grads: Vec<Vec<f32>> = Vec::new();
         let mut all_gathers: Vec<Vec<f32>> = Vec::new();
@@ -2628,6 +7119,11 @@ impl WgpuDevice {
             )?;
             all_grads.append(&mut cf.relu_grads);
             all_gathers.append(&mut cf.beta_gather);
+            // #u4 SEAM OR (identical rule to the segment loop): the sub-chain
+            // walk G13-covered `coeff`'s VALUES; its laundered row history
+            // survives only via this OR. Either side `None` ⇒ `None` (whole-
+            // result poisoning, never partial). Gate OFF: `None|None = None`.
+            cf.taint_rows = merge_taint_rows(cf.taint_rows.take(), coeff.taint_rows.as_deref());
             coeff = cf;
             // Concretize the error against THIS ReLU's pre-node abs-max bound. The
             // sub-chain ending in a ReLU has its frontier = that ReLU's pre-node; the
@@ -2642,6 +7138,11 @@ impl WgpuDevice {
                     // #batched-bab HOLE 4: `fab` is the per-domain-STACKED node abs-max
                     // (`n_domains*coeff.dim`, single domain → coeff.dim); each row folds
                     // against ITS OWN domain block (`dom = s/num_specs_per_dom`).
+                    // #u4 ROW-INVARIANT: err→bias-err movement within the same
+                    // spec row; the err's taint already sits in the row word
+                    // (walk-exit `le`/`ue` OR + G13 seed-err wording), so no
+                    // per-coefficient companion call is needed at row
+                    // granularity — see the segment-loop analogue.
                     Self::concretize_error_into_bias(&mut coeff, num_specs, num_specs_per_dom, fab);
                 }
             }
@@ -2684,6 +7185,9 @@ impl WgpuDevice {
                 dim: seed.dim,
                 relu_grads: Vec::new(),
                 beta_gather: Vec::new(),
+                // #u4: an empty part is an exact passthrough (no ops run), so
+                // the seed's row words pass through verbatim.
+                taint_rows: seed.taint_rows.clone(),
             });
         }
         if concretize_fine {
@@ -2698,7 +7202,7 @@ impl WgpuDevice {
                 node_slice,
             )
         } else {
-            self.crown_backward_sound_resident_coeff_seeded_err_gather(
+            let mut cf = self.crown_backward_sound_resident_coeff_seeded_err_gather(
                 part,
                 &seed.lower_a,
                 &seed.upper_a,
@@ -2714,13 +7218,24 @@ impl WgpuDevice {
                 pre_slice,
                 beta_slice,
                 gather_slice,
-            )
+            )?;
+            // #u4 SEAM OR (identical rule to the segment loop): the walk
+            // G13-covered the seed's VALUES (and the cut-fold host adds
+            // between parts are exact finite validated data — never a taint
+            // source; any saturation they produce is re-G13'd right here by
+            // the following part's entry seeding); the seed's laundered row
+            // history survives only via this OR. Either side `None` ⇒ `None`.
+            cf.taint_rows = merge_taint_rows(cf.taint_rows.take(), seed.taint_rows.as_deref());
+            Ok(cf)
         }
     }
 
-    /// Certified Cut-CROWN C2 (resident lane, dark `NY_CUT_FOLD_RESIDENT` gate):
-    /// run one branch with the registered cut fold applied at its
-    /// `local_act_idx`-th `Activation` (in-branch backward order).
+    /// Retired Cut-CROWN C2 raw fold kernel.
+    ///
+    /// The proof-bearing caller can no longer reach this function because
+    /// `active_resident_cut_fold()` is hard-quarantined before environment or
+    /// registry state is read. It remains here for non-authoritative arithmetic
+    /// tests and for a future provenance-bound replacement.
     ///
     /// The branch is split at that Activation on the HOST — the resident
     /// backward already round-trips the coefficient frontier between segments
@@ -2975,6 +7490,180 @@ impl WgpuDevice {
         Ok(c2)
     }
 
+    /// Carrier-driven resident Cut-CROWN branch split (the observation-only
+    /// SHADOW; `ops/cut_shadow_resident.rs` is the driver and audit home).
+    ///
+    /// Mirrors [`Self::backward_branch_cut_fold`]'s geometry — part1 → POST
+    /// channels → [target Activation] → PRE channels + per-row bias → rest,
+    /// matching the CUDA resident cut fold's application order — but consumes a
+    /// call-local per-row [`super::cut_shadow_resident::CutApplySnapshot`]
+    /// (built from one validated `ResidentLowerCutCarrier`) instead of the
+    /// hard-quarantined registry entry, applies every channel on the charged
+    /// device through the audited cut-apply kernel (source error + resident
+    /// mutation rounding + flush cover charged into the LOWER error lanes), and
+    /// REFUSES (typed) on any structural mismatch instead of degrading to the
+    /// untouched branch: a silently unapplied cut would let the shadow driver
+    /// mislabel `shadow == baseline` as a measured Δ=0.
+    ///
+    /// #u4 taint note (same argument as the legacy cut-fold seam): the apply
+    /// kernel writes finite validated values that the next part's G13 entry
+    /// seeding re-words; error-lane widening is refusal-only mass and cannot
+    /// launder a row word.
+    #[allow(clippy::too_many_arguments)]
+    fn backward_branch_carrier_cut(
+        &self,
+        branch: &[GpuCrownLayer],
+        seed: &ResidentCoeff,
+        num_specs: usize,
+        num_specs_per_dom: usize,
+        pre_slice: &[&[f32]],
+        beta_slice: &[&[f32]],
+        gather_slice: &[&[u32]],
+        node_slice: &[&[f32]],
+        concretize_fine: bool,
+        local_act_idx: usize,
+        snapshot: &super::cut_shadow_resident::CutApplySnapshot,
+    ) -> Result<ResidentCoeff> {
+        use super::cut_shadow_resident::CutChannelKind;
+        // The shadow driver is a serial single-domain entry; a wide fold would
+        // apply one row's channel to another domain's block.
+        if num_specs_per_dom != num_specs || snapshot.rows().len() != num_specs {
+            return Err(NyError::SoundnessRefusal(
+                "wgpu resident cut shadow: carrier rows do not match the serial fold".into(),
+            ));
+        }
+        let pos = branch
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l, GpuCrownLayer::Activation { .. }))
+            .nth(local_act_idx)
+            .map(|(i, _)| i)
+            .ok_or_else(|| {
+                NyError::SoundnessRefusal(
+                    "wgpu resident cut shadow: target activation index is outside its branch"
+                        .into(),
+                )
+            })?;
+        let target_num_neurons = match &branch[pos] {
+            GpuCrownLayer::Activation { num_neurons, .. } => *num_neurons,
+            _ => unreachable!("resident cut-shadow target was selected as an Activation"),
+        };
+        if target_num_neurons != snapshot.target_width() {
+            return Err(NyError::SoundnessRefusal(
+                "wgpu resident cut shadow: target width does not match the resident activation"
+                    .into(),
+            ));
+        }
+        let (part1, part2) = branch.split_at(pos);
+        fn split_chan<'x, T: ?Sized>(s: &[&'x T], k: usize) -> (Vec<&'x T>, Vec<&'x T>) {
+            if s.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let k = k.min(s.len());
+                (s[..k].to_vec(), s[k..].to_vec())
+            }
+        }
+        let (pre1, pre2) = split_chan(pre_slice, local_act_idx);
+        let (beta1, beta2) = split_chan(beta_slice, local_act_idx);
+        let (gat1, gat2) = split_chan(gather_slice, local_act_idx);
+        let (node1, node2) = split_chan(node_slice, local_act_idx);
+
+        let mut c1 = self.backward_branch_part(
+            part1,
+            seed,
+            num_specs,
+            num_specs_per_dom,
+            &pre1,
+            &beta1,
+            &gat1,
+            &node1,
+            concretize_fine,
+        )?;
+        if c1.dim != target_num_neurons {
+            return Err(NyError::SoundnessRefusal(
+                "wgpu resident cut shadow: realized frontier does not reach the target width"
+                    .into(),
+            ));
+        }
+        if self.crown_backward_deadline_expired() {
+            return Err(NyError::DeadlineExceeded(
+                "wgpu resident cut shadow: deadline expired before the post-channel apply".into(),
+            ));
+        }
+        // POST channels participate in sign selection, intercept, and slope
+        // composition, so they must land BEFORE the target relaxation.
+        self.resident_cut_apply_lower_pair_columns(
+            &mut c1.lower_a,
+            &mut c1.lower_err,
+            target_num_neurons,
+            num_specs,
+            snapshot,
+            CutChannelKind::Post,
+        )?;
+
+        // `part2[0]` is the target Activation (`pos` located it); run it alone
+        // so the PRE channels and the per-row bias land on the ReLU-INPUT
+        // frontier, bypassing the relaxation — exactly the CUDA fold order.
+        let (act_part, rest_part) = part2.split_at(1);
+        let (apre, rpre) = split_chan(&pre2, 1);
+        let (abeta, rbeta) = split_chan(&beta2, 1);
+        let (agat, rgat) = split_chan(&gat2, 1);
+        let (anode, rnode) = split_chan(&node2, 1);
+        let mut c1p = self.backward_branch_part(
+            act_part,
+            &c1,
+            num_specs,
+            num_specs_per_dom,
+            &apre,
+            &abeta,
+            &agat,
+            &anode,
+            concretize_fine,
+        )?;
+        if c1p.dim != target_num_neurons {
+            return Err(NyError::SoundnessRefusal(
+                "wgpu resident cut shadow: target relaxation changed the frontier width".into(),
+            ));
+        }
+        if self.crown_backward_deadline_expired() {
+            return Err(NyError::DeadlineExceeded(
+                "wgpu resident cut shadow: deadline expired before the pre-channel apply".into(),
+            ));
+        }
+        self.resident_cut_apply_lower_pair_columns(
+            &mut c1p.lower_a,
+            &mut c1p.lower_err,
+            target_num_neurons,
+            num_specs,
+            snapshot,
+            CutChannelKind::Pre,
+        )?;
+        // The bias belongs to the same Lagrangian row and is charged once here.
+        self.resident_cut_apply_lower_bias(&mut c1p.lower_b, &mut c1p.lower_b_err, snapshot)?;
+
+        let mut cr = self.backward_branch_part(
+            rest_part,
+            &c1p,
+            num_specs,
+            num_specs_per_dom,
+            &rpre,
+            &rbeta,
+            &rgat,
+            &rnode,
+            concretize_fine,
+        )?;
+        // Stitch capture channels back into branch order: part1, act, rest.
+        let mut grads = std::mem::take(&mut c1.relu_grads);
+        grads.append(&mut c1p.relu_grads);
+        grads.append(&mut cr.relu_grads);
+        cr.relu_grads = grads;
+        let mut gathers = std::mem::take(&mut c1.beta_gather);
+        gathers.append(&mut c1p.beta_gather);
+        gathers.append(&mut cr.beta_gather);
+        cr.beta_gather = gathers;
+        Ok(cr)
+    }
+
     /// Fold the accumulated per-coefficient error `(lower_err,upper_err)` into the
     /// scalar bias error `(lower_b_err,upper_b_err)` against the node abs-max bound
     /// `fab` (`fab[j] = max(|z_l[j]|,|z_u[j]|) ≥ |z[j]|`), then RESET the coefficient
@@ -2995,27 +7684,295 @@ impl WgpuDevice {
         num_specs_per_dom: usize,
         fab: &[f32],
     ) {
-        const U: f64 = f64::from_bits(0x3E70_0000_0000_0000); // 2^-24
         let d = coeff.dim;
-        let n_domains = num_specs.checked_div(num_specs_per_dom).unwrap_or(1);
-        if fab.len() != d * n_domains {
+        let Some(n_domains) = num_specs
+            .checked_div(num_specs_per_dom)
+            .filter(|_| num_specs.is_multiple_of(num_specs_per_dom))
+        else {
+            return;
+        };
+        let Some(expected_fab) = d.checked_mul(n_domains) else {
+            return;
+        };
+        let Some(coeff_elems) = num_specs.checked_mul(d) else {
+            return;
+        };
+        if fab.len() != expected_fab
+            || coeff.lower_err.len() != coeff_elems
+            || coeff.upper_err.len() != coeff_elems
+            || coeff.lower_b_err.len() != num_specs
+            || coeff.upper_b_err.len() != num_specs
+            || fab.iter().any(|value| {
+                let bits = value.to_bits();
+                bits & 0x7f80_0000 == 0x7f80_0000
+                    || (bits & 0x8000_0000 != 0 && bits & 0x7fff_ffff != 0)
+            })
+        {
             return;
         }
         for s in 0..num_specs {
-            let dom = s.checked_div(num_specs_per_dom).unwrap_or(0);
+            let dom = s / num_specs_per_dom;
             let fbase = dom * d;
+            let row = s * d;
             let mut le = 0.0f64;
             let mut ue = 0.0f64;
             for j in 0..d {
-                let b = f64::from(fab[fbase + j]);
-                le += f64::from(coeff.lower_err[s * d + j]) * b;
-                ue += f64::from(coeff.upper_err[s * d + j]) * b;
-                coeff.lower_err[s * d + j] = 0.0;
-                coeff.upper_err[s * d + j] = 0.0;
+                let b = f32_to_f64_exact(fab[fbase + j]);
+                let lower_term = f32_to_f64_exact(coeff.lower_err[row + j]) * b;
+                let upper_term = f32_to_f64_exact(coeff.upper_err[row + j]) * b;
+                le = add_nonnegative_f64_up(le, lower_term);
+                ue = add_nonnegative_f64_up(ue, upper_term);
+                coeff.lower_err[row + j] = 0.0;
+                coeff.upper_err[row + j] = 0.0;
             }
-            coeff.lower_b_err[s] = up_f32(f64::from(coeff.lower_b_err[s]) + le + le.abs() * U);
-            coeff.upper_b_err[s] = up_f32(f64::from(coeff.upper_b_err[s]) + ue + ue.abs() * U);
+            coeff.lower_b_err[s] = up_f32(add_nonnegative_f64_up(
+                f32_to_f64_exact(coeff.lower_b_err[s]),
+                le,
+            ));
+            coeff.upper_b_err[s] = up_f32(add_nonnegative_f64_up(
+                f32_to_f64_exact(coeff.upper_b_err[s]),
+                ue,
+            ));
         }
+    }
+
+    /// #u4 taint companion of [`Self::concretize_error_into_bias`]
+    /// (TAINT_GUARD_AUDIT.md §4 C1, "plumbed from"): OR the per-coefficient
+    /// ERR-taint words into the per-spec BIAS-taint words, one channel (lower
+    /// or upper) per call, to be invoked BEFORE the real fold zeroes the
+    /// per-coefficient err it mirrors.
+    ///
+    /// Canon rule: `taint_out = OR over inputs of (taint_in AND its
+    /// multiplicative partner != 0)`. Each err element's multiplicative partner
+    /// here is `fab[dom*d + j]` (the per-domain node abs-max the real fold
+    /// charges the err against), so `fab == 0.0` — either sign of zero —
+    /// annihilates: a zero abs-max is a PROVEN exactly-zero pre-activation
+    /// (`|z[j]| ≤ 0`), the one case where dropping the taint is sound
+    /// (`R·0 == 0` for every finite real the sentinel stands for). The fold's
+    /// own saturation term is absent by construction: it accumulates in f64
+    /// (which never clamps to the finite sentinel) and any non-finite escape is
+    /// refused by the concretize host preflight bit tests
+    /// (crown_concretize_sound.rs, guard G5).
+    ///
+    /// Validation and indexing mirror the real fold EXACTLY (same
+    /// `n_domains` partition and `fab` shape checks, same fab
+    /// non-finite/negative bit tests, same `fab[dom*d + j]` per-domain block
+    /// addressing — HOLE 4): whenever the real fold no-ops, this companion
+    /// no-ops too, leaving the err-taint words paired with the (unzeroed)
+    /// per-coefficient err they describe — nothing is lost. After the real fold
+    /// zeroes the err channel, its taint words are stale-conservative at worst
+    /// (a kept word on an exact 0.0 can only cause refusal, never a tighter
+    /// bound).
+    ///
+    /// The ordinary resident walk and ResNet composition now carry row words
+    /// without invoking this older CPU companion. It remains as a focused
+    /// reference for the fold semantics; armed C1 receives the composed rows.
+    #[allow(dead_code)]
+    fn concretize_error_taint_into_bias(
+        err_taint: &[u32],
+        fab: &[f32],
+        per_spec_bias_taint: &mut [u32],
+        num_specs: usize,
+        num_specs_per_dom: usize,
+        dim: usize,
+    ) {
+        let d = dim;
+        let Some(n_domains) = num_specs
+            .checked_div(num_specs_per_dom)
+            .filter(|_| num_specs.is_multiple_of(num_specs_per_dom))
+        else {
+            return;
+        };
+        let Some(expected_fab) = d.checked_mul(n_domains) else {
+            return;
+        };
+        let Some(coeff_elems) = num_specs.checked_mul(d) else {
+            return;
+        };
+        if fab.len() != expected_fab
+            || err_taint.len() != coeff_elems
+            || per_spec_bias_taint.len() != num_specs
+            || fab.iter().any(|value| {
+                let bits = value.to_bits();
+                bits & 0x7f80_0000 == 0x7f80_0000
+                    || (bits & 0x8000_0000 != 0 && bits & 0x7fff_ffff != 0)
+            })
+        {
+            return;
+        }
+        for s in 0..num_specs {
+            let dom = s / num_specs_per_dom;
+            let fbase = dom * d;
+            let row = s * d;
+            let mut word = 0u32;
+            for j in 0..d {
+                // Annihilation conjunct. `-0.0 != 0.0` is false, so a negative
+                // zero abs-max annihilates too (|z[j]| ≤ 0 ⇒ z[j] exactly 0).
+                if fab[fbase + j] != 0.0 {
+                    word |= err_taint[row + j];
+                }
+            }
+            per_spec_bias_taint[s] |= word;
+        }
+    }
+
+    /// #u4: a tiny one-shot UNIFORM buffer written via `mapped_at_creation` —
+    /// deliberately NOT `queue.write_buffer` (submission-ordered: many
+    /// transport dispatches share one per-layer encoder/submit, and reusing a
+    /// written uniform would collapse every dispatch's params to the last
+    /// value). Each on-device taint dispatch owns its params buffer; the bind
+    /// group keeps it alive past this scope.
+    fn taint_uniform(&self, label: &str, bytes: &[u8]) -> wgpu::Buffer {
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: true,
+        });
+        buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
+        buf.unmap();
+        super::intermediate_sweep::note_host_to_device(bytes.len());
+        buf
+    }
+
+    /// #u4 (gate-ON only): encode ONE `TAINT_ROW_OR_SHADER` dispatch that ORs
+    /// a `[rows × cols]` word buffer down to the per-spec-row device
+    /// accumulator `rows_out` (atomicOr — monotone, so transport order is
+    /// free). This replaced every mid-walk `taint_read_words` + host-fold
+    /// round trip (the measured 2.3–3.1× gate-ON tax).
+    ///
+    /// `partner`:
+    /// * `None` — unconditional row-OR (the fail-closed no-twin form; the
+    ///   shader's partner binding is filled with `words` itself, never read);
+    /// * `Some((buf, false))` — per-COLUMN annihilation partner `buf[k]`,
+    ///   `len ≥ cols` (the `bias[k] != 0` / intercept conjuncts);
+    /// * `Some((buf, true))` — per-ELEMENT partner `buf[i]`, same shape as
+    ///   `words` (no walk site yet; the shader supports it).
+    ///
+    /// The extra bias-error dispatch that charges a layer's declared
+    /// `bias_abs_err` (`d`). No-op when `d == 0`, which is every pre-`cert_err`
+    /// caller — so the default walk issues no dispatch and stays byte-identical.
+    ///
+    /// See [`cert_bias_charge_slack`] for the derivation: re-running the
+    /// UNMODIFIED bias kernel with the constant operand `[d; k]` and
+    /// `gamma_k = 1` computes `d·(Σ|a_j| + Σ err_j)` recovered outward, and the
+    /// kernel accumulates it (`+=`) into the very `bias_err_out` the ordinary
+    /// fold just wrote. The centre-bias output is aimed at `sink`, a buffer
+    /// nothing else reads, so `blo`/`buo` never move.
+    fn cert_bias_charge_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bias_pipe: &(wgpu::ComputePipeline, wgpu::BindGroupLayout),
+        args: CertBiasChargeArgs<'_>,
+    ) -> Result<()> {
+        let d = args.cert_err.bias_abs_err;
+        if d == 0.0 {
+            return Ok(());
+        }
+        let (Some(params), Some(operand), Some(sink)) = (args.params, args.operand, args.sink)
+        else {
+            return Err(NyError::UnsupportedOp(format!(
+                "#cert-err: layer {} declares bias_abs_err={d:e} but this walk \
+                 allocated no charge buffers — refusing (fail-closed)",
+                args.layer_index
+            )));
+        };
+        if !d.is_finite() || d < 0.0 {
+            return Err(NyError::UnsupportedOp(format!(
+                "#cert-err: layer {} declares a non-finite/negative \
+                 bias_abs_err={d:e} — refusing (fail-closed)",
+                args.layer_index
+            )));
+        }
+        let k = args.reduction;
+        let k_u32 = resident_checked_u32(k, "cert bias charge reduction")?;
+        let num_specs_u32 = resident_checked_u32(args.num_specs, "cert bias charge spec rows")?;
+        // #flush-charge belt-and-braces: charged authority refuses cert_err
+        // layers at walk entry, so this is unreachable there — but if that
+        // guard ever regressed, the bias-combine widening still applies.
+        let slack = charged_bias_slack_or(
+            self.charged_flush_authority_cached(),
+            cert_bias_charge_slack(k)?,
+        )?;
+        let additive = crate::wgpu_device::sound_consts::rung3_flush_safe_additive(k_u32)?;
+        self.queue
+            .write_buffer(operand, 0, bytemuck::cast_slice(&vec![d; k.max(1)]));
+        self.queue.write_buffer(
+            params,
+            0,
+            bytemuck::bytes_of(&BiasParams {
+                num_specs: num_specs_u32,
+                k: k_u32,
+                // `gamma_k = 1` turns the kernel's `gamma_k·Σ|a·bias|` rounding
+                // correction into the FULL first-order `d·Σ|a|` charge.
+                gamma_k: 1.0,
+                additive,
+                slack,
+                // `eft_mode = 0` is mandatory, not a default: the EFT lane
+                // REPLACES the `gamma_k·Σ|a·bias|` term with a measured residual
+                // of the value reduction, which would delete this charge
+                // entirely. The walk preflight already refuses `cert_err` under
+                // `NY_EFT_ERR`; this is the second, local guarantee.
+                eft_mode: 0,
+                eft_r_slack: 0.0,
+                _p: 0,
+            }),
+        );
+        super::intermediate_sweep::note_host_to_device(
+            k.max(1)
+                .saturating_mul(size_of::<f32>())
+                .saturating_add(size_of::<BiasParams>()),
+        );
+        for side in 0..2 {
+            self.pass_simple(
+                encoder,
+                bias_pipe,
+                params,
+                &[
+                    args.a[side],
+                    args.a_err[side],
+                    operand,
+                    sink,
+                    args.bias_err_out[side],
+                ],
+                num_specs_u32,
+            );
+        }
+        Ok(())
+    }
+
+    fn taint_row_or_dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        words: &wgpu::Buffer,
+        partner: Option<(&wgpu::Buffer, bool)>,
+        rows: usize,
+        cols: usize,
+        rows_out: &wgpu::Buffer,
+    ) {
+        let cols = cols.max(1);
+        let (mode, pbuf) = match partner {
+            None => (0u32, words),
+            Some((buf, false)) => (1u32, buf),
+            Some((buf, true)) => (2u32, buf),
+        };
+        let params = self.taint_uniform(
+            "res_taint_row_or_p",
+            bytemuck::bytes_of(&TaintRowOrParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                use_partner: mode,
+                _pad: 0,
+            }),
+        );
+        let pipes = self.resident_backward_pipelines();
+        self.pass_simple(
+            encoder,
+            &pipes.taint_row_or,
+            &params,
+            &[words, pbuf, rows_out],
+            ((rows * cols) as u32).div_ceil(256),
+        );
     }
 
     /// Sound resident backward over a RESNET decomposed into backward-order
@@ -3184,6 +8141,87 @@ impl WgpuDevice {
         // byte-for-byte unchanged. `num_specs_per_dom` is set by the caller.
         coeff_full_out: Option<&mut ny_core::GpuResidentCoeffBatched>,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        let (coeff, all_grads, all_gathers) = self.resnet_seeded_compose_coeff(
+            segments,
+            lower_a,
+            upper_a,
+            lower_b,
+            upper_b,
+            num_specs,
+            num_specs_per_dom,
+            output_dim,
+            relu_pre_lower,
+            beta_signed,
+            beta_gather_idx,
+            frontier_abs,
+            force_concretize,
+            node_abs,
+            force_fine,
+        )?;
+        if let Some(out) = input_coeff_out {
+            out.clear();
+            out.extend_from_slice(&coeff.lower_a);
+        }
+        if let Some(out) = coeff_full_out {
+            out.lower_a = coeff.lower_a.clone();
+            out.upper_a = coeff.upper_a.clone();
+            out.lower_err = coeff.lower_err.clone();
+            out.upper_err = coeff.upper_err.clone();
+            out.lower_b = coeff.lower_b.clone();
+            out.upper_b = coeff.upper_b.clone();
+            out.lower_b_err = coeff.lower_b_err.clone();
+            out.upper_b_err = coeff.upper_b_err.clone();
+            out.dim = coeff.dim;
+            out.num_specs = num_specs;
+            out.num_specs_per_dom = num_specs_per_dom;
+        }
+        // #u4 (previously: forced `taint_rows = None` here): the segment
+        // composition now carries the word channel end-to-end (see
+        // `resnet_seeded_compose_coeff`), so `coeff.taint_rows` is handed to
+        // the C1 consult as-is. Gate ON on admitted host per-segment Linear /
+        // Activation/Conv paths ⇒ `Some(rows)`; gate OFF ⇒ `None`, which armed
+        // C1 refuses. Segment-resident device streams and coalesced folds
+        // likewise refuse before reaching here until their own word seams arm.
+        // A `None` at this boundary therefore still means "no words carried"
+        // — the honest fail-closed value at the armed consult.
+        let (lo, hi) = self.concretize_resident_coeff_batched(
+            &coeff,
+            num_specs,
+            num_specs_per_dom,
+            input_lower,
+            input_upper,
+        )?;
+        Ok((lo, hi, all_grads, all_gathers))
+    }
+
+    /// The resnet segment-composition loop of
+    /// [`Self::crown_backward_sound_resident_resnet_seeded_gather`], returning
+    /// the COMPOSED coefficient frontier (pre-concretize) plus the accumulated
+    /// per-ReLU gradient/gather channels. Split out so the #u4 word channel is
+    /// observable/testable at the exact frontier the C1 consult will read:
+    /// `ResidentCoeff::taint_rows` here is the per-spec-row OR over every
+    /// sub-walk, skip add, projection merge, re-seed seam and host fold of the
+    /// whole segment walk (`None` iff the gate is off or a seam genuinely
+    /// carried no words — fail-closed at the consult, never a partial set).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resnet_seeded_compose_coeff(
+        &self,
+        segments: &[ResnetSegment],
+        lower_a: &[f32],
+        upper_a: &[f32],
+        lower_b: &[f32],
+        upper_b: &[f32],
+        num_specs: usize,
+        num_specs_per_dom: usize,
+        output_dim: usize,
+        relu_pre_lower: &[&[f32]],
+        beta_signed: &[&[f32]],
+        beta_gather_idx: &[&[u32]],
+        frontier_abs: &[&[f32]],
+        force_concretize: bool,
+        node_abs: &[&[f32]],
+        force_fine: bool,
+    ) -> Result<(ResidentCoeff, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
         let concretize_err = !frontier_abs.is_empty()
             && (force_concretize
                 || std::env::var("NY_RESNET_ERR_CONCRETIZE").ok().as_deref() == Some("1"));
@@ -3193,7 +8231,7 @@ impl WgpuDevice {
                     .ok()
                     .as_deref()
                     == Some("1"));
-        if std::env::var("NY_SEG_PROBE").ok().as_deref() == Some("1") {
+        if seg_probe_armed() {
             eprintln!(
                 "[conc-gate] concretize_err={concretize_err} concretize_fine={concretize_fine} \
                  frontier_abs.len()={} node_abs.len()={} seg.len()={}",
@@ -3202,7 +8240,9 @@ impl WgpuDevice {
                 segments.len()
             );
         }
-        let n0 = num_specs * output_dim;
+        let n0 =
+            resident_checked_product(&[num_specs, output_dim], "resnet seed coefficient elements")?;
+        resident_checked_u32(n0, "resnet seed coefficient elements")?;
         if lower_a.len() != n0 || upper_a.len() != n0 {
             return Err(NyError::shape_mismatch(
                 vec![num_specs, output_dim],
@@ -3220,6 +8260,35 @@ impl WgpuDevice {
                 "crown_backward_sound_resident_resnet: empty segment list".into(),
             ));
         }
+        // #u4 (AUTO or explicit NY_GPU_TAINT_WORDS=1; explicit opt-out ⇒
+        // `None`, byte-identical): the composition's OWN G13 seeding of the
+        // ENTRY frontier, at spec-row
+        // granularity (the same granularity the walk's seed-BIAS wording uses).
+        // A sentinel-magnitude coefficient/bias shipped into the resnet path
+        // condemns its row before any sub-walk runs. The first sub-walk G13-
+        // seeds the same host values again per-coefficient — that double-cover
+        // is sound, not a launder: both mechanisms only ever ADD words (OR),
+        // neither can clear one, so the composed set is always a superset of
+        // the true taint at row granularity. Seed errors enter as exact 0.0
+        // and need no wording.
+        let taint_on = self.taint_words_armed();
+        let seed_taint_rows: Option<Vec<u32>> = if taint_on {
+            let mut rows = vec![0u32; num_specs];
+            for (s, row) in rows.iter_mut().enumerate() {
+                let base = s * output_dim;
+                let mut word = 0u32;
+                for j in 0..output_dim {
+                    word |= taint_seed_word(lower_a[base + j]);
+                    word |= taint_seed_word(upper_a[base + j]);
+                }
+                word |= taint_seed_word(lower_b[s]);
+                word |= taint_seed_word(upper_b[s]);
+                *row = word;
+            }
+            Some(rows)
+        } else {
+            None
+        };
         let mut coeff = ResidentCoeff {
             lower_a: lower_a.to_vec(),
             upper_a: upper_a.to_vec(),
@@ -3232,6 +8301,7 @@ impl WgpuDevice {
             dim: output_dim,
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
+            taint_rows: seed_taint_rows,
         };
         // Captured per-ReLU gradients + gathered A-values, accumulated across
         // segments in fold order (the per-segment `coeff` is replaced on each
@@ -3304,6 +8374,28 @@ impl WgpuDevice {
                 total.checked_sub(1)
             }
         });
+        // Carrier-driven resident Cut-CROWN SHADOW hook (observation-only;
+        // `ops/cut_shadow_resident.rs`). Armed strictly around one synchronous
+        // shadow fold by the cut-shadow driver on this thread; `None` on every
+        // production walk ⇒ byte-identical. Unlike the quarantined registry
+        // fold above, an armed hook that cannot be applied exactly once is a
+        // typed refusal, never a silent untouched walk.
+        let cut_shadow_target = super::cut_shadow_resident::armed_cut_shadow_target();
+        if let Some(target) = cut_shadow_target {
+            let total: usize = segments
+                .iter()
+                .map(|s| match s {
+                    ResnetSegment::Chain(b) | ResnetSegment::Residual(b) => n_act(b),
+                    ResnetSegment::ResidualProj(f, p) => n_act(f) + n_act(p),
+                })
+                .sum();
+            if target >= total {
+                return Err(NyError::SoundnessRefusal(
+                    "wgpu resident cut shadow: target activation is outside the fold".into(),
+                ));
+            }
+        }
+        let mut cut_shadow_applied = false;
         // #seg-resident (dark `NY_SEG_RESIDENT=1`): keep the coefficient stream
         // ON DEVICE across segments — the per-segment download → CPU merge →
         // re-upload round-trip (measured ~8.6 ms fixed cost × 2810 calls in a
@@ -3318,10 +8410,11 @@ impl WgpuDevice {
             && !concretize_fine
             && !concretize_err
             && cut_fold.is_none()
+            && cut_shadow_target.is_none()
             && relu_pre_lower.is_empty()
             && beta_gather_idx.is_empty()
             && matches!(segments.first(), Some(ResnetSegment::Chain(_)));
-        if seg_resident_enabled() && std::env::var("NY_SEG_PROBE").ok().as_deref() == Some("1") {
+        if seg_resident_enabled() && seg_probe_armed() {
             eprintln!(
                 "[seg-resident] eligible={seg_resident} fine={concretize_fine} \
                  err={concretize_err} cut={} pre={} gather={} first_chain={} nseg={}",
@@ -3351,7 +8444,37 @@ impl WgpuDevice {
                     .filter(|&t| t >= grad_idx && t < grad_idx + fb_count)
                     .map(|t| (t - grad_idx, f))
             });
-            let mut cf = if let Some((local_act, fold)) = fb_fold {
+            // Carrier-driven cut SHADOW: same branch-window rule as the legacy
+            // fold, dispatched first (the registry fold is hard-quarantined and
+            // can never coexist with an armed hook in practice).
+            let fb_cut_shadow = cut_shadow_target
+                .filter(|&t| t >= grad_idx && t < grad_idx + fb_count)
+                .map(|t| t - grad_idx);
+            let mut cf = if let Some(local_act) = fb_cut_shadow {
+                let fb_node = node_slice_for(grad_idx, fb_count);
+                let snapshot =
+                    super::cut_shadow_resident::armed_cut_shadow_snapshot().ok_or_else(|| {
+                        NyError::InternalError(
+                            "wgpu resident cut shadow: armed hook lost its snapshot".into(),
+                        )
+                    })?;
+                let out = self.backward_branch_carrier_cut(
+                    branch,
+                    &coeff,
+                    num_specs,
+                    num_specs_per_dom,
+                    &fb_pre,
+                    &fb_beta,
+                    &fb_gather,
+                    &fb_node,
+                    concretize_fine,
+                    local_act,
+                    &snapshot,
+                )?;
+                cut_shadow_applied = true;
+                super::cut_shadow_resident::note_cut_shadow_walk_applied();
+                out
+            } else if let Some((local_act, fold)) = fb_fold {
                 let fb_node = node_slice_for(grad_idx, fb_count);
                 self.backward_branch_cut_fold(
                     branch,
@@ -3435,10 +8558,7 @@ impl WgpuDevice {
                             )
                         })?;
                         if f_out.dim != prev.dim {
-                            return Err(NyError::shape_mismatch(
-                                vec![prev.dim],
-                                vec![f_out.dim],
-                            ));
+                            return Err(NyError::shape_mismatch(vec![prev.dim], vec![f_out.dim]));
                         }
                         let n = num_specs * f_out.dim;
                         self.seg_merge_dispatch(&[
@@ -3495,10 +8615,7 @@ impl WgpuDevice {
                                 )
                             })?;
                         if f_out.dim != p_out.dim {
-                            return Err(NyError::shape_mismatch(
-                                vec![f_out.dim],
-                                vec![p_out.dim],
-                            ));
+                            return Err(NyError::shape_mismatch(vec![f_out.dim], vec![p_out.dim]));
                         }
                         let n = num_specs * f_out.dim;
                         self.seg_merge_dispatch(&[
@@ -3524,9 +8641,34 @@ impl WgpuDevice {
                     dim,
                     relu_grads: Vec::new(),
                     beta_gather: Vec::new(),
+                    // #u4 GENUINELY UNWIRABLE (seg-resident device stream
+                    // placeholder): the frontier lives on-device with no word
+                    // buffers. Unreachable under the gate — taint_on +
+                    // seed/keep streams is a typed refusal at the sub-walk
+                    // entry (pinned by
+                    // `taint_resnet_seg_resident_stream_refuses`) — so this
+                    // `None` only ever flows on the gate-off path, where it is
+                    // today's exact value.
+                    taint_rows: None,
                 };
                 continue;
             }
+            // #u4 SEAM OR (re-seed carriage): the next frontier `cf`/the merge
+            // below was seeded from THIS `coeff`'s VALUES — the sub-walk's G13
+            // entry seeding re-words anything still at sentinel magnitude, but
+            // a word whose value was already LAUNDERED below the magnitude
+            // threshold in an earlier segment survives ONLY in `coeff`'s
+            // per-spec rows. OR them into the outgoing frontier (rows are
+            // spec-stable across segments). Together with G13 this DOUBLE-
+            // COVERS the seam, which is sound rather than a launder: G13 is
+            // exact (per-coefficient, with dead-partner annihilation) for
+            // still-visible sentinels, the row OR is conservative (refusal-
+            // only) for laundered history, and both operations can only ADD
+            // words — no path through the seam can clear one. Fail-closed:
+            // either side `None` poisons the whole result to `None`
+            // (`merge_taint_rows`), never a partial `Some`. Gate OFF: every
+            // side is `None` ⇒ `None`, byte-identical.
+            let prev_taint_rows = coeff.taint_rows.clone();
             coeff = match seg {
                 ResnetSegment::Chain(_) => cf,
                 ResnetSegment::Residual(_) => {
@@ -3551,21 +8693,64 @@ impl WgpuDevice {
                             .filter(|&t| t >= grad_idx && t < grad_idx + pb_count)
                             .map(|t| (t - grad_idx, f))
                     });
+                    // Carrier-driven cut SHADOW target inside the P branch:
+                    // supported through the same zero-bias P seed (the bias
+                    // channel applied inside P survives `merge_streams`, which
+                    // adds the two branch streams — the F stream carries the
+                    // incoming bias once).
+                    let pb_cut_shadow = cut_shadow_target
+                        .filter(|&t| t >= grad_idx && t < grad_idx + pb_count)
+                        .map(|t| t - grad_idx);
                     // P branch carries ONLY the coefficient/its error (zero bias).
-                    let p_seed = (concretize_fine || pb_fold.is_some()).then(|| ResidentCoeff {
-                        lower_a: coeff.lower_a.clone(),
-                        upper_a: coeff.upper_a.clone(),
-                        lower_err: coeff.lower_err.clone(),
-                        upper_err: coeff.upper_err.clone(),
-                        lower_b: zb.clone(),
-                        upper_b: zb.clone(),
-                        lower_b_err: zb.clone(),
-                        upper_b_err: zb.clone(),
-                        dim: coeff.dim,
-                        relu_grads: Vec::new(),
-                        beta_gather: Vec::new(),
-                    });
-                    let mut cp = if let Some((local_act, fold)) = pb_fold {
+                    let p_seed = (concretize_fine || pb_fold.is_some() || pb_cut_shadow.is_some())
+                        .then(|| ResidentCoeff {
+                            lower_a: coeff.lower_a.clone(),
+                            upper_a: coeff.upper_a.clone(),
+                            lower_err: coeff.lower_err.clone(),
+                            upper_err: coeff.upper_err.clone(),
+                            lower_b: zb.clone(),
+                            upper_b: zb.clone(),
+                            lower_b_err: zb.clone(),
+                            upper_b_err: zb.clone(),
+                            dim: coeff.dim,
+                            relu_grads: Vec::new(),
+                            beta_gather: Vec::new(),
+                            // #u4: the P branch consumes the SAME incoming frontier
+                            // (coefficients + errors; bias zeroed — an exact 0.0
+                            // contributes no word), so it inherits the frontier's
+                            // row words. Without this the fine/cut-fold P walk
+                            // would start from `None` and poison the projection
+                            // merge (fail-closed but needlessly refusing the whole
+                            // common path).
+                            taint_rows: coeff.taint_rows.clone(),
+                        });
+                    let mut cp = if let Some(local_act) = pb_cut_shadow {
+                        let pb_node = node_slice_for(grad_idx, pb_count);
+                        let snapshot = super::cut_shadow_resident::armed_cut_shadow_snapshot()
+                            .ok_or_else(|| {
+                                NyError::InternalError(
+                                    "wgpu resident cut shadow: armed hook lost its snapshot".into(),
+                                )
+                            })?;
+                        let out = self.backward_branch_carrier_cut(
+                            p_branch,
+                            p_seed
+                                .as_ref()
+                                .expect("p_seed built when the shadow is set"),
+                            num_specs,
+                            num_specs_per_dom,
+                            &pb_pre,
+                            &pb_beta,
+                            &pb_gather,
+                            &pb_node,
+                            concretize_fine,
+                            local_act,
+                            &snapshot,
+                        )?;
+                        cut_shadow_applied = true;
+                        super::cut_shadow_resident::note_cut_shadow_walk_applied();
+                        out
+                    } else if let Some((local_act, fold)) = pb_fold {
                         let pb_node = node_slice_for(grad_idx, pb_count);
                         self.backward_branch_cut_fold(
                             p_branch,
@@ -3620,6 +8805,11 @@ impl WgpuDevice {
                     merge_streams(cf, &cp)
                 }
             };
+            // (#u4 seam OR, see the comment above `prev_taint_rows`.) For the
+            // Residual arm `add_skip_stream` already OR'd the same rows —
+            // ORing them again is idempotent, keeping this seam uniform.
+            coeff.taint_rows =
+                merge_taint_rows(coeff.taint_rows.take(), prev_taint_rows.as_deref());
             // #unsat-keystone: concretize the accumulated coefficient error against the
             // frontier node bounds → fold into the (scalar, non-amplifying) bias error,
             // then reset the coefficient error. Caps the per-segment L1 error blow-up.
@@ -3628,37 +8818,20 @@ impl WgpuDevice {
             // valid over-approximation (mirrors per-node CPU concretization).
             if concretize_err {
                 if let Some(fab) = frontier_abs.get(seg_idx) {
-                    const U: f64 = f64::from_bits(0x3E70_0000_0000_0000); // 2^-24
-                    let d = coeff.dim;
-                    // #batched-bab HOLE 4: `fab` is the per-domain-STACKED frontier abs-max
-                    // (`n_domains*d`, single domain → d), laid out in `n_domains` blocks of
-                    // `d`. Row `s` folds against ITS OWN block `dom = s/num_specs_per_dom` at
-                    // `fab[dom*d + j]`; sharing another domain's (smaller) abs-max would
-                    // UNDER-count the error ⇒ tighter bound ⇒ false VERIFIED.
-                    let n_dom = num_specs.checked_div(num_specs_per_dom).unwrap_or(1);
-                    if fab.len() == d * n_dom {
-                        for s in 0..num_specs {
-                            let dom = s.checked_div(num_specs_per_dom).unwrap_or(0);
-                            let fbase = dom * d;
-                            let mut le = 0.0f64;
-                            let mut ue = 0.0f64;
-                            for j in 0..d {
-                                let b = f64::from(fab[fbase + j]);
-                                le += f64::from(coeff.lower_err[s * d + j]) * b;
-                                ue += f64::from(coeff.upper_err[s * d + j]) * b;
-                                coeff.lower_err[s * d + j] = 0.0;
-                                coeff.upper_err[s * d + j] = 0.0;
-                            }
-                            // Round-up the certified add (sound over-approximation).
-                            coeff.lower_b_err[s] =
-                                up_f32(f64::from(coeff.lower_b_err[s]) + le + le.abs() * U);
-                            coeff.upper_b_err[s] =
-                                up_f32(f64::from(coeff.upper_b_err[s]) + ue + ue.abs() * U);
-                        }
-                    }
+                    // #u4 ROW-INVARIANT host fold: the per-coefficient taint
+                    // companion (`concretize_error_taint_into_bias`) is NOT
+                    // needed at this altitude — the composition carries words
+                    // only per SPEC ROW, and this fold moves err mass into the
+                    // bias err of the SAME spec row. The err's taint is already
+                    // in the row word (each sub-walk ORs its final `le`/`ue`
+                    // words into its rows at exit; seed errs are G13-worded at
+                    // walk entry), so the fold cannot launder it; skipping the
+                    // `fab == 0` annihilation is conservative-only (a row stays
+                    // condemned that a per-coefficient channel might clear).
+                    Self::concretize_error_into_bias(&mut coeff, num_specs, num_specs_per_dom, fab);
                 }
             }
-            if std::env::var("NY_SEG_PROBE").ok().as_deref() == Some("1") {
+            if seg_probe_armed() {
                 let cmax = coeff
                     .lower_a
                     .iter()
@@ -3680,37 +8853,28 @@ impl WgpuDevice {
                 );
             }
         }
+        // The armed cut-shadow hook must have been applied exactly once (the
+        // disjoint, increasing branch windows make a double application
+        // unrepresentable; a miss means the target/fold accounting disagreed).
+        // Mirrors the CUDA "target activation was not encountered exactly
+        // once" refusal — never a silent untouched walk.
+        if cut_shadow_target.is_some() && !cut_shadow_applied {
+            return Err(NyError::SoundnessRefusal(
+                "wgpu resident cut shadow: target activation was not encountered exactly once"
+                    .into(),
+            ));
+        }
         // #seg-resident: the ONE download for the whole backward — every
         // downstream consumer (input-coeff capture, full-coeff capture, the
         // final concretization) then flows through the unchanged host path.
+        // (#u4: unreachable under the gate — taint_on + device seed/keep
+        // streams is a typed refusal at the sub-walk entry, so `coeff_dev` is
+        // only ever `Some` with the gate off, where `taint_rows == None` is
+        // the correct value.)
         if let Some(bufs) = coeff_dev.take() {
             coeff = self.download_resident_coeff(&bufs)?;
         }
-        if let Some(out) = input_coeff_out {
-            out.clear();
-            out.extend_from_slice(&coeff.lower_a);
-        }
-        if let Some(out) = coeff_full_out {
-            out.lower_a = coeff.lower_a.clone();
-            out.upper_a = coeff.upper_a.clone();
-            out.lower_err = coeff.lower_err.clone();
-            out.upper_err = coeff.upper_err.clone();
-            out.lower_b = coeff.lower_b.clone();
-            out.upper_b = coeff.upper_b.clone();
-            out.lower_b_err = coeff.lower_b_err.clone();
-            out.upper_b_err = coeff.upper_b_err.clone();
-            out.dim = coeff.dim;
-            out.num_specs = num_specs;
-            out.num_specs_per_dom = num_specs_per_dom;
-        }
-        let (lo, hi) = self.concretize_resident_coeff_batched(
-            &coeff,
-            num_specs,
-            num_specs_per_dom,
-            input_lower,
-            input_upper,
-        )?;
-        Ok((lo, hi, all_grads, all_gathers))
+        Ok((coeff, all_grads, all_gathers))
     }
 
     /// #seg-resident: dispatch the on-device stream merge for each `(a, err_a,
@@ -3722,7 +8886,13 @@ impl WgpuDevice {
     /// encode into ONE submit.
     fn seg_merge_dispatch(
         &self,
-        pairs: &[(&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, usize)],
+        pairs: &[(
+            &wgpu::Buffer,
+            &wgpu::Buffer,
+            &wgpu::Buffer,
+            &wgpu::Buffer,
+            usize,
+        )],
     ) -> Result<()> {
         self.run_gpu_checked("seg_merge", || {
             let pipes = self.resident_backward_pipelines();
@@ -3735,7 +8905,9 @@ impl WgpuDevice {
             #[allow(clippy::collection_is_never_read)]
             let mut _params_keepalive: Vec<wgpu::Buffer> = Vec::with_capacity(pairs.len());
             for &(a, ea, b, eb, n) in pairs {
-                let wg = (super::gpu_checked_u32(n, "seg_merge n")?).div_ceil(256).min(32768);
+                let wg = (super::gpu_checked_u32(n, "seg_merge n")?)
+                    .div_ceil(256)
+                    .min(32768);
                 let pbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("seg_merge_params"),
                     size: size_of::<SegMergeParams>() as u64,
@@ -3834,6 +9006,12 @@ impl WgpuDevice {
                 dim,
                 relu_grads: Vec::new(),
                 beta_gather: Vec::new(),
+                // #u4 GENUINELY UNWIRABLE: seg-resident device streams carry
+                // no word buffers, and taint_on + device streams is a typed
+                // refusal at the walk entry (pinned by
+                // `taint_resnet_seg_resident_stream_refuses`) — this download
+                // only ever runs gate-off, where `None` is today's exact value.
+                taint_rows: None,
             })
         })
     }
@@ -4517,7 +9695,18 @@ impl WgpuDevice {
         num_specs: usize,
         num_neurons: usize,
     ) -> Result<Vec<f32>> {
-        if a_lower.len() != num_specs * num_neurons {
+        let coefficient_elems = resident_checked_product(
+            &[num_specs, num_neurons],
+            "standalone alpha-gradient coefficient elements",
+        )?;
+        let num_specs_u32 = resident_checked_u32(num_specs, "standalone alpha-gradient specs")?;
+        let num_neurons_u32 =
+            resident_checked_u32(num_neurons, "standalone alpha-gradient neurons")?;
+        resident_checked_u32(
+            coefficient_elems,
+            "standalone alpha-gradient coefficient elements",
+        )?;
+        if a_lower.len() != coefficient_elems {
             return Err(NyError::shape_mismatch(
                 vec![num_specs, num_neurons],
                 vec![a_lower.len()],
@@ -4531,6 +9720,30 @@ impl WgpuDevice {
         }
         if num_neurons == 0 {
             return Ok(Vec::new());
+        }
+        let limits = self.device.limits();
+        let coefficient_bytes =
+            resident_f32_bytes(coefficient_elems.max(1), "standalone alpha-gradient input")?;
+        let neuron_bytes =
+            resident_f32_bytes(num_neurons.max(1), "standalone alpha-gradient output")?;
+        let storage_limit = limits.max_storage_buffer_binding_size;
+        if coefficient_bytes > limits.max_buffer_size
+            || coefficient_bytes > storage_limit
+            || neuron_bytes > limits.max_buffer_size
+            || neuron_bytes > storage_limit
+        {
+            return Err(NyError::UnsupportedOp(
+                "standalone alpha-gradient buffers exceed device limits".into(),
+            ));
+        }
+        let workgroups = num_neurons_u32.div_ceil(256);
+        if limits.max_compute_workgroups_per_dimension == 0
+            || workgroups > limits.max_compute_workgroups_per_dimension
+        {
+            return Err(NyError::UnsupportedOp(format!(
+                "standalone alpha-gradient dispatch {workgroups} exceeds device limit {}",
+                limits.max_compute_workgroups_per_dimension
+            )));
         }
         self.run_gpu_checked("crown_alpha_gradient_resident", || {
             let storage = |label: &str, n: usize| {
@@ -4560,18 +9773,14 @@ impl WgpuDevice {
                 &params,
                 0,
                 bytemuck::bytes_of(&GradAlphaParams {
-                    num_specs: num_specs as u32,
-                    num_neurons: num_neurons as u32,
+                    num_specs: num_specs_u32,
+                    num_neurons: num_neurons_u32,
                     // 0 = single-domain full reduction (legacy standalone entry).
                     num_specs_per_dom: 0,
                     _p1: 0,
                 }),
             );
-            let pipe = self.create_simple_pipeline(
-                super::super::shaders::CROWN_ALPHA_GRADIENT_SHADER,
-                "crown_alpha_gradient",
-                &[false, false, true],
-            );
+            let pipe = &self.resident_backward_pipelines().alpha_grad;
             let mut enc = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4579,10 +9788,10 @@ impl WgpuDevice {
                 });
             self.pass_simple(
                 &mut enc,
-                &pipe,
+                pipe,
                 &params,
                 &[&a_buf, &pl_buf, &g_buf],
-                (num_neurons as u32).div_ceil(256),
+                workgroups,
             );
             let st = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("grad_stage"),
@@ -4634,10 +9843,62 @@ impl WgpuDevice {
         input_lower: &[f32],
         input_upper: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
+        self.crown_joint_alpha_gradient_resident_impl(
+            segments,
+            seed_lower_a,
+            num_specs,
+            output_dim,
+            input_lower,
+            input_upper,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn crown_joint_alpha_gradient_resident_with_deadline(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed_lower_a: &[f32],
+        num_specs: usize,
+        output_dim: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.crown_joint_alpha_gradient_resident_impl(
+            segments,
+            seed_lower_a,
+            num_specs,
+            output_dim,
+            input_lower,
+            input_upper,
+            Some(deadline),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crown_joint_alpha_gradient_resident_impl(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed_lower_a: &[f32],
+        num_specs: usize,
+        output_dim: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Vec<f32>>> {
         if num_specs == 0 || output_dim == 0 {
             return Err(NyError::InvalidSpec("joint grad: empty spec/output".into()));
         }
-        if seed_lower_a.len() != num_specs * output_dim {
+        if segments.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "joint grad: empty segment list".into(),
+            ));
+        }
+        let seed_elems =
+            resident_checked_product(&[num_specs, output_dim], "joint-gradient seed elements")?;
+        resident_checked_u32(seed_elems, "joint-gradient seed elements")?;
+        if seed_lower_a.len() != seed_elems {
             return Err(NyError::shape_mismatch(
                 vec![num_specs, output_dim],
                 vec![seed_lower_a.len()],
@@ -4650,17 +9911,26 @@ impl WgpuDevice {
                 vec![input_upper.len()],
             ));
         }
-        if segments.is_empty() {
-            return Err(NyError::InvalidSpec(
-                "joint grad: empty segment list".into(),
-            ));
+        let limits = self.device.limits();
+        let final_dim = joint_segment_preflight(
+            segments,
+            num_specs,
+            output_dim,
+            limits.max_compute_workgroups_per_dimension,
+            limits.max_buffer_size,
+            limits.max_storage_buffer_binding_size,
+        )?;
+        if final_dim != input_dim {
+            return Err(NyError::shape_mismatch(vec![input_dim], vec![final_dim]));
         }
         let bias_channel = std::env::var("NY_WIDE_ALPHA_NOBIAS").ok().as_deref() != Some("1");
         let adj_depth = std::env::var("NY_WIDE_ALPHA_ADJ_DEPTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
 
-        self.run_gpu_checked("crown_joint_alpha_gradient_resident", || {
+        Self::poll_joint_alpha_deadline(deadline)?;
+        let run = || {
+            Self::poll_joint_alpha_deadline(deadline)?;
             let jp = self.joint_adjoint_pipelines();
 
             // ---- forward fold (lower coefficient only; capture per-ReLU A_preᵏ) ----
@@ -4669,8 +9939,9 @@ impl WgpuDevice {
             let mut a = a0;
             let mut dim = output_dim;
             for seg in segments {
-                let (na, nd) =
-                    self.joint_fwd_segment(jp, seg, a, num_specs, dim, &mut relu_caps)?;
+                let (na, nd) = Self::run_joint_alpha_deadline_unit(deadline, || {
+                    self.joint_fwd_segment(jp, seg, a, num_specs, dim, &mut relu_caps, deadline)
+                })?;
                 a = na;
                 dim = nd;
             }
@@ -4702,6 +9973,7 @@ impl WgpuDevice {
                     &[&a_input, &in_lo_buf, &in_hi_buf, &abar0],
                     ((num_specs * input_dim) as u32).div_ceil(256),
                 );
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
             }
 
@@ -4724,6 +9996,7 @@ impl WgpuDevice {
                 bias_channel,
                 adj_depth,
                 &mut harvested,
+                deadline,
             )?;
             if cursor != 0 {
                 return Err(NyError::InvalidSpec(
@@ -4734,6 +10007,7 @@ impl WgpuDevice {
             // ---- download the per-ReLU gradients (fold order) ----
             let mut out: Vec<Vec<f32>> = Vec::with_capacity(grad_bufs.len());
             for (gb, n) in &grad_bufs {
+                Self::poll_joint_alpha_deadline(deadline)?;
                 let st = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("joint_grad_stage"),
                     size: ((*n).max(1) * size_of::<f32>()) as u64,
@@ -4746,11 +10020,49 @@ impl WgpuDevice {
                         label: Some("joint_grad_dl"),
                     });
                 enc.copy_buffer_to_buffer(gb, 0, &st, 0, (*n * size_of::<f32>()) as u64);
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
-                out.push(Self::read_buffer(&self.device, &st, *n)?);
+                Self::poll_joint_alpha_deadline(deadline)?;
+                let values = Self::read_buffer(&self.device, &st, *n)?;
+                Self::poll_joint_alpha_deadline(deadline)?;
+                out.push(values);
             }
+            Self::poll_joint_alpha_deadline(deadline)?;
             Ok(out)
-        })
+        };
+        match deadline {
+            Some(value) => self.run_gpu_checked_with_deadline(
+                "crown_joint_alpha_gradient_resident",
+                value,
+                run,
+            ),
+            None => self.run_gpu_checked("crown_joint_alpha_gradient_resident", run),
+        }
+    }
+
+    #[inline]
+    fn poll_joint_alpha_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+        if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
+            Err(NyError::DeadlineExceeded(
+                "WGPU joint alpha adjoint exceeded its call-local deadline".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Execute one scheduler unit with polls on both sides.  The post-unit poll
+    /// is load-bearing: if a submitted/readback unit consumes the remaining
+    /// budget, the next scripted unit (and therefore the whole tail) is never
+    /// entered.
+    fn run_joint_alpha_deadline_unit<T>(
+        deadline: Option<std::time::Instant>,
+        work: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        Self::poll_joint_alpha_deadline(deadline)?;
+        let value = work()?;
+        Self::poll_joint_alpha_deadline(deadline)?;
+        Ok(value)
     }
 
     /// Fresh resident storage buffer of `n` f32 (zero-initialized by wgpu).
@@ -4793,31 +10105,43 @@ impl WgpuDevice {
         num_specs: usize,
         dim: usize,
         relu_caps: &mut Vec<JointReluCap>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(wgpu::Buffer, usize)> {
+        Self::poll_joint_alpha_deadline(deadline)?;
         match seg {
             GpuResnetSegment::Chain(layers) => {
-                self.joint_fwd_chain(jp, layers, a, num_specs, dim, relu_caps)
+                self.joint_fwd_chain(jp, layers, a, num_specs, dim, relu_caps, deadline)
             }
             GpuResnetSegment::Residual(f) => {
                 // out = F(z) + z; skip = identity. A_in = A_skip + A_F.
                 let a_skip = a.clone();
-                let (a_f, dim_f) = self.joint_fwd_chain(jp, f, a, num_specs, dim, relu_caps)?;
+                let (a_f, dim_f) =
+                    self.joint_fwd_chain(jp, f, a, num_specs, dim, relu_caps, deadline)?;
                 if dim_f != dim {
                     return Err(NyError::shape_mismatch(vec![dim], vec![dim_f]));
                 }
-                let merged = self.joint_add(jp, &a_skip, &a_f, num_specs * dim);
+                let merge_elems = resident_checked_product(
+                    &[num_specs, dim],
+                    "joint forward residual merge elements",
+                )?;
+                let merged = self.joint_add(jp, &a_skip, &a_f, merge_elems, deadline)?;
                 Ok((merged, dim))
             }
             GpuResnetSegment::ResidualProj(f, p) => {
                 // out = F(z) + P(z). Fold F THEN P (matches CPU relu-cap order).
                 let a_p_in = a.clone();
-                let (a_f, dim_f) = self.joint_fwd_chain(jp, f, a, num_specs, dim, relu_caps)?;
+                let (a_f, dim_f) =
+                    self.joint_fwd_chain(jp, f, a, num_specs, dim, relu_caps, deadline)?;
                 let (a_p, dim_p) =
-                    self.joint_fwd_chain(jp, p, a_p_in, num_specs, dim, relu_caps)?;
+                    self.joint_fwd_chain(jp, p, a_p_in, num_specs, dim, relu_caps, deadline)?;
                 if dim_f != dim_p {
                     return Err(NyError::shape_mismatch(vec![dim_f], vec![dim_p]));
                 }
-                let merged = self.joint_add(jp, &a_f, &a_p, num_specs * dim_f);
+                let merge_elems = resident_checked_product(
+                    &[num_specs, dim_f],
+                    "joint forward projection merge elements",
+                )?;
+                let merged = self.joint_add(jp, &a_f, &a_p, merge_elems, deadline)?;
                 Ok((merged, dim_f))
             }
         }
@@ -4831,11 +10155,14 @@ impl WgpuDevice {
         num_specs: usize,
         dim: usize,
         relu_caps: &mut Vec<JointReluCap>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(wgpu::Buffer, usize)> {
         let mut cur = a;
         let mut cur_dim = dim;
         for layer in layers {
-            let (na, nd) = self.joint_fwd_layer(jp, layer, cur, num_specs, cur_dim, relu_caps)?;
+            Self::poll_joint_alpha_deadline(deadline)?;
+            let (na, nd) =
+                self.joint_fwd_layer(jp, layer, cur, num_specs, cur_dim, relu_caps, deadline)?;
             cur = na;
             cur_dim = nd;
         }
@@ -4850,7 +10177,9 @@ impl WgpuDevice {
         num_specs: usize,
         dim: usize,
         relu_caps: &mut Vec<JointReluCap>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(wgpu::Buffer, usize)> {
+        Self::poll_joint_alpha_deadline(deadline)?;
         match layer {
             GpuCrownLayer::Linear {
                 weight,
@@ -4887,6 +10216,7 @@ impl WgpuDevice {
                 self.pass_gemm(
                     &mut enc, pipe, &params, &a, &w_buf, &out, disp.wg_x, disp.wg_y,
                 );
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
                 Ok((out, if_))
             }
@@ -4946,6 +10276,7 @@ impl WgpuDevice {
                     &[&a, &*w_buf, &out],
                     ((num_specs * in_d) as u32).div_ceil(256),
                 );
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
                 Ok((out, in_d))
             }
@@ -4981,6 +10312,7 @@ impl WgpuDevice {
                     &[&a, &ls_buf, &us_buf, &out],
                     ((num_specs * nn) as u32).div_ceil(256),
                 );
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
                 relu_caps.push(JointReluCap { a_pre: a, nn });
                 Ok((out, nn))
@@ -4999,10 +10331,13 @@ impl WgpuDevice {
         x: &wgpu::Buffer,
         y: &wgpu::Buffer,
         n: usize,
-    ) -> wgpu::Buffer {
+        deadline: Option<std::time::Instant>,
+    ) -> Result<wgpu::Buffer> {
+        Self::poll_joint_alpha_deadline(deadline)?;
+        let n_u32 = resident_checked_u32(n, "joint add elements")?;
         let out = self.joint_buf(n);
         let params = self.joint_uniform(&JointU4 {
-            a: n as u32,
+            a: n_u32,
             b: 0,
             c: 0,
             d: 0,
@@ -5017,10 +10352,11 @@ impl WgpuDevice {
             &jp.add,
             &params,
             &[x, y, &out],
-            (n as u32).div_ceil(256),
+            n_u32.div_ceil(256),
         );
+        Self::poll_joint_alpha_deadline(deadline)?;
         self.queue.submit(Some(enc.finish()));
-        out
+        Ok(out)
     }
 
     /// Adjoint over segments walked in REVERSE (input→output, design doc §2).
@@ -5038,9 +10374,11 @@ impl WgpuDevice {
         bias_channel: bool,
         adj_depth: Option<usize>,
         harvested: &mut usize,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(wgpu::Buffer, usize)> {
         let mut cur_dim = dim;
         for seg in segments.iter().rev() {
+            Self::poll_joint_alpha_deadline(deadline)?;
             let (na, nd) = self.joint_adj_segment(
                 jp,
                 seg,
@@ -5053,6 +10391,7 @@ impl WgpuDevice {
                 bias_channel,
                 adj_depth,
                 harvested,
+                deadline,
             )?;
             abar = na;
             cur_dim = nd;
@@ -5074,7 +10413,9 @@ impl WgpuDevice {
         bias_channel: bool,
         adj_depth: Option<usize>,
         harvested: &mut usize,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(wgpu::Buffer, usize)> {
+        Self::poll_joint_alpha_deadline(deadline)?;
         match seg {
             GpuResnetSegment::Chain(layers) => self.joint_adj_chain(
                 jp,
@@ -5088,6 +10429,7 @@ impl WgpuDevice {
                 bias_channel,
                 adj_depth,
                 harvested,
+                deadline,
             ),
             GpuResnetSegment::Residual(f) => {
                 // Ā_out = Ā_in + adjoint_F(Ā_in) (skip fan-out).
@@ -5104,11 +10446,16 @@ impl WgpuDevice {
                     bias_channel,
                     adj_depth,
                     harvested,
+                    deadline,
                 )?;
                 if dim_f != dim {
                     return Err(NyError::shape_mismatch(vec![dim], vec![dim_f]));
                 }
-                let out = self.joint_add(jp, &abar, &abar_f, num_specs * dim);
+                let merge_elems = resident_checked_product(
+                    &[num_specs, dim],
+                    "joint adjoint residual merge elements",
+                )?;
+                let out = self.joint_add(jp, &abar, &abar_f, merge_elems, deadline)?;
                 Ok((out, dim))
             }
             GpuResnetSegment::ResidualProj(f, p) => {
@@ -5126,6 +10473,7 @@ impl WgpuDevice {
                     bias_channel,
                     adj_depth,
                     harvested,
+                    deadline,
                 )?;
                 let (abar_f, dim_f) = self.joint_adj_chain(
                     jp,
@@ -5139,11 +10487,16 @@ impl WgpuDevice {
                     bias_channel,
                     adj_depth,
                     harvested,
+                    deadline,
                 )?;
                 if dim_f != dim_p {
                     return Err(NyError::shape_mismatch(vec![dim_f], vec![dim_p]));
                 }
-                let out = self.joint_add(jp, &abar_f, &abar_p, num_specs * dim_f);
+                let merge_elems = resident_checked_product(
+                    &[num_specs, dim_f],
+                    "joint adjoint projection merge elements",
+                )?;
+                let out = self.joint_add(jp, &abar_f, &abar_p, merge_elems, deadline)?;
                 Ok((out, dim_f))
             }
         }
@@ -5163,9 +10516,11 @@ impl WgpuDevice {
         bias_channel: bool,
         adj_depth: Option<usize>,
         harvested: &mut usize,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(wgpu::Buffer, usize)> {
         let mut cur_dim = dim;
         for layer in layers.iter().rev() {
+            Self::poll_joint_alpha_deadline(deadline)?;
             let (na, nd) = self.joint_adj_layer(
                 jp,
                 layer,
@@ -5178,6 +10533,7 @@ impl WgpuDevice {
                 bias_channel,
                 adj_depth,
                 harvested,
+                deadline,
             )?;
             abar = na;
             cur_dim = nd;
@@ -5199,13 +10555,16 @@ impl WgpuDevice {
         bias_channel: bool,
         adj_depth: Option<usize>,
         harvested: &mut usize,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(wgpu::Buffer, usize)> {
+        Self::poll_joint_alpha_deadline(deadline)?;
         match layer {
             GpuCrownLayer::Linear {
                 weight,
                 bias,
                 out_features,
                 in_features,
+                ..
             } => {
                 // Ā_out[s,i] = Σ_j Ā_in[s,j]·W[i,j] + bias[i]  (Ā_in dim = in_features).
                 let dof = *out_features;
@@ -5241,6 +10600,7 @@ impl WgpuDevice {
                 self.pass_gemm(
                     &mut enc, pipe, &gparams, &abar, &wt_buf, &tmp, disp.wg_x, disp.wg_y,
                 );
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
                 // + bias[i] (the bias channel) when present and enabled.
                 match (bias_channel, bias) {
@@ -5266,6 +10626,7 @@ impl WgpuDevice {
                             &[&tmp, &*b_buf, &out],
                             ((num_specs * dof) as u32).div_ceil(256),
                         );
+                        Self::poll_joint_alpha_deadline(deadline)?;
                         self.queue.submit(Some(e2.finish()));
                         Ok((out, dof))
                     }
@@ -5287,6 +10648,7 @@ impl WgpuDevice {
                 out_w,
                 in_h,
                 in_w,
+                ..
             } => {
                 // Ā_in dim = ic*ih*iw (incoming abar); Ā_out dim = oc*oh*ow.
                 let (oc, ic, kh, kw) = (*out_channels, *in_channels, *kernel_h, *kernel_w);
@@ -5334,6 +10696,7 @@ impl WgpuDevice {
                     &[&abar, &*w_buf, &*b_buf, &out],
                     ((num_specs * out_d) as u32).div_ceil(256),
                 );
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
                 Ok((out, out_d))
             }
@@ -5377,6 +10740,7 @@ impl WgpuDevice {
                         &[&abar, &rec.a_pre, &grads[*cursor].0],
                         (nn as u32).div_ceil(256),
                     );
+                    Self::poll_joint_alpha_deadline(deadline)?;
                     self.queue.submit(Some(enc.finish()));
                     *harvested += 1;
                 }
@@ -5404,6 +10768,7 @@ impl WgpuDevice {
                     &[&abar, &rec.a_pre, &ls, &us, &li, &ui, &out],
                     ((num_specs * nn) as u32).div_ceil(256),
                 );
+                Self::poll_joint_alpha_deadline(deadline)?;
                 self.queue.submit(Some(enc.finish()));
                 Ok((out, nn))
             }
@@ -5415,7 +10780,9 @@ impl WgpuDevice {
 
     /// Borrow the ON-DEVICE joint α-gradient adjoint pipelines, compiling them once
     /// on first use (under the `gpu_serialize` lock) and caching them on the device.
-    fn joint_adjoint_pipelines(&self) -> &super::super::JointAdjointPipelines {
+    pub(in crate::wgpu_device) fn joint_adjoint_pipelines(
+        &self,
+    ) -> &super::super::JointAdjointPipelines {
         self.joint_adjoint_pipelines.get_or_init(|| {
             use super::super::shaders as sh;
             super::super::JointAdjointPipelines {
@@ -5463,6 +10830,117 @@ impl WgpuDevice {
         })
     }
 
+    /// Reset rows injected at one intermediate boundary on the active resident
+    /// frontier. Queue writes are ordered after the just-submitted layer and
+    /// before the next submit/readback. Every arithmetic/error/taint lane is
+    /// overwritten, so work accumulated while a row was dormant is erased.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_intermediate_sweep_boundary(
+        &self,
+        boundary: usize,
+        dim: usize,
+        num_specs: usize,
+        la: &wgpu::Buffer,
+        ua: &wgpu::Buffer,
+        le: &wgpu::Buffer,
+        ue: &wgpu::Buffer,
+        blo: &wgpu::Buffer,
+        buo: &wgpu::Buffer,
+        ble: &wgpu::Buffer,
+        bue: &wgpu::Buffer,
+        taint: Option<&mut TaintWalkState>,
+    ) -> Result<()> {
+        let Some(scheduled) = super::intermediate_sweep::take_boundary(boundary, dim)? else {
+            return Ok(());
+        };
+        if scheduled.resets.is_empty() {
+            return Ok(());
+        }
+        let taint = taint.ok_or_else(|| {
+            NyError::UnsupportedOp(
+                "WGPU intermediate sweep requires the authoritative word-taint resident route"
+                    .into(),
+            )
+        })?;
+        let row_bytes = dim.checked_mul(size_of::<f32>()).ok_or_else(|| {
+            NyError::InvalidSpec("WGPU intermediate sweep reset row byte overflow".into())
+        })?;
+        let mut identity = vec![0.0f32; dim];
+        let zeros_f32 = vec![0.0f32; dim];
+        let zeros_u32 = vec![0u32; dim];
+        let zero_f32 = [0.0f32];
+        let zero_u32 = [0u32];
+        for (index, reset) in scheduled.resets.iter().enumerate() {
+            if index.is_multiple_of(256) && self.crown_backward_deadline_expired() {
+                return Err(NyError::DeadlineExceeded(
+                    "WGPU intermediate sweep deadline exceeded while injecting rows".into(),
+                ));
+            }
+            if reset.carrier_row >= num_specs || reset.coordinate >= dim {
+                return Err(NyError::InternalError(format!(
+                    "WGPU intermediate sweep reset ({}, {}) outside carrier ({num_specs}, {dim})",
+                    reset.carrier_row, reset.coordinate
+                )));
+            }
+            identity[reset.coordinate] = 1.0;
+            let coeff_offset = reset
+                .carrier_row
+                .checked_mul(row_bytes)
+                .and_then(|offset| u64::try_from(offset).ok())
+                .ok_or_else(|| {
+                    NyError::InvalidSpec(
+                        "WGPU intermediate sweep coefficient offset overflow".into(),
+                    )
+                })?;
+            let bias_offset = reset
+                .carrier_row
+                .checked_mul(size_of::<f32>())
+                .and_then(|offset| u64::try_from(offset).ok())
+                .ok_or_else(|| {
+                    NyError::InvalidSpec("WGPU intermediate sweep bias offset overflow".into())
+                })?;
+            self.queue
+                .write_buffer(la, coeff_offset, bytemuck::cast_slice(&identity));
+            self.queue
+                .write_buffer(ua, coeff_offset, bytemuck::cast_slice(&identity));
+            for buffer in [le, ue] {
+                self.queue
+                    .write_buffer(buffer, coeff_offset, bytemuck::cast_slice(&zeros_f32));
+            }
+            for buffer in [blo, buo, ble, bue] {
+                self.queue
+                    .write_buffer(buffer, bias_offset, bytemuck::cast_slice(&zero_f32));
+            }
+            // `ping` and the number of completed unary layers have identical
+            // parity, so boundary parity selects the active word frontier.
+            for buffer in [
+                &taint.wla[boundary % 2],
+                &taint.wua[boundary % 2],
+                &taint.wle[boundary % 2],
+                &taint.wue[boundary % 2],
+            ] {
+                self.queue
+                    .write_buffer(buffer, coeff_offset, bytemuck::cast_slice(&zeros_u32));
+            }
+            self.queue.write_buffer(
+                &taint.rows_dev,
+                bias_offset,
+                bytemuck::cast_slice(&zero_u32),
+            );
+            taint.rows[reset.carrier_row] = 0;
+            identity[reset.coordinate] = 0.0;
+            let bytes = dim
+                .checked_mul(8)
+                .and_then(|value| value.checked_add(5))
+                .and_then(|value| value.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| {
+                    NyError::InvalidSpec("WGPU intermediate sweep transfer byte overflow".into())
+                })?;
+            super::intermediate_sweep::note_host_to_device(bytes);
+        }
+        Ok(())
+    }
+
     /// Borrow the always-built resident-backward pipelines, compiling them once on
     /// first use and caching them on the device for every later segment/sub-chain.
     /// These are pure compiled shader programs (no numerical data), so reusing them
@@ -5473,6 +10951,10 @@ impl WgpuDevice {
     pub(in crate::wgpu_device) fn resident_backward_pipelines(
         &self,
     ) -> &super::super::ResidentBackwardPipelines {
+        // #u4: the widest twin (activation) needs 11 storage bindings; the
+        // GRANTED limit is 8 when NY_GPU_BIG_BINDINGS=0 (and on adapters that
+        // cap below 11). See the field docs on the struct.
+        let taint_twins_supported = self.device.limits().max_storage_buffers_per_shader_stage >= 11;
         self.resident_pipelines
             .get_or_init(|| super::super::ResidentBackwardPipelines {
                 abs: self.create_simple_pipeline(
@@ -5508,7 +10990,8 @@ impl WgpuDevice {
                 eft_min_combine: self.create_simple_pipeline(
                     super::super::shaders::CROWN_EFT_MIN_COMBINE_SHADER,
                     "eft_min_combine",
-                    &[false, false, false, false, true, false],
+                    // binding 7 (read) = s_prod, for the sentinel-stickiness guard.
+                    &[false, false, false, false, true, false, false],
                 ),
                 eft_col2im: self.create_simple_pipeline(
                     super::super::shaders::CONV_COL2IM_EFT_TWIN_SHADER,
@@ -5520,7 +11003,124 @@ impl WgpuDevice {
                     "seg_merge",
                     &[true, true, false, false],
                 ),
+                conv_reshape: self.create_simple_pipeline(
+                    super::super::shaders::CONV_RESHAPE_SHADER,
+                    "conv_reshape",
+                    &[false, true],
+                ),
+                conv_col2im: self.create_simple_pipeline(
+                    super::super::shaders::CONV_COL2IM_SHADER,
+                    "conv_col2im",
+                    &[false, true],
+                ),
+                conv_err: self.create_simple_pipeline(
+                    super::super::shaders::CROWN_CONV_ERROR_ROWMAX_SHADER,
+                    "conv_err",
+                    &[false, false, true],
+                ),
+                alpha_grad: self.create_simple_pipeline(
+                    super::super::shaders::CROWN_ALPHA_GRADIENT_SHADER,
+                    "crown_alpha_grad_capture",
+                    &[false, false, true],
+                ),
+                // #u4 taint twins (AUTO or explicit NY_GPU_TAINT_WORDS=1):
+                // rw-flag arrays copied verbatim from the probe authors — the GEMM/activation
+                // twins from `sentinel_taint_selfcheck::dual_chain_run`, the
+                // combine twin from `taint_chain.rs`, the min-combine consult
+                // twin from `eft_min_combine_taint_probe.rs`. Built ONLY when
+                // the granted limit can host the widest twin (act = 11 storage
+                // bindings): a BGL validation error here would poison the
+                // shared OnceCell cache and kill every gate-OFF walk too.
+                gemm_taint: taint_twins_supported.then(|| {
+                    // GEMM twin: a, b, out(rw), taint_a, taint_b, taint_out(rw).
+                    self.create_simple_pipeline(
+                        super::super::shaders::GEMM_F32_TAINT_SHADER,
+                        "gemm_f32_taint",
+                        &[false, false, true, false, false, true],
+                    )
+                }),
+                gemm_small_k_taint: taint_twins_supported.then(|| {
+                    // Exact-value twin of the large-M small-K schedule.
+                    self.create_simple_pipeline(
+                        super::super::shaders::GEMM_F32_SMALL_K_TAINT_SHADER,
+                        "gemm_f32_small_k_taint",
+                        &[false, false, true, false, false, true],
+                    )
+                }),
+                conv_reshape_taint: taint_twins_supported.then(|| {
+                    // src, dst(rw), source words, destination words(rw).
+                    self.create_simple_pipeline(
+                        super::super::shaders::CONV_RESHAPE_TAINT_SHADER,
+                        "conv_reshape_taint",
+                        &[false, true, false, true],
+                    )
+                }),
+                conv_col2im_taint: taint_twins_supported.then(|| {
+                    // GEMM values, dst(rw), GEMM words, destination words(rw).
+                    self.create_simple_pipeline(
+                        super::super::shaders::CONV_COL2IM_TAINT_SHADER,
+                        "conv_col2im_taint",
+                        &[false, true, false, true],
+                    )
+                }),
+                act_taint: taint_twins_supported.then(|| {
+                    // a_in, err_in, ls, us, a_out(rw), err_out(rw), beta,
+                    // ta_in, te_in, ta_out(rw), te_out(rw) — 11 storage.
+                    self.create_simple_pipeline(
+                        super::super::shaders::CROWN_ACTIVATION_RESIDENT_TAINT_SHADER,
+                        "act_resident_taint",
+                        &[
+                            false, false, false, false, true, true, false, false, false, true, true,
+                        ],
+                    )
+                }),
+                combine_taint: taint_twins_supported.then(|| {
+                    // s_prod, prop, err_out(rw), row_abs_a, taint_sprod_in,
+                    // taint_prop_in, taint_e_out(rw).
+                    self.create_simple_pipeline(
+                        super::super::shaders::CROWN_AW_ERROR_COMBINE_TAINT_SHADER,
+                        "aw_err_combine_taint",
+                        &[false, false, true, false, false, false, true],
+                    )
+                }),
+                eft_min_combine_taint: taint_twins_supported.then(|| {
+                    // Audit C2: v_twin, r_in, value, prop, err_out(rw),
+                    // row_abs_a, s_prod, taint_s, taint_p — no taint output
+                    // binding (its refusal is in-shader).
+                    self.create_simple_pipeline(
+                        super::super::shaders::CROWN_EFT_MIN_COMBINE_TAINT_SHADER,
+                        "eft_min_combine_taint",
+                        &[false, false, false, false, true, false, false, false, false],
+                    )
+                }),
+                // #u4 on-device word transport: 3 storage bindings, so built
+                // unconditionally (see the field docs) and dispatched only
+                // under the gate. The source-level G13 reseed stays dormant and
+                // unbuilt: internal Conv births are captured at the exact op.
+                // `rows_out` is `array<atomic<u32>>` in WGSL; atomics need
+                // `read_write`, hence the single `true`.
+                taint_row_or: self.create_simple_pipeline(
+                    // words, partner, rows_out(rw, atomic).
+                    super::super::shaders::TAINT_ROW_OR_SHADER,
+                    "taint_row_or",
+                    &[false, false, true],
+                ),
             })
+    }
+
+    /// Lazily build the dense strided-gather kernel only when a caller actually
+    /// requests more than [`LEGACY_BETA_GATHER_MAX_COPIES`] values. Bound-only
+    /// CROWN and the established small β-gather lane never compile or dispatch it.
+    pub(in crate::wgpu_device) fn resident_strided_gather_pipeline(
+        &self,
+    ) -> &(wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        self.resident_gather_pipeline.get_or_init(|| {
+            self.create_simple_pipeline(
+                super::super::shaders::CROWN_STRIDED_GATHER_SHADER,
+                "crown_strided_gather",
+                &[false, false, true],
+            )
+        })
     }
 
     /// Create a compute pipeline from WGSL with binding 0 = uniform params and
@@ -5534,12 +11134,12 @@ impl WgpuDevice {
         label: &str,
         rw: &[bool],
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
-            });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            &self.device,
+            self.denorm_preserve_enabled(),
+            label,
+            src,
+        );
         let mut entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -5598,6 +11198,7 @@ impl WgpuDevice {
         storage: &[&wgpu::Buffer],
         workgroups_x: u32,
     ) {
+        super::intermediate_sweep::note_dispatches(1);
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: params.as_entire_binding(),
@@ -5632,6 +11233,7 @@ impl WgpuDevice {
         dst: &wgpu::Buffer,
         data: &[u8],
     ) -> Result<()> {
+        super::intermediate_sweep::note_host_to_device(data.len());
         match arena {
             Some(a) => a.upload(encoder, dst, data),
             None => {
@@ -5652,6 +11254,7 @@ impl WgpuDevice {
         workgroups_x: u32,
         workgroups_y: u32,
     ) {
+        super::intermediate_sweep::note_dispatches(1);
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: params.as_entire_binding(),
@@ -5690,6 +11293,7 @@ impl WgpuDevice {
         wg_x: u32,
         wg_y: u32,
     ) {
+        super::intermediate_sweep::note_dispatches(1);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("res_gemm_bg"),
             layout: &self.gemm_f32_bind_group_layout,
@@ -5729,10 +11333,10 @@ impl WgpuDevice {
 #[cfg(test)]
 mod stem_fold_rounding_tests {
     use super::{
-        fold_add_lower_bias_outward, fold_add_lower_coeff_outward,
-        resident_cut_fold_valid_for_activation,
+        fold_add_lower_bias_outward, fold_add_lower_coeff_outward, merge_streams,
+        resident_cut_fold_valid_for_activation, ResidentCoeff,
     };
-    use ny_core::resident_cut_fold::ResidentCutFold;
+    use ny_core::{f32_to_f64_exact, resident_cut_fold::ResidentCutFold};
 
     fn fold(
         coeffs: Vec<(u32, f32)>,
@@ -5830,17 +11434,1663 @@ mod stem_fold_rounding_tests {
         // Final concretization form `b - b_err` never exceeds the exact bias.
         assert!(f64::from(b) - f64::from(b_err) <= exact);
     }
+
+    #[test]
+    fn stream_merge_charges_a_subnormal_publication_gap() {
+        let tiny = f32::from_bits(1);
+        let make = || ResidentCoeff {
+            lower_a: vec![tiny],
+            upper_a: vec![tiny],
+            lower_err: vec![0.0],
+            upper_err: vec![0.0],
+            lower_b: vec![tiny],
+            upper_b: vec![tiny],
+            lower_b_err: vec![0.0],
+            upper_b_err: vec![0.0],
+            dim: 1,
+            relu_grads: Vec::new(),
+            beta_gather: Vec::new(),
+            taint_rows: None,
+        };
+        let exact = 2.0 * f32_to_f64_exact(tiny);
+        let merged = merge_streams(make(), &make());
+        for (center, error) in [
+            (merged.lower_a[0], merged.lower_err[0]),
+            (merged.upper_a[0], merged.upper_err[0]),
+            (merged.lower_b[0], merged.lower_b_err[0]),
+            (merged.upper_b[0], merged.upper_b_err[0]),
+        ] {
+            let center = f32_to_f64_exact(center);
+            let error = f32_to_f64_exact(error);
+            assert!(center - error <= exact && exact <= center + error);
+        }
+    }
+}
+
+#[cfg(test)]
+mod joint_deadline_scheduler_tests {
+    use super::WgpuDevice;
+    use ny_core::{NyError, Result};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn deadline_crossed_inside_scripted_unit_leaves_tail_unexecuted() {
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let mut executed = Vec::new();
+        let result: Result<()> = (|| {
+            for unit in 0..4 {
+                WgpuDevice::run_joint_alpha_deadline_unit(Some(deadline), || {
+                    executed.push(unit);
+                    if unit == 0 {
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })();
+
+        assert!(
+            matches!(result, Err(NyError::DeadlineExceeded(_))),
+            "the scripted scheduler must return the cooperative deadline error"
+        );
+        assert_eq!(
+            executed,
+            vec![0],
+            "units 1..3 are the unexecuted joint-adjoint tail"
+        );
+    }
+}
+
+// CPU-only unit tests for the #u4 concretize-error taint companion (no GPU
+// device required): annihilation on an exactly-zero fab partner, OR
+// accumulation into a pre-set bias word, the HOLE-4 per-domain fab block
+// addressing cross-checked against the REAL value fold, and the mirrored
+// no-op refusals.
+/// #cert-err — the host-side arithmetic pins for the certified weight-error
+/// charge. These need no GPU: they pin the exact uniform substitutions the walk
+/// performs, which is where the whole soundness argument lives.
+#[cfg(test)]
+mod cert_err_charge_tests {
+    use super::{
+        cert_bias_charge_required, cert_bias_charge_slack, cert_charged_slack, combine_slack_f32,
+        gamma_k_f32,
+    };
+    use ny_core::{CertifiedWeightError, GpuCrownLayer};
+    use std::sync::Arc;
+
+    const U: f64 = 5.960_464_477_539_063e-8; // 2^-24, the binary32 unit roundoff
+
+    fn linear(cert_err: CertifiedWeightError) -> GpuCrownLayer {
+        GpuCrownLayer::Linear {
+            weight: Arc::from(vec![1.0f32, 0.0, 0.0, 1.0]),
+            bias: Some(Arc::from(vec![0.0f32, 0.0])),
+            out_features: 2,
+            in_features: 2,
+            cert_err,
+        }
+    }
+
+    fn conv(cert_err: CertifiedWeightError) -> GpuCrownLayer {
+        GpuCrownLayer::Conv2d {
+            weight_col: Arc::from(vec![1.0f32]),
+            bias_expanded: None,
+            out_channels: 1,
+            in_channels: 1,
+            kernel_h: 1,
+            kernel_w: 1,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            out_h: 1,
+            out_w: 1,
+            in_h: 1,
+            in_w: 1,
+            cert_err,
+        }
+    }
+
+    /// THE NON-BREAKING PIN. Every pre-`cert_err` caller constructs the default
+    /// (all-zero) declaration, and this asserts that such a walk substitutes
+    /// BIT-IDENTICAL uniforms and allocates/dispatches no charge at all — i.e.
+    /// the walk is byte-identical to the build before `cert_err` existed.
+    #[test]
+    fn zero_cert_err_charges_are_byte_identical() {
+        let exact = CertifiedWeightError::default();
+        assert_eq!(exact, CertifiedWeightError::EXACT);
+        assert!(exact.is_exact() && exact.is_valid());
+
+        for k in [1usize, 2, 7, 64, 512, 4096, 100_000] {
+            let gamma = gamma_k_f32(k).expect("finite gamma");
+            let slack = combine_slack_f32(k).expect("finite slack");
+            let charged_gamma = exact.charged_gamma(gamma);
+            assert_eq!(
+                charged_gamma.to_bits(),
+                gamma.to_bits(),
+                "k={k}: zero cert_err must leave gamma_k bit-identical"
+            );
+            let charged_slack = cert_charged_slack(slack, exact, 0).expect("finite charged slack");
+            assert_eq!(
+                charged_slack.to_bits(),
+                slack.to_bits(),
+                "k={k}: zero cert_err must leave the combine slack bit-identical"
+            );
+        }
+
+        // `-0.0` is still exact, and no charge buffers are demanded.
+        let neg_zero = CertifiedWeightError {
+            weight_rel_err: -0.0,
+            bias_abs_err: -0.0,
+        };
+        assert!(neg_zero.is_exact());
+        assert!(!cert_bias_charge_required(&[
+            linear(CertifiedWeightError::default()),
+            conv(neg_zero),
+        ]));
+    }
+
+    /// A declared error must move the charge STRICTLY OUTWARD, and by at least
+    /// the mathematically required `gamma + w` (the derivation in
+    /// `CertifiedWeightError::charged_gamma`).
+    #[test]
+    fn nonzero_cert_err_charge_is_strictly_outward() {
+        for k in [1usize, 64, 4096] {
+            let gamma = gamma_k_f32(k).expect("finite gamma");
+            let slack = combine_slack_f32(k).expect("finite slack");
+            for w in [1e-7f32, 1e-5, 1e-3, 0.25] {
+                let cert_err = CertifiedWeightError {
+                    weight_rel_err: w,
+                    bias_abs_err: 0.0,
+                };
+                let g = cert_err.charged_gamma(gamma);
+                assert!(g > gamma, "k={k} w={w}: charge must widen gamma");
+                assert!(
+                    f64::from(g) >= f64::from(gamma) + f64::from(w),
+                    "k={k} w={w}: charged gamma {g:e} must dominate gamma + w"
+                );
+                let charged = cert_charged_slack(slack, cert_err, 0).expect("finite");
+                assert!(
+                    f64::from(charged) >= f64::from(slack) * (1.0 + f64::from(w)),
+                    "k={k} w={w}: charged slack must dominate slack*(1+w) — the \
+                     (1+w) factor is what covers the PROPAGATED error term"
+                );
+                assert!(charged > slack, "k={k} w={w}: charge must widen the slack");
+            }
+        }
+    }
+
+    /// A meaningless declaration must saturate to `+inf` (a refusal) rather
+    /// than wrap to some finite, under-charging factor.
+    #[test]
+    fn invalid_cert_err_saturates_and_refuses() {
+        let gamma = gamma_k_f32(64).expect("finite gamma");
+        for bad in [
+            CertifiedWeightError {
+                weight_rel_err: f32::NAN,
+                bias_abs_err: 0.0,
+            },
+            CertifiedWeightError {
+                weight_rel_err: f32::INFINITY,
+                bias_abs_err: 0.0,
+            },
+            CertifiedWeightError {
+                weight_rel_err: -1e-6,
+                bias_abs_err: 0.0,
+            },
+            CertifiedWeightError {
+                weight_rel_err: 0.0,
+                bias_abs_err: f32::NAN,
+            },
+        ] {
+            assert!(!bad.is_valid(), "{bad:?} must be rejected as a declaration");
+            assert_eq!(
+                bad.charged_gamma(gamma),
+                f32::INFINITY,
+                "{bad:?} must saturate outward"
+            );
+            assert!(
+                cert_charged_slack(1.0, bad, 0).is_err(),
+                "{bad:?} must refuse a charged slack"
+            );
+        }
+        assert!(
+            CertifiedWeightError::default()
+                .charged_gamma(f32::NAN)
+                .is_infinite(),
+            "a non-finite base gamma must saturate too"
+        );
+    }
+
+    /// The extra bias dispatch runs with `gamma_k = 1`, so its `slack` is the
+    /// ONLY thing recovering the two f32 reductions' undercount. Pin that it
+    /// dominates the `1/(1 - gamma_{k+1})` the derivation demands.
+    #[test]
+    fn cert_bias_charge_slack_dominates_the_reduction_undercount() {
+        for k in [1usize, 2, 33, 1024, 65_536] {
+            let slack = f64::from(cert_bias_charge_slack(k).expect("finite bias charge slack"));
+            let terms = (k + 1) as f64;
+            let gamma_next = terms * U / (1.0 - terms * U);
+            let required = 1.0 / (1.0 - gamma_next);
+            assert!(
+                slack >= required,
+                "k={k}: bias charge slack {slack:.17e} must dominate {required:.17e}"
+            );
+            assert!(slack >= 1.0, "k={k}: slack must never shrink a radius");
+        }
+        // Reduction lengths whose gamma has no finite recovery fail closed.
+        assert!(cert_bias_charge_slack(usize::MAX).is_err());
+    }
+
+    /// `cert_bias_charge_required` is the allocation trigger: it must fire on a
+    /// nonzero `bias_abs_err` in EITHER variant, and only then.
+    #[test]
+    fn bias_charge_trigger_tracks_the_declaration() {
+        let with_bias_err = CertifiedWeightError {
+            weight_rel_err: 0.0,
+            bias_abs_err: 1e-6,
+        };
+        let weight_only = CertifiedWeightError {
+            weight_rel_err: 1e-6,
+            bias_abs_err: 0.0,
+        };
+        assert!(cert_bias_charge_required(&[linear(with_bias_err)]));
+        assert!(cert_bias_charge_required(&[conv(with_bias_err)]));
+        assert!(!cert_bias_charge_required(&[
+            linear(weight_only),
+            conv(weight_only)
+        ]));
+        assert!(!cert_bias_charge_required(&[]));
+    }
+}
+
+#[cfg(test)]
+mod concretize_error_taint_tests {
+    use super::{ResidentCoeff, WgpuDevice};
+
+    /// `fab == 0.0` (either sign of zero) is a proven exactly-zero
+    /// pre-activation: the err-taint word must annihilate instead of reaching
+    /// the bias word (canon: `R·0 == 0`).
+    #[test]
+    fn exactly_zero_fab_annihilates_err_taint() {
+        let err_taint = vec![0xdead_beef_u32, 0x1, 0x2];
+        let fab = vec![0.0f32, -0.0, 0.0];
+        let mut bias_taint = vec![0u32];
+        WgpuDevice::concretize_error_taint_into_bias(&err_taint, &fab, &mut bias_taint, 1, 1, 3);
+        assert_eq!(bias_taint, vec![0], "exact-zero partners must annihilate");
+    }
+
+    /// A nonzero fab partner carries the word, and the fold ORs INTO the
+    /// existing bias word (words are provenance bits — accumulated, never
+    /// overwritten).
+    #[test]
+    fn nonzero_fab_ors_words_and_accumulates() {
+        let err_taint = vec![0x4u32, 0x0, 0x10];
+        let fab = vec![1.5f32, 2.0, 0.25];
+        let mut bias_taint = vec![0x1u32];
+        WgpuDevice::concretize_error_taint_into_bias(&err_taint, &fab, &mut bias_taint, 1, 1, 3);
+        assert_eq!(bias_taint, vec![0x1 | 0x4 | 0x10]);
+    }
+
+    /// HOLE-4 indexing, cross-checked against the REAL fold on the same
+    /// inputs: 2 spec rows in 2 one-row domains, `d = 3`, `fab` = 2 stacked
+    /// per-domain blocks. With every err element `1.0` and a unique word per
+    /// element, the value fold's per-spec bias err (≈ Σ of ITS domain's
+    /// nonzero fab entries) pins exactly which partners contributed — the
+    /// companion's word must be the OR of exactly those elements' bits.
+    /// Sharing domain 0's block across domain 1's rows (the under-count HOLE 4
+    /// forbids) would show up here as bit 3 leaking into spec row 1.
+    #[test]
+    fn per_domain_fab_block_addressing_matches_real_fold() {
+        let (num_specs, per_dom, d) = (2usize, 1usize, 3usize);
+        // dom 0 block: [1.0, 0.0, 2.0] — dom 1 block: [0.0, 4.0, 0.5].
+        let fab = vec![1.0f32, 0.0, 2.0, 0.0, 4.0, 0.5];
+        let err_taint: Vec<u32> = (0..num_specs * d).map(|i| 1u32 << i).collect();
+
+        // Real fold on the same shape: err = 1.0 everywhere, so each spec row's
+        // bias err is (up to outward rounding) the sum of ITS fab block.
+        let mut coeff = ResidentCoeff {
+            lower_a: vec![0.0; num_specs * d],
+            upper_a: vec![0.0; num_specs * d],
+            lower_err: vec![1.0; num_specs * d],
+            upper_err: vec![1.0; num_specs * d],
+            lower_b: vec![0.0; num_specs],
+            upper_b: vec![0.0; num_specs],
+            lower_b_err: vec![0.0; num_specs],
+            upper_b_err: vec![0.0; num_specs],
+            taint_rows: None,
+            dim: d,
+            relu_grads: Vec::new(),
+            beta_gather: Vec::new(),
+        };
+        WgpuDevice::concretize_error_into_bias(&mut coeff, num_specs, per_dom, &fab);
+        // Spec 0 folded against dom 0 (1.0 + 0.0 + 2.0), spec 1 against dom 1
+        // (0.0 + 4.0 + 0.5) — proving which partner each element multiplied.
+        assert!((f64::from(coeff.lower_b_err[0]) - 3.0).abs() < 1e-5);
+        assert!((f64::from(coeff.lower_b_err[1]) - 4.5).abs() < 1e-5);
+        assert!(coeff.lower_err.iter().all(|&e| e == 0.0), "err reset to 0");
+
+        let mut bias_taint = vec![0x100u32, 0x200];
+        WgpuDevice::concretize_error_taint_into_bias(
+            &err_taint,
+            &fab,
+            &mut bias_taint,
+            num_specs,
+            per_dom,
+            d,
+        );
+        // Spec 0: elements 0 (fab 1.0) and 2 (fab 2.0) survive; element 1
+        // annihilates (fab 0.0). Spec 1: elements 4 and 5 survive; element 3
+        // annihilates against DOMAIN 1's fab[3] = 0.0 — bit 3 present would
+        // mean the companion consulted domain 0's (nonzero) block.
+        assert_eq!(bias_taint[0], 0x100 | (1 << 0) | (1 << 2));
+        assert_eq!(bias_taint[1], 0x200 | (1 << 4) | (1 << 5));
+    }
+
+    /// The companion mirrors the real fold's no-op refusals exactly: malformed
+    /// fab (NaN / +inf / negative), shape mismatch, and a degenerate domain
+    /// partition all leave the bias words untouched (in those cases the real
+    /// fold leaves the per-coefficient err unzeroed, so the err-taint words
+    /// stay live beside it — nothing is laundered).
+    #[test]
+    fn mirrors_real_fold_no_op_refusals() {
+        let err_taint = vec![0xfu32, 0xf, 0xf];
+        let cases: [(&[f32], usize, usize, usize); 6] = [
+            (&[f32::NAN, 1.0, 1.0], 1, 1, 3),      // NaN fab
+            (&[f32::INFINITY, 1.0, 1.0], 1, 1, 3), // +inf fab
+            (&[-1.0, 1.0, 1.0], 1, 1, 3),          // negative fab
+            (&[1.0, 1.0], 1, 1, 3),                // fab length mismatch
+            (&[1.0, 1.0, 1.0], 1, 0, 3),           // zero-row domains
+            // fab fits 2 domains × d=3, but err_taint (len 3) ≠ num_specs·d = 6.
+            (&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 2, 1, 3),
+        ];
+        for (fab, num_specs, per_dom, d) in cases {
+            let mut bias_taint = vec![0u32; num_specs];
+            WgpuDevice::concretize_error_taint_into_bias(
+                &err_taint,
+                fab,
+                &mut bias_taint,
+                num_specs,
+                per_dom,
+                d,
+            );
+            assert!(
+                bias_taint.iter().all(|&w| w == 0),
+                "refusal case ({fab:?}, {num_specs}, {per_dom}, {d}) must no-op"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
     use super::*;
-    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+    use crate::wgpu_device::test_support::{
+        gpu_test_serial_guard, require_device, require_verdict_device,
+    };
     // Blessed env-mutation choke point (clippy env wall): all env writes in
     // these tests are ScopedEnvVar guards, serialized by gpu_test_serial_guard.
     use ny_core::{GpuCrownBackward, GpuCrownLayer, GpuResnetBatchedDomainRef};
     use ny_test_utils::env::ScopedEnvVar;
     use std::sync::Arc;
+    use wgpu::util::DeviceExt;
+
+    /// Concretize a raw, explicitly unworded coefficient frontier for arithmetic
+    /// tests only. This is not a verdict seam: it uses directed host arithmetic
+    /// and requires the frontier to carry no C1 receipt. Production callers must
+    /// use `concretize_resident_coeff`, whose armed consult rejects this frontier.
+    fn concretize_unworded_test_frontier(
+        coeff: &ResidentCoeff,
+        num_specs: usize,
+        num_specs_per_dom: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        assert!(
+            coeff.taint_rows.is_none(),
+            "unworded arithmetic helper must never consume a C1 receipt"
+        );
+        assert!(num_specs_per_dom > 0);
+        assert!(num_specs.is_multiple_of(num_specs_per_dom));
+        let n_domains = num_specs / num_specs_per_dom;
+        assert_eq!(input_lower.len(), n_domains * coeff.dim);
+        assert_eq!(input_upper.len(), n_domains * coeff.dim);
+        for field in [
+            &coeff.lower_a,
+            &coeff.upper_a,
+            &coeff.lower_err,
+            &coeff.upper_err,
+        ] {
+            assert_eq!(field.len(), num_specs * coeff.dim);
+        }
+        for field in [
+            &coeff.lower_b,
+            &coeff.upper_b,
+            &coeff.lower_b_err,
+            &coeff.upper_b_err,
+        ] {
+            assert_eq!(field.len(), num_specs);
+        }
+
+        let next_down = |x: f64| -next_up_f64(-x);
+        let mut lower = Vec::with_capacity(num_specs);
+        let mut upper = Vec::with_capacity(num_specs);
+        for s in 0..num_specs {
+            let dom = s / num_specs_per_dom;
+            let xbase = dom * coeff.dim;
+            let abase = s * coeff.dim;
+            let mut lo = next_down(
+                f32_to_f64_exact(coeff.lower_b[s]) - f32_to_f64_exact(coeff.lower_b_err[s]),
+            );
+            let mut hi = next_up_f64(
+                f32_to_f64_exact(coeff.upper_b[s]) + f32_to_f64_exact(coeff.upper_b_err[s]),
+            );
+            for j in 0..coeff.dim {
+                let xl = f32_to_f64_exact(input_lower[xbase + j]);
+                let xu = f32_to_f64_exact(input_upper[xbase + j]);
+                let la = f32_to_f64_exact(coeff.lower_a[abase + j]);
+                let le = f32_to_f64_exact(coeff.lower_err[abase + j]);
+                let ua = f32_to_f64_exact(coeff.upper_a[abase + j]);
+                let ue = f32_to_f64_exact(coeff.upper_err[abase + j]);
+                let lprod = [
+                    (la - le) * xl,
+                    (la - le) * xu,
+                    (la + le) * xl,
+                    (la + le) * xu,
+                ]
+                .into_iter()
+                .fold(f64::INFINITY, f64::min);
+                let uprod = [
+                    (ua - ue) * xl,
+                    (ua - ue) * xu,
+                    (ua + ue) * xl,
+                    (ua + ue) * xu,
+                ]
+                .into_iter()
+                .fold(f64::NEG_INFINITY, f64::max);
+                lo = next_down(lo + lprod);
+                hi = next_up_f64(hi + uprod);
+            }
+            lower.push(down_f32(lo));
+            upper.push(up_f32(hi));
+        }
+        (lower, upper)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unworded_resident_test_bounds(
+        device: &WgpuDevice,
+        layers: &[GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        output_dim: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let zero_bias = vec![0.0; num_specs];
+        let coeff = device.crown_backward_sound_resident_coeff_seeded(
+            layers, spec, spec, &zero_bias, &zero_bias, num_specs, output_dim,
+        )?;
+        Ok(concretize_unworded_test_frontier(
+            &coeff,
+            num_specs,
+            num_specs,
+            input_lower,
+            input_upper,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unworded_resident_test_chunked(
+        device: &WgpuDevice,
+        layers: &[GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        output_dim: usize,
+        chunk: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> Result<ny_core::GpuCrownResult> {
+        let mut lower_bounds = Vec::with_capacity(num_specs);
+        let mut upper_bounds = Vec::with_capacity(num_specs);
+        let mut start = 0;
+        while start < num_specs {
+            let end = (start + chunk.max(1)).min(num_specs);
+            let (lo, hi) = unworded_resident_test_bounds(
+                device,
+                layers,
+                &spec[start * output_dim..end * output_dim],
+                end - start,
+                output_dim,
+                input_lower,
+                input_upper,
+            )?;
+            lower_bounds.extend(lo);
+            upper_bounds.extend(hi);
+            start = end;
+        }
+        Ok(ny_core::GpuCrownResult {
+            lower_bounds,
+            upper_bounds,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unworded_resnet_test_bounds(
+        device: &WgpuDevice,
+        segments: &[GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        beta_signed: &[Vec<f32>],
+        frontier_abs: &[Vec<f32>],
+        node_abs: &[Vec<f32>],
+    ) -> Result<ny_core::GpuCrownResult> {
+        let internal: Vec<ResnetSegment<'_>> = segments
+            .iter()
+            .map(|segment| match segment {
+                GpuResnetSegment::Chain(layers) => ResnetSegment::Chain(layers),
+                GpuResnetSegment::Residual(layers) => ResnetSegment::Residual(layers),
+                GpuResnetSegment::ResidualProj(branch, projection) => {
+                    ResnetSegment::ResidualProj(branch, projection)
+                }
+            })
+            .collect();
+        let beta_refs: Vec<&[f32]> = beta_signed.iter().map(Vec::as_slice).collect();
+        let frontier_refs: Vec<&[f32]> = frontier_abs.iter().map(Vec::as_slice).collect();
+        let node_refs: Vec<&[f32]> = node_abs.iter().map(Vec::as_slice).collect();
+        let (coeff, _grads, _gathers) = device.resnet_seeded_compose_coeff(
+            &internal,
+            &seed.lower_a,
+            &seed.upper_a,
+            &seed.lower_b,
+            &seed.upper_b,
+            seed.num_specs,
+            seed.num_specs,
+            seed.current_dim,
+            &[],
+            &beta_refs,
+            &[],
+            &frontier_refs,
+            false,
+            &node_refs,
+            false,
+        )?;
+        let (lower_bounds, upper_bounds) = concretize_unworded_test_frontier(
+            &coeff,
+            seed.num_specs,
+            seed.num_specs,
+            input_lower,
+            input_upper,
+        );
+        Ok(ny_core::GpuCrownResult {
+            lower_bounds,
+            upper_bounds,
+        })
+    }
+
+    #[test]
+    fn worded_conv_runtime_returns_clean_receipt() {
+        let _g = gpu_test_serial_guard();
+        let _words = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+        let _rowmax = ScopedEnvVar::unset("NY_CONV_ERR_ROWMAX");
+        let device = require_verdict_device();
+        let layers = [GpuCrownLayer::Conv2d {
+            weight_col: vec![1.0].into(),
+            bias_expanded: None,
+            out_channels: 1,
+            in_channels: 1,
+            kernel_h: 1,
+            kernel_w: 1,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            out_h: 1,
+            out_w: 1,
+            in_h: 1,
+            in_w: 1,
+            cert_err: Default::default(),
+        }];
+        let coeff = device
+            .crown_backward_sound_resident_coeff_seeded(
+                &layers,
+                &[1.0],
+                &[1.0],
+                &[0.0],
+                &[0.0],
+                1,
+                1,
+            )
+            .expect("the internally worded Conv route must be admitted");
+        assert_eq!(coeff.lower_a[0].to_bits(), 1.0f32.to_bits());
+        assert_eq!(coeff.upper_a[0].to_bits(), 1.0f32.to_bits());
+        assert_eq!(coeff.taint_rows, Some(vec![0]));
+    }
+
+    #[test]
+    fn worded_conv_gate_preserves_asymmetric_value_bits() {
+        let _g = gpu_test_serial_guard();
+        let _eft = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _rowmax = ScopedEnvVar::unset("NY_CONV_ERR_ROWMAX");
+        let device = require_verdict_device();
+        let layers = [GpuCrownLayer::Conv2d {
+            weight_col: vec![0.5, -0.25, 0.75, 0.125].into(),
+            bias_expanded: None,
+            out_channels: 2,
+            in_channels: 1,
+            kernel_h: 1,
+            kernel_w: 2,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            out_h: 1,
+            out_w: 2,
+            in_h: 1,
+            in_w: 3,
+            cert_err: Default::default(),
+        }];
+        let lower = [0.25, -0.5, 0.75, -1.0, -0.125, 0.375, -0.625, 0.875];
+        let upper = [0.5, -0.25, 1.0, -0.75, 0.125, 0.625, -0.375, 1.125];
+        let zeros = [0.0f32; 2];
+        let run = |gate: &str| {
+            let _words = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", gate);
+            device
+                .crown_backward_sound_resident_coeff_seeded(
+                    &layers, &lower, &upper, &zeros, &zeros, 2, 4,
+                )
+                .expect("asymmetric Conv word route")
+        };
+        let off = run("0");
+        let on = run("1");
+        for (lhs, rhs) in [
+            (&off.lower_a, &on.lower_a),
+            (&off.upper_a, &on.upper_a),
+            (&off.lower_err, &on.lower_err),
+            (&off.upper_err, &on.upper_err),
+            (&off.lower_b, &on.lower_b),
+            (&off.upper_b, &on.upper_b),
+            (&off.lower_b_err, &on.lower_b_err),
+            (&off.upper_b_err, &on.upper_b_err),
+        ] {
+            assert_eq!(
+                lhs.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                rhs.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(off.taint_rows, None);
+        assert_eq!(on.taint_rows, Some(vec![0, 0]));
+    }
+
+    #[test]
+    fn worded_conv_catches_gemm_saturation_cancelled_by_col2im() {
+        let _g = gpu_test_serial_guard();
+        let _words = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+        let _eft = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _rowmax = ScopedEnvVar::unset("NY_CONV_ERR_ROWMAX");
+        let device = require_verdict_device();
+        let layers = [GpuCrownLayer::Conv2d {
+            weight_col: vec![20.0, 20.0].into(),
+            bias_expanded: None,
+            out_channels: 1,
+            in_channels: 1,
+            kernel_h: 1,
+            kernel_w: 2,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            out_h: 1,
+            out_w: 2,
+            in_h: 1,
+            in_w: 3,
+            cert_err: Default::default(),
+        }];
+        // Neither seed is tainted. Each Conv GEMM output saturates, and the
+        // two contributions at input position 1 then cancel to exactly zero.
+        let coeff = device
+            .crown_backward_sound_resident_coeff_seeded(
+                &layers,
+                &[1.0e9, -1.0e9],
+                &[1.0e9, -1.0e9],
+                &[0.0],
+                &[0.0],
+                1,
+                2,
+            )
+            .expect("internally saturated Conv must complete with a tainted receipt");
+        assert_eq!(coeff.lower_a[1].to_bits(), 0.0f32.to_bits());
+        assert_eq!(coeff.upper_a[1].to_bits(), 0.0f32.to_bits());
+        assert_eq!(coeff.taint_rows, Some(vec![1]));
+    }
+
+    #[test]
+    fn small_k_taint_twin_matches_base_bits_and_carries_words() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+        let (m, k, n) = (3u32, 3u32, 2u32);
+        let params = GemmParams {
+            m,
+            k,
+            n,
+            _padding: 0,
+        };
+        let a = [1.25f32, -2.0, 0.5, -0.75, 4.0, 2.5, 3.0, -1.0, 0.25];
+        let b = [0.5f32, -1.0, 2.0, 0.25, -0.5, 3.0];
+        let ta = [0u32, 1, 0, 0, 0, 0, 0, 0, 0];
+        let tb = [0u32; 6];
+        let init = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| {
+            device
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytes,
+                    usage,
+                })
+        };
+        let pbuf = init(
+            "small_k_taint_params",
+            bytemuck::bytes_of(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let abuf = init(
+            "small_k_taint_a",
+            bytemuck::cast_slice(&a),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let bbuf = init(
+            "small_k_taint_b",
+            bytemuck::cast_slice(&b),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let tabuf = init(
+            "small_k_taint_wa",
+            bytemuck::cast_slice(&ta),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let tbbuf = init(
+            "small_k_taint_wb",
+            bytemuck::cast_slice(&tb),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let scratch = |label: &str| {
+            device.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: u64::from(m * n) * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let base = scratch("small_k_base_out");
+        let twin = scratch("small_k_twin_out");
+        let words = scratch("small_k_twin_words");
+        let stage = |label: &str| {
+            device.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: u64::from(m * n) * 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let base_stage = stage("small_k_base_stage");
+        let twin_stage = stage("small_k_twin_stage");
+        let word_stage = stage("small_k_word_stage");
+        let mut enc = device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("small_k_taint_test"),
+            });
+        device.pass_gemm(
+            &mut enc,
+            &device.gemm_f32_small_k_pipeline,
+            &pbuf,
+            &abuf,
+            &bbuf,
+            &base,
+            1,
+            1,
+        );
+        let pipe = device
+            .resident_backward_pipelines()
+            .gemm_small_k_taint
+            .as_ref()
+            .expect("gpu-tests require the word twin binding limit");
+        device.pass_simple_2d(
+            &mut enc,
+            pipe,
+            &pbuf,
+            &[&abuf, &bbuf, &twin, &tabuf, &tbbuf, &words],
+            1,
+            1,
+        );
+        let bytes = u64::from(m * n) * 4;
+        enc.copy_buffer_to_buffer(&base, 0, &base_stage, 0, bytes);
+        enc.copy_buffer_to_buffer(&twin, 0, &twin_stage, 0, bytes);
+        enc.copy_buffer_to_buffer(&words, 0, &word_stage, 0, bytes);
+        device.queue.submit(Some(enc.finish()));
+        let base_values = WgpuDevice::read_buffer(&device.device, &base_stage, (m * n) as usize)
+            .expect("read base small-K values");
+        let twin_values = WgpuDevice::read_buffer(&device.device, &twin_stage, (m * n) as usize)
+            .expect("read twin small-K values");
+        let twin_words = WgpuDevice::read_u32_buffer(&device.device, &word_stage, (m * n) as usize)
+            .expect("read small-K words");
+        assert_eq!(
+            base_values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            twin_values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(&twin_words[..2], &[1, 1]);
+        assert!(twin_words[2..].iter().all(|&word| word == 0));
+    }
+
+    /// Census-shape regression for the word channel: enabling it must preserve
+    /// every value bit and return an explicit clean receipt. Performance data
+    /// belongs in Criterion, not an ignored unit test.
+    #[test]
+    fn taint_gate_census_shape_preserves_values() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let mut state: u64 = 0x5EED_CAFE;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        // cifar100-head-ish: 100 spec rows over a width-512 stack, 6 blocks.
+        let (w, specs, blocks) = (512usize, 100usize, 6usize);
+        let mut layers: Vec<GpuCrownLayer> = Vec::new();
+        for _ in 0..blocks {
+            let wt: Vec<f32> = (0..w * w).map(|_| rng() * (1.0 / 22.6)).collect();
+            let b: Vec<f32> = (0..w).map(|_| rng() * 0.1).collect();
+            let ls: Vec<f32> = (0..w).map(|_| 0.25 + rng().abs() * 0.5).collect();
+            let li: Vec<f32> = (0..w).map(|_| rng() * 0.05).collect();
+            let ui: Vec<f32> = (0..w)
+                .map(|i| li[i].abs() + 0.02 + rng().abs() * 0.05)
+                .collect();
+            layers.push(GpuCrownLayer::Linear {
+                weight: Arc::from(wt.into_boxed_slice()),
+                bias: Some(Arc::from(b.into_boxed_slice())),
+                out_features: w,
+                in_features: w,
+                cert_err: Default::default(),
+            });
+            layers.push(GpuCrownLayer::Activation {
+                lower_slope: ls.clone(),
+                upper_slope: ls,
+                lower_intercept: li,
+                upper_intercept: ui,
+                num_neurons: w,
+            });
+        }
+        let mut spec = vec![0.0f32; specs * w];
+        for i in 0..specs {
+            spec[i * w + i] = 1.0;
+        }
+        let zb = vec![0.0f32; specs];
+        let run = || {
+            device
+                .crown_backward_sound_resident_coeff_seeded(
+                    &layers, &spec, &spec, &zb, &zb, specs, w,
+                )
+                .expect("resident walk")
+        };
+        let off = {
+            let _off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+            run()
+        };
+        let on = {
+            let _on = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+            run()
+        };
+        assert_eq!(off.lower_a.len(), on.lower_a.len());
+        assert!(off
+            .lower_a
+            .iter()
+            .zip(on.lower_a.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert!(
+            on.taint_rows
+                .as_deref()
+                .is_some_and(|rows| rows.iter().all(|&word| word == 0)),
+            "clean census walk must return an all-clean word receipt"
+        );
+    }
+
+    /// #u4 differential oracle: `NY_GPU_TAINT_WORDS` OFF vs ON is VALUE
+    /// bit-identical on a Linear→Activation→Linear walk (the taint twins
+    /// recompute the base arithmetic byte-for-byte — the walk-scale
+    /// counterpart of the probe-scale `random_wide_twin_drift_pin`; the
+    /// on-device transports write only `rows_dev` and the word buffers, never
+    /// a value buffer), the gate-off frontier carries NO words
+    /// (`taint_rows == None`, exactly today's behavior), and the gate-on
+    /// frontier's row words are ALL ZERO for clean inputs (the twins must
+    /// never invent taint).
+    ///
+    /// Env discipline: env vars are process-global and the GPU tests are
+    /// serialized by `gpu_test_serial_guard` — every ScopedEnvVar is created
+    /// INSIDE the guard's scope and dropped (restoring the var) before it.
+    #[test]
+    fn taint_walk_gate_off_is_bit_identical() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        // Determinism: the EFT lane must stay dark for both runs (the sibling
+        // C2 test arms the per-device EFT cache process-wide).
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let mut state: u64 = 0x00D4_71A7;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let (din, h, dout) = (7usize, 9usize, 4usize);
+        let w1: Vec<f32> = (0..h * din).map(|_| rng() * 0.7).collect();
+        let b1: Vec<f32> = (0..h).map(|_| rng() * 0.4).collect();
+        let w2: Vec<f32> = (0..dout * h).map(|_| rng() * 0.7).collect();
+        let b2: Vec<f32> = (0..dout).map(|_| rng() * 0.4).collect();
+        // Any valid relaxation works: this oracle compares the walk to itself.
+        let ls: Vec<f32> = (0..h).map(|_| 0.25 + rng().abs() * 0.5).collect();
+        let li: Vec<f32> = (0..h).map(|_| rng() * 0.1).collect();
+        let ui: Vec<f32> = (0..h)
+            .map(|i| li[i].abs() + 0.05 + rng().abs() * 0.1)
+            .collect();
+        let layers = vec![
+            GpuCrownLayer::Linear {
+                weight: Arc::from(w2.into_boxed_slice()),
+                bias: Some(Arc::from(b2.into_boxed_slice())),
+                out_features: dout,
+                in_features: h,
+                cert_err: Default::default(),
+            },
+            GpuCrownLayer::Activation {
+                lower_slope: ls.clone(),
+                upper_slope: ls,
+                lower_intercept: li,
+                upper_intercept: ui,
+                num_neurons: h,
+            },
+            GpuCrownLayer::Linear {
+                weight: Arc::from(w1.into_boxed_slice()),
+                bias: Some(Arc::from(b1.into_boxed_slice())),
+                out_features: h,
+                in_features: din,
+                cert_err: Default::default(),
+            },
+        ];
+        let mut spec = vec![0.0f32; dout * dout];
+        for i in 0..dout {
+            spec[i * dout + i] = 1.0;
+        }
+        let zb = vec![0.0f32; dout];
+        let run = || {
+            device
+                .crown_backward_sound_resident_coeff_seeded(
+                    &layers, &spec, &spec, &zb, &zb, dout, dout,
+                )
+                .expect("resident walk")
+        };
+        let base = {
+            let _off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+            run()
+        };
+        let gated = {
+            let _on = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+            run()
+        };
+
+        for (name, b, g) in [
+            ("lower_a", &base.lower_a, &gated.lower_a),
+            ("upper_a", &base.upper_a, &gated.upper_a),
+            ("lower_err", &base.lower_err, &gated.lower_err),
+            ("upper_err", &base.upper_err, &gated.upper_err),
+            ("lower_b", &base.lower_b, &gated.lower_b),
+            ("upper_b", &base.upper_b, &gated.upper_b),
+            ("lower_b_err", &base.lower_b_err, &gated.lower_b_err),
+            ("upper_b_err", &base.upper_b_err, &gated.upper_b_err),
+        ] {
+            assert_eq!(b.len(), g.len(), "{name}: length drift");
+            for (i, (x, y)) in b.iter().zip(g.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{name}[{i}]: gate off ({x}) vs on ({y}) diverged — the taint \
+                     twins are not bit-identical to the base kernels on this adapter"
+                );
+            }
+        }
+        assert!(
+            base.taint_rows.is_none(),
+            "gate off must carry NO words (byte-identical to today)"
+        );
+        let rows = gated.taint_rows.expect("gate on must carry row words");
+        assert_eq!(rows.len(), dout);
+        assert!(
+            rows.iter().all(|&w| w == 0),
+            "clean inputs must produce all-zero row words, got {rows:?}"
+        );
+    }
+
+    /// #u4 G13 seeding + carriage: a seed coefficient at exactly
+    /// `CROWN_COEFF_MAX` (the CPU transport sentinel, == FALLBACK_BOUND)
+    /// enters PRE-TAINTED and its word survives a Linear layer with NONZERO
+    /// weights — arriving nonzero in the final per-spec-row accumulator even
+    /// though the downscaled VALUE (1e10·0.5 = 5e9) passes every magnitude
+    /// guard. The clean spec row stays zero (words are never invented).
+    #[test]
+    fn taint_walk_seeds_and_carries() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let _on = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+        let layers = vec![GpuCrownLayer::Linear {
+            // 2×2, every weight nonzero ⇒ no annihilation path; magnitudes
+            // scale the sentinel DOWN so only the word can carry the taint.
+            weight: Arc::from(vec![0.5f32, 0.25, -0.75, 1.0].into_boxed_slice()),
+            bias: Some(Arc::from(vec![0.1f32, -0.2].into_boxed_slice())),
+            out_features: 2,
+            in_features: 2,
+            cert_err: Default::default(),
+        }];
+        // Spec row 0 carries the sentinel at (0,0); row 1 is clean.
+        let lower_a = vec![ny_core::CROWN_COEFF_MAX, 0.0, 1.0, 1.0];
+        let upper_a = lower_a.clone();
+        let zb = vec![0.0f32; 2];
+        let c = device
+            .crown_backward_sound_resident_coeff_seeded(&layers, &lower_a, &upper_a, &zb, &zb, 2, 2)
+            .expect("resident walk");
+        let rows = c.taint_rows.expect("gate on must carry row words");
+        assert_eq!(rows.len(), 2);
+        assert_ne!(
+            rows[0],
+            0,
+            "the pre-tainted seed's word must arrive at spec row 0 (values: \
+             lower_a={:?})",
+            &c.lower_a[..2]
+        );
+        assert_eq!(
+            rows[1], 0,
+            "the clean spec row must stay word-free (annihilation/invention \
+             check), got {rows:?}"
+        );
+        // The laundered VALUE is small and finite — invisible to every
+        // magnitude guard — which is exactly why the word channel must exist.
+        assert!(c.lower_a[0].abs() < ny_core::FALLBACK_BOUND);
+    }
+
+    /// #u4 on-device bias-fold conjunct pin (`TAINT_ROW_OR_SHADER`,
+    /// per-COLUMN partner): a seed ERROR word whose ONLY route to the row
+    /// accumulator is the Linear bias transport is DROPPED when its
+    /// multiplicative partner `bias[k] == 0.0` and CARRIED when
+    /// `bias[k] != 0` — matching the CPU reference `bias_fold_taint` exactly.
+    ///
+    /// Route isolation: the word rides `lower_a_err` (1e30 degrade marker ⇒
+    /// G13-worded at walk entry) at (row 0, k 0), and weight ROW 0 is exactly
+    /// zero, so (a) the `err@|W|` GEMM twin annihilates it per tap (partner
+    /// `|W|[0,j] == 0`), keeping the outgoing words — and hence the final
+    /// fold — clean, and (b) the §0 row-L1 word channel reads only the
+    /// COEFFICIENT words, which are clean. That leaves the bias transport as
+    /// the word's single path to `rows_dev`, pinning the on-device conjunct
+    /// through the whole walk.
+    #[test]
+    fn taint_walk_bias_conjunct_annihilates_on_device() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let _on = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+        let run = |bias0: f32| {
+            let layers = vec![GpuCrownLayer::Linear {
+                // Weight ROW 0 exactly zero: the k=0 err word cannot ride the
+                // GEMM twins into the outgoing words (per-tap annihilation).
+                weight: Arc::from(vec![0.0f32, 0.0, 0.5, -0.5].into_boxed_slice()),
+                bias: Some(Arc::from(vec![bias0, 0.2f32].into_boxed_slice())),
+                out_features: 2,
+                in_features: 2,
+                cert_err: Default::default(),
+            }];
+            // Clean coefficients; the ERROR seed carries the 1e30 degrade
+            // marker at (row 0, k 0).
+            let lower_a = vec![1.0f32, 0.0, 0.0, 1.0];
+            let upper_a = lower_a.clone();
+            let lower_a_err = vec![1e30f32, 0.0, 0.0, 0.0];
+            let zero_err = vec![0.0f32; 4];
+            let zb = vec![0.0f32; 2];
+            device
+                .crown_backward_sound_resident_coeff_seeded_err(
+                    &layers,
+                    &lower_a,
+                    &upper_a,
+                    &lower_a_err,
+                    &zero_err,
+                    &zb,
+                    &zb,
+                    &zb,
+                    &zb,
+                    2,
+                    2,
+                    &[],
+                    &[],
+                )
+                .expect("resident walk")
+                .taint_rows
+                .expect("gate on must carry row words")
+        };
+        let annihilated = run(0.0);
+        assert_eq!(
+            annihilated,
+            vec![0, 0],
+            "bias[0] == 0.0 must annihilate the k=0 err word ON-DEVICE (no \
+             other transport reaches its row), got {annihilated:?}"
+        );
+        let carried = run(0.1);
+        assert_ne!(
+            carried[0], 0,
+            "bias[0] != 0 must carry the k=0 err word to spec row 0, got \
+             {carried:?}"
+        );
+        assert_eq!(
+            carried[1], 0,
+            "the clean spec row must stay word-free, got {carried:?}"
+        );
+    }
+
+    /// #u4 audit C2 through the WALK: on the lane-2 shape (sentinel × tiny
+    /// weight ⇒ every magnitude innocent) the EFT min-combine CONSULT twin
+    /// refuses the tightening on the worded element — the walk's error output
+    /// is bit-identical to the un-tightened Higham charge.  When the composed
+    /// EFT authorization passes, the base (gate-off) min-combine demonstrably
+    /// TIGHTENS that same element (the laundering hole this consult closes).
+    /// When any EFT precondition refuses the channel, this oracle instead pins
+    /// the required fail-closed Higham fallback.
+    #[test]
+    fn taint_walk_eft_word_refuses_min_combine_tightening() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let eft_authorized = device.verify_eft_primitives();
+        // Separation shape: k = 64 taps but only TWO are nonzero in the seed
+        // rows, so Higham's a-priori γ_64·s_prod over-counts the ACTUAL
+        // rounding (≈ 1 add) by ~16x — the base min-combine tightening is
+        // reliably STRICT wherever it is permitted.
+        let (of, if_) = (64usize, 2usize);
+        // W (64×2): column 0 carries the 1e-20 launder tap at row 0 and a
+        // 1e-3 tap at row 1 (rest exactly 0 — exact-zero products add no
+        // rounding); column 1 is all ones (drives the in-band saturation arm
+        // on the sentinel row, exercised but not asserted here).
+        let mut w = vec![0.0f32; of * if_];
+        w[0] = 1e-20;
+        w[if_] = 1e-3;
+        for r in 0..of {
+            w[r * if_ + 1] = 1.0;
+        }
+        let layers = vec![GpuCrownLayer::Linear {
+            weight: Arc::from(w.into_boxed_slice()),
+            bias: None,
+            out_features: of,
+            in_features: if_,
+            cert_err: Default::default(),
+        }];
+        // Spec row 0: the sentinel at (0,0) plus one clean tap at (0,1).
+        // Spec row 1: clean, one tap at (1,1).
+        let mut lower_a = vec![0.0f32; 2 * of];
+        lower_a[0] = ny_core::CROWN_COEFF_MAX;
+        lower_a[1] = 1.0;
+        lower_a[of + 1] = 1.0;
+        let upper_a = lower_a.clone();
+        let zb = vec![0.0f32; 2];
+        let run = || {
+            device
+                .crown_backward_sound_resident_coeff_seeded(
+                    &layers, &lower_a, &upper_a, &zb, &zb, 2, of,
+                )
+                .expect("resident walk")
+        };
+        // (a) Higham reference: gate ON, EFT OFF (no tightening dispatched).
+        let higham = {
+            let _t = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+            let _e = ScopedEnvVar::unset("NY_EFT_ERR");
+            run()
+        };
+        // (b) EFT requested, gate OFF: when the composed authorization passes,
+        // the base min-combine sees only innocent magnitudes
+        // (s_prod(0,0) ≈ 1e-3 « FALLBACK_BOUND) and TIGHTENS; otherwise
+        // it falls back to Higham.
+        let eft_base = {
+            let _t = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+            let _e = ScopedEnvVar::set("NY_EFT_ERR", "1");
+            run()
+        };
+        // (c) EFT requested, gate ON: when authorized, the consult twin reads
+        // the carried word and REFUSES; a globally refused authorization also
+        // falls back to the un-tightened Higham charge.
+        let eft_taint = {
+            let _t = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+            let _e = ScopedEnvVar::set("NY_EFT_ERR", "1");
+            run()
+        };
+        // Element (0,0): spec row 0, output column 0 — the laundered tap.
+        let idx = 0usize;
+        if eft_authorized {
+            assert!(
+                eft_base.lower_err[idx] < higham.lower_err[idx],
+                "precondition: the base EFT min-combine must strictly tighten the \
+                 laundered element ({} !< {}) — if this fails the shape no longer \
+                 separates the channels, pick taps further apart",
+                eft_base.lower_err[idx],
+                higham.lower_err[idx],
+            );
+        } else {
+            assert_eq!(
+                eft_base.lower_err[idx].to_bits(),
+                higham.lower_err[idx].to_bits(),
+                "a refused composed EFT authorization must disable the unworded \
+                 EFT tightening and preserve the Higham charge"
+            );
+        }
+        assert_eq!(
+            eft_taint.lower_err[idx].to_bits(),
+            higham.lower_err[idx].to_bits(),
+            "the carried word must REFUSE the tightening: gate-on error {} != \
+             un-tightened Higham {}",
+            eft_taint.lower_err[idx],
+            higham.lower_err[idx],
+        );
+        // The worded row is condemned in the accumulator; the clean row's
+        // tightening stays permitted (never wider than Higham).
+        let rows = eft_taint.taint_rows.as_ref().expect("gate on words");
+        assert_ne!(rows[0], 0, "the laundered row must be worded");
+        assert_eq!(rows[1], 0, "the clean row must stay word-free");
+        // Post-layer errors are [num_specs × if_]: spec row 1, column 0.
+        let clean_idx = if_;
+        assert!(
+            eft_taint.lower_err[clean_idx] <= higham.lower_err[clean_idx],
+            "clean-row tightening must never widen"
+        );
+    }
+
+    /// Shared fixture for the #u4 resnet-composition tests: a small resnet-
+    /// shaped segment walk in backward order (cribbed from the stacked-resnet
+    /// and beta fixtures) — `[Chain(Linear out), Residual([Linear, ReLU])]`,
+    /// every weight/slope nonzero so no annihilation path exists. Returns the
+    /// owned layer vecs; callers borrow them into `ResnetSegment`s.
+    fn taint_resnet_fixture(d: usize, dout: usize) -> (Vec<GpuCrownLayer>, Vec<GpuCrownLayer>) {
+        let mut state: u64 = 0x00D4_C0FE_E5E7;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        // Nonzero-everywhere weights: they scale the seed sentinel DOWN below
+        // FALLBACK_BOUND (launder) while keeping every multiplicative partner
+        // nonzero (no annihilation). The Chain (first-consumed) weights are
+        // ~0.02–0.07 so a 1e10 seed sentinel drops to ~e8 territory and the
+        // later d-term GEMM sums (≤ d·0.7·|A|) can never climb back to the
+        // 1e10 clamp — the value channel stays strictly sub-threshold through
+        // the WHOLE composition, so only the word channel can carry the taint.
+        let mut nz = |n: usize, lo: f32, span: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| (lo + rng().abs() * span) * if rng() > 0.0 { 1.0 } else { -1.0 })
+                .collect()
+        };
+        let ow = nz(dout * d, 0.02, 0.05);
+        let ob = nz(dout, 0.02, 0.05);
+        let rw = nz(d * d, 0.2, 0.5);
+        let rb = nz(d, 0.2, 0.5);
+        let ls: Vec<f32> = (0..d).map(|_| 0.25 + rng().abs() * 0.5).collect();
+        let li: Vec<f32> = (0..d).map(|_| rng() * 0.1).collect();
+        let ui: Vec<f32> = (0..d)
+            .map(|i| li[i].abs() + 0.05 + rng().abs() * 0.1)
+            .collect();
+        let out_chain = vec![GpuCrownLayer::Linear {
+            weight: Arc::from(ow.into_boxed_slice()),
+            bias: Some(Arc::from(ob.into_boxed_slice())),
+            out_features: dout,
+            in_features: d,
+            cert_err: Default::default(),
+        }];
+        let res_branch = vec![
+            GpuCrownLayer::Linear {
+                weight: Arc::from(rw.into_boxed_slice()),
+                bias: Some(Arc::from(rb.into_boxed_slice())),
+                out_features: d,
+                in_features: d,
+                cert_err: Default::default(),
+            },
+            GpuCrownLayer::Activation {
+                lower_slope: ls.clone(),
+                upper_slope: ls,
+                lower_intercept: li,
+                upper_intercept: ui,
+                num_neurons: d,
+            },
+        ];
+        (out_chain, res_branch)
+    }
+
+    /// #u4 resnet composition, differential oracle: on a resnet-shaped segment
+    /// walk (Chain + identity Residual with a ReLU), `NY_GPU_TAINT_WORDS` OFF
+    /// vs ON is VALUE bit-identical on every channel of the COMPOSED frontier,
+    /// gate off carries no words (`taint_rows == None`, today's behavior), and
+    /// gate ON carries `Some(all-zero)` rows for clean inputs — Some, NOT
+    /// None: the segment composition must produce a real word set, otherwise
+    /// an ARMED C1 consult would refuse every resnet row to the CPU path.
+    #[test]
+    fn taint_resnet_compose_gate_off_identical_and_clean_rows() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let _seg_off = ScopedEnvVar::unset("NY_SEG_RESIDENT");
+        let (d, dout) = (6usize, 4usize);
+        let (out_chain, res_branch) = taint_resnet_fixture(d, dout);
+        let segments = [
+            ResnetSegment::Chain(&out_chain),
+            ResnetSegment::Residual(&res_branch),
+        ];
+        let mut spec = vec![0.0f32; dout * dout];
+        for i in 0..dout {
+            spec[i * dout + i] = 1.0;
+        }
+        let zb = vec![0.0f32; dout];
+        let run = || {
+            device
+                .resnet_seeded_compose_coeff(
+                    &segments,
+                    &spec,
+                    &spec,
+                    &zb,
+                    &zb,
+                    dout,
+                    dout,
+                    dout,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                    &[],
+                    false,
+                )
+                .expect("resnet compose")
+                .0
+        };
+        let base = {
+            let _off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+            run()
+        };
+        let gated = {
+            let _on = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+            run()
+        };
+        for (name, b, g) in [
+            ("lower_a", &base.lower_a, &gated.lower_a),
+            ("upper_a", &base.upper_a, &gated.upper_a),
+            ("lower_err", &base.lower_err, &gated.lower_err),
+            ("upper_err", &base.upper_err, &gated.upper_err),
+            ("lower_b", &base.lower_b, &gated.lower_b),
+            ("upper_b", &base.upper_b, &gated.upper_b),
+            ("lower_b_err", &base.lower_b_err, &gated.lower_b_err),
+            ("upper_b_err", &base.upper_b_err, &gated.upper_b_err),
+        ] {
+            assert_eq!(b.len(), g.len(), "{name}: length drift");
+            for (i, (x, y)) in b.iter().zip(g.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{name}[{i}]: gate off ({x}) vs on ({y}) diverged through the \
+                     segment composition"
+                );
+            }
+        }
+        assert!(
+            base.taint_rows.is_none(),
+            "gate off must carry NO words (byte-identical to today)"
+        );
+        let rows = gated
+            .taint_rows
+            .expect("gate on must carry Some(rows) through the resnet composition — None here means a seam dropped the word set");
+        assert_eq!(rows.len(), dout);
+        assert!(
+            rows.iter().all(|&w| w == 0),
+            "clean inputs must produce all-zero row words, got {rows:?}"
+        );
+    }
+
+    /// #u4 resnet composition, sentinel carriage: a `CROWN_COEFF_MAX` seed
+    /// coefficient in spec row 0 is G13-worded at entry, LAUNDERED below every
+    /// magnitude guard by the first (Chain) segment's sub-1.0 weights — so the
+    /// Residual segment's own G13 re-seed sees only innocent values — and its
+    /// row word still arrives set through the FULL composition (Chain sub-walk
+    /// → seam OR → Residual branch sub-walk + skip add). Other rows stay zero
+    /// (words are never invented; the seam OR is per-row exact).
+    #[test]
+    fn taint_resnet_compose_sentinel_row_survives_composition() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let _seg_off = ScopedEnvVar::unset("NY_SEG_RESIDENT");
+        let _on = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+        let (d, dout) = (6usize, 4usize);
+        let (out_chain, res_branch) = taint_resnet_fixture(d, dout);
+        let segments = [
+            ResnetSegment::Chain(&out_chain),
+            ResnetSegment::Residual(&res_branch),
+        ];
+        let mut lower_a = vec![0.0f32; dout * dout];
+        for i in 0..dout {
+            lower_a[i * dout + i] = 1.0;
+        }
+        // Spec row 0 ships the CPU transport sentinel; rows 1.. stay clean.
+        lower_a[0] = ny_core::CROWN_COEFF_MAX;
+        let upper_a = lower_a.clone();
+        let zb = vec![0.0f32; dout];
+        let (coeff, _grads, _gathers) = device
+            .resnet_seeded_compose_coeff(
+                &segments,
+                &lower_a,
+                &upper_a,
+                &zb,
+                &zb,
+                dout,
+                dout,
+                dout,
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                &[],
+                false,
+            )
+            .expect("resnet compose");
+        let rows = coeff
+            .taint_rows
+            .expect("gate on must carry Some(rows) through the resnet composition");
+        assert_eq!(rows.len(), dout);
+        assert_ne!(
+            rows[0], 0,
+            "the sentinel seed's word must survive the full segment \
+             composition into spec row 0"
+        );
+        for (s, &w) in rows.iter().enumerate().skip(1) {
+            assert_eq!(w, 0, "clean spec row {s} must stay word-free, got {rows:?}");
+        }
+        // The VALUE channel is fully laundered (finite, sub-threshold) by the
+        // sub-1.0 weights/slopes — only the word channel still knows. This is
+        // the property that makes the wiring load-bearing: the Residual
+        // segment's G13 re-seed alone could NOT have re-worded row 0.
+        assert!(
+            coeff
+                .lower_a
+                .iter()
+                .chain(coeff.upper_a.iter())
+                .all(|v| v.is_finite() && v.abs() < ny_core::FALLBACK_BOUND),
+            "fixture drift: the sentinel was expected to launder below \
+             FALLBACK_BOUND through the composition"
+        );
+    }
+
+    /// #u4 genuinely-unwirable configuration, pinned: seg-resident device
+    /// seed/keep streams carry no word buffers, so under the gate the walk
+    /// entry REFUSES (typed), and the resnet composition surfaces that error
+    /// instead of silently running un-worded (fail-closed — the gate-off
+    /// seg-resident path is untouched).
+    #[test]
+    fn taint_resnet_seg_resident_stream_refuses() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let _seg_on = ScopedEnvVar::set("NY_SEG_RESIDENT", "1");
+        let _on = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "1");
+        let (d, dout) = (6usize, 4usize);
+        let (out_chain, res_branch) = taint_resnet_fixture(d, dout);
+        // First segment Chain + no fine/cut/capture channels ⇒ seg-resident
+        // eligible, so the first sub-walk runs in keep mode.
+        let segments = [
+            ResnetSegment::Chain(&out_chain),
+            ResnetSegment::Residual(&res_branch),
+        ];
+        let mut spec = vec![0.0f32; dout * dout];
+        for i in 0..dout {
+            spec[i * dout + i] = 1.0;
+        }
+        let zb = vec![0.0f32; dout];
+        // (No `expect_err`: `ResidentCoeff` deliberately has no Debug impl.)
+        let err = match device.resnet_seeded_compose_coeff(
+            &segments,
+            &spec,
+            &spec,
+            &zb,
+            &zb,
+            dout,
+            dout,
+            dout,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            false,
+        ) {
+            Ok(_) => {
+                panic!("taint_on + seg-resident device streams must refuse (typed, fail-closed)")
+            }
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("seg-resident device"),
+            "expected the typed seg-resident word-channel refusal, got: {msg}"
+        );
+    }
+
+    /// #flush-charge Lane A, route GA3 (module-doc guard-coverage table): a
+    /// frontier that carries NO row words — the ONLY kind a seg-resident
+    /// device stream can produce (its merge shell and `download_resident_coeff`
+    /// both set `taint_rows: None`) — is VERDICT-DEAD at the concretize
+    /// funnel: the armed C1 consult refuses it BEFORE any dispatch, on every
+    /// adapter, under every authority mode. This is the pin that keeps the
+    /// seg-resident stream's un-audited on-device merge error lanes
+    /// (`seg_merge_dispatch`) outside both the uncharged and the charged
+    /// verdict surface without a walk guard of their own.
+    #[test]
+    fn unworded_frontier_is_verdict_dead_at_the_concretize_funnel() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+
+        // Part 1 (deterministic on every adapter, refusal is pre-dispatch):
+        // an unworded frontier is refused by the armed C1 consult.
+        let c = ResidentCoeff {
+            lower_a: vec![0.5, -0.25],
+            upper_a: vec![0.75, 0.25],
+            lower_err: vec![0.0; 2],
+            upper_err: vec![0.0; 2],
+            lower_b: vec![0.0],
+            upper_b: vec![0.0],
+            lower_b_err: vec![0.0],
+            upper_b_err: vec![0.0],
+            dim: 2,
+            relu_grads: Vec::new(),
+            beta_gather: Vec::new(),
+            taint_rows: None,
+        };
+        let msg = device
+            .concretize_resident_coeff(&c, 1, &[-1.0, -1.0], &[1.0, 1.0])
+            .expect_err("an unworded frontier must never concretize")
+            .to_string();
+        assert!(
+            msg.contains("taint words absent"),
+            "expected the armed C1 absent-words refusal, got: {msg}"
+        );
+
+        // Part 2: the seg-resident stream itself, under the explicit un-worded
+        // opt-out (so the sub-walk's worded refusal cannot fire first). On a
+        // non-authoritative adapter the sub-walk refuses outright (also
+        // verdict-dead, by an earlier gate); on an authoritative one the
+        // composed frontier must carry NO words and die at the same funnel.
+        let _eft_off = ScopedEnvVar::unset("NY_EFT_ERR");
+        let _coalesce_off = ScopedEnvVar::unset("NY_FOLD_COALESCE");
+        let _seg_on = ScopedEnvVar::set("NY_SEG_RESIDENT", "1");
+        let _words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let (d, dout) = (6usize, 4usize);
+        let (out_chain, res_branch) = taint_resnet_fixture(d, dout);
+        let segments = [
+            ResnetSegment::Chain(&out_chain),
+            ResnetSegment::Residual(&res_branch),
+        ];
+        let mut spec = vec![0.0f32; dout * dout];
+        for i in 0..dout {
+            spec[i * dout + i] = 1.0;
+        }
+        let zb = vec![0.0f32; dout];
+        match device.resnet_seeded_compose_coeff(
+            &segments,
+            &spec,
+            &spec,
+            &zb,
+            &zb,
+            dout,
+            dout,
+            dout,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            false,
+        ) {
+            Ok((coeff, _grads, _gathers)) => {
+                assert!(
+                    coeff.taint_rows.is_none(),
+                    "a seg-resident stream grew row words without a word \
+                     channel across device-resident segment boundaries"
+                );
+                let xl = vec![-1.0f32; coeff.dim];
+                let xu = vec![1.0f32; coeff.dim];
+                let msg = device
+                    .concretize_resident_coeff(&coeff, dout, &xl, &xu)
+                    .expect_err("the un-worded seg-resident frontier must die at C1")
+                    .to_string();
+                assert!(msg.contains("taint words absent"), "got: {msg}");
+            }
+            Err(e) => {
+                assert!(
+                    !e.to_string().is_empty(),
+                    "seg-resident refusal must be a typed error"
+                );
+            }
+        }
+    }
 
     /// #NY_GPU_BATCHED_COLLECT differential oracle: spec-row chunking is EXACT.
     ///
@@ -5855,7 +13105,7 @@ mod tests {
     #[test]
     fn spec_row_chunk_is_exact_vs_unchunked() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
 
         let (out_dim, mid, in_dim) = (8usize, 32usize, 4usize);
         let mut state: u64 = 0x00C0_FFEE_1234_5678;
@@ -5882,6 +13132,7 @@ mod tests {
                 bias: Some(b0),
                 out_features: out_dim,
                 in_features: mid,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: (0..mid).map(|_| 0.4 + 0.2 * rng()).collect(),
@@ -5895,6 +13146,7 @@ mod tests {
                 bias: Some(b1),
                 out_features: mid,
                 in_features: in_dim,
+                cert_err: Default::default(),
             },
         ];
         // Identity spec: one row per output neuron.
@@ -5905,8 +13157,11 @@ mod tests {
         let in_lo: Vec<f32> = (0..in_dim).map(|j| -1.0 - 0.05 * j as f32).collect();
         let in_hi: Vec<f32> = (0..in_dim).map(|j| 1.0 + 0.05 * j as f32).collect();
 
-        // Reference: the single unchunked dispatch (gate off → the Ok branch).
-        let _collect_off = ScopedEnvVar::unset("NY_GPU_BATCHED_COLLECT");
+        // Reference: the single unchunked dispatch. The KILL SWITCH (`=0`) pins this to
+        // the genuinely unchunked path rather than relying on the fit-preserving first
+        // attempt, so the reference cannot silently become a chunked result if this
+        // shape ever grows past a device limit.
+        let _collect_off = ScopedEnvVar::set("NY_GPU_BATCHED_COLLECT", "0");
         let reference = device
             .crown_backward_gpu_sound(&layers, &spec, out_dim, &in_lo, &in_hi)
             .expect("unchunked sound backward");
@@ -5956,83 +13211,260 @@ mod tests {
         }
     }
 
-    /// #NY_WIDE_PROBE STEP-1 profiler (ignored by default; run explicitly with
-    /// `NY_GPU_BATCHED_COLLECT=1 NY_WIDE_PROBE=1 cargo test -p ny-gpu --features
-    /// gpu-tests --release wide_node_chunk_profile -- --ignored --nocapture`).
-    /// Builds a realistic wide-TLL subnetwork (a 6272-wide lattice bank whose
-    /// A-coefficient buffer is 157 MiB > Metal's 128 MiB binding cap) so the single
-    /// unchunked dispatch Errs and the chunked path runs. The per-resident-call and
-    /// per-chunk breakdown (setup / cpu_wprep / loop / readback) reveals WHERE the
-    /// re-paid per-dispatch overhead lives — the input to STEP 2.
+    /// #wg-limit-subchunk TAIL ORACLE on a CONV chain — the gap the Linear-only oracle
+    /// above left open, and the precondition for making the chunking DEFAULT-ON.
+    ///
+    /// Why a separate test: the production tripping shape (relusplitter/cifar_biasfield)
+    /// is a Conv2d chain, and a conv layer takes a completely different resident route
+    /// than Linear — an im2col reshape whose GEMM `m` is row-count-dependent (so
+    /// `select_gemm_dispatch`'s `use_small_k` branch is a *function of the chunk size*),
+    /// plus a col2im scatter and a separate `ceil(rows·oc·oh·ow / 256)` elementwise
+    /// dispatch width distinct from the `ic·ih·iw` one. If chunking were going to drop
+    /// or mis-accumulate a row, conv is where it would happen.
+    ///
+    /// `num_specs = 7` is PRIME, so EVERY chunk size in `[1,2,3,4,5,6,7]` leaves a
+    /// different short tail (7 = 3+3+**1** = 4+**3** = 5+**2** = 6+**1**), i.e. this
+    /// asserts the off-by-one tail case the Linear oracle only hit for chunk∈{3,5}. The
+    /// spec rows are DENSE random (not the identity used above): an identity row reads a
+    /// single output column, which would mask a row-indexing error that a dense row
+    /// exposes.
     #[test]
-    #[ignore = "heavy wide-node GPU profiler; run explicitly with NY_WIDE_PROBE=1"]
-    fn wide_node_chunk_profile() {
+    fn spec_row_chunk_is_exact_vs_unchunked_conv_chain() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
-        let w: usize = std::env::var("NY_PROBE_W")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6272);
-        let n_specs = w; // collect bounds for every neuron of the wide node.
-        let mut state: u64 = 0xDEAD_BEEF_1234;
+        // This is a raw coefficient/chunking oracle, not a verdict-path test.
+        // Disable words so it isolates row slicing from receipt composition;
+        // dedicated tests exercise the production worded Conv route.
+        let _taint_words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let device = require_verdict_device();
+
+        let mut state: u64 = 0x00C0_FFEE_C047_0001;
         let mut rng = || {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
-        // Backward order (representative of a wide TLL bank): Linear(w←mid) [weight
-        // w×mid ≤ 128 MiB so the WEIGHT binding fits], ReLU(mid), Linear(mid←2). The
-        // seed A-coefficient is num_specs×w = w×w = 157 MiB > 128 MiB, so the SPEC-ROW
-        // dimension is what overflows (exactly the real-network case chunking targets).
-        let mid: usize = w / 2;
-        let w0: Arc<[f32]> = (0..w * mid)
-            .map(|_| rng() * 0.05)
+
+        // Backward order (output→input), 3x3 stride-1 pad-1 so H/W are preserved:
+        //   Conv2d(oc=4 ← ic=3) : coeff 4*6*6=144 → 3*6*6=108
+        //   Activation(108)
+        //   Conv2d(oc=3 ← ic=2) : coeff 108 → 2*6*6=72   (= input dim)
+        let (hw, k) = (6usize, 3usize);
+        let (oc0, ic0, oc1, ic1) = (4usize, 3usize, 3usize, 2usize);
+        let out_dim = oc0 * hw * hw; // 144 = spec width
+        let mid = ic0 * hw * hw; // 108
+        let in_dim = ic1 * hw * hw; // 72
+        let num_specs = 7usize; // PRIME → every chunk size exercises a short tail
+
+        let wcol0: Arc<[f32]> = (0..oc0 * ic0 * k * k)
+            .map(|_| rng() * 0.25)
             .collect::<Vec<_>>()
             .into();
-        let b0: Arc<[f32]> = (0..w).map(|_| rng() * 0.1).collect::<Vec<_>>().into();
-        let w1: Arc<[f32]> = (0..mid * 2)
-            .map(|_| rng() * 0.05)
+        let wcol1: Arc<[f32]> = (0..oc1 * ic1 * k * k)
+            .map(|_| rng() * 0.25)
             .collect::<Vec<_>>()
             .into();
-        let b1: Arc<[f32]> = (0..mid).map(|_| rng() * 0.1).collect::<Vec<_>>().into();
+        let b0: Arc<[f32]> = (0..out_dim).map(|_| rng() * 0.2).collect::<Vec<_>>().into();
+        let b1: Arc<[f32]> = (0..mid).map(|_| rng() * 0.2).collect::<Vec<_>>().into();
+        let conv = |weight_col: Arc<[f32]>,
+                    bias_expanded: Option<Arc<[f32]>>,
+                    out_channels: usize,
+                    in_channels: usize| GpuCrownLayer::Conv2d {
+            weight_col,
+            bias_expanded,
+            out_channels,
+            in_channels,
+            kernel_h: k,
+            kernel_w: k,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 1,
+            pad_w: 1,
+            out_h: hw,
+            out_w: hw,
+            in_h: hw,
+            in_w: hw,
+            cert_err: Default::default(),
+        };
         let layers = vec![
-            GpuCrownLayer::Linear {
-                weight: w0,
-                bias: Some(b0),
-                out_features: w,
-                in_features: mid,
-            },
+            conv(Arc::clone(&wcol0), Some(Arc::clone(&b0)), oc0, ic0),
             GpuCrownLayer::Activation {
-                lower_slope: (0..mid).map(|_| 0.5).collect(),
-                upper_slope: (0..mid).map(|_| 0.9).collect(),
+                lower_slope: (0..mid).map(|_| 0.35 + 0.25 * rng()).collect(),
+                upper_slope: (0..mid).map(|_| 0.75 + 0.15 * rng()).collect(),
                 lower_intercept: vec![0.0; mid],
-                upper_intercept: (0..mid).map(|_| 0.05).collect(),
+                upper_intercept: (0..mid).map(|_| 0.1 + 0.05 * rng()).collect(),
                 num_neurons: mid,
             },
-            GpuCrownLayer::Linear {
-                weight: w1,
-                bias: Some(b1),
-                out_features: mid,
-                in_features: 2,
-            },
+            conv(Arc::clone(&wcol1), Some(Arc::clone(&b1)), oc1, ic1),
         ];
-        let mut spec = vec![0.0f32; n_specs * w];
-        for i in 0..n_specs {
-            spec[i * w + i] = 1.0;
+
+        // DENSE random spec rows (num_specs × out_dim), not identity.
+        let spec: Vec<f32> = (0..num_specs * out_dim).map(|_| rng() * 0.5).collect();
+        let in_lo: Vec<f32> = (0..in_dim).map(|j| -1.0 - 0.01 * (j % 7) as f32).collect();
+        let in_hi: Vec<f32> = (0..in_dim).map(|j| 1.0 + 0.01 * (j % 5) as f32).collect();
+
+        // Raw, explicitly unworded reference: one resident coefficient dispatch.
+        // The separate runtime-preflight test pins that this is not a verdict route.
+        let reference = unworded_resident_test_chunked(
+            &device, &layers, &spec, num_specs, out_dim, num_specs, &in_lo, &in_hi,
+        )
+        .expect("unchunked raw conv backward");
+        assert_eq!(reference.lower_bounds.len(), num_specs);
+        assert_eq!(reference.upper_bounds.len(), num_specs);
+
+        for chunk in 1..=num_specs {
+            let chunked = unworded_resident_test_chunked(
+                &device, &layers, &spec, num_specs, out_dim, chunk, &in_lo, &in_hi,
+            )
+            .expect("chunked raw conv backward");
+            // ROW COUNT: no dropped/duplicated tail row.
+            assert_eq!(
+                chunked.lower_bounds.len(),
+                num_specs,
+                "chunk={chunk} returned {} lower bounds for {num_specs} spec rows",
+                chunked.lower_bounds.len()
+            );
+            assert_eq!(chunked.upper_bounds.len(), num_specs, "chunk={chunk} upper");
+            for s in 0..num_specs {
+                assert!(
+                    reference.lower_bounds[s].is_finite() && reference.upper_bounds[s].is_finite(),
+                    "reference bound non-finite at {s}"
+                );
+                assert!(
+                    reference.lower_bounds[s] <= reference.upper_bounds[s],
+                    "reference lo>hi at {s}"
+                );
+                // EXACT and IN ORDER: row s of every partition is row s of the whole.
+                assert_eq!(
+                    chunked.lower_bounds[s].to_bits(),
+                    reference.lower_bounds[s].to_bits(),
+                    "conv chunk={chunk} lower differs at spec {s}: {} vs {}",
+                    chunked.lower_bounds[s],
+                    reference.lower_bounds[s]
+                );
+                assert_eq!(
+                    chunked.upper_bounds[s].to_bits(),
+                    reference.upper_bounds[s].to_bits(),
+                    "conv chunk={chunk} upper differs at spec {s}: {} vs {}",
+                    chunked.upper_bounds[s],
+                    reference.upper_bounds[s]
+                );
+            }
         }
-        let in_lo = vec![-1.0f32, -1.0];
-        let in_hi = vec![1.0f32, 1.0];
-        let t0 = std::time::Instant::now();
-        let out = device
-            .crown_backward_gpu_sound(&layers, &spec, n_specs, &in_lo, &in_hi)
-            .expect("wide chunked backward");
-        eprintln!(
-            "[profile] w={w} n_specs={n_specs} WHOLE-NODE gpu backward took {:.3}s ({} bounds)",
-            t0.elapsed().as_secs_f64(),
-            out.lower_bounds.len()
+    }
+
+    /// #wg-limit-subchunk DEFAULT LOCK: with NO env var set, `sound_spec_row_chunk` must
+    /// SPLIT an over-limit row batch (auto-detected from this adapter's real
+    /// `device.limits()`), and `NY_GPU_BATCHED_COLLECT=0` must restore never-chunk.
+    ///
+    /// This is the regression that would catch a silent revert of the default. It also
+    /// pins the two no-op invariants that make default-ON safe: a shape that FITS this
+    /// adapter yields `chunk == num_specs` (the caller's `chunk < num_specs` guard then
+    /// takes the unchunked path, byte-identical to pre-fix), and the split chunk is
+    /// small enough that `worst_1d = max(rows, ceil(rows·W/256))` clears the adapter's
+    /// own cap — the exact predicate `crown_backward_sound_resident` fails closed on.
+    #[test]
+    fn sound_spec_row_chunk_defaults_to_auto_detected_split() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+        let max_wg = device
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .max(1) as usize;
+
+        // The production tripping shape: relusplitter/cifar_biasfield's widest conv
+        // node, 8192 spec rows × W=16384 ⇒ worst_1d = 524288 (8.0× the 65535 cap).
+        let (num_specs, width) = (8192usize, 16384usize);
+        let act = |n: usize| GpuCrownLayer::Activation {
+            lower_slope: vec![0.5; n],
+            upper_slope: vec![0.9; n],
+            lower_intercept: vec![0.0; n],
+            upper_intercept: vec![0.1; n],
+            num_neurons: n,
+        };
+        let wide = vec![act(width)];
+        // Sanity: this shape really is over THIS adapter's limit (else the test is
+        // vacuous on some future adapter and should be re-sized, not silently passed).
+        let worst_1d = num_specs.max(num_specs * width / 256);
+        assert!(
+            worst_1d > max_wg,
+            "test shape no longer exceeds this adapter's cap \
+             (worst_1d={worst_1d}, max_compute_workgroups_per_dimension={max_wg}) — re-size it"
         );
-        assert_eq!(out.lower_bounds.len(), n_specs);
+
+        // DEFAULT (no env var): must split.
+        let chunk = {
+            let _unset = ScopedEnvVar::unset("NY_GPU_BATCHED_COLLECT");
+            device
+                .sound_spec_row_chunk(&wide, num_specs)
+                .expect("default must size a chunk, not decline")
+        };
+        assert!(
+            chunk >= 1 && chunk < num_specs,
+            "default must SPLIT an over-limit batch: chunk={chunk} of {num_specs}"
+        );
+        let chunk_worst_1d = chunk.max(chunk * width / 256);
+        assert!(
+            chunk_worst_1d <= max_wg,
+            "chunk={chunk} still dispatches {chunk_worst_1d} > cap {max_wg}"
+        );
+
+        // KILL SWITCH: `=0` ⇒ never chunk (pre-fix hard-fail → CPU sound fallback).
+        {
+            let _off = ScopedEnvVar::set("NY_GPU_BATCHED_COLLECT", "0");
+            assert_eq!(
+                device.sound_spec_row_chunk(&wide, num_specs),
+                None,
+                "NY_GPU_BATCHED_COLLECT=0 must disable chunking"
+            );
+        }
+        // Legacy opt-in value keeps working (was the only enabling value pre-flip).
+        {
+            let _on = ScopedEnvVar::set("NY_GPU_BATCHED_COLLECT", "1");
+            let c = device
+                .sound_spec_row_chunk(&wide, num_specs)
+                .expect("=1 must still chunk");
+            assert_eq!(c, chunk, "=1 must agree with the default");
+        }
+
+        // BLAST-RADIUS FENCE: an over-limit batch whose layers include something the
+        // resident fold rejects outright ("R4": not Linear/Activation/Conv2d) must
+        // DECLINE, not spin one futile sub-call per chunk — chunking cannot fix an R4
+        // rejection. Keeps the default flip inert on MaxPool2d / dual-alpha graphs.
+        {
+            let _unset = ScopedEnvVar::unset("NY_GPU_BATCHED_COLLECT");
+            let unchunkable = vec![
+                act(width),
+                GpuCrownLayer::MaxPool2d {
+                    routing: vec![0],
+                    ibp_lower: vec![0.0],
+                    ibp_upper: vec![1.0],
+                    input_dim: width,
+                    output_dim: width,
+                },
+            ];
+            assert_eq!(
+                device.sound_spec_row_chunk(&unchunkable, num_specs),
+                None,
+                "an R4-rejected layer list must not be chunked"
+            );
+        }
+
+        // NO-OP INVARIANT: a narrow shape that fits ⇒ chunk == num_specs ⇒ the caller's
+        // `chunk < num_specs` guard declines ⇒ byte-identical to the pre-fix path.
+        let narrow = vec![act(64)];
+        let _unset = ScopedEnvVar::unset("NY_GPU_BATCHED_COLLECT");
+        assert_eq!(
+            device.sound_spec_row_chunk(&narrow, 10),
+            Some(10),
+            "a fitting shape must not be split"
+        );
+        assert_eq!(
+            device.sound_spec_row_chunk(&narrow, 0),
+            None,
+            "zero rows must decline"
+        );
     }
 
     /// INC2 (the TRUE joint α-gradient, `docs/BATCHED_BAB_JOINT_ALPHA_GRADIENT.md`):
@@ -6051,7 +13483,10 @@ mod tests {
             joint_alpha_gradient, joint_lower_bound_debug, JointGradConfig,
         };
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // This finite-difference oracle intentionally isolates Conv arithmetic
+        // from the verdict receipt; dedicated worded Conv tests cover authority.
+        let _taint_words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let device = require_verdict_device();
         // Conv is same-padding (k=3,pad=1 → out=hw). Block dim d = c·hw·hw.
         let (c, hw, k) = (2usize, 3usize, 3usize);
         let d = c * hw * hw; // 18
@@ -6115,6 +13550,7 @@ mod tests {
                 out_w: hw,
                 in_h: hw,
                 in_w: hw,
+                cert_err: Default::default(),
             };
             let act = |a: &[f32], up: &[f32], ui: &[f32]| GpuCrownLayer::Activation {
                 lower_slope: a.to_vec(),
@@ -6128,6 +13564,7 @@ mod tests {
                 bias: Some(lin_b.clone()),
                 out_features: d,
                 in_features: d,
+                cert_err: Default::default(),
             };
             vec![
                 GpuResnetSegment::Chain(vec![conv, act(a0, &upper0, &uint0)]),
@@ -6135,8 +13572,7 @@ mod tests {
             ]
         };
         let gpu_bound = |segs: &[GpuResnetSegment]| -> Vec<f32> {
-            device
-                .crown_backward_gpu_resnet_sound_beta(segs, &seed, &in_lo, &in_hi, &[], &[], &[])
+            unworded_resnet_test_bounds(&device, segs, &seed, &in_lo, &in_hi, &[], &[], &[])
                 .expect("serial sound beta bound")
                 .lower_bounds
         };
@@ -6347,7 +13783,7 @@ mod tests {
     #[test]
     fn crown_resident_cut_fold_malformed_entries_are_atomic_noops() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         use crate::wgpu_device::{
             clear_resident_cut_fold, reset_resident_cut_fold_applied_count,
             resident_cut_fold_applied_count, set_resident_cut_fold, ResidentCutFold,
@@ -6361,6 +13797,7 @@ mod tests {
                 bias: None,
                 out_features: 1,
                 in_features: 3,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: vec![0.0; 3],
@@ -6374,6 +13811,7 @@ mod tests {
                 bias: None,
                 out_features: 3,
                 in_features: 2,
+                cert_err: Default::default(),
             },
         ];
         let segments = [ResnetSegment::Chain(&layers)];
@@ -6471,19 +13909,15 @@ mod tests {
         clear_resident_cut_fold();
     }
 
-    /// Certified Cut-CROWN C2 resident-lane fold, exact-value falsifier: the
-    /// MultiReluCutK k=3 genuine-coupling geometry (z1 = x1, z2 = −x1 + 2x2,
-    /// z3 = −x1 − 2x2 on [−1,1]², f = −Σ relu(z_i); true min −3, plain CROWN
-    /// −4, proven joint cut Σ relu(z) ≤ 3). Folding the cut at λ through the
-    /// RESIDENT resnet path (`backward_branch_cut_fold`) must yield exactly
-    /// −4 + λ — the same closed form the CPU-lane `cut_fold.rs` test proves —
-    /// while the UPPER bounds stay bit-identical (the fold is lower-side
-    /// only). This pins the fold's sign/site on the resident lane, so a
-    /// no-improvement measurement on a real net is a measurement, not a bug.
+    /// Resident cut-fold proof-authority quarantine on the exact k=3 geometry.
+    ///
+    /// The raw registry request historically tightened −4 to −4+λ here. Public
+    /// env/registry state must now leave the ordinary resident verifier exactly
+    /// unchanged and record zero applications.
     #[test]
-    fn crown_resident_cut_fold_k3_geometry_tightens() {
+    fn crown_resident_cut_fold_k3_geometry_is_quarantined() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         use crate::wgpu_device::{
             clear_resident_cut_fold, reset_resident_cut_fold_applied_count,
             resident_cut_fold_applied_count, set_resident_cut_fold, ResidentCutFold,
@@ -6499,6 +13933,7 @@ mod tests {
                 bias: None,
                 out_features: 1,
                 in_features: 3,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: vec![0.0; 3],
@@ -6512,6 +13947,7 @@ mod tests {
                 bias: None,
                 out_features: 3,
                 in_features: 2,
+                cert_err: Default::default(),
             },
         ];
         let segments = [ResnetSegment::Chain(&layers)];
@@ -6549,7 +13985,6 @@ mod tests {
         );
 
         let _fold_on = ScopedEnvVar::set("NY_CUT_FOLD_RESIDENT", "1");
-        let mut prev = base_lo;
         for lambda in [0.25f32, 0.5, 1.0] {
             set_resident_cut_fold(ResidentCutFold {
                 coeffs: vec![(0, lambda), (1, lambda), (2, lambda)],
@@ -6558,417 +13993,27 @@ mod tests {
             });
             reset_resident_cut_fold_applied_count();
             let (lo, hi) = run(&device);
-            assert_eq!(resident_cut_fold_applied_count(), 1, "fold must apply once");
-            let expected = -4.0 + lambda;
-            assert!(
-                (f64::from(lo) - f64::from(expected)).abs() < 1e-4,
-                "λ={lambda}: expected {expected}, got {lo}"
+            assert_eq!(
+                resident_cut_fold_applied_count(),
+                0,
+                "λ={lambda}: resident verifier must not consume public cut-fold state"
             );
-            assert!(lo > prev, "λ={lambda} must strictly tighten");
-            assert!(
-                f64::from(lo) <= -3.0 + 1e-4,
-                "λ={lambda}: bound {lo} must stay below the true min −3 (sound)"
+            assert_eq!(
+                lo.to_bits(),
+                base_lo.to_bits(),
+                "λ={lambda}: lower bound must be bit-identical to baseline"
             );
-            assert_eq!(hi, base_hi, "upper side must be untouched by the fold");
-            prev = lo;
+            assert_eq!(
+                hi.to_bits(),
+                base_hi.to_bits(),
+                "λ={lambda}: upper bound must be bit-identical to baseline"
+            );
         }
         clear_resident_cut_fold();
         // Env guards restore the pre-test state on drop.
     }
 
     // =======================================================================
-    // #mn-head-resident ORACLE (b) — HEAD-retargeted resident fold soundness.
-    //
-    // Fixture (BACKWARD order = output→input), TWO activations so the HEAD (fold
-    // index 0) and STEM (fold index total-1) are DISTINCT targets:
-    //   [ L2(1×2) , ReLU_head(2) , L1(2×2) , ReLU_stem(2) , L0(2×2) ]
-    // with L0 = I + [5,5] and ReLU_stem an EXACT identity relaxation. Over the
-    // input box u ∈ [−1,1]² the stem pre-activations sit in [4,6] > 0, so the
-    // true relu there IS the identity and the identity relaxation is a VALID
-    // over-approximation. L1 = W1·(·) − W1·[5,5] cancels the shift, so the head
-    // pre-activations are the increment-1 "diamond" (u1+u2, u1−u2) — both
-    // crossing — and the margin is exactly −(relu(u1+u2)+relu(u1−u2)). The head
-    // coupling facet −0.5·x1−0.5·x2+y1+y2 ≤ 1 (Monte-Carlo-proven sound in
-    // increment 1) applied at the HEAD recovers the true min −2 from the baseline
-    // −3; applied at the STEM (the OLD, un-retargeted target) it lands on the
-    // WRONG neurons and produces an UNSOUND +1 (> true min) — which is exactly the
-    // false-UNSAT hazard the head driver's GUARD1 refuses, and precisely why the
-    // retarget is soundness-load-bearing, not cosmetic.
-    // =======================================================================
-
-    /// Diamond+identity-stem fixture layers (backward order) + input box + spec.
-    fn head_resident_fixture() -> (Vec<GpuCrownLayer>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        let lin = |w: Vec<f32>, b: Vec<f32>, o: usize, i: usize| GpuCrownLayer::Linear {
-            weight: Arc::from(w.into_boxed_slice()),
-            bias: Some(Arc::from(b.into_boxed_slice())),
-            out_features: o,
-            in_features: i,
-        };
-        let act =
-            |ls: Vec<f32>, us: Vec<f32>, li: Vec<f32>, ui: Vec<f32>| GpuCrownLayer::Activation {
-                lower_slope: ls,
-                upper_slope: us,
-                lower_intercept: li,
-                upper_intercept: ui,
-                num_neurons: 2,
-            };
-        let layers = vec![
-            lin(vec![-1.0, -1.0], vec![0.0], 1, 2), // out = −(y1+y2)
-            act(
-                vec![0.0, 0.0],
-                vec![0.5, 0.5],
-                vec![0.0, 0.0],
-                vec![1.0, 1.0],
-            ), // ReLU_head
-            lin(vec![1.0, 1.0, 1.0, -1.0], vec![-10.0, 0.0], 2, 2), // head_pre = W1·stem_post + b1
-            act(
-                vec![1.0, 1.0],
-                vec![1.0, 1.0],
-                vec![0.0, 0.0],
-                vec![0.0, 0.0],
-            ), // ReLU_stem = identity
-            lin(vec![1.0, 0.0, 0.0, 1.0], vec![5.0, 5.0], 2, 2), // stem_pre = I·u + 5
-        ];
-        (layers, vec![1.0], vec![-1.0, -1.0], vec![1.0, 1.0])
-    }
-
-    /// The diamond coupling facet `−0.5·x1−0.5·x2 + y1+y2 ≤ 1`, reduced to a
-    /// [`ResidentCutFold`] at `beta` via the EXISTING `pool_to_resident_fold`
-    /// semantics (post `+β·g`, pre `+β·a`, bias `−β·b`). `sound_round = true`
-    /// selects the production outward-rounded fold.
-    fn diamond_resident_fold(beta: f32) -> crate::wgpu_device::ResidentCutFold {
-        crate::wgpu_device::ResidentCutFold {
-            coeffs: vec![(0, beta), (1, beta)], // +β·g_i on the ReLU-OUTPUT
-            bias_shift: -beta,                  // −β·b
-            pre_coeffs: vec![(0, -0.5 * beta), (1, -0.5 * beta)], // +β·a_i on the ReLU-INPUT
-            sound_round: true,
-        }
-    }
-
-    /// FAITHFUL host-f64 CROWN LOWER bound over a dense backward-order chain, with
-    /// the fold optionally applied at activation index `target` — the CPU
-    /// reference oracle (b) compares the GPU-resident head fold against. Standard
-    /// CROWN: at a ReLU, an incoming coeff `a_i ≥ 0` picks the LOWER relaxation,
-    /// `a_i < 0` the UPPER; the post-fold adds on the ReLU-OUTPUT frontier BEFORE
-    /// the relaxation, the pre-fold on the ReLU-INPUT frontier AFTER it, and the
-    /// bias once — the identical fold points the resident `backward_branch_cut_fold`
-    /// uses. Concretize by picking `in_lo`/`in_hi` per coeff sign (minimization).
-    fn cpu_crown_lb(
-        layers: &[GpuCrownLayer],
-        spec: &[f32],
-        in_lo: &[f32],
-        in_hi: &[f32],
-        fold: Option<(&crate::wgpu_device::ResidentCutFold, usize)>,
-    ) -> f64 {
-        let mut a: Vec<f64> = spec.iter().map(|&c| f64::from(c)).collect();
-        let mut b: f64 = 0.0;
-        let mut act_idx = 0usize;
-        for layer in layers {
-            match layer {
-                GpuCrownLayer::Linear {
-                    weight,
-                    bias,
-                    out_features,
-                    in_features,
-                } => {
-                    let mut na = vec![0.0f64; *in_features];
-                    for o in 0..*out_features {
-                        let ao = a[o];
-                        for k in 0..*in_features {
-                            na[k] += ao * f64::from(weight[o * *in_features + k]);
-                        }
-                        if let Some(bs) = bias {
-                            b += ao * f64::from(bs[o]);
-                        }
-                    }
-                    a = na;
-                }
-                GpuCrownLayer::Activation {
-                    lower_slope,
-                    upper_slope,
-                    lower_intercept,
-                    upper_intercept,
-                    num_neurons,
-                } => {
-                    if let Some((f, t)) = fold {
-                        if t == act_idx {
-                            for &(i, c) in &f.coeffs {
-                                a[i as usize] += f64::from(c);
-                            }
-                            b += f64::from(f.bias_shift);
-                        }
-                    }
-                    let mut na = vec![0.0f64; *num_neurons];
-                    for i in 0..*num_neurons {
-                        let ai = a[i];
-                        if ai >= 0.0 {
-                            na[i] = ai * f64::from(lower_slope[i]);
-                            b += ai * f64::from(lower_intercept[i]);
-                        } else {
-                            na[i] = ai * f64::from(upper_slope[i]);
-                            b += ai * f64::from(upper_intercept[i]);
-                        }
-                    }
-                    if let Some((f, t)) = fold {
-                        if t == act_idx {
-                            for &(i, c) in &f.pre_coeffs {
-                                na[i as usize] += f64::from(c);
-                            }
-                        }
-                    }
-                    a = na;
-                    act_idx += 1;
-                }
-                _ => unreachable!("head_resident fixture is dense chain only"),
-            }
-        }
-        let mut lb = b;
-        for k in 0..a.len() {
-            lb += if a[k] >= 0.0 {
-                a[k] * f64::from(in_lo[k])
-            } else {
-                a[k] * f64::from(in_hi[k])
-            };
-        }
-        lb
-    }
-
-    /// The TRUE (unrelaxed) network margin at `u`, forwarding through the fixture
-    /// layers in FORWARD order (reverse of the backward list) with real ReLUs.
-    fn true_head_margin(layers: &[GpuCrownLayer], u: &[f32]) -> f32 {
-        let mut x = u.to_vec();
-        for layer in layers.iter().rev() {
-            match layer {
-                GpuCrownLayer::Linear {
-                    weight,
-                    bias,
-                    out_features,
-                    in_features,
-                } => {
-                    let mut y = vec![0.0f32; *out_features];
-                    for o in 0..*out_features {
-                        for k in 0..*in_features {
-                            y[o] += weight[o * *in_features + k] * x[k];
-                        }
-                        if let Some(bs) = bias {
-                            y[o] += bs[o];
-                        }
-                    }
-                    x = y;
-                }
-                GpuCrownLayer::Activation { .. } => {
-                    for v in x.iter_mut() {
-                        *v = v.max(0.0);
-                    }
-                }
-                _ => unreachable!("head_resident fixture is dense chain only"),
-            }
-        }
-        x[0]
-    }
-
-    /// ORACLE (b) — DIFFERENTIAL GPU-vs-CPU + Monte-Carlo soundness for the
-    /// HEAD-retargeted resident fold. Proves, on the real-shaped 2-activation
-    /// diamond head fixture:
-    ///  1. GATE-OFF byte-identical: no fold reproduces the plain resident bound and
-    ///     the CPU reference matches it (validates the reference's CROWN convention).
-    ///  2. HEAD-retarget (NY_MN_HEAD_RESIDENT=1) folds at index 0 exactly ONCE, and
-    ///     the GPU-folded bound EQUALS the CPU reference that applies the SAME facet
-    ///     at the head, is ≤ the dense Monte-Carlo true min (SOUND), and MATERIALLY
-    ///     lifts the bound (a nonzero multi-neuron coupling tightening).
-    ///  3. RETARGET is load-bearing: with the OLD target (stem, index total-1) the
-    ///     SAME head facet lands on the wrong neurons and produces a DIFFERENT,
-    ///     UNSOUND (> true min) value — the false-UNSAT hazard GUARD1 refuses.
-    ///  4. The MC oracle has TEETH: a wrong-signed (+bias) fold at the head exceeds
-    ///     the true min — the failure this test would catch.
-    #[test]
-    #[ignore = "research-only head retarget is production-authority quarantined"]
-    fn mn_head_resident_oracle_b_differential_mc() {
-        let _g = gpu_test_serial_guard();
-        let device = require_device();
-        use crate::wgpu_device::{
-            clear_resident_cut_fold, reset_resident_cut_fold_applied_count,
-            resident_cut_fold_applied_count, set_resident_cut_fold, ResidentCutFold,
-        };
-
-        let (layers, spec, xl, xu) = head_resident_fixture();
-        let segments = [ResnetSegment::Chain(&layers)];
-        let (seed_a, seed_b) = (spec.clone(), vec![0.0f32]);
-        let run = |dev: &WgpuDevice| -> f32 {
-            let (lo, _hi, _grads) = dev
-                .crown_backward_sound_resident_resnet_seeded(
-                    &segments,
-                    &seed_a,
-                    &seed_a,
-                    &seed_b,
-                    &seed_b,
-                    1,
-                    1,
-                    &xl,
-                    &xu,
-                    &[],
-                    &[],
-                    &[],
-                    false,
-                    &[],
-                    false,
-                )
-                .expect("resident head backward");
-            lo[0]
-        };
-
-        // Dense Monte-Carlo TRUE min over u ∈ [−1,1]² (grid + randoms).
-        let mut true_min = f32::INFINITY;
-        for gi in 0..=200 {
-            for gj in 0..=200 {
-                let u = [
-                    -1.0 + 2.0 * gi as f32 / 200.0,
-                    -1.0 + 2.0 * gj as f32 / 200.0,
-                ];
-                true_min = true_min.min(true_head_margin(&layers, &u));
-            }
-        }
-        let mut state: u64 = 0x0D1A_0FED_C0DE_9E37;
-        let mut rngf = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-        };
-        for _ in 0..200_000 {
-            let u = [rngf(), rngf()];
-            true_min = true_head_margin(&layers, &u).min(true_min);
-        }
-
-        // (1) GATE-OFF byte-identical + CPU-reference validation.
-        let base_lo = {
-            let _a = ScopedEnvVar::unset("NY_CUT_FOLD_RESIDENT");
-            let _b = ScopedEnvVar::unset("NY_MN_HEAD_RESIDENT");
-            let _c = ScopedEnvVar::unset("NY_MULTINEURON_STEM");
-            clear_resident_cut_fold();
-            run(&device)
-        };
-        let cpu_base = cpu_crown_lb(&layers, &spec, &xl, &xu, None);
-        assert!(
-            (f64::from(base_lo) - cpu_base).abs() < 5e-3,
-            "CPU reference (no fold) must match the GPU resident baseline: gpu={base_lo} cpu={cpu_base}"
-        );
-        assert!(
-            f64::from(base_lo) <= f64::from(true_min) + 1e-4,
-            "baseline bound {base_lo} must be a valid lower bound (≤ true min {true_min})"
-        );
-
-        // (2) HEAD-retarget ON: fold at index 0 = ReLU_head.
-        let fold = diamond_resident_fold(1.0);
-        let cpu_head = cpu_crown_lb(&layers, &spec, &xl, &xu, Some((&fold, 0)));
-        let (head_lo, head_applied) = {
-            let _on = ScopedEnvVar::set("NY_MN_HEAD_RESIDENT", "1");
-            let _off1 = ScopedEnvVar::unset("NY_CUT_FOLD_RESIDENT");
-            let _off2 = ScopedEnvVar::unset("NY_MULTINEURON_STEM");
-            set_resident_cut_fold(fold.clone());
-            reset_resident_cut_fold_applied_count();
-            let lo = run(&device);
-            let applied = resident_cut_fold_applied_count();
-            clear_resident_cut_fold();
-            (lo, applied)
-        };
-        assert_eq!(
-            head_applied, 1,
-            "head fold must apply exactly ONCE (at index 0)"
-        );
-        // DIFFERENTIAL: GPU head fold == CPU reference at the head.
-        assert!(
-            (f64::from(head_lo) - cpu_head).abs() < 5e-3,
-            "DIFFERENTIAL: GPU head-folded bound {head_lo} must equal the CPU reference \
-             that applies the same facet at the head {cpu_head}"
-        );
-        // SOUND: ≤ dense Monte-Carlo true min, with a NONZERO facet.
-        assert!(
-            f64::from(head_lo) <= f64::from(true_min) + 1e-4,
-            "SOUNDNESS: head-folded bound {head_lo} must stay ≤ true min {true_min}"
-        );
-        // MATERIAL: the coupling facet lifts the bound (base −3 → head −2).
-        assert!(
-            head_lo > base_lo + 0.5,
-            "the head coupling facet must MATERIALLY tighten: base={base_lo} head={head_lo}"
-        );
-        eprintln!(
-            "[mn-head-resident oracle-b] base={base_lo:.5} head_folded={head_lo:.5} \
-             cpu_head={cpu_head:.5} true_min={true_min:.5} applied={head_applied}"
-        );
-
-        // (3) RETARGET is soundness-load-bearing. In the error-free CPU model the
-        // SAME head facet applied at the OLD target (stem = index total-1 = 1) lands
-        // on the WRONG neurons and yields a DIFFERENT, UNSOUND (> true min) value —
-        // exactly the false-UNSAT hazard the head driver's GUARD1 refuses. (On the
-        // GPU the certified-error channel clamps this wrong-target bound to the
-        // ±FALLBACK_BOUND sentinel, so it stays a valid — if useless — lower bound;
-        // we therefore assert the CPU model for the unsoundness claim, and only that
-        // the GPU OUTPUT genuinely CHANGES when the retarget gate flips.)
-        let cpu_stem = cpu_crown_lb(&layers, &spec, &xl, &xu, Some((&fold, 1)));
-        assert!(
-            (cpu_head - cpu_stem).abs() > 0.5,
-            "head-target ({cpu_head}) and stem-target ({cpu_stem}) folds must DIFFER"
-        );
-        assert!(
-            cpu_stem > f64::from(true_min) + 0.5,
-            "the head facet on the WRONG (stem) target is UNSOUND ({cpu_stem} > true min \
-             {true_min}) in the error-free model — the false-UNSAT hazard GUARD1 refuses"
-        );
-        let stem_lo = {
-            let _on = ScopedEnvVar::set("NY_CUT_FOLD_RESIDENT", "1"); // arms, does NOT retarget
-            let _off1 = ScopedEnvVar::unset("NY_MN_HEAD_RESIDENT");
-            let _off2 = ScopedEnvVar::unset("NY_MULTINEURON_STEM");
-            set_resident_cut_fold(fold); // last use of `fold` — move it
-            let lo = run(&device);
-            clear_resident_cut_fold();
-            lo
-        };
-        assert!(
-            (f64::from(head_lo) - f64::from(stem_lo)).abs() > 0.5,
-            "RETARGET must MOVE the GPU target: head-fold {head_lo} != stem-fold {stem_lo}"
-        );
-        assert!(
-            f64::from(stem_lo) <= f64::from(true_min) + 1e-4,
-            "even the wrong-target GPU bound must remain a valid lower bound (≤ true min): \
-             stem={stem_lo} true_min={true_min}"
-        );
-
-        // (4) The Monte-Carlo oracle has TEETH: a wrong-signed (+bias) head fold —
-        // NOT a valid facet Lagrangian — lifts the certified lower bound ABOVE the
-        // true min, which the `bound ≤ true_min` assertion catches. We use a +2.0
-        // bias (non-inverting: the lifted lower −1 stays below the ~0 upper, so the
-        // GPU's inversion-repair does NOT pre-clamp it), so the lifted-and-UNSOUND
-        // value actually surfaces — exactly the broken fold this test would flag.
-        let bad = ResidentCutFold {
-            coeffs: vec![],
-            bias_shift: 2.0,
-            pre_coeffs: vec![],
-            sound_round: true,
-        };
-        let cpu_bad = cpu_crown_lb(&layers, &spec, &xl, &xu, Some((&bad, 0)));
-        assert!(
-            cpu_bad > f64::from(true_min) + 0.5,
-            "negative control (CPU model): a wrong-signed (+bias) fold MUST exceed true \
-             min (cpu_bad={cpu_bad} true_min={true_min})"
-        );
-        let bad_lo = {
-            let _on = ScopedEnvVar::set("NY_MN_HEAD_RESIDENT", "1");
-            let _off1 = ScopedEnvVar::unset("NY_CUT_FOLD_RESIDENT");
-            let _off2 = ScopedEnvVar::unset("NY_MULTINEURON_STEM");
-            set_resident_cut_fold(bad);
-            let lo = run(&device);
-            clear_resident_cut_fold();
-            lo
-        };
-        assert!(
-            f64::from(bad_lo) > f64::from(true_min) + 0.5,
-            "negative control (GPU): a wrong-signed (+bias) head fold MUST exceed true min \
-             (bad={bad_lo} true_min={true_min}) — proving the MC oracle discriminates a \
-             broken fold on the GPU path too"
-        );
-    }
-
     /// The on-device per-ReLU alpha gradient must match the CPU analytic formula
     /// `compute_graph_chain_rule_gradients`: grad[i] = pre_lower[i]·Σ_j max(A[j,i],0)
     /// (the lower-relaxation derivative for unstable ReLUs). Step 1 of the
@@ -7025,7 +14070,7 @@ mod tests {
     #[test]
     fn crown_resident_backward_captures_relu_alpha_gradients() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let (o, h, i) = (3usize, 5usize, 4usize);
         let mut state: u64 = 0xBEEF_F00D;
         let mut rng = || {
@@ -7046,6 +14091,7 @@ mod tests {
                 bias: None,
                 out_features: o,
                 in_features: h,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: vec![0.5; h],
@@ -7059,6 +14105,7 @@ mod tests {
                 bias: None,
                 out_features: h,
                 in_features: i,
+                cert_err: Default::default(),
             },
         ];
         let mut seed = vec![0.0f32; o * o];
@@ -7134,7 +14181,7 @@ mod tests {
     #[test]
     fn crown_resnet_seeded_fold_captures_gradients_across_segments() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let (o, h, k, i) = (2usize, 3usize, 4usize, 5usize);
         let mut state: u64 = 0xD00D_5EED;
         let mut rng = || {
@@ -7155,6 +14202,7 @@ mod tests {
             bias: None,
             out_features: o,
             in_features: h,
+            cert_err: Default::default(),
         }];
         let seg1_layers = vec![
             GpuCrownLayer::Linear {
@@ -7162,6 +14210,7 @@ mod tests {
                 bias: None,
                 out_features: h,
                 in_features: k,
+                cert_err: Default::default(),
             },
             GpuCrownLayer::Activation {
                 lower_slope: vec![0.5; k],
@@ -7175,6 +14224,7 @@ mod tests {
                 bias: None,
                 out_features: k,
                 in_features: i,
+                cert_err: Default::default(),
             },
         ];
         let segments = vec![
@@ -7248,7 +14298,7 @@ mod tests {
     #[test]
     fn crown_resnet_beta_matches_cpu_formula() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let nn = 3usize;
         let lower_slope = vec![0.5f32, 0.6, 0.4];
         let upper_slope = vec![0.7f32, 0.8, 0.5];
@@ -7381,7 +14431,7 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_single_linear_matches_host() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x12EE_5151;
         let mut rng = || {
             state = state
@@ -7397,6 +14447,7 @@ mod tests {
                 bias: None,
                 out_features: dout,
                 in_features: din,
+                cert_err: Default::default(),
             }];
             let mut spec = vec![0.0f32; dout * dout];
             for i in 0..dout {
@@ -7442,12 +14493,12 @@ mod tests {
     /// that lost mass back. The GPU-resident bound must still enclose the EXACT objective
     /// (and the CPU host). Without the flushacc term this collapses to ~0 and the upper
     /// bound drops below the true ~2^-110 output → UNSOUND; with it, the bound stays
-    /// outward. (On a subnormal-preserving adapter — Vulkan/NVIDIA — nothing flushes, so
-    /// this is a strict non-regression there and a real FTZ guard on Metal.)
+    /// outward. On a preserving path this is a widening-only non-regression; the
+    /// live gradual-underflow probe, not Vulkan/NVIDIA naming, establishes that fact.
     #[test]
     fn crown_backward_sound_resident_daz_subnormal_coeff_stays_outward() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         // (subnormal coeff a, large weight w): the exact product a·w is a NORMAL f32
         // that a flush-to-zero GPU drops to 0. obj(x) = a·w·x over x ∈ [0.5, 1.5].
         let cases: &[(f32, f32)] = &[
@@ -7461,6 +14512,7 @@ mod tests {
                 bias: None,
                 out_features: 1,
                 in_features: 1,
+                cert_err: Default::default(),
             }];
             let spec = vec![a_sub]; // 1×1 objective coefficient (subnormal)
             let (xl, xu) = (vec![0.5f32], vec![1.5f32]);
@@ -7481,12 +14533,13 @@ mod tests {
                 rlo[0],
                 rhi[0]
             );
-            // GPU must also enclose the (also-amplified) CPU host bound.
+            // The independent host oracle must enclose the same exact range.
+            // The two certified implementations use different error accounting,
+            // so neither sound interval is required to enclose the other.
             assert!(
-                f64::from(rlo[0]) <= f64::from(hlo[0]) && f64::from(rhi[0]) >= f64::from(hhi[0]),
-                "DAZ: GPU [{}, {}] does not enclose host [{}, {}]",
-                rlo[0],
-                rhi[0],
+                f64::from(hlo[0]) <= ylo && f64::from(hhi[0]) >= yhi,
+                "DAZ HOST UNSOUND: a={a_sub:e} w={w_large:e} exact obj [{ylo:e}, {yhi:e}] \
+                 not enclosed by host [{}, {}]",
                 hlo[0],
                 hhi[0]
             );
@@ -7499,7 +14552,7 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_multilayer_bias_matches_host() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x77AB_1234;
         let mut rng = || {
             state = state
@@ -7519,12 +14572,14 @@ mod tests {
                     bias: Some(Arc::from(b2.clone().into_boxed_slice())),
                     out_features: dout,
                     in_features: h,
+                    cert_err: Default::default(),
                 },
                 GpuCrownLayer::Linear {
                     weight: Arc::from(w1.clone().into_boxed_slice()),
                     bias: Some(Arc::from(b1.clone().into_boxed_slice())),
                     out_features: h,
                     in_features: din,
+                    cert_err: Default::default(),
                 },
             ];
             let mut spec = vec![0.0f32; dout * dout];
@@ -7588,7 +14643,7 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_activation_matches_host() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x5AC7_9001;
         let mut rng = || {
             state = state
@@ -7617,6 +14672,7 @@ mod tests {
                         bias: Some(Arc::from(b2.clone().into_boxed_slice())),
                         out_features: dout,
                         in_features: h,
+                        cert_err: Default::default(),
                     },
                     GpuCrownLayer::Activation {
                         lower_slope: ls,
@@ -7630,6 +14686,7 @@ mod tests {
                         bias: Some(Arc::from(b1.clone().into_boxed_slice())),
                         out_features: h,
                         in_features: din,
+                        cert_err: Default::default(),
                     },
                 ]
             };
@@ -7749,12 +14806,16 @@ mod tests {
         }
     }
 
-    /// R4: resident single Conv2d. Resident bounds must enclose the host reference
-    /// AND the sampled conv forward output. IC=1, OC=2, K=2×2, IH=IW=3 → OH=OW=2.
+    /// R4 diagnostic: the explicitly unworded resident single-Conv coefficient
+    /// walk must enclose sampled forward outputs. Dedicated tests above pin the
+    /// worded route and gate-on/off identity separately.
     #[test]
-    fn crown_backward_sound_resident_single_conv_matches_host() {
+    fn crown_backward_sound_resident_single_conv_raw_is_sound() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // Raw Conv arithmetic/enclosure oracle; explicitly disable receipts so
+        // the helper can inspect the pre-concretize value/error channels.
+        let _taint_words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let device = require_verdict_device();
         let mut state: u64 = 0xC0AB_2026;
         let mut rng = || {
             state = state
@@ -7784,6 +14845,7 @@ mod tests {
                 out_w: ow,
                 in_h: ih,
                 in_w: iw,
+                cert_err: Default::default(),
             }];
             let mut spec = vec![0.0f32; out_dim * out_dim];
             for i in 0..out_dim {
@@ -7793,21 +14855,10 @@ mod tests {
             let xl: Vec<f32> = xc.iter().map(|&c| c - 0.2).collect();
             let xu: Vec<f32> = xc.iter().map(|&c| c + 0.2).collect();
 
-            let (rlo, rhi) = device
-                .crown_backward_sound_resident(&layers, &spec, out_dim, out_dim, &xl, &xu)
-                .expect("res conv");
-            let (hlo, hhi) = device
-                .crown_backward_sound_host(&layers, &spec, out_dim, out_dim, &xl, &xu)
-                .expect("host conv");
+            let (rlo, rhi) =
+                unworded_resident_test_bounds(&device, &layers, &spec, out_dim, out_dim, &xl, &xu)
+                    .expect("res conv");
             for k in 0..out_dim {
-                assert!(
-                    f64::from(rlo[k]) <= f64::from(hlo[k]) + 3e-4,
-                    "conv lower enclose host"
-                );
-                assert!(
-                    f64::from(rhi[k]) >= f64::from(hhi[k]) - 3e-4,
-                    "conv upper enclose host"
-                );
                 assert!(rlo[k] <= rhi[k]);
             }
             // conv forward: out[oc,oh,ow] = Σ_{kh,kw} W[oc,kh*KW+kw]·x[(oh+kh)*IW+(ow+kw)]
@@ -7847,7 +14898,7 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_seeded_frontier_is_sound() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x5EED_0001;
         let mut rng = || {
             state = state
@@ -7865,6 +14916,7 @@ mod tests {
                 bias: Some(Arc::from(bsuf.clone().into_boxed_slice())),
                 out_features: cdim,
                 in_features: din,
+                cert_err: Default::default(),
             }];
             // Asymmetric frontier (num_specs × cdim) + bias.
             let lower_a: Vec<f32> = (0..num_specs * cdim).map(|_| rng() * 0.8).collect();
@@ -7917,7 +14969,7 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_residual_block_is_sound() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x4E51_DEAD;
         let mut rng = || {
             state = state
@@ -7935,6 +14987,7 @@ mod tests {
                 bias: Some(Arc::from(b.clone().into_boxed_slice())),
                 out_features: d,
                 in_features: d,
+                cert_err: Default::default(),
             }];
             let mut seed = vec![0.0f32; d * d];
             for i in 0..d {
@@ -7977,7 +15030,7 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_stacked_resnet_is_sound() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x57AC_C0DE;
         let mut rng = || {
             state = state
@@ -8000,6 +15053,7 @@ mod tests {
                 bias: Some(Arc::from(b.to_vec().into_boxed_slice())),
                 out_features: o,
                 in_features: i,
+                cert_err: Default::default(),
             };
             let out_chain = vec![lin(&ow, &ob, dout, d)];
             let f2_branch = vec![lin(&f2w, &f2b, d, d)];
@@ -8066,7 +15120,7 @@ mod tests {
     #[test]
     fn crown_backward_resnet_err_concretize_caps_soundly() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x4357_0117;
         let mut rng = || {
             state = state
@@ -8122,6 +15176,7 @@ mod tests {
             bias: Some(Arc::from(b.to_vec().into_boxed_slice())),
             out_features: d,
             in_features: d,
+            cert_err: Default::default(),
         };
         let mut id_w = vec![0.0f32; d * d];
         for i in 0..d {
@@ -8248,7 +15303,7 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_projection_block_is_sound() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0x9803_1CE5;
         let mut rng = || {
             state = state
@@ -8271,6 +15326,7 @@ mod tests {
                 bias: Some(Arc::from(b.to_vec().into_boxed_slice())),
                 out_features: o,
                 in_features: i,
+                cert_err: Default::default(),
             };
             let out_chain = vec![lin(&ow, &ob, dout, dmid)];
             let f_branch = vec![lin(&fw, &fb, dmid, din)];
@@ -8328,7 +15384,10 @@ mod tests {
     #[test]
     fn crown_backward_sound_resident_conv_relu_linear_is_sound() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // Raw Conv arithmetic/enclosure oracle; production AUTO is covered by
+        // the worded Conv receipt and equivalence tests above.
+        let _taint_words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let device = require_verdict_device();
         let mut state: u64 = 0xC04E_70F0;
         let mut rng = || {
             state = state
@@ -8420,6 +15479,7 @@ mod tests {
                     bias: Some(Arc::from(blin.clone().into_boxed_slice())),
                     out_features: dout,
                     in_features: conv_out,
+                    cert_err: Default::default(),
                 },
                 GpuCrownLayer::Activation {
                     lower_slope: ls,
@@ -8443,6 +15503,7 @@ mod tests {
                     out_w: ow,
                     in_h: ih,
                     in_w: iw,
+                    cert_err: Default::default(),
                 },
             ];
             let mut spec = vec![0.0f32; dout * dout];
@@ -8450,9 +15511,9 @@ mod tests {
                 spec[i * dout + i] = 1.0;
             }
 
-            let (rlo, rhi) = device
-                .crown_backward_sound_resident(&layers, &spec, dout, dout, &xl, &xu)
-                .expect("res conv-relu-linear");
+            let (rlo, rhi) =
+                unworded_resident_test_bounds(&device, &layers, &spec, dout, dout, &xl, &xu)
+                    .expect("res conv-relu-linear");
             for k in 0..dout {
                 assert!(rlo[k].is_finite() && rhi[k].is_finite() && rlo[k] <= rhi[k]);
             }
@@ -8494,7 +15555,10 @@ mod tests {
     #[test]
     fn crown_backward_conv_err_per_entry_tighter_than_rowmax_and_sound() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // Compare the two Conv error algorithms directly. The legacy row-max
+        // diagnostic is intentionally unworded, so disable receipts for this A/B.
+        let _taint_words_off = ScopedEnvVar::set("NY_GPU_TAINT_WORDS", "0");
+        let device = require_verdict_device();
         let mut state: u64 = 0xC0DE_C0EF;
         let mut rng = || {
             state = state
@@ -8601,6 +15665,7 @@ mod tests {
             out_w: hw,
             in_h: hw,
             in_w: hw,
+            cert_err: Default::default(),
         };
         let mut layers: Vec<GpuCrownLayer> = Vec::new();
         for li in (0..depth).rev() {
@@ -8620,13 +15685,12 @@ mod tests {
         let spec: Vec<f32> = (0..num_specs * dim).map(|_| rng()).collect();
 
         // Per-entry (default) vs legacy row-max (env), same layers/spec/box.
-        let (lo_pe, hi_pe) = device
-            .crown_backward_sound_resident(&layers, &spec, num_specs, dim, &xl, &xu)
-            .expect("per-entry conv err backward");
+        let (lo_pe, hi_pe) =
+            unworded_resident_test_bounds(&device, &layers, &spec, num_specs, dim, &xl, &xu)
+                .expect("per-entry conv err backward");
         let (lo_rm, hi_rm) = {
             let _guard = ScopedEnvVar::set("NY_CONV_ERR_ROWMAX", "1");
-            device
-                .crown_backward_sound_resident(&layers, &spec, num_specs, dim, &xl, &xu)
+            unworded_resident_test_bounds(&device, &layers, &spec, num_specs, dim, &xl, &xu)
                 .expect("row-max conv err backward")
         };
 
@@ -8723,7 +15787,7 @@ mod tests {
     #[test]
     fn crown_backward_deep_relu_resnet_fine_concretize_caps_explosion() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let mut state: u64 = 0xDEEB_3110;
         let mut rng = || {
             state = state
@@ -8826,6 +15890,7 @@ mod tests {
             bias: Some(Arc::from(b.to_vec().into_boxed_slice())),
             out_features: d,
             in_features: d,
+            cert_err: Default::default(),
         };
         let mut id_w = vec![0.0f32; d * d];
         for i in 0..d {
@@ -9109,7 +16174,7 @@ mod tests {
     #[test]
     fn crown_backward_resnet_auto_fallback_uses_fine_no_env() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
 
         // Shared helpers.
         let absmax = |lo: &[f32], hi: &[f32]| -> Vec<f32> {
@@ -9224,6 +16289,7 @@ mod tests {
                 bias: Some(Arc::from(b.to_vec().into_boxed_slice())),
                 out_features: d,
                 in_features: d,
+                cert_err: Default::default(),
             };
             let mut id_w = vec![0.0f32; d * d];
             for i in 0..d {
@@ -9352,25 +16418,25 @@ mod tests {
         };
 
         // ----------------------------------------------------------------------------
-        // CLAIM 1 — deep CLAMP net (constant-magnitude ±wscale): the un-concretized OFF
-        // bound's certified error L1-overflows f32 and the sound concretize clamps it to
-        // ±FALLBACK_BOUND. The AUTO path (production inner, no env/force) must detect the
-        // ≥FALLBACK_BOUND clamp, fire the fallback, and return a finite, sound bound ≤ OFF.
+        // CLAIM 1 — deep OVERSIZE net (constant-magnitude ±wscale): its exact
+        // outward affine radius itself exceeds FALLBACK_BOUND.  Since the
+        // sentinel is finite rather than mathematical infinity, neither the
+        // cheap nor AUTO path may publish a clamped interval; both must refuse
+        // before dispatch.  The moderate fixture below separately exercises
+        // the valid fine-concretization recovery regime.
         // ----------------------------------------------------------------------------
         {
             let d = 16usize;
             let depth = 52usize;
-            let (segments, seed, _seed_a, frontier, node_abs, xl, xu, ws, bs, w_final, b_final) =
+            let (segments, seed, _seed_a, frontier, node_abs, xl, xu, ..) =
                 build(0xC1A_3110, d, depth, 0.22, true, 0.0, 0.05);
             let frontier_refs: Vec<&[f32]> = frontier.iter().map(|v| v.as_slice()).collect();
             let node_refs: Vec<&[f32]> = node_abs.iter().map(|v| v.as_slice()).collect();
 
-            // OFF baseline: empty frontier_abs ⇒ no fallback (the raw exploding bound).
-            let (lo_off, hi_off) = device
+            let off_error = device
                 .crown_backward_gpu_resnet_sound_inner(&segments, &seed, &xl, &xu, &[], &[])
-                .expect("clamp-net OFF");
-            // AUTO: production wiring — frontier_abs + node_abs threaded, NO env, NO force.
-            let (lo_auto, hi_auto) = device
+                .expect_err("oversize OFF path must refuse the finite fallback sentinel");
+            let auto_error = device
                 .crown_backward_gpu_resnet_sound_inner(
                     &segments,
                     &seed,
@@ -9379,59 +16445,14 @@ mod tests {
                     &frontier_refs,
                     &node_refs,
                 )
-                .expect("clamp-net AUTO");
-            let off_ep_max = lo_off
-                .iter()
-                .chain(hi_off.iter())
-                .fold(0.0f32, |m, &v| m.max(v.abs()));
-            eprintln!(
-                "[auto/clamp] off_ep_max={off_ep_max:.3e} width_off={:.3e} width_auto={:.3e}",
-                width(&lo_off, &hi_off),
-                width(&lo_auto, &hi_auto)
-            );
-
-            // (i) the OFF bound actually exploded into the ±FALLBACK_BOUND clamp (else vacuous).
-            let off_clamped = lo_off
-                .iter()
-                .chain(hi_off.iter())
-                .any(|v| !v.is_finite() || v.abs() >= crate::FALLBACK_BOUND);
-            assert!(
-                off_clamped,
-                "clamp-net OFF did not reach the FALLBACK_BOUND clamp (test vacuous): off_ep_max={off_ep_max}"
-            );
-            // (ii) AUTO is finite and SOUND.
-            for o in 0..d {
+                .expect_err("oversize AUTO path must refuse the finite fallback sentinel");
+            for (route, error) in [("OFF", off_error), ("AUTO", auto_error)] {
+                let message = error.to_string();
                 assert!(
-                    lo_auto[o].is_finite() && hi_auto[o].is_finite(),
-                    "AUTO not finite at {o}: [{}, {}]",
-                    lo_auto[o],
-                    hi_auto[o]
-                );
-                assert!(lo_auto[o] <= hi_auto[o] + 1e-3, "AUTO lower>upper at {o}");
-            }
-            assert_sound(
-                d,
-                depth,
-                &ws,
-                &bs,
-                &w_final,
-                &b_final,
-                &xl,
-                &xu,
-                &lo_auto,
-                &hi_auto,
-                "AUTO clamp-net",
-            );
-            // (iii) INTERSECTION guarantee: AUTO never looser than OFF (the fallback fired and
-            // intersected — proving node_abs reached it). max-of-lowers / min-of-uppers.
-            for o in 0..d {
-                assert!(
-                    lo_auto[o] >= lo_off[o] - 1e-3 && hi_auto[o] <= hi_off[o] + 1e-3,
-                    "AUTO not ≤ OFF (intersection broken) at {o}: off=[{}, {}] auto=[{}, {}]",
-                    lo_off[o],
-                    hi_off[o],
-                    lo_auto[o],
-                    hi_auto[o]
+                    matches!(error, NyError::InvalidSpec(_))
+                        && message.contains("outward affine radius")
+                        && message.contains("FALLBACK_BOUND"),
+                    "oversize {route} path returned the wrong refusal: {message}"
                 );
             }
         }
@@ -9606,15 +16627,14 @@ mod tests {
 
         // ----------------------------------------------------------------------------
         // CLAIM 4 — GRAD variant (#w4-gpu-dag-backward): the alpha-warmup entry
-        // (`crown_backward_gpu_resnet_sound_grad_inner`) now runs the SAME explosion
-        // auto-fallback. On the deep clamp net the OFF grad bound explodes; the AUTO
-        // grad bound must be finite, SOUND, ≤ OFF element-wise, and the per-ReLU
-        // gradients (first pass's) must survive the fallback.
+        // must enforce the SAME finite-sentinel preflight as the plain entry.  The
+        // deep oversize fixture's exact outward radius exceeds FALLBACK_BOUND, so
+        // neither OFF nor AUTO may publish a clamped bound or gradients.
         // ----------------------------------------------------------------------------
         {
             let d = 16usize;
             let depth = 52usize;
-            let (segments, seed, _seed_a, frontier, node_abs, xl, xu, ws, bs, w_final, b_final) =
+            let (segments, seed, _seed_a, frontier, node_abs, xl, xu, ..) =
                 build(0xC1A_3110, d, depth, 0.22, true, 0.0, 0.05);
             let frontier_refs: Vec<&[f32]> = frontier.iter().map(|v| v.as_slice()).collect();
             let node_refs: Vec<&[f32]> = node_abs.iter().map(|v| v.as_slice()).collect();
@@ -9622,7 +16642,7 @@ mod tests {
             // scale the steering gradients; no soundness role).
             let pre_refs: Vec<&[f32]> = node_abs.iter().map(|v| v.as_slice()).collect();
 
-            let (lo_off, hi_off, _g_off) = device
+            let off_error = device
                 .crown_backward_gpu_resnet_sound_grad_inner(
                     &segments,
                     &seed,
@@ -9632,12 +16652,8 @@ mod tests {
                     &[],
                     &[],
                 )
-                .expect("grad clamp-net OFF");
-            assert!(
-                WgpuDevice::resnet_bound_exploded(&lo_off, &hi_off),
-                "grad clamp-net OFF did not reach the FALLBACK_BOUND clamp (test vacuous)"
-            );
-            let (lo_auto, hi_auto, g_auto) = device
+                .expect_err("oversize grad OFF path must refuse the finite fallback sentinel");
+            let auto_error = device
                 .crown_backward_gpu_resnet_sound_grad_inner(
                     &segments,
                     &seed,
@@ -9647,60 +16663,34 @@ mod tests {
                     &frontier_refs,
                     &node_refs,
                 )
-                .expect("grad clamp-net AUTO");
-            for o in 0..d {
+                .expect_err("oversize grad AUTO path must refuse the finite fallback sentinel");
+            for (route, error) in [("OFF", off_error), ("AUTO", auto_error)] {
+                let message = error.to_string();
                 assert!(
-                    lo_auto[o].is_finite() && hi_auto[o].is_finite(),
-                    "grad AUTO not finite at {o}: [{}, {}]",
-                    lo_auto[o],
-                    hi_auto[o]
-                );
-                assert!(
-                    lo_auto[o] >= lo_off[o] - 1e-3 && hi_auto[o] <= hi_off[o] + 1e-3,
-                    "grad AUTO not ≤ OFF (intersection broken) at {o}"
+                    matches!(error, NyError::InvalidSpec(_))
+                        && message.contains("outward affine radius")
+                        && message.contains("FALLBACK_BOUND"),
+                    "oversize grad {route} path returned the wrong refusal: {message}"
                 );
             }
-            assert_sound(
-                d,
-                depth,
-                &ws,
-                &bs,
-                &w_final,
-                &b_final,
-                &xl,
-                &xu,
-                &lo_auto,
-                &hi_auto,
-                "grad AUTO clamp-net",
-            );
-            assert_eq!(
-                g_auto.len(),
-                depth,
-                "grad AUTO must keep the first pass's per-ReLU gradients across the fallback"
-            );
-            assert!(
-                g_auto.iter().flatten().all(|v| v.is_finite()),
-                "grad AUTO gradients must stay finite"
-            );
         }
 
         // ----------------------------------------------------------------------------
         // CLAIM 5 — BETA variant (#w4-gpu-dag-backward): the BaB per-domain entry
-        // (`crown_backward_gpu_resnet_sound_beta_inner`) runs the same fallback. With
-        // β = 0 duals (semantically the plain bound), the AUTO beta bound on the clamp
-        // net must be finite, SOUND, and ≤ OFF element-wise.
+        // must likewise refuse the oversize fixture for both OFF and AUTO.  A zero
+        // dual does not make a finite FALLBACK_BOUND sentinel infinite.
         // ----------------------------------------------------------------------------
         {
             let d = 16usize;
             let depth = 52usize;
-            let (segments, seed, _seed_a, frontier, node_abs, xl, xu, ws, bs, w_final, b_final) =
+            let (segments, seed, _seed_a, frontier, node_abs, xl, xu, ..) =
                 build(0xC1A_3110, d, depth, 0.22, true, 0.0, 0.05);
             let frontier_refs: Vec<&[f32]> = frontier.iter().map(|v| v.as_slice()).collect();
             let node_refs: Vec<&[f32]> = node_abs.iter().map(|v| v.as_slice()).collect();
             let zeros: Vec<Vec<f32>> = (0..depth).map(|_| vec![0.0f32; d]).collect();
             let beta_refs: Vec<&[f32]> = zeros.iter().map(|v| v.as_slice()).collect();
 
-            let (lo_off, hi_off) = device
+            let off_error = device
                 .crown_backward_gpu_resnet_sound_beta_inner(
                     &segments,
                     &seed,
@@ -9710,12 +16700,8 @@ mod tests {
                     &[],
                     &[],
                 )
-                .expect("beta clamp-net OFF");
-            assert!(
-                WgpuDevice::resnet_bound_exploded(&lo_off, &hi_off),
-                "beta clamp-net OFF did not reach the FALLBACK_BOUND clamp (test vacuous)"
-            );
-            let (lo_auto, hi_auto) = device
+                .expect_err("oversize beta OFF path must refuse the finite fallback sentinel");
+            let auto_error = device
                 .crown_backward_gpu_resnet_sound_beta_inner(
                     &segments,
                     &seed,
@@ -9725,32 +16711,16 @@ mod tests {
                     &frontier_refs,
                     &node_refs,
                 )
-                .expect("beta clamp-net AUTO");
-            for o in 0..d {
+                .expect_err("oversize beta AUTO path must refuse the finite fallback sentinel");
+            for (route, error) in [("OFF", off_error), ("AUTO", auto_error)] {
+                let message = error.to_string();
                 assert!(
-                    lo_auto[o].is_finite() && hi_auto[o].is_finite(),
-                    "beta AUTO not finite at {o}: [{}, {}]",
-                    lo_auto[o],
-                    hi_auto[o]
-                );
-                assert!(
-                    lo_auto[o] >= lo_off[o] - 1e-3 && hi_auto[o] <= hi_off[o] + 1e-3,
-                    "beta AUTO not ≤ OFF (intersection broken) at {o}"
+                    matches!(error, NyError::InvalidSpec(_))
+                        && message.contains("outward affine radius")
+                        && message.contains("FALLBACK_BOUND"),
+                    "oversize beta {route} path returned the wrong refusal: {message}"
                 );
             }
-            assert_sound(
-                d,
-                depth,
-                &ws,
-                &bs,
-                &w_final,
-                &b_final,
-                &xl,
-                &xu,
-                &lo_auto,
-                &hi_auto,
-                "beta AUTO clamp-net",
-            );
         }
     }
 
@@ -9802,8 +16772,11 @@ mod tests {
             );
             // Tiny coefficient ⇒ γ_k·s_prod negligible; isolates the prop under-report.
             let s_prod = 5e-4f32;
-            let g = gamma_k_f32(k);
-            let additive = ny_core::ftz_safe_underflow_floor(u32::try_from(k).unwrap_or(u32::MAX)); // FTZ-safe (#gpu-metal)
+            let g = gamma_k_f32(k).expect("test reduction has finite Higham gamma");
+            let additive = crate::wgpu_device::sound_consts::rung3_flush_safe_additive(
+                u32::try_from(k).unwrap_or(u32::MAX),
+            )
+            .expect("test reduction has a representable rung-3 point count"); // FTZ+rung3-fma-safe
 
             // OLD (buggy) combine: fixed slack 1.000001, NO round_up — UNSOUND here.
             let old_cert = (g * s_prod + prop_f32) * 1.000001f32 + additive;
@@ -9814,7 +16787,7 @@ mod tests {
             );
 
             // NEW (fixed) combine: k-scaled slack + round_up_pos — must be OUTWARD.
-            let slack = combine_slack_f32(k);
+            let slack = combine_slack_f32(k).expect("test reduction has finite recovery slack");
             let new_cert = round_up_pos((g * s_prod + prop_f32) * slack + additive);
             assert!(
                 f64::from(new_cert) >= prop_exact,
@@ -9826,7 +16799,7 @@ mod tests {
 
         // ---- LEG 2: real GPU resident path stays sound (and not absurdly loose) ----
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let num_specs = 3usize;
         let of = 512usize;
         let if_ = 4usize;
@@ -9853,6 +16826,7 @@ mod tests {
             bias: None,
             out_features: of,
             in_features: if_,
+            cert_err: Default::default(),
         }];
         let c = device
             .crown_backward_sound_resident_coeff_seeded_err(
@@ -9967,7 +16941,7 @@ mod tests {
     fn crown_backward_gpu_sound_encloses_cpu_sound_and_samples_adversarial() {
         use ny_core::GpuCrownBackward;
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         // The trait object the production un-gated path actually calls.
         let gpu: &dyn GpuCrownBackward = &*device;
 
@@ -10069,6 +17043,7 @@ mod tests {
                         bias: Some(Arc::from(biases[w].clone().into_boxed_slice())),
                         out_features: no,
                         in_features: ni,
+                        cert_err: Default::default(),
                     });
                     // The ReLU BEFORE this Linear (stage index w-1 in pre_l/pre_u).
                     if w > 0 {
@@ -10219,16 +17194,35 @@ mod tests {
     ///   4. the channel actually FIRES: on these cancellation-heavy folds the
     ///      Higham charge is orders above the actual error, so a measurable
     ///      fraction of specs must tighten strictly.
+    ///
+    /// `#u2b` — claim 4 is CONDITIONAL on the adapter, claims 1-3 are not.
+    /// `verify_eft_primitives()` now entails the rung-3 subnormal policy, so on
+    /// an adapter that violates that policy the channel is REFUSED and cannot
+    /// fire. Asserting that it fires would demand tightening without its full
+    /// preconditions. So when the gate refuses, this test
+    /// flips to the complementary oracle that IS checkable there and is just as
+    /// load-bearing: the refusal must be BYTE-IDENTICAL — `NY_EFT_ERR=1` must
+    /// produce bit-for-bit the same bounds as `NY_EFT_ERR` unset. That is the
+    /// fail-closed contract the whole channel design rests on, and before the
+    /// #u2b composition it was FALSE on this box (measured: 72/72 specs
+    /// tightened on an adapter with `verify_gradual_underflow() == false`).
     #[test]
     fn eft_err_channel_ab_tightens_and_stays_sound() {
         use ny_core::GpuCrownBackward;
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let gpu: &dyn GpuCrownBackward = &*device;
-        assert!(
-            device.verify_eft_primitives(),
-            "the GB10 adapter must pass the EFT primitive gate (probe-pinned)"
+        // Hardware fact, not an assertion. Drives which of claim 4 / the
+        // byte-identity claim is checked below.
+        let eft_authorized = device.verify_eft_primitives();
+        println!(
+            "[eft-ab] adapter={} backend={:?} verify_eft_primitives={eft_authorized} \
+             (verify_gradual_underflow={})",
+            device.adapter_info.name,
+            device.adapter_info.backend,
+            device.verify_gradual_underflow(),
         );
+        let mut n_bit_identical = 0usize;
 
         let mut state: u64 = 0x5EED_EF71_2026_0723;
         let mut rng = || {
@@ -10309,6 +17303,7 @@ mod tests {
                         bias: Some(Arc::from(biases[w].clone().into_boxed_slice())),
                         out_features: no,
                         in_features: ni,
+                        cert_err: Default::default(),
                     });
                     if w > 0 {
                         let stage = w - 1;
@@ -10379,6 +17374,7 @@ mod tests {
                                 bias,
                                 out_features,
                                 in_features,
+                                ..
                             } => {
                                 let (of, if_) = (*out_features, *in_features);
                                 if let Some(bs) = bias {
@@ -10490,6 +17486,12 @@ mod tests {
                     if lo_on > lo_off || hi_on < hi_off {
                         n_tightened += 1;
                     }
+                    // #u2b: when the gate REFUSES, the fallback must be exact —
+                    // same bits, not merely "no worse". Counted always, asserted
+                    // below only in the refused case.
+                    if lo_on.to_bits() == lo_off.to_bits() && hi_on.to_bits() == hi_off.to_bits() {
+                        n_bit_identical += 1;
+                    }
                     width_off_sum += f64::from(hi_off) - f64::from(lo_off);
                     width_on_sum += f64::from(hi_on) - f64::from(lo_on);
                     n_specs += 1;
@@ -10529,132 +17531,40 @@ mod tests {
                 }
             }
         }
-        // (4) The channel must actually fire on cancellation-heavy folds.
-        assert!(
-            n_tightened * 2 >= n_specs,
-            "EFT channel barely fired: {n_tightened}/{n_specs} specs tightened"
-        );
+        assert!(n_specs > 0, "the A/B fold produced no specs to compare");
+        if eft_authorized {
+            // (4) The channel must actually fire on cancellation-heavy folds.
+            assert!(
+                n_tightened * 2 >= n_specs,
+                "EFT channel barely fired: {n_tightened}/{n_specs} specs tightened"
+            );
+        } else {
+            // (4′) #u2b BYTE-IDENTICAL REFUSAL. The gate refused, so
+            // `NY_EFT_ERR=1` must be
+            // a complete no-op on the published bounds — every spec bit-for-bit
+            // equal to the gate-off arm. Anything else means some part of the
+            // compensated path is still reachable behind a refused gate.
+            assert_eq!(
+                n_bit_identical,
+                n_specs,
+                "EFT gate REFUSED (verify_eft_primitives=false) but NY_EFT_ERR=1 \
+                 still changed {} / {n_specs} bounds — the refusal is not \
+                 byte-identical, so the compensated channel is partially \
+                 reachable behind a closed gate",
+                n_specs - n_bit_identical
+            );
+            assert_eq!(
+                n_tightened, 0,
+                "EFT gate REFUSED but the channel still tightened {n_tightened} \
+                 specs — a refused gate must not narrow any bound"
+            );
+        }
         println!(
-            "[eft-ab] specs={n_specs} tightened={n_tightened} mean_width off={:.6e} on={:.6e} (ratio {:.3})",
+            "[eft-ab] authorized={eft_authorized} specs={n_specs} tightened={n_tightened} \
+             bit_identical={n_bit_identical} mean_width off={:.6e} on={:.6e} (ratio {:.3})",
             width_off_sum / n_specs as f64,
             width_on_sum / n_specs as f64,
             width_off_sum / width_on_sum.max(1e-300),
-        );
-    }
-
-    /// PERF (#vnncomp-gpu-crown-soundness): the verdict-path speedup the un-gate
-    /// buys. Times the SOUND GPU-resident backward (`crown_backward_gpu_sound`,
-    /// the new gated dispatch — coefficients + certified error stay on-device
-    /// across the whole chain, ONE download) against the host-orchestrated sound
-    /// reference (`crown_backward_sound_host`, the per-layer host round-trip that
-    /// stands in for the CPU-fallback cost the resident path eliminates) on a
-    /// non-trivial multi-layer net. Prints the wall-clock ratio. `#[ignore]` so it
-    /// only runs when asked (it is a measurement, not a pass/fail gate); both
-    /// methods are already proven sound by the enclosure tests above.
-    ///
-    /// Run: `cargo test -p ny-gpu --lib --features gpu-tests \
-    ///   crown_backward_gpu_sound_perf_vs_host -- --ignored --nocapture --test-threads=1`
-    #[test]
-    #[ignore = "perf measurement; run deliberately with --ignored --nocapture"]
-    fn crown_backward_gpu_sound_perf_vs_host() {
-        use ny_core::GpuCrownBackward;
-        use std::time::Instant;
-        let _g = gpu_test_serial_guard();
-        let device = require_device();
-        let gpu: &dyn GpuCrownBackward = &*device;
-
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut rng = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-        };
-
-        // Non-trivial net: 4 hidden Linear+ReLU stages, ~256-wide, dout=128 specs.
-        let din = 200usize;
-        let widths = [256usize, 256, 256, 256];
-        let dout = 128usize;
-        let mut dims = vec![din];
-        dims.extend_from_slice(&widths);
-        dims.push(dout);
-
-        let mut weights: Vec<Vec<f32>> = Vec::new();
-        let mut biases: Vec<Vec<f32>> = Vec::new();
-        for w in 0..dims.len() - 1 {
-            let (ni, no) = (dims[w], dims[w + 1]);
-            weights.push(
-                (0..no * ni)
-                    .map(|_| rng() * (1.0 / (ni as f32).sqrt()))
-                    .collect(),
-            );
-            biases.push((0..no).map(|_| rng() * 0.1).collect());
-        }
-        let xl: Vec<f32> = (0..din).map(|_| -0.3).collect();
-        let xu: Vec<f32> = (0..din).map(|_| 0.3).collect();
-
-        // Build backward-order layers with neutral (identity-active) ReLU slopes —
-        // the timing is dominated by the GEMM chain, not the relaxation values.
-        let mut layers: Vec<GpuCrownLayer> = Vec::new();
-        let n_lin = dims.len() - 1;
-        for w in (0..n_lin).rev() {
-            let (ni, no) = (dims[w], dims[w + 1]);
-            layers.push(GpuCrownLayer::Linear {
-                weight: Arc::from(weights[w].clone().into_boxed_slice()),
-                bias: Some(Arc::from(biases[w].clone().into_boxed_slice())),
-                out_features: no,
-                in_features: ni,
-            });
-            if w > 0 {
-                let nn = dims[w];
-                layers.push(GpuCrownLayer::Activation {
-                    lower_slope: vec![1.0; nn],
-                    upper_slope: vec![1.0; nn],
-                    lower_intercept: vec![0.0; nn],
-                    upper_intercept: vec![0.0; nn],
-                    num_neurons: nn,
-                });
-            }
-        }
-        let mut spec = vec![0.0f32; dout * dout];
-        for i in 0..dout {
-            spec[i * dout + i] = 1.0;
-        }
-
-        // Warm both paths (shader/pipeline compile, allocation) before timing.
-        let _ = gpu
-            .crown_backward_gpu_sound(&layers, &spec, dout, &xl, &xu)
-            .expect("sound resident warmup");
-        let _ = device
-            .crown_backward_sound_host(&layers, &spec, dout, dout, &xl, &xu)
-            .expect("sound host warmup");
-
-        let iters = 10;
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            let _ = gpu
-                .crown_backward_gpu_sound(&layers, &spec, dout, &xl, &xu)
-                .expect("sound resident");
-        }
-        let resident = t0.elapsed().as_secs_f64() / iters as f64;
-
-        let t1 = Instant::now();
-        for _ in 0..iters {
-            let _ = device
-                .crown_backward_sound_host(&layers, &spec, dout, dout, &xl, &xu)
-                .expect("sound host");
-        }
-        let host = t1.elapsed().as_secs_f64() / iters as f64;
-
-        println!(
-            "[PERF] sound GPU-resident backward: {:.3} ms/iter ; host-orchestrated \
-             sound backward: {:.3} ms/iter ; speedup {:.2}x  (net: {din}->{widths:?}->{dout}, \
-             {} specs, {} layers)",
-            resident * 1e3,
-            host * 1e3,
-            host / resident,
-            dout,
-            layers.len(),
         );
     }
 
@@ -10671,7 +17581,7 @@ mod tests {
     #[test]
     fn crown_batched_reference_stacker_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         let (o, h, i) = (3usize, 6usize, 4usize);
         let num_specs = 2usize;
         let mut state: u64 = 0x5EED_B0B5;
@@ -10712,6 +17622,7 @@ mod tests {
                         bias: None,
                         out_features: o,
                         in_features: h,
+                        cert_err: Default::default(),
                     },
                     GpuCrownLayer::Activation {
                         lower_slope: vec![0.30 + 0.13 * df; h],
@@ -10725,6 +17636,7 @@ mod tests {
                         bias: None,
                         out_features: h,
                         in_features: i,
+                        cert_err: Default::default(),
                     },
                 ])],
                 in_lo: (0..i).map(|k| -1.0 - 0.2 * df - 0.05 * k as f32).collect(),
@@ -10848,6 +17760,516 @@ mod tests {
         );
     }
 
+    /// #batched-bab ARMING test (2026-08-11): on a synthetic 2-domain
+    /// RESNET-ish stack (Chain[Linear,Activation] + Residual[Linear], shared
+    /// weight `Arc`s, per-domain DISTINCT relaxation/β/box) the batched trait
+    /// entry must (i) TAKE the wide one-pass sound lane — asserted via the
+    /// PRODUCTION-ARMED `wide_resnet_batched_taken_count()` counter, not probe
+    /// stderr — and (ii) produce per-domain bounds that ENCLOSE the serial
+    /// per-domain sound reference (never tighter beyond the f32 GEMM-reorder
+    /// tolerance: a tighter wide bound is exactly the false-VERIFY hazard the
+    /// refold guard exists for) while matching it two-sided within the same
+    /// tolerance (the in-tree differential-oracle contract).
+    ///
+    /// Also pins the newly-armed deadline-bounded capability surface on the
+    /// REAL device: honest K=8 capacity, working 2-row bounded call that is
+    /// byte-identical to the unbounded sound entry, and a refusal (never a
+    /// late publication) once the deadline has passed.
+    #[test]
+    fn crown_batched_wide_sound_lane_taken_and_encloses_serial_reference() {
+        let _g = gpu_test_serial_guard();
+        // The wide lane is DEFAULT-ON; make the arming explicit + scoped so a
+        // stray environment cannot silently turn this into the stacker path.
+        let _wide_on = ScopedEnvVar::set("NY_BAB_RESNET_WIDE", "1");
+        let device = require_verdict_device();
+
+        // Capability surface (the pre-fix decline point was max_rows == 0).
+        assert!(device.provides_sound_gpu_crown());
+        assert!(device.honors_crown_backward_deadline());
+        assert!(device.provides_deadline_bounded_single_row_resnet_sound());
+        assert_eq!(
+            device.deadline_bounded_resnet_sound_max_rows(),
+            ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
+            "honest bounded-rows capacity must be the full audited K=8 contract"
+        );
+
+        let (o, h) = (3usize, 5usize);
+        let num_specs = 2usize;
+        let mut state: u64 = 0x71DE_A51D_5EED;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        // SHARED weights (same Arc across domains — the homogeneity gate needs
+        // Arc::ptr_eq); per-domain DISTINCT Activation relaxation, box, and β.
+        let w_out: Arc<[f32]> = (0..o * h).map(|_| rng()).collect::<Vec<_>>().into();
+        let w_f: Arc<[f32]> = (0..h * h).map(|_| rng() * 0.4).collect::<Vec<_>>().into();
+        let seed_a: Vec<f32> = (0..num_specs * o).map(|_| rng()).collect();
+        let seed = GpuCrownSeed {
+            lower_a: seed_a.clone().into(),
+            upper_a: seed_a.into(),
+            lower_b: vec![0.0f32; num_specs].into(),
+            upper_b: vec![0.0f32; num_specs].into(),
+            num_specs,
+            current_dim: o,
+        };
+        struct Dom {
+            segments: Vec<GpuResnetSegment>,
+            in_lo: Vec<f32>,
+            in_hi: Vec<f32>,
+            beta: Vec<Vec<f32>>,
+        }
+        let build = |d: usize| -> Dom {
+            let df = d as f32;
+            Dom {
+                segments: vec![
+                    // FOLD order (output→input): output Chain, then the
+                    // residual block (identity skip, affine F) — resnet-ish.
+                    GpuResnetSegment::Chain(vec![
+                        GpuCrownLayer::Linear {
+                            weight: w_out.clone(),
+                            bias: None,
+                            out_features: o,
+                            in_features: h,
+                            cert_err: Default::default(),
+                        },
+                        GpuCrownLayer::Activation {
+                            lower_slope: vec![0.25 + 0.17 * df; h],
+                            upper_slope: vec![0.60 + 0.12 * df; h],
+                            lower_intercept: vec![0.03 * df; h],
+                            upper_intercept: vec![0.08 + 0.04 * df; h],
+                            num_neurons: h,
+                        },
+                    ]),
+                    GpuResnetSegment::Residual(vec![GpuCrownLayer::Linear {
+                        weight: w_f.clone(),
+                        bias: None,
+                        out_features: h,
+                        in_features: h,
+                        cert_err: Default::default(),
+                    }]),
+                ],
+                in_lo: (0..h).map(|k| -0.8 - 0.15 * df - 0.03 * k as f32).collect(),
+                in_hi: (0..h).map(|k| 0.8 + 0.15 * df + 0.03 * k as f32).collect(),
+                beta: vec![vec![0.04 * df; h]],
+            }
+        };
+        let doms: Vec<Dom> = (0..2).map(build).collect();
+        let empty: Vec<Vec<f32>> = Vec::new();
+        let refs: Vec<GpuResnetBatchedDomainRef> = doms
+            .iter()
+            .map(|dd| GpuResnetBatchedDomainRef {
+                segments: &dd.segments,
+                input_lower: &dd.in_lo,
+                input_upper: &dd.in_hi,
+                beta_signed: &dd.beta,
+                frontier_abs: &empty,
+                node_abs: &empty,
+            })
+            .collect();
+
+        // (i) the wide sound lane is TAKEN (production counter, not stderr).
+        let taken_before = super::super::crown_backward::wide_resnet_batched_taken_count();
+        let batched = device
+            .crown_backward_gpu_resnet_sound_beta_batched(&refs, &seed)
+            .expect("batched resnet-ish 2-domain call");
+        assert_eq!(batched.len(), doms.len());
+        assert!(
+            super::super::crown_backward::wide_resnet_batched_taken_count() > taken_before,
+            "the ONE-pass wide sound lane must be TAKEN for a 2-domain homogeneous \
+             resnet-ish batch (counter unchanged ⇒ it fell to the reference stacker)"
+        );
+
+        // (ii) per-domain bounds ENCLOSE the serial sound reference (and match
+        // it two-sided within the oracle's f32 GEMM-reorder tolerance).
+        for (d, dd) in doms.iter().enumerate() {
+            let serial = device
+                .crown_backward_gpu_resnet_sound_beta(
+                    &dd.segments,
+                    &seed,
+                    &dd.in_lo,
+                    &dd.in_hi,
+                    &dd.beta,
+                    &empty,
+                    &empty,
+                )
+                .expect("serial per-domain sound reference");
+            for r in 0..num_specs {
+                let (wl, wu) = (batched[d].lower_bounds[r], batched[d].upper_bounds[r]);
+                let (sl, su) = (serial.lower_bounds[r], serial.upper_bounds[r]);
+                let tol = 1e-3 * (1.0 + sl.abs().max(su.abs()));
+                // ENCLOSURE (soundness-critical direction): the wide bound must
+                // never be TIGHTER than the serial sound reference beyond tol.
+                assert!(
+                    wl <= sl + tol,
+                    "domain {d} row {r}: wide lower {wl} tighter than serial {sl} (+{tol})"
+                );
+                assert!(
+                    wu >= su - tol,
+                    "domain {d} row {r}: wide upper {wu} tighter than serial {su} (-{tol})"
+                );
+                // PARITY (two-sided differential oracle contract).
+                assert!(
+                    (wl - sl).abs() <= tol && (wu - su).abs() <= tol,
+                    "domain {d} row {r}: wide [{wl},{wu}] vs serial [{sl},{su}] exceeds tol {tol}"
+                );
+            }
+        }
+
+        // Deadline-bounded 2-row entry: byte-identical to the unbounded sound
+        // entry under a generous deadline (same inner resident path)...
+        let dd = &doms[0];
+        let generous = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        let bounded = device
+            .crown_backward_gpu_resnet_sound_bounded_rows_with_deadline(
+                &dd.segments,
+                &seed,
+                &dd.in_lo,
+                &dd.in_hi,
+                &empty,
+                &empty,
+                generous,
+            )
+            .expect("bounded 2-row deadline entry");
+        let plain = device
+            .crown_backward_gpu_resnet_sound(
+                &dd.segments,
+                &seed,
+                &dd.in_lo,
+                &dd.in_hi,
+                &empty,
+                &empty,
+            )
+            .expect("unbounded sound entry");
+        assert_eq!(bounded.lower_bounds, plain.lower_bounds);
+        assert_eq!(bounded.upper_bounds, plain.upper_bounds);
+        // ...and a REFUSAL (never a late publication) once the deadline passed.
+        // A deadline captured NOW is already unmet by the entry's pre-check
+        // (`Instant::now() >= deadline`), with no Instant-underflow risk.
+        let expired = std::time::Instant::now();
+        assert!(
+            device
+                .crown_backward_gpu_resnet_sound_bounded_rows_with_deadline(
+                    &dd.segments,
+                    &seed,
+                    &dd.in_lo,
+                    &dd.in_hi,
+                    &empty,
+                    &empty,
+                    expired,
+                )
+                .is_err(),
+            "an expired deadline must refuse, not publish"
+        );
+    }
+
+    /// #batched-bab HOLE-7 SUB-GROUPING device oracle (the coverage increment).
+    ///
+    /// A HETEROGENEOUS wave `[A, A, B, B]` — two skeletons that differ in SEGMENT
+    /// COUNT, per-domain distinct relaxation/box/β — is exactly what today's
+    /// homogeneity gate throws away wholesale. This pins all three behaviours:
+    ///
+    /// 1. GATE OFF (the default, and the scored configuration): the entry still
+    ///    returns `Err` and the production publication counter does NOT move, so
+    ///    landing the lane changes nothing until it is deliberately armed.
+    /// 2. GATE ON: the entry PUBLISHES — the production
+    ///    `wide_resnet_batched_taken_count()` rises (one wide pass per homogeneous
+    ///    run), which is the coverage the campaign is buying — and returns one
+    ///    result per domain in the caller's domain order.
+    /// 3. Every published per-domain bound ENCLOSES that domain's SERIAL sound
+    ///    reference (never tighter beyond the f32 GEMM-reorder tolerance — a
+    ///    tighter sub-grouped bound is precisely the false-VERIFY hazard) and
+    ///    matches it two-sided: the same differential-oracle contract the
+    ///    homogeneous wide lane is held to.
+    #[test]
+    fn crown_batched_wide_subgroup_publishes_and_encloses_serial_reference() {
+        // Review defect 1 (mirror): the unit pin in crown_backward/tests.rs
+        // writes the same NY_BAB_RESNET_WIDE_SUBGROUP under lock_env() only.
+        // Take BOTH guards here too, in the same order, so neither suite can
+        // observe the other's value mid-assertion.
+        let _env_guard = ny_test_utils::env::lock_env();
+        let _g = gpu_test_serial_guard();
+        let _wide_on = ScopedEnvVar::set("NY_BAB_RESNET_WIDE", "1");
+        let device = require_verdict_device();
+
+        let (o, h) = (3usize, 5usize);
+        let num_specs = 2usize;
+        let mut state: u64 = 0x5B67_0FF5_1234;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        // SHARED weights so homogeneity holds WITHIN each run (Arc::ptr_eq).
+        let w_out: Arc<[f32]> = (0..o * h).map(|_| rng()).collect::<Vec<_>>().into();
+        let w_f: Arc<[f32]> = (0..h * h).map(|_| rng() * 0.4).collect::<Vec<_>>().into();
+        let seed_a: Vec<f32> = (0..num_specs * o).map(|_| rng()).collect();
+        let seed = GpuCrownSeed {
+            lower_a: seed_a.clone().into(),
+            upper_a: seed_a.into(),
+            lower_b: vec![0.0f32; num_specs].into(),
+            upper_b: vec![0.0f32; num_specs].into(),
+            num_specs,
+            current_dim: o,
+        };
+        struct Dom {
+            segments: Vec<GpuResnetSegment>,
+            in_lo: Vec<f32>,
+            in_hi: Vec<f32>,
+            beta: Vec<Vec<f32>>,
+        }
+        // `with_residual == false` drops the Residual segment, so skeleton A and
+        // skeleton B differ STRUCTURALLY (segment count) — `resnet_skeleton_matches`
+        // refuses across the A/B boundary while holding inside each run. Both map
+        // input dim h → output dim o, so one shared seed and box length serve both.
+        let build = |d: usize, with_residual: bool| -> Dom {
+            let df = d as f32;
+            let mut segments = vec![GpuResnetSegment::Chain(vec![
+                GpuCrownLayer::Linear {
+                    weight: w_out.clone(),
+                    bias: None,
+                    out_features: o,
+                    in_features: h,
+                    cert_err: Default::default(),
+                },
+                GpuCrownLayer::Activation {
+                    lower_slope: vec![0.25 + 0.11 * df; h],
+                    upper_slope: vec![0.60 + 0.09 * df; h],
+                    lower_intercept: vec![0.03 * df; h],
+                    upper_intercept: vec![0.08 + 0.04 * df; h],
+                    num_neurons: h,
+                },
+            ])];
+            if with_residual {
+                segments.push(GpuResnetSegment::Residual(vec![GpuCrownLayer::Linear {
+                    weight: w_f.clone(),
+                    bias: None,
+                    out_features: h,
+                    in_features: h,
+                    cert_err: Default::default(),
+                }]));
+            }
+            Dom {
+                segments,
+                in_lo: (0..h).map(|k| -0.8 - 0.13 * df - 0.03 * k as f32).collect(),
+                in_hi: (0..h).map(|k| 0.8 + 0.13 * df + 0.03 * k as f32).collect(),
+                beta: vec![vec![0.04 * df; h]],
+            }
+        };
+        // Contiguous runs: domains 0,1 share skeleton A; domains 2,3 share B.
+        let doms: Vec<Dom> = vec![
+            build(0, true),
+            build(1, true),
+            build(2, false),
+            build(3, false),
+        ];
+        let empty: Vec<Vec<f32>> = Vec::new();
+        let refs: Vec<GpuResnetBatchedDomainRef> = doms
+            .iter()
+            .map(|dd| GpuResnetBatchedDomainRef {
+                segments: &dd.segments,
+                input_lower: &dd.in_lo,
+                input_upper: &dd.in_hi,
+                beta_signed: &dd.beta,
+                frontier_abs: &empty,
+                node_abs: &empty,
+            })
+            .collect();
+        // Fixture self-check: the wave really is heterogeneous (differing segment
+        // COUNT is what `resnet_skeleton_matches` refuses on), or the test would
+        // silently prove nothing about sub-grouping.
+        assert_eq!(doms[0].segments.len(), doms[1].segments.len());
+        assert_eq!(doms[2].segments.len(), doms[3].segments.len());
+        assert_ne!(
+            doms[0].segments.len(),
+            doms[2].segments.len(),
+            "fixture bug: skeletons A and B must differ for this to exercise HOLE 7"
+        );
+
+        // (1) GATE OFF ⇒ historical refusal, and NO publication.
+        {
+            let _off = ScopedEnvVar::unset("NY_BAB_RESNET_WIDE_SUBGROUP");
+            let before = super::super::crown_backward::wide_resnet_batched_taken_count();
+            assert!(
+                device
+                    .crown_backward_gpu_resnet_sound_beta_batched(&refs, &seed)
+                    .is_err(),
+                "with the sub-group gate OFF a heterogeneous batch must still abort \
+                 to the caller's serial path (byte-identical scored routing)"
+            );
+            assert_eq!(
+                super::super::crown_backward::wide_resnet_batched_taken_count(),
+                before,
+                "the dark gate must not publish anything"
+            );
+        }
+
+        // (2) GATE ON ⇒ the wave PUBLISHES, one wide pass per homogeneous run.
+        let _sub_on = ScopedEnvVar::set("NY_BAB_RESNET_WIDE_SUBGROUP", "1");
+        let taken_before = super::super::crown_backward::wide_resnet_batched_taken_count();
+        let batched = device
+            .crown_backward_gpu_resnet_sound_beta_batched(&refs, &seed)
+            .expect("sub-grouped heterogeneous batch must publish");
+        assert_eq!(batched.len(), doms.len(), "one result per domain, in order");
+        assert!(
+            super::super::crown_backward::wide_resnet_batched_taken_count() >= taken_before + 2,
+            "each homogeneous run is one wide publication (>= 2 for A,A|B,B); the \
+             counter standing still means the whole wave silently fell back"
+        );
+
+        // (3) ENCLOSURE + two-sided parity against the SERIAL per-domain reference.
+        for (d, dd) in doms.iter().enumerate() {
+            let serial = device
+                .crown_backward_gpu_resnet_sound_beta(
+                    &dd.segments,
+                    &seed,
+                    &dd.in_lo,
+                    &dd.in_hi,
+                    &dd.beta,
+                    &empty,
+                    &empty,
+                )
+                .expect("serial per-domain sound reference");
+            for r in 0..num_specs {
+                let (wl, wu) = (batched[d].lower_bounds[r], batched[d].upper_bounds[r]);
+                let (sl, su) = (serial.lower_bounds[r], serial.upper_bounds[r]);
+                let tol = 1e-3 * (1.0 + sl.abs().max(su.abs()));
+                assert!(
+                    wl <= sl + tol,
+                    "domain {d} row {r}: sub-grouped lower {wl} TIGHTER than serial {sl} (+{tol})"
+                );
+                assert!(
+                    wu >= su - tol,
+                    "domain {d} row {r}: sub-grouped upper {wu} TIGHTER than serial {su} (-{tol})"
+                );
+                assert!(
+                    (wl - sl).abs() <= tol && (wu - su).abs() <= tol,
+                    "domain {d} row {r}: sub-grouped [{wl},{wu}] vs serial [{sl},{su}] > tol {tol}"
+                );
+            }
+        }
+    }
+
+    /// #batched-bab HOLE-7 SUB-GROUPING fail-closed pin: arming the sub-group lane
+    /// must NOT weaken HOLE 8. A heterogeneous wave in which one run carries a
+    /// dual-alpha ReLU (backward shader not domain-block-indexed) must be refused
+    /// WHOLESALE — never partially folded, never mixed wide-and-serial — so the
+    /// caller's proven per-domain path runs exactly as it does today.
+    #[test]
+    fn crown_batched_wide_subgroup_still_declines_hole8_runs() {
+        // Review defect 1 (mirror): the unit pin in crown_backward/tests.rs
+        // writes the same NY_BAB_RESNET_WIDE_SUBGROUP under lock_env() only.
+        // Take BOTH guards here too, in the same order, so neither suite can
+        // observe the other's value mid-assertion.
+        let _env_guard = ny_test_utils::env::lock_env();
+        let _g = gpu_test_serial_guard();
+        let _wide_on = ScopedEnvVar::set("NY_BAB_RESNET_WIDE", "1");
+        let _sub_on = ScopedEnvVar::set("NY_BAB_RESNET_WIDE_SUBGROUP", "1");
+        let device = require_device();
+
+        let (o, h) = (3usize, 4usize);
+        let num_specs = 1usize;
+        let w_out: Arc<[f32]> = (0..o * h)
+            .map(|n| 0.02 * n as f32)
+            .collect::<Vec<_>>()
+            .into();
+        let seed_a: Vec<f32> = (0..num_specs * o).map(|n| 0.1 * (n as f32 + 1.0)).collect();
+        let seed = GpuCrownSeed {
+            lower_a: seed_a.clone().into(),
+            upper_a: seed_a.into(),
+            lower_b: vec![0.0f32; num_specs].into(),
+            upper_b: vec![0.0f32; num_specs].into(),
+            num_specs,
+            current_dim: o,
+        };
+        let plain = |slope: f32| -> Vec<GpuResnetSegment> {
+            vec![GpuResnetSegment::Chain(vec![
+                GpuCrownLayer::Linear {
+                    weight: w_out.clone(),
+                    bias: None,
+                    out_features: o,
+                    in_features: h,
+                    cert_err: Default::default(),
+                },
+                GpuCrownLayer::Activation {
+                    lower_slope: vec![slope; h],
+                    upper_slope: vec![slope + 0.3; h],
+                    lower_intercept: vec![0.0; h],
+                    upper_intercept: vec![0.05; h],
+                    num_neurons: h,
+                },
+            ])]
+        };
+        // Run 2 is HOLE-8: a dual-alpha ReLU the wide fold cannot domain-block.
+        let hole8 = vec![GpuResnetSegment::Chain(vec![
+            GpuCrownLayer::Linear {
+                weight: w_out.clone(),
+                bias: None,
+                out_features: o,
+                in_features: h,
+                cert_err: Default::default(),
+            },
+            GpuCrownLayer::ActivationReluDualAlpha {
+                lower_pos_slope: vec![0.5; h],
+                cross_slope: vec![0.6; h],
+                upper_neg_slope: vec![0.5; h],
+                cross_intercept: vec![0.1; h],
+                num_neurons: h,
+            },
+        ])];
+        let (s0, s1, s2) = (plain(0.25), plain(0.35), hole8);
+        let (lo, hi) = (vec![-1.0f32; h], vec![1.0f32; h]);
+        let beta: Vec<Vec<f32>> = vec![vec![0.0; h]];
+        let empty: Vec<Vec<f32>> = Vec::new();
+        // Inlined (was a closure): a closure cannot express "the returned ref
+        // borrows from the ARGUMENT, not from my frame", so the three domain
+        // refs are built directly.
+        let dom = |segments: &'static Vec<GpuResnetSegment>| segments;
+        let _ = dom;
+        let refs = vec![
+            GpuResnetBatchedDomainRef {
+                segments: &s0,
+                input_lower: &lo,
+                input_upper: &hi,
+                beta_signed: &beta,
+                frontier_abs: &empty,
+                node_abs: &empty,
+            },
+            GpuResnetBatchedDomainRef {
+                segments: &s1,
+                input_lower: &lo,
+                input_upper: &hi,
+                beta_signed: &beta,
+                frontier_abs: &empty,
+                node_abs: &empty,
+            },
+            GpuResnetBatchedDomainRef {
+                segments: &s2,
+                input_lower: &lo,
+                input_upper: &hi,
+                beta_signed: &beta,
+                frontier_abs: &empty,
+                node_abs: &empty,
+            },
+        ];
+        let before = super::super::crown_backward::wide_resnet_batched_taken_count();
+        assert!(
+            device
+                .crown_backward_gpu_resnet_sound_beta_batched(&refs, &seed)
+                .is_err(),
+            "a wave containing a HOLE-8 run must be refused wholesale even with \
+             sub-grouping armed"
+        );
+        assert_eq!(
+            super::super::crown_backward::wide_resnet_batched_taken_count(),
+            before,
+            "fail-closed means NO run is published when any run is unfoldable"
+        );
+    }
+
     /// #metaroom-chain-wide differential oracle: a PURE-CHAIN CONV batch — the exact
     /// segment shape the chain-permitting extractor emits for metaroom's 6cnn conv
     /// chains (`segments = [Chain(conv, act, conv, act, conv)]`, ONE per-segment
@@ -10861,7 +18283,10 @@ mod tests {
     #[test]
     fn crown_batched_chain_only_conv_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // This is verdict-facing: AUTO must carry Conv words and run the full
+        // two-sided/contamination oracle below.
+        let _taint_words_auto = ScopedEnvVar::unset("NY_GPU_TAINT_WORDS");
+        let device = require_verdict_device();
         // D = c*hw*hw shared dim; convs are same-padding (k=3,pad=1 → out=hw).
         let (c, hw, k) = (2usize, 3usize, 3usize);
         let d = c * hw * hw; // 18
@@ -10919,6 +18344,7 @@ mod tests {
             out_w: hw,
             in_h: hw,
             in_w: hw,
+            cert_err: Default::default(),
         };
         let build = |dd: usize| -> Dom {
             let df = dd as f32;
@@ -10972,7 +18398,7 @@ mod tests {
         // batch; each domain block matches its serial per-domain bound.
         let batched = device
             .crown_backward_gpu_resnet_sound_beta_batched(&refs, &seed)
-            .expect("chain-only conv batched");
+            .expect("worded pure-Conv chain batch");
         assert_eq!(batched.len(), doms.len());
         let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * (1.0 + a.abs().max(b.abs()));
         for (dd, dom) in doms.iter().enumerate() {
@@ -11056,7 +18482,10 @@ mod tests {
     #[test]
     fn crown_batched_wide_multi_segment_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // This is a verdict-facing entry: pin today's typed refusal, while
+        // retaining the differential oracle for the day Conv words are admitted.
+        let _taint_words_auto = ScopedEnvVar::unset("NY_GPU_TAINT_WORDS");
+        let device = require_verdict_device();
         // D = c*hw*hw shared block dim; conv is same-padding (k=3,pad=1 → out=hw).
         let (c, hw, k) = (2usize, 3usize, 3usize);
         let d = c * hw * hw; // 18
@@ -11109,6 +18538,7 @@ mod tests {
                 out_w: hw,
                 in_h: hw,
                 in_w: hw,
+                cert_err: Default::default(),
             };
             let act = || GpuCrownLayer::Activation {
                 lower_slope: vec![0.30 + 0.13 * df; d],
@@ -11122,6 +18552,7 @@ mod tests {
                 bias: None,
                 out_features: d,
                 in_features: d,
+                cert_err: Default::default(),
             };
             Dom {
                 // Backward order (output→input): Conv chain, then identity residual.
@@ -11165,7 +18596,7 @@ mod tests {
         // block matches its serial per-domain bound within an f32 GEMM-reorder tol.
         let batched = device
             .crown_backward_gpu_resnet_sound_beta_batched(&refs, &seed)
-            .expect("wide multi-segment batched");
+            .expect("worded Conv residual batch");
         assert_eq!(batched.len(), doms.len());
         let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * (1.0 + a.abs().max(b.abs()));
         for (dd, dom) in doms.iter().enumerate() {
@@ -11261,6 +18692,7 @@ mod tests {
                     bias: None,
                     out_features: o,
                     in_features: h,
+                    cert_err: Default::default(),
                 },
                 dual(),
                 GpuCrownLayer::Linear {
@@ -11268,6 +18700,7 @@ mod tests {
                     bias: None,
                     out_features: h,
                     in_features: i,
+                    cert_err: Default::default(),
                 },
             ])]
         };
@@ -11302,6 +18735,78 @@ mod tests {
         );
     }
 
+    /// Dense Complete Clip gather regression: force the compute path just above
+    /// [`LEGACY_BETA_GATHER_MAX_COPIES`] and prove it is a bit-exact strided copy
+    /// of the pre-activation lower-A matrix. The final requested column is
+    /// deliberately out of range and must retain the legacy `+0.0` behavior.
+    #[test]
+    fn crown_dense_strided_gather_is_bit_exact() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let num_specs = 65usize;
+        let num_neurons = 64usize;
+        let gather_cols: Vec<u32> = (0..=num_neurons as u32).collect();
+        assert!(
+            num_specs * gather_cols.len() > LEGACY_BETA_GATHER_MAX_COPIES,
+            "fixture must exercise the compute gather"
+        );
+
+        let lower_a: Vec<f32> = (0..num_specs * num_neurons)
+            .map(|i| ((i * 37 % 1009) as f32 - 504.0) / 257.0)
+            .collect();
+        let seed = GpuCrownSeed {
+            lower_a: lower_a.clone().into(),
+            upper_a: lower_a.clone().into(),
+            lower_b: vec![0.0; num_specs].into(),
+            upper_b: vec![0.0; num_specs].into(),
+            num_specs,
+            current_dim: num_neurons,
+        };
+        let segments = vec![GpuResnetSegment::Chain(vec![GpuCrownLayer::Activation {
+            lower_slope: vec![0.4; num_neurons],
+            upper_slope: vec![0.7; num_neurons],
+            lower_intercept: vec![0.0; num_neurons],
+            upper_intercept: vec![0.0; num_neurons],
+            num_neurons,
+        }])];
+        let input_lower = vec![-1.0; num_neurons];
+        let input_upper = vec![1.0; num_neurons];
+        let beta_signed = vec![vec![0.0; num_neurons]];
+        let domain = GpuResnetBatchedDomainRef {
+            segments: &segments,
+            input_lower: &input_lower,
+            input_upper: &input_upper,
+            beta_signed: &beta_signed,
+            frontier_abs: &[],
+            node_abs: &[],
+        };
+        let (_bounds, _alpha_grads, gathered) = device
+            .crown_backward_gpu_resnet_sound_beta_batched_grad(
+                &[domain],
+                &seed,
+                &[gather_cols.as_slice()],
+                &[],
+            )
+            .expect("dense strided gather");
+        assert_eq!(gathered.len(), 1);
+        assert_eq!(gathered[0].len(), num_specs * gather_cols.len());
+        for row in 0..num_specs {
+            for slot in 0..gather_cols.len() {
+                let actual = gathered[0][row * gather_cols.len() + slot];
+                let expected = if slot < num_neurons {
+                    lower_a[row * num_neurons + slot]
+                } else {
+                    0.0
+                };
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "row {row} gather slot {slot}: actual={actual} expected={expected}"
+                );
+            }
+        }
+    }
+
     /// #batched-bab part A — the wide-GATHER differential oracle (step 3 of the wide
     /// β-opt plan). The wide-grad batched backward gathers A_lower at the per-ReLU UNION
     /// of all domains' split columns; each domain's OWN columns' values at its OWN rows
@@ -11312,9 +18817,11 @@ mod tests {
     #[test]
     fn crown_batched_wide_grad_gather_matches_serial_per_domain() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
-        let (c, hw, k) = (2usize, 3usize, 3usize);
-        let d = c * hw * hw; // 18
+        let device = require_verdict_device();
+        // This oracle targets domain-block gather indexing, not affine transport.
+        // Use an Activation-only topology so this oracle isolates domain-block
+        // gather indexing from affine transport.
+        let d = 18usize;
         let nsp = 2usize;
         let n_domains = 3usize;
         let n_relu = 2usize;
@@ -11325,11 +18832,6 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
-        let conv_w: Arc<[f32]> = (0..c * c * k * k)
-            .map(|_| rng() * 0.3)
-            .collect::<Vec<_>>()
-            .into();
-        let lin_w: Arc<[f32]> = (0..d * d).map(|_| rng() * 0.2).collect::<Vec<_>>().into();
         let seed_a: Vec<f32> = (0..nsp * d).map(|_| rng()).collect();
         let seed = GpuCrownSeed {
             lower_a: seed_a.clone().into(),
@@ -11349,43 +18851,21 @@ mod tests {
             na: Vec<Vec<f32>>,
             gidx: Vec<Vec<u32>>, // per-ReLU split columns (fold order), DISTINCT per domain
         }
-        let build = |dd: usize, cw: &Arc<[f32]>, lw: &Arc<[f32]>| -> Dom {
+        let build = |dd: usize| -> Dom {
             let df = dd as f32;
-            let conv = GpuCrownLayer::Conv2d {
-                weight_col: cw.clone(),
-                bias_expanded: None,
-                out_channels: c,
-                in_channels: c,
-                kernel_h: k,
-                kernel_w: k,
-                stride_h: 1,
-                stride_w: 1,
-                pad_h: 1,
-                pad_w: 1,
-                out_h: hw,
-                out_w: hw,
-                in_h: hw,
-                in_w: hw,
-            };
-            let act = || GpuCrownLayer::Activation {
-                lower_slope: vec![0.30 + 0.13 * df; d],
-                upper_slope: vec![0.62 + 0.11 * df; d],
-                lower_intercept: vec![0.02 * df; d],
-                upper_intercept: vec![0.10 + 0.03 * df; d],
+            let act = |slot: f32| GpuCrownLayer::Activation {
+                lower_slope: vec![0.30 + 0.13 * df + 0.04 * slot; d],
+                upper_slope: vec![0.62 + 0.11 * df + 0.03 * slot; d],
+                lower_intercept: vec![0.02 * df + 0.01 * slot; d],
+                upper_intercept: vec![0.10 + 0.03 * df + 0.02 * slot; d],
                 num_neurons: d,
-            };
-            let lin = GpuCrownLayer::Linear {
-                weight: lw.clone(),
-                bias: None,
-                out_features: d,
-                in_features: d,
             };
             let dd = dd as u32;
             let dm = d as u32;
             Dom {
                 segments: vec![
-                    GpuResnetSegment::Chain(vec![conv, act()]),
-                    GpuResnetSegment::Residual(vec![lin, act()]),
+                    GpuResnetSegment::Chain(vec![act(0.0)]),
+                    GpuResnetSegment::Residual(vec![act(1.0)]),
                 ],
                 in_lo: (0..d).map(|j| -1.0 - 0.2 * df - 0.03 * j as f32).collect(),
                 in_hi: (0..d).map(|j| 1.0 + 0.2 * df + 0.03 * j as f32).collect(),
@@ -11406,9 +18886,7 @@ mod tests {
             }
         };
 
-        let doms: Vec<Dom> = (0..n_domains)
-            .map(|dd| build(dd, &conv_w, &lin_w))
-            .collect();
+        let doms: Vec<Dom> = (0..n_domains).map(build).collect();
         let union_cols: Vec<Vec<u32>> = (0..n_relu)
             .map(|r| {
                 let mut u: Vec<u32> = doms
@@ -11501,11 +18979,9 @@ mod tests {
         }
 
         // CONTAM: mutate ONLY domain 1's slopes → domains 0 and 2's gather blocks byte-exact.
-        let mut doms2: Vec<Dom> = (0..n_domains)
-            .map(|dd| build(dd, &conv_w, &lin_w))
-            .collect();
+        let mut doms2: Vec<Dom> = (0..n_domains).map(build).collect();
         if let GpuResnetSegment::Chain(ls) = &mut doms2[1].segments[0] {
-            if let GpuCrownLayer::Activation { lower_slope, .. } = &mut ls[1] {
+            if let GpuCrownLayer::Activation { lower_slope, .. } = &mut ls[0] {
                 for s in lower_slope.iter_mut() {
                     *s += 0.3;
                 }
@@ -11549,9 +19025,11 @@ mod tests {
     #[test]
     fn crown_batched_wide_alpha_grads_match_serial_per_domain() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
-        let (c, hw, k) = (2usize, 3usize, 3usize);
-        let d = c * hw * hw; // 18
+        let device = require_verdict_device();
+        // Alpha-gradient parity needs two relaxation sites and distinct domain
+        // blocks, not affine kernels. Activation-only Chain + Residual keeps the
+        // fixture inside the admitted worded route.
+        let d = 18usize;
         let nsp = 2usize;
         let n_domains = 3usize;
         let n_relu = 2usize;
@@ -11562,11 +19040,6 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
-        let conv_w: Arc<[f32]> = (0..c * c * k * k)
-            .map(|_| rng() * 0.3)
-            .collect::<Vec<_>>()
-            .into();
-        let lin_w: Arc<[f32]> = (0..d * d).map(|_| rng() * 0.2).collect::<Vec<_>>().into();
         let seed_a: Vec<f32> = (0..nsp * d).map(|_| rng()).collect();
         let seed = GpuCrownSeed {
             lower_a: seed_a.clone().into(),
@@ -11585,41 +19058,19 @@ mod tests {
             na: Vec<Vec<f32>>,
             pl: Vec<Vec<f32>>, // per-ReLU pre-activation lower (stable masked 0), DISTINCT per domain
         }
-        let build = |dd: usize, cw: &Arc<[f32]>, lw: &Arc<[f32]>| -> Dom {
+        let build = |dd: usize| -> Dom {
             let df = dd as f32;
-            let conv = GpuCrownLayer::Conv2d {
-                weight_col: cw.clone(),
-                bias_expanded: None,
-                out_channels: c,
-                in_channels: c,
-                kernel_h: k,
-                kernel_w: k,
-                stride_h: 1,
-                stride_w: 1,
-                pad_h: 1,
-                pad_w: 1,
-                out_h: hw,
-                out_w: hw,
-                in_h: hw,
-                in_w: hw,
-            };
-            let act = || GpuCrownLayer::Activation {
-                lower_slope: vec![0.30 + 0.13 * df; d],
-                upper_slope: vec![0.62 + 0.11 * df; d],
-                lower_intercept: vec![0.02 * df; d],
-                upper_intercept: vec![0.10 + 0.03 * df; d],
+            let act = |slot: f32| GpuCrownLayer::Activation {
+                lower_slope: vec![0.30 + 0.13 * df + 0.04 * slot; d],
+                upper_slope: vec![0.62 + 0.11 * df + 0.03 * slot; d],
+                lower_intercept: vec![0.02 * df + 0.01 * slot; d],
+                upper_intercept: vec![0.10 + 0.03 * df + 0.02 * slot; d],
                 num_neurons: d,
-            };
-            let lin = GpuCrownLayer::Linear {
-                weight: lw.clone(),
-                bias: None,
-                out_features: d,
-                in_features: d,
             };
             Dom {
                 segments: vec![
-                    GpuResnetSegment::Chain(vec![conv, act()]),
-                    GpuResnetSegment::Residual(vec![lin, act()]),
+                    GpuResnetSegment::Chain(vec![act(0.0)]),
+                    GpuResnetSegment::Residual(vec![act(1.0)]),
                 ],
                 in_lo: (0..d).map(|j| -1.0 - 0.2 * df - 0.03 * j as f32).collect(),
                 in_hi: (0..d).map(|j| 1.0 + 0.2 * df + 0.03 * j as f32).collect(),
@@ -11650,9 +19101,7 @@ mod tests {
                     .collect(),
             }
         };
-        let doms: Vec<Dom> = (0..n_domains)
-            .map(|dd| build(dd, &conv_w, &lin_w))
-            .collect();
+        let doms: Vec<Dom> = (0..n_domains).map(build).collect();
         let refs: Vec<GpuResnetBatchedDomainRef> = doms
             .iter()
             .map(|dm| GpuResnetBatchedDomainRef {
@@ -11720,9 +19169,7 @@ mod tests {
         }
 
         // CONTAMINATION: mutate dom 1's slopes AND pre_lower; doms 0/2 byte-identical.
-        let mut doms2: Vec<Dom> = (0..n_domains)
-            .map(|dd| build(dd, &conv_w, &lin_w))
-            .collect();
+        let mut doms2: Vec<Dom> = (0..n_domains).map(build).collect();
         for seg in doms2[1].segments.iter_mut() {
             let layers = match seg {
                 GpuResnetSegment::Chain(l) | GpuResnetSegment::Residual(l) => l,
@@ -11941,7 +19388,10 @@ mod tests {
         use ny_tensor::BoundedTensor;
 
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        // Keep AUTO armed; the Conv-capable wide helper must execute, and any
+        // regression is a hard test failure rather than a vacuous fallback.
+        let _taint_words_auto = ScopedEnvVar::unset("NY_GPU_TAINT_WORDS");
+        let device = require_verdict_device();
 
         // input [1,4,4] → conv1(1→2) → relu1 → [F: conv2(2→2) → relu2] →
         // add(relu2, relu1) → flatten → lin1(32→3) → relu3 → lin2(3→2).
@@ -12049,7 +19499,7 @@ mod tests {
                 plan.output_dim,
                 plan.input_dim,
             )
-            .expect("batched resnet point VJP");
+            .expect("batched Conv residual point VJP");
         assert_eq!(grads.len(), k_restarts);
 
         // Sequential oracle per restart: the exact point-Jacobian VJP through
@@ -12118,12 +19568,14 @@ mod tests {
     #[test]
     fn crown_batched_wide_subchunk_is_bit_identical_to_single_pass() {
         let _g = gpu_test_serial_guard();
-        let device = require_device();
+        let device = require_verdict_device();
         // Clear any inherited cap so the "single pass" baseline truly runs unchunked.
         let _cap_clear = ScopedEnvVar::unset("NY_WIDE_MAX_STACKED_ROWS");
 
-        let (c, hw, k) = (2usize, 3usize, 3usize);
-        let d = c * hw * hw; // 18
+        // Subchunk stitching is independent of affine transport. Two Activation
+        // sites preserve every bounds/gradient/gather channel while keeping the
+        // fixture compact.
+        let d = 18usize;
         let nsp = 2usize;
         let n_domains = 7usize; // odd, > cap, so groups are ragged (2,2,2,1)
         let n_relu = 2usize;
@@ -12134,11 +19586,6 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
-        let conv_w: Arc<[f32]> = (0..c * c * k * k)
-            .map(|_| rng() * 0.3)
-            .collect::<Vec<_>>()
-            .into();
-        let lin_w: Arc<[f32]> = (0..d * d).map(|_| rng() * 0.2).collect::<Vec<_>>().into();
         let seed_a: Vec<f32> = (0..nsp * d).map(|_| rng()).collect();
         let seed = GpuCrownSeed {
             lower_a: seed_a.clone().into(),
@@ -12160,39 +19607,17 @@ mod tests {
         // Distinct per-domain relaxation/box so a mis-stitched sub-chunk would diverge.
         let build = |dd: usize| -> Dom {
             let df = dd as f32;
-            let conv = GpuCrownLayer::Conv2d {
-                weight_col: conv_w.clone(),
-                bias_expanded: None,
-                out_channels: c,
-                in_channels: c,
-                kernel_h: k,
-                kernel_w: k,
-                stride_h: 1,
-                stride_w: 1,
-                pad_h: 1,
-                pad_w: 1,
-                out_h: hw,
-                out_w: hw,
-                in_h: hw,
-                in_w: hw,
-            };
-            let act = || GpuCrownLayer::Activation {
-                lower_slope: vec![0.28 + 0.09 * df; d],
-                upper_slope: vec![0.61 + 0.07 * df; d],
-                lower_intercept: vec![0.015 * df; d],
-                upper_intercept: vec![0.08 + 0.02 * df; d],
+            let act = |slot: f32| GpuCrownLayer::Activation {
+                lower_slope: vec![0.28 + 0.06 * df + 0.03 * slot; d],
+                upper_slope: vec![0.61 + 0.04 * df + 0.02 * slot; d],
+                lower_intercept: vec![0.015 * df + 0.01 * slot; d],
+                upper_intercept: vec![0.08 + 0.02 * df + 0.015 * slot; d],
                 num_neurons: d,
-            };
-            let lin = GpuCrownLayer::Linear {
-                weight: lin_w.clone(),
-                bias: None,
-                out_features: d,
-                in_features: d,
             };
             Dom {
                 segments: vec![
-                    GpuResnetSegment::Chain(vec![conv, act()]),
-                    GpuResnetSegment::Residual(vec![lin, act()]),
+                    GpuResnetSegment::Chain(vec![act(0.0)]),
+                    GpuResnetSegment::Residual(vec![act(1.0)]),
                 ],
                 in_lo: (0..d).map(|j| -1.0 - 0.2 * df - 0.03 * j as f32).collect(),
                 in_hi: (0..d).map(|j| 1.0 + 0.2 * df + 0.03 * j as f32).collect(),
@@ -12316,6 +19741,1745 @@ mod tests {
                     "relu {r} gather[{i}]: single {a} vs sub-chunk {b}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "gpu-tests"))]
+mod u1_composed_sequence_integrity {
+    use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
+    use wgpu::util::DeviceExt;
+
+    /// CPU twin of `GEMM_F32_EFT_TWIN_SHADER`, replicating its op sequence
+    /// EXACTLY — including the 16-wide k tiling and the zero-padded OOB taps,
+    /// because the residual channel measures the sequence it executes.
+    fn cpu_twin(a: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+        const TILE: usize = 16;
+        const F32_MIN_NORMAL: f32 = 1.1754944e-38;
+        const FLOOR: f32 = 3.9443045e-31; // 2^-101
+        let mut v = vec![0.0f32; m * n];
+        let mut r = vec![0.0f32; m * n];
+        let num_tiles = k.div_ceil(TILE);
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                let mut rsum = 0.0f32;
+                for t in 0..num_tiles {
+                    for kk in 0..TILE {
+                        let idx = t * TILE + kk;
+                        // Zero-padded exactly as the shader's tile loads do.
+                        let av = if idx < k { a[row * k + idx] } else { 0.0 };
+                        let wv = if idx < k { w[idx * n + col] } else { 0.0 };
+                        let prod = av * wv;
+                        let ep = av.mul_add(wv, -prod);
+                        let mut eterm = ep.abs();
+                        // Match the shader's operand-based guard: a nonzero exact
+                        // product may round all the way to zero before this test.
+                        if av != 0.0 && wv != 0.0 && prod.abs() < FLOOR {
+                            eterm = F32_MIN_NORMAL;
+                        }
+                        let s = acc + prod;
+                        let bb = (-1.0f32).mul_add(acc, s);
+                        let sb = (-1.0f32).mul_add(bb, s);
+                        let da = (-1.0f32).mul_add(sb, acc);
+                        let db = (-1.0f32).mul_add(bb, prod);
+                        let es = da + db;
+                        rsum = rsum + eterm + es.abs();
+                        acc = s;
+                    }
+                }
+                v[row * n + col] = acc;
+                r[row * n + col] = rsum;
+            }
+        }
+        (v, r)
+    }
+
+    #[test]
+    fn cpu_twin_charges_a_nonzero_product_that_rounds_to_zero() {
+        let a = [f32::from_bits(1)]; // Smallest positive subnormal.
+        let w = [0.5f32];
+        assert_ne!(a[0], 0.0);
+        assert_ne!(w[0], 0.0);
+        assert_eq!(a[0] * w[0], 0.0, "the exact product rounds to zero");
+
+        let (value, residual) = cpu_twin(&a, &w, 1, 1, 1);
+        assert_eq!(value[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(
+            residual[0].to_bits(),
+            f32::MIN_POSITIVE.to_bits(),
+            "the operand guard must charge the normal underflow floor"
+        );
+    }
+
+    /// #s1 U1 — composed-sequence integrity in the PRODUCTION kernel.
+    ///
+    /// `METAL_EFT_VIABLE_2026-08-04.md` §5 lists this as the big undischarged
+    /// obligation: every EFT probe is a `workgroup_size(1)` straight-line shader,
+    /// while the shipping twin is a 16x16 tiled GEMM with `var<workgroup>` tiles
+    /// and barriers. A passing probe does not prove the production kernel
+    /// compiled with the same op sequence.
+    ///
+    /// Its stated settling test: per-element bit-compare of the twin's `(V, R)`
+    /// against a CPU twin executing the identical sequence, at CROWN-shaped
+    /// `(m, k, n)`. This is that test.
+    ///
+    /// BIT-compare, not approximate: an over-estimating `R` would also "enclose",
+    /// so only bit-equality discriminates a correctly-compiled sequence from a
+    /// reassociated one that happens to be conservative.
+    #[test]
+    fn eft_twin_matches_cpu_sequence_bitwise_at_crown_shapes() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        // CROWN-shaped, and deliberately including k not a multiple of TILE so
+        // the zero-padded tail is exercised.
+        for (m, k, n) in [(16usize, 16usize, 16usize), (32, 40, 24), (17, 65, 33)] {
+            let mut st: u32 = 0x2F6E_5B11;
+            let mut rng = || {
+                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((st >> 8) as f32 / 8_388_608.0) - 1.0
+            };
+            let a: Vec<f32> = (0..m * k).map(|_| rng() * 0.7).collect();
+            let w: Vec<f32> = (0..k * n).map(|_| rng() * 0.7).collect();
+            let (cv, cr) = cpu_twin(&a, &w, m, k, n);
+
+            let params = [m as u32, k as u32, n as u32, 0u32];
+            let pbuf = device
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("u1_params"),
+                    contents: bytemuck::cast_slice(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let mk = |data: &[f32], rw: bool| {
+                device
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("u1_buf"),
+                        contents: bytemuck::cast_slice(data),
+                        usage: wgpu::BufferUsages::STORAGE
+                            | if rw {
+                                wgpu::BufferUsages::COPY_SRC
+                            } else {
+                                wgpu::BufferUsages::empty()
+                            },
+                    })
+            };
+            let abuf = mk(&a, false);
+            let wbuf = mk(&w, false);
+            let vbuf = mk(&vec![0.0f32; m * n], true);
+            let rbuf = mk(&vec![0.0f32; m * n], true);
+
+            let pipe = device.create_simple_pipeline(
+                crate::wgpu_device::shaders::GEMM_F32_EFT_TWIN_SHADER,
+                "u1_eft_twin",
+                &[false, false, true, true],
+            );
+            let mut enc = device
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("u1") });
+            device.pass_simple_2d(
+                &mut enc,
+                &pipe,
+                &pbuf,
+                &[&abuf, &wbuf, &vbuf, &rbuf],
+                n.div_ceil(16) as u32,
+                m.div_ceil(16) as u32,
+            );
+            let bytes = (m * n * 4) as u64;
+            let stage = |lbl: &str| {
+                device.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(lbl),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            };
+            let vstage = stage("u1_v_stage");
+            let rstage = stage("u1_r_stage");
+            enc.copy_buffer_to_buffer(&vbuf, 0, &vstage, 0, bytes);
+            enc.copy_buffer_to_buffer(&rbuf, 0, &rstage, 0, bytes);
+            device.queue.submit(std::iter::once(enc.finish()));
+            let gv_bits = crate::WgpuDevice::read_u32_buffer(&device.device, &vstage, m * n)
+                .expect("read twin V");
+            let gr_bits = crate::WgpuDevice::read_u32_buffer(&device.device, &rstage, m * n)
+                .expect("read twin R");
+
+            let mut vbad = 0usize;
+            let mut rbad = 0usize;
+            for i in 0..m * n {
+                if gv_bits[i] != cv[i].to_bits() {
+                    vbad += 1;
+                }
+                if gr_bits[i] != cr[i].to_bits() {
+                    rbad += 1;
+                }
+            }
+            // DIRECTION is what decides whether an R mismatch matters. R bounds
+            // |exact - V|, so a GPU R that is LARGER than the reference is merely
+            // loose; one that is SMALLER is an under-charge, and under-charging is
+            // the false-proof direction.
+            let mut r_under = 0usize;
+            let mut worst_under_rel = 0.0f32;
+            let mut worst_over_rel = 0.0f32;
+            for i in 0..m * n {
+                let g = f32::from_bits(gr_bits[i]);
+                let c = cr[i];
+                if g < c {
+                    r_under += 1;
+                    worst_under_rel = worst_under_rel.max((c - g) / c.abs().max(f32::MIN_POSITIVE));
+                } else if g > c {
+                    worst_over_rel = worst_over_rel.max((g - c) / c.abs().max(f32::MIN_POSITIVE));
+                }
+            }
+            eprintln!(
+                "#u1 shape=({m},{k},{n}) V_mismatch={vbad}/{tot} R_mismatch={rbad}/{tot} \
+                 R_UNDER={r_under} worst_under_rel={worst_under_rel:.3e} \
+                 worst_over_rel={worst_over_rel:.3e}",
+                tot = m * n
+            );
+            assert_eq!(
+                vbad, 0,
+                "({m},{k},{n}): twin V is not bit-identical to the CPU sequence — the \
+                 tiled kernel compiled to a DIFFERENT op sequence than the probe measured"
+            );
+            // R's own f32 accumulation is a plain add chain, NOT fma-barriered, so
+            // the compiler may reassociate it — which is what the mismatches above
+            // are. `eft_r_slack_f32` recovers that with `1/(1 - gamma_{2k+2})`,
+            // the Higham factor for a 2k+2-term non-negative f32 reduction.
+            //
+            // Compare against THAT, not against the function's `(1+u)^6` factor:
+            // the `(1+u)^6` covers the MIN-COMBINE's own six f32 ops (the
+            // |V-value| subtract/abs, the R+d add, the *r_slack multiply, the
+            // prop*slack product, the cross add, the +flush) and has nothing to do
+            // with the residual reduction. Checking the wrong term would pass for
+            // the wrong reason.
+            //
+            // Computed in f64: in f32, `1.0 + 2^-24` rounds to exactly 1.0 (half an
+            // ULP at 1.0), so the same expression there evaluates to 0.
+            const U: f64 = 5.960_464_477_539_063e-8; // 2^-24, f32 unit roundoff
+            let terms = (2 * k + 2) as f64;
+            let gamma = terms * U / (1.0 - terms * U);
+            let slack = (1.0 / (1.0 - gamma) - 1.0) as f32;
+            assert!(
+                worst_under_rel < slack,
+                "({m},{k},{n}): R under-charges by {worst_under_rel:.3e} relative, EXCEEDING \
+                 the 1/(1-gamma_{{2k+2}}) = {slack:.3e} recovery that eft_r_slack_f32 \
+                 applies — the residual channel would publish a radius that does not enclose"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "gpu-tests"))]
+mod u5_activation_lipschitz {
+    //! #u5 — the LIPSCHITZ PROPAGATION SWAP (sound_authority.rs obligation U5).
+    //!
+    //! `NY_EFT_ERR=1` is not only an error-MEASUREMENT flag: in the activation
+    //! kernels it also swaps the propagated coefficient-error factor from the
+    //! conservative `|ls|+|us|` to the Lipschitz transport factor of the
+    //! piecewise-linear activation map `v ↦ v·sel(v) ∓ β` — `|sel|` when the
+    //! coefficient's sign is certain (`|a| > err_in`), `max(|ls|,|us|)`
+    //! otherwise. That is an A-PRIORI claim, not an EFT measurement
+    //! (`docs/METAL_EFT_VIABLE_2026-08-04.md` U5), and until this module it had
+    //! NO dedicated adversarial oracle.
+    //!
+    //! # The soundness claim under test
+    //!
+    //! For every realization `a' ∈ [a − err_in, a + err_in]` of the incoming
+    //! coefficient, the published error must cover the exact deviation of the
+    //! activation map at `a'` from the shipped f32 coefficient:
+    //!
+    //! ```text
+    //!   |g(a') − coeff| ≤ err_out,   g(t) = t·sel(t) ∓ β   (exact reals)
+    //! ```
+    //!
+    //! `g` is continuous piecewise-linear with the only kink at `t = 0`
+    //! (`g(0) = ∓β` from both sides), so on each linear piece `|g − coeff|` is
+    //! convex and its supremum over the interval is attained at one of the
+    //! piece endpoints — i.e. at `a − err_in`, `a + err_in`, or the kink `0`
+    //! when the interval straddles it. The f64 oracle evaluates exactly those
+    //! candidates; f32 products/f32-pair sums are exact in f64, so the only
+    //! oracle noise is one f64 rounding per endpoint (≤ 2⁻⁵³ relative,
+    //! absorbed by a 1e-9 allowance far below the kernel's own ×1.000001
+    //! SLACK, so it cannot mask a real violation).
+    //!
+    //! Params are driven directly (`eft_mode` at the uniform level, the
+    //! `u1_composed_sequence_integrity` / `tests/u1_tree_settling.rs`
+    //! precedent): U5 is a claim about the KERNEL's error algebra, and this
+    //! way BOTH modes are exercised on every adapter regardless of the
+    //! authority-gate state. Production `additive` (`rung3_flush_safe_additive`)
+    //! is used so the fma-subnormal-flush floor the shipped walk charges is
+    //! part of what is validated (GB10: fma flushes subnormal RESULTS even
+    //! under DenormPreserve — the floor is the cover for the measured
+    //! `e_prod`/`e_sub` lanes at 2⁻¹²⁶-edge operands).
+    // The certified-coefficient fixtures appended to this module (cert_err_*,
+    // resnet_coeff_fixture and its projection twin) build real layer/segment
+    // plans, which this module's original two imports did not cover.
+    use crate::wgpu_device::test_support::{
+        gpu_test_serial_guard, require_device, require_verdict_device,
+    };
+    use crate::WgpuDevice;
+    use ny_core::dd::next_up_f64;
+    use ny_core::f32_to_f64_exact;
+    use ny_core::GpuCrownBackward;
+    use ny_core::{GpuCrownLayer, GpuCrownSeed, GpuResnetSegment};
+    use ny_test_utils::env::ScopedEnvVar;
+    use std::sync::Arc;
+    use wgpu::util::DeviceExt;
+
+    /// NaN payload pre-written into the read_write outputs: a silently no-op'd
+    /// dispatch reads back as a mismatch, never as agreement (u1 discipline).
+    const UNWRITTEN_SENTINEL: u32 = 0x7FC0_1234;
+
+    /// Deterministic xorshift64* (idiom copied from the settling probes).
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// Uniform in [0, 1).
+        fn frac(&mut self) -> f32 {
+            ((self.next_u64() >> 40) as f32) / (1u64 << 24) as f32
+        }
+        fn sign(&mut self) -> f32 {
+            if self.next_u64() & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        /// `± 2^e · (1 + frac)` with `e` uniform in `[lo, hi]` (powi handles
+        /// the subnormal-edge exponents exactly).
+        fn banded(&mut self, lo: i32, hi: i32) -> f32 {
+            let span = (hi - lo + 1) as u64;
+            let e = lo + (self.next_u64() % span) as i32;
+            self.sign() * 2.0f32.powi(e) * (1.0 + self.frac())
+        }
+    }
+
+    /// Exact-f64 supremum of `|g(a') − coeff|` over `a' ∈ [a−e_in, a+e_in]`,
+    /// `g(t) = t·sel(t) + sb2` with the shader's own branch convention
+    /// (`t >= 0` selects the same slope the WGSL `select(..., a >= 0.0)` does)
+    /// and `sb2 = +β` (upper) / `−β` (lower). Candidates: the two interval
+    /// ends plus the kink at 0 when interior (see the module doc for why that
+    /// set is exhaustive).
+    #[allow(clippy::too_many_arguments)]
+    fn worst_realization_sup(
+        a: f32,
+        e_in: f32,
+        ls: f32,
+        us: f32,
+        bv: f32,
+        is_upper: bool,
+        coeff: f32,
+    ) -> f64 {
+        let (s_nonneg, s_neg) = if is_upper { (us, ls) } else { (ls, us) };
+        let sb2 = if is_upper {
+            f64::from(bv)
+        } else {
+            -f64::from(bv)
+        };
+        let c = f64::from(coeff);
+        // Cancellation-safe endpoint deviations (review defect 1): the naive
+        // `g(a ± e) − c` rounds the endpoint on the grid of |a| (error up to
+        // 2^-53·|a| — relative to |a|, NOT to the deviation) whenever the
+        // a/e exponent gap exceeds 29, overshooting the sup by up to ~3% in
+        // the small-e/large-a regime and false-failing the eft arm (its only
+        // margin is ×1.000001). Instead: `(a·s − c) + σ·e·s + sb2` — the
+        // f32×f32 products are exact 48-bit f64 values, leaving ≤3 roundings
+        // AT THE DEVIATION SCALE, which 1e-9 genuinely covers. The rounded
+        // endpoint is still used for the SIGN branch only (f64 rounding never
+        // crosses zero).
+        let dev = |sigma: f64| -> f64 {
+            let t = f64::from(a) + sigma * f64::from(e_in);
+            let s = if t >= 0.0 {
+                f64::from(s_nonneg)
+            } else {
+                f64::from(s_neg)
+            };
+            // Order matters: sb2 and c are the LARGE near-equal terms
+            // (c ≈ fl(a·s + sb2)) — cancel them FIRST (Sterbenz-exact when
+            // they cancel at all), then the exact small products join at the
+            // deviation scale. `(a·s − c) + ...` would round the tiny a into
+            // the grid of |c| and re-introduce exactly the defect-1 bug.
+            (((sb2 - c) + f64::from(a) * s) + sigma * (f64::from(e_in) * s)).abs()
+        };
+        let lo = f64::from(a) - f64::from(e_in);
+        let hi = f64::from(a) + f64::from(e_in);
+        let mut sup = dev(-1.0).max(dev(1.0));
+        if lo < 0.0 && hi > 0.0 {
+            // g(0) = sb2 exactly.
+            sup = sup.max((sb2 - c).abs());
+        }
+        sup
+    }
+
+    /// Dispatch the PRODUCTION `CROWN_ACTIVATION_RESIDENT_SHADER` (same
+    /// `create_simple_pipeline` construction and rw-flag array as
+    /// `resident_backward_pipelines().act`) and return `(a_out, err_out)` as
+    /// raw bits.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_act(
+        device: &WgpuDevice,
+        params: super::ActParams,
+        a: &[f32],
+        err: &[f32],
+        ls: &[f32],
+        us: &[f32],
+        beta: &[f32],
+    ) -> (Vec<u32>, Vec<u32>) {
+        let total = a.len();
+        let pbuf = device
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("u5_act_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let mk_ro = |data: &[f32]| {
+            device
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("u5_act_ro"),
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let mk_rw = || {
+            device
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("u5_act_rw"),
+                    contents: bytemuck::cast_slice(&vec![UNWRITTEN_SENTINEL; total]),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                })
+        };
+        let (ab, eb, lb, ub, bb) = (mk_ro(a), mk_ro(err), mk_ro(ls), mk_ro(us), mk_ro(beta));
+        let (aout, eout) = (mk_rw(), mk_rw());
+        let pipe = device.create_simple_pipeline(
+            crate::wgpu_device::shaders::CROWN_ACTIVATION_RESIDENT_SHADER,
+            "u5_act_resident",
+            &[false, false, false, false, true, true, false],
+        );
+        let mut enc = device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("u5") });
+        device.pass_simple(
+            &mut enc,
+            &pipe,
+            &pbuf,
+            &[&ab, &eb, &lb, &ub, &aout, &eout, &bb],
+            (total as u32).div_ceil(256),
+        );
+        let bytes = (total * 4) as u64;
+        let stage = |lbl: &str| {
+            device.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(lbl),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let (astage, estage) = (stage("u5_a_stage"), stage("u5_e_stage"));
+        enc.copy_buffer_to_buffer(&aout, 0, &astage, 0, bytes);
+        enc.copy_buffer_to_buffer(&eout, 0, &estage, 0, bytes);
+        device.queue.submit(std::iter::once(enc.finish()));
+        let a_bits =
+            WgpuDevice::read_u32_buffer(&device.device, &astage, total).expect("u5: read a_out");
+        let e_bits =
+            WgpuDevice::read_u32_buffer(&device.device, &estage, total).expect("u5: read err_out");
+        (a_bits, e_bits)
+    }
+
+    /// U5 device oracle for the COEFFICIENT activation kernel: adversarial
+    /// bands (mixed signs, 2^-30..2^8 magnitudes plus 2^-126 subnormal edges,
+    /// slopes in [0,1] incl. exact 0/1, β ≠ 0 arm, exact zeros, sign-certain
+    /// AND sign-uncertain err bands), BOTH eft_mode settings, BOTH sides.
+    /// Asserts per element: published `err_out` ≥ the exact worst-realization
+    /// deviation; the VALUE lane is bit-identical across modes (the swap must
+    /// touch only the error channel). Prints the eft/legacy tightness ratio
+    /// (eft ≤ legacy on the stable-neuron majority is EXPECTED, printed, not
+    /// asserted).
+    #[test]
+    fn act_eft_err_encloses_worst_realization() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+
+        let num_specs = 4usize;
+        let nn = 2048usize;
+        let total = num_specs * nn;
+        let mut rng = Rng(0x0055_EFAB_2026_0810);
+
+        // Per-neuron slopes in [0,1] incl. EXACT 0 and 1, and β (≠0 on a third).
+        let mut ls = vec![0.0f32; nn];
+        let mut us = vec![0.0f32; nn];
+        let mut beta = vec![0.0f32; nn];
+        for i in 0..nn {
+            let (l, u) = match i % 5 {
+                0 => (0.0, 1.0),
+                1 => (1.0, 1.0),
+                2 => (0.0, 0.0),
+                3 => (rng.frac(), 1.0),
+                _ => (rng.frac(), rng.frac()),
+            };
+            ls[i] = l;
+            us[i] = u;
+            if i % 3 == 0 {
+                beta[i] = rng.banded(-20, 3);
+            }
+        }
+        // Per-element coefficients and incoming errors.
+        let mut a = vec![0.0f32; total];
+        let mut e_in = vec![0.0f32; total];
+        for idx in 0..total {
+            a[idx] = if rng.frac() < 0.01 {
+                0.0 // ~1% exact zeros
+            } else if idx % 97 == 0 {
+                rng.banded(-129, -122) // subnormal / 2^-126 edge band
+            } else {
+                rng.banded(-30, 8)
+            };
+            e_in[idx] = match idx % 4 {
+                0 => 0.0,
+                1 => a[idx].abs() * 2.0f32.powi(-20) * (1.0 + rng.frac()), // sign certain
+                2 => a[idx].abs() * (1.0 + rng.frac()) + 1e-30,            // sign UNCERTAIN
+                _ => rng.banded(-40, 2).abs(),
+            };
+        }
+        // Non-vacuity: every adversarial class must actually be present.
+        assert!(a.contains(&0.0), "no exact-zero coefficients");
+        assert!(
+            a.iter()
+                .any(|&v| v != 0.0 && v.abs() < f32::MIN_POSITIVE * 128.0),
+            "no 2^-126-edge coefficients"
+        );
+        assert!(
+            (0..total).any(|i| e_in[i] > a[i].abs()),
+            "no sign-uncertain elements"
+        );
+        assert!((0..nn).any(|i| beta[i] != 0.0), "beta arm never exercised");
+
+        let additive = crate::wgpu_device::sound_consts::rung3_flush_safe_additive(1)
+            .expect("single-term U5 fixture has a representable rung-3 point count");
+        let mk_params = |is_upper: u32, eft_mode: u32| super::ActParams {
+            num_specs: num_specs as u32,
+            num_neurons: nn as u32,
+            is_upper,
+            additive,
+            num_specs_per_dom: num_specs as u32, // single domain
+            eft_mode,
+            _p: [0; 2],
+        };
+
+        for is_upper in [0u32, 1u32] {
+            let (a_leg, e_leg) =
+                dispatch_act(&device, mk_params(is_upper, 0), &a, &e_in, &ls, &us, &beta);
+            let (a_eft, e_eft) =
+                dispatch_act(&device, mk_params(is_upper, 1), &a, &e_in, &ls, &us, &beta);
+            assert!(
+                !a_leg
+                    .iter()
+                    .chain(&e_leg)
+                    .chain(&a_eft)
+                    .chain(&e_eft)
+                    .any(|&b| b == UNWRITTEN_SENTINEL),
+                "is_upper={is_upper}: an output element was never written (no-op dispatch)"
+            );
+            // The VALUE lane must be bit-identical across modes: the swap is an
+            // error-channel-only change by construction.
+            assert_eq!(
+                a_leg, a_eft,
+                "is_upper={is_upper}: eft_mode changed the VALUE lane of the \
+                 activation kernel — the Lipschitz swap must only touch err_out"
+            );
+
+            let mut ratio_sum = 0.0f64;
+            let mut ratio_n = 0usize;
+            let mut eft_tighter = 0usize;
+            let mut eft_looser = 0usize;
+            let mut stable_ratio_sum = 0.0f64;
+            let mut stable_n = 0usize;
+            for idx in 0..total {
+                let i = idx % nn;
+                let coeff = f32::from_bits(a_leg[idx]);
+                let sup = worst_realization_sup(
+                    a[idx],
+                    e_in[idx],
+                    ls[i],
+                    us[i],
+                    beta[i],
+                    is_upper == 1,
+                    coeff,
+                );
+                for (mode, bits) in [("legacy", &e_leg), ("eft", &e_eft)] {
+                    let e_out = f32::from_bits(bits[idx]);
+                    assert!(
+                        e_out.is_finite() && e_out >= 0.0,
+                        "is_upper={is_upper} {mode} idx={idx}: err_out={e_out} not a \
+                         finite nonnegative bound"
+                    );
+                    // 1e-9 relative allowance = the oracle's OWN f64 endpoint
+                    // rounding only (see module doc); three orders below the
+                    // kernel's ×1.000001 SLACK, so a real violation cannot hide.
+                    assert!(
+                        f64::from(e_out) >= sup * (1.0 - 1e-9),
+                        "is_upper={is_upper} {mode} idx={idx}: err_out={e_out:e} DOES NOT \
+                         ENCLOSE the worst realization {sup:e} \
+                         (a={}, e_in={}, ls={}, us={}, beta={}, coeff={coeff})",
+                        a[idx],
+                        e_in[idx],
+                        ls[i],
+                        us[i],
+                        beta[i],
+                    );
+                }
+                let (l, f) = (
+                    f64::from(f32::from_bits(e_leg[idx])),
+                    f64::from(f32::from_bits(e_eft[idx])),
+                );
+                if f < l {
+                    eft_tighter += 1;
+                } else if f > l {
+                    eft_looser += 1;
+                }
+                if f > 0.0 {
+                    ratio_sum += l / f;
+                    ratio_n += 1;
+                    if a[idx].abs() > e_in[idx] {
+                        stable_ratio_sum += l / f;
+                        stable_n += 1;
+                    }
+                }
+            }
+            println!(
+                "[u5-act] is_upper={is_upper} elements={total} eft_tighter={eft_tighter} \
+                 eft_looser={eft_looser} mean legacy/eft ratio={:.4} \
+                 (sign-certain subset: {:.4} over {stable_n})",
+                ratio_sum / ratio_n.max(1) as f64,
+                stable_ratio_sum / stable_n.max(1) as f64,
+            );
+        }
+    }
+
+    /// Neumaier-compensated f64 accumulation (u1_tree idiom): keeps the
+    /// row-sum oracle's own noise at the 2^-104 class so a flat 1e-12 relative
+    /// allowance suffices.
+    #[inline]
+    fn neumaier_add(sum: &mut f64, comp: &mut f64, term: f64) {
+        let t = *sum + term;
+        *comp += if sum.abs() >= term.abs() {
+            (*sum - t) + term
+        } else {
+            (term - t) + *sum
+        };
+        *sum = t;
+    }
+
+    /// U5 device oracle for the INTERCEPT-BIAS kernel — the other half of the
+    /// swap (`CROWN_ACTIVATION_INTERCEPT_BIAS_SHADER`: Lipschitz factor of
+    /// `v ↦ v·int(v)`, `max(|li|,|ui|)` / `|sel_int|`, replacing `|li|+|ui|`).
+    /// Per spec row the published increment must satisfy, for EVERY joint
+    /// realization `a'_j ∈ [a_j − e_j, a_j + e_j]`:
+    /// `|Σ_j g_j(a'_j) − bias_out| ≤ bias_err_out`. The per-element intervals
+    /// are independent, so the exact sup is
+    /// `max(Σ_j max g_j − B, B − Σ_j min g_j)` with per-element min/max over
+    /// the same 3-candidate set as the coefficient oracle. `nn = 1` isolates
+    /// the per-element Lipschitz claim from the (U1-settled) tree; larger `nn`
+    /// validates its composition with the reduction charges.
+    #[test]
+    fn act_intercept_bias_eft_err_encloses_worst_realization() {
+        let _g = gpu_test_serial_guard();
+        let device = require_device();
+
+        for &nn in &[1usize, 7, 300] {
+            let num_specs = 8usize;
+            let total = num_specs * nn;
+            let mut rng = Rng(0x0055_1B1A_5000_0000 ^ nn as u64);
+            let mut li = vec![0.0f32; nn];
+            let mut ui = vec![0.0f32; nn];
+            for i in 0..nn {
+                // Mixed-sign intercepts incl. exact zeros (the lower intercept
+                // of a ReLU relaxation is 0 in production; keep that shape).
+                li[i] = if i % 4 == 0 { 0.0 } else { rng.banded(-10, 4) };
+                ui[i] = rng.banded(-10, 4).abs();
+            }
+            let mut a = vec![0.0f32; total];
+            let mut e_in = vec![0.0f32; total];
+            for idx in 0..total {
+                a[idx] = if rng.frac() < 0.02 {
+                    0.0
+                } else {
+                    rng.banded(-30, 6)
+                };
+                e_in[idx] = match idx % 3 {
+                    0 => 0.0,
+                    1 => a[idx].abs() * 2.0f32.powi(-18) * (1.0 + rng.frac()),
+                    _ => a[idx].abs() * (1.0 + rng.frac()) + 1e-32, // uncertain
+                };
+            }
+
+            let gamma = crate::wgpu_device::sound_consts::gamma_k_f32(nn).expect("gamma");
+            let slack = crate::wgpu_device::sound_consts::combine_slack_f32(nn).expect("slack");
+            let eft_slack =
+                crate::wgpu_device::sound_consts::eft_r_slack_f32(nn).expect("eft slack");
+            let additive = crate::wgpu_device::sound_consts::rung3_flush_safe_additive(
+                u32::try_from(nn).unwrap(),
+            )
+            .expect("U5 activation-bias fixture has a representable rung-3 point count");
+
+            for is_upper in [0u32, 1u32] {
+                let mut per_mode: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+                for eft_mode in [0u32, 1u32] {
+                    let params = super::ActBiasParams {
+                        num_specs: num_specs as u32,
+                        num_neurons: nn as u32,
+                        is_upper,
+                        // Production wiring: γ carries r_slack in EFT mode.
+                        gamma_k: if eft_mode == 1 { eft_slack } else { gamma },
+                        additive,
+                        slack,
+                        num_specs_per_dom: num_specs as u32,
+                        eft_mode,
+                    };
+                    let pbuf =
+                        device
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("u5_actbias_params"),
+                                contents: bytemuck::bytes_of(&params),
+                                usage: wgpu::BufferUsages::UNIFORM,
+                            });
+                    let mk_ro = |data: &[f32]| {
+                        device
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("u5_actbias_ro"),
+                                contents: bytemuck::cast_slice(data),
+                                usage: wgpu::BufferUsages::STORAGE,
+                            })
+                    };
+                    // Read-modify-write outputs: zero preloads (the kernel `+=`s).
+                    let mk_rw = || {
+                        device
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("u5_actbias_rw"),
+                                contents: bytemuck::cast_slice(&vec![0.0f32; num_specs]),
+                                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                            })
+                    };
+                    let (ab, eb, lb, ub) = (mk_ro(&a), mk_ro(&e_in), mk_ro(&li), mk_ro(&ui));
+                    let (bout, berr) = (mk_rw(), mk_rw());
+                    let pipe = device.create_simple_pipeline(
+                        crate::wgpu_device::shaders::CROWN_ACTIVATION_INTERCEPT_BIAS_SHADER,
+                        "u5_act_intercept_bias",
+                        &[false, false, false, false, true, true],
+                    );
+                    let mut enc =
+                        device
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("u5_bias"),
+                            });
+                    // One workgroup per spec row — the production dispatch shape.
+                    device.pass_simple(
+                        &mut enc,
+                        &pipe,
+                        &pbuf,
+                        &[&ab, &eb, &lb, &ub, &bout, &berr],
+                        num_specs as u32,
+                    );
+                    let bytes = (num_specs * 4) as u64;
+                    let stage = |lbl: &str| {
+                        device.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(lbl),
+                            size: bytes,
+                            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        })
+                    };
+                    let (bstage, estage) = (stage("u5_b_stage"), stage("u5_be_stage"));
+                    enc.copy_buffer_to_buffer(&bout, 0, &bstage, 0, bytes);
+                    enc.copy_buffer_to_buffer(&berr, 0, &estage, 0, bytes);
+                    device.queue.submit(std::iter::once(enc.finish()));
+                    let b_bits = WgpuDevice::read_u32_buffer(&device.device, &bstage, num_specs)
+                        .expect("u5: read bias_out");
+                    let e_bits = WgpuDevice::read_u32_buffer(&device.device, &estage, num_specs)
+                        .expect("u5: read bias_err_out");
+                    per_mode.push((
+                        b_bits.iter().map(|&b| f32::from_bits(b)).collect(),
+                        e_bits.iter().map(|&b| f32::from_bits(b)).collect(),
+                    ));
+                }
+
+                for (mode_i, mode) in ["legacy", "eft"].iter().enumerate() {
+                    let (bias_out, bias_err) = &per_mode[mode_i];
+                    for s in 0..num_specs {
+                        let (mut smax, mut cmax) = (0.0f64, 0.0f64);
+                        let (mut smin, mut cmin) = (0.0f64, 0.0f64);
+                        for j in 0..nn {
+                            let idx = s * nn + j;
+                            let av = a[idx];
+                            let (s_nonneg, s_neg) = if is_upper == 1 {
+                                (ui[j], li[j])
+                            } else {
+                                (li[j], ui[j])
+                            };
+                            let g = |t: f64| -> f64 {
+                                let sl = if t >= 0.0 {
+                                    f64::from(s_nonneg)
+                                } else {
+                                    f64::from(s_neg)
+                                };
+                                t * sl
+                            };
+                            let lo = f64::from(av) - f64::from(e_in[idx]);
+                            let hi = f64::from(av) + f64::from(e_in[idx]);
+                            let mut gmin = g(lo).min(g(hi));
+                            let mut gmax = g(lo).max(g(hi));
+                            if lo < 0.0 && hi > 0.0 {
+                                gmin = gmin.min(0.0);
+                                gmax = gmax.max(0.0);
+                            }
+                            neumaier_add(&mut smax, &mut cmax, gmax);
+                            neumaier_add(&mut smin, &mut cmin, gmin);
+                        }
+                        let b = f64::from(bias_out[s]);
+                        let sup = ((smax + cmax) - b).max(b - (smin + cmin)).max(0.0);
+                        let e_out = f64::from(bias_err[s]);
+                        assert!(
+                            e_out.is_finite() && e_out >= 0.0,
+                            "nn={nn} is_upper={is_upper} {mode} row {s}: bias_err_out={e_out}"
+                        );
+                        assert!(
+                            e_out >= sup * (1.0 - 1e-12),
+                            "nn={nn} is_upper={is_upper} {mode} row {s}: \
+                             bias_err_out={e_out:e} DOES NOT ENCLOSE the worst joint \
+                             realization {sup:e} (bias_out={b:e})"
+                        );
+                    }
+                }
+                let tighter = (0..num_specs)
+                    .filter(|&s| per_mode[1].1[s] < per_mode[0].1[s])
+                    .count();
+                println!(
+                    "[u5-actbias] nn={nn} is_upper={is_upper} rows={num_specs} \
+                     eft_tighter={tighter} legacy_err[0]={:e} eft_err[0]={:e}",
+                    per_mode[0].1[0], per_mode[1].1[0],
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // #cert-err / #cert-coeffs — the device-level soundness oracles
+    // -----------------------------------------------------------------
+
+    /// A single-Linear fixture whose published bound is exactly the range of
+    /// `y = W x + b` over the input box, so an EXACT f64 oracle exists.
+    struct CertErrFixture {
+        weight: Vec<f32>,
+        bias: Vec<f32>,
+        out_features: usize,
+        in_features: usize,
+        input_lower: Vec<f32>,
+        input_upper: Vec<f32>,
+        spec: Vec<f32>,
+    }
+
+    fn cert_err_fixture() -> CertErrFixture {
+        let (out_features, in_features) = (3usize, 4usize);
+        // Mixed signs and magnitudes: sign-agnostic charge coverage.
+        let weight = vec![
+            0.75, -0.40, 0.25, 0.90, //
+            -1.20, 0.60, -0.35, 0.15, //
+            0.05, 0.80, 1.10, -0.70,
+        ];
+        let bias = vec![0.20f32, -0.35, 0.05];
+        let input_lower = vec![-1.0f32, -0.5, 0.0, -0.25];
+        let input_upper = vec![1.0f32, 0.5, 0.75, 0.25];
+        let mut spec = vec![0.0f32; out_features * out_features];
+        for r in 0..out_features {
+            spec[r * out_features + r] = 1.0;
+        }
+        CertErrFixture {
+            weight,
+            bias,
+            out_features,
+            in_features,
+            input_lower,
+            input_upper,
+            spec,
+        }
+    }
+
+    fn cert_err_layers(
+        fx: &CertErrFixture,
+        cert_err: ny_core::CertifiedWeightError,
+    ) -> Vec<GpuCrownLayer> {
+        vec![GpuCrownLayer::Linear {
+            weight: Arc::from(fx.weight.clone().into_boxed_slice()),
+            bias: Some(Arc::from(fx.bias.clone().into_boxed_slice())),
+            out_features: fx.out_features,
+            in_features: fx.in_features,
+            cert_err,
+        }]
+    }
+
+    /// The EXACT extreme of `y_i = Σ_j w*_ij x_j + b*_i` over BOTH the input box
+    /// and the declared weight/bias band, computed in f64 by enumerating the four
+    /// corners of each `(w*, x)` product interval. This is the truth the
+    /// published bound must enclose — not an approximation of it.
+    fn cert_err_true_extremes(
+        fx: &CertErrFixture,
+        w_rel: f64,
+        bias_abs: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut lo = Vec::with_capacity(fx.out_features);
+        let mut hi = Vec::with_capacity(fx.out_features);
+        for i in 0..fx.out_features {
+            let mut row_lo = f64::from(fx.bias[i]) - bias_abs;
+            let mut row_hi = f64::from(fx.bias[i]) + bias_abs;
+            for j in 0..fx.in_features {
+                let w = f64::from(fx.weight[i * fx.in_features + j]);
+                let (wl, wh) = (w - w_rel * w.abs(), w + w_rel * w.abs());
+                let (xl, xu) = (f64::from(fx.input_lower[j]), f64::from(fx.input_upper[j]));
+                let corners = [wl * xl, wl * xu, wh * xl, wh * xu];
+                row_lo += corners.iter().copied().fold(f64::INFINITY, f64::min);
+                row_hi += corners.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            }
+            lo.push(row_lo);
+            hi.push(row_hi);
+        }
+        (lo, hi)
+    }
+
+    /// THE SOUNDNESS ORACLE for the certified weight-error charge.
+    ///
+    /// Declaring `weight_rel_err`/`bias_abs_err` asserts that the SUPPLIED
+    /// weights are only an approximation of an exact real fold. This test takes
+    /// that assertion literally: it computes, in exact f64, the true output range
+    /// over every weight inside the declared band (plus a set of concrete
+    /// samples), and asserts the published GPU bound encloses all of it. It also
+    /// asserts the charge is (a) strictly widening and (b) NECESSARY — the
+    /// uncharged bound demonstrably fails to enclose the same oracle, so the test
+    /// cannot pass vacuously.
+    #[test]
+    fn cert_err_widens_and_encloses_the_perturbed_weight_oracle() {
+        let _guard = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let fx = cert_err_fixture();
+
+        let (w_rel, bias_abs) = (1e-3f32, 1e-3f32);
+        let exact_layers = cert_err_layers(&fx, ny_core::CertifiedWeightError::default());
+        let charged_layers = cert_err_layers(
+            &fx,
+            ny_core::CertifiedWeightError {
+                weight_rel_err: w_rel,
+                bias_abs_err: bias_abs,
+            },
+        );
+
+        let (exact_lo, exact_hi) = device
+            .crown_backward_sound_resident(
+                &exact_layers,
+                &fx.spec,
+                fx.out_features,
+                fx.out_features,
+                &fx.input_lower,
+                &fx.input_upper,
+            )
+            .expect("exact-weight resident walk");
+        let (charged_lo, charged_hi) = device
+            .crown_backward_sound_resident(
+                &charged_layers,
+                &fx.spec,
+                fx.out_features,
+                fx.out_features,
+                &fx.input_lower,
+                &fx.input_upper,
+            )
+            .expect("charged resident walk");
+
+        let (true_lo, true_hi) = cert_err_true_extremes(&fx, f64::from(w_rel), f64::from(bias_abs));
+
+        for i in 0..fx.out_features {
+            // (1) The charge is strictly OUTWARD on both sides.
+            assert!(
+                charged_lo[i] < exact_lo[i] && charged_hi[i] > exact_hi[i],
+                "row {i}: charged bound [{}, {}] must be strictly wider than the \
+                 exact-weight bound [{}, {}]",
+                charged_lo[i],
+                charged_hi[i],
+                exact_lo[i],
+                exact_hi[i]
+            );
+            // (2) The charged bound ENCLOSES the true range over the whole band.
+            assert!(
+                f64::from(charged_lo[i]) <= true_lo[i],
+                "row {i}: charged lower {} does NOT enclose the band minimum {} \
+                 — a bound below the truth is a false proof",
+                charged_lo[i],
+                true_lo[i]
+            );
+            assert!(
+                f64::from(charged_hi[i]) >= true_hi[i],
+                "row {i}: charged upper {} does NOT enclose the band maximum {}",
+                charged_hi[i],
+                true_hi[i]
+            );
+        }
+
+        // (3) TEETH: without the charge the very same oracle is violated, so the
+        // enclosure above is not an artifact of slack the walk already had.
+        let uncharged_fails = (0..fx.out_features)
+            .any(|i| f64::from(exact_lo[i]) > true_lo[i] || f64::from(exact_hi[i]) < true_hi[i]);
+        assert!(
+            uncharged_fails,
+            "the uncharged bound already enclosed the perturbed-weight oracle — \
+             this fixture cannot detect a missing charge; widen w_rel"
+        );
+
+        // (4) Concrete samples inside the band, evaluated exactly.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next_unit = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64).mul_add(2.0, -1.0)
+        };
+        for sample in 0..32 {
+            let perturbed: Vec<f64> = fx
+                .weight
+                .iter()
+                .map(|&w| {
+                    let w = f64::from(w);
+                    w + next_unit() * f64::from(w_rel) * w.abs()
+                })
+                .collect();
+            let perturbed_bias: Vec<f64> = fx
+                .bias
+                .iter()
+                .map(|&b| f64::from(b) + next_unit() * f64::from(bias_abs))
+                .collect();
+            for i in 0..fx.out_features {
+                let mut lo = perturbed_bias[i];
+                let mut hi = perturbed_bias[i];
+                for j in 0..fx.in_features {
+                    let w = perturbed[i * fx.in_features + j];
+                    let (xl, xu) = (f64::from(fx.input_lower[j]), f64::from(fx.input_upper[j]));
+                    lo += (w * xl).min(w * xu);
+                    hi += (w * xl).max(w * xu);
+                }
+                assert!(
+                    f64::from(charged_lo[i]) <= lo && f64::from(charged_hi[i]) >= hi,
+                    "sample {sample} row {i}: published [{}, {}] does not enclose \
+                     the sampled true range [{lo}, {hi}]",
+                    charged_lo[i],
+                    charged_hi[i]
+                );
+            }
+        }
+    }
+
+    /// Host-side OUTWARD concretization of a published `CertifiedCoeffs`
+    /// frontier over one input box. Deliberately independent of the device
+    /// concretize so the self-consistency check below is a real cross-check.
+    fn concretize_certified_coeffs(
+        c: &ny_core::CertifiedCoeffs,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let next_down = |x: f64| -next_up_f64(-x);
+        let mut lower = Vec::with_capacity(c.num_specs);
+        let mut upper = Vec::with_capacity(c.num_specs);
+        for s in 0..c.num_specs {
+            let mut lo =
+                next_down(f32_to_f64_exact(c.lower_b[s]) - f32_to_f64_exact(c.lower_b_err[s]));
+            let mut hi =
+                next_up_f64(f32_to_f64_exact(c.upper_b[s]) + f32_to_f64_exact(c.upper_b_err[s]));
+            for j in 0..c.dim {
+                let idx = s * c.dim + j;
+                let (xl, xu) = (
+                    f32_to_f64_exact(input_lower[j]),
+                    f32_to_f64_exact(input_upper[j]),
+                );
+                let (la, le) = (
+                    f32_to_f64_exact(c.lower_a[idx]),
+                    f32_to_f64_exact(c.lower_a_err[idx]),
+                );
+                let (ua, ue) = (
+                    f32_to_f64_exact(c.upper_a[idx]),
+                    f32_to_f64_exact(c.upper_a_err[idx]),
+                );
+                let lprod = [
+                    (la - le) * xl,
+                    (la - le) * xu,
+                    (la + le) * xl,
+                    (la + le) * xu,
+                ]
+                .into_iter()
+                .fold(f64::INFINITY, f64::min);
+                let uprod = [
+                    (ua - ue) * xl,
+                    (ua - ue) * xu,
+                    (ua + ue) * xl,
+                    (ua + ue) * xu,
+                ]
+                .into_iter()
+                .fold(f64::NEG_INFINITY, f64::max);
+                lo = next_down(lo + lprod);
+                hi = next_up_f64(hi + uprod);
+            }
+            lower.push(lo);
+            upper.push(hi);
+        }
+        (lower, upper)
+    }
+
+    /// The coefficient egress must be the SAME walk as the bounds entry, merely
+    /// stopped one step earlier: concretizing what it publishes has to reproduce
+    /// the bounds entry's answer. It must also actually publish COEFFICIENTS —
+    /// `dim` is the input width, not a concretized scalar per row.
+    #[test]
+    fn certified_coeffs_entry_concretizes_to_the_bounds_entry() {
+        let _guard = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let fx = cert_err_fixture();
+        let layers = cert_err_layers(&fx, ny_core::CertifiedWeightError::default());
+        let seed = GpuCrownSeed {
+            lower_a: Arc::from(fx.spec.clone().into_boxed_slice()),
+            upper_a: Arc::from(fx.spec.clone().into_boxed_slice()),
+            lower_b: Arc::from(vec![0.0f32; fx.out_features].into_boxed_slice()),
+            upper_b: Arc::from(vec![0.0f32; fx.out_features].into_boxed_slice()),
+            num_specs: fx.out_features,
+            current_dim: fx.out_features,
+        };
+
+        let coeffs = device
+            .crown_backward_gpu_seeded_sound_coeffs(
+                &layers,
+                &seed,
+                &fx.input_lower,
+                &fx.input_upper,
+            )
+            .expect("coefficient egress must not error on a qualified device")
+            .expect("a qualified device must publish the frontier");
+
+        assert_eq!(coeffs.num_specs, fx.out_features);
+        assert_eq!(
+            coeffs.dim, fx.in_features,
+            "the entry must publish INPUT-dim coefficients, not concretized rows"
+        );
+        for field in [
+            &coeffs.lower_a,
+            &coeffs.upper_a,
+            &coeffs.lower_a_err,
+            &coeffs.upper_a_err,
+        ] {
+            assert_eq!(field.len(), coeffs.num_specs * coeffs.dim);
+        }
+        for field in [
+            &coeffs.lower_b,
+            &coeffs.upper_b,
+            &coeffs.lower_b_err,
+            &coeffs.upper_b_err,
+        ] {
+            assert_eq!(field.len(), coeffs.num_specs);
+        }
+        assert!(
+            coeffs
+                .lower_a_err
+                .iter()
+                .chain(coeffs.upper_a_err.iter())
+                .chain(coeffs.lower_b_err.iter())
+                .chain(coeffs.upper_b_err.iter())
+                .all(|v| v.is_finite() && *v >= 0.0),
+            "published radii must be finite and non-negative"
+        );
+
+        let bounds = device
+            .crown_backward_gpu_seeded_sound(&layers, &seed, &fx.input_lower, &fx.input_upper)
+            .expect("bounds entry");
+        let (host_lo, host_hi) =
+            concretize_certified_coeffs(&coeffs, &fx.input_lower, &fx.input_upper);
+
+        for s in 0..coeffs.num_specs {
+            let (gl, gu) = (
+                f64::from(bounds.lower_bounds[s]),
+                f64::from(bounds.upper_bounds[s]),
+            );
+            let tol = 1e-4 * (1.0 + gl.abs().max(gu.abs()));
+            assert!(
+                (host_lo[s] - gl).abs() <= tol && (host_hi[s] - gu).abs() <= tol,
+                "row {s}: concretizing the published frontier gives [{}, {}] but \
+                 the bounds entry says [{gl}, {gu}] — the two entries disagree",
+                host_lo[s],
+                host_hi[s]
+            );
+            assert!(host_lo[s] <= host_hi[s], "row {s}: inverted frontier");
+        }
+    }
+
+    /// Publishing coefficients is MORE authority than publishing the bound
+    /// derived from them, so the egress must move in lockstep with the sound
+    /// CROWN authority gate: no authority, no frontier.
+    #[test]
+    fn certified_coeffs_entry_publishes_only_with_authority() {
+        let _guard = gpu_test_serial_guard();
+        let device = require_device();
+        let fx = cert_err_fixture();
+        let layers = cert_err_layers(&fx, ny_core::CertifiedWeightError::default());
+        let seed = GpuCrownSeed {
+            lower_a: Arc::from(fx.spec.clone().into_boxed_slice()),
+            upper_a: Arc::from(fx.spec.clone().into_boxed_slice()),
+            lower_b: Arc::from(vec![0.0f32; fx.out_features].into_boxed_slice()),
+            upper_b: Arc::from(vec![0.0f32; fx.out_features].into_boxed_slice()),
+            num_specs: fx.out_features,
+            current_dim: fx.out_features,
+        };
+        let published = device
+            .crown_backward_gpu_seeded_sound_coeffs(
+                &layers,
+                &seed,
+                &fx.input_lower,
+                &fx.input_upper,
+            )
+            .expect("the egress declines by returning Ok(None), never by erroring");
+        assert_eq!(
+            published.is_some(),
+            GpuCrownBackward::provides_sound_gpu_crown(&*device),
+            "the coefficient egress and the sound-CROWN authority gate must \
+             move together"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #cert-coeffs-resnet: the SEGMENT coefficient egress
+    // -----------------------------------------------------------------------
+
+    /// A three-segment residual fixture with CHANGING widths, so a frontier that
+    /// stopped at any single segment is detectable by its `dim` alone:
+    /// `3 -(Chain)-> 6 -(Residual, identity skip)-> 6 -(Chain)-> 4`.
+    #[allow(clippy::type_complexity)]
+    fn resnet_coeff_fixture() -> (Vec<GpuResnetSegment>, GpuCrownSeed, Vec<f32>, Vec<f32>) {
+        let (num_specs, seed_dim, mid, in_dim) = (3usize, 3usize, 6usize, 4usize);
+        let mk = |n: usize, f: fn(usize) -> f32| -> Arc<[f32]> {
+            (0..n).map(f).collect::<Vec<f32>>().into()
+        };
+        // Backward-order layers. `Linear { out_features, in_features }` maps an
+        // (specs x out_features) frontier to (specs x in_features).
+        let head = GpuCrownLayer::Linear {
+            weight: mk(seed_dim * mid, |i| {
+                0.4 - 0.13 * ((i % 7) as f32) + 0.05 * ((i % 3) as f32)
+            }),
+            bias: Some(mk(seed_dim, |i| 0.1 - 0.07 * (i as f32))),
+            out_features: seed_dim,
+            in_features: mid,
+            cert_err: ny_core::CertifiedWeightError::default(),
+        };
+        let act = |scale: f32| GpuCrownLayer::Activation {
+            lower_slope: (0..mid).map(|j| 0.3 + 0.05 * (j as f32)).collect(),
+            upper_slope: (0..mid).map(|j| 0.6 + 0.04 * (j as f32)).collect(),
+            lower_intercept: vec![0.0; mid],
+            upper_intercept: (0..mid)
+                .map(|j| scale * (0.1 + 0.02 * (j as f32)))
+                .collect(),
+            num_neurons: mid,
+        };
+        // The residual branch must map the block dim back to itself (6 -> 6).
+        let branch = GpuCrownLayer::Linear {
+            weight: mk(mid * mid, |i| 0.25 - 0.09 * ((i % 5) as f32)),
+            bias: Some(mk(mid, |i| 0.05 * (i as f32) - 0.1)),
+            out_features: mid,
+            in_features: mid,
+            cert_err: ny_core::CertifiedWeightError::default(),
+        };
+        let tail = GpuCrownLayer::Linear {
+            weight: mk(mid * in_dim, |i| 0.5 - 0.11 * ((i % 4) as f32)),
+            bias: Some(mk(mid, |i| 0.02 * (i as f32))),
+            out_features: mid,
+            in_features: in_dim,
+            cert_err: ny_core::CertifiedWeightError::default(),
+        };
+        let segments = vec![
+            GpuResnetSegment::Chain(vec![head, act(1.0)]),
+            GpuResnetSegment::Residual(vec![branch, act(0.7)]),
+            GpuResnetSegment::Chain(vec![tail]),
+        ];
+        let mut spec = vec![0.0f32; num_specs * seed_dim];
+        for r in 0..num_specs {
+            spec[r * seed_dim + r] = 1.0;
+        }
+        let seed = GpuCrownSeed {
+            lower_a: Arc::from(spec.clone().into_boxed_slice()),
+            upper_a: Arc::from(spec.into_boxed_slice()),
+            lower_b: Arc::from(vec![0.0f32; num_specs].into_boxed_slice()),
+            upper_b: Arc::from(vec![0.0f32; num_specs].into_boxed_slice()),
+            num_specs,
+            current_dim: seed_dim,
+        };
+        let input_lower: Vec<f32> = (0..in_dim).map(|j| -0.5 - 0.1 * (j as f32)).collect();
+        let input_upper: Vec<f32> = (0..in_dim).map(|j| 0.4 + 0.1 * (j as f32)).collect();
+        (segments, seed, input_lower, input_upper)
+    }
+
+    /// #margin-row-gpu-batch: the BATCHED coefficient egress must publish, for
+    /// every slot, exactly what the SINGLE-DOMAIN egress publishes for that
+    /// slot's own domain.
+    ///
+    /// The two domains here differ ONLY in their `Activation` relaxation (the
+    /// only thing that varies per domain in the margin-row lane) and are
+    /// deliberately DISTINGUISHABLE, so a wide fold that mixed the blocks — or
+    /// a split that mis-cut the domain-major rows — moves at least one slot off
+    /// its reference. That is the failure this test exists for; the shapes
+    /// alone would agree either way.
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn resnet_batched_certified_coeffs_match_the_single_domain_egress() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let (segs_a, seed, lo, hi) = resnet_coeff_fixture();
+        // Domain B: same skeleton, same weights (value-equal `Arc`s, which the
+        // homogeneity gate accepts), DIFFERENT relaxation.
+        let segs_b: Vec<GpuResnetSegment> = segs_a
+            .iter()
+            .map(|seg| {
+                let bump = |layers: &Vec<GpuCrownLayer>| -> Vec<GpuCrownLayer> {
+                    layers
+                        .iter()
+                        .map(|l| match l {
+                            GpuCrownLayer::Activation {
+                                lower_slope,
+                                upper_slope,
+                                lower_intercept,
+                                upper_intercept,
+                                num_neurons,
+                            } => GpuCrownLayer::Activation {
+                                // A genuinely different, still valid, relaxation.
+                                lower_slope: lower_slope.iter().map(|v| v * 0.5).collect(),
+                                upper_slope: upper_slope.iter().map(|v| v * 1.3).collect(),
+                                lower_intercept: lower_intercept.clone(),
+                                upper_intercept: upper_intercept.iter().map(|v| v + 0.25).collect(),
+                                num_neurons: *num_neurons,
+                            },
+                            other => other.clone(),
+                        })
+                        .collect()
+                };
+                match seg {
+                    GpuResnetSegment::Chain(l) => GpuResnetSegment::Chain(bump(l)),
+                    GpuResnetSegment::Residual(l) => GpuResnetSegment::Residual(bump(l)),
+                    GpuResnetSegment::ResidualProj(f, p) => {
+                        GpuResnetSegment::ResidualProj(bump(f), bump(p))
+                    }
+                }
+            })
+            .collect();
+
+        let single = |segs: &[GpuResnetSegment]| {
+            device
+                .crown_backward_gpu_resnet_sound_coeffs(segs, &seed, &lo, &hi, &[], &[])
+                .expect("the single-domain egress must run")
+                .expect("the single-domain egress must publish on an armed adapter")
+        };
+        let want_a = single(&segs_a);
+        let want_b = single(&segs_b);
+        // The premise: without this, a slot error would be invisible.
+        assert!(
+            want_a
+                .lower_b
+                .iter()
+                .zip(&want_b.lower_b)
+                .any(|(x, y)| (x - y).abs() > 1e-4),
+            "the two domains must be distinguishable for this pin to mean anything"
+        );
+
+        let domains = vec![
+            ny_core::GpuResnetBatchedDomainRef {
+                segments: &segs_a,
+                input_lower: &lo,
+                input_upper: &hi,
+                beta_signed: &[],
+                frontier_abs: &[],
+                node_abs: &[],
+            },
+            ny_core::GpuResnetBatchedDomainRef {
+                segments: &segs_b,
+                input_lower: &lo,
+                input_upper: &hi,
+                beta_signed: &[],
+                frontier_abs: &[],
+                node_abs: &[],
+            },
+        ];
+        let got = device
+            .crown_backward_gpu_resnet_sound_batched_coeffs(&domains, &seed)
+            .expect("the batched egress must run")
+            .expect("the batched egress must publish on an armed adapter");
+        assert_eq!(got.len(), 2, "one frontier per domain, in domain order");
+        // Wide vs serial differ only by f32 GEMM accumulation order; both are
+        // independently certified enclosures, so this is a match with a
+        // documented tolerance, never a bit-equality.
+        let tol = |x: f32, y: f32| {
+            (f64::from(x) - f64::from(y)).abs()
+                <= 1e-6 + 1e-3 * f64::from(x).abs().max(f64::from(y).abs())
+        };
+        for (slot, want) in [(0usize, &want_a), (1usize, &want_b)] {
+            let cc = &got[slot];
+            assert_eq!(cc.num_specs, seed.num_specs, "slot {slot}: per-domain rows");
+            assert_eq!(cc.dim, want.dim, "slot {slot}: frontier width");
+            for (i, (g, w)) in cc.lower_a.iter().zip(&want.lower_a).enumerate() {
+                assert!(tol(*g, *w), "slot {slot} lower_a[{i}]: {g} vs {w}");
+            }
+            for (i, (g, w)) in cc.lower_b.iter().zip(&want.lower_b).enumerate() {
+                assert!(tol(*g, *w), "slot {slot} lower_b[{i}]: {g} vs {w}");
+            }
+            for (i, (g, w)) in cc.upper_b.iter().zip(&want.upper_b).enumerate() {
+                assert!(tol(*g, *w), "slot {slot} upper_b[{i}]: {g} vs {w}");
+            }
+        }
+    }
+
+    /// Review defect D4: every existing fixture emits only `Residual`, so
+    /// `merge_streams`, the zero-bias P seeding, the `cf.dim != cp.dim` guard
+    /// and the F-before-P `node_abs` split were unreached by any test — and
+    /// that is exactly the branch where a fold-order drift is possible. This
+    /// fixture emits a genuine `ResidualProj` (BOTH branches non-empty).
+    #[cfg(feature = "gpu-tests")]
+    fn resnet_proj_coeff_fixture() -> (Vec<GpuResnetSegment>, GpuCrownSeed, Vec<f32>, Vec<f32>) {
+        let (segments, seed, lo, hi) = resnet_coeff_fixture();
+        let mid = 6usize;
+        let mk = |n: usize, f: fn(usize) -> f32| -> Arc<[f32]> {
+            (0..n).map(f).collect::<Vec<f32>>().into()
+        };
+        // P branch: a second mid->mid map, deliberately DIFFERENT from F so a
+        // swapped or shared fold would change the composed frontier.
+        let proj = GpuCrownLayer::Linear {
+            weight: mk(mid * mid, |i| {
+                0.17 - 0.06 * ((i % 4) as f32) + 0.01 * ((i % 3) as f32)
+            }),
+            bias: Some(mk(mid, |i| 0.03 - 0.02 * (i as f32))),
+            out_features: mid,
+            in_features: mid,
+            cert_err: ny_core::CertifiedWeightError::default(),
+        };
+        let proj_act = GpuCrownLayer::Activation {
+            lower_slope: (0..mid).map(|j| 0.2 + 0.06 * (j as f32)).collect(),
+            upper_slope: (0..mid).map(|j| 0.55 + 0.03 * (j as f32)).collect(),
+            lower_intercept: vec![0.0; mid],
+            upper_intercept: (0..mid).map(|j| 0.07 + 0.015 * (j as f32)).collect(),
+            num_neurons: mid,
+        };
+        let segments = segments
+            .into_iter()
+            .map(|seg| match seg {
+                GpuResnetSegment::Residual(f) => {
+                    GpuResnetSegment::ResidualProj(f, vec![proj.clone(), proj_act.clone()])
+                }
+                other => other,
+            })
+            .collect();
+        (segments, seed, lo, hi)
+    }
+
+    /// Review defect D4: the `ResidualProj` twin of the self-consistency pin.
+    /// The projection branch is where `merge_streams` and the F-before-P
+    /// `node_abs` split live, so the egress must agree with the bounds entry
+    /// THERE too, not just on the identity-skip shape.
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn resnet_proj_certified_coeffs_concretize_to_the_resnet_bounds_entry() {
+        let _g = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let (segments, seed, lo, hi) = resnet_proj_coeff_fixture();
+        let coeffs = device
+            .crown_backward_gpu_resnet_sound_coeffs(&segments, &seed, &lo, &hi, &[], &[])
+            .expect("projection egress must run")
+            .expect("projection egress must publish on an armed adapter");
+        // The composed frontier must reach the INPUT width, not a branch width.
+        assert_eq!(
+            coeffs.dim,
+            lo.len(),
+            "composed frontier must reach the input"
+        );
+        assert_eq!(coeffs.num_specs, seed.num_specs);
+        for (label, v) in [
+            ("lower_a_err", &coeffs.lower_a_err),
+            ("upper_a_err", &coeffs.upper_a_err),
+        ] {
+            assert!(
+                v.iter().all(|x| x.is_finite() && *x >= 0.0),
+                "{label}: radii must be finite and non-negative"
+            );
+        }
+        let bounds = device
+            .crown_backward_gpu_resnet_sound(&segments, &seed, &lo, &hi, &[], &[])
+            .expect("projection bounds entry must run");
+        // Independent host concretization of the published coefficients must
+        // ENCLOSE the bounds entry's own published bounds (identical single
+        // pass here, so this is the self-consistency oracle for the PROJ path).
+        for r in 0..coeffs.num_specs {
+            let (mut lo_acc, mut hi_acc) = (
+                f64::from(coeffs.lower_b[r]) - f64::from(coeffs.lower_b_err[r]),
+                f64::from(coeffs.upper_b[r]) + f64::from(coeffs.upper_b_err[r]),
+            );
+            for j in 0..coeffs.dim {
+                let k = r * coeffs.dim + j;
+                let (al, au) = (
+                    f64::from(coeffs.lower_a[k]) - f64::from(coeffs.lower_a_err[k]),
+                    f64::from(coeffs.upper_a[k]) + f64::from(coeffs.upper_a_err[k]),
+                );
+                let (xl, xu) = (f64::from(lo[j]), f64::from(hi[j]));
+                lo_acc += (al * xl)
+                    .min(al * xu)
+                    .min((f64::from(coeffs.lower_a[k]) + f64::from(coeffs.lower_a_err[k])) * xl)
+                    .min((f64::from(coeffs.lower_a[k]) + f64::from(coeffs.lower_a_err[k])) * xu);
+                hi_acc += (au * xl)
+                    .max(au * xu)
+                    .max((f64::from(coeffs.upper_a[k]) - f64::from(coeffs.upper_a_err[k])) * xl)
+                    .max((f64::from(coeffs.upper_a[k]) - f64::from(coeffs.upper_a_err[k])) * xu);
+            }
+            let tol = 1e-4 * (1.0 + lo_acc.abs().max(hi_acc.abs()));
+            assert!(
+                lo_acc <= f64::from(bounds.lower_bounds[r]) + tol,
+                "spec {r}: coeff concretization {lo_acc} must not exceed the \
+                 bounds entry's lower {}",
+                bounds.lower_bounds[r]
+            );
+            assert!(
+                hi_acc >= f64::from(bounds.upper_bounds[r]) - tol,
+                "spec {r}: coeff concretization {hi_acc} must not undercut the \
+                 bounds entry's upper {}",
+                bounds.upper_bounds[r]
+            );
+        }
+    }
+
+    /// The coefficient egress MUST ignore every domain-specific magnitude even
+    /// when both bounds-only concretization gates are armed. Folding a radius
+    /// against either table and zeroing that coefficient error is sound only for
+    /// the supplied domain; publishing it as box-independent
+    /// [`ny_core::CertifiedCoeffs`] would violate the trait contract. Different
+    /// valid and deliberately understated tables must therefore publish the
+    /// exact same nonzero coefficient radii.
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn resnet_certified_coeffs_ignore_domain_abs_frontiers() {
+        let _guard = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let (segments, seed, in_lo, in_hi) = resnet_coeff_fixture();
+        // Two Activations in the fixture (trunk act, branch act), width 6 each,
+        // in backward fold order.
+        let outward: Vec<Vec<f32>> = vec![vec![4.0f32; 6], vec![4.0f32; 6]];
+        let understated: Vec<Vec<f32>> = vec![vec![0.0f32; 6], vec![0.0f32; 6]];
+        let _coarse = ScopedEnvVar::set("NY_RESNET_ERR_CONCRETIZE", "1");
+        let _fine = ScopedEnvVar::set("NY_RESNET_ERR_CONCRETIZE_FINE", "1");
+
+        let wide = device
+            .crown_backward_gpu_resnet_sound_coeffs(
+                &segments, &seed, &in_lo, &in_hi, &outward, &outward,
+            )
+            .expect("outward tables must not error")
+            .expect("outward tables must publish");
+        let tight = device
+            .crown_backward_gpu_resnet_sound_coeffs(
+                &segments,
+                &seed,
+                &in_lo,
+                &in_hi,
+                &understated,
+                &understated,
+            )
+            .expect("understated tables must not error")
+            .expect("understated tables must publish");
+
+        for (label, lhs, rhs) in [
+            ("lower_a", &wide.lower_a, &tight.lower_a),
+            ("upper_a", &wide.upper_a, &tight.upper_a),
+            ("lower_a_err", &wide.lower_a_err, &tight.lower_a_err),
+            ("upper_a_err", &wide.upper_a_err, &tight.upper_a_err),
+            ("lower_b", &wide.lower_b, &tight.lower_b),
+            ("upper_b", &wide.upper_b, &tight.upper_b),
+            ("lower_b_err", &wide.lower_b_err, &tight.lower_b_err),
+            ("upper_b_err", &wide.upper_b_err, &tight.upper_b_err),
+        ] {
+            assert_eq!(lhs, rhs, "{label} changed with ignored domain tables");
+        }
+        assert_eq!((wide.num_specs, wide.dim), (tight.num_specs, tight.dim));
+        assert!(
+            wide.lower_a_err.iter().any(|radius| *radius > 0.0)
+                || wide.upper_a_err.iter().any(|radius| *radius > 0.0),
+            "fixture must carry a real coefficient radius or equality is vacuous"
+        );
+    }
+
+    #[test]
+    fn resnet_certified_coeffs_concretize_to_the_resnet_bounds_entry() {
+        let _guard = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let (segments, seed, in_lo, in_hi) = resnet_coeff_fixture();
+
+        let coeffs = device
+            .crown_backward_gpu_resnet_sound_coeffs(&segments, &seed, &in_lo, &in_hi, &[], &[])
+            .expect("the segment egress must not error on a qualified device")
+            .expect("a qualified device must publish the composed frontier");
+
+        assert_eq!(coeffs.num_specs, seed.num_specs);
+        assert_eq!(
+            coeffs.dim,
+            in_lo.len(),
+            "the segment egress must publish the COMPOSED (input-width) frontier, \
+             not a single segment's intermediate one"
+        );
+        for field in [
+            &coeffs.lower_a,
+            &coeffs.upper_a,
+            &coeffs.lower_a_err,
+            &coeffs.upper_a_err,
+        ] {
+            assert_eq!(field.len(), coeffs.num_specs * coeffs.dim);
+        }
+        assert!(
+            coeffs
+                .lower_a_err
+                .iter()
+                .chain(coeffs.upper_a_err.iter())
+                .chain(coeffs.lower_b_err.iter())
+                .chain(coeffs.upper_b_err.iter())
+                .all(|v| v.is_finite() && *v >= 0.0),
+            "published radii must be finite and non-negative"
+        );
+
+        let bounds = device
+            .crown_backward_gpu_resnet_sound(&segments, &seed, &in_lo, &in_hi, &[], &[])
+            .expect("resnet bounds entry");
+        let (host_lo, host_hi) = concretize_certified_coeffs(&coeffs, &in_lo, &in_hi);
+        for s in 0..coeffs.num_specs {
+            let (gl, gu) = (
+                f64::from(bounds.lower_bounds[s]),
+                f64::from(bounds.upper_bounds[s]),
+            );
+            let tol = 1e-4 * (1.0 + gl.abs().max(gu.abs()));
+            assert!(
+                (host_lo[s] - gl).abs() <= tol && (host_hi[s] - gu).abs() <= tol,
+                "row {s}: concretizing the published segment frontier gives \
+                 [{}, {}] but the resnet bounds entry says [{gl}, {gu}] — the two \
+                 entries disagree",
+                host_lo[s],
+                host_hi[s]
+            );
+            assert!(host_lo[s] <= host_hi[s], "row {s}: inverted frontier");
+        }
+    }
+
+    /// Publishing coefficients is MORE authority than publishing the bound
+    /// derived from them, so the SEGMENT egress must move in lockstep with the
+    /// sound CROWN authority gate too: no authority, no frontier.
+    #[test]
+    fn resnet_certified_coeffs_publish_only_with_authority() {
+        let _guard = gpu_test_serial_guard();
+        let device = require_device();
+        let (segments, seed, in_lo, in_hi) = resnet_coeff_fixture();
+        let published = device
+            .crown_backward_gpu_resnet_sound_coeffs(&segments, &seed, &in_lo, &in_hi, &[], &[])
+            .expect("the egress declines by returning Ok(None), never by erroring");
+        assert_eq!(
+            published.is_some(),
+            GpuCrownBackward::provides_sound_gpu_crown(&*device),
+            "the segment coefficient egress and the sound-CROWN authority gate \
+             must move together"
+        );
+    }
+
+    /// Modes whose kernels cannot carry the charge must REFUSE a nonzero
+    /// declaration rather than silently drop it.
+    #[test]
+    fn cert_err_refuses_the_modes_that_cannot_charge_it() {
+        let _guard = gpu_test_serial_guard();
+        let device = require_verdict_device();
+        let fx = cert_err_fixture();
+        let charged = cert_err_layers(
+            &fx,
+            ny_core::CertifiedWeightError {
+                weight_rel_err: 1e-4,
+                bias_abs_err: 0.0,
+            },
+        );
+        let run = |device: &WgpuDevice| {
+            device.crown_backward_sound_resident(
+                &charged,
+                &fx.spec,
+                fx.out_features,
+                fx.out_features,
+                &fx.input_lower,
+                &fx.input_upper,
+            )
+        };
+        // Baseline: the charge is accepted in the default mode.
+        run(&device).expect("the default per-entry mode charges cert_err");
+
+        {
+            let _eft = ScopedEnvVar::set("NY_EFT_ERR", "1");
+            // The EFT min-combine has no weight-error term, so min(higham, eft)
+            // could erase the charge. Either the gate is inactive on this adapter
+            // (walk succeeds, charge intact) or the walk refuses — never a
+            // silent tightening.
+            if let Ok((lo, hi)) = run(&device) {
+                let (exact_lo, exact_hi) = device
+                    .crown_backward_sound_resident(
+                        &cert_err_layers(&fx, ny_core::CertifiedWeightError::default()),
+                        &fx.spec,
+                        fx.out_features,
+                        fx.out_features,
+                        &fx.input_lower,
+                        &fx.input_upper,
+                    )
+                    .expect("exact-weight walk");
+                for i in 0..fx.out_features {
+                    assert!(
+                        lo[i] <= exact_lo[i] && hi[i] >= exact_hi[i],
+                        "row {i}: NY_EFT_ERR=1 admitted a charged walk whose bound \
+                         is TIGHTER than the uncharged one"
+                    );
+                }
+            }
+        }
+        {
+            let _rowmax = ScopedEnvVar::set("NY_CONV_ERR_ROWMAX", "1");
+            assert!(
+                run(&device).is_err(),
+                "the legacy row-max conv error mode must refuse a nonzero cert_err"
+            );
+        }
+        {
+            let _coalesce = ScopedEnvVar::set("NY_FOLD_COALESCE", "1");
+            let bias_charged = cert_err_layers(
+                &fx,
+                ny_core::CertifiedWeightError {
+                    weight_rel_err: 0.0,
+                    bias_abs_err: 1e-4,
+                },
+            );
+            assert!(
+                device
+                    .crown_backward_sound_resident(
+                        &bias_charged,
+                        &fx.spec,
+                        fx.out_features,
+                        fx.out_features,
+                        &fx.input_lower,
+                        &fx.input_upper,
+                    )
+                    .is_err(),
+                "the bias charge must refuse the coalesced fold"
+            );
         }
     }
 }

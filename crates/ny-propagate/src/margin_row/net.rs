@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 use super::spec::{TwinOpSpec, TwinSpec};
 
 /// Compiled conv: forward gather table + transposed (backward) tap table.
+#[derive(Clone)]
 pub struct ConvOp {
     /// Consumed tensor id.
     pub input: usize,
@@ -29,6 +30,22 @@ pub struct ConvOp {
     pub ishape: (usize, usize, usize),
     /// Output shape.
     pub oshape: (usize, usize, usize),
+    /// `(stride_h, stride_w)` of the ORIGINAL spec op.
+    ///
+    /// GEOMETRY METADATA ONLY: every kernel in this file reads the compiled
+    /// `gather`/`back_taps` tables, which already encode the stride. This field
+    /// exists so the default-dark GPU seam (`super::gpu_seam`) can rebuild the
+    /// equivalent `GpuCrownLayer::Conv2d` descriptor without re-deriving the
+    /// geometry from the tap tables. No bound reads it.
+    pub stride: (usize, usize),
+    /// `(pad_top, pad_left, pad_bottom, pad_right)` of the ORIGINAL spec op.
+    /// Geometry metadata only, exactly like [`ConvOp::stride`].
+    pub pads: (usize, usize, usize, usize),
+    /// True when this op was compiled from a `ConvTranspose` spec op (the
+    /// transpose-aware gather tables make it indistinguishable downstream).
+    /// Geometry metadata only; the GPU seam REFUSES transposed convs because
+    /// `GpuCrownLayer` has no transposed-conv variant.
+    pub transposed: bool,
     /// Kernel `[cout][cin*kh*kw]` row-major (weight-stationary forward).
     pub wmat: Vec<f64>,
     /// Kernel transposed `[cin][kh][kw][cout]` (contiguous over cout;
@@ -601,6 +618,9 @@ fn compile_conv(
         kernel,
         ishape,
         oshape,
+        stride,
+        pads,
+        transposed: false,
         wmat: weight.to_vec(),
         wt,
         bias: bias.to_vec(),
@@ -796,6 +816,9 @@ fn compile_conv_transpose(
         kernel,
         ishape,
         oshape,
+        stride,
+        pads,
+        transposed: true,
         wmat: weight.to_vec(),
         wt,
         bias: bias.to_vec(),
@@ -886,8 +909,29 @@ pub fn conv_apply_forward_prec(
     abs_w: bool,
     use_f32: bool,
 ) {
+    conv_apply_forward_prec_masked(c, src, dst, abs_w, use_f32, None);
+}
+
+/// [`conv_apply_forward_prec`] with the optional `#tableau-support-mask`
+/// column-block filter (`root.rs`).
+///
+/// `mask` is `(src_row_masks, out_row_masks, n_blocks)`. Both mask slices carry
+/// ONE `u64` per row of their tensor; bit `b` means "columns of block `b` MAY
+/// be nonzero in this row". The caller owns the invariant that a clear bit
+/// means the coefficients there are EXACTLY `0.0` — see the module comment in
+/// `root.rs`. Under that invariant the skipped output blocks are exactly zero,
+/// so the masked kernel is bit-identical to the dense one on every column it
+/// does compute and correct (`dst` arrives zeroed) on every column it skips.
+pub fn conv_apply_forward_prec_masked(
+    c: &ConvOp,
+    src: &Array2<f64>,
+    dst: &mut Array2<f64>,
+    abs_w: bool,
+    use_f32: bool,
+    mask: Option<(&[u64], &[u64], usize)>,
+) {
     if use_f32 {
-        conv_forward_blocked_f32(c, src, dst, abs_w);
+        conv_forward_blocked_f32(c, src, dst, abs_w, mask);
     } else {
         conv_apply_forward(c, src, dst, abs_w);
     }
@@ -911,6 +955,7 @@ pub(crate) fn conv_forward_blocked_f32(
     src: &Array2<f64>,
     dst: &mut Array2<f64>,
     abs_w: bool,
+    mask: Option<(&[u64], &[u64], usize)>,
 ) {
     let (co, _, _, _) = c.kernel;
     let p = c.oshape.1 * c.oshape.2;
@@ -918,29 +963,65 @@ pub(crate) fn conv_forward_blocked_f32(
     let r = src.ncols();
     debug_assert_eq!(dst.nrows(), co * p);
     debug_assert_eq!(dst.ncols(), r);
+    // #tableau-support-mask: the column blocking is driven by the mask when one
+    // is supplied (so a block is either wholly computed or wholly skipped), and
+    // by the cache-tuned default otherwise.
+    let rmax = r.max(1);
+    let (blk, nblk) = match mask {
+        Some((_, _, n)) => (r.div_ceil(n), n),
+        None => {
+            let b = ((1usize << 15) / co.max(1)).clamp(64.min(rmax), rmax);
+            (b, r.div_ceil(b))
+        }
+    };
     let src_flat = src.as_slice().expect("standard layout");
     // f32 scratch of the whole input tensor (read once from f64, then reused
     // across the tap reduction from f32 — the bandwidth win). f64->f32 conversion
     // is nearest-rounding (rel err <= UNIT_F32), covered by the caller's slack.
     // Parallel: these tableau tensors are multi-GB, so a serial cast would itself
     // be a memory-bound pass that eats the win.
+    //
+    // With a mask the cast is restricted to the live blocks of each source row;
+    // the rest is provably exact `0.0` and the scratch is already zeroed, so the
+    // converted values are identical either way.
     let mut src32: Vec<f32> = vec![0.0; src_flat.len()];
-    src32
-        .par_chunks_mut(1 << 16)
-        .zip(src_flat.par_chunks(1 << 16))
-        .for_each(|(dchunk, schunk)| {
-            for (d, &s) in dchunk.iter_mut().zip(schunk) {
-                *d = s as f32;
-            }
-        });
+    match mask {
+        Some((src_mask, _, _)) => {
+            src32
+                .par_chunks_mut(r)
+                .zip(src_flat.par_chunks(r))
+                .zip(src_mask.par_iter())
+                .for_each(|((drow, srow), &m)| {
+                    for b in 0..nblk {
+                        if m & (1u64 << b) == 0 {
+                            continue;
+                        }
+                        let lo = (b * blk).min(r);
+                        let hi = (lo + blk).min(r);
+                        for (d, &s) in drow[lo..hi].iter_mut().zip(&srow[lo..hi]) {
+                            *d = s as f32;
+                        }
+                    }
+                });
+        }
+        None => {
+            src32
+                .par_chunks_mut(1 << 16)
+                .zip(src_flat.par_chunks(1 << 16))
+                .for_each(|(dchunk, schunk)| {
+                    for (d, &s) in dchunk.iter_mut().zip(schunk) {
+                        *d = s as f32;
+                    }
+                });
+        }
+    }
     // f32 weights (small, cached in registers/L1). |w| for the abs (D) lane.
     let w32: Vec<f32> = if abs_w {
         c.wmat.iter().map(|&w| (w as f32).abs()).collect()
     } else {
         c.wmat.iter().map(|&w| w as f32).collect()
     };
-    let rmax = r.max(1);
-    let r_blk = ((1usize << 15) / co.max(1)).clamp(64.min(rmax), rmax);
+    let out_mask = mask.map(|(_, out, _)| out);
     let mut dst3 = dst
         .view_mut()
         .into_shape_with_order((co, p, r))
@@ -949,11 +1030,21 @@ pub(crate) fn conv_forward_blocked_f32(
         .into_par_iter()
         .enumerate()
         .for_each_init(
-            || vec![0.0f32; co * r_blk],
+            || vec![0.0f32; co * blk],
             |acc, (sp, mut out_sp)| {
-                let mut rc = 0;
-                while rc < r {
-                    let rb = (r - rc).min(r_blk);
+                // All output channels at one spatial position gather the same
+                // source rows, so row `sp` (channel 0) carries the whole
+                // position's mask. `nblk == SUPPORT_BLOCKS <= 64` exactly when a
+                // mask is present, so the shift below is always in range.
+                for b in 0..nblk {
+                    if out_mask.is_some_and(|om| om[sp] & (1u64 << b) == 0) {
+                        continue;
+                    }
+                    let rc = (b * blk).min(r);
+                    let rb = (r - rc).min(blk);
+                    if rb == 0 {
+                        continue;
+                    }
                     for v in acc[..co * rb].iter_mut() {
                         *v = 0.0;
                     }
@@ -978,7 +1069,6 @@ pub(crate) fn conv_forward_blocked_f32(
                             *d = f64::from(a);
                         }
                     }
-                    rc += rb;
                 }
             },
         );
@@ -1325,12 +1415,31 @@ pub(super) fn blocked_backward_enabled_from_env(value: Option<&str>) -> bool {
     })
 }
 
+/// Read-once kernel selector for [`conv_apply_backward`].
+///
+/// This used to be a bare `std::env::var` on EVERY call. `conv_apply_backward`
+/// is ~17% of profiled samples and runs twice per conv op per backward pass
+/// (once for the coefficient lane, once for the abs-weight error lane) --
+/// ~38 calls per pass, several passes per BaB expansion, concurrently from
+/// every rayon worker in the parallel frontier. `std::env::var` takes a
+/// process-global lock and allocates a `String` each time, so that was
+/// lock traffic and allocator churn injected directly into the hottest kernel
+/// by a flag that cannot change during a run.
+///
+/// Matches `blas_tile_elems` above -- same file, same idiom, same rationale.
+fn blocked_backward_enabled() -> bool {
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| {
+        blocked_backward_enabled_from_env(
+            std::env::var("NY_MARGIN_ROW_CONV_BWD_BLOCKED")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 pub fn conv_apply_backward(c: &ConvOp, src: &Array2<f64>, dst: &mut Array2<f64>, abs_w: bool) {
-    if blocked_backward_enabled_from_env(
-        std::env::var("NY_MARGIN_ROW_CONV_BWD_BLOCKED")
-            .ok()
-            .as_deref(),
-    ) {
+    if blocked_backward_enabled() {
         conv_backward_blocked(c, src, dst, abs_w);
     } else {
         conv_backward_icgrain(c, src, dst, abs_w);

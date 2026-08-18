@@ -189,6 +189,7 @@ mod gpu_crown_backward {
                     bias,
                     out_features,
                     in_features,
+                    ..
                 } => {
                     cpu_linear_backward(
                         &mut a_l,
@@ -259,6 +260,7 @@ mod gpu_crown_backward {
                     out_w,
                     in_h,
                     in_w,
+                    ..
                 } => {
                     let spatial = out_h * out_w;
                     let total_spatial = num_specs * spatial;

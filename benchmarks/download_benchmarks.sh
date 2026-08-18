@@ -150,12 +150,25 @@ run_vnncomp2025_setup() {
         PATH="$PWD/$compat_dir:$PATH" gunzip -r benchmarks/
 
         echo "CREATING HARDCODED SYMLINKS FOR BROKEN BENCHMARKS"
-        ln -sf ../../nn4sys_2023/onnx/mscn_2048d.onnx benchmarks/nn4sys/onnx/mscn_2048d.onnx
-        ln -sf ../../nn4sys_2023/onnx/mscn_2048d_dual.onnx benchmarks/nn4sys/onnx/mscn_2048d_dual.onnx
-        ln -sf ../../vggnet16_2023/onnx/vgg16-7.onnx benchmarks/vggnet16_2022/onnx/vgg16-7.onnx
+        # `ln` fails outright when the link's parent directory is absent, and a
+        # benchmark whose own archive did not land has no `onnx/` directory. That
+        # failure used to escape as the whole download's exit status, so a single
+        # missing optional benchmark reported "benchmark download failed" and hid
+        # every category that HAD been fetched. Create the parent first, and let a
+        # link whose source is genuinely missing warn instead of aborting the run.
+        link_broken_benchmark() {
+            local target="$1" link="$2"
+            mkdir -p "$(dirname "$link")"
+            if ! ln -sf "$target" "$link"; then
+                echo "WARNING: could not link $link -> $target (benchmark not fetched?)" >&2
+            fi
+        }
+        link_broken_benchmark ../../nn4sys_2023/onnx/mscn_2048d.onnx benchmarks/nn4sys/onnx/mscn_2048d.onnx
+        link_broken_benchmark ../../nn4sys_2023/onnx/mscn_2048d_dual.onnx benchmarks/nn4sys/onnx/mscn_2048d_dual.onnx
+        link_broken_benchmark ../../vggnet16_2023/onnx/vgg16-7.onnx benchmarks/vggnet16_2022/onnx/vgg16-7.onnx
 
         rm -f "$compat_dir/wget" "$compat_dir/gunzip"
-        rmdir "$compat_dir" 2>/dev/null || true
+        rmdir "$compat_dir"
     )
 }
 
@@ -176,7 +189,7 @@ run_vnncomp_setup() {
             write_vnncomp2025_gunzip_shim "$compat_dir" "$system_gunzip"
             PATH="$PWD/$compat_dir:$PATH" ./setup.sh
             rm -f "$compat_dir/gunzip"
-            rmdir "$compat_dir" 2>/dev/null || true
+            rmdir "$compat_dir"
         )
     fi
 }
@@ -184,7 +197,7 @@ run_vnncomp_setup() {
 vnncomp2025_setup_targets_need_refresh() {
     local dir="$1"
     local symlink_target
-    local file_target
+    local file_target="$dir/benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx"
 
     for symlink_target in \
         "$dir/benchmarks/nn4sys/onnx/mscn_2048d.onnx" \
@@ -199,13 +212,9 @@ vnncomp2025_setup_targets_need_refresh() {
     # setup.sh also materializes select benchmark assets from the downloaded
     # large-model archive. Refresh existing 2025 checkouts when those files
     # are missing even if the historical symlink repairs are already present.
-    for file_target in \
-        "$dir/benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx"
-    do
-        if [ ! -e "$file_target" ]; then
-            return 0
-        fi
-    done
+    if [ ! -e "$file_target" ]; then
+        return 0
+    fi
 
     return 1
 }
@@ -291,20 +300,24 @@ download_year() {
     else
         # Decompress gzipped files
         echo "[$year] Decompressing files..."
-        find "$dir" -name "*.gz" -exec gunzip -k {} \; 2>/dev/null || true
+        find "$dir" -name "*.gz" -exec gunzip -k -- {} +
     fi
 
     echo "[$year] Done"
 }
 
 # Default: download 2021 and 2023-2026 (exclude 2022 unless explicitly requested)
-YEARS="${@:-2021 2023 2024 2025 2026}"
+if [ "$#" -eq 0 ]; then
+    YEARS=(2021 2023 2024 2025 2026)
+else
+    YEARS=("$@")
+fi
 
 echo "=== VNN-COMP Benchmark Downloader ==="
-echo "Years: $YEARS"
+echo "Years: ${YEARS[*]}"
 echo ""
 
-for year in $YEARS; do
+for year in "${YEARS[@]}"; do
     download_year "$year"
 done
 

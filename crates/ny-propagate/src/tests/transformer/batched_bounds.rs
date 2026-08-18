@@ -466,6 +466,15 @@ fn test_batched_linear_bounds_compose_avoids_nan_from_0_times_inf() {
         vec![batch, dim],
         vec![batch, dim],
     );
+    let zeros = vec![0.0_f32; dim * dim];
+    let bounds2_finite = BatchedLinearBounds::from_parts_unchecked(
+        ArrayD::from_shape_vec(IxDyn(&[batch, dim, dim]), zeros.clone()).unwrap(),
+        ArrayD::zeros(IxDyn(&[batch, dim])),
+        ArrayD::from_shape_vec(IxDyn(&[batch, dim, dim]), zeros).unwrap(),
+        ArrayD::zeros(IxDyn(&[batch, dim])),
+        vec![batch, dim],
+        vec![batch, dim],
+    );
 
     let composed = bounds1.compose(&bounds2).expect("Compose should succeed");
 
@@ -479,16 +488,56 @@ fn test_batched_linear_bounds_compose_avoids_nan_from_0_times_inf() {
         assert!(!v.is_nan(), "compose produced NaN");
     }
 
-    // Coefficients should be near zero (0 * inf treated as 0).
-    // compose() applies directed rounding: next_down_f32(0.0) = -1e-45 for lower,
-    // next_up_f32(0.0) = 1e-45 for upper. This is the sound 1-ULP widening.
+    // A saturated (non-`is_crown_coeff_safe`) coefficient is an OVERFLOW
+    // SENTINEL, and its taint deliberately survives multiplication by an exact
+    // zero: `compose_scalar` yields `(-inf, +inf)` for the product rather than
+    // collapsing it to 0 ("CROWN_COEFF_MAX is also the finite GPU overflow
+    // transport sentinel. Its taint must survive even multiplication by an
+    // exact zero." — bounds/batched/compose.rs). That is fail-closed and sound:
+    // the bound only ever widens.
+    //
+    // This test originally asserted the pre-hardening semantics (0 * inf -> ~0),
+    // which `1ede1d30` ("Harden verification correctness and fail-closed APIs",
+    // 2026-07-26) deliberately superseded. Its actual purpose — that compose
+    // never manufactures a NaN from `0 * inf` — is asserted above and still
+    // holds; what follows now pins the taint contract instead.
     for v in composed.lower_a.iter() {
-        assert!(v.abs() < 1e-30, "lower_a should be ~0, got {}", v);
-        assert!(*v <= 0.0, "lower_a should be <= 0 (sound), got {}", v);
+        assert!(
+            *v == f32::NEG_INFINITY,
+            "a saturated coefficient must keep its taint through *0 (fail-closed), got {v}"
+        );
     }
     for v in composed.upper_a.iter() {
-        assert!(v.abs() < 1e-30, "upper_a should be ~0, got {}", v);
-        assert!(*v >= 0.0, "upper_a should be >= 0 (sound), got {}", v);
+        assert!(
+            *v == f32::INFINITY,
+            "a saturated coefficient must keep its taint through *0 (fail-closed), got {v}"
+        );
+    }
+
+    // The `0 * finite -> ~0` property the original assertions were reaching for
+    // still holds where it is actually well-defined: with coefficients BELOW the
+    // `CROWN_COEFF_MAX` (1e10) saturation sentinel on both sides, composing
+    // against an all-zero matrix gives zero, up to the 1-ULP directed-rounding
+    // widening compose applies. (1e30 would itself be treated as saturated.)
+    let a1_finite = vec![1e6_f32, 0.0, 0.0, 1e6];
+    let bounds1_finite = BatchedLinearBounds::from_parts_unchecked(
+        ArrayD::from_shape_vec(IxDyn(&[batch, dim, dim]), a1_finite.clone()).unwrap(),
+        ArrayD::zeros(IxDyn(&[batch, dim])),
+        ArrayD::from_shape_vec(IxDyn(&[batch, dim, dim]), a1_finite).unwrap(),
+        ArrayD::zeros(IxDyn(&[batch, dim])),
+        vec![batch, dim],
+        vec![batch, dim],
+    );
+    let composed_finite = bounds1_finite
+        .compose(&bounds2_finite)
+        .expect("Compose should succeed");
+    for v in composed_finite
+        .lower_a
+        .iter()
+        .chain(composed_finite.upper_a.iter())
+    {
+        assert!(!v.is_nan(), "finite compose produced NaN");
+        assert!(v.abs() < 1e-30, "0 * finite should be ~0, got {v}");
     }
 }
 

@@ -47,7 +47,9 @@
 //! a quality guard — soundness always comes from the GPU fold itself).
 
 use ny_core::head_f64_fold::HeadF64Fold;
-use ny_core::{GpuCrownLayer, GpuResnetSegment};
+use ny_core::{
+    GpuCrownBackward, GpuCrownLayer, GpuCrownSeed, GpuResnetBatchedDomainRef, GpuResnetSegment,
+};
 
 /// Env gate for the TRUE wide-alpha gradient (dark, default off). Only
 /// meaningful on top of `NY_BAB_RESNET_WIDE_ALPHA=1`.
@@ -210,6 +212,13 @@ fn prof_add(slot: usize, dt: f64) {
     });
 }
 
+#[inline]
+fn true_replay_deadline_open(deadline: Option<std::time::Instant>) -> Option<()> {
+    deadline
+        .is_none_or(|value| std::time::Instant::now() < value)
+        .then_some(())
+}
+
 /// Result of replaying one spec row's backward over a domain's segments.
 pub(super) struct CriticalRowReplay {
     /// PRE-relaxation lower coefficient row at each Activation (fold order).
@@ -245,15 +254,17 @@ impl CriticalRowReplay {
 /// Backward one branch (layers already in backward order: output -> input).
 /// `beta` holds the per-Activation signed-beta slices for THIS branch's
 /// Activations in slice order; `nu_out` collects the pre-relaxation rows.
-fn backward_branch(
+fn backward_branch_until(
     layers: &[GpuCrownLayer],
     mut coeff: Vec<f32>,
     bias: &mut f64,
     beta: &[Option<&[f32]>],
     nu_out: &mut Vec<Vec<f32>>,
+    deadline: Option<std::time::Instant>,
 ) -> Option<Vec<f32>> {
     let mut act_idx = 0usize;
     for layer in layers {
+        true_replay_deadline_open(deadline)?;
         let t0 = prof_enabled().then(std::time::Instant::now);
         match layer {
             GpuCrownLayer::Linear {
@@ -261,6 +272,7 @@ fn backward_branch(
                 bias: lbias,
                 out_features,
                 in_features,
+                ..
             } => {
                 if coeff.len() != *out_features {
                     return None;
@@ -272,6 +284,9 @@ fn backward_branch(
                 }
                 let mut next = vec![0.0f32; *in_features];
                 for (o, &a) in coeff.iter().enumerate() {
+                    if o.is_multiple_of(64) {
+                        true_replay_deadline_open(deadline)?;
+                    }
                     if a == 0.0 {
                         continue;
                     }
@@ -297,6 +312,7 @@ fn backward_branch(
                 out_w,
                 in_h,
                 in_w,
+                ..
             } => {
                 let (oc, ic) = (*out_channels, *in_channels);
                 let (kh, kw) = (*kernel_h, *kernel_w);
@@ -318,13 +334,16 @@ fn backward_branch(
                 // scalar loop; fine here — the gradient is advisory and the
                 // fail-closed lb check has wide tolerance. `mat_mul` degrades
                 // to Par::Seq inside the domain-parallel rayon workers.
+                true_replay_deadline_open(deadline)?;
                 let wt = faer::Mat::<f32>::from_fn(n, oc, |i, c| weight_col[c * n + i]);
                 let cm = faer::Mat::<f32>::from_fn(oc, ohw, |c, s| coeff[c * ohw + s]);
                 let cols = crate::faer_parallelism::mat_mul(&wt, &cm);
+                true_replay_deadline_open(deadline)?;
                 // col2im: s outer / r inner keeps the col-major `cols` reads
                 // contiguous (column s is contiguous in r).
                 let mut next = vec![0.0f32; ic * in_h * in_w];
                 for oh_i in 0..*out_h {
+                    true_replay_deadline_open(deadline)?;
                     for ow_i in 0..*out_w {
                         let s = oh_i * out_w + ow_i;
                         for ci in 0..ic {
@@ -362,6 +381,9 @@ fn backward_branch(
                 nu_out.push(coeff.clone());
                 let bs = beta.get(act_idx).copied().flatten();
                 for (i, a) in coeff.iter_mut().enumerate() {
+                    if i.is_multiple_of(4096) {
+                        true_replay_deadline_open(deadline)?;
+                    }
                     // Lower-row branch select: a >= 0 -> lower relaxation
                     // (CROWN_ACTIVATION_RESIDENT_SHADER / relu/mod.rs:620-641).
                     let (sel, sel_int) = if *a >= 0.0 {
@@ -394,6 +416,7 @@ fn backward_branch(
             prof_add(slot, t0.elapsed().as_secs_f64());
         }
     }
+    true_replay_deadline_open(deadline)?;
     Some(coeff)
 }
 
@@ -418,6 +441,44 @@ pub(super) fn replay_critical_row(
     spec_row: &[f32],
     beta_signed: &[Vec<f32>],
 ) -> Option<CriticalRowReplay> {
+    replay_critical_row_until(segments, spec_row, beta_signed, None)
+}
+
+/// #envelope-grad-gpu: the concretization argmin corner `x*` of ONE spec row,
+/// derived from the SAME segments the resident fold consumed.
+///
+/// This is the only thing the envelope-factor lane needs from a replay: it
+/// consumes the FACTOR at `x*`, never the row's `nu` and never a gradient.
+/// [`CriticalRowReplay::argmin_corner`] applies the identical
+/// `a > 0 ? lo : hi` convention that `envelope_binding_points` applies to
+/// `intermediate.final_bounds.lower_a()`, so this names the same point without
+/// a `GraphAlphaCrownIntermediate` capture — which the GPU warmup lane cannot
+/// afford (building one is the ~27 s/iteration CPU backward it exists to skip).
+///
+/// `None` on any dim/layer mismatch or deadline expiry; the caller then keeps
+/// the local rule. Fail-closed is cheap here because gradients only steer
+/// `alpha in [0,1]`, every value of which is a sound relaxation.
+pub(crate) fn binding_row_argmin_corner(
+    segments: &[GpuResnetSegment],
+    spec_row: &[f32],
+    in_lo: &[f32],
+    in_hi: &[f32],
+    deadline: Option<std::time::Instant>,
+) -> Option<Vec<f32>> {
+    if in_lo.len() != in_hi.len() {
+        return None;
+    }
+    let replay = replay_critical_row_until(segments, spec_row, &[], deadline)?;
+    (replay.final_a.len() == in_lo.len()).then(|| replay.argmin_corner(in_lo, in_hi))
+}
+
+fn replay_critical_row_until(
+    segments: &[GpuResnetSegment],
+    spec_row: &[f32],
+    beta_signed: &[Vec<f32>],
+    deadline: Option<std::time::Instant>,
+) -> Option<CriticalRowReplay> {
+    true_replay_deadline_open(deadline)?;
     let mut nu: Vec<Vec<f32>> = Vec::new();
     let mut coeff = spec_row.to_vec();
     let mut bias = 0.0f64;
@@ -433,22 +494,27 @@ pub(super) fn replay_critical_row(
             .collect()
     };
     for seg in segments {
+        true_replay_deadline_open(deadline)?;
         match seg {
             GpuResnetSegment::Chain(branch) => {
                 let nf = n_act(branch);
                 let beta = beta_for(fold_idx, nf);
-                coeff = backward_branch(branch, coeff, &mut bias, &beta, &mut nu)?;
+                coeff = backward_branch_until(branch, coeff, &mut bias, &beta, &mut nu, deadline)?;
                 fold_idx += nf;
             }
             GpuResnetSegment::Residual(branch) => {
                 let nf = n_act(branch);
                 let beta = beta_for(fold_idx, nf);
                 let skip = coeff.clone();
-                let mut through = backward_branch(branch, coeff, &mut bias, &beta, &mut nu)?;
+                let mut through =
+                    backward_branch_until(branch, coeff, &mut bias, &beta, &mut nu, deadline)?;
                 if through.len() != skip.len() {
                     return None;
                 }
-                for (t, s) in through.iter_mut().zip(skip.iter()) {
+                for (idx, (t, s)) in through.iter_mut().zip(skip.iter()).enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        true_replay_deadline_open(deadline)?;
+                    }
                     *t += s;
                 }
                 coeff = through;
@@ -460,26 +526,38 @@ pub(super) fn replay_critical_row(
                 let beta_f = beta_for(fold_idx, nf);
                 let beta_p = beta_for(fold_idx + nf, np);
                 let seed_p = coeff.clone();
-                let through = backward_branch(f_branch, coeff, &mut bias, &beta_f, &mut nu)?;
+                let through =
+                    backward_branch_until(f_branch, coeff, &mut bias, &beta_f, &mut nu, deadline)?;
                 // P carries coefficients only; its bias contributions are real
                 // (a projection conv can carry a bias) so keep accumulating
                 // into the same scalar — matches the fold, which seeds P's
                 // bias to 0 and ADDS both streams' biases at the join.
                 let mut p_bias = 0.0f64;
-                let p_coeff = backward_branch(p_branch, seed_p, &mut p_bias, &beta_p, &mut nu)?;
+                let p_coeff = backward_branch_until(
+                    p_branch,
+                    seed_p,
+                    &mut p_bias,
+                    &beta_p,
+                    &mut nu,
+                    deadline,
+                )?;
                 bias += p_bias;
                 if through.len() != p_coeff.len() {
                     return None;
                 }
-                coeff = through
-                    .iter()
-                    .zip(p_coeff.iter())
-                    .map(|(&a, &b)| a + b)
-                    .collect();
+                let mut joined = Vec::with_capacity(through.len());
+                for (idx, (&a, &b)) in through.iter().zip(p_coeff.iter()).enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        true_replay_deadline_open(deadline)?;
+                    }
+                    joined.push(a + b);
+                }
+                coeff = joined;
                 fold_idx += nf + np;
             }
         }
     }
+    true_replay_deadline_open(deadline)?;
     Some(CriticalRowReplay {
         nu,
         final_a: coeff,
@@ -550,6 +628,34 @@ pub(super) fn sound_f64_lower_bound(
     // (gate off / unregistered) ⇒ the fold arm is NEVER entered ⇒ byte-identical.
     head_fold: Option<&HeadF64Fold>,
 ) -> Option<f32> {
+    sound_f64_lower_bound_with_deadline(
+        segments,
+        spec_row,
+        beta_signed,
+        in_lo,
+        in_hi,
+        head_fold,
+        None,
+    )
+}
+
+/// Deadline-aware face of [`sound_f64_lower_bound`].
+///
+/// The kFSB f64 shadow uses this observation-only entry with a private deadline.
+/// Existing verdict-bearing callers keep using the wrapper above with
+/// `deadline=None`, preserving their arithmetic and result bits. Expiry is a
+/// fail-closed diagnostic miss (`None`), never a partial lower bound.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::beta_crown::engine::graph) fn sound_f64_lower_bound_with_deadline(
+    segments: &[GpuResnetSegment],
+    spec_row: &[f32],
+    beta_signed: &[Vec<f32>],
+    in_lo: &[f32],
+    in_hi: &[f32],
+    head_fold: Option<&HeadF64Fold>,
+    deadline: Option<std::time::Instant>,
+) -> Option<f32> {
+    sound_f64_deadline_open(deadline)?;
     let mut row = SoundRowF64 {
         a: spec_row.iter().map(|&x| f64::from(x)).collect(),
         err: vec![0.0f64; spec_row.len()],
@@ -569,11 +675,12 @@ pub(super) fn sound_f64_lower_bound(
             .collect()
     };
     for seg in segments {
+        sound_f64_deadline_open(deadline)?;
         match seg {
             GpuResnetSegment::Chain(branch) => {
                 let nf = n_act_all(branch);
                 let beta = beta_for(fold_idx, nf);
-                sound_f64_branch(branch, &mut row, &beta, fold_idx, head_fold)?;
+                sound_f64_branch(branch, &mut row, &beta, fold_idx, head_fold, deadline)?;
                 fold_idx += nf;
             }
             GpuResnetSegment::Residual(branch) => {
@@ -581,11 +688,14 @@ pub(super) fn sound_f64_lower_bound(
                 let beta = beta_for(fold_idx, nf);
                 let skip_a = row.a.clone();
                 let skip_err = row.err.clone();
-                sound_f64_branch(branch, &mut row, &beta, fold_idx, head_fold)?;
+                sound_f64_branch(branch, &mut row, &beta, fold_idx, head_fold, deadline)?;
                 if row.a.len() != skip_a.len() {
                     return None;
                 }
                 for j in 0..row.a.len() {
+                    if j % 4096 == 0 {
+                        sound_f64_deadline_open(deadline)?;
+                    }
                     let sum = row.a[j] + skip_a[j];
                     // add rounding ≤ u·|sum|, plus both incoming errors.
                     row.err[j] += skip_err[j] + U_F64 * sum.abs();
@@ -601,7 +711,7 @@ pub(super) fn sound_f64_lower_bound(
                 let seed_a = row.a.clone();
                 let seed_err = row.err.clone();
                 // F branch mutates `row` in place (keeps bias accumulator).
-                sound_f64_branch(f_branch, &mut row, &beta_f, fold_idx, head_fold)?;
+                sound_f64_branch(f_branch, &mut row, &beta_f, fold_idx, head_fold, deadline)?;
                 // P branch on its own coeff/err, bias seeded to 0 then added.
                 let mut prow = SoundRowF64 {
                     a: seed_a,
@@ -610,7 +720,14 @@ pub(super) fn sound_f64_lower_bound(
                     berr: 0.0,
                     babs: 0.0,
                 };
-                sound_f64_branch(p_branch, &mut prow, &beta_p, fold_idx + nf, head_fold)?;
+                sound_f64_branch(
+                    p_branch,
+                    &mut prow,
+                    &beta_p,
+                    fold_idx + nf,
+                    head_fold,
+                    deadline,
+                )?;
                 row.bias += prow.bias;
                 row.berr += prow.berr;
                 row.babs += prow.babs;
@@ -618,6 +735,9 @@ pub(super) fn sound_f64_lower_bound(
                     return None;
                 }
                 for j in 0..row.a.len() {
+                    if j % 4096 == 0 {
+                        sound_f64_deadline_open(deadline)?;
+                    }
                     let sum = row.a[j] + prow.a[j];
                     row.err[j] += prow.err[j] + U_F64 * sum.abs();
                     row.a[j] = sum;
@@ -637,6 +757,9 @@ pub(super) fn sound_f64_lower_bound(
     let mut lb = row.bias;
     let mut penalty = row.berr;
     for j in 0..n {
+        if j % 4096 == 0 {
+            sound_f64_deadline_open(deadline)?;
+        }
         let a = row.a[j];
         let (xl, xu) = (f64::from(in_lo[j]), f64::from(in_hi[j]));
         lb += if a >= 0.0 { a * xl } else { a * xu };
@@ -646,6 +769,9 @@ pub(super) fn sound_f64_lower_bound(
     // The concretize sum itself rounds (length-n f64 reduction): ≤ γ_n·Σ|a·x|.
     let mut l1_ax = 0.0f64;
     for j in 0..n {
+        if j % 4096 == 0 {
+            sound_f64_deadline_open(deadline)?;
+        }
         let xmax = f64::from(in_lo[j]).abs().max(f64::from(in_hi[j]).abs());
         l1_ax += row.a[j].abs() * xmax;
     }
@@ -679,6 +805,13 @@ pub(super) fn sound_f64_lower_bound(
     })
 }
 
+#[inline]
+fn sound_f64_deadline_open(deadline: Option<std::time::Instant>) -> Option<()> {
+    deadline
+        .is_none_or(|limit| std::time::Instant::now() < limit)
+        .then_some(())
+}
+
 /// Count ALL Activation layers in a branch (twin of the private `n_act`).
 fn n_act_all(layers: &[GpuCrownLayer]) -> usize {
     layers
@@ -702,15 +835,32 @@ fn sound_f64_branch(
     beta: &[Option<&[f32]>],
     act_base: usize,
     head_fold: Option<&HeadF64Fold>,
+    deadline: Option<std::time::Instant>,
 ) -> Option<()> {
+    // #cert-err fail-closed: this f64 walk publishes a CERTIFIED row and charges
+    // only its own rounding, treating `weight`/`bias` as exact. A layer carrying
+    // a BN-fold `CertifiedWeightError` would need the extra `w_rel`/`bias_abs_err`
+    // terms; decline the whole branch (the caller falls back) rather than emit a
+    // row whose radius omits them.
+    if layers.iter().any(|layer| {
+        matches!(
+            layer,
+            GpuCrownLayer::Linear { cert_err, .. } | GpuCrownLayer::Conv2d { cert_err, .. }
+                if !cert_err.is_exact()
+        )
+    }) {
+        return None;
+    }
     let mut act_idx = 0usize;
     for layer in layers {
+        sound_f64_deadline_open(deadline)?;
         match layer {
             GpuCrownLayer::Linear {
                 weight,
                 bias: lbias,
                 out_features,
                 in_features,
+                ..
             } => {
                 if row.a.len() != *out_features {
                     return None;
@@ -725,6 +875,9 @@ fn sound_f64_branch(
                     let mut absdot = 0.0f64;
                     let mut errdot = 0.0f64;
                     for (i, &a) in row.a.iter().enumerate() {
+                        if i % 4096 == 0 {
+                            sound_f64_deadline_open(deadline)?;
+                        }
                         let bv = f64::from(b[i]);
                         dot += a * bv;
                         absdot += a.abs() * bv.abs();
@@ -739,6 +892,9 @@ fn sound_f64_branch(
                 let mut ne = vec![0.0f64; *in_features]; // Σ err·|w|
                 let mut sprod = vec![0.0f64; *in_features]; // Σ |a|·|w|
                 for (o, &a) in row.a.iter().enumerate() {
+                    if o % 16 == 0 {
+                        sound_f64_deadline_open(deadline)?;
+                    }
                     let e = row.err[o];
                     let av = a.abs();
                     if a == 0.0 && e == 0.0 {
@@ -746,6 +902,9 @@ fn sound_f64_branch(
                     }
                     let wrow = &weight[o * in_features..(o + 1) * in_features];
                     for (j, &w) in wrow.iter().enumerate() {
+                        if j % 4096 == 0 {
+                            sound_f64_deadline_open(deadline)?;
+                        }
                         let wf = f64::from(w);
                         let wa = wf.abs();
                         na[j] += a * wf;
@@ -754,6 +913,9 @@ fn sound_f64_branch(
                     }
                 }
                 for j in 0..*in_features {
+                    if j % 4096 == 0 {
+                        sound_f64_deadline_open(deadline)?;
+                    }
                     ne[j] += gk * sprod[j];
                 }
                 row.a = na;
@@ -774,6 +936,7 @@ fn sound_f64_branch(
                 out_w,
                 in_h,
                 in_w,
+                ..
             } => {
                 let (oc, ic) = (*out_channels, *in_channels);
                 let (kh, kw) = (*kernel_h, *kernel_w);
@@ -791,6 +954,9 @@ fn sound_f64_branch(
                     let mut absdot = 0.0f64;
                     let mut errdot = 0.0f64;
                     for (i, &a) in row.a.iter().enumerate() {
+                        if i % 4096 == 0 {
+                            sound_f64_deadline_open(deadline)?;
+                        }
                         let bv = f64::from(b[i]);
                         dot += a * bv;
                         absdot += a.abs() * bv.abs();
@@ -805,7 +971,9 @@ fn sound_f64_branch(
                 let mut ne = vec![0.0f64; in_dim];
                 let mut sprod = vec![0.0f64; in_dim];
                 for oh_i in 0..*out_h {
+                    sound_f64_deadline_open(deadline)?;
                     for ow_i in 0..*out_w {
+                        sound_f64_deadline_open(deadline)?;
                         for c in 0..oc {
                             let s = (c * out_h + oh_i) * out_w + ow_i;
                             let a = row.a[s];
@@ -842,6 +1010,9 @@ fn sound_f64_branch(
                     }
                 }
                 for j in 0..in_dim {
+                    if j % 4096 == 0 {
+                        sound_f64_deadline_open(deadline)?;
+                    }
                     ne[j] += gk * sprod[j];
                 }
                 row.a = na;
@@ -879,6 +1050,9 @@ fn sound_f64_branch(
                     }
                 }
                 for i in 0..*num_neurons {
+                    if i % 4096 == 0 {
+                        sound_f64_deadline_open(deadline)?;
+                    }
                     let mut a = row.a[i];
                     // step 1 (BEFORE the sign-select): add the post-activation term
                     // `+Σβ·g_i` to the ReLU-OUTPUT coefficient, so it rides the same
@@ -936,16 +1110,18 @@ fn sound_f64_branch(
 /// forward order (fold index `fold_start + (n_branch_acts - 1 - k)`), record
 /// the incoming pre-activation into `pre_out[fold_idx]` and apply the affine
 /// relaxation selected by `nu[fold_idx]`'s sign.
-fn forward_branch(
+fn forward_branch_until(
     layers: &[GpuCrownLayer],
     mut x: Vec<f32>,
     fold_start: usize,
     nu: &[Vec<f32>],
     pre_out: &mut [Vec<f32>],
+    deadline: Option<std::time::Instant>,
 ) -> Option<Vec<f32>> {
     let n_acts = n_act(layers);
     let mut seen = 0usize;
     for layer in layers.iter().rev() {
+        true_replay_deadline_open(deadline)?;
         let t0 = prof_enabled().then(std::time::Instant::now);
         match layer {
             GpuCrownLayer::Linear {
@@ -953,12 +1129,16 @@ fn forward_branch(
                 bias,
                 out_features,
                 in_features,
+                ..
             } => {
                 if x.len() != *in_features {
                     return None;
                 }
                 let mut y = vec![0.0f32; *out_features];
                 for (o, yo) in y.iter_mut().enumerate() {
+                    if o.is_multiple_of(64) {
+                        true_replay_deadline_open(deadline)?;
+                    }
                     let row = &weight[o * in_features..(o + 1) * in_features];
                     let mut acc = 0.0f64;
                     for (&w, &xv) in row.iter().zip(x.iter()) {
@@ -986,6 +1166,7 @@ fn forward_branch(
                 out_w,
                 in_h,
                 in_w,
+                ..
             } => {
                 let (oc, ic) = (*out_channels, *in_channels);
                 let (kh, kw) = (*kernel_h, *kernel_w);
@@ -1002,6 +1183,7 @@ fn forward_branch(
                 // col-major column writes stay contiguous; padding stays 0.
                 let mut p_mat = faer::Mat::<f32>::zeros(n, ohw);
                 for oh_i in 0..*out_h {
+                    true_replay_deadline_open(deadline)?;
                     for ow_i in 0..*out_w {
                         let s = oh_i * out_w + ow_i;
                         for ci in 0..ic {
@@ -1024,10 +1206,15 @@ fn forward_branch(
                         }
                     }
                 }
+                true_replay_deadline_open(deadline)?;
                 let w = faer::Mat::<f32>::from_fn(oc, n, |c, i| weight_col[c * n + i]);
                 let ym = crate::faer_parallelism::mat_mul(&w, &p_mat);
+                true_replay_deadline_open(deadline)?;
                 let mut y = vec![0.0f32; oc * ohw];
                 for s in 0..ohw {
+                    if s.is_multiple_of(64) {
+                        true_replay_deadline_open(deadline)?;
+                    }
                     for c in 0..oc {
                         let p = c * ohw + s;
                         let mut acc = ym[(c, s)];
@@ -1056,6 +1243,9 @@ fn forward_branch(
                 }
                 pre_out.get_mut(fold_idx)?.clone_from(&x);
                 for (i, v) in x.iter_mut().enumerate() {
+                    if i.is_multiple_of(4096) {
+                        true_replay_deadline_open(deadline)?;
+                    }
                     let (s, t) = if nu_r[i] >= 0.0 {
                         (lower_slope[i], lower_intercept[i])
                     } else {
@@ -1076,6 +1266,7 @@ fn forward_branch(
             prof_add(slot, t0.elapsed().as_secs_f64());
         }
     }
+    true_replay_deadline_open(deadline)?;
     Some(x)
 }
 
@@ -1087,12 +1278,23 @@ pub(super) fn relaxed_forward(
     nu: &[Vec<f32>],
     x: &[f32],
 ) -> Option<(Vec<Vec<f32>>, Vec<f32>)> {
+    relaxed_forward_until(segments, nu, x, None)
+}
+
+fn relaxed_forward_until(
+    segments: &[GpuResnetSegment],
+    nu: &[Vec<f32>],
+    x: &[f32],
+    deadline: Option<std::time::Instant>,
+) -> Option<(Vec<Vec<f32>>, Vec<f32>)> {
+    true_replay_deadline_open(deadline)?;
     let n_relu = nu.len();
     let mut pre = vec![Vec::new(); n_relu];
     // Fold-order start index of each segment's activations.
     let mut starts: Vec<usize> = Vec::with_capacity(segments.len());
     let mut idx = 0usize;
     for seg in segments {
+        true_replay_deadline_open(deadline)?;
         starts.push(idx);
         idx += match seg {
             GpuResnetSegment::Chain(b) | GpuResnetSegment::Residual(b) => n_act(b),
@@ -1105,30 +1307,46 @@ pub(super) fn relaxed_forward(
     // Forward = reverse segment order (fold order is output -> input).
     let mut h = x.to_vec();
     for (seg, &start) in segments.iter().zip(starts.iter()).rev() {
+        true_replay_deadline_open(deadline)?;
         h = match seg {
-            GpuResnetSegment::Chain(branch) => forward_branch(branch, h, start, nu, &mut pre)?,
+            GpuResnetSegment::Chain(branch) => {
+                forward_branch_until(branch, h, start, nu, &mut pre, deadline)?
+            }
             GpuResnetSegment::Residual(branch) => {
-                let through = forward_branch(branch, h.clone(), start, nu, &mut pre)?;
+                let through =
+                    forward_branch_until(branch, h.clone(), start, nu, &mut pre, deadline)?;
                 if through.len() != h.len() {
                     return None;
                 }
-                through.iter().zip(h.iter()).map(|(&a, &b)| a + b).collect()
+                let mut joined = Vec::with_capacity(through.len());
+                for (idx, (&a, &b)) in through.iter().zip(h.iter()).enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        true_replay_deadline_open(deadline)?;
+                    }
+                    joined.push(a + b);
+                }
+                joined
             }
             GpuResnetSegment::ResidualProj(f_branch, p_branch) => {
                 let nf = n_act(f_branch);
-                let through = forward_branch(f_branch, h.clone(), start, nu, &mut pre)?;
-                let proj = forward_branch(p_branch, h, start + nf, nu, &mut pre)?;
+                let through =
+                    forward_branch_until(f_branch, h.clone(), start, nu, &mut pre, deadline)?;
+                let proj = forward_branch_until(p_branch, h, start + nf, nu, &mut pre, deadline)?;
                 if through.len() != proj.len() {
                     return None;
                 }
-                through
-                    .iter()
-                    .zip(proj.iter())
-                    .map(|(&a, &b)| a + b)
-                    .collect()
+                let mut joined = Vec::with_capacity(through.len());
+                for (idx, (&a, &b)) in through.iter().zip(proj.iter()).enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        true_replay_deadline_open(deadline)?;
+                    }
+                    joined.push(a + b);
+                }
+                joined
             }
         };
     }
+    true_replay_deadline_open(deadline)?;
     Some((pre, h))
 }
 
@@ -1149,13 +1367,84 @@ pub(crate) fn true_alpha_grads_for_row(
     gpu_lb: f32,
     probe: bool,
 ) -> Option<Vec<Vec<f32>>> {
+    true_alpha_grads_for_row_until(
+        segments,
+        spec_row,
+        beta_signed,
+        in_lo,
+        in_hi,
+        n_relu_expected,
+        gpu_lb,
+        probe,
+        None,
+    )
+}
+
+/// Deadline-aware face of [`true_alpha_grads_for_row`].
+///
+/// Expiry at any checked replay boundary returns `None`; no partial gradient is
+/// ever exposed.  The legacy wide-alpha callers keep the wrapper above and
+/// therefore preserve their existing arithmetic and scheduling.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::beta_crown::engine::graph) fn true_alpha_grads_for_row_until(
+    segments: &[GpuResnetSegment],
+    spec_row: &[f32],
+    beta_signed: &[Vec<f32>],
+    in_lo: &[f32],
+    in_hi: &[f32],
+    n_relu_expected: usize,
+    gpu_lb: f32,
+    probe: bool,
+    deadline: Option<std::time::Instant>,
+) -> Option<Vec<Vec<f32>>> {
+    true_replay_deadline_open(deadline)?;
     let prof = prof_enabled();
     if prof {
         PROF_ACC.with(|a| a.set([0.0; 6]));
     }
     let t_bwd = std::time::Instant::now();
-    let replay = replay_critical_row(segments, spec_row, beta_signed)?;
+    let replay = match deadline {
+        Some(_) => replay_critical_row_until(segments, spec_row, beta_signed, deadline)?,
+        None => replay_critical_row(segments, spec_row, beta_signed)?,
+    };
     let bwd_s = t_bwd.elapsed().as_secs_f64();
+    true_alpha_grads_from_replay(
+        segments,
+        replay,
+        spec_row,
+        beta_signed,
+        in_lo,
+        in_hi,
+        n_relu_expected,
+        gpu_lb,
+        probe,
+        deadline,
+        prof,
+        bwd_s,
+    )
+}
+
+/// Shared tail of the true-gradient computation: validate a completed
+/// [`CriticalRowReplay`] against the fold bound (the fail-closed live oracle),
+/// run the relaxed forward at the argmin corner, and assemble the per-neuron
+/// chain-rule gradients. Extracted verbatim from `true_alpha_grads_for_row_until`
+/// so the #true-grad-gpu-replay lane can feed a GPU-evaluated replay through the
+/// IDENTICAL validation + gradient arithmetic (byte-for-byte for CPU replays).
+#[allow(clippy::too_many_arguments)]
+fn true_alpha_grads_from_replay(
+    segments: &[GpuResnetSegment],
+    replay: CriticalRowReplay,
+    spec_row: &[f32],
+    beta_signed: &[Vec<f32>],
+    in_lo: &[f32],
+    in_hi: &[f32],
+    n_relu_expected: usize,
+    gpu_lb: f32,
+    probe: bool,
+    deadline: Option<std::time::Instant>,
+    prof: bool,
+    bwd_s: f64,
+) -> Option<Vec<Vec<f32>>> {
     if replay.nu.len() != n_relu_expected || replay.final_a.len() != in_lo.len() {
         if probe {
             eprintln!(
@@ -1168,7 +1457,22 @@ pub(crate) fn true_alpha_grads_for_row(
         }
         return None;
     }
-    let replay_lb = replay.lower_bound(in_lo, in_hi);
+    if replay.final_a.len() != in_hi.len() {
+        return None;
+    }
+    let replay_lb = if deadline.is_none() {
+        replay.lower_bound(in_lo, in_hi)
+    } else {
+        let mut replay_lb_acc = replay.final_b as f64;
+        for (j, &a) in replay.final_a.iter().enumerate() {
+            if j.is_multiple_of(4096) {
+                true_replay_deadline_open(deadline)?;
+            }
+            let x = if a > 0.0 { in_lo[j] } else { in_hi[j] };
+            replay_lb_acc += a as f64 * x as f64;
+        }
+        replay_lb_acc as f32
+    };
     // The GPU fold subtracts certified error, so gpu_lb <= replay_lb + noise;
     // a large gap either way means the replay walked the net differently.
     let scale = 1.0 + replay_lb.abs().max(gpu_lb.abs());
@@ -1181,9 +1485,58 @@ pub(crate) fn true_alpha_grads_for_row(
         }
         return None;
     }
-    let x_star = replay.argmin_corner(in_lo, in_hi);
+    let x_star = if deadline.is_none() {
+        replay.argmin_corner(in_lo, in_hi)
+    } else {
+        let mut x_star = Vec::with_capacity(replay.final_a.len());
+        for (j, &a) in replay.final_a.iter().enumerate() {
+            if j.is_multiple_of(4096) {
+                true_replay_deadline_open(deadline)?;
+            }
+            x_star.push(if a > 0.0 { in_lo[j] } else { in_hi[j] });
+        }
+        x_star
+    };
     let t_fwd = std::time::Instant::now();
-    let (pre, _out) = relaxed_forward(segments, &replay.nu, &x_star)?;
+    let (pre, fwd_out) = match deadline {
+        Some(_) => relaxed_forward_until(segments, &replay.nu, &x_star, deadline)?,
+        None => relaxed_forward(segments, &replay.nu, &x_star)?,
+    };
+    // #nu-oracle (review defect 1a): with beta = 0 at every wired site,
+    // adjointness gives `spec·F_relaxed(x*) == final_a·x* + final_b =
+    // replay_lb` (pinned by `replay_backward_and_relaxed_forward_are_adjoint`)
+    // — and the relaxed forward's branch SELECT consumes nu, so this ties the
+    // nu payload to the lb THROUGH THE NETWORK on every iteration. A gather
+    // offset/permutation bug in a GPU-supplied nu returns finite garbage that
+    // passes every shape/lb check yet silently corrupts every gradient; this
+    // is the live oracle that catches it. Fail closed: disagreement means the
+    // nu channel is untrustworthy, so the caller falls back to the CPU replay
+    // (or skips the alpha step) exactly like the lb-tolerance check above.
+    // Adjointness holds in this simple spec-dot form only with beta = 0
+    // (every wired production site); a nonzero beta adds the split-plane
+    // Lagrangian term to replay_lb that the relaxed forward's spec-dot does
+    // not carry. Gate the oracle accordingly.
+    let beta_all_zero = beta_signed.iter().all(|b| b.iter().all(|&x| x == 0.0));
+    if beta_all_zero {
+        let spec_dot: f64 = spec_row
+            .iter()
+            .zip(fwd_out.iter())
+            .map(|(&s, &o)| f64::from(s) * f64::from(o))
+            .sum();
+        let spec_dot = spec_dot as f32;
+        let fwd_scale = 1.0 + replay_lb.abs().max(spec_dot.abs());
+        let fwd_diff = (spec_dot - replay_lb).abs();
+        if !fwd_diff.is_finite() || fwd_diff > 1e-3 * fwd_scale {
+            if probe {
+                eprintln!(
+                    "[wide-alpha-true] nu-oracle: spec·F_relaxed(x*) {spec_dot:.6} vs \
+                     replay lb {replay_lb:.6} out of tolerance — nu channel \
+                     untrusted, skipping alpha step"
+                );
+            }
+            return None;
+        }
+    }
     if prof {
         let fwd_s = t_fwd.elapsed().as_secs_f64();
         let a = PROF_ACC.with(|acc| acc.get());
@@ -1302,18 +1655,323 @@ pub(crate) fn true_alpha_grads_for_row(
         }
         eprintln!("[wide-alpha-true] replay ok: lb={replay_lb:.5} gpu={gpu_lb:.5} diff={diff:.2e}");
     }
-    Some(
-        replay
-            .nu
-            .iter()
-            .zip(pre.iter())
-            .map(|(nu_r, z_r)| {
-                nu_r.iter()
-                    .zip(z_r.iter())
-                    .map(|(&nu, &z)| if nu > 0.0 { nu * z } else { 0.0 })
-                    .collect()
-            })
-            .collect(),
+    let mut gradients = Vec::with_capacity(replay.nu.len());
+    for (relu_idx, (nu_r, z_r)) in replay.nu.iter().zip(pre.iter()).enumerate() {
+        true_replay_deadline_open(deadline)?;
+        if nu_r.len() != z_r.len() {
+            return None;
+        }
+        let mut row = Vec::with_capacity(nu_r.len());
+        for (idx, (&nu, &z)) in nu_r.iter().zip(z_r.iter()).enumerate() {
+            if idx.is_multiple_of(4096) {
+                true_replay_deadline_open(deadline)?;
+            }
+            let gradient = if nu > 0.0 { nu * z } else { 0.0 };
+            if !gradient.is_finite() {
+                return None;
+            }
+            row.push(gradient);
+        }
+        debug_assert_eq!(relu_idx, gradients.len());
+        gradients.push(row);
+    }
+    true_replay_deadline_open(deadline)?;
+    Some(gradients)
+}
+
+// ============================================================================
+// #true-grad-gpu-replay: evaluate the replay's CROWN backward on the ARMED
+// sound GPU lane (direction × width).
+//
+// B8-1 established that the TRUE binding-row gradient (direction) dispatches
+// but completes only 1–2 margin-ascent iterations per 100s because every
+// iteration pays a FULL CPU replay (`replay_critical_row`: per-Linear dense
+// row GEMV + per-Conv transpose-conv GEMM + col2im — the O(n·m) coefficient
+// walk over the whole suffix). The sound wide resident backward
+// (`crown_backward_gpu_resnet_sound_beta_batched_trajectory`) computes the
+// SAME walk on the GPU and can export everything the gradient needs:
+//   - `beta_gather[r]` with an ALL-COLUMNS union gather = the PRE-relaxation
+//     lower coefficient row at ReLU `r` — exactly the replay's `nu[r]`
+//     (captured "before the ReLU relaxation is applied, matching the CPU
+//     capture point", gemm.rs `GpuCrownBetaGradResult`);
+//   - `coeff.lower_a`/`lower_b` row 0 = the input-level folded row — the
+//     replay's `final_a`/`final_b` (centers; the certified-error channel is
+//     carried separately and is irrelevant to an advisory gradient).
+// The relaxed forward at x* and the gradient assembly stay on the CPU and
+// reuse the exact tail (`true_alpha_grads_from_replay`), INCLUDING the
+// existing replay-lb-vs-fold-lb tolerance cross-check — which becomes the
+// live oracle over the GPU-evaluated replay. Every refusal (backend error,
+// shape mismatch, non-finite payload, tolerance miss, deadline expiry) falls
+// closed to the same CPU implementation, subject to the remaining absolute
+// deadline. Only the no-GPU seam is pinned bit-identical.
+//
+// SOUNDNESS: gradients only steer α ∈ [0,1] (any value is a valid lower
+// relaxation slope); no bound from this lane is ever published. The verdict
+// bound is always the caller's own certified fold.
+// ============================================================================
+
+/// Opt-out gate for the GPU-evaluated replay (`NY_TRUE_GRAD_GPU_REPLAY=0`
+/// disables; default ON where a caller supplies operands). The no-GPU path is
+/// untouched either way: callers that pass no operands are byte-identical.
+pub(crate) fn true_grad_gpu_replay_enabled() -> bool {
+    ny_levers::read(&ny_levers::decls::telemetry::TRUE_GRAD_GPU_REPLAY)
+        .value
+        .as_bool()
+}
+
+/// Borrowed operands for one GPU-evaluated replay. Constructed only around a
+/// backend that advertises the SOUND resident backward; the certified-error
+/// concretization tables may be EMPTY (sanctioned by the trait contract:
+/// empty ⇒ pre-concretization path / degraded fallback — a non-finite or
+/// exploded payload is rejected here and falls closed to the CPU replay).
+pub(crate) struct TrueGradGpuReplayOps<'a> {
+    gpu: &'a dyn GpuCrownBackward,
+    frontier_abs: &'a [Vec<f32>],
+    node_abs: &'a [Vec<f32>],
+}
+
+impl<'a> TrueGradGpuReplayOps<'a> {
+    /// `None` unless `gpu` advertises the sound resident CROWN backward.
+    pub(crate) fn new(
+        gpu: &'a dyn GpuCrownBackward,
+        frontier_abs: &'a [Vec<f32>],
+        node_abs: &'a [Vec<f32>],
+    ) -> Option<Self> {
+        gpu.provides_sound_gpu_crown().then_some(Self {
+            gpu,
+            frontier_abs,
+            node_abs,
+        })
+    }
+}
+
+/// Fold-order Activation widths across the whole segment stack (F before P for
+/// `ResidualProj`), matching the order `replay_critical_row` harvests `nu`.
+fn activation_widths(segments: &[GpuResnetSegment]) -> Vec<usize> {
+    fn push_branch(layers: &[GpuCrownLayer], out: &mut Vec<usize>) {
+        for layer in layers {
+            if let GpuCrownLayer::Activation { num_neurons, .. } = layer {
+                out.push(*num_neurons);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for seg in segments {
+        match seg {
+            GpuResnetSegment::Chain(b) | GpuResnetSegment::Residual(b) => push_branch(b, &mut out),
+            GpuResnetSegment::ResidualProj(f, p) => {
+                push_branch(f, &mut out);
+                push_branch(p, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Evaluate ONE spec row's replay on the sound GPU resident backward:
+/// a single-domain, single-spec trajectory call with an all-columns union
+/// gather. Returns the same [`CriticalRowReplay`] shape the CPU walk produces
+/// (`nu` per Activation in fold order + the input-level `final_a`/`final_b`
+/// centers), or `None` on ANY refusal — the caller then takes the CPU replay.
+#[allow(clippy::too_many_arguments)]
+fn gpu_replay_critical_row_until(
+    ops: &TrueGradGpuReplayOps<'_>,
+    segments: &[GpuResnetSegment],
+    spec_row: &[f32],
+    beta_signed: &[Vec<f32>],
+    in_lo: &[f32],
+    in_hi: &[f32],
+    deadline: Option<std::time::Instant>,
+    probe: bool,
+) -> Option<CriticalRowReplay> {
+    true_replay_deadline_open(deadline)?;
+    if segments.is_empty() || spec_row.is_empty() || in_lo.len() != in_hi.len() {
+        return None;
+    }
+    let widths = activation_widths(segments);
+    if widths.is_empty() {
+        return None;
+    }
+    // One β slice per Activation in fold order (the batched-domain contract);
+    // callers may pass fewer/empty slices meaning zero — pad, never truncate a
+    // longer table (that would silently drop duals: refuse instead).
+    if beta_signed.len() > widths.len() {
+        return None;
+    }
+    let beta_padded: Vec<Vec<f32>>;
+    let beta_ref: &[Vec<f32>] = if beta_signed.len() == widths.len() {
+        beta_signed
+    } else {
+        beta_padded = (0..widths.len())
+            .map(|r| beta_signed.get(r).cloned().unwrap_or_default())
+            .collect();
+        &beta_padded
+    };
+    // ALL-COLUMNS union gather: `beta_gather[r]` then carries the full
+    // pre-relaxation lower coefficient row at ReLU `r` — the replay's `nu[r]`.
+    let gather: Vec<Vec<u32>> = widths
+        .iter()
+        .map(|&w| (0..w as u32).collect::<Vec<u32>>())
+        .collect();
+    let gather_refs: Vec<&[u32]> = gather.iter().map(|v| v.as_slice()).collect();
+    let domain = GpuResnetBatchedDomainRef {
+        segments,
+        input_lower: in_lo,
+        input_upper: in_hi,
+        beta_signed: beta_ref,
+        frontier_abs: ops.frontier_abs,
+        node_abs: ops.node_abs,
+    };
+    let seed = GpuCrownSeed {
+        lower_a: spec_row.to_vec().into(),
+        upper_a: spec_row.to_vec().into(),
+        lower_b: vec![0.0f32].into(),
+        upper_b: vec![0.0f32].into(),
+        num_specs: 1,
+        current_dim: spec_row.len(),
+    };
+    let trajectory = {
+        // Target the deadline at the exact backend receiving the dispatch (the
+        // wide lane may differ from the propagation engine).
+        let _deadline_scope =
+            crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(ops.gpu, deadline);
+        ops.gpu
+            .crown_backward_gpu_resnet_sound_beta_batched_trajectory(
+                &[domain],
+                &seed,
+                &gather_refs,
+                &[],
+            )
+    };
+    let trajectory = match trajectory {
+        Ok(t) => t,
+        Err(e) => {
+            if probe {
+                eprintln!("[true-grad-gpu-replay] backend refusal: {e}");
+            }
+            return None;
+        }
+    };
+    true_replay_deadline_open(deadline)?;
+    // Payload validation (fail closed — an advisory lane must never consume a
+    // malformed device payload): exactly one publishable bound row, one full
+    // finite nu row per Activation, and a finite input-level coefficient row.
+    if trajectory.bounds.len() != 1
+        || !crate::sound_gpu_gate::gpu_interval_payload_is_publishable(
+            &trajectory.bounds[0].lower_bounds,
+            &trajectory.bounds[0].upper_bounds,
+            1,
+        )
+    {
+        return None;
+    }
+    if trajectory.beta_gather.len() != widths.len() {
+        return None;
+    }
+    for (row, &w) in trajectory.beta_gather.iter().zip(widths.iter()) {
+        if row.len() != w || row.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+    }
+    let coeff = trajectory.coeff;
+    if coeff.num_specs != 1
+        || coeff.num_specs_per_dom != 1
+        || coeff.dim != in_lo.len()
+        || coeff.lower_a.len() != coeff.dim
+        || coeff.lower_b.len() != 1
+        || coeff.lower_a.iter().any(|v| !v.is_finite())
+        || !coeff.lower_b[0].is_finite()
+    {
+        return None;
+    }
+    true_replay_deadline_open(deadline)?;
+    Some(CriticalRowReplay {
+        nu: trajectory.beta_gather,
+        final_a: coeff.lower_a,
+        final_b: coeff.lower_b[0],
+    })
+}
+
+/// GPU-accelerated face of [`true_alpha_grads_for_row_until`]
+/// (#true-grad-gpu-replay). When `ops` is supplied (a sound resident backend)
+/// and the gate is not opted out, the replay's heavy backward walk runs as ONE
+/// wide sound GPU call; the relaxed forward, the fail-closed lb tolerance
+/// cross-check (the live oracle), and the gradient arithmetic are the SAME
+/// code as the CPU path. Any refusal — including a tolerance miss on the
+/// GPU-evaluated replay — falls closed to the same CPU implementation, subject
+/// to the remaining absolute deadline.
+/// `ops == None` is EXACTLY `true_alpha_grads_for_row_until` (no-GPU parity).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn true_alpha_grads_for_row_gpu_until(
+    ops: Option<&TrueGradGpuReplayOps<'_>>,
+    segments: &[GpuResnetSegment],
+    spec_row: &[f32],
+    beta_signed: &[Vec<f32>],
+    in_lo: &[f32],
+    in_hi: &[f32],
+    n_relu_expected: usize,
+    gpu_lb: f32,
+    probe: bool,
+    deadline: Option<std::time::Instant>,
+) -> Option<Vec<Vec<f32>>> {
+    if let Some(ops) = ops {
+        if true_grad_gpu_replay_enabled() {
+            let prof = prof_enabled();
+            if prof {
+                PROF_ACC.with(|a| a.set([0.0; 6]));
+            }
+            let t_bwd = std::time::Instant::now();
+            if let Some(replay) = gpu_replay_critical_row_until(
+                ops,
+                segments,
+                spec_row,
+                beta_signed,
+                in_lo,
+                in_hi,
+                deadline,
+                probe,
+            ) {
+                let bwd_s = t_bwd.elapsed().as_secs_f64();
+                if let Some(grads) = true_alpha_grads_from_replay(
+                    segments,
+                    replay,
+                    spec_row,
+                    beta_signed,
+                    in_lo,
+                    in_hi,
+                    n_relu_expected,
+                    gpu_lb,
+                    probe,
+                    deadline,
+                    prof,
+                    bwd_s,
+                ) {
+                    if probe {
+                        eprintln!(
+                            "[true-grad-gpu-replay] dispatched: bwd={:.1}ms (device)",
+                            bwd_s * 1e3
+                        );
+                    }
+                    return Some(grads);
+                }
+                if probe {
+                    eprintln!("[true-grad-gpu-replay] GPU replay failed validation — CPU fallback");
+                }
+            } else if probe {
+                eprintln!("[true-grad-gpu-replay] GPU replay unavailable — CPU fallback");
+            }
+        }
+    }
+    true_alpha_grads_for_row_until(
+        segments,
+        spec_row,
+        beta_signed,
+        in_lo,
+        in_hi,
+        n_relu_expected,
+        gpu_lb,
+        probe,
+        deadline,
     )
 }
 
@@ -1322,12 +1980,32 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn true_alpha_replay_expired_deadline_exposes_no_partial_gradient() {
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_nanos(1))
+            .expect("one nanosecond before the current instant must be representable");
+        assert!(true_alpha_grads_for_row_until(
+            &[],
+            &[1.0],
+            &[],
+            &[-1.0],
+            &[1.0],
+            0,
+            -1.0,
+            false,
+            Some(expired),
+        )
+        .is_none());
+    }
+
     fn lin(w: Vec<f32>, b: Option<Vec<f32>>, out_f: usize, in_f: usize) -> GpuCrownLayer {
         GpuCrownLayer::Linear {
             weight: Arc::from(w.into_boxed_slice()),
             bias: b.map(|v| Arc::from(v.into_boxed_slice())),
             out_features: out_f,
             in_features: in_f,
+            cert_err: Default::default(),
         }
     }
 
@@ -1368,6 +2046,7 @@ mod tests {
             out_w: out_hw,
             in_h: in_hw,
             in_w: in_hw,
+            cert_err: Default::default(),
         }
     }
 
@@ -1534,6 +2213,50 @@ mod tests {
                 "trial {trial}: sound_f64 {sound} too far below affine min {affine_min}"
             );
         }
+    }
+
+    #[test]
+    fn sound_f64_deadline_face_expires_and_preserves_no_deadline_bits() {
+        let mut state = 0xF64D_EAD1u64;
+        let (segments, in_dim) = build_stack(&mut state);
+        let spec = vec![0.75, -0.25];
+        let beta = vec![Vec::new(), Vec::new(), Vec::new()];
+        let in_lo = vec![-0.5; in_dim];
+        let in_hi = vec![0.5; in_dim];
+        let baseline = sound_f64_lower_bound(&segments, &spec, &beta, &in_lo, &in_hi, None)
+            .expect("baseline fold");
+        let far_deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(30))
+            .expect("future deadline");
+        let deadline_face = sound_f64_lower_bound_with_deadline(
+            &segments,
+            &spec,
+            &beta,
+            &in_lo,
+            &in_hi,
+            None,
+            Some(far_deadline),
+        )
+        .expect("deadlined fold");
+        assert_eq!(
+            deadline_face.to_bits(),
+            baseline.to_bits(),
+            "deadline polling must not perturb completed fold arithmetic"
+        );
+
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("expired deadline");
+        assert!(sound_f64_lower_bound_with_deadline(
+            &segments,
+            &spec,
+            &beta,
+            &in_lo,
+            &in_hi,
+            None,
+            Some(expired),
+        )
+        .is_none());
     }
 
     /// FINITE-DIFFERENCE self-check on the full conv/residual stack: the
@@ -1966,5 +2689,450 @@ mod tests {
             base.to_bits(),
             "a looser fold must be DISCARDED by the max (baseline retained bit-exact)"
         );
+    }
+
+    // ==================================================================
+    // #true-grad-gpu-replay seam tests
+    // ==================================================================
+
+    fn seam_fixture() -> (Vec<GpuResnetSegment>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut state = 0x600D_CAFEu64;
+        let (segments, in_dim) = build_stack(&mut state);
+        let spec = vec![0.9f32, -0.4];
+        let in_lo: Vec<f32> = (0..in_dim).map(|_| -0.4 + 0.1 * rngf(&mut state)).collect();
+        let in_hi: Vec<f32> = in_lo.iter().map(|&l| l + 0.8).collect();
+        (segments, spec, in_lo, in_hi)
+    }
+
+    fn assert_bit_identical(a: &[Vec<f32>], b: &[Vec<f32>]) {
+        assert_eq!(a.len(), b.len(), "gradient relu-count mismatch");
+        for (ra, rb) in a.iter().zip(b.iter()) {
+            assert_eq!(ra.len(), rb.len(), "gradient row width mismatch");
+            for (x, y) in ra.iter().zip(rb.iter()) {
+                assert_eq!(x.to_bits(), y.to_bits(), "gradient bits diverged");
+            }
+        }
+    }
+
+    /// FAIL-CLOSED PIN 1: with NO GPU operands the GPU face is bit-for-bit the
+    /// CPU path (the "no-GPU ⇒ identical to today" contract).
+    #[test]
+    fn true_grad_gpu_face_without_ops_is_bit_identical_to_cpu() {
+        let (segments, spec, in_lo, in_hi) = seam_fixture();
+        let replay = replay_critical_row(&segments, &spec, &[]).expect("cpu replay");
+        let lb = replay.lower_bound(&in_lo, &in_hi);
+        let cpu = true_alpha_grads_for_row_until(
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            lb,
+            false,
+            None,
+        )
+        .expect("cpu gradients");
+        let face = true_alpha_grads_for_row_gpu_until(
+            None,
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            lb,
+            false,
+            None,
+        )
+        .expect("gpu face without ops");
+        assert_bit_identical(&cpu, &face);
+        let nz = cpu.iter().flatten().filter(|g| **g != 0.0).count();
+        assert!(nz > 0, "fixture must produce a nonzero gradient");
+    }
+
+    /// A stub backend that ADVERTISES the sound capability but refuses every
+    /// dispatch (the trait's defaults) — the seam must fall closed to the CPU
+    /// replay bit-for-bit.
+    struct RefusingSoundStub;
+
+    impl GpuCrownBackward for RefusingSoundStub {
+        fn crown_backward_gpu(
+            &self,
+            _layers: &[GpuCrownLayer],
+            _spec: &[f32],
+            _num_specs: usize,
+            _input_lower: &[f32],
+            _input_upper: &[f32],
+        ) -> ny_core::Result<ny_core::GpuCrownResult> {
+            Err(ny_core::NyError::UnsupportedOp(
+                "refusing stub: no dispatch".into(),
+            ))
+        }
+
+        fn provides_sound_gpu_crown(&self) -> bool {
+            true
+        }
+    }
+
+    /// FAIL-CLOSED PIN 2: a backend refusal (trajectory unsupported) yields the
+    /// CPU path's exact bits.
+    #[test]
+    fn true_grad_gpu_face_backend_refusal_fails_closed_to_cpu_bits() {
+        let (segments, spec, in_lo, in_hi) = seam_fixture();
+        let replay = replay_critical_row(&segments, &spec, &[]).expect("cpu replay");
+        let lb = replay.lower_bound(&in_lo, &in_hi);
+        let stub = RefusingSoundStub;
+        let ops = TrueGradGpuReplayOps::new(&stub, &[], &[]).expect("stub advertises sound");
+        let cpu = true_alpha_grads_for_row_until(
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            lb,
+            false,
+            None,
+        )
+        .expect("cpu gradients");
+        let face = true_alpha_grads_for_row_gpu_until(
+            Some(&ops),
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            lb,
+            false,
+            None,
+        )
+        .expect("refusal must fall closed to the CPU replay");
+        assert_bit_identical(&cpu, &face);
+    }
+
+    /// A backend that does NOT advertise the sound capability cannot construct
+    /// operands at all (the constructor is the capability gate).
+    struct UnsoundStub;
+
+    impl GpuCrownBackward for UnsoundStub {
+        fn crown_backward_gpu(
+            &self,
+            _layers: &[GpuCrownLayer],
+            _spec: &[f32],
+            _num_specs: usize,
+            _input_lower: &[f32],
+            _input_upper: &[f32],
+        ) -> ny_core::Result<ny_core::GpuCrownResult> {
+            Err(ny_core::NyError::UnsupportedOp("unsound stub".into()))
+        }
+    }
+
+    #[test]
+    fn true_grad_gpu_ops_require_sound_capability() {
+        let stub = UnsoundStub;
+        assert!(
+            TrueGradGpuReplayOps::new(&stub, &[], &[]).is_none(),
+            "operands must refuse a backend without the sound resident capability"
+        );
+    }
+
+    /// ECHO stub: implements the trajectory entry by running the CPU replay on
+    /// the SAME domain operands and packaging it exactly as a device would
+    /// (all-columns beta_gather = nu rows; coeff frontier = final_a/final_b;
+    /// one publishable bound row). Pins the caller-side mapping — union-gather
+    /// construction, `beta_gather → nu`, `coeff.lower_a/lower_b → final_a/b` —
+    /// and proves the GPU face reproduces the CPU gradients bit-for-bit when
+    /// the device walk agrees with the host walk.
+    struct EchoTrajectoryStub {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GpuCrownBackward for EchoTrajectoryStub {
+        fn crown_backward_gpu(
+            &self,
+            _layers: &[GpuCrownLayer],
+            _spec: &[f32],
+            _num_specs: usize,
+            _input_lower: &[f32],
+            _input_upper: &[f32],
+        ) -> ny_core::Result<ny_core::GpuCrownResult> {
+            Err(ny_core::NyError::UnsupportedOp(
+                "echo stub exposes only the trajectory entry".into(),
+            ))
+        }
+
+        fn provides_sound_gpu_crown(&self) -> bool {
+            true
+        }
+
+        fn crown_backward_gpu_resnet_sound_beta_batched_trajectory(
+            &self,
+            domains: &[GpuResnetBatchedDomainRef<'_>],
+            seed: &GpuCrownSeed,
+            union_gather_idx: &[&[u32]],
+            _relu_pre_lower: &[&[Vec<f32>]],
+        ) -> ny_core::Result<ny_core::GpuCrownTrajectoryResult> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if domains.len() != 1 || seed.num_specs != 1 {
+                return Err(ny_core::NyError::InvalidSpec(
+                    "echo stub expects one domain, one spec row".into(),
+                ));
+            }
+            let d = &domains[0];
+            let spec: Vec<f32> = seed.lower_a.to_vec();
+            let replay =
+                replay_critical_row(d.segments, &spec, d.beta_signed).ok_or_else(|| {
+                    ny_core::NyError::InvalidSpec("echo stub: host replay declined".into())
+                })?;
+            // The caller must have requested EVERY column of every ReLU (the
+            // all-columns union gather) — that is what makes beta_gather ≡ nu.
+            if union_gather_idx.len() != replay.nu.len() {
+                return Err(ny_core::NyError::InvalidSpec(
+                    "echo stub: union gather relu-count mismatch".into(),
+                ));
+            }
+            for (idx, nu_r) in union_gather_idx.iter().zip(replay.nu.iter()) {
+                if idx.len() != nu_r.len()
+                    || idx
+                        .iter()
+                        .enumerate()
+                        .any(|(pos, &col)| col as usize != pos)
+                {
+                    return Err(ny_core::NyError::InvalidSpec(
+                        "echo stub: caller did not request the identity all-columns gather".into(),
+                    ));
+                }
+            }
+            let lb = replay.lower_bound(d.input_lower, d.input_upper);
+            let dim = replay.final_a.len();
+            Ok(ny_core::GpuCrownTrajectoryResult {
+                bounds: vec![ny_core::GpuCrownResult {
+                    lower_bounds: vec![lb],
+                    upper_bounds: vec![lb],
+                }],
+                alpha_grads: Vec::new(),
+                beta_gather: replay.nu.clone(),
+                coeff: ny_core::GpuResidentCoeffBatched {
+                    lower_a: replay.final_a.clone(),
+                    upper_a: replay.final_a.clone(),
+                    lower_err: vec![0.0; dim],
+                    upper_err: vec![0.0; dim],
+                    lower_b: vec![replay.final_b],
+                    upper_b: vec![replay.final_b],
+                    lower_b_err: vec![0.0],
+                    upper_b_err: vec![0.0],
+                    dim,
+                    num_specs: 1,
+                    num_specs_per_dom: 1,
+                },
+            })
+        }
+    }
+
+    /// MAPPING PIN: through the echo stub the GPU face must (a) actually cross
+    /// the trajectory seam, (b) reproduce the CPU gradients bit-for-bit, and
+    /// (c) preserve the raw_nz sparsity (trivially, by bit-equality).
+    #[test]
+    fn true_grad_gpu_face_echo_trajectory_matches_cpu_bits() {
+        let (segments, spec, in_lo, in_hi) = seam_fixture();
+        let replay = replay_critical_row(&segments, &spec, &[]).expect("cpu replay");
+        let lb = replay.lower_bound(&in_lo, &in_hi);
+        let stub = EchoTrajectoryStub {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ops = TrueGradGpuReplayOps::new(&stub, &[], &[]).expect("echo advertises sound");
+        let cpu = true_alpha_grads_for_row_until(
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            lb,
+            false,
+            None,
+        )
+        .expect("cpu gradients");
+        let face = true_alpha_grads_for_row_gpu_until(
+            Some(&ops),
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            lb,
+            false,
+            None,
+        )
+        .expect("echo-backed gpu gradients");
+        assert!(
+            stub.calls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the test never crossed the trajectory seam"
+        );
+        assert_bit_identical(&cpu, &face);
+        let nz = face.iter().flatten().filter(|g| **g != 0.0).count();
+        assert!(nz > 0, "raw_nz must stay nonzero through the GPU face");
+    }
+
+    /// GPU replay of a BETA-carrying row: the padded per-Activation β table
+    /// must reach the backend intact (echoed through the CPU replay inside the
+    /// stub) and reproduce the CPU beta-replay gradients bit-for-bit.
+    #[test]
+    fn true_grad_gpu_face_echo_with_beta_matches_cpu_bits() {
+        let (segments, spec, in_lo, in_hi) = seam_fixture();
+        let mut state = 0xBE7A_5EEDu64;
+        // Nonzero β on the middle Activation (fold index 1, width 12) with a
+        // SHORT table (len 2 < 3 activations) to exercise the padding path.
+        let beta = vec![
+            Vec::new(),
+            (0..12)
+                .map(|_| rngf(&mut state) * 0.05)
+                .collect::<Vec<f32>>(),
+        ];
+        let replay = replay_critical_row(&segments, &spec, &beta).expect("cpu beta replay");
+        let lb = replay.lower_bound(&in_lo, &in_hi);
+        let stub = EchoTrajectoryStub {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ops = TrueGradGpuReplayOps::new(&stub, &[], &[]).expect("echo advertises sound");
+        let cpu = true_alpha_grads_for_row_until(
+            &segments, &spec, &beta, &in_lo, &in_hi, 3, lb, false, None,
+        )
+        .expect("cpu beta gradients");
+        let face = true_alpha_grads_for_row_gpu_until(
+            Some(&ops),
+            &segments,
+            &spec,
+            &beta,
+            &in_lo,
+            &in_hi,
+            3,
+            lb,
+            false,
+            None,
+        )
+        .expect("echo-backed beta gradients");
+        assert_bit_identical(&cpu, &face);
+    }
+
+    /// Deadline pin: an expired deadline on the GPU face exposes no partial
+    /// gradient (both the GPU attempt and the CPU fallback refuse).
+    #[test]
+    fn true_grad_gpu_face_expired_deadline_exposes_no_partial_gradient() {
+        let (segments, spec, in_lo, in_hi) = seam_fixture();
+        let stub = EchoTrajectoryStub {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ops = TrueGradGpuReplayOps::new(&stub, &[], &[]).expect("echo advertises sound");
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_nanos(1))
+            .expect("representable expired instant");
+        assert!(true_alpha_grads_for_row_gpu_until(
+            Some(&ops),
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            -1.0,
+            false,
+            Some(expired),
+        )
+        .is_none());
+    }
+
+    /// REAL-DEVICE CONTRACT (`gpu-tests`, fail-fast — no skip path): the wide
+    /// sound WGPU backend must execute the single-row trajectory replay on the
+    /// conv/residual fixture, its replay bound must agree with the CPU replay
+    /// within the live-oracle tolerance, and gradients must still dispatch
+    /// (nonzero raw_nz) through the full GPU face. Empty certified-error
+    /// tables are the trait-sanctioned degraded mode (pre-concretization
+    /// path); an exploded payload would be rejected and would surface here as
+    /// a loud failure, not a silent skip.
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn true_grad_gpu_replay_matches_cpu_replay_on_device() {
+        let device = ny_gpu::WgpuDevice::new_for_verdict(ny_gpu::WgpuVerdictRequest::new())
+            .expect("gpu-tests requires a WGPU device passing all five authority rungs");
+        let engine: &dyn ny_core::GemmEngine = &device;
+        let gpu = engine
+            .as_gpu_crown_backward()
+            .filter(|g| g.provides_sound_gpu_crown())
+            .expect("qualified device must expose the sound CROWN seam");
+        let (segments, spec, in_lo, in_hi) = seam_fixture();
+        let ops = TrueGradGpuReplayOps::new(gpu, &[], &[]).expect("device advertises sound");
+
+        let cpu_replay = replay_critical_row(&segments, &spec, &[]).expect("cpu replay");
+        let cpu_lb = cpu_replay.lower_bound(&in_lo, &in_hi);
+
+        let gpu_replay =
+            gpu_replay_critical_row_until(&ops, &segments, &spec, &[], &in_lo, &in_hi, None, true)
+                .expect("device trajectory replay must fire on the supported conv/residual stack");
+        assert_eq!(gpu_replay.nu.len(), cpu_replay.nu.len());
+        // #nu-oracle (review defect 1b): the nu payload is the seam's CORE
+        // deliverable and travels on an INDEPENDENT device channel from the
+        // frontier download — a gather offset/permutation bug returns finite,
+        // correctly-shaped garbage that passes every lb check. Compare the
+        // VALUES per ReLU. Tolerance: the device gather reads the same
+        // pre-relaxation activations the CPU walk records; both sides are
+        // plain f32 walks over identical weights, so agreement is limited
+        // only by fold-order noise (~1e-4 relative at fixture scales).
+        for (r, (gnu, cnu)) in gpu_replay.nu.iter().zip(cpu_replay.nu.iter()).enumerate() {
+            assert_eq!(gnu.len(), cnu.len(), "relu {r}: nu width");
+            for (i, (g, c)) in gnu.iter().zip(cnu.iter()).enumerate() {
+                let tol = 1e-4 * (1.0 + c.abs());
+                assert!(
+                    (g - c).abs() <= tol,
+                    "relu {r} elem {i}: gpu nu {g} vs cpu nu {c} (tol {tol})"
+                );
+            }
+        }
+        assert_eq!(gpu_replay.final_a.len(), cpu_replay.final_a.len());
+        let gpu_replay_lb = gpu_replay.lower_bound(&in_lo, &in_hi);
+        let scale = 1.0 + cpu_lb.abs().max(gpu_replay_lb.abs());
+        assert!(
+            (gpu_replay_lb - cpu_lb).abs() <= 0.05 * scale,
+            "device replay bound {gpu_replay_lb} disagrees with CPU replay bound {cpu_lb}"
+        );
+
+        let cpu = true_alpha_grads_for_row_until(
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            cpu_lb,
+            false,
+            None,
+        )
+        .expect("cpu gradients");
+        let face = true_alpha_grads_for_row_gpu_until(
+            Some(&ops),
+            &segments,
+            &spec,
+            &[],
+            &in_lo,
+            &in_hi,
+            3,
+            cpu_lb,
+            true,
+            None,
+        )
+        .expect("device-backed gradients must dispatch");
+        assert_eq!(face.len(), cpu.len());
+        for (fr, cr) in face.iter().zip(cpu.iter()) {
+            assert_eq!(fr.len(), cr.len(), "gradient row width mismatch");
+            assert!(fr.iter().all(|g| g.is_finite()));
+        }
+        let nz_face = face.iter().flatten().filter(|g| **g != 0.0).count();
+        let nz_cpu = cpu.iter().flatten().filter(|g| **g != 0.0).count();
+        assert!(nz_face > 0, "raw_nz vanished on the device lane");
+        assert!(nz_cpu > 0, "cpu fixture gradient must be nonzero");
     }
 }

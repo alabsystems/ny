@@ -40,7 +40,7 @@
 //! per-cell slice already relies on — established by NY's runtime forward
 //! self-check, not by this linear checker.
 
-use crate::rational::{Rat, RatError};
+use crate::rational::{ensure_healthy, poisoned, Rat, RatError};
 use crate::schema::{entailment_to_json, ConstraintKind, EntailmentCertificate, LinearConstraint};
 use crate::selfcheck::{check_entailment, CheckError};
 #[cfg(trust_verify)]
@@ -77,7 +77,9 @@ pub struct BranchLeaf {
 }
 
 /// Whether the property threshold is an upper (`Y_0 ≤ t`) or lower (`Y_0 ≥ t`)
-/// bound. UNSAT for `Le` iff `min y > t`; for `Ge` iff `max y < t`.
+/// bound. The current lower-bound certificate format supports only `Le`;
+/// `Ge` is retained in the wire model but rejected until upper-bound leaf
+/// evidence has a direction-aware checker and composition rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreshDir {
     /// Unsafe region `Y_0 ≤ t`; a lower-bound branch tree refutes it.
@@ -112,6 +114,10 @@ pub enum BranchError {
     /// The leaf set is not exactly the product grid (gap, overlap, or extra).
     #[error("leaf set is not the exact product grid: {0}")]
     PartitionMismatch(String),
+    /// The Cartesian product of per-axis cells cannot be represented by
+    /// `usize`; attempting to enumerate it would otherwise wrap or saturate.
+    #[error("partition cell count overflows usize at axis {0}")]
+    PartitionSizeOverflow(usize),
     /// A leaf's dimension disagrees with the number of axes.
     #[error("leaf {0} has wrong dimension")]
     LeafDimension(usize),
@@ -130,6 +136,9 @@ pub enum BranchError {
     /// A member entailment does not bind to the leaf's declared bound.
     #[error("leaf {0} member {1}: conclusion + bias does not equal the leaf bound")]
     BoundBindingFailed(usize, usize),
+    /// The certificate direction needs evidence this format cannot express.
+    #[error("threshold direction {0:?} is unsupported by lower-bound branch certificates")]
+    UnsupportedDirection(ThreshDir),
     /// The composed global bound does not clear the threshold.
     #[error("global bound does not clear the threshold ({0})")]
     ThresholdNotCleared(String),
@@ -177,20 +186,45 @@ fn is_cell_face(c: &LinearConstraint, vars: &[String], lo: &[Rat], hi: &[Rat]) -
     }
 }
 
+/// Locate exactly one slab `[lo, hi]` in a strictly increasing edge list.
+///
+/// Manual lower-bound search keeps leaf lookup logarithmic without allocating
+/// string keys. The caller has already validated edge monotonicity.
+fn slab_index(edges: &[Rat], lo: Rat, hi: Rat) -> Option<usize> {
+    let mut left = 0usize;
+    let mut right = edges.len();
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let edge = *edges.get(mid)?;
+        if edge < lo {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    if edges.get(left) == Some(&lo) && edges.get(left.checked_add(1)?) == Some(&hi) {
+        Some(left)
+    } else {
+        None
+    }
+}
+
 /// Verify a branch-tree certificate and return the composed global bound.
 ///
 /// On success returns `(global_bound, threshold)` where `global_bound =
 /// min_C bound_C` is a sound bound on `y` over the whole box, and (for the `Le`
 /// direction) `global_bound > threshold`, so the property `Y_0 ≤ threshold` is
-/// UNSAT. For `Ge`, `global_bound = max_C bound_C < threshold`.
+/// UNSAT. `Ge` certificates are rejected because leaves currently contain only
+/// lower-bound (`≥`) entailments, not the upper-bound evidence needed to refute
+/// `Y_0 ≥ threshold`.
 ///
 /// # Soundness contract (L1 — Trust = Clean fusion)
 /// If this returns `Ok((g, t))`, then: (1) the leaves EXACTLY partition the box
 /// (each axis' edges strictly increase `lo→hi`; the leaf set equals the product
 /// grid); (2) every leaf's member entailments are individually valid
 /// ([`check_entailment`]) over that leaf's own box faces and bind to the leaf's
-/// declared bound; (3) `g` is the min (resp. max) of the per-leaf bounds and
-/// clears the threshold. By the cited, kernel-re-typechecked `branch_split_min`
+/// declared bound; (3) `g` is the minimum of the per-leaf lower bounds and
+/// clears the `Le` threshold. By the cited, kernel-re-typechecked `branch_split_min`
 /// applied recursively over the grid, `g` is a sound bound on `y` over the whole
 /// box — so the composed verdict is a proof, not a float claim. The leaf
 /// entailments' grounding is [`check_entailment`]'s `farkas_premise_combination`;
@@ -200,10 +234,6 @@ fn is_cell_face(c: &LinearConstraint, vars: &[String], lo: &[Rat], hi: &[Rat]) -
 /// # Errors
 /// [`BranchError`] on any malformed axis, non-exact partition, invalid or
 /// mis-bound leaf entailment, or an uncleared threshold.
-// CONTRACT FIX: the old predicate `!(… if g <= t)` was FALSIFIABLE — for
-// `ThreshDir::Ge` the cleared verdict is `global < threshold`, so the Ok pair
-// has g < t (masked as Unknown until the grounding lane could refute it). The
-// direction-independent invariant BOTH arms guarantee is STRICT inequality.
 #[ensures(|r: &Result<(Rat, Rat), BranchError>| !matches!(r, Ok((g, t)) if g == t))]
 #[trust::cite(crownproof::branch_split_min)]
 // `?` here would desugar to `from_residual` return paths the verifier's
@@ -211,6 +241,15 @@ fn is_cell_face(c: &LinearConstraint, vars: &[String], lo: &[Rat], hi: &[Rat]) -
 // returns ARE the proof shape (see the extract-then-guard comment).
 #[allow(clippy::question_mark)]
 pub fn check_branch_tree(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), BranchError> {
+    if poisoned() {
+        return Err(crate::err_barrier(BranchError::Rat(RatError::Poisoned)));
+    }
+    if cert.dir != ThreshDir::Le {
+        return Err(crate::err_barrier(BranchError::UnsupportedDirection(
+            cert.dir,
+        )));
+    }
+
     // Extract-then-guard: makes the `#[ensures]` locally provable. The match
     // only EXTRACTS (the Err arm returns early), the direction-matched
     // threshold-clearance guard is straight-line on the extracted pair, and
@@ -232,16 +271,24 @@ pub fn check_branch_tree(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), Bra
         // `crate::err_barrier` (identity, `#[inline(never)]`): a fresh in-body
         // `Err` aggregate, not a whole-`Result` forward the return-grounding
         // lane cannot see (nor a const-promoted+merged unit variant).
-        Err(e) => return Err(crate::err_barrier(e)),
+        Err(e) => {
+            if poisoned() {
+                return Err(crate::err_barrier(BranchError::Rat(RatError::Poisoned)));
+            }
+            return Err(crate::err_barrier(e));
+        }
     };
-    let cleared = match cert.dir {
-        ThreshDir::Le => g > t,
-        ThreshDir::Ge => g < t,
-    };
+    let cleared = g > t;
     if !cleared {
+        if poisoned() {
+            return Err(crate::err_barrier(BranchError::Rat(RatError::Poisoned)));
+        }
         return Err(crate::err_barrier(BranchError::ThresholdNotCleared(
             "internal: strict-inequality invariant violated after compose (unreachable)".to_owned(),
         )));
+    }
+    if poisoned() {
+        return Err(crate::err_barrier(BranchError::Rat(RatError::Poisoned)));
     }
     Ok((g, t))
 }
@@ -253,6 +300,14 @@ pub fn check_branch_tree(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), Bra
 /// its `Vec` end-of-body drops split the tail `Ok` construction out of the
 /// local proof's grounding window).
 fn check_branch_tree_inner(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), BranchError> {
+    // Every leaf below proves `y >= bound`. Such lower bounds can refute only
+    // an unsafe `y <= threshold` region. Treating them as upper bounds for
+    // `Ge` would be a false proof, so fail closed until the schema carries and
+    // checks direction-aware upper-bound evidence.
+    if cert.dir != ThreshDir::Le {
+        return Err(BranchError::UnsupportedDirection(cert.dir));
+    }
+
     // --- 1. Axis partitions are exact 1-D covers -------------------------------
     for (ai, axis) in cert.axes.iter().enumerate() {
         if axis.edges.len() < 2 {
@@ -275,94 +330,19 @@ fn check_branch_tree_inner(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), B
     }
 
     // --- 2. Leaves are EXACTLY the product grid --------------------------------
-    // Build the expected cell keys (lo,hi corner rationals as strings). A plain
-    // `Vec<String>` (not `BTreeSet::new`/`insert`/`contains`): keeps the
-    // membership machinery in verified code (no absent std-collection
-    // obligation). Grid keys are pairwise distinct (edges strictly increase and
-    // the `|`/`;` separators never occur in clean rational strings, so the key
-    // encoding is injective over distinct index tuples), and membership below is
-    // a first-match scan — identical accept/reject to the old set.
-    // Explicit loop (not `.map(closure).product()`): keeps the cell-count
-    // product in verified code (no absent-adapter `Iterator::map`/`product` or
-    // closure-Fn obligation). `saturating_sub`/`saturating_mul` (not `- 1`/`*`):
-    // every axis passed the `edges.len() < 2` DegenerateAxis guard above, so
-    // neither saturates — identical slab count, no underflow/overflow VC (same
-    // totalization as the `dims` loop below).
+    // Every axis passed the degenerate-axis guard. Compute the product with
+    // checked arithmetic, then require the compact certificate's cardinality to
+    // agree before allocating claim flags or inspecting per-leaf proofs.
     let mut ncells: usize = 1;
-    for a in &cert.axes {
-        ncells = ncells.saturating_mul(a.edges.len().saturating_sub(1));
+    for (axis_index, a) in cert.axes.iter().enumerate() {
+        let axis_cells = a.edges.len().saturating_sub(1);
+        ncells = ncells
+            .checked_mul(axis_cells)
+            .ok_or(BranchError::PartitionSizeOverflow(axis_index))?;
     }
-    let key = |lo: &[Rat], hi: &[Rat]| -> Result<String, BranchError> {
-        // total: length guard + zip (not `lo[k]`/`hi[k]`): both call sites
-        // pass equal-length corners (grid-built / LeafDimension-checked), so
-        // the guard is unreachable and fails closed (reject) rather than
-        // index or silently truncate.
-        if lo.len() != hi.len() {
-            return Err(BranchError::PartitionMismatch(
-                "cell corner arity mismatch".to_owned(),
-            ));
-        }
-        let mut s = String::new();
-        for (l, h) in lo.iter().zip(hi) {
-            s.push_str(&l.to_clean_string()?);
-            s.push('|');
-            s.push_str(&h.to_clean_string()?);
-            s.push(';');
-        }
-        Ok(s)
-    };
-    let mut expected_keys: Vec<String> = Vec::new();
-    // Cartesian product of the per-axis slabs.
-    // Explicit Vec::new()+push (not `.collect()` / `vec![0; n]`): input-derived
-    // bulk allocs raise unbounded-alloc obligations; the loop builds the
-    // identical parallel (slab-count, cursor) vectors.
-    let mut dims: Vec<usize> = Vec::new();
-    let mut idx: Vec<usize> = Vec::new();
-    for a in &cert.axes {
-        // total: `saturating_sub` (not `- 1`): every axis passed the
-        // `edges.len() < 2` DegenerateAxis guard above, so the subtraction
-        // never saturates — identical slab count, no underflow VC.
-        dims.push(a.edges.len().saturating_sub(1));
-        idx.push(0);
-    }
-    for _ in 0..ncells {
-        // total: zip + `get` (not `axes[d].edges[idx[d]]` collects): every
-        // cursor stays `< edges.len() - 1` by the mixed-radix wrap below, so
-        // the `None` arm is unreachable — and fails closed (reject) rather
-        // than index.
-        let mut lo: Vec<Rat> = Vec::new();
-        let mut hi: Vec<Rat> = Vec::new();
-        // total: `saturating_add` (not `k + 1`): `k < edges.len() - 1 <=
-        // isize::MAX` by the mixed-radix wrap, so the add never saturates; a
-        // (unreachable) saturated cursor makes `get` return `None` — the same
-        // fail-closed reject arm below.
-        for (axis, &k) in cert.axes.iter().zip(&idx) {
-            let (Some(l), Some(h)) = (axis.edges.get(k), axis.edges.get(k.saturating_add(1)))
-            else {
-                return Err(BranchError::PartitionMismatch(format!(
-                    "internal: slab cursor {k} outside axis {}",
-                    axis.var
-                )));
-            };
-            lo.push(*l);
-            hi.push(*h);
-        }
-        expected_keys.push(key(&lo, &hi)?);
-        // increment mixed-radix counter over the per-axis slab indices.
-        // total: parallel walk via zip (not `idx[d]`/`dims[d]`): `idx` and
-        // `dims` are built together (same length), so this is the identical
-        // carry loop with no slice-bounds obligation.
-        for (slot, &dim) in idx.iter_mut().zip(&dims) {
-            // total: `saturating_add` (not `+= 1`): the cursor is `< dim <=
-            // isize::MAX` on entry (reset below whenever it reaches `dim`), so
-            // the add never saturates — identical carry, no overflow VC.
-            *slot = (*slot).saturating_add(1);
-            if *slot < dim {
-                break;
-            }
-            *slot = 0;
-        }
-    }
+    // Reject a cardinality mismatch before enumerating the product. Otherwise
+    // a compact certificate with many two-cell axes and no leaves can force an
+    // enormous (but still representable) loop.
     if cert.leaves.len() != ncells {
         return Err(BranchError::PartitionMismatch(format!(
             "{} leaves vs {} product cells",
@@ -370,43 +350,41 @@ fn check_branch_tree_inner(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), B
             ncells
         )));
     }
-    // Claim flags parallel to `expected_keys` (was `seen: BTreeSet<String>`):
-    // `used[i]` marks grid cell `i` as already claimed by an earlier leaf.
-    // Every key the old code inserted into `seen` had just passed the
-    // `expected` membership test, so seen-membership ≡ the claim flag on the
-    // (deterministic) first-match index — identical dup detection and error
-    // order. Explicit Vec::new()+push (not `vec![false; n]`): input-derived
-    // bulk allocs raise unbounded-alloc obligations; identical parallel vector.
     let mut used: Vec<bool> = Vec::new();
-    // Push loop (not `vec![false; n]`): input-derived bulk fill raises an
-    // unbounded-alloc obligation; identical parallel flag vector.
-    #[allow(clippy::same_item_push)]
-    for _ in 0..expected_keys.len() {
-        used.push(false);
-    }
+    used.try_reserve_exact(ncells).map_err(|error| {
+        BranchError::PartitionMismatch(format!(
+            "claim table for {ncells} product cells cannot be allocated: {error}"
+        ))
+    })?;
+    used.resize(ncells, false);
     for (li, leaf) in cert.leaves.iter().enumerate() {
         if leaf.lo.len() != cert.axes.len() || leaf.hi.len() != cert.axes.len() {
             return Err(BranchError::LeafDimension(li));
         }
-        let k = key(&leaf.lo, &leaf.hi)?;
-        // Explicit first-match scan (not `BTreeSet::contains`): keeps the
-        // membership test in verified code (no absent std-collection
-        // obligation). Identical: found iff the key is a grid key.
-        let mut pos_opt: Option<usize> = None;
-        for (ei, e) in expected_keys.iter().enumerate() {
-            if e.as_str() == k.as_str() {
-                pos_opt = Some(ei);
-                break;
-            }
+        // Map the leaf directly to its mixed-radix grid index (axis 0 is the
+        // fastest-changing digit). This avoids materializing every cell key and
+        // the former O(leaves × cells) string scan.
+        let mut pos = 0usize;
+        let mut stride = 1usize;
+        for (axis_index, ((axis, &lo), &hi)) in
+            cert.axes.iter().zip(&leaf.lo).zip(&leaf.hi).enumerate()
+        {
+            let Some(slab) = slab_index(&axis.edges, lo, hi) else {
+                return Err(BranchError::PartitionMismatch(format!(
+                    "leaf {li} is not a product-grid cell on axis {axis_index} ({})",
+                    axis.var
+                )));
+            };
+            let offset = slab
+                .checked_mul(stride)
+                .ok_or(BranchError::PartitionSizeOverflow(axis_index))?;
+            pos = pos
+                .checked_add(offset)
+                .ok_or(BranchError::PartitionSizeOverflow(axis_index))?;
+            stride = stride
+                .checked_mul(axis.edges.len().saturating_sub(1))
+                .ok_or(BranchError::PartitionSizeOverflow(axis_index))?;
         }
-        let Some(pos) = pos_opt else {
-            return Err(BranchError::PartitionMismatch(format!(
-                "leaf {li} cell {k} is not a product-grid cell"
-            )));
-        };
-        // total: `get_mut` (not `used[pos]`): `pos` indexes `expected_keys`
-        // and `used` was built parallel to it (same length), so the `None`
-        // arm is unreachable — and fails closed (reject) rather than index.
         let Some(claimed) = used.get_mut(pos) else {
             return Err(BranchError::PartitionMismatch(
                 "internal: claim flag missing for a grid cell (unreachable)".to_owned(),
@@ -458,18 +436,11 @@ fn check_branch_tree_inner(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), B
                 return Err(BranchError::BoundBindingFailed(li, mi));
             }
         }
-        // (d) compose: global bound is the MIN (Le) / MAX (Ge) over leaves.
-        global = Some(match (global, cert.dir) {
-            (None, _) => leaf.bound,
-            (Some(g), ThreshDir::Le) => {
+        // (d) compose the global lower bound as the minimum over leaves.
+        global = Some(match global {
+            None => leaf.bound,
+            Some(g) => {
                 if leaf.bound < g {
-                    leaf.bound
-                } else {
-                    g
-                }
-            }
-            (Some(g), ThreshDir::Ge) => {
-                if leaf.bound > g {
                     leaf.bound
                 } else {
                     g
@@ -489,10 +460,7 @@ fn check_branch_tree_inner(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), B
     };
 
     // --- 4. The composed bound clears the threshold ----------------------------
-    let cleared = match cert.dir {
-        ThreshDir::Le => global > cert.threshold,
-        ThreshDir::Ge => global < cert.threshold,
-    };
+    let cleared = global > cert.threshold;
     if !cleared {
         return Err(BranchError::ThresholdNotCleared(format!(
             "global={}/{} thresh={}/{} dir={:?}",
@@ -533,15 +501,19 @@ fn rat_arr_json(xs: &[Rat]) -> Result<serde_json::Value, RatError> {
 /// The envelope records the exact axis partition, the property threshold and
 /// direction, the composition rule citation (`branch_split_min`), and — per leaf
 /// — the cell corners, the certified `bound`, and every member entailment (as a
-/// Clean-canonical `entailment_certificate`). A consumer re-checks it by (a)
-/// verifying the partition is the exact product grid, (b) batch-verifying every
-/// embedded leaf entailment with Clean's `verify_entailment_certificate`, and
-/// (c) taking the min/max of the leaf bounds and comparing to the threshold —
-/// which is exactly what [`check_branch_tree`] does, backed by `branch_split_min`.
+/// Clean-canonical `entailment_certificate`). The wire format retains
+/// `"direction": "ge"` for compatibility, but the current leaves prove only
+/// lower bounds and [`check_branch_tree`] rejects every `Ge` certificate. For a
+/// supported `Le` certificate, a consumer re-checks the exact product partition,
+/// verifies every embedded entailment, takes the minimum leaf lower bound, and
+/// compares it to the threshold, backed by `branch_split_min`. Serialized data
+/// alone is not proof evidence; consumers must apply those checks and must not
+/// infer a `Ge` verdict from this lower-bound envelope.
 ///
 /// # Errors
-/// Propagates rational-encoding failures (infallible in practice — full bignum).
+/// Propagates rational-encoding failures, including a poisoned rational arena.
 pub fn branch_tree_to_json(cert: &BranchTreeCertificate) -> Result<serde_json::Value, RatError> {
+    ensure_healthy()?;
     // Explicit loops (not `.map(closure).collect::<Result<Vec<_>, _>>()?`): keeps
     // the per-axis / per-leaf JSON construction in verified code (no
     // absent-adapter `Iterator::map`/`Result::map`/closure-Fn obligations).
@@ -611,7 +583,9 @@ pub fn branch_tree_to_json(cert: &BranchTreeCertificate) -> Result<serde_json::V
         serde_json::Value::String(dir_str(cert.dir).to_owned()),
     );
     root.insert("leaves".to_owned(), serde_json::Value::Array(leaves));
-    Ok(serde_json::Value::Object(root))
+    let value = serde_json::Value::Object(root);
+    ensure_healthy()?;
+    Ok(value)
 }
 
 /// Serialize EVERY leaf member entailment as a flat JSON array of tagged
@@ -621,22 +595,34 @@ pub fn branch_tree_to_json(cert: &BranchTreeCertificate) -> Result<serde_json::V
 /// (arithmetically trivial, `branch_split_min`-backed) partition + min step.
 ///
 /// # Errors
-/// Propagates rational-encoding failures (infallible in practice).
+/// Propagates rational-encoding failures, including a poisoned rational arena
+/// even when the leaf batch is empty.
 pub fn branch_tree_leaf_batch_json(
     cert: &BranchTreeCertificate,
 ) -> Result<serde_json::Value, RatError> {
+    ensure_healthy()?;
     let mut items = Vec::new();
     for leaf in &cert.leaves {
         for ent in &leaf.member_entailments {
             items.push(entailment_to_json(ent)?);
         }
     }
-    Ok(serde_json::Value::Array(items))
+    let value = serde_json::Value::Array(items);
+    ensure_healthy()?;
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
 
     fn r(n: i128, d: i128) -> Rat {
         Rat::new(n, d).unwrap()
@@ -723,10 +709,79 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ge_direction_without_upper_bound_evidence() {
+        // These leaves validly prove only lower bounds on y=x0. The old Ge
+        // path incorrectly treated max(lower bounds)=0 as an upper bound and
+        // would refute y>=1 even though y=1 at x0=1.
+        let mut cert = two_cell_cert(r(1, 1));
+        cert.dir = ThreshDir::Ge;
+        assert!(matches!(
+            check_branch_tree(&cert),
+            Err(BranchError::UnsupportedDirection(ThreshDir::Ge))
+        ));
+    }
+
+    #[test]
     fn rejects_partition_gap() {
         // Drop the second leaf: only 1 leaf vs 2 product cells -> mismatch.
         let mut cert = two_cell_cert(r(-2, 1));
         cert.leaves.pop();
+        assert!(matches!(
+            check_branch_tree(&cert),
+            Err(BranchError::PartitionMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_partition_cell_count_overflow_before_enumeration() {
+        // Each axis contributes two cells. One more axis than usize has bits
+        // makes the Cartesian-product count overflow with only a tiny input.
+        let axes = (0..=usize::BITS)
+            .map(|i| AxisPartition {
+                var: format!("x{i}"),
+                edges: vec![Rat::ZERO, Rat::ONE, Rat::from_int(2)],
+            })
+            .collect();
+        let cert = BranchTreeCertificate {
+            axes,
+            leaves: Vec::new(),
+            threshold: Rat::ZERO,
+            dir: ThreshDir::Le,
+        };
+        assert!(matches!(
+            check_branch_tree(&cert),
+            Err(BranchError::PartitionSizeOverflow(_))
+        ));
+    }
+
+    #[test]
+    fn slab_lookup_handles_large_axes_without_linear_key_scans() {
+        let edges: Vec<Rat> = (0..=10_000).map(Rat::from_int).collect();
+        assert_eq!(
+            slab_index(&edges, Rat::from_int(9_999), Rat::from_int(10_000)),
+            Some(9_999)
+        );
+        assert_eq!(
+            slab_index(&edges, Rat::from_int(9_998), Rat::from_int(10_000)),
+            None,
+            "a leaf may claim only one exact adjacent slab"
+        );
+    }
+
+    #[test]
+    fn rejects_leaf_count_mismatch_before_large_product_enumeration() {
+        let axes = (0..40)
+            .map(|i| AxisPartition {
+                var: format!("x{i}"),
+                edges: vec![Rat::ZERO, Rat::ONE, Rat::from_int(2)],
+            })
+            .collect();
+        let cert = BranchTreeCertificate {
+            axes,
+            leaves: Vec::new(),
+            threshold: Rat::ZERO,
+            dir: ThreshDir::Le,
+        };
         assert!(matches!(
             check_branch_tree(&cert),
             Err(BranchError::PartitionMismatch(_))
@@ -772,5 +827,24 @@ mod tests {
             check_branch_tree(&cert),
             Err(BranchError::PremiseNotCellFace(0, 0))
         ));
+    }
+
+    #[test]
+    fn checker_and_emitters_refuse_poison_on_degenerate_payloads() {
+        let cert = BranchTreeCertificate {
+            axes: Vec::new(),
+            leaves: Vec::new(),
+            threshold: Rat::ZERO,
+            dir: ThreshDir::Ge,
+        };
+        crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+
+        assert_eq!(
+            check_branch_tree(&cert),
+            Err(BranchError::Rat(RatError::Poisoned))
+        );
+        assert_eq!(branch_tree_to_json(&cert), Err(RatError::Poisoned));
+        assert_eq!(branch_tree_leaf_batch_json(&cert), Err(RatError::Poisoned));
     }
 }

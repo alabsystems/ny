@@ -20,12 +20,17 @@
 //! Reference: designs/2026-03-06-gpu-crown-backward.md
 //! Reference: alpha-beta-CROWN `auto_LiRPA/backward_bound.py`
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use ny_core::wide_lane_telemetry::{
+    note_wide_lane_attempt, note_wide_lane_decline, note_wide_lane_decline_none, WideLaneDecline,
+};
 use ny_core::{
     GpuCrownBackward, GpuCrownGradResult, GpuCrownLayer, GpuCrownResult, GpuCrownSeed,
-    GpuCrownTrajectoryResult, GpuResidentCoeffBatched, GpuResnetBatchedDomainRef, GpuResnetSegment,
-    NyError, Result,
+    GpuCrownTrajectoryResult, GpuIntermediateSweepRequest, GpuIntermediateSweepResourcePolicy,
+    GpuIntermediateSweepResult, GpuResidentCoeffBatched, GpuResnetBatchedDomainRef,
+    GpuResnetSegment, NyError, Result,
 };
 
 use super::super::WgpuDevice;
@@ -47,6 +52,129 @@ mod batching;
 const WGPU_MAX_BINDING_BYTES: usize = 134_217_728;
 const WGPU_MAX_DISPATCH_WORKGROUPS: usize = 65_535;
 const WGPU_1D_DISPATCH_THREADS: usize = WGPU_MAX_DISPATCH_WORKGROUPS * 256;
+
+const SWEEP_MIB: usize = 1024 * 1024;
+const SWEEP_MIN_BINDING_BYTES: usize = SWEEP_MIB;
+const SWEEP_MIN_ROWS_PER_TARGET: usize = 8;
+
+/// Build a conservative automatic scheduling profile from live WGPU facts.
+///
+/// WGPU does not expose physical VRAM. Device type therefore supplies only a
+/// conservative class ceiling, while the granted single-buffer/binding limits
+/// choose the useful starting row tier. The exact sweep planner remains the
+/// final capacity authority and may cleanly decline any whole request before
+/// allocation or dispatch.
+fn automatic_intermediate_sweep_resource_policy(
+    device_type: wgpu::DeviceType,
+    max_buffer_size: u64,
+    max_storage_buffer_binding_size: u64,
+    backend_budget_bytes: usize,
+) -> Option<GpuIntermediateSweepResourcePolicy> {
+    if device_type == wgpu::DeviceType::Cpu {
+        return None;
+    }
+    let max_buffer_size = usize::try_from(max_buffer_size).ok()?;
+    let binding_bytes = max_buffer_size.min(usize::try_from(max_storage_buffer_binding_size).ok()?);
+    if binding_bytes < SWEEP_MIN_BINDING_BYTES {
+        return None;
+    }
+
+    let (class_bytes, class_rows) = match device_type {
+        wgpu::DeviceType::DiscreteGpu => (8 * 1024 * SWEEP_MIB, 32),
+        wgpu::DeviceType::IntegratedGpu => (2 * 1024 * SWEEP_MIB, 16),
+        wgpu::DeviceType::VirtualGpu => (1024 * SWEEP_MIB, 8),
+        wgpu::DeviceType::Other => (512 * SWEEP_MIB, 8),
+        wgpu::DeviceType::Cpu => unreachable!("CPU adapters returned above"),
+    };
+    // #comprehensive-rows-probe (measurement-only): the class table is a proxy
+    // for "how much memory does this device class usually have", and on a unified
+    // -memory part it is badly wrong in one direction — an `IntegratedGpu` here
+    // gets 2 GiB / 16 rows on a board with 121 GiB shared. The comprehensive root
+    // sweep is memory-bound in ROWS (1.4 GiB peak at 144 rows), and 16 rows/target
+    // is 0.26% coverage of the eligible neurons, which is why the sweep completes
+    // atomically and still moves the root census by nothing.
+    //
+    // Raising this is NOT obviously safe on this box: the 121 GiB is shared with
+    // the host, and an earlier over-allocation caused a global OOM. So it is
+    // deliberately an explicit opt-in for measurement, never a default, and the
+    // backend preflight still computes exact simultaneous liveness and refuses
+    // anything it cannot honour. Its purpose is to establish the memory-vs-rows
+    // SCALING LAW, which decides between one wide sweep and row-chunked
+    // accumulation. Absent/malformed values leave the shipped class policy.
+    let (class_bytes, class_rows) = match (
+        ny_levers::read(&ny_levers::decls::comprehensive_rows::SWEEP_CLASS_MIB)
+            .value
+            .as_u64()
+            .and_then(|mib| usize::try_from(mib).ok())
+            .filter(|mib| *mib > 0),
+        ny_levers::read(&ny_levers::decls::comprehensive_rows::SWEEP_CLASS_ROWS)
+            .value
+            .as_u64()
+            .and_then(|rows| usize::try_from(rows).ok())
+            .filter(|rows| *rows > 0),
+    ) {
+        (None, None) => (class_bytes, class_rows),
+        (mib, rows) => (
+            mib.map_or(class_bytes, |mib| mib.saturating_mul(SWEEP_MIB)),
+            rows.unwrap_or(class_rows),
+        ),
+    };
+    // A sweep carrier is a bounded family of independently limit-checked
+    // buffers, not one giant binding. This multiplier merely prevents a tiny
+    // granted binding from inheriting a much larger class-wide ceiling; exact
+    // simultaneous liveness is still computed by the backend preflight.
+    let binding_scaled_ceiling = binding_bytes.saturating_mul(16);
+    let policy = GpuIntermediateSweepResourcePolicy {
+        max_device_bytes: class_bytes
+            .min(backend_budget_bytes)
+            .min(binding_scaled_ceiling),
+        preferred_rows_per_target: class_rows,
+        minimum_rows_per_target: SWEEP_MIN_ROWS_PER_TARGET,
+    };
+    policy.is_valid().then_some(policy)
+}
+
+/// Honest bounded-rows capacity for the deadline-bounded ResNet sound entries
+/// (`deadline_bounded_resnet_sound_max_rows`) = the FULL audited K=8 contract
+/// cap ([`ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS`]).
+///
+/// HONESTY ARGUMENT (why 8 rows, not fewer):
+/// - Row capacity: the resident sound fold is ROW-BATCHED — the batched-BaB
+///   wide lane already drives the SAME kernels + certified-error folds with
+///   `n_domains × num_specs` STACKED rows (admitted up to 512 rows by
+///   ny-propagate's `try_gpu_beta_batched_resnet_opt`, with
+///   `sound_spec_row_chunk` splitting anything past a device binding/dispatch
+///   limit). Every row is an independent certified enclosure, so 8 rows sit far
+///   inside limits this backend already validates in production.
+/// - Deadline: `honors_crown_backward_deadline()` is `true` — the resident fold
+///   polls `crown_backward_deadline_expired()` between layers
+///   (crown_backward_sound_resident.rs) and between spec-row chunks
+///   (crown_backward/batching.rs). The deadline-bounded entries below arm a
+///   CALL-LOCAL scope feeding that same poll, pre-check before dispatch, and
+///   refuse to publish a late result — the trait's documented contract.
+/// - Soundness: the entries delegate to `crown_backward_gpu_resnet_sound_inner`,
+///   i.e. the certified-error resident path (`γ_k·S` combine + outward-rounded
+///   host folds) — NEVER the fast round-to-nearest tier.
+pub(crate) const WGPU_DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS: usize =
+    ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS;
+
+/// #batched-bab wide-lane taken counter — PRODUCTION-ARMED (not test-only):
+/// incremented exactly once per batch whenever the ONE-pass wide resident fold
+/// produced the published result (bound-only wrapper or the β-opt grad lane;
+/// single-group or sub-chunked). Device tests assert lane-taken against the
+/// REAL routing instead of trusting probe stderr; monotonic, never reset. The
+/// independently gated margin-row coefficient batch uses its own profile
+/// counters and is deliberately excluded from this candidate denominator.
+static WIDE_RESNET_BATCHED_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic count of wide one-pass batched ResNet dispatches that produced the
+/// published result (see [`WIDE_RESNET_BATCHED_TAKEN`]).
+/// Public for the CLI's dark `[wide-lane]` readout (`NY_BETA_GPU_PROBE=1`):
+/// a lane that silently never fires must be distinguishable from one doing
+/// the work. Observability only — reading it changes nothing.
+pub fn wide_resnet_batched_taken_count() -> u64 {
+    WIDE_RESNET_BATCHED_TAKEN.load(Ordering::Relaxed)
+}
 
 /// #batched-bab HOLE 7 homogeneity gate: two domains may batch together only if
 /// their segment lists share the SAME network skeleton — identical variant
@@ -113,14 +241,20 @@ fn layer_skeleton_matches(a: &GpuCrownLayer, b: &GpuCrownLayer) -> bool {
                 bias: ba,
                 out_features: oa,
                 in_features: ia,
+                cert_err: cea,
             },
             Linear {
                 weight: wb,
                 bias: bb,
                 out_features: ob,
                 in_features: ib,
+                cert_err: ceb,
             },
-        ) => oa == ob && ia == ib && arc_slice_eq(wa, wb) && arc_opt_slice_eq(ba, bb),
+            // #cert-err is part of the SKELETON, not a per-domain value: two layers
+            // that differ only in their declared BN-fold error charge different
+            // certified radii, so reusing one's plan for the other would publish a
+            // bound built from the wrong charge.
+        ) => oa == ob && ia == ib && cea == ceb && arc_slice_eq(wa, wb) && arc_opt_slice_eq(ba, bb),
         // Relaxation slopes/intercepts are per-domain VALUES — only the shape matters.
         (
             Activation {
@@ -154,6 +288,7 @@ fn layer_skeleton_matches(a: &GpuCrownLayer, b: &GpuCrownLayer) -> bool {
                 out_w: owa,
                 in_h: iha,
                 in_w: iwa,
+                cert_err: cea,
             },
             Conv2d {
                 weight_col: wb,
@@ -170,9 +305,12 @@ fn layer_skeleton_matches(a: &GpuCrownLayer, b: &GpuCrownLayer) -> bool {
                 out_w: owb,
                 in_h: ihb,
                 in_w: iwb,
+                cert_err: ceb,
             },
+            // #cert-err is part of the SKELETON (see the Linear arm above).
         ) => {
-            oca == ocb
+            cea == ceb
+                && oca == ocb
                 && ica == icb
                 && kha == khb
                 && kwa == kwb
@@ -307,6 +445,35 @@ fn wide_max_safe_stacked_rows(max_wg: usize, width: usize) -> usize {
         n = n.min(cap);
     }
     n
+}
+
+/// #batched-bab HOLE-7 SUB-GROUPING gate — DARK, default OFF.
+///
+/// ON (`NY_BAB_RESNET_WIDE_SUBGROUP=1`) lets a HETEROGENEOUS batch be split into
+/// maximal homogeneous runs and folded wide run-by-run instead of abandoning the
+/// whole wave to the serial path (see
+/// [`WgpuDevice::try_wide_resnet_batched_subgrouped`]). OFF ⇒ byte-identical
+/// routing to today: a heterogeneous batch returns the historical `Err` and the
+/// caller runs its proven per-domain loop.
+///
+/// It is deliberately not `env_gate_default_on`-style: this lane changes WHICH
+/// kernel produces a verdict-bearing bound, so arming it is a measured-session
+/// decision, not a default.
+fn wide_subgroup_enabled() -> bool {
+    ny_levers::read(&ny_levers::decls::wide_lane::BAB_RESNET_WIDE_SUBGROUP)
+        .value
+        .as_bool()
+}
+
+/// Legacy-armed global selector for every wide ResNet CROWN dispatch.
+///
+/// Exact `0` disables the lane; absence and every other spelling retain the
+/// shipped ON behavior. The declaration preserves that compatibility contract
+/// while keeping its unqualified-default debt explicit in the central registry.
+fn wide_resnet_enabled() -> bool {
+    ny_levers::read(&ny_levers::decls::wide_lane::BAB_RESNET_WIDE)
+        .value
+        .as_bool()
 }
 
 /// Number of whole domains that fit in a device-safe wide group.  A domain is
@@ -481,9 +648,21 @@ fn stack_wide_table(per_domain: &[&[Vec<f32>]]) -> Option<Vec<Vec<f32>>> {
 /// Compute the max specs that fit in a single GPU dispatch without exceeding
 /// the wgpu max storage buffer binding size.  Returns `num_specs` when no
 /// batching is needed.
-fn max_specs_per_batch(layers: &[GpuCrownLayer], num_specs: usize, first_dim: usize) -> usize {
+fn max_specs_per_batch(
+    layers: &[GpuCrownLayer],
+    num_specs: usize,
+    first_dim: usize,
+    max_binding_bytes: usize,
+) -> usize {
     // BufferPool applies a 1.2× growth factor, so effective max is smaller.
-    let effective_max = (WGPU_MAX_BINDING_BYTES as f64 / 1.2) as usize;
+    //
+    // #hard-caps: `max_binding_bytes` is the LIVE device limit, not the
+    // hard-coded 128 MiB this used to read. `WgpuDevice::new` requests the
+    // adapter's real limits, and on an Apple M4 Pro that is 4095 MiB — so this
+    // was batching against a 32x under-estimate and issuing far more dispatches
+    // than the device required. Its sibling at `resident_spec_cap` already read
+    // the live limit; this one did not.
+    let effective_max = (max_binding_bytes as f64 / 1.2) as usize;
     let max_elems_for_f32 = effective_max / size_of::<f32>();
 
     // Per-spec element counts for the largest buffers:
@@ -631,6 +810,55 @@ fn record_host_phase<T>(
 }
 
 impl GpuCrownBackward for WgpuDevice {
+    fn clear_crown_working_set(&self) -> Result<()> {
+        // Fully qualify the inherent method: the trait hook is the public
+        // type-erased seam used by long-lived attack engines, while the
+        // inherent implementation owns the actual cache/pool teardown.
+        WgpuDevice::clear_crown_working_set(self)
+    }
+
+    fn provides_sound_intermediate_sweep(&self) -> bool {
+        self.provides_intermediate_sweep()
+    }
+
+    fn intermediate_sweep_resource_policy(&self) -> Option<GpuIntermediateSweepResourcePolicy> {
+        if !self.provides_intermediate_sweep() {
+            return None;
+        }
+        let limits = self.device.limits();
+        automatic_intermediate_sweep_resource_policy(
+            self.adapter_info.device_type,
+            limits.max_buffer_size,
+            limits.max_storage_buffer_binding_size,
+            gpu_memory_budget_bytes(),
+        )
+    }
+
+    fn crown_backward_gpu_sound_intermediate_sweep(
+        &self,
+        request: &GpuIntermediateSweepRequest<'_>,
+    ) -> Result<Option<GpuIntermediateSweepResult>> {
+        // Validation deliberately precedes even the default-dark capability
+        // decline: malformed/late typed requests never disappear as a benign
+        // backend miss.
+        request.validate()?;
+        self.run_intermediate_sweep(request)
+    }
+
+    fn provides_sound_gpu_bab_bound_phase(&self) -> bool {
+        // A separate, default-closed source/selfcheck qualification is bound
+        // to this exact device's stable registration epoch. The predicate also
+        // re-reads ordinary WGPU verdict/loading-path authority on every call.
+        self.bab_bound_authority_cached()
+    }
+
+    fn gpu_bab_bound_numerical_tcb(&self) -> Option<&dyn ny_core::GpuBabBoundNumericalTcb> {
+        // This accessor and the boolean gate share one predicate. Ordinary,
+        // charged-flush, authority-lost, forced-fail, and unfinished-kernel
+        // devices all remain `None`.
+        self.bab_bound_numerical_tcb_cached()
+    }
+
     fn crown_backward_gpu(
         &self,
         layers: &[GpuCrownLayer],
@@ -711,15 +939,17 @@ impl GpuCrownBackward for WgpuDevice {
                 upper_bounds,
             }),
             Err(e) => {
-                // #NY_GPU_BATCHED_COLLECT (wide-TLL spec-row chunking, default-OFF):
-                // the sound-resident backward allocates an A-coefficient buffer of
-                // `num_specs × max_layer_width` f32 and dispatches
-                // ~`num_specs × max_layer_width / 64` workgroups in X. On the widest
-                // TLL intermediate nodes (up to 6272-wide) these exceed wgpu's
-                // per-binding `max_storage_buffer_binding_size` (Metal 128 MiB) and
-                // `max_compute_workgroups_per_dimension` (65535) limits, so the whole
-                // node errored above and — without the gate — falls back to the CPU
-                // sound path. Under the gate we instead split the SPEC ROWS (an EXACT
+                // #wg-limit-subchunk (spec-row chunking, DEFAULT-ON since 2026-07-24;
+                // kill switch `NY_GPU_BATCHED_COLLECT=0`): the sound-resident backward
+                // allocates an A-coefficient buffer of `num_specs × max_layer_width`
+                // f32 and dispatches `ceil(num_specs × max_layer_width / 256)`
+                // workgroups in X. On a wide node these exceed wgpu's per-binding
+                // `max_storage_buffer_binding_size` and/or
+                // `max_compute_workgroups_per_dimension` — the latter is 65535 on BOTH
+                // Metal AND the GB10 Vulkan stack (MEASURED; the old
+                // Metal-only-hits-this belief is what made this a latent trap) — so the
+                // whole node errors above and, with the kill switch set, falls back to
+                // the CPU sound path. By default we instead split the SPEC ROWS (an EXACT
                 // batch dimension: CROWN backward has no cross-row reduction — each row
                 // is an independent linear functional of the output, and the ReLU
                 // relaxation slopes are per-neuron and shared across rows) so each
@@ -737,22 +967,43 @@ impl GpuCrownBackward for WgpuDevice {
                         input_lower,
                         input_upper,
                     ),
-                    // Gate off, or chunking cannot split further → propagate the
-                    // original error so the caller takes the proven CPU sound path.
+                    // Kill switch set, or this adapter's limits already admit the full
+                    // row batch (so the Err was NOT a dispatch/binding overflow and
+                    // chunking cannot help) → propagate the original error so the
+                    // caller takes the proven CPU sound path. Fail-closed either way.
                     _ => Err(e),
                 }
             }
         }
     }
 
-    /// Offer the authoritative sound-GPU CROWN backward ONLY on an adapter that
-    /// passed the one-time IEEE-754 f32-model self-check (`ops/f32_selfcheck.rs`).
-    /// A covert reduced-precision / broken-bitcast / dispatch-faulting adapter
-    /// reports `false` here → the soundness gate routes verdicts to the CPU
-    /// f64+γ·S sound fallback (fail-safe, never a wrong verdict). The check is
-    /// cached, so this is a cheap read after the first call.
+    /// Raw `WgpuDevice` CROWN authority passed the U1/U3/U4/U5/U6 ledger and B0
+    /// source review. The resident word route is AUTO/default-on when its twins
+    /// are available, ResNet segments compose row words, and the armed C1
+    /// consult fails closed. Unsupported configurations typed-refuse. See the
+    /// live ledger in `ops/sound_authority.rs`.
+    ///
+    /// Delegates to the immutable per-device verdict report
+    /// (`ops/sound_authority.rs`). The seam returns true only on a device built
+    /// through the typed explicit constructor after a passing five-rung ladder;
+    /// ordinary devices, failed/uninitialized probes, and unsupported operations
+    /// refuse. The public `ComputeDevice` wrapper exposes this CROWN seam only
+    /// through its matching proof constructor.
+    ///
+    /// This MUST stay in lockstep with `impl GemmEngine for WgpuDevice`'s
+    /// `as_gpu_crown_backward` — `test_support::sound_gpu_crown_quarantined`
+    /// asserts the two agree, and `sound_gpu_gate` only ever reaches this
+    /// predicate through that accessor.
+    ///
+    /// #flush-charge: charged-flush authority ALSO opens this seam — that is
+    /// the entire point of the charged mode: the same walk runs with the
+    /// oracle-derived widenings/refusals armed by `charged_walk_guard` and the
+    /// charge sites. Unreachable until the reviewed charged source gate opens
+    /// (`PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED`, compile-time
+    /// `false`); the provenance string distinguishes the two modes on every
+    /// ledger row.
     fn provides_sound_gpu_crown(&self) -> bool {
-        self.verify_ieee_f32_model()
+        self.sound_gpu_authority_cached() || self.charged_flush_authority_cached().is_some()
     }
 
     fn crown_backward_gpu_seeded_sound(
@@ -782,6 +1033,38 @@ impl GpuCrownBackward for WgpuDevice {
             lower_bounds,
             upper_bounds,
         })
+    }
+
+    /// COEFFICIENT egress for the seeded sound resident walk (#cert-coeffs).
+    ///
+    /// Same walk, same layers, same seed as
+    /// [`Self::crown_backward_gpu_seeded_sound`] — but the certified frontier is
+    /// published instead of concretized, because the margin-row lane's hot step
+    /// consumes coefficients and cannot use a concretized bound at all.
+    ///
+    /// Gated on exactly the same authority as the bounds entry: without
+    /// `provides_sound_gpu_crown()` this DECLINES (`Ok(None)`) rather than
+    /// handing back a frontier a verdict might trust. `input_lower`/
+    /// `input_upper` are accepted for signature parity with the bounds entry and
+    /// are deliberately unused — the whole point is that the caller chooses the
+    /// concretization.
+    fn crown_backward_gpu_seeded_sound_coeffs(
+        &self,
+        layers: &[GpuCrownLayer],
+        seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+    ) -> Result<Option<ny_core::CertifiedCoeffs>> {
+        if !self.provides_sound_gpu_crown() {
+            return Ok(None);
+        }
+        if layers.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "crown_backward_gpu_seeded_sound_coeffs: empty layer list".into(),
+            ));
+        }
+        self.crown_backward_sound_resident_certified_coeffs(layers, seed)
+            .map(Some)
     }
 
     fn crown_backward_gpu_resnet_sound(
@@ -825,6 +1108,280 @@ impl GpuCrownBackward for WgpuDevice {
             lower_bounds,
             upper_bounds,
         })
+    }
+
+    /// COEFFICIENT egress for the RESNET sound resident backward
+    /// (#cert-coeffs-resnet).
+    ///
+    /// Same segments and seed as [`Self::crown_backward_gpu_resnet_sound`] — but
+    /// the COMPOSED certified frontier (across every segment) is published
+    /// instead of concretized, because the margin-row lane's hot step consumes
+    /// coefficients and every cifar100/tinyimagenet net it must accelerate is a
+    /// resnet. The box and abs-frontier arguments are deliberately ignored:
+    /// using them to move coefficient error into bias would produce a
+    /// domain-bound functional enclosure, not a coefficient-wise
+    /// [`ny_core::CertifiedCoeffs`] enclosure.
+    ///
+    /// Gated on exactly the same authority as the bounds entry: without
+    /// `provides_sound_gpu_crown()` this DECLINES (`Ok(None)`) rather than
+    /// handing back a frontier a verdict might trust. `input_lower`/
+    /// `input_upper` are accepted for signature parity and deliberately unused.
+    ///
+    /// NOTE (same reason as the bounds entry): do NOT wrap in `run_gpu_checked`
+    /// — the inner per-segment folds take the non-reentrant `gpu_serialize`
+    /// lock themselves and an outer wrapper would deadlock on segment one.
+    fn crown_backward_gpu_resnet_sound_coeffs(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+        _frontier_abs: &[Vec<f32>],
+        _node_abs: &[Vec<f32>],
+    ) -> Result<Option<ny_core::CertifiedCoeffs>> {
+        if !self.provides_sound_gpu_crown() {
+            return Ok(None);
+        }
+        if segments.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "crown_backward_gpu_resnet_sound_coeffs: empty segment list".into(),
+            ));
+        }
+        self.crown_backward_gpu_resnet_sound_certified_coeffs(segments, seed)
+            .map(Some)
+    }
+
+    /// BATCHED COEFFICIENT EGRESS (#margin-row-gpu-batch): ONE wide resident
+    /// pass over `N = n_domains * seed.num_specs` stacked rows, publishing one
+    /// COMPOSED certified frontier PER DOMAIN.
+    ///
+    /// This is the entry the margin-row twin-wall lane needs to stop processing
+    /// BaB domains one at a time. It reuses, unchanged, the machinery the wide
+    /// bounds lane already proved out:
+    ///
+    /// * the HOLE-7 homogeneity gate ([`resnet_skeleton_matches`]) — identical
+    ///   variant sequence, dims, `CertifiedWeightError` charges and shared
+    ///   weights, differing ONLY in per-domain relaxation VALUES;
+    /// * the HOLE-8 unbatchable-layer gate ([`segments_contain_unbatchable`]);
+    /// * [`stack_wide_segments`] to build the ONE shared skeleton with each
+    ///   domain's Activation block at `d*num_neurons`;
+    /// * the device dispatch-limit check ([`wide_safe_domain_count`]) — the
+    ///   `max_compute_workgroups_per_dimension` overrun is a latent
+    ///   false-VERIFY hole, so an over-limit batch returns the typed,
+    ///   pre-dispatch `GpuBatchCapacityExceeded` signal. The margin-row caller
+    ///   alone may use that signal to narrow its chunk width.
+    ///
+    /// Everything after that is the SAME un-concretized composition and the
+    /// SAME fail-closed firewall the single-domain egress runs
+    /// (`resnet_certified_coeffs_unconcretized`), followed by the pinned
+    /// domain-major split (`split_batched_certified_coeffs`). Domain boxes and
+    /// abs frontiers remain unused, as required by the coefficient contract.
+    ///
+    /// `Ok(None)` = unsupported/declined (no authority, gate or stacking
+    /// refusal). `GpuBatchCapacityExceeded` is the only retryable `Err`, and is
+    /// guaranteed pre-dispatch. Every other `Err` is a terminal failure of an
+    /// accepted request. All outcomes leave the exact CPU fallback available.
+    ///
+    /// NOTE (same reason as the other resnet methods): do NOT wrap in
+    /// `run_gpu_checked` — the inner folds take the non-reentrant
+    /// `gpu_serialize` lock themselves.
+    fn crown_backward_gpu_resnet_sound_batched_coeffs(
+        &self,
+        domains: &[GpuResnetBatchedDomainRef<'_>],
+        seed: &GpuCrownSeed,
+    ) -> Result<Option<Vec<ny_core::CertifiedCoeffs>>> {
+        if !self.provides_sound_gpu_crown() {
+            return Ok(None);
+        }
+        let n_domains = domains.len();
+        let nsp = seed.num_specs;
+        if n_domains == 0 || nsp == 0 {
+            return Err(NyError::InvalidSpec(
+                "crown_backward_gpu_resnet_sound_batched_coeffs: empty batch".into(),
+            ));
+        }
+        if domains[0].segments.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "crown_backward_gpu_resnet_sound_batched_coeffs: empty segment list".into(),
+            ));
+        }
+        // HOLE 7: one shared skeleton, per-domain relaxation VALUES only.
+        for d in &domains[1..] {
+            if !resnet_skeleton_matches(domains[0].segments, d.segments) {
+                return Ok(None);
+            }
+        }
+        // HOLE 8: the backward shaders for these kinds are not domain-block
+        // indexed, so a wide fold would read another domain's state.
+        if segments_contain_unbatchable(domains[0].segments) {
+            return Ok(None);
+        }
+        // #wg-limit-subchunk: an overrun of `max_compute_workgroups_per_dimension`
+        // is a latent FALSE-VERIFY hole (some drivers silently return an
+        // over-tight bound instead of erroring). Unlike the bounds lane this
+        // entry does not sub-chunk — a coefficient frontier must stay ONE
+        // domain-major object — so an over-limit batch declines and the caller
+        // narrows its own batch.
+        let max_wg = self
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .max(1) as usize;
+        let width = resnet_segments_max_1d_dispatch_dim(domains[0].segments);
+        let Some(safe_domains) = wide_safe_domain_count(max_wg, width, nsp) else {
+            return Err(NyError::GpuBatchCapacityExceeded {
+                requested: n_domains,
+                capacity: 0,
+                unit: "domains",
+                site: "coefficient dispatch-limit preflight",
+            });
+        };
+        if n_domains > safe_domains {
+            return Err(NyError::GpuBatchCapacityExceeded {
+                requested: n_domains,
+                capacity: safe_domains,
+                unit: "domains",
+                site: "coefficient dispatch-limit preflight",
+            });
+        }
+        // ONE shared skeleton carrying every domain's Activation block.
+        let Some(wide_segments) = stack_wide_segments(domains) else {
+            return Ok(None);
+        };
+        // Tile the SHARED spec seed n_domains times → N rows, so each domain
+        // block starts from the identical seed exactly as N serial calls do.
+        let od = seed.current_dim;
+        let Some(n) = n_domains.checked_mul(nsp) else {
+            return Ok(None);
+        };
+        if seed.lower_a.len() != nsp * od
+            || seed.upper_a.len() != nsp * od
+            || seed.lower_b.len() != nsp
+            || seed.upper_b.len() != nsp
+        {
+            return Ok(None);
+        }
+        let mut wl_a = Vec::with_capacity(n * od);
+        let mut wu_a = Vec::with_capacity(n * od);
+        let mut wl_b = Vec::with_capacity(n);
+        let mut wu_b = Vec::with_capacity(n);
+        for _ in 0..n_domains {
+            wl_a.extend_from_slice(&seed.lower_a);
+            wu_a.extend_from_slice(&seed.upper_a);
+            wl_b.extend_from_slice(&seed.lower_b);
+            wu_b.extend_from_slice(&seed.upper_b);
+        }
+        let wide_seed = GpuCrownSeed {
+            lower_a: wl_a.into(),
+            upper_a: wu_a.into(),
+            lower_b: wl_b.into(),
+            upper_b: wu_b.into(),
+            num_specs: n,
+            current_dim: od,
+        };
+        let out = self.crown_backward_gpu_resnet_sound_batched_certified_coeffs(
+            &wide_segments,
+            &wide_seed,
+            nsp,
+            n_domains,
+        )?;
+        // The caller indexes results BY DOMAIN; a count drift must refuse
+        // rather than associate a frontier with another domain's relaxation.
+        if out.len() != n_domains {
+            return Err(NyError::InvalidSpec(format!(
+                "crown_backward_gpu_resnet_sound_batched_coeffs: produced {} frontiers for {} \
+                 domains",
+                out.len(),
+                n_domains
+            )));
+        }
+        Ok(Some(out))
+    }
+
+    /// The deadline-bounded ResNet sound entries below are REAL on this backend
+    /// (#batched-bab arming, 2026-08-11). Historically WgpuDevice inherited the
+    /// ny-core defaults — `provides… = false`, `max_rows = 0`
+    /// (ny-core/src/gemm.rs:2052/:2087) — so EVERY bounded-rows admission seam
+    /// (`RootJointDeadlineGpu::from_engine`, resnet_decompose's
+    /// `DeadlineBoundedRows` dispatch, the active-set/bounded-shared K≤8
+    /// selectors) refused the prewarmed sound WGPU backend even with the
+    /// authority ladder green. See `WGPU_DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS`
+    /// for the honest-capacity argument.
+    fn provides_deadline_bounded_single_row_resnet_sound(&self) -> bool {
+        true
+    }
+
+    fn deadline_bounded_resnet_sound_max_rows(&self) -> usize {
+        WGPU_DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS
+    }
+
+    fn crown_backward_gpu_resnet_sound_single_row_with_deadline(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        frontier_abs: &[Vec<f32>],
+        node_abs: &[Vec<f32>],
+        deadline: Instant,
+    ) -> Result<GpuCrownResult> {
+        if seed.num_specs != 1 {
+            return Err(NyError::InvalidSpec(format!(
+                "crown_backward_gpu_resnet_sound_single_row_with_deadline: exactly one \
+                 spec row required, got {}",
+                seed.num_specs
+            )));
+        }
+        self.resnet_sound_rows_with_call_local_deadline(
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            frontier_abs,
+            node_abs,
+            deadline,
+        )
+    }
+
+    fn crown_backward_gpu_resnet_sound_bounded_rows_with_deadline(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        frontier_abs: &[Vec<f32>],
+        node_abs: &[Vec<f32>],
+        deadline: Instant,
+    ) -> Result<GpuCrownResult> {
+        if seed.num_specs == 1 {
+            // Contract (ny-core): K=1 delegates to the single-row entry and
+            // inherits its validation/result contract exactly.
+            return self.crown_backward_gpu_resnet_sound_single_row_with_deadline(
+                segments,
+                seed,
+                input_lower,
+                input_upper,
+                frontier_abs,
+                node_abs,
+                deadline,
+            );
+        }
+        if !(2..=WGPU_DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS).contains(&seed.num_specs) {
+            return Err(NyError::InvalidSpec(format!(
+                "crown_backward_gpu_resnet_sound_bounded_rows_with_deadline: row count {} \
+                 outside the advertised 2..={} capacity",
+                seed.num_specs, WGPU_DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS
+            )));
+        }
+        self.resnet_sound_rows_with_call_local_deadline(
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            frontier_abs,
+            node_abs,
+            deadline,
+        )
     }
 
     fn crown_backward_gpu_resnet_sound_grad(
@@ -902,6 +1459,51 @@ impl GpuCrownBackward for WgpuDevice {
         })
     }
 
+    /// Observation-only, deadline-bounded Cut-CROWN fold on the actual wgpu
+    /// resident walk (the CUDA override's charged-Metal twin;
+    /// `ops/cut_shadow_resident.rs`). The ordinary beta result remains the
+    /// sole consumable baseline; a complete cut fold can only attach
+    /// telemetry.
+    #[allow(clippy::too_many_arguments)]
+    fn crown_backward_gpu_resnet_sound_beta_cut_shadow(
+        &self,
+        policy: ny_core::ResidentCutShadowPolicy,
+        segments: &[GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        beta_signed: &[Vec<f32>],
+        frontier_abs: &[Vec<f32>],
+        node_abs: &[Vec<f32>],
+        carrier: Option<&ny_core::ResidentLowerCutCarrier>,
+        binding_row: usize,
+        deadline: Instant,
+    ) -> Result<ny_core::ResidentCutShadowOutcome> {
+        super::cut_shadow_resident::run_resident_cut_shadow(
+            self,
+            policy,
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            beta_signed,
+            frontier_abs,
+            node_abs,
+            carrier,
+            binding_row,
+            deadline,
+        )
+    }
+
+    /// The resident Cut-CROWN shadow capability is claimed ONLY when this
+    /// device holds verdict authority (fully-qualified OR charged-flush) AND
+    /// the audited cut-apply kernel's pinned selfcheck passed at qualification
+    /// (`ops/cut_shadow_resident.rs`). This does not grant verdict authority
+    /// — the shadow is observation-only by type.
+    fn provides_resident_cut_shadow(&self) -> bool {
+        self.resident_cut_shadow_capability()
+    }
+
     /// #batched-bab INCREMENT 1 — REFERENCE STACKER (byte-identical to N serial
     /// [`Self::crown_backward_gpu_resnet_sound_beta`] calls). Runs the homogeneity
     /// gate, then computes each domain-block's bounds by dispatching the EXISTING
@@ -916,7 +1518,12 @@ impl GpuCrownBackward for WgpuDevice {
         domains: &[GpuResnetBatchedDomainRef<'_>],
         seed: &GpuCrownSeed,
     ) -> Result<Vec<GpuCrownResult>> {
+        // #wide-decline-tally: one relaxed increment marking that a candidate
+        // batch reached a batched GPU trait entry. `attempts - published` is the
+        // coverage gap the reasons below explain. Observability only.
+        note_wide_lane_attempt();
         if domains.is_empty() {
+            note_wide_lane_decline(WideLaneDecline::GpuEmptyBatch);
             return Err(NyError::InvalidSpec(
                 "crown_backward_gpu_resnet_sound_beta_batched: empty batch".into(),
             ));
@@ -930,20 +1537,48 @@ impl GpuCrownBackward for WgpuDevice {
         // precondition. A mismatch aborts the whole batch to the serial fallback;
         // it never packs ragged rows.
         let wprobe = std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1");
-        for d in &domains[1..] {
-            if !resnet_skeleton_matches(domains[0].segments, d.segments) {
+        let homogeneous = domains[1..]
+            .iter()
+            .all(|d| resnet_skeleton_matches(domains[0].segments, d.segments));
+        if !homogeneous {
+            // #batched-bab HOLE-7 SUB-GROUPING (DARK, `NY_BAB_RESNET_WIDE_SUBGROUP=1`):
+            // rather than abandoning the WHOLE wave because two domains disagree,
+            // split it into maximal contiguous homogeneous runs and run one wide
+            // pass per run. Each run satisfies the wide fold's own precondition
+            // (one shared skeleton) exactly as a homogeneous batch does, and runs
+            // are visited in domain order so the concatenation preserves the
+            // caller's per-domain result layout. Any run this backend cannot fold
+            // soundly (HOLE-8 layer kinds, or a wide-assembly refusal) declines the
+            // WHOLE batch back to the historical `Err` — never a partial answer,
+            // never a serial/wide mixture. DEFAULT OFF: until the device-level
+            // enclosure oracle is measured on a real heterogeneous wave, the gate
+            // keeps scored routing byte-identical.
+            if let Some(res) = self.try_wide_resnet_batched_subgrouped(domains, seed) {
+                // Review defect 2: this is the SUCCESS path — count it as a
+                // published sub-group run, never as a decline (a decline entry
+                // here files a covered batch under `declines:` and drives the
+                // documented `attempts - published` gap negative).
+                ny_core::wide_lane_telemetry::note_wide_lane_subgrouped_run();
                 if wprobe {
                     eprintln!(
-                        "[wide] GATE homogeneity mismatch (n_domains={})",
+                        "[wide] GATE homogeneity mismatch SUBGROUPED (n_domains={})",
                         domains.len()
                     );
                 }
-                return Err(NyError::UnsupportedOp(
-                    "crown_backward_gpu_resnet_sound_beta_batched: heterogeneous resnet skeleton \
-                     across domains — falling back to the per-domain path"
-                        .into(),
-                ));
+                return Ok(res);
             }
+            note_wide_lane_decline(WideLaneDecline::GpuHomogeneityMismatch);
+            if wprobe {
+                eprintln!(
+                    "[wide] GATE homogeneity mismatch (n_domains={})",
+                    domains.len()
+                );
+            }
+            return Err(NyError::UnsupportedOp(
+                "crown_backward_gpu_resnet_sound_beta_batched: heterogeneous resnet skeleton \
+                 across domains — falling back to the per-domain path"
+                    .into(),
+            ));
         }
         // #batched-bab HOLE 8: decline dual-alpha / maxpool (backward shaders not
         // domain-block-indexed) → serial per-domain fallback (fail-closed).
@@ -967,6 +1602,7 @@ impl GpuCrownBackward for WgpuDevice {
                     .collect();
                 eprintln!("[wide] GATE hole8 unbatchable; layer kinds: {kinds:?}");
             }
+            note_wide_lane_decline(WideLaneDecline::GpuUnbatchableLayer);
             return Err(NyError::UnsupportedOp(
                 "crown_backward_gpu_resnet_sound_beta_batched: batch contains \
                  ActivationReluDualAlpha/MaxPool2d — not wide-batchable, using the serial path"
@@ -978,11 +1614,20 @@ impl GpuCrownBackward for WgpuDevice {
         // the two-sided differential oracle (wide bound matches serial per-domain within
         // f32-reorder tol). Any build/shape failure falls THROUGH to the byte-identical
         // reference stacker below (0-wrong moat). Opt out with NY_BAB_RESNET_WIDE=0 (A/B).
-        let wide_disabled = std::env::var("NY_BAB_RESNET_WIDE").ok().as_deref() == Some("0");
+        let wide_disabled = !wide_resnet_enabled();
         if domains.len() > 1 && !wide_disabled {
             if let Some(res) = self.try_wide_resnet_batched(domains, seed) {
                 return Ok(res);
             }
+            // The wide assembly itself declined; `try_wide_resnet_batched_grad`
+            // already recorded WHICH predicate refused, so do not double-count
+            // here — fall through to the byte-identical reference stacker.
+        } else if wide_disabled {
+            note_wide_lane_decline(WideLaneDecline::GpuWideEnvDisabled);
+        } else {
+            // A one-domain batch has nothing to stack: the per-domain kernel below
+            // IS the wide pass for it. Counted so the denominator stays honest.
+            note_wide_lane_decline(WideLaneDecline::GpuSingleDomainBatch);
         }
         let mut out = Vec::with_capacity(domains.len());
         for d in domains {
@@ -1025,13 +1670,19 @@ impl GpuCrownBackward for WgpuDevice {
         union_gather_idx: &[&[u32]],
         relu_pre_lower: &[&[Vec<f32>]],
     ) -> Result<(Vec<GpuCrownResult>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        // #wide-decline-tally: see the bound entry. The β-opt lane calls this once
+        // per ascent ITERATION, so attempts here are iteration-granular — the same
+        // granularity as the published counter it is compared against.
+        note_wide_lane_attempt();
         if domains.is_empty() {
+            note_wide_lane_decline(WideLaneDecline::GpuEmptyBatch);
             return Err(NyError::InvalidSpec(
                 "crown_backward_gpu_resnet_sound_beta_batched_grad: empty batch".into(),
             ));
         }
         for d in &domains[1..] {
             if !resnet_skeleton_matches(domains[0].segments, d.segments) {
+                note_wide_lane_decline(WideLaneDecline::GpuHomogeneityMismatch);
                 return Err(NyError::UnsupportedOp(
                     "batched-grad: heterogeneous resnet skeleton — using the serial β ascent"
                         .into(),
@@ -1039,6 +1690,7 @@ impl GpuCrownBackward for WgpuDevice {
             }
         }
         if segments_contain_unbatchable(domains[0].segments) {
+            note_wide_lane_decline(WideLaneDecline::GpuUnbatchableLayer);
             return Err(NyError::UnsupportedOp(
                 "batched-grad: ActivationReluDualAlpha/MaxPool2d — using the serial β ascent"
                     .into(),
@@ -1071,19 +1723,24 @@ impl GpuCrownBackward for WgpuDevice {
         union_gather_idx: &[&[u32]],
         relu_pre_lower: &[&[Vec<f32>]],
     ) -> Result<GpuCrownTrajectoryResult> {
+        // #wide-decline-tally: see the bound entry.
+        note_wide_lane_attempt();
         if domains.is_empty() {
+            note_wide_lane_decline(WideLaneDecline::GpuEmptyBatch);
             return Err(NyError::InvalidSpec(
                 "batched-trajectory: empty batch".into(),
             ));
         }
         for d in &domains[1..] {
             if !resnet_skeleton_matches(domains[0].segments, d.segments) {
+                note_wide_lane_decline(WideLaneDecline::GpuHomogeneityMismatch);
                 return Err(NyError::UnsupportedOp(
                     "batched-trajectory: heterogeneous resnet skeleton".into(),
                 ));
             }
         }
         if segments_contain_unbatchable(domains[0].segments) {
+            note_wide_lane_decline(WideLaneDecline::GpuUnbatchableLayer);
             return Err(NyError::UnsupportedOp(
                 "batched-trajectory: ActivationReluDualAlpha/MaxPool2d is not wide-batchable"
                     .into(),
@@ -1167,19 +1824,24 @@ impl GpuCrownBackward for WgpuDevice {
         domains: &[GpuResnetBatchedDomainRef<'_>],
         seed: &GpuCrownSeed,
     ) -> Result<(Vec<GpuCrownResult>, GpuResidentCoeffBatched)> {
+        // #wide-decline-tally: see the bound entry.
+        note_wide_lane_attempt();
         if domains.is_empty() {
+            note_wide_lane_decline(WideLaneDecline::GpuEmptyBatch);
             return Err(NyError::InvalidSpec(
                 "crown_backward_gpu_resnet_sound_beta_batched_coeff: empty batch".into(),
             ));
         }
         for d in &domains[1..] {
             if !resnet_skeleton_matches(domains[0].segments, d.segments) {
+                note_wide_lane_decline(WideLaneDecline::GpuHomogeneityMismatch);
                 return Err(NyError::UnsupportedOp(
                     "batched-coeff: heterogeneous resnet skeleton — no batched clip".into(),
                 ));
             }
         }
         if segments_contain_unbatchable(domains[0].segments) {
+            note_wide_lane_decline(WideLaneDecline::GpuUnbatchableLayer);
             return Err(NyError::UnsupportedOp(
                 "batched-coeff: ActivationReluDualAlpha/MaxPool2d — no batched clip".into(),
             ));
@@ -1212,6 +1874,31 @@ impl GpuCrownBackward for WgpuDevice {
             output_dim,
             input_lower,
             input_upper,
+        )
+    }
+
+    fn provides_deadline_bounded_joint_alpha_gradient_resident(&self) -> bool {
+        true
+    }
+
+    fn crown_joint_alpha_gradient_resident_with_deadline(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed_lower_a: &[f32],
+        num_specs: usize,
+        output_dim: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        deadline: Instant,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.crown_joint_alpha_gradient_resident_with_deadline(
+            segments,
+            seed_lower_a,
+            num_specs,
+            output_dim,
+            input_lower,
+            input_upper,
+            deadline,
         )
     }
 
@@ -1462,6 +2149,10 @@ impl GpuCrownBackward for WgpuDevice {
     fn set_crown_backward_deadline(&self, deadline: Option<Instant>) {
         self.store_crown_backward_deadline(deadline);
     }
+
+    fn honors_crown_backward_deadline(&self) -> bool {
+        true
+    }
 }
 
 /// #batched-vjp: stack the shared backward template into ONE wide layer vec for
@@ -1591,37 +2282,174 @@ fn stack_point_vjp_wide_branch(
 }
 
 impl WgpuDevice {
-    /// #NY_GPU_BATCHED_COLLECT: the largest spec-row chunk for the sound-resident
-    /// backward that keeps every per-dispatch buffer binding under this adapter's
-    /// `max_buffer_binding_size` AND every workgroup dimension under
-    /// `max_compute_workgroups_per_dimension`. Returns `None` (→ single unchunked
-    /// call, byte-identical to main) UNLESS the `NY_GPU_BATCHED_COLLECT=1` gate is
-    /// set; then returns `Some(chunk)` with `1 ≤ chunk ≤ num_specs`.
+    /// Shared body of the two deadline-bounded ResNet sound trait entries.
     ///
-    /// Sizing model (validated against the observed wgpu limit errors on the wide
-    /// TLL nodes): the peak A-coefficient buffer is `num_specs × W` f32 and the
-    /// GEMM shader dispatches `ceil(num_specs × W / 64)` workgroups in X, where
-    /// `W = max` layer in/out width in this sub-network. Both are linear in the
+    /// Contract discharge (ny-core `GpuCrownBackward` docs):
+    /// - PRE-CHECK: refuses before any dispatch once `deadline` has passed.
+    /// - MALFORMED INPUT: rejects non-finite seed coefficients/biases and a
+    ///   non-finite or inverted input box before publication.
+    /// - MID-FLIGHT: arms the thread-local [`CallLocalCrownDeadlineScope`], which
+    ///   `crown_backward_deadline_expired()` folds into the SAME between-layer /
+    ///   between-chunk polls the resident sound fold already runs — without
+    ///   touching the lease-owned backend deadline slot.
+    /// - LATE PUBLICATION: re-checks after the fold and returns
+    ///   `DeadlineExceeded` instead of publishing a late result.
+    /// - RESULT SHAPE: exactly one finite, ordered interval per row, else `Err`.
+    /// - SOUNDNESS: delegates to `crown_backward_gpu_resnet_sound_inner` — the
+    ///   certified-error RESIDENT path (γ_k·S combine, outward-rounded host
+    ///   folds), never the fast round-to-nearest tier.
+    #[allow(clippy::too_many_arguments)]
+    fn resnet_sound_rows_with_call_local_deadline(
+        &self,
+        segments: &[GpuResnetSegment],
+        seed: &GpuCrownSeed,
+        input_lower: &[f32],
+        input_upper: &[f32],
+        frontier_abs: &[Vec<f32>],
+        node_abs: &[Vec<f32>],
+        deadline: Instant,
+    ) -> Result<GpuCrownResult> {
+        if segments.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "deadline-bounded resnet sound backward: empty segment list".into(),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(NyError::DeadlineExceeded(
+                "deadline-bounded resnet sound backward: deadline passed before dispatch".into(),
+            ));
+        }
+        if seed
+            .lower_a
+            .iter()
+            .chain(seed.upper_a.iter())
+            .chain(seed.lower_b.iter())
+            .chain(seed.upper_b.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(NyError::InvalidSpec(
+                "deadline-bounded resnet sound backward: non-finite seed".into(),
+            ));
+        }
+        if input_lower.is_empty()
+            || input_lower.len() != input_upper.len()
+            || input_lower
+                .iter()
+                .zip(input_upper)
+                .any(|(&lo, &hi)| !lo.is_finite() || !hi.is_finite() || lo > hi)
+        {
+            return Err(NyError::InvalidSpec(
+                "deadline-bounded resnet sound backward: malformed input box".into(),
+            ));
+        }
+        let _deadline_scope = crate::wgpu_device::CallLocalCrownDeadlineScope::arm(deadline);
+        let fa_refs: Vec<&[f32]> = frontier_abs.iter().map(|v| v.as_slice()).collect();
+        let na_refs: Vec<&[f32]> = node_abs.iter().map(|v| v.as_slice()).collect();
+        let (lower_bounds, upper_bounds) = self.crown_backward_gpu_resnet_sound_inner(
+            segments,
+            seed,
+            input_lower,
+            input_upper,
+            &fa_refs,
+            &na_refs,
+        )?;
+        if Instant::now() >= deadline {
+            // Never publish a late result: the caller's schedule assumed this
+            // budget and a sound refusal is always available (CPU fallback).
+            return Err(NyError::DeadlineExceeded(
+                "deadline-bounded resnet sound backward: refusing to publish a late result".into(),
+            ));
+        }
+        let rows = seed.num_specs;
+        let publishable = lower_bounds.len() == rows
+            && upper_bounds.len() == rows
+            && lower_bounds
+                .iter()
+                .zip(&upper_bounds)
+                .all(|(&lo, &hi)| lo.is_finite() && hi.is_finite() && lo <= hi);
+        if !publishable {
+            return Err(NyError::InternalError(
+                "deadline-bounded resnet sound backward: result is not one finite ordered \
+                 interval per row"
+                    .into(),
+            ));
+        }
+        Ok(GpuCrownResult {
+            lower_bounds,
+            upper_bounds,
+        })
+    }
+
+    /// #wg-limit-subchunk (DEFAULT-ON, auto-detected): the largest spec-row chunk for
+    /// the sound-resident backward that keeps every per-dispatch buffer binding under
+    /// this adapter's `max_storage_buffer_binding_size` AND every workgroup dimension
+    /// under its `max_compute_workgroups_per_dimension`. Returns `Some(chunk)` with
+    /// `1 ≤ chunk ≤ num_specs`; the caller only *uses* it when `chunk < num_specs`
+    /// (i.e. when this adapter's own reported limits say the single wide dispatch does
+    /// not fit), so on any adapter/shape that fits, this is a no-op.
+    ///
+    /// AUTO-DETECT, NOT A PLATFORM ASSUMPTION. Both caps are read from
+    /// `self.device.limits()` — the exact values wgpu validates the dispatch against.
+    /// `docs/METAL_CUDA_SPECIALIZATION_DECISION.md` used to claim only Metal's tighter
+    /// caps trigger this and that "CUDA/Vulkan report larger limits"; MEASURED FALSE on
+    /// the GB10 Vulkan stack, which reports `max_compute_workgroups_per_dimension =
+    /// 65535` — the wgpu default — exactly like Metal. Hard-coding a platform belief is
+    /// what made this a latent trap; asking the device is the fix.
+    ///
+    /// KILL SWITCH: `NY_GPU_BATCHED_COLLECT=0` returns `None` (never chunk), restoring
+    /// the pre-2026-07-25 behavior in which an over-limit node hard-fails
+    /// (`crown_backward_sound_resident: 1-D dispatch … exceeds
+    /// max_compute_workgroups_per_dimension …`) and the caller falls back to the CPU
+    /// sound path. Kept only as an escape hatch for bisecting a suspected chunking bug.
+    /// Measured cost of setting it, 16-row A/B on relusplitter/cifar_biasfield at official
+    /// budgets (`scratchpad/wg_cap_default_flip_2026-07-25/`): 1–9 CPU fallbacks instead
+    /// of 0, CROWN-IBP collection 14.6–97.1 s instead of 13.0–20.9 s, root objective
+    /// −2.6e7…−1.2e8 instead of −1.6e5…−6.8e5, and 3 of 8 unsat rows never reaching the
+    /// BaB root report at all. Verdicts are identical either way (0 flips, delta +0), so
+    /// this is a robustness/bound-quality knob, not a scorecard one.
+    ///
+    /// Sizing model: the peak A-coefficient buffer is `num_specs × W` f32 and the
+    /// resident elementwise passes dispatch `ceil(num_specs × W / 256)` workgroups in X,
+    /// where `W = max` layer in/out width in this sub-network. Both are linear in the
     /// row count, so a row-chunk of
-    ///   `min( 0.9·max_binding_bytes / (4·W),  0.9·(max_wg·64) / W )`
-    /// respects both limits with a 10% margin. The `/64` matches the confirmed
-    /// workgroup size of the resident backward GEMM (`76832 = 1568·3136/64` in the
-    /// diagnostic run); assuming 64 is conservative for any shader with a larger
-    /// group size. Backend-agnostic: the caps come from `device.limits()`, so this
-    /// adapts to Metal's 128 MiB / Vulkan/CUDA's own reported limits automatically.
+    ///   `min( 0.9·max_binding_bytes / (4·W),  0.9·(max_wg·256) / W )`
+    /// respects both limits with a 10% margin.
     ///
-    /// Chunking is EXACT (not merely sound): spec rows carry no cross-row reduction,
-    /// so each chunk's per-row bounds equal the single-dispatch bounds.
+    /// Chunking is EXACT (not merely sound): spec rows carry no cross-row reduction, so
+    /// each chunk's per-row bounds equal the single-dispatch bounds — verified
+    /// bit-for-bit by `spec_row_chunk_is_exact_vs_unchunked` (Linear/ReLU chain) and
+    /// `spec_row_chunk_is_exact_vs_unchunked_conv_chain` (Conv2d chain, prime row count
+    /// so every chunk size exercises a short tail).
     pub(crate) fn sound_spec_row_chunk(
         &self,
         layers: &[GpuCrownLayer],
         num_specs: usize,
     ) -> Option<usize> {
-        // Default-OFF gate: absent/≠"1" ⇒ no chunking (byte-identical to main).
-        if std::env::var("NY_GPU_BATCHED_COLLECT").ok().as_deref() != Some("1") {
+        // Kill switch: `NY_GPU_BATCHED_COLLECT=0` ⇒ never chunk (pre-fix behavior:
+        // over-limit node → Err → caller's CPU sound fallback). Any other value
+        // (including unset, the default) ⇒ size the chunk from the device's limits.
+        if std::env::var("NY_GPU_BATCHED_COLLECT").ok().as_deref() == Some("0") {
             return None;
         }
         if num_specs == 0 {
+            return None;
+        }
+        // BLAST-RADIUS FENCE (matters now that this is the default): the caller only
+        // reaches us AFTER the unchunked attempt returned SOME `Err`, and not every
+        // `Err` is a device-limit overflow. `crown_backward_sound_resident` also
+        // rejects any layer that is not Linear/Activation/Conv2d ("R4"), which is what
+        // a MaxPool2d / dual-alpha graph hits. Chunking cannot fix an R4 rejection —
+        // every chunk would re-reject — so decline here and let the original `Err` go
+        // straight to the CPU sound path instead of spinning `num_specs/chunk` futile
+        // sub-calls. Mirrors R4 exactly, so it can never suppress a legitimate chunk.
+        if !layers.iter().all(|l| {
+            matches!(
+                l,
+                GpuCrownLayer::Linear { .. }
+                    | GpuCrownLayer::Activation { .. }
+                    | GpuCrownLayer::Conv2d { .. }
+            )
+        }) {
             return None;
         }
         let max_dim = layers
@@ -1634,8 +2462,11 @@ impl WgpuDevice {
         let limits = self.device.limits();
         // Use the adapter's OWN reported limits (authoritative — this is exactly what
         // wgpu validates the dispatch against), falling back to the known wgpu
-        // defaults only if a field reports 0. Backend-agnostic: Metal reports 128 MiB,
-        // Vulkan/CUDA report their own, and this adapts automatically.
+        // defaults only if a field reports 0. Backend-agnostic and adapts
+        // automatically. (The note here used to say "Metal reports 128 MiB" —
+        // that is wgpu's DEFAULT, not Metal's capability. With
+        // `NY_GPU_BIG_BINDINGS` requesting adapter limits, an Apple M4 Pro
+        // reports 4095 MiB; measured 2026-08-06.)
         let max_bind = match limits.max_storage_buffer_binding_size as usize {
             0 => WGPU_MAX_BINDING_BYTES,
             r => r,
@@ -1664,11 +2495,19 @@ impl WgpuDevice {
         Some(chunk)
     }
 
-    /// #NY_GPU_BATCHED_COLLECT: run the sound-resident backward in `chunk`-row
-    /// batches and concatenate the per-row bounds. Each chunk carries the SAME
-    /// layers / input box; only the spec-row slice differs. EXACT (each row's bound
-    /// equals its single-dispatch value — no cross-row reduction). Any chunk `Err`
-    /// propagates (→ caller's CPU sound fallback).
+    /// #wg-limit-subchunk: run the sound-resident backward in `chunk`-row batches and
+    /// concatenate the per-row bounds. Each chunk carries the SAME layers / input box;
+    /// only the spec-row slice differs. EXACT (each row's bound equals its
+    /// single-dispatch value — no cross-row reduction). Any chunk `Err` propagates
+    /// (→ caller's CPU sound fallback).
+    ///
+    /// TAIL: the loop is a half-open walk `[start, min(start+chunk, num_specs))`, so a
+    /// `num_specs` that is NOT a multiple of `chunk` yields a final short chunk of
+    /// `num_specs % chunk` rows — never a truncated, over-read, or duplicated row. Each
+    /// chunk asserts it returned exactly `rows` lower AND `rows` upper bounds before
+    /// appending, so a kernel that silently returned the wrong row count `Err`s here
+    /// instead of shifting every later row's bound. The concatenation preserves spec
+    /// order (`lower_bounds[s]` is spec row `s`), which the callers index positionally.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn crown_backward_sound_chunked(
         &self,
@@ -1681,6 +2520,20 @@ impl WgpuDevice {
         input_upper: &[f32],
     ) -> Result<GpuCrownResult> {
         let chunk = chunk.max(1);
+        // PANIC GUARD (required by the default flip): the row slice below indexes
+        // `spec[start*output_dim .. end*output_dim]`, so an under-sized `spec` would
+        // PANIC instead of returning `Err`. Reachable because the caller only lands
+        // here after the unchunked attempt already returned `Err` — and one of the
+        // errors it can return is exactly a `spec`-length `shape_mismatch` (the
+        // resident fold checks `lower_a.len() != num_specs*output_dim` BEFORE the
+        // dispatch-cap guard). While the chunking was opt-in this path was unreachable
+        // in production; as the default it must fail closed, not abort the verifier.
+        if output_dim == 0 || spec.len() < num_specs * output_dim {
+            return Err(NyError::shape_mismatch(
+                vec![num_specs, output_dim],
+                vec![spec.len()],
+            ));
+        }
         let probe = std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1");
         if probe {
             eprintln!(
@@ -1766,7 +2619,7 @@ impl WgpuDevice {
         let n_domains = domains.len();
         let nsp = seed.num_specs; // per-domain spec-row count
         if n_domains == 0 || nsp == 0 {
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuEmptyBatch);
         }
         let max_wg = self
             .device
@@ -1774,9 +2627,11 @@ impl WgpuDevice {
             .max_compute_workgroups_per_dimension
             .max(1) as usize;
         let width = resnet_segments_max_1d_dispatch_dim(domains[0].segments);
-        let safe_domains = wide_safe_domain_count(max_wg, width, nsp)?;
+        let Some(safe_domains) = wide_safe_domain_count(max_wg, width, nsp) else {
+            return note_wide_lane_decline_none(WideLaneDecline::GpuDispatchLimitTooWide);
+        };
         if !relu_pre_lower.is_empty() && relu_pre_lower.len() != n_domains {
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuPreLowerShapeMismatch);
         }
 
         // Common case: the whole batch fits in one wide pass (byte-identical to the
@@ -1784,7 +2639,7 @@ impl WgpuDevice {
         // not fit because concatenating `GpuResidentCoeffBatched` across sub-chunks is
         // not yet implemented in this backend.
         if n_domains <= safe_domains {
-            return self.try_wide_resnet_batched_grad_group(
+            let out = self.try_wide_resnet_batched_grad_group(
                 domains,
                 seed,
                 union_gather_idx,
@@ -1792,12 +2647,16 @@ impl WgpuDevice {
                 coeff_full_out,
                 force_fine_coeff,
             );
+            if out.is_some() {
+                WIDE_RESNET_BATCHED_TAKEN.fetch_add(1, Ordering::Relaxed);
+            }
+            return out;
         }
         // A coefficient frontier must remain one domain-major object.  Until
         // this backend has a checked concatenator, decline an over-limit capture
         // instead of issuing an invalid oversized dispatch.
         if coeff_full_out.is_some() {
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuCoeffOverDispatchLimit);
         }
 
         if std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1") {
@@ -1814,15 +2673,23 @@ impl WgpuDevice {
         for (group_index, group) in domains.chunks(safe_domains).enumerate() {
             let start = group_index * safe_domains;
             let end = start + group.len();
-            let group_pre_lower = wide_domain_table_chunk(relu_pre_lower, n_domains, start, end)?;
-            let (b, ag, gv) = self.try_wide_resnet_batched_grad_group(
+            let Some(group_pre_lower) =
+                wide_domain_table_chunk(relu_pre_lower, n_domains, start, end)
+            else {
+                return note_wide_lane_decline_none(WideLaneDecline::GpuPreLowerShapeMismatch);
+            };
+            let Some((b, ag, gv)) = self.try_wide_resnet_batched_grad_group(
                 group,
                 seed,
                 union_gather_idx,
                 group_pre_lower,
                 None,
                 false,
-            )?;
+            ) else {
+                // The group recorded its own precise reason; this marks that a
+                // partially-completed sub-chunked batch was abandoned wholesale.
+                return note_wide_lane_decline_none(WideLaneDecline::GpuSubchunkGroupFailed);
+            };
             out_bounds.extend(b);
             if first {
                 out_alpha = ag;
@@ -1833,7 +2700,7 @@ impl WgpuDevice {
                 // so appending each group's block preserves the global domain layout
                 // (`alpha_grads[r][dom*nn + i]`, `gathers[r]` row-major N×U_r).
                 if ag.len() != out_alpha.len() || gv.len() != out_gathers.len() {
-                    return None;
+                    return note_wide_lane_decline_none(WideLaneDecline::GpuSubchunkGroupFailed);
                 }
                 for (dst, src) in out_alpha.iter_mut().zip(ag) {
                     dst.extend(src);
@@ -1843,6 +2710,7 @@ impl WgpuDevice {
                 }
             }
         }
+        WIDE_RESNET_BATCHED_TAKEN.fetch_add(1, Ordering::Relaxed);
         Some((out_bounds, out_alpha, out_gathers))
     }
 
@@ -1868,9 +2736,11 @@ impl WgpuDevice {
         let n_domains = domains.len();
         let nsp = seed.num_specs; // per-domain spec-row count
         if nsp == 0 {
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuSeedShapeRefused);
         }
-        let n = n_domains.checked_mul(nsp)?;
+        let Some(n) = n_domains.checked_mul(nsp) else {
+            return note_wide_lane_decline_none(WideLaneDecline::GpuSeedShapeRefused);
+        };
         let od = seed.current_dim;
         let probe = std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1");
         // Wide skeleton: shared weights + per-domain-STACKED Activation slopes.
@@ -1878,7 +2748,7 @@ impl WgpuDevice {
             if probe {
                 eprintln!("[wide] BAIL stack_wide_segments None (n_domains={n_domains})");
             }
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuSegmentStackRefused);
         };
         // Tile the SHARED spec seed n_domains times → N rows (each domain block starts
         // from the identical seed, exactly as the serial per-domain calls do).
@@ -1895,7 +2765,7 @@ impl WgpuDevice {
                     seed.lower_b.len()
                 );
             }
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuSeedShapeRefused);
         }
         let mut wl_a = Vec::with_capacity(n * od);
         let mut wu_a = Vec::with_capacity(n * od);
@@ -1928,7 +2798,7 @@ impl WgpuDevice {
                         d.input_upper.len()
                     );
                 }
-                return None;
+                return note_wide_lane_decline_none(WideLaneDecline::GpuInputBoxMismatch);
             }
             w_lo.extend_from_slice(d.input_lower);
             w_hi.extend_from_slice(d.input_upper);
@@ -1955,15 +2825,15 @@ impl WgpuDevice {
         };
         let Some(wide_beta) = stack_wide_table(&beta_tbls) else {
             bail_tbl("beta");
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuBetaTableStackRefused);
         };
         let Some(wide_fa) = stack_wide_table(&fa_tbls) else {
             bail_tbl("fa");
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuFrontierTableStackRefused);
         };
         let Some(wide_na) = stack_wide_table(&na_tbls) else {
             bail_tbl("na");
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuNodeTableStackRefused);
         };
         let bs: Vec<&[f32]> = wide_beta.iter().map(|v| v.as_slice()).collect();
         let fa: Vec<&[f32]> = wide_fa.iter().map(|v| v.as_slice()).collect();
@@ -1976,7 +2846,7 @@ impl WgpuDevice {
         } else {
             let Some(w) = stack_wide_table(relu_pre_lower) else {
                 bail_tbl("pre_lower");
-                return None;
+                return note_wide_lane_decline_none(WideLaneDecline::GpuPreLowerTableStackRefused);
             };
             w
         };
@@ -2009,11 +2879,20 @@ impl WgpuDevice {
                         wide_na.len()
                     );
                 }
-                return None;
+                // Structurally classify the refusal so the tally distinguishes a
+                // budget expiry (schedule) from a host memory cap (sizing) from a
+                // genuine device/shape fault — three different fixes.
+                return note_wide_lane_decline_none(if e.is_deadline_exceeded() {
+                    WideLaneDecline::GpuWideInnerDeadline
+                } else if e.is_cpu_memory_exceeded() {
+                    WideLaneDecline::GpuWideInnerMemoryCap
+                } else {
+                    WideLaneDecline::GpuWideInnerError
+                });
             }
         };
         if lo.len() != n || hi.len() != n {
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuWideOutputLenMismatch);
         }
         if std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1") {
             eprintln!(
@@ -2076,9 +2955,90 @@ impl WgpuDevice {
             self.try_wide_resnet_batched_grad(domains, seed, &[], &[], Some(&mut coeff), true)?;
         // Guard: a coeff request that produced an empty frontier is unusable.
         if coeff.dim == 0 || coeff.num_specs == 0 || coeff.num_specs_per_dom == 0 {
-            return None;
+            return note_wide_lane_decline_none(WideLaneDecline::GpuCoeffFrontierEmpty);
         }
         Some((bounds, coeff))
+    }
+
+    /// #batched-bab HOLE-7 SUB-GROUPING (DARK, `NY_BAB_RESNET_WIDE_SUBGROUP=1`) —
+    /// the coverage increment for heterogeneous waves.
+    ///
+    /// Today a single odd domain sends the WHOLE batch to the serial path. This
+    /// splits `domains` into MAXIMAL CONTIGUOUS runs of skeleton-equal domains and
+    /// runs one wide pass per run. Soundness rests on exactly the argument the
+    /// homogeneous lane already relies on:
+    /// - every run satisfies the wide fold's precondition (one shared skeleton,
+    ///   per-domain relaxation VALUES only), so each run's per-domain block is
+    ///   folded against its OWN box / β / abs-max tables — a run is not "part of"
+    ///   a bigger reduction, and no state crosses runs;
+    /// - runs are visited in domain order and their results appended in order, so
+    ///   output slot `i` is domain `i`'s own bound (the caller's contract);
+    /// - a run whose head carries HOLE-8 layer kinds, or whose wide assembly
+    ///   refuses for any reason, declines the ENTIRE batch (`None`) so the caller
+    ///   falls back exactly as today. There is never a partial result and never a
+    ///   mixture of a wide run with a serial one. (HOLE 8 is decided for EVERY run
+    ///   before the first dispatch, so an unfoldable wave costs zero GPU work; a
+    ///   late assembly refusal in phase 2 can still discard already-computed runs —
+    ///   wasted work, never an unsound or partial answer.)
+    ///
+    /// A run of length 1 is admissible: the wide fold with `n_domains == 1`
+    /// degenerates to the same single-block computation the per-domain sound inner
+    /// performs, so it neither tightens nor loosens.
+    ///
+    /// DEFAULT OFF. Enabling it changes which kernel produces a verdict-bearing
+    /// bound on heterogeneous waves, so it stays dark until the device-level
+    /// enclosure oracle (`wide_subgrouped_encloses_serial_reference`) has been run
+    /// on real heterogeneous waves on the target adapter.
+    fn try_wide_resnet_batched_subgrouped(
+        &self,
+        domains: &[GpuResnetBatchedDomainRef<'_>],
+        seed: &GpuCrownSeed,
+    ) -> Option<Vec<GpuCrownResult>> {
+        if !wide_subgroup_enabled() {
+            return None;
+        }
+        // The A/B kill-switch for the wide kernel outranks the sub-grouping lane:
+        // `NY_BAB_RESNET_WIDE=0` must mean "no wide dispatches at all".
+        if !wide_resnet_enabled() {
+            return None;
+        }
+        if domains.len() < 2 {
+            return None;
+        }
+        // PHASE 1 — partition and validate WITHOUT dispatching. Deciding HOLE 8 for
+        // every run up front is what makes the refusal genuinely fail-closed: a
+        // wave with one unfoldable run must cost zero wide dispatches, not publish
+        // the earlier runs and then abandon them.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        while start < domains.len() {
+            let head = &domains[start];
+            if segments_contain_unbatchable(head.segments) {
+                return None;
+            }
+            let mut end = start + 1;
+            while end < domains.len()
+                && resnet_skeleton_matches(head.segments, domains[end].segments)
+            {
+                end += 1;
+            }
+            runs.push((start, end));
+            start = end;
+        }
+        // A wave that turned out to be one homogeneous run does not belong here:
+        // the caller's ordinary wide path already handles it (and calling it again
+        // would double-count a publication).
+        if runs.len() < 2 {
+            return None;
+        }
+        // PHASE 2 — one wide pass per run, appended in domain order.
+        let mut out: Vec<GpuCrownResult> = Vec::with_capacity(domains.len());
+        for (run_start, run_end) in runs {
+            out.extend(self.try_wide_resnet_batched(&domains[run_start..run_end], seed)?);
+        }
+        // Defensive: the caller indexes results by domain, so a count drift must
+        // decline rather than silently re-associate bounds with other domains.
+        (out.len() == domains.len()).then_some(out)
     }
 
     fn crown_backward_gpu_seeded_inner(
@@ -2141,7 +3101,8 @@ impl WgpuDevice {
         // reduced to safe spec batches before any GPU allocations occur.
         let estimate = estimate_crown_backward_memory(layers, num_specs);
         let budget = gpu_memory_budget_bytes();
-        let binding_batch = max_specs_per_batch(layers, num_specs, first_dim);
+        let binding_batch =
+            max_specs_per_batch(layers, num_specs, first_dim, self.max_binding_bytes_live());
         let budget_batch = max_specs_per_budget(layers, num_specs, budget);
         let dispatch_batch = max_specs_per_dispatch(layers, num_specs);
 

@@ -13,6 +13,42 @@ use super::super::mode_mutators;
 use super::GraphNetwork;
 
 impl GraphNetwork {
+    /// Enable the forward-linear spec-alpha surrogate for this graph.
+    ///
+    /// The production CLI only sets this from the typed preset key after its
+    /// loader admission check has sealed the authored FLOAT initializers and
+    /// required raw BatchNormalization nodes. The gate is graph-local and
+    /// default off; it authorizes only the existing slope-selection heuristic.
+    /// Every published bound still comes from the certified alpha-fed rebuild.
+    /// Changing the policy drops every forward-linear cache identity, including
+    /// a memoized optimizer refusal.
+    pub fn set_forward_linear_spec_alpha(&mut self, enabled: bool) {
+        if self.forward_linear_spec_alpha != enabled {
+            self.forward_linear_spec_alpha = enabled;
+            self.invalidate_forward_linear_cache();
+        }
+    }
+
+    /// Whether this graph admits the typed forward-linear spec-alpha surrogate.
+    #[must_use]
+    pub fn forward_linear_spec_alpha_enabled(&self) -> bool {
+        self.forward_linear_spec_alpha
+    }
+
+    /// Backward-compatible alias for the original cGAN-named admission API.
+    ///
+    /// This deliberately writes the same generic graph-local bit; it does not
+    /// create a second gate or widen the optimizer's authority.
+    pub fn set_cgan_forward_alpha_surrogate(&mut self, enabled: bool) {
+        self.set_forward_linear_spec_alpha(enabled);
+    }
+
+    /// Backward-compatible alias for the original cGAN-named admission API.
+    #[must_use]
+    pub fn cgan_forward_alpha_surrogate_enabled(&self) -> bool {
+        self.forward_linear_spec_alpha_enabled()
+    }
+
     /// Enable or disable forward mode for all normalization nodes that share
     /// `LayerNorm`-style statistics in the graph.
     ///

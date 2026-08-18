@@ -9,7 +9,7 @@
 # VISION.md claims: "Model diffing: detect where implementations diverge (seconds vs hours)"
 # Target: Sub-10s for Whisper-scale models (~39M params)
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -50,7 +50,12 @@ echo ""
 
 # Build ny-cli in release mode for accurate benchmarks
 echo "Building ny-cli in release mode..."
-cargo build -p ny-cli --release 2>&1 | grep -v "Compiling\|Downloaded" || true
+BUILD_LOG="$TEMP_DIR/cargo-build.log"
+if ! cargo build -p ny-cli --release >"$BUILD_LOG" 2>&1; then
+    cat "$BUILD_LOG" >&2
+    exit 1
+fi
+sed '/Compiling\|Downloaded/d' "$BUILD_LOG"
 NY="$REPO_ROOT/target/release/ny"
 
 if [ ! -f "$NY" ]; then
@@ -88,22 +93,27 @@ create_perturbed() {
 benchmark_model() {
     local name="$1"
     local model="$2"
-    local perturbed="$TEMP_DIR/perturbed_$(basename "$model")"
+    local perturbed
+    perturbed="$TEMP_DIR/perturbed_$(basename "$model")"
 
     create_perturbed "$model" "$perturbed"
 
     # Warm-up run
-    "$NY" diff "$model" "$perturbed" --tolerance 1e-5 > /dev/null 2>&1 || true
+    "$NY" diff "$model" "$perturbed" --tolerance 1e-5 > /dev/null 2>&1
 
     # Timed run
-    local start=$(python3 -c "import time; print(time.time())")
-    "$NY" diff "$model" "$perturbed" --tolerance 1e-5 > /dev/null 2>&1 || true
-    local end=$(python3 -c "import time; print(time.time())")
+    local start
+    local end
+    start=$(python3 -c "import time; print(time.time())")
+    "$NY" diff "$model" "$perturbed" --tolerance 1e-5 > /dev/null 2>&1
+    end=$(python3 -c "import time; print(time.time())")
 
-    local elapsed=$(python3 -c "print(f'{$end - $start:.3f}')")
+    local elapsed
+    elapsed=$(python3 -c "print(f'{$end - $start:.3f}')")
 
     # Get model size
-    local size=$(ls -lh "$model" | awk '{print $5}')
+    local size
+    size=$(ls -lh "$model" | awk '{print $5}')
 
     printf "%-30s %8s %8ss\n" "$name" "$size" "$elapsed"
 }
@@ -139,8 +149,8 @@ else
     echo "  - If sub-linear (graph structure): likely faster"
     echo ""
     echo "Note: To benchmark actual Whisper-scale models, run:"
-    echo "  python scripts/export_docling_to_onnx.py --model granite-docling-258M"
-    echo "  scripts/benchmark_diff.sh --model models/docling/granite-docling-258M/model.onnx"
+    echo "  python3 scripts/export_docling_to_onnx.py --model granite-docling-258M --trust-remote-code"
+    echo "  scripts/benchmark_diff.sh --model models/docling/granite-docling-258M/vision_encoder.onnx"
 fi
 
 echo ""

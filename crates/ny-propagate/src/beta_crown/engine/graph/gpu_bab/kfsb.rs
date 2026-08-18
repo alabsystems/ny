@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Graph kFSB selection for the GPU BaB ReLU-split path.
+//! Graph kFSB selection for the DomainList BaB ReLU-split path.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -232,6 +232,14 @@ impl BetaCrownVerifier {
             return Ok(None);
         };
 
+        // Candidate-side propagation is advisory: its bounds only rank the
+        // split and this local child is discarded. αβ-CROWN computes clip
+        // decisions during this phase but runs Complete Clipping only after
+        // committing a split, so do not spend the verdict-path clip budget
+        // here.
+        let _complete_clip_suppression = self
+            .complete_clip_deadline_overrides
+            .suppress_complete_clip_scoped();
         if self.evaluate_graph_child_bounds(
             request.graph,
             &mut child,
@@ -460,7 +468,12 @@ impl BetaCrownVerifier {
             },
         )?;
 
-        // ONE forward+backward pass for all children.
+        // ONE forward+backward pass for all children. These results feed only
+        // the advisory kFSB reducer below; neither returned node cache is
+        // installed on a child.
+        let _complete_clip_suppression = self
+            .complete_clip_deadline_overrides
+            .suppress_complete_clip_scoped();
         let results = self.propagate_crown_with_batched_domains_full(
             graph,
             &child_refs,

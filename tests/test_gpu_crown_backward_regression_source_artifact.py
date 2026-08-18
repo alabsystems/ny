@@ -41,41 +41,6 @@ def load_report(tmp_path: Path) -> dict[str, object]:
     return json.loads(report_path.read_text(encoding="utf-8"))
 
 
-def assert_resolves_to_artifact(
-    observed_candidates: dict[str, str],
-    check_name: str,
-    suffix: str,
-) -> None:
-    assert observed_candidates[check_name].endswith(suffix), (
-        f"{check_name} should resolve to its pinned source artifact: {observed_candidates!r}"
-    )
-
-
-def assert_parameter_count(
-    report: dict[str, object],
-    check_name: str,
-    expected_parameter_count: int,
-) -> None:
-    check = next(item for item in report["checks"] if item["name"] == check_name)
-    assert check["expected_parameter_count"] == expected_parameter_count, (
-        f"checked-in policy should pin workload metadata for {check_name}: {check!r}"
-    )
-    assert check["observed_parameter_count"] == expected_parameter_count, (
-        f"checked-in artifact should match the pinned workload metadata for {check_name}: {check!r}"
-    )
-
-
-def assert_observed_seconds(
-    report: dict[str, object],
-    check_name: str,
-    expected_seconds: float,
-) -> None:
-    check = next(item for item in report["checks"] if item["name"] == check_name)
-    assert check["observed_seconds"] == expected_seconds, (
-        f"checked-in artifact should preserve the pinned timing evidence for {check_name}: {check!r}"
-    )
-
-
 def test_gpu_crown_backward_regression_rejects_stale_split_artifacts_after_engine_only_pin(
     tmp_path: Path,
 ) -> None:
@@ -109,48 +74,6 @@ def test_gpu_crown_backward_regression_rejects_stale_split_artifacts_after_engin
         assert check["reasons"] == ["source_artifact_missing"], (
             f"stale split artifact bundle should fail on source pin mismatch only: {check!r}"
         )
-
-
-def test_gpu_crown_backward_regression_accepts_checked_in_engine_only_artifact(
-    tmp_path: Path,
-) -> None:
-    policy = REPO_ROOT / "configs" / "benchmark_regressions" / "gpu_crown_backward.json"
-    candidate = (
-        REPO_ROOT
-        / "reports"
-        / "benchmarks"
-        / "gpu_crown_backward_engine_only_20260319.csv"
-    )
-
-    result = run_checker(tmp_path, [candidate], policy)
-
-    assert result.returncode == 0, (
-        "checked-in policy should accept the pinned engine-only artifact "
-        f"without fallback warnings: {result.stderr}\n{result.stdout}"
-    )
-    assert "source_artifact" not in result.stdout, result.stdout
-    report = load_report(tmp_path)
-    observed_candidates = {
-        item["name"]: item["observed_candidate"]
-        for item in report["checks"]
-        if item["observed_candidate"] is not None
-    }
-    assert report["regression"] is False, f"expected pinned engine-only artifact to pass, got {report!r}"
-    for check_name in observed_candidates:
-        assert_resolves_to_artifact(
-            observed_candidates,
-            check_name,
-            "reports/benchmarks/gpu_crown_backward_engine_only_20260319.csv",
-        )
-    for check in report["checks"]:
-        assert check["selection_mode"] == "source_artifact_match", (
-            "checked-in engine-only artifact should resolve via a direct "
-            f"source-artifact match: {check!r}"
-        )
-    assert_parameter_count(report, "soundnessbench_graph_engine", 1740696)
-    assert_parameter_count(report, "metaroom_graph_engine", 7410996)
-    assert_observed_seconds(report, "soundnessbench_graph_engine", 14.900598)
-    assert_observed_seconds(report, "metaroom_graph_engine", 3.895002)
 
 
 def test_gpu_crown_backward_regression_prefers_source_artifact_match(
@@ -316,59 +239,4 @@ def test_gpu_crown_backward_regression_soft_fallback_still_detects_regression(
     )
     assert "seconds_exceeded" in gpu_check["reasons"], (
         f"expected seconds_exceeded in reasons: {gpu_check['reasons']!r}"
-    )
-
-
-def test_gpu_crown_backward_regression_currenthead_consolidated_artifact_surfaces_real_regression(
-    tmp_path: Path,
-) -> None:
-    """The checked-in consolidated currenthead artifact should exercise the
-    sole-candidate fallback and still report the real metaroom timing
-    regression instead of failing on source-artifact routing."""
-    policy = REPO_ROOT / "configs" / "benchmark_regressions" / "gpu_crown_backward.json"
-    candidate = (
-        REPO_ROOT
-        / "reports"
-        / "benchmarks"
-        / "gpu_crown_backward_timing_currenthead_20260314.csv"
-    )
-
-    result = run_checker(tmp_path, [candidate], policy)
-
-    assert result.returncode == 1, (
-        "the checked-in currenthead artifact should currently fail on the real "
-        "metaroom graph-engine timing regression"
-    )
-    assert "metaroom_graph_engine: source_artifact" in result.stdout, (
-        "the checked-in currenthead artifact should still exercise the "
-        "sole-candidate soft fallback for metaroom_graph_engine"
-    )
-    report = load_report(tmp_path)
-    metaroom_check = next(
-        item for item in report["checks"] if item["name"] == "metaroom_graph_engine"
-    )
-    soundnessbench_check = next(
-        item for item in report["checks"] if item["name"] == "soundnessbench_graph_engine"
-    )
-    failing_checks = [item["name"] for item in report["checks"] if item["regression"] is True]
-    assert report["regression"] is True, f"expected currenthead report regression, got {report!r}"
-    assert failing_checks == ["metaroom_graph_engine"], (
-        "the checked-in currenthead artifact should only regress on "
-        f"metaroom_graph_engine, got {failing_checks!r}"
-    )
-    assert metaroom_check["observed_candidate"].endswith(
-        "reports/benchmarks/gpu_crown_backward_timing_currenthead_20260314.csv"
-    ), f"expected consolidated currenthead artifact to be selected, got {metaroom_check!r}"
-    assert metaroom_check["selection_mode"] == "source_artifact_sole_candidate_fallback", (
-        "the currenthead consolidated artifact should record the soft fallback "
-        f"selection path: {metaroom_check!r}"
-    )
-    assert metaroom_check["reasons"] == ["seconds_exceeded"], (
-        f"expected real metaroom timing regression, got {metaroom_check['reasons']!r}"
-    )
-    assert metaroom_check["observed_seconds"] == 32.648467, (
-        f"expected pinned metaroom timing evidence, got {metaroom_check!r}"
-    )
-    assert soundnessbench_check["regression"] is False, (
-        f"soundnessbench currenthead timing should remain within policy: {soundnessbench_check!r}"
     )

@@ -17,6 +17,7 @@ default = []
 [dependencies]
 half.workspace = true
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 # Contract attributes (`#[ensures]`/`#[requires]`). The NY-owned compatibility
 # macros are no-ops under stable rustc; under tRustc contract verification the

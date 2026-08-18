@@ -114,6 +114,91 @@ fn test_graph_crown_div_negative_denominator_sound() {
     }
 }
 
+#[test]
+fn test_graph_crown_div_non_power_reciprocal_with_negative_numerator_sound() {
+    let x_lo = -2.0_f32.powi(30);
+    let x_hi = -2.0_f32.powi(20);
+    let y_lo = 0.1_f32;
+    let y_hi = 0.3_f32;
+    let input_a = BoundedTensor::new(arr1(&[x_lo]).into_dyn(), arr1(&[x_hi]).into_dyn()).unwrap();
+    let input_b = BoundedTensor::new(arr1(&[y_lo]).into_dyn(), arr1(&[y_hi]).into_dyn()).unwrap();
+    let out =
+        BoundedTensor::new(arr1(&[-2.0e10_f32]).into_dyn(), arr1(&[0.0_f32]).into_dyn()).unwrap();
+    let node_lb = LinearBounds::new(
+        arr2(&[[1.000_000_1_f32]]),
+        arr1(&[0.0]),
+        arr2(&[[1.000_000_1_f32]]),
+        arr1(&[0.0]),
+    )
+    .unwrap();
+    let DivBackwardResult::PropagateNumerator(bounds) =
+        backward_div_to_numerator(&node_lb, &input_a, &input_b, &out).unwrap()
+    else {
+        panic!("strictly positive denominator should propagate")
+    };
+
+    let (la, lb) = (
+        f64::from(bounds.lower_a()[[0, 0]]),
+        f64::from(bounds.lower_b()[0]),
+    );
+    let (ua, ub) = (
+        f64::from(bounds.upper_a()[[0, 0]]),
+        f64::from(bounds.upper_b()[0]),
+    );
+    for ix in 0..=64 {
+        let x = f64::from(x_lo) + (f64::from(x_hi) - f64::from(x_lo)) * (ix as f64 / 64.0);
+        for iy in 0..=64 {
+            let y = f64::from(y_lo) + (f64::from(y_hi) - f64::from(y_lo)) * (iy as f64 / 64.0);
+            let truth = f64::from(1.000_000_1_f32) * x / y;
+            assert!(la * x + lb <= truth, "lower missed at x={x:e}, y={y:e}");
+            assert!(ua * x + ub >= truth, "upper missed at x={x:e}, y={y:e}");
+        }
+    }
+}
+
+#[test]
+fn test_graph_crown_div_discharges_incoming_coefficient_error() {
+    let input_a = BoundedTensor::new(arr1(&[-2.0]).into_dyn(), arr1(&[2.0]).into_dyn()).unwrap();
+    let input_b = BoundedTensor::new(arr1(&[1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    let output = BoundedTensor::new(arr1(&[-2.0]).into_dyn(), arr1(&[2.0]).into_dyn()).unwrap();
+    let mut node_lb =
+        LinearBounds::new(arr2(&[[1.0]]), arr1(&[0.0]), arr2(&[[1.0]]), arr1(&[0.0])).unwrap();
+    node_lb.set_coeff_err(arr2(&[[0.25]]), arr2(&[[0.25]]));
+
+    let DivBackwardResult::PropagateNumerator(bounds) =
+        backward_div_to_numerator(&node_lb, &input_a, &input_b, &output).unwrap()
+    else {
+        panic!("point positive denominator should propagate")
+    };
+    assert!(
+        bounds.lower_b()[0] <= -0.5,
+        "lower bias={}",
+        bounds.lower_b()[0]
+    );
+    assert!(
+        bounds.upper_b()[0] >= 0.5,
+        "upper bias={}",
+        bounds.upper_b()[0]
+    );
+    assert!(!bounds.has_coeff_err());
+}
+
+#[test]
+fn test_graph_crown_div_nonfinite_denominator_falls_back() {
+    let input_a = BoundedTensor::new(arr1(&[1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    let input_b = BoundedTensor::new_allow_infinite(
+        arr1(&[f32::INFINITY]).into_dyn(),
+        arr1(&[f32::INFINITY]).into_dyn(),
+    )
+    .unwrap();
+    let output = BoundedTensor::new(arr1(&[0.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    let node_lb = LinearBounds::identity(1);
+    assert!(matches!(
+        backward_div_to_numerator(&node_lb, &input_a, &input_b, &output).unwrap(),
+        DivBackwardResult::ConcretizeCurrentNode(_)
+    ));
+}
+
 /// Mixed-sign denominator (0 ∈ [ly, uy]) must keep the concretization fallback.
 #[test]
 fn test_graph_crown_div_mixed_sign_denominator_concretizes() {
@@ -136,6 +221,82 @@ fn test_graph_crown_div_mixed_sign_denominator_concretizes() {
         matches!(result, DivBackwardResult::ConcretizeCurrentNode(_)),
         "mixed-sign denominator must concretize, not propagate"
     );
+}
+
+#[test]
+fn test_graph_crown_div_sign_definite_elements_may_have_different_signs() {
+    let input_a = BoundedTensor::new(
+        arr1(&[-2.0_f32, -3.0]).into_dyn(),
+        arr1(&[4.0_f32, 5.0]).into_dyn(),
+    )
+    .unwrap();
+    let input_b = BoundedTensor::new(
+        arr1(&[1.0_f32, -4.0]).into_dyn(),
+        arr1(&[2.0_f32, -1.0]).into_dyn(),
+    )
+    .unwrap();
+    let out = BoundedTensor::new(
+        arr1(&[-5.0_f32, -5.0]).into_dyn(),
+        arr1(&[5.0_f32, 5.0]).into_dyn(),
+    )
+    .unwrap();
+    let node_lb = LinearBounds::identity(2);
+    let DivBackwardResult::PropagateNumerator(bounds) =
+        backward_div_to_numerator(&node_lb, &input_a, &input_b, &out).unwrap()
+    else {
+        panic!("element-wise sign-definite denominator should propagate")
+    };
+
+    for element in 0..2 {
+        let (x_lo, x_hi) = (input_a.lower()[[element]], input_a.upper()[[element]]);
+        let (y_lo, y_hi) = (input_b.lower()[[element]], input_b.upper()[[element]]);
+        for ix in 0..=32 {
+            let x = x_lo + (x_hi - x_lo) * ix as f32 / 32.0;
+            for iy in 0..=32 {
+                let y = y_lo + (y_hi - y_lo) * iy as f32 / 32.0;
+                let truth = x / y;
+                let lower = bounds.lower_a().row(element).dot(&arr1(&[
+                    if element == 0 { x } else { 0.0 },
+                    if element == 1 { x } else { 0.0 },
+                ])) + bounds.lower_b()[element];
+                let upper = bounds.upper_a().row(element).dot(&arr1(&[
+                    if element == 0 { x } else { 0.0 },
+                    if element == 1 { x } else { 0.0 },
+                ])) + bounds.upper_b()[element];
+                assert!(
+                    lower <= truth,
+                    "element={element} lower={lower} truth={truth}"
+                );
+                assert!(
+                    upper >= truth,
+                    "element={element} upper={upper} truth={truth}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_graph_crown_div_rejects_incompatible_denominator_broadcast() {
+    let input_a = BoundedTensor::new(
+        arr1(&[1.0_f32, 2.0]).into_dyn(),
+        arr1(&[2.0, 3.0]).into_dyn(),
+    )
+    .unwrap();
+    let input_b = BoundedTensor::new(
+        arr1(&[1.0_f32, 2.0, 3.0]).into_dyn(),
+        arr1(&[2.0_f32, 3.0, 4.0]).into_dyn(),
+    )
+    .unwrap();
+    let out = BoundedTensor::new(
+        arr1(&[0.0_f32, 0.0]).into_dyn(),
+        arr1(&[3.0, 3.0]).into_dyn(),
+    )
+    .unwrap();
+    assert!(matches!(
+        backward_div_to_numerator(&LinearBounds::identity(2), &input_a, &input_b, &out).unwrap(),
+        DivBackwardResult::ConcretizeCurrentNode(_)
+    ));
 }
 
 #[test]

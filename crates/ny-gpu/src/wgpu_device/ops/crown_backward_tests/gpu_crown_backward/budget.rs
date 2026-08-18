@@ -75,15 +75,8 @@ fn test_gpu_crown_memory_budget_fallback_3515() {
     let inp_u = vec![0.01f32; input_dim];
 
     let result = device.crown_backward_gpu(&layers, &spec, num_specs, &inp_l, &inp_u);
-    assert!(
-        result.is_err(),
-        "1 MB budget should reject even a single soundnessbench spec batch",
-    );
-    let err = if let Err(err) = result {
-        err
-    } else {
-        return;
-    };
+    let err =
+        result.expect_err("1 MB budget should reject even a single soundnessbench spec batch");
     assert!(
         matches!(err, ny_core::NyError::GpuMemoryExceeded { .. }),
         "expected GpuMemoryExceeded, got {err:?}",
@@ -118,6 +111,7 @@ fn test_crown_resource_release_between_models() {
         bias: Some(vec![0.0, 0.0].into()),
         out_features: 2,
         in_features: 2,
+        cert_err: Default::default(),
     }];
     let spec = identity_spec(2);
     let inp_l = vec![-1.0f32; 2];

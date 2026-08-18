@@ -47,16 +47,22 @@
 //! region index equals the terminal-leaf index when the proposal trace reports
 //! exactly one terminal per region (as in the sealed row-5 trace). Exact box bits
 //! are logged so the identity can be checked. This mode has no certificate or
-//! bound-return channel and always leaves caller bounds unchanged.
+//! bound-return channel and always leaves caller bounds unchanged. The selected
+//! zero-based leaf 4 additionally emits a bounded, deadline-bearing census of its
+//! ReLU pre-activation phases. That research telemetry is capped at 64 ranked
+//! coordinates and likewise has no certificate, solver, or bound-return channel.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use ndarray::{Array2, ArrayD, IxDyn};
-use ny_core::GemmEngine;
+use ndarray::{Array1, Array2, ArrayD, IxDyn};
+use ny_core::{
+    dd::{next_down_f64, next_up_f64},
+    GemmEngine,
+};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use crate::beta_crown::engine::graph::input_split::grouped_semantics::valid_disjunctive_layout;
@@ -98,6 +104,10 @@ struct PreparedExactPrefix {
 struct ExactPrefixUse {
     prefix: Arc<GraphNetwork>,
     anchor: Option<Arc<HashMap<String, BoundedTensor>>>,
+    /// Immutable root-valid support premise shared only within this exact
+    /// graph/input session. A failed build leaves the cell empty so a later
+    /// objective may retry with its own proposal bank.
+    shared_root_envelope: Arc<OnceLock<super::AyTailSharedInputReachabilityEnvelope>>,
 }
 
 /// Run-local exact identity for objective-independent prefix work.
@@ -110,6 +120,7 @@ struct ExactPrefixSession<'model> {
     source_graph: &'model GraphNetwork,
     root_input: &'model BoundedTensor,
     prepared: Option<PreparedExactPrefix>,
+    shared_root_envelope: Arc<OnceLock<super::AyTailSharedInputReachabilityEnvelope>>,
 }
 
 impl<'model> ExactPrefixSession<'model> {
@@ -118,6 +129,7 @@ impl<'model> ExactPrefixSession<'model> {
             source_graph,
             root_input,
             prepared: None,
+            shared_root_envelope: Arc::new(OnceLock::new()),
         }
     }
 
@@ -184,6 +196,7 @@ impl<'model> ExactPrefixSession<'model> {
             return Some(ExactPrefixUse {
                 prefix: Arc::clone(&prepared.prefix),
                 anchor: Some(Arc::clone(&prepared.anchor)),
+                shared_root_envelope: Arc::clone(&self.shared_root_envelope),
             });
         }
 
@@ -196,6 +209,7 @@ impl<'model> ExactPrefixSession<'model> {
         let prepared_use = ExactPrefixUse {
             prefix: Arc::clone(&prefix),
             anchor: anchor.as_ref().map(Arc::clone),
+            shared_root_envelope: Arc::clone(&self.shared_root_envelope),
         };
 
         // A returned map remains a sound enclosure after the build deadline, but
@@ -360,8 +374,61 @@ fn k2_support_directions(
 /// is even admitted.
 const SHARED_INPUT_BANK_BUILD_CAP: Duration = Duration::from_secs(30);
 const SHARED_INPUT_AY_PROOF_CAP: Duration = Duration::from_secs(45);
+/// Selector-only proof cap qualified by the sealed r3 fixed-tree replay.
+///
+/// The corrected 23-binary model closes clause 0 at its root relaxation in
+/// 56.008 seconds. Keeping the shared/affine lanes at 45 seconds while giving
+/// the explicit selector canary 65 seconds preserves a nine-second scheduling
+/// margin without widening any proof authority or outer IMB deadline.
+const REGION_SELECTOR_AY_PROOF_CAP: Duration = Duration::from_secs(65);
 const SHARED_INPUT_EVIDENCE_CANARY_ROWS: usize = 4;
+const SELECTOR_K2_EVIDENCE_CANARY_ROWS: usize = super::AY_TAIL_REGION_SELECTOR_K2_SUPPORTS;
 const SHARED_INPUT_EVIDENCE_REGION_COUNT: usize = 16;
+
+/// Explicit production canary for the selector-conditioned K4 input lift.
+///
+/// Gate: `NY_IMB_SELECTOR_K4_LIFT=1`, and only objective/clause index 1.
+/// Clause zero and every other value preserve the legacy selector envelope and
+/// Graph-MIP byte-for-byte.
+fn selector_k4_lift_enabled_for_objective(value: Option<&str>, obj_idx: usize) -> bool {
+    value == Some("1") && obj_idx == 1
+}
+
+/// Distinct default-off K2 canary. It deliberately does not reinterpret the
+/// established K4 gate or schema-v4 request identity.
+fn selector_k2_lift_enabled_for_objective(value: Option<&str>, obj_idx: usize) -> bool {
+    value == Some("1") && obj_idx == 1
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorInputLiftKind {
+    K2,
+    K4,
+}
+
+/// Resolve the two exact canary gates without precedence.
+///
+/// Simultaneous exact requests are a configuration error and fail closed even
+/// outside objective one; silently preferring either bank would make authority
+/// depend on an undocumented environment-variable ordering.
+fn selector_input_lift_kind(
+    k2_value: Option<&str>,
+    k4_value: Option<&str>,
+    obj_idx: usize,
+) -> Result<Option<SelectorInputLiftKind>, &'static str> {
+    let k2_requested = k2_value == Some("1");
+    let k4_requested = k4_value == Some("1");
+    if k2_requested && k4_requested {
+        return Err("conflicting-selector-k2-k4-lift-gates");
+    }
+    if selector_k2_lift_enabled_for_objective(k2_value, obj_idx) {
+        Ok(Some(SelectorInputLiftKind::K2))
+    } else if selector_k4_lift_enabled_for_objective(k4_value, obj_idx) {
+        Ok(Some(SelectorInputLiftKind::K4))
+    } else {
+        Ok(None)
+    }
+}
 
 fn checked_shared_input_bank_deadline(overall: Instant, now: Instant) -> Option<Instant> {
     (now < overall).then(|| {
@@ -377,32 +444,163 @@ fn checked_shared_input_proof_deadline(overall: Instant, now: Instant) -> Option
     })
 }
 
+fn checked_region_selector_proof_deadline(overall: Instant, now: Instant) -> Option<Instant> {
+    (now < overall).then(|| {
+        now.checked_add(REGION_SELECTOR_AY_PROOF_CAP)
+            .map_or(overall, |cap| cap.min(overall))
+    })
+}
+
+const SHARED_SUPPORT_MIN_RELATIVE_RESIDUAL2: f64 = 1.0e-10;
+
+#[derive(Clone, Debug, PartialEq)]
+enum SharedSupportBasisDecline {
+    EmptyProposals,
+    EmptyDirection,
+    UnsupportedRequestedRows {
+        requested_rows: usize,
+    },
+    TooFewProposals {
+        requested_rows: usize,
+        proposal_count: usize,
+    },
+    MalformedProposalWidth {
+        proposal_idx: usize,
+        expected_width: usize,
+        actual_width: usize,
+    },
+    NonFiniteProposal {
+        proposal_idx: usize,
+        value_idx: usize,
+    },
+    RankShortfall {
+        requested_rows: usize,
+        selected_indices: Vec<usize>,
+        max_remaining_relative_residual2: f64,
+        min_relative_residual2: f64,
+    },
+    DirectionSizeOverflow {
+        requested_rows: usize,
+        width: usize,
+    },
+    MalformedDirectionShape {
+        requested_rows: usize,
+        width: usize,
+    },
+}
+
+impl std::fmt::Display for SharedSupportBasisDecline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyProposals => formatter.write_str("support-basis-empty-proposals"),
+            Self::EmptyDirection => formatter.write_str("support-basis-empty-direction"),
+            Self::UnsupportedRequestedRows { requested_rows } => write!(
+                formatter,
+                "support-basis-unsupported-width requested_rows={requested_rows}"
+            ),
+            Self::TooFewProposals {
+                requested_rows,
+                proposal_count,
+            } => write!(
+                formatter,
+                "support-basis-too-few-proposals requested_rows={requested_rows} \
+                 proposal_count={proposal_count}"
+            ),
+            Self::MalformedProposalWidth {
+                proposal_idx,
+                expected_width,
+                actual_width,
+            } => write!(
+                formatter,
+                "support-basis-malformed-proposal proposal_idx={proposal_idx} \
+                 expected_width={expected_width} actual_width={actual_width}"
+            ),
+            Self::NonFiniteProposal {
+                proposal_idx,
+                value_idx,
+            } => write!(
+                formatter,
+                "support-basis-non-finite-proposal proposal_idx={proposal_idx} \
+                 value_idx={value_idx}"
+            ),
+            Self::RankShortfall {
+                requested_rows,
+                selected_indices,
+                max_remaining_relative_residual2,
+                min_relative_residual2,
+            } => write!(
+                formatter,
+                "support-basis-rank-shortfall requested_rows={requested_rows} \
+                 selected_indices={selected_indices:?} \
+                 max_remaining_relative_residual2={max_remaining_relative_residual2:.17e} \
+                 min_relative_residual2={min_relative_residual2:.17e}"
+            ),
+            Self::DirectionSizeOverflow {
+                requested_rows,
+                width,
+            } => write!(
+                formatter,
+                "support-basis-size-overflow requested_rows={requested_rows} width={width}"
+            ),
+            Self::MalformedDirectionShape {
+                requested_rows,
+                width,
+            } => write!(
+                formatter,
+                "support-basis-malformed-direction-shape requested_rows={requested_rows} \
+                 width={width}"
+            ),
+        }
+    }
+}
+
 /// Deterministically build one requested closed-width proposal basis.
 ///
 /// Modified Gram-Schmidt residual is the diversity score; ties use the lowest
 /// proposal index. A negated/collinear proposal has zero residual and cannot
 /// inflate the basis. The selected order is bound into every exact request
 /// token.
-fn shared_support_basis(
+fn shared_support_basis_diagnosed(
     proposals: &[RegionProposal],
     requested_rows: usize,
-) -> Option<(Array2<f32>, Vec<usize>)> {
-    let first = proposals.first()?;
+) -> Result<(Array2<f32>, Vec<usize>), SharedSupportBasisDecline> {
+    let first = proposals
+        .first()
+        .ok_or(SharedSupportBasisDecline::EmptyProposals)?;
     let width = first.p.len();
-    if width == 0
-        || !super::AY_TAIL_SHARED_INPUT_SUPPORT_ROWS.contains(&requested_rows)
-        || proposals.len() < requested_rows
-        || proposals
-            .iter()
-            .any(|proposal| proposal.p.len() != width || proposal.p.iter().any(|v| !v.is_finite()))
-    {
-        return None;
+    if width == 0 {
+        return Err(SharedSupportBasisDecline::EmptyDirection);
+    }
+    if !super::AY_TAIL_SHARED_INPUT_SUPPORT_ROWS.contains(&requested_rows) {
+        return Err(SharedSupportBasisDecline::UnsupportedRequestedRows { requested_rows });
+    }
+    if proposals.len() < requested_rows {
+        return Err(SharedSupportBasisDecline::TooFewProposals {
+            requested_rows,
+            proposal_count: proposals.len(),
+        });
+    }
+    for (proposal_idx, proposal) in proposals.iter().enumerate() {
+        if proposal.p.len() != width {
+            return Err(SharedSupportBasisDecline::MalformedProposalWidth {
+                proposal_idx,
+                expected_width: width,
+                actual_width: proposal.p.len(),
+            });
+        }
+        if let Some(value_idx) = proposal.p.iter().position(|value| !value.is_finite()) {
+            return Err(SharedSupportBasisDecline::NonFiniteProposal {
+                proposal_idx,
+                value_idx,
+            });
+        }
     }
 
     let mut selected = Vec::with_capacity(requested_rows);
     let mut basis: Vec<Vec<f64>> = Vec::with_capacity(requested_rows);
     while selected.len() < requested_rows {
         let mut best: Option<(usize, f64, Vec<f64>)> = None;
+        let mut max_remaining_relative_residual2 = 0.0_f64;
         for (idx, proposal) in proposals.iter().enumerate() {
             if selected.contains(&idx) {
                 continue;
@@ -427,7 +625,10 @@ fn shared_support_basis(
             }
             let residual_norm2 = residual.iter().map(|value| value * value).sum::<f64>();
             let score = residual_norm2 / original_norm2;
-            if !score.is_finite() || score <= 1.0e-10 {
+            if score.is_finite() {
+                max_remaining_relative_residual2 = max_remaining_relative_residual2.max(score);
+            }
+            if !score.is_finite() || score <= SHARED_SUPPORT_MIN_RELATIVE_RESIDUAL2 {
                 continue;
             }
             if best.as_ref().is_none_or(|(best_idx, best_score, _)| {
@@ -437,7 +638,12 @@ fn shared_support_basis(
             }
         }
         let Some((idx, _score, residual)) = best else {
-            break;
+            return Err(SharedSupportBasisDecline::RankShortfall {
+                requested_rows,
+                selected_indices: selected,
+                max_remaining_relative_residual2,
+                min_relative_residual2: SHARED_SUPPORT_MIN_RELATIVE_RESIDUAL2,
+            });
         };
         let norm2 = residual.iter().map(|value| value * value).sum::<f64>();
         let inverse_norm = norm2.sqrt().recip();
@@ -450,15 +656,31 @@ fn shared_support_basis(
         selected.push(idx);
     }
 
-    if selected.len() != requested_rows {
-        return None;
-    }
-    let mut values = Vec::with_capacity(requested_rows.checked_mul(width)?);
+    let value_count = requested_rows.checked_mul(width).ok_or(
+        SharedSupportBasisDecline::DirectionSizeOverflow {
+            requested_rows,
+            width,
+        },
+    )?;
+    let mut values = Vec::with_capacity(value_count);
     for &idx in &selected {
-        values.extend_from_slice(&proposals.get(idx)?.p);
+        values.extend_from_slice(&proposals[idx].p);
     }
-    let directions = Array2::from_shape_vec((requested_rows, width), values).ok()?;
-    Some((directions, selected))
+    let directions = Array2::from_shape_vec((requested_rows, width), values).map_err(|_| {
+        SharedSupportBasisDecline::MalformedDirectionShape {
+            requested_rows,
+            width,
+        }
+    })?;
+    Ok((directions, selected))
+}
+
+#[cfg(test)]
+fn shared_support_basis(
+    proposals: &[RegionProposal],
+    requested_rows: usize,
+) -> Option<(Array2<f32>, Vec<usize>)> {
+    shared_support_basis_diagnosed(proposals, requested_rows).ok()
 }
 
 /// Dark larger-basis policy exercised by unit tests but not yet production
@@ -472,12 +694,124 @@ fn shared_support_bases(proposals: &[RegionProposal]) -> Vec<(Array2<f32>, Vec<u
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedInputEnvelopeDeadlineStage {
+    BeforeBuild,
+    AfterBasis,
+    DuringCrown,
+    AfterCrown,
+    AfterLinearFold,
+    AfterEnvelope,
+}
+
+impl std::fmt::Display for SharedInputEnvelopeDeadlineStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BeforeBuild => "before-build",
+            Self::AfterBasis => "after-basis",
+            Self::DuringCrown => "during-crown",
+            Self::AfterCrown => "after-crown",
+            Self::AfterLinearFold => "after-linear-fold",
+            Self::AfterEnvelope => "after-envelope",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SharedInputEnvelopeDecline {
+    RootHasL2Constraint,
+    RegionCount {
+        expected: usize,
+        actual: usize,
+    },
+    ProposalCount {
+        region_count: usize,
+        proposal_count: usize,
+    },
+    Deadline(SharedInputEnvelopeDeadlineStage),
+    SupportBasis(SharedSupportBasisDecline),
+    CrownError,
+    MissingLinear,
+    MalformedBoundsShape {
+        expected_values: usize,
+        actual_values: usize,
+    },
+    NonFiniteBounds,
+    MalformedRootStorage {
+        input_values: usize,
+    },
+    ResidualCoefficientError,
+    MalformedLinearShape {
+        expected_outputs: usize,
+        actual_outputs: usize,
+        expected_inputs: usize,
+        actual_inputs: usize,
+    },
+    EnvelopeRejected,
+}
+
+impl std::fmt::Display for SharedInputEnvelopeDecline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RootHasL2Constraint => formatter.write_str("root-has-l2-constraint"),
+            Self::RegionCount { expected, actual } => write!(
+                formatter,
+                "malformed-region-count expected={expected} actual={actual}"
+            ),
+            Self::ProposalCount {
+                region_count,
+                proposal_count,
+            } => write!(
+                formatter,
+                "malformed-proposal-count regions={region_count} proposals={proposal_count}"
+            ),
+            Self::Deadline(stage) => write!(formatter, "deadline stage={stage}"),
+            Self::SupportBasis(reason) => write!(formatter, "{reason}"),
+            Self::CrownError => formatter.write_str("crown-err"),
+            Self::MissingLinear => formatter.write_str("missing-linear"),
+            Self::MalformedBoundsShape {
+                expected_values,
+                actual_values,
+            } => write!(
+                formatter,
+                "malformed-bounds-shape expected_values={expected_values} \
+                 actual_values={actual_values}"
+            ),
+            Self::NonFiniteBounds => formatter.write_str("non-finite-bounds"),
+            Self::MalformedRootStorage { input_values } => write!(
+                formatter,
+                "malformed-root-storage input_values={input_values}"
+            ),
+            Self::ResidualCoefficientError => formatter.write_str("residual-coefficient-error"),
+            Self::MalformedLinearShape {
+                expected_outputs,
+                actual_outputs,
+                expected_inputs,
+                actual_inputs,
+            } => write!(
+                formatter,
+                "malformed-linear-shape expected_outputs={expected_outputs} \
+                 actual_outputs={actual_outputs} expected_inputs={expected_inputs} \
+                 actual_inputs={actual_inputs}"
+            ),
+            Self::EnvelopeRejected => formatter.write_str("envelope-rejection"),
+        }
+    }
+}
+
+fn shared_input_envelope_crown_error(error: &ny_core::NyError) -> SharedInputEnvelopeDecline {
+    if matches!(error, ny_core::NyError::DeadlineExceeded(_)) {
+        SharedInputEnvelopeDecline::Deadline(SharedInputEnvelopeDeadlineStage::DuringCrown)
+    } else {
+        SharedInputEnvelopeDecline::CrownError
+    }
+}
+
 /// Derive one root-valid support bank for one global exact tail proof.
 ///
-/// The r5 evidence admits K4 as the production canary. K8/K16 remain closed
-/// type/encoder capabilities but are deliberately dark until a measured build
-/// proves they fit this same immutable slice. This prevents an oversized first
-/// attempt from starving the evidence-backed K4 construction. CROWN coefficient
+/// The shared route remains fixed at K4. The selector route may explicitly ask
+/// for the distinct default-off K2 or K4 canary; K8/K16 remain closed
+/// type/encoder capabilities but are deliberately dark. CROWN coefficient
 /// errors are widened over the exact root box, never a narrower region.
 #[allow(clippy::too_many_arguments)]
 fn prefix_shared_input_reachability_envelope(
@@ -485,25 +819,69 @@ fn prefix_shared_input_reachability_envelope(
     root: &BoundedTensor,
     regions: &[BoundedTensor],
     proposals: &[RegionProposal],
+    support_rows: usize,
     shared_root_anchor: &HashMap<String, BoundedTensor>,
     engine: Option<&dyn GemmEngine>,
     overall_deadline: Instant,
 ) -> Option<super::AyTailSharedInputReachabilityEnvelope> {
-    if root.has_l2_constraint()
-        || regions.len() != SHARED_INPUT_EVIDENCE_REGION_COUNT
-        || regions.len() != proposals.len()
-    {
-        return None;
+    match prefix_shared_input_reachability_envelope_diagnosed(
+        prefix,
+        root,
+        regions,
+        proposals,
+        support_rows,
+        shared_root_anchor,
+        engine,
+        overall_deadline,
+    ) {
+        Ok(envelope) => Some(envelope),
+        Err(reason) => {
+            eprintln!("[imb] AY-TAIL-CERT shared root bank declined: {reason}");
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefix_shared_input_reachability_envelope_diagnosed(
+    prefix: &GraphNetwork,
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    proposals: &[RegionProposal],
+    support_rows: usize,
+    shared_root_anchor: &HashMap<String, BoundedTensor>,
+    engine: Option<&dyn GemmEngine>,
+    overall_deadline: Instant,
+) -> Result<super::AyTailSharedInputReachabilityEnvelope, SharedInputEnvelopeDecline> {
+    if root.has_l2_constraint() {
+        return Err(SharedInputEnvelopeDecline::RootHasL2Constraint);
+    }
+    if regions.len() != SHARED_INPUT_EVIDENCE_REGION_COUNT {
+        return Err(SharedInputEnvelopeDecline::RegionCount {
+            expected: SHARED_INPUT_EVIDENCE_REGION_COUNT,
+            actual: regions.len(),
+        });
+    }
+    if regions.len() != proposals.len() {
+        return Err(SharedInputEnvelopeDecline::ProposalCount {
+            region_count: regions.len(),
+            proposal_count: proposals.len(),
+        });
     }
     let build_started = Instant::now();
-    let build_deadline = checked_shared_input_bank_deadline(overall_deadline, build_started)?;
-    let (directions, support_indices) =
-        shared_support_basis(proposals, SHARED_INPUT_EVIDENCE_CANARY_ROWS)?;
+    let build_deadline = checked_shared_input_bank_deadline(overall_deadline, build_started)
+        .ok_or(SharedInputEnvelopeDecline::Deadline(
+            SharedInputEnvelopeDeadlineStage::BeforeBuild,
+        ))?;
+    let (directions, support_indices) = shared_support_basis_diagnosed(proposals, support_rows)
+        .map_err(SharedInputEnvelopeDecline::SupportBasis)?;
     if Instant::now() >= build_deadline {
-        return None;
+        return Err(SharedInputEnvelopeDecline::Deadline(
+            SharedInputEnvelopeDeadlineStage::AfterBasis,
+        ));
     }
     let rows = directions.nrows();
-    let (bounds, Some(mut linear)) = prefix
+    let (bounds, linear) = prefix
         .propagate_crown_with_specs_and_node_bounds_and_linear_and_deadline(
             root,
             &directions,
@@ -511,32 +889,53 @@ fn prefix_shared_input_reachability_envelope(
             shared_root_anchor,
             Some(build_deadline),
         )
-        .ok()?
-    else {
-        return None;
+        .map_err(|error| shared_input_envelope_crown_error(&error))?;
+    let Some(mut linear) = linear else {
+        return Err(SharedInputEnvelopeDecline::MissingLinear);
     };
-    if Instant::now() >= build_deadline
-        || bounds.flatten().len() != rows
-        || bounds
-            .lower()
-            .iter()
-            .chain(bounds.upper())
-            .any(|value| !value.is_finite())
+    if Instant::now() >= build_deadline {
+        return Err(SharedInputEnvelopeDecline::Deadline(
+            SharedInputEnvelopeDeadlineStage::AfterCrown,
+        ));
+    }
+    let actual_bound_values = bounds.flatten().len();
+    if actual_bound_values != rows {
+        return Err(SharedInputEnvelopeDecline::MalformedBoundsShape {
+            expected_values: rows,
+            actual_values: actual_bound_values,
+        });
+    }
+    if bounds
+        .lower()
+        .iter()
+        .chain(bounds.upper())
+        .any(|value| !value.is_finite())
     {
-        return None;
+        return Err(SharedInputEnvelopeDecline::NonFiniteBounds);
     }
     let flat_root = root.flatten();
     let (Some(lower), Some(upper)) = (flat_root.lower().as_slice(), flat_root.upper().as_slice())
     else {
-        return None;
+        return Err(SharedInputEnvelopeDecline::MalformedRootStorage {
+            input_values: flat_root.len(),
+        });
     };
     linear.fold_coeff_err_into_bias(lower, upper);
-    if linear.has_coeff_err()
-        || linear.num_outputs() != rows
-        || linear.num_inputs() != flat_root.len()
-        || Instant::now() >= build_deadline
-    {
-        return None;
+    if linear.has_coeff_err() {
+        return Err(SharedInputEnvelopeDecline::ResidualCoefficientError);
+    }
+    if linear.num_outputs() != rows || linear.num_inputs() != flat_root.len() {
+        return Err(SharedInputEnvelopeDecline::MalformedLinearShape {
+            expected_outputs: rows,
+            actual_outputs: linear.num_outputs(),
+            expected_inputs: flat_root.len(),
+            actual_inputs: linear.num_inputs(),
+        });
+    }
+    if Instant::now() >= build_deadline {
+        return Err(SharedInputEnvelopeDecline::Deadline(
+            SharedInputEnvelopeDeadlineStage::AfterLinearFold,
+        ));
     }
     let (lower_a, lower_b, upper_a, upper_b) = linear.into_parts();
     let envelope = super::AyTailSharedInputReachabilityEnvelope::from_prefix_crown(
@@ -549,9 +948,12 @@ fn prefix_shared_input_reachability_envelope(
         lower_b,
         upper_a,
         upper_b,
-    )?;
+    )
+    .ok_or(SharedInputEnvelopeDecline::EnvelopeRejected)?;
     if Instant::now() >= build_deadline {
-        return None;
+        return Err(SharedInputEnvelopeDecline::Deadline(
+            SharedInputEnvelopeDeadlineStage::AfterEnvelope,
+        ));
     }
     eprintln!(
         "[imb] AY-TAIL-CERT shared root bank accepted: supports={} latent={} \
@@ -562,7 +964,144 @@ fn prefix_shared_input_reachability_envelope(
         envelope.bank_bytes(),
         build_started.elapsed().as_secs_f64(),
     );
-    Some(envelope)
+    Ok(envelope)
+}
+
+/// Revalidate every context fact that makes a run-local shared bank reusable.
+///
+/// The cache itself is owned by [`ExactPrefixSession`], which binds it to one
+/// graph allocation and one root-input allocation. These value checks add a
+/// fail-closed defense at the consumption site: the bank must still name the
+/// exact seam, cover the exact current root (not a subregion), retain the
+/// evidence-qualified K4 shape, and retain four distinct, in-range region
+/// positions from the objective that originated the bank.
+fn validate_cached_shared_root_envelope_context(
+    envelope: &super::AyTailSharedInputReachabilityEnvelope,
+    expected_seam: &str,
+    root: &BoundedTensor,
+    seam_dim: usize,
+    region_count: usize,
+) -> Result<(), &'static str> {
+    if expected_seam.is_empty() || envelope.seam_node() != expected_seam {
+        return Err("seam-identity-mismatch");
+    }
+    if root.has_l2_constraint() {
+        return Err("root-has-l2-constraint");
+    }
+    if region_count != SHARED_INPUT_EVIDENCE_REGION_COUNT {
+        return Err("region-count-mismatch");
+    }
+    if !same_bounded_tensor_bits(root, envelope.certified_root_input()) {
+        return Err("certified-root-mismatch");
+    }
+    if !same_bounded_tensor_bits(root, envelope.region_input()) {
+        return Err("bank-is-not-global-root");
+    }
+    if seam_dim == 0 || envelope.directions().ncols() != seam_dim {
+        return Err("seam-width-mismatch");
+    }
+    if envelope.directions().nrows() != SHARED_INPUT_EVIDENCE_CANARY_ROWS
+        || envelope.support_indices().len() != SHARED_INPUT_EVIDENCE_CANARY_ROWS
+    {
+        return Err("bank-is-not-production-k4");
+    }
+    if envelope
+        .support_indices()
+        .iter()
+        .enumerate()
+        .any(|(index, &support_idx)| {
+            support_idx >= region_count
+                || envelope.support_indices()[..index].contains(&support_idx)
+        })
+    {
+        return Err("support-indices-invalid");
+    }
+    if envelope.bank_bytes() > super::AY_TAIL_SHARED_INPUT_MAX_BANK_BYTES {
+        return Err("bank-payload-over-cap");
+    }
+    Ok(())
+}
+
+/// Read or populate the exact prefix session's immutable shared-root bank.
+///
+/// A failed builder or a context-invalid product never initializes the
+/// [`OnceLock`], so a later objective may retry. A populated but context-invalid
+/// cell is an invariant violation and fails closed without invoking a substitute
+/// builder. The only possible concurrent setter is another user of this exact
+/// session; its winning value is independently revalidated before consumption.
+fn shared_root_envelope_from_session_cache<Build>(
+    cache: &OnceLock<super::AyTailSharedInputReachabilityEnvelope>,
+    expected_seam: &str,
+    root: &BoundedTensor,
+    seam_dim: usize,
+    region_count: usize,
+    build: Build,
+) -> Option<super::AyTailSharedInputReachabilityEnvelope>
+where
+    Build: FnOnce() -> Option<super::AyTailSharedInputReachabilityEnvelope>,
+{
+    if let Some(envelope) = cache.get() {
+        if let Err(reason) = validate_cached_shared_root_envelope_context(
+            envelope,
+            expected_seam,
+            root,
+            seam_dim,
+            region_count,
+        ) {
+            eprintln!(
+                "[imb] AY-TAIL-CERT shared root bank cache rejected: {reason}; \
+                 retaining full-network replay authority"
+            );
+            return None;
+        }
+        eprintln!(
+            "[imb] AY-TAIL-CERT shared root bank RUN-LOCAL HIT: supports={} \
+             latent={} regions={} payload={}B",
+            envelope.directions().nrows(),
+            envelope.region_input().flatten().len(),
+            region_count,
+            envelope.bank_bytes(),
+        );
+        return Some(envelope.clone());
+    }
+
+    let envelope = build()?;
+    if let Err(reason) = validate_cached_shared_root_envelope_context(
+        &envelope,
+        expected_seam,
+        root,
+        seam_dim,
+        region_count,
+    ) {
+        eprintln!(
+            "[imb] AY-TAIL-CERT shared root bank build rejected before cache: {reason}; \
+             retaining full-network replay authority"
+        );
+        return None;
+    }
+
+    if cache.set(envelope.clone()).is_ok() {
+        eprintln!("[imb] AY-TAIL-CERT shared root bank stored in exact prefix session");
+        return Some(envelope);
+    }
+
+    // Defensive race handling: consume only the value that actually won the
+    // immutable session cell, and only after repeating every context check.
+    let winner = cache.get()?;
+    if let Err(reason) = validate_cached_shared_root_envelope_context(
+        winner,
+        expected_seam,
+        root,
+        seam_dim,
+        region_count,
+    ) {
+        eprintln!(
+            "[imb] AY-TAIL-CERT shared root bank cache race rejected: {reason}; \
+             retaining full-network replay authority"
+        );
+        return None;
+    }
+    Some(winner.clone())
 }
 
 /// Derive the K=2 input-relational support envelope in one batched prefix
@@ -1018,6 +1557,73 @@ struct ReplayStageTimings {
     standard: Option<Duration>,
 }
 
+/// GEMM source selected for the verdict-authoritative batched replay.
+///
+/// The explicit caller retains precedence and its complete capability surface.
+/// A process-global fast-f32 engine is admitted only through
+/// [`RegisteredFastF32ReplayEngine`], which exposes the registry's promised
+/// IEEE RN-f32 GEMM capability without implicitly enabling unrelated optional
+/// GPU/f64 surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayAuthorityEngineRoute {
+    Caller,
+    RegisteredFastF32,
+    CpuFallback,
+}
+
+impl ReplayAuthorityEngineRoute {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Caller => "caller",
+            Self::RegisteredFastF32 => "registered_fast_f32",
+            Self::CpuFallback => "cpu_fallback",
+        }
+    }
+}
+
+/// Use the historical CPU route only when no registered engine was available.
+///
+/// An evaluator failure after selecting a registered engine must remain a
+/// failure instead of spending the remaining authority deadline on a second
+/// CPU evaluation.
+enum RegisteredReplayAttempt<T> {
+    Unavailable,
+    Evaluated(Option<T>),
+}
+
+fn registered_replay_or_cpu_fallback<T>(
+    registered_attempt: RegisteredReplayAttempt<T>,
+    cpu_fallback: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    match registered_attempt {
+        RegisteredReplayAttempt::Unavailable => cpu_fallback(),
+        RegisteredReplayAttempt::Evaluated(result) => result,
+    }
+}
+
+/// Capability-confined view of the process-global fast-f32 accelerator.
+///
+/// [`crate::fast_f32_gemm`] certifies only `gemm_f32`: it does not promise
+/// anything about a registered engine's optional f64, fused-convolution, IBP,
+/// or GPU-CROWN methods. Passing the raw trait object into a verifier would
+/// widen that contract and could bypass those capabilities' independent gates.
+/// This adapter deliberately implements only the required RN-f32 GEMM method;
+/// every other [`GemmEngine`] method keeps its conservative trait default.
+struct RegisteredFastF32ReplayEngine<'a>(&'a dyn GemmEngine);
+
+impl GemmEngine for RegisteredFastF32ReplayEngine<'_> {
+    fn gemm_f32(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+    ) -> ny_core::Result<Vec<f32>> {
+        self.0.gemm_f32(m, k, n, a, b)
+    }
+}
+
 #[derive(Clone)]
 struct FlatPartitionBox {
     lower: Vec<f32>,
@@ -1226,7 +1832,7 @@ fn validate_partition_subtree(
     Err("terminal boxes are not an exact binary split cover")
 }
 
-fn validate_binary_partition_cover(
+pub(super) fn validate_binary_partition_cover(
     root: &BoundedTensor,
     terminal_boxes: &[BoundedTensor],
     deadline: Instant,
@@ -1622,15 +2228,18 @@ where
 
 /// Prove the global original tail objective once under one root-input bank.
 ///
-/// The R-region grid remains exact-checked proposal provenance: its complete
-/// cover is checked, and every request-bit-bound support index must name one of
-/// those proposals. It is not expanded into R exact tail models. The one
-/// envelope instead uses `region_input == certified_root_input == root`, so one
-/// exact Graph-MIP/AY call proves the global objective directly. Because every
-/// would-be regional model uses this identical root-certified bank and the
-/// regions exactly cover root, their feasible-set union is precisely this one
-/// root-input model. The entire callback, including encoding, shares one
-/// immutable 45-second slice.
+/// The R-region grid remains exact-checked cover provenance: its complete cover
+/// is checked, and every request-bit-bound support index names a deterministic
+/// region position from the objective that originated the bank. A root-certified
+/// bank may be reused by later objectives in the same exact prefix session:
+/// every stored inequality is a universal prefix fact about `y = h(x)`, not an
+/// objective-specific premise. It is not expanded into R exact tail models. The
+/// one envelope instead uses `region_input == certified_root_input == root`, so
+/// one exact Graph-MIP/AY call proves the current global objective directly.
+/// Because every would-be regional model uses this identical root-certified bank
+/// and the current regions exactly cover root, their feasible-set union is
+/// precisely this one root-input model. The entire callback, including encoding,
+/// shares one immutable 45-second slice.
 fn certify_ay_shared_input_root_with<F>(
     root: &BoundedTensor,
     regions: &[BoundedTensor],
@@ -1670,6 +2279,413 @@ where
     }
 
     let proof_deadline = checked_shared_input_proof_deadline(overall_deadline, Instant::now())?;
+    let certified_lower = certify_original(envelope, requested_lower, proof_deadline)?;
+    if certified_lower.to_bits() != requested_lower.to_bits()
+        || !replay_deadline_open(proof_deadline)
+    {
+        return None;
+    }
+    (certified_lower.is_finite() && certified_lower > threshold).then_some(certified_lower)
+}
+
+/// Validate the complete prefix provenance needed by the synthetic-selector
+/// envelope before any envelope allocation or exact solver admission.
+///
+/// Every `p_r · h(x) >= L_r` premise comes from its own prefix BaB frontier.
+/// The outer 16 boxes must exactly cover root, and every inner frontier must
+/// exactly cover its corresponding outer box. Thus every root execution has at
+/// least one region whose canonical selector assignment makes the associated
+/// gated row valid.
+fn preflight_ay_region_selector_frontiers(
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    proposals: &[RegionProposal],
+    seam_dim: usize,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    if !replay_deadline_open(deadline) {
+        return Err("selector preflight deadline expired");
+    }
+    if root.has_l2_constraint() {
+        return Err("selector root has L2 constraint");
+    }
+    if regions.len() != super::AY_TAIL_REGION_SELECTOR_REGIONS {
+        return Err("selector requires exactly 16 regions");
+    }
+    if proposals.len() != regions.len() {
+        return Err("selector proposal count mismatch");
+    }
+    if seam_dim == 0 {
+        return Err("selector seam is empty");
+    }
+    validate_binary_partition_cover(root, regions, deadline)?;
+
+    let mut total_leaves = 0usize;
+    for (region, proposal) in regions.iter().zip(proposals) {
+        if !replay_deadline_open(deadline)
+            || region.has_l2_constraint()
+            || proposal.p.len() != seam_dim
+            || proposal.p.iter().any(|value| !value.is_finite())
+            || !proposal.prefix_floor.is_finite()
+            || proposal
+                .terminal_boxes
+                .iter()
+                .any(BoundedTensor::has_l2_constraint)
+        {
+            return Err("selector regional prefix premise is malformed");
+        }
+        total_leaves = total_leaves
+            .checked_add(proposal.terminal_boxes.len())
+            .ok_or("selector frontier leaf count overflow")?;
+        if total_leaves > MAX_AY_REGION_TOTAL_LEAVES {
+            return Err("selector frontier exceeds exact-lane leaf cap");
+        }
+        validate_binary_partition_cover(region, &proposal.terminal_boxes, deadline)?;
+    }
+    replay_deadline_open(deadline)
+        .then_some(())
+        .ok_or("selector preflight deadline expired")
+}
+
+/// Check the exact sealed 2^4 Cartesian topology before spending a K4 CROWN
+/// backward. Region indices are mixed-radix/little-endian: selector bit `j`
+/// chooses the half of original-input dimension `[0,1,2,4][j]`.
+fn preflight_selector_k4_grid(
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+) -> Result<(), &'static str> {
+    if root.has_l2_constraint()
+        || root.flatten().len() != super::AY_TAIL_REGION_SELECTOR_K4_INPUTS
+        || regions.len() != super::AY_TAIL_REGION_SELECTOR_REGIONS
+    {
+        return Err("selector K4 requires one plain five-input 16-region grid");
+    }
+    let flat_root = root.flatten();
+    let (Some(root_lower), Some(root_upper)) =
+        (flat_root.lower().as_slice(), flat_root.upper().as_slice())
+    else {
+        return Err("selector K4 root storage is not contiguous");
+    };
+    let mut is_split = [false; super::AY_TAIL_REGION_SELECTOR_K4_INPUTS];
+    let mut boundaries = [0.0_f32; super::AY_TAIL_REGION_SELECTOR_BITS];
+    for (bit_index, &dim) in super::AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS
+        .iter()
+        .enumerate()
+    {
+        if dim >= root_lower.len() || is_split[dim] {
+            return Err("selector K4 split dimensions are malformed");
+        }
+        is_split[dim] = true;
+        let region_zero = regions[0].flatten();
+        let boundary = *region_zero
+            .upper()
+            .get(dim)
+            .ok_or("selector K4 boundary is missing")?;
+        if !(root_lower[dim].is_finite()
+            && root_upper[dim].is_finite()
+            && boundary.is_finite()
+            && root_lower[dim] < boundary
+            && boundary < root_upper[dim])
+        {
+            return Err("selector K4 split boundary is not strictly interior");
+        }
+        boundaries[bit_index] = boundary;
+    }
+    for (region_index, region) in regions.iter().enumerate() {
+        if region.has_l2_constraint() || region.shape() != root.shape() {
+            return Err("selector K4 region shape is malformed");
+        }
+        let flat = region.flatten();
+        let (Some(lower), Some(upper)) = (flat.lower().as_slice(), flat.upper().as_slice()) else {
+            return Err("selector K4 region storage is not contiguous");
+        };
+        for dim in 0..root_lower.len() {
+            let expected = super::AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS
+                .iter()
+                .position(|&split_dim| split_dim == dim)
+                .map_or((root_lower[dim], root_upper[dim]), |bit_index| {
+                    if ((region_index >> bit_index) & 1) == 0 {
+                        (root_lower[dim], boundaries[bit_index])
+                    } else {
+                        (boundaries[bit_index], root_upper[dim])
+                    }
+                });
+            if lower[dim].to_bits() != expected.0.to_bits()
+                || upper[dim].to_bits() != expected.1.to_bits()
+            {
+                return Err("selector K4 regions do not match canonical little-endian cells");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the immutable selector envelope only after every regional prefix
+/// frontier and both levels of exact cover have passed preflight.
+fn ay_region_selector_envelope_from_frontiers(
+    seam_node: &str,
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    root_seam_box: &BoundedTensor,
+    root_tail_anchors: &[super::AyTailRootAnchor],
+    regional_relu_bounds: &[super::AyTailRegionReluBounds],
+    proposals: &[RegionProposal],
+    deadline: Instant,
+) -> Option<super::AyTailRegionSelectorEnvelope> {
+    ay_region_selector_envelope_from_frontiers_with_input_lift(
+        seam_node,
+        root,
+        regions,
+        root_seam_box,
+        root_tail_anchors,
+        regional_relu_bounds,
+        proposals,
+        None,
+        deadline,
+    )
+}
+
+enum SelectorInputLift {
+    K2(super::AyTailSharedInputReachabilityEnvelope),
+    K4(super::AyTailSharedInputReachabilityEnvelope),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ay_region_selector_envelope_from_frontiers_with_k2_lift(
+    seam_node: &str,
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    root_seam_box: &BoundedTensor,
+    root_tail_anchors: &[super::AyTailRootAnchor],
+    regional_relu_bounds: &[super::AyTailRegionReluBounds],
+    proposals: &[RegionProposal],
+    selector_k2_lift: super::AyTailSharedInputReachabilityEnvelope,
+    deadline: Instant,
+) -> Option<super::AyTailRegionSelectorEnvelope> {
+    ay_region_selector_envelope_from_frontiers_with_input_lift(
+        seam_node,
+        root,
+        regions,
+        root_seam_box,
+        root_tail_anchors,
+        regional_relu_bounds,
+        proposals,
+        Some(SelectorInputLift::K2(selector_k2_lift)),
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ay_region_selector_envelope_from_frontiers_with_k4_lift(
+    seam_node: &str,
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    root_seam_box: &BoundedTensor,
+    root_tail_anchors: &[super::AyTailRootAnchor],
+    regional_relu_bounds: &[super::AyTailRegionReluBounds],
+    proposals: &[RegionProposal],
+    selector_k4_lift: super::AyTailSharedInputReachabilityEnvelope,
+    deadline: Instant,
+) -> Option<super::AyTailRegionSelectorEnvelope> {
+    ay_region_selector_envelope_from_frontiers_with_input_lift(
+        seam_node,
+        root,
+        regions,
+        root_seam_box,
+        root_tail_anchors,
+        regional_relu_bounds,
+        proposals,
+        Some(SelectorInputLift::K4(selector_k4_lift)),
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ay_region_selector_envelope_from_frontiers_with_input_lift(
+    seam_node: &str,
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    root_seam_box: &BoundedTensor,
+    root_tail_anchors: &[super::AyTailRootAnchor],
+    regional_relu_bounds: &[super::AyTailRegionReluBounds],
+    proposals: &[RegionProposal],
+    selector_input_lift: Option<SelectorInputLift>,
+    deadline: Instant,
+) -> Option<super::AyTailRegionSelectorEnvelope> {
+    let seam_dim = root_seam_box.flatten().len();
+    if let Err(reason) =
+        preflight_ay_region_selector_frontiers(root, regions, proposals, seam_dim, deadline)
+    {
+        eprintln!("[imb] AY-TAIL-CERT selector prefix preflight rejected: {reason}");
+        return None;
+    }
+    let direction_values = proposals
+        .iter()
+        .flat_map(|proposal| proposal.p.iter().copied())
+        .collect();
+    let directions = Array2::from_shape_vec(
+        (super::AY_TAIL_REGION_SELECTOR_REGIONS, seam_dim),
+        direction_values,
+    )
+    .ok()?;
+    let prefix_floors = Array1::from_vec(
+        proposals
+            .iter()
+            .map(|proposal| proposal.prefix_floor)
+            .collect(),
+    );
+    match selector_input_lift {
+        Some(SelectorInputLift::K2(lift)) => {
+            super::AyTailRegionSelectorEnvelope::from_certified_prefix_frontiers_with_selector_k2_lift(
+                seam_node.to_string(),
+                root.clone(),
+                regions.to_vec(),
+                root_seam_box.clone(),
+                root_tail_anchors.to_vec(),
+                regional_relu_bounds.to_vec(),
+                lift,
+                directions,
+                prefix_floors,
+            )
+        }
+        Some(SelectorInputLift::K4(lift)) => {
+            super::AyTailRegionSelectorEnvelope::from_certified_prefix_frontiers_with_selector_k4_lift(
+                seam_node.to_string(),
+                root.clone(),
+                regions.to_vec(),
+                root_seam_box.clone(),
+                root_tail_anchors.to_vec(),
+                regional_relu_bounds.to_vec(),
+                lift,
+                directions,
+                prefix_floors,
+            )
+        }
+        None => super::AyTailRegionSelectorEnvelope::from_certified_prefix_frontiers(
+            seam_node.to_string(),
+            root.clone(),
+            regions.to_vec(),
+            root_seam_box.clone(),
+            root_tail_anchors.to_vec(),
+            regional_relu_bounds.to_vec(),
+            directions,
+            prefix_floors,
+        ),
+    }
+}
+
+/// Prove the global original tail objective once under the 16 canonical gated
+/// prefix rows.
+///
+/// This repeats the prefix-cover preflight at the authority seam, checks that
+/// the opaque envelope still corresponds bit-for-bit to the regional
+/// proposals, and then admits exactly one callback under an immutable
+/// selector-specific 65-second exact-proof slice.
+#[allow(clippy::too_many_arguments)]
+fn certify_ay_region_selector_root_with<F>(
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    proposals: &[RegionProposal],
+    expected_seam: &str,
+    expected_root_tail_anchors: &[super::AyTailRootAnchor],
+    expected_regional_relu_bounds: &[super::AyTailRegionReluBounds],
+    envelope: &super::AyTailRegionSelectorEnvelope,
+    threshold: f32,
+    overall_deadline: Instant,
+    certify_original: F,
+) -> Option<f32>
+where
+    F: FnOnce(&super::AyTailRegionSelectorEnvelope, f32, Instant) -> Option<f32>,
+{
+    let requested_lower = next_up_f32(threshold);
+    let seam_dim = envelope.root_seam_box().flatten().len();
+    if !replay_deadline_open(overall_deadline)
+        || !threshold.is_finite()
+        || !requested_lower.is_finite()
+        || requested_lower <= threshold
+        || expected_seam.is_empty()
+        || envelope.seam_node() != expected_seam
+        || !same_bounded_tensor_bits(root, envelope.certified_root_input())
+        || expected_root_tail_anchors.is_empty()
+        || envelope.root_tail_anchors().len() != expected_root_tail_anchors.len()
+        || envelope
+            .root_tail_anchors()
+            .iter()
+            .zip(expected_root_tail_anchors)
+            .any(|(stored, expected)| {
+                stored.node_name() != expected.node_name()
+                    || !same_bounded_tensor_bits(stored.bounds(), expected.bounds())
+            })
+        || expected_regional_relu_bounds.is_empty()
+        || envelope.regional_relu_bounds().len() != expected_regional_relu_bounds.len()
+        || envelope
+            .regional_relu_bounds()
+            .iter()
+            .zip(expected_regional_relu_bounds)
+            .any(|(stored, expected)| {
+                stored.region_index() != expected.region_index()
+                    || stored.node_name() != expected.node_name()
+                    || !same_bounded_tensor_bits(stored.bounds(), expected.bounds())
+            })
+        || envelope.region_inputs().len() != regions.len()
+        || envelope
+            .region_inputs()
+            .iter()
+            .zip(regions)
+            .any(|(stored, current)| !same_bounded_tensor_bits(stored, current))
+        || envelope.directions().shape() != [super::AY_TAIL_REGION_SELECTOR_REGIONS, seam_dim]
+        || envelope.prefix_floors().len() != super::AY_TAIL_REGION_SELECTOR_REGIONS
+        || envelope.selector_coefficients().shape()
+            != [
+                super::AY_TAIL_REGION_SELECTOR_REGIONS,
+                super::AY_TAIL_REGION_SELECTOR_BITS,
+            ]
+        || envelope.row_lowers().len() != super::AY_TAIL_REGION_SELECTOR_REGIONS
+        || (envelope.selector_k2_lift().is_some() && envelope.selector_k4_lift().is_some())
+        || envelope.selector_k2_lift().is_some_and(|lift| {
+            !super::checked_region_selector_k2_lift_context(
+                envelope.seam_node(),
+                root,
+                seam_dim,
+                lift,
+            )
+        })
+        || envelope.selector_k4_lift().is_some_and(|lift| {
+            !super::checked_region_selector_k4_lift_context(
+                envelope.seam_node(),
+                root,
+                seam_dim,
+                lift,
+            )
+        })
+    {
+        return None;
+    }
+    if let Err(reason) =
+        preflight_ay_region_selector_frontiers(root, regions, proposals, seam_dim, overall_deadline)
+    {
+        eprintln!("[imb] AY-TAIL-CERT selector authority preflight rejected: {reason}");
+        return None;
+    }
+    if (envelope.selector_k2_lift().is_some() || envelope.selector_k4_lift().is_some())
+        && preflight_selector_k4_grid(root, regions).is_err()
+    {
+        return None;
+    }
+    for (region_idx, proposal) in proposals.iter().enumerate() {
+        if envelope.prefix_floors()[region_idx].to_bits() != proposal.prefix_floor.to_bits()
+            || envelope
+                .directions()
+                .row(region_idx)
+                .iter()
+                .zip(&proposal.p)
+                .any(|(&stored, &current)| stored.to_bits() != current.to_bits())
+        {
+            return None;
+        }
+    }
+
+    let proof_deadline = checked_region_selector_proof_deadline(overall_deadline, Instant::now())?;
     let certified_lower = certify_original(envelope, requested_lower, proof_deadline)?;
     if certified_lower.to_bits() != requested_lower.to_bits()
         || !replay_deadline_open(proof_deadline)
@@ -1915,6 +2931,648 @@ fn stable_box_fingerprint(bx: &BoundedTensor) -> u64 {
     hash
 }
 
+const REPLAY_ONLY_PHASE_CENSUS_LEAF: usize = 4;
+const MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES: usize = 64;
+const MAX_REPLAY_ONLY_PHASE_CENSUS_GRAPH_NODES: usize = 512;
+const MAX_REPLAY_ONLY_PHASE_CENSUS_CACHED_F32_VALUES: usize = 8_000_000;
+const MAX_REPLAY_ONLY_PHASE_CENSUS_NAME_BYTES: usize = 64 * 1024;
+const REPLAY_ONLY_PHASE_CENSUS_POLL_STRIDE: usize = 4_096;
+
+#[derive(Debug, Clone, Copy)]
+struct ReplayPhaseCensusCollectionLimits {
+    graph_nodes: usize,
+    cached_f32_values: usize,
+    name_bytes: usize,
+}
+
+const REPLAY_PHASE_CENSUS_COLLECTION_LIMITS: ReplayPhaseCensusCollectionLimits =
+    ReplayPhaseCensusCollectionLimits {
+        graph_nodes: MAX_REPLAY_ONLY_PHASE_CENSUS_GRAPH_NODES,
+        cached_f32_values: MAX_REPLAY_ONLY_PHASE_CENSUS_CACHED_F32_VALUES,
+        name_bytes: MAX_REPLAY_ONLY_PHASE_CENSUS_NAME_BYTES,
+    };
+
+/// One unstable ReLU coordinate retained by the leaf-4 research census.
+///
+/// Names are deliberately not cloned per candidate: `relu_exec_index` resolves
+/// both the ReLU and its producer from the immutable graph after ranking. This
+/// keeps memory bounded by the fixed 64-entry heap even when a leaf has millions
+/// of unstable coordinates.
+#[derive(Debug, Clone, Copy)]
+struct ReplayPhaseCandidate {
+    relu_exec_index: usize,
+    flat_index: usize,
+    lower: f32,
+    upper: f32,
+    score: f32,
+    width: f64,
+}
+
+impl ReplayPhaseCandidate {
+    fn new(relu_exec_index: usize, flat_index: usize, lower: f32, upper: f32) -> Option<Self> {
+        if !(lower.is_finite() && upper.is_finite() && lower < 0.0 && upper > 0.0) {
+            return None;
+        }
+        let score = (-lower).min(upper);
+        let width = f64::from(upper) - f64::from(lower);
+        (score.is_finite() && score > 0.0 && width.is_finite() && width > 0.0).then_some(Self {
+            relu_exec_index,
+            flat_index,
+            lower,
+            upper,
+            score,
+            width,
+        })
+    }
+}
+
+/// Distance-to-stability order: closest side first, then widest interval, then
+/// graph-topological ReLU position and flat coordinate. The last two raw-value
+/// comparisons only total-order malformed duplicate identities; a valid graph
+/// has one bound pair per `(relu_exec_index, flat_index)`.
+fn compare_replay_phase_candidates(
+    left: &ReplayPhaseCandidate,
+    right: &ReplayPhaseCandidate,
+) -> Ordering {
+    left.score
+        .total_cmp(&right.score)
+        .then_with(|| right.width.total_cmp(&left.width))
+        .then_with(|| left.relu_exec_index.cmp(&right.relu_exec_index))
+        .then_with(|| left.flat_index.cmp(&right.flat_index))
+        .then_with(|| left.lower.total_cmp(&right.lower))
+        .then_with(|| left.upper.total_cmp(&right.upper))
+}
+
+impl PartialEq for ReplayPhaseCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.relu_exec_index == other.relu_exec_index
+            && self.flat_index == other.flat_index
+            && self.lower.to_bits() == other.lower.to_bits()
+            && self.upper.to_bits() == other.upper.to_bits()
+            && self.score.to_bits() == other.score.to_bits()
+            && self.width.to_bits() == other.width.to_bits()
+    }
+}
+
+impl Eq for ReplayPhaseCandidate {}
+
+impl PartialOrd for ReplayPhaseCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReplayPhaseCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_replay_phase_candidates(self, other)
+    }
+}
+
+fn retain_replay_phase_candidate(
+    heap: &mut BinaryHeap<ReplayPhaseCandidate>,
+    candidate: ReplayPhaseCandidate,
+    cap: usize,
+) {
+    if cap == 0 {
+        return;
+    }
+    if heap.len() < cap {
+        heap.push(candidate);
+        return;
+    }
+    if heap
+        .peek()
+        .is_some_and(|worst| compare_replay_phase_candidates(&candidate, worst).is_lt())
+    {
+        let _ = heap.pop();
+        heap.push(candidate);
+    }
+}
+
+#[cfg(test)]
+fn rank_replay_phase_candidates(
+    candidates: impl IntoIterator<Item = ReplayPhaseCandidate>,
+    cap: usize,
+) -> Vec<ReplayPhaseCandidate> {
+    let cap = cap.min(MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES);
+    let mut heap = BinaryHeap::with_capacity(cap);
+    for candidate in candidates {
+        retain_replay_phase_candidate(&mut heap, candidate, cap);
+    }
+    let mut ranked = heap.into_vec();
+    ranked.sort_by(compare_replay_phase_candidates);
+    ranked
+}
+
+#[derive(Debug)]
+struct ReplayPhaseCensus {
+    relu_nodes: usize,
+    coordinates: usize,
+    stable_inactive: usize,
+    stable_active: usize,
+    unstable: usize,
+    node_box_endpoint_digest: u64,
+    ranked: Vec<ReplayPhaseCandidate>,
+}
+
+impl ReplayPhaseCensus {
+    fn stable(&self) -> usize {
+        self.stable_inactive + self.stable_active
+    }
+}
+
+fn mix_replay_phase_digest(hash: &mut u64, bytes: &[u8]) {
+    const PRIME: u64 = 0x100000001b3;
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(PRIME);
+    }
+}
+
+fn mix_replay_phase_usize(hash: &mut u64, value: usize) -> Result<(), &'static str> {
+    let word = u64::try_from(value).map_err(|_| "usize-does-not-fit-u64")?;
+    mix_replay_phase_digest(hash, &word.to_le_bytes());
+    Ok(())
+}
+
+fn replay_phase_producer_bounds<'a>(
+    producer: &str,
+    input: &'a BoundedTensor,
+    node_bounds: &'a HashMap<String, BoundedTensor>,
+) -> Option<&'a BoundedTensor> {
+    if producer == NETWORK_INPUT {
+        Some(input)
+    } else {
+        node_bounds.get(producer)
+    }
+}
+
+fn replay_phase_tensor_payload_f32_values(bounds: &BoundedTensor) -> Result<usize, &'static str> {
+    if bounds.shape() != bounds.lower().shape()
+        || bounds.shape() != bounds.upper().shape()
+        || bounds.lower().len() != bounds.upper().len()
+    {
+        return Err("malformed-cached-tensor-shape");
+    }
+    let mut values = bounds
+        .lower()
+        .len()
+        .checked_mul(2)
+        .ok_or("cached-f32-count-overflow")?;
+    if let Some(l2) = bounds.l2_constraint() {
+        if l2.center().shape() != bounds.shape()
+            || l2.axis() >= bounds.ndim()
+            || l2.radius().ndim().checked_add(1) != Some(bounds.ndim())
+        {
+            return Err("malformed-cached-l2-shape");
+        }
+        let mut radius_axis = 0usize;
+        for (axis, &dim) in bounds.shape().iter().enumerate() {
+            if axis == l2.axis() {
+                continue;
+            }
+            if l2.radius().shape().get(radius_axis) != Some(&dim) {
+                return Err("malformed-cached-l2-shape");
+            }
+            radius_axis = radius_axis
+                .checked_add(1)
+                .ok_or("cached-l2-rank-overflow")?;
+        }
+        if radius_axis != l2.radius().ndim() {
+            return Err("malformed-cached-l2-shape");
+        }
+        values = values
+            .checked_add(l2.center().len())
+            .and_then(|count| count.checked_add(l2.radius().len()))
+            .ok_or("cached-f32-count-overflow")?;
+    }
+    Ok(values)
+}
+
+fn validate_replay_phase_cached_tensor(
+    bounds: &BoundedTensor,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    let _ = replay_phase_tensor_payload_f32_values(bounds)?;
+    for (index, (&lower, &upper)) in bounds.lower().iter().zip(bounds.upper()).enumerate() {
+        if index % REPLAY_ONLY_PHASE_CENSUS_POLL_STRIDE == 0 && !replay_deadline_open(deadline) {
+            return Err("deadline-during-cached-tensor-validation");
+        }
+        if !lower.is_finite() || !upper.is_finite() || lower > upper {
+            return Err("nonfinite-or-inverted-cached-tensor");
+        }
+    }
+    if let Some(l2) = bounds.l2_constraint() {
+        for (index, &center) in l2.center().iter().enumerate() {
+            if index % REPLAY_ONLY_PHASE_CENSUS_POLL_STRIDE == 0 && !replay_deadline_open(deadline)
+            {
+                return Err("deadline-during-cached-l2-validation");
+            }
+            if !center.is_finite() {
+                return Err("nonfinite-cached-l2-center");
+            }
+        }
+        for (index, &radius) in l2.radius().iter().enumerate() {
+            if index % REPLAY_ONLY_PHASE_CENSUS_POLL_STRIDE == 0 && !replay_deadline_open(deadline)
+            {
+                return Err("deadline-during-cached-l2-validation");
+            }
+            if !radius.is_finite() || radius < 0.0 {
+                return Err("invalid-cached-l2-radius");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn charge_replay_phase_cached_values(
+    total: &mut usize,
+    bounds: &BoundedTensor,
+    cap: usize,
+) -> Result<(), &'static str> {
+    *total = total
+        .checked_add(replay_phase_tensor_payload_f32_values(bounds)?)
+        .ok_or("cached-f32-count-overflow")?;
+    (*total <= cap).then_some(()).ok_or("cached-f32-value-cap")
+}
+
+/// Validate and cap the complete payload of one graph node-bound collection.
+///
+/// `collect_node_bounds_with_engine_and_deadline` owns exactly one output
+/// [`BoundedTensor`] for every node in execution order. This preflight requires
+/// that complete map, counts both endpoint arrays for every node (not merely
+/// ReLU producers), counts optional L2 center/radius auxiliary arrays, cloned
+/// key bytes, and conservatively includes the live input box and its L2 payload.
+/// The same routine validates the completed leaf collection after allocation.
+fn preflight_replay_phase_census_collection(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    node_bounds: &HashMap<String, BoundedTensor>,
+    deadline: Instant,
+    limits: ReplayPhaseCensusCollectionLimits,
+) -> Result<(), &'static str> {
+    if !replay_deadline_open(deadline) {
+        return Err("deadline-before-preflight");
+    }
+    if graph.num_nodes() > limits.graph_nodes {
+        return Err("graph-node-cap");
+    }
+    let exec = graph.exec_order().map_err(|_| "invalid-graph-order")?;
+    if exec.len() != graph.num_nodes() || node_bounds.len() != exec.len() {
+        return Err("node-bound-map-cardinality-mismatch");
+    }
+    let mut cached_f32_values = 0usize;
+    let mut name_bytes = NETWORK_INPUT.len();
+    if name_bytes > limits.name_bytes {
+        return Err("name-byte-cap");
+    }
+    charge_replay_phase_cached_values(&mut cached_f32_values, input, limits.cached_f32_values)?;
+    validate_replay_phase_cached_tensor(input, deadline)?;
+
+    for name in exec {
+        if !replay_deadline_open(deadline) {
+            return Err("deadline-during-preflight");
+        }
+        graph.node(name).ok_or("missing-graph-node")?;
+        let bounds = node_bounds.get(name).ok_or("missing-cached-node-output")?;
+        charge_replay_phase_cached_values(
+            &mut cached_f32_values,
+            bounds,
+            limits.cached_f32_values,
+        )?;
+        name_bytes = name_bytes
+            .checked_add(name.len())
+            .ok_or("name-byte-count-overflow")?;
+        if name_bytes > limits.name_bytes {
+            return Err("name-byte-cap");
+        }
+        validate_replay_phase_cached_tensor(bounds, deadline)?;
+    }
+    replay_deadline_open(deadline)
+        .then_some(())
+        .ok_or("deadline-after-preflight")
+}
+
+/// Build a deterministic census from a completed leaf-specific node-bound map.
+///
+/// This function has no graph mutation, solver invocation, certificate, or bound
+/// output. Every endpoint is hashed in graph order; only the best `entry_cap`
+/// unstable coordinates survive in memory.
+fn build_replay_phase_census(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    node_bounds: &HashMap<String, BoundedTensor>,
+    deadline: Instant,
+    entry_cap: usize,
+) -> Result<ReplayPhaseCensus, &'static str> {
+    if !replay_deadline_open(deadline) {
+        return Err("deadline-before-scan");
+    }
+    let exec = graph.exec_order().map_err(|_| "invalid-graph-order")?;
+    let mut hash = 0xcbf29ce484222325_u64;
+    mix_replay_phase_digest(&mut hash, b"ny-replay-phase-census-node-box-v1");
+    let mut relu_nodes = 0usize;
+    let mut coordinates = 0usize;
+    let mut stable_inactive = 0usize;
+    let mut stable_active = 0usize;
+    let mut unstable = 0usize;
+    let mut endpoints = 0usize;
+    let entry_cap = entry_cap.min(MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES);
+    let mut heap = BinaryHeap::with_capacity(entry_cap);
+
+    for (relu_exec_index, name) in exec.iter().enumerate() {
+        if relu_exec_index % 16 == 0 && !replay_deadline_open(deadline) {
+            return Err("deadline-during-scan");
+        }
+        let node = graph.node(name).ok_or("missing-graph-node")?;
+        if !matches!(node.layer(), Layer::ReLU(_)) {
+            continue;
+        }
+        let producer = node
+            .require_unary_input()
+            .map_err(|_| "malformed-relu-inputs")?;
+        let bounds = replay_phase_producer_bounds(producer, input, node_bounds)
+            .ok_or("missing-leaf-producer-bounds")?;
+        if bounds.shape() != bounds.lower().shape()
+            || bounds.shape() != bounds.upper().shape()
+            || bounds.lower().len() != bounds.upper().len()
+        {
+            return Err("malformed-leaf-producer-bounds");
+        }
+
+        relu_nodes = relu_nodes
+            .checked_add(1)
+            .ok_or("relu-node-count-overflow")?;
+        coordinates = coordinates
+            .checked_add(bounds.lower().len())
+            .ok_or("coordinate-count-overflow")?;
+        endpoints = endpoints
+            .checked_add(
+                bounds
+                    .lower()
+                    .len()
+                    .checked_mul(2)
+                    .ok_or("endpoint-count-overflow")?,
+            )
+            .ok_or("endpoint-count-overflow")?;
+        if endpoints > MAX_REPLAY_ONLY_PHASE_CENSUS_CACHED_F32_VALUES {
+            return Err("endpoint-cap");
+        }
+
+        mix_replay_phase_usize(&mut hash, relu_exec_index)?;
+        mix_replay_phase_usize(&mut hash, name.len())?;
+        mix_replay_phase_digest(&mut hash, name.as_bytes());
+        mix_replay_phase_usize(&mut hash, producer.len())?;
+        mix_replay_phase_digest(&mut hash, producer.as_bytes());
+        mix_replay_phase_usize(&mut hash, bounds.shape().len())?;
+        for &dim in bounds.shape() {
+            mix_replay_phase_usize(&mut hash, dim)?;
+        }
+        mix_replay_phase_usize(&mut hash, bounds.lower().len())?;
+
+        for (flat_index, (&lower, &upper)) in bounds.lower().iter().zip(bounds.upper()).enumerate()
+        {
+            if flat_index % REPLAY_ONLY_PHASE_CENSUS_POLL_STRIDE == 0
+                && !replay_deadline_open(deadline)
+            {
+                return Err("deadline-during-endpoint-scan");
+            }
+            if !lower.is_finite() || !upper.is_finite() || lower > upper {
+                return Err("nonfinite-or-inverted-leaf-bounds");
+            }
+            mix_replay_phase_digest(&mut hash, &lower.to_bits().to_le_bytes());
+            mix_replay_phase_digest(&mut hash, &upper.to_bits().to_le_bytes());
+
+            if upper <= 0.0 {
+                stable_inactive = stable_inactive
+                    .checked_add(1)
+                    .ok_or("stable-count-overflow")?;
+            } else if lower >= 0.0 {
+                stable_active = stable_active
+                    .checked_add(1)
+                    .ok_or("stable-count-overflow")?;
+            } else {
+                unstable = unstable.checked_add(1).ok_or("unstable-count-overflow")?;
+                let candidate =
+                    ReplayPhaseCandidate::new(relu_exec_index, flat_index, lower, upper)
+                        .ok_or("invalid-unstable-score")?;
+                retain_replay_phase_candidate(&mut heap, candidate, entry_cap);
+            }
+        }
+    }
+    if !replay_deadline_open(deadline) {
+        return Err("deadline-after-scan");
+    }
+    let mut ranked = heap.into_vec();
+    ranked.sort_by(compare_replay_phase_candidates);
+    Ok(ReplayPhaseCensus {
+        relu_nodes,
+        coordinates,
+        stable_inactive,
+        stable_active,
+        unstable,
+        node_box_endpoint_digest: hash,
+        ranked,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayPhaseEmissionOutcome {
+    emitted: usize,
+    deadline_truncated: bool,
+}
+
+/// Visit ranked entries while polling immediately before every output action.
+///
+/// The callback is the sole place production prints an entry. Therefore an
+/// expired poll cannot be followed by another entry line; only the single
+/// explicit deadline-truncated marker is allowed afterward.
+fn visit_replay_phase_entries_until_deadline<DeadlineOpen, Emit>(
+    ranked: &[ReplayPhaseCandidate],
+    mut deadline_open: DeadlineOpen,
+    mut emit: Emit,
+) -> ReplayPhaseEmissionOutcome
+where
+    DeadlineOpen: FnMut() -> bool,
+    Emit: FnMut(usize, &ReplayPhaseCandidate),
+{
+    let mut emitted = 0usize;
+    for (rank, candidate) in ranked.iter().enumerate() {
+        if !deadline_open() {
+            return ReplayPhaseEmissionOutcome {
+                emitted,
+                deadline_truncated: true,
+            };
+        }
+        emit(rank, candidate);
+        emitted += 1;
+    }
+    ReplayPhaseEmissionOutcome {
+        emitted,
+        deadline_truncated: false,
+    }
+}
+
+fn replay_phase_deadline_truncated_marker(
+    leaf_idx: usize,
+    leaf_count: usize,
+    leaf_fingerprint: u64,
+    retained: usize,
+    outcome: ReplayPhaseEmissionOutcome,
+) -> Option<String> {
+    outcome.deadline_truncated.then(|| {
+        format!(
+            "[imb-replay-only] phase-census deadline-truncated leaf={leaf_idx}/{leaf_count} \
+             box_fingerprint=fnv1a64:{leaf_fingerprint:016x} emitted={} retained={retained} \
+             authority=false",
+            outcome.emitted
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_replay_phase_census(
+    graph: &GraphNetwork,
+    root_input: &BoundedTensor,
+    root_node_bounds: &HashMap<String, BoundedTensor>,
+    leaf: &BoundedTensor,
+    leaf_idx: usize,
+    leaf_count: usize,
+    leaf_fingerprint: u64,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Instant,
+) {
+    if leaf_idx != REPLAY_ONLY_PHASE_CENSUS_LEAF {
+        return;
+    }
+    if let Err(reason) = preflight_replay_phase_census_collection(
+        graph,
+        root_input,
+        root_node_bounds,
+        deadline,
+        REPLAY_PHASE_CENSUS_COLLECTION_LIMITS,
+    ) {
+        eprintln!(
+            "[imb-replay-only] phase-census declined leaf={leaf_idx}/{leaf_count} \
+             box_fingerprint=fnv1a64:{leaf_fingerprint:016x} reason={reason} authority=false"
+        );
+        return;
+    }
+
+    let collection_started = Instant::now();
+    let leaf_node_bounds =
+        match graph.collect_node_bounds_with_engine_and_deadline(leaf, engine, Some(deadline)) {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                eprintln!(
+                    "[imb-replay-only] phase-census declined leaf={leaf_idx}/{leaf_count} \
+                     box_fingerprint=fnv1a64:{leaf_fingerprint:016x} \
+                     reason=node-bound-collection error={error} authority=false"
+                );
+                return;
+            }
+        };
+    if !replay_deadline_open(deadline) {
+        eprintln!(
+            "[imb-replay-only] phase-census declined leaf={leaf_idx}/{leaf_count} \
+             box_fingerprint=fnv1a64:{leaf_fingerprint:016x} \
+             reason=deadline-after-collection authority=false"
+        );
+        return;
+    }
+    if let Err(reason) = preflight_replay_phase_census_collection(
+        graph,
+        leaf,
+        &leaf_node_bounds,
+        deadline,
+        REPLAY_PHASE_CENSUS_COLLECTION_LIMITS,
+    ) {
+        eprintln!(
+            "[imb-replay-only] phase-census declined leaf={leaf_idx}/{leaf_count} \
+             box_fingerprint=fnv1a64:{leaf_fingerprint:016x} \
+             reason=completed-collection-{reason} authority=false"
+        );
+        return;
+    }
+    let collection_s = collection_started.elapsed().as_secs_f64();
+    let census = match build_replay_phase_census(
+        graph,
+        leaf,
+        &leaf_node_bounds,
+        deadline,
+        MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES,
+    ) {
+        Ok(census) => census,
+        Err(reason) => {
+            eprintln!(
+                "[imb-replay-only] phase-census declined leaf={leaf_idx}/{leaf_count} \
+                 box_fingerprint=fnv1a64:{leaf_fingerprint:016x} reason={reason} authority=false"
+            );
+            return;
+        }
+    };
+    let omitted = census.unstable.saturating_sub(census.ranked.len());
+    eprintln!(
+        "[imb-replay-only] phase-census leaf={leaf_idx}/{leaf_count} \
+         box_fingerprint=fnv1a64:{leaf_fingerprint:016x} relu_nodes={} coordinates={} \
+         stable={} stable_inactive={} stable_active={} unstable={} retained={} omitted={} \
+         score_kind=min_neg_l_u rank_order=score_asc_width_desc_relu_topo_asc_flat_asc \
+         node_box_endpoint_digest=fnv1a64:{:016x} collection_s={collection_s:.6} authority=false",
+        census.relu_nodes,
+        census.coordinates,
+        census.stable(),
+        census.stable_inactive,
+        census.stable_active,
+        census.unstable,
+        census.ranked.len(),
+        omitted,
+        census.node_box_endpoint_digest,
+    );
+
+    let Ok(exec) = graph.exec_order() else {
+        return;
+    };
+    let emission = visit_replay_phase_entries_until_deadline(
+        &census.ranked,
+        || replay_deadline_open(deadline),
+        |rank, candidate| {
+            let Some(relu_name) = exec.get(candidate.relu_exec_index) else {
+                return;
+            };
+            let Some(relu) = graph.node(relu_name) else {
+                return;
+            };
+            let Ok(producer) = relu.require_unary_input() else {
+                return;
+            };
+            eprintln!(
+                "[imb-replay-only] phase-census-entry leaf={leaf_idx}/{leaf_count} \
+                 box_fingerprint=fnv1a64:{leaf_fingerprint:016x} rank={rank} \
+                 relu={relu_name:?} producer={producer:?} flat={} \
+                 l={:.9e} l_bits=0x{:08x} u={:.9e} u_bits=0x{:08x} \
+                 score={:.9e} score_bits=0x{:08x} width={:.17e} authority=false",
+                candidate.flat_index,
+                candidate.lower,
+                candidate.lower.to_bits(),
+                candidate.upper,
+                candidate.upper.to_bits(),
+                candidate.score,
+                candidate.score.to_bits(),
+                candidate.width,
+            );
+        },
+    );
+    if let Some(marker) = replay_phase_deadline_truncated_marker(
+        leaf_idx,
+        leaf_count,
+        leaf_fingerprint,
+        census.ranked.len(),
+        emission,
+    ) {
+        eprintln!("{marker}");
+    }
+}
+
 /// Run one original-network uniform-region replay without proposal construction.
 ///
 /// This hook is structurally diagnostic-only: it neither accepts nor returns a
@@ -1927,6 +3585,7 @@ fn maybe_run_replay_only_diagnostic(
     objectives: &[Vec<f32>],
     thresholds: &[f32],
     engine: Option<&dyn GemmEngine>,
+    root_node_bounds: &HashMap<String, BoundedTensor>,
     overall_deadline: Option<Instant>,
 ) -> bool {
     let gate = std::env::var("NY_IMB_REPLAY_ONLY").ok();
@@ -2052,6 +3711,7 @@ fn maybe_run_replay_only_diagnostic(
         exact_split_bounds_bits(target, &split_dims).unwrap_or_else(|| "unavailable".to_string());
     let full_bits =
         exact_box_bits(target).unwrap_or_else(|| format!("omitted(len={})", target.lower().len()));
+    let target_fingerprint = stable_box_fingerprint(target);
     eprintln!(
         "[imb-replay-only] target obj={obj_idx} leaf={leaf_idx}/{} k={region_k} split_dims={split_dims:?} \
          order=region_boxes_mixed_radix_low_dim_first exact_cover=true validation_s={:.6} \
@@ -2059,7 +3719,7 @@ fn maybe_run_replay_only_diagnostic(
          box_fingerprint=fnv1a64:{:016x} split_bounds_bits=[{split_bits}] full_bounds_bits=[{full_bits}] authority=false",
         regions.len(),
         validation_elapsed.as_secs_f64(),
-        stable_box_fingerprint(target),
+        target_fingerprint,
     );
 
     let Some(spec) = Array2::from_shape_vec((1, objective.len()), objective.clone()).ok() else {
@@ -2073,6 +3733,18 @@ fn maybe_run_replay_only_diagnostic(
     }
     #[cfg(test)]
     REPLAY_ONLY_EVALUATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    emit_replay_phase_census(
+        graph,
+        input,
+        root_node_bounds,
+        target,
+        leaf_idx,
+        regions.len(),
+        target_fingerprint,
+        engine,
+        deadline,
+    );
 
     let one_threshold = [threshold];
     let one_clause = [1_usize];
@@ -2413,42 +4085,84 @@ fn independently_recheck_original_objectives_batched(
         input_elements_per_leaf: root.lower().len(),
         output_dim,
     };
-    let batched = evaluate_batched_replay_if_admitted(resource_shape, || {
-        let spec_elements = replay_specs.checked_mul(output_dim)?;
-        let mut spec_values = Vec::new();
-        spec_values.try_reserve_exact(spec_elements).ok()?;
-        for row in &signed_plan.representatives {
-            spec_values.extend_from_slice(row);
-        }
-        let spec = Array2::from_shape_vec((replay_specs, output_dim), spec_values).ok()?;
-
-        // Materialization is bounded above, but it can still consume the last
-        // usable wall-clock slice. Never enter the evaluator after that work
-        // if the common authority deadline has closed.
-        if !replay_deadline_open(deadline) {
-            return None;
-        }
-
-        match compute_crown_or_ibp_bounds_batched_specs(
-            graph,
-            &unique_leaves,
-            &spec,
-            engine,
-            None,
-            None,
-            None,
-            Some(deadline),
-            None,
-            true,
-            true,
-        ) {
-            Ok(result) => Some(result),
-            Err(error) => {
-                eprintln!("[imb] FULL-RECHECK-BATCH evaluator failed closed: {error}");
-                None
+    let (batched, replay_engine_route) =
+        evaluate_batched_replay_if_admitted(resource_shape, || {
+            let spec_elements = replay_specs.checked_mul(output_dim)?;
+            let mut spec_values = Vec::new();
+            spec_values.try_reserve_exact(spec_elements).ok()?;
+            for row in &signed_plan.representatives {
+                spec_values.extend_from_slice(row);
             }
-        }
-    })?;
+            let spec = Array2::from_shape_vec((replay_specs, output_dim), spec_values).ok()?;
+
+            // Materialization is bounded above, but it can still consume the last
+            // usable wall-clock slice. Never enter the evaluator after that work
+            // if the common authority deadline has closed.
+            if !replay_deadline_open(deadline) {
+                return None;
+            }
+
+            let evaluate = |resolved_engine: Option<&dyn GemmEngine>,
+                            engine_route: ReplayAuthorityEngineRoute| {
+                eprintln!(
+                    "[imb] FULL-RECHECK-BATCH evaluator starting: engine_route={} ready_s={:.6}",
+                    engine_route.as_str(),
+                    started.elapsed().as_secs_f64(),
+                );
+                match compute_crown_or_ibp_bounds_batched_specs(
+                    graph,
+                    &unique_leaves,
+                    &spec,
+                    resolved_engine,
+                    None,
+                    None,
+                    None,
+                    Some(deadline),
+                    None,
+                    true,
+                    true,
+                ) {
+                    Ok(result) => Some((result, engine_route)),
+                    Err(error) => {
+                        eprintln!(
+                            "[imb] FULL-RECHECK-BATCH evaluator failed closed: \
+                         engine_route={} wall_s={:.6} error={error}",
+                            engine_route.as_str(),
+                            started.elapsed().as_secs_f64(),
+                        );
+                        None
+                    }
+                }
+            };
+
+            match engine {
+                Some(caller_engine) => {
+                    evaluate(Some(caller_engine), ReplayAuthorityEngineRoute::Caller)
+                }
+                None => {
+                    let registered_attempt = match crate::fast_f32_gemm::with_engine_for_deadline(
+                        Some(deadline),
+                        |registered_engine| {
+                            let confined_engine = RegisteredFastF32ReplayEngine(registered_engine);
+                            evaluate(
+                                Some(&confined_engine),
+                                ReplayAuthorityEngineRoute::RegisteredFastF32,
+                            )
+                        },
+                    ) {
+                        Some(result) => RegisteredReplayAttempt::Evaluated(result),
+                        None => RegisteredReplayAttempt::Unavailable,
+                    };
+                    registered_replay_or_cpu_fallback(
+                        registered_attempt,
+                        // A selected registered engine's evaluator failure is
+                        // `Evaluated(None)` and never reaches this fallback.
+                        // Only an unavailable registry uses None/faer.
+                        || evaluate(None, ReplayAuthorityEngineRoute::CpuFallback),
+                    )
+                }
+            }
+        })?;
     if !replay_deadline_open(deadline)
         || batched.bounds.len() != unique_leaves.len()
         || batched.rebound_timing.domains != unique_leaves.len()
@@ -2456,7 +4170,9 @@ fn independently_recheck_original_objectives_batched(
     {
         eprintln!(
             "[imb] FULL-RECHECK-BATCH rejected result shape/deadline: \
-             bounds={} unique_leaves={} timing_domains={} timing_specs={} expected_specs={}",
+             engine_route={} bounds={} unique_leaves={} timing_domains={} \
+             timing_specs={} expected_specs={}",
+            replay_engine_route.as_str(),
             batched.bounds.len(),
             unique_leaves.len(),
             batched.rebound_timing.domains,
@@ -2531,13 +4247,15 @@ fn independently_recheck_original_objectives_batched(
     eprintln!(
         "[imb] FULL-RECHECK-BATCH CERTIFIED: objectives={} replay_memberships={} \
          retained_certified_memberships={} total_live_memberships={} unique_leaves={} \
-         route={} wall_s={:.6} forward_s={:?} backward_s={:?} materialize_s={:?}",
+         route={} engine_route={} wall_s={:.6} forward_s={:?} backward_s={:?} \
+         materialize_s={:?}",
         objectives.len(),
         replay_memberships,
         retained_certified_memberships,
         total_live_memberships,
         unique_leaves.len(),
         batched.rebound_timing.mode.as_str(),
+        replay_engine_route.as_str(),
         started.elapsed().as_secs_f64(),
         batched.rebound_timing.forward_elapsed_s,
         batched.rebound_timing.backward_elapsed_s,
@@ -2754,7 +4472,15 @@ pub fn tighten_root_objective_bounds_imb(
     // Re-entrancy guard: the nested per-leaf prefix-BaB must not re-arm IMB.
     let _scope = super::scope();
 
-    if maybe_run_replay_only_diagnostic(graph, input, objectives, thresholds, engine, deadline) {
+    if maybe_run_replay_only_diagnostic(
+        graph,
+        input,
+        objectives,
+        thresholds,
+        engine,
+        node_bounds,
+        deadline,
+    ) {
         // Replay-only is measurement data, never a bound source. In particular,
         // NY_IMB_WIRE cannot turn its selected-leaf lower into authority.
         return baseline.to_vec();
@@ -2878,7 +4604,15 @@ pub fn imb_multi_objective_floors(
     // per-leaf prefix-BaB must not re-arm IMB).
     let _scope = super::scope();
 
-    if maybe_run_replay_only_diagnostic(graph, input, objectives, thresholds, engine, deadline) {
+    if maybe_run_replay_only_diagnostic(
+        graph,
+        input,
+        objectives,
+        thresholds,
+        engine,
+        node_bounds,
+        deadline,
+    ) {
         // A single diagnostic leaf cannot refute any clause.
         return out;
     }
@@ -3162,7 +4896,7 @@ fn run_imb_measurement(
     // path and never loosens the late path. Exact AY obtains a graph/input-bound
     // run-local pair; legacy proposal-only execution retains its historical memo.
     let exact_ay_requested = super::ay_tail_certificate_enabled();
-    let (prefix, prefix_anchor) = if exact_ay_requested {
+    let (prefix, prefix_anchor, shared_root_envelope_cache) = if exact_ay_requested {
         let t_anchor = Instant::now();
         let prepared = match exact_prefix_session {
             Some(session) => session.prepare(graph, input, &seam, engine, imb_deadline),
@@ -3182,7 +4916,11 @@ fn run_imb_measurement(
             eprintln!("[imb] exact prefix preparation unavailable; skip");
             return None;
         };
-        (prepared.prefix, prepared.anchor)
+        (
+            prepared.prefix,
+            prepared.anchor,
+            Some(prepared.shared_root_envelope),
+        )
     } else {
         // Proposal-only compatibility path: preserve the historical prefix-build
         // placement, timing, and one-slot memo behavior.
@@ -3201,7 +4939,7 @@ fn run_imb_measurement(
             t_anchor.elapsed().as_secs_f64(),
             imb_t0.elapsed().as_secs_f64()
         );
-        (prefix, prefix_anchor)
+        (prefix, prefix_anchor, None)
     };
     let exact_ay_anchor = exact_ay_requested
         .then_some(prefix_anchor.as_ref())
@@ -3324,6 +5062,7 @@ fn run_imb_measurement(
                 &tail,
                 prefix.as_ref(),
                 prefix_anchor.as_ref(),
+                shared_root_envelope_cache.as_deref(),
                 ay_seam_box_trusted,
                 node_bounds,
                 input,
@@ -3786,6 +5525,7 @@ fn run_region_loop(
     tail: &GraphNetwork,
     prefix: &GraphNetwork,
     prepared_prefix_anchor: Option<&Arc<HashMap<String, BoundedTensor>>>,
+    shared_root_envelope_cache: Option<&OnceLock<super::AyTailSharedInputReachabilityEnvelope>>,
     ay_seam_box_trusted: bool,
     node_bounds: &HashMap<String, BoundedTensor>,
     input: &BoundedTensor,
@@ -4065,12 +5805,15 @@ fn run_region_loop(
     // `NY_IMB_AY_REGION_PROOF=residual` retains the previous formulation only
     // for explicit A/B diagnostics. `affine` opts into the existing regional
     // K=2 envelope. `shared` opts into one root-valid K4 support bank and one
-    // global exact root model. Any other value, including unset, preserves the
-    // scalar reachability default byte-for-byte.
+    // global exact root model. `selector` encodes all 16 certified regional
+    // prefix facts in one tail model behind four canonical binary selectors.
+    // Any other value, including unset, preserves the scalar reachability
+    // default byte-for-byte.
     let region_proof_mode = std::env::var("NY_IMB_AY_REGION_PROOF").ok();
     let legacy_residual_proof = region_proof_mode.as_deref() == Some("residual");
     let affine_reachability_proof = region_proof_mode.as_deref() == Some("affine");
     let shared_input_reachability_proof = region_proof_mode.as_deref() == Some("shared");
+    let region_selector_proof = region_proof_mode.as_deref() == Some("selector");
     let ay_region_lower = if ay_region_authority {
         let certified = if input.has_l2_constraint() {
             eprintln!(
@@ -4111,6 +5854,183 @@ fn run_region_loop(
                     Some(certificate.q())
                 },
             )
+        } else if region_selector_proof {
+            eprintln!(
+                "[imb] AY-TAIL-CERT region proof mode=selector \
+                 ({} regions, {} canonical bits, one exact root model)",
+                super::AY_TAIL_REGION_SELECTOR_REGIONS,
+                super::AY_TAIL_REGION_SELECTOR_BITS,
+            );
+            let root_tail_anchors = match certified_root_tail_anchors(tail, &tail_coeffs) {
+                Some(anchors) => anchors,
+                None => {
+                    eprintln!(
+                        "[imb] AY-TAIL-CERT selector rejected: objective-independent \
+                         root tail anchors do not exactly cover tail ReLU sources"
+                    );
+                    return None;
+                }
+            };
+            let regional_relu_bounds =
+                match certified_regional_relu_bounds(tail, &tail_coeffs, &regions) {
+                    Some(bounds) => bounds,
+                    None => {
+                        eprintln!(
+                            "[imb] AY-TAIL-CERT selector rejected: targeted regional \
+                             ReLU boxes do not exactly cover root tail anchors"
+                        );
+                        return None;
+                    }
+                };
+            let selector_k2_gate_value = std::env::var("NY_IMB_SELECTOR_K2_LIFT").ok();
+            let selector_k4_gate_value = std::env::var("NY_IMB_SELECTOR_K4_LIFT").ok();
+            let selector_input_lift_kind = match selector_input_lift_kind(
+                selector_k2_gate_value.as_deref(),
+                selector_k4_gate_value.as_deref(),
+                obj_idx,
+            ) {
+                Ok(kind) => kind,
+                Err(reason) => {
+                    eprintln!(
+                        "[imb] AY-TAIL-CERT selector input lift rejected before bank build: \
+                         {reason}"
+                    );
+                    return None;
+                }
+            };
+            let selector_input_lift = if let Some(kind) = selector_input_lift_kind {
+                let (label, gate, support_rows) = match kind {
+                    SelectorInputLiftKind::K2 => (
+                        "K2",
+                        "NY_IMB_SELECTOR_K2_LIFT=1",
+                        SELECTOR_K2_EVIDENCE_CANARY_ROWS,
+                    ),
+                    SelectorInputLiftKind::K4 => (
+                        "K4",
+                        "NY_IMB_SELECTOR_K4_LIFT=1",
+                        SHARED_INPUT_EVIDENCE_CANARY_ROWS,
+                    ),
+                };
+                eprintln!(
+                    "[imb] AY-TAIL-CERT selector {label} input lift enabled obj=1 \
+                     ({gate}; fresh objective-specific bank)"
+                );
+                if let Err(reason) = preflight_selector_k4_grid(input, &regions) {
+                    eprintln!(
+                        "[imb] AY-TAIL-CERT selector {label} input lift rejected before bank build: \
+                         {reason}"
+                    );
+                    return None;
+                }
+                match prefix_shared_input_reachability_envelope(
+                    prefix,
+                    input,
+                    &regions,
+                    &proposals,
+                    support_rows,
+                    shared_anchor.as_ref(),
+                    engine,
+                    deadline,
+                ) {
+                    Some(lift) => Some((kind, lift)),
+                    None => {
+                        eprintln!(
+                            "[imb] AY-TAIL-CERT selector {label} input lift rejected: \
+                             fresh objective-specific bank unavailable"
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                if selector_k2_gate_value.as_deref() == Some("1") {
+                    eprintln!(
+                        "[imb] AY-TAIL-CERT selector K2 input lift scope-skip obj={obj_idx}; \
+                         evidence-selected objective is obj=1"
+                    );
+                }
+                if selector_k4_gate_value.as_deref() == Some("1") {
+                    eprintln!(
+                        "[imb] AY-TAIL-CERT selector K4 input lift scope-skip obj={obj_idx}; \
+                         evidence-selected objective is obj=1"
+                    );
+                }
+                None
+            };
+            match selector_input_lift {
+                Some((SelectorInputLiftKind::K2, lift)) => {
+                    ay_region_selector_envelope_from_frontiers_with_k2_lift(
+                        prefix.output_name(),
+                        input,
+                        &regions,
+                        root_seam_box,
+                        &root_tail_anchors,
+                        &regional_relu_bounds,
+                        &proposals,
+                        lift,
+                        deadline,
+                    )
+                }
+                Some((SelectorInputLiftKind::K4, lift)) => {
+                    ay_region_selector_envelope_from_frontiers_with_k4_lift(
+                        prefix.output_name(),
+                        input,
+                        &regions,
+                        root_seam_box,
+                        &root_tail_anchors,
+                        &regional_relu_bounds,
+                        &proposals,
+                        lift,
+                        deadline,
+                    )
+                }
+                None => ay_region_selector_envelope_from_frontiers(
+                    prefix.output_name(),
+                    input,
+                    &regions,
+                    root_seam_box,
+                    &root_tail_anchors,
+                    &regional_relu_bounds,
+                    &proposals,
+                    deadline,
+                ),
+            }
+            .and_then(|envelope| {
+                certify_ay_region_selector_root_with(
+                    input,
+                    &regions,
+                    &proposals,
+                    prefix.output_name(),
+                    &root_tail_anchors,
+                    &regional_relu_bounds,
+                    &envelope,
+                    band_lo,
+                    deadline,
+                    |envelope, requested_lower, proof_deadline| {
+                        if !replay_deadline_open(proof_deadline) {
+                            return None;
+                        }
+                        let certificate = super::certify_tail_with_ay_region_selector(
+                            tail,
+                            root_seam_box,
+                            obj_row,
+                            envelope,
+                            requested_lower,
+                            proof_deadline,
+                        )?;
+                        eprintln!(
+                            "[imb] AY-TAIL-CERT selector global root accepted \
+                             regions={} selector_bits={} original_lower={:.9} \
+                             tree_leaves={} ny_cert_replays={}",
+                            envelope.region_inputs().len(),
+                            super::AY_TAIL_REGION_SELECTOR_BITS,
+                            certificate.lower(),
+                            certificate.ay_tree_leaves(),
+                            certificate.ny_cert_farkas_replays(),
+                        );
+                        Some(certificate.lower())
+                    },
+                )
+            })
         } else if shared_input_reachability_proof {
             eprintln!(
                 "[imb] AY-TAIL-CERT region proof mode=shared \
@@ -4124,16 +6044,30 @@ fn run_region_loop(
                 );
                 None
             } else {
-                prefix_shared_input_reachability_envelope(
-                    prefix,
-                    input,
-                    &regions,
-                    &proposals,
-                    shared_anchor.as_ref(),
-                    engine,
-                    deadline,
-                )
-                .and_then(|envelope| {
+                let build_envelope = || {
+                    prefix_shared_input_reachability_envelope(
+                        prefix,
+                        input,
+                        &regions,
+                        &proposals,
+                        SHARED_INPUT_EVIDENCE_CANARY_ROWS,
+                        shared_anchor.as_ref(),
+                        engine,
+                        deadline,
+                    )
+                };
+                let envelope = match shared_root_envelope_cache {
+                    Some(cache) => shared_root_envelope_from_session_cache(
+                        cache,
+                        prefix.output_name(),
+                        input,
+                        root_seam_box.flatten().len(),
+                        regions.len(),
+                        build_envelope,
+                    ),
+                    None => build_envelope(),
+                };
+                envelope.and_then(|envelope| {
                     certify_ay_shared_input_root_with(
                         input,
                         &regions,
@@ -4274,9 +6208,14 @@ fn run_region_loop(
             )
         };
         if certified.is_none() {
-            if shared_input_reachability_proof {
+            if shared_input_reachability_proof || region_selector_proof {
+                let proof_mode = if region_selector_proof {
+                    "selector"
+                } else {
+                    "shared"
+                };
                 eprintln!(
-                    "[imb] AY-TAIL-CERT shared global-root proof unavailable/inconclusive; \
+                    "[imb] AY-TAIL-CERT {proof_mode} global-root proof unavailable/inconclusive; \
                      retaining full-network replay as the only authority path"
                 );
             } else {
@@ -4434,12 +6373,12 @@ fn build_subgraph_to_node(graph: &GraphNetwork, target: &str) -> Option<GraphNet
         .ok()?;
     }
     sub.set_output(target);
-    // Generous per-node CROWN-IBP budget: the ConvTranspose generator's 28,800-dim
-    // nodes exceed the default 12 s cap (cgan's BatchNormalization_11 alone needs
-    // ~143 s for a full collection), which would silently fall back to IBP and
-    // re-loosen the ReLU relaxations — exactly the failure the `crown`/`crown_root`
-    // modes exist to avoid. Raise the cap (`NY_IMB_PREFIX_CAP_S`, default 60 s) so
-    // the generator nodes complete CROWN.
+    // Explicit per-node CROWN-IBP budget: the ConvTranspose generator's
+    // 28,800-dim nodes can exceed the adaptive policy's 12 s floor. Do not make
+    // this prefix computation depend on its caller's remaining deadline:
+    // `NY_IMB_PREFIX_CAP_S` (default 60 s) supplies a deterministic base cap.
+    // Exceeding it retains sound IBP, but can re-loosen the ReLU relaxations
+    // that the `crown`/`crown_root` modes exist to improve.
     let cap = env_f64("NY_IMB_PREFIX_CAP_S", 60.0);
     if cap > 0.0 {
         sub.set_crown_ibp_per_node_time_budget(crate::types::CrownIbpPerNodeTimeBudget {
@@ -5216,6 +7155,123 @@ struct TailAnchorCoeff {
     shape: Vec<usize>,
 }
 
+/// Restore an identity-spec CROWN result to the source node's tensor shape.
+///
+/// `SpecCrownRequest` returns one scalar bound per spec row, so an identity
+/// objective over a spatial node is intentionally flattened to `[num_specs]`.
+/// The rows retain the node's standard flattened element order. Requiring the
+/// exact element count and reshaping to the independently collected source
+/// bound therefore restores structure without changing a single endpoint.
+fn restore_tail_anchor_source_shape(
+    name: &str,
+    root_bounds: BoundedTensor,
+    linear_outputs: usize,
+    source_bounds: &BoundedTensor,
+) -> Option<BoundedTensor> {
+    if root_bounds.len() != source_bounds.len() || linear_outputs != source_bounds.len() {
+        eprintln!(
+            "[imb] coeff {name}: identity-spec result has {} bounds / {} linear rows, \
+             source shape {:?} has {}; skip region-coeff path",
+            root_bounds.len(),
+            linear_outputs,
+            source_bounds.shape(),
+            source_bounds.len(),
+        );
+        return None;
+    }
+    if root_bounds.shape() != source_bounds.shape() {
+        eprintln!(
+            "[imb] coeff {name}: restoring identity-spec shape {:?} -> {:?}",
+            root_bounds.shape(),
+            source_bounds.shape(),
+        );
+    }
+    match root_bounds.reshape(source_bounds.shape()) {
+        Ok(reshaped) => Some(reshaped),
+        Err(error) => {
+            eprintln!(
+                "[imb] coeff {name}: identity-spec result cannot restore source shape {:?} \
+                 ({error}); skip region-coeff path",
+                source_bounds.shape(),
+            );
+            None
+        }
+    }
+}
+
+/// Extract the selector canary's objective-independent root anchors from the
+/// already-computed identity-spec tail coefficient maps.
+///
+/// This transports each map's root concretization separately from the targeted
+/// regional records built below. Objective-specific `(p,q)` rows stay out of
+/// both payloads. Exact coverage of every non-input tail ReLU source is
+/// mandatory; a cascade-mode or partial coefficient map fails closed.
+fn certified_root_tail_anchors(
+    tail: &GraphNetwork,
+    coeffs: &HashMap<String, TailAnchorCoeff>,
+) -> Option<Vec<super::AyTailRootAnchor>> {
+    let mut sources = tail_relu_source_names(tail);
+    sources.sort_unstable();
+    if sources.is_empty() || sources.len() != coeffs.len() {
+        return None;
+    }
+    let mut anchors = Vec::with_capacity(sources.len());
+    for source in sources {
+        let coeff = coeffs.get(&source)?;
+        if coeff.shape.as_slice() != coeff.root_box.shape() {
+            return None;
+        }
+        anchors.push(super::AyTailRootAnchor::from_certified_root_box(
+            source,
+            coeff.root_box.clone(),
+        )?);
+    }
+    Some(anchors)
+}
+
+/// Extract the selector canary's targeted regional ReLU pre-activation boxes.
+///
+/// Each record is a fresh concretization of the same root-valid input-linear
+/// map that backs its corresponding root anchor. The closed target set is
+/// regions zero and one; every non-input tail ReLU source must occur exactly
+/// once per target region.
+fn certified_regional_relu_bounds(
+    tail: &GraphNetwork,
+    coeffs: &HashMap<String, TailAnchorCoeff>,
+    regions: &[BoundedTensor],
+) -> Option<Vec<super::AyTailRegionReluBounds>> {
+    if regions.len() != super::AY_TAIL_REGION_SELECTOR_REGIONS {
+        return None;
+    }
+    let mut sources = tail_relu_source_names(tail);
+    sources.sort_unstable();
+    if sources.is_empty() || sources.len() != coeffs.len() {
+        return None;
+    }
+
+    let record_count = super::AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS
+        .len()
+        .checked_mul(sources.len())?;
+    if record_count > super::AY_TAIL_REGION_SELECTOR_MAX_RELU_BOUND_RECORDS {
+        return None;
+    }
+    let mut records = Vec::with_capacity(record_count);
+    for &region_index in &super::AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS {
+        let regional = concretize_region_anchors(coeffs, regions.get(region_index)?)?;
+        if regional.len() != sources.len() {
+            return None;
+        }
+        for source in &sources {
+            records.push(super::AyTailRegionReluBounds::from_certified_region_box(
+                region_index,
+                source.clone(),
+                regional.get(source)?.clone(),
+            )?);
+        }
+    }
+    Some(records)
+}
+
 /// FIX 2 (Option B) — extract each tail ReLU-source's INPUT-linear map ONCE over the
 /// ROOT box, so per-region anchors are a trivial `concretize_box` matmul instead of a
 /// fresh ~6-min `propagate_crown_to_node` through the whole ConvTranspose generator
@@ -5279,15 +7335,15 @@ fn build_tail_anchor_coeffs(
             }
         };
         let lin = lin_opt?;
+        let source_bounds = node_bounds.get(name)?;
+        let root_bounds =
+            restore_tail_anchor_source_shape(name, root_bounds, lin.num_outputs(), source_bounds)?;
         // ∩-cap the root enclosure with the full-graph IBP (numpy parity; keeps the
         // region ∩ cap tight).
-        let root_box = match node_bounds.get(name) {
-            Some(ib) if ib.shape() == root_bounds.shape() => root_bounds
-                .intersection_per_element(ib)
-                .map(|(t, _)| t)
-                .unwrap_or(root_bounds),
-            _ => root_bounds,
-        };
+        let root_box = root_bounds
+            .intersection_per_element(source_bounds)
+            .map(|(bounds, _)| bounds)
+            .unwrap_or(root_bounds);
         let (d, unst, mw) = node_stats(&root_box);
         eprintln!(
             "[imb] coeff {name}: dim={d} unstable={unst} root_max_w={mw:.4} in_cols={} ({:.1}s)",
@@ -5318,7 +7374,8 @@ fn build_tail_anchor_coeffs(
 /// the REGION box (numpy `concretize_box`) — the 0-fresh-crown-to-node-per-region
 /// step. For each source: `l_r[i] = Σ_j (pos(la)·rl + neg(la)·ru) + lb[i]` minus the
 /// outward coeff-error penalty; `u_r[i]` analogously with `ua/ub`; then `∩` the root
-/// box. Directed-rounded OUTWARD (accumulate in f64, `next_down`/`next_up` the f32).
+/// box. Every product and accumulation is directed OUTWARD in f64 before an
+/// outward binary32 downcast.
 ///
 /// SOUND: for a region ⊆ root, `l_r ≤ min_{x∈region} node(x)` and
 /// `u_r ≥ max_{x∈region} node(x)` (interval concretization of a root-valid linear
@@ -5360,25 +7417,40 @@ fn concretize_region_anchors(
             for j in 0..n_in {
                 let laij = la[[i, j]] as f64;
                 let uaij = ua[[i, j]] as f64;
-                l += if laij >= 0.0 {
+                let lower_term = if laij >= 0.0 {
                     laij * rl[j] as f64
                 } else {
                     laij * ru[j] as f64
                 };
-                u += if uaij >= 0.0 {
+                let upper_term = if uaij >= 0.0 {
                     uaij * ru[j] as f64
                 } else {
                     uaij * rl[j] as f64
                 };
+                if !lower_term.is_finite() || !upper_term.is_finite() {
+                    return None;
+                }
+                l = next_down_f64(l + next_down_f64(lower_term));
+                u = next_up_f64(u + next_up_f64(upper_term));
             }
             // Discharge the certified coeff error OUTWARD over the region box.
             if let Some(e) = le {
                 let mut p = 0.0f64;
                 for j in 0..n_in {
-                    p += e[[i, j]] as f64 * mag[j];
+                    let error = f64::from(e[[i, j]]);
+                    if !error.is_finite() || error < 0.0 {
+                        p = f64::INFINITY;
+                        break;
+                    }
+                    let error_term = error * mag[j];
+                    if !error_term.is_finite() {
+                        p = f64::INFINITY;
+                        break;
+                    }
+                    p = next_up_f64(p + next_up_f64(error_term));
                 }
                 if p.is_finite() {
-                    l -= p;
+                    l = next_down_f64(l - p);
                 } else {
                     l = f64::NEG_INFINITY;
                 }
@@ -5386,10 +7458,20 @@ fn concretize_region_anchors(
             if let Some(e) = ue {
                 let mut p = 0.0f64;
                 for j in 0..n_in {
-                    p += e[[i, j]] as f64 * mag[j];
+                    let error = f64::from(e[[i, j]]);
+                    if !error.is_finite() || error < 0.0 {
+                        p = f64::INFINITY;
+                        break;
+                    }
+                    let error_term = error * mag[j];
+                    if !error_term.is_finite() {
+                        p = f64::INFINITY;
+                        break;
+                    }
+                    p = next_up_f64(p + next_up_f64(error_term));
                 }
                 if p.is_finite() {
-                    u += p;
+                    u = next_up_f64(u + p);
                 } else {
                     u = f64::INFINITY;
                 }

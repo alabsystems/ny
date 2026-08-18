@@ -13,10 +13,26 @@
 //!
 //! Part of #2220 Packet C.
 
+use super::compose::{add_f64_down, add_f64_up};
 use super::BatchedLinearBounds;
+use crate::bounds::safe_math::{
+    f32_to_f64_exact_for_bounds, f64_to_f32_down_for_bounds, f64_to_f32_up_for_bounds,
+};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
-use ny_core::{Result, CROWN_COEFF_MAX};
-use ny_tensor::{next_down_f32, next_up_f32};
+use ny_core::{is_crown_coeff_safe, Result};
+
+/// Certify one nominal binary32 SGEMM result against a binary64 reference.
+///
+/// `stored` is decoded from its bits so a subnormal result cannot disappear
+/// during conversion. Both arithmetic terms and their sum are rounded upward
+/// in binary64 before publication as a non-subnormal upper binary32 bound.
+#[inline]
+fn certified_compose_error(stored: f32, reference: f64, absolute_sum: f64, gamma_k: f64) -> f32 {
+    let stored = f32_to_f64_exact_for_bounds(stored);
+    let divergence = add_f64_up(0.0, (stored - reference).abs());
+    let reference_error = add_f64_up(0.0, gamma_k * absolute_sum);
+    f64_to_f32_up_for_bounds(add_f64_up(divergence, reference_error))
+}
 
 impl BatchedLinearBounds {
     /// Check if all coefficient and bias arrays are finite (no NaN/Inf).
@@ -31,7 +47,7 @@ impl BatchedLinearBounds {
         b2_lower: &ArrayView2<f32>,
         b2_upper: &ArrayView2<f32>,
     ) -> bool {
-        let coeff_ok = |v: &f32| v.is_finite() && v.abs() <= CROWN_COEFF_MAX;
+        let coeff_ok = |v: &f32| is_crown_coeff_safe(*v);
         a2_lower.iter().all(coeff_ok)
             && a2_upper.iter().all(coeff_ok)
             && a1_lower.iter().all(coeff_ok)
@@ -82,9 +98,12 @@ impl BatchedLinearBounds {
     /// effective certified coefficient interval `[stored−err, stored+err]` encloses
     /// the exact real product `(A2·A1)[i,j]` for every coefficient.
     ///
-    /// The bias composition accumulates in **f64** directly (mirroring
-    /// `compose_scalar`), so its only rounding is the final f32 cast, covered by
-    /// the directed `next_down_f32`/`next_up_f32` — no bias error term is needed.
+    /// All binary32 operands and stored SGEMM results are decoded from their bit
+    /// patterns before certificate arithmetic. Thus a backend that applies DAZ
+    /// may flush a nominal SGEMM contribution, but the measured divergence still
+    /// includes the exact binary32 input contribution. Bias composition likewise
+    /// decodes operands bit-exactly, accumulates directionally in **f64**, and
+    /// publishes non-subnormal outward endpoints, so no bias error term is needed.
     ///
     /// Returns `(lower_a, upper_a, lower_b, upper_b, lower_a_err, upper_a_err)`.
     #[allow(clippy::type_complexity)]
@@ -190,12 +209,10 @@ impl BatchedLinearBounds {
                     let s_u = upper_a_b[[i, j]];
                     composed_lower_a[[b, i, j]] = s_l;
                     composed_upper_a[[b, i, j]] = s_u;
-                    let div_l = (s_l as f64 - lower_d[[i, j]]).abs();
-                    let div_u = (s_u as f64 - upper_d[[i, j]]).abs();
                     composed_lower_a_err[[b, i, j]] =
-                        next_up_f32((div_l + gamma_k * lower_s[[i, j]]) as f32);
+                        certified_compose_error(s_l, lower_d[[i, j]], lower_s[[i, j]], gamma_k);
                     composed_upper_a_err[[b, i, j]] =
-                        next_up_f32((div_u + gamma_k * upper_s[[i, j]]) as f32);
+                        certified_compose_error(s_u, upper_d[[i, j]], upper_s[[i, j]], gamma_k);
                 }
             }
 
@@ -206,26 +223,28 @@ impl BatchedLinearBounds {
             let b1_u_b = b1_upper.index_axis(ndarray::Axis(0), b);
 
             for i in 0..other_out_dim {
-                let mut sum_l = b2_lower[[b, i]] as f64;
-                let mut sum_u = b2_upper[[b, i]] as f64;
+                let mut sum_l = f32_to_f64_exact_for_bounds(b2_lower[[b, i]]);
+                let mut sum_u = f32_to_f64_exact_for_bounds(b2_upper[[b, i]]);
                 for k in 0..contraction {
-                    let a2l = a2_l_b[[i, k]] as f64;
-                    let a2u = a2_u_b[[i, k]] as f64;
+                    let a2l = f32_to_f64_exact_for_bounds(a2_l_b[[i, k]]);
+                    let a2u = f32_to_f64_exact_for_bounds(a2_u_b[[i, k]]);
                     // lower: pos(a2_l)·b1_l + neg(a2_l)·b1_u
-                    sum_l += if a2l >= 0.0 {
-                        a2l * b1_l_b[k] as f64
+                    let term_l = if a2l >= 0.0 {
+                        a2l * f32_to_f64_exact_for_bounds(b1_l_b[k])
                     } else {
-                        a2l * b1_u_b[k] as f64
+                        a2l * f32_to_f64_exact_for_bounds(b1_u_b[k])
                     };
+                    sum_l = add_f64_down(sum_l, term_l);
                     // upper: pos(a2_u)·b1_u + neg(a2_u)·b1_l
-                    sum_u += if a2u >= 0.0 {
-                        a2u * b1_u_b[k] as f64
+                    let term_u = if a2u >= 0.0 {
+                        a2u * f32_to_f64_exact_for_bounds(b1_u_b[k])
                     } else {
-                        a2u * b1_l_b[k] as f64
+                        a2u * f32_to_f64_exact_for_bounds(b1_l_b[k])
                     };
+                    sum_u = add_f64_up(sum_u, term_u);
                 }
-                composed_lower_b[[b, i]] = next_down_f32(sum_l as f32);
-                composed_upper_b[[b, i]] = next_up_f32(sum_u as f32);
+                composed_lower_b[[b, i]] = f64_to_f32_down_for_bounds(sum_l);
+                composed_upper_b[[b, i]] = f64_to_f32_up_for_bounds(sum_u);
             }
         }
 
@@ -269,24 +288,24 @@ impl BatchedLinearBounds {
                 let mut du = 0.0f64;
                 let mut su = 0.0f64;
                 for k in 0..contraction {
-                    let a2l = a2_l_b[[i, k]] as f64;
-                    let a2u = a2_u_b[[i, k]] as f64;
+                    let a2l = f32_to_f64_exact_for_bounds(a2_l_b[[i, k]]);
+                    let a2u = f32_to_f64_exact_for_bounds(a2_u_b[[i, k]]);
                     // lower: pos(a2_l)·a1_l + neg(a2_l)·a1_u — select a1_l if a2_l>=0.
                     let a1_for_l = if a2l >= 0.0 {
-                        a1_l_b[[k, j]] as f64
+                        f32_to_f64_exact_for_bounds(a1_l_b[[k, j]])
                     } else {
-                        a1_u_b[[k, j]] as f64
+                        f32_to_f64_exact_for_bounds(a1_u_b[[k, j]])
                     };
                     dl += a2l * a1_for_l;
-                    sl += a2l.abs() * a1_for_l.abs();
+                    sl = add_f64_up(sl, a2l.abs() * a1_for_l.abs());
                     // upper: pos(a2_u)·a1_u + neg(a2_u)·a1_l — select a1_u if a2_u>=0.
                     let a1_for_u = if a2u >= 0.0 {
-                        a1_u_b[[k, j]] as f64
+                        f32_to_f64_exact_for_bounds(a1_u_b[[k, j]])
                     } else {
-                        a1_l_b[[k, j]] as f64
+                        f32_to_f64_exact_for_bounds(a1_l_b[[k, j]])
                     };
                     du += a2u * a1_for_u;
-                    su += a2u.abs() * a1_for_u.abs();
+                    su = add_f64_up(su, a2u.abs() * a1_for_u.abs());
                 }
                 lower_d[[i, j]] = dl;
                 lower_s[[i, j]] = sl;
@@ -412,5 +431,265 @@ mod tests {
                 "lower_b {l} > upper_b {u}"
             );
         }
+    }
+
+    #[test]
+    fn compose_rejects_an_incoming_certified_coefficient_error() {
+        // These adjacent binary32 values have distinct exact products with q,
+        // but both products round to the same stored binary32 coefficient:
+        //
+        // q*a0 = 1.0046255139361833
+        // q*a1 = 1.0046255813405338
+        //
+        // Chaining a [1, -1] composition therefore cancels the stored values to
+        // zero while the exact residual is -6.740435054553018e-8. The first
+        // compose records that discrepancy in coeff_err; the second must not
+        // silently drop it.
+        let q = f32::from_bits(0x3f90_bfef);
+        let a0 = f32::from_bits(0x3f63_6c8d);
+        let a1 = f32::from_bits(0x3f63_6c8e);
+        let source = make_bounds(
+            array![[q]],
+            array![0.0],
+            array![[q]],
+            array![0.0],
+            vec![1],
+            vec![1],
+        );
+        let expand = make_bounds(
+            array![[a0], [a1]],
+            array![0.0, 0.0],
+            array![[a0], [a1]],
+            array![0.0, 0.0],
+            vec![1],
+            vec![2],
+        );
+        let first = source.compose(&expand).expect("first composition");
+        assert!(first.has_coeff_err());
+        let nominal: Vec<f32> = first.lower_a().iter().copied().collect();
+        assert_eq!(nominal[0].to_bits(), nominal[1].to_bits());
+
+        let cancel = make_bounds(
+            array![[1.0, -1.0]],
+            array![0.0],
+            array![[1.0, -1.0]],
+            array![0.0],
+            vec![2],
+            vec![1],
+        );
+        let err = first
+            .compose(&cancel)
+            .expect_err("incoming coefficient error must not be discarded");
+        assert!(
+            err.to_string().contains("certified coefficient error"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compose_bias_reduction_survives_binary64_cancellation() {
+        // Sequential RN-f64 evaluation of (2^32 + 2^-32) - 2^32 is zero:
+        // the tiny middle term is lost at the large partial sum. A final
+        // binary32 next_up(0) is still far below the exact 2^-32 result.
+        let huge = 4_294_967_296.0_f32;
+        let tiny = 2.0_f32.powi(-32);
+        let source = make_bounds(
+            Array2::eye(3),
+            array![huge, tiny, -huge],
+            Array2::eye(3),
+            array![huge, tiny, -huge],
+            vec![3],
+            vec![3],
+        );
+        let sum = make_bounds(
+            array![[1.0, 1.0, 1.0]],
+            array![0.0],
+            array![[1.0, 1.0, 1.0]],
+            array![0.0],
+            vec![3],
+            vec![1],
+        );
+
+        let composed = source.compose(&sum).expect("composition");
+        assert!(
+            composed.lower_b()[[0]] <= tiny,
+            "lower bias {} excludes exact {tiny}",
+            composed.lower_b()[[0]]
+        );
+        assert!(
+            composed.upper_b()[[0]] >= tiny,
+            "upper bias {} excludes exact {tiny}",
+            composed.upper_b()[[0]]
+        );
+    }
+
+    #[test]
+    fn compose_blas_certifies_amplified_subnormal_coefficient_and_bias() {
+        let tiny = f32::from_bits(1);
+        let large = 2.0_f32.powi(120);
+        let exact = 2.0_f64.powi(-29);
+        let a2_lower = Array3::from_elem((1, 1, 1), tiny);
+        let a2_upper = Array3::from_elem((1, 1, 1), tiny);
+        let a1_lower = Array3::from_elem((1, 1, 1), large);
+        let a1_upper = Array3::from_elem((1, 1, 1), large);
+        let b1_lower = Array2::from_elem((1, 1), large);
+        let b1_upper = Array2::from_elem((1, 1), large);
+        let b2_lower = Array2::zeros((1, 1));
+        let b2_upper = Array2::zeros((1, 1));
+
+        // Call the BLAS implementation directly: the public router deliberately
+        // sends 2^120 (above CROWN_COEFF_MAX) through the scalar fallback.
+        let (lower_a, upper_a, lower_b, upper_b, lower_a_err, upper_a_err) =
+            BatchedLinearBounds::compose_blas(
+                &a2_lower.view(),
+                &a2_upper.view(),
+                &a1_lower.view(),
+                &a1_upper.view(),
+                &b1_lower.view(),
+                &b1_upper.view(),
+                &b2_lower.view(),
+                &b2_upper.view(),
+                1,
+                1,
+                1,
+            )
+            .expect("BLAS composition");
+
+        let lower_stored = f32_to_f64_exact_for_bounds(lower_a[[0, 0, 0]]);
+        let upper_stored = f32_to_f64_exact_for_bounds(upper_a[[0, 0, 0]]);
+        let lower_err = f32_to_f64_exact_for_bounds(lower_a_err[[0, 0, 0]]);
+        let upper_err = f32_to_f64_exact_for_bounds(upper_a_err[[0, 0, 0]]);
+        assert!(
+            lower_stored - lower_err <= exact && lower_stored + lower_err >= exact,
+            "lower coefficient certificate [{:e}, {:e}] excludes {exact:e}",
+            lower_stored - lower_err,
+            lower_stored + lower_err
+        );
+        assert!(
+            upper_stored - upper_err <= exact && upper_stored + upper_err >= exact,
+            "upper coefficient certificate [{:e}, {:e}] excludes {exact:e}",
+            upper_stored - upper_err,
+            upper_stored + upper_err
+        );
+
+        let lower_bias = f32_to_f64_exact_for_bounds(lower_b[[0, 0]]);
+        let upper_bias = f32_to_f64_exact_for_bounds(upper_b[[0, 0]]);
+        assert!(
+            lower_bias <= exact,
+            "lower bias {lower_bias:e} excludes {exact:e}"
+        );
+        assert!(
+            upper_bias >= exact,
+            "upper bias {upper_bias:e} excludes {exact:e}"
+        );
+    }
+
+    #[test]
+    fn public_compose_blas_certifies_a_daz_sensitive_normal_result() {
+        let tiny = f32::from_bits(1);
+        let large = 2.0_f32.powi(30);
+        let exact = 2.0_f64.powi(-119);
+        let source = make_bounds(
+            array![[large]],
+            array![large],
+            array![[large]],
+            array![large],
+            vec![1],
+            vec![1],
+        );
+        let outer = make_bounds(
+            array![[tiny]],
+            array![0.0],
+            array![[tiny]],
+            array![0.0],
+            vec![1],
+            vec![1],
+        );
+
+        let composed = source.compose(&outer).expect("public BLAS composition");
+        assert!(
+            composed.has_coeff_err(),
+            "safe finite operands must use the certified BLAS path"
+        );
+        let stored = f32_to_f64_exact_for_bounds(composed.lower_a()[[0, 0]]);
+        let error = f32_to_f64_exact_for_bounds(
+            composed.lower_a_err.as_ref().expect("coefficient error")[[0, 0]],
+        );
+        assert!(
+            stored - error <= exact && stored + error >= exact,
+            "coefficient certificate [{:e}, {:e}] excludes {exact:e}",
+            stored - error,
+            stored + error
+        );
+        let lower_bias = f32_to_f64_exact_for_bounds(composed.lower_b()[[0]]);
+        let upper_bias = f32_to_f64_exact_for_bounds(composed.upper_b()[[0]]);
+        assert!(lower_bias <= exact, "lower bias excludes {exact:e}");
+        assert!(upper_bias >= exact, "upper bias excludes {exact:e}");
+    }
+
+    #[test]
+    fn compose_certificate_survives_a_daz_flushing_engine_result() {
+        use ny_core::GemmEngine;
+
+        struct MockDazGemmEngine;
+
+        impl GemmEngine for MockDazGemmEngine {
+            fn gemm_f32(
+                &self,
+                m: usize,
+                k: usize,
+                n: usize,
+                a: &[f32],
+                b: &[f32],
+            ) -> Result<Vec<f32>> {
+                assert_eq!(a.len(), m * k);
+                assert_eq!(b.len(), k * n);
+
+                let flush = |value: f32| {
+                    let bits = value.to_bits();
+                    if bits & 0x7f80_0000 == 0 && bits & 0x007f_ffff != 0 {
+                        f32::from_bits(bits & 0x8000_0000)
+                    } else {
+                        value
+                    }
+                };
+                let mut output = vec![0.0; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0.0;
+                        for l in 0..k {
+                            let lhs = flush(a[i * k + l]);
+                            let rhs = flush(b[l * n + j]);
+                            acc = flush(acc + flush(lhs * rhs));
+                        }
+                        output[i * n + j] = acc;
+                    }
+                }
+                Ok(output)
+            }
+        }
+
+        let tiny = f32::from_bits(1);
+        let large = 2.0_f32.powi(120);
+        let exact = f32_to_f64_exact_for_bounds(tiny) * f32_to_f64_exact_for_bounds(large);
+        let stored = MockDazGemmEngine
+            .gemm_f32(1, 1, 1, &[tiny], &[large])
+            .expect("mock DAZ GEMM")[0];
+        assert_eq!(stored.to_bits(), 0, "mock engine must flush the operand");
+
+        let gamma_k = crate::layers::linear::crown_single_gamma_n_f64(2);
+        let error = certified_compose_error(stored, exact, exact, gamma_k);
+        let error = f32_to_f64_exact_for_bounds(error);
+        let stored = f32_to_f64_exact_for_bounds(stored);
+        assert!(
+            stored - error <= exact && stored + error >= exact,
+            "certificate [{:e}, {:e}] excludes {exact:e}",
+            stored - error,
+            stored + error
+        );
+        assert!(
+            error >= exact,
+            "flushed nominal zero needs at least the amplified {exact:e} error, got {error:e}"
+        );
     }
 }

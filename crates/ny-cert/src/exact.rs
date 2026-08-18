@@ -2,11 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exact true-minimum of a one-hidden-layer ReLU network over its input box, in
-//! **arbitrary** input dimension, by complete hyperplane-arrangement vertex
-//! enumeration. This is a *decision procedure*, not sampling: it computes the
-//! exact minimum (so `certified_bound ≤ exact_min` is a real per-network
-//! soundness proof, with no grid blind spot in any dimension).
+//! Exact true-minimum of a one-hidden-layer ReLU network over its input box by
+//! complete hyperplane-arrangement vertex enumeration. This is a
+//! resource-bounded decision procedure, not sampling: for every accepted
+//! instance it computes the exact minimum (so
+//! `certified_bound ≤ exact_min` is a real per-network soundness proof, with no
+//! grid blind spot). Instances whose complete enumeration would exceed the
+//! explicit work cap are rejected before enumeration.
 //!
 //! The true network `y = W₂·ReLU(W₁·x + b₁) + b₂` is continuous piecewise-linear
 //! in `x`. Its minimum over the axis-aligned box is attained at a **vertex of the
@@ -21,22 +23,83 @@
 use crate::crown::{CrownError, Relu1Problem};
 use crate::rational::{Rat, RatError};
 
+/// Maximum number of candidate hyperplane subsets `exact_min_nd` will solve.
+///
+/// Vertex enumeration is complete only when every `n`-subset is visited, so a
+/// resource limit must reject the request before constructing a truncated
+/// combination. Silently clipping the initial index vector changes the
+/// dimension of the linear systems and can return a false "exact" minimum.
+const MAX_EXACT_COMBINATIONS: usize = 100_000;
+
+/// Legacy syntactic bound consumed by the allocation checker in
+/// [`solve_system`]. The public entry rejects at or above it before allocating
+/// any plane rows; the much tighter combination cap normally fires first.
+const MAX_EXACT_SYSTEM_DIMENSION: usize = 1_048_576;
+
+/// Return whether `C(total, choose)` is at most `limit`.
+///
+/// The multiplicative binomial recurrence is exact at every step. While the
+/// running count is within `limit`, multiplying it by a `usize` numerator fits
+/// in `u128` on all supported targets for this bounded-work cap. Any
+/// arithmetic failure is conservatively treated as over limit.
+fn combination_count_within_limit(total: usize, choose: usize, limit: usize) -> bool {
+    if choose > total {
+        return true;
+    }
+    let choose = choose.min(total - choose);
+    let mut count = 1_u128;
+    for i in 1..=choose {
+        let numerator = total - choose + i;
+        let Some(product) = count.checked_mul(numerator as u128) else {
+            return false;
+        };
+        count = product / i as u128;
+        if count > limit as u128 {
+            return false;
+        }
+    }
+    true
+}
+
 impl Relu1Problem {
-    /// Exact minimum of the true network over the input box, for any input
-    /// dimension, by arrangement-vertex enumeration. Returns `None` only for the
-    /// empty (zero-dimensional) input.
+    /// Exact minimum of the true network over the input box, in any dimension
+    /// whose complete arrangement enumeration fits the work cap. Returns `None`
+    /// only for the empty (zero-dimensional) input.
     ///
     /// # Errors
     /// Returns [`CrownError::Dimension`] for a shape-inconsistent network built
     /// through the pub fields (previously: under-long vectors hit an index
     /// panic, while over-long `input_upper`/`b1`/`w2` were silently truncated —
-    /// both now error, matching `certify`/`preact_bounds`); propagates
-    /// exact-arithmetic overflow.
+    /// both now error, matching `certify`/`preact_bounds`) or when complete
+    /// arrangement enumeration would exceed the explicit resource caps. The
+    /// method never silently truncates an enumeration. Rational-arena failures
+    /// are propagated.
     pub fn exact_min_nd(&self) -> Result<Option<Rat>, CrownError> {
+        crate::rational::ensure_healthy()?;
         self.validate()?;
         let n = self.input_lower.len();
         if n == 0 {
             return Ok(None);
+        }
+        if n >= MAX_EXACT_SYSTEM_DIMENSION {
+            return Err(CrownError::Dimension(format!(
+                "exact_min_nd input dimension {n} reaches the \
+                 {MAX_EXACT_SYSTEM_DIMENSION}-dimension resource cap"
+            )));
+        }
+        let plane_count = n
+            .checked_mul(2)
+            .and_then(|box_planes| box_planes.checked_add(self.w1.len()))
+            .ok_or_else(|| {
+                CrownError::Dimension(
+                    "exact_min_nd arrangement plane count overflows usize".to_string(),
+                )
+            })?;
+        if !combination_count_within_limit(plane_count, n, MAX_EXACT_COMBINATIONS) {
+            return Err(CrownError::Dimension(format!(
+                "exact_min_nd arrangement C({plane_count},{n}) exceeds the \
+                 {MAX_EXACT_COMBINATIONS}-combination resource cap"
+            )));
         }
 
         // Assemble candidate hyperplanes `a · x = b`.
@@ -73,11 +136,11 @@ impl Relu1Problem {
         // `Vec::new()` + push loop (NOT `collect`): the inline `min(n, C)`
         // collect-count form did not discharge in every lane (see
         // `solve_system`'s solution-vector note below) — the push loop carries
-        // no allocation-size obligation. The `.min(1_048_576)` loop cap is kept
-        // so the count is identical (`n` is the input dimension,
-        // `input_lower.len()`, in practice a handful — `.min` is the identity).
+        // no allocation-size obligation. The `.min(MAX_EXACT_SYSTEM_DIMENSION)`
+        // loop cap remains as the allocation checker's syntactic bound. The
+        // explicit public-entry guard above proves it is the identity.
         let mut combo: Vec<usize> = Vec::new();
-        for i in 0..n.min(1_048_576) {
+        for i in 0..n.min(MAX_EXACT_SYSTEM_DIMENSION) {
             combo.push(i);
         }
         // Iterate all n-subsets of `planes` in lexicographic order.
@@ -105,6 +168,7 @@ impl Relu1Problem {
                 break;
             }
         }
+        crate::rational::ensure_healthy()?;
         Ok(best)
     }
 }
@@ -133,7 +197,12 @@ fn next_combination(combo: &mut [usize], total: usize) -> bool {
     if total < k {
         return false;
     }
-    for i in (0..k).rev() {
+    // Forward index (not `(0..k).rev()`): the `Rev<Range>` adapter is an
+    // absent-callee for the panic-freedom checker; `i = k-1-idx` reverses the
+    // walk exactly (idx=0 → i=k-1 down to idx=k-1 → i=0). Saturating subs match
+    // the file idiom and are provably exact here (k >= 1 in-body, idx <= k-1).
+    for idx in 0..k {
+        let i = k.saturating_sub(1).saturating_sub(idx);
         // Maximum value position `i` can take is `total - k + i`. Saturating
         // ops + `.get()` reads keep every step TOTAL for the intraprocedural
         // verifier: the `total < k` guard above makes `total - k` non-wrapping
@@ -205,7 +274,7 @@ fn solve_system(planes: &[(Vec<Rat>, Rat)], combo: &[usize]) -> Result<Option<Ve
     // solution-vector `collect`'s unbounded-allocation obligation and makes the
     // function fail-closed against an implausibly large `combo` rather than
     // attempting a multi-gigabyte allocation. No behavior change for real inputs.
-    if n >= (1_048_576) {
+    if n >= MAX_EXACT_SYSTEM_DIMENSION {
         return Ok(None);
     }
     // Augmented matrix [A | b]. `Vec::new()` (not `with_capacity(n)`): the
@@ -289,11 +358,9 @@ fn solve_system(planes: &[(Vec<Rat>, Rat)], combo: &[usize]) -> Result<Option<Ve
         }
     }
 
-    // `n.min(1<<20)` gives the allocation checker a *syntactic* `min(n, C) <= C`
-    // bound it can consume (the early `n >= 1<<20` return's path-condition is in
-    // a different lane and was NOT consumed — the collect stayed FAILED). Since
-    // that guard already ensures `n < 1<<20` here, so the solution vector still
-    // has exactly `n` entries — behavior-preserving.
+    // The public entry's `MAX_EXACT_SYSTEM_DIMENSION` guard supplies a syntactic
+    // allocation bound to the checker; this solution vector still has exactly
+    // `n` entries.
     // `Vec::new()` + push loop (NOT `collect`): neither the let-bound nor the
     // inline `min(_, C)` collect-count form discharges here (the checker
     // fail-closes it), but incremental push growth carries no bulk-allocation
@@ -389,5 +456,39 @@ mod tests {
         }
         assert_eq!(count, 6);
         assert_eq!(c, vec![2, 3]); // last combination
+    }
+
+    #[test]
+    fn nd_rejects_an_intractable_arrangement_before_enumeration() {
+        // Even with no ReLU planes, C(20,10)=184,756 vertices. The former
+        // min-capped combo construction could silently change the system
+        // dimension at very large n; the public entry must instead refuse any
+        // arrangement beyond its explicit complete-enumeration budget.
+        let n = 10;
+        let p = Relu1Problem {
+            w1: Vec::new(),
+            b1: Vec::new(),
+            w2: Vec::new(),
+            b2: Rat::ZERO,
+            input_lower: vec![Rat::ZERO; n],
+            input_upper: vec![Rat::ONE; n],
+            alpha: None,
+        };
+        let error = p
+            .exact_min_nd()
+            .expect_err("an incomplete enumeration must be rejected");
+        assert!(
+            matches!(error, CrownError::Dimension(message) if message.contains("combination resource cap"))
+        );
+        assert!(combination_count_within_limit(
+            18,
+            9,
+            MAX_EXACT_COMBINATIONS
+        ));
+        assert!(!combination_count_within_limit(
+            20,
+            10,
+            MAX_EXACT_COMBINATIONS
+        ));
     }
 }

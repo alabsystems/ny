@@ -20,6 +20,9 @@ general:
 
 attack:
   pgd_order: middle
+  # NY does not implement reference middle placement; explicitly retain the
+  # measured upfront schedule (including the VNN-COMP disjunction APGD lane).
+  ny_pgd_order_compat: upfront
   pgd_restarts: 10
   pgd_restart_when_stuck: true
 
@@ -28,11 +31,104 @@ attack:
 # alpha/beta verifier. Unknown or renamed eligible rows retain the reserve;
 # structural nonmatches keep the historical NotApplicable behavior. The
 # released route also arms the bounded sparse root CROWN pass in-process.
+#
+# MARGIN-ROW TWIN-WALL PAIR (#twinwall-join, measured 2026-08-04, GB10 + CUDA).
+#
+# WHY THIS CATEGORY DID NOT ADMIT THE LANE. Nothing structural was ever in the
+# way: `extract_twin_spec` accepts both CIFAR100 ResNets, `parse_vnnlib_robustness`
+# accepts every row, and `general.device: wgpu` satisfies the GPU premise in
+# `spawn_concurrent_lane`. cifar100 simply never set `margin_row.concurrent`,
+# so `concurrent_lane_armed` returned false and the lane only ever ran INLINE,
+# on the seconds left after the internal verifier gave up.
+#
+# DO NOT TRUST THE OLD NEGATIVE RESULT. `spawn_concurrent_lane`'s own comment
+# records a 12-row cifar100 A/B (2026-08-02) that found "no conversion and no
+# regression" and concluded the mechanism "simply does not pay on this
+# category". That test armed `concurrent` ALONE, before `root_f32` existed, and
+# — decisively — on a binary whose post-BaB join threw the lane's answer away
+# (see below). It is not evidence about the pair.
+#
+# MEASURED, 20 resnet_large rows, arms INTERLEAVED, same binary, official 100 s
+# budget, through `ny vnncomp` with this preset:
+#     stock preset  timeout 20/20   unsat 0/20
+#     this preset   unsat   20/20   (lane 23.9-77.1 s, median 32.7 s)
+# The 20 are exactly the resnet_large rows the 2026-07-18 sweep bank
+# (c4a8821b) closed with the bare lane and that the harness has never
+# reproduced; all 20 carry 4 independent published `(h)` proofs and zero `(v)`
+# dissent, and none is on the 29-row counterexample watchlist.
+#
+# WHY BOTH KEYS. `concurrent: true` is what hands the lane the whole instance
+# budget instead of the verifier's leftovers — the budget its bank was measured
+# with. `root_f32: true` halves the streamed width of the bandwidth-bound root
+# forward conv, which is the dominant cost; it is a PURE LOOSENING (every f32
+# rounding is charged into a certified additive concretize slack that is
+# subtracted from each lower endpoint and added to each upper one), re-verified
+# here by `f32_fastpath_boxes_contain_f64_and_report_dj` (23424 box checks, 0
+# containment breaches) and by the whole ny-propagate `margin_row` suite run
+# under `NY_MARGIN_ROW_ROOT_F32=1` (66/66 pass, enclosure oracles 0 violations).
+#
+# COST, MEASURED AND NOT HIDDEN. Arming `concurrent` also DISABLES the inline
+# post-verifier lane (they are exclusive in `run_and_translate`), so a row the
+# inline lane closed with the whole machine can be lost to the contended
+# concurrent one. On the 25 currently-decided rows: 12/12 `sat` held, 11/13
+# `unsat` held. Of the two that did not, `prop_idx_8600` times out in BOTH arms
+# on 3 interleaved repeats (a stale banked row, not a pair effect) and
+# `prop_idx_8450` is a genuine marginal loss (control closes it 1 of 3, this
+# preset 0 of 4). Net on the 45 rows measured: +20, -1.
+#
+# `adaptive_reserve` STAYS. It is what releases the 45 s reserve back to the
+# internal verifier at this category's 95 s internal tier AND what arms the
+# scored sparse root CROWN pass; writing `reserve_secs: 0` instead would
+# short-circuit `margin_row_reserve_decision` to `NotApplicable` and silently
+# drop that pass. The reserve and the concurrent lane therefore never both bill
+# the verifier — see `concurrent_presets_never_also_hold_a_reserve`, which
+# checks the effective reserve through the real policy function.
 margin_row:
   adaptive_reserve: true
+  concurrent: true
+  root_f32: true
 
 bab:
+  # #root-cap-100s: hard-cap the ROOT alpha-CROWN warmup (and the
+  # intermediate-bound collection inside it) so the margin-row BaB actually gets
+  # the ~26s it needs to close. Uncapped, the warmup expands to fill the
+  # initial-bounds slice and BaB inherits too little. Measured on
+  # CIFAR100_resnet_medium_prop_idx_9694 at the OFFICIAL 100s budget:
+  # timeout -> unsat. Paired with disjunctive_pgd_fraction below; NEITHER change
+  # converts the instance alone (both measured timeout in isolation).
+  # 2026-08-02: the pin was moved to plan-resolver rule 6 by 4c6f9033 and is
+  # RESTORED HERE, because delegating it is a measured regression on
+  # resnet_LARGE. 4c6f9033's own rationale covers the MEDIUM rule ("the medium
+  # rule reproduces 40s whenever rule 6 declines"); large is not covered, and
+  # large is where 25 banked UNSAT rows live. Measured at the official 100s
+  # budget on resnet_large: the margin-row BaB inline slice collapses from
+  # 47.4s with the pins to 8.1s without them (47.2s -> 8.2s on a second row) —
+  # a 6x loss of the slice these proofs need, with worst-case exposure
+  # 1422.3 -> 1409.1 (-13.2 normalized).
+  #
+  # It also breaks `plan_resolver::tests::shipped_cifar100_2024_resolves_byte_identical`,
+  # which fails at crates/ny-cli/src/plan_resolver.rs:2123 with
+  # "preset owns the pair keys: the FL probe must never be paid here" —
+  # the test states the contract: this preset OWNS the pair, and delegating it
+  # makes the resolver pay a 1.95s FL probe on the scored path. Reproduced by
+  # running it in release on 2026-08-02.
+  #
+  # Re-attempt the delegation only when rule 6 covers resnet_large and that
+  # test passes; the pins below are the measured bd6a9eff values.
+  root_alpha_cap_secs: 40
+  # Preserve finite DAG-alpha progress when the local 40s cap expires, then
+  # spend the remaining official budget on independently certified root CROWN
+  # and BaB instead of returning with domains_explored=0. The checkpoint is
+  # never verdict authority. Exact A/B kill switch:
+  # NY_ROOT_ALPHA_PHASE_CHECKPOINT=0.
+  root_alpha_phase_checkpoint: true
   batch_size: 256
+  # Match alpha-beta-CROWN's adaptive activation-split fill policy. The
+  # reference default ratio gives floor(log2(256 * 0.1)) = depth 4 at the
+  # singleton root (16 committed leaves). max_split_depth is NY's defensive
+  # truth-table/resource cap; alpha-beta-CROWN itself has no equivalent key.
+  min_batch_size_ratio: 0.1
+  max_split_depth: 4
   branching:
     # method removed: model-class-aware auto-branching selects ReLU-split (kFSB,
     # graph engine) for this high-dim conv net (3072-element input) — input-splitting
@@ -43,14 +139,97 @@ bab:
     # Pareto on cifar100 (9/9 instances strictly better bound trajectory, 0
     # verdict regressions, wall never extended). Kill switch: NY_MO_KFSB=0.
     kfsb_multi: true
+    # Reuse the one-row certified lower endpoint already paid for by historical
+    # kFSB child simulation when it independently closes a committed leaf.
+    # The proof path is lower-bound-only, exact-history-scoped, deadline-gated,
+    # and default-off everywhere else. Kill switch:
+    # NY_MO_KFSB_CERT_REUSE=0 (every other present non-1 value also disables).
+    kfsb_cert_reuse: true
+  # --- Row-chunked comprehensive sound-GPU root intermediate sweep ---
+  # DELIVERY: the scored entry point exports exactly one NY_* variable, so the
+  # env lever this was measured through cannot fire in competition. These typed
+  # keys are how the result actually reaches a scored run
+  # (crates/ny-cli/tests/measured_gate_delivery.rs).
+  #
+  # MEASURED (official 100s budget, scored config, memory-guarded, GB10):
+  #   root objective census 0/99 -> 92/99 best row; 8 of 14 sampled timeout rows
+  #   gain; worst-objective margin -18.42 -> -1.09; per_child 3.10s -> 0.56s
+  #   because union_rows collapses 99 -> 7.
+  # NOT YET a conversion: all 14 rows still time out. This is banked because the
+  # root census is the quantity every remaining cifar100 lever depends on.
+  #
+  # chunks>1 runs the SAME bounded sweep over DISJOINT row windows and
+  # accumulates: peak device memory stays at one chunk while coverage grows with
+  # available time. Sound by construction - each sweep atomic over its window,
+  # each commit shrink-only, all windows cut from one frozen transcript.
+  # chunks: 1 is byte-identical to the historical single sweep.
+  root_comprehensive_gpu_interm: true
+  root_comprehensive_gpu_interm_chunks: 64
   alpha_crown:
     lr_alpha: 0.25
+    # RETRACTED JUSTIFICATION, kept value. The old reason for 20 was a sealed
+    # zero-update experiment that reclaimed the dead CPU preloop on prop7704 but
+    # did not convert it and turned already-banked medium row 4 from UNSAT to
+    # timeout. That experiment PREDATES the row-chunked intermediate sweep above;
+    # with the sweep supplying the root tightening the warmup and the sweep are
+    # SUBSTITUTES, so the old result no longer justifies this value
+    # (docs/VNNCOMP_CRITICAL_PATH_2026-08-12.md §33). The narrow zero-update
+    # mechanism is still available for controlled experiments.
+    #
+    # MEASURED there, iterations 20 -> 4, official 100s budget, three closest
+    # cifar100 rows:
+    #   row        bootstrap       verified    frontier
+    #   idx_2176   23.2 -> 12.5s   87 -> 87    -3.360 -> -3.360
+    #   idx_8600   22.9 -> 11.8s   85 -> 86    -1.085 -> -1.085
+    #   idx_2132   21.9 -> 11.5s   82 -> 79    -2.433 -> -2.700
+    # ZERO conversions either way - every one of those rows still times out.
+    # §33's own words are "Freeing 11 s changed the frontier by nothing -
+    # identical to five decimals" and "redundancy removal, not budget
+    # reallocation". Note §33 argues that in the OTHER direction - its heading is
+    # "The alpha warmup is now REDUNDANT" and it reads the substitution as reason
+    # to drop the warmup. Reading it instead as "no reason to touch a scored
+    # preset" is this file's judgement, not §33's, and rests on the zero
+    # conversions plus the idx_2132 regression below. §33 also records that BaB
+    # is not time-starved in the way the 11s would relieve - ~70% of the BaB
+    # window is spent outside the wave stage and is still unmeasured.
+    #
+    # AND THE A/B DOES NOT DESCRIBE THE PATH THAT SCORES. Its `verified` baseline
+    # column above is 87/85/82 for idx_2176/idx_8600/idx_2132. §33's own headline
+    # sweep table gives 92/85/79 for the same three rows, and §34's delivered
+    # typed-key table - the route that actually runs during scoring, the two keys
+    # set above - gives 95/87/83. Three tables, three different baselines: the
+    # 20 -> 4 arm was measured in NEITHER the headline sweep configuration NOR the
+    # typed-key path. That is table-to-table in one document, not an inference
+    # about provenance, and it is the strongest single reason not to act on the
+    # A/B - whatever it measured, it was not this preset.
+    #
+    # So 20 stays: the 11s buys nothing measurable, idx_2132 REGRESSES (82 -> 79
+    # verified, frontier -2.433 -> -2.700), the arm was measured against a
+    # baseline the scored path does not reproduce, and a 3-row sample carrying a
+    # live regression and no conversion is not grounds to change a SCORED preset.
+    # Revisit only if the freed time is shown to convert a row, measured through
+    # the typed-key path.
     iterations: 20
     full_conv_alpha: false
+    # alpha_zero_yield_frac intentionally stays absent. The 2026-08-11 samples
+    # found useful time recovery on 16 medium rows and no engagement on 16
+    # large rows, but retained neither a promotion-grade per-row artifact nor
+    # a row-complete A/B for this 200-row preset. Keep the typed seam available
+    # for controlled work; ship only after the evidence rule in the cited
+    # lever-census §8 is actually met.
   beta_crown:
     lr_alpha: 0.1
     lr_beta: 0.2
     iterations: 10
+  # Match the reference Complete Clipping policy for this ResNet lane: tighten
+  # the top 20 intermediate objectives during BaB, without alpha-CROWN clipping
+  # or the optional pruning/final-layer extensions.
+  clip:
+    interm_domain: true
+    interm_topk: 20
+    in_alpha_crown: false
+    prune: false
+    use_final_layer: false
   # #cifar-head-crown: the official winner's pre-alpha CROWN intermediate at
   # the structurally discovered Linear/Gemm -> ReLU head is the first measured
   # beneficial divergence from NY. On prop1761 this one 0.5s shrink-intersect
@@ -96,8 +275,76 @@ bab:
     # convergence throughput (the prop885 straggler climbs ~+0.25/depth and is still
     # -1.24 at depth 9 / 300s), NOT PGD budget — reclaim helps a little, but the
     # unsat pool needs the on-device batched-across-domains BaB throughput lever.
-    disjunctive_pgd_fraction: 0.40
+    # 2026-08-02 #fl-phase-budget: pin moved to the resolver's medium rule
+    # (same 0.05 when rule 6 declines); delegation required for rule-6 scope.
+    #
+    # MEASURED 2026-08-02 (RTX 5080 + WSL2, 10-CPU cgroup, official 100s budget).
+    # The "restore to 0.40 / keep 0.40" reasoning above is HALF the picture: it
+    # counts sat conversions and never counts the unsat losses. Both arms:
+    #
+    #   on 10 rows the bank falsifies and this box missed (all resnet_large):
+    #     0.05  sat 0/10          0.40  sat 8/10
+    #   on the 21 rows this box currently solves:
+    #     0.05  kept 21/21        0.40  kept 13/21  (lost 8)
+    #   => 0.40 is a WASH: +8 sat, -8 unsat.
+    #
+    # That also corrects a tempting misreading of the "unsat instances time out
+    # regardless, so attack budget is free" claim: BaB is NOT idle on the timeout
+    # pool. It converts exactly those 8 rows, and taking its slice is what loses
+    # them. Attack budget is not free.
+    #
+    # An interior sweep looked like a real optimum — total solved on a pool of
+    # those 31 rows: 0.05 -> 21, 0.10 -> 27, 0.15 -> 27, 0.20 -> 26. Clean
+    # unimodal curve. It did NOT survive an unbiased check, because that pool is
+    # 21 already-solved + 10 known-falsifiable rows, i.e. enriched with exactly
+    # the rows a budget shift moves. Two disjoint every-5th-row slices, 80 of 200:
+    #
+    #   slice A (n=40)  0.05 -> 2   0.10 -> 3
+    #   slice B (n=40)  0.05 -> 4   0.10 -> 3   (unsat 2 -> 1)
+    #   combined        0.05 -> 6   0.10 -> 6   NET ZERO
+    #
+    # So 0.05 stands. If you revisit this knob, score TOTAL SOLVED on an unbiased
+    # sample: single-lane evidence misleads in whichever direction you sampled,
+    # and an enriched pool will manufacture an optimum that is not there.
+    #
+    # RESTORED 2026-08-02 with its partner `root_alpha_cap_secs` above — see that
+    # comment for the measurement. The two are a measured PAIR (neither converts
+    # prop_idx_9694 alone; both timeout in isolation), so delegating one
+    # delegates both, and the delegation is a regression on resnet_large.
+    disjunctive_pgd_fraction: 0.05
     disjunctive_pgd_max_secs: 30
+    # #attack-anchor (2026-08-06). The 0.05 above is spent as `start + 5s`,
+    # anchored at the INSTANCE start, so model load / graph build / VNN-LIB
+    # parse are all charged against the falsifier's own slice. On the 15 MB
+    # resnet_LARGE that is the entire slice. MEASURED at the official 100s
+    # budget with NY_PGD_DIAG=1 on prop_idx_9773, shipped preset, loadavg 112:
+    #
+    #   [pgd-vjp-disj] deadline (0.1s): wave_steps=0 avg fwd=0.0ms vjp=0.0ms best_margin=-0.15517
+    #
+    # The batched exact-VJP falsifier got 0.1s of its 5s slice and took ZERO
+    # steps. That is why resnet_LARGE falsifies 0 of its 15 CE-watchlist rows
+    # while resnet_MEDIUM (cheaper setup) still falsifies 12 of 14 — and why the
+    # loss is load-dependent: on a quiet box the same rows sometimes come back,
+    # on a busy one never. `bd6a9eff` (0.40 -> 0.05) did not create this; it
+    # exposed it, because at 0.40 the 30s absolute cap left ~25s of REAL attack.
+    #
+    # `from_phase_start` makes the declared 5% actually reach the falsifier;
+    # `min_secs: 20` is the measured slice it needs on this model. A/B on the
+    # fix binary, official 100s, interleaved arms, one instance at a time
+    # (reports/measured-runs/lane2-cifar100-attack-anchor-2026-08-06):
+    #
+    #   6 lost resnet_LARGE sat rows (all GT-sat, organizer-accepted CEs):
+    #     stock 2/6      from_phase_start alone 2/6      + min_secs 20  5/6
+    #   6 resnet_MEDIUM unsat rows the bank still decides:
+    #     see cost.csv — the cost is real and lands on the WALL-HUGGERS
+    #     (prop_4429 closes at 86.4s of 100s and does not survive the slice).
+    #
+    # Sound for free: this only changes how long the falsifier runs. Every
+    # candidate still passes `re_evaluate_and_confirm` + the trusted-ORT gate
+    # (the recovered rows carry `True-f64 gate: enclosure CERTIFIES the
+    # violation`), and NO `unsat` is ever concluded from an attack.
+    disjunctive_pgd_from_phase_start: true
+    disjunctive_pgd_min_secs: 20
     # #graph-mip-admission-refund (measured 2026-07-22): the medium ResNet's
     # whole-net encoding is about 44M nonzeros, so Graph-MIP deterministically
     # declines against the shipped 5M memory-safety cap. Reserving its default

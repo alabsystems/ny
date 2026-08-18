@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ny_core::{NyError, Result};
+use ny_core::{f64_to_f32_down, f64_to_f32_up, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use super::LinearRelaxation;
@@ -70,8 +70,10 @@ impl BoundPropagation for ExpLayer {
         // NaN-propagating: .max() swallows NaN (IEEE 754-2008). (#3316)
         let lower = input
             .lower()
-            .mapv(|x| nan_propagating_max_zero(next_down_f32((x as f64).exp() as f32)));
-        let upper = input.upper().mapv(|x| next_up_f32((x as f64).exp() as f32));
+            .mapv(|x| nan_propagating_max_zero(next_down_f32(f64_to_f32_down((x as f64).exp()))));
+        let upper = input
+            .upper()
+            .mapv(|x| next_up_f32(f64_to_f32_up((x as f64).exp())));
         BoundedTensor::new(lower, upper)
     }
     impl_elementwise_activation!(
@@ -113,6 +115,24 @@ fn exp_intercept_correction(
     slope_err + mul_err + eval_add_err + exp_faithful_err
 }
 
+/// Reject an affine envelope that overflowed while being assembled.
+///
+/// Non-zero infinite slopes/intercepts are not a usable conservative line:
+/// ordinary evaluation can produce `inf - inf = NaN`.  The zero-slope wide
+/// fallback remains well-defined for every finite input.
+#[inline]
+fn finite_exp_relaxation_or_fallback(relaxation: LinearRelaxation) -> LinearRelaxation {
+    if relaxation.lower_slope.is_finite()
+        && relaxation.lower_intercept.is_finite()
+        && relaxation.upper_slope.is_finite()
+        && relaxation.upper_intercept.is_finite()
+    {
+        relaxation
+    } else {
+        LinearRelaxation::nan_fallback()
+    }
+}
+
 /// Linear relaxation for exp on interval [l, u].
 ///
 /// exp(x) is convex and monotonically increasing.
@@ -137,9 +157,11 @@ fn exp_intercept_correction(
 /// Reference: alpha-beta-CROWN `BoundExp.bound_relax` in
 /// `auto_LiRPA/operators/convex_concave.py:298-313`
 pub fn exp_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
-    // Guard: NaN bounds -> return conservative intercepts so downstream
-    // propagation widens to +/-inf instead of silently absorbing NaN.
-    if l.is_nan() || u.is_nan() {
+    // Guard invalid/unbounded intervals: return conservative intercepts so
+    // direct callers cannot receive NaN coefficients. Normal CROWN entry
+    // points reject these bounds in `exp_crown_domain_guard`, but this helper
+    // is public and must also fail closed on its own.
+    if !l.is_finite() || !u.is_finite() || l > u {
         return LinearRelaxation::nan_fallback();
     }
 
@@ -160,12 +182,12 @@ pub fn exp_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         let slope_f32 = slope as f32;
         let total_err =
             exp_intercept_correction(slope, slope_f32, intercept, l.abs() as f64, exp_l);
-        return LinearRelaxation::new(
+        return finite_exp_relaxation_or_fallback(LinearRelaxation::new(
             slope_f32,
-            next_down_f32((intercept - total_err) as f32),
+            next_down_f32(f64_to_f32_down(intercept - total_err)),
             slope_f32,
-            next_up_f32((intercept + total_err) as f32),
-        );
+            next_up_f32(f64_to_f32_up(intercept + total_err)),
+        ));
     }
 
     let exp_l = l64.exp();
@@ -218,12 +240,12 @@ pub fn exp_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         max_exp_val,
     );
 
-    LinearRelaxation::new(
+    finite_exp_relaxation_or_fallback(LinearRelaxation::new(
         lower_slope_f32,
-        next_down_f32((lower_intercept - lower_correction) as f32),
+        next_down_f32(f64_to_f32_down(lower_intercept - lower_correction)),
         upper_slope_f32,
-        next_up_f32((upper_intercept + upper_correction) as f32),
-    )
+        next_up_f32(f64_to_f32_up(upper_intercept + upper_correction)),
+    ))
 }
 
 fn exp_crown_domain_guard(pre_activation: &BoundedTensor) -> Result<()> {
@@ -544,6 +566,58 @@ mod tests {
         assert!(li.is_infinite() && li.is_sign_negative());
         assert_eq!(us, 0.0);
         assert!(ui.is_infinite() && ui.is_sign_positive());
+    }
+
+    #[test]
+    fn test_relaxation_invalid_or_unbounded_bounds_return_wide_bounds_4369() {
+        for (lower, upper) in [(1.0, -1.0), (f32::NEG_INFINITY, 0.0), (0.0, f32::INFINITY)] {
+            let result = exp_linear_relaxation(lower, upper);
+            assert_eq!(result.lower_slope, 0.0);
+            assert!(
+                result.lower_intercept.is_infinite() && result.lower_intercept.is_sign_negative()
+            );
+            assert_eq!(result.upper_slope, 0.0);
+            assert!(
+                result.upper_intercept.is_infinite() && result.upper_intercept.is_sign_positive()
+            );
+        }
+    }
+
+    #[test]
+    fn test_relaxation_finite_overflow_risk_returns_wide_bounds_4369() {
+        for (lower, upper) in [(89.0, 89.0), (1_000.0, 1_001.0)] {
+            assert_eq!(
+                exp_linear_relaxation(lower, upper),
+                LinearRelaxation::nan_fallback(),
+                "finite endpoints must still fail closed when affine coefficients overflow"
+            );
+        }
+    }
+
+    #[test]
+    fn exp_underflow_bounds_and_lines_remain_sound_under_ftz() {
+        use ndarray::arr1;
+
+        let x = -100.0_f32;
+        let reference = (x as f64).exp();
+        let input = BoundedTensor::new(arr1(&[x]).into_dyn(), arr1(&[x]).into_dyn()).unwrap();
+        let ibp = ExpLayer::new().propagate_ibp(&input).unwrap();
+        assert_eq!(ibp.lower()[[0]], 0.0);
+        assert!(
+            ibp.upper()[[0]] >= f32::MIN_POSITIVE,
+            "positive upper endpoints must not depend on binary32 subnormals"
+        );
+        assert!((ibp.upper()[[0]] as f64) >= reference);
+
+        let relaxation = exp_linear_relaxation(x, x);
+        assert!(
+            relaxation.upper_intercept >= f32::MIN_POSITIVE,
+            "the affine upper line must survive FTZ: {relaxation:?}"
+        );
+        let lower = relaxation.lower_slope * x + relaxation.lower_intercept;
+        let upper = relaxation.upper_slope * x + relaxation.upper_intercept;
+        assert!((lower as f64) <= reference, "{lower:e} > {reference:e}");
+        assert!((upper as f64) >= reference, "{upper:e} < {reference:e}");
     }
 
     #[ntest::timeout(5000)]

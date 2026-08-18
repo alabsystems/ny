@@ -463,7 +463,12 @@ fn split_sexpr(src: &str) -> Option<Vec<String>> {
             }
             c if c.is_whitespace() && depth == 0 => {
                 if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
+                    // Move + fresh `String::new()` (not `std::mem::take(&mut cur)`):
+                    // `mem::take` is an absent-callee for the panic-freedom checker;
+                    // this is its exact effect — push the old string, leave `cur`
+                    // holding a fresh empty `String` (`String::default()`).
+                    out.push(cur);
+                    cur = String::new();
                 }
             }
             c => cur.push(c),

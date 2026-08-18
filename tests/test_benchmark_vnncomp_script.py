@@ -10,7 +10,6 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "benchmark_vnncomp.sh"
 
@@ -216,6 +215,155 @@ def test_benchmark_vnncomp_emits_provenance_tags_in_notes(tmp_path: Path) -> Non
     assert "ny_sha256=" in notes, f"expected ny_sha256 in notes, got {notes!r}"
 
 
+def test_benchmark_vnncomp_honors_resolved_benchmark_and_preset_overrides(
+    tmp_path: Path,
+) -> None:
+    category = "versionedcat"
+    category_dir = tmp_path / "external" / category / "1.0"
+    category_dir.mkdir(parents=True)
+    (category_dir / "onnx").mkdir()
+    (category_dir / "vnnlib").mkdir()
+    (category_dir / "onnx" / "model.onnx").write_bytes(b"\x08\x01\x12\x03foo")
+    (category_dir / "vnnlib" / "prop.vnnlib").write_text("", encoding="utf-8")
+    (category_dir / "instances.csv").write_text(
+        "onnx/model.onnx,vnnlib/prop.vnnlib,2\n",
+        encoding="utf-8",
+    )
+    preset = tmp_path / "configs with spaces" / "vnncomp26" / f"{category}.yaml"
+    preset.parent.mkdir(parents=True)
+    preset.write_text("general: {}\n", encoding="utf-8")
+    ny_path = _write_fake_ny(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            printf '%s\\n' "$@" > "$(dirname "$0")/argv.txt"
+            printf 'Status: VERIFIED\\nDomains explored: 1\\n'
+            """
+        ),
+    )
+
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        bench_root=tmp_path / "deliberately-missing-root",
+        extra_env={
+            "BENCH_DIR": str(category_dir),
+            "PRESET_PATH_OVERRIDE": str(preset),
+        },
+    )
+
+    assert result.returncode == 0, f"versioned benchmark route failed: {result.stderr}"
+    row = _load_single_result(tmp_path, category)
+    assert row["status"] == "verified", row
+    argv = (tmp_path / "argv.txt").read_text(encoding="utf-8").splitlines()
+    assert argv[0] == "beta-crown", argv
+    preset_index = argv.index("--preset")
+    assert argv[preset_index + 1] == str(preset)
+
+
+def test_benchmark_vnncomp_competition_wrapper_uses_result_protocol_and_labels_provenance(
+    tmp_path: Path,
+) -> None:
+    category = "acasxu_2023"
+    _write_category_fixture(tmp_path, category, suite="vnncomp2026")
+    ny_path = _write_fake_ny(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+                printf 'ny 0.1.0-test\n'
+                exit 0
+            fi
+            printf '%s\n' "$@" > "$(dirname "$0")/argv.txt"
+            [ "$1" = "vnncomp" ] || exit 3
+            shift
+            if [ "${1:-}" = "--configs-dir" ]; then
+                shift 2
+            fi
+            [ "$1" = "v1" ] || exit 4
+            printf 'unsat\n' > "$5"
+            printf 'Domains explored: 4\nResult: unsat\n'
+            """
+        ),
+    )
+
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        args=["--competition-wrapper"],
+        benchmark_suite="vnncomp2026",
+    )
+
+    assert result.returncode == 0, result.stderr
+    row = _load_single_result(tmp_path, category)
+    assert row["status"] == "verified", row
+    assert row["domains_explored"] == "4", row
+    assert row["backend"] == "auto", row
+    assert "execution_surface=ny-vnncomp-competition-wrapper" in row["notes"]
+    assert "score_projection=modeled-only" in row["notes"]
+    assert "organizer_results=not-bound" in row["notes"]
+    argv = (tmp_path / "argv.txt").read_text(encoding="utf-8").splitlines()
+    assert argv[:3] == ["vnncomp", "v1", category], argv
+    assert "Execution surface: ny-vnncomp-competition-wrapper" in result.stdout
+
+
+def test_benchmark_vnncomp_competition_wrapper_rejects_diagnostic_strategy_flags(
+    tmp_path: Path,
+) -> None:
+    category = "acasxu_2023"
+    _write_category_fixture(tmp_path, category, suite="vnncomp2026")
+    ny_path = _write_fake_ny(tmp_path, "#!/bin/sh\nexit 0\n")
+
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        args=["--competition-wrapper", "--backend", "cpu"],
+        benchmark_suite="vnncomp2026",
+    )
+
+    assert result.returncode == 1
+    assert "owns preset/backend/branching/verifier/attack policy" in result.stdout
+    assert not (tmp_path / "reports" / "benchmarks").exists()
+
+
+def test_benchmark_vnncomp_2026_relusplitter_keeps_mip_default(
+    tmp_path: Path,
+) -> None:
+    category = "relusplitter_2026"
+    _write_category_fixture(tmp_path, category, suite="vnncomp2026")
+    ny_path = _write_fake_ny(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+                printf 'ny 0.1.0-test\n'
+                exit 0
+            fi
+            printf '%s\n' "$@" > "$(dirname "$0")/argv.txt"
+            printf 'Status: VERIFIED\nDomains explored: 1\n'
+            """
+        ),
+    )
+
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        benchmark_suite="vnncomp2026",
+    )
+
+    assert result.returncode == 0, result.stderr
+    argv = (tmp_path / "argv.txt").read_text(encoding="utf-8").splitlines()
+    verifier_index = argv.index("--complete-verifier")
+    assert argv[verifier_index + 1] == "mip"
+
+
 def test_benchmark_vnncomp_explicit_ny_bin_records_explicit_source(tmp_path: Path) -> None:
     """When NY_BIN is set explicitly, ny_source=explicit must appear (#4346)."""
     category = "explicitcat"
@@ -241,6 +389,85 @@ def test_benchmark_vnncomp_explicit_ny_bin_records_explicit_source(tmp_path: Pat
     assert "ny_source=explicit" in notes, (
         f"NY_BIN was set explicitly, expected ny_source=explicit, got {notes!r}"
     )
+
+
+def test_benchmark_vnncomp_private_scratch_survives_generic_tmp_cleanup(
+    tmp_path: Path,
+) -> None:
+    """A shared-TMPDIR janitor must not unlink the active solver transcript."""
+    category = "tmpscratchcat"
+    _write_category_fixture(tmp_path, category)
+    shared_tmp = tmp_path / "shared-tmp"
+    shared_tmp.mkdir()
+    ny_path = _write_fake_ny(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            for tmp_file in "${TMPDIR:-/tmp}"/tmp.*; do
+                [ -e "$tmp_file" ] || continue
+                rm -f -- "$tmp_file"
+            done
+            printf 'Status: VERIFIED\nDomains explored: 1\n'
+            """
+        ),
+    )
+
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        extra_env={"TMPDIR": str(shared_tmp)},
+    )
+
+    assert result.returncode == 0, f"benchmark script failed: {result.stderr}"
+    row = _load_single_result(tmp_path, category)
+    assert row["status"] == "verified", row
+    assert not list(shared_tmp.glob("ny-benchmark-vnncomp.*"))
+
+
+def test_benchmark_vnncomp_keeps_secure_watchdog_marker_until_solver_starts(
+    tmp_path: Path,
+) -> None:
+    category = "watchdogmarkercat"
+    _write_category_fixture(tmp_path, category)
+    shared_tmp = tmp_path / "shared-tmp"
+    shared_tmp.mkdir()
+    ny_path = _write_fake_ny(
+        tmp_path,
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            if [ "${1:-}" = "--version" ]; then
+                printf 'ny 0.1.0-test\n'
+                exit 0
+            fi
+            marker_count=0
+            for marker in "${TMPDIR:?}"/ny-benchmark-vnncomp.*/ny-benchmark-watchdog.*; do
+                [ -f "$marker" ] || continue
+                marker_count=$((marker_count + 1))
+            done
+            if [ "$marker_count" -ne 1 ]; then
+                printf 'Error: expected one retained watchdog marker, found %s\n' \
+                    "$marker_count"
+                exit 1
+            fi
+            printf 'Status: VERIFIED\nDomains explored: 1\n'
+            """
+        ),
+    )
+
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        extra_env={"TMPDIR": str(shared_tmp)},
+    )
+
+    assert result.returncode == 0, f"benchmark script failed: {result.stderr}"
+    row = _load_single_result(tmp_path, category)
+    assert row["status"] == "verified", row
+    assert not list(shared_tmp.glob("ny-benchmark-vnncomp.*"))
 
 
 def test_benchmark_vnncomp_domain_batch_metrics_flag_links_sidecar(tmp_path: Path) -> None:
@@ -272,10 +499,22 @@ def test_benchmark_vnncomp_domain_batch_metrics_flag_links_sidecar(tmp_path: Pat
         ),
     )
 
-    result = _run_benchmark(tmp_path, ny_path, category, ["--domain-batch-metrics"])
+    report_dir = tmp_path / "reports with spaces"
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        ["--domain-batch-metrics"],
+        extra_env={"REPORT_DIR": str(report_dir)},
+    )
 
     assert result.returncode == 0, f"benchmark script failed: {result.stderr}"
-    row = _load_single_result(tmp_path, category)
+    reports = sorted(report_dir.glob(f"{category}_*.csv"))
+    assert len(reports) == 1, reports
+    with reports[0].open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1, rows
+    row = rows[0]
     notes = row.get("notes", "")
     assert "domain_batch_metrics_jsonl=" in notes, (
         f"expected domain-batch metrics tag in notes, got {notes!r}"
@@ -341,13 +580,14 @@ def test_benchmark_vnncomp_disjunctive_output_uses_final_domains_summary(tmp_pat
     )
 
     result = _run_benchmark(tmp_path, ny_path, category)
-    combined_output = result.stdout + result.stderr
-
     assert result.returncode == 0, f"benchmark script failed: {result.stderr}"
     row = _load_single_result(tmp_path, category)
     assert row["status"] == "unknown", f"expected disjunctive fixture to stay unknown, got {row}"
     assert row["domains_explored"] == "17", f"expected final aggregate domains count, got {row}"
-    assert "unknown" in result.stdout and "17 domains" in result.stdout, (
+    assert "unknown" in result.stdout, (
+        f"expected stdout summary to use final aggregate domains, got: {result.stdout}"
+    )
+    assert "17 domains" in result.stdout, (
         f"expected stdout summary to use final aggregate domains, got: {result.stdout}"
     )
 
@@ -381,6 +621,44 @@ def test_benchmark_vnncomp_signal_exit_without_verdict_counts_as_timeout(tmp_pat
         "NOTE[default]: external watchdog enforced timeout" in combined_output
         or "NOTE[default]: counting exit code 143 without a verdict as timeout" in combined_output
     ), f"expected timeout note in output, got stdout={result.stdout!r} stderr={result.stderr!r}"
+
+
+def test_benchmark_result_normalizes_both_late_conclusive_statuses_to_timeout(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "solver-output.txt"
+    script = textwrap.dedent(
+        """\
+        set -euo pipefail
+        source "$1"
+        TMPOUT="$2"
+        LAST_EXIT_CODE=0
+        WATCHDOG_TIMEOUT_HIT=0
+        for status in VERIFIED VIOLATED; do
+            printf 'Status: %s\\nDomains explored: 1\\n' "$status" > "$TMPOUT"
+            parse_benchmark_result 1 1.01 fixture
+            printf '%s\\n' "$LAST_RESULT"
+        done
+        """
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "benchmark-result-test",
+            str(REPO_ROOT / "scripts" / "benchmark_vnncomp_helpers.sh"),
+            str(transcript),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["timeout", "timeout"], result.stdout
 
 
 def test_benchmark_vnncomp_external_timeout_without_verdict_counts_as_timeout(
@@ -477,7 +755,10 @@ def test_benchmark_vnncomp_forwards_backend_flag(tmp_path: Path) -> None:
     assert row["status"] == "verified", f"expected backend fixture to verify, got {row}"
     assert row["backend"] == "wgpu", f"expected backend field to record wgpu, got {row}"
     argv = (tmp_path / "argv.txt").read_text(encoding="utf-8")
-    assert "--backend" in argv and "wgpu" in argv, (
+    assert "--backend" in argv, (
+        f"expected backend flag to be forwarded to ny, got argv: {argv}"
+    )
+    assert "wgpu" in argv, (
         f"expected backend flag to be forwarded to ny, got argv: {argv}"
     )
     assert "Backend: --backend wgpu" in result.stdout, (
@@ -507,7 +788,10 @@ def test_benchmark_vnncomp_vit_forwards_heuristic_softmax_flag(tmp_path: Path) -
     assert "--allow-heuristic-softmax" in argv, (
         f"expected vit_2023 benchmark to forward heuristic softmax flag, got argv: {argv}"
     )
-    assert "--branching" in argv and "input" in argv, (
+    assert "--branching" in argv, (
+        f"expected vit_2023 benchmark to default to input branching, got argv: {argv}"
+    )
+    assert "input" in argv, (
         f"expected vit_2023 benchmark to default to input branching, got argv: {argv}"
     )
     assert "Category flags: --allow-heuristic-softmax" in result.stdout, (
@@ -579,6 +863,26 @@ def test_benchmark_vnncomp_compare_backends_emits_two_normalized_rows(tmp_path: 
     assert by_backend["cpu"]["model_path"].endswith("comparecat/onnx/model.onnx"), rows
     assert by_backend["cpu"]["property_path"].endswith("comparecat/vnnlib/prop.vnnlib"), rows
     assert "Backend-only status divergence: 0" in result.stdout, result.stdout
+
+
+def test_benchmark_vnncomp_honors_report_directory_override(tmp_path: Path) -> None:
+    category = "reportdircat"
+    _write_category_fixture(tmp_path, category)
+    ny_path = _write_compare_backends_ny(tmp_path)
+    report_dir = tmp_path / "isolated reports"
+
+    result = _run_benchmark(
+        tmp_path,
+        ny_path,
+        category,
+        args=["--compare-backends"],
+        extra_env={"REPORT_DIR": str(report_dir)},
+    )
+
+    assert result.returncode == 0, f"benchmark script failed: {result.stderr}"
+    reports = sorted(report_dir.glob(f"{category}_compare_backends_*.csv"))
+    assert len(reports) == 1, reports
+    assert not (tmp_path / "reports" / "benchmarks").exists()
 
 
 def test_benchmark_vnncomp_compare_backends_distinguishes_duplicate_source_rows(

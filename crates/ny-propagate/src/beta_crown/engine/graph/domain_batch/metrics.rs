@@ -49,6 +49,8 @@ pub enum GraphDomainBatchFallbackReason {
     UnsupportedCallerMode,
     /// Child-local node-bound overrides forced per-domain rebound.
     OverrideOnly,
+    /// General-nonlinearity branching is unsupported by the ReLU-only shared executor.
+    GeneralNonlinearBranching,
 }
 
 impl GraphDomainBatchFallbackReason {
@@ -61,6 +63,7 @@ impl GraphDomainBatchFallbackReason {
             Self::CutsEnabled => "cuts_enabled",
             Self::UnsupportedCallerMode => "unsupported_caller_mode",
             Self::OverrideOnly => "override_only",
+            Self::GeneralNonlinearBranching => "general_nonlinear_branching",
         }
     }
 }

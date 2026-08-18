@@ -45,8 +45,9 @@ fn talker_smoke_region_spec(seq_len: usize, epsilon: f32) -> Vec<RegionSpec> {
 /// Part of #3520 Packet B.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_talker_training_signal_smoke_3520() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let seq_len = TALKER_ATTENTION_SHORT_SEQ_LEN;
     let epsilon = 5e-4;
     let model = load_talker_attention_with_fixed_aux_for_seq_len(seq_len);
@@ -115,8 +116,9 @@ fn test_talker_training_signal_smoke_3520() {
 /// Part of #3520 Packet B.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_talker_training_signal_ranking_3520() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let seq_len = TALKER_ATTENTION_SHORT_SEQ_LEN;
     let model = load_talker_attention_with_fixed_aux_for_seq_len(seq_len);
     let primary_input = model.network.inputs[0].name.clone();

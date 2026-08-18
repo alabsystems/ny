@@ -9,7 +9,7 @@
 //! Ported from NN's trace-path ground truth:
 //! `trace_to_graph_layerspec_pad.rs` (ReflectionPad1d, ConstantPadNd),
 //! `trace_to_graph_layerspec_decompose.rs` (PixelShuffle, PixelUnshuffle,
-//! Upsample2d, ResizeBilinear), `trace_to_graph_layerspec_shape.rs`
+//! Upsample2d), `trace_to_graph_layerspec_shape.rs`
 //! (Upsample1d), and the `translate_conservative_passthrough` arm of
 //! `trace_to_graph_layerspec_dispatch_extended.rs` (GridSample).
 //!
@@ -17,29 +17,25 @@
 //!
 //! - `ReflectionPad1d` → one single-element `Slice` per reflected position +
 //!   `Concat` along the last axis (ONNX-adjusted).
-//! - `ConstantPadNd` → a single `LayerType::Pad` (mode `constant`) with ONNX
-//!   `pads = [before_0.., after_0..]` at trace rank, plus NN's transient
-//!   unbatched tensor-shape override on the Pad input so gamma-build's
-//!   `parse_pad_pairs` keeps all rank pairs (no batch-axis drop).
+//! - `ConstantPadNd` → a `LayerType::Pad` (mode `constant`) with ONNX
+//!   `pads = [before_0.., after_0..]` at trace rank. A private identity alias
+//!   carries the unbatched input-shape compatibility metadata without
+//!   overwriting a source tensor that may fan out to other consumers.
 //! - `PixelShuffle` / `PixelUnshuffle` → `Reshape` + `Transpose` + `Reshape`
 //!   with perms `[0,1,4,2,5,3]` / `[0,1,3,5,2,4]`.
 //! - `Upsample1d` → `Reshape` + `Tile(axis=-1)` + `Reshape` (nearest only).
 //! - `Upsample2d` (nearest only) → per-axis `Reshape` + `Tile` + `Reshape`,
 //!   H pass then W pass (6 specs).
-//! - `ResizeBilinear` → conservative flatten-`Tile`-`Slice`-`Reshape`: bilinear
-//!   outputs are convex combinations of input pixels, so bounds within
-//!   `[min(input), max(input)]` are sound; Tile/Slice/Reshape all preserve
-//!   element bounds. Loose but correct (NN #3545).
-//! - `GridSample` → conservative identity passthrough `Add(input, 0)`:
-//!   sampled values are bounded by the input tensor's bounds (NN #3557).
-//!
 //! ## Still refused (fail-closed)
 //!
 //! `ReflectionPad2d` has **no** translator arm in NN: it falls into NN's
 //! catch-all, which emits an opaque-skip layer with vacuous `[-inf, +inf]`
 //! bounds. The bridge's sound-by-construction contract forbids vacuous layers
 //! (see `mod.rs`), so `ReflectionPad2d` keeps the explicit `UnsupportedOp`
-//! refusal here until a real Slice+Concat lowering is ported.
+//! refusal here until a real Slice+Concat lowering is ported. `ResizeBilinear`
+//! and `GridSample` are also refused: their former Tile/identity surrogates
+//! preserved per-element input intervals, not the global convex hull required
+//! for resampling, and could under-approximate reachable outputs.
 
 use std::collections::HashMap;
 
@@ -49,8 +45,8 @@ use ny_core::{LayerType, NyError, Result};
 use crate::schema::{TraceNode, TraceOp, TraceUpsampleMode};
 
 use super::{
-    checked_f64_to_f32, dim_as_i64, first_input, insert_scalar_constant, op_name, shape_to_i64,
-    simple_spec, Ctx, NodeOutput,
+    checked_f64_to_f32, dim_as_i64, first_input, op_name, ops_core, shape_to_i64, simple_spec, Ctx,
+    NodeOutput,
 };
 
 /// Maximum total pad size for decomposition (limits graph explosion).
@@ -83,6 +79,7 @@ pub(super) fn translate_pad_resample(
             input_tensors,
             output_tensor,
             output_shape,
+            ctx,
         ),
         TraceOp::ConstantPadNd { padding, value } => translate_constant_pad_nd(
             name,
@@ -123,21 +120,12 @@ pub(super) fn translate_pad_resample(
             output_tensor,
             output_shape,
         ),
-        TraceOp::ResizeBilinear { target_h, target_w } => translate_resize_bilinear(
-            name,
-            *target_h,
-            *target_w,
-            input_tensors,
-            output_tensor,
-            output_shape,
-            ctx,
-        ),
-        // Grid sampling interpolates between input pixel values, so the output
-        // is bounded by the input's bounds; NN models it as an identity
-        // passthrough regardless of padding_mode / align_corners.
-        TraceOp::GridSample { .. } => {
-            translate_grid_sample(name, input_tensors, output_tensor, ctx)
-        }
+        TraceOp::ResizeBilinear { .. } => Err(NyError::UnsupportedOp(
+            "ResizeBilinear: no sound per-element interval lowering is available".to_string(),
+        )),
+        TraceOp::GridSample { .. } => Err(NyError::UnsupportedOp(
+            "GridSample: no sound per-element interval lowering is available".to_string(),
+        )),
         // ReflectionPad2d (and any mis-routed op): fail-closed refusal. See
         // the module docs — NN's only handling is a vacuous opaque-skip
         // catch-all, which the bridge must not reproduce.
@@ -166,6 +154,7 @@ fn translate_reflection_pad_1d(
     input_tensors: &[String],
     output_tensor: &str,
     output_shape: &[usize],
+    ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
     let data_input = first_input(input_tensors, "ReflectionPad1d")?;
 
@@ -175,10 +164,17 @@ fn translate_reflection_pad_1d(
         ));
     }
 
-    let total_pad = pad_left + pad_right;
+    let total_pad = pad_left.checked_add(pad_right).ok_or_else(|| {
+        NyError::InternalError("ReflectionPad1d: pad_left + pad_right overflows usize".to_string())
+    })?;
     if total_pad == 0 {
-        // NN emits no specs for a zero pad; the op is a no-op.
-        return Ok(NodeOutput::none());
+        return ops_core::translate_identity_add_zero(
+            name,
+            "ReflectionPad1d with zero padding",
+            input_tensors,
+            output_tensor,
+            ctx,
+        );
     }
     if total_pad > MAX_PAD_SIZE {
         return Err(NyError::UnsupportedOp(format!(
@@ -259,12 +255,9 @@ fn translate_reflection_pad_1d(
 /// `pads = [before_0.., after_0..]` at the traced tensor rank and the f32
 /// fill value.
 ///
-/// Mirrors NN's transient tensor-shape override: for rank >= 2 the Pad
-/// input's registered shape is replaced by its *unbatched* pre-pad shape so
-/// gamma-build's `parse_pad_pairs` keeps all `rank` pairs (case 2,
-/// `shape.len() + 1 == onnx_rank`) instead of dropping a leading batch axis,
-/// which would desync the resulting `PadLayer` from IBP's full-rank tensor.
-/// Safe because the Pad input has exactly one consumer (the Pad itself).
+/// Trace shapes are already data-layout shapes, so the emitted spec carries an
+/// internal certificate telling ny-build not to discard its leading pad pair
+/// as an ONNX batch axis. Raw ONNX cannot supply this private attribute.
 fn translate_constant_pad_nd(
     name: &str,
     padding: &[usize],
@@ -303,10 +296,14 @@ fn translate_constant_pad_nd(
     for pair_idx in 0..num_dim_pairs {
         let pl = padding[pair_idx * 2];
         let pr = padding[pair_idx * 2 + 1];
-        if pl + pr > MAX_PAD_SIZE {
+        let pair_total = pl.checked_add(pr).ok_or_else(|| {
+            NyError::InternalError(format!(
+                "ConstantPadNd: pair {pair_idx} total pad overflows usize"
+            ))
+        })?;
+        if pair_total > MAX_PAD_SIZE {
             return Err(NyError::UnsupportedOp(format!(
-                "ConstantPadNd: pair {pair_idx} total pad {} exceeds limit {MAX_PAD_SIZE}",
-                pl + pr
+                "ConstantPadNd: pair {pair_idx} total pad {pair_total} exceeds limit {MAX_PAD_SIZE}"
             )));
         }
     }
@@ -323,33 +320,25 @@ fn translate_constant_pad_nd(
         let pr = padding[pair_idx * 2 + 1];
         before[dim] = dim_as_i64(pl, "ConstantPadNd before")?;
         after[dim] = dim_as_i64(pr, "ConstantPadNd after")?;
-        total_pad = total_pad.saturating_add(pl).saturating_add(pr);
+        total_pad = total_pad
+            .checked_add(pl)
+            .and_then(|total| total.checked_add(pr))
+            .ok_or_else(|| {
+                NyError::InternalError(
+                    "ConstantPadNd: aggregate padding overflows usize".to_string(),
+                )
+            })?;
     }
 
-    // Zero total padding is a no-op: NN emits no specs.
+    // A no-op still needs a real producer for this trace node's output tensor.
     if total_pad == 0 {
-        return Ok(NodeOutput::none());
-    }
-
-    // Pre-register the unbatched pre-pad input shape (see doc comment).
-    if rank >= 2 {
-        let mut unbatched_input_shape: Vec<i64> = Vec::with_capacity(rank - 1);
-        for dim in 1..rank {
-            let out_dim = dim_as_i64(output_shape[dim], "ConstantPadNd unbatched input dim")?;
-            let total = before[dim].checked_add(after[dim]).ok_or_else(|| {
-                NyError::InternalError(format!(
-                    "ConstantPadNd: before[{dim}] + after[{dim}] overflow"
-                ))
-            })?;
-            let in_dim = out_dim.checked_sub(total).ok_or_else(|| {
-                NyError::InternalError(format!(
-                    "ConstantPadNd: dim {dim}: out {out_dim} - total pad {total} underflow"
-                ))
-            })?;
-            unbatched_input_shape.push(in_dim);
-        }
-        ctx.tensor_shapes
-            .insert(data_input.clone(), unbatched_input_shape);
+        return ops_core::translate_identity_add_zero(
+            name,
+            "ConstantPadNd with zero padding",
+            input_tensors,
+            output_tensor,
+            ctx,
+        );
     }
 
     // ONNX pads layout: all befores then all afters, at trace rank.
@@ -364,6 +353,10 @@ fn translate_constant_pad_nd(
     );
     attrs.insert("pads".to_string(), AttributeValue::Ints(pads));
     attrs.insert("value".to_string(), AttributeValue::Float(val_f32));
+    attrs.insert(
+        ny_build::PAD_PRESERVE_ALL_AXES_ATTR.to_string(),
+        AttributeValue::Int(1),
+    );
 
     Ok(NodeOutput::one(simple_spec(
         name,
@@ -409,6 +402,11 @@ fn translate_pixel_shuffle(
     ];
     let data_input = first_input(input_tensors, "PixelShuffle")?;
 
+    if !h.is_multiple_of(r) || !w.is_multiple_of(r) {
+        return Err(NyError::ModelLoad(format!(
+            "PixelShuffle: output spatial shape [{h}, {w}] is not divisible by factor {r}"
+        )));
+    }
     let h_in = h / r;
     let w_in = w / r;
 
@@ -461,6 +459,11 @@ fn translate_pixel_unshuffle(
     let r_sq = r.checked_mul(r).ok_or_else(|| {
         NyError::UnsupportedOp(format!("PixelUnshuffle: factor {r} squared overflows"))
     })?;
+    if !c_out.is_multiple_of(r_sq) {
+        return Err(NyError::ModelLoad(format!(
+            "PixelUnshuffle: output channels {c_out} are not divisible by factor squared {r_sq}"
+        )));
+    }
     let c = c_out / r_sq;
     let data_input = first_input(input_tensors, "PixelUnshuffle")?;
 
@@ -582,6 +585,12 @@ fn translate_upsample2d(
     }
     let h_out = output_shape[rank - 2];
     let w_out = output_shape[rank - 1];
+    if !h_out.is_multiple_of(sh) || !w_out.is_multiple_of(sw) {
+        return Err(NyError::ModelLoad(format!(
+            "Upsample2d: output spatial shape [{h_out}, {w_out}] is not divisible by \
+             scale [{sh}, {sw}]"
+        )));
+    }
     let h_in = h_out / sh;
     let w_in = w_out / sw;
     let prefix = &output_shape[..rank - 2];
@@ -631,180 +640,6 @@ fn translate_upsample2d(
     )?);
 
     Ok(NodeOutput { specs })
-}
-
-// ---------------------------------------------------------------------------
-// ResizeBilinear (port of NN translate_resize_bilinear + its dispatch arm)
-// ---------------------------------------------------------------------------
-
-/// ResizeBilinear → conservative Tile + Slice + Reshape decomposition.
-///
-/// Bilinear interpolation produces convex combinations of input pixel values,
-/// so output bounds are always within `[min(input), max(input)]`. NY has no
-/// bilinear resize layer, so NN decomposes into bounds-preserving primitives:
-///   1. Flatten spatial: `[prefix, h_in, w_in]` → `[prefix, h_in*w_in]`
-///   2. Tile the spatial axis to reach >= `target_h * target_w` elements
-///   3. Slice the spatial axis to exactly `target_h * target_w`
-///   4. Reshape to `[prefix, target_h, target_w]`
-///
-/// Sound over-approximation: Tile duplicates (preserves bounds), Slice trims
-/// (preserves bounds), Reshape relabels (preserves bounds). Real bilinear
-/// outputs are tighter (convex hull), so these bounds are conservative.
-///
-/// Input spatial dims are resolved from `ctx.tensor_shapes` (mirrors NN's
-/// dispatch arm).
-fn translate_resize_bilinear(
-    name: &str,
-    target_h: usize,
-    target_w: usize,
-    input_tensors: &[String],
-    output_tensor: &str,
-    output_shape: &[usize],
-    ctx: &Ctx,
-) -> Result<NodeOutput> {
-    // Resolve input spatial dims from ctx.tensor_shapes (NN dispatch arm).
-    let input_shape = input_tensors
-        .first()
-        .and_then(|first| ctx.tensor_shapes.get(first));
-    let (h_in, w_in) = match input_shape {
-        Some(shape) if shape.len() >= 2 => {
-            let rank = shape.len();
-            (
-                checked_i64_to_usize(shape[rank - 2], "ResizeBilinear input h")?,
-                checked_i64_to_usize(shape[rank - 1], "ResizeBilinear input w")?,
-            )
-        }
-        _ => {
-            return Err(NyError::InternalError(format!(
-                "ResizeBilinear: cannot resolve input spatial dims for {name}"
-            )));
-        }
-    };
-
-    let rank = output_shape.len();
-    if rank < 2 {
-        return Err(NyError::UnsupportedOp(format!(
-            "ResizeBilinear: output rank {rank} < 2"
-        )));
-    }
-    if target_h == 0 || target_w == 0 || h_in == 0 || w_in == 0 {
-        return Err(NyError::UnsupportedOp(
-            "ResizeBilinear: all spatial dimensions must be > 0".to_string(),
-        ));
-    }
-
-    let data_input = first_input(input_tensors, "ResizeBilinear")?;
-    let prefix = &output_shape[..rank - 2];
-    let spatial_in = h_in.checked_mul(w_in).ok_or_else(|| {
-        NyError::InternalError("ResizeBilinear: h_in * w_in overflow".to_string())
-    })?;
-    let spatial_out = target_h.checked_mul(target_w).ok_or_else(|| {
-        NyError::InternalError("ResizeBilinear: target_h * target_w overflow".to_string())
-    })?;
-
-    let mut specs = Vec::new();
-
-    // Step 1: Flatten spatial dims: [prefix, h_in, w_in] → [prefix, spatial_in]
-    let mut flat_shape: Vec<usize> = prefix.to_vec();
-    flat_shape.push(spatial_in);
-    let flat_name = format!("{name}_flat");
-    let flat_out = format!("{flat_name}_out");
-    specs.push(reshape_spec(
-        &flat_name,
-        vec![data_input],
-        &flat_out,
-        &flat_shape,
-    )?);
-
-    // Step 2: Tile spatial axis to reach >= spatial_out elements.
-    let tile_reps = spatial_out.div_ceil(spatial_in);
-    let spatial_axis = dim_as_i64(flat_shape.len() - 1, "ResizeBilinear tile")?;
-
-    let mut prev_out = flat_out.clone();
-    if tile_reps > 1 {
-        let tile_name = format!("{name}_tile");
-        let tile_out = format!("{tile_name}_out");
-        specs.push(tile_spec(
-            &tile_name,
-            vec![flat_out],
-            &tile_out,
-            spatial_axis,
-            tile_reps,
-        )?);
-        prev_out = tile_out;
-    }
-
-    // Step 3: Slice to exactly spatial_out elements (if tiled size overshoots).
-    // Trailing-relative axis: the trimmed dim is the LAST dim of the (flat,
-    // possibly tiled) intermediate, so `-1` selects it in every ny-build
-    // conversion regime. Audit note (consolidation pass): the historic
-    // `spatial_axis + 1` positive encoding relied on the legacy blanket
-    // `axis - 1` adjustment, which still fires for this UNRECORDED
-    // intermediate in batched-classified models but is wrong (fail-closed out
-    // of range at runtime, never unsound) for unbatched-classified ones;
-    // `-1` is correct in both. NN's `translate_resize_bilinear` aligned.
-    let tiled_spatial = spatial_in.checked_mul(tile_reps).ok_or_else(|| {
-        NyError::InternalError("ResizeBilinear: spatial_in * tile_reps overflow".to_string())
-    })?;
-    if tiled_spatial > spatial_out {
-        let slice_name = format!("{name}_trim");
-        let slice_out = format!("{slice_name}_out");
-        let onnx_axis = -1_i64;
-        let mut attrs = HashMap::new();
-        attrs.insert("axis".to_string(), AttributeValue::Int(onnx_axis));
-        attrs.insert("start".to_string(), AttributeValue::Int(0));
-        attrs.insert(
-            "end".to_string(),
-            AttributeValue::Int(dim_as_i64(spatial_out, "ResizeBilinear trim end")?),
-        );
-        specs.push(simple_spec(
-            &slice_name,
-            LayerType::Slice,
-            vec![prev_out],
-            &slice_out,
-            attrs,
-        ));
-        prev_out = slice_out;
-    }
-
-    // Step 4: Reshape to output shape: [prefix, target_h, target_w]
-    specs.push(reshape_spec(
-        name,
-        vec![prev_out],
-        output_tensor,
-        output_shape,
-    )?);
-
-    Ok(NodeOutput { specs })
-}
-
-// ---------------------------------------------------------------------------
-// GridSample (port of NN translate_conservative_passthrough)
-// ---------------------------------------------------------------------------
-
-/// GridSample → conservative identity passthrough `Add(input, 0)`.
-///
-/// Bilinear/nearest grid sampling interpolates between input pixel values, so
-/// the output is bounded by the input tensor's bounds. Exact verification is
-/// infeasible (grid positions are data), so NN emits an identity that
-/// preserves the input bounds. `padding_mode` / `align_corners` are not
-/// consumed, mirroring NN's arm.
-fn translate_grid_sample(
-    name: &str,
-    input_tensors: &[String],
-    output_tensor: &str,
-    ctx: &mut Ctx,
-) -> Result<NodeOutput> {
-    let data_input = first_input(input_tensors, "GridSample")?;
-    let const_name = format!("{name}_zero");
-    insert_scalar_constant(ctx, &const_name, 0.0)?;
-    Ok(NodeOutput::one(simple_spec(
-        name,
-        LayerType::Add,
-        vec![data_input, const_name],
-        output_tensor,
-        HashMap::new(),
-    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -897,17 +732,6 @@ fn checked_f64_to_usize(val: f64, context: &str) -> Result<usize> {
     // Safe: rounded is finite, non-negative, and integral. For practical
     // tensor shapes (< 2^53), f64 → usize cast is exact.
     Ok(rounded as usize)
-}
-
-/// Convert `i64` to `usize`, rejecting negative values.
-///
-/// Mirrors NN's `checked_i64_to_usize` (copied here; dedupe later).
-fn checked_i64_to_usize(val: i64, context: &str) -> Result<usize> {
-    usize::try_from(val).map_err(|_| {
-        NyError::InternalError(format!(
-            "{context}: i64 value {val} is negative (cannot convert to usize)"
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -1034,9 +858,52 @@ mod tests {
         );
     }
 
-    /// ConstantPadNd emits a single Pad layer with NN's exact attributes
-    /// (mode=constant, ONNX pads at trace rank, f32 value) and overrides the
-    /// input's registered shape with the unbatched pre-pad shape.
+    #[test]
+    fn reflection_pad1d_rejects_pad_sum_overflow() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1]),
+            node(
+                1,
+                "pad",
+                TraceOp::ReflectionPad1d {
+                    pad_left: usize::MAX,
+                    pad_right: 1,
+                },
+                &[0],
+                &[1],
+            ),
+        ]);
+        let err = translate(&graph).expect_err("overflowing pad sum refused");
+        assert!(
+            matches!(err, NyError::InternalError(ref m) if m.contains("overflows usize")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn zero_reflection_pad1d_emits_identity_output() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[5]),
+            node(
+                1,
+                "pad",
+                TraceOp::ReflectionPad1d {
+                    pad_left: 0,
+                    pad_right: 0,
+                },
+                &[0],
+                &[5],
+            ),
+        ]);
+        let model = translate(&graph).expect("zero reflection pad translates");
+        let pad = find(&model, "layer0_trace_1");
+        assert_eq!(pad.layer_type, LayerType::Add);
+        assert_eq!(pad.outputs, vec!["layer0_trace_1_out".to_string()]);
+        build_ok(&model, "zero reflection pad1d");
+    }
+
+    /// ConstantPadNd emits a Pad layer with exact attributes and an internal
+    /// certificate preserving every trace-native axis.
     #[test]
     fn constant_pad_nd_emits_pad_layer() {
         let graph = ComputationGraph::from_nodes(vec![
@@ -1069,17 +936,79 @@ mod tests {
             pad.attributes.get("value"),
             Some(&AttributeValue::Float(0.5))
         );
+        assert_eq!(
+            pad.attributes.get(ny_build::PAD_PRESERVE_ALL_AXES_ATTR),
+            Some(&AttributeValue::Int(1))
+        );
         assert_eq!(pad.inputs, vec!["layer0_trace_0_out".to_string()]);
-
-        // Unbatched pre-pad shape override on the Pad input: dims 1..rank of
-        // the output minus pads → [5 - 1 - 1] = [3].
         assert_eq!(
             model.tensor_shapes.get("layer0_trace_0_out"),
-            Some(&vec![3]),
-            "input shape overridden to unbatched pre-pad shape"
+            Some(&vec![2, 3]),
+            "source shape remains intact"
         );
 
         build_ok(&model, "constant pad nd");
+    }
+
+    #[test]
+    fn zero_constant_pad_nd_emits_identity_output() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[3]),
+            node(
+                1,
+                "pad",
+                TraceOp::ConstantPadNd {
+                    padding: vec![0, 0],
+                    value: 7.0,
+                },
+                &[0],
+                &[3],
+            ),
+        ]);
+        let model = translate(&graph).expect("zero constant pad translates");
+        let pad = find(&model, "layer0_trace_1");
+        assert_eq!(pad.layer_type, LayerType::Add);
+        assert_eq!(pad.outputs, vec!["layer0_trace_1_out".to_string()]);
+        assert_eq!(count(&model, &LayerType::Pad), 0);
+        build_ok(&model, "zero constant pad nd");
+    }
+
+    #[test]
+    fn constant_pad_nd_preserves_fanout_source_shape() {
+        let mut graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[2, 3]),
+            node(
+                1,
+                "pad",
+                TraceOp::ConstantPadNd {
+                    padding: vec![1, 1],
+                    value: 0.0,
+                },
+                &[0],
+                &[2, 5],
+            ),
+            node(2, "relu", TraceOp::Relu, &[0], &[2, 3]),
+        ]);
+        graph.output_nodes = vec![NodeId(1), NodeId(2)];
+
+        let model = translate(&graph).expect("fan-out constant pad translates");
+        assert_eq!(
+            model.tensor_shapes.get("layer0_trace_0_out"),
+            Some(&vec![2, 3]),
+            "shared source keeps its traced shape"
+        );
+        assert_eq!(
+            find(&model, "layer0_trace_1").inputs,
+            vec!["layer0_trace_0_out".to_string()]
+        );
+        assert!(!model
+            .tensor_shapes
+            .contains_key("layer0_trace_1_pad_input_out"));
+        assert_eq!(
+            find(&model, "layer0_trace_2").inputs,
+            vec!["layer0_trace_0_out".to_string()]
+        );
+        build_ok(&model, "constant pad nd fan-out");
     }
 
     /// ConstantPadNd with an odd padding vector is a hard error.
@@ -1101,6 +1030,28 @@ mod tests {
         let err = translate(&graph).expect_err("odd padding refused");
         assert!(
             matches!(err, NyError::ModelLoad(ref m) if m.contains("not even")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn constant_pad_nd_rejects_pair_sum_overflow() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1]),
+            node(
+                1,
+                "pad",
+                TraceOp::ConstantPadNd {
+                    padding: vec![usize::MAX, 1],
+                    value: 0.0,
+                },
+                &[0],
+                &[1],
+            ),
+        ]);
+        let err = translate(&graph).expect_err("overflowing pad pair refused");
+        assert!(
+            matches!(err, NyError::InternalError(ref m) if m.contains("overflows usize")),
             "got {err:?}"
         );
     }
@@ -1328,10 +1279,10 @@ mod tests {
         );
     }
 
-    /// ResizeBilinear upscale [1,2,2]→(4,4): flatten + Tile(reps=4), exact
-    /// fit so no Slice trim, final Reshape.
+    /// A Tile/Slice surrogate only preserves each input element's interval; it
+    /// does not bound interpolated values by the global input convex hull.
     #[test]
-    fn resize_bilinear_upscale_tiles_without_trim() {
+    fn resize_bilinear_is_refused_without_a_sound_lowering() {
         let graph = ComputationGraph::from_nodes(vec![
             node(0, "x", TraceOp::Input, &[], &[1, 2, 2]),
             node(
@@ -1345,70 +1296,18 @@ mod tests {
                 &[1, 4, 4],
             ),
         ]);
-        let model = translate(&graph).expect("resize upscale translates");
-
-        assert_eq!(count(&model, &LayerType::Tile), 1);
-        assert_eq!(count(&model, &LayerType::Slice), 0, "16 == 4*4: no trim");
-
-        let flat = find(&model, "layer0_trace_1_flat");
-        assert_eq!(
-            flat.attributes.get("shape"),
-            Some(&AttributeValue::Ints(vec![1, 4])),
-            "[prefix, h_in*w_in]"
+        let err = translate(&graph).expect_err("ResizeBilinear must fail closed");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("ResizeBilinear") && m.contains("sound")),
+            "got {err:?}"
         );
-        let tile = find(&model, "layer0_trace_1_tile");
-        assert_eq!(tile.attributes.get("axis"), Some(&AttributeValue::Int(1)));
-        assert_eq!(
-            tile.attributes.get("reps"),
-            Some(&AttributeValue::Int(4)),
-            "ceil(16/4)"
-        );
-        let fin = find(&model, "layer0_trace_1");
-        assert_eq!(
-            fin.attributes.get("shape"),
-            Some(&AttributeValue::Ints(vec![1, 4, 4]))
-        );
-
-        build_ok(&model, "resize bilinear upscale");
     }
 
-    /// ResizeBilinear downscale [1,4,4]→(2,2): no Tile (reps=1), Slice trim
-    /// on trailing-relative axis -1 (the flat spatial dim) to exactly 4
-    /// elements, final Reshape.
+    /// GridSample remaps coordinates and zero padding can introduce values not
+    /// present at the corresponding input element, so identity is unsound.
     #[test]
-    fn resize_bilinear_downscale_trims_with_slice() {
-        let graph = ComputationGraph::from_nodes(vec![
-            node(0, "x", TraceOp::Input, &[], &[1, 4, 4]),
-            node(
-                1,
-                "rb",
-                TraceOp::ResizeBilinear {
-                    target_h: 2,
-                    target_w: 2,
-                },
-                &[0],
-                &[1, 2, 2],
-            ),
-        ]);
-        let model = translate(&graph).expect("resize downscale translates");
-
-        assert_eq!(count(&model, &LayerType::Tile), 0, "16 >= 4: no tile");
-        assert_eq!(count(&model, &LayerType::Slice), 1, "trim to 4 elements");
-
-        let trim = find(&model, "layer0_trace_1_trim");
-        // Trailing-relative: the trimmed dim is the last dim of the flat
-        // intermediate → -1, rank-agnostic.
-        assert_eq!(trim.attributes.get("axis"), Some(&AttributeValue::Int(-1)));
-        assert_eq!(trim.attributes.get("start"), Some(&AttributeValue::Int(0)));
-        assert_eq!(trim.attributes.get("end"), Some(&AttributeValue::Int(4)));
-
-        build_ok(&model, "resize bilinear downscale");
-    }
-
-    /// GridSample is a conservative identity passthrough: Add(input, 0),
-    /// ignoring the grid input (NN's exact emission).
-    #[test]
-    fn grid_sample_is_identity_passthrough() {
+    fn grid_sample_is_refused_without_a_sound_lowering() {
         let graph = ComputationGraph::from_nodes(vec![
             node(0, "x", TraceOp::Input, &[], &[1, 1, 4, 4]),
             node(
@@ -1431,26 +1330,12 @@ mod tests {
                 &[1, 1, 4, 4],
             ),
         ]);
-        let model = translate(&graph).expect("grid sample translates");
-
-        // Input identity Add + GridSample passthrough Add.
-        assert_eq!(count(&model, &LayerType::Add), 2);
-        let gs = find(&model, "layer0_trace_2");
-        assert_eq!(gs.layer_type, LayerType::Add);
-        assert_eq!(
-            gs.inputs,
-            vec![
-                "layer0_trace_0_out".to_string(),
-                "layer0_trace_2_zero".to_string(),
-            ],
-            "passthrough consumes the data input + a zero constant"
-        );
+        let err = translate(&graph).expect_err("GridSample must fail closed");
         assert!(
-            model.weights.contains_key("layer0_trace_2_zero"),
-            "zero constant registered"
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("GridSample") && m.contains("sound")),
+            "got {err:?}"
         );
-
-        build_ok(&model, "grid sample");
     }
 
     /// ReflectionPad2d stays refused: NN's only handling is a vacuous

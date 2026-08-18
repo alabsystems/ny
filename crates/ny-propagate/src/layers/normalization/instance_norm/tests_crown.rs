@@ -658,7 +658,7 @@ fn test_crown_sampling_jacobian_overflow_returns_numerical_instability() {
     let layer = InstanceNorm1dLayer::new(
         Array1::from_vec(vec![1e35, 1e35]),
         Array1::from_vec(vec![0.0, 0.0]),
-        0.0, // eps clamped to 1e-12
+        crate::layers::normalization::NORMALIZATION_MIN_EPS,
     )
     .expect("valid InstanceNorm1d")
     .with_crown_mode(LayerNormCrownMode::Sampling);

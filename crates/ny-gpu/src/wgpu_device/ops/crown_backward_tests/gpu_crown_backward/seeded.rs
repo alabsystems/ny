@@ -97,6 +97,7 @@ fn cpu_crown_backward_seeded(
                 bias,
                 out_features,
                 in_features,
+                ..
             } => {
                 cpu_linear_backward(
                     &mut a_l,
@@ -126,6 +127,7 @@ fn cpu_crown_backward_seeded(
                 out_w,
                 in_h,
                 in_w,
+                ..
             } => {
                 let spatial = out_h * out_w;
                 let total_spatial = num_specs * spatial;
@@ -350,6 +352,7 @@ fn test_crown_backward_gpu_seeded_fallback_bound_coeff_degrades_row_2708() {
         bias: None,
         out_features: 1,
         in_features: 1,
+        cert_err: Default::default(),
     }];
     let seed = GpuCrownSeed {
         lower_a: vec![FALLBACK_BOUND].into(),

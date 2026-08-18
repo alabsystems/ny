@@ -19,8 +19,11 @@
 //!    base name with the `_20NN` year suffix stripped, newest year directory first.
 //! 2. **Timeout tiering** — the internal `ny --timeout` is set below the scored budget
 //!    (`TIMEOUT - max(5, TIMEOUT/20)`) so the JSON verdict is always flushed before the
-//!    competition budget elapses. The OS-backstop tier (`timeout(1)`) stays in the thin
-//!    shell wrapper.
+//!    competition budget elapses. A preset that explicitly disables the outer
+//!    post-BaB attack and gives the engine phase a zero fraction assigns the scalable
+//!    part of that tail to proof while retaining five seconds for publication.
+//!    A narrow, default-off SafeNLP experiment can reduce the reserve to one second; the
+//!    OS-backstop tier (`timeout(1)`) stays in the thin shell wrapper.
 //! 3. **β-CROWN invocation** — call [`handle_beta_crown_command`] directly (no shell-out
 //!    to a second `ny`) with the AUTO defaults (branching/backend/complete-verifier/PGD
 //!    self-selected), the preset, and the internal timeout. No lane-level `--max-domains`
@@ -39,17 +42,22 @@
 //! (missing input file, model-load failure with no verdict produced).
 
 use anyhow::{anyhow, Context, Result};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::commands::beta_crown::{
+    attack_arming::{shared_wgpu_attack_steering, AttackEngineSource},
     begin_capture,
     best_margin_export::{
         reset_best_margin_candidate, take_best_margin_candidates, BestMarginCandidate,
     },
-    end_capture, handle_beta_crown_command, take_captured_json, BetaCrownInstanceOverrides,
-    ProofOpts,
+    end_capture, handle_beta_crown_command, take_captured_json, take_captured_terminal_ingress,
+    BetaCrownInstanceOverrides, BetaCrownPresetSnapshot, CapturedTerminalIngress,
+    CganInputLeafRoute, ProofOpts, CGAN_DEPTH_TWO_PRODUCTION_MODE,
 };
+use crate::commands::terminal_peel::AppliedTerminalPeel;
+use crate::preset::{resolve_initial_pgd_schedule, ResolvedInitialPgdSchedule};
 use crate::subcommands::{BackendArg, CompleteVerifierArg, MipSolverArg};
 use ndarray::{arr1, Array2, ArrayD, IxDyn};
 use ny_cert::{
@@ -57,9 +65,11 @@ use ny_cert::{
     schema::{farkas_to_json, ConstraintKind, FarkasCertificate, LinearConstraint},
     Rat,
 };
-use ny_core::{Bound, VerificationResult, VerificationSpec};
+use ny_core::{
+    f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, Bound, VerificationResult, VerificationSpec,
+};
 use ny_onnx::{
-    load_onnx_with_config,
+    load_onnx_with_config, read_onnx_bytes_maybe_gzip,
     vnnlib::{
         load_vnnlib_assignment_declarations, DualNetworkProperty, DualNetworkSpec,
         IsomorphicAtomRelation, IsomorphicOutputAtom, TensorDeclaration, TensorDeclarationKind,
@@ -69,9 +79,10 @@ use ny_onnx::{
 use ny_propagate::{
     build_difference_network,
     layers::{AddLayer, ConcatLayer, GatherLayer, SubLayer},
+    network::crown_memory::ProcessMemoryEnvelope,
     reset_bab_frontier_export, take_bab_frontier_seeds, BabFrontierSeed, BabVerificationStatus,
-    BetaCrownConfig, BetaCrownVerifier, GraphNetwork, GraphNode, Layer, PropagationConfig,
-    PropagationMethod, Verifier, BAB_FRONTIER_CORNER_BOXES, NETWORK_INPUT,
+    BetaCrownConfig, BetaCrownVerifier, GraphNetwork, GraphNode, Layer, PointVjpWavePlan,
+    PropagationConfig, PropagationMethod, Verifier, BAB_FRONTIER_CORNER_BOXES, NETWORK_INPUT,
 };
 
 // (No lane-level BaB domain cap: the runner used to pass `--max-domains 50000`
@@ -170,12 +181,711 @@ fn parse_competition_json(json: &str) -> Option<VnncompResult> {
 /// budgets (`< grace`), give `ny` the whole budget rather than a zero/negative
 /// internal timeout (the OS backstop in the wrapper still applies). This matches
 /// `run_instance.sh` exactly.
-fn internal_timeout_secs(timeout_secs: u64) -> u64 {
-    let grace = (timeout_secs / 20).max(5);
+pub(crate) fn internal_timeout_secs(timeout_secs: u64) -> u64 {
+    let grace = (timeout_secs / 20).max(MIN_RESULTS_FLUSH_RESERVE_SECS);
     timeout_secs
         .checked_sub(grace)
         .filter(|&t| t >= 1)
         .unwrap_or(timeout_secs)
+}
+
+/// Smallest whole-second publication margin used by the historical wrapper.
+///
+/// The historical policy scales this to 5% on long rows. A category that
+/// explicitly assigns zero time to post-BaB PGD gives that scalable tail back
+/// to proof search while retaining this fixed margin for verdict translation,
+/// trusted-oracle work, and atomic RESULTS_FILE publication.
+const MIN_RESULTS_FLUSH_RESERVE_SECS: u64 = 5;
+
+const SAFENLP_SHORT_GRACE_ENV: &str = "NY_SAFENLP_SHORT_GRACE";
+const SAFENLP_SHORT_GRACE_MAX_BUDGET_SECS: u64 = 30;
+const SAFENLP_SHORT_GRACE_SECS: u64 = 1;
+/// Default-dark direct-MIP-first experiment for official short SafeNLP rows.
+///
+/// This gate only records category/budget intent in a typed instance override.
+/// The loaded network/spec shape, live absolute deadline, AUTO verifier policy,
+/// and the independent shared-prefix gate are all rechecked at the dispatch
+/// seam before BaB can be bypassed.
+const SAFENLP_DIRECT_MIP_FIRST_ENV: &str = "NY_MIP_SAFENLP_DIRECT_FIRST";
+const SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS: u64 = 30;
+/// Default-dark terminal-Softmax peel experiment for the 2023 traffic-sign
+/// benchmark. The exact category fence is intentional: terminal-Softmax
+/// classification constraints are order-preserving, but no other category is
+/// admitted until it has its own measured treatment.
+const TRAFFIC_TERMINAL_SOFTMAX_PEEL_ENV: &str = "NY_TRAFFIC_TERMINAL_SOFTMAX_PEEL";
+const TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY: &str = "traffic_signs_recognition_2023";
+/// Default-dark certified imgSz32 cGAN input-leaf experiment.
+///
+/// Only the literal `cgan_2023` category may mint the typed route. Model,
+/// property, profile, graph, row, deadline, and memory evidence are all
+/// independently rechecked by the attached oracle.
+const CGAN_INPUT_LEAF_ENV: &str = "NY_CGAN_INPUT_LEAF";
+const CGAN_INPUT_LEAF_CATEGORY: &str = "cgan_2023";
+/// Stop admitting final renames before the hard-stop boundary. Rendering and
+/// staging happen before admission, so this interval contains only one rename
+/// plus the explicit publication acknowledgement.
+const SAFENLP_SHORT_PUBLICATION_MARGIN: std::time::Duration = std::time::Duration::from_millis(500);
+/// Leave bounded time for direct SIGKILL delivery and for the harness to reap
+/// the process. The solver still receives the exact 19-second internal timeout
+/// on an official 20-second row; this guard belongs only to hard-stop delivery,
+/// not the solver budget calculation.
+const SAFENLP_SHORT_HARD_STOP_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
+/// A child-consumed prepare ACK must arrive this far before the hard stop,
+/// leaving a distinct bounded window for the helper to receive the finalize
+/// byte before canonical H.
+const SAFENLP_SHORT_FINALIZATION_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Central declared read for the shared beta/GPU diagnostic switch.
+///
+/// This deliberately remains a live read for parity with the older probe
+/// sites. It nonetheless passes through `ny-levers`, so the two terminal
+/// readouts added in this module do not create new unenumerated raw-read debt.
+fn beta_gpu_probe_armed() -> bool {
+    ny_levers::read(&ny_levers::decls::telemetry::BETA_GPU_PROBE)
+        .value
+        .as_bool()
+}
+
+/// Typed VNN-COMP routing receipt for the traffic terminal-Softmax experiment.
+///
+/// `env_armed` and `category_matched` are kept separately so a flight record
+/// distinguishes a dark gate from an explicitly requested but category-fenced
+/// run. Only `effective` is forwarded to the model loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrafficTerminalSoftmaxPeelDecision {
+    env_armed: bool,
+    category_matched: bool,
+    effective: bool,
+}
+
+/// Typed category-gate receipt for the cGAN input-leaf experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CganInputLeafDecision {
+    env_armed: bool,
+    category_matched: bool,
+    mip_compiled: bool,
+    route: Option<CganInputLeafRoute>,
+}
+
+/// What the verifier actually did with an admitted traffic peel request.
+///
+/// This is kept separate from the routing decision: an armed gate can be
+/// bypassed by an earlier wrapper verdict, declined by the joint model/property
+/// pass, or applied.  `ReceiptUnavailable` is fail-closed evidence that beta
+/// returned a captured verdict without the expected typed effective-config
+/// fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficTerminalSoftmaxPeelExecution {
+    NotRequested,
+    NotReached,
+    Declined,
+    Applied,
+    ReceiptUnavailable,
+}
+
+/// What the default-dark traffic treatment did before the ordinary upfront
+/// attack schedule.
+///
+/// This receipt is deliberately separate from [`TrafficTerminalSoftmaxPeelExecution`]:
+/// the latter records the beta-CROWN loader, while this one records an additive
+/// attack-only logit-DLR micro-leg that can run (and find a witness) before beta
+/// is reached.  No state here carries verdict authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficUpfrontSoftmaxExecution {
+    NotRequested,
+    NotReached,
+    AttackDisabled,
+    AdmissionDeclined,
+    QualificationDeclined,
+    QualifiedNotRun,
+    Applied,
+    Invalidated,
+}
+
+impl TrafficUpfrontSoftmaxExecution {
+    fn before_run(requested: bool) -> Self {
+        if requested {
+            Self::NotReached
+        } else {
+            Self::NotRequested
+        }
+    }
+
+    fn flight_status(self) -> crate::flight::FlightStatus {
+        match self {
+            Self::Applied => crate::flight::FlightStatus::Ran,
+            Self::NotReached | Self::QualifiedNotRun => crate::flight::FlightStatus::NotReached,
+            Self::NotRequested
+            | Self::AttackDisabled
+            | Self::AdmissionDeclined
+            | Self::QualificationDeclined
+            | Self::Invalidated => crate::flight::FlightStatus::Skipped,
+        }
+    }
+
+    fn flight_reason(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not requested",
+            Self::NotReached => "admitted traffic request did not reach the upfront attack",
+            Self::AttackDisabled => "the authoritative upfront-attack route was disabled",
+            Self::AdmissionDeclined => "the original property did not admit the upfront attack",
+            Self::QualificationDeclined => {
+                "the one-load exact terminal-Softmax qualification declined fail-closed"
+            }
+            Self::QualifiedNotRun => {
+                "authenticated logit objective was built but no logit-DLR step ran"
+            }
+            Self::Applied => {
+                "authenticated restart-0 logit-DLR micro-leg ran before the historical schedule"
+            }
+            Self::Invalidated => {
+                "a malformed or non-finite logit view invalidated the treatment; historical restart 0 was reset"
+            }
+        }
+    }
+}
+
+fn note_traffic_upfront_softmax_execution(execution: TrafficUpfrontSoftmaxExecution) {
+    crate::flight::note(
+        "traffic_upfront_softmax_objective",
+        execution.flight_status(),
+        Some(execution.flight_reason().to_string()),
+    );
+}
+
+impl TrafficTerminalSoftmaxPeelExecution {
+    fn before_run(requested: bool) -> Self {
+        if requested {
+            Self::NotReached
+        } else {
+            Self::NotRequested
+        }
+    }
+
+    fn from_beta_capture(requested: bool, captured: Option<&str>) -> Self {
+        if !requested {
+            return Self::NotRequested;
+        }
+        let Some(captured) = captured else {
+            return Self::ReceiptUnavailable;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(captured) else {
+            return Self::ReceiptUnavailable;
+        };
+        let receipt = &value["effective_config"]["softmax"];
+        if receipt["terminal_peel_requested"].as_bool() != Some(true) {
+            return Self::ReceiptUnavailable;
+        }
+        match (
+            receipt["terminal_peel_applied"].as_bool(),
+            receipt["terminal_peel_activation"].as_str(),
+        ) {
+            (Some(true), Some("softmax")) => Self::Applied,
+            (Some(false), Some("none")) => Self::Declined,
+            _ => Self::ReceiptUnavailable,
+        }
+    }
+
+    fn applied(self) -> bool {
+        self == Self::Applied
+    }
+
+    fn flight_status(self) -> crate::flight::FlightStatus {
+        match self {
+            Self::Applied => crate::flight::FlightStatus::Ran,
+            Self::NotReached => crate::flight::FlightStatus::NotReached,
+            Self::NotRequested | Self::Declined | Self::ReceiptUnavailable => {
+                crate::flight::FlightStatus::Skipped
+            }
+        }
+    }
+
+    fn flight_reason(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not requested",
+            Self::NotReached => "admitted gate was not reached because an earlier lane terminated",
+            Self::Declined => "joint model/property pass reached and declined fail-closed",
+            Self::Applied => {
+                "authenticated single-group terminal Softmax peeled and all atoms rewritten"
+            }
+            Self::ReceiptUnavailable => {
+                "beta was invoked but no valid terminal-peel execution receipt was captured"
+            }
+        }
+    }
+}
+
+fn traffic_terminal_softmax_peel_decision(
+    category: &str,
+    raw: Option<&OsStr>,
+) -> TrafficTerminalSoftmaxPeelDecision {
+    // Exact `OsStr` comparison makes unset, malformed, whitespace-padded, and
+    // non-Unicode values fail closed without a lossy conversion.
+    let env_armed = raw == Some(OsStr::new("1"));
+    let category_matched = category == TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY;
+    TrafficTerminalSoftmaxPeelDecision {
+        env_armed,
+        category_matched,
+        effective: env_armed && category_matched,
+    }
+}
+
+fn cgan_input_leaf_decision(category: &str, raw: Option<&OsStr>) -> CganInputLeafDecision {
+    let env_armed = raw == Some(OsStr::new("1"));
+    let category_matched = category == CGAN_INPUT_LEAF_CATEGORY;
+    let mip_compiled = cfg!(feature = "mip");
+    CganInputLeafDecision {
+        env_armed,
+        category_matched,
+        mip_compiled,
+        route: (env_armed && category_matched && mip_compiled)
+            .then_some(CganInputLeafRoute::Cgan2023),
+    }
+}
+
+fn cgan_input_leaf_gate_receipt(decision: CganInputLeafDecision, category: &str) -> String {
+    format!(
+        "env_armed={} category_matched={} mip_compiled={} effective={} depth_two_production_mode={} category={category}",
+        decision.env_armed,
+        decision.category_matched,
+        decision.mip_compiled,
+        decision.route.is_some(),
+        CGAN_DEPTH_TWO_PRODUCTION_MODE,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalTimeoutRoute {
+    Historical,
+    SafeNlpShortGrace,
+    /// An explicit preset opt-out for both post-BaB attack consumers assigns
+    /// the scalable historical tail to proof search, retaining only the fixed
+    /// publication margin.
+    PresetProofTail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InternalTimeoutDecision {
+    solver_timeout_secs: u64,
+    effective_flush_reserve_secs: u64,
+    historical_solver_timeout_secs: u64,
+    route: InternalTimeoutRoute,
+}
+
+/// VNN-COMP wrapper policy for the attack that runs after the in-process
+/// verifier returns `unknown`/`timeout`.
+///
+/// This independent wrapper lane has its own typed preset switch. The engine's
+/// `post_bab_pgd_fraction` remains solely an engine schedule: zero alone cannot
+/// disable this lane. A preset that explicitly disables both consumers may
+/// give the scalable historical tail to proof. The environment kill switch
+/// disables only the wrapper lane and never reclaims an engine reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostBabWrapperRoute {
+    AttackEnabled,
+    DisabledByEnvironment,
+    DisabledByPreset,
+    ProofTailByPreset,
+}
+
+impl PostBabWrapperRoute {
+    fn attack_enabled(self) -> bool {
+        matches!(self, Self::AttackEnabled)
+    }
+
+    fn proof_owns_historical_tail(self) -> bool {
+        matches!(self, Self::ProofTailByPreset)
+    }
+}
+
+fn postbab_deferred_pgd_consumer_available(
+    route: PostBabWrapperRoute,
+    margin_row_memory_allowed: bool,
+    safenlp_direct_mip_first: bool,
+) -> bool {
+    route.attack_enabled() && margin_row_memory_allowed && !safenlp_direct_mip_first
+}
+
+fn deferred_outer_pgd_has_priority(
+    schedule: Option<ResolvedInitialPgdSchedule>,
+    consumer_available: bool,
+) -> bool {
+    consumer_available && matches!(schedule, Some(ResolvedInitialPgdSchedule::Deferred))
+}
+
+/// Reproduce the handler's effective deferred-PGD fraction from the exact
+/// validated preset snapshot it will later consume. Reading the raw YAML field
+/// is insufficient: `pgd_order: after` moves `max(upfront, post)` into the
+/// post-BaB slot during typed preset application.
+fn effective_deferred_pgd_fraction(snapshot: Option<&BetaCrownPresetSnapshot>) -> Option<f32> {
+    let preset = snapshot?.loaded()?;
+    if !matches!(
+        resolve_initial_pgd_schedule(preset),
+        Ok(Some(ResolvedInitialPgdSchedule::Deferred))
+    ) {
+        return None;
+    }
+    let mut config = BetaCrownConfig::default();
+    crate::preset::apply_preset(&mut config, preset).ok()?;
+    config
+        .enable_pgd_attack
+        .then_some(config.phase_budget.post_bab_pgd_fraction.clamp(0.0, 0.5))
+}
+
+/// Freeze the internal/outer-PGD handoff against the command-level solver
+/// clock. `timeout_before_fixed_reserves_secs` has already charged the upfront
+/// wrapper attack. The difference to `verifier_timeout_secs` is the exact
+/// fixed tail held by margin/post-BaB policy. Subtract that held tail and the
+/// effective fractional tail from the already-anchored solver deadline; never
+/// create a fresh deadline from the later verifier setup time.
+fn frozen_outer_deferred_internal_deadline(
+    solver_phase_deadline: Option<std::time::Instant>,
+    timeout_before_fixed_reserves_secs: u64,
+    verifier_timeout_secs: u64,
+    effective_post_bab_fraction: Option<f32>,
+    outer_pgd_has_priority: bool,
+) -> Option<std::time::Instant> {
+    if !outer_pgd_has_priority {
+        return None;
+    }
+    let solver_phase_deadline = solver_phase_deadline?;
+    let fraction = effective_post_bab_fraction?;
+    let held_fixed_secs = timeout_before_fixed_reserves_secs.saturating_sub(verifier_timeout_secs);
+    solver_phase_deadline
+        .checked_sub(std::time::Duration::from_secs(held_fixed_secs))?
+        .checked_sub(
+            std::time::Duration::from_secs(verifier_timeout_secs).mul_f32(fraction.clamp(0.0, 0.5)),
+        )
+}
+
+fn nonlinear_fallback_may_precede_outer_pgd(deferred_outer_pgd_priority: bool) -> bool {
+    !deferred_outer_pgd_priority
+}
+
+/// VNN-COMP wrapper policy for the exact-gradient falsifier that runs before
+/// the in-process verifier.
+///
+/// The wrapper used to ignore `attack.pgd_order`, so a preset such as NN4SYS
+/// (`skip`) still reloaded a 151 MB model, built ORT state, and spent an attack
+/// slice before the preset-disabled verifier attack. `input_bab` likewise
+/// promises to suppress the upfront stage. Resolve both consumers from the
+/// same immutable preset snapshot while retaining the exact historical
+/// environment overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpfrontWrapperRoute {
+    AutoDisjunction,
+    /// Preserve automatic multi-clause-disjunction admission and additionally
+    /// admit the narrow low-dimensional relational-conjunction shape selected
+    /// by a typed preset.
+    PresetRelationalConjunction,
+    DisabledByEnvironment,
+    DisabledByPreset,
+    /// The frozen preset is syntactically or semantically invalid. No
+    /// environment force may run a verdict-producing wrapper lane ahead of
+    /// the retained preset error.
+    DisabledByInvalidPreset,
+    ForcedByEnvironment,
+    /// The typed `attack.upfront_attack: true` category key (#upfront-preset).
+    /// Identical arming to [`Self::ForcedByEnvironment`], but it travels with
+    /// the preset, so `ny vnncomp`, `vnncomp_sweep`, and `ny benchmarks run`
+    /// all measure the same lane the submission wrapper arms.
+    ForcedByPreset,
+}
+
+impl UpfrontWrapperRoute {
+    fn attack_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::AutoDisjunction
+                | Self::PresetRelationalConjunction
+                | Self::ForcedByEnvironment
+                | Self::ForcedByPreset
+        )
+    }
+
+    fn forced(self) -> bool {
+        matches!(self, Self::ForcedByEnvironment | Self::ForcedByPreset)
+    }
+
+    fn preset_relational_conjunction(self) -> bool {
+        matches!(self, Self::PresetRelationalConjunction)
+    }
+}
+
+fn upfront_wrapper_route(
+    preset_schedule: Option<ResolvedInitialPgdSchedule>,
+    preset_upfront_attack: Option<bool>,
+    preset_relational_exact_gradient: bool,
+    attack_env_raw: Option<&OsStr>,
+) -> UpfrontWrapperRoute {
+    if attack_env_raw == Some(OsStr::new("0")) {
+        return UpfrontWrapperRoute::DisabledByEnvironment;
+    }
+    if attack_env_raw == Some(OsStr::new("1")) {
+        return UpfrontWrapperRoute::ForcedByEnvironment;
+    }
+    // Typed category-level force (`attack.upfront_attack`, #upfront-preset).
+    // Below the exact-spelling environment overrides (`0` still kills, `1`
+    // still forces) and above the schedule-derived suppression: the key names
+    // the WRAPPER LANE itself, so it is the most specific preset statement
+    // about it — the same precedence the category-fenced environment force it
+    // mirrors has always had.
+    match preset_upfront_attack {
+        Some(true) => return UpfrontWrapperRoute::ForcedByPreset,
+        Some(false) => return UpfrontWrapperRoute::DisabledByPreset,
+        None => {}
+    }
+    if matches!(
+        preset_schedule,
+        Some(
+            ResolvedInitialPgdSchedule::Disabled
+                | ResolvedInitialPgdSchedule::InputBab
+                // `after`: the attack still runs, just not HERE. Suppressing the upfront
+                // wrapper is what frees its slice for branch-and-bound; the post-BaB stage
+                // spends it.
+                | ResolvedInitialPgdSchedule::Deferred
+        )
+    ) {
+        UpfrontWrapperRoute::DisabledByPreset
+    } else if preset_relational_exact_gradient {
+        UpfrontWrapperRoute::PresetRelationalConjunction
+    } else {
+        UpfrontWrapperRoute::AutoDisjunction
+    }
+}
+
+/// Resolve the upfront wrapper from the already-frozen, semantically validated
+/// preset.
+///
+/// A missing preset preserves the historical automatic disjunction lane.
+/// Invalid snapshots suppress wrapper work regardless of environment overrides;
+/// [`run_and_translate`] returns their retained error as a sound `unknown`
+/// before every wrapper fast path.
+fn upfront_wrapper_route_from_snapshot(
+    preset_snapshot: Option<&BetaCrownPresetSnapshot>,
+    attack_env_raw: Option<&OsStr>,
+) -> UpfrontWrapperRoute {
+    match preset_snapshot {
+        None => upfront_wrapper_route(None, None, false, attack_env_raw),
+        Some(BetaCrownPresetSnapshot::Invalid(_)) => UpfrontWrapperRoute::DisabledByInvalidPreset,
+        Some(BetaCrownPresetSnapshot::Loaded(preset)) => {
+            match resolve_initial_pgd_schedule(preset) {
+                Ok(schedule) => upfront_wrapper_route(
+                    schedule,
+                    preset.attack.upfront_attack,
+                    preset
+                        .attack
+                        .vnncomp_upfront_relational_exact_gradient
+                        .unwrap_or(false),
+                    attack_env_raw,
+                ),
+                // `BetaCrownPresetSnapshot::load` turns this into `Invalid`.
+                // Retain a fail-closed guard for manually constructed snapshots.
+                Err(_) => UpfrontWrapperRoute::DisabledByInvalidPreset,
+            }
+        }
+    }
+}
+
+/// Resolve the wrapper policy from independent typed engine/wrapper fields and
+/// the existing exact-spelling environment kill switch.
+///
+/// Wrapper omission/`true` preserves the default-enabled lane even when the
+/// engine fraction is zero. Proof-tail ownership requires an explicit wrapper
+/// opt-out AND an explicit typed value whose established engine clamp resolves
+/// to zero; neither an environment-only kill nor a non-finite fraction can
+/// acquire proof time.
+fn postbab_wrapper_route(
+    explicit_fraction: Option<f32>,
+    preset_attack: Option<bool>,
+    attack_env_raw: Option<&OsStr>,
+) -> PostBabWrapperRoute {
+    let effective_fraction = explicit_fraction
+        .filter(|fraction| fraction.is_finite())
+        .map(|fraction| fraction.clamp(0.0, 0.5));
+    if preset_attack == Some(false) && effective_fraction == Some(0.0) {
+        PostBabWrapperRoute::ProofTailByPreset
+    } else if attack_env_raw == Some(OsStr::new("0")) {
+        PostBabWrapperRoute::DisabledByEnvironment
+    } else if preset_attack == Some(false) {
+        PostBabWrapperRoute::DisabledByPreset
+    } else {
+        PostBabWrapperRoute::AttackEnabled
+    }
+}
+
+/// Resolve from the wrapper's immutable preset snapshot. A missing or invalid
+/// snapshot preserves the historical route; β-CROWN receives the same invalid
+/// snapshot and returns a sound non-verdict without rereading the path.
+fn postbab_wrapper_route_from_snapshot(
+    preset_snapshot: Option<&BetaCrownPresetSnapshot>,
+    attack_env_raw: Option<&OsStr>,
+) -> PostBabWrapperRoute {
+    let phase_budget = preset_snapshot
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .map(|preset| &preset.bab.phase_budget);
+    postbab_wrapper_route(
+        phase_budget.and_then(|phase| phase.post_bab_pgd_fraction),
+        phase_budget.and_then(|phase| phase.vnncomp_post_bab_attack),
+        attack_env_raw,
+    )
+}
+
+/// Give the scalable historical flush reserve back to the solver only when the
+/// typed preset explicitly gives the post-BaB lane zero budget. SafeNLP's
+/// separately guarded one-second route remains authoritative.
+fn apply_postbab_wrapper_timeout_policy(
+    historical: InternalTimeoutDecision,
+    timeout_secs: u64,
+    wrapper_route: PostBabWrapperRoute,
+) -> InternalTimeoutDecision {
+    if historical.route != InternalTimeoutRoute::Historical
+        || !wrapper_route.proof_owns_historical_tail()
+    {
+        return historical;
+    }
+
+    let solver_timeout_secs = timeout_secs
+        .checked_sub(MIN_RESULTS_FLUSH_RESERVE_SECS)
+        .filter(|&timeout| timeout >= 1)
+        .unwrap_or(timeout_secs);
+    InternalTimeoutDecision {
+        solver_timeout_secs,
+        effective_flush_reserve_secs: timeout_secs.saturating_sub(solver_timeout_secs),
+        historical_solver_timeout_secs: historical.historical_solver_timeout_secs,
+        route: InternalTimeoutRoute::PresetProofTail,
+    }
+}
+
+/// Absolute verifier deadline for routes that consume nearly all of the scored
+/// budget. The proof-tail route is anchored before model/runtime setup so setup
+/// time cannot slide a duration-based timeout past the publication margin.
+fn beta_phase_deadline(
+    decision: InternalTimeoutDecision,
+    instance_deadline: std::time::Instant,
+) -> Option<std::time::Instant> {
+    match decision.route {
+        InternalTimeoutRoute::SafeNlpShortGrace => Some(instance_deadline),
+        InternalTimeoutRoute::PresetProofTail => Some(
+            instance_deadline
+                .checked_sub(std::time::Duration::from_secs(
+                    decision.effective_flush_reserve_secs,
+                ))
+                .unwrap_or(instance_deadline),
+        ),
+        InternalTimeoutRoute::Historical => None,
+    }
+}
+
+/// Absolute end of the internal solver grant, frozen from the scored instance
+/// clock before preset planning, model loading, wrapper attacks, or verifier
+/// setup. Unlike [`beta_phase_deadline`], this exists for the historical route
+/// too; it is scheduling authority only for an outer-owned deferred PGD handoff.
+fn solver_phase_deadline(
+    decision: InternalTimeoutDecision,
+    instance_deadline: std::time::Instant,
+) -> std::time::Instant {
+    instance_deadline
+        .checked_sub(std::time::Duration::from_secs(
+            decision.effective_flush_reserve_secs,
+        ))
+        .unwrap_or(instance_deadline)
+}
+
+/// Normalize only the harmless spelling differences accepted for the narrow
+/// SafeNLP timeout experiment. Paths, suffixes, and broader aliases stay out of
+/// scope so the dark lever cannot accidentally affect another category.
+fn is_safenlp_2024_category(category: &str) -> bool {
+    category.trim().to_ascii_lowercase().replace('-', "_") == "safenlp_2024"
+}
+
+/// Exact-string gate for the dark SafeNLP timeout experiment.
+///
+/// `var_os` plus `OsStr` equality makes non-Unicode values fail closed. In
+/// particular, truthy spellings, whitespace, and malformed values do not arm
+/// the experiment.
+fn safenlp_short_grace_gate_enabled(raw: Option<&OsStr>) -> bool {
+    raw == Some(OsStr::new("1"))
+}
+
+/// Resolve only the VNN-COMP-owned half of the direct-MIP-first route.
+///
+/// `var_os`/`OsStr` equality gives this the same exact-literal semantics as the
+/// short-grace experiment: unset, malformed, whitespace-padded, truthy, and
+/// non-Unicode values all fail closed. A positive scored budget is required so
+/// the later dispatch can never manufacture an unbounded direct solve.
+fn safenlp_direct_mip_first_requested(
+    category: &str,
+    timeout_secs: u64,
+    gate_raw: Option<&OsStr>,
+) -> bool {
+    gate_raw == Some(OsStr::new("1"))
+        && is_safenlp_2024_category(category)
+        && (1..=SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS).contains(&timeout_secs)
+}
+
+/// Select the competition verifier's internal timeout.
+///
+/// The historical timeout function above remains the sole path unless every
+/// narrow experiment gate matches: exact environment value `1`, normalized
+/// category `safenlp_2024`, and a scored budget of at most 30 seconds. The
+/// outer instance deadline, both watchdogs, and the pre-written sound
+/// `unknown` remain unchanged and authoritative.
+fn internal_timeout_decision(
+    category: &str,
+    timeout_secs: u64,
+    gate_raw: Option<&OsStr>,
+) -> InternalTimeoutDecision {
+    let historical_solver_timeout_secs = internal_timeout_secs(timeout_secs);
+    if !safenlp_short_grace_gate_enabled(gate_raw)
+        || !is_safenlp_2024_category(category)
+        || timeout_secs > SAFENLP_SHORT_GRACE_MAX_BUDGET_SECS
+    {
+        return InternalTimeoutDecision {
+            solver_timeout_secs: historical_solver_timeout_secs,
+            effective_flush_reserve_secs: timeout_secs
+                .saturating_sub(historical_solver_timeout_secs),
+            historical_solver_timeout_secs,
+            route: InternalTimeoutRoute::Historical,
+        };
+    }
+
+    // Keep the established positive-timeout fallback for the one-second edge:
+    // a one-second scored budget cannot reserve a full second and still launch
+    // the solver. This is unreachable through normal 2025 SafeNLP instances,
+    // but keeping it explicit makes the pure boundary behavior total.
+    let solver_timeout_secs = timeout_secs
+        .checked_sub(SAFENLP_SHORT_GRACE_SECS)
+        .filter(|&t| t >= 1)
+        .unwrap_or(timeout_secs);
+    InternalTimeoutDecision {
+        solver_timeout_secs,
+        effective_flush_reserve_secs: timeout_secs.saturating_sub(solver_timeout_secs),
+        historical_solver_timeout_secs,
+        route: InternalTimeoutRoute::SafeNlpShortGrace,
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn safenlp_short_hard_stop_deadline(instance_deadline: std::time::Instant) -> std::time::Instant {
+    instance_deadline
+        .checked_sub(SAFENLP_SHORT_HARD_STOP_MARGIN)
+        .unwrap_or_else(std::time::Instant::now)
+}
+
+fn safenlp_short_publication_deadline(instance_deadline: std::time::Instant) -> std::time::Instant {
+    instance_deadline
+        .checked_sub(SAFENLP_SHORT_PUBLICATION_MARGIN)
+        .unwrap_or_else(std::time::Instant::now)
+}
+
+fn safenlp_short_prepare_ack_deadline(
+    hard_stop_deadline: CanonicalMonotonicInstant,
+) -> CanonicalMonotonicInstant {
+    hard_stop_deadline
+        .checked_sub(SAFENLP_SHORT_FINALIZATION_WINDOW)
+        .unwrap_or(CanonicalMonotonicInstant::EXPIRED)
 }
 
 /// Lowercase the category and strip a trailing `_20NN` year suffix, yielding the two
@@ -243,7 +953,7 @@ fn vnncomp_dirs_newest_first(configs_dir: &Path) -> Vec<PathBuf> {
 /// For each `vnncomp*` directory (newest first), the full category-with-year name is
 /// tried before the year-stripped base name. The first existing file wins. Returns
 /// `None` when no preset exists for the category (epsilon/auto defaults are then used).
-fn resolve_preset_path(configs_dir: &Path, category: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_preset_path(configs_dir: &Path, category: &str) -> Option<PathBuf> {
     let candidates = preset_basename_candidates(category);
     for year_dir in vnncomp_dirs_newest_first(configs_dir) {
         for candidate in &candidates {
@@ -261,7 +971,7 @@ fn resolve_preset_path(configs_dir: &Path, category: &str) -> Option<PathBuf> {
 /// Tries, in order: each provided start path's ancestors for a child `configs/`
 /// directory (so a binary at `<repo>/target/release/ny` and an ONNX anywhere under
 /// `<repo>` both resolve to `<repo>/configs`). Returns the first existing directory.
-fn auto_derive_configs_dir(starts: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn auto_derive_configs_dir(starts: &[PathBuf]) -> Option<PathBuf> {
     for start in starts {
         let mut cursor: Option<&Path> = Some(start.as_path());
         while let Some(dir) = cursor {
@@ -275,38 +985,1469 @@ fn auto_derive_configs_dir(starts: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-/// Hidden argv[1] for the out-of-process vnncomp watchdog helper (see
+/// Hidden `argv[1]` for the out-of-process vnncomp watchdog helper (see
 /// `handle_vnncomp_command`). Intercepted in `main.rs` before clap parsing and
 /// logging setup, like `__shape-infer`.
 pub(crate) const EXTERNAL_WATCHDOG_SUBCOMMAND: &str = "__vnncomp-watchdog";
+
+// ── The external-watchdog subsystem is Unix-only ────────────────────────────
+//
+// Everything that drives it — `spawn_external_watchdog`, the writer/reader
+// loops, `hard_kill_parent` — is `#[cfg(unix)]`, because it is built on fork
+// semantics, process groups and signals. The scored platform is Linux.
+//
+// The items those Unix paths CONSUME (the protocol bytes, the deadline types,
+// the policy enums) are deliberately NOT `#[cfg(unix)]`-gated, so on Windows
+// they are compiled but unreachable, which is exactly `dead_code`. Each such
+// item therefore carries
+//
+//     #[cfg_attr(not(unix), allow(dead_code, reason = "..."))]
+//
+// rather than a `#[cfg(unix)]` gate. The distinction matters: an `allow` keeps
+// the item COMPILED AND TYPE-CHECKED on every platform, whereas a gate would
+// remove it from the Windows build entirely and let it rot unnoticed — which
+// is precisely how `ny-onnx`'s Windows arm came to name two unstable APIs and
+// stop building at all. Silence the warning; do not hide the code.
 
 /// Extra grace the OUT-OF-PROCESS watchdog waits past the in-process watchdog
 /// (`timeout + WATCHDOG_GRACE_SECS + this`) before declaring the verifier
 /// process wedged. Healthy overruns always exit through the in-process path
 /// first; the helper only ever fires on a process that stopped scheduling.
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
 const EXTERNAL_WATCHDOG_EXTRA_GRACE_SECS: u64 = 10;
 
+/// Extra grace the in-process watchdog waits past the scored budget before
+/// replacing the placeholder result and requesting a process-wide hard stop.
+const WATCHDOG_GRACE_SECS: u64 = 5;
+
+/// A byte on the external watchdog's stdin asks it to fire immediately. EOF
+/// still means the parent exited normally and the helper should retire.
+const EXTERNAL_WATCHDOG_FIRE_REQUEST: &[u8] = b"F";
+/// Fire immediately, but leave RESULTS_FILE alone: the parent's in-process
+/// watchdog found a verdict this instance had already published BEFORE its own
+/// deadline, so the only thing left to enforce is the hard stop
+/// (#watchdog-verdict-overwrite). Distinct from `F` because an ordinary
+/// immediate fire must still seal a verdict that raced in after the deadline.
+const EXTERNAL_WATCHDOG_PRESERVE_FIRE_REQUEST: &[u8] = b"K";
+/// A byte tells the short helper that the coordinator completed its sole
+/// rename. It remains only a request until the helper consumes it pre-cutoff
+/// and returns [`EXTERNAL_WATCHDOG_PUBLICATION_ACK`].
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+const EXTERNAL_WATCHDOG_PUBLICATION_COMMIT: &[u8] = b"C";
+/// After accepting the child's prepare ACK, the parent writes this byte into
+/// the same ordered control pipe. Only a helper receipt timestamp strictly
+/// before the shared canonical H transitions Prepared → Finalized.
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+const EXTERNAL_WATCHDOG_PUBLICATION_FINALIZE: &[u8] = b"P";
+/// The short helper writes this byte back only after consuming `C` before its
+/// anchored cutoff. A non-text value avoids mistaking any incidental stdout
+/// text for a protocol acknowledgement.
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+const EXTERNAL_WATCHDOG_PUBLICATION_ACK: u8 = 0x06;
+const EXTERNAL_WATCHDOG_PARENT_ANCHORED_PROTOCOL: &str = "parent-anchored-monotonic-v2";
+
+fn publish_result_atomically(
+    results_file: &Path,
+    rendered: &str,
+    tmp_extension: &str,
+) -> std::io::Result<()> {
+    let tmp = results_file.with_extension(tmp_extension);
+    fs::write(&tmp, rendered)?;
+    fs::rename(tmp, results_file)
+}
+
+/// Process-local record that a DECIDED verdict reached RESULTS_FILE.
+///
+/// #watchdog-verdict-overwrite. The deadline watchdogs exist to replace the
+/// competition-safety placeholder (`unknown`) when the verifier overruns its
+/// budget. They must never replace a verdict the verifier already committed.
+/// MEASURED loss: a `sat` was published at 1.7 s, the process then wedged in
+/// its exit handlers for the rest of the 350 s budget, and the in-process
+/// watchdog overwrote its own already-written result file with `timeout` — a
+/// scored point silently converted to a zero, with the log still reading
+/// `Result: sat`. That is a correctness-of-REPORTING defect independent of any
+/// backend: ANY hang after publication converts a decided row into a lost one.
+static DECIDED_VERDICT_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `true` for the verdicts the verifier only writes when it actually decided
+/// the instance. `unknown` is deliberately excluded: it is also the
+/// competition-safety pre-write, so the watchdogs cannot tell a placeholder
+/// from a final `unknown` and must keep their historical freedom to replace it
+/// (both score zero either way). `timeout` is likewise replaceable.
+fn is_decided_verdict_token(token: &str) -> bool {
+    matches!(token, "sat" | "unsat" | "error")
+}
+
+/// Record a successful RESULTS_FILE publication so the in-process watchdog can
+/// refuse to overwrite it (#watchdog-verdict-overwrite).
+fn note_published_verdict(result: &VnncompResult) {
+    if is_decided_verdict_token(result.token()) {
+        DECIDED_VERDICT_PUBLISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Outcome of the in-process watchdog's timeout commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeoutCommit {
+    /// The placeholder (or an earlier `timeout`) was replaced with `timeout`.
+    Committed,
+    /// This instance had already published a decided verdict BEFORE the
+    /// watchdog's deadline; the watchdog left it alone.
+    DeclinedDecidedVerdict,
+}
+
+/// The in-process watchdog's timeout commit (#watchdog-verdict-overwrite).
+///
+/// Enforcing a deadline means replacing the competition-safety PLACEHOLDER.
+/// A verdict this instance itself published before the watchdog woke is not a
+/// placeholder — it is the answer the row earned — so it is preserved and only
+/// the hard stop still happens.
+///
+/// The decision reads the in-process publication flag and NOTHING ELSE. It
+/// deliberately does not sniff the results file: sweeps reuse results paths, so
+/// a decided token on disk can be a STALE verdict from a previous run that this
+/// instance wedged before overwriting with its placeholder, and preserving that
+/// would report another instance's answer.
+///
+/// Deadline integrity is unaffected. The flag is set only by a publication this
+/// process completed, and this function is only consulted at the moment the
+/// watchdog fires; a verdict that arrives AFTER the deadline is still sealed as
+/// `timeout` by the out-of-process helper (see `ExternalWatchdogControl`).
+fn commit_timeout_unless_verdict_published(
+    results_file: &Path,
+    tmp_extension: &str,
+) -> std::io::Result<TimeoutCommit> {
+    commit_timeout_unless_verdict_published_with(
+        DECIDED_VERDICT_PUBLISHED.load(std::sync::atomic::Ordering::SeqCst),
+        results_file,
+        tmp_extension,
+    )
+}
+
+/// Seam for [`commit_timeout_unless_verdict_published`]: the process-global
+/// publication flag is passed in so the rule is testable without a global whose
+/// value depends on which other test published first.
+fn commit_timeout_unless_verdict_published_with(
+    published_in_process: bool,
+    results_file: &Path,
+    tmp_extension: &str,
+) -> std::io::Result<TimeoutCommit> {
+    if published_in_process {
+        return Ok(TimeoutCommit::DeclinedDecidedVerdict);
+    }
+    commit_timeout_result_checked(results_file, tmp_extension).map(|()| TimeoutCommit::Committed)
+}
+
+/// End a COMPLETED scored `ny vnncomp` instance without running libc exit
+/// handlers or ELF fini sections.
+///
+/// #attack-steering-segv — MEASURED root cause (12 of 12 captured faults, gdb,
+/// same signature): the main thread reaches `exit` → `__run_exit_handlers` →
+/// `_dl_fini` → `_dl_call_fini`, which runs libGLX_nvidia's / libnvidia-glcore's
+/// destructors, WHILE a detached verifier thread is still inside that same
+/// driver stack. On this host that thread is `ny-attack-arming` inside
+/// `WgpuDevice::new` (`create_compute_pipeline`, or `vkDestroyDevice` while
+/// dropping a partially built device); it then faults on the globals fini just
+/// freed (`__pthread_rwlock_wrlock_full64 (rwlock=0x8)`), or the main thread
+/// itself aborts inside fini's own `free` (`malloc_consolidate(): invalid chunk
+/// size`). Fast rows are the exposed class because a ~0.7 s instance publishes
+/// its verdict while ~360 ms of driver construction is still in flight.
+///
+/// The class is NOT specific to WGPU: `hard_stop_from_in_process_watchdog`
+/// already documents the same fault hitting the r7 cGAN scorecard with a
+/// detached AY worker and the CUDA replay live at `exit(0)`. ORT's thread pools
+/// are in the same position. Joining every such thread is neither possible (a
+/// wedged driver never returns) nor desirable (it is pure latency on a scored
+/// budget).
+///
+/// So the scored path abandons them the only way that is race-free by
+/// construction: the verdict and the flight sidecar are already durable, stdout
+/// and stderr are flushed here, and `_exit(2)` ends the process with status 0
+/// through a single syscall — no atexit handler, no ELF fini, no destructor,
+/// nothing for a live thread to race. The kernel reclaims the address space,
+/// the GPU contexts, and every thread at once. This also removes the observed
+/// HANG: the exiting thread can no longer deadlock against a driver lock held
+/// by a thread that is still initializing.
+///
+/// RE-MEASURED on the exposed row (cctsdb patch-1 /
+/// spec_onnx_patch-1_idx_00099_1, 350 s budget, serial, WGPU route):
+///
+/// * before — 3 abnormal exits in 40 runs (2x SIGSEGV, 1x SIGABRT
+///   `free(): invalid size`), every one of them AFTER `Result: sat`;
+/// * after  — 0 abnormal exits in 100 runs, 100 `sat`, and the mean instance
+///   is 0.72 s rather than 0.88 s because driver fini no longer runs.
+#[allow(unsafe_code)]
+pub(crate) fn exit_scored_instance_without_teardown() -> ! {
+    use std::io::Write;
+    // Rust's stdout is line-buffered, so `Result:`/`Loading preset:` are
+    // already on their way out; flush anyway so a redirected (block-buffered)
+    // stdout is complete before the process disappears. stderr is unbuffered.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    {
+        // SAFETY: `_exit` is async-signal-safe, touches no Rust state, and
+        // never returns. Status 0 preserves the historical exit code of a
+        // completed instance (a harness that reads a signal/137 would treat
+        // the row as killed rather than decided).
+        unsafe { libc::_exit(0) }
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::exit(0)
+    }
+}
+
+static SHORT_GRACE_STAGE_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn stage_short_grace_result(
+    results_file: &Path,
+    result: &VnncompResult,
+) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::Ordering;
+
+    // Rendering and the potentially blocking file write deliberately happen
+    // in the verifier thread, before the coordinator admits a publication.
+    // The coordinator's final critical section is therefore one same-directory
+    // rename plus a child-confirmed ACK wait bounded by the anchored cutoff.
+    let rendered = result.render_results_file();
+    let sequence = SHORT_GRACE_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staged_path = results_file.with_extension(format!(
+        "short-grace.{}.{}.staged",
+        std::process::id(),
+        sequence
+    ));
+    fs::write(&staged_path, rendered)?;
+    Ok(staged_path)
+}
+
+struct ShortGracePublicationRequest {
+    staged_path: PathBuf,
+    acknowledgement: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
+impl Drop for ShortGracePublicationRequest {
+    fn drop(&mut self) {
+        // A successful rename makes this a cheap NotFound. Every decline/error
+        // path removes the staged verdict so it can never be mistaken for an
+        // admitted RESULTS_FILE publication.
+        let _ = fs::remove_file(&self.staged_path);
+    }
+}
+
+#[derive(Clone)]
+struct ShortGraceResultPublisher {
+    results_file: PathBuf,
+    sender: std::sync::mpsc::Sender<ShortGracePublicationRequest>,
+}
+
+impl ShortGraceResultPublisher {
+    /// Ask the sole short-grace coordinator to publish one terminal result.
+    ///
+    /// `Ok(false)` means the scored deadline won the race: the coordinator is
+    /// closed and the pre-written `unknown` is immutable. No caller on this
+    /// route writes RESULTS_FILE directly after the coordinator starts.
+    fn publish_terminal(&self, result: VnncompResult) -> std::io::Result<bool> {
+        let staged_path = stage_short_grace_result(&self.results_file, &result)?;
+        let (acknowledgement, result_rx) = std::sync::mpsc::sync_channel(1);
+        if self
+            .sender
+            .send(ShortGracePublicationRequest {
+                staged_path,
+                acknowledgement,
+            })
+            .is_err()
+        {
+            return Ok(false);
+        }
+        match result_rx.recv() {
+            Ok(Ok(())) => {
+                // Only an ACKNOWLEDGED rename is a publication on this route,
+                // so the #watchdog-verdict-overwrite record is taken here and
+                // not at staging time.
+                note_published_verdict(&result);
+                Ok(true)
+            }
+            Ok(Err(error)) => Err(std::io::Error::other(error)),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShortGraceCoordinatorOutcome {
+    Published,
+    Deadline,
+    PublisherDropped,
+    PublicationFailed,
+    AcknowledgementFailed,
+}
+
+/// Sole terminal-results writer for the short-grace route.
+///
+/// The placeholder is written before this starts and verdict bytes are fully
+/// staged before they enter the channel. A request must be admitted strictly
+/// before `publication_deadline`; after its sole rename, it must also complete
+/// the helper's child-confirmed canonical-monotonic C/ACK/P protocol. The
+/// independent hard-stop timer does not run in this function, so a blocked
+/// rename or missing ACK cannot delay deadline enforcement.
+fn await_short_grace_terminal_result(
+    results_file: &Path,
+    publication_deadline: std::time::Instant,
+    receiver: std::sync::mpsc::Receiver<ShortGracePublicationRequest>,
+    external_watchdog: Option<&ExternalWatchdogController>,
+) -> ShortGraceCoordinatorOutcome {
+    await_short_grace_terminal_result_with_rename(
+        results_file,
+        publication_deadline,
+        receiver,
+        external_watchdog,
+        |staged_path, destination| fs::rename(staged_path, destination),
+    )
+}
+
+fn await_short_grace_terminal_result_with_rename<F>(
+    results_file: &Path,
+    publication_deadline: std::time::Instant,
+    receiver: std::sync::mpsc::Receiver<ShortGracePublicationRequest>,
+    external_watchdog: Option<&ExternalWatchdogController>,
+    rename: F,
+) -> ShortGraceCoordinatorOutcome
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    await_short_grace_terminal_result_with_rename_and_record(
+        results_file,
+        publication_deadline,
+        receiver,
+        external_watchdog,
+        rename,
+        ExternalWatchdogController::record_publication_commit,
+    )
+}
+
+fn await_short_grace_terminal_result_with_rename_and_record<F, R>(
+    results_file: &Path,
+    publication_deadline: std::time::Instant,
+    receiver: std::sync::mpsc::Receiver<ShortGracePublicationRequest>,
+    external_watchdog: Option<&ExternalWatchdogController>,
+    rename: F,
+    record_publication: R,
+) -> ShortGraceCoordinatorOutcome
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    R: FnOnce(&ExternalWatchdogController) -> bool,
+{
+    let remaining = publication_deadline.saturating_duration_since(std::time::Instant::now());
+    let request = match receiver.recv_timeout(remaining) {
+        Ok(request) => request,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return ShortGraceCoordinatorOutcome::Deadline
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return ShortGraceCoordinatorOutcome::PublisherDropped
+        }
+    };
+
+    // `recv_timeout` may return a concurrently queued request at the boundary.
+    // The absolute deadline, not channel scheduling order, is authoritative.
+    if std::time::Instant::now() >= publication_deadline {
+        return ShortGraceCoordinatorOutcome::Deadline;
+    }
+
+    match rename(&request.staged_path, results_file) {
+        Ok(()) => {
+            // A rename that stalls across the acknowledgement boundary is not
+            // a committed result. The always-armed in-process timer kills the
+            // parent, and the external helper restores `unknown` unless it
+            // consumed C, returned ACK before the earlier prepare cutoff, and
+            // then received P before the exact shared monotonic H.
+            let acknowledged = external_watchdog.is_some_and(record_publication);
+            if !acknowledged {
+                let _ =
+                    commit_unknown_result_checked(results_file, "short-grace-unacknowledged.tmp");
+                return ShortGraceCoordinatorOutcome::AcknowledgementFailed;
+            }
+            // Best-effort parent-side suppression only. The helper's P receipt
+            // timestamp remains authoritative across this check's scheduling
+            // gap.
+            if external_watchdog.is_none_or(|watchdog| !watchdog.hard_stop.is_strictly_future()) {
+                let _ =
+                    commit_unknown_result_checked(results_file, "short-grace-unacknowledged.tmp");
+                return ShortGraceCoordinatorOutcome::Deadline;
+            }
+            let _ = request.acknowledgement.send(Ok(()));
+            ShortGraceCoordinatorOutcome::Published
+        }
+        Err(error) => {
+            let _ = request.acknowledgement.send(Err(error.to_string()));
+            ShortGraceCoordinatorOutcome::PublicationFailed
+        }
+    }
+}
+
+/// Best-effort deadline-result commit with explicit confirmation.
+///
+/// The atomic temp-file + rename path is retried once, then a direct write is
+/// attempted as a last resort. Failure remains non-fatal to watchdog
+/// enforcement: an unwritable results path must not let a wedged verifier run
+/// forever, and the competition pre-write normally leaves sound `unknown`.
+fn commit_timeout_result_checked(results_file: &Path, tmp_extension: &str) -> std::io::Result<()> {
+    let rendered = VnncompResult::Timeout.render_results_file();
+    let confirm = || -> std::io::Result<()> {
+        let contents = fs::read_to_string(results_file)?;
+        if contents.lines().next() == Some("timeout") {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "results file did not contain timeout after watchdog write",
+            ))
+        }
+    };
+
+    let mut last_error = None;
+    for _ in 0..2 {
+        match publish_result_atomically(results_file, &rendered, tmp_extension)
+            .and_then(|()| confirm())
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    fs::write(results_file, rendered)
+        .and_then(|()| confirm())
+        .map_err(|direct_error| {
+            std::io::Error::other(format!(
+                "atomic timeout commit failed ({}) and direct fallback failed ({direct_error})",
+                last_error
+                    .as_ref()
+                    .map_or_else(|| "unknown error".to_owned(), ToString::to_string)
+            ))
+        })
+}
+
+fn commit_unknown_result_checked(results_file: &Path, tmp_extension: &str) -> std::io::Result<()> {
+    let rendered = VnncompResult::Unknown.render_results_file();
+    let confirm = || -> std::io::Result<()> {
+        let contents = fs::read_to_string(results_file)?;
+        if contents.lines().next() == Some("unknown") {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "results file did not contain unknown after watchdog write",
+            ))
+        }
+    };
+
+    publish_result_atomically(results_file, &rendered, tmp_extension)
+        .and_then(|()| confirm())
+        .or_else(|atomic_error| {
+            fs::write(results_file, rendered)
+                .and_then(|()| confirm())
+                .map_err(|direct_error| {
+                    std::io::Error::other(format!(
+                        "atomic unknown commit failed ({atomic_error}) and direct fallback failed \
+                         ({direct_error})"
+                    ))
+                })
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+enum ExternalWatchdogDeadline {
+    /// Historical/default-off protocol. The helper starts this relative timer
+    /// after exec exactly as it did before the SafeNLP experiment existed.
+    RelativeSeconds(u64),
+    /// Short-grace protocol. This is the exact absolute `CLOCK_MONOTONIC`
+    /// boundary sampled by the parent and transported unchanged through exec.
+    ParentAnchoredMonotonic {
+        hard_stop: CanonicalMonotonicInstant,
+    },
+}
+
+/// Process-independent nanoseconds on Unix `CLOCK_MONOTONIC`.
+///
+/// Unlike `std::time::Instant`, this value can be serialized into the helper
+/// argv without deriving a second deadline from later wall/monotonic samples.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CanonicalMonotonicInstant(u64);
+
+impl CanonicalMonotonicInstant {
+    const EXPIRED: Self = Self(0);
+
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "the external watchdog is Unix-only")
+    )]
+    fn checked_add(self, duration: std::time::Duration) -> Option<Self> {
+        let nanos = u64::try_from(duration.as_nanos()).ok()?;
+        self.0.checked_add(nanos).map(Self)
+    }
+
+    fn checked_sub(self, duration: std::time::Duration) -> Option<Self> {
+        let nanos = u64::try_from(duration.as_nanos()).ok()?;
+        self.0.checked_sub(nanos).map(Self)
+    }
+
+    fn remaining(self) -> Option<std::time::Duration> {
+        let now = canonical_monotonic_now()?;
+        Some(std::time::Duration::from_nanos(
+            self.0.saturating_sub(now.0),
+        ))
+    }
+
+    fn is_strictly_future(self) -> bool {
+        canonical_monotonic_now().is_some_and(|now| now < self)
+    }
+}
+
+#[cfg(unix)]
+fn canonical_monotonic_now() -> Option<CanonicalMonotonicInstant> {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let nanos = u64::try_from(now.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(now.tv_nsec).ok()?)?;
+    Some(CanonicalMonotonicInstant(nanos))
+}
+
+#[cfg(not(unix))]
+fn canonical_monotonic_now() -> Option<CanonicalMonotonicInstant> {
+    None
+}
+
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+fn parent_anchored_watchdog_deadline(
+    hard_stop: CanonicalMonotonicInstant,
+) -> ExternalWatchdogDeadline {
+    ExternalWatchdogDeadline::ParentAnchoredMonotonic { hard_stop }
+}
+
+fn parse_canonical_monotonic_instant(value: &OsStr) -> Result<CanonicalMonotonicInstant> {
+    let nanos: u64 = value.to_string_lossy().parse().map_err(|error| {
+        anyhow!("{EXTERNAL_WATCHDOG_SUBCOMMAND}: bad hard_stop_monotonic_nanos: {error}")
+    })?;
+    Ok(CanonicalMonotonicInstant(nanos))
+}
+
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+fn resolve_short_external_watchdog_deadline(
+    deadline: ExternalWatchdogDeadline,
+) -> CanonicalMonotonicInstant {
+    match deadline {
+        ExternalWatchdogDeadline::RelativeSeconds(seconds) => canonical_monotonic_now()
+            .and_then(|now| now.checked_add(std::time::Duration::from_secs(seconds)))
+            .unwrap_or(CanonicalMonotonicInstant::EXPIRED),
+        ExternalWatchdogDeadline::ParentAnchoredMonotonic { hard_stop } => hard_stop,
+    }
+}
+
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+fn historical_external_watchdog_contract(
+    timeout_secs: u64,
+) -> (ExternalWatchdogDeadline, ExternalWatchdogResultPolicy) {
+    (
+        ExternalWatchdogDeadline::RelativeSeconds(
+            timeout_secs + WATCHDOG_GRACE_SECS + EXTERNAL_WATCHDOG_EXTRA_GRACE_SECS,
+        ),
+        ExternalWatchdogResultPolicy::CommitTimeout,
+    )
+}
+
 /// Spawn the out-of-process watchdog helper: a fresh exec of this binary via
-/// the hidden [`EXTERNAL_WATCHDOG_SUBCOMMAND`] entry. The returned `Child`'s
-/// piped stdin is the helper's retire signal (EOF => parent exited); the
-/// caller must keep it open for the parent's whole lifetime.
+/// the hidden [`EXTERNAL_WATCHDOG_SUBCOMMAND`] entry.
 #[cfg(unix)]
 fn spawn_external_watchdog(
     results_file: &Path,
-    fire_after_secs: u64,
+    deadline: ExternalWatchdogDeadline,
+    result_policy: ExternalWatchdogResultPolicy,
 ) -> std::io::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg(EXTERNAL_WATCHDOG_SUBCOMMAND)
-        .arg(results_file)
-        .arg(fire_after_secs.to_string())
-        .arg(std::process::id().to_string())
+    let mut command = std::process::Command::new(exe);
+    command.arg(EXTERNAL_WATCHDOG_SUBCOMMAND).arg(results_file);
+    let child_returns_publication_ack = match (deadline, result_policy) {
+        (
+            ExternalWatchdogDeadline::RelativeSeconds(fire_after_secs),
+            ExternalWatchdogResultPolicy::CommitTimeout,
+        ) => {
+            // Keep the historical argv contract byte-for-byte for all
+            // default-off/out-of-scope routes.
+            command
+                .arg(fire_after_secs.to_string())
+                .arg(std::process::id().to_string());
+            false
+        }
+        (
+            ExternalWatchdogDeadline::ParentAnchoredMonotonic { hard_stop },
+            ExternalWatchdogResultPolicy::PreserveAcknowledged,
+        ) => {
+            command
+                .arg(EXTERNAL_WATCHDOG_PARENT_ANCHORED_PROTOCOL)
+                .arg(hard_stop.0.to_string())
+                .arg(std::process::id().to_string())
+                .arg("preserve-acknowledged");
+            true
+        }
+        _ => {
+            return Err(std::io::Error::other(
+                "external watchdog deadline/result policy mismatch",
+            ))
+        }
+    };
+    command
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
+        // Historical/default-off stdout remains exactly null. Only the
+        // parent-anchored short protocol receives a one-byte ACK pipe.
+        .stdout(if child_returns_publication_ack {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         // The helper's fire message must land in the same place the in-process
         // watchdog's message would have gone.
         .stderr(std::process::Stdio::inherit())
         .spawn()
+}
+
+#[derive(Clone)]
+struct ExternalWatchdogController {
+    sender: std::sync::mpsc::SyncSender<ExternalWatchdogWriteRequest>,
+    hard_stop: CanonicalMonotonicInstant,
+    publication_acks: std::sync::Arc<
+        std::sync::Mutex<std::sync::mpsc::Receiver<Option<CanonicalMonotonicInstant>>>,
+    >,
+}
+
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+enum ExternalWatchdogWriteRequest {
+    FireNow,
+    PublicationCommit {
+        prepare_ack_deadline: CanonicalMonotonicInstant,
+    },
+    PublicationFinalize {
+        hard_stop: CanonicalMonotonicInstant,
+        write_observed_before_h: std::sync::mpsc::SyncSender<bool>,
+    },
+}
+
+impl ExternalWatchdogController {
+    fn record_publication_commit(&self) -> bool {
+        self.record_publication_commit_inner(|| {})
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "the external watchdog is Unix-only")
+    )]
+    fn record_publication_commit_with_boundary_fault<F>(&self, before_finalize_enqueue: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        self.record_publication_commit_inner(before_finalize_enqueue)
+    }
+
+    fn record_publication_commit_inner<F>(&self, before_finalize_enqueue: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        let prepare_ack_deadline = safenlp_short_prepare_ack_deadline(self.hard_stop);
+        if !prepare_ack_deadline.is_strictly_future() {
+            return false;
+        }
+        if self
+            .sender
+            .try_send(ExternalWatchdogWriteRequest::PublicationCommit {
+                prepare_ack_deadline,
+            })
+            .is_err()
+        {
+            return false;
+        }
+
+        let Some(remaining) = prepare_ack_deadline
+            .remaining()
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return false;
+        };
+        let Ok(receiver) = self.publication_acks.lock() else {
+            return false;
+        };
+        let prepare_acknowledged = match receiver.recv_timeout(remaining) {
+            Ok(Some(received_at)) => {
+                // The ACK reader timestamps receipt in the parent. Requiring
+                // both that timestamp and this return path to precede the
+                // cutoff prevents a queued/stale ACK from becoming retroactive.
+                received_at < prepare_ack_deadline && prepare_ack_deadline.is_strictly_future()
+            }
+            Ok(None) | Err(_) => false,
+        };
+        drop(receiver);
+        if !prepare_acknowledged {
+            return false;
+        }
+
+        // These checks minimize late queue traffic, but no userspace
+        // check→send sequence is atomic with H. The helper's canonical
+        // receive timestamp is the sole authority if this thread is preempted
+        // in the final gap below.
+        if !self.hard_stop.is_strictly_future() {
+            return false;
+        }
+        let (write_observed_before_h, write_observed_before_h_rx) =
+            std::sync::mpsc::sync_channel(1);
+        if !self.hard_stop.is_strictly_future() {
+            return false;
+        }
+        before_finalize_enqueue();
+        if self
+            .sender
+            .try_send(ExternalWatchdogWriteRequest::PublicationFinalize {
+                hard_stop: self.hard_stop,
+                write_observed_before_h,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let Some(remaining) = self
+            .hard_stop
+            .remaining()
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return false;
+        };
+        write_observed_before_h_rx
+            .recv_timeout(remaining)
+            .is_ok_and(|observed| observed && self.hard_stop.is_strictly_future())
+    }
+
+    fn request_immediate_fire(&self) -> bool {
+        self.sender
+            .try_send(ExternalWatchdogWriteRequest::FireNow)
+            .is_ok()
+    }
+}
+
+#[cfg(all(unix, test))]
+fn write_short_watchdog_request_with_boundary_fault<W, F>(
+    writer: &mut W,
+    request: ExternalWatchdogWriteRequest,
+    before_finalize_write: F,
+) -> bool
+where
+    W: std::io::Write + std::os::fd::AsFd,
+    F: FnOnce(),
+{
+    write_short_watchdog_request_inner(writer, request, before_finalize_write)
+}
+
+#[cfg(unix)]
+fn write_short_watchdog_request_inner<W, F>(
+    writer: &mut W,
+    request: ExternalWatchdogWriteRequest,
+    before_finalize_write: F,
+) -> bool
+where
+    W: std::io::Write + std::os::fd::AsFd,
+    F: FnOnce(),
+{
+    match request {
+        ExternalWatchdogWriteRequest::FireNow => {
+            writer.write_all(EXTERNAL_WATCHDOG_FIRE_REQUEST).is_ok()
+        }
+        ExternalWatchdogWriteRequest::PublicationCommit {
+            prepare_ack_deadline,
+        } => {
+            if !prepare_ack_deadline.is_strictly_future() {
+                return true;
+            }
+            writer
+                .write_all(EXTERNAL_WATCHDOG_PUBLICATION_COMMIT)
+                .is_ok()
+        }
+        ExternalWatchdogWriteRequest::PublicationFinalize {
+            hard_stop,
+            write_observed_before_h,
+        } => {
+            // This best-effort check avoids a known-late syscall. It cannot
+            // prevent scheduler preemption in the final check→write gap, so a
+            // physically late P is allowed to reach the helper and is rejected
+            // there by its authoritative canonical receive timestamp.
+            if !hard_stop.is_strictly_future() {
+                let _ = write_observed_before_h.send(false);
+                return true;
+            }
+            before_finalize_write();
+            let write_succeeded =
+                rustix::io::write(writer.as_fd(), EXTERNAL_WATCHDOG_PUBLICATION_FINALIZE) == Ok(1);
+            let timely_observation =
+                canonical_monotonic_now().is_some_and(|written_at| written_at < hard_stop);
+            let _ = write_observed_before_h.send(write_succeeded && timely_observation);
+            write_succeeded
+        }
+    }
+}
+
+#[cfg(unix)]
+fn forward_short_watchdog_acknowledgements<R>(
+    mut acknowledgement_reader: R,
+    publication_ack_tx: std::sync::mpsc::SyncSender<Option<CanonicalMonotonicInstant>>,
+) where
+    R: std::io::Read,
+{
+    let mut response = [0u8; 64];
+    loop {
+        match acknowledgement_reader.read(&mut response) {
+            Ok(0) => return,
+            Ok(read) => {
+                for byte in &response[..read] {
+                    if *byte == EXTERNAL_WATCHDOG_PUBLICATION_ACK
+                        && publication_ack_tx.send(canonical_monotonic_now()).is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_short_watchdog_writer<W>(
+    writer: W,
+    receiver: std::sync::mpsc::Receiver<ExternalWatchdogWriteRequest>,
+) where
+    W: std::io::Write + std::os::fd::AsFd,
+{
+    run_short_watchdog_writer_inner(writer, receiver, || {});
+}
+
+#[cfg(all(unix, test))]
+fn run_short_watchdog_writer_with_boundary_fault<W, F>(
+    writer: W,
+    receiver: std::sync::mpsc::Receiver<ExternalWatchdogWriteRequest>,
+    before_finalize_write: F,
+) where
+    W: std::io::Write + std::os::fd::AsFd,
+    F: FnMut(),
+{
+    run_short_watchdog_writer_inner(writer, receiver, before_finalize_write);
+}
+
+#[cfg(unix)]
+fn run_short_watchdog_writer_inner<W, F>(
+    mut writer: W,
+    receiver: std::sync::mpsc::Receiver<ExternalWatchdogWriteRequest>,
+    mut before_finalize_write: F,
+) where
+    W: std::io::Write + std::os::fd::AsFd,
+    F: FnMut(),
+{
+    while let Ok(request) = receiver.recv() {
+        if !write_short_watchdog_request_inner(&mut writer, request, || {
+            before_finalize_write();
+        }) {
+            break;
+        }
+    }
+}
+
+/// Split the short-route helper control pipe into a non-blocking command queue
+/// and an outer lifetime lease. The leaked lease is intentional: the kernel
+/// closes it only when the verifier process actually exits, so returning from
+/// the publication coordinator cannot retire the helper early.
+#[cfg(unix)]
+fn retain_short_watchdog_until_process_exit(
+    mut child: std::process::Child,
+    hard_stop: CanonicalMonotonicInstant,
+) -> std::io::Result<ExternalWatchdogController> {
+    use std::os::fd::AsFd;
+
+    let lifetime_lease = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("watchdog child had no piped stdin"))?;
+    let acknowledgement_reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("short watchdog child had no ACK pipe"))?;
+    let writer_fd = lifetime_lease.as_fd().try_clone_to_owned()?;
+    let writer = fs::File::from(writer_fd);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+    let (publication_ack_tx, publication_ack_rx) = std::sync::mpsc::sync_channel(4);
+    std::thread::Builder::new()
+        .name("vnncomp-watchdog-ack".to_owned())
+        .spawn(move || {
+            forward_short_watchdog_acknowledgements(acknowledgement_reader, publication_ack_tx);
+        })?;
+    std::thread::Builder::new()
+        .name("vnncomp-watchdog-control".to_owned())
+        .spawn(move || run_short_watchdog_writer(writer, receiver))?;
+
+    // This is the main-owned watchdog lease. Unlike the coordinator-owned
+    // writer in the rejected design, it survives terminal publication and all
+    // Rust returns. The OS closes it at actual process exit.
+    std::mem::forget(lifetime_lease);
+    let _ = std::thread::Builder::new()
+        .name("vnncomp-watchdog-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(ExternalWatchdogController {
+        sender,
+        hard_stop,
+        publication_acks: std::sync::Arc::new(std::sync::Mutex::new(publication_ack_rx)),
+    })
+}
+
+#[cfg(unix)]
+fn spawn_and_retain_short_watchdog(
+    results_file: &Path,
+    hard_stop: CanonicalMonotonicInstant,
+) -> std::io::Result<ExternalWatchdogController> {
+    // One argument supplies both consumers: the exact H serialized into the
+    // helper argv is also stored in the controller and every writer request.
+    let child = spawn_external_watchdog(
+        results_file,
+        parent_anchored_watchdog_deadline(hard_stop),
+        ExternalWatchdogResultPolicy::PreserveAcknowledged,
+    )?;
+    retain_short_watchdog_until_process_exit(child, hard_stop)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+enum ExternalWatchdogControl {
+    Retire,
+    FireNow,
+    /// Hard-stop now, but do NOT touch RESULTS_FILE: the parent published a
+    /// decided verdict before its own deadline (#watchdog-verdict-overwrite).
+    FirePreservingVerdict,
+    PublicationCommitRequested {
+        received_at: Option<CanonicalMonotonicInstant>,
+    },
+    PublicationFinalizeRequested {
+        received_at: Option<CanonicalMonotonicInstant>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+enum ShortWatchdogPublicationState {
+    Unacknowledged,
+    Prepared,
+    Finalized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+enum ExternalWatchdogResultPolicy {
+    CommitTimeout,
+    PreserveAcknowledged,
+}
+
+/// Exact historical/default-off watchdog loop from the pre-experiment
+/// baseline. Keep this separate from the short protocol so an unset gate or
+/// explicit `0` retains the original reader, relative clock, timeout commit,
+/// `kill(1)`, and retirement behavior.
+fn serve_historical_external_watchdog_loop<R>(
+    results_file: PathBuf,
+    fire_after_secs: u64,
+    parent_pid: u32,
+    mut control: R,
+) -> Result<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+
+    let (control_tx, control_rx) = sync_channel(1);
+    std::thread::spawn(move || {
+        let mut request = [0u8; 64];
+        let event = loop {
+            match control.read(&mut request) {
+                Ok(0) => break ExternalWatchdogControl::Retire,
+                // #watchdog-verdict-overwrite: the parent distinguishes the two
+                // hard-stop reasons by BYTE. Anything that is not the explicit
+                // preserve request keeps the historical unconditional timeout
+                // commit, so an unknown/legacy byte can never silently preserve
+                // a post-deadline verdict.
+                Ok(read)
+                    if request[..read].contains(&EXTERNAL_WATCHDOG_PRESERVE_FIRE_REQUEST[0]) =>
+                {
+                    break ExternalWatchdogControl::FirePreservingVerdict
+                }
+                Ok(_) => break ExternalWatchdogControl::FireNow,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break ExternalWatchdogControl::Retire,
+            }
+        };
+        let _ = control_tx.send(event);
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(fire_after_secs);
+    let mut preserve_published_verdict = false;
+    let immediate = loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break false;
+        }
+        #[cfg(target_os = "linux")]
+        if !Path::new(&format!("/proc/{parent_pid}")).exists() {
+            return Ok(());
+        }
+        match control_rx.recv_timeout(std::cmp::min(
+            deadline - now,
+            std::time::Duration::from_secs(1),
+        )) {
+            Ok(ExternalWatchdogControl::Retire) => return Ok(()),
+            Ok(ExternalWatchdogControl::FirePreservingVerdict) => {
+                preserve_published_verdict = true;
+                break true;
+            }
+            Ok(ExternalWatchdogControl::FireNow)
+            | Ok(ExternalWatchdogControl::PublicationCommitRequested { .. })
+            | Ok(ExternalWatchdogControl::PublicationFinalizeRequested { .. }) => break true,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    };
+
+    // #watchdog-verdict-overwrite: `preserve` means the parent's in-process
+    // watchdog found a verdict it had ALREADY published before its own deadline
+    // and declined to replace it. The hard stop below still happens — only the
+    // verdict survives. Every other path is byte-for-byte historical: an
+    // ordinary immediate fire still seals `timeout` over a verdict that raced
+    // in after the deadline, and a helper firing on its own timer still
+    // replaces only a placeholder.
+    let write_timeout = !preserve_published_verdict
+        && (immediate
+            || match fs::read_to_string(&results_file) {
+                Ok(contents) => contents.lines().next().is_none_or(|line| line == "unknown"),
+                Err(_) => true,
+            });
+    let commit_error = if write_timeout {
+        commit_timeout_result_checked(&results_file, "extwatchdog.tmp").err()
+    } else {
+        None
+    };
+
+    let status = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(parent_pid.to_string())
+        .status()
+        .with_context(|| format!("external watchdog failed to invoke kill for pid {parent_pid}"))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "external watchdog kill -KILL {parent_pid} exited with {status}"
+        ));
+    }
+    if let Some(error) = commit_error {
+        eprintln!(
+            "vnncomp external watchdog: WARNING: could not confirm timeout in {} before \
+             hard-stopping pid {parent_pid}: {error}; preserving deadline enforcement",
+            results_file.display()
+        );
+    }
+    if immediate {
+        eprintln!(
+            "vnncomp external watchdog: in-process deadline helper requested an immediate hard \
+             stop; SIGKILLed verifier pid {parent_pid} without running process exit handlers"
+        );
+    } else {
+        eprintln!(
+            "vnncomp external watchdog: {fire_after_secs}s (scored budget + grace) exceeded with \
+             the verifier process still alive and its in-process watchdog silent — process-wide \
+             wedge; SIGKILLed verifier pid {parent_pid}"
+        );
+    }
+    Ok(())
+}
+
+/// Parent-anchored short protocol. `C` installs Prepared before the raw ACK
+/// syscall; only a later, ordered `P` installs Finalized.
+#[cfg(unix)]
+fn serve_short_external_watchdog_loop<R, W>(
+    results_file: PathBuf,
+    deadline_spec: ExternalWatchdogDeadline,
+    parent_pid: u32,
+    control: R,
+    publication_acknowledgement: W,
+) -> Result<()>
+where
+    R: std::io::Read + Send + 'static,
+    W: std::os::fd::AsFd,
+{
+    serve_short_external_watchdog_loop_with_fault(
+        results_file,
+        deadline_spec,
+        parent_pid,
+        control,
+        publication_acknowledgement,
+        || {},
+    )
+}
+
+#[cfg(unix)]
+fn serve_short_external_watchdog_loop_with_fault<R, W, F>(
+    results_file: PathBuf,
+    deadline_spec: ExternalWatchdogDeadline,
+    parent_pid: u32,
+    mut control: R,
+    publication_acknowledgement: W,
+    after_ack_visible: F,
+) -> Result<()>
+where
+    R: std::io::Read + Send + 'static,
+    W: std::os::fd::AsFd,
+    F: FnOnce(),
+{
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut request = [0u8; 64];
+        loop {
+            match control.read(&mut request) {
+                Ok(0) => {
+                    let _ = control_tx.send(ExternalWatchdogControl::Retire);
+                    return;
+                }
+                Ok(read) => {
+                    // Timestamp raw receipt in the helper on the exact
+                    // process-independent clock carried in argv. If the clock
+                    // cannot be sampled, C/P are non-authoritative.
+                    let received_at = canonical_monotonic_now();
+                    for byte in &request[..read] {
+                        let event = match *byte {
+                            byte if byte == EXTERNAL_WATCHDOG_PUBLICATION_COMMIT[0] => {
+                                ExternalWatchdogControl::PublicationCommitRequested { received_at }
+                            }
+                            byte if byte == EXTERNAL_WATCHDOG_PUBLICATION_FINALIZE[0] => {
+                                ExternalWatchdogControl::PublicationFinalizeRequested {
+                                    received_at,
+                                }
+                            }
+                            _ => ExternalWatchdogControl::FireNow,
+                        };
+                        if control_tx.send(event).is_err()
+                            || event == ExternalWatchdogControl::FireNow
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    let _ = control_tx.send(ExternalWatchdogControl::Retire);
+                    return;
+                }
+            }
+        }
+    });
+
+    serve_short_external_watchdog_events(
+        results_file,
+        deadline_spec,
+        parent_pid,
+        control_rx,
+        &publication_acknowledgement,
+        after_ack_visible,
+    )
+}
+
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+fn retire_short_external_watchdog(
+    results_file: &Path,
+    publication_state: ShortWatchdogPublicationState,
+) -> Result<()> {
+    if publication_state != ShortWatchdogPublicationState::Finalized {
+        commit_unknown_result_checked(results_file, "extwatchdog-unknown.tmp").with_context(
+            || {
+                format!(
+                    "short-grace watchdog could not seal unacknowledged result {} on parent exit",
+                    results_file.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hard_kill_parent(parent_pid: u32) -> Result<bool> {
+    let raw_pid = i32::try_from(parent_pid)
+        .map_err(|_| anyhow!("external watchdog parent pid {parent_pid} exceeds i32"))?;
+    let pid = rustix::process::Pid::from_raw(raw_pid)
+        .ok_or_else(|| anyhow!("external watchdog parent pid must be nonzero"))?;
+    match rustix::process::kill_process(pid, rustix::process::Signal::KILL) {
+        Ok(()) => Ok(true),
+        // The in-process fail-safe may have aborted the parent immediately
+        // after queuing F. The helper still seals an unacknowledged result.
+        Err(error) if error == rustix::io::Errno::SRCH => Ok(false),
+        Err(error) => Err(anyhow!(
+            "external watchdog failed to SIGKILL pid {parent_pid}: {error}"
+        )),
+    }
+}
+
+/// Non-Unix fallback. Every caller sits behind `#[cfg(unix)]`, so nothing
+/// reaches it here — it exists to keep this arm type-checked rather than to
+/// run. See the subsystem note at the top of the watchdog section for why that
+/// is an `allow` and not a `#[cfg]` gate.
+#[cfg(not(unix))]
+#[allow(dead_code, reason = "the external watchdog is Unix-only")]
+fn hard_kill_parent(parent_pid: u32) -> Result<bool> {
+    let status = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(parent_pid.to_string())
+        .status()
+        .with_context(|| format!("external watchdog failed to invoke kill for pid {parent_pid}"))?;
+    if status.success() {
+        Ok(true)
+    } else {
+        Err(anyhow!(
+            "external watchdog kill -KILL {parent_pid} exited with {status}"
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn apply_short_watchdog_control<W, F>(
+    event: ExternalWatchdogControl,
+    publication_state: &mut ShortWatchdogPublicationState,
+    prepare_ack_deadline: CanonicalMonotonicInstant,
+    hard_stop: CanonicalMonotonicInstant,
+    publication_acknowledgement: &W,
+    after_ack_visible: &mut Option<F>,
+) where
+    W: std::os::fd::AsFd,
+    F: FnOnce(),
+{
+    match event {
+        ExternalWatchdogControl::PublicationCommitRequested { received_at } => {
+            if *publication_state == ShortWatchdogPublicationState::Unacknowledged
+                && received_at.is_some_and(|received_at| received_at < prepare_ack_deadline)
+            {
+                // Install Prepared BEFORE the one-byte raw pipe write. An ACK
+                // can therefore never describe state that still needs
+                // post-write installation. On a definite zero/error write,
+                // roll back because no ACK byte became visible.
+                *publication_state = ShortWatchdogPublicationState::Prepared;
+                let returned = match rustix::io::write(
+                    publication_acknowledgement.as_fd(),
+                    &[EXTERNAL_WATCHDOG_PUBLICATION_ACK],
+                ) {
+                    Ok(1) => {
+                        if let Some(fault) = after_ack_visible.take() {
+                            // Deterministic audit seam: this is the first
+                            // action after the successful raw syscall.
+                            fault();
+                        }
+                        true
+                    }
+                    Ok(_) | Err(_) => false,
+                };
+                if !returned {
+                    *publication_state = ShortWatchdogPublicationState::Unacknowledged;
+                }
+            }
+        }
+        ExternalWatchdogControl::PublicationFinalizeRequested { received_at } => {
+            if *publication_state == ShortWatchdogPublicationState::Prepared
+                && received_at.is_some_and(|received_at| received_at < hard_stop)
+            {
+                *publication_state = ShortWatchdogPublicationState::Finalized;
+            }
+        }
+        // `FirePreservingVerdict` belongs to the historical protocol's reader
+        // (#watchdog-verdict-overwrite); the short protocol never emits it, and
+        // like `FireNow` it carries no publication-state transition.
+        ExternalWatchdogControl::Retire
+        | ExternalWatchdogControl::FireNow
+        | ExternalWatchdogControl::FirePreservingVerdict => {}
+    }
+}
+
+#[cfg(unix)]
+fn serve_short_external_watchdog_events<W, F>(
+    results_file: PathBuf,
+    deadline_spec: ExternalWatchdogDeadline,
+    parent_pid: u32,
+    control_rx: std::sync::mpsc::Receiver<ExternalWatchdogControl>,
+    publication_acknowledgement: &W,
+    after_ack_visible: F,
+) -> Result<()>
+where
+    W: std::os::fd::AsFd,
+    F: FnOnce(),
+{
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+
+    let hard_stop = resolve_short_external_watchdog_deadline(deadline_spec);
+    let prepare_ack_deadline = safenlp_short_prepare_ack_deadline(hard_stop);
+    let mut publication_state = ShortWatchdogPublicationState::Unacknowledged;
+    let mut after_ack_visible = Some(after_ack_visible);
+
+    let immediate = 'watch: loop {
+        // Preserve pipe order across adversarial scheduling: process every
+        // already-forwarded C/P/EOF record before declaring the clock expired.
+        loop {
+            match control_rx.try_recv() {
+                Ok(ExternalWatchdogControl::Retire) => {
+                    return retire_short_external_watchdog(&results_file, publication_state)
+                }
+                Ok(ExternalWatchdogControl::FireNow) => break 'watch true,
+                Ok(event) => apply_short_watchdog_control(
+                    event,
+                    &mut publication_state,
+                    prepare_ack_deadline,
+                    hard_stop,
+                    publication_acknowledgement,
+                    &mut after_ack_visible,
+                ),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return retire_short_external_watchdog(&results_file, publication_state)
+                }
+            }
+        }
+
+        let Some(remaining) = hard_stop.remaining() else {
+            break 'watch false;
+        };
+        if remaining.is_zero() {
+            break 'watch false;
+        }
+        // Deliberately rely on the process-lifetime pipe lease. A /proc check
+        // can observe parent disappearance before the reader forwards an
+        // earlier C byte, violating control-pipe order at parent exit.
+        match control_rx.recv_timeout(std::cmp::min(remaining, std::time::Duration::from_secs(1))) {
+            Ok(ExternalWatchdogControl::Retire) => {
+                return retire_short_external_watchdog(&results_file, publication_state)
+            }
+            Ok(ExternalWatchdogControl::FireNow) => break 'watch true,
+            Ok(event) => apply_short_watchdog_control(
+                event,
+                &mut publication_state,
+                prepare_ack_deadline,
+                hard_stop,
+                publication_acknowledgement,
+                &mut after_ack_visible,
+            ),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return retire_short_external_watchdog(&results_file, publication_state)
+            }
+        }
+    };
+
+    // This is one safe syscall through rustix on Unix, with no child process
+    // and no unbounded `Command::status()` wait.
+    let kill_delivered = hard_kill_parent(parent_pid)?;
+    if publication_state == ShortWatchdogPublicationState::Prepared {
+        // SIGKILL closes the main-owned lease. Drain the reader's ordered
+        // kernel-pipe tail so a P written before parent acceptance/exit cannot
+        // be lost merely because this helper was paused after returning ACK.
+        // This starts only after successful SIGKILL/ESRCH: kernel teardown
+        // guarantees EOF, while channel disconnect is the reader fail-safe.
+        loop {
+            match control_rx.recv() {
+                Ok(ExternalWatchdogControl::Retire) | Err(std::sync::mpsc::RecvError) => break,
+                Ok(event) => apply_short_watchdog_control(
+                    event,
+                    &mut publication_state,
+                    prepare_ack_deadline,
+                    hard_stop,
+                    publication_acknowledgement,
+                    &mut after_ack_visible,
+                ),
+            }
+        }
+    }
+    let unknown_commit_error = if publication_state != ShortWatchdogPublicationState::Finalized {
+        // SIGKILL prevents any further parent userspace write. Sealing after
+        // signal delivery therefore erases a rename that crossed the cutoff
+        // without receiving an explicit pre-cutoff acknowledgement.
+        commit_unknown_result_checked(&results_file, "extwatchdog-unknown.tmp").err()
+    } else {
+        None
+    };
+
+    if let Some(error) = unknown_commit_error {
+        eprintln!(
+            "vnncomp external watchdog: WARNING: could not seal unacknowledged short-grace \
+             publication in {} after hard-stopping pid {parent_pid}: {error}",
+            results_file.display()
+        );
+    }
+    if immediate {
+        eprintln!(
+            "vnncomp external watchdog: in-process deadline helper requested an immediate hard \
+             stop; {} verifier pid {parent_pid} without running process exit handlers",
+            if kill_delivered {
+                "SIGKILLed"
+            } else {
+                "found already-exited"
+            }
+        );
+    } else {
+        eprintln!(
+            "vnncomp external watchdog: parent-anchored deadline exceeded with the verifier \
+             process still alive — process-wide wedge; {} verifier pid {parent_pid}",
+            if kill_delivered {
+                "SIGKILLed"
+            } else {
+                "found already-exited"
+            }
+        );
+    }
+    Ok(())
 }
 
 /// Serve the hidden `ny __vnncomp-watchdog <results_file> <fire_after_secs>
@@ -315,90 +2456,197 @@ fn spawn_external_watchdog(
 /// job is to outlive a wedged parent verifier and enforce the scored deadline
 /// from a separate address space.
 ///
-/// Retire paths (no verdict written, exit 0):
-/// - stdin EOF: the parent exited (normal return, watchdog exit, panic, kill);
-/// - the parent pid disappeared (belt-and-braces for a lost pipe).
+/// Retire paths:
+/// - stdin EOF: the parent actually exited (normal return, watchdog, panic,
+///   signal); the short protocol seals `unknown` unless ordered C/ACK/P
+///   preparation and finalization completed first;
+/// - the parent pid disappeared (the same conservative rule applies).
 ///
-/// Fire path (deadline passed, parent still alive):
-/// - if RESULTS_FILE still holds the pre-written `unknown` placeholder (or is
-///   missing/unreadable), replace it with the sound `timeout` via temp-file +
-///   rename — the same contract as the in-process watchdog. A real verdict
-///   written by a parent that then wedged mid-exit is left untouched;
-/// - SIGKILL the parent so no harness hangs behind a wedged verifier.
+/// Fire paths:
+/// - historical/default-off: preserve the existing checked-timeout contract;
+/// - short-grace: SIGKILL first, then preserve only a result carrying an
+///   early child ACK whose later P was received by the helper strictly before
+///   the exact shared monotonic H; otherwise seal sound `unknown`;
+/// - direct SIGKILL is one bounded syscall, so no `kill(1)` subprocess can
+///   extend the deadline.
 pub(crate) fn serve_external_watchdog() -> Result<()> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
-    let [results_file, fire_after_secs, parent_pid] = args.as_slice() else {
-        return Err(anyhow!(
-            "{EXTERNAL_WATCHDOG_SUBCOMMAND}: expected <results_file> <fire_after_secs> <parent_pid>"
-        ));
-    };
-    let results_file = PathBuf::from(results_file);
-    let fire_after_secs: u64 = fire_after_secs
-        .to_string_lossy()
-        .parse()
-        .map_err(|err| anyhow!("{EXTERNAL_WATCHDOG_SUBCOMMAND}: bad fire_after_secs: {err}"))?;
-    let parent_pid: u32 = parent_pid
-        .to_string_lossy()
-        .parse()
-        .map_err(|err| anyhow!("{EXTERNAL_WATCHDOG_SUBCOMMAND}: bad parent_pid: {err}"))?;
-
-    // Retire-with-parent channel: the parent holds our stdin's write end for
-    // its whole lifetime (the spawn site mem::forgets the Child), so EOF —
-    // delivered by the kernel on ANY parent exit — means there is nothing left
-    // to guard. Read in a thread so the deadline sleep below stays primary.
-    std::thread::spawn(|| {
-        use std::io::Read;
-        let mut sink = [0u8; 64];
-        let mut stdin = std::io::stdin();
-        loop {
-            match stdin.read(&mut sink) {
-                Ok(0) | Err(_) => std::process::exit(0),
-                Ok(_) => {}
+    match args.as_slice() {
+        [results_file, fire_after_secs, parent_pid] => {
+            let results_file = PathBuf::from(results_file);
+            let fire_after_secs: u64 =
+                fire_after_secs.to_string_lossy().parse().map_err(|err| {
+                    anyhow!("{EXTERNAL_WATCHDOG_SUBCOMMAND}: bad fire_after_secs: {err}")
+                })?;
+            let parent_pid: u32 = parent_pid
+                .to_string_lossy()
+                .parse()
+                .map_err(|err| anyhow!("{EXTERNAL_WATCHDOG_SUBCOMMAND}: bad parent_pid: {err}"))?;
+            serve_historical_external_watchdog_loop(
+                results_file,
+                fire_after_secs,
+                parent_pid,
+                std::io::stdin(),
+            )
+        }
+        [results_file, protocol, hard_stop_monotonic_nanos, parent_pid, policy]
+            if protocol == OsStr::new(EXTERNAL_WATCHDOG_PARENT_ANCHORED_PROTOCOL)
+                && policy == OsStr::new("preserve-acknowledged") =>
+        {
+            let results_file = PathBuf::from(results_file);
+            let hard_stop = parse_canonical_monotonic_instant(hard_stop_monotonic_nanos)?;
+            let parent_pid: u32 = parent_pid
+                .to_string_lossy()
+                .parse()
+                .map_err(|err| anyhow!("{EXTERNAL_WATCHDOG_SUBCOMMAND}: bad parent_pid: {err}"))?;
+            #[cfg(unix)]
+            {
+                serve_short_external_watchdog_loop(
+                    results_file,
+                    ExternalWatchdogDeadline::ParentAnchoredMonotonic { hard_stop },
+                    parent_pid,
+                    std::io::stdin(),
+                    std::io::stdout(),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (results_file, hard_stop, parent_pid);
+                Err(anyhow!(
+                    "{EXTERNAL_WATCHDOG_SUBCOMMAND}: parent-anchored short watchdog protocol \
+                     requires Unix"
+                ))
             }
         }
-    });
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(fire_after_secs);
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        // Linux belt-and-braces: retire if the parent vanished without the
-        // EOF thread noticing (it practically always notices first).
-        #[cfg(target_os = "linux")]
-        if !Path::new(&format!("/proc/{parent_pid}")).exists() {
-            std::process::exit(0);
-        }
-        std::thread::sleep(std::cmp::min(
-            deadline - now,
-            std::time::Duration::from_secs(1),
-        ));
+        _ => Err(anyhow!(
+            "{EXTERNAL_WATCHDOG_SUBCOMMAND}: expected <results_file> <fire_after_secs> \
+             <parent_pid>, or <results_file> {EXTERNAL_WATCHDOG_PARENT_ANCHORED_PROTOCOL} \
+             <hard_stop_monotonic_nanos> <parent_pid> preserve-acknowledged"
+        )),
     }
+}
 
-    let placeholder_still_on_disk = match fs::read_to_string(&results_file) {
-        Ok(contents) => contents.lines().next().is_none_or(|line| line == "unknown"),
-        Err(_) => true,
-    };
-    if placeholder_still_on_disk {
-        let tmp = results_file.with_extension("extwatchdog.tmp");
-        if fs::write(&tmp, VnncompResult::Timeout.render_results_file()).is_ok() {
-            let _ = fs::rename(&tmp, &results_file);
+/// End an over-budget Unix verifier without `std::process::exit`.
+///
+/// Rust's Unix `process::exit` calls libc `exit`, which runs `atexit` handlers
+/// and ELF shared-object fini sections while other verifier threads are still
+/// active. The r7 cGAN scorecard hit SIGSEGV exactly in that window: a detached
+/// AY worker and the CUDA replay were live when the watchdog called `exit(0)`.
+/// Ask the already-clean helper process to SIGKILL us instead, so no parent
+/// exit handler or foreign-library teardown runs concurrently. If the helper
+/// is unavailable, `abort` is the fail-safe hard stop: it also skips exit
+/// handlers. The timeout commit has already been attempted, and the sound
+/// pre-written `unknown` remains if the results path is unwritable.
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "the external watchdog is Unix-only")
+)]
+fn historical_watchdog_abort_delay_after_request<W: std::io::Write>(
+    control: Option<W>,
+    request: &[u8],
+) -> Option<std::time::Duration> {
+    let mut control = control?;
+    if control.write_all(request).is_err() {
+        return None;
+    }
+    drop(control);
+    Some(std::time::Duration::from_secs(
+        EXTERNAL_WATCHDOG_EXTRA_GRACE_SECS,
+    ))
+}
+
+#[cfg(unix)]
+fn hard_stop_from_in_process_watchdog(
+    external_watchdog_control: Option<std::process::ChildStdin>,
+    request: &[u8],
+) -> ! {
+    if let Some(delay) =
+        historical_watchdog_abort_delay_after_request(external_watchdog_control, request)
+    {
+        // This is intentionally the exact baseline/default-off fallback:
+        // normally the helper kills us immediately, while abort remains a
+        // bounded last resort if the helper fails after consuming F.
+        std::thread::sleep(delay);
+    }
+    std::process::abort()
+}
+
+#[cfg(not(unix))]
+fn hard_stop_from_in_process_watchdog(
+    _external_watchdog_control: Option<std::process::ChildStdin>,
+    _request: &[u8],
+) -> ! {
+    std::process::exit(0)
+}
+
+// Keep the historical non-Unix termination contract type-checked even though
+// Unix CI cannot execute it. In particular, do not let the Unix-only short
+// protocol pull `AsFd` or raw-syscall types into this fallback build.
+#[cfg(not(unix))]
+const _: fn(Option<std::process::ChildStdin>, &[u8]) -> ! = hard_stop_from_in_process_watchdog;
+
+fn hard_kill_current_process() -> ! {
+    #[cfg(unix)]
+    {
+        if let Ok(raw_pid) = i32::try_from(std::process::id()) {
+            if let Some(pid) = rustix::process::Pid::from_raw(raw_pid) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
         }
     }
+    // A direct SIGKILL normally never returns. `abort` is the no-exit-handler
+    // fail-safe if PID conversion or signal delivery unexpectedly fails.
+    std::process::abort()
+}
+
+#[cfg(unix)]
+fn run_short_grace_hard_stop<F>(hard_stop_deadline: CanonicalMonotonicInstant, hard_stop: F)
+where
+    F: FnOnce(),
+{
+    // Clock/conversion failure is fail-closed: zero delay preserves the
+    // pre-written unknown rather than extending the scored budget.
+    std::thread::sleep(hard_stop_deadline.remaining().unwrap_or_default());
+    hard_stop();
+}
+
+#[cfg(not(unix))]
+fn run_short_grace_hard_stop<F>(deadline: std::time::Instant, hard_stop: F)
+where
+    F: FnOnce(),
+{
+    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+    hard_stop();
+}
+
+/// The short route has no post-notification wait. Queueing F is non-blocking;
+/// `abort` is the immediate, process-local fail-safe if the helper or its
+/// control writer is unavailable. The external helper independently owns the
+/// same canonical monotonic deadline.
+fn hard_stop_short_grace(external_watchdog: Option<ExternalWatchdogController>) -> ! {
+    if let Some(watchdog) = external_watchdog {
+        let _ = watchdog.request_immediate_fire();
+    }
+    hard_kill_current_process()
+}
+
+/// #batched-bab observability (dark, `NY_BETA_GPU_PROBE=1`): the `[wide-lane]`
+/// readout.
+///
+/// The published count alone cannot say whether a lane that fired 6 times covered
+/// 6 of 6 candidate batches or 6 of 600 — so print the DENOMINATOR and the decline
+/// tally beside it (`ny_core::wide_lane_telemetry`). Both are process-global and
+/// monotonic, so this renders the same totals from either completion site; call it
+/// from BOTH (the timing-out one is the path a scored deep row takes).
+///
+/// Print-only: reading the counters cannot change a verdict, a bound, or a route.
+fn emit_wide_lane_readout() {
+    let published = ny_gpu::wide_resnet_batched_taken_count();
+    eprintln!("[wide-lane] domain-stacked GPU CROWN published {published} time(s) this run");
     eprintln!(
-        "vnncomp external watchdog: {fire_after_secs}s (scored budget + grace) exceeded with the \
-         verifier process still alive and its in-process watchdog silent — process-wide wedge; \
-         SIGKILLing verifier pid {parent_pid}"
+        "[wide-lane] {}",
+        ny_core::wide_lane_telemetry::format_wide_lane_tally(published)
     );
-    // `#![deny(unsafe_code)]` holds for the whole CLI, so deliver the SIGKILL
-    // through kill(1) rather than libc::kill. Absent/failed kill(1) still
-    // leaves the sound verdict on disk.
-    let _ = std::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(parent_pid.to_string())
-        .status();
-    Ok(())
 }
 
 /// Native VNN-COMP `run_instance.sh` entry point.
@@ -422,78 +2670,248 @@ pub(crate) fn handle_vnncomp_command(
         ));
     }
 
-    // Wall-clock anchor for the scored budget. Everything downstream that spends
-    // opportunistic time after the main verification run (the trusted-oracle gate's
-    // escalated witness refinement) budgets against this instant so it can never
-    // push the process past the scored deadline / the watchdog below.
-    let instance_deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // State the compute regime before any work: which measurements mean what
+    // has turned on this line before (#backend-detect).
+    crate::compute_backend::log_once();
 
-    // Hard wall-clock watchdog: every deadline inside the verifier is cooperative
-    // (`Instant` polling between rounds/steps), so a single oversized BaB batch or
-    // a wedged GPU readback can overrun the scored budget unboundedly when the
-    // `timeout(1)` backstop of run_instance.sh is absent — direct invocation, or
-    // macOS where coreutils `timeout` is not installed. A small grace past the
-    // scored budget lets a verdict racing the deadline still land (anything slower
-    // is scored `timeout` regardless). The watchdog writes via temp-file + rename
-    // so a race with the main thread's `write_results` always leaves one valid
-    // verdict on disk. SOUND: `timeout` never claims unsat/sat.
-    const WATCHDOG_GRACE_SECS: u64 = 5;
+    // FLIGHT RECORDER (#flight-record, I7): from here on, every seam this
+    // command layer decides is noted, and the record is serialized next to
+    // RESULTS_FILE on every terminal path. The artifact — not the log stream —
+    // is where "which methods ran/skipped, on what backend" must live, because
+    // the scored paths run RUST_LOG=error.
     {
-        let results_file = results_file.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(
-                timeout_secs + WATCHDOG_GRACE_SECS,
-            ));
-            let tmp = results_file.with_extension("watchdog.tmp");
-            if fs::write(&tmp, VnncompResult::Timeout.render_results_file()).is_ok() {
-                let _ = fs::rename(&tmp, &results_file);
-            }
-            eprintln!(
-                "vnncomp watchdog: {timeout_secs}s scored budget + {WATCHDOG_GRACE_SECS}s grace exceeded; exiting with `timeout`"
-            );
-            std::process::exit(0);
-        });
+        let backend = crate::compute_backend::detect();
+        crate::flight::global().begin(backend.kind, &backend.summary, &category, timeout_secs);
     }
 
-    // OUT-OF-PROCESS BACKSTOP (#vnncomp-external-watchdog): the watchdog above
-    // is itself a THREAD of this process, so it enforces nothing once the whole
-    // process stops scheduling. Observed 2026-07-24 (vggnet16_2022 spec1,
+    let traffic_terminal_softmax_peel = traffic_terminal_softmax_peel_decision(
+        &category,
+        std::env::var_os(TRAFFIC_TERMINAL_SOFTMAX_PEEL_ENV).as_deref(),
+    );
+    crate::flight::note(
+        "traffic_terminal_softmax_peel_gate",
+        if traffic_terminal_softmax_peel.effective {
+            crate::flight::FlightStatus::Ran
+        } else {
+            crate::flight::FlightStatus::Skipped
+        },
+        Some(format!(
+            "env_armed={} category_matched={} effective={} category={category}",
+            traffic_terminal_softmax_peel.env_armed,
+            traffic_terminal_softmax_peel.category_matched,
+            traffic_terminal_softmax_peel.effective,
+        )),
+    );
+    let cgan_input_leaf =
+        cgan_input_leaf_decision(&category, std::env::var_os(CGAN_INPUT_LEAF_ENV).as_deref());
+    crate::flight::note(
+        "cgan_input_leaf_gate",
+        if cgan_input_leaf.route.is_some() {
+            crate::flight::FlightStatus::Ran
+        } else {
+            crate::flight::FlightStatus::Skipped
+        },
+        Some(cgan_input_leaf_gate_receipt(cgan_input_leaf, &category)),
+    );
+
+    // Local cooperative anchor for the scored budget. Everything downstream
+    // that spends opportunistic time after the main verification run budgets
+    // against this `Instant`; the hard-stop authority below uses the shared
+    // process-independent monotonic value instead.
+    // Sample the process-independent scored clock first. The short watchdog's
+    // authoritative H is derived exactly once from this value and never
+    // reconstructed from a later `Instant`, wall clock, or helper-local sample.
+    #[cfg(unix)]
+    let canonical_instance_start = canonical_monotonic_now();
+    let instance_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // #instance-budget: publish the authoritative deadline ONCE so deep gates
+    // can apply invariant I1 against the real remaining budget instead of
+    // whatever phase-local deadline happens to be in scope. Measured defect:
+    // the forward-linear admission gate saw 37-38s when 186-226s was live,
+    // because five call levels down the only deadline available was the 40s
+    // root-alpha phase cap. Advisory and scheduling-only -- it never touches a
+    // bound.
+    ny_core::instance_budget::publish(instance_deadline);
+    let short_grace_gate = std::env::var_os(SAFENLP_SHORT_GRACE_ENV);
+    let timeout_decision =
+        internal_timeout_decision(&category, timeout_secs, short_grace_gate.as_deref());
+    let short_grace_route = timeout_decision.route == InternalTimeoutRoute::SafeNlpShortGrace;
+    let safenlp_direct_mip_first = safenlp_direct_mip_first_requested(
+        &category,
+        timeout_secs,
+        std::env::var_os(SAFENLP_DIRECT_MIP_FIRST_ENV).as_deref(),
+    );
+    crate::flight::note(
+        "internal_timeout_route",
+        crate::flight::FlightStatus::Ran,
+        Some(format!(
+            "route={:?} solver_timeout={}s scored_budget={timeout_secs}s",
+            timeout_decision.route, timeout_decision.solver_timeout_secs
+        )),
+    );
+    #[cfg(unix)]
+    let short_hard_stop = short_grace_route
+        .then_some(canonical_instance_start)
+        .flatten()
+        .and_then(|start| {
+            start.checked_add(
+                std::time::Duration::from_secs(timeout_secs)
+                    .saturating_sub(SAFENLP_SHORT_HARD_STOP_MARGIN),
+            )
+        });
+    #[cfg(not(unix))]
+    let short_hard_stop =
+        short_grace_route.then(|| safenlp_short_hard_stop_deadline(instance_deadline));
+
+    // The short-grace route gives RESULTS_FILE one writer: a coordinator whose
+    // receive window closes at the already-anchored scored deadline. Publish
+    // the sound placeholder before either watchdog starts, then hand the
+    // verifier only a channel sender; it has no post-deadline file-write path.
+    let (short_grace_publisher, short_grace_receiver) = if short_grace_route {
+        write_results(&results_file, &VnncompResult::Unknown)?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (
+            Some(ShortGraceResultPublisher {
+                results_file: results_file.clone(),
+                sender,
+            }),
+            Some(receiver),
+        )
+    } else {
+        (None, None)
+    };
+
+    // OUT-OF-PROCESS WATCHDOG (#vnncomp-external-watchdog): the deadline
+    // coordinator below is itself a THREAD of this process, so it enforces
+    // nothing once the whole process stops scheduling. Observed 2026-07-24
+    // (vggnet16_2022 spec1,
     // NY_DD_ZONOTOPE=0, GB10, concurrent GPU verifier on the same device): the
     // run froze process-wide and sat >6h past a 1200s budget with the
-    // pre-written `unknown` placeholder still on disk — the watchdog thread's
+    // pre-written `unknown` placeholder still on disk — the coordinator's
     // post-sleep work (allocate + write) never completed because every thread
     // wedged behind the stalled GPU submission. The only deadline enforcement
     // that survives a process-wide freeze lives in a DIFFERENT process: spawn a
     // helper via the hidden `__vnncomp-watchdog` entry (fresh exec of this
     // binary; no GPU/ORT/preset/logging state). The helper idles on its stdin
-    // pipe — parent exit through ANY path (normal return, watchdog exit(0),
-    // panic, external kill) closes the pipe and the helper exits silently. If
-    // the fire deadline passes while the pipe is still open, the helper writes
-    // the sound `timeout` verdict (temp-file + rename, and only over the
-    // `unknown` placeholder — a real verdict from a parent wedged mid-exit is
-    // preserved) and SIGKILLs this process so no harness hangs behind a wedged
-    // verifier. Fires EXTERNAL_WATCHDOG_EXTRA_GRACE_SECS after the in-process
-    // watchdog so every healthy overrun still exits through the historical
-    // path first. SOUND: `timeout` never claims unsat/sat. Kill switch:
-    // NY_VNNCOMP_EXTERNAL_WATCHDOG=0.
+    // pipe — parent exit through ANY path closes the pipe and retires the
+    // helper. The short route keeps a dedicated lease open until actual OS
+    // process exit and sends explicit publication/fire control records through
+    // a separate non-blocking writer. Its helper deadline is anchored in this
+    // parent before spawn/exec. This avoids libc `exit` and its concurrent
+    // foreign-library fini handlers. SOUND:
+    // `timeout` never claims unsat/sat. Kill switch:
+    // NY_VNNCOMP_EXTERNAL_WATCHDOG=0 (the coordinator then uses hard abort).
     #[cfg(unix)]
-    if std::env::var("NY_VNNCOMP_EXTERNAL_WATCHDOG").as_deref() != Ok("0") {
-        let fire_after_secs =
-            timeout_secs + WATCHDOG_GRACE_SECS + EXTERNAL_WATCHDOG_EXTRA_GRACE_SECS;
-        match spawn_external_watchdog(&results_file, fire_after_secs) {
-            // Keep the helper's stdin write-end open for the REST OF THIS
-            // PROCESS'S LIFETIME: dropping the Child would close the pipe and
-            // retire the helper immediately. The kernel closes the fd on any
-            // parent exit, which is exactly the retire signal.
-            Ok(child) => std::mem::forget(child),
-            Err(err) => eprintln!(
-                "vnncomp external watchdog failed to start (thread watchdog still armed): {err}"
-            ),
-        }
+    let (historical_external_watchdog_control, short_external_watchdog) =
+        if std::env::var("NY_VNNCOMP_EXTERNAL_WATCHDOG").as_deref() != Ok("0") {
+            if short_grace_route {
+                match short_hard_stop {
+                    Some(hard_stop) => {
+                        match spawn_and_retain_short_watchdog(&results_file, hard_stop) {
+                            Ok(controller) => (None, Some(controller)),
+                            // No diagnostic on the deadline setup path: the independent
+                            // in-process timer still has an immediate abort fail-safe.
+                            Err(_) => (None, None),
+                        }
+                    }
+                    // A missing/overflowed canonical clock cannot authorize a
+                    // terminal verdict or extend the deadline.
+                    None => (None, None),
+                }
+            } else {
+                let (deadline, result_policy) = historical_external_watchdog_contract(timeout_secs);
+                match spawn_external_watchdog(&results_file, deadline, result_policy) {
+                    Ok(mut child) => {
+                        // Historical/default-off ownership and argv/timing
+                        // remain exactly as before.
+                        let control = child.stdin.take();
+                        std::mem::forget(child);
+                        (control, None)
+                    }
+                    Err(_) => (None, None),
+                }
+            }
+        } else {
+            (None, None)
+        };
+    #[cfg(not(unix))]
+    let (historical_external_watchdog_control, short_external_watchdog): (
+        Option<std::process::ChildStdin>,
+        Option<ExternalWatchdogController>,
+    ) = (None, None);
+
+    // Hard wall-clock enforcement: every deadline inside the verifier is
+    // cooperative (`Instant` polling between rounds/steps), so a single
+    // oversized BaB batch or wedged GPU readback can overrun the scored budget
+    // unboundedly when the shell backstop is absent. The short route separates
+    // its sole publication coordinator from an ALWAYS-ARMED timer. Even if the
+    // final rename blocks, the timer queues a fire request without blocking and
+    // immediately aborts this process; the helper independently fires at the
+    // same parent-anchored boundary.
+    if let Some(receiver) = short_grace_receiver {
+        let publication_deadline = safenlp_short_publication_deadline(instance_deadline);
+        let hard_stop_watchdog = short_external_watchdog.clone();
+        #[cfg(unix)]
+        let hard_stop_deadline = short_hard_stop.unwrap_or(CanonicalMonotonicInstant::EXPIRED);
+        #[cfg(not(unix))]
+        let hard_stop_deadline =
+            short_hard_stop.unwrap_or_else(|| safenlp_short_hard_stop_deadline(instance_deadline));
+        std::thread::spawn(move || {
+            run_short_grace_hard_stop(hard_stop_deadline, || {
+                // No I/O, allocation, logging, or wait is allowed between the
+                // timer boundary and the abort fail-safe.
+                hard_stop_short_grace(hard_stop_watchdog);
+            });
+        });
+
+        let results_file = results_file.clone();
+        let publication_watchdog = short_external_watchdog;
+        std::thread::spawn(move || {
+            let _ = await_short_grace_terminal_result(
+                &results_file,
+                publication_deadline,
+                receiver,
+                publication_watchdog.as_ref(),
+            );
+        });
+    } else {
+        let results_file = results_file.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(
+                timeout_secs + WATCHDOG_GRACE_SECS,
+            ));
+            // #watchdog-verdict-overwrite: enforce the deadline against the
+            // PLACEHOLDER only. If this instance already published a decided
+            // verdict and then wedged (the measured 1.7 s `sat` that hung for
+            // the rest of a 350 s budget), the hard stop below still fires —
+            // but the verdict it earned survives instead of being replaced by
+            // `timeout`, and the helper is told to preserve it too.
+            let request =
+                match commit_timeout_unless_verdict_published(&results_file, "watchdog.tmp") {
+                    Ok(TimeoutCommit::DeclinedDecidedVerdict) => {
+                        EXTERNAL_WATCHDOG_PRESERVE_FIRE_REQUEST
+                    }
+                    Ok(TimeoutCommit::Committed) | Err(_) => EXTERNAL_WATCHDOG_FIRE_REQUEST,
+                };
+            // No stderr write is allowed on this critical path: a full pipe
+            // must not delay the helper request or the bounded abort fallback.
+            hard_stop_from_in_process_watchdog(historical_external_watchdog_control, request);
+        });
     }
 
     if is_relational_category(&category) {
+        // Relational categories bypass the YAML category-preset path, but
+        // they still execute registered verifier/env-gated code. Resolve the
+        // frozen entry-time environment over declaration defaults before
+        // entering that scored path; `not_materialized` would falsely omit
+        // the declared input evidence for these runs.
+        crate::flight::global().materialize_levers(|_| None);
+        crate::flight::note(
+            "relational_route",
+            crate::flight::FlightStatus::Ran,
+            Some("dual-network category; standard lanes not applicable".to_string()),
+        );
         write_results(&results_file, &VnncompResult::Unknown)?;
         let result = run_relational_vnncomp(&category, &onnx, &vnnlib, timeout_secs)
             .unwrap_or_else(|err| {
@@ -501,20 +2919,59 @@ pub(crate) fn handle_vnncomp_command(
                 VnncompResult::Unknown
             });
         write_results(&results_file, &result)?;
+        // #batched-bab observability (dark, NY_BETA_GPU_PROBE=1): report
+        // whether the wide domain-stacked GPU CROWN lane actually PUBLISHED a
+        // result this run. The counter is production-armed but was previously
+        // readable only from tests, so a lane that silently never fires (the
+        // exact failure this campaign kept hitting: an armed device refused by
+        // a capability, a request gate, or a shape predicate) looked identical
+        // to one doing the work.
+        if beta_gpu_probe_armed() {
+            emit_wide_lane_readout();
+        }
         println!("Result: {}", result.token());
+        crate::flight::note(
+            "result_publish",
+            crate::flight::FlightStatus::Ran,
+            Some(result.token().to_string()),
+        );
+        crate::flight::finish(result.token());
+        crate::flight::global().write_sidecar(&results_file);
         return Ok(());
     }
 
     // Validate input files BEFORE touching RESULTS_FILE. A missing input is a genuine
     // failure -> write `error` (matches the shell wrapper).
     if !onnx.is_file() {
-        write_results(&results_file, &VnncompResult::Error)?;
+        write_terminal_result(
+            &results_file,
+            short_grace_publisher.as_ref(),
+            VnncompResult::Error,
+        )?;
         eprintln!("Error: ONNX file not found: {}", onnx.display());
+        crate::flight::note(
+            "result_publish",
+            crate::flight::FlightStatus::Ran,
+            Some("error: ONNX file not found".to_string()),
+        );
+        crate::flight::finish(VnncompResult::Error.token());
+        crate::flight::global().write_sidecar(&results_file);
         return Ok(());
     }
     if !vnnlib.is_file() {
-        write_results(&results_file, &VnncompResult::Error)?;
+        write_terminal_result(
+            &results_file,
+            short_grace_publisher.as_ref(),
+            VnncompResult::Error,
+        )?;
         eprintln!("Error: VNNLIB file not found: {}", vnnlib.display());
+        crate::flight::note(
+            "result_publish",
+            crate::flight::FlightStatus::Ran,
+            Some("error: VNNLIB file not found".to_string()),
+        );
+        crate::flight::finish(VnncompResult::Error.token());
+        crate::flight::global().write_sidecar(&results_file);
         return Ok(());
     }
 
@@ -550,13 +3007,105 @@ pub(crate) fn handle_vnncomp_command(
         });
 
     // Preset auto-loading: category -> yaml, newest year first, base-name fallback.
-    let preset = configs_dir
+    let base_preset = configs_dir
         .as_deref()
         .and_then(|dir| resolve_preset_path(dir, &category));
-    match (&configs_dir, &preset) {
+    // Resolve model/budget/backend-adaptive defaults under the category preset
+    // before freezing the shared wrapper/engine preset snapshot. The temporary
+    // effective preset is owned by `resolved_plan` through the entire run.
+    let plan_runtime = crate::plan_resolver::PlanRuntimeOverrides::from_env_values(
+        std::env::var_os(crate::plan_resolver::PGD_TIME_CAP_DISABLE_ENV).as_deref(),
+        std::env::var_os(crate::plan_resolver::DISJUNCTIVE_PGD_SKIP_ENV).as_deref(),
+    );
+    let resolved_plan = crate::plan_resolver::resolve_and_materialize_with_runtime(
+        &onnx,
+        base_preset.as_deref(),
+        timeout_secs,
+        crate::compute_backend::detect(),
+        plan_runtime,
+        crate::plan_resolver::probe_fl_rate,
+    );
+    crate::flight::note(
+        "plan_resolved",
+        crate::flight::FlightStatus::Ran,
+        Some(resolved_plan.flight_summary()),
+    );
+    if resolved_plan.effective_preset() != base_preset.as_deref() {
+        println!(
+            "Plan resolver: merged effective preset {} (base: {})",
+            resolved_plan
+                .effective_preset()
+                .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+            base_preset.as_deref().map_or_else(
+                || "auto defaults (no category preset)".to_string(),
+                |path| path.display().to_string()
+            ),
+        );
+    }
+    // Borrow from the value that owns the merged temp preset's keep-alive
+    // guard. At this call site the path is never copied beyond the synchronous
+    // run, so `resolved_plan` necessarily remains live through every reader.
+    // (The accessor cannot prevent a future caller from copying the path; its
+    // contract explicitly requires retaining the plan in that case.)
+    let preset = resolved_plan.effective_preset();
+    // One immutable, semantically validated preset read owns both wrapper
+    // scheduling and the in-process β-CROWN configuration. An invalid snapshot
+    // is retained so run_and_translate returns sound unknown before every
+    // wrapper verdict/work lane, without a second path read. Optional
+    // margin-row helpers keep their independent path-based preset surface.
+    let preset_snapshot = preset.map(BetaCrownPresetSnapshot::load);
+    // PHASE 0c LAYERED REGISTRY RECEIPT: `begin` captured the registered raw env
+    // bytes before any work, but it deliberately did not pretend that an
+    // env-only snapshot was the run's final declared-input resolution. Materialize only
+    // after this exact preset snapshot has passed semantic validation. No
+    // preset is a valid resolved default layer; an invalid preset gets an
+    // explicit `invalid_config` state and is rejected below before any wrapper
+    // verdict lane.
+    match preset_snapshot.as_ref() {
+        None => crate::flight::global().materialize_levers(|_| None),
+        Some(snapshot) => {
+            if let Some(loaded) = snapshot.loaded() {
+                let alpha_zero_yield = crate::preset::effective_alpha_zero_yield_frac(loaded);
+                // The sign-space lane is armed from the preset on the scored
+                // path (#bnn-sign-space), so the receipt must show it that way:
+                // without this projection the run's evidence would record the
+                // declaration default while a new `sat` SOURCE was live.
+                let bnn_sign_space = loaded.attack.bnn_sign_space;
+                crate::flight::global().materialize_levers(|decl| {
+                    if std::ptr::eq(
+                        decl,
+                        &raw const ny_levers::decls::dark_probes::BNN_SIGN_SPACE_LANE,
+                    ) {
+                        return bnn_sign_space.map(ny_levers::LeverValue::Bool);
+                    }
+                    std::ptr::eq(
+                        decl,
+                        &raw const ny_levers::decls::root_alpha::ALPHA_ZERO_YIELD_FRAC,
+                    )
+                    .then_some(alpha_zero_yield)
+                    .flatten()
+                    .map(ny_levers::LeverValue::F64)
+                });
+            } else if let Some(reason) = snapshot.invalid_error() {
+                crate::flight::global().mark_levers_invalid_config(reason);
+            }
+        }
+    }
+    let postbab_wrapper_route = postbab_wrapper_route_from_snapshot(
+        preset_snapshot.as_ref(),
+        std::env::var_os("NY_POSTBAB_ATTACK").as_deref(),
+    );
+    let timeout_decision =
+        apply_postbab_wrapper_timeout_policy(timeout_decision, timeout_secs, postbab_wrapper_route);
+    match (&configs_dir, preset) {
         (Some(dir), Some(path)) => {
             println!("Configs dir: {}", dir.display());
             println!("Loading preset: {}", path.display());
+            crate::flight::note(
+                "preset",
+                crate::flight::FlightStatus::Ran,
+                Some(path.display().to_string()),
+            );
         }
         (Some(dir), None) => {
             println!(
@@ -583,15 +3132,53 @@ pub(crate) fn handle_vnncomp_command(
             );
         }
     }
+    if preset.is_none() {
+        // One skip event for both no-preset shapes; the reason distinguishes
+        // them so a bank query can separate "category has no yaml" from the
+        // far worse "binary ran outside the repo and lost every preset".
+        crate::flight::note(
+            "preset",
+            crate::flight::FlightStatus::Skipped,
+            Some(if configs_dir.is_some() {
+                format!("no preset for category '{category}'; AUTO DEFAULTS")
+            } else {
+                "no configs dir found; AUTO DEFAULTS".to_string()
+            }),
+        );
+    }
 
     // Timeout tiering: internal ny deadline fires below the scored budget. The
+    // dark SafeNLP short-grace selector changes only this inner deadline; the
+    // scored instance deadline and watchdog tiers above remain untouched. The
     // margin-row twin-wall lane's budget reserve is applied later, per-instance,
     // inside run_and_translate (see `margin_row_reserve_decision`), so it is NOT
     // pre-subtracted here — doing so would double-reserve and starve both tiers.
-    let ny_timeout = internal_timeout_secs(timeout_secs);
+    let ny_timeout = timeout_decision.solver_timeout_secs;
     println!(
         "Timeout: ny --timeout={ny_timeout}s, competition budget={timeout_secs}s (auto branching/backend/verifier/PGD)"
     );
+    if timeout_decision.route == InternalTimeoutRoute::SafeNlpShortGrace {
+        println!(
+            "SafeNLP short-grace: gate={SAFENLP_SHORT_GRACE_ENV}=1, \
+             normalized_category=safenlp_2024, budget={timeout_secs}s, \
+             requested_flush_reserve={SAFENLP_SHORT_GRACE_SECS}s, \
+             effective_flush_reserve={}s, solver_timeout={ny_timeout}s, \
+             historical_solver_timeout={}s, hard_stop_margin_ms={}",
+            timeout_decision.effective_flush_reserve_secs,
+            timeout_decision.historical_solver_timeout_secs,
+            SAFENLP_SHORT_HARD_STOP_MARGIN.as_millis(),
+        );
+    } else if timeout_decision.route == InternalTimeoutRoute::PresetProofTail {
+        println!(
+            "Post-BaB proof-tail policy: explicit vnncomp_post_bab_attack=false and \
+             post_bab_pgd_fraction=0; \
+             leftover wrapper attack disabled, solver receives an absolute {}s deadline, \
+             fixed RESULTS_FILE reserve={}s (historical solver timeout={}s)",
+            ny_timeout,
+            timeout_decision.effective_flush_reserve_secs,
+            timeout_decision.historical_solver_timeout_secs,
+        );
+    }
 
     // Competition-safety pre-write (sound `unknown`). If verification overruns its
     // internal deadline — e.g. a long single CROWN backward or α-CROWN
@@ -602,14 +3189,181 @@ pub(crate) fn handle_vnncomp_command(
     // no-penalty `unknown`/`timeout`). Writing `unknown` up front guarantees a sound
     // verdict always exists; `write_results` below overwrites it with the real
     // verdict on normal completion. SOUND: `unknown` never claims unsat/sat.
-    write_results(&results_file, &VnncompResult::Unknown)?;
+    if !short_grace_route {
+        write_results(&results_file, &VnncompResult::Unknown)?;
+    }
 
     // Run β-CROWN in-process with the AUTO defaults and capture the verdict JSON.
-    let result = run_and_translate(&onnx, &vnnlib, preset, ny_timeout, Some(instance_deadline));
+    let beta_phase_deadline = beta_phase_deadline(timeout_decision, instance_deadline);
+    let solver_phase_deadline = solver_phase_deadline(timeout_decision, instance_deadline);
+    let mut traffic_terminal_softmax_execution =
+        TrafficTerminalSoftmaxPeelExecution::before_run(traffic_terminal_softmax_peel.effective);
+    let result = run_and_translate(
+        &onnx,
+        &vnnlib,
+        preset,
+        ny_timeout,
+        Some(instance_deadline),
+        beta_phase_deadline,
+        Some(solver_phase_deadline),
+        postbab_wrapper_route,
+        preset_snapshot,
+        safenlp_direct_mip_first,
+        traffic_terminal_softmax_peel.effective,
+        cgan_input_leaf.route,
+        &mut traffic_terminal_softmax_execution,
+    );
+    crate::flight::note(
+        "traffic_terminal_softmax_peel_execution",
+        traffic_terminal_softmax_execution.flight_status(),
+        Some(
+            traffic_terminal_softmax_execution
+                .flight_reason()
+                .to_string(),
+        ),
+    );
     let result = normalize_vnnlib2_sat_result(&onnx, &vnnlib, result);
 
-    write_results(&results_file, &result)?;
-    println!("Result: {}", result.token());
+    if write_terminal_result(
+        &results_file,
+        short_grace_publisher.as_ref(),
+        result.clone(),
+    )? {
+        // #batched-bab observability (see the sibling site): report whether
+        // the wide domain-stacked GPU CROWN lane actually PUBLISHED here too —
+        // this is the completion path a timing-out scored row takes.
+        if beta_gpu_probe_armed() {
+            emit_wide_lane_readout();
+        }
+        println!("Result: {}", result.token());
+    }
+    // #alpha-steering-proposal: record actual proposal-channel dispatches in
+    // the flight record (truthful outcome, not gate eligibility — the counter
+    // increments only after accepted joint-adjoint gradients).
+    let alpha_steering = ny_propagate::alpha_gradient_steering::telemetry();
+    if alpha_steering.proposal_dispatches > 0 {
+        crate::flight::note(
+            "alpha_gradient_steering",
+            crate::flight::FlightStatus::Ran,
+            Some(format!(
+                "source=wgpu_proposal dispatches={} backend={}",
+                alpha_steering.proposal_dispatches,
+                alpha_steering.backend.unwrap_or("unmaterialized"),
+            )),
+        );
+    }
+    // #binding-row-replay: record accepted CPU replay gradients the same way
+    // (truthful outcome — the counter increments only after the margin lane
+    // consumed the replay's gradients).
+    if alpha_steering.replay_dispatches > 0 {
+        crate::flight::note(
+            "alpha_gradient_replay",
+            crate::flight::FlightStatus::Ran,
+            Some(format!(
+                "source=cpu_replay dispatches={}",
+                alpha_steering.replay_dispatches,
+            )),
+        );
+    }
+    // #forward-linear-cost-gate (I7): mirror the last cold-build admission
+    // decision — calibrated rate + provenance, seam mode, predicted vs
+    // remaining — into the sidecar. `None` means no deadline-carrying cold
+    // build was ever considered (cache hit, non-conv category, or the 30 s
+    // floor refused before the rate mattered).
+    if let Some(admission) = ny_propagate::forward_linear_admission_record() {
+        crate::flight::note(
+            "forward_linear_admission",
+            if admission.admitted {
+                crate::flight::FlightStatus::Ran
+            } else {
+                crate::flight::FlightStatus::Skipped
+            },
+            Some(format!(
+                "seam={} rate={}MACs source={} predicted={}s remaining={}s \
+                 build_gmacs={} probe_gmacs={} probe_secs={:.3}",
+                if admission.seam_f32 { "f32" } else { "f64" },
+                admission.macs_per_sec,
+                admission.rate_source,
+                admission.predicted_secs,
+                admission.remaining_secs,
+                admission.build_macs / 1_000_000_000,
+                admission.probe_macs / 1_000_000_000,
+                admission.probe_secs,
+            )),
+        );
+    }
+    // #cprime-admission (I7): mirror collector walk-admission activity —
+    // refusal/admission counts, reclaimed share seconds, and the numbers of
+    // the last refusal — into the sidecar. `None` means no deadline-carrying
+    // collection ever consulted the estimator.
+    if let Some(walks) = ny_propagate::collector_walk_admission_record() {
+        crate::flight::note(
+            "collector_walk_admission",
+            if walks.refused > 0 {
+                crate::flight::FlightStatus::Skipped
+            } else {
+                crate::flight::FlightStatus::Ran
+            },
+            Some(format!(
+                "admitted={} refused={} rollover_grants={} measured_grants={} \
+                 reclaimed_share={:.1}s \
+                 rate={}MACs correction={:.3}{} last_refused={}",
+                walks.admitted,
+                walks.refused,
+                walks.rollover_grants,
+                walks.measured_grants,
+                walks.reclaimed_share_secs,
+                walks.macs_per_sec,
+                walks.correction,
+                if walks.calibrated {
+                    " (calibrated)"
+                } else {
+                    " (prior)"
+                },
+                walks
+                    .last_refused_node
+                    .as_deref()
+                    .map(|node| {
+                        format!(
+                            "{node}[est={:.1}s share={:.1}s]",
+                            walks.last_refused_estimate_secs, walks.last_refused_share_secs,
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string()),
+            )),
+        );
+    }
+    // #fl-value-gpu-tier (I7): whether the FL value dispatch consulted the
+    // wgpu f32 tier this run, and how often it actually dispatched. calls=0
+    // with an installed engine means every consult refused (size threshold /
+    // budget / deadline) — the discriminating datum the 2026-08-02 wiring
+    // hunt lacked.
+    {
+        let fl = ny_propagate::fl_value_gemm::telemetry_snapshot();
+        if fl.calls > 0 || fl.backend.is_some() {
+            crate::flight::note(
+                "fl_value_gpu_tier",
+                if fl.hits > 0 {
+                    crate::flight::FlightStatus::Ran
+                } else {
+                    crate::flight::FlightStatus::Skipped
+                },
+                Some(format!(
+                    "consults={} dispatches={} backend={}",
+                    fl.calls,
+                    fl.hits,
+                    fl.backend.unwrap_or("uninitialized")
+                )),
+            );
+        }
+    }
+    crate::flight::note(
+        "result_publish",
+        crate::flight::FlightStatus::Ran,
+        Some(result.token().to_string()),
+    );
+    crate::flight::finish(result.token());
+    crate::flight::global().write_sidecar(&results_file);
     Ok(())
 }
 
@@ -1020,7 +3774,7 @@ impl DualDifferenceGate {
 ///
 /// SOUNDNESS: this bypass only widens where the difference network is BUILT
 /// and VERIFIED. The verdict surface is unchanged: `Verified` still maps to
-/// `unsat` ONLY with the [`RelationalUnsatAuth`] token (per-pair Farkas
+/// `unsat` ONLY with the `RelationalUnsatAuth` token (per-pair Farkas
 /// certificates, `check_farkas`-re-checked, plus the structural spot check),
 /// and everything else stays `unknown`. A semantic mismatch the shape gate
 /// would have caught makes the implication proof fail — gate stays down.
@@ -1418,21 +4172,11 @@ pub(crate) fn load_graph_network(path: &Path) -> Result<GraphNetwork> {
 }
 
 fn directed_lower_f32(v: f64) -> f32 {
-    let f = v as f32;
-    if f.is_finite() {
-        ny_tensor::next_down_f32(f)
-    } else {
-        f
-    }
+    f64_to_f32_down(v)
 }
 
 fn directed_upper_f32(v: f64) -> f32 {
-    let f = v as f32;
-    if f.is_finite() {
-        ny_tensor::next_up_f32(f)
-    } else {
-        f
-    }
+    f64_to_f32_up(v)
 }
 
 pub(crate) fn inward_nonnegative_f32(v: f64) -> f32 {
@@ -1448,29 +4192,13 @@ pub(crate) fn inward_nonnegative_f32(v: f64) -> f32 {
 /// guaranteed `>= declared_lower` even after the f64->f32 cast. Used when emitting a
 /// counterexample witness so the organizer's exact re-check `(>= X v)` passes.
 fn inward_lower_f32(v: f64) -> f32 {
-    let f = v as f32;
-    if !f.is_finite() {
-        return f;
-    }
-    if (f as f64) < v {
-        ny_tensor::next_up_f32(f)
-    } else {
-        f
-    }
+    f64_to_f32_up(v)
 }
 
 /// Round a DECLARED upper bound INWARD (down) to f32 so a clamped witness is
 /// guaranteed `<= declared_upper` even after the f64->f32 cast.
 fn inward_upper_f32(v: f64) -> f32 {
-    let f = v as f32;
-    if !f.is_finite() {
-        return f;
-    }
-    if (f as f64) > v {
-        ny_tensor::next_down_f32(f)
-    } else {
-        f
-    }
+    f64_to_f32_down(v)
 }
 
 /// Clamp `v` into `[lo, hi]` without panicking on a degenerate/NaN box
@@ -1537,44 +4265,16 @@ fn infer_output_dim(graph: &GraphNetwork, input_bounds: &[Bound]) -> Result<usiz
     Ok(graph.propagate_ibp(&input)?.lower().len())
 }
 
-/// Convert an `f64` epsilon to its EXACT dyadic rational, or `None` if it does
-/// not fit the certificate's i128 dyadic encoding (extreme magnitude / subnormal).
-/// "Nice" epsilon thresholds (e.g. `0.05`) round-trip exactly.
+/// Convert an `f64` epsilon to its EXACT dyadic rational. Non-finite values and
+/// a poisoned exact-rational arena fail closed.
 fn epsilon_to_exact_rat(eps: f64) -> Option<Rat> {
-    if !eps.is_finite() {
-        return None;
-    }
-    if eps == 0.0 {
-        return Some(Rat::ZERO);
-    }
-    let bits = eps.to_bits();
-    let sign: i128 = if bits >> 63 == 0 { 1 } else { -1 };
-    let exp_field = ((bits >> 52) & 0x7ff) as i32;
-    let frac = (bits & 0x000f_ffff_ffff_ffff) as i128;
-    let (mantissa, e2) = if exp_field == 0 {
-        (frac, -1022 - 52)
-    } else {
-        ((1i128 << 52) | frac, exp_field - 1023 - 52)
-    };
-    let signed = sign * mantissa;
-    if e2 >= 0 {
-        if e2 > 70 {
-            return None;
-        }
-        Rat::new(signed.checked_mul(1i128 << e2)?, 1).ok()
-    } else {
-        let shift = (-e2) as u32;
-        if shift > 120 {
-            return None;
-        }
-        Rat::new(signed, 1i128.checked_shl(shift)?).ok()
-    }
+    Rat::from_f64_exact(eps)
 }
 
 /// Convert one REAL parsed deviation atom `t = Y_g[i] - Y_f[i] ⋈ c` into the
 /// exact ny-cert [`LinearConstraint`] over named variables `yg_i`, `yf_i`,
-/// preserving the atom's SIGNED constant exactly. Returns `None` if the signed
-/// constant does not fit ny-cert's exact dyadic rational encoding.
+/// preserving the atom's SIGNED constant exactly. Returns `None` for a
+/// non-finite constant or an unhealthy exact-rational arena.
 ///
 /// This is the load-bearing soundness primitive: the constraint is built from
 /// the atom's REAL `(relation, constant)` — never a `±eps` template — so a
@@ -1602,17 +4302,18 @@ fn atom_to_constraint(atom: &IsomorphicOutputAtom) -> Option<LinearConstraint> {
 ///
 /// The certificate is the non-negative combination (multipliers all `1`) of the
 /// index's constraints. For the canonical strict-strict safe complement
-///   A1:  Y_g[i] - Y_f[i] >  c_gt   (`Gt`)
-///   A2:  Y_g[i] - Y_f[i] <  c_lt   (`Lt`)
+///   A1:  `Y_g[i] - Y_f[i] > c_gt`   (`Gt`)
+///   A2:  `Y_g[i] - Y_f[i] < c_lt`   (`Lt`)
 /// with coeffs `{yg_i:+1, yf_i:-1}`, the multipliers `(1,1)` cancel both
 /// variables and leave the strict residual `0 < c_lt - c_gt`, a contradiction
 /// iff `c_lt <= c_gt` — which holds for the REAL region (`c_gt=+eps`,
 /// `c_lt=-eps`) but FAILS for a crafted feasible region (`c_gt=-eps`,
 /// `c_lt=+eps`), where `check_farkas` then returns an error and we decline.
 ///
-/// Returns `None` if any atom's signed constant does not fit the exact rational
-/// encoding (caller then declines to `unknown`). The returned certificate is
-/// NOT yet self-checked; the caller runs [`check_farkas`] over it.
+/// Returns `None` if any atom's signed constant is non-finite or the rational
+/// arena is unhealthy (caller then declines to `unknown`). The returned
+/// certificate is NOT yet self-checked; the caller runs [`check_farkas`] over
+/// it.
 fn build_isomorphic_index_cert(idx_atoms: &[&IsomorphicOutputAtom]) -> Option<FarkasCertificate> {
     let mut constraints = Vec::with_capacity(idx_atoms.len());
     for atom in idx_atoms {
@@ -1645,11 +4346,12 @@ fn build_isomorphic_index_cert(idx_atoms: &[&IsomorphicOutputAtom]) -> Option<Fa
 ///
 /// On `Ok(true)` the certificate sidecar JSON is written next to `vnnlib`.
 ///
-/// Returns `Ok(false)` whenever any structural precondition is not met, an atom's
-/// constant is not exactly representable, or a built certificate does NOT prove a
-/// contradiction (the shortcut declines; caller falls through to the sound
-/// difference-network path => `unknown`). It NEVER returns `Err` for an
-/// unprovable region — only a genuine, self-checked contradiction yields `unsat`.
+/// Returns `Ok(false)` whenever any structural precondition is not met, an
+/// atom's constant cannot enter the exact arena, or a built certificate does
+/// NOT prove a contradiction (the shortcut declines; caller falls through to
+/// the sound difference-network path => `unknown`). It NEVER returns `Err` for
+/// an unprovable region — only a genuine, self-checked contradiction yields
+/// `unsat`.
 fn try_prove_empty_isomorphic_unsafe_region(
     category: &str,
     dual: &DualNetworkSpec,
@@ -1703,9 +4405,10 @@ fn try_prove_empty_isomorphic_unsafe_region(
             return Ok(false);
         }
         // Build the certificate from the REAL signed atoms and verify it proves
-        // a contradiction of the ACTUAL region. If construction fails (constant
-        // not representable) or the contradiction does NOT hold (feasible /
-        // wrong-sign region, BUG 1), we DECLINE to `unknown` — never `unsat`.
+        // a contradiction of the ACTUAL region. If construction fails
+        // (non-finite constant or unhealthy arena) or the contradiction does
+        // NOT hold (feasible / wrong-sign region, BUG 1), we DECLINE to
+        // `unknown` — never `unsat`.
         let Some(cert) = build_isomorphic_index_cert(&idx_atoms) else {
             return Ok(false);
         };
@@ -1836,7 +4539,7 @@ fn band_clauses_from_output_bounds(
 }
 
 /// The gate-flip verdict for a difference-network `Verified`: `unsat` ONLY
-/// with the [`RelationalUnsatAuth`] token (see `verify_difference_bounds`),
+/// with the `RelationalUnsatAuth` token (see `verify_difference_bounds`),
 /// else the sound `unknown`. Shared by the BaB and single-pass lanes.
 fn authorized_unsat_or_unknown(
     unsat_auth: Option<super::relational_equiv::RelationalUnsatAuth>,
@@ -2279,7 +4982,7 @@ fn verify_difference_bounds(
                             }
                             return Ok(VnncompResult::Timeout);
                         }
-                        BabVerificationStatus::PotentialViolation
+                        BabVerificationStatus::PotentialViolation { .. }
                         | BabVerificationStatus::Unknown { .. } => {
                             if try_whole_net_diff_finisher(
                                 &graph,
@@ -2679,7 +5382,9 @@ impl SearchRng {
             return lo;
         }
         let frac = (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64);
-        let v = lo as f64 + frac * (hi as f64 - lo as f64);
+        let lo64 = f32_to_f64_exact(lo);
+        let hi64 = f32_to_f64_exact(hi);
+        let v = lo64 + frac * (hi64 - lo64);
         (v as f32).clamp(lo, hi)
     }
 }
@@ -2953,8 +5658,8 @@ fn revalidate_monotonic_witness(
     if output >= y_f_ort.len() || output >= y_g_ort.len() {
         return Ok(None);
     }
-    let ort_margin = f64::from(y_g_ort[output]) - f64::from(y_f_ort[output]);
-    if !ort_margin.is_finite() || ort_margin < f64::from(MONOTONIC_REVALIDATION_MARGIN) {
+    let ort_margin = f32_to_f64_exact(y_g_ort[output]) - f32_to_f64_exact(y_f_ort[output]);
+    if !ort_margin.is_finite() || ort_margin < f32_to_f64_exact(MONOTONIC_REVALIDATION_MARGIN) {
         eprintln!(
             "Monotonic sat candidate REJECTED by the trusted ORT dual-forward \
              (internal forward disagreed with ONNX Runtime); downgrading to the sound path"
@@ -3009,7 +5714,7 @@ fn tensor_shape_len(shape: &[usize]) -> Result<usize> {
 /// and therefore fail closed.
 fn format_vnnlib2_assignment(
     declarations: &[TensorDeclaration],
-    inputs: &[f32],
+    inputs: &[f64],
     outputs: &[f64],
 ) -> Result<String> {
     if declarations.is_empty() {
@@ -3051,6 +5756,19 @@ fn format_vnnlib2_assignment(
                     )
                 })?;
                 for &value in values {
+                    // #witness-f64-render: the emitted decimal MUST reproduce the
+                    // declared f64 exactly. Rust's f64 `Display` is the shortest
+                    // round-tripping form, so this holds by construction — but a
+                    // witness that fell off its declared bound by 1e-8 is scored
+                    // -150, so the invariant is asserted rather than assumed.
+                    // (The previous f32 renderer violated it: collins_rul_cnn pin
+                    // -0.42296521394810976 -> "-0.42296523".)
+                    if value.to_string().parse::<f64>() != Ok(value) {
+                        anyhow::bail!(
+                            "VNN-LIB 2.0 assignment for '{}' would not round-trip losslessly",
+                            declaration.name
+                        );
+                    }
                     if !value.is_finite() {
                         anyhow::bail!(
                             "non-finite input value in VNN-LIB assignment for '{}'",
@@ -3139,7 +5857,17 @@ fn normalize_vnnlib2_sat_result(
         }
         _ => unreachable!(),
     };
-    let inputs = match parse_witness_inputs(witness) {
+    // #witness-f64-render: parse with the F64-PRESERVING parser. The f32 parser
+    // here re-rendered every pin through `f32::to_string()`, i.e. the shortest
+    // decimal that round-trips AS F32 — which moves the emitted value off the
+    // declared f64 bound and can push it OUT of the declared box, turning a
+    // genuine `sat` into an organizer-invalid counterexample (-150).
+    // Measured: collins_rul_cnn_2022 pin -0.42296521394810976 -> "-0.42296523"
+    // (1.6e-8 outside its own degenerate [a,a] box); cgan2026 face
+    // 0.6853536367416382 -> "0.68535364", 3.3e-9 ABOVE the declared upper.
+    // Emitting the declared f64 verbatim is valid under both an f64 and an f32
+    // reading of the witness; the f32 re-render is valid only under the latter.
+    let inputs = match parse_witness_inputs_f64(witness) {
         Ok(inputs) => inputs,
         Err(error) => {
             eprintln!(
@@ -3148,8 +5876,11 @@ fn normalize_vnnlib2_sat_result(
             return VnncompResult::Unknown;
         }
     };
-    let outputs = match ny_onnx::diff::OrtForward::from_path(onnx, inputs.len())
-        .and_then(|mut forward| forward.run(&inputs))
+    // The network is still evaluated on the f32 tensor, exactly as the organizer
+    // does; only the RENDERED witness keeps full f64 precision.
+    let inputs_f32: Vec<f32> = inputs.iter().map(|&v| v as f32).collect();
+    let outputs = match ny_onnx::diff::OrtForward::from_path(onnx, inputs_f32.len())
+        .and_then(|mut forward| forward.run(&inputs_f32))
     {
         Ok(outputs) => outputs.into_iter().map(f64::from).collect::<Vec<_>>(),
         Err(error) => {
@@ -3160,8 +5891,8 @@ fn normalize_vnnlib2_sat_result(
         }
     };
     match format_vnnlib2_assignment(&declarations, &inputs, &outputs) {
-        Ok(witness) => VnncompResult::Sat {
-            witness: Some(witness),
+        Ok(rendered) => VnncompResult::Sat {
+            witness: Some(rendered),
         },
         Err(error) => {
             eprintln!(
@@ -3238,8 +5969,9 @@ fn revalidate_isomorphic_witness(
         y_f.len() == y_g.len()
             && !y_f.is_empty()
             && y_f.iter().zip(y_g.iter()).any(|(&f, &g)| {
-                let dev = f64::from(g) - f64::from(f);
-                dev.is_finite() && dev.abs() > epsilon + f64::from(MONOTONIC_REVALIDATION_MARGIN)
+                let dev = f32_to_f64_exact(g) - f32_to_f64_exact(f);
+                dev.is_finite()
+                    && dev.abs() > epsilon + f32_to_f64_exact(MONOTONIC_REVALIDATION_MARGIN)
             })
     };
     // Internal pre-filter: cheap, but NEVER sufficient for a `sat` on its own.
@@ -3327,7 +6059,7 @@ fn search_isomorphic_deviation(
         }
     };
 
-    let threshold = epsilon + f64::from(MONOTONIC_REVALIDATION_MARGIN);
+    let threshold = epsilon + f32_to_f64_exact(MONOTONIC_REVALIDATION_MARGIN);
     // EARLY EXIT + VISIBILITY: a silent decline is undiagnosable — always log
     // best deviation, argmax, eval count, and wall time. A SAT witness needs
     // ONE point past the band; the moment `best` crosses `threshold` we stop
@@ -3335,12 +6067,12 @@ fn search_isomorphic_deviation(
     // logs, so a MISS is diagnosable live rather than invisible.
     let crossed = |best: &Option<(Vec<f32>, f32)>| {
         best.as_ref()
-            .is_some_and(|(_, v)| f64::from(*v) > threshold)
+            .is_some_and(|(_, v)| f32_to_f64_exact(*v) > threshold)
     };
     let finish = |best: &Option<(Vec<f32>, f32)>| -> Option<Vec<f32>> {
         match best {
             Some((x, v)) => {
-                let over = f64::from(*v) > threshold;
+                let over = f32_to_f64_exact(*v) > threshold;
                 tracing::info!(
                     best_dev = *v,
                     eps = epsilon,
@@ -3643,7 +6375,7 @@ fn relational_counterexample_vnnlib(
     }
 
     let mut declarations = Vec::with_capacity(4);
-    let mut inputs = Vec::with_capacity(xf.len() + xg.len());
+    let mut inputs: Vec<f64> = Vec::with_capacity(xf.len() + xg.len());
     let mut outputs = Vec::with_capacity(yf.len() + yg.len());
     for (index, network) in dual.networks.iter().enumerate() {
         let (network_input, network_output) = if index == f_index {
@@ -3667,8 +6399,11 @@ fn relational_counterexample_vnnlib(
             shape: network.output_shape.clone(),
             kind: TensorDeclarationKind::Output,
         });
-        inputs.extend_from_slice(network_input);
-        outputs.extend(network_output.iter().map(|&value| f64::from(value)));
+        // Decode f32 bits directly so subnormal witness values remain exact
+        // even if the calling thread has DAZ enabled. The renderer keeps full
+        // f64 precision (#witness-f64-render).
+        inputs.extend(network_input.iter().map(|&value| f32_to_f64_exact(value)));
+        outputs.extend(network_output.iter().map(|&value| f32_to_f64_exact(value)));
     }
     format_vnnlib2_assignment(&declarations, &inputs, &outputs)
 }
@@ -3726,26 +6461,103 @@ fn copy_prefixed_network(
 /// translate it to a VNN-COMP result.
 ///
 /// All capture state is torn down before returning, even on error. A verification
-/// error (the `Result` is `Err`) that did NOT crash maps to the sound `unknown` —
-/// the run completed without a verdict. `error` is reserved for the file-validation
-/// failures handled by the caller.
+/// error (the `Result` is `Err`) that did NOT crash maps to the sound `unknown`,
+/// except for a structurally preserved verifier deadline, which maps to `timeout`.
+/// `error` is reserved for the file-validation failures handled by the caller.
 fn run_and_translate(
     onnx: &Path,
     vnnlib: &Path,
-    preset: Option<PathBuf>,
+    preset: Option<&Path>,
     ny_timeout: u64,
     instance_deadline: Option<std::time::Instant>,
+    beta_phase_deadline: Option<std::time::Instant>,
+    solver_phase_deadline: Option<std::time::Instant>,
+    postbab_wrapper_route: PostBabWrapperRoute,
+    preset_snapshot: Option<BetaCrownPresetSnapshot>,
+    safenlp_direct_mip_first: bool,
+    traffic_terminal_softmax_peel: bool,
+    cgan_input_leaf_route: Option<CganInputLeafRoute>,
+    traffic_terminal_softmax_execution: &mut TrafficTerminalSoftmaxPeelExecution,
 ) -> VnncompResult {
-    // Structure-aware SOUND fast path for Two-Level-Lattice (TLL) nets
-    // (tllverifybench_2023). Decodes the min/max lattice + affine local
-    // functions and certifies UNSAT from a correlation-preserving,
-    // outward-rounded bound over the 2-D input box - closing the ~-199 vs
-    // -2.369 root-bound gap the generic relaxation cannot. Self-checked and
-    // enclosure-gated; returns `None` (falls through) on any non-TLL net,
-    // unsupported property, or too-loose bound. See `tll_structure`.
-    if let Some(res) = super::tll_structure::try_tll_unsat(onnx, vnnlib) {
-        return res;
+    *traffic_terminal_softmax_execution =
+        TrafficTerminalSoftmaxPeelExecution::before_run(traffic_terminal_softmax_peel);
+    let mut traffic_upfront_softmax_execution =
+        TrafficUpfrontSoftmaxExecution::before_run(traffic_terminal_softmax_peel);
+    // PRESET AUTHORITY GATE: a YAML-valid preset can still be semantically
+    // invalid (unsupported branching/attack/model-loader policy, invalid
+    // numeric config, and so on). The immutable snapshot validates those
+    // decisions before this function. Reject an invalid snapshot before TLL,
+    // upfront APGD, concurrent margin work, or any other wrapper verdict lane:
+    // none may earn a verdict from configuration the verifier would reject.
+    //
+    // No-preset calls remain historical. A loaded snapshot is the exact same
+    // object later handed to β-CROWN, so there is no second path read or TOCTOU.
+    if let Some(error) = preset_snapshot
+        .as_ref()
+        .and_then(BetaCrownPresetSnapshot::invalid_error)
+    {
+        eprintln!(
+            "Invalid VNN-COMP preset; suppressing all wrapper fast paths and returning \
+             sound unknown: {error}"
+        );
+        note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
+        return VnncompResult::Unknown;
     }
+
+    // Reserve the sole WGPU-context slot before any wrapper falsification
+    // wave can materialize its attack device. The later in-process β-CROWN
+    // call receives `backend=None` and `gpu=false`, so its request is exactly
+    // determined by this frozen preset pin or the VNN-LIB input-size AUTO rule.
+    // When that request is WGPU, β-CROWN owns qualification and reuses the
+    // admitted proof device for attacks. Sequential CPU/ORT falsification
+    // remains enabled; only the separate wrapper WGPU pre-wave is suppressed.
+    let preset_device = preset_snapshot
+        .as_ref()
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| preset.general.device.as_deref());
+    let input_element_count = ny_onnx::vnnlib::load_vnnlib(vnnlib)
+        .ok()
+        .map(|spec| spec.num_inputs);
+    let beta_requests_wgpu = vnncomp_beta_requests_wgpu(
+        preset_device,
+        input_element_count,
+        accelerator_capability_hint(),
+    );
+    let _beta_wgpu_context_reservation = BetaWgpuContextReservation::enter(beta_requests_wgpu);
+
+    // The proof-tail route's absolute β deadline is the last instant at which
+    // optional proof work may run. The interval after it belongs exclusively
+    // to verdict normalization and RESULTS_FILE publication.
+    let post_beta_deadline = post_beta_work_deadline(instance_deadline, beta_phase_deadline);
+    let proof_tail_reserved = beta_phase_deadline.is_some();
+
+    // Release-dark structural probe for Two-Level-Lattice (TLL) nets
+    // (tllverifybench_2023). Its decoded lattice bound is useful, but finite
+    // NY/ORT samples do not authenticate equality with the authored graph.
+    // `try_tll_unsat` therefore always declines until a raw graph-identity and
+    // source-property certificate lands; do not restore verdict authority by
+    // merely flipping its source gate. See `tll_structure`.
+    // TLL decoding performs non-interruptible model loading and an ORT
+    // cross-check. It therefore cannot be admitted when a fixed proof tail is
+    // reserved; the ordinary verifier retains the full bounded proof phase.
+    if !proof_tail_reserved {
+        if let Some(res) = super::tll_structure::try_tll_unsat(onnx, vnnlib) {
+            crate::flight::note(
+                "tll_fast_path",
+                crate::flight::FlightStatus::Ran,
+                Some(
+                    "TLL structural lane produced the verdict; later lanes not reached".to_string(),
+                ),
+            );
+            note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
+            return res;
+        }
+    }
+    crate::flight::note(
+        "tll_fast_path",
+        crate::flight::FlightStatus::Skipped,
+        Some("structural probe declined (non-TLL net or unsupported property)".to_string()),
+    );
 
     // UPFRONT FALSIFICATION LANE (#upfront-apgd). Try the exact-gradient DLR-APGD
     // attack before the (SPSA-attack) BaB verifier: on adversarial-robustness
@@ -3765,14 +6577,101 @@ fn run_and_translate(
     // through this same unchanged gate), or stay `unknown`. No gate is weakened:
     // no new sat source and no new unsat source is introduced by falling through.
     let attack_start = std::time::Instant::now();
-    if let Some(witness) = try_upfront_falsify(onnx, vnnlib, instance_deadline) {
+
+    // SIGN-SPACE FALSIFICATION LANE (#bnn-sign-space, `attack.bnn_sign_space`,
+    // override `NY_BNN_SIGN_SPACE`).
+    //
+    // Placed FIRST inside the attack slice, and inside it deliberately: the time
+    // it spends is charged against the internal verifier budget by the same
+    // `attack_start` subtraction the upfront attack pays, so arming it cannot
+    // push BaB past the scored deadline. It has to run BEFORE
+    // `try_upfront_falsify` because on a `Sign` net that lane takes half the
+    // remaining budget (`#bnn-attack-budget`) and would leave nothing behind it.
+    //
+    // WHY IT IS HERE AT ALL. On a binarized net gradients through `Sign` are
+    // meaningless and BaB cannot progress through a piecewise-constant
+    // activation, so the DLR-APGD lane and the verifier are both structurally
+    // weak; the LP-guided sign-space search is the only thing that has ever
+    // taken the three `model_30` eps=1 rows
+    // (`docs/BNN_SIGN_SPACE_FALSIFICATION_2026-08-12.md`).
+    //
+    // SOUNDNESS. The lane returns a claimed counterexample INPUT, never a
+    // verdict — `ny_mip::SignSpaceOutcome` has no verified/unsat variant by
+    // construction, so it cannot cause a false `unsat`. The candidate becomes a
+    // `sat` only by passing the EXISTING, UNCHANGED `gate_sat_with_trusted_oracle`
+    // (real ONNX Runtime forward on the ORIGINAL model + true-f64 recheck), and
+    // it reaches that gate as an ORIGINAL-MODEL witness via the same
+    // `rehydrate_original_witness_outputs` the traffic peel uses. Every other
+    // outcome — refused, exhausted, disarmed — is `None` here and falls through
+    // to the normal verification path with no behaviour change; that rule is
+    // `sign_space_lane_verdict`, which is unit-tested.
+    //
+    // ARMED BY DEFAULT ON THE SCORED PATH, THROUGH THE CATEGORY PRESET
+    // (`attack.bnn_sign_space`) — not globally, and not by an environment
+    // variable, which is the point: a competition harness exports no `NY_*`, so
+    // the typed preset key is what turns the three captured `model_30` eps=1
+    // rows into an actual score. `NY_BNN_SIGN_SPACE` still WINS wherever it is
+    // present, in both directions ("1" arms, "0" disarms, anything else is a
+    // recorded rejection that falls back to the declaration default) — see
+    // `sign_space_falsify_armed`. With the key absent AND the variable unset,
+    // `try_sign_space_falsify` returns `None` before loading the model or the
+    // property, exactly as before.
+    let sign_space_preset = preset_snapshot
+        .as_ref()
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| preset.attack.bnn_sign_space);
+    if let Some(sat) = sign_space_lane_verdict(
+        try_sign_space_falsify(onnx, vnnlib, post_beta_deadline, sign_space_preset),
+        |witness| gate_sat_with_trusted_oracle(onnx, vnnlib, Some(witness), instance_deadline),
+    ) {
+        crate::flight::note(
+            "bnn_sign_space",
+            crate::flight::FlightStatus::Ran,
+            Some("sat: trusted-oracle gate confirmed the sign-space candidate".to_string()),
+        );
+        return sat;
+    }
+
+    let upfront_wrapper_route = upfront_wrapper_route_from_snapshot(
+        preset_snapshot.as_ref(),
+        std::env::var_os("NY_UPFRONT_ATTACK").as_deref(),
+    );
+    let upfront_witness = try_upfront_falsify(
+        onnx,
+        vnnlib,
+        post_beta_deadline,
+        upfront_wrapper_route,
+        traffic_terminal_softmax_peel,
+        &mut traffic_upfront_softmax_execution,
+    );
+    note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
+    if let Some(witness) = upfront_witness {
         let gated = gate_sat_with_trusted_oracle(onnx, vnnlib, Some(&witness), instance_deadline);
         if matches!(gated, VnncompResult::Sat { .. }) {
+            crate::flight::note(
+                "upfront_attack",
+                crate::flight::FlightStatus::Ran,
+                Some("sat: trusted-oracle gate confirmed the upfront candidate".to_string()),
+            );
             return gated;
         }
+        crate::flight::note(
+            "upfront_attack",
+            crate::flight::FlightStatus::Ran,
+            Some("candidate rejected by the trusted-oracle gate; fell through".to_string()),
+        );
         eprintln!(
             "Upfront attack: candidate rejected by the trusted-oracle gate; falling \
              through to the full verification path (verdict-neutral lane)"
+        );
+    } else {
+        // The command layer cannot see WHY the lane produced nothing (preset
+        // gate vs a fruitless search) without engine surgery; v0 records only
+        // that it was consulted and came back empty.
+        crate::flight::note(
+            "upfront_attack",
+            crate::flight::FlightStatus::Ran,
+            Some("consulted; no confirmed candidate".to_string()),
         );
     }
     // Charge the time the attack already spent against the internal verifier budget
@@ -3780,6 +6679,16 @@ fn run_and_translate(
     let ny_timeout = ny_timeout
         .saturating_sub(attack_start.elapsed().as_secs())
         .max(1);
+    let timeout_before_fixed_reserves_secs = ny_timeout;
+
+    // TYPED f32 ROOT TABLEAU (#twinwall-provenance): arm the category's
+    // `margin_row.root_f32` before ANY margin-row lane can start. The gate
+    // itself lives in ny-propagate and is otherwise env-only; the workspace
+    // forbids writing process environment from code, so the preset speaks to
+    // it through this setter. Pure loosening — see `set_root_f32_preset`.
+    if let Some(on) = super::margin_row_bab::root_f32_from_preset(preset) {
+        ny_propagate::margin_row::set_root_f32_preset(on);
+    }
 
     // MARGIN-ROW CONCURRENT LANE (#epoch-bab): start the twin-wall lane on a
     // background CPU thread NOW, so it gets the whole instance budget instead
@@ -3787,12 +6696,62 @@ fn run_and_translate(
     // verifier on `device: wgpu`, so the two lanes are on different hardware
     // and barely contend. Its verdict is consumed only if the verifier comes
     // back undecided (see the join below); it can never produce `sat`.
-    let concurrent_lane = super::margin_row_bab::spawn_concurrent_lane(
-        onnx,
-        vnnlib,
-        preset.as_deref(),
-        instance_deadline,
+    // The proof-tail route's absolute β deadline is also the latest instant at
+    // which any optional proof lane may work. The fixed interval after it is
+    // exclusively for verdict normalization and RESULTS_FILE publication.
+    // Historical and SafeNLP routes retain their existing instance deadlines.
+    // Detached margin-row workers cannot be synchronously cancelled: dropping
+    // their receiver stops publication but not CPU/Rayon work. Suppress them
+    // entirely under proof-tail authority so no abandoned worker can contend
+    // with the fixed publication reserve.
+    let margin_row_memory_allowed = optional_heavy_memory_allowed_now();
+    let frozen_pgd_schedule = preset_snapshot
+        .as_ref()
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| resolve_initial_pgd_schedule(preset).ok())
+        .flatten();
+    let effective_deferred_pgd_fraction = effective_deferred_pgd_fraction(preset_snapshot.as_ref());
+    let deferred_pgd_consumer_available = postbab_deferred_pgd_consumer_available(
+        postbab_wrapper_route,
+        margin_row_memory_allowed,
+        safenlp_direct_mip_first,
     );
+    let deferred_outer_pgd_priority =
+        deferred_outer_pgd_has_priority(frozen_pgd_schedule, deferred_pgd_consumer_available);
+    let concurrent_lane =
+        if proof_tail_reserved || deferred_outer_pgd_priority || !margin_row_memory_allowed {
+            None
+        } else {
+            super::margin_row_bab::spawn_concurrent_lane(onnx, vnnlib, preset, post_beta_deadline)
+        };
+    if concurrent_lane.is_some() {
+        crate::flight::note(
+            "margin_row_concurrent",
+            crate::flight::FlightStatus::Ran,
+            Some("twin-wall lane spawned at instance start".to_string()),
+        );
+    } else {
+        crate::flight::note(
+            "margin_row_concurrent",
+            crate::flight::FlightStatus::Skipped,
+            Some(if proof_tail_reserved {
+                "lane suppressed by proof-tail publication authority".to_string()
+            } else if deferred_outer_pgd_priority {
+                "lane suppressed so the frozen deferred-PGD owner receives its exclusive tail"
+                    .to_string()
+            } else if !margin_row_memory_allowed {
+                format!(
+                    "lane not started; independently, graph-heavy optional work is prohibited \
+                     when the live cgroup/RLIMIT envelope is unavailable or below the {} GiB \
+                     headroom boundary; {}=1 is the explicit operator override",
+                    OPTIONAL_HEAVY_MIN_HEADROOM_BYTES / (1024 * 1024 * 1024),
+                    OPTIONAL_HEAVY_MEMORY_OVERRIDE_ENV,
+                )
+            } else {
+                "lane not armed for this instance".to_string()
+            }),
+        );
+    }
 
     // MARGIN-ROW BUDGET RESERVE (#twinwall, opt-in NY_MARGIN_ROW_BAB=1): the
     // internal tier consumes ~95% of the scored budget, which would leave the
@@ -3802,10 +6761,52 @@ fn run_and_translate(
     // internal verifier. Verdict risk is confined to the opt-in config: an
     // instance the internal verifier could only decide in the reserved tail
     // loses that chance — the tier sweep measures exactly this trade.
-    let reserve =
-        super::margin_row_bab::margin_row_reserve_decision(onnx, vnnlib, preset.as_deref());
-    let instance_overrides = BetaCrownInstanceOverrides {
+    // The reserve above is a FIXED number of seconds, so its share of the
+    // budget grows as the budget shrinks (measured: 47% of the internal tier
+    // at a scored 100s, 24% at 200s — see `capped_reserve_secs`). The dark
+    // ceiling makes it proportional instead — `margin_row.reserve_max_frac` in
+    // the category preset, or `NY_MARGIN_ROW_RESERVE_MAX_FRAC` overriding it.
+    // Absent from both ⇒ byte-identical to the shipped policy.
+    // One decision only: `margin_row_reserve_decision` runs a structural probe
+    // that parses the ONNX, so it must not be called twice per instance.
+    let margin_row_reserve_actionable = margin_row_reserve_is_actionable(
+        proof_tail_reserved,
+        margin_row_memory_allowed,
+        deferred_outer_pgd_priority,
+    );
+    let uncapped = if !margin_row_reserve_actionable {
+        super::margin_row_bab::MarginRowReserveDecision {
+            configured_secs: 0,
+            reserve_secs: 0,
+            route: super::margin_row_bab::MarginRowReserveRoute::NotApplicable,
+        }
+    } else {
+        super::margin_row_bab::margin_row_reserve_decision(onnx, vnnlib, preset, ny_timeout)
+    };
+    let uncapped_reserve_secs = uncapped.reserve_secs;
+    let reserve = uncapped.capped_to_internal_budget(ny_timeout, preset);
+    if reserve.reserve_secs != uncapped_reserve_secs {
+        eprintln!(
+            "margin-row reserve ceiling: {}s -> {}s (frac={} of the {ny_timeout}s internal \
+             budget; {}={})",
+            uncapped_reserve_secs,
+            reserve.reserve_secs,
+            super::margin_row_bab::margin_row_reserve_max_frac(preset)
+                .map_or_else(|| "none".to_string(), |f| f.to_string()),
+            super::margin_row_bab::RESERVE_MAX_FRAC_ENV,
+            std::env::var(super::margin_row_bab::RESERVE_MAX_FRAC_ENV)
+                .unwrap_or_else(|_| "unset".to_string()),
+        );
+    }
+    let mut instance_overrides = BetaCrownInstanceOverrides {
         root_sparse_interm_crown: reserve.enables_scored_sparse_crown(),
+        authoritative_deadline: beta_phase_deadline,
+        outer_deferred_internal_deadline: None,
+        post_bab_wrapper_attack_enabled: Some(deferred_pgd_consumer_available),
+        preset_snapshot,
+        safenlp_direct_mip_first,
+        traffic_terminal_softmax_peel,
+        cgan_input_leaf_route,
     };
     if instance_overrides.root_sparse_interm_crown {
         eprintln!(
@@ -3815,6 +6816,14 @@ fn run_and_translate(
     }
     let ny_timeout = if reserve.reserve_secs > 0 {
         let kept = ny_timeout.saturating_sub(reserve.reserve_secs).max(10);
+        crate::flight::note(
+            "margin_row_reserve",
+            crate::flight::FlightStatus::Ran,
+            Some(format!(
+                "reserved {}s (route={:?}, internal verifier keeps {kept}s)",
+                reserve.reserve_secs, reserve.route
+            )),
+        );
         eprintln!(
             "margin-row BaB armed: reserving {}s of the internal budget \
              (internal verifier gets {kept}s, route={:?})",
@@ -3822,6 +6831,11 @@ fn run_and_translate(
         );
         kept
     } else {
+        crate::flight::note(
+            "margin_row_reserve",
+            crate::flight::FlightStatus::Skipped,
+            Some(format!("no reserve held back (route={:?})", reserve.route)),
+        );
         if matches!(
             reserve.route,
             super::margin_row_bab::MarginRowReserveRoute::AdaptiveReleasedAlphaBetaTier
@@ -3846,7 +6860,15 @@ fn run_and_translate(
     // still requires the unchanged trusted-ORT gate, and the only risk is the
     // measured-away chance that the internal verifier could have decided the
     // instance in the reserved tail.
-    let ny_timeout = match postbab_reserve_secs() {
+    let active_postbab_reserve_secs = if postbab_reserve_is_actionable(
+        deferred_pgd_consumer_available,
+        margin_row_memory_allowed,
+    ) {
+        postbab_reserve_secs()
+    } else {
+        0
+    };
+    let ny_timeout = match active_postbab_reserve_secs {
         0 => ny_timeout,
         reserved => {
             let kept = ny_timeout.saturating_sub(reserved).max(10);
@@ -3857,6 +6879,22 @@ fn run_and_translate(
             kept
         }
     };
+    instance_overrides.outer_deferred_internal_deadline = frozen_outer_deferred_internal_deadline(
+        solver_phase_deadline,
+        timeout_before_fixed_reserves_secs,
+        ny_timeout,
+        effective_deferred_pgd_fraction,
+        deferred_outer_pgd_priority,
+    );
+    if deferred_outer_pgd_priority
+        && instance_overrides
+            .outer_deferred_internal_deadline
+            .is_none()
+    {
+        eprintln!(
+            "Deferred outer PGD: no representable frozen internal deadline; verifier admission will fail closed"
+        );
+    }
 
     // #postbab-seed: clear the internal best-margin tracker so anything read
     // after the run belongs to THIS instance.
@@ -3866,9 +6904,50 @@ fn run_and_translate(
     // recorded and the take below returns empty.
     reset_bab_frontier_export();
     begin_capture();
-    let outcome = invoke_beta_crown(onnx, vnnlib, preset, ny_timeout, instance_overrides);
+    let beta_started = std::time::Instant::now();
+    let outcome = invoke_beta_crown(
+        onnx,
+        vnnlib,
+        preset,
+        ny_timeout,
+        deferred_pgd_consumer_available,
+        instance_overrides,
+    );
+    let beta_elapsed = beta_started.elapsed();
     let captured = take_captured_json();
+    let terminal_ingress = take_captured_terminal_ingress();
     end_capture();
+
+    // #phase-ledger (dark, `NY_PHASE_LEDGER=1`): the internal verifier's own
+    // verdict JSON plus the wall it actually consumed against the wall it was
+    // granted. Without this the default log shows a silent gap between "verifier
+    // started" and "post-BaB attack handed N s", so an instance that ends at 12 s
+    // of a 600 s budget is indistinguishable from one whose proof lane was cut by
+    // a deadline — the two call for opposite fixes. Diagnostic only: it reads
+    // state the run already computed and changes no verdict, bound or schedule.
+    if std::env::var("NY_PHASE_LEDGER").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[phase-ledger] internal verifier returned after {:.2}s of a {}s internal grant \
+             (outcome={}), leftover={:.2}s",
+            beta_elapsed.as_secs_f64(),
+            ny_timeout,
+            if outcome.is_ok() { "ok" } else { "err" },
+            instance_deadline
+                .map(|d| d
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f64())
+                .unwrap_or(f64::NAN),
+        );
+        eprintln!(
+            "[phase-ledger] verifier JSON: {}",
+            captured.as_deref().unwrap_or("<none>")
+        );
+    }
+    *traffic_terminal_softmax_execution = TrafficTerminalSoftmaxPeelExecution::from_beta_capture(
+        traffic_terminal_softmax_peel,
+        captured.as_deref(),
+    );
+    let captured_beta_verdict = captured.is_some();
     // The closest-to-violation points the internal graph-PGD search found, even
     // when they never crossed the internal violation threshold (the resister
     // class: the search burns its tier without emitting a witness while
@@ -3890,6 +6969,23 @@ fn run_and_translate(
         // No JSON verdict but the call returned Ok (verified IBP fast-path writes JSON,
         // so this is unusual): stay sound.
         (Ok(()), None) => VnncompResult::Unknown,
+        // The primary CLI dispatch translates a verifier deadline into a
+        // BetaCrownResult::Timeout and emits JSON. Keep this final typed
+        // fallback at the capture boundary as well: a deadline from any
+        // later/pre-dispatch seam must not become `unknown`.
+        (Err(err), None)
+            if error_chain_has_expired_typed_deadline(
+                &err,
+                match (beta_phase_deadline, instance_deadline) {
+                    (Some(beta), Some(instance)) => Some(beta.min(instance)),
+                    (Some(beta), None) => Some(beta),
+                    (None, instance) => instance,
+                },
+            ) =>
+        {
+            eprintln!("Verification deadline exceeded before JSON publication: {err}");
+            VnncompResult::Timeout
+        }
         // The call errored before producing any verdict (e.g. propagation error during
         // the initial bound pass). The run did not crash; emit the sound `unknown`.
         (Err(err), None) => {
@@ -3908,7 +7004,49 @@ fn run_and_translate(
             } else {
                 eprintln!("Verification produced no verdict (sound unknown): {err}");
             }
-            VnncompResult::Unknown
+            // #nonlinear-vnnlib: the affine parser refuses non-linear arithmetic
+            // outright, which makes every instance of a non-linear category an
+            // instant `unknown` (adaptive_cruise_control_non_linear_2026: 50/50 at
+            // 0.1s each — a guaranteed zero on a whole benchmark). Fall back to
+            // the complete non-linear lane: first search for an exact,
+            // independently backed-up counterexample; if none is found, try to
+            // refute every input subbox with sound output bounds plus outward
+            // interval evaluation of the ORIGINAL, UNRELAXED formula. Any
+            // unsupported or unresolved operation remains `unknown`.
+            if affine_parser_refused_for_representability(&msg)
+                && nonlinear_fallback_may_precede_outer_pgd(deferred_outer_pgd_priority)
+            {
+                // SAT first: a counterexample is far cheaper than a proof and
+                // settles the violated instances immediately. The value falls
+                // through to the trusted-oracle gate below like any other `sat`
+                // — it is NOT returned early, so the ORT re-confirmation still
+                // runs.
+                if let Some(witness) =
+                    try_nonlinear_sat(onnx, vnnlib, ny_timeout / 4, post_beta_deadline)
+                {
+                    eprintln!(
+                        "#nonlinear-vnnlib: EXACT counterexample found for a spec the affine \
+                         parser refuses; the full unrelaxed formula holds at this point"
+                    );
+                    VnncompResult::Sat {
+                        witness: Some(witness),
+                    }
+                } else if try_nonlinear_unsat(onnx, vnnlib, ny_timeout, post_beta_deadline)
+                    == Some(true)
+                {
+                    // No counterexample found, and the whole region is refuted by
+                    // sound interval branch-and-bound.
+                    eprintln!(
+                        "#nonlinear-vnnlib: region exhaustively refuted by sound interval \
+                         branch-and-bound over the declared box — no counterexample exists"
+                    );
+                    VnncompResult::Unsat
+                } else {
+                    VnncompResult::Unknown
+                }
+            } else {
+                VnncompResult::Unknown
+            }
         }
     };
 
@@ -3925,13 +7063,43 @@ fn run_and_translate(
     // sound `unknown`.
     let (gated, internal_witness) = match translated {
         VnncompResult::Sat { witness } => {
-            let gated =
-                gate_sat_with_trusted_oracle(onnx, vnnlib, witness.as_deref(), instance_deadline);
+            let internal_witness = witness.clone();
+            let gated = if traffic_terminal_softmax_execution.applied() {
+                match witness.as_deref() {
+                    Some(witness) => match rehydrate_original_witness_outputs(onnx, witness) {
+                        Ok(original_witness) => gate_sat_with_trusted_oracle(
+                            onnx,
+                            vnnlib,
+                            Some(&original_witness),
+                            instance_deadline,
+                        ),
+                        Err(error) => {
+                            eprintln!(
+                                "Traffic terminal-Softmax peel: could not restore original-model \
+                                 witness outputs ({error}); downgrading to sound unknown"
+                            );
+                            VnncompResult::Unknown
+                        }
+                    },
+                    None => gate_sat_with_trusted_oracle(onnx, vnnlib, None, instance_deadline),
+                }
+            } else if traffic_terminal_softmax_peel
+                && captured_beta_verdict
+                && *traffic_terminal_softmax_execution
+                    == TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable
+            {
+                eprintln!(
+                    "Traffic terminal-Softmax peel: captured sat lacked a trustworthy actual-application receipt; downgrading to sound unknown"
+                );
+                VnncompResult::Unknown
+            } else {
+                gate_sat_with_trusted_oracle(onnx, vnnlib, witness.as_deref(), instance_deadline)
+            };
             // Keep the internal witness even when the gate DOWNGRADES: on the
             // ORT-divergence class (soundnessbench model_5: ny's internal forward
             // says violated, real ORT says SAFE) it is a near-miss and the best
             // available seed for the post-BaB attack below.
-            (gated, witness)
+            (gated, internal_witness)
         }
         other => (other, None),
     };
@@ -3948,8 +7116,9 @@ fn run_and_translate(
     // ONLY through the identical trusted-ORT gate. The verdict at this point is
     // already non-sat, so this pass can only ADD sats; it can never cost a
     // verdict (it runs strictly after the outcome is decided) nor introduce a
-    // false one (the acceptance gate is unchanged). Kill-switch: NY_POSTBAB_ATTACK=0.
-    if matches!(gated, VnncompResult::Unknown | VnncompResult::Timeout) {
+    // false one (the acceptance gate is unchanged). Kill switches: exact
+    // NY_POSTBAB_ATTACK=0, or typed vnncomp_post_bab_attack=false.
+    if deferred_pgd_consumer_available && postbab_escalation_allowed(&gated, terminal_ingress) {
         // MARGIN-ROW TWIN-WALL BaB (#twinwall, strictly additive): after the
         // generic verifier failed to decide and the attack found no CE, spend
         // the remaining budget on the certified margin-row lane. It can only
@@ -3960,44 +7129,168 @@ fn run_and_translate(
         // inline attempt on the leftover seconds. Give it a short grace to
         // land, then fall back to the inline attempt (which is what runs when
         // no concurrent lane was started).
-        if let Some(lane) = concurrent_lane {
-            let grace = instance_deadline
-                .map(|d| d.saturating_duration_since(std::time::Instant::now()))
-                .unwrap_or_else(|| std::time::Duration::from_secs(5))
-                .min(std::time::Duration::from_secs(5));
-            if let Some(res) = lane.take(grace) {
-                return res;
+        let mut margin_worker_still_running = false;
+        // BORROW, do not move: the FINAL CONCURRENT-LANE JOIN below consults the
+        // same handle after the attack lane has had its slice. Moving it here
+        // is what silently discarded a certified proof on cifar100_2024.
+        if !deferred_outer_pgd_priority {
+            if let Some(lane) = &concurrent_lane {
+                let grace =
+                    concurrent_margin_row_grace(post_beta_deadline, std::time::Instant::now());
+                match lane.peek(grace) {
+                    super::margin_row_bab::ConcurrentLaneTake::Verdict(res) => return res,
+                    super::margin_row_bab::ConcurrentLaneTake::FinishedWithoutVerdict => {}
+                    super::margin_row_bab::ConcurrentLaneTake::StillRunning => {
+                        margin_worker_still_running = true;
+                        eprintln!(
+                            "Post-BaB attack: declined because the detached concurrent margin-row \
+                         worker is still running; graph-heavy optional tails may not overlap"
+                        );
+                    }
+                }
+            } else if !proof_tail_reserved && optional_heavy_memory_allowed_now() {
+                match super::margin_row_bab::try_margin_row_unsat(
+                    onnx,
+                    vnnlib,
+                    // #twinwall-reserve-respect (banked 99ed4d42): when the post-BaB
+                    // attack reserve is armed, the inline margin-row lane must not be
+                    // handed the FULL instance deadline — measured, it consumed the
+                    // whole tail (113.1s against a 45s margin-row slice on metaroom),
+                    // starving the seeded post-BaB lane and once overrunning to the
+                    // watchdog kill. Cap its deadline so the attack keeps its slice.
+                    margin_row_lane_deadline(post_beta_deadline, active_postbab_reserve_secs),
+                ) {
+                    super::margin_row_bab::MarginRowTry::Verdict(res) => return res,
+                    super::margin_row_bab::MarginRowTry::FinishedWithoutVerdict => {}
+                    super::margin_row_bab::MarginRowTry::StillRunning => {
+                        margin_worker_still_running = true;
+                        eprintln!(
+                            "Post-BaB attack: declined because the detached inline margin-row \
+                         worker is still running; graph-heavy optional tails may not overlap"
+                        );
+                    }
+                }
             }
-        } else if let Some(res) = super::margin_row_bab::try_margin_row_unsat(
-            onnx,
-            vnnlib,
-            // #twinwall-reserve-respect (banked 99ed4d42): when the post-BaB
-            // attack reserve is armed, the inline margin-row lane must not be
-            // handed the FULL instance deadline — measured, it consumed the
-            // whole tail (113.1s against a 45s margin-row slice on metaroom),
-            // starving the seeded post-BaB lane and once overrunning to the
-            // watchdog kill. Cap its deadline so the attack keeps its slice.
-            margin_row_lane_deadline(instance_deadline, postbab_reserve_secs()),
-        ) {
-            return res;
         }
-        if let Some(witness) = try_postbab_falsify(
-            onnx,
-            vnnlib,
-            internal_witness.as_deref(),
-            &best_margin_candidates,
-            &bab_frontier_seeds,
-            instance_deadline,
-        ) {
-            let regated =
-                gate_sat_with_trusted_oracle(onnx, vnnlib, Some(&witness), instance_deadline);
-            if matches!(regated, VnncompResult::Sat { .. }) {
-                return regated;
+        if deferred_pgd_consumer_available
+            && postbab_after_margin_allowed(margin_worker_still_running)
+        {
+            if active_postbab_reserve_secs > 0 && !optional_heavy_memory_allowed_now() {
+                eprintln!(
+                    "post-BaB attack reserve: {}s was held at instance start but live \
+                     cgroup/RLIMIT state became unavailable or fell below the graph-tail \
+                     boundary before handoff; the lane will decline and preserve the existing verdict",
+                    active_postbab_reserve_secs
+                );
             }
-            // Gate rejected the candidate: keep the original (sound) verdict.
+            if let Some(witness) = try_postbab_falsify(
+                onnx,
+                vnnlib,
+                internal_witness.as_deref(),
+                &best_margin_candidates,
+                &bab_frontier_seeds,
+                instance_deadline,
+            ) {
+                let regated =
+                    gate_sat_with_trusted_oracle(onnx, vnnlib, Some(&witness), instance_deadline);
+                if matches!(regated, VnncompResult::Sat { .. }) {
+                    return regated;
+                }
+                // Gate rejected the candidate: keep the original (sound) verdict.
+            }
+        }
+        // FINAL CONCURRENT-LANE JOIN (#twinwall-join, measured 2026-08-03).
+        //
+        // THE DEFECT THIS FIXES. The join above waits at most 5 s, anchored to
+        // the moment the internal verifier RETURNS — not to the instance
+        // deadline. On cifar100_2024 the verifier gives its slice back early
+        // (BaB hits its phase deadline, Graph-MIP declines on the nnz cap), so
+        // that 5 s window opens around t=57 s of a 100 s budget while the lane
+        // is still working. Measured on resnet_large prop_idx_4486 with the
+        // twin-wall pair armed: the lane returned `UNSAT in 77.3s
+        // (root_bound=-0.2051, expansions=72, maxDepth=13, ledger=Some(true))`
+        // — 20 s INSIDE the budget — and the instance still wrote `timeout`,
+        // because by then the only remaining consumer was the APGD attack and
+        // the handle had already been polled and dropped. A certified proof
+        // was computed, printed, and thrown away.
+        //
+        // THE FIX. Consult the SAME handle once more after the attack lane has
+        // had its full slice. The message the 5 s poll missed is still queued
+        // (a `recv_timeout` that times out consumes nothing), so this collects
+        // it with no extra work.
+        //
+        // SOUND AND STRICTLY ADDITIVE. (a) It runs only inside the
+        // already-guarded `postbab_escalation_allowed` block, i.e. the verdict
+        // is Unknown/Timeout and nothing is being overwritten. (b) The lane is
+        // fail-closed — `run_margin_row_lane` returns `Unsat` or `Unknown`,
+        // never `Sat` — so this can only convert timeout into a certified
+        // `unsat`. (c) It is placed AFTER `try_postbab_falsify`, so the attack
+        // keeps its whole slice and no `sat` can be lost to it; the lane has
+        // been running on its own thread throughout, so waiting here costs it
+        // nothing either. (d) The wait stops short of the scored deadline, and
+        // the lane's own deadline is already `instance_deadline - 3s`.
+        if !deferred_outer_pgd_priority {
+            if let Some(lane) = concurrent_lane {
+                let grace = instance_deadline
+                    .map(|d| {
+                        d.saturating_duration_since(std::time::Instant::now())
+                            .saturating_sub(CONCURRENT_LANE_JOIN_MARGIN)
+                    })
+                    .unwrap_or_default();
+                if !grace.is_zero() {
+                    if let super::margin_row_bab::ConcurrentLaneTake::Verdict(res) =
+                        lane.take(grace)
+                    {
+                        eprintln!(
+                            "margin-row BaB: collected the CONCURRENT lane verdict at the \
+                         post-BaB join (waited up to {:.1}s)",
+                            grace.as_secs_f64()
+                        );
+                        return res;
+                    }
+                }
+            }
         }
     }
     gated
+}
+
+/// Headroom kept below the scored deadline when joining the concurrent
+/// margin-row lane at the end of the post-BaB tail: enough for the results
+/// write, and short enough that the wait cannot itself cause an overrun.
+const CONCURRENT_LANE_JOIN_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Detect an expired verifier deadline authority through arbitrary `anyhow`
+/// context without relying on rendered error text.
+///
+/// `NyError::DeadlineExceeded` may also represent a recoverable node-local cap.
+/// A live or absent outer authority therefore keeps the ordinary sound-unknown
+/// translation rather than claiming whole-attempt exhaustion.
+fn error_chain_has_expired_typed_deadline(
+    error: &anyhow::Error,
+    authority_deadline: Option<std::time::Instant>,
+) -> bool {
+    authority_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        && error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ny_core::NyError>()
+                .is_some_and(ny_core::NyError::is_deadline_exceeded)
+        })
+}
+
+/// Decide whether an inconclusive verifier result may enter any post-BaB lane.
+///
+/// The historical/default and required-plain-prefix policies are unchanged:
+/// timeout/unknown may still spend leftover budget on the existing margin-row
+/// and APGD lanes.  The typed marked-margin SafeNLP ingress is different: once
+/// admitted it owns the terminal result, so timeout/unknown must return
+/// directly without a fallback, retry, APGD pass, or second solve.
+fn postbab_escalation_allowed(
+    result: &VnncompResult,
+    terminal_ingress: CapturedTerminalIngress,
+) -> bool {
+    matches!(result, VnncompResult::Unknown | VnncompResult::Timeout)
+        && terminal_ingress == CapturedTerminalIngress::None
 }
 
 /// Time reserved below the scored deadline for the confirming ORT gate + true-f64
@@ -4038,6 +7331,152 @@ fn postbab_attack_reserves(
     } else {
         (POSTBAB_ATTACK_SAFETY_MARGIN, POSTBAB_ATTACK_MIN_BUDGET)
     }
+}
+
+/// #deadlane — process-memoized answer to "can ANY exact-gradient attack step
+/// run on this net?", keyed by model path.
+///
+/// [`GraphNetwork::supports_attack_point_gradient`] is a purely static scan of
+/// node layer types, so the answer is fixed for the whole process. Without the
+/// memo the SAME probe is repeated by every lane: measured on vit_2023
+/// ibp_3_3_8_3005 the upfront lane learned "exact gradient unavailable" at
+/// t≈0.06 s and the post-BaB lane re-derived the identical answer 87.7 s later,
+/// each time after a full ONNX re-load.
+///
+/// FAIL-OPEN: a model that does not load returns `true`, so a load hiccup can
+/// only preserve today's behavior (run the lane, discover the answer inside),
+/// never silently disable an attack that would have worked.
+fn net_supports_attack_gradients(onnx: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // A poisoned mutex must not change the verdict path: fail open.
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => return true,
+    };
+    if let Some(&hit) = guard.get(onnx) {
+        return hit;
+    }
+    let supported = match load_graph_network(onnx) {
+        Ok(graph) => graph.supports_attack_point_gradient(),
+        Err(_) => true,
+    };
+    if !supported {
+        eprintln!(
+            "Attack lanes: {} is outside the exact-gradient fragment; gradient-driven \
+             falsification is STATICALLY unavailable on this net (probed once)",
+            onnx.display()
+        );
+    }
+    guard.insert(onnx.to_path_buf(), supported);
+    supported
+}
+
+/// #deadlane — does the post-BaB falsification lane have ANY stage it can
+/// actually execute?
+///
+/// Pure so the decision is testable without a model or a clock. Two independent
+/// capabilities feed every stage of [`try_postbab_falsify`]:
+///
+/// * `has_seed` — an internal near-miss witness, an exported best-margin point,
+///   or a BaB-frontier center. These drive the DERIVATIVE-FREE stages
+///   (trusted-ORT active-set repair, exact-f64 polish, ULP jitter), which need no
+///   network gradient at all.
+/// * `grad_ok` — [`net_supports_attack_gradients`]. Required by the Newton
+///   equality-seek rows and by the final DLR-APGD lane. Taken as a CLOSURE so a
+///   seeded lane never pays for the probe's ONNX load.
+///
+/// With NEITHER, every stage is structurally dead: the seeded stages have
+/// nothing to start from and the gradient stages cannot take a step. Handing
+/// such a lane budget is pure waste — measured on vit_2023, 9,407.6 s across the
+/// 200-row category (47.0 % of the whole category budget), on a benchmark whose
+/// official results contain ZERO `sat` instances, so a falsifier could not have
+/// earned a point with any of it.
+///
+/// Deliberately conservative: EITHER capability keeps the lane and its full
+/// window, so a lane that can run is unaffected.
+fn postbab_lane_has_executable_stage(has_seed: bool, grad_ok: impl FnOnce() -> bool) -> bool {
+    has_seed || grad_ok()
+}
+
+/// Operator assertion that the optional graph-heavy proof/attack tails may run
+/// inside a finite cgroup/RLIMIT envelope.  `1` opts in, `0` opts out even on an
+/// unbounded host; every other value keeps the fail-closed automatic policy.
+const OPTIONAL_HEAVY_MEMORY_OVERRIDE_ENV: &str = "NY_OPTIONAL_HEAVY_UNDER_MEMORY_LIMIT";
+
+/// Minimum LIVE cgroup/RLIMIT headroom for graph-heavy optional tails.
+///
+/// The failed 12 GiB campaign entered post-BaB with about 9.6 GiB remaining
+/// and consumed all of it.  Requiring 16 GiB of *remaining* headroom adds 6.4
+/// GiB beyond that observed failed allowance, while retaining the banked lanes
+/// at startup on documented 24/32 GiB competition boxes and the 80 GiB default
+/// profile.  This is an admission boundary, not a claimed aggregate peak proof;
+/// the exact override exists for externally isolated runs with a stronger
+/// containment contract.
+const OPTIONAL_HEAVY_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Graph-heavy optional tails currently have no aggregate peak reservation:
+/// margin-row can overlap the verifier, and post-BaB may retain an ORT session
+/// while loading several full GraphNetworks.  A 12 GiB measured run entered the
+/// latter with about 9.6 GiB of live headroom and still hit `memory.max` exactly.
+/// Therefore a constrained kernel envelope below the measured-safe admission
+/// boundary is not treated as an amount these lanes may race to consume. Keep
+/// the already-sound verifier verdict until the heavy work is isolated in a
+/// child or gains an aggregate reservation contract.
+fn optional_heavy_memory_allowed(
+    process_envelope: ProcessMemoryEnvelope,
+    operator_override: Option<&OsStr>,
+) -> bool {
+    match operator_override {
+        Some(value) if value == OsStr::new("1") => true,
+        Some(value) if value == OsStr::new("0") => false,
+        _ => match process_envelope {
+            ProcessMemoryEnvelope::Bounded { headroom_bytes } => {
+                headroom_bytes >= OPTIONAL_HEAVY_MIN_HEADROOM_BYTES
+            }
+            ProcessMemoryEnvelope::Unbounded => true,
+            ProcessMemoryEnvelope::Unavailable => false,
+        },
+    }
+}
+
+fn optional_heavy_memory_allowed_now() -> bool {
+    optional_heavy_memory_allowed(
+        ny_propagate::network::crown_memory::process_memory_envelope(),
+        std::env::var_os(OPTIONAL_HEAVY_MEMORY_OVERRIDE_ENV).as_deref(),
+    )
+}
+
+fn margin_row_reserve_is_actionable(
+    proof_tail_reserved: bool,
+    memory_allowed: bool,
+    deferred_outer_pgd_priority: bool,
+) -> bool {
+    !proof_tail_reserved && memory_allowed && !deferred_outer_pgd_priority
+}
+
+fn postbab_reserve_is_actionable(lane_enabled: bool, memory_allowed: bool) -> bool {
+    lane_enabled && memory_allowed
+}
+
+fn postbab_after_margin_allowed(margin_worker_still_running: bool) -> bool {
+    !margin_worker_still_running
+}
+
+fn postbab_graph_stage_memory_allowed(stage: &str) -> bool {
+    let allowed = optional_heavy_memory_allowed_now();
+    if !allowed {
+        println!(
+            "Post-BaB attack: DECLINED before {stage} — the live cgroup/RLIMIT envelope is \
+             unavailable or below the {} GiB graph-tail admission boundary ({}=1 overrides); \
+             preserving the already-sound verifier verdict",
+            OPTIONAL_HEAVY_MIN_HEADROOM_BYTES / (1024 * 1024 * 1024),
+            OPTIONAL_HEAVY_MEMORY_OVERRIDE_ENV
+        );
+    }
+    allowed
 }
 
 /// Freeze the post-BaB attack's hard deadline before any VNN-LIB, graph, or
@@ -4105,6 +7544,62 @@ fn margin_row_lane_deadline(
                 .unwrap_or_else(std::time::Instant::now)
         }),
     }
+}
+
+/// Latest work deadline shared by β-CROWN and every optional post-β proof lane.
+///
+/// The proof-tail route supplies an earlier absolute β deadline so the final
+/// publication margin cannot be consumed by concurrent-join grace or a fresh
+/// inline margin-row attempt. Historical routes pass `None` and retain the
+/// scored instance deadline.
+fn post_beta_work_deadline(
+    instance_deadline: Option<std::time::Instant>,
+    beta_phase_deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (instance_deadline, beta_phase_deadline) {
+        (Some(instance), Some(beta)) => Some(instance.min(beta)),
+        (Some(instance), None) => Some(instance),
+        (None, Some(beta)) => Some(beta),
+        (None, None) => None,
+    }
+}
+
+/// Freeze a lane-local wall budget at admission and cap it by any enclosing
+/// absolute authority. `None` means the duration overflowed; an already-lapsed
+/// result is left to the caller to reject.
+fn bounded_work_deadline(
+    admitted_at: std::time::Instant,
+    wall_budget: std::time::Duration,
+    authority_deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let local_deadline = admitted_at.checked_add(wall_budget)?;
+    Some(
+        authority_deadline
+            .map(|authority| authority.min(local_deadline))
+            .unwrap_or(local_deadline),
+    )
+}
+
+/// Freeze the nonlinear fallback's relative slice before any file/model/runtime
+/// setup and cap it by the shared proof-work deadline.
+fn nonlinear_lane_deadline(
+    timeout_secs: u64,
+    work_deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let admitted_at = std::time::Instant::now();
+    let local_budget = std::time::Duration::from_secs(timeout_secs.max(1)).mul_f32(0.8);
+    let deadline = bounded_work_deadline(admitted_at, local_budget, work_deadline)?;
+    (deadline > admitted_at).then_some(deadline)
+}
+
+fn concurrent_margin_row_grace(
+    work_deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    work_deadline
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or_else(|| std::time::Duration::from_secs(5))
+        .min(std::time::Duration::from_secs(5))
 }
 
 /// Parse the opt-in frontier-fast-lane environment contract without touching
@@ -4234,10 +7729,12 @@ fn insert_active_set_pair_extrapolation(
             if !first.is_finite() || !second.is_finite() || lo > hi {
                 return None;
             }
-            let extrapolated = 2.0 * f64::from(second) - f64::from(first);
-            extrapolated
-                .is_finite()
-                .then(|| extrapolated.max(f64::from(lo)).min(f64::from(hi)) as f32)
+            let extrapolated = 2.0 * f32_to_f64_exact(second) - f32_to_f64_exact(first);
+            extrapolated.is_finite().then(|| {
+                extrapolated
+                    .max(f32_to_f64_exact(lo))
+                    .min(f32_to_f64_exact(hi)) as f32
+            })
         })
         .collect();
     let Some(candidate) = candidate else {
@@ -4265,6 +7762,30 @@ fn f64_polish_candidate_is_terminal(
     ort_violates == Some(true) && !definite_f64_margin_rejection(emitted_f64_margin)
 }
 
+/// Recheck admission after releasing another graph-backed oracle, run one
+/// graph-loading stage when admitted, then restore the oracle before the caller
+/// evaluates the stage's candidate.
+///
+/// The recheck is deliberately after the retained graph is dropped, and the
+/// restore is after `stage` returns, so the stage's local
+/// GraphNetwork has been destroyed. Repeating this swap preserves f64-guided
+/// jitter and local candidate rejection across every seed/round without ever
+/// retaining the f64 graph alongside fast-lane/Newton graph state.
+fn run_graph_stage_without_retained_oracle<T, R>(
+    retained_oracle: &mut Option<T>,
+    admit_stage: impl FnOnce() -> bool,
+    stage: impl FnOnce() -> R,
+    reload_oracle: impl FnOnce() -> Option<T>,
+) -> Option<R> {
+    drop(retained_oracle.take());
+    if !admit_stage() {
+        return None;
+    }
+    let result = stage();
+    *retained_oracle = reload_oracle();
+    Some(result)
+}
+
 /// Post-BaB leftover-budget falsification (#postbab-apgd): after the internal
 /// verifier returned `unknown`/`timeout`, spend the REMAINING scored budget on the
 /// exact-gradient DLR-APGD attack ([`gradient_guided_falsify`]) for ANY spec shape
@@ -4286,12 +7807,41 @@ fn try_postbab_falsify(
     bab_frontier_seeds: &[BabFrontierSeed],
     instance_deadline: Option<std::time::Instant>,
 ) -> Option<String> {
-    if std::env::var("NY_POSTBAB_ATTACK").ok().as_deref() == Some("0") {
-        return None;
-    }
     // No known scored deadline => no measurable leftover budget => skip (the
     // upfront/refine lanes already cover the interactive paths).
     let scored_deadline = instance_deadline?;
+
+    // #deadlane: DECLINE BEFORE THE WINDOW IS HANDED OUT. `postbab_attack_window`
+    // grants ALL remaining wall (minus the safety margin), so a lane with no
+    // executable stage would otherwise be handed the whole early-exit — measured
+    // 87.8 s of a 100 s budget on vit_2023 ibp_3_3_8_3005 and 556.5 s of a 600 s
+    // budget on ml4acopf 14_ieee_prop9, each consumed in ~0.05 s before printing
+    // "exact gradient unavailable for this net". See
+    // `postbab_lane_has_executable_stage` for why "no gradient AND no seed" is
+    // structurally dead. `NY_POSTBAB_DEADLANE=0` restores the legacy behavior.
+    let has_seed = internal_witness.is_some()
+        || !best_margin_candidates.is_empty()
+        || !bab_frontier_seeds.is_empty();
+    // Re-read the LIVE process envelope here, after any margin-row work and the
+    // verifier have changed residency.  A stale start-of-instance observation
+    // cannot authorize a post-verifier allocation burst.
+    if !postbab_graph_stage_memory_allowed("tail setup") {
+        return None;
+    }
+    let executable =
+        postbab_lane_has_executable_stage(has_seed, || net_supports_attack_gradients(onnx));
+    if std::env::var("NY_POSTBAB_DEADLANE").ok().as_deref() != Some("0") && !executable {
+        println!(
+            "Post-BaB attack: DECLINED — no exact-gradient support on this net and no \
+             seed to drive the derivative-free stages; the remaining {:.1}s is left \
+             to verdict publication",
+            scored_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs_f64()
+        );
+        return None;
+    }
+
     // Freeze the scored-minus-safety deadline BEFORE setup so graph/runtime
     // construction consumes this window rather than shifting it later.
     let (attack_deadline, budget) =
@@ -4390,8 +7940,13 @@ fn try_postbab_falsify(
     // #witness-deepen: the jitter deepens past the first violation toward the
     // target margin; the f64 enclosure oracle joins the objective at
     // checkpoints when the net supports the exact-f64 cell (None ⇒ ORT-only).
-    let f64_oracle =
-        witness_deepen_target().and_then(|_| F64MarginOracle::load(onnx, box_lo.len()));
+    let f64_oracle_enabled = witness_deepen_target().is_some();
+    let load_f64_oracle = || {
+        (f64_oracle_enabled && optional_heavy_memory_allowed_now())
+            .then(|| F64MarginOracle::load(onnx, box_lo.len()))
+            .flatten()
+    };
+    let mut f64_oracle = load_f64_oracle();
 
     println!(
         "Post-BaB attack: DLR-APGD falsification in leftover budget ({:.1}s, {} dims, seed={})",
@@ -4611,7 +8166,7 @@ fn try_postbab_falsify(
                     {
                         break;
                     }
-                    let s64: Vec<f64> = s.iter().map(|&v| v as f64).collect();
+                    let s64: Vec<f64> = s.iter().map(|&v| f32_to_f64_exact(v)).collect();
                     // Near-miss gate: skip seeds genuinely far from a violation.
                     match oracle.point_margin_f64(&spec, &s64) {
                         Some(m) if m > -band => {
@@ -4660,17 +8215,25 @@ fn try_postbab_falsify(
             priority_seeds.len(),
             fastlane_budget.as_secs_f64()
         );
-        if let Some(found) = frontier_fastlane_gradient_falsify(
-            onnx,
-            &mut forward,
-            &spec,
-            &box_lo,
-            &box_hi,
-            &emit_pin,
-            &priority_seeds,
-            instance_deadline,
-            fastlane_budget,
-        ) {
+        let found = run_graph_stage_without_retained_oracle(
+            &mut f64_oracle,
+            || postbab_graph_stage_memory_allowed("frontier fast-lane graph load"),
+            || {
+                frontier_fastlane_gradient_falsify(
+                    onnx,
+                    &mut forward,
+                    &spec,
+                    &box_lo,
+                    &box_hi,
+                    &emit_pin,
+                    &priority_seeds,
+                    instance_deadline,
+                    fastlane_budget,
+                )
+            },
+            load_f64_oracle,
+        )?;
+        if let Some(found) = found {
             emit_found!(found);
         }
         println!(
@@ -4752,16 +8315,23 @@ fn try_postbab_falsify(
                 break;
             }
             let slice = (budget / 4).min(remaining);
-            let (violation, best) = equality_seek_falsify(
-                onnx,
-                &mut forward,
-                &spec,
-                &box_lo,
-                &box_hi,
-                &emit_pin,
-                Some(&cur),
-                slice,
-            );
+            let (violation, best) = run_graph_stage_without_retained_oracle(
+                &mut f64_oracle,
+                || postbab_graph_stage_memory_allowed("Newton graph load"),
+                || {
+                    equality_seek_falsify(
+                        onnx,
+                        &mut forward,
+                        &spec,
+                        &box_lo,
+                        &box_hi,
+                        &emit_pin,
+                        Some(&cur),
+                        slice,
+                    )
+                },
+                load_f64_oracle,
+            )?;
             if let Some(found) = violation {
                 emit_found!(found);
             }
@@ -4770,7 +8340,7 @@ fn try_postbab_falsify(
                 // ORT property margin (its feasibility residual is a different
                 // metric, and a worse point would send the next jitter astray).
                 if let Ok(out) = forward.run(&nx) {
-                    let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+                    let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
                     let nm = property_margin(&spec, &nx, &out64);
                     if nm > cur_margin {
                         cur_margin = nm;
@@ -4798,16 +8368,23 @@ fn try_postbab_falsify(
         let remaining = attack_deadline.saturating_duration_since(std::time::Instant::now());
         let slice = (budget / 3).min(remaining);
         if slice >= std::time::Duration::from_secs(2) {
-            let (violation, best) = equality_seek_falsify(
-                onnx,
-                &mut forward,
-                &spec,
-                &box_lo,
-                &box_hi,
-                &emit_pin,
-                None,
-                slice,
-            );
+            let (violation, best) = run_graph_stage_without_retained_oracle(
+                &mut f64_oracle,
+                || postbab_graph_stage_memory_allowed("center-seek graph load"),
+                || {
+                    equality_seek_falsify(
+                        onnx,
+                        &mut forward,
+                        &spec,
+                        &box_lo,
+                        &box_hi,
+                        &emit_pin,
+                        None,
+                        slice,
+                    )
+                },
+                load_f64_oracle,
+            )?;
             if let Some(found) = violation {
                 emit_found!(found);
             }
@@ -4835,6 +8412,12 @@ fn try_postbab_falsify(
     // #postbab-small-budget: same adaptive minimum as the entry gate, so the
     // gradient lane still fires inside a small re-opened window.
     if remaining < postbab_attack_reserves(remaining).1 {
+        return None;
+    }
+    // The final APGD lane owns another full GraphNetwork; no f64-oracle graph
+    // may remain resident across its load.
+    drop(f64_oracle.take());
+    if !postbab_graph_stage_memory_allowed("final APGD graph load") {
         return None;
     }
     let found = gradient_guided_falsify(
@@ -5165,7 +8748,7 @@ fn in_box_fd_axis_pair(
     let mut xm = x.to_vec();
     xp[d] = clamp_to_box(x[d] + h, box_lo[d], box_hi[d]);
     xm[d] = clamp_to_box(x[d] - h, box_lo[d], box_hi[d]);
-    let denom = f64::from(xp[d]) - f64::from(xm[d]);
+    let denom = f32_to_f64_exact(xp[d]) - f32_to_f64_exact(xm[d]);
     (denom > 0.0 && denom.is_finite()).then_some((xp, xm, denom))
 }
 
@@ -5204,10 +8787,10 @@ fn prefer_forward_one_sided_fd_pair(
     }
     let denom = if xp != center {
         xm.clone_from_slice(center);
-        f64::from(xp[d]) - f64::from(center[d])
+        f32_to_f64_exact(xp[d]) - f32_to_f64_exact(center[d])
     } else {
         xp.clone_from_slice(center);
-        f64::from(center[d]) - f64::from(xm[d])
+        f32_to_f64_exact(center[d]) - f32_to_f64_exact(xm[d])
     };
     (denom > 0.0 && denom.is_finite()).then_some((xp, xm, denom))
 }
@@ -5237,6 +8820,97 @@ struct OrtActiveSetRepairOutcome {
 enum OrtActiveSetFdMode {
     Central,
     OneSided,
+}
+
+/// Explicit, non-verdict research lanes for post-BaB attack development.
+///
+/// These commands deliberately require every external asset as an argument.
+/// They never participate in `ny vnncomp`, and a missing or malformed
+/// prerequisite is a command error rather than a silently skipped test.
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum VnncompResearchAction {
+    /// Run one serial real-corpus margin-row measurement.
+    MarginRow {
+        /// Named probe; invalid names report the complete selector list.
+        probe: String,
+    },
+    /// Compare the Pensieve fractional-head fast and full bound paths.
+    PensieveGap {
+        /// ONNX model containing the normalized-power fractional head.
+        onnx: PathBuf,
+        /// VNN-LIB property defining the model's root input box.
+        vnnlib: PathBuf,
+    },
+    /// Run one serial graph-MIP measurement from an explicit corpus checkout.
+    GraphMip {
+        /// Named probe; invalid names report the complete selector list.
+        probe: String,
+        /// Benchmark-version directory containing the selected probe's
+        /// `onnx/`, `vnnlib/`, and (where needed) `instances.csv`.
+        #[arg(long)]
+        bench_dir: PathBuf,
+        /// Output directory required only by the `emit-smtlib` probe.
+        #[arg(long)]
+        corpus_dir: Option<PathBuf>,
+    },
+    /// Run trusted-ORT active-set repair from an explicit NumPy f32 seed.
+    ActiveSet {
+        /// ONNX model used by the trusted ORT forward.
+        onnx: PathBuf,
+        /// VNN-LIB property defining the search box and unsafe region.
+        vnnlib: PathBuf,
+        /// Little-endian, one-dimensional NumPy v1 f32 seed.
+        seed: PathBuf,
+        /// Total attack budget in milliseconds.
+        #[arg(long, default_value_t = 3_000)]
+        budget_ms: u64,
+        /// Finite-difference policy.
+        #[arg(long, value_enum, default_value_t = ResearchFdModeArg::Central)]
+        fd_mode: ResearchFdModeArg,
+        /// Iteration cap for the initial active-set pass.
+        #[arg(long, default_value_t = 32)]
+        max_iters: usize,
+        /// Retry the best guidance point with one-sided differences.
+        #[arg(long, default_value_t = false)]
+        restart_one_sided: bool,
+        /// Iteration cap for the optional one-sided retry.
+        #[arg(long, default_value_t = 32)]
+        restart_iters: usize,
+    },
+    /// Run equality-seek directly with an explicit wall-clock budget.
+    EqualitySeek {
+        /// ONNX model used by the trusted ORT forward.
+        onnx: PathBuf,
+        /// VNN-LIB property defining the search box and unsafe region.
+        vnnlib: PathBuf,
+        /// Total equality-seek budget in seconds.
+        #[arg(long, default_value_t = 60)]
+        budget_secs: u64,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResearchFdModeArg {
+    Central,
+    OneSided,
+}
+
+impl From<ResearchFdModeArg> for OrtActiveSetFdMode {
+    fn from(value: ResearchFdModeArg) -> Self {
+        match value {
+            ResearchFdModeArg::Central => Self::Central,
+            ResearchFdModeArg::OneSided => Self::OneSided,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveSetResearchPolicy {
+    budget_ms: u64,
+    fd_mode: OrtActiveSetFdMode,
+    max_iters: usize,
+    restart_one_sided: bool,
+    restart_iters: usize,
 }
 
 fn adopt_active_set_guidance(
@@ -5334,7 +9008,7 @@ fn ort_active_set_repair_falsify(
      -> Option<(Vec<f64>, bool)> {
         *evals += 1;
         let out = forward.run(point).ok()?;
-        let out64: Vec<f64> = out.iter().map(|&v| f64::from(v)).collect();
+        let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
         let margins: Vec<f64> = conjuncts
             .iter()
             .map(|c| constraint_margin(c, &out64))
@@ -5371,7 +9045,7 @@ fn ort_active_set_repair_falsify(
         );
     }
     let mut cap = 0.25f64;
-    let mut h_rel = f64::from(H_REL);
+    let mut h_rel = f32_to_f64_exact(H_REL);
     let mut iterations = 0usize;
     let mut stop_reason = "iteration cap";
 
@@ -5450,7 +9124,7 @@ fn ort_active_set_repair_falsify(
             if width[d] <= 0.0 {
                 continue;
             }
-            let h = (h_rel * f64::from(width[d])).max(f64::from(H_MIN)) as f32;
+            let h = (h_rel * f32_to_f64_exact(width[d])).max(f32_to_f64_exact(H_MIN)) as f32;
             let Some((mut xp, mut xm, mut denom)) = in_box_fd_axis_pair(&x, d, h, box_lo, box_hi)
             else {
                 continue;
@@ -5550,10 +9224,16 @@ fn ort_active_set_repair_falsify(
 
         let rhs: Vec<f64> = active.iter().map(|&c| TARGET - margins[c]).collect();
         let lower: Vec<f64> = (0..dim)
-            .map(|d| (f64::from(box_lo[d]) - f64::from(x[d])).max(-cap * f64::from(width[d])))
+            .map(|d| {
+                (f32_to_f64_exact(box_lo[d]) - f32_to_f64_exact(x[d]))
+                    .max(-cap * f32_to_f64_exact(width[d]))
+            })
             .collect();
         let upper: Vec<f64> = (0..dim)
-            .map(|d| (f64::from(box_hi[d]) - f64::from(x[d])).min(cap * f64::from(width[d])))
+            .map(|d| {
+                (f32_to_f64_exact(box_hi[d]) - f32_to_f64_exact(x[d]))
+                    .min(cap * f32_to_f64_exact(width[d]))
+            })
             .collect();
         let Some(delta) = bounded_min_norm_row_lift(&rows, &rhs, &lower, &upper, Some(deadline))
         else {
@@ -5586,7 +9266,7 @@ fn ort_active_set_repair_falsify(
             let cand: Vec<f32> = (0..dim)
                 .map(|d| {
                     clamp_to_box(
-                        (f64::from(x[d]) + scale * delta[d]) as f32,
+                        (f32_to_f64_exact(x[d]) + scale * delta[d]) as f32,
                         box_lo[d],
                         box_hi[d],
                     )
@@ -5796,7 +9476,7 @@ fn equality_seek_falsify(
 
         // Evaluate the restart's start point.
         let Ok(out) = forward.run(&x) else { continue };
-        let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+        let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
         if property_violated_f64(spec, &refine_emit_view(&x, emit_pin), &out64) {
             return (clamp_inside_box(&x, box_lo, box_hi), best_x);
         }
@@ -5844,7 +9524,7 @@ fn equality_seek_falsify(
                     Ok(None) | Err(_) => break 'restarts, // ineligible / deadline
                 };
                 vjp_rows += 1;
-                rows_a.push(g.iter().take(dim).map(|&v| v as f64).collect());
+                rows_a.push(g.iter().take(dim).map(|&v| f32_to_f64_exact(v)).collect());
             }
             if rows_a.len() != violated.len() {
                 break 'restarts;
@@ -5883,7 +9563,7 @@ fn equality_seek_falsify(
                 .enumerate()
                 .map(|(d, &v)| {
                     if width[d] > 0.0 {
-                        (v.abs() / width[d] as f64).abs()
+                        (v.abs() / f32_to_f64_exact(width[d])).abs()
                     } else {
                         0.0
                     }
@@ -5908,7 +9588,7 @@ fn equality_seek_falsify(
                         continue;
                     }
                     let nv = clamp_to_box(
-                        (cand[d] as f64 + scale * delta[d]) as f32,
+                        (f32_to_f64_exact(cand[d]) + scale * delta[d]) as f32,
                         box_lo[d],
                         box_hi[d],
                     );
@@ -5921,7 +9601,7 @@ fn equality_seek_falsify(
                     break;
                 }
                 let Ok(out) = forward.run(&cand) else { break };
-                let cand64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+                let cand64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
                 if property_violated_f64(spec, &refine_emit_view(&cand, emit_pin), &cand64) {
                     println!(
                         "Post-BaB equality-seek: ORT-confirmed violation (restart {}, {newton_steps} Newton steps, {vjp_rows} VJP rows)",
@@ -5969,7 +9649,7 @@ fn equality_seek_falsify(
                         x[d] = clamp_to_box(x[d] + noise, box_lo[d], box_hi[d]);
                     }
                     let Ok(out) = forward.run(&x) else { break };
-                    let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+                    let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
                     if property_violated_f64(spec, &refine_emit_view(&x, emit_pin), &out64) {
                         return (clamp_inside_box(&x, box_lo, box_hi), best_x);
                     }
@@ -5990,6 +9670,298 @@ fn equality_seek_falsify(
         "Post-BaB equality-seek: no violation; best feasibility residual = {best_phi:.6e} ({newton_steps} Newton steps, {restart_idx} restarts)"
     );
     (None, best_x)
+}
+
+/// Execute an explicit post-BaB research lane.
+pub(crate) fn handle_vnncomp_research_command(action: VnncompResearchAction) -> Result<()> {
+    match action {
+        VnncompResearchAction::MarginRow { probe } => super::margin_row_bab::research::run(&probe),
+        VnncompResearchAction::PensieveGap { onnx, vnnlib } => {
+            super::beta_crown::run_pensieve_fastpath_gap_research(&onnx, &vnnlib)
+        }
+        VnncompResearchAction::GraphMip {
+            probe,
+            bench_dir,
+            corpus_dir,
+        } => {
+            #[cfg(feature = "mip")]
+            {
+                super::beta_crown::run_graph_mip_research(&probe, &bench_dir, corpus_dir.as_deref())
+            }
+            #[cfg(not(feature = "mip"))]
+            {
+                let _ = (probe, bench_dir, corpus_dir);
+                anyhow::bail!("graph-mip research requires rebuilding ny-cli with --features mip")
+            }
+        }
+        VnncompResearchAction::ActiveSet {
+            onnx,
+            vnnlib,
+            seed,
+            budget_ms,
+            fd_mode,
+            max_iters,
+            restart_one_sided,
+            restart_iters,
+        } => {
+            anyhow::ensure!(budget_ms > 0, "--budget-ms must be positive");
+            anyhow::ensure!(
+                (1..=128).contains(&max_iters),
+                "--max-iters must be in 1..=128"
+            );
+            anyhow::ensure!(
+                (1..=128).contains(&restart_iters),
+                "--restart-iters must be in 1..=128"
+            );
+            let policy = ActiveSetResearchPolicy {
+                budget_ms,
+                fd_mode: fd_mode.into(),
+                max_iters,
+                restart_one_sided,
+                restart_iters,
+            };
+            run_active_set_research(&onnx, &vnnlib, &seed, policy)
+        }
+        VnncompResearchAction::EqualitySeek {
+            onnx,
+            vnnlib,
+            budget_secs,
+        } => {
+            anyhow::ensure!(budget_secs > 0, "--budget-secs must be positive");
+            run_equality_seek_research(&onnx, &vnnlib, budget_secs)
+        }
+    }
+}
+
+fn run_active_set_research(
+    onnx: &Path,
+    vnnlib: &Path,
+    seed_path: &Path,
+    policy: ActiveSetResearchPolicy,
+) -> Result<()> {
+    let ActiveSetResearchPolicy {
+        budget_ms,
+        fd_mode,
+        max_iters,
+        restart_one_sided,
+        restart_iters,
+    } = policy;
+    anyhow::ensure!(onnx.is_file(), "missing ONNX file {}", onnx.display());
+    anyhow::ensure!(
+        vnnlib.is_file(),
+        "missing VNN-LIB file {}",
+        vnnlib.display()
+    );
+    anyhow::ensure!(
+        seed_path.is_file(),
+        "missing NumPy seed file {}",
+        seed_path.display()
+    );
+
+    let bytes =
+        fs::read(seed_path).with_context(|| format!("read NumPy seed {}", seed_path.display()))?;
+    anyhow::ensure!(
+        bytes.len() >= 10,
+        "NumPy seed is shorter than its v1 header"
+    );
+    anyhow::ensure!(&bytes[..6] == b"\x93NUMPY", "invalid NumPy magic");
+    anyhow::ensure!(
+        bytes[6..8] == [1, 0],
+        "only NumPy v1 seed files are supported"
+    );
+    let header_len = usize::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+    let payload_start = 10usize
+        .checked_add(header_len)
+        .context("NumPy header length overflow")?;
+    anyhow::ensure!(
+        payload_start <= bytes.len(),
+        "NumPy header extends past end of seed file"
+    );
+    let payload = &bytes[payload_start..];
+    let (chunks, remainder) = payload.as_chunks::<4>();
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "NumPy seed payload is not a whole number of f32 values"
+    );
+    let seed: Vec<f32> = chunks
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect();
+
+    let spec = ny_onnx::vnnlib::load_vnnlib(vnnlib)
+        .with_context(|| format!("load VNN-LIB {}", vnnlib.display()))?;
+    let (box_lo, box_hi, emit_pin) =
+        build_search_box(&spec).context("property has no supported search box")?;
+    anyhow::ensure!(
+        seed.len() == box_lo.len(),
+        "seed dimension {} does not match property input dimension {}",
+        seed.len(),
+        box_lo.len()
+    );
+    let mut forward = ny_onnx::diff::OrtForward::from_path(onnx, box_lo.len())
+        .with_context(|| format!("load ORT model {}", onnx.display()))?;
+    let start = forward.run(&seed).context("run initial ORT forward")?;
+    let start64: Vec<f64> = start.iter().map(|&value| f32_to_f64_exact(value)).collect();
+    println!(
+        "initial ORT margin = {:.9e}",
+        property_margin(&spec, &seed, &start64)
+    );
+    let repair_start = std::time::Instant::now();
+    let deadline = repair_start
+        .checked_add(std::time::Duration::from_millis(budget_ms))
+        .context("active-set deadline overflow")?;
+    println!(
+        "active-set policy = {fd_mode:?}/{max_iters}{}",
+        if restart_one_sided {
+            "+best-one-sided-restart"
+        } else {
+            ""
+        }
+    );
+    let mut outcome = ort_active_set_repair_falsify(
+        &mut forward,
+        &spec,
+        &box_lo,
+        &box_hi,
+        &emit_pin,
+        &seed,
+        deadline,
+        fd_mode,
+        max_iters,
+    );
+    let restart_seed = outcome
+        .as_ref()
+        .filter(|outcome| outcome.violation.is_none())
+        .and_then(|outcome| outcome.best_guidance.as_ref())
+        .map(|(point, _)| point.clone());
+    if restart_one_sided {
+        if let Some(restart_seed) = restart_seed {
+            println!(
+                "active-set best-point one-sided restart ({restart_iters} iteration cap, \
+                 {:.6}s remaining)",
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f64()
+            );
+            if let Some(restarted) = ort_active_set_repair_falsify(
+                &mut forward,
+                &spec,
+                &box_lo,
+                &box_hi,
+                &emit_pin,
+                &restart_seed,
+                deadline,
+                OrtActiveSetFdMode::OneSided,
+                restart_iters,
+            ) {
+                let previous_best = outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.best_guidance.as_ref())
+                    .map_or(f64::NEG_INFINITY, |(_, margin)| *margin);
+                let restarted_best = restarted
+                    .best_guidance
+                    .as_ref()
+                    .map_or(f64::NEG_INFINITY, |(_, margin)| *margin);
+                if restarted.violation.is_some() || restarted_best > previous_best {
+                    outcome = Some(restarted);
+                }
+            }
+        }
+    }
+    println!(
+        "active-set repair elapsed = {:.6}s",
+        repair_start.elapsed().as_secs_f64()
+    );
+    if let Some(point) = outcome
+        .as_ref()
+        .and_then(|outcome| outcome.violation.as_ref())
+    {
+        let output = forward.run(point).context("run repaired ORT forward")?;
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        println!(
+            "repaired ORT margin = {:.9e}",
+            property_margin(&spec, point, &output64)
+        );
+        if let Some(oracle) = F64MarginOracle::load(onnx, box_lo.len()) {
+            let emit_point = refine_emit_view(point, &emit_pin);
+            println!(
+                "repaired true-f64 point/worst margins = {:.9e} / {:.9e}",
+                oracle
+                    .point_margin_f64(&spec, &emit_point)
+                    .unwrap_or(f64::NAN),
+                oracle.worst_margin(&spec, point).unwrap_or(f64::NAN)
+            );
+        }
+    } else if let Some((point, tracked_margin)) = outcome
+        .as_ref()
+        .and_then(|outcome| outcome.best_guidance.as_ref())
+    {
+        let output = forward.run(point).context("run guidance ORT forward")?;
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        println!(
+            "best guidance ORT margin = {:.9e} (tracked {:.9e})",
+            property_margin(&spec, point, &output64),
+            tracked_margin
+        );
+    } else {
+        println!("no repair or improved guidance");
+    }
+    Ok(())
+}
+
+fn run_equality_seek_research(onnx: &Path, vnnlib: &Path, budget_secs: u64) -> Result<()> {
+    anyhow::ensure!(onnx.is_file(), "missing ONNX file {}", onnx.display());
+    anyhow::ensure!(
+        vnnlib.is_file(),
+        "missing VNN-LIB file {}",
+        vnnlib.display()
+    );
+    let spec = ny_onnx::vnnlib::load_vnnlib(vnnlib)
+        .with_context(|| format!("load VNN-LIB {}", vnnlib.display()))?;
+    let (box_lo, box_hi, emit_pin) =
+        build_search_box(&spec).context("property has no supported search box")?;
+    let mut forward = ny_onnx::diff::OrtForward::from_path(onnx, box_lo.len())
+        .with_context(|| format!("load ORT model {}", onnx.display()))?;
+    let (violation, best) = equality_seek_falsify(
+        onnx,
+        &mut forward,
+        &spec,
+        &box_lo,
+        &box_hi,
+        &emit_pin,
+        None,
+        std::time::Duration::from_secs(budget_secs),
+    );
+    if let Some(point) = &violation {
+        let output = forward.run(point).context("run violating ORT forward")?;
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        println!(
+            "VIOLATION FOUND; ORT margin = {:.6e}",
+            property_margin(&spec, point, &output64)
+        );
+    } else if let Some(point) = &best {
+        let output = forward.run(point).context("run best-point ORT forward")?;
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        println!(
+            "no violation; best point ORT min-margin = {:.6e}",
+            property_margin(&spec, point, &output64)
+        );
+    } else {
+        println!("no violation or guidance point");
+    }
+    Ok(())
 }
 
 /// Solve the small dense symmetric-positive-definite system `M w = rhs`
@@ -6100,14 +10072,14 @@ impl F64MarginOracle {
     fn worst_margin(&self, spec: &ny_onnx::vnnlib::VnnLibSpec, x: &[f32]) -> Option<f64> {
         let point = ArrayD::from_shape_vec(IxDyn(&self.input_shape), x.to_vec())
             .ok()?
-            .mapv(f64::from);
+            .mapv(f32_to_f64_exact);
         let out = self
             .net
             .propagate_ibp_f64_cell(&ny_propagate::Interval64::point(point))
             .ok()?;
         let out_lo: Vec<f64> = out.lower.iter().copied().collect();
         let out_hi: Vec<f64> = out.upper.iter().copied().collect();
-        let input_f64: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+        let input_f64: Vec<f64> = x.iter().map(|&v| f32_to_f64_exact(v)).collect();
         Some(property_margin_f64_worst(
             spec, &input_f64, &out_lo, &out_hi,
         ))
@@ -6175,7 +10147,7 @@ fn ulp_jitter_falsify(
      -> Option<(f64, bool)> {
         *evals += 1;
         let out = forward.run(x).ok()?;
-        let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+        let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
         let violated = property_violated_f64(spec, &refine_emit_view(x, emit_pin), &out64);
         Some((property_margin(spec, x, &out64), violated))
     };
@@ -6410,8 +10382,8 @@ impl JitterOutcome {
 /// #moat-leak-cora-mnist-set (2026-07-09): true-f64 re-validation of an
 /// ORT-f32-confirmed `sat` witness.
 ///
-/// The trusted-oracle gate confirms via ONNX Runtime in **f32** (then casts f32
-/// outputs to f64). A witness sitting a few f32-ULPs inside the box at a
+/// The trusted-oracle gate confirms via ONNX Runtime in **f32** (then decodes
+/// those f32 output bits exactly as f64). A witness sitting a few f32-ULPs inside the box at a
 /// robustness BOUNDARY (cora `mnist-set`/img0,img20 — unsat but on the knife's
 /// edge) can therefore pass as `sat` while the true real-valued property HOLDS: a
 /// false counterexample the organizer rejects (`-150`, a 0-wrong-moat break).
@@ -6466,14 +10438,14 @@ fn snap_witness_to_declared(spec: &ny_onnx::vnnlib::VnnLibSpec, witness: &str) -
         .iter()
         .zip(spec.input_bounds.iter())
         .map(|(&v, &(lo, hi))| {
-            if lo.is_finite() && within_ulps(v, lo as f32, 4) && (v as f64) != lo {
+            if lo.is_finite() && within_ulps(v, lo as f32, 4) && f32_to_f64_exact(v) != lo {
                 snapped = true;
                 lo
-            } else if hi.is_finite() && within_ulps(v, hi as f32, 4) && (v as f64) != hi {
+            } else if hi.is_finite() && within_ulps(v, hi as f32, 4) && f32_to_f64_exact(v) != hi {
                 snapped = true;
                 hi
             } else {
-                v as f64
+                f32_to_f64_exact(v)
             }
         })
         .collect();
@@ -6529,7 +10501,7 @@ fn deepen_accepted_witness(
     }
     let mut forward = ny_onnx::diff::OrtForward::from_path(onnx, box_lo.len()).ok()?;
     let out = forward.run(&seed).ok()?;
-    let out64: Vec<f64> = out.iter().map(|&v| f64::from(v)).collect();
+    let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
     let accepted_margin = property_margin(spec, &seed, &out64);
     if accepted_margin >= target {
         return None; // already robust — nothing to strengthen
@@ -6601,6 +10573,25 @@ fn f64_forward_rejects_witness(
         // documented contract ("downgrade ONLY on a definite f64 not-violated").
         let out_lo: Vec<f64> = out.lower.iter().copied().collect();
         let out_hi: Vec<f64> = out.upper.iter().copied().collect();
+        // Verdict-NEUTRAL certification report (#sat-relu-zero-margin). The
+        // downgrade decision below is unchanged; this only records when the
+        // enclosure is strong enough that EVERY output vector it admits
+        // violates — the CE-certificate primitive, and the answer W0.2 recorded
+        // as a permanent NO on sat_relu before the f64 cell walk gained its
+        // integer-exactness path.
+        if property_violation_certain_f64(spec, &input_f64, &out_lo, &out_hi) {
+            eprintln!(
+                "True-f64 gate: enclosure CERTIFIES the violation (margin_worst {:+.6e}, \
+                 max enclosure width {:.3e}) — every conforming implementation the \
+                 enclosure covers violates",
+                property_margin_f64_worst(spec, &input_f64, &out_lo, &out_hi),
+                out_lo
+                    .iter()
+                    .zip(out_hi.iter())
+                    .map(|(l, h)| h - l)
+                    .fold(0.0f64, f64::max),
+            );
+        }
         Some(!property_violation_possible_f64(
             spec, &input_f64, &out_lo, &out_hi,
         ))
@@ -6664,7 +10655,12 @@ fn gate_sat_with_trusted_oracle(
     let snapped_witness_passes = |w: &str| -> Option<String> {
         let spec = spec_f64.as_ref()?;
         let snapped = snap_witness_to_declared(spec, w)?;
-        let text = format_smtlib_witness_f64(&snapped, &[]);
+        // Snapping changes the emitted input decimals. Re-run the ORIGINAL
+        // model at that exact input view before publication; an input-only
+        // witness would otherwise erase a traffic peel's repaired `Y_j`
+        // coordinates when `uphold_sat` keeps the snapped candidate unchanged.
+        let input_only = format_smtlib_witness_f64(&snapped, &[]);
+        let text = rehydrate_original_witness_outputs(onnx, &input_only).ok()?;
         (confirm_violation_with_ort(onnx, vnnlib, Some(&text)).unwrap_or(false) && f64_keeps(&text))
             .then_some(text)
     };
@@ -6894,6 +10890,72 @@ fn build_search_box(
 // (ORT re-confirm + true-f64 re-check). A stronger search can only surface a REAL
 // in-box violation; it can never manufacture a false `sat`.
 
+/// Is `onnx` a binarized (BNN) net — i.e. does it contain a `Sign` node?
+///
+/// Memoized per path exactly like [`net_supports_attack_gradients`], so the
+/// probe's ONNX load is paid once per process. Fails CLOSED (`false` ⇒ the
+/// historical non-BNN policy) on any load error, so a probe failure can never
+/// change behaviour on a net we cannot classify.
+///
+/// This is the scoping predicate for the BNN attack-budget policy below. It is
+/// NON-certified: it selects how much wall-clock the ATTACK lane may use.
+/// Acceptance is always the unchanged `gate_sat_with_trusted_oracle`.
+fn net_is_sign_network(onnx: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // A poisoned mutex must not change the policy: fall back to the non-BNN path.
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if let Some(&hit) = guard.get(onnx) {
+        return hit;
+    }
+    let is_sign = load_graph_network(onnx).is_ok_and(|graph| graph.has_sign_layer());
+    guard.insert(onnx.to_path_buf(), is_sign);
+    is_sign
+}
+
+/// Fraction of the scored instance budget the upfront attack may take ON A
+/// BINARIZED (Sign) NET, and its wall cap.
+///
+/// #bnn-attack-budget. On a `Sign` net the ordinary 8 s / 4 s caps are exactly
+/// backwards. `Sign` is piecewise constant, so BaB makes no progress — before
+/// the surrogate-gradient attack existed ny scored **0/45** on
+/// `traffic_signs_recognition_2023`, every instance a timeout. Every point on
+/// such a benchmark comes from falsification, so time ceded to BaB is time
+/// thrown away.
+///
+/// The hard-tail instances need a LOT of attack steps: the external
+/// `bnn_falsifier` prototype cracks net-2 `idx_10645_eps_1` only at iteration
+/// ~101 of a β 2→20 ramp, and in ny each step costs a full smooth-Sign forward.
+/// Measured on that instance at a 240 s budget: with the historical 4 s
+/// disjunction cap the lane got **9 gradient steps** and timed out; with a
+/// 150 s cap it reached **325 steps across 3 restarts and emitted a sound `sat`**
+/// (ORT-confirmed, independently re-validated strictly in-box).
+///
+/// So on a Sign net take half the remaining budget, capped at 240 s. Overridable
+/// with `NY_BNN_ATTACK_FRAC` / `NY_BNN_ATTACK_CAP`. NON-certified: this only
+/// decides how long a NON-certified ascent runs; every candidate it produces is
+/// still checked by the UNCHANGED trusted-oracle gate.
+fn bnn_attack_budget_fraction() -> f64 {
+    std::env::var("NY_BNN_ATTACK_FRAC")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|f| *f > 0.0 && *f <= 1.0)
+        .unwrap_or(0.5)
+}
+
+fn bnn_attack_wall_cap() -> std::time::Duration {
+    let secs = std::env::var("NY_BNN_ATTACK_CAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(240);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Hard wall-clock cap for the upfront attack (a good APGD finds a nearby
 /// robustness CE in seconds; beyond this, cede the budget to BaB).
 ///
@@ -6913,10 +10975,11 @@ fn upfront_attack_wall_cap() -> std::time::Duration {
 }
 
 /// Wall cap for the DEFAULT (auto) multi-clause-disjunction falsification lane —
-/// tighter than the force-on cap so an UNSAT robustness disjunction surrenders only
-/// a few seconds to the attack before its BaB proof. Gradient-findable CEs land in
-/// <1s (~6 exact steps from the clean image), so 4s comfortably catches them while
-/// bounding the steal from BaB on the unsat instances that share the category.
+/// tighter than the force-on or typed relational cap so an UNSAT robustness
+/// disjunction surrenders only a few seconds to the attack before its BaB proof.
+/// Gradient-findable CEs land in <1s (~6 exact steps from the clean image), so
+/// 4s comfortably catches them while bounding the steal from BaB on the unsat
+/// instances that share the category.
 /// Overridable with `NY_UPFRONT_ATTACK_AUTO_CAP` (whole seconds).
 fn auto_disjunction_attack_wall_cap() -> std::time::Duration {
     let secs = std::env::var("NY_UPFRONT_ATTACK_AUTO_CAP")
@@ -6942,6 +11005,82 @@ const UPFRONT_ATTACK_SAFETY_MARGIN: std::time::Duration = std::time::Duration::f
 /// Below this the upfront attack is not worth starting.
 const UPFRONT_ATTACK_MIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(800);
 
+/// Maximum input dimension for the typed relational-conjunction route.
+///
+/// ACAS Xu has five inputs. Keeping this structural ceiling here prevents a
+/// category-level opt-in from turning the outer attack into a blanket lane for
+/// image-sized conjunctions.
+const UPFRONT_RELATIONAL_MAX_INPUT_DIMS: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpfrontAttackAdmission {
+    Forced,
+    AutoDisjunction,
+    PresetRelationalConjunction,
+}
+
+/// Narrow structural predicate for the typed ACAS prop_2 route.
+///
+/// After normalizing `Y_i >= Y_j` to `Y_j <= Y_i`, every comparison must share
+/// one right-hand reference output. This admits ACAS prop_2's
+/// `Y_1..Y_4 <= Y_0` unsafe conjunction without charging the same bounded attack
+/// to the mirror-shaped prop_3/prop_4 conjunctions (`Y_0 <= Y_1..Y_4`), which
+/// are already fully solved by the proof path.
+///
+/// Constant thresholds, an `or` around one conjunction, dual-network
+/// properties, and input dimensions above the ACAS-sized ceiling remain
+/// ineligible.
+fn is_low_dim_common_rhs_relational_conjunction(spec: &ny_onnx::vnnlib::VnnLibSpec) -> bool {
+    use ny_onnx::vnnlib::OutputConstraint as OC;
+
+    if spec.is_disjunction
+        || spec.dual_network.is_some()
+        || spec.num_inputs == 0
+        || spec.num_inputs != spec.input_bounds.len()
+        || spec.num_inputs > UPFRONT_RELATIONAL_MAX_INPUT_DIMS
+        || spec.output_constraint_clauses.len() != 1
+    {
+        return false;
+    }
+    let clause = &spec.output_constraint_clauses[0];
+    let normalized_pair = |constraint: &OC| match constraint {
+        OC::LessEq(lhs, rhs) | OC::LessThan(lhs, rhs) => Some((*lhs, *rhs)),
+        OC::GreaterEq(lhs, rhs) | OC::GreaterThan(lhs, rhs) => Some((*rhs, *lhs)),
+        _ => None,
+    };
+    let Some((first_lhs, common_rhs)) = clause.first().and_then(normalized_pair) else {
+        return false;
+    };
+    clause.len() >= 2
+        && first_lhs != common_rhs
+        && clause.iter().all(|constraint| {
+            normalized_pair(constraint).is_some_and(|(lhs, rhs)| lhs != rhs && rhs == common_rhs)
+        })
+}
+
+/// Select why a parsed property may enter the outer exact-gradient lane.
+///
+/// Keeping the reason typed matters for scheduling: existing automatic
+/// multi-clause disjunctions retain their tighter wall cap even in a preset
+/// that also opts into relational conjunctions.
+fn upfront_attack_admission(
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    wrapper_route: UpfrontWrapperRoute,
+) -> Option<UpfrontAttackAdmission> {
+    if !wrapper_route.attack_enabled() {
+        return None;
+    }
+    if wrapper_route.forced() {
+        return Some(UpfrontAttackAdmission::Forced);
+    }
+    if spec.is_disjunction && spec.output_constraint_clauses.len() > 1 {
+        return Some(UpfrontAttackAdmission::AutoDisjunction);
+    }
+    (wrapper_route.preset_relational_conjunction()
+        && is_low_dim_common_rhs_relational_conjunction(spec))
+    .then_some(UpfrontAttackAdmission::PresetRelationalConjunction)
+}
+
 /// Compute the upfront-attack wall budget from the remaining scored budget.
 fn upfront_attack_budget(remaining: Option<std::time::Duration>) -> Option<std::time::Duration> {
     let budget = match remaining {
@@ -6963,6 +11102,244 @@ const UPFRONT_CORNER_MAX_VARIABLE_DIMS: usize = 5;
 /// Maximum total number of f32 coordinates materialized across every corner.
 /// This bounds the corner payload to 4 MiB even for huge, mostly-pinned boxes.
 const UPFRONT_CORNER_MAX_TOTAL_SCALARS: usize = 1_048_576;
+
+/// Coarse and local grids for the typed low-dimensional relational lane.
+///
+/// For the largest admitted domain (five dimensions), enumerating every face
+/// with exactly two free coordinates costs
+/// `C(5,2) * 2^3 * 11^2 = 9,680` trusted forwards. Refining the best eight
+/// faces costs at most another `8 * 31^2 = 7,688`, for a hard total below 18k.
+/// The absolute attack deadline remains the primary wall bound.
+const RELATIONAL_FACE_COARSE_TICKS: usize = 11;
+const RELATIONAL_FACE_REFINE_TICKS: usize = 31;
+const RELATIONAL_FACE_REFINE_TOP_K: usize = 8;
+const RELATIONAL_FACE_MAX_EVALS: usize = 18_000;
+
+#[derive(Debug)]
+struct RelationalFaceBest {
+    point: Vec<f32>,
+    free_dims: Vec<usize>,
+    margin: f64,
+    violated: bool,
+}
+
+fn face_grid_value(lower: f32, upper: f32, index: usize, ticks: usize) -> f32 {
+    debug_assert!(ticks >= 2);
+    match index {
+        0 => lower,
+        i if i + 1 == ticks => upper,
+        i => lower + (upper - lower) * (i as f32 / (ticks - 1) as f32),
+    }
+}
+
+/// Deterministic face-grid candidate generation for a low-dimensional
+/// relational conjunction.
+///
+/// A conjunction optimum can live on several input faces while retaining one
+/// or two genuinely free coordinates. Full-box random/APGD restarts almost
+/// never start on that lower-dimensional manifold, and corner-only enumeration
+/// misses its interior. Enumerate every face with two free axes (one for a
+/// one-dimensional domain), rank them by the exact parsed property margin, then
+/// refine a bounded number locally around their coarse incumbents.
+///
+/// Candidate authority is unchanged: every evaluation uses the trusted ORT
+/// forward at a point constructed inside `box_lo..=box_hi`, and a returned hit
+/// must satisfy [`property_violated_f64`]. The caller still sends the rendered
+/// witness through [`gate_sat_with_trusted_oracle`]. Any error, exhausted
+/// evaluation cap, or absolute deadline expiry returns only an already
+/// ORT-confirmed hit, otherwise `None`.
+fn low_dim_relational_face_grid_falsify(
+    forward: &mut ny_onnx::diff::OrtForward,
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    box_lo: &[f32],
+    box_hi: &[f32],
+    emit_pin: &[Option<f64>],
+    deadline: std::time::Instant,
+) -> Option<Vec<f32>> {
+    if !is_low_dim_common_rhs_relational_conjunction(spec)
+        || box_lo.len() != box_hi.len()
+        || box_lo.len() != emit_pin.len()
+        || box_lo.is_empty()
+        || box_lo.len() > UPFRONT_RELATIONAL_MAX_INPUT_DIMS
+        || box_lo
+            .iter()
+            .zip(box_hi)
+            .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+    {
+        return None;
+    }
+
+    let dimensions = box_lo.len();
+    let free_sets: Vec<Vec<usize>> = if dimensions == 1 {
+        vec![vec![0]]
+    } else {
+        (0..dimensions)
+            .flat_map(|first| ((first + 1)..dimensions).map(move |second| vec![first, second]))
+            .collect()
+    };
+    let center: Vec<f32> = box_lo
+        .iter()
+        .zip(box_hi)
+        .map(|(&lower, &upper)| lower + 0.5 * (upper - lower))
+        .collect();
+    let mut evaluations = 0usize;
+    let mut confirmed_hit: Option<(Vec<f32>, f64)> = None;
+    let mut evaluate = |point: &[f32]| -> Option<(f64, bool)> {
+        if evaluations >= RELATIONAL_FACE_MAX_EVALS || std::time::Instant::now() >= deadline {
+            return None;
+        }
+        evaluations += 1;
+        let output = forward.run(point).ok()?;
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        let emitted = refine_emit_view(point, emit_pin);
+        Some((
+            property_margin(spec, point, &output64),
+            property_violated_f64(spec, &emitted, &output64),
+        ))
+    };
+
+    let mut faces = Vec::new();
+    for free_dims in free_sets {
+        let fixed_dims: Vec<usize> = (0..dimensions)
+            .filter(|dimension| !free_dims.contains(dimension))
+            .collect();
+        let fixed_assignments = 1usize << fixed_dims.len();
+        for sides in 0..fixed_assignments {
+            let mut base = center.clone();
+            for (bit, &dimension) in fixed_dims.iter().enumerate() {
+                base[dimension] = if sides & (1usize << bit) == 0 {
+                    box_lo[dimension]
+                } else {
+                    box_hi[dimension]
+                };
+            }
+
+            let second_ticks = if free_dims.len() == 2 {
+                RELATIONAL_FACE_COARSE_TICKS
+            } else {
+                1
+            };
+            let mut face_best: Option<RelationalFaceBest> = None;
+            for first_index in 0..RELATIONAL_FACE_COARSE_TICKS {
+                for second_index in 0..second_ticks {
+                    let mut point = base.clone();
+                    point[free_dims[0]] = face_grid_value(
+                        box_lo[free_dims[0]],
+                        box_hi[free_dims[0]],
+                        first_index,
+                        RELATIONAL_FACE_COARSE_TICKS,
+                    );
+                    if free_dims.len() == 2 {
+                        point[free_dims[1]] = face_grid_value(
+                            box_lo[free_dims[1]],
+                            box_hi[free_dims[1]],
+                            second_index,
+                            RELATIONAL_FACE_COARSE_TICKS,
+                        );
+                    }
+                    let Some((margin, violated)) = evaluate(&point) else {
+                        return confirmed_hit.map(|(point, _)| point);
+                    };
+                    if violated
+                        && confirmed_hit
+                            .as_ref()
+                            .is_none_or(|(_, incumbent)| margin > *incumbent)
+                    {
+                        confirmed_hit = Some((point.clone(), margin));
+                    }
+                    if margin.is_finite()
+                        && face_best
+                            .as_ref()
+                            .is_none_or(|incumbent| margin > incumbent.margin)
+                    {
+                        face_best = Some(RelationalFaceBest {
+                            point,
+                            free_dims: free_dims.clone(),
+                            margin,
+                            violated,
+                        });
+                    }
+                }
+            }
+            if let Some(best) = face_best {
+                if best.violated {
+                    return Some(best.point);
+                }
+                faces.push(best);
+            }
+        }
+    }
+
+    faces.sort_by(|left, right| {
+        right
+            .margin
+            .partial_cmp(&left.margin)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for face in faces.into_iter().take(RELATIONAL_FACE_REFINE_TOP_K) {
+        let local_bounds: Vec<(f32, f32)> = face
+            .free_dims
+            .iter()
+            .map(|&dimension| {
+                let coarse_step = (box_hi[dimension] - box_lo[dimension])
+                    / (RELATIONAL_FACE_COARSE_TICKS - 1) as f32;
+                (
+                    (face.point[dimension] - coarse_step).max(box_lo[dimension]),
+                    (face.point[dimension] + coarse_step).min(box_hi[dimension]),
+                )
+            })
+            .collect();
+        let second_ticks = if face.free_dims.len() == 2 {
+            RELATIONAL_FACE_REFINE_TICKS
+        } else {
+            1
+        };
+        let mut local_hit: Option<(Vec<f32>, f64)> = None;
+        for first_index in 0..RELATIONAL_FACE_REFINE_TICKS {
+            for second_index in 0..second_ticks {
+                let mut point = face.point.clone();
+                point[face.free_dims[0]] = face_grid_value(
+                    local_bounds[0].0,
+                    local_bounds[0].1,
+                    first_index,
+                    RELATIONAL_FACE_REFINE_TICKS,
+                );
+                if face.free_dims.len() == 2 {
+                    point[face.free_dims[1]] = face_grid_value(
+                        local_bounds[1].0,
+                        local_bounds[1].1,
+                        second_index,
+                        RELATIONAL_FACE_REFINE_TICKS,
+                    );
+                }
+                let Some((margin, violated)) = evaluate(&point) else {
+                    return local_hit.or(confirmed_hit).map(|(point, _)| point);
+                };
+                if violated
+                    && local_hit
+                        .as_ref()
+                        .is_none_or(|(_, incumbent)| margin > *incumbent)
+                {
+                    local_hit = Some((point, margin));
+                }
+            }
+        }
+        if let Some((point, margin)) = local_hit {
+            println!(
+                "Upfront attack: trusted-ORT relational face grid found a violation \
+                 after {evaluations} evaluations (margin {margin:.3e})"
+            );
+            return Some(point);
+        }
+    }
+    confirmed_hit.map(|(point, _)| point)
+}
 
 /// Deterministic box-corner seeds for a very low-dimensional attack domain.
 ///
@@ -7028,11 +11405,255 @@ fn low_dim_ort_corner_falsify(
             return None;
         }
         let output = forward.run(&point).ok()?;
-        let output64: Vec<f64> = output.iter().map(|&v| f64::from(v)).collect();
-        if property_violated_f64(spec, &refine_emit_view(&point, emit_pin), &output64) {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let output64: Vec<f64> = output.iter().map(|&v| f32_to_f64_exact(v)).collect();
+        if property_violated_f64(spec, &refine_emit_view(&point, emit_pin), &output64)
+            && std::time::Instant::now() < deadline
+        {
             return Some(point);
         }
     }
+    None
+}
+
+/// A one-load receipt for the traffic upfront logit experiment.
+///
+/// The graph is intentionally the ORIGINAL, unpeeled graph: its attack VJP
+/// already treats terminal Softmax as an attack-only identity and its
+/// `attack_pre_softmax_logits` method exposes the corresponding logits.  The
+/// rewritten spec can exist only after the exact joint model/property peel
+/// succeeds on the same loaded [`ny_onnx::OnnxModel`].  This type is
+/// deliberately not `Clone`, avoiding accidental whole-object cloning; this
+/// path retains exactly one graph.
+struct QualifiedTrafficSoftmaxAttackObjective {
+    graph: GraphNetwork,
+    rewritten_spec: ny_onnx::vnnlib::VnnLibSpec,
+    receipt: AppliedTerminalPeel,
+}
+
+/// Build the one-graph traffic objective without retaining the source model.
+///
+/// Convert before peeling so the retained graph remains the original graph,
+/// then authenticate the rewritten clone using that SAME `OnnxModel`.  A
+/// second model load or graph conversion here would create both a provenance
+/// gap and an avoidable peak-memory hazard.
+fn qualify_traffic_upfront_softmax_objective(
+    onnx: &Path,
+    original_spec: &ny_onnx::vnnlib::VnnLibSpec,
+    deadline: Option<std::time::Instant>,
+) -> std::result::Result<QualifiedTrafficSoftmaxAttackObjective, String> {
+    let expired = || deadline.is_some_and(|limit| std::time::Instant::now() >= limit);
+    if expired() {
+        return Err("deadline expired before model load".to_string());
+    }
+
+    let load_config = OnnxLoadConfig::default()
+        .with_shape_infer_backend(crate::commands::cli_shape_infer_backend());
+    let model_bytes =
+        read_onnx_bytes_maybe_gzip(onnx).map_err(|error| format!("model read failed: {error}"))?;
+    let model_name = onnx
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("traffic-model");
+    let options = GraphNetworkOptions {
+        compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
+        ..GraphNetworkOptions::default()
+    };
+    let mut rewritten_spec = original_spec.clone();
+    let (graph, report) = ny_onnx::load_and_peel_terminal_softmax_single_group_with_original_graph(
+        model_name,
+        &model_bytes,
+        &load_config,
+        options,
+        &mut rewritten_spec,
+    )
+    .map_err(|error| format!("model load/qualification failed: {error}"))?;
+    let receipt = AppliedTerminalPeel::from_report(&report)
+        .map_err(|error| format!("malformed terminal-peel receipt: {error}"))?;
+    if receipt != AppliedTerminalPeel::Softmax || report.reason.is_some() {
+        return Err(report
+            .reason
+            .unwrap_or_else(|| "exact terminal Softmax was not applied".to_string()));
+    }
+    if expired() {
+        return Err("deadline expired after exact terminal-Softmax qualification".to_string());
+    }
+
+    // Make the intended peak-live boundary explicit: ORT is constructed only
+    // after this helper returns, when the source model has been released.
+    Ok(QualifiedTrafficSoftmaxAttackObjective {
+        graph,
+        rewritten_spec,
+        receipt,
+    })
+}
+
+/// Lazy request gate for the heavyweight one-load qualification. Keeping the
+/// closure unevaluated on the dark arm is both the default-path compatibility
+/// contract and the memory contract.
+fn traffic_upfront_objective_if_requested<T>(
+    requested: bool,
+    qualify: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<Option<T>, String> {
+    if requested {
+        qualify().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+const TRAFFIC_UPFRONT_LOGIT_DLR_STEPS: usize = 4;
+const TRAFFIC_UPFRONT_LOGIT_WIDTH: usize = 43;
+
+/// Exact-width finite logit-DLR row for the authenticated micro-leg.
+/// `None` invalidates the treatment; callers must reset to the historical
+/// center rather than mixing coordinate systems in one trajectory.
+fn traffic_upfront_logit_dlr_row(
+    rewritten_spec: &ny_onnx::vnnlib::VnnLibSpec,
+    input: &[f32],
+    logits: &[f64],
+) -> Option<Vec<f32>> {
+    if logits.len() != TRAFFIC_UPFRONT_LOGIT_WIDTH || logits.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    let margin = property_margin(rewritten_spec, input, logits);
+    if !margin.is_finite() {
+        return None;
+    }
+    let raw = margin_subgradient_row(rewritten_spec, input, logits, None)?;
+    if raw.len() != TRAFFIC_UPFRONT_LOGIT_WIDTH || raw.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let row = dlr_grad_row(&raw, margin, logits);
+    (row.len() == TRAFFIC_UPFRONT_LOGIT_WIDTH && row.iter().all(|value| value.is_finite()))
+        .then_some(row)
+}
+
+/// The only candidate-acceptance predicate inside the traffic micro-leg.
+/// Callers supply outputs from the ORIGINAL ONNX Runtime session and the
+/// ORIGINAL parsed property; rewritten logits cannot enter this boundary.
+fn traffic_upfront_original_candidate_violates(
+    original_spec: &ny_onnx::vnnlib::VnnLibSpec,
+    input: &[f64],
+    original_outputs: &[f64],
+) -> bool {
+    property_violated_f64(original_spec, input, original_outputs)
+}
+
+// --- Dark sign-space falsification lane (#bnn-sign-space). ----------------
+
+/// The CALL-SITE rule for the sign-space lane, factored out so it can be tested
+/// without a scored run.
+///
+/// This is the whole of the lane's verdict authority, and it is deliberately
+/// tiny:
+///
+/// * no witness (lane disarmed, refused, exhausted, out of budget, or the
+///   graph/property is outside the admitted fragment) => `None`. The `gate`
+///   closure is NEVER invoked, so no new `sat` source exists on that arm and
+///   the caller proceeds down the normal verification path EXACTLY as it would
+///   have with the lane absent;
+/// * a witness that the gate DOWNGRADES => `None`, and the caller falls through
+///   the same way (`#upfront-gate-fallthrough`: forfeiting the instance on a
+///   rejected candidate would cost the sound verifier its whole budget);
+/// * a witness the gate UPHOLDS as `sat` => `Some(sat)`, which is the only way
+///   this lane can terminate an instance.
+///
+/// There is no arm that can produce `unsat`, and none that can produce a `sat`
+/// without the caller's UNCHANGED [`gate_sat_with_trusted_oracle`] having
+/// confirmed it against the ORIGINAL model.
+fn sign_space_lane_verdict(
+    witness: Option<String>,
+    gate: impl FnOnce(&str) -> VnncompResult,
+) -> Option<VnncompResult> {
+    let witness = witness?;
+    let gated = gate(&witness);
+    if matches!(gated, VnncompResult::Sat { .. }) {
+        return Some(gated);
+    }
+    crate::flight::note(
+        "bnn_sign_space",
+        crate::flight::FlightStatus::Ran,
+        Some("candidate rejected by the trusted-oracle gate; fell through".to_string()),
+    );
+    eprintln!(
+        "Sign-space falsification: candidate rejected by the trusted-oracle gate; falling \
+         through to the full verification path (verdict-neutral lane)"
+    );
+    None
+}
+
+/// Consult the dark LP-guided sign-space falsifier and render any candidate as
+/// an ORIGINAL-MODEL SMT-LIB witness for the caller's trusted-oracle gate.
+///
+/// Returns `None` for every non-candidate outcome, including the default
+/// disarmed one. The candidate's `Y_j` values are supplied by
+/// [`rehydrate_original_witness_outputs`] — a real ONNX Runtime forward on the
+/// ORIGINAL graph — so the search's own integer logits never appear in a
+/// published witness; if that re-forward fails, the candidate is dropped rather
+/// than emitted on internal arithmetic.
+#[cfg(feature = "mip")]
+fn try_sign_space_falsify(
+    onnx: &Path,
+    vnnlib: &Path,
+    instance_deadline: Option<std::time::Instant>,
+    preset_armed: Option<bool>,
+) -> Option<String> {
+    use super::beta_crown::sign_space_falsify::{run_sign_space_lane, SignSpaceLaneOutcome};
+
+    let remaining = instance_deadline
+        .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+    let started = std::time::Instant::now();
+    let outcome = run_sign_space_lane(onnx, vnnlib, remaining, preset_armed);
+    if matches!(outcome, SignSpaceLaneOutcome::Disarmed) {
+        // Unarmed arm: no receipt entry, no stderr, no behaviour.
+        return None;
+    }
+    // The elapsed time is on the REFUSAL lines too, on purpose. Armed, this
+    // lane spends scored budget before every other family's attack, and a
+    // structural decline is only "free" if it is measured to be: this is the
+    // number that decides whether the key can widen beyond the category where
+    // it is validated (`preset::AttackPreset::bnn_sign_space`).
+    eprintln!(
+        "Sign-space falsification: {} [{:.2}s]",
+        outcome.describe(),
+        started.elapsed().as_secs_f64()
+    );
+    let input = outcome.candidate_input()?;
+    // Input-only witness first: the organizer parses these decimals AS WRITTEN,
+    // and the outputs must come from the ORIGINAL model, never from the search.
+    let input_only = format_smtlib_witness_f64(input, &[]);
+    match rehydrate_original_witness_outputs(onnx, &input_only) {
+        Ok(witness) => Some(witness),
+        Err(error) => {
+            crate::flight::note(
+                "bnn_sign_space",
+                crate::flight::FlightStatus::Ran,
+                Some(format!(
+                    "candidate dropped: original-model re-forward failed ({error})"
+                )),
+            );
+            eprintln!(
+                "Sign-space falsification: could not re-forward the candidate through the \
+                 ORIGINAL model ({error}); dropping it and continuing on the normal path"
+            );
+            None
+        }
+    }
+}
+
+/// Non-mip build: `ny-mip` is not linked, so the lane does not exist. Identical
+/// `None` contract, so the call site is unchanged.
+#[cfg(not(feature = "mip"))]
+fn try_sign_space_falsify(
+    _onnx: &Path,
+    _vnnlib: &Path,
+    _instance_deadline: Option<std::time::Instant>,
+    _preset_armed: Option<bool>,
+) -> Option<String> {
     None
 }
 
@@ -7045,6 +11666,9 @@ fn try_upfront_falsify(
     onnx: &Path,
     vnnlib: &Path,
     instance_deadline: Option<std::time::Instant>,
+    wrapper_route: UpfrontWrapperRoute,
+    traffic_terminal_softmax_peel: bool,
+    traffic_execution: &mut TrafficUpfrontSoftmaxExecution,
 ) -> Option<String> {
     // STRUCTURAL GATE (#upfront-apgd-disjunction, the REAL falsifier fix): the prior
     // default-OFF was because the lane's 8% budget was stolen from BaB on EVERY
@@ -7054,40 +11678,97 @@ fn try_upfront_falsify(
     // run the exact-gradient DLR-APGD lane by default ONLY on MULTI-CLAUSE DISJUNCTIONS
     // — the robustness `(or (Y_i >= Y_true) ...)` over wrong classes (cifar100 /
     // tinyimagenet). These are EXACTLY the gradient-findable sats the internal search
-    // MISSES: the graph upfront-PGD block is disjunction-skipped (verify_graph_relational
-    // gates it on `!is_disjunction || is_single_clause`), so a multi-clause disjunction
-    // gets NO upfront falsification and times out even when a CE sits ~6 gradient steps
-    // from the clean image (measured: cifar100 medium 1592_sidx_3741 — baseline TIMEOUT,
-    // this lane sat@1s). Single-clause / conjunctive instances (soundnessbench is a
-    // single-clause `(or (and ...))`) are EXCLUDED by construction, so their full BaB
-    // budget is preserved and they cannot regress. Soundness is unchanged either way:
-    // every witness is re-confirmed by the trusted-ORT gate downstream.
+    // MISSES: the graph upfront-PGD block is disjunction-skipped
+    // (verify_graph_relational gates it on `!is_disjunction || is_single_clause`),
+    // so a multi-clause disjunction gets NO upfront falsification and times out
+    // even when a CE sits ~6 gradient steps from the clean image (measured:
+    // cifar100 medium 1592_sidx_3741 — baseline TIMEOUT, this lane sat@1s).
+    // Single-clause / conjunctive instances remain EXCLUDED by default
+    // (soundnessbench is a single-clause `(or (and ...))`), preserving their
+    // full BaB budget. A typed category preset may additionally admit only the
+    // low-dimensional, top-level relational-conjunction shape; ACAS prop_2 is
+    // the motivating case. Soundness is unchanged either way: every witness is
+    // re-confirmed by the trusted-ORT gate downstream.
     //   NY_UPFRONT_ATTACK=0 → hard kill switch (never run).
     //   NY_UPFRONT_ATTACK=1 → force the lane on for ALL instances (the old opt-in).
-    let force = std::env::var("NY_UPFRONT_ATTACK").ok();
-    if force.as_deref() == Some("0") {
+    if !wrapper_route.attack_enabled() {
+        if traffic_terminal_softmax_peel {
+            *traffic_execution = TrafficUpfrontSoftmaxExecution::AttackDisabled;
+        }
         return None;
     }
+    // Freeze admission before any VNN-LIB/model/ORT setup. Every subsequent
+    // stage is charged to this one slice instead of rebasing a fresh duration.
+    let attack_start = std::time::Instant::now();
+    let remaining = instance_deadline.map(|d| d.saturating_duration_since(attack_start));
     let spec = ny_onnx::vnnlib::load_vnnlib(vnnlib).ok()?;
-    let is_multiclause_disjunction =
-        spec.is_disjunction && spec.output_constraint_clauses.len() > 1;
-    if force.as_deref() != Some("1") && !is_multiclause_disjunction {
+    if instance_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
         return None;
     }
-    let remaining =
-        instance_deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-    // Auto (disjunction) lane: cap the steal from BaB tighter than the force-on lane.
-    // Gradient-findable robustness CEs land in <1s (~6 exact steps from the clean
-    // image); an unsat multi-clause disjunction should surrender at most a few seconds
-    // to the attack before its BaB proof. The force-on path keeps the full 8% budget.
+    let admission = match upfront_attack_admission(&spec, wrapper_route) {
+        Some(admission) => admission,
+        None => {
+            if traffic_terminal_softmax_peel {
+                *traffic_execution = TrafficUpfrontSoftmaxExecution::AdmissionDeclined;
+            }
+            return None;
+        }
+    };
+    let traffic_objective =
+        match traffic_upfront_objective_if_requested(traffic_terminal_softmax_peel, || {
+            qualify_traffic_upfront_softmax_objective(onnx, &spec, instance_deadline)
+        }) {
+            Ok(Some(objective)) => {
+                *traffic_execution = TrafficUpfrontSoftmaxExecution::QualifiedNotRun;
+                Some(objective)
+            }
+            Ok(None) => None,
+            Err(reason) => {
+                if traffic_terminal_softmax_peel {
+                    *traffic_execution = TrafficUpfrontSoftmaxExecution::QualificationDeclined;
+                    eprintln!(
+                        "Traffic upfront logit objective declined fail-closed ({reason}); \
+                     continuing with the historical attack"
+                    );
+                }
+                None
+            }
+        };
+    // Auto (disjunction) lane: cap the steal from BaB tighter than the force-on
+    // and typed relational lanes. Gradient-findable robustness CEs land in <1s
+    // (~6 exact steps from the clean image); an unsat multi-clause disjunction
+    // should surrender at most a few seconds to the attack before its BaB proof.
+    // The force-on and typed relational paths keep the full 8% / 8-second cap.
+    //
+    // #bnn-attack-budget EXCEPTION: on a binarized (`Sign`) net that reasoning is
+    // inverted — BaB cannot progress through a piecewise-constant activation, so
+    // there is no BaB proof to protect and falsification is the only lane that can
+    // score. Take the much larger BNN budget instead (see `bnn_attack_budget_*`).
+    let sign_net = traffic_objective
+        .as_ref()
+        .map(|objective| objective.graph.has_sign_layer())
+        .unwrap_or_else(|| net_is_sign_network(onnx));
     let budget = {
         let b = upfront_attack_budget(remaining)?;
-        if force.as_deref() == Some("1") {
+        if sign_net {
+            match remaining {
+                Some(rem) => rem
+                    .saturating_sub(UPFRONT_ATTACK_SAFETY_MARGIN)
+                    .mul_f64(bnn_attack_budget_fraction())
+                    .min(bnn_attack_wall_cap())
+                    .max(b),
+                None => bnn_attack_wall_cap(),
+            }
+        } else if !matches!(admission, UpfrontAttackAdmission::AutoDisjunction) {
             b
         } else {
             b.min(auto_disjunction_attack_wall_cap())
         }
     };
+    let attack_deadline = bounded_work_deadline(attack_start, budget, instance_deadline)?;
+    if std::time::Instant::now() >= attack_deadline {
+        return None;
+    }
 
     let (box_lo, box_hi, emit_pin) = build_search_box(&spec)?;
 
@@ -7098,19 +11779,50 @@ fn try_upfront_falsify(
             return None;
         }
     };
+    if std::time::Instant::now() >= attack_deadline {
+        return None;
+    }
 
     println!(
         "Upfront attack: DLR-APGD falsification lane (budget {:.1}s, {} dims)",
         budget.as_secs_f64(),
         box_lo.len()
     );
+    // A low-dimensional relational conjunction can attain its optimum on a
+    // face interior: corners miss it, while full-box random/APGD restarts have
+    // probability zero of starting on the exact face. The typed preset route
+    // gets a bounded deterministic face-grid stage before APGD. It shares this
+    // SAME absolute attack deadline and every point is already checked by the
+    // trusted ORT/property predicate; the final gate below remains mandatory.
+    if matches!(
+        admission,
+        UpfrontAttackAdmission::PresetRelationalConjunction
+    ) {
+        if let Some(found) = low_dim_relational_face_grid_falsify(
+            &mut forward,
+            &spec,
+            &box_lo,
+            &box_hi,
+            &emit_pin,
+            attack_deadline,
+        ) {
+            if std::time::Instant::now() >= attack_deadline {
+                return None;
+            }
+            let output = forward.run(&found).ok()?;
+            if std::time::Instant::now() >= attack_deadline {
+                return None;
+            }
+            let found64 = refine_emit_view(&found, &emit_pin);
+            return Some(format_smtlib_witness_f64(&found64, &output));
+        }
+    }
     // cGAN/ACAS-style five-dimensional boxes often attain a scalar output-band
     // violation at a face corner.  The internal gradient follows ny's converted
     // graph while acceptance follows ORT, so conversion-level direction error can
     // make hundreds of restarts converge just short of a real witness.  Exhaust
     // the at-most-32 corners against ORT first; charge the work to the SAME
     // bounded upfront slice and leave all acceptance gates unchanged.
-    let attack_deadline = std::time::Instant::now().checked_add(budget)?;
     if let Some(found) = low_dim_ort_corner_falsify(
         &mut forward,
         &spec,
@@ -7120,9 +11832,16 @@ fn try_upfront_falsify(
         attack_deadline,
     ) {
         println!("Upfront attack: trusted-ORT low-dimensional corner found a violation");
+        if std::time::Instant::now() >= attack_deadline {
+            return None;
+        }
         let output = forward.run(&found).ok()?;
+        if std::time::Instant::now() >= attack_deadline {
+            return None;
+        }
         let found64 = refine_emit_view(&found, &emit_pin);
-        return Some(format_smtlib_witness_f64(&found64, &output));
+        let witness = format_smtlib_witness_f64(&found64, &output);
+        return (std::time::Instant::now() < attack_deadline).then_some(witness);
     }
     let remaining_budget = attack_deadline.saturating_duration_since(std::time::Instant::now());
     if remaining_budget.is_zero() {
@@ -7132,7 +11851,7 @@ fn try_upfront_falsify(
     // hill-climb is hopeless on these high-dimensional boxes — see its own docs).
     // Seed is None: restart 0 starts at the box center (= the clean image for a
     // symmetric L-inf robustness box), exactly where a nearby CE is reachable.
-    let found = gradient_guided_falsify(
+    let found = gradient_guided_falsify_with_traffic_objective(
         onnx,
         &mut forward,
         &spec,
@@ -7141,16 +11860,25 @@ fn try_upfront_falsify(
         &emit_pin,
         None,
         &[], // #bab-frontier seeds are post-BaB-lane only
-        instance_deadline,
+        Some(attack_deadline),
         Some(remaining_budget),
         false, // bounded upfront lane keeps the restart cap
+        traffic_objective,
+        traffic_execution,
     )?;
 
     // Render the witness in the emit view (pinned dims verbatim), Y recomputed with
     // the same trusted forward. The caller re-confirms via gate_sat_with_trusted_oracle.
+    if std::time::Instant::now() >= attack_deadline {
+        return None;
+    }
     let output = forward.run(&found).ok()?;
+    if std::time::Instant::now() >= attack_deadline {
+        return None;
+    }
     let found64 = refine_emit_view(&found, &emit_pin);
-    Some(format_smtlib_witness_f64(&found64, &output))
+    let witness = format_smtlib_witness_f64(&found64, &output);
+    (std::time::Instant::now() < attack_deadline).then_some(witness)
 }
 
 /// Build the trusted ORT forward and run a bounded ORT-guided local search for a
@@ -7256,11 +11984,11 @@ fn refine_witness_with_ort(
 
 /// The f64 witness view the refinement EMITS (and the organizer re-parses): pinned
 /// dims carry their exact declared f64 value; free dims carry the f32 search value
-/// widened to f64 (a lossless cast the organizer's parser reproduces).
+/// decoded exactly as f64 (the organizer's parser reproduces the same value).
 fn refine_emit_view(x: &[f32], emit_pin: &[Option<f64>]) -> Vec<f64> {
     x.iter()
         .zip(emit_pin)
-        .map(|(&v, pin)| pin.unwrap_or(v as f64))
+        .map(|(&v, pin)| pin.unwrap_or_else(|| f32_to_f64_exact(v)))
         .collect()
 }
 
@@ -7292,53 +12020,40 @@ fn clamp_finite_inward(v: f64, is_lower: bool) -> f32 {
     if !v.is_finite() {
         return clamp_finite(v);
     }
-    let f = v as f32;
     if is_lower {
-        // Smallest f32 that is >= v.
-        if (f as f64) >= v {
-            f
-        } else {
-            next_up_f32(f)
-        }
+        f64_to_f32_up(v)
     } else {
-        // Largest f32 that is <= v.
-        if (f as f64) <= v {
-            f
-        } else {
-            next_down_f32(f)
-        }
+        f64_to_f32_down(v)
     }
 }
 
 /// Next representable f32 strictly greater than `x` (finite `x`; used only on the
 /// finite box bounds in [`clamp_finite_inward`]).
 fn next_up_f32(x: f32) -> f32 {
-    if x == f32::INFINITY {
-        return x;
-    }
     let bits = x.to_bits();
-    let next = if x == 0.0 {
-        1 // smallest positive subnormal
-    } else if x > 0.0 {
-        bits + 1
-    } else {
-        bits - 1
+    let magnitude = bits & 0x7fff_ffff;
+    let negative = bits & 0x8000_0000 != 0;
+    let next = match (negative, magnitude) {
+        (_, m) if m > 0x7f80_0000 => return x, // NaN
+        (false, 0x7f80_0000) => return x,      // +infinity
+        (_, 0) => 1,                           // either signed zero -> +minsub
+        (false, _) => bits + 1,
+        (true, _) => bits - 1,
     };
     f32::from_bits(next)
 }
 
 /// Next representable f32 strictly less than `x` (finite `x`).
 fn next_down_f32(x: f32) -> f32 {
-    if x == f32::NEG_INFINITY {
-        return x;
-    }
     let bits = x.to_bits();
-    let next = if x == 0.0 {
-        0x8000_0001 // smallest negative subnormal
-    } else if x > 0.0 {
-        bits - 1
-    } else {
-        bits + 1
+    let magnitude = bits & 0x7fff_ffff;
+    let negative = bits & 0x8000_0000 != 0;
+    let next = match (negative, magnitude) {
+        (_, m) if m > 0x7f80_0000 => return x, // NaN
+        (true, 0x7f80_0000) => return x,       // -infinity
+        (_, 0) => 0x8000_0001,                 // either signed zero -> -minsub
+        (false, _) => bits - 1,
+        (true, _) => bits + 1,
     };
     f32::from_bits(next)
 }
@@ -7521,6 +12236,97 @@ fn property_violation_possible_f64(
     }
 }
 
+/// Whether EVERY output vector inside the per-output enclosure `[lo, hi]`
+/// violates the property at witness `input` — the CERTIFIED-side dual of
+/// [`property_violation_possible_f64`] (#sat-relu-zero-margin).
+///
+/// `possible` uses each constraint's FAVORABLE endpoint and answers "can the
+/// enclosure violate"; this uses the UNFAVORABLE endpoint
+/// ([`constraint_margin_min`]) and answers "must it". A `true` here is the
+/// strongest statement the sound f64 enclosure can make about a witness: the
+/// real-arithmetic output lies in `[lo, hi]`, so the witness is a genuine
+/// counterexample for EVERY conforming float implementation the enclosure
+/// covers, not merely for the runtime that produced it.
+///
+/// # Why `m == 0` is admitted on NON-STRICT constraints
+///
+/// Symmetric with the ACCEPTANCE side [`property_violated_f64`] and — measured
+/// — with the ORGANIZER. `SCORING-ZERO-TOL/counterexamples.py:294` evaluates
+/// `np.all(vec <= prop_rhs + tol)` with `tol = 0.0`, i.e. NON-STRICT at zero
+/// tolerance; on `2025_sat_relu` it printed `prop #0 violated: [0. 0.]` —
+/// margins EXACTLY zero — and classified those counterexamples `CE result
+/// correct` (strictly correct, not `correct_up_to_tolerance`) for
+/// alpha_beta_crown, cora, neuralsat, nnenum, nnv and pyrat alike.
+///
+/// The rule is also sound independently of that measurement: for a non-strict
+/// `<= k`, `constraint_margin_min = k - hi[i] >= 0` means `hi[i] <= k`, so
+/// EVERY value in `[lo[i], hi[i]]` satisfies `y_i <= k`. Requiring `> 0` there
+/// would demand a margin the constraint never asked for. Strict constraints
+/// keep `> 0`, since `hi[i] == k` leaves `y_i == k` possible.
+///
+/// A zero margin can only survive an OUTWARD-widened enclosure when the
+/// enclosure is exact; that is what `integer_exact_linear_reduction` in
+/// `ny-propagate`'s f64 cell walk supplies for the integer-operand SAT-encoded
+/// nets, where the attainable extremes are exactly the thresholds.
+fn property_violation_certain_f64(
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    input: &[f64],
+    lo: &[f64],
+    hi: &[f64],
+) -> bool {
+    // Input-box membership: identical gates to `property_violated_f64`,
+    // including the un-widened declared top-level asserts (a certificate must
+    // not be stronger than the box it is about).
+    if spec.per_clause_input_bounds.is_empty() {
+        for (i, &(blo, bhi)) in spec.input_bounds.iter().enumerate() {
+            match input.get(i) {
+                Some(&v) if v >= blo && v <= bhi => {}
+                _ => return false,
+            }
+        }
+    }
+    for (i, &(blo, bhi)) in spec.declared_input_bounds.iter().enumerate() {
+        match input.get(i) {
+            Some(&v) if v >= blo && v <= bhi => {}
+            _ => return false,
+        }
+    }
+    let constraint_certain = |c: &ny_onnx::vnnlib::OutputConstraint| -> bool {
+        let m = constraint_margin_min(c, lo, hi);
+        if c.is_strict() {
+            m > 0.0
+        } else {
+            m >= 0.0
+        }
+    };
+    let clause_certain = |clause: &[ny_onnx::vnnlib::OutputConstraint], idx: usize| -> bool {
+        if let Some(map) = spec.per_clause_input_bounds.get(idx) {
+            for (d, (blo, bhi)) in map {
+                match input.get(*d) {
+                    Some(&v) if v >= *blo && v <= *bhi => {}
+                    _ => return false,
+                }
+            }
+        }
+        clause.iter().all(constraint_certain)
+    };
+    if spec.output_constraint_clauses.is_empty() {
+        return !spec.output_constraints.is_empty()
+            && spec.output_constraints.iter().all(constraint_certain);
+    }
+    if spec.is_disjunction {
+        spec.output_constraint_clauses
+            .iter()
+            .enumerate()
+            .any(|(idx, clause)| clause_certain(clause, idx))
+    } else {
+        spec.output_constraint_clauses
+            .iter()
+            .enumerate()
+            .all(|(idx, clause)| clause_certain(clause, idx))
+    }
+}
+
 fn constraint_margin(c: &ny_onnx::vnnlib::OutputConstraint, outputs: &[f64]) -> f64 {
     use ny_onnx::vnnlib::OutputConstraint as OC;
     let y = |i: usize| outputs.get(i).copied();
@@ -7563,7 +12369,7 @@ fn property_margin(spec: &ny_onnx::vnnlib::VnnLibSpec, input: &[f32], outputs: &
         if let Some(map) = spec.per_clause_input_bounds.get(clause_idx) {
             for (idx, (lo, hi)) in map {
                 match input.get(*idx) {
-                    Some(&v) if (v as f64) >= *lo && (v as f64) <= *hi => {}
+                    Some(&v) if f32_to_f64_exact(v) >= *lo && f32_to_f64_exact(v) <= *hi => {}
                     _ => return f64::NEG_INFINITY,
                 }
             }
@@ -7617,7 +12423,7 @@ fn property_margin(spec: &ny_onnx::vnnlib::VnnLibSpec, input: &[f32], outputs: &
 // as the historical-semantics reference for the tests that pin the difference.
 #[cfg_attr(not(test), allow(dead_code))]
 fn property_violated(spec: &ny_onnx::vnnlib::VnnLibSpec, input: &[f32], outputs: &[f64]) -> bool {
-    let input64: Vec<f64> = input.iter().map(|&v| v as f64).collect();
+    let input64: Vec<f64> = input.iter().map(|&v| f32_to_f64_exact(v)).collect();
     property_violated_f64(spec, &input64, outputs)
 }
 
@@ -7627,7 +12433,7 @@ fn property_violated(spec: &ny_onnx::vnnlib::VnnLibSpec, input: &[f32], outputs:
 /// refinement path calls this directly with its emit view, where degenerate
 /// (pinned) dims carry the declared f64 bound verbatim (see
 /// `refine_witness_with_ort`); the comparison stays ZERO tolerance.
-fn property_violated_f64(
+pub(crate) fn property_violated_f64(
     spec: &ny_onnx::vnnlib::VnnLibSpec,
     input: &[f64],
     outputs: &[f64],
@@ -7758,7 +12564,7 @@ fn ort_guided_falsify(
             // A transient forward failure is treated as a dead candidate, not fatal.
             Err(_) => return Ok(f64::NEG_INFINITY),
         };
-        let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+        let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
         // Accept ONLY a genuine full-property violation: `property_violated_f64`
         // on the EMIT VIEW (pinned dims carry their declared f64 bound — the value
         // the organizer's exact asserts re-check) enforces the input box AND the
@@ -7955,10 +12761,55 @@ fn constraint_grad_row(
 /// structure (disjunction: clause with max margin among clauses whose per-clause
 /// input box contains `input`; conjunction: clause with min margin). Guidance
 /// only — never part of acceptance — so a suboptimal pick merely slows the search.
+///
+/// `tiebreak` (#traffic-saturated-softmax): an alternative, strictly-monotone
+/// view of the same outputs — ny's PRE-`Softmax` logits — consulted ONLY when the
+/// disjunction's winning margin is attained by MORE THAN ONE clause. It changes
+/// nothing whenever the outputs carry any information (softmax is monotone, so
+/// the argmax disjunct is the same in both spaces) and everything when they do
+/// not: on the traffic_signs BNNs the f32 softmax SATURATES (`p_true = 1`, all 42
+/// others exactly `0`), every disjunct margin is exactly `-1`, and the `max_by`
+/// below silently returns the LAST clause — measured on
+/// `model_30_idx_12375_eps_3` as targeting class 42 (logit rank 31/42) in
+/// 697/697 attack steps, where the argmax-logit target is class 30 (rank 1/42).
+/// `None` restores the historical behaviour exactly.
 fn margin_subgradient_row(
     spec: &ny_onnx::vnnlib::VnnLibSpec,
     input: &[f32],
     outputs: &[f64],
+    tiebreak: Option<&[f64]>,
+) -> Option<Vec<f32>> {
+    margin_subgradient_row_ranked(spec, input, outputs, tiebreak, 0)
+}
+
+/// [`margin_subgradient_row`] with an explicit TARGET RANK among the tied
+/// disjuncts (#traffic-ranked-target).
+///
+/// `rank = 0` is [`margin_subgradient_row`] exactly: the best target in the
+/// tie-break space. `rank = k` takes the `k`-th best instead (clamped to the
+/// number of tied clauses), which is what lets a restart schedule walk the
+/// ranking — the α,β-CROWN-style multi-targeted attack — instead of re-running
+/// one target or, worse, the arbitrary LAST tied clause.
+///
+/// # Why a ranking, not one target
+///
+/// On the traffic BNNs the f32 softmax saturates, so ALL 42 disjunct margins tie
+/// and the tie-break is the only thing choosing a target. The tie-break was
+/// scoped to restart 0 because applying the SAME rank-0 target on every restart
+/// was measured a net loss — but that made restarts 1..n redundant copies of
+/// restart 0's direction, while leaving them on the arbitrary last-tied clause
+/// is a target of logit rank ~31/42. A ranked schedule is neither: restart `k`
+/// attacks the `k`-th closest-to-violation class, so a 5-restart budget covers
+/// the 5 best targets instead of 1 good and 4 arbitrary.
+///
+/// Guidance only: this picks a NON-certified ascent direction. Acceptance stays
+/// the unchanged ORT + zero-tolerance gate.
+fn margin_subgradient_row_ranked(
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    input: &[f32],
+    outputs: &[f64],
+    tiebreak: Option<&[f64]>,
+    rank: usize,
 ) -> Option<Vec<f32>> {
     use ny_onnx::vnnlib::OutputConstraint as OC;
     let num_outputs = outputs.len();
@@ -7979,7 +12830,7 @@ fn margin_subgradient_row(
         if let Some(map) = spec.per_clause_input_bounds.get(clause_idx) {
             for (idx, (lo, hi)) in map {
                 match input.get(*idx) {
-                    Some(&v) if (v as f64) >= *lo && (v as f64) <= *hi => {}
+                    Some(&v) if f32_to_f64_exact(v) >= *lo && f32_to_f64_exact(v) <= *hi => {}
                     _ => return None,
                 }
             }
@@ -8000,12 +12851,51 @@ fn margin_subgradient_row(
             .output_constraint_clauses
             .iter()
             .enumerate()
-            .filter_map(|(idx, clause)| clause_binding(spec, input, outputs, clause, idx))
-            .filter(|(m, _)| m.is_finite());
+            .filter_map(|(idx, clause)| {
+                clause_binding(spec, input, outputs, clause, idx).map(|(m, c)| (idx, m, c))
+            })
+            .filter(|(_, m, _)| m.is_finite());
         if spec.is_disjunction {
-            candidates.max_by(cmp)?
+            let all: Vec<(usize, f64, &OC)> = candidates.collect();
+            // `max_by` returns the LAST maximum, so taking the last tied clause
+            // reproduces the historical pick byte-for-byte.
+            let (_, best_margin, _) = *all
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+            let tied: Vec<&(usize, f64, &OC)> =
+                all.iter().filter(|(_, m, _)| *m == best_margin).collect();
+            let picked = match tiebreak {
+                // Re-rank ONLY the tied clauses in the monotone alternative space,
+                // then take the `rank`-th best (rank 0 == the historical argmax).
+                Some(alt) if tied.len() > 1 && alt.len() == num_outputs => {
+                    let mut ranked: Vec<(f64, &OC)> = tied
+                        .iter()
+                        .filter_map(|(idx, _, _)| {
+                            clause_binding(
+                                spec,
+                                input,
+                                alt,
+                                &spec.output_constraint_clauses[*idx],
+                                *idx,
+                            )
+                        })
+                        .collect();
+                    // Descending by alternative-space margin: closest to violation
+                    // first. `sort_by` is stable, so equal alt margins keep clause
+                    // order and the schedule stays deterministic.
+                    ranked.sort_by(|a, b| cmp(&(b.0, b.1), &(a.0, a.1)));
+                    ranked
+                        .get(rank.min(ranked.len().saturating_sub(1)))
+                        .map(|(_, c)| *c)
+                }
+                _ => None,
+            };
+            match picked {
+                Some(c) => (best_margin, c),
+                None => (best_margin, tied.last()?.2),
+            }
         } else {
-            candidates.min_by(cmp)?
+            candidates.map(|(_, m, c)| (m, c)).min_by(cmp)?
         }
     };
     constraint_grad_row(binding.1, num_outputs)
@@ -8131,6 +13021,18 @@ fn restart_seed(
 /// APGD momentum weight: `x' = P(x + 0.75·(z − x) + 0.25·(x − prev))`.
 const APGD_MOMENTUM: f32 = 0.75;
 
+/// Three-way ascent direction shared by the sequential and wide exact-VJP
+/// paths. Unlike `f32::signum`, both IEEE signed zeros (and NaN) mean no move.
+fn gradient_direction_sign(gradient: f32) -> f32 {
+    if gradient > 0.0 {
+        1.0
+    } else if gradient < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 /// One APGD coordinate update, extracted pure for the #bab-frontier v2
 /// in-box-invariance oracle: the FGSM-style sign step to the trial point `z`,
 /// then the Nesterov-momentum blend, each stage clamped into `[lo, hi]` — so
@@ -8181,18 +13083,818 @@ fn apgd_coord_step(x: f32, prev: f32, sign: f32, alpha: f32, width: f32, lo: f32
 ///
 /// `NY_SIGN_BETA=<f32>` forces a single constant β on every restart/step (a
 /// diagnostic escape hatch; `10` reproduces the pre-ramp fixed-β behavior).
-fn sign_beta_schedule(restart_idx: usize, step: usize, max_steps: usize) -> f32 {
+fn sign_beta_schedule(
+    restart_idx: usize,
+    step: usize,
+    max_steps: usize,
+    smooth_forward: bool,
+) -> f32 {
     if let Some(b) = std::env::var("NY_SIGN_BETA")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
     {
         return b;
     }
-    if restart_idx == 0 {
+    // #smooth-sign-forward (attack-only, soundness-neutral): on a binarized net
+    // the Sign surrogate slope is evaluated at a smooth
+    // forward's pre-activations (see `attack_point_gradient`). The hard-tail
+    // traffic_signs BNN sats then need β to reach the sharp end (measured: net-2
+    // `idx_10645_eps_1` cracks only at β≳15 — a fixed β=10 CANNOT flip it), and the
+    // budget-available restart is restart 0 (the upfront lane seeds it at the box
+    // CENTER — exactly the external bnn_falsifier prototype's winning start). So on
+    // a BNN restart 0 ALSO anneals β 2→20 (reproducing the prototype's
+    // `alpha = 2 + 18·it/iters` from center) instead of the fixed β. On every
+    // non-Sign net `smooth_forward` is false ⇒ restart 0 keeps the proven fixed β,
+    // byte-identical to today; β only reshapes a NON-certified ascent direction, so
+    // every candidate is still ORT+zero-tol re-checked and no verdict can change.
+    if restart_idx == 0 && !smooth_forward {
         return ny_propagate::DEFAULT_ATTACK_SIGN_BETA;
     }
     let denom = (max_steps - 1).max(1) as f32;
     2.0 + 18.0 * (step as f32 / denom)
+}
+
+/// Hard restart-width ceiling for the wrapper's exact-VJP pre-wave.
+///
+/// The resident backward allocates coefficients proportional to K.  This is a
+/// compile-time ceiling, not merely a default: it bounds this optional attack
+/// wave's resident-cache and allocation exposure. K=64 is the measured
+/// throughput sweet spot of the already-shipped engine-side wave.
+const ORT_REFINE_VJP_MAX_K: usize = 64;
+
+/// Operator assertion that only the bounded wrapper VJP pre-wave may run
+/// inside an externally isolated finite-memory child. Unlike
+/// `NY_OPTIONAL_HEAVY_UNDER_MEMORY_LIMIT`, this does not admit margin-row BaB,
+/// post-BaB graph reloads, or any other optional heavy tail.
+const ORT_REFINE_VJP_MEMORY_OVERRIDE_ENV: &str = "NY_ORT_REFINE_VJP_UNDER_MEMORY_LIMIT";
+
+/// Exact, machine-readable prefix used by the sealed wrapper-VJP qualifier.
+///
+/// Refusals are deliberately emitted only for an explicit
+/// `NY_ORT_REFINE_VJP_BATCH=1` diagnostic arm. The production default remains
+/// quiet on accelerator-less hosts, while a qualification run can distinguish
+/// "the treatment lost" from "the treatment could not engage" without ever
+/// authenticating the latter as an on arm.
+const ORT_REFINE_VJP_DECLINED_PREFIX: &str = "ORT-refine grad lane: exact-VJP pre-wave declined";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrtRefineVjpDeclineReason {
+    DeadlineExpired,
+    NoAccelerator,
+    WgpuOptOut,
+    MemoryNotAdmitted,
+    InsufficientBudget,
+    DeadlineOverflow,
+    InvalidInputShape,
+    InvalidAttackBox,
+    UnsupportedGraph,
+    PlanDimensionMismatch,
+    PlanSetupDeadline,
+    AttackEngineUnavailable,
+    ExactVjpCapabilityUnavailable,
+    WorkingSetClearFailed,
+    WorkingSetSetupDeadline,
+}
+
+impl OrtRefineVjpDeclineReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeadlineExpired => "deadline_expired",
+            Self::NoAccelerator => "no_accelerator",
+            Self::WgpuOptOut => "wgpu_opt_out",
+            Self::MemoryNotAdmitted => "memory_not_admitted",
+            Self::InsufficientBudget => "insufficient_budget",
+            Self::DeadlineOverflow => "deadline_overflow",
+            Self::InvalidInputShape => "invalid_input_shape",
+            Self::InvalidAttackBox => "invalid_attack_box",
+            Self::UnsupportedGraph => "unsupported_graph",
+            Self::PlanDimensionMismatch => "plan_dimension_mismatch",
+            Self::PlanSetupDeadline => "plan_setup_deadline",
+            Self::AttackEngineUnavailable => "attack_engine_unavailable",
+            Self::ExactVjpCapabilityUnavailable => "exact_vjp_capability_unavailable",
+            Self::WorkingSetClearFailed => "working_set_clear_failed",
+            Self::WorkingSetSetupDeadline => "working_set_setup_deadline",
+        }
+    }
+}
+
+/// Private slice for the speculative wide pre-wave. Plan setup and the bounded
+/// wait for the asynchronously armed WGPU device are charged to this frozen
+/// interval. Individual ORT/GPU calls are not preemptible, but the wrapper
+/// never deliberately schedules another wave step after this slice expires.
+const ORT_REFINE_VJP_WALL_CAP: std::time::Duration = std::time::Duration::from_secs(1);
+const ORT_REFINE_VJP_BUDGET_FRACTION: f64 = 0.25;
+const ORT_REFINE_VJP_MIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Bound the number of trusted-ORT checks made after each wide internal screen.
+/// Lane zero preserves the incumbent/witness trajectory and the remaining slots
+/// take the highest internal margins.  The exact-VJP/internal forward has no
+/// verdict authority; every returned point still has to pass one of these checks.
+const ORT_REFINE_VJP_ORT_CANDIDATES_PER_STEP: usize = 4;
+
+fn ort_refine_vjp_batch_enabled_from(raw: Option<&str>, test_build: bool) -> bool {
+    // Unit tests stay hardware-independent unless their whole process explicitly
+    // opts in. Production is batteries-included with an exact kill switch.
+    raw != Some("0") && (!test_build || raw == Some("1"))
+}
+
+fn ort_refine_vjp_decline_marker_from(
+    raw_batch_gate: Option<&str>,
+    reason: OrtRefineVjpDeclineReason,
+) -> Option<String> {
+    (raw_batch_gate == Some("1")).then(|| {
+        format!(
+            "{ORT_REFINE_VJP_DECLINED_PREFIX} (reason={})",
+            reason.as_str()
+        )
+    })
+}
+
+fn emit_ort_refine_vjp_decline(raw_batch_gate: Option<&str>, reason: OrtRefineVjpDeclineReason) {
+    if let Some(marker) = ort_refine_vjp_decline_marker_from(raw_batch_gate, reason) {
+        println!("{marker}");
+    }
+}
+
+fn ort_refine_vjp_width_from(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&k| k >= 1)
+        .unwrap_or(ORT_REFINE_VJP_MAX_K)
+        .min(ORT_REFINE_VJP_MAX_K)
+}
+
+fn ort_refine_vjp_width() -> usize {
+    ort_refine_vjp_width_from(std::env::var("NY_ORT_REFINE_VJP_K").ok().as_deref())
+}
+
+fn ort_refine_vjp_memory_allowed(
+    ordinary_optional_heavy_allowed: bool,
+    isolated_override: Option<&OsStr>,
+) -> bool {
+    ordinary_optional_heavy_allowed || isolated_override == Some(OsStr::new("1"))
+}
+
+fn ort_refine_vjp_memory_allowed_now() -> bool {
+    ort_refine_vjp_memory_allowed(
+        optional_heavy_memory_allowed_now(),
+        std::env::var_os(ORT_REFINE_VJP_MEMORY_OVERRIDE_ENV).as_deref(),
+    )
+}
+
+thread_local! {
+    /// True while the in-process β-CROWN invocation is expected to request a
+    /// typed WGPU proof device. The wrapper pre-wave must not initialize its
+    /// separate process-global attack device in that interval: β-CROWN will
+    /// either reuse its exact qualified proof context for attacks or fall back
+    /// after a failed qualification, but it must never coexist with a wrapper
+    /// context created earlier in the same command.
+    static BETA_WGPU_CONTEXT_RESERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct BetaWgpuContextReservation {
+    previous: bool,
+}
+
+impl BetaWgpuContextReservation {
+    fn enter(reserved: bool) -> Self {
+        let previous = BETA_WGPU_CONTEXT_RESERVED.with(|slot| slot.replace(reserved));
+        Self { previous }
+    }
+}
+
+impl Drop for BetaWgpuContextReservation {
+    fn drop(&mut self) {
+        BETA_WGPU_CONTEXT_RESERVED.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Mirror the in-process β-CROWN call's fixed backend inputs (`backend=None`,
+/// `gpu=false`): a preset pin wins, otherwise the existing large-input AUTO
+/// boundary selects WGPU only when an accelerator is available.
+///
+/// This local pure projection exists because the wrapper must decide before
+/// β-CROWN starts, while the immutable preset snapshot and VNN-LIB size are
+/// already available. It consumes β-CROWN's canonical AUTO threshold directly,
+/// so reservation and later routing cannot drift apart.
+fn vnncomp_beta_requests_wgpu(
+    preset_device: Option<&str>,
+    input_element_count: Option<usize>,
+    gpu_available: bool,
+) -> bool {
+    match preset_device {
+        Some("wgpu") => true,
+        Some(_) => false,
+        None => {
+            input_element_count
+                .is_some_and(|count| count > super::beta_crown::AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS)
+                && gpu_available
+        }
+    }
+}
+
+fn wrapper_vjp_prewave_allowed(traffic_softmax_qualified: bool) -> bool {
+    !traffic_softmax_qualified && !BETA_WGPU_CONTEXT_RESERVED.with(std::cell::Cell::get)
+}
+
+fn ort_refine_vjp_budget(remaining: std::time::Duration) -> Option<std::time::Duration> {
+    let budget = remaining
+        .mul_f64(ORT_REFINE_VJP_BUDGET_FRACTION)
+        .min(ORT_REFINE_VJP_WALL_CAP);
+    (budget >= ORT_REFINE_VJP_MIN_BUDGET).then_some(budget)
+}
+
+struct OrtRefineVjpProjection {
+    lower: Vec<f32>,
+    upper: Vec<f32>,
+    width: Vec<f32>,
+}
+
+struct OrtRefineVjpLane {
+    x: Vec<f32>,
+    previous_x: Vec<f32>,
+    best_x: Vec<f32>,
+    projection: Option<OrtRefineVjpProjection>,
+    best_margin: f64,
+    alpha: f32,
+    stall: usize,
+    use_dlr: bool,
+    active: bool,
+}
+
+/// Clear this wrapper graph's resident VJP/CROWN plans and pooled coefficient
+/// buffers before the process-global attack engine is handed back to the
+/// verifier. The trait default is a no-op for cacheless engines; WGPU releases
+/// its model-specific working set.
+struct OrtRefineVjpWorkingSetGuard<'a> {
+    gpu: &'a dyn ny_core::GpuCrownBackward,
+}
+
+impl Drop for OrtRefineVjpWorkingSetGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.gpu.clear_crown_working_set() {
+            eprintln!("ORT-refine grad lane: failed to clear exact-VJP GPU working set ({error})");
+        }
+    }
+}
+
+/// Run one K-wide exact-VJP APGD wave before the historical sequential loop.
+///
+/// `PointVjpWavePlan` supplies the same exact-at-a-point ReLU VJP used by the
+/// engine attack, but its forward values and gradients are proposal-only.  At
+/// most four promising points per wave-step are evaluated by `forward` and a
+/// point is returned only when that trusted ORT output satisfies the unchanged
+/// zero-tolerance property predicate.  Any capability/device failure returns
+/// `None`, leaving the sequential attack below as the fallback inside the same
+/// frozen absolute deadline.
+#[allow(clippy::too_many_arguments)]
+fn try_ort_refine_vjp_wave(
+    graph: &GraphNetwork,
+    forward: &mut ny_onnx::diff::OrtForward,
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    input_shape: &[usize],
+    box_lo: &[f32],
+    box_hi: &[f32],
+    width: &[f32],
+    emit_pin: &[Option<f64>],
+    seed_witness: Option<&[f32]>,
+    priority_seeds: &[PrioritySeed],
+    center: &[f32],
+    deadline: std::time::Instant,
+    ort_evals: &mut usize,
+    grad_steps: &mut usize,
+) -> Option<Vec<f32>> {
+    use std::time::Instant;
+
+    let raw_batch_gate = std::env::var("NY_ORT_REFINE_VJP_BATCH").ok();
+    let decline = |reason: OrtRefineVjpDeclineReason| -> Option<Vec<f32>> {
+        emit_ort_refine_vjp_decline(raw_batch_gate.as_deref(), reason);
+        None
+    };
+    let admitted_at = Instant::now();
+    if !ort_refine_vjp_batch_enabled_from(raw_batch_gate.as_deref(), cfg!(test)) {
+        return None;
+    }
+    if admitted_at >= deadline {
+        return decline(OrtRefineVjpDeclineReason::DeadlineExpired);
+    }
+    let wgpu_opted_out = crate::compute_backend::detect().wgpu_probe_skipped
+        && crate::commands::beta_crown::attack_steering_wgpu_opt_out();
+    if !accelerator_capability_hint() {
+        return decline(OrtRefineVjpDeclineReason::NoAccelerator);
+    }
+    if wgpu_opted_out {
+        return decline(OrtRefineVjpDeclineReason::WgpuOptOut);
+    }
+    if !ort_refine_vjp_memory_allowed_now() {
+        return decline(OrtRefineVjpDeclineReason::MemoryNotAdmitted);
+    }
+    let Some(wave_budget) = ort_refine_vjp_budget(deadline.saturating_duration_since(admitted_at))
+    else {
+        return decline(OrtRefineVjpDeclineReason::InsufficientBudget);
+    };
+    // Shadow the outer deadline deliberately: every check in this helper uses
+    // the private pre-wave authority, while the caller retains the untouched
+    // outer deadline for its sequential fallback.
+    let Some(private_deadline) = admitted_at.checked_add(wave_budget) else {
+        return decline(OrtRefineVjpDeclineReason::DeadlineOverflow);
+    };
+    let deadline = private_deadline.min(deadline);
+
+    let Ok(lower) = ArrayD::from_shape_vec(IxDyn(input_shape), box_lo.to_vec()) else {
+        return decline(OrtRefineVjpDeclineReason::InvalidInputShape);
+    };
+    let Ok(upper) = ArrayD::from_shape_vec(IxDyn(input_shape), box_hi.to_vec()) else {
+        return decline(OrtRefineVjpDeclineReason::InvalidInputShape);
+    };
+    let Ok(attack_box) = ny_tensor::BoundedTensor::new(lower, upper) else {
+        return decline(OrtRefineVjpDeclineReason::InvalidAttackBox);
+    };
+    let Some(plan) = PointVjpWavePlan::build(graph, &attack_box) else {
+        return decline(OrtRefineVjpDeclineReason::UnsupportedGraph);
+    };
+    if plan.input_dim() != box_lo.len() || plan.output_dim() == 0 {
+        return decline(OrtRefineVjpDeclineReason::PlanDimensionMismatch);
+    }
+    if Instant::now() >= deadline {
+        return decline(OrtRefineVjpDeclineReason::PlanSetupDeadline);
+    }
+
+    // Use the same process-global asynchronous armer as the engine attack
+    // lanes. Device creation happens off-thread and this wait is bounded by the
+    // private pre-wave deadline; a slow/stuck constructor therefore cannot
+    // erase the sequential fallback. If the wrapper times out first, completed
+    // initialization is retained for verifier PGD instead of being dropped or
+    // duplicated. This also preserves the documented NVIDIA default/opt-out.
+    let steering = shared_wgpu_attack_steering();
+    let source = AttackEngineSource::Arming(steering);
+    let Some(resolved) = source.take_within(deadline.saturating_duration_since(Instant::now()))
+    else {
+        return decline(OrtRefineVjpDeclineReason::AttackEngineUnavailable);
+    };
+    let engine = resolved.as_gemm();
+    let Some(gpu) = engine.as_gpu_crown_backward() else {
+        return decline(OrtRefineVjpDeclineReason::ExactVjpCapabilityUnavailable);
+    };
+
+    // The process-global engine may already hold verifier state when this wave
+    // runs after graph BaB. Establish a clean ownership boundary before the
+    // K-wide wrapper allocation so the two graphs' working sets cannot overlap.
+    // The guard below performs the symmetric wrapper-to-verifier handoff.
+    if let Err(error) = gpu.clear_crown_working_set() {
+        eprintln!(
+            "ORT-refine grad lane: failed to acquire a clean exact-VJP GPU working set ({error})"
+        );
+        return decline(OrtRefineVjpDeclineReason::WorkingSetClearFailed);
+    }
+    let _working_set_guard = OrtRefineVjpWorkingSetGuard { gpu };
+    if Instant::now() >= deadline {
+        return decline(OrtRefineVjpDeclineReason::WorkingSetSetupDeadline);
+    }
+
+    let k = ort_refine_vjp_width().min(GRAD_REFINE_MAX_RESTARTS);
+    let mut rng = SimpleRng::new(0xA24B_AED4_963E_E407);
+    let mut lanes = Vec::with_capacity(k);
+    for restart_idx in 0..k {
+        let mut x = restart_seed(
+            restart_idx,
+            seed_witness,
+            priority_seeds,
+            center,
+            box_lo,
+            box_hi,
+            &mut rng,
+        );
+        if spec.is_disjunction && !spec.per_clause_input_bounds.is_empty() {
+            project_into_clause_box(
+                &mut x,
+                restart_idx % spec.per_clause_input_bounds.len(),
+                spec,
+                box_lo,
+                box_hi,
+            );
+        }
+        let projection = restart_projection_box(restart_idx, priority_seeds, box_lo, box_hi).map(
+            |(lower, upper)| {
+                let local_width = lower
+                    .iter()
+                    .zip(&upper)
+                    .map(|(&l, &h)| (h - l).max(0.0))
+                    .collect();
+                OrtRefineVjpProjection {
+                    lower,
+                    upper,
+                    width: local_width,
+                }
+            },
+        );
+        if let Some(local) = projection.as_ref() {
+            for d in 0..x.len() {
+                x[d] = clamp_to_box(x[d], local.lower[d], local.upper[d]);
+            }
+        }
+        lanes.push(OrtRefineVjpLane {
+            previous_x: x.clone(),
+            best_x: x.clone(),
+            x,
+            projection,
+            best_margin: f64::NEG_INFINITY,
+            alpha: 0.25,
+            stall: 0,
+            use_dlr: restart_idx % 2 == 1,
+            active: true,
+        });
+    }
+
+    println!(
+        "ORT-refine grad lane: exact-VJP pre-wave armed (K={}, hard cap {}, backend={})",
+        lanes.len(),
+        ORT_REFINE_VJP_MAX_K,
+        engine.backend_provenance(),
+    );
+
+    let output_dim = plan.output_dim();
+    let mut wave_steps = 0usize;
+    for _step in 0..GRAD_REFINE_MAX_STEPS_PER_RESTART {
+        if Instant::now() >= deadline {
+            break;
+        }
+        // Keep K EXACTLY fixed for the whole wave. The resident point-VJP cache
+        // key includes K and one cached K=64 plan is roughly 250 MiB on the
+        // measured ResNet; compacting dead lanes would retain a new large plan
+        // for every population size. Inactive lanes keep their point/masks but
+        // receive zero cotangent rows and skip state updates below.
+        if lanes.iter().all(|lane| !lane.active) {
+            break;
+        }
+        let points: Vec<Vec<f32>> = lanes.iter().map(|lane| lane.x.clone()).collect();
+        let (masks, outputs) = match plan.forward_masks(&points) {
+            Ok(result) => result,
+            Err(_) => return None,
+        };
+        // `points` duplicates K full inputs; masks now own everything the VJP
+        // needs. Release that duplicate before resident coefficient allocation.
+        drop(points);
+        if Instant::now() >= deadline
+            || outputs.len() != lanes.len()
+            || masks.len() != lanes.len()
+            || outputs.iter().any(|output| output.len() != output_dim)
+        {
+            break;
+        }
+        wave_steps += 1;
+
+        let outputs64: Vec<Vec<f64>> = outputs
+            .iter()
+            .map(|output| output.iter().map(|&v| f32_to_f64_exact(v)).collect())
+            .collect();
+        let margins: Vec<f64> = lanes
+            .iter()
+            .zip(&outputs64)
+            .map(|(lane, output)| property_margin(spec, &lane.x, output))
+            .collect();
+        let internal_unsafe: Vec<bool> = margins
+            .iter()
+            .map(|&margin| margin.is_finite() && margin >= 0.0)
+            .collect();
+
+        // Trusted candidate shortlist: always retain live lane zero (the
+        // incumbent/witness path), the best internal margin, and then any other
+        // internally-unsafe lanes up to the cap. Internal "unsafe" is only a
+        // ranking signal; ORT remains the acceptance oracle. Typical safe steps
+        // therefore cost two ORT forwards, not K (or the full shortlist).
+        let mut ranked: Vec<usize> = (0..lanes.len()).filter(|&idx| lanes[idx].active).collect();
+        ranked.sort_by(|&a, &b| margins[b].total_cmp(&margins[a]));
+        let mut candidates = Vec::with_capacity(ORT_REFINE_VJP_ORT_CANDIDATES_PER_STEP);
+        if lanes.first().is_some_and(|lane| lane.active) {
+            candidates.push(0);
+        }
+        if let Some(&best) = ranked.first() {
+            if !candidates.contains(&best) {
+                candidates.push(best);
+            }
+        }
+        for idx in ranked.into_iter().filter(|&idx| internal_unsafe[idx]) {
+            if candidates.len() >= ORT_REFINE_VJP_ORT_CANDIDATES_PER_STEP {
+                break;
+            }
+            if !candidates.contains(&idx) {
+                candidates.push(idx);
+            }
+        }
+        for idx in candidates {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let output = match forward.run(&lanes[idx].x) {
+                Ok(output) => output,
+                Err(_) => continue,
+            };
+            if Instant::now() >= deadline {
+                return None;
+            }
+            *ort_evals += 1;
+            let trusted64: Vec<f64> = output
+                .iter()
+                .map(|&value| f32_to_f64_exact(value))
+                .collect();
+            if property_violated_f64(spec, &refine_emit_view(&lanes[idx].x, emit_pin), &trusted64)
+                && Instant::now() < deadline
+            {
+                println!(
+                    "ORT-refine grad lane: ORT-confirmed violation in exact-VJP pre-wave \
+                     (lane {idx}, {wave_steps} wave steps, {grad_steps} restart-gradient steps, \
+                     {ort_evals} ORT evals)"
+                );
+                return clamp_inside_box(&lanes[idx].x, box_lo, box_hi);
+            }
+        }
+
+        let mut spec_rows = vec![0.0f32; lanes.len().checked_mul(output_dim)?];
+        let mut step_directional = vec![false; lanes.len()];
+        let mut directional = 0usize;
+        for idx in 0..lanes.len() {
+            if !lanes[idx].active {
+                continue;
+            }
+            let margin = margins[idx];
+            if margin > lanes[idx].best_margin {
+                lanes[idx].best_margin = margin;
+                let current_x = lanes[idx].x.clone();
+                lanes[idx].best_x = current_x;
+                lanes[idx].stall = 0;
+            } else {
+                lanes[idx].stall += 1;
+                if lanes[idx].stall >= 6 {
+                    lanes[idx].alpha *= 0.5;
+                    lanes[idx].stall = 0;
+                    if lanes[idx].alpha < 1e-4 {
+                        lanes[idx].active = false;
+                        continue;
+                    }
+                    let best_x = lanes[idx].best_x.clone();
+                    lanes[idx].x.clone_from(&best_x);
+                    lanes[idx].previous_x = best_x;
+                    continue;
+                }
+            }
+
+            let Some(raw_row) = margin_subgradient_row(spec, &lanes[idx].x, &outputs64[idx], None)
+            else {
+                lanes[idx].active = false;
+                continue;
+            };
+            let row = if lanes[idx].use_dlr {
+                dlr_grad_row(&raw_row, margin, &outputs64[idx])
+            } else {
+                raw_row
+            };
+            if row.len() != output_dim || row.iter().any(|value| !value.is_finite()) {
+                lanes[idx].active = false;
+                continue;
+            }
+            spec_rows[idx * output_dim..(idx + 1) * output_dim].copy_from_slice(&row);
+            step_directional[idx] = true;
+            directional += 1;
+        }
+        if directional == 0 || Instant::now() >= deadline {
+            break;
+        }
+
+        // One fixed-width resident plan only. If K does not fit this adapter,
+        // abandon the speculative pre-wave and preserve the sequential path;
+        // retrying smaller widths would retain multiple ~K-sized cache entries.
+        let grads = match plan.gpu_vjp(gpu, &masks, &spec_rows) {
+            Ok(grads)
+                if grads.len() == lanes.len()
+                    && grads.iter().all(|grad| grad.len() == box_lo.len()) =>
+            {
+                grads
+            }
+            _ => return None,
+        };
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        // The gradient vectors are self-contained. Drop the K-wide masks/rows
+        // and forward copies before updating/retaining the next point wave so
+        // allocator high water does not combine both iterations' large buffers.
+        drop(masks);
+        drop(spec_rows);
+        drop(outputs);
+        drop(outputs64);
+        drop(margins);
+        drop(internal_unsafe);
+
+        for ((lane, grad), has_direction) in lanes.iter_mut().zip(&grads).zip(step_directional) {
+            if !lane.active || !has_direction {
+                continue;
+            }
+            if grad.iter().any(|value| !value.is_finite()) {
+                lane.active = false;
+                continue;
+            }
+            *grad_steps += 1;
+            let (eff_lo, eff_hi, eff_width): (&[f32], &[f32], &[f32]) =
+                match lane.projection.as_ref() {
+                    Some(local) => (&local.lower, &local.upper, &local.width),
+                    None => (box_lo, box_hi, width),
+                };
+            let mut moved = false;
+            for d in 0..lane.x.len() {
+                if eff_width[d] <= 0.0 {
+                    continue;
+                }
+                let sign = gradient_direction_sign(grad[d]);
+                let old_x = lane.x[d];
+                let next = apgd_coord_step(
+                    old_x,
+                    lane.previous_x[d],
+                    sign,
+                    lane.alpha,
+                    eff_width[d],
+                    eff_lo[d],
+                    eff_hi[d],
+                );
+                moved |= next != old_x;
+                lane.previous_x[d] = old_x;
+                lane.x[d] = next;
+            }
+            if !moved {
+                lane.active = false;
+            }
+        }
+    }
+
+    println!(
+        "ORT-refine grad lane: exact-VJP pre-wave found no trusted violation \
+         ({wave_steps} wave steps, {} live lanes); continuing sequentially",
+        lanes.iter().filter(|lane| lane.active).count(),
+    );
+    None
+}
+
+enum TrafficUpfrontMicroLegOutcome {
+    Found(Vec<f32>),
+    Finished { gradient_steps: usize },
+    Invalidated,
+}
+
+/// Run the authenticated traffic treatment as a strictly additive, bounded
+/// center-seeded leg.  It owns no RNG and none of its local optimizer state is
+/// returned, so the historical sequential restart loop below begins from a
+/// complete reset regardless of this outcome.
+#[allow(clippy::too_many_arguments)]
+fn run_traffic_upfront_logit_dlr_micro_leg(
+    graph: &GraphNetwork,
+    rewritten_spec: &ny_onnx::vnnlib::VnnLibSpec,
+    forward: &mut ny_onnx::diff::OrtForward,
+    original_spec: &ny_onnx::vnnlib::VnnLibSpec,
+    input_shape: &[usize],
+    box_lo: &[f32],
+    box_hi: &[f32],
+    width: &[f32],
+    emit_pin: &[Option<f64>],
+    center: &[f32],
+    sign_net: bool,
+    deadline: std::time::Instant,
+) -> TrafficUpfrontMicroLegOutcome {
+    use std::time::Instant;
+
+    let dim = box_lo.len();
+    let input_elements = input_shape
+        .iter()
+        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension));
+    if center.len() != dim
+        || box_hi.len() != dim
+        || width.len() != dim
+        || input_elements != Some(dim)
+    {
+        return TrafficUpfrontMicroLegOutcome::Invalidated;
+    }
+
+    let mut x = center.to_vec();
+    let mut previous_x = x.clone();
+    let alpha = 0.25f32;
+    let mut lr_scale = 0.30f32;
+    let mut gradient_steps = 0usize;
+
+    // Five trusted evaluations cover the center and the points after each of
+    // at most four VJP steps. Every acceptance uses ORIGINAL outputs/spec.
+    for micro_step in 0..=TRAFFIC_UPFRONT_LOGIT_DLR_STEPS {
+        if Instant::now() >= deadline {
+            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
+        }
+        let output = match forward.run(&x) {
+            Ok(output) => output,
+            Err(_) => return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps },
+        };
+        if Instant::now() >= deadline {
+            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
+        }
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        if traffic_upfront_original_candidate_violates(
+            original_spec,
+            &refine_emit_view(&x, emit_pin),
+            &output64,
+        ) && Instant::now() < deadline
+        {
+            return match clamp_inside_box(&x, box_lo, box_hi) {
+                Some(found) => TrafficUpfrontMicroLegOutcome::Found(found),
+                None => TrafficUpfrontMicroLegOutcome::Invalidated,
+            };
+        }
+        if micro_step == TRAFFIC_UPFRONT_LOGIT_DLR_STEPS {
+            break;
+        }
+
+        let x_array = match ArrayD::from_shape_vec(IxDyn(input_shape), x.clone()) {
+            Ok(value) => value,
+            Err(_) => return TrafficUpfrontMicroLegOutcome::Invalidated,
+        };
+        if Instant::now() >= deadline {
+            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
+        }
+        let logits = graph.attack_pre_softmax_logits(&x_array, Some(deadline));
+        if Instant::now() >= deadline {
+            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
+        }
+        let Some(logits) = logits else {
+            return TrafficUpfrontMicroLegOutcome::Invalidated;
+        };
+        let Some(row) = traffic_upfront_logit_dlr_row(rewritten_spec, &x, &logits) else {
+            return TrafficUpfrontMicroLegOutcome::Invalidated;
+        };
+        let spec_row = match Array2::from_shape_vec((1, TRAFFIC_UPFRONT_LOGIT_WIDTH), row) {
+            Ok(row) => row,
+            Err(_) => return TrafficUpfrontMicroLegOutcome::Invalidated,
+        };
+
+        ny_propagate::set_attack_sign_beta(sign_beta_schedule(
+            0,
+            micro_step,
+            GRAD_REFINE_MAX_STEPS_PER_RESTART,
+            sign_net,
+        ));
+        if Instant::now() >= deadline {
+            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
+        }
+        let gradient = match graph.attack_point_gradient(&x_array, &spec_row, None, Some(deadline))
+        {
+            Ok(Some(gradient)) => gradient,
+            Ok(None) | Err(_) if Instant::now() >= deadline => {
+                return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
+            }
+            Ok(None) | Err(_) => return TrafficUpfrontMicroLegOutcome::Invalidated,
+        };
+        if Instant::now() >= deadline {
+            return TrafficUpfrontMicroLegOutcome::Finished { gradient_steps };
+        }
+        if gradient.len() != dim || gradient.iter().any(|value| !value.is_finite()) {
+            return TrafficUpfrontMicroLegOutcome::Invalidated;
+        }
+        gradient_steps += 1;
+
+        let mut moved = false;
+        let mut next_x = x.clone();
+        for (dimension, &gradient) in gradient.iter().enumerate() {
+            if width[dimension] <= 0.0 {
+                continue;
+            }
+            let direction = gradient_direction_sign(gradient);
+            let next = if sign_net {
+                clamp_to_box(
+                    x[dimension] + lr_scale * width[dimension] * direction,
+                    box_lo[dimension],
+                    box_hi[dimension],
+                )
+            } else {
+                apgd_coord_step(
+                    x[dimension],
+                    previous_x[dimension],
+                    direction,
+                    alpha,
+                    width[dimension],
+                    box_lo[dimension],
+                    box_hi[dimension],
+                )
+            };
+            moved |= next != x[dimension];
+            next_x[dimension] = next;
+        }
+        previous_x = std::mem::replace(&mut x, next_x);
+        if sign_net {
+            lr_scale *= 0.99;
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    TrafficUpfrontMicroLegOutcome::Finished { gradient_steps }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8209,6 +13911,40 @@ fn gradient_guided_falsify(
     budget_override: Option<std::time::Duration>,
     exhaust_restarts: bool,
 ) -> Option<Vec<f32>> {
+    let mut traffic_execution = TrafficUpfrontSoftmaxExecution::NotRequested;
+    gradient_guided_falsify_with_traffic_objective(
+        onnx,
+        forward,
+        spec,
+        box_lo,
+        box_hi,
+        emit_pin,
+        seed_witness,
+        priority_seeds,
+        instance_deadline,
+        budget_override,
+        exhaust_restarts,
+        None,
+        &mut traffic_execution,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gradient_guided_falsify_with_traffic_objective(
+    onnx: &Path,
+    forward: &mut ny_onnx::diff::OrtForward,
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+    box_lo: &[f32],
+    box_hi: &[f32],
+    emit_pin: &[Option<f64>],
+    seed_witness: Option<&[f32]>,
+    priority_seeds: &[PrioritySeed],
+    instance_deadline: Option<std::time::Instant>,
+    budget_override: Option<std::time::Duration>,
+    exhaust_restarts: bool,
+    traffic_objective: Option<QualifiedTrafficSoftmaxAttackObjective>,
+    traffic_execution: &mut TrafficUpfrontSoftmaxExecution,
+) -> Option<Vec<f32>> {
     use std::time::Instant;
 
     // The kill-switch disables the stage-2 refinement escalation; the upfront
@@ -8216,6 +13952,62 @@ fn gradient_guided_falsify(
     // its own `NY_UPFRONT_ATTACK` gate at the call site.
     if budget_override.is_none() && std::env::var("NY_ORT_REFINE_GRAD").ok().as_deref() == Some("0")
     {
+        return None;
+    }
+    let admitted_at = Instant::now();
+    let remaining = instance_deadline.map(|d| d.saturating_duration_since(admitted_at));
+    let budget = match budget_override {
+        // Upfront lane: caller-fixed budget, capped again by its frozen
+        // absolute slice below.
+        Some(b) => b,
+        None => match grad_refine_budget(remaining) {
+            Some(b) => b,
+            None => {
+                eprintln!(
+                    "ORT-refine grad lane: not enough remaining budget ({remaining:?}); no escalation"
+                );
+                return None;
+            }
+        },
+    };
+    let deadline = bounded_work_deadline(admitted_at, budget, instance_deadline)?;
+    if deadline <= admitted_at {
+        return None;
+    }
+
+    // #deadlane: this lane's ONLY step direction is
+    // `GraphNetwork::attack_point_gradient`, which returns `Ok(None)` for every
+    // point on a net outside the exact-gradient fragment. That verdict is a
+    // static layer-type scan, but it used to be discovered only INSIDE the
+    // innermost step loop — after printing the escalation banner, re-loading the
+    // ONNX graph, re-reading the input shape, building the RNG/seed schedule and
+    // running restart 0's trusted-ORT forward. Answer it here, once per process
+    // (memoized), so an ineligible net costs nothing and prints no misleading
+    // "keeping derivative-free behavior" (this lane has no derivative-free
+    // fallback — it returns `None`).
+    let attack_gradients_supported = traffic_objective
+        .as_ref()
+        .map(|objective| objective.graph.supports_attack_point_gradient())
+        .unwrap_or_else(|| net_supports_attack_gradients(onnx));
+    if !attack_gradients_supported {
+        return None;
+    }
+    if Instant::now() >= deadline {
+        return None;
+    }
+    // #smooth-sign-forward / #bnn-attack-budget scoping. A binarized (`Sign`) net
+    // gets the BNN attack recipe — smooth-Sign pre-activations in
+    // `attack_point_gradient`, a β 2→20 ramp from restart 0, and the prototype's
+    // pure sign-PGD step rule — because `Sign` is piecewise constant and the
+    // ordinary APGD-on-hard-Sign recipe provably cannot crack the hard tail.
+    // Every other net takes the historical path byte-for-byte. Memoized probe, so
+    // this costs one ONNX load per process. ATTACK-DIRECTION ONLY.
+    let sign_net = traffic_objective
+        .as_ref()
+        .map(|objective| objective.graph.has_sign_layer())
+        .unwrap_or_else(|| net_is_sign_network(onnx))
+        && ny_propagate::smooth_sign_forward_enabled();
+    if Instant::now() >= deadline {
         return None;
     }
     let dim = box_lo.len();
@@ -8229,38 +14021,46 @@ fn gradient_guided_falsify(
         return None;
     }
 
-    let remaining = instance_deadline.map(|d| d.saturating_duration_since(Instant::now()));
-    let budget = match budget_override {
-        // Upfront lane: caller-fixed budget (already fits the scored deadline).
-        Some(b) => b,
-        None => match grad_refine_budget(remaining) {
-            Some(b) => b,
-            None => {
-                eprintln!(
-                    "ORT-refine grad lane: not enough remaining budget ({remaining:?}); no escalation"
-                );
+    // ny's exact-gradient oracle. Any load failure -> keep today's behavior.
+    let (graph, traffic_rewritten_spec) = match traffic_objective {
+        Some(objective) => {
+            if objective.receipt != AppliedTerminalPeel::Softmax {
+                *traffic_execution = TrafficUpfrontSoftmaxExecution::Invalidated;
                 return None;
             }
-        },
-    };
-    let deadline = Instant::now() + budget;
-
-    // ny's exact-gradient oracle. Any load failure -> keep today's behavior.
-    let graph = match load_graph_network(onnx) {
-        Ok(g) => g,
-        Err(err) => {
-            eprintln!("ORT-refine grad lane: graph load failed ({err}); no escalation");
-            return None;
+            (objective.graph, Some(objective.rewritten_spec))
+        }
+        None => {
+            let graph = match load_graph_network(onnx) {
+                Ok(graph) => graph,
+                Err(err) => {
+                    eprintln!("ORT-refine grad lane: graph load failed ({err}); no escalation");
+                    return None;
+                }
+            };
+            (graph, None)
         }
     };
+    if Instant::now() >= deadline {
+        return None;
+    }
     // Same protobuf-derived shape the trusted ORT forward runs with.
-    let (_bytes, input_shape) = match ny_onnx::diff::read_input_shape_maybe_gzip(onnx, dim) {
-        Ok(v) => v,
+    let input_shape = match ny_onnx::diff::read_input_shape_maybe_gzip(onnx, dim) {
+        Ok((model_bytes, input_shape)) => {
+            // The shape parser returns the whole (possibly decompressed) ONNX
+            // payload. Drop it immediately after parsing so it is not retained
+            // for the attack working set's lifetime.
+            drop(model_bytes);
+            input_shape
+        }
         Err(err) => {
             eprintln!("ORT-refine grad lane: input shape unavailable ({err}); no escalation");
             return None;
         }
     };
+    if Instant::now() >= deadline {
+        return None;
+    }
 
     println!(
         "ORT-refine grad lane: escalating to gradient-guided PGD (budget {:.1}s, {} dims, {} non-degenerate)",
@@ -8268,6 +14068,57 @@ fn gradient_guided_falsify(
         dim,
         width.iter().filter(|&&w| w > 0.0).count()
     );
+
+    // #traffic-input-linear-window (attack-only, soundness-neutral): install the
+    // EXACT per-unit reachability window of every `Sign` node whose pre-activation
+    // is a unary-affine function of the input, computed over THIS search box. The
+    // masked-STE default `t = 6` is calibrated in `±1` (Sign-output) input units
+    // and is wrong by two orders of magnitude for a `Sign` that reads a
+    // convolution of raw pixels (measured on traffic net-1: `mean|z| = 1356` vs a
+    // reachability radius of 40.5–81, so the mask held 3 of 12544 units and every
+    // restart died of a zero gradient after ~10 of its 120 steps). Scoped
+    // STRUCTURALLY: no `Sign` node ⇒ no map ⇒ byte-identical to today, and a
+    // `Sign` behind a reconverging join or a genuinely non-monotone op is
+    // deliberately NOT in the map and keeps the measured default.
+    // #traffic-pool-window: monotone `MaxPool2d` IS in the chain, because
+    // net-2/net-3 are `Conv -> MaxPool -> BN -> Sign` and excluding pooling left
+    // them on the flat `t = 6` — which, after the BN rescales to `O(1)`, holds
+    // EVERY unit (15488/15488, 28800/28800 measured at eps 1) and is therefore no
+    // mask at all. Through a `MaxPool` the interval is an ENCLOSURE rather than
+    // exact, so the mask can only be a SUPERSET of the flippable units. The RAII
+    // guard restores the previous thread-local map on every exit path. Selects a
+    // NON-certified ascent direction only; acceptance stays the unchanged
+    // `gate_sat_with_trusted_oracle`.
+    // `NY_STE_INPUT_LINEAR_WINDOW=0` is a diagnostic escape hatch back to the flat
+    // `masked_ste_window()` default (batteries-included: a disable-flag, never an
+    // enable-flag).
+    let _ste_window_guard = (sign_net
+        && std::env::var("NY_STE_INPUT_LINEAR_WINDOW").ok().as_deref() != Some("0"))
+    .then(|| {
+        let lo = ArrayD::from_shape_vec(IxDyn(&input_shape), box_lo.to_vec()).ok()?;
+        let hi = ArrayD::from_shape_vec(IxDyn(&input_shape), box_hi.to_vec()).ok()?;
+        let bounds = ny_tensor::BoundedTensor::new(lo, hi).ok()?;
+        let windows = graph.input_linear_sign_windows(&bounds);
+        if windows.is_empty() {
+            return None;
+        }
+        // Median window, purely diagnostic: it is what distinguishes the two
+        // failure modes of the flat `t = 6` default (net-1 median 27 => t=6 far
+        // too SMALL; net-2/net-3 median 0.10 => t=6 far too LARGE, holding every
+        // unit and degenerating to an unmasked STE).
+        let mut radii: Vec<f32> = windows.values().flat_map(|w| w.iter().copied()).collect();
+        radii.sort_by(f32::total_cmp);
+        let median = radii.get(radii.len() / 2).copied().unwrap_or(0.0);
+        println!(
+            "ORT-refine grad lane: per-unit STE reachability windows for \
+                 {} input-linear Sign node(s) ({} units, median window {median:.4}; \
+                 flat default t=6)",
+            windows.len(),
+            radii.len()
+        );
+        Some(ny_propagate::AttackSteWindowsGuard::install(windows))
+    })
+    .flatten();
 
     let mut rng = SimpleRng::new(0xA24B_AED4_963E_E407);
     let center: Vec<f32> = box_lo
@@ -8283,7 +14134,93 @@ fn gradient_guided_falsify(
     // soft-sign surrogate β on EVERY exit path so the per-step ramp installed in
     // the step loop below cannot leak into later attacks on this thread. β only
     // scales the non-certified Sign attack direction — never a verdict.
-    let _sign_beta_guard = ny_propagate::AttackSignBetaGuard::new(ny_propagate::attack_sign_beta());
+    let historical_sign_beta = ny_propagate::attack_sign_beta();
+    let _sign_beta_guard = ny_propagate::AttackSignBetaGuard::new(historical_sign_beta);
+
+    if let Some(rewritten_spec) = traffic_rewritten_spec.as_ref() {
+        crate::flight::note(
+            "traffic_upfront_softmax_objective_selection",
+            crate::flight::FlightStatus::Ran,
+            Some(
+                "authenticated original graph + exact rewritten spec selected before upfront search"
+                    .to_string(),
+            ),
+        );
+        let outcome = run_traffic_upfront_logit_dlr_micro_leg(
+            &graph,
+            rewritten_spec,
+            forward,
+            spec,
+            &input_shape,
+            box_lo,
+            box_hi,
+            &width,
+            emit_pin,
+            &center,
+            sign_net,
+            deadline,
+        );
+        // The micro-leg owns no historical optimizer state. Restore the sole
+        // thread-local it touched before restart 0 is reconstructed below.
+        ny_propagate::set_attack_sign_beta(historical_sign_beta);
+        match outcome {
+            TrafficUpfrontMicroLegOutcome::Found(found) => {
+                *traffic_execution = TrafficUpfrontSoftmaxExecution::Applied;
+                println!(
+                    "Traffic upfront logit-DLR: original-ORT-confirmed violation \
+                     within the {}-step micro-leg",
+                    TRAFFIC_UPFRONT_LOGIT_DLR_STEPS
+                );
+                return Some(found);
+            }
+            TrafficUpfrontMicroLegOutcome::Finished { gradient_steps } => {
+                if gradient_steps > 0 {
+                    *traffic_execution = TrafficUpfrontSoftmaxExecution::Applied;
+                }
+                println!(
+                    "Traffic upfront logit-DLR: additive micro-leg finished after \
+                     {gradient_steps}/{} gradient steps; resetting to the historical schedule",
+                    TRAFFIC_UPFRONT_LOGIT_DLR_STEPS
+                );
+            }
+            TrafficUpfrontMicroLegOutcome::Invalidated => {
+                *traffic_execution = TrafficUpfrontSoftmaxExecution::Invalidated;
+                eprintln!(
+                    "Traffic upfront logit-DLR: malformed/non-finite view or VJP; \
+                     treatment invalidated and historical restart 0 reset"
+                );
+            }
+        }
+    }
+
+    // #wrapper-batched-vjp: spend the same frozen slice on a K-wide exact-VJP
+    // wave when the graph/device/memory envelope support it. This is a proposal
+    // accelerator only: `try_ort_refine_vjp_wave` returns a point exclusively
+    // after the trusted ORT + zero-tolerance check, and any miss/failure drops
+    // through to the historical sequential loop below.
+    if wrapper_vjp_prewave_allowed(traffic_rewritten_spec.is_some()) {
+        if let Some(found) = try_ort_refine_vjp_wave(
+            &graph,
+            forward,
+            spec,
+            &input_shape,
+            box_lo,
+            box_hi,
+            &width,
+            emit_pin,
+            seed_witness,
+            priority_seeds,
+            &center,
+            deadline,
+            &mut ort_evals,
+            &mut grad_steps,
+        ) {
+            return Some(found);
+        }
+    }
+    if Instant::now() >= deadline {
+        return None;
+    }
 
     // Restart schedule: the bounded lanes stop at GRAD_REFINE_MAX_RESTARTS (their
     // wall budgets are small, so the cap is a safety net for very fast nets); the
@@ -8354,8 +14291,29 @@ fn gradient_guided_falsify(
         // margin, whose backward cotangent couples the top logits (π1, π3) and so
         // flips the sign pattern of some input coordinates away from the margin
         // gradient — escaping the local maxima that trap a single-loss attack.
+        // #smooth-sign-forward (attack-only, soundness-neutral): a BINARIZED
+        // (`Sign`) net also switches this restart's STEP rule from
+        // APGD (Nesterov momentum + stall-halving + re-center on best) to the
+        // external `bnn_falsifier` prototype's PURE sign-PGD:
+        //   x ← Π_box(x + lr·sign(g)),  lr = 0.30·width decaying ×0.99 per step,
+        // with NO halving, NO momentum, NO re-centering. Measured on the hard-tail
+        // traffic_signs BNN sats: ny's APGD converges to a robust local max at
+        // ~step 72 REGARDLESS of β, while pure sign-PGD driven by the SAME smooth
+        // gradient cracks them (~step 90–115) — reproducing the prototype's proven
+        // trajectory (e.g. net-2 `idx_10645_eps_1`). Default OFF ⇒ the APGD path
+        // below runs verbatim (byte-identical to today). Only the ATTACK step
+        // direction/size changes; every candidate is still ORT + zero-tol
+        // re-checked at (1), so no verdict can change.
+        let smooth_step = sign_net;
+        // #traffic-saturated-softmax: ny's PRE-`Softmax` logits at this restart's
+        // START point, used ONLY to break exact ties between disjunct margins (see
+        // `margin_subgradient_row`). Computed lazily, at most once per restart —
+        // the external prototype likewise fixes its target once, at the box centre.
+        let mut logit_guide: Option<Vec<f64>> = None;
+        let mut logit_guide_unavailable = false;
         let use_dlr = restart_idx % 2 == 1;
         let mut alpha = 0.25f32;
+        let mut lr_scale = 0.30f32; // pure sign-PGD step scale (smooth mode only)
         let mut best_margin = f64::NEG_INFINITY;
         let mut best_x = x.clone();
         let mut prev_x = x.clone();
@@ -8376,6 +14334,7 @@ fn gradient_guided_falsify(
                 restart_idx,
                 step,
                 GRAD_REFINE_MAX_STEPS_PER_RESTART,
+                sign_net,
             ));
             // (1) ACCEPTANCE — the trusted ORT forward + exact zero-tol property
             // check, identical to stage 1 and to the primary gate. UNTOUCHED.
@@ -8383,21 +14342,33 @@ fn gradient_guided_falsify(
                 Ok(o) => o,
                 Err(_) => break, // dead candidate / transient ORT failure
             };
+            if Instant::now() >= deadline {
+                break;
+            }
             ort_evals += 1;
-            let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
-            if property_violated_f64(spec, &refine_emit_view(&x, emit_pin), &out64) {
+            let out64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
+            if property_violated_f64(spec, &refine_emit_view(&x, emit_pin), &out64)
+                && Instant::now() < deadline
+            {
+                let found = clamp_inside_box(&x, box_lo, box_hi);
                 println!(
                     "ORT-refine grad lane: ORT-confirmed violation (restart {restart_idx}, \
                      {grad_steps} gradient steps, {ort_evals} ORT evals)"
                 );
-                return clamp_inside_box(&x, box_lo, box_hi);
+                if Instant::now() < deadline {
+                    return found;
+                }
+                break;
             }
             let margin = property_margin(spec, &x, &out64);
             if margin > best_margin {
                 best_margin = margin;
                 best_x = x.clone();
                 stall = 0;
-            } else {
+            } else if !smooth_step {
+                // APGD stall-halving + re-center (default). DISABLED in smooth mode:
+                // the prototype's pure sign-PGD keeps taking large steps while β
+                // ramps, which is exactly what escapes the local max APGD halts at.
                 stall += 1;
                 if stall >= 6 {
                     alpha *= 0.5;
@@ -8414,10 +14385,69 @@ fn gradient_guided_falsify(
                 }
             }
 
+            let x_arr = match ArrayD::from_shape_vec(IxDyn(&input_shape), x.clone()) {
+                Ok(a) => a,
+                Err(_) => return None,
+            };
+            // #traffic-saturated-softmax (attack-only, soundness-neutral): on a
+            // BNN the trusted ORT forward's post-`Softmax` output saturates in f32
+            // (measured: `p_true = 1`, all 42 others EXACTLY `0`, at every one of
+            // 697 iterates), so every disjunct's margin is exactly `-1` and the
+            // clause pick below degenerates to "the last clause". Compute ny's
+            // PRE-`Softmax` logits ONCE per restart — softmax is strictly
+            // monotone, so this is the SAME ranking whenever the outputs carry
+            // information — and pass them as a TIE-BREAK only. Non-Sign nets and
+            // non-Softmax heads get `None` and are byte-identical to today.
+            //
+            // #traffic-ranked-target: restart `k` takes the `k`-th best target in
+            // logit space (`margin_subgradient_row_ranked`), so restart 0 is
+            // BYTE-IDENTICAL to the historical rank-0 pick and restarts >= 1 walk
+            // the ranking instead of the arbitrary LAST tied clause.
+            //
+            // The previous scoping (`restart_idx == 0`) came from a measurement
+            // that applied the SAME rank-0 target on every restart — a net loss,
+            // because it made restarts 1..n redundant copies of restart 0. The
+            // alternative it was compared against, however, leaves restarts >= 1
+            // on a target of logit rank ~31/42 (`max_by` returns the LAST tied
+            // clause), i.e. an arbitrary class. A RANKED schedule is neither: it
+            // spends the restart budget on the 2nd, 3rd, … closest-to-violation
+            // classes. Measured at HEAD, the four deep-net rows that scoping was
+            // protecting (`48_10645_eps_1`, `64_10645_eps_1`, `64_10495_eps_1`,
+            // `64_9022_eps_1`) no longer converge under the historical target at
+            // ANY budget: 408 gradient steps at the shipped 238 s slice and 604 at
+            // a 430 s slice, all `timeout`. There is nothing left for the scoping
+            // to protect on them.
+            // `NY_LOGIT_TIEBREAK=0` disables the tie-break entirely;
+            // `NY_LOGIT_TARGET_RANKED=0` keeps the tie-break but restores the
+            // restart-0-only scoping.
+            let ranked_targets =
+                std::env::var("NY_LOGIT_TARGET_RANKED").ok().as_deref() != Some("0");
+            if sign_net
+                && (ranked_targets || restart_idx == 0)
+                && logit_guide.is_none()
+                && !logit_guide_unavailable
+                && std::env::var("NY_LOGIT_TIEBREAK").ok().as_deref() != Some("0")
+            {
+                logit_guide = graph.attack_pre_softmax_logits(&x_arr, Some(deadline));
+                logit_guide_unavailable = logit_guide.is_none();
+            }
+            // Rank 0 on restart 0 (and whenever the ranked schedule is off) keeps
+            // the historical pick exactly.
+            let target_rank = if ranked_targets { restart_idx } else { 0 };
+            if Instant::now() >= deadline {
+                break;
+            }
+
             // (2) DIRECTION — subgradient row of the loss (binding-constraint margin,
             // or its DLR-normalized form on odd restarts), backed by ny's exact CPU
             // point gradient at x.
-            let margin_row = match margin_subgradient_row(spec, &x, &out64) {
+            let margin_row = match margin_subgradient_row_ranked(
+                spec,
+                &x,
+                &out64,
+                logit_guide.as_deref(),
+                target_rank,
+            ) {
                 Some(r) => r,
                 None => break, // no finite direction here — next restart
             };
@@ -8427,10 +14457,6 @@ fn gradient_guided_falsify(
                 margin_row
             };
             let spec_row = Array2::from_shape_vec((1, out.len()), row).ok()?;
-            let x_arr = match ArrayD::from_shape_vec(IxDyn(&input_shape), x.clone()) {
-                Ok(a) => a,
-                Err(_) => return None,
-            };
             let grad = match graph.attack_point_gradient(&x_arr, &spec_row, None, Some(deadline)) {
                 Ok(Some(g)) => g,
                 Ok(None) | Err(_) => {
@@ -8446,6 +14472,9 @@ fn gradient_guided_falsify(
                     return None;
                 }
             };
+            if Instant::now() >= deadline {
+                break;
+            }
             grad_steps += 1;
 
             // (3) STEP — APGD: a signed, box-width-scaled gradient step to the
@@ -8459,31 +14488,34 @@ fn gradient_guided_falsify(
                 if eff_width[d] <= 0.0 {
                     continue;
                 }
-                let sign = if *g > 0.0 {
-                    1.0
-                } else if *g < 0.0 {
-                    -1.0
+                let sign = gradient_direction_sign(*g);
+                let nx = if smooth_step {
+                    // PURE sign-PGD (prototype): x + lr·width·sign(g), projected into
+                    // the inward-rounded box so every iterate stays f64-box-member.
+                    clamp_to_box(x[d] + lr_scale * eff_width[d] * sign, eff_lo[d], eff_hi[d])
                 } else {
-                    0.0
+                    // Sign step + momentum + projection (see [`apgd_coord_step`]).
+                    // eff_* is the global box on legacy legs and the #bab-frontier
+                    // v2 subbox on projected legs — every iterate stays inside.
+                    apgd_coord_step(
+                        x[d],
+                        prev_x[d],
+                        sign,
+                        alpha,
+                        eff_width[d],
+                        eff_lo[d],
+                        eff_hi[d],
+                    )
                 };
-                // Sign step + momentum + projection (see [`apgd_coord_step`]).
-                // eff_* is the global box on legacy legs and the #bab-frontier
-                // v2 subbox on projected legs — every iterate stays inside.
-                let nx = apgd_coord_step(
-                    x[d],
-                    prev_x[d],
-                    sign,
-                    alpha,
-                    eff_width[d],
-                    eff_lo[d],
-                    eff_hi[d],
-                );
                 if nx != x[d] {
                     moved = true;
                 }
                 next_x[d] = nx;
             }
             prev_x = std::mem::replace(&mut x, next_x);
+            if smooth_step {
+                lr_scale *= 0.99; // prototype's slow per-step lr decay
+            }
             if !moved {
                 break; // pinned on the boundary along every ascent coordinate
             }
@@ -8544,8 +14576,8 @@ fn f64_polish_falsify(
     if seed.len() != dim {
         return None;
     }
-    let lo: Vec<f64> = box_lo.iter().map(|&v| v as f64).collect();
-    let hi: Vec<f64> = box_hi.iter().map(|&v| v as f64).collect();
+    let lo: Vec<f64> = box_lo.iter().map(|&v| f32_to_f64_exact(v)).collect();
+    let hi: Vec<f64> = box_hi.iter().map(|&v| f32_to_f64_exact(v)).collect();
     let width: Vec<f64> = lo.iter().zip(&hi).map(|(l, h)| (h - l).max(0.0)).collect();
     if width.iter().all(|&w| w <= 0.0) {
         return None;
@@ -8557,7 +14589,7 @@ fn f64_polish_falsify(
     let ort_violates = |x: &[f64], forward: &mut ny_onnx::diff::OrtForward| -> Option<bool> {
         let x32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
         let out = forward.run(&x32).ok()?;
-        let o64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+        let o64: Vec<f64> = out.iter().map(|&v| f32_to_f64_exact(v)).collect();
         Some(property_violated_f64(
             spec,
             &refine_emit_view(&x32, emit_pin),
@@ -8581,7 +14613,7 @@ fn f64_polish_falsify(
     let mut x: Vec<f64> = seed
         .iter()
         .enumerate()
-        .map(|(d, &v)| clamp(v as f64, d))
+        .map(|(d, &v)| clamp(f32_to_f64_exact(v), d))
         .collect();
 
     let mut cur_m = oracle.point_margin_f64(spec, &x)?;
@@ -8724,15 +14756,538 @@ fn clamp_inside_box(x: &[f32], box_lo: &[f32], box_hi: &[f32]) -> Option<Vec<f32
 /// decimal that round-trips, so a pinned dim's emitted `X_i` re-parses to
 /// exactly the declared f64 bound (passing the organizer's exact box asserts)
 /// and casts to exactly the f32 the trusted ORT forward confirmed with.
+///
+/// `Y_j` uses the shortest decimal for the exact `f64` promotion of the ORT
+/// `f32`.  VNN-COMP 2025 compared parsed textual outputs as `f64` against its
+/// promoted ONNX `f32` outputs and required literal zero difference for a
+/// strict counterexample; ordinary `f32` Display can differ after that
+/// promotion.  VNN-COMP 2026 ignores textual outputs and authoritatively
+/// replays ONNX, so this Y-only compatibility hardening does not weaken its
+/// strict input-membership check.
 fn format_smtlib_witness_f64(input: &[f64], output: &[f32]) -> String {
     let mut lines = Vec::with_capacity(input.len() + output.len());
     for (i, &v) in input.iter().enumerate() {
         lines.push(format!("(X_{i} {v})"));
     }
     for (j, &v) in output.iter().enumerate() {
-        lines.push(format!("(Y_{j} {v})"));
+        lines.push(format!("(Y_{j} {})", f32_to_f64_exact(v)));
     }
     format!("({})", lines.join("\n"))
+}
+
+/// `#nonlinear-vnnlib`: exact counterexample search for a spec the affine parser
+/// refuses ("Non-linear arithmetic expressions are not supported in constraints").
+///
+/// # Soundness
+///
+/// A candidate is accepted ONLY when the ORIGINAL, UNRELAXED formula — including
+/// every non-linear input constraint — evaluates true at that concrete point,
+/// with the network output supplied by the trusted ONNX Runtime forward that
+/// ny's existing SAT gate relies on. This routine can only ever return a
+/// counterexample; this function never concludes `unsat`, so a false UNSAT is
+/// structurally unreachable here. The companion [`try_nonlinear_unsat`] path
+/// handles the proof direction with sound interval branch-and-bound. Candidate
+/// points come from the INTERVAL HULL, which is a superset of the true
+/// (non-convex) region — points from outside the real region are rejected by
+/// `holds_at`, not believed.
+/// Did the affine parser refuse this spec because ny cannot REPRESENT it as an
+/// affine problem — as opposed to the spec being malformed?
+///
+/// Only a representability refusal may be re-offered to the non-linear lane
+/// (`nonlinear.rs`), which evaluates the ORIGINAL, UNRELAXED formula: the input
+/// box only drives the search, every candidate witness is re-checked against the
+/// full formula in exact `BigRational`, and `unsat` comes from outward-interval
+/// branch-and-bound. So the lane is strictly stronger than the affine path on
+/// these specs, and it is fail-closed — `try_nonlinear_*` return `None` when
+/// `!formula.is_nonlinear()`, and `NonLinearFormula::parse` errors on anything it
+/// cannot represent. Widening this predicate can therefore only gain verdicts.
+///
+/// This existed as a single `contains("Non-linear arithmetic")` test, which made
+/// the whole lane DEAD CODE for adaptive_cruise_control_non_linear_2026 — the
+/// benchmark it was written for (`989cd7b5`). Those specs put a strict atom
+/// FIRST inside a conjunction, so the affine parser refuses them with
+/// "Strict input constraints are unsupported" and never mentions non-linearity.
+/// Merely REORDERING the asserts (semantics-preserving) flipped the message and
+/// produced 33/50 verdicts, which is how the dead gate was found.
+///
+/// NOTE: the affine parser's strict-input rejection itself is CORRECT and must
+/// stay. 10 of the 50 specs declare `(>= X[0,0] 0.0)`, so `(> X[0,0] 0.0)` is not
+/// implied by the box there, and on instance_11 the point (0,0) satisfies the
+/// parabola — a witness at (0,0) would be invalid. The non-linear lane honors
+/// the strict atom; the affine one cannot represent it.
+fn affine_parser_refused_for_representability(msg: &str) -> bool {
+    msg.contains("Non-linear arithmetic")
+        || msg.contains("Strict input constraints are unsupported")
+        || msg.contains("Constraint mixes input and output variables")
+        || msg.contains("Unsupported list expression")
+}
+
+fn try_nonlinear_sat(
+    onnx: &Path,
+    vnnlib: &Path,
+    timeout_secs: u64,
+    work_deadline: Option<std::time::Instant>,
+) -> Option<String> {
+    // Freeze the slice before parsing or loading either execution backend so
+    // setup is charged and a later fallback cannot rebase beyond the enclosing
+    // proof/publication boundary.
+    let deadline = nonlinear_lane_deadline(timeout_secs, work_deadline)?;
+    let content = fs::read_to_string(vnnlib).ok()?;
+    let formula = ny_onnx::vnnlib::nonlinear::NonLinearFormula::parse(&content).ok()?;
+    if !formula.is_nonlinear() {
+        // An affine spec belongs to the normal pipeline; never shadow it.
+        return None;
+    }
+    let (lo, hi) = formula.input_box()?;
+    let n = lo.len();
+    if n == 0 {
+        return None;
+    }
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let mut forward = ny_onnx::diff::OrtForward::from_path(onnx, n).ok()?;
+    // True-f64 backstop graph (see `nonlinear_f64_rejects_point`). If it cannot be
+    // built we do NOT emit sat at all on this lane: without the backstop an f32
+    // cancellation artifact is indistinguishable from a real counterexample.
+    let backstop_graph = load_onnx_with_config(onnx, &OnnxLoadConfig::default())
+        .ok()
+        .and_then(|m| {
+            m.to_graph_network_with_options(GraphNetworkOptions::default())
+                .ok()
+        })?;
+    if !backstop_graph.supports_ibp_f64_cell() {
+        return None;
+    }
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+
+    let check = |x: &[f64], forward: &mut ny_onnx::diff::OrtForward| -> Option<String> {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let y = forward.run(&xf).ok()?;
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let yf: Vec<f64> = y.iter().map(|&v| f32_to_f64_exact(v)).collect();
+        // The full original formula, at this exact point.
+        if formula.holds_at(x, &yf) == Some(true) {
+            // ...and the violation must survive EXACT arithmetic, not just f32.
+            if nonlinear_f64_rejects_point(&backstop_graph, &formula, x) {
+                return None;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let witness = format_smtlib_witness_f64(x, &y);
+            return (std::time::Instant::now() < deadline).then_some(witness);
+        }
+        None
+    };
+
+    // 1. Structured probes: centre, faces, and (for low dimension) the corners.
+    let centre: Vec<f64> = lo.iter().zip(&hi).map(|(a, b)| 0.5 * (a + b)).collect();
+    let mut probes: Vec<Vec<f64>> = vec![centre.clone(), lo.clone(), hi.clone()];
+    for i in 0..n {
+        for bound in [lo[i], hi[i]] {
+            let mut p = centre.clone();
+            p[i] = bound;
+            probes.push(p);
+        }
+    }
+    if n <= 12 {
+        for mask in 0u32..(1u32 << n.min(12)) {
+            let p: Vec<f64> = (0..n)
+                .map(|i| if mask >> i & 1 == 1 { hi[i] } else { lo[i] })
+                .collect();
+            probes.push(p);
+        }
+    }
+    for p in &probes {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if let Some(w) = check(p, &mut forward) {
+            return Some(w);
+        }
+    }
+
+    // 2. A dense axis grid for the very low-dimensional control specs this path
+    //    targets (ACC declares 2 inputs), then uniform random for the rest.
+    if n <= 3 {
+        let steps = 64usize;
+        let mut idx = vec![0usize; n];
+        'grid: loop {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let p: Vec<f64> = (0..n)
+                .map(|i| {
+                    let t = idx[i] as f64 / (steps - 1) as f64;
+                    lo[i] + t * (hi[i] - lo[i])
+                })
+                .collect();
+            if let Some(w) = check(&p, &mut forward) {
+                return Some(w);
+            }
+            let mut d = 0;
+            loop {
+                if d == n {
+                    break 'grid;
+                }
+                idx[d] += 1;
+                if idx[d] < steps {
+                    break;
+                }
+                idx[d] = 0;
+                d += 1;
+            }
+        }
+    }
+
+    // 3. ZERO-CROSSING REFINEMENT. These specs contain atoms of the form
+    //    `(== Y[k] 0.0)` inside a disjunction. Interval arithmetic can never
+    //    REFUTE such an atom while the output enclosure straddles 0, so the unsat
+    //    proof stalls exactly at the zero crossing — and the same points are
+    //    where a counterexample would live if one exists. A uniform grid or
+    //    random sampler essentially never lands on an exact root, so search for
+    //    it: bracket sign changes along each axis and bisect on the f32 output
+    //    the network actually computes.
+    if n <= 3 {
+        let steps = 64usize;
+        let eval = |p: &[f64], forward: &mut ny_onnx::diff::OrtForward| -> Option<Vec<f32>> {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let pf: Vec<f32> = p.iter().map(|&v| v as f32).collect();
+            let output = forward.run(&pf).ok()?;
+            (std::time::Instant::now() < deadline).then_some(output)
+        };
+        'axis: for axis in 0..n {
+            for other in 0..=steps {
+                if std::time::Instant::now() >= deadline {
+                    break 'axis;
+                }
+                let mut base: Vec<f64> = (0..n)
+                    .map(|i| {
+                        if i == axis {
+                            lo[i]
+                        } else {
+                            let t = other as f64 / steps as f64;
+                            lo[i] + t * (hi[i] - lo[i])
+                        }
+                    })
+                    .collect();
+                let mut prev: Option<(f64, Vec<f32>)> = None;
+                for k in 0..=steps {
+                    let t = k as f64 / steps as f64;
+                    base[axis] = lo[axis] + t * (hi[axis] - lo[axis]);
+                    let Some(y) = eval(&base, &mut forward) else {
+                        continue;
+                    };
+                    if let Some((pt, py)) = prev.as_ref() {
+                        for j in 0..y.len().min(py.len()) {
+                            if (py[j] > 0.0) != (y[j] > 0.0) {
+                                // Bisect this bracket toward an exact f32 root.
+                                let (mut a, mut b) = (*pt, base[axis]);
+                                let sa = py[j] > 0.0;
+                                for _ in 0..60 {
+                                    let m = 0.5 * (a + b);
+                                    if !m.is_finite() || m <= a.min(b) || m >= a.max(b) {
+                                        break;
+                                    }
+                                    let mut probe = base.clone();
+                                    probe[axis] = m;
+                                    let Some(ym) = eval(&probe, &mut forward) else {
+                                        break;
+                                    };
+                                    if let Some(w) = check(&probe, &mut forward) {
+                                        return Some(w);
+                                    }
+                                    if (ym[j] > 0.0) == sa {
+                                        a = m;
+                                    } else {
+                                        b = m;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    prev = Some((base[axis], y));
+                }
+            }
+        }
+    }
+
+    let mut rng = SimpleRng::new(0x9E37_79B9_7F4A_7C15);
+    while std::time::Instant::now() < deadline {
+        let p: Vec<f64> = (0..n)
+            .map(|i| lo[i] + f32_to_f64_exact(rng.next_f32()) * (hi[i] - lo[i]))
+            .collect();
+        if let Some(w) = check(&p, &mut forward) {
+            return Some(w);
+        }
+    }
+    None
+}
+
+/// `#nonlinear-vnnlib` TRUE-f64 BACKSTOP for a candidate counterexample.
+///
+/// Returns true unless the violation is DEFINITELY present throughout the
+/// certified exact-arithmetic output enclosure. A false or undecided formula,
+/// unsupported construct, or propagation failure must NOT be emitted as `sat`.
+///
+/// # Why this is mandatory on this lane
+///
+/// The generic backstop `f64_forward_rejects_witness` is unreachable here: the
+/// gate obtains its spec with `load_vnnlib(..).ok()`, and on this lane that parse
+/// ALWAYS fails — the failure is what routes us here in the first place — so
+/// `f64_keeps` fell through to `true` and the lane was f32 end-to-end.
+///
+/// MEASURED consequence on `adaptive_cruise_control_non_linear_2026`: the network
+/// clamps at `float32(100.001) = 100.0009994506836`, which is 5.49e-7 BELOW the
+/// declared threshold `100.001`, so `Y > 100.001` is unsatisfiable in exact
+/// arithmetic. At witness x=[30,-20] the f32 forward gives 100.00100708 (appears
+/// violated) while the exact f64 forward gives 100.00099945 (not violated). All
+/// 16 emitted `sat` verdicts were cancellation artifacts — 16 x -150.
+///
+/// Uses `propagate_ibp_f64_cell` over the DEGENERATE box `[x, x]`, which yields a
+/// sound outward-rounded enclosure of the true output at that point; the
+/// candidate survives only if the formula is `Tri::True` throughout that
+/// enclosure. Merely "can still hold" (`Tri::Unknown`) is not a counterexample
+/// certificate.
+fn nonlinear_backstop_accepts(truth: Option<ny_onnx::vnnlib::nonlinear::Tri>) -> bool {
+    matches!(truth, Some(ny_onnx::vnnlib::nonlinear::Tri::True))
+}
+
+fn nonlinear_f64_rejects_point(
+    graph: &GraphNetwork,
+    formula: &ny_onnx::vnnlib::nonlinear::NonLinearFormula,
+    x: &[f64],
+) -> bool {
+    if !graph.supports_ibp_f64_cell() {
+        return true;
+    }
+    let shape = IxDyn(&[1, x.len()]);
+    let Ok(lower) = ArrayD::from_shape_vec(shape.clone(), x.to_vec()) else {
+        return true;
+    };
+    let Ok(upper) = ArrayD::from_shape_vec(shape, x.to_vec()) else {
+        return true;
+    };
+    let Ok(out) = graph.propagate_ibp_f64_cell(&ny_propagate::Interval64 { lower, upper }) else {
+        return true;
+    };
+    let yl: Vec<f64> = out.lower.iter().copied().collect();
+    let yu: Vec<f64> = out.upper.iter().copied().collect();
+    // Only Tri::True certifies a violation. False, Unknown, and evaluator
+    // refusal all reject the candidate.
+    !nonlinear_backstop_accepts(formula.holds_over_box(x, x, &yl, &yu))
+}
+
+/// Tighten one nonlinear-proof output enclosure when the optional centered
+/// walk succeeds, retaining the already-sound IBP enclosure on every refusal.
+fn nonlinear_centered_mono_or_ibp(
+    graph: &GraphNetwork,
+    input: &ny_propagate::Interval64,
+    ibp: ny_propagate::Interval64,
+) -> ny_propagate::Interval64 {
+    let Ok(refined) = graph.propagate_ibp_f64_centered_mono(input) else {
+        // Refinement is optional search power. An unsupported op, numerical
+        // refusal, or any future implementation error must retain the already
+        // sound IBP enclosure instead of aborting an otherwise viable proof.
+        return ibp;
+    };
+    // `centered` is intersected with the walk's bit-identical zeroth-order
+    // value channel; `mono`, when present, is intersected with `centered`.
+    // Thus either choice is a sound subset of the original IBP enclosure.
+    refined.mono.unwrap_or(refined.centered)
+}
+
+/// `#nonlinear-vnnlib` UNSAT half: prove that NO point of the declared region
+/// satisfies a non-linear property, by input-space branch and bound.
+///
+/// # Why this is sound
+///
+/// For each subbox we compute a SOUND enclosure of the network output with
+/// `propagate_ibp_f64_cell` (outward-rounded f64 interval propagation) and then
+/// evaluate the ORIGINAL formula over `(input subbox, output enclosure)` with
+/// outward-rounded interval arithmetic. If that first screen is undecided and
+/// the graph supports it, [`GraphNetwork::propagate_ibp_f64_centered_mono`]
+/// supplies a tighter sound enclosure; a failed refinement keeps the original
+/// IBP result. `Tri::False` from either sound enclosure means no point of the
+/// subbox can satisfy the formula — including the non-linear input constraints,
+/// which shrink the region and therefore only help. A subbox that is not decided
+/// is SPLIT, never assumed. `unsat` is returned only when every leaf is refuted,
+/// so the proof covers the whole region.
+///
+/// Any refusal — unsupported op, budget exhausted, split limit — returns `None`
+/// and the caller keeps its sound `unknown`.
+fn try_nonlinear_unsat(
+    onnx: &Path,
+    vnnlib: &Path,
+    timeout_secs: u64,
+    work_deadline: Option<std::time::Instant>,
+) -> Option<bool> {
+    // This is the second half of a sequential fallback. It shares the caller's
+    // absolute work deadline instead of receiving a fresh full relative budget.
+    let deadline = nonlinear_lane_deadline(timeout_secs, work_deadline)?;
+    let content = fs::read_to_string(vnnlib).ok()?;
+    let formula = ny_onnx::vnnlib::nonlinear::NonLinearFormula::parse(&content).ok()?;
+    if !formula.is_nonlinear() {
+        return None;
+    }
+    let (lo, hi) = formula.input_box()?;
+    let n = lo.len();
+    // Input-space splitting is only tractable in low dimension; the control
+    // benchmarks this targets declare 2 inputs.
+    if n == 0 || n > 4 {
+        return None;
+    }
+
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let model = load_onnx_with_config(onnx, &OnnxLoadConfig::default()).ok()?;
+    let graph = model
+        .to_graph_network_with_options(GraphNetworkOptions::default())
+        .ok()?;
+    if !graph.supports_ibp_f64_cell() {
+        return None;
+    }
+    // Compute the graph-wide support predicate once. Re-walking the 13-node ACC
+    // graph for every one of millions of possible cells is pure overhead.
+    let supports_centered_mono = graph.supports_ibp_f64_centered();
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    // BEST-FIRST by box volume — always split the LARGEST remaining box.
+    //
+    // Depth-first dives to the f64 grid on one branch and abandons the proof
+    // having discharged almost nothing (ACC instance_34 gave up at 25s with 75%
+    // of its budget unused). Breadth-first fixes that but explodes the frontier:
+    // instance_1 hit the 2^20 queue cap after only 64s of a 240s budget. Taking
+    // the largest box first discharges the bulk of the region early, so the
+    // frontier stays small and only genuinely thin slivers survive to the end —
+    // which is also the honest signal that the RELAXATION, not the search, is
+    // what is left.
+    #[derive(PartialEq)]
+    struct Cell(f64, Vec<f64>, Vec<f64>, u32);
+    impl Eq for Cell {}
+    impl Ord for Cell {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0.total_cmp(&other.0)
+        }
+    }
+    impl PartialOrd for Cell {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    let volume = |l: &[f64], u: &[f64]| -> f64 {
+        l.iter().zip(u).map(|(a, b)| (b - a).max(0.0)).sum::<f64>()
+    };
+    let mut stack: std::collections::BinaryHeap<Cell> = std::collections::BinaryHeap::new();
+    stack.push(Cell(volume(&lo, &hi), lo, hi, 0));
+    // Bound the search by TIME and by f64 representability, not by an arbitrary
+    // depth constant. A fixed cap aborted two ACC instances that still had 70%
+    // of their budget left. `MAX_DEPTH` remains only as a runaway backstop far
+    // above where a 2-D box collapses to the f64 grid (the `mid` check below is
+    // what actually terminates a degenerate branch), and `MAX_STACK` bounds
+    // memory.
+    const MAX_DEPTH: u32 = 200;
+    const MAX_STACK: usize = 1 << 20;
+    let mut leaves = 0usize;
+
+    while let Some(Cell(_, bl, bu, depth)) = stack.pop() {
+        if std::time::Instant::now() >= deadline || leaves > 20_000_000 || stack.len() > MAX_STACK {
+            return None;
+        }
+        leaves += 1;
+
+        let shape = IxDyn(&[1, bl.len()]);
+        let lower = ArrayD::from_shape_vec(shape.clone(), bl.clone()).ok()?;
+        let upper = ArrayD::from_shape_vec(shape, bu.clone()).ok()?;
+        let input = ny_propagate::Interval64 { lower, upper };
+        let mut out = graph.propagate_ibp_f64_cell(&input).ok()?;
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let mut yl: Vec<f64> = out.lower.iter().copied().collect();
+        let mut yu: Vec<f64> = out.upper.iter().copied().collect();
+        let mut truth = formula.holds_over_box(&bl, &bu, &yl, &yu)?;
+        // Formula evaluation is verdict-authorized work too. Do not admit the
+        // optional multi-walk refinement after the absolute proof deadline.
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+
+        // The measured ACC residual is not search-order limited: ordinary IBP
+        // keeps straddling Y=0 after millions of leaves. Escalate ONLY an
+        // undecided cell, preserving the cheap historical result for every
+        // cell IBP already settles. ACC has at most two seeded axes, so this
+        // adds a small fixed live-tensor working set rather than frontier-sized
+        // state.
+        if truth == ny_onnx::vnnlib::nonlinear::Tri::Unknown && supports_centered_mono {
+            out = nonlinear_centered_mono_or_ibp(&graph, &input, out);
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            yl = out.lower.iter().copied().collect();
+            yu = out.upper.iter().copied().collect();
+            // The baseline evaluation succeeded, so a refinement-evaluator
+            // refusal is unexpected. Fail open to its prior Unknown instead of
+            // throwing away the existing complete-cover search.
+            if let Some(refined_truth) = formula.holds_over_box(&bl, &bu, &yl, &yu) {
+                truth = refined_truth;
+            }
+        }
+
+        match truth {
+            // No counterexample in this subbox — discharged.
+            ny_onnx::vnnlib::nonlinear::Tri::False => continue,
+            // A whole subbox of counterexamples: the property is violated, so
+            // this is emphatically NOT unsat. Hand back to the sat path.
+            ny_onnx::vnnlib::nonlinear::Tri::True => {
+                return (std::time::Instant::now() < deadline).then_some(false);
+            }
+            ny_onnx::vnnlib::nonlinear::Tri::Unknown => {}
+        }
+        if depth >= MAX_DEPTH {
+            return None;
+        }
+        // Split the widest coordinate.
+        let (widest, _) = bl
+            .iter()
+            .zip(&bu)
+            .enumerate()
+            .map(|(i, (l, u))| (i, u - l))
+            .fold((0usize, f64::NEG_INFINITY), |acc, (i, w)| {
+                if w > acc.1 {
+                    (i, w)
+                } else {
+                    acc
+                }
+            });
+        let mid = 0.5 * (bl[widest] + bu[widest]);
+        if !mid.is_finite() || mid <= bl[widest] || mid >= bu[widest] {
+            // The box has collapsed to the f64 grid and is still undecided.
+            return None;
+        }
+        let mut ll = bl.clone();
+        let mut lu = bu.clone();
+        lu[widest] = mid;
+        let mut rl = bl;
+        let ru = bu;
+        rl[widest] = mid;
+        stack.push(Cell(volume(&ll, &lu), ll.clone(), lu, depth + 1));
+        stack.push(Cell(volume(&rl, &ru), rl, ru, depth + 1));
+        ll.clear();
+    }
+    (std::time::Instant::now() < deadline).then_some(true)
 }
 
 /// Simple seeded xorshift64 PRNG (no `rand` dependency), matching the PGD samplers.
@@ -8787,7 +15342,7 @@ fn confirm_violation_with_ort(onnx: &Path, vnnlib: &Path, witness: Option<&str>)
     if output_f32.is_empty() {
         return Err(anyhow!("ONNX Runtime returned no outputs"));
     }
-    let output_values: Vec<f64> = output_f32.iter().map(|&v| v as f64).collect();
+    let output_values: Vec<f64> = output_f32.iter().map(|&v| f32_to_f64_exact(v)).collect();
 
     // Evaluate the FULL parsed VNN-LIB property at the witness (input, trusted output).
     //
@@ -8799,8 +15354,71 @@ fn confirm_violation_with_ort(onnx: &Path, vnnlib: &Path, witness: Option<&str>)
     // `is_unsafe(output)` produced 71 false `sat` on nn4sys (witness X_0 outside every
     // clause box). `property_violated` enforces BOTH the per-clause input box and the
     // output constraints; `> 0` is a strict, robust, ZERO-TOL violation.
-    let spec = ny_onnx::vnnlib::load_vnnlib(vnnlib)
-        .map_err(|e| anyhow!("re-parsing VNN-LIB property {}: {e}", vnnlib.display()))?;
+    let spec = match ny_onnx::vnnlib::load_vnnlib(vnnlib) {
+        Ok(spec) => spec,
+        Err(e) => {
+            // #nonlinear-vnnlib: the affine parser cannot REPRESENT a non-linear
+            // property, so it cannot confirm one either — which silently
+            // downgraded every genuine counterexample on
+            // adaptive_cruise_control_non_linear_2026 back to `unknown`.
+            //
+            // Confirm with the exact evaluator instead. This keeps the gate's
+            // semantics EXACTLY: the full original property, evaluated at the
+            // witness input and the TRUSTED ORT output. It is strictly stronger
+            // than the affine path here, because it also enforces the non-linear
+            // INPUT constraints (the parabolic region) that the affine parser
+            // would have had to drop.
+            let msg = e.to_string();
+            if !affine_parser_refused_for_representability(&msg) {
+                return Err(anyhow!(
+                    "re-parsing VNN-LIB property {}: {e}",
+                    vnnlib.display()
+                ));
+            }
+            let content = fs::read_to_string(vnnlib)
+                .map_err(|io| anyhow!("re-reading VNN-LIB property {}: {io}", vnnlib.display()))?;
+            let formula =
+                ny_onnx::vnnlib::nonlinear::NonLinearFormula::parse(&content).map_err(|pe| {
+                    anyhow!("non-linear re-parse of {} failed: {pe}", vnnlib.display())
+                })?;
+            // TRUE-f64 BACKSTOP (#nonlinear-vnnlib). `f64_forward_rejects_witness`
+            // is unreachable on this lane because the caller's `load_vnnlib` fails
+            // by construction, so the f32-artifact hole must be closed HERE too —
+            // this is the funnel every `sat` passes through.
+            let model =
+                load_onnx_with_config(onnx, &OnnxLoadConfig::default()).map_err(|load| {
+                    anyhow!(
+                        "loading exact-f64 backstop for {} failed: {load}",
+                        vnnlib.display()
+                    )
+                })?;
+            let graph = model
+                .to_graph_network_with_options(GraphNetworkOptions::default())
+                .map_err(|build| {
+                    anyhow!(
+                        "building exact-f64 backstop for {} failed: {build}",
+                        vnnlib.display()
+                    )
+                })?;
+            if nonlinear_f64_rejects_point(&graph, &formula, &input_f64) {
+                return Err(anyhow!(
+                    "non-linear counterexample at {} is not definitely violating in exact f64; \
+                     refusing to confirm",
+                    vnnlib.display()
+                ));
+            }
+            return match formula.holds_at(&input_f64, &output_values) {
+                Some(v) => Ok(v),
+                // An unsupported construct must NOT read as "confirmed"; refuse
+                // so the caller downgrades to a sound unknown.
+                None => Err(anyhow!(
+                    "non-linear property at {} uses a construct the exact evaluator \
+                     does not implement; cannot confirm",
+                    vnnlib.display()
+                )),
+            };
+        }
+    };
     // `input_f64` is the flat witness input in X_i index order — the organizer's
     // f64 view of the exact decimals the witness declares (zero tolerance kept).
     Ok(property_violated_f64(&spec, &input_f64, &output_values))
@@ -8854,7 +15472,7 @@ fn log_internal_vs_ort_divergence(onnx: &Path, witness: &str) {
         }
         let (mut max_abs, mut max_idx) = (0f64, 0usize);
         for (j, (&c, &o)) in claimed.iter().zip(ort.iter()).enumerate() {
-            let d = (c - o as f64).abs();
+            let d = (c - f32_to_f64_exact(o)).abs();
             if d > max_abs {
                 max_abs = d;
                 max_idx = j;
@@ -8864,7 +15482,7 @@ fn log_internal_vs_ort_divergence(onnx: &Path, witness: &str) {
             "ORT-divergence diagnostic: max|Y_internal - Y_ort| = {max_abs:.6e} at Y_{max_idx} \
              (internal {}, ORT {}) over {} outputs",
             claimed[max_idx],
-            ort[max_idx] as f64,
+            f32_to_f64_exact(ort[max_idx]),
             ort.len()
         );
         Some(())
@@ -8928,33 +15546,69 @@ fn parse_witness_inputs_generic<T: std::str::FromStr + Copy>(witness: &str) -> R
     Ok(indexed.into_iter().map(|(_, v)| v).collect())
 }
 
-/// Resolve the GPU capability hint that feeds the AUTO backend size gate.
+/// Replace a peeled verifier witness's output coordinates with the ORIGINAL
+/// model's trusted ONNX Runtime outputs while preserving its input decimals.
+///
+/// A terminal Softmax peel proves and searches in logit coordinates. The
+/// ordering rewrite is exact, but VNN-COMP 2025 also compares the textual
+/// `Y_j` assignments against the original ONNX output at zero tolerance. Thus
+/// a sound counterexample can still be rejected if its witness publishes
+/// logits. This helper repairs only that representation boundary; the caller
+/// subsequently runs the unchanged full trusted-oracle property gate.
+fn rehydrate_original_witness_outputs(onnx: &Path, witness: &str) -> Result<String> {
+    let input_f64 = parse_witness_inputs_f64(witness)?;
+    let input_f32: Vec<f32> = input_f64.iter().map(|&value| value as f32).collect();
+    let mut forward = ny_onnx::diff::OrtForward::from_path(onnx, input_f32.len())
+        .map_err(|error| anyhow!("building original-model ORT session: {error}"))?;
+    let output = forward
+        .run(&input_f32)
+        .map_err(|error| anyhow!("running original-model ORT witness repair: {error}"))?;
+    if output.is_empty() {
+        anyhow::bail!("original-model ORT witness repair returned no outputs");
+    }
+    Ok(format_smtlib_witness_f64(&input_f64, &output))
+}
+
+/// Resolve the accelerator capability hint that feeds the AUTO backend size
+/// gate.
 ///
 /// An explicit `GPU_AVAILABLE` env var wins in both directions (`0`, empty, or
 /// unparseable => no GPU) so scripts/operators keep full control. When the var
-/// is UNSET, ny probes for a hardware GPU adapter itself
-/// ([`ny_gpu::wgpu_adapter_available`]): the VNN-COMP protocol runs
-/// `prepare_instance.sh` and `run_instance.sh` as SEPARATE processes, so an env
-/// var exported by the prepare step never reaches the run step
-/// (#vnncomp-gpu-available-lost) — relying on it silently pinned every
-/// auto-routed category to CPU on GPU hardware in scored runs.
-fn gpu_capability_hint() -> bool {
-    resolve_gpu_hint(
+/// is UNSET, reuse compute-backend detection's cached CUDA/WGPU observation.
+/// NVIDIA hosts intentionally do not ask Vulkan for a WGPU adapter: a usable
+/// CUDA engine still counts as acceleration for large-model attack steering,
+/// and the verifier routes it through the process-global CUDA GEMM handle. The
+/// VNN-COMP protocol runs `prepare_instance.sh` and `run_instance.sh` as
+/// SEPARATE processes, so an env var exported by the prepare step never reaches
+/// the run step (#vnncomp-gpu-available-lost).
+fn accelerator_capability_hint() -> bool {
+    let detected = crate::compute_backend::detect();
+    let cuda_attack_candidate =
+        detected.cuda_engine_candidate && std::env::var_os("NY_NO_CUDA_F32").is_none();
+    resolve_accelerator_hint(
         std::env::var("GPU_AVAILABLE").ok().as_deref(),
-        ny_gpu::wgpu_adapter_available,
+        ny_gpu::wgpu_backend_compiled(),
+        detected.wgpu_adapter.is_some(),
+        cuda_attack_candidate,
     )
 }
 
-/// Injectable core of [`gpu_capability_hint`]: unit-testable without touching
-/// process env or GPU hardware.
-fn resolve_gpu_hint(env_val: Option<&str>, probe: impl FnOnce() -> bool) -> bool {
-    // A runtime GPU is only usable if the wgpu backend is also compiled in.
-    if !ny_gpu::wgpu_backend_compiled() {
+/// Injectable core of [`accelerator_capability_hint`]: unit-testable without
+/// touching process env or GPU hardware.
+fn resolve_accelerator_hint(
+    env_val: Option<&str>,
+    wgpu_backend_compiled: bool,
+    wgpu_adapter_detected: bool,
+    cuda_engine_candidate: bool,
+) -> bool {
+    // An operator hint cannot make an accelerator appear in a build/runtime
+    // that has neither a compiled WGPU route nor a usable CUDA candidate.
+    if !wgpu_backend_compiled && !cuda_engine_candidate {
         return false;
     }
     match env_val {
         Some(v) => v.parse::<u32>().map(|n| n != 0).unwrap_or(false),
-        None => probe(),
+        None => cuda_engine_candidate || (wgpu_backend_compiled && wgpu_adapter_detected),
     }
 }
 
@@ -8970,15 +15624,17 @@ fn resolve_gpu_hint(env_val: Option<&str>, probe: impl FnOnce() -> bool) -> bool
 fn invoke_beta_crown(
     onnx: &Path,
     vnnlib: &Path,
-    preset: Option<PathBuf>,
+    preset: Option<&Path>,
     ny_timeout: u64,
+    deferred_pgd_consumer_available: bool,
     instance_overrides: BetaCrownInstanceOverrides,
 ) -> Result<()> {
     // GPU capability HINT for the AUTO size gate, not a backend force: the
     // per-instance decision still applies — LARGE conv-dominated inputs (>1000
     // elements) go to the GPU, while small input-split nets (acasxu = 5 inputs,
     // cersyve = 4, …) stay on the CPU input-split BaB, which is materially
-    // faster for them. See `gpu_capability_hint` for how the hint is resolved.
+    // faster for them. See `accelerator_capability_hint` for how the hint is
+    // resolved.
     //
     // REGRESSION FIX (#vnncomp-gpu-routing): this used to be threaded into the
     // legacy `--gpu` FORCE parameter, which `resolve_beta_crown_backend` treats as
@@ -8994,12 +15650,16 @@ fn invoke_beta_crown(
     // `handle_beta_crown_command` (`ny_propagate::set_sound_gpu_crown_required`) so
     // verdict-deciding CROWN runs on the proven-sound CPU path; GPU is used only for
     // GEMM, IBP forward, and PGD/attack, which cannot produce an unsound Verified.
-    let gpu_available = gpu_capability_hint();
+    let gpu_available = accelerator_capability_hint();
 
     handle_beta_crown_command(
         onnx.to_path_buf(),
         Some(vnnlib.to_path_buf()),
-        preset,
+        // `handle_beta_crown_command` is also the clap entry (main.rs), so it
+        // owns its `PathBuf`s: this is the single point where the borrow tied
+        // to the plan's temp-preset guard has to become owned, alongside the
+        // model/property conversions above it.
+        preset.map(Path::to_path_buf),
         // epsilon / threshold defaults (ignored when --property is set).
         0.01,
         0.0,
@@ -9007,6 +15667,7 @@ fn invoke_beta_crown(
         false, // allow_heuristic_logsoftmax
         false, // allow_heuristic_softmax
         None,  // max_domains: preset-owned (see the lane-cap note at the top of this file)
+        None,  // max_queue_bytes: preset-owned
         Some(ny_timeout),
         None,       // max_depth
         None,       // branching: auto
@@ -9059,8 +15720,8 @@ fn invoke_beta_crown(
         None::<BackendArg>, // backend: auto
         false,              // gpu: NO legacy force — GPU_AVAILABLE is a capability
         // hint, not an unconditional wgpu override (#vnncomp-gpu-routing).
-        Some(gpu_available), // gpu_available: explicit GPU_AVAILABLE or the in-process
-        // hardware-adapter probe feeds the AUTO size gate: large conv -> GPU, ACAS -> CPU.
+        Some(gpu_available), // gpu_available: explicit GPU_AVAILABLE or cached CUDA/WGPU
+        // capability feeds AUTO: large conv -> accelerated attack route, ACAS -> CPU.
         None,  // input_split_metrics_jsonl
         None,  // domain_batch_metrics_jsonl
         true,  // json: REQUIRED so the verdict is rendered and captured
@@ -9079,30 +15740,2295 @@ fn invoke_beta_crown(
         // The scored VNN-COMP path runs in competition mode: proof-carrying
         // certificate emission and the in-tree self-checks are turned OFF so the
         // exact-arithmetic pass never competes with the wall-clock budget. This
-        // does NOT weaken verdict soundness — only the extra cert artifact is
-        // skipped. Interactive `ny beta-crown` keeps certificates ON by default.
+        // does NOT weaken verdict soundness: it explicitly grants only runtime
+        // verdict authority, while interactive `ny beta-crown` requests external
+        // certificate authority by default.
         ProofOpts {
             competition_mode: true,
             ..ProofOpts::default()
         },
+        // This is the frozen wrapper decision resolved before verifier setup,
+        // including the exact NY_POSTBAB_ATTACK=0 and typed-preset opt-outs.
+        // Deferred PGD may be admitted only when that outer phase can run.
+        deferred_pgd_consumer_available,
         instance_overrides,
     )
 }
 
 /// Write the VNN-COMP result (and witness, for `sat`) to RESULTS_FILE.
+///
+/// A successful publication of a DECIDED verdict is recorded process-globally
+/// so the in-process watchdog cannot later replace it with `timeout`
+/// (#watchdog-verdict-overwrite). A FAILED publication records nothing: the
+/// bytes never landed, so the placeholder is still what a watchdog would be
+/// replacing.
 fn write_results(results_file: &Path, result: &VnncompResult) -> Result<()> {
-    fs::write(results_file, result.render_results_file()).map_err(|e| {
-        anyhow!(
-            "failed to write results file {}: {e}",
-            results_file.display()
-        )
-    })
+    publish_result_atomically(results_file, &result.render_results_file(), "result.tmp")
+        .map(|()| note_published_verdict(result))
+        .map_err(|e| {
+            anyhow!(
+                "failed to atomically publish results file {}: {e}",
+                results_file.display()
+            )
+        })
+}
+
+/// Publish a terminal result through the route's sole authorized writer.
+///
+/// Historical/off routes call [`write_results`] exactly as before. The
+/// short-grace route sends the value to its deadline coordinator; `false`
+/// means the scored deadline closed publication first and the pre-written
+/// `unknown` remains final.
+fn write_terminal_result(
+    results_file: &Path,
+    short_grace_publisher: Option<&ShortGraceResultPublisher>,
+    result: VnncompResult,
+) -> Result<bool> {
+    if let Some(publisher) = short_grace_publisher {
+        publisher.publish_terminal(result).map_err(|error| {
+            anyhow!(
+                "failed to publish short-grace terminal result {}: {error}",
+                results_file.display()
+            )
+        })
+    } else {
+        write_results(results_file, &result)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::write::GzEncoder;
+
+    /// (c) A REFUSAL LEAVES THE VERDICT EXACTLY AS THE UNWIRED PATH PRODUCED IT.
+    ///
+    /// `sign_space_lane_verdict` is the lane's ENTIRE verdict authority at the
+    /// call site. This pins all three of its arms:
+    ///
+    /// 1. no witness — which is what EVERY non-candidate outcome maps to,
+    ///    including the disarmed default, a `Refused` and an `Exhausted` — must
+    ///    not even CONSULT the gate, and must return `None` so the caller runs
+    ///    the ordinary verification path untouched. The `gate` closure here
+    ///    panics if invoked, so "the gate is never consulted" is checked rather
+    ///    than assumed;
+    /// 2. a witness the gate downgrades must also return `None` (verdict-neutral
+    ///    fall-through), NOT the downgraded `unknown` — returning that would
+    ///    forfeit the instance before the sound verifier ever ran;
+    /// 3. only an UPHELD `sat` terminates the instance, and it is returned
+    ///    byte-for-byte as the gate produced it.
+    ///
+    /// There is no arm that returns `unsat`, so the lane cannot manufacture a
+    /// proof.
+    #[test]
+    fn sign_space_lane_is_verdict_neutral_unless_it_has_a_candidate() {
+        // 1. Refused / exhausted / disarmed / out-of-budget all arrive as None.
+        let verdict = sign_space_lane_verdict(None, |_| {
+            panic!("the trusted-oracle gate must not be consulted without a candidate")
+        });
+        assert!(
+            verdict.is_none(),
+            "a lane refusal must fall through to the unchanged solver path"
+        );
+
+        // 2. A candidate the gate rejects also falls through.
+        let mut consulted = 0usize;
+        let verdict = sign_space_lane_verdict(Some("(X_0 1.0)".to_string()), |witness| {
+            consulted += 1;
+            assert_eq!(witness, "(X_0 1.0)", "the gate sees the witness verbatim");
+            VnncompResult::Unknown
+        });
+        assert_eq!(consulted, 1, "a candidate must reach the gate exactly once");
+        assert!(
+            verdict.is_none(),
+            "a downgraded candidate must NOT return the gate's unknown as the verdict"
+        );
+
+        // 3. Only an upheld sat terminates the instance.
+        let verdict =
+            sign_space_lane_verdict(Some("(X_0 1.0)".to_string()), |_| VnncompResult::Sat {
+                witness: Some("(X_0 1.0)\n(Y_0 2.0)".to_string()),
+            });
+        assert!(
+            matches!(
+                verdict,
+                Some(VnncompResult::Sat { witness: Some(ref w) }) if w == "(X_0 1.0)\n(Y_0 2.0)"
+            ),
+            "an upheld sat must be returned exactly as the gate produced it, got {verdict:?}"
+        );
+    }
+
+    /// The unarmed default, at the CALL SITE rather than inside the lane
+    /// module: with `NY_BNN_SIGN_SPACE` unset AND no category preset asking for
+    /// the lane, `try_sign_space_falsify` produces no witness even for a real
+    /// staged instance path, so `sign_space_lane_verdict` never consults the
+    /// gate and the caller's behaviour is byte-identical to the unwired tree.
+    ///
+    /// `Some(false)` — a preset that explicitly declines the lane — is checked
+    /// alongside `None`, because those are the two shapes every category other
+    /// than `traffic_signs_recognition_2023` presents.
+    #[test]
+    fn unset_lever_leaves_the_sign_space_call_site_inert() {
+        for preset_armed in [None, Some(false)] {
+            let witness = try_sign_space_falsify(
+                Path::new("/nonexistent/sign-space/model.onnx"),
+                Path::new("/nonexistent/sign-space/property.vnnlib"),
+                // 8 minutes IS the official VNN-COMP per-instance budget (480s).
+                Some(std::time::Instant::now() + std::time::Duration::from_mins(8)),
+                preset_armed,
+            );
+            assert!(
+                witness.is_none(),
+                "the unarmed lane must produce no witness (preset {preset_armed:?})"
+            );
+            assert!(sign_space_lane_verdict(witness, |_| panic!(
+                "gate consulted on the unarmed arm"
+            ))
+            .is_none());
+        }
+    }
+
+    /// THE SHIPPED PRESET IS THE ARMING ROUTE.
+    ///
+    /// `attack.bnn_sign_space` is only worth having if the category's shipped
+    /// YAML actually carries it, and the value the call site reads is the one
+    /// `load_preset` produces — not a hand-built struct. This loads the real
+    /// file from `configs/` and asserts the exact projection
+    /// `run_and_translate` performs (`preset.attack.bnn_sign_space`).
+    ///
+    /// It also pins the SCOPE decision: every other shipped preset must leave
+    /// the key absent, so this capability cannot silently start spending the
+    /// attack slice on a category where its refusal cost has not been measured.
+    /// Widening it is a deliberate edit to this list plus the measurement that
+    /// licenses it.
+    #[test]
+    fn only_the_traffic_signs_preset_arms_the_sign_space_lane() {
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let armed_by_design = ["traffic_signs_recognition_2023.yaml"];
+        let mut armed = Vec::new();
+        for year in fs::read_dir(&configs).expect("list configs/") {
+            let year = year.expect("configs entry").path();
+            let is_vnncomp = year
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("vnncomp"));
+            if !is_vnncomp || !year.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(&year).expect("list preset dir") {
+                let path = entry.expect("preset entry").path();
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let preset = crate::preset::load_preset(&path)
+                    .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("preset file name")
+                    .to_string();
+                match preset.attack.bnn_sign_space {
+                    Some(true) => armed.push(name),
+                    Some(false) => panic!(
+                        "{name} sets attack.bnn_sign_space: false; omit the key instead. \
+                         Absent and false resolve to the same disarmed lane, so an explicit \
+                         false reads as a kill switch it is not — `NY_BNN_SIGN_SPACE=1` \
+                         overrides both."
+                    ),
+                    None => {}
+                }
+            }
+        }
+        armed.sort();
+        assert_eq!(
+            armed, armed_by_design,
+            "attack.bnn_sign_space is scoped to the category whose armed sweep is banked \
+             (reports/measured-2026/traffic_signs_recognition_2023_NOTES.md); adding a \
+             category needs its own measured refusal cost"
+        );
+    }
+
+    #[test]
+    fn upfront_wrapper_policy_honors_preset_schedule_and_exact_env_overrides() {
+        for schedule in [
+            ResolvedInitialPgdSchedule::Disabled,
+            ResolvedInitialPgdSchedule::InputBab,
+        ] {
+            assert_eq!(
+                upfront_wrapper_route(Some(schedule), None, true, None),
+                UpfrontWrapperRoute::DisabledByPreset,
+                "preset schedule {schedule:?} must suppress even the typed relational opt-in"
+            );
+        }
+        assert_eq!(
+            upfront_wrapper_route(Some(ResolvedInitialPgdSchedule::Upfront), None, false, None),
+            UpfrontWrapperRoute::AutoDisjunction,
+            "a validated upfront schedule keeps the historical structural gate"
+        );
+        assert_eq!(
+            upfront_wrapper_route(Some(ResolvedInitialPgdSchedule::Upfront), None, true, None),
+            UpfrontWrapperRoute::PresetRelationalConjunction,
+            "the typed opt-in adds the narrow conjunction route"
+        );
+        assert_eq!(
+            upfront_wrapper_route(None, None, false, None),
+            UpfrontWrapperRoute::AutoDisjunction
+        );
+        assert_eq!(
+            upfront_wrapper_route(
+                Some(ResolvedInitialPgdSchedule::Disabled),
+                None,
+                false,
+                Some(OsStr::new("1"))
+            ),
+            UpfrontWrapperRoute::ForcedByEnvironment,
+            "the documented force-on override remains authoritative"
+        );
+        assert_eq!(
+            upfront_wrapper_route(
+                Some(ResolvedInitialPgdSchedule::Upfront),
+                None,
+                true,
+                Some(OsStr::new("0"))
+            ),
+            UpfrontWrapperRoute::DisabledByEnvironment,
+            "the documented kill switch remains authoritative"
+        );
+        for malformed in ["", "00", "true", "off", "1 "] {
+            assert_eq!(
+                upfront_wrapper_route(
+                    Some(ResolvedInitialPgdSchedule::Disabled),
+                    None,
+                    true,
+                    Some(OsStr::new(malformed))
+                ),
+                UpfrontWrapperRoute::DisabledByPreset,
+                "near-miss environment spelling {malformed:?} must not override the preset"
+            );
+        }
+        // Typed `attack.upfront_attack` (#upfront-preset): true forces the lane
+        // exactly as the environment does, false kills it, and the exact-spelling
+        // environment overrides stay authoritative in both directions.
+        assert_eq!(
+            upfront_wrapper_route(
+                Some(ResolvedInitialPgdSchedule::Upfront),
+                Some(true),
+                false,
+                None
+            ),
+            UpfrontWrapperRoute::ForcedByPreset,
+            "the typed category key must arm the lane with no environment export"
+        );
+        assert_eq!(
+            upfront_wrapper_route(None, Some(false), false, None),
+            UpfrontWrapperRoute::DisabledByPreset,
+            "an explicit preset false suppresses even the automatic disjunction lane"
+        );
+        assert_eq!(
+            upfront_wrapper_route(None, Some(true), false, Some(OsStr::new("0"))),
+            UpfrontWrapperRoute::DisabledByEnvironment,
+            "the environment kill switch still outranks the typed preset force"
+        );
+        assert_eq!(
+            upfront_wrapper_route(None, Some(false), false, Some(OsStr::new("1"))),
+            UpfrontWrapperRoute::ForcedByEnvironment,
+            "the environment force still outranks the typed preset kill"
+        );
+    }
+
+    /// #upfront-preset DELIVERY: `attack.upfront_attack: true` must arm the
+    /// wrapper lane WITHOUT `NY_UPFRONT_ATTACK`. Until this consumer existed the
+    /// key parsed and did nothing, so every non-wrapper entry point (sweep,
+    /// `ny benchmarks run`, direct `ny vnncomp`) measured a verifier weaker
+    /// than the submission — the divergence a233053d was written to end.
+    #[test]
+    fn preset_upfront_attack_key_arms_the_route_without_the_env_var() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("preset.yaml");
+        fs::write(&path, "attack:\n  upfront_attack: true\n").expect("write preset");
+        let snapshot = BetaCrownPresetSnapshot::load(&path);
+        let route = upfront_wrapper_route_from_snapshot(Some(&snapshot), None);
+        assert_eq!(
+            route,
+            UpfrontWrapperRoute::ForcedByPreset,
+            "the typed key alone must arm the route"
+        );
+        // Admission parity with the environment force: a single-constraint
+        // (safenlp-shaped) spec is admitted as Forced, which the auto
+        // disjunction rule would skip.
+        let single_constraint =
+            spec_with(2, vec![vec![OC::LessEq(0, 1)]], false, vec![(0.0, 1.0); 30]);
+        assert_eq!(
+            upfront_attack_admission(&single_constraint, route),
+            Some(UpfrontAttackAdmission::Forced),
+            "preset arming must admit exactly what the environment force admits"
+        );
+        assert_eq!(
+            upfront_attack_admission(&single_constraint, UpfrontWrapperRoute::AutoDisjunction),
+            None,
+            "without the force the auto rule still skips single-constraint specs"
+        );
+        // The environment kill switch remains authoritative over the key.
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&snapshot), Some(OsStr::new("0"))),
+            UpfrontWrapperRoute::DisabledByEnvironment
+        );
+        // And the SHIPPED safenlp presets deliver it: this is the category whose
+        // lane previously lived only in run_instance.sh's environment export.
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        for shipped in ["vnncomp25/safenlp_2024.yaml", "vnncomp26/safenlp_2024.yaml"] {
+            let snapshot = BetaCrownPresetSnapshot::load(&configs.join(shipped));
+            assert_eq!(
+                upfront_wrapper_route_from_snapshot(Some(&snapshot), None),
+                UpfrontWrapperRoute::ForcedByPreset,
+                "{shipped} must arm the upfront lane with no environment export"
+            );
+        }
+    }
+
+    #[test]
+    fn upfront_wrapper_policy_reads_the_same_frozen_preset_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("preset.yaml");
+        fs::write(&path, "attack:\n  pgd_order: skip\n").expect("write preset");
+        let frozen = BetaCrownPresetSnapshot::load(&path);
+
+        fs::write(&path, "attack:\n  pgd_order: before\n").expect("replace preset");
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&frozen), None),
+            UpfrontWrapperRoute::DisabledByPreset,
+            "later path contents cannot change the frozen upfront decision"
+        );
+
+        fs::write(&path, "attack: [malformed").expect("write malformed preset");
+        let invalid = BetaCrownPresetSnapshot::load(&path);
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&invalid), None),
+            UpfrontWrapperRoute::DisabledByInvalidPreset,
+            "an invalid snapshot must suppress verdict-producing wrapper work"
+        );
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&invalid), Some(OsStr::new("1"))),
+            UpfrontWrapperRoute::DisabledByInvalidPreset,
+            "the force-on environment cannot outrank an invalid frozen preset"
+        );
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(None, None),
+            UpfrontWrapperRoute::AutoDisjunction,
+            "missing presets preserve the historical automatic lane"
+        );
+    }
+
+    #[test]
+    fn relational_conjunction_admission_is_narrow_and_default_off() {
+        let prop2 = spec_with(
+            5,
+            vec![vec![
+                OC::LessEq(1, 0),
+                OC::LessEq(2, 0),
+                OC::LessEq(3, 0),
+                OC::LessEq(4, 0),
+            ]],
+            false,
+            vec![(0.0, 1.0); 5],
+        );
+        assert_eq!(
+            upfront_attack_admission(&prop2, UpfrontWrapperRoute::AutoDisjunction),
+            None,
+            "the historical/default route must continue to skip prop_2"
+        );
+        assert_eq!(
+            upfront_attack_admission(&prop2, UpfrontWrapperRoute::PresetRelationalConjunction),
+            Some(UpfrontAttackAdmission::PresetRelationalConjunction),
+            "the typed preset route must admit the five-dimensional relational conjunction"
+        );
+        let prop2_equivalent_greater_eq = spec_with(
+            5,
+            vec![vec![
+                OC::GreaterEq(0, 1),
+                OC::GreaterEq(0, 2),
+                OC::GreaterEq(0, 3),
+                OC::GreaterEq(0, 4),
+            ]],
+            false,
+            vec![(0.0, 1.0); 5],
+        );
+        assert_eq!(
+            upfront_attack_admission(
+                &prop2_equivalent_greater_eq,
+                UpfrontWrapperRoute::PresetRelationalConjunction
+            ),
+            Some(UpfrontAttackAdmission::PresetRelationalConjunction),
+            "equivalent >= spelling must normalize to the same common-RHS relation"
+        );
+        assert_eq!(
+            upfront_attack_admission(&prop2, UpfrontWrapperRoute::DisabledByPreset),
+            None,
+            "a disabled PGD schedule remains authoritative"
+        );
+
+        let wrapped_in_or = spec_with(
+            5,
+            prop2.output_constraint_clauses.clone(),
+            true,
+            vec![(0.0, 1.0); 5],
+        );
+        assert_eq!(
+            upfront_attack_admission(
+                &wrapped_in_or,
+                UpfrontWrapperRoute::PresetRelationalConjunction
+            ),
+            None,
+            "a one-clause `or (and ...)` is not the opted-in conjunction shape"
+        );
+
+        let constant_threshold = spec_with(
+            5,
+            vec![vec![OC::GreaterEqConst(0, 0.0), OC::LessEq(1, 0)]],
+            false,
+            vec![(0.0, 1.0); 5],
+        );
+        assert_eq!(
+            upfront_attack_admission(
+                &constant_threshold,
+                UpfrontWrapperRoute::PresetRelationalConjunction
+            ),
+            None,
+            "the relational route must reject constant-threshold conjunctions"
+        );
+
+        for (name, mirror) in [
+            (
+                "prop_3",
+                vec![
+                    OC::LessEq(0, 1),
+                    OC::LessEq(0, 2),
+                    OC::LessEq(0, 3),
+                    OC::LessEq(0, 4),
+                ],
+            ),
+            (
+                "prop_4",
+                vec![
+                    OC::GreaterEq(1, 0),
+                    OC::GreaterEq(2, 0),
+                    OC::GreaterEq(3, 0),
+                    OC::GreaterEq(4, 0),
+                ],
+            ),
+        ] {
+            let spec = spec_with(5, vec![mirror], false, vec![(0.0, 1.0); 5]);
+            assert_eq!(
+                upfront_attack_admission(&spec, UpfrontWrapperRoute::PresetRelationalConjunction),
+                None,
+                "{name}'s varying right-hand outputs must stay on the proof path"
+            );
+        }
+
+        let too_wide = spec_with(
+            5,
+            prop2.output_constraint_clauses,
+            false,
+            vec![(0.0, 1.0); UPFRONT_RELATIONAL_MAX_INPUT_DIMS + 1],
+        );
+        assert_eq!(
+            upfront_attack_admission(&too_wide, UpfrontWrapperRoute::PresetRelationalConjunction),
+            None,
+            "the category opt-in must not become an image-sized conjunction lane"
+        );
+    }
+
+    #[test]
+    fn relational_opt_in_preserves_multiclause_auto_admission_and_cap_reason() {
+        let disjunction = spec_with(
+            3,
+            vec![vec![OC::GreaterEq(0, 2)], vec![OC::GreaterEq(1, 2)]],
+            true,
+            vec![(0.0, 1.0); 3],
+        );
+        for route in [
+            UpfrontWrapperRoute::AutoDisjunction,
+            UpfrontWrapperRoute::PresetRelationalConjunction,
+        ] {
+            assert_eq!(
+                upfront_attack_admission(&disjunction, route),
+                Some(UpfrontAttackAdmission::AutoDisjunction),
+                "typed conjunction opt-in must not widen the existing automatic \
+                 disjunction's budget class"
+            );
+        }
+    }
+
+    #[test]
+    fn relational_upfront_slice_uses_one_frozen_absolute_deadline() {
+        use std::time::{Duration, Instant};
+
+        let admitted_at = Instant::now();
+        let setup_finished = admitted_at + Duration::from_secs(3);
+        let outer_authority = admitted_at + Duration::from_secs(6);
+        let deadline =
+            bounded_work_deadline(admitted_at, Duration::from_secs(8), Some(outer_authority))
+                .expect("representable deadline");
+        assert_eq!(
+            deadline, outer_authority,
+            "the enclosing scored authority must cap the local attack slice"
+        );
+        assert_eq!(
+            deadline.saturating_duration_since(setup_finished),
+            Duration::from_secs(3),
+            "setup time is charged to the original deadline instead of rebasing a fresh slice"
+        );
+
+        let local_deadline = bounded_work_deadline(admitted_at, Duration::from_secs(4), None)
+            .expect("representable local deadline");
+        assert_eq!(
+            local_deadline,
+            admitted_at + Duration::from_secs(4),
+            "an unbounded caller still gets one absolute lane-local deadline"
+        );
+    }
+
+    #[test]
+    fn invalid_preset_semantics_suppress_all_wrapper_fast_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("preset.yaml");
+
+        for yaml in [
+            "attack:\n  pgd_orderr: before\n",
+            "attack:\n  pgd_order: skpi\n",
+            "attack:\n  pgd_order: ' skip '\n",
+            "attack:\n  pgd_order: middle\n",
+            "bab:\n  branching:\n    method: definitely_not_a_method\n",
+            "model:\n  onnx_optimization_flags: [definitely_not_a_flag]\n",
+        ] {
+            fs::write(&path, yaml).expect("write semantically invalid preset");
+            let snapshot = BetaCrownPresetSnapshot::load(&path);
+            assert!(
+                snapshot.invalid_error().is_some(),
+                "semantic error must invalidate the frozen snapshot: {yaml:?}"
+            );
+            assert_eq!(
+                upfront_wrapper_route_from_snapshot(Some(&snapshot), None),
+                UpfrontWrapperRoute::DisabledByInvalidPreset
+            );
+        }
+
+        let mut traffic_execution = TrafficTerminalSoftmaxPeelExecution::NotRequested;
+        let result = run_and_translate(
+            Path::new("/path/that/must/not/be/read/model.onnx"),
+            Path::new("/path/that/must/not/be/read/property.vnnlib"),
+            None,
+            30,
+            None,
+            None,
+            None,
+            PostBabWrapperRoute::AttackEnabled,
+            Some(BetaCrownPresetSnapshot::Invalid(
+                "retained semantic error".to_string(),
+            )),
+            false,
+            false,
+            None,
+            &mut traffic_execution,
+        );
+        assert_eq!(
+            result,
+            VnncompResult::Unknown,
+            "invalid snapshots must return before TLL/APGD/margin/verifier wrapper lanes"
+        );
+        assert_eq!(
+            traffic_execution,
+            TrafficTerminalSoftmaxPeelExecution::NotRequested
+        );
+    }
+
+    #[test]
+    fn shipped_pgd_compatibility_routes_are_explicit() {
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/vnncomp25");
+        let nn4sys = BetaCrownPresetSnapshot::load(&configs.join("nn4sys.yaml"));
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&nn4sys), None),
+            UpfrontWrapperRoute::DisabledByPreset,
+            "the shipped NN4SYS skip schedule must avoid its redundant model/ORT setup"
+        );
+        assert_eq!(
+            postbab_wrapper_route_from_snapshot(Some(&nn4sys), None),
+            PostBabWrapperRoute::ProofTailByPreset,
+            "NN4SYS explicitly gives both post-BaB attack reservations to proof"
+        );
+
+        let cifar = BetaCrownPresetSnapshot::load(&configs.join("cifar100_2024.yaml"));
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&cifar), None),
+            UpfrontWrapperRoute::AutoDisjunction,
+            "CIFAR's explicit middle->upfront compatibility must preserve its outer APGD sentinel"
+        );
+
+        let acas = BetaCrownPresetSnapshot::load(&configs.join("acasxu_2023.yaml"));
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&acas), None),
+            UpfrontWrapperRoute::PresetRelationalConjunction,
+            "only ACAS explicitly adds the narrow relational-conjunction route"
+        );
+
+        let soundness = BetaCrownPresetSnapshot::load(&configs.join("soundnessbench.yaml"));
+        assert_eq!(
+            upfront_wrapper_route_from_snapshot(Some(&soundness), None),
+            UpfrontWrapperRoute::AutoDisjunction,
+            "soundnessbench must retain the default-off conjunction behavior"
+        );
+    }
+
+    #[test]
+    fn postbab_wrapper_policy_requires_independent_typed_opt_out_for_proof_tail() {
+        assert_eq!(
+            postbab_wrapper_route(None, None, None),
+            PostBabWrapperRoute::AttackEnabled,
+            "omitted fields preserve the default-enabled wrapper"
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(0.10), None, None),
+            PostBabWrapperRoute::AttackEnabled
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(0.0), None, None),
+            PostBabWrapperRoute::AttackEnabled,
+            "the engine fraction never disables the independent wrapper by itself"
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(0.10), Some(false), None),
+            PostBabWrapperRoute::DisabledByPreset,
+            "a wrapper-only opt-out cannot reclaim a still-reserved engine tail"
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(0.0), Some(false), None),
+            PostBabWrapperRoute::ProofTailByPreset
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(-0.0), Some(false), Some(OsStr::new("1"))),
+            PostBabWrapperRoute::ProofTailByPreset,
+            "signed zero has the same typed engine schedule"
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(-0.01), Some(false), None),
+            PostBabWrapperRoute::ProofTailByPreset,
+            "finite legacy values use the engine's established [0, 0.5] clamp"
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(0.0), Some(true), None),
+            PostBabWrapperRoute::AttackEnabled,
+            "an explicit wrapper enable wins over an unrelated zero engine fraction"
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(0.0), Some(false), Some(OsStr::new("0"))),
+            PostBabWrapperRoute::ProofTailByPreset,
+            "the preset's complete typed opt-out retains proof-tail ownership when the \
+             environment kill switch also holds"
+        );
+        assert_eq!(
+            postbab_wrapper_route(Some(0.10), None, Some(OsStr::new("0"))),
+            PostBabWrapperRoute::DisabledByEnvironment
+        );
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                postbab_wrapper_route(Some(invalid), Some(false), None),
+                PostBabWrapperRoute::DisabledByPreset,
+                "non-finite value {invalid} must not acquire proof-tail privilege; effective \
+                 config validation rejects it later"
+            );
+        }
+        assert_eq!(
+            postbab_wrapper_route(Some(0.51), Some(false), None),
+            PostBabWrapperRoute::DisabledByPreset,
+            "a finite oversized value clamps to a nonzero half-budget reservation"
+        );
+        for malformed in ["", "00", "false", "off", "0 "] {
+            assert_eq!(
+                postbab_wrapper_route(Some(0.10), None, Some(OsStr::new(malformed))),
+                PostBabWrapperRoute::AttackEnabled,
+                "near-miss environment spelling {malformed:?} must preserve history"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_pgd_consumer_exists_only_on_the_enabled_frozen_wrapper_route() {
+        for (route, expected) in [
+            (PostBabWrapperRoute::AttackEnabled, true),
+            (PostBabWrapperRoute::DisabledByEnvironment, false),
+            (PostBabWrapperRoute::DisabledByPreset, false),
+            (PostBabWrapperRoute::ProofTailByPreset, false),
+        ] {
+            assert_eq!(
+                postbab_deferred_pgd_consumer_available(route, true, false),
+                expected,
+                "{route:?} must describe the exact outer consumer availability passed to \
+                 beta-crown admission"
+            );
+            assert!(
+                !postbab_deferred_pgd_consumer_available(route, false, false),
+                "{route:?} must be unavailable when the frozen heavy-memory admission declines"
+            );
+        }
+
+        assert!(postbab_deferred_pgd_consumer_available(
+            postbab_wrapper_route(None, None, None),
+            true,
+            false,
+        ));
+        assert!(
+            !postbab_deferred_pgd_consumer_available(
+                PostBabWrapperRoute::AttackEnabled,
+                true,
+                true,
+            ),
+            "the terminal SafeNLP direct-MIP ingress suppresses every post-BaB lane"
+        );
+        assert!(
+            !postbab_deferred_pgd_consumer_available(
+                postbab_wrapper_route(None, None, Some(OsStr::new("0"))),
+                true,
+                false,
+            ),
+            "NY_POSTBAB_ATTACK=0 must disable deferred-PGD admission"
+        );
+        assert!(
+            !postbab_deferred_pgd_consumer_available(
+                postbab_wrapper_route(Some(0.25), Some(false), None),
+                true,
+                false,
+            ),
+            "the frozen typed wrapper opt-out must disable deferred-PGD admission"
+        );
+    }
+
+    #[test]
+    fn postbab_wrapper_policy_reads_independent_preset_fields_from_one_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("preset.yaml");
+
+        for (yaml, expected) in [
+            (
+                "bab:\n  phase_budget: {}\n",
+                PostBabWrapperRoute::AttackEnabled,
+            ),
+            (
+                "bab:\n  phase_budget:\n    post_bab_pgd_fraction: 0.0\n",
+                PostBabWrapperRoute::AttackEnabled,
+            ),
+            (
+                "bab:\n  phase_budget:\n    post_bab_pgd_fraction: 0.25\n    \
+                 vnncomp_post_bab_attack: false\n",
+                PostBabWrapperRoute::DisabledByPreset,
+            ),
+            (
+                "bab:\n  phase_budget:\n    post_bab_pgd_fraction: 0.0\n    \
+                 vnncomp_post_bab_attack: false\n",
+                PostBabWrapperRoute::ProofTailByPreset,
+            ),
+            (
+                "bab:\n  phase_budget:\n    post_bab_pgd_fraction: 0.0\n    \
+                 vnncomp_post_bab_attack: true\n",
+                PostBabWrapperRoute::AttackEnabled,
+            ),
+        ] {
+            fs::write(&path, yaml).expect("write preset");
+            let snapshot = BetaCrownPresetSnapshot::load(&path);
+            assert_eq!(
+                postbab_wrapper_route_from_snapshot(Some(&snapshot), None),
+                expected,
+                "yaml={yaml:?}"
+            );
+        }
+
+        fs::write(&path, "bab: [malformed").expect("write malformed preset");
+        let invalid = BetaCrownPresetSnapshot::load(&path);
+        assert_eq!(
+            postbab_wrapper_route_from_snapshot(Some(&invalid), None),
+            PostBabWrapperRoute::AttackEnabled,
+            "outer scheduling must preserve history while β-CROWN reports the same frozen error"
+        );
+        assert_eq!(
+            postbab_wrapper_route_from_snapshot(Some(&invalid), Some(OsStr::new("0"))),
+            PostBabWrapperRoute::DisabledByEnvironment,
+            "an unreadable preset cannot acquire proof-tail privilege, but the independent \
+             wrapper kill switch still applies"
+        );
+
+        fs::write(
+            &path,
+            "bab:\n  phase_budget:\n    post_bab_pgd_fraction: 0.0\n    \
+             vnncomp_post_bab_attack: false\n",
+        )
+        .expect("write proof-tail preset");
+        let frozen = BetaCrownPresetSnapshot::load(&path);
+        fs::write(
+            &path,
+            "bab:\n  phase_budget:\n    post_bab_pgd_fraction: 0.25\n    \
+             vnncomp_post_bab_attack: true\n",
+        )
+        .expect("replace preset after snapshot");
+        assert_eq!(
+            postbab_wrapper_route_from_snapshot(Some(&frozen), None),
+            PostBabWrapperRoute::ProofTailByPreset,
+            "later path contents cannot change the wrapper's frozen scheduling decision"
+        );
+    }
+
+    #[test]
+    fn shipped_explicit_wrapper_opt_outs_select_the_proof_tail_route() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative in [
+            "configs/vnncomp25/cersyve.yaml",
+            "configs/vnncomp25/cgan_2023.yaml",
+            "configs/vnncomp25/cgan_2023_abcrown_parity_canary.yaml",
+            "configs/vnncomp25/cgan_2023_generator_relu_phase_split_canary.yaml",
+            "configs/vnncomp25/cgan_2023_reorder_warm_parallel_canary.yaml",
+            "configs/vnncomp26/cgan2026.yaml",
+            "configs/vnncomp25/yolo_2023.yaml",
+        ] {
+            let path = repo_root.join(relative);
+            let snapshot = BetaCrownPresetSnapshot::load(&path);
+            assert_eq!(
+                postbab_wrapper_route_from_snapshot(Some(&snapshot), None),
+                PostBabWrapperRoute::ProofTailByPreset,
+                "{relative} must assign the wrapper tail to proof"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_wrapper_and_engine_opt_out_assign_long_row_tail_to_absolute_proof_deadline() {
+        use std::time::{Duration, Instant};
+
+        let historical = internal_timeout_decision("cgan_2023", 900, None);
+        assert_eq!(historical.solver_timeout_secs, 855);
+        let proof = apply_postbab_wrapper_timeout_policy(
+            historical,
+            900,
+            PostBabWrapperRoute::ProofTailByPreset,
+        );
+        assert_eq!(
+            proof,
+            InternalTimeoutDecision {
+                solver_timeout_secs: 895,
+                effective_flush_reserve_secs: 5,
+                historical_solver_timeout_secs: 855,
+                route: InternalTimeoutRoute::PresetProofTail,
+            }
+        );
+
+        let scored_deadline = Instant::now() + Duration::from_mins(15);
+        let proof_deadline = scored_deadline
+            .checked_sub(Duration::from_secs(5))
+            .expect("15 minutes exceeds publication reserve");
+        assert_eq!(
+            beta_phase_deadline(proof, scored_deadline),
+            Some(proof_deadline),
+            "the authority is absolute, so model/runtime setup counts against proof time"
+        );
+
+        let yolo_historical = internal_timeout_decision("yolo_2023", 300, None);
+        assert_eq!(yolo_historical.solver_timeout_secs, 285);
+        let yolo_proof = apply_postbab_wrapper_timeout_policy(
+            yolo_historical,
+            300,
+            PostBabWrapperRoute::ProofTailByPreset,
+        );
+        assert_eq!(yolo_proof.solver_timeout_secs, 295);
+        let yolo_deadline = Instant::now() + Duration::from_mins(5);
+        let yolo_proof_deadline = yolo_deadline
+            .checked_sub(Duration::from_secs(5))
+            .expect("five minutes exceeds publication reserve");
+        assert_eq!(
+            beta_phase_deadline(yolo_proof, yolo_deadline),
+            Some(yolo_proof_deadline),
+            "every official 300-second YOLO row gives proof 295 absolute seconds"
+        );
+
+        let env_only = apply_postbab_wrapper_timeout_policy(
+            historical,
+            900,
+            PostBabWrapperRoute::DisabledByEnvironment,
+        );
+        assert_eq!(
+            env_only, historical,
+            "the wrapper-only env kill switch cannot silently rewrite a positive engine reserve"
+        );
+
+        for budget in [5, 60, 100] {
+            let historical = internal_timeout_decision("cgan_2023", budget, None);
+            let proof = apply_postbab_wrapper_timeout_policy(
+                historical,
+                budget,
+                PostBabWrapperRoute::ProofTailByPreset,
+            );
+            let expected = budget
+                .checked_sub(MIN_RESULTS_FLUSH_RESERVE_SECS)
+                .filter(|&timeout| timeout >= 1)
+                .unwrap_or(budget);
+            assert_eq!(proof.solver_timeout_secs, expected, "budget={budget}");
+            assert_eq!(
+                proof.effective_flush_reserve_secs,
+                budget.saturating_sub(expected),
+                "budget={budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_zero_does_not_override_safenlp_short_grace() {
+        let short = internal_timeout_decision("safenlp_2024", 20, Some(OsStr::new("1")));
+        let unchanged =
+            apply_postbab_wrapper_timeout_policy(short, 20, PostBabWrapperRoute::ProofTailByPreset);
+        assert_eq!(unchanged, short);
+    }
+
+    #[test]
+    fn nonlinear_backstop_accepts_only_definite_true() {
+        use ny_onnx::vnnlib::nonlinear::Tri;
+
+        assert!(nonlinear_backstop_accepts(Some(Tri::True)));
+        assert!(!nonlinear_backstop_accepts(Some(Tri::False)));
+        assert!(!nonlinear_backstop_accepts(Some(Tri::Unknown)));
+        assert!(!nonlinear_backstop_accepts(None));
+    }
+
+    #[test]
+    fn nonlinear_centered_refinement_closes_an_ibp_zero_straddle() {
+        use ndarray::{arr1, arr2};
+        use ny_onnx::vnnlib::nonlinear::{NonLinearFormula, Tri};
+        use ny_propagate::layers::{LinearLayer, ReLULayer};
+
+        // Both hidden coordinates are the same ReLU(x). Ordinary IBP forgets
+        // that dependency before the subtraction and encloses
+        // ReLU(x)-ReLU(x)+0.25 by [-0.75, 1.25] on x in [1,2]. The centered
+        // derivative channels retain the cancellation and prove Y > 0.
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "duplicate",
+            Layer::Linear(
+                LinearLayer::new(arr2(&[[1.0_f32], [1.0]]), Some(arr1(&[0.0, 0.0])))
+                    .expect("duplicate linear"),
+            ),
+        ));
+        graph.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer),
+            vec!["duplicate".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "cancel",
+            Layer::Linear(
+                LinearLayer::new(arr2(&[[1.0_f32, -1.0]]), Some(arr1(&[0.25])))
+                    .expect("cancelling linear"),
+            ),
+            vec!["relu".to_string()],
+        ));
+        graph.set_output("cancel");
+        assert!(graph.supports_ibp_f64_centered());
+
+        let input = ny_propagate::Interval64 {
+            lower: arr2(&[[1.0_f64]]).into_dyn(),
+            upper: arr2(&[[2.0_f64]]).into_dyn(),
+        };
+        let ibp = graph
+            .propagate_ibp_f64_cell(&input)
+            .expect("sound baseline IBP");
+        let formula = NonLinearFormula::parse(
+            r#"
+(vnnlib-version <2.0>)
+(declare-network f
+    (declare-input X real [1,1])
+    (declare-output Y real [1,1])
+)
+(assert (>= (* X[0,0] X[0,0]) 0.0))
+(assert (<= Y[0,0] 0.0))
+"#,
+        )
+        .expect("nonlinear formula");
+        let ibp_lower: Vec<_> = ibp.lower.iter().copied().collect();
+        let ibp_upper: Vec<_> = ibp.upper.iter().copied().collect();
+        assert_eq!(
+            formula.holds_over_box(&[1.0], &[2.0], &ibp_lower, &ibp_upper),
+            Some(Tri::Unknown),
+            "the fixture must exercise the measured zero-straddle failure mode"
+        );
+
+        let refined = nonlinear_centered_mono_or_ibp(&graph, &input, ibp);
+        let refined_lower: Vec<_> = refined.lower.iter().copied().collect();
+        let refined_upper: Vec<_> = refined.upper.iter().copied().collect();
+        assert!(refined_lower[0] >= ibp_lower[0]);
+        assert!(refined_upper[0] <= ibp_upper[0]);
+        assert!(refined_lower[0] > 0.0);
+        assert!(refined_lower[0] <= 0.25 && 0.25 <= refined_upper[0]);
+        for x in [1.0_f64, 1.25, 1.5, 1.75, 2.0] {
+            // Exact real semantics of this fixture: both hidden coordinates
+            // are the same stable ReLU(x), so they cancel before the exactly
+            // representable 0.25 bias. Do not require an independently
+            // outward-rounded point IBP interval to nest inside a different
+            // sound enclosure; two valid rounded enclosures need not nest.
+            let relu = x.max(0.0);
+            let exact = relu - relu + 0.25;
+            assert!(
+                refined_lower[0] <= exact && exact <= refined_upper[0],
+                "sample x={x} escaped the refined enclosure"
+            );
+        }
+        assert_eq!(
+            formula.holds_over_box(&[1.0], &[2.0], &refined_lower, &refined_upper),
+            Some(Tri::False),
+            "the stronger sound enclosure should discharge the whole cell"
+        );
+    }
+
+    #[test]
+    fn nonlinear_centered_refinement_retains_ibp_on_unsupported_graph() {
+        use ndarray::arr2;
+        use ny_propagate::layers::ClipLayer;
+
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "clip",
+            Layer::Clip(ClipLayer::new(-1.0, 1.0)),
+        ));
+        graph.set_output("clip");
+        assert!(!graph.supports_ibp_f64_centered());
+
+        let input = ny_propagate::Interval64 {
+            lower: arr2(&[[-2.0_f64]]).into_dyn(),
+            upper: arr2(&[[2.0_f64]]).into_dyn(),
+        };
+        let ibp = graph
+            .propagate_ibp_f64_cell(&input)
+            .expect("supported baseline IBP");
+        let expected_lower: Vec<_> = ibp.lower.iter().map(|value| value.to_bits()).collect();
+        let expected_upper: Vec<_> = ibp.upper.iter().map(|value| value.to_bits()).collect();
+        let retained = nonlinear_centered_mono_or_ibp(&graph, &input, ibp);
+        assert_eq!(
+            retained
+                .lower
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_lower
+        );
+        assert_eq!(
+            retained
+                .upper
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_upper
+        );
+    }
+
+    #[cfg(unix)]
+    fn monotonic_deadline_after(duration: std::time::Duration) -> CanonicalMonotonicInstant {
+        canonical_monotonic_now()
+            .expect("CLOCK_MONOTONIC")
+            .checked_add(duration)
+            .expect("small test deadline")
+    }
+
+    /// #deadlane — the post-BaB lane is declined ONLY when it has no executable
+    /// stage at all. Handing budget to a lane that cannot use it is the measured
+    /// waste (9,407.6 s across vit_2023's 200 rows, 47.0 % of the category
+    /// budget, on a benchmark with ZERO `sat` instances) — but a lane that CAN
+    /// run must keep every second, because on a genuinely-`sat` row the
+    /// falsifier is the correct tool.
+    #[test]
+    fn postbab_lane_declines_only_when_no_stage_can_execute() {
+        // Gradient-driven stages available => keep the lane, seed or not.
+        assert!(postbab_lane_has_executable_stage(false, || true));
+        assert!(postbab_lane_has_executable_stage(true, || true));
+        // No gradients, but a seed drives the DERIVATIVE-FREE stages
+        // (trusted-ORT active-set repair, exact-f64 polish, ULP jitter).
+        assert!(
+            postbab_lane_has_executable_stage(true, || false),
+            "a seeded derivative-free lane needs no network gradient and must keep its window"
+        );
+        // Neither: every stage is structurally dead.
+        assert!(
+            !postbab_lane_has_executable_stage(false, || false),
+            "no gradient AND no seed => nothing to run => decline before the window is granted"
+        );
+        // A seed must SHORT-CIRCUIT the probe: it performs an ONNX load, and a
+        // lane that already has work to do must not pay for it.
+        assert!(postbab_lane_has_executable_stage(true, || {
+            panic!("the gradient probe must not run when a seed is present")
+        }));
+    }
+
+    #[test]
+    fn optional_heavy_tails_require_a_safe_kernel_envelope_or_exact_override() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert!(optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Unbounded,
+            None
+        ));
+        assert!(!optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Unavailable,
+            None
+        ));
+        assert!(!optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: 16 * gib - 1
+            },
+            None
+        ));
+        assert!(optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: 16 * gib
+            },
+            None
+        ));
+        assert!(optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Bounded {
+                headroom_bytes: 80 * gib
+            },
+            None
+        ));
+        assert!(optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Unbounded,
+            Some(OsStr::new("unexpected"))
+        ));
+        assert!(optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Unavailable,
+            Some(OsStr::new("1"))
+        ));
+        assert!(!optional_heavy_memory_allowed(
+            ProcessMemoryEnvelope::Unbounded,
+            Some(OsStr::new("0"))
+        ));
+    }
+
+    #[test]
+    fn optional_tail_reserves_are_never_held_for_a_declined_lane() {
+        assert!(margin_row_reserve_is_actionable(false, true, false));
+        assert!(!margin_row_reserve_is_actionable(true, true, false));
+        assert!(!margin_row_reserve_is_actionable(false, false, false));
+        assert!(!margin_row_reserve_is_actionable(false, true, true));
+
+        // Proof-tail authority suppresses margin-row, not post-BaB. Preserve
+        // the pre-existing post-BaB reserve whenever that attack is enabled
+        // and memory-admitted.
+        assert!(postbab_reserve_is_actionable(true, true));
+        assert!(!postbab_reserve_is_actionable(false, true));
+        assert!(!postbab_reserve_is_actionable(true, false));
+    }
+
+    #[test]
+    fn frozen_deferred_outer_pgd_suppresses_pre_attack_margin_work() {
+        assert!(deferred_outer_pgd_has_priority(
+            Some(ResolvedInitialPgdSchedule::Deferred),
+            true,
+        ));
+        for schedule in [
+            None,
+            Some(ResolvedInitialPgdSchedule::Disabled),
+            Some(ResolvedInitialPgdSchedule::Upfront),
+            Some(ResolvedInitialPgdSchedule::InputBab),
+        ] {
+            assert!(!deferred_outer_pgd_has_priority(schedule, true));
+        }
+        assert!(!deferred_outer_pgd_has_priority(
+            Some(ResolvedInitialPgdSchedule::Deferred),
+            false,
+        ));
+        assert!(!nonlinear_fallback_may_precede_outer_pgd(true));
+        assert!(nonlinear_fallback_may_precede_outer_pgd(false));
+    }
+
+    #[test]
+    fn deferred_outer_cutoff_is_frozen_at_instance_ingress_and_charges_reserves() {
+        use std::time::{Duration, Instant};
+
+        let ingress = Instant::now();
+        let instance_deadline = ingress + Duration::from_secs(100);
+        let decision = internal_timeout_decision("deferred_fixture", 100, None);
+        assert_eq!(decision.solver_timeout_secs, 95);
+        let solver_end = solver_phase_deadline(decision, instance_deadline);
+        assert_eq!(solver_end, ingress + Duration::from_secs(95));
+
+        let plain =
+            frozen_outer_deferred_internal_deadline(Some(solver_end), 95, 95, Some(0.25), true)
+                .expect("representable plain cutoff");
+        assert_eq!(plain, ingress + Duration::from_millis(71_250));
+        assert_eq!(
+            plain.saturating_duration_since(ingress + Duration::from_secs(20)),
+            Duration::from_millis(51_250),
+            "setup elapsed after ingress must consume, not slide, the proof window"
+        );
+
+        // Ten charged upfront seconds leave an 85-second verifier grant. A
+        // further 15-second fixed tail leaves 70 seconds, of which proof owns
+        // exactly 75% after the upfront work: 10 + 52.5 = 62.5 seconds from
+        // ingress. The remaining 37.5 seconds are 15 fixed + 17.5 fractional
+        // + 5 publication reserve.
+        let with_upfront_and_fixed =
+            frozen_outer_deferred_internal_deadline(Some(solver_end), 85, 70, Some(0.25), true)
+                .expect("representable reserved cutoff");
+        assert_eq!(
+            with_upfront_and_fixed,
+            ingress + Duration::from_millis(62_500)
+        );
+        assert_eq!(
+            with_upfront_and_fixed.saturating_duration_since(ingress + Duration::from_secs(10)),
+            Duration::from_millis(52_500)
+        );
+        assert_eq!(
+            frozen_outer_deferred_internal_deadline(Some(solver_end), 95, 95, Some(0.25), false,),
+            None,
+            "non-outer schedules must not acquire the dedicated cutoff"
+        );
+    }
+
+    #[test]
+    fn deferred_outer_fraction_uses_effective_typed_preset_application() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("deferred.yaml");
+        fs::write(
+            &path,
+            "attack:\n  pgd_order: after\nbab:\n  phase_budget:\n    upfront_pgd_fraction: 0.30\n    post_bab_pgd_fraction: 0.10\n",
+        )
+        .expect("write deferred preset");
+        let snapshot = BetaCrownPresetSnapshot::load(&path);
+        let fraction = effective_deferred_pgd_fraction(Some(&snapshot))
+            .expect("validated compat-free deferred fraction");
+        assert!(
+            (fraction - 0.30).abs() < 1e-6,
+            "typed application must move max(upfront, post), not reuse the raw post field"
+        );
+
+        fs::write(&path, "attack:\n  pgd_order: before\n").expect("write upfront preset");
+        let upfront = BetaCrownPresetSnapshot::load(&path);
+        assert_eq!(effective_deferred_pgd_fraction(Some(&upfront)), None);
+    }
+
+    #[test]
+    fn postbab_never_overlaps_a_detached_concurrent_margin_worker() {
+        assert!(postbab_after_margin_allowed(false));
+        assert!(!postbab_after_margin_allowed(true));
+    }
+
+    #[test]
+    fn graph_stage_swaps_and_restores_retained_oracle_on_every_round() {
+        struct Tracked(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut oracle = Some(Tracked(std::sync::Arc::clone(&drops)));
+        for round in 1..=3 {
+            let observed = run_graph_stage_without_retained_oracle(
+                &mut oracle,
+                || true,
+                || drops.load(std::sync::atomic::Ordering::Acquire),
+                || Some(Tracked(std::sync::Arc::clone(&drops))),
+            )
+            .expect("stage admitted");
+            assert_eq!(observed, round);
+            assert!(oracle.is_some(), "round {round} did not restore the oracle");
+        }
+        drop(oracle);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn graph_stage_rechecks_admission_after_releasing_retained_oracle() {
+        struct Tracked(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut oracle = Some(Tracked(std::sync::Arc::clone(&drops)));
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let reloaded = std::sync::atomic::AtomicBool::new(false);
+        let result = run_graph_stage_without_retained_oracle(
+            &mut oracle,
+            || false,
+            || {
+                ran.store(true, std::sync::atomic::Ordering::Release);
+            },
+            || {
+                reloaded.store(true, std::sync::atomic::Ordering::Release);
+                Some(Tracked(std::sync::Arc::clone(&drops)))
+            },
+        );
+        assert!(result.is_none());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert!(!ran.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!reloaded.load(std::sync::atomic::Ordering::Acquire));
+        assert!(oracle.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_watchdog_fire_request_hard_kills_victim_and_commits_timeout() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        // Exercise the helper's re-commit after a solver verdict races the
+        // coordinator's initial timeout rename.
+        fs::write(&results_file, "unsat\n").expect("write racing verdict");
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable watchdog victim");
+        let victim_pid = victim.id();
+        let started = std::time::Instant::now();
+
+        if let Err(error) = serve_historical_external_watchdog_loop(
+            results_file.clone(),
+            60,
+            victim_pid,
+            std::io::Cursor::new(EXTERNAL_WATCHDOG_FIRE_REQUEST.to_vec()),
+        ) {
+            let _ = victim.kill();
+            let _ = victim.wait();
+            panic!("immediate-fire watchdog failed: {error}");
+        }
+
+        let status = victim.wait().expect("reap watchdog victim");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "immediate-fire control must use SIGKILL, got {status}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "control byte must bypass the 60-second fallback deadline"
+        );
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read watchdog result"),
+            "timeout\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_watchdog_eof_retires_without_killing_or_rewriting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unsat\n").expect("write completed verdict");
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable watchdog victim");
+
+        let result = serve_historical_external_watchdog_loop(
+            results_file.clone(),
+            60,
+            victim.id(),
+            std::io::Cursor::new(Vec::<u8>::new()),
+        );
+        let _ = victim.kill();
+        let _ = victim.wait();
+
+        result.expect("EOF retirement should succeed");
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read untouched result"),
+            "unsat\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_watchdog_fallback_deadline_preserves_completed_verdict() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let completed = VnncompResult::Sat {
+            witness: Some("(X_0 0.5)".to_owned()),
+        };
+        write_results(&results_file, &completed).expect("publish completed verdict");
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable watchdog victim");
+
+        serve_historical_external_watchdog_loop(
+            results_file.clone(),
+            0,
+            victim.id(),
+            std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .expect("fallback watchdog should fire");
+
+        let status = victim.wait().expect("reap watchdog victim");
+        assert_eq!(status.signal(), Some(9));
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read preserved result"),
+            completed.render_results_file()
+        );
+    }
+
+    #[test]
+    fn short_grace_injected_deadline_makes_placeholder_immutable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unknown\n").expect("write placeholder");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let publisher = ShortGraceResultPublisher {
+            results_file: results_file.clone(),
+            sender,
+        };
+
+        let expired = std::time::Instant::now();
+        let outcome = await_short_grace_terminal_result(
+            &results_file,
+            // Inject an already-expired clock boundary: no wall sleep and no
+            // scheduler tolerance can hide a +5s publication window.
+            expired,
+            receiver,
+            None,
+        );
+        assert_eq!(outcome, ShortGraceCoordinatorOutcome::Deadline);
+        assert!(
+            !publisher
+                .publish_terminal(VnncompResult::Unsat)
+                .expect("closed publication is not an I/O error"),
+            "a verifier result offered after the deadline must be declined"
+        );
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read sealed placeholder"),
+            "unknown\n",
+            "the pre-written unknown must remain immutable after deadline closure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_grace_coordinator_is_the_sole_predeadline_terminal_writer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unknown\n").expect("write placeholder");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let publisher = ShortGraceResultPublisher {
+            results_file: results_file.clone(),
+            sender,
+        };
+        let writer = std::thread::spawn(move || {
+            publisher
+                .publish_terminal(VnncompResult::Unsat)
+                .expect("coordinator publication")
+        });
+
+        let publication_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let hard_stop = monotonic_deadline_after(std::time::Duration::from_secs(5));
+        let (publication_ack_sender, publication_ack_receiver) = std::sync::mpsc::sync_channel(1);
+        let (control_sender, control_receiver) = std::sync::mpsc::sync_channel(1);
+        let control_worker = std::thread::spawn(move || {
+            assert!(matches!(
+                control_receiver.recv().expect("receive C request"),
+                ExternalWatchdogWriteRequest::PublicationCommit { .. }
+            ));
+            publication_ack_sender
+                .send(canonical_monotonic_now())
+                .expect("return child-consumed ACK");
+            let ExternalWatchdogWriteRequest::PublicationFinalize {
+                write_observed_before_h,
+                ..
+            } = control_receiver.recv().expect("receive P request")
+            else {
+                panic!("publication must finalize after child ACK");
+            };
+            write_observed_before_h
+                .send(true)
+                .expect("confirm timely P observation");
+        });
+        let watchdog = ExternalWatchdogController {
+            sender: control_sender,
+            hard_stop,
+            publication_acks: std::sync::Arc::new(std::sync::Mutex::new(publication_ack_receiver)),
+        };
+        let outcome = await_short_grace_terminal_result(
+            &results_file,
+            publication_deadline,
+            receiver,
+            Some(&watchdog),
+        );
+        assert_eq!(outcome, ShortGraceCoordinatorOutcome::Published);
+        control_worker.join().expect("join control writer");
+        assert!(writer.join().expect("join terminal writer"));
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read terminal result"),
+            "unsat\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_check_send_preemption_can_enqueue_late_but_never_authorizes() {
+        let (control_sender, control_receiver) = std::sync::mpsc::sync_channel(2);
+        let (publication_ack_sender, publication_ack_receiver) = std::sync::mpsc::sync_channel(1);
+        let hard_stop = monotonic_deadline_after(std::time::Duration::from_millis(180));
+        publication_ack_sender
+            .send(canonical_monotonic_now())
+            .expect("preload accepted child ACK");
+        let controller = ExternalWatchdogController {
+            sender: control_sender,
+            hard_stop,
+            publication_acks: std::sync::Arc::new(std::sync::Mutex::new(publication_ack_receiver)),
+        };
+
+        assert!(
+            !controller.record_publication_commit_with_boundary_fault(|| {
+                std::thread::sleep(
+                    hard_stop.remaining().expect("CLOCK_MONOTONIC")
+                        + std::time::Duration::from_millis(10),
+                );
+            }),
+            "a request enqueued after H must remain non-authoritative"
+        );
+        assert!(matches!(
+            control_receiver.try_recv(),
+            Ok(ExternalWatchdogWriteRequest::PublicationCommit { .. })
+        ));
+        assert!(
+            matches!(
+                control_receiver.try_recv(),
+                Ok(ExternalWatchdogWriteRequest::PublicationFinalize { .. })
+            ),
+            "the seam models unavoidable preemption after the final userspace check"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_check_write_preemption_can_cross_h_but_reports_nonauthoritative() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer, mut reader) = UnixStream::pair().expect("watchdog socket pair");
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_millis(25)))
+            .expect("bound byte check");
+        let hard_stop = monotonic_deadline_after(std::time::Duration::from_millis(100));
+        let (write_observed_before_h, write_observed_before_h_rx) =
+            std::sync::mpsc::sync_channel(1);
+
+        assert!(write_short_watchdog_request_with_boundary_fault(
+            &mut writer,
+            ExternalWatchdogWriteRequest::PublicationFinalize {
+                hard_stop,
+                write_observed_before_h,
+            },
+            || {
+                std::thread::sleep(
+                    hard_stop.remaining().expect("CLOCK_MONOTONIC")
+                        + std::time::Duration::from_millis(10),
+                );
+            },
+        ));
+        assert!(
+            !write_observed_before_h_rx
+                .recv()
+                .expect("writer reports post-write observation"),
+            "parent-side writer observation after H must fail closed"
+        );
+        let mut byte = [0u8; 1];
+        reader
+            .read_exact(&mut byte)
+            .expect("the seam deliberately permits a physical late byte");
+        assert_eq!(
+            byte.as_slice(),
+            EXTERNAL_WATCHDOG_PUBLICATION_FINALIZE,
+            "helper receipt time, not an impossible atomic parent check, is authoritative"
+        );
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum FullChainBoundaryFault {
+        ControllerCheckToSend,
+        WriterCheckToWrite,
+    }
+
+    #[cfg(unix)]
+    fn assert_full_publication_chain_fault_seals_unknown(fault: FullChainBoundaryFault) {
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unknown\n").expect("write placeholder");
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable verifier victim");
+        let hard_stop = monotonic_deadline_after(std::time::Duration::from_millis(500));
+
+        let (parent_control_lease, child_control) =
+            UnixStream::pair().expect("control socket pair");
+        let writer_control = parent_control_lease
+            .try_clone()
+            .expect("clone production writer fd");
+        let (parent_ack, child_ack) = UnixStream::pair().expect("ACK socket pair");
+        let helper_results = results_file.clone();
+        let victim_pid = victim.id();
+        let helper = std::thread::spawn(move || {
+            serve_short_external_watchdog_loop(
+                helper_results,
+                parent_anchored_watchdog_deadline(hard_stop),
+                victim_pid,
+                child_control,
+                child_ack,
+            )
+        });
+
+        let (control_sender, control_receiver) = std::sync::mpsc::sync_channel(4);
+        let (publication_ack_sender, publication_ack_receiver) = std::sync::mpsc::sync_channel(4);
+        let ack_forwarder = std::thread::spawn(move || {
+            forward_short_watchdog_acknowledgements(parent_ack, publication_ack_sender);
+        });
+        let pause_writer = matches!(fault, FullChainBoundaryFault::WriterCheckToWrite);
+        let writer_fault_entered = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_fault_observer = std::sync::Arc::clone(&writer_fault_entered);
+        let writer = std::thread::spawn(move || {
+            run_short_watchdog_writer_with_boundary_fault(
+                writer_control,
+                control_receiver,
+                move || {
+                    if pause_writer {
+                        writer_fault_observer.store(true, Ordering::SeqCst);
+                        std::thread::sleep(
+                            hard_stop.remaining().expect("CLOCK_MONOTONIC")
+                                + std::time::Duration::from_millis(20),
+                        );
+                        assert!(
+                            !hard_stop.is_strictly_future(),
+                            "writer fault must resume inside the check→raw-write gap after H"
+                        );
+                    }
+                },
+            );
+        });
+        let controller = ExternalWatchdogController {
+            sender: control_sender,
+            hard_stop,
+            publication_acks: std::sync::Arc::new(std::sync::Mutex::new(publication_ack_receiver)),
+        };
+
+        let (publication_sender, publication_receiver) = std::sync::mpsc::channel();
+        let publisher = ShortGraceResultPublisher {
+            results_file: results_file.clone(),
+            sender: publication_sender,
+        };
+        let publisher = std::thread::spawn(move || {
+            publisher
+                .publish_terminal(VnncompResult::Unsat)
+                .expect("faulted publication is a sound decline")
+        });
+        let publication_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let controller_fault_entered = AtomicBool::new(false);
+        let outcome = match fault {
+            FullChainBoundaryFault::ControllerCheckToSend => {
+                await_short_grace_terminal_result_with_rename_and_record(
+                    &results_file,
+                    publication_deadline,
+                    publication_receiver,
+                    Some(&controller),
+                    |staged, destination| fs::rename(staged, destination),
+                    |watchdog| {
+                        watchdog.record_publication_commit_with_boundary_fault(|| {
+                            controller_fault_entered.store(true, Ordering::SeqCst);
+                            std::thread::sleep(
+                                hard_stop.remaining().expect("CLOCK_MONOTONIC")
+                                    + std::time::Duration::from_millis(20),
+                            );
+                            assert!(
+                                !hard_stop.is_strictly_future(),
+                                "controller fault must resume inside the check→enqueue gap after H"
+                            );
+                        })
+                    },
+                )
+            }
+            FullChainBoundaryFault::WriterCheckToWrite => {
+                await_short_grace_terminal_result_with_rename_and_record(
+                    &results_file,
+                    publication_deadline,
+                    publication_receiver,
+                    Some(&controller),
+                    |staged, destination| fs::rename(staged, destination),
+                    ExternalWatchdogController::record_publication_commit,
+                )
+            }
+        };
+        match fault {
+            FullChainBoundaryFault::ControllerCheckToSend => assert!(
+                controller_fault_entered.load(Ordering::SeqCst),
+                "full chain must reach the controller check→enqueue seam"
+            ),
+            FullChainBoundaryFault::WriterCheckToWrite => assert!(
+                writer_fault_entered.load(Ordering::SeqCst),
+                "full chain must reach the writer check→raw-write seam"
+            ),
+        }
+
+        assert_eq!(
+            outcome,
+            ShortGraceCoordinatorOutcome::AcknowledgementFailed,
+            "{fault:?} must never become a parent-authorized publication"
+        );
+        assert!(
+            !publisher.join().expect("join terminal publisher"),
+            "{fault:?} must be reported as a declined terminal publication"
+        );
+        drop(controller);
+        drop(parent_control_lease);
+        writer.join().expect("join production writer loop");
+
+        let victim_status = victim.wait().expect("reap deadline-killed victim");
+        assert_eq!(
+            victim_status.signal(),
+            Some(9),
+            "{fault:?} must not delay the canonical hard stop"
+        );
+        helper
+            .join()
+            .expect("join production helper loop")
+            .expect("helper must seal the result");
+        ack_forwarder.join().expect("join production ACK forwarder");
+        assert_eq!(
+            fs::read_to_string(&results_file).expect("read final verdict"),
+            "unknown\n",
+            "{fault:?}: a late or ambiguous P must be non-authoritative"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_grace_complete_chain_rejects_both_boundary_preemptions() {
+        for fault in [
+            FullChainBoundaryFault::ControllerCheckToSend,
+            FullChainBoundaryFault::WriterCheckToWrite,
+        ] {
+            assert_full_publication_chain_fault_seals_unknown(fault);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_grace_missing_child_ack_resets_the_renamed_result() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unknown\n").expect("write placeholder");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let publisher = ShortGraceResultPublisher {
+            results_file: results_file.clone(),
+            sender,
+        };
+        let writer = std::thread::spawn(move || {
+            publisher
+                .publish_terminal(VnncompResult::Unsat)
+                .expect("missing ACK is a deadline decline, not an I/O error")
+        });
+
+        let (control_sender, _control_receiver) = std::sync::mpsc::sync_channel(1);
+        let (_publication_ack_sender, publication_ack_receiver) = std::sync::mpsc::sync_channel(1);
+        let hard_stop = monotonic_deadline_after(std::time::Duration::from_millis(140));
+        let watchdog = ExternalWatchdogController {
+            sender: control_sender,
+            hard_stop,
+            publication_acks: std::sync::Arc::new(std::sync::Mutex::new(publication_ack_receiver)),
+        };
+        let publication_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let outcome = await_short_grace_terminal_result(
+            &results_file,
+            publication_deadline,
+            receiver,
+            Some(&watchdog),
+        );
+
+        assert_eq!(outcome, ShortGraceCoordinatorOutcome::AcknowledgementFailed);
+        assert!(
+            !writer.join().expect("join declined publisher"),
+            "parent must not observe publication without child-consumed ACK"
+        );
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read fail-closed result"),
+            "unknown\n",
+            "a renamed verdict must be rolled back when child ACK is missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_grace_pause_immediately_after_ack_cannot_rollback_parent_finalization() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unsat\n").expect("write prepared verdict");
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable parent");
+        let (mut parent_control, child_control) = UnixStream::pair().expect("control socket pair");
+        let (mut parent_ack, child_ack) = UnixStream::pair().expect("ACK socket pair");
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let hard_stop = monotonic_deadline_after(std::time::Duration::from_secs(1));
+        let deadline_spec = parent_anchored_watchdog_deadline(hard_stop);
+        let child_results = results_file.clone();
+        let victim_pid = victim.id();
+        let child = std::thread::spawn(move || {
+            serve_short_external_watchdog_loop_with_fault(
+                child_results,
+                deadline_spec,
+                victim_pid,
+                child_control,
+                child_ack,
+                move || {
+                    paused_tx.send(()).expect("announce post-ACK pause");
+                    release_rx.recv().expect("release post-ACK pause");
+                },
+            )
+        });
+
+        parent_control
+            .write_all(EXTERNAL_WATCHDOG_PUBLICATION_COMMIT)
+            .expect("send C");
+        let mut ack = [0u8; 1];
+        parent_ack.read_exact(&mut ack).expect("read raw child ACK");
+        assert_eq!(ack[0], EXTERNAL_WATCHDOG_PUBLICATION_ACK);
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("child must pause in first post-write action");
+
+        // Parent acceptance places P before process-lifetime EOF while the
+        // child remains paused at the exact audited instruction boundary.
+        parent_control
+            .write_all(EXTERNAL_WATCHDOG_PUBLICATION_FINALIZE)
+            .expect("send P");
+        drop(parent_control);
+        drop(parent_ack);
+        assert!(
+            hard_stop.is_strictly_future(),
+            "test must release the ACK-visible pause while P is still eligible"
+        );
+        release_tx.send(()).expect("resume child before cutoff");
+
+        child
+            .join()
+            .expect("join fault-seam helper")
+            .expect("fault-seam helper succeeds");
+        assert_eq!(
+            fs::read_to_string(&results_file).expect("read durable verdict"),
+            "unsat\n",
+            "ACK-visible Prepared plus P consumed before H must imply durable Finalized state"
+        );
+        assert!(
+            victim
+                .try_wait()
+                .expect("inspect disposable parent")
+                .is_none(),
+            "ordered P+EOF retirement must not kill a parent that already exited"
+        );
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_grace_blocked_rename_cannot_block_the_hard_stop_cutoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unknown\n").expect("write placeholder");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let publisher = ShortGraceResultPublisher {
+            results_file: results_file.clone(),
+            sender,
+        };
+        let writer = std::thread::spawn(move || {
+            publisher
+                .publish_terminal(VnncompResult::Unsat)
+                .expect("blocked publication is a deadline decline")
+        });
+
+        let (rename_entered_tx, rename_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_rename_tx, release_rename_rx) = std::sync::mpsc::sync_channel(1);
+        let admission_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let hard_stop_deadline = monotonic_deadline_after(std::time::Duration::from_millis(80));
+        let coordinator_results = results_file.clone();
+        let coordinator = std::thread::spawn(move || {
+            await_short_grace_terminal_result_with_rename(
+                &coordinator_results,
+                admission_deadline,
+                receiver,
+                None,
+                move |_staged, _destination| {
+                    rename_entered_tx.send(()).expect("announce blocked rename");
+                    release_rename_rx.recv().expect("release blocked rename");
+                    Ok(())
+                },
+            )
+        });
+        rename_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("coordinator must reach injected rename");
+
+        let (hard_stop_tx, hard_stop_rx) = std::sync::mpsc::sync_channel(1);
+        let timer = std::thread::spawn(move || {
+            run_short_grace_hard_stop(hard_stop_deadline, || {
+                hard_stop_tx.send(()).expect("record hard stop");
+            });
+        });
+        hard_stop_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("independent hard stop must fire while rename is blocked");
+        release_rename_tx.send(()).expect("release coordinator");
+
+        assert_eq!(
+            coordinator.join().expect("join coordinator"),
+            ShortGraceCoordinatorOutcome::AcknowledgementFailed,
+            "a rename without an authoritative helper commit must not be acknowledged"
+        );
+        assert!(
+            !writer.join().expect("join publisher"),
+            "the verifier must not observe a post-cutoff publication"
+        );
+        timer.join().expect("join injected hard-stop timer");
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read placeholder"),
+            "unknown\n"
+        );
+    }
+
+    #[test]
+    fn parent_controller_writer_and_helper_share_bit_identical_monotonic_h() {
+        let hard_stop = CanonicalMonotonicInstant(1_020_000_000_123);
+        let encoded = hard_stop.0.to_string();
+        let parsed = parse_canonical_monotonic_instant(OsStr::new(&encoded))
+            .expect("helper argv parses canonical H");
+        let deadline_spec = parent_anchored_watchdog_deadline(parsed);
+        let (control_sender, _control_receiver) = std::sync::mpsc::sync_channel(1);
+        let (_ack_sender, ack_receiver) =
+            std::sync::mpsc::sync_channel::<Option<CanonicalMonotonicInstant>>(1);
+        let controller = ExternalWatchdogController {
+            sender: control_sender,
+            hard_stop,
+            publication_acks: std::sync::Arc::new(std::sync::Mutex::new(ack_receiver)),
+        };
+        let (write_observed_before_h, _write_observed_before_h_rx) =
+            std::sync::mpsc::sync_channel(1);
+        let request = ExternalWatchdogWriteRequest::PublicationFinalize {
+            hard_stop: controller.hard_stop,
+            write_observed_before_h,
+        };
+
+        assert_eq!(parsed, hard_stop, "decimal argv must preserve every H bit");
+        assert_eq!(controller.hard_stop, parsed);
+        assert_eq!(
+            resolve_short_external_watchdog_deadline(deadline_spec),
+            hard_stop,
+            "helper must not derive H from any later clock sample"
+        );
+        assert!(matches!(
+            request,
+            ExternalWatchdogWriteRequest::PublicationFinalize {
+                hard_stop: request_h,
+                ..
+            } if request_h == parsed
+        ));
+    }
+
+    #[test]
+    fn short_grace_helper_notification_failure_is_non_blocking() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(ExternalWatchdogWriteRequest::FireNow)
+            .expect("fill watchdog command queue");
+        let (_publication_ack_tx, publication_ack_rx) = std::sync::mpsc::sync_channel(1);
+        let controller = ExternalWatchdogController {
+            sender,
+            hard_stop: CanonicalMonotonicInstant::EXPIRED,
+            publication_acks: std::sync::Arc::new(std::sync::Mutex::new(publication_ack_rx)),
+        };
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let queued = controller.request_immediate_fire();
+            finished_tx.send(queued).expect("report request outcome");
+        });
+        assert!(
+            !finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .expect("a full/failed helper queue must never delay the abort fail-safe"),
+            "a full queue must fail closed instead of blocking"
+        );
+        drop(receiver);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_grace_external_deadline_erases_unacknowledged_late_rename() {
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::ExitStatusExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        // Model a rename that completed across the cutoff but never delivered
+        // the explicit publication-commit record.
+        fs::write(&results_file, "unsat\n").expect("write unacknowledged late verdict");
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable verifier process");
+        let started = std::time::Instant::now();
+        let acknowledgement_sink = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open ACK sink");
+        let (_parent_control, child_control) = UnixStream::pair().expect("open live control pipe");
+
+        serve_short_external_watchdog_loop(
+            results_file.clone(),
+            // Inject the scored boundary as already due.
+            ExternalWatchdogDeadline::RelativeSeconds(0),
+            victim.id(),
+            child_control,
+            acknowledgement_sink,
+        )
+        .expect("preserving watchdog should fire");
+
+        let status = victim.wait().expect("reap verifier process");
+        assert_eq!(status.signal(), Some(9));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "hard stop must occur at the injected deadline, not after the historical +5s grace"
+        );
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read immutable placeholder"),
+            "unknown\n",
+            "an unacknowledged late rename must be conservatively sealed as unknown"
+        );
+    }
+
+    /// #watchdog-verdict-overwrite acceptance 1: the exact measured loss.
+    ///
+    /// A 1.7 s `sat` (witness and all) is on disk; the process then wedges for
+    /// the rest of its 350 s budget and the in-process watchdog fires. It must
+    /// leave the verdict alone — the row was earned.
+    #[test]
+    fn watchdog_refuses_to_overwrite_a_published_verdict() {
+        let published = "sat\n(X_0 0.25)\n(Y_0 -1.5)\n";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, published).expect("publish verdict");
+
+        assert_eq!(
+            commit_timeout_unless_verdict_published_with(true, &results_file, "watchdog.tmp")
+                .expect("declining is not an error"),
+            TimeoutCommit::DeclinedDecidedVerdict,
+            "a verdict published before the deadline must never become timeout"
+        );
+        assert_eq!(
+            fs::read_to_string(&results_file).expect("read preserved verdict"),
+            published,
+            "the published bytes (including the sat witness) must survive verbatim"
+        );
+    }
+
+    /// #watchdog-verdict-overwrite acceptance 2: deadline enforcement itself is
+    /// unchanged. With nothing published, the competition-safety placeholder is
+    /// still replaced — including the empty/unwritten file.
+    #[test]
+    fn watchdog_still_replaces_the_placeholder() {
+        for placeholder in ["unknown\n", "timeout\n", ""] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let results_file = tmp.path().join("result.txt");
+            fs::write(&results_file, placeholder).expect("write placeholder");
+
+            assert_eq!(
+                commit_timeout_unless_verdict_published_with(false, &results_file, "watchdog.tmp")
+                    .expect("placeholder replacement must succeed"),
+                TimeoutCommit::Committed,
+                "placeholder {placeholder:?} must still be replaceable"
+            );
+            assert_eq!(
+                fs::read_to_string(&results_file).expect("read committed timeout"),
+                "timeout\n"
+            );
+        }
+    }
+
+    /// The decision is the in-process publication record and NOTHING ELSE — in
+    /// particular not the bytes on disk. Sweeps reuse results paths, so a
+    /// decided token left by a PREVIOUS run must not stop this instance's
+    /// watchdog from enforcing its deadline.
+    #[test]
+    fn watchdog_replaces_a_stale_verdict_this_instance_never_published() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        fs::write(&results_file, "unsat\n").expect("write a previous run's verdict");
+
+        assert_eq!(
+            commit_timeout_unless_verdict_published_with(false, &results_file, "watchdog.tmp")
+                .expect("stale verdict must not block enforcement"),
+            TimeoutCommit::Committed
+        );
+        assert_eq!(
+            fs::read_to_string(&results_file).expect("read committed timeout"),
+            "timeout\n"
+        );
+    }
+
+    /// The in-process flag is authoritative on its own: a results file that
+    /// cannot be read or written must not re-open the overwrite once this
+    /// process knows it published a verdict.
+    #[test]
+    fn in_process_publication_flag_alone_blocks_the_overwrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("gone").join("result.txt");
+        assert_eq!(
+            commit_timeout_unless_verdict_published_with(true, &missing, "watchdog.tmp")
+                .expect("declining is not an error"),
+            TimeoutCommit::DeclinedDecidedVerdict
+        );
+        assert!(
+            !missing.exists(),
+            "declining must not create a results file"
+        );
+    }
+
+    /// #watchdog-verdict-overwrite acceptance 3: the OUT-OF-PROCESS half.
+    ///
+    /// The parent's in-process watchdog declined and asked for a preserving
+    /// hard stop. The helper must SIGKILL the wedged verifier and leave the
+    /// published `sat` — witness included — exactly as it found it. Compare
+    /// `external_watchdog_fire_request_hard_kills_victim_and_commits_timeout`,
+    /// which pins the unchanged `F` behavior for a verdict that raced in AFTER
+    /// the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn external_watchdog_preserve_request_kills_victim_and_keeps_the_verdict() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let published = "sat\n(X_0 0.25)\n(Y_0 -1.5)\n";
+        fs::write(&results_file, published).expect("publish pre-deadline verdict");
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable watchdog victim");
+        let victim_pid = victim.id();
+
+        if let Err(error) = serve_historical_external_watchdog_loop(
+            results_file.clone(),
+            60,
+            victim_pid,
+            std::io::Cursor::new(EXTERNAL_WATCHDOG_PRESERVE_FIRE_REQUEST.to_vec()),
+        ) {
+            let _ = victim.kill();
+            let _ = victim.wait();
+            panic!("preserving-fire watchdog failed: {error}");
+        }
+
+        let status = victim.wait().expect("reap watchdog victim");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "a preserving fire must still hard-stop the wedged verifier, got {status}"
+        );
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read preserved verdict"),
+            published,
+            "the helper must not replace a verdict published before the deadline"
+        );
+    }
+
+    /// The placeholder `unknown` is deliberately NOT protected: it is what the
+    /// competition-safety pre-write puts on disk, so protecting it would
+    /// disable deadline enforcement for every instance.
+    #[test]
+    fn decided_verdict_tokens_exclude_the_placeholder() {
+        assert!(is_decided_verdict_token("sat"));
+        assert!(is_decided_verdict_token("unsat"));
+        assert!(is_decided_verdict_token("error"));
+        assert!(!is_decided_verdict_token("unknown"));
+        assert!(!is_decided_verdict_token("timeout"));
+        assert!(!is_decided_verdict_token(""));
+    }
+
+    /// A successful publication records itself, so the watchdog thread of THIS
+    /// process refuses the overwrite even before it reads the file back.
+    #[test]
+    fn publishing_a_decided_verdict_records_the_publication() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        write_results(
+            &results_file,
+            &VnncompResult::Sat {
+                witness: Some("(X_0 0.25)".to_owned()),
+            },
+        )
+        .expect("publish sat");
+        assert!(
+            DECIDED_VERDICT_PUBLISHED.load(std::sync::atomic::Ordering::SeqCst),
+            "a published sat must be recorded for the in-process watchdog"
+        );
+    }
+
+    #[test]
+    fn external_watchdog_timeout_commit_uses_checked_direct_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let blocked_tmp = results_file.with_extension("blocked");
+        fs::write(&results_file, "unknown\n").expect("write placeholder");
+        fs::create_dir(&blocked_tmp).expect("block atomic temp-file creation");
+
+        commit_timeout_result_checked(&results_file, "blocked")
+            .expect("direct timeout fallback should be confirmed");
+
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read committed timeout"),
+            "timeout\n"
+        );
+    }
+
+    #[test]
+    fn vnncomp_result_publication_is_atomic_for_sat_witness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let publication_tmp = results_file.with_extension("result.tmp");
+        fs::write(&results_file, "unknown\n").expect("write placeholder");
+        fs::create_dir(&publication_tmp).expect("block temp-file creation");
+        let sat = VnncompResult::Sat {
+            witness: Some("(X_0 0.25)\n(Y_0 -1.5)".to_owned()),
+        };
+
+        assert!(
+            write_results(&results_file, &sat).is_err(),
+            "failed temp publication must be reported"
+        );
+        assert_eq!(
+            fs::read_to_string(&results_file).expect("read preserved placeholder"),
+            "unknown\n",
+            "a failed publication must not truncate the prior sound result"
+        );
+
+        fs::remove_dir(publication_tmp).expect("unblock temp-file creation");
+        write_results(&results_file, &sat).expect("publish complete SAT result");
+        assert_eq!(
+            fs::read_to_string(results_file).expect("read complete SAT result"),
+            sat.render_results_file()
+        );
+    }
 
     #[test]
     fn whole_net_reservation_requires_every_activation_gate() {
@@ -9258,6 +18184,84 @@ mod tests {
     }
 
     #[test]
+    fn proof_tail_deadline_caps_concurrent_grace_and_inline_margin_row_work() {
+        let now = std::time::Instant::now();
+        let instance_deadline = now + std::time::Duration::from_mins(5);
+        let proof_deadline = instance_deadline
+            .checked_sub(std::time::Duration::from_secs(5))
+            .expect("five minutes exceeds publication reserve");
+        let work_deadline = post_beta_work_deadline(Some(instance_deadline), Some(proof_deadline));
+        assert_eq!(work_deadline, Some(proof_deadline));
+        assert_eq!(
+            margin_row_lane_deadline(work_deadline, 0),
+            Some(proof_deadline),
+            "inline proof work must not consume the publication reserve"
+        );
+
+        let two_seconds_left = proof_deadline
+            .checked_sub(std::time::Duration::from_secs(2))
+            .expect("proof deadline is in the future");
+        assert_eq!(
+            concurrent_margin_row_grace(work_deadline, two_seconds_left),
+            std::time::Duration::from_secs(2),
+            "concurrent join grace is capped by the same proof deadline"
+        );
+        assert_eq!(
+            concurrent_margin_row_grace(
+                work_deadline,
+                proof_deadline + std::time::Duration::from_millis(1),
+            ),
+            std::time::Duration::ZERO,
+            "no post-deadline join wait may enter the final five seconds"
+        );
+
+        assert_eq!(
+            post_beta_work_deadline(Some(instance_deadline), None),
+            Some(instance_deadline),
+            "historical routes remain byte-identical"
+        );
+        assert_eq!(
+            post_beta_work_deadline(Some(proof_deadline), Some(instance_deadline)),
+            Some(proof_deadline),
+            "malformed later phase authority cannot extend the scored deadline"
+        );
+    }
+
+    #[test]
+    fn optional_lane_deadlines_are_frozen_and_authority_capped() {
+        let admitted_at = std::time::Instant::now();
+        let authority = admitted_at + std::time::Duration::from_secs(2);
+        assert_eq!(
+            bounded_work_deadline(
+                admitted_at,
+                std::time::Duration::from_secs(30),
+                Some(authority),
+            ),
+            Some(authority),
+            "a relative lane budget must never rebase past outer authority"
+        );
+        assert_eq!(
+            bounded_work_deadline(
+                admitted_at,
+                std::time::Duration::from_secs(1),
+                Some(authority),
+            ),
+            Some(admitted_at + std::time::Duration::from_secs(1)),
+            "a tighter lane-local slice remains authoritative"
+        );
+        assert_eq!(
+            nonlinear_lane_deadline(30, Some(authority)),
+            Some(authority),
+            "nonlinear setup and both sequential search halves share the absolute cap"
+        );
+        assert_eq!(
+            nonlinear_lane_deadline(30, Some(admitted_at)),
+            None,
+            "an already-lapsed proof deadline cannot start fresh nonlinear work"
+        );
+    }
+
+    #[test]
     fn whole_net_reservation_normalizes_small_large_and_overflowing_slices() {
         let budget = std::time::Duration::from_secs(10);
         let start = std::time::Instant::now();
@@ -9394,16 +18398,19 @@ mod tests {
     /// The (B) assertion is fast + always-on; the full-search assertion is
     /// release-gated (a debug forward is ~3.4ms, far too slow for 200k evals).
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn search_finds_known_iso_witness() {
         let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let base = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
         ));
-        if !base.is_dir() {
-            eprintln!("benchmarks absent; skipping");
-            return;
-        }
+        assert!(
+            base.is_dir(),
+            "external VNN-COMP 2026 isomorphic ACAS-Xu fixture missing at {}; run \
+             benchmarks/vnncomp2026_benchmarks/setup.sh",
+            base.display()
+        );
         // (label, instance_stem, f_onnx, g_onnx, witness x, expected dev)
         let cases: &[(&str, &str, &str, &str, [f32; 5], f64)] = &[
             (
@@ -9427,10 +18434,13 @@ mod tests {
         for (label, stem, f_name, g_name, x, expected) in cases {
             let f = base.join("onnx/original").join(f_name);
             let g = base.join("onnx/perturbed").join(g_name);
-            if !f.is_file() || !g.is_file() {
-                eprintln!("[iso-witness] {label} {stem}: onnx absent, skipping");
-                continue;
-            }
+            assert!(
+                f.is_file() && g.is_file(),
+                "[iso-witness] {label} {stem}: external ONNX fixtures missing (f={}, g={}); \
+                 run benchmarks/vnncomp2026_benchmarks/setup.sh",
+                f.display(),
+                g.display()
+            );
             let graph_f = load_graph_network(&f).expect("load f");
             let graph_g = load_graph_network(&g).expect("load g");
             let diff = build_difference_network(&graph_f, &graph_g).expect("diff");
@@ -9691,203 +18701,6 @@ mod tests {
         assert_eq!(best, Some((vec![0.2], 7.0e-7)));
     }
 
-    /// Offline experiment harness for the trusted-ORT active-set repair. The
-    /// seed is a little-endian, one-dimensional f32 NumPy array.
-    #[test]
-    #[ignore = "manual experiment: needs NY_ACTIVE_SET_{ONNX,VNNLIB,SEED}"]
-    fn postbab_active_set_repair_experiment() {
-        let onnx = PathBuf::from(std::env::var("NY_ACTIVE_SET_ONNX").expect("NY_ACTIVE_SET_ONNX"));
-        let vnnlib =
-            PathBuf::from(std::env::var("NY_ACTIVE_SET_VNNLIB").expect("NY_ACTIVE_SET_VNNLIB"));
-        let seed_path =
-            PathBuf::from(std::env::var("NY_ACTIVE_SET_SEED").expect("NY_ACTIVE_SET_SEED"));
-        let budget_ms: u64 = std::env::var("NY_ACTIVE_SET_BUDGET_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3_000);
-        let fd_mode = if std::env::var("NY_ACTIVE_SET_FD_MODE").ok().as_deref() == Some("one-sided")
-        {
-            OrtActiveSetFdMode::OneSided
-        } else {
-            OrtActiveSetFdMode::Central
-        };
-        let max_iters: usize = std::env::var("NY_ACTIVE_SET_MAX_ITERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
-            .clamp(1, 128);
-        let restart_one_sided = std::env::var("NY_ACTIVE_SET_RESTART_ONE_SIDED")
-            .ok()
-            .as_deref()
-            == Some("1");
-        let restart_iters: usize = std::env::var("NY_ACTIVE_SET_RESTART_ITERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
-            .clamp(1, 128);
-
-        let bytes = fs::read(seed_path).expect("seed npy");
-        assert_eq!(&bytes[..6], b"\x93NUMPY", "NumPy magic");
-        assert_eq!(&bytes[6..8], &[1, 0], "only npy v1 is supported");
-        let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-        let payload = &bytes[10 + header_len..];
-        assert_eq!(payload.len() % 4, 0, "f32 payload");
-        let seed: Vec<f32> = payload
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|bytes| f32::from_le_bytes(*bytes))
-            .collect();
-
-        let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("vnnlib");
-        let (box_lo, box_hi, emit_pin) = build_search_box(&spec).expect("box");
-        assert_eq!(seed.len(), box_lo.len(), "seed dimension");
-        let mut forward =
-            ny_onnx::diff::OrtForward::from_path(&onnx, box_lo.len()).expect("ort forward");
-        let start = forward.run(&seed).expect("initial ORT");
-        let start64: Vec<f64> = start.iter().map(|&v| f64::from(v)).collect();
-        println!(
-            "initial ORT margin = {:.9e}",
-            property_margin(&spec, &seed, &start64)
-        );
-        let repair_start = std::time::Instant::now();
-        let deadline = repair_start + std::time::Duration::from_millis(budget_ms);
-        println!(
-            "active-set policy = {fd_mode:?}/{max_iters}{}",
-            if restart_one_sided {
-                "+best-one-sided-restart"
-            } else {
-                ""
-            }
-        );
-        let mut outcome = ort_active_set_repair_falsify(
-            &mut forward,
-            &spec,
-            &box_lo,
-            &box_hi,
-            &emit_pin,
-            &seed,
-            deadline,
-            fd_mode,
-            max_iters,
-        );
-        let restart_seed = outcome
-            .as_ref()
-            .filter(|o| o.violation.is_none())
-            .and_then(|o| o.best_guidance.as_ref())
-            .map(|(x, _)| x.clone());
-        if restart_one_sided {
-            if let Some(restart_seed) = restart_seed {
-                println!(
-                    "active-set best-point one-sided restart ({restart_iters} iteration cap, \
-                     {:.6}s remaining)",
-                    deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .as_secs_f64()
-                );
-                if let Some(restarted) = ort_active_set_repair_falsify(
-                    &mut forward,
-                    &spec,
-                    &box_lo,
-                    &box_hi,
-                    &emit_pin,
-                    &restart_seed,
-                    deadline,
-                    OrtActiveSetFdMode::OneSided,
-                    restart_iters,
-                ) {
-                    let previous_best = outcome
-                        .as_ref()
-                        .and_then(|o| o.best_guidance.as_ref())
-                        .map_or(f64::NEG_INFINITY, |(_, margin)| *margin);
-                    let restarted_best = restarted
-                        .best_guidance
-                        .as_ref()
-                        .map_or(f64::NEG_INFINITY, |(_, margin)| *margin);
-                    if restarted.violation.is_some() || restarted_best > previous_best {
-                        outcome = Some(restarted);
-                    }
-                }
-            }
-        }
-        println!(
-            "active-set repair elapsed = {:.6}s",
-            repair_start.elapsed().as_secs_f64()
-        );
-        if let Some(x) = outcome.as_ref().and_then(|o| o.violation.as_ref()) {
-            let out = forward.run(x).expect("repaired ORT");
-            let out64: Vec<f64> = out.iter().map(|&v| f64::from(v)).collect();
-            println!(
-                "repaired ORT margin = {:.9e}",
-                property_margin(&spec, x, &out64)
-            );
-            if let Some(oracle) = F64MarginOracle::load(&onnx, box_lo.len()) {
-                let emit_x = refine_emit_view(x, &emit_pin);
-                println!(
-                    "repaired true-f64 point/worst margins = {:.9e} / {:.9e}",
-                    oracle.point_margin_f64(&spec, &emit_x).unwrap_or(f64::NAN),
-                    oracle.worst_margin(&spec, x).unwrap_or(f64::NAN)
-                );
-            }
-        } else if let Some((x, tracked_margin)) =
-            outcome.as_ref().and_then(|o| o.best_guidance.as_ref())
-        {
-            let out = forward.run(x).expect("guidance ORT");
-            let out64: Vec<f64> = out.iter().map(|&v| f64::from(v)).collect();
-            println!(
-                "best guidance ORT margin = {:.9e} (tracked {:.9e})",
-                property_margin(&spec, x, &out64),
-                tracked_margin
-            );
-        } else {
-            println!("no repair or improved guidance");
-        }
-    }
-
-    /// Offline experiment harness (#postbab-equality-seek): run the
-    /// equality-seek stage directly on a real benchmark instance with a large
-    /// budget, to measure convergence without the 150s harness around it.
-    /// `NY_EQSEEK_ONNX` / `NY_EQSEEK_VNNLIB` / `NY_EQSEEK_BUDGET_S` control it.
-    #[test]
-    #[ignore = "manual experiment: needs NY_EQSEEK_ONNX/NY_EQSEEK_VNNLIB"]
-    fn postbab_equality_seek_experiment() {
-        let onnx = PathBuf::from(std::env::var("NY_EQSEEK_ONNX").expect("NY_EQSEEK_ONNX"));
-        let vnnlib = PathBuf::from(std::env::var("NY_EQSEEK_VNNLIB").expect("NY_EQSEEK_VNNLIB"));
-        let budget_s: u64 = std::env::var("NY_EQSEEK_BUDGET_S")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
-        let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("vnnlib");
-        let (box_lo, box_hi, emit_pin) = build_search_box(&spec).expect("box");
-        let mut forward =
-            ny_onnx::diff::OrtForward::from_path(&onnx, box_lo.len()).expect("ort forward");
-        let (violation, best) = equality_seek_falsify(
-            &onnx,
-            &mut forward,
-            &spec,
-            &box_lo,
-            &box_hi,
-            &emit_pin,
-            None,
-            std::time::Duration::from_secs(budget_s),
-        );
-        if let Some(x) = &violation {
-            let out = forward.run(x).expect("ort");
-            let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
-            println!(
-                "VIOLATION FOUND; ORT margin = {:.6e}",
-                property_margin(&spec, x, &out64)
-            );
-        } else if let Some(x) = &best {
-            let out = forward.run(x).expect("ort");
-            let out64: Vec<f64> = out.iter().map(|&v| v as f64).collect();
-            println!(
-                "no violation; best point ORT min-margin = {:.6e}",
-                property_margin(&spec, x, &out64)
-            );
-        }
-    }
-
     use flate2::Compression;
     use ny_onnx::onnx_proto::{
         tensor_shape_proto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorProto,
@@ -9898,24 +18711,36 @@ mod tests {
 
     // ---- GPU capability hint (#vnncomp-gpu-available-lost) ----
     // The official two-script protocol drops env vars between prepare and run,
-    // so an UNSET GPU_AVAILABLE must fall through to the self-probe, while an
-    // explicit value must win in both directions without probing.
+    // so an UNSET GPU_AVAILABLE must use cached accelerator detection, while an
+    // explicit value must win in both directions.
 
     #[test]
-    fn gpu_hint_explicit_env_wins_without_probing() {
-        // wgpu is compiled into the test build (default feature), so the env
-        // value alone decides; the probe must not run when the var is set.
-        let probe_must_not_run = || panic!("probe must not run when GPU_AVAILABLE is set");
-        assert!(resolve_gpu_hint(Some("1"), probe_must_not_run));
-        assert!(!resolve_gpu_hint(Some("0"), probe_must_not_run));
-        assert!(!resolve_gpu_hint(Some(""), probe_must_not_run));
-        assert!(!resolve_gpu_hint(Some("yes"), probe_must_not_run));
+    fn accelerator_hint_explicit_env_wins() {
+        // With WGPU compiled, the env value alone decides even when automatic
+        // hardware detection failed.
+        assert!(resolve_accelerator_hint(Some("1"), true, false, false));
+        assert!(!resolve_accelerator_hint(Some("0"), true, true, false));
+        assert!(!resolve_accelerator_hint(Some(""), true, true, false));
+        assert!(!resolve_accelerator_hint(Some("yes"), true, true, false));
     }
 
     #[test]
-    fn gpu_hint_unset_env_falls_through_to_probe() {
-        assert!(resolve_gpu_hint(None, || true));
-        assert!(!resolve_gpu_hint(None, || false));
+    fn accelerator_hint_unset_uses_cached_wgpu_detection() {
+        assert!(resolve_accelerator_hint(None, true, true, false));
+        assert!(!resolve_accelerator_hint(None, true, false, false));
+    }
+
+    #[test]
+    fn accelerator_hint_unset_uses_cuda_without_wgpu_probe() {
+        assert!(resolve_accelerator_hint(None, true, false, true));
+        assert!(resolve_accelerator_hint(None, false, false, true));
+        assert!(!resolve_accelerator_hint(Some("0"), true, false, true));
+    }
+
+    #[test]
+    fn accelerator_hint_without_any_backend_fails_closed() {
+        assert!(!resolve_accelerator_hint(None, false, false, false));
+        assert!(!resolve_accelerator_hint(Some("1"), false, false, false));
     }
 
     // ---- Result-string translation (soundness-critical) ----
@@ -9957,6 +18782,41 @@ mod tests {
     fn translate_timeout_maps_to_timeout() {
         assert_eq!(translate_status("Timeout", None), VnncompResult::Timeout);
         assert_eq!(translate_status("timeout", None), VnncompResult::Timeout);
+    }
+
+    #[test]
+    fn uncaptured_typed_deadline_requires_expired_authority_through_anyhow_context() {
+        let deadline_error = anyhow::Error::new(ny_core::NyError::DeadlineExceeded(
+            "batched ConvTranspose deadline".to_string(),
+        ))
+        .context("graph verification failed");
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("one millisecond before now is representable");
+        assert!(
+            error_chain_has_expired_typed_deadline(&deadline_error, Some(expired)),
+            "typed deadline plus expired authority must become timeout"
+        );
+        assert!(
+            !error_chain_has_expired_typed_deadline(
+                &deadline_error,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            ),
+            "a node-local deadline cannot exhaust a still-live authority"
+        );
+        assert!(
+            !error_chain_has_expired_typed_deadline(&deadline_error, None),
+            "an unbounded caller cannot claim authority expiry"
+        );
+
+        let ordinary = anyhow::Error::new(ny_core::NyError::InvalidSpec(
+            "malformed objective".to_string(),
+        ))
+        .context("graph verification failed");
+        assert!(
+            !error_chain_has_expired_typed_deadline(&ordinary, Some(expired)),
+            "ordinary errors must retain the existing sound-unknown translation"
+        );
     }
 
     // ---- ORT-guided refinement: margin surrogate + witness rendering ----
@@ -10040,6 +18900,75 @@ mod tests {
         let worst2 = property_margin_f64_worst(&spec, &x, &lo2, &hi);
         assert!(worst2 < 0.0);
         assert!(property_violation_possible_f64(&spec, &x, &lo2, &hi));
+    }
+
+    /// #sat-relu-zero-margin: the CERTIFIED side must admit `m == 0` on
+    /// NON-STRICT constraints (symmetric with the acceptance side
+    /// `property_violated_f64` and with the organizer's zero-tolerance
+    /// `np.all(vec <= prop_rhs + 0.0)`), and must keep refusing it on STRICT
+    /// constraints and on any straddling enclosure.
+    #[test]
+    fn certified_side_admits_zero_margin_only_for_non_strict_constraints() {
+        // The sat_relu spec shape: unsafe iff (Y_0 >= 1 AND Y_1 <= 0), both
+        // non-strict, at the network's exactly-attained extremes.
+        let spec = spec_with(
+            2,
+            vec![vec![OC::GreaterEqConst(0, 1.0), OC::LessEqConst(1, 0.0)]],
+            true,
+            vec![(0.0, 1.0); 2],
+        );
+        let x = [1.0f64, 0.0]; // a boolean corner, inside [0,1]^2
+
+        // EXACT enclosure ON the thresholds (what the integer-exactness path in
+        // `ny-propagate`'s f64 cell walk now produces): margin exactly 0.
+        let exact = [1.0f64, 0.0];
+        assert_eq!(
+            property_margin_f64_worst(&spec, &x, &exact, &exact),
+            0.0,
+            "the exact boolean-corner enclosure has margin exactly zero"
+        );
+        assert!(
+            property_violation_certain_f64(&spec, &x, &exact, &exact),
+            "non-strict constraints are satisfied AT equality, so a zero-width \
+             enclosure sitting on the threshold CERTIFIES the violation"
+        );
+        // The acceptance side already agreed; the two are now symmetric.
+        assert!(property_violated_f64(&spec, &x, &exact));
+
+        // STRICT variant of the same shape: equality is NOT a violation, so the
+        // same enclosure must NOT certify.
+        let strict = spec_with(
+            2,
+            vec![vec![
+                OC::GreaterThanConst(0, 1.0),
+                OC::LessThanConst(1, 0.0),
+            ]],
+            true,
+            vec![(0.0, 1.0); 2],
+        );
+        assert!(!property_violation_certain_f64(&strict, &x, &exact, &exact));
+        assert!(!property_violated_f64(&strict, &x, &exact));
+
+        // The Higham-widened enclosure MEASURED on sat_v14_c57 before the
+        // exactness path (Y_0 in [1 - 9.8e-15, 1 + 1.0e-14], Y_1 straddling 0):
+        // violation stays POSSIBLE but must not be CERTIFIED.
+        let lo = [1.0 - 9.769963e-15, -2.675637e-14];
+        let hi = [1.0 + 9.99e-15, 2.675637e-14];
+        assert!(property_violation_possible_f64(&spec, &x, &lo, &hi));
+        assert!(
+            !property_violation_certain_f64(&spec, &x, &lo, &hi),
+            "a straddling enclosure must never certify"
+        );
+
+        // Certain must imply possible, and an out-of-box witness certifies
+        // nothing however good its output enclosure is.
+        let out_of_box = [1.5f64, 0.0];
+        assert!(!property_violation_certain_f64(
+            &spec,
+            &out_of_box,
+            &exact,
+            &exact
+        ));
     }
 
     /// #moat-leak / f32-boundary false-`sat` regression (model_8 class,
@@ -10287,6 +19216,15 @@ mod tests {
             assert!(next_up_f32(x) > x, "next_up({x}) must be strictly greater");
             assert!(next_down_f32(x) < x, "next_down({x}) must be strictly less");
         }
+        assert_eq!(next_up_f32(0.0).to_bits(), 1);
+        assert_eq!(next_up_f32(-0.0).to_bits(), 1);
+        assert_eq!(next_down_f32(0.0).to_bits(), 0x8000_0001);
+        assert_eq!(next_down_f32(-0.0).to_bits(), 0x8000_0001);
+        assert_eq!(
+            next_up_f32(f32::from_bits(0x8000_0001)).to_bits(),
+            0x8000_0000
+        );
+        assert_eq!(next_down_f32(f32::from_bits(1)).to_bits(), 0);
         assert_eq!(next_up_f32(f32::INFINITY), f32::INFINITY);
         assert_eq!(next_down_f32(f32::NEG_INFINITY), f32::NEG_INFINITY);
     }
@@ -10375,12 +19313,17 @@ mod tests {
     }
 
     #[test]
-    fn refine_emit_view_pins_declared_values_and_widens_free_dims() {
-        let emit_pin = vec![Some(0.61035156_f64), None];
-        let x = vec![0.61035156_f32, 0.25_f32];
+    fn refine_emit_view_pins_declared_values_and_decodes_free_dims_exactly() {
+        let emit_pin = vec![Some(0.61035156_f64), None, None];
+        let x = vec![0.61035156_f32, 0.25_f32, f32::from_bits(1)];
         let view = refine_emit_view(&x, &emit_pin);
         assert_eq!(view[0], 0.61035156_f64, "pinned dim emits the declared f64");
-        assert_eq!(view[1], 0.25_f64, "free dim is the lossless f32->f64 cast");
+        assert_eq!(view[1], 0.25_f64, "free normal dim is lossless");
+        assert_eq!(
+            view[2].to_bits(),
+            (u64::from(1023_u16 - 149)) << 52,
+            "free subnormal dim is decoded without a DAZ-sensitive cast"
+        );
         // The emitted decimal round-trips to the same f64 AND casts to the same
         // f32 the ORT forward was fed — the organizer reproduces our tensor bits.
         let s = format_smtlib_witness_f64(&view, &[1.5_f32]);
@@ -10414,6 +19357,116 @@ mod tests {
     }
 
     #[test]
+    fn ort_refine_vjp_policy_is_default_on_in_production_but_test_explicit() {
+        assert!(ort_refine_vjp_batch_enabled_from(None, false));
+        assert!(ort_refine_vjp_batch_enabled_from(Some("1"), false));
+        assert!(!ort_refine_vjp_batch_enabled_from(Some("0"), false));
+
+        // The ordinary unit suite must not initialize a graphics device merely
+        // because it exercises `gradient_guided_falsify` on a tiny fixture.
+        assert!(!ort_refine_vjp_batch_enabled_from(None, true));
+        assert!(ort_refine_vjp_batch_enabled_from(Some("1"), true));
+        assert!(!ort_refine_vjp_batch_enabled_from(Some("0"), true));
+    }
+
+    #[test]
+    fn ort_refine_vjp_decline_telemetry_requires_explicit_diagnostic_arm() {
+        let no_accelerator = OrtRefineVjpDeclineReason::NoAccelerator;
+        assert_eq!(
+            ort_refine_vjp_decline_marker_from(None, no_accelerator),
+            None
+        );
+        assert_eq!(
+            ort_refine_vjp_decline_marker_from(Some("0"), no_accelerator),
+            None,
+            "the kill-switch arm must remain marker-free"
+        );
+        assert_eq!(
+            ort_refine_vjp_decline_marker_from(Some("invalid"), no_accelerator),
+            None,
+            "malformed/default policy must not make ordinary runs noisy"
+        );
+        assert_eq!(
+            ort_refine_vjp_decline_marker_from(Some("1"), no_accelerator).as_deref(),
+            Some(
+                "ORT-refine grad lane: exact-VJP pre-wave declined \
+                 (reason=no_accelerator)"
+            )
+        );
+        assert_eq!(
+            ort_refine_vjp_decline_marker_from(
+                Some("1"),
+                OrtRefineVjpDeclineReason::MemoryNotAdmitted,
+            )
+            .as_deref(),
+            Some(
+                "ORT-refine grad lane: exact-VJP pre-wave declined \
+                 (reason=memory_not_admitted)"
+            )
+        );
+    }
+
+    #[test]
+    fn ort_refine_vjp_isolated_memory_override_does_not_admit_other_tails() {
+        assert!(!ort_refine_vjp_memory_allowed(false, None));
+        assert!(!ort_refine_vjp_memory_allowed(false, Some(OsStr::new("0"))));
+        assert!(ort_refine_vjp_memory_allowed(false, Some(OsStr::new("1"))));
+        assert!(ort_refine_vjp_memory_allowed(true, None));
+    }
+
+    #[test]
+    fn ort_refine_vjp_width_is_hard_capped_at_64() {
+        assert_eq!(ort_refine_vjp_width_from(None), 64);
+        assert_eq!(ort_refine_vjp_width_from(Some("1")), 1);
+        assert_eq!(ort_refine_vjp_width_from(Some(" 32 ")), 32);
+        assert_eq!(ort_refine_vjp_width_from(Some("64")), 64);
+        assert_eq!(ort_refine_vjp_width_from(Some("65")), 64);
+        assert_eq!(ort_refine_vjp_width_from(Some("1000000")), 64);
+        assert_eq!(ort_refine_vjp_width_from(Some("0")), 64);
+        assert_eq!(ort_refine_vjp_width_from(Some("invalid")), 64);
+    }
+
+    #[test]
+    fn exact_vjp_gradient_sign_does_not_move_on_signed_zero() {
+        assert_eq!(gradient_direction_sign(1.0), 1.0);
+        assert_eq!(gradient_direction_sign(-1.0), -1.0);
+        assert_eq!(gradient_direction_sign(0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(gradient_direction_sign(-0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(gradient_direction_sign(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn ort_refine_vjp_private_budget_preserves_sequential_fallback() {
+        use std::time::Duration;
+
+        assert_eq!(ort_refine_vjp_budget(Duration::ZERO), None);
+        assert_eq!(ort_refine_vjp_budget(Duration::from_secs(1)), None);
+        assert_eq!(
+            ort_refine_vjp_budget(Duration::from_millis(1999)),
+            None,
+            "a sub-500ms quarter is too small to admit device setup"
+        );
+        assert_eq!(
+            ort_refine_vjp_budget(Duration::from_secs(2)),
+            Some(Duration::from_millis(500)),
+            "the minimum boundary is inclusive"
+        );
+        assert_eq!(
+            ort_refine_vjp_budget(Duration::from_secs(3)),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(
+            ort_refine_vjp_budget(Duration::from_secs(4)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            ort_refine_vjp_budget(Duration::from_secs(30)),
+            Some(Duration::from_secs(1)),
+            "long lanes keep all but the hard one-second pre-wave cap"
+        );
+    }
+
+    #[test]
     fn margin_subgradient_row_picks_binding_constraint_of_active_clause() {
         // metaroom-shaped disjunction: unsafe iff any Y_i >= Y_2 (i != 2).
         let spec = spec_with(
@@ -10424,7 +19477,7 @@ mod tests {
         );
         // Y = [0.1, 0.8, 1.0]: clause margins are -0.9 and -0.2 -> the active
         // (max) clause is Y_1 >= Y_2, whose margin row is +1 at 1, -1 at 2.
-        let row = margin_subgradient_row(&spec, &[0.5], &[0.1, 0.8, 1.0]).unwrap();
+        let row = margin_subgradient_row(&spec, &[0.5], &[0.1, 0.8, 1.0], None).unwrap();
         assert_eq!(row, vec![0.0, 1.0, -1.0]);
 
         // Conjunction clause: binding = MIN constraint margin within the clause.
@@ -10435,8 +19488,94 @@ mod tests {
             vec![(0.0, 1.0)],
         );
         // Y = [0.9, 0.2]: binding constraint is Y_1 >= 1.0 (margin -0.8 < -0.1).
-        let row = margin_subgradient_row(&conj, &[0.5], &[0.9, 0.2]).unwrap();
+        let row = margin_subgradient_row(&conj, &[0.5], &[0.9, 0.2], None).unwrap();
         assert_eq!(row, vec![0.0, 1.0]);
+    }
+
+    /// #traffic-saturated-softmax: when the post-`Softmax` outputs saturate every
+    /// disjunct margin ties exactly, and the historical `max_by` silently returns
+    /// the LAST clause. The monotone `tiebreak` view (ny's pre-`Softmax` logits)
+    /// must then select the argmax disjunct — and must change NOTHING when the
+    /// outputs are informative.
+    #[test]
+    fn margin_subgradient_row_breaks_saturated_ties_in_logit_space() {
+        // Unsafe iff Y_0 >= Y_3 or Y_1 >= Y_3 or Y_2 >= Y_3.
+        let spec = spec_with(
+            4,
+            vec![
+                vec![OC::GreaterEq(0, 3)],
+                vec![OC::GreaterEq(1, 3)],
+                vec![OC::GreaterEq(2, 3)],
+            ],
+            true,
+            vec![(0.0, 1.0)],
+        );
+        // SATURATED softmax: p_true = 1, every other output exactly 0, so all
+        // three clause margins are exactly -1.
+        let saturated = [0.0, 0.0, 0.0, 1.0];
+        // Historical behaviour (no tie-break): the LAST clause, Y_2 >= Y_3.
+        let row = margin_subgradient_row(&spec, &[0.5], &saturated, None).unwrap();
+        assert_eq!(row, vec![0.0, 0.0, 1.0, -1.0]);
+        // With logits, clause 0 (Y_0) is the argmax target -> its row instead.
+        let logits = [-10.0, -900.0, -500.0, 3.0];
+        let row = margin_subgradient_row(&spec, &[0.5], &saturated, Some(&logits)).unwrap();
+        assert_eq!(row, vec![1.0, 0.0, 0.0, -1.0]);
+        // UNSATURATED outputs: no tie, so the tie-break is inert — the pick is the
+        // same with and without it (softmax is monotone, so it would agree anyway).
+        let informative = [0.30, 0.05, 0.15, 0.50];
+        let a = margin_subgradient_row(&spec, &[0.5], &informative, None).unwrap();
+        let b = margin_subgradient_row(&spec, &[0.5], &informative, Some(&logits)).unwrap();
+        assert_eq!(a, vec![1.0, 0.0, 0.0, -1.0]);
+        assert_eq!(a, b);
+        // A tie-break vector of the wrong length is ignored (historical pick).
+        let row = margin_subgradient_row(&spec, &[0.5], &saturated, Some(&[1.0, 2.0])).unwrap();
+        assert_eq!(row, vec![0.0, 0.0, 1.0, -1.0]);
+    }
+
+    /// #traffic-ranked-target: rank 0 must be the argmax target (byte-identical
+    /// to [`margin_subgradient_row`]); ranks 1, 2, … must walk DOWN the logit
+    /// ranking; ranks past the end must clamp to the last, never panic.
+    #[test]
+    fn margin_subgradient_row_ranked_walks_the_logit_ranking() {
+        let spec = spec_with(
+            4,
+            vec![
+                vec![OC::GreaterEq(0, 3)],
+                vec![OC::GreaterEq(1, 3)],
+                vec![OC::GreaterEq(2, 3)],
+            ],
+            true,
+            vec![(0.0, 1.0)],
+        );
+        let saturated = [0.0, 0.0, 0.0, 1.0];
+        // Logit margins vs Y_3=3: clause 0 -> -13, clause 2 -> -503, clause 1 ->
+        // -903. Ranking (closest to violation first) is 0, 2, 1.
+        let logits = [-10.0, -900.0, -500.0, 3.0];
+        let expect = |i: usize| {
+            let mut row = vec![0.0f32; 4];
+            row[i] = 1.0;
+            row[3] = -1.0;
+            row
+        };
+        for (rank, clause) in [(0usize, 0usize), (1, 2), (2, 1)] {
+            let row = margin_subgradient_row_ranked(&spec, &[0.5], &saturated, Some(&logits), rank)
+                .unwrap();
+            assert_eq!(
+                row,
+                expect(clause),
+                "rank {rank} must target clause {clause}"
+            );
+        }
+        // Rank 0 is exactly the unranked entry point.
+        assert_eq!(
+            margin_subgradient_row_ranked(&spec, &[0.5], &saturated, Some(&logits), 0).unwrap(),
+            margin_subgradient_row(&spec, &[0.5], &saturated, Some(&logits)).unwrap()
+        );
+        // Past the end clamps to the last ranked target.
+        assert_eq!(
+            margin_subgradient_row_ranked(&spec, &[0.5], &saturated, Some(&logits), 99).unwrap(),
+            expect(1)
+        );
     }
 
     #[test]
@@ -10458,10 +19597,10 @@ mod tests {
         ];
         // X = 0.5 is only in clause 0's box -> its row (+1 at 0) despite clause 1
         // having the better output margin.
-        let row = margin_subgradient_row(&spec, &[0.5], &[0.9]).unwrap();
+        let row = margin_subgradient_row(&spec, &[0.5], &[0.9], None).unwrap();
         assert_eq!(row, vec![1.0]);
         // X = 5.0 is outside every clause box -> no direction.
-        assert!(margin_subgradient_row(&spec, &[5.0], &[0.9]).is_none());
+        assert!(margin_subgradient_row(&spec, &[5.0], &[0.9], None).is_none());
     }
 
     #[test]
@@ -10557,15 +19696,35 @@ mod tests {
 
     #[test]
     fn smtlib_witness_format_matches_renderer() {
-        let w = format_smtlib_witness_f64(&[0.5_f64, -0.25_f64], &[1.5_f32]);
+        let input = [0.1_f64, -0.25_f64];
+        let output = [0.1_f32];
+        let w = format_smtlib_witness_f64(&input, &output);
         let lines: Vec<&str> = w.split('\n').collect();
         assert!(lines[0].starts_with("((X_0 "), "{w}");
         assert!(lines[1].starts_with("(X_1 "), "{w}");
         assert!(lines[2].starts_with("(Y_0 "), "{w}");
         assert!(w.ends_with(')'), "{w}");
+        // X decimals remain the exact f64 emit view; strict organizer box
+        // membership must not change as a side effect of Y hardening.
+        assert_eq!(lines[0], format!("((X_0 {})", input[0]));
+        assert_eq!(lines[1], format!("(X_1 {})", input[1]));
+        // Strip the assignment close plus the outer-list close.
+        let y0_text = lines[2]
+            .strip_prefix("(Y_0 ")
+            .and_then(|text| text.strip_suffix("))"))
+            .expect("Y_0 assignment");
+        let y0: f64 = y0_text.parse().expect("Y_0 decimal");
+        assert_eq!(y0, f64::from(output[0]));
+        assert_ne!(
+            output[0]
+                .to_string()
+                .parse::<f64>()
+                .expect("short f32 decimal"),
+            f64::from(output[0])
+        );
         // Round-trips back through the gate's own witness parser.
         let parsed = parse_witness_inputs(&w).expect("parse refined witness");
-        assert_eq!(parsed, vec![0.5_f32, -0.25_f32]);
+        assert_eq!(parsed, vec![0.1_f32, -0.25_f32]);
     }
 
     #[test]
@@ -11424,6 +20583,15 @@ mod tests {
         tiny_relu_onnx_bytes_with_dim(2)
     }
 
+    fn generated_ort_forward(path: &Path, input_dim: usize) -> ny_onnx::diff::OrtForward {
+        ny_onnx::diff::OrtForward::from_path(path, input_dim).unwrap_or_else(|error| {
+            panic!(
+                "generated ONNX fixture {} must load through the required ORT runtime: {error}",
+                path.display()
+            )
+        })
+    }
+
     fn tiny_relu_onnx_bytes_with_dim(dim: i64) -> Vec<u8> {
         let graph = GraphProto {
             node: vec![NodeProto {
@@ -11436,6 +20604,7 @@ mod tests {
             }],
             name: "tiny_relu".to_string(),
             initializer: Vec::new(),
+            sparse_initializer: Vec::new(),
             input: vec![f32_value_info("input", &[dim])],
             output: vec![f32_value_info("output", &[dim])],
             value_info: Vec::new(),
@@ -11476,14 +20645,19 @@ mod tests {
             initializer: vec![TensorProto {
                 dims: vec![dim],
                 data_type: 1, // FLOAT
+                segment: None,
                 name: "scale".to_string(),
                 raw_data: Vec::new(),
                 float_data: vec![2.0; dim as usize],
                 int32_data: Vec::new(),
                 int64_data: Vec::new(),
                 double_data: Vec::new(),
+                string_data: Vec::new(),
+                uint64_data: Vec::new(),
+                external_data: Vec::new(),
                 data_location: 0,
             }],
+            sparse_initializer: Vec::new(),
             input: vec![f32_value_info("input", &[dim])],
             output: vec![f32_value_info("output", &[dim])],
             value_info: Vec::new(),
@@ -11563,6 +20737,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relational_face_grid_has_a_fixed_five_dimensional_eval_ceiling() {
+        let coarse_faces = 10 * 8; // C(5,2) choices, 2^3 fixed-face sides.
+        let coarse = coarse_faces * RELATIONAL_FACE_COARSE_TICKS * RELATIONAL_FACE_COARSE_TICKS;
+        let refine = RELATIONAL_FACE_REFINE_TOP_K
+            * RELATIONAL_FACE_REFINE_TICKS
+            * RELATIONAL_FACE_REFINE_TICKS;
+        assert_eq!(coarse, 9_680);
+        assert_eq!(refine, 7_688);
+        assert!(
+            coarse + refine <= RELATIONAL_FACE_MAX_EVALS,
+            "the generic five-dimensional plan must remain below its explicit eval cap"
+        );
+    }
+
     /// Real-ORT integration pin: only the mixed corner (x0 high, x1 low)
     /// satisfies this conjunction.  The precheck must return that in-box point;
     /// an unreachable companion must remain `None`.
@@ -11572,10 +20761,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let onnx = tmp.path().join("corner_relu.onnx");
         fs::write(&onnx, &bytes).expect("write onnx");
-        let mut forward = match ny_onnx::diff::OrtForward::from_path(&onnx, 2) {
-            Ok(f) => f,
-            Err(_) => return, // runtime likewise falls through when ORT is absent
-        };
+        let mut forward = generated_ort_forward(&onnx, 2);
         let box_lo = vec![0.0f32, 0.0];
         let box_hi = vec![1.0f32, 1.0];
         let emit_pin = vec![None, None];
@@ -11614,12 +20800,157 @@ mod tests {
         .is_none());
     }
 
+    /// Row 84 recovery pin using only tracked immutable fixtures. The published
+    /// ACAS 5_3 / prop_2 witness sits a few f32 ULPs outside three decimal f64
+    /// faces; clamping it to the shared inward search box must retain a strict
+    /// trusted-ORT violation and pass the unchanged terminal gate.
+    #[test]
+    fn acas_row84_inward_snapped_witness_has_strict_margin_and_passes_gate() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let onnx = repo_root.join(
+            "benchmarks/vnncomp2023/benchmarks/acasxu/onnx/\
+             ACASXU_run2a_5_3_batch_2000.onnx",
+        );
+        let vnnlib = repo_root.join("tests/models/acasxu_prop2.vnnlib");
+        assert!(onnx.is_file(), "tracked ACAS model fixture is missing");
+        assert!(vnnlib.is_file(), "tracked ACAS property fixture is missing");
+
+        let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("load tracked prop_2");
+        assert_eq!(
+            upfront_attack_admission(&spec, UpfrontWrapperRoute::PresetRelationalConjunction),
+            Some(UpfrontAttackAdmission::PresetRelationalConjunction)
+        );
+        let (box_lo, box_hi, emit_pin) =
+            build_search_box(&spec).expect("five-dimensional inward search box");
+
+        // alpha-beta-CROWN's published row-84 input, represented as the f32
+        // tensor consumed by ORT. Only candidate generation uses this seed;
+        // the assertions below independently enforce the real acceptance path.
+        let published = [
+            0.679_857_8_f32,
+            -0.007_131_8_f32,
+            -0.042_386_368_f32,
+            0.45_f32,
+            -0.45_f32,
+        ];
+        let snapped: Vec<f32> = published
+            .iter()
+            .enumerate()
+            .map(|(dimension, &value)| clamp_to_box(value, box_lo[dimension], box_hi[dimension]))
+            .collect();
+        assert_ne!(
+            snapped, published,
+            "fixture must exercise inward boundary repair"
+        );
+
+        let emitted = refine_emit_view(&snapped, &emit_pin);
+        assert!(emitted
+            .iter()
+            .zip(&spec.input_bounds)
+            .all(|(&value, &(lower, upper))| value >= lower && value <= upper));
+
+        let mut forward =
+            ny_onnx::diff::OrtForward::from_path(&onnx, snapped.len()).expect("trusted ORT model");
+        let output = forward.run(&snapped).expect("trusted ORT row-84 forward");
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        let margin = property_margin(&spec, &snapped, &output64);
+        assert!(
+            margin > 1e-5,
+            "snapped row-84 witness needs a strict, non-artifact ORT margin; got {margin:.9e}"
+        );
+        assert!(property_violated_f64(&spec, &emitted, &output64));
+
+        let witness = format_smtlib_witness_f64(&emitted, &output);
+        assert!(
+            matches!(
+                gate_sat_with_trusted_oracle(&onnx, &vnnlib, Some(&witness), None),
+                VnncompResult::Sat { .. }
+            ),
+            "the existing trusted ORT/true-f64 terminal gate must uphold the snapped witness"
+        );
+    }
+
+    /// End-to-end recovery test: unlike the published-witness oracle above,
+    /// this supplies no seed or model/property-specific coordinate values.
+    /// The generic bounded face-grid search must discover its own strict,
+    /// inward-box row-84 witness and pass the unchanged terminal authority.
+    #[test]
+    fn acas_row84_generic_relational_face_grid_finds_and_gates_witness() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let onnx = repo_root.join(
+            "benchmarks/vnncomp2023/benchmarks/acasxu/onnx/\
+             ACASXU_run2a_5_3_batch_2000.onnx",
+        );
+        let vnnlib = repo_root.join("tests/models/acasxu_prop2.vnnlib");
+        let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib).expect("load tracked prop_2");
+        let (box_lo, box_hi, emit_pin) =
+            build_search_box(&spec).expect("five-dimensional inward search box");
+        let mut forward =
+            ny_onnx::diff::OrtForward::from_path(&onnx, box_lo.len()).expect("trusted ORT model");
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(5);
+        let found = low_dim_relational_face_grid_falsify(
+            &mut forward,
+            &spec,
+            &box_lo,
+            &box_hi,
+            &emit_pin,
+            deadline,
+        )
+        .expect("generic face grid should recover the known strict row-84 witness");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the candidate generator must respect its absolute deadline"
+        );
+        assert!(found
+            .iter()
+            .zip(&box_lo)
+            .zip(&box_hi)
+            .all(|((&value, &lower), &upper)| value >= lower && value <= upper));
+
+        let output = forward.run(&found).expect("trusted ORT candidate forward");
+        let output64: Vec<f64> = output
+            .iter()
+            .map(|&value| f32_to_f64_exact(value))
+            .collect();
+        let margin = property_margin(&spec, &found, &output64);
+        assert!(
+            margin > 0.0,
+            "candidate must be a strict trusted-ORT violation; got {margin:.9e}"
+        );
+        let emitted = refine_emit_view(&found, &emit_pin);
+        let witness = format_smtlib_witness_f64(&emitted, &output);
+        assert!(
+            matches!(
+                gate_sat_with_trusted_oracle(&onnx, &vnnlib, Some(&witness), None),
+                VnncompResult::Sat { .. }
+            ),
+            "the unchanged ORT/true-f64 terminal gate must uphold the discovered witness"
+        );
+
+        assert!(
+            low_dim_relational_face_grid_falsify(
+                &mut forward,
+                &spec,
+                &box_lo,
+                &box_hi,
+                &emit_pin,
+                std::time::Instant::now(),
+            )
+            .is_none(),
+            "an expired absolute deadline must prevent even the first face-grid evaluation"
+        );
+    }
+
     /// End-to-end exercise of the stage-2 gradient lane on a real (tiny) ONNX
     /// model with a real ORT acceptance oracle: y = relu(x), unsafe iff
     /// Y_0 >= 0.9. The seed sits far from the violating face (margin -0.8) where
     /// the derivative-free stage would need luck; the exact gradient walks x_0
-    /// straight up the box. Skips silently when ORT is unavailable in the test
-    /// environment (the lane itself falls back identically at runtime).
+    /// straight up the box. ORT is a required test/runtime dependency: loader
+    /// failures must fail this integration pin rather than erase its coverage.
     #[test]
     fn gradient_lane_recovers_violation_on_tiny_relu_net() {
         let bytes = tiny_relu_onnx_bytes();
@@ -11636,10 +20967,7 @@ mod tests {
         let box_lo = vec![0.0f32, 0.0];
         let box_hi = vec![1.0f32, 1.0];
         let emit_pin = vec![None, None];
-        let mut forward = match ny_onnx::diff::OrtForward::from_path(&onnx, 2) {
-            Ok(f) => f,
-            Err(_) => return, // ORT not available here; runtime falls back the same way
-        };
+        let mut forward = generated_ort_forward(&onnx, 2);
 
         let seed = vec![0.1f32, 0.5];
         let found = gradient_guided_falsify(
@@ -11691,10 +21019,7 @@ mod tests {
         let box_lo = vec![0.0f32, 0.0];
         let box_hi = vec![1.0f32, 1.0];
         let emit_pin = vec![None, None];
-        let mut forward = match ny_onnx::diff::OrtForward::from_path(&onnx, 2) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
+        let mut forward = generated_ort_forward(&onnx, 2);
 
         let start = std::time::Instant::now();
         let found = gradient_guided_falsify(
@@ -11947,10 +21272,7 @@ mod tests {
         let box_lo = vec![0.0f32, 0.0];
         let box_hi = vec![1.0f32, 1.0];
         let emit_pin = vec![None, None];
-        let mut forward = match ny_onnx::diff::OrtForward::from_path(&onnx, 2) {
-            Ok(f) => f,
-            Err(_) => return, // runtime likewise falls through when ORT is unavailable
-        };
+        let mut forward = generated_ort_forward(&onnx, 2);
         let priority = vec![PrioritySeed {
             // A genuine point in the planted 0.1%-wide violation basin.
             point: vec![0.999_511_7_f32, 0.5],
@@ -12314,7 +21636,7 @@ mod tests {
     /// v2 END-TO-END basin oracle: on the plateau-basin net, a priority seed
     /// carrying the basin SUBBOX (v2) must both find the violation and return
     /// a point INSIDE that subbox — the projected leg cannot wander out of
-    /// the unverified region. Skips silently when ORT is unavailable.
+    /// the unverified region. ORT loader failures are hard test failures.
     #[test]
     fn subbox_projected_leg_finds_and_stays_in_basin() {
         let bytes = plateau_basin_onnx_bytes();
@@ -12331,10 +21653,7 @@ mod tests {
         let box_lo = vec![0.0f32, 0.0];
         let box_hi = vec![1.0f32, 1.0];
         let emit_pin = vec![None, None];
-        let mut forward = match ny_onnx::diff::OrtForward::from_path(&onnx, 2) {
-            Ok(f) => f,
-            Err(_) => return, // ORT not available here
-        };
+        let mut forward = generated_ort_forward(&onnx, 2);
 
         // The exported basin subbox [1-2^-10, 1] x [0, 1] with its midpoint
         // center — exactly what mode-2 assembly produces for a frontier seed.
@@ -12409,6 +21728,7 @@ mod tests {
             ],
             name: "plateau_basin".to_string(),
             initializer: vec![cbias],
+            sparse_initializer: Vec::new(),
             input: vec![f32_value_info("input", &[2])],
             output: vec![f32_value_info("output", &[2])],
             value_info: Vec::new(),
@@ -12435,8 +21755,7 @@ mod tests {
     /// attack lands in the basin immediately (restart 2); without it the same
     /// fixed-RNG budget finds nothing (zero gradient outside the basin, and no
     /// deterministic random draw reaches the 0.1% sliver within the restart
-    /// cap). Skips silently when ORT is unavailable (the lane falls back the
-    /// same way at runtime).
+    /// cap). ORT loader failures are hard test failures.
     #[test]
     fn bab_frontier_seed_flips_plateau_basin_attack() {
         let bytes = plateau_basin_onnx_bytes();
@@ -12454,10 +21773,7 @@ mod tests {
         let box_lo = vec![0.0f32, 0.0];
         let box_hi = vec![1.0f32, 1.0];
         let emit_pin = vec![None, None];
-        let mut forward = match ny_onnx::diff::OrtForward::from_path(&onnx, 2) {
-            Ok(f) => f,
-            Err(_) => return, // ORT not available here
-        };
+        let mut forward = generated_ort_forward(&onnx, 2);
 
         // Arm OFF: no frontier seeds — the fixed-RNG restart schedule must
         // exhaust its cap without a violation (deterministic).
@@ -12533,10 +21849,7 @@ mod tests {
         let box_lo = vec![0.0f32, 0.0];
         let box_hi = vec![1.0f32, 1.0];
         let emit_pin = vec![None, None];
-        let mut forward = match ny_onnx::diff::OrtForward::from_path(&onnx, 2) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
+        let mut forward = generated_ort_forward(&onnx, 2);
 
         // One bogus v1 seed and one bogus v2 seed (with a subbox, exercising
         // the projected-leg path) — neither may manufacture a sat.
@@ -12585,7 +21898,14 @@ mod tests {
 
     #[test]
     fn parse_competition_json_verified() {
-        let json = r#"{"status": "verified", "counterexample_vnnlib": null}"#;
+        let json = r#"{
+            "status": "verified",
+            "counterexample_vnnlib": null,
+            "effective_config": {
+                "schema": "ny_beta_crown_effective_treatment_v1",
+                "batch": {"configured_size": 256}
+            }
+        }"#;
         assert_eq!(parse_competition_json(json), Some(VnncompResult::Unsat));
     }
 
@@ -12619,6 +21939,746 @@ mod tests {
         assert_eq!(internal_timeout_secs(5), 5);
         assert_eq!(internal_timeout_secs(3), 3);
         assert_eq!(internal_timeout_secs(1), 1);
+    }
+
+    #[test]
+    fn safenlp_short_grace_gate_is_exact() {
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("01"),
+            Some("true"),
+            Some(" 1"),
+            Some("1 "),
+        ] {
+            assert!(
+                !safenlp_short_grace_gate_enabled(raw.map(OsStr::new)),
+                "malformed/non-arming gate spelling {raw:?} must preserve history"
+            );
+        }
+        assert!(safenlp_short_grace_gate_enabled(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn safenlp_direct_mip_first_gate_category_and_budget_are_exact() {
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("01"),
+            Some("true"),
+            Some(" 1"),
+            Some("1 "),
+        ] {
+            assert!(
+                !safenlp_direct_mip_first_requested("safenlp_2024", 20, raw.map(OsStr::new)),
+                "malformed/non-arming direct-first gate {raw:?} must preserve history"
+            );
+        }
+
+        let armed = Some(OsStr::new("1"));
+        for category in [
+            "safenlp",
+            "safenlp_2023",
+            "safenlp_2024_extra",
+            "other_safenlp_2024",
+            "path/safenlp_2024",
+            "cifar100_2024",
+        ] {
+            assert!(
+                !safenlp_direct_mip_first_requested(category, 20, armed),
+                "out-of-scope category {category:?} must preserve history"
+            );
+        }
+        assert!(!safenlp_direct_mip_first_requested(
+            "safenlp_2024",
+            0,
+            armed
+        ));
+        assert!(safenlp_direct_mip_first_requested("safenlp_2024", 1, armed));
+        assert!(safenlp_direct_mip_first_requested(
+            " SafeNLP-2024 ",
+            20,
+            armed
+        ));
+        assert!(safenlp_direct_mip_first_requested(
+            "safenlp_2024",
+            SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS,
+            armed
+        ));
+        assert!(!safenlp_direct_mip_first_requested(
+            "safenlp_2024",
+            SAFENLP_DIRECT_MIP_FIRST_MAX_BUDGET_SECS + 1,
+            armed
+        ));
+    }
+
+    #[test]
+    fn marked_direct_timeout_is_terminal_before_every_postbab_lane() {
+        let marked = CapturedTerminalIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
+        for result in [VnncompResult::Timeout, VnncompResult::Unknown] {
+            assert!(
+                !postbab_escalation_allowed(&result, marked),
+                "an admitted marked-margin result must not reach fallback/APGD/second-solve work"
+            );
+            assert!(
+                postbab_escalation_allowed(&result, CapturedTerminalIngress::None),
+                "historical and required-plain timeout policy must remain unchanged"
+            );
+        }
+        for result in [
+            VnncompResult::Unsat,
+            VnncompResult::Sat { witness: None },
+            VnncompResult::Error,
+        ] {
+            assert!(!postbab_escalation_allowed(
+                &result,
+                CapturedTerminalIngress::None
+            ));
+            assert!(!postbab_escalation_allowed(&result, marked));
+        }
+
+        // Normalize line endings first: the needles below are multi-line `\n`
+        // literals, but `.rs` files check out CRLF under core.autocrlf, so on
+        // Windows `"\n    gated\n}"` never matched and this source-introspection
+        // gate failed on a file whose CONTENT was exactly right.
+        let source = include_str!("vnncomp.rs").replace("\r\n", "\n");
+        let (_, post_verify) = source
+            .split_once("&& postbab_escalation_allowed(&gated, terminal_ingress)")
+            .expect("typed terminal gate must guard post-BaB work");
+        let guarded = post_verify
+            .split_once("\n    gated\n}")
+            .expect("end of run_and_translate")
+            .0;
+        assert!(
+            guarded.contains("try_margin_row_unsat("),
+            "the terminal guard must cover the inline certified second-solver lane"
+        );
+        assert!(
+            guarded.contains("try_postbab_falsify("),
+            "the terminal guard must cover the DLR-APGD post-BaB lane"
+        );
+        assert!(
+            guarded.contains("lane.take(grace)"),
+            "the terminal guard must prevent downstream consumption of a concurrent fallback verdict"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safenlp_short_grace_non_unicode_gate_fails_closed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(!safenlp_short_grace_gate_enabled(Some(OsStr::from_bytes(
+            b"1\xff"
+        ))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safenlp_direct_mip_first_non_unicode_gate_fails_closed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(!safenlp_direct_mip_first_requested(
+            "safenlp_2024",
+            20,
+            Some(OsStr::from_bytes(b"1\xff")),
+        ));
+    }
+
+    #[test]
+    fn traffic_upfront_dark_gate_does_not_invoke_qualification() {
+        let invoked = std::cell::Cell::new(false);
+        let result = traffic_upfront_objective_if_requested(false, || {
+            invoked.set(true);
+            Ok::<usize, String>(7)
+        })
+        .expect("dark gate is not an error");
+        assert_eq!(result, None);
+        assert!(!invoked.get(), "dark gate performed heavyweight model I/O");
+
+        let armed = traffic_upfront_objective_if_requested(true, || {
+            invoked.set(true);
+            Ok::<usize, String>(7)
+        })
+        .expect("armed synthetic qualification");
+        assert_eq!(armed, Some(7));
+        assert!(invoked.get());
+    }
+
+    #[test]
+    fn traffic_or_reserved_proof_context_suppresses_the_k_wide_prewave() {
+        assert!(wrapper_vjp_prewave_allowed(false));
+        assert!(!wrapper_vjp_prewave_allowed(true));
+
+        {
+            let _reservation = BetaWgpuContextReservation::enter(true);
+            assert!(!wrapper_vjp_prewave_allowed(false));
+            assert!(!wrapper_vjp_prewave_allowed(true));
+        }
+        assert!(
+            wrapper_vjp_prewave_allowed(false),
+            "the command-scoped reservation must restore prior thread state"
+        );
+    }
+
+    #[test]
+    fn vnncomp_wgpu_context_reservation_matches_beta_backend_precedence() {
+        assert!(vnncomp_beta_requests_wgpu(Some("wgpu"), Some(5), false));
+        assert!(!vnncomp_beta_requests_wgpu(Some("cpu"), Some(3072), true));
+        assert!(vnncomp_beta_requests_wgpu(None, Some(3072), true));
+        assert!(!vnncomp_beta_requests_wgpu(None, Some(1000), true));
+        assert!(!vnncomp_beta_requests_wgpu(None, Some(3072), false));
+        assert!(!vnncomp_beta_requests_wgpu(None, None, true));
+    }
+
+    #[test]
+    fn traffic_upfront_logit_dlr_requires_exact_finite_width() {
+        let spec = spec_with(
+            TRAFFIC_UPFRONT_LOGIT_WIDTH,
+            vec![vec![OC::GreaterEq(0, 42)], vec![OC::GreaterEq(1, 42)]],
+            true,
+            vec![(0.0, 1.0)],
+        );
+        let mut logits = vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH];
+        logits[0] = 4.0;
+        logits[1] = 3.0;
+        logits[2] = 2.0;
+        logits[42] = 5.0;
+        let row = traffic_upfront_logit_dlr_row(&spec, &[0.5], &logits)
+            .expect("exact finite traffic logits must produce a DLR row");
+        assert_eq!(row.len(), TRAFFIC_UPFRONT_LOGIT_WIDTH);
+        assert!(row.iter().all(|value| value.is_finite()));
+
+        for malformed in [
+            vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH - 1],
+            vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH + 1],
+        ] {
+            assert!(traffic_upfront_logit_dlr_row(&spec, &[0.5], &malformed).is_none());
+        }
+        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut malformed = logits.clone();
+            malformed[7] = non_finite;
+            assert!(
+                traffic_upfront_logit_dlr_row(&spec, &[0.5], &malformed).is_none(),
+                "non-finite logit {non_finite:?} did not invalidate treatment"
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_upfront_acceptance_ignores_a_logit_only_hit() {
+        let spec = spec_with(
+            TRAFFIC_UPFRONT_LOGIT_WIDTH,
+            vec![vec![OC::GreaterEq(0, 42)]],
+            true,
+            vec![(0.0, 1.0)],
+        );
+        let mut logits = vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH];
+        logits[0] = 2.0;
+        logits[42] = 1.0;
+        assert!(property_margin(&spec, &[0.5], &logits) > 0.0);
+
+        let mut original_outputs = vec![0.0; TRAFFIC_UPFRONT_LOGIT_WIDTH];
+        original_outputs[42] = 1.0;
+        assert!(
+            !traffic_upfront_original_candidate_violates(&spec, &[0.5], &original_outputs,),
+            "rewritten-logit guidance crossed the original-output acceptance boundary"
+        );
+    }
+
+    #[test]
+    fn traffic_upfront_execution_telemetry_is_exhaustive() {
+        assert_eq!(
+            TrafficUpfrontSoftmaxExecution::before_run(false),
+            TrafficUpfrontSoftmaxExecution::NotRequested
+        );
+        assert_eq!(
+            TrafficUpfrontSoftmaxExecution::before_run(true),
+            TrafficUpfrontSoftmaxExecution::NotReached
+        );
+
+        let states = [
+            TrafficUpfrontSoftmaxExecution::NotRequested,
+            TrafficUpfrontSoftmaxExecution::NotReached,
+            TrafficUpfrontSoftmaxExecution::AttackDisabled,
+            TrafficUpfrontSoftmaxExecution::AdmissionDeclined,
+            TrafficUpfrontSoftmaxExecution::QualificationDeclined,
+            TrafficUpfrontSoftmaxExecution::QualifiedNotRun,
+            TrafficUpfrontSoftmaxExecution::Applied,
+            TrafficUpfrontSoftmaxExecution::Invalidated,
+        ];
+        for state in states {
+            assert!(!state.flight_reason().is_empty());
+        }
+        assert_eq!(
+            TrafficUpfrontSoftmaxExecution::Applied.flight_status(),
+            crate::flight::FlightStatus::Ran
+        );
+        assert_eq!(
+            TrafficUpfrontSoftmaxExecution::QualifiedNotRun.flight_status(),
+            crate::flight::FlightStatus::NotReached
+        );
+        assert_eq!(
+            TrafficUpfrontSoftmaxExecution::Invalidated.flight_status(),
+            crate::flight::FlightStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn traffic_terminal_softmax_peel_is_default_dark() {
+        assert_eq!(
+            traffic_terminal_softmax_peel_decision(TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY, None,),
+            TrafficTerminalSoftmaxPeelDecision {
+                env_armed: false,
+                category_matched: true,
+                effective: false,
+            }
+        );
+    }
+
+    #[test]
+    fn traffic_terminal_softmax_peel_env_parsing_is_exact() {
+        for raw in ["", "0", "01", "true", "on", " 1", "1 "] {
+            let decision = traffic_terminal_softmax_peel_decision(
+                TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
+                Some(OsStr::new(raw)),
+            );
+            assert!(!decision.env_armed, "near-miss spelling {raw:?} armed");
+            assert!(!decision.effective, "near-miss spelling {raw:?} forwarded");
+        }
+
+        let armed = traffic_terminal_softmax_peel_decision(
+            TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
+            Some(OsStr::new("1")),
+        );
+        assert!(armed.env_armed);
+        assert!(armed.effective);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traffic_terminal_softmax_peel_non_unicode_env_fails_closed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let decision = traffic_terminal_softmax_peel_decision(
+            TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
+            Some(OsStr::from_bytes(b"1\xff")),
+        );
+        assert!(!decision.env_armed);
+        assert!(!decision.effective);
+    }
+
+    #[test]
+    fn traffic_terminal_softmax_peel_is_category_isolated() {
+        for category in [
+            "traffic_signs_recognition",
+            "traffic_signs_recognition_2024",
+            "Traffic_Signs_Recognition_2023",
+            " traffic_signs_recognition_2023",
+            "traffic_signs_recognition_2023 ",
+            "other_traffic_signs_recognition_2023",
+            "path/traffic_signs_recognition_2023",
+        ] {
+            let decision = traffic_terminal_softmax_peel_decision(category, Some(OsStr::new("1")));
+            assert!(decision.env_armed);
+            assert!(
+                !decision.category_matched,
+                "near-miss category {category:?}"
+            );
+            assert!(
+                !decision.effective,
+                "near-miss category {category:?} forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_terminal_softmax_peel_gate_on_forwards_typed_request() {
+        let decision = traffic_terminal_softmax_peel_decision(
+            TRAFFIC_TERMINAL_SOFTMAX_PEEL_CATEGORY,
+            Some(OsStr::new("1")),
+        );
+        let overrides = BetaCrownInstanceOverrides {
+            traffic_terminal_softmax_peel: decision.effective,
+            ..BetaCrownInstanceOverrides::default()
+        };
+        assert!(overrides.traffic_terminal_softmax_peel);
+    }
+
+    #[test]
+    fn cgan_input_leaf_gate_is_default_dark_and_exact() {
+        assert_eq!(
+            cgan_input_leaf_decision(CGAN_INPUT_LEAF_CATEGORY, None),
+            CganInputLeafDecision {
+                env_armed: false,
+                category_matched: true,
+                mip_compiled: cfg!(feature = "mip"),
+                route: None,
+            }
+        );
+        for raw in ["", "0", "01", "true", "on", " 1", "1 "] {
+            let decision =
+                cgan_input_leaf_decision(CGAN_INPUT_LEAF_CATEGORY, Some(OsStr::new(raw)));
+            assert!(!decision.env_armed, "near-miss spelling {raw:?} armed");
+            assert_eq!(decision.route, None);
+        }
+        let expected_route = cfg!(feature = "mip").then_some(CganInputLeafRoute::Cgan2023);
+        assert_eq!(
+            cgan_input_leaf_decision(CGAN_INPUT_LEAF_CATEGORY, Some(OsStr::new("1"))).route,
+            expected_route
+        );
+        let armed = cgan_input_leaf_decision(CGAN_INPUT_LEAF_CATEGORY, Some(OsStr::new("1")));
+        assert_eq!(
+            cgan_input_leaf_gate_receipt(armed, CGAN_INPUT_LEAF_CATEGORY),
+            format!(
+                "env_armed=true category_matched=true mip_compiled={} effective={} \
+                 depth_two_production_mode=disabled_not_requested category=cgan_2023",
+                cfg!(feature = "mip"),
+                cfg!(feature = "mip"),
+            )
+        );
+    }
+
+    #[test]
+    fn cgan_input_leaf_route_is_exact_category_only() {
+        for category in [
+            "cgan2023",
+            "cgan_2024",
+            "cgan2026",
+            "CGAN_2023",
+            " cgan_2023",
+            "cgan_2023 ",
+            "path/cgan_2023",
+        ] {
+            let decision = cgan_input_leaf_decision(category, Some(OsStr::new("1")));
+            assert!(decision.env_armed);
+            assert!(
+                !decision.category_matched,
+                "near-miss category {category:?}"
+            );
+            assert_eq!(decision.route, None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cgan_input_leaf_non_unicode_env_fails_closed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let decision =
+            cgan_input_leaf_decision(CGAN_INPUT_LEAF_CATEGORY, Some(OsStr::from_bytes(b"1\xff")));
+        assert!(!decision.env_armed);
+        assert_eq!(decision.route, None);
+    }
+
+    #[test]
+    fn traffic_terminal_softmax_execution_distinguishes_every_receipt_state() {
+        assert_eq!(
+            TrafficTerminalSoftmaxPeelExecution::before_run(false),
+            TrafficTerminalSoftmaxPeelExecution::NotRequested
+        );
+        assert_eq!(
+            TrafficTerminalSoftmaxPeelExecution::before_run(true),
+            TrafficTerminalSoftmaxPeelExecution::NotReached
+        );
+        assert_eq!(
+            TrafficTerminalSoftmaxPeelExecution::NotReached.flight_status(),
+            crate::flight::FlightStatus::NotReached
+        );
+        assert_eq!(
+            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, None),
+            TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable
+        );
+
+        let captured = |requested, applied, activation| {
+            serde_json::json!({
+                "status": "unknown",
+                "effective_config": {
+                    "softmax": {
+                        "terminal_peel_requested": requested,
+                        "terminal_peel_applied": applied,
+                        "terminal_peel_activation": activation,
+                    }
+                }
+            })
+            .to_string()
+        };
+        let declined = captured(true, false, "none");
+        assert_eq!(
+            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, Some(&declined)),
+            TrafficTerminalSoftmaxPeelExecution::Declined
+        );
+        assert_eq!(
+            TrafficTerminalSoftmaxPeelExecution::Declined.flight_status(),
+            crate::flight::FlightStatus::Skipped
+        );
+        let applied = captured(true, true, "softmax");
+        let applied_receipt =
+            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, Some(&applied));
+        assert_eq!(
+            applied_receipt,
+            TrafficTerminalSoftmaxPeelExecution::Applied
+        );
+        assert!(applied_receipt.applied());
+        assert_eq!(
+            applied_receipt.flight_status(),
+            crate::flight::FlightStatus::Ran
+        );
+
+        let inconsistent = captured(false, true, "softmax");
+        assert_eq!(
+            TrafficTerminalSoftmaxPeelExecution::from_beta_capture(true, Some(&inconsistent)),
+            TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable
+        );
+
+        for inconsistent_activation in [
+            captured(true, true, "sigmoid"),
+            captured(true, true, "log_softmax"),
+            captured(true, false, "softmax"),
+        ] {
+            assert_eq!(
+                TrafficTerminalSoftmaxPeelExecution::from_beta_capture(
+                    true,
+                    Some(&inconsistent_activation),
+                ),
+                TrafficTerminalSoftmaxPeelExecution::ReceiptUnavailable,
+                "traffic receipt must authenticate the exact applied activation"
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_declared_bound_snap_rehydrates_original_outputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let onnx = tmp.path().join("tiny_relu.onnx");
+        fs::write(&onnx, tiny_relu_onnx_bytes()).expect("write tiny ONNX");
+        let spec = spec_with(
+            2,
+            vec![vec![OC::GreaterEqConst(0, 0.0)]],
+            true,
+            vec![(0.0, 1.0), (0.0, 1.0)],
+        );
+        let peeled = "((X_0 -1.401298464324817e-45)\n(X_1 0.5)\n(Y_0 123.0)\n(Y_1 456.0))";
+        let snapped = snap_witness_to_declared(&spec, peeled).expect("X_0 snaps to declared zero");
+        assert_eq!(snapped, vec![0.0, 0.5]);
+
+        let input_only = format_smtlib_witness_f64(&snapped, &[]);
+        assert!(parse_witness_outputs(&input_only).is_none());
+        let repaired = rehydrate_original_witness_outputs(&onnx, &input_only)
+            .expect("snapped input must be forwarded through original ONNX");
+
+        assert_eq!(parse_witness_inputs_f64(&repaired).unwrap(), snapped);
+        assert_eq!(
+            parse_witness_outputs(&repaired).unwrap(),
+            vec![0.0, 0.5],
+            "the snap path must not return an input-only or peeled-coordinate witness"
+        );
+    }
+
+    #[test]
+    fn safenlp_short_grace_category_match_is_normalized_but_narrow() {
+        for category in [
+            "safenlp_2024",
+            "SafeNLP_2024",
+            "safenlp-2024",
+            "  SafeNLP-2024\t",
+        ] {
+            assert!(
+                is_safenlp_2024_category(category),
+                "normalized SafeNLP spelling {category:?} must match"
+            );
+        }
+        for category in [
+            "safenlp",
+            "safenlp_2023",
+            "safenlp_2024_extra",
+            "other_safenlp_2024",
+            "path/safenlp_2024",
+            "safe nlp_2024",
+        ] {
+            assert!(
+                !is_safenlp_2024_category(category),
+                "near-miss category {category:?} must stay on history"
+            );
+        }
+    }
+
+    #[test]
+    fn safenlp_short_grace_applies_through_thirty_seconds() {
+        let gate = Some(OsStr::new("1"));
+        let official = internal_timeout_decision("safenlp_2024", 20, gate);
+        assert_eq!(
+            official,
+            InternalTimeoutDecision {
+                solver_timeout_secs: 19,
+                effective_flush_reserve_secs: 1,
+                historical_solver_timeout_secs: 15,
+                route: InternalTimeoutRoute::SafeNlpShortGrace,
+            }
+        );
+
+        let boundary = internal_timeout_decision(" SafeNLP-2024 ", 30, gate);
+        assert_eq!(boundary.solver_timeout_secs, 29);
+        assert_eq!(boundary.effective_flush_reserve_secs, 1);
+        assert_eq!(boundary.historical_solver_timeout_secs, 25);
+        assert_eq!(boundary.route, InternalTimeoutRoute::SafeNlpShortGrace);
+
+        let above = internal_timeout_decision("safenlp_2024", 31, gate);
+        assert_eq!(above.solver_timeout_secs, internal_timeout_secs(31));
+        assert_eq!(above.route, InternalTimeoutRoute::Historical);
+
+        let scored_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        assert_eq!(
+            scored_deadline.duration_since(safenlp_short_hard_stop_deadline(scored_deadline)),
+            SAFENLP_SHORT_HARD_STOP_MARGIN
+        );
+    }
+
+    #[test]
+    fn safenlp_official_2025_row_592_reaches_the_short_route() {
+        // Official VNN-COMP 2025 safenlp_2024 instances.csv line 592.
+        let row = "onnx/ruarobot/perturbations_0.onnx,\
+                   vnnlib/ruarobot/hyperrectangle_5984.vnnlib,20";
+        let fields: Vec<_> = row.split(',').collect();
+        assert_eq!(fields.len(), 3);
+        let budget: u64 = fields[2].parse().expect("official integer budget");
+
+        let decision = internal_timeout_decision("safenlp_2024", budget, Some(OsStr::new("1")));
+        assert_eq!(decision.route, InternalTimeoutRoute::SafeNlpShortGrace);
+        assert_eq!(decision.solver_timeout_secs, 19);
+        assert_eq!(decision.effective_flush_reserve_secs, 1);
+    }
+
+    #[test]
+    fn safenlp_short_grace_tiny_budgets_keep_a_positive_solver_timeout() {
+        let gate = Some(OsStr::new("1"));
+        let zero = internal_timeout_decision("safenlp_2024", 0, gate);
+        assert_eq!(zero.solver_timeout_secs, 0);
+        assert_eq!(zero.effective_flush_reserve_secs, 0);
+
+        let one = internal_timeout_decision("safenlp_2024", 1, gate);
+        assert_eq!(one.solver_timeout_secs, 1);
+        assert_eq!(one.effective_flush_reserve_secs, 0);
+
+        for budget in 2..=5 {
+            let decision = internal_timeout_decision("safenlp_2024", budget, gate);
+            assert_eq!(decision.solver_timeout_secs, budget - 1);
+            assert_eq!(decision.effective_flush_reserve_secs, 1);
+            assert_eq!(decision.route, InternalTimeoutRoute::SafeNlpShortGrace);
+        }
+    }
+
+    #[test]
+    fn safenlp_short_grace_off_and_out_of_scope_are_historical() {
+        let nonarming = [None, Some(""), Some("0"), Some("true"), Some("01")];
+        for budget in 0..=1_000 {
+            for raw in nonarming {
+                let decision =
+                    internal_timeout_decision("safenlp_2024", budget, raw.map(OsStr::new));
+                assert_eq!(
+                    decision.solver_timeout_secs,
+                    internal_timeout_secs(budget),
+                    "gate={raw:?}, budget={budget}"
+                );
+                assert_eq!(decision.route, InternalTimeoutRoute::Historical);
+            }
+        }
+
+        let armed = Some(OsStr::new("1"));
+        for category in ["cifar100_2024", "safenlp_2023", "safenlp_2024_extra"] {
+            for budget in 0..=1_000 {
+                let decision = internal_timeout_decision(category, budget, armed);
+                assert_eq!(
+                    decision.solver_timeout_secs,
+                    internal_timeout_secs(budget),
+                    "category={category:?}, budget={budget}"
+                );
+                assert_eq!(decision.route, InternalTimeoutRoute::Historical);
+            }
+        }
+        for budget in 31..=1_000 {
+            let decision = internal_timeout_decision("safenlp_2024", budget, armed);
+            assert_eq!(
+                decision.solver_timeout_secs,
+                internal_timeout_secs(budget),
+                "armed out-of-range budget={budget}"
+            );
+            assert_eq!(decision.route, InternalTimeoutRoute::Historical);
+        }
+    }
+
+    #[test]
+    fn safenlp_unset_and_zero_keep_the_exact_historical_watchdog_contract() {
+        #[derive(Clone)]
+        struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("recording writer lock").extend(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let timeout_secs = 20;
+        let expected = (
+            ExternalWatchdogDeadline::RelativeSeconds(
+                timeout_secs + WATCHDOG_GRACE_SECS + EXTERNAL_WATCHDOG_EXTRA_GRACE_SECS,
+            ),
+            ExternalWatchdogResultPolicy::CommitTimeout,
+        );
+        for raw in [None, Some(OsStr::new("0"))] {
+            let decision = internal_timeout_decision("safenlp_2024", timeout_secs, raw);
+            assert_eq!(decision.route, InternalTimeoutRoute::Historical);
+            assert_eq!(
+                decision.solver_timeout_secs,
+                internal_timeout_secs(timeout_secs)
+            );
+            assert_eq!(
+                historical_external_watchdog_contract(timeout_secs),
+                expected
+            );
+
+            let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let delay = historical_watchdog_abort_delay_after_request(
+                Some(RecordingWriter(writes.clone())),
+                EXTERNAL_WATCHDOG_FIRE_REQUEST,
+            );
+            assert_eq!(
+                delay,
+                Some(std::time::Duration::from_secs(
+                    EXTERNAL_WATCHDOG_EXTRA_GRACE_SECS
+                )),
+                "gate={raw:?}: historical overrun must retain its 10-second abort fail-safe"
+            );
+            assert_eq!(
+                writes.lock().expect("recorded fire request").as_slice(),
+                EXTERNAL_WATCHDOG_FIRE_REQUEST,
+                "gate={raw:?}: historical overrun must notify the helper with the exact F byte"
+            );
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let direct_file = tmp.path().join("direct.txt");
+        let routed_file = tmp.path().join("routed.txt");
+        let verdict = VnncompResult::Sat {
+            witness: Some("(X_0 0.25)".to_owned()),
+        };
+        write_results(&direct_file, &verdict).expect("historical direct write");
+        assert!(
+            write_terminal_result(&routed_file, None, verdict).expect("default-off routed write"),
+            "historical publication must still report success"
+        );
+        assert_eq!(
+            fs::read(&routed_file).expect("read routed bytes"),
+            fs::read(&direct_file).expect("read direct bytes"),
+            "unset/0 must retain the exact historical result bytes"
+        );
     }
 
     // ---- Preset-path resolution ----
@@ -12898,17 +22958,20 @@ mod tests {
 
     /// END-TO-END: the real ACAS net + the canonical instance-0 vnnlib yields `sat`
     /// with a revalidated dual-network witness whose Y_f[3] < Y_g[3] genuinely holds.
-    /// Uses the repo-vendored benchmark ONNX; skips only if it is absent.
+    /// Uses the external VNN-COMP 2026 benchmark checkout.
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn monotonic_real_instance0_emits_revalidated_sat() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let onnx = manifest.join(
-            "../../benchmarks/vnncomp2026/benchmarks/monotonic_acasxu_2026/2.0/onnx/original/ACASXU_run2a_2_2_batch_2000.onnx",
+            "../../benchmarks/vnncomp2026_benchmarks/benchmarks/monotonic_acasxu_2026/2.0/onnx/original/ACASXU_run2a_2_2_batch_2000.onnx",
         );
-        if !onnx.is_file() {
-            eprintln!("benchmark ONNX absent; skipping real-instance SAT test");
-            return;
-        }
+        assert!(
+            onnx.is_file(),
+            "external-vnncomp real-instance SAT conformance requires {}; run \
+             benchmarks/download_benchmarks.sh 2026",
+            onnx.display()
+        );
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let category = tmp.path().join("monotonic_acasxu_2026");
@@ -13092,9 +23155,8 @@ mod tests {
         let g_path = tmp.path().join("g.onnx");
         fs::write(&f_path, tiny_relu_onnx_bytes_with_dim(2)).expect("write f");
         fs::write(&g_path, tiny_mul2_onnx_bytes_with_dim(2)).expect("write g");
-        if ny_onnx::diff::OrtForward::from_path(&f_path, 2).is_err() {
-            return; // runtime likewise downgrades when ORT is absent
-        }
+        drop(generated_ort_forward(&f_path, 2));
+        drop(generated_ort_forward(&g_path, 2));
         let graph_f = load_graph_network(&f_path).expect("load f");
         let graph_g = load_graph_network(&g_path).expect("load g");
         let dual = isomorphic_dual_with_dim(2, 0.05);
@@ -13174,5 +23236,65 @@ mod tests {
             )
             .is_some());
         }
+    }
+
+    /// #witness-box-audit (2026-07-31): an out-of-box counterexample candidate
+    /// is REFUSED by the trusted gate's decision core on the cifar100 spec
+    /// shape — a multi-clause adversarial disjunction whose OUTPUT condition
+    /// (`some Y_j >= Y_true`) is satisfiable almost anywhere in input space,
+    /// so the GLOBAL input-box gate is the only thing separating a genuine
+    /// eps-box witness from an arbitrary misclassified image. MEASURED origin:
+    /// the archived `ab_L5308_pgd40` "witness" (really the L3585 instance's CE
+    /// — a wrong-instance harness artifact, see
+    /// docs/CIFAR100_REGRESSION_ATTRIBUTION_2026-07-31.md §6) has 25/3072
+    /// coords in L5308's box and `confirm_violation_with_ort` returns
+    /// `Ok(false)` on it; this test pins that refusal semantics on a synthetic
+    /// replica so it can never regress.
+    #[test]
+    fn out_of_box_witness_is_refused_on_global_box_disjunctions() {
+        // 2 inputs in [0, 0.1]^2 (an eps-box), 3-clause disjunction over
+        // outputs only (per-clause input maps EMPTY => the global gate must
+        // carry the membership decision alone).
+        let spec = spec_with(
+            3,
+            vec![
+                vec![OC::GreaterEq(0, 2)],
+                vec![OC::GreaterEq(1, 2)],
+                vec![OC::GreaterEqConst(0, 0.5)],
+            ],
+            true,
+            vec![(0.0, 0.1), (0.0, 0.1)],
+        );
+        // Outputs that STRONGLY satisfy every clause.
+        let violating_y = [10.0, 10.0, 0.0];
+        // In-box X: violated (the sat direction still works).
+        assert!(property_violated_f64(&spec, &[0.05, 0.05], &violating_y));
+        // Same violating Y, X outside the box (another image's eps-ball, a
+        // pre-projection iterate, a foreign buffer): REFUSED — never sat.
+        assert!(!property_violated_f64(&spec, &[0.5, 0.05], &violating_y));
+        assert!(!property_violated_f64(&spec, &[3.0, -2.0], &violating_y));
+        // Zero tolerance: one ULP-scale excursion outside the declared f64
+        // bound already refuses (the organizer's exact asserts would too).
+        assert!(!property_violated_f64(
+            &spec,
+            &[0.1000001, 0.05],
+            &violating_y
+        ));
+        // Box faces are inside (non-strict asserts).
+        assert!(property_violated_f64(&spec, &[0.0, 0.1], &violating_y));
+    }
+
+    /// The vnncomp emitting path prints EXACTLY the gate-validated witness
+    /// text: `render_results_file` is a verbatim carrier, so the vector the
+    /// trusted-ORT gate confirmed is bit-for-bit the vector the organizer
+    /// re-checks (witness == validated vector, #witness-box-audit).
+    #[test]
+    fn results_file_carries_the_gated_witness_verbatim() {
+        let witness = "((X_0 -1.779750943183899)\n(Y_0 0.10000000149011612))".to_string();
+        let rendered = VnncompResult::Sat {
+            witness: Some(witness.clone()),
+        }
+        .render_results_file();
+        assert_eq!(rendered, format!("sat\n{witness}\n"));
     }
 }

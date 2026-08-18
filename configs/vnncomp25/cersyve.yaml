@@ -31,7 +31,11 @@
 #   * pgd_alpha: 0.01, pgd_alpha_scale: True — now mirrored in the preset
 #   * adv_check: -1 — now configurable, disabled for cersyve (#3870)
 #   * reorder_bab: True — now implemented (#3870)
-# - Status: ENTRY READY (6/12, 50%).
+# - Sealed proof-tail A/B 2026-07-31 on official row 12, cap 100s, immutable
+#   commit 10c06d2a / solver SHA df67ffae: the frozen 10% engine tail plus
+#   implicit outer attack timed out at 97s; changing only the two tail controls
+#   below returned sound UNSAT in 71s. Completion integrity is valid.
+# - Status: ENTRY READY; row 12 proof-tail recovered, full category rerun pending.
 
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/cersyve
@@ -68,6 +72,17 @@ bab:
       sb_sum: true
       touch_zero_score: 0.1
       reorder_bab: true
+      # Complete clipping gives deferred children private intermediate-bound
+      # overrides. Rebound those independent tiny-controller CROWN calls two at
+      # a time; an 8x conservative live-headroom check limits incremental OOM
+      # risk, result order is preserved, and the route can be killed with
+      # NY_INPUT_SPLIT_OVERRIDE_PARALLEL=0.
+      # Capped A/B 2026-08-08 (4 Rayon threads, batch 64, 2 GiB/no swap):
+      # pendulum 2.90s -> 2.70s, lane keep 14.50s -> 10.80s, and point mass
+      # 40.81s -> 28.91s with identical proof counts. Official 2026 CartPole
+      # remained a 95s timeout but explored 48,187 -> 68,924 domains (+43.0%);
+      # peak RSS stayed within 2.2 MiB (967.3 -> 969.4 MiB).
+      override_parallel: true
       adv_check: -1
       # IBP-screen each input-split sub-domain before CROWN: domains that IBP can
       # close are discharged cheaply, tightening the BaB frontier enough to verify
@@ -77,13 +92,14 @@ bab:
     relaxed: true
     relaxed_iterations: 20
     clip_type: complete
-  # Phase budget overrides (#2206 Packet E).
-  # Evidence: finetune UNSAT instances spend 17-35s in BaB with 0 verified
-  # (CROWN bounds too loose). Cap warmup to give BaB maximum time.
-  # Reserve 10% for post-BaB PGD as safety net for SAT detection.
+  # Phase budget overrides (#2206 Packet E). Cap warmup, then keep both tail
+  # consumers explicitly off so the verifier owns the available proof window.
+  # The sealed row-12 A/B above measured UNSAT in 71s versus a 97s timeout with
+  # the frozen 10%/implicit-wrapper schedule; the fixed result margin is retained.
   phase_budget:
     initial_bounds_fraction: 0.15
-    post_bab_pgd_fraction: 0.10
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

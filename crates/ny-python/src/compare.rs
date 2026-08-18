@@ -7,9 +7,14 @@ use crate::utils::{
 };
 use crate::verify::resolve_verify_backend;
 use numpy::{PyArrayDyn, PyArrayMethods};
-use ny_core::nan_propagating_max;
+use ny_core::{
+    nan_propagating_max, Bound as CoreBound, GemmEngine, VerificationResult,
+    VerificationSoundnessMode, VerificationSpec,
+};
 use ny_onnx::{load_onnx, load_onnx_bytes};
-use ny_propagate::PropagationMethod;
+use ny_propagate::{
+    build_difference_network, GraphNetwork, Network, PropagationConfig, PropagationMethod, Verifier,
+};
 use ny_tensor::BoundedTensor;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -64,7 +69,7 @@ impl CompareResult {
         lines.push("Model Comparison Result".to_string());
         lines.push("=======================".to_string());
         lines.push(format!(
-            "Equivalent: {}",
+            "Functionally equivalent (proved): {}",
             if self.is_equivalent { "YES" } else { "NO" }
         ));
         lines.push(format!("Method: {}", self.method));
@@ -138,6 +143,104 @@ fn parse_compare_method(method: &str) -> PyResult<PropagationMethod> {
     }
 }
 
+/// Reject output layouts that an element-wise comparison cannot cover fully.
+///
+/// The comparison loops use `zip`, so checking first is essential: without it,
+/// a shorter target output silently truncates the comparison and can make
+/// different models appear equivalent. Empty outputs likewise have no
+/// meaningful overlap percentage or maximum difference.
+fn validate_comparable_outputs(
+    reference: &BoundedTensor,
+    target: &BoundedTensor,
+) -> ny_core::Result<()> {
+    if reference.shape() != target.shape() {
+        return Err(ny_core::NyError::InvalidSpec(format!(
+            "Output shape mismatch: reference {:?}, target {:?}",
+            reference.shape(),
+            target.shape()
+        )));
+    }
+    if reference.lower().is_empty() {
+        return Err(ny_core::NyError::InvalidSpec(
+            "Models produced empty outputs; cannot compare bounds".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The propagation facade accepts one bounded tensor. Selecting one input from
+/// a genuinely multi-input model does not supply values for the remaining
+/// inputs, so it cannot be made correct by an `input_index` choice.
+fn validate_single_input_models(
+    reference_count: usize,
+    target_count: usize,
+    api_name: &str,
+) -> ny_core::Result<()> {
+    if reference_count == 0 || target_count == 0 {
+        return Err(ny_core::NyError::InvalidSpec(
+            "Models must declare exactly one input".to_string(),
+        ));
+    }
+    if reference_count != target_count {
+        return Err(ny_core::NyError::InvalidSpec(format!(
+            "Input count mismatch: reference has {reference_count}, target has {target_count}"
+        )));
+    }
+    if reference_count != 1 {
+        return Err(ny_core::NyError::UnsupportedConfiguration(format!(
+            "{api_name} supports exactly one model input; both models declare \
+             {reference_count}. Multi-input comparison requires joint bounds for \
+             every input and cannot be emulated with input_index."
+        )));
+    }
+    Ok(())
+}
+
+/// Prove pointwise equivalence on the shared input box.
+///
+/// Equal independently-propagated output ranges are only diagnostics: for
+/// example, `f(x)=x` and `g(x)=-x` have the same range on a symmetric box. A
+/// true equivalence claim therefore comes only from verifying the difference
+/// graph `f(x)-g(x)` against `[-tolerance, tolerance]`, with sound provenance.
+fn prove_functional_equivalence(
+    reference: &Network,
+    target: &Network,
+    input: &BoundedTensor,
+    output_elements: usize,
+    tolerance: f32,
+    method: PropagationMethod,
+    engine: Option<&dyn GemmEngine>,
+) -> ny_core::Result<bool> {
+    let reference = GraphNetwork::from_sequential(reference)?;
+    let target = GraphNetwork::from_sequential(target)?;
+    let difference = build_difference_network(&reference, &target)?;
+    let input_bounds = input
+        .lower()
+        .iter()
+        .zip(input.upper())
+        .map(|(&lower, &upper)| CoreBound::try_new_allow_infinite(lower, upper))
+        .collect::<ny_core::Result<Vec<_>>>()?;
+    let required = CoreBound::try_new(-tolerance, tolerance)?;
+    let output_bounds = vec![required; output_elements];
+    let spec = VerificationSpec::from_parts(
+        input_bounds,
+        output_bounds,
+        None,
+        Some(input.shape().to_vec()),
+    )?;
+    let verifier = Verifier::new(PropagationConfig {
+        method,
+        ..PropagationConfig::default()
+    });
+    let result = verifier.verify_graph_with_engine(&difference, &spec, engine)?;
+
+    Ok(matches!(
+        result,
+        VerificationResult::Verified { provenance, .. }
+            if provenance.mode() == VerificationSoundnessMode::Sound
+    ))
+}
+
 /// Compare two models using bound propagation.
 ///
 /// Runs bound propagation on both models with the same input perturbation
@@ -151,9 +254,8 @@ fn parse_compare_method(method: &str) -> PyResult<PropagationMethod> {
 ///     method: Verification method - 'ibp', 'crown', 'alpha' (default: 'crown')
 ///     input: Optional float32 numpy array for input center (default: zeros).
 ///         The shape must match the selected model input.
-///     input_index: Optional 0-based input index to use when models declare multiple
-///         inputs. Required when models declare more than one input; defaults to 0
-///         for single-input models.
+///     input_index: Retained for compatibility; only 0 is valid because compare
+///         fails closed for multi-input models.
 ///     backend: Compute backend - 'auto', 'cpu', or 'wgpu'/'gpu' (default: 'cpu').
 ///         Only used for CROWN/alpha methods; ignored for IBP. Compare keeps both
 ///         reference and target propagation work in one call, so CPU stays the
@@ -161,10 +263,11 @@ fn parse_compare_method(method: &str) -> PyResult<PropagationMethod> {
 ///         Pass `backend="auto"` to opt into GPU probing.
 ///
 /// Notes:
-///     compare currently propagates bounds for a single input tensor. For models
-///     with multiple inputs, pass input_index to select which input to use. Other
-///     inputs are ignored, so models must not depend on them (e.g., they are
-///     constant-folded or otherwise unused).
+///     compare currently propagates bounds for exactly one model input. Models
+///     declaring multiple inputs are rejected until joint multi-input bounds are
+///     supported. The endpoint-difference fields remain diagnostics;
+///     `is_equivalent` is true only when a sound shared-input difference-network
+///     proof establishes pointwise equivalence within tolerance.
 ///
 /// Returns:
 ///     CompareResult with comparison results
@@ -176,7 +279,6 @@ fn parse_compare_method(method: &str) -> PyResult<PropagationMethod> {
 ///     >>> # import numpy as np
 ///     >>> # my_input = np.zeros((1, 3, 224, 224), dtype=np.float32)
 ///     >>> # result = ny.compare("model_a.onnx", "model_b.onnx", input=my_input)
-///     >>> # result = ny.compare("model_a.onnx", "model_b.onnx", input_index=0, input=my_input)
 #[pyfunction]
 #[pyo3(signature = (reference, target, tolerance=0.001, epsilon=0.01, method="crown", input=None, input_index=None, backend="cpu"))]
 #[allow(clippy::too_many_arguments)] // Python API requires all parameters
@@ -222,19 +324,7 @@ pub fn compare(
         let ref_inputs = &ref_model.network.inputs;
         let target_inputs = &target_model.network.inputs;
 
-        if ref_inputs.is_empty() || target_inputs.is_empty() {
-            return Err(ny_core::NyError::InvalidSpec(
-                "Models must declare at least one input".to_string(),
-            ));
-        }
-
-        if ref_inputs.len() != target_inputs.len() {
-            return Err(ny_core::NyError::InvalidSpec(format!(
-                "Input count mismatch: reference has {}, target has {}",
-                ref_inputs.len(),
-                target_inputs.len()
-            )));
-        }
+        validate_single_input_models(ref_inputs.len(), target_inputs.len(), "compare")?;
 
         let selected_index = match input_index {
             Some(idx) => {
@@ -247,15 +337,7 @@ pub fn compare(
                 }
                 idx
             }
-            None => {
-                if ref_inputs.len() > 1 {
-                    return Err(ny_core::NyError::InvalidSpec(format!(
-                        "compare currently supports a single input tensor; model has {} inputs. Pass input_index to select one input to use, or use diff() for full multi-input handling.",
-                        ref_inputs.len()
-                    )));
-                }
-                0
-            }
+            None => 0,
         };
 
         let ref_input = &ref_inputs[selected_index];
@@ -351,6 +433,8 @@ pub fn compare(
             }
         };
 
+        validate_comparable_outputs(&ref_output, &target_output)?;
+
         // Compare outputs
         let ref_lower = ref_output.lower();
         let ref_upper = ref_output.upper();
@@ -407,7 +491,15 @@ pub fn compare(
         }
         let overlap_pct = 100.0 * overlap_count as f32 / total as f32;
 
-        let is_equivalent = max_lower_diff <= tolerance && max_upper_diff <= tolerance;
+        let is_equivalent = prove_functional_equivalence(
+            &ref_network,
+            &target_network,
+            &input,
+            ref_output.lower().len(),
+            tolerance,
+            prop_method,
+            engine,
+        )?;
 
         Ok(CompareResult {
             is_equivalent,
@@ -436,13 +528,20 @@ pub fn compare(
 ///     epsilon: Input perturbation radius (default: 0.01)
 ///     method: Verification method - 'ibp', 'crown', 'alpha' (default: 'crown')
 ///     input: Optional float32 numpy array for input center (default: zeros)
-///     input_index: Optional 0-based input index (default: 0)
+///     input_index: Retained for compatibility; only 0 is valid because
+///         multi-input models are rejected.
 ///     ref_name: Friendly name for reference model (default: "reference")
 ///     target_name: Friendly name for target model (default: "target")
 ///     backend: Compute backend - 'auto', 'cpu', or 'wgpu'/'gpu' (default: 'cpu').
 ///         Only used for CROWN/alpha methods; ignored for IBP. Compare keeps both
 ///         model propagations in one call, so CPU remains the conservative default;
 ///         pass `backend="auto"` to opt into GPU probing.
+///
+/// Notes:
+///     Models declaring multiple inputs are rejected. The endpoint-difference
+///     fields remain diagnostics; `is_equivalent` is true only when a sound
+///     shared-input difference-network proof establishes pointwise equivalence
+///     within tolerance.
 ///
 /// Returns:
 ///     CompareResult with comparison results
@@ -494,19 +593,7 @@ pub fn compare_bytes(
         let ref_inputs = &ref_model.network.inputs;
         let target_inputs = &target_model.network.inputs;
 
-        if ref_inputs.is_empty() || target_inputs.is_empty() {
-            return Err(ny_core::NyError::InvalidSpec(
-                "Models must declare at least one input".to_string(),
-            ));
-        }
-
-        if ref_inputs.len() != target_inputs.len() {
-            return Err(ny_core::NyError::InvalidSpec(format!(
-                "Input count mismatch: reference has {}, target has {}",
-                ref_inputs.len(),
-                target_inputs.len()
-            )));
-        }
+        validate_single_input_models(ref_inputs.len(), target_inputs.len(), "compare_bytes")?;
 
         let selected_index = match input_index {
             Some(idx) => {
@@ -519,18 +606,29 @@ pub fn compare_bytes(
                 }
                 idx
             }
-            None => {
-                if ref_inputs.len() > 1 {
-                    return Err(ny_core::NyError::InvalidSpec(format!(
-                        "compare_bytes currently supports a single input tensor; model has {} inputs. Pass input_index to select one input.",
-                        ref_inputs.len()
-                    )));
-                }
-                0
-            }
+            None => 0,
         };
 
         let ref_input = &ref_inputs[selected_index];
+        let target_input = &target_inputs[selected_index];
+
+        if ref_input.shape.len() != target_input.shape.len() {
+            return Err(ny_core::NyError::InvalidSpec(format!(
+                "Input shape mismatch at index {}: reference {:?}, target {:?}",
+                selected_index, ref_input.shape, target_input.shape
+            )));
+        }
+        for (dim_idx, (ref_dim, target_dim)) in
+            ref_input.shape.iter().zip(target_input.shape.iter()).enumerate()
+        {
+            if *ref_dim > 0 && *target_dim > 0 && ref_dim != target_dim {
+                return Err(ny_core::NyError::InvalidSpec(format!(
+                    "Input shape mismatch at index {} dim {}: reference {}, target {}",
+                    selected_index, dim_idx, ref_dim, target_dim
+                )));
+            }
+        }
+
         let ref_input_shape: Vec<usize> = ref_input
             .shape
             .iter()
@@ -538,7 +636,32 @@ pub fn compare_bytes(
             .collect();
 
         let input_center = match input_array {
-            Some(arr) => arr,
+            Some(arr) => {
+                let input_shape = arr.shape();
+                if input_shape.len() != ref_input.shape.len() {
+                    return Err(ny_core::NyError::InvalidSpec(format!(
+                        "Input rank mismatch at index {}: expected {:?}, got {:?}",
+                        selected_index, ref_input.shape, input_shape
+                    )));
+                }
+                for (idx, actual) in input_shape.iter().enumerate() {
+                    let ref_dim = ref_input.shape[idx];
+                    let target_dim = target_input.shape[idx];
+                    if ref_dim > 0 && *actual != ref_dim as usize {
+                        return Err(ny_core::NyError::InvalidSpec(format!(
+                            "Input shape mismatch at index {} dim {}: expected {}, got {}",
+                            selected_index, idx, ref_dim, actual
+                        )));
+                    }
+                    if target_dim > 0 && *actual != target_dim as usize {
+                        return Err(ny_core::NyError::InvalidSpec(format!(
+                            "Input shape mismatch at index {} dim {}: target expects {}, got {}",
+                            selected_index, idx, target_dim, actual
+                        )));
+                    }
+                }
+                arr
+            }
             None => ndarray::ArrayD::from_elem(ndarray::IxDyn(&ref_input_shape), 0.0f32),
         };
 
@@ -575,6 +698,8 @@ pub fn compare_bytes(
                 )));
             }
         };
+
+        validate_comparable_outputs(&ref_output, &target_output)?;
 
         let ref_lower = ref_output.lower();
         let ref_upper = ref_output.upper();
@@ -629,7 +754,15 @@ pub fn compare_bytes(
         }
         let overlap_pct = 100.0 * overlap_count as f32 / total as f32;
 
-        let is_equivalent = max_lower_diff <= tolerance && max_upper_diff <= tolerance;
+        let is_equivalent = prove_functional_equivalence(
+            &ref_network,
+            &target_network,
+            &input,
+            ref_output.lower().len(),
+            tolerance,
+            prop_method,
+            engine,
+        )?;
 
         Ok(CompareResult {
             is_equivalent,
@@ -659,12 +792,18 @@ pub fn compare_bytes(
 ///     epsilon: Input perturbation radius (default: 0.01)
 ///     method: Verification method - 'ibp', 'crown', 'alpha' (default: 'crown')
 ///     input: Optional float32 numpy array for input center (default: zeros)
-///     input_index: Optional 0-based input index (default: 0)
+///     input_index: Retained for compatibility; only 0 is valid because
+///         multi-input models are rejected.
 ///     opset: ONNX opset version for export (default: 17)
 ///     backend: Compute backend - 'auto', 'cpu', or 'wgpu'/'gpu' (default: 'cpu').
 ///         Only used for CROWN/alpha methods; ignored for IBP. Compare defaults to
 ///         CPU because the dual-model path is more memory-hungry; pass
 ///         `backend="auto"` to opt into GPU probing.
+///
+/// Notes:
+///     Models declaring multiple inputs are rejected. `is_equivalent` is true
+///     only when a sound shared-input difference-network proof establishes
+///     pointwise equivalence within tolerance.
 ///
 /// Returns:
 ///     CompareResult with comparison results
@@ -707,8 +846,27 @@ pub fn compare_torch(
 
 #[cfg(test)]
 mod tests {
-    use super::{nan_propagating_max, parse_compare_method};
-    use ny_propagate::PropagationMethod;
+    use super::{
+        nan_propagating_max, parse_compare_method, prove_functional_equivalence,
+        validate_comparable_outputs, validate_single_input_models,
+    };
+    use ndarray::{arr1, arr2, ArrayD, IxDyn};
+    use ny_propagate::layers::{Layer, LinearLayer};
+    use ny_propagate::{Network, PropagationMethod};
+    use ny_tensor::BoundedTensor;
+
+    fn zero_bounds(shape: &[usize]) -> BoundedTensor {
+        let values = ArrayD::zeros(IxDyn(shape));
+        BoundedTensor::new(values.clone(), values).expect("valid zero-width bounds")
+    }
+
+    fn scalar_linear(weight: f32) -> Network {
+        let mut network = Network::new();
+        network.add_layer(Layer::Linear(
+            LinearLayer::new(arr2(&[[weight]]), None).expect("valid scalar linear layer"),
+        ));
+        network
+    }
 
     // Regression tests for nan_propagating_max (#2845, #2898).
     // This replaced unstable f32::maximum. If refactored to f32::max,
@@ -761,6 +919,64 @@ mod tests {
         // Once NaN, stays NaN (the whole point of propagation).
         acc = nan_propagating_max(acc, 100.0);
         assert!(acc.is_nan());
+    }
+
+    #[test]
+    fn comparable_outputs_reject_shape_mismatch_and_empty_outputs() {
+        let two = zero_bounds(&[2]);
+        let one = zero_bounds(&[1]);
+        assert!(validate_comparable_outputs(&two, &one).is_err());
+
+        let empty = zero_bounds(&[0]);
+        assert!(validate_comparable_outputs(&empty, &empty).is_err());
+        assert!(validate_comparable_outputs(&two, &two).is_ok());
+    }
+
+    #[test]
+    fn single_tensor_facade_rejects_multi_input_models() {
+        assert!(validate_single_input_models(1, 1, "compare").is_ok());
+        assert!(validate_single_input_models(0, 0, "compare").is_err());
+        assert!(validate_single_input_models(1, 2, "compare").is_err());
+        let error = validate_single_input_models(2, 2, "compare")
+            .expect_err("selecting one input cannot supply the other input");
+        assert!(error.to_string().contains("exactly one model input"));
+    }
+
+    #[test]
+    fn equal_independent_ranges_do_not_prove_functional_equivalence() {
+        // x and -x both have output range [-1, 1] on this box, but differ at
+        // every non-zero point. A range-endpoint comparison would claim a
+        // perfect match; the shared-input difference graph must not.
+        let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())
+            .expect("valid input box");
+        let equivalent = prove_functional_equivalence(
+            &scalar_linear(1.0),
+            &scalar_linear(-1.0),
+            &input,
+            1,
+            0.1,
+            PropagationMethod::Ibp,
+            None,
+        )
+        .expect("difference verification");
+        assert!(!equivalent);
+    }
+
+    #[test]
+    fn sound_difference_proof_can_establish_box_equivalence() {
+        let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())
+            .expect("valid input box");
+        let equivalent = prove_functional_equivalence(
+            &scalar_linear(1.0),
+            &scalar_linear(1.0),
+            &input,
+            1,
+            1e-6,
+            PropagationMethod::Crown,
+            None,
+        )
+        .expect("difference verification");
+        assert!(equivalent);
     }
 
     // Regression tests for #3622: compare backend routing.

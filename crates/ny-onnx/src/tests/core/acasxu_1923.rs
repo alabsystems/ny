@@ -19,17 +19,20 @@ fn acasxu_1923_paths() -> (PathBuf, PathBuf) {
     )
 }
 
-fn acasxu_1923_case() -> Option<(OnnxModel, BoundedTensor, Vec<Vec<f32>>)> {
+fn acasxu_1923_case() -> (OnnxModel, BoundedTensor, Vec<Vec<f32>>) {
     let (model_path, property_path) = acasxu_1923_paths();
-    if !model_path.exists() || !property_path.exists() {
-        eprintln!(
-            "SKIP: optional ACAS-Xu benchmark assets are unavailable (model={}, property={}); \
-             download them with benchmarks/download_benchmarks.sh",
-            model_path.display(),
-            property_path.display()
-        );
-        return None;
-    }
+    assert!(
+        model_path.is_file(),
+        "ACAS-Xu ONNX benchmark fixture is missing at {}; \
+         run benchmarks/download_benchmarks.sh",
+        model_path.display()
+    );
+    assert!(
+        property_path.is_file(),
+        "ACAS-Xu VNN-LIB benchmark fixture is missing at {}; \
+         run benchmarks/download_benchmarks.sh",
+        property_path.display()
+    );
     let model = load_onnx(&model_path).expect("load ACAS-Xu 4_2 ONNX model");
     let vnnlib = load_vnnlib(&property_path).expect("load ACAS-Xu prop_2 VNNLIB");
     let (lower_bounds, upper_bounds) = vnnlib.split_input_bounds_f32();
@@ -52,7 +55,7 @@ fn acasxu_1923_case() -> Option<(OnnxModel, BoundedTensor, Vec<Vec<f32>>)> {
         .iter()
         .map(|constraint| objective_from_constraint(constraint, vnnlib.num_outputs))
         .collect::<Vec<_>>();
-    Some((model, input, objectives))
+    (model, input, objectives)
 }
 
 fn objective_from_constraint(constraint: &OutputConstraint, num_outputs: usize) -> Vec<f32> {
@@ -146,10 +149,9 @@ fn assert_scalar_parity(
 
 #[ntest::timeout(120000)]
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn test_acasxu_4_2_prop_2_root_spec_guided_parity_1923() {
-    let Some((model, input, objectives)) = acasxu_1923_case() else {
-        return;
-    };
+    let (model, input, objectives) = acasxu_1923_case();
     let network = model
         .to_propagate_network()
         .expect("convert ACAS-Xu 4_2 to sequential network");
@@ -157,6 +159,11 @@ fn test_acasxu_4_2_prop_2_root_spec_guided_parity_1923() {
         .to_graph_network()
         .expect("convert ACAS-Xu 4_2 to graph network");
 
+    assert!(
+        !objectives.is_empty(),
+        "ACAS-Xu property must provide at least one output objective"
+    );
+    let mut compared = 0usize;
     for (objective_idx, coeffs) in objectives.iter().enumerate() {
         let augmented = scalar_objective_network(&network, coeffs);
         let seq_bounds = augmented
@@ -171,15 +178,16 @@ fn test_acasxu_4_2_prop_2_root_spec_guided_parity_1923() {
             &format!("root objective[{objective_idx}]"),
             1e-3,
         );
+        compared += 1;
     }
+    assert_eq!(compared, objectives.len(), "every root objective must run");
 }
 
 #[ntest::timeout(300000)]
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn test_acasxu_4_2_prop_2_child_spec_guided_parity_1923() {
-    let Some((model, input, objectives)) = acasxu_1923_case() else {
-        return;
-    };
+    let (model, input, objectives) = acasxu_1923_case();
     let network = model
         .to_propagate_network()
         .expect("convert ACAS-Xu 4_2 to sequential network");
@@ -187,6 +195,11 @@ fn test_acasxu_4_2_prop_2_child_spec_guided_parity_1923() {
         .to_graph_network()
         .expect("convert ACAS-Xu 4_2 to graph network");
 
+    assert!(
+        !objectives.is_empty(),
+        "ACAS-Xu property must provide at least one output objective"
+    );
+    let mut children_checked = 0usize;
     for flat_dim in 0..input.len() {
         let lower = input
             .lower()
@@ -218,7 +231,12 @@ fn test_acasxu_4_2_prop_2_child_spec_guided_parity_1923() {
                     &format!("child dim={flat_dim} {label} objective[{objective_idx}]"),
                     1e-3,
                 );
+                children_checked += 1;
             }
         }
     }
+    assert!(
+        children_checked > 0,
+        "at least one splittable input child/objective parity comparison must run"
+    );
 }

@@ -108,6 +108,26 @@ fn test_disjunctive_domain_verified_ignores_nonfinite_rows_3740() {
 }
 
 #[test]
+fn test_disjunctive_domain_verified_rejects_malformed_interval_authority() {
+    let threshold = [0.0_f32];
+    let one_clause = [1usize];
+    assert!(
+        disjunctive_domain_verified(&[(1.0_f32, f32::INFINITY)], &threshold, &one_clause),
+        "+inf is a valid upper side of a one-sided certified-lower enclosure"
+    );
+    for bounds in [[(1.0_f32, f32::NAN)], [(1.0_f32, 0.5_f32)]] {
+        assert!(
+            !disjunctive_domain_verified(&bounds, &threshold, &one_clause),
+            "a NaN or inverted interval must not close a clause"
+        );
+    }
+    assert!(
+        !disjunctive_domain_verified(&[(1.0, 2.0)], &[f32::NEG_INFINITY], &one_clause),
+        "a non-finite threshold must not acquire proof authority"
+    );
+}
+
+#[test]
 fn test_grouped_helpers_fail_closed_on_malformed_layouts() {
     let positive = vec![(1.0_f32, 1.0)];
     let threshold = vec![0.0_f32];

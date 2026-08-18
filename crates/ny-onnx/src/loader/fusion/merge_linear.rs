@@ -9,6 +9,8 @@ use ndarray::{Array1, Array2, ArrayD, Ix1, Ix2, IxDyn};
 use ny_core::LayerType;
 use std::collections::{HashMap, HashSet};
 
+use super::helpers::fused_subgraph_is_closed;
+
 struct AffineStep {
     input_name: String,
     output_name: String,
@@ -24,6 +26,7 @@ pub(in crate::loader) fn try_fuse_merge_linear(
     start_idx: usize,
     consumers_by_input: &HashMap<&str, Vec<usize>>,
     weights: &mut WeightStore,
+    graph_output_names: &HashSet<String>,
 ) -> Option<(LayerSpec, HashSet<usize>)> {
     let first = extract_affine_step(nodes, start_idx, consumers_by_input, weights)?;
     let input_name = first.input_name.clone();
@@ -58,6 +61,32 @@ pub(in crate::loader) fn try_fuse_merge_linear(
 
     let base = node_name_or_output(nodes.get(start_idx)?);
     let fused_weight_name = format!("{base}__merge_linear_weight");
+    if generated_tensor_name_is_taken(&fused_weight_name, nodes, weights, graph_output_names) {
+        return None;
+    }
+    let fused_bias_name = has_bias.then(|| format!("{base}__merge_linear_bias"));
+    if fused_bias_name.as_ref().is_some_and(|name| {
+        generated_tensor_name_is_taken(name, nodes, weights, graph_output_names)
+    }) {
+        return None;
+    }
+    if removable_tensors
+        .iter()
+        .any(|name| graph_output_names.contains(name))
+    {
+        return None;
+    }
+    let replacement_outputs = vec![output_name.clone()];
+    if !fused_subgraph_is_closed(
+        nodes,
+        &consumed,
+        &replacement_outputs,
+        consumers_by_input,
+        graph_output_names,
+    ) {
+        return None;
+    }
+
     let fused_weight_shape = fused_weight.shape().to_vec();
     weights.insert(fused_weight_name.clone(), fused_weight.into_dyn());
 
@@ -69,7 +98,7 @@ pub(in crate::loader) fn try_fuse_merge_linear(
     });
 
     if has_bias {
-        let fused_bias_name = format!("{base}__merge_linear_bias");
+        let fused_bias_name = fused_bias_name?;
         spec_inputs.push(fused_bias_name.clone());
         weights.insert(fused_bias_name, fused_bias.into_dyn());
     }
@@ -91,6 +120,20 @@ pub(in crate::loader) fn try_fuse_merge_linear(
     };
 
     Some((spec, consumed.into_iter().collect()))
+}
+
+fn generated_tensor_name_is_taken(
+    candidate: &str,
+    nodes: &[onnx_proto::NodeProto],
+    weights: &WeightStore,
+    graph_output_names: &HashSet<String>,
+) -> bool {
+    weights.contains_key(candidate)
+        || graph_output_names.contains(candidate)
+        || nodes.iter().any(|node| {
+            node.input.iter().any(|name| name == candidate)
+                || node.output.iter().any(|name| name == candidate)
+        })
 }
 
 fn extract_affine_step(
@@ -222,14 +265,14 @@ fn matmul_transpose_b(node: &onnx_proto::NodeProto) -> bool {
     node.attribute
         .iter()
         .find(|attr| attr.name == "transpose_b")
-        .is_some_and(|attr| attr.i != 0)
+        .is_some_and(|attr| attr.i_value() != 0)
 }
 
 fn matmul_scale(node: &onnx_proto::NodeProto) -> Option<f32> {
     node.attribute
         .iter()
         .find(|attr| attr.name == "scale")
-        .map(|attr| attr.f)
+        .map(|attr| attr.f_value())
 }
 
 fn single_consumer(

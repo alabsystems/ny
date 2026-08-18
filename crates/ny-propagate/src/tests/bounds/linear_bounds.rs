@@ -5,6 +5,140 @@
 use super::*;
 use proptest::prelude::*;
 
+#[test]
+fn concretize_sound_survives_three_term_binary64_cancellation() {
+    let large = 2.0_f32.powi(30);
+    let coefficients = arr2(&[[large, 1.0, -large]]);
+    let bounds = LinearBounds::new(
+        coefficients.clone(),
+        arr1(&[0.0]),
+        coefficients,
+        arr1(&[0.0]),
+    )
+    .unwrap();
+    let point = arr1(&[large, 1.0, large]).into_dyn();
+    let input = BoundedTensor::new(point.clone(), point).unwrap();
+
+    // Exact value: 2^60 + 1 - 2^60 = 1. Nearest binary64 accumulation
+    // loses the middle one, which one final binary32 ULP at zero cannot cover.
+    let result = bounds.concretize_sound(&input);
+    let lower = result.lower()[[0]];
+    let upper = result.upper()[[0]];
+    assert!(lower <= 1.0 && upper >= 1.0, "[{lower:e}, {upper:e}]");
+    assert!(lower > 0.99 && upper < 1.01, "[{lower:e}, {upper:e}]");
+}
+
+#[test]
+fn concretize_l2_zero_radius_survives_three_term_binary64_cancellation() {
+    let large = 2.0_f32.powi(30);
+    let coefficients = arr2(&[[large, 1.0, -large]]);
+    let bounds = LinearBounds::new(
+        coefficients.clone(),
+        arr1(&[0.0]),
+        coefficients,
+        arr1(&[0.0]),
+    )
+    .unwrap();
+    let result = bounds
+        .concretize_l2_ball(&arr1(&[large, 1.0, large]), 0.0)
+        .unwrap();
+    let lower = result.lower()[[0]];
+    let upper = result.upper()[[0]];
+    assert!(lower <= 1.0 && upper >= 1.0, "[{lower:e}, {upper:e}]");
+    assert!(lower > 0.99 && upper < 1.01, "[{lower:e}, {upper:e}]");
+}
+
+#[test]
+fn concretize_l2_ball_discharges_coefficient_error_over_the_whole_ball() {
+    let coefficients = arr2(&[[0.0_f32]]);
+    let mut bounds = LinearBounds::new(
+        coefficients.clone(),
+        arr1(&[0.0]),
+        coefficients,
+        arr1(&[0.0]),
+    )
+    .unwrap();
+    bounds.set_coeff_err(arr2(&[[1.0]]), arr2(&[[1.0]]));
+
+    // For x in the radius-3 ball around 2, |x| may reach 5.  A true
+    // coefficient anywhere in [-1,1] therefore requires at least [-5,5].
+    let result = bounds.concretize_l2_ball(&arr1(&[2.0]), 3.0).unwrap();
+    assert!(result.lower()[[0]] <= -5.0, "lower={}", result.lower()[[0]]);
+    assert!(result.upper()[[0]] >= 5.0, "upper={}", result.upper()[[0]]);
+}
+
+#[test]
+fn coeff_error_penalty_discharge_stays_outward_after_bias_cancellation() {
+    let large = 2.0_f32.powi(50);
+    let bias = 2.0_f32.powi(100);
+    let coefficients = arr2(&[[0.0, 0.0]]);
+    let mut bounds = LinearBounds::new(
+        coefficients.clone(),
+        arr1(&[bias]),
+        coefficients,
+        arr1(&[-bias]),
+    )
+    .unwrap();
+    let error = arr2(&[[large, 1.0]]);
+    bounds.set_coeff_err(error.clone(), error);
+    bounds.fold_coeff_err_into_bias(&[large, 1.0], &[large, 1.0]);
+
+    // Exact penalty is 2^100 + 1. A nearest-f64 sum loses the one; subtracting
+    // from the nearly equal bias cancels to zero, where final f32 widening is
+    // far too small. Lower and upper folds must enclose the exact ±1 residue.
+    assert!(bounds.lower_b()[0] <= -1.0, "lower={}", bounds.lower_b()[0]);
+    assert!(bounds.upper_b()[0] >= 1.0, "upper={}", bounds.upper_b()[0]);
+}
+
+#[test]
+fn malformed_coefficient_error_fails_closed() {
+    let coefficients = arr2(&[[0.0, 0.0]]);
+    let mut bounds = LinearBounds::new(
+        coefficients.clone(),
+        arr1(&[0.0]),
+        coefficients,
+        arr1(&[0.0]),
+    )
+    .unwrap();
+    bounds.set_coeff_err(arr2(&[[-1.0, 0.0]]), arr2(&[[f32::NAN, 0.0]]));
+    let point = arr1(&[1.0, 1.0]).into_dyn();
+    let result = bounds.concretize_sound(&BoundedTensor::new(point.clone(), point).unwrap());
+    assert_eq!(result.lower()[[0]], f32::NEG_INFINITY);
+    assert_eq!(result.upper()[[0]], f32::INFINITY);
+
+    let mut shape_mismatch = LinearBounds::identity(2);
+    shape_mismatch.set_coeff_err(arr2(&[[0.0]]), arr2(&[[0.0]]));
+    assert_eq!(shape_mismatch.lower_b()[0], f32::NEG_INFINITY);
+    assert_eq!(shape_mismatch.upper_b()[0], f32::INFINITY);
+
+    // Defense in depth for crate-internal construction sites: a malformed
+    // carrier must degrade before a fold can index or under-count it.
+    let mut directly_malformed = LinearBounds::identity(2);
+    directly_malformed.lower_a_err = Some(arr2(&[[-1.0, 0.0], [0.0, 0.0]]));
+    directly_malformed.upper_a_err = Some(arr2(&[[0.0, 0.0], [0.0, 0.0]]));
+    directly_malformed.fold_coeff_err_into_bias(&[1.0, 1.0], &[1.0, 1.0]);
+    assert!(directly_malformed
+        .lower_b()
+        .iter()
+        .all(|&value| value == f32::NEG_INFINITY));
+    assert!(directly_malformed
+        .upper_b()
+        .iter()
+        .all(|&value| value == f32::INFINITY));
+
+    let constructor_mismatch = LinearBounds::new_or_conservative_with_err(
+        arr2(&[[1.0, 0.0]]),
+        arr1(&[0.0]),
+        arr2(&[[1.0, 0.0]]),
+        arr1(&[0.0]),
+        arr2(&[[0.0]]),
+        arr2(&[[0.0]]),
+    )
+    .unwrap();
+    assert_eq!(constructor_mismatch.lower_b()[0], f32::NEG_INFINITY);
+    assert_eq!(constructor_mismatch.upper_b()[0], f32::INFINITY);
+}
+
 #[ntest::timeout(10000)]
 #[test]
 fn test_linear_bounds_concretize_handles_inf_by_avoiding_zero_times_inf() {

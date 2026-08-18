@@ -9,27 +9,30 @@ use ny_propagate::{BetaCrownConfig, ConvMode};
 use super::{apply_preset, load_preset};
 
 #[test]
-fn relusplitter_preset_sets_reference_conv_mode_auto_3813() {
+fn relusplitter_preset_keeps_matrix_mode_without_cut_authority_3813() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let preset = load_preset(&repo_root.join("configs/vnncomp25/relusplitter.yaml"))
         .expect("relusplitter preset should load");
 
     assert_eq!(
         preset.general.conv_mode,
-        Some(ConvMode::Auto),
-        "#3813: relusplitter preset should declare general.conv_mode: auto"
+        Some(ConvMode::Matrix),
+        "#3813: relusplitter must retain matrix Conv2d throughput while cuts are quarantined"
     );
 
-    let mut config = BetaCrownConfig {
-        enable_cuts: true,
-        ..Default::default()
-    };
+    let mut config = BetaCrownConfig::default();
     apply_preset(&mut config, &preset).expect("preset application should succeed");
+    config
+        .validate()
+        .expect("the scored relusplitter preset must remain valid");
 
-    assert_eq!(config.conv_mode, ConvMode::Auto);
+    assert_eq!(config.conv_mode, ConvMode::Matrix);
+    assert!(!config.enable_cuts);
+    assert!(!config.enable_near_miss_cuts);
+    assert!(!config.enable_proactive_cuts);
     assert!(
         !config.use_patches(),
-        "#3813: relusplitter preset auto conv_mode should resolve to matrix mode when cuts are enabled"
+        "#3813: explicit matrix mode must preserve the measured Conv2d lane without cut authority"
     );
 }
 

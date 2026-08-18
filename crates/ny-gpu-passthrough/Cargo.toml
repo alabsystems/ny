@@ -1,0 +1,16 @@
+[package]
+name = "ny-gpu-passthrough"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+# The ONE crate in the workspace allowed to touch wgpu's unsafe passthrough
+# API. ny-gpu carries `#![forbid(unsafe_code)]` — a soundness stance this crate
+# deliberately does not weaken: the single unsafe call here is wrapped in a
+# validation error scope and every failure path falls back, so callers get a
+# safe, fail-closed interface.
+
+[dependencies]
+wgpu = { workspace = true }
+naga = { version = "29", features = ["wgsl-in", "spv-out"] }
+pollster = { workspace = true }

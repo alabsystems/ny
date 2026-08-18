@@ -18,8 +18,12 @@ fn test_graph_crown_batched_with_provenance_and_engine_threads_backward_3959() {
             .propagate_crown_batched_with_provenance(&input)
             .expect("#3959 baseline graph batched CROWN should succeed");
 
+        // Engine-agnostic cache serving may reuse the baseline's valid map.
+        // Clone resets that cache so this call still tests engine plumbing.
+        #[allow(clippy::redundant_clone)]
+        let collection_graph = graph.clone();
         let collection_engine = CountingGemmEngine::new();
-        graph
+        collection_graph
             .collect_crown_ibp_bounds_dag_with_engine(&input, Some(&collection_engine))
             .expect("#3959 graph CROWN-IBP collection should succeed");
         let collection_calls = collection_engine.gemm_calls();

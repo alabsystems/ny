@@ -11,6 +11,15 @@ use ny_core::{NyError, Result};
 use super::{GraphNetwork, GraphNode, NETWORK_INPUT};
 
 impl GraphNetwork {
+    /// Borrow a previously initialized execution order without initializing it.
+    ///
+    /// The retained-BaB v1 static composer is a pre-open, default-dark consumer:
+    /// a cold cache is an ordinary refusal and must never trigger an allocation-
+    /// bearing topological sort after provider selection or phase opening.
+    pub(crate) fn retained_v1_exec_order_if_cached(&self) -> Option<&[String]> {
+        self.cached_exec_order.get().map(Vec::as_slice)
+    }
+
     /// Borrow the graph execution order, caching the computed topological sort
     /// until the graph structure mutates.
     pub fn exec_order(&self) -> Result<&[String]> {
@@ -154,7 +163,7 @@ impl GraphNetwork {
 
         fn visit(
             name: &str,
-            nodes: &HashMap<String, GraphNode>,
+            nodes: &super::TrackedStringMap<GraphNode>,
             visited: &mut HashSet<String>,
             temp_mark: &mut HashSet<String>,
             result: &mut Vec<String>,

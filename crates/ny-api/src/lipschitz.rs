@@ -153,7 +153,7 @@ pub fn certify_upper_bound(network: &SequentialNetwork) -> Result<SoundLipschitz
     let mut squared_global = Rat::ONE;
     for (index, layer) in network.layers().iter().enumerate() {
         let (squared_bound, norm_kind) = match layer {
-            Layer::Linear(linear) => linear_squared_bound(&linear.weight, index)?,
+            Layer::Linear(linear) => linear_squared_bound(linear.weight(), index)?,
             Layer::Conv1d(conv) => conv_squared_bound(&conv.kernel, conv.groups, index)?,
             Layer::Conv2d(conv) => conv_squared_bound(&conv.kernel, conv.groups, index)?,
             Layer::ReLU(_) | Layer::Reshape(_) | Layer::Flatten(_) | Layer::Transpose(_) => {

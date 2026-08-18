@@ -2,7 +2,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
 use ny_propagate::layers::ScatterNdLayer;
 use ny_propagate::Layer;
@@ -30,12 +29,7 @@ impl ConvertContext<'_> {
 
         let data_constant = self.constant_value(&spec.inputs[0]);
         let indices = self
-            .constant_value(&spec.inputs[1])
-            .map(parse_indices_i64)
-            .transpose()
-            .map_err(|err| {
-                NyError::ModelLoad(format!("ScatterND {} indices error: {}", spec.name, err))
-            })?;
+            .discrete_constant_i64(&spec.inputs[1], &format!("ScatterND {} indices", spec.name))?;
         let updates_constant = self.constant_value(&spec.inputs[2]);
 
         Ok(Layer::ScatterNd(ScatterNdLayer::new(
@@ -46,34 +40,13 @@ impl ConvertContext<'_> {
     }
 }
 
-fn parse_indices_i64(arr: ArrayD<f32>) -> Result<ArrayD<i64>> {
-    let shape = arr.shape().to_vec();
-    let mut values = Vec::with_capacity(arr.len());
-    for &v in &arr {
-        if !v.is_finite() {
-            return Err(NyError::InvalidSpec(
-                "ScatterND indices contain NaN/Inf".to_string(),
-            ));
-        }
-        let rounded = v.round();
-        if (v - rounded).abs() > 1e-6 {
-            return Err(NyError::InvalidSpec(format!(
-                "ScatterND indices must be integers; got {}",
-                v
-            )));
-        }
-        values.push(rounded as i64);
-    }
-
-    ArrayD::from_shape_vec(IxDyn(&shape), values)
-        .map_err(|e| NyError::InvalidSpec(format!("ScatterND indices reshape failed: {}", e)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::WeightStore;
+    use ndarray::{ArrayD, IxDyn};
     use ny_core::LayerType;
+    use ny_tensor::BoundedTensor;
     use std::collections::{HashMap, HashSet};
 
     fn scatter_spec() -> LayerSpec {
@@ -113,5 +86,49 @@ mod tests {
 
         assert_eq!(scatter.activation_input_count(), 1);
         assert!(scatter.has_static_indices());
+    }
+
+    #[test]
+    fn scatter_nd_rejects_adjacent_non_integer_indices() {
+        for value in [
+            f32::from_bits(1.0_f32.to_bits() - 1),
+            f32::from_bits(1.0_f32.to_bits() + 1),
+        ] {
+            let mut weights = WeightStore::new();
+            weights.insert(
+                "indices".to_string(),
+                ArrayD::from_shape_vec(IxDyn(&[1]), vec![value]).unwrap(),
+            );
+            let tensor_shapes = HashMap::new();
+            let constant_tensors = HashSet::new();
+            let ctx = ConvertContext::new(&weights, &tensor_shapes, &constant_tensors);
+            assert!(ctx.convert_scatter_nd(&scatter_spec()).is_err());
+        }
+    }
+
+    #[test]
+    fn scatter_nd_prefers_exact_integer_indices() {
+        let mut weights = WeightStore::new();
+        weights.insert(
+            "indices".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![0.0]).unwrap(),
+        );
+        weights.insert_integers(
+            "indices".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1_i64]).unwrap(),
+        );
+        let tensor_shapes = HashMap::new();
+        let constant_tensors = HashSet::new();
+        let ctx = ConvertContext::new(&weights, &tensor_shapes, &constant_tensors);
+        let layer = ctx.convert_scatter_nd(&scatter_spec()).unwrap();
+        let Layer::ScatterNd(scatter) = layer else {
+            panic!("expected ScatterNd layer");
+        };
+        let data_point = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 2.0]).unwrap();
+        let data = BoundedTensor::new(data_point.clone(), data_point).unwrap();
+        let updates_point = ArrayD::from_shape_vec(IxDyn(&[1]), vec![9.0]).unwrap();
+        let updates = BoundedTensor::new(updates_point.clone(), updates_point).unwrap();
+        let output = scatter.propagate_ibp_binary(&data, &updates).unwrap();
+        assert_eq!(output.lower().as_slice().unwrap(), &[1.0, 9.0]);
     }
 }

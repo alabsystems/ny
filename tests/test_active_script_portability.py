@@ -18,7 +18,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "extended_bank" / "validate_sat_rows.py"
 RESNET_SCRIPT = REPO_ROOT / "scripts" / "resnet_gpu_sweep.sh"
 MEASURE_SCRIPT = REPO_ROOT / "scripts" / "vnncomp_sat_measure.sh"
-ACTIVE_SCRIPTS = (VALIDATE_SCRIPT, RESNET_SCRIPT, MEASURE_SCRIPT)
+STRICT_REGEN_SCRIPT = REPO_ROOT / "scripts" / "strict_ce" / "regen_witnesses.py"
+STRICT_VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "strict_ce" / "strict_validate.py"
+ACTIVE_SCRIPTS = (
+    VALIDATE_SCRIPT,
+    RESNET_SCRIPT,
+    MEASURE_SCRIPT,
+    STRICT_REGEN_SCRIPT,
+    STRICT_VALIDATE_SCRIPT,
+)
 
 
 def _write_executable(path: Path, contents: str) -> Path:
@@ -54,6 +62,20 @@ def _base_environment(tmp_path: Path, ny_bin: Path) -> dict[str, str]:
     )
     (tmp_path / "tmp").mkdir(exist_ok=True)
     return environment
+
+
+def _add_runtime_dependency_stubs(
+    tmp_path: Path, environment: dict[str, str]
+) -> None:
+    """Provide import-only stubs for paths that never execute model replay."""
+    stub_dir = tmp_path / "runtime-dependency-stubs"
+    stub_dir.mkdir(exist_ok=True)
+    for package in ("numpy", "onnx", "onnxruntime"):
+        (stub_dir / f"{package}.py").write_text("", encoding="utf-8")
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        f"{stub_dir}{os.pathsep}{existing}" if existing else str(stub_dir)
+    )
 
 
 def _write_vnncomp_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -241,6 +263,7 @@ def test_validate_sat_rows_process_error_is_inconclusive(tmp_path: Path) -> None
             "NY_SAT_AUDIT_OUT": str(output),
         }
     )
+    _add_runtime_dependency_stubs(tmp_path, environment)
     result = subprocess.run(
         [sys.executable, str(VALIDATE_SCRIPT), category_dir.name, "0", "1"],
         env=environment,

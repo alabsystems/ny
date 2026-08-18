@@ -11,8 +11,31 @@ and markers.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
+
+
+def _finite_nonnegative_float(name: str, value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a number, got {value!r}") from error
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{name} must be finite and nonnegative, got {value!r}")
+    return parsed
+
+
+def _positive_int(name: str, value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from error
+    if parsed <= 0 or str(value).strip() != str(parsed):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return parsed
 
 
 @dataclass
@@ -68,48 +91,70 @@ class NyConfig:
 
             # Read from pytest.ini
             if hasattr(ini_config, "getini"):
-                if ini_config.getini("ny_epsilon"):
-                    try:
-                        config.epsilon = float(ini_config.getini("ny_epsilon"))
-                    except (TypeError, ValueError):
-                        pass
+                epsilon = ini_config.getini("ny_epsilon")
+                if epsilon not in (None, ""):
+                    config.epsilon = _finite_nonnegative_float(
+                        "ny_epsilon", epsilon
+                    )
 
-                if ini_config.getini("ny_method"):
-                    method = ini_config.getini("ny_method")
-                    if method in ("ibp", "crown", "alpha", "beta"):
-                        config.method = method
+                method = ini_config.getini("ny_method")
+                if method not in (None, ""):
+                    if method not in ("ibp", "crown", "alpha", "beta"):
+                        raise ValueError(
+                            "ny_method must be one of ibp, crown, alpha, or beta, "
+                            f"got {method!r}"
+                        )
+                    config.method = method
 
-                if ini_config.getini("ny_timeout"):
-                    try:
-                        config.timeout = int(ini_config.getini("ny_timeout"))
-                    except (TypeError, ValueError):
-                        pass
+                timeout = ini_config.getini("ny_timeout")
+                if timeout not in (None, ""):
+                    config.timeout = _positive_int("ny_timeout", timeout)
 
-                if ini_config.getini("ny_tolerance"):
-                    try:
-                        config.tolerance = float(ini_config.getini("ny_tolerance"))
-                    except (TypeError, ValueError):
-                        pass
+                tolerance = ini_config.getini("ny_tolerance")
+                if tolerance not in (None, ""):
+                    config.tolerance = _finite_nonnegative_float(
+                        "ny_tolerance", tolerance
+                    )
 
             # Read from command-line options
             if hasattr(ini_config, "getoption"):
-                if ini_config.getoption("--ny-epsilon", default=None):
-                    config.epsilon = ini_config.getoption("--ny-epsilon")
-                if ini_config.getoption("--ny-method", default=None):
-                    config.method = ini_config.getoption("--ny-method")
-                if ini_config.getoption("--ny-timeout", default=None):
-                    config.timeout = ini_config.getoption("--ny-timeout")
+                epsilon = ini_config.getoption("--ny-epsilon", default=None)
+                if epsilon is not None:
+                    config.epsilon = _finite_nonnegative_float(
+                        "--ny-epsilon", epsilon
+                    )
+                method = ini_config.getoption("--ny-method", default=None)
+                if method is not None:
+                    if method not in ("ibp", "crown", "alpha", "beta"):
+                        raise ValueError(
+                            "--ny-method must be one of ibp, crown, alpha, or beta, "
+                            f"got {method!r}"
+                        )
+                    config.method = method
+                timeout = ini_config.getoption("--ny-timeout", default=None)
+                if timeout is not None:
+                    config.timeout = _positive_int("--ny-timeout", timeout)
 
         # Override with marker settings
         if hasattr(request, "node"):
             marker = request.node.get_closest_marker("ny_verify")
             if marker:
                 if "epsilon" in marker.kwargs:
-                    config.epsilon = marker.kwargs["epsilon"]
+                    config.epsilon = _finite_nonnegative_float(
+                        "ny_verify epsilon", marker.kwargs["epsilon"]
+                    )
                 if "method" in marker.kwargs:
-                    config.method = marker.kwargs["method"]
+                    method = marker.kwargs["method"]
+                    if method not in ("ibp", "crown", "alpha", "beta"):
+                        raise ValueError(
+                            "ny_verify method must be one of ibp, crown, alpha, "
+                            f"or beta, got {method!r}"
+                        )
+                    config.method = method
                 if "timeout" in marker.kwargs:
-                    config.timeout = marker.kwargs["timeout"]
+                    config.timeout = _positive_int(
+                        "ny_verify timeout", marker.kwargs["timeout"]
+                    )
 
         return config
 

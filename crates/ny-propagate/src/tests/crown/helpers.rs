@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
 };
+use std::time::Instant;
 
 // Canonical CountingGemmEngine lives in ny-test-utils; re-export for
 // existing callers that import from this module.
@@ -54,6 +55,7 @@ pub struct MockGpuCrownEngine {
     gpu_calls: AtomicUsize,
     observed_num_specs: Mutex<Option<usize>>,
     observed_layer_kinds: Mutex<Option<Vec<&'static str>>>,
+    crown_backward_deadline: Mutex<Option<Instant>>,
 }
 
 impl MockGpuCrownEngine {
@@ -66,6 +68,7 @@ impl MockGpuCrownEngine {
             gpu_calls: AtomicUsize::new(0),
             observed_num_specs: Mutex::new(None),
             observed_layer_kinds: Mutex::new(None),
+            crown_backward_deadline: Mutex::new(None),
         }
     }
 
@@ -83,6 +86,7 @@ impl MockGpuCrownEngine {
             gpu_calls: AtomicUsize::new(0),
             observed_num_specs: Mutex::new(None),
             observed_layer_kinds: Mutex::new(None),
+            crown_backward_deadline: Mutex::new(None),
         }
     }
 
@@ -131,6 +135,16 @@ impl GpuCrownBackward for MockGpuCrownEngine {
         input_lower: &[f32],
         input_upper: &[f32],
     ) -> ny_core::Result<GpuCrownResult> {
+        if self
+            .crown_backward_deadline
+            .lock()
+            .expect("crown_backward_deadline mutex should not be poisoned")
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(ny_core::NyError::DeadlineExceeded(
+                "mock GPU CROWN deadline exceeded before launch".to_string(),
+            ));
+        }
         self.gpu_calls.fetch_add(1, Ordering::SeqCst);
         *self
             .observed_num_specs
@@ -168,6 +182,17 @@ impl GpuCrownBackward for MockGpuCrownEngine {
                 upper_bounds: vec![1e6; num_specs],
             })
         }
+    }
+
+    fn set_crown_backward_deadline(&self, deadline: Option<Instant>) {
+        *self
+            .crown_backward_deadline
+            .lock()
+            .expect("crown_backward_deadline mutex should not be poisoned") = deadline;
+    }
+
+    fn honors_crown_backward_deadline(&self) -> bool {
+        true
     }
 }
 

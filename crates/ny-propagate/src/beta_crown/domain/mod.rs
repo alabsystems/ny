@@ -16,7 +16,30 @@
 mod context;
 mod graph;
 mod multi_objective;
+mod node_bounds;
 mod sequential;
+
+/// Validate the scalar objective enclosure stored on a BaB domain.
+///
+/// Domain constructors and queue-admission helpers are verdict-adjacent: an
+/// inverted pair cannot be treated as a usable priority or later proof bound.
+pub(crate) fn validate_domain_interval(
+    context: &str,
+    lower: f32,
+    upper: f32,
+) -> ny_core::Result<()> {
+    if !lower.is_finite() || !upper.is_finite() {
+        return Err(ny_core::NyError::NumericalInstability(format!(
+            "{context} bounds are non-finite: lower={lower}, upper={upper}"
+        )));
+    }
+    if lower > upper {
+        return Err(ny_core::NyError::NumericalInstability(format!(
+            "{context} bounds are inverted: lower={lower}, upper={upper}"
+        )));
+    }
+    Ok(())
+}
 
 /// NaN-aware priority comparison for BaB domain queue ordering.
 ///
@@ -57,7 +80,12 @@ pub use context::{
     DomainProcessingConfig, GraphCrownContext, GraphPrecomputedBounds, MultiObjectiveTargets,
 };
 pub use graph::GraphBabDomain;
-pub use multi_objective::MultiObjectiveGraphBabDomain;
+pub use multi_objective::{MultiObjectiveGraphBabDomain, ObjectiveAggregation};
+pub use node_bounds::{
+    NodeBoundsHostAllocationInvalidV1, NodeBoundsHostAllocationObservationV1,
+    NodeBoundsHostAllocationReceiptV1, NodeBoundsHostAllocationUnsupportedV1, NodeBoundsMap,
+    NodeBoundsMapIter, NodeBoundsView, NodeBoundsViewIter, NODE_BOUNDS_HOST_ALLOCATION_MODEL_V1,
+};
 pub use sequential::{BabDomain, IntermediateLinearBounds};
 
 /// Domain with unstable neurons for parallel processing.

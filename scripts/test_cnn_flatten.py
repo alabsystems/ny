@@ -13,7 +13,11 @@ This validates that ny can now verify complete CNN architectures.
 
 import json
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def create_cnn_with_flatten():
@@ -22,7 +26,7 @@ def create_cnn_with_flatten():
         import torch
         import torch.nn as nn
     except ImportError:
-        print("PyTorch not installed. Cannot create test model.")
+        print("SKIP: PyTorch not installed; cannot create test model")
         return None
 
     class SimpleCNN(nn.Module):
@@ -131,7 +135,9 @@ def create_vnnlib_property(model_path: str, output_path: str, epsilon: float = 0
     print(f"  - Epsilon: {epsilon}")
 
 
-def run_ny_verify(model_path: str, property_path: str, method: str = "ibp"):
+def run_ny_verify(
+    model_path: str, property_path: str, method: str = "ibp"
+) -> tuple[bool, dict]:
     """Run ny verify on the model."""
     cmd = [
         "cargo",
@@ -146,92 +152,100 @@ def run_ny_verify(model_path: str, property_path: str, method: str = "ibp"):
         property_path,
         "--method",
         method,
+        "--json",
+        "--allow-unknown",
     ]
 
     print(f"\nRunning: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
 
     print(f"stdout: {result.stdout}")
     if result.returncode != 0:
         print(f"stderr: {result.stderr}")
-        return {"status": "error", "message": result.stderr}
+        return False, {
+            "status": "error",
+            "message": result.stderr or result.stdout,
+            "returncode": result.returncode,
+        }
 
-    # Parse the output - look for status in the output
-    output_lines = result.stdout.strip().split("\n")
-    status = "unknown"
-    for line in output_lines:
-        if "property_status" in line.lower() or "status" in line.lower():
-            status = line
-            break
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return False, {"status": "error", "message": f"invalid JSON output: {exc}"}
 
-    return {"status": status, "raw_output": result.stdout}
+    status = output.get("status")
+    bounds = output.get("output_bounds")
+    if status not in {"verified", "violated", "unknown"}:
+        return False, {"status": "error", "message": f"missing result status: {status!r}"}
+    if not isinstance(bounds, list) or not bounds:
+        return False, {"status": "error", "message": "missing output_bounds"}
+    return True, output
 
 
-def main():
+def main() -> int:
     print("=" * 60)
     print("Testing Full CNN Pipeline with Flatten Layer")
     print("=" * 60)
 
-    # Paths
-    models_dir = Path("tests/models")
-    models_dir.mkdir(exist_ok=True)
+    try:
+        import onnx  # noqa: F401
+        import torch
+    except ImportError as exc:
+        print(f"\nSKIP: optional CNN export dependency is unavailable: {exc}")
+        return 0
 
-    onnx_path = str(models_dir / "cnn_with_flatten.onnx")
-    pt_path = str(models_dir / "cnn_with_flatten.pt")
-    vnnlib_path = str(models_dir / "cnn_with_flatten.vnnlib")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            models_dir = Path(tmpdir)
+            onnx_path = str(models_dir / "cnn_with_flatten.onnx")
+            pt_path = str(models_dir / "cnn_with_flatten.pt")
+            vnnlib_path = str(models_dir / "cnn_with_flatten.vnnlib")
 
-    # Step 1: Create and export model
-    print("\n1. Creating CNN model with Flatten layer...")
-    model = create_cnn_with_flatten()
-    if model is None:
-        print("Skipping test (PyTorch not available)")
-        return
+            # Step 1: Create and export model
+            print("\n1. Creating CNN model with Flatten layer...")
+            model = create_cnn_with_flatten()
+            if model is None:
+                print("SKIP: PyTorch not available")
+                return 0
 
-    # Save TorchScript for reference
-    import torch
+            dummy_input = torch.randn(1, 1, 8, 8)
+            with torch.no_grad():
+                traced = torch.jit.trace(model, dummy_input)
+                torch.jit.save(traced, pt_path)
+            print(f"Saved TorchScript to {pt_path}")
 
-    dummy_input = torch.randn(1, 1, 8, 8)
-    with torch.no_grad():
-        traced = torch.jit.trace(model, dummy_input)
-        torch.jit.save(traced, pt_path)
-    print(f"Saved TorchScript to {pt_path}")
+            # Export to ONNX
+            export_to_onnx(model, onnx_path)
 
-    # Export to ONNX
-    export_to_onnx(model, onnx_path)
+            # Step 2: Create property file
+            print("\n2. Creating VNN-LIB property file...")
+            create_vnnlib_property(onnx_path, vnnlib_path, epsilon=0.01)
 
-    # Step 2: Create property file
-    print("\n2. Creating VNN-LIB property file...")
-    create_vnnlib_property(onnx_path, vnnlib_path, epsilon=0.01)
+            # Step 3: Test with ny verify
+            print("\n3. Running ny verify...")
 
-    # Step 3: Test with ny verify
-    print("\n3. Running ny verify...")
+            print("\n--- IBP Method ---")
+            ibp_ok, ibp_result = run_ny_verify(onnx_path, vnnlib_path, "ibp")
+            print(f"Result: {json.dumps(ibp_result, indent=2)}")
 
-    # Test with IBP first
-    print("\n--- IBP Method ---")
-    ibp_result = run_ny_verify(onnx_path, vnnlib_path, "ibp")
-    if ibp_result:
-        print(f"Result: {json.dumps(ibp_result, indent=2)}")
-
-    # Test with CROWN
-    print("\n--- CROWN Method ---")
-    crown_result = run_ny_verify(onnx_path, vnnlib_path, "crown")
-    if crown_result:
-        print(f"Result: {json.dumps(crown_result, indent=2)}")
+            print("\n--- CROWN Method ---")
+            crown_ok, crown_result = run_ny_verify(onnx_path, vnnlib_path, "crown")
+            print(f"Result: {json.dumps(crown_result, indent=2)}")
+    except Exception as exc:
+        print(f"\nFAIL: CNN pipeline raised an exception: {exc}")
+        return 1
 
     print("\n" + "=" * 60)
-    print("Full CNN Pipeline Test Complete!")
+    print("Full CNN Pipeline Test Complete")
     print("=" * 60)
 
-    # Summary
     print("\nSummary:")
-    print("  - Model architecture: Conv2d -> ReLU -> MaxPool2d -> Flatten -> Linear")
-    print("  - Input shape: (1, 1, 8, 8)")
-    print("  - Output shape: (1, 2)")
-    if ibp_result:
-        print(f"  - IBP result: {ibp_result.get('status', 'N/A')}")
-    if crown_result:
-        print(f"  - CROWN result: {crown_result.get('status', 'N/A')}")
+    print(f"  - IBP: {'PASS' if ibp_ok else 'FAIL'} ({ibp_result.get('status', 'error')})")
+    print(f"  - CROWN: {'PASS' if crown_ok else 'FAIL'} ({crown_result.get('status', 'error')})")
+    failed = int(not ibp_ok) + int(not crown_ok)
+    print(f"  - Total: {2 - failed} passed, {failed} failed, 0 skipped")
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

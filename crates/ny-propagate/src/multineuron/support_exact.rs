@@ -29,6 +29,35 @@ use ny_tensor::next_up_f32;
 
 use super::{Facet, Octahedron2};
 
+/// Exact-support evidence for one stored 2-ReLU half-space.
+///
+/// Unlike [`Facet`], this type cannot be assembled from public fields.  It is
+/// created only after [`ExactRelu2Support`] has maximized the stored `f32`
+/// normal over all four exact ReLU cells.  The exact octahedron used for that
+/// proof is retained so a future verdict-bearing carrier can require equality
+/// with the octahedron freshly produced for its own graph/input/domain request.
+///
+/// This token is necessary but not sufficient authority: callers must still
+/// bind `support_domain()` to the current request and apply only a nonnegative
+/// multiplier with sound arithmetic.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExactRelu2FacetCertificate {
+    facet: Facet,
+    support_domain: Octahedron2,
+}
+
+impl ExactRelu2FacetCertificate {
+    /// The certified stored-`f32` half-space.
+    pub fn facet(&self) -> Facet {
+        self.facet
+    }
+
+    /// The exact octahedral support domain used to certify the half-space.
+    pub fn support_domain(&self) -> &Octahedron2 {
+        &self.support_domain
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ExactRow {
     // Coefficients are from {-1, 0, 1}; keeping them integral avoids introducing
@@ -51,6 +80,7 @@ struct ExactLiftedVertex {
 /// product.  The object has no connection to any authority gate.
 #[derive(Clone, Debug)]
 pub struct ExactRelu2Support {
+    support_domain: Octahedron2,
     vertices: Vec<ExactLiftedVertex>,
     orthant_vertex_counts: [usize; 4],
 }
@@ -140,8 +170,23 @@ impl ExactRelu2Support {
             return None;
         }
         Some(Self {
+            support_domain: p.clone(),
             vertices,
             orthant_vertex_counts,
+        })
+    }
+
+    /// Certify one stored `f32` normal and preserve the exact support domain in
+    /// an unforgeable evidence token.
+    ///
+    /// The returned certificate satisfies `a*w <= b` for every
+    /// `w=(x,ReLU(x))`, `x in support_domain()`. `None` means "drop this
+    /// proposal", never "accept without a certificate".
+    pub fn certify_normal_certificate(&self, a: [f32; 4]) -> Option<ExactRelu2FacetCertificate> {
+        let facet = self.certify_normal_inner(a)?;
+        Some(ExactRelu2FacetCertificate {
+            facet,
+            support_domain: self.support_domain.clone(),
         })
     }
 
@@ -151,6 +196,10 @@ impl ExactRelu2Support {
     /// `w=(x,ReLU(x))`, `x in P`.  `None` means "drop this proposal", never
     /// "accept without a certificate".
     pub fn certify_normal(&self, a: [f32; 4]) -> Option<Facet> {
+        self.certify_normal_inner(a)
+    }
+
+    fn certify_normal_inner(&self, a: [f32; 4]) -> Option<Facet> {
         let a_exact = [
             rat_f32(a[0])?,
             rat_f32(a[1])?,

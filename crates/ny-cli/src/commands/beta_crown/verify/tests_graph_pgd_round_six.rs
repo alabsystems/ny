@@ -6,18 +6,18 @@
 //!
 //! Split from `tests_graph_pgd.rs` for file size compliance.
 
-use ny_propagate::{
-    layers::{
-        GatherLayer, LayerNormLayer, LinearLayer, ReduceMeanLayer, SqueezeLayer, UnsqueezeLayer,
-    },
-    GraphNetwork, Layer, Network,
-};
-use ny_test_utils::CountingGemmEngine;
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
+use ny_propagate::layers::{
+    GatherLayer, LayerNormLayer, LinearLayer, ReduceMeanLayer, SqueezeLayer, UnsqueezeLayer,
+};
+use ny_propagate::{GraphNetwork, Layer, Network};
+use ny_test_utils::CountingGemmEngine;
 
-use super::graph_pgd::try_graph_pgd_upfront;
-use super::{make_interval_input, make_upper_bound_spec};
-use super::{make_multi_input_upper_bound_spec, make_tensor_interval_input};
+use super::super::graph_pgd::try_graph_pgd_upfront;
+use super::{
+    make_interval_input, make_multi_input_upper_bound_spec, make_tensor_interval_input,
+    make_upper_bound_spec,
+};
 
 fn make_layernorm_linear_graph() -> GraphNetwork {
     let ln = LayerNormLayer::new(arr1(&[1.0, 1.0]), arr1(&[0.0, 0.0]), 1e-5)

@@ -21,10 +21,114 @@ use ny_core::{NyError, Result};
 use rayon::prelude::*;
 use std::time::Instant;
 
-use super::net::{conv_apply_forward, conv_apply_forward_prec, ConvOp, TwinNet, TwinOp};
+use super::net::{conv_apply_forward, conv_apply_forward_prec_masked, ConvOp, TwinNet, TwinOp};
 use super::rounding::{
     certify_up, gamma_n, gamma_n_f32, next_down, next_up, RoundMode, SUBNORMAL_F32, UNIT,
 };
+
+// --------------------------------------------------------------------------
+//  #tableau-support-mask: exact column-block occupancy of the (M, D) tableau
+// --------------------------------------------------------------------------
+//
+// WHAT THIS IS. Every tableau row is `naug = n_in + 1` wide (9409 on
+// tinyimagenet), but for the first ~two thirds of a conv stack most of that
+// width is EXACTLY ZERO: a neuron's row can only be nonzero on its receptive
+// field, and the receptive field does not cover the whole image until late.
+// The mask records, per tableau ROW, which of [`SUPPORT_BLOCKS`] equal column
+// blocks can hold a nonzero coefficient. Blocks outside it are skipped by the
+// forward conv, the gate application and the concretize reduction.
+//
+// THE INVARIANT (this is the whole soundness argument):
+//
+//   for every row j and every block b NOT set in mask[j],
+//   `M[j, i] == 0.0` and `D[j, i] == 0.0` EXACTLY for every column i in b.
+//
+// It is established at the identity input and preserved by every op:
+//   * conv  — out row (oc, sp) is a weighted sum of the gathered src rows, so
+//     its support is contained in their union; the D lane uses |W| over the
+//     same gather, so it has the same containment. The bias column is always
+//     retained (the conv folds `c.bias` / `c.bias_err` into it).
+//   * add   — union of the two operand masks.
+//   * relu/gate application, channel affine, flatten — per-row elementwise, so
+//     the mask is unchanged (plus the bias column, which `c[j]` / `shift[j]`
+//     writes into).
+//
+// WHY SKIPPING IS EXACT, NOT A RELAXATION. Inside a masked-out block both
+// operands of every one of these ops are exactly `0.0`, so the exact result is
+// exactly `0.0` and writing `0.0` is not an approximation — it IS the value.
+// The one place where today's code differs is the outward widening: `next_up`
+// maps `0.0` to `5e-324` (its smallest-subnormal branch), so the shipped lane
+// currently sprinkles subnormal dust across the provably-zero region and then
+// carries it. Dropping that dust makes `D` equal to its EXACT value rather than
+// a subnormal over-estimate of it, so the tableau stays a valid outward
+// enclosure — `D` is defined as an upper bound on the coefficient error, and
+// the error is exactly zero there. It is a change of at most ~1e-300 against
+// accumulators holding ~1e-1 with a ~1e-12 certified `gam` slack, i.e. below
+// the ulp of every sum it enters; the root bound is expected to print
+// identically, and that identity is the acceptance test for this change.
+//
+// Kill switch: `NY_MARGIN_ROW_SUPPORT_MASK=0` restores the dense passes.
+
+/// Number of equal column blocks tracked per tableau row (one `u64` of bits).
+///
+/// 64 is not a tuning parameter with headroom: replaying the real gather
+/// geometry of `TinyImageNet_resnet_medium` gives 64.4% mean occupancy at 64
+/// blocks and 62.5% at 128, against a ~60% floor for exact per-coefficient
+/// support. One machine word already captures essentially all of the available
+/// work elimination.
+const SUPPORT_BLOCKS: usize = 64;
+
+/// Column-block width for a tableau of `naug` columns.
+#[inline]
+const fn support_blk(naug: usize) -> usize {
+    naug.div_ceil(SUPPORT_BLOCKS)
+}
+
+/// Is block `b` live in `mask`?
+#[inline]
+const fn support_has(mask: u64, b: usize) -> bool {
+    mask & (1u64 << b) != 0
+}
+
+/// Mask with only the bias column's block set (every op writes there).
+#[inline]
+const fn support_bias_bit(n_in: usize, blk: usize) -> u64 {
+    1u64 << (n_in / blk)
+}
+
+/// Per-row masks of the identity input tableau: row `i` holds `1.0` at column
+/// `i` and nothing else; the bias block is retained so downstream bias folds
+/// are always in range.
+fn support_input(n_in: usize, blk: usize) -> Vec<u64> {
+    let bias = support_bias_bit(n_in, blk);
+    (0..n_in).map(|i| (1u64 << (i / blk)) | bias).collect()
+}
+
+/// Per-out-row masks of a conv: the union of the gathered source rows' masks.
+/// All output channels at one spatial position gather the same rows, so the
+/// union is computed once per position and broadcast.
+fn support_conv(c: &ConvOp, src: &[u64], n_out: usize, bias: u64) -> Vec<u64> {
+    let p = c.oshape.1 * c.oshape.2;
+    let k = c.k_fwd;
+    let mut per_sp = vec![bias; p];
+    per_sp.par_iter_mut().enumerate().for_each(|(sp, m)| {
+        for t in 0..k {
+            let gi = c.gather[t * p + sp];
+            if gi != usize::MAX {
+                *m |= src[gi];
+            }
+        }
+    });
+    (0..n_out).map(|j| per_sp[j % p]).collect()
+}
+
+/// Is the support-mask work elimination armed? Default ON; exact `0` disarms.
+fn support_mask_enabled() -> bool {
+    !matches!(
+        std::env::var("NY_MARGIN_ROW_SUPPORT_MASK").as_deref(),
+        Ok("0")
+    )
+}
 
 /// Frozen gates of one trunk relu layer.
 pub struct LayerGates {
@@ -131,17 +235,27 @@ impl RetainedLayer {
     }
 }
 
-/// Is the SOUND f32 root-tableau conv fast path requested? Opt-in
-/// (`NY_MARGIN_ROW_ROOT_F32=1`), default OFF — the bit-for-bit f64 lane. When
-/// on, the two bandwidth-bound forward-conv lanes (M and D) run in f32 and a
-/// certified additive concretize slack (accumulated per op) dominates the
-/// worst-case effect of that f32 rounding on every box endpoint. Pure loosening:
-/// `dj` can only shrink, never a false-UNSAT (moat-safe).
+/// Is the SOUND f32 root-tableau conv fast path requested? Default OFF — the
+/// bit-for-bit f64 lane. When on, the two bandwidth-bound forward-conv lanes (M
+/// and D) run in f32 and a certified additive concretize slack (accumulated per
+/// op) dominates the worst-case effect of that f32 rounding on every box
+/// endpoint. Pure loosening: `dj` can only shrink, never a false-UNSAT
+/// (moat-safe).
+///
+/// Resolution order — the env var is authoritative in BOTH directions wherever
+/// it is present, so a sealed A/B can pin either arm regardless of the preset:
+///   * `NY_MARGIN_ROW_ROOT_F32=1|true|on`  => f32 root, whatever the preset says;
+///   * `NY_MARGIN_ROW_ROOT_F32=<anything else>` => f64 root (kill switch);
+///   * absent => [`super::root_f32_preset`], the typed `margin_row.root_f32`
+///     route the CLI sets once from the category preset.
+///
+/// Neither route can make the tableau TIGHTER, so an accidental arming costs
+/// proofs and can never manufacture one.
 fn root_f32_requested() -> bool {
-    matches!(
-        std::env::var("NY_MARGIN_ROW_ROOT_F32").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
-    )
+    match std::env::var("NY_MARGIN_ROW_ROOT_F32") {
+        Ok(raw) => matches!(raw.trim(), "1" | "true" | "on"),
+        Err(_) => super::root_f32_preset(),
+    }
 }
 
 impl RootGates {
@@ -296,9 +410,20 @@ impl RootGates {
         // `sum_i (|dM_ji| + |dD_ji|) * xabs_ext_i` (bias column weight 1). Consumed
         // as a pure additive concretize slack. Identity input carries zero error.
         let g0: Vec<f64> = if use_f32 { vec![0.0; n_in] } else { Vec::new() };
-        let mut state: Vec<Option<(Array2<f64>, Array2<f64>, Vec<f64>)>> =
+        // #tableau-support-mask. Armed only alongside the f32 kernel (the only
+        // conv lane that reads it) and only when the kill switch is absent.
+        // Empty vectors elsewhere, which every consumer reads as "dense".
+        let blk = support_blk(naug);
+        let bias_bit = support_bias_bit(n_in, blk);
+        let use_mask = use_f32 && support_mask_enabled();
+        let s0: Vec<u64> = if use_mask {
+            support_input(n_in, blk)
+        } else {
+            Vec::new()
+        };
+        let mut state: Vec<Option<(Array2<f64>, Array2<f64>, Vec<f64>, Vec<u64>)>> =
             vec![None; net.ops.len() + 1];
-        state[0] = Some((m0, d0, g0));
+        state[0] = Some((m0, d0, g0, s0));
         let mut layers = Vec::new();
 
         // Baked splits per trunk layer (#epoch-bab Tier 2).
@@ -329,29 +454,49 @@ impl RootGates {
                 }
             }
             let op_t0 = Instant::now();
-            let take = |st: &mut Vec<Option<(Array2<f64>, Array2<f64>, Vec<f64>)>>,
-                        cons: &mut Vec<usize>,
-                        id: usize|
-             -> Result<(Array2<f64>, Array2<f64>, Vec<f64>, bool)> {
-                let last = cons[id] == 1;
-                cons[id] -= 1;
-                let entry = st[id]
-                    .as_ref()
-                    .ok_or_else(|| NyError::InvalidSpec("margin_row: dead tensor".into()))?;
-                if last {
-                    let owned = st[id].take().expect("checked above");
-                    Ok((owned.0, owned.1, owned.2, true))
-                } else {
-                    Ok((entry.0.clone(), entry.1.clone(), entry.2.clone(), false))
-                }
-            };
+            let take =
+                |st: &mut Vec<Option<(Array2<f64>, Array2<f64>, Vec<f64>, Vec<u64>)>>,
+                 cons: &mut Vec<usize>,
+                 id: usize|
+                 -> Result<(Array2<f64>, Array2<f64>, Vec<f64>, Vec<u64>, bool)> {
+                    let last = cons[id] == 1;
+                    cons[id] -= 1;
+                    let entry = st[id]
+                        .as_ref()
+                        .ok_or_else(|| NyError::InvalidSpec("margin_row: dead tensor".into()))?;
+                    if last {
+                        let owned = st[id].take().expect("checked above");
+                        Ok((owned.0, owned.1, owned.2, owned.3, true))
+                    } else {
+                        Ok((
+                            entry.0.clone(),
+                            entry.1.clone(),
+                            entry.2.clone(),
+                            entry.3.clone(),
+                            false,
+                        ))
+                    }
+                };
             match op {
                 TwinOp::Conv(c) => {
-                    let (mi, di, gerr_in, _) = take(&mut state, &mut consumers, c.input)?;
+                    let (mi, di, gerr_in, smask_in, _) = take(&mut state, &mut consumers, c.input)?;
                     let n_out = net.tsize[k + 1];
+                    // #tableau-support-mask: the output row support is the union
+                    // of the gathered source rows' supports (plus the bias column
+                    // the folds below write into).
+                    let smask_out: Vec<u64> = if use_mask {
+                        support_conv(c, &smask_in, n_out, bias_bit)
+                    } else {
+                        Vec::new()
+                    };
+                    let cmask: Option<(&[u64], &[u64], usize)> = if use_mask {
+                        Some((&smask_in, &smask_out, SUPPORT_BLOCKS))
+                    } else {
+                        None
+                    };
                     let mut mo = Array2::<f64>::zeros((n_out, naug));
                     // M lane (f64 default, or f32 fast path stored back exactly).
-                    conv_apply_forward_prec(c, &mi, &mut mo, false, use_f32);
+                    conv_apply_forward_prec_masked(c, &mi, &mut mo, false, use_f32, cmask);
                     let mut do_ = Array2::<f64>::zeros((n_out, naug));
                     // g_err accumulation for the f32 fast path (see conv_f32_gerr
                     // doc): g_err_out = conv_abs(g_err_in + gamma_f32 * B) + FTZ
@@ -366,15 +511,31 @@ impl RootGates {
                                 + gamma_n(c.k_fwd + 2) * c.weight_rel_err,
                         );
                         let mut din = Array2::<f64>::zeros(mi.raw_dim());
-                        par_zip3(&mut din, &mi, &di, |dst, m, d| *dst = d + g * (m.abs() + d));
+                        // Masked-out columns have `m == d == 0.0`, so the exact
+                        // result is `0.0` and the zeroed `din` already holds it.
+                        par_zip3_masked(&mut din, &mi, &di, &smask_in, blk, |dst, m, d| {
+                            *dst = d + g * (m.abs() + d);
+                        });
                         if use_f32 {
-                            gerr_out = conv_f32_gerr(c, &mi, &din, &gerr_in, &xabs, s_xabs, n_in);
+                            gerr_out = conv_f32_gerr(
+                                c,
+                                &mi,
+                                &din,
+                                &gerr_in,
+                                &xabs,
+                                s_xabs,
+                                n_in,
+                                if use_mask { Some(&smask_in) } else { None },
+                                blk,
+                            );
                         }
-                        conv_apply_forward_prec(c, &din, &mut do_, true, use_f32);
+                        conv_apply_forward_prec_masked(c, &din, &mut do_, true, use_f32, cmask);
                         let g2 = gamma_n(c.k_fwd + 8);
-                        do_.par_mapv_inplace(|v| certify_up(v, g2));
+                        // Same argument: `certify_up` of an exact `0.0` is `0.0`
+                        // (its `next_up` would otherwise return 5e-324 dust).
+                        map_masked(&mut do_, &smask_out, blk, |v| certify_up(v, g2));
                     } else {
-                        conv_apply_forward_prec(c, &di, &mut do_, true, use_f32);
+                        conv_apply_forward_prec_masked(c, &di, &mut do_, true, use_f32, cmask);
                     }
                     // Bias into the M bias column (+ certified bias error into D).
                     let p = c.oshape.1 * c.oshape.2;
@@ -386,17 +547,23 @@ impl RootGates {
                             do_[[j, n_in]] = next_up(do_[[j, n_in]] + extra);
                         }
                     }
-                    state[k + 1] = Some((mo, do_, gerr_out));
+                    state[k + 1] = Some((mo, do_, gerr_out, smask_out));
                 }
                 TwinOp::Add { lhs, rhs } => {
-                    let (ma, da, ga, _) = take(&mut state, &mut consumers, *lhs)?;
-                    let (mb, db, gb, _) = take(&mut state, &mut consumers, *rhs)?;
+                    let (ma, da, ga, sa_, _) = take(&mut state, &mut consumers, *lhs)?;
+                    let (mb, db, gb, sb_, _) = take(&mut state, &mut consumers, *rhs)?;
+                    // Support of an elementwise sum is the union of the operands'.
+                    let smask_out: Vec<u64> = if use_mask {
+                        sa_.iter().zip(&sb_).map(|(a, b)| a | b).collect()
+                    } else {
+                        Vec::new()
+                    };
                     let mut mo = ma;
                     mo += &mb;
                     let mut do_ = da;
                     if mode.outward() {
                         // do_ still holds da: dst = widen(da + db + 2u|mo|).
-                        par_zip3(&mut do_, &db, &mo, |dst, dbv, mv| {
+                        par_zip3_masked(&mut do_, &db, &mo, &smask_out, blk, |dst, dbv, mv| {
                             *dst = next_up(((*dst + dbv) + 2.0 * UNIT * mv.abs()) * (1.0 + 1e-15));
                         });
                     } else {
@@ -410,11 +577,11 @@ impl RootGates {
                     } else {
                         Vec::new()
                     };
-                    state[k + 1] = Some((mo, do_, gerr_out));
+                    state[k + 1] = Some((mo, do_, gerr_out, smask_out));
                 }
                 TwinOp::Flatten { input } => {
-                    let (mi, di, gi, _) = take(&mut state, &mut consumers, *input)?;
-                    state[k + 1] = Some((mi, di, gi));
+                    let (mi, di, gi, si, _) = take(&mut state, &mut consumers, *input)?;
+                    state[k + 1] = Some((mi, di, gi, si));
                 }
                 TwinOp::ChannelAffine {
                     input,
@@ -426,7 +593,16 @@ impl RootGates {
                     // Diagonal affine on the tableau: M' = s ⊙ M (+ shift in
                     // the bias column); D' = |s| ⊙ D widened by the certified
                     // parameter/rounding envelope in Outward mode.
-                    let (mut mi, mut di, gerr_in, _) = take(&mut state, &mut consumers, *input)?;
+                    let (mut mi, mut di, gerr_in, smask_in, _) =
+                        take(&mut state, &mut consumers, *input)?;
+                    // Diagonal scaling is per-row elementwise, so the support is
+                    // unchanged; the shift only touches the (always live) bias
+                    // column.
+                    let smask_out: Vec<u64> = if use_mask {
+                        smask_in.iter().map(|m| m | bias_bit).collect()
+                    } else {
+                        Vec::new()
+                    };
                     let g = next_up(*scale_rel_err + 4.0 * UNIT);
                     let msl = mi.as_slice_mut().expect("standard layout");
                     let dsl = di.as_slice_mut().expect("standard layout");
@@ -434,16 +610,25 @@ impl RootGates {
                         let sa = sj.abs();
                         let mrow = &mut msl[j * naug..(j + 1) * naug];
                         let drow = &mut dsl[j * naug..(j + 1) * naug];
-                        for i in 0..naug {
-                            let m2 = sj * mrow[i];
-                            if mode.outward() {
-                                drow[i] = next_up(
-                                    (sa * drow[i] + g * (m2.abs() + sa * drow[i])) * (1.0 + 1e-15),
-                                );
-                            } else {
-                                drow[i] *= sa;
+                        let m = if use_mask { smask_in[j] } else { u64::MAX };
+                        for b in 0..SUPPORT_BLOCKS {
+                            if !support_has(m, b) {
+                                continue;
                             }
-                            mrow[i] = m2;
+                            let lo = (b * blk).min(naug);
+                            let hi = (lo + blk).min(naug);
+                            for i in lo..hi {
+                                let m2 = sj * mrow[i];
+                                if mode.outward() {
+                                    drow[i] = next_up(
+                                        (sa * drow[i] + g * (m2.abs() + sa * drow[i]))
+                                            * (1.0 + 1e-15),
+                                    );
+                                } else {
+                                    drow[i] *= sa;
+                                }
+                                mrow[i] = m2;
+                            }
                         }
                         let b2 = mrow[n_in] + tj;
                         if mode.outward() {
@@ -465,10 +650,10 @@ impl RootGates {
                     } else {
                         Vec::new()
                     };
-                    state[k + 1] = Some((mi, di, gerr_out));
+                    state[k + 1] = Some((mi, di, gerr_out, smask_out));
                 }
                 TwinOp::Relu { input, layer } => {
-                    let (mi, di, gerr_in, _) = take(&mut state, &mut consumers, *input)?;
+                    let (mi, di, gerr_in, smask_in, _) = take(&mut state, &mut consumers, *input)?;
                     let n = net.tsize[k + 1];
                     let f32_gerr = if use_f32 {
                         Some(gerr_in.as_slice())
@@ -484,6 +669,8 @@ impl RootGates {
                         mode,
                         net.trunk_relus.len(),
                         f32_gerr,
+                        if use_mask { Some(&smask_in) } else { None },
+                        blk,
                     );
                     for v in l.iter().chain(u.iter()) {
                         if !v.is_finite() {
@@ -576,7 +763,24 @@ impl RootGates {
                         break; // downstream tableau unused beyond retention
                     }
                     // Apply gates: L = (M-D)*alpha; U = (M+D)*s + c@bias.
-                    let (mo, do_) = apply_gates(&mi, &di, &alpha, &s, &c, n_in, mode);
+                    // Support is unchanged (per-row elementwise) plus the bias
+                    // column that `c[j]` writes into.
+                    let smask_out: Vec<u64> = if use_mask {
+                        smask_in.iter().map(|m| m | bias_bit).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let (mo, do_) = apply_gates(
+                        &mi,
+                        &di,
+                        &alpha,
+                        &s,
+                        &c,
+                        n_in,
+                        mode,
+                        if use_mask { Some(&smask_in) } else { None },
+                        blk,
+                    );
                     // Propagate the f32 error through the gate transform. Per
                     // neuron j the new coefficient errors are
                     // |dM'| + |dD'| <= (alpha_j + s_j) * (|dM| + |dD|), so the
@@ -591,7 +795,7 @@ impl RootGates {
                     } else {
                         Vec::new()
                     };
-                    state[k + 1] = Some((mo, do_, gerr_out));
+                    state[k + 1] = Some((mo, do_, gerr_out, smask_out));
                 }
                 TwinOp::Gemm { .. } => unreachable!("guarded above"),
             }
@@ -674,6 +878,79 @@ fn par_zip3(
         });
 }
 
+/// [`par_zip3`] restricted to the live column blocks of a
+/// `#tableau-support-mask` (empty mask ⇒ dense).
+///
+/// Every writer that uses this maps `(0, 0) -> 0` in exact arithmetic, and the
+/// destination arrives zeroed, so a skipped block already holds the exact
+/// result. See the module comment for the invariant.
+fn par_zip3_masked(
+    dst: &mut Array2<f64>,
+    a: &Array2<f64>,
+    b: &Array2<f64>,
+    smask: &[u64],
+    blk: usize,
+    f: impl Fn(&mut f64, f64, f64) + Sync,
+) {
+    if smask.is_empty() {
+        par_zip3(dst, a, b, f);
+        return;
+    }
+    let cols = dst.ncols();
+    let ds = dst.as_slice_mut().expect("standard layout");
+    let asl = a.as_slice().expect("standard layout");
+    let bs = b.as_slice().expect("standard layout");
+    ds.par_chunks_mut(cols)
+        .zip(asl.par_chunks(cols).zip(bs.par_chunks(cols)))
+        .zip(smask.par_iter())
+        .for_each(|((d, (ar, br)), &m)| {
+            for blk_i in 0..SUPPORT_BLOCKS {
+                if !support_has(m, blk_i) {
+                    continue;
+                }
+                let lo = (blk_i * blk).min(cols);
+                let hi = (lo + blk).min(cols);
+                for ((dv, &av), &bv) in d[lo..hi].iter_mut().zip(&ar[lo..hi]).zip(&br[lo..hi]) {
+                    f(dv, av, bv);
+                }
+            }
+        });
+}
+
+/// Elementwise map over the live column blocks of a `#tableau-support-mask`
+/// (empty mask ⇒ dense `par_mapv_inplace`).
+///
+/// Used for the outward `certify_up` widening of the D lane: outside the mask
+/// the value is an exact `0.0` whose certified upper bound is `0.0`, while
+/// `certify_up(0.0, _)` would return `next_up(0.0) = 5e-324`.
+fn map_masked(
+    dst: &mut Array2<f64>,
+    smask: &[u64],
+    blk: usize,
+    f: impl Fn(f64) -> f64 + Sync + Send,
+) {
+    if smask.is_empty() {
+        dst.par_mapv_inplace(f);
+        return;
+    }
+    let cols = dst.ncols();
+    let ds = dst.as_slice_mut().expect("standard layout");
+    ds.par_chunks_mut(cols)
+        .zip(smask.par_iter())
+        .for_each(|(row, &m)| {
+            for blk_i in 0..SUPPORT_BLOCKS {
+                if !support_has(m, blk_i) {
+                    continue;
+                }
+                let lo = (blk_i * blk).min(cols);
+                let hi = (lo + blk).min(cols);
+                for v in row[lo..hi].iter_mut() {
+                    *v = f(*v);
+                }
+            }
+        });
+}
+
 /// f32-fast-path g_err propagation across ONE forward conv (`NY_MARGIN_ROW_ROOT_F32`).
 ///
 /// Returns the per-output-neuron certified error functional
@@ -695,6 +972,7 @@ fn par_zip3(
 /// single-column `conv_abs` — negligible beside the two full-width conv lanes.
 /// Everything is rounded outward (upper bound). A per-output additive floor
 /// covers f32 subnormal/FTZ rounding. Pure over-estimate -> pure loosening.
+#[allow(clippy::too_many_arguments)]
 fn conv_f32_gerr(
     c: &ConvOp,
     mi: &Array2<f64>,
@@ -703,6 +981,8 @@ fn conv_f32_gerr(
     xabs: &[f64],
     s_xabs: f64,
     n_in: usize,
+    smask: Option<&[u64]>,
+    blk: usize,
 ) -> Vec<f64> {
     let n_src = mi.nrows();
     let naug = n_in + 1;
@@ -724,8 +1004,17 @@ fn conv_f32_gerr(
             let mrow = &mis[t * naug..(t + 1) * naug];
             let drow = &dins[t * naug..(t + 1) * naug];
             let mut braw = 0.0;
-            for i in 0..n_in {
-                braw += (mrow[i].abs() + drow[i]) * xabs[i];
+            // #tableau-support-mask: skipped blocks contribute an exact `0.0`.
+            let mask = smask.map_or(u64::MAX, |s| s[t]);
+            for b in 0..SUPPORT_BLOCKS {
+                if !support_has(mask, b) {
+                    continue;
+                }
+                let lo = (b * blk).min(n_in);
+                let hi = (lo + blk).min(n_in);
+                for i in lo..hi {
+                    braw += (mrow[i].abs() + drow[i]) * xabs[i];
+                }
             }
             // Bias column (index n_in): xabs_ext weight = 1.
             braw += mrow[n_in].abs() + drow[n_in];
@@ -773,6 +1062,8 @@ fn concretize_box(
     mode: RoundMode,
     relu_depth: usize,
     f32_gerr: Option<&[f64]>,
+    smask: Option<&[u64]>,
+    blk: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = m.nrows();
     let n_in = mid.len();
@@ -802,14 +1093,25 @@ fn concretize_box(
             let mut vu = 0.0;
             let mut ru = 0.0;
             let mut tabs = 0.0;
-            for i in 0..n_in {
-                let lo_c = mrow[i] - drow[i];
-                let up_c = mrow[i] + drow[i];
-                vl += lo_c * mid[i];
-                rl += lo_c.abs() * rad[i];
-                vu += up_c * mid[i];
-                ru += up_c.abs() * rad[i];
-                tabs += (lo_c.abs() + up_c.abs()) * xabs[i];
+            // #tableau-support-mask: a masked-out block has `m == d == 0.0`, so
+            // every one of the five accumulations above adds an exact `0.0`
+            // there. Skipping it is bit-identical, not an approximation.
+            let mask = smask.map_or(u64::MAX, |s| s[j]);
+            for b in 0..SUPPORT_BLOCKS {
+                if !support_has(mask, b) {
+                    continue;
+                }
+                let lo = (b * blk).min(n_in);
+                let hi = (lo + blk).min(n_in);
+                for i in lo..hi {
+                    let lo_c = mrow[i] - drow[i];
+                    let up_c = mrow[i] + drow[i];
+                    vl += lo_c * mid[i];
+                    rl += lo_c.abs() * rad[i];
+                    vu += up_c * mid[i];
+                    ru += up_c.abs() * rad[i];
+                    tabs += (lo_c.abs() + up_c.abs()) * xabs[i];
+                }
             }
             let bl = mrow[n_in] - drow[n_in];
             let bu = mrow[n_in] + drow[n_in];
@@ -888,6 +1190,7 @@ pub fn repair_upper_lines(l: &[f64], u: &[f64], s: &mut [f64], c: &mut [f64]) {
 /// Gate application on the tableau (Python parity):
 /// `L = (M-D)*alpha; U = (M+D)*s; U_bias += c; M' = (L+U)/2; D' = (U-L)/2`.
 /// Outward: widen `D'` by the elementwise rounding envelope.
+#[allow(clippy::too_many_arguments)]
 fn apply_gates(
     m: &Array2<f64>,
     d: &Array2<f64>,
@@ -896,6 +1199,8 @@ fn apply_gates(
     c: &[f64],
     n_in: usize,
     mode: RoundMode,
+    smask: Option<&[u64]>,
+    blk: usize,
 ) -> (Array2<f64>, Array2<f64>) {
     let naug = n_in + 1;
     let n = m.nrows();
@@ -913,23 +1218,37 @@ fn apply_gates(
             let s_j = s[j];
             let msr = &msrc[j * naug..(j + 1) * naug];
             let dsr = &dsrc[j * naug..(j + 1) * naug];
-            for i in 0..naug {
-                let lo_c = (msr[i] - dsr[i]) * a_j;
-                let mut up_c = (msr[i] + dsr[i]) * s_j;
-                if i == n_in {
-                    up_c += c[j];
+            // #tableau-support-mask: outside the mask `msr[i] == dsr[i] == 0.0`,
+            // so `lo_c == up_c == 0.0` and both outputs are EXACTLY zero — which
+            // is what the freshly zeroed `mo`/`do_` already hold. (The dense lane
+            // instead stores `next_up(0.0) = 5e-324` into `drow[i]`; dropping
+            // that subnormal makes `D` equal its exact value, so the tableau
+            // stays a valid outward enclosure.) The bias column is always live.
+            let mask = smask.map_or(u64::MAX, |s| s[j]);
+            for b in 0..SUPPORT_BLOCKS {
+                if !support_has(mask, b) {
+                    continue;
                 }
-                // Bit-identical (a+b)*0.5 anchor: midpoint's overflow-edge branch
-                // would move the produced center on this bound path.
-                #[allow(clippy::manual_midpoint)]
-                let mm = (lo_c + up_c) * 0.5;
-                let dd = (up_c - lo_c) * 0.5;
-                if mode.outward() {
-                    mrow[i] = mm;
-                    drow[i] = next_up((dd + 6.0 * UNIT * (mm.abs() + dd)) * (1.0 + 1e-15));
-                } else {
-                    mrow[i] = mm;
-                    drow[i] = dd;
+                let lo = (b * blk).min(naug);
+                let hi = (lo + blk).min(naug);
+                for i in lo..hi {
+                    let lo_c = (msr[i] - dsr[i]) * a_j;
+                    let mut up_c = (msr[i] + dsr[i]) * s_j;
+                    if i == n_in {
+                        up_c += c[j];
+                    }
+                    // Bit-identical (a+b)*0.5 anchor: midpoint's overflow-edge branch
+                    // would move the produced center on this bound path.
+                    #[allow(clippy::manual_midpoint)]
+                    let mm = (lo_c + up_c) * 0.5;
+                    let dd = (up_c - lo_c) * 0.5;
+                    if mode.outward() {
+                        mrow[i] = mm;
+                        drow[i] = next_up((dd + 6.0 * UNIT * (mm.abs() + dd)) * (1.0 + 1e-15));
+                    } else {
+                        mrow[i] = mm;
+                        drow[i] = dd;
+                    }
                 }
             }
         });

@@ -57,28 +57,37 @@ run_ny_with_watchdog() {
 
 start_ny_with_watchdog() {
     local backend_flag="$1"
-    local timeout="${2%.*}"  # Truncate float to integer (e.g., 480.0 → 480)
+    local timeout_digits="${2%%.*}"  # Truncate float to integer (e.g., 480.0 → 480)
+    local timeout=$((10#$timeout_digits))
     local watchdog_timeout=$((timeout + EXTERNAL_TIMEOUT_SLACK))
     local watchdog_polls=$((watchdog_timeout * 5))
 
     LAST_EXIT_CODE=0
     WATCHDOG_TIMEOUT_HIT=0
     WATCHDOG_TIMEOUT_LIMIT=$watchdog_timeout
-    WATCHDOG_MARKER=$(mktemp)
-    rm -f "$WATCHDOG_MARKER"
+    local marker_root="${BENCHMARK_TMP_DIR:-${TMPDIR:-/tmp}}"
+    WATCHDOG_MARKER=$(mktemp "${marker_root%/}/ny-benchmark-watchdog.XXXXXX")
 
     set +e
-    # shellcheck disable=SC2086
-    "$NY_BIN" beta-crown "$ONNX_PATH" \
-        --property "$VNNLIB_PATH" \
-        $PRESET \
-        $PGD_FLAG \
-        $CATEGORY_EXTRA_FLAGS \
-        $BRANCHING_FLAG \
-        $backend_flag \
-        $DOMAIN_BATCH_METRICS_FLAG \
-        $VERIFIER_FLAG \
-        --timeout "$timeout" > "$TMPOUT" 2>&1 &
+    if [[ "${COMPETITION_WRAPPER:-false}" == "true" ]]; then
+        : > "$VNNCOMP_RESULTS_FILE"
+        "$NY_BIN" vnncomp \
+            ${WRAPPER_CONFIGS_ARGS[@]+"${WRAPPER_CONFIGS_ARGS[@]}"} \
+            v1 "$CATEGORY" "$ONNX_PATH" "$VNNLIB_PATH" \
+            "$VNNCOMP_RESULTS_FILE" "$timeout" > "$TMPOUT" 2>&1 &
+    else
+        # shellcheck disable=SC2086
+        "$NY_BIN" beta-crown "$ONNX_PATH" \
+            --property "$VNNLIB_PATH" \
+            ${PRESET_ARGS[@]+"${PRESET_ARGS[@]}"} \
+            $PGD_FLAG \
+            $CATEGORY_EXTRA_FLAGS \
+            $BRANCHING_FLAG \
+            $backend_flag \
+            ${DOMAIN_BATCH_METRICS_ARGS[@]+"${DOMAIN_BATCH_METRICS_ARGS[@]}"} \
+            $VERIFIER_FLAG \
+            --timeout "$timeout" > "$TMPOUT" 2>&1 &
+    fi
     NY_PID=$!
 
     (
@@ -135,7 +144,20 @@ finish_ny_with_watchdog() {
 }
 
 add_elapsed() {
-    python3 -c "print(f'{float(\"$1\") + float(\"$2\"):.2f}')"
+    python3 -c \
+        'import sys; print(f"{float(sys.argv[1]) + float(sys.argv[2]):.2f}")' \
+        "$1" "$2"
+}
+
+elapsed_is_within_timeout() {
+    python3 -c '
+import math
+import sys
+
+elapsed = float(sys.argv[1])
+timeout = float(sys.argv[2])
+raise SystemExit(0 if math.isfinite(elapsed) and math.isfinite(timeout) and elapsed <= timeout else 1)
+' "$1" "$2"
 }
 
 to_repo_relative_path() {
@@ -408,6 +430,9 @@ run_benchmark_attempts() {
         LAST_EXIT_CODE=$?
         set -e
 
+        if [[ "${COMPETITION_WRAPPER:-false}" == "true" && -s "${VNNCOMP_RESULTS_FILE:-/nonexistent}" ]]; then
+            return
+        fi
         if grep -q "Status:" "$TMPOUT" || grep -qi "Timed out" "$TMPOUT" || grep -q "Error:" "$TMPOUT"; then
             return
         fi
@@ -440,12 +465,21 @@ parse_benchmark_result() {
     actual_method=$(sed -n 's/.*Actual method: \(.*\)$/\1/p' "$TMPOUT" 2>/dev/null | tail -n1)
     LAST_ACTUAL_METHOD="${actual_method:-}"
 
-    if grep -q "Status: VERIFIED" "$TMPOUT"; then
-        if python3 -c "exit(0 if float('$elapsed') <= float('$timeout') else 1)"; then
-            LAST_RESULT="verified"
-        else
-            LAST_RESULT="timeout"
-        fi
+    if [[ "${COMPETITION_WRAPPER:-false}" == "true" && -s "${VNNCOMP_RESULTS_FILE:-/nonexistent}" ]]; then
+        case "$(sed -n '1{s/[[:space:]]//g;p;}' "$VNNCOMP_RESULTS_FILE")" in
+            unsat) LAST_RESULT="verified" ;;
+            sat) LAST_RESULT="violated" ;;
+            timeout) LAST_RESULT="timeout" ;;
+            unknown) LAST_RESULT="unknown" ;;
+            error) LAST_RESULT="error" ;;
+            *)
+                LAST_RESULT="error"
+                echo "" >&2
+                echo "  ERROR[$backend_name]: competition wrapper wrote an invalid result token" >&2
+                ;;
+        esac
+    elif grep -q "Status: VERIFIED" "$TMPOUT"; then
+        LAST_RESULT="verified"
     elif grep -q "Status: VIOLATED" "$TMPOUT"; then
         LAST_RESULT="violated"
     elif grep -q "Status: POTENTIAL VIOLATION" "$TMPOUT" || grep -q "Status: UNKNOWN" "$TMPOUT"; then
@@ -464,6 +498,13 @@ parse_benchmark_result() {
         LAST_RESULT="error"
         echo "" >&2
         echo "  DEBUG[$backend_name](exit=$LAST_EXIT_CODE): $(tail -3 "$TMPOUT")" >&2
+    fi
+
+    # Organizer scoring treats every verdict reported after the row budget as a
+    # timeout. Apply that rule symmetrically to UNSAT/VERIFIED and SAT/VIOLATED.
+    if [[ "$LAST_RESULT" == "verified" || "$LAST_RESULT" == "violated" ]] \
+        && ! elapsed_is_within_timeout "$elapsed" "$timeout"; then
+        LAST_RESULT="timeout"
     fi
 
     if [[ "$WATCHDOG_TIMEOUT_HIT" -eq 1 ]]; then

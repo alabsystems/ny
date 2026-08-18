@@ -33,14 +33,17 @@
 //!    `precision_ratio * |margin center|`. So "is double-double enough for
 //!    THIS network?" is answered at runtime, not by a static claim about
 //!    `vgg16-7`.
-//! 2. **`dd_selfcheck`.** The double-double error-free transformations are
+//! 2. **Qualified binary64 environment.** The caller and every Rayon worker
+//!    must use round-to-nearest/ties-to-even with gradual underflow. The pass
+//!    probes both before detection and again immediately before execution.
+//! 3. **`dd_selfcheck`.** The double-double error-free transformations are
 //!    algebraically trivial and a reassociating backend silently degrades them
 //!    to f64 — which would publish a bound that is too TIGHT. The path refuses
 //!    unless `ny_core::dd_selfcheck::dd_selfcheck_ok()` passes.
-//! 3. **Fail-closed everywhere.** Any unsupported layer, non-finite value,
+//! 4. **Fail-closed everywhere.** Any unsupported layer, non-finite value,
 //!    generator-count overflow, byte-budget overflow, or deadline expiry
 //!    returns `None`. There is no degraded bound.
-//! 4. **Intersect, never replace.** The caller keeps the tighter side of two
+//! 5. **Intersect, never replace.** The caller keeps the tighter side of two
 //!    certified enclosures; a refusal is byte-identical to today.
 //!
 //! # Deliberate scope limits
@@ -65,8 +68,11 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use ny_core::dd::{next_down_f64, next_up_f64, Dd, U_F64};
-use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_core::{
+    f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, require_f64_interval_proof_environment,
+    NyError, Result,
+};
+use ny_tensor::BoundedTensor;
 
 use crate::layers::Layer;
 use crate::GraphNetwork;
@@ -118,24 +124,13 @@ pub struct DdZonoConfig {
     /// i.e. by IBP. The self-policing precision gate is what decides whether
     /// the result survives. See `certified_box` for the measurement.
     pub point_tol: f64,
-    /// **MEASUREMENT ONLY — changes what is verified. Default `false`.**
-    ///
-    /// When set (`NY_DD_ZONOTOPE_DECLARED_POINT_EXACT=1`), a sub-`point_tol`
-    /// input coordinate is seeded as an EXACT POINT at the midpoint of its
-    /// exact-decimal enclosure instead of carrying its residual width in the
-    /// interval channel.
-    ///
-    /// That residue is the gap between a non-dyadic VNN-LIB decimal (e.g.
-    /// `2.6399001`) and its nearest f64 — one f64 ulp, `~4.4e-16` at vggnet16
-    /// pixel magnitudes. Dropping it verifies the property at the FLOAT point
-    /// rather than over the exact-rational point. That is how every tool which
-    /// parses the decimal into a float behaves, but it is strictly weaker than
-    /// what the rest of ny guarantees (`split_input_bounds_f32` rounds OUTWARD
-    /// to f32, a `~2.4e-7`-wide interval). It exists so the cost of the
-    /// rigorous treatment can be MEASURED rather than argued about, and every
-    /// telemetry line it produces is tagged `semantics=float-point` so no
-    /// number obtained under it can be mistaken for the shipped one.
-    pub declared_point_exact: bool,
+    /// `#dd-zono-interm`: populate [`DdZonoMargin::interm`] with the certified
+    /// per-node enclosures so the root coordinator may intersect them into its
+    /// stored intermediate bounds. Default `false` (the map stays empty and the
+    /// downstream intersect phase is inert). Sound either way: each entry is an
+    /// outward-rounded enclosure on the same certified footing as the margin,
+    /// and intersection of two certified enclosures can only tighten.
+    pub collect_interm: bool,
 }
 
 impl Default for DdZonoConfig {
@@ -150,7 +145,7 @@ impl Default for DdZonoConfig {
             precision_ratio: 0.1,
             safety_factor: 2.0,
             point_tol: 0.0,
-            declared_point_exact: false,
+            collect_interm: false,
         }
     }
 }
@@ -187,15 +182,60 @@ impl DdZonoConfig {
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .unwrap_or(d.point_tol),
-            declared_point_exact: std::env::var("NY_DD_ZONOTOPE_DECLARED_POINT_EXACT")
-                .ok()
-                .as_deref()
-                == Some("1"),
+            collect_interm: matches!(
+                std::env::var("NY_DD_ZONO_INTERM").ok().as_deref(),
+                Some("1")
+            ) || d.collect_interm,
         }
+    }
+
+    /// Apply per-category ADMISSION overrides from a preset (#metaroom-ddzono).
+    ///
+    /// Precedence: an explicitly set environment knob wins over the preset, so
+    /// the operator's `NY_DD_ZONOTOPE_*` overrides (including tightening back
+    /// down) and the `NY_DD_ZONOTOPE=0` kill switch retain full authority. The
+    /// preset only substitutes where the corresponding variable is unset.
+    ///
+    /// Only blast-radius/resource caps are reachable here. The soundness knobs
+    /// (`precision_ratio`, `safety_factor`, `point_tol`) are deliberately NOT
+    /// preset-configurable: they change what the certificate must prove, not
+    /// how much work the pass may buy.
+    #[must_use]
+    pub fn with_admission_overrides(
+        mut self,
+        min_input_numel: Option<usize>,
+        max_k: Option<usize>,
+        max_generators: Option<usize>,
+        collect_interm: Option<bool>,
+    ) -> Self {
+        fn env_unset(key: &str) -> bool {
+            std::env::var_os(key).is_none()
+        }
+        if env_unset("NY_DD_ZONOTOPE_MIN_INPUT") {
+            if let Some(v) = min_input_numel {
+                self.min_input_numel = v;
+            }
+        }
+        if env_unset("NY_DD_ZONOTOPE_MAX_K") {
+            if let Some(v) = max_k {
+                self.max_k = v;
+            }
+        }
+        if env_unset("NY_DD_ZONOTOPE_MAX_GENS") {
+            if let Some(v) = max_generators {
+                self.max_generators = v;
+            }
+        }
+        if env_unset("NY_DD_ZONO_INTERM") {
+            if let Some(v) = collect_interm {
+                self.collect_interm = v;
+            }
+        }
+        self
     }
 }
 
-/// Is the dark `#dd-zonotope` gate on?
+/// Is the default-on `#dd-zonotope` gate on?
 ///
 /// Read once per process so a mid-run environment change cannot make two
 /// callers disagree about whether the path is armed.
@@ -234,6 +274,18 @@ fn decline(reason: &str) {
     }
 }
 
+/// Qualify the caller and every worker in Rayon's current pool.
+///
+/// The affine kernels execute double-double/f64 arithmetic inside Rayon
+/// closures. Floating-point control state is thread-local on the supported
+/// targets, so a caller-only probe would not qualify those reductions.
+fn f64_environment_qualified_for_rayon() -> bool {
+    require_f64_interval_proof_environment().is_ok()
+        && rayon::broadcast(|_| require_f64_interval_proof_environment())
+            .into_iter()
+            .all(|result| result.is_ok())
+}
+
 /// Admission decision for one (graph, input) pair.
 #[derive(Debug, Clone)]
 pub struct DdZonoPlan {
@@ -246,8 +298,6 @@ pub struct DdZonoPlan {
     /// [`certified_box`]. Required: the engine's f32 box is 2 f32 ULPs wide on
     /// every "fixed" pixel, which this method cannot afford to carry.
     exact: certified_box::ExactBox,
-    /// See [`DdZonoConfig::declared_point_exact`]. MEASUREMENT ONLY.
-    declared_point_exact: bool,
 }
 
 impl DdZonoPlan {
@@ -268,6 +318,13 @@ impl DdZonoPlan {
         input: &BoundedTensor,
         cfg: &DdZonoConfig,
     ) -> Option<DdZonoPlan> {
+        if !f64_environment_qualified_for_rayon() {
+            decline(
+                "binary64 environment is not round-to-nearest with gradual underflow \
+                 on the caller and every Rayon worker",
+            );
+            return None;
+        }
         // The double-double EFTs must have survived the compiler. A silent
         // degradation to f64 would publish a bound that is too TIGHT.
         if !ny_core::dd_selfcheck::dd_selfcheck_ok() {
@@ -332,15 +389,10 @@ impl DdZonoPlan {
         if verbose() {
             eprintln!(
                 "[dd-zonotope] detect: k={} point_tol={:.3e} max_folded_input_width={:.3e} \
-                 semantics={}",
+                 semantics=exact-decimal (rigorous)",
                 perturbed.len(),
                 cfg.point_tol,
                 max_folded_width,
-                if cfg.declared_point_exact {
-                    "float-point (MEASUREMENT ONLY, weaker than ny's outward f32 box)"
-                } else {
-                    "exact-decimal (rigorous)"
-                }
             );
         }
         // Full op-surface support is required up front: a mid-pass refusal
@@ -365,7 +417,6 @@ impl DdZonoPlan {
             perturbed,
             input_shape: shape,
             exact,
-            declared_point_exact: cfg.declared_point_exact,
         })
     }
 }
@@ -385,8 +436,13 @@ fn input_chw(graph: &GraphNetwork, input: &BoundedTensor) -> Option<Vec<usize>> 
     while shape.len() > 3 && shape[0] == 1 {
         shape.remove(0);
     }
-    if shape.len() == 3 && shape.iter().product::<usize>() == input.len() {
-        return Some(shape);
+    if shape.len() == 3 {
+        let shape_numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dim| product.checked_mul(dim))?;
+        if shape_numel == input.len() {
+            return Some(shape);
+        }
     }
     let order = graph.exec_order().ok()?;
     for name in order {
@@ -435,6 +491,23 @@ pub struct DdZonoMargin {
     pub output_upper: Vec<f32>,
     /// Output element shape.
     pub output_shape: Vec<usize>,
+    /// Per-node certified enclosures produced by this pass, keyed by graph node
+    /// name (`#dd-zono-interm`).
+    ///
+    /// These are the INTERMEDIATE bounds the pass already computes and, until
+    /// now, discarded — `concretize()` was called only to print a width under
+    /// `verbose()`. They are the quantity that drives ReLU relaxation tightness,
+    /// and the measured root-bound gap against alpha-beta-CROWN is a bound
+    /// QUALITY gap, so they are worth keeping.
+    ///
+    /// Each entry is a sound outward-rounded enclosure of that node's value over
+    /// the exact input box, on the same certified footing as `lower`/`upper`.
+    /// Intersecting them into an existing intermediate-bound cache is therefore
+    /// sound (an intersection of two valid enclosures is a valid enclosure, and
+    /// can only tighten). The root coordinator consumes this map only when
+    /// `NY_DD_ZONO_INTERM=1`; with that gate off the map is empty and the
+    /// intermediate-bound path is inert.
+    pub interm: HashMap<String, (Vec<f64>, Vec<f64>)>,
     /// Live generator columns at the output.
     pub n_generators: usize,
     /// Wall time of the pass.
@@ -458,11 +531,14 @@ impl DdZonoMargin {
     /// safety factor.
     #[must_use]
     pub fn lower_with_safety(&self, index: usize, factor: f64) -> f64 {
+        if require_f64_interval_proof_environment().is_err() {
+            return f64::NEG_INFINITY;
+        }
         let (Some(&l), Some(&hw)) = (self.lower.get(index), self.rounding_half_width.get(index))
         else {
             return f64::NEG_INFINITY;
         };
-        if !l.is_finite() || !hw.is_finite() || !factor.is_finite() || factor < 1.0 {
+        if !l.is_finite() || !hw.is_finite() || hw < 0.0 || !factor.is_finite() || factor < 1.0 {
             return f64::NEG_INFINITY;
         }
         next_down_f64(l - (factor - 1.0) * hw)
@@ -470,16 +546,24 @@ impl DdZonoMargin {
 
     #[must_use]
     pub fn precision_ok(&self, ratio: f64) -> bool {
+        if require_f64_interval_proof_environment().is_err() || !ratio.is_finite() || ratio <= 0.0 {
+            return false;
+        }
         self.lower
             .iter()
             .zip(self.upper.iter())
             .zip(self.rounding_half_width.iter())
             .all(|((&l, &u), &hw)| {
-                if !l.is_finite() || !u.is_finite() || !hw.is_finite() || l > u {
+                if !l.is_finite() || !u.is_finite() || !hw.is_finite() || hw < 0.0 || l > u {
                     return false;
                 }
-                let center = 0.5 * (l + u);
-                hw <= ratio * center.abs()
+                // Halve before adding so a finite same-sign interval near
+                // f64::MAX cannot overflow its midpoint. The threshold itself
+                // must remain finite: accepting `hw <= +inf` would disable the
+                // precision gate.
+                let center = 0.5 * l + 0.5 * u;
+                let threshold = ratio * center.abs();
+                center.is_finite() && threshold.is_finite() && hw <= threshold
             })
     }
 }
@@ -498,6 +582,9 @@ pub fn dd_zonotope_margins(
     deadline: Option<Instant>,
 ) -> Result<Option<DdZonoMargin>> {
     let t0 = Instant::now();
+    if !f64_environment_qualified_for_rayon() {
+        return Ok(None);
+    }
     if !ny_core::dd_selfcheck::dd_selfcheck_ok() {
         return Ok(None);
     }
@@ -520,6 +607,13 @@ pub fn dd_zonotope_margins(
         Some(z) => z,
         None => return Ok(None),
     };
+
+    // `#dd-zono-interm` (default OFF). See `DdZonoMargin::interm`. The env
+    // gate now lives in `DdZonoConfig::from_env` (with a preset override via
+    // `with_admission_overrides`), so all callers agree with the config they
+    // were handed.
+    let collect_interm = cfg.collect_interm;
+    let mut interm: HashMap<String, (Vec<f64>, Vec<f64>)> = HashMap::new();
 
     let order = graph.exec_order()?.to_vec();
     // Only the values still needed downstream are kept live.
@@ -611,6 +705,18 @@ pub fn dd_zonotope_margins(
             );
         }
 
+        // #dd-zono-interm: keep this node's certified enclosure. `concretize()`
+        // is the same outward-rounded operation the objective evaluation uses,
+        // so these are sound intermediate bounds, not a diagnostic estimate.
+        // Off by default: the map is O(sum of node widths) and nothing on the
+        // verdict path consumes it yet.
+        if collect_interm {
+            let (lo, up) = out.concretize();
+            if lo.iter().chain(up.iter()).all(|v| v.is_finite()) {
+                interm.insert(name.clone(), (lo, up));
+            }
+        }
+
         // Free every producer whose last consumer is this node.
         live.insert(name.clone(), out);
         retire_dead(&live_names_needed(&order, name, graph), &mut live);
@@ -627,7 +733,10 @@ pub fn dd_zonotope_margins(
         None => return Ok(None),
     };
 
-    let margin = evaluate_objectives(z, objectives, t0.elapsed());
+    let margin = evaluate_objectives(z, objectives, t0.elapsed()).map(|mut m| {
+        m.interm = interm;
+        m
+    });
     Ok(margin)
 }
 
@@ -696,7 +805,7 @@ fn seed(plan: &DdZonoPlan) -> Option<DdZono> {
         // center. `~|x| * 2^-106 ~ 3e-32` at vggnet16 pixel magnitudes — the
         // whole reason a second word is carried; see `certified_box`.
         let mut e_i = e.center_err[i];
-        if !is_gen[i] && !plan.declared_point_exact {
+        if !is_gen[i] {
             // A sub-tolerance coordinate keeps its exact half-width in the
             // INTERVAL channel (sound: an interval over-approximates a `+-w`
             // symbol). For a declared point this term is exactly zero.
@@ -752,12 +861,12 @@ fn step(
             if kernel[1] != plan.in_c {
                 return None;
             }
-            let w: Vec<f64> = conv.kernel.iter().map(|&v| f64::from(v)).collect();
+            let w: Vec<f64> = conv.kernel.iter().map(|&v| f32_to_f64_exact(v)).collect();
             let wabs: Vec<f64> = w.iter().map(|v| v.abs()).collect();
             let bias: Option<Vec<f64>> = conv
                 .bias
                 .as_ref()
-                .map(|b| b.iter().map(|&v| f64::from(v)).collect());
+                .map(|b| b.iter().map(|&v| f32_to_f64_exact(v)).collect());
             let op = AffineOp::Conv {
                 plan,
                 w: &w,
@@ -776,13 +885,13 @@ fn step(
                 .weight
                 .iter()
                 .copied()
-                .map(f64::from)
+                .map(f32_to_f64_exact)
                 .collect::<Vec<f64>>();
             let wabs: Vec<f64> = w.iter().map(|v| v.abs()).collect();
             let bias: Option<Vec<f64>> = lin
                 .bias
                 .as_ref()
-                .map(|b| b.iter().map(|&v| f64::from(v)).collect());
+                .map(|b| b.iter().map(|&v| f32_to_f64_exact(v)).collect());
             let op = AffineOp::Linear {
                 out_features,
                 in_features,
@@ -877,9 +986,17 @@ fn step(
 /// silently produce a wrong `unsat`. The generator cap upstream bounds the
 /// column growth.
 fn add_states(a: &DdZono, b: &DdZono) -> Option<DdZono> {
-    if a.numel() != b.numel() {
+    if !a.has_valid_layout()
+        || !b.has_valid_layout()
+        || a.shape != b.shape
+        || a.numel() != b.numel()
+    {
         return None;
     }
+    // TwoSum-based center addition plus error-channel assembly. A fixed
+    // elementary-op floor covers subnormal EFT residuals that a relative
+    // U_DD term cannot represent.
+    let center_underflow = affine::operation_underflow_floor(64).ok()?;
     let n = a.numel();
     let center: Vec<Dd> = (0..n)
         .map(|i| ny_core::dd::dd_add(a.center[i], b.center[i]))
@@ -891,14 +1008,16 @@ fn add_states(a: &DdZono, b: &DdZono) -> Option<DdZono> {
             err_up(
                 a.ec[i]
                     + b.ec[i]
-                    + ny_core::dd::U_DD * (a.center[i].abs_upper() + b.center[i].abs_upper()),
+                    + ny_core::dd::U_DD * (a.center[i].abs_upper() + b.center[i].abs_upper())
+                    + center_underflow,
             )
         })
         .collect();
     // Columns are carried through unchanged (no arithmetic on them), so the
     // generator error channel simply adds with no new rounding term.
     let eg: Vec<f64> = (0..n).map(|i| err_up(a.eg[i] + b.eg[i])).collect();
-    let mut gens = Vec::with_capacity(a.n_gens() + b.n_gens());
+    let generator_count = a.n_gens().checked_add(b.n_gens())?;
+    let mut gens = Vec::with_capacity(generator_count);
     gens.extend(a.gens.iter().cloned());
     gens.extend(b.gens.iter().cloned());
     Some(DdZono {
@@ -939,6 +1058,9 @@ fn evaluate_objectives(
     objectives: &[Vec<f32>],
     wall: std::time::Duration,
 ) -> Option<DdZonoMargin> {
+    if !z.has_valid_layout() {
+        return None;
+    }
     let n = z.numel();
     let (out_lo, out_hi) = z.concretize();
     if out_lo.iter().chain(out_hi.iter()).any(|v| !v.is_finite()) {
@@ -957,7 +1079,7 @@ fn evaluate_objectives(
         let mut mc = Dd::ZERO;
         let mut s_abs = 0.0_f64;
         for (i, &r) in obj.iter().enumerate() {
-            let r = f64::from(r);
+            let r = f32_to_f64_exact(r);
             if r == 0.0 {
                 continue;
             }
@@ -978,8 +1100,8 @@ fn evaluate_objectives(
             let mut d = 0.0_f64;
             let mut a = 0.0_f64;
             for (i, &r) in obj.iter().enumerate() {
+                let r = f32_to_f64_exact(r);
                 if r != 0.0 {
-                    let r = f64::from(r);
                     d += r * g[i];
                     a += r.abs() * g[i].abs();
                 }
@@ -991,15 +1113,34 @@ fn evaluate_objectives(
         // rounding and the double-double collapse of `mc`.
         let mut me = 0.0_f64;
         for (i, &r) in obj.iter().enumerate() {
+            let r = f32_to_f64_exact(r);
             if r != 0.0 {
-                me += f64::from(r).abs() * (z.ec[i] + z.eg[i]);
+                me += r.abs() * (z.ec[i] + z.eg[i]);
             }
         }
-        let nnz = obj.iter().filter(|v| **v != 0.0).count().max(1);
+        let nnz = obj
+            .iter()
+            .filter(|value| value.to_bits() & 0x7fff_ffff != 0)
+            .count()
+            .max(1);
+        let dd_gamma_terms = nnz.checked_mul(2)?.checked_add(2)?;
+        let f64_gamma_terms = nnz.checked_add(1)?;
+        // Final objective evaluation repeats the same two-dd_fma center dot,
+        // every live plain-f64 generator dot, magnitude reductions, transported
+        // error reduction, and endpoint assembly. Charge both conservative
+        // affine operation budgets so subnormal loss cannot disappear from
+        // either the margin or the self-policing rounding channel.
+        let (center_operations, generator_operations) =
+            affine::affine_underflow_operation_counts(nnz, z.n_gens()).ok()?;
+        let objective_operations = center_operations
+            .checked_add(generator_operations)?
+            .checked_add(64)?;
+        let underflow_floor = affine::operation_underflow_floor(objective_operations).ok()?;
         let me = err_up(
-            me + ny_core::dd::gamma_n_dd(2 * nnz + 2) * s_abs
+            me + ny_core::dd::gamma_n_dd(dd_gamma_terms) * s_abs
                 + 2.0 * U_F64 * mc.abs_upper()
-                + ny_core::dd::gamma_n_f64(nnz + 1) * g_abs,
+                + ny_core::dd::gamma_n_f64(f64_gamma_terms) * g_abs
+                + underflow_floor,
         );
         let mg = err_up(mg);
         let c = mc.to_f64();
@@ -1017,9 +1158,11 @@ fn evaluate_objectives(
         upper,
         rounding_half_width: rounding,
         relax_half_width: relax,
-        output_lower: out_lo.iter().map(|&v| next_down_f32(v as f32)).collect(),
-        output_upper: out_hi.iter().map(|&v| next_up_f32(v as f32)).collect(),
+        output_lower: out_lo.iter().map(|&v| f64_to_f32_down(v)).collect(),
+        output_upper: out_hi.iter().map(|&v| f64_to_f32_up(v)).collect(),
         output_shape: z.shape.clone(),
+        // Filled by the caller, which owns the per-node walk.
+        interm: HashMap::new(),
         n_generators: z.n_gens(),
         wall,
     })

@@ -273,7 +273,10 @@ fn gate_on_verdict_bound_is_cpu_sound_not_gpu() -> Result<()> {
 /// `crown_backward_gpu` is poisoned (must never decide a verdict under the gate),
 /// while `crown_backward_gpu_sound` returns a supplied SOUND bound and counts its
 /// own calls. Mirrors `WgpuDevice`, which provides a certified GPU-resident
-/// sound backward.
+/// sound backward. `with_deadline_support()` additionally mirrors the
+/// charged-Metal/WgpuDevice cooperative-cancellation claim
+/// (`honors_crown_backward_deadline == true`); without it the engine models the
+/// CUDA shape, whose global deadline claim is deliberately narrow.
 struct SoundGpuCrownEngine {
     sound_lower: Vec<f32>,
     sound_upper: Vec<f32>,
@@ -281,6 +284,40 @@ struct SoundGpuCrownEngine {
     poisoned_upper: Vec<f32>,
     unsound_calls: AtomicUsize,
     sound_calls: AtomicUsize,
+    honors_deadline: bool,
+    deadline_writes: std::sync::Mutex<Vec<Option<std::time::Instant>>>,
+}
+
+impl SoundGpuCrownEngine {
+    fn new(
+        sound_lower: Vec<f32>,
+        sound_upper: Vec<f32>,
+        poisoned_lower: Vec<f32>,
+        poisoned_upper: Vec<f32>,
+    ) -> Self {
+        Self {
+            sound_lower,
+            sound_upper,
+            poisoned_lower,
+            poisoned_upper,
+            unsound_calls: AtomicUsize::new(0),
+            sound_calls: AtomicUsize::new(0),
+            honors_deadline: false,
+            deadline_writes: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_deadline_support(mut self) -> Self {
+        self.honors_deadline = true;
+        self
+    }
+
+    fn deadline_writes(&self) -> Vec<Option<std::time::Instant>> {
+        self.deadline_writes
+            .lock()
+            .expect("deadline_writes mutex should not be poisoned")
+            .clone()
+    }
 }
 
 impl GemmEngine for SoundGpuCrownEngine {
@@ -324,6 +361,15 @@ impl GpuCrownBackward for SoundGpuCrownEngine {
     fn provides_sound_gpu_crown(&self) -> bool {
         true
     }
+    fn honors_crown_backward_deadline(&self) -> bool {
+        self.honors_deadline
+    }
+    fn set_crown_backward_deadline(&self, deadline: Option<std::time::Instant>) {
+        self.deadline_writes
+            .lock()
+            .expect("deadline_writes mutex should not be poisoned")
+            .push(deadline);
+    }
 }
 
 /// THE NEW PATH. With soundness required AND an engine that advertises a sound
@@ -351,14 +397,7 @@ fn gate_on_sound_gpu_path_decides_verdict() -> Result<()> {
     // result would be wrong — so reaching the right (CPU-equal) bound proves the
     // SOUND method decided it.
     let (p_lower, p_upper) = poisoned_tighter_than_cpu(&cpu_sound);
-    let gpu = SoundGpuCrownEngine {
-        sound_lower: sound_lower.clone(),
-        sound_upper: sound_upper.clone(),
-        poisoned_lower: p_lower,
-        poisoned_upper: p_upper,
-        unsound_calls: AtomicUsize::new(0),
-        sound_calls: AtomicUsize::new(0),
-    };
+    let gpu = SoundGpuCrownEngine::new(sound_lower.clone(), sound_upper.clone(), p_lower, p_upper);
 
     set_sound_gpu_crown_required(true);
     let out = crown_verdict_with_engine(&network, &input, &layer_bounds, &gpu)?;
@@ -382,6 +421,134 @@ fn gate_on_sound_gpu_path_decides_verdict() -> Result<()> {
         assert!(
             (out.upper().as_slice().unwrap()[i] - sound_upper[i]).abs() < 1e-4,
             "gated upper[{i}] must come from the sound GPU bound"
+        );
+    }
+    Ok(())
+}
+
+/// #charged-metal-engagement (deadline-route decision). Under FINITE authority
+/// the sequential GPU fast-path may now be decided by an ALREADY-MATERIALIZED
+/// SOUND backend that honors cooperative cancellation — the charged-Metal /
+/// `WgpuDevice` capability shape. The route consults no lazy factory under a
+/// deadline (`select_lazy_backend_for_deadline`), the exact backend receives a
+/// scoped cooperative lease (installed then cleared), and the verdict equals
+/// the certified sound bound, never the poisoned unsound one.
+#[test]
+fn finite_deadline_dispatches_materialized_sound_cooperative_backend() -> Result<()> {
+    let _g = lock_gate();
+    let (network, input) = build_linear_relu_network()?;
+    assert!(network.is_gpu_crown_eligible());
+
+    let cpu_engine = NaiveCpuGemmEngine;
+    let layer_bounds = network.collect_crown_ibp_bounds_with_engine_and_deadline(
+        &input,
+        Some(&cpu_engine),
+        None,
+    )?;
+    let cpu_sound = crown_verdict_with_engine(&network, &input, &layer_bounds, &cpu_engine)?;
+    let sound_lower: Vec<f32> = cpu_sound.lower().iter().copied().collect();
+    let sound_upper: Vec<f32> = cpu_sound.upper().iter().copied().collect();
+    let (p_lower, p_upper) = poisoned_tighter_than_cpu(&cpu_sound);
+    let gpu = SoundGpuCrownEngine::new(sound_lower.clone(), sound_upper.clone(), p_lower, p_upper)
+        .with_deadline_support();
+
+    set_sound_gpu_crown_required(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let out = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        Some(&gpu),
+        Some(deadline),
+        None,
+    )?;
+
+    assert_eq!(
+        gpu.sound_calls.load(Ordering::SeqCst),
+        1,
+        "finite authority must dispatch the SOUND GPU backward exactly once when the \
+         backend is materialized and cooperative"
+    );
+    assert_eq!(
+        gpu.unsound_calls.load(Ordering::SeqCst),
+        0,
+        "the unsound GPU backward must NEVER decide a gated verdict, deadline or not"
+    );
+    assert_eq!(
+        gpu.deadline_writes(),
+        vec![Some(deadline), None],
+        "the exact-backend cooperative lease must be installed for the dispatch and \
+         cleared afterwards"
+    );
+    for i in 0..out.len() {
+        assert!(
+            (out.lower().as_slice().unwrap()[i] - sound_lower[i]).abs() < 1e-4,
+            "deadline-admitted lower[{i}] must come from the sound GPU bound"
+        );
+        assert!(
+            (out.upper().as_slice().unwrap()[i] - sound_upper[i]).abs() < 1e-4,
+            "deadline-admitted upper[{i}] must come from the sound GPU bound"
+        );
+    }
+    Ok(())
+}
+
+/// Byte-identity pin for the CUDA capability shape (#charged-metal-engagement):
+/// a SOUND backend that leaves the cooperative-deadline capability at its
+/// default (`honors_crown_backward_deadline == false` — CUDA's global claim is
+/// deliberately narrow) must be refused under finite authority exactly as the
+/// pre-engagement blanket skip refused it: no GPU method is consulted, no
+/// device lease is installed, and the deadline-aware CPU loop decides the same
+/// sound bound.
+#[test]
+fn finite_deadline_refuses_sound_backend_without_cooperative_cancellation() -> Result<()> {
+    let _g = lock_gate();
+    let (network, input) = build_linear_relu_network()?;
+
+    let cpu_engine = NaiveCpuGemmEngine;
+    let layer_bounds = network.collect_crown_ibp_bounds_with_engine_and_deadline(
+        &input,
+        Some(&cpu_engine),
+        None,
+    )?;
+    let cpu_sound = crown_verdict_with_engine(&network, &input, &layer_bounds, &cpu_engine)?;
+    let (p_lower, p_upper) = poisoned_tighter_than_cpu(&cpu_sound);
+    let gpu = SoundGpuCrownEngine::new(
+        cpu_sound.lower().iter().copied().collect(),
+        cpu_sound.upper().iter().copied().collect(),
+        p_lower,
+        p_upper,
+    );
+
+    set_sound_gpu_crown_required(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let out = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        Some(&gpu),
+        Some(deadline),
+        None,
+    )?;
+
+    assert_eq!(
+        gpu.sound_calls.load(Ordering::SeqCst),
+        0,
+        "a noncooperative sound backend must not be dispatched under finite authority"
+    );
+    assert_eq!(gpu.unsound_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        gpu.deadline_writes().is_empty(),
+        "a refused backend must never receive a device lease"
+    );
+    for i in 0..out.len() {
+        assert!(
+            (out.lower().as_slice().unwrap()[i] - cpu_sound.lower().as_slice().unwrap()[i]).abs()
+                < 1e-5,
+            "refusal must leave the deadline-aware CPU sound bound deciding lower[{i}]"
+        );
+        assert!(
+            (out.upper().as_slice().unwrap()[i] - cpu_sound.upper().as_slice().unwrap()[i]).abs()
+                < 1e-5,
+            "refusal must leave the deadline-aware CPU sound bound deciding upper[{i}]"
         );
     }
     Ok(())

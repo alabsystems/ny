@@ -522,40 +522,123 @@ fn test_dense_spec_batched_mul_binary_alphas_two_domains_match_independent_calls
 
 #[test]
 fn test_dense_spec_batched_capture_matches_direct_cache_4403() {
+    fn assert_array_close_4403<D: ndarray::Dimension>(
+        node_name: &str,
+        field: &str,
+        actual: &ndarray::Array<f32, D>,
+        expected: &ndarray::Array<f32, D>,
+    ) {
+        assert_eq!(
+            actual.shape(),
+            expected.shape(),
+            "{node_name}: {field} shape changed"
+        );
+
+        // The direct and domain-batched graph coordinators publish directed
+        // endpoints and discharge certified coefficient error at different
+        // boundaries. The underlying layer dispatch is bit-identical (checked
+        // below), but those graph-level publication points can accumulate a few
+        // binary32 ULPs across this five-node backward chain. Use a local-scale
+        // ULP budget rather than a magnitude-independent decimal tolerance.
+        //
+        // The unit-scale floor also handles cancellation near zero: endpoint
+        // error is governed by the scale of the accumulated terms, not by the
+        // tiny residual alone. Sixteen ULPs is deliberately small enough to
+        // catch a changed relaxation or dropped error term while covering the
+        // observed directed-publication depth (currently at most nine ULPs).
+        const MAX_ULPS: f32 = 16.0;
+        for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            if actual.to_bits() == expected.to_bits() {
+                continue;
+            }
+            assert!(
+                actual.is_finite() && expected.is_finite(),
+                "{node_name}: {field}[{index}] non-finite mismatch: \
+                 actual={actual}, expected={expected}"
+            );
+            let scale = actual.abs().max(expected.abs()).max(1.0);
+            let next = f32::from_bits(scale.to_bits() + 1);
+            let ulp = if next.is_finite() {
+                next - scale
+            } else {
+                scale - f32::from_bits(scale.to_bits() - 1)
+            };
+            let tolerance = MAX_ULPS * ulp;
+            let difference = (actual - expected).abs();
+            assert!(
+                difference <= tolerance,
+                "{node_name}: {field}[{index}] differs by {difference}: \
+                 actual={actual}, expected={expected}, tolerance={tolerance} \
+                 ({MAX_ULPS} ULPs at scale {scale})"
+            );
+        }
+    }
+
     fn assert_node_linear_bounds_match_4403(
         node_name: &str,
         actual: &LinearBounds,
         expected: &LinearBounds,
     ) {
-        let tol = 1e-6_f32;
-        let max_diff_lower_a = (actual.lower_a().to_owned() - expected.lower_a())
-            .mapv(f32::abs)
-            .fold(0.0_f32, |a, &b| a.max(b));
-        assert!(
-            max_diff_lower_a <= tol,
-            "{node_name}: lower_a max diff {max_diff_lower_a} exceeds tolerance {tol}"
+        assert_array_close_4403(node_name, "lower_a", actual.lower_a(), expected.lower_a());
+        assert_array_close_4403(node_name, "lower_b", actual.lower_b(), expected.lower_b());
+        assert_array_close_4403(node_name, "upper_a", actual.upper_a(), expected.upper_a());
+        assert_array_close_4403(node_name, "upper_b", actual.upper_b(), expected.upper_b());
+    }
+
+    fn assert_array_bits_equal_4403<D: ndarray::Dimension>(
+        label: &str,
+        actual: &ndarray::Array<f32, D>,
+        expected: &ndarray::Array<f32, D>,
+    ) {
+        assert_eq!(actual.shape(), expected.shape(), "{label}: shape changed");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{label}[{index}] bit mismatch: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    fn assert_node_linear_bounds_bits_equal_4403(
+        node_name: &str,
+        actual: &LinearBounds,
+        expected: &LinearBounds,
+    ) {
+        assert_array_bits_equal_4403(
+            &format!("{node_name} lower_a"),
+            actual.lower_a(),
+            expected.lower_a(),
         );
-        let max_diff_lower_b = (actual.lower_b().to_owned() - expected.lower_b())
-            .mapv(f32::abs)
-            .fold(0.0_f32, |a, &b| a.max(b));
-        assert!(
-            max_diff_lower_b <= tol,
-            "{node_name}: lower_b max diff {max_diff_lower_b} exceeds tolerance {tol}"
+        assert_array_bits_equal_4403(
+            &format!("{node_name} lower_b"),
+            actual.lower_b(),
+            expected.lower_b(),
         );
-        let max_diff_upper_a = (actual.upper_a().to_owned() - expected.upper_a())
-            .mapv(f32::abs)
-            .fold(0.0_f32, |a, &b| a.max(b));
-        assert!(
-            max_diff_upper_a <= tol,
-            "{node_name}: upper_a max diff {max_diff_upper_a} exceeds tolerance {tol}"
+        assert_array_bits_equal_4403(
+            &format!("{node_name} upper_a"),
+            actual.upper_a(),
+            expected.upper_a(),
         );
-        let max_diff_upper_b = (actual.upper_b().to_owned() - expected.upper_b())
-            .mapv(f32::abs)
-            .fold(0.0_f32, |a, &b| a.max(b));
-        assert!(
-            max_diff_upper_b <= tol,
-            "{node_name}: upper_b max diff {max_diff_upper_b} exceeds tolerance {tol}"
+        assert_array_bits_equal_4403(
+            &format!("{node_name} upper_b"),
+            actual.upper_b(),
+            expected.upper_b(),
         );
+        match (actual.lower_a_err(), expected.lower_a_err()) {
+            (Some(actual), Some(expected)) => {
+                assert_array_bits_equal_4403(&format!("{node_name} lower_a_err"), actual, expected)
+            }
+            (None, None) => {}
+            _ => panic!("{node_name}: lower_a_err availability changed"),
+        }
+        match (actual.upper_a_err(), expected.upper_a_err()) {
+            (Some(actual), Some(expected)) => {
+                assert_array_bits_equal_4403(&format!("{node_name} upper_a_err"), actual, expected)
+            }
+            (None, None) => {}
+            _ => panic!("{node_name}: upper_a_err availability changed"),
+        }
     }
 
     let graph = build_multi_objective_child_parity_graph();
@@ -576,12 +659,12 @@ fn test_dense_spec_batched_capture_matches_direct_cache_4403() {
 
     // Pin every path in this test — direct cache, direct final-linear, the batched
     // standard/capture passes, and the layer-level scalar/batched dispatch — to the
-    // SAME f32 GEMM engine. The direct path otherwise defaults (engine = None) to
-    // f64 CPU accumulation while the batched/engine paths use f32 GEMM; both are
-    // sound (each carries its accumulation-appropriate certified error, 5de589a) but
-    // they legitimately differ by the f32-vs-f64 certified error (~1 ULP/coeff,
-    // depth-amplified to ~1e-6 in the bias). With a shared engine the cached lA and
-    // final input linear bounds match bit-exactly — a stronger check than a tolerance.
+    // SAME f32 GEMM engine. This removes backend-specific coefficient differences.
+    // The complete graph paths are not bit-identical, however: their coordinators
+    // discharge certified coefficient errors and publish directed f32 bias endpoints
+    // at different boundaries. The comparison above therefore uses a small,
+    // scale-aware ULP budget; the final scalar/batched Linear dispatch isolates and
+    // checks the underlying layer implementation separately.
     let engine = NaiveCpuGemmEngine;
 
     let (_direct_bounds, direct_cache_opt) = graph
@@ -706,7 +789,7 @@ fn test_dense_spec_batched_capture_matches_direct_cache_4403() {
         1,
         "single-domain linear1 batched dispatch should return one result"
     );
-    assert_node_linear_bounds_match_4403(
+    assert_node_linear_bounds_bits_equal_4403(
         "linear1->_input dispatch",
         &batched_input_linear_from_linear1[0],
         &scalar_input_linear,

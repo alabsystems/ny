@@ -1,0 +1,62 @@
+# Interleaved A/B resolving the ONE genuinely disputed ledger row of the
+# verify/wave-da5c7cd3 merge.
+#
+# THE DISPUTE. reports/measured/cora_2024.csv row `cifar10-set.onnx /
+# cifar10-img398.vnnlib` (official budget 30s):
+#   main   banked `unsat@14s`  run_id cora-row174-clean86eb-r1-20260731T064355Z
+#   branch banked `timeout`    run_id l1audit-20260804-d1282d23, 3 repeats +
+#                              a high-contention recheck, all timeout
+# Both sides MEASURED it, so this is not additive and could not be unioned.
+#
+# THE EXPERIMENT. Both binaries built --release --features cuda,mip with their
+# own CARGO_TARGET_DIR, each driven through `ny vnncomp v1 --configs-dir
+# <its own>/configs` with absolute paths (preset=1 confirms `Loading preset:`
+# fired on every single run). Arms are INTERLEAVED, not blocked, so drifting
+# GPU/host contention cannot be attributed to a binary; loadavg is recorded but
+# is NOT treated as evidence of GPU quiet.
+#   main  = 4c066b28 (merge parent 1)          -> <home>/ny-mainctl-target
+#   merge = 5fbaed4c (this merge commit)       -> <home>/ny-mergewave-target
+#
+# RESULT. 6 attempts per arm across two sessions at loadavg 5.6-42.5:
+#   disputed row  : timeout 6/6 on main, timeout 6/6 on merge  -> NO arm effect
+#   control row   : unknown 6/6 on main, unknown 6/6 on merge  -> NO arm effect
+#
+# CONCLUSIONS.
+# 1. The branch's downgrade of the disputed row is CORRECT and the ledger keeps
+#    `timeout`. main's own banked `unsat@14s` no longer reproduces AT MAIN, so
+#    this is a main-side capability loss that predates the merge, not something
+#    the merge caused.
+# 2. The control (`mnist-set / mnist-img0`, banked `unsat@7.66s` by the branch
+#    audit at d1282d23) now returns `unknown` on BOTH arms -- "Numerical
+#    instability: BoundedTensor::new: lower bounds contain NaN or Inf" out of the
+#    spec-guided multi-objective CROWN path. That is an INHERITED main-side
+#    regression: it reproduces identically without the merge. It is reported,
+#    NOT silently repaired here, and it means further cora_2024 rows banked at
+#    d1282d23 are stale at today's main. Re-sweeping cora is a separate audit.
+# 3. Because the control is itself failing, neither arm's result on the disputed
+#    row could be read alone; the A/B is what makes the reading sound.
+session,arm,commit,row,onnx,vnnlib,budget_s,attempt,verdict,rc,wall_s,loadavg,preset_loaded
+1,main,4c066b28,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,1,timeout,0,27.96,9.50,yes
+1,merge,5fbaed4c,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,1,timeout,0,27.91,10.22,yes
+1,main,4c066b28,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,1,unknown,0,25.83,9.11,yes
+1,merge,5fbaed4c,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,1,unknown,0,25.83,8.33,yes
+1,main,4c066b28,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,2,timeout,0,27.88,7.92,yes
+1,merge,5fbaed4c,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,2,timeout,0,27.90,7.65,yes
+1,main,4c066b28,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,2,unknown,0,25.83,7.01,yes
+1,merge,5fbaed4c,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,2,unknown,0,25.81,6.44,yes
+1,main,4c066b28,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,3,timeout,0,27.80,5.65,yes
+1,merge,5fbaed4c,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,3,timeout,0,27.78,9.50,yes
+1,main,4c066b28,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,3,unknown,0,25.77,8.84,yes
+1,merge,5fbaed4c,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,3,unknown,0,25.82,12.11,yes
+2,main,4c066b28,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,1,timeout,0,27.79,15.14,yes
+2,merge,5fbaed4c,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,1,timeout,0,27.98,17.98,yes
+2,main,4c066b28,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,1,unknown,0,26.03,25.45,yes
+2,merge,5fbaed4c,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,1,unknown,0,25.91,34.17,yes
+2,main,4c066b28,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,2,timeout,0,28.65,35.15,yes
+2,merge,5fbaed4c,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,2,timeout,0,28.27,42.53,yes
+2,main,4c066b28,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,2,unknown,0,25.76,42.12,yes
+2,merge,5fbaed4c,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,2,unknown,0,25.94,32.17,yes
+2,main,4c066b28,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,3,timeout,0,27.87,27.59,yes
+2,merge,5fbaed4c,disputed,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,30,3,timeout,0,27.79,27.53,yes
+2,main,4c066b28,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,3,unknown,0,25.78,27.02,yes
+2,merge,5fbaed4c,control,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,30,3,unknown,0,25.75,26.48,yes

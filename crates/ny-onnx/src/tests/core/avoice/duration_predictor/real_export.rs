@@ -66,8 +66,9 @@ fn real_duration_predictor_input(model: &OnnxModel, epsilon: f32) -> BoundedTens
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_real_duration_predictor_graph_ibp_positive_expected_duration_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_duration_predictor.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_duration_predictor.onnx");
     let (model, graph) = load_real_duration_predictor_graph();
 
     assert_eq!(model.network.inputs.len(), 1, "single activation input");
@@ -112,8 +113,9 @@ fn test_real_duration_predictor_graph_ibp_positive_expected_duration_3497() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_real_duration_predictor_crown_no_looser_than_ibp_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_duration_predictor.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_duration_predictor.onnx");
     let (model, graph) = load_real_duration_predictor_graph();
     let input = real_duration_predictor_input(&model, KOKORO_REAL_DURATION_EPSILON);
 
@@ -159,8 +161,9 @@ fn test_real_duration_predictor_crown_no_looser_than_ibp_3497() {
 /// - designs/2026-03-11-avoice-phase1-onnx-execution.md (section 4)
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_real_duration_predictor_epsilon_sensitivity_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_duration_predictor.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_duration_predictor.onnx");
     let (model, graph) = load_real_duration_predictor_graph();
     let max_width = kokoro_duration_fixture_contract().duration_bin_count as f32;
     let mut found_nontrivial = false;
@@ -209,8 +212,9 @@ fn test_real_duration_predictor_epsilon_sensitivity_3497() {
 /// - reports/research/issue-3497-monotonicity-current.md (BiLSTM tightening)
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_real_duration_predictor_crown_tightens_at_nontrivial_epsilon_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_duration_predictor.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_duration_predictor.onnx");
     let (model, graph) = load_real_duration_predictor_graph();
     let max_width = kokoro_duration_fixture_contract().duration_bin_count as f32;
 

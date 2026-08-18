@@ -2,6 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+// Inherent kernels remain exercised by crate-internal `gpu-tests`; the public
+// `GemmEngine` implementation below deliberately fails closed.
+#![allow(dead_code)]
+
 use ny_core::{ConvTranspose2dParams, GemmEngine, GpuCrownBackward, NyError, Result};
 
 use super::super::WgpuDevice;
@@ -15,14 +19,49 @@ use crate::wgpu_device::params::GemmParams;
 /// per buffer is `WGPU_MAX_BINDING_BYTES / 1.2 / sizeof(f32)`.
 ///
 /// Reference: `crown_backward.rs` uses the same constant for spec batching.
-pub(super) const WGPU_MAX_BINDING_BYTES: usize = 134_217_728;
+/// `pub(crate)`: the FL value tier (`crate::fl_value_gemm`) derives its
+/// row-chunk budget from this same constant (#fl-value-gpu-tier).
+pub(crate) const WGPU_MAX_BINDING_BYTES: usize = 134_217_728;
 
 /// Maximum f32 elements per buffer that will fit within the binding limit
 /// after the BufferPool 1.2× growth factor.
 ///
 /// `128 MB / 1.2 / 4 = 128 MB × 5/6 / 4 = 27,962,026` f32 elements.
 /// (1/1.2 = 5/6 exactly, so this is precise integer arithmetic.)
-pub(super) const MAX_BINDING_ELEMS: usize = WGPU_MAX_BINDING_BYTES * 5 / 6 / size_of::<f32>();
+/// `pub(crate)`: shared with `crate::fl_value_gemm` (#fl-value-gpu-tier).
+pub(crate) const MAX_BINDING_ELEMS: usize = WGPU_MAX_BINDING_BYTES * 5 / 6 / size_of::<f32>();
+
+impl WgpuDevice {
+    /// Max f32 elements per storage binding, from the LIVE device limits
+    /// (#hard-caps, 2026-08-06).
+    ///
+    /// [`MAX_BINDING_ELEMS`] is derived from a hard-coded 128 MiB, which is
+    /// wgpu's *default* `max_storage_buffer_binding_size`. But `WgpuDevice::new`
+    /// requests the ADAPTER's real limits by default (`NY_GPU_BIG_BINDINGS`,
+    /// which is on unless explicitly set to `0`), and `device.rs` states the
+    /// intent outright: "Buffer-fit gates elsewhere read `device.limits()` live."
+    /// This gate did not, so it refused work the device could do.
+    ///
+    /// Measured on an Apple M4 Pro, 2026-08-06: the granted binding size is
+    /// **4095 MiB** and `max_buffer_size` is 13639 MiB, against the constant's
+    /// 128 MiB — a 32x under-estimate. The conv-CROWN speedup sweep hit exactly
+    /// that wall: 15.52x at the largest shape that ran, then a refusal at the
+    /// next size up, on the very path all four scoreboard deficits share.
+    ///
+    /// Falls back to the constant when the granted limit is smaller (a device
+    /// with tighter limits than wgpu's default), so this can only ever RAISE the
+    /// ceiling relative to today, never lower it.
+    pub(crate) fn max_binding_elems_live(&self) -> usize {
+        let granted = self.device.limits().max_storage_buffer_binding_size as usize;
+        let live = granted * 5 / 6 / size_of::<f32>();
+        live.max(MAX_BINDING_ELEMS)
+    }
+
+    /// Byte twin of [`Self::max_binding_elems_live`], for diagnostics.
+    pub(crate) fn max_binding_bytes_live(&self) -> usize {
+        (self.device.limits().max_storage_buffer_binding_size as usize).max(WGPU_MAX_BINDING_BYTES)
+    }
+}
 
 /// Output tile dimension for the GEMM shaders (= workgroup_size per dimension).
 ///
@@ -61,6 +100,52 @@ pub(super) const SMALL_K_ROWS_PER_THREAD: usize = 4;
 /// We use the larger limit since `gemm_f32` selects the shader at dispatch time.
 /// Without this cap, large workloads cause a wgpu validation panic. See #3603.
 const MAX_M_FOR_DISPATCH: usize = 65535 * GEMM_TILE_DIM * SMALL_K_ROWS_PER_THREAD;
+
+#[derive(Clone, Copy)]
+struct CheckedGemmLengths {
+    lhs: usize,
+    rhs: usize,
+    output: usize,
+    rhs_bytes: usize,
+    output_bytes: usize,
+}
+
+fn checked_gemm_lengths(m: usize, k: usize, n: usize) -> Result<CheckedGemmLengths> {
+    let overflow = |product: &str| {
+        NyError::InvalidSpec(format!(
+            "wgpu gemm_f32: {product} overflows usize for shape {m}x{k}x{n}"
+        ))
+    };
+    let lhs = m.checked_mul(k).ok_or_else(|| overflow("m*k"))?;
+    let rhs = k.checked_mul(n).ok_or_else(|| overflow("k*n"))?;
+    let output = m.checked_mul(n).ok_or_else(|| overflow("m*n"))?;
+    let rhs_bytes = rhs
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| overflow("k*n*sizeof(f32)"))?;
+    let output_bytes = output
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| overflow("m*n*sizeof(f32)"))?;
+    Ok(CheckedGemmLengths {
+        lhs,
+        rhs,
+        output,
+        rhs_bytes,
+        output_bytes,
+    })
+}
+
+fn allocate_host_gemm_output(shape: CheckedGemmLengths) -> Result<Vec<f32>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(shape.output)
+        .map_err(|_| NyError::CpuMemoryExceeded {
+            required_bytes: shape.output_bytes,
+            budget_bytes: usize::MAX,
+            site: "ny-gpu::wgpu::gemm_f32/output",
+        })?;
+    output.resize(shape.output, 0.0);
+    Ok(output)
+}
 
 /// GEMM dispatch parameters computed from matrix dimensions.
 ///
@@ -120,22 +205,23 @@ impl WgpuDevice {
         a: &[f32],
         b: &[f32],
     ) -> Result<Vec<f32>> {
-        if m == 0 || k == 0 || n == 0 {
-            return Ok(vec![]);
-        }
-        if a.len() != m * k {
+        let shape = checked_gemm_lengths(m, k, n)?;
+        if a.len() != shape.lhs {
             return Err(NyError::shape_mismatch(vec![m, k], vec![a.len()]));
         }
-        if b.len() != k * n {
+        if b.len() != shape.rhs {
             return Err(NyError::shape_mismatch(vec![k, n], vec![b.len()]));
+        }
+        if m == 0 || k == 0 || n == 0 {
+            return allocate_host_gemm_output(shape);
         }
 
         // Check if any buffer exceeds the wgpu binding limit after 1.2× growth.
         // B matrix (k×n) cannot be split, so if it alone exceeds the limit,
         // return an error to let the caller fall back to CPU.
-        if k * n > MAX_BINDING_ELEMS {
+        if shape.rhs > MAX_BINDING_ELEMS {
             return Err(NyError::GpuMemoryExceeded {
-                required_bytes: k * n * size_of::<f32>(),
+                required_bytes: shape.rhs_bytes,
                 budget_bytes: WGPU_MAX_BINDING_BYTES,
             });
         }
@@ -196,7 +282,8 @@ impl WgpuDevice {
             )));
         }
 
-        let out_elems = m * n;
+        let shape = checked_gemm_lengths(m, k, n)?;
+        let out_elems = shape.output;
         let params = GemmParams {
             m: m_u32,
             k: k_u32,
@@ -306,7 +393,12 @@ impl WgpuDevice {
             compute_pass.dispatch_workgroups(dispatch.wg_x, dispatch.wg_y, 1);
         }
 
-        let out_bytes = (out_elems * size_of::<f32>()) as u64;
+        let out_bytes = u64::try_from(shape.output_bytes).map_err(|_| {
+            NyError::InvalidSpec(format!(
+                "wgpu gemm_f32: output byte count {} exceeds u64",
+                shape.output_bytes
+            ))
+        })?;
         encoder.copy_buffer_to_buffer(&out_buffer, 0, &staging, 0, out_bytes);
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -329,7 +421,15 @@ impl WgpuDevice {
         b: &[f32],
         batch_m: usize,
     ) -> Result<Vec<f32>> {
-        let mut result = Vec::with_capacity(m * n);
+        let shape = checked_gemm_lengths(m, k, n)?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(shape.output)
+            .map_err(|_| NyError::CpuMemoryExceeded {
+                required_bytes: shape.output_bytes,
+                budget_bytes: usize::MAX,
+                site: "ny-gpu::wgpu::gemm_f32_batched/output",
+            })?;
         let mut row_offset = 0;
 
         while row_offset < m {
@@ -345,47 +445,120 @@ impl WgpuDevice {
     }
 }
 
-/// Implementation of GemmEngine for WgpuDevice to enable GPU-accelerated CROWN.
-impl GemmEngine for WgpuDevice {
+/// Crate-private adapter for numerical diagnostics that deliberately exercise
+/// the raw WGPU GEMM kernel.
+///
+/// `WgpuDevice`'s public [`GemmEngine`] implementation must stay quarantined:
+/// exposing raw GEMM there would let an ordinary device enter verdict-bearing
+/// generic routes.  A few in-crate arithmetic oracles still need the trait's
+/// backend-agnostic certified helpers, so they use this narrowly scoped
+/// adapter instead.  It exposes no GPU proof capability and cannot escape the
+/// private `wgpu_device::ops` module.
+pub(super) struct WgpuDiagnosticGemm<'a> {
+    device: &'a WgpuDevice,
+}
+
+impl<'a> WgpuDiagnosticGemm<'a> {
+    pub(super) const fn new(device: &'a WgpuDevice) -> Self {
+        Self { device }
+    }
+}
+
+impl GemmEngine for WgpuDiagnosticGemm<'_> {
+    fn backend_provenance(&self) -> &'static str {
+        "wgpu-private-diagnostic"
+    }
+
     fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
-        self.gemm_f32(m, k, n, a, b)
+        self.device.gemm_f32(m, k, n, a, b)
+    }
+}
+
+/// Quarantined proof-engine adapter for WGPU.
+///
+/// Crate-internal inherent kernels remain available to GPU diagnostic tests.
+/// The public `GemmEngine` seam fails closed so a caller cannot
+/// inject `WgpuDevice` directly and bypass `ComputeDevice`'s verdict quarantine.
+impl GemmEngine for WgpuDevice {
+    fn backend_provenance(&self) -> &'static str {
+        if self.sound_gpu_authority_cached() {
+            "wgpu-qualified-crown"
+        } else if self.charged_flush_authority_cached().is_some() {
+            // #flush-charge: every ledger row records the charged mode
+            // distinctly from full qualification.
+            "wgpu-qualified-crown-flush-charged"
+        } else {
+            "wgpu-quarantined"
+        }
+    }
+
+    fn gemm_f32(
+        &self,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _a: &[f32],
+        _b: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(NyError::UnsupportedConfiguration(
+            "WGPU GEMM is quarantined from verdict-bearing GemmEngine routes".to_string(),
+        ))
     }
 
     fn conv_transpose_2d(
         &self,
-        a_reshaped: &[f32],
-        weight_col: &[f32],
-        params: &ConvTranspose2dParams,
+        _a_reshaped: &[f32],
+        _weight_col: &[f32],
+        _params: &ConvTranspose2dParams,
     ) -> Result<Vec<f32>> {
-        self.conv_transpose_2d(a_reshaped, weight_col, params)
+        Err(NyError::UnsupportedConfiguration(
+            "WGPU transpose convolution is quarantined from verdict-bearing GemmEngine routes"
+                .to_string(),
+        ))
     }
 
     fn conv_transpose_2d_pair_cached(
         &self,
-        a_lower: &[f32],
-        a_upper: &[f32],
-        weight_col: &std::sync::Arc<[f32]>,
-        params: &ConvTranspose2dParams,
+        _a_lower: &[f32],
+        _a_upper: &[f32],
+        _weight_col: &std::sync::Arc<[f32]>,
+        _params: &ConvTranspose2dParams,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        // GPU-resident plan cache: weight uploaded once, buffers reused, lower
-        // and upper fused into one 2*S dispatch. See ops/conv_transpose_plan.rs.
-        self.conv_transpose_2d_pair_cached(a_lower, a_upper, weight_col, params)
+        Err(NyError::UnsupportedConfiguration(
+            "WGPU cached transpose convolution is quarantined from verdict-bearing GemmEngine \
+             routes"
+                .to_string(),
+        ))
     }
 
+    /// The SECOND authority seam (the router only ever reaches
+    /// `provides_sound_gpu_crown` through this accessor, so both must move
+    /// together or qualification is inconsistent — pinned by the authority
+    /// routing tests.
+    ///
+    /// Decided by the same reviewed source gate, exact request, and cached live
+    /// ladder as `provides_sound_gpu_crown`, never by a backend name alone.
+    /// Failed or uninitialized qualification remains `None`. The public
+    /// `ComputeDevice`/CLI proof router consumes this exact accessor; its raw
+    /// GEMM, IBP, convolution, and DAG accessors remain closed.
     fn as_gpu_crown_backward(&self) -> Option<&dyn GpuCrownBackward> {
-        Some(self)
+        if self.sound_gpu_authority_cached() || self.charged_flush_authority_cached().is_some() {
+            Some(self)
+        } else {
+            None
+        }
     }
 
     fn as_gpu_ibp_forward(&self) -> Option<&dyn ny_core::GpuIbpForward> {
-        Some(self)
+        None
     }
 
     fn as_gpu_ibp_forward_ext(&self) -> Option<&dyn ny_core::GpuIbpForwardExt> {
-        Some(self)
+        None
     }
 
     fn as_gpu_dag_ibp_forward_ext(&self) -> Option<&dyn ny_core::GpuDagIbpForwardExt> {
-        Some(self)
+        None
     }
 }
 
@@ -396,6 +569,21 @@ mod tests {
     // Boundary: M = 65535 * 16 = 1,048,560 is the exact tiled dispatch limit.
     // tiled_wg_y = ceil(1_048_560 / 16) = 65535, which is NOT > 65535 → tiled.
     const M_EXACT_BOUNDARY: u32 = 65535 * 16; // 1,048,560
+
+    #[test]
+    fn checked_gemm_lengths_reject_overflow_without_gpu_state() {
+        let huge = 1usize << (usize::BITS - 1);
+        assert!(checked_gemm_lengths(huge, huge, huge).is_err());
+        assert!(checked_gemm_lengths(usize::MAX / 2, 1, 1).is_err());
+    }
+
+    #[test]
+    fn checked_gemm_lengths_preserve_empty_shape() {
+        let shape = checked_gemm_lengths(usize::MAX, 0, 0).expect("empty shape is representable");
+        assert_eq!(shape.lhs, 0);
+        assert_eq!(shape.rhs, 0);
+        assert_eq!(shape.output, 0);
+    }
 
     #[test]
     fn test_select_gemm_dispatch_small_m_uses_tiled() {

@@ -83,7 +83,7 @@ fn test_round_crown_soundness() {
     ];
 
     for point in &test_points {
-        let round_output: Vec<f32> = point.iter().map(|x| x.round()).collect();
+        let round_output: Vec<f32> = point.iter().map(|x| x.round_ties_even()).collect();
 
         for (j, &round_val) in round_output.iter().enumerate() {
             let lower_bound = result.lower_b[j];
@@ -103,4 +103,34 @@ fn test_round_crown_soundness() {
             );
         }
     }
+}
+
+#[test]
+fn test_round_bounds_enclose_onnx_and_half_away_ties() {
+    let values = [-3.5_f32, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5];
+    let expected_lower = [-4.0_f32, -3.0, -2.0, -1.0, 0.0, 2.0, 2.0, 4.0];
+    let expected_upper = [-4.0_f32, -2.0, -2.0, -0.0, 1.0, 2.0, 3.0, 4.0];
+    let points = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[values.len()]), values.to_vec()).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[values.len()]), values.to_vec()).unwrap(),
+    )
+    .unwrap();
+
+    let result = RoundLayer::new().propagate_ibp(&points).unwrap();
+    assert_eq!(result.lower().as_slice().unwrap(), expected_lower);
+    assert_eq!(result.upper().as_slice().unwrap(), expected_upper);
+    assert!(result.upper().as_slice().unwrap()[3].is_sign_negative());
+    assert!(!result.lower().as_slice().unwrap()[4].is_sign_negative());
+
+    // Every finite f32 at and above 2^23 is already integral; rounding must be
+    // an exact no-op there rather than overflowing an integer conversion.
+    let large = [8_388_608.0_f32, -8_388_608.0, f32::MAX, -f32::MAX];
+    let large_points = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[large.len()]), large.to_vec()).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[large.len()]), large.to_vec()).unwrap(),
+    )
+    .unwrap();
+    let large_result = RoundLayer::new().propagate_ibp(&large_points).unwrap();
+    assert_eq!(large_result.lower().as_slice().unwrap(), large);
+    assert_eq!(large_result.upper().as_slice().unwrap(), large);
 }

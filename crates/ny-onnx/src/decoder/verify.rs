@@ -2,104 +2,45 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! CPU-based compositional decoder block verification.
+//! Fail-closed decoder verification compatibility APIs.
 
 use ny_core::{NyError, Result};
-use tracing::info;
 
 use super::{DecoderModel, DecoderVerificationDetails};
 
+pub(super) fn decoder_verification_unavailable() -> NyError {
+    NyError::UnsupportedConfiguration(
+        "decoder verification is unavailable: the current decoder analysis code has not proven \
+         that its extracted attention topology, projection conventions, masks, normalization \
+         attributes, and cross-attention composition are equivalent to the loaded ONNX graph; \
+         no bounds or verification details were produced"
+            .to_string(),
+    )
+}
+
 impl DecoderModel {
-    /// Compositional verification of a decoder block using IBP.
+    /// Unavailable compositional decoder-block verification surface.
     ///
-    /// Algorithm:
-    /// 1. Bound causal self-attention subgraph with IBP
-    /// 2. Compose with first residual: x_attn = x + attn_delta
-    /// 3. Bound MLP subgraph with IBP
-    /// 4. Compose with second residual: x_out = x_attn + mlp_delta
-    ///
-    /// # Arguments
-    /// * `block_index` - Index of the decoder block
-    /// * `input` - Input bounded tensor [batch, seq, hidden]
-    ///
-    /// # Returns
-    /// (output_bounds, details) with intermediate information.
+    /// Decoder model loading and subgraph inspection remain available. This
+    /// method fails closed until the extracted block is proven equivalent to
+    /// the loaded graph and covered by independent concrete-point tests.
     pub fn verify_block_compositional(
         &self,
-        block_index: usize,
-        input: &ny_tensor::BoundedTensor,
+        _block_index: usize,
+        _input: &ny_tensor::BoundedTensor,
     ) -> Result<(ny_tensor::BoundedTensor, DecoderVerificationDetails)> {
-        // Step 1: Bound causal self-attention subgraph
-        let attn_graph = self.causal_attention_subgraph(block_index)?;
-        let attn_delta = attn_graph.propagate_ibp(input)?;
-
-        // Step 2: Compose with first residual
-        let x_attn = input.add(&attn_delta)?;
-
-        // Step 3: Bound MLP subgraph
-        let mlp_graph = self.mlp_subgraph(block_index)?;
-        let mlp_delta = mlp_graph.propagate_ibp(&x_attn)?;
-
-        // Step 4: Compose with second residual
-        let x_out = x_attn.add(&mlp_delta)?;
-
-        let details = DecoderVerificationDetails {
-            attention_delta_width: attn_delta.max_width(),
-            x_attn_width: x_attn.max_width(),
-            mlp_delta_width: mlp_delta.max_width(),
-            output_width: x_out.max_width(),
-        };
-
-        Ok((x_out, details))
+        Err(decoder_verification_unavailable())
     }
 
-    /// Verify multiple decoder blocks sequentially.
+    /// Unavailable sequential decoder verification surface.
     ///
-    /// # Arguments
-    /// * `input` - Input bounded tensor [batch, seq, hidden]
-    /// * `start_block` - First block to verify (0-indexed)
-    /// * `end_block` - Last block to verify (exclusive)
-    ///
-    /// # Returns
-    /// (output_bounds, details) with per-block information.
+    /// Fails closed without returning bounds or per-block details.
     pub fn verify_sequential(
         &self,
-        input: &ny_tensor::BoundedTensor,
-        start_block: usize,
-        end_block: usize,
+        _input: &ny_tensor::BoundedTensor,
+        _start_block: usize,
+        _end_block: usize,
     ) -> Result<(ny_tensor::BoundedTensor, Vec<DecoderVerificationDetails>)> {
-        if start_block >= end_block {
-            return Err(NyError::InvalidSpec(format!(
-                "Invalid block range: start {} >= end {}",
-                start_block, end_block
-            )));
-        }
-        if end_block > self.num_blocks {
-            return Err(NyError::InvalidSpec(format!(
-                "Block {} out of range (max {})",
-                end_block, self.num_blocks
-            )));
-        }
-
-        let mut current_bounds = input.clone();
-        let mut block_details = Vec::with_capacity(end_block - start_block);
-
-        for block_idx in start_block..end_block {
-            let (block_output, details) =
-                self.verify_block_compositional(block_idx, &current_bounds)?;
-
-            info!(
-                "Decoder block {} output: max_width {:.2e}, attn_delta {:.2e}, mlp_delta {:.2e}",
-                block_idx,
-                details.output_width,
-                details.attention_delta_width,
-                details.mlp_delta_width
-            );
-
-            block_details.push(details);
-            current_bounds = block_output;
-        }
-
-        Ok((current_bounds, block_details))
+        Err(decoder_verification_unavailable())
     }
 }

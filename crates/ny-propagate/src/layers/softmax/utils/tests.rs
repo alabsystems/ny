@@ -122,6 +122,50 @@ fn exp_interval_bounds_rejects_inverted_interval() {
     );
 }
 
+#[test]
+fn exp_interval_bounds_enclose_real_endpoint_rounding_4369() {
+    for x in [-100.0_f32, -1.0, 0.0, 1.0, 80.0, 89.0] {
+        let (lower, upper) = exp_interval_bounds(x, x).expect("valid point interval");
+        let reference = (x as f64).exp();
+        assert!(
+            (lower as f64) <= reference,
+            "lower endpoint {lower:e} exceeds exp({x:e})={reference:e}"
+        );
+        assert!(
+            reference <= upper as f64,
+            "upper endpoint {upper:e} is below exp({x:e})={reference:e}"
+        );
+        assert!(lower >= 0.0);
+        assert!(lower <= upper);
+    }
+
+    let (lower, upper) = exp_interval_bounds(89.0, 89.0).expect("finite overflow point is valid");
+    assert_eq!(lower, f32::MAX);
+    assert_eq!(upper, f32::INFINITY);
+
+    let (_, underflow_upper) =
+        exp_interval_bounds(-100.0, -100.0).expect("finite underflow point is valid");
+    assert!(
+        underflow_upper >= f32::MIN_POSITIVE,
+        "an FTZ-safe upper endpoint must never publish a positive subnormal: {underflow_upper:e}"
+    );
+    assert!((underflow_upper as f64) >= (-100.0_f64).exp());
+}
+
+#[test]
+fn exp_interval_bounds_rejects_nan_and_handles_infinity_4369() {
+    assert!(exp_interval_bounds(f32::NAN, 0.0).is_err());
+    assert!(exp_interval_bounds(0.0, f32::NAN).is_err());
+    assert_eq!(
+        exp_interval_bounds(f32::NEG_INFINITY, f32::NEG_INFINITY).expect("exp(-inf) is defined"),
+        (0.0, 0.0)
+    );
+    assert_eq!(
+        exp_interval_bounds(f32::INFINITY, f32::INFINITY).expect("exp(+inf) is defined"),
+        (f32::INFINITY, f32::INFINITY)
+    );
+}
+
 // ========== softmax_ibp_element_bounds tests ==========
 
 #[test]

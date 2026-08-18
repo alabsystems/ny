@@ -6,9 +6,10 @@ use super::helpers::whisper_tiny_encoder;
 use ny_core::LayerType;
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_encoder_layer_graph_extraction() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let whisper = whisper_tiny_encoder();
 
     // Extract block 0 as a GraphNetwork
@@ -71,9 +72,10 @@ fn test_encoder_layer_graph_extraction() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_encoder_layer_graph_ibp() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // GraphNetwork connectivity for Whisper blocks.
     //
     // This Whisper model uses post-norm architecture (LayerNorm after residual),
@@ -144,9 +146,10 @@ fn test_encoder_layer_graph_ibp() {
 // timer, which exceeds the old 10s budget under parallel suite load. 120s
 // matches the heavy whisper siblings and still guards against hangs.
 #[ntest::timeout(120000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_encoder_sequential_subcomponents() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test that we can at least run IBP through individual sublayers
     use ndarray::ArrayD;
     use ny_propagate::BoundPropagation;
@@ -178,9 +181,10 @@ fn test_encoder_sequential_subcomponents() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_encoder_layer_graph_network_ibp() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test GraphNetwork IBP on a Whisper encoder block
     // This verifies the connectivity fix enables DAG propagation
     use ndarray::ArrayD;
@@ -213,13 +217,14 @@ fn test_encoder_layer_graph_network_ibp() {
 
     assert_eq!(output.shape(), &[batch, seq_len, hidden_dim]);
 
-    // Verify bounds are sound (lower <= upper for all elements)
-    let sound = output
+    // Verify every interval is ordered. This structural invariant alone is not
+    // a soundness proof.
+    let ordered = output
         .lower()
         .iter()
         .zip(output.upper().iter())
         .all(|(l, u)| l <= u);
-    assert!(sound, "Bounds must be sound (lower <= upper)");
+    assert!(ordered, "Bounds must be ordered (lower <= upper)");
 }
 
 // Budget: the block graph extraction works against the dynamo fixture since
@@ -227,34 +232,16 @@ fn test_encoder_layer_graph_network_ibp() {
 // old 10s budget dated from when the test died fast at extraction. 120s
 // matches the heavy whisper siblings and leaves headroom under parallel load.
 #[ntest::timeout(120000)]
+#[cfg(feature = "external-whisper")]
 #[test]
-fn test_encoder_layer_graph_network_crown_limitation() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
-    // LIMITATION: CROWN does not work on full Whisper blocks with N-D batched inputs.
-    //
-    // Root cause: LinearBounds assume flattened tensors where the weight matrix
-    // operates on all elements. But transformer Linear layers operate per-position
-    // (last dimension only), so a [384, 384] weight applied to [1, 4, 384] input
-    // processes each of 4 positions independently.
-    //
-    // CROWN backward propagation through Linear expects:
-    //   new_A = A @ W  where A is [output_dim, layer_output_dim], W is [layer_output_dim, layer_input_dim]
-    //
-    // For full block with [1, 4, 384] = 1536 elements:
-    //   - A starts as identity [1536, 1536]
-    //   - Linear weight is [384, 384] (per-position operation)
-    //   - A @ W would need [1536, 1536] @ [384, 384] → dimension mismatch!
-    //
-    // Solutions:
-    // 1. Implement N-D batched LinearBounds (significant refactor)
-    // 2. Use compositional verification (verify subgraphs, compose bounds)
-    // 3. Use IBP for full blocks (current approach - sound but loose)
-    //
-    // For now, we verify that:
-    // - IBP works and produces sound bounds
-    // - CROWN correctly fails with dimension mismatch (expected behavior)
+fn test_encoder_layer_graph_network_crown_probe() {
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
+    // Regression: the known fixture supports full-block CROWN over N-D batched
+    // inputs. Require successful, ordered, shape-correct bounds; an error or
+    // panic is a failure rather than an accepted diagnostic outcome.
 
     use ndarray::ArrayD;
+    use ny_propagate::types::BoundsProvenance;
     use ny_tensor::BoundedTensor;
 
     let whisper = whisper_tiny_encoder();
@@ -264,13 +251,17 @@ fn test_encoder_layer_graph_network_crown_limitation() {
 
     let hidden_dim = whisper.hidden_dim;
 
-    // Create input tensor with Whisper block input shape [batch, seq, hidden].
+    // Keep the production hidden width and rank-3 batched path, but use one
+    // token. Four tokens make this debug-build regression test spend minutes
+    // materializing full-output CROWN coefficients and exceed its 120s
+    // watchdog on an otherwise healthy checkout.
     let batch = 1;
-    let seq_len = 4;
+    let seq_len = 1;
     let input_data = ArrayD::from_elem(ndarray::IxDyn(&[batch, seq_len, hidden_dim]), 0.0f32);
-    let input = BoundedTensor::from_epsilon(input_data, 0.01).expect("valid test input");
+    let input = BoundedTensor::from_epsilon(input_data.clone(), 0.01).expect("valid test input");
+    let nominal_input = BoundedTensor::from_epsilon(input_data, 0.0).expect("valid nominal input");
 
-    println!("\n=== Testing CROWN Limitation on N-D Batched Transformer Block ===");
+    println!("\n=== Probing CROWN on N-D Batched Transformer Block ===");
     println!("Input shape: {:?}", input.shape());
     println!("Total elements: {} (batch * seq * hidden)", input.len());
 
@@ -280,50 +271,82 @@ fn test_encoder_layer_graph_network_crown_limitation() {
         .expect("Full block IBP should succeed");
     println!("IBP max width: {:.6e}", ibp_output.max_width());
 
-    // Verify IBP bounds are sound
-    let sound = ibp_output
+    // Verify every IBP interval is ordered.
+    let ordered = ibp_output
         .lower()
         .iter()
         .zip(ibp_output.upper().iter())
         .all(|(l, u)| l <= u);
-    assert!(sound, "IBP bounds must be sound");
+    assert!(ordered, "IBP bounds must be ordered");
 
-    // CROWN is expected to fail due to N-D batched dimension mismatch
-    let crown_result = std::panic::catch_unwind(|| graph.propagate_crown(&input));
+    let crown_result = graph
+        .propagate_crown_with_engine_and_deadline(&input, None, None)
+        .expect("full-block CROWN must remain supported for this fixture");
+    assert_eq!(
+        crown_result.provenance,
+        BoundsProvenance::Crown,
+        "the CROWN regression must not pass via forward-bound fallback"
+    );
+    let bounds = crown_result.bounds;
+    println!("CROWN succeeded");
+    let finite_and_ordered = bounds
+        .lower()
+        .iter()
+        .zip(bounds.upper().iter())
+        .all(|(l, u)| l.is_finite() && u.is_finite() && l <= u);
+    assert!(
+        finite_and_ordered,
+        "CROWN bounds must be finite and ordered"
+    );
+    assert_eq!(bounds.shape(), input.shape());
 
-    match crown_result {
-        Ok(Ok(bounds)) => {
-            // If CROWN somehow succeeds, that's fine - we've improved!
-            println!("CROWN succeeded (unexpected - may have been fixed)");
-            let sound = bounds
-                .lower()
-                .iter()
-                .zip(bounds.upper().iter())
-                .all(|(l, u)| l <= u);
-            assert!(sound, "CROWN bounds must be sound");
-            assert_eq!(bounds.shape(), input.shape());
-        }
-        Ok(Err(e)) => {
-            println!("CROWN failed with error (expected): {:?}", e);
-        }
-        Err(_) => {
-            // Panic (dimension mismatch in ndarray) is expected behavior for now
-            println!("CROWN panicked due to dimension mismatch (expected limitation)");
-        }
+    let nominal_output = graph
+        .propagate_concrete_point(&nominal_input, None, None)
+        .expect("independent concrete-point propagation must succeed");
+    for (index, (((&crown_lower, &crown_upper), &concrete_lower), &concrete_upper)) in bounds
+        .lower()
+        .iter()
+        .zip(bounds.upper().iter())
+        .zip(nominal_output.lower().iter())
+        .zip(nominal_output.upper().iter())
+        .enumerate()
+    {
+        assert_eq!(
+            concrete_lower.to_bits(),
+            concrete_upper.to_bits(),
+            "concrete-point propagation must return a degenerate interval at flat index {index}"
+        );
+        assert!(
+            crown_lower <= concrete_lower && concrete_upper <= crown_upper,
+            "CROWN did not contain the independently evaluated concrete point at flat index \
+             {index}: crown=[{crown_lower}, {crown_upper}], concrete={concrete_lower}"
+        );
+    }
+    for (index, (((&crown_lower, &crown_upper), &ibp_lower), &ibp_upper)) in bounds
+        .lower()
+        .iter()
+        .zip(bounds.upper().iter())
+        .zip(ibp_output.lower().iter())
+        .zip(ibp_output.upper().iter())
+        .enumerate()
+    {
+        assert!(
+            crown_lower >= ibp_lower && crown_upper <= ibp_upper,
+            "CROWN must stay within the graph-IBP enclosure at flat index {index}: \
+             crown=[{crown_lower}, {crown_upper}], ibp=[{ibp_lower}, {ibp_upper}]"
+        );
     }
 
-    // Key insight: IBP gives very loose widths for full blocks.
-    // Compositional verification of subgraphs gives much tighter bounds.
-    // Full block bound explosion comes from composing these loose bounds sequentially.
-    println!("\nRecommendation: Use compositional verification for tighter bounds");
+    println!("\nProduction Whisper block compatibility remains full-graph IBP");
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_encoder_mlp_subpath_ibp() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test IBP on just the MLP subpath of a Whisper encoder block.
-    // This demonstrates compositional verification: verify subcomponents that work.
+    // This is a focused subgraph diagnostic for the MLP path.
     //
     // MLP path: LayerNorm → Linear → GELU → Linear → Add (bias)
     // No shape transformations, should work with [seq, hidden] input.
@@ -417,13 +440,13 @@ fn test_encoder_mlp_subpath_ibp() {
             // Output should be [seq, hidden] (after projection back)
             assert_eq!(output.shape()[0], seq_len);
 
-            // Bounds should be sound
-            let sound = output
+            // Every returned interval must be ordered.
+            let ordered = output
                 .lower()
                 .iter()
                 .zip(output.upper().iter())
                 .all(|(l, u)| l <= u);
-            assert!(sound, "Bounds must be sound");
+            assert!(ordered, "Bounds must be ordered");
         }
         Err(e) => {
             println!("MLP IBP failed: {:?}", e);

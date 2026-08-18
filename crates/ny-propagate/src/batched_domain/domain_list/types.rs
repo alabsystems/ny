@@ -16,6 +16,7 @@ use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
 use ny_tensor::TreeTraversal;
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::sync::Arc;
 
 /// Cached linear bound coefficients (A matrices + bias) for CROWN backward pass.
@@ -51,6 +52,34 @@ impl CachedLinearBounds {
     /// Number of cached layers (max of lower_a and upper_a entries).
     pub fn len(&self) -> usize {
         self.lower_a.len().max(self.upper_a.len())
+    }
+
+    /// Estimated bytes owned by this cache, including array payloads and keys.
+    ///
+    /// This is a conservative queue-budget census, not an allocator/RSS
+    /// measurement. An `Arc`-shared cache is charged to every referencing
+    /// domain so the resident frontier is never under-budgeted due to sharing.
+    pub(crate) fn estimated_owned_bytes(&self) -> usize {
+        let arrays = self
+            .lower_a
+            .iter()
+            .chain(self.upper_a.iter())
+            .map(|(name, array)| {
+                name.len()
+                    .saturating_add(array.len().saturating_mul(size_of::<f32>()))
+            })
+            .sum::<usize>()
+            .saturating_add(
+                self.lower_b
+                    .iter()
+                    .chain(self.upper_b.iter())
+                    .map(|(name, array)| {
+                        name.len()
+                            .saturating_add(array.len().saturating_mul(size_of::<f32>()))
+                    })
+                    .sum::<usize>(),
+            );
+        size_of::<Self>().saturating_add(arrays)
     }
 
     /// Reconstruct full `LinearBounds` at a given node from cached data.
@@ -383,6 +412,49 @@ impl DomainMetadata {
         self.alpha_state
             .as_ref()
             .map(QueuedGraphAlphaState::byte_census)
+    }
+
+    /// Estimated bytes carried by this queued metadata row.
+    ///
+    /// Includes split history, cached linear bounds, child-local bound
+    /// overrides, and packed/runtime alpha state. Shared `Arc` payloads are
+    /// deliberately charged per reference for a conservative queue cap.
+    pub(crate) fn estimated_owned_bytes(&self) -> usize {
+        let constraints = self
+            .constraints
+            .iter()
+            .map(|(name, _, _, _)| size_of::<ConstraintTuple>().saturating_add(name.len()))
+            .sum::<usize>();
+        let cached = self
+            .cached_la
+            .as_deref()
+            .map(CachedLinearBounds::estimated_owned_bytes)
+            .unwrap_or(0);
+        let override_bytes = self
+            .node_bounds_override
+            .as_deref()
+            .map(|bounds| {
+                bounds
+                    .iter()
+                    .map(|(name, tensor)| {
+                        name.len().saturating_add(
+                            tensor
+                                .len()
+                                .saturating_mul(2usize.saturating_mul(size_of::<f32>())),
+                        )
+                    })
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let alpha_bytes = self
+            .alpha_state_byte_census()
+            .map(|census| census.estimated_total_bytes)
+            .unwrap_or(0);
+        size_of::<Self>()
+            .saturating_add(constraints)
+            .saturating_add(cached)
+            .saturating_add(override_bytes)
+            .saturating_add(alpha_bytes)
     }
 
     pub(crate) fn set_alpha_state(&mut self, alpha_state: Option<GraphDomainAlphaState>) {

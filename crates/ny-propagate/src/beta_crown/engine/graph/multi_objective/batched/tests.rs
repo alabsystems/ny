@@ -12,9 +12,10 @@ use ny_core::{GemmEngine, NaiveCpuGemmEngine, NyError};
 use ny_tensor::BoundedTensor;
 
 use super::children::collect_multi_objective_children;
+use crate::batched_domain::CachedLinearBounds;
 use crate::beta_crown::branching::GraphNeuronConstraint;
 use crate::beta_crown::domain::{
-    GraphBabDomain, GraphCrownContext, MultiObjDomainWithUnstable, MultiObjectiveGraphBabDomain,
+    GraphBabDomain, MultiObjDomainWithUnstable, MultiObjectiveGraphBabDomain, NodeBoundsMap,
 };
 use crate::beta_crown::engine::domain_results::{
     GraphDomainResult, MultiObjectiveGraphDomainResult,
@@ -24,6 +25,7 @@ use crate::beta_crown::engine::graph::domain_batch::{
     GraphDomainBatchExecutor, MultiObjectiveBatchRequest, SingleObjectiveBatchRequest,
 };
 use crate::beta_crown::engine::graph::multi_objective::batched::children::MultiObjectiveChildCreationResult;
+use crate::beta_crown::engine::graph::multi_objective::selective_root_alpha::ChildContinuationStateProvenance;
 use crate::beta_crown::BetaCrownConfig;
 use crate::{GraphNetwork, GraphNode, Layer, LinearLayer, ReLULayer};
 
@@ -97,7 +99,8 @@ fn test_auto_enlarge_off_executor_setup_error_keeps_legacy_fallback_1993() {
     let root = GraphBabDomain::root(initial_bounds, -1.0, 1.0, &input_bounds, false)
         .expect("root domain with finite bounds should not fail");
 
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    verifier.config.alpha_config.deadline = None;
     assert!(!verifier.config.auto_enlarge_batch_size);
     let objective = vec![1.0];
     let relu_nodes = vec!["relu1".to_string(), "missing_relu".to_string()];
@@ -114,6 +117,7 @@ fn test_auto_enlarge_off_executor_setup_error_keeps_legacy_fallback_1993() {
             threshold: 0.0,
             engine: &NaiveCpuGemmEngine,
             cut_pool: None,
+            split_depth: 1,
             retry_refusals: false,
         },
     )
@@ -123,6 +127,60 @@ fn test_auto_enlarge_off_executor_setup_error_keeps_legacy_fallback_1993() {
         matches!(results.as_slice(), [GraphDomainResult::PropagationFailure]),
         "setup failure must map to PropagationFailure, got: {results:?}"
     );
+}
+
+#[test]
+fn shared_single_objective_executor_caps_each_parent_at_max_depth() {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu");
+    let input = BoundedTensor::new(
+        arr1(&[-1.0, -1.0, -1.0, -1.0]).into_dyn(),
+        arr1(&[1.0, 1.0, 1.0, 1.0]).into_dyn(),
+    )
+    .unwrap();
+    let bounds = graph.collect_node_bounds(&input).unwrap();
+    let root = GraphBabDomain::root(bounds, -1.0, 1.0, &input, false).unwrap();
+    let mut deep = root.clone();
+    deep.depth = 3;
+
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        max_depth: 4,
+        beta_iterations: 0,
+        ..Default::default()
+    });
+    let domains = [&root, &deep];
+    let relu_nodes = ["relu".to_string()];
+    let results = GraphDomainBatchExecutor::execute_single_objective(
+        &verifier,
+        SingleObjectiveBatchRequest {
+            graph: &graph,
+            domains: &domains,
+            relu_nodes: &relu_nodes,
+            objective: &[1.0, 0.0, 0.0, 0.0],
+            threshold: 0.0,
+            engine: &NaiveCpuGemmEngine,
+            cut_pool: None,
+            split_depth: 4,
+            retry_refusals: false,
+        },
+    )
+    .expect("legacy execution keeps its internal fallback");
+
+    assert_eq!(results.len(), 2);
+    for (parent, result) in domains.into_iter().zip(results) {
+        let GraphDomainResult::Children(children) = result else {
+            panic!("mixed-depth shared executor must produce children");
+        };
+        assert!(!children.is_empty());
+        assert!(children
+            .iter()
+            .all(|(child, _)| child.depth <= verifier.config.max_depth));
+        let expected_depth = verifier.config.max_depth.min(parent.depth + 4);
+        assert!(children
+            .iter()
+            .all(|(child, _)| child.depth == expected_depth));
+    }
 }
 
 #[test]
@@ -154,9 +212,13 @@ fn test_auto_enlarge_off_executor_never_surfaces_retry_refusal() {
         false,
     )
     .unwrap();
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    // This is an executor-unit refusal probe, not a wall-clock verifier run.
+    // A live authoritative deadline deliberately selects the pollable CPU
+    // linear-backward path, so clear it here to force the engine dispatch whose
+    // structured allocation refusal the adaptive caller must observe.
+    verifier.config.alpha_config.deadline = None;
     assert!(!verifier.config.auto_enlarge_batch_size);
-
     let results = GraphDomainBatchExecutor::execute_single_objective(
         &verifier,
         SingleObjectiveBatchRequest {
@@ -167,6 +229,7 @@ fn test_auto_enlarge_off_executor_never_surfaces_retry_refusal() {
             threshold: 0.5,
             engine: &AllocationRefusingEngine,
             cut_pool: None,
+            split_depth: 1,
             retry_refusals: false,
         },
     )
@@ -183,13 +246,14 @@ fn test_auto_enlarge_off_executor_never_surfaces_retry_refusal() {
             threshold: 0.5,
             engine: &AllocationRefusingEngine,
             cut_pool: None,
+            split_depth: 1,
             retry_refusals: true,
         },
     );
-    assert!(matches!(
-        adaptive,
-        Err(MicrobatchRefusalReason::DeviceAllocation)
-    ));
+    assert!(
+        matches!(adaptive, Err(MicrobatchRefusalReason::DeviceAllocation)),
+        "adaptive executor must surface a retryable allocation refusal, got {adaptive:?}"
+    );
 }
 
 #[test]
@@ -200,7 +264,7 @@ fn test_multi_objective_parent_lookup_failure_returns_propagation_failure_1993()
 
     let (children, parent_lookup) = collect_multi_objective_children(
         &domains_with_unstable,
-        &child_creation_results,
+        child_creation_results,
         &mut quick_results,
     );
 
@@ -219,6 +283,84 @@ fn test_multi_objective_parent_lookup_failure_returns_propagation_failure_1993()
 }
 
 #[test]
+fn collect_multi_objective_children_moves_cache_payload_without_clone() {
+    let (graph, input_bounds) = build_single_linear_graph_4280();
+    let parent = make_multi_objective_root_domain_4280(&graph, &input_bounds, 0.5, (-1.0, 1.0));
+    let mut child = parent.clone();
+    let mut cache = CachedLinearBounds::default();
+    cache
+        .lower_a
+        .insert("linear1".to_string(), arr2(&[[1.25_f32]]));
+    cache
+        .lower_b
+        .insert("linear1".to_string(), arr1(&[-0.5_f32]));
+    child
+        .set_cached_las(vec![Some(cache)])
+        .expect("one objective requires one cache slot");
+    child.history.add_constraint(
+        GraphNeuronConstraint::new(
+            "collect_move_owned_history_allocation_probe".to_string(),
+            0,
+            true,
+            1.0,
+        )
+        .expect("finite synthetic history constraint"),
+    );
+    let source_history_vec = child.history.constraints.as_ptr();
+    let source_history_name = child.history.constraints[0].node_name().as_ptr();
+    let source_payload = child.cached_las()[0]
+        .as_ref()
+        .expect("source cache should exist")
+        .lower_a["linear1"]
+        .as_ptr();
+    let expected_a_bits = child.cached_las()[0]
+        .as_ref()
+        .expect("source cache should exist")
+        .lower_a["linear1"][[0, 0]]
+    .to_bits();
+    let expected_b_bits = child.cached_las()[0]
+        .as_ref()
+        .expect("source cache should exist")
+        .lower_b["linear1"][0]
+        .to_bits();
+
+    let domains_with_unstable: Vec<MultiObjDomainWithUnstable<'_>> = vec![(0, &parent, Vec::new())];
+    let child_creation_results: Vec<MultiObjectiveChildCreationResult> =
+        vec![(0, vec![(0, child, true, Default::default())])];
+    let mut quick_results = HashMap::new();
+
+    let (children, parent_lookup) = collect_multi_objective_children(
+        &domains_with_unstable,
+        child_creation_results,
+        &mut quick_results,
+    );
+
+    assert!(quick_results.is_empty());
+    let looked_up_parent = *parent_lookup.get(&0).expect("parent lookup should exist");
+    assert_eq!(
+        std::ptr::from_ref(looked_up_parent),
+        std::ptr::from_ref(&parent)
+    );
+    assert_eq!(children.len(), 1);
+    let moved_child = &children[0].1;
+    assert_eq!(moved_child.history.constraints.as_ptr(), source_history_vec);
+    assert_eq!(
+        moved_child.history.constraints[0].node_name().as_ptr(),
+        source_history_name,
+        "collection must move the domain rather than deep-clone owned history"
+    );
+    let moved_cache = moved_child.cached_las()[0]
+        .as_ref()
+        .expect("moved cache should exist");
+    assert_eq!(moved_cache.lower_a["linear1"].as_ptr(), source_payload);
+    assert_eq!(
+        moved_cache.lower_a["linear1"][[0, 0]].to_bits(),
+        expected_a_bits
+    );
+    assert_eq!(moved_cache.lower_b["linear1"][0].to_bits(), expected_b_bits);
+}
+
+#[test]
 fn test_execute_multi_objective_no_unstable_recomputes_verified_bounds_4280() {
     let (graph, input_bounds) = build_single_linear_graph_4280();
     let domain = make_multi_objective_root_domain_4280(&graph, &input_bounds, 0.5, (0.0, 1.0));
@@ -230,6 +372,7 @@ fn test_execute_multi_objective_no_unstable_recomputes_verified_bounds_4280() {
     let results = GraphDomainBatchExecutor::execute_multi_objective(
         &verifier,
         MultiObjectiveBatchRequest {
+            bab_round: 0,
             graph: &graph,
             domains: &[&domain],
             relu_nodes: &relu_nodes,
@@ -237,7 +380,7 @@ fn test_execute_multi_objective_no_unstable_recomputes_verified_bounds_4280() {
             thresholds: &thresholds,
             engine: &NaiveCpuGemmEngine,
             cut_pool: None,
-            endgame: false,
+            selective_root_alpha_candidate: None,
         },
     );
 
@@ -265,6 +408,7 @@ fn test_execute_multi_objective_no_unstable_recomputes_violated_bounds_4280() {
     let results = GraphDomainBatchExecutor::execute_multi_objective(
         &verifier,
         MultiObjectiveBatchRequest {
+            bab_round: 0,
             graph: &graph,
             domains: &[&domain],
             relu_nodes: &relu_nodes,
@@ -272,7 +416,7 @@ fn test_execute_multi_objective_no_unstable_recomputes_violated_bounds_4280() {
             thresholds: &thresholds,
             engine: &NaiveCpuGemmEngine,
             cut_pool: None,
-            endgame: false,
+            selective_root_alpha_candidate: None,
         },
     );
 
@@ -285,6 +429,79 @@ fn test_execute_multi_objective_no_unstable_recomputes_violated_bounds_4280() {
             }]
         ),
         "no-unstable executor path should preserve violation detection, got {results:?}"
+    );
+}
+
+#[test]
+fn test_execute_multi_objective_no_unstable_preserves_deadline_outcome() {
+    let (graph, input_bounds) = build_single_linear_graph_4280();
+    let domain = make_multi_objective_root_domain_4280(&graph, &input_bounds, 0.5, (0.0, 1.0));
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        timeout: std::time::Duration::ZERO,
+        ..Default::default()
+    });
+    let results = GraphDomainBatchExecutor::execute_multi_objective(
+        &verifier,
+        MultiObjectiveBatchRequest {
+            bab_round: 0,
+            graph: &graph,
+            domains: &[&domain],
+            relu_nodes: &[],
+            objectives: &[vec![1.0_f32]],
+            thresholds: &[0.5_f32],
+            engine: &NaiveCpuGemmEngine,
+            cut_pool: None,
+            selective_root_alpha_candidate: None,
+        },
+    );
+
+    assert!(
+        matches!(
+            results.as_slice(),
+            [MultiObjectiveGraphDomainResult::DeadlineExpired]
+        ),
+        "NoUnstable CROWN must preserve the typed deadline, got {results:?}"
+    );
+}
+
+#[test]
+fn test_execute_multi_objective_expired_branch_wave_is_typed_deadline() {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu1", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu1");
+    let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+        .expect("valid input");
+    let node_bounds = graph
+        .collect_node_bounds(&input)
+        .expect("root bounds should collect");
+    let domain =
+        MultiObjectiveGraphBabDomain::root(node_bounds, vec![(-1.0, 1.0)], &input, &[0.0], false)
+            .expect("root multi-objective domain");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        timeout: std::time::Duration::ZERO,
+        ..Default::default()
+    });
+    let results = GraphDomainBatchExecutor::execute_multi_objective(
+        &verifier,
+        MultiObjectiveBatchRequest {
+            bab_round: 0,
+            graph: &graph,
+            domains: &[&domain],
+            relu_nodes: &["relu1".to_string()],
+            objectives: &[vec![1.0_f32]],
+            thresholds: &[0.0_f32],
+            engine: &NaiveCpuGemmEngine,
+            cut_pool: None,
+            selective_root_alpha_candidate: None,
+        },
+    );
+
+    assert!(
+        matches!(
+            results.as_slice(),
+            [MultiObjectiveGraphDomainResult::DeadlineExpired]
+        ),
+        "expired branch creation must not become PropagationFailure, got {results:?}"
     );
 }
 
@@ -348,24 +565,15 @@ fn build_equiv_root(
     let node_bounds = graph
         .collect_node_bounds(input)
         .expect("root node bounds should collect");
-    // Compute objective bounds at the root so the domain carries plausible parent
-    // bounds for the verified-latch (verified objectives keep these).
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
-    let arc_node_bounds: HashMap<String, Arc<BoundedTensor>> = node_bounds
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
-        .collect();
-    let root_history = crate::beta_crown::branching::GraphSplitHistory::new();
-    let context = GraphCrownContext::new(
-        &root_history,
-        None,
-        Some(&arc_node_bounds),
-        Some(&NaiveCpuGemmEngine),
-    );
-    let (output, _) = verifier
-        .propagate_crown_with_graph_constraints(graph, input, &context, None, None)
-        .expect("root CROWN should succeed");
-    let obj_bounds = BetaCrownVerifier::objective_bounds_multi(&output, objectives)
+    // Seed the root with a certified parent enclosure projected directly from
+    // the already-collected output IBP bounds. The fixture only needs sound,
+    // non-vacuous parent values for the verified latch; running constrained
+    // CROWN here would make setup depend on the finite dense-ReLU policy that
+    // the selective-wrapper test exercises separately.
+    let output = node_bounds
+        .get(graph.output_node.as_str())
+        .expect("root output bounds should be present");
+    let obj_bounds = BetaCrownVerifier::objective_bounds_multi(output, objectives)
         .expect("root objective bounds should compute");
     MultiObjectiveGraphBabDomain::root(node_bounds, obj_bounds, input, thresholds, false)
         .expect("root multi-objective domain should construct")
@@ -418,8 +626,130 @@ fn adapter_single_child(
         .expect("single-child adapter should not fall back");
     out[0]
         .as_ref()
-        .map(|(obj_bounds, _, _, _, _, _)| obj_bounds.clone())
-        .unwrap_or_else(|e| panic!("single-child adapter errored: infeasible={e}"))
+        .map(|(obj_bounds, _, _, _, _, _, _)| obj_bounds.clone())
+        .unwrap_or_else(|e| panic!("single-child adapter errored: {e:?}"))
+}
+
+#[test]
+fn selective_wrapper_off_and_private_w_cutoff_preserve_h_but_hard_deadline_is_terminal() {
+    let graph = build_equiv_parity_graph();
+    let input = BoundedTensor::new(
+        arr1(&[-1.0_f32, -1.0]).into_dyn(),
+        arr1(&[1.0_f32, 1.0]).into_dyn(),
+    )
+    .expect("valid input");
+    let objectives = vec![vec![1.0_f32, -0.35], vec![-0.6, 1.0]];
+    let thresholds = vec![0.0_f32, 0.0];
+    let relu_nodes = vec!["relu1".to_string(), "relu2".to_string()];
+    let root = build_equiv_root(&graph, &input, &objectives, &thresholds);
+    let child = root
+        .with_constraint(
+            &graph,
+            GraphNeuronConstraint {
+                node_name: "relu1".to_string(),
+                neuron_idx: 0,
+                is_active: true,
+                score: 1.0,
+            },
+            false,
+            &thresholds,
+        )
+        .expect("child construction should not error")
+        .expect("child should be feasible");
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    // H and the gate-off wrapper are the no-deadline reference. The two calls
+    // below that pass an authoritative deadline still install their own live
+    // or expired finite scope and therefore exercise refusal/expiry policy.
+    verifier.config.alpha_config.deadline = None;
+
+    let established = verifier
+        .batched_single_pass_multi_objective_children(
+            &graph,
+            &[&child],
+            &relu_nodes,
+            &objectives,
+            &thresholds,
+            &NaiveCpuGemmEngine,
+            false,
+        )
+        .expect("H should evaluate");
+    let off = verifier
+        .batched_selective_root_alpha_multi_objective_children(
+            &graph,
+            &[&child],
+            &relu_nodes,
+            &objectives,
+            &thresholds,
+            &NaiveCpuGemmEngine,
+            false,
+            None,
+            None,
+        )
+        .expect("gate-off wrapper should evaluate H");
+    super::batched_dense_specs::reset_batched_single_pass_dispatch_count_for_test();
+    let private_cutoff_expired = verifier
+        .batched_selective_root_alpha_multi_objective_children(
+            &graph,
+            &[&child],
+            &relu_nodes,
+            &objectives,
+            &thresholds,
+            &NaiveCpuGemmEngine,
+            false,
+            Some(root.alpha_state()),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(4)),
+        )
+        .expect("private W cutoff must retain completed H");
+    assert_eq!(
+        super::batched_dense_specs::batched_single_pass_dispatch_count_for_test(),
+        1,
+        "private cutoff must run H exactly once and decline W before dispatch"
+    );
+    super::batched_dense_specs::reset_batched_single_pass_dispatch_count_for_test();
+    let hard_expired = verifier.batched_selective_root_alpha_multi_objective_children(
+        &graph,
+        &[&child],
+        &relu_nodes,
+        &objectives,
+        &thresholds,
+        &NaiveCpuGemmEngine,
+        false,
+        Some(root.alpha_state()),
+        Some(std::time::Instant::now()),
+    );
+    assert!(
+        matches!(
+            hard_expired,
+            Err(super::batched_dense_specs::BatchedMultiObjectiveAdapterError::DeadlineExpired)
+        ),
+        "optional W must not mask the verifier's hard deadline"
+    );
+    assert_eq!(
+        super::batched_dense_specs::batched_single_pass_dispatch_count_for_test(),
+        0,
+        "an expired hard authority must refuse before launching H or W"
+    );
+
+    let extract = |results: &[super::batched_dense_specs::BatchedChildResult]| {
+        let result = results[0].as_ref().expect("child result should be sound");
+        assert_eq!(
+            result.6,
+            ChildContinuationStateProvenance::Established,
+            "optional W refusal must retain H provenance"
+        );
+        result
+            .0
+            .iter()
+            .map(|&(lower, upper)| (lower.to_bits(), upper.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    let established_bits = extract(&established);
+    assert_eq!(extract(&off), established_bits, "gate-off H bounds drifted");
+    assert_eq!(
+        extract(&private_cutoff_expired),
+        established_bits,
+        "private-cutoff-cancelled W changed completed H bounds"
+    );
 }
 
 /// Independent soundness floor: sample concrete points in the child's constrained
@@ -429,17 +759,17 @@ fn adapter_single_child(
 /// minimum over the sub-domain (any sound lower bound must be <= this).
 fn sampled_objective_minimums(
     graph: &GraphNetwork,
-    parent_node_bounds: &HashMap<String, Arc<BoundedTensor>>,
+    parent_node_bounds: &NodeBoundsMap,
     child: &MultiObjectiveGraphBabDomain,
     objectives: &[Vec<f32>],
 ) -> Vec<f32> {
     let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
     let (_fwd, constrained_input) = verifier
-        .compute_constrained_forward_bounds(
+        .compute_constrained_forward_bounds_from_view(
             graph,
             child.input_bounds.as_ref(),
             &child.history,
-            Some(parent_node_bounds),
+            Some(parent_node_bounds.into()),
             None,
         )
         .expect("constrained forward bounds should succeed");
@@ -628,9 +958,10 @@ fn test_dense_spec_adapter_matches_direct_crown_oracle_and_is_sound() {
         .zip(children.iter())
         .enumerate()
     {
-        let (obj_bounds, _node_cache, _beta, _alpha, _cached_las, _pruned) = child_result
-            .as_ref()
-            .unwrap_or_else(|e| panic!("child {ci} adapter result errored: infeasible={e}"));
+        let (obj_bounds, _node_cache, _beta, _alpha, _cached_las, _pruned, _provenance) =
+            child_result
+                .as_ref()
+                .unwrap_or_else(|e| panic!("child {ci} adapter result errored: {e:?}"));
         assert_eq!(
             obj_bounds.len(),
             iso_bounds.len(),
@@ -738,11 +1069,11 @@ fn test_dense_spec_adapter_union_pruning_matches_full_matrix_w5() {
 
     let full_bounds = full[0]
         .as_ref()
-        .map(|(b, _, _, _, _, _)| b.clone())
+        .map(|(b, _, _, _, _, _, _)| b.clone())
         .expect("full-matrix child result should be Ok");
     let pruned_bounds = pruned[0]
         .as_ref()
-        .map(|(b, _, _, _, _, _)| b.clone())
+        .map(|(b, _, _, _, _, _, _)| b.clone())
         .expect("union-pruned child result should be Ok");
 
     assert_eq!(
@@ -768,21 +1099,34 @@ mod kfsb_multi_tests {
     use ndarray::{arr1, arr2};
     use ny_core::NaiveCpuGemmEngine;
 
+    use super::super::batched_multi::with_kfsb_final_publication_now;
+    use super::super::children::KfsbCertEffect;
     use super::super::kfsb_multi::{
-        adaptive_depth_authority_identity, adaptive_depth_shadow_budget_available,
-        adaptive_depth_shadow_deadline, append_layer_quota_candidates, clear_shadow_cached_las,
-        pick_kfsb_candidate, rank_adaptive_depth_authority_portfolio,
-        rank_adaptive_depth_candidates, resolve_adaptive_depth_authority_candidate,
-        resolve_adaptive_depth_evaluation_enabled, resolve_adaptive_depth_select_enabled,
+        adaptive_depth_authority_identity, adaptive_depth_proxy_recommended_rank,
+        adaptive_depth_shadow_budget_available, adaptive_depth_shadow_deadline,
+        append_layer_quota_candidates, claim_adaptive_depth_attempt, clear_shadow_cached_las,
+        complete_clip_decision_scoring_deadline, depth_two_lookahead_score,
+        kfsb_f64_shadow_budget_available, kfsb_f64_shadow_deadline, kfsb_f64_shadow_objective,
+        materialize_kfsb_candidates_with_completeness, pick_kfsb_candidate,
+        pick_kfsb_candidate_subset_original_order, rank_adaptive_depth_candidates,
+        rank_kfsb_candidate_portfolio, resolve_adaptive_depth_authority_candidate,
+        resolve_adaptive_depth_commit_enabled, resolve_adaptive_depth_select_enabled,
         resolve_adaptive_depth_shadow_enabled, resolve_kfsb_cached_la_enabled,
-        select_complete_adaptive_depth_rank, AdaptiveDepthShadowCapture,
-        AdaptiveDepthShadowMetrics, DomainPrep, SideSlot,
+        resolve_kfsb_f64_shadow_enabled, select_complete_depth_two_lookahead,
+        select_depth_two_frontier_worst_slot, select_depth_two_root_portfolio,
+        select_kfsb_straggler, AdaptiveDepthPrivatePeakDecline, AdaptiveDepthPrivatePeakLedger,
+        AdaptiveDepthShadowCapture, DepthTwoLookaheadBudget, DepthTwoLookaheadCapture,
+        DepthTwoLookaheadOverlayPlan, DepthTwoLookaheadSideScore, DomainPrep, KfsbF64ShadowCapture,
+        SideSlot,
     };
     use crate::batched_domain::CachedLinearBounds;
     use crate::beta_crown::branching::{BranchingHeuristic, GraphNeuronConstraint};
-    use crate::beta_crown::config::KfsbReduceOp;
+    use crate::beta_crown::config::{
+        DepthTwoBranchLookaheadConfig, DepthTwoBranchLookaheadMode, KfsbReduceOp,
+    };
     use crate::beta_crown::domain::MultiObjectiveGraphBabDomain;
     use crate::beta_crown::engine::branching::kfsb_shared::GraphKfsbCandidate;
+    use crate::beta_crown::engine::domain_results::MultiObjectiveGraphDomainResult;
     use crate::beta_crown::{BetaCrownConfig, BetaCrownVerifier};
     use crate::{
         BoundedTensor, GraphNetwork, GraphNode, Layer, LinearBounds, LinearLayer, ReLULayer,
@@ -827,6 +1171,58 @@ mod kfsb_multi_tests {
         (graph, domain)
     }
 
+    /// Two-row variant whose first row is reusable but not terminal.
+    ///
+    /// Both rows describe the same scalar output. Row 0 has the worse root
+    /// proof margin and is therefore the KFSB straggler; either side of the
+    /// useful split proves it above zero. Row 1's threshold is deliberately
+    /// unreachable by a lower-bound proof (the two child minima are 3 and 2),
+    /// so a sound certificate can only produce `RowVerified`, never
+    /// `ChildComplete`.
+    fn kfsb_partial_receipt_fixture() -> (GraphNetwork, MultiObjectiveGraphBabDomain) {
+        let (graph, seed) = kfsb_fixture();
+        let input = seed.input_bounds();
+        let node_bounds = graph.collect_node_bounds(input).expect("node bounds");
+        let mut domain = MultiObjectiveGraphBabDomain::root(
+            node_bounds,
+            vec![(-10.0, 10.0), (-5.0, 10.0)],
+            input,
+            &[0.0, 4.0],
+            false,
+        )
+        .expect("partial-receipt root domain");
+        let mut row_zero = CachedLinearBounds::default();
+        row_zero
+            .lower_a
+            .insert("relu1".to_string(), arr2(&[[1.0_f32, 1.0_f32]]));
+        row_zero
+            .upper_a
+            .insert("relu1".to_string(), arr2(&[[1.0_f32, 1.0_f32]]));
+        row_zero
+            .lower_b
+            .insert("relu1".to_string(), arr1(&[0.0_f32]));
+        row_zero
+            .upper_b
+            .insert("relu1".to_string(), arr1(&[0.0_f32]));
+        let mut row_one = CachedLinearBounds::default();
+        row_one
+            .lower_a
+            .insert("relu1".to_string(), arr2(&[[1.0_f32, 1.0_f32]]));
+        row_one
+            .upper_a
+            .insert("relu1".to_string(), arr2(&[[1.0_f32, 1.0_f32]]));
+        row_one
+            .lower_b
+            .insert("relu1".to_string(), arr1(&[0.0_f32]));
+        row_one
+            .upper_b
+            .insert("relu1".to_string(), arr1(&[0.0_f32]));
+        domain
+            .set_cached_las(vec![Some(row_zero), Some(row_one)])
+            .expect("two objectives require two full-spec cache slots");
+        (graph, domain)
+    }
+
     /// Three genuinely unstable candidates for the adaptive-depth observer.
     fn adaptive_depth_fixture() -> (GraphNetwork, MultiObjectiveGraphBabDomain) {
         let linear1 = LinearLayer::new(
@@ -839,6 +1235,43 @@ mod kfsb_multi_tests {
         // child-specific interval cache, rather than a fixed coefficient sign,
         // decide the second split.
         let linear2 = LinearLayer::new(arr2(&[[1.0_f32, -0.75, -0.4]]), None).expect("linear2");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("linear1", Layer::Linear(linear1)));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer),
+            vec!["linear1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "linear2",
+            Layer::Linear(linear2),
+            vec!["relu1".to_string()],
+        ));
+        graph.set_output("linear2");
+
+        let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())
+            .expect("input bounds");
+        let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+        let domain = MultiObjectiveGraphBabDomain::root(
+            node_bounds,
+            vec![(-10.0, 10.0)],
+            &input,
+            &[0.0],
+            false,
+        )
+        .expect("root domain");
+        (graph, domain)
+    }
+
+    /// Four unstable candidates exercise the production depth-four wave cap.
+    fn adaptive_depth_four_candidate_fixture() -> (GraphNetwork, MultiObjectiveGraphBabDomain) {
+        let linear1 = LinearLayer::new(
+            arr2(&[[1.0_f32], [-1.0], [0.5], [-0.5]]),
+            Some(arr1(&[0.0_f32, 0.0, 0.0, 0.0])),
+        )
+        .expect("linear1");
+        let linear2 =
+            LinearLayer::new(arr2(&[[1.0_f32, -0.75, -0.4, -0.2]]), None).expect("linear2");
         let mut graph = GraphNetwork::new();
         graph.add_node(GraphNode::from_input("linear1", Layer::Linear(linear1)));
         graph.add_node(GraphNode::new(
@@ -887,6 +1320,277 @@ mod kfsb_multi_tests {
     }
 
     #[test]
+    fn kfsb_f64_shadow_gate_and_budget_fail_closed() {
+        assert!(!resolve_kfsb_f64_shadow_enabled(None));
+        assert!(!resolve_kfsb_f64_shadow_enabled(Some("")));
+        assert!(!resolve_kfsb_f64_shadow_enabled(Some("0")));
+        assert!(!resolve_kfsb_f64_shadow_enabled(Some("true")));
+        assert!(resolve_kfsb_f64_shadow_enabled(Some("1")));
+        let objective = [1.0_f32, -2.0, 0.0];
+        assert!(matches!(
+            kfsb_f64_shadow_objective(&objective, false),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let negated = kfsb_f64_shadow_objective(&objective, true);
+        assert_eq!(
+            negated
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [-1.0_f32, 2.0, -0.0]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "verify-upper shadow must score lower(-c), exactly matching -upper(c)"
+        );
+
+        let now = std::time::Instant::now();
+        assert!(kfsb_f64_shadow_deadline(now, None).is_some());
+        assert!(
+            kfsb_f64_shadow_deadline(now, now.checked_add(std::time::Duration::from_secs(14)))
+                .is_none()
+        );
+        let admitted =
+            kfsb_f64_shadow_deadline(now, now.checked_add(std::time::Duration::from_secs(16)))
+                .expect("five-second shadow plus ten-second reserve");
+        assert!(kfsb_f64_shadow_budget_available(
+            now,
+            admitted,
+            now.checked_add(std::time::Duration::from_secs(16))
+        ));
+        assert!(!kfsb_f64_shadow_budget_available(
+            admitted,
+            admitted,
+            now.checked_add(std::time::Duration::from_secs(16))
+        ));
+    }
+
+    #[test]
+    fn kfsb_f64_shadow_respects_earlier_call_scoped_authority() {
+        let now = std::time::Instant::now();
+        let configured_deadline = now.checked_add(std::time::Duration::from_mins(1));
+        let call_scoped_deadline = now.checked_add(std::time::Duration::from_secs(14));
+
+        assert!(
+            kfsb_f64_shadow_deadline(now, configured_deadline).is_some(),
+            "the looser configured deadline would admit the observer"
+        );
+        assert!(
+            kfsb_f64_shadow_deadline(now, call_scoped_deadline).is_none(),
+            "the effective call-scoped deadline must preserve post-BaB authority"
+        );
+    }
+
+    #[test]
+    fn kfsb_f64_shadow_streams_exact_post_f32_top_three() {
+        let candidate = |node: &str, idx: usize, main: f32| GraphKfsbCandidate {
+            node_name: node.to_string(),
+            neuron_idx: idx,
+            main_score: main,
+            backup_score: 0.0,
+        };
+        let prep = DomainPrep {
+            slot: 0,
+            straggler: 0,
+            cached_score_candidates: 0,
+            legacy_candidates_len: 4,
+            depth_two_lookahead_candidates: Some(vec![4]),
+            attribution_diag: None,
+            candidates: vec![
+                candidate("n0", 0, 0.0),
+                candidate("n1", 1, 0.0),
+                candidate("n2", 2, 0.0),
+                candidate("n3", 3, 0.0),
+                candidate("paper-only", 4, 100.0),
+            ],
+            sides: vec![
+                [SideSlot::Sim(0), SideSlot::Sim(1)],
+                [SideSlot::Sim(2), SideSlot::Sim(3)],
+                [SideSlot::Sim(4), SideSlot::Sim(5)],
+                [SideSlot::Sim(6), SideSlot::Sim(7)],
+                [SideSlot::Sim(8), SideSlot::Sim(9)],
+            ],
+        };
+        let values = vec![
+            Some(0.1),
+            Some(0.1),
+            Some(0.4),
+            Some(0.4),
+            Some(0.3),
+            Some(0.3),
+            Some(0.2),
+            Some(0.2),
+            Some(100.0),
+            Some(100.0),
+        ];
+        let mut capture =
+            KfsbF64ShadowCapture::new(0, &prep, values.len()).expect("four-candidate capture");
+        for sim_index in 0..values.len() {
+            capture.record(sim_index, HashMap::new(), &prep, &values, KfsbReduceOp::Min);
+        }
+
+        assert!(capture.complete());
+        assert_eq!(
+            capture
+                .top
+                .iter()
+                .map(|candidate| candidate.candidate_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the observer must retain the legacy post-simulation top three and ignore paper-only roots"
+        );
+    }
+
+    #[test]
+    fn kfsb_f64_shadow_portfolio_uses_historical_near_tie_contract() {
+        let candidate = |node: &str, main: f32| GraphKfsbCandidate {
+            node_name: node.to_string(),
+            neuron_idx: 0,
+            main_score: main,
+            backup_score: 0.0,
+        };
+        let candidates = vec![
+            candidate("exact-lead", 1.0),
+            candidate("historical-main", 2.0),
+            candidate("third", 0.0),
+            candidate("fourth", 0.0),
+        ];
+        let exact_lead = f32::from_bits(1.0_f32.to_bits() + 4);
+        let values = vec![
+            (exact_lead, exact_lead),
+            (1.0, 1.0),
+            (0.5, 0.5),
+            (0.25, 0.25),
+        ];
+
+        let ranked = rank_kfsb_candidate_portfolio(&candidates, &values, KfsbReduceOp::Min, 3);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|(candidate_index, _)| *candidate_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2],
+            "top-three validation must repeat the authoritative 1e-6/main-score picker"
+        );
+    }
+
+    #[test]
+    fn kfsb_f64_shadow_f64_pick_preserves_original_first_seen_order() {
+        let candidate = |node: &str| GraphKfsbCandidate {
+            node_name: node.to_string(),
+            neuron_idx: 0,
+            main_score: 1.0,
+            backup_score: 0.0,
+        };
+        let candidates = vec![
+            candidate("original-first"),
+            candidate("f32-rank-first"),
+            candidate("third"),
+        ];
+        let near_lead = f32::from_bits(1.0_f32.to_bits() + 4);
+        let ranked_order_values = vec![
+            (1, (near_lead, near_lead)),
+            (0, (1.0, 1.0)),
+            (2, (0.5, 0.5)),
+        ];
+
+        let (winner, _, _) = pick_kfsb_candidate_subset_original_order(
+            &candidates,
+            &ranked_order_values,
+            KfsbReduceOp::Min,
+        )
+        .expect("three-candidate subset");
+        assert_eq!(
+            winner, 0,
+            "a near-tied f64 subset must use original candidate order, not f32 rank order"
+        );
+    }
+
+    #[ntest::timeout(30000)]
+    #[test]
+    fn kfsb_f64_shadow_is_one_shot_and_cannot_change_selection() {
+        let run = |f64_gate: &'static str, scalar_gate: &'static str| {
+            crate::tests::with_serialized_env_vars(
+                &[
+                    ("NY_MO_KFSB_F64_SHADOW", f64_gate),
+                    ("NY_MO_ADAPTIVE_DEPTH_SHADOW", scalar_gate),
+                    ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                    ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0"),
+                    ("NY_MO_KFSB_K", "3"),
+                    ("NY_MO_KFSB_REDUCE", "min"),
+                    ("NY_BAB_CHAIN_WIDE", "1"),
+                ],
+                || {
+                    let (graph, domain) = adaptive_depth_fixture();
+                    let verifier = kfsb_verifier(KfsbReduceOp::Min);
+                    let unstable = vec![
+                        ("relu1".to_string(), 0),
+                        ("relu1".to_string(), 1),
+                        ("relu1".to_string(), 2),
+                    ];
+                    let wave = vec![(41usize, &domain, unstable)];
+                    let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                        0,
+                        &graph,
+                        &wave,
+                        &["relu1".to_string()],
+                        &[vec![1.0]],
+                        &[0.0],
+                        &NaiveCpuGemmEngine,
+                    );
+                    let signature = committed
+                        .get(&41)
+                        .expect("candidate must commit")
+                        .iter()
+                        .map(|(child, is_active, _)| {
+                            let constraint =
+                                child.history().iter_all().next().expect("split constraint");
+                            match constraint {
+                                crate::beta_crown::branching::GraphConstraint::Relu(neuron) => (
+                                    neuron.node_name.clone(),
+                                    neuron.neuron_idx,
+                                    neuron.is_active,
+                                    *is_active,
+                                ),
+                                other => panic!("unexpected constraint: {other:?}"),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let fired = verifier
+                        .kfsb_f64_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let scalar_fired = verifier
+                        .adaptive_depth_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    (signature, fired, scalar_fired)
+                },
+            )
+        };
+
+        let (off_signature, off_fired, off_scalar_fired) = run("0", "0");
+        let (on_signature, on_fired, on_scalar_fired) = run("1", "0");
+        assert_eq!(
+            on_signature, off_signature,
+            "observation-only f64 telemetry cannot alter the committed split or children"
+        );
+        assert!(!off_fired, "gate-off path must not claim the one-shot");
+        assert!(!off_scalar_fired);
+        assert!(on_fired, "gate-on path must claim exactly one attempt");
+        assert!(!on_scalar_fired);
+
+        let (both_signature, both_f64_fired, both_scalar_fired) = run("1", "1");
+        assert_eq!(
+            both_signature, off_signature,
+            "simultaneous observers must preserve the committed split and children",
+        );
+        assert!(both_f64_fired, "f64 must retain its simultaneous one-shot");
+        assert!(
+            both_scalar_fired,
+            "the scalar observer must retain its simultaneous one-shot",
+        );
+    }
+
+    #[test]
     fn adaptive_depth_shadow_gate_and_budget_fail_closed() {
         assert!(!resolve_adaptive_depth_shadow_enabled(None));
         assert!(!resolve_adaptive_depth_shadow_enabled(Some("")));
@@ -899,13 +1603,18 @@ mod kfsb_multi_tests {
         assert!(!resolve_adaptive_depth_select_enabled(Some("0")));
         assert!(!resolve_adaptive_depth_select_enabled(Some("true")));
         assert!(resolve_adaptive_depth_select_enabled(Some("1")));
-        assert!(!resolve_adaptive_depth_evaluation_enabled(None, None));
-        assert!(resolve_adaptive_depth_evaluation_enabled(Some("1"), None));
-        assert!(resolve_adaptive_depth_evaluation_enabled(None, Some("1")));
-        assert!(!resolve_adaptive_depth_evaluation_enabled(
-            Some("true"),
-            Some("yes")
-        ));
+        assert!(!resolve_adaptive_depth_commit_enabled(None));
+        assert!(!resolve_adaptive_depth_commit_enabled(Some("")));
+        assert!(!resolve_adaptive_depth_commit_enabled(Some("0")));
+        assert!(!resolve_adaptive_depth_commit_enabled(Some("true")));
+        assert!(resolve_adaptive_depth_commit_enabled(Some("1")));
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        assert!(claim_adaptive_depth_attempt(&fired));
+        assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !claim_adaptive_depth_attempt(&fired),
+            "the observer must claim its deterministic one-shot exactly once"
+        );
 
         let now = std::time::Instant::now();
         assert!(adaptive_depth_shadow_deadline(now, None).is_some());
@@ -951,77 +1660,345 @@ mod kfsb_multi_tests {
         );
     }
 
-    fn complete_adaptive_depth_metric(score: f32) -> AdaptiveDepthShadowMetrics {
-        AdaptiveDepthShadowMetrics {
-            expected: 4,
-            bounded: 4,
-            surviving: 4,
-            post_min: score,
-            ..AdaptiveDepthShadowMetrics::default()
-        }
+    #[test]
+    fn typed_depth_two_budget_is_admitted_once_at_entry_and_fails_closed() {
+        let now = std::time::Instant::now();
+        assert!(
+            DepthTwoLookaheadBudget::admit(now, now.checked_add(std::time::Duration::from_secs(5)))
+                .is_none(),
+            "a typed wave may not start without the full five-second authority reserve"
+        );
+        let budget =
+            DepthTwoLookaheadBudget::admit(now, now.checked_add(std::time::Duration::from_secs(7)))
+                .expect("one second of optional work plus the reserve is admissible");
+        assert!(budget.available_at(now));
+        assert!(
+            !budget.available_at(
+                now.checked_add(std::time::Duration::from_secs(1))
+                    .expect("private deadline")
+            ),
+            "later phases must observe the entry-created deadline, not reset it"
+        );
+        assert!(
+            !budget.available_at(
+                now.checked_add(std::time::Duration::from_secs(2))
+                    .expect("expired private deadline")
+            ),
+            "expired typed work declines to the historical winner"
+        );
     }
 
     #[test]
-    fn adaptive_depth_authority_requires_three_complete_finite_trees() {
-        let mut metrics = vec![
-            complete_adaptive_depth_metric(1.0),
-            complete_adaptive_depth_metric(3.0),
-            complete_adaptive_depth_metric(2.0),
-        ];
-        assert_eq!(select_complete_adaptive_depth_rank(&metrics), Some(1));
-
-        metrics[0].post_min = 3.0;
-        assert_eq!(
-            select_complete_adaptive_depth_rank(&metrics),
-            Some(0),
-            "an exact score tie must preserve the earlier one-step rank"
-        );
-        metrics = vec![
-            complete_adaptive_depth_metric(-0.0),
-            complete_adaptive_depth_metric(0.0),
-            complete_adaptive_depth_metric(-1.0),
-        ];
-        assert_eq!(
-            select_complete_adaptive_depth_rank(&metrics),
-            Some(0),
-            "signed zero is a numerical tie, not a reason to reorder roots"
-        );
-
-        metrics[0] = complete_adaptive_depth_metric(1.0);
-        metrics[1].post_min = f32::NAN;
-        assert_eq!(select_complete_adaptive_depth_rank(&metrics), None);
-        metrics[1].post_min = f32::NEG_INFINITY;
-        assert_eq!(select_complete_adaptive_depth_rank(&metrics), None);
-        metrics[1] = complete_adaptive_depth_metric(3.0);
-        metrics[1].failures = 1;
-        assert_eq!(select_complete_adaptive_depth_rank(&metrics), None);
-        metrics[1] = complete_adaptive_depth_metric(3.0);
-        metrics[1].bounded = 3;
-        metrics[1].surviving = 3;
-        assert_eq!(select_complete_adaptive_depth_rank(&metrics), None);
-        assert_eq!(select_complete_adaptive_depth_rank(&metrics[..2]), None);
+    fn typed_depth_two_expired_overlay_append_is_transactional() {
+        let (graph, domain) = adaptive_depth_fixture();
+        let candidate = |neuron_idx| GraphKfsbCandidate {
+            node_name: "relu1".to_string(),
+            neuron_idx,
+            main_score: 1.0 - neuron_idx as f32,
+            backup_score: 0.0,
+        };
+        let mut prep = DomainPrep {
+            slot: 0,
+            straggler: 0,
+            cached_score_candidates: 0,
+            legacy_candidates_len: 1,
+            depth_two_lookahead_candidates: None,
+            attribution_diag: None,
+            candidates: vec![candidate(0)],
+            sides: vec![[SideSlot::Infeasible, SideSlot::Infeasible]],
+        };
+        let plan = DepthTwoLookaheadOverlayPlan {
+            selected: vec![candidate(0), candidate(1)],
+        };
+        let budget = DepthTwoLookaheadBudget::expired_at(std::time::Instant::now());
+        let mut sims: Vec<Option<MultiObjectiveGraphBabDomain>> = Vec::new();
+        let mut owners = Vec::new();
+        let verifier = kfsb_verifier(KfsbReduceOp::Min);
+        assert!(!verifier.append_depth_two_lookahead_overlay(
+            &graph,
+            &domain,
+            &[0.0],
+            0,
+            &mut prep,
+            plan,
+            budget,
+            &mut sims,
+            &mut owners,
+        ));
+        assert_eq!(prep.candidates.len(), 1);
+        assert_eq!(prep.sides.len(), 1);
+        assert!(prep.depth_two_lookahead_candidates.is_none());
+        assert!(sims.is_empty());
+        assert!(owners.is_empty());
     }
 
     #[test]
-    fn adaptive_depth_authority_accepts_only_certified_all_infeasible_infinity() {
-        let mut metrics = vec![
-            complete_adaptive_depth_metric(1.0),
-            complete_adaptive_depth_metric(2.0),
-            AdaptiveDepthShadowMetrics {
-                expected: 2,
-                infeasible: 2,
-                verified: 2,
-                post_min: f32::INFINITY,
-                ..AdaptiveDepthShadowMetrics::default()
+    fn typed_depth_two_recurrence_balances_both_children_in_f64() {
+        let finite = DepthTwoLookaheadSideScore::Finite;
+        let balanced =
+            depth_two_lookahead_score(-2.0, finite(5.0), finite(5.0), 0.5).expect("balanced");
+        let lopsided =
+            depth_two_lookahead_score(-2.0, finite(9.0), finite(1.0), 0.5).expect("lopsided");
+        assert!(
+            balanced > lopsided,
+            "product-over-sum bonus must prefer two strong child outcomes"
+        );
+        assert_eq!(
+            depth_two_lookahead_score(-2.0, finite(5.0), finite(5.0), 0.0),
+            Some(-2.0),
+            "lambda zero is exactly the one-step score"
+        );
+        assert_eq!(
+            depth_two_lookahead_score(
+                1.0,
+                DepthTwoLookaheadSideScore::Infeasible,
+                finite(4.0),
+                0.5,
+            ),
+            Some(3.0),
+            "one empty side uses the finite-side limit"
+        );
+        assert_eq!(
+            depth_two_lookahead_score(
+                f64::INFINITY,
+                DepthTwoLookaheadSideScore::Infeasible,
+                DepthTwoLookaheadSideScore::Infeasible,
+                0.5,
+            ),
+            Some(f64::INFINITY)
+        );
+        assert!(
+            depth_two_lookahead_score(
+                0.0,
+                DepthTwoLookaheadSideScore::Infeasible,
+                DepthTwoLookaheadSideScore::Infeasible,
+                0.5,
+            )
+            .is_none(),
+            "all-infeasible infinity requires the matching exact one-step state"
+        );
+        assert!(
+            depth_two_lookahead_score(0.0, finite(f64::MAX), finite(f64::MAX), 0.5)
+                .is_some_and(f64::is_finite),
+            "algebraically stable recurrence must not overflow a finite portfolio"
+        );
+        assert!(depth_two_lookahead_score(0.0, finite(-1.0), finite(2.0), 0.5).is_none());
+        assert!(depth_two_lookahead_score(0.0, finite(1.0), finite(2.0), f64::NAN).is_none());
+    }
+
+    #[test]
+    fn typed_depth_two_portfolio_is_complete_and_ties_keep_historical_winner() {
+        let tied = [(0, Some(1.0)), (1, Some(3.0)), (2, Some(3.0))];
+        assert_eq!(
+            select_complete_depth_two_lookahead(&tied, 3, 2),
+            Some((2, 3.0)),
+            "an exact tie must retain the historical one-step root"
+        );
+        assert_eq!(
+            select_complete_depth_two_lookahead(&tied, 3, 0),
+            Some((1, 3.0)),
+            "otherwise the first deterministic maximum wins"
+        );
+        assert!(select_complete_depth_two_lookahead(&tied[..2], 3, 0).is_none());
+        assert!(select_complete_depth_two_lookahead(
+            &[(0, Some(1.0)), (1, None), (2, Some(3.0))],
+            3,
+            0,
+        )
+        .is_none());
+        assert!(select_complete_depth_two_lookahead(
+            &[(0, Some(1.0)), (0, Some(2.0)), (2, Some(3.0))],
+            3,
+            0,
+        )
+        .is_none());
+        assert!(select_complete_depth_two_lookahead(&tied, 3, 9).is_none());
+    }
+
+    #[test]
+    fn typed_depth_two_frontier_target_is_explicit_worst_then_stable_slot() {
+        assert_eq!(
+            select_depth_two_frontier_worst_slot([(4, -0.1), (2, -0.8), (1, -0.8), (0, f32::NAN),]),
+            Some(1)
+        );
+        assert_eq!(select_depth_two_frontier_worst_slot([(0, f32::NAN)]), None);
+    }
+
+    #[test]
+    fn typed_depth_two_upper_mode_fails_closed_without_mutating_legacy_straggler() {
+        crate::tests::with_serialized_env_vars_removed(
+            &[
+                "NY_MO_KFSB",
+                "NY_BRANCH_KFSB_CHILDSIM",
+                "NY_MO_ADAPTIVE_DEPTH_SHADOW",
+                "NY_MO_ADAPTIVE_DEPTH_SELECT",
+                "NY_MO_ADAPTIVE_DEPTH_COMMIT",
+                "NY_MO_KFSB_F64_SHADOW",
+                "NY_MO_KFSB_REDUCE",
+                "NY_MO_KFSB_K",
+            ],
+            || {
+                let bounds = [(-9.0, 1.0), (-1.0, 8.0), (-4.0, 3.0)];
+                let verified = [false, false, false];
+                assert_eq!(
+                    select_kfsb_straggler(&bounds, &verified, false),
+                    Some((0, -9.0)),
+                    "lower-bound mode chooses the smallest lower bound"
+                );
+                assert_eq!(
+                    select_kfsb_straggler(&bounds, &verified, true),
+                    Some((1, -8.0)),
+                    "upper-bound mode chooses the highest raw upper via normalized -upper"
+                );
+                let upper = BetaCrownVerifier::new(BetaCrownConfig {
+                    branching_heuristic: BranchingHeuristic::Kfsb,
+                    verify_upper_bound: true,
+                    use_kfsb_multi_branching: false,
+                    depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
+                        mode: DepthTwoBranchLookaheadMode::Select,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                assert!(
+                    !upper.kfsb_multi_wave_enabled_at_round(0),
+                    "phase-1 typed advice must decline rather than score a highest-upper target \
+                     with the historical smallest-lower prep"
+                );
             },
-        ];
-        assert_eq!(select_complete_adaptive_depth_rank(&metrics), Some(2));
+        );
+    }
 
-        metrics[2] = complete_adaptive_depth_metric(f32::INFINITY);
+    #[test]
+    fn typed_depth_two_missing_babsr_entry_cannot_fabricate_exact_portfolio() {
+        let unstable = (0..15)
+            .map(|neuron_idx| ("relu".to_string(), neuron_idx))
+            .collect::<Vec<_>>();
+        let (mut scored, complete) =
+            materialize_kfsb_candidates_with_completeness(&unstable, |(_, neuron_idx)| {
+                (*neuron_idx != 14).then_some((-1.0 - *neuron_idx as f32, 0.0))
+            });
+        scored.sort_by(|a, b| {
+            crate::cmp_utils::nan_last_descending_cmp(&a.main_score, &b.main_score)
+        });
+        assert!(!complete);
         assert_eq!(
-            select_complete_adaptive_depth_rank(&metrics),
-            None,
-            "infinite propagated bounds are not an all-infeasible certificate"
+            scored[0].neuron_idx, 14,
+            "the historical zero-fill would make the missing entry look best"
+        );
+        assert!(
+            select_depth_two_root_portfolio(&scored, complete, 15).is_none(),
+            "typed advice must decline even when zero-filling appears to make an exact total"
+        );
+
+        let (mut complete_scores, complete) =
+            materialize_kfsb_candidates_with_completeness(&unstable, |(_, neuron_idx)| {
+                Some((-1.0 - *neuron_idx as f32, 0.0))
+            });
+        complete_scores.sort_by(|a, b| {
+            crate::cmp_utils::nan_last_descending_cmp(&a.main_score, &b.main_score)
+        });
+        assert!(complete);
+        assert_eq!(
+            select_depth_two_root_portfolio(&complete_scores, complete, 15)
+                .expect("complete score map")
+                .len(),
+            15
+        );
+    }
+
+    #[test]
+    fn typed_depth_two_capture_is_hard_capped_at_two_times_fifteen() {
+        let candidates = (0..17)
+            .map(|neuron_idx| GraphKfsbCandidate {
+                node_name: "relu".to_string(),
+                neuron_idx,
+                main_score: (17 - neuron_idx) as f32,
+                backup_score: 0.0,
+            })
+            .collect();
+        let sides = (0..17)
+            .map(|candidate| {
+                [
+                    SideSlot::Sim(2 * candidate),
+                    SideSlot::Sim(2 * candidate + 1),
+                ]
+            })
+            .collect();
+        let mut prep = DomainPrep {
+            slot: 0,
+            straggler: 0,
+            cached_score_candidates: 0,
+            legacy_candidates_len: 2,
+            depth_two_lookahead_candidates: Some((2..17).collect()),
+            attribution_diag: None,
+            candidates,
+            sides,
+        };
+        let capture =
+            DepthTwoLookaheadCapture::new(0, &prep, 34, 15).expect("complete 15-root overlay");
+        assert_eq!(capture.planned_slot_count(), 30);
+        assert!(DepthTwoLookaheadCapture::new(0, &prep, 33, 15).is_none());
+        assert!(DepthTwoLookaheadCapture::new(0, &prep, 34, 16).is_none());
+        prep.depth_two_lookahead_candidates
+            .as_mut()
+            .expect("paper mapping")[14] = 15;
+        assert!(
+            DepthTwoLookaheadCapture::new(0, &prep, 34, 15).is_none(),
+            "duplicate paper identities must fail closed"
+        );
+    }
+
+    #[test]
+    fn typed_depth_two_advice_crosses_only_revalidated_first_level_identity() {
+        let (_graph, domain) = adaptive_depth_fixture();
+        let prep = DomainPrep {
+            slot: 0,
+            straggler: 0,
+            cached_score_candidates: 0,
+            legacy_candidates_len: 1,
+            depth_two_lookahead_candidates: Some(vec![0]),
+            attribution_diag: None,
+            candidates: vec![GraphKfsbCandidate {
+                node_name: "relu1".to_string(),
+                neuron_idx: 0,
+                main_score: 1.0,
+                backup_score: 0.0,
+            }],
+            sides: vec![[SideSlot::Sim(0), SideSlot::Infeasible]],
+        };
+        let winner = select_complete_depth_two_lookahead(&[(0, Some(2.0))], 1, 0)
+            .expect("complete advice")
+            .0;
+        let identity =
+            adaptive_depth_authority_identity(0, 41, &prep, winner).expect("root identity");
+        let values = [Some(0.25)];
+        let sims = [Some(domain)];
+        assert_eq!(
+            resolve_adaptive_depth_authority_candidate(
+                &identity,
+                0,
+                41,
+                &prep,
+                &values,
+                &sims,
+                KfsbReduceOp::Min,
+            )
+            .map(|(candidate, _)| candidate),
+            Some(0)
+        );
+        assert!(
+            resolve_adaptive_depth_authority_candidate(
+                &identity,
+                0,
+                41,
+                &prep,
+                &values,
+                &[None],
+                KfsbReduceOp::Min,
+            )
+            .is_none(),
+            "missing authoritative first-level child must decline private advice"
         );
     }
 
@@ -1038,6 +2015,9 @@ mod kfsb_multi_tests {
             slot: 0,
             straggler: 0,
             cached_score_candidates: 0,
+            legacy_candidates_len: 1,
+            depth_two_lookahead_candidates: None,
+            attribution_diag: None,
             candidates: vec![candidate],
             sides: vec![[SideSlot::Sim(0), SideSlot::Infeasible]],
         };
@@ -1137,110 +2117,75 @@ mod kfsb_multi_tests {
     }
 
     #[test]
-    fn adaptive_depth_authority_portfolio_preserves_historical_near_tie_winner() {
-        let candidate = |node: &str, main: f32| GraphKfsbCandidate {
-            node_name: node.to_string(),
-            neuron_idx: 0,
-            main_score: main,
-            backup_score: 0.0,
-        };
-        let mut candidates = vec![
-            candidate("exact-first", 1.0),
-            candidate("historical", 2.0),
-            candidate("third", 0.0),
-        ];
-        let exact_lead = f32::from_bits(1.0_f32.to_bits() + 4);
-        let mut values = vec![(exact_lead, exact_lead), (1.0, 1.0), (0.0, 0.0)];
-
-        let exact = rank_adaptive_depth_candidates(&candidates, &values, KfsbReduceOp::Min);
-        assert_eq!(exact[0].0, 0, "exact ranking sees the sub-1e-6 lead");
-        let historical =
-            pick_kfsb_candidate(&candidates, values.iter().copied(), KfsbReduceOp::Min)
-                .expect("historical winner");
+    fn adaptive_depth_proxy_advice_can_differ_but_ties_preserve_history() {
         assert_eq!(
-            historical.0, 1,
-            "the historical 1e-6 tie rule uses the larger main score"
+            adaptive_depth_proxy_recommended_rank(&[0.1, 0.9, 0.2]),
+            Some(1),
+            "the bounded proxy must be capable of recommending a nonhistorical root",
         );
-
-        let portfolio = rank_adaptive_depth_authority_portfolio(
-            &candidates,
-            &values,
-            &[true, true, true],
-            KfsbReduceOp::Min,
-        )
-        .expect("complete captured portfolio");
         assert_eq!(
-            portfolio.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
-            vec![1, 0, 2]
+            adaptive_depth_proxy_recommended_rank(&[0.5, 0.5, 0.5]),
+            Some(0),
+            "ties must preserve historical rank zero",
         );
-        let tied_depth2 = vec![
-            complete_adaptive_depth_metric(4.0),
-            complete_adaptive_depth_metric(4.0),
-            complete_adaptive_depth_metric(4.0),
-        ];
-        let selected_rank =
-            select_complete_adaptive_depth_rank(&tied_depth2).expect("complete depth-2 metrics");
-        assert_eq!(portfolio[selected_rank].0, historical.0);
-
-        assert!(rank_adaptive_depth_authority_portfolio(
-            &candidates,
-            &values,
-            &[true, false, true],
-            KfsbReduceOp::Min,
-        )
-        .is_none());
-        assert!(rank_adaptive_depth_authority_portfolio(
-            &candidates,
-            &values,
-            &[true, true, false],
-            KfsbReduceOp::Min,
-        )
-        .is_none());
-
-        candidates.push(candidate("outside-capture", 3.0));
-        values.push((5.0, 5.0));
-        assert!(rank_adaptive_depth_authority_portfolio(
-            &candidates,
-            &values,
-            &[true, true, true],
-            KfsbReduceOp::Min,
-        )
-        .is_none());
+        assert_eq!(
+            adaptive_depth_proxy_recommended_rank(&[0.1, f32::NAN, 0.2]),
+            None,
+            "malformed advice must fail closed",
+        );
     }
 
     #[test]
-    fn adaptive_depth_capture_is_fixed_size_on_large_frontier() {
-        let consumed = std::cell::Cell::new(0usize);
-        let mut capture = AdaptiveDepthShadowCapture::from_sim_indices(
-            0,
-            (0..1_000_000usize).inspect(|_| consumed.set(consumed.get() + 1)),
-            1_000_000,
-        );
-        let small = AdaptiveDepthShadowCapture::from_sim_indices(0, 0..6usize, 6);
+    fn adaptive_depth_capture_is_fixed_size_and_retains_only_scalars() {
+        let sides = [
+            [SideSlot::Sim(0), SideSlot::Sim(1)],
+            [SideSlot::Sim(2), SideSlot::Sim(3)],
+            [SideSlot::Sim(4), SideSlot::Sim(5)],
+        ];
+        let mut capture =
+            AdaptiveDepthShadowCapture::from_candidate_indices(0, &sides, &[0, 1, 2], 1_000_000)
+                .expect("valid fixed capture");
+        let small = AdaptiveDepthShadowCapture::from_candidate_indices(0, &sides, &[0, 1, 2], 6)
+            .expect("valid fixed capture");
 
-        assert_eq!(AdaptiveDepthShadowCapture::slot_capacity(), 6);
+        assert_eq!(AdaptiveDepthShadowCapture::slot_capacity(), 128);
         assert_eq!(capture.planned_slot_count(), 6);
-        assert_eq!(capture.captured_map_count(), 0);
-        assert_eq!(consumed.get(), 6, "capture planning must stop at six slots");
-        assert_eq!(
-            size_of_val(&capture),
-            size_of_val(&small),
-            "capture metadata must not scale with the simulated frontier"
-        );
+        assert_eq!(capture.captured_score_count(), 0);
+        assert_eq!(size_of_val(&capture), size_of_val(&small));
         for sim_index in 0..6 {
             assert!(capture.contains_sim(sim_index));
+            assert!(capture.insert_proxy_score(sim_index, sim_index as f32 / 10.0));
         }
-        assert!(!capture.contains_sim(6));
         assert!(!capture.contains_sim(999_999));
-
-        for sim_index in 0..6 {
-            capture.insert_node_bounds(sim_index, HashMap::new());
-        }
-        capture.insert_node_bounds(999_999, HashMap::new());
+        assert!(!capture.insert_proxy_score(999_999, 0.0));
+        assert!(
+            !capture.insert_proxy_score(0, 1.0),
+            "a side is captured once"
+        );
+        assert!(!capture.insert_proxy_score(1, f32::NAN));
+        assert_eq!(capture.captured_score_count(), 6);
+    }
+    #[test]
+    fn adaptive_depth_peak_ledger_rejects_overflow_and_coexisting_peak() {
+        let mut overflow = AdaptiveDepthPrivatePeakLedger::new(usize::MAX);
         assert_eq!(
-            capture.captured_map_count(),
-            6,
-            "captured result maps must remain bounded by the fixed slot count"
+            overflow.admit([usize::MAX, 1]),
+            Err(AdaptiveDepthPrivatePeakDecline::ArithmeticOverflow),
+        );
+        assert_eq!(overflow.admitted_peak_bytes(), 0);
+
+        let mut coexistence = AdaptiveDepthPrivatePeakLedger::new(100);
+        assert_eq!(coexistence.admit([40]), Ok(40));
+        assert_eq!(coexistence.admit([40, 40]), Ok(80));
+        assert_eq!(
+            coexistence.admit([40, 40, 21]),
+            Err(AdaptiveDepthPrivatePeakDecline::PeakCapExceeded),
+            "components that fit alone must still be rejected when live together",
+        );
+        assert_eq!(
+            coexistence.admitted_peak_bytes(),
+            80,
+            "a refused stage must not publish a larger admitted peak",
         );
     }
 
@@ -1311,41 +2256,6 @@ mod kfsb_multi_tests {
     }
 
     #[test]
-    fn adaptive_depth_base_select_expired_budget_fails_before_scoring() {
-        let (graph, domain) = adaptive_depth_fixture();
-        let verifier = kfsb_verifier(KfsbReduceOp::Min);
-        let now = std::time::Instant::now();
-        let error = verifier
-            .select_adaptive_depth_base_candidate_with_budget(
-                &graph,
-                &domain,
-                &["relu1".to_string()],
-                &[1.0],
-                now,
-                None,
-            )
-            .err()
-            .expect("expired private deadline must fail closed");
-        assert!(error.is_deadline_exceeded());
-
-        let shadow_deadline = now
-            .checked_add(std::time::Duration::from_secs(10))
-            .expect("future shadow deadline");
-        let error = verifier
-            .select_adaptive_depth_base_candidate_with_budget(
-                &graph,
-                &domain,
-                &["relu1".to_string()],
-                &[1.0],
-                shadow_deadline,
-                now.checked_add(std::time::Duration::from_secs(5)),
-            )
-            .err()
-            .expect("exhausted authority reserve must fail closed");
-        assert!(error.is_deadline_exceeded());
-    }
-
-    #[test]
     fn adaptive_depth_babsr_scoring_rejects_expired_private_deadline() {
         let (graph, domain) = adaptive_depth_fixture();
         let verifier = kfsb_verifier(KfsbReduceOp::Min);
@@ -1386,8 +2296,8 @@ mod kfsb_multi_tests {
         assert!(domain.cached_las().iter().all(Option::is_none));
     }
 
-    /// The observer performs extra private dense work, but the authoritative
-    /// committed split, child histories, bounds, masks, and depth remain exact.
+    /// The scalar observer leaves committed histories, bounds, masks, and depth
+    /// exact.
     #[ntest::timeout(30000)]
     #[test]
     fn adaptive_depth_shadow_on_off_preserves_committed_children() {
@@ -1405,6 +2315,7 @@ mod kfsb_multi_tests {
                 &[
                     ("NY_MO_ADAPTIVE_DEPTH_SHADOW", gate),
                     ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                    ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0"),
                     ("NY_MO_KFSB_REDUCE", "min"),
                 ],
                 || {
@@ -1421,6 +2332,7 @@ mod kfsb_multi_tests {
                     ];
                     let wave = vec![(17usize, &domain, unstable)];
                     let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                        0,
                         &graph,
                         &wave,
                         &["relu1".to_string()],
@@ -1432,7 +2344,7 @@ mod kfsb_multi_tests {
                         .get(&17)
                         .expect("scored domain commits")
                         .iter()
-                        .map(|(child, active)| {
+                        .map(|(child, active, _)| {
                             (
                                 *active,
                                 child.history().constraints.clone(),
@@ -1453,13 +2365,68 @@ mod kfsb_multi_tests {
         assert_eq!(run("0"), run("1"));
     }
 
-    /// Test-only metrics force the third exact one-step-ranked root to win depth 2.
-    /// The production commit path must take exactly that root's pre-existing
-    /// first-level children, while every incomplete/corrupt authority result
-    /// falls back bit-for-bit to the historical one-step winner.
+    /// SELECT is now an observer gate only and cannot publish a root or child.
     #[ntest::timeout(30000)]
     #[test]
-    fn adaptive_depth_selection_commits_authoritative_children_and_faults_fall_back() {
+    fn adaptive_depth_select_is_advice_only_and_cannot_publish_children() {
+        type Snapshot = Vec<(bool, Vec<GraphNeuronConstraint>, usize)>;
+
+        let (graph, domain) = adaptive_depth_fixture();
+        let run = |selection: &str, reduce: &str| -> Snapshot {
+            crate::tests::with_serialized_env_vars(
+                &[
+                    ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0"),
+                    ("NY_MO_ADAPTIVE_DEPTH_SELECT", selection),
+                    ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0"),
+                    ("NY_MO_KFSB_CERT_REUSE", "0"),
+                    ("NY_MO_KFSB_REDUCE", reduce),
+                ],
+                || {
+                    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                        branching_heuristic: BranchingHeuristic::Kfsb,
+                        fsb_candidates: 3,
+                        beta_iterations: 0,
+                        batch_size: 4,
+                        min_batch_fill_ratio: 1.0,
+                        max_relu_split_depth: 2,
+                        ..Default::default()
+                    });
+                    let unstable = (0..3).map(|index| ("relu1".to_string(), index)).collect();
+                    let wave = vec![(17usize, &domain, unstable)];
+                    verifier
+                        .select_graph_branch_kfsb_multi_batched(
+                            0,
+                            &graph,
+                            &wave,
+                            &["relu1".to_string()],
+                            &[vec![1.0]],
+                            &[0.0],
+                            &NaiveCpuGemmEngine,
+                        )
+                        .get(&17)
+                        .expect("historical selection commits")
+                        .iter()
+                        .map(|(child, active, _)| {
+                            (*active, child.history().constraints.clone(), child.depth())
+                        })
+                        .collect()
+                },
+            )
+        };
+
+        for reduce in ["min", "max"] {
+            assert_eq!(
+                run("1", reduce),
+                run("0", reduce),
+                "advice-only SELECT must preserve historical children"
+            );
+        }
+    }
+    /// Advice-only SELECT may observe any historical horizon but must never
+    /// alter one- or four-decision covers.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn adaptive_depth_selection_observes_without_overriding_depth_one_or_four() {
         type Snapshot = Vec<(
             bool,
             Vec<GraphNeuronConstraint>,
@@ -1468,48 +2435,393 @@ mod kfsb_multi_tests {
             usize,
         )>;
 
-        fn snapshot_children(children: &[(MultiObjectiveGraphBabDomain, bool)]) -> Snapshot {
-            children
-                .iter()
-                .map(|(child, active)| {
-                    (
-                        *active,
-                        child.history().constraints.clone(),
-                        child
-                            .objective_bounds()
-                            .iter()
-                            .map(|(lower, upper)| (lower.to_bits(), upper.to_bits()))
-                            .collect(),
-                        child.verified().to_vec(),
-                        child.depth(),
-                    )
-                })
-                .collect()
-        }
-
-        let (graph, domain) = adaptive_depth_fixture();
-        let run = |shadow: &str, selection: &str, fault: &str| -> Snapshot {
+        fn run(
+            graph: &GraphNetwork,
+            domain: &MultiObjectiveGraphBabDomain,
+            parent_index: usize,
+            unstable_count: usize,
+            production_depth: usize,
+            shadow: &str,
+            selection: &str,
+        ) -> (Snapshot, bool) {
             crate::tests::with_serialized_env_vars(
                 &[
                     ("NY_MO_ADAPTIVE_DEPTH_SHADOW", shadow),
                     ("NY_MO_ADAPTIVE_DEPTH_SELECT", selection),
+                    ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0"),
+                    ("NY_MO_KFSB_CERT_REUSE", "0"),
                     ("NY_MO_KFSB_REDUCE", "min"),
-                    ("NY_TEST_MO_ADAPTIVE_DEPTH_FAULT", fault),
+                ],
+                || {
+                    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                        branching_heuristic: BranchingHeuristic::Kfsb,
+                        fsb_candidates: unstable_count,
+                        beta_iterations: 0,
+                        batch_size: if production_depth == 4 { 16 } else { 64 },
+                        min_batch_fill_ratio: 1.0,
+                        max_relu_split_depth: production_depth,
+                        ..Default::default()
+                    });
+                    let unstable = (0..unstable_count)
+                        .map(|index| ("relu1".to_string(), index))
+                        .collect();
+                    let wave = vec![(parent_index, domain, unstable)];
+                    let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                        0,
+                        graph,
+                        &wave,
+                        &["relu1".to_string()],
+                        &[vec![1.0]],
+                        &[0.0],
+                        &NaiveCpuGemmEngine,
+                    );
+                    let snapshot = committed
+                        .get(&parent_index)
+                        .expect("scored domain commits")
+                        .iter()
+                        .map(|(child, root_phase, _)| {
+                            (
+                                *root_phase,
+                                child.history().constraints.clone(),
+                                child
+                                    .objective_bounds()
+                                    .iter()
+                                    .map(|(lower, upper)| (lower.to_bits(), upper.to_bits()))
+                                    .collect(),
+                                child.verified().to_vec(),
+                                child.depth(),
+                            )
+                        })
+                        .collect();
+                    (
+                        snapshot,
+                        verifier
+                            .adaptive_depth_shadow_fired
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                },
+            )
+        }
+
+        let (depth_one_graph, depth_one_domain) = adaptive_depth_fixture();
+        let (depth_four_graph, depth_four_domain) = adaptive_depth_four_candidate_fixture();
+        for (graph, domain, parent_index, unstable_count, production_depth, expected_leaves) in [
+            (&depth_one_graph, &depth_one_domain, 51, 3, 1, 2),
+            (&depth_four_graph, &depth_four_domain, 53, 4, 4, 16),
+        ] {
+            let (control, control_fired) = run(
+                graph,
+                domain,
+                parent_index,
+                unstable_count,
+                production_depth,
+                "0",
+                "0",
+            );
+            assert!(!control_fired);
+            assert_eq!(control.len(), expected_leaves);
+
+            let (observed, observed_fired) = run(
+                graph,
+                domain,
+                parent_index,
+                unstable_count,
+                production_depth,
+                "0",
+                "1",
+            );
+            assert!(
+                observed_fired,
+                "SELECT observer must claim its one-shot at either horizon"
+            );
+            assert_eq!(
+                observed, control,
+                "depth {production_depth} must not override"
+            );
+
+            let (shadowed, shadowed_fired) = run(
+                graph,
+                domain,
+                parent_index,
+                unstable_count,
+                production_depth,
+                "1",
+                "1",
+            );
+            assert!(shadowed_fired, "explicit SHADOW may run the mismatch");
+            assert_eq!(
+                shadowed, control,
+                "depth {production_depth} shadow observation must not override"
+            );
+        }
+    }
+
+    /// COMMIT is also an observer gate until true bounded second-child
+    /// propagation exists; it cannot publish a replay cover or UNSAT verdict.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn adaptive_depth_commit_is_advice_only_and_cannot_publish_children_or_unsat() {
+        type Snapshot = Vec<(
+            bool,
+            Vec<GraphNeuronConstraint>,
+            Vec<(u32, u32)>,
+            Vec<bool>,
+            usize,
+        )>;
+
+        let (graph, domain) = adaptive_depth_fixture();
+        let run = |commit: &str| -> Snapshot {
+            crate::tests::with_serialized_env_vars(
+                &[
+                    ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0"),
+                    ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                    ("NY_MO_ADAPTIVE_DEPTH_COMMIT", commit),
+                    ("NY_MO_KFSB_CERT_REUSE", "0"),
+                    ("NY_MO_KFSB_REDUCE", "min"),
                 ],
                 || {
                     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
                         branching_heuristic: BranchingHeuristic::Kfsb,
                         fsb_candidates: 3,
                         beta_iterations: 0,
+                        batch_size: 4,
+                        min_batch_fill_ratio: 1.0,
+                        max_relu_split_depth: 2,
                         ..Default::default()
                     });
-                    let unstable = vec![
-                        ("relu1".to_string(), 0),
-                        ("relu1".to_string(), 1),
-                        ("relu1".to_string(), 2),
-                    ];
+                    let unstable = (0..3).map(|index| ("relu1".to_string(), index)).collect();
                     let wave = vec![(17usize, &domain, unstable)];
+                    verifier
+                        .select_graph_branch_kfsb_multi_batched(
+                            0,
+                            &graph,
+                            &wave,
+                            &["relu1".to_string()],
+                            &[vec![1.0]],
+                            &[0.0],
+                            &NaiveCpuGemmEngine,
+                        )
+                        .get(&17)
+                        .expect("historical selection commits")
+                        .iter()
+                        .map(|(child, active, effect)| {
+                            assert!(
+                                !matches!(effect, KfsbCertEffect::ParentComplete(_)),
+                                "advice-only M28 cannot publish an UNSAT close"
+                            );
+                            (
+                                *active,
+                                child.history().constraints.clone(),
+                                child
+                                    .objective_bounds()
+                                    .iter()
+                                    .map(|(lower, upper)| (lower.to_bits(), upper.to_bits()))
+                                    .collect(),
+                                child.verified().to_vec(),
+                                child.depth(),
+                            )
+                        })
+                        .collect()
+                },
+            )
+        };
+
+        assert_eq!(
+            run("1"),
+            run("0"),
+            "advice-only COMMIT must preserve historical children and verdicts"
+        );
+    }
+    /// Arming the legacy COMMIT observer on a depth-four wave preserves every
+    /// common-plan leaf.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn adaptive_depth_commit_preserves_depth_four_control_exactly() {
+        type Snapshot = Vec<(
+            bool,
+            Vec<GraphNeuronConstraint>,
+            Vec<(u32, u32)>,
+            Vec<bool>,
+            usize,
+        )>;
+
+        let (graph, domain) = adaptive_depth_four_candidate_fixture();
+        let run = |commit: &str| -> Snapshot {
+            crate::tests::with_serialized_env_vars(
+                &[
+                    ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0"),
+                    ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                    ("NY_MO_ADAPTIVE_DEPTH_COMMIT", commit),
+                    ("NY_MO_KFSB_CERT_REUSE", "0"),
+                    ("NY_MO_KFSB_REDUCE", "min"),
+                ],
+                || {
+                    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                        branching_heuristic: BranchingHeuristic::Kfsb,
+                        fsb_candidates: 4,
+                        beta_iterations: 0,
+                        batch_size: 16,
+                        min_batch_fill_ratio: 1.0,
+                        max_relu_split_depth: 4,
+                        ..Default::default()
+                    });
+                    let unstable = (0..4).map(|index| ("relu1".to_string(), index)).collect();
+                    let wave = vec![(23usize, &domain, unstable)];
+                    verifier
+                        .select_graph_branch_kfsb_multi_batched(
+                            0,
+                            &graph,
+                            &wave,
+                            &["relu1".to_string()],
+                            &[vec![1.0]],
+                            &[0.0],
+                            &NaiveCpuGemmEngine,
+                        )
+                        .get(&23)
+                        .expect("scored domain commits")
+                        .iter()
+                        .map(|(child, root_phase, _)| {
+                            (
+                                *root_phase,
+                                child.history().constraints.clone(),
+                                child
+                                    .objective_bounds()
+                                    .iter()
+                                    .map(|(lower, upper)| (lower.to_bits(), upper.to_bits()))
+                                    .collect(),
+                                child.verified().to_vec(),
+                                child.depth(),
+                            )
+                        })
+                        .collect()
+                },
+            )
+        };
+
+        let control = run("0");
+        let armed = run("1");
+        assert_eq!(control.len(), 16);
+        assert!(control
+            .iter()
+            .all(|(_, history, _, _, depth)| history.len() == 4 && *depth == 4));
+        assert_eq!(armed, control);
+    }
+
+    /// An ineligible COMMIT horizon must not consume the verifier-lifetime
+    /// observer receipt needed by the next eligible depth-two wave.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn adaptive_depth_commit_claims_first_eligible_wave_on_same_verifier() {
+        crate::tests::with_serialized_env_vars(
+            &[
+                ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "1"),
+                ("NY_MO_KFSB_CERT_REUSE", "0"),
+                ("NY_MO_KFSB_REDUCE", "min"),
+            ],
+            || {
+                let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                    branching_heuristic: BranchingHeuristic::Kfsb,
+                    fsb_candidates: 4,
+                    beta_iterations: 0,
+                    batch_size: 16,
+                    min_batch_fill_ratio: 1.0,
+                    max_relu_split_depth: 4,
+                    ..Default::default()
+                });
+
+                let (depth_four_graph, depth_four_domain) = adaptive_depth_four_candidate_fixture();
+                let depth_four_wave = vec![(
+                    23usize,
+                    &depth_four_domain,
+                    (0..4).map(|index| ("relu1".to_string(), index)).collect(),
+                )];
+                let depth_four = verifier.select_graph_branch_kfsb_multi_batched(
+                    0,
+                    &depth_four_graph,
+                    &depth_four_wave,
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &NaiveCpuGemmEngine,
+                );
+                assert_eq!(depth_four.get(&23).map(Vec::len), Some(16));
+                assert!(
+                    !verifier
+                        .adaptive_depth_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "the ineligible depth-four wave must leave the receipt untouched",
+                );
+
+                let (depth_two_graph, depth_two_domain) = adaptive_depth_fixture();
+                let depth_two_wave: Vec<_> = (100usize..104)
+                    .map(|parent_index| {
+                        (
+                            parent_index,
+                            &depth_two_domain,
+                            (0..3).map(|index| ("relu1".to_string(), index)).collect(),
+                        )
+                    })
+                    .collect();
+                let depth_two = verifier.select_graph_branch_kfsb_multi_batched(
+                    5,
+                    &depth_two_graph,
+                    &depth_two_wave,
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &NaiveCpuGemmEngine,
+                );
+                assert_eq!(depth_two.len(), depth_two_wave.len());
+                assert!(depth_two.values().all(|children| children.len() == 4));
+                assert!(
+                    verifier
+                        .adaptive_depth_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "the next eligible depth-two wave must claim the same verifier receipt",
+                );
+            },
+        );
+    }
+
+    /// Adding an ineligible COMMIT gate must not alter M27 SHADOW or SELECT
+    /// output/state behavior on the historical first captured parent.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn adaptive_depth_ineligible_commit_preserves_shadow_select_interactions() {
+        type Snapshot = Vec<(
+            bool,
+            Vec<GraphNeuronConstraint>,
+            Vec<(u32, u32)>,
+            Vec<bool>,
+            usize,
+        )>;
+
+        let (graph, domain) = adaptive_depth_four_candidate_fixture();
+        let run = |shadow: &str, selection: &str, commit: &str| {
+            crate::tests::with_serialized_env_vars(
+                &[
+                    ("NY_MO_ADAPTIVE_DEPTH_SHADOW", shadow),
+                    ("NY_MO_ADAPTIVE_DEPTH_SELECT", selection),
+                    ("NY_MO_ADAPTIVE_DEPTH_COMMIT", commit),
+                    ("NY_MO_KFSB_CERT_REUSE", "0"),
+                    ("NY_MO_KFSB_REDUCE", "min"),
+                ],
+                || {
+                    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                        branching_heuristic: BranchingHeuristic::Kfsb,
+                        fsb_candidates: 4,
+                        beta_iterations: 0,
+                        batch_size: 16,
+                        min_batch_fill_ratio: 1.0,
+                        max_relu_split_depth: 4,
+                        ..Default::default()
+                    });
+                    let unstable = (0..4).map(|index| ("relu1".to_string(), index)).collect();
+                    let wave = vec![(41usize, &domain, unstable)];
                     let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                        0,
                         &graph,
                         &wave,
                         &["relu1".to_string()],
@@ -1517,67 +2829,41 @@ mod kfsb_multi_tests {
                         &[0.0],
                         &NaiveCpuGemmEngine,
                     );
-                    snapshot_children(committed.get(&17).expect("scored domain commits"))
+                    let snapshot: Snapshot = committed
+                        .get(&41)
+                        .expect("depth-four domain commits")
+                        .iter()
+                        .map(|(child, root_phase, _)| {
+                            (
+                                *root_phase,
+                                child.history().constraints.clone(),
+                                child
+                                    .objective_bounds()
+                                    .iter()
+                                    .map(|(lower, upper)| (lower.to_bits(), upper.to_bits()))
+                                    .collect(),
+                                child.verified().to_vec(),
+                                child.depth(),
+                            )
+                        })
+                        .collect();
+                    (
+                        snapshot,
+                        verifier
+                            .adaptive_depth_shadow_fired
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
                 },
             )
         };
 
-        let control = run("0", "0", "force-third");
-        assert_eq!(
-            run("1", "0", "force-third"),
-            control,
-            "shadow-only mode must remain observation-only"
-        );
-        let promoted = run("0", "1", "force-third");
-        assert_ne!(
-            promoted, control,
-            "the forced depth-2 winner must differ from the one-step winner"
-        );
-        assert_eq!(promoted.len(), 2, "both selected root sides are feasible");
-        let root_key = |snapshot: &Snapshot| {
-            let root = snapshot[0].1.first().expect("committed root constraint");
-            (root.node_name.clone(), root.neuron_idx)
-        };
-        assert_ne!(root_key(&promoted), root_key(&control));
-        assert!(promoted
-            .iter()
-            .all(|(_, history, _, _, depth)| history.len() == 1 && *depth == 1));
+        let shadow = run("1", "0", "0");
+        assert!(shadow.1);
+        assert_eq!(run("1", "0", "1"), shadow);
 
-        // Rebuild each selected root side directly from the untouched parent.
-        // Exact snapshots prove the commit used authoritative first-level
-        // children rather than any private depth-2 leaf or propagated bound.
-        let expected: Snapshot = promoted
-            .iter()
-            .map(|(_, history, _, _, _)| {
-                let constraint = history.first().expect("one root constraint").clone();
-                let child = domain
-                    .with_constraint(&graph, constraint, false, &[0.0])
-                    .expect("selected root construction")
-                    .expect("selected root side remains feasible");
-                snapshot_children(&[(child, history[0].is_active)])
-                    .pop()
-                    .expect("one expected child")
-            })
-            .collect();
-        assert_eq!(promoted, expected);
-
-        for fault in [
-            "timeout",
-            "nan-bounds",
-            "failed-leaf",
-            "construction-error",
-            "shape-error",
-            "malformed-counts",
-            "partial-metrics",
-            "missing-side",
-            "identity-mismatch",
-        ] {
-            assert_eq!(
-                run("0", "1", fault),
-                control,
-                "fault {fault} must preserve committed histories and bound bits"
-            );
-        }
+        let selected = run("0", "1", "0");
+        assert!(selected.1);
+        assert_eq!(run("0", "1", "1"), selected);
     }
 
     #[test]
@@ -1657,7 +2943,9 @@ mod kfsb_multi_tests {
         .expect("captured lA");
         let mut captured_map = HashMap::new();
         captured_map.insert("relu1".to_string(), captured);
-        domain.cached_las[0] = Some(CachedLinearBounds::from_linear_bounds_map(captured_map));
+        domain.cached_las[0] = Some(Arc::new(CachedLinearBounds::from_linear_bounds_map(
+            captured_map,
+        )));
 
         let verifier = BetaCrownVerifier::new(BetaCrownConfig {
             branching_heuristic: BranchingHeuristic::Kfsb,
@@ -1679,6 +2967,7 @@ mod kfsb_multi_tests {
                 || {
                     let wave = vec![(0usize, &domain, unstable.clone())];
                     let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                        0,
                         &graph,
                         &wave,
                         &relu_nodes,
@@ -1716,123 +3005,569 @@ mod kfsb_multi_tests {
     #[ntest::timeout(30000)]
     #[test]
     fn kfsb_multi_min_reduce_picks_child_evaluated_winner() {
-        if std::env::var("NY_MO_KFSB_REDUCE").is_ok() {
-            return; // don't fight an externally-set A/B override
-        }
-        let (graph, domain) = kfsb_fixture();
-        let verifier = kfsb_verifier(KfsbReduceOp::Min);
-        let unstable = vec![("relu1".to_string(), 0), ("relu1".to_string(), 1)];
-        let wave = vec![(7usize, &domain, unstable)];
-        let engine = NaiveCpuGemmEngine;
+        crate::tests::with_serialized_env_vars_removed(&["NY_MO_KFSB_REDUCE"], || {
+            let (graph, domain) = kfsb_fixture();
+            let verifier = kfsb_verifier(KfsbReduceOp::Min);
+            let unstable = vec![("relu1".to_string(), 0), ("relu1".to_string(), 1)];
+            let wave = vec![(7usize, &domain, unstable)];
+            let engine = NaiveCpuGemmEngine;
 
-        let committed = verifier.select_graph_branch_kfsb_multi_batched(
-            &graph,
-            &wave,
-            &["relu1".to_string()],
-            &[vec![1.0]],
-            &[0.0],
-            &engine,
-        );
+            let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                0,
+                &graph,
+                &wave,
+                &["relu1".to_string()],
+                &[vec![1.0]],
+                &[0.0],
+                &engine,
+            );
 
-        let children = committed.get(&7).expect("wave domain must be resolved");
-        assert_eq!(children.len(), 2, "both children of the winner commit");
-        for (child, is_active) in children {
-            let constraint = child
-                .history()
-                .iter_all()
-                .next()
-                .expect("committed child carries the split constraint");
-            match &constraint {
-                crate::beta_crown::branching::GraphConstraint::Relu(nc) => {
-                    assert_eq!(nc.node_name, "relu1");
-                    assert_eq!(
-                        nc.neuron_idx, 0,
-                        "Min reduce must pick the genuinely-tightening split n0"
-                    );
-                    assert_eq!(nc.is_active, *is_active);
+            let children = committed.get(&7).expect("wave domain must be resolved");
+            assert_eq!(children.len(), 2, "both children of the winner commit");
+            for (child, is_active, _) in children {
+                let constraint = child
+                    .history()
+                    .iter_all()
+                    .next()
+                    .expect("committed child carries the split constraint");
+                match &constraint {
+                    crate::beta_crown::branching::GraphConstraint::Relu(nc) => {
+                        assert_eq!(nc.node_name, "relu1");
+                        assert_eq!(
+                            nc.neuron_idx, 0,
+                            "Min reduce must pick the genuinely-tightening split n0"
+                        );
+                        assert_eq!(nc.is_active, *is_active);
+                    }
+                    other => panic!("unexpected constraint kind: {other:?}"),
                 }
-                other => panic!("unexpected constraint kind: {other:?}"),
             }
-        }
+        });
     }
 
-    /// #kfsb-multi reduce-op PIN (end-to-end): with `config.kfsb_reduce_op = Max`
-    /// (exactly the value every cifar100/relational preset configures) and no
-    /// A/B env override, the wave lane STILL resolves the `Min` winner — n0 with
-    /// BOTH children — because the multi-objective lane is DECOUPLED from
-    /// `config.kfsb_reduce_op` (pinned to `Min`; see
-    /// `kfsb_multi::resolve_kfsb_multi_reduce_op`). n1's inactive half-space is
-    /// infeasible (+inf), but under `Min` its split is ranked by its surviving
-    /// child (~1.5), which n0's genuinely-tightening split (min(2,3)=2) beats.
-    /// This guards a future preset edit from silently flipping this lane to the
-    /// wrong metric. (Was `kfsb_multi_max_reduce_rewards_...`: `Max` is now
-    /// reachable only via `NY_MO_KFSB_REDUCE=max`, covered by the pure-resolver
-    /// test below.)
+    /// Regression for the selector -> process boundary: a terminal simulated
+    /// parent-cover certificate must bypass split-leaf construction, Complete
+    /// Clip, and both dense/scalar child evaluators. Sending this cover onward
+    /// would create an empty objective matrix and turn a sound proof into
+    /// PropagationFailure.
     #[ntest::timeout(30000)]
     #[test]
-    fn kfsb_multi_lane_ignores_config_max_and_stays_min() {
-        if std::env::var("NY_MO_KFSB_REDUCE").is_ok() {
-            return; // don't fight an externally-set A/B override
-        }
-        let (graph, domain) = kfsb_fixture();
-        let verifier = kfsb_verifier(KfsbReduceOp::Max); // cifar100/relational preset value
-        let unstable = vec![("relu1".to_string(), 0), ("relu1".to_string(), 1)];
-        let wave = vec![(3usize, &domain, unstable)];
-        let engine = NaiveCpuGemmEngine;
+    fn kfsb_certified_children_bypass_empty_target_propagation() {
+        crate::tests::with_serialized_env_vars(
+            &[
+                ("NY_MO_KFSB", "1"),
+                ("NY_MO_KFSB_CERT_REUSE", "1"),
+                ("NY_MO_KFSB_REDUCE", "min"),
+            ],
+            || {
+                let (graph, domain) = kfsb_fixture();
+                let mut verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                    branching_heuristic: BranchingHeuristic::Kfsb,
+                    fsb_candidates: 2,
+                    kfsb_reduce_op: KfsbReduceOp::Min,
+                    use_kfsb_multi_branching: true,
+                    beta_iterations: 0,
+                    ..Default::default()
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                verifier.config.alpha_config.deadline = Some(deadline);
+                let engine = NaiveCpuGemmEngine;
+                let wave = vec![(
+                    0usize,
+                    &domain,
+                    vec![("relu1".to_string(), 0), ("relu1".to_string(), 1)],
+                )];
+                let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                    0,
+                    &graph,
+                    &wave,
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &engine,
+                );
+                let selected = committed.get(&0).expect("parent cover must commit");
+                assert_eq!(selected.len(), 1, "terminal proof skips both split leaves");
+                let (cover, _, effect) = &selected[0];
+                let KfsbCertEffect::ParentComplete(receipt) = effect else {
+                    panic!("terminal fast path needs typed ParentComplete, got {effect:?}");
+                };
+                assert_eq!(receipt.row, 0);
+                assert!(matches!(
+                    &receipt.scope,
+                    super::super::children::KfsbCertScope::ParentCover
+                ));
+                assert_eq!(receipt.lower_bits, cover.objective_bounds()[0].0.to_bits());
+                assert_eq!(receipt.authority_deadline, deadline);
+                assert_eq!(
+                    cover.history().exact_provenance_identity(),
+                    domain.history().exact_provenance_identity()
+                );
+                assert_eq!(cover.depth(), domain.depth());
+                assert!(cover.all_verified());
+                assert!(cover.cached_las()[0].is_none());
+                assert!(
+                    cover.node_bounds().is_empty(),
+                    "verified shell retains no node cache"
+                );
+                assert!(std::ptr::eq(cover.input_bounds(), domain.input_bounds()));
 
-        let committed = verifier.select_graph_branch_kfsb_multi_batched(
-            &graph,
-            &wave,
-            &["relu1".to_string()],
-            &[vec![1.0]],
-            &[0.0],
-            &engine,
-        );
-
-        let children = committed.get(&3).expect("wave domain must be resolved");
-        assert_eq!(
-            children.len(),
-            2,
-            "the Min metric commits BOTH children of the genuinely-tightening split n0"
-        );
-        for (child, is_active) in children {
-            let constraint = child.history().iter_all().next().expect("constraint");
-            match &constraint {
-                crate::beta_crown::branching::GraphConstraint::Relu(nc) => {
-                    assert_eq!(nc.node_name, "relu1");
-                    assert_eq!(
-                        nc.neuron_idx, 0,
-                        "lane pinned to Min must pick n0 despite config.kfsb_reduce_op = Max"
+                let results = verifier.process_graph_domains_batched_gpu_multi_objective(
+                    0,
+                    &graph,
+                    &[&domain],
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &engine,
+                    None,
+                    None,
+                );
+                let MultiObjectiveGraphDomainResult::Children(children) = &results[0] else {
+                    panic!(
+                        "certified cover must survive as Children, got {:?}",
+                        results[0]
                     );
-                    assert_eq!(nc.is_active, *is_active);
-                }
-                other => panic!("unexpected constraint kind: {other:?}"),
-            }
-        }
+                };
+                assert_eq!(children.len(), 1);
+                assert!(children.iter().all(|(child, verified)| {
+                    *verified
+                        && child.all_verified()
+                        && child.lower_bound() > 0.0
+                        && child.history().exact_provenance_identity()
+                            == domain.history().exact_provenance_identity()
+                        && child.depth() == domain.depth()
+                        && child.node_bounds().is_empty()
+                        && std::ptr::eq(child.input_bounds(), domain.input_bounds())
+                }));
+            },
+        );
     }
 
-    /// #kfsb-multi reduce-op PIN (regression, pure): the wave-batched
-    /// multi-objective lane's effective reduce op is `Min` by DEFAULT — the
-    /// min-of-children metric — DECOUPLED from `config.kfsb_reduce_op` (which
-    /// every cifar100/relational preset sets to `max`, the α,β-CROWN
-    /// single-objective parity knob). Guards a future preset edit from silently
-    /// flipping this lane to the wrong metric. The `NY_MO_KFSB_REDUCE` A/B
-    /// override still binds in BOTH directions; any other value falls back to
-    /// the pinned `Min`.
+    /// Gate-off preserves the historical exhaustive winner split. In
+    /// particular, an all-verifying simulated pair alone cannot collapse the
+    /// parent without typed certificate authority.
+    #[ntest::timeout(30000)]
     #[test]
-    fn kfsb_multi_reduce_op_pinned_to_min_by_default() {
+    fn kfsb_terminal_parent_cover_gate_off_commits_normal_split() {
+        crate::tests::with_serialized_env_vars(
+            &[
+                ("NY_MO_KFSB", "1"),
+                ("NY_MO_KFSB_CERT_REUSE", "0"),
+                ("NY_MO_KFSB_REDUCE", "min"),
+            ],
+            || {
+                let (graph, domain) = kfsb_fixture();
+                let mut verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                    branching_heuristic: BranchingHeuristic::Kfsb,
+                    fsb_candidates: 2,
+                    kfsb_reduce_op: KfsbReduceOp::Min,
+                    use_kfsb_multi_branching: true,
+                    beta_iterations: 0,
+                    ..Default::default()
+                });
+                verifier.config.alpha_config.deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+                let wave = vec![(
+                    0usize,
+                    &domain,
+                    vec![("relu1".to_string(), 0), ("relu1".to_string(), 1)],
+                )];
+                let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                    0,
+                    &graph,
+                    &wave,
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &NaiveCpuGemmEngine,
+                );
+
+                let children = committed.get(&0).expect("winner split must commit");
+                assert_eq!(children.len(), 2);
+                assert!(children.iter().all(|(child, _, effect)| {
+                    matches!(effect, KfsbCertEffect::None)
+                        && child.depth() == domain.depth() + 1
+                        && child.history().exact_provenance_identity()
+                            != domain.history().exact_provenance_identity()
+                }));
+            },
+        );
+    }
+
+    /// A non-terminal KFSB receipt must remain attached to the exact child,
+    /// prune only its certified row, and survive both child-evaluation routes.
+    /// This covers the selector -> typed tuple -> dense/scalar evaluator ->
+    /// objective/cache merge -> final parent assembly dataflow.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn kfsb_partial_row_receipt_survives_dense_and_scalar_assembly() {
+        crate::tests::with_serialized_env_vars(
+            &[
+                ("NY_MO_KFSB", "1"),
+                ("NY_MO_KFSB_K", "2"),
+                ("NY_MO_KFSB_CERT_REUSE", "1"),
+                ("NY_MO_KFSB_REDUCE", "min"),
+                ("NY_MO_GPU_BETA", "0"),
+                ("NY_BAB_DROP_VIOLATED_CHILD", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0"),
+            ],
+            || {
+                let objectives = vec![vec![1.0_f32], vec![1.0_f32]];
+                let thresholds = vec![0.0_f32, 4.0_f32];
+                let relu_nodes = vec!["relu1".to_string()];
+                let engine = NaiveCpuGemmEngine;
+                let make_verifier = |beta_iterations| {
+                    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                        branching_heuristic: BranchingHeuristic::Kfsb,
+                        fsb_candidates: 2,
+                        kfsb_reduce_op: KfsbReduceOp::Min,
+                        use_kfsb_multi_branching: true,
+                        beta_iterations,
+                        ..Default::default()
+                    });
+                    verifier.config.alpha_config.deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+                    verifier
+                };
+                let root_phase = |child: &MultiObjectiveGraphBabDomain| match child
+                    .history()
+                    .iter_all()
+                    .next()
+                    .expect("committed child has a root constraint")
+                {
+                    crate::beta_crown::branching::GraphConstraint::Relu(neuron) => neuron.is_active,
+                    other => panic!("unexpected root constraint: {other:?}"),
+                };
+
+                // Establish the fixture's exact typed authority before testing
+                // either consumer. This prevents a full two-row recomputation
+                // from accidentally making the process-level assertions pass.
+                let (selector_graph, selector_domain) = kfsb_partial_receipt_fixture();
+                let selector_verifier = make_verifier(0);
+                let selector_caches = selector_domain
+                    .cached_las()
+                    .iter()
+                    .map(|cache| Arc::clone(cache.as_ref().expect("fixture has full-spec cache")))
+                    .collect::<Vec<_>>();
+                let selector_wave = vec![(0usize, &selector_domain, vec![("relu1".into(), 0)])];
+                let committed = selector_verifier.select_graph_branch_kfsb_multi_batched(
+                    0,
+                    &selector_graph,
+                    &selector_wave,
+                    &relu_nodes,
+                    &objectives,
+                    &thresholds,
+                    &engine,
+                );
+                let selected_children = committed.get(&0).expect("KFSB candidate must commit");
+                assert_eq!(selected_children.len(), 2);
+                let mut certified_lower_by_phase = HashMap::new();
+                for (child, is_active, effect) in selected_children {
+                    let KfsbCertEffect::RowVerified(receipt) = effect else {
+                        panic!("partial fixture must produce RowVerified, got {effect:?}");
+                    };
+                    assert_eq!(receipt.row, 0);
+                    assert_eq!(child.verified(), &[true, false]);
+                    assert!(!child.all_verified());
+                    assert!(child.cached_las().iter().all(Option::is_some));
+                    for (row, parent_cache) in selector_caches.iter().enumerate() {
+                        let child_cache = child.cached_las()[row]
+                            .as_ref()
+                            .expect("committed child retains full-spec cache");
+                        assert!(Arc::ptr_eq(parent_cache, child_cache));
+                        assert_eq!(
+                            child_cache.lower_a["relu1"]
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            parent_cache.lower_a["relu1"]
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    let scorer_rows = child
+                        .cached_las()
+                        .iter()
+                        .map(Option::as_deref)
+                        .collect::<Option<Vec<_>>>()
+                        .expect("committed child exposes every cached spec row");
+                    let decisions = crate::beta_crown::engine::graph::propagation::batched::interm_refine::complete_clip_decisions_from_cached_las(
+                        &selector_graph,
+                        selector_domain.node_bounds(),
+                        child.node_bounds(),
+                        child.history(),
+                        &scorer_rows,
+                        1,
+                        None,
+                    )
+                    .expect("retained cache must be directly consumable by Complete-Clip");
+                    assert_eq!(decisions.get("relu1"), Some(&vec![0]));
+                    assert_eq!(root_phase(child), *is_active);
+                    assert_eq!(
+                        child.objective_bounds()[receipt.row].0.to_bits(),
+                        receipt.lower_bits
+                    );
+                    assert!(certified_lower_by_phase
+                        .insert(*is_active, receipt.lower_bits)
+                        .is_none());
+                }
+                assert_eq!(certified_lower_by_phase.len(), 2);
+
+                // Exercise the union-pruned dense adapter directly. Its returned
+                // full vector must retain the receipt-installed row bit-for-bit
+                // while evaluating only row 1.
+                let selected_refs: Vec<&MultiObjectiveGraphBabDomain> = selected_children
+                    .iter()
+                    .map(|(child, _, _)| child)
+                    .collect();
+                let dense_results = selector_verifier
+                    .batched_single_pass_multi_objective_children(
+                        &selector_graph,
+                        &selected_refs,
+                        &relu_nodes,
+                        &objectives,
+                        &thresholds,
+                        &engine,
+                        true,
+                    )
+                    .expect("partial children are dense-adapter compatible");
+                assert_eq!(dense_results.len(), selected_children.len());
+                for ((selected, _, _), dense_result) in selected_children.iter().zip(dense_results)
+                {
+                    let (bounds, _, _, _, active_cached_las, pruned, _) =
+                        dense_result.expect("remaining row must propagate");
+                    assert_eq!(pruned.active_indices, vec![1]);
+                    assert_eq!(active_cached_las.len(), 1);
+                    assert_eq!(
+                        bounds[0].0.to_bits(),
+                        selected.objective_bounds()[0].0.to_bits(),
+                        "dense merge must retain the certified lower bit-for-bit"
+                    );
+                    assert!(bounds[1].0 < thresholds[1]);
+                }
+
+                // beta_iterations=0 selects the ordinary dense adapter on this
+                // non-convolution graph; beta_iterations=1 selects the exact
+                // per-child analytical-beta route. Both must publish the same
+                // receipt-bearing row and a still-open second row.
+                for beta_iterations in [0, 1] {
+                    let (graph, domain) = kfsb_partial_receipt_fixture();
+                    let certified_parent_cache = Arc::clone(
+                        domain.cached_las()[0]
+                            .as_ref()
+                            .expect("fixture has certified-row cache"),
+                    );
+                    let verifier = make_verifier(beta_iterations);
+                    let results = verifier.process_graph_domains_batched_gpu_multi_objective(
+                        0,
+                        &graph,
+                        &[&domain],
+                        &relu_nodes,
+                        &objectives,
+                        &thresholds,
+                        &engine,
+                        None,
+                        None,
+                    );
+                    let MultiObjectiveGraphDomainResult::Children(children) = &results[0] else {
+                        panic!(
+                            "partial receipt must survive beta_iterations={beta_iterations}, got {:?}",
+                            results[0]
+                        );
+                    };
+                    assert_eq!(children.len(), 2);
+                    for (child, all_verified) in children {
+                        let phase = root_phase(child);
+                        assert!(!*all_verified);
+                        assert_eq!(child.verified(), &[true, false]);
+                        assert!(!child.all_verified());
+                        assert_eq!(
+                            child.objective_bounds()[0].0.to_bits(),
+                            certified_lower_by_phase[&phase],
+                            "child evaluation must not overwrite the receipt row"
+                        );
+                        assert!(child.objective_bounds()[1].0 < thresholds[1]);
+                        let retained_cache = child.cached_las()[0]
+                            .as_ref()
+                            .expect("certified row stays available to next-wave Complete-Clip");
+                        assert!(Arc::ptr_eq(&certified_parent_cache, retained_cache));
+                        assert_eq!(
+                            retained_cache.lower_a["relu1"]
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            certified_parent_cache.lower_a["relu1"]
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(child.cached_las().len(), thresholds.len());
+                    }
+                }
+            },
+        );
+    }
+
+    /// Receipt authority is strict through the final parent publication, not
+    /// merely when the simulated scalar is captured or the child is partitioned.
+    /// The test clock affects only that final boundary; all proof-producing and
+    /// child-evaluation work must complete under the real live deadline first.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn kfsb_partial_row_receipt_late_publication_is_deadline_expired() {
+        crate::tests::with_serialized_env_vars(
+            &[
+                ("NY_MO_KFSB", "1"),
+                ("NY_MO_KFSB_K", "2"),
+                ("NY_MO_KFSB_CERT_REUSE", "1"),
+                ("NY_MO_KFSB_REDUCE", "min"),
+                ("NY_MO_GPU_BETA", "0"),
+                ("NY_BAB_DROP_VIOLATED_CHILD", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0"),
+            ],
+            || {
+                let (graph, domain) = kfsb_partial_receipt_fixture();
+                let objectives = vec![vec![1.0_f32], vec![1.0_f32]];
+                let thresholds = vec![0.0_f32, 4.0_f32];
+                let relu_nodes = vec!["relu1".to_string()];
+                let engine = NaiveCpuGemmEngine;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                let mut verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                    branching_heuristic: BranchingHeuristic::Kfsb,
+                    fsb_candidates: 2,
+                    kfsb_reduce_op: KfsbReduceOp::Min,
+                    use_kfsb_multi_branching: true,
+                    beta_iterations: 0,
+                    ..Default::default()
+                });
+                verifier.config.alpha_config.deadline = Some(deadline);
+
+                let results = with_kfsb_final_publication_now(deadline, || {
+                    verifier.process_graph_domains_batched_gpu_multi_objective(
+                        0,
+                        &graph,
+                        &[&domain],
+                        &relu_nodes,
+                        &objectives,
+                        &thresholds,
+                        &engine,
+                        None,
+                        None,
+                    )
+                });
+                assert!(
+                    matches!(
+                        results.as_slice(),
+                        [MultiObjectiveGraphDomainResult::DeadlineExpired]
+                    ),
+                    "a parent still depending on a partial receipt must not publish at its strict deadline: {results:?}"
+                );
+            },
+        );
+    }
+
+    /// αβ-CROWN parity (end-to-end): the configured Max reduction must remain
+    /// authoritative in the multi-objective lane. Here n1's inactive half is
+    /// infeasible (+inf), so Max selects n1 and commits its one feasible child.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn kfsb_multi_lane_honors_configured_max() {
+        crate::tests::with_serialized_env_vars_removed(&["NY_MO_KFSB_REDUCE"], || {
+            let (graph, domain) = kfsb_fixture();
+            let verifier = kfsb_verifier(KfsbReduceOp::Max); // cifar100 preset value
+            let unstable = vec![("relu1".to_string(), 0), ("relu1".to_string(), 1)];
+            let wave = vec![(3usize, &domain, unstable)];
+            let engine = NaiveCpuGemmEngine;
+
+            let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                0,
+                &graph,
+                &wave,
+                &["relu1".to_string()],
+                &[vec![1.0]],
+                &[0.0],
+                &engine,
+            );
+
+            let children = committed.get(&3).expect("wave domain must be resolved");
+            assert_eq!(children.len(), 1, "n1 has one feasible child");
+            for (child, is_active, _) in children {
+                let constraint = child.history().iter_all().next().expect("constraint");
+                match &constraint {
+                    crate::beta_crown::branching::GraphConstraint::Relu(nc) => {
+                        assert_eq!(nc.node_name, "relu1");
+                        assert_eq!(nc.neuron_idx, 1, "configured Max must select n1");
+                        assert_eq!(nc.is_active, *is_active);
+                    }
+                    other => panic!("unexpected constraint kind: {other:?}"),
+                }
+            }
+        });
+    }
+
+    /// The configured reduce op is authoritative, while the measurement-only
+    /// environment override can still bind in either direction.
+    #[test]
+    fn kfsb_multi_reduce_op_honors_config_and_override() {
         use super::super::kfsb_multi::resolve_kfsb_multi_reduce_op;
-        // Lane default (no A/B env override) is Min.
-        assert_eq!(resolve_kfsb_multi_reduce_op(None), KfsbReduceOp::Min);
-        // Unknown / non-min-max override falls back to the pinned Min.
         assert_eq!(
-            resolve_kfsb_multi_reduce_op(Some("mean")),
+            resolve_kfsb_multi_reduce_op(KfsbReduceOp::Max, None),
+            KfsbReduceOp::Max
+        );
+        assert_eq!(
+            resolve_kfsb_multi_reduce_op(KfsbReduceOp::Min, None),
             KfsbReduceOp::Min
         );
-        assert_eq!(resolve_kfsb_multi_reduce_op(Some("")), KfsbReduceOp::Min);
-        // The A/B measurement override still binds both ways.
-        assert_eq!(resolve_kfsb_multi_reduce_op(Some("min")), KfsbReduceOp::Min);
-        assert_eq!(resolve_kfsb_multi_reduce_op(Some("max")), KfsbReduceOp::Max);
+        assert_eq!(
+            resolve_kfsb_multi_reduce_op(KfsbReduceOp::Max, Some("mean")),
+            KfsbReduceOp::Max
+        );
+        assert_eq!(
+            resolve_kfsb_multi_reduce_op(KfsbReduceOp::Max, Some("")),
+            KfsbReduceOp::Max
+        );
+        assert_eq!(
+            resolve_kfsb_multi_reduce_op(KfsbReduceOp::Max, Some("min")),
+            KfsbReduceOp::Min
+        );
+        assert_eq!(
+            resolve_kfsb_multi_reduce_op(KfsbReduceOp::Min, Some("max")),
+            KfsbReduceOp::Max
+        );
+    }
+
+    #[test]
+    fn complete_clip_decision_deadline_preserves_full_authority_reserve() {
+        let now = std::time::Instant::now();
+        let reserve = std::time::Duration::from_secs(5);
+        let slack = std::time::Duration::from_millis(1);
+
+        assert_eq!(
+            complete_clip_decision_scoring_deadline(now, now + reserve),
+            None,
+            "the exact reserve boundary has no private-work budget"
+        );
+        assert_eq!(
+            complete_clip_decision_scoring_deadline(
+                now,
+                (now + reserve)
+                    .checked_sub(slack)
+                    .expect("one millisecond fits within the authority reserve"),
+            ),
+            None,
+            "less than the reserve must refuse private work"
+        );
+        assert_eq!(
+            complete_clip_decision_scoring_deadline(now, now + reserve + slack),
+            Some(now + slack),
+            "the scorer deadline must be authority minus the full reserve"
+        );
     }
 
     /// Gate default-OFF: without NY_MO_KFSB=1 the wave selector never arms,
@@ -1840,11 +3575,10 @@ mod kfsb_multi_tests {
     /// byte-identical to the advisory path.
     #[test]
     fn kfsb_multi_gate_is_default_off() {
-        if std::env::var("NY_MO_KFSB").is_ok() {
-            return; // don't fight an externally-set gate
-        }
-        let verifier = kfsb_verifier(KfsbReduceOp::Max);
-        assert!(!verifier.kfsb_multi_wave_enabled());
+        crate::tests::with_serialized_env_vars_removed(&["NY_MO_KFSB"], || {
+            let verifier = kfsb_verifier(KfsbReduceOp::Max);
+            assert!(!verifier.kfsb_multi_wave_enabled());
+        });
     }
 
     /// #kfsb-multi tri-state arming (config opt-in + env kill switch):
@@ -1854,42 +3588,318 @@ mod kfsb_multi_tests {
     /// (3) `NY_MO_KFSB=0` force-DISARMS even with the config armed (kill switch).
     #[test]
     fn kfsb_multi_gate_tri_state_arming() {
-        if std::env::var("NY_MO_KFSB").is_ok() {
-            return; // don't fight an externally-set gate for the env-UNSET cases
-        }
-        let armed = BetaCrownVerifier::new(BetaCrownConfig {
-            branching_heuristic: BranchingHeuristic::Kfsb,
-            fsb_candidates: 2,
-            use_kfsb_multi_branching: true,
-            beta_iterations: 0,
-            ..Default::default()
-        });
-        // (1) config-armed, env unset ⇒ on.
-        assert!(
-            armed.kfsb_multi_wave_enabled(),
-            "config.use_kfsb_multi_branching=true + Kfsb + candidates>0 must arm the wave lane"
-        );
+        crate::tests::with_env_edits(|env| {
+            env.remove("NY_MO_KFSB");
+            let armed = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 2,
+                use_kfsb_multi_branching: true,
+                beta_iterations: 0,
+                ..Default::default()
+            });
+            // (1) config-armed, env unset ⇒ on.
+            assert!(
+                armed.kfsb_multi_wave_enabled(),
+                "config.use_kfsb_multi_branching=true + Kfsb + candidates>0 must arm the wave lane"
+            );
 
-        // (2) config false, env unset ⇒ off.
-        let disarmed = BetaCrownVerifier::new(BetaCrownConfig {
-            branching_heuristic: BranchingHeuristic::Kfsb,
-            fsb_candidates: 2,
-            use_kfsb_multi_branching: false,
-            beta_iterations: 0,
-            ..Default::default()
-        });
-        assert!(
-            !disarmed.kfsb_multi_wave_enabled(),
-            "config.use_kfsb_multi_branching=false with no env must keep the wave lane off"
-        );
+            // (2) config false, env unset ⇒ off.
+            let disarmed = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 2,
+                use_kfsb_multi_branching: false,
+                beta_iterations: 0,
+                ..Default::default()
+            });
+            assert!(
+                !disarmed.kfsb_multi_wave_enabled(),
+                "config.use_kfsb_multi_branching=false with no env must keep the wave lane off"
+            );
 
-        // (3) KILL SWITCH: NY_MO_KFSB=0 forces off despite the config arming.
-        crate::tests::with_serialized_env_vars(&[("NY_MO_KFSB", "0")], || {
+            // (3) KILL SWITCH: NY_MO_KFSB=0 forces off despite the config arming.
+            env.set("NY_MO_KFSB", "0");
             assert!(
                 !armed.kfsb_multi_wave_enabled(),
                 "NY_MO_KFSB=0 must force the wave lane off (kill switch) despite config arming"
             );
         });
+    }
+
+    #[test]
+    fn typed_depth_two_gate_uses_canonical_first_five_rounds_and_kill_switch() {
+        crate::tests::with_env_edits(|env| {
+            for name in [
+                "NY_MO_KFSB",
+                "NY_BRANCH_KFSB_CHILDSIM",
+                "NY_MO_ADAPTIVE_DEPTH_SHADOW",
+                "NY_MO_ADAPTIVE_DEPTH_SELECT",
+                "NY_MO_ADAPTIVE_DEPTH_COMMIT",
+                "NY_MO_KFSB_F64_SHADOW",
+                "NY_MO_KFSB_REDUCE",
+                "NY_MO_KFSB_K",
+            ] {
+                env.remove(name);
+            }
+            let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                use_kfsb_multi_branching: false,
+                depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
+                    mode: DepthTwoBranchLookaheadMode::Select,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            assert!(
+                !verifier.kfsb_multi_wave_enabled(),
+                "legacy round-agnostic gate remains unchanged"
+            );
+            assert!(verifier.kfsb_multi_wave_enabled_at_round(0));
+            assert!(verifier.kfsb_multi_wave_enabled_at_round(4));
+            assert!(!verifier.kfsb_multi_wave_enabled_at_round(5));
+            env.set("NY_MO_KFSB_REDUCE", "max");
+            assert!(
+                !verifier.kfsb_multi_wave_enabled_at_round(0),
+                "unsupported Max reduction must not OR-arm a declined typed experiment"
+            );
+            env.remove("NY_MO_KFSB_REDUCE");
+
+            env.set("NY_MO_KFSB_K", "0");
+            assert!(
+                !verifier.kfsb_multi_wave_enabled_at_round(0),
+                "a zero effective candidate budget must decline before Select can OR-arm"
+            );
+            env.remove("NY_MO_KFSB_K");
+
+            env.set("NY_MO_ADAPTIVE_DEPTH_SHADOW", "1");
+            env.set("NY_MO_ADAPTIVE_DEPTH_SELECT", "0");
+            env.set("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0");
+            env.set("NY_MO_KFSB_F64_SHADOW", "0");
+            assert!(
+                verifier.kfsb_multi_wave_enabled_at_round(0),
+                "advice-only SHADOW must not suppress typed Select arming"
+            );
+
+            env.set("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0");
+            env.set("NY_MO_ADAPTIVE_DEPTH_SELECT", "1");
+            assert!(
+                verifier.kfsb_multi_wave_enabled_at_round(0),
+                "advice-only legacy SELECT must not suppress typed Select arming"
+            );
+
+            env.set("NY_MO_ADAPTIVE_DEPTH_SELECT", "0");
+            env.set("NY_MO_ADAPTIVE_DEPTH_COMMIT", "1");
+            assert!(
+                verifier.kfsb_multi_wave_enabled_at_round(0),
+                "advice-only COMMIT must not suppress typed Select arming"
+            );
+
+            env.set("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0");
+            env.set("NY_MO_KFSB_F64_SHADOW", "1");
+            assert!(
+                verifier.kfsb_multi_wave_enabled_at_round(0),
+                "the precision observer must not suppress typed Select arming"
+            );
+            for name in [
+                "NY_MO_ADAPTIVE_DEPTH_SHADOW",
+                "NY_MO_ADAPTIVE_DEPTH_SELECT",
+                "NY_MO_ADAPTIVE_DEPTH_COMMIT",
+                "NY_MO_KFSB_F64_SHADOW",
+            ] {
+                env.remove(name);
+            }
+            let shadow_only = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 2,
+                use_kfsb_multi_branching: false,
+                depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
+                    mode: DepthTwoBranchLookaheadMode::Shadow,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            assert!(
+                !shadow_only.kfsb_multi_wave_enabled_at_round(0),
+                "typed Shadow must not replace the historical advisory selector by OR-arming kFSB"
+            );
+            let piggyback_shadow = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 2,
+                use_kfsb_multi_branching: true,
+                depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
+                    mode: DepthTwoBranchLookaheadMode::Shadow,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            assert!(
+                piggyback_shadow.kfsb_multi_wave_enabled_at_round(0),
+                "Shadow remains observable when the historical kFSB lane is independently armed"
+            );
+            let zero_candidates = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 0,
+                use_kfsb_multi_branching: false,
+                depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
+                    mode: DepthTwoBranchLookaheadMode::Select,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            assert!(
+                !zero_candidates.kfsb_multi_wave_enabled_at_round(0),
+                "typed selection needs a nonempty historical fallback prefix"
+            );
+            let invalid = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
+                    mode: DepthTwoBranchLookaheadMode::Select,
+                    candidates: 16,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            assert!(
+                !invalid.kfsb_multi_wave_enabled_at_round(0),
+                "unchecked invalid policies must also fail closed at runtime"
+            );
+            env.set("NY_MO_KFSB", "0");
+            assert!(!verifier.kfsb_multi_wave_enabled_at_round(0));
+        });
+    }
+
+    /// An admitted typed receipt owns its wave. Legacy observer flags cannot
+    /// change the typed result or consume either verifier-lifetime one-shot;
+    /// both receipts remain available after typed top-round eligibility ends.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn typed_depth_two_priority_defers_legacy_observers_to_later_round() {
+        type Snapshot = Vec<(bool, Vec<GraphNeuronConstraint>, usize)>;
+
+        let (graph, domain) = adaptive_depth_fixture();
+        let make_verifier = || {
+            BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 3,
+                use_kfsb_multi_branching: true,
+                beta_iterations: 0,
+                depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig {
+                    mode: DepthTwoBranchLookaheadMode::Select,
+                    candidates: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        let make_wave = |parent_index| {
+            vec![(
+                parent_index,
+                &domain,
+                (0..3).map(|index| ("relu1".to_string(), index)).collect(),
+            )]
+        };
+        let snapshot = |children: &super::super::kfsb_multi::KfsbMultiChildren| -> Snapshot {
+            children
+                .iter()
+                .map(|(child, root_phase, _)| {
+                    (
+                        *root_phase,
+                        child.history().constraints.clone(),
+                        child.depth(),
+                    )
+                })
+                .collect()
+        };
+
+        let control = crate::tests::with_serialized_env_vars(
+            &[
+                ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_SELECT", "0"),
+                ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "0"),
+                ("NY_MO_KFSB_F64_SHADOW", "0"),
+                ("NY_MO_KFSB_K", "3"),
+                ("NY_MO_KFSB_REDUCE", "min"),
+            ],
+            || {
+                let verifier = make_verifier();
+                let committed = verifier.select_graph_branch_kfsb_multi_batched(
+                    0,
+                    &graph,
+                    &make_wave(71),
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &NaiveCpuGemmEngine,
+                );
+                snapshot(committed.get(&71).expect("typed control commits"))
+            },
+        );
+
+        crate::tests::with_serialized_env_vars(
+            &[
+                ("NY_MO_ADAPTIVE_DEPTH_SHADOW", "1"),
+                ("NY_MO_ADAPTIVE_DEPTH_SELECT", "1"),
+                ("NY_MO_ADAPTIVE_DEPTH_COMMIT", "1"),
+                ("NY_MO_KFSB_F64_SHADOW", "1"),
+                ("NY_MO_KFSB_K", "3"),
+                ("NY_MO_KFSB_REDUCE", "min"),
+            ],
+            || {
+                let verifier = make_verifier();
+                let typed = verifier.select_graph_branch_kfsb_multi_batched(
+                    0,
+                    &graph,
+                    &make_wave(71),
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &NaiveCpuGemmEngine,
+                );
+                assert_eq!(
+                    snapshot(typed.get(&71).expect("typed armed commits")),
+                    control,
+                    "legacy observers must not change typed committed children",
+                );
+                assert!(
+                    !verifier
+                        .adaptive_depth_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "typed priority must not consume the scalar one-shot",
+                );
+                assert!(
+                    !verifier
+                        .kfsb_f64_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "typed priority must not consume the f64 one-shot",
+                );
+
+                assert!(
+                    verifier.kfsb_multi_wave_enabled_at_round(5),
+                    "the historical kFSB lane must dispatch the later non-typed wave",
+                );
+                let later = verifier.select_graph_branch_kfsb_multi_batched(
+                    5,
+                    &graph,
+                    &make_wave(72),
+                    &["relu1".to_string()],
+                    &[vec![1.0]],
+                    &[0.0],
+                    &NaiveCpuGemmEngine,
+                );
+                assert!(later.contains_key(&72));
+                assert!(
+                    verifier
+                        .adaptive_depth_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "the scalar one-shot must remain claimable after typed rounds",
+                );
+                assert!(
+                    verifier
+                        .kfsb_f64_shadow_fired
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "the f64 one-shot must remain claimable after typed rounds",
+                );
+            },
+        );
     }
 
     /// Stratified layer quota: each unstable ReLU layer's top-1 main-score

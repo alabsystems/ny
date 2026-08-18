@@ -243,15 +243,10 @@ impl ConvertContext<'_> {
                 (0, 0) // Indicates global pooling
             }
         };
-        // For GlobalAveragePool (kernel_shape=(0,0) placeholder), default strides
-        // to (1,1) since the kernel covers the full spatial extent and stride is
-        // irrelevant. For regular AveragePool, ONNX defaults strides to kernel_shape.
-        let stride_default = if kernel_shape == (0, 0) {
-            (1, 1)
-        } else {
-            kernel_shape
-        };
-        let strides = parse_pair_attr(spec, "AveragePool", "strides", stride_default)?;
+        // ONNX defaults every spatial stride to one. GlobalAveragePool also
+        // uses this harmless placeholder value because its full-spatial kernel
+        // produces one output regardless of stride.
+        let strides = parse_pair_attr(spec, "AveragePool", "strides", (1, 1))?;
         let strides = validate_pool_strides(strides, "AveragePool", &spec.name)?;
         let pads = parse_symmetric_pool_padding(spec, "AveragePool")?;
 
@@ -279,7 +274,9 @@ impl ConvertContext<'_> {
                 spec.name
             )));
         };
-        let strides = parse_pair_attr(spec, "MaxPool", "strides", kernel_shape)?;
+        // ONNX MaxPool defaults every spatial stride to one, not to the kernel
+        // extent. Using kernel_shape here silently changed overlapping pools.
+        let strides = parse_pair_attr(spec, "MaxPool", "strides", (1, 1))?;
         let strides = validate_pool_strides(strides, "MaxPool", &spec.name)?;
         let pads = parse_symmetric_pool_padding(spec, "MaxPool")?;
         let pads = validate_max_pool_padding(pads, kernel_shape, &spec.name)?;
@@ -452,6 +449,30 @@ mod tests {
         let spec = max_pool_spec(attrs);
         ctx.convert_max_pool(&spec)
             .expect("default attribute values must be accepted");
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn standard_pool_default_stride_is_one_not_kernel_extent() {
+        let mut attrs = HashMap::new();
+        attrs.insert("kernel_shape".to_string(), AttributeValue::Ints(vec![3, 2]));
+        let (ws, shapes, constants) = make_context();
+        let ctx = ConvertContext::new(&ws, &shapes, &constants);
+
+        match ctx
+            .convert_max_pool(&max_pool_spec(attrs.clone()))
+            .expect("MaxPool with omitted strides")
+        {
+            Layer::MaxPool2d(pool) => assert_eq!(pool.stride, (1, 1)),
+            other => panic!("expected MaxPool2d, got {other:?}"),
+        }
+        match ctx
+            .convert_average_pool(&average_pool_spec(attrs))
+            .expect("AveragePool with omitted strides")
+        {
+            Layer::AveragePool(pool) => assert_eq!(pool.stride, (1, 1)),
+            other => panic!("expected AveragePool, got {other:?}"),
+        }
     }
 
     // Regression tests for #2872: pooling stride=0 panic cliff

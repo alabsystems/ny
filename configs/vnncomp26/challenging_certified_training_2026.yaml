@@ -22,6 +22,7 @@ general:
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 20
   pgd_restart_when_stuck: true
 

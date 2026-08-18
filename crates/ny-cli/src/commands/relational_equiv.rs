@@ -759,6 +759,7 @@ mod tests {
 
     /// Test-only atom builder: `Σ coeff·var ⋈ k` from f64 literals (each an
     /// exact dyadic, same semantics the extractor gives real files).
+    #[cfg(feature = "mip")]
     fn atom(
         relation: DualAtomRelation,
         terms: &[(DualVarRole, usize, f64)],
@@ -784,6 +785,7 @@ mod tests {
 
     /// The largest f32 that is <= the f64 `x` (the inward rounding the real
     /// pipeline applies to epsilon before building E).
+    #[cfg(feature = "mip")]
     fn inward_f32(x: f64) -> f32 {
         let mut e = x as f32;
         // Exact ULP bit-walk: the f64>f64 compare is the intended exact
@@ -800,6 +802,7 @@ mod tests {
     /// `in_dim` inputs / `out_dim` outputs: box on X_f, X_f == X_g coupling,
     /// and per output the two one-sided deviation atoms (strict, eps = 0.05
     /// as an f64 literal — exactly what the 2026 files assert).
+    #[cfg(feature = "mip")]
     fn iso_dnf(in_dim: usize, out_dim: usize, eps: f64) -> DualFormulaDnf {
         use DualAtomRelation::{Eq, Ge, Gt, Le, Lt};
         use DualVarRole::{FInput, FOutput, GInput, GOutput};
@@ -1074,9 +1077,10 @@ mod tests {
     #[test]
     fn mono_e_builds_from_production_outward_rounded_bounds() {
         // Regression: the PRODUCTION monotonic diff box is outward-rounded,
-        // so its delta lower is the f32 subnormal below 0 (not 0), and any
-        // 0.0 endpoint becomes +/-1e-45. E construction must accept the
-        // literal box (real monotonic_acasxu_2026 instance_0 values).
+        // while the FTZ-safe conversion preserves an exactly representable
+        // zero endpoint as +0 instead of publishing a subnormal. E
+        // construction must accept that literal box (real
+        // monotonic_acasxu_2026 instance_0 values).
         use super::super::vnncomp::finite_bound_from_f64;
         let f: [(f64, f64); 5] = [
             (-0.16247807, 0.667245963),
@@ -1093,7 +1097,11 @@ mod tests {
         for &(lo, hi) in f.iter().skip(1) {
             bounds.push(finite_bound_from_f64(lo, hi).unwrap());
         }
-        assert!(bounds[1].lower() < 0.0, "outward rounding steps below 0");
+        assert_eq!(
+            bounds[1].lower().to_bits(),
+            0,
+            "an exact zero lower endpoint stays +0"
+        );
         assert!(checked_region_monotonic(&bounds, 3, 0.0).is_some());
     }
 
@@ -1191,6 +1199,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "mip")]
     #[test]
     fn authorization_succeeds_on_valid_symbolic_containment() {
         // `try_authorize_relational_unsat` proves the SYMBOLIC polyhedral
@@ -1210,26 +1219,29 @@ mod tests {
         // `iso_implication_rejects_missing_coupling`,
         // `iso_implication_rejects_wider_parsed_box`, and
         // `adjacent_f64_feasible_system_is_rejected_by_check_farkas`.
-        if std::env::var("NY_RELATIONAL_UNSAT").ok().as_deref() == Some("0") {
-            return; // don't fight an externally-set kill-switch in CI
-        }
-        let f = scale_graph(2.0);
-        let g = scale_graph(0.5);
-        let diff = scale_graph(1.5);
-        let bounds = [Bound::new(-1.0, 1.0)];
-        let dnf = iso_dnf(1, 1, 0.05);
-        assert!(try_authorize_relational_unsat(
-            Some(&dnf),
-            CheckedKind::Isomorphic {
-                eps_hat: inward_f32(0.05),
-                output_dim: 1
-            },
-            &diff,
-            &f,
-            &g,
-            &bounds,
-        )
-        .is_some());
+        ny_test_utils::env::with_env_edits(|env| {
+            // The test owns a serialized, scoped enabled state. An unrelated
+            // process-level kill switch must not turn a proof regression into
+            // a passing no-op, and the caller's value is restored afterwards.
+            env.set("NY_RELATIONAL_UNSAT", "1");
+            let f = scale_graph(2.0);
+            let g = scale_graph(0.5);
+            let diff = scale_graph(1.5);
+            let bounds = [Bound::new(-1.0, 1.0)];
+            let dnf = iso_dnf(1, 1, 0.05);
+            assert!(try_authorize_relational_unsat(
+                Some(&dnf),
+                CheckedKind::Isomorphic {
+                    eps_hat: inward_f32(0.05),
+                    output_dim: 1
+                },
+                &diff,
+                &f,
+                &g,
+                &bounds,
+            )
+            .is_some());
+        });
     }
 }
 
@@ -1237,10 +1249,11 @@ mod tests {
 /// files: for every instance whose formula the extractor covers, the
 /// implication `parsed ⇒ E` must be provable with the EXACT bounds the
 /// production arms derive (`bounds_from_f64` / the monotonic diff layout)
-/// and the inward-rounded ε̂ / a boundary `lb = 0`. Skips when the benchmark
-/// checkout is absent. This is the formula half of the gate flip measured on
-/// all 100 scored instances; only the α-CROWN emptiness proof remains for
-/// the coordinator's live runs.
+/// and the inward-rounded ε̂ / a boundary `lb = 0`. These real-corpus tests
+/// live only in the explicit `external-vnncomp` lane and fail actionably when
+/// selected without their benchmark checkout. This is the formula half of the gate flip measured
+/// on all 100 scored instances; only the α-CROWN emptiness proof remains for the
+/// coordinator's live runs.
 #[cfg(all(test, feature = "mip"))]
 mod real_benchmark_e2e {
     use std::path::{Path, PathBuf};
@@ -1278,19 +1291,24 @@ mod real_benchmark_e2e {
     /// falsifier slice, the band→clause conversion, the input-split BaB call,
     /// and the verdict mapping end-to-end on real networks.
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn relational_bab_smoke_one_real_instance() {
-        let Some(root) = benchmark_root() else {
-            eprintln!("2026 relational benchmarks not present; skipping");
-            return;
-        };
+        let root = benchmark_root().unwrap_or_else(|| {
+            panic!(
+                "external VNN-COMP 2026 relational fixtures missing; run \
+                 benchmarks/vnncomp2026_benchmarks/setup.sh"
+            )
+        });
         let base = root.join("isomorphic_acasxu_2026/2.0");
         let vnnlib = base.join("vnnlib/instance_0.vnnlib");
         let onnx_field = "[('f', 'onnx/original/ACASXU_run2a_2_4_batch_2000.onnx'), \
                           ('g', 'onnx/perturbed/ACASXU_run2a_2_4_batch_2000_perturbed_0.onnx')]";
-        if !vnnlib.is_file() {
-            eprintln!("instance_0 not present; skipping");
-            return;
-        }
+        assert!(
+            vnnlib.is_file(),
+            "external relational fixture missing at {}; run \
+             benchmarks/vnncomp2026_benchmarks/setup.sh",
+            vnnlib.display()
+        );
         let verdict = super::super::vnncomp::run_relational_vnncomp(
             "isomorphic_acasxu_2026",
             Path::new(onnx_field),
@@ -1315,11 +1333,14 @@ mod real_benchmark_e2e {
     }
 
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn real_2026_formulas_imply_their_checked_regions() {
-        let Some(root) = benchmark_root() else {
-            eprintln!("2026 relational benchmarks not present; skipping");
-            return;
-        };
+        let root = benchmark_root().unwrap_or_else(|| {
+            panic!(
+                "external VNN-COMP 2026 relational fixtures missing; run \
+                 benchmarks/vnncomp2026_benchmarks/setup.sh"
+            )
+        });
         let mut proven = 0usize;
         let mut total = 0usize;
         let mut failures: Vec<String> = Vec::new();
@@ -1414,16 +1435,19 @@ mod bab_gap_probe {
     use std::path::PathBuf;
 
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn probe_diffnet_intermediates_on_deep_box() {
         let root = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../benchmarks/vnncomp2026_benchmarks/benchmarks",
         ));
         let base = root.join("isomorphic_acasxu_2026/2.0");
-        if !base.is_dir() {
-            eprintln!("benchmarks absent; skipping");
-            return;
-        }
+        assert!(
+            base.is_dir(),
+            "external VNN-COMP 2026 relational fixtures missing at {}; run \
+             benchmarks/vnncomp2026_benchmarks/setup.sh",
+            base.display()
+        );
         let f = base.join("onnx/original/ACASXU_run2a_2_4_batch_2000.onnx");
         let g = base.join("onnx/perturbed/ACASXU_run2a_2_4_batch_2000_perturbed_0.onnx");
         let vnnlib = base.join("vnnlib/instance_0.vnnlib");
@@ -1512,6 +1536,16 @@ mod bab_gap_probe {
         let entry_min = (0..out_entry.len())
             .map(|i| out_entry.lower()[[i]].min(-out_entry.upper()[[i]]))
             .fold(f32::INFINITY, f32::min);
+        assert!(
+            [min_lower_ibp, min_lower_cibp, entry_min]
+                .into_iter()
+                .all(f32::is_finite),
+            "deep-box comparison must publish finite IBP/CROWN-IBP bounds"
+        );
+        assert!(
+            min_lower_cibp + 1e-5 >= min_lower_ibp,
+            "CROWN-IBP intermediates must not loosen the binding lower bound: IBP={min_lower_ibp}, CROWN-IBP={min_lower_cibp}"
+        );
         eprintln!(
             "lever-1 parity: collection output entry band min={entry_min:.6} vs spec backward min={min_lower_cibp:.6}"
         );
@@ -1522,6 +1556,7 @@ mod bab_gap_probe {
 
         // CORNER boxes at several depths, CROWN-IBP intermediates: is the
         // stall genuine corner hardness or a refresh failure?
+        let mut corner_cases = 0usize;
         for frac in [16.0f32, 64.0, 256.0, 1024.0] {
             let corner: Vec<ny_core::Bound> = bounds
                 .iter()
@@ -1562,10 +1597,20 @@ mod bab_gap_probe {
             let mli = (0..flati.len())
                 .map(|i| flati.lower()[[i]])
                 .fold(f32::INFINITY, f32::min);
+            assert!(
+                ml.is_finite() && mli.is_finite(),
+                "corner 1/{frac} must publish finite comparison bounds"
+            );
+            assert!(
+                ml + 1e-5 >= mli,
+                "corner 1/{frac}: CROWN-IBP must not loosen IBP intermediates ({ml} < {mli})"
+            );
+            corner_cases += 1;
             eprintln!(
                 "corner 1/{frac} box: CROWN-IBP min_lower={ml:.4} ({t_nb:.3}s) | IBP min_lower={mli:.4}"
             );
         }
+        assert_eq!(corner_cases, 4, "the complete corner-depth corpus must run");
     }
 }
 
@@ -1627,7 +1672,7 @@ mod f32_tax_probe {
             };
             match node.layer() {
                 Layer::Linear(lin) => {
-                    let (out_dim, in_dim) = lin.weight.dim();
+                    let (out_dim, in_dim) = lin.weight().dim();
                     if a.len() != out_dim {
                         return None;
                     }
@@ -1637,9 +1682,9 @@ mod f32_tax_probe {
                             continue;
                         }
                         for j in 0..in_dim {
-                            back[j] += ai * f64::from(lin.weight[[i, j]]);
+                            back[j] += ai * f64::from(lin.weight()[[i, j]]);
                         }
-                        if let Some(b) = &lin.bias {
+                        if let Some(b) = lin.bias() {
                             bias += ai * f64::from(b[i]);
                         }
                     }
@@ -1736,7 +1781,7 @@ mod f32_tax_probe {
             // requires knowing the width; derive from the layer.
             let node = graph.node(name)?;
             let width = match node.layer() {
-                Layer::Linear(lin) => lin.weight.dim().0,
+                Layer::Linear(lin) => lin.weight().dim().0,
                 Layer::ReLU(_)
                 | Layer::AddConstant(_)
                 | Layer::SubConstant(_)
@@ -1774,15 +1819,18 @@ mod f32_tax_probe {
     }
 
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn measure_f32_storage_tax_on_stuck_geometry() {
         let base = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
         ));
-        if !base.is_dir() {
-            eprintln!("benchmarks absent; skipping");
-            return;
-        }
+        assert!(
+            base.is_dir(),
+            "external VNN-COMP 2026 relational fixtures missing at {}; run \
+             benchmarks/vnncomp2026_benchmarks/setup.sh",
+            base.display()
+        );
         let f = base.join("onnx/original/ACASXU_run2a_2_4_batch_2000.onnx");
         let g = base.join("onnx/perturbed/ACASXU_run2a_2_4_batch_2000_perturbed_0.onnx");
         let graph_f = super::super::vnncomp::load_graph_network(&f).expect("load f");
@@ -1842,6 +1890,14 @@ mod f32_tax_probe {
                     worst64 = worst64.min(b64);
                 }
             }
+            assert!(
+                worst32.is_finite() && worst64.is_finite(),
+                "{label}: both storage modes must publish finite bounds"
+            );
+            assert!(
+                worst64 + 1e-6 >= worst32,
+                "{label}: f64 storage unexpectedly underperformed f32 storage: f32={worst32}, f64={worst64}"
+            );
             eprintln!(
                 "[f32-tax] {label}: f32-storage worst_row={worst32:.7} | f64 worst_row={worst64:.7} | tax={:.3e}",
                 worst64 - worst32
@@ -1870,15 +1926,18 @@ mod interm_alpha_probe {
     }
 
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn measure_interm_alpha_gain_on_stuck_geometry() {
         let base = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
         ));
-        if !base.is_dir() {
-            eprintln!("benchmarks absent; skipping");
-            return;
-        }
+        assert!(
+            base.is_dir(),
+            "external VNN-COMP 2026 relational fixtures missing at {}; run \
+             benchmarks/vnncomp2026_benchmarks/setup.sh",
+            base.display()
+        );
         let f = base.join("onnx/original/ACASXU_run2a_2_4_batch_2000.onnx");
         let g = base.join("onnx/perturbed/ACASXU_run2a_2_4_batch_2000_perturbed_0.onnx");
         let graph_f = super::super::vnncomp::load_graph_network(&f).expect("load f");
@@ -1899,6 +1958,7 @@ mod interm_alpha_probe {
         let spec_matrix =
             ndarray::Array2::from_shape_vec((rows.len(), n_out), rows.concat()).unwrap();
 
+        let mut compared = 0usize;
         for frac in [64.0f32, 128.0, 256.0] {
             let lo: Vec<f32> = bounds
                 .iter()
@@ -1969,10 +2029,24 @@ mod interm_alpha_probe {
                 .expect("B");
             let b = min_band_row(&b_bounds);
 
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "center 1/{frac}: both intermediate-bound routes must publish finite margins"
+            );
+            assert!(
+                b + 1e-5 >= a,
+                "center 1/{frac}: intersecting tighter alpha intermediates must not lower the certified margin ({b} < {a})"
+            );
+            compared += 1;
+
             eprintln!(
                 "[interm-alpha] center 1/{frac}: A(default CROWN-IBP)={a:.6} B(∩ 30-iter α-collection)={b:.6} | gain B−A={:.3e}",
                 b - a
             );
         }
+        assert_eq!(
+            compared, 3,
+            "the complete intermediate-alpha corpus must run"
+        );
     }
 }

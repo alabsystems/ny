@@ -23,14 +23,82 @@
 //!   Verification via Clipping," arXiv:2512.11087
 
 use ndarray::{Array2, ArrayD};
-use ny_core::Result;
+use ny_core::{
+    dd::{next_down_f64, next_up_f64},
+    Result,
+};
 use ny_core::{nan_propagating_max, nan_propagating_min};
 use ny_tensor::{next_down_f32, next_up_f32};
+
+use crate::bounds::{certified_affine_sum_f32, OutwardDirection};
 
 struct RelaxedClipOptions {
     num_iterations: usize,
     is_lower: bool,
     preserve_infeasible: bool,
+}
+
+/// Outward enclosure of `a·x_hat ± |a|·eps + bias`.
+///
+/// The shared self-checked DD reducer keeps cancellation-heavy constraints
+/// tight while retaining a directed-per-add fallback for non-finite inputs.
+fn affine_center_radius_outward<F>(len: usize, bias: f32, is_lower: bool, mut term_at: F) -> f64
+where
+    F: FnMut(usize) -> (f32, f32, f32),
+{
+    affine_center_radius_except_outward(len, None, bias, is_lower, &mut term_at)
+}
+
+fn affine_center_radius_except_outward<F>(
+    len: usize,
+    skip: Option<usize>,
+    bias: f32,
+    is_lower: bool,
+    mut term_at: F,
+) -> f64
+where
+    F: FnMut(usize) -> (f32, f32, f32),
+{
+    let direction = if is_lower {
+        OutwardDirection::Lower
+    } else {
+        OutwardDirection::Upper
+    };
+    certified_affine_sum_f32(
+        bias,
+        (0..len)
+            .filter(|index| Some(*index) != skip)
+            .flat_map(|index| {
+                let (coefficient, midpoint, epsilon) = term_at(index);
+                let radius_coefficient = if is_lower {
+                    -coefficient.abs()
+                } else {
+                    coefficient.abs()
+                };
+                [(coefficient, midpoint), (radius_coefficient, epsilon)]
+            }),
+        direction,
+    )
+}
+
+#[inline]
+fn outward_clip_candidate(
+    threshold: f32,
+    concrete_without_dimension: f64,
+    coefficient: f32,
+    is_lower_form: bool,
+) -> f32 {
+    let numerator = if is_lower_form {
+        next_up_f64(f64::from(threshold) - concrete_without_dimension)
+    } else {
+        next_down_f64(f64::from(threshold) - concrete_without_dimension)
+    };
+    let quotient = numerator / f64::from(coefficient);
+    if coefficient < 0.0 {
+        next_down_f32(next_down_f64(quotient) as f32)
+    } else {
+        next_up_f32(next_up_f64(quotient) as f32)
+    }
 }
 
 /// Relaxed Clipping: shrink input domain using linear constraints.
@@ -224,8 +292,6 @@ fn relaxed_clip_internal_scalar(
         ));
     }
 
-    let sign: f32 = if options.is_lower { 1.0 } else { -1.0 };
-
     let mut x_l_out = x_l.clone();
     let mut x_u_out = x_u.clone();
     let mut verified_by_clip = vec![false; batch];
@@ -252,18 +318,11 @@ fn relaxed_clip_internal_scalar(
         let x_hat = (&x_l_out + &x_u_out) / 2.0;
         let eps = (&x_u_out - &x_l_out) / 2.0;
 
-        // Concretize bounds: dm_lb shape (batch, n_spec)
-        let dm_lb = concretize_bounds(&x_hat, &eps, l_a, lbias, options.is_lower);
-
         // For each dimension, compute the clipping update
         // We iterate per-dimension to avoid creating large intermediate tensors
         for dim in 0..x_dim {
             // Extract l_a column for this dimension: shape (batch, n_spec)
             let l_a_dim = extract_dim_slice(l_a, dim);
-
-            // Extract x_hat and eps for this dimension: shape (batch,)
-            let x_hat_dim: Vec<f32> = (0..batch).map(|b| x_hat[[b, dim]]).collect();
-            let eps_dim: Vec<f32> = (0..batch).map(|b| eps[[b, dim]]).collect();
 
             // Solve for the clip candidate x_i* = (threshold - concrete_minus_one) / l_a_dim,
             // where concrete_minus_one is `dm_lb` with the contribution of dimension `dim`
@@ -285,19 +344,25 @@ fn relaxed_clip_internal_scalar(
                 for s in 0..n_spec {
                     let a_val = l_a_dim[[b, s]];
                     if a_val.abs() > 1e-10 {
-                        let a64 = a_val as f64;
-                        // concrete_minus_one in f64: dm_lb with dim `dim` removed.
-                        let concrete_minus_one = (dm_lb[[b, s]] as f64)
-                            - a64 * (x_hat_dim[b] as f64)
-                            + (sign as f64) * a64.abs() * (eps_dim[b] as f64);
-                        let x_star = ((thresholds[[b, s]] as f64) - concrete_minus_one) / a64;
-                        curr_x[[b, s]] = if a_val < 0.0 {
-                            // Lower-bound candidate: round outward = down.
-                            next_down_f32(x_star as f32)
-                        } else {
-                            // Upper-bound candidate: round outward = up.
-                            next_up_f32(x_star as f32)
-                        };
+                        let concrete_minus_one = affine_center_radius_except_outward(
+                            x_dim,
+                            Some(dim),
+                            lbias[[b, s]],
+                            options.is_lower,
+                            |other_dim| {
+                                (
+                                    l_a[[b, s, other_dim]],
+                                    x_hat[[b, other_dim]],
+                                    eps[[b, other_dim]],
+                                )
+                            },
+                        );
+                        curr_x[[b, s]] = outward_clip_candidate(
+                            thresholds[[b, s]],
+                            concrete_minus_one,
+                            a_val,
+                            options.is_lower,
+                        );
                     } else {
                         // Coefficient near zero: no constraint on this dimension
                         curr_x[[b, s]] = if a_val < 0.0 {
@@ -451,7 +516,6 @@ fn relaxed_clip_internal_fast(
         ));
     }
 
-    let sign: f32 = if options.is_lower { 1.0 } else { -1.0 };
     let is_lower = options.is_lower;
 
     // Standard-layout (row-major, contiguous) views so `.as_slice()` yields flat
@@ -479,10 +543,7 @@ fn relaxed_clip_internal_fast(
     // Reused scratch (allocated once, not per dim / per iteration).
     let mut x_hat = vec![0f32; batch * x_dim];
     let mut eps = vec![0f32; batch * x_dim];
-    let mut dm_lb = vec![0f32; batch * n_spec];
     let mut curr_x = vec![0f32; batch * n_spec];
-
-    let csign: f64 = if is_lower { -1.0 } else { 1.0 };
 
     for _iter in 0..options.num_iterations {
         // Validity check (skip already-verified batches), matching the scalar path.
@@ -510,34 +571,6 @@ fn relaxed_clip_internal_fast(
             eps[i] = (xu[i] - xl[i]) / 2.0;
         }
 
-        // dm_lb = concretize_bounds(x_hat, eps, l_a, lbias, is_lower), inlined with
-        // the identical f64 accumulation order and directed rounding / NaN guard.
-        for b in 0..batch {
-            for s in 0..n_spec {
-                let mut a_dot_xhat: f64 = 0.0;
-                let mut abs_a_dot_eps: f64 = 0.0;
-                let a_base = b * n_spec * x_dim + s * x_dim;
-                let xe_base = b * x_dim;
-                for d in 0..x_dim {
-                    let a = l_a_s[a_base + d] as f64;
-                    a_dot_xhat += a * (x_hat[xe_base + d] as f64);
-                    abs_a_dot_eps += a.abs() * (eps[xe_base + d] as f64);
-                }
-                let val = a_dot_xhat + csign * abs_a_dot_eps + (lbias_s[b * n_spec + s] as f64);
-                dm_lb[b * n_spec + s] = if val.is_nan() {
-                    if is_lower {
-                        f32::NEG_INFINITY
-                    } else {
-                        f32::INFINITY
-                    }
-                } else if is_lower {
-                    next_down_f32(val as f32)
-                } else {
-                    next_up_f32(val as f32)
-                };
-            }
-        }
-
         for dim in 0..x_dim {
             // curr_x[b, s] for this dimension (computed for all b, exactly as scalar).
             for b in 0..batch {
@@ -546,16 +579,25 @@ fn relaxed_clip_internal_fast(
                 for s in 0..n_spec {
                     let a_val = l_a_s[a_base + s * x_dim];
                     curr_x[s_base + s] = if a_val.abs() > 1e-10 {
-                        let a64 = a_val as f64;
-                        let concrete_minus_one = (dm_lb[s_base + s] as f64)
-                            - a64 * (x_hat[b * x_dim + dim] as f64)
-                            + (sign as f64) * a64.abs() * (eps[b * x_dim + dim] as f64);
-                        let x_star = ((thr_s[s_base + s] as f64) - concrete_minus_one) / a64;
-                        if a_val < 0.0 {
-                            next_down_f32(x_star as f32)
-                        } else {
-                            next_up_f32(x_star as f32)
-                        }
+                        let concrete_minus_one = affine_center_radius_except_outward(
+                            x_dim,
+                            Some(dim),
+                            lbias_s[s_base + s],
+                            is_lower,
+                            |other_dim| {
+                                (
+                                    l_a_s[b * n_spec * x_dim + s * x_dim + other_dim],
+                                    x_hat[b * x_dim + other_dim],
+                                    eps[b * x_dim + other_dim],
+                                )
+                            },
+                        );
+                        outward_clip_candidate(
+                            thr_s[s_base + s],
+                            concrete_minus_one,
+                            a_val,
+                            is_lower,
+                        )
                     } else if a_val < 0.0 {
                         f32::NEG_INFINITY
                     } else {
@@ -742,8 +784,6 @@ pub(crate) fn relaxed_clip_single_spec_row_fast(
     }
     scratch.reset(x_dim, xl, xu);
 
-    let sign: f32 = if is_lower { 1.0 } else { -1.0 };
-    let csign: f64 = if is_lower { -1.0 } else { 1.0 };
     let mut active = m;
 
     for _iter in 0..num_iterations {
@@ -779,41 +819,24 @@ pub(crate) fn relaxed_clip_single_spec_row_fast(
                 scratch.eps[d] = (xu[base + d] - xl[base + d]) / 2.0;
             }
 
-            // dm_lb, single spec: identical f64 order + directed round + NaN
-            // degrade as the reference's inlined concretize.
-            let mut a_dot_xhat: f64 = 0.0;
-            let mut abs_a_dot_eps: f64 = 0.0;
-            for d in 0..x_dim {
-                let av = a[base + d] as f64;
-                a_dot_xhat += av * (scratch.x_hat[d] as f64);
-                abs_a_dot_eps += av.abs() * (scratch.eps[d] as f64);
-            }
-            let val = a_dot_xhat + csign * abs_a_dot_eps + (bias[b] as f64);
-            let dm = if val.is_nan() {
-                if is_lower {
-                    f32::NEG_INFINITY
-                } else {
-                    f32::INFINITY
-                }
-            } else if is_lower {
-                next_down_f32(val as f32)
-            } else {
-                next_up_f32(val as f32)
-            };
-
             let mut changed = false;
             for dim in 0..x_dim {
                 let a_val = a[base + dim];
                 let curr = if a_val.abs() > 1e-10 {
-                    let a64 = a_val as f64;
-                    let concrete_minus_one = (dm as f64) - a64 * (scratch.x_hat[dim] as f64)
-                        + (sign as f64) * a64.abs() * (scratch.eps[dim] as f64);
-                    let x_star = ((thr[b] as f64) - concrete_minus_one) / a64;
-                    if a_val < 0.0 {
-                        next_down_f32(x_star as f32)
-                    } else {
-                        next_up_f32(x_star as f32)
-                    }
+                    let concrete_minus_one = affine_center_radius_except_outward(
+                        x_dim,
+                        Some(dim),
+                        bias[b],
+                        is_lower,
+                        |other_dim| {
+                            (
+                                a[base + other_dim],
+                                scratch.x_hat[other_dim],
+                                scratch.eps[other_dim],
+                            )
+                        },
+                    );
+                    outward_clip_candidate(thr[b], concrete_minus_one, a_val, is_lower)
                 } else if a_val < 0.0 {
                     f32::NEG_INFINITY
                 } else {
@@ -900,7 +923,6 @@ pub fn concretize_bounds(
     lbias: &ArrayD<f32>,
     is_lower: bool,
 ) -> Array2<f32> {
-    let sign: f64 = if is_lower { -1.0 } else { 1.0 };
     // Directed rounding: lower bounds round down, upper bounds round up (#2303).
     let round: fn(f64) -> f32 = if is_lower {
         |v| next_down_f32(v as f32)
@@ -916,17 +938,9 @@ pub fn concretize_bounds(
 
     for b in 0..batch {
         for s in 0..n_spec {
-            // Use f64 accumulators to match concretize_f64_inner precision (#2303).
-            let mut a_dot_xhat: f64 = 0.0;
-            let mut abs_a_dot_eps: f64 = 0.0;
-
-            for d in 0..x_dim {
-                let a = l_a[[b, s, d]] as f64;
-                a_dot_xhat += a * (x_hat[[b, d]] as f64);
-                abs_a_dot_eps += a.abs() * (eps[[b, d]] as f64);
-            }
-
-            let val = a_dot_xhat + sign * abs_a_dot_eps + (lbias[[b, s]] as f64);
+            let val = affine_center_radius_outward(x_dim, lbias[[b, s]], is_lower, |d| {
+                (l_a[[b, s, d]], x_hat[[b, d]], eps[[b, d]])
+            });
             // NaN guard: if NaN entered the accumulator (e.g., from NaN CROWN
             // coefficients via safe_add overflow), fall back to conservative
             // bounds matching concretize_f64_inner (#2963, #2577).
@@ -964,6 +978,26 @@ fn extract_dim_slice(l_a: &ArrayD<f32>, dim: usize) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concretize_bounds_is_outward_under_catastrophic_cancellation() {
+        let large = 2.0_f32.powi(50);
+        let x_hat =
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 3]), vec![large, 1.0, large]).unwrap();
+        let eps = ArrayD::zeros(ndarray::IxDyn(&[1, 3]));
+        let coefficients =
+            ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 3]), vec![large, 1.0, -large]).unwrap();
+        let bias = ArrayD::zeros(ndarray::IxDyn(&[1, 1]));
+
+        let lower = concretize_bounds(&x_hat, &eps, &coefficients, &bias, true);
+        let upper = concretize_bounds(&x_hat, &eps, &coefficients, &bias, false);
+        assert!(lower[[0, 0]] <= 1.0);
+        assert!(
+            upper[[0, 0]] >= 1.0,
+            "upper {} must enclose exact 2^100 + 1 - 2^100",
+            upper[[0, 0]]
+        );
+    }
     use ndarray::array;
 
     /// The fast flat-slice relaxed-clip path must be BIT-IDENTICAL to the scalar

@@ -199,7 +199,8 @@ fn test_verify_with_larger_network() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_verify_beta_crown_with_engine_threads_gpu_fast_path() {
+fn test_verify_beta_crown_with_engine_preserves_finite_gpu_crown_fallback() {
+    let _gate = crate::sound_gpu_gate::test_lock::lock_gate();
     let weight1 =
         Array2::from_shape_vec((4, 2), vec![1.0, 0.5, -0.5, 1.0, 0.3, -0.7, -0.2, 0.8]).unwrap();
     let weight2 = Array2::from_shape_vec(
@@ -252,15 +253,21 @@ fn test_verify_beta_crown_with_engine_threads_gpu_fast_path() {
         result,
         VerificationResult::Violated { .. } | VerificationResult::Unknown { .. }
     ));
-    assert!(
-        mock_gpu.gpu_calls() > 0,
-        "Verifier::verify_with_engine should preserve the beta-crown GPU fast-path"
+    // BetaCrownVerifier converts its timeout into finite CROWN authority. The
+    // sequential GPU route therefore fails closed before its opaque,
+    // non-pollable host staging; see the matching direct-engine regression in
+    // beta_crown::engine::tests::crown_ibp.
+    assert_eq!(
+        mock_gpu.gpu_calls(),
+        0,
+        "finite verifier authority must decline opaque GPU CROWN host staging"
     );
 }
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_verify_beta_crown_with_stored_engine_threads_gpu_fast_path() {
+fn test_verify_beta_crown_with_stored_engine_preserves_finite_gpu_crown_fallback() {
+    let _gate = crate::sound_gpu_gate::test_lock::lock_gate();
     let weight1 =
         Array2::from_shape_vec((4, 2), vec![1.0, 0.5, -0.5, 1.0, 0.3, -0.7, -0.2, 0.8]).unwrap();
     let weight2 = Array2::from_shape_vec(
@@ -314,9 +321,12 @@ fn test_verify_beta_crown_with_stored_engine_threads_gpu_fast_path() {
         result,
         VerificationResult::Violated { .. } | VerificationResult::Unknown { .. }
     ));
-    assert!(
-        mock_gpu.gpu_calls() > 0,
-        "Verifier::with_engine should preserve the beta-crown GPU fast-path for verify()"
+    // Stored engines obey the same finite-authority policy as call-local
+    // engines: no backend call may begin behind unbounded host preparation.
+    assert_eq!(
+        mock_gpu.gpu_calls(),
+        0,
+        "finite verifier authority must decline opaque stored-engine GPU CROWN host staging"
     );
 }
 

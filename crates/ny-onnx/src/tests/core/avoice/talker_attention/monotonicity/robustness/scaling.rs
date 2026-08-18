@@ -192,8 +192,9 @@ fn assert_seq_len_16_regression(results: &[(usize, f32, f32)]) {
 /// Tests seq_len ∈ {4, 8, 16, 32} and reports the scaling relationship.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_centroid_monotonicity_seq_len_scaling_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let seq_lens: Vec<usize> = vec![4, 8, 16, 32];
 
     println!(

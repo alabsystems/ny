@@ -84,6 +84,41 @@ impl MarginOutputSeedGuard {
     }
 }
 
+/// Publicly-constructible scope handle for the spec-referenced OUTPUT indices
+/// (#margin-subset-seed).
+///
+/// WHY THIS EXISTS. Publication used to happen only inside two BaB entry points
+/// (the conjunctive multi-objective root and the single-objective relu-split
+/// loop). The plain `verify` path — which is what runs a VNN-LIB property
+/// end to end — published nothing, so `margin_subset_indices` returned `None`
+/// and the OUTPUT node always took the full `[dim x dim]` identity seed.
+/// Measured on TinyYOLO (yolo_2023): the spec reads 5 of 21,125 outputs, but
+/// the collector seeded all 21,125, asking for a 3.57 GB identity pair that the
+/// Conv2d scratch cap then refused — degrading the node to loose IBP for want
+/// of rows the verdict never reads.
+///
+/// The guard is thread-local and restores the previous publication on drop, so
+/// callers must hold it across the propagation they want it to apply to, on the
+/// same thread.
+///
+/// Sound: publishing only selects which rows get the TIGHTER treatment. Rows
+/// outside the set keep their existing IBP/forward bounds, which are valid
+/// enclosures (see the scatter contract above), so a too-small publication
+/// costs tightness and never validity. An empty set disengages subset seeding
+/// entirely and is byte-identical to the historical full-width path.
+pub struct SpecOutputSeedScope {
+    _guard: MarginOutputSeedGuard,
+}
+
+impl SpecOutputSeedScope {
+    /// Publish `indices` for the lifetime of the returned scope.
+    pub fn publish(indices: Vec<usize>) -> Self {
+        Self {
+            _guard: MarginOutputSeedGuard::publish(indices),
+        }
+    }
+}
+
 impl Drop for MarginOutputSeedGuard {
     fn drop(&mut self) {
         PUBLISHED.with(|slot| {

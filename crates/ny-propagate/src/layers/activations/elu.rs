@@ -62,14 +62,16 @@ impl BoundPropagation for EluLayer {
                 alpha,
             )));
         }
-        // Guard: non-finite input bounds → NaN.exp() = NaN flows silently into
-        // output bounds. CROWN path rejects via non_finite_domain_guard.
-        // Pattern: SELU guard at selu.rs:47-53.
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // OpaqueSkip taint (#opaque-skip-six-sites): ±Inf input endpoints are
+        // legitimate (an upstream OpaqueSkip emits [-inf, +inf]) and ELU maps
+        // them cleanly with no NaN-producing inf arithmetic: x = -inf takes the
+        // exp branch, exp(-inf) = 0 → alpha*(0-1) = -alpha (finite, alpha is
+        // validated finite positive above); x = +inf takes the identity branch
+        // → +inf. So only NaN inputs are rejected here — NaN.exp() = NaN would
+        // otherwise flow into the output — and ±Inf is allowed to propagate.
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "ELU IBP: non-finite input bounds".to_string(),
+                "ELU IBP: NaN input bounds".to_string(),
             ));
         }
         // Directed rounding: for x < 0, exp is a transcendental that can round
@@ -98,7 +100,10 @@ impl BoundPropagation for EluLayer {
         };
         let lower = input.lower().mapv(elu_lower);
         let upper = input.upper().mapv(elu_upper);
-        BoundedTensor::new(lower, upper)
+        // ±Inf endpoints (upper = +inf from a +inf input) are sound here; NaN
+        // is impossible given the NaN input guard above, and would still be
+        // rejected by `new_allow_infinite` as defense-in-depth.
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
     impl_elementwise_activation!(
         @trait_methods
@@ -710,16 +715,32 @@ mod tests {
         assert!(matches!(err, NyError::NumericalInstability(_)));
     }
 
+    /// OpaqueSkip taint probe (#opaque-skip-six-sites): a legitimate
+    /// [-inf, +inf] input (upstream OpaqueSkip) must FLOW as a widened output
+    /// — ELU(-inf) = -alpha, ELU(+inf) = +inf — not abort graph IBP with
+    /// NumericalInstability. Supersedes the pre-migration expectation of
+    /// test_ibp_inf_input_rejected_3278 (NaN rejection is retained separately
+    /// by the two _3278 tests above).
     #[test]
-    fn test_ibp_inf_input_rejected_3278() {
-        let layer = EluLayer::new(1.0);
-        let input = BoundedTensor::new_unchecked(
+    fn test_ibp_opaque_skip_inf_input_flows() {
+        let alpha = 1.5;
+        let layer = EluLayer::new(alpha);
+        let input = BoundedTensor::new_allow_infinite(
             ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NEG_INFINITY]).unwrap(),
             ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::INFINITY]).unwrap(),
         )
         .unwrap();
-        let err = layer.propagate_ibp(&input).expect_err("Inf input");
-        assert!(matches!(err, NyError::NumericalInstability(_)));
+        let out = layer
+            .propagate_ibp(&input)
+            .expect("±inf input must propagate, not error");
+        // ELU range over (-inf, +inf) is (-alpha, +inf); the bound must
+        // enclose it: lower <= -alpha (clamped to exactly -alpha), upper = +inf.
+        assert_eq!(out.lower()[[0]], -alpha, "ELU(-inf) saturates at -alpha");
+        assert!(
+            out.upper()[[0]].is_infinite() && out.upper()[[0]].is_sign_positive(),
+            "ELU(+inf) is +inf, got {}",
+            out.upper()[[0]]
+        );
     }
 
     // ── NaN alpha absorption regression tests (#2714) ─────────────────

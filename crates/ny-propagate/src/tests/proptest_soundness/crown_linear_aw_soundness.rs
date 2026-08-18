@@ -43,32 +43,7 @@ use ny_cert::rational::Rat;
 /// exponent `e`; we build that rational exactly (no rounding). Used to compare
 /// the f32 concretized bound against the exact-rational oracle with zero slack.
 fn f32_to_rat(x: f32) -> Rat {
-    use num_bigint::BigInt;
-    use num_traits::Zero;
-    assert!(x.is_finite(), "f32_to_rat: non-finite {x}");
-    if x == 0.0 {
-        return Rat::ZERO;
-    }
-    let bits = x.to_bits();
-    let sign = if bits >> 31 == 1 { -1i64 } else { 1i64 };
-    let exp_field = ((bits >> 23) & 0xff) as i64;
-    let mant_field = (bits & 0x7f_ffff) as i64;
-    // value = sign * mantissa * 2^exp2
-    let (mantissa, exp2) = if exp_field == 0 {
-        // subnormal: value = mant_field * 2^(-126-23)
-        (mant_field, -126 - 23)
-    } else {
-        // normal: value = (2^23 + mant_field) * 2^(exp_field-127-23)
-        ((1i64 << 23) | mant_field, exp_field - 127 - 23)
-    };
-    let num_i = BigInt::from(sign * mantissa);
-    let (num, den) = if exp2 >= 0 {
-        (num_i * (BigInt::from(1) << (exp2 as u32)), BigInt::from(1))
-    } else {
-        (num_i, BigInt::from(1) << ((-exp2) as u32))
-    };
-    let _ = BigInt::zero();
-    Rat::from_bigints(num, den).expect("exact f32 rational is well-formed")
+    Rat::from_f32_exact(x).unwrap_or_else(|| panic!("f32_to_rat: non-finite {x}"))
 }
 
 /// Dyadic rational `k / 2^m`, exactly representable as both `Rat` and `f32`
@@ -842,27 +817,7 @@ proptest! {
 /// exponent bias). Needed to compare the f64 `S_hat` against the exact real
 /// `true_S` with ZERO slack.
 fn f64_to_rat(x: f64) -> Rat {
-    use num_bigint::BigInt;
-    assert!(x.is_finite(), "f64_to_rat: non-finite {x}");
-    if x == 0.0 {
-        return Rat::ZERO;
-    }
-    let bits = x.to_bits();
-    let sign = if bits >> 63 == 1 { -1i64 } else { 1i64 };
-    let exp_field = ((bits >> 52) & 0x7ff) as i64;
-    let mant_field = (bits & 0xf_ffff_ffff_ffff) as i64;
-    let (mantissa, exp2) = if exp_field == 0 {
-        (mant_field, -1022 - 52) // subnormal
-    } else {
-        ((1i64 << 52) | mant_field, exp_field - 1023 - 52) // normal
-    };
-    let num_i = BigInt::from(sign * mantissa); // |mantissa| < 2^53 fits in i64
-    let (num, den) = if exp2 >= 0 {
-        (num_i * (BigInt::from(1) << (exp2 as u32)), BigInt::from(1))
-    } else {
-        (num_i, BigInt::from(1) << ((-exp2) as u32))
-    };
-    Rat::from_bigints(num, den).expect("exact f64 rational is well-formed")
+    Rat::from_f64_exact(x).unwrap_or_else(|| panic!("f64_to_rat: non-finite {x}"))
 }
 
 /// Exact real `true_S[i,j] = Σ_k |a_ik|·|w_kj|` in `Rat` (each `|f32|` is exact).

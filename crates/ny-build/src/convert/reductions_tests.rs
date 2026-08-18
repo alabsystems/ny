@@ -312,6 +312,22 @@ fn convert_reduce_sum_opset13_input_tensor_via_weights() {
 }
 
 #[test]
+fn convert_reduce_sum_prefers_exact_integer_axis_payload() {
+    let mut weights = WeightStore::new();
+    weights.insert("axes_tensor".to_string(), arr1(&[1.0_f32]).into_dyn());
+    weights.insert_integers("axes_tensor".to_string(), arr1(&[2_i64]).into_dyn());
+    let shapes = x_shape(&[1, 4, 6]);
+    let ctx = test_ctx_with_x_shape(&weights, &shapes);
+    let layer = ctx
+        .convert_reduce_sum(&reduce_sum_spec_with_input_axes("axes_tensor"))
+        .unwrap();
+    let Layer::ReduceSum(reduce) = layer else {
+        panic!("expected ReduceSum, got {layer:?}");
+    };
+    assert_eq!(reduce.axes, vec![-1_i64]);
+}
+
+#[test]
 fn convert_reduce_sum_opset13_input_tensor_via_evaluated_constants() {
     let weights = WeightStore::new();
     let shapes = x_shape(&[1, 2, 3, 4]);
@@ -412,6 +428,21 @@ fn convert_cumsum_input_tensor_negative_axis_passthrough() {
 }
 
 #[test]
+fn convert_cumsum_rejects_adjacent_non_integer_axis() {
+    let mut weights = WeightStore::new();
+    let axis = f32::from_bits(1.0_f32.to_bits() - 1);
+    weights.insert("axis_tensor".to_string(), arr1(&[axis]).into_dyn());
+    let shapes = x_shape(&[1, 4, 6]);
+    let ctx = test_ctx_with_x_shape(&weights, &shapes);
+    let spec = cumsum_spec_with_axis_input("axis_tensor", false, false);
+
+    let err = ctx
+        .convert_cumsum(&spec)
+        .expect_err("fractional CumSum axis must not be rounded");
+    assert!(err.to_string().contains("integral"));
+}
+
+#[test]
 fn convert_cumsum_missing_axis_input_returns_model_load() {
     let weights = WeightStore::new();
     let ctx = test_ctx(&weights);
@@ -442,27 +473,24 @@ fn convert_cumsum_dynamic_axis_input_returns_unsupported_configuration() {
 }
 
 // ---------------------------------------------------------------------------
-// Path 2 edge: attributes take priority over input tensor
+// Path 2 edge: ambiguous schema encodings fail closed
 // ---------------------------------------------------------------------------
 
 #[test]
-fn convert_reduce_sum_attributes_take_priority_over_input() {
+fn convert_reduce_sum_rejects_attribute_and_input_axes() {
     let mut weights = WeightStore::new();
     weights.insert("axes_tensor".to_string(), arr1(&[99.0f32]).into_dyn());
     let shapes = x_shape(&[1, 4, 6]);
     let ctx = test_ctx_with_x_shape(&weights, &shapes);
 
-    // Spec has BOTH attributes AND input tensor — attributes should win.
+    // A LayerSpec does not retain the originating opset, so it cannot safely
+    // decide which of these mutually exclusive schema encodings is live.
     let mut spec = reduce_sum_spec_with_input_axes("axes_tensor");
     spec.attributes
         .insert("axes".to_string(), AttributeValue::Ints(vec![2]));
 
-    let layer = ctx.convert_reduce_sum(&spec).unwrap();
-    let Layer::ReduceSum(reduce) = layer else {
-        panic!("expected ReduceSum, got {layer:?}");
-    };
-    // Attribute axis=2 on rank-3 → -1, not input tensor axis=99
-    assert_eq!(reduce.axes, vec![-1i64]);
+    let err = ctx.convert_reduce_sum(&spec).unwrap_err();
+    assert!(err.to_string().contains("both an attribute and an input"));
 }
 
 // ---------------------------------------------------------------------------
@@ -496,19 +524,93 @@ fn convert_reduce_sum_empty_attribute_axes_reduces_all() {
 }
 
 #[test]
-fn convert_reduce_sum_missing_input_tensor_reduces_all() {
+fn convert_reduce_sum_dynamic_input_tensor_is_rejected() {
     let weights = WeightStore::new();
     let ctx = test_ctx(&weights);
     let spec = reduce_sum_spec_with_input_axes("nonexistent");
 
-    let layer = ctx.convert_reduce_sum(&spec).unwrap();
-    let Layer::ReduceSum(reduce) = layer else {
-        panic!("expected ReduceSum, got {layer:?}");
-    };
-    assert!(
-        reduce.axes.is_empty(),
-        "missing input tensor should fall through to reduce-all"
+    let err = ctx.convert_reduce_sum(&spec).unwrap_err();
+    assert!(err.to_string().contains("requires axes input"));
+}
+
+#[test]
+fn dynamic_axes_are_rejected_for_every_supported_reduction() {
+    let weights = WeightStore::new();
+    let ctx = test_ctx(&weights);
+    for layer_type in [
+        LayerType::ReduceSum,
+        LayerType::ReduceMean,
+        LayerType::ReduceMax,
+        LayerType::ReduceMin,
+        LayerType::LogSumExp,
+    ] {
+        let spec = LayerSpec {
+            name: format!("dynamic_{layer_type}"),
+            layer_type: layer_type.clone(),
+            inputs: vec!["x".to_string(), "runtime_axes".to_string()],
+            outputs: vec!["y".to_string()],
+            weights: None,
+            attributes: HashMap::new(),
+        };
+        let result = match layer_type {
+            LayerType::ReduceSum => ctx.convert_reduce_sum(&spec),
+            LayerType::ReduceMean => ctx.convert_reduce_mean(&spec),
+            LayerType::ReduceMax => ctx.convert_reduce_max(&spec),
+            LayerType::ReduceMin => ctx.convert_reduce_min(&spec),
+            LayerType::LogSumExp => ctx.convert_logsumexp(&spec),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(NyError::UnsupportedConfiguration(_))),
+            "{layer_type} must reject dynamic axes, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_axes_with_noop_is_identity_for_every_supported_reduction() {
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "empty_axes".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[0]), Vec::new()).unwrap(),
     );
+    weights.insert_integers(
+        "empty_axes".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[0]), Vec::new()).unwrap(),
+    );
+    let ctx = test_ctx(&weights);
+    for layer_type in [
+        LayerType::ReduceSum,
+        LayerType::ReduceMean,
+        LayerType::ReduceMax,
+        LayerType::ReduceMin,
+        LayerType::LogSumExp,
+    ] {
+        let spec = LayerSpec {
+            name: format!("noop_{layer_type}"),
+            layer_type: layer_type.clone(),
+            inputs: vec!["x".to_string(), "empty_axes".to_string()],
+            outputs: vec!["y".to_string()],
+            weights: None,
+            attributes: HashMap::from([(
+                "noop_with_empty_axes".to_string(),
+                AttributeValue::Int(1),
+            )]),
+        };
+        let layer = match layer_type {
+            LayerType::ReduceSum => ctx.convert_reduce_sum(&spec),
+            LayerType::ReduceMean => ctx.convert_reduce_mean(&spec),
+            LayerType::ReduceMax => ctx.convert_reduce_max(&spec),
+            LayerType::ReduceMin => ctx.convert_reduce_min(&spec),
+            LayerType::LogSumExp => ctx.convert_logsumexp(&spec),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        assert!(
+            matches!(layer, Layer::SkipMerge(_)),
+            "{layer_type} empty axes + noop must be identity, got {layer:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

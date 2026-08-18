@@ -39,13 +39,35 @@
 //! only when independent outward replay strictly improves the certified lower
 //! bound.  Projected Adam is candidate search only.
 //!
-//! The module is not called by a CLI, verifier verdict, preset, or scored path.
+//! The prepared M17/M20 portfolio is consumed by the CLI's explicitly enabled
+//! cGAN input-leaf route. No default preset enables that route; the remaining
+//! experimental entry points document their wiring status individually.
 
 use std::time::{Duration, Instant};
 
+use ndarray::ArrayView4;
 use num_rational::BigRational;
 use num_traits::{Signed, ToPrimitive, Zero};
 
+use crate::constrained_zonotope_batch_norm::{
+    batch_norm_affine_certificate_peak_live_bytes, certify_batch_norm_affine_surrogate_impl,
+    ConstrainedZonotopeBatchNormAffineCertificateLimits, ConstrainedZonotopeBatchNormBudgetError,
+    ConstrainedZonotopeBatchNormError, ConstrainedZonotopeBatchNormSpec,
+};
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallAttempt, ConstrainedZonotopeCallBudget,
+    ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, ConstrainedZonotopeCallTracker,
+    ConstrainedZonotopePeakLiveBytes, InertConstrainedZonotopeCallGate,
+};
+use crate::constrained_zonotope_conv2d::{
+    input_coordinate as conv2d_input_coordinate, output_dimension as conv2d_output_dimension,
+    ConstrainedZonotopeConv2dError, ConstrainedZonotopeConv2dSpec,
+};
+use crate::constrained_zonotope_dual::{
+    evaluate_constrained_zonotope64_dual_with_call_gate, ConstrainedZonotopeDualBudgetError,
+    DUAL_SHAPE_ERROR_LIVE_BYTES,
+};
 use crate::{CertifiedAuxiliaryBounds64, ConstrainedZonotope64, ConstrainedZonotope64Error};
 
 /// Hard ceiling on the pre-ReLU value dimension accepted by the authority path.
@@ -94,6 +116,21 @@ const RELU_TAIL_BOX_CUT_ADAM_BETA1: f64 = 0.9;
 const RELU_TAIL_BOX_CUT_ADAM_BETA2: f64 = 0.999;
 const RELU_TAIL_BOX_CUT_ADAM_EPSILON: f64 = 1e-8;
 
+// One retained exact rational can reach the 32,768-bit accepted ceiling in
+// both numerator and denominator, while the checked operation constructing it
+// can transiently carry roughly twice that width before rejection/reduction.
+// This charge covers both integer payloads, their containers, and wide
+// allocator/carry slack.
+const RELU_TAIL_RATIONAL_LIVE_BYTES: usize = 64 * 1_024;
+// A small fixed pool covers transient exact scalars held while one coordinate
+// is converted, corrected, combined with a replay, or rounded for publication.
+const RELU_TAIL_TRANSIENT_RATIONAL_SLOTS: usize = 16;
+// M24 simultaneously retains its source/cut directions, two multiplier
+// values, endpoint values, rounding repair, and accumulated exact constant.
+// Keep this separate from the M17 line-builder pool so its peak model can be
+// tightened independently without weakening either authority path.
+const RELU_TAIL_BOX_CUT_TRANSIENT_RATIONAL_SLOTS: usize = 24;
+
 /// Exact declared output margin.
 ///
 /// Fields are private so construction always applies the rational size caps.
@@ -103,6 +140,24 @@ const RELU_TAIL_BOX_CUT_ADAM_EPSILON: f64 = 1e-8;
 pub struct ExactReluTailMargin {
     coefficients: Vec<BigRational>,
     bias: BigRational,
+}
+
+/// Private provenance seal for an exact margin constructed by the
+/// transactional Conv2d/BatchNorm pullback.
+///
+/// Caller-declared margins cannot acquire this wrapper: their only public
+/// constructor remains [`ExactReluTailMargin::try_new`], with the stricter
+/// input-rational ceiling.  The wrapper lets the downstream transaction retain
+/// exact terms that grew past that input ceiling, but not past the immutable
+/// intermediate or aggregate ceilings.
+struct InternallyPulledReluTailMargin {
+    margin: ExactReluTailMargin,
+}
+
+impl InternallyPulledReluTailMargin {
+    fn as_exact_margin(&self) -> &ExactReluTailMargin {
+        &self.margin
+    }
 }
 
 impl ExactReluTailMargin {
@@ -311,6 +366,127 @@ pub struct ReluTailDualResult {
     pub supplied_multipliers_used: bool,
 }
 
+/// Caller-tightenable geometry and post-certificate construction limits.
+///
+/// There is intentionally no `Default`: an experimental caller must price the
+/// exact Conv2d transpose and channel-error margin construction explicitly.
+/// Raw BatchNorm certification and both M17 calls retain their own checked
+/// internal resource accounting and are not counted by the product field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReluTailConvBatchNormPullbackLimits {
+    /// Maximum flat value count on the upstream side of the convolution.
+    pub max_input_value_count: usize,
+    /// Maximum flat value count on the downstream side of the convolution.
+    pub max_output_value_count: usize,
+    /// Maximum authored convolution weight elements inspected for finiteness.
+    pub max_weight_elements: usize,
+    /// Maximum output/kernel visits, including padding and structural zeros.
+    pub max_kernel_visits: usize,
+    /// Maximum exact products in post-certificate pulled-margin construction.
+    pub max_pulled_margin_construction_exact_products: usize,
+}
+
+/// Checked geometry and work accounting for one transactional pullback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReluTailConvBatchNormPullbackPlan {
+    /// Upstream pre-ReLU shape, also used by BatchNorm after that ReLU.
+    pub input_shape: [usize; 3],
+    /// Downstream convolution output shape `[channels, height, width]`.
+    pub output_shape: [usize; 3],
+    /// Weight shape `[output_channels, input_channels_per_group, height, width]`.
+    pub weight_shape: [usize; 4],
+    /// Authored convolution weight elements validated before exact work.
+    pub weight_elements: usize,
+    /// Output/kernel visits, including padding and structural zeros.
+    pub kernel_visits: usize,
+    /// Conservative exact-product bound for post-certificate margin construction.
+    ///
+    /// This excludes raw BatchNorm certification and both M17 calls, which
+    /// perform separate checked preflights and immutable-cap validation.
+    pub pulled_margin_construction_exact_product_bound: usize,
+}
+
+/// Two M17 certificates linked by one internally constructed exact pullback.
+///
+/// The transaction accepts no externally supplied downstream line and never
+/// publishes the temporary pulled-back [`ExactReluTailMargin`].  The ordinary
+/// downstream result fields remain available for certificate inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReluTailConvBatchNormPullbackResult {
+    /// M17 certificate for the caller-declared final margin.
+    pub downstream: ReluTailDualResult,
+    /// M17 certificate after exact Conv2d transpose and certified BatchNorm
+    /// surrogate-error pullback.
+    pub upstream: ReluTailDualResult,
+    /// Checked tensor geometry and post-certificate construction work count.
+    pub plan: ReluTailConvBatchNormPullbackPlan,
+}
+
+/// Transactional downstream M17 plus retained upstream M17/M20 portfolio.
+///
+/// The exact Conv2d/BatchNorm pullback is constructed once.  Its ordinary
+/// upstream M17 replay is mandatory; the auxiliary-bound M20 replay is
+/// optional and can never suppress that certificate.  No Box-cut lane is
+/// present in this transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReluTailConvBatchNormPullbackM17M20Result {
+    /// M17 certificate for the caller-declared final margin.
+    pub downstream: ReluTailDualResult,
+    /// Strict ordered maximum of mandatory upstream M17 and optional M20.
+    pub upstream: ReluTailBoxCutDualResult,
+    /// Shared-firewall refusal that caused optional M20 to fall back.
+    ///
+    /// Invalid or disjoint auxiliary geometry is intentionally represented
+    /// only by [`ReluTailBoxCutStatus::AuxiliaryFallback`]; this field retains
+    /// allocation-accounting overflow, peak refusal, or deadline exhaustion.
+    pub optional_budget_error: Option<ConstrainedZonotopeCallBudgetError>,
+    /// Checked tensor geometry and post-certificate construction work count.
+    pub plan: ReluTailConvBatchNormPullbackPlan,
+}
+
+/// Invalid geometry, BatchNorm certificate, or mandatory M17 proof work.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReluTailConvBatchNormPullbackError {
+    /// Convolution geometry, values, or caller-selected work limits failed.
+    #[error(transparent)]
+    Conv2d(#[from] ConstrainedZonotopeConv2dError),
+    /// Raw BatchNorm data or its declared affine surrogate failed certification.
+    #[error(transparent)]
+    BatchNorm(#[from] ConstrainedZonotopeBatchNormError),
+    /// Exact pullback arithmetic or either mandatory M17 replay failed.
+    #[error(transparent)]
+    ReluTail(#[from] ReluTailDualError),
+}
+
+/// Transactional pullback proof failure or shared-firewall refusal.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReluTailConvBatchNormPullbackBudgetError {
+    /// Geometry, exact arithmetic, or mandatory proof work was invalid.
+    #[error(transparent)]
+    Transform(#[from] ReluTailConvBatchNormPullbackError),
+    /// The shared absolute deadline or peak-live-byte ceiling refused work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
+}
+
+impl From<ConstrainedZonotopeConv2dError> for ReluTailConvBatchNormPullbackBudgetError {
+    fn from(error: ConstrainedZonotopeConv2dError) -> Self {
+        ReluTailConvBatchNormPullbackError::Conv2d(error).into()
+    }
+}
+
+impl From<ConstrainedZonotopeBatchNormError> for ReluTailConvBatchNormPullbackBudgetError {
+    fn from(error: ConstrainedZonotopeBatchNormError) -> Self {
+        ReluTailConvBatchNormPullbackError::BatchNorm(error).into()
+    }
+}
+
+impl From<ReluTailDualError> for ReluTailConvBatchNormPullbackBudgetError {
+    fn from(error: ReluTailDualError) -> Self {
+        ReluTailConvBatchNormPullbackError::ReluTail(error).into()
+    }
+}
+
 /// Exact coordinate geometry prepared once for many one-ReLU-tail margins.
 ///
 /// The private borrow is the provenance link: a prepared value can only replay
@@ -327,8 +503,8 @@ pub struct ReluTailDualResult {
 /// geometry therefore removes repeated setup work without becoming proof
 /// authority independent of the original domain.
 ///
-/// This experimental type is not wired to a CLI, verifier verdict, preset, or
-/// scored path.
+/// This experimental type is consumed by the explicitly enabled cGAN
+/// input-leaf route. No default preset enables that route.
 ///
 /// The domain borrow cannot escape its source:
 ///
@@ -348,6 +524,7 @@ pub struct PreparedReluTailGeometry64<'domain> {
     domain: &'domain ConstrainedZonotope64,
     exact_coordinate_bounds: Vec<(BigRational, BigRational)>,
     generator_nonzeros: usize,
+    conservative_live_bytes: usize,
 }
 
 impl PreparedReluTailGeometry64<'_> {
@@ -365,6 +542,18 @@ impl PreparedReluTailGeometry64<'_> {
     #[must_use]
     pub fn coordinate_hull_generator_additions(&self) -> usize {
         self.generator_nonzeros
+    }
+
+    /// Conservative logical bytes retained by this prepared geometry.
+    ///
+    /// The count covers the prepared-value header, exact coordinate-pair
+    /// storage, and a deliberately wide payload allowance for every retained
+    /// rational.  It excludes the borrowed domain.  A caller retaining this
+    /// value across a budgeted margin call must include both this count and its
+    /// own accounting for the domain in that call's baseline.
+    #[must_use]
+    pub const fn conservative_live_bytes(&self) -> usize {
+        self.conservative_live_bytes
     }
 
     /// Bound one exact margin using this domain-tied prepared geometry.
@@ -396,6 +585,445 @@ impl PreparedReluTailGeometry64<'_> {
             supplied_multipliers,
             config,
         )
+    }
+
+    /// Bound one exact M17 margin behind the shared synchronous call firewall.
+    ///
+    /// The prepared hull remains caller-owned throughout this call.  Therefore
+    /// `budget.baseline_live_bytes()` must include
+    /// [`Self::conservative_live_bytes`], the borrowed domain, `margin`, any
+    /// supplied multipliers, and every other buffer sharing the same ceiling.
+    /// Exact line construction and every CPU outward replay use the same
+    /// budget tracker as admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReluTailDualBudgetError::Bound`] for the same mandatory proof
+    /// failures as [`Self::bound_margin_unwired`] and
+    /// [`ReluTailDualBudgetError::Budget`] when the caller's deadline or peak
+    /// ceiling refuses work.
+    pub fn bound_margin_unwired_with_budget(
+        &self,
+        margin: &ExactReluTailMargin,
+        supplied_multipliers: Option<&[f64]>,
+        config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailDualResult>, ReluTailDualBudgetError> {
+        let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+        let result = bound_prepared_relu_tail_margin_impl(
+            self,
+            margin,
+            supplied_multipliers,
+            config,
+            &mut gate,
+        )?;
+        Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
+    }
+
+    /// Certify a final margin and immediately pull its accepted line backward
+    /// through exact Conv2d weights and a certified BatchNorm surrogate.
+    ///
+    /// Both M17 calls, raw BatchNorm certification, exact pullback arithmetic,
+    /// and publication run under one call gate.  No caller-authored direction
+    /// or constant is accepted, and the temporary upstream exact margin never
+    /// leaves this transaction.  The exact Conv2d transpose uses the same
+    /// grouped CHW geometry as [`crate::constrained_zonotope_conv2d_unwired`].
+    /// BatchNorm scale and bias errors are shared per channel; consequently the
+    /// sound bias penalties are `scale_error * H_c` and
+    /// `bias_error * |sum_i r_i|`, not a coordinate-wise error sum.
+    ///
+    /// The authored forward order assumed here is
+    /// `Conv2d(BatchNorm(ReLU(x)))`: `x` is represented by `upstream`, its ReLU
+    /// output is consumed by BatchNorm, and Conv2d produces the preactivation
+    /// represented by `self`.  The caller must prove that this complete map
+    /// sends every concrete `upstream` witness into the exact coordinate hull
+    /// represented by `self`.  This semantic wiring obligation cannot be
+    /// established from two abstract domains alone.
+    /// `budget.baseline_live_bytes()` must include both prepared geometries and
+    /// borrowed domains, the final margin, Conv2d/BatchNorm arrays, multiplier
+    /// slices, and all other caller-retained storage sharing the ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on mismatched geometry, non-finite parameters, malformed
+    /// BatchNorm data, exact-rational growth, either mandatory replay failure,
+    /// or a shared deadline/peak-memory refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bound_conv2d_batch_norm_pullback_unwired_with_budget(
+        &self,
+        final_margin: &ExactReluTailMargin,
+        downstream_supplied_multipliers: Option<&[f64]>,
+        downstream_config: ReluTailDualConfig,
+        upstream: &PreparedReluTailGeometry64<'_>,
+        conv_input_shape: [usize; 3],
+        conv_weights: ArrayView4<'_, f64>,
+        conv_bias: &[f64],
+        conv_spec: ConstrainedZonotopeConv2dSpec,
+        batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+        nominal_batch_norm_scale: &[f64],
+        nominal_batch_norm_bias: &[f64],
+        batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+        pullback_limits: ReluTailConvBatchNormPullbackLimits,
+        upstream_supplied_multipliers: Option<&[f64]>,
+        upstream_config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<
+        ConstrainedZonotopeCallOutcome<ReluTailConvBatchNormPullbackResult>,
+        ReluTailConvBatchNormPullbackBudgetError,
+    > {
+        let (result, report) = self
+            .bound_conv2d_batch_norm_pullback_unwired_attempt_with_budget(
+                final_margin,
+                downstream_supplied_multipliers,
+                downstream_config,
+                upstream,
+                conv_input_shape,
+                conv_weights,
+                conv_bias,
+                conv_spec,
+                batch_norm_spec,
+                nominal_batch_norm_scale,
+                nominal_batch_norm_bias,
+                batch_norm_limits,
+                pullback_limits,
+                upstream_supplied_multipliers,
+                upstream_config,
+                budget,
+            )
+            .into_parts();
+        result.map(|value| ConstrainedZonotopeCallOutcome::new(value, report))
+    }
+
+    /// Attempt the transactional Conv2d/BatchNorm pullback and always return
+    /// its call-local accounting receipt.
+    ///
+    /// Admission, validation, proof, deadline, and peak-memory failures are
+    /// carried inside the returned [`ConstrainedZonotopeCallAttempt`].  This
+    /// allows an enclosing optional portfolio lane to account for failed work
+    /// before continuing with its mandatory fallback.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn bound_conv2d_batch_norm_pullback_unwired_attempt_with_budget(
+        &self,
+        final_margin: &ExactReluTailMargin,
+        downstream_supplied_multipliers: Option<&[f64]>,
+        downstream_config: ReluTailDualConfig,
+        upstream: &PreparedReluTailGeometry64<'_>,
+        conv_input_shape: [usize; 3],
+        conv_weights: ArrayView4<'_, f64>,
+        conv_bias: &[f64],
+        conv_spec: ConstrainedZonotopeConv2dSpec,
+        batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+        nominal_batch_norm_scale: &[f64],
+        nominal_batch_norm_bias: &[f64],
+        batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+        pullback_limits: ReluTailConvBatchNormPullbackLimits,
+        upstream_supplied_multipliers: Option<&[f64]>,
+        upstream_config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> ConstrainedZonotopeCallAttempt<
+        ReluTailConvBatchNormPullbackResult,
+        ReluTailConvBatchNormPullbackBudgetError,
+    > {
+        let (mut gate, admission) =
+            ConstrainedZonotopeCallTracker::from_system_clock_attempt(budget);
+        let result = admission
+            .map_err(ReluTailConvBatchNormPullbackBudgetError::from)
+            .and_then(|()| {
+                bound_conv2d_batch_norm_pullback_impl(
+                    self,
+                    final_margin,
+                    downstream_supplied_multipliers,
+                    downstream_config,
+                    upstream,
+                    conv_input_shape,
+                    conv_weights,
+                    conv_bias,
+                    conv_spec,
+                    batch_norm_spec,
+                    nominal_batch_norm_scale,
+                    nominal_batch_norm_bias,
+                    batch_norm_limits,
+                    pullback_limits,
+                    upstream_supplied_multipliers,
+                    upstream_config,
+                    &mut gate,
+                )
+            });
+        ConstrainedZonotopeCallAttempt::new(result, gate.report())
+    }
+
+    /// Run the transactional pullback with mandatory downstream/upstream M17
+    /// certificates and an optional retained upstream M20 certificate.
+    ///
+    /// Invalid, disjoint, over-budget, or late auxiliary work is reported as
+    /// [`ReluTailBoxCutStatus::AuxiliaryFallback`]; the mandatory upstream M17
+    /// certificate remains authoritative. Ties retain M17 exactly. A budget
+    /// refusal is additionally retained in
+    /// [`ReluTailConvBatchNormPullbackM17M20Result::optional_budget_error`].
+    ///
+    /// The authored forward order is exactly
+    /// `Conv2d(BatchNorm(ReLU(upstream)))`: `upstream` is the pre-ReLU domain,
+    /// BatchNorm consumes that ReLU output, and `self` encloses the resulting
+    /// Conv2d preactivation. The caller must prove that this complete map sends
+    /// every concrete upstream witness into `self`. `upstream_auxiliary` must
+    /// independently enclose those same concrete witnesses at the same
+    /// pre-ReLU program location as `upstream`; a post-ReLU or other-layer
+    /// enclosure is not a valid M20 premise.
+    ///
+    /// `budget.baseline_live_bytes()` must include both prepared geometries and
+    /// borrowed domains, `upstream_auxiliary` and its endpoint arrays, the final
+    /// margin, Conv2d weights and bias, every BatchNorm parameter and nominal
+    /// surrogate array, both optional multiplier slices, configs/specs/limits,
+    /// and all other caller-retained storage sharing the ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for tracker admission, invalid Conv2d/BatchNorm
+    /// geometry, exact pullback failure, or either mandatory M17 failure.
+    /// Optional M20 failures never make this method return `Err`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bound_conv2d_batch_norm_pullback_m17_m20_unwired_with_budget(
+        &self,
+        final_margin: &ExactReluTailMargin,
+        downstream_supplied_multipliers: Option<&[f64]>,
+        downstream_config: ReluTailDualConfig,
+        upstream: &PreparedReluTailGeometry64<'_>,
+        upstream_auxiliary: &CertifiedAuxiliaryBounds64,
+        conv_input_shape: [usize; 3],
+        conv_weights: ArrayView4<'_, f64>,
+        conv_bias: &[f64],
+        conv_spec: ConstrainedZonotopeConv2dSpec,
+        batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+        nominal_batch_norm_scale: &[f64],
+        nominal_batch_norm_bias: &[f64],
+        batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+        pullback_limits: ReluTailConvBatchNormPullbackLimits,
+        upstream_supplied_multipliers: Option<&[f64]>,
+        upstream_config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<
+        ConstrainedZonotopeCallOutcome<ReluTailConvBatchNormPullbackM17M20Result>,
+        ReluTailConvBatchNormPullbackBudgetError,
+    > {
+        let (result, report) = self
+            .bound_conv2d_batch_norm_pullback_m17_m20_unwired_attempt_with_budget(
+                final_margin,
+                downstream_supplied_multipliers,
+                downstream_config,
+                upstream,
+                upstream_auxiliary,
+                conv_input_shape,
+                conv_weights,
+                conv_bias,
+                conv_spec,
+                batch_norm_spec,
+                nominal_batch_norm_scale,
+                nominal_batch_norm_bias,
+                batch_norm_limits,
+                pullback_limits,
+                upstream_supplied_multipliers,
+                upstream_config,
+                budget,
+            )
+            .into_parts();
+        result.map(|value| ConstrainedZonotopeCallOutcome::new(value, report))
+    }
+
+    /// Attempt the retained M17/M20 transaction and always return accounting.
+    ///
+    /// This has the same forward-map, same-location auxiliary-premise, and
+    /// complete caller-baseline obligations as
+    /// [`Self::bound_conv2d_batch_norm_pullback_m17_m20_unwired_with_budget`].
+    /// Admission and mandatory failures are carried in the attempt; optional
+    /// M20 budget failures are retained inside a successful result.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn bound_conv2d_batch_norm_pullback_m17_m20_unwired_attempt_with_budget(
+        &self,
+        final_margin: &ExactReluTailMargin,
+        downstream_supplied_multipliers: Option<&[f64]>,
+        downstream_config: ReluTailDualConfig,
+        upstream: &PreparedReluTailGeometry64<'_>,
+        upstream_auxiliary: &CertifiedAuxiliaryBounds64,
+        conv_input_shape: [usize; 3],
+        conv_weights: ArrayView4<'_, f64>,
+        conv_bias: &[f64],
+        conv_spec: ConstrainedZonotopeConv2dSpec,
+        batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+        nominal_batch_norm_scale: &[f64],
+        nominal_batch_norm_bias: &[f64],
+        batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+        pullback_limits: ReluTailConvBatchNormPullbackLimits,
+        upstream_supplied_multipliers: Option<&[f64]>,
+        upstream_config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> ConstrainedZonotopeCallAttempt<
+        ReluTailConvBatchNormPullbackM17M20Result,
+        ReluTailConvBatchNormPullbackBudgetError,
+    > {
+        let (mut gate, admission) =
+            ConstrainedZonotopeCallTracker::from_system_clock_attempt(budget);
+        let result = admission
+            .map_err(ReluTailConvBatchNormPullbackBudgetError::from)
+            .and_then(|()| {
+                bound_conv2d_batch_norm_pullback_m17_m20_impl(
+                    self,
+                    final_margin,
+                    downstream_supplied_multipliers,
+                    downstream_config,
+                    upstream,
+                    upstream_auxiliary,
+                    conv_input_shape,
+                    conv_weights,
+                    conv_bias,
+                    conv_spec,
+                    batch_norm_spec,
+                    nominal_batch_norm_scale,
+                    nominal_batch_norm_bias,
+                    batch_norm_limits,
+                    pullback_limits,
+                    upstream_supplied_multipliers,
+                    upstream_config,
+                    &mut gate,
+                )
+            });
+        ConstrainedZonotopeCallAttempt::new(result, gate.report())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn bound_conv2d_batch_norm_pullback_m17_m20_unwired_attempt_with_clock<N>(
+        &self,
+        final_margin: &ExactReluTailMargin,
+        downstream_supplied_multipliers: Option<&[f64]>,
+        downstream_config: ReluTailDualConfig,
+        upstream: &PreparedReluTailGeometry64<'_>,
+        upstream_auxiliary: &CertifiedAuxiliaryBounds64,
+        conv_input_shape: [usize; 3],
+        conv_weights: ArrayView4<'_, f64>,
+        conv_bias: &[f64],
+        conv_spec: ConstrainedZonotopeConv2dSpec,
+        batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+        nominal_batch_norm_scale: &[f64],
+        nominal_batch_norm_bias: &[f64],
+        batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+        pullback_limits: ReluTailConvBatchNormPullbackLimits,
+        upstream_supplied_multipliers: Option<&[f64]>,
+        upstream_config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+        now: N,
+    ) -> ConstrainedZonotopeCallAttempt<
+        ReluTailConvBatchNormPullbackM17M20Result,
+        ReluTailConvBatchNormPullbackBudgetError,
+    >
+    where
+        N: FnMut(&'static str) -> Instant,
+    {
+        let (mut gate, admission) = ConstrainedZonotopeCallTracker::with_clock_attempt(budget, now);
+        let result = admission
+            .map_err(ReluTailConvBatchNormPullbackBudgetError::from)
+            .and_then(|()| {
+                bound_conv2d_batch_norm_pullback_m17_m20_impl(
+                    self,
+                    final_margin,
+                    downstream_supplied_multipliers,
+                    downstream_config,
+                    upstream,
+                    upstream_auxiliary,
+                    conv_input_shape,
+                    conv_weights,
+                    conv_bias,
+                    conv_spec,
+                    batch_norm_spec,
+                    nominal_batch_norm_scale,
+                    nominal_batch_norm_bias,
+                    batch_norm_limits,
+                    pullback_limits,
+                    upstream_supplied_multipliers,
+                    upstream_config,
+                    &mut gate,
+                )
+            });
+        ConstrainedZonotopeCallAttempt::new(result, gate.report())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn bound_conv2d_batch_norm_pullback_unwired_attempt_with_clock<N>(
+        &self,
+        final_margin: &ExactReluTailMargin,
+        downstream_supplied_multipliers: Option<&[f64]>,
+        downstream_config: ReluTailDualConfig,
+        upstream: &PreparedReluTailGeometry64<'_>,
+        conv_input_shape: [usize; 3],
+        conv_weights: ArrayView4<'_, f64>,
+        conv_bias: &[f64],
+        conv_spec: ConstrainedZonotopeConv2dSpec,
+        batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+        nominal_batch_norm_scale: &[f64],
+        nominal_batch_norm_bias: &[f64],
+        batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+        pullback_limits: ReluTailConvBatchNormPullbackLimits,
+        upstream_supplied_multipliers: Option<&[f64]>,
+        upstream_config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+        now: N,
+    ) -> ConstrainedZonotopeCallAttempt<
+        ReluTailConvBatchNormPullbackResult,
+        ReluTailConvBatchNormPullbackBudgetError,
+    >
+    where
+        N: FnMut(&'static str) -> Instant,
+    {
+        let (mut gate, admission) = ConstrainedZonotopeCallTracker::with_clock_attempt(budget, now);
+        let result = admission
+            .map_err(ReluTailConvBatchNormPullbackBudgetError::from)
+            .and_then(|()| {
+                bound_conv2d_batch_norm_pullback_impl(
+                    self,
+                    final_margin,
+                    downstream_supplied_multipliers,
+                    downstream_config,
+                    upstream,
+                    conv_input_shape,
+                    conv_weights,
+                    conv_bias,
+                    conv_spec,
+                    batch_norm_spec,
+                    nominal_batch_norm_scale,
+                    nominal_batch_norm_bias,
+                    batch_norm_limits,
+                    pullback_limits,
+                    upstream_supplied_multipliers,
+                    upstream_config,
+                    &mut gate,
+                )
+            });
+        ConstrainedZonotopeCallAttempt::new(result, gate.report())
+    }
+
+    #[cfg(test)]
+    fn bound_margin_unwired_with_clock<N>(
+        &self,
+        margin: &ExactReluTailMargin,
+        supplied_multipliers: Option<&[f64]>,
+        config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+        now: N,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailDualResult>, ReluTailDualBudgetError>
+    where
+        N: FnMut(&'static str) -> Instant,
+    {
+        let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+        let result = bound_prepared_relu_tail_margin_impl(
+            self,
+            margin,
+            supplied_multipliers,
+            config,
+            &mut gate,
+        )?;
+        Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
     }
 
     /// Bound one exact margin using caller-certified auxiliary bounds.
@@ -447,6 +1075,731 @@ impl PreparedReluTailGeometry64<'_> {
             supplied_multipliers,
             config,
         )
+    }
+
+    /// Bound one exact M20 margin behind the shared synchronous call firewall.
+    ///
+    /// This clones and intersects the cached hull without revisiting generator
+    /// entries, then gates exact line construction and every outward replay.
+    /// It does not silently replace or suppress M17: a portfolio caller must
+    /// independently invoke [`Self::bound_margin_unwired_with_budget`] and
+    /// retain the better replay-certified result.  The caller continues to own
+    /// the proof that every concrete preactivation witness lies in `auxiliary`.
+    ///
+    /// `budget.baseline_live_bytes()` must include
+    /// [`Self::conservative_live_bytes`], the borrowed domain, all arguments,
+    /// and other caller-owned buffers sharing the same ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReluTailDualBudgetError::Bound`] for the same auxiliary,
+    /// margin, exact-line, and mandatory-replay failures as
+    /// [`Self::bound_margin_with_auxiliary_bounds_unwired`], and
+    /// [`ReluTailDualBudgetError::Budget`] when the call firewall refuses work.
+    pub fn bound_margin_with_auxiliary_bounds_unwired_with_budget(
+        &self,
+        auxiliary: &CertifiedAuxiliaryBounds64,
+        margin: &ExactReluTailMargin,
+        supplied_multipliers: Option<&[f64]>,
+        config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailDualResult>, ReluTailDualBudgetError> {
+        let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+        let result = bound_prepared_relu_tail_margin_with_auxiliary_impl(
+            self,
+            auxiliary,
+            margin,
+            supplied_multipliers,
+            config,
+            0,
+            &mut gate,
+        )?;
+        Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
+    }
+
+    /// Bound one margin with a mandatory M17 certificate and an optional M20
+    /// auxiliary certificate behind one shared execution firewall.
+    ///
+    /// M17 is evaluated first and remains authoritative on every optional M20
+    /// failure, including malformed/disjoint auxiliary bounds, allocation
+    /// refusal, peak-budget refusal, or deadline exhaustion. The returned call
+    /// report covers both the mandatory work and every attempted optional
+    /// operation. Selection is a strict ordered maximum, so ties retain M17
+    /// bit-for-bit.
+    ///
+    /// The caller owns the semantic proof that every concrete preactivation
+    /// witness represented by this prepared domain lies in `auxiliary`.
+    /// `budget.baseline_live_bytes()` must include the prepared geometry, the
+    /// borrowed domain, both arguments, and all other caller-owned live state.
+    /// The call itself accounts for the mandatory M17 result retained while
+    /// M20 is validated, constructed, and replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when construction of the shared tracker or the
+    /// mandatory M17 setup/replay fails. Optional M20 failures are represented
+    /// by [`ReluTailBoxCutStatus::AuxiliaryFallback`] in the returned portfolio.
+    pub fn bound_margin_m17_m20_unwired_with_budget(
+        &self,
+        auxiliary: &CertifiedAuxiliaryBounds64,
+        margin: &ExactReluTailMargin,
+        supplied_multipliers: Option<&[f64]>,
+        config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailBoxCutDualResult>, ReluTailDualBudgetError>
+    {
+        let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+        let original = bound_prepared_relu_tail_margin_impl(
+            self,
+            margin,
+            supplied_multipliers,
+            config,
+            &mut gate,
+        )?;
+        let retained_original_bytes = relu_tail_dual_result_live_bytes(
+            self.domain.value_dim(),
+            self.domain.constraint_count(),
+        )?;
+        let auxiliary_result = bound_prepared_relu_tail_margin_with_auxiliary_impl(
+            self,
+            auxiliary,
+            margin,
+            supplied_multipliers,
+            config,
+            retained_original_bytes,
+            &mut gate,
+        )
+        .ok();
+        let status = if auxiliary_result.is_some() {
+            ReluTailBoxCutStatus::Completed
+        } else {
+            ReluTailBoxCutStatus::AuxiliaryFallback
+        };
+        let result = finish_box_cut_portfolio(original, auxiliary_result, None, status);
+        Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
+    }
+
+    #[cfg(test)]
+    fn bound_margin_with_auxiliary_bounds_unwired_with_clock<N>(
+        &self,
+        auxiliary: &CertifiedAuxiliaryBounds64,
+        margin: &ExactReluTailMargin,
+        supplied_multipliers: Option<&[f64]>,
+        config: ReluTailDualConfig,
+        budget: ConstrainedZonotopeCallBudget,
+        now: N,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailDualResult>, ReluTailDualBudgetError>
+    where
+        N: FnMut(&'static str) -> Instant,
+    {
+        let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+        let result = bound_prepared_relu_tail_margin_with_auxiliary_impl(
+            self,
+            auxiliary,
+            margin,
+            supplied_multipliers,
+            config,
+            0,
+            &mut gate,
+        )?;
+        Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
+    }
+
+    /// Bound one margin with mandatory M17, optional M20, and optional M24
+    /// behind one shared synchronous execution firewall.
+    ///
+    /// The exact authority order is fixed: M17, then M20, then the first
+    /// replay-certified M24 candidate. When the authenticated Box has no
+    /// endpoint strictly inside the prepared hull, M17's accepted pointwise
+    /// replay is reused as the explicit, bit-identical M20 certificate; its
+    /// result fields describe that reused certificate, while the call report
+    /// charges only work actually performed. Selection changes only on a
+    /// strict improvement, so ties retain the earlier member bit-for-bit.
+    /// M20 and every M24 phase are optional; their validation, resource,
+    /// allocation, deadline, search, or exact-replay failures retain the best
+    /// earlier certificate and publish complete attempted-work accounting.
+    ///
+    /// `budget.baseline_live_bytes()` has the same caller-owned obligations as
+    /// [`Self::bound_margin_m17_m20_unwired_with_budget`]. This call adds the
+    /// retained M17/M20 results, optimizer state, exact-replay scratch, and a
+    /// prior retained M24 certificate to each applicable peak preflight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when shared admission or mandatory M17
+    /// setup/replay fails. Optional firewall refusal is retained in
+    /// [`ReluTailBoxCutBudgetedResult::optional_budget_error`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn bound_margin_m17_m20_m24_unwired_with_budget(
+        &self,
+        auxiliary: &CertifiedAuxiliaryBounds64,
+        margin: &ExactReluTailMargin,
+        supplied_predicate_multipliers: Option<&[f64]>,
+        relu_config: ReluTailDualConfig,
+        box_config: ReluTailBoxCutOptimizerConfig,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailBoxCutBudgetedResult>, ReluTailDualBudgetError>
+    {
+        let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+        self.bound_margin_m17_m20_m24_unwired_with_call_gate(
+            auxiliary,
+            margin,
+            supplied_predicate_multipliers,
+            relu_config,
+            box_config,
+            &mut gate,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn bound_margin_m17_m20_m24_unwired_with_clock<N>(
+        &self,
+        auxiliary: &CertifiedAuxiliaryBounds64,
+        margin: &ExactReluTailMargin,
+        supplied_predicate_multipliers: Option<&[f64]>,
+        relu_config: ReluTailDualConfig,
+        box_config: ReluTailBoxCutOptimizerConfig,
+        budget: ConstrainedZonotopeCallBudget,
+        now: N,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailBoxCutBudgetedResult>, ReluTailDualBudgetError>
+    where
+        N: FnMut(&'static str) -> Instant,
+    {
+        let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+        self.bound_margin_m17_m20_m24_unwired_with_call_gate(
+            auxiliary,
+            margin,
+            supplied_predicate_multipliers,
+            relu_config,
+            box_config,
+            &mut gate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bound_margin_m17_m20_m24_unwired_with_call_gate<G>(
+        &self,
+        auxiliary: &CertifiedAuxiliaryBounds64,
+        margin: &ExactReluTailMargin,
+        supplied_predicate_multipliers: Option<&[f64]>,
+        relu_config: ReluTailDualConfig,
+        box_config: ReluTailBoxCutOptimizerConfig,
+        gate: &mut G,
+    ) -> Result<ConstrainedZonotopeCallOutcome<ReluTailBoxCutBudgetedResult>, ReluTailDualBudgetError>
+    where
+        G: ConstrainedZonotopeCallGate,
+    {
+        let original = bound_prepared_relu_tail_margin_impl(
+            self,
+            margin,
+            supplied_predicate_multipliers,
+            relu_config,
+            gate,
+        )?;
+        let result_live_bytes = match relu_tail_dual_result_live_bytes(
+            self.domain.value_dim(),
+            self.domain.constraint_count(),
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let status = box_optimizer_status_from_budget_error(&error);
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    None,
+                    None,
+                    status,
+                    None,
+                    BoxSearchTelemetry::default(),
+                    Some(error),
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+
+        // Count useful Box endpoints before replaying M20.  If none is
+        // strict, intersecting the prepared hull with `auxiliary` leaves the
+        // exact line plan unchanged.  The already accepted M17 affine replay
+        // is therefore also a valid M20 certificate, without assuming that a
+        // fresh heuristic run under a different clock would follow the same
+        // candidate schedule.  M24 also has no multiplier variables.
+        // Validate the dimension explicitly before the gated counter: that
+        // helper's zip is deliberately unchecked because all of its other
+        // callers have already crossed an equivalent shape boundary.
+        if let Err(error) = gate.checkpoint("prepared M20/M24 auxiliary validation") {
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                None,
+                None,
+                ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                None,
+                BoxSearchTelemetry::default(),
+                Some(error),
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+        if auxiliary.value_dim() != self.domain.value_dim() {
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                None,
+                None,
+                ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                None,
+                BoxSearchTelemetry::default(),
+                None,
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+        if let Err(error) = gate.checkpoint("prepared M20/M24 auxiliary validation complete") {
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                None,
+                None,
+                ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                None,
+                BoxSearchTelemetry::default(),
+                Some(error),
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+
+        let endpoint_count_peak = match box_cut_endpoint_count_peak_live_bytes().and_then(|bytes| {
+            result_live_bytes.checked_add(bytes).ok_or(
+                ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "M24 endpoint count plus retained M17 result bytes",
+                },
+            )
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    None,
+                    None,
+                    ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                    None,
+                    BoxSearchTelemetry::default(),
+                    Some(error),
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+        if let Err(error) = gate.preflight_peak_live_bytes(endpoint_count_peak) {
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                None,
+                None,
+                ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                None,
+                BoxSearchTelemetry::default(),
+                Some(error),
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+
+        let box_variables = match count_tighter_auxiliary_box_endpoints_with_gate(
+            &self.exact_coordinate_bounds,
+            auxiliary,
+            gate,
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                let optional_budget_error = match error {
+                    ReluTailDualBudgetError::Budget(error) => Some(error),
+                    ReluTailDualBudgetError::Bound(_) => None,
+                };
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    None,
+                    None,
+                    ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                    None,
+                    BoxSearchTelemetry::default(),
+                    optional_budget_error,
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+        if box_variables == 0 {
+            let retained_result_bytes = match result_live_bytes.checked_mul(2) {
+                Some(bytes) => bytes,
+                None => {
+                    let error = ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                        operation: "equivalent M17/M20 retained result bytes",
+                    };
+                    let result = finish_budgeted_optimized_box_cut_result(
+                        original,
+                        None,
+                        None,
+                        ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                        None,
+                        BoxSearchTelemetry::default(),
+                        Some(error),
+                    );
+                    return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+                }
+            };
+            if let Err(error) = gate.preflight_peak_live_bytes(retained_result_bytes) {
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    None,
+                    None,
+                    ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                    None,
+                    BoxSearchTelemetry::default(),
+                    Some(error),
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+            let equivalent_auxiliary =
+                match clone_equivalent_relu_tail_result_with_gate(&original, gate) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let optional_budget_error = match error {
+                            ReluTailDualBudgetError::Budget(error) => Some(error),
+                            ReluTailDualBudgetError::Bound(_) => None,
+                        };
+                        let result = finish_budgeted_optimized_box_cut_result(
+                            original,
+                            None,
+                            None,
+                            ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                            None,
+                            BoxSearchTelemetry::default(),
+                            optional_budget_error,
+                        );
+                        return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+                    }
+                };
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                Some(equivalent_auxiliary),
+                None,
+                ReluTailBoxCutOptimizerStatus::NoTighterAuxiliaryBox,
+                None,
+                BoxSearchTelemetry::default(),
+                None,
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+
+        let auxiliary_result = match bound_prepared_relu_tail_margin_with_auxiliary_impl(
+            self,
+            auxiliary,
+            margin,
+            supplied_predicate_multipliers,
+            relu_config,
+            result_live_bytes,
+            gate,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let optional_budget_error = match error {
+                    ReluTailDualBudgetError::Budget(error) => Some(error),
+                    ReluTailDualBudgetError::Bound(_) => None,
+                };
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    None,
+                    None,
+                    ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                    None,
+                    BoxSearchTelemetry::default(),
+                    optional_budget_error,
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+
+        let retained_result_bytes = match result_live_bytes.checked_mul(2) {
+            Some(bytes) => bytes,
+            None => {
+                let error = ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "M24 retained M17/M20 result bytes",
+                };
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    Some(auxiliary_result),
+                    None,
+                    ReluTailBoxCutOptimizerStatus::ResourceFallback,
+                    None,
+                    BoxSearchTelemetry::default(),
+                    Some(error),
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+
+        if let Err(error) = gate.checkpoint("M24 optimizer plan admission") {
+            let status = box_optimizer_status_from_budget_error(&error);
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                Some(auxiliary_result),
+                None,
+                status,
+                None,
+                BoxSearchTelemetry::default(),
+                Some(error),
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+        let plan = match ReluTailBoxCutOptimizerPlan::checked(
+            self.domain,
+            self.generator_nonzeros,
+            box_variables,
+            box_config,
+        ) {
+            Ok(plan) => plan,
+            Err(status) => {
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    Some(auxiliary_result),
+                    None,
+                    status,
+                    None,
+                    BoxSearchTelemetry::default(),
+                    None,
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+        if plan.total_iterations == 0 {
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                Some(auxiliary_result),
+                None,
+                ReluTailBoxCutOptimizerStatus::SearchDisabled,
+                Some(plan),
+                BoxSearchTelemetry::default(),
+                None,
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+
+        let search_peak = box_cut_search_peak_live_bytes(plan);
+        let search_peak = match search_peak.and_then(|bytes| {
+            retained_result_bytes.checked_add(bytes).ok_or(
+                ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "M24 search plus retained result bytes",
+                },
+            )
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let status = box_optimizer_status_from_budget_error(&error);
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    Some(auxiliary_result),
+                    None,
+                    status,
+                    Some(plan),
+                    BoxSearchTelemetry::default(),
+                    Some(error),
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+        if let Err(error) = gate.preflight_peak_live_bytes(search_peak) {
+            let status = box_optimizer_status_from_budget_error(&error);
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                Some(auxiliary_result),
+                None,
+                status,
+                Some(plan),
+                BoxSearchTelemetry::default(),
+                Some(error),
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+
+        let budgeted_search = optimize_auxiliary_box_multipliers_with_call_gate(
+            self.domain,
+            &self.exact_coordinate_bounds,
+            auxiliary,
+            &auxiliary_result.direction,
+            box_config,
+            plan,
+            gate,
+        );
+        let search = budgeted_search.search;
+        if let Some(error) = budgeted_search.budget_error {
+            let status = box_optimizer_status_from_budget_error(&error);
+            let result = finish_budgeted_optimized_box_cut_result(
+                original,
+                Some(auxiliary_result),
+                None,
+                status,
+                Some(plan),
+                BoxSearchTelemetry {
+                    iterations_completed: search.iterations_completed,
+                    restarts_completed: search.restarts_completed,
+                    candidates_scored: search.candidates_scored,
+                    exact_replays: 0,
+                },
+                Some(error),
+            );
+            return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+        }
+
+        let search_retained_bytes = match box_cut_search_retained_live_bytes(plan) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let status = box_optimizer_status_from_budget_error(&error);
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    Some(auxiliary_result),
+                    None,
+                    status,
+                    Some(plan),
+                    BoxSearchTelemetry {
+                        iterations_completed: search.iterations_completed,
+                        restarts_completed: search.restarts_completed,
+                        candidates_scored: search.candidates_scored,
+                        exact_replays: 0,
+                    },
+                    Some(error),
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+        let exact_replay_owned_bytes = match box_cut_exact_replay_peak_live_bytes(
+            self.domain.value_dim(),
+            self.domain.constraint_count(),
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let status = box_optimizer_status_from_budget_error(&error);
+                let result = finish_budgeted_optimized_box_cut_result(
+                    original,
+                    Some(auxiliary_result),
+                    None,
+                    status,
+                    Some(plan),
+                    BoxSearchTelemetry {
+                        iterations_completed: search.iterations_completed,
+                        restarts_completed: search.restarts_completed,
+                        candidates_scored: search.candidates_scored,
+                        exact_replays: 0,
+                    },
+                    Some(error),
+                );
+                return Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()));
+            }
+        };
+
+        let mut best_box_cut = None;
+        let mut exact_replays = 0_usize;
+        let mut exact_replay_failed = false;
+        let mut optional_budget_error = None;
+        for candidate in search.candidates.iter().take(plan.exact_replays) {
+            let retained_certificate_bytes = if best_box_cut.is_some() {
+                match relu_tail_box_cut_certificate_live_bytes(
+                    self.domain.value_dim(),
+                    self.domain.constraint_count(),
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        optional_budget_error = Some(error);
+                        break;
+                    }
+                }
+            } else {
+                0
+            };
+            let replay_peak = retained_result_bytes
+                .checked_add(search_retained_bytes)
+                .and_then(|bytes| bytes.checked_add(retained_certificate_bytes))
+                .and_then(|bytes| bytes.checked_add(exact_replay_owned_bytes));
+            let Some(replay_peak) = replay_peak else {
+                optional_budget_error =
+                    Some(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                        operation: "M24 exact replay aggregate peak",
+                    });
+                break;
+            };
+            if let Err(error) = gate.preflight_peak_live_bytes(replay_peak) {
+                optional_budget_error = Some(error);
+                break;
+            }
+            if let Err(error) = gate.checkpoint("M24 exact replay admission") {
+                optional_budget_error = Some(error);
+                break;
+            }
+            exact_replays += 1;
+            #[cfg(test)]
+            let force_replay_failure =
+                BOX_OPTIMIZER_FAIL_NEXT_EXACT_REPLAY.with(|fail| fail.replace(false));
+            #[cfg(not(test))]
+            let force_replay_failure = false;
+            let replay: Result<ReluTailBoxCutCertificate, ReluTailDualBudgetError> =
+                if force_replay_failure {
+                    Err(ReluTailDualError::NonFiniteArithmetic {
+                        coordinate: 0,
+                        operation: "injected budgeted optimized Box exact replay failure",
+                    }
+                    .into())
+                } else {
+                    expand_box_candidate_with_gate(
+                        &search.variables,
+                        candidate,
+                        self.domain.value_dim(),
+                        gate,
+                    )
+                    .and_then(|(upper, lower)| {
+                        build_auxiliary_box_cut_certificate_with_original_hull_and_gate(
+                            self.domain,
+                            auxiliary,
+                            &auxiliary_result,
+                            &upper,
+                            &lower,
+                            supplied_predicate_multipliers,
+                            &self.exact_coordinate_bounds,
+                            gate,
+                        )
+                    })
+                };
+            match replay {
+                Ok(certificate) => {
+                    if best_box_cut
+                        .as_ref()
+                        .is_none_or(|best: &ReluTailBoxCutCertificate| {
+                            certificate.lower_bound > best.lower_bound
+                        })
+                    {
+                        best_box_cut = Some(certificate);
+                    }
+                }
+                Err(ReluTailDualBudgetError::Bound(_)) => exact_replay_failed = true,
+                Err(ReluTailDualBudgetError::Budget(error)) => {
+                    optional_budget_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        let search_status = if let Some(error) = optional_budget_error.as_ref() {
+            box_optimizer_status_from_budget_error(error)
+        } else if exact_replay_failed {
+            ReluTailBoxCutOptimizerStatus::ExactReplayFallback
+        } else {
+            search.status
+        };
+        let result = finish_budgeted_optimized_box_cut_result(
+            original,
+            Some(auxiliary_result),
+            best_box_cut,
+            search_status,
+            Some(plan),
+            BoxSearchTelemetry {
+                iterations_completed: search.iterations_completed,
+                restarts_completed: search.restarts_completed,
+                candidates_scored: search.candidates_scored,
+                exact_replays,
+            },
+            optional_budget_error,
+        );
+        Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
     }
 
     /// Search auxiliary-Box multipliers and replay at most two exact cuts.
@@ -687,13 +2040,14 @@ pub enum ReluTailBoxCutSelection {
     BoxCut,
 }
 
-/// Outcome of the optional auxiliary-Box cut lane.
+/// Outcome of an optional auxiliary-certificate lane.
 ///
 /// Every fallback retains the mandatory original M17 result, and an available
 /// M20 result, in the returned portfolio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReluTailBoxCutStatus {
-    /// The cut direction and exact correction were independently replayed.
+    /// The requested optional certificate completed. For Box-cut entry points,
+    /// the cut direction and exact correction were independently replayed.
     Completed,
     /// M20 rejected the auxiliary bounds or its mandatory setup failed.
     AuxiliaryFallback,
@@ -751,7 +2105,7 @@ pub struct ReluTailBoxCutDualResult {
     pub auxiliary: Option<ReluTailDualResult>,
     /// Independently replayed cut candidate when optional setup succeeded.
     pub box_cut: Option<ReluTailBoxCutCertificate>,
-    /// Outcome of the optional cut lane.
+    /// Outcome of the optional auxiliary-certificate lane.
     pub status: ReluTailBoxCutStatus,
 }
 
@@ -875,6 +2229,20 @@ pub struct ReluTailBoxCutOptimizedResult {
     pub exact_replays: usize,
 }
 
+/// Budgeted M17/M20/M24 result plus an optional-lane firewall receipt.
+///
+/// Keeping the refusal separate preserves the source-compatible shape of
+/// [`ReluTailBoxCutOptimizedResult`] for existing unbudgeted callers. A
+/// successful call always contains a sound `optimized` portfolio; refusal of
+/// optional M20 or M24 work is reported here instead of replacing that value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReluTailBoxCutBudgetedResult {
+    /// Best sound portfolio completed before the shared firewall closed.
+    pub optimized: ReluTailBoxCutOptimizedResult,
+    /// Shared-firewall refusal from optional M20/M24 work, when present.
+    pub optional_budget_error: Option<ConstrainedZonotopeCallBudgetError>,
+}
+
 /// Failure of exact setup or the mandatory zero-multiplier authority path.
 ///
 /// Heuristic failures are represented by [`ReluTailDualStatus`] and retain the
@@ -944,7 +2312,9 @@ pub enum ReluTailDualError {
         limit: u64,
     },
     /// Exact arithmetic grew beyond its immutable intermediate cap.
-    #[error("exact rational growth at coordinate {coordinate} while computing {operation}: {bits} bits above {limit}")]
+    #[error(
+        "exact rational growth at coordinate {coordinate} while computing {operation}: {bits} bits above {limit}"
+    )]
     RationalGrowthLimit {
         /// Logical coordinate.
         coordinate: usize,
@@ -974,6 +2344,19 @@ pub enum ReluTailDualError {
     Baseline(ConstrainedZonotope64Error),
 }
 
+/// ReLU-tail proof failure or call-local execution-firewall refusal.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReluTailDualBudgetError {
+    /// Exact geometry, declared objective, or mandatory replay was invalid.
+    #[error(transparent)]
+    Bound(#[from] ReluTailDualError),
+
+    /// The caller's absolute deadline or aggregate peak-memory ceiling refused
+    /// work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
+}
+
 /// Prepare exact coordinate geometry for repeated one-ReLU-tail margins.
 ///
 /// Exact coordinate bounds deliberately ignore predicate constraints, matching
@@ -991,11 +2374,1268 @@ pub fn prepare_relu_tail_triangle_dual_unwired(
 ) -> Result<PreparedReluTailGeometry64<'_>, ReluTailDualError> {
     let generator_nonzeros = check_mandatory_domain_resources(domain)?;
     let exact_coordinate_bounds = exact_coordinate_bounds(domain)?;
+    let conservative_live_bytes =
+        prepared_relu_tail_geometry_live_bytes(domain.value_dim()).unwrap_or(usize::MAX);
     Ok(PreparedReluTailGeometry64 {
         domain,
         exact_coordinate_bounds,
         generator_nonzeros,
+        conservative_live_bytes,
     })
+}
+
+/// Prepare domain-tied exact coordinate geometry behind the shared call
+/// firewall.
+///
+/// The preflight covers the retained prepared geometry, the overlapping exact
+/// coordinate-radius storage, and exact-arithmetic scratch.  The caller's
+/// baseline must separately include the borrowed `domain` and all other live
+/// storage sharing the same ceiling.  On success, callers retaining the result
+/// across another budgeted call must add
+/// [`PreparedReluTailGeometry64::conservative_live_bytes`] to that later
+/// call's baseline.
+///
+/// # Errors
+///
+/// Returns [`ReluTailDualBudgetError::Bound`] for the same immutable geometry
+/// failures as [`prepare_relu_tail_triangle_dual_unwired`] and
+/// [`ReluTailDualBudgetError::Budget`] when the caller's deadline or peak-live
+/// ceiling refuses work.
+pub fn prepare_relu_tail_triangle_dual_unwired_with_budget(
+    domain: &ConstrainedZonotope64,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<PreparedReluTailGeometry64<'_>>, ReluTailDualBudgetError>
+{
+    let (result, report) =
+        prepare_relu_tail_triangle_dual_unwired_attempt_with_budget(domain, budget).into_parts();
+    result.map(|prepared| ConstrainedZonotopeCallOutcome::new(prepared, report))
+}
+
+/// Attempt prepared ReLU-tail geometry construction and always return its
+/// call-local accounting receipt.
+///
+/// Unlike [`prepare_relu_tail_triangle_dual_unwired_with_budget`], admission,
+/// geometry, deadline, and peak-memory failures are carried inside the returned
+/// [`ConstrainedZonotopeCallAttempt`].  This is useful when an enclosing
+/// transaction must account for a failed optional preparation.
+#[must_use]
+pub fn prepare_relu_tail_triangle_dual_unwired_attempt_with_budget(
+    domain: &ConstrainedZonotope64,
+    budget: ConstrainedZonotopeCallBudget,
+) -> ConstrainedZonotopeCallAttempt<PreparedReluTailGeometry64<'_>, ReluTailDualBudgetError> {
+    let (mut gate, admission) = ConstrainedZonotopeCallTracker::from_system_clock_attempt(budget);
+    let result = admission
+        .map_err(ReluTailDualBudgetError::from)
+        .and_then(|()| prepare_relu_tail_triangle_dual_impl(domain, &mut gate));
+    ConstrainedZonotopeCallAttempt::new(result, gate.report())
+}
+
+#[cfg(test)]
+fn prepare_relu_tail_triangle_dual_unwired_with_clock<N>(
+    domain: &ConstrainedZonotope64,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<ConstrainedZonotopeCallOutcome<PreparedReluTailGeometry64<'_>>, ReluTailDualBudgetError>
+where
+    N: FnMut(&'static str) -> Instant,
+{
+    let (result, report) =
+        prepare_relu_tail_triangle_dual_unwired_attempt_with_clock(domain, budget, now)
+            .into_parts();
+    result.map(|prepared| ConstrainedZonotopeCallOutcome::new(prepared, report))
+}
+
+#[cfg(test)]
+fn prepare_relu_tail_triangle_dual_unwired_attempt_with_clock<N>(
+    domain: &ConstrainedZonotope64,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> ConstrainedZonotopeCallAttempt<PreparedReluTailGeometry64<'_>, ReluTailDualBudgetError>
+where
+    N: FnMut(&'static str) -> Instant,
+{
+    let (mut gate, admission) = ConstrainedZonotopeCallTracker::with_clock_attempt(budget, now);
+    let result = admission
+        .map_err(ReluTailDualBudgetError::from)
+        .and_then(|()| prepare_relu_tail_triangle_dual_impl(domain, &mut gate));
+    ConstrainedZonotopeCallAttempt::new(result, gate.report())
+}
+
+fn prepare_relu_tail_triangle_dual_impl<'domain, G>(
+    domain: &'domain ConstrainedZonotope64,
+    gate: &mut G,
+) -> Result<PreparedReluTailGeometry64<'domain>, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("prepared ReLU-tail geometry validation")?;
+    let generator_nonzeros = check_mandatory_domain_resources_with_gate(domain, gate)?;
+    gate.checkpoint("prepared ReLU-tail geometry validation complete")?;
+    let conservative_live_bytes = prepared_relu_tail_geometry_live_bytes(domain.value_dim())?;
+    if gate.is_enforcing() {
+        gate.preflight_peak_live_bytes(prepared_relu_tail_geometry_peak_live_bytes(
+            domain.value_dim(),
+        )?)?;
+    }
+    gate.checkpoint("prepared ReLU-tail geometry peak-memory preflight complete")?;
+    let exact_coordinate_bounds = exact_coordinate_bounds_with_gate(domain, gate)?;
+    gate.checkpoint("prepared ReLU-tail exact coordinate hull complete")?;
+    let prepared = PreparedReluTailGeometry64 {
+        domain,
+        exact_coordinate_bounds,
+        generator_nonzeros,
+        conservative_live_bytes,
+    };
+    gate.checkpoint("prepared ReLU-tail geometry publication")?;
+    Ok(prepared)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bound_conv2d_batch_norm_pullback_impl<G>(
+    downstream_prepared: &PreparedReluTailGeometry64<'_>,
+    final_margin: &ExactReluTailMargin,
+    downstream_supplied_multipliers: Option<&[f64]>,
+    downstream_config: ReluTailDualConfig,
+    upstream_prepared: &PreparedReluTailGeometry64<'_>,
+    conv_input_shape: [usize; 3],
+    conv_weights: ArrayView4<'_, f64>,
+    conv_bias: &[f64],
+    conv_spec: ConstrainedZonotopeConv2dSpec,
+    batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+    nominal_batch_norm_scale: &[f64],
+    nominal_batch_norm_bias: &[f64],
+    batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+    pullback_limits: ReluTailConvBatchNormPullbackLimits,
+    upstream_supplied_multipliers: Option<&[f64]>,
+    upstream_config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<ReluTailConvBatchNormPullbackResult, ReluTailConvBatchNormPullbackBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("transactional ReLU-tail pullback admission")?;
+    let plan = validate_conv2d_batch_norm_pullback_with_gate(
+        downstream_prepared,
+        upstream_prepared,
+        conv_input_shape,
+        conv_weights,
+        conv_bias,
+        conv_spec,
+        batch_norm_spec,
+        pullback_limits,
+        gate,
+    )?;
+    gate.checkpoint("transactional ReLU-tail pullback validation complete")?;
+
+    if gate.is_enforcing() {
+        let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+        peak.add_bytes(
+            relu_tail_peak_live_bytes(
+                downstream_prepared.domain,
+                downstream_prepared.generator_nonzeros,
+            )?,
+            "transactional downstream M17 peak bytes",
+        )?;
+        peak.add_bytes(
+            size_of::<ReluTailConvBatchNormPullbackResult>(),
+            "transactional pullback result header bytes",
+        )?;
+        gate.preflight_peak_live_bytes(peak.finish())?;
+    }
+    gate.checkpoint("transactional downstream M17 peak-memory preflight complete")?;
+    let downstream = bound_prepared_relu_tail_margin_impl(
+        downstream_prepared,
+        final_margin,
+        downstream_supplied_multipliers,
+        downstream_config,
+        gate,
+    )
+    .map_err(map_relu_tail_pullback_budget_error)?;
+    gate.checkpoint("transactional downstream M17 accepted line complete")?;
+
+    let downstream_live_bytes = relu_tail_dual_result_live_bytes(
+        downstream_prepared.value_dim(),
+        downstream_prepared.domain.constraint_count(),
+    )?;
+    let pulled_margin = build_conv2d_batch_norm_pulled_margin_with_gate(
+        upstream_prepared,
+        &downstream,
+        conv_input_shape,
+        conv_weights,
+        conv_bias,
+        conv_spec,
+        batch_norm_spec,
+        nominal_batch_norm_scale,
+        nominal_batch_norm_bias,
+        batch_norm_limits,
+        plan,
+        downstream_live_bytes,
+        gate,
+    )?;
+    gate.checkpoint("transactional exact pullback complete")?;
+
+    if gate.is_enforcing() {
+        let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+        peak.add_bytes(
+            downstream_live_bytes,
+            "retained transactional downstream result bytes",
+        )?;
+        peak.add_bytes(
+            exact_relu_tail_margin_live_bytes(upstream_prepared.value_dim())?,
+            "retained transactional pulled-margin bytes",
+        )?;
+        peak.add_bytes(
+            relu_tail_peak_live_bytes(
+                upstream_prepared.domain,
+                upstream_prepared.generator_nonzeros,
+            )?,
+            "transactional upstream M17 peak bytes",
+        )?;
+        peak.add_bytes(
+            size_of::<ReluTailConvBatchNormPullbackResult>(),
+            "transactional pullback result header bytes",
+        )?;
+        gate.preflight_peak_live_bytes(peak.finish())?;
+    }
+    gate.checkpoint("transactional upstream M17 peak-memory preflight complete")?;
+    let upstream = bound_prepared_internally_pulled_relu_tail_margin_impl(
+        upstream_prepared,
+        &pulled_margin,
+        upstream_supplied_multipliers,
+        upstream_config,
+        gate,
+    )
+    .map_err(map_relu_tail_pullback_budget_error)?;
+    drop(pulled_margin);
+    gate.checkpoint("transactional upstream M17 complete")?;
+
+    let result = ReluTailConvBatchNormPullbackResult {
+        downstream,
+        upstream,
+        plan,
+    };
+    gate.checkpoint("transactional ReLU-tail pullback publication")?;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bound_conv2d_batch_norm_pullback_m17_m20_impl<G>(
+    downstream_prepared: &PreparedReluTailGeometry64<'_>,
+    final_margin: &ExactReluTailMargin,
+    downstream_supplied_multipliers: Option<&[f64]>,
+    downstream_config: ReluTailDualConfig,
+    upstream_prepared: &PreparedReluTailGeometry64<'_>,
+    upstream_auxiliary: &CertifiedAuxiliaryBounds64,
+    conv_input_shape: [usize; 3],
+    conv_weights: ArrayView4<'_, f64>,
+    conv_bias: &[f64],
+    conv_spec: ConstrainedZonotopeConv2dSpec,
+    batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+    nominal_batch_norm_scale: &[f64],
+    nominal_batch_norm_bias: &[f64],
+    batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+    pullback_limits: ReluTailConvBatchNormPullbackLimits,
+    upstream_supplied_multipliers: Option<&[f64]>,
+    upstream_config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<ReluTailConvBatchNormPullbackM17M20Result, ReluTailConvBatchNormPullbackBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("transactional retained M17/M20 ReLU-tail pullback admission")?;
+    let plan = validate_conv2d_batch_norm_pullback_with_gate(
+        downstream_prepared,
+        upstream_prepared,
+        conv_input_shape,
+        conv_weights,
+        conv_bias,
+        conv_spec,
+        batch_norm_spec,
+        pullback_limits,
+        gate,
+    )?;
+    gate.checkpoint("transactional retained M17/M20 ReLU-tail pullback validation complete")?;
+
+    if gate.is_enforcing() {
+        let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+        peak.add_bytes(
+            relu_tail_peak_live_bytes(
+                downstream_prepared.domain,
+                downstream_prepared.generator_nonzeros,
+            )?,
+            "transactional retained downstream M17 peak bytes",
+        )?;
+        peak.add_bytes(
+            size_of::<ReluTailConvBatchNormPullbackM17M20Result>(),
+            "transactional retained pullback result header bytes",
+        )?;
+        gate.preflight_peak_live_bytes(peak.finish())?;
+    }
+    gate.checkpoint("transactional retained downstream M17 peak-memory preflight complete")?;
+    let downstream = bound_prepared_relu_tail_margin_impl(
+        downstream_prepared,
+        final_margin,
+        downstream_supplied_multipliers,
+        downstream_config,
+        gate,
+    )
+    .map_err(map_relu_tail_pullback_budget_error)?;
+    gate.checkpoint("transactional retained downstream M17 accepted line complete")?;
+
+    let downstream_live_bytes = relu_tail_dual_result_live_bytes(
+        downstream_prepared.value_dim(),
+        downstream_prepared.domain.constraint_count(),
+    )?;
+    let pulled_margin = build_conv2d_batch_norm_pulled_margin_with_gate(
+        upstream_prepared,
+        &downstream,
+        conv_input_shape,
+        conv_weights,
+        conv_bias,
+        conv_spec,
+        batch_norm_spec,
+        nominal_batch_norm_scale,
+        nominal_batch_norm_bias,
+        batch_norm_limits,
+        plan,
+        downstream_live_bytes,
+        gate,
+    )?;
+    gate.checkpoint("transactional retained exact pullback complete")?;
+
+    if gate.is_enforcing() {
+        let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+        peak.add_bytes(
+            downstream_live_bytes,
+            "retained transactional downstream result bytes",
+        )?;
+        peak.add_bytes(
+            exact_relu_tail_margin_live_bytes(upstream_prepared.value_dim())?,
+            "retained transactional pulled-margin bytes",
+        )?;
+        peak.add_bytes(
+            relu_tail_peak_live_bytes(
+                upstream_prepared.domain,
+                upstream_prepared.generator_nonzeros,
+            )?,
+            "transactional retained upstream M17 peak bytes",
+        )?;
+        peak.add_bytes(
+            size_of::<ReluTailConvBatchNormPullbackM17M20Result>(),
+            "transactional retained pullback result header bytes",
+        )?;
+        gate.preflight_peak_live_bytes(peak.finish())?;
+    }
+    gate.checkpoint("transactional retained upstream M17 peak-memory preflight complete")?;
+    let upstream_original = bound_prepared_internally_pulled_relu_tail_margin_impl(
+        upstream_prepared,
+        &pulled_margin,
+        upstream_supplied_multipliers,
+        upstream_config,
+        gate,
+    )
+    .map_err(map_relu_tail_pullback_budget_error)?;
+    gate.checkpoint("transactional retained upstream M17 complete")?;
+
+    // All work unique to M20, including checked accounting arithmetic, lives
+    // inside one optional boundary. No overflow or firewall refusal here may
+    // suppress the already completed mandatory upstream M17 certificate.
+    let optional_attempt = (|| -> Result<ReluTailDualResult, ReluTailDualBudgetError> {
+        let mut overlap = ConstrainedZonotopePeakLiveBytes::new();
+        overlap
+            .add_bytes(
+                downstream_live_bytes,
+                "retained transactional downstream result bytes during M20",
+            )
+            .map_err(ReluTailDualBudgetError::from)?;
+        overlap
+            .add_bytes(
+                exact_relu_tail_margin_live_bytes(upstream_prepared.value_dim())?,
+                "retained transactional pulled-margin bytes during M20",
+            )
+            .map_err(ReluTailDualBudgetError::from)?;
+        overlap
+            .add_bytes(
+                relu_tail_dual_result_live_bytes(
+                    upstream_prepared.value_dim(),
+                    upstream_prepared.domain.constraint_count(),
+                )?,
+                "retained transactional upstream M17 result bytes during M20",
+            )
+            .map_err(ReluTailDualBudgetError::from)?;
+        overlap
+            .add_bytes(
+                size_of::<ReluTailConvBatchNormPullbackM17M20Result>(),
+                "transactional retained pullback result header bytes during M20",
+            )
+            .map_err(ReluTailDualBudgetError::from)?;
+        bound_prepared_internally_pulled_relu_tail_margin_with_auxiliary_impl(
+            upstream_prepared,
+            upstream_auxiliary,
+            &pulled_margin,
+            upstream_supplied_multipliers,
+            upstream_config,
+            overlap.finish(),
+            gate,
+        )
+    })();
+    let (upstream_auxiliary_result, optional_budget_error) = match optional_attempt {
+        Ok(result) => (Some(result), None),
+        Err(ReluTailDualBudgetError::Budget(error)) => (None, Some(error)),
+        Err(ReluTailDualBudgetError::Bound(_)) => (None, None),
+    };
+    let status = if upstream_auxiliary_result.is_some() {
+        ReluTailBoxCutStatus::Completed
+    } else {
+        ReluTailBoxCutStatus::AuxiliaryFallback
+    };
+    drop(pulled_margin);
+    let upstream =
+        finish_box_cut_portfolio(upstream_original, upstream_auxiliary_result, None, status);
+
+    // Deliberately no deadline checkpoint after optional M20: an exhausted
+    // optional lane must publish the already completed mandatory M17 result.
+    Ok(ReluTailConvBatchNormPullbackM17M20Result {
+        downstream,
+        upstream,
+        optional_budget_error,
+        plan,
+    })
+}
+
+fn map_relu_tail_pullback_budget_error(
+    error: ReluTailDualBudgetError,
+) -> ReluTailConvBatchNormPullbackBudgetError {
+    match error {
+        ReluTailDualBudgetError::Bound(error) => {
+            ReluTailConvBatchNormPullbackError::ReluTail(error).into()
+        }
+        ReluTailDualBudgetError::Budget(error) => error.into(),
+    }
+}
+
+fn map_batch_norm_pullback_budget_error(
+    error: ConstrainedZonotopeBatchNormBudgetError,
+) -> ReluTailConvBatchNormPullbackBudgetError {
+    match error {
+        ConstrainedZonotopeBatchNormBudgetError::Transform(error) => {
+            ReluTailConvBatchNormPullbackError::BatchNorm(error).into()
+        }
+        ConstrainedZonotopeBatchNormBudgetError::Budget(error) => error.into(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_conv2d_batch_norm_pullback_with_gate<G>(
+    downstream_prepared: &PreparedReluTailGeometry64<'_>,
+    upstream_prepared: &PreparedReluTailGeometry64<'_>,
+    input_shape: [usize; 3],
+    weights: ArrayView4<'_, f64>,
+    bias: &[f64],
+    spec: ConstrainedZonotopeConv2dSpec,
+    batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+    limits: ReluTailConvBatchNormPullbackLimits,
+    gate: &mut G,
+) -> Result<ReluTailConvBatchNormPullbackPlan, ReluTailConvBatchNormPullbackBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let input_value_count = pullback_checked_product(&input_shape, "pullback input value count")?;
+    if upstream_prepared.value_dim() != input_value_count {
+        return Err(ConstrainedZonotopeConv2dError::Shape {
+            field: "upstream prepared geometry",
+            expected: vec![input_value_count],
+            got: vec![upstream_prepared.value_dim()],
+        }
+        .into());
+    }
+    pullback_check_limit(
+        "input value count",
+        input_value_count,
+        limits.max_input_value_count,
+    )?;
+    pullback_check_hard_limit("input value count", input_value_count)?;
+
+    let [input_channels, input_height, input_width] = input_shape;
+    if input_channels == 0 || input_height == 0 || input_width == 0 {
+        return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
+            message: format!("input shape must be non-empty, got {input_shape:?}"),
+        }
+        .into());
+    }
+    if batch_norm_spec.input_shape != input_shape {
+        return Err(ConstrainedZonotopeBatchNormError::Shape {
+            field: "BatchNorm input shape for Conv2d pullback",
+            expected: input_shape.to_vec(),
+            got: batch_norm_spec.input_shape.to_vec(),
+        }
+        .into());
+    }
+    if batch_norm_spec.channel_axis != 0 {
+        return Err(ConstrainedZonotopeBatchNormError::InvalidSpec {
+            message: format!(
+                "Conv2d pullback requires channel-major axis 0, got {}",
+                batch_norm_spec.channel_axis
+            ),
+        }
+        .into());
+    }
+    if spec.groups == 0 {
+        return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
+            message: "groups must be non-zero".to_string(),
+        }
+        .into());
+    }
+    if spec.stride.contains(&0) || spec.dilation.contains(&0) {
+        return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
+            message: format!(
+                "stride and dilation must be non-zero, got {:?} and {:?}",
+                spec.stride, spec.dilation
+            ),
+        }
+        .into());
+    }
+
+    let weight_shape_slice = weights.shape();
+    let weight_shape = [
+        weight_shape_slice[0],
+        weight_shape_slice[1],
+        weight_shape_slice[2],
+        weight_shape_slice[3],
+    ];
+    let [output_channels, kernel_input_channels, kernel_height, kernel_width] = weight_shape;
+    if output_channels == 0 || kernel_input_channels == 0 || kernel_height == 0 || kernel_width == 0
+    {
+        return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
+            message: format!("weight shape must be non-empty, got {weight_shape:?}"),
+        }
+        .into());
+    }
+    if input_channels % spec.groups != 0 || output_channels % spec.groups != 0 {
+        return Err(ConstrainedZonotopeConv2dError::InvalidSpec {
+            message: format!(
+                "input/output channels {input_channels}/{output_channels} must be divisible by groups {}",
+                spec.groups
+            ),
+        }
+        .into());
+    }
+    let expected_kernel_input_channels = input_channels / spec.groups;
+    if kernel_input_channels != expected_kernel_input_channels {
+        return Err(ConstrainedZonotopeConv2dError::Shape {
+            field: "weight input channels per group",
+            expected: vec![expected_kernel_input_channels],
+            got: vec![kernel_input_channels],
+        }
+        .into());
+    }
+    if bias.len() != output_channels {
+        return Err(ConstrainedZonotopeConv2dError::Shape {
+            field: "bias",
+            expected: vec![output_channels],
+            got: vec![bias.len()],
+        }
+        .into());
+    }
+
+    let weight_elements = pullback_checked_product(&weight_shape, "pullback weight elements")?;
+    pullback_check_limit(
+        "weight elements",
+        weight_elements,
+        limits.max_weight_elements,
+    )?;
+    pullback_check_hard_work_limit("weight elements", weight_elements)?;
+    for (index, value) in weights.iter().copied().enumerate() {
+        gate.charge_items(1, "transactional pullback weight validation")?;
+        if !value.is_finite() {
+            return Err(ConstrainedZonotopeConv2dError::NonFinite {
+                field: "weights",
+                index,
+            }
+            .into());
+        }
+    }
+    for (index, &value) in bias.iter().enumerate() {
+        gate.charge_items(1, "transactional pullback bias validation")?;
+        if !value.is_finite() {
+            return Err(ConstrainedZonotopeConv2dError::NonFinite {
+                field: "bias",
+                index,
+            }
+            .into());
+        }
+    }
+
+    let output_height = conv2d_output_dimension(
+        input_height,
+        spec.padding[0],
+        spec.padding[2],
+        kernel_height,
+        spec.dilation[0],
+        spec.stride[0],
+        "pullback output height",
+    )?;
+    let output_width = conv2d_output_dimension(
+        input_width,
+        spec.padding[1],
+        spec.padding[3],
+        kernel_width,
+        spec.dilation[1],
+        spec.stride[1],
+        "pullback output width",
+    )?;
+    let output_shape = [output_channels, output_height, output_width];
+    let output_value_count =
+        pullback_checked_product(&output_shape, "pullback output value count")?;
+    if downstream_prepared.value_dim() != output_value_count {
+        return Err(ConstrainedZonotopeConv2dError::Shape {
+            field: "downstream prepared geometry",
+            expected: vec![output_value_count],
+            got: vec![downstream_prepared.value_dim()],
+        }
+        .into());
+    }
+    pullback_check_limit(
+        "output value count",
+        output_value_count,
+        limits.max_output_value_count,
+    )?;
+    pullback_check_hard_limit("output value count", output_value_count)?;
+    let kernel_visits = pullback_checked_product(
+        &[
+            output_value_count,
+            kernel_input_channels,
+            kernel_height,
+            kernel_width,
+        ],
+        "pullback kernel visits",
+    )?;
+    pullback_check_limit("kernel visits", kernel_visits, limits.max_kernel_visits)?;
+    pullback_check_hard_work_limit("kernel visits", kernel_visits)?;
+
+    let pulled_margin_construction_exact_product_bound = kernel_visits
+        .checked_add(output_value_count)
+        .and_then(|count| {
+            input_value_count
+                .checked_mul(3)
+                .and_then(|n| count.checked_add(n))
+        })
+        .and_then(|count| {
+            input_channels
+                .checked_mul(3)
+                .and_then(|n| count.checked_add(n))
+        })
+        .ok_or(ConstrainedZonotopeConv2dError::ResourceOverflow {
+            operation: "post-certificate pulled-margin exact product bound",
+        })?;
+    pullback_check_limit(
+        "post-certificate pulled-margin exact rational products",
+        pulled_margin_construction_exact_product_bound,
+        limits.max_pulled_margin_construction_exact_products,
+    )?;
+    pullback_check_hard_work_limit(
+        "post-certificate pulled-margin exact rational products",
+        pulled_margin_construction_exact_product_bound,
+    )?;
+
+    Ok(ReluTailConvBatchNormPullbackPlan {
+        input_shape,
+        output_shape,
+        weight_shape,
+        weight_elements,
+        kernel_visits,
+        pulled_margin_construction_exact_product_bound,
+    })
+}
+
+fn pullback_checked_product(
+    factors: &[usize],
+    operation: &'static str,
+) -> Result<usize, ConstrainedZonotopeConv2dError> {
+    factors.iter().try_fold(1_usize, |product, &factor| {
+        product
+            .checked_mul(factor)
+            .ok_or(ConstrainedZonotopeConv2dError::ResourceOverflow { operation })
+    })
+}
+
+fn pullback_check_limit(
+    resource: &'static str,
+    required: usize,
+    limit: usize,
+) -> Result<(), ConstrainedZonotopeConv2dError> {
+    if required > limit {
+        Err(ConstrainedZonotopeConv2dError::ResourceLimit {
+            resource,
+            required,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn pullback_check_hard_limit(
+    resource: &'static str,
+    required: usize,
+) -> Result<(), ConstrainedZonotopeConv2dError> {
+    pullback_check_limit(resource, required, RELU_TAIL_DUAL_HARD_MAX_VALUE_DIM)
+}
+
+fn pullback_check_hard_work_limit(
+    resource: &'static str,
+    required: usize,
+) -> Result<(), ConstrainedZonotopeConv2dError> {
+    let hard = usize::try_from(RELU_TAIL_DUAL_HARD_MAX_BASELINE_TERMS).unwrap_or(usize::MAX);
+    pullback_check_limit(resource, required, hard)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_conv2d_batch_norm_pulled_margin_with_gate<G>(
+    upstream_prepared: &PreparedReluTailGeometry64<'_>,
+    downstream: &ReluTailDualResult,
+    input_shape: [usize; 3],
+    weights: ArrayView4<'_, f64>,
+    conv_bias: &[f64],
+    conv_spec: ConstrainedZonotopeConv2dSpec,
+    batch_norm_spec: ConstrainedZonotopeBatchNormSpec<'_>,
+    nominal_batch_norm_scale: &[f64],
+    nominal_batch_norm_bias: &[f64],
+    batch_norm_limits: ConstrainedZonotopeBatchNormAffineCertificateLimits,
+    plan: ReluTailConvBatchNormPullbackPlan,
+    downstream_live_bytes: usize,
+    gate: &mut G,
+) -> Result<InternallyPulledReluTailMargin, ReluTailConvBatchNormPullbackBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let output_value_count = plan.output_shape[0]
+        .checked_mul(plan.output_shape[1])
+        .and_then(|count| count.checked_mul(plan.output_shape[2]))
+        .ok_or(ConstrainedZonotopeConv2dError::ResourceOverflow {
+            operation: "pullback downstream direction length",
+        })?;
+    if downstream.direction.len() != output_value_count {
+        return Err(ReluTailDualError::Shape {
+            field: "accepted downstream direction",
+            expected: output_value_count,
+            got: downstream.direction.len(),
+        }
+        .into());
+    }
+
+    let channel_count = input_shape[0];
+    if gate.is_enforcing() {
+        let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+        peak.add_bytes(
+            downstream_live_bytes,
+            "retained downstream result during BatchNorm certification",
+        )?;
+        peak.add_bytes(
+            batch_norm_affine_certificate_peak_live_bytes(channel_count)?,
+            "transactional BatchNorm certificate peak bytes",
+        )?;
+        peak.add_bytes(
+            size_of::<ReluTailConvBatchNormPullbackResult>(),
+            "transactional pullback result header bytes",
+        )?;
+        gate.preflight_peak_live_bytes(peak.finish())?;
+    }
+    gate.checkpoint("transactional BatchNorm certificate preflight complete")?;
+    let certificate = certify_batch_norm_affine_surrogate_impl(
+        batch_norm_spec,
+        nominal_batch_norm_scale,
+        nominal_batch_norm_bias,
+        batch_norm_limits,
+        gate,
+    )
+    .map_err(map_batch_norm_pullback_budget_error)?;
+    gate.checkpoint("transactional BatchNorm certificate complete")?;
+
+    if gate.is_enforcing() {
+        let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+        peak.add_bytes(
+            downstream_live_bytes,
+            "retained downstream result during exact pullback",
+        )?;
+        peak.add_bytes(
+            certificate.conservative_live_bytes(),
+            "retained BatchNorm certificate during exact pullback",
+        )?;
+        peak.add_bytes(
+            exact_relu_tail_margin_peak_live_bytes(upstream_prepared.value_dim())?,
+            "transactional exact pulled-margin construction bytes",
+        )?;
+        peak.add_bytes(
+            size_of::<ReluTailConvBatchNormPullbackResult>(),
+            "transactional pullback result header bytes",
+        )?;
+        gate.preflight_peak_live_bytes(peak.finish())?;
+    }
+    gate.checkpoint("transactional exact pullback peak-memory preflight complete")?;
+
+    let input_value_count = upstream_prepared.value_dim();
+    let mut coefficients = Vec::new();
+    try_reserve(
+        &mut coefficients,
+        input_value_count,
+        "transactional pulled-margin coefficients",
+    )?;
+    for _ in 0..input_value_count {
+        gate.charge_items(1, "transactional pulled-margin initialization")?;
+        coefficients.push(BigRational::zero());
+    }
+    let mut exact_bias = checked_rational(
+        downstream.exact_constant.clone(),
+        "downstream exact-constant pullback",
+        0,
+    )?;
+
+    let [input_channels, input_height, input_width] = input_shape;
+    let [output_channels, kernel_input_channels, kernel_height, kernel_width] = plan.weight_shape;
+    let [_output_channels, output_height, output_width] = plan.output_shape;
+    let input_channels_per_group = input_channels / conv_spec.groups;
+    let output_channels_per_group = output_channels / conv_spec.groups;
+
+    for output_channel in 0..output_channels {
+        let group = output_channel / output_channels_per_group;
+        let input_channel_base = group * input_channels_per_group;
+        let exact_conv_bias = exact_objective_f64(
+            conv_bias[output_channel],
+            "convolution bias",
+            output_channel,
+        )?;
+        for output_y in 0..output_height {
+            for output_x in 0..output_width {
+                gate.charge_items(1, "transactional Conv2d transpose output")?;
+                let output_index =
+                    (output_channel * output_height + output_y) * output_width + output_x;
+                let exact_direction = exact_objective_f64(
+                    downstream.direction[output_index],
+                    "accepted downstream direction",
+                    output_index,
+                )?;
+                let bias_contribution = checked_rational(
+                    &exact_direction * &exact_conv_bias,
+                    "Conv2d bias pullback product",
+                    output_index,
+                )?;
+                exact_bias = checked_rational(
+                    exact_bias + bias_contribution,
+                    "Conv2d bias pullback accumulation",
+                    output_index,
+                )?;
+
+                for kernel_input_channel in 0..kernel_input_channels {
+                    let input_channel = input_channel_base + kernel_input_channel;
+                    for kernel_y in 0..kernel_height {
+                        let input_y = conv2d_input_coordinate(
+                            output_y,
+                            conv_spec.stride[0],
+                            kernel_y,
+                            conv_spec.dilation[0],
+                            conv_spec.padding[0],
+                            input_height,
+                        )?;
+                        for kernel_x in 0..kernel_width {
+                            gate.charge_items(1, "transactional Conv2d exact transpose")?;
+                            let Some(input_y) = input_y else {
+                                continue;
+                            };
+                            let Some(input_x) = conv2d_input_coordinate(
+                                output_x,
+                                conv_spec.stride[1],
+                                kernel_x,
+                                conv_spec.dilation[1],
+                                conv_spec.padding[1],
+                                input_width,
+                            )?
+                            else {
+                                continue;
+                            };
+                            let weight =
+                                weights[[output_channel, kernel_input_channel, kernel_y, kernel_x]];
+                            if weight == 0.0 || exact_direction.is_zero() {
+                                continue;
+                            }
+                            let input_index =
+                                (input_channel * input_height + input_y) * input_width + input_x;
+                            let exact_weight = exact_objective_f64(
+                                weight,
+                                "convolution weights",
+                                (((output_channel * kernel_input_channels + kernel_input_channel)
+                                    * kernel_height
+                                    + kernel_y)
+                                    * kernel_width)
+                                    + kernel_x,
+                            )?;
+                            let contribution = checked_rational(
+                                &exact_direction * exact_weight,
+                                "Conv2d transpose product",
+                                input_index,
+                            )?;
+                            coefficients[input_index] = checked_rational(
+                                coefficients[input_index].clone() + contribution,
+                                "Conv2d transpose accumulation",
+                                input_index,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    gate.checkpoint("transactional exact Conv2d transpose complete")?;
+
+    let channel_stride = input_height.checked_mul(input_width).ok_or(
+        ConstrainedZonotopeConv2dError::ResourceOverflow {
+            operation: "pullback channel stride",
+        },
+    )?;
+    for channel in 0..input_channels {
+        gate.charge_items(1, "transactional BatchNorm channel pullback")?;
+        let channel_start = channel * channel_stride;
+        let channel_end = channel_start + channel_stride;
+        let mut coefficient_sum = BigRational::zero();
+        let mut activation_min = BigRational::zero();
+        let mut activation_max = BigRational::zero();
+        for coordinate in channel_start..channel_end {
+            gate.charge_items(1, "transactional BatchNorm error envelope")?;
+            let coefficient = &coefficients[coordinate];
+            coefficient_sum = checked_rational(
+                coefficient_sum + coefficient,
+                "BatchNorm shared coefficient sum",
+                coordinate,
+            )?;
+            let (lower, upper) = &upstream_prepared.exact_coordinate_bounds[coordinate];
+            let relu_lower = if lower.is_negative() {
+                BigRational::zero()
+            } else {
+                lower.clone()
+            };
+            let relu_upper = if upper.is_negative() {
+                BigRational::zero()
+            } else {
+                upper.clone()
+            };
+            let (minimum_product, maximum_product) = if coefficient.is_negative() {
+                (
+                    checked_rational(
+                        coefficient * &relu_upper,
+                        "BatchNorm scale-error lower envelope",
+                        coordinate,
+                    )?,
+                    checked_rational(
+                        coefficient * &relu_lower,
+                        "BatchNorm scale-error upper envelope",
+                        coordinate,
+                    )?,
+                )
+            } else {
+                (
+                    checked_rational(
+                        coefficient * &relu_lower,
+                        "BatchNorm scale-error lower envelope",
+                        coordinate,
+                    )?,
+                    checked_rational(
+                        coefficient * &relu_upper,
+                        "BatchNorm scale-error upper envelope",
+                        coordinate,
+                    )?,
+                )
+            };
+            activation_min = checked_rational(
+                activation_min + minimum_product,
+                "BatchNorm scale-error lower accumulation",
+                coordinate,
+            )?;
+            activation_max = checked_rational(
+                activation_max + maximum_product,
+                "BatchNorm scale-error upper accumulation",
+                coordinate,
+            )?;
+        }
+
+        let channel_certificate = &certificate.channels()[channel];
+        if channel_certificate.scale_error().is_negative()
+            || channel_certificate.bias_error().is_negative()
+        {
+            return Err(ConstrainedZonotopeBatchNormError::InvalidSpec {
+                message: "internal affine-surrogate certificate error is negative".to_string(),
+            }
+            .into());
+        }
+        let nominal_scale = exact_objective_f64(
+            nominal_batch_norm_scale[channel],
+            "nominal BatchNorm scale",
+            channel,
+        )?;
+        let nominal_bias = exact_objective_f64(
+            nominal_batch_norm_bias[channel],
+            "nominal BatchNorm bias",
+            channel,
+        )?;
+        let activation_abs = activation_min.abs().max(activation_max.abs());
+        let scale_penalty = checked_rational(
+            channel_certificate.scale_error() * &activation_abs,
+            "BatchNorm shared scale-error penalty",
+            channel,
+        )?;
+        let bias_penalty = checked_rational(
+            channel_certificate.bias_error() * coefficient_sum.abs(),
+            "BatchNorm shared bias-error penalty",
+            channel,
+        )?;
+        let nominal_bias_contribution = checked_rational(
+            &coefficient_sum * nominal_bias,
+            "BatchNorm nominal bias pullback",
+            channel,
+        )?;
+        exact_bias = checked_rational(
+            exact_bias + nominal_bias_contribution,
+            "BatchNorm nominal bias accumulation",
+            channel,
+        )?;
+        exact_bias = checked_rational(
+            exact_bias - scale_penalty,
+            "BatchNorm scale-error subtraction",
+            channel,
+        )?;
+        exact_bias = checked_rational(
+            exact_bias - bias_penalty,
+            "BatchNorm bias-error subtraction",
+            channel,
+        )?;
+
+        for coordinate in channel_start..channel_end {
+            gate.charge_items(1, "transactional BatchNorm nominal scale pullback")?;
+            coefficients[coordinate] = checked_rational(
+                coefficients[coordinate].clone() * &nominal_scale,
+                "BatchNorm nominal scale product",
+                coordinate,
+            )?;
+        }
+    }
+    gate.checkpoint("transactional certified BatchNorm pullback complete")?;
+    drop(certificate);
+    gate.checkpoint("transactional pulled-margin declared-rational validation")?;
+    check_internally_pulled_rationals_with_gate(&coefficients, &exact_bias, gate)
+        .map_err(map_relu_tail_pullback_budget_error)?;
+    gate.checkpoint("transactional pulled-margin declared-rational validation complete")?;
+    Ok(InternallyPulledReluTailMargin {
+        margin: ExactReluTailMargin {
+            coefficients,
+            bias: exact_bias,
+        },
+    })
+}
+
+fn bound_prepared_relu_tail_margin_impl<G>(
+    prepared: &PreparedReluTailGeometry64<'_>,
+    margin: &ExactReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("prepared ReLU-tail margin validation")?;
+    check_mandatory_margin_resources_with_gate(prepared.domain.value_dim(), margin, gate)?;
+    gate.checkpoint("prepared ReLU-tail margin validation complete")?;
+    bound_prepared_validated_relu_tail_margin_impl(
+        prepared,
+        margin,
+        supplied_multipliers,
+        config,
+        gate,
+    )
+}
+
+fn bound_prepared_internally_pulled_relu_tail_margin_impl<G>(
+    prepared: &PreparedReluTailGeometry64<'_>,
+    pulled_margin: &InternallyPulledReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let margin = pulled_margin.as_exact_margin();
+    gate.checkpoint("prepared ReLU-tail margin validation")?;
+    if margin.coefficients.len() != prepared.domain.value_dim() {
+        return Err(ReluTailDualError::Shape {
+            field: "margin coefficients",
+            expected: prepared.domain.value_dim(),
+            got: margin.coefficients.len(),
+        }
+        .into());
+    }
+    check_internally_pulled_rationals_with_gate(&margin.coefficients, &margin.bias, gate)?;
+    gate.checkpoint("prepared ReLU-tail margin validation complete")?;
+    bound_prepared_validated_relu_tail_margin_impl(
+        prepared,
+        margin,
+        supplied_multipliers,
+        config,
+        gate,
+    )
+}
+
+fn bound_prepared_internally_pulled_relu_tail_margin_with_auxiliary_impl<G>(
+    prepared: &PreparedReluTailGeometry64<'_>,
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    pulled_margin: &InternallyPulledReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    overlapping_retained_bytes: usize,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("prepared internally pulled auxiliary ReLU-tail validation")?;
+    if auxiliary.value_dim() != prepared.domain.value_dim() {
+        return Err(ReluTailDualError::AuxiliaryDimensionMismatch {
+            expected: prepared.domain.value_dim(),
+            got: auxiliary.value_dim(),
+        }
+        .into());
+    }
+    let margin = pulled_margin.as_exact_margin();
+    if margin.coefficients.len() != prepared.domain.value_dim() {
+        return Err(ReluTailDualError::Shape {
+            field: "margin coefficients",
+            expected: prepared.domain.value_dim(),
+            got: margin.coefficients.len(),
+        }
+        .into());
+    }
+    check_internally_pulled_rationals_with_gate(&margin.coefficients, &margin.bias, gate)?;
+    gate.checkpoint("prepared internally pulled auxiliary ReLU-tail validation complete")?;
+    if gate.is_enforcing() {
+        let transform_peak =
+            relu_tail_peak_live_bytes(prepared.domain, prepared.generator_nonzeros)?
+                .checked_add(overlapping_retained_bytes)
+                .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation:
+                        "prepared internally pulled auxiliary ReLU-tail overlapping retained bytes",
+                })?;
+        gate.preflight_peak_live_bytes(transform_peak)?;
+    }
+    gate.checkpoint(
+        "prepared internally pulled auxiliary ReLU-tail peak-memory preflight complete",
+    )?;
+    let bounds = exact_coordinate_bounds_with_auxiliary_from_bounds_with_gate(
+        &prepared.exact_coordinate_bounds,
+        auxiliary,
+        gate,
+    )?;
+    gate.checkpoint("prepared internally pulled auxiliary ReLU-tail intersection complete")?;
+    let line_plan = build_line_plan_from_bounds_with_gate(prepared.domain, margin, &bounds, gate)?;
+    gate.checkpoint(
+        "prepared internally pulled auxiliary ReLU-tail exact line construction complete",
+    )?;
+    let result = bound_relu_tail_triangle_dual_from_line_plan_with_gate(
+        prepared.domain,
+        line_plan,
+        prepared.generator_nonzeros,
+        supplied_multipliers,
+        config,
+        gate,
+    )?;
+    gate.checkpoint("prepared internally pulled auxiliary ReLU-tail mandatory replay complete")?;
+    Ok(result)
+}
+
+fn bound_prepared_validated_relu_tail_margin_impl<G>(
+    prepared: &PreparedReluTailGeometry64<'_>,
+    margin: &ExactReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    if gate.is_enforcing() {
+        gate.preflight_peak_live_bytes(relu_tail_peak_live_bytes(
+            prepared.domain,
+            prepared.generator_nonzeros,
+        )?)?;
+    }
+    gate.checkpoint("prepared ReLU-tail margin peak-memory preflight complete")?;
+    let line_plan = build_line_plan_from_bounds_with_gate(
+        prepared.domain,
+        margin,
+        &prepared.exact_coordinate_bounds,
+        gate,
+    )?;
+    gate.checkpoint("prepared ReLU-tail exact line construction complete")?;
+    let result = bound_relu_tail_triangle_dual_from_line_plan_with_gate(
+        prepared.domain,
+        line_plan,
+        prepared.generator_nonzeros,
+        supplied_multipliers,
+        config,
+        gate,
+    )?;
+    gate.checkpoint("prepared ReLU-tail mandatory replay complete")?;
+    Ok(result)
+}
+
+fn bound_prepared_relu_tail_margin_with_auxiliary_impl<G>(
+    prepared: &PreparedReluTailGeometry64<'_>,
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    margin: &ExactReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    overlapping_retained_bytes: usize,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("prepared auxiliary ReLU-tail validation")?;
+    if auxiliary.value_dim() != prepared.domain.value_dim() {
+        return Err(ReluTailDualError::AuxiliaryDimensionMismatch {
+            expected: prepared.domain.value_dim(),
+            got: auxiliary.value_dim(),
+        }
+        .into());
+    }
+    check_mandatory_margin_resources_with_gate(prepared.domain.value_dim(), margin, gate)?;
+    gate.checkpoint("prepared auxiliary ReLU-tail validation complete")?;
+    if gate.is_enforcing() {
+        let transform_peak =
+            relu_tail_peak_live_bytes(prepared.domain, prepared.generator_nonzeros)?
+                .checked_add(overlapping_retained_bytes)
+                .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "prepared auxiliary ReLU-tail overlapping retained bytes",
+                })?;
+        gate.preflight_peak_live_bytes(transform_peak)?;
+    }
+    gate.checkpoint("prepared auxiliary ReLU-tail peak-memory preflight complete")?;
+    let bounds = exact_coordinate_bounds_with_auxiliary_from_bounds_with_gate(
+        &prepared.exact_coordinate_bounds,
+        auxiliary,
+        gate,
+    )?;
+    gate.checkpoint("prepared auxiliary ReLU-tail intersection complete")?;
+    let line_plan = build_line_plan_from_bounds_with_gate(prepared.domain, margin, &bounds, gate)?;
+    gate.checkpoint("prepared auxiliary ReLU-tail exact line construction complete")?;
+    let result = bound_relu_tail_triangle_dual_from_line_plan_with_gate(
+        prepared.domain,
+        line_plan,
+        prepared.generator_nonzeros,
+        supplied_multipliers,
+        config,
+        gate,
+    )?;
+    gate.checkpoint("prepared auxiliary ReLU-tail mandatory replay complete")?;
+    Ok(result)
 }
 
 /// Bound one exact margin after a single coordinatewise ReLU.
@@ -1019,15 +3659,100 @@ pub fn bound_relu_tail_triangle_dual_unwired(
     supplied_multipliers: Option<&[f64]>,
     config: ReluTailDualConfig,
 ) -> Result<ReluTailDualResult, ReluTailDualError> {
-    let generator_nonzeros = check_mandatory_resources(domain, margin)?;
-    let line_plan = build_line_plan(domain, margin)?;
-    bound_relu_tail_triangle_dual_from_line_plan(
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match bound_relu_tail_triangle_dual_impl(
+        domain,
+        margin,
+        supplied_multipliers,
+        config,
+        &mut gate,
+    ) {
+        Ok(result) => Ok(result),
+        Err(ReluTailDualBudgetError::Bound(error)) => Err(error),
+        Err(ReluTailDualBudgetError::Budget(_)) => {
+            unreachable!("the inert ReLU-tail call gate cannot refuse work")
+        }
+    }
+}
+
+/// Bound one exact ReLU-tail margin behind the shared synchronous call
+/// firewall.
+///
+/// The preflight covers exact coordinate geometry, exact line construction,
+/// all candidate/search buffers, result storage, and the nested sparse-dual
+/// error allowance. `budget.baseline_live_bytes()` must include `domain`,
+/// `margin`, optional supplied multipliers, and every other caller-owned buffer
+/// sharing the same ceiling.
+pub fn bound_relu_tail_triangle_dual_unwired_with_budget(
+    domain: &ConstrainedZonotope64,
+    margin: &ExactReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ReluTailDualResult>, ReluTailDualBudgetError> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let result = bound_relu_tail_triangle_dual_impl(
+        domain,
+        margin,
+        supplied_multipliers,
+        config,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
+}
+
+#[cfg(test)]
+fn bound_relu_tail_triangle_dual_unwired_with_clock<N>(
+    domain: &ConstrainedZonotope64,
+    margin: &ExactReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<ConstrainedZonotopeCallOutcome<ReluTailDualResult>, ReluTailDualBudgetError>
+where
+    N: FnMut(&'static str) -> Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let result = bound_relu_tail_triangle_dual_impl(
+        domain,
+        margin,
+        supplied_multipliers,
+        config,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(result, gate.report()))
+}
+
+fn bound_relu_tail_triangle_dual_impl<G>(
+    domain: &ConstrainedZonotope64,
+    margin: &ExactReluTailMargin,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("ReLU-tail input validation")?;
+    let generator_nonzeros = check_mandatory_resources_with_gate(domain, margin, gate)?;
+    gate.checkpoint("ReLU-tail input validation complete")?;
+    if gate.is_enforcing() {
+        gate.preflight_peak_live_bytes(relu_tail_peak_live_bytes(domain, generator_nonzeros)?)?;
+    }
+    gate.checkpoint("ReLU-tail peak-memory preflight complete")?;
+    let line_plan = build_line_plan_with_gate(domain, margin, gate)?;
+    gate.checkpoint("ReLU-tail exact line construction complete")?;
+    let result = bound_relu_tail_triangle_dual_from_line_plan_with_gate(
         domain,
         line_plan,
         generator_nonzeros,
         supplied_multipliers,
         config,
-    )
+        gate,
+    )?;
+    gate.checkpoint("ReLU-tail certificate publication")?;
+    Ok(result)
 }
 
 fn bound_relu_tail_triangle_dual_from_line_plan(
@@ -1037,25 +3762,84 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
     supplied_multipliers: Option<&[f64]>,
     config: ReluTailDualConfig,
 ) -> Result<ReluTailDualResult, ReluTailDualError> {
-    let mut zero = zero_f64(domain.constraint_count(), "zero multipliers")?;
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match bound_relu_tail_triangle_dual_from_line_plan_with_gate(
+        domain,
+        line_plan,
+        generator_nonzeros,
+        supplied_multipliers,
+        config,
+        &mut gate,
+    ) {
+        Ok(result) => Ok(result),
+        Err(ReluTailDualBudgetError::Bound(error)) => Err(error),
+        Err(ReluTailDualBudgetError::Budget(_)) => {
+            unreachable!("the inert ReLU-tail call gate cannot refuse work")
+        }
+    }
+}
+
+fn bound_relu_tail_triangle_dual_from_line_plan_with_gate<G>(
+    domain: &ConstrainedZonotope64,
+    line_plan: LinePlan,
+    generator_nonzeros: usize,
+    supplied_multipliers: Option<&[f64]>,
+    config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut zero = zero_f64_with_gate(
+        domain.constraint_count(),
+        "zero multipliers",
+        "ReLU-tail zero-multiplier initialization",
+        gate,
+    )?;
     // Canonicalize every structural zero, including platforms which preserve
     // a negative-zero payload through allocation helpers.
-    zero.fill(0.0);
+    for value in &mut zero {
+        gate.charge_items(1, "ReLU-tail zero canonicalization")?;
+        *value = 0.0;
+    }
 
-    let supplied = valid_supplied_multipliers(supplied_multipliers, domain.constraint_count());
-    let baseline_direction = clone_f64(&line_plan.fixed_direction, "baseline direction")?;
+    let supplied = valid_supplied_multipliers_with_gate(
+        supplied_multipliers,
+        domain.constraint_count(),
+        gate,
+    )?;
+    let baseline_direction = clone_f64_with_gate(
+        &line_plan.fixed_direction,
+        "baseline direction",
+        "ReLU-tail baseline-direction clone",
+        gate,
+    )?;
 
     // This call is deliberately first.  Search configuration and supplied
     // multiplier defects cannot hide a failure of the authority path.
-    let baseline_zero_raw = domain
-        .evaluate_dual(&baseline_direction, &zero)
-        .map_err(ReluTailDualError::Baseline)?;
+    let baseline_zero_raw = match evaluate_constrained_zonotope64_dual_with_call_gate(
+        domain,
+        &baseline_direction,
+        &zero,
+        gate,
+    ) {
+        Ok(bounds) => bounds,
+        Err(ConstrainedZonotopeDualBudgetError::Evaluation(error)) => {
+            return Err(ReluTailDualError::Baseline(error.into()).into());
+        }
+        Err(ConstrainedZonotopeDualBudgetError::Budget(error)) => return Err(error.into()),
+    };
     let baseline_zero = combine_exact_lower(baseline_zero_raw.lower, &line_plan.exact_constant)?;
     let mut best = AcceptedCandidate {
         lower: baseline_zero,
         zero_lower: baseline_zero,
         direction: baseline_direction,
-        multipliers: clone_f64(&zero, "accepted zero multipliers")?,
+        multipliers: clone_f64_with_gate(
+            &zero,
+            "accepted zero multipliers",
+            "ReLU-tail accepted-multiplier clone",
+            gate,
+        )?,
         supplied_used: false,
     };
     let mut candidate_replays = ReluTailDualZeroPredicateCandidateReplays {
@@ -1064,8 +3848,13 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         canonical_lower_bound: None,
         optimized_lower_bound: None,
     };
-    if maybe_replay_supplied(domain, &line_plan.exact_constant, supplied, &mut best)
-        == SuppliedReplayOutcome::AllocationFallback
+    if maybe_replay_supplied_with_gate(
+        domain,
+        &line_plan.exact_constant,
+        supplied,
+        &mut best,
+        gate,
+    )? == SuppliedReplayOutcome::AllocationFallback
     {
         return Ok(finish_result(
             best,
@@ -1119,7 +3908,12 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         ));
     };
 
-    let Some(mut endpoint) = candidate_clone_f64(&line_plan.fixed_direction) else {
+    let Some(mut endpoint) = candidate_clone_f64_with_gate(
+        &line_plan.fixed_direction,
+        "ReLU-tail endpoint-direction clone",
+        gate,
+    )?
+    else {
         return Ok(finish_result(
             best,
             line_plan,
@@ -1131,9 +3925,10 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         ));
     };
     for variable in &line_plan.variables {
+        gate.charge_items(1, "ReLU-tail endpoint-direction construction")?;
         endpoint[variable.coordinate] = variable.upper;
     }
-    match replay_direction(
+    match replay_direction_with_gate(
         domain,
         &line_plan.exact_constant,
         &line_plan.variables,
@@ -1141,7 +3936,8 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         &zero,
         supplied,
         &mut best,
-    ) {
+        gate,
+    )? {
         CandidateReplayOutcome::Replayed {
             zero_predicate_lower_bound,
         } => {
@@ -1162,7 +3958,12 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         }
     }
 
-    let Some(mut canonical) = candidate_clone_f64(&line_plan.fixed_direction) else {
+    let Some(mut canonical) = candidate_clone_f64_with_gate(
+        &line_plan.fixed_direction,
+        "ReLU-tail canonical-direction clone",
+        gate,
+    )?
+    else {
         return Ok(finish_result(
             best,
             line_plan,
@@ -1174,9 +3975,12 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         ));
     };
     for variable in &line_plan.variables {
+        gate.charge_items(1, "ReLU-tail canonical-direction construction")?;
         canonical[variable.coordinate] = variable.canonical;
     }
-    let Some(canonical_replay) = candidate_clone_f64(&canonical) else {
+    let Some(canonical_replay) =
+        candidate_clone_f64_with_gate(&canonical, "ReLU-tail canonical replay clone", gate)?
+    else {
         return Ok(finish_result(
             best,
             line_plan,
@@ -1187,7 +3991,7 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
             Some(plan),
         ));
     };
-    match replay_direction(
+    match replay_direction_with_gate(
         domain,
         &line_plan.exact_constant,
         &line_plan.variables,
@@ -1195,7 +3999,8 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         &zero,
         supplied,
         &mut best,
-    ) {
+        gate,
+    )? {
         CandidateReplayOutcome::Replayed {
             zero_predicate_lower_bound,
         } => {
@@ -1216,10 +4021,16 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
         }
     }
 
-    let search = projected_adam_candidate(domain, &line_plan.variables, canonical, config);
+    let search = projected_adam_candidate_with_call_gate(
+        domain,
+        &line_plan.variables,
+        canonical,
+        config,
+        gate,
+    );
     let (status, iterations_completed) = match search {
         Ok((candidate, iterations_completed)) => {
-            let replay = replay_direction(
+            let replay = replay_direction_with_gate(
                 domain,
                 &line_plan.exact_constant,
                 &line_plan.variables,
@@ -1227,7 +4038,8 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
                 &zero,
                 supplied,
                 &mut best,
-            );
+                gate,
+            )?;
             match replay {
                 CandidateReplayOutcome::Replayed {
                     zero_predicate_lower_bound,
@@ -1244,15 +4056,16 @@ fn bound_relu_tail_triangle_dual_from_line_plan(
                 }
             }
         }
-        Err(CandidateFailure::Deadline(iterations_completed)) => {
+        Err(GatedCandidateFailure::Deadline(iterations_completed)) => {
             (ReluTailDualStatus::Deadline, iterations_completed)
         }
-        Err(CandidateFailure::NonFinite(iterations_completed)) => {
+        Err(GatedCandidateFailure::NonFinite(iterations_completed)) => {
             (ReluTailDualStatus::NonFiniteCandidate, iterations_completed)
         }
-        Err(CandidateFailure::Allocation(iterations_completed)) => {
+        Err(GatedCandidateFailure::Allocation(iterations_completed)) => {
             (ReluTailDualStatus::AllocationFallback, iterations_completed)
         }
+        Err(GatedCandidateFailure::Budget(error)) => return Err(error.into()),
     };
 
     Ok(finish_result(
@@ -1529,6 +4342,29 @@ fn finish_optimized_box_cut_result(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finish_budgeted_optimized_box_cut_result(
+    original: ReluTailDualResult,
+    auxiliary: Option<ReluTailDualResult>,
+    box_cut: Option<ReluTailBoxCutCertificate>,
+    search_status: ReluTailBoxCutOptimizerStatus,
+    search_plan: Option<ReluTailBoxCutOptimizerPlan>,
+    telemetry: BoxSearchTelemetry,
+    optional_budget_error: Option<ConstrainedZonotopeCallBudgetError>,
+) -> ReluTailBoxCutBudgetedResult {
+    ReluTailBoxCutBudgetedResult {
+        optimized: finish_optimized_box_cut_result(
+            original,
+            auxiliary,
+            box_cut,
+            search_status,
+            search_plan,
+            telemetry,
+        ),
+        optional_budget_error,
+    }
+}
+
 impl ReluTailDualPlan {
     fn checked(
         domain: &ConstrainedZonotope64,
@@ -1749,12 +4585,31 @@ struct SlopeVariable {
     canonical: f64,
 }
 
+#[cfg(test)]
 fn build_line_plan(
     domain: &ConstrainedZonotope64,
     margin: &ExactReluTailMargin,
 ) -> Result<LinePlan, ReluTailDualError> {
-    let bounds = exact_coordinate_bounds(domain)?;
-    build_line_plan_from_bounds(domain, margin, &bounds)
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match build_line_plan_with_gate(domain, margin, &mut gate) {
+        Ok(plan) => Ok(plan),
+        Err(ReluTailDualBudgetError::Bound(error)) => Err(error),
+        Err(ReluTailDualBudgetError::Budget(_)) => {
+            unreachable!("the inert ReLU-tail call gate cannot refuse work")
+        }
+    }
+}
+
+fn build_line_plan_with_gate<G>(
+    domain: &ConstrainedZonotope64,
+    margin: &ExactReluTailMargin,
+    gate: &mut G,
+) -> Result<LinePlan, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let bounds = exact_coordinate_bounds_with_gate(domain, gate)?;
+    build_line_plan_from_bounds_with_gate(domain, margin, &bounds, gate)
 }
 
 fn build_line_plan_with_auxiliary_bounds(
@@ -1771,8 +4626,32 @@ fn build_line_plan_from_bounds(
     margin: &ExactReluTailMargin,
     bounds: &[(BigRational, BigRational)],
 ) -> Result<LinePlan, ReluTailDualError> {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match build_line_plan_from_bounds_with_gate(domain, margin, bounds, &mut gate) {
+        Ok(plan) => Ok(plan),
+        Err(ReluTailDualBudgetError::Bound(error)) => Err(error),
+        Err(ReluTailDualBudgetError::Budget(_)) => {
+            unreachable!("the inert ReLU-tail call gate cannot refuse work")
+        }
+    }
+}
+
+fn build_line_plan_from_bounds_with_gate<G>(
+    domain: &ConstrainedZonotope64,
+    margin: &ExactReluTailMargin,
+    bounds: &[(BigRational, BigRational)],
+    gate: &mut G,
+) -> Result<LinePlan, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     debug_assert_eq!(bounds.len(), domain.value_dim());
-    let mut fixed_direction = zero_f64(domain.value_dim(), "fixed direction")?;
+    let mut fixed_direction = zero_f64_with_gate(
+        domain.value_dim(),
+        "fixed direction",
+        "ReLU-tail fixed-direction initialization",
+        gate,
+    )?;
     let mut variables = Vec::new();
     try_reserve(
         &mut variables,
@@ -1784,6 +4663,7 @@ fn build_line_plan_from_bounds(
     for (coordinate, ((lower, upper), coefficient)) in
         bounds.iter().zip(margin.coefficients.iter()).enumerate()
     {
+        gate.charge_items(1, "ReLU-tail exact line construction")?;
         let zero = BigRational::zero();
         if upper <= &zero || coefficient.is_zero() {
             continue;
@@ -1862,7 +4742,8 @@ fn build_line_plan_from_bounds(
             return Err(ReluTailDualError::NonFiniteArithmetic {
                 coordinate,
                 operation: "exact positive slope interval validation",
-            });
+            }
+            .into());
         }
         variables.push(SlopeVariable {
             coordinate,
@@ -1895,12 +4776,30 @@ std::thread_local! {
 fn exact_coordinate_bounds(
     domain: &ConstrainedZonotope64,
 ) -> Result<Vec<(BigRational, BigRational)>, ReluTailDualError> {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match exact_coordinate_bounds_with_gate(domain, &mut gate) {
+        Ok(bounds) => Ok(bounds),
+        Err(ReluTailDualBudgetError::Bound(error)) => Err(error),
+        Err(ReluTailDualBudgetError::Budget(_)) => {
+            unreachable!("the inert ReLU-tail call gate cannot refuse work")
+        }
+    }
+}
+
+fn exact_coordinate_bounds_with_gate<G>(
+    domain: &ConstrainedZonotope64,
+    gate: &mut G,
+) -> Result<Vec<(BigRational, BigRational)>, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     #[cfg(test)]
     EXACT_COORDINATE_HULL_PASSES.with(|passes| passes.set(passes.get() + 1));
 
     let mut radii = Vec::new();
     try_reserve(&mut radii, domain.value_dim(), "exact coordinate radii")?;
     for (coordinate, &remainder) in domain.box_remainder().iter().enumerate() {
+        gate.charge_items(1, "ReLU-tail exact radius initialization")?;
         radii.push(checked_rational(
             exact_domain_f64(remainder, coordinate, "box remainder")?,
             "box remainder",
@@ -1908,7 +4807,9 @@ fn exact_coordinate_bounds(
         )?);
     }
     for generator in domain.generators() {
+        gate.charge_items(1, "ReLU-tail exact generator-column scan")?;
         for (coordinate, coefficient) in generator.entries() {
+            gate.charge_items(1, "ReLU-tail exact generator-entry accumulation")?;
             let coefficient = exact_domain_f64(coefficient, coordinate, "generator coefficient")?;
             radii[coordinate] = checked_rational(
                 radii[coordinate].clone() + coefficient.abs(),
@@ -1921,6 +4822,7 @@ fn exact_coordinate_bounds(
     let mut bounds = Vec::new();
     try_reserve(&mut bounds, domain.value_dim(), "exact coordinate bounds")?;
     for (coordinate, (&center, radius)) in domain.center().iter().zip(radii).enumerate() {
+        gate.charge_items(1, "ReLU-tail exact coordinate-bound materialization")?;
         let center = exact_domain_f64(center, coordinate, "center")?;
         let lower = checked_rational(&center - &radius, "coordinate lower bound", coordinate)?;
         let upper = checked_rational(center + radius, "coordinate upper bound", coordinate)?;
@@ -2003,6 +4905,62 @@ fn exact_coordinate_bounds_with_auxiliary_from_bounds(
     Ok(bounds)
 }
 
+fn exact_coordinate_bounds_with_auxiliary_from_bounds_with_gate<G>(
+    domain_bounds: &[(BigRational, BigRational)],
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    gate: &mut G,
+) -> Result<Vec<(BigRational, BigRational)>, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    debug_assert_eq!(domain_bounds.len(), auxiliary.value_dim());
+    let mut bounds = Vec::new();
+    try_reserve(
+        &mut bounds,
+        domain_bounds.len(),
+        "auxiliary exact coordinate bounds",
+    )?;
+    for (coordinate, ((domain_lower, domain_upper), (&auxiliary_lower, &auxiliary_upper))) in
+        domain_bounds
+            .iter()
+            .zip(auxiliary.lower().iter().zip(auxiliary.upper()))
+            .enumerate()
+    {
+        gate.charge_items(
+            1,
+            "prepared auxiliary ReLU-tail lower-endpoint intersection",
+        )?;
+        let mut lower = domain_lower.clone();
+        let auxiliary_lower = checked_rational(
+            exact_domain_f64(auxiliary_lower, coordinate, "auxiliary lower bound")?,
+            "auxiliary lower bound",
+            coordinate,
+        )?;
+        if auxiliary_lower > lower {
+            lower = auxiliary_lower;
+        }
+
+        gate.charge_items(
+            1,
+            "prepared auxiliary ReLU-tail upper-endpoint intersection",
+        )?;
+        let mut upper = domain_upper.clone();
+        let auxiliary_upper = checked_rational(
+            exact_domain_f64(auxiliary_upper, coordinate, "auxiliary upper bound")?,
+            "auxiliary upper bound",
+            coordinate,
+        )?;
+        if auxiliary_upper < upper {
+            upper = auxiliary_upper;
+        }
+        if lower > upper {
+            return Err(ReluTailDualError::EmptyAuxiliaryIntersection { coordinate }.into());
+        }
+        bounds.push((lower, upper));
+    }
+    Ok(bounds)
+}
+
 fn count_tighter_auxiliary_box_endpoints(
     original_hull: &[(BigRational, BigRational)],
     auxiliary: &CertifiedAuxiliaryBounds64,
@@ -2031,6 +4989,43 @@ fn count_tighter_auxiliary_box_endpoints(
                 })?;
         }
     }
+    Ok(count)
+}
+
+fn count_tighter_auxiliary_box_endpoints_with_gate<G>(
+    original_hull: &[(BigRational, BigRational)],
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    gate: &mut G,
+) -> Result<usize, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    debug_assert_eq!(original_hull.len(), auxiliary.value_dim());
+    let mut count = 0_usize;
+    for (coordinate, ((hull_lower, hull_upper), (&lower, &upper))) in original_hull
+        .iter()
+        .zip(auxiliary.lower().iter().zip(auxiliary.upper()))
+        .enumerate()
+    {
+        gate.charge_items(2, "M24 tighter auxiliary endpoint count")?;
+        let lower = exact_domain_f64(lower, coordinate, "Box optimizer lower endpoint")?;
+        let upper = exact_domain_f64(upper, coordinate, "Box optimizer upper endpoint")?;
+        if lower > *hull_lower {
+            count = count
+                .checked_add(1)
+                .ok_or(ReluTailDualError::ResourceOverflow {
+                    resource: "Box optimizer variables",
+                })?;
+        }
+        if upper < *hull_upper {
+            count = count
+                .checked_add(1)
+                .ok_or(ReluTailDualError::ResourceOverflow {
+                    resource: "Box optimizer variables",
+                })?;
+        }
+    }
+    gate.checkpoint("M24 tighter auxiliary endpoint count complete")?;
     Ok(count)
 }
 
@@ -2156,6 +5151,665 @@ where
         result.restarts_completed += 1;
     }
     result
+}
+
+struct BudgetedBoxApproximateSearch {
+    search: BoxApproximateSearch,
+    budget_error: Option<ConstrainedZonotopeCallBudgetError>,
+}
+
+fn optimize_auxiliary_box_multipliers_with_call_gate<G>(
+    domain: &ConstrainedZonotope64,
+    original_hull: &[(BigRational, BigRational)],
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    line_direction: &[f64],
+    config: ReluTailBoxCutOptimizerConfig,
+    plan: ReluTailBoxCutOptimizerPlan,
+    gate: &mut G,
+) -> BudgetedBoxApproximateSearch
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let start = Instant::now();
+    optimize_auxiliary_box_multipliers_with_clock_and_call_gate(
+        domain,
+        original_hull,
+        auxiliary,
+        line_direction,
+        config,
+        plan,
+        || start.elapsed(),
+        gate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optimize_auxiliary_box_multipliers_with_clock_and_call_gate<C, G>(
+    domain: &ConstrainedZonotope64,
+    original_hull: &[(BigRational, BigRational)],
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    line_direction: &[f64],
+    config: ReluTailBoxCutOptimizerConfig,
+    plan: ReluTailBoxCutOptimizerPlan,
+    elapsed: C,
+    gate: &mut G,
+) -> BudgetedBoxApproximateSearch
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut deadline = CandidateDeadline::new(config.wall_time, elapsed);
+    let mut search = BoxApproximateSearch {
+        variables: Vec::new(),
+        candidates: Vec::new(),
+        status: ReluTailBoxCutOptimizerStatus::Completed,
+        iterations_completed: 0,
+        restarts_completed: 0,
+        candidates_scored: 0,
+    };
+    if let Err(failure) =
+        gated_candidate_checkpoint(&mut deadline, 0, gate, "M24 candidate search startup")
+    {
+        let budget_error = apply_gated_box_search_failure(&mut search, failure);
+        return BudgetedBoxApproximateSearch {
+            search,
+            budget_error,
+        };
+    }
+    search.variables = match collect_box_search_variables_with_gate(
+        original_hull,
+        auxiliary,
+        plan.box_variables,
+        &mut deadline,
+        gate,
+    ) {
+        Ok(variables) => variables,
+        Err(failure) => {
+            let budget_error = apply_gated_box_search_failure(&mut search, failure);
+            return BudgetedBoxApproximateSearch {
+                search,
+                budget_error,
+            };
+        }
+    };
+    if search.variables.len() != plan.box_variables {
+        search.status = ReluTailBoxCutOptimizerStatus::NonFiniteCandidate;
+        return BudgetedBoxApproximateSearch {
+            search,
+            budget_error: None,
+        };
+    }
+    if search.candidates.try_reserve_exact(plan.restarts).is_err() {
+        search.status = ReluTailBoxCutOptimizerStatus::AllocationFallback;
+        return BudgetedBoxApproximateSearch {
+            search,
+            budget_error: None,
+        };
+    }
+    if let Err(failure) =
+        gated_candidate_checkpoint(&mut deadline, 0, gate, "M24 candidate storage publication")
+    {
+        let budget_error = apply_gated_box_search_failure(&mut search, failure);
+        return BudgetedBoxApproximateSearch {
+            search,
+            budget_error,
+        };
+    }
+
+    for schedule in config
+        .schedules
+        .iter()
+        .copied()
+        .filter(|schedule| schedule.iterations > 0)
+    {
+        let restart = run_box_optimizer_restart_with_gate(
+            domain,
+            line_direction,
+            &search.variables,
+            schedule,
+            config.multiplier_cap,
+            search.iterations_completed,
+            &mut deadline,
+            gate,
+        );
+        search.iterations_completed += restart.iterations_completed;
+        search.candidates_scored += restart.candidates_scored;
+        if let Some(candidate) = restart.best_candidate {
+            search.candidates.push(candidate);
+        }
+        if let Some(failure) = restart.failure {
+            let budget_error = apply_gated_box_search_failure(&mut search, failure);
+            return BudgetedBoxApproximateSearch {
+                search,
+                budget_error,
+            };
+        }
+        search.restarts_completed += 1;
+    }
+    if let Err(failure) = gated_candidate_checkpoint(
+        &mut deadline,
+        search.iterations_completed,
+        gate,
+        "M24 candidate search publication",
+    ) {
+        let budget_error = apply_gated_box_search_failure(&mut search, failure);
+        return BudgetedBoxApproximateSearch {
+            search,
+            budget_error,
+        };
+    }
+    BudgetedBoxApproximateSearch {
+        search,
+        budget_error: None,
+    }
+}
+
+fn apply_gated_box_search_failure(
+    search: &mut BoxApproximateSearch,
+    failure: GatedCandidateFailure,
+) -> Option<ConstrainedZonotopeCallBudgetError> {
+    match failure {
+        GatedCandidateFailure::Deadline(_) => {
+            search.status = ReluTailBoxCutOptimizerStatus::Deadline;
+            None
+        }
+        GatedCandidateFailure::NonFinite(_) => {
+            search.status = ReluTailBoxCutOptimizerStatus::NonFiniteCandidate;
+            None
+        }
+        GatedCandidateFailure::Allocation(_) => {
+            search.status = ReluTailBoxCutOptimizerStatus::AllocationFallback;
+            None
+        }
+        GatedCandidateFailure::Budget(error) => {
+            search.status = box_optimizer_status_from_budget_error(&error);
+            Some(error)
+        }
+    }
+}
+
+fn collect_box_search_variables_with_gate<C, G>(
+    original_hull: &[(BigRational, BigRational)],
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    expected: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+) -> Result<Vec<BoxSearchVariable>, GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut variables = Vec::new();
+    variables
+        .try_reserve_exact(expected)
+        .map_err(|_| GatedCandidateFailure::Allocation(0))?;
+    for (coordinate, ((hull_lower, hull_upper), (&lower, &upper))) in original_hull
+        .iter()
+        .zip(auxiliary.lower().iter().zip(auxiliary.upper()))
+        .enumerate()
+    {
+        gated_candidate_visit(
+            deadline,
+            0,
+            gate,
+            "M24 candidate endpoint-variable construction",
+        )?;
+        let Some(exact_lower) = BigRational::from_float(lower) else {
+            return Err(GatedCandidateFailure::NonFinite(0));
+        };
+        let Some(exact_upper) = BigRational::from_float(upper) else {
+            return Err(GatedCandidateFailure::NonFinite(0));
+        };
+        if exact_lower > *hull_lower {
+            variables.push(BoxSearchVariable {
+                coordinate,
+                kind: BoxVariableKind::Lower,
+                endpoint: lower,
+            });
+        }
+        if exact_upper < *hull_upper {
+            variables.push(BoxSearchVariable {
+                coordinate,
+                kind: BoxVariableKind::Upper,
+                endpoint: upper,
+            });
+        }
+    }
+    Ok(variables)
+}
+
+struct GatedBoxRestartOutcome {
+    best_candidate: Option<Vec<f64>>,
+    failure: Option<GatedCandidateFailure>,
+    iterations_completed: usize,
+    candidates_scored: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_box_optimizer_restart_with_gate<C, G>(
+    domain: &ConstrainedZonotope64,
+    line_direction: &[f64],
+    variables: &[BoxSearchVariable],
+    schedule: ReluTailBoxCutAdamSchedule,
+    multiplier_cap: f64,
+    completed_before: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+) -> GatedBoxRestartOutcome
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    let failed_without_candidate = |failure| GatedBoxRestartOutcome {
+        best_candidate: None,
+        failure: Some(failure),
+        iterations_completed: 0,
+        candidates_scored: 0,
+    };
+    if let Err(failure) = gated_candidate_checkpoint(
+        deadline,
+        completed_before,
+        gate,
+        "M24 candidate restart admission",
+    ) {
+        return failed_without_candidate(failure);
+    }
+    let mut multipliers = match gated_box_candidate_zeros(
+        variables.len(),
+        completed_before,
+        deadline,
+        gate,
+        "M24 multiplier initialization",
+    ) {
+        Ok(values) => values,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+    let mut first = match gated_box_candidate_zeros(
+        variables.len(),
+        completed_before,
+        deadline,
+        gate,
+        "M24 first-moment initialization",
+    ) {
+        Ok(values) => values,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+    let mut second = match gated_box_candidate_zeros(
+        variables.len(),
+        completed_before,
+        deadline,
+        gate,
+        "M24 second-moment initialization",
+    ) {
+        Ok(values) => values,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+    let mut best = match gated_box_candidate_zeros(
+        variables.len(),
+        completed_before,
+        deadline,
+        gate,
+        "M24 best-candidate initialization",
+    ) {
+        Ok(values) => values,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+    let mut best_scratch = match gated_box_candidate_zeros(
+        variables.len(),
+        completed_before,
+        deadline,
+        gate,
+        "M24 best-candidate scratch initialization",
+    ) {
+        Ok(values) => values,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+    let mut direction = match gated_box_candidate_zeros(
+        domain.value_dim(),
+        completed_before,
+        deadline,
+        gate,
+        "M24 candidate direction initialization",
+    ) {
+        Ok(values) => values,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+    let mut witness = match gated_box_candidate_zeros(
+        domain.value_dim(),
+        completed_before,
+        deadline,
+        gate,
+        "M24 candidate witness initialization",
+    ) {
+        Ok(values) => values,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+
+    let mut best_objective = match approximate_box_objective_and_witness_with_gate(
+        domain,
+        line_direction,
+        variables,
+        &multipliers,
+        &mut direction,
+        &mut witness,
+        completed_before,
+        deadline,
+        gate,
+    ) {
+        Ok(objective) => objective,
+        Err(failure) => return failed_without_candidate(failure),
+    };
+    let mut iterations_completed = 0_usize;
+    let mut candidates_scored = 1_usize;
+
+    for iteration in 0..schedule.iterations {
+        let global_completed = completed_before + iterations_completed;
+        if let Err(failure) =
+            gated_candidate_checkpoint(deadline, global_completed, gate, "M24 candidate iteration")
+        {
+            return GatedBoxRestartOutcome {
+                best_candidate: Some(best),
+                failure: Some(failure),
+                iterations_completed,
+                candidates_scored,
+            };
+        }
+        let step = match i32::try_from(iteration + 1) {
+            Ok(step) => step,
+            Err(_) => {
+                return GatedBoxRestartOutcome {
+                    best_candidate: Some(best),
+                    failure: Some(GatedCandidateFailure::NonFinite(global_completed)),
+                    iterations_completed,
+                    candidates_scored,
+                };
+            }
+        };
+        let first_correction = 1.0 - RELU_TAIL_BOX_CUT_ADAM_BETA1.powi(step);
+        let second_correction = 1.0 - RELU_TAIL_BOX_CUT_ADAM_BETA2.powi(step);
+        let learning_rate = schedule.learning_rate * schedule.decay.powi(step - 1);
+        if !first_correction.is_finite()
+            || !second_correction.is_finite()
+            || first_correction <= 0.0
+            || second_correction <= 0.0
+            || !learning_rate.is_finite()
+        {
+            return GatedBoxRestartOutcome {
+                best_candidate: Some(best),
+                failure: Some(GatedCandidateFailure::NonFinite(global_completed)),
+                iterations_completed,
+                candidates_scored,
+            };
+        }
+        for (slot, variable) in variables.iter().enumerate() {
+            if let Err(failure) = gated_candidate_visit(
+                deadline,
+                global_completed,
+                gate,
+                "M24 candidate Adam update",
+            ) {
+                return GatedBoxRestartOutcome {
+                    best_candidate: Some(best),
+                    failure: Some(failure),
+                    iterations_completed,
+                    candidates_scored,
+                };
+            }
+            let gradient = match variable.kind {
+                BoxVariableKind::Upper => witness[variable.coordinate] - variable.endpoint,
+                BoxVariableKind::Lower => variable.endpoint - witness[variable.coordinate],
+            };
+            first[slot] = RELU_TAIL_BOX_CUT_ADAM_BETA1 * first[slot]
+                + (1.0 - RELU_TAIL_BOX_CUT_ADAM_BETA1) * gradient;
+            second[slot] = RELU_TAIL_BOX_CUT_ADAM_BETA2 * second[slot]
+                + (1.0 - RELU_TAIL_BOX_CUT_ADAM_BETA2) * gradient * gradient;
+            let first_hat = first[slot] / first_correction;
+            let second_hat = second[slot] / second_correction;
+            let update =
+                learning_rate * first_hat / (second_hat.sqrt() + RELU_TAIL_BOX_CUT_ADAM_EPSILON);
+            let raw_candidate = multipliers[slot] + update;
+            if !gradient.is_finite()
+                || !first[slot].is_finite()
+                || !second[slot].is_finite()
+                || !first_hat.is_finite()
+                || !second_hat.is_finite()
+                || !update.is_finite()
+                || !raw_candidate.is_finite()
+            {
+                return GatedBoxRestartOutcome {
+                    best_candidate: Some(best),
+                    failure: Some(GatedCandidateFailure::NonFinite(global_completed)),
+                    iterations_completed,
+                    candidates_scored,
+                };
+            }
+            multipliers[slot] = canonical_zero(raw_candidate.clamp(0.0, multiplier_cap));
+        }
+
+        let completed = global_completed + 1;
+        let objective = match approximate_box_objective_and_witness_with_gate(
+            domain,
+            line_direction,
+            variables,
+            &multipliers,
+            &mut direction,
+            &mut witness,
+            completed,
+            deadline,
+            gate,
+        ) {
+            Ok(objective) => objective,
+            Err(failure) => {
+                return GatedBoxRestartOutcome {
+                    best_candidate: Some(best),
+                    failure: Some(failure),
+                    iterations_completed,
+                    candidates_scored,
+                };
+            }
+        };
+        iterations_completed += 1;
+        candidates_scored += 1;
+        if objective > best_objective {
+            if let Err(failure) = gated_copy_box_candidate_atomically(
+                &mut best,
+                &mut best_scratch,
+                &multipliers,
+                completed,
+                deadline,
+                gate,
+            ) {
+                return GatedBoxRestartOutcome {
+                    best_candidate: Some(best),
+                    failure: Some(failure),
+                    iterations_completed,
+                    candidates_scored,
+                };
+            }
+            best_objective = objective;
+        }
+    }
+
+    GatedBoxRestartOutcome {
+        best_candidate: Some(best),
+        failure: None,
+        iterations_completed,
+        candidates_scored,
+    }
+}
+
+fn gated_box_candidate_zeros<C, G>(
+    count: usize,
+    iterations: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+    checkpoint: &'static str,
+) -> Result<Vec<f64>, GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    #[cfg(test)]
+    if BOX_OPTIMIZER_FAIL_NEXT_ALLOCATION.with(|fail| fail.replace(false)) {
+        return Err(GatedCandidateFailure::Allocation(iterations));
+    }
+    gated_candidate_zeros(count, iterations, deadline, gate, checkpoint)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approximate_box_objective_and_witness_with_gate<C, G>(
+    domain: &ConstrainedZonotope64,
+    line_direction: &[f64],
+    variables: &[BoxSearchVariable],
+    multipliers: &[f64],
+    direction: &mut [f64],
+    witness: &mut [f64],
+    iterations: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+) -> Result<f64, GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    debug_assert_eq!(line_direction.len(), domain.value_dim());
+    debug_assert_eq!(direction.len(), domain.value_dim());
+    debug_assert_eq!(witness.len(), domain.value_dim());
+    debug_assert_eq!(variables.len(), multipliers.len());
+    for (coordinate, ((target, witness_value), &source)) in direction
+        .iter_mut()
+        .zip(witness.iter_mut())
+        .zip(line_direction)
+        .enumerate()
+    {
+        gated_candidate_visit(
+            deadline,
+            iterations,
+            gate,
+            "M24 candidate direction and witness initialization",
+        )?;
+        if !source.is_finite() {
+            return Err(GatedCandidateFailure::NonFinite(iterations));
+        }
+        *target = source;
+        *witness_value = domain.center()[coordinate];
+    }
+    let mut objective = 0.0_f64;
+    for (variable, &multiplier) in variables.iter().zip(multipliers) {
+        gated_candidate_visit(
+            deadline,
+            iterations,
+            gate,
+            "M24 candidate Box-variable score",
+        )?;
+        if !multiplier.is_finite() || multiplier < 0.0 {
+            return Err(GatedCandidateFailure::NonFinite(iterations));
+        }
+        match variable.kind {
+            BoxVariableKind::Upper => {
+                direction[variable.coordinate] += multiplier;
+                objective -= multiplier * variable.endpoint;
+            }
+            BoxVariableKind::Lower => {
+                direction[variable.coordinate] -= multiplier;
+                objective += multiplier * variable.endpoint;
+            }
+        }
+        if !direction[variable.coordinate].is_finite() || !objective.is_finite() {
+            return Err(GatedCandidateFailure::NonFinite(iterations));
+        }
+    }
+    for coordinate in 0..domain.value_dim() {
+        gated_candidate_visit(
+            deadline,
+            iterations,
+            gate,
+            "M24 candidate center/remainder score",
+        )?;
+        let value = direction[coordinate];
+        let sign = if value > 0.0 {
+            1.0
+        } else if value < 0.0 {
+            -1.0
+        } else {
+            0.0
+        };
+        objective += value * domain.center()[coordinate];
+        objective -= value.abs() * domain.box_remainder()[coordinate];
+        witness[coordinate] -= sign * domain.box_remainder()[coordinate];
+        if !objective.is_finite() || !witness[coordinate].is_finite() {
+            return Err(GatedCandidateFailure::NonFinite(iterations));
+        }
+    }
+    for generator in domain.generators() {
+        gated_candidate_visit(
+            deadline,
+            iterations,
+            gate,
+            "M24 candidate generator-column score",
+        )?;
+        let mut projection = 0.0_f64;
+        for (coordinate, coefficient) in generator.entries() {
+            gated_candidate_visit(
+                deadline,
+                iterations,
+                gate,
+                "M24 candidate generator-entry projection",
+            )?;
+            projection += direction[coordinate] * coefficient;
+            if !projection.is_finite() {
+                return Err(GatedCandidateFailure::NonFinite(iterations));
+            }
+        }
+        objective -= projection.abs();
+        if !objective.is_finite() {
+            return Err(GatedCandidateFailure::NonFinite(iterations));
+        }
+        let sign = if projection > 0.0 {
+            1.0
+        } else if projection < 0.0 {
+            -1.0
+        } else {
+            0.0
+        };
+        if sign != 0.0 {
+            for (coordinate, coefficient) in generator.entries() {
+                gated_candidate_visit(
+                    deadline,
+                    iterations,
+                    gate,
+                    "M24 candidate sparse-witness replay",
+                )?;
+                witness[coordinate] -= sign * coefficient;
+                if !witness[coordinate].is_finite() {
+                    return Err(GatedCandidateFailure::NonFinite(iterations));
+                }
+            }
+        }
+    }
+    Ok(objective)
+}
+
+fn gated_copy_box_candidate_atomically<C, G>(
+    best: &mut Vec<f64>,
+    scratch: &mut Vec<f64>,
+    source: &[f64],
+    iterations: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+) -> Result<(), GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    debug_assert_eq!(best.len(), source.len());
+    debug_assert_eq!(scratch.len(), source.len());
+    for (target, &source) in scratch.iter_mut().zip(source) {
+        gated_candidate_visit(deadline, iterations, gate, "M24 best-candidate atomic copy")?;
+        *target = source;
+    }
+    std::mem::swap(best, scratch);
+    Ok(())
 }
 
 fn collect_box_search_variables<C>(
@@ -2548,6 +6202,20 @@ fn box_status_from_candidate_failure(failure: CandidateFailure) -> ReluTailBoxCu
     }
 }
 
+fn box_optimizer_status_from_budget_error(
+    error: &ConstrainedZonotopeCallBudgetError,
+) -> ReluTailBoxCutOptimizerStatus {
+    match error {
+        ConstrainedZonotopeCallBudgetError::DeadlineExpired { .. } => {
+            ReluTailBoxCutOptimizerStatus::Deadline
+        }
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow { .. }
+        | ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. } => {
+            ReluTailBoxCutOptimizerStatus::ResourceFallback
+        }
+    }
+}
+
 fn expand_box_candidate(
     variables: &[BoxSearchVariable],
     candidate: &[f64],
@@ -2574,6 +6242,53 @@ fn expand_box_candidate(
             BoxVariableKind::Lower => lower[variable.coordinate] = canonical_zero(value),
         }
     }
+    Ok((upper, lower))
+}
+
+fn expand_box_candidate_with_gate<G>(
+    variables: &[BoxSearchVariable],
+    candidate: &[f64],
+    value_dim: usize,
+    gate: &mut G,
+) -> Result<(Vec<f64>, Vec<f64>), ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    if candidate.len() != variables.len() {
+        return Err(ReluTailDualError::Shape {
+            field: "optimized Box multipliers",
+            expected: variables.len(),
+            got: candidate.len(),
+        }
+        .into());
+    }
+    let mut upper = zero_f64_with_gate(
+        value_dim,
+        "optimized upper Box multipliers",
+        "M24 upper Box-multiplier expansion",
+        gate,
+    )?;
+    let mut lower = zero_f64_with_gate(
+        value_dim,
+        "optimized lower Box multipliers",
+        "M24 lower Box-multiplier expansion",
+        gate,
+    )?;
+    for (slot, (variable, &value)) in variables.iter().zip(candidate).enumerate() {
+        gate.charge_items(1, "M24 Box-multiplier expansion")?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(ReluTailDualError::NonFiniteArithmetic {
+                coordinate: slot,
+                operation: "optimized Box multiplier expansion",
+            }
+            .into());
+        }
+        match variable.kind {
+            BoxVariableKind::Upper => upper[variable.coordinate] = canonical_zero(value),
+            BoxVariableKind::Lower => lower[variable.coordinate] = canonical_zero(value),
+        }
+    }
+    gate.checkpoint("M24 Box-multiplier expansion complete")?;
     Ok((upper, lower))
 }
 
@@ -2612,18 +6327,80 @@ fn build_auxiliary_box_cut_certificate_with_original_hull(
     supplied_predicate_multipliers: Option<&[f64]>,
     original_hull: &[(BigRational, BigRational)],
 ) -> Result<ReluTailBoxCutCertificate, ReluTailDualError> {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match build_auxiliary_box_cut_certificate_with_original_hull_and_gate(
+        domain,
+        auxiliary,
+        auxiliary_result,
+        upper_box_multipliers,
+        lower_box_multipliers,
+        supplied_predicate_multipliers,
+        original_hull,
+        &mut gate,
+    ) {
+        Ok(certificate) => Ok(certificate),
+        Err(ReluTailDualBudgetError::Bound(error)) => Err(error),
+        Err(ReluTailDualBudgetError::Budget(_)) => {
+            unreachable!("the inert M24 replay gate cannot refuse work")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_auxiliary_box_cut_certificate_with_original_hull_and_gate<G>(
+    domain: &ConstrainedZonotope64,
+    auxiliary: &CertifiedAuxiliaryBounds64,
+    auxiliary_result: &ReluTailDualResult,
+    upper_box_multipliers: &[f64],
+    lower_box_multipliers: &[f64],
+    supplied_predicate_multipliers: Option<&[f64]>,
+    original_hull: &[(BigRational, BigRational)],
+    gate: &mut G,
+) -> Result<ReluTailBoxCutCertificate, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     debug_assert_eq!(auxiliary.value_dim(), domain.value_dim());
     debug_assert_eq!(auxiliary_result.direction.len(), domain.value_dim());
     debug_assert_eq!(upper_box_multipliers.len(), domain.value_dim());
     debug_assert_eq!(lower_box_multipliers.len(), domain.value_dim());
     debug_assert_eq!(original_hull.len(), domain.value_dim());
 
+    if auxiliary.value_dim() != domain.value_dim() {
+        return Err(ReluTailDualError::AuxiliaryDimensionMismatch {
+            expected: domain.value_dim(),
+            got: auxiliary.value_dim(),
+        }
+        .into());
+    }
+    for (field, got) in [
+        ("Box-cut source direction", auxiliary_result.direction.len()),
+        ("upper Box multipliers", upper_box_multipliers.len()),
+        ("lower Box multipliers", lower_box_multipliers.len()),
+        ("original Box-cut hull", original_hull.len()),
+    ] {
+        if got != domain.value_dim() {
+            return Err(ReluTailDualError::Shape {
+                field,
+                expected: domain.value_dim(),
+                got,
+            }
+            .into());
+        }
+    }
+    gate.checkpoint("M24 exact Box-cut validation")?;
+
     // This hull deliberately precedes and excludes the auxiliary
     // intersection.  The residual between p* and the replayed dyadic p must be
     // valid at every point considered by D_Z, including spurious Z points
     // outside the certified Box.  The direct M22 wrapper computes it here;
     // M24 passes the domain-tied prepared copy without changing the replay.
-    let mut replay_direction = zero_f64(domain.value_dim(), "Box-cut replay direction")?;
+    let mut replay_direction = zero_f64_with_gate(
+        domain.value_dim(),
+        "Box-cut replay direction",
+        "M24 exact Box-cut direction initialization",
+        gate,
+    )?;
     let mut exact_constant = checked_rational(
         auxiliary_result.exact_constant.clone(),
         "Box-cut line constant",
@@ -2631,6 +6408,8 @@ fn build_auxiliary_box_cut_certificate_with_original_hull(
     )?;
 
     for coordinate in 0..domain.value_dim() {
+        gate.checkpoint("M24 exact Box-cut coordinate admission")?;
+        gate.charge_items(16, "M24 exact Box-cut coordinate arithmetic")?;
         let line_direction = checked_rational(
             exact_domain_f64(
                 auxiliary_result.direction[coordinate],
@@ -2750,27 +6529,59 @@ fn build_auxiliary_box_cut_certificate_with_original_hull(
         )?;
     }
 
-    let mut zero = zero_f64(
+    let mut zero = zero_f64_with_gate(
         domain.constraint_count(),
         "Box-cut zero predicate multipliers",
+        "M24 zero predicate-multiplier initialization",
+        gate,
     )?;
-    zero.fill(0.0);
-    let replay = domain
-        .evaluate_dual(&replay_direction, &zero)
-        .map_err(ReluTailDualError::Baseline)?;
+    for value in &mut zero {
+        gate.charge_items(1, "M24 zero predicate-multiplier canonicalization")?;
+        *value = 0.0;
+    }
+    let replay = match evaluate_constrained_zonotope64_dual_with_call_gate(
+        domain,
+        &replay_direction,
+        &zero,
+        gate,
+    ) {
+        Ok(bounds) => bounds,
+        Err(ConstrainedZonotopeDualBudgetError::Evaluation(error)) => {
+            return Err(ReluTailDualError::Baseline(error.into()).into());
+        }
+        Err(ConstrainedZonotopeDualBudgetError::Budget(error)) => return Err(error.into()),
+    };
+    gate.charge_items(1, "M24 exact zero-replay combination")?;
     let zero_predicate_lower_bound = combine_exact_lower(replay.lower, &exact_constant)?;
     let mut lower_bound = zero_predicate_lower_bound;
     let mut predicate_multipliers = zero;
     let mut supplied_predicate_multipliers_used = false;
 
-    if let Some(supplied) =
-        valid_supplied_multipliers(supplied_predicate_multipliers, domain.constraint_count())
-    {
-        if let Ok(replay) = domain.evaluate_dual(&replay_direction, supplied) {
+    if let Some(supplied) = valid_supplied_multipliers_with_gate(
+        supplied_predicate_multipliers,
+        domain.constraint_count(),
+        gate,
+    )? {
+        let supplied_replay = match evaluate_constrained_zonotope64_dual_with_call_gate(
+            domain,
+            &replay_direction,
+            supplied,
+            gate,
+        ) {
+            Ok(bounds) => Some(bounds),
+            Err(ConstrainedZonotopeDualBudgetError::Evaluation(_)) => None,
+            Err(ConstrainedZonotopeDualBudgetError::Budget(error)) => return Err(error.into()),
+        };
+        if let Some(replay) = supplied_replay {
+            gate.charge_items(1, "M24 exact supplied-replay combination")?;
             if let Ok(candidate) = combine_exact_lower(replay.lower, &exact_constant) {
                 if candidate > lower_bound {
-                    predicate_multipliers =
-                        clone_f64(supplied, "accepted Box-cut predicate multipliers")?;
+                    predicate_multipliers = clone_f64_with_gate(
+                        supplied,
+                        "accepted Box-cut predicate multipliers",
+                        "M24 accepted predicate-multiplier clone",
+                        gate,
+                    )?;
                     lower_bound = candidate;
                     supplied_predicate_multipliers_used = true;
                 }
@@ -2778,12 +6589,25 @@ fn build_auxiliary_box_cut_certificate_with_original_hull(
         }
     }
 
+    let accepted_upper = clone_f64_with_gate(
+        upper_box_multipliers,
+        "accepted upper Box multipliers",
+        "M24 accepted upper Box-multiplier clone",
+        gate,
+    )?;
+    let accepted_lower = clone_f64_with_gate(
+        lower_box_multipliers,
+        "accepted lower Box multipliers",
+        "M24 accepted lower Box-multiplier clone",
+        gate,
+    )?;
+    gate.checkpoint("M24 exact Box-cut publication")?;
     Ok(ReluTailBoxCutCertificate {
         lower_bound,
         zero_predicate_lower_bound,
         replay_direction,
-        upper_box_multipliers: clone_f64(upper_box_multipliers, "accepted upper Box multipliers")?,
-        lower_box_multipliers: clone_f64(lower_box_multipliers, "accepted lower Box multipliers")?,
+        upper_box_multipliers: accepted_upper,
+        lower_box_multipliers: accepted_lower,
         predicate_multipliers,
         exact_constant,
         supplied_predicate_multipliers_used,
@@ -2843,7 +6667,8 @@ enum SuppliedReplayOutcome {
     AllocationFallback,
 }
 
-fn replay_direction(
+#[allow(clippy::too_many_arguments)]
+fn replay_direction_with_gate<G>(
     domain: &ConstrainedZonotope64,
     exact_constant: &BigRational,
     variables: &[SlopeVariable],
@@ -2851,19 +6676,52 @@ fn replay_direction(
     zero: &[f64],
     supplied: Option<&[f64]>,
     best: &mut AcceptedCandidate,
-) -> CandidateReplayOutcome {
-    replay_direction_with_cloner(
-        domain,
-        exact_constant,
-        variables,
+    gate: &mut G,
+) -> Result<CandidateReplayOutcome, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    if !valid_direction_slopes_with_gate(&direction, variables, gate)? {
+        return Ok(CandidateReplayOutcome::Rejected);
+    }
+    let bounds =
+        match evaluate_constrained_zonotope64_dual_with_call_gate(domain, &direction, zero, gate) {
+            Ok(bounds) => bounds,
+            Err(ConstrainedZonotopeDualBudgetError::Evaluation(_)) => {
+                return Ok(CandidateReplayOutcome::Rejected);
+            }
+            Err(ConstrainedZonotopeDualBudgetError::Budget(error)) => return Err(error.into()),
+        };
+    gate.charge_items(1, "ReLU-tail exact replay combination")?;
+    let Ok(zero_lower) = combine_exact_lower(bounds.lower, exact_constant) else {
+        return Ok(CandidateReplayOutcome::Rejected);
+    };
+    let Some(candidate_multipliers) =
+        candidate_clone_f64_with_gate(zero, "ReLU-tail replay multiplier clone", gate)?
+    else {
+        return Ok(CandidateReplayOutcome::AllocationFallback);
+    };
+    let mut candidate = AcceptedCandidate {
+        lower: zero_lower,
+        zero_lower,
         direction,
-        zero,
-        supplied,
-        best,
-        &mut candidate_clone_f64,
-    )
+        multipliers: candidate_multipliers,
+        supplied_used: false,
+    };
+    let supplied_outcome =
+        maybe_replay_supplied_with_gate(domain, exact_constant, supplied, &mut candidate, gate)?;
+    if candidate.lower > best.lower {
+        *best = candidate;
+    }
+    Ok(match supplied_outcome {
+        SuppliedReplayOutcome::ReplayedOrUnused => CandidateReplayOutcome::Replayed {
+            zero_predicate_lower_bound: zero_lower,
+        },
+        SuppliedReplayOutcome::AllocationFallback => CandidateReplayOutcome::AllocationFallback,
+    })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn replay_direction_with_cloner<F>(
     domain: &ConstrainedZonotope64,
@@ -2915,21 +6773,52 @@ where
     }
 }
 
-fn maybe_replay_supplied(
+fn maybe_replay_supplied_with_gate<G>(
     domain: &ConstrainedZonotope64,
     exact_constant: &BigRational,
     supplied: Option<&[f64]>,
     candidate: &mut AcceptedCandidate,
-) -> SuppliedReplayOutcome {
-    maybe_replay_supplied_with_cloner(
+    gate: &mut G,
+) -> Result<SuppliedReplayOutcome, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let Some(supplied) = supplied else {
+        return Ok(SuppliedReplayOutcome::ReplayedOrUnused);
+    };
+    let bounds = match evaluate_constrained_zonotope64_dual_with_call_gate(
         domain,
-        exact_constant,
+        &candidate.direction,
         supplied,
-        candidate,
-        &mut candidate_clone_f64,
-    )
+        gate,
+    ) {
+        Ok(bounds) => bounds,
+        Err(ConstrainedZonotopeDualBudgetError::Evaluation(_)) => {
+            return Ok(SuppliedReplayOutcome::ReplayedOrUnused);
+        }
+        Err(ConstrainedZonotopeDualBudgetError::Budget(error)) => return Err(error.into()),
+    };
+    gate.charge_items(1, "ReLU-tail supplied replay combination")?;
+    let Ok(lower) = combine_exact_lower(bounds.lower, exact_constant) else {
+        return Ok(SuppliedReplayOutcome::ReplayedOrUnused);
+    };
+    if lower > candidate.lower {
+        let Some(accepted_multipliers) = candidate_clone_f64_with_gate(
+            supplied,
+            "ReLU-tail accepted supplied-multiplier clone",
+            gate,
+        )?
+        else {
+            return Ok(SuppliedReplayOutcome::AllocationFallback);
+        };
+        candidate.lower = lower;
+        candidate.multipliers = accepted_multipliers;
+        candidate.supplied_used = true;
+    }
+    Ok(SuppliedReplayOutcome::ReplayedOrUnused)
 }
 
+#[cfg(test)]
 fn maybe_replay_supplied_with_cloner<F>(
     domain: &ConstrainedZonotope64,
     exact_constant: &BigRational,
@@ -2960,21 +6849,55 @@ where
     SuppliedReplayOutcome::ReplayedOrUnused
 }
 
-fn valid_supplied_multipliers(supplied: Option<&[f64]>, expected: usize) -> Option<&[f64]> {
-    let supplied = supplied?;
-    (supplied.len() == expected
-        && supplied
-            .iter()
-            .all(|value| value.is_finite() && *value >= 0.0))
-    .then_some(supplied)
+fn valid_supplied_multipliers_with_gate<'a, G>(
+    supplied: Option<&'a [f64]>,
+    expected: usize,
+    gate: &mut G,
+) -> Result<Option<&'a [f64]>, ConstrainedZonotopeCallBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let Some(supplied) = supplied else {
+        return Ok(None);
+    };
+    if supplied.len() != expected {
+        return Ok(None);
+    }
+    for &value in supplied {
+        gate.charge_items(1, "ReLU-tail supplied-multiplier validation")?;
+        if !value.is_finite() || value < 0.0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(supplied))
 }
 
+#[cfg(test)]
 fn valid_direction_slopes(direction: &[f64], variables: &[SlopeVariable]) -> bool {
     variables.iter().all(|variable| {
         direction.get(variable.coordinate).is_some_and(|&slope| {
             slope.is_finite() && valid_direct_slope(slope, &variable.exact_upper)
         })
     })
+}
+
+fn valid_direction_slopes_with_gate<G>(
+    direction: &[f64],
+    variables: &[SlopeVariable],
+    gate: &mut G,
+) -> Result<bool, ConstrainedZonotopeCallBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    for variable in variables {
+        gate.charge_items(1, "ReLU-tail replay-slope validation")?;
+        if direction.get(variable.coordinate).is_none_or(|&slope| {
+            !slope.is_finite() || !valid_direct_slope(slope, &variable.exact_upper)
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn valid_direct_slope(slope: f64, exact_upper: &BigRational) -> bool {
@@ -3016,6 +6939,25 @@ enum CandidateFailure {
     Allocation(usize),
 }
 
+#[derive(Clone, Debug)]
+enum GatedCandidateFailure {
+    Deadline(usize),
+    NonFinite(usize),
+    Allocation(usize),
+    Budget(ConstrainedZonotopeCallBudgetError),
+}
+
+impl From<CandidateFailure> for GatedCandidateFailure {
+    fn from(failure: CandidateFailure) -> Self {
+        match failure {
+            CandidateFailure::Deadline(iterations) => Self::Deadline(iterations),
+            CandidateFailure::NonFinite(iterations) => Self::NonFinite(iterations),
+            CandidateFailure::Allocation(iterations) => Self::Allocation(iterations),
+        }
+    }
+}
+
+#[cfg(test)]
 fn projected_adam_candidate(
     domain: &ConstrainedZonotope64,
     variables: &[SlopeVariable],
@@ -3026,52 +6968,171 @@ fn projected_adam_candidate(
     projected_adam_candidate_with_clock(domain, variables, direction, config, || start.elapsed())
 }
 
+#[cfg(test)]
 fn projected_adam_candidate_with_clock<C>(
     domain: &ConstrainedZonotope64,
     variables: &[SlopeVariable],
-    mut direction: Vec<f64>,
+    direction: Vec<f64>,
     config: ReluTailDualConfig,
     elapsed: C,
 ) -> Result<(Vec<f64>, usize), CandidateFailure>
 where
     C: FnMut() -> Duration,
 {
+    let mut gate = InertConstrainedZonotopeCallGate;
+    match projected_adam_candidate_with_clock_and_gate(
+        domain, variables, direction, config, elapsed, &mut gate,
+    ) {
+        Ok(result) => Ok(result),
+        Err(GatedCandidateFailure::Deadline(iterations)) => {
+            Err(CandidateFailure::Deadline(iterations))
+        }
+        Err(GatedCandidateFailure::NonFinite(iterations)) => {
+            Err(CandidateFailure::NonFinite(iterations))
+        }
+        Err(GatedCandidateFailure::Allocation(iterations)) => {
+            Err(CandidateFailure::Allocation(iterations))
+        }
+        Err(GatedCandidateFailure::Budget(_)) => {
+            unreachable!("the inert candidate call gate cannot refuse work")
+        }
+    }
+}
+
+fn projected_adam_candidate_with_call_gate<G>(
+    domain: &ConstrainedZonotope64,
+    variables: &[SlopeVariable],
+    direction: Vec<f64>,
+    config: ReluTailDualConfig,
+    gate: &mut G,
+) -> Result<(Vec<f64>, usize), GatedCandidateFailure>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let start = Instant::now();
+    projected_adam_candidate_with_clock_and_gate(
+        domain,
+        variables,
+        direction,
+        config,
+        || start.elapsed(),
+        gate,
+    )
+}
+
+fn projected_adam_candidate_with_clock_and_gate<C, G>(
+    domain: &ConstrainedZonotope64,
+    variables: &[SlopeVariable],
+    mut direction: Vec<f64>,
+    config: ReluTailDualConfig,
+    elapsed: C,
+    gate: &mut G,
+) -> Result<(Vec<f64>, usize), GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
     let mut deadline = CandidateDeadline::new(config.wall_time, elapsed);
     // The candidate-only clock starts inside the wrapper above.  Check it
     // before any allocation, initialization, or approximate scoring work.
-    deadline.checkpoint(0)?;
-    let mut first = candidate_zeros(variables.len(), 0, &mut deadline)?;
-    let mut second = candidate_zeros(variables.len(), 0, &mut deadline)?;
-    let mut gradient = candidate_zeros(variables.len(), 0, &mut deadline)?;
-    let mut variable_slot = candidate_usizes(domain.value_dim(), 0, &mut deadline)?;
+    gated_candidate_checkpoint(&mut deadline, 0, gate, "ReLU-tail candidate startup")?;
+    let mut first = gated_candidate_zeros(
+        variables.len(),
+        0,
+        &mut deadline,
+        gate,
+        "ReLU-tail first-moment initialization",
+    )?;
+    let mut second = gated_candidate_zeros(
+        variables.len(),
+        0,
+        &mut deadline,
+        gate,
+        "ReLU-tail second-moment initialization",
+    )?;
+    let mut gradient = gated_candidate_zeros(
+        variables.len(),
+        0,
+        &mut deadline,
+        gate,
+        "ReLU-tail gradient initialization",
+    )?;
+    let mut variable_slot = gated_candidate_usizes(
+        domain.value_dim(),
+        0,
+        &mut deadline,
+        gate,
+        "ReLU-tail candidate coordinate-map initialization",
+    )?;
     for (slot, variable) in variables.iter().enumerate() {
-        deadline.visit(0)?;
+        gated_candidate_visit(
+            &mut deadline,
+            0,
+            gate,
+            "ReLU-tail candidate coordinate-map construction",
+        )?;
         variable_slot[variable.coordinate] = slot;
     }
-    let mut best = candidate_clone_with_deadline(&direction, 0, &mut deadline)?;
-    let mut best_objective =
-        approximate_zero_multiplier_objective(domain, &direction, 0, &mut deadline)?;
+    let mut best = gated_candidate_clone_with_deadline(
+        &direction,
+        0,
+        &mut deadline,
+        gate,
+        "ReLU-tail candidate best-direction clone",
+    )?;
+    let mut best_objective = approximate_zero_multiplier_objective_with_gate(
+        domain,
+        &direction,
+        0,
+        &mut deadline,
+        gate,
+    )?;
 
     for iteration in 0..config.iterations {
-        deadline.checkpoint(iteration)?;
+        gated_candidate_checkpoint(
+            &mut deadline,
+            iteration,
+            gate,
+            "ReLU-tail candidate iteration",
+        )?;
         for value in &mut gradient {
-            deadline.visit(iteration)?;
+            gated_candidate_visit(
+                &mut deadline,
+                iteration,
+                gate,
+                "ReLU-tail candidate gradient clearing",
+            )?;
             *value = 0.0;
         }
         for (slot, variable) in variables.iter().enumerate() {
-            deadline.visit(iteration)?;
+            gated_candidate_visit(
+                &mut deadline,
+                iteration,
+                gate,
+                "ReLU-tail candidate center gradient",
+            )?;
             gradient[slot] =
                 domain.center()[variable.coordinate] - domain.box_remainder()[variable.coordinate];
         }
         for generator in domain.generators() {
             // Count and check every generator column, including empty ones.
-            deadline.visit(iteration)?;
+            gated_candidate_visit(
+                &mut deadline,
+                iteration,
+                gate,
+                "ReLU-tail candidate generator-column gradient",
+            )?;
             let mut projection = 0.0_f64;
             for (coordinate, coefficient) in generator.entries() {
-                deadline.visit(iteration)?;
+                gated_candidate_visit(
+                    &mut deadline,
+                    iteration,
+                    gate,
+                    "ReLU-tail candidate generator-entry projection",
+                )?;
                 projection += direction[coordinate] * coefficient;
                 if !projection.is_finite() {
-                    return Err(CandidateFailure::NonFinite(iteration));
+                    return Err(GatedCandidateFailure::NonFinite(iteration));
                 }
             }
             let sign = if projection > 0.0 {
@@ -3083,7 +7144,12 @@ where
             };
             if sign != 0.0 {
                 for (coordinate, coefficient) in generator.entries() {
-                    deadline.visit(iteration)?;
+                    gated_candidate_visit(
+                        &mut deadline,
+                        iteration,
+                        gate,
+                        "ReLU-tail candidate sparse-gradient replay",
+                    )?;
                     let slot = variable_slot[coordinate];
                     if slot != usize::MAX {
                         gradient[slot] -= sign * coefficient;
@@ -3092,8 +7158,8 @@ where
             }
         }
 
-        let step =
-            i32::try_from(iteration + 1).map_err(|_| CandidateFailure::NonFinite(iteration))?;
+        let step = i32::try_from(iteration + 1)
+            .map_err(|_| GatedCandidateFailure::NonFinite(iteration))?;
         let first_correction = 1.0 - config.beta1.powi(step);
         let second_correction = 1.0 - config.beta2.powi(step);
         if !first_correction.is_finite()
@@ -3101,10 +7167,15 @@ where
             || first_correction <= 0.0
             || second_correction <= 0.0
         {
-            return Err(CandidateFailure::NonFinite(iteration));
+            return Err(GatedCandidateFailure::NonFinite(iteration));
         }
         for (slot, variable) in variables.iter().enumerate() {
-            deadline.visit(iteration)?;
+            gated_candidate_visit(
+                &mut deadline,
+                iteration,
+                gate,
+                "ReLU-tail candidate Adam update",
+            )?;
             first[slot] = config.beta1 * first[slot] + (1.0 - config.beta1) * gradient[slot];
             second[slot] = config.beta2 * second[slot]
                 + (1.0 - config.beta2) * gradient[slot] * gradient[slot];
@@ -3118,57 +7189,207 @@ where
                 || !candidate.is_finite()
                 || !valid_direct_slope(candidate, &variable.exact_upper)
             {
-                return Err(CandidateFailure::NonFinite(iteration));
+                return Err(GatedCandidateFailure::NonFinite(iteration));
             }
             direction[variable.coordinate] = canonical_zero(candidate);
         }
         let completed = iteration + 1;
-        let objective =
-            approximate_zero_multiplier_objective(domain, &direction, completed, &mut deadline)?;
+        let objective = approximate_zero_multiplier_objective_with_gate(
+            domain,
+            &direction,
+            completed,
+            &mut deadline,
+            gate,
+        )?;
         if objective > best_objective {
             best_objective = objective;
-            copy_candidate_direction(&mut best, &direction, completed, &mut deadline)?;
+            gated_copy_candidate_direction(&mut best, &direction, completed, &mut deadline, gate)?;
         }
     }
-    deadline.checkpoint(config.iterations)?;
+    gated_candidate_checkpoint(
+        &mut deadline,
+        config.iterations,
+        gate,
+        "ReLU-tail candidate completion",
+    )?;
     Ok((best, config.iterations))
 }
 
-fn approximate_zero_multiplier_objective<C>(
+fn gated_candidate_checkpoint<C, G>(
+    deadline: &mut CandidateDeadline<C>,
+    iterations: usize,
+    gate: &mut G,
+    checkpoint: &'static str,
+) -> Result<(), GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint(checkpoint)
+        .map_err(GatedCandidateFailure::Budget)?;
+    deadline
+        .checkpoint(iterations)
+        .map_err(GatedCandidateFailure::from)
+}
+
+fn gated_candidate_visit<C, G>(
+    deadline: &mut CandidateDeadline<C>,
+    iterations: usize,
+    gate: &mut G,
+    checkpoint: &'static str,
+) -> Result<(), GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.charge_items(1, checkpoint)
+        .map_err(GatedCandidateFailure::Budget)?;
+    deadline
+        .visit(iterations)
+        .map_err(GatedCandidateFailure::from)
+}
+
+fn approximate_zero_multiplier_objective_with_gate<C, G>(
     domain: &ConstrainedZonotope64,
     direction: &[f64],
     iterations: usize,
     deadline: &mut CandidateDeadline<C>,
-) -> Result<f64, CandidateFailure>
+    gate: &mut G,
+) -> Result<f64, GatedCandidateFailure>
 where
     C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
 {
     let mut value = 0.0_f64;
     for coordinate in 0..domain.value_dim() {
-        deadline.visit(iterations)?;
+        gated_candidate_visit(
+            deadline,
+            iterations,
+            gate,
+            "ReLU-tail candidate coordinate score",
+        )?;
         value += direction[coordinate] * domain.center()[coordinate];
         value -= direction[coordinate].abs() * domain.box_remainder()[coordinate];
         if !value.is_finite() {
-            return Err(CandidateFailure::NonFinite(iterations));
+            return Err(GatedCandidateFailure::NonFinite(iterations));
         }
     }
     for generator in domain.generators() {
-        // Empty generator columns still consume bounded candidate time.
-        deadline.visit(iterations)?;
+        gated_candidate_visit(
+            deadline,
+            iterations,
+            gate,
+            "ReLU-tail candidate generator-column score",
+        )?;
         let mut projection = 0.0_f64;
         for (coordinate, coefficient) in generator.entries() {
-            deadline.visit(iterations)?;
+            gated_candidate_visit(
+                deadline,
+                iterations,
+                gate,
+                "ReLU-tail candidate generator-entry score",
+            )?;
             projection += direction[coordinate] * coefficient;
             if !projection.is_finite() {
-                return Err(CandidateFailure::NonFinite(iterations));
+                return Err(GatedCandidateFailure::NonFinite(iterations));
             }
         }
         value -= projection.abs();
         if !value.is_finite() {
-            return Err(CandidateFailure::NonFinite(iterations));
+            return Err(GatedCandidateFailure::NonFinite(iterations));
         }
     }
     Ok(value)
+}
+
+fn gated_candidate_zeros<C, G>(
+    count: usize,
+    iterations: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+    checkpoint: &'static str,
+) -> Result<Vec<f64>, GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| GatedCandidateFailure::Allocation(iterations))?;
+    for _ in 0..count {
+        gated_candidate_visit(deadline, iterations, gate, checkpoint)?;
+        values.push(0.0);
+    }
+    Ok(values)
+}
+
+fn gated_candidate_usizes<C, G>(
+    count: usize,
+    iterations: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+    checkpoint: &'static str,
+) -> Result<Vec<usize>, GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| GatedCandidateFailure::Allocation(iterations))?;
+    for _ in 0..count {
+        gated_candidate_visit(deadline, iterations, gate, checkpoint)?;
+        values.push(usize::MAX);
+    }
+    Ok(values)
+}
+
+fn gated_candidate_clone_with_deadline<C, G>(
+    source: &[f64],
+    iterations: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+    checkpoint: &'static str,
+) -> Result<Vec<f64>, GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(source.len())
+        .map_err(|_| GatedCandidateFailure::Allocation(iterations))?;
+    for &value in source {
+        gated_candidate_visit(deadline, iterations, gate, checkpoint)?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn gated_copy_candidate_direction<C, G>(
+    target: &mut [f64],
+    source: &[f64],
+    iterations: usize,
+    deadline: &mut CandidateDeadline<C>,
+    gate: &mut G,
+) -> Result<(), GatedCandidateFailure>
+where
+    C: FnMut() -> Duration,
+    G: ConstrainedZonotopeCallGate,
+{
+    debug_assert_eq!(target.len(), source.len());
+    for (target, &source) in target.iter_mut().zip(source) {
+        gated_candidate_visit(
+            deadline,
+            iterations,
+            gate,
+            "ReLU-tail candidate best-direction copy",
+        )?;
+        *target = source;
+    }
+    Ok(())
 }
 
 fn candidate_zeros<C>(
@@ -3188,61 +7409,6 @@ where
         values.push(0.0);
     }
     Ok(values)
-}
-
-fn candidate_usizes<C>(
-    count: usize,
-    iterations: usize,
-    deadline: &mut CandidateDeadline<C>,
-) -> Result<Vec<usize>, CandidateFailure>
-where
-    C: FnMut() -> Duration,
-{
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|_| CandidateFailure::Allocation(iterations))?;
-    for _ in 0..count {
-        deadline.visit(iterations)?;
-        values.push(usize::MAX);
-    }
-    Ok(values)
-}
-
-fn candidate_clone_with_deadline<C>(
-    source: &[f64],
-    iterations: usize,
-    deadline: &mut CandidateDeadline<C>,
-) -> Result<Vec<f64>, CandidateFailure>
-where
-    C: FnMut() -> Duration,
-{
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(source.len())
-        .map_err(|_| CandidateFailure::Allocation(iterations))?;
-    for &value in source {
-        deadline.visit(iterations)?;
-        values.push(value);
-    }
-    Ok(values)
-}
-
-fn copy_candidate_direction<C>(
-    target: &mut [f64],
-    source: &[f64],
-    iterations: usize,
-    deadline: &mut CandidateDeadline<C>,
-) -> Result<(), CandidateFailure>
-where
-    C: FnMut() -> Duration,
-{
-    debug_assert_eq!(target.len(), source.len());
-    for (target, &source) in target.iter_mut().zip(source) {
-        deadline.visit(iterations)?;
-        *target = source;
-    }
-    Ok(())
 }
 
 struct CandidateDeadline<C> {
@@ -3465,12 +7631,120 @@ fn check_declared_rationals(
     )
 }
 
+fn check_declared_rationals_with_gate<G>(
+    coefficients: &[BigRational],
+    bias: &BigRational,
+    gate: &mut G,
+) -> Result<(), ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    check_rationals_with_gate(
+        coefficients,
+        bias,
+        RELU_TAIL_DUAL_HARD_MAX_INPUT_RATIONAL_BITS,
+        gate,
+    )
+}
+
+fn check_internally_pulled_rationals_with_gate<G>(
+    coefficients: &[BigRational],
+    bias: &BigRational,
+    gate: &mut G,
+) -> Result<(), ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    check_rationals_with_gate(
+        coefficients,
+        bias,
+        RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS,
+        gate,
+    )
+}
+
+fn check_rationals_with_gate<G>(
+    coefficients: &[BigRational],
+    bias: &BigRational,
+    per_term_limit: u64,
+    gate: &mut G,
+) -> Result<(), ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    require_resource_limit(
+        "objective coefficients",
+        u64::try_from(coefficients.len()).unwrap_or(u64::MAX),
+        RELU_TAIL_DUAL_HARD_MAX_VALUE_DIM as u64,
+    )?;
+    let mut total = 0_u64;
+    for (index, coefficient) in coefficients.iter().enumerate() {
+        gate.charge_items(1, "ReLU-tail declared-rational validation")?;
+        let bits = rational_bits(coefficient);
+        if bits > per_term_limit {
+            return Err(ReluTailDualError::RationalInputLimit {
+                field: "coefficients",
+                index,
+                bits,
+                limit: per_term_limit,
+            }
+            .into());
+        }
+        total = total
+            .checked_add(bits)
+            .ok_or(ReluTailDualError::ResourceOverflow {
+                resource: "total objective rational bits",
+            })?;
+    }
+    let bias_bits = rational_bits(bias);
+    if bias_bits > per_term_limit {
+        return Err(ReluTailDualError::RationalInputLimit {
+            field: "bias",
+            index: 0,
+            bits: bias_bits,
+            limit: per_term_limit,
+        }
+        .into());
+    }
+    total = total
+        .checked_add(bias_bits)
+        .ok_or(ReluTailDualError::ResourceOverflow {
+            resource: "total objective rational bits",
+        })?;
+    require_resource_limit(
+        "total objective rational bits",
+        total,
+        RELU_TAIL_DUAL_HARD_MAX_TOTAL_RATIONAL_BITS,
+    )?;
+    Ok(())
+}
+
 fn check_mandatory_resources(
     domain: &ConstrainedZonotope64,
     margin: &ExactReluTailMargin,
 ) -> Result<usize, ReluTailDualError> {
     check_mandatory_margin_resources(domain.value_dim(), margin)?;
     check_mandatory_domain_resources(domain)
+}
+
+fn check_mandatory_resources_with_gate<G>(
+    domain: &ConstrainedZonotope64,
+    margin: &ExactReluTailMargin,
+    gate: &mut G,
+) -> Result<usize, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    if margin.coefficients.len() != domain.value_dim() {
+        return Err(ReluTailDualError::Shape {
+            field: "margin coefficients",
+            expected: domain.value_dim(),
+            got: margin.coefficients.len(),
+        }
+        .into());
+    }
+    check_declared_rationals_with_gate(&margin.coefficients, &margin.bias, gate)?;
+    check_mandatory_domain_resources_with_gate(domain, gate)
 }
 
 fn check_mandatory_margin_resources(
@@ -3485,6 +7759,25 @@ fn check_mandatory_margin_resources(
         });
     }
     check_declared_rationals(&margin.coefficients, &margin.bias)
+}
+
+fn check_mandatory_margin_resources_with_gate<G>(
+    value_dim: usize,
+    margin: &ExactReluTailMargin,
+    gate: &mut G,
+) -> Result<(), ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    if margin.coefficients.len() != value_dim {
+        return Err(ReluTailDualError::Shape {
+            field: "margin coefficients",
+            expected: value_dim,
+            got: margin.coefficients.len(),
+        }
+        .into());
+    }
+    check_declared_rationals_with_gate(&margin.coefficients, &margin.bias, gate)
 }
 
 fn check_mandatory_domain_resources(
@@ -3537,6 +7830,60 @@ fn check_mandatory_domain_resources(
     Ok(generator_nonzeros)
 }
 
+fn check_mandatory_domain_resources_with_gate<G>(
+    domain: &ConstrainedZonotope64,
+    gate: &mut G,
+) -> Result<usize, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    require_resource_limit(
+        "value dimension",
+        u64::try_from(domain.value_dim()).unwrap_or(u64::MAX),
+        RELU_TAIL_DUAL_HARD_MAX_VALUE_DIM as u64,
+    )?;
+    require_resource_limit(
+        "alpha dimension",
+        u64::try_from(domain.alpha_dim()).unwrap_or(u64::MAX),
+        RELU_TAIL_DUAL_HARD_MAX_ALPHA_DIM as u64,
+    )?;
+    require_resource_limit(
+        "constraints",
+        u64::try_from(domain.constraint_count()).unwrap_or(u64::MAX),
+        RELU_TAIL_DUAL_HARD_MAX_CONSTRAINTS as u64,
+    )?;
+    let constraint_elements = domain
+        .constraint_count()
+        .checked_mul(domain.alpha_dim())
+        .ok_or(ReluTailDualError::ResourceOverflow {
+            resource: "constraint elements",
+        })?;
+    require_resource_limit(
+        "constraint elements",
+        u64::try_from(constraint_elements).unwrap_or(u64::MAX),
+        RELU_TAIL_DUAL_HARD_MAX_CONSTRAINT_ELEMENTS as u64,
+    )?;
+    let generator_nonzeros = generator_nonzeros_with_gate(domain, gate)?;
+    require_resource_limit(
+        "generator nonzeros",
+        u64::try_from(generator_nonzeros).unwrap_or(u64::MAX),
+        RELU_TAIL_DUAL_HARD_MAX_GENERATOR_NONZEROS as u64,
+    )?;
+    let terms = (constraint_elements as u128)
+        .checked_add(generator_nonzeros as u128)
+        .and_then(|value| value.checked_add(domain.value_dim() as u128))
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(ReluTailDualError::ResourceOverflow {
+            resource: "mandatory baseline terms",
+        })?;
+    require_resource_limit(
+        "mandatory baseline terms",
+        terms,
+        RELU_TAIL_DUAL_HARD_MAX_BASELINE_TERMS,
+    )?;
+    Ok(generator_nonzeros)
+}
+
 fn generator_nonzeros(domain: &ConstrainedZonotope64) -> Result<usize, ReluTailDualError> {
     domain.generators().iter().try_fold(0_usize, |sum, column| {
         sum.checked_add(column.nnz())
@@ -3544,6 +7891,301 @@ fn generator_nonzeros(domain: &ConstrainedZonotope64) -> Result<usize, ReluTailD
                 resource: "generator nonzeros",
             })
     })
+}
+
+fn generator_nonzeros_with_gate<G>(
+    domain: &ConstrainedZonotope64,
+    gate: &mut G,
+) -> Result<usize, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut nonzeros = 0_usize;
+    for column in domain.generators() {
+        gate.charge_items(1, "ReLU-tail generator geometry validation")?;
+        nonzeros =
+            nonzeros
+                .checked_add(column.nnz())
+                .ok_or(ReluTailDualError::ResourceOverflow {
+                    resource: "generator nonzeros",
+                })?;
+    }
+    Ok(nonzeros)
+}
+
+fn prepared_relu_tail_geometry_live_bytes(
+    value_dim: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let retained_rationals =
+        value_dim
+            .checked_mul(2)
+            .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "prepared ReLU-tail retained rational count",
+            })?;
+    let mut live = ConstrainedZonotopePeakLiveBytes::new();
+    live.add_bytes(
+        size_of::<PreparedReluTailGeometry64<'static>>(),
+        "prepared ReLU-tail geometry header bytes",
+    )?;
+    live.add_elements::<(BigRational, BigRational)>(
+        value_dim,
+        "prepared ReLU-tail coordinate-pair storage",
+    )?;
+    live.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        retained_rationals,
+        "prepared ReLU-tail retained rational payloads",
+    )?;
+    Ok(live.finish())
+}
+
+fn exact_relu_tail_margin_live_bytes(
+    value_dim: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let rational_count =
+        value_dim
+            .checked_add(1)
+            .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "exact ReLU-tail margin rational count",
+            })?;
+    let mut live = ConstrainedZonotopePeakLiveBytes::new();
+    live.add_bytes(
+        size_of::<ExactReluTailMargin>(),
+        "exact ReLU-tail margin header bytes",
+    )?;
+    live.add_elements::<BigRational>(value_dim, "exact ReLU-tail margin coefficient storage")?;
+    live.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        rational_count,
+        "exact ReLU-tail margin rational payloads",
+    )?;
+    Ok(live.finish())
+}
+
+fn exact_relu_tail_margin_peak_live_bytes(
+    value_dim: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_bytes(
+        exact_relu_tail_margin_live_bytes(value_dim)?,
+        "retained exact pulled-margin bytes",
+    )?;
+    peak.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        RELU_TAIL_TRANSIENT_RATIONAL_SLOTS,
+        "exact pulled-margin transient rational payloads",
+    )?;
+    Ok(peak.finish())
+}
+
+fn prepared_relu_tail_geometry_peak_live_bytes(
+    value_dim: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let retained = prepared_relu_tail_geometry_live_bytes(value_dim)?;
+    let scratch_rationals = value_dim
+        .checked_add(RELU_TAIL_TRANSIENT_RATIONAL_SLOTS)
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "prepared ReLU-tail scratch rational count",
+        })?;
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_bytes(retained, "prepared ReLU-tail retained geometry bytes")?;
+    peak.add_elements::<BigRational>(value_dim, "prepared ReLU-tail coordinate-radius storage")?;
+    peak.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        scratch_rationals,
+        "prepared ReLU-tail exact scratch rational payloads",
+    )?;
+    Ok(peak.finish())
+}
+
+fn relu_tail_dual_result_live_bytes(
+    value_dim: usize,
+    constraints: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let mut live = ConstrainedZonotopePeakLiveBytes::new();
+    live.add_bytes(
+        size_of::<ReluTailDualResult>(),
+        "retained ReLU-tail result header bytes",
+    )?;
+    live.add_elements::<f64>(value_dim, "retained ReLU-tail direction storage")?;
+    live.add_elements::<f64>(constraints, "retained ReLU-tail multiplier storage")?;
+    live.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        1,
+        "retained ReLU-tail exact-constant payload",
+    )?;
+    Ok(live.finish())
+}
+
+fn relu_tail_box_cut_certificate_live_bytes(
+    value_dim: usize,
+    constraints: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let value_vectors =
+        value_dim
+            .checked_mul(3)
+            .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "retained M24 certificate value-vector elements",
+            })?;
+    let mut live = ConstrainedZonotopePeakLiveBytes::new();
+    live.add_bytes(
+        size_of::<ReluTailBoxCutCertificate>(),
+        "retained M24 certificate header bytes",
+    )?;
+    live.add_elements::<f64>(value_vectors, "retained M24 certificate value vectors")?;
+    live.add_elements::<f64>(
+        constraints,
+        "retained M24 certificate predicate multipliers",
+    )?;
+    live.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        1,
+        "retained M24 certificate exact-constant payload",
+    )?;
+    Ok(live.finish())
+}
+
+fn box_cut_endpoint_count_peak_live_bytes() -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        2,
+        "M24 endpoint-count exact scratch rationals",
+    )?;
+    Ok(peak.finish())
+}
+
+fn box_cut_search_peak_live_bytes(
+    plan: ReluTailBoxCutOptimizerPlan,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    // The active restart owns five Box-length buffers. At restart R it can
+    // overlap only R-1 previously published candidates, hence R+4 rather than
+    // R+5. After publication the five restart-local buffers have been dropped.
+    let retained_and_current_box_buffers = plan
+        .restarts
+        .checked_add(4)
+        .and_then(|buffers| buffers.checked_mul(plan.box_variables))
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "M24 search Box-buffer elements",
+        })?;
+    let float_elements = plan
+        .value_dim
+        .checked_mul(2)
+        .and_then(|elements| elements.checked_add(retained_and_current_box_buffers))
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "M24 aggregate search f64 elements",
+        })?;
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_bytes(
+        size_of::<BoxApproximateSearch>(),
+        "M24 search result header bytes",
+    )?;
+    peak.add_elements::<BoxSearchVariable>(plan.box_variables, "M24 search variables")?;
+    peak.add_elements::<Vec<f64>>(plan.restarts, "M24 search candidate headers")?;
+    peak.add_elements::<f64>(float_elements, "M24 search scratch and retained candidates")?;
+    peak.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        2,
+        "M24 search exact endpoint scratch rationals",
+    )?;
+    Ok(peak.finish())
+}
+
+fn box_cut_search_retained_live_bytes(
+    plan: ReluTailBoxCutOptimizerPlan,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let candidate_elements = plan.box_variables.checked_mul(plan.restarts).ok_or(
+        ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "retained M24 candidate elements",
+        },
+    )?;
+    let mut live = ConstrainedZonotopePeakLiveBytes::new();
+    live.add_bytes(
+        size_of::<BoxApproximateSearch>(),
+        "retained M24 search header bytes",
+    )?;
+    live.add_elements::<BoxSearchVariable>(plan.box_variables, "retained M24 search variables")?;
+    live.add_elements::<Vec<f64>>(plan.restarts, "retained M24 candidate headers")?;
+    live.add_elements::<f64>(candidate_elements, "retained M24 candidate values")?;
+    Ok(live.finish())
+}
+
+fn box_cut_exact_replay_peak_live_bytes(
+    value_dim: usize,
+    constraints: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let value_elements =
+        value_dim
+            .checked_mul(5)
+            .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "M24 exact replay value-vector elements",
+            })?;
+    let constraint_elements =
+        constraints
+            .checked_mul(2)
+            .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "M24 exact replay predicate-vector elements",
+            })?;
+    let rational_slots = RELU_TAIL_BOX_CUT_TRANSIENT_RATIONAL_SLOTS
+        .checked_add(1)
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "M24 exact replay rational slots",
+        })?;
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_bytes(
+        size_of::<ReluTailBoxCutCertificate>() + 2 * size_of::<Vec<f64>>(),
+        "M24 exact replay result and expanded-vector headers",
+    )?;
+    peak.add_elements::<f64>(value_elements, "M24 exact replay value vectors")?;
+    peak.add_elements::<f64>(constraint_elements, "M24 exact replay predicate vectors")?;
+    peak.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        rational_slots,
+        "M24 exact replay rational payloads",
+    )?;
+    peak.add_bytes(
+        DUAL_SHAPE_ERROR_LIVE_BYTES,
+        "M24 nested dual error allowance",
+    )?;
+    Ok(peak.finish())
+}
+
+fn relu_tail_peak_live_bytes(
+    domain: &ConstrainedZonotope64,
+    _generator_nonzeros: usize,
+) -> Result<usize, ConstrainedZonotopeCallBudgetError> {
+    let value_dim = domain.value_dim();
+    let constraints = domain.constraint_count();
+    let rational_slots = value_dim
+        .checked_mul(4)
+        .and_then(|slots| slots.checked_add(RELU_TAIL_TRANSIENT_RATIONAL_SLOTS))
+        .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+            operation: "ReLU-tail exact rational slots",
+        })?;
+
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(
+        rational_slots,
+        "ReLU-tail exact rational live bytes",
+    )?;
+    // Fixed/best/candidate directions, endpoint/canonical replay storage, and
+    // the projected-Adam direction/moment buffers can overlap.
+    peak.add_elements::<f64>(
+        value_dim
+            .checked_mul(8)
+            .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "ReLU-tail direction buffer elements",
+            })?,
+        "ReLU-tail direction and search buffers",
+    )?;
+    peak.add_elements::<usize>(value_dim, "ReLU-tail candidate coordinate map")?;
+    // `SlopeVariable`'s exact rational payload is charged above. Account for
+    // its coordinate and two binary64 proposal fields separately.
+    peak.add_elements::<(usize, f64, f64)>(value_dim, "ReLU-tail slope-variable metadata")?;
+    peak.add_elements::<f64>(
+        constraints
+            .checked_mul(3)
+            .ok_or(ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                operation: "ReLU-tail multiplier buffer elements",
+            })?,
+        "ReLU-tail multiplier buffers",
+    )?;
+    peak.add_bytes(
+        DUAL_SHAPE_ERROR_LIVE_BYTES,
+        "ReLU-tail nested dual error allowance",
+    )?;
+    Ok(peak.finish())
 }
 
 fn require_resource_limit(
@@ -3569,18 +8211,110 @@ fn zero_f64(count: usize, resource: &'static str) -> Result<Vec<f64>, ReluTailDu
     Ok(values)
 }
 
-fn clone_f64(values: &[f64], resource: &'static str) -> Result<Vec<f64>, ReluTailDualError> {
+fn zero_f64_with_gate<G>(
+    count: usize,
+    resource: &'static str,
+    checkpoint: &'static str,
+    gate: &mut G,
+) -> Result<Vec<f64>, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    let mut values = Vec::new();
+    try_reserve(&mut values, count, resource)?;
+    for _ in 0..count {
+        gate.charge_items(1, checkpoint)?;
+        values.push(0.0);
+    }
+    Ok(values)
+}
+
+fn clone_f64_with_gate<G>(
+    values: &[f64],
+    resource: &'static str,
+    checkpoint: &'static str,
+    gate: &mut G,
+) -> Result<Vec<f64>, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let mut result = Vec::new();
     try_reserve(&mut result, values.len(), resource)?;
-    result.extend_from_slice(values);
+    for &value in values {
+        gate.charge_items(1, checkpoint)?;
+        result.push(value);
+    }
     Ok(result)
 }
 
-fn candidate_clone_f64(values: &[f64]) -> Option<Vec<f64>> {
+/// Materialize M20's typed portfolio member when its authenticated auxiliary
+/// Box is a coordinatewise superset of the prepared exact hull.
+///
+/// In that case M20 has exactly the same line geometry, and M17's accepted
+/// pointwise affine replay remains valid on the identical intersection.
+/// Keeping that certificate as a duplicate result preserves the public
+/// M17/M20 attribution contract without claiming that a fresh heuristic run
+/// under another clock would visit the same candidates. Vector storage
+/// remains fallible and the final checkpoint makes publication transactional.
+/// The exact constant is already covered by the caller's two-result peak
+/// preflight and by the immutable rational-size checks that constructed
+/// `source`.
+fn clone_equivalent_relu_tail_result_with_gate<G>(
+    source: &ReluTailDualResult,
+    gate: &mut G,
+) -> Result<ReluTailDualResult, ReluTailDualBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("equivalent M20 result copy admission")?;
+    let direction = clone_f64_with_gate(
+        &source.direction,
+        "equivalent M20 direction",
+        "equivalent M20 direction copy",
+        gate,
+    )?;
+    let multipliers = clone_f64_with_gate(
+        &source.multipliers,
+        "equivalent M20 predicate multipliers",
+        "equivalent M20 predicate-multiplier copy",
+        gate,
+    )?;
+    gate.charge_items(1, "equivalent M20 exact-constant copy")?;
+    let result = ReluTailDualResult {
+        lower_bound: source.lower_bound,
+        zero_multiplier_lower_bound: source.zero_multiplier_lower_bound,
+        zero_predicate_candidate_replays: source.zero_predicate_candidate_replays,
+        direction,
+        multipliers,
+        exact_constant: source.exact_constant.clone(),
+        optimizable_slopes: source.optimizable_slopes,
+        candidates_replayed: source.candidates_replayed,
+        iterations_completed: source.iterations_completed,
+        status: source.status,
+        plan: source.plan,
+        supplied_multipliers_used: source.supplied_multipliers_used,
+    };
+    gate.checkpoint("equivalent M20 result copy publication")?;
+    Ok(result)
+}
+
+fn candidate_clone_f64_with_gate<G>(
+    values: &[f64],
+    checkpoint: &'static str,
+    gate: &mut G,
+) -> Result<Option<Vec<f64>>, ConstrainedZonotopeCallBudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
     let mut result = Vec::new();
-    result.try_reserve_exact(values.len()).ok()?;
-    result.extend_from_slice(values);
-    Some(result)
+    if result.try_reserve_exact(values.len()).is_err() {
+        return Ok(None);
+    }
+    for &value in values {
+        gate.charge_items(1, checkpoint)?;
+        result.push(value);
+    }
+    Ok(Some(result))
 }
 
 fn try_reserve<T>(
@@ -3595,11 +8329,15 @@ fn try_reserve<T>(
 
 #[cfg(test)]
 mod tests {
-    use ndarray::{array, Array2};
+    use std::cell::Cell;
+    use std::mem::{size_of, size_of_val};
+
+    use ndarray::{array, Array2, Array4};
     use num_bigint::BigInt;
     use proptest::prelude::*;
 
     use super::*;
+    use crate::constrained_zonotope_batch_norm::ConstrainedZonotopeBatchNormMode;
 
     fn exact(value: f64) -> BigRational {
         BigRational::from_float(value).expect("finite test dyadic")
@@ -3667,6 +8405,66 @@ mod tests {
         ExactReluTailMargin::try_new(coefficients, bias).expect("small exact objective")
     }
 
+    fn pullback_limits() -> ReluTailConvBatchNormPullbackLimits {
+        ReluTailConvBatchNormPullbackLimits {
+            max_input_value_count: 64,
+            max_output_value_count: 64,
+            max_weight_elements: 64,
+            max_kernel_visits: 1_024,
+            max_pulled_margin_construction_exact_products: 4_096,
+        }
+    }
+
+    fn batch_norm_certificate_limits(
+        channels: usize,
+    ) -> ConstrainedZonotopeBatchNormAffineCertificateLimits {
+        ConstrainedZonotopeBatchNormAffineCertificateLimits {
+            max_rank: 3,
+            max_channel_count: channels,
+            max_parameter_elements: 6 * channels,
+        }
+    }
+
+    fn caller_retained_domain_live_bytes(domain: &ConstrainedZonotope64) -> usize {
+        let generator_entry_bytes = domain
+            .generators()
+            .iter()
+            .map(|generator| generator.nnz() * size_of::<(usize, f64)>())
+            .sum::<usize>();
+        size_of::<ConstrainedZonotope64>()
+            + size_of_val(domain.center())
+            + size_of_val(domain.generators())
+            + generator_entry_bytes
+            + domain.constraints().len() * size_of::<f64>()
+            + size_of_val(domain.rhs())
+            + size_of_val(domain.box_remainder())
+    }
+
+    fn synthetic_accepted_line(
+        direction: Vec<f64>,
+        exact_constant: BigRational,
+    ) -> ReluTailDualResult {
+        ReluTailDualResult {
+            lower_bound: 0.0,
+            zero_multiplier_lower_bound: 0.0,
+            zero_predicate_candidate_replays: ReluTailDualZeroPredicateCandidateReplays {
+                zero_positive_slope_lower_bound: 0.0,
+                upper_endpoint_lower_bound: None,
+                canonical_lower_bound: None,
+                optimized_lower_bound: None,
+            },
+            direction,
+            multipliers: Vec::new(),
+            exact_constant,
+            optimizable_slopes: 0,
+            candidates_replayed: 1,
+            iterations_completed: 0,
+            status: ReluTailDualStatus::SearchDisabled,
+            plan: None,
+            supplied_multipliers_used: false,
+        }
+    }
+
     fn auxiliary(lower: Vec<f64>, upper: Vec<f64>) -> CertifiedAuxiliaryBounds64 {
         CertifiedAuxiliaryBounds64::try_new(lower, upper).expect("valid test auxiliary bounds")
     }
@@ -3723,8 +8521,2217 @@ mod tests {
         );
     }
 
+    fn assert_f64_slice_bit_identical(left: &[f64], right: &[f64]) {
+        assert_eq!(
+            left.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            right
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn assert_box_cut_bit_identical(
+        left: &ReluTailBoxCutCertificate,
+        right: &ReluTailBoxCutCertificate,
+    ) {
+        assert_eq!(left.lower_bound.to_bits(), right.lower_bound.to_bits());
+        assert_eq!(
+            left.zero_predicate_lower_bound.to_bits(),
+            right.zero_predicate_lower_bound.to_bits()
+        );
+        assert_f64_slice_bit_identical(&left.replay_direction, &right.replay_direction);
+        assert_f64_slice_bit_identical(&left.upper_box_multipliers, &right.upper_box_multipliers);
+        assert_f64_slice_bit_identical(&left.lower_box_multipliers, &right.lower_box_multipliers);
+        assert_f64_slice_bit_identical(&left.predicate_multipliers, &right.predicate_multipliers);
+        assert_eq!(left.exact_constant, right.exact_constant);
+        assert_eq!(
+            left.supplied_predicate_multipliers_used,
+            right.supplied_predicate_multipliers_used
+        );
+    }
+
+    fn assert_optimized_box_cut_bit_identical(
+        left: &ReluTailBoxCutOptimizedResult,
+        right: &ReluTailBoxCutOptimizedResult,
+    ) {
+        assert_eq!(left.lower_bound.to_bits(), right.lower_bound.to_bits());
+        assert_eq!(left.selected, right.selected);
+        assert_eq!(
+            left.portfolio.lower_bound.to_bits(),
+            right.portfolio.lower_bound.to_bits()
+        );
+        assert_eq!(left.portfolio.selected, right.portfolio.selected);
+        assert_eq!(left.portfolio.status, right.portfolio.status);
+        assert_result_bit_identical(&left.portfolio.original, &right.portfolio.original);
+        match (&left.portfolio.auxiliary, &right.portfolio.auxiliary) {
+            (Some(left), Some(right)) => assert_result_bit_identical(left, right),
+            (None, None) => {}
+            mismatch => panic!("auxiliary portfolio mismatch: {mismatch:?}"),
+        }
+        match (&left.portfolio.box_cut, &right.portfolio.box_cut) {
+            (Some(left), Some(right)) => assert_box_cut_bit_identical(left, right),
+            (None, None) => {}
+            mismatch => panic!("Box-cut portfolio mismatch: {mismatch:?}"),
+        }
+        assert_eq!(left.search_status, right.search_status);
+        assert_eq!(left.search_plan, right.search_plan);
+        assert_eq!(left.iterations_completed, right.iterations_completed);
+        assert_eq!(left.restarts_completed, right.restarts_completed);
+        assert_eq!(left.candidates_scored, right.candidates_scored);
+        assert_eq!(left.exact_replays, right.exact_replays);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct M24TestPeaks {
+        m17: usize,
+        m20: usize,
+        endpoint_count: usize,
+        search: usize,
+        first_replay: usize,
+        second_replay: usize,
+        retained_certificate: usize,
+    }
+
+    fn oracle_sum(parts: &[usize]) -> usize {
+        parts
+            .iter()
+            .try_fold(0_usize, |sum, &part| sum.checked_add(part))
+            .expect("test byte-oracle sum must fit usize")
+    }
+
+    fn oracle_product(left: usize, right: usize) -> usize {
+        left.checked_mul(right)
+            .expect("test byte-oracle product must fit usize")
+    }
+
+    fn oracle_elements<T>(count: usize) -> usize {
+        oracle_product(count, size_of::<T>())
+    }
+
+    fn independent_relu_tail_result_bytes(value_dim: usize, constraints: usize) -> usize {
+        oracle_sum(&[
+            size_of::<ReluTailDualResult>(),
+            oracle_elements::<f64>(value_dim),
+            oracle_elements::<f64>(constraints),
+            oracle_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(1),
+        ])
+    }
+
+    fn independent_m24_test_peaks(
+        prepared: &PreparedReluTailGeometry64<'_>,
+        plan: ReluTailBoxCutOptimizerPlan,
+    ) -> M24TestPeaks {
+        let value_dim = prepared.domain.value_dim();
+        let constraints = prepared.domain.constraint_count();
+
+        let result = independent_relu_tail_result_bytes(value_dim, constraints);
+        let retained_results = oracle_product(result, 2);
+
+        let relu_rational_slots = oracle_sum(&[
+            oracle_product(value_dim, 4),
+            RELU_TAIL_TRANSIENT_RATIONAL_SLOTS,
+        ]);
+        let m17 = oracle_sum(&[
+            oracle_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(relu_rational_slots),
+            oracle_elements::<f64>(oracle_product(value_dim, 8)),
+            oracle_elements::<usize>(value_dim),
+            oracle_elements::<(usize, f64, f64)>(value_dim),
+            oracle_elements::<f64>(oracle_product(constraints, 3)),
+            DUAL_SHAPE_ERROR_LIVE_BYTES,
+        ]);
+        let m20 = oracle_sum(&[m17, result]);
+
+        let endpoint_count_owned = oracle_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(2);
+        // The budgeted core now proves endpoint usefulness before retaining
+        // or replaying M20, so only the mandatory M17 result overlaps this
+        // scan.
+        let endpoint_count = oracle_sum(&[result, endpoint_count_owned]);
+
+        // Five current restart buffers overlap at most R-1 earlier candidates.
+        // Direction and witness are the separate 2*value_dim term below.
+        let search_box_buffers =
+            oracle_product(oracle_sum(&[plan.restarts, 4]), plan.box_variables);
+        let search_float_elements =
+            oracle_sum(&[oracle_product(plan.value_dim, 2), search_box_buffers]);
+        let search_owned = oracle_sum(&[
+            size_of::<BoxApproximateSearch>(),
+            oracle_elements::<BoxSearchVariable>(plan.box_variables),
+            oracle_elements::<Vec<f64>>(plan.restarts),
+            oracle_elements::<f64>(search_float_elements),
+            oracle_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(2),
+        ]);
+        let search = oracle_sum(&[retained_results, search_owned]);
+
+        let retained_candidate_elements = oracle_product(plan.box_variables, plan.restarts);
+        let search_retained = oracle_sum(&[
+            size_of::<BoxApproximateSearch>(),
+            oracle_elements::<BoxSearchVariable>(plan.box_variables),
+            oracle_elements::<Vec<f64>>(plan.restarts),
+            oracle_elements::<f64>(retained_candidate_elements),
+        ]);
+
+        let exact_replay_header = oracle_sum(&[
+            size_of::<ReluTailBoxCutCertificate>(),
+            oracle_elements::<Vec<f64>>(2),
+        ]);
+        let exact_replay_rational_slots =
+            oracle_sum(&[RELU_TAIL_BOX_CUT_TRANSIENT_RATIONAL_SLOTS, 1]);
+        let exact_replay_owned = oracle_sum(&[
+            exact_replay_header,
+            oracle_elements::<f64>(oracle_product(value_dim, 5)),
+            oracle_elements::<f64>(oracle_product(constraints, 2)),
+            oracle_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(exact_replay_rational_slots),
+            DUAL_SHAPE_ERROR_LIVE_BYTES,
+        ]);
+        let first_replay = oracle_sum(&[retained_results, search_retained, exact_replay_owned]);
+
+        let retained_certificate = oracle_sum(&[
+            size_of::<ReluTailBoxCutCertificate>(),
+            oracle_elements::<f64>(oracle_product(value_dim, 3)),
+            oracle_elements::<f64>(constraints),
+            oracle_elements::<[u8; RELU_TAIL_RATIONAL_LIVE_BYTES]>(1),
+        ]);
+        let second_replay = oracle_sum(&[first_replay, retained_certificate]);
+
+        assert_eq!(
+            relu_tail_dual_result_live_bytes(value_dim, constraints).unwrap(),
+            result,
+            "production M17/M20 result accounting must match the independent oracle"
+        );
+        assert_eq!(
+            relu_tail_peak_live_bytes(prepared.domain, prepared.generator_nonzeros).unwrap(),
+            m17,
+            "production M17 peak accounting must match the independent oracle"
+        );
+        assert_eq!(
+            box_cut_endpoint_count_peak_live_bytes().unwrap(),
+            endpoint_count_owned,
+            "production M24 endpoint-count accounting must match the independent oracle"
+        );
+        assert_eq!(
+            box_cut_search_peak_live_bytes(plan).unwrap(),
+            search_owned,
+            "production M24 search accounting must match the independent oracle"
+        );
+        assert_eq!(
+            box_cut_search_retained_live_bytes(plan).unwrap(),
+            search_retained,
+            "production retained-search accounting must match the independent oracle"
+        );
+        assert_eq!(
+            box_cut_exact_replay_peak_live_bytes(value_dim, constraints).unwrap(),
+            exact_replay_owned,
+            "production M24 exact-replay accounting must match the independent oracle"
+        );
+        assert_eq!(
+            relu_tail_box_cut_certificate_live_bytes(value_dim, constraints).unwrap(),
+            retained_certificate,
+            "production retained-certificate accounting must match the independent oracle"
+        );
+
+        M24TestPeaks {
+            m17,
+            m20,
+            endpoint_count,
+            search,
+            first_replay,
+            second_replay,
+            retained_certificate,
+        }
+    }
+
     fn exact_relu(value: &BigRational) -> BigRational {
         value.clone().max(BigRational::zero())
+    }
+
+    #[test]
+    fn transactional_pullback_uses_shared_channel_scale_and_bias_errors() {
+        let upstream_domain = ConstrainedZonotope64::from_certified_bounds(
+            &[-1.0, 1.0],
+            &[1.0, 4.0],
+            &[false, false],
+        )
+        .unwrap();
+        let downstream_domain = ConstrainedZonotope64::from_certified_bounds(
+            &[-32.0, -32.0],
+            &[32.0, 32.0],
+            &[false, false],
+        )
+        .unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream_prepared =
+            prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let weights = Array4::from_shape_vec((1, 1, 1, 1), vec![1.0]).unwrap();
+        let conv_bias = [5.0];
+        let input_shape = [1, 1, 2];
+        let gamma = [3.0];
+        let beta = [7.0];
+        let mean = [0.0];
+        let variance = [0.0];
+        let nominal_scale = [2.0];
+        let nominal_bias = [6.0];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &gamma,
+            beta: &beta,
+            mean: &mean,
+            variance: &variance,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [1, 1],
+            padding: [0, 0, 0, 0],
+            dilation: [1, 1],
+            groups: 1,
+        };
+        let mut gate = InertConstrainedZonotopeCallGate;
+        let plan = validate_conv2d_batch_norm_pullback_with_gate(
+            &downstream_prepared,
+            &upstream,
+            input_shape,
+            weights.view(),
+            &conv_bias,
+            conv_spec,
+            batch_norm_spec,
+            pullback_limits(),
+            &mut gate,
+        )
+        .unwrap();
+        let accepted = synthetic_accepted_line(vec![2.0, -3.0], ratio(1, 1));
+        let pulled = build_conv2d_batch_norm_pulled_margin_with_gate(
+            &upstream,
+            &accepted,
+            input_shape,
+            weights.view(),
+            &conv_bias,
+            conv_spec,
+            batch_norm_spec,
+            &nominal_scale,
+            &nominal_bias,
+            batch_norm_certificate_limits(1),
+            plan,
+            relu_tail_dual_result_live_bytes(2, downstream_domain.constraint_count()).unwrap(),
+            &mut gate,
+        )
+        .unwrap();
+
+        // r = [2,-3], R = -1, and ReLU hulls are [0,1] and [1,4].
+        // Hence [Smin,Smax]=[-12,-1], H=12, and
+        // B = 1 + (2-3)*5 + R*6 - 1*H - 1*|R| = -23.
+        assert_eq!(
+            pulled.as_exact_margin().coefficients(),
+            &[ratio(4, 1), ratio(-6, 1)]
+        );
+        assert_eq!(pulled.as_exact_margin().bias(), &ratio(-23, 1));
+    }
+
+    #[test]
+    fn internally_pulled_margin_accepts_input_limit_plus_one_but_not_intermediate_plus_one() {
+        let upstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[0.0], &[0.0], &[true]).unwrap();
+        let downstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[0.0], &[0.0], &[true]).unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream = prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let weights = Array4::from_shape_vec((1, 1, 1, 1), vec![1.0]).unwrap();
+        let zeros = [0.0];
+        let ones = [1.0];
+        let input_shape = [1, 1, 1];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &ones,
+            beta: &zeros,
+            mean: &zeros,
+            variance: &zeros,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [1, 1],
+            padding: [0; 4],
+            dilation: [1, 1],
+            groups: 1,
+        };
+        let mut gate = InertConstrainedZonotopeCallGate;
+        let plan = validate_conv2d_batch_norm_pullback_with_gate(
+            &downstream,
+            &upstream,
+            input_shape,
+            weights.view(),
+            &zeros,
+            conv_spec,
+            batch_norm_spec,
+            pullback_limits(),
+            &mut gate,
+        )
+        .unwrap();
+        let input_limit_plus_one = BigRational::from_integer(
+            BigInt::from(1_u8)
+                << usize::try_from(RELU_TAIL_DUAL_HARD_MAX_INPUT_RATIONAL_BITS).unwrap(),
+        );
+        assert_eq!(
+            rational_bits(&input_limit_plus_one),
+            RELU_TAIL_DUAL_HARD_MAX_INPUT_RATIONAL_BITS + 1
+        );
+        assert!(matches!(
+            ExactReluTailMargin::try_new(vec![BigRational::zero()], input_limit_plus_one.clone()),
+            Err(ReluTailDualError::RationalInputLimit {
+                field: "bias",
+                bits,
+                limit: RELU_TAIL_DUAL_HARD_MAX_INPUT_RATIONAL_BITS,
+                ..
+            }) if bits == RELU_TAIL_DUAL_HARD_MAX_INPUT_RATIONAL_BITS + 1
+        ));
+
+        let intermediate_limit = BigRational::from_integer(
+            BigInt::from(1_u8)
+                << usize::try_from(RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS - 1).unwrap(),
+        );
+        assert_eq!(
+            rational_bits(&intermediate_limit),
+            RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS
+        );
+        check_internally_pulled_rationals_with_gate(
+            std::slice::from_ref(&intermediate_limit),
+            &intermediate_limit,
+            &mut gate,
+        )
+        .unwrap();
+
+        let pulled = build_conv2d_batch_norm_pulled_margin_with_gate(
+            &upstream,
+            &synthetic_accepted_line(vec![0.0], input_limit_plus_one.clone()),
+            input_shape,
+            weights.view(),
+            &zeros,
+            conv_spec,
+            batch_norm_spec,
+            &ones,
+            &zeros,
+            batch_norm_certificate_limits(1),
+            plan,
+            relu_tail_dual_result_live_bytes(1, downstream_domain.constraint_count()).unwrap(),
+            &mut gate,
+        )
+        .unwrap();
+        assert_eq!(pulled.as_exact_margin().bias(), &input_limit_plus_one);
+        let replay = bound_prepared_internally_pulled_relu_tail_margin_impl(
+            &upstream,
+            &pulled,
+            None,
+            config(0),
+            &mut gate,
+        )
+        .unwrap();
+        assert_eq!(replay.exact_constant, input_limit_plus_one);
+        let auxiliary_replay =
+            bound_prepared_internally_pulled_relu_tail_margin_with_auxiliary_impl(
+                &upstream,
+                &auxiliary(vec![0.0], vec![0.0]),
+                &pulled,
+                None,
+                config(0),
+                0,
+                &mut gate,
+            )
+            .unwrap();
+        assert_eq!(auxiliary_replay.exact_constant, input_limit_plus_one);
+
+        let intermediate_limit_plus_one = BigRational::from_integer(
+            BigInt::from(1_u8)
+                << usize::try_from(RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS).unwrap(),
+        );
+        let coefficient_rejected = check_internally_pulled_rationals_with_gate(
+            std::slice::from_ref(&intermediate_limit_plus_one),
+            &BigRational::zero(),
+            &mut gate,
+        );
+        assert!(matches!(
+            coefficient_rejected,
+            Err(ReluTailDualBudgetError::Bound(
+                ReluTailDualError::RationalInputLimit {
+                    field: "coefficients",
+                    index: 0,
+                    bits,
+                    limit: RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS,
+                }
+            )) if bits == RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS + 1
+        ));
+        let rejected = build_conv2d_batch_norm_pulled_margin_with_gate(
+            &upstream,
+            &synthetic_accepted_line(vec![0.0], intermediate_limit_plus_one.clone()),
+            input_shape,
+            weights.view(),
+            &zeros,
+            conv_spec,
+            batch_norm_spec,
+            &ones,
+            &zeros,
+            batch_norm_certificate_limits(1),
+            plan,
+            relu_tail_dual_result_live_bytes(1, downstream_domain.constraint_count()).unwrap(),
+            &mut gate,
+        );
+        assert!(matches!(
+            rejected,
+            Err(ReluTailConvBatchNormPullbackBudgetError::Transform(
+                ReluTailConvBatchNormPullbackError::ReluTail(
+                    ReluTailDualError::RationalGrowthLimit {
+                        operation: "downstream exact-constant pullback",
+                        bits,
+                        limit: RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS,
+                        ..
+                    }
+                )
+            )) if bits == RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS + 1
+        ));
+
+        // Defense in depth: even an impossible, directly forged private seal
+        // cannot bypass the upstream replay's independent validation scan.
+        let forged = InternallyPulledReluTailMargin {
+            margin: ExactReluTailMargin {
+                coefficients: vec![BigRational::zero()],
+                bias: intermediate_limit_plus_one,
+            },
+        };
+        let replay_rejected = bound_prepared_internally_pulled_relu_tail_margin_impl(
+            &upstream,
+            &forged,
+            None,
+            config(0),
+            &mut gate,
+        );
+        assert!(matches!(
+            replay_rejected,
+            Err(ReluTailDualBudgetError::Bound(
+                ReluTailDualError::RationalInputLimit {
+                    field: "bias",
+                    bits,
+                    limit: RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS,
+                    ..
+                }
+            )) if bits == RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS + 1
+        ));
+        let auxiliary_replay_rejected =
+            bound_prepared_internally_pulled_relu_tail_margin_with_auxiliary_impl(
+                &upstream,
+                &auxiliary(vec![0.0], vec![0.0]),
+                &forged,
+                None,
+                config(0),
+                0,
+                &mut gate,
+            );
+        assert!(matches!(
+            auxiliary_replay_rejected,
+            Err(ReluTailDualBudgetError::Bound(
+                ReluTailDualError::RationalInputLimit {
+                    field: "bias",
+                    bits,
+                    limit: RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS,
+                    ..
+                }
+            )) if bits == RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS + 1
+        ));
+    }
+
+    #[test]
+    fn internally_pulled_margin_still_enforces_total_rational_bit_cap() {
+        let maximum_width = BigRational::from_integer(
+            BigInt::from(1_u8)
+                << usize::try_from(RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS - 1).unwrap(),
+        );
+        assert_eq!(
+            rational_bits(&maximum_width),
+            RELU_TAIL_DUAL_HARD_MAX_INTERMEDIATE_RATIONAL_BITS
+        );
+        let coefficients = vec![maximum_width; 512];
+        let mut gate = InertConstrainedZonotopeCallGate;
+        let result = check_internally_pulled_rationals_with_gate(
+            &coefficients,
+            &BigRational::zero(),
+            &mut gate,
+        );
+        assert!(matches!(
+            result,
+            Err(ReluTailDualBudgetError::Bound(ReluTailDualError::ResourceLimit {
+                resource: "total objective rational bits",
+                actual,
+                limit: RELU_TAIL_DUAL_HARD_MAX_TOTAL_RATIONAL_BITS,
+            })) if actual == RELU_TAIL_DUAL_HARD_MAX_TOTAL_RATIONAL_BITS + 1
+        ));
+    }
+
+    #[test]
+    fn transactional_pullback_shared_bias_error_cancels_when_channel_sum_is_zero() {
+        let upstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[0.0, 0.0], &[1.0, 2.0], &[true, true])
+                .unwrap();
+        let downstream_domain = ConstrainedZonotope64::from_certified_bounds(
+            &[-8.0, -8.0],
+            &[8.0, 8.0],
+            &[false, false],
+        )
+        .unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream_prepared =
+            prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let weights = Array4::from_shape_vec((1, 1, 1, 1), vec![1.0]).unwrap();
+        let input_shape = [1, 1, 2];
+        let gamma = [2.0];
+        let beta = [7.0];
+        let zero = [0.0];
+        let nominal_scale = [2.0];
+        let nominal_bias = [6.0];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &gamma,
+            beta: &beta,
+            mean: &zero,
+            variance: &zero,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [1, 1],
+            padding: [0; 4],
+            dilation: [1, 1],
+            groups: 1,
+        };
+        let mut gate = InertConstrainedZonotopeCallGate;
+        let plan = validate_conv2d_batch_norm_pullback_with_gate(
+            &downstream_prepared,
+            &upstream,
+            input_shape,
+            weights.view(),
+            &zero,
+            conv_spec,
+            batch_norm_spec,
+            pullback_limits(),
+            &mut gate,
+        )
+        .unwrap();
+        let pulled = build_conv2d_batch_norm_pulled_margin_with_gate(
+            &upstream,
+            &synthetic_accepted_line(vec![1.0, -1.0], ratio(0, 1)),
+            input_shape,
+            weights.view(),
+            &zero,
+            conv_spec,
+            batch_norm_spec,
+            &nominal_scale,
+            &nominal_bias,
+            batch_norm_certificate_limits(1),
+            plan,
+            relu_tail_dual_result_live_bytes(2, downstream_domain.constraint_count()).unwrap(),
+            &mut gate,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pulled.as_exact_margin().coefficients(),
+            &[ratio(2, 1), ratio(-2, 1)]
+        );
+        assert_eq!(pulled.as_exact_margin().bias(), &ratio(0, 1));
+    }
+
+    #[test]
+    fn transactional_pullback_matches_grouped_conv2d_chw_transpose() {
+        let upstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0; 4], &[1.0; 4], &[false; 4])
+                .unwrap();
+        let downstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-16.0; 4], &[16.0; 4], &[false; 4])
+                .unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream_prepared =
+            prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let weights = Array4::from_shape_vec((2, 1, 1, 1), vec![2.0, 3.0]).unwrap();
+        let conv_bias = [1.0, -2.0];
+        let input_shape = [2, 1, 2];
+        let ones = [1.0, 1.0];
+        let zeros = [0.0, 0.0];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &ones,
+            beta: &zeros,
+            mean: &zeros,
+            variance: &zeros,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [1, 1],
+            padding: [0; 4],
+            dilation: [1, 1],
+            groups: 2,
+        };
+        let mut gate = InertConstrainedZonotopeCallGate;
+        let plan = validate_conv2d_batch_norm_pullback_with_gate(
+            &downstream_prepared,
+            &upstream,
+            input_shape,
+            weights.view(),
+            &conv_bias,
+            conv_spec,
+            batch_norm_spec,
+            pullback_limits(),
+            &mut gate,
+        )
+        .unwrap();
+        let pulled = build_conv2d_batch_norm_pulled_margin_with_gate(
+            &upstream,
+            &synthetic_accepted_line(vec![1.0, 2.0, -1.0, 4.0], ratio(5, 1)),
+            input_shape,
+            weights.view(),
+            &conv_bias,
+            conv_spec,
+            batch_norm_spec,
+            &ones,
+            &zeros,
+            batch_norm_certificate_limits(2),
+            plan,
+            relu_tail_dual_result_live_bytes(4, downstream_domain.constraint_count()).unwrap(),
+            &mut gate,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pulled.as_exact_margin().coefficients(),
+            &[ratio(2, 1), ratio(4, 1), ratio(-3, 1), ratio(12, 1)]
+        );
+        assert_eq!(pulled.as_exact_margin().bias(), &ratio(2, 1));
+        assert_eq!(plan.output_shape, [2, 1, 2]);
+    }
+
+    #[test]
+    fn transactional_pullback_matches_spatial_padding_stride_and_dilation_oracle() {
+        let upstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0; 20], &[1.0; 20], &[false; 20])
+                .unwrap();
+        let downstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-128.0; 6], &[128.0; 6], &[false; 6])
+                .unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream_prepared =
+            prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let weights = Array4::from_shape_vec((1, 1, 2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let conv_bias = [5.0];
+        let input_shape = [1, 4, 5];
+        let ones = [1.0];
+        let zeros = [0.0];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &ones,
+            beta: &zeros,
+            mean: &zeros,
+            variance: &zeros,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [2, 2],
+            padding: [1, 1, 0, 0],
+            dilation: [2, 1],
+            groups: 1,
+        };
+        let mut gate = InertConstrainedZonotopeCallGate;
+        let plan = validate_conv2d_batch_norm_pullback_with_gate(
+            &downstream_prepared,
+            &upstream,
+            input_shape,
+            weights.view(),
+            &conv_bias,
+            conv_spec,
+            batch_norm_spec,
+            pullback_limits(),
+            &mut gate,
+        )
+        .unwrap();
+        let accepted = synthetic_accepted_line(vec![1.0, -2.0, 3.0, -1.0, 2.0, -2.0], ratio(1, 1));
+        let pulled = build_conv2d_batch_norm_pulled_margin_with_gate(
+            &upstream,
+            &accepted,
+            input_shape,
+            weights.view(),
+            &conv_bias,
+            conv_spec,
+            batch_norm_spec,
+            &ones,
+            &zeros,
+            batch_norm_certificate_limits(1),
+            plan,
+            relu_tail_dual_result_live_bytes(6, downstream_domain.constraint_count()).unwrap(),
+            &mut gate,
+        )
+        .unwrap();
+
+        // Independent CHW oracle. The two output rows start at padded input
+        // y=-1 and y=1; dilation maps kernel rows to offsets 0 and 2. The
+        // three output columns start at x=-1,1,3. Applying W^T to directions
+        // [[1,-2,3],[-1,2,-2]] gives these four input rows.
+        let expected = [
+            0, 0, 0, 0, 0, 2, -4, -4, 7, 8, 0, 0, 0, 0, 0, -4, 6, 8, -6, -8,
+        ]
+        .into_iter()
+        .map(|value| ratio(value, 1))
+        .collect::<Vec<_>>();
+        assert_eq!(plan.output_shape, [1, 2, 3]);
+        assert_eq!(pulled.as_exact_margin().coefficients(), expected.as_slice());
+        // The downstream direction sums to one, so broadcast Conv bias adds
+        // five to the accepted exact constant one.
+        assert_eq!(pulled.as_exact_margin().bias(), &ratio(6, 1));
+    }
+
+    #[test]
+    fn public_transaction_wires_both_m17_lines_and_enforces_complete_caller_peak() {
+        let upstream_domain = ConstrainedZonotope64::from_certified_bounds(
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &[false, false],
+        )
+        .unwrap();
+        let downstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[0.0, 0.0], &[1.0, 1.0], &[true, true])
+                .unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream = prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let final_margin = margin(vec![ratio(1, 1), ratio(-1, 1)], ratio(0, 1));
+        let weights = Array4::from_shape_vec((1, 1, 1, 1), vec![1.0]).unwrap();
+        let zeros = [0.0];
+        let ones = [1.0];
+        let input_shape = [1, 1, 2];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &ones,
+            beta: &zeros,
+            mean: &zeros,
+            variance: &zeros,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [1, 1],
+            padding: [0; 4],
+            dilation: [1, 1],
+            groups: 1,
+        };
+        let downstream_config = config(0);
+        let upstream_config = config(0);
+        let certificate_limits = batch_norm_certificate_limits(1);
+        let construction_limits = pullback_limits();
+        let caller_retained_objects = [
+            upstream.conservative_live_bytes(),
+            downstream.conservative_live_bytes(),
+            caller_retained_domain_live_bytes(&upstream_domain),
+            caller_retained_domain_live_bytes(&downstream_domain),
+            exact_relu_tail_margin_live_bytes(final_margin.coefficients().len()).unwrap(),
+            size_of_val(&weights) + weights.len() * size_of::<f64>(),
+            size_of_val(&zeros),
+            size_of_val(&ones),
+            size_of_val(&input_shape),
+            size_of_val(&batch_norm_spec),
+            size_of_val(&conv_spec),
+            size_of_val(&downstream_config),
+            size_of_val(&upstream_config),
+            size_of_val(&certificate_limits),
+            size_of_val(&construction_limits),
+        ];
+        let baseline = caller_retained_objects
+            .into_iter()
+            .try_fold(0_usize, usize::checked_add)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let run = |max_peak_live_bytes| {
+            downstream.bound_conv2d_batch_norm_pullback_unwired_with_budget(
+                &final_margin,
+                None,
+                downstream_config,
+                &upstream,
+                input_shape,
+                weights.view(),
+                &zeros,
+                conv_spec,
+                batch_norm_spec,
+                &ones,
+                &zeros,
+                certificate_limits,
+                construction_limits,
+                None,
+                upstream_config,
+                ConstrainedZonotopeCallBudget::new(deadline, baseline, max_peak_live_bytes),
+            )
+        };
+        let completed = run(usize::MAX).unwrap();
+        assert_eq!(completed.value().plan.output_shape, [1, 1, 2]);
+        // The downstream hull is [0,1]^2, so M17 retains the exact final line
+        // x_0 - x_1 with zero correction.  The mandatory outward replay places
+        // the represented analytic lower bound -1 two binary64 ULPs downward.
+        assert_eq!(completed.value().downstream.direction, vec![1.0, -1.0]);
+        assert_eq!(completed.value().downstream.exact_constant, ratio(0, 1));
+        assert_eq!(
+            completed.value().downstream.lower_bound.to_bits(),
+            (-1.0_f64).next_down().next_down().to_bits()
+        );
+        // Identity BN/Conv pulls that line back to ReLU(x_0)-ReLU(x_1).
+        // On [-1,1]^2 the zero-positive-slope M17 line is
+        // 0*x_0 - x_1/2 - 1/2.  Both halves are exactly representable, so this
+        // replay attains the analytic lower bound -1 without an extra ULP.
+        assert_eq!(completed.value().upstream.direction, vec![0.0, -0.5]);
+        assert_eq!(completed.value().upstream.exact_constant, ratio(-1, 2));
+        assert_eq!(
+            completed.value().upstream.lower_bound.to_bits(),
+            (-1.0_f64).to_bits()
+        );
+        let exact_peak = completed.report().peak_live_bytes();
+        assert!(matches!(
+            run(exact_peak - 1),
+            Err(ReluTailConvBatchNormPullbackBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. }
+            ))
+        ));
+
+        let start = Instant::now();
+        let attempt = |bias: &[f64], budget| {
+            downstream.bound_conv2d_batch_norm_pullback_unwired_attempt_with_clock(
+                &final_margin,
+                None,
+                downstream_config,
+                &upstream,
+                input_shape,
+                weights.view(),
+                bias,
+                conv_spec,
+                batch_norm_spec,
+                &ones,
+                &zeros,
+                certificate_limits,
+                construction_limits,
+                None,
+                upstream_config,
+                budget,
+                |_| start,
+            )
+        };
+        let (admission, admission_report) = attempt(
+            &zeros,
+            ConstrainedZonotopeCallBudget::new(start, baseline, usize::MAX),
+        )
+        .into_parts();
+        assert!(matches!(
+            admission,
+            Err(ReluTailConvBatchNormPullbackBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "admission"
+                }
+            ))
+        ));
+        assert_eq!(admission_report.peak_live_bytes(), baseline);
+        assert_eq!(admission_report.charged_items(), 0);
+        assert_eq!(admission_report.deadline_polls(), 1);
+
+        let (transform, transform_report) = attempt(
+            &[],
+            ConstrainedZonotopeCallBudget::new(
+                start + Duration::from_secs(1),
+                baseline,
+                usize::MAX,
+            ),
+        )
+        .into_parts();
+        assert!(matches!(
+            transform,
+            Err(ReluTailConvBatchNormPullbackBudgetError::Transform(
+                ReluTailConvBatchNormPullbackError::Conv2d(ConstrainedZonotopeConv2dError::Shape {
+                    field: "bias",
+                    ..
+                })
+            ))
+        ));
+        assert_eq!(transform_report.peak_live_bytes(), baseline);
+        assert_eq!(transform_report.charged_items(), 0);
+        assert_eq!(transform_report.deadline_polls(), 2);
+    }
+
+    #[test]
+    fn retained_pullback_m20_strictly_wins_ties_and_falls_back_transactionally() {
+        // x_0=t and x_1=2t.  Original M17 for
+        // ReLU(x_0)-ReLU(x_1) is -x_1/2-1, whose replay gives -2.
+        // The certified fact x_0>=0 makes M20's line x_0-x_1/2-1,
+        // cancelling the shared generator and improving the bound to -1.
+        let upstream_domain = ConstrainedZonotope64::try_new(
+            vec![0.0, 0.0],
+            vec![vec![(0, 1.0), (1, 2.0)]],
+            Array2::zeros((0, 1)),
+            Vec::new(),
+            vec![0.0, 0.0],
+        )
+        .unwrap();
+        let downstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[0.0, 0.0], &[1.0, 2.0], &[true, true])
+                .unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream = prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let final_margin = margin(vec![ratio(1, 1), ratio(-1, 1)], ratio(0, 1));
+        let weights = Array4::from_shape_vec((1, 1, 1, 1), vec![1.0]).unwrap();
+        let zeros = [0.0];
+        let ones = [1.0];
+        let input_shape = [1, 1, 2];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &ones,
+            beta: &zeros,
+            mean: &zeros,
+            variance: &zeros,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [1, 1],
+            padding: [0; 4],
+            dilation: [1, 1],
+            groups: 1,
+        };
+        let downstream_config = config(0);
+        let upstream_config = config(0);
+        let certificate_limits = batch_norm_certificate_limits(1);
+        let construction_limits = pullback_limits();
+        let strengthening = auxiliary(vec![0.0, -2.0], vec![1.0, 2.0]);
+        let caller_retained_objects = [
+            upstream.conservative_live_bytes(),
+            downstream.conservative_live_bytes(),
+            caller_retained_domain_live_bytes(&upstream_domain),
+            caller_retained_domain_live_bytes(&downstream_domain),
+            exact_relu_tail_margin_live_bytes(final_margin.coefficients().len()).unwrap(),
+            size_of_val(&strengthening)
+                + size_of_val(strengthening.lower())
+                + size_of_val(strengthening.upper()),
+            size_of_val(&weights) + weights.len() * size_of::<f64>(),
+            size_of_val(&zeros),
+            size_of_val(&ones),
+            size_of_val(&input_shape),
+            size_of_val(&batch_norm_spec),
+            size_of_val(&conv_spec),
+            size_of_val(&downstream_config),
+            size_of_val(&upstream_config),
+            size_of_val(&certificate_limits),
+            size_of_val(&construction_limits),
+        ];
+        let baseline = caller_retained_objects
+            .into_iter()
+            .try_fold(0_usize, usize::checked_add)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let run = |auxiliary: &CertifiedAuxiliaryBounds64, max_peak_live_bytes| {
+            downstream.bound_conv2d_batch_norm_pullback_m17_m20_unwired_with_budget(
+                &final_margin,
+                None,
+                downstream_config,
+                &upstream,
+                auxiliary,
+                input_shape,
+                weights.view(),
+                &zeros,
+                conv_spec,
+                batch_norm_spec,
+                &ones,
+                &zeros,
+                certificate_limits,
+                construction_limits,
+                None,
+                upstream_config,
+                ConstrainedZonotopeCallBudget::new(deadline, baseline, max_peak_live_bytes),
+            )
+        };
+
+        let completed = run(&strengthening, usize::MAX).unwrap();
+        let legacy = downstream
+            .bound_conv2d_batch_norm_pullback_unwired_with_budget(
+                &final_margin,
+                None,
+                downstream_config,
+                &upstream,
+                input_shape,
+                weights.view(),
+                &zeros,
+                conv_spec,
+                batch_norm_spec,
+                &ones,
+                &zeros,
+                certificate_limits,
+                construction_limits,
+                None,
+                upstream_config,
+                ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+            )
+            .unwrap();
+        assert_result_bit_identical(&legacy.value().downstream, &completed.value().downstream);
+        assert_result_bit_identical(
+            &legacy.value().upstream,
+            &completed.value().upstream.original,
+        );
+        assert_eq!(
+            completed.value().upstream.status,
+            ReluTailBoxCutStatus::Completed
+        );
+        assert!(completed.value().optional_budget_error.is_none());
+        assert_eq!(
+            completed.value().upstream.selected,
+            ReluTailBoxCutSelection::Auxiliary
+        );
+        assert!(completed.value().upstream.box_cut.is_none());
+        let strengthened = completed.value().upstream.auxiliary.as_ref().unwrap();
+        assert!(
+            strengthened.lower_bound > completed.value().upstream.original.lower_bound,
+            "M20 must strictly strengthen this correlated fixture"
+        );
+        assert_eq!(strengthened.direction, vec![1.0, -0.5]);
+        assert_eq!(strengthened.exact_constant, ratio(-1, 1));
+        // The exact analytic minimum is -1.  As in the downstream replay
+        // above, mandatory outward accumulation places that represented
+        // endpoint two binary64 ULPs downward.
+        assert_eq!(
+            strengthened.lower_bound.to_bits(),
+            (-1.0_f64).next_down().next_down().to_bits()
+        );
+        // The same-location auxiliary premise restricts the concrete shared
+        // generator to t in [0,1]. Its exact objective is -t, with minimum -1.
+        for t in [0.0_f64, 0.25, 0.5, 1.0] {
+            let concrete = t.max(0.0) - (2.0 * t).max(0.0);
+            assert!(concrete >= -1.0);
+        }
+
+        // The optional peak is strictly above the mandatory transaction peak.
+        // Refusing its last byte must return M17 rather than fail the call.
+        let exact_peak = completed.report().peak_live_bytes();
+        let expected_transform_owned_peak = [
+            relu_tail_dual_result_live_bytes(
+                downstream.value_dim(),
+                downstream_domain.constraint_count(),
+            )
+            .unwrap(),
+            exact_relu_tail_margin_live_bytes(upstream.value_dim()).unwrap(),
+            relu_tail_dual_result_live_bytes(
+                upstream.value_dim(),
+                upstream_domain.constraint_count(),
+            )
+            .unwrap(),
+            relu_tail_peak_live_bytes(&upstream_domain, upstream.generator_nonzeros).unwrap(),
+            size_of::<ReluTailConvBatchNormPullbackM17M20Result>(),
+        ]
+        .into_iter()
+        .try_fold(0_usize, usize::checked_add)
+        .unwrap();
+        assert_eq!(
+            exact_peak,
+            baseline.checked_add(expected_transform_owned_peak).unwrap()
+        );
+        let peak_fallback = run(&strengthening, exact_peak - 1).unwrap();
+        assert_eq!(
+            peak_fallback.value().upstream.status,
+            ReluTailBoxCutStatus::AuxiliaryFallback
+        );
+        assert_eq!(
+            peak_fallback.value().upstream.selected,
+            ReluTailBoxCutSelection::Original
+        );
+        assert!(peak_fallback.value().upstream.auxiliary.is_none());
+        assert!(matches!(
+            peak_fallback.value().optional_budget_error.as_ref(),
+            Some(ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. })
+        ));
+        assert_result_bit_identical(
+            &completed.value().upstream.original,
+            &peak_fallback.value().upstream.original,
+        );
+
+        let nonrestrictive = auxiliary(vec![-1.0, -2.0], vec![1.0, 2.0]);
+        let tied = run(&nonrestrictive, usize::MAX).unwrap();
+        assert_eq!(
+            tied.value().upstream.status,
+            ReluTailBoxCutStatus::Completed
+        );
+        assert!(tied.value().optional_budget_error.is_none());
+        assert_eq!(
+            tied.value().upstream.selected,
+            ReluTailBoxCutSelection::Original
+        );
+        assert_result_bit_identical(
+            &tied.value().upstream.original,
+            tied.value().upstream.auxiliary.as_ref().unwrap(),
+        );
+
+        for rejected in [
+            auxiliary(vec![-1.0], vec![1.0]),
+            auxiliary(vec![2.0, -2.0], vec![3.0, 2.0]),
+        ] {
+            let fallback = run(&rejected, usize::MAX).unwrap();
+            assert_eq!(
+                fallback.value().upstream.status,
+                ReluTailBoxCutStatus::AuxiliaryFallback
+            );
+            assert_eq!(
+                fallback.value().upstream.selected,
+                ReluTailBoxCutSelection::Original
+            );
+            assert!(fallback.value().upstream.auxiliary.is_none());
+            assert!(fallback.value().optional_budget_error.is_none());
+        }
+
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        let target = "prepared internally pulled auxiliary ReLU-tail validation";
+        let target_polled = Cell::new(false);
+        let attempt = downstream
+            .bound_conv2d_batch_norm_pullback_m17_m20_unwired_attempt_with_clock(
+                &final_margin,
+                None,
+                downstream_config,
+                &upstream,
+                &strengthening,
+                input_shape,
+                weights.view(),
+                &zeros,
+                conv_spec,
+                batch_norm_spec,
+                &ones,
+                &zeros,
+                certificate_limits,
+                construction_limits,
+                None,
+                upstream_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    usize::MAX,
+                ),
+                |checkpoint| {
+                    if checkpoint == target {
+                        target_polled.set(true);
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            );
+        assert!(target_polled.get());
+        let (deadline_result, deadline_report) = attempt.into_parts();
+        let deadline_result = deadline_result.unwrap();
+        assert_eq!(
+            deadline_result.upstream.status,
+            ReluTailBoxCutStatus::AuxiliaryFallback
+        );
+        assert_eq!(
+            deadline_result.upstream.selected,
+            ReluTailBoxCutSelection::Original
+        );
+        assert!(deadline_result.upstream.auxiliary.is_none());
+        assert!(matches!(
+            deadline_result.optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint })
+                if checkpoint == target
+        ));
+        assert!(deadline_report.deadline_polls() > 1);
+    }
+
+    #[test]
+    fn transactional_pulled_margin_final_scan_polls_inside_the_rational_walk() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        // Keep the domain alpha-free so this test isolates the pulled-margin
+        // rational walk rather than hitting the independent symbol ceiling.
+        // The dense Conv transpose still constructs `dimension` coefficients.
+        let lower = vec![0.0; dimension];
+        let upper = vec![0.0; dimension];
+        let declared_point = vec![true; dimension];
+        let upstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&lower, &upper, &declared_point).unwrap();
+        let downstream_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[0.0], &[1.0], &[true]).unwrap();
+        let upstream = prepare_relu_tail_triangle_dual_unwired(&upstream_domain).unwrap();
+        let downstream = prepare_relu_tail_triangle_dual_unwired(&downstream_domain).unwrap();
+        let final_margin = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let weights = Array4::from_elem((1, 1, 1, dimension), 1.0);
+        let zeros = [0.0];
+        let ones = [1.0];
+        let input_shape = [1, 1, dimension];
+        let batch_norm_spec = ConstrainedZonotopeBatchNormSpec {
+            input_shape: &input_shape,
+            channel_axis: 0,
+            gamma: &ones,
+            beta: &zeros,
+            mean: &zeros,
+            variance: &zeros,
+            epsilon: 1.0,
+            mode: ConstrainedZonotopeBatchNormMode::Inference,
+        };
+        let conv_spec = ConstrainedZonotopeConv2dSpec {
+            stride: [1, 1],
+            padding: [0; 4],
+            dilation: [1, 1],
+            groups: 1,
+        };
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        let target = "ReLU-tail declared-rational validation";
+        let target_polled = Cell::new(false);
+        let construction_limits = ReluTailConvBatchNormPullbackLimits {
+            max_input_value_count: dimension,
+            max_output_value_count: 1,
+            max_weight_elements: dimension,
+            max_kernel_visits: dimension,
+            max_pulled_margin_construction_exact_products: dimension * 4 + 4,
+        };
+        let attempt = downstream.bound_conv2d_batch_norm_pullback_unwired_attempt_with_clock(
+            &final_margin,
+            None,
+            config(0),
+            &upstream,
+            input_shape,
+            weights.view(),
+            &zeros,
+            conv_spec,
+            batch_norm_spec,
+            &ones,
+            &zeros,
+            batch_norm_certificate_limits(1),
+            construction_limits,
+            None,
+            config(0),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == target {
+                    target_polled.set(true);
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(target_polled.get());
+        let (result, report) = attempt.into_parts();
+        assert!(matches!(
+            result,
+            Err(ReluTailConvBatchNormPullbackBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+            )) if checkpoint == target
+        ));
+        assert!(report.peak_live_bytes() > 0);
+        assert!(report.charged_items() >= dimension);
+        assert!(report.deadline_polls() > 1);
+    }
+
+    #[test]
+    fn budgeted_m17_is_bit_identical_and_reports_exact_peak() {
+        let domain = ConstrainedZonotope64::try_new(
+            vec![0.0, 0.25],
+            vec![vec![(0, 1.0), (1, -0.5)]],
+            array![[1.0]],
+            vec![0.25],
+            vec![0.0, 0.0],
+        )
+        .unwrap();
+        let declared = margin(vec![ratio(1, 1), ratio(-1, 2)], ratio(1, 7));
+        let supplied = [0.5];
+        let legacy =
+            bound_relu_tail_triangle_dual_unwired(&domain, &declared, Some(&supplied), config(3))
+                .unwrap();
+
+        let baseline = 37_usize;
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let budgeted = bound_relu_tail_triangle_dual_unwired_with_budget(
+            &domain,
+            &declared,
+            Some(&supplied),
+            config(3),
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+        )
+        .unwrap();
+        assert_result_bit_identical(&legacy, budgeted.value());
+
+        let value_dim = domain.value_dim();
+        let constraints = domain.constraint_count();
+        let rational_slots = 4 * value_dim + RELU_TAIL_TRANSIENT_RATIONAL_SLOTS;
+        let transform_peak = rational_slots * RELU_TAIL_RATIONAL_LIVE_BYTES
+            + 8 * value_dim * size_of::<f64>()
+            + value_dim * size_of::<usize>()
+            + value_dim * size_of::<(usize, f64, f64)>()
+            + 3 * constraints * size_of::<f64>()
+            + DUAL_SHAPE_ERROR_LIVE_BYTES;
+        assert_eq!(
+            budgeted.report().peak_live_bytes(),
+            baseline + transform_peak
+        );
+        assert!(budgeted.report().charged_items() > 0);
+        assert!(budgeted.report().deadline_polls() > 0);
+
+        let at_boundary = bound_relu_tail_triangle_dual_unwired_with_budget(
+            &domain,
+            &declared,
+            Some(&supplied),
+            config(3),
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, baseline + transform_peak),
+        )
+        .unwrap();
+        assert_result_bit_identical(&legacy, at_boundary.value());
+        assert_eq!(
+            at_boundary.report().peak_live_bytes(),
+            baseline + transform_peak
+        );
+        assert!(matches!(
+            bound_relu_tail_triangle_dual_unwired_with_budget(
+                &domain,
+                &declared,
+                Some(&supplied),
+                config(3),
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    baseline,
+                    baseline + transform_peak - 1,
+                ),
+            ),
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required,
+                    limit
+                }
+            )) if required == baseline + transform_peak
+                && limit == baseline + transform_peak - 1
+        ));
+    }
+
+    #[test]
+    fn budgeted_m17_preserves_errors_and_refuses_admission_overflow_and_publication() {
+        let domain = ConstrainedZonotope64::from_certified_bounds(
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &[false, false],
+        )
+        .unwrap();
+        let malformed = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let legacy = bound_relu_tail_triangle_dual_unwired(&domain, &malformed, None, config(0))
+            .unwrap_err();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        assert_eq!(
+            bound_relu_tail_triangle_dual_unwired_with_budget(
+                &domain,
+                &malformed,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+            )
+            .unwrap_err(),
+            ReluTailDualBudgetError::Bound(legacy)
+        );
+
+        let start = Instant::now();
+        let reads = Cell::new(0_usize);
+        let expired = bound_relu_tail_triangle_dual_unwired_with_clock(
+            &domain,
+            &malformed,
+            None,
+            config(0),
+            ConstrainedZonotopeCallBudget::new(start, usize::MAX, 0),
+            |_| {
+                reads.set(reads.get() + 1);
+                start
+            },
+        );
+        assert!(matches!(
+            expired,
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "admission"
+                }
+            ))
+        ));
+        assert_eq!(reads.get(), 1);
+
+        let valid = margin(vec![ratio(1, 1), ratio(1, 1)], ratio(0, 1));
+        let overflow = bound_relu_tail_triangle_dual_unwired_with_clock(
+            &domain,
+            &valid,
+            None,
+            config(0),
+            ConstrainedZonotopeCallBudget::new(
+                start + Duration::from_secs(1),
+                usize::MAX,
+                usize::MAX,
+            ),
+            |_| start,
+        );
+        assert!(matches!(
+            overflow,
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::ResourceOverflow {
+                    operation: "aggregate peak-live bytes"
+                }
+            ))
+        ));
+
+        let active = ConstrainedZonotope64::from_certified_bounds(&[1.0], &[1.0], &[true]).unwrap();
+        let active_margin = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let publication = bound_relu_tail_triangle_dual_unwired_with_clock(
+            &active,
+            &active_margin,
+            None,
+            config(0),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "ReLU-tail certificate publication" {
+                    start + Duration::from_secs(2)
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            publication,
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "ReLU-tail certificate publication"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn budgeted_m17_polls_exact_setup_generator_entries_and_candidate_search() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let fixed = vec![true; dimension];
+        let lower = vec![0.0; dimension];
+        let upper = vec![0.0; dimension];
+        let domain = ConstrainedZonotope64::from_certified_bounds(&lower, &upper, &fixed).unwrap();
+        let declared = margin(vec![BigRational::zero(); dimension], BigRational::zero());
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        for phase in [
+            "ReLU-tail declared-rational validation",
+            "ReLU-tail exact radius initialization",
+            "ReLU-tail exact coordinate-bound materialization",
+            "ReLU-tail exact line construction",
+        ] {
+            let result = bound_relu_tail_triangle_dual_unwired_with_clock(
+                &domain,
+                &declared,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |checkpoint| {
+                    if checkpoint == phase {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ReluTailDualBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == phase
+                ),
+                "deadline must be polled during {phase}"
+            );
+        }
+
+        let entries = (0..dimension).map(|index| (index, 1.0)).collect();
+        let sparse = ConstrainedZonotope64::try_new(
+            vec![0.0; dimension],
+            vec![entries],
+            Array2::zeros((0, 1)),
+            Vec::new(),
+            vec![0.0; dimension],
+        )
+        .unwrap();
+        let generator_entry = bound_relu_tail_triangle_dual_unwired_with_clock(
+            &sparse,
+            &declared,
+            None,
+            config(0),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "ReLU-tail exact generator-entry accumulation" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            generator_entry,
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "ReLU-tail exact generator-entry accumulation"
+                }
+            ))
+        ));
+
+        let unstable =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let unstable_margin = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let candidate = bound_relu_tail_triangle_dual_unwired_with_clock(
+            &unstable,
+            &unstable_margin,
+            None,
+            config(1),
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "ReLU-tail candidate startup" {
+                    expired
+                } else {
+                    start
+                }
+            },
+        );
+        assert!(matches!(
+            candidate,
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "ReLU-tail candidate startup"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn budgeted_prepared_m17_and_m20_match_direct_results_with_one_hull_pass() {
+        let domain = ConstrainedZonotope64::try_new(
+            vec![0.0, 2.0, -2.0],
+            vec![vec![(0, 1.0), (1, 1.0)], vec![(0, 0.5), (2, 0.25)]],
+            array![[1.0, 0.0], [-1.0, 0.0]],
+            vec![0.75, 1.0],
+            vec![0.0, 0.125, 0.5],
+        )
+        .unwrap();
+        let margins = [
+            margin(vec![ratio(1, 1), ratio(-1, 2), ratio(2, 1)], ratio(1, 7)),
+            margin(vec![ratio(-5, 3), ratio(1, 3), ratio(-2, 1)], ratio(-2, 9)),
+        ];
+        let certified = auxiliary(vec![-0.75, 1.5, -2.5], vec![1.25, 2.5, -1.5]);
+        let supplied = [0.25, 0.0];
+        let expected_m17: Vec<_> = margins
+            .iter()
+            .map(|declared| {
+                bound_relu_tail_triangle_dual_unwired(&domain, declared, Some(&supplied), config(3))
+                    .unwrap()
+            })
+            .collect();
+        let expected_m20: Vec<_> = margins
+            .iter()
+            .map(|declared| {
+                bound_relu_tail_triangle_dual_with_auxiliary_bounds_unwired(
+                    &domain,
+                    &certified,
+                    declared,
+                    Some(&supplied),
+                    config(3),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        EXACT_COORDINATE_HULL_PASSES.with(|passes| passes.set(0));
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let prepared_outcome = prepare_relu_tail_triangle_dual_unwired_with_budget(
+            &domain,
+            ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+        )
+        .unwrap();
+        let prepared = prepared_outcome.into_value();
+        let baseline = prepared.conservative_live_bytes();
+        for ((declared, expected_m17), expected_m20) in
+            margins.iter().zip(&expected_m17).zip(&expected_m20)
+        {
+            let m17 = prepared
+                .bound_margin_unwired_with_budget(
+                    declared,
+                    Some(&supplied),
+                    config(3),
+                    ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+                )
+                .unwrap();
+            assert_result_bit_identical(expected_m17, m17.value());
+            let m17_report = m17.report();
+            drop(m17);
+            let m20 = prepared
+                .bound_margin_with_auxiliary_bounds_unwired_with_budget(
+                    &certified,
+                    declared,
+                    Some(&supplied),
+                    config(3),
+                    ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+                )
+                .unwrap();
+            assert_result_bit_identical(expected_m20, m20.value());
+            let m20_report = m20.report();
+            drop(m20);
+
+            let portfolio = prepared
+                .bound_margin_m17_m20_unwired_with_budget(
+                    &certified,
+                    declared,
+                    Some(&supplied),
+                    config(3),
+                    ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+                )
+                .unwrap();
+            assert_result_bit_identical(expected_m17, &portfolio.value().original);
+            assert_result_bit_identical(
+                expected_m20,
+                portfolio.value().auxiliary.as_ref().unwrap(),
+            );
+            assert_eq!(portfolio.value().box_cut, None);
+            assert_eq!(portfolio.value().status, ReluTailBoxCutStatus::Completed);
+            assert_eq!(
+                portfolio.report().charged_items(),
+                m17_report
+                    .charged_items()
+                    .checked_add(m20_report.charged_items())
+                    .unwrap()
+            );
+            assert_eq!(
+                portfolio.report().deadline_polls(),
+                m17_report
+                    .deadline_polls()
+                    .checked_add(m20_report.deadline_polls())
+                    .and_then(|polls| polls.checked_sub(1))
+                    .unwrap()
+            );
+            assert!(portfolio.report().peak_live_bytes() > m17_report.peak_live_bytes());
+            assert!(portfolio.report().peak_live_bytes() > m20_report.peak_live_bytes());
+            let (expected_lower_bound, expected_selection) =
+                if expected_m20.lower_bound > expected_m17.lower_bound {
+                    (expected_m20.lower_bound, ReluTailBoxCutSelection::Auxiliary)
+                } else {
+                    (expected_m17.lower_bound, ReluTailBoxCutSelection::Original)
+                };
+            assert_eq!(portfolio.value().selected, expected_selection);
+            assert_eq!(
+                portfolio.value().lower_bound.to_bits(),
+                expected_lower_bound.to_bits()
+            );
+        }
+        EXACT_COORDINATE_HULL_PASSES.with(|passes| assert_eq!(passes.get(), 1));
+    }
+
+    #[test]
+    fn prepared_m17_m20_portfolio_accounts_auxiliary_fallback() {
+        let domain = ConstrainedZonotope64::from_certified_bounds(
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &[false, false],
+        )
+        .unwrap();
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let declared = margin(vec![ratio(1, 1), ratio(-1, 1)], ratio(0, 1));
+        let wrong_dimension = auxiliary(vec![-1.0], vec![1.0]);
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let m17 = prepared
+            .bound_margin_unwired_with_budget(
+                &declared,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    prepared.conservative_live_bytes(),
+                    usize::MAX,
+                ),
+            )
+            .unwrap();
+        let outcome = prepared
+            .bound_margin_m17_m20_unwired_with_budget(
+                &wrong_dimension,
+                &declared,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    prepared.conservative_live_bytes(),
+                    usize::MAX,
+                ),
+            )
+            .expect("optional M20 shape failure must retain accounted M17 authority");
+        let portfolio = outcome.value();
+        assert_eq!(portfolio.status, ReluTailBoxCutStatus::AuxiliaryFallback);
+        assert_eq!(portfolio.selected, ReluTailBoxCutSelection::Original);
+        assert_eq!(portfolio.auxiliary, None);
+        assert_eq!(portfolio.box_cut, None);
+        assert_eq!(
+            portfolio.lower_bound.to_bits(),
+            portfolio.original.lower_bound.to_bits()
+        );
+        assert_eq!(
+            outcome.report().charged_items(),
+            m17.report().charged_items()
+        );
+        assert_eq!(
+            outcome.report().deadline_polls(),
+            m17.report().deadline_polls() + 1
+        );
+    }
+
+    #[test]
+    fn prepared_m17_m20_portfolio_uses_strict_stable_selection() {
+        let tied_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let tied_auxiliary = auxiliary(vec![-1.0], vec![1.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let tied_prepared = prepare_relu_tail_triangle_dual_unwired(&tied_domain).unwrap();
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let tied = tied_prepared
+            .bound_margin_m17_m20_unwired_with_budget(
+                &tied_auxiliary,
+                &declared,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    tied_prepared.conservative_live_bytes(),
+                    usize::MAX,
+                ),
+            )
+            .unwrap();
+        assert_eq!(tied.value().status, ReluTailBoxCutStatus::Completed);
+        assert_eq!(tied.value().selected, ReluTailBoxCutSelection::Original);
+        assert_result_bit_identical(
+            &tied.value().original,
+            tied.value().auxiliary.as_ref().unwrap(),
+        );
+        assert_eq!(
+            tied.value().lower_bound.to_bits(),
+            tied.value().original.lower_bound.to_bits()
+        );
+
+        let improving_domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let improving_auxiliary = auxiliary(vec![-2.0], vec![1.0]);
+        let negative_margin = margin(vec![ratio(-1, 1)], ratio(0, 1));
+        let improving_prepared =
+            prepare_relu_tail_triangle_dual_unwired(&improving_domain).unwrap();
+        let improved = improving_prepared
+            .bound_margin_m17_m20_unwired_with_budget(
+                &improving_auxiliary,
+                &negative_margin,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    improving_prepared.conservative_live_bytes(),
+                    usize::MAX,
+                ),
+            )
+            .unwrap();
+        assert_eq!(improved.value().status, ReluTailBoxCutStatus::Completed);
+        assert_eq!(
+            improved.value().selected,
+            ReluTailBoxCutSelection::Auxiliary
+        );
+        assert!(
+            improved.value().auxiliary.as_ref().unwrap().lower_bound
+                > improved.value().original.lower_bound
+        );
+        assert_eq!(
+            improved.value().lower_bound.to_bits(),
+            improved
+                .value()
+                .auxiliary
+                .as_ref()
+                .unwrap()
+                .lower_bound
+                .to_bits()
+        );
+    }
+
+    #[test]
+    fn prepared_attempt_receipts_survive_admission_and_peak_failures() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let start = Instant::now();
+        let baseline = 37_usize;
+
+        let (admission, admission_report) =
+            prepare_relu_tail_triangle_dual_unwired_attempt_with_clock(
+                &domain,
+                ConstrainedZonotopeCallBudget::new(start, baseline, usize::MAX),
+                |_| start,
+            )
+            .into_parts();
+        assert!(matches!(
+            admission,
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "admission"
+                }
+            ))
+        ));
+        assert_eq!(admission_report.peak_live_bytes(), baseline);
+        assert_eq!(admission_report.charged_items(), 0);
+        assert_eq!(admission_report.deadline_polls(), 1);
+
+        let (peak, peak_report) = prepare_relu_tail_triangle_dual_unwired_attempt_with_clock(
+            &domain,
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), baseline, baseline),
+            |_| start,
+        )
+        .into_parts();
+        assert!(matches!(
+            peak,
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required,
+                    limit
+                }
+            )) if required > baseline && limit == baseline
+        ));
+        assert_eq!(peak_report.peak_live_bytes(), baseline);
+        assert!(peak_report.deadline_polls() >= 3);
+    }
+
+    #[test]
+    fn budgeted_prepared_geometry_accounts_retained_bytes_and_exact_peaks() {
+        let domain = ConstrainedZonotope64::try_new(
+            vec![0.0, 1.0],
+            vec![vec![(0, 1.0), (1, -0.5)]],
+            array![[1.0]],
+            vec![0.25],
+            vec![0.0, 0.0],
+        )
+        .unwrap();
+        let declared = margin(vec![ratio(1, 1), ratio(-1, 2)], ratio(1, 7));
+        let certified = auxiliary(vec![-0.75, 0.75], vec![0.75, 1.25]);
+        let start = Instant::now();
+        let deadline = start + Duration::from_mins(1);
+        let baseline = 37_usize;
+
+        let first = prepare_relu_tail_triangle_dual_unwired_with_clock(
+            &domain,
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+            |_| start,
+        )
+        .unwrap();
+        let preparation_peak = first.report().peak_live_bytes();
+        let conservative_live_bytes = first.value().conservative_live_bytes();
+        let expected_live_bytes = size_of::<PreparedReluTailGeometry64<'static>>()
+            + domain.value_dim() * size_of::<(BigRational, BigRational)>()
+            + 2 * domain.value_dim() * RELU_TAIL_RATIONAL_LIVE_BYTES;
+        assert_eq!(conservative_live_bytes, expected_live_bytes);
+        assert!(preparation_peak > baseline + conservative_live_bytes);
+        drop(first);
+
+        let at_boundary = prepare_relu_tail_triangle_dual_unwired_with_clock(
+            &domain,
+            ConstrainedZonotopeCallBudget::new(deadline, baseline, preparation_peak),
+            |_| start,
+        )
+        .unwrap();
+        assert_eq!(at_boundary.report().peak_live_bytes(), preparation_peak);
+        drop(at_boundary);
+        assert!(matches!(
+            prepare_relu_tail_triangle_dual_unwired_with_clock(
+                &domain,
+                ConstrainedZonotopeCallBudget::new(deadline, baseline, preparation_peak - 1),
+                |_| start,
+            ),
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { required, limit }
+            )) if required == preparation_peak && limit == preparation_peak - 1
+        ));
+
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        assert_eq!(prepared.conservative_live_bytes(), conservative_live_bytes);
+        let call_baseline = 43_usize + prepared.conservative_live_bytes();
+        let first = prepared
+            .bound_margin_with_auxiliary_bounds_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, usize::MAX),
+                |_| start,
+            )
+            .unwrap();
+        let call_peak = first.report().peak_live_bytes();
+        assert!(call_peak > call_baseline);
+        drop(first);
+        let at_boundary = prepared
+            .bound_margin_with_auxiliary_bounds_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, call_peak),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(at_boundary.report().peak_live_bytes(), call_peak);
+        drop(at_boundary);
+        assert!(matches!(
+            prepared.bound_margin_with_auxiliary_bounds_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, call_peak - 1),
+                |_| start,
+            ),
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { required, limit }
+            )) if required == call_peak && limit == call_peak - 1
+        ));
+
+        let first_m17 = prepared
+            .bound_margin_unwired_with_clock(
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, usize::MAX),
+                |_| start,
+            )
+            .unwrap();
+        let m17_peak = first_m17.report().peak_live_bytes();
+        drop(first_m17);
+        let m17_at_boundary = prepared
+            .bound_margin_unwired_with_clock(
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, m17_peak),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(m17_at_boundary.report().peak_live_bytes(), m17_peak);
+        drop(m17_at_boundary);
+        assert!(matches!(
+            prepared.bound_margin_unwired_with_clock(
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, m17_peak - 1),
+                |_| start,
+            ),
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { required, limit }
+            )) if required == m17_peak && limit == m17_peak - 1
+        ));
+
+        assert_eq!(m17_peak, call_peak);
+        let retained_m17_bytes =
+            independent_relu_tail_result_bytes(domain.value_dim(), domain.constraint_count());
+        assert_eq!(
+            relu_tail_dual_result_live_bytes(domain.value_dim(), domain.constraint_count())
+                .unwrap(),
+            retained_m17_bytes
+        );
+        let portfolio_peak = call_peak.checked_add(retained_m17_bytes).unwrap();
+        let portfolio = prepared
+            .bound_margin_m17_m20_unwired_with_budget(
+                &certified,
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, usize::MAX),
+            )
+            .unwrap();
+        assert_eq!(portfolio.value().status, ReluTailBoxCutStatus::Completed);
+        assert_eq!(portfolio.report().peak_live_bytes(), portfolio_peak);
+        drop(portfolio);
+
+        let at_boundary = prepared
+            .bound_margin_m17_m20_unwired_with_budget(
+                &certified,
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, portfolio_peak),
+            )
+            .unwrap();
+        assert_eq!(at_boundary.value().status, ReluTailBoxCutStatus::Completed);
+        assert_eq!(at_boundary.report().peak_live_bytes(), portfolio_peak);
+        drop(at_boundary);
+
+        let below_boundary = prepared
+            .bound_margin_m17_m20_unwired_with_budget(
+                &certified,
+                &declared,
+                None,
+                config(3),
+                ConstrainedZonotopeCallBudget::new(deadline, call_baseline, portfolio_peak - 1),
+            )
+            .expect("optional M20 peak refusal must retain M17");
+        assert_eq!(
+            below_boundary.value().status,
+            ReluTailBoxCutStatus::AuxiliaryFallback
+        );
+        assert_eq!(
+            below_boundary.value().selected,
+            ReluTailBoxCutSelection::Original
+        );
+        assert!(below_boundary.value().auxiliary.is_none());
+        assert_eq!(below_boundary.report().peak_live_bytes(), m17_peak);
+    }
+
+    #[test]
+    fn budgeted_prepared_deadlines_cover_preparation_intersection_line_and_replay() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let certified = auxiliary(vec![-0.75], vec![0.75]);
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let expired = start + Duration::from_secs(2);
+        let preparation_seam = "prepared ReLU-tail exact coordinate hull complete";
+        assert!(matches!(
+            prepare_relu_tail_triangle_dual_unwired_with_clock(
+                &domain,
+                ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+                move |checkpoint| {
+                    if checkpoint == preparation_seam {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            ),
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+            )) if checkpoint == preparation_seam
+        ));
+
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let baseline = prepared.conservative_live_bytes();
+        for seam in [
+            "prepared auxiliary ReLU-tail intersection complete",
+            "prepared auxiliary ReLU-tail exact line construction complete",
+            "prepared auxiliary ReLU-tail mandatory replay complete",
+        ] {
+            let result = prepared.bound_margin_with_auxiliary_bounds_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+                move |checkpoint| {
+                    if checkpoint == seam {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ReluTailDualBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == seam
+                ),
+                "deadline must close at {seam}"
+            );
+        }
+        for seam in [
+            "prepared ReLU-tail exact line construction complete",
+            "prepared ReLU-tail mandatory replay complete",
+        ] {
+            let result = prepared.bound_margin_unwired_with_clock(
+                &declared,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(deadline, baseline, usize::MAX),
+                move |checkpoint| {
+                    if checkpoint == seam {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ReluTailDualBudgetError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == seam
+                ),
+                "M17 deadline must close at {seam}"
+            );
+        }
+
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL / 2;
+        let lower = vec![-1.0; dimension];
+        let upper = vec![1.0; dimension];
+        let fixed = vec![false; dimension];
+        let wide_domain =
+            ConstrainedZonotope64::from_certified_bounds(&lower, &upper, &fixed).unwrap();
+        let wide_margin = margin(vec![BigRational::zero(); dimension], BigRational::zero());
+        let wide_auxiliary = auxiliary(vec![-0.5; dimension], vec![0.5; dimension]);
+        let wide_prepared = prepare_relu_tail_triangle_dual_unwired(&wide_domain).unwrap();
+        let endpoint_seam = "prepared auxiliary ReLU-tail upper-endpoint intersection";
+        assert!(matches!(
+            wide_prepared.bound_margin_with_auxiliary_bounds_unwired_with_clock(
+                &wide_auxiliary,
+                &wide_margin,
+                None,
+                config(0),
+                ConstrainedZonotopeCallBudget::new(
+                    deadline,
+                    wide_prepared.conservative_live_bytes(),
+                    usize::MAX,
+                ),
+                move |checkpoint| {
+                    if checkpoint == endpoint_seam {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            ),
+            Err(ReluTailDualBudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+            )) if checkpoint == endpoint_seam
+        ));
+    }
+
+    #[test]
+    fn budgeted_prepared_m20_preserves_auxiliary_dimension_and_disjoint_errors() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let wrong_dimension = auxiliary(Vec::new(), Vec::new());
+        let disjoint = auxiliary(vec![2.0], vec![3.0]);
+        let start = Instant::now();
+        let budget = ConstrainedZonotopeCallBudget::new(
+            start + Duration::from_secs(1),
+            prepared.conservative_live_bytes(),
+            usize::MAX,
+        );
+
+        for auxiliary in [&wrong_dimension, &disjoint] {
+            let legacy = prepared
+                .bound_margin_with_auxiliary_bounds_unwired(auxiliary, &declared, None, config(0))
+                .unwrap_err();
+            let budgeted = prepared
+                .bound_margin_with_auxiliary_bounds_unwired_with_clock(
+                    auxiliary,
+                    &declared,
+                    None,
+                    config(0),
+                    budget,
+                    |_| start,
+                )
+                .unwrap_err();
+            assert_eq!(budgeted, ReluTailDualBudgetError::Bound(legacy));
+        }
     }
 
     #[test]
@@ -4393,6 +11400,937 @@ mod tests {
     }
 
     #[test]
+    fn budgeted_m17_m20_m24_matches_legacy_with_one_prepared_hull_pass() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        EXACT_COORDINATE_HULL_PASSES.with(|passes| passes.set(0));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let legacy = prepared
+            .bound_margin_with_optimized_auxiliary_box_cut_unwired(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(1, 1),
+            )
+            .unwrap();
+
+        let start = Instant::now();
+        let budgeted = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(1, 1),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 37, usize::MAX),
+                |_| start,
+            )
+            .unwrap();
+        assert_optimized_box_cut_bit_identical(&legacy, &budgeted.value().optimized);
+        assert_eq!(budgeted.value().optional_budget_error, None);
+        assert!(budgeted.report().charged_items() > 0);
+        assert!(budgeted.report().deadline_polls() > 0);
+        EXACT_COORDINATE_HULL_PASSES.with(|passes| assert_eq!(passes.get(), 1));
+    }
+
+    #[test]
+    fn budgeted_no_tighter_auxiliary_elides_m20_replay_but_retains_its_certificate() {
+        // The predicate multiplier is genuinely useful, so this also proves
+        // that equivalent-certificate publication copies nonempty multiplier
+        // storage and a nonzero exact constant rather than only scalar bits.
+        let domain = ConstrainedZonotope64::try_new(
+            vec![0.0],
+            vec![vec![(0, 1.0)]],
+            array![[1.0]],
+            vec![0.0],
+            vec![0.0],
+        )
+        .unwrap();
+        // The lower endpoint is exact and the upper endpoint is wider.
+        let certified = auxiliary(vec![-1.0], vec![2.0]);
+        let declared = margin(vec![ratio(-1, 1)], ratio(1, 7));
+        let supplied = [0.5];
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        assert_eq!(
+            count_tighter_auxiliary_box_endpoints(&prepared.exact_coordinate_bounds, &certified)
+                .unwrap(),
+            0
+        );
+        let independently_replayed_m20 = prepared
+            .bound_margin_with_auxiliary_bounds_unwired(
+                &certified,
+                &declared,
+                Some(&supplied),
+                config(0),
+            )
+            .unwrap();
+        assert!(independently_replayed_m20.supplied_multipliers_used);
+        assert!(!independently_replayed_m20.multipliers.is_empty());
+        assert!(!independently_replayed_m20.exact_constant.is_zero());
+
+        let m20_replay_admissions = Cell::new(0_usize);
+        let start = Instant::now();
+        let outcome = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                Some(&supplied),
+                config(0),
+                box_config(1, 1),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |checkpoint| {
+                    if checkpoint == "prepared auxiliary ReLU-tail validation" {
+                        m20_replay_admissions.set(m20_replay_admissions.get() + 1);
+                    }
+                    start
+                },
+            )
+            .unwrap();
+        let receipt = outcome.value();
+        assert_eq!(m20_replay_admissions.get(), 0);
+        assert_eq!(receipt.optional_budget_error, None);
+        assert_eq!(
+            receipt.optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::NoTighterAuxiliaryBox
+        );
+        assert_eq!(receipt.optimized.search_plan, None);
+        assert_eq!(receipt.optimized.iterations_completed, 0);
+        assert_eq!(receipt.optimized.restarts_completed, 0);
+        assert_eq!(receipt.optimized.candidates_scored, 0);
+        assert_eq!(receipt.optimized.exact_replays, 0);
+        assert_eq!(
+            receipt.optimized.portfolio.status,
+            ReluTailBoxCutStatus::CandidateFallback
+        );
+        assert_eq!(
+            receipt.optimized.selected,
+            ReluTailBoxCutSelection::Original
+        );
+        let equivalent_m20 = receipt.optimized.portfolio.auxiliary.as_ref().unwrap();
+        assert_result_bit_identical(&receipt.optimized.portfolio.original, equivalent_m20);
+        assert_result_bit_identical(&independently_replayed_m20, equivalent_m20);
+    }
+
+    #[test]
+    fn budgeted_one_ulp_strict_endpoint_still_runs_real_m20() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let certified = auxiliary(vec![(-1.0_f64).next_up()], vec![1.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        assert_eq!(
+            count_tighter_auxiliary_box_endpoints(&prepared.exact_coordinate_bounds, &certified)
+                .unwrap(),
+            1
+        );
+
+        let m20_replay_admissions = Cell::new(0_usize);
+        let start = Instant::now();
+        let outcome = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(0, 0),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |checkpoint| {
+                    if checkpoint == "prepared auxiliary ReLU-tail validation" {
+                        m20_replay_admissions.set(m20_replay_admissions.get() + 1);
+                    }
+                    start
+                },
+            )
+            .unwrap();
+        let receipt = outcome.value();
+        assert_eq!(m20_replay_admissions.get(), 1);
+        assert_eq!(receipt.optional_budget_error, None);
+        assert_eq!(
+            receipt.optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::SearchDisabled
+        );
+        let plan = receipt.optimized.search_plan.unwrap();
+        assert_eq!(plan.box_variables, 1);
+        assert!(receipt.optimized.portfolio.auxiliary.is_some());
+        assert_eq!(
+            receipt.optimized.portfolio.status,
+            ReluTailBoxCutStatus::CandidateFallback
+        );
+    }
+
+    #[test]
+    fn budgeted_endpoint_precheck_rejects_wrong_auxiliary_shape_fail_closed() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let wrong_shape = auxiliary(Vec::new(), Vec::new());
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let start = Instant::now();
+        let outcome = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &wrong_shape,
+                &declared,
+                None,
+                config(0),
+                box_config(1, 1),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |_| start,
+            )
+            .unwrap();
+        let receipt = outcome.value();
+        assert_eq!(receipt.optional_budget_error, None);
+        assert_eq!(
+            receipt.optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::AuxiliaryFallback
+        );
+        assert_eq!(
+            receipt.optimized.portfolio.status,
+            ReluTailBoxCutStatus::AuxiliaryFallback
+        );
+        assert!(receipt.optimized.portfolio.auxiliary.is_none());
+        assert!(receipt.optimized.portfolio.box_cut.is_none());
+        assert_eq!(receipt.optimized.search_plan, None);
+        assert_eq!(
+            receipt.optimized.selected,
+            ReluTailBoxCutSelection::Original
+        );
+    }
+
+    #[test]
+    fn no_tighter_endpoint_and_copy_deadlines_retain_original_only() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-1.0], &[1.0], &[false]).unwrap();
+        let certified = auxiliary(vec![-1.0], vec![1.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let expired = start + Duration::from_secs(2);
+        for target in [
+            "M24 tighter auxiliary endpoint count complete",
+            "equivalent M20 result copy publication",
+        ] {
+            let outcome = prepared
+                .bound_margin_m17_m20_m24_unwired_with_clock(
+                    &certified,
+                    &declared,
+                    None,
+                    config(0),
+                    box_config(1, 1),
+                    ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+                    |checkpoint| if checkpoint == target { expired } else { start },
+                )
+                .unwrap();
+            let receipt = outcome.value();
+            assert_eq!(
+                receipt.optimized.search_status,
+                ReluTailBoxCutOptimizerStatus::AuxiliaryFallback
+            );
+            assert_eq!(
+                receipt.optimized.portfolio.status,
+                ReluTailBoxCutStatus::AuxiliaryFallback
+            );
+            assert!(receipt.optimized.portfolio.auxiliary.is_none());
+            assert!(receipt.optimized.portfolio.box_cut.is_none());
+            assert_eq!(
+                receipt.optional_budget_error,
+                Some(ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint: target })
+            );
+            assert!(receipt.optimized.portfolio.original.lower_bound.is_finite());
+        }
+    }
+
+    #[test]
+    fn budgeted_m20_exact_peak_and_cap_minus_one_are_deterministic() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let search_config = box_config(0, 0);
+        let box_variables =
+            count_tighter_auxiliary_box_endpoints(&prepared.exact_coordinate_bounds, &certified)
+                .unwrap();
+        let plan = ReluTailBoxCutOptimizerPlan::checked(
+            &domain,
+            prepared.generator_nonzeros,
+            box_variables,
+            search_config,
+        )
+        .unwrap();
+        let peaks = independent_m24_test_peaks(&prepared, plan);
+        assert!(peaks.m20 >= peaks.endpoint_count);
+
+        let baseline = 41_usize;
+        let start = Instant::now();
+        let exact = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.m20,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(exact.value().optional_budget_error, None);
+        assert!(exact.value().optimized.portfolio.auxiliary.is_some());
+        assert_eq!(
+            exact.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::SearchDisabled
+        );
+        assert_eq!(exact.report().peak_live_bytes(), baseline + peaks.m20);
+
+        let below = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.m20 - 1,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(
+            below.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::AuxiliaryFallback
+        );
+        assert_eq!(
+            below.value().optimized.portfolio.status,
+            ReluTailBoxCutStatus::AuxiliaryFallback
+        );
+        assert!(below.value().optimized.portfolio.auxiliary.is_none());
+        assert!(below.value().optimized.portfolio.box_cut.is_none());
+        assert_eq!(
+            below.value().optimized.selected,
+            ReluTailBoxCutSelection::Original
+        );
+        assert_result_bit_identical(
+            &exact.value().optimized.portfolio.original,
+            &below.value().optimized.portfolio.original,
+        );
+        assert_eq!(
+            below.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                required: baseline + peaks.m20,
+                limit: baseline + peaks.m20 - 1,
+            })
+        );
+        assert_eq!(below.report().peak_live_bytes(), baseline + peaks.m17);
+    }
+
+    #[test]
+    fn budgeted_first_m24_replay_exact_peak_and_cap_minus_one_are_deterministic() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let search_config = box_config(1, 0);
+        let box_variables =
+            count_tighter_auxiliary_box_endpoints(&prepared.exact_coordinate_bounds, &certified)
+                .unwrap();
+        let plan = ReluTailBoxCutOptimizerPlan::checked(
+            &domain,
+            prepared.generator_nonzeros,
+            box_variables,
+            search_config,
+        )
+        .unwrap();
+        let peaks = independent_m24_test_peaks(&prepared, plan);
+        assert!(peaks.first_replay >= peaks.m20);
+        assert!(peaks.first_replay >= peaks.endpoint_count);
+        assert!(peaks.first_replay >= peaks.search);
+
+        let baseline = 53_usize;
+        let start = Instant::now();
+        let exact = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.first_replay,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(exact.value().optional_budget_error, None);
+        assert_eq!(exact.value().optimized.exact_replays, 1);
+        assert!(exact.value().optimized.portfolio.box_cut.is_some());
+        assert_eq!(
+            exact.report().peak_live_bytes(),
+            baseline + peaks.first_replay
+        );
+
+        let below = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.first_replay - 1,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(
+            below.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::ResourceFallback
+        );
+        assert_eq!(below.value().optimized.exact_replays, 0);
+        assert!(below.value().optimized.portfolio.auxiliary.is_some());
+        assert!(below.value().optimized.portfolio.box_cut.is_none());
+        assert_result_bit_identical(
+            &exact.value().optimized.portfolio.original,
+            &below.value().optimized.portfolio.original,
+        );
+        assert_result_bit_identical(
+            exact
+                .value()
+                .optimized
+                .portfolio
+                .auxiliary
+                .as_ref()
+                .unwrap(),
+            below
+                .value()
+                .optimized
+                .portfolio
+                .auxiliary
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(
+            below.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                required: baseline + peaks.first_replay,
+                limit: baseline + peaks.first_replay - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn budgeted_second_m24_replay_accounts_for_and_retains_first_certificate() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let search_config = box_config(1, 1);
+        let box_variables =
+            count_tighter_auxiliary_box_endpoints(&prepared.exact_coordinate_bounds, &certified)
+                .unwrap();
+        let plan = ReluTailBoxCutOptimizerPlan::checked(
+            &domain,
+            prepared.generator_nonzeros,
+            box_variables,
+            search_config,
+        )
+        .unwrap();
+        let peaks = independent_m24_test_peaks(&prepared, plan);
+        assert_eq!(
+            peaks.second_replay - peaks.first_replay,
+            peaks.retained_certificate
+        );
+
+        let baseline = 67_usize;
+        let start = Instant::now();
+        let full = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.second_replay,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(full.value().optional_budget_error, None);
+        assert_eq!(full.value().optimized.exact_replays, 2);
+        assert_eq!(
+            full.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::Completed
+        );
+        assert!(full.value().optimized.portfolio.box_cut.is_some());
+        assert_eq!(
+            full.report().peak_live_bytes(),
+            baseline + peaks.second_replay
+        );
+
+        let at_first = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.first_replay,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(at_first.value().optimized.exact_replays, 1);
+        assert_eq!(
+            at_first.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::ResourceFallback
+        );
+        assert!(at_first.value().optimized.portfolio.box_cut.is_some());
+        assert_eq!(
+            at_first.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                required: baseline + peaks.second_replay,
+                limit: baseline + peaks.first_replay,
+            })
+        );
+
+        let below_first = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.first_replay - 1,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(below_first.value().optimized.exact_replays, 0);
+        assert!(below_first.value().optimized.portfolio.box_cut.is_none());
+        assert_eq!(
+            below_first.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                required: baseline + peaks.first_replay,
+                limit: baseline + peaks.first_replay - 1,
+            })
+        );
+
+        let below_second = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(
+                    start + Duration::from_secs(1),
+                    baseline,
+                    baseline + peaks.second_replay - 1,
+                ),
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(
+            below_second.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::ResourceFallback
+        );
+        assert_eq!(below_second.value().optimized.exact_replays, 1);
+        assert_box_cut_bit_identical(
+            at_first
+                .value()
+                .optimized
+                .portfolio
+                .box_cut
+                .as_ref()
+                .unwrap(),
+            below_second
+                .value()
+                .optimized
+                .portfolio
+                .box_cut
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(
+            below_second.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                required: baseline + peaks.second_replay,
+                limit: baseline + peaks.second_replay - 1,
+            })
+        );
+        assert_eq!(
+            below_second.report().peak_live_bytes(),
+            baseline + peaks.first_replay
+        );
+    }
+
+    #[test]
+    fn budgeted_m17_m20_m24_deadlines_close_optional_phase_seams() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let expired = start + Duration::from_secs(2);
+
+        for (target, expected_status, expect_auxiliary) in [
+            (
+                "prepared auxiliary ReLU-tail validation",
+                ReluTailBoxCutOptimizerStatus::AuxiliaryFallback,
+                false,
+            ),
+            (
+                "M24 candidate search startup",
+                ReluTailBoxCutOptimizerStatus::Deadline,
+                true,
+            ),
+            (
+                "M24 exact replay admission",
+                ReluTailBoxCutOptimizerStatus::Deadline,
+                true,
+            ),
+        ] {
+            let outcome = prepared
+                .bound_margin_m17_m20_m24_unwired_with_clock(
+                    &certified,
+                    &declared,
+                    None,
+                    config(0),
+                    box_config(1, 0),
+                    ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+                    |checkpoint| if checkpoint == target { expired } else { start },
+                )
+                .unwrap();
+            let receipt = outcome.value();
+            assert_eq!(receipt.optimized.search_status, expected_status);
+            assert_eq!(
+                receipt.optimized.portfolio.auxiliary.is_some(),
+                expect_auxiliary
+            );
+            assert!(receipt.optimized.portfolio.box_cut.is_none());
+            assert_eq!(receipt.optimized.exact_replays, 0);
+            assert!(
+                receipt.optimized.lower_bound >= receipt.optimized.portfolio.original.lower_bound
+            );
+            assert_eq!(
+                receipt.optional_budget_error,
+                Some(ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint: target })
+            );
+        }
+    }
+
+    #[test]
+    fn gated_box_search_keeps_candidate_deadline_distinct_from_outer_budget() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let auxiliary_result = prepared
+            .bound_margin_with_auxiliary_bounds_unwired(&certified, &declared, None, config(0))
+            .unwrap();
+        let search_config = box_config(1, 0);
+        let box_variables =
+            count_tighter_auxiliary_box_endpoints(&prepared.exact_coordinate_bounds, &certified)
+                .unwrap();
+        let plan = ReluTailBoxCutOptimizerPlan::checked(
+            &domain,
+            prepared.generator_nonzeros,
+            box_variables,
+            search_config,
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let mut outer_gate = ConstrainedZonotopeCallTracker::with_clock(
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+            |_| start,
+        )
+        .unwrap();
+        let search = optimize_auxiliary_box_multipliers_with_clock_and_call_gate(
+            &domain,
+            &prepared.exact_coordinate_bounds,
+            &certified,
+            &auxiliary_result.direction,
+            search_config,
+            plan,
+            || search_config.wall_time,
+            &mut outer_gate,
+        );
+        assert_eq!(
+            search.search.status,
+            ReluTailBoxCutOptimizerStatus::Deadline
+        );
+        assert_eq!(search.budget_error, None);
+        assert!(search.search.variables.is_empty());
+        assert!(search.search.candidates.is_empty());
+        assert!(outer_gate.report().deadline_polls() >= 2);
+    }
+
+    #[test]
+    fn budgeted_internal_box_search_deadline_retains_m17_m20() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let lower = vec![-2.0; dimension];
+        let upper = vec![2.0; dimension];
+        let remainder_only = vec![true; dimension];
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&lower, &upper, &remainder_only).unwrap();
+        let certified = auxiliary(vec![1.0; dimension], vec![2.0; dimension]);
+        let declared = margin(vec![ratio(1, 1); dimension], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let mut search_config = box_config(1, 0);
+        search_config.wall_time = Duration::from_secs(5);
+        search_config.limits.max_value_dim = dimension;
+        search_config.limits.max_box_variables = dimension;
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let expired = start + Duration::from_secs(2);
+        let interior_polls = Cell::new(0_usize);
+        let outcome = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                search_config,
+                ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+                |checkpoint| {
+                    if checkpoint == "M24 candidate direction and witness initialization" {
+                        interior_polls.set(interior_polls.get() + 1);
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(interior_polls.get(), 1);
+        assert_eq!(
+            outcome.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::Deadline
+        );
+        assert!(outcome.value().optimized.portfolio.auxiliary.is_some());
+        assert!(outcome.value().optimized.portfolio.box_cut.is_none());
+        assert_eq!(outcome.value().optimized.exact_replays, 0);
+        assert_eq!(
+            outcome.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                checkpoint: "M24 candidate direction and witness initialization",
+            })
+        );
+    }
+
+    #[test]
+    fn budgeted_exact_box_cut_publication_deadline_rolls_back_partial_certificate() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let expired = start + Duration::from_secs(2);
+        let publication_polls = Cell::new(0_usize);
+        let outcome = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(1, 0),
+                ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+                |checkpoint| {
+                    if checkpoint == "M24 exact Box-cut publication" {
+                        publication_polls.set(publication_polls.get() + 1);
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(publication_polls.get(), 1);
+        assert_eq!(
+            outcome.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::Deadline
+        );
+        assert!(outcome.value().optimized.portfolio.auxiliary.is_some());
+        assert!(outcome.value().optimized.portfolio.box_cut.is_none());
+        assert_eq!(
+            outcome.value().optimized.portfolio.status,
+            ReluTailBoxCutStatus::CandidateFallback
+        );
+        assert_eq!(outcome.value().optimized.exact_replays, 1);
+        assert_eq!(
+            outcome.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                checkpoint: "M24 exact Box-cut publication",
+            })
+        );
+    }
+
+    #[test]
+    fn budgeted_second_replay_deadline_retains_first_certificate_bitwise() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let expired = start + Duration::from_secs(2);
+
+        let first_only = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(1, 0),
+                ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+                |_| start,
+            )
+            .unwrap();
+        let first_certificate = first_only
+            .value()
+            .optimized
+            .portfolio
+            .box_cut
+            .as_ref()
+            .unwrap();
+
+        let replay_admissions = Cell::new(0_usize);
+        let interrupted = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(1, 1),
+                ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+                |checkpoint| {
+                    if checkpoint == "M24 exact replay admission" {
+                        let admission = replay_admissions.get() + 1;
+                        replay_admissions.set(admission);
+                        if admission == 2 {
+                            return expired;
+                        }
+                    }
+                    start
+                },
+            )
+            .unwrap();
+        assert_eq!(replay_admissions.get(), 2);
+        assert_eq!(
+            interrupted.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::Deadline
+        );
+        assert_eq!(interrupted.value().optimized.exact_replays, 1);
+        assert_box_cut_bit_identical(
+            first_certificate,
+            interrupted
+                .value()
+                .optimized
+                .portfolio
+                .box_cut
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(
+            interrupted.value().optional_budget_error,
+            Some(ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                checkpoint: "M24 exact replay admission",
+            })
+        );
+    }
+
+    #[test]
+    fn budgeted_bound_failure_on_first_m24_candidate_continues_to_second() {
+        let domain =
+            ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
+        let certified = auxiliary(vec![1.0], vec![2.0]);
+        let declared = margin(vec![ratio(1, 1)], ratio(0, 1));
+        let prepared = prepare_relu_tail_triangle_dual_unwired(&domain).unwrap();
+        let start = Instant::now();
+        let budget =
+            ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX);
+
+        let second_only = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(0, 1),
+                budget,
+                |_| start,
+            )
+            .unwrap();
+        let second_certificate = second_only
+            .value()
+            .optimized
+            .portfolio
+            .box_cut
+            .as_ref()
+            .unwrap();
+
+        BOX_OPTIMIZER_FAIL_NEXT_EXACT_REPLAY.with(|fail| fail.set(true));
+        let continued = prepared
+            .bound_margin_m17_m20_m24_unwired_with_clock(
+                &certified,
+                &declared,
+                None,
+                config(0),
+                box_config(1, 1),
+                budget,
+                |_| start,
+            )
+            .unwrap();
+        assert_eq!(continued.value().optional_budget_error, None);
+        assert_eq!(continued.value().optimized.exact_replays, 2);
+        assert_eq!(
+            continued.value().optimized.search_status,
+            ReluTailBoxCutOptimizerStatus::ExactReplayFallback
+        );
+        assert_box_cut_bit_identical(
+            second_certificate,
+            continued
+                .value()
+                .optimized
+                .portfolio
+                .box_cut
+                .as_ref()
+                .unwrap(),
+        );
+    }
+
+    #[test]
     fn optimized_box_multipliers_strictly_close_lower_and_upper_one_dimensional_gaps() {
         let lower_domain =
             ConstrainedZonotope64::from_certified_bounds(&[-2.0], &[2.0], &[false]).unwrap();
@@ -4847,7 +12785,7 @@ mod tests {
         assert!(preallocation.candidates.is_empty());
         assert_eq!(preallocation.candidates_scored, 0);
 
-        let clock_calls = std::cell::Cell::new(0_usize);
+        let clock_calls = Cell::new(0_usize);
         let miditeration = optimize_auxiliary_box_multipliers_with_clock(
             &domain,
             &prepared.exact_coordinate_bounds,

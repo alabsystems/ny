@@ -10,19 +10,30 @@
 #   transposedConvPadding, upsample, small_transformer variants
 # - Architecture: Gemm → Reshape → ConvTranspose+BN+ReLU (gen) → Conv+ReLU+BN (disc) → Gemm
 # - 5-dimensional latent input, scalar output — extremely small search space
-# - 21 instances with official per-row budgets of 900s, 1200s, or 1800s;
-#   among the five retained timeout targets, upsample prop_0 is 1200s and the
-#   other four are 900s
-# - RETAINED PROJECTION STATUS: 16/21 official rows decided (12 sat, 4 unsat)
-#   and five timeouts. The legacy CSV lacks sealed per-row run provenance; these
-#   counts are planning input, not audited solve evidence.
+# - 21 instances with official per-row budgets of 900s, 1200s, or 1800s
+# - RETAINED PROJECTION STATUS: 12 sat and 9 timeout rows. The legacy CSV lacks
+#   sealed per-row run provenance, so these counts are planning input rather
+#   than audited solve evidence.
 # - Disjunctive properties: multi-constraint output specifications
-# - Graph model (Reshape between Gemm and ConvTranspose) — CROWN-IBP disabled
+# - Sequential ConvTranspose2d+Conv2d graph after ONNX normalization
 # - alpha-beta-CROWN reference: solves all instances
 
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
   csv_name: instances.csv
+
+model:
+  # cGAN is a measured rewrite class: the historical f32 ConvTranspose/Gemm
+  # BatchNorm folds can exclude the authored ONNX function from NY's certified
+  # enclosure. Preserve the authored nodes for every official verdict.
+  batch_norm_folding: preserve_raw
+  # Fail before verification if any loader rewrite still changes a raw FLOAT
+  # initializer despite the raw-BN policy.
+  require_authored_float32_initializers: true
+  # Default-dark until a sealed physical-GB10 A/B and the 21-row authored-graph
+  # moat pass. This key, not an environment variable, is the only production
+  # admission path for the forward-map alpha surrogate.
+  cgan_forward_alpha_surrogate: false
 
 attack:
   pgd_order: before
@@ -41,11 +52,13 @@ bab:
   # longer budget only lets the chunked CROWN backward finish.
   crown_ibp_per_node_cap_secs: 150
   phase_budget:
-    # Measured (prop_1 at 900 s with the cap lever active, 2026-07-10):
-    # disjunctive PGD burned ~8 min (0.50 fraction + attack extension) before
-    # any bound work. The 2 sat cgan instances fall to PGD in <2 s, so a much
-    # smaller upfront fraction loses nothing on them (root-cause doc item 2).
+    # All retained SAT rows found by the attack are found in under 2 s. On the
+    # official row-7 holdout, the uncapped 0.10 fraction spent 85.1 s before
+    # proof search. Keep the fraction for small-budget behavior but cap its
+    # absolute work. Fewer attack steps cannot create a wrong verdict: every SAT
+    # result is still ORT-confirmed; a missed witness only falls through to BaB.
     disjunctive_pgd_fraction: 0.10
+    disjunctive_pgd_max_secs: 5
     # Disable the adaptive attack extension (#attack-extend) for cgan: the
     # reachable set hugs the disjunctive band thresholds, so every UNSAT
     # instance reports a "promising" margin (measured prop_1 @300 s:
@@ -54,65 +67,38 @@ bab:
     # the sat instances fall to PGD inside the base slice, so the extension
     # only starves the bound phases. NY_ATTACK_EXTEND_FRAC still overrides.
     attack_extension_fraction: 0.0
-    # The alpha warmup RE-RUNS the CROWN-IBP collection several times
-    # (reference bounds, the iteration-0 output backward, sequential-alpha
-    # re-references), each ~55-93 s for the full 8-node set (28,800-dim BN_11
-    # chunked backward 18-26 s + the disc convs), and the LAST (truncated)
-    # collection is the one whose node bounds reach the BaB loop. Measured
-    # roots on prop_1 at 900 s: fraction 0.20 -> [-1628, 673]; 0.30 ->
-    # [-2215, 1054]; 0.40 -> [-1293, 595]; 0.45 -> [-1212, 580] (best; the
-    # 4th collection completes all 8 nodes but a 5th truncated re-collection
-    # still degrades the decisive map). Realizing the measured full-collection
-    # root ([-127.9, 138.4]) in-pipeline needs the collection re-run chain
-    # deduplicated (cache/share one map across precheck + alpha warmup) —
-    # that is the next lever; no preset fraction can express it.
+    # The forward-linear ConvTranspose reference route now builds and reuses one
+    # sound map in about 0.1-0.3 s. Retain the historical fraction as generous
+    # fail-closed headroom; the aggregate alpha refresh cap below prevents it
+    # from scaling with the official wall budget.
     initial_bounds_fraction: 0.45
-    # Companion to the input-keyed CROWN-IBP collection cache
-    # (#cgan-collection-cache): the cache serves the FIRST COMPLETE collection
-    # to every later same-box consumer (alpha-warmup reference bounds,
-    # iteration-0 output backward, sequential-alpha re-reference), so making
-    # the PRECHECK's collection complete deduplicates the entire chain.
-    # BatchNormalization_11's chunked backward costs ~95 s alone (the 142 s
-    # full-collection probe minus ~47 s for the other 7 nodes — the "18-26 s"
-    # in the earlier comment was the per-chunk, not per-node, cost). The
-    # equal-share per-node budget divides the remaining slice by the number of
-    # remaining candidates (6 at BN_11), so BN_11's share reaches 95 s only
-    # when the slice is >= ~590 s. Measured truncations at the share wire:
-    # slice 180 s (default 0.20) -> BN_11 "took 27-30 s"; 315 s (0.35) ->
-    # 49.7 s; 405 s (0.45) -> 61.6 s — every one PerNodeDeadlineExceeded, map
-    # stuck at 7 of 8 CROWN nodes, realized root [-829, 618]. 0.75 (675 s
-    # slice) puts BN_11's share at ~110 s. The slice is an upper bound, NOT
-    # spend: the precheck returns as soon as the ~150 s collection finishes,
-    # and the collection cache then serves the complete map to the alpha
-    # warmup and BaB bootstrap (zero re-collection). The principled successor
-    # is a dim/chunk-aware per-node share. Measured complete-map root:
-    # [-127.9, 138.4] (threshold +-0.33).
-    # 0.75 -> 0.85 (2026-07-10): at 0.75 BN_11's share is ~110 s, which a
-    # thermally-throttled run measured as too tight (BN_11 needed 112 s ->
-    # PerNodeDeadlineExceeded -> collection marked incomplete -> cache never
-    # served -> THREE re-collections ate the warmup slice and BaB started
-    # from the worst map [-829, 618]). 0.85 puts the share at ~125 s. The
-    # same-key intersection merge in the collection cache (#cgan-collection-
-    # cache v2) additionally makes any re-runs monotonically tightening.
+    # The precheck also exits as soon as the cached forward-linear map is
+    # available, so this is a ceiling rather than reserved/spent time.
     disjunctive_precheck_fraction: 0.85
+    # Upfront PGD already covers the retained SAT behavior. The official
+    # holdout's inherited 10% post-BaB reservation cut off a nearly closed tree
+    # at 749 explored / 740 verified and then spent 40.5 s on another failed
+    # attack. Give that schedule-only slice to the proof tree instead.
+    post_bab_pgd_fraction: 0.0
+    # The independent VNN-COMP exact-gradient fallback measured 39.8 s with no
+    # witness on the same holdout. Opt it out explicitly; paired with the zero
+    # engine fraction above, the wrapper gives the scalable tail to proof.
+    vnncomp_post_bab_attack: false
   branching:
     method: input
     candidates: 5
     reduceop: max
     input_split:
-      # Reordered input-split BaB (bound -> filter -> split -> clip) with the
-      # batched rebound lane: 64 domains per pop instead of 1, measured 3.4x
-      # domain throughput on cGAN_imgSz32_nCh_1 (5.8 -> 19.5 domains/s).
-      # Reference: alpha-beta-CROWN acasxu.yaml (same 5-d input-split shape).
-      # step-2B measurement: reorder OFF to unmask per-domain warm alpha.
-      # step-2C (2026-07-19) was invalid as an overlay A/B because reordered
-      # grouped children carried no inherited alpha. The root/deferred seeding
-      # fix is now present, but scratchpad/cgan_step2d.csv has no immutable run
-      # manifest, exact artifact identities, input hashes, or retained logs.
-      # Keep reorder OFF until the engaged route reproduces on the current,
-      # remote-aligned artifact under the fail-closed measurement wrapper.
+      # Keep the eager best-first path in production until the reordered
+      # warm-parallel canary closes an official-budget row. The repaired route
+      # is active and sound, but at batch 64 it breadth-expanded to 319 domains
+      # without a verified child in 120 s. Batch 8 was much healthier (319
+      # explored / 117 verified, queue 104 -> ~90), but did not yet decide.
       reorder_bab: false
-      alpha_iteration: 5
+      # One warm step is the measured sweet spot on official row 7: 116 explored
+      # / 106 verified at 180 s, versus 34 / 23 at 120 s with five steps.
+      # Two steps were slower (51 / 40 at 120 s) without tighter convergence.
+      alpha_iteration: 1
       lr_alpha: 0.05
       # Batched IBP prescreen before the CROWN rebound for child domains.
       ibp_enhancement: true
@@ -134,6 +120,20 @@ bab:
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100
+    # Root-only complete cascade: the fast forward-linear map is a sound
+    # baseline but leaves nCh_1 prop_1 at roughly [-2.58, 3.92]. The ordinary
+    # eight-target CROWN-IBP cascade completes in ~101 s on the current sound
+    # CPU route and tightens the same official box to [0.29993, 0.32200],
+    # proving the band at the root. Children explicitly clear this policy and
+    # retain the fast forward-linear map.
+    cgan_complete_crown_ibp_root: true
+    # Aggregate scheduling-only ceiling: the 900 s row spent 77.6 s refreshing
+    # unchanged references, while the 120 s control needed about 10 s.
+    reference_refresh_max_secs: 12
+    # Endgame scheduling: once a child-specific forward-linear map refuses
+    # below its 30 s cold-build floor, use the same sound plain-IBP fallback
+    # directly instead of spending the remaining slice in futile CROWN-IBP.
+    forward_linear_deadline_fallback_to_ibp: true
   beta_crown:
     lr_alpha: 0.1
     lr_beta: 0.15

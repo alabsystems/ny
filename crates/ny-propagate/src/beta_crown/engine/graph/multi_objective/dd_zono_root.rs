@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Root wiring for the certified double-double zonotope (`#dd-zonotope`,
-//! dark `NY_DD_ZONOTOPE=1`, default-OFF).
+//! default-ON for the fail-closed sparse-input detector; `NY_DD_ZONOTOPE=0`
+//! is the kill switch).
 //!
 //! # Where this sits and why
 //!
@@ -25,11 +26,14 @@
 //!
 //! # Soundness contract
 //!
-//! * Gate-off (`NY_DD_ZONOTOPE` unset) short-circuits before any allocation,
-//!   so the path is byte-identical to today — asserted by
-//!   `dd_zono_root_gate_off_is_inert`.
-//! * The detector is conjunctive and narrow (large image input, `k <= 128`,
-//!   full op-surface support), so no other VNN-COMP category is reachable.
+//! * The explicit `NY_DD_ZONOTOPE=0` kill switch short-circuits before any
+//!   allocation. With no preset or environment override, the built-in detector
+//!   remains narrow (large image input, `k <= 128`, full op-surface support)
+//!   and declines unsupported/non-sparse instances before allocation.
+//! * Typed preset plumbing can broaden only the detector's admission/resource
+//!   caps. No shipped preset currently does so; a future arming must state and
+//!   measure the larger category scope. The soundness gates remain outside the
+//!   preset surface.
 //! * The self-policing precision gate refuses when the CERTIFIED rounding
 //!   half-width is not far below the margin — "is double-double enough for
 //!   THIS network?" is answered at runtime.
@@ -39,7 +43,8 @@
 
 use std::time::{Duration, Instant};
 
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_core::{f64_to_f32_down, f64_to_f32_up};
+use ny_tensor::BoundedTensor;
 
 use crate::dd_zonotope::{
     dd_zonotope_enabled, dd_zonotope_margins, DdZonoConfig, DdZonoMargin, DdZonoPlan,
@@ -86,11 +91,20 @@ pub(super) fn run_dd_zono_root(
     input: &BoundedTensor,
     objectives: &[Vec<f32>],
     deadline: Option<Instant>,
+    config: &crate::BetaCrownConfig,
 ) -> Option<DdZonoRootResult> {
     if !dd_zonotope_enabled() {
         return None;
     }
-    let cfg = DdZonoConfig::from_env();
+    // Admission caps only (#metaroom-ddzono): the preset may resize the
+    // detector's blast-radius/resource caps; env knobs keep precedence and the
+    // soundness gates are not reachable from here.
+    let cfg = DdZonoConfig::from_env().with_admission_overrides(
+        config.dd_zonotope_min_input_numel,
+        config.dd_zonotope_max_k,
+        config.dd_zonotope_max_generators,
+        config.dd_zonotope_collect_interm,
+    );
     let plan = DdZonoPlan::detect(graph, input, &cfg)?;
     let now = Instant::now();
     let pass_deadline = budget(now, deadline)?;
@@ -185,8 +199,8 @@ pub(super) fn intersect_objective_bounds(
         }
         // Round OUTWARD on the f64 -> f32 narrowing so the published f32
         // interval still encloses the certified f64 one.
-        let lo32 = next_down_f32(lo as f32);
-        let hi32 = next_up_f32(hi as f32);
+        let lo32 = f64_to_f32_down(lo);
+        let hi32 = f64_to_f32_up(hi);
         if !lo32.is_finite() || !hi32.is_finite() || lo32 > hi32 {
             continue;
         }
@@ -240,6 +254,7 @@ mod tests {
             output_lower: vec![],
             output_upper: vec![],
             output_shape: vec![],
+            interm: std::collections::HashMap::new(),
             n_generators: 1,
             wall: Duration::from_secs(0),
         }

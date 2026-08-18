@@ -82,8 +82,9 @@ fn assert_speaker_encoder_layer_inventory(model: &OnnxModel) {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(60000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_load_avoice_speaker_encoder_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = shared::avoice_speaker_encoder();
 
     assert_speaker_encoder_io_shapes(model);
@@ -92,8 +93,9 @@ fn test_load_avoice_speaker_encoder_3499() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_ibp_avoice_speaker_encoder_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = shared::avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = shared::bounded_speaker_encoder_input(
@@ -116,8 +118,9 @@ fn test_graph_ibp_avoice_speaker_encoder_3499() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_ibp_avoice_speaker_encoder_rejects_t4_3873() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = shared::avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = shared::bounded_speaker_encoder_input(model, 4, shared::SPEAKER_ENCODER_EPSILON);
@@ -139,8 +142,9 @@ fn test_graph_ibp_avoice_speaker_encoder_rejects_t4_3873() {
 /// Part of #3600.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_ibp_avoice_speaker_encoder_multi_seq_len_3600() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = shared::avoice_speaker_encoder();
     for &dynamic_t in &[SPEAKER_ENCODER_SEQUENCE_LEN, 16] {
         let graph = model
@@ -170,8 +174,9 @@ fn test_graph_ibp_avoice_speaker_encoder_multi_seq_len_3600() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_crown_avoice_speaker_encoder_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = shared::avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = shared::bounded_speaker_encoder_input(
@@ -205,8 +210,9 @@ fn test_graph_crown_avoice_speaker_encoder_3499() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_collect_node_bounds_avoice_speaker_encoder_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = shared::avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = shared::bounded_speaker_encoder_input(

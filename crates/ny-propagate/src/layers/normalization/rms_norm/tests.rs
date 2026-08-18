@@ -264,9 +264,16 @@ fn test_invalid_eps_rejected() {
 }
 
 #[test]
-fn test_eps_floor_applied() {
-    let rn = RmsNormLayer::new_default(3, 0.0).expect("valid RmsNorm with eps=0");
-    assert!(rn.eps > 0.0, "eps should be clamped above zero");
+fn test_eps_below_supported_minimum_rejected() {
+    assert!(RmsNormLayer::new_default(3, 0.0).is_err());
+    assert!(RmsNormLayer::new_default(
+        3,
+        f32::from_bits(crate::layers::normalization::NORMALIZATION_MIN_EPS.to_bits() - 1),
+    )
+    .is_err());
+    let rn = RmsNormLayer::new_default(3, crate::layers::normalization::NORMALIZATION_MIN_EPS)
+        .expect("minimum supported epsilon must remain exact");
+    assert_eq!(rn.eps, crate::layers::normalization::NORMALIZATION_MIN_EPS);
 }
 
 // ── Sampling-based IBP soundness test (brute force) ─────────────────────────

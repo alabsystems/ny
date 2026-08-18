@@ -2,11 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{LayerType, NyError, Result};
 use ny_propagate::layers::{
     AbsLayer, ArctanLayer, CausalSoftmaxLayer, CeilLayer, CeluLayer, ClipLayer, CompareLayer,
-    CompareOp, CompareTensorLayer, CosLayer, EluLayer, ExpLayer, FloorLayer, GELULayer,
+    CompareOp, CompareTensorLayer, CosLayer, EluLayer, ErfLayer, ExpLayer, FloorLayer, GELULayer,
     GeluApproximation, HardSigmoidLayer, HardSwishLayer, LeakyReLULayer, LogLayer, LogSoftmaxLayer,
     MishLayer, MulConstantLayer, PReluLayer, ReLULayer, ReciprocalLayer, RoundLayer, SeluLayer,
     ShrinkLayer, SiLULayer, SigmoidLayer, SignLayer, SinLayer, SnakeLayer, SoftmaxLayer,
@@ -90,6 +90,173 @@ fn validate_clip_bounds(op_name: &str, node_name: &str, min_val: f32, max_val: f
         )));
     }
     Ok(())
+}
+
+fn clip_bound_input(
+    context: &ConvertContext<'_>,
+    spec: &LayerSpec,
+    index: usize,
+    bound_name: &str,
+) -> Result<Option<f32>> {
+    let Some(input_name) = spec.inputs.get(index).filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+    let tensor = context.constant_value(input_name).ok_or_else(|| {
+        NyError::UnsupportedOp(format!(
+            "Clip {} {bound_name} input '{}' must be a constant scalar",
+            spec.name, input_name
+        ))
+    })?;
+    if tensor.ndim() != 0 || tensor.len() != 1 {
+        return Err(NyError::UnsupportedOp(format!(
+            "Clip {} {bound_name} input '{}' must be a rank-0 scalar, got shape {:?}",
+            spec.name,
+            input_name,
+            tensor.shape()
+        )));
+    }
+    Ok(tensor.iter().next().copied())
+}
+
+fn prelu_slope_values(context: &ConvertContext<'_>, spec: &LayerSpec) -> Result<Array1<f32>> {
+    if spec.inputs.len() != 2 || spec.inputs.iter().any(String::is_empty) {
+        return Err(NyError::ModelLoad(format!(
+            "PRelu {} requires exactly two non-empty inputs, got {:?}",
+            spec.name, spec.inputs
+        )));
+    }
+    for (name, value) in &spec.attributes {
+        if name != "consumed_inputs" || !matches!(value, AttributeValue::Ints(_)) {
+            return Err(NyError::ModelLoad(format!(
+                "PRelu {} has unsupported attribute '{name}'",
+                spec.name
+            )));
+        }
+    }
+
+    let slope_name = &spec.inputs[1];
+    let slope = context.constant_value(slope_name).ok_or_else(|| {
+        NyError::UnsupportedOp(format!(
+            "PRelu {} required slope input '{}' must be constant; dynamic slopes are not represented",
+            spec.name, slope_name
+        ))
+    })?;
+    if slope.is_empty() {
+        return Err(NyError::ModelLoad(format!(
+            "PRelu {} has empty slope tensor from '{}'",
+            spec.name, slope_name
+        )));
+    }
+    if slope.iter().any(|value| !value.is_finite()) {
+        return Err(NyError::ModelLoad(format!(
+            "PRelu {} slope tensor '{}' must contain only finite FLOAT32 values",
+            spec.name, slope_name
+        )));
+    }
+
+    let input_name = &spec.inputs[0];
+    let input_shape = context.tensor_shapes.get(input_name);
+    let slope_shape = slope.shape();
+    if slope.len() == 1 {
+        // A rank-0 scalar never changes output shape. Tensor-shaped singleton
+        // constants are safe only when their unidirectional broadcast is
+        // proven not to add a leading dimension to X.
+        if !slope_shape.is_empty() {
+            let input_shape = input_shape.ok_or_else(|| {
+                NyError::UnsupportedOp(format!(
+                    "PRelu {} cannot authenticate singleton slope shape {:?} against unknown input shape '{}'",
+                    spec.name, slope_shape, input_name
+                ))
+            })?;
+            if slope_shape.len() > input_shape.len()
+                || slope_shape.iter().rev().zip(input_shape.iter().rev()).any(
+                    |(&slope_dim, &input_dim)| {
+                        slope_dim != 1 && (input_dim <= 0 || slope_dim as i64 != input_dim)
+                    },
+                )
+            {
+                return Err(NyError::UnsupportedOp(format!(
+                    "PRelu {} singleton slope shape {:?} is not shape-preserving for input shape {:?}",
+                    spec.name, slope_shape, input_shape
+                )));
+            }
+        }
+        let scalar = slope.iter().next().copied().ok_or_else(|| {
+            NyError::ModelLoad(format!("PRelu {} has empty slope tensor", spec.name))
+        })?;
+        return Ok(Array1::from_elem(1, scalar));
+    }
+
+    let input_shape = input_shape.ok_or_else(|| {
+        NyError::UnsupportedOp(format!(
+            "PRelu {} requires a known input shape to authenticate per-channel slope shape {:?}",
+            spec.name, slope_shape
+        ))
+    })?;
+    let channel_axis = if context.model_unbatched { 0 } else { 1 };
+    if input_shape.len() <= channel_axis {
+        return Err(NyError::UnsupportedOp(format!(
+            "PRelu {} input shape {:?} has no represented channel axis",
+            spec.name, input_shape
+        )));
+    }
+    let channels = usize::try_from(input_shape[channel_axis])
+        .ok()
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| {
+            NyError::UnsupportedOp(format!(
+                "PRelu {} cannot authenticate unresolved channel extent in input shape {:?}",
+                spec.name, input_shape
+            ))
+        })?;
+    if slope.len() != channels {
+        return Err(NyError::UnsupportedOp(format!(
+            "PRelu {} slope shape {:?} has {} values, expected {channels} channels for input shape {:?}",
+            spec.name,
+            slope_shape,
+            slope.len(),
+            input_shape
+        )));
+    }
+
+    let canonical_shape: Vec<usize> = if context.model_unbatched {
+        std::iter::once(channels)
+            .chain(std::iter::repeat_n(1, input_shape.len().saturating_sub(1)))
+            .collect()
+    } else {
+        std::iter::once(channels)
+            .chain(std::iter::repeat_n(1, input_shape.len().saturating_sub(2)))
+            .collect()
+    };
+    let batch_explicit_shape: Vec<usize> = if context.model_unbatched {
+        Vec::new()
+    } else {
+        std::iter::once(1)
+            .chain(canonical_shape.iter().copied())
+            .collect()
+    };
+    if slope_shape != canonical_shape.as_slice() && slope_shape != batch_explicit_shape.as_slice() {
+        return Err(NyError::UnsupportedOp(format!(
+            "PRelu {} slope shape {:?} is not the represented per-channel layout {:?}{} for input shape {:?}; last-axis [C] broadcasting is not channel-wise for rank > 2",
+            spec.name,
+            slope_shape,
+            canonical_shape,
+            if batch_explicit_shape.is_empty() {
+                String::new()
+            } else {
+                format!(" or {:?}", batch_explicit_shape)
+            },
+            input_shape
+        )));
+    }
+
+    let slope_len = slope.len();
+    slope.into_shape_with_order(slope_len).map_err(|error| {
+        NyError::ModelLoad(format!(
+            "PRelu {} could not flatten authenticated slope '{}': {error}",
+            spec.name, slope_name
+        ))
+    })
 }
 
 fn tensor_shape_usize(context: &ConvertContext<'_>, name: &str) -> Option<Vec<usize>> {
@@ -236,39 +403,100 @@ impl ConvertContext<'_> {
                 Ok(Some(Layer::GELU(GELULayer::new(approximation))))
             }
             LayerType::SiLU => {
-                if let Some(AttributeValue::Float(beta)) = spec.attributes.get("beta") {
-                    if (beta - 1.0).abs() > 1.0e-6 {
-                        return Err(NyError::InvalidSpec(format!(
-                            "Swish/SiLU beta {} unsupported (expected 1.0)",
-                            beta
-                        )));
+                // Standard ONNX Swish-24 calls this coefficient `alpha`.
+                // Retain `beta` only as a strict custom-domain compatibility
+                // spelling. `SiLULayer` implements exactly x * sigmoid(x), so
+                // any other value changes the authored function.
+                if spec.attributes.contains_key("alpha") && spec.attributes.contains_key("beta") {
+                    return Err(NyError::ModelLoad(format!(
+                        "Swish/SiLU {} cannot define both alpha and beta",
+                        spec.name
+                    )));
+                }
+                for (name, attribute) in &spec.attributes {
+                    match (name.as_str(), attribute) {
+                        ("alpha" | "beta", AttributeValue::Float(value)) if *value == 1.0 => {}
+                        ("alpha" | "beta", AttributeValue::Float(value)) => {
+                            return Err(NyError::InvalidSpec(format!(
+                                "Swish/SiLU {name} {value} unsupported (expected 1.0)"
+                            )));
+                        }
+                        ("alpha" | "beta", _) => {
+                            return Err(NyError::ModelLoad(format!(
+                                "Swish/SiLU {} attribute '{name}' must be FLOAT",
+                                spec.name
+                            )));
+                        }
+                        _ => {
+                            return Err(NyError::ModelLoad(format!(
+                                "Swish/SiLU {} has unsupported attribute '{name}'",
+                                spec.name
+                            )));
+                        }
                     }
                 }
                 Ok(Some(Layer::SiLU(SiLULayer::new())))
             }
             LayerType::Sigmoid => Ok(Some(Layer::Sigmoid(SigmoidLayer))),
             LayerType::Tanh => Ok(Some(Layer::Tanh(TanhLayer))),
+            LayerType::Erf => {
+                if spec.inputs.len() != 1 || spec.inputs[0].is_empty() {
+                    return Err(NyError::ModelLoad(format!(
+                        "Erf {} requires exactly one non-empty input, got {:?}",
+                        spec.name, spec.inputs
+                    )));
+                }
+                if !spec.attributes.is_empty() {
+                    return Err(NyError::ModelLoad(format!(
+                        "Erf {} has unsupported attributes {:?}; standard ONNX Erf has none",
+                        spec.name,
+                        spec.attributes.keys().collect::<Vec<_>>()
+                    )));
+                }
+                Ok(Some(Layer::Erf(ErfLayer)))
+            }
             LayerType::Softplus => Ok(Some(Layer::Softplus(SoftplusLayer))),
             LayerType::Clip => {
+                if !(1..=3).contains(&spec.inputs.len())
+                    || spec.inputs[0].is_empty()
+                    || spec.outputs.len() != 1
+                    || spec.outputs[0].is_empty()
+                {
+                    return Err(NyError::ModelLoad(format!(
+                        "Clip {} has invalid inputs {:?} or outputs {:?}",
+                        spec.name, spec.inputs, spec.outputs
+                    )));
+                }
+                for (name, value) in &spec.attributes {
+                    let valid = matches!(
+                        (name.as_str(), value),
+                        ("min" | "max", AttributeValue::Float(_))
+                            | ("consumed_inputs", AttributeValue::Ints(_))
+                    );
+                    if !valid {
+                        return Err(NyError::ModelLoad(format!(
+                            "Clip {} has unsupported or wrong-typed attribute '{name}'",
+                            spec.name
+                        )));
+                    }
+                }
+                let min_input = clip_bound_input(self, spec, 1, "min")?;
+                let max_input = clip_bound_input(self, spec, 2, "max")?;
+                if spec.attributes.contains_key("min") && min_input.is_some()
+                    || spec.attributes.contains_key("max") && max_input.is_some()
+                {
+                    return Err(NyError::ModelLoad(format!(
+                        "Clip {} cannot specify the same bound by both attribute and input",
+                        spec.name
+                    )));
+                }
                 let min_val = match spec.attributes.get("min") {
                     Some(AttributeValue::Float(v)) => *v,
-                    _ => spec
-                        .inputs
-                        .get(1)
-                        .and_then(|name| self.weights.get(name))
-                        .and_then(|t| t.as_slice())
-                        .and_then(|s| s.first().copied())
-                        .unwrap_or(f32::NEG_INFINITY),
+                    _ => min_input.unwrap_or(f32::NEG_INFINITY),
                 };
                 let max_val = match spec.attributes.get("max") {
                     Some(AttributeValue::Float(v)) => *v,
-                    _ => spec
-                        .inputs
-                        .get(2)
-                        .and_then(|name| self.weights.get(name))
-                        .and_then(|t| t.as_slice())
-                        .and_then(|s| s.first().copied())
-                        .unwrap_or(f32::INFINITY),
+                    _ => max_input.unwrap_or(f32::INFINITY),
                 };
                 validate_clip_bounds("Clip", &spec.name, min_val, max_val)?;
                 Ok(Some(Layer::Clip(ClipLayer::new(min_val, max_val))))
@@ -282,43 +510,51 @@ impl ConvertContext<'_> {
                 let layer = EluLayer::new(alpha);
                 Ok(Some(Layer::Elu(layer)))
             }
-            LayerType::Selu => Ok(Some(Layer::Selu(SeluLayer::new()))),
-            LayerType::PRelu => {
-                if spec.inputs.len() >= 2 {
-                    let slope_name = &spec.inputs[1];
-                    if let Some(slope_arr) = self.weights.get(slope_name) {
-                        let slope_1d = slope_arr
-                            .clone()
-                            .into_shape_with_order(slope_arr.len())
-                            .map_err(|err| {
-                                NyError::ModelLoad(format!(
-                                    "PRelu {} invalid slope shape from '{}': {err}",
-                                    spec.name, slope_name
-                                ))
-                            })?;
-                        if slope_1d.is_empty() {
-                            return Err(NyError::ModelLoad(format!(
-                                "PRelu {} has empty slope tensor from '{}'",
-                                spec.name, slope_name
-                            )));
-                        }
-                        debug!(
-                            "PRelu: loaded {} slopes from {}",
-                            slope_1d.len(),
-                            slope_name
-                        );
-                        Ok(Some(Layer::PRelu(PReluLayer::new(slope_1d)?)))
-                    } else {
-                        debug!(
-                            "PRelu: slope {} not found in weights, using default 0.25",
-                            slope_name
-                        );
-                        Ok(Some(Layer::PRelu(PReluLayer::from_scalar(0.25))))
+            LayerType::Selu => {
+                let alpha = match spec.attributes.get("alpha") {
+                    Some(AttributeValue::Float(value)) => *value,
+                    Some(_) => {
+                        return Err(NyError::ModelLoad(format!(
+                            "Selu {} attribute 'alpha' must be FLOAT",
+                            spec.name
+                        )));
                     }
-                } else {
-                    debug!("PRelu: no slope input, using default 0.25");
-                    Ok(Some(Layer::PRelu(PReluLayer::from_scalar(0.25))))
+                    None => SeluLayer::ALPHA,
+                };
+                let gamma = match spec.attributes.get("gamma") {
+                    Some(AttributeValue::Float(value)) => *value,
+                    Some(_) => {
+                        return Err(NyError::ModelLoad(format!(
+                            "Selu {} attribute 'gamma' must be FLOAT",
+                            spec.name
+                        )));
+                    }
+                    None => SeluLayer::LAMBDA,
+                };
+                if alpha.to_bits() != SeluLayer::ALPHA.to_bits()
+                    || gamma.to_bits() != SeluLayer::LAMBDA.to_bits()
+                {
+                    return Err(NyError::UnsupportedOp(format!(
+                        "Selu {} coefficients alpha={alpha}, gamma={gamma} are unsupported; expected the implemented ONNX defaults alpha={}, gamma={}",
+                        spec.name,
+                        SeluLayer::ALPHA,
+                        SeluLayer::LAMBDA
+                    )));
                 }
+                for name in spec.attributes.keys() {
+                    if !matches!(name.as_str(), "alpha" | "gamma") {
+                        return Err(NyError::ModelLoad(format!(
+                            "Selu {} has unsupported attribute '{name}'",
+                            spec.name
+                        )));
+                    }
+                }
+                Ok(Some(Layer::Selu(SeluLayer::new())))
+            }
+            LayerType::PRelu => {
+                let slope = prelu_slope_values(self, spec)?;
+                debug!("PRelu: authenticated {} slope value(s)", slope.len());
+                Ok(Some(Layer::PRelu(PReluLayer::new(slope)?)))
             }
             LayerType::HardSigmoid => {
                 let alpha = match spec.attributes.get("alpha") {
@@ -428,10 +664,28 @@ impl ConvertContext<'_> {
             LayerType::Floor => Ok(Some(Layer::Floor(FloorLayer::new()))),
             LayerType::Ceil => Ok(Some(Layer::Ceil(CeilLayer::new()))),
             LayerType::Round => Ok(Some(Layer::Round(RoundLayer::new()))),
-            // ONNX Cast to an integer dtype on non-constant input: float->int
-            // casts truncate toward zero, so identity is unsound for fractional
-            // intervals (#cctsdb B1).
-            LayerType::Trunc => Ok(Some(Layer::Trunc(TruncLayer::new()))),
+            // Native ONNX Trunc and the guarded lowering of ONNX Cast to an
+            // integer dtype share the same point function, but not the same
+            // domain. Floating-point-to-fixed-point Cast is undefined outside
+            // the destination range, so retain its `to` attribute and require
+            // every verdict-bearing propagation to prove the input finite and
+            // in range. A plain Trunc has no `to` attribute and stays
+            // unrestricted over finite f32 values.
+            LayerType::Trunc => {
+                let layer = match spec.attributes.get("to") {
+                    None => TruncLayer::new(),
+                    Some(AttributeValue::Int(6)) => TruncLayer::for_int32_cast(),
+                    Some(AttributeValue::Int(7)) => TruncLayer::for_int64_cast(),
+                    Some(other) => {
+                        return Err(NyError::ModelLoad(format!(
+                            "Trunc layer '{}' carries invalid Cast target attribute {other:?}; \
+                             only INT32(6) and INT64(7) may lower through guarded Trunc",
+                            spec.name
+                        )));
+                    }
+                };
+                Ok(Some(Layer::Trunc(layer)))
+            }
             LayerType::Sign => Ok(Some(Layer::Sign(SignLayer::new()))),
             LayerType::Reciprocal => Ok(Some(Layer::Reciprocal(ReciprocalLayer::new()))),
             LayerType::Sin => Ok(Some(Layer::Sin(SinLayer::new()))),

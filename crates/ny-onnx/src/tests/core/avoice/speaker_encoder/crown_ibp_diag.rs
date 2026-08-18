@@ -81,7 +81,7 @@ fn log_provenance_summary(
     log_fallback_details(&fallback_nodes, &result.fallback_events);
 }
 
-fn log_output_comparison(
+fn assert_and_log_output_comparison(
     graph: &GraphNetwork,
     input: &BoundedTensor,
     ibp_bounds: &HashMap<String, BoundedTensor>,
@@ -92,6 +92,27 @@ fn log_output_comparison(
         scalar_spec_bounds_with_node_bounds(graph, input, cibp_bounds, "diag dot + CROWN-IBP");
     let ibp_width = scalar_width(ibp_out.0, ibp_out.1);
     let cibp_width = scalar_width(cibp_out.0, cibp_out.1);
+    assert!(
+        ibp_out.0.is_finite()
+            && ibp_out.1.is_finite()
+            && cibp_out.0.is_finite()
+            && cibp_out.1.is_finite(),
+        "dot output comparison must stay finite: IBP={ibp_out:?}, CROWN-IBP={cibp_out:?}"
+    );
+    assert!(ibp_out.0 <= ibp_out.1 && cibp_out.0 <= cibp_out.1);
+    let scale = ibp_out
+        .0
+        .abs()
+        .max(ibp_out.1.abs())
+        .max(cibp_out.0.abs())
+        .max(cibp_out.1.abs())
+        .max(1.0);
+    let tol = 1e-4 * scale;
+    assert!(
+        cibp_out.0 >= ibp_out.0 - tol && cibp_out.1 <= ibp_out.1 + tol,
+        "CROWN-IBP intermediates loosened the scalar dot enclosure: \
+         IBP={ibp_out:?}, CROWN-IBP={cibp_out:?}"
+    );
     eprintln!(
         "dot output: ibp=[{}, {}] width={}; cibp=[{}, {}] width={}; improved={}",
         ibp_out.0,
@@ -104,16 +125,80 @@ fn log_output_comparison(
     );
 }
 
-/// Diagnostic: report which nodes get CROWN-IBP tightened and which fall back
-/// on the dot component graph with a 60s deadline (#3596).
+fn assert_complete_finite_no_looser_than_ibp(
+    result: &ny_propagate::types::GraphCrownIbpBoundsResult,
+    ibp_bounds: &HashMap<String, BoundedTensor>,
+) {
+    assert_eq!(
+        result.bounds.len(),
+        ibp_bounds.len(),
+        "deadline fallback must still publish one bound for every IBP node"
+    );
+    assert_eq!(
+        result.provenance.len(),
+        result.bounds.len(),
+        "every published CROWN-IBP bound must have provenance"
+    );
+
+    for (name, ibp) in ibp_bounds {
+        let cibp = result
+            .bounds
+            .get(name)
+            .unwrap_or_else(|| panic!("CROWN-IBP result omitted node {name}"));
+        assert!(
+            result.provenance.contains_key(name),
+            "CROWN-IBP result omitted provenance for node {name}"
+        );
+        assert_eq!(
+            cibp.shape(),
+            ibp.shape(),
+            "CROWN-IBP changed the bound shape for node {name}"
+        );
+        for (index, (((&ibp_l, &ibp_u), &cibp_l), &cibp_u)) in ibp
+            .lower()
+            .iter()
+            .zip(ibp.upper().iter())
+            .zip(cibp.lower().iter())
+            .zip(cibp.upper().iter())
+            .enumerate()
+        {
+            assert!(
+                ibp_l.is_finite() && ibp_u.is_finite() && cibp_l.is_finite() && cibp_u.is_finite(),
+                "node {name}[{index}] produced non-finite bounds: \
+                 IBP=[{ibp_l}, {ibp_u}], CROWN-IBP=[{cibp_l}, {cibp_u}]"
+            );
+            assert!(
+                ibp_l <= ibp_u && cibp_l <= cibp_u,
+                "node {name}[{index}] produced inverted bounds"
+            );
+            let scale = ibp_l
+                .abs()
+                .max(ibp_u.abs())
+                .max(cibp_l.abs())
+                .max(cibp_u.abs())
+                .max(1.0);
+            let tol = 1e-4 * scale;
+            assert!(
+                cibp_l >= ibp_l - tol && cibp_u <= ibp_u + tol,
+                "node {name}[{index}] CROWN-IBP loosened IBP: \
+                 IBP=[{ibp_l}, {ibp_u}], CROWN-IBP=[{cibp_l}, {cibp_u}]"
+            );
+        }
+    }
+}
+
+/// A deadline-bounded CROWN-IBP pass must preserve complete, finite, no-looser
+/// node bounds even when individual nodes fall back. Provenance and timing are
+/// logged to diagnose how much real CROWN work fit in the 60s budget. #3596
 ///
 /// Uses the same deadline as the comparison test to diagnose the provenance
 /// distribution: how many nodes are CROWN-tightened, how many fall back to
 /// IBP (deadline, memory, error), and what reduction each tightened node achieves.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
-fn test_speaker_crown_ibp_dag_provenance_diagnostic_3596() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+#[cfg(feature = "external-avoice")]
+fn test_speaker_crown_ibp_dag_deadline_fallback_is_complete_and_sound_3596() {
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let t_start = Instant::now();
     let (dot_graph, _, _) = cosine_head::build_speaker_cosine_component_graphs();
     eprintln!(
@@ -157,11 +242,12 @@ fn test_speaker_crown_ibp_dag_provenance_diagnostic_3596() {
         )
         .expect("CROWN-IBP status collection should succeed");
 
+    assert_complete_finite_no_looser_than_ibp(&cibp_result, &ibp_bounds);
     log_provenance_summary(
         &cibp_result,
         &ibp_bounds,
         shared::SPEAKER_COMPONENT_CROWN_IBP_DEADLINE_SECS,
         t0.elapsed(),
     );
-    log_output_comparison(&dot_graph, &input, &ibp_bounds, &cibp_result.bounds);
+    assert_and_log_output_comparison(&dot_graph, &input, &ibp_bounds, &cibp_result.bounds);
 }

@@ -52,6 +52,18 @@ impl GraphAlphaReferenceBounds {
         &self.current
     }
 
+    /// Consume the optimizer-owned state and return its final sound reference
+    /// map without cloning it.
+    ///
+    /// The DAG collection dispatcher uses this artifact to re-evaluate the
+    /// returned alpha state against the exact map that initialized and survived
+    /// the optimizer. This is especially important for default-uncached typed
+    /// collectors, where recollecting would repeat the whole root transaction.
+    #[must_use]
+    pub(in crate::network::graph_alpha) fn into_current(self) -> HashMap<String, BoundedTensor> {
+        self.current
+    }
+
     #[must_use]
     pub(in crate::network::graph_alpha) fn targets(&self) -> &[String] {
         &self.targets

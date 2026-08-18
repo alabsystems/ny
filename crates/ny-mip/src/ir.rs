@@ -81,7 +81,7 @@ pub struct RowSpec {
 }
 
 /// Solver-neutral MILP problem: plain data, no solver handles.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MilpProblem {
     cols: Vec<ColSpec>,
     rows: Vec<RowSpec>,

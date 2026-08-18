@@ -22,6 +22,7 @@ use ndarray::{arr1, arr2, Array2};
 use ny_core::{NaiveCpuGemmEngine, Result};
 use ny_tensor::BoundedTensor;
 
+use super::super::super::fresh_domain_clip::FreshDomainClipTelemetry;
 use super::super::super::shared::{MultiObjBounds, MultiObjInputDomain};
 use super::super::process_batch::process_disjunctive_domain_batch;
 use super::super::screen_child::WarmAlphaTelemetry;
@@ -370,6 +371,7 @@ fn run_leg(force: bool, clip_planes: Option<bool>, config: BetaCrownConfig) -> L
     let mut lifecycle = GraphBabLifecycle::new(Instant::now());
     let mut domains_verified_by_clip = 0usize;
     let warm_alpha_telemetry = WarmAlphaTelemetry::new(false);
+    let fresh_domain_clip_telemetry = FreshDomainClipTelemetry::new(false);
 
     let result = process_disjunctive_domain_batch(
         &verifier,
@@ -384,6 +386,7 @@ fn run_leg(force: bool, clip_planes: Option<bool>, config: BetaCrownConfig) -> L
         },
         None,
         &warm_alpha_telemetry,
+        &fresh_domain_clip_telemetry,
         // No MulBinary alphas in this fixture (pre-existing merge fixup:
         // ddb123c1 merged S1's call site without the alphas parameter).
         None,
@@ -821,6 +824,39 @@ fn test_batched_clip_planes_matches_stacked_s5() {
             }
         }
     }
+}
+
+#[test]
+fn postclip_concretizers_round_each_addition_down_under_cancellation() {
+    use super::super::super::batched_clip::{
+        concretize_postclip_lower_bounds_planes, ParentClipPlane,
+    };
+    use super::super::push_survivors::concretize_postclip_lower_bounds;
+    use ndarray::{ArrayD, IxDyn};
+    use std::borrow::Cow;
+
+    let large = 2.0_f32.powi(50);
+    let row = arr2(&[[large, 1.0, -large]]);
+    let bounds =
+        LinearBounds::new(row.clone(), arr1(&[0.0]), row, arr1(&[0.0])).expect("linear row");
+    let point = vec![large, -1.0, large];
+    let clipped_lower = ArrayD::from_shape_vec(IxDyn(&[3]), point.clone()).unwrap();
+    let clipped_upper = clipped_lower.clone();
+
+    let reference =
+        concretize_postclip_lower_bounds(&clipped_lower, &clipped_upper, &bounds, &[0.0], false);
+    let coeffs = bounds.lower_a().as_slice().expect("standard layout");
+    let plane = ParentClipPlane {
+        coeffs: Cow::Borrowed(coeffs),
+        nrows: 1,
+    };
+    let mut projected = Vec::new();
+    concretize_postclip_lower_bounds_planes(&point, &point, &plane, &[0.0], 1, &mut projected);
+
+    // Exact binary value: 2^100 - 1 - 2^100 = -1. A nearest-f64 fold
+    // returns zero, whose final next-down f32 is still inward and could prune.
+    assert!(reference[0].0 <= -1.0, "stacked lower={}", reference[0].0);
+    assert!(projected[0].0 <= -1.0, "plane lower={}", projected[0].0);
 }
 
 /// #disj-cross-clause-clip-unsat: the clause-aware (grouped) stacked and planes

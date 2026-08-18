@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use ny_core::NyError;
 
-use crate::batched_domain::{CachedLinearBounds, DomainList, DomainMetadata, PickedDomains};
+use crate::batched_domain::{DomainList, PickedDomains};
 use crate::beta_crown::domain::GraphBabDomain;
 
 use crate::beta_crown::config::AUTO_ENLARGE_BATCH_CAP;
@@ -26,6 +26,61 @@ use crate::beta_crown::config::AUTO_ENLARGE_BATCH_CAP;
 pub(crate) const ADAPTIVE_MICROBATCH_GATE_ENV: &str = "NY_ADAPTIVE_MICROBATCH_CONTROLLER";
 
 const MIB: usize = 1024 * 1024;
+
+/// Fallback ceiling for [`runtime_device_budget_bytes`], in MiB.
+///
+/// # Provenance — this is NOT a device query (#device-budget-provenance)
+///
+/// This is a verbatim copy of `DEFAULT_GPU_MEMORY_BUDGET_MB` in
+/// `ny-gpu/src/wgpu_device/ops/crown_memory_estimate.rs`, which predates this
+/// module: it arrived with the initial import (`3c6c271b`) as the **WGPU** CROWN
+/// backward budget for #3515. `runtime_device_budget_bytes` below duplicates
+/// that function whole — same `NY_GPU_MEMORY_BUDGET_MB` override, same
+/// `min(system / 2, 8 GiB)` policy, same `system_memory_bytes` helper down to
+/// the macOS `sysctl hw.memsize` branch.
+///
+/// The duplication is FORCED, not accidental: `ny-gpu` depends on
+/// `ny-propagate`, so `ny-propagate` can only take `ny-gpu` as a
+/// dev-dependency. Production code here cannot call the original. The
+/// `device_budget_matches_ny_gpu_policy` test below therefore pins the two
+/// copies together so they cannot drift silently; change one, change both.
+///
+/// Nothing about the number was ever measured against a device. It is not a
+/// VRAM probe, and on a unified-memory host "device budget" and host RAM are
+/// the same pool.
+///
+/// # Why raising it is not free score (measured 2026-08-09, GB10, 121 GB)
+///
+/// Raising this constant cannot help any shipped run at HEAD, because nothing
+/// shipped reaches the controller it feeds:
+///
+///   * The controller needs `bab.auto_enlarge_batch_size` AND exact
+///     `NY_ADAPTIVE_MICROBATCH_CONTROLLER=1`. No shipped preset, no bank sweep
+///     script, and no `ny vnncomp` code path sets that variable — the only
+///     setter in-tree is `configs/experiments/abcrown_transfer_factorials.yaml`.
+///   * 22 of 26 resolvable VNN-COMP categories do not set
+///     `auto_enlarge_batch_size` at all, including `cgan_2023`,
+///     `cifar100_2024` and `relusplitter`.
+///   * [`AdaptiveBatchRoute::DomainListInputSplit`] additionally requires
+///     `gpu_bab`, which no shipped preset sets.
+///   * [`AdaptiveBatchRoute::GraphReluSplit`] sits in
+///     `verify_graph_relu_split_impl`, reached only through the SINGLE-objective
+///     `dispatch_graph_constraint`. Specs with >= 2 constraints take the
+///     multi-objective core instead, which has no controller.
+///
+/// Measured: `tinyimagenet_2024` at its official 100 s budget emits ZERO
+/// "adaptive microbatch telemetry" lines both with and without the gate armed —
+/// the treatment is NOT EXERCISED there, not "neutral".
+///
+/// And even where the controller does run, this constant is not the binding
+/// term: [`MicrobatchMemoryBudget::runtime`] takes
+/// `min(backend_bytes, host_bytes)`, and `host_bytes` is the adaptive CROWN
+/// dense budget, whose own ceiling is `MAX_ADAPTIVE_DENSE_BUDGET_MB` = 12 GiB.
+/// Lifting 8 GiB to `system / 2` moves the limit to 12 GiB, i.e. 1.5x — not the
+/// 7.5x that `system / 2` on a 121 GB host suggests.
+///
+/// An operator who does want more already has `NY_GPU_MEMORY_BUDGET_MB`; it
+/// bypasses this ceiling entirely and needs no rebuild.
 const DEFAULT_DEVICE_BUDGET_MIB: usize = 8192;
 const RESERVE_NUMERATOR: usize = 1;
 const RESERVE_DENOMINATOR: usize = 5;
@@ -446,7 +501,7 @@ pub(crate) fn estimate_graph_domain_bytes(domain: &GraphBabDomain) -> usize {
     let cached_bytes = domain
         .cached_la
         .as_deref()
-        .map(estimate_cached_linear_bounds_bytes)
+        .map(crate::batched_domain::CachedLinearBounds::estimated_owned_bytes)
         .unwrap_or(0);
 
     size_of::<GraphBabDomain>()
@@ -467,34 +522,7 @@ pub(crate) fn estimate_graph_domain_bytes(domain: &GraphBabDomain) -> usize {
 
 /// Estimate the average row footprint in the DomainList before pick-out.
 pub(crate) fn estimate_domain_list_bytes_per_domain(domain_list: &DomainList) -> usize {
-    let tensor_elements = domain_list
-        .config
-        .layer_names
-        .iter()
-        .filter_map(|name| domain_list.config.layer_shapes.get(name))
-        .map(|shape| shape.iter().copied().fold(1usize, usize::saturating_mul))
-        .sum::<usize>()
-        .saturating_add(
-            domain_list
-                .config
-                .input_shape
-                .iter()
-                .copied()
-                .fold(1usize, usize::saturating_mul),
-        )
-        .saturating_add(1);
-    let tensor_bytes = tensor_elements.saturating_mul(2 * size_of::<f32>());
-    let metadata_bytes = if domain_list.metadata.is_empty() {
-        size_of::<DomainMetadata>()
-    } else {
-        domain_list
-            .metadata
-            .iter()
-            .map(estimate_domain_metadata_bytes)
-            .sum::<usize>()
-            .div_ceil(domain_list.metadata.len())
-    };
-    tensor_bytes.saturating_add(metadata_bytes).max(1)
+    domain_list.estimated_bytes_per_domain()
 }
 
 /// Estimate the actual tensor and metadata bytes in an extracted batch.
@@ -515,66 +543,13 @@ pub(crate) fn estimate_picked_bytes_per_domain(picked: &PickedDomains) -> usize 
     let metadata_bytes = picked
         .metadata
         .iter()
-        .map(estimate_domain_metadata_bytes)
+        .map(crate::batched_domain::DomainMetadata::estimated_owned_bytes)
         .sum::<usize>();
     tensor_elements
         .saturating_mul(size_of::<f32>())
         .saturating_add(metadata_bytes)
         .div_ceil(picked.batch_size)
         .max(1)
-}
-
-fn estimate_domain_metadata_bytes(metadata: &DomainMetadata) -> usize {
-    let constraints = metadata
-        .constraints
-        .iter()
-        .map(|(name, _, _, _)| size_of_val(&(name, 0usize, false, None::<f32>)) + name.len())
-        .sum::<usize>();
-    let cached = metadata
-        .cached_la
-        .as_deref()
-        .map(estimate_cached_linear_bounds_bytes)
-        .unwrap_or(0);
-    let override_bytes = metadata
-        .node_bounds_override
-        .as_deref()
-        .map(|bounds| {
-            bounds
-                .iter()
-                .map(|(name, tensor)| {
-                    name.len()
-                        .saturating_add(tensor.len().saturating_mul(2 * size_of::<f32>()))
-                })
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-    let alpha_bytes = metadata
-        .alpha_state_byte_census()
-        .map(|census| census.estimated_total_bytes)
-        .unwrap_or(0);
-    size_of::<DomainMetadata>()
-        .saturating_add(constraints)
-        .saturating_add(cached)
-        .saturating_add(override_bytes)
-        .saturating_add(alpha_bytes)
-}
-
-fn estimate_cached_linear_bounds_bytes(bounds: &CachedLinearBounds) -> usize {
-    let arrays = bounds
-        .lower_a
-        .iter()
-        .chain(bounds.upper_a.iter())
-        .map(|(name, array)| name.len().saturating_add(array.len() * size_of::<f32>()))
-        .sum::<usize>()
-        .saturating_add(
-            bounds
-                .lower_b
-                .iter()
-                .chain(bounds.upper_b.iter())
-                .map(|(name, array)| name.len().saturating_add(array.len() * size_of::<f32>()))
-                .sum::<usize>(),
-        );
-    size_of::<CachedLinearBounds>().saturating_add(arrays)
 }
 
 fn runtime_host_budget_bytes() -> usize {
@@ -645,6 +620,22 @@ mod tests {
             per_domain,
             MicrobatchMemoryBudget::fixed(total, total / 5),
         )
+    }
+
+    /// `runtime_device_budget_bytes` is a hand-copy of `ny-gpu`'s
+    /// `gpu_memory_budget_bytes` (see `DEFAULT_DEVICE_BUDGET_MIB`). The copy is
+    /// forced — `ny-gpu` depends on `ny-propagate`, so only a dev-dependency can
+    /// see the original — which means nothing but this test stops the two
+    /// policies drifting apart. Both read `NY_GPU_MEMORY_BUDGET_MB` the same
+    /// way, so the assertion holds whether or not that variable is set.
+    #[test]
+    fn device_budget_matches_ny_gpu_policy() {
+        assert_eq!(
+            runtime_device_budget_bytes(),
+            ny_gpu::wgpu_device::gpu_memory_budget_bytes(),
+            "the duplicated device-budget policy drifted from ny-gpu's original; \
+             change DEFAULT_DEVICE_BUDGET_MIB and DEFAULT_GPU_MEMORY_BUDGET_MB together"
+        );
     }
 
     #[test]

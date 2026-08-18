@@ -4,7 +4,7 @@
 
 //! Dark, print-only PHASE telemetry for the root pipeline (#phase-telemetry).
 //!
-//! `NY_PHASE_TELEMETRY=1` enables; default unset ⇒ byte-identical, NO output.
+//! `NY_PHASE_TELEMETRY=1` enables; the declared `false` default emits no output.
 //! The banking ledger (docs/BANKING_SWEEP_2026-07-18.md, last entries)
 //! established that single-row wall-time deltas are unpriceable across builds
 //! (~±15% layout noise) — lever pricing needs PHASE boundaries. Each marker is
@@ -17,8 +17,9 @@
 //! All markers share ONE process-wide clock (an `Instant` captured lazily at
 //! the first emitted marker), so per-phase durations are simple differences
 //! between adjacent lines in a log. Print-only: no marker feeds any bound,
-//! verdict, or schedule decision. Call sites check the (cached) gate FIRST, so
-//! the default-unset path is one boolean load — no formatting, no allocation.
+//! verdict, or schedule decision. Call sites check the gate FIRST, so the
+//! declared-false path is one latched-string compare — no formatting or
+//! allocation. Armed-vs-unarmed deadline/verdict parity is not claimed.
 //! Existing lane markers (`[root-crown-interm-tighten]` END elapsed, the
 //! `[converge]` per-batch prints, the margin-row arm/report lines) are
 //! unchanged and complementary.
@@ -34,17 +35,27 @@ fn gate_on(raw: Option<&str>) -> bool {
     raw == Some("1")
 }
 
-/// Uncached env read — the cache initializer, and the deterministic seam the
-/// smoke test drives under the crate's `with_serialized_env_vars` idiom.
-fn enabled_uncached() -> bool {
-    gate_on(std::env::var("NY_PHASE_TELEMETRY").ok().as_deref())
+/// Uncached env read through the ny-levers chokepoint's raw view — the cache
+/// initializer, and the deterministic seam the smoke test drives under the
+/// crate's `with_serialized_env_vars` idiom.
+fn raw_uncached() -> Option<String> {
+    ny_levers::read_raw(&ny_levers::decls::telemetry::PHASE_TELEMETRY)
 }
 
-/// Cached process-wide gate. Checked FIRST at every marker site; when the env
-/// is unset this is a cached-bool load and nothing else.
+/// Latched RAW env string (lever-debt batch B1 preparation). Marker sites are
+/// hot (per-depth in the batched BaB lane), so the STRING is latched once and
+/// the decision is derived per call by [`gate_on`]. This remains process-wide;
+/// Phase 2 must replace it with an injected per-run `LeverSet`.
+fn env_raw() -> Option<&'static str> {
+    static RAW: OnceLock<Option<String>> = OnceLock::new();
+    RAW.get_or_init(raw_uncached).as_deref()
+}
+
+/// Process-wide gate over the latched raw string. Checked FIRST at every
+/// marker site; when the env is unset this is a latched-string compare and
+/// nothing else.
 pub(crate) fn phase_telemetry_enabled() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(enabled_uncached)
+    gate_on(env_raw())
 }
 
 /// Shared marker clock: captured at the FIRST emitted marker so every line in
@@ -126,6 +137,14 @@ pub(crate) fn frontier_frame(depth: usize, worst_margin: f32, domains_cumulative
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uncached decision, rebuilt from the raw chokepoint view on every call —
+    /// the deterministic seam the env-gate test drives (the production path
+    /// latches the string in [`env_raw`], which another test in this process
+    /// may already have initialized).
+    fn enabled_uncached() -> bool {
+        gate_on(raw_uncached().as_deref())
+    }
 
     /// Smoke test (#phase-telemetry): the gate-off path produces NOTHING and
     /// the gate-on path produces the bootstrap markers in the documented

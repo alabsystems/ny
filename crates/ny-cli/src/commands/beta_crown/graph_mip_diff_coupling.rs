@@ -260,8 +260,8 @@ pub(super) fn compute_difference_bounds(
             let input_name = &a_node.inputs()[0];
             match (a_node.layer(), b_node.layer()) {
                 (Layer::Linear(la), Layer::Linear(lb)) => {
-                    let (out_a, in_a) = la.weight.dim();
-                    let (out_b, in_b) = lb.weight.dim();
+                    let (out_a, in_a) = la.weight().dim();
+                    let (out_b, in_b) = lb.weight().dim();
                     if out_a != out_b || in_a != in_b {
                         inf_vec(out_len)
                     } else {
@@ -269,14 +269,14 @@ pub(super) fn compute_difference_bounds(
                         if eps_u.len() != in_a || mag_u.len() != in_a {
                             inf_vec(Some(out_a))
                         } else {
-                            let bias_a = la.bias.as_ref();
-                            let bias_b = lb.bias.as_ref();
+                            let bias_a = la.bias();
+                            let bias_b = lb.bias();
                             (0..out_a)
                                 .map(|i| {
                                     let mut acc = 0.0f64;
                                     for j in 0..in_a {
-                                        let wa = f64::from(la.weight[[i, j]]);
-                                        let wb = f64::from(lb.weight[[i, j]]);
+                                        let wa = f64::from(la.weight()[[i, j]]);
+                                        let wb = f64::from(lb.weight()[[i, j]]);
                                         // W_a·e_U term (uses f's weight magnitude).
                                         acc += nonneg_prod(wa.abs(), eps_u[j]);
                                         // ΔW·b_U term (exact f32→f64 difference).
@@ -433,6 +433,5 @@ pub(super) fn attach_diff_coupling(
     (added, out_delta)
 }
 
-#[cfg(test)]
 #[path = "graph_mip_diff_coupling_tests.rs"]
-mod tests;
+pub(crate) mod research;

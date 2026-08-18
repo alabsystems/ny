@@ -351,3 +351,156 @@ fn test_ibp_spec_fallback_negative_coeff_3044() {
         restored_upper
     );
 }
+
+/// A final directed f32 cast cannot repair a term already lost by an f64
+/// round-to-nearest addition. Both polarities must enclose the exact residual.
+#[test]
+fn spec_row_interval_bounds_rounds_every_f64_addition_outward() {
+    use ndarray::arr1;
+
+    let magnitude = f32::from_bits((127 + 80) << 23); // exactly 2^80
+    let lower_values = [magnitude, 1.0, magnitude];
+    let upper_values = lower_values;
+
+    let positive_residual = arr1(&[1.0_f32, 1.0, -1.0]);
+    let (lower, upper) = GraphNetwork::spec_row_interval_bounds(
+        positive_residual.view(),
+        &lower_values,
+        &upper_values,
+    );
+    assert!(
+        lower <= 1.0 && upper >= 1.0,
+        "must enclose +1, got [{lower}, {upper}]"
+    );
+    assert!(
+        lower > 0.99 && upper < 1.01,
+        "authorized double-double path should retain the residual, got [{lower}, {upper}]"
+    );
+
+    let negative_residual = arr1(&[1.0_f32, -1.0, -1.0]);
+    let (lower, upper) = GraphNetwork::spec_row_interval_bounds(
+        negative_residual.view(),
+        &lower_values,
+        &upper_values,
+    );
+    assert!(
+        lower <= -1.0 && upper >= -1.0,
+        "must enclose -1, got [{lower}, {upper}]"
+    );
+    assert!(
+        lower > -1.01 && upper < -0.99,
+        "authorized double-double path should retain the residual, got [{lower}, {upper}]"
+    );
+}
+
+#[test]
+fn finite_spec_fallback_matches_legacy_endpoint_bits() {
+    use ndarray::{arr1, arr2};
+    use ny_tensor::BoundedTensor;
+    use std::time::{Duration, Instant};
+
+    let output = BoundedTensor::new_allow_infinite(
+        arr1(&[-2.0, f32::NEG_INFINITY, 0.25]).into_dyn(),
+        arr1(&[3.0, f32::INFINITY, 0.75]).into_dyn(),
+    )
+    .expect("fixture bounds are valid");
+    let spec = arr2(&[[1.0, 0.0, -2.0], [-0.5, 0.0, 4.0]]);
+
+    let legacy = GraphNetwork::apply_spec_matrix_to_bounds_fallback(&spec, &output)
+        .expect("legacy fallback should succeed");
+    let finite = GraphNetwork::apply_spec_matrix_to_bounds_fallback_with_deadline(
+        &spec,
+        &output,
+        Some(Instant::now() + Duration::from_secs(5)),
+    )
+    .expect("live finite fallback should succeed");
+
+    assert_eq!(
+        finite
+            .lower()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        legacy
+            .lower()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        finite
+            .upper()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        legacy
+            .upper()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn finite_spec_fallback_expiry_is_typed_and_preserves_source() {
+    use ndarray::{arr1, arr2};
+    use ny_core::NyError;
+    use ny_tensor::BoundedTensor;
+    use std::time::{Duration, Instant};
+
+    let output = BoundedTensor::new(
+        arr1(&[-2.0, 0.25]).into_dyn(),
+        arr1(&[3.0, 0.75]).into_dyn(),
+    )
+    .expect("fixture bounds are valid");
+    let lower_before = output.lower().clone();
+    let upper_before = output.upper().clone();
+    let error = GraphNetwork::apply_spec_matrix_to_bounds_fallback_with_deadline(
+        &arr2(&[[1.0, -2.0]]),
+        &output,
+        Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("one millisecond fits before now"),
+        ),
+    )
+    .expect_err("expired finite authority must refuse before fallback work");
+
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+    assert_eq!(output.lower(), &lower_before);
+    assert_eq!(output.upper(), &upper_before);
+}
+
+#[test]
+fn finite_spec_fallback_budget_refusal_is_typed_and_atomic() {
+    use ndarray::{arr1, arr2};
+    use ny_core::NyError;
+    use ny_tensor::BoundedTensor;
+    use std::time::{Duration, Instant};
+
+    let output = BoundedTensor::new(
+        arr1(&[-2.0, 0.25]).into_dyn(),
+        arr1(&[3.0, 0.75]).into_dyn(),
+    )
+    .expect("fixture bounds are valid");
+    let lower_before = output.lower().clone();
+    let upper_before = output.upper().clone();
+    let error = GraphNetwork::apply_spec_matrix_to_bounds_fallback_with_budget_for_test(
+        &arr2(&[[1.0, -2.0]]),
+        &output,
+        Instant::now() + Duration::from_secs(5),
+        1,
+    )
+    .expect_err("one byte cannot admit the resident and staged fallback payloads");
+
+    assert!(matches!(
+        error,
+        NyError::CpuMemoryExceeded {
+            site: "spec-guided CROWN cooperative IBP fallback",
+            budget_bytes: 1,
+            ..
+        }
+    ));
+    assert_eq!(output.lower(), &lower_before);
+    assert_eq!(output.upper(), &upper_before);
+}

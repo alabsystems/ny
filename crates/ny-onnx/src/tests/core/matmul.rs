@@ -96,13 +96,13 @@ fn test_convert_matmul_weight_transpose_b_true_and_scale_applied() {
     let layer = model.convert_layer(&spec).unwrap();
     match layer {
         PropLayer::Linear(l) => {
-            assert_eq!(l.weight.shape(), &[2, 3]);
-            assert_relative_eq!(l.weight[[0, 0]], 0.5, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[0, 1]], 1.0, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[0, 2]], 1.5, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[1, 0]], 2.0, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[1, 1]], 2.5, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[1, 2]], 3.0, epsilon = 1e-6);
+            assert_eq!(l.weight().shape(), &[2, 3]);
+            assert_relative_eq!(l.weight()[[0, 0]], 0.5, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[0, 1]], 1.0, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[0, 2]], 1.5, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[1, 0]], 2.0, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[1, 1]], 2.5, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[1, 2]], 3.0, epsilon = 1e-6);
         }
         other => panic!(
             "Expected Linear layer (constant weight), got {:?}",
@@ -150,13 +150,13 @@ fn test_convert_matmul_weight_transpose_b_false_transposes_weight() {
     let layer = model.convert_layer(&spec).unwrap();
     match layer {
         PropLayer::Linear(l) => {
-            assert_eq!(l.weight.shape(), &[2, 3]);
-            assert_relative_eq!(l.weight[[0, 0]], 1.0, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[0, 1]], 3.0, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[0, 2]], 5.0, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[1, 0]], 2.0, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[1, 1]], 4.0, epsilon = 1e-6);
-            assert_relative_eq!(l.weight[[1, 2]], 6.0, epsilon = 1e-6);
+            assert_eq!(l.weight().shape(), &[2, 3]);
+            assert_relative_eq!(l.weight()[[0, 0]], 1.0, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[0, 1]], 3.0, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[0, 2]], 5.0, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[1, 0]], 2.0, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[1, 1]], 4.0, epsilon = 1e-6);
+            assert_relative_eq!(l.weight()[[1, 2]], 6.0, epsilon = 1e-6);
         }
         other => panic!(
             "Expected Linear layer (constant weight), got {:?}",
@@ -170,7 +170,9 @@ fn test_convert_matmul_weight_transpose_b_false_transposes_weight() {
 fn test_load_matmul_transpose_b_const_weight() {
     let path = require_test_model("matmul_transpose_b_const.onnx");
 
-    let model = load_onnx(&path).expect("Failed to load MatMul transpose_b model");
+    // Standard ONNX represents B^T with an explicit Transpose node; constant
+    // folding should preserve that exact matrix before MatMul becomes Linear.
+    let model = load_onnx(&path).expect("Failed to load explicit-transpose MatMul model");
     let prop = model
         .to_propagate_network()
         .expect("Failed to convert MatMul transpose_b model");
@@ -178,16 +180,16 @@ fn test_load_matmul_transpose_b_const_weight() {
     assert_eq!(prop.layers().len(), 1);
     match &prop.layers()[0] {
         PropLayer::Linear(layer) => {
-            assert_eq!(layer.weight.shape(), &[2, 3]);
-            assert_relative_eq!(layer.weight[[0, 0]], 1.0, epsilon = 1e-6);
-            assert_relative_eq!(layer.weight[[0, 1]], 2.0, epsilon = 1e-6);
-            assert_relative_eq!(layer.weight[[0, 2]], 3.0, epsilon = 1e-6);
-            assert_relative_eq!(layer.weight[[1, 0]], 4.0, epsilon = 1e-6);
-            assert_relative_eq!(layer.weight[[1, 1]], 5.0, epsilon = 1e-6);
-            assert_relative_eq!(layer.weight[[1, 2]], 6.0, epsilon = 1e-6);
+            assert_eq!(layer.weight().shape(), &[2, 3]);
+            assert_relative_eq!(layer.weight()[[0, 0]], 1.0, epsilon = 1e-6);
+            assert_relative_eq!(layer.weight()[[0, 1]], 2.0, epsilon = 1e-6);
+            assert_relative_eq!(layer.weight()[[0, 2]], 3.0, epsilon = 1e-6);
+            assert_relative_eq!(layer.weight()[[1, 0]], 4.0, epsilon = 1e-6);
+            assert_relative_eq!(layer.weight()[[1, 1]], 5.0, epsilon = 1e-6);
+            assert_relative_eq!(layer.weight()[[1, 2]], 6.0, epsilon = 1e-6);
         }
         other => panic!(
-            "Expected Linear layer from MatMul transpose_b const weight, got {:?}",
+            "Expected Linear layer from explicit-transpose MatMul const weight, got {:?}",
             other.layer_type()
         ),
     }

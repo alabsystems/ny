@@ -196,7 +196,19 @@ fn phoneme_feature_graph_model_verifies_packed_f0_energy_bounds() {
     let spec = VerificationSpec::from_parts(
         input_bounds(),
         expected_phoneme_feature_bounds(),
-        Some(5_000),
+        // Budget by BUILD PROFILE. What this test asserts is PROVENANCE — that
+        // the packet stays on CROWN instead of degrading to IBP — and the
+        // deadline is only here so a hang cannot wedge the suite. A flat 5 s
+        // silently turned it into a speed benchmark for the profile it runs
+        // under: unoptimized CROWN on this graph exceeds 5 s and the verifier
+        // (correctly) fell back, so the test failed with `Ibp` under plain
+        // `cargo test` while passing in release. Measured here: 2.15 s release,
+        // over 5 s debug.
+        Some(if cfg!(debug_assertions) {
+            60_000
+        } else {
+            5_000
+        }),
         Some(vec![4]),
     )
     .expect("valid phoneme feature verification spec");

@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use ny_core::LayerType;
-use ny_gpu::{Backend, ComputeDevice};
+use ny_core::{LayerType, NyError};
 use ny_propagate::BoundPropagation;
 
 #[ntest::timeout(10000)]
@@ -25,24 +24,25 @@ fn test_load_decoder_block() {
     let layer_types: Vec<_> = model.network.layers.iter().map(|l| &l.layer_type).collect();
     println!("Decoder block layer types: {:?}", layer_types);
 
-    // Should have LayerNorm (fused), GELU, and causal attention pattern
+    // The fixture contains LayerNorm and an exact Erf decomposition of GELU.
     let has_layer_norm = model
         .network
         .layers
         .iter()
         .any(|l| l.layer_type == LayerType::LayerNorm);
-    let has_gelu = model
+    let has_erf = model
         .network
         .layers
         .iter()
-        .any(|l| l.layer_type == LayerType::GELU);
+        .any(|l| l.layer_type == LayerType::Erf);
 
     // Decoder should have transformer components
-    let transformer_markers = [has_layer_norm, has_gelu].iter().filter(|&&x| x).count();
+    let transformer_markers = [has_layer_norm, has_erf].iter().filter(|&&x| x).count();
     assert!(
         transformer_markers >= 1,
-        "Expected at least 1 transformer marker (LayerNorm/GELU)"
+        "Expected at least 1 transformer marker (LayerNorm/Erf)"
     );
+    assert!(has_erf, "decoder block must preserve decomposed GELU Erf");
 }
 
 #[ntest::timeout(10000)]
@@ -75,7 +75,8 @@ fn test_decoder_block_structure() {
         .layers()
         .iter()
         .any(|l| l.layer_type() == "CausalSoftmax");
-    let has_gelu = network.layers().iter().any(|l| l.layer_type() == "GELU");
+    let has_softmax = network.layers().iter().any(|l| l.layer_type() == "Softmax");
+    let has_erf = network.layers().iter().any(|l| l.layer_type() == "Erf");
     // Since c93afde62, all activation-activation MatMuls produce BilinearCrown.
     let has_bilinear = network
         .layers()
@@ -84,15 +85,17 @@ fn test_decoder_block_structure() {
 
     println!("\nHas LayerNorm: {}", has_layer_norm);
     println!("Has CausalSoftmax: {}", has_causal_softmax);
-    println!("Has GELU: {}", has_gelu);
+    println!("Has Softmax: {}", has_softmax);
+    println!("Has Erf: {}", has_erf);
     println!("Has BilinearCrown: {}", has_bilinear);
 
     assert!(has_layer_norm, "Decoder block should have LayerNorm");
+    assert!(!has_causal_softmax, "finite mask must not hard-fuse");
     assert!(
-        has_causal_softmax,
-        "Decoder block should have CausalSoftmax"
+        has_softmax,
+        "decoder block should preserve ordinary Softmax"
     );
-    assert!(has_gelu, "Decoder block should have GELU");
+    assert!(has_erf, "Decoder block should preserve decomposed GELU Erf");
     assert!(
         has_bilinear,
         "Decoder block should have BilinearCrown (for attention MatMul)"
@@ -125,10 +128,9 @@ fn test_decoder_block_structure() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_decoder_compositional_verification() {
-    // Test end-to-end compositional verification of a decoder block.
-    // This uses the DecoderModel API which handles the compositional approach
-    // required for attention (MatMul of two bounded tensors).
+fn test_decoder_compositional_verification_fails_closed() {
+    // Subgraph inspection remains available, while proof-looking decoder
+    // compatibility APIs fail closed.
     use ndarray::ArrayD;
     use ny_tensor::BoundedTensor;
 
@@ -176,48 +178,35 @@ fn test_decoder_compositional_verification() {
         .expect("MLP subgraph extraction should succeed");
     println!("  MLP subgraph: {} nodes", mlp_graph.num_nodes());
 
-    // Test compositional verification
-    println!("\nRunning compositional verification...");
-    let result = decoder.verify_block_compositional(0, &input);
+    for result in [
+        decoder.causal_attention_subgraph(decoder.num_blocks),
+        decoder.mlp_subgraph(decoder.num_blocks),
+    ] {
+        assert!(
+            matches!(result, Err(NyError::InvalidSpec(message)) if message.contains("not found")),
+            "an out-of-range block must not alias an unprefixed block-zero graph"
+        );
+    }
 
-    match result {
-        Ok((output, details)) => {
-            println!("\nCompositional verification succeeded!");
-            println!(
-                "  Attention delta width: {:.2e}",
-                details.attention_delta_width
-            );
-            println!(
-                "  After residual 1 (x + attn): {:.2e}",
-                details.x_attn_width
-            );
-            println!("  MLP delta width: {:.2e}", details.mlp_delta_width);
-            println!("  Final output width: {:.2e}", details.output_width);
-
-            // Verify bounds are sound
-            let sound = output
-                .lower()
-                .iter()
-                .zip(output.upper().iter())
-                .all(|(l, u)| l <= u);
-            assert!(sound, "Decoder output bounds must be sound");
-
-            // Verify output shape matches input shape
-            assert_eq!(
-                output.shape(),
-                input.shape(),
-                "Decoder output shape should match input shape"
-            );
-
-            // Verify bounds are not NaN or infinite (for valid inputs)
-            let has_nan = output.lower().iter().any(|x| x.is_nan())
-                || output.upper().iter().any(|x| x.is_nan());
-            assert!(!has_nan, "Output bounds should not contain NaN");
-
-            println!("\nAll assertions passed!");
-        }
-        Err(e) => {
-            panic!("Compositional verification failed: {:?}", e);
+    for (label, result) in [
+        (
+            "single-block API",
+            decoder.verify_block_compositional(0, &input).map(|_| ()),
+        ),
+        (
+            "sequential API",
+            decoder.verify_sequential(&input, 0, 1).map(|_| ()),
+        ),
+    ] {
+        match result {
+            Err(NyError::UnsupportedConfiguration(message)) => {
+                assert!(
+                    message.contains("no bounds or verification details were produced"),
+                    "{label}: unexpected error: {message}"
+                );
+            }
+            Err(other) => panic!("{label}: expected UnsupportedConfiguration, got {other:?}"),
+            Ok(()) => panic!("{label}: unavailable decoder verification returned bounds"),
         }
     }
 }
@@ -261,13 +250,10 @@ fn test_load_decoder_function() {
     );
 }
 
-// WGPU device/shader initialization can exceed ten seconds on a cold or shared
-// host even for this tiny fixture. Keep a finite hang guard without turning
-// ordinary backend startup latency into a suite failure.
-#[ntest::timeout(60000)]
+#[ntest::timeout(10000)]
 #[test]
-fn test_decoder_gpu_verification() {
-    // Test GPU-accelerated decoder verification
+fn test_decoder_gpu_verification_fails_closed() {
+    // The accelerated compatibility surface must fail before device work.
     use ndarray::ArrayD;
     use ny_tensor::BoundedTensor;
 
@@ -291,55 +277,18 @@ fn test_decoder_gpu_verification() {
     let upper = center.mapv(|v| v + eps);
     let input = BoundedTensor::new(lower, upper).expect("Failed to create input");
 
-    // Try GPU verification (will use CPU fallback if GPU unavailable)
-    let gpu_device = ComputeDevice::new(Backend::Wgpu).ok();
-    if gpu_device.is_some() {
-        println!("GPU device available for testing");
-    } else {
-        println!("No GPU device - will use CPU fallback");
-    }
-
-    let result = decoder.verify_block_compositional_gpu(0, &input, gpu_device.as_ref());
-
-    match result {
-        Ok((output, details)) => {
-            println!("\nGPU verification succeeded!");
-            println!("  Used GPU attention: {}", details.used_gpu_attention);
-            println!("  Sequence length: {}", details.seq_len);
-            println!(
-                "  Attention delta width: {:.2e}",
-                details.attention_delta_width
-            );
-            println!("  MLP delta width: {:.2e}", details.mlp_delta_width);
-            println!("  Final output width: {:.2e}", details.output_width);
-
-            // Verify bounds are sound
-            let sound = output
-                .lower()
-                .iter()
-                .zip(output.upper().iter())
-                .all(|(l, u)| l <= u);
-            assert!(sound, "Decoder output bounds must be sound");
-
-            // Verify output shape matches input shape
-            assert_eq!(output.shape(), input.shape());
+    match decoder.verify_block_compositional_gpu(0, &input, None) {
+        Err(NyError::UnsupportedConfiguration(message)) => {
+            assert!(message.contains("no bounds or verification details were produced"));
         }
-        Err(e) => {
-            let msg = format!("{:?}", e);
-            if msg.contains("Soundness refusal") && msg.contains("LayerNorm") {
-                println!("GPU verification correctly refused unsound LayerNorm CROWN: {msg}");
-            } else {
-                panic!("GPU verification failed: {:?}", e);
-            }
-        }
+        Err(other) => panic!("expected UnsupportedConfiguration, got {other:?}"),
+        Ok(_) => panic!("unavailable accelerated decoder verification returned bounds"),
     }
 }
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_decoder_sequential_gpu() {
-    // Test sequential GPU verification for decoder blocks
-    // This will likely overflow for multi-block models, but tests the infrastructure
+fn test_decoder_sequential_gpu_fails_closed() {
     use ndarray::ArrayD;
     use ny_tensor::BoundedTensor;
 
@@ -364,38 +313,12 @@ fn test_decoder_sequential_gpu() {
     let upper = center.mapv(|v| v + eps);
     let input = BoundedTensor::new(lower, upper).expect("Failed to create input");
 
-    let gpu_device = ComputeDevice::new(Backend::Wgpu).ok();
-
-    // Test sequential verification with just 1 block
-    let result = decoder.verify_sequential_gpu(&input, 0, 1, gpu_device.as_ref());
-
-    match result {
-        Ok((output, details)) => {
-            println!("Sequential GPU verification succeeded for 1 block");
-            assert_eq!(details.len(), 1);
-
-            let detail = &details[0];
-            println!(
-                "  Block 0: attn={:.2e}, mlp={:.2e}, output={:.2e}, gpu={}",
-                detail.attention_delta_width,
-                detail.mlp_delta_width,
-                detail.output_width,
-                detail.used_gpu_attention
-            );
-
-            // Verify output shape
-            assert_eq!(output.shape(), input.shape());
+    match decoder.verify_sequential_gpu(&input, 0, 1, None) {
+        Err(NyError::UnsupportedConfiguration(message)) => {
+            assert!(message.contains("no bounds or verification details were produced"));
         }
-        Err(e) => {
-            let msg = format!("{:?}", e);
-            if msg.contains("Soundness refusal") && msg.contains("LayerNorm") {
-                println!(
-                    "Sequential GPU verification correctly refused unsound LayerNorm CROWN: {msg}"
-                );
-            } else {
-                panic!("Sequential GPU verification failed: {:?}", e);
-            }
-        }
+        Err(other) => panic!("expected UnsupportedConfiguration, got {other:?}"),
+        Ok(_) => panic!("unavailable sequential accelerated decoder verification returned bounds"),
     }
 }
 
@@ -496,8 +419,8 @@ fn insert_weight(ws: &mut WeightStore, name: &str, rows: usize, cols: usize) {
     );
 }
 
-/// Assert MLP subgraph IBP produces sound, NaN-free bounds.
-fn assert_mlp_ibp_sound(graph: &ny_propagate::GraphNetwork, hidden: usize) {
+/// Assert MLP subgraph IBP produces ordered, NaN-free bounds.
+fn assert_mlp_ibp_well_formed(graph: &ny_propagate::GraphNetwork, hidden: usize) {
     use ndarray::ArrayD;
     use ny_tensor::BoundedTensor;
 
@@ -508,12 +431,12 @@ fn assert_mlp_ibp_sound(graph: &ny_propagate::GraphNetwork, hidden: usize) {
         .propagate_ibp(&input)
         .expect("MLP subgraph IBP should succeed");
 
-    let sound = output
+    let ordered = output
         .lower()
         .iter()
         .zip(output.upper().iter())
         .all(|(l, u)| l <= u);
-    assert!(sound, "MLP output bounds must be sound");
+    assert!(ordered, "MLP output bounds must be ordered");
 
     let has_nan =
         output.lower().iter().any(|x| x.is_nan()) || output.upper().iter().any(|x| x.is_nan());
@@ -523,8 +446,8 @@ fn assert_mlp_ibp_sound(graph: &ny_propagate::GraphNetwork, hidden: usize) {
 #[ntest::timeout(10000)]
 #[test]
 fn test_mlp_subgraph_gelu_backward_compat() {
-    // Verify that after the refactor, the existing GELU decoder model still
-    // produces the same MLP subgraph through the dispatcher.
+    // Verify that the existing decomposed-GELU decoder model still produces
+    // the same MLP subgraph through the dispatcher without canonical fusion.
     let path = require_test_model_with_hint("decoder_block.onnx", TRANSFORMER_TEST_MODEL_HINT);
     let decoder = load_decoder(&path).expect("Failed to load decoder model");
 
@@ -532,11 +455,19 @@ fn test_mlp_subgraph_gelu_backward_compat() {
         .mlp_subgraph(0)
         .expect("MLP subgraph extraction should succeed after refactor");
 
-    // The GELU path should produce a non-empty graph
+    // The GELU-shaped path should include its exact Erf primitive.
     assert!(
         mlp_graph.num_nodes() >= 2,
-        "GELU MLP subgraph should have at least 2 nodes (fc1 + fc2), got {}",
+        "decomposed GELU MLP should have at least 2 nodes (fc1 + fc2), got {}",
         mlp_graph.num_nodes()
+    );
+    assert!(
+        mlp_graph
+            .node_names()
+            .iter()
+            .filter_map(|name| mlp_graph.node(name))
+            .any(|node| matches!(node.layer(), ny_propagate::Layer::Erf(_))),
+        "decomposed GELU MLP subgraph must preserve its Erf primitive"
     );
 
     // Verify IBP works through the extracted subgraph
@@ -549,20 +480,23 @@ fn test_mlp_subgraph_gelu_backward_compat() {
 
     let mlp_output = mlp_graph
         .propagate_ibp(&input)
-        .expect("GELU MLP subgraph IBP should succeed");
+        .expect("decomposed GELU MLP subgraph IBP should succeed");
 
-    // Bounds must be sound (lower <= upper everywhere)
-    let sound = mlp_output
+    // Bounds must be ordered (lower <= upper everywhere).
+    let ordered = mlp_output
         .lower()
         .iter()
         .zip(mlp_output.upper().iter())
         .all(|(l, u)| l <= u);
-    assert!(sound, "GELU MLP output bounds must be sound");
+    assert!(ordered, "decomposed GELU MLP output bounds must be ordered");
 
     // No NaN in output
     let has_nan = mlp_output.lower().iter().any(|x| x.is_nan())
         || mlp_output.upper().iter().any(|x| x.is_nan());
-    assert!(!has_nan, "GELU MLP output should not contain NaN");
+    assert!(
+        !has_nan,
+        "decomposed GELU MLP output should not contain NaN"
+    );
 }
 
 #[ntest::timeout(10000)]
@@ -606,7 +540,7 @@ fn test_mlp_subgraph_swiglu_detection() {
         5,
         "SwiGLU: gate, SiLU, up, Mul, down"
     );
-    assert_mlp_ibp_sound(&mlp_graph, hidden);
+    assert_mlp_ibp_well_formed(&mlp_graph, hidden);
 }
 
 #[ntest::timeout(10000)]
@@ -635,7 +569,7 @@ fn test_mlp_subgraph_swiglu_alt_naming() {
         .expect("SwiGLU (w1/w3/w2) subgraph extraction should succeed");
 
     assert_eq!(mlp_graph.num_nodes(), 5, "SwiGLU alt naming: 5 nodes");
-    assert_mlp_ibp_sound(&mlp_graph, hidden);
+    assert_mlp_ibp_well_formed(&mlp_graph, hidden);
 }
 
 #[ntest::timeout(10000)]

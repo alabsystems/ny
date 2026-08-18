@@ -36,14 +36,19 @@ echo "Model: $MODEL_VARIANT (eps=$EPS)"
 echo "Start: $TIMESTAMP"
 echo ""
 
-if [ ! -f "$NY" ]; then
-    echo "ERROR: Binary not found: $NY"
+if [ ! -x "$NY" ]; then
+    echo "ERROR: Binary not found or not executable: $NY"
     exit 1
 fi
 
 if [ ! -f "$MODEL" ]; then
     echo "ERROR: Model not found: $MODEL"
     echo "Run: benchmarks/download_benchmarks.sh"
+    exit 1
+fi
+
+if [[ ! "$MAX_INSTANCES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MAX_INSTANCES must be a positive integer: $MAX_INSTANCES"
     exit 1
 fi
 
@@ -56,59 +61,73 @@ ERROR_COUNT=0
 TOTAL=0
 RESULTS_JSON="["
 
-for i in $(seq 0 $((MAX_INSTANCES - 1))); do
+for ((i = 0; i < MAX_INSTANCES; i++)); do
     PROP="$BENCHMARK_DIR/vnnlib_properties_pgd_filtered/${PROP_DIR}/prop_${i}_eps_${EPS}.vnnlib"
     if [ ! -f "$PROP" ]; then
-        echo "  SKIP: prop_${i} not found"
-        continue
+        echo "ERROR: Required property not found: $PROP"
+        exit 1
     fi
 
-    START_NS=$(python3 --no-wrapper -c "import time; print(int(time.time_ns()))")
+    START_NS=$(python3 -c "import time; print(int(time.time_ns()))")
 
+    SOLVER_EXIT=0
     if [ "$METHOD" = "beta" ]; then
-        PGD_FLAGS=""
+        PGD_FLAGS=()
         if [ "$PGD_ATTACK" = "1" ]; then
-            PGD_FLAGS="--pgd-attack"
+            PGD_FLAGS=(--pgd-attack)
         fi
-        OUTPUT=$("$NY" beta-crown "$MODEL" \
-            --property "$PROP" \
-            --timeout "$TIMEOUT" \
-            --branching input \
-            $PGD_FLAGS \
-            2>&1) || true
+        if OUTPUT=$("$NY" beta-crown "$MODEL" \
+                --property "$PROP" \
+                --timeout "$TIMEOUT" \
+                --branching input \
+                "${PGD_FLAGS[@]}" \
+                2>&1)
+        then
+            SOLVER_EXIT=0
+        else
+            SOLVER_EXIT=$?
+        fi
     else
-        OUTPUT=$("$NY" verify "$MODEL" \
-            --property "$PROP" \
-            --method "$METHOD" \
-            --timeout "$TIMEOUT" \
-            --json \
-            2>&1) || true
+        if OUTPUT=$("$NY" verify "$MODEL" \
+                --property "$PROP" \
+                --method "$METHOD" \
+                --timeout "$TIMEOUT" \
+                --json \
+                2>&1)
+        then
+            SOLVER_EXIT=0
+        else
+            SOLVER_EXIT=$?
+        fi
     fi
 
-    END_NS=$(python3 --no-wrapper -c "import time; print(int(time.time_ns()))")
+    END_NS=$(python3 -c "import time; print(int(time.time_ns()))")
     ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
-    ELAPSED_S=$(python3 --no-wrapper -c "print(f'{${ELAPSED_MS}/1000:.2f}')")
+    ELAPSED_S=$(python3 -c "print(f'{${ELAPSED_MS}/1000:.2f}')")
 
-    # Parse status from JSON output.
-    # The verify command outputs "property_status" (safe/unknown/violated) and "status" (always "verified"
-    # meaning the process completed). The beta-crown command outputs plain text "Status: VERIFIED/UNKNOWN".
-    # Use property_status for JSON output; fall back to text parsing for beta-crown.
-    STATUS="error"
-    if echo "$OUTPUT" | grep -qi '"property_status".*"safe"'; then
-        STATUS="verified"
-    elif echo "$OUTPUT" | grep -qi '"property_status".*"violated"'; then
-        STATUS="falsified"
-    elif echo "$OUTPUT" | grep -qi '"property_status".*"unknown"'; then
-        STATUS="unknown"
-    elif echo "$OUTPUT" | grep -qi 'Status: VERIFIED'; then
-        STATUS="verified"
-    elif echo "$OUTPUT" | grep -qi 'Status: UNKNOWN'; then
-        STATUS="unknown"
-    elif echo "$OUTPUT" | grep -qi 'PotentialViolation\|Status: FALSIFIED'; then
-        STATUS="falsified"
-    elif echo "$OUTPUT" | grep -qi 'TIMEOUT\|timed out'; then
-        STATUS="timeout"
+    # Parse the rendered verdict, then require it to match ny's documented
+    # 0=verified, 1=falsified, 2=unknown, 3=timeout process contract.
+    PARSED_STATUS="error"
+    if grep -Eqi '"status"[[:space:]]*:[[:space:]]*"verified"|Status: VERIFIED' <<< "$OUTPUT"; then
+        PARSED_STATUS="verified"
+    elif grep -Eqi '"status"[[:space:]]*:[[:space:]]*"violated"|Status: (VIOLATED|FALSIFIED)' <<< "$OUTPUT"; then
+        PARSED_STATUS="falsified"
+    elif grep -Eqi '"status"[[:space:]]*:[[:space:]]*"timeout"|Status: TIMEOUT|timed out' <<< "$OUTPUT"; then
+        PARSED_STATUS="timeout"
+    elif grep -Eqi '"status"[[:space:]]*:[[:space:]]*"unknown"|Status: UNKNOWN|PotentialViolation' <<< "$OUTPUT"; then
+        PARSED_STATUS="unknown"
     fi
+
+    case "$SOLVER_EXIT:$PARSED_STATUS" in
+        0:verified|1:falsified|2:unknown|3:timeout)
+            STATUS="$PARSED_STATUS"
+            ;;
+        *)
+            STATUS="error"
+            echo "  ERROR: ny exit=$SOLVER_EXIT parsed=$PARSED_STATUS" >&2
+            printf '%s\n' "$OUTPUT" | tail -5 >&2
+            ;;
+    esac
 
     echo "  prop_${i}: ${STATUS} (${ELAPSED_S}s)"
 
@@ -125,7 +144,7 @@ for i in $(seq 0 $((MAX_INSTANCES - 1))); do
     if [ "$TOTAL" -gt 1 ]; then
         RESULTS_JSON="${RESULTS_JSON},"
     fi
-    RESULTS_JSON="${RESULTS_JSON}{\"instance\":\"prop_${i}\",\"status\":\"${STATUS}\",\"time_s\":${ELAPSED_S}}"
+    RESULTS_JSON="${RESULTS_JSON}{\"instance\":\"prop_${i}\",\"status\":\"${STATUS}\",\"time_s\":${ELAPSED_S},\"exit_code\":${SOLVER_EXIT}}"
 done
 
 RESULTS_JSON="${RESULTS_JSON}]"
@@ -160,10 +179,14 @@ cat > "$OUTPUT_JSON" << ENDJSON
   "unknown": $UNKNOWN,
   "timeout": $TIMEOUT_COUNT,
   "error": $ERROR_COUNT,
-  "solved_rate": $(python3 --no-wrapper -c "print(f'{($VERIFIED + $FALSIFIED) / $TOTAL:.4f}' if $TOTAL > 0 else '0')"),
+  "solved_rate": $(python3 -c "print(f'{($VERIFIED + $FALSIFIED) / $TOTAL:.4f}' if $TOTAL > 0 else '0')"),
   "results": $RESULTS_JSON
 }
 ENDJSON
 
 echo ""
 echo "Results written to: $OUTPUT_JSON"
+
+if [ "$ERROR_COUNT" -gt 0 ]; then
+    exit 1
+fi

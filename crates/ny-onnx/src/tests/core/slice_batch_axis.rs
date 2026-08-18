@@ -105,6 +105,7 @@ fn slice_batch_axis_noop_loads_and_propagates_identity() {
             tensor_i64("ends", &[1], &[i64::MAX]),
             tensor_i64("axes", &[1], &[0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 3])],
         output: vec![tensor_value_info("out", &[1, 3])],
         #[cfg(feature = "onnx-value-info")]
@@ -182,6 +183,7 @@ fn slice_batch_axis_full_finite_end_loads() {
             tensor_i64("ends", &[1], &[1]),
             tensor_i64("axes", &[1], &[0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("out", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]

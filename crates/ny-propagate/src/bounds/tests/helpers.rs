@@ -248,6 +248,8 @@ fn test_alpha_crown_config_default() {
     assert_eq!(config.gradient_method, GradientMethod::AnalyticChain);
     assert_eq!(config.spsa_samples, 1);
     assert!(config.fix_interm_bounds);
+    assert!(!config.cgan_sparse_target_complete_root);
+    assert!(!config.cgan_complete_crown_ibp_root);
     assert_eq!(config.sparse_ratio, 0.3);
     assert!(!config.adaptive_skip); // #3918: disabled — reference has no depth gate, uses early_stop_patience
     assert_eq!(config.adaptive_skip_depth_threshold, 20); // Retained for explicit opt-in
@@ -279,7 +281,11 @@ fn test_alpha_crown_config_clone() {
 #[test]
 fn test_alpha_crown_config_custom() {
     let config = AlphaCrownConfig {
+        // #joint-interm-grad: 0 = legacy frozen-intermediate ascent, which is
+        // what these fixtures were written against.
+        joint_interm_alpha_every: 0,
         iterations: 10,
+        alpha_spec_slots: 0,
         learning_rate: 0.1,
         lr_decay: 0.95,
         tolerance: 1e-6,
@@ -288,6 +294,8 @@ fn test_alpha_crown_config_custom() {
         gradient_method: GradientMethod::FiniteDifferences,
         spsa_samples: 5,
         fix_interm_bounds: false,
+        cgan_sparse_target_complete_root: false,
+        cgan_complete_crown_ibp_root: false,
         sparse_ratio: 1.0,
         adaptive_skip: false,
         adaptive_skip_depth_threshold: 100,
@@ -306,7 +314,14 @@ fn test_alpha_crown_config_custom() {
         deadline: None,
         start_save_best: 0.5,
         full_conv_alpha: true,
+        reference_refresh_fraction: 0.25,
+        reference_refresh_max_secs: None,
+        forward_linear_deadline_fallback_to_ibp: false,
+        skip_zero_iteration_collection_initial_bound: false,
         spec_early_exit: None,
+        spec_ascent: None,
+        root_alpha_margin: false,
+        alpha_zero_yield_frac: None,
     };
 
     assert_eq!(config.iterations, 10);
@@ -325,4 +340,26 @@ fn test_alpha_crown_config_serialization() {
     assert_eq!(config.iterations, deserialized.iterations);
     assert_eq!(config.learning_rate, deserialized.learning_rate);
     assert_eq!(config.gradient_method, deserialized.gradient_method);
+
+    let mut legacy = serde_json::to_value(&config).unwrap();
+    legacy
+        .as_object_mut()
+        .expect("serialized config is an object")
+        .remove("root_alpha_margin");
+    let legacy: AlphaCrownConfig = serde_json::from_value(legacy).unwrap();
+    assert!(
+        !legacy.root_alpha_margin,
+        "configs written before the typed delivery key must keep the legacy default"
+    );
+
+    let mut legacy = serde_json::to_value(&config).unwrap();
+    legacy
+        .as_object_mut()
+        .expect("serialized config is an object")
+        .remove("alpha_zero_yield_frac");
+    let legacy: AlphaCrownConfig = serde_json::from_value(legacy).unwrap();
+    assert!(
+        legacy.alpha_zero_yield_frac.is_none(),
+        "configs written before the typed delivery key must keep the legacy default"
+    );
 }

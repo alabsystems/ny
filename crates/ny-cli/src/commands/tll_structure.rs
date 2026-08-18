@@ -45,31 +45,34 @@
 //!
 //! - Every affine corner value rounds OUTWARD (lower rounds DOWN, upper rounds UP),
 //!   so `lb <= true min` and `ub >= true max` of the REAL-valued network.
-//! - The decode (affine `L_i` + selector sets + max-of-min vs min-of-max order) is
-//!   SELF-CHECKED at runtime against NY's own concrete forward at many sampled
-//!   points; a mismatch fails closed (returns `None`, generic path runs).
-//! - An enclosure gate additionally requires `lb <= sampled_min` and
-//!   `ub >= sampled_max`; a violated gate fails closed.
+//! - A raw-protobuf identity proof checks the sole FLOAT input/output, every
+//!   node and edge, all authored FLOAT tensors, the bit-exact selector, and
+//!   every algebraic min/max gadget. Finite NY/ORT samples remain diagnostics
+//!   only and cannot establish or change the decoded whole-domain identity.
 //! - We only ever return `Unsat`, and only when the sound bound strictly clears
 //!   the threshold - so a too-LOOSE bound merely forgoes the win (falls through),
 //!   never a false verdict.
 //!
-//! Default ON; disable with `NY_TLL_STRUCTURE_BOUND=0`. Only engages when the
-//! filename, node-name pattern, shape signature, one-hot selection, and forward
-//! self-check ALL match a genuine TLL net - a no-op for every other benchmark.
+//! Exact source authentication is wired for the property input box and
+//! directional threshold as well as the model. The verdict route remains
+//! release-dark while the complete chain undergoes qualification; no rounded
+//! property constant can reach the bound or verdict comparison.
 
 use std::path::Path;
 
 use ndarray::{ArrayD, IxDyn};
-use ny_onnx::vnnlib::OutputConstraint;
+use ny_core::f32_to_f64_exact;
 use ny_onnx::{load_onnx_with_config, OnnxLoadConfig};
 use ny_propagate::Interval64;
 
 use super::vnncomp::VnncompResult;
 use ny_onnx::{CompoundNodePolicy, GraphNetworkOptions};
 
+mod model_identity;
+mod property_identity;
+
 /// Direction of the single output threshold constraint (on `Y_0`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThreshDir {
     /// unsafe region is `Y_0 <= c` (or `< c`): UNSAT iff `min Y_0 > c`.
     Le,
@@ -85,14 +88,26 @@ struct TllStructure {
     b: Vec<f64>,
     /// Selector sets `S_j` (indices into `0..N`).
     groups: Vec<Vec<usize>>,
-    /// `true`: `y = max_j min_{i} L_i` (the observed tllverifybench realization);
-    /// `false`: `y = min_j max_{i} L_i` (checked as a fallback).
+    /// `true`: `y = max_j min_{i} L_i` (the authenticated realization);
+    /// `false`: retained only for symmetric bound-level tests.
     max_of_min: bool,
 }
 
 /// Relative outward-rounding slack (>> the ~4u accumulated f64 error for a
 /// 2-term affine; u = 2^-53, `EPSILON` = 2^-52).
 const OUTWARD: f64 = 32.0 * f64::EPSILON;
+
+/// Bound worst-case work before entering the per-cell lattice reductions. The
+/// largest qualified official model has 2,031 group memberships, requiring
+/// 831,897,600 membership comparisons at the final 640x640 grid. One billion
+/// preserves that route while rejecting adversarial authenticated shapes that
+/// could otherwise monopolize the verifier before the generic fallback.
+const MAX_GRID_LATTICE_WORK: usize = 1_000_000_000;
+
+/// Both authored model and property sources now have independent raw identity
+/// proofs. Publication remains deliberately dark during release qualification;
+/// no environment variable may bypass this compile-time gate.
+const TLL_PROPERTY_SOURCE_AUTHENTICATED: bool = false;
 
 /// Round `v` DOWN by a slack proportional to `mag`, an upper bound on the
 /// magnitude SUM of the addends that produced `v` (#tll-round-slack-harden).
@@ -137,39 +152,63 @@ fn round_up(v: f64) -> f64 {
 /// self-check/enclosure failure, or bound too loose) so the caller falls
 /// through to the generic verifier with no behavior change.
 pub(crate) fn try_tll_unsat(onnx: &Path, vnnlib: &Path) -> Option<VnncompResult> {
-    // Disable knob (batteries-included default ON).
-    if std::env::var("NY_TLL_STRUCTURE_BOUND").ok().as_deref() == Some("0") {
+    // Keep publication unreachable during qualification of the complete raw
+    // model + exact-decimal property authentication chain.
+    if !TLL_PROPERTY_SOURCE_AUTHENTICATED {
         return None;
     }
+    try_tll_unsat_authenticated(onnx, vnnlib)
+}
 
-    // Cheap pre-gate: only touch the (large) model for TLL-named instances.
-    let fname = onnx.file_name()?.to_string_lossy().to_ascii_lowercase();
-    if !fname.contains("tll") {
-        return None;
-    }
-
-    // Parse the property: require a single atomic threshold on Y_0 over a 2-D box.
-    let spec = ny_onnx::vnnlib::load_vnnlib(vnnlib).ok()?;
+/// Complete qualified route kept separate so tests can exercise every proof
+/// seam while the public compile-time publication gate remains dark.
+fn try_tll_unsat_authenticated(onnx: &Path, vnnlib: &Path) -> Option<VnncompResult> {
+    // Cheap STRUCTURAL pre-gate. The property is a small text file; the model
+    // may be hundreds of MB, so the spec shape is filtered first and the ONNX
+    // is only touched once this looks like the TLL family.
+    //
+    // This replaces a `file_name().contains("tll")` pre-gate. That gate was an
+    // identity check on public benchmark filenames: a TLL network delivered
+    // under any other name silently lost the fast path, and a non-TLL network
+    // named "tll_*" paid a pointless load. The 2-input/1-output/non-disjunctive
+    // shape below is what the decoder actually requires, and it is selective
+    // enough to keep the load off unrelated families. The raw model-identity
+    // proof below remains the real admission gate and fails closed.
+    let authenticated_property = property_identity::authenticate_raw_tll_property(vnnlib)?;
+    let spec = authenticated_property.spec();
     if spec.is_disjunction || spec.num_outputs != 1 || spec.num_inputs != 2 {
         return None;
     }
-    let (dir, thresh) = single_output_threshold(&spec)?;
-    if spec.input_bounds.len() != 2 {
-        return None;
-    }
-    let box0 = spec.input_bounds[0];
-    let box1 = spec.input_bounds[1];
+    let (dir, thresh) = authenticated_property.threshold();
+    let [box0, box1] = authenticated_property.input_bounds();
     if !(box0.0.is_finite() && box0.1.is_finite() && box1.0.is_finite() && box1.1.is_finite())
         || box0.0 > box0.1
         || box1.0 > box1.1
     {
         return None;
     }
+    // Every authored affine coefficient is f32. Keeping endpoints inside the
+    // finite f32 range makes edge differences, coefficient products, magnitude
+    // sums, and their outward slack finite in f64. Extreme finite f64 boxes
+    // could otherwise create NaNs that `min`/`max` reductions silently ignore.
+    let finite_input_limit = f32_to_f64_exact(f32::MAX);
+    if [box0.0, box0.1, box1.0, box1.1]
+        .iter()
+        .any(|bound| bound.abs() > finite_input_limit)
+    {
+        return None;
+    }
 
-    // Load ONCE: raw weights (pre-fusion names/initializers intact) for the
-    // decode, then build the concrete graph from the SAME model (no re-parse).
+    // Authenticate the authored protobuf itself. This proves the sole FLOAT
+    // input/output, the complete live chain, every edge/op/attribute, exact
+    // affine and selector tensors, and every min/max gadget. It neither uses
+    // NY's lowering nor samples as proof authority.
+    let authenticated_model = model_identity::authenticate_raw_tll_model(onnx)?;
+    let tll = authenticated_model.structure();
+
+    // NY and ORT forwards below are diagnostics only. A mismatch can decline
+    // the lane, but a match contributes no identity authority.
     let model = load_onnx_with_config(onnx, &OnnxLoadConfig::default()).ok()?;
-    let mut tll = decode_tll(&model.weights)?;
     let graph = model
         .to_graph_network_with_options(GraphNetworkOptions {
             compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
@@ -181,25 +220,16 @@ pub(crate) fn try_tll_unsat(onnx: &Path, vnnlib: &Path) -> Option<VnncompResult>
     let samples = sample_points(box0, box1);
     let forward = concrete_forward(&graph, &samples)?;
 
-    // Self-check the decode; auto-detect max-of-min vs min-of-max order.
-    // A mismatch on BOTH orders means our reconstruction is not this network -
-    // fail closed (fall through to the generic verifier).
-    if !self_check(&tll, &samples, &forward).0 {
-        tll.max_of_min = !tll.max_of_min;
-        if !self_check(&tll, &samples, &forward).0 {
-            return None;
-        }
+    // The raw proof fixes the order as max-of-min. Samples may veto that proof
+    // path diagnostically, but must never select or alter its semantics.
+    if !self_check(tll, &samples, &forward).0 {
+        return None;
     }
 
-    // Independent parse oracle (#tll-ort-oracle): `forward` above derives from
-    // the SAME ny ONNX parse as the decode (load_onnx_with_config +
-    // to_graph_network), so a systematic misparse could fool the self-check
-    // AND the bound together. Cross-check the same sample grid through ONNX
-    // Runtime, committed from the ORIGINAL model bytes with the input shape
-    // read straight from the protobuf - shares nothing with ny's parse. ORT
-    // unavailable or any disagreement beyond the self-check tolerance fails
-    // closed: the generic (non-fast-path) lane runs, and no verdict ever
-    // rests on the ny parse alone.
+    // Independent diagnostic oracle (#tll-ort-oracle): cross-check NY's sample
+    // forward through ONNX Runtime. Neither sample engine contributes to the
+    // raw algebraic identity proof; either may only veto the structural lane.
+    // ORT unavailable or any disagreement beyond tolerance fails closed.
     if !ort_cross_check(onnx, &samples, &forward) {
         return None;
     }
@@ -210,7 +240,10 @@ pub(crate) fn try_tll_unsat(onnx: &Path, vnnlib: &Path) -> Option<VnncompResult>
     // Escalating grid: return as soon as the sound bound clears the threshold.
     let enclose_tol = 1e-3 * (1.0 + sampled_max.abs().max(sampled_min.abs()));
     for &nx in &[32usize, 96, 288, 640] {
-        let (lb, ub) = tll.box_bounds(box0, box1, nx);
+        let (lb, ub) = tll.box_bounds(box0, box1, nx)?;
+        if !(lb.is_finite() && ub.is_finite()) || lb > ub {
+            return None;
+        }
         // Enclosure gate: a sound bound MUST enclose every sampled forward value
         // (lb <= sampled_min, ub >= sampled_max). A violation means the decode or
         // bound is inconsistent with the real network - fail closed.
@@ -222,6 +255,12 @@ pub(crate) fn try_tll_unsat(onnx: &Path, vnnlib: &Path) -> Option<VnncompResult>
             ThreshDir::Ge => ub < thresh, // max Y_0 <= ub < c  =>  no x with Y_0 >= c
         };
         if proven {
+            // Bind publication to the exact bytes whose algebra was proved.
+            if !authenticated_model.source_still_matches(onnx)
+                || !authenticated_property.source_still_matches(vnnlib)
+            {
+                return None;
+            }
             eprintln!(
                 "TLL structure bound: certified UNSAT via {} lattice bound \
                  (dir={dir:?}, thresh={thresh:.6}, lb={lb:.6}, ub={ub:.6}, \
@@ -236,113 +275,6 @@ pub(crate) fn try_tll_unsat(onnx: &Path, vnnlib: &Path) -> Option<VnncompResult>
         }
     }
     None
-}
-
-/// Extract the single atomic output-threshold constraint on `Y_0`, if that is
-/// exactly the property.
-fn single_output_threshold(spec: &ny_onnx::vnnlib::VnnLibSpec) -> Option<(ThreshDir, f64)> {
-    // Prefer the clause representation; fall back to the flat list.
-    let atoms: &[OutputConstraint] = if !spec.output_constraint_clauses.is_empty() {
-        if spec.output_constraint_clauses.len() != 1 {
-            return None;
-        }
-        &spec.output_constraint_clauses[0]
-    } else {
-        &spec.output_constraints
-    };
-    if atoms.len() != 1 {
-        return None;
-    }
-    match atoms[0] {
-        OutputConstraint::LessEqConst(0, c) | OutputConstraint::LessThanConst(0, c) => {
-            Some((ThreshDir::Le, c))
-        }
-        OutputConstraint::GreaterEqConst(0, c) | OutputConstraint::GreaterThanConst(0, c) => {
-            Some((ThreshDir::Ge, c))
-        }
-        _ => None,
-    }
-}
-
-/// Decode `L_i` (linearLayer) and selector sets `S_j` (selectionLayer one-hot)
-/// from the raw weight store. Returns `None` unless the full TLL signature -
-/// linearLayer + selectionLayer + minBank* + maxBank* with a clean one-hot
-/// selection and a 2-D input - is present.
-fn decode_tll(weights: &ny_onnx::WeightStore) -> Option<TllStructure> {
-    let find = |needle: &str| -> Option<&ArrayD<f32>> {
-        weights
-            .iter()
-            .find(|(k, _)| k.contains(needle))
-            .map(|(_, v)| v)
-    };
-    // Bank signature: both min and max banks must be present.
-    if !weights.keys().any(|k| k.contains("minBank"))
-        || !weights.keys().any(|k| k.contains("maxBank"))
-    {
-        return None;
-    }
-
-    let lin_w = find("linearLayer/MatMul")?; // shape [in=2, N]
-    let lin_b = find("linearLayer/BiasAdd")?; // shape [N]
-    let sel_w = find("selectionLayer/MatMul")?; // shape [N, N*SL]
-
-    if lin_w.ndim() != 2 || sel_w.ndim() != 2 || lin_b.ndim() != 1 {
-        return None;
-    }
-    let in_dim = lin_w.shape()[0];
-    let n = lin_w.shape()[1];
-    if in_dim != 2 || n == 0 || lin_b.shape()[0] != n {
-        return None;
-    }
-    if sel_w.shape()[0] != n {
-        return None;
-    }
-    let ncol = sel_w.shape()[1];
-    if ncol == 0 || ncol % n != 0 {
-        return None;
-    }
-    let slots = ncol / n; // slots per group
-
-    // Affine functions L_i(x) = a_i . x + b_i.
-    let mut a = Vec::with_capacity(n);
-    let mut b = Vec::with_capacity(n);
-    for i in 0..n {
-        a.push([lin_w[[0, i]] as f64, lin_w[[1, i]] as f64]);
-        b.push(lin_b[[i]] as f64);
-    }
-
-    // Decode groups from the one-hot selection matrix. Column c belongs to
-    // group `c / slots`; its single ~1.0 row is the selected L-index. A column
-    // that is not clean one-hot aborts the decode (fail closed).
-    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for c in 0..ncol {
-        let mut sel_row: Option<usize> = None;
-        for r in 0..n {
-            let v = sel_w[[r, c]];
-            if v.abs() > 1e-4 {
-                if (v - 1.0).abs() > 1e-3 || sel_row.is_some() {
-                    return None; // not a clean one-hot column
-                }
-                sel_row = Some(r);
-            }
-        }
-        let r = sel_row?;
-        let j = c / slots;
-        let g = &mut groups[j];
-        if !g.contains(&r) {
-            g.push(r);
-        }
-    }
-    if groups.iter().any(|g| g.is_empty()) {
-        return None;
-    }
-
-    Some(TllStructure {
-        a,
-        b,
-        groups,
-        max_of_min: true,
-    })
 }
 
 impl TllStructure {
@@ -371,23 +303,18 @@ impl TllStructure {
     /// Separable pre-computation: the box-min of `a_i . x` over a cell splits
     /// per coordinate, so we tabulate per-axis contributions once (`N x nx`) and
     /// only add per cell.
-    fn box_bounds(&self, box0: (f64, f64), box1: (f64, f64), nx: usize) -> (f64, f64) {
+    fn box_bounds(&self, box0: (f64, f64), box1: (f64, f64), nx: usize) -> Option<(f64, f64)> {
         let n = self.a.len();
-        let edges = |lo: f64, hi: f64| -> Vec<f64> {
-            let mut e = Vec::with_capacity(nx + 1);
-            for k in 0..=nx {
-                if k == 0 {
-                    e.push(lo);
-                } else if k == nx {
-                    e.push(hi);
-                } else {
-                    e.push(lo + (hi - lo) * (k as f64) / (nx as f64));
-                }
-            }
-            e
-        };
-        let e0 = edges(box0.0, box0.1);
-        let e1 = edges(box1.0, box1.1);
+        let memberships = self
+            .groups
+            .iter()
+            .try_fold(0usize, |sum, group| sum.checked_add(group.len()))?;
+        let cells = nx.checked_mul(nx)?;
+        if memberships.checked_mul(cells)? > MAX_GRID_LATTICE_WORK {
+            return None;
+        }
+        let e0 = checked_grid_edges(box0.0, box0.1, nx)?;
+        let e1 = checked_grid_edges(box1.0, box1.1, nx)?;
 
         // Per-axis min/max contribution of a_i * x over each cell slice.
         // xlo[i*nx+ix] = min over [e0[ix],e0[ix+1]] of a_i0 * x  (rounded DOWN)
@@ -481,8 +408,48 @@ impl TllStructure {
                 global_ub = global_ub.max(ub_cell);
             }
         }
-        (global_lb, global_ub)
+        Some((global_lb, global_ub))
     }
+}
+
+/// Construct a complete cell partition of `[lo, hi]` and authenticate the
+/// floating-point realization before it can drive a proof. Exact endpoints
+/// plus finite, contained, nondecreasing interior edges ensure the adjacent
+/// closed cells cover the complete outward input interval. Duplicate edges are
+/// harmless zero-width cells; a gap, reversal, overflow, or NaN fails closed.
+fn checked_grid_edges(lo: f64, hi: f64, nx: usize) -> Option<Vec<f64>> {
+    if nx == 0 || !lo.is_finite() || !hi.is_finite() || lo > hi {
+        return None;
+    }
+    let span = hi - lo;
+    let denominator = nx as f64;
+    if !span.is_finite() || span < 0.0 || !denominator.is_finite() || denominator <= 0.0 {
+        return None;
+    }
+
+    let capacity = nx.checked_add(1)?;
+    let mut edges = Vec::new();
+    edges.try_reserve_exact(capacity).ok()?;
+    edges.push(lo);
+    for k in 1..nx {
+        let edge = lo + span * (k as f64) / denominator;
+        let previous = *edges.last()?;
+        if !edge.is_finite() || edge < lo || edge > hi || edge < previous {
+            return None;
+        }
+        edges.push(edge);
+    }
+    if hi < *edges.last()? {
+        return None;
+    }
+    edges.push(hi);
+    if edges.len() != capacity
+        || edges.first().copied()?.to_bits() != lo.to_bits()
+        || edges.last().copied()?.to_bits() != hi.to_bits()
+    {
+        return None;
+    }
+    Some(edges)
 }
 
 /// Sample points for the decode self-check: a dense interior grid spanning the
@@ -519,6 +486,9 @@ fn concrete_forward(graph: &ny_propagate::GraphNetwork, pts: &[[f64; 2]]) -> Opt
         }
         let lo = *r.lower.iter().next()?;
         let hi = *r.upper.iter().next()?;
+        if !(lo.is_finite() && hi.is_finite()) || lo > hi {
+            return None;
+        }
         out.push(f64::midpoint(lo, hi));
     }
     Some(out)
@@ -527,7 +497,7 @@ fn concrete_forward(graph: &ny_propagate::GraphNetwork, pts: &[[f64; 2]]) -> Opt
 /// Require the reconstructed function to match NY's forward at every sample.
 /// Returns `(passed, max_abs_err)`.
 fn self_check(tll: &TllStructure, pts: &[[f64; 2]], forward: &[f64]) -> (bool, f64) {
-    if pts.len() != forward.len() {
+    if pts.len() != forward.len() || forward.iter().any(|value| !value.is_finite()) {
         return (false, f64::INFINITY);
     }
     let scale = forward.iter().fold(0.0f64, |m, &v| m.max(v.abs())).max(1.0);
@@ -577,7 +547,7 @@ fn ort_cross_check(onnx: &Path, pts: &[[f64; 2]], forward: &[f64]) -> bool {
         if out.len() != 1 {
             return false;
         }
-        let o = f64::from(out[0]);
+        let o = f32_to_f64_exact(out[0]);
         if !o.is_finite() || (o - f).abs() > tol {
             eprintln!(
                 "TLL structure bound: ORT oracle disagrees with ny forward at \
@@ -629,20 +599,73 @@ mod tests {
     }
 
     #[test]
+    fn verdict_route_requires_source_authenticated_property() {
+        // Raw model and exact-decimal property identity are independently
+        // established; publication stays dark until release qualification is
+        // explicitly completed.
+        const { assert!(!TLL_PROPERTY_SOURCE_AUTHENTICATED) };
+    }
+
+    #[test]
+    fn checked_grid_edges_cover_box_or_fail_closed() {
+        let edges =
+            checked_grid_edges(-0.1_f64, 0.3_f64.next_up(), 640).expect("finite ordered grid");
+        assert_eq!(edges.len(), 641);
+        assert_eq!(edges.first().unwrap().to_bits(), (-0.1_f64).to_bits());
+        assert_eq!(edges.last().unwrap().to_bits(), 0.3_f64.next_up().to_bits());
+        assert!(edges.iter().all(|edge| edge.is_finite()));
+        assert!(edges.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(edges
+            .iter()
+            .all(|&edge| { edge >= -0.1_f64 && edge <= 0.3_f64.next_up() }));
+
+        assert!(checked_grid_edges(0.0, 1.0, 0).is_none());
+        assert!(checked_grid_edges(1.0, 0.0, 32).is_none());
+        assert!(checked_grid_edges(f64::NAN, 1.0, 32).is_none());
+        assert!(checked_grid_edges(-f64::MAX, f64::MAX, 32).is_none());
+    }
+
+    #[test]
+    fn adversarial_grid_work_fails_closed_before_cell_reduction() {
+        let mut tll = sample();
+        tll.groups = vec![vec![0; 2_500]];
+        assert!(tll.box_bounds((-2.0, 2.0), (-2.0, 2.0), 640).is_none());
+    }
+
+    /// Exercise the complete route, including raw source seals, NY/ORT vetoes,
+    /// checked grid, and directional threshold, without enabling publication.
+    #[cfg(feature = "external-vnncomp")]
+    #[test]
+    fn requested_real_end_to_end_pair_is_certified() {
+        let model = std::env::var("NY_TLL_END_TO_END_MODEL").expect(
+            "external-vnncomp TLL end-to-end conformance requires \
+             NY_TLL_END_TO_END_MODEL=/path/to/model.onnx",
+        );
+        let property = std::env::var("NY_TLL_END_TO_END_PROPERTY").expect(
+            "external-vnncomp TLL end-to-end conformance requires \
+             NY_TLL_END_TO_END_PROPERTY=/path/to/property.vnnlib",
+        );
+        assert_eq!(
+            try_tll_unsat_authenticated(Path::new(&model), Path::new(&property)),
+            Some(VnncompResult::Unsat)
+        );
+    }
+
+    #[test]
     fn bound_is_sound_enclosure_max_of_min() {
         let tll = sample();
         let b0 = (-2.0, 2.0);
         let b1 = (-2.0, 2.0);
         let (bmin, bmax) = brute(&tll, b0, b1, 2000);
         for &nx in &[8usize, 32, 128] {
-            let (lb, ub) = tll.box_bounds(b0, b1, nx);
+            let (lb, ub) = tll.box_bounds(b0, b1, nx).expect("valid grid");
             // SOUND: lb <= true min, ub >= true max (small slack for the coarse
             // brute grid missing the exact extremum on the low-nx bounds).
             assert!(lb <= bmin + 1e-9, "nx={nx}: lb={lb} > brute_min={bmin}");
             assert!(ub >= bmax - 1e-9, "nx={nx}: ub={ub} < brute_max={bmax}");
         }
         // Convergence: the finest grid brackets the true min/max tightly.
-        let (lb, ub) = tll.box_bounds(b0, b1, 512);
+        let (lb, ub) = tll.box_bounds(b0, b1, 512).expect("valid grid");
         assert!(bmin - lb < 0.05, "lb not tight: {lb} vs {bmin}");
         assert!(ub - bmax < 0.05, "ub not tight: {ub} vs {bmax}");
     }
@@ -655,7 +678,7 @@ mod tests {
         let b1 = (-2.0, 1.0);
         let (bmin, bmax) = brute(&tll, b0, b1, 2000);
         for &nx in &[8usize, 32, 128] {
-            let (lb, ub) = tll.box_bounds(b0, b1, nx);
+            let (lb, ub) = tll.box_bounds(b0, b1, nx).expect("valid grid");
             assert!(lb <= bmin + 1e-9, "nx={nx}: lb={lb} > brute_min={bmin}");
             assert!(ub >= bmax - 1e-9, "nx={nx}: ub={ub} < brute_max={bmax}");
         }

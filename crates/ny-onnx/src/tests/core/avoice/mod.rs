@@ -36,4 +36,5 @@ mod speaker_encoder;
 mod talker_attention;
 mod training_signal_support;
 mod verifier_smoke;
+#[cfg(feature = "ort")]
 mod vocoder_speaker_bridge;

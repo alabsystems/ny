@@ -50,14 +50,13 @@ fn gpu_real_graph_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn try_wgpu_device(label: &str) -> Option<ComputeDevice> {
-    match ComputeDevice::new(Backend::Wgpu) {
-        Ok(device) => Some(device),
-        Err(err) => {
-            eprintln!("{label}: SKIP: wgpu device not available ({err})");
-            None
-        }
-    }
+fn require_wgpu_device(label: &str) -> ComputeDevice {
+    ComputeDevice::new(Backend::Wgpu).unwrap_or_else(|err| {
+        panic!(
+            "{label}: WGPU device required; run the external-wgpu conformance lane on a \
+             compatible GPU host ({err})"
+        )
+    })
 }
 
 fn model_input(model: &OnnxModel, eps: f32) -> (BoundedTensor, Vec<usize>) {
@@ -173,32 +172,27 @@ fn load_real_graph_case(
     model_path: &str,
     eps: f32,
     label: &str,
-) -> Option<(ComputeDevice, GraphNetwork, BoundedTensor, Vec<usize>)> {
+) -> (ComputeDevice, GraphNetwork, BoundedTensor, Vec<usize>) {
     let onnx_path = benchmark_path(model_path);
-    if !onnx_path.exists() {
-        eprintln!(
-            "{label}: SKIP: benchmark data not available at {}",
-            onnx_path.display()
-        );
-        return None;
-    }
+    assert!(
+        onnx_path.is_file(),
+        "{label}: external benchmark fixture missing at {}; run \
+         benchmarks/download_benchmarks.sh",
+        onnx_path.display()
+    );
 
-    let gpu_device = try_wgpu_device(label)?;
+    let gpu_device = require_wgpu_device(label);
     let model =
         load_onnx(&onnx_path).unwrap_or_else(|e| panic!("{label}: failed to load model: {e}"));
     let graph = model
         .to_graph_network()
         .unwrap_or_else(|e| panic!("{label}: to_graph_network failed: {e}"));
     let (input, shape) = model_input(&model, eps);
-    Some((gpu_device, graph, input, shape))
+    (gpu_device, graph, input, shape)
 }
 
-fn real_graph_crown_ibp_timing(
-    model_path: &str,
-    eps: f32,
-    label: &str,
-) -> Option<RealGraphProbeSummary> {
-    let (gpu_device, graph, input, shape) = load_real_graph_case(model_path, eps, label)?;
+fn real_graph_crown_ibp_timing(model_path: &str, eps: f32, label: &str) -> RealGraphProbeSummary {
+    let (gpu_device, graph, input, shape) = load_real_graph_case(model_path, eps, label);
 
     eprintln!(
         "{label}: graph nodes={}, output='{}', eps={eps}",
@@ -243,11 +237,11 @@ fn real_graph_crown_ibp_timing(
     assert_output_tightens_or_matches_ibp(output_bounds, &ibp_output, label);
     assert_concrete_center_inside(output_bounds, &concrete_output, label);
 
-    Some(RealGraphProbeSummary {
+    RealGraphProbeSummary {
         elapsed,
         output_provenance,
         fallback_events: result.fallback_events,
-    })
+    }
 }
 
 fn assert_no_fallbacks(summary: &RealGraphProbeSummary, label: &str) {
@@ -316,14 +310,13 @@ fn assert_within_competition_budget(label: &str, elapsed: Duration) {
     // policy as the avoice wall-clock budget policy, see `tests::core::avoice`
     // module docs). The `report_competition_budget` line above still records
     // the debug measurement.
-    if cfg!(debug_assertions) {
-        return;
+    if !cfg!(debug_assertions) {
+        assert!(
+            elapsed < budget,
+            "{label}: graph CROWN-IBP collection took {:.3}s, exceeds 180s VNN-COMP budget",
+            elapsed.as_secs_f64(),
+        );
     }
-    assert!(
-        elapsed < budget,
-        "{label}: graph CROWN-IBP collection took {:.3}s, exceeds 180s VNN-COMP budget",
-        elapsed.as_secs_f64(),
-    );
 }
 
 /// Real metaroom graph-path timing for the engine-threaded CROWN-IBP collector.
@@ -332,18 +325,16 @@ fn assert_within_competition_budget(label: &str, elapsed: Duration) {
 /// verifier, not the sequential precomputed-IBP fast path.
 #[ntest::timeout(900000)]
 #[test]
+#[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 fn test_gpu_graph_crown_ibp_real_metaroom_3397() {
     let _gpu_lock = gpu_real_graph_test_lock()
         .lock()
         .expect("real graph GPU test lock poisoned");
-    let summary = match real_graph_crown_ibp_timing(
+    let summary = real_graph_crown_ibp_timing(
         "benchmarks/vnncomp2025/benchmarks/metaroom_2023/onnx/6cnn_ry_0_0_no_custom_OP.onnx",
         0.00001,
         "metaroom/graph_crown_ibp",
-    ) {
-        Some(summary) => summary,
-        None => return,
-    };
+    );
     assert_conv2d_patches_budget_fallbacks(&summary, "metaroom/graph_crown_ibp");
     report_competition_budget("metaroom/graph_crown_ibp", summary.elapsed);
 }
@@ -358,18 +349,16 @@ fn test_gpu_graph_crown_ibp_real_metaroom_3397() {
 /// no-fallback assertions and report the measured time.
 #[cfg_attr(not(debug_assertions), ntest::timeout(900000))]
 #[test]
+#[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 fn test_gpu_graph_crown_ibp_real_soundnessbench_3397() {
     let _gpu_lock = gpu_real_graph_test_lock()
         .lock()
         .expect("real graph GPU test lock poisoned");
-    let summary = match real_graph_crown_ibp_timing(
+    let summary = real_graph_crown_ibp_timing(
         "benchmarks/vnncomp2025/benchmarks/soundnessbench/onnx/model.onnx",
         0.001,
         "soundnessbench/graph_crown_ibp",
-    ) {
-        Some(summary) => summary,
-        None => return,
-    };
+    );
     assert_no_fallbacks(&summary, "soundnessbench/graph_crown_ibp");
     assert_within_competition_budget("soundnessbench/graph_crown_ibp", summary.elapsed);
 }

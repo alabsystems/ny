@@ -1,0 +1,103 @@
+{
+  "schema": "ny_compact_tail_envelope_plan_v1",
+  "diagnostic_only": true,
+  "execution_allowed": false,
+  "authority": false,
+  "target": {
+    "id": "cifar100-medium-1761",
+    "model_sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4",
+    "property_sha256": "f2a5e14de263f19a36d06a2200197e111f3cb7467eaf0f524edb09e3253b667b",
+    "objective_index": 95,
+    "threshold": 0.0,
+    "input_elements": 3072,
+    "seam_node": "Gemm_56",
+    "seam_elements": 100,
+    "relu_node": "Relu_57",
+    "output_node": "Gemm_58",
+    "output_elements": 100,
+    "fixed_tree_selectors": [
+      45,
+      1,
+      93,
+      96
+    ]
+  },
+  "evidence_sha256": {
+    "lpopt_dump": "e389308a536281258c5bfed51e71455a47525a62b640006c7d55fa9889b33782",
+    "root_margins": "9c6cf87bbb740f9e33e6ea533e4977fc71454d9b9f329e6a2a8d7bf1839311a0",
+    "solver_log": "8e02767dfb01be0a75136b3eaaa32c4f5b9c8bbcdeca6139c1b4a38eb34ad454"
+  },
+  "contract": {
+    "variants": [
+      "B0",
+      "B1",
+      "K2",
+      "K4",
+      "K8",
+      "K16"
+    ],
+    "shared_input_support_rows": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "encode_delta": 0.0001,
+    "max_tail_binaries": 96,
+    "max_input_elements": 4096,
+    "max_seam_elements": 256,
+    "max_projected_columns": 8192,
+    "max_projected_rows": 4096,
+    "max_projected_nnz": 250000,
+    "max_support_bank_bytes": 524288,
+    "usize_bytes": 8,
+    "split_depth": 4,
+    "fixed_tree_leaves": 16
+  },
+  "proof_ladder": [
+    {
+      "id": "adaptive-five",
+      "route": "adaptive_five_leaf_comb_target_fsb",
+      "ny_api": "certify_linear_lower_bound_at_with_ay_adaptive_five_leaf_comb_target_fsb_admission",
+      "implementation_status": "solver_api_ready_compact_tail_producer_executor_absent",
+      "time_cap_seconds": 1.0,
+      "warm_start": "no_caller_start_ay_internal_probe_and_leaf_warm_reuse"
+    },
+    {
+      "id": "fixed-tree-cold",
+      "route": "fixed_assignment_tree",
+      "ny_api": "certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_admission",
+      "implementation_status": "solver_api_ready_compact_tail_producer_executor_absent",
+      "time_cap_seconds": 3.0,
+      "warm_start": "ay_default_root_cold_then_gray_order_preceding_basis_warm_leaves"
+    },
+    {
+      "id": "fixed-tree-progressive",
+      "route": "fixed_assignment_tree_progressive_warm_start",
+      "ny_api": "certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_compact_progressive_admission",
+      "implementation_status": "executor_ready_live_prefix_crown_producer_absent",
+      "adapter_requirement": "implemented: thread FixedAssignmentTreeWarmStart::RootProbeThenProgressivePrefix through solve_and_replay_fixed_assignment_tree_proof into SolveOpts::with_fixed_assignment_tree_warm_start",
+      "time_cap_seconds": 3.0,
+      "warm_start": "root_probe_then_progressive_prefix",
+      "root_probe_milliseconds": 50,
+      "prefix_milliseconds": 25,
+      "start_assignment": 0
+    },
+    {
+      "id": "exact-decision",
+      "route": "certified_exact_decision",
+      "ny_api": "certify_linear_lower_bound_at_with_ay_admission",
+      "implementation_status": "solver_api_ready_compact_tail_producer_executor_absent",
+      "time_cap_seconds": 5.0,
+      "warm_start": "no_ny_incumbent_or_branch_advice_ay_internal_defaults"
+    }
+  ],
+  "acceptance": {
+    "max_prefix_bank_wall_seconds": 1.0,
+    "max_proof_wall_seconds": 5.0,
+    "max_peak_rss_bytes": 1073741824,
+    "minimum_worst_leaf_improvement": 0.75,
+    "required_certified_lower": 0.0,
+    "required_certificate_scope": "end_to_end_request_bound_prefix_plus_tail"
+  }
+}

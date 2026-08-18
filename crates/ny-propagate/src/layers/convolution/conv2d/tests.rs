@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ny_core::{NyError, Result};
+use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use ny_test_utils::CountingGemmEngine;
 
@@ -11,6 +11,7 @@ use crate::layers::common::BoundPropagation;
 use crate::tests::{assert_batched_bounds_close, assert_close};
 use crate::{BatchedLinearBounds, LinearBounds};
 use ndarray::{array, Array2, ArrayD, IxDyn};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const TOL: f32 = 1e-6;
 
@@ -60,6 +61,212 @@ fn test_conv2d_ibp_single_channel_exact_positive_kernel() -> Result<()> {
     assert_close(output.upper()[[0, 0, 1]], 12.5, TOL);
     assert_close(output.upper()[[0, 1, 0]], 14.5, TOL);
     assert_close(output.upper()[[0, 1, 1]], 16.5, TOL);
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_conv2d_sound_ibp_is_pollable_grouped_and_engine_free() -> Result<()> {
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[2, 1, 2, 2]),
+        vec![0.5, -0.25, 0.75, 0.1, -0.4, 0.2, 0.3, -0.6],
+    )
+    .expect("grouped kernel");
+    let layer = Conv2dLayer::new_full(kernel, Some(array![0.1_f32, -0.2]), (1, 1), (0, 0), 2)?;
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(
+            IxDyn(&[2, 3, 3]),
+            (0..18).map(|i| -1.0 + i as f32 * 0.07).collect(),
+        )
+        .expect("lower"),
+        ArrayD::from_shape_vec(
+            IxDyn(&[2, 3, 3]),
+            (0..18).map(|i| 0.5 + i as f32 * 0.09).collect(),
+        )
+        .expect("upper"),
+    )?;
+    let expected = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    let engine = CountingGemmEngine::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let actual = layer.propagate_ibp_sound_with_engine_and_deadline(
+        &input,
+        Some(&engine),
+        Some(deadline),
+    )?;
+
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite-deadline interval and abssum passes must not enter the opaque engine"
+    );
+    assert_eq!(actual.shape(), expected.shape());
+    for (actual, expected) in actual
+        .lower()
+        .iter()
+        .chain(actual.upper().iter())
+        .zip(expected.lower().iter().chain(expected.upper().iter()))
+    {
+        assert!(
+            (*actual - *expected).abs() <= 1e-4,
+            "pollable grouped result {actual} diverged from legacy {expected}"
+        );
+    }
+
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let error = layer
+        .propagate_ibp_sound_with_engine_and_deadline(&input, Some(&engine), Some(expired))
+        .expect_err("expired certified Conv2d IBP must remain structured");
+    assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "expired Conv2d IBP must refuse before caller-engine launch"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_convtranspose2d_encloses_unbatched_and_batched_geometry() -> Result<()> {
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![1.0_f32, -2.0, 0.5, 0.25])
+        .expect("kernel");
+    let layer = ConvTranspose2dLayer::new_full(
+        kernel,
+        Some(array![0.5_f32]),
+        (2, 2),
+        (1, 0),
+        (2, 1),
+        (1, 1),
+    )?;
+    let lower = ArrayD::from_shape_vec(IxDyn(&[1, 2, 3]), vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+        .expect("lower input");
+    let upper = &lower + 1.0;
+    let unbatched = BoundedTensor::new(lower.clone(), upper.clone())?;
+    let legacy = layer.propagate_ibp(&unbatched)?;
+    let engine = CountingGemmEngine::new();
+    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let finite =
+        layer.propagate_ibp_sound_with_engine_and_deadline(&unbatched, Some(&engine), deadline)?;
+    assert_eq!(finite.shape(), &[1, 4, 7]);
+    for ((&actual_lower, &actual_upper), (&legacy_lower, &legacy_upper)) in finite
+        .lower()
+        .iter()
+        .zip(finite.upper().iter())
+        .zip(legacy.lower().iter().zip(legacy.upper().iter()))
+    {
+        assert!(actual_lower <= legacy_lower);
+        assert!(actual_upper >= legacy_upper);
+    }
+
+    let lower_second = &lower - 1.0;
+    let upper_second = &upper + 2.0;
+    let batched_lower = ndarray::stack(ndarray::Axis(0), &[lower.view(), lower_second.view()])
+        .expect("batched lower");
+    let batched_upper = ndarray::stack(ndarray::Axis(0), &[upper.view(), upper_second.view()])
+        .expect("batched upper");
+    let batched = BoundedTensor::new(batched_lower, batched_upper)?;
+    let batched_legacy = layer.propagate_ibp(&batched)?;
+    let batched_finite =
+        layer.propagate_ibp_with_engine_and_deadline(&batched, Some(&engine), deadline)?;
+    assert_eq!(batched_finite.shape(), &[2, 1, 4, 7]);
+    for ((&actual_lower, &actual_upper), (&legacy_lower, &legacy_upper)) in batched_finite
+        .lower()
+        .iter()
+        .zip(batched_finite.upper().iter())
+        .zip(
+            batched_legacy
+                .lower()
+                .iter()
+                .zip(batched_legacy.upper().iter()),
+        )
+    {
+        assert!(actual_lower <= legacy_lower);
+        assert!(actual_upper >= legacy_upper);
+    }
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite ConvTranspose2d IBP must refuse the opaque engine"
+    );
+
+    let legacy_sound = layer.propagate_ibp_sound_with_engine(&unbatched, Some(&engine))?;
+    let none_sound =
+        layer.propagate_ibp_sound_with_engine_and_deadline(&unbatched, Some(&engine), None)?;
+    assert_eq!(none_sound.lower(), legacy_sound.lower());
+    assert_eq!(none_sound.upper(), legacy_sound.upper());
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_convtranspose2d_expiry_and_cap_are_typed_and_engine_free() -> Result<()> {
+    let layer = make_convtranspose2d(1.0, None, (1, 1));
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 1, 1]), -1.0),
+        ArrayD::from_elem(IxDyn(&[1, 1, 1]), 1.0),
+    )?;
+    let engine = CountingGemmEngine::new();
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let error = layer
+        .propagate_ibp_sound_with_engine_and_deadline(&input, Some(&engine), Some(expired))
+        .expect_err("expired ConvTranspose2d IBP must remain structured");
+    assert!(error.is_deadline_exceeded());
+    assert_eq!(engine.gemm_calls(), 0);
+
+    let cap_layer = ConvTranspose2dLayer::new_full(
+        ArrayD::ones(IxDyn(&[1, 1, 1, 1])),
+        None,
+        (2, 2),
+        (0, 0),
+        (1, 1),
+        (1, 1),
+    )?;
+    let large_input = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[1, 1_025, 1_025])),
+        ArrayD::ones(IxDyn(&[1, 1_025, 1_025])),
+    )?;
+    let error = cap_layer
+        .propagate_ibp_with_engine_and_deadline(
+            &large_input,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect_err("oversized ConvTranspose2d output must trip the finite cap");
+    assert!(
+        matches!(error, NyError::CpuMemoryExceeded { .. }),
+        "live cap refusal must remain distinct from deadline expiry: {error}"
+    );
+    assert_eq!(engine.gemm_calls(), 0);
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_small_conv2d_crown_never_enters_engine() -> Result<()> {
+    let layer = make_conv2d(2.0, Some(0.25), (2, 2));
+    let bounds = LinearBounds::identity(4);
+    let expected = layer
+        .propagate_linear_with_engine(&bounds, None)?
+        .into_owned();
+    let engine = CountingGemmEngine::new();
+    let actual = layer
+        .propagate_linear_with_engine_and_deadline(
+            &bounds,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )?
+        .into_owned();
+
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite deadline must refuse the generic engine even below the old chunk threshold"
+    );
+    assert_linear_bounds_bitwise_eq(&actual, &expected, "small finite Conv2d CROWN");
     Ok(())
 }
 
@@ -133,6 +340,93 @@ fn test_conv2d_crown_batched_identity_bounds_maps_to_scaled_identity() -> Result
         }
     }
     Ok(())
+}
+
+fn one_cell_batched_bounds_with_unit_coeff_error() -> BatchedLinearBounds {
+    let mut bounds = BatchedLinearBounds::new(
+        ArrayD::zeros(IxDyn(&[1, 1, 1])),
+        ArrayD::zeros(IxDyn(&[1, 1])),
+        ArrayD::zeros(IxDyn(&[1, 1, 1])),
+        ArrayD::zeros(IxDyn(&[1, 1])),
+        vec![1, 1],
+        vec![1, 1],
+    )
+    .expect("valid bounds");
+    bounds.set_coeff_err(
+        ArrayD::ones(IxDyn(&[1, 1, 1])),
+        ArrayD::ones(IxDyn(&[1, 1, 1])),
+    );
+    bounds
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_batched_bias_folds_incoming_coefficient_error() -> Result<()> {
+    let layer = make_conv2d(0.0, Some(1.0), (1, 1));
+    let result =
+        layer.propagate_linear_batched(&one_cell_batched_bounds_with_unit_coeff_error(), None)?;
+
+    assert!(
+        result.lower_b[[0, 0]] <= -1.0,
+        "lower bias must include -A_err*|bias|"
+    );
+    assert!(
+        result.upper_b[[0, 0]] >= 1.0,
+        "upper bias must include +A_err*|bias|"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn convtranspose2d_batched_bias_folds_incoming_coefficient_error() -> Result<()> {
+    let layer = make_convtranspose2d(0.0, Some(1.0), (1, 1));
+    let result = layer.propagate_linear_batched(&one_cell_batched_bounds_with_unit_coeff_error())?;
+
+    assert!(
+        result.lower_b[[0, 0]] <= -1.0,
+        "lower bias must include -A_err*|bias|"
+    );
+    assert!(
+        result.upper_b[[0, 0]] >= 1.0,
+        "upper bias must include +A_err*|bias|"
+    );
+    Ok(())
+}
+
+fn one_cell_batched_bounds_with_malformed_coeff_error() -> BatchedLinearBounds {
+    let mut bounds = BatchedLinearBounds::identity(&[1, 1]).expect("valid identity bounds");
+    // Same element count as the coefficient tensor, so the former
+    // `into_shape(...).ok()` path accepted this semantic shape mismatch.
+    bounds.lower_a_err = Some(ArrayD::ones(IxDyn(&[1])));
+    bounds.upper_a_err = Some(ArrayD::ones(IxDyn(&[1])));
+    bounds
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn batched_conv2d_rejects_malformed_incoming_coefficient_error() {
+    let bounds = one_cell_batched_bounds_with_malformed_coeff_error();
+    let error = make_conv2d(1.0, None, (1, 1))
+        .propagate_linear_batched(&bounds, None)
+        .expect_err("malformed Conv2d coefficient error must fail closed");
+    assert!(
+        matches!(error, NyError::InvalidSpec(ref message) if message.contains("lower_a_err shape")),
+        "unexpected Conv2d coefficient-error failure: {error:?}"
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn batched_convtranspose2d_rejects_malformed_incoming_coefficient_error() {
+    let bounds = one_cell_batched_bounds_with_malformed_coeff_error();
+    let error = make_convtranspose2d(1.0, None, (1, 1))
+        .propagate_linear_batched(&bounds)
+        .expect_err("malformed ConvTranspose2d coefficient error must fail closed");
+    assert!(
+        matches!(error, NyError::InvalidSpec(ref message) if message.contains("lower_a_err shape")),
+        "unexpected ConvTranspose2d coefficient-error failure: {error:?}"
+    );
 }
 
 #[ntest::timeout(10000)]
@@ -638,6 +932,215 @@ fn conv2d_stride_one_accepted() {
     Conv2dLayer::new(kernel, None, (1, 1), (0, 0)).expect("stride=(1,1) must be accepted");
 }
 
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_zero_kernel_dimensions_are_rejected() {
+    for shape in [[0, 1, 1, 1], [1, 0, 1, 1], [1, 1, 0, 1], [1, 1, 1, 0]] {
+        let error = Conv2dLayer::new(ArrayD::zeros(IxDyn(&shape)), None, (1, 1), (0, 0))
+            .expect_err("zero Conv2d kernel dimension must be rejected");
+        assert!(
+            matches!(error, NyError::InvalidSpec(ref message) if message.contains("nonzero")),
+            "unexpected error for {shape:?}: {error:?}"
+        );
+
+        let error = ConvTranspose2dLayer::new(ArrayD::zeros(IxDyn(&shape)), None, (1, 1), (0, 0))
+            .expect_err("zero ConvTranspose2d kernel dimension must be rejected");
+        assert!(
+            matches!(error, NyError::InvalidSpec(ref message) if message.contains("nonzero")),
+            "unexpected transpose error for {shape:?}: {error:?}"
+        );
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_output_size_arithmetic_is_checked() -> Result<()> {
+    let kernel = ArrayD::zeros(IxDyn(&[1, 1, 2, 1]));
+    let conv = Conv2dLayer::new_dilated(kernel.clone(), None, (1, 1), (0, 0), (usize::MAX, 1), 1)?;
+    assert!(
+        matches!(conv.output_size(2, 1), Err(NyError::InvalidSpec(_))),
+        "effective Conv2d kernel overflow must return an error"
+    );
+    let padded = Conv2dLayer::new(
+        ArrayD::zeros(IxDyn(&[1, 1, 1, 1])),
+        None,
+        (1, 1),
+        (usize::MAX, 0),
+    )?;
+    assert!(
+        matches!(padded.output_size(1, 1), Err(NyError::InvalidSpec(_))),
+        "Conv2d doubled-padding overflow must return an error"
+    );
+
+    let transpose =
+        ConvTranspose2dLayer::new_full(kernel, None, (1, 1), (0, 0), (usize::MAX, 1), (0, 0))?;
+    assert!(
+        matches!(transpose.output_size(2, 1), Err(NyError::InvalidSpec(_))),
+        "effective ConvTranspose2d kernel overflow must return an error"
+    );
+    let transpose_padded = ConvTranspose2dLayer::new(
+        ArrayD::zeros(IxDyn(&[1, 1, 1, 1])),
+        None,
+        (1, 1),
+        (usize::MAX, 0),
+    )?;
+    assert!(
+        matches!(
+            transpose_padded.output_size(1, 1),
+            Err(NyError::InvalidSpec(_))
+        ),
+        "ConvTranspose2d doubled-padding overflow must return an error"
+    );
+    assert!(
+        matches!(
+            transpose_padded.output_size(0, 1),
+            Err(NyError::InvalidSpec(_))
+        ),
+        "zero ConvTranspose2d input height must return an error"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_revalidates_publicly_mutable_geometry() -> Result<()> {
+    let mut conv = Conv2dLayer::new(ArrayD::zeros(IxDyn(&[1, 2, 1, 1])), None, (1, 1), (0, 0))?;
+    conv.groups = usize::MAX;
+    let error = conv
+        .output_size(1, 1)
+        .expect_err("mutated grouped-channel overflow must be rejected");
+    assert!(
+        matches!(error, NyError::InvalidSpec(ref message) if message.contains("overflow")),
+        "unexpected mutated Conv2d error: {error:?}"
+    );
+    conv.groups = 1;
+    conv.stride = (0, 1);
+    assert!(matches!(
+        conv.output_size(1, 1),
+        Err(NyError::InvalidSpec(_))
+    ));
+    conv.kernel = ArrayD::zeros(IxDyn(&[1, 1, 1]));
+    assert!(matches!(
+        conv.output_size(1, 1),
+        Err(NyError::ShapeMismatch { .. })
+    ));
+
+    let mut transpose =
+        ConvTranspose2dLayer::new(ArrayD::zeros(IxDyn(&[1, 1, 1, 1])), None, (2, 2), (0, 0))?;
+    transpose.output_padding = (2, 0);
+    assert!(matches!(
+        transpose.output_size(1, 1),
+        Err(NyError::UnsupportedConfiguration(_))
+    ));
+    transpose.output_padding = (0, 0);
+    transpose.dilation = (0, 1);
+    assert!(matches!(
+        transpose.output_size(1, 1),
+        Err(NyError::InvalidSpec(_))
+    ));
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_public_geometry_accessors_do_not_panic_after_mutation() -> Result<()> {
+    let mut conv = Conv2dLayer::new(ArrayD::zeros(IxDyn(&[1, 2, 1, 1])), None, (1, 1), (0, 0))?;
+    conv.groups = usize::MAX;
+    assert_eq!(
+        conv.in_channels(),
+        0,
+        "legacy accessor must use the invalid-geometry sentinel on overflow"
+    );
+    assert!(matches!(
+        conv.try_in_channels(),
+        Err(NyError::InvalidSpec(_))
+    ));
+
+    conv.kernel = ArrayD::zeros(IxDyn(&[1]));
+    assert_eq!(conv.out_channels(), 0);
+    assert_eq!(conv.in_channels(), 0);
+    assert_eq!(conv.kernel_size(), (0, 0));
+    assert!(matches!(
+        conv.try_out_channels(),
+        Err(NyError::ShapeMismatch { .. })
+    ));
+    assert!(matches!(
+        conv.try_kernel_size(),
+        Err(NyError::ShapeMismatch { .. })
+    ));
+
+    let mut transpose =
+        ConvTranspose2dLayer::new(ArrayD::zeros(IxDyn(&[1, 1, 1, 1])), None, (1, 1), (0, 0))?;
+    transpose.kernel = ArrayD::zeros(IxDyn(&[]));
+    assert_eq!(transpose.out_channels(), 0);
+    assert_eq!(transpose.in_channels(), 0);
+    assert_eq!(transpose.kernel_size(), (0, 0));
+    assert!(matches!(
+        transpose.try_in_channels(),
+        Err(NyError::ShapeMismatch { .. })
+    ));
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_propagation_fast_paths_report_mutated_geometry() -> Result<()> {
+    let input = BoundedTensor::concrete(ArrayD::ones(IxDyn(&[1, 1, 1])))?;
+
+    let mut conv = make_conv2d(1.0, None, (1, 1));
+    conv.kernel = ArrayD::zeros(IxDyn(&[1]));
+    let engine = CountingGemmEngine::new();
+    assert!(matches!(
+        conv.propagate_ibp_with_engine(&input, Some(&engine)),
+        Err(NyError::ShapeMismatch { .. })
+    ));
+
+    let mut transpose = make_convtranspose2d(f32::from_bits(1), None, (1, 1));
+    transpose.kernel = ArrayD::from_elem(IxDyn(&[1]), f32::from_bits(1));
+    assert!(matches!(
+        transpose.propagate_ibp_sound_with_engine(&input, None),
+        Err(NyError::ShapeMismatch { .. })
+    ));
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_raw_ops_reject_invalid_geometry_without_panicking() {
+    let input = ArrayD::zeros(IxDyn(&[1, 1, 1]));
+    let zero_kernel = ArrayD::zeros(IxDyn(&[1, 1, 0, 1]));
+    assert!(matches!(
+        conv2d_single_grouped(&input, &zero_kernel, (1, 1), (0, 0), (1, 1), 1),
+        Err(NyError::InvalidSpec(_))
+    ));
+    assert!(matches!(
+        conv2d_transpose_forward(&input, &zero_kernel, (1, 1), (0, 0), (1, 1), (0, 0)),
+        Err(NyError::InvalidSpec(_))
+    ));
+
+    let kernel = ArrayD::zeros(IxDyn(&[1, 1, 1, 1]));
+    assert!(matches!(
+        conv2d_transpose(&input, &kernel, (1, 1), (0, 0), (1, 1), (usize::MAX, 2)),
+        Err(NyError::InvalidSpec(_))
+    ));
+
+    let mismatched_upper = ArrayD::zeros(IxDyn(&[1, 1, 2]));
+    let result = ops_ibp_fwd::conv2d_ibp_forward_grouped(
+        &input,
+        &mismatched_upper,
+        &kernel,
+        (1, 1),
+        (0, 0),
+        (1, 1),
+        1,
+        None,
+    );
+    assert!(
+        matches!(result, Err(NyError::ShapeMismatch { .. })),
+        "mismatched IBP endpoints must return ShapeMismatch"
+    );
+}
+
 /// Regression test for #2877: IBP forward with kernel > padded input returns error, not panic.
 #[ntest::timeout(10000)]
 #[test]
@@ -882,19 +1385,21 @@ fn test_convtranspose2d_crown_batched_2x2_kernel_soundness() -> Result<()> {
 #[ntest::timeout(10000)]
 #[test]
 fn test_convtranspose2d_batched_crown_engine_matches_cpu_3622() -> Result<()> {
-    let layer = make_convtranspose2d(3.0, Some(0.25), (2, 2));
-    let bounds = BatchedLinearBounds::identity(&[2, 4])?;
-    let expected = layer.propagate_linear_batched(&bounds)?;
-    let engine = CountingGemmEngine::new();
-    let actual = layer.propagate_linear_batched_maybe_engine(&bounds, Some(&engine))?;
+    crate::tests::with_serialized_env_vars(&[("NY_CONV_SKIP_DEAD_F32", "0")], || {
+        let layer = make_convtranspose2d(3.0, Some(0.25), (2, 2));
+        let bounds = BatchedLinearBounds::identity(&[2, 4])?;
+        let expected = layer.propagate_linear_batched(&bounds)?;
+        let engine = CountingGemmEngine::new();
+        let actual = layer.propagate_linear_batched_maybe_engine(&bounds, Some(&engine))?;
 
-    let calls = engine.gemm_calls();
-    assert!(
-        calls > 0,
-        "#3622 regression: ConvTranspose2d batched CROWN should invoke GemmEngine, got {calls} calls"
-    );
-    assert_batched_bounds_close(&actual, &expected, TOL, "conv_transpose2d_gemm");
-    Ok(())
+        let calls = engine.gemm_calls();
+        assert!(
+            calls > 0,
+            "#3622 regression: the ConvTranspose2d batched CROWN diagnostic legacy route should invoke GemmEngine, got {calls} calls"
+        );
+        assert_batched_bounds_close(&actual, &expected, TOL, "conv_transpose2d_gemm");
+        Ok(())
+    })
 }
 
 /// Regression (#2812, #3228): ConvTranspose2d CROWN backward per-row coefficient magnitude fallback.
@@ -913,6 +1418,56 @@ fn test_convtranspose2d_crown_backward_nonfinite_row_fallback() -> Result<()> {
     assert_nonfinite_row_fallback(&lb, 0);
     assert_finite_row(&lb, 1);
     Ok(())
+}
+
+/// The batched ConvTranspose dead-f32 optimization must retain the magnitude
+/// firewall on the authoritative f64 coefficients. Before the post-recompute
+/// scan, the default skip route left these `1e24` coefficients live because the
+/// only `is_crown_coeff_safe` scan was inside the skipped f32 contraction.
+#[ntest::timeout(10000)]
+#[test]
+fn wall_deadwork_convtranspose_batched_authoritative_f64_keeps_row_firewall() -> Result<()> {
+    crate::tests::with_env_edits(|env| {
+        let layer = make_convtranspose2d(1e5, Some(1.0), (2, 2));
+        let mut lower_a = ArrayD::<f32>::zeros(IxDyn(&[1, 2, 4]));
+        let mut upper_a = ArrayD::<f32>::zeros(IxDyn(&[1, 2, 4]));
+        for col in 0..4 {
+            lower_a[[0, 0, col]] = 1e19;
+            upper_a[[0, 0, col]] = 1e19;
+            lower_a[[0, 1, col]] = 1.0;
+            upper_a[[0, 1, col]] = 1.0;
+        }
+        let bounds = BatchedLinearBounds::new(
+            lower_a,
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            upper_a,
+            ArrayD::zeros(IxDyn(&[1, 2])),
+            vec![1, 1, 2, 2],
+            vec![1, 2],
+        )?;
+
+        env.set("NY_CONV_SKIP_DEAD_F32", "0");
+        let legacy = layer.propagate_linear_batched(&bounds)?;
+        env.remove("NY_CONV_SKIP_DEAD_F32");
+        let skipped = layer.propagate_linear_batched(&bounds)?;
+
+        assert_batched_linear_bounds_bitwise_eq(
+            &legacy,
+            &skipped,
+            "authoritative f64 magnitude firewall",
+        );
+        for col in 0..4 {
+            assert_eq!(skipped.lower_a[[0, 0, col]], 0.0);
+            assert_eq!(skipped.upper_a[[0, 0, col]], 0.0);
+            assert!(skipped.lower_a[[0, 1, col]].is_finite());
+            assert!(skipped.upper_a[[0, 1, col]].is_finite());
+        }
+        assert_eq!(skipped.lower_b[[0, 0]], f32::NEG_INFINITY);
+        assert_eq!(skipped.upper_b[[0, 0]], f32::INFINITY);
+        assert!(skipped.lower_b[[0, 1]].is_finite());
+        assert!(skipped.upper_b[[0, 1]].is_finite());
+        Ok(())
+    })
 }
 
 // ===== GEMM-based conv2d_transpose tests (#3382) =====
@@ -1943,6 +2498,34 @@ fn test_convtranspose2d_output_padding_forward() -> Result<()> {
     Ok(())
 }
 
+/// Output padding changes the selected output extent; it does not append a
+/// universally bias-only border. With ordinary padding, a newly exposed
+/// high-edge cell can still be reached by a valid input/kernel pair.
+#[test]
+fn test_convtranspose2d_output_padding_with_padding_keeps_real_edge_contribution() -> Result<()> {
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[1, 1, 3, 3]),
+        (1..=9).map(|value| value as f32).collect(),
+    )
+    .unwrap();
+    let input = ArrayD::from_shape_vec(IxDyn(&[1, 2, 2]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let bias = 0.25_f32;
+    let layer =
+        ConvTranspose2dLayer::new_full(kernel, Some(array![bias]), (2, 2), (1, 1), (1, 1), (1, 1))?;
+    let point = BoundedTensor::new(input.clone(), input)?;
+    let output = layer.propagate_ibp(&point)?;
+    assert_eq!(output.lower().shape(), &[1, 4, 4]);
+
+    // q=3 is reached by x=1, k=2 in both axes:
+    // q = x*stride + k - padding = 1*2 + 2 - 1.
+    assert_close(output.lower()[[0, 3, 3]], 4.0 * 9.0 + bias, 1e-4);
+    assert_eq!(
+        output.lower()[[0, 3, 3]].to_bits(),
+        output.upper()[[0, 3, 3]].to_bits()
+    );
+    Ok(())
+}
+
 /// ConvTranspose2d CROWN backward with output_padding must be exact: an
 /// identity objective re-evaluated at a point reproduces the forward
 /// transposed-conv output (affine op). stride 2, output_padding 1.
@@ -2436,34 +3019,51 @@ fn test_stack_keeps_patches_past_old_threshold() -> Result<()> {
     Ok(())
 }
 
-/// SOUNDNESS guard for padded chains (#hotpath): patches composition through a
-/// conv whose INCOMING patches carry nonzero padding is NOT element-wise
-/// equivalent to dense (boundary truncation of the intermediate conv is lost), so
-/// `propagate_patches` rejects it and the dispatcher falls back to the exact dense
-/// path. This test stacks three pad-1 stride-1 convs: the output-side conv runs in
-/// patches (identity incoming, zero padding), but the next conv sees nonzero
-/// incoming padding and falls back to dense. The end-to-end result must STILL
-/// match the all-dense operator element-wise (the fallback preserves exactness).
+/// Padded chains (#hotpath, #conv-crown-residual): composing patches through a
+/// conv whose INCOMING patches carry nonzero padding is not element-wise
+/// equivalent to dense unless the out-of-range intermediate taps (the downstream
+/// conv's zero-padding around this conv's output) are masked out first.
+///
+/// With the masking feature ON — the shipped default — the whole pad-1 stride-1
+/// chain stays in the memory-light patches representation AND still matches the
+/// all-dense operator element-wise. With `NY_CONV_PATCHES_COLLECT=0` the guard
+/// re-engages and only the output-side conv (identity incoming, zero padding)
+/// stays in patches, the rest falling back to the exact dense path.
+///
+/// Both directions are asserted here because this chain shape IS the ResNet
+/// shape: every 3x3 conv in CIFAR100/TinyImageNet carries `pads=[1,1,1,1]`, so
+/// the guard firing is precisely what kept those benchmarks on the dense path.
+/// The element-wise equivalence check inside
+/// `assert_stack_patches_matches_dense` runs in both configurations, so this is
+/// also a direct exactness test of the masked composition.
 #[ntest::timeout(60000)]
 #[test]
-fn test_stack_padded_chain_falls_back_but_stays_exact() -> Result<()> {
-    let depth = assert_stack_patches_matches_dense(
-        2,
-        10,
-        10,
-        &[
-            (3, 3, (1, 1), (1, 1)),
-            (3, 3, (1, 1), (1, 1)),
-            (2, 3, (1, 1), (1, 1)),
-        ],
-    )?;
-    // Only the output-side conv (identity incoming, zero padding) stays in patches;
-    // the padding-composition guard converts the rest to dense.
-    assert_eq!(
-        depth, 1,
-        "padded chain keeps only the first (output-side) conv in patches; \
-         the guard falls the rest back to dense"
+fn test_stack_padded_chain_stays_in_patches_and_exact() -> Result<()> {
+    const CHAIN: &[(usize, usize, (usize, usize), (usize, usize))] = &[
+        (3, 3, (1, 1), (1, 1)),
+        (3, 3, (1, 1), (1, 1)),
+        (2, 3, (1, 1), (1, 1)),
+    ];
+
+    let depth = assert_stack_patches_matches_dense(2, 10, 10, CHAIN)?;
+    assert!(
+        depth > 1,
+        "with intermediate-tap masking on (the default), a padded chain must \
+         compose past the first conv instead of densifying; got depth {depth}"
     );
+
+    // The `NY_CONV_PATCHES_COLLECT=0` direction is deliberately NOT exercised
+    // here. Toggling that env var flips a process-global gate that the whole
+    // engine reads, and `with_serialized_env_vars` only serialises env-MUTATING
+    // tests against each other — it cannot stop the hundreds of concurrently
+    // running tests that merely READ the gate from observing the flipped value.
+    // Adding that sub-case made `where_layer::test_sequential_crown_embedded_
+    // constant_where_exact_and_sound` and `tests_image::test_image_conv_transpose_
+    // batch_norm_preserves_split_correlated_rows` start failing intermittently in
+    // full-suite runs while passing in isolation. The disable path is a
+    // one-line delegation to `util::conv_patches_collect_enabled`, which is
+    // covered by its own semantics; the default-ON behaviour asserted above is
+    // what production runs.
     Ok(())
 }
 
@@ -2785,49 +3385,6 @@ fn test_conv2d_layer_ibp_matches_elementwise_reference_with_bias() -> Result<()>
     Ok(())
 }
 
-// Manual timing (run with: cargo test -p ny-propagate --lib --release
-//   convolution::tests::bench_conv2d_ibp_forward -- --ignored --nocapture).
-// Representative conv: 64 in/out channels, 27x27, stride 1, 3x3, groups 1.
-// Measured on dev hardware (release, 20 iters):
-//   old(elementwise) = 312.7 ms/iter   new(im2col+gemm) = 3.57 ms/iter
-//   => ~87x speedup, since the inner products become a cache-friendly faer
-//   GEMM instead of per-output-element dynamic ArrayD indexing.
-#[test]
-#[ignore = "manual timing benchmark; run explicitly with --ignored --nocapture"]
-fn bench_conv2d_ibp_forward() {
-    use super::ops_ibp_fwd::conv2d_ibp_forward_grouped;
-    use std::time::Instant;
-    let mut rng = Lcg(7);
-    let (in_c, out_c, kh, kw, h, w) = (64usize, 64usize, 3usize, 3usize, 27usize, 27usize);
-    let kernel = rand_arr(&mut rng, &[out_c, in_c, kh, kw], 0.1);
-    let center = rand_arr(&mut rng, &[in_c, h, w], 1.0);
-    let radius = rand_arr(&mut rng, &[in_c, h, w], 0.1).mapv(f32::abs);
-    let lower = &center - &radius;
-    let upper = &center + &radius;
-    let iters = 20;
-
-    let t0 = Instant::now();
-    for _ in 0..iters {
-        let _ = conv2d_ibp_forward_reference(&lower, &upper, &kernel, (1, 1), (0, 0), (1, 1), 1);
-    }
-    let old = t0.elapsed();
-
-    let t1 = Instant::now();
-    for _ in 0..iters {
-        let _ =
-            conv2d_ibp_forward_grouped(&lower, &upper, &kernel, (1, 1), (0, 0), (1, 1), 1, None)
-                .unwrap();
-    }
-    let new = t1.elapsed();
-
-    println!(
-        "conv2d IBP forward 64ch 27x27 3x3: old(elementwise)={:?}/iter  new(im2col+gemm)={:?}/iter  speedup={:.2}x",
-        old / iters,
-        new / iters,
-        old.as_secs_f64() / new.as_secs_f64()
-    );
-}
-
 /// Fail-before / pass-after repro for the conv IBP-forward under-widening
 /// (#vnncomp-aw-soundness). The f32 window-sum accumulation can deviate from the
 /// true value by far more than the generic 1-ULP `round_for_soundness` widening
@@ -2901,6 +3458,126 @@ fn conv2d_sound_ibp_forward_encloses_under_f32_cancellation() {
     }
 }
 
+/// Normal binary32 operands can still have an exact subnormal product. Five
+/// copies of 2^-126 * 2^-24 sum to 5*2^-150, while each individually rounded
+/// binary32 product is the halfway case that rounds to zero. This also drives
+/// the independent |W|*|x| S-pass to zero, so a relative-only Higham margin
+/// misses the exact result.
+#[test]
+fn convtranspose2d_sound_ibp_encloses_normal_operand_product_underflow() -> Result<()> {
+    let x = f32::MIN_POSITIVE; // 2^-126: normal, so DAZ cannot erase it.
+    let w = f32::from_bits((103_u32) << 23); // 2^-24: also normal.
+    let kernel =
+        ArrayD::from_shape_vec(IxDyn(&[5, 1, 1, 1]), vec![w; 5]).expect("five-channel kernel");
+    let layer = ConvTranspose2dLayer::new(kernel, None, (1, 1), (0, 0))?;
+    let input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[5, 1, 1]), vec![x; 5]).expect("five-channel input"),
+    )?;
+
+    let exact = 5.0_f64 * 2.0_f64.powi(-150);
+    let plain = layer.propagate_ibp(&input)?;
+    assert!(
+        (plain.upper()[[0, 0, 0]] as f64) < exact,
+        "fixture must expose product underflow before certified widening"
+    );
+
+    let certified = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    let lower = certified.lower()[[0, 0, 0]] as f64;
+    let upper = certified.upper()[[0, 0, 0]] as f64;
+    assert!(
+        lower <= exact && upper >= exact,
+        "certified ConvTranspose2d [{lower},{upper}] must enclose exact {exact}"
+    );
+    assert!(
+        lower.is_finite() && upper.is_finite(),
+        "normal source operands should retain finite certified bounds"
+    );
+
+    let negative_kernel =
+        ArrayD::from_shape_vec(IxDyn(&[5, 1, 1, 1]), vec![-w; 5]).expect("negative kernel");
+    let negative_layer = ConvTranspose2dLayer::new(negative_kernel, None, (1, 1), (0, 0))?;
+    let negative_plain = negative_layer.propagate_ibp(&input)?;
+    assert!(
+        (negative_plain.lower()[[0, 0, 0]] as f64) > -exact,
+        "fixture must expose negative product underflow before certified widening"
+    );
+    let negative_certified = negative_layer.propagate_ibp_sound_with_engine(&input, None)?;
+    let negative_lower = negative_certified.lower()[[0, 0, 0]] as f64;
+    let negative_upper = negative_certified.upper()[[0, 0, 0]] as f64;
+    assert!(
+        negative_lower <= -exact && negative_upper >= -exact,
+        "certified negative ConvTranspose2d [{negative_lower},{negative_upper}] must enclose \
+         exact {}",
+        -exact
+    );
+    Ok(())
+}
+
+/// A subnormal bias is an additive source: DAZ/FTZ can erase it, but it cannot
+/// subsequently be amplified by a weight. The absolute error budget must
+/// therefore enclose it without falling back to universal bounds.
+#[test]
+fn convtranspose2d_sound_ibp_encloses_subnormal_bias_with_finite_bounds() -> Result<()> {
+    let bias = f32::from_bits(1);
+    let kernel = ArrayD::zeros(IxDyn(&[1, 1, 1, 1]));
+    let layer = ConvTranspose2dLayer::new(kernel, Some(array![bias]), (1, 1), (0, 0))?;
+    let input = BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[1, 1, 1])))?;
+
+    let certified = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    let exact = 2.0_f64.powi(-149);
+    let lower = certified.lower()[[0, 0, 0]] as f64;
+    let upper = certified.upper()[[0, 0, 0]] as f64;
+    assert!(
+        lower <= exact && upper >= exact,
+        "certified ConvTranspose2d [{lower},{upper}] must enclose subnormal bias {exact}"
+    );
+    assert!(
+        lower.is_finite() && upper.is_finite(),
+        "an additive subnormal bias should retain finite certified bounds"
+    );
+    Ok(())
+}
+
+/// DAZ erases subnormal *source* operands before multiplication, so a large
+/// normal peer can amplify the missing value far beyond the absolute
+/// product-underflow budget. The certified caller must detect either source
+/// side by bits and return a correctly shaped universal interval.
+#[test]
+fn convtranspose2d_sound_ibp_fails_open_on_daz_sensitive_sources() -> Result<()> {
+    let subnormal = f32::from_bits(1);
+
+    // Subnormal kernel, batched non-square input, and non-trivial output shape.
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 2, 2, 1]), vec![subnormal, 1.0, -2.0, 0.5])
+        .expect("two-output kernel");
+    let layer = ConvTranspose2dLayer::new(kernel, None, (1, 1), (0, 0))?;
+    let input = BoundedTensor::concrete(ArrayD::from_elem(IxDyn(&[3, 1, 2, 4]), f32::MAX))?;
+    let kernel_guard = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    assert_eq!(kernel_guard.shape(), &[3, 2, 3, 4]);
+    assert!(kernel_guard
+        .lower()
+        .iter()
+        .all(|value| *value == f32::NEG_INFINITY));
+    assert!(kernel_guard
+        .upper()
+        .iter()
+        .all(|value| *value == f32::INFINITY));
+
+    // Subnormal input endpoint with a large normal kernel.
+    let layer = make_convtranspose2d(f32::MAX, None, (2, 3));
+    let input = BoundedTensor::concrete(ArrayD::from_elem(IxDyn(&[1, 2, 3]), subnormal))?;
+    let input_guard = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    assert_eq!(input_guard.shape(), &[1, 2, 3]);
+    assert!(input_guard
+        .lower()
+        .iter()
+        .all(|value| *value == f32::NEG_INFINITY));
+    assert!(input_guard
+        .upper()
+        .iter()
+        .all(|value| *value == f32::INFINITY));
+    Ok(())
+}
+
 // ---- #wall-deadwork oracles (NY_CONV_SKIP_DEAD_F32) ----
 // These tests use the crate-wide environment lock shared with other CROWN tests
 // that use the helper, including the existing NY_CROWN_MEM_CAP_MB oracles.
@@ -2942,6 +3619,98 @@ fn deadwork_bounds(with_err: bool) -> LinearBounds {
     b
 }
 
+#[derive(Default)]
+struct BoundedHostConvTestEngine {
+    f32_calls: AtomicUsize,
+    f64_calls: AtomicUsize,
+    polls: AtomicUsize,
+}
+
+impl GemmEngine for BoundedHostConvTestEngine {
+    fn gemm_f32(
+        &self,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _a: &[f32],
+        _b: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.f32_calls.fetch_add(1, Ordering::Relaxed);
+        Err(NyError::UnsupportedOp(
+            "bounded Conv test refuses the legacy f32 GEMM".into(),
+        ))
+    }
+
+    fn gemm_f64(&self, m: usize, k: usize, n: usize, a: &[f64], b: &[f64]) -> Result<Vec<f64>> {
+        self.f64_calls.fetch_add(1, Ordering::Relaxed);
+        let mut result = vec![0.0; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0;
+                for inner in 0..k {
+                    sum += a[row * k + inner] * b[inner * n + col];
+                }
+                result[row * n + col] = sum;
+            }
+        }
+        Ok(result)
+    }
+
+    fn poll_crown_backward_deadline(&self) -> Result<()> {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn forbids_unbounded_cpu_fallback(&self) -> bool {
+        true
+    }
+
+    fn provides_deadline_pollable_host_gemm(&self) -> bool {
+        true
+    }
+}
+
+#[ntest::timeout(30000)]
+#[test]
+fn bounded_conv_forces_certified_f64_route_despite_dead_f32_kill_switch() {
+    crate::tests::with_serialized_env_vars(&[("NY_CONV_SKIP_DEAD_F32", "0")], || {
+        let layer = deadwork_conv();
+        let bounds = deadwork_bounds(true);
+        let engine = BoundedHostConvTestEngine::default();
+
+        layer
+            .propagate_linear_with_engine_and_deadline(&bounds, Some(&engine), None)
+            .expect("scalar bounded Conv CROWN");
+
+        let batched = BatchedLinearBounds::new(
+            bounds.lower_a.into_dyn(),
+            bounds.lower_b.into_dyn(),
+            bounds.upper_a.into_dyn(),
+            bounds.upper_b.into_dyn(),
+            vec![3, 2, 2],
+            vec![12],
+        )
+        .expect("batched Conv relation");
+        let _bounded = layer
+            .propagate_linear_batched(&batched, Some(&engine))
+            .expect("batched bounded Conv CROWN");
+
+        assert_eq!(
+            engine.f32_calls.load(Ordering::Relaxed),
+            0,
+            "bounded Conv must never enter the legacy generic f32 pair"
+        );
+        assert!(
+            engine.f64_calls.load(Ordering::Relaxed) >= 4,
+            "both scalar and batched lower/upper coefficients use certified f64"
+        );
+        assert!(
+            engine.polls.load(Ordering::Relaxed) > engine.f64_calls.load(Ordering::Relaxed),
+            "bounded authority must also be polled through post-f64 publication work"
+        );
+    });
+}
+
 fn assert_linear_bounds_bitwise_eq(a: &LinearBounds, b: &LinearBounds, ctx: &str) {
     assert_eq!(a.lower_a.shape(), b.lower_a.shape(), "{ctx}: lower_a shape");
     for (x, y) in a.lower_a.iter().zip(b.lower_a.iter()) {
@@ -2974,6 +3743,173 @@ fn assert_linear_bounds_bitwise_eq(a: &LinearBounds, b: &LinearBounds, ctx: &str
         (None, None) => {}
         _ => panic!("{ctx}: upper_a_err presence mismatch"),
     }
+}
+
+fn assert_batched_linear_bounds_bitwise_eq(
+    a: &BatchedLinearBounds,
+    b: &BatchedLinearBounds,
+    ctx: &str,
+) {
+    assert_eq!(a.input_shape(), b.input_shape(), "{ctx}: input_shape");
+    assert_eq!(a.output_shape(), b.output_shape(), "{ctx}: output_shape");
+    for (name, lhs, rhs) in [
+        ("lower_a", &a.lower_a, &b.lower_a),
+        ("upper_a", &a.upper_a, &b.upper_a),
+        ("lower_b", &a.lower_b, &b.lower_b),
+        ("upper_b", &a.upper_b, &b.upper_b),
+    ] {
+        assert_eq!(lhs.shape(), rhs.shape(), "{ctx}: {name} shape");
+        for (index, (x, y)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{ctx}: {name}[{index}] mismatch");
+        }
+    }
+    for (name, lhs, rhs) in [
+        ("lower_a_err", &a.lower_a_err, &b.lower_a_err),
+        ("upper_a_err", &a.upper_a_err, &b.upper_a_err),
+    ] {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) => {
+                assert_eq!(lhs.shape(), rhs.shape(), "{ctx}: {name} shape");
+                for (index, (x, y)) in lhs.iter().zip(rhs.iter()).enumerate() {
+                    assert_eq!(x.to_bits(), y.to_bits(), "{ctx}: {name}[{index}] mismatch");
+                }
+            }
+            (None, None) => {}
+            _ => panic!("{ctx}: {name} presence mismatch"),
+        }
+    }
+}
+
+fn deadwork_convtranspose_stacked_fixture(
+    with_err: bool,
+) -> (ConvTranspose2dLayer, BatchedLinearBounds) {
+    const DOMAINS: usize = 3;
+    const SPECS: usize = 2;
+    const MID_DIM: usize = 3 * 4 * 4;
+
+    let kernel_values: Vec<f32> = (0..2 * 3 * 2 * 2)
+        .map(|i| ((i as f32) * 0.7311).sin() * 0.5)
+        .collect();
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[2, 3, 2, 2]), kernel_values).expect("kernel");
+    let layer = ConvTranspose2dLayer::with_input_shape(
+        kernel,
+        Some(array![0.1, -0.2, 0.3]),
+        (1, 1),
+        (0, 0),
+        3,
+        3,
+    )
+    .expect("valid convtranspose2d");
+
+    let coefficient_shape = IxDyn(&[DOMAINS, SPECS, MID_DIM]);
+    let coefficient_count = DOMAINS * SPECS * MID_DIM;
+    let lower_a = ArrayD::from_shape_vec(
+        coefficient_shape.clone(),
+        (0..coefficient_count)
+            .map(|i| ((i as f32) * 0.317).sin() * 0.75 - 0.1)
+            .collect(),
+    )
+    .expect("stacked lower coefficients");
+    let upper_a = ArrayD::from_shape_vec(
+        coefficient_shape.clone(),
+        (0..coefficient_count)
+            .map(|i| ((i as f32) * 0.173).cos() * 0.6 + 0.2)
+            .collect(),
+    )
+    .expect("stacked upper coefficients");
+    let lower_b = ArrayD::from_shape_vec(
+        IxDyn(&[DOMAINS, SPECS]),
+        (0..DOMAINS * SPECS)
+            .map(|i| i as f32 * 0.07 - 0.4)
+            .collect(),
+    )
+    .expect("stacked lower bias");
+    let upper_b = ArrayD::from_shape_vec(
+        IxDyn(&[DOMAINS, SPECS]),
+        (0..DOMAINS * SPECS)
+            .map(|i| i as f32 * 0.09 + 0.3)
+            .collect(),
+    )
+    .expect("stacked upper bias");
+    let mut bounds = BatchedLinearBounds::new(
+        lower_a,
+        lower_b,
+        upper_a,
+        upper_b,
+        vec![DOMAINS, 3, 4, 4],
+        vec![DOMAINS, SPECS],
+    )
+    .expect("stacked ConvTranspose relation");
+    if with_err {
+        bounds.set_coeff_err(
+            ArrayD::from_shape_vec(
+                coefficient_shape.clone(),
+                (0..coefficient_count)
+                    .map(|i| ((i * 13) % 7) as f32 * 1e-6)
+                    .collect(),
+            )
+            .expect("stacked lower error"),
+            ArrayD::from_shape_vec(
+                coefficient_shape,
+                (0..coefficient_count)
+                    .map(|i| ((i * 7) % 5) as f32 * 1e-6)
+                    .collect(),
+            )
+            .expect("stacked upper error"),
+        );
+    }
+    (layer, bounds)
+}
+
+/// The domain-stacked rebound shape (`[domains, specs, coefficients]`) must be
+/// bit-identical with the batched dead-f32 skip on and off. Distinct lower and
+/// upper matrices plus incoming certified errors cover both authoritative f64
+/// publications and their error carriers. The engine counters prove that the
+/// default-on route actually removes both legacy f32 contractions.
+#[ntest::timeout(30000)]
+#[test]
+fn wall_deadwork_convtranspose_batched_stacked_skip_is_bitwise_identical() {
+    crate::tests::with_env_edits(|env| {
+        for with_err in [false, true] {
+            let (layer, bounds) = deadwork_convtranspose_stacked_fixture(with_err);
+
+            env.set("NY_CONV_SKIP_DEAD_F32", "0");
+            let legacy_cpu = layer
+                .propagate_linear_batched(&bounds)
+                .expect("legacy CPU batched path");
+            let legacy_engine = CountingGemmEngine::new();
+            let legacy_accelerated = layer
+                .propagate_linear_batched_maybe_engine(&bounds, Some(&legacy_engine))
+                .expect("legacy engine batched path");
+            assert!(
+                legacy_engine.gemm_calls() >= 2,
+                "kill-switch route must execute lower and upper f32 contractions"
+            );
+
+            env.remove("NY_CONV_SKIP_DEAD_F32");
+            let skipped_cpu = layer
+                .propagate_linear_batched(&bounds)
+                .expect("default skip CPU batched path");
+            let skipped_engine = CountingGemmEngine::new();
+            let skipped_accelerated = layer
+                .propagate_linear_batched_maybe_engine(&bounds, Some(&skipped_engine))
+                .expect("default skip engine batched path");
+            assert_eq!(
+                skipped_engine.gemm_calls(),
+                0,
+                "default-on skip must not execute either dead f32 contraction"
+            );
+
+            let context = format!("stacked ConvTranspose with_err={with_err}");
+            assert_batched_linear_bounds_bitwise_eq(&legacy_cpu, &skipped_cpu, &context);
+            assert_batched_linear_bounds_bitwise_eq(
+                &legacy_accelerated,
+                &skipped_accelerated,
+                &context,
+            );
+            assert_batched_linear_bounds_bitwise_eq(&skipped_cpu, &skipped_accelerated, &context);
+        }
+    });
 }
 
 /// The skip must be BITWISE identical to the shipped path on recompute success —
@@ -3035,6 +3971,35 @@ fn wall_deadwork_skip_expired_deadline_aborts() {
     });
 }
 
+#[test]
+fn finite_deadline_conv2d_incoming_error_composition_is_engine_free() {
+    crate::tests::with_env_edits(|env| {
+        env.remove("NY_CONV_SKIP_DEAD_F32");
+        let layer = deadwork_conv();
+        let bounds = deadwork_bounds(true);
+        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        let expected = layer
+            .propagate_linear_with_engine_and_deadline(&bounds, None, deadline)
+            .expect("finite deadline CPU reference")
+            .into_owned();
+        let engine = CountingGemmEngine::new();
+        let actual = layer
+            .propagate_linear_with_engine_and_deadline(&bounds, Some(&engine), deadline)
+            .expect("finite deadline caller-engine route")
+            .into_owned();
+        assert_eq!(
+            engine.gemm_calls(),
+            0,
+            "finite-deadline point and incoming-error coefficients must not enter generic GEMM"
+        );
+        assert_linear_bounds_bitwise_eq(
+            &actual,
+            &expected,
+            "finite-deadline incoming-error engine refusal",
+        );
+    });
+}
+
 /// With the gate on, the memory-cap refusal must fire exactly as on the pair
 /// path (CpuMemoryExceeded → the collector's sound IBP fallback), not attempt
 /// the allocation. The cap parses integer MB (min enforceable 1MB), so the
@@ -3069,12 +4034,12 @@ fn wall_deadwork_skip_respects_mem_cap() {
     );
 }
 
-/// The kill-switch (`NY_CONV_SKIP_DEAD_F32=0`) restores the pair path. The
-/// discriminating observable: an already-expired deadline on a SMALL workload
-/// — the skip aborts (strict check), while the unchunked pair path finishes.
+/// The kill-switch (`NY_CONV_SKIP_DEAD_F32=0`) restores the historical point
+/// coefficient path, but the certified-f64 recompute still owns the verifier
+/// deadline. Both variants must therefore refuse an already-expired authority.
 #[ntest::timeout(30000)]
 #[test]
-fn wall_deadwork_kill_switch_restores_pair_path() {
+fn wall_deadwork_kill_switch_keeps_strict_deadline_authority() {
     crate::tests::with_env_edits(|env| {
         env.set("NY_CONV_SKIP_DEAD_F32", "0");
         let layer = deadwork_conv();
@@ -3084,8 +4049,8 @@ fn wall_deadwork_kill_switch_restores_pair_path() {
             .expect("now() is at least 10ms past the Instant epoch");
         let off = layer.propagate_linear_with_engine_and_deadline(&bounds, None, Some(expired));
         assert!(
-            off.is_ok(),
-            "kill-switch must restore the pair path (small workload finishes despite expired deadline)"
+            matches!(off, Err(NyError::DeadlineExceeded(_))),
+            "kill-switch must not bypass the certified recompute deadline"
         );
         // Default (unset): the skip is ON and aborts on the expired deadline.
         env.remove("NY_CONV_SKIP_DEAD_F32");
@@ -3167,6 +4132,595 @@ fn wall_deadwork_convtranspose_skip_is_bitwise_identical() {
             }
         }
     });
+}
+
+// ---- #cgan-conv-ibp-magnitude-floor: certified f64 finite-deadline arm ----
+//
+// The finite-deadline sound Conv2d IBP arm is the f64 dual-accumulator kernel
+// (`conv2d_ibp_forward_grouped_certified_f64_with_deadline`), replacing the
+// f32 3-pass gamma*S arm whose magnitude-scaled widening stopped cgan BaB
+// trees from closing. These tests certify: enclosure against a
+// directed-rounding f64 oracle, tightness vs the legacy arm (>= 100x on a
+// magnitude-dominated box), the macs > 5793 self-audit adaptation, the typed
+// deadline error, and bit-identity of the untouched deadline=None arm.
+
+/// Next representable f64 toward -inf (test-local `next_after` step for the
+/// directed-rounding oracle; the production helpers in ny-tensor are f32).
+fn oracle_next_down_f64(x: f64) -> f64 {
+    if x.is_nan() || x == f64::NEG_INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = x.to_bits();
+    if bits >> 63 == 0 {
+        f64::from_bits(bits - 1)
+    } else {
+        f64::from_bits(bits + 1)
+    }
+}
+
+/// Next representable f64 toward +inf. See [`oracle_next_down_f64`].
+fn oracle_next_up_f64(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = x.to_bits();
+    if bits >> 63 == 0 {
+        f64::from_bits(bits + 1)
+    } else {
+        f64::from_bits(bits - 1)
+    }
+}
+
+/// Exact-enclosure oracle: f64 interval conv forward with an outward directed
+/// step after EVERY addition (products of f32 values are exact in f64, so only
+/// the sums need direction). Tap index math is an INDEPENDENT i64
+/// transcription, so a slip in the production kernel's checked-usize
+/// enumeration diverges from this instead of being reproduced.
+#[allow(clippy::too_many_arguments)]
+fn oracle_directed_conv_interval(
+    kernel: &ArrayD<f32>,
+    bias: Option<&ndarray::Array1<f32>>,
+    lower: &ArrayD<f32>,
+    upper: &ArrayD<f32>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    groups: usize,
+) -> (ArrayD<f64>, ArrayD<f64>) {
+    let (in_h, in_w) = (lower.shape()[1], lower.shape()[2]);
+    let (out_c, icpg, kh, kw) = (
+        kernel.shape()[0],
+        kernel.shape()[1],
+        kernel.shape()[2],
+        kernel.shape()[3],
+    );
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let (dh, dw) = dilation;
+    let out_h = (in_h + 2 * ph - ((kh - 1) * dh + 1)) / sh + 1;
+    let out_w = (in_w + 2 * pw - ((kw - 1) * dw + 1)) / sw + 1;
+    let ocpg = out_c / groups;
+    let mut lo = ArrayD::<f64>::zeros(IxDyn(&[out_c, out_h, out_w]));
+    let mut hi = ArrayD::<f64>::zeros(IxDyn(&[out_c, out_h, out_w]));
+    for oc in 0..out_c {
+        let g = oc / ocpg;
+        for oh in 0..out_h {
+            for ow in 0..out_w {
+                let mut olo = 0.0f64;
+                let mut ohi = 0.0f64;
+                for ic_local in 0..icpg {
+                    let ic = g * icpg + ic_local;
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let ih = (oh * sh + ki * dh) as i64 - ph as i64;
+                            let iw = (ow * sw + kj * dw) as i64 - pw as i64;
+                            if ih < 0 || iw < 0 || ih >= in_h as i64 || iw >= in_w as i64 {
+                                continue;
+                            }
+                            let w = f64::from(kernel[[oc, ic_local, ki, kj]]);
+                            let l = f64::from(lower[[ic, ih as usize, iw as usize]]);
+                            let u = f64::from(upper[[ic, ih as usize, iw as usize]]);
+                            let (tl, th) = if w >= 0.0 {
+                                (w * l, w * u)
+                            } else {
+                                (w * u, w * l)
+                            };
+                            olo = oracle_next_down_f64(olo + tl);
+                            ohi = oracle_next_up_f64(ohi + th);
+                        }
+                    }
+                }
+                if let Some(b) = bias {
+                    let b = f64::from(b[oc]);
+                    olo = oracle_next_down_f64(olo + b);
+                    ohi = oracle_next_up_f64(ohi + b);
+                }
+                lo[[oc, oh, ow]] = olo;
+                hi[[oc, oh, ow]] = ohi;
+            }
+        }
+    }
+    (lo, hi)
+}
+
+struct CertifiedF64Case {
+    name: &'static str,
+    out_c: usize,
+    in_c: usize,
+    kh: usize,
+    kw: usize,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    groups: usize,
+    in_h: usize,
+    in_w: usize,
+    bias: bool,
+    half_width: f32,
+    center_scale: f32,
+}
+
+fn certified_f64_case_fixture(
+    case: &CertifiedF64Case,
+) -> Result<(Conv2dLayer, BoundedTensor, ArrayD<f32>, ArrayD<f32>)> {
+    let kernel_len = case.out_c * (case.in_c / case.groups) * case.kh * case.kw;
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[case.out_c, case.in_c / case.groups, case.kh, case.kw]),
+        (0..kernel_len)
+            .map(|i| ((i as f32) * 0.7311).sin() * 1.5 - 0.05)
+            .collect(),
+    )
+    .expect("kernel");
+    let bias = case.bias.then(|| {
+        ndarray::Array1::from_vec(
+            (0..case.out_c)
+                .map(|i| ((i as f32) * 0.912).cos() * 0.4)
+                .collect(),
+        )
+    });
+    let layer = Conv2dLayer::new_dilated(
+        kernel,
+        bias,
+        case.stride,
+        case.padding,
+        case.dilation,
+        case.groups,
+    )?;
+    let n = case.in_c * case.in_h * case.in_w;
+    let center: Vec<f32> = (0..n)
+        .map(|i| ((i as f32) * 0.331).cos() * case.center_scale)
+        .collect();
+    let lower = ArrayD::from_shape_vec(
+        IxDyn(&[case.in_c, case.in_h, case.in_w]),
+        center.iter().map(|c| c - case.half_width).collect(),
+    )
+    .expect("lower");
+    let upper = ArrayD::from_shape_vec(
+        IxDyn(&[case.in_c, case.in_h, case.in_w]),
+        center.iter().map(|c| c + case.half_width).collect(),
+    )
+    .expect("upper");
+    let input = BoundedTensor::new(lower.clone(), upper.clone())?;
+    Ok((layer, input, lower, upper))
+}
+
+/// Enclosure + tightness of the certified f64 finite-deadline arm across
+/// grouped / depthwise / dilated / padded / strided geometry, mixed-sign
+/// weights, degenerate (l == u) and wide boxes: the new box must (1) enclose
+/// the outward-directed f64 oracle and (2) never be wider than the legacy
+/// f32 gamma*S arm (deadline=None route) on ANY element, engine-free.
+#[ntest::timeout(60000)]
+#[test]
+fn certified_f64_deadline_conv2d_encloses_oracle_and_never_widens_legacy() -> Result<()> {
+    let cases = [
+        CertifiedF64Case {
+            name: "dense_wide",
+            out_c: 3,
+            in_c: 3,
+            kh: 2,
+            kw: 2,
+            stride: (1, 1),
+            padding: (0, 0),
+            dilation: (1, 1),
+            groups: 1,
+            in_h: 4,
+            in_w: 4,
+            bias: true,
+            half_width: 0.5,
+            center_scale: 1.0,
+        },
+        CertifiedF64Case {
+            name: "grouped_padded",
+            out_c: 4,
+            in_c: 4,
+            kh: 3,
+            kw: 3,
+            stride: (1, 1),
+            padding: (1, 1),
+            dilation: (1, 1),
+            groups: 2,
+            in_h: 5,
+            in_w: 5,
+            bias: true,
+            half_width: 0.25,
+            center_scale: 2.0,
+        },
+        CertifiedF64Case {
+            name: "dilated_strided",
+            out_c: 2,
+            in_c: 3,
+            kh: 3,
+            kw: 2,
+            stride: (1, 2),
+            padding: (1, 1),
+            dilation: (2, 1),
+            groups: 1,
+            in_h: 6,
+            in_w: 5,
+            bias: false,
+            half_width: 1.0,
+            center_scale: 0.5,
+        },
+        CertifiedF64Case {
+            name: "depthwise_degenerate_box",
+            out_c: 3,
+            in_c: 3,
+            kh: 2,
+            kw: 2,
+            stride: (2, 2),
+            padding: (2, 1),
+            dilation: (1, 1),
+            groups: 3,
+            in_h: 5,
+            in_w: 5,
+            bias: true,
+            half_width: 0.0, // l == u
+            center_scale: 1.5,
+        },
+        CertifiedF64Case {
+            name: "magnitude_wide_box",
+            out_c: 2,
+            in_c: 8,
+            kh: 3,
+            kw: 3,
+            stride: (1, 1),
+            padding: (1, 1),
+            dilation: (1, 1),
+            groups: 1,
+            in_h: 6,
+            in_w: 6,
+            bias: true,
+            half_width: 4.0,
+            center_scale: 100.0,
+        },
+    ];
+    for case in &cases {
+        let (layer, input, lower, upper) = certified_f64_case_fixture(case)?;
+        let legacy = layer.propagate_ibp_sound_with_engine(&input, None)?;
+        let engine = CountingGemmEngine::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+        let certified = layer.propagate_ibp_sound_with_engine_and_deadline(
+            &input,
+            Some(&engine),
+            Some(deadline),
+        )?;
+        assert_eq!(
+            engine.gemm_calls(),
+            0,
+            "{}: certified deadline arm must stay engine-free",
+            case.name
+        );
+        let (oracle_lo, oracle_hi) = oracle_directed_conv_interval(
+            &layer.kernel,
+            layer.bias.as_ref(),
+            &lower,
+            &upper,
+            case.stride,
+            case.padding,
+            case.dilation,
+            case.groups,
+        );
+        assert_eq!(certified.shape(), legacy.shape(), "{}", case.name);
+        assert_eq!(certified.shape(), oracle_lo.shape(), "{}", case.name);
+        for ((((&new_lo, &new_hi), (&old_lo, &old_hi)), &olo), &ohi) in certified
+            .lower()
+            .iter()
+            .zip(certified.upper().iter())
+            .zip(legacy.lower().iter().zip(legacy.upper().iter()))
+            .zip(oracle_lo.iter())
+            .zip(oracle_hi.iter())
+        {
+            assert!(
+                (new_lo as f64) <= olo && (new_hi as f64) >= ohi,
+                "{}: certified [{new_lo},{new_hi}] must enclose oracle [{olo},{ohi}]",
+                case.name
+            );
+            let new_width = new_hi as f64 - new_lo as f64;
+            let old_width = old_hi as f64 - old_lo as f64;
+            assert!(
+                new_width <= old_width,
+                "{}: certified width {new_width} exceeds legacy width {old_width} \
+                 ([{new_lo},{new_hi}] vs [{old_lo},{old_hi}])",
+                case.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The point of the fix: on a magnitude-dominated box (large activations,
+/// small box) the legacy arm's gamma_f32*S charge dwarfs the true interval,
+/// while the f64 arm's gamma_f64*S is ~2^29x smaller. Every element must be
+/// at least 100x tighter.
+#[ntest::timeout(60000)]
+#[test]
+fn certified_f64_deadline_conv2d_is_100x_tighter_on_magnitude_dominated_box() -> Result<()> {
+    let (out_c, in_c, kh, kw) = (2usize, 64usize, 3usize, 3usize);
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[out_c, in_c, kh, kw]),
+        (0..out_c * in_c * kh * kw)
+            .map(|i| if i % 2 == 0 { 0.5f32 } else { -0.5 })
+            .collect(),
+    )
+    .expect("kernel");
+    let layer = Conv2dLayer::new(kernel, None, (1, 1), (0, 0))?;
+    let n = in_c * 8 * 8;
+    let center: Vec<f32> = (0..n).map(|i| 1.0e4 + (i % 7) as f32).collect();
+    let half_width = 1.0e-3f32;
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(
+            IxDyn(&[in_c, 8, 8]),
+            center.iter().map(|c| c - half_width).collect(),
+        )
+        .expect("lower"),
+        ArrayD::from_shape_vec(
+            IxDyn(&[in_c, 8, 8]),
+            center.iter().map(|c| c + half_width).collect(),
+        )
+        .expect("upper"),
+    )?;
+    let legacy = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+    let certified =
+        layer.propagate_ibp_sound_with_engine_and_deadline(&input, None, Some(deadline))?;
+    for (((&new_lo, &new_hi), &old_lo), &old_hi) in certified
+        .lower()
+        .iter()
+        .zip(certified.upper().iter())
+        .zip(legacy.lower().iter())
+        .zip(legacy.upper().iter())
+    {
+        let new_width = new_hi as f64 - new_lo as f64;
+        let old_width = old_hi as f64 - old_lo as f64;
+        assert!(
+            new_width > 0.0 && old_width >= 100.0 * new_width,
+            "expected >= 100x tightening, got old {old_width} vs new {new_width}"
+        );
+    }
+    Ok(())
+}
+
+/// #vnncomp-aw-soundness self-audit case (macs > 5793) adapted to the f64 arm:
+/// at this contraction size the f32 arm needed s_inflate to stop S_f32 from
+/// under-running true S. The f64 arm's abs-sum inflation must keep the box
+/// enclosing an EXACT integer-constructed true value through an embedded
+/// [2^24, 1, -2^24, 4] cancellation block, with a width that stays tiny.
+#[ntest::timeout(60000)]
+#[test]
+fn certified_f64_deadline_conv2d_self_audit_macs_above_5793() -> Result<()> {
+    let in_c = 6_000usize; // macs = 6000 > 5793
+    let p = (1u32 << 24) as f32;
+    let mut weights: Vec<f32> = (0..in_c).map(|i| ((i % 5) as f32 - 2.0) * 0.25).collect();
+    weights[0] = p;
+    weights[1] = 1.0;
+    weights[2] = -p;
+    weights[3] = 4.0;
+    // Exact true value at the all-ones point input, in quarter units for the
+    // pattern plus the cancellation block (2^24 + 1 - 2^24 + 4 = 5).
+    let pattern_quarters: i64 = (4..in_c).map(|i| (i % 5) as i64 - 2).sum();
+    let true_val = 5.0f64 + pattern_quarters as f64 * 0.25;
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, in_c, 1, 1]), weights).expect("kernel");
+    let layer = Conv2dLayer::new(kernel, None, (1, 1), (0, 0))?;
+    let input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[in_c, 1, 1]), vec![1.0f32; in_c]).expect("point"),
+    )?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+    let certified =
+        layer.propagate_ibp_sound_with_engine_and_deadline(&input, None, Some(deadline))?;
+    let (lo, hi) = (
+        certified.lower()[[0, 0, 0]] as f64,
+        certified.upper()[[0, 0, 0]] as f64,
+    );
+    assert!(
+        lo <= true_val && hi >= true_val,
+        "certified [{lo},{hi}] must enclose exact {true_val}"
+    );
+    assert!(lo.is_finite() && hi.is_finite());
+    assert!(
+        hi - lo <= 1e-2,
+        "f64-arm width {} must stay tiny at macs=6000 despite the 2^24 abs-sum",
+        hi - lo
+    );
+    // Documented scale win vs the legacy arm at the same contraction size.
+    let legacy = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    let old_width = legacy.upper()[[0, 0, 0]] as f64 - legacy.lower()[[0, 0, 0]] as f64;
+    assert!(
+        old_width >= 100.0 * (hi - lo),
+        "expected >= 100x tightening at macs=6000, got old {old_width} vs new {}",
+        hi - lo
+    );
+    Ok(())
+}
+
+/// The certified arm's deadline error stays TYPED: refused at entry when
+/// already expired (engine never consulted), and returned from within the
+/// tap loop's poll cadence when the deadline lapses mid-contraction (the
+/// workload below is orders of magnitude past DEADLINE_CPU_POLL_OPS).
+#[ntest::timeout(60000)]
+#[test]
+fn certified_f64_deadline_conv2d_deadline_error_is_typed_and_engine_free() -> Result<()> {
+    let small = CertifiedF64Case {
+        name: "expired_entry",
+        out_c: 2,
+        in_c: 2,
+        kh: 2,
+        kw: 2,
+        stride: (1, 1),
+        padding: (0, 0),
+        dilation: (1, 1),
+        groups: 1,
+        in_h: 3,
+        in_w: 3,
+        bias: true,
+        half_width: 0.5,
+        center_scale: 1.0,
+    };
+    let (layer, input, _, _) = certified_f64_case_fixture(&small)?;
+    let engine = CountingGemmEngine::new();
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let error = layer
+        .propagate_ibp_sound_with_engine_and_deadline(&input, Some(&engine), Some(expired))
+        .expect_err("expired certified Conv2d IBP must remain structured");
+    assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "expired certified arm must refuse before any engine launch"
+    );
+
+    // Mid-loop: ~33M taps at a 5ms deadline cannot finish before a poll fires.
+    let big = CertifiedF64Case {
+        name: "mid_loop",
+        out_c: 16,
+        in_c: 256,
+        kh: 3,
+        kw: 3,
+        stride: (1, 1),
+        padding: (1, 1),
+        dilation: (1, 1),
+        groups: 1,
+        in_h: 32,
+        in_w: 32,
+        bias: true,
+        half_width: 0.5,
+        center_scale: 1.0,
+    };
+    let (layer, input, _, _) = certified_f64_case_fixture(&big)?;
+    let soon = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    let error = layer
+        .propagate_ibp_sound_with_engine_and_deadline(&input, None, Some(soon))
+        .expect_err("a 5ms deadline on a ~33M-tap conv must abort mid-loop");
+    assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    Ok(())
+}
+
+/// The deadline=None arm is the UNTOUCHED historical engine/faer route: its
+/// output must be bit-identical through both public entries, and a caller
+/// engine must still receive the grouped GEMMs (proving the engine route was
+/// not severed by the finite-deadline rewire).
+#[ntest::timeout(30000)]
+#[test]
+fn certified_f64_rewire_keeps_deadline_none_arm_bit_identical() -> Result<()> {
+    let case = CertifiedF64Case {
+        name: "none_arm_pin",
+        out_c: 4,
+        in_c: 4,
+        kh: 3,
+        kw: 3,
+        stride: (1, 1),
+        padding: (1, 1),
+        dilation: (1, 1),
+        groups: 2,
+        in_h: 5,
+        in_w: 5,
+        bias: true,
+        half_width: 0.5,
+        center_scale: 1.0,
+    };
+    let (layer, input, _, _) = certified_f64_case_fixture(&case)?;
+    let reference = layer.propagate_ibp_sound_with_engine(&input, None)?;
+    let via_deadline_entry =
+        layer.propagate_ibp_sound_with_engine_and_deadline(&input, None, None)?;
+    for (a, b) in reference
+        .lower()
+        .iter()
+        .chain(reference.upper().iter())
+        .zip(
+            via_deadline_entry
+                .lower()
+                .iter()
+                .chain(via_deadline_entry.upper().iter()),
+        )
+    {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "deadline=None arm must stay bit-identical to the engine route"
+        );
+    }
+    let engine = CountingGemmEngine::new();
+    let _ = layer.propagate_ibp_sound_with_engine_and_deadline(&input, Some(&engine), None)?;
+    assert!(
+        engine.gemm_calls() > 0,
+        "deadline=None must keep routing grouped GEMMs through the caller engine"
+    );
+    Ok(())
+}
+
+/// Batched (4D) inputs through the certified arm must equal the per-item 3D
+/// results bit-for-bit (the batch loop only dispatches the same kernel).
+#[ntest::timeout(30000)]
+#[test]
+fn certified_f64_deadline_conv2d_batched_matches_per_item_bits() -> Result<()> {
+    let case = CertifiedF64Case {
+        name: "batched",
+        out_c: 3,
+        in_c: 3,
+        kh: 2,
+        kw: 2,
+        stride: (1, 1),
+        padding: (1, 0),
+        dilation: (1, 1),
+        groups: 1,
+        in_h: 4,
+        in_w: 4,
+        bias: true,
+        half_width: 0.75,
+        center_scale: 1.0,
+    };
+    let (layer, item0, lower0, upper0) = certified_f64_case_fixture(&case)?;
+    let lower1 = lower0.mapv(|v| v * 0.5 - 0.1);
+    let upper1 = upper0.mapv(|v| v * 0.5 + 0.1);
+    let item1 = BoundedTensor::new(lower1.clone(), upper1.clone())?;
+    let batched = BoundedTensor::new(
+        ndarray::stack(ndarray::Axis(0), &[lower0.view(), lower1.view()]).expect("batched lower"),
+        ndarray::stack(ndarray::Axis(0), &[upper0.view(), upper1.view()]).expect("batched upper"),
+    )?;
+    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_mins(2));
+    let batched_out =
+        layer.propagate_ibp_sound_with_engine_and_deadline(&batched, None, deadline)?;
+    let out0 = layer.propagate_ibp_sound_with_engine_and_deadline(&item0, None, deadline)?;
+    let out1 = layer.propagate_ibp_sound_with_engine_and_deadline(&item1, None, deadline)?;
+    assert_eq!(batched_out.shape()[0], 2);
+    for (b, item) in [(0usize, &out0), (1usize, &out1)] {
+        let batch_lower = batched_out.lower().index_axis(ndarray::Axis(0), b);
+        let batch_upper = batched_out.upper().index_axis(ndarray::Axis(0), b);
+        for (x, y) in batch_lower.iter().zip(item.lower().iter()) {
+            assert_eq!(x.to_bits(), y.to_bits(), "batch item {b} lower mismatch");
+        }
+        for (x, y) in batch_upper.iter().zip(item.upper().iter()) {
+            assert_eq!(x.to_bits(), y.to_bits(), "batch item {b} upper mismatch");
+        }
+    }
+    Ok(())
 }
 
 /// With the ConvTranspose skip on, an already-expired per-node deadline must

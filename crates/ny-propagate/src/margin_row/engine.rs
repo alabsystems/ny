@@ -725,6 +725,48 @@ impl<'a> BackwardEngine<'a> {
         Ok((al, au))
     }
 
+    /// One backward pass, GPU-authoritative when the dark seam admits it.
+    ///
+    /// Semantically IDENTICAL to `run(seed, dom, dir, None, false)`: the seam
+    /// either returns a certified [`PassOut`] the caller concretizes with the
+    /// lane's own unchanged `concretize_*`, or refuses — in which case this is
+    /// exactly the CPU call, bit-for-bit. With `NY_MARGIN_ROW_GPU` unset the
+    /// seam refuses before touching anything, so every existing bound is
+    /// unchanged by construction.
+    pub(crate) fn run_seamed(
+        &self,
+        seed: &Seed,
+        dom: Option<&DomainGates>,
+        dir: LaneDir,
+        ctx: &super::gpu_seam::SeamCtx<'_>,
+    ) -> Result<PassOut> {
+        match super::gpu_seam::run_pass(self, seed, dom, dir, ctx) {
+            Ok(pass) => Ok(pass),
+            Err(_refused) => self.run(seed, dom, dir, None, false),
+        }
+    }
+
+    /// The 2 x n_y y-row refresh, GPU-authoritative when the seam admits it.
+    ///
+    /// The identity seed is exact in f32 and carries no certified error, so it
+    /// needs no `y_abs`; and the device publishes BOTH lanes from ONE walk, so
+    /// an admitted refresh costs one dispatch instead of two CPU passes.
+    pub(crate) fn y_rows_seamed(
+        &self,
+        dom: Option<&DomainGates>,
+        ctx: &super::gpu_seam::SeamCtx<'_>,
+    ) -> Result<(PassOut, PassOut)> {
+        let seed = self.identity_seed();
+        match super::gpu_seam::run_pass_pair(self, &seed, dom, ctx) {
+            Ok(pair) => Ok(pair),
+            Err(_refused) => {
+                let al = self.run(&seed, dom, LaneDir::Lower, None, false)?;
+                let au = self.run(&seed, dom, LaneDir::Upper, None, false)?;
+                Ok((al, au))
+            }
+        }
+    }
+
     /// Concretize lower rows over the root box: per row
     /// `A@mid + b - |A|@rad` (Python parity), minus the certified penalty and
     /// rounded toward -inf in Outward mode.

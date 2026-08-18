@@ -359,6 +359,10 @@ fn test_genbab_gelu_verification_needs_splitting() {
     };
     let config = BetaCrownConfig {
         branching_heuristic: BranchingHeuristic::GenBaB(genbab_config),
+        // Isolate the nonlinear branching contract from the separate alpha
+        // warmup phase. The assertions below still require real GenBaB descent
+        // and verified child-domain progress, so this remains non-vacuous.
+        use_alpha_crown: false,
         max_domains: 2100,
         timeout: Duration::from_secs(10),
         ..Default::default()
@@ -373,7 +377,8 @@ fn test_genbab_gelu_verification_needs_splitting() {
     assert!(
         result.domains_explored >= 2,
         "Root CROWN bound < -0.05 should require BaB splitting \
-         (got domains_explored={}, expected >= 2)",
+         (got status={:?}, domains_explored={}, expected >= 2)",
+        result.result,
         result.domains_explored,
     );
     assert!(

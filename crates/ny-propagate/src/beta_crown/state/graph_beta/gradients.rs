@@ -28,23 +28,17 @@ impl GraphBetaState {
         let mut max_grad = 0.0f32;
 
         for entry in &mut self.entries {
-            let a_matrix = match intermediate.a_at_relu.get(&entry.node_name) {
-                Some(a) => a,
+            let a_column = match intermediate.beta_a_column(&entry.node_name, entry.neuron_idx) {
+                Some(column) => column,
                 None => {
                     entry.grad = 0.0;
                     continue;
                 }
             };
 
-            if entry.neuron_idx >= a_matrix.ncols() {
-                entry.grad = 0.0;
-                continue;
-            }
-
             let mut sensitivity = 0.0f32;
-            let num_outputs = a_matrix.nrows();
-            for j in 0..num_outputs {
-                sensitivity += a_matrix[[j, entry.neuron_idx]];
+            for &coefficient in a_column.iter() {
+                sensitivity += coefficient;
             }
 
             let grad = -entry.sign * sensitivity;
@@ -232,16 +226,13 @@ impl GraphBetaState {
             }
             let mut total_sensitivity = 0.0f32;
             for entry in &self.entries {
-                let a_matrix = match intermediate.a_at_relu.get(&entry.node_name) {
-                    Some(a) => a,
+                let a_column = match intermediate.beta_a_column(&entry.node_name, entry.neuron_idx)
+                {
+                    Some(column) => column,
                     None => continue,
                 };
-                if entry.neuron_idx >= a_matrix.ncols() {
-                    continue;
-                }
                 let mut sensitivity = 0.0f32;
-                for j in 0..a_matrix.nrows() {
-                    let a_jk = a_matrix[[j, entry.neuron_idx]];
+                for (j, &a_jk) in a_column.iter().enumerate() {
                     let c_j = if j < objective.len() {
                         objective[j]
                     } else {
@@ -283,16 +274,16 @@ impl GraphBetaState {
 
             let mut total_sensitivity = 0.0f32;
             for entry in &self.entries {
-                let a_matrix = match intermediate.a_at_relu.get(&entry.node_name) {
-                    Some(a) => a,
+                let a_column = match intermediate.beta_a_column(&entry.node_name, entry.neuron_idx)
+                {
+                    Some(column) => column,
                     None => continue,
                 };
-                if objective_idx >= a_matrix.nrows() || entry.neuron_idx >= a_matrix.ncols() {
+                let Some(&sensitivity) = a_column.get(objective_idx) else {
                     continue;
-                }
-                total_sensitivity += a_matrix[[objective_idx, entry.neuron_idx]].abs();
+                };
+                total_sensitivity += sensitivity.abs();
             }
-
             if total_sensitivity > best_sensitivity {
                 best_sensitivity = total_sensitivity;
                 best_idx = Some(objective_idx);
@@ -343,21 +334,16 @@ impl GraphBetaState {
         let mut max_grad = 0.0f32;
 
         for entry in &mut self.entries {
-            let a_matrix = match intermediate.a_at_relu.get(&entry.node_name) {
-                Some(a) => a,
+            let a_column = match intermediate.beta_a_column(&entry.node_name, entry.neuron_idx) {
+                Some(column) => column,
                 None => {
                     entry.grad = 0.0;
                     continue;
                 }
             };
-            if entry.neuron_idx >= a_matrix.ncols() {
-                entry.grad = 0.0;
-                continue;
-            }
 
             let mut sensitivity = 0.0f32;
-            for j in 0..a_matrix.nrows() {
-                let a_jk = a_matrix[[j, entry.neuron_idx]];
+            for (j, &a_jk) in a_column.iter().enumerate() {
                 let c_j = if j < objective.len() {
                     objective[j]
                 } else {
@@ -383,19 +369,18 @@ impl GraphBetaState {
         let mut max_grad = 0.0f32;
 
         for entry in &mut self.entries {
-            let a_matrix = match intermediate.a_at_relu.get(&entry.node_name) {
-                Some(a) => a,
+            let a_column = match intermediate.beta_a_column(&entry.node_name, entry.neuron_idx) {
+                Some(column) => column,
                 None => {
                     entry.grad = 0.0;
                     continue;
                 }
             };
-            if objective_idx >= a_matrix.nrows() || entry.neuron_idx >= a_matrix.ncols() {
+            let Some(&sensitivity) = a_column.get(objective_idx) else {
                 entry.grad = 0.0;
                 continue;
-            }
+            };
 
-            let sensitivity = a_matrix[[objective_idx, entry.neuron_idx]];
             let grad = -entry.sign * sensitivity;
             entry.grad = grad;
             max_grad = nan_propagating_max(max_grad, grad.abs());

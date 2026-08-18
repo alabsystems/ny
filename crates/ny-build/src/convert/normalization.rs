@@ -10,7 +10,7 @@ use ny_propagate::Layer;
 use tracing::{debug, warn};
 
 use super::{AttributeValue, ConvertContext, LayerSpec};
-use crate::layernorm_mode_from_attrs;
+use crate::{layernorm_mode_from_attrs, INTERNAL_CT_INSTANCE_NORM_ATTR};
 
 /// Load an optional 1-D weight for LayerNorm. Returns error if the weight
 /// exists but has wrong dimensionality. Returns `default_fn()` if missing.
@@ -143,6 +143,38 @@ impl ConvertContext<'_> {
     pub(crate) fn convert_instance_norm(&self, spec: &LayerSpec) -> Result<Layer> {
         // ONNX InstanceNormalization inputs: X, scale (ny), B (beta)
         // Attributes: epsilon (float, default 1e-5)
+        let internal_ct_layout = match spec.attributes.get(INTERNAL_CT_INSTANCE_NORM_ATTR) {
+            None => false,
+            Some(AttributeValue::Int(1)) => true,
+            Some(value) => {
+                return Err(NyError::ModelLoad(format!(
+                    "InstanceNormalization {} has invalid internal [C,T] layout certificate {value:?}",
+                    spec.name
+                )));
+            }
+        };
+        if let Some(input_shape) = spec
+            .inputs
+            .first()
+            .and_then(|input_name| self.tensor_shapes.get(input_name))
+        {
+            // InstanceNorm1d represents an internal `[C,T]` tensor.  Authored
+            // raw `[N,C,T]` maps to that shape after the loader strips N, but
+            // raw `[N,C,H,W]` would become `[C,H,W]` and cannot be represented
+            // by the monolithic layer.  The graph decomposition policy handles
+            // arbitrary spatial ranks before conversion; preserve must fail
+            // closed instead of silently treating H as part of the channel
+            // layout.
+            let expected_rank = if internal_ct_layout { 2 } else { 3 };
+            if input_shape.len() != expected_rank {
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "InstanceNormalization {} preserve path expects {} layout, got {:?}; use normalization decomposition for higher spatial ranks",
+                    spec.name,
+                    if internal_ct_layout { "certified internal [C,T]" } else { "authored [N,C,T]" },
+                    input_shape,
+                )));
+            }
+        }
         let num_channels = if spec.inputs.len() >= 2 {
             let ny_name = &spec.inputs[1];
             if let Some(ny) = self.weights.get(ny_name) {
@@ -151,7 +183,7 @@ impl ConvertContext<'_> {
                 .inputs
                 .first()
                 .and_then(|input_name| self.tensor_shapes.get(input_name))
-                .and_then(|shape| shape.get(1))
+                .and_then(|shape| shape.get(usize::from(!internal_ct_layout)))
                 .and_then(|&channels| usize::try_from(channels).ok())
                 .filter(|&channels| channels > 0)
             {
@@ -223,6 +255,22 @@ impl ConvertContext<'_> {
         // ONNX GroupNormalization inputs: X, scale (ny), bias (beta)
         // Attributes: epsilon (float, default 1e-5), num_groups (int, required)
         // Part of #3205.
+        if let Some(input_shape) = spec
+            .inputs
+            .first()
+            .and_then(|input_name| self.tensor_shapes.get(input_name))
+        {
+            // GroupNormLayer currently represents internal `[C,T]` only.
+            // Preserve is exact for authored `[N,C,T]`; a raw image tensor
+            // would retain two spatial axes after batch stripping and needs a
+            // general spatial implementation before it can be admitted.
+            if input_shape.len() != 3 {
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "GroupNormalization {} supports authored rank 3 [N,C,T], got {:?}",
+                    spec.name, input_shape
+                )));
+            }
+        }
         let num_channels = if spec.inputs.len() >= 2 {
             let ny_name = &spec.inputs[1];
             if let Some(ny) = self.weights.get(ny_name) {
@@ -372,12 +420,32 @@ impl ConvertContext<'_> {
     pub(crate) fn convert_batch_norm(&self, spec: &LayerSpec) -> Result<Layer> {
         // ONNX BatchNormalization inputs: X, scale(ny), B(beta), input_mean, input_var
         // For inference mode (the only mode we support), mean and var are fixed (running statistics)
-        if spec.inputs.len() < 5 {
+        if spec.inputs.len() != 5
+            || spec.inputs.iter().any(String::is_empty)
+            || spec.outputs.len() != 1
+            || spec.outputs[0].is_empty()
+        {
             return Err(NyError::ModelLoad(format!(
-                "BatchNormalization {} requires 5 inputs (X, scale, B, mean, var), got {}",
+                "BatchNormalization {} requires exactly 5 non-empty inputs (X, scale, B, mean, var) and one output, got {} inputs",
                 spec.name,
                 spec.inputs.len()
             )));
+        }
+
+        for (name, value) in &spec.attributes {
+            let supported = match (name.as_str(), value) {
+                ("epsilon", AttributeValue::Float(value)) => value.is_finite() && *value >= 0.0,
+                ("momentum", AttributeValue::Float(value)) => value.is_finite(),
+                ("training_mode", AttributeValue::Int(0)) => true,
+                ("__onnx_batch_norm_input_rank", AttributeValue::Int(rank)) => *rank >= 2,
+                _ => false,
+            };
+            if !supported {
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "BatchNormalization {} has unsupported attribute {}={value:?}",
+                    spec.name, name
+                )));
+            }
         }
 
         let ny_name = &spec.inputs[1];
@@ -409,14 +477,73 @@ impl ConvertContext<'_> {
             .ok_or_else(|| NyError::ModelLoad(format!("BatchNorm var {} not found", var_name)))?
             .clone();
 
+        let parameter_shape = ny.shape().to_vec();
+        if ny.ndim() != 1
+            || beta.shape() != parameter_shape
+            || mean.shape() != parameter_shape
+            || var.shape() != parameter_shape
+        {
+            return Err(NyError::ModelLoad(format!(
+                "BatchNormalization {} requires scale, B, mean, and var to share one-dimensional [C] shape; got scale {:?}, B {:?}, mean {:?}, var {:?}",
+                spec.name,
+                ny.shape(),
+                beta.shape(),
+                mean.shape(),
+                var.shape()
+            )));
+        }
+        if let Some(input_shape) = spec
+            .inputs
+            .first()
+            .and_then(|input_name| self.tensor_shapes.get(input_name))
+        {
+            let channels = input_shape
+                .get(1)
+                .and_then(|&dimension| usize::try_from(dimension).ok())
+                .filter(|&dimension| dimension > 0)
+                .ok_or_else(|| {
+                    NyError::ModelLoad(format!(
+                        "BatchNormalization {} requires a known positive raw channel dimension at axis 1, got {:?}",
+                        spec.name, input_shape
+                    ))
+                })?;
+            if parameter_shape != [channels] {
+                return Err(NyError::ModelLoad(format!(
+                    "BatchNormalization {} parameter shape {:?} does not match input channel dimension {}",
+                    spec.name, parameter_shape, channels
+                )));
+            }
+        }
+
         let epsilon = match spec.attributes.get("epsilon") {
             Some(AttributeValue::Float(e)) => *e,
-            _ => 1e-5,
+            None => 1e-5,
+            Some(_) => unreachable!("validated above"),
         };
 
-        Ok(Layer::BatchNorm(BatchNormLayer::new(
-            &ny, &beta, &mean, &var, epsilon,
-        )?))
+        let authored_input_rank = match spec.attributes.get("__onnx_batch_norm_input_rank") {
+            Some(AttributeValue::Int(rank)) => Some(usize::try_from(*rank).map_err(|_| {
+                NyError::ModelLoad(format!(
+                    "BatchNormalization {} has invalid authored input rank {}",
+                    spec.name, rank
+                ))
+            })?),
+            Some(_) => unreachable!("validated above"),
+            None => spec
+                .inputs
+                .first()
+                .and_then(|input_name| self.tensor_shapes.get(input_name))
+                .map(Vec::len),
+        };
+        let layer = BatchNormLayer::new(&ny, &beta, &mean, &var, epsilon)?;
+        let layer = if let Some(authored_input_rank) = authored_input_rank {
+            layer.with_onnx_nchw_rank(authored_input_rank)?
+        } else {
+            // Non-ONNX callers that construct a bare LayerSpec retain the
+            // manual BatchNorm layer's shape-based behavior.
+            layer
+        };
+        Ok(Layer::BatchNorm(layer))
     }
 }
 
@@ -424,7 +551,7 @@ impl ConvertContext<'_> {
 mod tests {
     use ndarray::{ArrayD, IxDyn};
     use ny_core::LayerType;
-    use ny_propagate::layers::LayerNormMode;
+    use ny_propagate::{layers::LayerNormMode, Layer};
     use std::collections::{HashMap, HashSet};
 
     use super::ConvertContext;
@@ -646,5 +773,137 @@ mod tests {
             "RMSNorm with missing ny should use defaults: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn convert_batch_norm_rejects_non_inference_signatures_and_attributes() {
+        let mut weights = WeightStore::new();
+        for name in ["scale", "bias", "mean", "var"] {
+            weights.insert(
+                name.to_string(),
+                ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap(),
+            );
+        }
+        let context = make_context(&weights);
+        let base = LayerSpec {
+            name: "bn".to_string(),
+            layer_type: LayerType::BatchNorm,
+            inputs: ["input", "scale", "bias", "mean", "var"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            outputs: vec!["output".to_string()],
+            weights: None,
+            attributes: HashMap::new(),
+        };
+        assert!(context.convert_batch_norm(&base).is_ok());
+
+        let mut extra_input = base.clone();
+        extra_input.inputs.push("ignored".to_string());
+        assert!(context.convert_batch_norm(&extra_input).is_err());
+
+        let mut training = base.clone();
+        training
+            .attributes
+            .insert("training_mode".to_string(), AttributeValue::Int(1));
+        assert!(context.convert_batch_norm(&training).is_err());
+
+        let mut wrong_epsilon_type = base;
+        wrong_epsilon_type
+            .attributes
+            .insert("epsilon".to_string(), AttributeValue::Int(0));
+        assert!(context.convert_batch_norm(&wrong_epsilon_type).is_err());
+    }
+
+    #[test]
+    fn preserve_channel_normalizations_reject_unrepresented_spatial_rank() {
+        let mut weights = WeightStore::new();
+        weights.insert("scale".to_string(), ArrayD::ones(IxDyn(&[2])));
+        weights.insert("bias".to_string(), ArrayD::zeros(IxDyn(&[2])));
+        let shapes = HashMap::from([("input".to_string(), vec![1, 2, 2, 3])]);
+        let constants = HashSet::new();
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+
+        let instance = LayerSpec {
+            name: "instance".to_string(),
+            layer_type: LayerType::InstanceNorm,
+            inputs: vec!["input".to_string(), "scale".to_string(), "bias".to_string()],
+            outputs: vec!["output".to_string()],
+            weights: None,
+            attributes: HashMap::new(),
+        };
+        assert!(context.convert_instance_norm(&instance).is_err());
+
+        let mut group = instance;
+        group.name = "group".to_string();
+        group.layer_type = LayerType::GroupNorm;
+        group
+            .attributes
+            .insert("num_groups".to_string(), AttributeValue::Int(1));
+        assert!(context.convert_group_norm(&group).is_err());
+    }
+
+    #[test]
+    fn instance_norm_accepts_only_certified_internal_ct_layout() {
+        let mut weights = WeightStore::new();
+        weights.insert("scale".to_string(), ArrayD::ones(IxDyn(&[2])));
+        weights.insert("bias".to_string(), ArrayD::zeros(IxDyn(&[2])));
+        let shapes = HashMap::from([("input".to_string(), vec![2, 4])]);
+        let constants = HashSet::new();
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let mut spec = LayerSpec {
+            name: "instance".to_string(),
+            layer_type: LayerType::InstanceNorm,
+            inputs: vec!["input".to_string(), "scale".to_string(), "bias".to_string()],
+            outputs: vec!["output".to_string()],
+            weights: None,
+            attributes: HashMap::new(),
+        };
+
+        assert!(context.convert_instance_norm(&spec).is_err());
+        spec.attributes.insert(
+            crate::INTERNAL_CT_INSTANCE_NORM_ATTR.to_string(),
+            AttributeValue::Int(1),
+        );
+        let Layer::InstanceNorm1d(layer) = context.convert_instance_norm(&spec).unwrap() else {
+            panic!("expected InstanceNorm1d layer");
+        };
+        assert_eq!(layer.num_channels(), 2);
+
+        spec.attributes.insert(
+            crate::INTERNAL_CT_INSTANCE_NORM_ATTR.to_string(),
+            AttributeValue::Int(0),
+        );
+        assert!(context.convert_instance_norm(&spec).is_err());
+    }
+
+    #[test]
+    fn batch_norm_converter_attaches_loaded_channel_axis() {
+        let mut weights = WeightStore::new();
+        for name in ["scale", "bias", "mean", "var"] {
+            weights.insert(name.to_string(), ArrayD::ones(IxDyn(&[2])));
+        }
+        let shapes = HashMap::from([("input".to_string(), vec![1, 2, 2])]);
+        let constants = HashSet::new();
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = LayerSpec {
+            name: "bn".to_string(),
+            layer_type: LayerType::BatchNorm,
+            inputs: ["input", "scale", "bias", "mean", "var"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            outputs: vec!["output".to_string()],
+            weights: None,
+            attributes: HashMap::new(),
+        };
+        let layer = context.convert_batch_norm(&spec).unwrap();
+        let Layer::BatchNorm(layer) = layer else {
+            panic!("expected BatchNorm layer");
+        };
+        assert!(matches!(
+            layer.channel_axis_hint,
+            Some(ny_propagate::layers::BatchNormChannelAxisHint::OnnxNchw { authored_rank: 3 })
+        ));
     }
 }

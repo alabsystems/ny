@@ -7,6 +7,7 @@
 use super::*;
 use approx::assert_relative_eq;
 use ndarray::{arr1, arr2};
+use serde::Serialize;
 
 #[test]
 fn test_compress_decompress_basic() {
@@ -129,6 +130,85 @@ fn test_new_rejects_shape_mismatch() {
 
     let result = CompressedBounds::new(lower, upper, shape);
     assert!(result.is_err(), "Should reject shape/data mismatch");
+}
+
+#[test]
+fn test_serde_round_trip_preserves_valid_compressed_bounds() {
+    let compressed = CompressedBounds::new(
+        vec![f16::from_f32(-1.0), f16::from_f32(0.0)],
+        vec![f16::from_f32(1.0), f16::from_f32(2.0)],
+        vec![2],
+    )
+    .expect("valid compressed bounds");
+
+    let encoded = serde_json::to_string(&compressed).expect("serialize");
+    let decoded: CompressedBounds = serde_json::from_str(&encoded).expect("deserialize");
+
+    assert_eq!(decoded.lower_raw(), compressed.lower_raw());
+    assert_eq!(decoded.upper_raw(), compressed.upper_raw());
+    assert_eq!(decoded.shape(), compressed.shape());
+}
+
+#[test]
+fn test_serde_rejects_shape_data_mismatch() {
+    #[derive(Serialize)]
+    struct RawCompressedBounds {
+        lower: Vec<f16>,
+        upper: Vec<f16>,
+        shape: Vec<usize>,
+    }
+
+    let raw = RawCompressedBounds {
+        lower: vec![f16::from_f32(0.0)],
+        upper: vec![f16::from_f32(1.0)],
+        shape: vec![2],
+    };
+    let encoded = serde_json::to_string(&raw).expect("serialize malformed fixture");
+
+    assert!(serde_json::from_str::<CompressedBounds>(&encoded).is_err());
+}
+
+#[test]
+fn test_new_and_serde_reject_invalid_interval_endpoints() {
+    assert!(
+        CompressedBounds::new(vec![f16::NAN], vec![f16::ONE], vec![1]).is_err(),
+        "NaN lower endpoints must be rejected"
+    );
+    assert!(
+        CompressedBounds::new(vec![f16::ZERO], vec![f16::NAN], vec![1]).is_err(),
+        "NaN upper endpoints must be rejected"
+    );
+    assert!(
+        CompressedBounds::new(vec![f16::ONE], vec![f16::ZERO], vec![1]).is_err(),
+        "ordinary inverted intervals must be rejected"
+    );
+    CompressedBounds::new(vec![f16::INFINITY], vec![f16::NEG_INFINITY], vec![1])
+        .expect("canonical infeasible sentinel remains representable");
+
+    #[derive(Serialize)]
+    struct RawCompressedBounds {
+        lower: Vec<f16>,
+        upper: Vec<f16>,
+        shape: Vec<usize>,
+    }
+    for raw in [
+        RawCompressedBounds {
+            lower: vec![f16::NAN],
+            upper: vec![f16::ONE],
+            shape: vec![1],
+        },
+        RawCompressedBounds {
+            lower: vec![f16::ONE],
+            upper: vec![f16::ZERO],
+            shape: vec![1],
+        },
+    ] {
+        let encoded = serde_json::to_string(&raw).expect("serialize malformed fixture");
+        assert!(
+            serde_json::from_str::<CompressedBounds>(&encoded).is_err(),
+            "deserialization must apply constructor invariants"
+        );
+    }
 }
 
 #[test]

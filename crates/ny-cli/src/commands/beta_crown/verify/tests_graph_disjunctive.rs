@@ -2,7 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::Duration;
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ndarray::{arr1, ArrayD, IxDyn};
 use ny_onnx::vnnlib::parse_vnnlib;
@@ -14,8 +18,40 @@ use ny_propagate::{
 };
 use ny_tensor::BoundedTensor;
 
+use super::disjunctive::config_for_clause_invprop;
 use super::disjunctive_unified::filter_unverified_clauses_for_unified;
 use super::{verify_relational_constraints, BetaCrownModel};
+
+#[derive(Clone, Default)]
+struct CapturedTracing(Arc<Mutex<Vec<u8>>>);
+
+struct CapturedTracingWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedTracing {
+    type Writer = CapturedTracingWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedTracingWriter(Arc::clone(&self.0))
+    }
+}
+
+impl Write for CapturedTracingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("captured tracing mutex").extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedTracing {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("captured tracing mutex").clone())
+            .expect("tracing output is UTF-8")
+    }
+}
 
 fn build_two_output_sequential_network() -> Network {
     let w1 = ndarray::arr2(&[[1.0_f32]]);
@@ -108,6 +144,27 @@ fn make_disjunction_spec() -> ny_onnx::vnnlib::VnnLibSpec {
     make_disjunction_spec_with_threshold(0.55)
 }
 
+fn make_ml4_shaped_opposite_direction_disjunction() -> ny_onnx::vnnlib::VnnLibSpec {
+    let outputs = (0..160).fold(String::new(), |mut acc, idx| {
+        use std::fmt::Write as _;
+        let _ = writeln!(acc, "(declare-const Y_{idx} Real)");
+        acc
+    });
+    parse_vnnlib(&format!(
+        r#"
+(declare-const X_0 Real)
+{outputs}
+(assert (>= X_0 -1.0))
+(assert (<= X_0 1.0))
+(assert (or
+    (>= Y_159 1.060001)
+    (<= Y_159 0.939999)
+))
+"#,
+    ))
+    .unwrap()
+}
+
 fn make_three_clause_disjunction_spec() -> ny_onnx::vnnlib::VnnLibSpec {
     parse_vnnlib(
         r#"
@@ -151,6 +208,210 @@ fn make_graph_disjunction_config() -> BetaCrownConfig {
         batch_size: 1,
         ..Default::default()
     }
+}
+
+#[test]
+fn disjunctive_clause_invprop_rebinds_exact_matrix_and_isolates_clauses() {
+    let top_level = make_ml4_shaped_opposite_direction_disjunction();
+    let first_spec = make_single_clause_spec(&top_level, 0);
+    let second_spec = make_single_clause_spec(&top_level, 1);
+    let stale_constraints = first_spec.to_output_constraints().unwrap();
+
+    let mut base = make_graph_disjunction_config();
+    base.max_domains = 731;
+    base.alpha_config.invprop.enabled = true;
+    base.alpha_config.invprop.optimize_gammas = true;
+    base.alpha_config.invprop.share_gammas = true;
+    base.alpha_config.invprop.gamma_lr = 0.375;
+    base.alpha_config.invprop.apply_output_constraints_to = vec!["all".to_string()];
+    // Deliberately seed clause 0's matrix.  Clause 1 must overwrite it; a
+    // conditional get-or-insert implementation is unsound and fails below.
+    base.alpha_config.output_constraints = Some(stale_constraints.clone());
+
+    let first = config_for_clause_invprop(&base, &first_spec);
+    let second = config_for_clause_invprop(&base, &second_spec);
+    let first_constraints = first.alpha_config.output_constraints.as_ref().unwrap();
+    let second_constraints = second.alpha_config.output_constraints.as_ref().unwrap();
+    let first_expected = first_spec.to_output_constraints().unwrap();
+    let second_expected = second_spec.to_output_constraints().unwrap();
+
+    for constraints in [first_constraints, second_constraints] {
+        assert!(constraints.is_conjunction);
+        assert!(constraints.clause_indices.is_none());
+        assert_eq!(constraints.num_constraints(), 1);
+        assert_eq!(constraints.output_dim(), 160);
+    }
+    assert_eq!(first_constraints.a_matrix, first_expected.a_matrix);
+    assert_eq!(first_constraints.rhs, first_expected.rhs);
+    assert_eq!(second_constraints.a_matrix, second_expected.a_matrix);
+    assert_eq!(second_constraints.rhs, second_expected.rhs);
+    assert_eq!(first_constraints.a_matrix[[0, 159]], -1.0);
+    assert_eq!(second_constraints.a_matrix[[0, 159]], 1.0);
+    assert_eq!(
+        first_constraints.rhs[0].to_bits(),
+        ny_tensor::next_up_f32(-1.060001_f32).to_bits()
+    );
+    assert_eq!(
+        second_constraints.rhs[0].to_bits(),
+        ny_tensor::next_up_f32(0.939999_f32).to_bits()
+    );
+
+    for rebound in [&first, &second] {
+        assert_eq!(rebound.max_domains, base.max_domains);
+        assert_eq!(
+            rebound.alpha_config.invprop.enabled,
+            base.alpha_config.invprop.enabled
+        );
+        assert_eq!(
+            rebound.alpha_config.invprop.optimize_gammas,
+            base.alpha_config.invprop.optimize_gammas
+        );
+        assert_eq!(
+            rebound.alpha_config.invprop.share_gammas,
+            base.alpha_config.invprop.share_gammas
+        );
+        assert_eq!(
+            rebound.alpha_config.invprop.gamma_lr.to_bits(),
+            base.alpha_config.invprop.gamma_lr.to_bits()
+        );
+        assert_eq!(
+            rebound.alpha_config.invprop.apply_output_constraints_to,
+            base.alpha_config.invprop.apply_output_constraints_to
+        );
+    }
+    assert_eq!(
+        base.alpha_config
+            .output_constraints
+            .as_ref()
+            .unwrap()
+            .a_matrix,
+        stale_constraints.a_matrix,
+        "clause rebinding must not mutate the shared top-level config"
+    );
+
+    let mut invprop_disabled = base.clone();
+    invprop_disabled.alpha_config.invprop.enabled = false;
+    let disabled = config_for_clause_invprop(&invprop_disabled, &second_spec);
+    assert!(
+        !disabled.alpha_config.invprop.enabled,
+        "clause rebinding must preserve the NY_INVPROP=0 policy decision"
+    );
+
+    let assert_refused = |refused: BetaCrownConfig, context: &str| {
+        assert!(
+            refused.alpha_config.output_constraints.is_none(),
+            "{context}: refused clause must clear every inherited matrix"
+        );
+        assert!(
+            !refused.alpha_config.invprop.enabled,
+            "{context}: refused clause must disable the inert INVPROP channel"
+        );
+        assert!(
+            !refused.alpha_config.invprop.optimize_gammas,
+            "{context}: refused clause must disable gamma optimization"
+        );
+    };
+
+    let mut disjunction_only = first_spec.clone();
+    disjunction_only.is_disjunction = true;
+    assert_refused(
+        config_for_clause_invprop(&base, &disjunction_only),
+        "top-level disjunction",
+    );
+
+    let mut grouped_only = first_spec.clone();
+    grouped_only.output_constraint_clauses = vec![grouped_only.output_constraints.clone()];
+    assert_refused(
+        config_for_clause_invprop(&base, &grouped_only),
+        "residual clause grouping",
+    );
+
+    let mut empty = first_spec.clone();
+    empty.output_constraints.clear();
+    assert_refused(config_for_clause_invprop(&base, &empty), "empty clause");
+
+    let mut malformed = first_spec;
+    malformed.output_constraints = vec![ny_onnx::vnnlib::OutputConstraint::LessEqConst(
+        malformed.num_outputs,
+        0.0,
+    )];
+    assert_refused(
+        config_for_clause_invprop(&base, &malformed),
+        "programmatic out-of-range output index",
+    );
+}
+
+#[test]
+fn serial_disjunctive_dispatch_engages_clause_local_invprop() {
+    let telemetry_run = ny_propagate::execution_telemetry::begin_run();
+    let (graph, input) = build_single_relu_anti_correlated_graph_for_disjunction();
+    let vnnlib = make_disjunction_spec();
+    let mut config = make_graph_disjunction_config();
+    config.use_alpha_crown = true;
+    config.alpha_config.iterations = 1;
+    config.alpha_config.adaptive_skip = false;
+    config.alpha_config.invprop.enabled = true;
+    config.alpha_config.invprop.optimize_gammas = false;
+    config.alpha_config.output_constraints = None;
+    let verifier = BetaCrownVerifier::new(config.clone());
+
+    let captured = CapturedTracing::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(captured.clone())
+        .finish();
+    // This deliberately tiny one-ReLU graph stays on the synchronous
+    // single-domain route, so the thread-local subscriber observes the actual
+    // downstream alpha initialization.  If this fixture is ever parallelized,
+    // replace the trace assertion with a typed metrics sink.
+    let result = tracing::subscriber::with_default(subscriber, || {
+        verify_relational_constraints(
+            &BetaCrownModel::Graph(Box::new(graph)),
+            &input,
+            &vnnlib,
+            &config,
+            &verifier,
+            true,  // use_relu_split
+            false, // gpu_bab
+            false, // pgd_attack
+            0,     // pgd_restarts
+            0,     // pgd_steps
+            5,     // timeout
+            None,  // gemm_engine
+            true,  // json
+        )
+    })
+    .unwrap();
+    assert!(matches!(
+        result.result,
+        BabVerificationStatus::Unknown { .. }
+    ));
+
+    let logs = captured.text();
+    assert!(
+        logs.contains("GraphNetwork α-CROWN: INVPROP enabled with 1 constraints"),
+        "the serial clause dispatch did not deliver the rebound matrix downstream:\n{logs}"
+    );
+    assert!(
+        !logs.contains("INVPROP enabled in config but no output_constraints provided"),
+        "a serial clause reached graph alpha without its local matrix:\n{logs}"
+    );
+    let observed = ny_propagate::execution_telemetry::snapshot();
+    assert!(observed.invprop.observed);
+    assert!(observed.invprop.clause_rebind_attempts > 0);
+    assert_eq!(
+        observed.invprop.clause_rebind_accepted + observed.invprop.clause_rebind_refused,
+        observed.invprop.clause_rebind_attempts
+    );
+    assert!(observed.invprop.clause_rebind_accepted > 0);
+    assert!(observed.invprop.alpha_initializations > 0);
+    assert_eq!(observed.invprop.gamma_steps_attempted, 0);
+    assert!(!observed.invprop.attribution_conflict);
+    drop(telemetry_run);
+    assert!(!ny_propagate::execution_telemetry::snapshot().run_active);
 }
 
 #[test]

@@ -118,7 +118,7 @@ impl BetaCrownVerifier {
         for iter in 0..self.config.beta_iterations {
             // Deadline check (#3109): bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 info!(
                     "Joint α-β-λ optimization: deadline exceeded at iteration {}/{}, returning best bounds",
                     iter, self.config.beta_iterations
@@ -378,7 +378,7 @@ impl BetaCrownVerifier {
         for iter in 0..self.config.beta_iterations {
             // Deadline check (#3109): bail early if verification timeout budget
             // is exhausted. Return current best bounds instead of running all iterations.
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 info!(
                     "Joint α-β-λ optimization (from layer {}): deadline exceeded at iteration {}/{}, returning best bounds",
                     start_layer, iter, self.config.beta_iterations

@@ -19,10 +19,10 @@
 //! Every cut satisfies `Σ cc·relu(ẑ) − B ≤ 0` on the box with `λ ≥ 0`, so the
 //! folded objective lower-bounds the true one (Lean `cuts_fold_lower_bound`).
 //!
-//! DARK GATE: inert unless `NY_CUT_FOLD_RESIDENT=1` (legacy research lane) AND
-//! an entry is registered. The proposed stem/head production authorities are
-//! hard-quarantined below; the default path is byte-identical (no branch split,
-//! no host work).
+//! QUARANTINE: the registry and environment request remain available for raw
+//! research construction, but the reader used by the proof-bearing resident
+//! CROWN lane has a hard-false authority gate. Neither arbitrary public registry
+//! data nor process-global environment state can influence a verdict bound.
 
 use std::sync::{OnceLock, RwLock};
 
@@ -69,6 +69,17 @@ pub fn resident_cut_fold_enabled() -> bool {
     )
 }
 
+/// Proof authority for consuming a resident cut fold.
+///
+/// The public registry carries no graph/input/target identity or proof
+/// provenance, and legacy `sound_round=false` entries use plain f32 additions.
+/// Keep the consumer hard-dark until entries are non-forgeably bound to checked
+/// cut derivations and the exact verification request.
+#[inline]
+const fn resident_cut_fold_proof_authority_enabled() -> bool {
+    false
+}
+
 /// Production authority for the proposed HEAD-RESIDENT retarget.
 ///
 /// Hard-quarantined even when `NY_MN_HEAD_RESIDENT=1` is present. The current
@@ -102,10 +113,12 @@ pub fn clear_resident_cut_fold() {
     }
 }
 
-/// The active fold, or `None` (zero-cost untouched path) unless the gate is set
-/// AND an entry is registered.
+/// The active proof-path fold.
+///
+/// Currently always `None`: environment and registry state are research inputs,
+/// not proof authority.
 pub fn active_resident_cut_fold() -> Option<ResidentCutFold> {
-    if !resident_cut_fold_enabled() {
+    if !resident_cut_fold_proof_authority_enabled() || !resident_cut_fold_enabled() {
         return None;
     }
     registry().read().ok()?.clone()
@@ -116,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gate_and_registry_semantics() {
+    fn resident_cut_fold_registry_cannot_acquire_proof_authority() {
         // Serialized env scope (clippy env wall); pre-test state restored on
         // exit.
         ny_test_utils::env::with_env_edits(|env| {
@@ -132,9 +145,19 @@ mod tests {
             // Default (research gate unset) ⇒ inert even with an entry registered.
             assert!(active_resident_cut_fold().is_none());
 
-            // Legacy gate arms it.
+            // The legacy environment request is observable to research
+            // harnesses, but cannot arm the proof-path reader.
             env.set("NY_CUT_FOLD_RESIDENT", "1");
-            let fold = active_resident_cut_fold().expect("entry must be active");
+            assert!(resident_cut_fold_enabled());
+            assert!(!resident_cut_fold_proof_authority_enabled());
+            assert!(active_resident_cut_fold().is_none());
+
+            // The raw entry remains registered for non-authoritative research.
+            let fold = registry()
+                .read()
+                .expect("resident registry lock")
+                .clone()
+                .expect("raw research entry remains registered");
             assert_eq!(fold.coeffs, vec![(3, 0.5)]);
             assert_eq!(fold.bias_shift, -1.25);
             assert_eq!(fold.pre_coeffs, vec![(2, 0.75)]);

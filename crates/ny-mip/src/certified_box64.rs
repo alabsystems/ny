@@ -16,8 +16,14 @@
 //! because the experiment needs caller-priced per-layer work, intermediate
 //! pre-ReLU boxes, and raw-parameter provenance checks at the CLI bridge.
 
-use ndarray::{ArrayView2, ArrayView4};
+use ndarray::{Array2, ArrayView2, ArrayView4};
 
+use crate::constrained_zonotope64::ConstrainedZonotope64CallGateError;
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, ConstrainedZonotopeCallTracker,
+    ConstrainedZonotopePeakLiveBytes,
+};
 use crate::{ConstrainedZonotope64, ConstrainedZonotopeConv2dSpec};
 
 /// Absolute ceilings for this diagnostic-only domain.
@@ -170,6 +176,43 @@ pub enum CertifiedBox64Error {
     },
 }
 
+/// Typed refusal from a budgeted remainder-only CZ/Box bridge.
+///
+/// These bridges are deliberately narrower than
+/// [`unconstrained_zonotope_box_unwired`]. They preserve an exact structural
+/// boundary: the source or result CZ has no alpha symbols and no predicate
+/// rows, so all uncertainty is carried by its independent box remainder.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CertifiedBox64BridgeError {
+    /// A remainder-only CZ cannot carry alpha symbols, including empty sparse
+    /// generator columns.
+    #[error("remainder-only CZ bridge requires alpha_dim == 0, got {alpha_dim}")]
+    NonzeroAlphaDimension {
+        /// Rejected source alpha dimension.
+        alpha_dim: usize,
+    },
+
+    /// Even a zero-width predicate row can make a zero-symbol domain empty,
+    /// so predicate rows are never ignored by this bridge.
+    #[error("remainder-only CZ bridge requires constraint_count == 0, got {constraint_count}")]
+    NonzeroPredicateCount {
+        /// Rejected source predicate-row count.
+        constraint_count: usize,
+    },
+
+    /// Box invariants, caller limits, or outward arithmetic failed closed.
+    #[error(transparent)]
+    Box(#[from] CertifiedBox64Error),
+
+    /// The validated zero-symbol result could not be materialized.
+    #[error(transparent)]
+    Domain(#[from] crate::ConstrainedZonotope64Error),
+
+    /// The caller's deadline or aggregate peak-memory ceiling refused work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
+}
+
 impl CertifiedBox64 {
     /// Copy caller-certified outer endpoints into a bounded Box domain.
     pub fn from_certified_bounds(
@@ -239,6 +282,404 @@ impl CertifiedBox64 {
             upper.push(hi.max(0.0));
         }
         Ok(Self { lower, upper })
+    }
+}
+
+/// Convert a remainder-only constrained zonotope into its certified axis box
+/// behind the shared synchronous call firewall.
+///
+/// The source must have exactly zero alpha symbols and zero predicate rows.
+/// Consequently its represented set is the Cartesian product
+/// `center[i] +/- box_remainder[i]`; each endpoint is rounded outward here.
+/// Empty value dimensions remain valid empty-dimensional boxes. The caller's
+/// budget baseline must include the borrowed source and other retained data.
+pub fn certified_box_from_remainder_only_zonotope_unwired_with_budget(
+    input: &ConstrainedZonotope64,
+    limits: CertifiedBox64Limits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<CertifiedBox64>, CertifiedBox64BridgeError> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let value = certified_box_from_remainder_only_zonotope_impl(input, limits, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+/// Recenter a certified axis box into a zero-symbol, zero-predicate
+/// constrained zonotope behind the shared synchronous call firewall.
+///
+/// Midpoints are nominal binary64 values. Each symmetric radius is widened
+/// upward enough to contain both exact-dyadic source endpoints. The conversion
+/// therefore preserves the complete source box but may contain additional
+/// points when the source interval is asymmetric around its stored midpoint.
+pub fn remainder_only_zonotope_from_certified_box_unwired_with_budget(
+    input: &CertifiedBox64,
+    limits: CertifiedBox64Limits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, CertifiedBox64BridgeError> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let value = remainder_only_zonotope_from_certified_box_impl(
+        input,
+        limits,
+        BoxRecenterOperation::Identity,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+/// Apply exact interval ReLU endpoints and recenter the result as a
+/// zero-symbol, zero-predicate constrained zonotope.
+///
+/// ReLU is monotone, so `[lower.max(0), upper.max(0)]` is the exact interval
+/// image. Only the subsequent symmetric binary64 recentering is outward. This
+/// fused helper keeps validation, allocation, numeric work, result
+/// materialization, and publication under one caller-owned budget.
+pub fn certified_box_relu_recenter_unwired_with_budget(
+    input: &CertifiedBox64,
+    limits: CertifiedBox64Limits,
+    budget: ConstrainedZonotopeCallBudget,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, CertifiedBox64BridgeError> {
+    let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+    let value = remainder_only_zonotope_from_certified_box_impl(
+        input,
+        limits,
+        BoxRecenterOperation::Relu,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+#[cfg(test)]
+fn certified_box_from_remainder_only_zonotope_unwired_with_clock<N>(
+    input: &ConstrainedZonotope64,
+    limits: CertifiedBox64Limits,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<ConstrainedZonotopeCallOutcome<CertifiedBox64>, CertifiedBox64BridgeError>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let value = certified_box_from_remainder_only_zonotope_impl(input, limits, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+#[cfg(test)]
+fn certified_box_relu_recenter_unwired_with_clock<N>(
+    input: &CertifiedBox64,
+    limits: CertifiedBox64Limits,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<ConstrainedZonotopeCallOutcome<ConstrainedZonotope64>, CertifiedBox64BridgeError>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let value = remainder_only_zonotope_from_certified_box_impl(
+        input,
+        limits,
+        BoxRecenterOperation::Relu,
+        &mut gate,
+    )?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+fn certified_box_from_remainder_only_zonotope_impl<G>(
+    input: &ConstrainedZonotope64,
+    limits: CertifiedBox64Limits,
+    gate: &mut G,
+) -> Result<CertifiedBox64, CertifiedBox64BridgeError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    require_gradual_underflow()?;
+    gate.checkpoint("remainder-only CZ-to-Box floating-point preflight")?;
+    validate_limits(limits)?;
+    require_remainder_only_zonotope(input)?;
+
+    let value_dim = input.value_dim();
+    check_output_storage(value_dim, limits)?;
+    check_limit(
+        "remainder-only CZ-to-Box coordinate visits",
+        value_dim,
+        limits.max_work_items,
+    )?;
+    gate.checkpoint("remainder-only CZ-to-Box geometry validation complete")?;
+    gate.preflight_peak_live_bytes(box_bridge_output_bytes(value_dim)?)?;
+    gate.checkpoint("remainder-only CZ-to-Box peak-memory preflight complete")?;
+
+    let mut lower = Vec::new();
+    let mut upper = Vec::new();
+    gate.checkpoint("remainder-only CZ-to-Box lower allocation")?;
+    try_reserve(&mut lower, value_dim, "remainder-only CZ lower endpoints")?;
+    gate.checkpoint("remainder-only CZ-to-Box upper allocation")?;
+    try_reserve(&mut upper, value_dim, "remainder-only CZ upper endpoints")?;
+
+    for coordinate in 0..value_dim {
+        gate.charge_items(1, "remainder-only CZ-to-Box coordinate transform")?;
+        let center = input.center()[coordinate];
+        let radius = input.box_remainder()[coordinate];
+        if !center.is_finite() {
+            return Err(CertifiedBox64Error::NonFinite {
+                field: "CZ center",
+                index: coordinate,
+            }
+            .into());
+        }
+        if !radius.is_finite() {
+            return Err(CertifiedBox64Error::NonFinite {
+                field: "CZ remainder",
+                index: coordinate,
+            }
+            .into());
+        }
+        if radius < 0.0 {
+            return Err(CertifiedBox64Error::InvalidSpec {
+                message: format!("CZ remainder[{coordinate}] must be nonnegative"),
+            }
+            .into());
+        }
+        if radius == 0.0 {
+            lower.push(center);
+            upper.push(center);
+        } else {
+            lower.push(sub_down(
+                center,
+                radius,
+                "remainder-only CZ lower endpoint",
+            )?);
+            upper.push(add_up(center, radius, "remainder-only CZ upper endpoint")?);
+        }
+    }
+    gate.checkpoint("remainder-only CZ-to-Box numeric transform complete")?;
+
+    let output = CertifiedBox64 { lower, upper };
+    debug_assert_eq!(output.len(), value_dim);
+    debug_assert!(output
+        .lower()
+        .iter()
+        .zip(output.upper())
+        .all(|(&lower, &upper)| lower <= upper));
+    gate.checkpoint("remainder-only CZ-to-Box publication")?;
+    Ok(output)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoxRecenterOperation {
+    Identity,
+    Relu,
+}
+
+fn remainder_only_zonotope_from_certified_box_impl<G>(
+    input: &CertifiedBox64,
+    limits: CertifiedBox64Limits,
+    operation: BoxRecenterOperation,
+    gate: &mut G,
+) -> Result<ConstrainedZonotope64, CertifiedBox64BridgeError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    require_gradual_underflow()?;
+    gate.checkpoint("certified Box-to-CZ floating-point preflight")?;
+    validate_limits(limits)?;
+    let value_dim = input.len();
+    if input.upper().len() != value_dim {
+        return Err(CertifiedBox64Error::Shape {
+            field: "Box upper endpoints",
+            expected: vec![value_dim],
+            got: vec![input.upper().len()],
+        }
+        .into());
+    }
+    check_output_storage(value_dim, limits)?;
+    // The fused transform charges one numeric recenter visit, then the shared
+    // CZ constructor charges center finiteness, remainder finiteness, and
+    // remainder-sign validation for every coordinate. Price that complete
+    // deterministic plan before allocating either output vector.
+    let charged_work = value_dim
+        .checked_mul(4)
+        .ok_or(CertifiedBox64Error::ResourceOverflow {
+            operation: "certified Box-to-CZ charged work items",
+        })?;
+    check_limit(
+        "certified Box-to-CZ charged work items",
+        charged_work,
+        limits.max_work_items,
+    )?;
+    gate.checkpoint("certified Box-to-CZ geometry validation complete")?;
+    gate.preflight_peak_live_bytes(box_bridge_output_bytes(value_dim)?)?;
+    gate.checkpoint("certified Box-to-CZ peak-memory preflight complete")?;
+
+    let mut center = Vec::new();
+    let mut box_remainder = Vec::new();
+    gate.checkpoint("certified Box-to-CZ center allocation")?;
+    try_reserve(&mut center, value_dim, "recentered CZ centers")?;
+    gate.checkpoint("certified Box-to-CZ remainder allocation")?;
+    try_reserve(
+        &mut box_remainder,
+        value_dim,
+        "recentered CZ box remainders",
+    )?;
+
+    for coordinate in 0..value_dim {
+        gate.charge_items(1, "certified Box-to-CZ coordinate transform")?;
+        let mut lower = input.lower()[coordinate];
+        let mut upper = input.upper()[coordinate];
+        validate_box_coordinate(lower, upper, coordinate)?;
+        if operation == BoxRecenterOperation::Relu {
+            // ReLU is monotone and max with exactly representable zero needs
+            // no floating-point arithmetic or endpoint widening.
+            lower = lower.max(0.0);
+            upper = upper.max(0.0);
+        }
+        let (coordinate_center, coordinate_remainder) = recenter_outward(lower, upper)?;
+        center.push(coordinate_center);
+        box_remainder.push(coordinate_remainder);
+    }
+    gate.checkpoint("certified Box-to-CZ numeric transform complete")?;
+
+    gate.checkpoint("certified Box-to-CZ domain materialization")?;
+    let constraints = Array2::from_shape_vec((0, 0), Vec::new()).map_err(|_| {
+        CertifiedBox64Error::ResourceOverflow {
+            operation: "empty remainder-only CZ constraint matrix shape",
+        }
+    })?;
+    let output = ConstrainedZonotope64::try_new_with_call_gate(
+        center,
+        Vec::new(),
+        constraints,
+        Vec::new(),
+        box_remainder,
+        gate,
+    )
+    .map_err(map_remainder_only_domain_error)?;
+    gate.checkpoint("certified Box-to-CZ domain materialization complete")?;
+    debug_assert_eq!(output.alpha_dim(), 0);
+    debug_assert_eq!(output.constraint_count(), 0);
+    gate.checkpoint("certified Box-to-CZ publication")?;
+    Ok(output)
+}
+
+fn require_remainder_only_zonotope(
+    input: &ConstrainedZonotope64,
+) -> Result<(), CertifiedBox64BridgeError> {
+    if input.box_remainder().len() != input.value_dim() {
+        return Err(CertifiedBox64Error::Shape {
+            field: "CZ box remainder",
+            expected: vec![input.value_dim()],
+            got: vec![input.box_remainder().len()],
+        }
+        .into());
+    }
+    if input.alpha_dim() != 0 {
+        return Err(CertifiedBox64BridgeError::NonzeroAlphaDimension {
+            alpha_dim: input.alpha_dim(),
+        });
+    }
+    if input.constraint_count() != 0 {
+        return Err(CertifiedBox64BridgeError::NonzeroPredicateCount {
+            constraint_count: input.constraint_count(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_box_coordinate(
+    lower: f64,
+    upper: f64,
+    coordinate: usize,
+) -> Result<(), CertifiedBox64Error> {
+    if !lower.is_finite() {
+        return Err(CertifiedBox64Error::NonFinite {
+            field: "Box lower",
+            index: coordinate,
+        });
+    }
+    if !upper.is_finite() {
+        return Err(CertifiedBox64Error::NonFinite {
+            field: "Box upper",
+            index: coordinate,
+        });
+    }
+    if lower > upper {
+        return Err(CertifiedBox64Error::ReversedBounds { index: coordinate });
+    }
+    Ok(())
+}
+
+fn recenter_outward(lower: f64, upper: f64) -> Result<(f64, f64), CertifiedBox64Error> {
+    debug_assert!(lower.is_finite() && upper.is_finite() && lower <= upper);
+    let center = f64::midpoint(lower, upper);
+    if !center.is_finite() || center < lower || center > upper {
+        return Err(CertifiedBox64Error::NonFiniteArithmetic {
+            operation: "certified Box midpoint",
+        });
+    }
+    let lower_radius =
+        nonnegative_difference_up(center, lower, "certified Box recenter lower half-width")?;
+    let upper_radius =
+        nonnegative_difference_up(upper, center, "certified Box recenter upper half-width")?;
+    let radius = lower_radius.max(upper_radius);
+    if !radius.is_finite() || radius < 0.0 {
+        return Err(CertifiedBox64Error::NonFiniteArithmetic {
+            operation: "certified Box recenter radius",
+        });
+    }
+    Ok((center, radius))
+}
+
+/// Subtract two ordered finite binary64 values, widening only when exactness
+/// is not established. Subtraction by zero is exact. Sterbenz's lemma makes
+/// same-sign operands within a factor of two exact as well; retaining that
+/// case is essential for `[0, u]` ReLU boxes to remain nonnegative after
+/// symmetric recentering.
+fn nonnegative_difference_up(
+    minuend: f64,
+    subtrahend: f64,
+    operation: &'static str,
+) -> Result<f64, CertifiedBox64Error> {
+    debug_assert!(minuend.is_finite() && subtrahend.is_finite());
+    debug_assert!(minuend >= subtrahend);
+    let difference = minuend - subtrahend;
+    if !difference.is_finite() || difference < 0.0 {
+        return Err(CertifiedBox64Error::NonFiniteArithmetic { operation });
+    }
+    if difference == 0.0 || minuend == 0.0 || subtrahend == 0.0 {
+        return Ok(difference);
+    }
+    let same_sign = minuend.is_sign_positive() == subtrahend.is_sign_positive();
+    let smaller_magnitude = minuend.abs().min(subtrahend.abs());
+    let larger_magnitude = minuend.abs().max(subtrahend.abs());
+    if same_sign && larger_magnitude / 2.0 <= smaller_magnitude {
+        return Ok(difference);
+    }
+    round_up(difference, operation)
+}
+
+fn box_bridge_output_bytes(value_dim: usize) -> Result<usize, CertifiedBox64Error> {
+    let stored = value_dim
+        .checked_mul(2)
+        .ok_or(CertifiedBox64Error::ResourceOverflow {
+            operation: "remainder-only bridge stored f64 count",
+        })?;
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_elements::<f64>(stored, "remainder-only bridge output storage")
+        .map_err(|error| match error {
+            ConstrainedZonotopeCallBudgetError::ResourceOverflow { operation } => {
+                CertifiedBox64Error::ResourceOverflow { operation }
+            }
+            ConstrainedZonotopeCallBudgetError::DeadlineExpired { .. }
+            | ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { .. } => {
+                unreachable!("peak-size construction performs no deadline or cap checks")
+            }
+        })?;
+    Ok(peak.finish())
+}
+
+fn map_remainder_only_domain_error(
+    error: ConstrainedZonotope64CallGateError,
+) -> CertifiedBox64BridgeError {
+    match error {
+        ConstrainedZonotope64CallGateError::Domain(error) => error.into(),
+        ConstrainedZonotope64CallGateError::Budget(error) => error.into(),
     }
 }
 
@@ -894,6 +1335,10 @@ fn require_gradual_underflow() -> Result<(), CertifiedBox64Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::mem::size_of;
+    use std::time::{Duration, Instant};
+
     use ndarray::{array, Array4};
     use num_rational::BigRational;
     use proptest::prelude::*;
@@ -908,6 +1353,34 @@ mod tests {
             max_work_items: 4_096,
             max_scalar_products: 8_192,
         }
+    }
+
+    fn budget(
+        start: Instant,
+        baseline_live_bytes: usize,
+        max_peak_live_bytes: usize,
+    ) -> ConstrainedZonotopeCallBudget {
+        ConstrainedZonotopeCallBudget::new(
+            start + Duration::from_mins(1),
+            baseline_live_bytes,
+            max_peak_live_bytes,
+        )
+    }
+
+    fn exact(value: f64) -> BigRational {
+        BigRational::from_float(value).unwrap()
+    }
+
+    fn assert_remainder_coordinate_contains(
+        domain: &ConstrainedZonotope64,
+        coordinate: usize,
+        lower: f64,
+        upper: f64,
+    ) {
+        let center = exact(domain.center()[coordinate]);
+        let radius = exact(domain.box_remainder()[coordinate]);
+        assert!(center.clone() - radius.clone() <= exact(lower));
+        assert!(center + radius >= exact(upper));
     }
 
     #[test]
@@ -971,7 +1444,7 @@ mod tests {
         let cz = ConstrainedZonotope64::try_new(
             vec![1.0, -2.0],
             vec![vec![(0, 2.0), (1, -1.0)], vec![(0, -0.5)]],
-            ndarray::Array2::from_shape_vec((1, 2), vec![1.0, -1.0]).unwrap(),
+            Array2::from_shape_vec((1, 2), vec![1.0, -1.0]).unwrap(),
             vec![0.25],
             vec![0.25, 0.5],
         )
@@ -999,12 +1472,348 @@ mod tests {
     }
 
     #[test]
+    fn remainder_only_bridges_preserve_exact_dyadic_enclosure_and_accounting() {
+        let source = ConstrainedZonotope64::try_new(
+            vec![0.1, -2.0, f64::from_bits(2)],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.2, 0.0, f64::from_bits(1)],
+        )
+        .unwrap();
+        let start = Instant::now();
+        let baseline = 11;
+        let expected_peak = baseline + 2 * source.value_dim() * size_of::<f64>();
+        let boxed = certified_box_from_remainder_only_zonotope_unwired_with_clock(
+            &source,
+            limits(),
+            budget(start, baseline, expected_peak),
+            |_| start,
+        )
+        .unwrap();
+        assert_eq!(boxed.report().peak_live_bytes(), expected_peak);
+        assert_eq!(boxed.report().charged_items(), source.value_dim());
+        for coordinate in 0..source.value_dim() {
+            let exact_center = exact(source.center()[coordinate]);
+            let exact_radius = exact(source.box_remainder()[coordinate]);
+            assert!(
+                exact(boxed.value().lower()[coordinate]) <= exact_center.clone() - &exact_radius
+            );
+            assert!(exact(boxed.value().upper()[coordinate]) >= exact_center + exact_radius);
+        }
+
+        let recentered = remainder_only_zonotope_from_certified_box_unwired_with_budget(
+            boxed.value(),
+            limits(),
+            budget(Instant::now(), baseline, expected_peak),
+        )
+        .unwrap();
+        assert_eq!(recentered.value().alpha_dim(), 0);
+        assert_eq!(recentered.value().constraint_count(), 0);
+        assert_eq!(recentered.report().peak_live_bytes(), expected_peak);
+        // One numeric visit plus gated center finiteness, remainder finiteness,
+        // and remainder-sign validation per coordinate. No generator or
+        // predicate storage exists to validate.
+        assert_eq!(recentered.report().charged_items(), 4 * source.value_dim());
+        for coordinate in 0..source.value_dim() {
+            assert_remainder_coordinate_contains(
+                recentered.value(),
+                coordinate,
+                boxed.value().lower()[coordinate],
+                boxed.value().upper()[coordinate],
+            );
+        }
+    }
+
+    #[test]
+    fn remainder_only_source_rejects_symbols_and_predicates_separately() {
+        let symbol = ConstrainedZonotope64::try_new(
+            vec![0.0],
+            vec![Vec::new()],
+            Array2::zeros((0, 1)),
+            Vec::new(),
+            vec![1.0],
+        )
+        .unwrap();
+        let predicate = ConstrainedZonotope64::try_new(
+            vec![0.0],
+            Vec::new(),
+            Array2::zeros((1, 0)),
+            vec![-1.0],
+            vec![1.0],
+        )
+        .unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            certified_box_from_remainder_only_zonotope_unwired_with_clock(
+                &symbol,
+                limits(),
+                budget(start, 0, usize::MAX),
+                |_| start,
+            ),
+            Err(CertifiedBox64BridgeError::NonzeroAlphaDimension { alpha_dim: 1 })
+        );
+        assert_eq!(
+            certified_box_from_remainder_only_zonotope_unwired_with_clock(
+                &predicate,
+                limits(),
+                budget(start, 0, usize::MAX),
+                |_| start,
+            ),
+            Err(CertifiedBox64BridgeError::NonzeroPredicateCount {
+                constraint_count: 1
+            })
+        );
+    }
+
+    #[test]
+    fn exact_interval_relu_phases_recenter_into_remainder_only_domain() {
+        let input = CertifiedBox64::from_certified_bounds(
+            &[-4.0, 2.0, -3.0, -0.0],
+            &[-1.0, 6.0, 5.0, 0.0],
+            limits(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let output = certified_box_relu_recenter_unwired_with_clock(
+            &input,
+            limits(),
+            budget(start, 0, usize::MAX),
+            |_| start,
+        )
+        .unwrap();
+        let output = output.value();
+        assert_eq!(output.alpha_dim(), 0);
+        assert_eq!(output.constraint_count(), 0);
+
+        // Negative and zero phases are exact points. Sterbenz-exact half
+        // widths keep both the positive and unstable phases exact here; in
+        // particular the unstable ReLU box must not leak below zero.
+        assert_eq!(output.center()[0].to_bits(), 0.0_f64.to_bits());
+        assert_eq!(output.box_remainder()[0].to_bits(), 0.0_f64.to_bits());
+        assert_eq!(output.center()[1].to_bits(), 4.0_f64.to_bits());
+        assert_eq!(output.box_remainder()[1].to_bits(), 2.0_f64.to_bits());
+        assert_remainder_coordinate_contains(output, 1, 2.0, 6.0);
+        assert_eq!(output.center()[2].to_bits(), 2.5_f64.to_bits());
+        assert_eq!(output.box_remainder()[2].to_bits(), 2.5_f64.to_bits());
+        assert_eq!(output.center()[2] - output.box_remainder()[2], 0.0);
+        assert_eq!(output.center()[2] + output.box_remainder()[2], 5.0);
+        assert_remainder_coordinate_contains(output, 2, 0.0, 5.0);
+        assert_eq!(output.center()[3].to_bits(), 0.0_f64.to_bits());
+        assert_eq!(output.box_remainder()[3].to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn exact_full_finite_range_recenters_without_spurious_overflow() {
+        let input =
+            CertifiedBox64::from_certified_bounds(&[-f64::MAX], &[f64::MAX], limits()).unwrap();
+        let output = remainder_only_zonotope_from_certified_box_unwired_with_budget(
+            &input,
+            limits(),
+            budget(Instant::now(), 0, usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(output.value().center()[0].to_bits(), 0.0_f64.to_bits());
+        assert_eq!(output.value().box_remainder()[0], f64::MAX);
+    }
+
+    #[test]
+    fn remainder_only_bridges_preserve_empty_dimension() {
+        let empty_cz = ConstrainedZonotope64::try_new(
+            Vec::new(),
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let boxed = certified_box_from_remainder_only_zonotope_unwired_with_clock(
+            &empty_cz,
+            limits(),
+            budget(start, 7, 7),
+            |_| start,
+        )
+        .unwrap();
+        assert!(boxed.value().is_empty());
+        assert_eq!(boxed.report().peak_live_bytes(), 7);
+        assert_eq!(boxed.report().charged_items(), 0);
+
+        let relu = certified_box_relu_recenter_unwired_with_clock(
+            boxed.value(),
+            limits(),
+            budget(start, 7, 7),
+            |_| start,
+        )
+        .unwrap();
+        assert_eq!(relu.value().value_dim(), 0);
+        assert_eq!(relu.value().alpha_dim(), 0);
+        assert_eq!(relu.value().constraint_count(), 0);
+        assert_eq!(relu.report().charged_items(), 0);
+    }
+
+    #[test]
+    fn relu_recenter_revalidates_and_rejects_an_empty_coordinate_interval() {
+        // Public construction cannot create this state; exercise the private
+        // invariant check so a future internal constructor cannot bypass it.
+        let malformed = CertifiedBox64 {
+            lower: vec![1.0],
+            upper: vec![-1.0],
+        };
+        let start = Instant::now();
+        assert_eq!(
+            certified_box_relu_recenter_unwired_with_clock(
+                &malformed,
+                limits(),
+                budget(start, 0, usize::MAX),
+                |_| start,
+            ),
+            Err(CertifiedBox64BridgeError::Box(
+                CertifiedBox64Error::ReversedBounds { index: 0 }
+            ))
+        );
+    }
+
+    #[test]
+    fn bridge_limits_and_peak_preflight_fail_before_allocation() {
+        let input =
+            CertifiedBox64::from_certified_bounds(&[-1.0, -2.0, -3.0], &[1.0, 2.0, 3.0], limits())
+                .unwrap();
+        let start = Instant::now();
+        let baseline = 5;
+        let exact_peak = baseline + 2 * input.len() * size_of::<f64>();
+        certified_box_relu_recenter_unwired_with_clock(
+            &input,
+            limits(),
+            budget(start, baseline, exact_peak),
+            |_| start,
+        )
+        .unwrap();
+        assert!(matches!(
+            certified_box_relu_recenter_unwired_with_clock(
+                &input,
+                limits(),
+                budget(start, baseline, exact_peak - 1),
+                |_| start,
+            ),
+            Err(CertifiedBox64BridgeError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded {
+                    required,
+                    limit,
+                }
+            )) if required == exact_peak && limit == exact_peak - 1
+        ));
+
+        let exact_work = 4 * input.len();
+        let mut capped = limits();
+        capped.max_work_items = exact_work - 1;
+        assert!(matches!(
+            certified_box_relu_recenter_unwired_with_clock(
+                &input,
+                capped,
+                budget(start, 0, usize::MAX),
+                |_| start,
+            ),
+            Err(CertifiedBox64BridgeError::Box(
+                CertifiedBox64Error::ResourceLimit {
+                    resource: "certified Box-to-CZ charged work items",
+                    required: 12,
+                    limit: 11,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn bridge_deadlines_cover_numeric_materialization_and_publication_phases() {
+        let input = CertifiedBox64::from_certified_bounds(&[-1.0], &[2.0], limits()).unwrap();
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        for seam in [
+            "certified Box-to-CZ numeric transform complete",
+            "certified Box-to-CZ domain materialization complete",
+            "certified Box-to-CZ publication",
+        ] {
+            let result = certified_box_relu_recenter_unwired_with_clock(
+                &input,
+                limits(),
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |checkpoint| if checkpoint == seam { expired } else { start },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CertifiedBox64BridgeError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == seam
+                ),
+                "deadline seam {seam} must refuse publication"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_charging_polls_inside_coordinate_and_domain_validation() {
+        let dimension = crate::CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let input = CertifiedBox64::from_certified_bounds(
+            &vec![-1.0; dimension],
+            &vec![1.0; dimension],
+            CertifiedBox64Limits {
+                max_values: dimension,
+                max_stored_f64: 2 * dimension,
+                max_weight_elements: 0,
+                max_work_items: 4 * dimension,
+                max_scalar_products: 0,
+            },
+        )
+        .unwrap();
+        let large_limits = CertifiedBox64Limits {
+            max_values: dimension,
+            max_stored_f64: 2 * dimension,
+            max_weight_elements: 0,
+            max_work_items: 4 * dimension,
+            max_scalar_products: 0,
+        };
+        let start = Instant::now();
+        let expired = start + Duration::from_secs(2);
+        for phase in [
+            "certified Box-to-CZ coordinate transform",
+            "constrained-zonotope finite-value validation",
+        ] {
+            let reads = Cell::new(0_usize);
+            let result = certified_box_relu_recenter_unwired_with_clock(
+                &input,
+                large_limits,
+                ConstrainedZonotopeCallBudget::new(start + Duration::from_secs(1), 0, usize::MAX),
+                |checkpoint| {
+                    reads.set(reads.get() + 1);
+                    if checkpoint == phase {
+                        expired
+                    } else {
+                        start
+                    }
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CertifiedBox64BridgeError::Budget(
+                        ConstrainedZonotopeCallBudgetError::DeadlineExpired { checkpoint }
+                    )) if checkpoint == phase
+                ),
+                "deadline must be polled during {phase}"
+            );
+            assert!(reads.get() > 1);
+        }
+    }
+
+    #[test]
     fn empty_generator_columns_are_preflighted_and_charged() {
         const EMPTY_COLUMNS: usize = 64;
         let cz = ConstrainedZonotope64::try_new(
             vec![0.0],
             vec![vec![]; EMPTY_COLUMNS],
-            ndarray::Array2::zeros((0, EMPTY_COLUMNS)),
+            Array2::zeros((0, EMPTY_COLUMNS)),
             vec![],
             vec![0.0],
         )
@@ -1049,7 +1858,7 @@ mod tests {
             let weights = [f64::from(w0) / 8.0, f64::from(w1) / 8.0];
             let bias = f64::from(bias) / 8.0;
             let input = CertifiedBox64::from_certified_bounds(&lower, &upper, limits()).unwrap();
-            let matrix = ndarray::Array2::from_shape_vec((1, 2), weights.to_vec()).unwrap();
+            let matrix = Array2::from_shape_vec((1, 2), weights.to_vec()).unwrap();
             let (output, _) = certified_box_affine_unwired(
                 &input,
                 matrix.view(),

@@ -123,3 +123,4 @@ for a1v,afv in [(0.5,0.5),(0.3,0.7),(0.8,0.2),(0.2,0.9),(0.6,0.1)]:
 print()
 print(f"WORST joint-vs-FD (incl. residual-branch alpha) : {worst:.3e}")
 print("PASS" if worst<1e-4 else "FAIL -- residual fan-out adjoint error!")
+raise SystemExit(0 if worst < 1e-4 else 1)

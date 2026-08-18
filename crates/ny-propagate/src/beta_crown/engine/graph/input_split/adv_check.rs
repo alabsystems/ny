@@ -22,8 +22,22 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use tracing::debug;
 
+use crate::beta_crown::result::ViolationWitness;
 use crate::GraphNetwork;
 
+/// Run the PGD probe on one domain.
+///
+/// Returns `Some(witness)` with the concrete point (and its concrete-forward
+/// output) when a restart lands on a violating point, `None` otherwise.
+///
+/// SOUNDNESS (#advcheck-witness): the returned point is a CANDIDATE, not a
+/// verdict. Before this change the caller learned only `true` and threw `x`
+/// and `output` away, so the post-BaB confirmer had to re-search the ROOT box
+/// for a point that was already in hand -- and a validated candidate routinely
+/// downgraded to Unknown. Carrying it changes nothing about who decides: the
+/// confirmer still re-evaluates the model at the point and checks the full
+/// VNN-LIB constraints, and the trusted ONNX-Runtime gate still has the final
+/// word on every scored `sat`.
 pub(crate) fn try_adv_check_on_domain(
     graph: &GraphNetwork,
     input_bounds: &BoundedTensor,
@@ -33,7 +47,7 @@ pub(crate) fn try_adv_check_on_domain(
     deadline: Option<Instant>,
     seed_offset: u64,
     engine: Option<&dyn GemmEngine>,
-) -> Result<bool> {
+) -> Result<Option<ViolationWitness>> {
     const PGD_RESTARTS: usize = 5;
     const PGD_STEPS: usize = 5;
     const SPSA_DELTA: f32 = 0.001;
@@ -145,8 +159,10 @@ pub(crate) fn try_adv_check_on_domain(
         }
 
         // Check if violation found at final point (TRUE concrete point forward).
+        // `x` is cloned into the box rather than moved: on a hit it becomes the
+        // carried witness instead of being dropped on the floor.
         let output = {
-            let b = BoundedTensor::concrete(x)?;
+            let b = BoundedTensor::concrete(x.clone())?;
             graph.propagate_concrete_point(&b, engine, deadline)?
         };
         let obj_val: f32 = objective
@@ -170,11 +186,19 @@ pub(crate) fn try_adv_check_on_domain(
                 "adv_check PGD: found counterexample at restart {} (obj={:.6}, threshold={:.6})",
                 restart, obj_val, threshold
             );
-            return Ok(true);
+            // Carry the exact point and the exact concrete-forward output that
+            // produced `obj_val`. `output` is degenerate (concrete point in,
+            // concrete point out), so `.lower()` IS the network value the
+            // violation decision above was taken on.
+            return Ok(Some(ViolationWitness {
+                input_shape: x.shape().to_vec(),
+                input: x.iter().copied().collect(),
+                output: output.lower().iter().copied().collect(),
+            }));
         }
     }
 
-    Ok(false)
+    Ok(None)
 }
 
 pub(crate) fn try_adv_check_on_input_bounds_batch<'a, I>(
@@ -186,12 +210,12 @@ pub(crate) fn try_adv_check_on_input_bounds_batch<'a, I>(
     deadline: Option<Instant>,
     seed_offset: u64,
     engine: Option<&dyn GemmEngine>,
-) -> Result<bool>
+) -> Result<Option<ViolationWitness>>
 where
     I: IntoIterator<Item = &'a BoundedTensor>,
 {
     for (offset, input_bounds) in input_bounds_batch.into_iter().enumerate() {
-        if try_adv_check_on_domain(
+        if let Some(witness) = try_adv_check_on_domain(
             graph,
             input_bounds,
             objective,
@@ -201,10 +225,10 @@ where
             seed_offset.wrapping_add(offset as u64),
             engine,
         )? {
-            return Ok(true);
+            return Ok(Some(witness));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Check interval for adv_check PGD probes during BaB.

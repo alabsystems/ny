@@ -25,7 +25,7 @@ use crate::bounds::BatchedLinearBounds;
 use crate::layers::Layer;
 use crate::network::core::graph::batched_accumulator::BatchedCrownAccumulator;
 use crate::network::crown_memory::check_batched_identity_budget;
-use crate::network::tighten_crown_output_with_provenance;
+use crate::network::tighten_crown_output_with_provenance_and_deadline;
 use crate::types::{BoundsProvenance, CrownBackwardResult, CrownIbpFallbackReason};
 use crate::MulBinaryRelaxationMode;
 
@@ -47,10 +47,57 @@ mod entrypoints;
 use binary_ops::AttentionCompositionRuntime;
 use dispatch::{PatchesDispatchResult, SpecialBatchedDispatchResult};
 
+fn has_non_finite_batched_bounds_with_deadline(
+    bounds: &BatchedLinearBounds,
+    deadline: Option<Instant>,
+) -> Result<bool> {
+    let Some(limit) = deadline else {
+        return Ok(GraphNetwork::has_non_finite_coefficients(bounds));
+    };
+    if Instant::now() >= limit {
+        return Err(NyError::DeadlineExceeded(
+            "batched CROWN: deadline exceeded before final coefficient scan".into(),
+        ));
+    }
+    let mut work = 0usize;
+    for values in [
+        bounds.lower_a(),
+        bounds.lower_b(),
+        bounds.upper_a(),
+        bounds.upper_b(),
+    ] {
+        for &value in values {
+            if !value.is_finite() {
+                if Instant::now() >= limit {
+                    return Err(NyError::DeadlineExceeded(
+                        "batched CROWN: deadline exceeded during final coefficient scan".into(),
+                    ));
+                }
+                return Ok(true);
+            }
+            work += 1;
+            if work >= 4096 {
+                work = 0;
+                if Instant::now() >= limit {
+                    return Err(NyError::DeadlineExceeded(
+                        "batched CROWN: deadline exceeded during final coefficient scan".into(),
+                    ));
+                }
+            }
+        }
+    }
+    if Instant::now() >= limit {
+        return Err(NyError::DeadlineExceeded(
+            "batched CROWN: deadline exceeded after final coefficient scan".into(),
+        ));
+    }
+    Ok(false)
+}
+
 /// Resolve a node name to its IBP bounds, using the network input for `NETWORK_INPUT`.
 ///
 /// Deduplicates the 9× repeated pattern in `propagate_crown_batched_inner`:
-/// ```ignore
+/// ```text
 /// let bounds = if name == NETWORK_INPUT { input } else { node_bounds.get(name)? };
 /// ```
 fn resolve_node_bounds<'a>(
@@ -202,7 +249,7 @@ impl GraphNetwork {
         // Phase 4 (#2613): Use BatchedCrownBounds to support Patches mode for CNN DAGs.
         // When the output is 3D spatial with Conv2d layers, start in Patches mode.
         // Phase 3 (#4297): Use BatchedCrownAccumulator for Vec-indexed storage.
-        let mut node_linear_bounds = BatchedCrownAccumulator::new(plan);
+        let mut node_linear_bounds = BatchedCrownAccumulator::new_with_deadline(plan, deadline);
 
         let initial_bounds = if output_shape.len() == 3 && has_conv2d {
             let (oc, oh, ow) = (output_shape[0], output_shape[1], output_shape[2]);
@@ -210,10 +257,26 @@ impl GraphNetwork {
                 "GraphNetwork batched CROWN: Initializing Patches mode (output {}x{}x{})",
                 oc, oh, ow
             );
-            BatchedCrownBounds::Patches(Box::new(PatchesLinearBounds::identity(
-                (oc, oh, ow),
-                (oc, oh, ow),
-            )))
+            let shape = (oc, oh, ow);
+            let seed =
+                match PatchesLinearBounds::try_identity_with_deadline(shape, shape, deadline, 0) {
+                    Ok(seed) => seed,
+                    Err(error)
+                        if error.is_deadline_exceeded() || error.is_cpu_memory_exceeded() =>
+                    {
+                        let reason = if error.is_deadline_exceeded() {
+                            CrownIbpFallbackReason::DeadlineExceeded
+                        } else {
+                            CrownIbpFallbackReason::MemoryBudgetExceeded
+                        };
+                        return self.propagate_ibp(input).map(|bounds| CrownBackwardResult {
+                            bounds,
+                            provenance: BoundsProvenance::ForwardFallback(reason),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+            BatchedCrownBounds::Patches(Box::new(seed))
         } else {
             // Guard: check CPU dense budget before allocating batched identity (#3550).
             check_batched_identity_budget(
@@ -305,6 +368,7 @@ impl GraphNetwork {
                 node_name,
                 pre_activation,
                 engine,
+                deadline,
                 first_input,
                 &node_bounds,
                 &output_shape,
@@ -317,7 +381,7 @@ impl GraphNetwork {
             };
 
             // Keep binary/special graph operators local; delegate all unary dispatch to Layer.
-            match self.dispatch_special_batched_operator(
+            let special_dispatch = self.dispatch_special_batched_operator(
                 node,
                 node_name,
                 &node_lb,
@@ -328,7 +392,16 @@ impl GraphNetwork {
                 bilinear_alphas,
                 &mut attention_runtime,
                 &mut node_linear_bounds,
-            )? {
+            );
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return self.propagate_ibp(input).map(|bounds| CrownBackwardResult {
+                    bounds,
+                    provenance: BoundsProvenance::ForwardFallback(
+                        CrownIbpFallbackReason::DeadlineExceeded,
+                    ),
+                });
+            }
+            match special_dispatch? {
                 SpecialBatchedDispatchResult::Handled => continue,
                 SpecialBatchedDispatchResult::PartialFallback(fallback) => return Ok(*fallback),
                 SpecialBatchedDispatchResult::NotHandled => {}
@@ -340,7 +413,7 @@ impl GraphNetwork {
             // Elementwise activations:
             match &node.layer {
                 Layer::ReLU(_) | Layer::GELU(_) | Layer::SiLU(_) | Layer::Tanh(_)
-                | Layer::Sigmoid(_) | Layer::Exp(_) | Layer::Log(_) | Layer::Sqrt(_)
+                | Layer::Sigmoid(_) | Layer::Erf(_) | Layer::Exp(_) | Layer::Log(_) | Layer::Sqrt(_)
                 | Layer::Reciprocal(_) | Layer::Softplus(_) | Layer::HardSwish(_)
                 | Layer::Mish(_) | Layer::Selu(_) | Layer::Softsign(_) | Layer::Arctan(_)
                 | Layer::Tan(_) | Layer::Sin(_) | Layer::Cos(_) | Layer::Elu(_)
@@ -394,6 +467,7 @@ impl GraphNetwork {
                         &node_lb,
                         pre_activation,
                         engine,
+                        deadline,
                         first_input,
                         &node_bounds,
                         &output_shape,
@@ -424,16 +498,27 @@ impl GraphNetwork {
             peak_memory_bytes as f64 / 1_048_576.0
         );
 
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return self.propagate_ibp(input).map(|bounds| CrownBackwardResult {
+                bounds,
+                provenance: BoundsProvenance::ForwardFallback(
+                    CrownIbpFallbackReason::DeadlineExceeded,
+                ),
+            });
+        }
+
         // Step 4: Concretize using input bounds.
         // Convert BatchedCrownBounds to BatchedLinearBounds for concretization.
         let final_bcb = node_linear_bounds
             .take(NETWORK_INPUT)
             .ok_or_else(|| NyError::InvalidSpec("No path to network input found".to_string()))?;
-        let final_bounds =
-            final_bcb.into_batched_dense_checked("crown_batched:final_concretization")?;
+        let final_bounds = final_bcb.into_batched_dense_checked_with_deadline(
+            "crown_batched:final_concretization",
+            deadline,
+        )?;
 
         // Check if final bounds coefficients contain inf/NaN
-        if Self::has_non_finite_coefficients(&final_bounds) {
+        if has_non_finite_batched_bounds_with_deadline(&final_bounds, deadline)? {
             debug!(
                 "GraphNetwork batched CROWN: final linear bounds contain inf/NaN, falling back to IBP"
             );
@@ -451,22 +536,40 @@ impl GraphNetwork {
             final_bounds.input_shape, final_bounds.output_shape
         );
 
-        let input_for_concretize = if input.shape() == final_bounds.input_shape.as_slice() {
-            Cow::Borrowed(input)
-        } else {
-            Cow::Owned(input.reshape(&final_bounds.input_shape)?)
-        };
-        // concretize_sound() guarantees no NaN/inversion (#2287).
-        let crown_output = final_bounds.concretize_sound(input_for_concretize.as_ref())?;
+        let input_for_concretize =
+            if deadline.is_some() || input.shape() == final_bounds.input_shape.as_slice() {
+                Cow::Borrowed(input)
+            } else {
+                Cow::Owned(input.reshape(&final_bounds.input_shape)?)
+            };
+        // The finite implementation owns validation, allocation, arithmetic,
+        // endpoint publication, and final scans under the same authority.
+        let crown_output =
+            final_bounds.concretize_sound_with_deadline(input_for_concretize.as_ref(), deadline)?;
         // Post-concretization tightening with provenance — matches graph CROWN (#4240, #4242).
-        let (tightened_output, provenance) =
-            tighten_crown_output_with_provenance(crown_output, output_bounds, "Batched CROWN")?;
+        let (tightened_output, provenance) = tighten_crown_output_with_provenance_and_deadline(
+            crown_output,
+            output_bounds,
+            "Batched CROWN",
+            deadline,
+        )?;
 
         // Ensure output shape matches expected
         if tightened_output.shape() != output_shape.as_slice() {
-            tightened_output
-                .reshape(&output_shape)
-                .map(|bounds| CrownBackwardResult { bounds, provenance })
+            let bounds = if deadline.is_some() {
+                tightened_output.into_reshape_with_poll(&output_shape, || {
+                    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                        Err(NyError::DeadlineExceeded(
+                            "batched CROWN: deadline exceeded during final output reshape".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })?
+            } else {
+                tightened_output.reshape(&output_shape)?
+            };
+            Ok(CrownBackwardResult { bounds, provenance })
         } else {
             Ok(CrownBackwardResult {
                 bounds: tightened_output,

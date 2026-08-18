@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use super::helpers::build_layer_to_relu_idx;
 use ndarray::{Array1, Array2};
@@ -35,6 +36,8 @@ pub(super) struct BackwardPassConfig<'a> {
     pub best_of_oc: bool,
     /// Optional GEMM acceleration engine for linear layer propagation.
     pub engine: Option<&'a dyn GemmEngine>,
+    /// Literal verifier authority for this backward pass.
+    pub deadline: Option<Instant>,
     /// Mapping from layer index to ReLU index.
     pub layer_to_relu_idx: &'a HashMap<usize, usize>,
     /// Indices of ReLU layers in the network.
@@ -68,6 +71,17 @@ pub(super) enum BackwardPassResult {
     Fallback,
 }
 
+#[inline]
+fn check_backward_deadline(deadline: Option<Instant>, phase: &str) -> Result<()> {
+    if deadline.is_some_and(|value| Instant::now() >= value) {
+        Err(NyError::DeadlineExceeded(format!(
+            "sequential alpha-CROWN backward: deadline exceeded {phase}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// Propagate a generic (non-Linear, non-ReLU) layer backward via the
 /// `propagate_crown_backward` trait method, with standard error handling.
 ///
@@ -79,7 +93,10 @@ fn propagate_generic_layer_backward(
     pre_activation: &BoundedTensor,
     layer_idx: usize,
     engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
 ) -> Result<(LinearBounds, Option<BackwardPassResult>)> {
+    check_backward_deadline(deadline, "before generic layer dispatch")?;
+
     // Conv layers: use engine-aware path for GPU acceleration (#3598).
     let backward_result = match layer {
         Layer::Conv1d(c) => {
@@ -87,7 +104,7 @@ fn propagate_generic_layer_backward(
             let in_len = input_shape.last().copied().unwrap_or(0);
             let mut conv = c.clone();
             conv.set_input_length(in_len);
-            conv.propagate_linear_with_engine(linear_bounds, engine)
+            conv.propagate_linear_with_engine_and_deadline(linear_bounds, engine, deadline)
                 .map(|cow| cow.into_owned())
         }
         Layer::ConvTranspose1d(c) => {
@@ -95,7 +112,7 @@ fn propagate_generic_layer_backward(
             let in_len = input_shape.last().copied().unwrap_or(0);
             let mut conv = c.clone();
             conv.set_input_length(in_len);
-            conv.propagate_linear_with_engine(linear_bounds, engine)
+            conv.propagate_linear_with_engine_and_deadline(linear_bounds, engine, deadline)
                 .map(|cow| cow.into_owned())
         }
         Layer::Conv2d(c) => {
@@ -110,7 +127,7 @@ fn propagate_generic_layer_backward(
             };
             let mut conv = c.clone();
             conv.set_input_shape(in_h, in_w);
-            conv.propagate_linear_with_engine(linear_bounds, engine)
+            conv.propagate_linear_with_engine_and_deadline(linear_bounds, engine, deadline)
                 .map(|cow| cow.into_owned())
         }
         Layer::ConvTranspose2d(c) => {
@@ -125,24 +142,23 @@ fn propagate_generic_layer_backward(
             };
             let mut conv = c.clone();
             conv.set_input_shape(in_h, in_w);
-            conv.propagate_linear_with_engine(linear_bounds, engine)
+            conv.propagate_linear_with_engine_and_deadline(linear_bounds, engine, deadline)
                 .map(|cow| cow.into_owned())
         }
         _ => layer.propagate_crown_backward(linear_bounds, Some(pre_activation)),
     };
+    check_backward_deadline(deadline, "after generic layer dispatch")?;
     match backward_result {
         Ok(next) => Ok((next, None)),
         // #3166: Catch UnsupportedConfiguration alongside UnsupportedOp.
         // #2888: NumericalInstability also triggers fallback.
         // #3813: ShapeMismatch from Dense Conv2d backward when graph restructuring
         // (e.g., RSPLITTER) changes intermediate dimensions. IBP fallback is sound.
-        // #3795: DeadlineExceeded triggers fallback (per-node budget exhausted).
         Err(
             e @ NyError::UnsupportedOp(_)
             | e @ NyError::UnsupportedConfiguration(_)
             | e @ NyError::NumericalInstability(_)
-            | e @ NyError::ShapeMismatch { .. }
-            | e @ NyError::DeadlineExceeded(_),
+            | e @ NyError::ShapeMismatch { .. },
         ) => {
             warn!(
                 "α-CROWN backward: layer {} ({}) unsupported/unstable: {}",
@@ -156,7 +172,9 @@ fn propagate_generic_layer_backward(
         Err(NyError::LayerError { source, .. })
             if matches!(
                 source.as_ref(),
-                NyError::SoundnessRefusal(_) | NyError::InternalError(_)
+                NyError::SoundnessRefusal(_)
+                    | NyError::InternalError(_)
+                    | NyError::DeadlineExceeded(_)
             ) =>
         {
             Err(*source)
@@ -192,6 +210,7 @@ pub(super) fn backward_pass_core(
     output_dim: usize,
     config: &BackwardPassConfig<'_>,
 ) -> Result<BackwardPassResult> {
+    check_backward_deadline(config.deadline, "before initialization")?;
     let mut linear_bounds = LinearBounds::identity(output_dim);
 
     // INVPROP assume-violation dual, folded into the OUTPUT IDENTITY SEED (re-seed).
@@ -202,14 +221,16 @@ pub(super) fn backward_pass_core(
     // gamma == 0 (un-optimized) this is the identity map => byte-identical baseline.
     if let Some(ref state) = alpha_state.invprop_state {
         if let Some(gammas) = state.layer_gammas(crate::invprop::INVPROP_OUTPUT_SEED) {
-            if gammas.active {
-                let gammas_lower = gammas.lower_gammas().to_owned();
-                let gammas_upper = gammas.upper_gammas().to_owned();
+            if let Some((gammas_lower, gammas_upper)) = gammas
+                .active
+                .then(|| gammas.checked_bound_gammas())
+                .flatten()
+            {
                 linear_bounds = augment_bounds_with_constraints(
                     &linear_bounds,
                     &state.constraints,
-                    &gammas_lower,
-                    &gammas_upper,
+                    &gammas_lower.to_owned(),
+                    &gammas_upper.to_owned(),
                 );
             }
         }
@@ -246,6 +267,7 @@ pub(super) fn backward_pass_core(
 
     // Backward pass through layers
     for (layer_idx, layer) in layers.iter().enumerate().rev() {
+        check_backward_deadline(config.deadline, "between layers")?;
         let pre_activation = if layer_idx == 0 {
             input
         } else {
@@ -254,7 +276,11 @@ pub(super) fn backward_pass_core(
 
         match layer {
             Layer::Linear(l) => {
-                let next = l.propagate_linear_with_engine(&linear_bounds, config.engine)?;
+                let next = l.propagate_linear_with_engine_and_deadline(
+                    &linear_bounds,
+                    config.engine,
+                    config.deadline,
+                )?;
                 if let Cow::Owned(next) = next {
                     linear_bounds = next;
                 }
@@ -327,6 +353,7 @@ pub(super) fn backward_pass_core(
             | Layer::SiLU(_)
             | Layer::Tanh(_)
             | Layer::Sigmoid(_)
+            | Layer::Erf(_)
             | Layer::Exp(_)
             | Layer::Log(_)
             | Layer::Sqrt(_)
@@ -401,6 +428,7 @@ pub(super) fn backward_pass_core(
                     pre_activation,
                     layer_idx,
                     config.engine,
+                    config.deadline,
                 )?;
                 if let Some(result) = fallback {
                     return Ok(result);
@@ -413,10 +441,11 @@ pub(super) fn backward_pass_core(
         if let Some(ref state) = alpha_state.invprop_state {
             let layer_name = format!("/layer.{}", layer_idx);
             if let Some(gammas) = state.layer_gammas(&layer_name) {
-                if gammas.active {
-                    let gammas_lower = gammas.lower_gammas().to_owned();
-                    let gammas_upper = gammas.upper_gammas().to_owned();
-
+                if let Some((gammas_lower, gammas_upper)) = gammas
+                    .active
+                    .then(|| gammas.checked_bound_gammas())
+                    .flatten()
+                {
                     if config.best_of_oc {
                         bounds_without_oc = Some(linear_bounds.clone());
                     }
@@ -424,14 +453,16 @@ pub(super) fn backward_pass_core(
                     linear_bounds = augment_bounds_with_constraints(
                         &linear_bounds,
                         &state.constraints,
-                        &gammas_lower,
-                        &gammas_upper,
+                        &gammas_lower.to_owned(),
+                        &gammas_upper.to_owned(),
                     );
                 }
             }
         }
+        check_backward_deadline(config.deadline, "after layer dispatch")?;
     }
 
+    check_backward_deadline(config.deadline, "before input augmentation")?;
     // Input-level INVPROP augmentation (#2928).
     // After the backward loop completes, apply constraint augmentation at the
     // network input level if configured. Mirrors graph path:
@@ -440,20 +471,22 @@ pub(super) fn backward_pass_core(
     // snapshots bounds_without_oc inside the per-layer loop.
     if let Some(ref state) = alpha_state.invprop_state {
         if let Some(gammas) = state.layer_gammas(crate::NETWORK_INPUT) {
-            if gammas.active {
-                let gammas_lower = gammas.lower_gammas().to_owned();
-                let gammas_upper = gammas.upper_gammas().to_owned();
-
+            if let Some((gammas_lower, gammas_upper)) = gammas
+                .active
+                .then(|| gammas.checked_bound_gammas())
+                .flatten()
+            {
                 linear_bounds = augment_bounds_with_constraints(
                     &linear_bounds,
                     &state.constraints,
-                    &gammas_lower,
-                    &gammas_upper,
+                    &gammas_lower.to_owned(),
+                    &gammas_upper.to_owned(),
                 );
             }
         }
     }
 
+    check_backward_deadline(config.deadline, "before returning")?;
     Ok(BackwardPassResult::Success(Box::new(BackwardPassOutput {
         linear_bounds,
         gradients,
@@ -475,6 +508,7 @@ pub(super) fn run_simple_backward_pass(
     layer_bounds: &[BoundedTensor],
     alpha_state: &AlphaState,
     engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
     store_intermediates: bool,
     context: &str,
 ) -> Result<BackwardPassResult> {
@@ -492,6 +526,7 @@ pub(super) fn run_simple_backward_pass(
         store_intermediates,
         best_of_oc: false,
         engine,
+        deadline,
         layer_to_relu_idx: &layer_to_relu_idx,
         relu_layer_indices: &relu_layer_indices,
     };
@@ -504,4 +539,81 @@ pub(super) fn run_simple_backward_pass(
         output_dim,
         &bp_config,
     )
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::layers::{FlattenLayer, LinearLayer};
+    use ndarray::{arr1, arr2};
+    use ny_test_utils::CountingGemmEngine;
+    use std::time::Duration;
+
+    fn scalar_input() -> BoundedTensor {
+        BoundedTensor::new(arr1(&[-1.0f32]).into_dyn(), arr1(&[1.0f32]).into_dyn())
+            .expect("valid scalar input")
+    }
+
+    #[test]
+    fn expired_backward_refuses_linear_before_engine_launch() {
+        let input = scalar_input();
+        let layers = vec![Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0f32]]), None).expect("valid linear layer"),
+        )];
+        let layer_bounds = vec![input.clone()];
+        let alpha_state =
+            AlphaState::from_preactivation_bounds(&[], &[]).expect("empty alpha state");
+        let engine = CountingGemmEngine::new();
+        let relu_layer_indices = Vec::new();
+        let layer_to_relu_idx = HashMap::new();
+        let config = BackwardPassConfig {
+            track_gradients: false,
+            store_intermediates: false,
+            best_of_oc: false,
+            engine: Some(&engine),
+            deadline: Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond fits before the current instant"),
+            ),
+            layer_to_relu_idx: &layer_to_relu_idx,
+            relu_layer_indices: &relu_layer_indices,
+        };
+
+        let error =
+            match backward_pass_core(&layers, &input, &layer_bounds, &alpha_state, 1, &config) {
+                Err(error) => error,
+                Ok(_) => panic!("expired deadline must remain a structured error"),
+            };
+
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+        assert_eq!(
+            engine.gemm_calls(),
+            0,
+            "expired backward must not launch the configured GEMM engine"
+        );
+    }
+
+    #[test]
+    fn expired_generic_dispatch_is_not_converted_to_fallback() {
+        let input = scalar_input();
+        let layer = Layer::Flatten(FlattenLayer::new(1));
+        let error = match propagate_generic_layer_backward(
+            &layer,
+            &LinearBounds::identity(1),
+            &input,
+            0,
+            None,
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond fits before the current instant"),
+            ),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expired generic dispatch must not become Fallback"),
+        };
+
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    }
 }

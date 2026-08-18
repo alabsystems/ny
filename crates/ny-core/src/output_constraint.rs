@@ -57,9 +57,9 @@ pub enum OutputConstraint {
 impl OutputConstraint {
     /// Validate the structural shape of this constraint.
     ///
-    /// Cheap, value-independent checks only:
+    /// Cheap structural and numeric checks:
     /// - `Bounds` must be non-empty.
-    /// - `Linear` must have non-empty `coeffs` and a non-NaN, finite `bias`.
+    /// - `Linear` must have non-empty, finite `coeffs` and a finite `bias`.
     /// - `ArgmaxMargin` is always structurally valid (any `class` index is allowed;
     ///   range validity against an output dimension is checked at use sites).
     ///
@@ -91,10 +91,14 @@ impl OutputConstraint {
                         "OutputConstraint::Linear bias is non-finite: {bias}"
                     )));
                 }
-                if coeffs.iter().any(|c| c.is_nan()) {
-                    return Err(crate::NyError::InvalidSpec(
-                        "OutputConstraint::Linear coeffs contain NaN".to_string(),
-                    ));
+                if let Some((index, coeff)) = coeffs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, coeff)| !coeff.is_finite())
+                {
+                    return Err(crate::NyError::InvalidSpec(format!(
+                        "OutputConstraint::Linear coeffs[{index}] is non-finite: {coeff}"
+                    )));
                 }
                 Ok(())
             }
@@ -233,6 +237,22 @@ mod tests {
             kind: ConstraintKind::Le,
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_linear_coeffs() {
+        for coeff in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let c = OutputConstraint::Linear {
+                coeffs: vec![1.0, coeff],
+                bias: 0.0,
+                kind: ConstraintKind::Le,
+            };
+            let error = c.validate().expect_err("non-finite coefficient must fail");
+            assert!(
+                error.to_string().contains("coeffs[1]"),
+                "diagnostic should identify the invalid coefficient: {error}"
+            );
+        }
     }
 
     #[test]

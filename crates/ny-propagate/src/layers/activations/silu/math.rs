@@ -10,6 +10,7 @@
 use std::sync::OnceLock;
 
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
+use ny_core::{f32_affine_eval_error, f64_to_f32_down, f64_to_f32_up};
 use ny_tensor::{next_down_f32, next_up_f32};
 
 static SILU_CRITICAL_POINT: OnceLock<f32> = OnceLock::new();
@@ -203,13 +204,12 @@ pub(crate) fn silu_chord(l: f32, u: f32) -> (f32, f32, f32) {
     // from the true f64 line by up to |slope_f32 - slope64| * max(|l|, |u|).
     // Ref: Exp (exp.rs:159-166), ELU (elu.rs:197-206).
     let slope_f32 = slope64 as f32;
-    let max_abs_x = (l.abs().max(u.abs())) as f64;
-    let slope_err = next_up_f32(((slope64 - slope_f32 as f64).abs() * max_abs_x) as f32);
-    let intercept_f32 = intercept64 as f32;
+    let max_abs_x = l.abs().max(u.abs());
+    let eval_err = f32_affine_eval_error(slope64, slope_f32, intercept64, max_abs_x);
     (
         slope_f32,
-        next_down_f32(intercept_f32 - slope_err),
-        next_up_f32(intercept_f32 + slope_err),
+        next_down_f32(f64_to_f32_down(intercept64 - eval_err)),
+        next_up_f32(f64_to_f32_up(intercept64 + eval_err)),
     )
 }
 
@@ -234,12 +234,11 @@ pub(crate) fn silu_tangent(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
     // Directed rounding: absorb f64→f32 slope truncation error.
     // Ref: Exp (exp.rs:159-166), ELU (elu.rs:197-206).
     let slope_f32 = slope64 as f32;
-    let slope_err = next_up_f32(((slope64 - slope_f32 as f64).abs() * max_abs_x as f64) as f32);
-    let intercept_f32 = intercept64 as f32;
+    let eval_err = f32_affine_eval_error(slope64, slope_f32, intercept64, max_abs_x);
     (
         slope_f32,
-        next_down_f32(intercept_f32 - slope_err),
-        next_up_f32(intercept_f32 + slope_err),
+        next_down_f32(f64_to_f32_down(intercept64 - eval_err)),
+        next_up_f32(f64_to_f32_up(intercept64 + eval_err)),
     )
 }
 

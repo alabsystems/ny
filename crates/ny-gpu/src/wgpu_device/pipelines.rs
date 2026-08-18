@@ -2,8 +2,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::borrow::Cow;
-
 use super::shaders::{
     ADD_IBP_SHADER, AVGPOOL_IBP_SHADER, CONV2D_IBP_IM2COL_SHADER, GEMM_F32_SHADER,
     GEMM_F32_SMALL_K_SHADER, LINEAR_IBP_SHADER, MATMUL_IBP_SHADER, RELU_IBP_SHADER,
@@ -14,11 +12,14 @@ use super::WgpuDevice;
 impl WgpuDevice {
     pub(super) fn create_linear_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("linear_ibp_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(LINEAR_IBP_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "linear_ibp_shader",
+            LINEAR_IBP_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("linear_ibp_bind_group_layout"),
@@ -134,11 +135,14 @@ impl WgpuDevice {
 
     pub(super) fn create_matmul_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("matmul_ibp_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MATMUL_IBP_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "matmul_ibp_shader",
+            MATMUL_IBP_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("matmul_ibp_bind_group_layout"),
@@ -243,11 +247,14 @@ impl WgpuDevice {
 
     pub(super) fn create_softmax_reduce_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("softmax_reduce_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SOFTMAX_REDUCE_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "softmax_reduce_shader",
+            SOFTMAX_REDUCE_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("softmax_reduce_bind_group_layout"),
@@ -363,11 +370,14 @@ impl WgpuDevice {
 
     pub(super) fn create_softmax_apply_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("softmax_apply_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SOFTMAX_APPLY_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "softmax_apply_shader",
+            SOFTMAX_APPLY_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("softmax_apply_bind_group_layout"),
@@ -472,11 +482,14 @@ impl WgpuDevice {
 
     pub(super) fn create_transpose_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("transpose_ibp_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(TRANSPOSE_IBP_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "transpose_ibp_shader",
+            TRANSPOSE_IBP_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("transpose_ibp_bind_group_layout"),
@@ -559,11 +572,14 @@ impl WgpuDevice {
 
     pub(super) fn create_scale_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("scale_ibp_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SCALE_IBP_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "scale_ibp_shader",
+            SCALE_IBP_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scale_ibp_bind_group_layout"),
@@ -646,11 +662,14 @@ impl WgpuDevice {
 
     pub(super) fn create_gemm_f32_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gemm_f32_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GEMM_F32_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "gemm_f32_shader",
+            GEMM_F32_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gemm_f32_bind_group_layout"),
@@ -727,12 +746,15 @@ impl WgpuDevice {
     /// Reference: #3599 (tall-skinny GEMM specialization)
     pub(super) fn create_gemm_f32_small_k_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
         bind_group_layout: &wgpu::BindGroupLayout,
     ) -> wgpu::ComputePipeline {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gemm_f32_small_k_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GEMM_F32_SMALL_K_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "gemm_f32_small_k_shader",
+            GEMM_F32_SMALL_K_SHADER,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gemm_f32_small_k_pipeline_layout"),
@@ -754,11 +776,14 @@ impl WgpuDevice {
     /// accumulation for groups=1 Conv2d layers.
     pub(super) fn create_conv2d_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("conv2d_ibp_im2col_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CONV2D_IBP_IM2COL_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "conv2d_ibp_im2col_shader",
+            CONV2D_IBP_IM2COL_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("conv2d_ibp_bind_group_layout"),
@@ -868,11 +893,14 @@ impl WgpuDevice {
     /// Part of #4081 (GPU-resident IBP forward).
     pub(super) fn create_relu_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("relu_ibp_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(RELU_IBP_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "relu_ibp_shader",
+            RELU_IBP_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("relu_ibp_bind_group_layout"),
@@ -935,11 +963,14 @@ impl WgpuDevice {
     /// connections. Part of #4319 (graph-DAG resident IBP).
     pub(super) fn create_add_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("add_ibp_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(ADD_IBP_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "add_ibp_shader",
+            ADD_IBP_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("add_ibp_bind_group_layout"),
@@ -1039,11 +1070,14 @@ impl WgpuDevice {
     /// interval bounds. Part of #4320 (AveragePool graph-DAG resident IBP).
     pub(super) fn create_avgpool_ibp_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("avgpool_ibp_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(AVGPOOL_IBP_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "avgpool_ibp_shader",
+            AVGPOOL_IBP_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("avgpool_ibp_bind_group_layout"),

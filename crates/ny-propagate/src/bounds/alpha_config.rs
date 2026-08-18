@@ -12,10 +12,9 @@
 
 use super::LinearBounds;
 use crate::invprop::{InvpropConfig, OutputConstraints};
-use ndarray::{Array1, Array2};
-use ny_tensor::{next_down_f32, next_up_f32};
+use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::{mem::size_of, time::Instant};
 
 /// Spec-proven early-exit for the single-objective α-CROWN warmup loop.
 ///
@@ -51,35 +50,45 @@ impl AlphaSpecEarlyExit {
     /// SOUNDNESS (#concretize-soundness-hardening): this projection feeds
     /// `is_verified`, a verdict early-exit, where an inward round-to-nearest
     /// endpoint would be an undetectable false Verified. Accumulate in f64 —
-    /// `f32 x f32` promoted to f64 is exact (48 < 53 significand bits), so only
-    /// the additions round — then close with a directed f32 cast, mirroring
-    /// `LinearBounds::concretize_sound`.
+    /// Reuse the certified double-double spec-row reducer (with its directed
+    /// f64 fallback) so this early-exit is bit-identical to the post-warmup
+    /// root projection and remains useful under catastrophic cancellation.
     #[must_use]
     pub fn project_bounds(&self, lower: &[f32], upper: &[f32]) -> Option<(f32, f32)> {
         if lower.len() != self.objective.len() || upper.len() != self.objective.len() {
             return None;
         }
-        let mut lo = 0.0f64;
-        let mut hi = 0.0f64;
-        for (idx, &c) in self.objective.iter().enumerate() {
-            let c = c as f64;
-            let l = lower[idx] as f64;
-            let u = upper[idx] as f64;
-            if c >= 0.0 {
-                lo += c * l;
-                hi += c * u;
-            } else {
-                lo += c * u;
-                hi += c * l;
-            }
-        }
-        // Guard against NaN from degenerate CROWN propagation (#2359 parity with
-        // `objective_bounds`): collapse to the sound unbounded interval, which
-        // `is_verified` rejects — the loop simply keeps optimizing.
-        if lo.is_nan() || hi.is_nan() {
-            return Some((f32::NEG_INFINITY, f32::INFINITY));
-        }
-        Some((next_down_f32(lo as f32), next_up_f32(hi as f32)))
+        let lo = super::certified_affine_sum_f32(
+            0.0,
+            self.objective
+                .iter()
+                .enumerate()
+                .map(|(index, &coefficient)| {
+                    let endpoint = if coefficient >= 0.0 {
+                        lower[index]
+                    } else {
+                        upper[index]
+                    };
+                    (coefficient, endpoint)
+                }),
+            super::OutwardDirection::Lower,
+        );
+        let hi = super::certified_affine_sum_f32(
+            0.0,
+            self.objective
+                .iter()
+                .enumerate()
+                .map(|(index, &coefficient)| {
+                    let endpoint = if coefficient >= 0.0 {
+                        upper[index]
+                    } else {
+                        lower[index]
+                    };
+                    (coefficient, endpoint)
+                }),
+            super::OutwardDirection::Upper,
+        );
+        Some((ny_core::f64_to_f32_down(lo), ny_core::f64_to_f32_up(hi)))
     }
 
     /// True when the projected scalar bounds already prove the property. Mirrors
@@ -87,7 +96,8 @@ impl AlphaSpecEarlyExit {
     /// non-finite inputs; #2993). Used by the warmup loop to break early.
     #[must_use]
     pub fn is_verified(&self, lower: f32, upper: f32) -> bool {
-        if !lower.is_finite() || !upper.is_finite() || !self.threshold.is_finite() {
+        if !lower.is_finite() || !upper.is_finite() || lower > upper || !self.threshold.is_finite()
+        {
             return false;
         }
         if self.verify_upper_bound {
@@ -95,6 +105,99 @@ impl AlphaSpecEarlyExit {
         } else {
             lower > self.threshold
         }
+    }
+
+    /// Signed proven-margin slack of this row under the given output box.
+    ///
+    /// `> 0` ⇔ [`Self::is_verified`] holds; the magnitude says how far past (or
+    /// short of) the threshold the projection lands. Returns `None` on a length
+    /// mismatch or a non-finite projection so callers fail closed.
+    #[must_use]
+    pub fn margin_slack(&self, lower: &[f32], upper: &[f32]) -> Option<f32> {
+        let (lo, hi) = self.project_bounds(lower, upper)?;
+        let slack = if self.verify_upper_bound {
+            self.threshold - hi
+        } else {
+            lo - self.threshold
+        };
+        slack.is_finite().then_some(slack)
+    }
+}
+
+/// Multi-row spec objective used to RANK α iterates in the root warmup
+/// (#root-alpha-margin).
+///
+/// ## Why this exists
+///
+/// The root warmup ascends `finite_lower_sum` — a plain sum over the RAW output
+/// dimensions — while multi-class properties are a conjunction of MARGIN rows
+/// (`y_true - y_i >= 0`). Worse, the loop returns its *last* α iterate, which is
+/// one optimizer update ahead of the last bound it evaluated, and there is no
+/// best-α snapshot. So iterations spent ascending the wrong objective hand the
+/// downstream spec pass an α that can be strictly worse for the margins than the
+/// one it started from, with no path back.
+///
+/// ## SOUNDNESS — this is SELECTION ONLY
+///
+/// [`Self::hinge_score`] is a *ranking* scalar. It never decides a verdict, never
+/// claims a proof, and never feeds a bound. It only chooses WHICH α to keep, and
+/// every α ∈ [0,1] yields a valid bound — so a badly-ranked α can cost bound
+/// quality but can never produce a wrong verdict. The verdict-grade projection
+/// remains [`AlphaSpecEarlyExit::is_verified`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlphaSpecAscent {
+    /// One row per property row. Each carries its own objective, threshold, and
+    /// direction, so mixed-direction conjunctions are handled per row.
+    pub rows: Vec<AlphaSpecEarlyExit>,
+}
+
+impl AlphaSpecAscent {
+    /// Fail-closed constructor: `None` unless there is at least one row and every
+    /// row shares one non-zero objective width.
+    #[must_use]
+    pub fn new(rows: Vec<AlphaSpecEarlyExit>) -> Option<Self> {
+        let width = rows.first()?.objective.len();
+        if width == 0 || rows.iter().any(|r| r.objective.len() != width) {
+            return None;
+        }
+        Some(Self { rows })
+    }
+
+    /// The objective width every row shares.
+    #[must_use]
+    pub fn output_len(&self) -> usize {
+        self.rows.first().map_or(0, |r| r.objective.len())
+    }
+
+    /// Hinge score `Σ_r min(0, slack_r)`: always `<= 0`, and `== 0` exactly when
+    /// every row already clears its threshold.
+    ///
+    /// Only UNPROVEN rows contribute, so ascent effort is never spent padding a
+    /// margin that is already comfortably positive — which is precisely the
+    /// failure mode of summing raw logits. Higher (closer to zero) is better.
+    ///
+    /// Returns `None` if any row fails to project, so the caller keeps its current
+    /// best rather than ranking on a partial score.
+    #[must_use]
+    pub fn hinge_score(&self, lower: &[f32], upper: &[f32]) -> Option<f32> {
+        let mut acc = 0.0f64;
+        for row in &self.rows {
+            acc += f64::from(row.margin_slack(lower, upper)?).min(0.0);
+        }
+        let score = acc as f32;
+        score.is_finite().then_some(score)
+    }
+
+    /// Count of rows already clearing their threshold. Telemetry only.
+    #[must_use]
+    pub fn verified_rows(&self, lower: &[f32], upper: &[f32]) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| {
+                r.project_bounds(lower, upper)
+                    .is_some_and(|(lo, hi)| r.is_verified(lo, hi))
+            })
+            .count()
     }
 }
 
@@ -169,6 +272,15 @@ impl Default for AlphaCrownIntermediate {
     }
 }
 
+/// Compact lower-A columns used only by analytical beta gradients.
+#[derive(Debug, Clone)]
+struct GraphBetaSparseA {
+    /// Global input-flat neuron indices, strictly ascending and duplicate-free.
+    neuron_indices: Vec<usize>,
+    /// One compact column per `neuron_indices` entry.
+    values: Array2<f32>,
+}
+
 /// Intermediate values stored during DAG α-CROWN backward pass for chain-rule gradient computation.
 ///
 /// Unlike `AlphaCrownIntermediate` which uses Vec for sequential networks, this uses HashMap
@@ -197,6 +309,11 @@ pub struct GraphAlphaCrownIntermediate {
     /// Each entry is ∂(upper_bound)/∂α_upper for each neuron at that ReLU.
     /// Populated when dual-alpha state is provided during the backward pass.
     pub alpha_gradients_upper: std::collections::HashMap<String, Array1<f32>>,
+
+    /// Beta-only compact lower-A columns captured under the default-dark sparse
+    /// Patches gate. Kept private so general graph-alpha consumers cannot mistake
+    /// a partial matrix for the historical full `a_at_relu` relation.
+    beta_sparse_a_at_relu: std::collections::HashMap<String, GraphBetaSparseA>,
 }
 
 impl GraphAlphaCrownIntermediate {
@@ -208,7 +325,53 @@ impl GraphAlphaCrownIntermediate {
             final_bounds: LinearBounds::identity(1),
             alpha_gradients: std::collections::HashMap::new(),
             alpha_gradients_upper: std::collections::HashMap::new(),
+            beta_sparse_a_at_relu: std::collections::HashMap::new(),
         }
+    }
+
+    /// Logical heap payload retained by this intermediate proof object.
+    ///
+    /// This includes every numeric buffer, sparse beta index, map key, and the
+    /// final linear relation. Hash-table buckets and allocator capacity slack
+    /// are intentionally excluded because standard containers do not expose a
+    /// complete resident-byte census; the global CROWN budget leaves seven
+    /// eighths of process headroom for that overhead. Deadline-aware staging
+    /// APIs use this value as their already-live request payload.
+    pub(crate) fn logical_memory_bytes(&self) -> usize {
+        let mut bytes = self.final_bounds.memory_bytes();
+        for (key, values) in &self.a_at_relu {
+            bytes = bytes
+                .saturating_add(key.len())
+                .saturating_add(values.len().saturating_mul(size_of::<f32>()));
+        }
+        for (key, (lower, upper)) in &self.pre_relu_bounds {
+            bytes = bytes
+                .saturating_add(key.len())
+                .saturating_add(lower.len().saturating_mul(size_of::<f32>()))
+                .saturating_add(upper.len().saturating_mul(size_of::<f32>()));
+        }
+        for (key, values) in &self.alpha_gradients {
+            bytes = bytes
+                .saturating_add(key.len())
+                .saturating_add(values.len().saturating_mul(size_of::<f32>()));
+        }
+        for (key, values) in &self.alpha_gradients_upper {
+            bytes = bytes
+                .saturating_add(key.len())
+                .saturating_add(values.len().saturating_mul(size_of::<f32>()));
+        }
+        for (key, sparse) in &self.beta_sparse_a_at_relu {
+            bytes = bytes
+                .saturating_add(key.len())
+                .saturating_add(
+                    sparse
+                        .neuron_indices
+                        .len()
+                        .saturating_mul(size_of::<usize>()),
+                )
+                .saturating_add(sparse.values.len().saturating_mul(size_of::<f32>()));
+        }
+        bytes
     }
 
     /// The A matrix at a specific ReLU node.
@@ -219,6 +382,55 @@ impl GraphAlphaCrownIntermediate {
     /// Pre-ReLU bounds at a specific ReLU node.
     pub fn pre_relu_bounds(&self, node_name: &str) -> Option<&(Array1<f32>, Array1<f32>)> {
         self.pre_relu_bounds.get(node_name)
+    }
+
+    /// Store selected lower-A columns for analytical beta sensitivity.
+    ///
+    /// This crate-private entry point deliberately cannot populate the public
+    /// full-matrix map. Callers must provide canonical sorted global indices and
+    /// a matching compact matrix.
+    pub(crate) fn insert_beta_sparse_a(
+        &mut self,
+        node_name: String,
+        neuron_indices: Vec<usize>,
+        values: Array2<f32>,
+    ) -> bool {
+        if values.ncols() != neuron_indices.len()
+            || !neuron_indices.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return false;
+        }
+        self.a_at_relu.remove(&node_name);
+        self.beta_sparse_a_at_relu.insert(
+            node_name,
+            GraphBetaSparseA {
+                neuron_indices,
+                values,
+            },
+        );
+        true
+    }
+
+    /// Resolve the lower-A column used by beta-gradient consumers.
+    ///
+    /// Dense storage takes precedence and preserves every existing graph-alpha
+    /// path. Compact storage is visible only through this beta-specific accessor.
+    pub(crate) fn beta_a_column(
+        &self,
+        node_name: &str,
+        neuron_idx: usize,
+    ) -> Option<ArrayView1<'_, f32>> {
+        if let Some(dense) = self.a_at_relu.get(node_name) {
+            return (neuron_idx < dense.ncols()).then(|| dense.column(neuron_idx));
+        }
+        let sparse = self.beta_sparse_a_at_relu.get(node_name)?;
+        let compact_col = sparse.neuron_indices.binary_search(&neuron_idx).ok()?;
+        Some(sparse.values.column(compact_col))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_beta_sparse_a(&self, node_name: &str) -> bool {
+        self.beta_sparse_a_at_relu.contains_key(node_name)
     }
 }
 
@@ -320,11 +532,32 @@ fn default_full_conv_alpha() -> bool {
     true
 }
 
+/// Serde/default value for the aggregate DAG reference-refresh budget.
+///
+/// This preserves the historical policy: the complete sequence of refreshes
+/// may consume at most 25% of the root alpha loop's remaining deadline.
+fn default_reference_refresh_fraction() -> f32 {
+    AlphaCrownConfig::DEFAULT_REFERENCE_REFRESH_FRACTION
+}
+
 /// Configuration for alpha-CROWN optimization.
+///
+/// This pre-1.0 configuration surface grows as proof scheduling gains typed
+/// resource and fallback policies. Downstream Rust callers should construct it
+/// from [`Self::default`] and override selected fields instead of using
+/// exhaustive struct literals. Newly added serialized fields carry explicit
+/// serde defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlphaCrownConfig {
     /// Number of optimization iterations.
     pub iterations: usize,
+    /// #spec-axis-alpha (design §4): number of per-spec δ slots. The K worst
+    /// margins at loop entry get private α corrections
+    /// (`α_eff = clamp01(α_base + δ_slot)`); 0 (default) = shared-α behavior,
+    /// byte-identical. Slots update only when the margin-gradient lane binds
+    /// their row, so a nonzero K without that lane is inert by construction.
+    pub alpha_spec_slots: usize,
     /// Learning rate for alpha parameter updates.
     pub learning_rate: f32,
     /// Learning rate decay factor per iteration.
@@ -348,6 +581,36 @@ pub struct AlphaCrownConfig {
     /// This dramatically speeds up initialization for deep networks (10x+ for ResNet-4b).
     /// Set to false for tighter intermediate bounds at the cost of O(N²) initialization.
     pub fix_interm_bounds: bool,
+    /// Root-only cGAN CROWN-IBP collection policy.
+    ///
+    /// When enabled together with `fix_interm_bounds = false`, a sequential
+    /// ConvTranspose graph keeps its certified forward-linear reference map as
+    /// the baseline and spends the root collection budget on one demanded
+    /// ReLU-preactivation target. Only unresolved ReLU rows are sent through
+    /// CROWN when they satisfy the established 90% sparse threshold; otherwise
+    /// that same target uses the dense/chunked collector. A target is published
+    /// only after its selected row set completes, then its enclosure is
+    /// intersected with the baseline and propagated through downstream nodes.
+    ///
+    /// This policy is deliberately category-shaped and default-dark. Child
+    /// input-split warm starts clear it explicitly and retain
+    /// `fix_interm_bounds = true`, so they continue to use the cheap
+    /// forward-linear route.
+    #[serde(default)]
+    pub cgan_sparse_target_complete_root: bool,
+    /// Root-only cGAN complete CROWN-IBP cascade.
+    ///
+    /// The collector starts from the certified forward-linear map, tightens
+    /// every demanded pre-activation target in topological order, and reuses
+    /// the resulting shrink-only map for the root objective. Child input-split
+    /// warm starts clear this flag explicitly, so their inexpensive
+    /// forward-linear route is unchanged.
+    ///
+    /// This is distinct from [`Self::cgan_sparse_target_complete_root`]: the
+    /// sparse policy deliberately buys one target, while this policy pays for
+    /// the complete cascade needed by the cGAN root certificate.
+    #[serde(default)]
+    pub cgan_complete_crown_ibp_root: bool,
     /// Sparse alpha optimization: only optimize the top K% most influential alphas.
     ///
     /// After the first iteration, alphas are ranked by gradient magnitude and only
@@ -444,8 +707,8 @@ pub struct AlphaCrownConfig {
 
     /// INVPROP configuration for output constraint backward propagation.
     ///
-    /// When enabled, output constraints (A·y <= rhs) are propagated backward
-    /// to tighten intermediate bounds before BaB.
+    /// When enabled, the candidate violation constraints (`A·y <= rhs`) are
+    /// propagated backward to tighten the region that remains for BaB.
     ///
     /// Default: disabled (InvpropConfig::default())
     #[serde(default)]
@@ -453,9 +716,14 @@ pub struct AlphaCrownConfig {
 
     /// Output constraints for INVPROP optimization.
     ///
-    /// When set and `invprop.enabled` is true, these constraints are used
-    /// to initialize ny dual variables and optimize them alongside alphas.
-    /// This implements the incomplete verifier integration for INVPROP (#371).
+    /// [`OutputConstraints`] is a generic linear-region representation, but
+    /// this verifier-facing field has a strict polarity contract: its
+    /// conjunctive inequalities describe the candidate **violation** region.
+    /// When `invprop.enabled` is true, they initialize nonnegative duals that
+    /// condition backward propagation on that region and are optimized
+    /// alongside alphas. Certifying the conditioned region infeasible proves
+    /// that the original property holds; supplying the property-holding region
+    /// here would reverse that reasoning.
     ///
     /// Default: None (no output constraints)
     #[serde(skip)]
@@ -490,6 +758,98 @@ pub struct AlphaCrownConfig {
     #[serde(default = "default_full_conv_alpha")]
     pub full_conv_alpha: bool,
 
+    /// Fraction of the root alpha loop's remaining deadline assigned to the
+    /// complete sequence of intermediate reference-bound refreshes.
+    ///
+    /// This is one aggregate pool, not a fresh fraction per iteration. Valid
+    /// values are in `[0.01, 1.0]`. The default `0.25` preserves the historical
+    /// scheduling policy for every preset that does not opt in.
+    #[serde(default = "default_reference_refresh_fraction")]
+    pub reference_refresh_fraction: f32,
+
+    /// #joint-interm-alpha: recompute the INTERMEDIATE bounds with the CURRENT
+    /// alpha every `k` ascent iterations, making the ascent a block-coordinate
+    /// (Gauss-Seidel) optimization over BOTH alpha and the relaxation instead of
+    /// an optimization of alpha over a relaxation that is frozen forever.
+    ///
+    /// `0` (default) = legacy: the historical `improved_output`-gated refresh.
+    /// `k >= 1` = joint mode, refresh on every `k`-th iteration.
+    ///
+    /// # Why this is the algorithm, not a schedule knob
+    ///
+    /// ny builds its intermediate map ONCE, before the ascent, from a
+    /// forward-linear reference computed with **no alpha at all**, then sets
+    /// `fix_interm_bounds` and reads that frozen map on every iteration. So the
+    /// ascent solves
+    ///
+    /// ```text
+    ///     max_alpha  f(alpha ; I_0)          I_0 fixed, alpha-independent
+    /// ```
+    ///
+    /// alpha-beta-CROWN instead deletes every cached intermediate bound each
+    /// iteration and recomputes it under autograd with the current alpha, so it
+    /// solves `max_alpha f(alpha ; I(alpha))`. Reviewing its source against ours:
+    /// *"a reimplementation that computes intermediate bounds once and then only
+    /// optimizes the last-layer slopes is solving a strictly weaker problem, and
+    /// no amount of extra iterations or throughput on that problem will close the
+    /// gap."* That is the measured situation — 20 abc iterations reach ~91/99 at
+    /// the root where ny reaches 0/99, and ny's own uncapped 3242s ascent moved
+    /// the scored frontier by exactly zero.
+    ///
+    /// ny has no autograd, so the gradient route through `I(alpha)` is not
+    /// available here (that needs a second adjoint harvest — see the ladder in
+    /// the design notes). What IS available, and is what this key turns on, is
+    /// the alternating form: ascend alpha, rebuild `I` at the new alpha, ascend
+    /// again on the tighter relaxation. Block-coordinate ascent on the same
+    /// objective — strictly stronger than holding `I` at `I_0`, and it is also
+    /// the mechanism behind abc's own `best_intermediate_bounds` carry-forward
+    /// (`optimized_bounds.py:338-367,500-615`), which this codebase already
+    /// ported in `reference_bounds.rs` and then left disarmed.
+    ///
+    /// # Soundness
+    ///
+    /// Neutral, on three legs: every alpha is clamped to `[0,1]` and any such
+    /// alpha is a certified-sound relaxation (`alpha_sound_regardless`, machine
+    /// checked); the commit path is `merge_tighter_bounds`, an element-wise
+    /// max/min that can only shrink the box; and every refusal (deadline,
+    /// capacity, shape) keeps the previous sound reference. Refreshing more often
+    /// therefore trades schedule for tightness and can never trade soundness.
+    #[serde(default)]
+    pub joint_interm_alpha_every: usize,
+
+    /// Optional absolute ceiling, in seconds, on the same aggregate reference-
+    /// refresh pool. The effective pool is
+    /// `min(remaining * reference_refresh_fraction, max_secs)`.
+    ///
+    /// `None` preserves the fraction-only default. `Some(0)` deliberately
+    /// disables refresh work while retaining the previous sound reference map.
+    /// This affects scheduling only; every completed candidate remains the same
+    /// certified enclosure.
+    #[serde(default)]
+    pub reference_refresh_max_secs: Option<u64>,
+
+    /// On a deadline refusal from the preferred forward-linear intermediate
+    /// collector, return a plain IBP reference map instead of entering the
+    /// historical CROWN-IBP fallback.
+    ///
+    /// This is a scheduling-only endgame policy for small-input image graphs:
+    /// both maps are certified enclosures, while IBP is generally looser and
+    /// much cheaper. It is default-off so callers and presets that do not opt
+    /// in preserve the historical fallback and bound quality exactly.
+    #[serde(default)]
+    pub forward_linear_deadline_fallback_to_ibp: bool,
+
+    /// Root-bootstrap scheduling hint: when the caller will retain only the
+    /// initialized alpha state and the fixed intermediate reference map, a
+    /// zero-update DAG collection may skip its otherwise-obligatory initial
+    /// output CROWN evaluation.
+    ///
+    /// This is deliberately runtime-only and defaults off. Direct bounds-only
+    /// callers preserve the historical `iterations == 0` contract: evaluate
+    /// the initial CROWN slopes once and return that bound.
+    #[serde(skip)]
+    pub skip_zero_iteration_collection_initial_bound: bool,
+
     /// Wall-clock deadline for alpha optimization (#2698).
     ///
     /// When set, the optimization loop checks this deadline at the start of each
@@ -509,6 +869,39 @@ pub struct AlphaCrownConfig {
     /// over-approximation. `None` (every non-warmup caller) → no behavior change.
     #[serde(skip)]
     pub spec_early_exit: Option<AlphaSpecEarlyExit>,
+
+    /// Optional multi-row spec objective for RANKING α iterates in the root warmup
+    /// (#root-alpha-margin). When `Some` and the effective gate is armed by the
+    /// typed preset default or `NY_ROOT_ALPHA_MARGIN`, the DAG warmup scores each
+    /// iterate with [`AlphaSpecAscent::hinge_score`] and returns the best-scoring
+    /// α instead of the last one.
+    ///
+    /// SELECTION ONLY — see [`AlphaSpecAscent`]. `None` (every caller today) ⇒ the
+    /// loop's objective, early stop, and returned α are byte-identical to the
+    /// legacy raw-sum path.
+    #[serde(skip)]
+    pub spec_ascent: Option<AlphaSpecAscent>,
+
+    /// Preset-supplied default for #root-alpha-margin (rank the root warmup's α iterates by
+    /// the spec objective and keep the best, rather than the last iterate).
+    ///
+    /// `NY_ROOT_ALPHA_MARGIN` still overrides this in both directions. Default `false`, so a
+    /// config that never names it is byte-identical.
+    #[serde(default)]
+    pub root_alpha_margin: bool,
+
+    /// Preset-supplied default for #alpha-zero-yield: retire the root α ascent after this
+    /// fraction of its own window passes with no improvement over the best iterate, returning
+    /// the remaining window to search. Sound by construction — the early exit returns the
+    /// already-certified elementwise best. Stopping sooner can return a looser certified
+    /// enclosure; it cannot manufacture an invalid bound.
+    ///
+    /// Valid range `(0.0, 0.9)`; see [`AlphaCrownConfig::alpha_zero_yield_frac_is_valid`].
+    /// `NY_ALPHA_ZERO_YIELD_FRAC` still overrides this wherever it is PRESENT, including as a
+    /// kill switch (any invalid value, e.g. `0`, disarms a preset-armed fraction). Default
+    /// `None`, so a config that never names it is byte-identical.
+    #[serde(default)]
+    pub alpha_zero_yield_frac: Option<f64>,
 }
 
 impl Default for AlphaCrownConfig {
@@ -518,6 +911,8 @@ impl Default for AlphaCrownConfig {
             // Early stop patience (10) terminates early when bounds converge.
             // Source: alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/arguments.py:354 (init_iteration=100).
             iterations: 100,
+            // Spec-axis δ is opt-in per category (#spec-axis-alpha).
+            alpha_spec_slots: 0,
             // α,β-CROWN default: lr_init_alpha=0.1.
             // Source: alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/arguments.py:351.
             learning_rate: 0.1,
@@ -533,6 +928,12 @@ impl Default for AlphaCrownConfig {
             // Default to true: use IBP bounds for intermediates (fast O(N)).
             // Matches α,β-CROWN's fix_interm_bounds=True default.
             fix_interm_bounds: true,
+            // cGAN single-target root collection is a measurement-only policy
+            // until a sealed official-budget row converts.
+            cgan_sparse_target_complete_root: false,
+            // Complete cGAN root collection is separately default-dark until
+            // its production-shaped official-row A/B passes.
+            cgan_complete_crown_ibp_root: false,
             // Sparse optimization: focus on top 30% most influential alphas.
             // Reduces SPSA variance when perturbing fewer coordinates.
             sparse_ratio: 0.3,
@@ -576,17 +977,71 @@ impl Default for AlphaCrownConfig {
             // Setting false enables channel-shared alpha (63x fewer params for cifar100).
             // Source: alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/arguments.py:348.
             full_conv_alpha: true,
+            // One cumulative 25%-of-remaining reference-refresh pool with no
+            // absolute ceiling. Presets may add a ceiling for categories where
+            // refresh cost scales with a long official budget but does not
+            // improve the retained bounds.
+            reference_refresh_fraction: default_reference_refresh_fraction(),
+            // Default OFF: byte-identical to the historical improved_output gate.
+            joint_interm_alpha_every: 0,
+            reference_refresh_max_secs: None,
+            // Preserve the historical forward-linear -> CROWN-IBP refusal
+            // chain unless a measured category opts into the cheaper sound
+            // endgame fallback.
+            forward_linear_deadline_fallback_to_ibp: false,
+            // Ordinary zero-iteration callers still consume the initial CROWN
+            // evaluation. The graph-BaB bootstrap opts into skipping it only
+            // for its fixed-intermediate collection route.
+            skip_zero_iteration_collection_initial_bound: false,
             // No deadline by default (run all iterations)
             deadline: None,
             // No spec early-exit by default: warmup runs to the iteration/time cap
             // exactly as before. Set programmatically by the single-objective ReLU-split
             // warmup so it can stop once the root bound clears the threshold.
             spec_early_exit: None,
+            spec_ascent: None,
+            root_alpha_margin: false,
+            alpha_zero_yield_frac: None,
         }
     }
 }
 
 impl AlphaCrownConfig {
+    /// Historical aggregate reference-refresh share.
+    pub const DEFAULT_REFERENCE_REFRESH_FRACTION: f32 = 0.25;
+
+    /// Lowest useful configured reference-refresh fraction. Matches the
+    /// historical environment override parser.
+    pub const MIN_REFERENCE_REFRESH_FRACTION: f32 = 0.01;
+
+    /// Whether a configured aggregate refresh fraction is finite and within
+    /// the supported scheduling range.
+    pub fn reference_refresh_fraction_is_valid(fraction: f32) -> bool {
+        fraction.is_finite() && (Self::MIN_REFERENCE_REFRESH_FRACTION..=1.0).contains(&fraction)
+    }
+
+    /// Whether a configured #alpha-zero-yield fraction is admissible. Matches
+    /// the historical `NY_ALPHA_ZERO_YIELD_FRAC` parser exactly: finite,
+    /// strictly positive, strictly below 0.9 (retiring the ascent at >=90% of
+    /// its own window would be indistinguishable from the deadline it exists
+    /// to preempt).
+    pub fn alpha_zero_yield_frac_is_valid(fraction: f64) -> bool {
+        fraction.is_finite() && fraction > 0.0 && fraction < 0.9
+    }
+
+    /// Resolve a directly-constructed or deserialized fraction fail-closed.
+    ///
+    /// Preset application rejects malformed values. This defensive fallback
+    /// protects programmatic callers that construct the public config directly:
+    /// an invalid value cannot disable or monopolize refresh scheduling.
+    pub fn resolved_reference_refresh_fraction(&self) -> f32 {
+        if Self::reference_refresh_fraction_is_valid(self.reference_refresh_fraction) {
+            self.reference_refresh_fraction
+        } else {
+            default_reference_refresh_fraction()
+        }
+    }
+
     /// Whether best bounds should be saved at the given iteration.
     ///
     /// Matches α,β-CROWN's `start_save_best` skip window (auto_LiRPA

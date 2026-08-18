@@ -146,13 +146,13 @@ impl GraphNetwork {
         );
 
         // Apply gate Linear projection (full scale — exact)
-        let gate_z = base_z.linear(&gate_linear.weight, gate_linear.bias.as_ref())?;
+        let gate_z = base_z.linear(gate_linear.weight(), gate_linear.bias())?;
 
         // Apply SiLU to gate at full scale — correct because silu is nonlinear
         let silu_z = gate_z.silu_affine()?;
 
         // Apply up Linear projection (full scale — exact)
-        let up_z = base_z.linear(&up_linear.weight, up_linear.bias.as_ref())?;
+        let up_z = base_z.linear(up_linear.weight(), up_linear.bias())?;
 
         // Normalize both sides before the quadratic multiplication to prevent
         // cross-term overflow, then scale back by s² (exact: (a/s)*(b/s)*s² = a*b)
@@ -310,13 +310,13 @@ impl GraphNetwork {
         );
 
         // Apply gate Linear projection (full scale — exact)
-        let gate_z = base_z.linear(&gate_linear.weight, gate_linear.bias.as_ref())?;
+        let gate_z = base_z.linear(gate_linear.weight(), gate_linear.bias())?;
 
         // Apply SiLU to gate at full scale — correct because silu is nonlinear
         let silu_z = gate_z.silu_affine()?;
 
         // Apply up Linear projection (full scale — exact)
-        let up_z = base_z.linear(&up_linear.weight, up_linear.bias.as_ref())?;
+        let up_z = base_z.linear(up_linear.weight(), up_linear.bias())?;
 
         // Normalize both sides before the quadratic multiplication to prevent
         // cross-term overflow, then scale back by s² (exact: (a/s)*(b/s)*s² = a*b)
@@ -507,13 +507,13 @@ impl GraphNetwork {
         );
 
         // Apply gate Linear projection (full scale — exact)
-        let gate_z = base_z.linear(&gate_linear.weight, gate_linear.bias.as_ref())?;
+        let gate_z = base_z.linear(gate_linear.weight(), gate_linear.bias())?;
 
         // Apply SiLU to gate at full scale — correct because silu is nonlinear
         let silu_z = gate_z.silu_affine()?;
 
         // Apply up Linear projection (full scale — exact)
-        let up_z = base_z.linear(&up_linear.weight, up_linear.bias.as_ref())?;
+        let up_z = base_z.linear(up_linear.weight(), up_linear.bias())?;
 
         // Normalize both sides before the quadratic multiplication to prevent
         // cross-term overflow, then scale back by s² (exact: (a/s)*(b/s)*s² = a*b)
@@ -537,7 +537,7 @@ impl GraphNetwork {
 
         // Apply down Linear projection (the key extension!)
         // Now swiglu_z is at correct magnitude, so bias is applied correctly.
-        let down_z = swiglu_z.linear(&down_linear.weight, down_linear.bias.as_ref())?;
+        let down_z = swiglu_z.linear(down_linear.weight(), down_linear.bias())?;
 
         let result = down_z.to_bounded_tensor()?;
 

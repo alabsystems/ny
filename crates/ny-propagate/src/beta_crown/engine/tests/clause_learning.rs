@@ -375,7 +375,7 @@ fn test_verify_gate_on_vs_off_identical_verdicts() {
         // decided variants exactly.
         if matches!(
             off.result,
-            BabVerificationStatus::Verified | BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::Verified | BabVerificationStatus::PotentialViolation { .. }
         ) {
             assert_eq!(off.result, on.result);
         }

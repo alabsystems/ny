@@ -170,7 +170,7 @@ fn compare_interval_bounds(l: f32, u: f32, t: f32, op: CompareOp) -> (f32, f32) 
 /// Piecewise-constant: zero slope in the general case.
 /// Determined case (constant output across entire domain): exact.
 /// Undetermined case (straddles threshold): lower=0, upper=1 (IBP fallback).
-fn compare_crown_relaxation(l: f32, u: f32, t: f32, op: CompareOp) -> LinearRelaxation {
+pub(crate) fn compare_crown_relaxation(l: f32, u: f32, t: f32, op: CompareOp) -> LinearRelaxation {
     let (out_l, out_u) = compare_interval_bounds(l, u, t, op);
     // Determined case: both bounds equal, exact relaxation
     // slope = 0, intercept = constant value

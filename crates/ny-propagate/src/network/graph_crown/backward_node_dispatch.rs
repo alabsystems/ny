@@ -12,20 +12,26 @@
 //! Part of #3935 / design: `designs/2026-03-16-graph-crown-backward-loop-dedup.md`
 
 use crate::bounds::patches::CrownBounds;
-use crate::bounds::LinearBounds;
+use crate::bounds::{certified_affine_sum_f32, LinearBounds, OutwardDirection};
 use crate::layers::{BoundPropagation, Layer};
 use crate::network::backward_dispatch::{
-    dispatch_backward_layer, BackwardDispatchResult, DispatchContext,
+    dispatch_backward_layer, dispatch_backward_layer_finite_boundary, BackwardDispatchResult,
+    DispatchContext,
 };
 use crate::network::core::graph::{graph_crown_dispatch_fallback_reason, GraphNode};
 use crate::network::core::GraphNetwork;
 use crate::types::CrownIbpFallbackReason;
 use crate::MulBinaryRelaxationMode;
 
-use ndarray::{Array1, Array2};
-use ny_core::{GemmEngine, NyError, Result};
+use ndarray::{Array1, Array2, ArrayD, Ix1};
+use ny_core::{
+    dd::{next_down_f64, next_up_f64, two_prod, two_sum},
+    GemmEngine, NyError, Result,
+};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -76,14 +82,16 @@ pub(super) fn try_patches_reentry(
     node_name: &str,
     use_patches_mode: bool,
     label: &str,
+    deadline: Option<Instant>,
 ) {
-    crate::network::core::try_dense_spatial_patches_reentry(
+    crate::network::core::try_dense_spatial_patches_reentry_with_deadline(
         node_cb,
         node,
         node_name,
         node_bounds,
         use_patches_mode,
         label,
+        deadline,
     );
 }
 
@@ -105,20 +113,89 @@ pub(super) enum SharedDispatchResult {
     IbpFallback(CrownIbpFallbackReason),
 }
 
-/// Convert a node's current linear form into constant bias bounds.
-pub(crate) fn concretized_node_bias(
+pub(crate) fn concretized_node_bias_with_deadline(
     node_lb: &LinearBounds,
     node_output_bounds: &BoundedTensor,
-) -> ConcretizedBias {
-    let concretized = node_lb.concretize_sound(node_output_bounds).flatten();
-    ConcretizedBias {
-        lower: Box::new(Array1::from_vec(
-            concretized.lower().iter().copied().collect(),
-        )),
-        upper: Box::new(Array1::from_vec(
-            concretized.upper().iter().copied().collect(),
-        )),
+    deadline: Option<Instant>,
+) -> Result<ConcretizedBias> {
+    let concretized = node_lb.concretize_sound_with_deadline(node_output_bounds, deadline)?;
+    check_node_deadline(deadline, "before concretized-bias publication")?;
+    let (lower, upper) = concretized.into_parts();
+    let lower = lower.into_dimensionality::<Ix1>().map_err(|error| {
+        NyError::InternalError(format!(
+            "graph CROWN concretized lower bias was not one-dimensional: {error}"
+        ))
+    })?;
+    let upper = upper.into_dimensionality::<Ix1>().map_err(|error| {
+        NyError::InternalError(format!(
+            "graph CROWN concretized upper bias was not one-dimensional: {error}"
+        ))
+    })?;
+    check_node_deadline(deadline, "after concretized-bias publication")?;
+    Ok(ConcretizedBias {
+        lower: Box::new(lower),
+        upper: Box::new(upper),
+    })
+}
+
+#[inline]
+fn check_node_deadline(deadline: Option<Instant>, phase: &'static str) -> Result<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        Err(NyError::DeadlineExceeded(format!(
+            "graph CROWN node dispatch: deadline exceeded {phase}"
+        )))
+    } else {
+        Ok(())
     }
+}
+
+fn flat_values_with_deadline<'a>(
+    values: &'a ArrayD<f32>,
+    deadline: Option<Instant>,
+    retained_base_bytes: usize,
+    phase: &'static str,
+) -> Result<Cow<'a, [f32]>> {
+    if let Some(slice) = values.as_slice() {
+        return Ok(Cow::Borrowed(slice));
+    }
+    let source_bytes = values.len().saturating_mul(size_of::<f32>());
+    let required_bytes = retained_base_bytes
+        .saturating_add(source_bytes)
+        .saturating_add(source_bytes);
+    let budget_bytes = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
+    if required_bytes > budget_bytes {
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+            site: "graph CROWN non-contiguous node-bound flatten",
+        });
+    }
+    let mut copied = Vec::new();
+    copied
+        .try_reserve_exact(values.len())
+        .map_err(|_| NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+            site: "graph CROWN non-contiguous node-bound flatten",
+        })?;
+    let actual_required_bytes = retained_base_bytes
+        .saturating_add(source_bytes)
+        .saturating_add(copied.capacity().saturating_mul(size_of::<f32>()));
+    if actual_required_bytes > budget_bytes {
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes: actual_required_bytes,
+            budget_bytes,
+            site: "graph CROWN non-contiguous node-bound flatten",
+        });
+    }
+    for (index, value) in values.iter().copied().enumerate() {
+        if index & 1023 == 0 {
+            check_node_deadline(deadline, phase)?;
+        }
+        copied.push(value);
+    }
+    check_node_deadline(deadline, phase)?;
+    Ok(Cow::Owned(copied))
 }
 
 /// Concretized bias bounds from a node's linear form.
@@ -133,6 +210,51 @@ pub(crate) enum DivBackwardResult {
     ConcretizeCurrentNode(ConcretizedBias),
 }
 
+#[inline]
+fn nonnegative_add_up(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+        return f64::INFINITY;
+    }
+    let (sum, residual) = two_sum(a, b);
+    if !sum.is_finite() {
+        f64::INFINITY
+    } else if residual > 0.0 {
+        next_up_f64(sum)
+    } else {
+        sum
+    }
+}
+
+#[inline]
+fn nonnegative_mul_up(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+        return f64::INFINITY;
+    }
+    let (product, residual) = two_prod(a, b);
+    if !product.is_finite() {
+        f64::INFINITY
+    } else if residual > 0.0 {
+        next_up_f64(product)
+    } else {
+        product
+    }
+}
+
+#[inline]
+fn scaled_coefficient_with_gap(a: f32, midpoint: f64) -> (f32, f64) {
+    if !a.is_finite() || !midpoint.is_finite() {
+        return (f32::NAN, f64::INFINITY);
+    }
+    let (product, product_residual) = two_prod(f64::from(a), midpoint);
+    let stored = product as f32;
+    if !stored.is_finite() {
+        return (stored, f64::INFINITY);
+    }
+    let (cast_gap_hi, cast_gap_lo) = two_sum(f64::from(stored), -product);
+    let cast_gap = nonnegative_add_up(cast_gap_hi.abs(), cast_gap_lo.abs());
+    (stored, nonnegative_add_up(cast_gap, product_residual.abs()))
+}
+
 /// Mirror the graph-alpha reciprocal-scaling Div helper for graph CROWN.
 pub(crate) fn backward_div_to_numerator(
     node_lb: &LinearBounds,
@@ -140,6 +262,66 @@ pub(crate) fn backward_div_to_numerator(
     input_b_bounds: &BoundedTensor,
     node_output_bounds: &BoundedTensor,
 ) -> Result<DivBackwardResult> {
+    backward_div_to_numerator_with_deadline(
+        node_lb,
+        input_a_bounds,
+        input_b_bounds,
+        node_output_bounds,
+        None,
+    )
+}
+
+pub(crate) fn backward_div_to_numerator_with_deadline(
+    node_lb: &LinearBounds,
+    input_a_bounds: &BoundedTensor,
+    input_b_bounds: &BoundedTensor,
+    node_output_bounds: &BoundedTensor,
+    deadline: Option<Instant>,
+) -> Result<DivBackwardResult> {
+    // The reciprocal transform below has several legacy nested-Vec/grouping
+    // kernels that are not cooperatively pollable. Under finite authority use
+    // the established sound per-node concretization fallback before any clone,
+    // coefficient-error fold, broadcast scratch, or reciprocal allocation.
+    if deadline.is_some() {
+        return concretized_node_bias_with_deadline(node_lb, node_output_bounds, deadline)
+            .map(DivBackwardResult::ConcretizeCurrentNode);
+    }
+
+    // The reciprocal transform does not propagate coefficient-error matrices.
+    // Discharge them over the Div output box first; this converts the carried
+    // uncertainty into an ordinary outward bias penalty that the transform keeps.
+    check_node_deadline(deadline, "before Div coefficient-error staging")?;
+    let mut discharged_node_lb = node_lb.clone();
+    check_node_deadline(deadline, "after Div coefficient-error staging")?;
+    if discharged_node_lb.has_coeff_err() {
+        let output_lower = flat_values_with_deadline(
+            node_output_bounds.lower(),
+            deadline,
+            node_lb
+                .memory_bytes()
+                .saturating_add(node_output_bounds.len().saturating_mul(size_of::<f32>())),
+            "while flattening Div output lower bounds",
+        )?;
+        let lower_clone_bytes = matches!(&output_lower, Cow::Owned(_))
+            .then_some(output_lower.len().saturating_mul(size_of::<f32>()))
+            .unwrap_or(0);
+        let output_upper = flat_values_with_deadline(
+            node_output_bounds.upper(),
+            deadline,
+            node_lb
+                .memory_bytes()
+                .saturating_add(node_output_bounds.len().saturating_mul(size_of::<f32>()))
+                .saturating_add(lower_clone_bytes),
+            "while flattening Div output upper bounds",
+        )?;
+        discharged_node_lb.fold_coeff_err_into_bias(&output_lower, &output_upper);
+    }
+    let node_lb = &discharged_node_lb;
+    let concretize_current = || {
+        concretized_node_bias_with_deadline(node_lb, node_output_bounds, deadline)
+            .map(DivBackwardResult::ConcretizeCurrentNode)
+    };
+
     let b_lower_flat = input_b_bounds
         .lower()
         .as_slice()
@@ -149,19 +331,25 @@ pub(crate) fn backward_div_to_numerator(
         .as_slice()
         .ok_or_else(|| NyError::InternalError("Div denominator upper not contiguous".into()))?;
 
-    // Sound only when the denominator interval is sign-definite (0 ∉ [ly, uy]),
-    // i.e. every element is strictly positive OR every element is strictly
-    // negative. A mixed-sign or zero-touching denominator makes 1/y unbounded,
-    // so we keep the sound concretization fallback. Reciprocal-scaling below is
-    // identical for both signs: r = 1/y ∈ [1/uy, 1/ly] (recip is monotone
-    // increasing on each side of zero), r_mid carries the sign of 1/y and
-    // r_delta ≥ 0 is the half-width error radius — sign-independent (#Div-neg).
-    let all_pos = b_lower_flat.iter().all(|&v| v > 0.0);
-    let all_neg = b_upper_flat.iter().all(|&v| v < 0.0);
-    if !(all_pos || all_neg) {
-        return Ok(DivBackwardResult::ConcretizeCurrentNode(
-            concretized_node_bias(node_lb, node_output_bounds),
-        ));
+    let denominator_valid = b_lower_flat
+        .iter()
+        .zip(b_upper_flat)
+        .all(|(&lower, &upper)| lower.is_finite() && upper.is_finite() && lower <= upper);
+    if !denominator_valid {
+        return concretize_current();
+    }
+
+    // Sound only when every denominator element is sign-definite
+    // (0 ∉ [ly, uy]). Different broadcast elements may lie on different sides
+    // of zero; the reciprocal center/radius construction is element-local and
+    // remains valid for that useful mixed-sign-tensor case. An individual
+    // zero-touching interval still requires concretization.
+    let every_element_sign_definite = b_lower_flat
+        .iter()
+        .zip(b_upper_flat)
+        .all(|(&lower, &upper)| lower > 0.0 || upper < 0.0);
+    if !every_element_sign_definite {
+        return concretize_current();
     }
 
     let num_lower_flat = input_a_bounds
@@ -172,16 +360,55 @@ pub(crate) fn backward_div_to_numerator(
         .upper()
         .as_slice()
         .ok_or_else(|| NyError::InternalError("Div numerator upper not contiguous".into()))?;
-
-    let n = node_lb.num_inputs();
-    if num_lower_flat.len() != n {
-        return Ok(DivBackwardResult::ConcretizeCurrentNode(
-            concretized_node_bias(node_lb, node_output_bounds),
-        ));
+    let numerator_valid = num_lower_flat
+        .iter()
+        .zip(num_upper_flat)
+        .all(|(&lower, &upper)| lower.is_finite() && upper.is_finite() && lower <= upper);
+    if !numerator_valid {
+        return concretize_current();
     }
 
-    let recip_lower: Vec<f64> = b_upper_flat.iter().map(|&v| 1.0 / (v as f64)).collect();
-    let recip_upper: Vec<f64> = b_lower_flat.iter().map(|&v| 1.0 / (v as f64)).collect();
+    let n = node_lb.num_inputs();
+    if n == 0 || num_lower_flat.len() != n {
+        return concretize_current();
+    }
+
+    // Validate the exact ONNX-style denominator broadcast before mapping flat
+    // output columns into denominator groups.  Ignoring an extra leading axis or
+    // an oversized broadcast dimension would otherwise leave some denominator
+    // elements unused and publish a relaxation for different semantics.
+    let b_shape_raw = input_b_bounds.shape();
+    let out_shape: Vec<usize> = node_output_bounds.shape().to_vec();
+    let Some(out_len) = out_shape
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+    else {
+        return concretize_current();
+    };
+    let ndim = out_shape.len();
+    if out_len != n || b_shape_raw.len() > ndim {
+        return concretize_current();
+    }
+    let mut b_shape_aligned = vec![1usize; ndim];
+    for (i, &size) in b_shape_raw.iter().rev().enumerate() {
+        b_shape_aligned[ndim - 1 - i] = size;
+    }
+    if b_shape_aligned
+        .iter()
+        .zip(&out_shape)
+        .any(|(&denominator, &output)| denominator != 1 && denominator != output)
+    {
+        return concretize_current();
+    }
+
+    let recip_lower: Vec<f64> = b_upper_flat
+        .iter()
+        .map(|&v| next_down_f64(1.0 / f64::from(v)))
+        .collect();
+    let recip_upper: Vec<f64> = b_lower_flat
+        .iter()
+        .map(|&v| next_up_f64(1.0 / f64::from(v)))
+        .collect();
     let num_abs_max: Vec<f64> = num_lower_flat
         .iter()
         .zip(num_upper_flat.iter())
@@ -197,18 +424,10 @@ pub(crate) fn backward_div_to_numerator(
     let r_delta: Vec<f64> = recip_lower
         .iter()
         .zip(recip_upper.iter())
-        .map(|(&rl, &ru)| (ru - rl) / 2.0)
+        .zip(r_mid.iter())
+        .map(|((&rl, &ru), &mid)| next_up_f64(mid - rl).max(next_up_f64(ru - mid)))
         .collect();
 
-    let b_shape_raw = input_b_bounds.shape();
-    let out_shape: Vec<usize> = node_output_bounds.shape().to_vec();
-    let ndim = out_shape.len();
-    let mut b_shape_aligned = vec![1usize; ndim];
-    for (i, &s) in b_shape_raw.iter().rev().enumerate() {
-        if i < ndim {
-            b_shape_aligned[ndim - 1 - i] = s;
-        }
-    }
     let b_len = b_lower_flat.len();
     let mut groups: Vec<Vec<usize>> = vec![vec![]; b_len];
     for out_flat in 0..n {
@@ -227,9 +446,7 @@ pub(crate) fn backward_div_to_numerator(
             b_stride *= b_shape_aligned[d];
         }
         if b_flat >= b_len {
-            return Ok(DivBackwardResult::ConcretizeCurrentNode(
-                concretized_node_bias(node_lb, node_output_bounds),
-            ));
+            return concretize_current();
         }
         groups[b_flat].push(out_flat);
     }
@@ -241,25 +458,62 @@ pub(crate) fn backward_div_to_numerator(
 
     for spec_idx in 0..node_lb.num_outputs() {
         for g in 0..b_len {
-            let mut lower_abs_sum = 0.0_f64;
-            let mut upper_abs_sum = 0.0_f64;
-
+            let mut lower_center_gap = 0.0;
+            let mut upper_center_gap = 0.0;
             for &elem in &groups[g] {
-                let lo = new_lower_a[[spec_idx, elem]] as f64;
-                let up = new_upper_a[[spec_idx, elem]] as f64;
+                let lo = new_lower_a[[spec_idx, elem]];
+                let up = new_upper_a[[spec_idx, elem]];
 
                 // r_mid is sign-definite (matches the denominator sign) but may
                 // be negative; only require it be finite and nonzero.
                 debug_assert!(r_mid[g].is_finite() && r_mid[g] != 0.0);
-                new_lower_a[[spec_idx, elem]] = next_down_f32((lo * r_mid[g]) as f32);
-                new_upper_a[[spec_idx, elem]] = next_up_f32((up * r_mid[g]) as f32);
-
-                lower_abs_sum += lo.abs() * num_abs_max[elem];
-                upper_abs_sum += up.abs() * num_abs_max[elem];
+                let (scaled_lo, gap_lo) = scaled_coefficient_with_gap(lo, r_mid[g]);
+                let (scaled_up, gap_up) = scaled_coefficient_with_gap(up, r_mid[g]);
+                new_lower_a[[spec_idx, elem]] = scaled_lo;
+                new_upper_a[[spec_idx, elem]] = scaled_up;
+                lower_center_gap = nonnegative_add_up(
+                    lower_center_gap,
+                    nonnegative_mul_up(gap_lo, num_abs_max[elem]),
+                );
+                upper_center_gap = nonnegative_add_up(
+                    upper_center_gap,
+                    nonnegative_mul_up(gap_up, num_abs_max[elem]),
+                );
             }
 
-            new_lower_b[spec_idx] -= next_up_f32((r_delta[g] * lower_abs_sum) as f32);
-            new_upper_b[spec_idx] += next_up_f32((r_delta[g] * upper_abs_sum) as f32);
+            let lower_abs_sum = certified_affine_sum_f32(
+                0.0,
+                groups[g].iter().map(|&elem| {
+                    (
+                        node_lb.lower_a()[[spec_idx, elem]].abs(),
+                        num_abs_max[elem] as f32,
+                    )
+                }),
+                OutwardDirection::Upper,
+            );
+            let upper_abs_sum = certified_affine_sum_f32(
+                0.0,
+                groups[g].iter().map(|&elem| {
+                    (
+                        node_lb.upper_a()[[spec_idx, elem]].abs(),
+                        num_abs_max[elem] as f32,
+                    )
+                }),
+                OutwardDirection::Upper,
+            );
+            let lower_penalty = nonnegative_add_up(
+                nonnegative_mul_up(r_delta[g], lower_abs_sum),
+                lower_center_gap,
+            );
+            let upper_penalty = nonnegative_add_up(
+                nonnegative_mul_up(r_delta[g], upper_abs_sum),
+                upper_center_gap,
+            );
+            new_lower_b[spec_idx] = next_down_f32(next_down_f64(
+                f64::from(new_lower_b[spec_idx]) - lower_penalty,
+            ) as f32);
+            new_upper_b[spec_idx] =
+                next_up_f32(next_up_f64(f64::from(new_upper_b[spec_idx]) + upper_penalty) as f32);
         }
     }
 
@@ -394,7 +648,6 @@ pub(super) fn linear_dimension_mismatch(node: &GraphNode, node_lb: &LinearBounds
 /// Dispatch ReLU backward using reused alpha when available, else the
 /// heuristic `propagate_crown_backward` path.
 pub(super) fn dispatch_relu_backward(
-    cut_fold_scope: crate::beta_crown::bab_cuts::CutFoldScope,
     node: &GraphNode,
     node_lb: &LinearBounds,
     pre_activation: &BoundedTensor,
@@ -405,18 +658,10 @@ pub(super) fn dispatch_relu_backward(
 ) -> Result<NodeDispatchResult> {
     // Verify unary input exists (ReLU is always single-input).
     let _first_input = node.require_unary_input()?;
-    // === Certified Cut-CROWN C2 dark gate (docs/CERTIFIED_CUT_CROWN_DESIGN.md §C2) ===
-    // When NY_CUT_FOLD=1 and a cut set is registered for this ReLU node OF
-    // THIS GRAPH (`cut_fold_scope` — never a same-named node of another
-    // graph), fold the λ-scaled cut weights onto the LOWER-side
-    // POST-activation coefficients (BEFORE relaxation selection — λ·cc
-    // multiplies relu(ẑ), the node output) and the −Σλ·B constant onto the
-    // lower bias. Sound for any λ ≥ 0 with a valid cut bound B
-    // (`cuts_fold_lower_bound`); upper side untouched.
-    // Default OFF: env unset / empty registry ⇒ `None` ⇒ byte-identical path.
-    let cut_folded =
-        crate::beta_crown::bab_cuts::fold_lower_side(cut_fold_scope, node_name, node_lb);
-    let node_lb: &LinearBounds = cut_folded.as_ref().unwrap_or(node_lb);
+    // The legacy Cut-CROWN C2 fold seam used to sit here. It was deleted: its
+    // proof authority was hard-false, so it could only ever return the incoming
+    // `node_lb` untouched, and its arithmetic was experiment-grade (plain f32,
+    // no directed rounding, no widened coefficient error).
     let result = match (&node.layer, alpha_lower) {
         (Layer::ReLU(relu), Some(alpha_lower)) => relu
             .propagate_linear_with_alpha(node_lb, pre_activation, alpha_lower, alpha_upper)
@@ -465,6 +710,10 @@ pub(super) struct SharedDispatchCtx<'a> {
     pub node_bounds: &'a HashMap<String, BoundedTensor>,
     pub engine: Option<&'a dyn GemmEngine>,
     pub node_deadline: Option<Instant>,
+    /// The Dense carrier was transactionally materialized from Patches while
+    /// this node's finite authority was live. Ordinary deadline-bearing Dense
+    /// carriers leave this false and retain the historical dispatch policy.
+    pub finite_structured_boundary: bool,
     pub mul_binary_relaxation: MulBinaryRelaxationMode,
     pub label: &'a str,
 }
@@ -486,6 +735,7 @@ pub(super) fn dispatch_shared_core(ctx: &SharedDispatchCtx<'_>) -> Result<Shared
         node_bounds,
         engine,
         node_deadline,
+        finite_structured_boundary,
         mul_binary_relaxation,
         label,
     } = ctx;
@@ -504,7 +754,13 @@ pub(super) fn dispatch_shared_core(ctx: &SharedDispatchCtx<'_>) -> Result<Shared
         norm_inv_rms_override: None,
     };
 
-    match dispatch_backward_layer(&dispatch_ctx, node_lb) {
+    let dispatch_result = if *finite_structured_boundary {
+        dispatch_backward_layer_finite_boundary(&dispatch_ctx, node_lb)
+    } else {
+        dispatch_backward_layer(&dispatch_ctx, node_lb)
+    };
+
+    match dispatch_result {
         Ok(result) => match result {
             BackwardDispatchResult::Unsupported(reason) => {
                 debug!(

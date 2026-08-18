@@ -657,14 +657,15 @@ fn half_smallest_subnormal(p: FloatPrecision) -> f32 {
 /// dependency on `ny_tensor`. Matches `ny_tensor::rounding::next_up_f32`.
 #[inline]
 fn next_up_f32_local(x: f32) -> f32 {
-    if x.is_nan() || x.is_infinite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff;
+    if magnitude >= f32::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f32::from_bits(1);
     }
-    let bits = x.to_bits();
-    if x.is_sign_positive() {
+    if bits & 0x8000_0000 == 0 {
         f32::from_bits(bits + 1)
     } else {
         f32::from_bits(bits - 1)
@@ -955,14 +956,15 @@ mod tests {
     }
 
     fn next_down_f32_local(x: f32) -> f32 {
-        if x.is_nan() || x.is_infinite() {
+        let bits = x.to_bits();
+        let magnitude = bits & 0x7fff_ffff;
+        if magnitude >= f32::INFINITY.to_bits() {
             return x;
         }
-        if x == 0.0 {
+        if magnitude == 0 {
             return f32::from_bits(0x8000_0001);
         }
-        let bits = x.to_bits();
-        if x.is_sign_positive() {
+        if bits & 0x8000_0000 == 0 {
             f32::from_bits(bits - 1)
         } else {
             f32::from_bits(bits + 1)

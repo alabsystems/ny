@@ -19,6 +19,8 @@ use crate::beta_crown::bab_cuts::GraphCutPool;
 use crate::beta_crown::branching::GraphSplitHistory;
 use crate::beta_crown::state::GraphDomainAlphaState;
 
+use super::{NodeBoundsMap, NodeBoundsView};
+
 ///
 /// Bundles common parameters for graph CROWN propagation to reduce function argument counts.
 /// This struct holds references to propagation context that are typically passed together.
@@ -28,8 +30,11 @@ pub struct GraphCrownContext<'a> {
     pub history: &'a GraphSplitHistory,
     /// Optional cut pool for cutting planes.
     pub cut_pool: Option<&'a GraphCutPool>,
-    /// Optional pre-computed bounds from CROWN-IBP.
-    pub base_bounds: Option<&'a std::collections::HashMap<String, Arc<BoundedTensor>>>,
+    /// Optional pre-computed bounds from CROWN-IBP, exposed only through an
+    /// opaque read-only view over either supported owner. [`Self::new`] keeps
+    /// accepting the legacy standard-map reference; direct struct literals
+    /// must wrap one with [`NodeBoundsView::from_hash_map`].
+    pub base_bounds: Option<NodeBoundsView<'a>>,
     /// Optional GPU/accelerated GEMM engine.
     pub engine: Option<&'a dyn GemmEngine>,
     /// Optional per-domain alpha state for optimized ReLU relaxation slopes.
@@ -55,7 +60,25 @@ impl<'a> GraphCrownContext<'a> {
         Self {
             history,
             cut_pool,
-            base_bounds,
+            base_bounds: base_bounds.map(NodeBoundsView::from_hash_map),
+            engine,
+            alpha_state: None,
+            delta_seeds: None,
+        }
+    }
+
+    /// Create a context borrowing the provenance-tracked multi-objective
+    /// node-bound carrier. Shared propagation receives only a read-only view.
+    pub(crate) fn new_with_node_bounds_map(
+        history: &'a GraphSplitHistory,
+        cut_pool: Option<&'a GraphCutPool>,
+        base_bounds: Option<&'a NodeBoundsMap>,
+        engine: Option<&'a dyn GemmEngine>,
+    ) -> Self {
+        Self {
+            history,
+            cut_pool,
+            base_bounds: base_bounds.map(NodeBoundsView::from_node_bounds_map),
             engine,
             alpha_state: None,
             delta_seeds: None,

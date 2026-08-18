@@ -388,7 +388,11 @@ fn test_batched_graph_dispatches_sigmoid_backward_1840() {
     let layer_names: Vec<String> = vec![];
     let batched = BatchedDomains::from_graph_domains(&domains, &layer_names).unwrap();
 
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    // This is a historical wildcard-dispatch parity test, not a finite-kernel
+    // admission test. Keep both scalar and batched Sigmoid paths on their
+    // ordinary no-deadline implementations.
+    verifier.config.alpha_config.deadline = None;
     let objective = vec![1.0_f32];
 
     let updates = verifier
@@ -756,7 +760,8 @@ fn test_sequential_bab_prefilter_detects_violation_3008() {
     assert!(
         matches!(
             result.result,
-            BabVerificationStatus::PotentialViolation | BabVerificationStatus::Unknown { .. }
+            BabVerificationStatus::PotentialViolation { .. }
+                | BabVerificationStatus::Unknown { .. }
         ),
         "Expected PotentialViolation or Unknown for false property, got {:?}",
         result.result

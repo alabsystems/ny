@@ -177,8 +177,9 @@ fn assert_bounds_match(actual: &BoundedTensor, expected: &BoundedTensor, label: 
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_kokoro_vocoder_graph_model_round_trip_matches_direct_inventory_3923() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let _guard = lock_heavy_avoice_round_trip();
     let baseline = kokoro_fixed_aux_baseline();
     let graph_model =
@@ -196,8 +197,9 @@ fn test_avoice_kokoro_vocoder_graph_model_round_trip_matches_direct_inventory_39
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_kokoro_prefix_energy_graph_model_round_trip_matches_direct_ibp_4100() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let _guard = lock_heavy_avoice_round_trip();
     let (direct_graph, direct_input) = kokoro_prefix_energy_verifier_setup();
     let (round_trip_graph, round_trip_input) =

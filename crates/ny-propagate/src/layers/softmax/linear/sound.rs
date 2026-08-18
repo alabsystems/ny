@@ -13,6 +13,7 @@
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_core::{NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use std::sync::OnceLock;
 
 use crate::bounds::nan_propagating_max;
 use crate::LinearBounds;
@@ -20,6 +21,66 @@ use crate::LinearBounds;
 use super::super::bounds::constant_bounds_from_output;
 use super::super::layer::SoftmaxLayer;
 use super::super::utils;
+
+const SOFTMAX_OBJECTIVE_ENVELOPE_ENV: &str = "NY_SOFTMAX_OBJECTIVE_ENVELOPE";
+
+#[inline]
+pub(super) fn softmax_objective_envelope_gate(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+#[inline]
+fn softmax_objective_envelope_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SOFTMAX_OBJECTIVE_ENVELOPE_TEST_OVERRIDE.with(|cell| cell.get()) {
+        return enabled;
+    }
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        softmax_objective_envelope_gate(
+            std::env::var(SOFTMAX_OBJECTIVE_ENVELOPE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SOFTMAX_OBJECTIVE_ENVELOPE_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run a unit-test closure with a thread-local gate override. This exercises the
+/// real 2-D, N-D, batched, and flat-grouped dispatch without mutating the
+/// process environment seen by parallel tests.
+#[cfg(test)]
+pub(super) fn with_softmax_objective_envelope_for_test<T>(
+    enabled: bool,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset<'a> {
+        cell: &'a std::cell::Cell<Option<bool>>,
+        previous: Option<bool>,
+    }
+
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            self.cell.set(self.previous);
+        }
+    }
+
+    SOFTMAX_OBJECTIVE_ENVELOPE_TEST_OVERRIDE.with(|cell| {
+        let reset = Reset {
+            cell,
+            previous: cell.replace(Some(enabled)),
+        };
+        let result = f();
+        drop(reset);
+        result
+    })
+}
 
 impl SoftmaxLayer {
     pub(super) fn propagate_linear_with_bounds_1d_sound(
@@ -62,7 +123,67 @@ impl SoftmaxLayer {
             return constant_bounds_from_output(bounds, &output_bounds);
         };
 
-        self.apply_affine_bounds(bounds, &lower_a, &lower_b, &upper_a, &upper_b)
+        let lse_candidate =
+            self.apply_affine_bounds(bounds, &lower_a, &lower_b, &upper_a, &upper_b)?;
+        if !softmax_objective_envelope_enabled() {
+            // Keep the historical default-off path byte-identical: the exact
+            // LSE-composed coefficients and biases are returned unchanged.
+            return Ok(lse_candidate);
+        }
+
+        self.select_softmax_objective_envelope(bounds, pre_lower, pre_upper, lse_candidate)
+    }
+
+    /// Select the stronger of two independently sound backward bounds for
+    /// each incoming objective row and each bound direction.
+    ///
+    /// The LSE relaxation retains affine dependence on the logits. The second
+    /// candidate first computes the exact coordinate-wise Softmax interval for
+    /// this 1-D group, then composes the incoming objective with that box as a
+    /// constant bound. Comparing their sound concretizations over the current
+    /// logit box makes the choice local to precisely the domain where either
+    /// candidate is used. A selected side is copied as one complete A row plus
+    /// its bias; coefficients from different candidates are never blended.
+    fn select_softmax_objective_envelope(
+        &self,
+        bounds: &LinearBounds,
+        pre_lower: &Array1<f32>,
+        pre_upper: &Array1<f32>,
+        lse_candidate: LinearBounds,
+    ) -> Result<LinearBounds> {
+        let logit_box =
+            BoundedTensor::new(pre_lower.clone().into_dyn(), pre_upper.clone().into_dyn())?;
+        // This extracted group is always exactly 1-D. Resolve it explicitly as
+        // axis 0; using self.propagate_ibp() here would incorrectly reinterpret
+        // a positive axis retained from the original 2-D/N-D Softmax layer.
+        let softmax_box = Self::propagate_ibp_with_axis(&logit_box, 0)?;
+        let constant_candidate = constant_bounds_from_output(bounds, &softmax_box)?;
+
+        let lse_concrete = lse_candidate.concretize_sound(&logit_box);
+        let constant_concrete = constant_candidate.concretize_sound(&logit_box);
+
+        let mut lower_a = lse_candidate.lower_a().clone();
+        let mut lower_b = lse_candidate.lower_b().clone();
+        let mut upper_a = lse_candidate.upper_a().clone();
+        let mut upper_b = lse_candidate.upper_b().clone();
+
+        for row in 0..bounds.num_outputs() {
+            // Ties deliberately retain LSE so the affine carrier is not lost.
+            if lse_concrete.lower()[[row]] < constant_concrete.lower()[[row]] {
+                lower_a
+                    .row_mut(row)
+                    .assign(&constant_candidate.lower_a().row(row));
+                lower_b[row] = constant_candidate.lower_b()[row];
+            }
+            if lse_concrete.upper()[[row]] > constant_concrete.upper()[[row]] {
+                upper_a
+                    .row_mut(row)
+                    .assign(&constant_candidate.upper_a().row(row));
+                upper_b[row] = constant_candidate.upper_b()[row];
+            }
+        }
+
+        LinearBounds::new_or_conservative(lower_a, lower_b, upper_a, upper_b)
     }
 
     // Justification: The 4-tuple return (lower_A, lower_b, upper_A, upper_b) represents

@@ -1,0 +1,26 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ny-levers"
+description = "Central declaration registry and single process-env chokepoint for the NY_* lever surface."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Deliberately a LEAF crate: every workspace crate must be able to depend on it
+# without a cycle, so it depends on nothing in the workspace and on exactly one
+# third-party crate (`serde_json`, for `LeverSet::receipt`). No `serde` derive
+# and no `thiserror` — the two error types here are hand-rolled `Display` +
+# `std::error::Error` impls, which is cheaper than a proc-macro dependency for
+# a crate every other crate will build.
+[dependencies]
+serde_json = { workspace = true }

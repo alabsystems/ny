@@ -68,7 +68,6 @@ proptest! {
     ) {
         // stride=1, padding=0 for both convs for simplicity
         // Conv1 output spatial
-        prop_assume!(in_h1 >= kh1 && in_w1 >= kw1);
         let out_h1 = in_h1 - kh1 + 1;
         let out_w1 = in_w1 - kw1 + 1;
 
@@ -76,10 +75,8 @@ proptest! {
         let in_c2 = out_c1;
         let in_h2 = out_h1;
         let in_w2 = out_w1;
-        prop_assume!(in_h2 >= kh2 && in_w2 >= kw2);
         let out_h2 = in_h2 - kh2 + 1;
         let out_w2 = in_w2 - kw2 + 1;
-        prop_assume!(out_h2 >= 1 && out_w2 >= 1);
 
         let conv2_out_dim = out_c2 * out_h2 * out_w2;
 
@@ -138,7 +135,11 @@ proptest! {
                 relu.propagate_patches_with_bounds(pb, &pre_relu_bt)
                     .map_err(|e| TestCaseError::fail(format!("Patches ReLU backward failed: {e}")))?
             }
-            CrownBounds::Dense(_) => return Ok(()),
+            CrownBounds::Dense(_) => {
+                return Err(TestCaseError::fail(
+                    "Conv2 backward unexpectedly left patches mode in a patches-composition test",
+                ));
+            }
         };
 
         // Conv1 backward: COMPOSES non-identity patches (the key test!)
@@ -147,7 +148,11 @@ proptest! {
                 conv1.propagate_patches(pb)
                     .map_err(|e| TestCaseError::fail(format!("Patches Conv1 composition failed: {e}")))?
             }
-            CrownBounds::Dense(_) => return Ok(()),
+            CrownBounds::Dense(_) => {
+                return Err(TestCaseError::fail(
+                    "ReLU backward unexpectedly left patches mode before Conv1 composition",
+                ));
+            }
         };
 
         // Convert Patches result to Dense for comparison
@@ -238,10 +243,8 @@ proptest! {
     ) {
         use crate::layers::activations::SiLULayer;
 
-        prop_assume!(in_h >= kh && in_w >= kw);
         let out_h = in_h - kh + 1;
         let out_w = in_w - kw + 1;
-        prop_assume!(out_h >= 1 && out_w >= 1);
         let conv_out_dim = out_c * out_h * out_w;
 
         let kernel = make_kernel(out_c, in_c, kh, kw, seed);

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Domain bound verification checks for GPU BaB.
+//! Domain bound verification checks for DomainList BaB.
 //!
 //! Consolidates the repeated verified/violated/unresolved check pattern that
 //! appeared 7 times in the original monolithic `gpu_bab.rs`.
@@ -53,11 +53,11 @@ pub(crate) fn check_domain_bounds(
     }
 }
 
-/// GPU BaB loop state — now a type alias for the shared `GraphBabLifecycle`.
+/// DomainList BaB loop state — now a type alias for the shared `GraphBabLifecycle`.
 ///
 /// All builder methods (`build_result`, `build_result_with_bounds`,
 /// `check_termination`, `build_final_result`) are provided by
-/// `GraphBabLifecycle`. GPU BaB callers use the same lifecycle type
+/// `GraphBabLifecycle`. DomainList BaB callers use the same lifecycle type
 /// as ReLU split and multi-objective verifiers.
 ///
 /// Part of #1860 (graph BaB service convergence, Packet A).

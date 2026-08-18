@@ -19,44 +19,30 @@
 //! relaxation could emit premises that pass Clean yet describe a network whose
 //! real minimum lies *below* the certified bound. None do.
 //!
-//! Networks whose exact certificate overflows Clean's `i64` rational encoding
-//! are counted and skipped (not unsound — simply not emittable); the test
-//! asserts that the overwhelming majority are certifiable so the harness is
-//! genuinely exercising the generator.
+//! NY's certificate arithmetic is arbitrary precision. Every generated network
+//! must therefore reach both the certificate checker and the exact-network
+//! oracle; a failure to do so is a test failure, not skipped coverage.
 
 use ny_cert::generate::random_problem;
 use ny_cert::{check_entailment, check_farkas, Rat};
 
 struct Stats {
     certified: u32,
-    skipped_overflow: u32,
 }
 
-fn run_range(seeds: std::ops::Range<u64>, grid_steps: u32) -> Stats {
-    let mut stats = Stats {
-        certified: 0,
-        skipped_overflow: 0,
-    };
+fn run_range(seeds: std::ops::Range<u64>) -> Stats {
+    let mut stats = Stats { certified: 0 };
 
     for seed in seeds {
         let problem = random_problem(seed, 3, 4);
 
         // Certify the property `y ≥ m` at the CROWN bound itself (the tightest
-        // threshold this relaxation can prove). Overflow in the exact backward
-        // pass means the certificate can't be encoded — skip, don't fail.
-        let bound = match problem.preact_bounds() {
-            Ok(_) => match certify_at_bound(&problem) {
-                Ok(b) => b,
-                Err(Skip::Overflow) => {
-                    stats.skipped_overflow += 1;
-                    continue;
-                }
-            },
-            Err(_) => {
-                stats.skipped_overflow += 1;
-                continue;
-            }
-        };
+        // threshold this relaxation can prove). The generated problem is valid
+        // and exact arithmetic is arbitrary precision, so refusal is a defect.
+        problem
+            .preact_bounds()
+            .unwrap_or_else(|error| panic!("seed {seed}: pre-activation bounds failed: {error}"));
+        let bound = certify_at_bound(&problem, seed);
 
         let certified = problem
             .certify(bound)
@@ -75,45 +61,45 @@ fn run_range(seeds: std::ops::Range<u64>, grid_steps: u32) -> Stats {
         // dimension via complete hyperplane-arrangement vertex enumeration
         // (`exact_min_nd`) — a decision procedure, not sampling, so `bound ≤
         // true_min` here is a genuine per-network soundness proof.
-        let _ = grid_steps;
-        if let Some(true_min) = problem.exact_min_nd().expect("exact nd eval") {
-            assert!(
-                certified.lower_bound <= true_min,
-                "UNSOUND at seed {seed}: certified bound {:?} exceeds exact true minimum {:?}",
-                certified.lower_bound,
-                true_min,
-            );
-        }
+        let true_min = problem
+            .exact_min_nd()
+            .expect("exact nd eval")
+            .unwrap_or_else(|| panic!("seed {seed}: valid bounded network has no exact minimum"));
+        assert!(
+            certified.lower_bound <= true_min,
+            "UNSOUND at seed {seed}: certified bound {:?} exceeds exact true minimum {:?}",
+            certified.lower_bound,
+            true_min,
+        );
 
         stats.certified += 1;
     }
     stats
 }
 
-enum Skip {
-    Overflow,
-}
-
-/// Certify at the network's own CROWN bound, mapping arithmetic overflow to a
-/// skip (the certificate isn't emittable, but nothing is unsound).
-fn certify_at_bound(problem: &ny_cert::Relu1Problem) -> Result<Rat, Skip> {
+/// Certify at the network's own CROWN bound. Generated inputs are valid and the
+/// rational backend is arbitrary precision, so every error is actionable.
+fn certify_at_bound(problem: &ny_cert::Relu1Problem, seed: u64) -> Rat {
     // `certify(ZERO)` runs the full backward pass and returns the bound; we then
     // re-certify at that bound. A cleaner one-shot API could return the bound
     // directly, but this keeps the public surface minimal.
     match problem.certify(Rat::ZERO) {
-        Ok(c) => Ok(c.lower_bound),
+        Ok(c) => c.lower_bound,
         Err(ny_cert::CrownError::ThresholdAboveBound { bound, .. }) => {
             // The bound is below 0; parse it back out exactly. With the bignum
             // rational backend this round-trips at any magnitude, so the only
-            // way to reach a Skip here is a malformed bound string.
-            parse_bound(&bound).ok_or(Skip::Overflow)
+            // way this can fail is a malformed bound string.
+            parse_bound(&bound)
+                .unwrap_or_else(|| panic!("seed {seed}: malformed certified bound {bound:?}"))
         }
         // Retained for source compatibility: with arbitrary-precision rationals
         // a `RatError::Overflow` from the backward pass is now UNREACHABLE
         // (bignum never overflows), so this arm no longer fires in practice.
-        // We keep it — and the `Skip::Overflow` accounting — so the harness
-        // stays sound-by-construction if a fixed-width path is ever reintroduced.
-        Err(ny_cert::CrownError::Rat(_)) => Err(Skip::Overflow),
+        // Keep the explicit arm so a future fixed-width regression fails with
+        // an actionable seed rather than being mistaken for absent coverage.
+        Err(ny_cert::CrownError::Rat(error)) => {
+            panic!("seed {seed}: arbitrary-precision certificate arithmetic failed: {error}")
+        }
         Err(other) => panic!("unexpected certify error: {other:?}"),
     }
 }
@@ -136,17 +122,11 @@ fn parse_bound(s: &str) -> Option<Rat> {
 fn differential_soundness_small_sweep() {
     // A fast in-`cargo test` sweep; the heavy multi-thousand sweep and the
     // cross-repo Clean-binary check run from scripts/clean_differential.sh.
-    let stats = run_range(0..2000, 6);
-    eprintln!(
-        "differential: {} certified, {} skipped (overflow/non-emittable)",
-        stats.certified, stats.skipped_overflow
-    );
-    // The generator is tuned so the large majority of nets are certifiable;
-    // if this regresses we are no longer meaningfully exercising emission.
-    assert!(
-        stats.certified > 1500,
-        "only {} / 2000 certified — generator or encoding regressed",
-        stats.certified
+    let stats = run_range(0..2000);
+    eprintln!("differential: {} certified", stats.certified);
+    assert_eq!(
+        stats.certified, 2000,
+        "every generated network must be checked"
     );
 }
 
@@ -160,12 +140,7 @@ fn exact_oracle_soundness_sweep_dim_le_2() {
     let mut checked = 0u32;
     for seed in 0..4000u64 {
         let problem = random_problem(seed, 2, 4);
-        // Obtain the net's own CROWN bound (sign-independent), skipping only
-        // non-emittable overflow cases.
-        let bound = match certify_at_bound(&problem) {
-            Ok(b) => b,
-            Err(Skip::Overflow) => continue,
-        };
+        let bound = certify_at_bound(&problem, seed);
         let exact = problem
             .exact_min()
             .expect("exact eval")
@@ -176,7 +151,7 @@ fn exact_oracle_soundness_sweep_dim_le_2() {
         );
         checked += 1;
     }
-    assert!(checked > 3500, "only {checked} certified");
+    assert_eq!(checked, 4000, "every generated network must be checked");
 }
 
 #[test]
@@ -230,10 +205,7 @@ fn certified_bound_is_a_valid_lower_bound_under_perturbation() {
     use ny_cert::generate::Lcg;
     for seed in 0..500u64 {
         let problem = random_problem(seed, 2, 3);
-        let Ok(certified) = problem.certify(Rat::ZERO) else {
-            continue;
-        };
-        let bound = certified.lower_bound;
+        let bound = certify_at_bound(&problem, seed);
         let mut g = Lcg::new(seed ^ 0xD1CE);
         let n = problem.input_lower.len();
         for _ in 0..40 {

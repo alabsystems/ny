@@ -130,23 +130,6 @@ impl WhisperModel {
         Ok(graph)
     }
 
-    /// Extract the attention suffix subgraph rooted at `ln_output`.
-    ///
-    /// Omits the attention LayerNorm from the graph. The unresolved `ln_output`
-    /// tensor maps to the single `_input` sentinel, giving all Q/K/V projections
-    /// one shared zonotope source.
-    ///
-    /// Part of #318: shared-source prefix cut.
-    #[cfg(test)]
-    pub(crate) fn attention_suffix_subgraph_from_layernorm_output(
-        &self,
-        index: usize,
-    ) -> Result<GraphNetwork> {
-        let (graph, _, _, _, _) =
-            self.build_attention_subgraph_with_root(index, AttentionGraphRoot::LayerNormOutput)?;
-        Ok(graph)
-    }
-
     #[cfg(test)]
     pub(crate) fn attention_subgraph_artifacts(
         &self,

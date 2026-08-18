@@ -4,9 +4,11 @@
 # Licensed under the Apache License, Version 2.0
 
 """
-Benchmark GCP-CROWN effectiveness on MNIST FC.
+Audit the quarantined legacy GCP-CROWN surface on MNIST FC.
 
-Compares verification rate with and without cutting planes.
+The cut-enabled arm is expected to return a configuration error until
+proof-derived cuts are folded through backward CROWN. It is retained as a
+research/quarantine regression, not as a scored verification benchmark.
 """
 
 import json
@@ -15,9 +17,11 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+QUARANTINE_MARKER = "cut proof authority is quarantined"
+
 
 def run_verification(model: str, prop: str, timeout: int, enable_cuts: bool) -> dict:
-    """Run ny beta-crown and parse the result."""
+    """Run ny beta-crown; cut requests must fail at configuration ingress."""
     cmd = [
         "./target/release/ny", "beta-crown",
         model,
@@ -35,6 +39,20 @@ def run_verification(model: str, prop: str, timeout: int, enable_cuts: bool) -> 
             text=True,
             timeout=timeout + 30  # Extra buffer
         )
+
+        if enable_cuts:
+            diagnostic = f"{result.stdout}\n{result.stderr}".lower()
+            if result.returncode == 0 or QUARANTINE_MARKER not in diagnostic:
+                raise RuntimeError(
+                    "cut-authority quarantine regression: --enable-cuts did not "
+                    f"fail with the expected marker (returncode={result.returncode}, "
+                    f"stdout={result.stdout!r}, stderr={result.stderr!r})"
+                )
+            return {
+                "status": "quarantined",
+                "domains_explored": 0,
+                "returncode": result.returncode,
+            }
 
         # Parse JSON output (may be multi-line pretty-printed)
         stdout = result.stdout.strip()
@@ -63,8 +81,15 @@ def run_verification(model: str, prop: str, timeout: int, enable_cuts: bool) -> 
         return {"status": "unknown", "domains_explored": 0}
 
     except subprocess.TimeoutExpired:
+        if enable_cuts:
+            raise RuntimeError(
+                "--enable-cuts reached execution/timeout instead of failing at "
+                "the cut-authority configuration quarantine"
+            )
         return {"status": "Timeout", "domains_explored": 0}
     except Exception as e:
+        if enable_cuts:
+            raise
         return {"status": f"Error: {e}", "domains_explored": 0}
 
 
@@ -94,7 +119,7 @@ def main():
     print()
 
     # Run benchmark
-    results = {"without_cuts": defaultdict(int), "with_cuts": defaultdict(int)}
+    results = {"without_cuts": defaultdict(int), "cut_request": defaultdict(int)}
     details = []
 
     for i, (model, prop) in enumerate(instances):  # All instances
@@ -107,19 +132,19 @@ def main():
         t_no_cuts = time.time() - t0
         status_no_cuts = result_no_cuts.get("status", "Unknown")
 
-        # With cuts
+        # A cut request must be rejected before any proof execution.
         t0 = time.time()
         result_with_cuts = run_verification(model, prop, timeout, enable_cuts=True)
         t_with_cuts = time.time() - t0
         status_with_cuts = result_with_cuts.get("status", "Unknown")
 
         results["without_cuts"][status_no_cuts] += 1
-        results["with_cuts"][status_with_cuts] += 1
+        results["cut_request"][status_with_cuts] += 1
 
         details.append({
             "property": prop_name,
             "without_cuts": {"status": status_no_cuts, "time": t_no_cuts},
-            "with_cuts": {"status": status_with_cuts, "time": t_with_cuts}
+            "cut_request": {"status": status_with_cuts, "time": t_with_cuts}
         })
 
         # Print compact result
@@ -133,7 +158,7 @@ def main():
             return s[:3].upper()
 
         print(f"no_cuts={short_status(status_no_cuts)} ({t_no_cuts:.1f}s), "
-              f"cuts={short_status(status_with_cuts)} ({t_with_cuts:.1f}s)")
+              f"cut_request={short_status(status_with_cuts)} ({t_with_cuts:.1f}s)")
 
     print("\n" + "="*60)
     print("SUMMARY")
@@ -143,33 +168,30 @@ def main():
     for status, count in sorted(results["without_cuts"].items()):
         print(f"  {status}: {count}")
 
-    print("\nWith GCP-CROWN:")
-    for status, count in sorted(results["with_cuts"].items()):
+    print("\nQuarantined --enable-cuts request:")
+    for status, count in sorted(results["cut_request"].items()):
         print(f"  {status}: {count}")
 
-    # Calculate improvement (handle various case variations)
+    # Report only the real, cut-dark verification arm. The rejected request is
+    # a configuration regression and must never enter a verification-rate
+    # comparison.
     def count_verified(d):
         return sum(v for k, v in d.items() if k.lower() == "verified")
-    def count_falsified(d):
-        return sum(v for k, v in d.items() if k.lower() in ("falsified", "violated"))
-    def count_unknown(d):
-        return sum(v for k, v in d.items() if k.lower() == "unknown")
 
     verified_no_cuts = count_verified(results["without_cuts"])
-    verified_with_cuts = count_verified(results["with_cuts"])
     total = sum(results["without_cuts"].values())
+    quarantined = results["cut_request"].get("quarantined", 0)
+    if quarantined != total:
+        raise RuntimeError(
+            f"expected all {total} cut requests to be quarantined, got {quarantined}"
+        )
 
     print("\nVerification rate:")
     print(f"  Without cuts: {verified_no_cuts}/{total} ({100*verified_no_cuts/total:.1f}%)")
-    print(f"  With cuts:    {verified_with_cuts}/{total} ({100*verified_with_cuts/total:.1f}%)")
-
-    if verified_with_cuts > verified_no_cuts:
-        improvement = verified_with_cuts - verified_no_cuts
-        print(f"\n  GCP-CROWN improves verification by {improvement} instances ({100*improvement/total:.1f}%)")
-    elif verified_with_cuts == verified_no_cuts:
-        print("\n  No change with GCP-CROWN (may need more iterations)")
-    else:
-        print("\n  Warning: GCP-CROWN reduced verification rate (unexpected)")
+    print(
+        f"\nCut-authority quarantine: PASSED ({quarantined}/{total} requests "
+        "rejected before proof execution)"
+    )
 
 
 if __name__ == "__main__":

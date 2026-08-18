@@ -1,3 +1,6 @@
+# Copyright 2026 Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import hashlib
@@ -6,6 +9,9 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "main16_gap_audit.py"
@@ -174,7 +180,12 @@ def _sealed_run(
         "preflight": {**_evidence(preflight_path, root), "inputs": preflight["inputs"]},
     }
     if replay_result is not None:
-        status, classification, credit = audit.replay._classification(replay_result)
+        # This helper intentionally emits the retired 2026 replay schema.  The
+        # 2025 score audit must keep it visible but never treat it as scoring
+        # evidence, irrespective of the self-attested classification fields.
+        status = "validated"
+        classification = "invalid" if replay_result == "no_ce" else "valid"
+        credit = classification == "valid"
         sidecar = {
             "schema": "ny_counterexample_validation_v1",
             "schema_version": 1,
@@ -182,10 +193,10 @@ def _sealed_run(
             "classification": classification,
             "official_result": replay_result,
             "score_credit": credit,
-            "provider": audit.replay.CPU_PROVIDER,
-            "checker": {"commit": audit.replay.PINNED_CHECKER_COMMIT},
+            "provider": "CPUExecutionProvider",
+            "checker": {"commit": "retired-2026-checker"},
             "vnnlib_python_source": {
-                "commit": audit.replay.PINNED_VNNLIB_PYTHON_COMMIT
+                "commit": "retired-2026-vnnlib"
             },
             "measurement": {
                 "run_id": run_id,
@@ -232,7 +243,10 @@ def _sealed_run(
                 "integrity": {
                     "status": "valid",
                     "violations": [],
-                    "checks": {"run_evidence": run_evidence},
+                    "checks": {
+                        "cuda_runtime": {"status": "valid"},
+                        "run_evidence": run_evidence,
+                    },
                 },
             },
         )
@@ -263,7 +277,12 @@ def test_empty_exact_bank_cannot_inherit_legacy_projection(tmp_path: Path) -> No
     assert qualified["qualified_incorrect"] == 0
     assert qualified["unmeasured"] == 16
     assert "legacy_optimistic_projection" in audit.render_csv(report)
-    assert "EVIDENCE TIERS MUST NOT BE COMBINED" in audit.render_table(report)
+    table = audit.render_table(report)
+    assert "EVIDENCE TIERS MUST NOT BE COMBINED" in table
+    assert (
+        "claim scope: local counterfactual; nonofficial; "
+        "not independently attested"
+    ) in table
 
 
 def test_only_requested_exact_commit_completion_scores(tmp_path: Path) -> None:
@@ -292,7 +311,9 @@ def test_only_requested_exact_commit_completion_scores(tmp_path: Path) -> None:
     assert qualified["qualification_audit"]["ignored_other_commit_runs"] == 1
 
 
-def test_sat_requires_replay_and_validated_invalid_is_penalized(tmp_path: Path) -> None:
+def test_sat_requires_exact_2025_replay_and_ignores_retired_sidecar(
+    tmp_path: Path,
+) -> None:
     official = _official_fixture(tmp_path)
     legacy = _legacy_fixture(tmp_path)
     commit = "4" * 40
@@ -324,9 +345,106 @@ def test_sat_requires_replay_and_validated_invalid_is_penalized(tmp_path: Path) 
     assert incomplete is False
     first = invalid_report["qualified_current"]["suites"][0]
     assert first["qualified_solved"] == 0
-    assert first["qualified_incorrect"] == 1
-    assert first["raw_points"] == -150
+    assert first["qualified_incorrect"] == 0
+    assert first["unqualified_sat"] == 1
+    assert first["raw_points"] == 0
     assert first["score"] == 0.0
+
+
+def test_main16_discovers_shared_exact_2025_replay_consumer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import regular_bank_evidence as regular  # noqa: PLC0415
+
+    official_root = _official_fixture(tmp_path, first_truth="sat")
+    legacy = _legacy_fixture(tmp_path)
+    artifacts = tmp_path / "exact-replay"
+    artifacts.mkdir()
+    commit = "a" * 40
+    run_dir = _sealed_run(artifacts, commit=commit, verdict="sat")
+    metadata = (
+        artifacts
+        / audit.retro.REGULAR[0]
+        / "00001-fixture"
+        / "sealed-run.json"
+    )
+    exact_sidecar = metadata.with_name(
+        f"{metadata.stem}.vnncomp2025-zero-tol-validation.json"
+    )
+    exact_sidecar.write_text("{}\n", encoding="utf-8")
+
+    official_context = audit.load_official_context(official_root)
+    pinned_official = SimpleNamespace(context=official_context)
+    pinned_benchmark = object()
+    occurrence = SimpleNamespace(
+        onnx=f"onnx/{audit.retro.REGULAR[0]}.onnx",
+        vnnlib=f"vnnlib/{audit.retro.REGULAR[0]}.vnnlib",
+    )
+    monkeypatch.setattr(
+        regular,
+        "validate_official_results",
+        lambda _: pinned_official,
+    )
+    monkeypatch.setattr(
+        regular,
+        "validate_official_benchmark",
+        lambda _: pinned_benchmark,
+    )
+    monkeypatch.setattr(
+        regular,
+        "_load_occurrence",
+        lambda **_: (occurrence, {}),
+    )
+    monkeypatch.setattr(
+        regular,
+        "authoritative_benchmark_input",
+        lambda **_: (SimpleNamespace(), b"fixture"),
+    )
+    monkeypatch.setattr(
+        regular,
+        "validate_exact_2025_sat_replay",
+        lambda **_: {"official_result": "correct", "score_credit": True},
+    )
+
+    report, incomplete = audit.build_audit(
+        official_root=official_root,
+        legacy_measured_root=legacy,
+        artifact_roots=[artifacts],
+        exact_commit=commit,
+        benchmark_root=tmp_path / "benchmark",
+    )
+
+    del run_dir
+    assert incomplete is False
+    first = report["qualified_current"]["suites"][0]
+    assert first["qualified_solved"] == 1
+    assert first["qualified_incorrect"] == 0
+    assert first["raw_points"] == 10
+
+
+def test_main16_frozen_projection_rejects_strict_sat_against_holds() -> None:
+    base = audit.SealedRecord(
+        artifact_root=Path("/fixture"),
+        run_id="fixture",
+        category=audit.retro.REGULAR[0],
+        instance_index=1,
+        instance=("onnx/a.onnx", "vnnlib/a.vnnlib", 0),
+        verdict="sat",
+        counterexample=audit.competitive.CounterexampleResult.CORRECT,
+        sat_replay_state="exact_2025_zero_tol:correct",
+    )
+
+    assert audit._score_record(base, "holds") is None
+    tolerance = SimpleNamespace(
+        **{
+            **base.__dict__,
+            "counterexample": (
+                audit.competitive.CounterexampleResult.CORRECT_UP_TO_TOLERANCE
+            ),
+        }
+    )
+    assert audit._score_record(tolerance, "holds") == 10
 
 
 def test_missing_completion_is_reported_and_zeroed(tmp_path: Path) -> None:
@@ -350,6 +468,36 @@ def test_missing_completion_is_reported_and_zeroed(tmp_path: Path) -> None:
     assert qualified["qualification_audit"]["status"] == "incomplete_fail_closed"
     assert (
         "no completion"
+        in qualified["qualification_audit"]["rejected_runs"][0]["reason"]
+    )
+
+
+def test_completion_without_cuda_runtime_identity_is_reported_and_zeroed(
+    tmp_path: Path,
+) -> None:
+    official = _official_fixture(tmp_path)
+    legacy = _legacy_fixture(tmp_path)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    commit = "7" * 40
+    run_dir = _sealed_run(artifacts, commit=commit)
+    completion_path = run_dir / "completion.json"
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    del completion["integrity"]["checks"]["cuda_runtime"]
+    _write_json(completion_path, completion)
+
+    report, incomplete = audit.build_audit(
+        official_root=official,
+        legacy_measured_root=legacy,
+        artifact_roots=[artifacts],
+        exact_commit=commit,
+    )
+
+    assert incomplete is True
+    qualified = report["qualified_current"]
+    assert qualified["qualified_solved"] == 0
+    assert (
+        "lacks valid CUDA runtime identity"
         in qualified["qualification_audit"]["rejected_runs"][0]["reason"]
     )
 
@@ -454,3 +602,97 @@ def test_help_names_exact_commit_and_artifact_scope() -> None:
     )
     assert "--exact-commit" in result.stdout
     assert "--artifact-root" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "tracked_diff_format",
+    [None, "ny_tracked_worktree_evidence_v2"],
+)
+def test_clean_start_accepts_legacy_and_v2_tracked_evidence(
+    tmp_path: Path,
+    tracked_diff_format: str | None,
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    commit = "8" * 40
+    ny: dict[str, object] = {
+        "commit": commit,
+        "clean": True,
+        "status_porcelain_v1_z_entries": [],
+        "tracked_diff_bytes": 0,
+        "untracked_files": [],
+    }
+    if tracked_diff_format is not None:
+        ny.update(
+            {
+                "tracked_diff_format": tracked_diff_format,
+                "tracked_diff_sha256": audit.provenance._sha256(b""),
+                "tracked_worktree_paths": [],
+            }
+        )
+    start_path = root / "runs" / "clean" / "start.json"
+    _write_json(
+        start_path,
+        {
+            "schema": "ny_measurement_start_v1",
+            "run_id": "clean",
+            "ny": ny,
+            "measurement": {"artifact_root": str(root.resolve())},
+        },
+    )
+
+    start, _, _ = audit._validate_start(start_path, root.resolve(), commit)
+
+    assert start["ny"] == ny
+
+
+@pytest.mark.parametrize(
+    ("tracked_diff_format", "tracked_diff_sha256", "tracked_paths", "message"),
+    [
+        ("unknown", _sha(b""), [], "unsupported"),
+        (
+            "ny_tracked_worktree_evidence_v2",
+            _sha(b"dirty"),
+            [],
+            "invalid clean",
+        ),
+        (
+            "ny_tracked_worktree_evidence_v2",
+            _sha(b""),
+            [{"path": "dirty"}],
+            "invalid clean",
+        ),
+    ],
+)
+def test_clean_start_rejects_unknown_or_inconsistent_tracked_evidence(
+    tmp_path: Path,
+    tracked_diff_format: str,
+    tracked_diff_sha256: str,
+    tracked_paths: list[dict[str, str]],
+    message: str,
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    commit = "9" * 40
+    start_path = root / "runs" / "invalid" / "start.json"
+    _write_json(
+        start_path,
+        {
+            "schema": "ny_measurement_start_v1",
+            "run_id": "invalid",
+            "ny": {
+                "commit": commit,
+                "clean": True,
+                "status_porcelain_v1_z_entries": [],
+                "tracked_diff_format": tracked_diff_format,
+                "tracked_diff_bytes": 0,
+                "tracked_diff_sha256": tracked_diff_sha256,
+                "tracked_worktree_paths": tracked_paths,
+                "untracked_files": [],
+            },
+            "measurement": {"artifact_root": str(root.resolve())},
+        },
+    )
+
+    with pytest.raises(audit.AuditError, match=message):
+        audit._validate_start(start_path, root.resolve(), commit)

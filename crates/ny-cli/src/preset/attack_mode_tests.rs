@@ -9,6 +9,32 @@ use super::*;
 use ny_propagate::{BetaCrownConfig, PgdInitialization};
 use std::path::Path;
 
+#[test]
+fn vnncomp_relational_exact_gradient_opt_in_is_typed_default_off_and_closed() {
+    let omitted: PresetConfig = serde_yaml::from_str("attack: {}\n").expect("empty attack map");
+    assert_eq!(
+        omitted.attack.vnncomp_upfront_relational_exact_gradient, None,
+        "omission must preserve the default-off wrapper route"
+    );
+
+    let enabled: PresetConfig =
+        serde_yaml::from_str("attack:\n  vnncomp_upfront_relational_exact_gradient: true\n")
+            .expect("typed wrapper opt-in");
+    assert_eq!(
+        enabled.attack.vnncomp_upfront_relational_exact_gradient,
+        Some(true)
+    );
+
+    let error = serde_yaml::from_str::<PresetConfig>(
+        "attack:\n  vnncomp_upfront_relational_exact_gradients: true\n",
+    )
+    .expect_err("near-miss key must be rejected by the closed attack schema");
+    assert!(
+        error.to_string().contains("unknown field"),
+        "closed-schema error should identify an unknown field: {error}"
+    );
+}
+
 /// #1449: attack_mode 'diversed_PGD' maps to PgdInitialization::Osi.
 #[test]
 fn apply_preset_attack_mode_diversed_pgd_sets_osi_1449() {

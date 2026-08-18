@@ -13,6 +13,9 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Ensure safetensors is available
 try:
@@ -28,7 +31,7 @@ def run_ny(args: list[str]) -> tuple[int, str, str]:
         ["cargo", "run", "-p", "ny-cli", "--"] + args,
         capture_output=True,
         text=True,
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cwd=REPO_ROOT,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -155,20 +158,20 @@ def test_weights_diff():
     return True
 
 
-def test_onnx_to_safetensors_diff():
-    """Test diffing between ONNX and SafeTensors formats."""
-    print("\n=== Test: ONNX to SafeTensors diff ===")
+def test_onnx_to_safetensors_diff() -> bool | None:
+    """Document the currently unsupported cross-format fixture comparison."""
+    print("\n=== Diagnostic: ONNX to SafeTensors diff ===")
 
-    # Check if test ONNX model exists
-    test_model = "tests/models/simple_linear.onnx"
-    if not os.path.exists(test_model):
-        print("SKIP: No test ONNX model available")
-        return True
+    # Keep this diagnostic tied to the real tracked fixture.
+    test_model = REPO_ROOT / "tests" / "models" / "single_linear.onnx"
+    if not test_model.is_file():
+        print(f"FAIL: Required tracked ONNX fixture is missing: {test_model}")
+        return False
 
-    # Create SafeTensors with same weight names
-    # (In practice, names might differ between formats)
-    print("SKIP: Cross-format diff requires matching tensor names")
-    return True
+    # This is intentionally non-gating until a SafeTensors fixture with matching
+    # tensor names is checked in. Do not claim comparator coverage.
+    print("SKIP: No matching-name SafeTensors comparator fixture is available")
+    return None
 
 
 def main():
@@ -184,17 +187,22 @@ def main():
     print("SUMMARY")
     print("=" * 50)
 
-    passed = sum(1 for _, r in results if r)
+    passed = sum(1 for _, r in results if r is True)
+    failed = sum(1 for _, r in results if r is False)
+    skipped = sum(1 for _, r in results if r is None)
     total = len(results)
 
     for name, result in results:
-        status = "PASS" if result else "FAIL"
+        status = "SKIP" if result is None else ("PASS" if result else "FAIL")
         print(f"  {name}: {status}")
 
-    print(f"\nTotal: {passed}/{total} passed")
+    print(f"\nTotal: {passed} passed, {failed} failed, {skipped} skipped ({total} total)")
 
-    if passed == total:
-        print("\nAll tests PASSED!")
+    if failed == 0:
+        if skipped:
+            print("\nAll runnable tests PASSED; skipped diagnostics were not counted as passes.")
+        else:
+            print("\nAll tests PASSED!")
         return 0
     print("\nSome tests FAILED!")
     return 1

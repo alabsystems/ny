@@ -1013,6 +1013,7 @@ fn test_layer_type_display() {
     assert_eq!(format!("{}", LayerType::Conv2d), "Conv2d");
     assert_eq!(format!("{}", LayerType::LeakyRelu), "LeakyRelu");
     assert_eq!(format!("{}", LayerType::HardSwish), "HardSwish");
+    assert_eq!(format!("{}", LayerType::Erf), "Erf");
     assert_eq!(
         format!("{}", LayerType::MultiHeadAttention),
         "MultiHeadAttention"
@@ -1054,6 +1055,7 @@ fn test_layer_type_all_activations_distinct() {
         LayerType::SiLU,
         LayerType::Sigmoid,
         LayerType::Tanh,
+        LayerType::Erf,
         LayerType::Softplus,
         LayerType::Tan,
         LayerType::Arctan,

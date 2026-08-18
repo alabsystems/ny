@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import importlib.metadata
 import importlib.util
 import json
 import subprocess
@@ -242,10 +241,10 @@ def test_records_official_malformed_classification_without_rewriting_archive(
     assert result_path.read_bytes() == raw
 
 
-def test_real_pinned_official_v1_checker_smoke(tmp_path: Path) -> None:
+def external_real_pinned_official_v1_checker_smoke(tmp_path: Path) -> None:
     checker_repo = REPO_ROOT / "external_tools" / "vnncomp2026_results"
     vnnlib_source_repo = REPO_ROOT / "external_tools" / "VNNLIB-Python"
-    checker_python = Path("/home/ayates/.venvs/vnncomp-ce-2026/bin/python")
+    checker_python = Path("<home>/.venvs/vnncomp-ce-2026/bin/python")
     benchmark_link = REPO_ROOT / "external_tools" / "vnncomp2026_benchmarks"
     benchmark_repo = REPO_ROOT / "benchmarks" / "vnncomp2025"
     official_result = (
@@ -260,22 +259,20 @@ def test_real_pinned_official_v1_checker_smoke(tmp_path: Path) -> None:
         benchmark_link,
         official_result,
     )
-    if not all(path.exists() for path in prerequisites):
-        pytest.skip("pinned checker/corpus/runtime is not installed")
-    try:
-        if importlib.metadata.version("vnnlib") != "1.0.2":
-            pytest.skip("vnnlib 1.0.2 is not installed in this pytest interpreter")
-    except importlib.metadata.PackageNotFoundError:
-        # The replay itself runs in the dedicated interpreter; the test runner
-        # does not need the package, so continue when that interpreter has it.
-        pass
+    missing = [path for path in prerequisites if not path.exists()]
+    assert not missing, (
+        "pinned checker/corpus/runtime prerequisites are missing: "
+        f"{missing!r}. Install the external replay environment before this test."
+    )
 
     model = (
         benchmark_repo / "benchmarks/acasxu_2023/onnx/ACASXU_run2a_2_9_batch_2000.onnx"
     )
     prop = benchmark_repo / "benchmarks/acasxu_2023/vnnlib/prop_2.vnnlib"
-    if not model.is_file() or not prop.is_file():
-        pytest.skip("2025 ACAS Xu smoke inputs are not installed")
+    assert model.is_file() and prop.is_file(), (
+        "2025 ACAS Xu smoke inputs are absent; "
+        "run benchmarks/download_benchmarks.sh"
+    )
     raw = b"sat\n" + gzip.open(official_result, "rb").read()
     artifact_root, metadata = _make_archive(
         tmp_path,
@@ -301,12 +298,12 @@ def test_real_pinned_official_v1_checker_smoke(tmp_path: Path) -> None:
     assert record["checker_runtime"]["dependency_versions"]["vnnlib"] == "1.0.2"
 
 
-def test_real_pinned_official_v2_checker_and_malformed_ny_syntax_smoke(
+def external_real_pinned_official_v2_checker_and_malformed_ny_syntax_smoke(
     tmp_path: Path,
 ) -> None:
     checker_repo = REPO_ROOT / "external_tools" / "vnncomp2026_results"
     vnnlib_source_repo = REPO_ROOT / "external_tools" / "VNNLIB-Python"
-    checker_python = Path("/home/ayates/.venvs/vnncomp-ce-2026/bin/python")
+    checker_python = Path("<home>/.venvs/vnncomp-ce-2026/bin/python")
     benchmark_link = REPO_ROOT / "external_tools" / "vnncomp2026_benchmarks"
     benchmark = REPO_ROOT / "benchmarks/vnncomp2026/benchmarks/test/2.0"
     model = benchmark / "onnx/test_nano.onnx"
@@ -319,8 +316,11 @@ def test_real_pinned_official_v2_checker_and_malformed_ny_syntax_smoke(
         model,
         prop,
     )
-    if not all(path.exists() for path in prerequisites):
-        pytest.skip("pinned checker, VNN-LIB 2.0 corpus, or runtime is not installed")
+    missing = [path for path in prerequisites if not path.exists()]
+    assert not missing, (
+        "pinned checker, VNN-LIB 2.0 corpus, or runtime prerequisites are "
+        f"missing: {missing!r}"
+    )
 
     well_formed_root, well_formed_metadata = _make_archive(
         tmp_path / "well-formed",
@@ -372,21 +372,23 @@ def test_real_pinned_official_v2_checker_and_malformed_ny_syntax_smoke(
     assert archived_result.read_bytes() == malformed_raw
 
 
-def test_patched_relational_assignment_format_is_strict_official_witness(
+def external_patched_relational_assignment_format_is_strict_official_witness(
     tmp_path: Path,
 ) -> None:
     """Cross-check NY's new tensor serializer shape/order against the checker."""
     checker_repo = REPO_ROOT / "external_tools" / "vnncomp2026_results"
-    checker_python = Path("/home/ayates/.venvs/vnncomp-ce-2026/bin/python")
+    checker_python = Path("<home>/.venvs/vnncomp-ce-2026/bin/python")
     benchmark = (
         REPO_ROOT / "benchmarks/vnncomp2026/benchmarks/monotonic_acasxu_2026/2.0"
     )
     model = benchmark / "onnx/ACASXU_run2a_2_4_batch_2000.onnx"
     prop = benchmark / "vnnlib/instance_0.vnnlib"
-    if not all(
-        path.exists() for path in (checker_repo / ".git", checker_python, model, prop)
-    ):
-        pytest.skip("pinned checker, relational corpus, or runtime is not installed")
+    prerequisites = (checker_repo / ".git", checker_python, model, prop)
+    missing = [path for path in prerequisites if not path.exists()]
+    assert not missing, (
+        "pinned checker, relational corpus, or runtime prerequisites are "
+        f"missing: {missing!r}"
+    )
 
     # This is exactly the section-5.3 header/scalar order emitted by NY's
     # patched `relational_counterexample_vnnlib`: f input/output followed by g

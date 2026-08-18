@@ -4,7 +4,7 @@
 
 //! Numeric operations on BoundedTensor: width, rounding, scalar access, intersection, repair.
 
-use ndarray::ArrayD;
+use ndarray::{ArrayD, IxDyn};
 use ny_core::{nan_propagating_max, Bound, NyError, Result};
 
 use crate::{next_down_f32, next_up_f32, shift_down_n_ulps, shift_up_n_ulps};
@@ -36,7 +36,7 @@ impl BoundedTensor {
     /// Check if this tensor contains any NaN or Inf values.
     #[inline]
     pub fn has_overflow(&self) -> bool {
-        Self::has_nan_or_inf(&self.lower) || Self::has_nan_or_inf(&self.upper)
+        Self::has_nan_or_inf(self.lower.as_array()) || Self::has_nan_or_inf(self.upper.as_array())
     }
 
     /// Apply directed rounding for mathematically sound interval arithmetic.
@@ -61,11 +61,11 @@ impl BoundedTensor {
         // Drop the L2 annotation on this widened copy (sound: only loses
         // tightening). The in-place variant keeps it, since widening the box can
         // only continue to contain the same sphere.
-        Self {
-            lower: self.lower.mapv(next_down_f32),
-            upper: self.upper.mapv(next_up_f32),
-            l2: None,
-        }
+        Self::from_parts_with_l2(
+            self.lower.mapv(next_down_f32),
+            self.upper.mapv(next_up_f32),
+            None,
+        )
     }
 
     /// Apply directed rounding in place.
@@ -76,6 +76,33 @@ impl BoundedTensor {
     pub fn round_for_soundness_inplace(&mut self) {
         self.lower.mapv_inplace(next_down_f32);
         self.upper.mapv_inplace(next_up_f32);
+    }
+
+    /// Apply directed 1-ULP widening in place while cooperatively polling.
+    ///
+    /// This has the same element-wise result as
+    /// [`Self::round_for_soundness_inplace`]. If `poll` returns an error, the
+    /// tensor may be partially widened and must not be published by the caller.
+    pub fn round_for_soundness_inplace_with_poll<F>(&mut self, mut poll: F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        for (index, value) in self.lower.iter_mut().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            *value = next_down_f32(*value);
+        }
+        for (index, value) in self.upper.iter_mut().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            *value = next_up_f32(*value);
+        }
+        poll()
     }
 
     /// Widen bounds by `n` ULPs in each direction for soundness.
@@ -95,11 +122,11 @@ impl BoundedTensor {
     pub fn round_for_soundness_n_ulps(&self, n: u32) -> Self {
         // Drop the L2 annotation on this widened copy (sound: only loses
         // tightening). See `round_for_soundness`.
-        Self {
-            lower: self.lower.mapv(|v| shift_down_n_ulps(v, n)),
-            upper: self.upper.mapv(|v| shift_up_n_ulps(v, n)),
-            l2: None,
-        }
+        Self::from_parts_with_l2(
+            self.lower.mapv(|v| shift_down_n_ulps(v, n)),
+            self.upper.mapv(|v| shift_up_n_ulps(v, n)),
+            None,
+        )
     }
 
     /// Widen bounds by `n` ULPs in each direction, in place.
@@ -109,6 +136,38 @@ impl BoundedTensor {
     pub fn round_for_soundness_n_ulps_inplace(&mut self, n: u32) {
         self.lower.mapv_inplace(|v| shift_down_n_ulps(v, n));
         self.upper.mapv_inplace(|v| shift_up_n_ulps(v, n));
+    }
+
+    /// Apply directed `n`-ULP widening in place while cooperatively polling.
+    ///
+    /// This has the same element-wise result as
+    /// [`Self::round_for_soundness_n_ulps_inplace`]. If `poll` returns an
+    /// error, the tensor may be partially widened and must not be published by
+    /// the caller.
+    pub fn round_for_soundness_n_ulps_inplace_with_poll<F>(
+        &mut self,
+        n: u32,
+        mut poll: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        for (index, value) in self.lower.iter_mut().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            *value = shift_down_n_ulps(*value, n);
+        }
+        for (index, value) in self.upper.iter_mut().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            *value = shift_up_n_ulps(*value, n);
+        }
+        poll()
     }
 
     /// Get bounds for a specific feasible element.
@@ -150,7 +209,7 @@ impl BoundedTensor {
     /// Compute the width (upper - lower) for each element.
     #[inline]
     pub fn width(&self) -> ArrayD<f32> {
-        &self.upper - &self.lower
+        self.upper.as_array() - self.lower.as_array()
     }
 
     /// Maximum width across all elements.
@@ -176,8 +235,8 @@ impl BoundedTensor {
     // consumers must keep seeing that ±inf rather than a fabricated finite center.
     #[allow(clippy::manual_midpoint)]
     pub fn center(&self) -> ArrayD<f32> {
-        ndarray::Zip::from(&self.lower)
-            .and(&self.upper)
+        ndarray::Zip::from(self.lower.as_array())
+            .and(self.upper.as_array())
             .map_collect(|&l, &u| {
                 if l.is_infinite() && u.is_infinite() && l.signum() != u.signum() {
                     0.0
@@ -185,6 +244,53 @@ impl BoundedTensor {
                     (l + u) / 2.0
                 }
             })
+    }
+
+    /// Compute [`Self::center`] while cooperatively polling bounded chunks.
+    ///
+    /// Allocator calls themselves are not preemptible, but every element scan
+    /// is split by `poll` calls. The returned array has the same shape and
+    /// element values as [`Self::center`].
+    // Preserve `Self::center` bit-for-bit, including its intentional overflow
+    // behavior for exploded finite bounds; `f32::midpoint` would change it.
+    #[allow(clippy::manual_midpoint)]
+    pub fn center_with_poll<F>(&self, mut poll: F) -> Result<ArrayD<f32>>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(self.lower.len())
+            .map_err(|error| {
+                NyError::InvalidSpec(format!(
+                    "BoundedTensor::center_with_poll: allocation failed for {} elements: {error}",
+                    self.lower.len()
+                ))
+            })?;
+        poll()?;
+        for (index, (&lower, &upper)) in self.lower.iter().zip(self.upper.iter()).enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            values.push(
+                if lower.is_infinite() && upper.is_infinite() && lower.signum() != upper.signum() {
+                    0.0
+                } else {
+                    (lower + upper) / 2.0
+                },
+            );
+        }
+        poll()?;
+        let center = ArrayD::from_shape_vec(IxDyn(self.shape()), values).map_err(|error| {
+            NyError::InternalError(format!(
+                "BoundedTensor::center_with_poll: output reshape failed: {error}"
+            ))
+        })?;
+        poll()?;
+        Ok(center)
     }
 
     /// Compute the intersection of two bounded tensors.
@@ -221,8 +327,8 @@ impl BoundedTensor {
             return None;
         }
 
-        let mut lower = self.lower.clone();
-        let mut upper = self.upper.clone();
+        let mut lower = self.lower.as_array().clone();
+        let mut upper = self.upper.as_array().clone();
         let mut disjoint_count = 0usize;
 
         for ((sl, su), (ol, ou)) in lower
@@ -246,13 +352,104 @@ impl BoundedTensor {
 
         // Drop any L2 annotation: the per-element intersection produces a fresh
         // interval whose sphere is not tracked. Sound (only loses tightening).
-        Some((
-            Self {
-                lower,
-                upper,
-                l2: None,
-            },
+        Some((Self::from_parts_with_l2(lower, upper, None), disjoint_count))
+    }
+
+    /// Pollable counterpart to [`Self::intersection_per_element`].
+    ///
+    /// The no-error result is element-for-element identical to the ordinary
+    /// method. If `poll` returns an error, no partially constructed
+    /// intersection is returned.
+    pub fn intersection_per_element_with_poll<F>(
+        &self,
+        other: &Self,
+        mut poll: F,
+    ) -> Result<Option<(Self, usize)>>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        if self.shape() != other.shape() {
+            return Ok(None);
+        }
+
+        // Preserve the ordinary method's all-endpoint NaN rejection before
+        // constructing any result.
+        for endpoints in [
+            self.lower.as_array(),
+            self.upper.as_array(),
+            other.lower.as_array(),
+            other.upper.as_array(),
+        ] {
+            for (index, &value) in endpoints.iter().enumerate() {
+                if index.is_multiple_of(POLL_ELEMENTS) {
+                    poll()?;
+                }
+                if value.is_nan() {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let elements = self.lower.len();
+        let mut lower = Vec::new();
+        let mut upper = Vec::new();
+        lower.try_reserve_exact(elements).map_err(|error| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::intersection_per_element_with_poll: lower allocation failed for \
+                 {elements} elements: {error}"
+            ))
+        })?;
+        poll()?;
+        upper.try_reserve_exact(elements).map_err(|error| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::intersection_per_element_with_poll: upper allocation failed for \
+                 {elements} elements: {error}"
+            ))
+        })?;
+        poll()?;
+
+        let mut disjoint_count = 0usize;
+        for (index, (((&self_lower, &self_upper), &other_lower), &other_upper)) in self
+            .lower
+            .iter()
+            .zip(self.upper.iter())
+            .zip(other.lower.iter())
+            .zip(other.upper.iter())
+            .enumerate()
+        {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            let tightened_lower = self_lower.max(other_lower);
+            let tightened_upper = self_upper.min(other_upper);
+            if tightened_lower <= tightened_upper {
+                lower.push(tightened_lower);
+                upper.push(tightened_upper);
+            } else {
+                disjoint_count += 1;
+                lower.push(self_lower.min(other_lower));
+                upper.push(self_upper.max(other_upper));
+            }
+        }
+        poll()?;
+
+        let lower = ArrayD::from_shape_vec(IxDyn(self.shape()), lower).map_err(|error| {
+            NyError::InternalError(format!(
+                "BoundedTensor::intersection_per_element_with_poll: lower reshape failed: {error}"
+            ))
+        })?;
+        let upper = ArrayD::from_shape_vec(IxDyn(self.shape()), upper).map_err(|error| {
+            NyError::InternalError(format!(
+                "BoundedTensor::intersection_per_element_with_poll: upper reshape failed: {error}"
+            ))
+        })?;
+        poll()?;
+        Ok(Some((
+            Self::from_parts_with_l2(lower, upper, None),
             disjoint_count,
-        ))
+        )))
     }
 }

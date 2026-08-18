@@ -18,7 +18,7 @@ use super::super::WgpuDevice;
 use super::gpu_checked_u32;
 use crate::wgpu_device::params::{ConvCol2imParams, GemmParams};
 
-use super::gemm::{select_gemm_dispatch, MAX_BINDING_ELEMS, WGPU_MAX_BINDING_BYTES};
+use super::gemm::select_gemm_dispatch;
 
 fn checked_col2im_workgroups(out_elems: usize) -> Result<u32> {
     let workgroups = out_elems.div_ceil(256);
@@ -90,14 +90,20 @@ impl WgpuDevice {
 
         // Check buffer limits: if any single buffer exceeds wgpu binding limit,
         // fall back to error (caller uses CPU path).
-        if gemm_k * gemm_n > MAX_BINDING_ELEMS
-            || gemm_m * gemm_k > MAX_BINDING_ELEMS
-            || gemm_out_elems > MAX_BINDING_ELEMS
-            || out_elems > MAX_BINDING_ELEMS
+        // #hard-caps: compare against the LIVE device limit, not wgpu's 128 MiB
+        // default. `WgpuDevice::new` requests the adapter's real limits, which on
+        // an Apple M4 Pro is 4095 MiB — 32x the constant this used to use. The
+        // old gate refused shapes the device could run, on the conv backward path
+        // that all four scoreboard deficits share.
+        let max_elems = self.max_binding_elems_live();
+        if gemm_k * gemm_n > max_elems
+            || gemm_m * gemm_k > max_elems
+            || gemm_out_elems > max_elems
+            || out_elems > max_elems
         {
             return Err(NyError::GpuMemoryExceeded {
                 required_bytes: gemm_out_elems.max(out_elems) * size_of::<f32>(),
-                budget_bytes: WGPU_MAX_BINDING_BYTES,
+                budget_bytes: self.max_binding_bytes_live(),
             });
         }
 
@@ -277,22 +283,32 @@ impl WgpuDevice {
 mod tests {
     use super::checked_col2im_workgroups;
 
-    /// The GPU fused `conv_transpose_2d` (GEMM + col2im) must be numerically
-    /// equivalent to the `NaiveCpuGemmEngine` reference for the small-conv
-    /// CROWN-backward shape. This pins down that the GPU conv op itself is NOT
-    /// the source of any GPU-vs-CPU CROWN bound gap (that gap was an alpha
-    /// optimization issue in the graph backward suffix, not this op). Skips
-    /// cleanly when no GPU is available.
+    /// #hard-caps: what the adapter ACTUALLY grants, vs the hard-coded
+    /// `WGPU_MAX_BINDING_BYTES` the buffer-fit gate compares against.
     #[test]
+    #[cfg(feature = "gpu-tests")]
+    fn adapter_binding_limits_cover_the_hardcoded_cap() {
+        let _g = crate::wgpu_device::test_support::gpu_test_serial_guard();
+        let device = crate::wgpu_device::test_support::require_device();
+        let l = device.device.limits();
+        let routing_cap = u64::try_from(crate::wgpu_device::ops::gemm::WGPU_MAX_BINDING_BYTES)
+            .expect("WGPU routing cap must fit the API's u64 byte unit");
+        assert!(
+            l.max_storage_buffer_binding_size >= routing_cap,
+            "constructor granted {} binding bytes, below the routing cap {}",
+            l.max_storage_buffer_binding_size,
+            routing_cap,
+        );
+    }
+
+    /// Deterministic small-shape correctness fixture. Unlike the measurement,
+    /// compiled by the explicit `gpu-tests` hardware suite.
+    #[test]
+    #[cfg(feature = "gpu-tests")]
     fn wgpu_conv_transpose_matches_naive_cpu_reference() {
         use ny_core::{ConvTranspose2dParams, GemmEngine, NaiveCpuGemmEngine};
-        let device = match crate::WgpuDevice::new() {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("no gpu; skipping wgpu_conv_transpose_matches_naive_cpu_reference");
-                return;
-            }
-        };
+        let _g = crate::wgpu_device::test_support::gpu_test_serial_guard();
+        let device = crate::wgpu_device::test_support::require_device();
         // Mirror the small conv graph case: conv kernel [1,1,2,2], stride 1, pad 0,
         // input 4x4 -> conv out 3x3. CROWN backward conv_transpose maps grad (3,3)
         // back to input (4,4). num_specs = number of objectives.

@@ -5,6 +5,7 @@
 //! Seeded GPU suffix acceleration for per-target graph alpha/CROWN backward.
 
 use super::target_backward_patches::resolve_preactivation;
+use crate::bounds::patches::PatchesMaterializationPurpose;
 use crate::bounds::{GraphAlphaState, LinearBounds};
 use crate::layers::Layer;
 use crate::network::core::{
@@ -16,6 +17,7 @@ use ndarray::{ArrayD, IxDyn};
 use ny_core::{GemmEngine, GpuCrownLayer, GpuCrownSeed, NyError, Result};
 use ny_tensor::{BoundedTensor, RepairStrategy};
 use std::collections::HashMap;
+use std::time::Instant;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -231,11 +233,32 @@ fn try_finish_target_gpu_suffix_with_plan(
     node_lb: &LinearBounds,
     plan: &GpuSuffixPlan,
     engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
     target_contract: &GraphTargetShapeContract,
 ) -> Result<Option<BoundedTensor>> {
+    // Building the host seed below scans and copies every coefficient and both
+    // input endpoints before the GPU call.  That legacy preparation is neither
+    // fallible nor cooperatively pollable, so a backend's own deadline support
+    // is insufficient to authorize this shortcut.  Keep finite requests on the
+    // CPU path, whose materialization/reduction kernels observe the same
+    // absolute deadline.  The ordinary no-deadline GPU suffix is unchanged.
+    // #gpu-suffix-expiry set-mate: default-off, byte-identical unarmed.
+    if let Some(limit) = deadline {
+        if Instant::now() >= limit {
+            return Err(NyError::DeadlineExceeded(
+                "Graph alpha GPU suffix deadline expired before host seed preparation".into(),
+            ));
+        }
+        if crate::sound_gpu_gate::gpu_suffix_declines_under_finite_authority(limit) {
+            return Ok(None);
+        }
+    }
+
     // Soundness gate (#vnncomp-gpu-crown-soundness): under the gate, route to the
     // SOUND seeded GPU-resident backward when available; else CPU sound fallback.
-    let Some((gpu, use_sound)) = crate::sound_gpu_gate::gpu_crown_backward_route(engine) else {
+    let Some((gpu, use_sound)) =
+        crate::sound_gpu_gate::gpu_crown_backward_route_with_deadline(engine, deadline)
+    else {
         return Ok(None);
     };
 
@@ -288,32 +311,30 @@ fn try_finish_target_gpu_suffix_with_plan(
         }
     };
 
-    // Only check for NaN, not Inf: Inf concrete bounds are valid conservative
-    // bounds and are handled downstream by RepairStrategy::Widen. The input
-    // seed guard (above) rejects non-finite coefficients since Inf in the linear
-    // relaxation matrices would produce meaningless GPU backward results.
-    if gpu_result
-        .lower_bounds
-        .iter()
-        .chain(gpu_result.upper_bounds.iter())
-        .any(|value| value.is_nan())
-    {
+    if !crate::sound_gpu_gate::gpu_crown_result_is_publishable(&gpu_result, seed.num_specs) {
         debug!(
             node_name = node_name,
-            "Graph alpha GPU suffix produced NaN bounds; falling back to CPU backward"
+            "Graph alpha GPU suffix produced malformed bounds; falling back to CPU backward"
         );
         return Ok(None);
     }
 
-    let lower = ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.lower_bounds)
-        .map_err(|error| NyError::InvalidSpec(format!("Graph alpha GPU lower reshape: {error}")))?;
-    let upper = ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.upper_bounds)
-        .map_err(|error| NyError::InvalidSpec(format!("Graph alpha GPU upper reshape: {error}")))?;
-    let bounds = BoundedTensor::new_repaired(lower, upper, RepairStrategy::Widen)?;
-    Ok(Some(target_contract.restore_concrete(
-        bounds,
-        "Graph alpha-CROWN GPU suffix restore",
-    )?))
+    let (Ok(lower), Ok(upper)) = (
+        ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.lower_bounds),
+        ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.upper_bounds),
+    ) else {
+        return Ok(None);
+    };
+    let Some(bounds) = BoundedTensor::new(lower, upper).ok() else {
+        return Ok(None);
+    };
+    let Some(bounds) = target_contract
+        .restore_concrete(bounds, "Graph alpha-CROWN GPU suffix restore")
+        .ok()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(bounds))
 }
 
 #[allow(clippy::too_many_arguments)] // extends try_finish_target_gpu_suffix with merge accumulator
@@ -323,6 +344,7 @@ pub(super) fn try_finish_target_gpu_suffix_with_pending_input(
     node_lb: &LinearBounds,
     plan: &GpuSuffixPlan,
     engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
     target_contract: &GraphTargetShapeContract,
     node_crown_bounds: &mut CrownMergeAccumulator,
 ) -> Result<Option<BoundedTensor>> {
@@ -337,6 +359,7 @@ pub(super) fn try_finish_target_gpu_suffix_with_pending_input(
         node_lb,
         plan,
         engine,
+        deadline,
         target_contract,
     )?
     else {
@@ -352,7 +375,10 @@ pub(super) fn try_finish_target_gpu_suffix_with_pending_input(
             })?;
         let pending_input_contribution = target_contract.restore_concrete(
             pending_input_contribution
-                .into_dense()?
+                .into_dense_with_deadline_for_purpose(
+                    deadline,
+                    PatchesMaterializationPurpose::NetworkInputTerminal,
+                )?
                 .concretize_sound(input),
             "Graph alpha-CROWN pending input contribution restore",
         )?;

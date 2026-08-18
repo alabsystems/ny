@@ -126,14 +126,15 @@ pub(super) struct JointCutDiag {
 /// The least representable float strictly greater than `x` (or `x` itself for
 /// NaN/+∞). Used to turn round-to-nearest primitive results into upper bounds.
 fn next_up(x: f64) -> f64 {
-    if x.is_nan() || x == f64::INFINITY {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > f64::INFINITY.to_bits() || bits == f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    let bits = x.to_bits();
-    if x > 0.0 {
+    if bits & 0x8000_0000_0000_0000 == 0 {
         f64::from_bits(bits + 1)
     } else {
         f64::from_bits(bits - 1)
@@ -193,7 +194,7 @@ fn vertex_tolerance(lf: f64, uf: f64, lg: f64, ug: f64, delta: f64) -> f64 {
 /// The critical (z_f, z_g) vertices: a SUPERSET of the vertices of P's
 /// subdivision by {z_f = 0, z_g = 0}. Every pairwise intersection of the lines
 ///   z_f ∈ {l_f, 0, u_f},  z_g ∈ {l_g, 0, u_g},  z_f − z_g = ±δ
-/// that lies inside P = [l_f,u_f]×[l_g,u_g] ∩ {|z_f−z_g| ≤ δ}. Membership uses
+/// that lies inside P = `[l_f, u_f] × [l_g, u_g] ∩ {|z_f − z_g| ≤ δ}`. Membership uses
 /// a conservative tolerance; deduplication is exact. See the module SOUNDNESS note.
 fn critical_vertices(lf: f64, uf: f64, lg: f64, ug: f64, delta: f64) -> (Vec<(f64, f64)>, f64) {
     let af = [lf, 0.0, uf];
@@ -590,6 +591,5 @@ pub(super) fn attach_joint_relu_cuts(
     (added, diag)
 }
 
-#[cfg(test)]
 #[path = "graph_mip_joint_relu_cuts_tests.rs"]
-mod tests;
+pub(crate) mod research;

@@ -25,6 +25,7 @@ mod softmax_overflow_3012;
 mod softmax_vacuous_2479;
 // Star-set affine transformer IBP-parity soundness gate (S1-2).
 mod star_parity;
+mod star_relu_exact;
 // Unwired block-generator convolution: scalar differential and resource model.
 mod star_blocked_conv2d;
 mod transpose;

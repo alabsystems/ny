@@ -437,9 +437,13 @@ fn analytic_chain_gradients(
         None, // mul_binary_alphas — not used in AnalyticChain gradient computation
         None, // No deadline for AnalyticChain gradient computation (#3393)
     ) {
-        Ok((_bounds, intermediate)) => {
-            Ok(graph.compute_graph_chain_rule_gradients(input, &relu_names, &intermediate))
-        }
+        Ok((_bounds, intermediate)) => Ok(graph.compute_graph_chain_rule_gradients_with_binding(
+            input,
+            &relu_names,
+            &intermediate,
+            Some(&graph_alpha_state),
+            engine,
+        )),
         Err(error) => {
             // Fall back to local gradients if intermediate storage failed.
             record_chain_rule_fallback(

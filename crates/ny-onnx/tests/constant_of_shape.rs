@@ -38,6 +38,19 @@ fn tensor_f32(name: &str, shape: &[i64], data: &[f32]) -> onnx_proto::TensorProt
     }
 }
 
+fn tensor_i64(name: &str, shape: &[i64], data: &[i64]) -> onnx_proto::TensorProto {
+    let elements = shape.iter().product::<i64>() as usize;
+    assert_eq!(elements, data.len());
+    onnx_proto::TensorProto {
+        dims: shape.to_vec(),
+        data_type: 7,
+        name: name.to_string(),
+        raw_data: Vec::new(),
+        int64_data: data.to_vec(),
+        ..Default::default()
+    }
+}
+
 fn node(
     name: &str,
     op_type: &str,
@@ -69,7 +82,7 @@ fn model_from_graph(graph: onnx_proto::GraphProto) -> onnx_proto::ModelProto {
 
 #[test]
 fn test_constant_of_shape_constant_fold() {
-    let shape_tensor = tensor_f32("shape", &[2], &[2.0, 1.0]);
+    let shape_tensor = tensor_i64("shape", &[2], &[2, 1]);
     let graph = onnx_proto::GraphProto {
         name: "const_of_shape_graph".to_string(),
         initializer: vec![shape_tensor],
@@ -97,7 +110,7 @@ fn test_constant_of_shape_constant_fold() {
 }
 
 #[test]
-fn test_constant_of_shape_rejects_non_integer_shape() {
+fn test_constant_of_shape_rejects_non_int64_shape() {
     let shape_tensor = tensor_f32("shape", &[2], &[1.0, 2.25]);
     let graph = onnx_proto::GraphProto {
         name: "const_of_shape_non_integer_shape".to_string(),
@@ -116,14 +129,19 @@ fn test_constant_of_shape_rejects_non_integer_shape() {
     let mut bytes = Vec::new();
     model.encode(&mut bytes).expect("encode model");
 
-    let model =
-        load_onnx_bytes("const_of_shape_non_integer_shape", &bytes).expect("load onnx bytes");
-    assert!(model.weights.get("out").is_none());
+    let error = load_onnx_bytes("const_of_shape_non_integer_shape", &bytes)
+        .expect_err("a FLOAT ConstantOfShape shape input must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("requires INT64 shape input 'shape', got ONNX dtype 1"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
-fn test_constant_fold_skips_multi_output_nodes() {
-    let shape_tensor = tensor_f32("shape", &[2], &[2.0, 1.0]);
+fn test_constant_of_shape_rejects_multi_output_nodes_at_raw_schema_boundary() {
+    let shape_tensor = tensor_i64("shape", &[2], &[2, 1]);
     let graph = onnx_proto::GraphProto {
         name: "const_of_shape_multi_output".to_string(),
         initializer: vec![shape_tensor],
@@ -141,9 +159,14 @@ fn test_constant_fold_skips_multi_output_nodes() {
     let mut bytes = Vec::new();
     model.encode(&mut bytes).expect("encode model");
 
-    let model = load_onnx_bytes("const_of_shape_multi_output", &bytes).expect("load onnx bytes");
-    assert!(model.weights.get("out").is_none());
-    assert!(model.weights.get("extra").is_none());
+    let error = load_onnx_bytes("const_of_shape_multi_output", &bytes)
+        .expect_err("a multi-output ConstantOfShape must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("must have exactly one non-empty input and exactly one non-empty output"),
+        "unexpected error: {error}"
+    );
 }
 
 /// Mul of two constant initializers with broadcast-compatible shapes folds to

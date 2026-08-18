@@ -484,14 +484,34 @@ fn exact_support_certifies_closed_form_diamond() {
     );
     assert_eq!(certified.b, 1.0, "closed-form exact support");
 
+    let certificate = checker
+        .certify_normal_certificate(normal)
+        .expect("finite exact support must produce evidence");
+    assert_eq!(certificate.facet(), certified);
+    assert_eq!(
+        certificate.support_domain(),
+        &p,
+        "the certificate must retain the exact support domain"
+    );
+
+    let err = certified_coupling_facet_certificates_exact_with_deadline(&p, Some(Instant::now()))
+        .expect_err("an expired exact-facet request must publish no certificates");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
+
     // The end-to-end repair seam must discard the legacy RHS and reproduce each
-    // proposal through the independent checker.
-    let facets = certified_coupling_facets_exact(&p);
+    // proposal through the independent checker without erasing proof identity.
+    let certificates = certified_coupling_facet_certificates_exact(&p);
     assert!(
-        !facets.is_empty(),
+        !certificates.is_empty(),
         "diamond must yield exact-certified proposals"
     );
-    for facet in facets {
+    for certificate in certificates {
+        assert_eq!(
+            certificate.support_domain(),
+            &p,
+            "every exact producer result must stay bound to its support domain"
+        );
+        let facet = certificate.facet();
         assert_eq!(
             checker.certify_normal(facet.a),
             Some(facet),
@@ -518,9 +538,9 @@ fn exact_support_preserves_sub_ulp_cancellation_band() {
 
     let expected = delta as f32;
     assert_eq!(certified.b, expected, "exact max(x1-x2) must be delta");
-    let rhs = BigRational::from_float(f64::from(certified.b)).unwrap();
+    let rhs = BigRational::from_float(certified.b).unwrap();
     let exact = BigRational::from_float(delta).unwrap();
-    let predecessor = BigRational::from_float(f64::from(next_down_f32(certified.b))).unwrap();
+    let predecessor = BigRational::from_float(next_down_f32(certified.b)).unwrap();
     assert!(rhs >= exact, "stored RHS is outward in exact arithmetic");
     assert!(predecessor < exact, "the directed f32 RHS is tight");
 }
@@ -543,7 +563,7 @@ fn exact_support_rounds_rhs_up_when_nearest_f32_is_inward() {
         .certify_normal([1.0, 0.0, 0.0, 0.0])
         .expect("finite directed RHS");
     assert_eq!(certified.b, next_up_f32(1.0));
-    let encoded = BigRational::from_float(f64::from(certified.b)).unwrap();
+    let encoded = BigRational::from_float(certified.b).unwrap();
     let optimum = BigRational::from_float(support).unwrap();
     assert!(
         encoded >= optimum,
@@ -671,13 +691,15 @@ fn injection_folds_coeff_error() {
     let after = bounds.lower_a()[[0, col]];
     let err_after = bounds.lower_a_err().unwrap()[[0, col]];
 
-    // The stored coefficient moved by ~coeff; the certified error grew by the
-    // exact f32 rounding gap of the mutation (folded via next_up).
-    let gap = ((after as f64) - (before as f64 + coeff as f64)).abs() as f32;
-    let expected = next_up_f32(err_before + gap);
-    assert_eq!(
-        err_after, expected,
-        "error fold must equal next_up(old_err + gap)"
+    // The stored coefficient moved by ~coeff; the certified error covers the
+    // exact-real f32 addition gap. The implementation may widen further to
+    // survive DAZ/FTZ and error-accumulation rounding.
+    let exact_gap = (ny_core::f32_to_f64_exact(after)
+        - (ny_core::f32_to_f64_exact(before) + ny_core::f32_to_f64_exact(coeff)))
+    .abs();
+    assert!(
+        ny_core::f32_to_f64_exact(err_after) >= ny_core::f32_to_f64_exact(err_before) + exact_gap,
+        "error fold must cover old error plus the exact addition gap"
     );
     assert!(
         err_after >= err_before,
@@ -685,6 +707,570 @@ fn injection_folds_coeff_error() {
     );
     // Untouched columns keep their (zero) error.
     assert_eq!(bounds.lower_a_err().unwrap()[[0, 0]], 0.0);
+}
+
+/// Column injection is transactional across output rows: a late overflow may
+/// not leave an earlier, otherwise-writable row modified.
+#[test]
+fn lower_column_injection_preflight_prevents_partial_mutation() {
+    let lower = Array2::from_shape_vec((2, 1), vec![0.0_f32, f32::MAX]).unwrap();
+    let upper = lower.clone();
+    let mut bounds = LinearBounds::new(
+        lower,
+        Array1::from_vec(vec![0.0, 0.0]),
+        upper,
+        Array1::from_vec(vec![0.0, 0.0]),
+    )
+    .unwrap();
+    bounds.ensure_lower_coeff_err_tracking();
+    let coefficients_before = bounds.lower_a().to_owned();
+    let errors_before = bounds.lower_a_err().unwrap().to_owned();
+
+    assert!(
+        !bounds.add_to_lower_column_with_err(0, f32::MAX, 0.0),
+        "the second row must reject finite-to-infinite overflow"
+    );
+    assert_eq!(bounds.lower_a(), &coefficients_before);
+    assert_eq!(bounds.lower_a_err().unwrap(), &errors_before);
+}
+
+/// A binary32 subnormal increment disappears when added to 1.0 even on a
+/// gradual-underflow host, and may be erased earlier by DAZ. Its exact bit value
+/// must still enter the coefficient-error certificate.
+#[test]
+fn subnormal_increment_is_not_erased_from_error_certificate() {
+    let tiny = f32::from_bits(1);
+    let lower = Array2::from_shape_vec((1, 1), vec![1.0_f32]).unwrap();
+    let upper = lower.clone();
+    let mut bounds = LinearBounds::new(
+        lower,
+        Array1::from_vec(vec![0.0]),
+        upper,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+    bounds.ensure_lower_coeff_err_tracking();
+
+    assert!(bounds.add_to_lower_column_with_err(0, tiny, 0.0));
+    assert!(
+        ny_core::f32_to_f64_exact(bounds.lower_a_err().unwrap()[[0, 0]])
+            >= ny_core::f32_to_f64_exact(tiny),
+        "subnormal addition loss must remain certified"
+    );
+}
+
+/// The pre-activation injection dispatcher itself must not classify a
+/// bit-nonzero subnormal as zero under DAZ before the certified column helper
+/// can account for its loss when it is added to 1.0.
+#[test]
+fn pre_activation_subnormal_reaches_error_certificate() {
+    let tiny = f32::from_bits(1);
+    let group = MultiNeuronConstraint::new(
+        vec![MnTerm {
+            node_name: "r".to_string(),
+            neuron_idx: 0,
+            var: MnVar::PreActivation,
+            coefficient: tiny,
+        }],
+        0.0,
+        1.0,
+    )
+    .unwrap();
+    let lower = Array2::from_shape_vec((1, 1), vec![1.0_f32]).unwrap();
+    let upper = lower.clone();
+    let mut carrier = LinearBounds::new(
+        lower,
+        Array1::from_vec(vec![0.0]),
+        upper,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        group.inject_post_terms_before_relu(&mut carrier, "r", 1.0),
+        MnInjectOutcome::Injected
+    );
+    assert!(group.inject_pre_terms_after_relu(&mut carrier, "r", 1.0));
+    assert!(
+        ny_core::f32_to_f64_exact(carrier.lower_a_err().unwrap()[[0, 0]])
+            >= ny_core::f32_to_f64_exact(tiny),
+        "the pre-activation subnormal must survive dispatch into the certificate"
+    );
+}
+
+/// A negative post-activation subnormal cannot be dropped under DAZ: doing so
+/// would raise a lower functional on the non-negative ReLU output.
+#[test]
+fn negative_post_activation_subnormal_reaches_error_certificate() {
+    let tiny = f32::from_bits(1);
+    let group = MultiNeuronConstraint::new(
+        vec![MnTerm {
+            node_name: "r".to_string(),
+            neuron_idx: 0,
+            var: MnVar::PostActivation,
+            coefficient: -tiny,
+        }],
+        0.0,
+        1.0,
+    )
+    .unwrap();
+    let lower = Array2::from_shape_vec((1, 1), vec![1.0_f32]).unwrap();
+    let upper = lower.clone();
+    let mut carrier = LinearBounds::new(
+        lower,
+        Array1::from_vec(vec![0.0]),
+        upper,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        group.inject_post_terms_before_relu(&mut carrier, "r", 1.0),
+        MnInjectOutcome::Injected
+    );
+    assert!(
+        ny_core::f32_to_f64_exact(carrier.lower_a_err().unwrap()[[0, 0]])
+            >= ny_core::f32_to_f64_exact(tiny),
+        "the negative post-activation subnormal must enter the certificate"
+    );
+}
+
+/// A negative facet bias can require a positive shift above the f32 range.
+/// Directed bias addition must stay finite at the greatest representable lower
+/// endpoint instead of publishing `+inf`.
+#[test]
+fn negative_bias_positive_overflow_rounds_to_finite_lower_endpoint() {
+    let group = MultiNeuronConstraint::new(
+        vec![MnTerm {
+            node_name: "r".to_string(),
+            neuron_idx: 0,
+            var: MnVar::PreActivation,
+            coefficient: 0.0,
+        }],
+        -f32::MAX,
+        10.0,
+    )
+    .unwrap();
+    let zeros = Array2::from_shape_vec((1, 1), vec![0.0_f32]).unwrap();
+    let mut carrier = LinearBounds::new(
+        zeros.clone(),
+        Array1::from_vec(vec![f32::MAX]),
+        zeros,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        group.inject_post_terms_before_relu(&mut carrier, "r", 10.0),
+        MnInjectOutcome::Injected
+    );
+    assert!(group.inject_pre_terms_after_relu(&mut carrier, "r", 10.0));
+    assert_eq!(carrier.lower_b()[0], f32::MAX);
+    assert!(carrier.lower_b()[0].is_finite());
+}
+
+/// Round-to-nearest can inject more non-negative ReLU-output mass than a
+/// certificate owns. Directed post rounding and upward price rounding must
+/// bracket the exact f64 products instead.
+#[test]
+fn adversarial_rounding_never_folds_more_than_the_certificate() {
+    let cases: &[(f32, f32)] = &[
+        (1.000_000_1, 3.000_000_2),
+        (0.1, 0.3),
+        (1.0 / 3.0, 7.0 / 9.0),
+        (f32::MIN_POSITIVE * 4.0, 0.5),
+        (1e-30, 1e-8),
+        (123.456_79, 0.007),
+    ];
+
+    let mut saw_nearest_overshoot = false;
+    for &(coefficient, beta) in cases {
+        let exact_coefficient =
+            ny_core::f32_to_f64_exact(beta) * ny_core::f32_to_f64_exact(coefficient);
+        if ny_core::f32_to_f64_exact(beta * coefficient) > exact_coefficient {
+            saw_nearest_overshoot = true;
+        }
+        let terms = vec![
+            MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PostActivation,
+                coefficient,
+            },
+            MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 1,
+                var: MnVar::PostActivation,
+                coefficient,
+            },
+        ];
+        let bias = 1.000_000_1_f32;
+        let group = MultiNeuronConstraint::new(terms, bias, beta).unwrap();
+        let zeros = Array2::from_shape_vec((1, 2), vec![0.0_f32, 0.0]).unwrap();
+        let mut carrier = LinearBounds::new(
+            zeros.clone(),
+            Array1::from_vec(vec![0.0]),
+            zeros,
+            Array1::from_vec(vec![0.0]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            group.inject_post_terms_before_relu(&mut carrier, "r", beta),
+            MnInjectOutcome::Injected
+        );
+        for column in 0..2 {
+            assert!(
+                ny_core::f32_to_f64_exact(carrier.lower_a()[[0, column]]) <= exact_coefficient,
+                "stored post coefficient exceeds exact beta*coefficient"
+            );
+        }
+
+        let before_price = carrier.lower_b()[0];
+        assert!(group.inject_pre_terms_after_relu(&mut carrier, "r", beta));
+        let paid = ny_core::f32_to_f64_exact(before_price)
+            - ny_core::f32_to_f64_exact(carrier.lower_b()[0]);
+        let exact_price = ny_core::f32_to_f64_exact(beta) * ny_core::f32_to_f64_exact(bias);
+        assert!(
+            paid >= exact_price,
+            "stored price {paid} underpays exact beta*bias {exact_price}"
+        );
+    }
+    assert!(
+        saw_nearest_overshoot,
+        "fixture must exercise a nearest-rounded product above its exact value"
+    );
+}
+
+/// Mutating an exact carrier must materialize error tracking before the first
+/// lossy f32 addition.
+#[test]
+fn injection_into_exact_carrier_starts_tracking_error() {
+    let terms = vec![
+        MnTerm {
+            node_name: "r".to_string(),
+            neuron_idx: 0,
+            var: MnVar::PostActivation,
+            coefficient: 0.1,
+        },
+        MnTerm {
+            node_name: "r".to_string(),
+            neuron_idx: 1,
+            var: MnVar::PostActivation,
+            coefficient: 0.7,
+        },
+    ];
+    let group = MultiNeuronConstraint::new(terms, 0.25, 0.3).unwrap();
+    let large = Array2::from_shape_vec((1, 2), vec![1e7_f32, 1e7]).unwrap();
+    let mut carrier = LinearBounds::new(
+        large.clone(),
+        Array1::from_vec(vec![0.0]),
+        large,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+    assert!(carrier.lower_a_err().is_none());
+    assert_eq!(
+        group.inject_post_terms_before_relu(&mut carrier, "r", 0.3),
+        MnInjectOutcome::Injected
+    );
+    assert!(
+        carrier.lower_a_err().unwrap()[[0, 0]] > 0.0,
+        "the carrier-addition rounding gap was not certified"
+    );
+}
+
+/// A signed pre-activation coefficient needs a symmetric product residual;
+/// neither directed coefficient rounding alone is conservative for arbitrary
+/// input signs.
+#[test]
+fn pre_activation_product_residual_is_certified() {
+    let coefficient = 0.1_f32;
+    let beta = 0.3_f32;
+    let group = MultiNeuronConstraint::new(
+        vec![MnTerm {
+            node_name: "r".to_string(),
+            neuron_idx: 0,
+            var: MnVar::PreActivation,
+            coefficient,
+        }],
+        0.0,
+        beta,
+    )
+    .unwrap();
+    let zeros = Array2::from_shape_vec((1, 1), vec![0.0_f32]).unwrap();
+    let mut carrier = LinearBounds::new(
+        zeros.clone(),
+        Array1::from_vec(vec![0.0]),
+        zeros,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        group.inject_post_terms_before_relu(&mut carrier, "r", beta),
+        MnInjectOutcome::Injected,
+        "a pre-only group still commits a price-bearing Lagrangian term"
+    );
+    assert!(group.inject_pre_terms_after_relu(&mut carrier, "r", beta));
+    let stored = ny_core::f32_to_f64_exact(carrier.lower_a()[[0, 0]]);
+    let exact = ny_core::f32_to_f64_exact(beta) * ny_core::f32_to_f64_exact(coefficient);
+    let certified_error = ny_core::f32_to_f64_exact(carrier.lower_a_err().unwrap()[[0, 0]]);
+    assert!(
+        certified_error >= (stored - exact).abs(),
+        "stored pre coefficient residual is not covered: stored={stored}, exact={exact}, err={certified_error}"
+    );
+}
+
+/// A late pre-term failure must erase any earlier pre-term mutation even when a
+/// caller ignores the returned status.
+#[test]
+fn pre_activation_completion_failure_degrades_internally() {
+    let group = MultiNeuronConstraint::new(
+        vec![
+            MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PreActivation,
+                coefficient: 0.1,
+            },
+            MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PreActivation,
+                coefficient: f32::MAX,
+            },
+        ],
+        0.0,
+        10.0,
+    )
+    .unwrap();
+    let zeros = Array2::from_shape_vec((1, 1), vec![0.0_f32]).unwrap();
+    let mut carrier = LinearBounds::new(
+        zeros.clone(),
+        Array1::from_vec(vec![0.0]),
+        zeros,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        group.inject_post_terms_before_relu(&mut carrier, "r", 10.0),
+        MnInjectOutcome::Injected
+    );
+    assert!(!group.inject_pre_terms_after_relu(&mut carrier, "r", 10.0));
+    assert_eq!(carrier.lower_a()[[0, 0]], 0.0);
+    assert_eq!(carrier.lower_b()[0], f32::NEG_INFINITY);
+    assert_eq!(carrier.lower_a_err().unwrap()[[0, 0]], 0.0);
+}
+
+/// An invalid term index suppresses the entire group before either coefficient
+/// mass or the bias price is applied.
+#[test]
+fn out_of_range_group_is_skipped_atomically() {
+    let group = MultiNeuronConstraint::new(
+        vec![
+            MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PostActivation,
+                coefficient: 1.0,
+            },
+            MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 99,
+                var: MnVar::PostActivation,
+                coefficient: 1.0,
+            },
+        ],
+        -5.0,
+        1.0,
+    )
+    .unwrap();
+    let zeros = Array2::from_shape_vec((1, 2), vec![0.0_f32, 0.0]).unwrap();
+    let mut carrier = LinearBounds::new(
+        zeros.clone(),
+        Array1::from_vec(vec![0.0]),
+        zeros,
+        Array1::from_vec(vec![0.0]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        group.inject_post_terms_before_relu(&mut carrier, "r", 1.0),
+        MnInjectOutcome::Skipped
+    );
+    assert_eq!(carrier.lower_a()[[0, 0]], 0.0);
+    assert_eq!(carrier.lower_b()[0], 0.0);
+    assert!(carrier.lower_a_err().is_none());
+}
+
+/// Exercise the production Graph-CROWN handshake, not only the injection
+/// primitives. A skipped group must be indistinguishable from an inert pool;
+/// a group whose post mass commits but whose price cannot be represented must
+/// degrade and recover the baseline instead of publishing free mass.
+#[test]
+fn graph_crown_group_injection_fails_closed_end_to_end() {
+    use crate::layers::{Layer, ReLULayer};
+    use crate::network::{GraphNetwork, GraphNode, SpecCrownRequest};
+    use crate::types::{BoundsProvenance, CrownIbpFallbackReason};
+    use ndarray::{arr1, arr2};
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("r", Layer::ReLU(ReLULayer::new())));
+    graph.set_output("r");
+    let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    let spec = arr2(&[[1.0_f32], [-1.0]]);
+    let node_bounds = graph.collect_node_bounds(&input).unwrap();
+
+    let mut inert_pool = MultiNeuronPool::new(1);
+    assert!(inert_pool.push(
+        MultiNeuronConstraint::new(
+            vec![MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PostActivation,
+                coefficient: 1.0,
+            }],
+            0.0,
+            0.0,
+        )
+        .unwrap()
+    ));
+    let (baseline, baseline_linear, _) = SpecCrownRequest::new(&graph, &input, &spec, None)
+        .node_bounds(&node_bounds)
+        .mn_pool_opt(Some(&inert_pool))
+        .run_all()
+        .unwrap();
+    assert_eq!(baseline.provenance, BoundsProvenance::Crown);
+    let baseline_linear = baseline_linear.unwrap();
+
+    // Engagement-sensitive positive control. `y <= 2` is valid over this
+    // fixture. Its nonzero multiplier deliberately loosens both objective rows;
+    // if the production handshake were bypassed this would equal `baseline`.
+    let mut payable_pool = MultiNeuronPool::new(1);
+    assert!(payable_pool.push(
+        MultiNeuronConstraint::new(
+            vec![MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PostActivation,
+                coefficient: 1.0,
+            }],
+            2.0,
+            0.5,
+        )
+        .unwrap()
+    ));
+    let (payable, payable_linear, _) = SpecCrownRequest::new(&graph, &input, &spec, None)
+        .node_bounds(&node_bounds)
+        .mn_pool_opt(Some(&payable_pool))
+        .run_all()
+        .unwrap();
+    assert_eq!(payable.provenance, BoundsProvenance::Crown);
+    let payable_linear = payable_linear.unwrap();
+    assert_ne!(
+        payable_linear.lower_b(),
+        baseline_linear.lower_b(),
+        "raw input-linear carrier must prove that the pool reached the ReLU handshake"
+    );
+    for (&lower, true_minimum) in payable.bounds.lower().iter().zip([0.0_f32, -1.0_f32]) {
+        assert!(
+            lower <= true_minimum,
+            "valid pooled lower {lower} exceeds the analytic minimum {true_minimum}"
+        );
+    }
+
+    let mut skipped_pool = MultiNeuronPool::new(1);
+    assert!(skipped_pool.push(
+        MultiNeuronConstraint::new(
+            vec![
+                MnTerm {
+                    node_name: "r".to_string(),
+                    neuron_idx: 0,
+                    var: MnVar::PostActivation,
+                    coefficient: 1.0,
+                },
+                MnTerm {
+                    node_name: "r".to_string(),
+                    neuron_idx: 1,
+                    var: MnVar::PostActivation,
+                    coefficient: 1.0,
+                },
+            ],
+            -5.0,
+            1.0,
+        )
+        .unwrap()
+    ));
+    let skipped = SpecCrownRequest::new(&graph, &input, &spec, None)
+        .node_bounds(&node_bounds)
+        .mn_pool_opt(Some(&skipped_pool))
+        .run_with_provenance()
+        .unwrap();
+    assert_eq!(skipped.provenance, BoundsProvenance::Crown);
+    assert_eq!(
+        skipped.bounds.lower(),
+        baseline.bounds.lower(),
+        "an OOB group must contribute neither partial mass nor an orphan price"
+    );
+
+    let mut unpayable_pool = MultiNeuronPool::new(1);
+    assert!(unpayable_pool.push(
+        MultiNeuronConstraint::new(
+            vec![MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PostActivation,
+                coefficient: 0.1,
+            }],
+            f32::MAX,
+            10.0,
+        )
+        .unwrap()
+    ));
+    let unpayable = SpecCrownRequest::new(&graph, &input, &spec, None)
+        .node_bounds(&node_bounds)
+        .mn_pool_opt(Some(&unpayable_pool))
+        .run_with_provenance()
+        .unwrap();
+    assert_eq!(
+        unpayable.provenance,
+        BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::CrownPropagationError)
+    );
+    for (&lower, true_minimum) in unpayable.bounds.lower().iter().zip([0.0_f32, -1.0_f32]) {
+        assert!(
+            lower <= true_minimum,
+            "fallback lower {lower} exceeds the analytic minimum {true_minimum}"
+        );
+    }
+
+    // Cache carriers do not encode coefficient-error matrices. A nonempty pool
+    // therefore suppresses cache publication for the whole request.
+    let mut pre_pool = MultiNeuronPool::new(1);
+    assert!(pre_pool.push(
+        MultiNeuronConstraint::new(
+            vec![MnTerm {
+                node_name: "r".to_string(),
+                neuron_idx: 0,
+                var: MnVar::PreActivation,
+                coefficient: 0.1,
+            }],
+            1.0,
+            0.3,
+        )
+        .unwrap()
+    ));
+    let (_, cache) = SpecCrownRequest::new(&graph, &input, &spec, None)
+        .node_bounds(&node_bounds)
+        .mn_pool_opt(Some(&pre_pool))
+        .capture_cache()
+        .run_with_cache()
+        .unwrap();
+    assert!(
+        cache.is_none(),
+        "mn_pool proof state must not enter a lossy cache"
+    );
 }
 
 // ===========================================================================
@@ -969,6 +1555,153 @@ fn excluded_corner_score_ranks_coupling_strength() {
 // (a genuine spec-guided CROWN backward through the intervening ReLU), then
 // verify P ⊇ Z by sampling REAL network inputs → true pre-activations.
 // ===========================================================================
+
+fn deadline_producer_fixture() -> (
+    crate::GraphNetwork,
+    BoundedTensor,
+    std::collections::HashMap<String, BoundedTensor>,
+    crate::bounds::GraphAlphaState,
+) {
+    use crate::{GraphNetwork, GraphNode, Layer, LinearLayer};
+    use ndarray::{arr1, arr2};
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "pre",
+        Layer::Linear(
+            LinearLayer::new(
+                arr2(&[[1.0_f32, 0.25], [-0.5, 1.0]]),
+                Some(arr1(&[0.0_f32, 0.0])),
+            )
+            .unwrap(),
+        ),
+    ));
+    graph.set_output("pre");
+    let input = BoundedTensor::new(
+        arr1(&[-1.0_f32, -1.0]).into_dyn(),
+        arr1(&[1.0_f32, 1.0]).into_dyn(),
+    )
+    .unwrap();
+    let node_bounds = graph.collect_node_bounds_with_engine(&input, None).unwrap();
+    let alpha = crate::bounds::GraphAlphaState::new();
+    (graph, input, node_bounds, alpha)
+}
+
+#[test]
+fn producer_batch_mid_conversion_deadline_publishes_no_partial_vec() {
+    use producer::ProducerDeadlineStage;
+    use std::cell::Cell;
+
+    let (graph, input, node_bounds, alpha) = deadline_producer_fixture();
+    let pairs = [(0usize, 1usize), (1, 0)];
+    let converted = Cell::new(0usize);
+    let err = producer::combined_rows_octahedra_with_checker_for_test(
+        &graph,
+        &input,
+        &alpha,
+        Some(&node_bounds),
+        "pre",
+        &pairs,
+        None,
+        |stage| {
+            if matches!(stage, ProducerDeadlineStage::AfterBatchPairConversion(_)) {
+                converted.set(converted.get() + 1);
+            }
+            if stage == ProducerDeadlineStage::BeforeBatchPairConversion(1) {
+                return Err(NyError::DeadlineExceeded(
+                    "injected mid-batch deadline".into(),
+                ));
+            }
+            Ok(())
+        },
+    )
+    .expect_err("mid-batch expiry must return Err, never a partial Vec");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    assert_eq!(
+        converted.get(),
+        1,
+        "the injected expiry must occur after one local result but before publication"
+    );
+}
+
+#[test]
+fn producer_batch_final_boundary_deadline_discards_complete_local_vec() {
+    use producer::ProducerDeadlineStage;
+    use std::cell::Cell;
+
+    let (graph, input, node_bounds, alpha) = deadline_producer_fixture();
+    let pairs = [(0usize, 1usize), (1, 0)];
+    let converted = Cell::new(0usize);
+    let err = producer::combined_rows_octahedra_with_checker_for_test(
+        &graph,
+        &input,
+        &alpha,
+        Some(&node_bounds),
+        "pre",
+        &pairs,
+        None,
+        |stage| {
+            if matches!(stage, ProducerDeadlineStage::AfterBatchPairConversion(_)) {
+                converted.set(converted.get() + 1);
+            }
+            if stage == ProducerDeadlineStage::BeforeBatchPublish {
+                return Err(NyError::DeadlineExceeded(
+                    "injected final batch deadline".into(),
+                ));
+            }
+            Ok(())
+        },
+    )
+    .expect_err("final-boundary expiry must discard the complete local Vec");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    assert_eq!(
+        converted.get(),
+        pairs.len(),
+        "the final publication check must run after every local conversion"
+    );
+}
+
+#[test]
+fn producer_single_post_conversion_deadline_discards_result() {
+    use producer::ProducerDeadlineStage;
+    use std::cell::Cell;
+
+    let (graph, input, node_bounds, alpha) = deadline_producer_fixture();
+    let conversion_stages = Cell::new(0usize);
+    let err = producer::combined_row_octahedron_with_checker_for_test(
+        &graph,
+        &input,
+        &alpha,
+        Some(&node_bounds),
+        "pre",
+        0,
+        1,
+        None,
+        |stage| {
+            if matches!(
+                stage,
+                ProducerDeadlineStage::AfterLowerConversion
+                    | ProducerDeadlineStage::AfterUpperConversion
+            ) {
+                conversion_stages.set(conversion_stages.get() + 1);
+            }
+            if stage == ProducerDeadlineStage::BeforeSinglePublish {
+                return Err(NyError::DeadlineExceeded(
+                    "injected post-conversion deadline".into(),
+                ));
+            }
+            Ok(())
+        },
+    )
+    .expect_err("post-conversion expiry must discard the single result");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    assert_eq!(
+        conversion_stages.get(),
+        2,
+        "the final publication check must follow both conversion stages"
+    );
+}
+
 #[test]
 fn producer_combined_row_encloses_on_real_backward() {
     use crate::bounds::GraphAlphaState;
@@ -1010,6 +1743,21 @@ fn producer_combined_row_encloses_on_real_backward() {
     alpha
         .add_relu_node("r1", node_bounds.get("l1").unwrap(), false)
         .unwrap();
+
+    let expired = Instant::now();
+    let err = combined_row_octahedron_with_deadline(
+        &graph,
+        &input,
+        &alpha,
+        Some(&node_bounds),
+        "pre",
+        0,
+        1,
+        None,
+        Some(expired),
+    )
+    .expect_err("an expired producer request must fail before its backward");
+    assert!(matches!(err, NyError::DeadlineExceeded(_)));
 
     let p = combined_row_octahedron(
         &graph,
@@ -1175,20 +1923,31 @@ fn routing_pre_post_is_sound_and_misrouting_is_detectable() {
             Array1::from_vec(vec![0.0f32]),
         )
         .unwrap();
+        let expected_post_outcome = if beta > 0.0 {
+            MnInjectOutcome::Injected
+        } else {
+            MnInjectOutcome::Inert
+        };
         if !mis {
-            group.inject_post_terms_before_relu(&mut node_lb, "r", beta);
+            assert_eq!(
+                group.inject_post_terms_before_relu(&mut node_lb, "r", beta),
+                expected_post_outcome
+            );
         } else {
             // WRONG: put the pre-activation (x) terms on the ReLU OUTPUT before relax.
-            group.inject_pre_terms_after_relu(&mut node_lb, "r", beta);
+            assert!(group.inject_pre_terms_after_relu(&mut node_lb, "r", beta));
         }
         let (mut new_lb, _g, _gu) = relu_layer
             .propagate_linear_with_alpha(&node_lb, &pre, &alpha, None)
             .unwrap();
         if !mis {
-            group.inject_pre_terms_after_relu(&mut new_lb, "r", beta);
+            assert!(group.inject_pre_terms_after_relu(&mut new_lb, "r", beta));
         } else {
             // WRONG: put the post-activation (y) terms directly on x, skipping relax.
-            group.inject_post_terms_before_relu(&mut new_lb, "r", beta);
+            assert_eq!(
+                group.inject_post_terms_before_relu(&mut new_lb, "r", beta),
+                expected_post_outcome
+            );
         }
         // Fold x = W u + t into u-columns, then box-concretize (exact f64 min).
         let qx = [
@@ -2526,4 +3285,100 @@ fn head_f64_certified_measure_produces_only_certified_facets() {
         total_facets,
         kept.len()
     );
+}
+
+// ===========================================================================
+// SOUNDNESS GUARD — the §2.2 step-3 price `−β_c·b_c` is once PER GROUP.
+//
+// The production sweep (`spec_propagation/core.rs`, the `mn_pool` arm) walks
+// every ReLU node once and offers EVERY pooled group at EVERY node. Before the
+// single-anchor guard, `inject_pre_terms_after_relu` folded `−β_c·b_c`
+// unconditionally on every call it did not early-return from, so the constant
+// was credited once per ReLU NODE rather than once per GROUP. With `b_c < 0`
+// that RAISES the lower bound above the Lagrangian value — a strict FALSE
+// TIGHTENING (i.e. a false VERIFIED). Both halves are pinned here.
+// ===========================================================================
+
+/// A carrier with two zero coefficient columns and a zero lower bias, so the
+/// only thing these tests observe is the group's constant fold.
+fn zero_bias_carrier() -> LinearBounds {
+    let a = Array2::<f32>::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+    LinearBounds::new(
+        a.clone(),
+        Array1::from_vec(vec![0.0f32]),
+        a,
+        Array1::from_vec(vec![0.0f32]),
+    )
+    .unwrap()
+}
+
+/// Guard 1 — a group whose terms straddle TWO ReLU nodes is UNCONSTRUCTIBLE.
+///
+/// Such a group has no unique anchor, so "charge the price once" is not even
+/// expressible: injecting at `r1` and then at `r2` credited `−β·b = +1.0` twice
+/// (measured pre-guard: `lower_b` 0.99999994 → 1.9999999 for `b = −1.0`,
+/// `β = 1`). Reject it at the constructor, the single choke point.
+#[test]
+fn mixed_node_group_is_unconstructible() {
+    let facet = Facet {
+        a: [0.5, 0.5, 1.0, 1.0],
+        b: -1.0,
+    };
+    let err = MultiNeuronConstraint::from_facet_for_group(&facet, "r1", 0, "r2", 0)
+        .expect_err("a group spanning TWO ReLU nodes must be rejected (no unique anchor)");
+    assert!(
+        err.contains("anchor"),
+        "rejection must name the single-anchor invariant, got {err:?}"
+    );
+
+    // A term-less group has no anchor either — its price could never be pinned.
+    assert!(
+        MultiNeuronConstraint::new(Vec::new(), -1.0, 0.0).is_err(),
+        "a term-less group must be rejected (no anchor node)"
+    );
+
+    // The production shape (both neurons on ONE ReLU node) still constructs.
+    let ok = MultiNeuronConstraint::from_facet_for_group(&facet, "r", 0, "r", 1)
+        .expect("a same-node k=2 group is the production shape and must construct");
+    assert_eq!(ok.anchor(), "r", "anchor is the group's single node");
+}
+
+/// Guard 2 — the price is charged at the ANCHOR node only, so a full backward
+/// sweep over many ReLU nodes credits `−β_c·b_c` exactly ONCE per group.
+///
+/// Pre-guard, a legitimate SAME-node group injected at an unrelated ReLU node
+/// still folded the bias: `lower_b` went 0.99999994 → 1.9999999. In a graph with
+/// K ReLU nodes that is a K-fold over-credit of a negative-bias facet.
+#[test]
+fn bias_price_is_charged_once_per_group_not_once_per_relu_node() {
+    let facet = Facet {
+        a: [0.5, 0.5, 1.0, 1.0],
+        b: -1.0, // b < 0 ⇒ −β·b > 0 ⇒ over-crediting RAISES the lower bound
+    };
+    let g = MultiNeuronConstraint::from_facet_for_group(&facet, "r", 0, "r", 1).unwrap();
+    let beta = 1.0f32;
+
+    let mut carrier = zero_bias_carrier();
+    assert!(g.inject_pre_terms_after_relu(&mut carrier, "r", beta));
+    let after_anchor = carrier.lower_b[0];
+    assert!(
+        after_anchor > 0.9 && after_anchor <= 1.0,
+        "the anchor node must pay the single price −β·b = +1.0 (outward-rounded down), got {after_anchor}"
+    );
+
+    // Sweep the rest of a multi-ReLU graph: nothing else may move the bias.
+    for other in ["r0", "r1", "r2", "relu_head", ""] {
+        assert!(g.inject_pre_terms_after_relu(&mut carrier, other, beta));
+        assert_eq!(
+            carrier.lower_b[0], after_anchor,
+            "a NON-anchor ReLU node ({other:?}) must not re-charge −β·b — that is a FALSE TIGHTENING"
+        );
+    }
+
+    // And the coefficient columns are likewise untouched off-anchor.
+    let mut fresh = zero_bias_carrier();
+    assert!(g.inject_pre_terms_after_relu(&mut fresh, "not_the_anchor", beta));
+    assert_eq!(fresh.lower_b[0], 0.0, "off-anchor injection must be inert");
+    assert_eq!(fresh.lower_a()[[0, 0]], 0.0);
+    assert_eq!(fresh.lower_a()[[0, 1]], 0.0);
 }

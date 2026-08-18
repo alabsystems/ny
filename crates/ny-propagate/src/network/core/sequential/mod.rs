@@ -4,17 +4,23 @@
 
 //! Sequential (layer-based) network representation.
 
-mod crown;
+pub(crate) mod crown;
 mod modes;
 
-pub(crate) use crown::crown_backward_step_patches;
 pub(crate) use crown::extract_relu_gpu_layer_with_alpha;
+pub(crate) use crown::materialize_terminal_crown_bounds_with_deadline;
 pub(crate) use crown::tighten_crown_output;
-pub(crate) use crown::tighten_crown_output_with_provenance;
+pub(crate) use crown::tighten_crown_output_with_deadline;
+pub(crate) use crown::tighten_crown_output_with_provenance_and_deadline;
 pub(crate) use crown::try_extract_single_gpu_layer;
 pub(crate) use crown::CrownStepFallback;
 pub(crate) use crown::CrownStepResult;
 pub(crate) use crown::{apply_bn_werr_to_host_relu, try_extract_batch_norm_conv1x1};
+pub(crate) use crown::{
+    crown_backward_step_patches, crown_backward_step_patches_spec_crown,
+    crown_backward_step_patches_with_deadline_authority, SpecPatchesStepError,
+};
+pub(crate) use crown::{gpu_relu_affine_cell, GpuReluAffineVariant};
 
 use crate::layers::Layer;
 use crown::GpuCrownStaticCache;
@@ -48,6 +54,17 @@ impl Clone for Network {
 }
 
 impl Network {
+    /// Drop static GPU CROWN descriptors after any model mutation.
+    ///
+    /// The cache owns cloned Linear/Conv parameters and topology. Returning a
+    /// mutable layer view or changing the sequence without invalidating it
+    /// could otherwise let a later authoritative GPU route bound the previous
+    /// network. Replacing the mutex is safe under `&mut self` and also clears a
+    /// prior poison state.
+    fn invalidate_gpu_crown_cache(&mut self) {
+        self.gpu_crown_cache = std::sync::Mutex::new(None);
+    }
+
     /// Create an empty network.
     pub fn new() -> Self {
         Self {
@@ -59,6 +76,7 @@ impl Network {
     /// Add a layer to the network.
     pub fn add_layer(&mut self, layer: Layer) {
         self.layers.push(layer);
+        self.invalidate_gpu_crown_cache();
     }
 
     /// Number of layers.
@@ -72,8 +90,11 @@ impl Network {
     }
 
     /// Mutable access to existing layers. Returns a slice to prevent
-    /// structural changes (push/pop/clear) — use `add_layer()` for those.
+    /// structural changes (push/pop/clear) — use `add_layer()` for those. Any
+    /// static GPU CROWN extraction is invalidated before mutable access is
+    /// granted.
     pub fn layers_mut(&mut self) -> &mut [Layer] {
+        self.invalidate_gpu_crown_cache();
         &mut self.layers
     }
 

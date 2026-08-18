@@ -14,7 +14,11 @@ fn make_test_network(layers: Vec<Layer>) -> Network {
     }
 }
 
-// GCP-CROWN: Cutting Plane Tests
+// Quarantined cutting-plane data structures and research arithmetic.
+//
+// These low-level tests preserve experimental code for a future certified
+// fold. They do not grant certificate authority or establish soundness of the
+// legacy post-concretization scalar.
 // =========================================================================
 
 fn make_basic_cut(kind: CutKind, bias: f32) -> CuttingPlane {
@@ -514,7 +518,7 @@ fn test_sequential_proactive_cuts_generation() {
 
 #[ntest::timeout(5000)]
 #[test]
-fn test_beta_crown_config_with_cuts() {
+fn test_quarantined_cut_config_fields_remain_inspectable() {
     let config = BetaCrownConfig {
         enable_cuts: true,
         max_cuts: 500,
@@ -525,87 +529,14 @@ fn test_beta_crown_config_with_cuts() {
     assert!(config.enable_cuts);
     assert_eq!(config.max_cuts, 500);
     assert_eq!(config.min_cut_depth, 3);
+    assert!(config.validate().is_err());
+    assert!(!config.cut_proof_authority_enabled());
 }
 
 #[ntest::timeout(5000)]
 #[test]
-fn test_cut_contribution_computation() {
-    // Test that cut contributions are computed correctly
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
-        ..Default::default()
-    });
-
-    // Create a simple cut with known terms
-    let mut cut = CuttingPlane {
-        terms: vec![
-            CutTerm {
-                layer_idx: 1,
-                neuron_idx: 0,
-                coefficient: 1.0,
-            },
-            CutTerm {
-                layer_idx: 1,
-                neuron_idx: 1,
-                coefficient: -1.0,
-            },
-        ],
-        bias: 0.0,
-        lambda: 1.0,
-        lambda_grad: 0.0,
-        lambda_m: 0.0,
-        lambda_v: 0.0,
-        source_depth: 2,
-        metadata: CutMetadata::new(0, CutKind::Verified),
-    };
-
-    // Create layer bounds: [lower, upper] for each neuron
-    // Neuron 0: [-1, 2] → unstable, z ∈ [0, 1]
-    // Neuron 1: [-2, 1] → unstable, z ∈ [0, 1]
-    let lower = arr1(&[-1.0, -2.0]).into_dyn();
-    let upper = arr1(&[2.0, 1.0]).into_dyn();
-    let bounds = BoundedTensor::new(lower, upper).unwrap();
-    let layer_bounds = vec![Arc::new(bounds)];
-
-    // Compute cut contribution using ReLU indicators
-    // For term 0: coeff=1 (positive) → use z_min = 0, contribution = 1 * 0 = 0
-    // For term 1: coeff=-1 (negative) → use z_max = 1, contribution = -1 * 1 = -1
-    // constraint_min = 0 + -1 = -1
-    // cut_contribution = lambda * (bias - constraint_min) = 1.0 * (0 - (-1)) = 1.0
-    let cuts = vec![&cut];
-    let contribution = verifier.compute_cut_contribution(&cuts, &layer_bounds);
-    assert!(
-        (contribution - 1.0).abs() < 1e-6,
-        "Expected 1.0, got {}",
-        contribution
-    );
-
-    // Test with different lambda
-    cut.lambda = 0.5;
-    let cuts = vec![&cut];
-    let contribution = verifier.compute_cut_contribution(&cuts, &layer_bounds);
-    assert!(
-        (contribution - 0.5).abs() < 1e-6,
-        "Expected 0.5, got {}",
-        contribution
-    );
-
-    // Test with non-zero bias
-    cut.lambda = 1.0;
-    cut.bias = -1.0; // bias - constraint_min = -1 - (-1) = 0
-    let cuts = vec![&cut];
-    let contribution = verifier.compute_cut_contribution(&cuts, &layer_bounds);
-    assert!(
-        (contribution - 0.0).abs() < 1e-6,
-        "Expected 0.0, got {}",
-        contribution
-    );
-}
-
-#[ntest::timeout(5000)]
-#[test]
-fn test_cut_gradient_computation() {
-    // Test that cut gradients are computed correctly
+fn test_quarantined_legacy_cut_gradient_arithmetic() {
+    // Characterize the matching legacy gradient only; it has no proof authority.
     // d(lb)/d(lambda) = bias - constraint_min (for lambda * (bias - constraint_min))
     let mut cut = CuttingPlane {
         terms: vec![CutTerm {
@@ -644,8 +575,8 @@ fn test_cut_gradient_computation() {
 
 #[ntest::timeout(5000)]
 #[test]
-fn test_cut_optimization_integration() {
-    // Test that cut optimization increases lower bounds when cuts have positive contribution
+fn test_quarantined_legacy_cut_optimizer_arithmetic() {
+    // Characterize the research optimizer independently of proof bounds.
     let config = AdaptiveOptConfig {
         lr_lambda: Some(0.1),
         ..Default::default()
@@ -781,7 +712,10 @@ fn test_graph_beta_crown_relu_split_detects_violation_relu_input() {
         .verify_graph_relu_split(&graph, &input, &[1.0], 0.5)
         .unwrap();
     assert!(
-        matches!(result.result, BabVerificationStatus::PotentialViolation),
+        matches!(
+            result.result,
+            BabVerificationStatus::PotentialViolation { .. }
+        ),
         "Expected PotentialViolation, got {:?}",
         result.result
     );
@@ -900,7 +834,10 @@ fn test_graph_beta_crown_relu_split_supports_conv2d() {
         .verify_graph_relu_split(&graph, &input, &[1.0], 0.5)
         .unwrap();
     assert!(
-        matches!(result.result, BabVerificationStatus::PotentialViolation),
+        matches!(
+            result.result,
+            BabVerificationStatus::PotentialViolation { .. }
+        ),
         "Expected PotentialViolation, got {:?}",
         result.result
     );
@@ -1101,9 +1038,9 @@ fn test_multi_objective_depth_limit_returns_unknown_1861() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_gcp_crown_cuts_generated_and_applied() {
-    // Test that GCP-CROWN cuts are generated from verified domains
-    // and applied to subsequent bound computations.
+fn test_gcp_crown_scored_verification_rejects_cut_authority() {
+    // The legacy research implementation remains unit-testable below, but it
+    // must not enter certificate-bearing verification.
     //
     // Network: Linear -> ReLU -> Linear -> ReLU -> Linear
     // Multiple ReLU layers create opportunities for cuts.
@@ -1127,12 +1064,12 @@ fn test_gcp_crown_cuts_generated_and_applied() {
 
     let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
 
-    // Test with cuts enabled - should generate cuts from verified sub-domains
+    // Any request for cut proof authority must fail before BaB starts.
     let verifier_with_cuts = BetaCrownVerifier::new(BetaCrownConfig {
         verify_upper_bound: false,
         use_alpha_crown: false,
         use_crown_ibp: false,
-        enable_cuts: true, // Enable GCP-CROWN
+        enable_cuts: true,
         max_cuts: 100,
         min_cut_depth: 1,
         max_domains: 128,
@@ -1142,90 +1079,21 @@ fn test_gcp_crown_cuts_generated_and_applied() {
         ..Default::default()
     });
 
-    // Verify a property that requires splitting
-    // Threshold of -2.0 should be easy enough to verify
-    let result_with_cuts = verifier_with_cuts.verify(&network, &input, -2.0).unwrap();
-
-    // Verify we got a result (verified or unknown)
+    let error = verifier_with_cuts
+        .verify(&network, &input, -2.0)
+        .expect_err("cut-enabled verification must be quarantined");
     assert!(
-        !matches!(
-            result_with_cuts.result,
-            BabVerificationStatus::PotentialViolation
-        ),
-        "Expected Verified or Unknown, got PotentialViolation"
-    );
-
-    // If verified, check that cuts were generated
-    if matches!(result_with_cuts.result, BabVerificationStatus::Verified) {
-        // Cuts should have been generated during the BaB process
-        // The cuts_generated count tracks how many times we tried to generate cuts
-        // (even if the pool was full or the domain was too shallow)
-        eprintln!(
-            "GCP-CROWN result: domains={}, verified={}, cuts={}",
-            result_with_cuts.domains_explored,
-            result_with_cuts.domains_verified,
-            result_with_cuts.cuts_generated
-        );
-
-        // With min_cut_depth=1, we should generate cuts from domains at depth >= 1
-        // When the property verifies quickly, there may be few or no cuts
-        // The test passes if verification completes
-    }
-}
-
-#[ntest::timeout(5000)]
-#[test]
-fn test_gcp_crown_cut_contribution_increases_lower_bound() {
-    // Test that when cuts have positive lambda, they contribute to tightening
-    // the lower bound via Lagrangian relaxation.
-    //
-    // This is a unit test for the cut contribution mechanism.
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
-        ..Default::default()
-    });
-
-    // Create a cut with positive lambda and terms
-    let cut = CuttingPlane {
-        terms: vec![CutTerm {
-            layer_idx: 1,
-            neuron_idx: 0,
-            coefficient: 1.0, // Active constraint: z_0 = 1
-        }],
-        bias: 0.5, // If neuron is stable-active (z=1), constraint is: 1 >= 0.5
-        // contribution = lambda * (bias - z_min) = 0.5 * (0.5 - 0) = 0.25
-        lambda: 0.5,
-        lambda_grad: 0.0,
-        lambda_m: 0.0,
-        lambda_v: 0.0,
-        source_depth: 1,
-        metadata: CutMetadata::new(0, CutKind::Verified),
-    };
-
-    // Create layer bounds where neuron is unstable (z_min=0, z_max=1)
-    let layer_bounds = vec![Arc::new(
-        BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap(),
-    )];
-
-    // Compute cut contribution
-    let contribution = verifier.compute_cut_contribution(&[&cut], &layer_bounds);
-
-    // Expected: lambda * (bias - z_min) = 0.5 * (0.5 - 0) = 0.25
-    // For unstable neuron with positive coefficient, z_min = 0
-    assert!(
-        (contribution - 0.25).abs() < 1e-6,
-        "Expected cut contribution 0.25, got {}",
-        contribution
+        error
+            .to_string()
+            .contains("cut proof authority is quarantined"),
+        "unexpected validation error: {error}"
     );
 }
 
 #[ntest::timeout(5000)]
 #[test]
-fn test_gcp_crown_lambda_optimization_convergence() {
-    // Test that lambda optimization converges when cuts have useful gradients.
-    //
-    // When the Lagrangian gradient is positive, lambda should increase
-    // (gradient ascent to maximize lower bound).
+fn test_quarantined_legacy_lambda_optimizer_arithmetic() {
+    // Characterize the research optimizer's positive-gradient behavior only.
     let config = AdaptiveOptConfig {
         lr_lambda: Some(0.1),
         ..Default::default()
@@ -1565,11 +1433,11 @@ fn bounds_with_and_without_cuts_2422(
     (baseline, with_cuts)
 }
 
-/// Regression test for #2422: scalar cut contributions must NOT be broadcast
-/// to multi-output bounds. Matches backward.rs objective guard (#2400).
+/// Defense in depth: even if validation is bypassed, quarantined cuts cannot
+/// alter multi-output certificate bounds.
 #[ntest::timeout(5000)]
 #[test]
-fn test_cut_contribution_not_broadcast_multi_output_2422() {
+fn test_quarantined_cut_authority_does_not_modify_multi_output_2422() {
     let w2 = arr2(&[[1.0f32, -0.3], [0.3, 1.0]]); // 2→2: multi-output
     let lb2 =
         BoundedTensor::new(arr1(&[-0.5, -0.5]).into_dyn(), arr1(&[2.0, 2.0]).into_dyn()).unwrap();
@@ -1604,18 +1472,20 @@ fn test_cut_contribution_not_broadcast_multi_output_2422() {
     }
 }
 
-/// Companion test for #2422: cuts SHOULD be applied for scalar output.
+/// Defense in depth: even the legacy scalar-output seam remains fail-closed
+/// when validation is bypassed.
 #[ntest::timeout(5000)]
 #[test]
-fn test_cut_contribution_applied_for_scalar_output_2422() {
+fn test_quarantined_cut_authority_does_not_modify_scalar_output_2422() {
     let w2 = arr2(&[[1.0f32, -1.0]]); // 2→1: scalar output
     let lb2 = BoundedTensor::new(arr1(&[-1.5]).into_dyn(), arr1(&[1.5]).into_dyn()).unwrap();
     let (baseline, with_cuts) = bounds_with_and_without_cuts_2422(w2, lb2);
 
     assert_eq!(baseline.lower().len(), 1, "output should be scalar");
-    assert!(
-        with_cuts.lower()[[0]] >= baseline.lower()[[0]],
-        "#2422: scalar output should have tighter lower bound with cuts: base={}, cut={}",
+    assert_eq!(
+        with_cuts.lower()[[0]],
+        baseline.lower()[[0]],
+        "quarantined cuts changed a scalar lower bound: base={}, cut={}",
         baseline.lower()[[0]],
         with_cuts.lower()[[0]]
     );

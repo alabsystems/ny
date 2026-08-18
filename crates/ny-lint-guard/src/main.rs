@@ -1,6 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! `ny-lint-guard` — a compiled, incremental clippy gate for the ny workspace.
 //!
 //! This repo has no CI, so the `-D warnings` lint gate (`make lint`) is only as

@@ -30,8 +30,10 @@ solver:
   bound_prop_method: crown
 
 attack:
-  # ny currently treats pgd_order as PGD enablement, not scheduler parity.
+  # Preserve the measured NY upfront placement explicitly; this is not a claim
+  # that reference after-BaB ordering is implemented.
   pgd_order: after
+  ny_pgd_order_compat: upfront
   pgd_restarts: 300
   pgd_steps: 20
 

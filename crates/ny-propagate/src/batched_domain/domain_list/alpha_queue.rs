@@ -24,7 +24,7 @@ pub(super) fn packed_graph_alpha_queue_enabled() -> bool {
 /// Allocate an immutable process-local identity for one graph-local DomainList.
 pub(super) fn allocate_graph_local_queue_identity() -> Result<u64> {
     NEXT_GRAPH_LOCAL_QUEUE_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
             identity.checked_add(1)
         })
         .map_err(|_| {
@@ -116,6 +116,18 @@ impl From<GraphDomainAlphaState> for QueuedGraphAlphaState {
 mod tests {
     use super::*;
     use crate::beta_crown::state::AlphaNeuronState;
+
+    #[test]
+    fn graph_local_queue_identities_are_nonzero_and_monotonic() {
+        let first = allocate_graph_local_queue_identity().unwrap();
+        let second = allocate_graph_local_queue_identity().unwrap();
+
+        assert_ne!(first, 0);
+        assert!(
+            second > first,
+            "later allocation {second} must follow {first}"
+        );
+    }
 
     #[test]
     fn alpha_heavy_queue_state_estimates_at_least_twenty_five_percent_reduction() {

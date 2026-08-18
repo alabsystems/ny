@@ -11,14 +11,15 @@
 /// Return the next representable f32 above `x`.
 #[inline]
 pub fn next_up_f32(x: f32) -> f32 {
-    if x.is_nan() || x.is_infinite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff;
+    if magnitude >= f32::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f32::from_bits(1);
     }
-    let bits = x.to_bits();
-    if x.is_sign_positive() {
+    if bits & 0x8000_0000 == 0 {
         f32::from_bits(bits + 1)
     } else {
         f32::from_bits(bits - 1)
@@ -28,16 +29,32 @@ pub fn next_up_f32(x: f32) -> f32 {
 /// Return the next representable f32 below `x`.
 #[inline]
 pub fn next_down_f32(x: f32) -> f32 {
-    if x.is_nan() || x.is_infinite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff;
+    if magnitude >= f32::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f32::from_bits(0x8000_0001);
     }
-    let bits = x.to_bits();
-    if x.is_sign_positive() {
+    if bits & 0x8000_0000 == 0 {
         f32::from_bits(bits - 1)
     } else {
         f32::from_bits(bits + 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_down_f32, next_up_f32};
+
+    #[test]
+    fn directed_steps_follow_subnormal_bit_order() {
+        let positive = f32::from_bits(7);
+        let negative = f32::from_bits(0x8000_0007);
+        assert_eq!(next_up_f32(positive).to_bits(), 8);
+        assert_eq!(next_down_f32(positive).to_bits(), 6);
+        assert_eq!(next_up_f32(negative).to_bits(), 0x8000_0006);
+        assert_eq!(next_down_f32(negative).to_bits(), 0x8000_0008);
     }
 }

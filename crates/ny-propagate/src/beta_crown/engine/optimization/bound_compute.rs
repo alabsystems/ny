@@ -5,8 +5,7 @@
 //! Bound-computation methods used by β-CROWN optimization.
 
 use super::super::BetaCrownVerifier;
-use super::objective::offset_lower_bounds;
-use ny_core::{nan_propagating_max, nan_propagating_min, GemmEngine, Result};
+use ny_core::{GemmEngine, Result};
 use ny_tensor::BoundedTensor;
 use std::sync::Arc;
 
@@ -84,8 +83,7 @@ impl BetaCrownVerifier {
     /// Compute output bounds using α, β, and λ (cut) parameters.
     ///
     /// This extends `compute_bounds_with_constraints` to use optimizable α values
-    /// for unstable neurons instead of the heuristic, and adds cutting plane
-    /// contributions to the lower bound via Lagrangian relaxation (GCP-CROWN).
+    /// for unstable neurons instead of the heuristic.
     // Justification: β-CROWN bound computation requires network, input, split history,
     // layer bounds, and alpha/beta/cut state — the full BaB verification context.
     #[allow(clippy::too_many_arguments)]
@@ -124,12 +122,15 @@ impl BetaCrownVerifier {
             self.output_dim_from_layer_bounds(layer_bounds, "compute_bounds_with_alpha_beta")?;
         let mut lin_bounds = LinearBounds::identity(output_dim);
 
-        // Build AreluState from cuts for arelu_cut backward integration
-        let arelu_state = if !cut_pool.is_empty() && self.config.enable_cuts {
-            Some(cut_pool.build_arelu_state(layer_bounds))
-        } else {
-            None
-        };
+        // CUT QUARANTINE: `cut_pool` is deliberately NOT consulted. Both folds
+        // that once read it are gone — the post-hoc scalar contribution (deleted
+        // in 28d1fbeb) and the `arelu_cut` backward integration (deleted here).
+        // The parameter is retained on purpose: it is the entry point the
+        // `test_quarantined_cut_authority_does_not_modify_*_2422` regressions
+        // push a POPULATED pool through to assert the bounds are unchanged.
+        // Do NOT consume it without a proof-producing, outward-rounded fold —
+        // see `BetaCrownConfig::cut_proof_authority_enabled()`.
+        let _ = cut_pool;
 
         // Backward pass through layers
         for (layer_idx, layer) in network.layers.iter().enumerate().rev() {
@@ -150,63 +151,19 @@ impl BetaCrownVerifier {
                 layer_constraints,
                 beta_state,
                 alpha_state,
-                arelu_state.as_ref(),
                 layer_idx,
                 engine,
             )?;
         }
 
         // Concretize with input bounds (#2239: directed rounding for soundness).
-        let base_bounds = lin_bounds.concretize_sound(input);
-
-        // GCP-CROWN: Add cutting plane contributions to lower bound
-        // For each cut, contribution is: lambda * (min_constraint_value - bias)
-        // where min_constraint_value uses lower/upper bounds depending on coefficient sign
         //
-        // #2422: Only apply scalar cut contribution when output is scalar (objective-reduced).
-        // Broadcasting a single scalar to multi-output dimensions is unsound — it tightens
-        // unrelated output dimensions. Matches the graph path guard in backward.rs (#2400).
-        if !cut_pool.is_empty() && self.config.enable_cuts && base_bounds.lower().len() == 1 {
-            let relevant_cuts = cut_pool.relevant_cuts_for(history);
-            if !relevant_cuts.is_empty() {
-                let cut_contribution = self.compute_cut_contribution(&relevant_cuts, layer_bounds);
-
-                // SOUNDNESS FIX: Clamp cut contribution to prevent lb > ub
-                // The cut contribution must not push the lower bound above the upper bound
-                // This can happen when lambda values grow too large during optimization
-                let base_lb = base_bounds
-                    .lower()
-                    .iter()
-                    .cloned()
-                    .reduce(nan_propagating_min)
-                    .ok_or_else(|| {
-                        ny_core::NyError::InternalError(
-                            "empty bounds in GCP-CROWN cut contribution clamping (lower)".into(),
-                        )
-                    })?;
-                let base_ub = base_bounds
-                    .upper()
-                    .iter()
-                    .cloned()
-                    .reduce(nan_propagating_max)
-                    .ok_or_else(|| {
-                        ny_core::NyError::InternalError(
-                            "empty bounds in GCP-CROWN cut contribution clamping (upper)".into(),
-                        )
-                    })?;
-
-                // Maximum safe contribution: don't let lb exceed ub (with small margin for numerical stability)
-                // NaN-safe: propagate NaN through both max and min to prevent unbounded contribution (#2643)
-                let max_safe_contribution = nan_propagating_max(base_ub - base_lb, 0.0) * 0.99;
-                let clamped_contribution =
-                    nan_propagating_min(cut_contribution, max_safe_contribution);
-
-                // Lower bound increases (tightens) with positive cut contribution
-                return offset_lower_bounds(&base_bounds, clamped_contribution);
-            }
-        }
-
-        Ok(base_bounds)
+        // No post-hoc cut term is added here. The legacy GCP-CROWN "scalar
+        // contribution after concretization" fold was deleted: it was never a
+        // certified GCP-CROWN fold (it was applied outside the backward
+        // relaxation) and `BetaCrownConfig::cut_proof_authority_enabled()` had
+        // already made it statically unreachable.
+        Ok(lin_bounds.concretize_sound(input))
     }
 
     /// Compute output bounds while capturing intermediate linear bounds.
@@ -298,12 +255,9 @@ impl BetaCrownVerifier {
             intermediate_bounds.push(Arc::new(lin_bounds.clone())); // Initialize with identity
         }
 
-        // Build AreluState from cuts for arelu_cut backward integration
-        let arelu_state = if !cut_pool.is_empty() && self.config.enable_cuts {
-            Some(cut_pool.build_arelu_state(layer_bounds))
-        } else {
-            None
-        };
+        // CUT QUARANTINE: `cut_pool` is deliberately NOT consulted.
+        // See `compute_bounds_with_alpha_beta` for the full rationale.
+        let _ = cut_pool;
 
         // Backward pass through layers
         for (layer_idx, layer) in network.layers.iter().enumerate().rev() {
@@ -327,7 +281,6 @@ impl BetaCrownVerifier {
                 layer_constraints,
                 beta_state,
                 alpha_state,
-                arelu_state.as_ref(),
                 layer_idx,
                 engine,
             )?;
@@ -335,51 +288,8 @@ impl BetaCrownVerifier {
 
         // #2239: Always use directed rounding on f64→f32 for soundness.
         // Matches alpha-beta-CROWN's __double2float_rd/__double2float_ru.
-        let base_bounds = lin_bounds.concretize_sound(input);
-
-        // GCP-CROWN: Add cutting plane contributions (same as compute_bounds_with_alpha_beta)
-        // #2422: Only apply scalar cut contribution when output is scalar (objective-reduced).
-        // Broadcasting a single scalar to multi-output dimensions is unsound (#2400).
-        let output_bounds = if !cut_pool.is_empty()
-            && self.config.enable_cuts
-            && base_bounds.lower().len() == 1
-        {
-            let relevant_cuts = cut_pool.relevant_cuts_for(history);
-            if !relevant_cuts.is_empty() {
-                let cut_contribution = self.compute_cut_contribution(&relevant_cuts, layer_bounds);
-
-                let base_lb = base_bounds
-                    .lower()
-                    .iter()
-                    .cloned()
-                    .reduce(nan_propagating_min)
-                    .ok_or_else(|| {
-                        ny_core::NyError::InternalError(
-                            "empty bounds in GCP-CROWN cut contribution clamping (lower)".into(),
-                        )
-                    })?;
-                let base_ub = base_bounds
-                    .upper()
-                    .iter()
-                    .cloned()
-                    .reduce(nan_propagating_max)
-                    .ok_or_else(|| {
-                        ny_core::NyError::InternalError(
-                            "empty bounds in GCP-CROWN cut contribution clamping (upper)".into(),
-                        )
-                    })?;
-                // NaN-safe: propagate NaN through both max and min (#2643)
-                let max_safe_contribution = nan_propagating_max(base_ub - base_lb, 0.0) * 0.99;
-                let clamped_contribution =
-                    nan_propagating_min(cut_contribution, max_safe_contribution);
-
-                offset_lower_bounds(&base_bounds, clamped_contribution)?
-            } else {
-                base_bounds
-            }
-        } else {
-            base_bounds
-        };
+        // (No post-hoc cut term — see `compute_bounds_with_alpha_beta`.)
+        let output_bounds = lin_bounds.concretize_sound(input);
 
         let intermediate = IntermediateLinearBounds {
             bounds_at_layer: intermediate_bounds,
@@ -539,12 +449,9 @@ impl BetaCrownVerifier {
             }
         };
 
-        // Build AreluState from cuts for arelu_cut backward integration
-        let arelu_state = if !cut_pool.is_empty() && self.config.enable_cuts {
-            Some(cut_pool.build_arelu_state(layer_bounds))
-        } else {
-            None
-        };
+        // CUT QUARANTINE: `cut_pool` is deliberately NOT consulted here either;
+        // it is only forwarded to the full-recompute fallbacks above.
+        // See `compute_bounds_with_alpha_beta` for the full rationale.
 
         // Backward pass through layers 0..=start_layer only
         // We process in reverse order: start_layer, start_layer-1, ..., 0
@@ -571,58 +478,14 @@ impl BetaCrownVerifier {
                 layer_constraints,
                 beta_state,
                 alpha_state,
-                arelu_state.as_ref(),
                 layer_idx,
                 engine,
             )?;
         }
 
         // #2239: Always use directed rounding on f64→f32 for soundness.
-        let base_bounds = lin_bounds.concretize_sound(input);
-
-        // GCP-CROWN: Add cutting plane contributions
-        // #2422: Only apply scalar cut contribution when output is scalar (objective-reduced).
-        // Broadcasting a single scalar to multi-output dimensions is unsound (#2400).
-        let output_bounds = if !cut_pool.is_empty()
-            && self.config.enable_cuts
-            && base_bounds.lower().len() == 1
-        {
-            let relevant_cuts = cut_pool.relevant_cuts_for(history);
-            if !relevant_cuts.is_empty() {
-                let cut_contribution = self.compute_cut_contribution(&relevant_cuts, layer_bounds);
-
-                let base_lb = base_bounds
-                    .lower()
-                    .iter()
-                    .cloned()
-                    .reduce(nan_propagating_min)
-                    .ok_or_else(|| {
-                        ny_core::NyError::InternalError(
-                            "empty bounds in GCP-CROWN cut contribution clamping (lower)".into(),
-                        )
-                    })?;
-                let base_ub = base_bounds
-                    .upper()
-                    .iter()
-                    .cloned()
-                    .reduce(nan_propagating_max)
-                    .ok_or_else(|| {
-                        ny_core::NyError::InternalError(
-                            "empty bounds in GCP-CROWN cut contribution clamping (upper)".into(),
-                        )
-                    })?;
-                // NaN-safe: propagate NaN through both max and min (#2643)
-                let max_safe_contribution = nan_propagating_max(base_ub - base_lb, 0.0) * 0.99;
-                let clamped_contribution =
-                    nan_propagating_min(cut_contribution, max_safe_contribution);
-
-                offset_lower_bounds(&base_bounds, clamped_contribution)?
-            } else {
-                base_bounds
-            }
-        } else {
-            base_bounds
-        };
+        // (No post-hoc cut term — see `compute_bounds_with_alpha_beta`.)
+        let output_bounds = lin_bounds.concretize_sound(input);
 
         let intermediate = IntermediateLinearBounds {
             bounds_at_layer: intermediate_bounds,

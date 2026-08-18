@@ -776,6 +776,28 @@ fn test_sort_out_constraints_active() {
 
 #[ntest::timeout(10000)]
 #[test]
+fn fully_covered_filter_uses_directed_box_arithmetic() {
+    // The old f32 centroid/radius calculation rounded the maximum to
+    // -0.00079345703125 and incorrectly dropped this row as fully covered.
+    // Evaluating the represented f32 values exactly gives a positive maximum
+    // of about 9.1e-5, so the row is active.
+    let constraints = SplitConstraints {
+        a_matrix: array![[f32::from_bits(0x4254_c6a5), f32::from_bits(0x423f_f514)]],
+        b_vector: array![f32::from_bits(0xc6a3_fb7f)],
+        num_constraints: 1,
+    };
+    let x_l = array![f32::from_bits(0x4371_364c), f32::from_bits(0x4319_65b5)];
+    let x_u = array![f32::from_bits(0x4379_d631), f32::from_bits(0x4320_7377)];
+
+    let preprocessed = sort_out_constraints(&constraints, &x_l, &x_u).expect("finite active row");
+
+    assert_eq!(preprocessed.a_active.nrows(), 1);
+    assert!(!preprocessed.infeasible_mask[0]);
+    assert!(!preprocessed.fully_covered_mask[0]);
+}
+
+#[ntest::timeout(10000)]
+#[test]
 fn test_tighten_with_constraints_no_active() {
     // Test with no active constraints
     let constraints = PreprocessedConstraints {

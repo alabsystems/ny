@@ -196,37 +196,57 @@ impl ConvertContext<'_> {
 
         // Check if exponent is a constant (weight or evaluated constant)
         if let Some(exp_tensor) = self.constant_value(input_b).as_ref() {
-            // Get the exponent as a scalar
-            let exponent = if exp_tensor.len() == 1 {
-                exp_tensor.iter().next().copied().unwrap_or(1.0)
-            } else {
-                // Non-scalar exponent: check if all elements are the same value.
-                // Homogeneous tensors (e.g., [2.0, 2.0, 2.0]) are safe to reduce
-                // to a scalar. Heterogeneous tensors (e.g., [2.0, 3.0]) would
-                // require per-element exponentiation which PowConstantLayer
-                // does not support — reject with an error (#2969).
-                let first = exp_tensor.iter().next().copied().unwrap_or(1.0);
-                let all_same = exp_tensor.iter().all(|&v| v == first);
-                if all_same {
-                    debug!(
-                        "Pow {} has non-scalar but homogeneous exponent (len={}, value={})",
-                        spec.name,
-                        exp_tensor.len(),
-                        first
-                    );
-                    first
-                } else {
+            let Some(&exponent) = exp_tensor.iter().next() else {
+                return Err(NyError::UnsupportedOp(format!(
+                    "Pow {} has an empty exponent tensor",
+                    spec.name
+                )));
+            };
+            let layer = self.pow_constant_layer(exponent, &spec.name)?;
+
+            // PowConstant applies one scalar exponent without changing the base
+            // tensor's shape.  A homogeneous ONNX exponent tensor has the same
+            // values, but reducing it to a scalar is only equivalent when ONNX
+            // broadcasting also leaves the base shape unchanged.  In particular,
+            // base [1] with exponent [3] produces [3] in ONNX, not [1].
+            if exp_tensor.ndim() != 0 {
+                if !exp_tensor.iter().all(|&value| value == exponent) {
                     return Err(NyError::UnsupportedOp(format!(
-                        "Pow {} has non-scalar heterogeneous exponent (len={}) — \
+                        "Pow {} has non-scalar heterogeneous exponent (shape={:?}) — \
                          per-element exponentiation not supported",
                         spec.name,
-                        exp_tensor.len()
+                        exp_tensor.shape()
                     )));
                 }
-            };
+
+                let Some(base_shape) = self.tensor_shape_usize(input_a) else {
+                    return Err(NyError::UnsupportedOp(format!(
+                        "Pow {} cannot authenticate whether exponent shape {:?} \
+                         preserves the unknown base shape",
+                        spec.name,
+                        exp_tensor.shape()
+                    )));
+                };
+                let broadcast_shape = broadcast_shapes(&base_shape, exp_tensor.shape());
+                if broadcast_shape.as_deref() != Some(base_shape.as_slice()) {
+                    return Err(NyError::UnsupportedOp(format!(
+                        "Pow {} exponent shape {:?} would change or is incompatible with \
+                         base shape {:?} under ONNX broadcasting",
+                        spec.name,
+                        exp_tensor.shape(),
+                        base_shape
+                    )));
+                }
+
+                debug!(
+                    "Pow {} has shape-preserving homogeneous exponent (shape={:?}, value={})",
+                    spec.name,
+                    exp_tensor.shape(),
+                    exponent
+                );
+            }
             debug!("Pow {} with constant exponent {}", spec.name, exponent);
-            self.pow_constant_layer(exponent, &spec.name)
-                .map(Layer::PowConstant)
+            Ok(Layer::PowConstant(layer))
         } else {
             // Exponent is not constant - not supported
             Err(NyError::UnsupportedOp(format!(
@@ -626,10 +646,11 @@ mod tests {
         );
     }
 
-    /// Regression test for #2969: non-scalar but homogeneous exponent should succeed.
+    /// A homogeneous exponent is safe when broadcasting preserves the base shape.
     #[test]
-    fn convert_pow_accepts_homogeneous_exponent_2969() {
-        let (mut weights, shapes, constants) = make_context();
+    fn convert_pow_accepts_shape_preserving_homogeneous_exponent() {
+        let (mut weights, mut shapes, constants) = make_context();
+        shapes.insert("input".to_string(), vec![3]);
         // Insert a non-scalar exponent where all values are the same
         weights.insert(
             "exp".to_string(),
@@ -644,6 +665,32 @@ mod tests {
         assert!(
             matches!(layer, Layer::PowConstant(_)),
             "expected PowConstant, got {layer:?}"
+        );
+    }
+
+    /// Regression: scalarizing a homogeneous exponent must not discard an ONNX
+    /// broadcast that expands the output shape.
+    #[test]
+    fn convert_pow_rejects_homogeneous_exponent_that_expands_base_shape() {
+        let (mut weights, shapes, constants) = make_context();
+        weights.insert(
+            "exp".to_string(),
+            ndarray::arr1(&[2.0f32, 2.0, 2.0]).into_dyn(),
+        );
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = make_spec(LayerType::Pow, &["input", "exp"]);
+
+        let error = context
+            .convert_pow(&spec)
+            .expect_err("shape-expanding exponent must be rejected");
+        assert!(
+            matches!(
+                &error,
+                NyError::UnsupportedOp(message)
+                    if message.contains("would change")
+                        && message.contains("base shape [1]")
+            ),
+            "unexpected error: {error:?}"
         );
     }
 

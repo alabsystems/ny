@@ -4,21 +4,25 @@
 
 //! Full-coverage validation of the dual-network formula DNF extractor against
 //! the REAL VNN-COMP 2026 relational ACAS benchmark files (100 instances).
-//! Skips gracefully when the benchmark checkout is absent; when present,
-//! EVERY instance must either extract completely (`formula_dnf: Some`) or be
-//! recognizably fail-closed — and for this benchmark we assert full coverage,
-//! since the gate flip depends on it.
+//! The explicit `external-vnncomp` conformance lane requires the benchmark
+//! checkout. When selected, EVERY instance must extract completely
+//! (`formula_dnf: Some`); absence or parser refusal is a hard failure.
 
 use std::path::{Path, PathBuf};
 
 use crate::vnnlib::load_vnnlib;
 
-/// Locate the sparse-cloned benchmark root in the repo checkout, or `None`
-/// to skip.
-fn benchmark_root() -> Option<PathBuf> {
+/// Require the sparse-cloned benchmark root in the repo checkout.
+fn benchmark_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidates = [manifest.join("../../benchmarks/vnncomp2026_benchmarks/benchmarks")];
-    candidates.into_iter().find(|c| c.is_dir())
+    let root = manifest.join("../../benchmarks/vnncomp2026_benchmarks/benchmarks");
+    assert!(
+        root.is_dir(),
+        "VNN-COMP 2026 benchmark fixture root is missing at {}; \
+         run benchmarks/download_benchmarks.sh",
+        root.display()
+    );
+    root
 }
 
 fn category_vnnlib_files(root: &Path, category: &str) -> Vec<PathBuf> {
@@ -35,11 +39,9 @@ fn category_vnnlib_files(root: &Path, category: &str) -> Vec<PathBuf> {
 }
 
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn extractor_fully_covers_the_real_2026_relational_benchmarks() {
-    let Some(root) = benchmark_root() else {
-        eprintln!("2026 relational benchmarks not present; skipping");
-        return;
-    };
+    let root = benchmark_root();
     let mut total = 0usize;
     let mut covered = 0usize;
     let mut failures: Vec<String> = Vec::new();
@@ -47,7 +49,8 @@ fn extractor_fully_covers_the_real_2026_relational_benchmarks() {
         let files = category_vnnlib_files(&root, category);
         assert!(
             !files.is_empty(),
-            "benchmark dir present but no vnnlib files under {category}"
+            "VNN-COMP 2026 fixture has no VNN-LIB files under {category}; \
+             run benchmarks/download_benchmarks.sh"
         );
         for file in files {
             total += 1;
@@ -94,29 +97,48 @@ fn extractor_fully_covers_the_real_2026_relational_benchmarks() {
     assert_eq!(covered, total);
 }
 
-/// Diagnostic (temporary-grade but harmless to keep): what does the dual
-/// parser + extractor produce on the first real instance of each category?
+/// Pin extractor/parser agreement on the first real instance of each category.
 #[test]
-fn dual_parse_diagnostic_instance0() {
-    let Some(root) = benchmark_root() else {
-        return;
-    };
+#[cfg(feature = "external-vnncomp")]
+fn dual_parser_and_extractor_agree_on_real_instance_zero() {
+    let root = benchmark_root();
+    let mut checked = 0usize;
     for category in ["isomorphic_acasxu_2026", "monotonic_acasxu_2026"] {
         let files = category_vnnlib_files(&root, category);
-        let Some(file) = files.first() else { continue };
-        let content = std::fs::read_to_string(file).unwrap();
+        let file = files.first().unwrap_or_else(|| {
+            panic!(
+                "VNN-COMP 2026 fixture has no VNN-LIB files under {category}; \
+                 run benchmarks/download_benchmarks.sh"
+            )
+        });
+        let content = std::fs::read_to_string(file)
+            .unwrap_or_else(|error| panic!("{}: read failed: {error}", file.display()));
         let cleaned = crate::vnnlib::syntax::strip_vnnlib_comments(&content);
-        let tokens = crate::vnnlib::syntax::tokenize(&cleaned).unwrap();
-        let exprs = crate::vnnlib::syntax::parse_expressions(&tokens).unwrap();
-        let dnf = crate::vnnlib::dual_formula::extract_dual_formula_dnf(&exprs);
-        println!(
-            "{category}: extractor -> {:?}",
-            dnf.as_ref().map(|d| (d.clauses.len(), d.num_asserts))
+        let tokens = crate::vnnlib::syntax::tokenize(&cleaned)
+            .unwrap_or_else(|error| panic!("{}: tokenization failed: {error}", file.display()));
+        let exprs = crate::vnnlib::syntax::parse_expressions(&tokens)
+            .unwrap_or_else(|error| panic!("{}: expression parse failed: {error}", file.display()));
+        let extracted = crate::vnnlib::dual_formula::extract_dual_formula_dnf(&exprs)
+            .unwrap_or_else(|| panic!("{}: formula extractor declined", file.display()));
+        let parsed = crate::vnnlib::parser::parse_dual_network_spec(&exprs)
+            .unwrap_or_else(|error| panic!("{}: dual parser failed: {error}", file.display()))
+            .unwrap_or_else(|| panic!("{}: dual parser declined", file.display()));
+        let parsed_dnf = parsed
+            .formula_dnf
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: parsed dual spec omitted its DNF", file.display()));
+        assert_eq!(
+            (parsed_dnf.clauses.len(), parsed_dnf.num_asserts),
+            (extracted.clauses.len(), extracted.num_asserts),
+            "{}: parser and direct extractor disagree",
+            file.display()
         );
-        match crate::vnnlib::parser::parse_dual_network_spec(&exprs) {
-            Ok(Some(d)) => println!("{category}: dual spec OK, property {:?}", d.property),
-            Ok(None) => println!("{category}: dual spec -> None"),
-            Err(e) => println!("{category}: dual spec ERR: {e}"),
-        }
+        assert!(
+            !extracted.clauses.is_empty() && extracted.num_asserts > 0,
+            "{}: extracted formula is empty",
+            file.display()
+        );
+        checked += 1;
     }
+    assert_eq!(checked, 2, "both relational categories must be checked");
 }

@@ -1725,6 +1725,37 @@ fn parse_assert(
         let (op, arg1, arg2) = infix_comparison.unwrap_or((op, &items[1], &items[2]));
         let op = if op == "==" { "=" } else { op };
 
+        // The affine input-domain representation stores closed intervals.
+        // Never collapse a strict real endpoint into that inclusive box: every
+        // downstream counterexample path would then be able to accept the
+        // excluded boundary. Classify the full linear atom here, before
+        // disjunct-scoped and dual-network early returns, so prefix/infix,
+        // direct/reversed, scaled, nested, and relational input forms all fail
+        // closed. Strict OUTPUT comparisons remain fully supported.
+        if matches!(op, "<" | ">") {
+            let canonical = Expr::List(vec![
+                Expr::Symbol(op.to_string()),
+                arg1.clone(),
+                arg2.clone(),
+            ]);
+            if let Ok(constraint) =
+                normalize::parse_linear_constraint(&canonical, input_declared, output_declared)
+            {
+                let mut terms = constraint.expr.terms();
+                if terms
+                    .next()
+                    .is_some_and(|(var, _)| matches!(var.kind, normalize::VarKind::Input))
+                    && terms.all(|(var, _)| matches!(var.kind, normalize::VarKind::Input))
+                {
+                    return Err(NyError::InvalidSpec(
+                        "Strict input constraints are unsupported: affine input boxes cannot \
+                         represent exclusive endpoints"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
         if v2_mode {
             let lhs = resolve_var_info(arg1, input_declared, output_declared)?;
             let rhs = resolve_var_info(arg2, input_declared, output_declared)?;
@@ -1744,6 +1775,12 @@ fn parse_assert(
             if is_input {
                 // Input constraint: X_i op constant
                 if let Some(val) = get_number(arg2) {
+                    if matches!(op, "<" | ">") {
+                        return Err(NyError::InvalidSpec(format!(
+                            "Strict input constraint on X_{var_idx} is unsupported: affine input \
+                             boxes cannot represent exclusive endpoints"
+                        )));
+                    }
                     if in_disjunction {
                         // Disjunct-scoped input atom: bounds ONE disjunct's
                         // region, not the global domain (whose true extent is
@@ -1868,6 +1905,12 @@ fn parse_assert(
         {
             if let Some(val) = get_number(arg1) {
                 if is_input {
+                    if matches!(op, "<" | ">") {
+                        return Err(NyError::InvalidSpec(format!(
+                            "Strict input constraint on X_{var_idx} is unsupported: affine input \
+                             boxes cannot represent exclusive endpoints"
+                        )));
+                    }
                     if in_disjunction {
                         // Disjunct-scoped input atom (reversed form) — see above.
                         return Ok(());
@@ -2092,6 +2135,13 @@ fn try_apply_linear_input_constraint(
     let Some((var_idx, coeff)) = input_var else {
         return Ok(false);
     };
+    if constraint.is_strict {
+        return Err(NyError::InvalidSpec(
+            "Strict input constraints are unsupported: affine input boxes cannot represent \
+             exclusive endpoints"
+                .to_string(),
+        ));
+    }
     if coeff.abs() <= f64::EPSILON {
         return Err(NyError::InvalidSpec(
             "Input constraint has zero coefficient".to_string(),

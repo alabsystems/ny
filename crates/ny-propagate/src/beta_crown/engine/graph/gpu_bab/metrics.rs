@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Domain-batch metrics helpers for GPU BaB.
+//! Domain-batch metrics helpers for DomainList BaB.
 
 use ny_core::Result;
 

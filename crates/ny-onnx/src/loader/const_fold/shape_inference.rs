@@ -9,6 +9,7 @@ use crate::WeightStore;
 use tracing::warn;
 
 use super::common::{read_tensor_i64s, reshape_allowzero};
+use super::is_standard_onnx_domain;
 
 pub(crate) struct ConstFoldLookups {
     graph_shapes: HashMap<String, Vec<i64>>,
@@ -82,6 +83,13 @@ impl ConstFoldLookups {
     ) -> Option<Vec<i64>> {
         let node_idx = *self.node_by_output.get(tensor_name)?;
         let node = graph.node.get(node_idx)?;
+        // Every rule below implements a standard ONNX operator's shape
+        // semantics.  A custom-domain lookalike may use the same op_type with
+        // unrelated semantics; inferring through it could make a downstream
+        // standard Shape node fold to a false constant.
+        if !is_standard_onnx_domain(&node.domain) {
+            return None;
+        }
         match node.op_type.as_str() {
             "Conv" if node.input.len() >= 2 => {
                 self.infer_conv_shape(node, graph, weights, depth - 1)
@@ -120,6 +128,21 @@ impl ConstFoldLookups {
         weights: &WeightStore,
         depth: usize,
     ) -> Option<Vec<i64>> {
+        let mut auto_pad = node
+            .attribute
+            .iter()
+            .filter(|attribute| attribute.name == "auto_pad");
+        if let Some(attribute) = auto_pad.next() {
+            if auto_pad.next().is_some()
+                || attribute.r#type != onnx_proto::attribute_type::STRING
+                || (!attribute.s_value().is_empty() && attribute.s_value() != b"NOTSET")
+            {
+                // SAME_*/VALID determine spatial extents by semantics not
+                // represented in the explicit-pad formula below. Decline
+                // rather than publishing a false Shape constant.
+                return None;
+            }
+        }
         let input_shape = self.infer_tensor_shape(&node.input[0], graph, weights, depth)?;
         let weight = weights.get(&node.input[1])?;
         let weight_shape = weight.shape();
@@ -215,13 +238,13 @@ impl ConstFoldLookups {
             .attribute
             .iter()
             .find(|attr| attr.name == "transA")
-            .map(|attr| attr.i != 0)
+            .map(|attr| attr.i_value() != 0)
             .unwrap_or(false);
         let trans_b = node
             .attribute
             .iter()
             .find(|attr| attr.name == "transB")
-            .map(|attr| attr.i != 0)
+            .map(|attr| attr.i_value() != 0)
             .unwrap_or(false);
 
         let (m, k_a) = if trans_a {
@@ -270,7 +293,15 @@ impl ConstFoldLookups {
             Some(name) if !name.is_empty() => read_tensor_i64s(weights, name)?,
             _ => (0..starts_vec.len() as i64).collect(),
         };
-        if starts_vec.len() != ends_vec.len() || axes_vec.len() != starts_vec.len() {
+        let steps_vec = match node.input.get(4) {
+            Some(name) if !name.is_empty() => read_tensor_i64s(weights, name)?,
+            _ => vec![1; starts_vec.len()],
+        };
+        if starts_vec.len() != ends_vec.len()
+            || axes_vec.len() != starts_vec.len()
+            || steps_vec.len() != starts_vec.len()
+            || steps_vec.iter().any(|&step| step != 1)
+        {
             return None;
         }
 
@@ -282,14 +313,14 @@ impl ConstFoldLookups {
                 }
                 resolved as usize
             } else {
-                axis as usize
+                usize::try_from(axis).ok()?
             };
             if axis_idx >= output_shape.len() {
-                continue;
+                return None;
             }
             let dim = output_shape[axis_idx];
             if dim <= 0 {
-                continue;
+                return None;
             }
             let start = if i < starts_vec.len() {
                 let value = starts_vec[i];
@@ -381,7 +412,7 @@ fn build_graph_shape_lookup(
             shapes.insert(input.name.clone(), dims);
         }
     }
-    for info in &graph.value_info {
+    for info in graph.value_info() {
         let dims = extract_shape_from_type(&info.r#type);
         if !dims.is_empty() {
             shapes.insert(info.name.clone(), dims);
@@ -504,4 +535,142 @@ fn reshape_output_shape(
     }
 
     (known_product == total_elems).then_some(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value_info(name: &str, shape: &[i64]) -> onnx_proto::ValueInfoProto {
+        onnx_proto::ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(onnx_proto::TypeProto {
+                tensor_type: Some(onnx_proto::TensorTypeProto {
+                    elem_type: 1,
+                    shape: Some(onnx_proto::TensorShapeProto {
+                        dim: shape
+                            .iter()
+                            .map(|&value| onnx_proto::tensor_shape_proto::Dimension {
+                                value: Some(
+                                    onnx_proto::tensor_shape_proto::dimension::Value::DimValue(
+                                        value,
+                                    ),
+                                ),
+                            })
+                            .collect(),
+                    }),
+                }),
+            }),
+        }
+    }
+
+    fn add_node(name: &str, output: &str, domain: &str) -> onnx_proto::NodeProto {
+        onnx_proto::NodeProto {
+            input: vec!["lhs".to_string(), "rhs".to_string()],
+            output: vec![output.to_string()],
+            name: name.to_string(),
+            op_type: "Add".to_string(),
+            domain: domain.to_string(),
+            attribute: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recursive_shape_inference_rejects_custom_domain_lookalikes() {
+        let graph = onnx_proto::GraphProto {
+            input: vec![value_info("lhs", &[2, 1]), value_info("rhs", &[1, 3])],
+            node: vec![
+                add_node("custom_add", "custom_out", "vendor.example"),
+                add_node("default_add", "default_out", ""),
+                add_node("explicit_standard_add", "standard_out", "ai.onnx"),
+            ],
+            ..Default::default()
+        };
+        let lookups = ConstFoldLookups::new(&graph, &HashMap::new(), false);
+        let weights = WeightStore::new();
+
+        assert_eq!(
+            lookups.infer_tensor_shape("custom_out", &graph, &weights, 8),
+            None,
+            "a custom-domain Add must not borrow standard broadcast semantics"
+        );
+        for output in ["default_out", "standard_out"] {
+            assert_eq!(
+                lookups.infer_tensor_shape(output, &graph, &weights, 8),
+                Some(vec![2, 3]),
+                "both standard ONNX domain spellings must retain shape inference"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_slice_shape_declines_non_unit_steps() {
+        let graph = onnx_proto::GraphProto {
+            input: vec![value_info("input", &[8])],
+            node: vec![onnx_proto::NodeProto {
+                input: vec![
+                    "input".to_string(),
+                    "starts".to_string(),
+                    "ends".to_string(),
+                    "axes".to_string(),
+                    "steps".to_string(),
+                ],
+                output: vec!["slice".to_string()],
+                name: "strided_slice".to_string(),
+                op_type: "Slice".to_string(),
+                domain: String::new(),
+                attribute: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let mut weights = WeightStore::new();
+        for (name, value) in [
+            ("starts", 0.0),
+            ("ends", 8.0),
+            ("axes", 0.0),
+            ("steps", 2.0),
+        ] {
+            weights.insert(
+                name.to_string(),
+                ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1]), vec![value]).unwrap(),
+            );
+        }
+        let lookups = ConstFoldLookups::new(&graph, &HashMap::new(), false);
+        assert_eq!(
+            lookups.infer_tensor_shape("slice", &graph, &weights, 8),
+            None
+        );
+    }
+
+    #[test]
+    fn recursive_conv_shape_declines_non_explicit_auto_pad() {
+        let graph = onnx_proto::GraphProto {
+            input: vec![value_info("input", &[1, 1, 5, 5])],
+            node: vec![onnx_proto::NodeProto {
+                input: vec!["input".to_string(), "kernel".to_string()],
+                output: vec!["conv".to_string()],
+                name: "same_conv".to_string(),
+                op_type: "Conv".to_string(),
+                domain: String::new(),
+                attribute: vec![onnx_proto::AttributeProto {
+                    name: "auto_pad".to_string(),
+                    r#type: onnx_proto::attribute_type::STRING,
+                    s: Some(b"SAME_UPPER".to_vec()),
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut weights = WeightStore::new();
+        weights.insert(
+            "kernel".to_string(),
+            ndarray::ArrayD::zeros(ndarray::IxDyn(&[1, 1, 3, 3])),
+        );
+        let lookups = ConstFoldLookups::new(&graph, &HashMap::new(), false);
+        assert_eq!(
+            lookups.infer_tensor_shape("conv", &graph, &weights, 8),
+            None,
+            "explicit-pad arithmetic must not infer SAME_* output shapes"
+        );
+    }
 }

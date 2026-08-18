@@ -261,7 +261,8 @@ fn test_genbab_norm_branching_descends_and_is_sound() {
     assert!(
         !matches!(
             res.result,
-            BabVerificationStatus::Violated { .. } | BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::Violated { .. }
+                | BabVerificationStatus::PotentialViolation { .. }
         ),
         "threshold {descent_threshold} below true min {true_min}; a sound \
          verifier must not report violation, got {:?}",

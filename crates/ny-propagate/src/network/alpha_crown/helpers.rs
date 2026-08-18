@@ -192,6 +192,9 @@ pub(super) fn init_invprop_if_enabled(
             .map(|s| s.layer_gammas.len())
             .unwrap_or(0)
     );
+    if alpha_state.invprop_state.is_some() {
+        crate::execution_telemetry::record_invprop_alpha_initialization();
+    }
 
     Ok(true)
 }

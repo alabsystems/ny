@@ -12,6 +12,11 @@
 //! in another abstract domain.
 
 use crate::certified_box64::{CertifiedBox64, BOX64_HARD_MAX_STORED_F64, BOX64_HARD_MAX_VALUES};
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, ConstrainedZonotopeCallTracker,
+    ConstrainedZonotopePeakLiveBytes,
+};
 
 /// Finite outward bounds accompanied by a caller-owned concrete-enclosure
 /// proof obligation.
@@ -81,6 +86,18 @@ pub enum CertifiedAuxiliaryBounds64Error {
         /// Requested endpoint buffer.
         resource: &'static str,
     },
+}
+
+/// Typed refusal from the budgeted certified-Box conversion.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CertifiedAuxiliaryBounds64BudgetError {
+    /// Endpoint structure, storage limits, or bounded allocation failed.
+    #[error(transparent)]
+    Bounds(#[from] CertifiedAuxiliaryBounds64Error),
+
+    /// The caller's deadline or aggregate peak-memory ceiling refused work.
+    #[error(transparent)]
+    Budget(#[from] ConstrainedZonotopeCallBudgetError),
 }
 
 impl CertifiedAuxiliaryBounds64 {
@@ -164,6 +181,23 @@ impl CertifiedAuxiliaryBounds64 {
         Self::try_new(lower, upper)
     }
 
+    /// Copy a certified Box under the shared synchronous call firewall.
+    ///
+    /// This is the budgeted equivalent of [`Self::try_from_certified_box`].
+    /// The caller's baseline must include the borrowed source Box and all
+    /// other retained state. The complete two-endpoint output is preflighted
+    /// before allocation, each coordinate copy/validation is charged with the
+    /// standard deadline cadence, and no value is published after a missed
+    /// final checkpoint.
+    pub fn try_from_certified_box_with_budget(
+        source: &CertifiedBox64,
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<ConstrainedZonotopeCallOutcome<Self>, CertifiedAuxiliaryBounds64BudgetError> {
+        let mut gate = ConstrainedZonotopeCallTracker::from_system_clock(budget)?;
+        let value = try_from_certified_box_with_gate(source, &mut gate)?;
+        Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+    }
+
     /// Number of bounded coordinates.
     #[must_use]
     pub fn value_dim(&self) -> usize {
@@ -181,6 +215,95 @@ impl CertifiedAuxiliaryBounds64 {
     pub fn upper(&self) -> &[f64] {
         &self.upper
     }
+}
+
+#[cfg(test)]
+fn try_from_certified_box_with_clock<N>(
+    source: &CertifiedBox64,
+    budget: ConstrainedZonotopeCallBudget,
+    now: N,
+) -> Result<
+    ConstrainedZonotopeCallOutcome<CertifiedAuxiliaryBounds64>,
+    CertifiedAuxiliaryBounds64BudgetError,
+>
+where
+    N: FnMut(&'static str) -> std::time::Instant,
+{
+    let mut gate = ConstrainedZonotopeCallTracker::with_clock(budget, now)?;
+    let value = try_from_certified_box_with_gate(source, &mut gate)?;
+    Ok(ConstrainedZonotopeCallOutcome::new(value, gate.report()))
+}
+
+fn try_from_certified_box_with_gate<G>(
+    source: &CertifiedBox64,
+    gate: &mut G,
+) -> Result<CertifiedAuxiliaryBounds64, CertifiedAuxiliaryBounds64BudgetError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    gate.checkpoint("certified auxiliary Box-copy admission")?;
+    let value_dim = source.len();
+    if value_dim != source.upper().len() {
+        return Err(CertifiedAuxiliaryBounds64Error::LengthMismatch {
+            lower: value_dim,
+            upper: source.upper().len(),
+        }
+        .into());
+    }
+    validate_box_conversion_storage(value_dim)?;
+    gate.checkpoint("certified auxiliary Box-copy validation complete")?;
+
+    let stored_endpoints =
+        value_dim
+            .checked_mul(2)
+            .ok_or(CertifiedAuxiliaryBounds64Error::ResourceOverflow {
+                operation: "budgeted Box lower plus upper endpoints",
+            })?;
+    let mut peak = ConstrainedZonotopePeakLiveBytes::new();
+    peak.add_elements::<f64>(
+        stored_endpoints,
+        "budgeted certified auxiliary endpoint storage",
+    )?;
+    gate.preflight_peak_live_bytes(peak.finish())?;
+    gate.checkpoint("certified auxiliary Box-copy peak-memory preflight complete")?;
+
+    let mut lower = Vec::new();
+    let mut upper = Vec::new();
+    gate.checkpoint("certified auxiliary lower-endpoint allocation")?;
+    try_reserve(&mut lower, value_dim, "budgeted auxiliary lower endpoints")?;
+    gate.checkpoint("certified auxiliary upper-endpoint allocation")?;
+    try_reserve(&mut upper, value_dim, "budgeted auxiliary upper endpoints")?;
+
+    for coordinate in 0..value_dim {
+        gate.charge_items(1, "certified auxiliary Box endpoint copy")?;
+        let lower_value = source.lower()[coordinate];
+        let upper_value = source.upper()[coordinate];
+        if !lower_value.is_finite() {
+            return Err(CertifiedAuxiliaryBounds64Error::NonFinite {
+                side: "lower",
+                coordinate,
+            }
+            .into());
+        }
+        if !upper_value.is_finite() {
+            return Err(CertifiedAuxiliaryBounds64Error::NonFinite {
+                side: "upper",
+                coordinate,
+            }
+            .into());
+        }
+        if lower_value > upper_value {
+            return Err(CertifiedAuxiliaryBounds64Error::Reversed { coordinate }.into());
+        }
+        lower.push(lower_value);
+        upper.push(upper_value);
+    }
+    gate.checkpoint("certified auxiliary Box endpoint copy complete")?;
+
+    let output = CertifiedAuxiliaryBounds64 { lower, upper };
+    debug_assert_eq!(output.value_dim(), value_dim);
+    gate.checkpoint("certified auxiliary Box-copy publication")?;
+    Ok(output)
 }
 
 fn validate_box_conversion_storage(
@@ -239,13 +362,22 @@ fn try_reserve<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+    use std::time::{Duration, Instant};
+
     use super::*;
-    use crate::{CertifiedBox64Error, CertifiedBox64Limits};
+    use crate::{
+        CertifiedBox64Error, CertifiedBox64Limits, CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL,
+    };
 
     fn box_limits() -> CertifiedBox64Limits {
+        box_limits_for(16)
+    }
+
+    fn box_limits_for(value_dim: usize) -> CertifiedBox64Limits {
         CertifiedBox64Limits {
-            max_values: 16,
-            max_stored_f64: 32,
+            max_values: value_dim,
+            max_stored_f64: value_dim * 2,
             max_weight_elements: 0,
             max_work_items: 0,
             max_scalar_products: 0,
@@ -361,6 +493,112 @@ mod tests {
             endpoint_bits(round_trip.upper()),
             endpoint_bits(source.upper())
         );
+    }
+
+    #[test]
+    fn budgeted_certified_box_conversion_is_bit_identical_with_exact_receipt() {
+        let lower = [
+            -f64::MAX,
+            f64::from_bits(0x8000_0000_0000_0001),
+            -0.0,
+            f64::from_bits(1),
+        ];
+        let upper = [-1.0, f64::from_bits(1), 0.0, f64::MAX];
+        let source = CertifiedBox64::from_certified_bounds(&lower, &upper, box_limits()).unwrap();
+        let start = Instant::now();
+        let baseline = 4_096;
+        let output_bytes = lower.len() * 2 * size_of::<f64>();
+        let budget = ConstrainedZonotopeCallBudget::new(
+            start + Duration::from_mins(1),
+            baseline,
+            baseline + output_bytes,
+        );
+
+        let outcome =
+            CertifiedAuxiliaryBounds64::try_from_certified_box_with_budget(&source, budget)
+                .unwrap();
+        assert_eq!(
+            endpoint_bits(outcome.value().lower()),
+            endpoint_bits(&lower)
+        );
+        assert_eq!(
+            endpoint_bits(outcome.value().upper()),
+            endpoint_bits(&upper)
+        );
+        assert_eq!(outcome.report().peak_live_bytes(), baseline + output_bytes);
+        assert_eq!(outcome.report().charged_items(), lower.len());
+        assert!(outcome.report().deadline_polls() > 0);
+
+        let one_byte_low = ConstrainedZonotopeCallBudget::new(
+            start + Duration::from_mins(1),
+            baseline,
+            baseline + output_bytes - 1,
+        );
+        assert!(matches!(
+            CertifiedAuxiliaryBounds64::try_from_certified_box_with_budget(
+                &source,
+                one_byte_low,
+            ),
+            Err(CertifiedAuxiliaryBounds64BudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::PeakLiveBytesExceeded { required, limit }
+            )) if required == baseline + output_bytes && limit + 1 == required
+        ));
+    }
+
+    #[test]
+    fn budgeted_certified_box_conversion_polls_copy_stride_and_publication() {
+        let value_dim = CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL + 1;
+        let source = CertifiedBox64::from_certified_bounds(
+            &vec![-1.0; value_dim],
+            &vec![1.0; value_dim],
+            box_limits_for(value_dim),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_mins(1);
+        let output_bytes = value_dim * 2 * size_of::<f64>();
+        let budget = ConstrainedZonotopeCallBudget::new(
+            deadline,
+            output_bytes,
+            output_bytes.checked_mul(2).unwrap(),
+        );
+
+        assert!(matches!(
+            try_from_certified_box_with_clock(&source, budget, |checkpoint| {
+                if checkpoint == "certified auxiliary Box endpoint copy" {
+                    deadline
+                } else {
+                    start
+                }
+            }),
+            Err(CertifiedAuxiliaryBounds64BudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "certified auxiliary Box endpoint copy"
+                }
+            ))
+        ));
+
+        let small =
+            CertifiedBox64::from_certified_bounds(&[-1.0, 2.0], &[1.0, 3.0], box_limits()).unwrap();
+        let small_bytes = 4 * size_of::<f64>();
+        assert!(matches!(
+            try_from_certified_box_with_clock(
+                &small,
+                ConstrainedZonotopeCallBudget::new(deadline, small_bytes, small_bytes * 2),
+                |checkpoint| {
+                    if checkpoint == "certified auxiliary Box-copy publication" {
+                        deadline
+                    } else {
+                        start
+                    }
+                },
+            ),
+            Err(CertifiedAuxiliaryBounds64BudgetError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "certified auxiliary Box-copy publication"
+                }
+            ))
+        ));
     }
 
     #[test]

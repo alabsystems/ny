@@ -4,7 +4,7 @@
 
 //! Backend and model routing helpers for `ny beta-crown`.
 
-use super::super::backend::apply_preset_device;
+use super::super::backend::{apply_preset_device, BackendRequest, BackendRequestSource};
 use crate::{BackendArg, CompleteVerifierArg};
 
 /// Input element-count threshold (in scalars) above which the GPU is preferred by
@@ -17,7 +17,7 @@ use crate::{BackendArg, CompleteVerifierArg};
 /// more than the highly-parallel CPU input-split BaB saves (acasxu=5, cersyve=4,
 /// sat_relu=30, collins_rul=400 input elements → CPU). A strict `> 1000` split
 /// cleanly separates these two regimes.
-pub(super) const AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS: usize = 1000;
+pub(crate) const AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS: usize = 1000;
 
 /// Pure auto-backend default decision used when neither an explicit `--backend`,
 /// the legacy `--gpu` flag, nor a preset `general.device` selected a backend.
@@ -70,6 +70,7 @@ pub(super) fn auto_backend_default(
 /// when no spec is present. `gpu_available` reports whether the wgpu backend is
 /// compiled in. A wgpu choice that fails to initialize a device at runtime still
 /// falls back to CPU at device-creation time, so this resolution never aborts.
+#[cfg(test)]
 pub(super) fn resolve_beta_crown_backend(
     backend: Option<BackendArg>,
     gpu: bool,
@@ -77,23 +78,78 @@ pub(super) fn resolve_beta_crown_backend(
     input_element_count: Option<usize>,
     gpu_available: bool,
 ) -> (BackendArg, Option<&'static str>) {
+    let request = resolve_beta_crown_backend_request(
+        backend,
+        gpu,
+        preset_device,
+        input_element_count,
+        gpu_available,
+    );
+    (request.backend, request.selection_reason)
+}
+
+/// Resolve the backend together with the exact source that selected it.
+///
+/// The older tuple helper remains for narrow callers that need only the
+/// selected backend and AUTO explanation. Runtime/provenance code must use
+/// this typed form so a preset request cannot be mislabeled as an explicit CLI
+/// choice and a qualification fallback cannot be mislabeled as the selection.
+pub(super) fn resolve_beta_crown_backend_request(
+    backend: Option<BackendArg>,
+    gpu: bool,
+    preset_device: Option<&str>,
+    input_element_count: Option<usize>,
+    gpu_available: bool,
+) -> BackendRequest {
     match backend {
         // 1. explicit --backend wins outright.
-        Some(explicit) => (explicit, None),
+        Some(explicit) => BackendRequest {
+            backend: explicit,
+            source: BackendRequestSource::ExplicitBackend,
+            selection_reason: None,
+        },
         // 2. legacy --gpu flag.
-        None if gpu => (BackendArg::Wgpu, None),
+        None if gpu => BackendRequest {
+            backend: BackendArg::Wgpu,
+            source: BackendRequestSource::LegacyGpuFlag,
+            selection_reason: None,
+        },
         None => {
             // 3. preset general.device, if it selected a non-default backend.
             let preset_backend = apply_preset_device(BackendArg::Cpu, false, preset_device);
             if preset_backend != BackendArg::Cpu || preset_device == Some("cpu") {
                 // Preset explicitly pinned a device (wgpu, or an explicit cpu).
-                return (preset_backend, None);
+                return BackendRequest {
+                    backend: preset_backend,
+                    source: BackendRequestSource::Preset,
+                    selection_reason: None,
+                };
             }
             // 4. AUTO default — no explicit/legacy/preset signal.
             let (chosen, reason) = auto_backend_default(input_element_count, gpu_available);
-            (chosen, Some(reason))
+            BackendRequest {
+                backend: chosen,
+                source: BackendRequestSource::Auto,
+                selection_reason: Some(reason),
+            }
         }
     }
+}
+
+/// Whether the caller deliberately selected WGPU rather than reaching it via AUTO.
+///
+/// Kept as a pure regression helper: runtime attack routing now preserves the
+/// complete pre-policy typed request instead of re-deriving this narrower bit.
+#[cfg(test)]
+#[must_use]
+pub(super) fn explicitly_requests_wgpu(
+    backend: Option<BackendArg>,
+    gpu: bool,
+    preset_device: Option<&str>,
+) -> bool {
+    backend == Some(BackendArg::Wgpu)
+        || (backend.is_none() && gpu)
+        || (backend.is_none() && !gpu && preset_device == Some("wgpu"))
 }
 
 pub(super) fn route_conv_model_to_graph(

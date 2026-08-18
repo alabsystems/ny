@@ -20,9 +20,9 @@ use crate::bounds::{
 };
 use crate::network::graph_alpha::invprop_backward::take_best_bounds;
 use crate::network::graph_alpha::propagate_helpers::{
-    bounds_infeasible, clamp_inverted_best_bounds, update_elementwise_best_bounds,
+    clamp_inverted_best_bounds, update_elementwise_best_bounds,
 };
-use ndarray::{Array1, ArrayD};
+use ndarray::{Array1, Array3, ArrayD};
 use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
 use std::{any::Any, mem::size_of, time::Instant};
@@ -30,6 +30,201 @@ use tracing::{debug, info, warn};
 
 /// Gradient pair: (lower_path_gradients, upper_path_gradients) per ReLU layer.
 pub(crate) type DualGradients = (Vec<Array1<f32>>, Vec<Array1<f32>>);
+
+/// Optional gamma probes may no-op on capability/numerical/deadline failures
+/// after restoring the authoritative state. Callers treat a deadline as an
+/// immediate optimization stop so the last authoritative global bound survives.
+/// Invariant/configuration errors outside this allow-list remain authoritative.
+pub(crate) fn invprop_gamma_probe_can_noop(error: &NyError) -> bool {
+    matches!(
+        error,
+        NyError::ShapeMismatch { .. }
+            | NyError::UnsupportedLayer(_)
+            | NyError::UnsupportedOp(_)
+            | NyError::UnsupportedConfiguration(_)
+            | NyError::NumericalInstability(_)
+            | NyError::GpuMemoryExceeded { .. }
+            | NyError::CpuMemoryExceeded { .. }
+            | NyError::InfeasibleDomain(_)
+            | NyError::DeadlineExceeded(_)
+    )
+}
+
+/// Deterministic, well-mixed Rademacher direction for INVPROP SPSA.
+///
+/// Using the low bit of affine odd multipliers collapses to a two-direction
+/// parity checkerboard. SplitMix64 avalanche and a high output bit give each
+/// `(iteration, parameter)` pair an independent-looking reproducible sign.
+pub(crate) fn invprop_spsa_sign(iter: usize, parameter: usize) -> f32 {
+    let mut mixed = (iter as u64)
+        .wrapping_mul(0xD1B5_4A32_D192_ED03)
+        .wrapping_add((parameter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(0x94D0_49BB_1331_11EB);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    if mixed >> 63 == 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// Convert a one-sided SPSA finite difference into a bounded trust-region step.
+pub(crate) fn invprop_bounded_spsa_step(
+    base_score: f64,
+    probe_score: f64,
+    probe_delta: f64,
+    learning_rate: f32,
+) -> Option<f64> {
+    if !base_score.is_finite()
+        || !probe_score.is_finite()
+        || !probe_delta.is_finite()
+        || probe_delta <= 0.0
+        || !learning_rate.is_finite()
+        || learning_rate <= 0.0
+    {
+        return None;
+    }
+    // The SPSA slope is Δobjective / Δparameter. Dividing by |base_score|
+    // suppresses the widest unresolved regions (exactly where gamma must move
+    // farthest), so normalize by the known probe displacement and clamp the
+    // resulting slope before applying the configured trust radius.
+    let direction = ((probe_score - base_score) / probe_delta).clamp(-1.0, 1.0);
+    let step = f64::from(learning_rate) * direction;
+    step.is_finite().then_some(step)
+}
+
+/// Build one projected SPSA update while retaining output-row objective
+/// provenance.
+///
+/// With per-output gammas, every parameter column uses only that output row's
+/// finite gap response. Thus progress on a currently non-winning row is not
+/// erased by `max_i(gap_i)`. With shared gammas, the one column affects every
+/// output, so it uses the mean of per-row normalized responses; this prevents a
+/// large-scale row from dominating solely because of units.
+pub(crate) fn invprop_projected_spsa_update(
+    base_params: &Array3<f32>,
+    base_row_gaps: &[Option<f64>],
+    probe_row_gaps: &[Option<f64>],
+    probe_delta: f64,
+    learning_rate: f32,
+    iter: usize,
+) -> Option<Array3<f32>> {
+    let (bound_dim, num_constraints, neuron_dim) = base_params.dim();
+    if bound_dim != 2
+        || num_constraints == 0
+        || neuron_dim == 0
+        || base_row_gaps.is_empty()
+        || base_row_gaps.len() != probe_row_gaps.len()
+        || base_params
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return None;
+    }
+
+    let row_step = |base: Option<f64>, probe: Option<f64>| {
+        base.zip(probe).and_then(|(base, probe)| {
+            invprop_bounded_spsa_step(base, probe, probe_delta, learning_rate)
+        })
+    };
+    let steps: Vec<Option<f64>> = if neuron_dim == 1 {
+        if !probe_delta.is_finite()
+            || probe_delta <= 0.0
+            || !learning_rate.is_finite()
+            || learning_rate <= 0.0
+        {
+            return None;
+        }
+        let responses: Vec<f64> = base_row_gaps
+            .iter()
+            .zip(probe_row_gaps)
+            .filter_map(|(&base, &probe)| {
+                base.zip(probe).and_then(|(base, probe)| {
+                    if !base.is_finite() || !probe.is_finite() {
+                        return None;
+                    }
+                    let response = ((probe - base) / probe_delta).clamp(-1.0, 1.0);
+                    response.is_finite().then_some(response)
+                })
+            })
+            .collect();
+        if responses.is_empty() {
+            return None;
+        }
+        let mean_response = responses.iter().sum::<f64>() / responses.len() as f64;
+        let step = f64::from(learning_rate) * mean_response;
+        vec![step.is_finite().then_some(step)]
+    } else {
+        if neuron_dim != base_row_gaps.len() {
+            return None;
+        }
+        base_row_gaps
+            .iter()
+            .zip(probe_row_gaps)
+            .map(|(&base, &probe)| row_step(base, probe))
+            .collect()
+    };
+
+    let mut updated = base_params.clone();
+    for (idx, value) in updated.iter_mut().enumerate() {
+        let output_idx = idx % neuron_dim;
+        let Some(step) = steps[output_idx] else {
+            continue;
+        };
+        *value =
+            (f64::from(*value) + f64::from(invprop_spsa_sign(iter, idx)) * step).max(0.0) as f32;
+    }
+    if updated.iter().any(|value| !value.is_finite())
+        || updated
+            .iter()
+            .zip(base_params)
+            .all(|(candidate, base)| candidate.to_bits() == base.to_bits())
+    {
+        return None;
+    }
+    Some(updated)
+}
+
+pub(crate) fn native_invprop_seed_treatment_eligible(
+    alpha_state: &AlphaState,
+    actual_output_dim: usize,
+) -> bool {
+    if actual_output_dim == 0 {
+        return false;
+    }
+    let Some(state) = alpha_state.invprop_state.as_ref() else {
+        return false;
+    };
+    let constraints = &state.constraints;
+    if !constraints.is_conjunction
+        || constraints.clause_indices.is_some()
+        || constraints.num_constraints() == 0
+        || constraints.output_dim() != actual_output_dim
+        || constraints.rhs.len() != constraints.num_constraints()
+        || constraints
+            .a_matrix
+            .iter()
+            .chain(constraints.rhs.iter())
+            .any(|value| !value.is_finite())
+    {
+        return false;
+    }
+    state
+        .layer_gammas(crate::invprop::INVPROP_OUTPUT_SEED)
+        .is_some_and(|gammas| {
+            gammas.active
+                && !gammas.gammas.is_empty()
+                && gammas.gammas.shape()[0] == 2
+                && gammas.num_constraints() == constraints.num_constraints()
+                && (gammas.num_neurons() == 1 || gammas.num_neurons() == actual_output_dim)
+                && gammas
+                    .gammas
+                    .iter()
+                    .all(|gamma| gamma.is_finite() && *gamma >= 0.0)
+        })
+}
 
 /// Result of a single backward pass iteration.
 pub(crate) struct BackwardIterationResult {
@@ -198,8 +393,13 @@ pub(crate) fn finite_lower_sum(arr: &ArrayD<f32>) -> f32 {
 /// detection, ny clipping).
 /// Max iterations that run the (one-extra-backward) INVPROP gamma ascent probe.
 /// Gammas are few and converge fast, so a small cap bounds the throughput cost of
-/// on-by-default INVPROP (see the throughput guard at the call site).
+/// explicitly enabled, default-dark gamma optimization (see the throughput
+/// guard at the call site).
 const INVPROP_ASCENT_MAX_ITERS: usize = 5;
+/// Pure gamma-only Linear/ReLU-stable episodes have no alpha-gradient cost and
+/// each backward is cheap. Give row-wise SPSA enough mixed directions to solve
+/// coupled polyhedral emptiness that five probes routinely miss.
+const INVPROP_GAMMA_ONLY_ASCENT_MAX_ITERS: usize = 20;
 
 /// Dark B1 gate: evaluate the planned terminal alpha iterate as a certified
 /// bound-only pass, then persist exactly the state that produced that bound.
@@ -443,23 +643,37 @@ impl AlphaFacetBankCollector {
 /// SOUNDNESS: this only mutates the gamma multipliers used by the *next*
 /// backward's seed fold. Every reported bound still goes through the sound,
 /// directed-rounding, sign-aware augment + `concretize_sound`, and the
-/// best-bounds merge keeps the tightest SOUND iterate — so a wrong or suboptimal
-/// gamma can only fail to improve, never inflate a bound. The gradient therefore
-/// need not be exact or certified; a cheap **deterministic** one-sided SPSA
-/// estimate (reproducible verdicts) is sufficient to steer tightness.
+/// feasible conditioned bounds are excluded from the global best-box merge; a
+/// gamma iterate affects the verdict only through a typed finite-inversion
+/// certificate. The gradient therefore need not be exact or certified; a
+/// deterministic bounded one-sided SPSA estimate is sufficient to steer the
+/// search without weakening proof authority.
 ///
-/// The extra backward here is a pure gradient probe; its bounds are discarded and
-/// never feed the verdict.
+/// The extra backward is normally a discarded gradient probe. If its typed
+/// pre-repair result certifies a finite inversion, the installed perturbed
+/// gamma state and fold attribution are promoted atomically and the caller may
+/// terminate with the infeasibility sentinel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvpropGammaStepOutcome {
+    Continue,
+    CertifiedInfeasible,
+    DeadlineExceeded,
+}
+
 fn invprop_seed_gamma_ascent_step<B: AlphaCrownBackend>(
     backend: &B,
     config: &AlphaCrownConfig,
     alpha_state: &mut AlphaState,
     input: &BoundedTensor,
     iter: usize,
-    base_obj: f32,
-) -> Result<()> {
-    if !base_obj.is_finite() {
-        return Ok(());
+    base_row_gaps: &[Option<f64>],
+    actual_output_dim: usize,
+) -> Result<InvpropGammaStepOutcome> {
+    if base_row_gaps.len() != actual_output_dim || !base_row_gaps.iter().any(Option::is_some) {
+        return Ok(InvpropGammaStepOutcome::Continue);
+    }
+    if !native_invprop_seed_treatment_eligible(alpha_state, actual_output_dim) {
+        return Ok(InvpropGammaStepOutcome::Continue);
     }
     // Snapshot the current seed duals.
     let seed = match alpha_state
@@ -468,27 +682,18 @@ fn invprop_seed_gamma_ascent_step<B: AlphaCrownBackend>(
         .and_then(|s| s.layer_gammas(crate::invprop::INVPROP_OUTPUT_SEED))
     {
         Some(g) if g.active && !g.gammas.is_empty() => g.gammas.clone(),
-        _ => return Ok(()),
+        _ => return Ok(InvpropGammaStepOutcome::Continue),
     };
+    crate::execution_telemetry::record_invprop_gamma_step_attempted();
 
-    let lr = if config.invprop.gamma_lr > 0.0 {
+    let lr = if config.invprop.gamma_lr.is_finite() && config.invprop.gamma_lr > 0.0 {
         config.invprop.gamma_lr
     } else {
         0.5
     };
     let delta = 0.1f32; // SPSA probe magnitude
 
-    // Deterministic +/-1 perturbation sign per entry (reproducible across runs).
-    let sign = |idx: usize| -> f32 {
-        let h = (iter.wrapping_mul(2_654_435_761) ^ idx.wrapping_mul(40_503)) & 1;
-        if h == 0 {
-            1.0
-        } else {
-            -1.0
-        }
-    };
-
-    let restore = |alpha_state: &mut AlphaState, g: &ndarray::Array3<f32>| {
+    let restore = |alpha_state: &mut AlphaState, g: &Array3<f32>| {
         if let Some(gm) = alpha_state
             .invprop_state
             .as_mut()
@@ -501,38 +706,63 @@ fn invprop_seed_gamma_ascent_step<B: AlphaCrownBackend>(
     // Probe: gamma + delta*sign (projected >= 0).
     let mut perturbed = seed.clone();
     for (idx, v) in perturbed.iter_mut().enumerate() {
-        *v = (*v + delta * sign(idx)).max(0.0);
+        *v = (*v + delta * invprop_spsa_sign(iter, idx)).max(0.0);
     }
     restore(alpha_state, &perturbed);
 
-    let obj_plus = match backend.backward_iteration(alpha_state, input, iter, true, true)? {
-        Some(bp) => {
-            let mut cb = bp.linear_bounds.concretize_sound(input);
-            if let Some(no_oc) = bp.bounds_without_oc {
-                cb = take_best_bounds(&cb, &no_oc.concretize_sound(input));
-            }
-            finite_lower_sum(cb.lower())
-        }
-        None => {
+    let evaluated_probe_scope = crate::execution_telemetry::begin_invprop_evaluated_fold_scope();
+    let probe_result = backend.backward_iteration(alpha_state, input, iter, true, false);
+    let probe_concretized = match probe_result {
+        Ok(Some(bp)) => bp.linear_bounds.concretize_sound_with_infeasibility(input),
+        Ok(None) => {
             restore(alpha_state, &seed);
-            return Ok(());
+            return Ok(InvpropGammaStepOutcome::Continue);
+        }
+        Err(error) => {
+            restore(alpha_state, &seed);
+            if matches!(error, NyError::DeadlineExceeded(_)) {
+                return Ok(InvpropGammaStepOutcome::DeadlineExceeded);
+            }
+            if invprop_gamma_probe_can_noop(&error) {
+                return Ok(InvpropGammaStepOutcome::Continue);
+            }
+            return Err(error);
         }
     };
 
-    // One-sided SPSA gradient of the maximize-lower-sum objective.
-    let scale = (obj_plus - base_obj) / delta;
-    if !scale.is_finite() {
-        restore(alpha_state, &seed);
-        return Ok(());
+    let perturbed_changed = perturbed
+        .iter()
+        .zip(seed.iter())
+        .any(|(candidate, base)| candidate.to_bits() != base.to_bits());
+    if probe_concretized.certified_finite_inversion && perturbed_changed {
+        crate::execution_telemetry::record_invprop_gamma_step_applied();
+        evaluated_probe_scope.commit();
+        return Ok(InvpropGammaStepOutcome::CertifiedInfeasible);
     }
+    let probe_row_gaps = probe_concretized.row_finite_gaps;
+    drop(evaluated_probe_scope);
 
-    // Ascent from the ORIGINAL duals; projection >= 0 (clip_gammas re-projects too).
-    let mut updated = seed;
-    for (idx, v) in updated.iter_mut().enumerate() {
-        *v = (*v + lr * scale * sign(idx)).max(0.0);
-    }
+    // The probe is a transaction: restore the authoritative base state before
+    // inspecting its objective or constructing a proposed update. Every early
+    // return below therefore leaves the evaluated gamma vector installed.
+    restore(alpha_state, &seed);
+
+    // Ascent from the ORIGINAL duals; projection >= 0. Per-output gammas use
+    // their own row response, while a shared column uses the mean normalized
+    // response across finite rows.
+    let Some(updated) = invprop_projected_spsa_update(
+        &seed,
+        base_row_gaps,
+        &probe_row_gaps,
+        f64::from(delta),
+        lr,
+        iter,
+    ) else {
+        return Ok(InvpropGammaStepOutcome::Continue);
+    };
     restore(alpha_state, &updated);
-    Ok(())
+    crate::execution_telemetry::record_invprop_gamma_step_applied();
+    Ok(InvpropGammaStepOutcome::Continue)
 }
 
 pub(crate) fn alpha_crown_optimize<B: AlphaCrownBackend>(
@@ -575,6 +805,8 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
     // Prior layout-agnostic fix: #1939.
     let mut best_lower_sum: f32 = finite_lower_sum(crown_bounds.lower());
     let mut prev_best_lower_sum = best_lower_sum;
+    let mut best_invprop_gap: Option<f64> = None;
+    let mut prev_best_invprop_gap: Option<f64> = None;
     let mut no_improve_iters = 0usize;
     let mut lr = config.learning_rate;
     let mut infeasible_bounds: Option<BoundedTensor> = None;
@@ -584,6 +816,9 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
     if let Some(collector) = facet_collector.as_mut() {
         collector.capture_constant_lower(crown_bounds.lower());
     }
+    let invprop_backend_active = invprop_enabled
+        && config.invprop.optimize_gammas
+        && native_invprop_seed_treatment_eligible(alpha_state, best_lower.len());
 
     for iter in 0..config.iterations {
         // Deadline check (#2698): bail early if verification timeout budget
@@ -599,13 +834,28 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         // Compute this before dispatch: analytic backends can avoid producing
         // gradients in the same pass that computes the terminal certified bound.
         let need_grad = alpha_iteration_needs_gradient(iter, config.iterations, final_bound_only);
+        // Nonzero INVPROP duals condition the next backward on the assumed
+        // violation region. They may prove that region infeasible, but a
+        // feasible conditioned result is not a global box bound and cannot be
+        // retained by this public bound-returning API.
+        let returnable_box_iterate = alpha_state.invprop_state.as_ref().is_none_or(|state| {
+            state
+                .all_ny_params()
+                .iter()
+                .all(|gamma| gamma.to_bits() == 0.0_f32.to_bits())
+        });
 
         // Run backward pass.
+        let evaluated_fold_scope = invprop_backend_active
+            .then(crate::execution_telemetry::begin_invprop_evaluated_fold_scope);
+        // OFF keeps exact-zero gamma and therefore follows the ordinary
+        // backward route. Only active optimization needs the output-seed fold
+        // and its proof provenance.
         let bp_result = match backend.backward_iteration(
             alpha_state,
             input,
             iter,
-            invprop_enabled,
+            invprop_backend_active,
             need_grad,
         )? {
             Some(result) => result,
@@ -615,22 +865,55 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         // Coefficient retention is optional and can copy a large matrix.  If the
         // backward itself crossed the deadline, preserve its scalar result but do
         // not spend post-deadline time materializing another trajectory facet.
-        if !config.past_deadline() {
+        if returnable_box_iterate && !config.past_deadline() {
             if let Some(collector) = facet_collector.as_mut() {
                 collector.capture(&bp_result.linear_bounds);
             }
         }
 
         // Concretize to get actual bounds
-        let mut concrete_bounds = bp_result.linear_bounds.concretize_sound(input);
+        let actual_output_dim = bp_result.linear_bounds.num_outputs();
+        let gamma_treatment_admissible =
+            native_invprop_seed_treatment_eligible(alpha_state, actual_output_dim);
+        let gamma_optimization_active = invprop_backend_active && gamma_treatment_admissible;
+        // Row-wise pre-repair provenance allocates and scans one entry per
+        // output. Keep ordinary/non-treatment/OFF iterations on the public
+        // allocation-free concretization path; probes and active treatment
+        // iterations retain the typed proof metadata.
+        let (
+            mut concrete_bounds,
+            certified_finite_inversion,
+            invprop_gap_score,
+            invprop_row_gap_scores,
+        ) = if gamma_optimization_active {
+            let concretized = bp_result
+                .linear_bounds
+                .concretize_sound_with_infeasibility(input);
+            (
+                concretized.bounds,
+                concretized.certified_finite_inversion,
+                concretized.max_finite_gap,
+                concretized.row_finite_gaps,
+            )
+        } else {
+            (
+                bp_result.linear_bounds.concretize_sound(input),
+                false,
+                None,
+                Vec::new(),
+            )
+        };
         if let Some(bounds_no_oc) = bp_result.bounds_without_oc {
             let no_oc_bounds = bounds_no_oc.concretize_sound(input);
             concrete_bounds = take_best_bounds(&concrete_bounds, &no_oc_bounds);
         }
+        if let Some(scope) = evaluated_fold_scope {
+            scope.commit();
+        }
 
         // INVPROP infeasibility check
         if let Some(ref mut state) = alpha_state.invprop_state {
-            if bounds_infeasible(&concrete_bounds) {
+            if certified_finite_inversion {
                 state.mark_infeasible(0)?;
                 state.apply_infeasible_mask(&mut concrete_bounds);
                 infeasible_bounds = Some(concrete_bounds);
@@ -643,7 +926,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         // Matches α,β-CROWN's start_save_best (optimized_bounds.py:785-797).
         // `force` is true on the last iteration to ensure we always capture final bounds.
         let is_last_iter = iter == config.iterations - 1;
-        if config.should_save_best(iter, is_last_iter) {
+        if returnable_box_iterate && config.should_save_best(iter, is_last_iter) {
             update_elementwise_best_bounds(
                 &mut best_lower,
                 &mut best_upper,
@@ -654,6 +937,18 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
 
         // Finite-only sum for early stopping (#2857). Layout-agnostic (#1939).
         let lower_sum: f32 = finite_lower_sum(concrete_bounds.lower());
+        let gamma_only_invprop = gamma_treatment_admissible && alpha_state.num_unstable() == 0;
+        let gamma_probe_limit = if gamma_only_invprop {
+            INVPROP_GAMMA_ONLY_ASCENT_MAX_ITERS
+        } else {
+            INVPROP_ASCENT_MAX_ITERS
+        };
+        let gamma_gap_control = gamma_optimization_active && invprop_gap_score.is_some();
+        if let Some(gap) = invprop_gap_score {
+            if best_invprop_gap.is_none_or(|best| gap > best) {
+                best_invprop_gap = Some(gap);
+            }
+        }
 
         // NaN detection: if any bound element is NaN, the backward pass produced
         // garbage. Break early to avoid wasting remaining iterations — the
@@ -665,6 +960,22 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
             break;
         }
 
+        // A full authoritative backward can itself consume the remaining
+        // budget. Preserve any typed proof handled above and any returnable
+        // global iterate, then stop before refresh/gradient probe work.
+        if config.past_deadline() {
+            if returnable_box_iterate && !config.should_save_best(iter, false) {
+                update_elementwise_best_bounds(
+                    &mut best_lower,
+                    &mut best_upper,
+                    &concrete_bounds,
+                    iter,
+                )?;
+            }
+            info!("{label}: deadline exceeded after authoritative iteration {iter}");
+            break;
+        }
+
         // Track best lower_sum for early stopping
         let improved_output = lower_sum > best_lower_sum;
         if improved_output {
@@ -672,17 +983,30 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         }
 
         // Early stopping check (compare best improvement since last iteration).
-        let best_improvement = best_lower_sum - prev_best_lower_sum;
-        if best_improvement < config.tolerance {
+        let best_improvement = if gamma_gap_control {
+            match (best_invprop_gap, prev_best_invprop_gap) {
+                (Some(best), Some(previous)) => best - previous,
+                (Some(_), None) => f64::INFINITY,
+                _ => 0.0,
+            }
+        } else {
+            f64::from(best_lower_sum - prev_best_lower_sum)
+        };
+        if best_improvement < f64::from(config.tolerance) {
             no_improve_iters += 1;
         } else {
             no_improve_iters = 0;
         }
-        if iter > 0 && no_improve_iters >= config.early_stop_patience {
+        let gamma_probe_available = gamma_optimization_active
+            && invprop_gap_score.is_some()
+            && need_grad
+            && iter < gamma_probe_limit
+            && !config.past_deadline();
+        if iter > 0 && no_improve_iters >= config.early_stop_patience && !gamma_probe_available {
             // Force-save before early exit to avoid losing optimization progress
             // when patience is exhausted during the warmup window.
             // Reference: optimized_bounds.py:794 (patience == early_stop_patience).
-            if !config.should_save_best(iter, false) {
+            if returnable_box_iterate && !config.should_save_best(iter, false) {
                 update_elementwise_best_bounds(
                     &mut best_lower,
                     &mut best_upper,
@@ -701,7 +1025,10 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         // (iter == 1), verify optimization helped before spending another update.
         // The DAG alpha-CROWN path performs this check before gradient computation
         // and parameter mutation for iteration 1.
-        if iter == 1 && backend.pilot_check(config, best_lower_sum, &crown_bounds) {
+        if iter == 1
+            && !gamma_gap_control
+            && backend.pilot_check(config, best_lower_sum, &crown_bounds)
+        {
             debug!("{label}: pilot check aborted at iteration 1 (#1948)");
             if let Some(collector) = facet_collector.take() {
                 collector.merge_into(input, &mut best_lower, &best_upper, label, config.deadline);
@@ -725,6 +1052,59 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
                 "{label}: NY_ALPHA_FINAL_BOUND_ONLY terminal pass"
             );
             break;
+        }
+
+        // INVPROP probes the exact alpha state that produced this iteration's
+        // typed gap. Run it before reference refresh or alpha-gradient work so
+        // gamma-only progress and direct proof promotion do not pay for
+        // unrelated discarded backwards.
+        let mut gamma_step_outcome = InvpropGammaStepOutcome::Continue;
+        if gamma_probe_available {
+            if invprop_gap_score.is_some() {
+                gamma_step_outcome = invprop_seed_gamma_ascent_step(
+                    &*backend,
+                    config,
+                    alpha_state,
+                    input,
+                    iter,
+                    &invprop_row_gap_scores,
+                    actual_output_dim,
+                )?;
+                if gamma_step_outcome == InvpropGammaStepOutcome::CertifiedInfeasible {
+                    if let Some(state) = alpha_state.invprop_state.as_mut() {
+                        state.mark_infeasible(0)?;
+                        state.apply_infeasible_mask(&mut concrete_bounds);
+                        infeasible_bounds = Some(concrete_bounds);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if gamma_step_outcome == InvpropGammaStepOutcome::DeadlineExceeded {
+            info!("{label}: INVPROP probe reached the deadline at iteration {iter}");
+            break;
+        }
+
+        if config.past_deadline() {
+            info!("{label}: deadline exceeded by INVPROP probe at iteration {iter}");
+            break;
+        }
+
+        // A pure-linear native route has no alpha or extended parameters to
+        // update. OFF therefore needs exactly its authoritative identity fold;
+        // ON continues only while another bounded gamma probe can change the
+        // next evaluated seed, then stops after one final authoritative fold.
+        if gamma_only_invprop {
+            if !config.invprop.optimize_gammas
+                || invprop_gap_score.is_none()
+                || iter >= gamma_probe_limit
+            {
+                break;
+            }
+            prev_best_lower_sum = best_lower_sum;
+            prev_best_invprop_gap = best_invprop_gap;
+            continue;
         }
 
         let refresh_candidate = backend.post_bounds_update(iter, improved_output)?;
@@ -812,24 +1192,6 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         // happen in sequence before reference bounds refresh.
         backend.update_extended_alphas(config, lr, iter, &mut total_gradient_skips)?;
 
-        // INVPROP: projected gamma ascent on the output-seed duals (Stage 2).
-        // Gated on optimize_gammas (default off => byte-identical baseline). Runs
-        // BEFORE clip so the >= 0 projection is applied uniformly. Soundness is
-        // independent of the gamma value (see helper docs), so a cheap SPSA step
-        // suffices; the verdict always comes from the sound best-bounds merge.
-        //
-        // THROUGHPUT GUARD: each step costs one extra backward, so it is capped to
-        // the first few iterations (gammas are few and converge fast) and skipped
-        // once the deadline is near. This bounds the overhead so on-by-default can
-        // only help or no-op, never regress a budget into a timeout.
-        if invprop_enabled
-            && config.invprop.optimize_gammas
-            && iter < INVPROP_ASCENT_MAX_ITERS
-            && !config.past_deadline()
-        {
-            invprop_seed_gamma_ascent_step(&*backend, config, alpha_state, input, iter, lower_sum)?;
-        }
-
         // Clip gammas to enforce non-negativity (INVPROP constraint)
         if invprop_enabled {
             alpha_state.clip_gammas();
@@ -856,6 +1218,7 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
         }
 
         prev_best_lower_sum = best_lower_sum;
+        prev_best_invprop_gap = best_invprop_gap;
     }
     // Gradient skip summary (#2981 Slice 5).
     if total_gradient_skips > 0 {
@@ -863,6 +1226,87 @@ fn alpha_crown_optimize_impl<B: AlphaCrownBackend>(
             "{label}: skipped {total_gradient_skips}/{} gradient updates (non-finite)",
             config.iterations * alpha_state.alphas.len()
         );
+    }
+
+    // Gamma-conditioned iterates are deliberately excluded from the returned
+    // global box. If alpha moved while gamma was nonzero but did not obtain a
+    // proof, recover that valid alpha progress with one deadline-gated fold at
+    // exact zero output-seed gamma. The seed transaction is restored on every
+    // outcome; optional backend/deadline failures simply retain the initial
+    // global CROWN bound already stored in `best_*`.
+    if infeasible_bounds.is_none()
+        && invprop_enabled
+        && config.invprop.optimize_gammas
+        && alpha_state.num_unstable() > 0
+        && !config.past_deadline()
+        && native_invprop_seed_treatment_eligible(alpha_state, best_lower.len())
+    {
+        let seed = alpha_state
+            .invprop_state
+            .as_ref()
+            .and_then(|state| state.layer_gammas(crate::invprop::INVPROP_OUTPUT_SEED))
+            .map(|gammas| gammas.gammas.clone());
+        if let Some(seed) = seed.filter(|values| {
+            values
+                .iter()
+                .any(|value| value.to_bits() != 0.0_f32.to_bits())
+        }) {
+            if let Some(gammas) = alpha_state
+                .invprop_state
+                .as_mut()
+                .and_then(|state| state.layer_gammas_mut(crate::invprop::INVPROP_OUTPUT_SEED))
+            {
+                gammas.gammas.fill(0.0);
+            }
+            let globally_unconditioned = alpha_state.invprop_state.as_ref().is_some_and(|state| {
+                state
+                    .all_ny_params()
+                    .iter()
+                    .all(|value| value.to_bits() == 0.0_f32.to_bits())
+            });
+            let final_result = globally_unconditioned.then(|| {
+                backend.backward_iteration(
+                    alpha_state,
+                    input,
+                    config.iterations,
+                    // Exact-zero gamma is the identity; use the ordinary
+                    // backend route for this global reconstruction.
+                    false,
+                    false,
+                )
+            });
+            if let Some(gammas) = alpha_state
+                .invprop_state
+                .as_mut()
+                .and_then(|state| state.layer_gammas_mut(crate::invprop::INVPROP_OUTPUT_SEED))
+            {
+                gammas.gammas.assign(&seed);
+            }
+            match final_result {
+                Some(Ok(Some(bp))) => {
+                    let mut global_bounds = bp.linear_bounds.concretize_sound(input);
+                    if let Some(bounds_no_oc) = bp.bounds_without_oc {
+                        global_bounds =
+                            take_best_bounds(&global_bounds, &bounds_no_oc.concretize_sound(input));
+                    }
+                    if !global_bounds.lower().iter().any(|value| value.is_nan())
+                        && !global_bounds.upper().iter().any(|value| value.is_nan())
+                    {
+                        update_elementwise_best_bounds(
+                            &mut best_lower,
+                            &mut best_upper,
+                            &global_bounds,
+                            config.iterations,
+                        )?;
+                    }
+                }
+                Some(Ok(None)) | None => {}
+                Some(Err(error)) if invprop_gamma_probe_can_noop(&error) => {}
+                Some(Err(error)) => {
+                    return Err(error);
+                }
+            }
+        }
     }
 
     if let Some(bounds) = infeasible_bounds {

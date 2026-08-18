@@ -53,6 +53,19 @@ fn parse_resolved_branching(method: &str, input_split_enabled: bool) -> Result<R
             use_relu_split: true,
         });
     }
+    // `nonlinear` (alpha-beta-CROWN's GenBaB method token; `genbab` accepted as
+    // the ny-native alias) selects GenBaB branching explicitly. Same routing as
+    // the method-absent `nonlinear_split` arm in `resolve_branching`: GenBaB
+    // runs in the GRAPH engine, so it uses the ReLU-split route (#ml4acopf-genbab).
+    // An explicit `method` always wins over an implicit `nonlinear_split`
+    // section, so presets that pin `method: input` alongside nonlinear-split
+    // tuning keep input splitting — selecting GenBaB requires naming it here.
+    if normalized == "nonlinear" || normalized == "genbab" {
+        return Ok(ResolvedBranching {
+            heuristic: BranchingHeuristic::GenBaB(NonlinearBranchingConfig::default()),
+            use_relu_split: true,
+        });
+    }
     if normalized == "sb" {
         if input_split_enabled {
             return Ok(ResolvedBranching {

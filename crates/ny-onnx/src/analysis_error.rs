@@ -100,3 +100,47 @@ impl AnalysisError {
         }
     }
 }
+
+/// Validate the perturbation radius shared by profile, quantization, and
+/// sensitivity analyses.
+///
+/// `BoundedTensor::from_epsilon` performs this check when an analysis creates
+/// its default input. A caller-supplied bounded tensor bypasses that
+/// constructor, so validate the configuration independently to keep result
+/// normalization and reported metadata meaningful.
+pub(crate) fn validate_analysis_epsilon(
+    context: &'static str,
+    epsilon: f32,
+) -> Result<(), AnalysisError> {
+    if epsilon >= 0.0 && epsilon.is_finite() {
+        return Ok(());
+    }
+
+    Err(AnalysisError::propagation(
+        context,
+        NyError::InvalidSpec(format!(
+            "analysis epsilon must be non-negative and finite, got {epsilon}"
+        )),
+    ))
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn analysis_epsilon_validation_rejects_non_finite_and_negative_values() {
+        for epsilon in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = validate_analysis_epsilon("test", epsilon)
+                .expect_err("invalid epsilon must fail even with a custom input");
+            assert!(err.to_string().contains("epsilon"), "err = {err}");
+            assert!(err.to_string().contains("non-negative"), "err = {err}");
+        }
+    }
+
+    #[test]
+    fn analysis_epsilon_validation_accepts_zero_and_positive_values() {
+        validate_analysis_epsilon("test", 0.0).expect("zero-radius analysis is valid");
+        validate_analysis_epsilon("test", 0.01).expect("positive epsilon is valid");
+    }
+}

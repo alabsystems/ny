@@ -5,6 +5,8 @@
 use super::WgpuDevice;
 use bytemuck::Pod;
 use ny_core::{NyError, Result};
+use std::mem::size_of;
+use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -12,6 +14,13 @@ pub(super) struct ReadTwoBuffersTiming {
     pub(super) map_requests_seconds: f64,
     pub(super) poll_wait_seconds: f64,
     pub(super) copy_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadbackWait {
+    Unbounded,
+    Expired,
+    Bounded(std::time::Duration),
 }
 
 /// RAII guard that unmaps a wgpu buffer on drop.
@@ -56,6 +65,70 @@ impl Drop for UnmapOnDrop<'_> {
 }
 
 impl WgpuDevice {
+    fn readback_wait() -> ReadbackWait {
+        match crate::wgpu_device::CALL_LOCAL_CROWN_DEADLINE.with(std::cell::Cell::get) {
+            None => ReadbackWait::Unbounded,
+            Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) => ReadbackWait::Bounded(remaining),
+                None => ReadbackWait::Expired,
+            },
+        }
+    }
+
+    fn poll_readback(device: &wgpu::Device, label: &str) -> Result<()> {
+        let timeout = match Self::readback_wait() {
+            ReadbackWait::Unbounded => None,
+            ReadbackWait::Bounded(remaining) => Some(remaining),
+            ReadbackWait::Expired => {
+                super::ops::intermediate_sweep::note_post_submit_abort();
+                return Err(NyError::DeadlineExceeded(format!(
+                    "{label}: deadline expired before GPU readback"
+                )));
+            }
+        };
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout,
+            })
+            .map_err(|error| match error {
+                wgpu::PollError::Timeout => {
+                    super::ops::intermediate_sweep::note_post_submit_abort();
+                    NyError::DeadlineExceeded(format!(
+                        "{label}: GPU readback did not complete before the call-local deadline"
+                    ))
+                }
+                other => NyError::InternalError(format!(
+                    "{label}: device poll failed during GPU readback: {other}"
+                )),
+            })?;
+        Ok(())
+    }
+
+    /// Deadline-bounded completion fence for device-resident intermediate
+    /// sweep units. Unlike a readback this transfers no bytes, but it is a real
+    /// synchronization and ensures command-buffer-owned scratch allocations
+    /// from the completed unit cannot overlap the next unit's admitted peak.
+    pub(super) fn wait_for_intermediate_sweep_unit(&self, label: &str) -> Result<()> {
+        Self::poll_readback(&self.device, label)?;
+        super::ops::intermediate_sweep::note_device_to_host(0, 0, 1);
+        Ok(())
+    }
+
+    fn receive_map_result(
+        receiver: &std::sync::mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>,
+        label: &str,
+    ) -> Result<std::result::Result<(), wgpu::BufferAsyncError>> {
+        receiver.try_recv().map_err(|error| match error {
+            TryRecvError::Empty => NyError::InternalError(format!(
+                "{label}: device poll completed without delivering the map callback"
+            )),
+            TryRecvError::Disconnected => {
+                NyError::InternalError(format!("{label}: map callback channel disconnected"))
+            }
+        })
+    }
+
     fn read_buffer_typed<T: Pod>(
         device: &wgpu::Device,
         buffer: &wgpu::Buffer,
@@ -73,13 +146,8 @@ impl WgpuDevice {
         // the next map_async on this pooled buffer aborts the process via wgpu's
         // `assert_eq!(mapped_range, 0..0, "Buffer is already mapped")`.
         let unmap_guard = UnmapOnDrop::new(buffer);
-        let _ = device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        let map_result = receiver.recv().map_err(|err| {
-            NyError::InternalError(format!("{label}: map callback channel disconnected: {err}"))
-        })?;
+        Self::poll_readback(device, label)?;
+        let map_result = Self::receive_map_result(&receiver, label)?;
         map_result
             .map_err(|err| NyError::InternalError(format!("{label}: map_async failed: {err:?}")))?;
 
@@ -100,6 +168,12 @@ impl WgpuDevice {
             .to_vec();
         drop(data);
         unmap_guard.unmap();
+
+        super::ops::intermediate_sweep::note_device_to_host(
+            count.saturating_mul(size_of::<T>()),
+            1,
+            1,
+        );
 
         Ok(result)
     }
@@ -172,18 +246,12 @@ impl WgpuDevice {
         }
 
         // Single poll completes every mapping.
-        let _ = device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
+        Self::poll_readback(device, "read_buffers_batched")?;
 
         let mut results = Vec::with_capacity(buffers.len());
         for (idx, ((_, count), slice)) in buffers.iter().zip(slices.iter()).enumerate() {
-            let map_result = receivers[idx].recv().map_err(|err| {
-                NyError::InternalError(format!(
-                    "read_buffers_batched: map callback channel disconnected: {err}"
-                ))
-            })?;
+            let map_result =
+                Self::receive_map_result(&receivers[idx], &format!("read_buffers_batched[{idx}]"))?;
             map_result.map_err(|err| {
                 NyError::InternalError(format!("read_buffers_batched: map_async failed: {err:?}"))
             })?;
@@ -209,7 +277,111 @@ impl WgpuDevice {
         for guard in guards {
             guard.unmap();
         }
+        let bytes = buffers.iter().fold(0usize, |total, (_, count)| {
+            total.saturating_add(count.saturating_mul(size_of::<f32>()))
+        });
+        super::ops::intermediate_sweep::note_device_to_host(bytes, buffers.len(), 1);
         Ok(results)
+    }
+
+    /// Mixed-type sibling used by the worded intermediate-sweep carrier: map
+    /// all f32 value/error staging buffers and the final u32 row accumulator
+    /// before one bounded poll, preserving a single transaction-final
+    /// synchronization and an exact nine-buffer readback receipt.
+    pub(super) fn read_sweep_carrier_batched(
+        device: &wgpu::Device,
+        f32_buffers: &[(&wgpu::Buffer, usize)],
+        row_words: (&wgpu::Buffer, usize),
+    ) -> Result<(Vec<Vec<f32>>, Vec<u32>)> {
+        let mut f32_slices = Vec::with_capacity(f32_buffers.len());
+        let mut f32_receivers = Vec::with_capacity(f32_buffers.len());
+        let mut guards = Vec::with_capacity(f32_buffers.len() + 1);
+        for (buffer, _) in f32_buffers {
+            let slice = buffer.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            guards.push(UnmapOnDrop::new(buffer));
+            f32_slices.push(slice);
+            f32_receivers.push(receiver);
+        }
+        let row_slice = row_words.0.slice(..);
+        let (row_sender, row_receiver) = std::sync::mpsc::channel();
+        row_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = row_sender.send(result);
+        });
+        guards.push(UnmapOnDrop::new(row_words.0));
+
+        Self::poll_readback(device, "read_sweep_carrier_batched")?;
+
+        let mut values = Vec::with_capacity(f32_buffers.len());
+        for (index, ((_, count), slice)) in f32_buffers.iter().zip(f32_slices.iter()).enumerate() {
+            Self::receive_map_result(
+                &f32_receivers[index],
+                &format!("read_sweep_carrier_batched[{index}]"),
+            )?
+            .map_err(|error| {
+                NyError::InternalError(format!(
+                    "read_sweep_carrier_batched[{index}]: map_async failed: {error:?}"
+                ))
+            })?;
+            let data = slice.get_mapped_range();
+            let typed: &[f32] = bytemuck::try_cast_slice(&data).map_err(|error| {
+                NyError::InternalError(format!(
+                    "read_sweep_carrier_batched[{index}]: invalid f32 layout: {error:?}"
+                ))
+            })?;
+            values.push(
+                typed
+                    .get(..*count)
+                    .ok_or_else(|| {
+                        NyError::InternalError(format!(
+                            "read_sweep_carrier_batched[{index}]: requested {count}, mapped {}",
+                            typed.len()
+                        ))
+                    })?
+                    .to_vec(),
+            );
+            drop(data);
+        }
+
+        Self::receive_map_result(&row_receiver, "read_sweep_carrier_batched[rows]")?.map_err(
+            |error| {
+                NyError::InternalError(format!(
+                    "read_sweep_carrier_batched[rows]: map_async failed: {error:?}"
+                ))
+            },
+        )?;
+        let row_data = row_slice.get_mapped_range();
+        let typed_rows: &[u32] = bytemuck::try_cast_slice(&row_data).map_err(|error| {
+            NyError::InternalError(format!(
+                "read_sweep_carrier_batched[rows]: invalid u32 layout: {error:?}"
+            ))
+        })?;
+        let rows = typed_rows
+            .get(..row_words.1)
+            .ok_or_else(|| {
+                NyError::InternalError(format!(
+                    "read_sweep_carrier_batched[rows]: requested {}, mapped {}",
+                    row_words.1,
+                    typed_rows.len()
+                ))
+            })?
+            .to_vec();
+        drop(row_data);
+
+        for guard in guards {
+            guard.unmap();
+        }
+        let value_bytes = f32_buffers.iter().try_fold(0usize, |total, (_, count)| {
+            total.checked_add(count.checked_mul(size_of::<f32>())?)
+        });
+        let bytes = value_bytes
+            .and_then(|total| total.checked_add(row_words.1.checked_mul(size_of::<u32>())?))
+            .ok_or_else(|| NyError::InternalError("sweep readback byte count overflow".into()))?;
+        super::ops::intermediate_sweep::note_device_to_host(bytes, f32_buffers.len() + 1, 1);
+        Ok((values, rows))
     }
 
     /// Map two readback buffers concurrently with a single `device.poll` (#3397).
@@ -256,30 +428,19 @@ impl WgpuDevice {
 
         // Single poll completes both mappings.
         let poll_start = Instant::now();
-        let _ = device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
+        Self::poll_readback(device, "wgpu read_two_buffers")?;
         let poll_wait_seconds = poll_start.elapsed().as_secs_f64();
 
         // Check both map results.
         let copy_start = Instant::now();
-        let map_a = receiver_a.recv().map_err(|err| {
-            NyError::InternalError(format!(
-                "wgpu read_two_buffers: map_a channel disconnected: {err}"
-            ))
-        })?;
+        let map_a = Self::receive_map_result(&receiver_a, "wgpu read_two_buffers map_a")?;
         map_a.map_err(|err| {
             NyError::InternalError(format!(
                 "wgpu read_two_buffers: map_async buf_a failed: {err:?}"
             ))
         })?;
 
-        let map_b = receiver_b.recv().map_err(|err| {
-            NyError::InternalError(format!(
-                "wgpu read_two_buffers: map_b channel disconnected: {err}"
-            ))
-        })?;
+        let map_b = Self::receive_map_result(&receiver_b, "wgpu read_two_buffers map_b")?;
         map_b.map_err(|err| {
             NyError::InternalError(format!(
                 "wgpu read_two_buffers: map_async buf_b failed: {err:?}"
@@ -330,5 +491,48 @@ impl WgpuDevice {
                 copy_seconds,
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn readback_wait_tracks_call_local_deadline_and_restores_scope() {
+        assert_eq!(WgpuDevice::readback_wait(), ReadbackWait::Unbounded);
+        {
+            let _scope = crate::wgpu_device::CallLocalCrownDeadlineScope::arm(
+                Instant::now() + Duration::from_mins(1),
+            );
+            assert!(matches!(
+                WgpuDevice::readback_wait(),
+                ReadbackWait::Bounded(remaining) if !remaining.is_zero()
+            ));
+        }
+        assert_eq!(WgpuDevice::readback_wait(), ReadbackWait::Unbounded);
+        {
+            let _scope = crate::wgpu_device::CallLocalCrownDeadlineScope::arm(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond is representable"),
+            );
+            assert_eq!(WgpuDevice::readback_wait(), ReadbackWait::Expired);
+        }
+    }
+
+    #[test]
+    fn map_callback_receive_distinguishes_empty_and_disconnected() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let empty = WgpuDevice::receive_map_result(&receiver, "scripted").unwrap_err();
+        assert!(empty.to_string().contains("without delivering"));
+        sender.send(Ok(())).unwrap();
+        assert!(WgpuDevice::receive_map_result(&receiver, "scripted")
+            .unwrap()
+            .is_ok());
+        drop(sender);
+        let disconnected = WgpuDevice::receive_map_result(&receiver, "scripted").unwrap_err();
+        assert!(disconnected.to_string().contains("disconnected"));
     }
 }

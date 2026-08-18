@@ -2,25 +2,23 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Adversarial enclosure tests for the extended BN folds
-//! (#cgan-structural-fold): 500 random ConvTranspose+BN pairs, 500 random
-//! Gemm+Reshape+BN triples, and 500 random BN+Reshape+Gemm forward tails, each
-//! checked against ONNX Runtime on the ORIGINAL (unfolded) graph.
+//! Adversarial enclosure tests for raw BatchNormalization evaluation:
+//! 500 random ConvTranspose+BN pairs, 500 random Gemm+Reshape+BN triples, and
+//! 500 random BN+Reshape+Gemm forward tails, each checked against ONNX Runtime.
 //!
-//! Soundness gate (the moat): the fold rewrites network WEIGHTS, so a folded
-//! network that disagrees with the unfolded one is a wrong-verdict factory.
-//! The landed Conv/Gemm BN-fold convention (mirrored here and in
-//! alpha-beta-CROWN's onnx_opt.py) is: the fold equations are EXACT in real
-//! arithmetic and are evaluated once in f32. The acceptance gate therefore is:
+//! #bn-fold-restore: BOTH BatchNorm routes are enclosure-tested here against
+//! ONNX Runtime over the same random cases:
 //!
-//!   for random weights & points, ORT(unfolded, x) must lie within the folded
-//!   network's outward-rounded point-box IBP interval, widened by
-//!   `FOLD_TOL_REL * max(1, |y|)` — slack for (a) the f32 rounding of the fold
-//!   equations themselves and (b) ORT-vs-ny summation-order differences that
-//!   exist even WITHOUT folding. FOLD_TOL_REL = 1e-4; a wrong channel axis or
-//!   a wrong block map produces order-1 errors with random per-channel scales,
-//!   so the gate is far tighter than any layout bug and far looser than
-//!   legitimate f32 round-off (measured ~1e-6 relative on these magnitudes).
+//!   * the RAW route (`BatchNormFoldingPolicy::PreserveRaw`), which keeps the
+//!     BatchNorm layer and its certified scale_err/bias_err enclosure; and
+//!   * the FOLDED route (default policy), where the BN affine is composed into
+//!     the preceding Conv/Gemm in f64 with one final f32 rounding. These
+//!     folded-vs-ORT cases are the empirical acceptance evidence the old
+//!     `BATCH_NORM_AFFINE_COMPOSITION_AUTHENTICATED` quarantine asked for.
+//!
+//! In both routes, ORT(x) must lie within NY's outward-rounded point-box IBP
+//! interval, widened by `REFERENCE_TOL_REL * max(1, |y|)` for ORT-vs-NY
+//! summation-order differences.
 //!
 //! Determinism: a fixed-seed xorshift64* generator, so every run checks the
 //! same 1500 cases and a failure is exactly reproducible from its case index.
@@ -35,7 +33,7 @@ use ny_tensor::BoundedTensor;
 use prost::Message;
 
 const CASES_PER_PATTERN: usize = 500;
-const FOLD_TOL_REL: f32 = 1e-4;
+const REFERENCE_TOL_REL: f32 = 1e-4;
 
 /// xorshift64* — deterministic, dependency-free case generator.
 struct Rng(u64);
@@ -148,7 +146,7 @@ fn int_attr(name: &str, value: i64) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
         r#type: attribute_type::INT,
-        i: value,
+        i: Some(value),
         ..Default::default()
     }
 }
@@ -157,7 +155,7 @@ fn float_attr(name: &str, value: f32) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
         r#type: attribute_type::FLOAT,
-        f: value,
+        f: Some(value),
         ..Default::default()
     }
 }
@@ -443,23 +441,44 @@ fn random_bn_reshape_gemm_case(
     )
 }
 
-/// Core check for one case: the fold fired, and ORT on the ORIGINAL graph is
-/// enclosed by the folded network's point-box IBP within FOLD_TOL_REL.
-fn assert_folded_encloses_ort(case: usize, model_bytes: &[u8], point: &ArrayD<f32>) {
-    // ORT reference on the unfolded bytes.
+/// Core check for one case: BatchNormalization remains explicit, and ORT is
+/// enclosed by the raw network's point-box IBP within `REFERENCE_TOL_REL`.
+fn assert_raw_batch_norm_encloses_ort(case: usize, model_bytes: &[u8], point: &ArrayD<f32>) {
+    assert_bn_route_encloses_ort(case, model_bytes, point, false)
+}
+
+fn assert_folded_batch_norm_encloses_ort(case: usize, model_bytes: &[u8], point: &ArrayD<f32>) {
+    assert_bn_route_encloses_ort(case, model_bytes, point, true)
+}
+
+fn assert_bn_route_encloses_ort(
+    case: usize,
+    model_bytes: &[u8],
+    point: &ArrayD<f32>,
+    expect_folded: bool,
+) {
     let ort_outputs =
         crate::diff::run_inference_bytes(model_bytes, point).expect("ORT inference on test model");
     let ort_y = ort_outputs.first().expect("ORT output");
 
-    // NY load — the extended fold fires here (default ON).
-    let model = crate::load_onnx_bytes("bn_fold_prop", model_bytes).expect("NY load of test model");
-    assert!(
-        !model
-            .network
-            .layers
-            .iter()
-            .any(|layer| layer.layer_type == LayerType::BatchNorm),
-        "case {case}: BatchNormalization survived the fold (layers: {:?})",
+    let model = if expect_folded {
+        // Default policy: the fold fires (f64 composition, one f32 rounding).
+        crate::load_onnx_bytes("bn_fold_prop", model_bytes).expect("NY load of test model")
+    } else {
+        let config = crate::loader::OnnxLoadConfig::default()
+            .with_batch_norm_folding_policy(crate::loader::BatchNormFoldingPolicy::PreserveRaw);
+        crate::loader::load_onnx_bytes_with_config("bn_raw_prop", model_bytes, &config)
+            .expect("NY PreserveRaw load of test model")
+    };
+    let has_bn = model
+        .network
+        .layers
+        .iter()
+        .any(|layer| layer.layer_type == LayerType::BatchNorm);
+    assert_eq!(
+        has_bn,
+        !expect_folded,
+        "case {case}: BatchNorm presence must follow the folding policy (layers: {:?})",
         model
             .network
             .layers
@@ -468,8 +487,24 @@ fn assert_folded_encloses_ort(case: usize, model_bytes: &[u8], point: &ArrayD<f3
             .collect::<Vec<_>>()
     );
 
-    // Point-box IBP through the folded graph (unbatched input).
-    let graph = model.to_graph_network().expect("graph conversion");
+    // Point-box IBP through the explicit BN graph (unbatched input).
+    let graph = model.to_graph_network().unwrap_or_else(|error| {
+        panic!(
+            "case {case}: raw-BN graph conversion failed: {error:?}; layers={:?}",
+            model
+                .network
+                .layers
+                .iter()
+                .map(|layer| (
+                    &layer.name,
+                    &layer.layer_type,
+                    &layer.inputs,
+                    &layer.outputs,
+                    &layer.attributes
+                ))
+                .collect::<Vec<_>>()
+        )
+    });
     let unbatched: Vec<usize> = point.shape()[1..].to_vec();
     let point_unbatched = point
         .clone()
@@ -489,10 +524,10 @@ fn assert_folded_encloses_ort(case: usize, model_bytes: &[u8], point: &ArrayD<f3
         ort_y.len()
     );
     for (idx, ((l, u), y)) in lower.iter().zip(upper.iter()).zip(ort_y.iter()).enumerate() {
-        let tol = FOLD_TOL_REL * y.abs().max(1.0);
+        let tol = REFERENCE_TOL_REL * y.abs().max(1.0);
         assert!(
             (l - tol) <= *y && *y <= (u + tol),
-            "case {case} elem {idx}: ORT (unfolded) {y} escapes folded point-IBP \
+            "case {case} elem {idx}: ORT {y} escapes raw-BN point-IBP \
              [{l}, {u}] beyond tol {tol}"
         );
         // Midpoint closeness: catches a fold that silently widens instead of
@@ -500,157 +535,60 @@ fn assert_folded_encloses_ort(case: usize, model_bytes: &[u8], point: &ArrayD<f3
         let mid = 0.5 * (l + u);
         assert!(
             (mid - y).abs() <= tol,
-            "case {case} elem {idx}: folded midpoint {mid} vs ORT {y} beyond tol {tol}"
+            "case {case} elem {idx}: raw-BN midpoint {mid} vs ORT {y} beyond tol {tol}"
         );
     }
 }
 
 #[test]
-fn prop_conv_transpose_bn_fold_encloses_ort_500() {
+fn prop_conv_transpose_folded_bn_encloses_ort_500() {
     let mut rng = Rng::new(0x000C_6A72_2023);
     for case in 0..CASES_PER_PATTERN {
         let (bytes, point) = random_conv_transpose_bn_case(&mut rng);
-        assert_folded_encloses_ort(case, &bytes, &point);
+        assert_folded_batch_norm_encloses_ort(case, &bytes, &point);
     }
 }
 
 #[test]
-fn prop_gemm_reshape_bn_fold_encloses_ort_500() {
+fn prop_gemm_reshape_folded_bn_encloses_ort_500() {
     let mut rng = Rng::new(0x6E44_5245_5348);
     for case in 0..CASES_PER_PATTERN {
         let (bytes, point) = random_gemm_reshape_bn_case(&mut rng);
-        assert_folded_encloses_ort(case, &bytes, &point);
+        assert_folded_batch_norm_encloses_ort(case, &bytes, &point);
     }
 }
 
 #[test]
-fn prop_bn_reshape_gemm_fold_encloses_ort_500() {
+fn prop_conv_transpose_raw_bn_encloses_ort_500() {
+    let mut rng = Rng::new(0x000C_6A72_2023);
+    for case in 0..CASES_PER_PATTERN {
+        let (bytes, point) = random_conv_transpose_bn_case(&mut rng);
+        assert_raw_batch_norm_encloses_ort(case, &bytes, &point);
+    }
+}
+
+#[test]
+fn prop_gemm_reshape_raw_bn_encloses_ort_500() {
+    let mut rng = Rng::new(0x6E44_5245_5348);
+    for case in 0..CASES_PER_PATTERN {
+        let (bytes, point) = random_gemm_reshape_bn_case(&mut rng);
+        assert_raw_batch_norm_encloses_ort(case, &bytes, &point);
+    }
+}
+
+#[test]
+fn prop_bn_reshape_gemm_raw_bn_encloses_ort_500() {
     let mut rng = Rng::new(0xB1A5_7A11_6E44);
     let mut covered = [[false; 2]; 2];
     for case in 0..CASES_PER_PATTERN {
         let (bytes, point, encoding) = random_bn_reshape_gemm_case(&mut rng, case);
         covered[usize::from(encoding.trans_b)][usize::from(encoding.explicit_affine_defaults)] =
             true;
-        assert_folded_encloses_ort(case, &bytes, &point);
+        assert_raw_batch_norm_encloses_ort(case, &bytes, &point);
     }
     assert_eq!(
         covered,
         [[true, true], [true, true]],
         "both transB layouts must be covered with implicit and explicit exact defaults"
     );
-}
-
-/// Real-net probe (run explicitly): on an actual cgan_2023 generator network,
-/// verify (a) the extended folds remove every generator BN (head Gemm->
-/// Reshape->BN + all ConvTranspose->BN pairs), (b) the folded network still
-/// encloses ORT's unfolded forward at the input-box midpoint, and (c) the
-/// root IBP bounds with the folds ON are equal-or-tighter than with the folds
-/// OFF (a single fused affine interval map is algebraically contained in the
-/// composition of the two interval maps it replaces).
-///
-/// Usage:
-///   NY_CGAN_PROBE_ONNX=.../cGAN_imgSz32_nCh_1.onnx \
-///   NY_CGAN_PROBE_VNNLIB=.../cGAN_imgSz32_nCh_1_prop_0_....vnnlib \
-///   cargo test -p ny-onnx --lib cgan_probe_fold_root_bounds -- --ignored --nocapture
-#[test]
-#[ignore = "needs NY_CGAN_PROBE_ONNX / NY_CGAN_PROBE_VNNLIB pointing at benchmark files"]
-fn cgan_probe_fold_root_bounds() {
-    let onnx_path = std::env::var("NY_CGAN_PROBE_ONNX").expect("NY_CGAN_PROBE_ONNX not set");
-    let vnnlib_path = std::env::var("NY_CGAN_PROBE_VNNLIB").expect("NY_CGAN_PROBE_VNNLIB not set");
-    let bytes = std::fs::read(&onnx_path).expect("read probe onnx");
-    let spec = crate::vnnlib::load_vnnlib(&vnnlib_path).expect("parse probe vnnlib");
-
-    let bn_count = |model: &crate::OnnxModel| {
-        model
-            .network
-            .layers
-            .iter()
-            .filter(|layer| layer.layer_type == LayerType::BatchNorm)
-            .count()
-    };
-
-    // Serialized env scope (clippy env wall); pre-test state restored on exit.
-    let (model_off, model_on) = ny_test_utils::env::with_env_edits(|env| {
-        // Fold OFF (kill switch).
-        env.set("NY_BN_FOLD_EXT", "0");
-        let model_off = crate::load_onnx_bytes("cgan_probe_off", &bytes).expect("load (fold off)");
-        // Fold ON (default).
-        env.remove("NY_BN_FOLD_EXT");
-        let model_on = crate::load_onnx_bytes("cgan_probe_on", &bytes).expect("load (fold on)");
-        (model_off, model_on)
-    });
-
-    let off_bns = bn_count(&model_off);
-    let on_bns = bn_count(&model_on);
-    println!("BatchNorm layers: fold OFF = {off_bns}, fold ON = {on_bns}");
-    assert!(
-        on_bns < off_bns,
-        "extended folds should remove generator BN layers ({on_bns} vs {off_bns})"
-    );
-
-    // Input box from the vnnlib property (unbatched [num_inputs]).
-    let num_inputs = spec.num_inputs;
-    let lower: Vec<f32> = spec.input_bounds.iter().map(|(l, _)| *l as f32).collect();
-    let upper: Vec<f32> = spec.input_bounds.iter().map(|(_, u)| *u as f32).collect();
-    let lower = ArrayD::from_shape_vec(ndarray::IxDyn(&[num_inputs]), lower).expect("lb");
-    let upper = ArrayD::from_shape_vec(ndarray::IxDyn(&[num_inputs]), upper).expect("ub");
-    let mid: ArrayD<f32> = (&lower + &upper) * 0.5;
-    let box_input = BoundedTensor::new(lower, upper).expect("input box");
-
-    // ORT reference at the midpoint on the ORIGINAL bytes (batched [1, n]).
-    let mid_batched = mid
-        .clone()
-        .into_shape_with_order(ndarray::IxDyn(&[1, num_inputs]))
-        .expect("batched midpoint");
-    let ort_y = crate::diff::run_inference_bytes(&bytes, &mid_batched).expect("ORT forward");
-    let ort_y = ort_y.first().expect("ORT output");
-
-    let graph_on = model_on.to_graph_network().expect("graph (fold on)");
-    let graph_off = model_off.to_graph_network().expect("graph (fold off)");
-
-    // (b) point enclosure on the real net.
-    let point_box = BoundedTensor::new(mid.clone(), mid).expect("point box");
-    let point_out = graph_on
-        .propagate_ibp(&point_box)
-        .expect("point IBP (fold on)");
-    for (idx, ((l, u), y)) in point_out
-        .lower()
-        .iter()
-        .zip(point_out.upper().iter())
-        .zip(ort_y.iter())
-        .enumerate()
-    {
-        let tol = FOLD_TOL_REL * y.abs().max(1.0);
-        assert!(
-            (l - tol) <= *y && *y <= (u + tol),
-            "elem {idx}: ORT {y} escapes folded point-IBP [{l}, {u}] (tol {tol})"
-        );
-    }
-    println!("point enclosure vs ORT: OK ({} outputs)", ort_y.len());
-
-    // (c) root IBP tightness, fold ON vs OFF.
-    let root_on = graph_on
-        .propagate_ibp(&box_input)
-        .expect("root IBP (fold on)");
-    let root_off = graph_off
-        .propagate_ibp(&box_input)
-        .expect("root IBP (fold off)");
-    for (idx, (((l_on, u_on), l_off), u_off)) in root_on
-        .lower()
-        .iter()
-        .zip(root_on.upper().iter())
-        .zip(root_off.lower().iter())
-        .zip(root_off.upper().iter())
-        .enumerate()
-    {
-        println!(
-            "root IBP Y_{idx}: fold ON [{l_on:.6e}, {u_on:.6e}]  fold OFF [{l_off:.6e}, {u_off:.6e}]"
-        );
-        let slack_l = FOLD_TOL_REL * l_off.abs().max(1.0);
-        let slack_u = FOLD_TOL_REL * u_off.abs().max(1.0);
-        assert!(
-            *l_on >= l_off - slack_l && *u_on <= u_off + slack_u,
-            "elem {idx}: folded root bounds looser than unfolded beyond fold tolerance"
-        );
-    }
 }

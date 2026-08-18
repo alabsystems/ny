@@ -219,15 +219,7 @@ impl MulBinaryLayer {
         // beta_u  = (x_l - x_u) * 0.5 + x_u = x_mid
         // ny_u = (y_l * x_u - y_u * x_l) * 0.5 - y_l * x_u
 
-        let alpha_l = (y_l - y_u) * 0.5 + y_u;
-        let beta_l = (x_l - x_u) * 0.5 + x_u;
-        let ny_l = (y_u * x_u - y_l * x_l) * 0.5 - y_u * x_u;
-
-        let alpha_u = (y_u - y_l) * 0.5 + y_l;
-        let beta_u = (x_l - x_u) * 0.5 + x_u;
-        let ny_u = (y_l * x_u - y_u * x_l) * 0.5 - y_l * x_u;
-
-        (alpha_l, beta_l, ny_l, alpha_u, beta_u, ny_u)
+        Self::compute_interpolated_coefficients(x_l, x_u, y_l, y_u, 0.5, 0.5)
     }
 
     /// Compute interpolated McCormick coefficients for MulBinary (z = x * y)
@@ -248,21 +240,13 @@ impl MulBinaryLayer {
         r_l: f32,
         r_u: f32,
     ) -> (f32, f32, f32, f32, f32, f32) {
-        // Lower bound interpolation (L2 at r=0, L1 at r=1):
-        //   L1: z >= y_l*x + x_l*y - x_l*y_l
-        //   L2: z >= y_u*x + x_u*y - x_u*y_u
-        let alpha_l = (y_l - y_u) * r_l + y_u;
-        let beta_l = (x_l - x_u) * r_l + x_u;
-        let ny_l = (y_u * x_u - y_l * x_l) * r_l - y_u * x_u;
-
-        // Upper bound interpolation (U2 at r=0, U1 at r=1):
-        //   U1: z <= y_u*x + x_l*y - x_l*y_u
-        //   U2: z <= y_l*x + x_u*y - x_u*y_l
-        let alpha_u = (y_u - y_l) * r_u + y_l;
-        let beta_u = (x_l - x_u) * r_u + x_u;
-        let ny_u = (y_l * x_u - y_u * x_l) * r_u - y_l * x_u;
-
-        (alpha_l, beta_l, ny_l, alpha_u, beta_u, ny_u)
+        // Delegates to the single canonical CERTIFIED implementation
+        // (#mulbinary-mccormick-f32). Constructing these planes in f32 is
+        // catastrophically cancelling and yields NON-ENCLOSING planes; see
+        // `bilinear::mccormick::interpolated_mccormick` for the derivation and
+        // `docs/MULBINARY_MCCORMICK_F32_CANCELLATION_2026-07-28.md` for the
+        // measurements. Kept as one implementation so the two cannot drift.
+        super::bilinear::mccormick::interpolated_mccormick(x_l, x_u, y_l, y_u, r_l, r_u)
     }
 
     /// CROWN backward propagation for Mul (z = x * y) using McCormick or Middle relaxation.

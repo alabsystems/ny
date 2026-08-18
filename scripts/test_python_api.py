@@ -39,9 +39,14 @@ TEST_MODELS_DIR = REPO_ROOT / "tests" / "models"
 class TestResult:
     """Result of a single test."""
     name: str
-    passed: bool
+    status: str
     duration_ms: float
     message: str
+
+    @property
+    def passed(self) -> bool:
+        """Backward-compatible boolean view; skipped results are not passes."""
+        return self.status == "PASS"
 
 
 class PythonAPITests:
@@ -51,14 +56,22 @@ class PythonAPITests:
         self.verbose = verbose
         self.results: list[TestResult] = []
 
-    def add_result(self, name: str, passed: bool, duration_ms: float, message: str):
+    def add_result(
+        self,
+        name: str,
+        passed: bool,
+        duration_ms: float,
+        message: str,
+        *,
+        skipped: bool = False,
+    ):
         """Record a test result."""
-        result = TestResult(name, passed, duration_ms, message)
+        status = "SKIP" if skipped else ("PASS" if passed else "FAIL")
+        result = TestResult(name, status, duration_ms, message)
         self.results.append(result)
 
         if self.verbose:
-            status = "PASS" if passed else "FAIL"
-            print(f"  [{status}] {name}: {message} ({duration_ms:.1f}ms)")
+            print(f"  [{result.status}] {name}: {message} ({duration_ms:.1f}ms)")
 
     # ========================================================================
     # Test Group 1: ny.diff()
@@ -853,7 +866,13 @@ class PythonAPITests:
         if not pytorch_model.exists():
             # Skip test if model not available
             duration = (time.time() - start) * 1000
-            self.add_result("weights_info_pytorch", True, duration, "SKIPPED: PyTorch model not found")
+            self.add_result(
+                "weights_info_pytorch",
+                False,
+                duration,
+                "optional PyTorch model not found",
+                skipped=True,
+            )
             return
 
         try:
@@ -880,7 +899,13 @@ class PythonAPITests:
         if not pytorch_model.exists():
             # Skip test if model not available
             duration = (time.time() - start) * 1000
-            self.add_result("weights_diff_pytorch", True, duration, "SKIPPED: PyTorch model not found")
+            self.add_result(
+                "weights_diff_pytorch",
+                False,
+                duration,
+                "optional PyTorch model not found",
+                skipped=True,
+            )
             return
 
         try:
@@ -1204,6 +1229,10 @@ class PythonAPITests:
             print(f"FATAL: Cannot import ny module: {NY_IMPORT_ERROR}")
             print("Build with: maturin develop --release")
             return False
+        required_model = TEST_MODELS_DIR / "simple_mlp.onnx"
+        if not required_model.is_file():
+            print(f"FATAL: Required tracked test fixture not found: {required_model}")
+            return False
 
         print("=" * 70)
         print("ny Python API Unit Tests")
@@ -1322,22 +1351,33 @@ class PythonAPITests:
         print("-" * 70)
 
         passed_count = 0
+        failed_count = 0
+        skipped_count = 0
         for result in self.results:
-            status = "PASS" if result.passed else "FAIL"
-            print(f"{result.name:<40} {status:<10} {result.duration_ms:>8.1f}")
-            if result.passed:
+            print(f"{result.name:<40} {result.status:<10} {result.duration_ms:>8.1f}")
+            if result.status == "PASS":
                 passed_count += 1
+            elif result.status == "FAIL":
+                failed_count += 1
+            else:
+                skipped_count += 1
 
         print("-" * 70)
-        print(f"\nTotal: {passed_count}/{len(self.results)} passed")
+        print(
+            f"\nTotal: {passed_count} passed, {failed_count} failed, "
+            f"{skipped_count} skipped ({len(self.results)} total)"
+        )
 
-        all_passed = passed_count == len(self.results)
+        all_passed = failed_count == 0
         if all_passed:
-            print("\nAll tests PASSED!")
+            if skipped_count:
+                print("\nAll runnable tests PASSED; skipped tests were not counted as passes.")
+            else:
+                print("\nAll tests PASSED!")
         else:
             print("\nSome tests FAILED!")
             for result in self.results:
-                if not result.passed:
+                if result.status == "FAIL":
                     print(f"  - {result.name}: {result.message}")
 
         return all_passed

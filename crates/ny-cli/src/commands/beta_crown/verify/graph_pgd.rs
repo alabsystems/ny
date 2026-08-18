@@ -24,6 +24,7 @@ use ny_propagate::{
 use ny_tensor::BoundedTensor;
 use std::time::Instant;
 
+use super::attack_stall::AttackStallPolicy;
 #[cfg(test)]
 pub(super) use super::graph_pgd_init::independent_graph_forward;
 pub(super) use super::graph_pgd_init::{
@@ -859,6 +860,14 @@ pub(super) struct GraphDisjunctiveAttackOutcome {
     /// True when the attack stopped on its phase deadline (budget-bound)
     /// rather than exhausting its configured restarts (work-bound).
     pub hit_deadline: bool,
+    /// True when the adaptive stall cutoff (#attack-stall) ended the attack
+    /// because its best margin stopped improving. DISTINCT from
+    /// [`Self::hit_deadline`] on purpose: a stall cut means "more time was not
+    /// what this attack lacked", so it must never be read as "the attack wanted
+    /// more budget" (that is what drives the attack extension). It is likewise
+    /// NOT evidence of `unsat` — nothing downstream may conclude a verdict from
+    /// the absence of a counterexample.
+    pub stalled_out: bool,
     /// Restarts started and PGD steps taken — extension-fire diagnostics.
     pub restarts_started: usize,
     pub steps_taken: usize,
@@ -870,6 +879,7 @@ impl GraphDisjunctiveAttackOutcome {
             candidate: None,
             best_margin: f32::NEG_INFINITY,
             hit_deadline: false,
+            stalled_out: false,
             restarts_started: 0,
             steps_taken: 0,
         }
@@ -902,7 +912,7 @@ pub(super) fn best_clause_bottleneck_margin(
 }
 
 /// Gradient-based **disjunctive** PGD attack on a `GraphNetwork` (the conv-resnet
-/// counterpart of [`try_sequential_disjunctive_pgd_attack_with_config`], which is
+/// counterpart of `try_sequential_disjunctive_pgd_attack_with_config`, which is
 /// Sequential-only). The graph disjunctive path otherwise falls back to random
 /// sampling, which cannot find adversarial counterexamples in a high-dimensional
 /// conv net at small `eps` — this targets the easiest disjunct with exact/SPSA
@@ -913,6 +923,11 @@ pub(super) fn best_clause_bottleneck_margin(
 /// holds). The caller re-evaluates and confirms it (and the verdict is ultimately
 /// re-checked against the full property), so this is sound regardless of attack
 /// internals — it can only produce candidates, never decide `sat`.
+///
+/// `stall` (#attack-stall) is the adaptive cutoff policy for THIS phase;
+/// [`AttackStallPolicy::disabled`] (the default) keeps the historical behavior
+/// exactly. It can only end candidate GENERATION early — never a bound, never a
+/// verdict.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_graph_disjunctive_pgd_attack(
     graph: &GraphNetwork,
@@ -921,11 +936,15 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
     pgd_config: &PgdConfig,
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
+    stall: AttackStallPolicy,
 ) -> Result<GraphDisjunctiveAttackOutcome> {
     let mut outcome = GraphDisjunctiveAttackOutcome::empty();
     if clauses.is_empty() {
         return Ok(outcome);
     }
+    // #attack-stall: window sized from THIS phase's own slice (deadline minus
+    // now), so the policy carries no absolute time constant.
+    let mut stall_monitor = stall.monitor(Instant::now(), pgd_config.deadline);
     let exact_grad_eligible = graph_supports_exact_gradients(graph);
     let spsa_delta = pgd_config
         .suggested_spsa_delta(input)
@@ -982,12 +1001,17 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
             pgd_config,
             gemm_engine,
             json,
+            stall,
             &mut outcome,
         )? {
             super::graph_pgd_vjp_batched_disj::DisjVjpBatchedOutcome::Completed => {
+                // A stall cut ends the ATTACK PHASE, not just this lane: the
+                // GAMA follow-on is more attack on an ascent that has already
+                // been judged flat, which would undo the reclaim.
                 let gama_follow_on = gama_lambda0.is_some()
                     && outcome.candidate.is_none()
                     && !outcome.hit_deadline
+                    && !outcome.stalled_out
                     && pgd_config.deadline.is_none_or(|d| Instant::now() < d);
                 if !gama_follow_on {
                     return Ok(outcome);
@@ -1068,6 +1092,24 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
         num_outputs.get_or_insert(output.len());
         if let Some(m) = best_clause_bottleneck_margin(&output, clauses) {
             outcome.best_margin = outcome.best_margin.max(m);
+            // `is_armed()` first: unarmed (every shipped category) pays one
+            // discriminant load, not a noise-floor fold and a clock read.
+            if stall_monitor.is_armed()
+                && stall_monitor.observe(
+                    m,
+                    super::disjunctive_pgd::noise_scaled_margin(&output),
+                    Instant::now(),
+                )
+            {
+                outcome.stalled_out = true;
+                super::attack_stall::report_stall_cut(
+                    json,
+                    diag,
+                    format_args!("restart {restart} init"),
+                    stall_monitor.best_margin(),
+                );
+                return Ok(outcome);
+            }
         }
         if satisfied(&output) {
             outcome.candidate = Some(x);
@@ -1173,6 +1215,26 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
             outcome.steps_taken += 1;
             if let Some(m) = best_clause_bottleneck_margin(&output, clauses) {
                 outcome.best_margin = outcome.best_margin.max(m);
+                // #attack-stall: a full window with no better-than-noise rise
+                // in the running max ⇒ the ascent has plateaued. Stop
+                // GENERATING candidates and let BaB have the rest; the caller
+                // treats this exactly like "attack found nothing".
+                if stall_monitor.is_armed()
+                    && stall_monitor.observe(
+                        m,
+                        super::disjunctive_pgd::noise_scaled_margin(&output),
+                        Instant::now(),
+                    )
+                {
+                    outcome.stalled_out = true;
+                    super::attack_stall::report_stall_cut(
+                        json,
+                        diag,
+                        format_args!("restart {restart} step {step}"),
+                        stall_monitor.best_margin(),
+                    );
+                    return Ok(outcome);
+                }
             }
             if satisfied(&output) {
                 if !json {

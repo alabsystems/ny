@@ -54,6 +54,7 @@ pub(crate) fn require_benchmark_file(path: &Path) {
     );
 }
 
+#[allow(dead_code)] // Shared helper; tests that must control the child env build their own Command.
 pub(crate) fn run_ny(args: &[&str]) -> Output {
     Command::new(ny_binary())
         .current_dir(workspace_root())

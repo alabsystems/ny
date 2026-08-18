@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::commands::backend::{BackendRequest, BackendRequestSource, ProofBackendReceipt};
 use ndarray::arr1;
 use ny_propagate::layers::ReLULayer;
 use ny_propagate::{GraphNode, Layer, PropagationMethod};
@@ -13,6 +14,17 @@ use std::path::{Path, PathBuf};
 fn bounded_input() -> BoundedTensor {
     BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
         .expect("valid bounded input")
+}
+
+fn cpu_backend_receipt() -> ProofBackendReceipt {
+    ProofBackendReceipt::cpu(
+        BackendRequest {
+            backend: BackendArg::Cpu,
+            source: BackendRequestSource::DefaultedCliValue,
+            selection_reason: None,
+        },
+        "cpu",
+    )
 }
 
 fn write_model_file(dir: &Path, name: &str) -> PathBuf {
@@ -61,6 +73,7 @@ fn test_run_block_wise_graph_writes_checkpoint_file_4314() {
         0,
         Some(checkpoint_path.as_path()),
         false,
+        &cpu_backend_receipt(),
     )
     .expect("block-wise CLI mode should write a checkpoint");
 
@@ -115,6 +128,7 @@ fn test_run_block_wise_graph_resumes_existing_checkpoint_without_resetting_4314(
         0,
         Some(checkpoint_path.as_path()),
         false,
+        &cpu_backend_receipt(),
     )
     .expect("block-wise CLI mode should resume from the saved checkpoint");
 

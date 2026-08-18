@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::bounds::patches::{PatchGeometry, PatchesData, PatchesLinearBounds};
 use crate::layers::{LinearLayer, ReLULayer, SigmoidLayer};
 use crate::network::core::GraphNode;
 use ndarray::{arr1, arr2, Array1, ArrayD, IxDyn};
@@ -13,6 +14,7 @@ use ny_core::{
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 fn test_input() -> BoundedTensor {
     BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn()).unwrap()
@@ -42,6 +44,11 @@ fn empty_dag_alpha_context_4205<'a>(
         input_accumulated,
         engine: None,
         deadline: None,
+        finite_structured_boundary: false,
+        forbid_full_output_fallback: false,
+        // Row provenance is irrelevant to these single-row unit fixtures;
+        // Shared keeps δ structurally unreachable (#spec-axis-alpha).
+        row_scope: &AlphaRowScope::Shared,
     }
 }
 
@@ -50,6 +57,281 @@ fn assert_linear_bounds_eq_4205(actual: &LinearBounds, expected: &LinearBounds) 
     assert_eq!(actual.lower_b(), expected.lower_b());
     assert_eq!(actual.upper_a(), expected.upper_a());
     assert_eq!(actual.upper_b(), expected.upper_b());
+}
+
+fn anchored_intermediate_fixture() -> PatchesLinearBounds {
+    let geometry =
+        PatchGeometry::anchored(vec![0, 1], vec![0, 1]).expect("fixture axes are non-empty");
+    PatchesLinearBounds {
+        row_count: 4,
+        lower_a: PatchesData {
+            coeff_err: None,
+            patches: Some(
+                ArrayD::from_shape_vec(IxDyn(&[1, 2, 2, 1, 1, 1]), vec![0.25, 0.5, 0.75, 1.0])
+                    .expect("fixture shape and values agree"),
+            ),
+            geometry: geometry.clone(),
+            identity: false,
+            output_shape: (1, 2, 2),
+            input_shape: (1, 2, 2),
+            unstable_idx: None,
+        },
+        lower_b: arr1(&[1.0, 2.0, 3.0, 4.0]),
+        upper_a: PatchesData {
+            coeff_err: None,
+            patches: Some(
+                ArrayD::from_shape_vec(IxDyn(&[1, 2, 2, 1, 1, 1]), vec![1.25, 1.5, 1.75, 2.0])
+                    .expect("fixture shape and values agree"),
+            ),
+            geometry,
+            identity: false,
+            output_shape: (1, 2, 2),
+            input_shape: (1, 2, 2),
+            unstable_idx: None,
+        },
+        upper_b: arr1(&[5.0, 6.0, 7.0, 8.0]),
+    }
+}
+
+fn assert_intermediate_patches_exact(actual: &PatchesLinearBounds, expected: &PatchesLinearBounds) {
+    fn assert_data(actual: &PatchesData, expected: &PatchesData) {
+        assert_eq!(actual.coeff_err, expected.coeff_err);
+        assert_eq!(actual.patches, expected.patches);
+        assert_eq!(actual.geometry, expected.geometry);
+        assert_eq!(actual.identity, expected.identity);
+        assert_eq!(actual.output_shape, expected.output_shape);
+        assert_eq!(actual.input_shape, expected.input_shape);
+        assert_eq!(actual.unstable_idx, expected.unstable_idx);
+    }
+
+    assert_eq!(actual.row_count, expected.row_count);
+    assert_data(&actual.lower_a, &expected.lower_a);
+    assert_eq!(actual.lower_b, expected.lower_b);
+    assert_data(&actual.upper_a, &expected.upper_a);
+    assert_eq!(actual.upper_b, expected.upper_b);
+}
+
+#[test]
+fn compact_exact_seed_refuses_before_full_output_fallback_callback() {
+    let entered = Cell::new(false);
+    let result: Result<BoundedTensor> = full_output_crown_fallback_or_refuse(true, || {
+        entered.set(true);
+        panic!("full-output fallback callback must remain unreachable")
+    });
+    assert!(matches!(
+        result,
+        Err(NyError::UnsupportedConfiguration(message))
+            if message.contains("compact exact seed")
+    ));
+    assert!(!entered.get());
+}
+
+#[test]
+fn patches_deadline_requires_atomic_return_before_dense_fallback() {
+    let error = NyError::DeadlineExceeded("expired anchored planner".into());
+    assert_eq!(
+        classify_patches_resource_error(&error),
+        PatchesResourceErrorDisposition::AtomicReturn
+    );
+}
+
+#[test]
+fn patches_memory_refusal_uses_full_crown_fallback_before_dense_retry() {
+    let error = NyError::CpuMemoryExceeded {
+        required_bytes: 2,
+        budget_bytes: 1,
+        site: "anchored planner test",
+    };
+    assert_eq!(
+        classify_patches_resource_error(&error),
+        PatchesResourceErrorDisposition::FullCrownFallback
+    );
+}
+
+#[test]
+fn patches_semantic_refusal_retains_historical_dense_fallback() {
+    let error = NyError::UnsupportedConfiguration("closed composition route".into());
+    assert_eq!(
+        classify_patches_resource_error(&error),
+        PatchesResourceErrorDisposition::DenseRetry
+    );
+}
+
+#[test]
+fn patches_relu_intermediate_budget_refusal_is_borrowed_and_atomic() {
+    crate::tests::with_env_edits(|env| {
+        env.set("NY_DENSE_BUDGET_MB", "0");
+
+        let expected = anchored_intermediate_fixture();
+        let carrier = CrownBounds::Patches(Box::new(expected.clone()));
+        let pre_activation = BoundedTensor::new(
+            arr1(&[-1.0_f32, -0.5, -0.25, -0.125]).into_dyn(),
+            arr1(&[1.0_f32, 0.5, 0.25, 0.125]).into_dyn(),
+        )
+        .expect("pre-activation fixture is well formed");
+        let relu_name_to_idx = HashMap::new();
+        let alpha_state = GraphAlphaState::new();
+        let mut gradients: Vec<Array1<f32>> = Vec::new();
+        let mut gradients_upper: Vec<Array1<f32>> = Vec::new();
+        let mut node_crown_bounds = CrownMergeAccumulator::new();
+        let mut input_accumulated = false;
+        let mut intermediate = GraphAlphaCrownIntermediate::new();
+        let row_scope = AlphaRowScope::Shared;
+
+        let error = {
+            let mut context = DagAlphaNodeContext {
+                input: &pre_activation,
+                relu_name_to_idx: &relu_name_to_idx,
+                alpha_state: &alpha_state,
+                invprop_state: None,
+                gradients: gradients.as_mut_slice(),
+                gradients_upper: gradients_upper.as_mut_slice(),
+                track_gradients: true,
+                node_crown_bounds: &mut node_crown_bounds,
+                intermediate: Some(&mut intermediate),
+                output_dim: 4,
+                input_dim: 4,
+                input_accumulated: &mut input_accumulated,
+                engine: None,
+                deadline: None,
+                finite_structured_boundary: false,
+                forbid_full_output_fallback: false,
+                row_scope: &row_scope,
+            };
+            record_patches_relu_intermediate(
+                "relu_anchored",
+                &carrier,
+                &pre_activation,
+                &mut context,
+            )
+            .expect_err("zero budget must refuse Patches intermediate materialization")
+        };
+
+        assert!(
+            matches!(error, NyError::CpuMemoryExceeded { .. }),
+            "expected typed memory refusal, got {error:?}"
+        );
+        match &carrier {
+            CrownBounds::Patches(actual) => assert_intermediate_patches_exact(actual, &expected),
+            CrownBounds::Dense(_) => panic!("borrowed recording changed the source carrier"),
+        }
+        assert!(
+            intermediate.a_at_relu.is_empty() && intermediate.pre_relu_bounds.is_empty(),
+            "failed recording must not publish a partial intermediate"
+        );
+    });
+}
+
+#[test]
+fn patches_relu_intermediate_deadline_refusal_is_borrowed_and_atomic() {
+    let expected = anchored_intermediate_fixture();
+    let carrier = CrownBounds::Patches(Box::new(expected.clone()));
+    let pre_activation = BoundedTensor::new(
+        arr1(&[-1.0_f32, -0.5, -0.25, -0.125]).into_dyn(),
+        arr1(&[1.0_f32, 0.5, 0.25, 0.125]).into_dyn(),
+    )
+    .expect("pre-activation fixture is well formed");
+    let relu_name_to_idx = HashMap::new();
+    let alpha_state = GraphAlphaState::new();
+    let mut gradients: Vec<Array1<f32>> = Vec::new();
+    let mut gradients_upper: Vec<Array1<f32>> = Vec::new();
+    let mut node_crown_bounds = CrownMergeAccumulator::new();
+    let mut input_accumulated = false;
+    let mut intermediate = GraphAlphaCrownIntermediate::new();
+    let row_scope = AlphaRowScope::Shared;
+
+    let error = {
+        let mut context = DagAlphaNodeContext {
+            input: &pre_activation,
+            relu_name_to_idx: &relu_name_to_idx,
+            alpha_state: &alpha_state,
+            invprop_state: None,
+            gradients: gradients.as_mut_slice(),
+            gradients_upper: gradients_upper.as_mut_slice(),
+            track_gradients: true,
+            node_crown_bounds: &mut node_crown_bounds,
+            intermediate: Some(&mut intermediate),
+            output_dim: 4,
+            input_dim: 4,
+            input_accumulated: &mut input_accumulated,
+            engine: None,
+            deadline: Some(Instant::now()),
+            finite_structured_boundary: true,
+            forbid_full_output_fallback: false,
+            row_scope: &row_scope,
+        };
+        record_patches_relu_intermediate("relu_anchored", &carrier, &pre_activation, &mut context)
+            .expect_err("expired authority must refuse Patches intermediate materialization")
+    };
+
+    assert!(
+        matches!(error, NyError::DeadlineExceeded(_)),
+        "expected typed deadline refusal, got {error:?}"
+    );
+    match &carrier {
+        CrownBounds::Patches(actual) => assert_intermediate_patches_exact(actual, &expected),
+        CrownBounds::Dense(_) => panic!("borrowed recording changed the source carrier"),
+    }
+    assert!(
+        intermediate.a_at_relu.is_empty() && intermediate.pre_relu_bounds.is_empty(),
+        "deadline refusal must not publish a partial intermediate"
+    );
+}
+
+#[test]
+fn dense_relu_intermediate_budget_refusal_is_atomic() {
+    crate::tests::with_env_edits(|env| {
+        env.set("NY_DENSE_BUDGET_MB", "0");
+
+        let node_lb = LinearBounds::identity(4);
+        let pre_activation = BoundedTensor::new(
+            arr1(&[-1.0_f32, -0.5, -0.25, -0.125]).into_dyn(),
+            arr1(&[1.0_f32, 0.5, 0.25, 0.125]).into_dyn(),
+        )
+        .expect("pre-activation fixture is well formed");
+        let relu_name_to_idx = HashMap::new();
+        let alpha_state = GraphAlphaState::new();
+        let mut gradients: Vec<Array1<f32>> = Vec::new();
+        let mut gradients_upper: Vec<Array1<f32>> = Vec::new();
+        let mut node_crown_bounds = CrownMergeAccumulator::new();
+        let mut input_accumulated = false;
+        let mut intermediate = GraphAlphaCrownIntermediate::new();
+        let row_scope = AlphaRowScope::Shared;
+
+        let error = {
+            let mut context = DagAlphaNodeContext {
+                input: &pre_activation,
+                relu_name_to_idx: &relu_name_to_idx,
+                alpha_state: &alpha_state,
+                invprop_state: None,
+                gradients: gradients.as_mut_slice(),
+                gradients_upper: gradients_upper.as_mut_slice(),
+                track_gradients: true,
+                node_crown_bounds: &mut node_crown_bounds,
+                intermediate: Some(&mut intermediate),
+                output_dim: 4,
+                input_dim: 4,
+                input_accumulated: &mut input_accumulated,
+                engine: None,
+                deadline: None,
+                finite_structured_boundary: false,
+                forbid_full_output_fallback: false,
+                row_scope: &row_scope,
+            };
+            record_dense_relu_intermediate("relu_dense", &node_lb, &pre_activation, &mut context)
+                .expect_err("zero budget must refuse Dense intermediate capture")
+        };
+
+        assert!(
+            matches!(error, NyError::CpuMemoryExceeded { .. }),
+            "expected typed memory refusal, got {error:?}"
+        );
+        assert!(
+            intermediate.a_at_relu.is_empty() && intermediate.pre_relu_bounds.is_empty(),
+            "failed Dense capture must not publish a partial intermediate"
+        );
+        assert_eq!(node_lb.lower_a(), LinearBounds::identity(4).lower_a());
+    });
 }
 
 #[ntest::timeout(10000)]
@@ -651,6 +933,35 @@ fn test_dag_backward_gpu_suffix_fires_on_chain_graph() {
     let gpu_upper: Vec<f32> = gpu_bounds.upper().iter().copied().collect();
     assert_eq!(gpu_lower, cpu_lower, "GPU suffix lower must match CPU");
     assert_eq!(gpu_upper, cpu_upper, "GPU suffix upper must match CPU");
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn dag_backward_gpu_suffix_malformed_payloads_restore_cpu_path() {
+    let _gate = crate::sound_gpu_gate::test_lock::lock_gate();
+    let expected = run_chain_graph_backward(None, "malformed-cpu-baseline");
+    let rows = expected.len();
+
+    for (lower, upper, label) in [
+        (vec![-1.0; rows.saturating_sub(1)], vec![1.0; rows], "shape"),
+        (vec![f32::NAN; rows], vec![1.0; rows], "NaN"),
+        (vec![-1.0; rows], vec![f32::INFINITY; rows], "infinity"),
+        (vec![2.0; rows], vec![1.0; rows], "inversion"),
+    ] {
+        let engine = BackwardGpuSuffixEngine::new(lower, upper);
+        let actual = run_chain_graph_backward(Some(&engine), label);
+        assert_eq!(engine.seeded_call_count(), 1, "{label}: GPU attempt count");
+        assert_eq!(
+            actual.lower(),
+            expected.lower(),
+            "{label}: CPU lower fallback"
+        );
+        assert_eq!(
+            actual.upper(),
+            expected.upper(),
+            "{label}: CPU upper fallback"
+        );
+    }
 }
 
 /// Regression test: GPU suffix does NOT fire when engine is None.

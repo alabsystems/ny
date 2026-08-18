@@ -114,6 +114,116 @@ fn test_graph_beta_analytical_gradients_from_a_matrix() {
 
 #[ntest::timeout(10000)]
 #[test]
+fn test_graph_beta_sparse_columns_match_dense_across_all_gradient_consumers() {
+    use crate::bounds::GraphAlphaCrownIntermediate;
+
+    let history = GraphSplitHistory::new()
+        .with_constraint(GraphNeuronConstraint {
+            node_name: "relu1".to_string(),
+            neuron_idx: 0,
+            is_active: true,
+            score: 0.0,
+        })
+        .with_constraint(GraphNeuronConstraint {
+            node_name: "relu1".to_string(),
+            neuron_idx: 2,
+            is_active: false,
+            score: 0.0,
+        });
+    let template = GraphBetaState::from_history(&history).unwrap();
+
+    let full = arr2(&[
+        [1.0, -2.0, 0.5, 4.0],
+        [0.25, 3.0, -1.0, 2.0],
+        [-0.75, 1.5, 2.0, -3.0],
+    ]);
+    let mut dense = GraphAlphaCrownIntermediate::new();
+    dense.a_at_relu.insert("relu1".to_string(), full);
+
+    let mut sparse = GraphAlphaCrownIntermediate::new();
+    assert!(sparse.insert_beta_sparse_a(
+        "relu1".to_string(),
+        vec![0, 2],
+        arr2(&[[1.0, 0.5], [0.25, -1.0], [-0.75, 2.0]]),
+    ));
+    assert!(sparse.has_beta_sparse_a("relu1"));
+    assert!(sparse.beta_a_column("relu1", 1).is_none());
+
+    let assert_same = |dense_state: &GraphBetaState,
+                       sparse_state: &GraphBetaState,
+                       dense_max: f32,
+                       sparse_max: f32| {
+        assert_eq!(dense_max.to_bits(), sparse_max.to_bits());
+        assert_eq!(dense_state.entries.len(), sparse_state.entries.len());
+        for (dense_entry, sparse_entry) in dense_state.entries.iter().zip(&sparse_state.entries) {
+            assert_eq!(
+                dense_entry.grad.to_bits(),
+                sparse_entry.grad.to_bits(),
+                "gradient differs for {}[{}]",
+                dense_entry.node_name,
+                dense_entry.neuron_idx
+            );
+        }
+    };
+
+    let mut dense_state = template.clone();
+    let mut sparse_state = template.clone();
+    let dense_max = dense_state.compute_analytical_gradients(&dense);
+    let sparse_max = sparse_state.compute_analytical_gradients(&sparse);
+    assert_same(&dense_state, &sparse_state, dense_max, sparse_max);
+
+    let objectives = vec![vec![1.0, -0.5, 0.25], vec![0.0, 2.0, -1.0]];
+    let objective_bounds = vec![(0.5, 1.0), (-0.25, 0.75)];
+    let objective_thresholds = vec![0.0, 0.0];
+    let objective_mask = vec![false, false];
+    for conjunctive in [false, true] {
+        let mut dense_state = template.clone();
+        let mut sparse_state = template.clone();
+        let dense_max = dense_state.compute_analytical_gradients_multi_objective(
+            &dense,
+            &objective_bounds,
+            &objectives,
+            &objective_thresholds,
+            &objective_mask,
+            conjunctive,
+        );
+        let sparse_max = sparse_state.compute_analytical_gradients_multi_objective(
+            &sparse,
+            &objective_bounds,
+            &objectives,
+            &objective_thresholds,
+            &objective_mask,
+            conjunctive,
+        );
+        assert_same(&dense_state, &sparse_state, dense_max, sparse_max);
+    }
+
+    let spec_bounds = vec![(0.5, 1.0), (-0.25, 0.75), (0.125, 0.5)];
+    let spec_thresholds = vec![0.0, 0.0, 0.0];
+    let spec_mask = vec![false, false, false];
+    for conjunctive in [false, true] {
+        let mut dense_state = template.clone();
+        let mut sparse_state = template.clone();
+        let dense_max = dense_state.compute_analytical_gradients_multi_objective_spec_rows(
+            &dense,
+            &spec_bounds,
+            &spec_thresholds,
+            &spec_mask,
+            conjunctive,
+        );
+        let sparse_max = sparse_state.compute_analytical_gradients_multi_objective_spec_rows(
+            &sparse,
+            &spec_bounds,
+            &spec_thresholds,
+            &spec_mask,
+            conjunctive,
+        );
+        assert_same(&dense_state, &sparse_state, dense_max, sparse_max);
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
 fn test_graph_beta_analytical_gradients_missing_node() {
     // Test that gradients are zero for constraints on nodes not in intermediate storage
 

@@ -35,7 +35,13 @@ solver:
 
 attack:
   pgd_order: after
+  ny_pgd_order_compat: upfront
   pgd_restarts: 10000
+  # ACAS prop_2 is one 5-D conjunction of output-to-output comparisons. Its
+  # internal SPSA lane can consume the upfront slice without finding a witness;
+  # admit that narrow shape to the wrapper's exact-gradient candidate search.
+  # Candidate authority is unchanged: inward box + trusted ORT/true-f64 gate.
+  vnncomp_upfront_relational_exact_gradient: true
 
 bab:
   # NOTE (#3453-adjacent, MEASURED 2026-07-08): a max_domains bump was tried here and

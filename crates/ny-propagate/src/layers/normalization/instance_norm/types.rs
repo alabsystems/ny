@@ -31,6 +31,9 @@ pub struct InstanceNorm1dLayer {
     pub eps: f32,
     /// Use forward mode for IBP: compute mean/std from center point (midpoint of bounds)
     /// instead of computing uncertain bounds on mean/std.
+    ///
+    /// This is a heuristic analysis mode and is not admitted as proof
+    /// authority; use conservative IBP for certified verification.
     /// Default: false (use conservative IBP)
     pub forward_mode: bool,
     /// CROWN linearization mode.
@@ -43,7 +46,7 @@ impl InstanceNorm1dLayer {
     /// Create a new InstanceNorm1d layer.
     ///
     /// `ny` and `beta` have shape `[num_channels]`.
-    /// Returns an error if eps is negative, NaN, or infinite.
+    /// Returns an error if eps is non-finite or below the supported minimum.
     pub fn new(ny: Array1<f32>, beta: Array1<f32>, eps: f32) -> Result<Self> {
         if ny.len() != beta.len() {
             return Err(NyError::ShapeMismatch {
@@ -62,7 +65,7 @@ impl InstanceNorm1dLayer {
 
     /// Create an InstanceNorm1d layer with default ny=1 and beta=0.
     ///
-    /// Returns an error if eps is negative, NaN, or infinite.
+    /// Returns an error if eps is non-finite or below the supported minimum.
     pub fn new_default(num_channels: usize, eps: f32) -> Result<Self> {
         Ok(Self {
             ny: Array1::ones(num_channels),

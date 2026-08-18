@@ -3,18 +3,19 @@
 # Licensed under the Apache License, Version 2.0
 
 """Tests for validate_vnncomp_results.sh and audit_vnncomp_counterexamples.py."""
+
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from scripts.vnnlib_parser import (
     VnnlibParseError,
     evaluate_output_property,
     parse_vnnlib_output_property,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "validate_vnncomp_results.sh"
@@ -23,6 +24,7 @@ VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "validate_vnncomp_results.sh"
 # ---------------------------------------------------------------------------
 # VNN-LIB parser tests
 # ---------------------------------------------------------------------------
+
 
 def test_parse_flat_conjunctive_prop2() -> None:
     """prop_2 style: multiple flat (assert (<= Y_i Y_0))."""
@@ -113,16 +115,14 @@ def test_unsupported_syntax_raises() -> None:
     text = """\
 (declare-const Y_0 Real)
 """
-    try:
+    with pytest.raises(VnnlibParseError):
         parse_vnnlib_output_property(text)
-        assert False, "should have raised VnnlibParseError"
-    except VnnlibParseError:
-        pass
 
 
 # ---------------------------------------------------------------------------
 # Constraint evaluation tests
 # ---------------------------------------------------------------------------
+
 
 def test_evaluate_conjunctive_satisfied() -> None:
     """Conjunctive property satisfied when all clauses hold."""
@@ -201,12 +201,15 @@ def test_evaluate_prop2_style_coc_maximal() -> None:
     assert result_sat is True, f"expected COC-maximal satisfied, got {result_sat}"
     # Y_0 is not largest -> safe
     result_unsat = evaluate_output_property(prop, [1.0, 5.0, 3.0, 2.0, 10.0])
-    assert result_unsat is False, f"expected COC-not-maximal unsatisfied, got {result_unsat}"
+    assert result_unsat is False, (
+        f"expected COC-not-maximal unsatisfied, got {result_unsat}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Validation script integration tests
 # ---------------------------------------------------------------------------
+
 
 def _write_ny_v1_csv(path: Path, rows: list[tuple[str, str, str]]) -> None:
     """Write a minimal backend_benchmark_row_v1 CSV."""
@@ -241,15 +244,15 @@ def test_critical_mismatch_exits_1(tmp_path: Path) -> None:
 
     result = subprocess.run(
         ["bash", str(VALIDATE_SCRIPT), str(ny_csv), str(ref_csv)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
         cwd=str(tmp_path),
     )
     assert result.returncode == 1, (
         f"expected exit 1, got {result.returncode}: {result.stdout}"
     )
-    assert "CRITICAL" in result.stdout, (
-        f"expected CRITICAL in output: {result.stdout}"
-    )
+    assert "CRITICAL" in result.stdout, f"expected CRITICAL in output: {result.stdout}"
     assert "requires replay classification" in result.stdout, (
         f"expected 'requires replay classification' in output: {result.stdout}"
     )
@@ -264,7 +267,9 @@ def test_no_critical_mismatch_exits_0(tmp_path: Path) -> None:
 
     result = subprocess.run(
         ["bash", str(VALIDATE_SCRIPT), str(ny_csv), str(ref_csv)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
         cwd=str(tmp_path),
     )
     assert result.returncode == 0, (
@@ -283,29 +288,44 @@ def test_same_basename_different_category_stays_distinct(tmp_path: Path) -> None
     """
     ny_csv = tmp_path / "ny.csv"
     ref_csv = tmp_path / "ref.csv"
-    _write_ny_v1_csv(ny_csv, [
-        ("onnx/ruarobot/perturbations_0.onnx",
-         "vnnlib/ruarobot/hyperrectangle_984.vnnlib", "verified"),
-    ])
-    _write_simple_ref_csv(ref_csv, [
-        ("onnx/medical/perturbations_0.onnx",
-         "vnnlib/medical/hyperrectangle_984.vnnlib", "verified"),
-        ("onnx/ruarobot/perturbations_0.onnx",
-         "vnnlib/ruarobot/hyperrectangle_984.vnnlib", "violated"),
-    ])
+    _write_ny_v1_csv(
+        ny_csv,
+        [
+            (
+                "onnx/ruarobot/perturbations_0.onnx",
+                "vnnlib/ruarobot/hyperrectangle_984.vnnlib",
+                "verified",
+            ),
+        ],
+    )
+    _write_simple_ref_csv(
+        ref_csv,
+        [
+            (
+                "onnx/medical/perturbations_0.onnx",
+                "vnnlib/medical/hyperrectangle_984.vnnlib",
+                "verified",
+            ),
+            (
+                "onnx/ruarobot/perturbations_0.onnx",
+                "vnnlib/ruarobot/hyperrectangle_984.vnnlib",
+                "violated",
+            ),
+        ],
+    )
 
     result = subprocess.run(
         ["bash", str(VALIDATE_SCRIPT), str(ny_csv), str(ref_csv)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
         cwd=str(tmp_path),
     )
     assert result.returncode == 1, (
         f"expected exit 1 (ruarobot verified vs ref violated), "
         f"got {result.returncode}: {result.stdout}"
     )
-    assert "CRITICAL" in result.stdout, (
-        f"expected CRITICAL in output: {result.stdout}"
-    )
+    assert "CRITICAL" in result.stdout, f"expected CRITICAL in output: {result.stdout}"
 
 
 def test_differing_path_prefixes_still_match(tmp_path: Path) -> None:
@@ -313,19 +333,32 @@ def test_differing_path_prefixes_still_match(tmp_path: Path) -> None:
     a reference path rooted at the benchmark directory."""
     ny_csv = tmp_path / "ny.csv"
     ref_csv = tmp_path / "ref.csv"
-    _write_ny_v1_csv(ny_csv, [
-        ("benchmarks/vnncomp2024/benchmarks/safenlp/onnx/medical/perturbations_0.onnx",
-         "benchmarks/vnncomp2024/benchmarks/safenlp/vnnlib/medical/hyperrectangle_984.vnnlib",
-         "verified"),
-    ])
-    _write_simple_ref_csv(ref_csv, [
-        ("./onnx/medical/perturbations_0.onnx",
-         "./vnnlib/medical/hyperrectangle_984.vnnlib", "verified"),
-    ])
+    _write_ny_v1_csv(
+        ny_csv,
+        [
+            (
+                "benchmarks/vnncomp2024/benchmarks/safenlp/onnx/medical/perturbations_0.onnx",
+                "benchmarks/vnncomp2024/benchmarks/safenlp/vnnlib/medical/hyperrectangle_984.vnnlib",
+                "verified",
+            ),
+        ],
+    )
+    _write_simple_ref_csv(
+        ref_csv,
+        [
+            (
+                "./onnx/medical/perturbations_0.onnx",
+                "./vnnlib/medical/hyperrectangle_984.vnnlib",
+                "verified",
+            ),
+        ],
+    )
 
     result = subprocess.run(
         ["bash", str(VALIDATE_SCRIPT), str(ny_csv), str(ref_csv)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
         cwd=str(tmp_path),
     )
     assert result.returncode == 0, (
@@ -345,20 +378,37 @@ def test_ambiguous_key_fails_closed(tmp_path: Path) -> None:
     """
     ny_csv = tmp_path / "ny.csv"
     ref_csv = tmp_path / "ref.csv"
-    _write_ny_v1_csv(ny_csv, [
-        ("ml4acopf_2024/onnx/14_ieee_ml4acopf.onnx",
-         "ml4acopf_2024/vnnlib/14_ieee_prop1.vnnlib", "verified"),
-    ])
-    _write_simple_ref_csv(ref_csv, [
-        ("ml4acopf_2023/onnx/14_ieee_ml4acopf.onnx",
-         "ml4acopf_2023/vnnlib/14_ieee_prop1.vnnlib", "verified"),
-        ("ml4acopf_2024/onnx/14_ieee_ml4acopf.onnx",
-         "ml4acopf_2024/vnnlib/14_ieee_prop1.vnnlib", "violated"),
-    ])
+    _write_ny_v1_csv(
+        ny_csv,
+        [
+            (
+                "ml4acopf_2024/onnx/14_ieee_ml4acopf.onnx",
+                "ml4acopf_2024/vnnlib/14_ieee_prop1.vnnlib",
+                "verified",
+            ),
+        ],
+    )
+    _write_simple_ref_csv(
+        ref_csv,
+        [
+            (
+                "ml4acopf_2023/onnx/14_ieee_ml4acopf.onnx",
+                "ml4acopf_2023/vnnlib/14_ieee_prop1.vnnlib",
+                "verified",
+            ),
+            (
+                "ml4acopf_2024/onnx/14_ieee_ml4acopf.onnx",
+                "ml4acopf_2024/vnnlib/14_ieee_prop1.vnnlib",
+                "violated",
+            ),
+        ],
+    )
 
     result = subprocess.run(
         ["bash", str(VALIDATE_SCRIPT), str(ny_csv), str(ref_csv)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
         cwd=str(tmp_path),
     )
     assert result.returncode == 2, (
@@ -380,7 +430,9 @@ def test_classifier_artifact_path_printed_on_critical_mismatch(tmp_path: Path) -
 
     result = subprocess.run(
         ["bash", str(VALIDATE_SCRIPT), str(ny_csv), str(ref_csv)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
         cwd=str(tmp_path),
     )
     # The classifier won't actually succeed (no ny binary), but the
@@ -388,15 +440,16 @@ def test_classifier_artifact_path_printed_on_critical_mismatch(tmp_path: Path) -
     assert "replay classification" in result.stdout, (
         f"expected 'replay classification' in output: {result.stdout}"
     )
+    assert (
+        "Classifier status: unresolved replay failure(s) (exit 1)" in result.stdout
+    ), f"expected the classifier's nonzero status to be reported: {result.stdout}"
+    assert "Classifier artifact:" in result.stdout, (
+        f"expected the replay artifact path to be reported: {result.stdout}"
+    )
 
 
 def test_unsupported_vnnlib_fails_closed() -> None:
     """Unsupported VNN-LIB syntax returns replay_failed classification."""
     text = "(declare-const Y_0 Real)\n"
-    try:
+    with pytest.raises(VnnlibParseError, match="no output constraints"):
         parse_vnnlib_output_property(text)
-        assert False, "should raise"
-    except VnnlibParseError as exc:
-        assert "no output constraints" in str(exc), (
-            f"expected 'no output constraints' in error, got: {exc}"
-        )

@@ -91,7 +91,7 @@ fn tensor_f32(name: &str, shape: &[i64], data: &[f32]) -> onnx_proto::TensorProt
 fn attr_int(name: &str, value: i64) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
-        i: value,
+        i: Some(value),
         r#type: onnx_proto::attribute_type::INT,
         ..Default::default()
     }

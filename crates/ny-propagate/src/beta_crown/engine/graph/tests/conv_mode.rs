@@ -57,24 +57,24 @@ fn assert_runtime_avoids_global_patches_reentry_3813(call_sites: &[String], cont
 }
 
 #[test]
-fn configured_graph_for_crown_uses_matrix_mode_for_auto_plus_cuts_3813() {
+fn configured_graph_for_crown_uses_explicit_matrix_without_cuts_3813() {
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
-        conv_mode: ConvMode::Auto,
+        enable_cuts: false,
+        conv_mode: ConvMode::Matrix,
         ..Default::default()
     });
 
     let configured = verifier.configured_graph_for_crown(&GraphNetwork::new());
     assert!(
         !configured.use_patches_mode,
-        "#3813: auto conv_mode with cuts must disable graph patches mode"
+        "#3813: explicit matrix mode must disable graph patches without cut authority"
     );
 }
 
 #[test]
 fn configured_graph_for_crown_preserves_explicit_patches_override_3813() {
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
+        enable_cuts: false,
         conv_mode: ConvMode::Patches,
         ..Default::default()
     });
@@ -86,13 +86,66 @@ fn configured_graph_for_crown_preserves_explicit_patches_override_3813() {
     );
 }
 
+#[test]
+fn configured_graph_scopes_degradation_logs_per_verification() {
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let source = GraphNetwork::new();
+
+    // Source/model scope is independent of every configured verification.
+    assert_eq!(
+        source
+            .crown_degradation_warning_log_receipt()
+            .map(|receipt| receipt.occurrence),
+        Some(1)
+    );
+    let first = verifier.configured_graph_for_crown(&source);
+    assert_eq!(
+        first
+            .crown_degradation_warning_log_receipt()
+            .map(|receipt| receipt.occurrence),
+        Some(1)
+    );
+
+    // A BaB domain clone shares the configured verification's Arc/counter.
+    let domain_clone = first.clone();
+    assert_eq!(
+        domain_clone
+            .crown_degradation_warning_log_receipt()
+            .map(|receipt| receipt.occurrence),
+        Some(2)
+    );
+    assert_eq!(first.crown_degradation_warning_log_receipt(), None);
+
+    // Reusing the same verifier/model later receives a fresh first diagnostic,
+    // without resetting either the source or the first verification's Arc.
+    let later = verifier.configured_graph_for_crown(&source);
+    assert_eq!(
+        later
+            .crown_degradation_warning_log_receipt()
+            .map(|receipt| receipt.occurrence),
+        Some(1)
+    );
+    assert_eq!(
+        source
+            .crown_degradation_warning_log_receipt()
+            .map(|receipt| receipt.occurrence),
+        Some(2)
+    );
+    assert_eq!(
+        first
+            .crown_degradation_warning_log_receipt()
+            .map(|receipt| receipt.occurrence),
+        Some(4)
+    );
+}
+
 #[ntest::timeout(10000)]
 #[test]
 fn multi_objective_relu_split_uses_configured_matrix_mode_3813() {
     let (graph, input) = build_conv_classifier_graph_3813();
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
-        conv_mode: ConvMode::Auto,
+        enable_cuts: false,
+        conv_mode: ConvMode::Matrix,
         use_alpha_crown: false,
         timeout: std::time::Duration::from_secs(1),
         max_domains: 1,
@@ -186,8 +239,8 @@ fn multi_objective_input_split_uses_explicit_matrix_mode_3813() {
 fn relu_split_uses_configured_matrix_mode_3813() {
     let (graph, input) = build_conv_classifier_graph_3813();
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
-        conv_mode: ConvMode::Auto,
+        enable_cuts: false,
+        conv_mode: ConvMode::Matrix,
         use_alpha_crown: false,
         timeout: std::time::Duration::from_secs(1),
         max_domains: 1,
@@ -213,8 +266,8 @@ fn relu_split_uses_configured_matrix_mode_3813() {
 fn relu_split_with_bounds_uses_configured_matrix_mode_3813() {
     let (graph, input) = build_conv_classifier_graph_3813();
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
-        conv_mode: ConvMode::Auto,
+        enable_cuts: false,
+        conv_mode: ConvMode::Matrix,
         use_alpha_crown: false,
         timeout: std::time::Duration::from_secs(1),
         max_domains: 1,
@@ -244,8 +297,8 @@ fn relu_split_with_bounds_uses_configured_matrix_mode_3813() {
 fn gpu_domain_list_uses_configured_matrix_mode_3813() {
     let (graph, input) = build_conv_classifier_graph_3813();
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
-        enable_cuts: true,
-        conv_mode: ConvMode::Auto,
+        enable_cuts: false,
+        conv_mode: ConvMode::Matrix,
         use_alpha_crown: false,
         timeout: std::time::Duration::from_secs(1),
         max_domains: 1,
@@ -282,7 +335,7 @@ fn configured_graph_for_crown_adopts_forward_linear_cache_w5() {
     // flip would turn the expected cache hit into a cold build (which the
     // expired deadline then refuses).
     crate::tests::with_serialized_env_vars(
-        &[("NY_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "0")],
+        &[("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "1")],
         configured_graph_for_crown_adopts_forward_linear_cache_w5_body,
     );
 }

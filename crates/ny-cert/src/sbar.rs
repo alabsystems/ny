@@ -29,7 +29,7 @@
 //! that cancels, so the free equality multiplier `λ` (which may be negative)
 //! must be carried by whichever half matches its sign.
 
-use crate::rational::{Rat, RatError};
+use crate::rational::{poisoned, Rat, RatError};
 use crate::schema::{ConstraintKind, EntailmentCertificate, LinearConstraint};
 // Contracts are written as the BARE `#[ensures]` (see `selfcheck.rs` for the full
 // rationale): under tRustc contract verification (`--cfg trust_verify`) it is the
@@ -41,6 +41,14 @@ use crate::schema::{ConstraintKind, EntailmentCertificate, LinearConstraint};
 use core::contracts::ensures;
 #[cfg(not(trust_verify))]
 use trust::ensures;
+
+/// Maximum attention positions accepted by the certificate producer.
+///
+/// This matches the syntactic allocation bound used below. Requests above the
+/// cap must fail before any loop: clipping `order` or `all_ones` would omit
+/// variables while leaving the conclusion full-width, invalidating the
+/// water-fill optimum and its entailment.
+const MAX_POSITIONS: usize = 16_384;
 
 /// A box-truncated-simplex support LP for one attention (head, query) and
 /// readout direction, in exact rationals.
@@ -67,6 +75,15 @@ pub enum SbarError {
     /// A bound was malformed (`p_lo_j > p_hi_j`).
     #[error("p_lo[{0}] > p_hi[{0}]")]
     BadBox(usize),
+    /// The position count exceeds the complete certificate producer's explicit
+    /// resource cap.
+    #[error("position count {got} exceeds the supported maximum {max}")]
+    TooLarge {
+        /// Requested number of positions.
+        got: usize,
+        /// Maximum number of positions processed without truncation.
+        max: usize,
+    },
     /// The LP dual objective did not equal the primal optimum exactly, an
     /// internal strong-duality invariant. Reported (fail-closed) instead of
     /// asserting so the certifier rejects rather than panicking; unreachable
@@ -151,6 +168,12 @@ fn pvar(j: usize) -> String {
 impl SimplexSupportLp {
     fn validate(&self) -> Result<(), SbarError> {
         let m = self.g.len();
+        if m > MAX_POSITIONS {
+            return Err(SbarError::TooLarge {
+                got: m,
+                max: MAX_POSITIONS,
+            });
+        }
         if self.p_lo.len() != m || self.p_hi.len() != m {
             return Err(SbarError::Dimension);
         }
@@ -188,9 +211,10 @@ impl SimplexSupportLp {
     /// obligations.)
     ///
     /// # Errors
-    /// [`SbarError::Dimension`] on a length mismatch, or exact-arithmetic
-    /// overflow.
+    /// [`SbarError::Dimension`] on a length mismatch, or a rational-arena
+    /// failure.
     pub fn objective(&self, p: &[Rat]) -> Result<Rat, SbarError> {
+        crate::rational::ensure_healthy()?;
         if p.len() != self.g.len() {
             return Err(SbarError::Dimension);
         }
@@ -198,6 +222,7 @@ impl SimplexSupportLp {
         for (gj, pj) in self.g.iter().zip(p) {
             acc = acc.add(gj.mul(*pj)?)?;
         }
+        crate::rational::ensure_healthy()?;
         Ok(acc)
     }
 
@@ -206,8 +231,9 @@ impl SimplexSupportLp {
     ///
     /// # Errors
     /// [`SbarError::Infeasible`] when the truncated simplex is empty,
-    /// [`SbarError::Dimension`]/[`SbarError::BadBox`] for malformed input, or
-    /// exact-arithmetic overflow.
+    /// [`SbarError::Dimension`]/[`SbarError::BadBox`] for malformed input,
+    /// [`SbarError::TooLarge`] when a complete certificate would exceed the
+    /// explicit position cap, or a rational-arena failure.
     ///
     /// The `#[ensures]` states the locally-provable producer well-formedness
     /// invariant: on `Ok` the emitted dual is structurally consistent — equally
@@ -223,6 +249,9 @@ impl SimplexSupportLp {
     #[ensures(|r: &Result<SbarUpperCert, SbarError>| !matches!(r, Ok(c) if c.mu_plus.len() != c.mu_minus.len() || c.entailment.premises.len() != c.entailment.multipliers.len()))]
     #[trust::cite(crownproof::sbar_support_sound)]
     pub fn certify_upper(&self) -> Result<SbarUpperCert, SbarError> {
+        if poisoned() {
+            return Err(crate::err_barrier(SbarError::Rat(RatError::Poisoned)));
+        }
         // Extract-then-guard wrapper. `certify_upper_inner` runs the water-fill
         // producer (with its `?`-carrying exact arithmetic); here two DOMINATING
         // length-equality guards re-establish the `#[ensures]` producer
@@ -254,7 +283,12 @@ impl SimplexSupportLp {
             Ok(cert) => cert,
             // `crate::err_barrier` (identity): a fresh in-body `Err` aggregate,
             // not a whole-`Result` forward the return-grounding lane cannot see.
-            Err(e) => return Err(crate::err_barrier(e)),
+            Err(e) => {
+                if poisoned() {
+                    return Err(crate::err_barrier(SbarError::Rat(RatError::Poisoned)));
+                }
+                return Err(crate::err_barrier(e));
+            }
         };
         // SINGLE compound guard (not two): one Err return means no merge point
         // for drop-elaboration to route a promoted-Err move through above the
@@ -265,6 +299,9 @@ impl SimplexSupportLp {
             || cert.entailment.premises.len() != cert.entailment.multipliers.len()
         {
             return Err(crate::err_barrier(SbarError::Dimension));
+        }
+        if poisoned() {
+            return Err(crate::err_barrier(SbarError::Rat(RatError::Poisoned)));
         }
         Ok(cert)
     }
@@ -283,11 +320,16 @@ impl SimplexSupportLp {
         }
 
         // Sort position indices by g descending (stable, exact comparisons).
-        // Allocation cap (`.min(1_048_576)`): syntactic `min(m, C) <= C < 2^28`
-        // bound for the checker. `m = g.len()` is the position count (a handful
-        // per attention), so `.min` is the identity — behavior-preserving. Same
-        // convention as `exact::solve_system`.
-        let mut order: Vec<usize> = (0..m.min(1_048_576)).collect();
+        // Allocation cap (`.min(MAX_POSITIONS)`): syntactic `min(m, C) <= C <
+        // 2^28` bound for the checker. `validate` explicitly rejects `m > C`,
+        // so `.min` is the identity on every accepted input.
+        // `Vec::new()` + push (not `(0..C).collect()`): the borrowing collect had
+        // no syntactic count bound at the allocation site, so it carried a hardened
+        // allocation obligation; identical elements in identical order.
+        let mut order: Vec<usize> = Vec::new();
+        for i in 0..m.min(MAX_POSITIONS) {
+            order.push(i);
+        }
         // `Rat: Ord` (exact rationals are totally ordered, never NaN), so use the total
         // `cmp` directly — avoids a `partial_cmp(..).expect(..)` panic boundary the verifier
         // (correctly) cannot discharge without a NaN-freedom proof.
@@ -339,10 +381,12 @@ impl SimplexSupportLp {
         debug_assert!(remaining.is_zero());
 
         // Closed-form dual (§5): μ⁺_j = max(0, g_j − λ), μ⁻_j = max(0, λ − g_j).
-        // Allocation caps (`.min(1_048_576)`, no-op — `m` is the position count):
-        // syntactic per-site capacity bounds for the dual vectors.
-        let mut mu_plus = Vec::with_capacity(m.min(1_048_576));
-        let mut mu_minus = Vec::with_capacity(m.min(1_048_576));
+        // `Vec::new()` (not `with_capacity(m.min(C))`): the capacity hint over the
+        // unbounded `m = g.len()` carries a hardened allocation obligation the
+        // checker fail-closes on; the growth cost is amortized noise. Same
+        // convention as the premise/multiplier vectors below.
+        let mut mu_plus = Vec::new();
+        let mut mu_minus = Vec::new();
         for gj in &self.g {
             let d = gj.sub(lambda)?;
             if d.is_positive() {
@@ -397,11 +441,16 @@ impl SimplexSupportLp {
         bound: Rat,
     ) -> Result<EntailmentCertificate, RatError> {
         let m = self.g.len();
-        // Allocation caps (`.min(1_048_576)`, no-op — `m` is the position count,
-        // so `2 + 2*m` is tiny): syntactic per-site bounds on the all-ones
-        // collect and the premise/multiplier capacities.
-        let all_ones: Vec<(String, Rat)> =
-            (0..m.min(1_048_576)).map(|j| (pvar(j), Rat::ONE)).collect();
+        // Allocation cap (`.min(MAX_POSITIONS)`) is a syntactic per-site bound
+        // on the all-ones vector. `validate` rejected larger inputs before this
+        // private helper can run, so it never truncates the certificate.
+        // `Vec::new()` + push (not `(0..C).map(..).collect()`): the mapped collect
+        // had no syntactic count bound at the allocation site, so it carried a
+        // hardened allocation obligation; identical elements in identical order.
+        let mut all_ones: Vec<(String, Rat)> = Vec::new();
+        for j in 0..m.min(MAX_POSITIONS) {
+            all_ones.push((pvar(j), Rat::ONE));
+        }
         // `Vec::new()` + push loop (not `collect`): the borrowing collect over
         // `all_ones` has no syntactic count bound at the allocation site, so it
         // carried a hardened allocation obligation. Same idiom as `premises`/
@@ -497,6 +546,14 @@ impl SimplexSupportLp {
 mod tests {
     use super::*;
     use crate::check_entailment;
+
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
 
     fn r(n: i128, d: i128) -> Rat {
         Rat::new(n, d).unwrap()
@@ -647,5 +704,42 @@ mod tests {
             p_hi: vec![r(1, 1), r(1, 1)],
         };
         assert_eq!(lp.certify_upper().unwrap_err(), SbarError::Infeasible);
+    }
+
+    #[test]
+    fn oversized_position_set_is_rejected_before_truncating_any_loop() {
+        let count = MAX_POSITIONS + 1;
+        let lp = SimplexSupportLp {
+            g: vec![Rat::ONE; count],
+            p_lo: vec![Rat::ZERO; count],
+            p_hi: vec![Rat::ONE; count],
+        };
+        assert_eq!(
+            lp.certify_upper().unwrap_err(),
+            SbarError::TooLarge {
+                got: count,
+                max: MAX_POSITIONS,
+            }
+        );
+    }
+
+    #[test]
+    fn certifier_refuses_poison_before_a_degenerate_path() {
+        let lp = SimplexSupportLp {
+            g: Vec::new(),
+            p_lo: Vec::new(),
+            p_hi: Vec::new(),
+        };
+        crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+
+        assert_eq!(
+            lp.objective(&[]).unwrap_err(),
+            SbarError::Rat(RatError::Poisoned)
+        );
+        assert_eq!(
+            lp.certify_upper().unwrap_err(),
+            SbarError::Rat(RatError::Poisoned)
+        );
     }
 }

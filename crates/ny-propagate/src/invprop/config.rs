@@ -10,14 +10,15 @@ use crate::NETWORK_INPUT;
 
 /// INVPROP configuration: output constraint backward propagation.
 ///
-/// INVPROP propagates output specification constraints backward through the network
-/// to tighten intermediate bounds BEFORE branch-and-bound begins. This breaks the
-/// chicken-and-egg problem where bounds are too loose initially for cuts to be effective.
-///
-/// NOT YET EFFECTIVE: the dual variables ("gammas") that drive the tightening are
-/// allocated and carried through the backward pass, but no optimization step for
-/// them exists yet. They stay at their zero initialization, so enabling INVPROP
-/// currently does not tighten any bounds.
+/// The production path allocates nonnegative output-seed dual variables
+/// ("gammas") and folds the candidate violation constraints into a CROWN
+/// backward pass. A finite contradiction can prove that violation region empty;
+/// a feasible conditioned iterate is not a global output enclosure and is not
+/// returned as one. Setting [`Self::optimize_gammas`] enables bounded,
+/// deterministic projected-ascent steps that search for that contradiction;
+/// leaving it false keeps the zero-initialized, byte-identical baseline.
+/// [`Self::per_layer_gammas`] separately opts into an unfinished research channel
+/// and does not imply production intermediate-bound tightening.
 ///
 /// Reference: Kotha et al., "Provably Computing the Preimage of Deep Neural Networks",
 /// arXiv:2302.01404 (NeurIPS 2023)
@@ -76,7 +77,7 @@ pub struct InvpropConfig {
     #[serde(default)]
     pub per_layer_gammas: bool,
 
-    /// Optimize the gammas via projected Adam ascent during alpha-CROWN.
+    /// Optimize the gammas via deterministic projected ascent during alpha-CROWN.
     ///
     /// Default `false`: gammas stay at their zero initialization, so the seed fold
     /// is the identity map and INVPROP is byte-identical to the baseline (inert
@@ -84,7 +85,7 @@ pub struct InvpropConfig {
     #[serde(default)]
     pub optimize_gammas: bool,
 
-    /// Learning rate for the gamma projected-Adam ascent (when `optimize_gammas`).
+    /// Learning rate for gamma projected ascent (when `optimize_gammas`).
     #[serde(default = "default_gamma_lr")]
     pub gamma_lr: f32,
 }

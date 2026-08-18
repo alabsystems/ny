@@ -2,23 +2,222 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{ArrayD, Axis};
-use ny_core::{GemmEngine, NyError, Result};
+use ndarray::{ArrayD, Axis, IxDyn};
+use ny_core::{checked_shape_product, GemmEngine, NyError, Result};
 use ny_tensor::{BoundedTensor, RepairStrategy};
 use std::borrow::Cow;
+use std::time::Instant;
 use tracing::debug;
 
 use super::super::crown_helpers::{
     compute_conv_bias_f64, detect_and_fix_nonfinite_rows, guard_nan_weights,
 };
 use super::{
-    conv1d_forward_backward_coeff_f64, conv1d_forward_batched_gemm, conv1d_single,
-    conv1d_transpose_backward_coeff_f64, conv1d_transpose_batched_gemm, conv1d_transpose_forward,
+    conv1d_forward_backward_coeff_f64, conv1d_forward_batched_gemm, conv1d_ibp_certified_forward,
+    conv1d_ibp_forward_with_deadline, conv1d_single, conv1d_transpose_backward_coeff_f64,
+    conv1d_transpose_batched_gemm, conv1d_transpose_forward,
+    conv1d_transpose_ibp_certified_forward, conv1d_transpose_ibp_forward_with_deadline,
     Conv1dLayer, ConvTranspose1dLayer,
 };
 use crate::bounds::{nan_propagating_max_zero, nan_propagating_min_zero};
 use crate::layers::common::BoundPropagation;
 use crate::LinearBounds;
+
+const DEADLINE_IBP_POLL_ELEMENTS: usize = 4_096;
+
+fn check_conv1d_ibp_deadline(deadline: Option<Instant>, layer: &str, stage: &str) -> Result<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(format!(
+            "{layer} IBP forward: deadline exceeded {stage}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_conv1d_ibp_geometry(layer: &Conv1dLayer) -> Result<(usize, usize)> {
+    if layer.kernel.ndim() != 3 {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![0, 0, 0],
+            got: layer.kernel.shape().to_vec(),
+        });
+    }
+    if layer.stride == 0 || layer.dilation == 0 || layer.groups == 0 {
+        return Err(NyError::InvalidSpec(
+            "Conv1d IBP geometry requires nonzero stride, dilation, and groups".to_string(),
+        ));
+    }
+    let out_channels = layer.kernel.shape()[0];
+    let input_channels_per_group = layer.kernel.shape()[1];
+    let kernel_size = layer.kernel.shape()[2];
+    if out_channels == 0 || input_channels_per_group == 0 || kernel_size == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "Conv1d kernel dimensions must be nonzero, got {:?}",
+            layer.kernel.shape()
+        )));
+    }
+    let in_channels = input_channels_per_group
+        .checked_mul(layer.groups)
+        .ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "Conv1d total input channels overflow: {input_channels_per_group} * {}",
+                layer.groups
+            ))
+        })?;
+    if !out_channels.is_multiple_of(layer.groups) {
+        return Err(NyError::InvalidSpec(format!(
+            "Conv1d out_channels ({out_channels}) must be divisible by groups ({})",
+            layer.groups
+        )));
+    }
+    if let Some(bias) = &layer.bias {
+        if bias.len() != out_channels {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![out_channels],
+                got: vec![bias.len()],
+            });
+        }
+    }
+    Ok((in_channels, out_channels))
+}
+
+fn validate_convtranspose1d_ibp_geometry(layer: &ConvTranspose1dLayer) -> Result<(usize, usize)> {
+    if layer.kernel.ndim() != 3 {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![0, 0, 0],
+            got: layer.kernel.shape().to_vec(),
+        });
+    }
+    if layer.stride == 0 || layer.dilation == 0 || layer.groups == 0 {
+        return Err(NyError::InvalidSpec(
+            "ConvTranspose1d IBP geometry requires nonzero stride, dilation, and groups"
+                .to_string(),
+        ));
+    }
+    let in_channels = layer.kernel.shape()[0];
+    let output_channels_per_group = layer.kernel.shape()[1];
+    let kernel_size = layer.kernel.shape()[2];
+    if in_channels == 0 || output_channels_per_group == 0 || kernel_size == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "ConvTranspose1d kernel dimensions must be nonzero, got {:?}",
+            layer.kernel.shape()
+        )));
+    }
+    if !in_channels.is_multiple_of(layer.groups) {
+        return Err(NyError::InvalidSpec(format!(
+            "ConvTranspose1d in_channels ({in_channels}) must be divisible by groups ({})",
+            layer.groups
+        )));
+    }
+    let out_channels = output_channels_per_group
+        .checked_mul(layer.groups)
+        .ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "ConvTranspose1d output channels overflow: {output_channels_per_group} * {}",
+                layer.groups
+            ))
+        })?;
+    if let Some(bias) = &layer.bias {
+        if bias.len() != out_channels {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![out_channels],
+                got: vec![bias.len()],
+            });
+        }
+    }
+    Ok((in_channels, out_channels))
+}
+
+fn finalize_conv1d_ibp_bounds(
+    lower: ArrayD<f32>,
+    upper: ArrayD<f32>,
+    deadline: Option<Instant>,
+    layer: &str,
+    stage: &str,
+) -> Result<BoundedTensor> {
+    if deadline.is_some() {
+        BoundedTensor::new_repaired_with_poll(lower, upper, RepairStrategy::Conservative, || {
+            check_conv1d_ibp_deadline(deadline, layer, stage)
+        })
+    } else {
+        BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
+    }
+}
+
+fn merge_certified_conv1d_hull(
+    ordinary: BoundedTensor,
+    certified_lower: ArrayD<f32>,
+    certified_upper: ArrayD<f32>,
+    deadline: Option<Instant>,
+    layer: &str,
+) -> Result<BoundedTensor> {
+    check_conv1d_ibp_deadline(deadline, layer, "before merging the f64 certificate")?;
+    if ordinary.shape() != certified_lower.shape()
+        || certified_lower.shape() != certified_upper.shape()
+    {
+        return Err(NyError::ShapeMismatch {
+            expected: ordinary.shape().to_vec(),
+            got: certified_lower.shape().to_vec(),
+        });
+    }
+    let (mut lower, mut upper) = ordinary.into_parts();
+    for (index, (((lower_value, upper_value), &certified_lower_value), &certified_upper_value)) in
+        lower
+            .iter_mut()
+            .zip(upper.iter_mut())
+            .zip(certified_lower.iter())
+            .zip(certified_upper.iter())
+            .enumerate()
+    {
+        if index.is_multiple_of(DEADLINE_IBP_POLL_ELEMENTS) {
+            check_conv1d_ibp_deadline(deadline, layer, "while merging the f64 certificate")?;
+        }
+        if certified_lower_value.is_nan() || certified_upper_value.is_nan() {
+            *lower_value = f32::NEG_INFINITY;
+            *upper_value = f32::INFINITY;
+            continue;
+        }
+        if certified_lower_value < *lower_value {
+            *lower_value = certified_lower_value;
+        }
+        if certified_upper_value > *upper_value {
+            *upper_value = certified_upper_value;
+        }
+    }
+    finalize_conv1d_ibp_bounds(
+        lower,
+        upper,
+        deadline,
+        layer,
+        "during certified-bound repair",
+    )
+}
+
+fn pollable_zero_array(
+    shape: &[usize],
+    deadline: Instant,
+    layer: &str,
+    stage: &str,
+) -> Result<ArrayD<f32>> {
+    let len = checked_shape_product(shape).ok_or_else(|| {
+        NyError::InvalidSpec(format!("{layer} IBP output dimensions overflow: {shape:?}"))
+    })?;
+    check_conv1d_ibp_deadline(Some(deadline), layer, stage)?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "{layer} IBP output allocation failed for {len} elements: {error}"
+        ))
+    })?;
+    check_conv1d_ibp_deadline(Some(deadline), layer, stage)?;
+    while values.len() < len {
+        let chunk = (len - values.len()).min(DEADLINE_IBP_POLL_ELEMENTS);
+        values.extend(std::iter::repeat_n(0.0, chunk));
+        check_conv1d_ibp_deadline(Some(deadline), layer, stage)?;
+    }
+    ArrayD::from_shape_vec(IxDyn(shape), values)
+        .map_err(|error| NyError::InternalError(format!("{layer} IBP output reshape: {error}")))
+}
+
 impl BoundPropagation for Conv1dLayer {
     /// IBP for Conv1d layer: y = conv1d(x, W) + b
     ///
@@ -115,8 +314,8 @@ impl BoundPropagation for Conv1dLayer {
                 let out_len = self.output_length(input_len)?;
                 let out_c = self.out_channels();
 
-                let mut lower_y = ArrayD::zeros(ndarray::IxDyn(&[batch, out_c, out_len]));
-                let mut upper_y = ArrayD::zeros(ndarray::IxDyn(&[batch, out_c, out_len]));
+                let mut lower_y = ArrayD::zeros(IxDyn(&[batch, out_c, out_len]));
+                let mut upper_y = ArrayD::zeros(IxDyn(&[batch, out_c, out_len]));
 
                 for b in 0..batch {
                     let lower_b = input.lower().index_axis(Axis(0), b).to_owned().into_dyn();
@@ -199,6 +398,62 @@ impl BoundPropagation for Conv1dLayer {
 }
 
 impl Conv1dLayer {
+    /// Deadline-bearing CROWN backward for Conv1d.
+    ///
+    /// The existing CPU implementation has a finite, shape-bounded amount of
+    /// work but its blocked faer kernels are not cancellable. A finite verifier
+    /// authority therefore refuses the generic caller engine, checks before
+    /// admission and after the bounded CPU operation, and never publishes a
+    /// result completed after expiry. `deadline: None` is the historical path.
+    pub fn propagate_linear_with_engine_and_deadline<'a>(
+        &self,
+        bounds: &'a LinearBounds,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<Cow<'a, LinearBounds>> {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(
+                "Conv1d CROWN backward: deadline exceeded before dispatch".to_string(),
+            ));
+        }
+        let admitted_engine = if deadline.is_some() { None } else { engine };
+        let result = self.propagate_linear_with_engine(bounds, admitted_engine)?;
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(
+                "Conv1d CROWN backward: deadline exceeded during bounded CPU dispatch".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+}
+
+impl ConvTranspose1dLayer {
+    /// ConvTranspose1d counterpart of
+    /// [`Conv1dLayer::propagate_linear_with_engine_and_deadline`].
+    pub fn propagate_linear_with_engine_and_deadline<'a>(
+        &self,
+        bounds: &'a LinearBounds,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<Cow<'a, LinearBounds>> {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(
+                "ConvTranspose1d CROWN backward: deadline exceeded before dispatch".to_string(),
+            ));
+        }
+        let admitted_engine = if deadline.is_some() { None } else { engine };
+        let result = self.propagate_linear_with_engine(bounds, admitted_engine)?;
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(
+                "ConvTranspose1d CROWN backward: deadline exceeded during bounded CPU dispatch"
+                    .to_string(),
+            ));
+        }
+        Ok(result)
+    }
+}
+
+impl Conv1dLayer {
     /// IBP propagation with optional GEMM-engine acceleration for PGD.
     ///
     /// The engine-aware path batches the four W+/W- convolution evaluations
@@ -222,36 +477,212 @@ impl Conv1dLayer {
         }
     }
 
-    /// SOUND IBP forward — the Conv1d analogue of `Conv2dLayer::propagate_ibp_sound_with_engine`
-    /// (#vnncomp-aw-soundness). The plain forward accumulates each output over
-    /// `K = (in_c/groups)·kw` products in round-to-nearest f32 (no f64, no directed rounding),
-    /// so under cancellation it can EXCLUDE the true value — unsound as an intermediate /
-    /// verdict node bound. This adds the certified Higham error `up(γ_{K+2}·S + 2u·|y|)` with
-    /// `S = Σ_k |W_ok|·max(|x_l_k|,|x_u_k|)` (run the SAME forward on `|kernel|` and the
-    /// degenerate `max(|l|,|u|)` box), rounded outward. SOUND: strictly encloses; looser only.
+    /// Deadline-authoritative Conv1d interval forward.
+    ///
+    /// `deadline: None` preserves [`Self::propagate_ibp_with_engine`] exactly.
+    /// A finite deadline refuses the opaque caller engine and uses a direct CPU
+    /// contraction with bounded polling quanta.
+    pub fn propagate_ibp_with_engine_and_deadline(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedTensor> {
+        let Some(deadline) = deadline else {
+            return self.propagate_ibp_with_engine(input, engine);
+        };
+        check_conv1d_ibp_deadline(Some(deadline), "Conv1d", "before entry")?;
+        self.propagate_ibp_pollable(input, deadline)
+    }
+
+    fn propagate_ibp_pollable(
+        &self,
+        input: &BoundedTensor,
+        deadline: Instant,
+    ) -> Result<BoundedTensor> {
+        let (in_c, out_c) = validate_conv1d_ibp_geometry(self)?;
+        match input.lower().ndim() {
+            2 => {
+                if input.lower().shape()[0] != in_c {
+                    return Err(NyError::ShapeMismatch {
+                        expected: vec![in_c],
+                        got: vec![input.lower().shape()[0]],
+                    });
+                }
+                let forward = conv1d_ibp_forward_with_deadline(
+                    input.lower().view(),
+                    input.upper().view(),
+                    &self.kernel,
+                    self.stride,
+                    self.padding,
+                    self.dilation,
+                    self.groups,
+                    deadline,
+                )?;
+                let mut lower_y = forward.lower;
+                let mut upper_y = forward.upper;
+                if let Some(bias) = &self.bias {
+                    let mut elements = 0usize;
+                    for oc in 0..out_c {
+                        for ol in 0..forward.out_len {
+                            elements += 1;
+                            if elements == DEADLINE_IBP_POLL_ELEMENTS {
+                                check_conv1d_ibp_deadline(
+                                    Some(deadline),
+                                    "Conv1d",
+                                    "while adding bias",
+                                )?;
+                                elements = 0;
+                            }
+                            lower_y[[oc, ol]] += bias[oc];
+                            upper_y[[oc, ol]] += bias[oc];
+                        }
+                    }
+                }
+                finalize_conv1d_ibp_bounds(
+                    lower_y,
+                    upper_y,
+                    Some(deadline),
+                    "Conv1d",
+                    "during result repair",
+                )
+            }
+            3 => {
+                if input.lower().shape()[1] != in_c {
+                    return Err(NyError::ShapeMismatch {
+                        expected: vec![0, in_c, 0],
+                        got: input.lower().shape().to_vec(),
+                    });
+                }
+                let batch = input.lower().shape()[0];
+                let input_len = input.lower().shape()[2];
+                let out_len = self.output_length(input_len)?;
+                let mut lower_y = pollable_zero_array(
+                    &[batch, out_c, out_len],
+                    deadline,
+                    "Conv1d",
+                    "during batched lower-bound initialization",
+                )?;
+                let mut upper_y = pollable_zero_array(
+                    &[batch, out_c, out_len],
+                    deadline,
+                    "Conv1d",
+                    "during batched upper-bound initialization",
+                )?;
+
+                let mut copied_elements = 0usize;
+                for batch_index in 0..batch {
+                    check_conv1d_ibp_deadline(Some(deadline), "Conv1d", "before a batch item")?;
+                    let forward = conv1d_ibp_forward_with_deadline(
+                        input.lower().index_axis(Axis(0), batch_index),
+                        input.upper().index_axis(Axis(0), batch_index),
+                        &self.kernel,
+                        self.stride,
+                        self.padding,
+                        self.dilation,
+                        self.groups,
+                        deadline,
+                    )?;
+                    for oc in 0..out_c {
+                        for ol in 0..out_len {
+                            copied_elements += 1;
+                            if copied_elements == DEADLINE_IBP_POLL_ELEMENTS {
+                                check_conv1d_ibp_deadline(
+                                    Some(deadline),
+                                    "Conv1d",
+                                    "while copying a batched result",
+                                )?;
+                                copied_elements = 0;
+                            }
+                            lower_y[[batch_index, oc, ol]] = forward.lower[[oc, ol]];
+                            upper_y[[batch_index, oc, ol]] = forward.upper[[oc, ol]];
+                        }
+                    }
+                }
+
+                if let Some(bias) = &self.bias {
+                    let mut elements = 0usize;
+                    for batch_index in 0..batch {
+                        for oc in 0..out_c {
+                            for ol in 0..out_len {
+                                elements += 1;
+                                if elements == DEADLINE_IBP_POLL_ELEMENTS {
+                                    check_conv1d_ibp_deadline(
+                                        Some(deadline),
+                                        "Conv1d",
+                                        "while adding batched bias",
+                                    )?;
+                                    elements = 0;
+                                }
+                                lower_y[[batch_index, oc, ol]] += bias[oc];
+                                upper_y[[batch_index, oc, ol]] += bias[oc];
+                            }
+                        }
+                    }
+                }
+                finalize_conv1d_ibp_bounds(
+                    lower_y,
+                    upper_y,
+                    Some(deadline),
+                    "Conv1d",
+                    "during batched result repair",
+                )
+            }
+            _ => Err(NyError::ShapeMismatch {
+                expected: vec![in_c, 0],
+                got: input.lower().shape().to_vec(),
+            }),
+        }
+    }
+
+    /// SOUND IBP forward for Conv1d.
+    ///
+    /// The ordinary f32/engine result is hulled with a direct interval
+    /// certificate whose f32 operands are bit-decoded exactly into normal f64,
+    /// whose additions are rounded outward, and whose final subnormal-range
+    /// endpoints use a normal f32 floor. This remains valid with host FTZ/DAZ
+    /// enabled and covers cancellation as well as product underflow.
     pub fn propagate_ibp_sound_with_engine(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
-        let y = self.propagate_ibp_with_engine(input, engine)?;
-        let mut xmax = input.lower().mapv(f32::abs);
-        ndarray::Zip::from(&mut xmax)
-            .and(input.upper())
-            .for_each(|m, &u| *m = m.max(u.abs()));
-        let abs_kernel = self.kernel.mapv(f32::abs);
-        let abs_layer = Conv1dLayer::new_full(
-            abs_kernel,
-            None,
+        self.propagate_ibp_sound_with_engine_and_deadline(input, engine, None)
+    }
+
+    /// Deadline-authoritative certified Conv1d interval forward.
+    ///
+    /// Both finite and no-deadline calls use the same directed-f64 certificate.
+    /// The ordinary path remains unchanged (including historical engine
+    /// dispatch when `deadline` is `None`); a finite authority polls both the
+    /// ordinary contraction and every certificate/merge/repair work quantum.
+    pub fn propagate_ibp_sound_with_engine_and_deadline(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedTensor> {
+        check_conv1d_ibp_deadline(deadline, "Conv1d", "before certified propagation")?;
+        validate_conv1d_ibp_geometry(self)?;
+        let ordinary = self.propagate_ibp_with_engine_and_deadline(input, engine, deadline)?;
+        let certified = conv1d_ibp_certified_forward(
+            input.lower().view(),
+            input.upper().view(),
+            &self.kernel,
+            self.bias.as_ref(),
             self.stride,
             self.padding,
             self.dilation,
             self.groups,
+            deadline,
         )?;
-        let s_bt = abs_layer.propagate_ibp_with_engine(&BoundedTensor::concrete(xmax)?, engine)?;
-        // Conv1d kernel is (out_c, in_c/groups, kw): shape[1] is already in_c/groups.
-        let macs = self.kernel.shape()[1].saturating_mul(self.kernel.shape()[2]);
-        super::super::crown_helpers::higham_widen_ibp(&y, s_bt.lower(), macs)
+        merge_certified_conv1d_hull(
+            ordinary,
+            certified.lower,
+            certified.upper,
+            deadline,
+            "Conv1d",
+        )
     }
 
     /// Single forward pass for a concrete (point) input.
@@ -435,7 +866,7 @@ impl Conv1dLayer {
         }
 
         let (mut new_lower_b, mut new_upper_b) =
-            compute_conv_bias_f64(bounds, self.bias.as_ref(), out_c, out_len);
+            compute_conv_bias_f64(bounds, self.bias.as_ref(), out_c, out_len)?;
 
         // Certified coefficient error `cast + γ·S + prop` (shared helper).
         let kernel_l1: f64 = self.kernel.iter().map(|&v| (v as f64).abs()).sum();
@@ -447,6 +878,7 @@ impl Conv1dLayer {
             kernel_l1,
             n_contraction,
             None,
+            None,
         );
         let mut upper_err = super::super::crown_helpers::conv_coeff_err_matrix(
             bounds.upper_a(),
@@ -455,6 +887,7 @@ impl Conv1dLayer {
             coeff_f64_u.as_ref().filter(|_| upper_recompute_ok),
             kernel_l1,
             n_contraction,
+            None,
             None,
         );
         let nrows = new_lower_a.nrows();
@@ -773,8 +1206,8 @@ impl BoundPropagation for ConvTranspose1dLayer {
                 let out_len = self.output_length(input_len)?;
                 let out_c = self.out_channels();
 
-                let mut lower_y = ArrayD::zeros(ndarray::IxDyn(&[batch, out_c, out_len]));
-                let mut upper_y = ArrayD::zeros(ndarray::IxDyn(&[batch, out_c, out_len]));
+                let mut lower_y = ArrayD::zeros(IxDyn(&[batch, out_c, out_len]));
+                let mut upper_y = ArrayD::zeros(IxDyn(&[batch, out_c, out_len]));
 
                 for b in 0..batch {
                     let lower_b = input.lower().index_axis(Axis(0), b).to_owned().into_dyn();
@@ -869,35 +1302,215 @@ impl ConvTranspose1dLayer {
         self.propagate_ibp(input)
     }
 
-    /// SOUND IBP forward (#vnncomp-aw-soundness) — same Higham construction as
-    /// `Conv1dLayer::propagate_ibp_sound_with_engine`, for the transposed conv. The plain
-    /// forward f32-accumulates each output over at most `K = (in_c/groups)·kw` scattered
-    /// products, so it can EXCLUDE the true value under cancellation; this folds the certified
-    /// `up(γ_{K+2}·S + 2u·|y|)` outward (`S = |kernel| transpose-forward on max(|l|,|u|)`).
+    /// Deadline-authoritative ConvTranspose1d interval forward.
+    ///
+    /// `deadline: None` preserves [`Self::propagate_ibp_with_engine`] exactly.
+    /// A finite deadline refuses the opaque caller engine and uses a direct CPU
+    /// contraction with bounded polling quanta.
+    pub fn propagate_ibp_with_engine_and_deadline(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedTensor> {
+        let Some(deadline) = deadline else {
+            return self.propagate_ibp_with_engine(input, engine);
+        };
+        check_conv1d_ibp_deadline(Some(deadline), "ConvTranspose1d", "before entry")?;
+        self.propagate_ibp_pollable(input, deadline)
+    }
+
+    fn propagate_ibp_pollable(
+        &self,
+        input: &BoundedTensor,
+        deadline: Instant,
+    ) -> Result<BoundedTensor> {
+        let (in_c, out_c) = validate_convtranspose1d_ibp_geometry(self)?;
+        match input.lower().ndim() {
+            2 => {
+                if input.lower().shape()[0] != in_c {
+                    return Err(NyError::ShapeMismatch {
+                        expected: vec![in_c],
+                        got: vec![input.lower().shape()[0]],
+                    });
+                }
+                let forward = conv1d_transpose_ibp_forward_with_deadline(
+                    input.lower().view(),
+                    input.upper().view(),
+                    &self.kernel,
+                    self.stride,
+                    self.padding,
+                    self.dilation,
+                    self.groups,
+                    deadline,
+                )?;
+                let mut lower_y = forward.lower;
+                let mut upper_y = forward.upper;
+                if let Some(bias) = &self.bias {
+                    let mut elements = 0usize;
+                    for oc in 0..out_c {
+                        for output_index in 0..forward.out_len {
+                            elements += 1;
+                            if elements == DEADLINE_IBP_POLL_ELEMENTS {
+                                check_conv1d_ibp_deadline(
+                                    Some(deadline),
+                                    "ConvTranspose1d",
+                                    "while adding bias",
+                                )?;
+                                elements = 0;
+                            }
+                            lower_y[[oc, output_index]] += bias[oc];
+                            upper_y[[oc, output_index]] += bias[oc];
+                        }
+                    }
+                }
+                finalize_conv1d_ibp_bounds(
+                    lower_y,
+                    upper_y,
+                    Some(deadline),
+                    "ConvTranspose1d",
+                    "during result repair",
+                )
+            }
+            3 => {
+                if input.lower().shape()[1] != in_c {
+                    return Err(NyError::ShapeMismatch {
+                        expected: vec![0, in_c, 0],
+                        got: input.lower().shape().to_vec(),
+                    });
+                }
+                let batch = input.lower().shape()[0];
+                let input_len = input.lower().shape()[2];
+                let out_len = self.output_length(input_len)?;
+                let mut lower_y = pollable_zero_array(
+                    &[batch, out_c, out_len],
+                    deadline,
+                    "ConvTranspose1d",
+                    "during batched lower-bound initialization",
+                )?;
+                let mut upper_y = pollable_zero_array(
+                    &[batch, out_c, out_len],
+                    deadline,
+                    "ConvTranspose1d",
+                    "during batched upper-bound initialization",
+                )?;
+
+                let mut copied_elements = 0usize;
+                for batch_index in 0..batch {
+                    check_conv1d_ibp_deadline(
+                        Some(deadline),
+                        "ConvTranspose1d",
+                        "before a batch item",
+                    )?;
+                    let forward = conv1d_transpose_ibp_forward_with_deadline(
+                        input.lower().index_axis(Axis(0), batch_index),
+                        input.upper().index_axis(Axis(0), batch_index),
+                        &self.kernel,
+                        self.stride,
+                        self.padding,
+                        self.dilation,
+                        self.groups,
+                        deadline,
+                    )?;
+                    for oc in 0..out_c {
+                        for output_index in 0..out_len {
+                            copied_elements += 1;
+                            if copied_elements == DEADLINE_IBP_POLL_ELEMENTS {
+                                check_conv1d_ibp_deadline(
+                                    Some(deadline),
+                                    "ConvTranspose1d",
+                                    "while copying a batched result",
+                                )?;
+                                copied_elements = 0;
+                            }
+                            lower_y[[batch_index, oc, output_index]] =
+                                forward.lower[[oc, output_index]];
+                            upper_y[[batch_index, oc, output_index]] =
+                                forward.upper[[oc, output_index]];
+                        }
+                    }
+                }
+
+                if let Some(bias) = &self.bias {
+                    let mut elements = 0usize;
+                    for batch_index in 0..batch {
+                        for oc in 0..out_c {
+                            for output_index in 0..out_len {
+                                elements += 1;
+                                if elements == DEADLINE_IBP_POLL_ELEMENTS {
+                                    check_conv1d_ibp_deadline(
+                                        Some(deadline),
+                                        "ConvTranspose1d",
+                                        "while adding batched bias",
+                                    )?;
+                                    elements = 0;
+                                }
+                                lower_y[[batch_index, oc, output_index]] += bias[oc];
+                                upper_y[[batch_index, oc, output_index]] += bias[oc];
+                            }
+                        }
+                    }
+                }
+                finalize_conv1d_ibp_bounds(
+                    lower_y,
+                    upper_y,
+                    Some(deadline),
+                    "ConvTranspose1d",
+                    "during batched result repair",
+                )
+            }
+            _ => Err(NyError::ShapeMismatch {
+                expected: vec![in_c, 0],
+                got: input.lower().shape().to_vec(),
+            }),
+        }
+    }
+
+    /// SOUND IBP forward for ConvTranspose1d.
+    ///
+    /// Uses the same FTZ/DAZ-independent directed-f64 interval certificate as
+    /// [`Conv1dLayer::propagate_ibp_sound_with_engine`], with the transposed
+    /// grouped scatter geometry.
     pub fn propagate_ibp_sound_with_engine(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<BoundedTensor> {
-        let y = self.propagate_ibp_with_engine(input, engine)?;
-        let mut xmax = input.lower().mapv(f32::abs);
-        ndarray::Zip::from(&mut xmax)
-            .and(input.upper())
-            .for_each(|m, &u| *m = m.max(u.abs()));
-        let abs_kernel = self.kernel.mapv(f32::abs);
-        let abs_layer = ConvTranspose1dLayer::new_full(
-            abs_kernel,
-            None,
+        self.propagate_ibp_sound_with_engine_and_deadline(input, engine, None)
+    }
+
+    /// Deadline-authoritative certified ConvTranspose1d interval forward.
+    ///
+    /// Both finite and no-deadline calls use one shared directed-f64 arithmetic
+    /// implementation. The generic caller engine is never admitted under a
+    /// finite authority, and all finite certificate/merge/repair loops poll.
+    pub fn propagate_ibp_sound_with_engine_and_deadline(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedTensor> {
+        check_conv1d_ibp_deadline(deadline, "ConvTranspose1d", "before certified propagation")?;
+        validate_convtranspose1d_ibp_geometry(self)?;
+        let ordinary = self.propagate_ibp_with_engine_and_deadline(input, engine, deadline)?;
+        let certified = conv1d_transpose_ibp_certified_forward(
+            input.lower().view(),
+            input.upper().view(),
+            &self.kernel,
+            self.bias.as_ref(),
             self.stride,
             self.padding,
             self.dilation,
             self.groups,
+            deadline,
         )?;
-        let s_bt = abs_layer.propagate_ibp_with_engine(&BoundedTensor::concrete(xmax)?, engine)?;
-        // Transpose kernel is (in_c, out_c/groups, kw); per-output fan-in <= (in_c/groups)·kw.
-        let macs =
-            (self.kernel.shape()[0] / self.groups.max(1)).saturating_mul(self.kernel.shape()[2]);
-        super::super::crown_helpers::higham_widen_ibp(&y, s_bt.lower(), macs)
+        merge_certified_conv1d_hull(
+            ordinary,
+            certified.lower,
+            certified.upper,
+            deadline,
+            "ConvTranspose1d",
+        )
     }
 
     /// Single forward pass for a concrete (point) input.
@@ -1085,7 +1698,7 @@ impl ConvTranspose1dLayer {
         }
 
         let (mut new_lower_b, mut new_upper_b) =
-            compute_conv_bias_f64(bounds, self.bias.as_ref(), out_c, out_len);
+            compute_conv_bias_f64(bounds, self.bias.as_ref(), out_c, out_len)?;
 
         // Certified coefficient error `cast + γ·S + prop` (shared helper).
         let kernel_l1: f64 = self.kernel.iter().map(|&v| (v as f64).abs()).sum();
@@ -1097,6 +1710,7 @@ impl ConvTranspose1dLayer {
             kernel_l1,
             n_contraction,
             None,
+            None,
         );
         let mut upper_err = super::super::crown_helpers::conv_coeff_err_matrix(
             bounds.upper_a(),
@@ -1105,6 +1719,7 @@ impl ConvTranspose1dLayer {
             coeff_f64_u.as_ref().filter(|_| upper_recompute_ok),
             kernel_l1,
             n_contraction,
+            None,
             None,
         );
         let nrows = new_lower_a.nrows();

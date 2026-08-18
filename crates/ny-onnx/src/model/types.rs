@@ -80,6 +80,24 @@ impl OnnxModel {
         Some(original.matches_current(name, &self.weights))
     }
 
+    /// Whether every loader-captured raw ONNX FLOAT initializer still matches
+    /// the current weight store exactly.
+    ///
+    /// `None` means provenance capture was not requested. An empty captured set
+    /// is `Some(false)`: a caller requesting authored-weight proof authority
+    /// must not silently admit a model for which the loader sealed no evidence.
+    #[must_use]
+    pub fn authored_float32_initializers_match_current(&self) -> Option<bool> {
+        self.original_network_topology.as_ref()?;
+        Some(
+            !self.original_float32_initializers.is_empty()
+                && self
+                    .original_float32_initializers
+                    .iter()
+                    .all(|(name, original)| original.matches_current(name, &self.weights)),
+        )
+    }
+
     /// Whether the current public network still exactly matches the finalized
     /// representation produced by an opt-in qualified ONNX load.
     ///

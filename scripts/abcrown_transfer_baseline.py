@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any
+from urllib.parse import urlsplit
 
 CORPUS_SCHEMA = "ny_abcrown_transfer_corpus_v1"
 BASELINE_SCHEMA = "ny_abcrown_transfer_baseline_v1"
@@ -56,6 +57,7 @@ REQUIRED_COVERAGE_TAGS = frozenset(
 )
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 PHASE_RE = re.compile(
     r"^\[phase\] (?P<name>.+) t=(?P<seconds>[0-9]+(?:\.[0-9]+)?)s$"
 )
@@ -194,7 +196,7 @@ def _validate_expected(raw: object, context: str) -> dict[str, str]:
     _expect_keys(
         raw,
         required={"model_sha256", "property_sha256"},
-        optional=set(),
+        optional={"expected_result"},
         context=context,
     )
     result: dict[str, str] = {}
@@ -203,7 +205,53 @@ def _validate_expected(raw: object, context: str) -> dict[str, str]:
         if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
             raise BaselineError(f"{context}.{key} must be lowercase SHA-256")
         result[key] = value
+    if "expected_result" in raw:
+        expected_result = raw["expected_result"]
+        if expected_result not in {"verified", "falsified"}:
+            raise BaselineError(
+                f"{context}.expected_result must be 'verified' or 'falsified'"
+            )
+        result["expected_result"] = expected_result
     return result
+
+
+def _validate_source_identity(raw: dict[str, Any], context: str) -> None:
+    """Validate an optional, inseparable benchmark repository/commit binding."""
+    repository = raw.get("source_repository")
+    commit = raw.get("source_commit")
+    if repository is None and commit is None:
+        return
+    if repository is None or commit is None:
+        raise BaselineError(
+            f"{context}.source_repository and source_commit must be provided together"
+        )
+    if not isinstance(repository, str):
+        raise BaselineError(f"{context}.source_repository must be an HTTPS URL")
+    try:
+        parsed = urlsplit(repository)
+        port = parsed.port
+    except ValueError:
+        parsed = None
+        port = None
+    if (
+        parsed is None
+        or parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or not parsed.path.strip("/")
+        or parsed.query
+        or parsed.fragment
+        or parsed.geturl() != repository
+    ):
+        raise BaselineError(
+            f"{context}.source_repository must be a canonical HTTPS repository URL"
+        )
+    if not isinstance(commit, str) or GIT_COMMIT_RE.fullmatch(commit) is None:
+        raise BaselineError(
+            f"{context}.source_commit must be a lowercase 40-hex Git commit"
+        )
 
 
 def _validate_entry(raw: object, index: int) -> dict[str, Any]:
@@ -224,7 +272,7 @@ def _validate_entry(raw: object, index: int) -> dict[str, Any]:
                 "preset",
                 "expected",
             },
-            optional={"notes"},
+            optional={"notes", "source_repository", "source_commit"},
             context=context,
         )
     elif kind == "repository_pair":
@@ -282,6 +330,7 @@ def _validate_entry(raw: object, index: int) -> dict[str, Any]:
         result["preset"] = _safe_relative_path(
             raw["preset"], f"{context}.preset"
         )
+        _validate_source_identity(raw, context)
     else:
         result["command"] = _string_list(raw["command"], f"{context}.command")
     if kind == "repository_test":
@@ -780,7 +829,7 @@ def _validate_numeric_group(
     extra_fields: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     if raw is None:
-        return {field: None for field in fields}
+        return dict.fromkeys(fields)
     if not isinstance(raw, dict):
         raise BaselineError(f"{context} must be an object")
     _expect_keys(

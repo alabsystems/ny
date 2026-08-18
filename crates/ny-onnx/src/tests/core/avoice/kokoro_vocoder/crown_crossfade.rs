@@ -277,8 +277,9 @@ fn assert_two_chunk_crown_crossfade_guarantees(
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_prefix_crown_crossfade_refines_ibp_guarantees_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // Concrete-point containment (#3683): evaluate prefix at center of the
     // epsilon ball and assert the output is within IBP bounds.
     {
@@ -353,8 +354,9 @@ fn test_prefix_crown_crossfade_refines_ibp_guarantees_3500() {
 }
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_crown_crossfade_refines_ibp_guarantees_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // Keep the historical exact-name replay for the real two-chunk lane, but
     // do not require strictly positive tightening here. On the current 2-node
     // shallow prefix, distinct chunk centers still satisfy the no-loosening
@@ -393,8 +395,9 @@ fn test_two_chunk_crown_crossfade_refines_ibp_guarantees_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_crown_crossfade_contains_concrete_overlap_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let (
         _,
         _,
@@ -433,8 +436,9 @@ fn test_two_chunk_crown_crossfade_contains_concrete_overlap_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_crown_crossfade_preserves_width_and_energy_caps_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let (
         (crown_a_last_lo, crown_a_last_hi),
         (crown_b_first_lo, crown_b_first_hi),

@@ -85,48 +85,18 @@ pub struct CertifiedResult {
 }
 
 /// Upper bound on the total hidden-neuron count we attempt to certify. Exact
-/// rational CROWN over a large net risks i128 overflow and very large
-/// denominators; above this we skip (non-fatal, no cert). Mirrors the CLI
-/// adapter's gate.
+/// rational CROWN over a large net can create very large intermediate values
+/// and consume excessive time/memory; above this we skip (non-fatal, no cert).
+/// Mirrors the CLI adapter's gate.
 const MAX_CERT_NEURONS: usize = 8192;
 
 /// Convert an `f32` to its EXACT dyadic rational value (no rounding).
 ///
 /// IEEE-754 binary32 values are exactly dyadic (`m · 2^e`), so this is lossless.
-/// Returns `None` for non-finite inputs or when the value does not fit the
-/// rational's i128 numerator/denominator (extreme magnitudes / tiny
-/// subnormals) — the caller then skips certification (sound: no cert emitted).
+/// Returns `None` for non-finite inputs or a poisoned exact-rational arena; the
+/// caller then skips certification (sound: no cert emitted).
 fn f32_to_rat(f: f32) -> Option<Rat> {
-    if !f.is_finite() {
-        return None;
-    }
-    if f == 0.0 {
-        return Some(Rat::ZERO);
-    }
-    let bits = f.to_bits();
-    let sign: i128 = if bits >> 31 == 0 { 1 } else { -1 };
-    let exp_field = ((bits >> 23) & 0xff) as i32;
-    let frac = (bits & 0x007f_ffff) as i128;
-    let (mantissa, e2) = if exp_field == 0 {
-        (frac, -126 - 23)
-    } else {
-        ((1i128 << 23) | frac, exp_field - 127 - 23)
-    };
-    let signed = sign * mantissa;
-    if e2 >= 0 {
-        if e2 > 100 {
-            return None;
-        }
-        let num = signed.checked_mul(1i128 << e2)?;
-        Rat::new(num, 1).ok()
-    } else {
-        let shift = (-e2) as u32;
-        if shift > 120 {
-            return None;
-        }
-        let den = 1i128.checked_shl(shift)?;
-        Rat::new(signed, den).ok()
-    }
+    Rat::from_f32_exact(f)
 }
 
 /// Convert a slice of `f32` to exact rationals, or `None` if any does not fit.
@@ -198,7 +168,7 @@ fn extract_fc_relu_stack(graph: &GraphNetwork) -> std::result::Result<FcReluStac
                 if expect_relu {
                     return Err("two Linear layers with no ReLU between them".to_string());
                 }
-                linears.push((&lin.weight, lin.bias.as_ref()));
+                linears.push((lin.weight(), lin.bias()));
                 expect_relu = true;
             }
             Layer::ReLU(_) => {
@@ -383,6 +353,13 @@ fn certify_problem_into(
     let certified = problem
         .certify(Rat::ZERO)
         .map_err(|e| format!("exact CROWN did not close '{label}': {e}"))?;
+    // Preserve the v1 wire shape (`n/d`, including `/1`) while using the
+    // checked arena read rather than the legacy unchecked accessors.
+    let (lower_num, lower_den) = certified
+        .lower_bound
+        .checked_parts()
+        .map_err(|e| format!("exact lower bound for '{label}' is not serialisable: {e}"))?;
+    let lower_bound = format!("{lower_num}/{lower_den}");
 
     // FAIL-CLOSED strictness gate: for a STRICT conjunct (argmax) the real
     // property is `margin > 0`. The kernel only checks the `>= 0` inequality, so
@@ -393,10 +370,8 @@ fn certify_problem_into(
     // attests `exact_lower_bound = L` with `L > 0`, which entails `margin > 0`.
     if strict && !certified.lower_bound.is_positive() {
         return Err(format!(
-            "strict conjunct '{label}' not discharged: exact lower bound {}/{} is not > 0 \
-             (a tie does not establish strict argmax)",
-            certified.lower_bound.num(),
-            certified.lower_bound.den()
+            "strict conjunct '{label}' not discharged: exact lower bound {lower_bound} is not > 0 \
+             (a tie does not establish strict argmax)"
         ));
     }
 
@@ -411,7 +386,6 @@ fn certify_problem_into(
         .map_err(|e| format!("entailment not serialisable for '{label}': {e}"))?;
     let farkas_json = farkas_to_json(&certified.farkas)
         .map_err(|e| format!("farkas not serialisable for '{label}': {e}"))?;
-    let lb = &certified.lower_bound;
     // Be honest about what L attests: a strict conjunct proves `margin > 0`
     // (justified by the just-checked `L > 0`); a non-strict one proves
     // `margin >= 0`. A Clean kernel re-checking only `>= 0` together with the
@@ -421,7 +395,7 @@ fn certify_problem_into(
         "discharged_conjunct": label,
         "relation": relation,
         "strict": strict,
-        "exact_lower_bound": format!("{}/{}", lb.num(), lb.den()),
+        "exact_lower_bound": lower_bound,
         "depth": problem.depth(),
         "entailment": entailment_json,
         "farkas": farkas_json,
@@ -464,8 +438,11 @@ fn margin_layer_from_augmented(
         .ok_or_else(|| format!("augmented net has no output node '{out}'"))?;
     match node.layer() {
         Layer::Linear(lin) => {
-            let m = lin.weight.clone();
-            let c = lin.bias.clone().unwrap_or_else(|| Array1::zeros(m.nrows()));
+            let m = lin.weight().clone();
+            let c = lin
+                .bias()
+                .cloned()
+                .unwrap_or_else(|| Array1::zeros(m.nrows()));
             if c.len() != m.nrows() {
                 return Err(format!(
                     "margin layer bias len {} != rows {}",
@@ -1501,7 +1478,7 @@ mod tests {
         );
         // And the attested exact lower bound is itself strictly positive.
         let lb = c["exact_lower_bound"].as_str().unwrap();
-        let (n, d) = lb.split_once('/').unwrap();
+        let (n, d) = lb.split_once('/').expect("v1 exact bound uses n/d");
         let num: i128 = n.parse().unwrap();
         let den: i128 = d.parse().unwrap();
         assert!(

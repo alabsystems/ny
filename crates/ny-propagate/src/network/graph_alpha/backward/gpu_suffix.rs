@@ -15,10 +15,23 @@ use crate::network::core::{
 };
 
 use ndarray::{ArrayD, IxDyn};
-use ny_core::{GemmEngine, GpuCrownSeed, NyError, Result};
-use ny_tensor::{BoundedTensor, RepairStrategy};
+use ny_core::{GemmEngine, GpuCrownSeed, Result};
+use ny_tensor::BoundedTensor;
 use std::collections::HashMap;
+use std::time::Instant;
 use tracing::debug;
+
+/// Per-alpha-state fail-closed marker. Once a selected GPU backend returns an
+/// error or malformed receipt, the remainder of this solve uses CPU suffixes
+/// instead of probing the same untrusted backend again at a later graph node.
+const GPU_SUFFIX_RUNTIME_REFUSED: &str = "\0gpu-suffix-runtime-refused";
+
+pub(super) fn gpu_suffix_runtime_refused(alpha_state: &GraphAlphaState) -> bool {
+    alpha_state
+        .gpu_suffix_ineligible
+        .read()
+        .is_ok_and(|set| set.contains(GPU_SUFFIX_RUNTIME_REFUSED))
+}
 
 impl GraphNetwork {
     /// Try to offload the remaining backward suffix to GPU.
@@ -39,14 +52,35 @@ impl GraphNetwork {
         node_bounds: &HashMap<String, BoundedTensor>,
         alpha_state: &GraphAlphaState,
         engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
     ) -> Result<Option<BoundedTensor>> {
+        // The legacy GPU shortcut builds a host seed, input endpoint copies,
+        // and an extracted layer Vec with infallible O(N) operations. A GPU
+        // deadline receipt cannot authorize work that happens before dispatch.
+        // Keep finite requests on the cooperatively pollable CPU relation path;
+        // no-deadline GPU behavior remains unchanged.
+        // #gpu-suffix-expiry: default-off, byte-identical unarmed. See
+        // `sound_gpu_gate::gpu_suffix_declines_under_finite_authority` — armed, a
+        // live deadline with headroom no longer forces the CPU relation path.
+        if let Some(limit) = deadline {
+            if Instant::now() >= limit {
+                return Err(ny_core::NyError::DeadlineExceeded(
+                    "alpha-CROWN GPU suffix deadline expired before host seed preparation".into(),
+                ));
+            }
+            if crate::sound_gpu_gate::gpu_suffix_declines_under_finite_authority(limit) {
+                return Ok(None);
+            }
+        }
+
         // Soundness gate (#vnncomp-gpu-crown-soundness): under the gate, route to
         // the SOUND seeded GPU-resident backward (certified) when the engine
         // provides it; otherwise fall back to the CPU sound suffix path.
-        let (gpu, use_sound) = match crate::sound_gpu_gate::gpu_crown_backward_route(engine) {
-            Some(route) => route,
-            None => return Ok(None),
-        };
+        let (gpu, use_sound) =
+            match crate::sound_gpu_gate::gpu_crown_backward_route_with_deadline(engine, deadline) {
+                Some(route) => route,
+                None => return Ok(None),
+            };
 
         // Negative cache: suffix extractability from this node is a property of
         // the graph structure, unchanged across alpha iterations. On
@@ -55,7 +89,7 @@ impl GraphNetwork {
         if alpha_state
             .gpu_suffix_ineligible
             .read()
-            .is_ok_and(|set| set.contains(node_name))
+            .is_ok_and(|set| set.contains(node_name) || set.contains(GPU_SUFFIX_RUNTIME_REFUSED))
         {
             return Ok(None);
         }
@@ -86,7 +120,7 @@ impl GraphNetwork {
                             node_bounds,
                             Some(alpha_state),
                             engine,
-                            None,
+                            deadline,
                             node_lb,
                         );
                     if matches!(resnet, Ok(None)) {
@@ -121,6 +155,9 @@ impl GraphNetwork {
         let gpu_result = match seeded {
             Ok(result) => result,
             Err(error) => {
+                if let Ok(mut set) = alpha_state.gpu_suffix_ineligible.write() {
+                    set.insert(GPU_SUFFIX_RUNTIME_REFUSED.to_string());
+                }
                 debug!(
                     node_name = node_name,
                     error = %error,
@@ -130,26 +167,26 @@ impl GraphNetwork {
             }
         };
 
-        // NaN check (Inf bounds are valid conservative bounds)
-        if gpu_result
-            .lower_bounds
-            .iter()
-            .chain(gpu_result.upper_bounds.iter())
-            .any(|v| v.is_nan())
-        {
+        // A device result is atomic. Shape, finiteness, and interval ordering
+        // must all validate before any endpoint can affect the host proof.
+        if !crate::sound_gpu_gate::gpu_crown_result_is_publishable(&gpu_result, seed.num_specs) {
+            if let Ok(mut set) = alpha_state.gpu_suffix_ineligible.write() {
+                set.insert(GPU_SUFFIX_RUNTIME_REFUSED.to_string());
+            }
             debug!(
                 node_name = node_name,
-                "Alpha-CROWN GPU suffix produced NaN; falling back to CPU backward"
+                "Alpha-CROWN GPU suffix produced malformed bounds; falling back to CPU backward"
             );
             return Ok(None);
         }
 
-        let lower = ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.lower_bounds)
-            .map_err(|e| NyError::InvalidSpec(format!("Alpha-CROWN GPU lower reshape: {e}")))?;
-        let upper = ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.upper_bounds)
-            .map_err(|e| NyError::InvalidSpec(format!("Alpha-CROWN GPU upper reshape: {e}")))?;
-        let bounds = BoundedTensor::new_repaired(lower, upper, RepairStrategy::Widen)?;
-        Ok(Some(bounds))
+        let (Ok(lower), Ok(upper)) = (
+            ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.lower_bounds),
+            ArrayD::from_shape_vec(IxDyn(&[seed.num_specs]), gpu_result.upper_bounds),
+        ) else {
+            return Ok(None);
+        };
+        Ok(BoundedTensor::new(lower, upper).ok())
     }
 
     /// Walk backward from `node_name` extracting GPU layers until NETWORK_INPUT.

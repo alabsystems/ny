@@ -12,6 +12,7 @@ mod shape_ops;
 #[cfg(test)]
 mod shape_ops_tests;
 mod slice;
+mod trilu;
 
 use crate::onnx_proto;
 use crate::WeightStore;
@@ -34,11 +35,10 @@ pub(super) fn try_fold_all_const_node(
     model_unbatched: bool,
 ) -> Option<FoldedTensor> {
     quantization::try_fold(node, weights)
-        .or_else(|| elementwise::try_fold(node, weights).map(FoldedTensor::from_float))
-        .or_else(|| reductions::try_fold(node, weights).map(FoldedTensor::from_float))
-        .or_else(|| {
-            constants::try_fold(node, weights, model_unbatched).map(FoldedTensor::from_float)
-        })
+        .or_else(|| trilu::try_fold(node, weights))
+        .or_else(|| elementwise::try_fold(node, weights))
+        .or_else(|| reductions::try_fold(node, weights))
+        .or_else(|| constants::try_fold(node, weights, model_unbatched))
         .or_else(|| range::try_fold(node, weights))
         .or_else(|| shape_ops::try_fold(node, weights, model_unbatched))
 }

@@ -91,6 +91,26 @@ impl LayerGammas {
         self.gammas.shape()[2]
     }
 
+    /// Return the lower/upper gamma matrices when the public tensor still
+    /// satisfies the `(2, constraints, neurons)` shape contract.
+    ///
+    /// `gammas` is public for optimizer integration, so callers can replace it
+    /// with an arbitrary `Array3`. Production backward paths use this checked
+    /// accessor and fail closed instead of indexing axis 0 at `1` and panicking
+    /// on malformed external state.
+    #[must_use]
+    pub fn checked_bound_gammas(
+        &self,
+    ) -> Option<(ndarray::ArrayView2<'_, f32>, ndarray::ArrayView2<'_, f32>)> {
+        if self.gammas.shape()[0] != 2 {
+            return None;
+        }
+        Some((
+            self.gammas.index_axis(ndarray::Axis(0), 0),
+            self.gammas.index_axis(ndarray::Axis(0), 1),
+        ))
+    }
+
     /// Get lower bound gammas for all constraints and neurons.
     /// Shape: `[num_constraints, num_neurons]`
     pub fn lower_gammas(&self) -> ndarray::ArrayView2<'_, f32> {

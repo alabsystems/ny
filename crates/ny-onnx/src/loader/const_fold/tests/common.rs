@@ -11,52 +11,36 @@ use crate::WeightStore;
 pub(super) fn attr_tensor(name: &str, tensor: TensorProto) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        f: 0.0,
-        i: 0,
-        s: Vec::new(),
         t: Some(tensor),
         r#type: attribute_type::TENSOR,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     }
 }
 
 pub(super) fn attr_ints(name: &str, values: &[i64]) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        f: 0.0,
-        i: 0,
-        s: Vec::new(),
-        t: None,
         r#type: attribute_type::INTS,
-        floats: Vec::new(),
         ints: values.to_vec(),
+        ..Default::default()
     }
 }
 
 pub(super) fn attr_float(name: &str, value: f32) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        f: value,
-        i: 0,
-        s: Vec::new(),
-        t: None,
+        f: Some(value),
         r#type: attribute_type::FLOAT,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     }
 }
 
 pub(super) fn attr_int(name: &str, value: i64) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        f: 0.0,
-        i: value,
-        s: Vec::new(),
-        t: None,
+        i: Some(value),
         r#type: attribute_type::INT,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     }
 }
 

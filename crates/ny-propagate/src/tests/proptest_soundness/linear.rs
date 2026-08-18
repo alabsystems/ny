@@ -129,8 +129,17 @@ fn directed_rounding_linear_crown_bias_2183() {
         .into_owned();
 
     let true_f64: f64 = (0..out_features).map(|_| 0.1_f32 as f64).sum();
-    let expected_lower = next_down_f32(true_f64 as f32);
-    let expected_upper = next_up_f32(true_f64 as f32);
+    let nearest = true_f64 as f32;
+    let expected_lower = if nearest as f64 <= true_f64 {
+        nearest
+    } else {
+        next_down_f32(nearest)
+    };
+    let expected_upper = if nearest as f64 >= true_f64 {
+        nearest
+    } else {
+        next_up_f32(nearest)
+    };
 
     let mut f32_sum = 0.0_f32;
     for _ in 0..out_features {
@@ -145,12 +154,12 @@ fn directed_rounding_linear_crown_bias_2183() {
     assert_eq!(
         result.lower_b[0].to_bits(),
         expected_lower.to_bits(),
-        "Linear lower_b must use next_down_f32 on f64 accumulation",
+        "Linear lower_b must be the tight directed f32 rounding of the f64 accumulation",
     );
     assert_eq!(
         result.upper_b[0].to_bits(),
         expected_upper.to_bits(),
-        "Linear upper_b must use next_up_f32 on f64 accumulation",
+        "Linear upper_b must be the tight directed f32 rounding of the f64 accumulation",
     );
     assert!(
         (result.lower_b[0] as f64) <= true_f64,

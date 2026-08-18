@@ -7,6 +7,11 @@
 use super::checked_bounds;
 use crate::bounds::BatchedLinearBounds;
 use ndarray::{array, ArrayD, IxDyn};
+use ny_core::NyError;
+use std::{
+    mem::size_of,
+    time::{Duration, Instant},
+};
 
 #[ntest::timeout(5000)]
 #[test]
@@ -592,6 +597,47 @@ fn test_batched_concretize_sound_scalar_fallback_cancellation_sound() {
     assert!(su[1].is_finite(), "row 1 upper is well-behaved (zero row)");
 }
 
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_exact_transport_sentinel_degrades_and_stays_sticky() {
+    use ny_core::CROWN_COEFF_MAX;
+
+    let sentinel = ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![CROWN_COEFF_MAX]).unwrap();
+    let zero_bias = ArrayD::zeros(IxDyn(&[1]));
+    let guarded = BatchedLinearBounds::new(
+        sentinel.clone(),
+        zero_bias.clone(),
+        sentinel,
+        zero_bias.clone(),
+        vec![1],
+        vec![1],
+    )
+    .expect("shape-valid sentinel test bound");
+    let input = checked_bounds(array![0.0_f32].into_dyn(), array![0.0_f32].into_dyn());
+    let concrete = guarded
+        .concretize_sound(&input)
+        .expect("sentinel concretization degrades instead of failing");
+    assert_eq!(concrete.lower()[[0]], f32::NEG_INFINITY);
+    assert_eq!(concrete.upper()[[0]], f32::INFINITY);
+
+    // Exact zero composition must not cancel the finite transport sentinel.
+    let zero_a = ArrayD::zeros(IxDyn(&[1, 1]));
+    let zero = BatchedLinearBounds::new(
+        zero_a.clone(),
+        zero_bias.clone(),
+        zero_a,
+        zero_bias,
+        vec![1],
+        vec![1],
+    )
+    .expect("zero outer bound");
+    let composed = guarded
+        .compose(&zero)
+        .expect("unsafe coefficient composition must conservatively degrade");
+    assert_eq!(composed.lower_a[[0, 0]], f32::NEG_INFINITY);
+    assert_eq!(composed.upper_a[[0, 0]], f32::INFINITY);
+}
+
 /// A ±Inf conservative guard coefficient (legal per `BatchedLinearBounds::new`,
 /// produced by `compose`) must degrade its bound direction to the sound
 /// saturating value on the scalar fallback. The pos/neg split would otherwise
@@ -658,4 +704,301 @@ fn test_batched_concretize_scalar_inf_guard_coefficient_degrades_row() {
         sl2.is_finite() && sl2 <= -2.0,
         "lower must stay sound: {sl2}"
     );
+}
+
+fn live_batched_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
+}
+
+fn assert_same_endpoint_bits(expected: &ArrayD<f32>, actual: &ArrayD<f32>) {
+    assert_eq!(expected.shape(), actual.shape());
+    for (&expected, &actual) in expected.iter().zip(actual) {
+        assert_eq!(
+            expected.to_bits(),
+            actual.to_bits(),
+            "endpoint mismatch: expected {expected:e}, actual {actual:e}"
+        );
+    }
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_memory_bytes_and_finite_deadline_live_parity() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let bounds = BatchedLinearBounds::identity(&[2, 3]).expect("batched identity");
+    assert_eq!(
+        bounds.memory_bytes(),
+        48 * size_of::<f32>() + 4 * size_of::<usize>()
+    );
+    let input = checked_bounds(
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![-2.0, -1.0, 0.5, 2.0, 3.0, 4.0]).unwrap(),
+    );
+    let legacy = bounds.concretize_sound(&input).expect("legacy concretize");
+    let no_deadline = bounds
+        .concretize_sound_with_deadline(&input, None)
+        .expect("no-deadline wrapper");
+    assert_same_endpoint_bits(legacy.lower(), no_deadline.lower());
+    assert_same_endpoint_bits(legacy.upper(), no_deadline.upper());
+    let finite = bounds
+        .concretize_sound_with_deadline(&input, Some(live_batched_deadline()))
+        .expect("finite-deadline concretize");
+    assert_same_endpoint_bits(legacy.lower(), finite.lower());
+    assert_same_endpoint_bits(legacy.upper(), finite.upper());
+
+    let mut with_error = bounds;
+    with_error.set_coeff_err(
+        ArrayD::zeros(IxDyn(&[2, 3, 3])),
+        ArrayD::zeros(IxDyn(&[2, 3, 3])),
+    );
+    assert_eq!(
+        with_error.memory_bytes(),
+        84 * size_of::<f32>() + 4 * size_of::<usize>()
+    );
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_finite_deadline_broadcast_and_flat_attention_parity() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let broadcast_a =
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, 0.0, 0.0, 0.0, -1.0, 0.5]).unwrap();
+    let broadcast_b = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.25, 0.75]).unwrap();
+    let broadcast = BatchedLinearBounds::new(
+        broadcast_a.clone(),
+        broadcast_b.clone(),
+        broadcast_a,
+        broadcast_b,
+        vec![2, 3],
+        vec![2, 2],
+    )
+    .unwrap();
+    let input = checked_bounds(
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![-2.0, 1.0, 2.0, 3.0, -4.0, 5.0]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![-1.0, 2.0, 3.0, 4.0, -3.0, 6.0]).unwrap(),
+    );
+    let broadcast_legacy = broadcast.concretize_sound(&input).unwrap();
+    let broadcast_finite = broadcast
+        .concretize_sound_with_deadline(&input, Some(live_batched_deadline()))
+        .unwrap();
+    assert_eq!(broadcast_finite.shape(), &[2, 2]);
+    for (&legacy, &finite) in broadcast_legacy
+        .lower()
+        .iter()
+        .zip(broadcast_finite.lower())
+    {
+        assert!(
+            finite <= legacy,
+            "finite lower {finite:e} must enclose legacy {legacy:e}"
+        );
+    }
+    for (&legacy, &finite) in broadcast_legacy
+        .upper()
+        .iter()
+        .zip(broadcast_finite.upper())
+    {
+        assert!(
+            finite >= legacy,
+            "finite upper {finite:e} must enclose legacy {legacy:e}"
+        );
+    }
+
+    let flat_a = ArrayD::from_shape_vec(
+        IxDyn(&[2, 6]),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+    )
+    .unwrap();
+    let flat_b = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0, 1.0]).unwrap();
+    let flat = BatchedLinearBounds::new(
+        flat_a.clone(),
+        flat_b.clone(),
+        flat_a,
+        flat_b,
+        vec![2, 3],
+        vec![2],
+    )
+    .unwrap();
+    let flat_legacy = flat.concretize_sound(&input).unwrap();
+    let flat_finite = flat
+        .concretize_sound_with_deadline(&input, Some(live_batched_deadline()))
+        .unwrap();
+    assert_eq!(flat_finite.shape(), &[2]);
+    for (&legacy, &finite) in flat_legacy.lower().iter().zip(flat_finite.lower()) {
+        assert!(
+            finite <= legacy,
+            "finite lower {finite:e} must enclose legacy {legacy:e}"
+        );
+    }
+    for (&legacy, &finite) in flat_legacy.upper().iter().zip(flat_finite.upper()) {
+        assert!(
+            finite >= legacy,
+            "finite upper {finite:e} must enclose legacy {legacy:e}"
+        );
+    }
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_finite_deadline_carries_coefficient_error_and_normalizes_endpoints() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let a = ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0]).unwrap();
+    let b = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap();
+    let mut bounds =
+        BatchedLinearBounds::new(a.clone(), b.clone(), a, b, vec![1], vec![1]).unwrap();
+    let input = checked_bounds(array![-2.0_f32].into_dyn(), array![3.0_f32].into_dyn());
+    let exact = bounds
+        .concretize_sound_with_deadline(&input, Some(live_batched_deadline()))
+        .unwrap();
+    bounds.set_coeff_err(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![0.25]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![0.25]).unwrap(),
+    );
+    let carried = bounds
+        .concretize_sound_with_deadline(&input, Some(live_batched_deadline()))
+        .unwrap();
+    assert!(carried.lower()[[0]] < exact.lower()[[0]]);
+    assert!(carried.upper()[[0]] > exact.upper()[[0]]);
+    assert!(carried.lower()[[0]] <= -2.5);
+    assert!(carried.upper()[[0]] >= 3.75);
+
+    let tiny = f32::from_bits(1);
+    let tiny_a = ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![-tiny]).unwrap();
+    let zero_b = ArrayD::zeros(IxDyn(&[1]));
+    let tiny_bounds = BatchedLinearBounds::new(
+        tiny_a.clone(),
+        zero_b.clone(),
+        tiny_a,
+        zero_b,
+        vec![1],
+        vec![1],
+    )
+    .unwrap();
+    let point = checked_bounds(array![1.0_f32].into_dyn(), array![1.0_f32].into_dyn());
+    let published = tiny_bounds
+        .concretize_sound_with_deadline(&point, Some(live_batched_deadline()))
+        .unwrap();
+    for &value in published.lower().iter().chain(published.upper()) {
+        let magnitude = value.to_bits() & 0x7fff_ffff;
+        assert!(
+            magnitude == 0 || magnitude >= f32::MIN_POSITIVE.to_bits(),
+            "finite-authority endpoint must be zero, normal, or infinite: {value:e}"
+        );
+    }
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_finite_deadline_is_atomic_when_expired_or_refused_mid_reduction() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let bounds = BatchedLinearBounds::identity(&[1, 8]).unwrap();
+    let input = checked_bounds(
+        ArrayD::from_shape_vec(IxDyn(&[1, 8]), vec![-1.0; 8]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[1, 8]), vec![1.0; 8]).unwrap(),
+    );
+    let source_lower = bounds.lower_a.clone();
+    let source_upper = bounds.upper_a.clone();
+    let input_lower = input.lower().clone();
+    let input_upper = input.upper().clone();
+
+    let expired = bounds
+        .concretize_sound_with_deadline(&input, Some(Instant::now()))
+        .expect_err("already-expired deadline must be terminal");
+    assert!(matches!(expired, NyError::DeadlineExceeded(_)));
+
+    let midwork = bounds
+        .concretize_sound_with_forced_deadline_for_test(
+            &input,
+            "during batched finite lower reduction",
+        )
+        .expect_err("forced reduction deadline must be terminal");
+    match midwork {
+        NyError::DeadlineExceeded(message) => {
+            assert!(message.contains("during batched finite lower reduction"));
+        }
+        error => panic!("expected DeadlineExceeded, got {error:?}"),
+    }
+    assert_eq!(bounds.lower_a, source_lower);
+    assert_eq!(bounds.upper_a, source_upper);
+    assert_eq!(input.lower(), &input_lower);
+    assert_eq!(input.upper(), &input_upper);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_finite_deadline_total_live_budget_exact_and_minus_one() {
+    let bounds = BatchedLinearBounds::identity(&[1, 4]).unwrap();
+    let input = checked_bounds(
+        ArrayD::from_shape_vec(IxDyn(&[1, 4]), vec![-1.0; 4]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[1, 4]), vec![1.0; 4]).unwrap(),
+    );
+    let required = bounds
+        .finite_concretize_required_bytes_for_test(&input)
+        .expect("valid finite plan");
+    bounds
+        .concretize_sound_with_budget_for_test(&input, live_batched_deadline(), required)
+        .expect("exact total-live budget must be admitted");
+    let error = bounds
+        .concretize_sound_with_budget_for_test(&input, live_batched_deadline(), required - 1)
+        .expect_err("budget-minus-one must refuse before allocation");
+    assert!(matches!(
+        error,
+        NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+            site: "batched finite concretization",
+        } if required_bytes == required && budget_bytes == required - 1
+    ));
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_finite_deadline_polls_final_validation_atomically() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let bounds = BatchedLinearBounds::identity(&[1, 4]).unwrap();
+    let input = checked_bounds(
+        ArrayD::from_shape_vec(IxDyn(&[1, 4]), vec![-1.0; 4]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[1, 4]), vec![1.0; 4]).unwrap(),
+    );
+    let source = bounds.lower_a.clone();
+    let error = bounds
+        .concretize_sound_with_forced_deadline_for_test(
+            &input,
+            "during batched bounded-tensor validation",
+        )
+        .expect_err("final validation refusal must remain terminal");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+    assert_eq!(bounds.lower_a, source);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn test_batched_finite_deadline_accepts_vector_like_input_reshape() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let bounds = BatchedLinearBounds::identity(&[1, 4]).unwrap();
+    let input = checked_bounds(
+        ArrayD::from_shape_vec(IxDyn(&[4]), vec![-3.0, -2.0, -1.0, 0.0]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[4]), vec![-2.0, -1.0, 0.0, 1.0]).unwrap(),
+    );
+    let finite = bounds
+        .concretize_sound_with_deadline(&input, Some(live_batched_deadline()))
+        .unwrap();
+    assert_eq!(finite.shape(), &[1, 4]);
+    for ((&actual_lower, &actual_upper), (&exact_lower, &exact_upper)) in finite
+        .lower()
+        .iter()
+        .zip(finite.upper())
+        .zip(input.lower().iter().zip(input.upper()))
+    {
+        assert!(
+            actual_lower <= exact_lower && actual_upper >= exact_upper,
+            "finite identity publication [{actual_lower:e}, {actual_upper:e}] must enclose the exact reshaped input [{exact_lower:e}, {exact_upper:e}]"
+        );
+        for endpoint in [actual_lower, actual_upper] {
+            let magnitude = endpoint.to_bits() & 0x7fff_ffff;
+            assert!(
+                magnitude == 0 || magnitude >= f32::MIN_POSITIVE.to_bits(),
+                "finite-authority endpoint must be zero, normal, or infinite: {endpoint:e}"
+            );
+        }
+    }
 }

@@ -571,11 +571,11 @@ fn test_collect_forward_linear_bounds_dag_seeds_transpose_input_shape() {
 /// hazard.
 #[test]
 fn forward_linear_cache_hit_miss_invalidate_clone() {
-    // Serialized + gate pinned: the cache key is salted with the dark
+    // Serialized + gate pinned: the cache key is salted with the
     // ConvTranspose surface gate, so an unsynchronized mid-test env flip (a
     // concurrent gate-mutating test) would break the Arc-identity assertions.
     crate::tests::with_serialized_env_vars(
-        &[("NY_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "0")],
+        &[("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "1")],
         forward_linear_cache_hit_miss_invalidate_clone_body,
     );
 }
@@ -642,7 +642,7 @@ fn forward_linear_cache_hit_miss_invalidate_clone_body() {
 fn forward_linear_cold_build_admission_preserves_cached_hits() {
     // Serialized + gate pinned: see forward_linear_cache_hit_miss_invalidate_clone.
     crate::tests::with_serialized_env_vars(
-        &[("NY_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "0")],
+        &[("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "1")],
         forward_linear_cold_build_admission_preserves_cached_hits_body,
     );
 }
@@ -788,4 +788,343 @@ fn run_with_linear_bypasses_root_candidates_on_conv_dag_w5() {
         "#w5: run_with_linear must produce the input LinearBounds — the bounds-only \
          root candidates must not intercept linear-extraction requests"
     );
+}
+
+/// #forward-linear-cost-gate: the cache fingerprint must carry the f32
+/// value-GEMM seam byte — a seam-on-built map holds different numeric values
+/// than a seam-off one, so serving across seam modes in-process would be a
+/// stale-cache soundness hazard for the tighter direction and a silent
+/// looseness for the other.
+#[test]
+fn forward_linear_fingerprint_distinguishes_f32_seam() {
+    let (_, input) = build_forward_linear_fixture();
+    let seam_off = forward_linear_cache_fingerprint(&input, None, true, false);
+    let seam_on = forward_linear_cache_fingerprint(&input, None, true, true);
+    assert!(
+        !seam_off.exact_match(&seam_on),
+        "identical input with a different f32-seam state must be a cache miss"
+    );
+    let seam_off_again = forward_linear_cache_fingerprint(&input, None, true, false);
+    assert!(
+        seam_off.exact_match(&seam_off_again),
+        "identical request identity must still match exactly"
+    );
+}
+
+/// #forward-linear-cost-gate: the startup micro-calibration returns a usable
+/// positive rate and the per-process cache serves the second call.
+///
+/// The env override is removed (serialized) so this deterministically
+/// exercises the probe/fallback path; either source is legitimate here (a
+/// heavily loaded debug host may hit the probe's 5 s rep deadline and fall
+/// back — the fallback constant is also positive and cached).
+#[ntest::timeout(120000)]
+#[test]
+fn forward_linear_rate_calibration_is_positive_and_cached() {
+    crate::tests::with_serialized_env_vars_removed(&["NY_FORWARD_LINEAR_MACS_PER_SEC"], || {
+        let first = forward_linear_rate_calibration(None);
+        assert!(
+            first.macs_per_sec > 0,
+            "calibrated rate must be positive (source={})",
+            first.source
+        );
+        assert!(
+            matches!(first.source, "probe" | "fallback"),
+            "with the env override removed the source must be probe or fallback, got {}",
+            first.source
+        );
+        if first.source == "probe" {
+            assert!(
+                first.probe_macs > 0,
+                "probe source must report its workload"
+            );
+            assert!(
+                first.probe_secs > 0.0,
+                "probe source must report its duration"
+            );
+        }
+        let started = Instant::now();
+        let second = forward_linear_rate_calibration(None);
+        assert_eq!(
+            first.macs_per_sec, second.macs_per_sec,
+            "second calibration must be served from the per-process cache"
+        );
+        assert_eq!(first.source, second.source);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cached calibration must not re-run the probe"
+        );
+    });
+}
+
+/// #forward-linear-cost-gate: the manual escape hatch keeps absolute
+/// precedence — `NY_FORWARD_LINEAR_MACS_PER_SEC` bypasses the probe entirely
+/// and is reported as source "env".
+#[test]
+fn forward_linear_rate_env_override_takes_precedence() {
+    crate::tests::with_serialized_env_vars(
+        &[("NY_FORWARD_LINEAR_MACS_PER_SEC", "123000000000")],
+        || {
+            let calibration = forward_linear_rate_calibration(None);
+            assert_eq!(calibration.source, "env");
+            assert_eq!(calibration.macs_per_sec, 123_000_000_000);
+            assert_eq!(calibration.probe_macs, 0);
+        },
+    );
+}
+
+/// #forward-linear-cost-gate (I7): a cost-gate refusal must carry the
+/// measured rate, seam mode, and rate provenance in its message, and the
+/// admission record must mirror the decision for the flight recorder.
+///
+/// The graph is sized so that NO realistic calibrated rate admits it inside
+/// the deadline (8 convs x 256 channels over 32x32 = ~29.7 T f64 MACs; even
+/// 1 TMAC/s predicts ~30 s x5/4 > the ~31 s remaining), so the refusal is
+/// deterministic while the rate itself is whatever this host measures.
+#[ntest::timeout(300000)]
+#[test]
+fn forward_linear_refusal_message_carries_measured_rate() {
+    crate::tests::with_serialized_env_vars_removed(&["NY_FORWARD_LINEAR_MACS_PER_SEC"], || {
+        let mut graph = GraphNetwork::new();
+        let mut prev: Option<String> = None;
+        for i in 0..8 {
+            let name = format!("conv{i}");
+            let kernel_len = 256 * 256 * 9;
+            let kernel = ArrayD::from_shape_vec(
+                IxDyn(&[256, 256, 3, 3]),
+                (0..kernel_len)
+                    .map(|j| ((j % 5) as f32 - 2.0) / 50.0)
+                    .collect(),
+            )
+            .expect("kernel shape");
+            let conv = crate::layers::Conv2dLayer::with_input_shape(
+                kernel,
+                Some(Array1::zeros(256)),
+                (1, 1),
+                (1, 1),
+                32,
+                32,
+            )
+            .expect("valid conv");
+            let node = match prev {
+                None => GraphNode::from_input(&name, Layer::Conv2d(conv)),
+                Some(p) => GraphNode::new(&name, Layer::Conv2d(conv), vec![p]),
+            };
+            graph.add_node(node);
+            prev = Some(name);
+        }
+        graph.set_output(&prev.expect("at least one conv"));
+
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[3, 32, 32]), -0.01f32),
+            ArrayD::from_elem(IxDyn(&[3, 32, 32]), 0.01f32),
+        )
+        .expect("input bounds");
+        let macs = graph
+            .forward_linear_cold_build_macs(input.len())
+            .expect("estimable conv graph");
+        assert!(
+            macs > 10_000_000_000_000,
+            "fixture must be too big for any realistic rate, got {macs} MACs"
+        );
+
+        // Just above the 30 s floor so the refusal comes from the COST
+        // gate (which consults the calibrated rate), not the floor.
+        let deadline = Instant::now() + std::time::Duration::from_secs(31);
+        let error = graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, Some(deadline))
+            .expect_err("a ~30 TMAC build must be refused at ~31 s remaining");
+        let NyError::DeadlineExceeded(message) = &error else {
+            panic!("cost-gate refusal must be DeadlineExceeded, got {error:?}");
+        };
+        assert!(
+            message.contains("MAC/s"),
+            "refusal must carry the calibrated rate: {message}"
+        );
+        assert!(
+            message.contains("seam="),
+            "refusal must carry the seam mode: {message}"
+        );
+        assert!(
+            message.contains("rate source="),
+            "refusal must carry the rate provenance: {message}"
+        );
+
+        // I7: the admission record mirrors the refusal.
+        let record = forward_linear_admission_record()
+            .expect("a considered cold build must leave an admission record");
+        if record.build_macs == u64::try_from(macs).unwrap_or(u64::MAX) {
+            assert!(!record.admitted, "the record must mirror the refusal");
+            assert!(record.macs_per_sec > 0);
+            assert!(
+                matches!(record.rate_source, "probe" | "fallback"),
+                "env was removed, got {}",
+                record.rate_source
+            );
+            assert!(record.predicted_secs > record.remaining_secs);
+        }
+    });
+}
+
+/// ADVERSARIAL VERIFY (#forward-linear-cost-gate): over-admission damage
+/// bound. Force the gate to lie fast (absurdly optimistic env rate), admit a
+/// build that is hundreds of GMACs (hours in a debug binary), and confirm the
+/// MID-BUILD deadline abort fires: typed `DeadlineExceeded`, wall time equal
+/// to the deadline plus at most poll-granularity overshoot, and the admission
+/// record honestly says the gate admitted on the "env" rate.
+#[ntest::timeout(240000)]
+#[test]
+fn adv_over_admission_is_bounded_by_mid_build_deadline_abort() {
+    crate::tests::with_serialized_env_vars(
+        &[("NY_FORWARD_LINEAR_MACS_PER_SEC", "1000000000000000")],
+        || {
+            // 6 convs x 32 channels over 32x32: ~296 G f64 MACs total, but the
+            // coefficient state (32768 x 3072 = 100.6M entries) stays under the
+            // 2^27 dense memory cap, so the build really starts GEMMs.
+            let mut graph = GraphNetwork::new();
+            let mut prev: Option<String> = None;
+            for i in 0..6 {
+                let name = format!("conv{i}");
+                let in_c = if i == 0 { 3 } else { 32 };
+                let kernel_len = 32 * in_c * 9;
+                let kernel = ArrayD::from_shape_vec(
+                    IxDyn(&[32, in_c, 3, 3]),
+                    (0..kernel_len)
+                        .map(|j| ((j % 5) as f32 - 2.0) / 50.0)
+                        .collect(),
+                )
+                .expect("kernel shape");
+                let conv = crate::layers::Conv2dLayer::with_input_shape(
+                    kernel,
+                    Some(Array1::zeros(32)),
+                    (1, 1),
+                    (1, 1),
+                    32,
+                    32,
+                )
+                .expect("valid conv");
+                let node = match prev {
+                    None => GraphNode::from_input(&name, Layer::Conv2d(conv)),
+                    Some(p) => GraphNode::new(&name, Layer::Conv2d(conv), vec![p]),
+                };
+                graph.add_node(node);
+                prev = Some(name);
+            }
+            graph.set_output(&prev.expect("at least one conv"));
+            let input = BoundedTensor::new(
+                ArrayD::from_elem(IxDyn(&[3, 32, 32]), -0.01f32),
+                ArrayD::from_elem(IxDyn(&[3, 32, 32]), 0.01f32),
+            )
+            .expect("input bounds");
+            let macs = graph
+                .forward_linear_cold_build_macs(input.len())
+                .expect("estimable conv graph");
+            assert!(
+                macs > 100_000_000_000,
+                "fixture must be far too big to finish in 32 s of debug-mode wall, got {macs}"
+            );
+
+            const DEADLINE_SECS: u64 = 32;
+            let started = Instant::now();
+            let deadline = started + std::time::Duration::from_secs(DEADLINE_SECS);
+            let error = graph
+                .collect_forward_linear_bounds_dag_cached(&input, None, Some(deadline))
+                .expect_err("a lied-into build must still be stopped mid-flight");
+            let wall = started.elapsed();
+
+            // Typed abort, not a panic, not a silent Ok.
+            let NyError::DeadlineExceeded(message) = &error else {
+                panic!("mid-build abort must be DeadlineExceeded, got {error:?}");
+            };
+            // It must be the MID-BUILD abort, not the up-front cost refusal.
+            assert!(
+                !message.contains("cold build needs"),
+                "the absurd env rate must have ADMITTED the build; got refusal: {message}"
+            );
+
+            // The gate really admitted on the fake rate (over-admission staged).
+            let record = forward_linear_admission_record()
+                .expect("an admitted cold build must leave an admission record");
+            if record.build_macs == u64::try_from(macs).unwrap_or(u64::MAX) {
+                assert!(record.admitted, "the fake env rate must have admitted");
+                assert_eq!(record.rate_source, "env");
+            }
+
+            // Damage bound: the build ran essentially to the deadline (it was
+            // admitted, and the work was unbounded)...
+            assert!(
+                wall >= std::time::Duration::from_secs(DEADLINE_SECS - 3),
+                "build should have run to the deadline; aborted after {wall:?} ({message})"
+            );
+            // ...and the overshoot past the deadline is bounded by the poll
+            // granularity (per exec-node + per 2^26-MAC GEMM tile), not by the
+            // remaining hours of admitted work.
+            let overshoot = wall.saturating_sub(std::time::Duration::from_secs(DEADLINE_SECS));
+            eprintln!(
+                "MEASURED over-admission abort: wall={:.3}s overshoot={:.3}s message={}",
+                wall.as_secs_f64(),
+                overshoot.as_secs_f64(),
+                message
+            );
+            assert!(
+                overshoot < std::time::Duration::from_secs(30),
+                "mid-build abort overshoot {overshoot:?} exceeds any claimed poll granularity"
+            );
+        },
+    );
+}
+
+/// ADVERSARIAL VERIFY (#forward-linear-cost-gate): deadline-free callers pay
+/// NOTHING for the gate — no probe, no admission record for this build. This
+/// is the flag-unset / no-cap parity surface: offline and test callers keep
+/// HEAD behavior byte-identical.
+#[test]
+fn adv_deadline_free_build_never_consults_the_gate() {
+    crate::tests::with_serialized_env_vars_removed(&["NY_FORWARD_LINEAR_MACS_PER_SEC"], || {
+        // Distinctive geometry so this build's MAC count cannot collide
+        // with any other test's admission record in the same process.
+        let kernel = ArrayD::from_shape_vec(
+            IxDyn(&[5, 3, 3, 3]),
+            (0..5 * 3 * 9)
+                .map(|j| ((j % 3) as f32 - 1.0) / 8.0)
+                .collect(),
+        )
+        .expect("kernel shape");
+        let conv = crate::layers::Conv2dLayer::with_input_shape(
+            kernel,
+            Some(Array1::zeros(5)),
+            (1, 1),
+            (1, 1),
+            7,
+            7,
+        )
+        .expect("valid conv");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("adv_solo_conv", Layer::Conv2d(conv)));
+        graph.set_output("adv_solo_conv");
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[3, 7, 7]), -0.02f32),
+            ArrayD::from_elem(IxDyn(&[3, 7, 7]), 0.02f32),
+        )
+        .expect("input bounds");
+        let macs = graph
+            .forward_linear_cold_build_macs(input.len())
+            .expect("estimable conv graph");
+
+        graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, None)
+            .expect("deadline-free small build must succeed");
+
+        // No admission record may have been minted FOR THIS BUILD. (The
+        // record is process-global, so other tests may legitimately have
+        // written records for THEIR builds; the distinctive MAC count is
+        // the race-safe discriminator.)
+        let this_macs = u64::try_from(macs).unwrap_or(u64::MAX);
+        if let Some(record) = forward_linear_admission_record() {
+            assert_ne!(
+                record.build_macs, this_macs,
+                "a deadline-free build must never be gated or recorded"
+            );
+        }
+    });
 }

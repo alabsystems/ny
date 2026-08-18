@@ -5,12 +5,14 @@
 #![cfg(unix)]
 
 use ny_test_utils::workspace_root;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
+use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 
 fn copy_build_script(temp_repo: &Path) -> PathBuf {
@@ -23,7 +25,30 @@ fn copy_build_script(temp_repo: &Path) -> PathBuf {
     // install_tool.sh relies on. Re-adding the exec bit here would let these
     // tests pass against a committed non-executable script.
     fs::copy(&script_source, &script_target).expect("failed to copy build_submission_binary.sh");
+    fs::copy(
+        workspace_root().join("vnncomp_scripts/submission_binary_receipt.sh"),
+        temp_repo.join("vnncomp_scripts/submission_binary_receipt.sh"),
+    )
+    .expect("failed to copy submission_binary_receipt.sh");
     script_target
+}
+
+fn write_archive_source_marker(temp_repo: &Path) {
+    let lock_path = temp_repo.join("Cargo.lock");
+    if !lock_path.is_file() {
+        fs::write(&lock_path, "version = 4\n").expect("failed to write fixture Cargo.lock");
+    }
+    let lock = fs::read(&lock_path).expect("failed to read fixture Cargo.lock");
+    let lock_sha256 = format!("{:x}", Sha256::digest(lock));
+    fs::write(
+        temp_repo.join(".ny-vnncomp-source.txt"),
+        format!(
+            "schema=ny-vnncomp-source-v1\n\
+             ny_commit=0123456789abcdef0123456789abcdef01234567\n\
+             cargo_lock_sha256={lock_sha256}\n"
+        ),
+    )
+    .expect("failed to write fixture archive source marker");
 }
 
 // `${...}` below is intentional shell parameter expansion in a raw fixture.
@@ -46,6 +71,7 @@ printf '%s\n' "$@" > "$PWD/cargo-args.txt"
     printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS:-}"
     printf 'CARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR:-}"
     printf 'CARGO_BUILD_TARGET_DIR=%s\n' "${CARGO_BUILD_TARGET_DIR:-}"
+    printf 'CARGO_BUILD_JOBS=%s\n' "${CARGO_BUILD_JOBS:-}"
 } > "$PWD/cargo-env.txt"
 : "${CARGO_TARGET_DIR:?build script must select an explicit Cargo target directory}"
 artifact_relative="${FAKE_CARGO_ARTIFACT_RELATIVE:-release/ny}"
@@ -125,48 +151,26 @@ esac
     fake_cargo
 }
 
-fn write_relocated_openssl_bundle(temp_repo: &Path) -> PathBuf {
-    let output = Command::new("cc")
-        .arg("-dumpmachine")
-        .output()
-        .expect("failed to query compiler target");
-    assert_success(&output, "cc -dumpmachine");
-    let compiler_triple = String::from_utf8(output.stdout)
-        .expect("compiler target should be UTF-8")
-        .trim()
-        .to_owned();
-    assert!(
-        !compiler_triple.is_empty(),
-        "compiler target must be non-empty"
-    );
-
-    let bundle = temp_repo.join("home/.local/opt/libssl-dev");
-    let include_dir = bundle.join("usr/include/openssl");
-    let arch_include_dir = bundle
-        .join("usr/include")
-        .join(&compiler_triple)
-        .join("openssl");
-    let lib_dir = bundle.join("usr/lib").join(compiler_triple);
-    fs::create_dir_all(&include_dir).expect("failed to create fake OpenSSL include directory");
-    fs::create_dir_all(&arch_include_dir)
-        .expect("failed to create fake architecture OpenSSL include directory");
-    fs::create_dir_all(&lib_dir).expect("failed to create fake OpenSSL library directory");
-    fs::write(include_dir.join("ssl.h"), "/* fake relocated OpenSSL */\n")
-        .expect("failed to write fake OpenSSL header");
-    fs::write(
-        arch_include_dir.join("opensslconf.h"),
-        "/* fake relocated OpenSSL configuration */\n",
-    )
-    .expect("failed to write fake OpenSSL configuration header");
-    fs::write(lib_dir.join("libssl.a"), []).expect("failed to write fake libssl");
-    fs::write(lib_dir.join("libcrypto.a"), []).expect("failed to write fake libcrypto");
-    bundle
-}
-
 fn write_failing_pkg_config(temp_repo: &Path) {
     let fake_pkg_config = temp_repo.join("bin/pkg-config");
-    fs::write(&fake_pkg_config, "#!/bin/bash\nexit 1\n").expect("failed to write fake pkg-config");
+    fs::write(
+        &fake_pkg_config,
+        "#!/bin/bash\n: > \"$PWD/pkg-config-invoked\"\nexit 1\n",
+    )
+    .expect("failed to write fake pkg-config");
     make_executable(&fake_pkg_config);
+}
+
+fn write_forbidden_package_manager_shims(temp_repo: &Path) {
+    for tool in ["apt-get", "dnf", "sudo"] {
+        let shim = temp_repo.join("bin").join(tool);
+        fs::write(
+            &shim,
+            format!("#!/bin/bash\n: > \"$PWD/{tool}-invoked\"\nexit 91\n"),
+        )
+        .unwrap_or_else(|err| panic!("failed to write fake {tool}: {err}"));
+        make_executable(&shim);
+    }
 }
 
 fn make_executable(path: &Path) {
@@ -181,9 +185,10 @@ fn make_executable(path: &Path) {
 fn fake_repo() -> (TempDir, PathBuf) {
     let temp_repo = tempdir().expect("failed to create temp repo");
     let script = copy_build_script(temp_repo.path());
+    write_archive_source_marker(temp_repo.path());
     write_fake_cargo(temp_repo.path());
     write_failing_pkg_config(temp_repo.path());
-    write_relocated_openssl_bundle(temp_repo.path());
+    write_forbidden_package_manager_shims(temp_repo.path());
     (temp_repo, script)
 }
 
@@ -225,6 +230,7 @@ fn real_cargo_repo() -> (TempDir, PathBuf) {
         .output()
         .expect("failed to generate tiny Cargo.lock");
     assert_success(&lock, "tiny cargo generate-lockfile");
+    write_archive_source_marker(temp_repo.path());
     (temp_repo, script)
 }
 
@@ -386,9 +392,9 @@ fn run_build_script_with_scenario(
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR");
     if let Some(rustup_home) = inherited_rustup_home {
-        // HOME is intentionally replaced so OpenSSL relocation is tested in
-        // the fixture.  Keep rustup's real toolchain root so `rustc -vV`
-        // still reports a host and the fp16 assertions are not vacuous.
+        // HOME is intentionally replaced for fixture isolation. Keep rustup's
+        // real toolchain root so `rustc -vV` still reports a host and the fp16
+        // assertions are not vacuous.
         command.env("RUSTUP_HOME", rustup_home);
     }
 
@@ -429,9 +435,7 @@ fn run_build_script_with_scenario(
         command.env("CARGO_BUILD_TARGET_DIR", target_dir);
     }
 
-    command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run {}: {err}", script.display()))
+    output_retrying_transient_text_file_busy(&mut command, script)
 }
 
 fn run_real_build_script(script: &Path, temp_repo: &Path, build_target: Option<&str>) -> Output {
@@ -443,7 +447,7 @@ fn run_real_build_script(script: &Path, temp_repo: &Path, build_target: Option<&
         .current_dir(temp_repo)
         .env("HOME", temp_repo.join("home"))
         .env("CARGO_HOME", temp_repo.join("home/.cargo"))
-        .env("OPENSSL_DIR", temp_repo.join("explicit-openssl"))
+        .env_remove("OPENSSL_DIR")
         .env_remove("OPENSSL_LIB_DIR")
         .env_remove("OPENSSL_INCLUDE_DIR")
         .env_remove("CFLAGS")
@@ -464,9 +468,29 @@ fn run_real_build_script(script: &Path, temp_repo: &Path, build_target: Option<&
     } else {
         command.env_remove("CARGO_BUILD_TARGET");
     }
-    command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run real Cargo via {}: {err}", script.display()))
+    output_retrying_transient_text_file_busy(&mut command, script)
+}
+
+fn output_retrying_transient_text_file_busy(command: &mut Command, script: &Path) -> Output {
+    // These tests deliberately preserve and exercise the script's direct-exec
+    // contract. On Linux, many concurrent copies into tmpfs can briefly make a
+    // just-closed executable report ETXTBSY. Retrying that one transient spawn
+    // error retains direct execution while keeping the parallel suite stable.
+    const MAX_ATTEMPTS: u32 = 8;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match command.output() {
+            Ok(output) => return output,
+            Err(err)
+                if err.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error())
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                thread::sleep(Duration::from_millis(1_u64 << attempt.min(5)));
+            }
+            Err(err) => panic!("failed to run {}: {err}", script.display()),
+        }
+    }
+    unreachable!("the bounded spawn loop always returns or panics")
 }
 
 fn assert_success(output: &Output, context: &str) {
@@ -476,6 +500,16 @@ fn assert_success(output: &Output, context: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn validate_receipt(temp_repo: &Path, binary: &Path) -> Output {
+    Command::new("bash")
+        .arg(temp_repo.join("vnncomp_scripts/submission_binary_receipt.sh"))
+        .arg("validate")
+        .arg(binary)
+        .arg(temp_repo)
+        .output()
+        .expect("failed to run receipt validator")
 }
 
 fn assert_full_tier_uses_private_staging(cargo_args: &str, expected_parent: &Path) -> PathBuf {
@@ -531,6 +565,7 @@ fn test_committed_harness_scripts_are_executable() {
         "vnncomp_scripts/build_submission_binary.sh",
         "vnncomp_scripts/prepare_instance.sh",
         "vnncomp_scripts/run_instance.sh",
+        "vnncomp_scripts/submission_binary_receipt.sh",
     ] {
         let path = workspace_root().join(script);
         let mode = fs::metadata(&path)
@@ -542,6 +577,15 @@ fn test_committed_harness_scripts_are_executable() {
             "{script} must be executable (mode {mode:o}): the harness execs it directly"
         );
     }
+
+    let cargo_config = fs::read_to_string(workspace_root().join(".cargo/config.toml"))
+        .expect("read repository Cargo config");
+    assert!(
+        !cargo_config
+            .lines()
+            .any(|line| line.trim_start().starts_with("jobs")),
+        "a developer host's build-job cap must not throttle every checkout"
+    );
 }
 
 #[test]
@@ -553,6 +597,15 @@ fn test_build_submission_binary_copies_root_release_binary() {
 
     let cargo_args = fs::read_to_string(temp_repo.path().join("cargo-args.txt"))
         .expect("failed to read fake cargo args");
+    let cargo_env = fs::read_to_string(temp_repo.path().join("cargo-env.txt"))
+        .expect("failed to read fake cargo environment");
+    let jobs = cargo_env
+        .lines()
+        .find_map(|line| line.strip_prefix("CARGO_BUILD_JOBS="))
+        .expect("build-job policy reaches Cargo")
+        .parse::<usize>()
+        .expect("build-job policy is numeric");
+    assert!(jobs > 0, "build-job policy must retain at least one worker");
     let staging =
         assert_full_tier_uses_private_staging(&cargo_args, &temp_repo.path().join("target"));
     assert!(
@@ -575,6 +628,18 @@ fn test_build_submission_binary_copies_root_release_binary() {
         String::from_utf8_lossy(&alias_output.stdout).trim(),
         "root-release"
     );
+    let receipt = alias_path.with_extension("receipt");
+    assert!(receipt.is_file(), "published binary receipt is missing");
+    let receipt_contents =
+        fs::read_to_string(&receipt).expect("failed to read published binary receipt");
+    assert!(receipt_contents.contains("schema=ny-submission-binary-receipt-v1\n"));
+    assert!(receipt_contents.contains("source_commit=0123456789abcdef0123456789abcdef01234567\n"));
+    assert!(receipt_contents.contains("features=mip,cuda\n"));
+    assert!(receipt_contents.contains("toolchain_kind=rustc-vv\n"));
+    assert_success(
+        &validate_receipt(temp_repo.path(), &alias_path),
+        "fresh binary receipt",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -584,6 +649,56 @@ fn test_build_submission_binary_copies_root_release_binary() {
     assert!(
         stdout.contains("alias:") && stdout.contains("target/release/ny"),
         "expected stable alias path in stdout, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("receipt:") && stdout.contains("target/release/ny.receipt"),
+        "expected stable receipt path in stdout, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_receipt_rejects_binary_bytes_changed_after_publication() {
+    let (temp_repo, script) = fake_repo();
+    let output = run_build_script(&script, temp_repo.path(), "root-release", None);
+    assert_success(&output, "receipt fixture build");
+    let alias = temp_repo.path().join("target/release/ny");
+
+    fs::write(&alias, "#!/bin/bash\necho replaced-after-build\n")
+        .expect("failed to replace published fixture bytes");
+    make_executable(&alias);
+    let validation = validate_receipt(temp_repo.path(), &alias);
+    assert!(!validation.status.success());
+    assert!(
+        String::from_utf8_lossy(&validation.stderr).contains("stale/mismatched binary"),
+        "missing binary mismatch diagnostic: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+}
+
+#[test]
+fn test_receipt_rejects_archive_source_identity_changed_after_build() {
+    let (temp_repo, script) = fake_repo();
+    let output = run_build_script(&script, temp_repo.path(), "root-release", None);
+    assert_success(&output, "receipt fixture build");
+    let alias = temp_repo.path().join("target/release/ny");
+    let marker = temp_repo.path().join(".ny-vnncomp-source.txt");
+    let marker_contents =
+        fs::read_to_string(&marker).expect("failed to read fixture source marker");
+    fs::write(
+        &marker,
+        marker_contents.replace(
+            "0123456789abcdef0123456789abcdef01234567",
+            "89abcdef0123456789abcdef0123456789abcdef",
+        ),
+    )
+    .expect("failed to change fixture source marker");
+
+    let validation = validate_receipt(temp_repo.path(), &alias);
+    assert!(!validation.status.success());
+    assert!(
+        String::from_utf8_lossy(&validation.stderr).contains("stale source identity"),
+        "missing source mismatch diagnostic: {}",
+        String::from_utf8_lossy(&validation.stderr)
     );
 }
 
@@ -1074,55 +1189,29 @@ fn test_host_tuple_is_normalized_for_native_fp16_and_artifact_selection() {
 }
 
 #[test]
-fn test_build_submission_binary_discovers_relocated_openssl_without_package_install() {
+fn test_build_submission_binary_does_not_probe_openssl_or_install_packages() {
     let (temp_repo, script) = fake_repo();
 
     let build_output = run_build_script(&script, temp_repo.path(), "root-release", None);
-    assert_success(&build_output, "build_submission_binary relocated OpenSSL");
+    assert_success(&build_output, "build_submission_binary rustls-only build");
 
-    let bundle = temp_repo.path().join("home/.local/opt/libssl-dev/usr");
-    let cc_output = Command::new("cc")
-        .arg("-dumpmachine")
-        .output()
-        .expect("failed to query compiler target");
-    assert_success(&cc_output, "cc -dumpmachine");
-    let compiler_triple = String::from_utf8(cc_output.stdout)
-        .expect("compiler target should be UTF-8")
-        .trim()
-        .to_owned();
-    let expected_lib = bundle.join("lib").join(&compiler_triple);
-    let expected_include = bundle.join("include");
-    let expected_arch_include = expected_include.join(compiler_triple);
+    for marker in [
+        "pkg-config-invoked",
+        "apt-get-invoked",
+        "dnf-invoked",
+        "sudo-invoked",
+    ] {
+        assert!(
+            !temp_repo.path().join(marker).exists(),
+            "submission builder unexpectedly invoked {marker}"
+        );
+    }
     let cargo_env = fs::read_to_string(temp_repo.path().join("cargo-env.txt"))
         .expect("failed to read fake cargo environment");
-    assert!(
-        cargo_env.contains(&format!("OPENSSL_DIR={}", bundle.display())),
-        "missing relocated OPENSSL_DIR in: {cargo_env}"
-    );
-    assert!(
-        cargo_env.contains(&format!("OPENSSL_LIB_DIR={}", expected_lib.display())),
-        "missing relocated OPENSSL_LIB_DIR in: {cargo_env}"
-    );
-    assert!(
-        cargo_env.contains(&format!(
-            "OPENSSL_INCLUDE_DIR={}",
-            expected_include.display()
-        )),
-        "missing relocated OPENSSL_INCLUDE_DIR in: {cargo_env}"
-    );
-    assert!(
-        cargo_env.contains(&format!(
-            "CFLAGS=-I{} -I{}",
-            expected_arch_include.display(),
-            expected_include.display()
-        )),
-        "missing relocated base/architecture header CFLAGS in: {cargo_env}"
-    );
-    assert!(
-        String::from_utf8_lossy(&build_output.stdout)
-            .contains("Using relocated OpenSSL development bundle"),
-        "expected explicit relocated-bundle diagnostic"
-    );
+    assert!(cargo_env.contains("OPENSSL_DIR=\n"));
+    assert!(cargo_env.contains("OPENSSL_LIB_DIR=\n"));
+    assert!(cargo_env.contains("OPENSSL_INCLUDE_DIR=\n"));
+    assert!(cargo_env.contains("CFLAGS=\n"));
 }
 
 #[test]
@@ -1277,10 +1366,17 @@ fn test_quoted_nonbuild_table_does_not_override_lower_priority_cross_target() {
 }
 
 #[test]
+#[cfg(all(
+    feature = "native-arm-conformance",
+    target_arch = "aarch64",
+    target_os = "linux"
+))]
 fn test_capable_native_aarch64_fixture_reaches_fp16_injection() {
-    if !native_fp16_injection_expected() {
-        return;
-    }
+    assert!(
+        native_fp16_injection_expected(),
+        "native FP16 conformance requires aarch64-unknown-linux-gnu, \
+         /proc/cpuinfo asimdhp support, and no pre-existing rustc fp16 cfg"
+    );
 
     let (temp_repo, script) = fake_repo();
     let output = run_build_script(&script, temp_repo.path(), "root-release", None);

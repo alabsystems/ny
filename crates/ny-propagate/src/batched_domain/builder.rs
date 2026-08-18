@@ -60,6 +60,56 @@ impl BatchedDomainsBuilder {
         }
     }
 
+    /// Borrowed-bounds variant of [`Self::add_domain`].
+    ///
+    /// #stack-double-copy: the owned form forces the caller to materialise an
+    /// intermediate `HashMap<String, (ArrayD, ArrayD)>` by cloning every layer's
+    /// lower and upper bound, and then this builder clones each one AGAIN into
+    /// the batch buffer. The first copy is pure waste — it is dropped the moment
+    /// `add_domain` returns — yet it is paid once per domain per stack, and the
+    /// kFSB SIMULATION path stacks far more children than the committed path
+    /// (k candidate splits per domain, of which one is committed).
+    ///
+    /// Measured motivation: on cifar100 idx_8600 round 1,
+    /// `mo-kfsb-sim sims=128 chunks=2 fwd=4.21s bwd=2.02s` — the forward, which
+    /// includes this stacking, costs twice the backward it exists to feed.
+    ///
+    /// Value-identical to [`Self::add_domain`]: the retained buffers are the same
+    /// bytes, one clone earlier.
+    // Justification: Domain builder needs layer bounds, input bounds, objective bounds,
+    // depth, constraints, alpha/beta state, and split history — all from a BaB domain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_domain_borrowed(
+        &mut self,
+        layer_bounds: &HashMap<&str, (&ArrayD<f32>, &ArrayD<f32>)>,
+        input_lower: ArrayD<f32>,
+        input_upper: ArrayD<f32>,
+        lower_bound: f32,
+        upper_bound: f32,
+        depth: usize,
+        domain_constraints: Vec<ConstraintTuple>,
+    ) {
+        for name in &self.layer_names {
+            if let Some((lower, upper)) = layer_bounds.get(name.as_str()) {
+                self.layer_lowers
+                    .entry(name.clone())
+                    .or_default()
+                    .push((*lower).clone());
+                self.layer_uppers
+                    .entry(name.clone())
+                    .or_default()
+                    .push((*upper).clone());
+            }
+        }
+
+        self.input_lowers.push(input_lower);
+        self.input_uppers.push(input_upper);
+        self.lower_bounds.push(lower_bound);
+        self.upper_bounds.push(upper_bound);
+        self.depths.push(depth);
+        self.constraints.push(domain_constraints);
+    }
+
     /// Add a domain's bounds to the batch.
     ///
     /// # Arguments

@@ -811,13 +811,15 @@ use ny_propagate::{
 use std::cell::RefCell;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+use std::time::Instant;
 
 struct CountingGpuCrownEngine {
     expected_lower: Vec<f32>,
     expected_upper: Vec<f32>,
     gpu_calls: AtomicUsize,
+    crown_backward_deadline: Mutex<Option<Instant>>,
 }
 
 impl CountingGpuCrownEngine {
@@ -826,6 +828,7 @@ impl CountingGpuCrownEngine {
             expected_lower: expected.lower().iter().copied().collect(),
             expected_upper: expected.upper().iter().copied().collect(),
             gpu_calls: AtomicUsize::new(0),
+            crown_backward_deadline: Mutex::new(None),
         }
     }
 
@@ -861,6 +864,16 @@ impl ny_core::GpuCrownBackward for CountingGpuCrownEngine {
         input_lower: &[f32],
         input_upper: &[f32],
     ) -> ny_core::Result<ny_core::GpuCrownResult> {
+        if self
+            .crown_backward_deadline
+            .lock()
+            .expect("mock GPU deadline mutex should not be poisoned")
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(ny_core::NyError::DeadlineExceeded(
+                "mock Python GPU CROWN deadline exceeded before launch".to_string(),
+            ));
+        }
         self.gpu_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(input_lower.len(), input_upper.len());
         assert_eq!(num_specs, self.expected_lower.len());
@@ -868,6 +881,34 @@ impl ny_core::GpuCrownBackward for CountingGpuCrownEngine {
             lower_bounds: self.expected_lower.clone(),
             upper_bounds: self.expected_upper.clone(),
         })
+    }
+
+    fn crown_backward_gpu_sound(
+        &self,
+        layers: &[ny_core::GpuCrownLayer],
+        spec: &[f32],
+        num_specs: usize,
+        input_lower: &[f32],
+        input_upper: &[f32],
+    ) -> ny_core::Result<ny_core::GpuCrownResult> {
+        // The fixture returns bounds precomputed by the proven CPU CROWN path,
+        // so it legitimately models the sound backend contract.
+        self.crown_backward_gpu(layers, spec, num_specs, input_lower, input_upper)
+    }
+
+    fn provides_sound_gpu_crown(&self) -> bool {
+        true
+    }
+
+    fn set_crown_backward_deadline(&self, deadline: Option<Instant>) {
+        *self
+            .crown_backward_deadline
+            .lock()
+            .expect("mock GPU deadline mutex should not be poisoned") = deadline;
+    }
+
+    fn honors_crown_backward_deadline(&self) -> bool {
+        true
     }
 }
 
@@ -937,7 +978,7 @@ fn test_resolve_verify_backend_non_crown_still_validates_backend_name() {
 }
 
 #[test]
-fn test_build_standard_verifier_uses_stored_engine_for_crown() {
+fn test_build_standard_verifier_uses_stored_engine_without_deadline() {
     let weight1 =
         Array2::from_shape_vec((4, 2), vec![1.0, 0.5, -0.5, 1.0, 0.3, -0.7, -0.2, 0.8]).unwrap();
     let weight2 = Array2::from_shape_vec((1, 4), vec![1.0, -0.5, 0.3, 0.2]).unwrap();
@@ -965,7 +1006,7 @@ fn test_build_standard_verifier_uses_stored_engine_for_crown() {
     let spec = VerificationSpec::from_parts(
         vec![Bound::new(-1.0, 1.0), Bound::new(-1.0, 1.0)],
         vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY)],
-        Some(5000),
+        None,
         None,
     )
     .expect("valid test spec");
@@ -977,7 +1018,7 @@ fn test_build_standard_verifier_uses_stored_engine_for_crown() {
     ));
     assert!(
         mock_gpu.gpu_calls() > 0,
-        "build_standard_verifier should preserve the stored GemmEngine for verify()"
+        "build_standard_verifier should preserve its stored engine for an unbounded verify()"
     );
 }
 

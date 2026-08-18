@@ -390,17 +390,17 @@ fn test_to_output_constraints_directed_rounding_2658() {
 
     let plain_cast = 0.1_f64 as f32;
 
-    // For LessEqConst: rhs should be rounded strictly UP (wider unsafe region → sound).
-    // Use strict > to prove next_up_f32 actually shifted the value.
+    // For LessEqConst, plain binary32 0.1 already lies above the f64 value, so
+    // the tight directed upper endpoint is the plain cast (not one extra ULP).
     assert!(
-        constraints.rhs[0] > plain_cast,
-        "LessEqConst rhs {:.20} should be > plain cast {:.20} (#2658 directed rounding)",
+        f64::from(constraints.rhs[0]) >= 0.1_f64,
+        "LessEqConst rhs {:.20} must contain f64 0.1 (#2658 directed rounding)",
         constraints.rhs[0],
-        plain_cast
     );
+    assert_eq!(constraints.rhs[0], plain_cast);
 
-    // For GreaterEqConst: rhs is -c, rounded UP via next_up_f32(-(*c as f32)).
-    // The negation of plain_cast is exact, so rhs[1] = next_up(-plain_cast) > -plain_cast.
+    // For GreaterEqConst, the plain negated cast lies below -0.1 and must move
+    // upward to contain the original f64 rhs.
     let neg_plain = -plain_cast;
     assert!(
         constraints.rhs[1] > neg_plain,
@@ -408,6 +408,73 @@ fn test_to_output_constraints_directed_rounding_2658() {
         constraints.rhs[1],
         neg_plain
     );
+}
+
+/// A finite f64 VNN-LIB threshold that is outside binary32 range must never be
+/// replaced by a finite sentinel. That would shrink the candidate violation
+/// region and could let assume-violation reasoning prove the wrong region empty.
+#[ntest::timeout(10000)]
+#[test]
+fn test_output_constraint_rhs_overflow_widens_instead_of_clamping() {
+    let content = r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(assert (>= X_0 0))
+(assert (<= X_0 1))
+(assert (<= Y_0 1e100))
+(assert (>= Y_0 -1e100))
+"#;
+    let spec = parse_vnnlib(content).expect("finite f64 thresholds parse");
+    let constraints = spec
+        .to_output_constraints()
+        .expect("overflow is represented by conservative widening");
+
+    assert_eq!(constraints.rhs.len(), 2);
+    assert!(constraints
+        .rhs
+        .iter()
+        .all(|rhs| rhs.is_infinite() && *rhs > 0.0));
+    assert!(
+        constraints.is_satisfied(&ndarray::arr1(&[1.0e20_f32])),
+        "the f32 lowering must contain an output admitted by the original broad region"
+    );
+}
+
+/// Negative binary64 overflow has a finite, sign-correct binary32 upper
+/// endpoint. Keeping it avoids throwing away the entire constraint while still
+/// widening the original region.
+#[ntest::timeout(10000)]
+#[test]
+fn test_output_constraint_negative_rhs_overflow_uses_tight_upper_endpoint() {
+    let mut spec = VnnLibSpec::new();
+    spec.num_inputs = 1;
+    spec.num_outputs = 2;
+    spec.input_bounds.push((0.0, 1.0));
+    spec.output_constraints = vec![
+        OutputConstraint::LessEqConst(0, -1.0e100_f64),
+        OutputConstraint::GreaterEqConst(1, 1.0e100_f64),
+    ];
+
+    let constraints = spec
+        .to_output_constraints()
+        .expect("negative overflow has a conservative binary32 endpoint");
+    assert_eq!(constraints.rhs.as_slice().unwrap(), &[f32::MIN, f32::MIN]);
+    assert!(f64::from(constraints.rhs[0]) >= -1.0e100_f64);
+    assert!(f64::from(constraints.rhs[1]) >= -1.0e100_f64);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_programmatic_output_constraint_index_fails_before_matrix_indexing() {
+    let mut spec = VnnLibSpec::new();
+    spec.num_outputs = 1;
+    spec.output_constraints = vec![OutputConstraint::LessEqConst(1, 0.0)];
+
+    let error = spec
+        .to_output_constraints()
+        .expect_err("out-of-range programmatic constraint must fail closed");
+    let message = error.to_string();
+    assert!(message.contains("Y_1"), "unexpected error: {message}");
 }
 
 /// Regression test for #2800: contradictory VNN-LIB assertions (X_0 >= 1 AND X_0 <= 0)

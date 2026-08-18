@@ -12,6 +12,7 @@ pub(crate) use ny_core::NyError;
 // Avoid re-exporting vnnlib::normalize to prevent test module name collisions.
 mod bounds;
 mod check_unsafe;
+#[cfg(feature = "external-vnncomp")]
 mod dual_formula_real;
 mod gz;
 mod normalize_output;

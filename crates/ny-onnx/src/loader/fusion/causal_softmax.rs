@@ -101,7 +101,7 @@ pub(in crate::loader) fn try_fuse_causal_softmax(
         .attribute
         .iter()
         .find(|a| a.name == "upper")
-        .map(|a| a.i)
+        .map(|a| a.i_value())
         .unwrap_or(1); // Default is upper=1
 
     if upper != 1 {
@@ -133,7 +133,7 @@ pub(in crate::loader) fn try_fuse_causal_softmax(
         .attribute
         .iter()
         .find(|a| a.name == "axis")
-        .map(|a| a.i)
+        .map(|a| a.i_value())
         .unwrap_or(-1);
 
     let mut attributes = HashMap::new();

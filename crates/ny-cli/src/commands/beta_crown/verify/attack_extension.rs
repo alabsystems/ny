@@ -33,6 +33,13 @@
 //!    -5.01 at its 20s cut on the sequential lane), not to prove promise; the
 //!    budget-bound gate is what keeps plateaued unsat instances out.
 //!
+//! One refusal on top of the two gates (#attack-stall): an attack ended by the
+//! adaptive STALL cutoff (`super::attack_stall`) is never extended. That cutoff
+//! fires on the one signal the margin gate above cannot read — the ascent
+//! stopped IMPROVING — so extending it would hand back the budget it just
+//! reclaimed. Its absence is not evidence of anything about the property; both
+//! paths lead to the same unchanged bound/BaB phases.
+//!
 //! The extension is granted at most ONCE, is a bounded fraction of the
 //! REMAINING budget, and CONTINUES the restart seed sequence where the first
 //! run's cap cut it (the first run's trajectories are already explored;
@@ -111,21 +118,31 @@ pub(super) fn attack_extension_slice(
         remaining,
         feedback.best_margin,
         feedback.hit_deadline,
+        feedback.stalled_out,
         attack_extend_enabled(),
         promising_margin(),
         extension_fraction(policy_fraction),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide(
     remaining: Option<Duration>,
     best_margin: Option<f32>,
     hit_deadline: bool,
+    stalled_out: bool,
     enabled: bool,
     promising_margin: f32,
     fraction: f32,
 ) -> Option<Duration> {
     if !enabled || fraction <= 0.0 {
+        return None;
+    }
+    // #attack-stall: an attack cut for a PLATEAUED margin gets nothing. The
+    // cutoff's whole claim is "this ascent stopped improving"; granting it more
+    // time would undo the reclaim it just made, and the plateau is exactly the
+    // near-wall UNSAT shape the budget-bound gate below already refuses.
+    if stalled_out {
         return None;
     }
     // Work-bound attacks (configured restarts exhausted) get nothing: more
@@ -157,7 +174,8 @@ mod tests {
     fn promising_budget_bound_cut_grants_fraction_of_remaining() {
         // metaroom spec_idx_129 shape: cut at the phase deadline mid-ascent
         // with margin -0.083.
-        let slice = decide(secs(180), Some(-0.08), true, true, 0.10, 0.15).expect("promising");
+        let slice =
+            decide(secs(180), Some(-0.08), true, false, true, 0.10, 0.15).expect("promising");
         assert_eq!(slice, Duration::from_mins(3).mul_f32(0.15));
     }
 
@@ -165,7 +183,7 @@ mod tests {
     fn margin_at_violation_boundary_grants() {
         // Internal candidate found but rejected by confirmation (margin >= 0):
         // the continuation retry is exactly the right response.
-        assert!(decide(secs(180), Some(0.02), true, true, 0.10, 0.15).is_some());
+        assert!(decide(secs(180), Some(0.02), true, false, true, 0.10, 0.15).is_some());
     }
 
     #[test]
@@ -173,49 +191,70 @@ mod tests {
         // metaroom spec_idx_28 shape (GT=unsat near-wall): the batched lane
         // exhausts the configured restarts with the unsat sup plateau at
         // -0.033 — more attack time is NOT what it lacked; BaB keeps its slice.
-        assert!(decide(secs(180), Some(-0.03), false, true, 0.10, 0.15).is_none());
+        assert!(decide(secs(180), Some(-0.03), false, false, true, 0.10, 0.15).is_none());
+    }
+
+    #[test]
+    fn stall_cut_attack_is_never_extended() {
+        // #attack-stall: the cutoff fires precisely BECAUSE the ascent stopped
+        // improving. Extending it would hand the reclaimed budget straight back
+        // to the lane that just proved it had nothing to do with it — even
+        // though the margin looks "promising" by the level gate, which cannot
+        // tell a plateaued unsat sup from a mid-ascent sat (spec_idx_28 at
+        // -0.033 vs spec_idx_129 at -0.083).
+        assert!(decide(secs(180), Some(-0.03), true, true, true, 0.10, 0.15).is_none());
+        assert!(decide(secs(180), Some(0.02), true, true, true, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn hopeless_margin_hands_off_immediately() {
         // metaroom spec_idx_148 sequential-lane shape: cut at -5.01.
-        assert!(decide(secs(180), Some(-5.01), true, true, 0.10, 0.15).is_none());
+        assert!(decide(secs(180), Some(-5.01), true, false, true, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn margin_just_below_threshold_hands_off() {
-        assert!(decide(secs(180), Some(-0.101), true, true, 0.10, 0.15).is_none());
+        assert!(decide(secs(180), Some(-0.101), true, false, true, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn no_margin_telemetry_hands_off() {
-        assert!(decide(secs(180), None, true, true, 0.10, 0.15).is_none());
+        assert!(decide(secs(180), None, true, false, true, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn non_finite_margin_hands_off() {
-        assert!(decide(secs(180), Some(f32::NEG_INFINITY), true, true, 0.10, 0.15).is_none());
-        assert!(decide(secs(180), Some(f32::NAN), true, true, 0.10, 0.15).is_none());
+        assert!(decide(
+            secs(180),
+            Some(f32::NEG_INFINITY),
+            true,
+            false,
+            true,
+            0.10,
+            0.15
+        )
+        .is_none());
+        assert!(decide(secs(180), Some(f32::NAN), true, false, true, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn kill_switch_disables() {
-        assert!(decide(secs(180), Some(-0.01), true, false, 0.10, 0.15).is_none());
+        assert!(decide(secs(180), Some(-0.01), true, false, false, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn small_remaining_budget_hands_off() {
         // Below the floor the remaining time is BaB-critical (lsnc_relu class).
-        assert!(decide(secs(45), Some(-0.01), true, true, 0.10, 0.15).is_none());
+        assert!(decide(secs(45), Some(-0.01), true, false, true, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn unbounded_budget_hands_off() {
-        assert!(decide(None, Some(-0.01), true, true, 0.10, 0.15).is_none());
+        assert!(decide(None, Some(-0.01), true, false, true, 0.10, 0.15).is_none());
     }
 
     #[test]
     fn zero_fraction_hands_off() {
-        assert!(decide(secs(180), Some(-0.01), true, true, 0.10, 0.0).is_none());
+        assert!(decide(secs(180), Some(-0.01), true, false, true, 0.10, 0.0).is_none());
     }
 }

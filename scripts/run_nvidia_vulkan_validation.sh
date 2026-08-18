@@ -21,7 +21,7 @@
 #   ABCROWN_DIR         - path to an alpha-beta-CROWN complete_verifier checkout
 #                         (github.com/Verified-Intelligence/alpha-beta-CROWN);
 #                         required unless --skip-reference is passed
-#   PYTHON_CMD          - python command (default: python)
+#   PYTHON_CMD          - Python command for alpha-beta-CROWN (default: python3)
 
 set -euo pipefail
 
@@ -35,7 +35,7 @@ NY_BIN="${NY_BIN:-./target/release/ny}"
 BENCHMARK_SCRIPT="${BENCHMARK_SCRIPT:-${REPO_ROOT}/scripts/benchmark_vnncomp.sh}"
 TIME_CMD="${TIME_CMD:-/usr/bin/time}"
 ABCROWN_DIR="${ABCROWN_DIR:-}"
-PYTHON_CMD="${PYTHON_CMD:-python}"
+PYTHON_CMD="${PYTHON_CMD:-python3}"
 
 # Parse arguments
 SKIP_REFERENCE=false
@@ -56,11 +56,183 @@ if [[ "${SKIP_REFERENCE}" != "true" && -z "${ABCROWN_DIR}" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 
 HOST_INFO_FILE="${OUTPUT_DIR}/issue-4359-nvidia-vulkan-host-info.txt"
 MEASURE_LOG="${OUTPUT_DIR}/issue-4359-nvidia-vulkan-measure.log"
 MEASURE_CSV="${OUTPUT_DIR}/issue-4359-nvidia-vulkan-crown-backward.csv"
 MANIFEST_FILE="${OUTPUT_DIR}/issue-4359-nvidia-vulkan-manifest.json"
+CERSYVE_CSV=""
+METAROOM_CSV=""
+REFERENCE_BLOCKER=""
+REFERENCE_REAL_SECONDS=""
+BLOCKER=""
+VERDICT="blocked"
+CHILD_LOG=""
+VULKAN_OK=false
+ADAPTER_LINE=""
+
+cleanup_validation_tempfiles() {
+    if [[ -n "${CHILD_LOG:-}" ]]; then
+        rm -f "$CHILD_LOG"
+    fi
+}
+trap cleanup_validation_tempfiles EXIT
+
+write_validation_manifest() {
+    python3 -I - \
+        "$MANIFEST_FILE" \
+        "$VERDICT" \
+        "$BLOCKER" \
+        "$VULKAN_OK" \
+        "$ADAPTER_LINE" \
+        "$CERSYVE_CSV" \
+        "$METAROOM_CSV" \
+        "$REFERENCE_BLOCKER" \
+        "$REFERENCE_REAL_SECONDS" \
+        "$HOST_INFO_FILE" \
+        "$MEASURE_LOG" \
+        "$MEASURE_CSV" <<'PY'
+import json
+import math
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+(
+    manifest_path,
+    verdict,
+    blocker,
+    vulkan_ok,
+    adapter_line,
+    cersyve_csv,
+    metaroom_csv,
+    reference_blocker,
+    reference_seconds,
+    host_info,
+    measure_log,
+    measure_csv,
+) = sys.argv[1:]
+
+reference_value = None
+if reference_seconds:
+    try:
+        reference_value = float(reference_seconds)
+    except ValueError as error:
+        raise SystemExit(f"invalid reference timing {reference_seconds!r}: {error}")
+    if not math.isfinite(reference_value) or reference_value < 0:
+        raise SystemExit(f"invalid reference timing {reference_seconds!r}")
+
+
+def artifact_name(value):
+    return Path(value).name if value else None
+
+
+payload = {
+    "schema": "nvidia_vulkan_validation_manifest_v1",
+    "verdict": verdict,
+    "blocker": blocker or None,
+    "host_info_path": artifact_name(host_info),
+    "measure_log_path": artifact_name(measure_log),
+    "measure_csv_path": artifact_name(measure_csv),
+    "vulkan_confirmed": vulkan_ok == "true",
+    "adapter_line": adapter_line,
+    "compare_backends_cersyve_csv": artifact_name(cersyve_csv),
+    "compare_backends_metaroom_csv": artifact_name(metaroom_csv),
+    "reference_blocker": reference_blocker or None,
+    "reference_cersyve_real_seconds": reference_value,
+}
+
+destination = Path(manifest_path)
+temporary_name = ""
+try:
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        temporary_name = temporary.name
+        json.dump(payload, temporary, indent=2, ensure_ascii=False)
+        temporary.write("\n")
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    os.replace(temporary_name, destination)
+except BaseException:
+    if temporary_name:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+    raise
+PY
+}
+
+run_compare_backends() {
+    local category="$1"
+    local start_at="$2"
+    local limit="$3"
+    local child_exit=0
+    local report_count
+    local report_path
+
+    CHILD_LOG=$(mktemp "${OUTPUT_DIR}/.${category}.compare.XXXXXX")
+    NY_BIN="${NY_BIN}" REPORT_DIR="${OUTPUT_DIR}" \
+        "${BENCHMARK_SCRIPT}" "$category" --compare-backends \
+        --start-at "$start_at" --limit "$limit" 2>&1 \
+        | tee "$CHILD_LOG" || child_exit=${PIPESTATUS[0]}
+    if [[ "$child_exit" -ne 0 ]]; then
+        rm -f "$CHILD_LOG"
+        CHILD_LOG=""
+        return "$child_exit"
+    fi
+
+    report_count=$(grep -c '^Report: ' "$CHILD_LOG" || true)
+    if [[ "$report_count" -ne 1 ]]; then
+        echo "ERROR: ${category} emitted ${report_count} exact Report: lines" >&2
+        rm -f "$CHILD_LOG"
+        CHILD_LOG=""
+        return 1
+    fi
+    report_path=$(grep -m1 '^Report: ' "$CHILD_LOG" | sed 's/^Report: //')
+    rm -f "$CHILD_LOG"
+    CHILD_LOG=""
+
+    # Resolve symlinks and traversal before accepting the child artifact. The
+    # canonical file must be a direct child of this run's output directory and
+    # retain the exact category report basename contract.
+    if ! report_path=$(python3 -I - "$report_path" "$OUTPUT_DIR" "$category" <<'PY'
+import sys
+from pathlib import Path
+
+candidate_text, output_text, category = sys.argv[1:]
+try:
+    candidate = Path(candidate_text).resolve(strict=True)
+    output = Path(output_text).resolve(strict=True)
+    relative = candidate.relative_to(output)
+except (OSError, RuntimeError, ValueError):
+    raise SystemExit(1)
+
+prefix = f"{category}_compare_backends_"
+if (
+    relative.parent != Path(".")
+    or not candidate.is_file()
+    or not relative.name.startswith(prefix)
+    or not relative.name.endswith(".csv")
+    or len(relative.name) <= len(prefix) + len(".csv")
+):
+    raise SystemExit(1)
+print(candidate)
+PY
+    ); then
+        echo "ERROR: ${category} report escaped or violated the validation output contract: ${report_path}" >&2
+        return 1
+    fi
+    COMPARE_REPORT="$report_path"
+}
 
 echo "=== NVIDIA/Vulkan Validation Orchestrator ==="
 echo "Output directory: ${OUTPUT_DIR}"
@@ -76,30 +248,47 @@ echo "--- Step 1: Capturing host facts ---"
     uname -a
     echo ""
     echo "--- rustc ---"
-    ${RUSTC_CMD:-rustc} -Vv 2>&1 || echo "rustc not found"
+    "${RUSTC_CMD:-rustc}" -Vv 2>&1 || echo "rustc not found"
     echo ""
     echo "--- cargo ---"
-    ${CARGO_VERSION_CMD:-cargo} -V 2>&1 || echo "cargo not found"
+    "${CARGO_VERSION_CMD:-cargo}" -V 2>&1 || echo "cargo not found"
     echo ""
     echo "--- nvidia-smi ---"
-    ${NVIDIA_SMI_CMD} --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 || echo "nvidia-smi not available"
+    "${NVIDIA_SMI_CMD}" --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 || echo "nvidia-smi not available"
     echo ""
     echo "--- nvidia-smi full ---"
-    ${NVIDIA_SMI_CMD} 2>&1 || echo "nvidia-smi not available"
+    "${NVIDIA_SMI_CMD}" 2>&1 || echo "nvidia-smi not available"
 } > "$HOST_INFO_FILE" 2>&1
 echo "Wrote: ${HOST_INFO_FILE}"
 
 # --- Step 2: Run measure_crown_backward_workloads ---
 echo ""
 echo "--- Step 2: Running measure_crown_backward_workloads --graph-engine-only ---"
-RUST_LOG=ny_gpu=info,ny_propagate=info \
-    ${CARGO_CMD} run -p ny-gpu --release --example measure_crown_backward_workloads -- \
+if ! rm -f -- "${MEASURE_CSV}"; then
+    BLOCKER="could not clear the prior measurement CSV artifact"
+    REFERENCE_BLOCKER="blocked: measurement setup failed, skipped all downstream steps"
+    write_validation_manifest
+    echo "Wrote: ${MANIFEST_FILE}"
+    exit 1
+fi
+
+MEASURE_PIPE_STATUSES=()
+if RUST_LOG=ny_gpu=info,ny_propagate=info \
+    "${CARGO_CMD}" run -p ny-gpu --release --example measure_crown_backward_workloads -- \
     --graph-engine-only \
     --output "${MEASURE_CSV}" \
-    2>&1 | tee "${MEASURE_LOG}"
+    2>&1 | tee "${MEASURE_LOG}"; then
+    :
+else
+    MEASURE_PIPE_STATUSES=("${PIPESTATUS[@]}")
+    BLOCKER="measurement command failed (cargo exit ${MEASURE_PIPE_STATUSES[0]:-unknown}, tee exit ${MEASURE_PIPE_STATUSES[1]:-unknown})"
+    REFERENCE_BLOCKER="blocked: measurement command failed, skipped all downstream steps"
+    write_validation_manifest
+    echo "Wrote: ${MANIFEST_FILE}"
+    exit 1
+fi
 
 # Fail-closed: verify Vulkan backend
-VULKAN_OK=false
 if grep -q 'backend: Vulkan' "${MEASURE_LOG}"; then
     VULKAN_OK=true
     echo "PASS: wgpu backend is Vulkan"
@@ -107,33 +296,27 @@ else
     echo "FAIL: wgpu backend is NOT Vulkan (or not detected in log)"
 fi
 
-ADAPTER_LINE=""
-if grep -q 'wgpu adapter:' "${MEASURE_LOG}"; then
-    ADAPTER_LINE=$(grep 'wgpu adapter:' "${MEASURE_LOG}" | head -1)
+if ADAPTER_LINE=$(grep -m1 'wgpu adapter:' "${MEASURE_LOG}"); then
     echo "Adapter: ${ADAPTER_LINE}"
 else
+    ADAPTER_LINE=""
     echo "WARNING: no 'wgpu adapter:' line found in measurement log"
+fi
+
+if [[ ! -s "${MEASURE_CSV}" ]]; then
+    BLOCKER="measurement command completed without a non-empty CSV artifact"
+    REFERENCE_BLOCKER="blocked: measurement CSV missing or empty, skipped all downstream steps"
+    write_validation_manifest
+    echo "Wrote: ${MANIFEST_FILE}"
+    exit 1
 fi
 
 if [[ "${VULKAN_OK}" != "true" ]]; then
     echo ""
     echo "FATAL: Vulkan backend not confirmed. Writing blocked manifest."
-    cat > "$MANIFEST_FILE" <<MANIFEST_EOF
-{
-    "schema": "nvidia_vulkan_validation_manifest_v1",
-    "verdict": "blocked",
-    "blocker": "wgpu did not select Vulkan backend — check driver stack",
-    "host_info_path": "$(basename "$HOST_INFO_FILE")",
-    "measure_log_path": "$(basename "$MEASURE_LOG")",
-    "measure_csv_path": "$(basename "$MEASURE_CSV")",
-    "vulkan_confirmed": false,
-    "adapter_line": "${ADAPTER_LINE}",
-    "compare_backends_cersyve_csv": null,
-    "compare_backends_metaroom_csv": null,
-    "reference_blocker": "blocked: Vulkan not confirmed, skipped all downstream steps",
-    "reference_cersyve_real_seconds": null
-}
-MANIFEST_EOF
+    BLOCKER="wgpu did not select Vulkan backend — check driver stack"
+    REFERENCE_BLOCKER="blocked: Vulkan not confirmed, skipped all downstream steps"
+    write_validation_manifest
     echo "Wrote: ${MANIFEST_FILE}"
     exit 1
 fi
@@ -142,42 +325,33 @@ fi
 echo ""
 echo "--- Step 3: Running compare-backends (cersyve + metaroom_2023) ---"
 
-# Find the compare-backends CSV outputs by timestamp
-BEFORE_TS=$(date +%s)
+COMPARE_REPORT=""
+if run_compare_backends cersyve 3 2; then
+    CERSYVE_CSV="$COMPARE_REPORT"
+else
+    BLOCKER="cersyve compare-backends command/report failed"
+fi
 
-NY_BIN="${NY_BIN}" "${BENCHMARK_SCRIPT}" cersyve --compare-backends --start-at 3 --limit 2
-
-# Find the cersyve CSV (most recent comparecat file)
-CERSYVE_CSV=""
-for f in "${REPO_ROOT}"/reports/benchmarks/comparecat_compare_backends_*.csv; do
-    if [[ -f "$f" ]]; then
-        FILE_TS=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
-        if [[ "$FILE_TS" -ge "$BEFORE_TS" ]]; then
-            CERSYVE_CSV="$f"
-        fi
+COMPARE_REPORT=""
+if run_compare_backends metaroom_2023 10 1; then
+    METAROOM_CSV="$COMPARE_REPORT"
+else
+    if [[ -n "$BLOCKER" ]]; then
+        BLOCKER="${BLOCKER}; metaroom_2023 compare-backends command/report failed"
+    else
+        BLOCKER="metaroom_2023 compare-backends command/report failed"
     fi
-done
-
-BEFORE_TS2=$(date +%s)
-NY_BIN="${NY_BIN}" "${BENCHMARK_SCRIPT}" metaroom_2023 --compare-backends --start-at 10 --limit 1
-
-METAROOM_CSV=""
-for f in "${REPO_ROOT}"/reports/benchmarks/comparecat_compare_backends_*.csv; do
-    if [[ -f "$f" ]]; then
-        FILE_TS=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
-        if [[ "$FILE_TS" -ge "$BEFORE_TS2" ]]; then
-            METAROOM_CSV="$f"
-        fi
-    fi
-done
+fi
 
 echo "Cersyve CSV: ${CERSYVE_CSV:-not found}"
 echo "Metaroom CSV: ${METAROOM_CSV:-not found}"
+if [[ -z "${CERSYVE_CSV}" || -z "${METAROOM_CSV}" ]]; then
+    if [[ -z "$BLOCKER" ]]; then
+        BLOCKER="compare-backends completed without both expected CSV artifacts"
+    fi
+fi
 
 # --- Step 4: Optional reference comparator ---
-REFERENCE_BLOCKER=""
-REFERENCE_REAL_SECONDS=""
-
 if [[ "${SKIP_REFERENCE}" == "true" ]]; then
     REFERENCE_BLOCKER="skipped: --skip-reference flag set"
     echo ""
@@ -190,7 +364,7 @@ else
     echo ""
     echo "--- Step 4: Running alpha-beta-CROWN reference (cersyve, start=2, end=4) ---"
     REFERENCE_OUTPUT="${OUTPUT_DIR}/issue-4359-abcrown-cersyve-reference.log"
-    if ${TIME_CMD} -p ${PYTHON_CMD} "${ABCROWN_DIR}/abcrown.py" \
+    if "${TIME_CMD}" -p "${PYTHON_CMD}" "${ABCROWN_DIR}/abcrown.py" \
         --config "${ABCROWN_DIR}/exp_configs/vnncomp25/cersyve.yaml" \
         --start 2 --end 4 \
         > "${REFERENCE_OUTPUT}" 2>&1; then
@@ -212,29 +386,14 @@ echo "--- Step 5: Writing manifest ---"
 
 # Determine verdict state
 VERDICT="blocked"
-if [[ -n "${REFERENCE_BLOCKER}" ]]; then
+if [[ -n "${BLOCKER}" || -n "${REFERENCE_BLOCKER}" ]]; then
     VERDICT="blocked"
 elif [[ -n "${REFERENCE_REAL_SECONDS}" ]]; then
     # We have both ny and reference data — verdict will be computed by renderer
     VERDICT="pending"
 fi
 
-cat > "$MANIFEST_FILE" <<MANIFEST_EOF
-{
-    "schema": "nvidia_vulkan_validation_manifest_v1",
-    "verdict": "${VERDICT}",
-    "blocker": $(if [[ -n "${REFERENCE_BLOCKER}" ]]; then echo "\"${REFERENCE_BLOCKER}\""; else echo "null"; fi),
-    "host_info_path": "$(basename "$HOST_INFO_FILE")",
-    "measure_log_path": "$(basename "$MEASURE_LOG")",
-    "measure_csv_path": "$(basename "$MEASURE_CSV")",
-    "vulkan_confirmed": true,
-    "adapter_line": "${ADAPTER_LINE}",
-    "compare_backends_cersyve_csv": $(if [[ -n "${CERSYVE_CSV}" ]]; then echo "\"$(basename "$CERSYVE_CSV")\""; else echo "null"; fi),
-    "compare_backends_metaroom_csv": $(if [[ -n "${METAROOM_CSV}" ]]; then echo "\"$(basename "$METAROOM_CSV")\""; else echo "null"; fi),
-    "reference_blocker": $(if [[ -n "${REFERENCE_BLOCKER}" ]]; then echo "\"${REFERENCE_BLOCKER}\""; else echo "null"; fi),
-    "reference_cersyve_real_seconds": $(if [[ -n "${REFERENCE_REAL_SECONDS}" ]]; then echo "${REFERENCE_REAL_SECONDS}"; else echo "null"; fi)
-}
-MANIFEST_EOF
+write_validation_manifest
 
 echo "Wrote: ${MANIFEST_FILE}"
 echo ""

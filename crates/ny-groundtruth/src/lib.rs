@@ -85,7 +85,10 @@ mod exact;
 pub use builders::{
     cone_residual, cylinder_residual, signed_plane_distance, sphere_residual, torus_residual,
 };
-pub use cert::{certify_dominance, DominanceCertError, DominanceCertificate};
+pub use cert::{
+    certify_dominance, certify_dominance_with, DominanceCertError, DominanceCertOptions,
+    DominanceCertificate,
+};
 pub use compose::{max_of, min_of, with_pose, Pose};
 pub use error::{GroundTruthError, Result};
 pub use escalate::{EscalateError, EscalateOptions, SmtEscalation, SmtVerdict};

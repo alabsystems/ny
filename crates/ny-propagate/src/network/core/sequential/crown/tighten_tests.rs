@@ -13,8 +13,9 @@
 
 use super::*;
 use ndarray::{arr1, Array1};
-use ny_core::Result;
+use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
+use std::time::{Duration, Instant};
 
 /// Helper: create 1D BoundedTensor from slices.
 fn bounded_1d(lower: &[f32], upper: &[f32]) -> BoundedTensor {
@@ -295,5 +296,58 @@ fn test_tighten_with_provenance_shape_mismatch_returns_crown() -> Result<()> {
         provenance
     );
     assert_eq!(result.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn deadline_tightening_rejects_expired_publication() {
+    let forward = bounded_1d(&[-5.0, -3.0], &[10.0, 8.0]);
+    let crown = bounded_1d(&[-2.0, -1.0], &[7.0, 5.0]);
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("system uptime exceeds one millisecond");
+
+    let error =
+        tighten_crown_output_with_provenance_and_deadline(crown, &forward, "test", Some(expired))
+            .expect_err("an expired authority must not publish tightened bounds");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
+}
+
+#[test]
+fn deadline_tightening_forward_clone_has_structured_budget_refusal() {
+    crate::tests::with_env_edits(|env| {
+        env.set("NY_DENSE_BUDGET_MB", "0");
+        let forward = bounded_1d(&[-3.0], &[5.0]);
+        let crown =
+            BoundedTensor::new_unchecked(arr1(&[-2.0f32]).into_dyn(), arr1(&[f32::NAN]).into_dyn())
+                .expect("NaN fixture uses unchecked constructor");
+
+        let error = tighten_crown_output_with_provenance_and_deadline(
+            crown,
+            &forward,
+            "test",
+            Some(Instant::now() + Duration::from_secs(1)),
+        )
+        .expect_err("zero budget must refuse the forward fallback clone");
+        assert!(matches!(error, NyError::CpuMemoryExceeded { .. }));
+    });
+}
+
+#[test]
+fn deadline_tightening_preserves_minsub_endpoint_order() -> Result<()> {
+    let minsub = f32::from_bits(1);
+    let crown = bounded_1d(&[minsub], &[f32::from_bits(2)]);
+    let forward = bounded_1d(&[0.0], &[minsub]);
+
+    let (result, provenance) = tighten_crown_output_with_provenance_and_deadline(
+        crown,
+        &forward,
+        "test",
+        Some(Instant::now() + Duration::from_secs(1)),
+    )?;
+
+    assert_eq!(result.lower()[[0]].to_bits(), minsub.to_bits());
+    assert_eq!(result.upper()[[0]].to_bits(), minsub.to_bits());
+    assert!(matches!(provenance, BoundsProvenance::Crown));
     Ok(())
 }

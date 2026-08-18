@@ -38,8 +38,9 @@ mod subgraph;
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_composition_boundary_discovers_unique_mfa_chain_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let graph = avoice_speaker_encoder_graph();
     let boundary = boundary::discover_ecapa_composition_boundary(graph)
         .expect("MFA boundary discovery should succeed on the real ECAPA graph");
@@ -92,8 +93,9 @@ fn test_ecapa_composition_boundary_discovers_unique_mfa_chain_3499() {
 }
 
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_composition_slices_are_single_input_graphs_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let graph = avoice_speaker_encoder_graph();
     let boundary = boundary::discover_ecapa_composition_boundary(graph)
         .expect("MFA boundary discovery should succeed");
@@ -172,8 +174,9 @@ fn test_ecapa_composition_slices_are_single_input_graphs_3499() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_suffix_ibp_matches_full_encoder_from_exact_mfa_bounds_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input =

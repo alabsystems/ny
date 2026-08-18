@@ -16,7 +16,10 @@ use super::core::{
 use super::cosine::{
     run_ecapa_alpha_compositional_cosine_bounds, run_ecapa_compositional_cosine_bounds,
 };
-use super::stage_local::{collect_ecapa_stage_local_crown_ibp, run_ecapa_stage_local_crown_ibp};
+use super::stage_local::{
+    collect_ecapa_stage_local_crown_ibp, collect_ecapa_stage_local_crown_ibp_with_unbounded_engine,
+    run_ecapa_stage_local_crown_ibp,
+};
 use super::*;
 use ny_tensor::BoundedTensor;
 use std::time::{Duration, Instant};

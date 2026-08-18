@@ -5,11 +5,11 @@
 use crate::onnx_proto;
 use crate::{AttributeValue, LayerSpec, WeightStore};
 use ny_core::LayerType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::helpers::{
-    add_has_input_and_const, match_gelu_tanh_add, mul_const_other_input, mul_has_input_and_const,
-    mul_has_inputs,
+    add_has_input_and_const, fused_subgraph_is_closed, match_gelu_tanh_add, mul_const_other_input,
+    mul_has_input_and_const, mul_has_inputs,
 };
 
 pub(crate) fn try_fuse_gelu_tanh(
@@ -18,6 +18,7 @@ pub(crate) fn try_fuse_gelu_tanh(
     producer_by_output: &HashMap<&str, usize>,
     consumers_by_input: &HashMap<&str, Vec<usize>>,
     weights: &WeightStore,
+    graph_output_names: &HashSet<String>,
 ) -> Option<(usize, LayerSpec, Vec<usize>)> {
     // Pattern (tanh approximation):
     //   x -> (x^3) -> Mul(0.044715) -> Add(x, ...) -> Mul(sqrt(2/pi))
@@ -26,6 +27,15 @@ pub(crate) fn try_fuse_gelu_tanh(
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
 
     let tanh = &nodes[tanh_idx];
+    if tanh.op_type != "Tanh"
+        || tanh.input.len() != 1
+        || tanh.output.len() != 1
+        || tanh.input[0].is_empty()
+        || tanh.output[0].is_empty()
+        || !tanh.attribute.is_empty()
+    {
+        return None;
+    }
     let tanh_out = tanh.output.first()?.as_str();
     let tanh_in = tanh.input.first()?.as_str();
     let scale_idx = *producer_by_output.get(tanh_in)?;
@@ -99,6 +109,15 @@ pub(crate) fn try_fuse_gelu_tanh(
                 };
                 used.push(mul1_idx);
                 used.push(mul2_idx);
+                if !fused_subgraph_is_closed(
+                    nodes,
+                    &used,
+                    &spec.outputs,
+                    consumers_by_input,
+                    graph_output_names,
+                ) {
+                    return None;
+                }
                 return Some((start_idx, spec, used));
             }
         }
@@ -137,10 +156,107 @@ pub(crate) fn try_fuse_gelu_tanh(
                 };
                 used.push(mul1_idx);
                 used.push(mul2_idx);
+                if !fused_subgraph_is_closed(
+                    nodes,
+                    &used,
+                    &spec.outputs,
+                    consumers_by_input,
+                    graph_output_names,
+                ) {
+                    return None;
+                }
                 return Some((start_idx, spec, used));
             }
         }
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::arr0;
+
+    fn node(op_type: &str, inputs: &[&str], output: &str) -> onnx_proto::NodeProto {
+        onnx_proto::NodeProto {
+            op_type: op_type.to_string(),
+            input: inputs.iter().map(|input| (*input).to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn tanh_gelu_nodes() -> Vec<onnx_proto::NodeProto> {
+        vec![
+            node("Mul", &["x", "x"], "x2"),
+            node("Mul", &["x2", "x"], "x3"),
+            node("Mul", &["x3", "cubic_scale"], "scaled_x3"),
+            node("Add", &["x", "scaled_x3"], "poly"),
+            node("Mul", &["poly", "outer_scale"], "pre_tanh"),
+            node("Tanh", &["pre_tanh"], "tanh"),
+            node("Add", &["tanh", "one"], "add_one"),
+            node("Mul", &["x", "add_one"], "mul_x"),
+            node("Mul", &["mul_x", "half"], "out"),
+        ]
+    }
+
+    fn weights() -> WeightStore {
+        let mut weights = WeightStore::new();
+        for (name, value) in [
+            ("cubic_scale", 0.044_715_f32),
+            ("outer_scale", 0.797_884_6_f32),
+            ("one", 1.0),
+            ("half", 0.5),
+        ] {
+            weights.insert(name.to_string(), arr0(value).into_dyn());
+        }
+        weights
+    }
+
+    fn can_fuse(nodes: &[onnx_proto::NodeProto], graph_outputs: &[&str]) -> bool {
+        let mut producers = HashMap::new();
+        let mut consumers: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, node) in nodes.iter().enumerate() {
+            for output in &node.output {
+                producers.insert(output.as_str(), idx);
+            }
+            for input in &node.input {
+                consumers.entry(input.as_str()).or_default().push(idx);
+            }
+        }
+        let graph_outputs = graph_outputs
+            .iter()
+            .map(|output| (*output).to_string())
+            .collect();
+        try_fuse_gelu_tanh(nodes, 5, &producers, &consumers, &weights(), &graph_outputs).is_some()
+    }
+
+    #[test]
+    fn tanh_gelu_preserves_every_observable_intermediate() {
+        for intermediate in [
+            "x2",
+            "x3",
+            "scaled_x3",
+            "poly",
+            "pre_tanh",
+            "tanh",
+            "add_one",
+            "mul_x",
+        ] {
+            let mut nodes = tanh_gelu_nodes();
+            assert!(can_fuse(&nodes, &[]), "canonical graph must fuse");
+            nodes.push(node("Identity", &[intermediate], "aux"));
+            assert!(
+                !can_fuse(&nodes, &[]),
+                "must preserve external consumer of {intermediate}"
+            );
+
+            let nodes = tanh_gelu_nodes();
+            assert!(
+                !can_fuse(&nodes, &[intermediate]),
+                "must preserve graph output {intermediate}"
+            );
+        }
+    }
 }

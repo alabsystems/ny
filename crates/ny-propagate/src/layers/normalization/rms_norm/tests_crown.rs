@@ -273,9 +273,12 @@ fn test_crown_ibp_margin_widens_near_zero_inputs_3162() {
 #[test]
 fn test_crown_sampling_jacobian_overflow_returns_numerical_instability() {
     // ny = 1e35, eps = minimum → ny/rms overflows f32 to Inf.
-    let layer = RmsNormLayer::new(arr1(&[1e35, 1e35, 1e35]), 0.0) // eps clamped to 1e-12
-        .expect("valid RmsNorm")
-        .with_crown_mode(LayerNormCrownMode::Sampling);
+    let layer = RmsNormLayer::new(
+        arr1(&[1e35, 1e35, 1e35]),
+        crate::layers::normalization::NORMALIZATION_MIN_EPS,
+    )
+    .expect("valid RmsNorm")
+    .with_crown_mode(LayerNormCrownMode::Sampling);
 
     let bounds = LinearBounds::identity(3);
     // Nearly-zero inputs → rms ≈ sqrt(eps)

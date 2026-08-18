@@ -66,6 +66,20 @@ impl BetaCrownVerifier {
             return GraphDomainResult::Violation;
         }
 
+        let split_depth = super::super::cap_relu_split_depth_for_parent(
+            split_depth,
+            usize::MAX,
+            domain.depth,
+            self.config.max_depth,
+        );
+        if split_depth == 0 {
+            tracing::warn!(
+                parent_depth = domain.depth,
+                max_depth = self.config.max_depth,
+                "parallel domain processor refused a parent with no remaining depth budget"
+            );
+            return GraphDomainResult::PropagationFailure;
+        }
         // Check for GenBaB heuristic FIRST — GenBaB handles all nonlinearities
         // (GELU, Sigmoid, BilinearCrown, etc.), not just ReLU. The GenBaB path
         // has its own split_nodes discovery that includes BilinearCrown (#286).

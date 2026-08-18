@@ -10,7 +10,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 def create_test_pytorch_file(path: Path):
@@ -117,23 +120,23 @@ def test_pytorch_weights_diff():
 
         output = result.stdout
         # Should detect the difference
-        if "layer1.weight" not in output:
-            print("FAIL: Expected diff in layer1.weight")
+        if "DIFFERS" not in output or "layer1.weight" not in output:
+            print("FAIL: Expected a DIFFERS result naming layer1.weight")
             return False
 
         print("  - PyTorch to PyTorch diff: PASS")
 
     return True
 
-def test_pytorch_safetensors_diff():
+def test_pytorch_safetensors_diff() -> bool | None:
     """Test cross-format comparison: PyTorch vs SafeTensors."""
     print("Testing: ny weights diff PyTorch vs SafeTensors...")
 
     try:
         from safetensors.torch import save_file
     except ImportError:
-        print("  - Skipping (safetensors not installed)")
-        return True
+        print("  - SKIP: safetensors not installed")
+        return None
 
     with tempfile.TemporaryDirectory() as tmpdir:
         pt_path = Path(tmpdir) / "model.pt"
@@ -154,10 +157,9 @@ def test_pytorch_safetensors_diff():
             return False
 
         output = result.stdout
-        # Should show no differences (or very small ones due to precision)
-        if "Max difference" in output:
-            # Check that differences are tiny
-            pass
+        if "MATCH" not in output:
+            print("FAIL: Identical cross-format tensors were not reported as MATCH")
+            return False
 
         print("  - PyTorch to SafeTensors diff: PASS")
 
@@ -170,6 +172,10 @@ def main():
     print("=" * 60)
     print()
 
+    if torch is None:
+        print("SKIP: torch is required for PyTorch format integration tests")
+        return 0
+
     tests = [
         test_pytorch_weights_info,
         test_pytorch_weights_diff,
@@ -178,20 +184,24 @@ def main():
 
     passed = 0
     failed = 0
+    skipped = 0
 
     for test in tests:
         try:
-            if test():
+            result = test()
+            if result is True:
                 passed += 1
-            else:
+            elif result is False:
                 failed += 1
+            else:
+                skipped += 1
         except Exception as e:
             print(f"FAIL: {test.__name__} raised exception: {e}")
             failed += 1
 
     print()
     print("=" * 60)
-    print(f"Results: {passed} passed, {failed} failed")
+    print(f"Results: {passed} passed, {failed} failed, {skipped} skipped")
     print("=" * 60)
 
     return 0 if failed == 0 else 1

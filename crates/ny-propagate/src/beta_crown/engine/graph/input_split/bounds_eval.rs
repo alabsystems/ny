@@ -142,7 +142,7 @@ pub(crate) fn graph_spec_crown_with_mul_binary_and_truncation(
         .deadline_opt(deadline)
         .truncate_after_opt(crown_backward_layers)
         .run_with_linear()?;
-    // #cgan-fwdlin-ref (DARK, `NY_FORWARD_LINEAR_CONV_TRANSPOSE_REF=1`):
+    // #cgan-fwdlin-ref (default-ON, opt out `NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF=1`):
     // PER-DOMAIN forward-linear C-margin intersect. This is the input-split
     // per-child evaluation entry, and it wants the input LinearBounds — which
     // the spec-propagation root-candidate fast paths deliberately skip (their

@@ -86,13 +86,14 @@ use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use ndarray::{Array2, ArrayD, IxDyn};
+use anyhow::Context;
+use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_onnx::vnnlib::VnnLibSpec;
 use ny_propagate::{BabVerificationStatus, BetaCrownResult, GraphNetwork, Layer, NETWORK_INPUT};
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
-use super::cell_enum::{box_definitely_safe, concrete_violates};
+use super::cell_enum::{box_definitely_safe, concrete_violates, scalar_box_safety_directions};
 use super::BetaCrownModel;
 
 /// Maximum logit width `n` accepted by the detector (pensieve uses 6).
@@ -116,7 +117,7 @@ pub(super) fn try_frac_head_verification(
     model_net: &BetaCrownModel,
     input_shape: &[usize],
     vnnlib: &VnnLibSpec,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Option<BetaCrownResult> {
     if std::env::var_os("NY_NO_FRAC_HEAD").is_some_and(|v| v == "1") {
         return None;
@@ -298,19 +299,24 @@ fn parse_head<'a>(graph: &'a GraphNetwork, linear_name: &str) -> Option<HeadNode
     if linear_node.inputs().len() != 1 {
         return None;
     }
-    let n = linear.weight.ncols();
-    if linear.weight.nrows() != 1 || !(2..=MAX_LOGITS).contains(&n) {
+    let n = linear.weight().ncols();
+    if linear.weight().nrows() != 1 || !(2..=MAX_LOGITS).contains(&n) {
         return None;
     }
-    if linear.weight.iter().any(|w| !w.is_finite()) {
+    if linear.weight().iter().any(|w| !w.is_finite()) {
         return None;
     }
-    let bias = match &linear.bias {
+    let bias = match linear.bias() {
         None => 0.0,
         Some(b) if b.len() == 1 && b[0].is_finite() => f64::from(b[0]),
         Some(_) => return None,
     };
-    let coeffs: Vec<f64> = linear.weight.row(0).iter().map(|&w| f64::from(w)).collect();
+    let coeffs: Vec<f64> = linear
+        .weight()
+        .row(0)
+        .iter()
+        .map(|&w| f64::from(w))
+        .collect();
 
     let div_node = graph.node(&linear_node.inputs()[0])?;
     if !matches!(div_node.layer(), Layer::Div(_)) || div_node.inputs().len() != 2 {
@@ -1734,9 +1740,14 @@ impl<'a> NetState<'a> {
     }
 
     /// Refine up to `batch` worst leaves; returns false when nothing was
-    /// refined (heap exhausted). Children past `deadline` stay unbounded
-    /// (sound: unbounded leaves can never be claimed).
-    fn refine_round(&mut self, batch: usize, input_shape: &[usize], deadline: Instant) -> bool {
+    /// refined (heap exhausted). Children past a bounded `deadline` stay
+    /// unbounded (sound: unbounded leaves can never be claimed).
+    fn refine_round(
+        &mut self,
+        batch: usize,
+        input_shape: &[usize],
+        deadline: Option<Instant>,
+    ) -> bool {
         let mut work = Vec::with_capacity(batch);
         for _ in 0..batch {
             let Some(top) = self.heap.pop() else { break };
@@ -1776,7 +1787,7 @@ impl<'a> NetState<'a> {
                     let mut hi = leaf.hi.clone();
                     lo[d] = a;
                     hi[d] = b;
-                    let (s, scores) = if Instant::now() < deadline {
+                    let (s, scores) = if deadline.is_none_or(|deadline| Instant::now() < deadline) {
                         match bound_head(head, &lo, &hi, input_shape, need, leaf.s) {
                             Some(eval) => (eval.s, eval.scores.or_else(|| leaf.scores.clone())),
                             None => (None, leaf.scores.clone()),
@@ -1807,12 +1818,11 @@ impl<'a> NetState<'a> {
 fn run_refinement(
     plan: &FracHeadPlan,
     vnnlib: &VnnLibSpec,
-    deadline: Instant,
+    deadline: Option<Instant>,
     start: Instant,
 ) -> Option<BetaCrownResult> {
     // Which direction of the Y cover can prove safety?
-    let raise_lb = box_definitely_safe(&[f64::INFINITY], &[f64::INFINITY], vnnlib);
-    let lower_ub = box_definitely_safe(&[f64::NEG_INFINITY], &[f64::NEG_INFINITY], vnnlib);
+    let (raise_lb, lower_ub) = scalar_box_safety_directions(vnnlib);
     let (obj_a, obj_b) = match (raise_lb, lower_ub) {
         (true, _) => (Objective::Min, Objective::Max),
         (_, true) => (Objective::Max, Objective::Min),
@@ -1912,7 +1922,7 @@ fn run_refinement(
         }
 
         if rounds >= MAX_ROUNDS
-            || Instant::now() >= deadline
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
             || net_a.live_leaves + net_b.live_leaves > MAX_LEAVES
         {
             info!(
@@ -2250,6 +2260,133 @@ mod probe {
             head.exponent,
         );
     }
+}
+
+/// Compare the forward-linear root fast path with the full spec-CROWN
+/// backward pass on an explicitly supplied Pensieve fixture.
+///
+/// This is a measurement lane, not a verifier verdict path. It runs serially
+/// and caps per-node attribution at prefixes with at most 512 outputs.
+pub(super) fn run_fastpath_gap_probe(
+    onnx: &std::path::Path,
+    vnnlib_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(onnx.is_file(), "missing ONNX file {}", onnx.display());
+    anyhow::ensure!(
+        vnnlib_path.is_file(),
+        "missing VNN-LIB file {}",
+        vnnlib_path.display()
+    );
+
+    let model = ny_onnx::load_onnx_with_config(onnx, &ny_onnx::OnnxLoadConfig::default())
+        .with_context(|| format!("load ONNX model {}", onnx.display()))?;
+    let graph = model
+        .to_graph_network_with_options(ny_onnx::GraphNetworkOptions::default())
+        .context("convert Pensieve model to graph network")?;
+    let vnnlib = ny_onnx::vnnlib::load_vnnlib(vnnlib_path)
+        .with_context(|| format!("load VNN-LIB property {}", vnnlib_path.display()))?;
+
+    let plan = detect(&graph, &[12, 8], &vnnlib)
+        .ok_or_else(|| anyhow::anyhow!("fixture is not a supported [12, 8] fractional head"))?;
+    let n_inputs = plan.root_lo.len();
+    let lower = Array1::from_iter(plan.root_lo.iter().map(|&v| v as f32));
+    let upper = Array1::from_iter(plan.root_hi.iter().map(|&v| v as f32));
+    let input = ny_tensor::BoundedTensor::new(
+        lower.into_shape_with_order(IxDyn(&plan.input_shape))?,
+        upper.into_shape_with_order(IxDyn(&plan.input_shape))?,
+    )
+    .context("construct fractional-head root box")?;
+    println!("root box: {n_inputs} inputs, shape {:?}", plan.input_shape);
+
+    for (hidx, head) in plan.heads.iter().enumerate() {
+        let n = head.coeffs.len();
+        let mut spec = Array2::<f32>::zeros((n + 1, n));
+        for i in 0..n {
+            spec[[i, i]] = 1.0;
+            spec[[n, i]] = 1.0;
+        }
+
+        let t0 = Instant::now();
+        let fast = head
+            .pow_graph
+            .propagate_crown_with_specs_and_engine(&input, &spec, None)
+            .with_context(|| format!("run fast path for head {hidx}"))?;
+        let t_fast = t0.elapsed();
+        let t0 = Instant::now();
+        let (full, _) = head
+            .pow_graph
+            .propagate_crown_with_specs_and_engine_with_linear(&input, &spec, None)
+            .with_context(|| format!("run full backward path for head {hidx}"))?;
+        let t_full = t0.elapsed();
+
+        println!(
+            "\nhead {hidx}: pow graph {} nodes; fast(plain entry) {:.3}s vs full(_with_linear) {:.3}s",
+            head.pow_graph.num_nodes(),
+            t_fast.as_secs_f64(),
+            t_full.as_secs_f64()
+        );
+        for r in 0..=n {
+            let name = if r < n {
+                format!("p[{r}]")
+            } else {
+                "sum(p)".to_string()
+            };
+            println!(
+                "  {name:<8} fast [{:>12.5}, {:>12.5}]  full [{:>12.5}, {:>12.5}]  gap(lo {:+.5}, hi {:+.5})",
+                fast.lower()[r],
+                fast.upper()[r],
+                full.lower()[r],
+                full.upper()[r],
+                full.lower()[r] - fast.lower()[r],
+                fast.upper()[r] - full.upper()[r],
+            );
+        }
+
+        if hidx == 0 {
+            let fwd_boxes = head
+                .pow_graph
+                .collect_forward_linear_bounds_dag_with_engine(&input, None)
+                .context("collect forward-linear prefix boxes")?;
+            println!(
+                "  {:<28} {:>13} {:>13} {:>9}",
+                "node", "fwd_max_w", "bwd_max_w", "ratio"
+            );
+            for name in head.pow_graph.exec_order().context("order pow graph")? {
+                let Some(prefix) = extract_prefix(&head.pow_graph, name) else {
+                    continue;
+                };
+                let Some(fwd) = fwd_boxes.get(name) else {
+                    continue;
+                };
+                let dim = fwd.len();
+                if dim > 512 {
+                    continue;
+                }
+                let ident = Array2::<f32>::eye(dim);
+                let Ok((bwd, _)) =
+                    prefix.propagate_crown_with_specs_and_engine_with_linear(&input, &ident, None)
+                else {
+                    continue;
+                };
+                let max_w = |b: &ny_tensor::BoundedTensor| {
+                    b.lower()
+                        .iter()
+                        .zip(b.upper().iter())
+                        .map(|(&l, &u)| u - l)
+                        .fold(0.0f32, f32::max)
+                };
+                let (fw, bw) = (max_w(fwd), max_w(&bwd));
+                println!(
+                    "  {:<28} {:>13.6} {:>13.6} {:>9.3}",
+                    name,
+                    fw,
+                    bw,
+                    if bw > 0.0 { fw / bw } else { f32::NAN }
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -108,7 +108,7 @@ impl BetaCrownVerifier {
                     .cloned()
                     .ok_or_else(|| {
                         NyError::InternalError(format!(
-                            "GPU BaB: unstable_batched missing at picked_idx={} \
+                            "DomainList BaB: unstable_batched missing at picked_idx={} \
                              (len={}) — domain would be treated as fully stable",
                             picked_idx,
                             ctx.unstable_batched.len(),
@@ -177,15 +177,15 @@ impl BetaCrownVerifier {
                             warn!(
                                 picked_idx,
                                 domain_depth = domain.depth,
-                                "GPU BaB NoUnstable domain propagation failed; aborting to avoid silent unknown classification"
+                                "DomainList BaB NoUnstable domain propagation failed; aborting to avoid silent unknown classification"
                             );
                             return Err(NyError::InternalError(format!(
-                                "GPU BaB: NoUnstable leaf propagation failed at picked_idx={picked_idx}"
+                                "DomainList BaB: NoUnstable leaf propagation failed at picked_idx={picked_idx}"
                             )));
                         }
                         other => {
                             return Err(NyError::InternalError(format!(
-                                "GPU BaB: unexpected leaf result {other:?} at picked_idx={picked_idx}"
+                                "DomainList BaB: unexpected leaf result {other:?} at picked_idx={picked_idx}"
                             )));
                         }
                     }
@@ -358,7 +358,7 @@ impl BetaCrownVerifier {
             }) => (results.into_iter().map(Some).collect(), intermediate_la),
             Err(err) => {
                 warn!(
-                    "GPU BaB batched backward failed ({}); falling back to sequential with beta optimization",
+                    "DomainList BaB batched backward failed ({}); falling back to sequential with beta optimization",
                     err
                 );
                 // Part of #1484: Use evaluate_graph_child_bounds for fallback
@@ -386,7 +386,7 @@ impl BetaCrownVerifier {
                                         child_depth = child.depth,
                                         lower = child.lower_bound,
                                         upper = child.upper_bound,
-                                        "GPU BaB fallback child dropped: non-finite bounds"
+                                        "DomainList BaB fallback child dropped: non-finite bounds"
                                     );
                                     return None;
                                 }
@@ -405,7 +405,7 @@ impl BetaCrownVerifier {
                                             child_idx = fallback_child_idx,
                                             child_depth = child.depth,
                                             error = %err,
-                                            "GPU BaB fallback child dropped: failed to build output bounded tensor"
+                                            "DomainList BaB fallback child dropped: failed to build output bounded tensor"
                                         );
                                         None
                                     }
@@ -415,7 +415,7 @@ impl BetaCrownVerifier {
                                 warn!(
                                     child_idx = fallback_child_idx,
                                     child_depth = child.depth,
-                                    "GPU BaB fallback child dropped: evaluate_graph_child_bounds returned no bounds"
+                                    "DomainList BaB fallback child dropped: evaluate_graph_child_bounds returned no bounds"
                                 );
                                 None
                             }
@@ -424,7 +424,7 @@ impl BetaCrownVerifier {
                                 debug!(
                                     child_idx = fallback_child_idx,
                                     child_depth = child.depth,
-                                    "GPU BaB fallback: infeasible domain (empty), pruning"
+                                    "DomainList BaB fallback: infeasible domain (empty), pruning"
                                 );
                                 None
                             }
@@ -433,7 +433,7 @@ impl BetaCrownVerifier {
                                     child_idx = fallback_child_idx,
                                     child_depth = child.depth,
                                     error = %err,
-                                    "GPU BaB fallback child dropped: evaluate_graph_child_bounds failed"
+                                    "DomainList BaB fallback child dropped: evaluate_graph_child_bounds failed"
                                 );
                                 None
                             }
@@ -483,7 +483,7 @@ impl BetaCrownVerifier {
                     child_depth = child.depth,
                     lower,
                     upper,
-                    "GPU BaB primary path child dropped: non-finite bounds"
+                    "DomainList BaB primary path child dropped: non-finite bounds"
                 );
                 lower_bounds_vec.push(f32::NEG_INFINITY);
                 upper_bounds_vec.push(f32::INFINITY);
@@ -575,7 +575,7 @@ impl BetaCrownVerifier {
                             child_depth = child.depth,
                             lower = child.lower_bound,
                             upper = child.upper_bound,
-                            "GPU BaB beta refinement child has non-finite bounds, \
+                            "DomainList BaB beta refinement child has non-finite bounds, \
                              keeping batched bounds"
                         );
                         // Don't update bounds — keep the batched values from the
@@ -746,7 +746,7 @@ mod tests {
     }
 
     /// Regression test for #2784: when `branch_relu_from_picked` cannot build a
-    /// child due to invalid bounds (for example NaN contamination), GPU BaB must
+    /// child due to invalid bounds (for example NaN contamination), DomainList BaB must
     /// mark propagation failure so final classification is Unknown, not Verified.
     #[ntest::timeout(5000)]
     #[test]

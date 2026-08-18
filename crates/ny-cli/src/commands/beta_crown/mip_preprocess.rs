@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// Network preprocessing utilities for HiGHS MIP verification.
+// Network preprocessing utilities for feed-forward MIP verification.
 // Extracts parameters, folds constants, strips shape layers.
 //
 // Part of #1763.
@@ -74,15 +74,15 @@ pub(super) fn extract_linear_relu_params(network: &Network) -> Result<NetworkPar
 
     for layer in network.layers() {
         if let Layer::Linear(linear) = layer {
-            let (out_dim, in_dim) = linear.weight.dim();
+            let (out_dim, in_dim) = linear.weight().dim();
             if first_layer {
                 layer_dims.push(in_dim);
                 first_layer = false;
             }
             layer_dims.push(out_dim);
-            let weight_vec: Vec<f64> = linear.weight.iter().map(|&x| x as f64).collect();
+            let weight_vec: Vec<f64> = linear.weight().iter().map(|&x| x as f64).collect();
             weights.push(weight_vec);
-            let bias_vec: Vec<f64> = match &linear.bias {
+            let bias_vec: Vec<f64> = match linear.bias() {
                 Some(b) => b.iter().map(|&x| x as f64).collect(),
                 None => vec![0.0; out_dim],
             };
@@ -93,7 +93,7 @@ pub(super) fn extract_linear_relu_params(network: &Network) -> Result<NetworkPar
     Ok((weights, biases, layer_dims))
 }
 
-/// Convert BoundedTensor to Vec<Bound>.
+/// Convert `BoundedTensor` to `Vec<Bound>`.
 pub(super) fn bounded_tensor_to_bounds(tensor: &BoundedTensor) -> Result<Vec<Bound>> {
     tensor
         .lower()
@@ -157,7 +157,7 @@ pub(super) fn convert_intermediate_bounds(
 /// Strip shape-only layers (Flatten, Reshape) that don't affect computation.
 ///
 /// ONNX models commonly start with a Flatten layer to convert 2D image tensors
-/// into 1D vectors. For MIP encoding, input is already flat (Vec<Bound>), so
+/// into 1D vectors. For MIP encoding, input is already flat (`Vec<Bound>`), so
 /// these layers are no-ops that we skip.
 pub(super) fn strip_shape_layers(network: &Network) -> Network {
     let mut stripped = Network::new();
@@ -246,7 +246,7 @@ pub(super) fn fold_constant_layers(network: &Network) -> Result<FoldedMipNetwork
                     .map(|&value| checked_f32(value, "structural folded Linear"))
                     .collect::<Result<Vec<_>>>()?;
                 folded.add_layer(Layer::Linear(LinearLayer::new(
-                    linear.layer.weight.clone(),
+                    linear.layer.weight().clone(),
                     Some(Array1::from_vec(structural_bias)),
                 )?));
                 exact_biases.push(exact_bias);
@@ -298,11 +298,11 @@ impl FoldEntry {
         let Layer::Linear(linear) = layer else {
             return Ok(Self::Other(layer.clone()));
         };
-        if linear.weight.iter().any(|value| !value.is_finite()) {
+        if linear.weight().iter().any(|value| !value.is_finite()) {
             anyhow::bail!("constant folding: Linear has a non-finite weight");
         }
-        let out_dim = linear.weight.nrows();
-        let bias = match &linear.bias {
+        let out_dim = linear.weight().nrows();
+        let bias = match linear.bias() {
             Some(bias) => bias
                 .iter()
                 .enumerate()
@@ -406,7 +406,7 @@ fn checked_f32(value: f64, context: &str) -> Result<f32> {
 }
 
 fn rat_f32(value: f32, context: &str) -> Result<BigRational> {
-    BigRational::from_float(value as f64)
+    BigRational::from_float(value)
         .ok_or_else(|| anyhow::anyhow!("{context}: non-finite f32 coefficient {value}"))
 }
 
@@ -433,7 +433,7 @@ fn fold_constant_after_linear(
     constant: &ArrayD<f32>,
     subtract: bool,
 ) -> Result<FoldEntry> {
-    let (out_dim, _) = linear.layer.weight.dim();
+    let (out_dim, _) = linear.layer.weight().dim();
     let constant = constant_feature_vector(constant, out_dim, "constant after Linear")?;
     let mut folded = linear.clone();
     for row in 0..out_dim {
@@ -452,7 +452,7 @@ fn fold_constant_before_linear(
     constant: &ArrayD<f32>,
     subtract: bool,
 ) -> Result<FoldEntry> {
-    let (out_dim, in_dim) = linear.layer.weight.dim();
+    let (out_dim, in_dim) = linear.layer.weight().dim();
     let constant = constant_feature_vector(constant, in_dim, "constant before Linear")?;
     let constant = constant
         .iter()
@@ -464,7 +464,7 @@ fn fold_constant_before_linear(
         let mut contribution = BigRational::zero();
         for (col, c) in constant.iter().enumerate() {
             let weight = rat_f32(
-                linear.layer.weight[[row, col]],
+                linear.layer.weight()[[row, col]],
                 &format!("constant-before-Linear weight [{row},{col}]"),
             )?;
             contribution += weight * c;
@@ -480,7 +480,7 @@ fn fold_constant_before_linear(
 
 /// Unfold Conv2d layers into equivalent Linear layers for MIP encoding.
 ///
-/// A Conv2d with kernel W[OC,IC,KH,KW], stride (SH,SW), padding (PH,PW)
+/// A Conv2d with kernel `W[OC, IC, KH, KW]`, stride `(SH, SW)`, padding `(PH, PW)`
 /// on input (IC,IH,IW) is mathematically equivalent to a Linear layer with
 /// weight matrix of shape (OC*OH*OW, IC*IH*IW) — the Toeplitz/im2col matrix.
 ///
@@ -683,13 +683,13 @@ mod tests {
         for layer in network.layers() {
             match layer {
                 Layer::Linear(linear) => {
-                    let (out_dim, in_dim) = linear.weight.dim();
+                    let (out_dim, in_dim) = linear.weight().dim();
                     assert_eq!(value.len(), in_dim);
                     value = (0..out_dim)
                         .map(|row| {
-                            let bias = linear.bias.as_ref().map_or(0.0, |b| b[row] as f64);
+                            let bias = linear.bias().map_or(0.0, |b| b[row] as f64);
                             bias + (0..in_dim)
-                                .map(|col| linear.weight[[row, col]] as f64 * value[col])
+                                .map(|col| linear.weight()[[row, col]] as f64 * value[col])
                                 .sum::<f64>()
                         })
                         .collect();
@@ -729,16 +729,15 @@ mod tests {
         for layer in network.layers() {
             match layer {
                 Layer::Linear(linear) => {
-                    let (out_dim, in_dim) = linear.weight.dim();
+                    let (out_dim, in_dim) = linear.weight().dim();
                     assert_eq!(value.len(), in_dim);
                     value = (0..out_dim)
                         .map(|row| {
-                            let mut output =
-                                linear.bias.as_ref().map_or_else(BigRational::zero, |bias| {
-                                    rat_f32(bias[row], "exact test bias").unwrap()
-                                });
+                            let mut output = linear.bias().map_or_else(BigRational::zero, |bias| {
+                                rat_f32(bias[row], "exact test bias").unwrap()
+                            });
                             for col in 0..in_dim {
-                                output += rat_f32(linear.weight[[row, col]], "exact test weight")
+                                output += rat_f32(linear.weight()[[row, col]], "exact test weight")
                                     .unwrap()
                                     * &value[col];
                             }
@@ -792,16 +791,18 @@ mod tests {
                 Layer::Linear(linear) => {
                     let bias = &folded.exact_biases()[bias_index];
                     bias_index += 1;
-                    let (out_dim, in_dim) = linear.weight.dim();
+                    let (out_dim, in_dim) = linear.weight().dim();
                     assert_eq!(value.len(), in_dim);
                     value = (0..out_dim)
                         .map(|row| {
                             let mut output = BigRational::from_float(bias[row]).unwrap();
                             for col in 0..in_dim {
-                                output +=
-                                    rat_f32(linear.weight[[row, col]], "folded exact test weight")
-                                        .unwrap()
-                                        * &value[col];
+                                output += rat_f32(
+                                    linear.weight()[[row, col]],
+                                    "folded exact test weight",
+                                )
+                                .unwrap()
+                                    * &value[col];
                             }
                             output
                         })
@@ -829,12 +830,12 @@ mod tests {
                 Layer::Linear(linear) => {
                     let bias = &folded.exact_biases()[bias_index];
                     bias_index += 1;
-                    let (out_dim, in_dim) = linear.weight.dim();
+                    let (out_dim, in_dim) = linear.weight().dim();
                     value = (0..out_dim)
                         .map(|row| {
                             bias[row]
                                 + (0..in_dim)
-                                    .map(|col| linear.weight[[row, col]] as f64 * value[col])
+                                    .map(|col| linear.weight()[[row, col]] as f64 * value[col])
                                     .sum::<f64>()
                         })
                         .collect();
@@ -962,7 +963,7 @@ mod tests {
         let Layer::Linear(linear) = &folded.layers()[0] else {
             panic!("ACAS constant prelude must reduce to one Linear");
         };
-        let bias = linear.bias.as_ref().unwrap();
+        let bias = linear.bias().unwrap();
         // b' = b - W*[1,-2,.5] + [.25,-.75]
         assert_close(bias[0], -3.9, "ACAS folded bias[0]");
         assert_close(bias[1], 9.05, "ACAS folded bias[1]");
@@ -1007,7 +1008,7 @@ mod tests {
         let Layer::Linear(linear) = &folded.layers()[0] else {
             panic!("both-sided constant chain must reduce to Linear");
         };
-        let bias = linear.bias.as_ref().unwrap();
+        let bias = linear.bias().unwrap();
         // The pre-linear shift is c=[.25,-1.5,3], then post shift=[1.5,-4].
         // b' = b + Wc + post.
         assert_close(bias[0], 6.375, "both-sided folded bias[0]");
@@ -1039,7 +1040,7 @@ mod tests {
         };
         assert_eq!(folded.layers().len(), 1);
         // 4 + [1,1,1] dot [1,2,3] - 2.5 = 7.5
-        assert_close(linear.bias.as_ref().unwrap()[0], 7.5, "broadcast bias");
+        assert_close(linear.bias().unwrap()[0], 7.5, "broadcast bias");
     }
 
     #[test]
@@ -1127,7 +1128,7 @@ mod tests {
             .layers()
             .iter()
             .find_map(|layer| match layer {
-                Layer::Linear(linear) => Some(linear.weight.ncols()),
+                Layer::Linear(linear) => Some(linear.weight().ncols()),
                 _ => None,
             })
             .expect("external ACAS model has a Linear layer");
@@ -1174,15 +1175,15 @@ mod tests {
         );
     }
 
-    /// Opt-in real-model audit used by the score campaign.  It is a no-op in
-    /// ordinary CI; provide `NY_TEST_ACAS_FOLD_MODEL` and optionally
+    /// Opt-in real-model audit used by the score campaign. Provide
+    /// `NY_TEST_ACAS_FOLD_MODEL` and optionally
     /// `NY_TEST_ACAS_FOLD_VNNLIB` to prove exact algebraic parity and exact MIP
     /// topology on the sealed ACAS network and deterministic property samples.
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn external_acas_constant_fold_is_exact_on_deterministic_samples() {
-        let Some(model_path) = std::env::var_os("NY_TEST_ACAS_FOLD_MODEL") else {
-            return;
-        };
+        let model_path = std::env::var_os("NY_TEST_ACAS_FOLD_MODEL")
+            .expect("set NY_TEST_ACAS_FOLD_MODEL when running this external conformance audit");
         let vnnlib_path =
             std::env::var_os("NY_TEST_ACAS_FOLD_VNNLIB").map(std::path::PathBuf::from);
         audit_external_acas_fold(
@@ -1192,9 +1193,8 @@ mod tests {
     }
 
     fn audit_external_acas_v2_row(row_index: usize, onnx: &str) {
-        let Some(version_root) = std::env::var_os("NY_TEST_ACAS_V2_ROOT") else {
-            return;
-        };
+        let version_root = std::env::var_os("NY_TEST_ACAS_V2_ROOT")
+            .expect("set NY_TEST_ACAS_V2_ROOT when running this external conformance audit");
         let version_root = std::path::PathBuf::from(version_root);
         let vnnlib = "vnnlib/prop_2.vnnlib";
         let expected_row = format!("onnx/{onnx},{vnnlib},116");
@@ -1213,12 +1213,14 @@ mod tests {
 
     /// Opt-in exact regression for VNN-COMP ACAS v2 physical row 66.
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn external_acas_row66_fold_matches_mip_topology_and_algebra() {
         audit_external_acas_v2_row(66, "ACASXU_run2a_3_3_batch_2000.onnx");
     }
 
     /// Opt-in exact regression for VNN-COMP ACAS v2 physical row 74.
     #[test]
+    #[cfg(feature = "external-vnncomp")]
     fn external_acas_row74_fold_matches_mip_topology_and_algebra() {
         audit_external_acas_v2_row(74, "ACASXU_run2a_4_2_batch_2000.onnx");
     }
@@ -1254,9 +1256,9 @@ mod tests {
 
         // Output: 2 channels * 3 rows * 3 cols = 18 outputs
         // Input: 1 channel * 4 rows * 4 cols = 16 inputs
-        assert_eq!(linear.weight.dim(), (18, 16));
-        assert!(linear.bias.is_some());
-        let bias = linear.bias.as_ref().unwrap();
+        assert_eq!(linear.weight().dim(), (18, 16));
+        assert!(linear.bias().is_some());
+        let bias = linear.bias().unwrap();
         assert_eq!(bias.len(), 18);
 
         // Verify bias broadcast: first 9 entries should be 0.5, next 9 should be -0.5
@@ -1271,16 +1273,16 @@ mod tests {
         // This output pixel depends on input positions (0,0), (0,1), (1,0), (1,1)
         // with kernel weights [1, 0, 0, 1]
         let out_idx = 0; // oc=0, oh=0, ow=0
-        assert_eq!(linear.weight[[out_idx, 0]], 1.0); // (0,0) * 1
-        assert_eq!(linear.weight[[out_idx, 1]], 0.0); // (0,1) * 0
-        assert_eq!(linear.weight[[out_idx, 4]], 0.0); // (1,0) * 0
-        assert_eq!(linear.weight[[out_idx, 5]], 1.0); // (1,1) * 1
+        assert_eq!(linear.weight()[[out_idx, 0]], 1.0); // (0,0) * 1
+        assert_eq!(linear.weight()[[out_idx, 1]], 0.0); // (0,1) * 0
+        assert_eq!(linear.weight()[[out_idx, 4]], 0.0); // (1,0) * 0
+        assert_eq!(linear.weight()[[out_idx, 5]], 1.0); // (1,1) * 1
 
         // Verify concrete computation: apply the Linear to a known input
         // Input: 4x4 all ones → Conv2d output at (0,0,0) should be 1*1 + 0*1 + 0*1 + 1*1 = 2
         let input_flat: Vec<f32> = vec![1.0; 16];
         let output: f32 = (0..16)
-            .map(|j| linear.weight[[out_idx, j]] * input_flat[j])
+            .map(|j| linear.weight()[[out_idx, j]] * input_flat[j])
             .sum::<f32>()
             + bias[out_idx];
         assert_eq!(output, 2.5); // 2.0 + 0.5 bias
@@ -1308,13 +1310,13 @@ mod tests {
         };
 
         // Same spatial: 9 outputs, 9 inputs
-        assert_eq!(linear.weight.dim(), (9, 9));
+        assert_eq!(linear.weight().dim(), (9, 9));
 
         // Identity kernel with padding=1 should produce identity matrix
         for i in 0..9 {
             for j in 0..9 {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert_eq!(linear.weight[[i, j]], expected, "weight[{},{}]", i, j);
+                assert_eq!(linear.weight()[[i, j]], expected, "weight[{},{}]", i, j);
             }
         }
     }

@@ -2055,3 +2055,173 @@ proptest! {
         }
     }
 }
+
+// ===== SubConstant broadcast CROWN backward (#ml4acopf-genbab) =====
+//
+// The ml4acopf trigonometric threshold banks contain
+// `Sub(x[1,P,1], thresholds[K]) -> [1,P,K]`: the variable input expands along
+// the last axis while the constant broadcasts across the leading axes. The
+// CROWN backward previously hard-errored with
+// `ShapeMismatch { expected: [P*K], got: [K] }`, killing every GenBaB child
+// propagation on the ml4acopf_2024 benchmark.
+
+fn broadcast_c3_layer(reverse: bool) -> SubConstantLayer {
+    let c = ArrayD::from_shape_vec(IxDyn(&[3]), vec![10.0, 20.0, 30.0]).unwrap();
+    if reverse {
+        SubConstantLayer::new_reverse(c)
+    } else {
+        SubConstantLayer::new(c)
+    }
+}
+
+fn broadcast_pre_x21() -> BoundedTensor {
+    BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 2, 1]), -1.0),
+        ArrayD::from_elem(IxDyn(&[1, 2, 1]), 1.0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_subconstant_broadcast_crown_backward_reduces_columns_ml4acopf() {
+    // y = broadcast(x[1,2,1]) - broadcast(c[3]) -> [1,2,3] (flat 6).
+    let layer = broadcast_c3_layer(false);
+    let a = Array2::from_shape_vec((1, 6), vec![1., 2., 3., 4., 5., 6.]).unwrap();
+    let bounds =
+        LinearBounds::new(a.clone(), ndarray::array![0.5], a, ndarray::array![0.5]).unwrap();
+    let out = layer
+        .propagate_crown_backward(&bounds, Some(&broadcast_pre_x21()))
+        .expect("broadcast CROWN backward must succeed");
+    // Column reduction: input col 0 <- outputs {0,1,2}: 1+2+3 = 6;
+    // input col 1 <- outputs {3,4,5}: 4+5+6 = 15.
+    assert_eq!(out.num_inputs(), 2);
+    assert_close(out.lower_a()[[0, 0]], 6.0, 1e-5, "reduced lower_a col 0");
+    assert_close(out.lower_a()[[0, 1]], 15.0, 1e-5, "reduced lower_a col 1");
+    assert_close(out.upper_a()[[0, 0]], 6.0, 1e-5, "reduced upper_a col 0");
+    // Bias: 0.5 - A @ bcast(c); bcast(c) = [10,20,30,10,20,30] so
+    // A @ c = 10+40+90+40+100+180 = 460.
+    assert_close(out.lower_b()[0], 0.5 - 460.0, 1e-2, "reduced lower_b");
+    assert_close(out.upper_b()[0], 0.5 - 460.0, 1e-2, "reduced upper_b");
+    // fan_in = 3 >= 2: certified scatter-add coefficient error must be attached.
+    assert!(
+        out.lower_a_err().is_some() && out.upper_a_err().is_some(),
+        "certified coefficient error channel must be attached for fan_in >= 2"
+    );
+}
+
+#[test]
+fn test_subconstant_broadcast_crown_backward_reverse_negates() {
+    // y = broadcast(c[3]) - broadcast(x[1,2,1]): A negates, bias adds A @ c.
+    let layer = broadcast_c3_layer(true);
+    let a = Array2::from_shape_vec((1, 6), vec![1., 2., 3., 4., 5., 6.]).unwrap();
+    let bounds =
+        LinearBounds::new(a.clone(), ndarray::array![0.5], a, ndarray::array![0.5]).unwrap();
+    let out = layer
+        .propagate_crown_backward(&bounds, Some(&broadcast_pre_x21()))
+        .expect("reverse broadcast CROWN backward must succeed");
+    assert_eq!(out.num_inputs(), 2);
+    assert_close(out.lower_a()[[0, 0]], -6.0, 1e-5, "reverse lower_a col 0");
+    assert_close(out.lower_a()[[0, 1]], -15.0, 1e-5, "reverse lower_a col 1");
+    assert_close(out.lower_b()[0], 0.5 + 460.0, 1e-2, "reverse lower_b");
+    assert_close(out.upper_b()[0], 0.5 + 460.0, 1e-2, "reverse upper_b");
+}
+
+#[test]
+fn test_subconstant_broadcast_crown_backward_encloses_affine_truth() {
+    // y = broadcast(x) - broadcast(c) is affine in x, so the reduced linear
+    // bounds evaluated at every input-box corner must enclose the exact
+    // A @ y(x) + b (directed rounding makes them outer, never inner).
+    let layer = broadcast_c3_layer(false);
+    let a = Array2::from_shape_vec(
+        (2, 6),
+        vec![
+            1.0, -2.0, 3.0, -4.0, 5.0, -6.0, //
+            0.5, 1.5, -2.5, 3.5, -4.5, 5.5,
+        ],
+    )
+    .unwrap();
+    let bias = ndarray::array![0.25, -0.75];
+    let bounds = LinearBounds::new(a.clone(), bias.clone(), a.clone(), bias.clone()).unwrap();
+    let lo = [-1.5f32, 0.5];
+    let hi = [2.0f32, 1.0];
+    let pre = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 1]), lo.to_vec()).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 1]), hi.to_vec()).unwrap(),
+    )
+    .unwrap();
+    let out = layer
+        .propagate_crown_backward(&bounds, Some(&pre))
+        .expect("broadcast CROWN backward must succeed");
+    let c = [10.0f64, 20.0, 30.0];
+    for corner in 0..4u32 {
+        let x = [
+            if corner & 1 == 0 { lo[0] } else { hi[0] } as f64,
+            if corner & 2 == 0 { lo[1] } else { hi[1] } as f64,
+        ];
+        for row in 0..2 {
+            let mut truth = bias[row] as f64;
+            for i in 0..2 {
+                for j in 0..3 {
+                    truth += a[[row, i * 3 + j]] as f64 * (x[i] - c[j]);
+                }
+            }
+            let mut lo_eval = out.lower_b()[row] as f64;
+            let mut hi_eval = out.upper_b()[row] as f64;
+            for i in 0..2 {
+                lo_eval += out.lower_a()[[row, i]] as f64 * x[i];
+                hi_eval += out.upper_a()[[row, i]] as f64 * x[i];
+            }
+            assert!(
+                lo_eval <= truth + 1e-3 && truth - 1e-3 <= hi_eval,
+                "corner {corner} row {row}: [{lo_eval}, {hi_eval}] must enclose {truth}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_subconstant_broadcast_crown_backward_ml4acopf_shape_regression() {
+    // Exact failing configuration from ml4acopf GenBaB child propagation:
+    // Sub(x[1,20,1], thresholds[18]) -> [1,20,18]; incoming A is [1, 360].
+    // Previously: ShapeMismatch { expected: [360], got: [18] } ->
+    // "GenBaB child propagation failed" on every child, BaB abandoned.
+    let c = ArrayD::from_shape_fn(IxDyn(&[18]), |i| i[0] as f32 * 0.1);
+    let layer = SubConstantLayer::new(c);
+    let a = Array2::from_elem((1, 360), 0.25);
+    let bounds =
+        LinearBounds::new(a.clone(), ndarray::array![0.0], a, ndarray::array![0.0]).unwrap();
+    let pre = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 20, 1]), -0.5),
+        ArrayD::from_elem(IxDyn(&[1, 20, 1]), 0.5),
+    )
+    .unwrap();
+    let out = layer
+        .propagate_crown_backward(&bounds, Some(&pre))
+        .expect("ml4acopf threshold-bank pattern must propagate");
+    assert_eq!(out.num_inputs(), 20);
+    // Each input column sums 18 coefficients of 0.25 = 4.5.
+    for i in 0..20 {
+        assert_close(out.lower_a()[[0, i]], 4.5, 1e-4, format!("col {i}"));
+    }
+}
+
+#[test]
+fn test_subconstant_crown_backward_elementwise_delegates_unchanged() {
+    // Non-broadcast case must stay byte-identical to propagate_linear.
+    let c = ArrayD::from_shape_vec(IxDyn(&[4]), vec![1.0, -2.0, 3.0, -4.0]).unwrap();
+    let layer = SubConstantLayer::new(c);
+    let a = Array2::from_shape_vec((2, 4), (0..8).map(|v| v as f32 - 3.5).collect()).unwrap();
+    let bias = ndarray::array![0.5, -0.5];
+    let bounds = LinearBounds::new(a.clone(), bias.clone(), a, bias).unwrap();
+    let pre = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[4]), -1.0),
+        ArrayD::from_elem(IxDyn(&[4]), 1.0),
+    )
+    .unwrap();
+    let via_crown = layer.propagate_crown_backward(&bounds, Some(&pre)).unwrap();
+    let via_linear = layer.propagate_linear(&bounds).unwrap().into_owned();
+    assert_eq!(via_crown.lower_a(), via_linear.lower_a());
+    assert_eq!(via_crown.upper_a(), via_linear.upper_a());
+    assert_eq!(via_crown.lower_b(), via_linear.lower_b());
+    assert_eq!(via_crown.upper_b(), via_linear.upper_b());
+}

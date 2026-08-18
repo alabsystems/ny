@@ -57,6 +57,30 @@ fn minimal_whisper_with_constants(constants: &[&str]) -> WhisperModel {
     minimal_whisper_with_weights(constants, &[])
 }
 
+#[test]
+fn direct_block_input_shape_validation_is_fixture_free() {
+    use ny_core::NyError;
+    use ny_tensor::BoundedTensor;
+
+    let mut model = minimal_whisper_with_constants(&[]);
+    model.hidden_dim = 8;
+
+    let rank_two = BoundedTensor::from_epsilon(ArrayD::zeros(IxDyn(&[4, 8])), 0.1)
+        .expect("well-formed rank-two bounds");
+    assert!(matches!(
+        model.validate_direct_block_input(&rank_two),
+        Err(NyError::InvalidSpec(message)) if message.contains("[batch, sequence, hidden]")
+    ));
+
+    let wrong_hidden = BoundedTensor::from_epsilon(ArrayD::zeros(IxDyn(&[1, 4, 7])), 0.1)
+        .expect("well-formed wrong-hidden bounds");
+    assert!(matches!(
+        model.validate_direct_block_input(&wrong_hidden),
+        Err(NyError::ShapeMismatch { expected, got })
+            if expected == vec![1, 4, 8] && got == vec![1, 4, 7]
+    ));
+}
+
 fn layer_spec(inputs: &[&str], layer_type: LayerType) -> LayerSpec {
     LayerSpec {
         name: "test_layer".to_string(),
@@ -1078,6 +1102,46 @@ fn test_parse_whisper_structure_mixed_encoder_decoder_blocks() {
     assert_eq!(structure.blocks[1].start_layer_idx, 3);
     assert_eq!(structure.blocks[1].end_layer_idx, 5);
     assert_eq!(structure.ln_post_start_idx, 5);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_parse_whisper_structure_rejects_nonzero_first_block() {
+    let network = Network {
+        name: "whisper-block-one-only".to_string(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        layers: vec![
+            layer_named("/encoder/blocks.1/attn"),
+            layer_named("/encoder/blocks.1/mlp"),
+        ],
+        param_count: 0,
+    };
+
+    let error = parse_whisper_structure(&network)
+        .expect_err("a block-one-only model must not alias vector position zero");
+    assert!(error.to_string().contains("expected 0, got 1"));
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_parse_whisper_structure_rejects_block_index_gap() {
+    let network = Network {
+        name: "whisper-block-gap".to_string(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        layers: vec![
+            layer_named("/encoder/blocks.0/attn"),
+            layer_named("/encoder/blocks.0/mlp"),
+            layer_named("/encoder/blocks.2/attn"),
+            layer_named("/encoder/blocks.2/mlp"),
+        ],
+        param_count: 0,
+    };
+
+    let error =
+        parse_whisper_structure(&network).expect_err("a gapped block sequence must fail closed");
+    assert!(error.to_string().contains("expected 1, got 2"));
 }
 
 #[ntest::timeout(10000)]

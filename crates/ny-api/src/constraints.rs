@@ -38,6 +38,11 @@ use ny_propagate::{GraphNetwork, GraphNode, Verifier};
 /// Name of the appended margin node in an augmented network.
 const MARGIN_NODE: &str = "_constraint_margin";
 
+/// Resource ceiling for the dense argmax margin map (64 MiB of `f32` data).
+/// The conceptual map is sparse, but the current `LinearLayer` representation
+/// is dense; reject oversized caller-controlled widths before allocating.
+const MAX_MARGIN_MATRIX_ELEMENTS: usize = 16 * 1024 * 1024;
+
 /// A flat affine margin map: row-major `weight` of shape
 /// `(out_features, in_features)` plus a `bias` of length `out_features`.
 struct MarginMap {
@@ -152,7 +157,9 @@ fn build_argmax_margin(class: usize, width: usize) -> Result<MarginMap> {
     if class >= width {
         return Err(NyError::ShapeMismatch {
             expected: vec![width],
-            got: vec![class + 1],
+            // `class` is caller-controlled; avoid overflowing while rendering
+            // the conventional minimum required width for an invalid index.
+            got: vec![class.saturating_add(1)],
         });
     }
     if width < 2 {
@@ -162,22 +169,53 @@ fn build_argmax_margin(class: usize, width: usize) -> Result<MarginMap> {
     }
     let num_competitors = width - 1;
     // Row-major (num_competitors, width) matrix.
-    let mut weight = vec![0.0f32; num_competitors * width];
+    let weight_len = num_competitors.checked_mul(width).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "ArgmaxMargin matrix size overflows usize: {num_competitors} × {width}"
+        ))
+    })?;
+    if weight_len > MAX_MARGIN_MATRIX_ELEMENTS {
+        return Err(NyError::InvalidSpec(format!(
+            "ArgmaxMargin requires {weight_len} dense matrix elements, exceeding the \
+             {MAX_MARGIN_MATRIX_ELEMENTS}-element resource limit"
+        )));
+    }
+    let mut weight = zeroed_f32(weight_len, "ArgmaxMargin weight matrix")?;
     let mut row = 0usize;
     for j in 0..width {
         if j == class {
             continue;
         }
-        weight[row * width + class] = 1.0;
-        weight[row * width + j] = -1.0;
+        let base = row.checked_mul(width).ok_or_else(|| {
+            NyError::InvalidSpec("ArgmaxMargin row offset overflows usize".to_string())
+        })?;
+        let class_entry = weight.get_mut(base + class).ok_or_else(|| {
+            NyError::InternalError("ArgmaxMargin class entry is out of range".to_string())
+        })?;
+        *class_entry = 1.0;
+        let competitor_entry = weight.get_mut(base + j).ok_or_else(|| {
+            NyError::InternalError("ArgmaxMargin competitor entry is out of range".to_string())
+        })?;
+        *competitor_entry = -1.0;
         row += 1;
     }
     Ok(MarginMap {
         weight,
-        bias: vec![0.0; num_competitors],
+        bias: zeroed_f32(num_competitors, "ArgmaxMargin bias")?,
         out_features: num_competitors,
         in_features: width,
     })
+}
+
+fn zeroed_f32(len: usize, label: &str) -> Result<Vec<f32>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "{label} with {len} elements cannot be allocated: {error}"
+        ))
+    })?;
+    values.resize(len, 0.0);
+    Ok(values)
 }
 
 /// Best-effort static output width: if the output node is a `Linear` layer,
@@ -508,8 +546,21 @@ mod tests {
     #[test]
     fn build_argmax_margin_rejects_out_of_range_class() {
         assert!(build_argmax_margin(3, 3).is_err());
+        assert!(
+            build_argmax_margin(usize::MAX, 3).is_err(),
+            "caller-controlled indices must not overflow while reporting the error"
+        );
         assert!(build_argmax_margin(0, 1).is_err());
         assert!(build_argmax_margin(0, 3).is_ok());
+        assert!(
+            build_argmax_margin(0, usize::MAX).is_err(),
+            "an overflowing dense margin matrix must reject before allocation"
+        );
+        let over_limit_width = (MAX_MARGIN_MATRIX_ELEMENTS as f64).sqrt() as usize + 2;
+        assert!(
+            build_argmax_margin(0, over_limit_width).is_err(),
+            "an oversized dense margin matrix must honor the resource limit"
+        );
     }
 
     #[test]

@@ -260,13 +260,27 @@ impl GraphNetwork {
         mul_binary_relaxation: MulBinaryRelaxationMode,
         deadline: Option<Instant>,
     ) -> Result<CrownBackwardResult> {
-        self.propagate_crown_batched_inner(
+        match self.propagate_crown_batched_inner(
             input,
             mul_binary_relaxation,
             None,
             deadline,
             engine,
             AttentionCompositionRuntime::production(),
-        )
+        ) {
+            Err(error) if deadline.is_some() && error.is_deadline_exceeded() => {
+                // Preserve the batched API's established terminal policy: a
+                // mid-kernel deadline publishes the same sound forward fallback
+                // as a loop-boundary expiry. It must not retry Dense or resume
+                // any further CROWN work.
+                self.propagate_ibp(input).map(|bounds| CrownBackwardResult {
+                    bounds,
+                    provenance: BoundsProvenance::ForwardFallback(
+                        CrownIbpFallbackReason::DeadlineExceeded,
+                    ),
+                })
+            }
+            result => result,
+        }
     }
 }

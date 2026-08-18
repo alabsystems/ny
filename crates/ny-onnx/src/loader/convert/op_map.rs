@@ -19,8 +19,10 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         // MatMul: could be a Linear layer (if one input is a weight) or a binary matmul
         // We mark it as MatMul; the converter will check if it should be treated as Linear
         "MatMul" => Ok((LayerType::MatMul, true)),
-        // Attention ops (if present in ONNX graph)
-        "Attention" | "MultiHeadAttention" => Ok((LayerType::MultiHeadAttention, true)),
+        // Standard Attention-23/24 is deliberately not mapped here: its
+        // packed-head, mask, cache, optional-output, and pre-MatMul scaling
+        // semantics are not represented by ny's simplified ternary layer.
+        // Custom-domain attention handlers run before this map.
         "Conv" => Ok((LayerType::Conv2d, true)),
         "ConvTranspose" => Ok((LayerType::ConvTranspose2d, true)),
         // Activations
@@ -30,6 +32,7 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         "Softmax" => Ok((LayerType::Softmax, true)),
         "Tanh" => Ok((LayerType::Tanh, true)),
         "Sigmoid" => Ok((LayerType::Sigmoid, true)),
+        "Erf" => Ok((LayerType::Erf, true)),
         "Softplus" => Ok((LayerType::Softplus, true)),
         "Clip" => Ok((LayerType::Clip, true)),
         "Elu" => Ok((LayerType::Elu, true)),
@@ -61,8 +64,9 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         "RoPE" | "RotaryPositionEmbedding" => Ok((LayerType::RoPE, true)),
         // Normalization (fused ops)
         "LayerNormalization" => Ok((LayerType::LayerNorm, true)),
-        // SimplifiedLayerNormalization is the ONNX name for RMSNorm (opset 21+).
-        // RMSNormalization is a common custom op name used by some frameworks.
+        // SimplifiedLayerNormalization is the legacy experimental ONNX RMSNorm
+        // spelling; RMSNormalization is the standard main-domain op since
+        // opset 23. Their exact supported schemas are checked by convert.rs.
         "SimplifiedLayerNormalization" | "RMSNormalization" => Ok((LayerType::RMSNorm, true)),
         // InstanceNormalization: per-channel normalization (ONNX opset 1+).
         // Used in style transfer and audio models (avoice K2/K3/K4).
@@ -192,16 +196,6 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
             debug!("{} op '{}' found", op_type, name);
             Ok((LayerType::Compare, true))
         }
-        // Logical ops: still traced through until boolean propagation exists.
-        "And" | "Or" | "Not" => {
-            debug!("{} op '{}' skipped (comparison/mask op)", op_type, name);
-            Ok((LayerType::Unknown, false))
-        }
-        // Reduction ops that produce scalars/shapes
-        "ReduceProd" => {
-            debug!("{} op '{}' skipped (reduction op)", op_type, name);
-            Ok((LayerType::Unknown, false))
-        }
         // ReduceMax/ReduceMin: supported with fixed_max_index CROWN assumption
         "ReduceMax" => Ok((LayerType::ReduceMax, true)),
         "ReduceMin" => Ok((LayerType::ReduceMin, true)),
@@ -212,20 +206,15 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         "ArgMin" => Ok((LayerType::ArgMin, true)),
         "ArgSort" => Ok((LayerType::ArgSort, true)),
         "TopK" => Ok((LayerType::Topk, true)),
-        // Cast with a full-precision FLOAT target (f32/f64) preserves values
-        // (we work in f32). Integer-target Casts never reach this arm:
-        // convert_node_to_layer lowers them to LayerType::Trunc BEFORE
-        // consulting this table, because float->int casts truncate and an
-        // identity drop is unsound for fractional values (#cctsdb B1).
-        // f16/bf16-target Casts never reach this arm either: they round with
-        // up to 2^-11 relative error, so convert_node_to_layer routes them to
-        // a refused LayerType::Cast (fail closed — permissive graph build
-        // degrades to a sound OpaqueSkip [-inf, +inf]) instead of identity.
+        // Only Casts whose drop is an EXACT identity reach this arm: a FLOAT32
+        // target, or a BOOL target on a provably {0,1}-valued operand.
+        // convert_node_to_layer handles every other target BEFORE consulting
+        // this table — integer targets lower to LayerType::Trunc (float->int
+        // casts truncate, and an identity drop is unsound for fractional
+        // values, #cctsdb B1), and unmodeled targets emit LayerType::Cast,
+        // which fails closed in ny-build.
         "Cast" => {
-            debug!(
-                "Cast op '{}' skipped (f32/f64 target, exact identity)",
-                name
-            );
+            debug!("Cast op '{}' skipped (exact identity target)", name);
             Ok((LayerType::Unknown, false))
         }
         "DequantizeLinear" => Ok((LayerType::DequantizeLinear, true)),
@@ -276,6 +265,19 @@ mod tests {
         // Truly unknown ops must return UnsupportedOp, not silently drop (#2931).
         let result = op_type_to_layer_type("FakeOp", "fake_0");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_identity_logical_and_reduction_ops_fail_closed() {
+        for op_type in ["And", "Or", "Not", "ReduceProd"] {
+            assert!(
+                matches!(
+                    op_type_to_layer_type(op_type, "live"),
+                    Err(NyError::UnsupportedOp(_))
+                ),
+                "{op_type} must not be dropped as a pass-through"
+            );
+        }
     }
 
     #[test]

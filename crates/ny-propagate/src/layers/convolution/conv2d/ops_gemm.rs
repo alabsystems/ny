@@ -18,10 +18,41 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Mutex,
     },
+    time::Instant as DeadlineInstant,
 };
 use tracing::debug;
 
 use crate::faer_parallelism::{mat_mul, mat_mul_f64};
+
+/// Maximum scalar multiply/add operations admitted between literal deadline
+/// polls on finite-deadline CPU convolution paths. Since
+/// #cgan-deadline-f32-gemm this is no longer a per-MAC poll cadence: it is the
+/// MAC threshold above which the finite-deadline f32 GEMM route runs an extra
+/// deadline checkpoint before constructing its full im2col operand. Every
+/// workload is checked again after im2col, immediately before the unpollable
+/// faer call.
+const DEADLINE_CPU_POLL_OPS: usize = 4_096;
+
+/// Launch one f32 GEMM only while its finite authority is still live.
+///
+/// Keeping the clock and launch as injected closures makes the ordering
+/// deterministic to test: expiry after operand construction must return the
+/// typed deadline error without entering the unpollable GEMM.
+#[inline]
+fn run_f32_gemm_before_deadline_with_clock<N, G>(
+    deadline: DeadlineInstant,
+    now: N,
+    gemm: G,
+) -> Result<Mat<f32>>
+where
+    N: FnOnce() -> DeadlineInstant,
+    G: FnOnce() -> Mat<f32>,
+{
+    if now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    Ok(gemm())
+}
 
 /// Helper: convert faer column-major Mat to flat row-major Vec.
 fn faer_mat_to_row_major(mat: &Mat<f32>, rows: usize, cols: usize) -> Vec<f32> {
@@ -33,6 +64,16 @@ fn faer_mat_to_row_major(mat: &Mat<f32>, rows: usize, cols: usize) -> Vec<f32> {
         }
     }
     flat
+}
+
+#[inline]
+fn unscoped_engine_error_is_terminal(error: &NyError, engine: &dyn GemmEngine) -> bool {
+    (error.is_cpu_memory_exceeded() && engine.forbids_unbounded_cpu_fallback())
+        || (error.is_deadline_exceeded()
+            && matches!(
+                engine.poll_crown_backward_deadline(),
+                Err(error) if error.is_deadline_exceeded()
+            ))
 }
 
 /// Batched forward conv2d via im2col + GEMM for ConvTranspose2d CROWN backward.
@@ -196,6 +237,7 @@ pub(crate) fn conv2d_forward_batched_gemm(
                 );
                 result
             }
+            Err(e) if unscoped_engine_error_is_terminal(&e, eng) => return Err(e),
             Err(e) => {
                 debug!("ConvTranspose2d CROWN backward: GemmEngine failed, CPU fallback: {e}");
                 let result = mat_mul(&im2col_matrix, &w_t);
@@ -229,6 +271,287 @@ pub(crate) fn conv2d_forward_batched_gemm(
     }
 
     Array2::from_shape_vec((num_objectives, conv_out_size), result_flat)
+        .map_err(|e| NyError::InternalError(format!("conv2d forward reshape: {e}")))
+}
+
+/// Deadline-authoritative ConvTranspose2d CROWN backward point-coefficient
+/// propagation.
+///
+/// `deadline: None` delegates to [`conv2d_forward_batched_gemm`] unchanged.
+/// With a finite deadline, the caller-supplied `GemmEngine` is deliberately not
+/// entered: its safe trait has no cancellation/launch-before-deadline contract.
+/// The CPU route runs the twin's im2col + faer f32 GEMM with deadline polls at
+/// every chunk boundary (entry, pre-flight before the single GEMM, and before
+/// publishing) — see the #cgan-deadline-f32-gemm comment inside
+/// [`conv2d_forward_pollable_cpu`] for the certificate argument.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_forward_batched_gemm_with_deadline(
+    a_coefficients: &Array2<f32>,
+    kernel: &ArrayD<f32>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    input_size: (usize, usize),
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<DeadlineInstant>,
+) -> Result<Array2<f32>> {
+    let Some(deadline) = deadline else {
+        return conv2d_forward_batched_gemm(
+            a_coefficients,
+            kernel,
+            stride,
+            padding,
+            dilation,
+            input_size,
+            engine,
+        );
+    };
+    conv2d_forward_pollable_cpu(
+        a_coefficients,
+        kernel,
+        stride,
+        padding,
+        dilation,
+        input_size,
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv2d_forward_pollable_cpu(
+    a_coefficients: &Array2<f32>,
+    kernel: &ArrayD<f32>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    input_size: (usize, usize),
+    deadline: DeadlineInstant,
+) -> Result<Array2<f32>> {
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    if kernel.ndim() != 4 {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![4],
+            got: vec![kernel.ndim()],
+        });
+    }
+
+    let num_objectives = a_coefficients.nrows();
+    let conv_out_c = kernel.shape()[0];
+    let conv_in_c = kernel.shape()[1];
+    let kh = kernel.shape()[2];
+    let kw = kernel.shape()[3];
+    let (in_h, in_w) = input_size;
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let (dh, dw) = dilation;
+    if sh == 0 || sw == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: stride must be >= 1, got ({sh},{sw})"
+        )));
+    }
+    if dh == 0 || dw == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: dilation must be >= 1, got ({dh},{dw})"
+        )));
+    }
+    if kh == 0 || kw == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: kernel spatial dimensions must be >= 1, got ({kh},{kw})"
+        )));
+    }
+
+    let input_spatial = in_h.checked_mul(in_w).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: input spatial dims overflow: {in_h} * {in_w}"
+        ))
+    })?;
+    let expected_cols = conv_in_c.checked_mul(input_spatial).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: input dims overflow: {conv_in_c} * {in_h} * {in_w}"
+        ))
+    })?;
+    if a_coefficients.ncols() != expected_cols {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![expected_cols],
+            got: vec![a_coefficients.ncols()],
+        });
+    }
+    let eff_kh = kh
+        .checked_sub(1)
+        .and_then(|extent| extent.checked_mul(dh))
+        .and_then(|extent| extent.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InvalidSpec(
+                "conv2d_forward_batched_gemm: effective kernel height overflow".to_string(),
+            )
+        })?;
+    let eff_kw = kw
+        .checked_sub(1)
+        .and_then(|extent| extent.checked_mul(dw))
+        .and_then(|extent| extent.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InvalidSpec(
+                "conv2d_forward_batched_gemm: effective kernel width overflow".to_string(),
+            )
+        })?;
+    let padded_h = ph
+        .checked_mul(2)
+        .and_then(|pad| in_h.checked_add(pad))
+        .ok_or_else(|| {
+            NyError::InvalidSpec("conv2d_forward_batched_gemm: padded height overflow".to_string())
+        })?;
+    let padded_w = pw
+        .checked_mul(2)
+        .and_then(|pad| in_w.checked_add(pad))
+        .ok_or_else(|| {
+            NyError::InvalidSpec("conv2d_forward_batched_gemm: padded width overflow".to_string())
+        })?;
+    if padded_h < eff_kh || padded_w < eff_kw {
+        return Err(NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: effective kernel ({eff_kh},{eff_kw}) larger than padded input ({padded_h},{padded_w})"
+        )));
+    }
+    let out_h = (padded_h - eff_kh) / sh + 1;
+    let out_w = (padded_w - eff_kw) / sw + 1;
+    let spatial_per_obj = out_h.checked_mul(out_w).ok_or_else(|| {
+        NyError::InvalidSpec(
+            "conv2d_forward_batched_gemm: output spatial size overflow".to_string(),
+        )
+    })?;
+    let conv_out_size = conv_out_c.checked_mul(spatial_per_obj).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_forward_batched_gemm: output size overflow".to_string())
+    })?;
+    let result_len = num_objectives.checked_mul(conv_out_size).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_forward_batched_gemm: result size overflow".to_string())
+    })?;
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    let kernel_spatial = kh.checked_mul(kw).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: kernel spatial dims overflow: {kh} * {kw}"
+        ))
+    })?;
+    let col_width = conv_in_c.checked_mul(kernel_spatial).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "conv2d_forward_batched_gemm: col_width overflows: {conv_in_c} * {kh} * {kw}"
+        ))
+    })?;
+    let total_spatial = num_objectives.checked_mul(spatial_per_obj).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_forward_batched_gemm: total_spatial overflow".to_string())
+    })?;
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+
+    // im2col + faer f32 GEMM (#cgan-deadline-f32-gemm — the f32 lane of
+    // #cifar100-deadline-gemm, c0b0ed94).
+    //
+    // This path previously ran a single-threaded scalar sextuple loop with a
+    // poll test per MAC, while its no-deadline twin
+    // [`conv2d_forward_batched_gemm`] (above) already used im2col + faer f32
+    // GEMM. Since a scored run ALWAYS carries a deadline anchored at t=0, every
+    // finite-deadline ConvTranspose2d CROWN-backward coefficient pass took the
+    // slow branch. Measured on cgan row 7: per-node CROWN collection blew its
+    // budgets (PerNodeDeadlineExceeded / WalkCostRefused), intermediate
+    // references degraded to IBP grade, the warm-alpha interior count was 100x
+    // worse at the same iteration, and the lost root proof exploded the BaB
+    // tree (unsat@640s -> timeout@1800s).
+    //
+    // faer's `mat_mul` is one blocking call and cannot be polled internally.
+    // Mirroring the repaired f64 twin (`conv_group_col_flat_f64_pollable`,
+    // c0b0ed94), this is deliberately ONE GEMM over the full row extent, not a
+    // row-chunked loop: chunking would make faer select a different blocking
+    // and break bit-parity with the no-deadline twin's CPU route, which
+    // `convtranspose_f32_finite_deadline_matches_no_deadline_twin_bitwise`
+    // pins — that parity is what lets the deadline and no-deadline routes be
+    // treated as the same computation everywhere else. Losing mid-multiply
+    // polling is acceptable BECAUSE of the speedup: the per-MAC poll existed
+    // only to keep a slow scalar loop interruptible, and the launch-boundary
+    // check after im2col refuses to START a multiply with no remaining wall
+    // clock. An over-run is therefore bounded by one GEMM rather than by the
+    // whole loop (the same audit contract as the f64 twin: no unpollable stretch
+    // beyond one chunk, and the chunk is the single GEMM).
+    //
+    // SOUND (certificate argument). The operands are identical to the
+    // no-deadline twin's: out-of-bounds taps enter the im2col matrix as exact
+    // 0.0f32, so every output element remains ONE plain RN-f32 dot product
+    // over exactly the values the scalar loop consumed. The caller certifies
+    // this coefficient with the conv transpose-GEMM error term `γ_n·S`,
+    // `S ≤ row_max|a| · ‖kernel‖_1` (`conv_coeff_err_matrix`; `γ_n^f32` on
+    // this lane), and that term does NOT depend on the reduction order —
+    // Higham's `γ_n·S` bounds ANY summation order of an n-term RN dot product.
+    // faer's blocked/parallel accumulation is therefore covered by exactly the
+    // same certificate as the scalar running sum — the identical argument the
+    // no-deadline twin, the cuBLAS route, and c0b0ed94's f64 twin already
+    // rely on. The caller-supplied
+    // `GemmEngine` is still never entered under a finite deadline (no
+    // cancellation contract); faer runs in-process on this thread.
+    let w_t = Mat::<f32>::from_fn(col_width, conv_out_c, |col, oc| {
+        let ic = col / kernel_spatial;
+        let rem = col % kernel_spatial;
+        let ki = rem / kw;
+        let kj = rem % kw;
+        kernel[[oc, ic, ki, kj]]
+    });
+
+    let macs = total_spatial
+        .saturating_mul(col_width)
+        .saturating_mul(conv_out_c);
+    if macs > DEADLINE_CPU_POLL_OPS {
+        // Before constructing a potentially large full im2col operand, repeat
+        // the deadline checkpoint. This can only cause an early, SOUND deadline
+        // error, never a wrong bound.
+        let remaining = deadline.saturating_duration_since(DeadlineInstant::now());
+        if remaining.is_zero() {
+            return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+        }
+    }
+
+    let im2col_matrix = Mat::<f32>::from_fn(total_spatial, col_width, |pos, col| {
+        let obj = pos / spatial_per_obj;
+        let spatial = pos % spatial_per_obj;
+        let oh = spatial / out_w;
+        let ow = spatial % out_w;
+        let ic = col / kernel_spatial;
+        let rem = col % kernel_spatial;
+        let ki = rem / kw;
+        let kj = rem % kw;
+        let ih = (oh * sh + ki * dh) as isize - ph as isize;
+        let iw = (ow * sw + kj * dw) as isize - pw as isize;
+        if ih >= 0 && ih < in_h as isize && iw >= 0 && iw < in_w as isize {
+            a_coefficients[[obj, ic * input_spatial + ih as usize * in_w + iw as usize]]
+        } else {
+            0.0
+        }
+    });
+    // im2col itself can consume the remaining node budget. Recheck at the exact
+    // launch boundary so an expired authority never enters the unpollable GEMM.
+    let prod = run_f32_gemm_before_deadline_with_clock(deadline, DeadlineInstant::now, || {
+        mat_mul(&im2col_matrix, &w_t)
+    })?;
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+
+    // Reshape — the identical scatter the no-deadline twin performs:
+    // gemm row `obj * spatial_per_obj + oh * out_w + ow`, column `oc`, into
+    // `result[obj, oc * spatial_per_obj + oh * out_w + ow]`.
+    let mut result = vec![0.0f32; result_len];
+    for obj in 0..num_objectives {
+        for oc in 0..conv_out_c {
+            for spatial in 0..spatial_per_obj {
+                let gemm_row = obj * spatial_per_obj + spatial;
+                result[obj * conv_out_size + oc * spatial_per_obj + spatial] = prod[(gemm_row, oc)];
+            }
+        }
+    }
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    Array2::from_shape_vec((num_objectives, conv_out_size), result)
         .map_err(|e| NyError::InternalError(format!("conv2d forward reshape: {e}")))
 }
 
@@ -323,6 +646,17 @@ fn conv2d_forward_backward_coeff_f64_with_deadline_and_engine(
     engine_min_macs: usize,
     try_engine: impl Fn(&Mat<f64>, &Mat<f64>, Option<std::time::Instant>) -> Result<Option<Vec<f64>>>,
 ) -> Result<Array2<f64>> {
+    if let Some(deadline) = deadline {
+        return conv2d_forward_backward_coeff_f64_pollable_cpu(
+            a_coefficients,
+            kernel,
+            stride,
+            padding,
+            dilation,
+            input_size,
+            deadline,
+        );
+    }
     let num_objectives = a_coefficients.nrows();
 
     if kernel.ndim() != 4 {
@@ -681,6 +1015,192 @@ fn conv2d_forward_backward_coeff_f64_with_deadline_and_engine(
         .map_err(|e| NyError::InternalError(format!("conv2d f64 forward reshape: {e}")))
 }
 
+/// Finite-deadline certified-f64 forward convolution.
+///
+/// Objective-blocked im2col + faer f64 GEMM (#cgan-deadline-f32-gemm, f64
+/// recompute lane; mirrors #cifar100-deadline-gemm / c0b0ed94).
+///
+/// This path previously evaluated the widened contraction as a single-threaded
+/// scalar quintuple loop with a poll test per MAC, while its no-deadline twin
+/// (the blocked loop in
+/// [`conv2d_forward_backward_coeff_f64_with_deadline_and_engine`]) already ran
+/// im2col + faer f64 GEMM. A scored run ALWAYS carries a deadline, so the
+/// wide-contraction f64 recompute — the verdict-carrying coefficient pass
+/// whenever `conv_should_f64_recompute` admits (cgan-class ConvTranspose
+/// stacks) — always took the slow branch.
+///
+/// CHUNK SIZE. faer's `mat_mul_f64` is one blocking call and cannot be polled
+/// internally, so the objectives are processed in the SAME blocks as the
+/// no-deadline twin ([`DirectF64PairGeometry::checked`]'s `block_objs`: at
+/// most `1 << 23` f64 im2col elements = 64 MiB per block, the twin's own
+/// quantum). Identical block boundaries mean faer sees identical operand
+/// shapes, so its per-block reduction blocking matches the twin's and this
+/// route stays bit-for-bit the same computation as the twin's faer CPU arm
+/// (the one taken whenever no engine is admitted;
+/// `convtranspose_sound_f64_finite_deadline_matches_no_deadline_twin_bitwise`
+/// pins this). The deadline is checked BETWEEN blocks and again after each
+/// block's im2col before launching its GEMM, so no unpollable stretch exceeds
+/// one block.
+///
+/// The process-global sound-f64 engine is still never entered here: its safe
+/// trait has no cancellation/launch-before-deadline contract, and
+/// `convtranspose_sound_f64_finite_deadline_never_enters_engine` pins that.
+///
+/// SOUND (certificate argument). Identical operands to the twin: the f32→f64
+/// widening is exact, `f32*f32` is exact in f64, and out-of-bounds taps enter
+/// the im2col block as exact `0.0`, so every output stays one plain RN-f64 dot
+/// product over the values the scalar loop consumed. The caller certifies the
+/// stored coefficient with `cast_err + γ_n^f64·S + prop`, where the conv
+/// transpose-GEMM error term `γ_n·S`, `S ≤ row_max|a| · ‖kernel‖_1`
+/// (`conv_coeff_err_matrix`), does NOT depend on the reduction order —
+/// Higham's `γ_n·S` bounds ANY summation order of an n-term RN dot product.
+/// faer's blocked accumulation is therefore covered by exactly the same
+/// certificate as the scalar running sum — the identical argument the
+/// no-deadline twin, the cuBLAS route, and c0b0ed94's repaired f64 twin in
+/// `ops_transpose_gemm.rs` already rely on.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_forward_backward_coeff_f64_pollable_cpu(
+    a_coefficients: &Array2<f32>,
+    kernel: &ArrayD<f32>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    input_size: (usize, usize),
+    deadline: DeadlineInstant,
+) -> Result<Array2<f64>> {
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    let geometry = DirectF64PairGeometry::checked(
+        a_coefficients,
+        a_coefficients,
+        kernel,
+        stride,
+        padding,
+        dilation,
+        input_size,
+    )
+    .ok_or_else(|| {
+        NyError::InvalidSpec(
+            "conv2d_forward_backward_coeff_f64: invalid finite-deadline geometry".to_string(),
+        )
+    })?;
+    if geometry.num_objectives == 0 {
+        return Array2::from_shape_vec((0, geometry.conv_out_size), Vec::new())
+            .map_err(|e| NyError::InternalError(format!("conv2d f64 forward reshape: {e}")));
+    }
+    conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs(
+        a_coefficients,
+        kernel,
+        geometry,
+        deadline,
+        geometry.block_objs,
+    )
+}
+
+/// Testable core of [`conv2d_forward_backward_coeff_f64_pollable_cpu`].
+///
+/// Production always passes `geometry.block_objs` (the twin's 64 MiB im2col
+/// quantum — required for the bit-parity pin). Tests pass `block_objs = 1` to
+/// force one block per objective and pin the BETWEEN-block typed-deadline
+/// abort without waiting on a full-size block.
+fn conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs(
+    a_coefficients: &Array2<f32>,
+    kernel: &ArrayD<f32>,
+    geometry: DirectF64PairGeometry,
+    deadline: DeadlineInstant,
+    block_objs: usize,
+) -> Result<Array2<f64>> {
+    let block_objs = block_objs.clamp(1, geometry.num_objectives.max(1));
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    let mut result = try_zeroed_f64(geometry.result_len).ok_or(NyError::CpuMemoryExceeded {
+        required_bytes: geometry.result_len.saturating_mul(size_of::<f64>()),
+        budget_bytes: usize::MAX,
+        site: "conv2d_forward_backward_coeff_f64/deadline_result",
+    })?;
+
+    // Kernel reshape — identical to the no-deadline twin's W_T:
+    // (conv_out_c, conv_in_c, kh, kw) → (col_width, conv_out_c).
+    let w_t = Mat::<f64>::from_fn(geometry.col_width, geometry.conv_out_c, |col, oc| {
+        let ic = col / geometry.kernel_spatial;
+        let rem = col % geometry.kernel_spatial;
+        let ki = rem / geometry.kw;
+        let kj = rem % geometry.kw;
+        f64::from(kernel[[oc, ic, ki, kj]])
+    });
+
+    let mut obj_start = 0usize;
+    while obj_start < geometry.num_objectives {
+        // Between-block deadline poll (chunk boundary): the caller propagates
+        // the typed DeadlineExceeded (collector reference-bounds fallback) —
+        // never a partial result.
+        if DeadlineInstant::now() >= deadline {
+            return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+        }
+        let block = block_objs.min(geometry.num_objectives - obj_start);
+        // In-bounds by `DirectF64PairGeometry::checked`'s representability
+        // checks (block <= num_objectives).
+        let block_rows = block * geometry.spatial_per_obj;
+
+        // im2col — gather receptive-field patches for this objective block,
+        // identical index math to the no-deadline twin.
+        let im2col_block = Mat::<f64>::from_fn(block_rows, geometry.col_width, |pos, col| {
+            let obj = obj_start + pos / geometry.spatial_per_obj;
+            let spatial = pos % geometry.spatial_per_obj;
+            let oh = spatial / geometry.out_w;
+            let ow = spatial % geometry.out_w;
+            let ic = col / geometry.kernel_spatial;
+            let rem = col % geometry.kernel_spatial;
+            let ki = rem / geometry.kw;
+            let kj = rem % geometry.kw;
+            let ih = oh
+                .checked_mul(geometry.sh)
+                .and_then(|base| ki.checked_mul(geometry.dh)?.checked_add(base))
+                .and_then(|padded| padded.checked_sub(geometry.ph))
+                .filter(|&index| index < geometry.in_h);
+            let iw = ow
+                .checked_mul(geometry.sw)
+                .and_then(|base| kj.checked_mul(geometry.dw)?.checked_add(base))
+                .and_then(|padded| padded.checked_sub(geometry.pw))
+                .filter(|&index| index < geometry.in_w);
+            match (ih, iw) {
+                (Some(ih), Some(iw)) => {
+                    let input_index = ic * geometry.input_spatial + ih * geometry.in_w + iw;
+                    f64::from(a_coefficients[[obj, input_index]])
+                }
+                _ => 0.0,
+            }
+        });
+        // Do not launch a GEMM after im2col itself has consumed the remaining
+        // node budget (mirrors the no-deadline twin's post-im2col poll).
+        if DeadlineInstant::now() >= deadline {
+            return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+        }
+        let prod = mat_mul_f64(&im2col_block, &w_t);
+
+        // Scatter to (obj, oc * spatial_per_obj + spatial) layout.
+        for local_obj in 0..block {
+            let obj = obj_start + local_obj;
+            for oc in 0..geometry.conv_out_c {
+                for spatial in 0..geometry.spatial_per_obj {
+                    let gemm_row = local_obj * geometry.spatial_per_obj + spatial;
+                    let result_index =
+                        obj * geometry.conv_out_size + oc * geometry.spatial_per_obj + spatial;
+                    result[result_index] = prod[(gemm_row, oc)];
+                }
+            }
+        }
+        obj_start += block;
+    }
+    if DeadlineInstant::now() >= deadline {
+        return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+    }
+    Array2::from_shape_vec((geometry.num_objectives, geometry.conv_out_size), result)
+        .map_err(|e| NyError::InternalError(format!("conv2d f64 forward reshape: {e}")))
+}
+
 /// Optional paired direct-layout recompute for ConvTranspose lower/upper CROWN
 /// coefficients. This route is admitted only by the same exact
 /// `NY_CONVTRANSPOSE_SOUND_F64_GPU=1` gate as the existing per-side CUDA seam.
@@ -703,6 +1223,14 @@ pub(crate) fn conv2d_forward_backward_coeff_f64_pair_with_deadline(
     input_size: (usize, usize),
     deadline: Option<std::time::Instant>,
 ) -> Result<Option<(Array2<f64>, Array2<f64>)>> {
+    if let Some(limit) = deadline {
+        if DeadlineInstant::now() >= limit {
+            return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+        }
+        // A finite authority never enters the process-global engine. Returning
+        // `None` selects the two pollable per-side CPU recomputes in the caller.
+        return Ok(None);
+    }
     let enabled = convtranspose_sound_f64_gpu_enabled(
         std::env::var_os("NY_CONVTRANSPOSE_SOUND_F64_GPU").as_deref(),
     );
@@ -1007,6 +1535,12 @@ fn conv2d_forward_backward_coeff_f64_pair_with_deadline_and_engine(
     engine: &dyn GemmEngine,
     dispatch_gate: &Mutex<()>,
 ) -> Result<Option<(Array2<f64>, Array2<f64>)>> {
+    if let Some(limit) = deadline {
+        if DeadlineInstant::now() >= limit {
+            return Err(super::ops_transpose_gemm::per_node_deadline_exceeded());
+        }
+        return Ok(None);
+    }
     let Some(geometry) =
         DirectF64PairGeometry::checked(lower, upper, kernel, stride, padding, dilation, input_size)
     else {
@@ -1365,6 +1899,7 @@ fn conv2d_forward_f64_block_with_engine_and_gate(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
     use std::time::{Duration, Instant};
@@ -1376,11 +1911,101 @@ mod tests {
     use super::{
         checked_sound_f64_gemm_shape,
         conv2d_forward_backward_coeff_f64_pair_with_deadline_and_engine,
-        conv2d_forward_backward_coeff_f64_with_deadline_and_engine,
-        conv2d_forward_f64_block_with_engine_and_gate,
+        conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs,
+        conv2d_forward_backward_coeff_f64_with_deadline_and_engine, conv2d_forward_batched_gemm,
+        conv2d_forward_batched_gemm_with_deadline, conv2d_forward_f64_block_with_engine_and_gate,
         conv2d_forward_f64_pair_with_engine_and_gate, convtranspose_sound_f64_gpu_enabled,
-        try_zeroed_f64, CheckedSoundF64GemmShape,
+        run_f32_gemm_before_deadline_with_clock, try_zeroed_f64, CheckedSoundF64GemmShape,
+        DirectF64PairGeometry,
     };
+
+    struct CountingF32Engine {
+        calls: AtomicUsize,
+    }
+
+    impl GemmEngine for CountingF32Engine {
+        fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            NaiveCpuGemmEngine.gemm_f32(m, k, n, a, b)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TerminalF32Error {
+        Deadline { expired: bool },
+        BoundedMemory,
+    }
+
+    struct TerminalF32Engine(TerminalF32Error);
+
+    impl GemmEngine for TerminalF32Engine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            match self.0 {
+                TerminalF32Error::Deadline { .. } => {
+                    Err(NyError::DeadlineExceeded("test ConvTranspose GEMM".into()))
+                }
+                TerminalF32Error::BoundedMemory => Err(NyError::CpuMemoryExceeded {
+                    required_bytes: 2,
+                    budget_bytes: 1,
+                    site: "test bounded ConvTranspose GEMM",
+                }),
+            }
+        }
+
+        fn poll_crown_backward_deadline(&self) -> Result<()> {
+            if matches!(self.0, TerminalF32Error::Deadline { expired: true }) {
+                Err(NyError::DeadlineExceeded(
+                    "test expired ConvTranspose engine".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn forbids_unbounded_cpu_fallback(&self) -> bool {
+            matches!(self.0, TerminalF32Error::BoundedMemory)
+        }
+    }
+
+    #[test]
+    fn convtranspose_batched_gemm_preserves_only_authoritative_engine_errors() {
+        let coefficients = Array2::from_elem((1, 1), 2.0);
+        let kernel = ArrayD::from_elem(IxDyn(&[1, 1, 1, 1]), 3.0);
+        let run = |engine: &dyn GemmEngine| {
+            conv2d_forward_batched_gemm(
+                &coefficients,
+                &kernel,
+                (1, 1),
+                (0, 0),
+                (1, 1),
+                (1, 1),
+                Some(engine),
+            )
+        };
+
+        let live = run(&TerminalF32Engine(TerminalF32Error::Deadline {
+            expired: false,
+        }))
+        .expect("unscoped deadline retains legacy CPU fallback");
+        assert_eq!(live, Array2::from_elem((1, 1), 6.0));
+
+        let expired = run(&TerminalF32Engine(TerminalF32Error::Deadline {
+            expired: true,
+        }))
+        .expect_err("expired proxy deadline is terminal");
+        assert!(expired.is_deadline_exceeded());
+
+        let memory = run(&TerminalF32Engine(TerminalF32Error::BoundedMemory))
+            .expect_err("bounded memory refusal is terminal");
+        assert!(memory.is_cpu_memory_exceeded());
+    }
 
     struct CountingCpuF64Engine {
         calls: AtomicUsize,
@@ -2421,18 +3046,303 @@ mod tests {
     }
 
     #[test]
-    fn convtranspose_sound_f64_failed_engine_honors_deadline_before_cpu_retry() {
-        let failing = FailingF64Engine::new(Duration::from_millis(350));
-        let gate = Mutex::new(());
-        let deadline = Instant::now() + Duration::from_millis(250);
-        let error = run_fixture(0, Some(deadline), |lhs, rhs, deadline| {
-            conv2d_forward_f64_block_with_engine_and_gate(&failing, lhs, rhs, deadline, &gate)
+    fn convtranspose_sound_f64_finite_deadline_never_enters_engine() {
+        let calls = AtomicUsize::new(0);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("Instant epoch is at least one millisecond old");
+        let error = run_fixture(0, Some(expired), |_, _, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            panic!("finite-deadline path must not enter an opaque engine")
         })
-        .expect_err("expired budget after engine failure must skip CPU retry");
-        assert_eq!(failing.calls.load(Ordering::Relaxed), 1);
+        .expect_err("expired finite-deadline CPU path must refuse");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert!(
             matches!(error, NyError::DeadlineExceeded(_)),
             "expected DeadlineExceeded, got {error:?}"
+        );
+
+        let reference = run_fixture(usize::MAX, None, |_, _, _| {
+            panic!("CPU reference bypasses engine")
+        })
+        .expect("historical CPU reference");
+        let finite = run_fixture(
+            0,
+            Some(Instant::now() + Duration::from_secs(30)),
+            |_, _, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                panic!("finite-deadline path must not enter an opaque engine")
+            },
+        )
+        .expect("pollable finite-deadline CPU result");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        for (index, (&got, &want)) in finite.iter().zip(reference.iter()).enumerate() {
+            let tolerance = 2.0e-13 * (1.0 + want.abs());
+            assert!(
+                (got - want).abs() <= tolerance,
+                "finite/legacy f64 parity mismatch at {index}: got={got:e} want={want:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn convtranspose_f32_finite_deadline_is_pollable_and_engine_free() {
+        let (a, kernel) = fixture_inputs();
+        let engine = CountingF32Engine {
+            calls: AtomicUsize::new(0),
+        };
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("Instant epoch is at least one millisecond old");
+        let error = conv2d_forward_batched_gemm_with_deadline(
+            &a,
+            &kernel,
+            (2, 1),
+            (1, 0),
+            (1, 2),
+            (4, 5),
+            Some(&engine),
+            Some(expired),
+        )
+        .expect_err("expired finite-deadline point-coefficient path must refuse");
+        assert!(matches!(error, NyError::DeadlineExceeded(_)));
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 0);
+
+        let reference = conv2d_forward_batched_gemm_with_deadline(
+            &a,
+            &kernel,
+            (2, 1),
+            (1, 0),
+            (1, 2),
+            (4, 5),
+            None,
+            None,
+        )
+        .expect("historical CPU reference");
+        let finite = conv2d_forward_batched_gemm_with_deadline(
+            &a,
+            &kernel,
+            (2, 1),
+            (1, 0),
+            (1, 2),
+            (4, 5),
+            Some(&engine),
+            Some(Instant::now() + Duration::from_secs(30)),
+        )
+        .expect("pollable finite-deadline point coefficients");
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 0);
+        for (index, (&got, &want)) in finite.iter().zip(reference.iter()).enumerate() {
+            let tolerance = 2.0e-5 * (1.0 + want.abs());
+            assert!(
+                (got - want).abs() <= tolerance,
+                "finite/legacy f32 parity mismatch at {index}: got={got:e} want={want:e}"
+            );
+        }
+    }
+
+    /// Expiry after im2col construction is a launch-boundary refusal: the
+    /// unpollable faer GEMM must not start. The injected clock makes this pin
+    /// deterministic instead of relying on a large allocation outrunning a
+    /// short real-time deadline.
+    #[test]
+    fn convtranspose_f32_post_im2col_expiry_refuses_gemm_launch() {
+        let deadline = Instant::now();
+        let gemm_entered = Cell::new(false);
+        let result = run_f32_gemm_before_deadline_with_clock(
+            deadline,
+            || deadline,
+            || {
+                gemm_entered.set(true);
+                Mat::<f32>::zeros(1, 1)
+            },
+        );
+
+        assert!(matches!(result, Err(NyError::DeadlineExceeded(_))));
+        assert!(!gemm_entered.get(), "expired authority entered f32 GEMM");
+    }
+
+    /// Deterministic wide-magnitude mixed-sign stream (mirror of the
+    /// `faer_parallelism` seam stream): exponents span [-12, 11] with random
+    /// signs, so cancellation pushes the low bits of any two DIFFERENT
+    /// summation orders apart instead of averaging the difference away.
+    fn wide_magnitude_stream(seed: u64) -> impl FnMut() -> f32 {
+        let mut s = seed | 1;
+        move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let e = ((s >> 40) % 24) as i32 - 12;
+            let mant = ((s >> 12) & 0x7f_ffff) as f32 / (1u32 << 23) as f32;
+            let sign = if (s >> 3) & 1 == 1 { -1.0 } else { 1.0 };
+            sign * (1.0 + mant) * 2f32.powi(e)
+        }
+    }
+
+    /// Bit-parity gate between the finite-deadline route and the no-deadline
+    /// CPU route, with the SIGNED-ZERO-ONLY relaxation of the f64 precedent
+    /// (`assert_same_f64_image`, #cifar100-deadline-gemm): `-0.0 == 0.0` in
+    /// IEEE-754 and a certified bound cannot distinguish them; every non-zero
+    /// value still requires exact `to_bits()` equality.
+    fn assert_same_f32_image(got: &Array2<f32>, want: &Array2<f32>, context: &str) {
+        assert_eq!(got.raw_dim(), want.raw_dim(), "{context}: result shape");
+        for (index, (&got, &want)) in got.iter().zip(want.iter()).enumerate() {
+            if want.is_nan() {
+                assert!(
+                    got.is_nan(),
+                    "{context}: expected NaN at {index}, got {got}"
+                );
+            } else if got == 0.0 && want == 0.0 {
+                // Signed zero only — see the doc comment above.
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{context}: bit mismatch at {index}: got={got:e}, want={want:e}"
+                );
+            }
+        }
+    }
+
+    /// #cgan-deadline-f32-gemm: the finite-deadline f32 point-coefficient path
+    /// must be BIT-IDENTICAL (modulo signed zero) to the no-deadline twin's
+    /// CPU GEMM route, across mixed-sign cancellation-heavy inputs, several
+    /// geometries (stride/padding/dilation, contractions up to k=144), and
+    /// without ever entering the caller's engine.
+    ///
+    /// This is the pin that proves the deadline arm now reaches faer: the
+    /// replaced scalar per-MAC loop accumulated in strict tap order and only
+    /// matched the twin to a 2e-5 relative tolerance (see the sibling test
+    /// above, which keeps that historical envelope); faer's blocked SIMD
+    /// accumulation cannot be reproduced bit-for-bit by that loop on this
+    /// data, so this test FAILS on the old scalar implementation.
+    #[test]
+    fn convtranspose_f32_finite_deadline_matches_no_deadline_twin_bitwise() {
+        let mut next = wide_magnitude_stream(0xC6A9_F32D);
+        // (out_c, in_c, kh, kw, in_h, in_w, stride, padding, dilation, n_obj)
+        type Case = (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            (usize, usize),
+            (usize, usize),
+            (usize, usize),
+            usize,
+        );
+        let cases: [Case; 3] = [
+            (4, 8, 3, 3, 6, 6, (1, 1), (1, 1), (1, 1), 3),
+            (3, 16, 3, 3, 5, 7, (2, 1), (0, 1), (1, 2), 2),
+            (2, 4, 2, 2, 4, 5, (2, 1), (1, 0), (1, 2), 3),
+        ];
+        for &(out_c, in_c, kh, kw, in_h, in_w, stride, padding, dilation, n_obj) in &cases {
+            let a = Array2::from_shape_fn((n_obj, in_c * in_h * in_w), |_| next());
+            let kernel = ArrayD::from_shape_fn(IxDyn(&[out_c, in_c, kh, kw]), |_| next());
+            let reference = conv2d_forward_batched_gemm_with_deadline(
+                &a,
+                &kernel,
+                stride,
+                padding,
+                dilation,
+                (in_h, in_w),
+                None,
+                None,
+            )
+            .expect("no-deadline CPU reference");
+            let engine = CountingF32Engine {
+                calls: AtomicUsize::new(0),
+            };
+            let finite = conv2d_forward_batched_gemm_with_deadline(
+                &a,
+                &kernel,
+                stride,
+                padding,
+                dilation,
+                (in_h, in_w),
+                Some(&engine),
+                Some(Instant::now() + Duration::from_secs(30)),
+            )
+            .expect("finite-deadline GEMM result");
+            assert_eq!(
+                engine.calls.load(Ordering::Relaxed),
+                0,
+                "finite deadline must never enter the caller engine"
+            );
+            assert_same_f32_image(
+                &finite,
+                &reference,
+                &format!("k={} geometry", in_c * kh * kw),
+            );
+        }
+    }
+
+    /// #cgan-deadline-f32-gemm (f64 recompute lane): the finite-deadline f64
+    /// recompute must be BIT-IDENTICAL (modulo signed zero) to the no-deadline
+    /// twin's faer CPU route — same 64 MiB objective blocking, same W_T, same
+    /// per-block GEMM — and must never enter the injected engine. The old
+    /// scalar quintuple loop only matched to 2e-13
+    /// (`convtranspose_sound_f64_finite_deadline_never_enters_engine`), so
+    /// this pin fails on it.
+    #[test]
+    fn convtranspose_sound_f64_finite_deadline_matches_no_deadline_twin_bitwise() {
+        let reference = run_fixture(usize::MAX, None, |_, _, _| {
+            panic!("CPU reference bypasses engine")
+        })
+        .expect("no-deadline CPU reference");
+        let finite = run_fixture(
+            usize::MAX,
+            Some(Instant::now() + Duration::from_secs(30)),
+            |_, _, _| panic!("finite-deadline path must not enter an opaque engine"),
+        )
+        .expect("finite-deadline recompute");
+        assert_eq!(finite.raw_dim(), reference.raw_dim(), "result shape");
+        for (index, (&got, &want)) in finite.iter().zip(reference.iter()).enumerate() {
+            if want.is_nan() {
+                assert!(got.is_nan(), "expected NaN at {index}, got {got}");
+            } else if got == 0.0 && want == 0.0 {
+                // Signed zero only (#cifar100-deadline-gemm precedent).
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "bit mismatch at {index}: got={got:e}, want={want:e}"
+                );
+            }
+        }
+    }
+
+    /// #cgan-deadline-f32-gemm chunk-boundary abort: with the testable core
+    /// forced to one objective per block, a deadline that expires while the
+    /// block loop is in flight must surface as the TYPED deadline error at a
+    /// between-block poll — never a partial result, never a panic.
+    ///
+    /// Determinism: entry is verified live (assert below), and the workload is
+    /// 16384 blocks, each of which allocates two faer matrices and runs a GEMM
+    /// — orders of magnitude more than the 1 ms budget on any host, so the
+    /// expiry is always observed at one of the 16384 between-block polls.
+    #[test]
+    fn convtranspose_sound_f64_deadline_expires_between_blocks_with_typed_error() {
+        let num_obj = 16_384usize;
+        let (_, kernel) = fixture_inputs();
+        let a = Array2::from_shape_fn((num_obj, 2 * 4 * 5), |(row, col)| {
+            (((row * 37 + col * 13) % 29) as f32 - 14.0) / 7.0
+        });
+        let geometry =
+            DirectF64PairGeometry::checked(&a, &a, &kernel, (2, 1), (1, 0), (1, 2), (4, 5))
+                .expect("fixture geometry is valid");
+        let deadline = Instant::now() + Duration::from_millis(1);
+        assert!(
+            Instant::now() < deadline,
+            "deadline must be live at entry so the abort is mid-run"
+        );
+        let error = conv2d_forward_backward_coeff_f64_pollable_cpu_with_block_objs(
+            &a, &kernel, geometry, deadline, 1,
+        )
+        .expect_err("expiry across 16384 forced blocks must abort");
+        assert!(
+            matches!(error, NyError::DeadlineExceeded(_)),
+            "expected the typed DeadlineExceeded, got {error:?}"
         );
     }
 

@@ -54,6 +54,21 @@ use crate::{Layer, LinearBounds, MulBinaryRelaxationMode, NETWORK_INPUT};
 
 use super::indexed_pending::IndexedPendingLinearBounds;
 
+#[inline]
+fn engine_error_is_terminal(
+    error: &ny_core::NyError,
+    engine: &dyn GemmEngine,
+    deadline: Option<Instant>,
+) -> bool {
+    (error.is_cpu_memory_exceeded() && engine.forbids_unbounded_cpu_fallback())
+        || (error.is_deadline_exceeded()
+            && (deadline.is_some()
+                || matches!(
+                    engine.poll_crown_backward_deadline(),
+                    Err(error) if error.is_deadline_exceeded()
+                )))
+}
+
 /// Layers whose batched backward may be domain-stacked into one dispatch call.
 ///
 /// Whitelist rationale (see module docs): the backward must be a
@@ -295,6 +310,8 @@ pub(super) fn try_stacked_dispatch(
         network_input: &hull_input,
         node_bounds: (&hull_cache).into(),
         engine: Some(engine),
+        // `stacked_lb` is already Dense. Ordinary dispatch keeps its historical
+        // operator route and threads this authority into pollable kernels.
         deadline,
         bilinear_alphas: None,
         mul_binary_relaxation: MulBinaryRelaxationMode::default(),
@@ -313,6 +330,9 @@ pub(super) fn try_stacked_dispatch(
                 "stacked batched backward: non-Single dispatch result, falling back to per-domain loop"
             );
             return Ok(false);
+        }
+        Err(err) if engine_error_is_terminal(&err, engine, deadline) => {
+            return Err(err);
         }
         Err(err) => {
             tracing::debug!(
@@ -355,8 +375,79 @@ pub(super) fn try_stacked_dispatch(
 #[cfg(test)]
 mod tests {
     use ndarray::{arr1, arr2, Array1};
+    use ny_core::NyError;
 
     use super::*;
+
+    struct DeadlinePollEngine {
+        expired: bool,
+        forbid_fallback: bool,
+    }
+
+    impl GemmEngine for DeadlinePollEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            unreachable!("deadline authority test does not dispatch GEMM")
+        }
+
+        fn poll_crown_backward_deadline(&self) -> Result<()> {
+            if self.expired {
+                Err(NyError::DeadlineExceeded(
+                    "test stacked-dispatch deadline".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn forbids_unbounded_cpu_fallback(&self) -> bool {
+            self.forbid_fallback
+        }
+    }
+
+    #[test]
+    fn stacked_dispatch_preserves_only_authoritative_deadlines() {
+        let live = DeadlinePollEngine {
+            expired: false,
+            forbid_fallback: false,
+        };
+        let expired = DeadlinePollEngine {
+            expired: true,
+            forbid_fallback: false,
+        };
+        let bounded = DeadlinePollEngine {
+            expired: false,
+            forbid_fallback: true,
+        };
+        assert!(!engine_error_is_terminal(
+            &NyError::DeadlineExceeded("unscoped".into()),
+            &live,
+            None
+        ));
+        assert!(engine_error_is_terminal(
+            &NyError::DeadlineExceeded("expired".into()),
+            &expired,
+            None
+        ));
+        assert!(engine_error_is_terminal(
+            &NyError::DeadlineExceeded("explicit".into()),
+            &live,
+            Some(Instant::now())
+        ));
+        let memory = NyError::CpuMemoryExceeded {
+            required_bytes: 2,
+            budget_bytes: 1,
+            site: "stacked-dispatch test",
+        };
+        assert!(!engine_error_is_terminal(&memory, &live, None));
+        assert!(engine_error_is_terminal(&memory, &bounded, None));
+    }
 
     fn mk_lb(scale: f32, rows: usize, cols: usize, with_err: bool) -> LinearBounds {
         let lower_a =

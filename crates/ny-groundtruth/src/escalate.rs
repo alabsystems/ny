@@ -51,7 +51,8 @@
 //!
 //! # Subprocess lane
 //!
-//! AY runs as a subprocess (`ay solve -t <ms> query.smt2`), the pattern
+//! AY runs as a subprocess
+//! (`ay solve --memory 8192 -t <ms> query.smt2`), the pattern
 //! a3d-solve/a3d-sketch ship: certificates land on disk next to the query,
 //! `-t` yields a sound `unknown` on budget exhaustion, and ny's build stays
 //! decoupled from the ay workspace. The binary is located via `$NY_AY`, then
@@ -73,6 +74,11 @@ use ny_tensor::next_down_f32;
 
 use crate::exact::rational;
 use crate::verify::Relation;
+
+/// Per-child AY memory envelope in MiB. The standalone solver otherwise sizes
+/// itself as if it were the host's sole tenant, while NY must keep the source
+/// models and exact-validation state resident alongside it.
+const AY_MEMORY_LIMIT_MIB: u64 = 8 * 1024;
 
 /// Why an SMT escalation could not run (as opposed to running and answering
 /// [`SmtVerdict::Unknown`], which is a sound non-answer from the solver).
@@ -304,11 +310,8 @@ impl SmtEscalation {
         std::fs::write(&query, query_text)?;
 
         let mut cmd = Command::new(&self.ay);
-        cmd.arg("solve");
-        if let Some(ms) = timeout_ms {
-            cmd.arg("-t").arg(ms.to_string());
-        }
-        let out = cmd.arg(&query).output()?;
+        configure_solver_command(&mut cmd, &query, timeout_ms);
+        let out = cmd.output()?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
 
         let verdict = stdout.lines().find_map(|l| match l.trim() {
@@ -331,6 +334,16 @@ impl SmtEscalation {
         });
         Ok((answer, query, stdout))
     }
+}
+
+fn configure_solver_command(cmd: &mut Command, query: &Path, timeout_ms: Option<u64>) {
+    cmd.arg("solve")
+        .arg("--memory")
+        .arg(AY_MEMORY_LIMIT_MIB.to_string());
+    if let Some(ms) = timeout_ms {
+        cmd.arg("-t").arg(ms.to_string());
+    }
+    cmd.arg(query);
 }
 
 /// Parsed solver verdict.
@@ -606,7 +619,7 @@ fn encode_linear(
     lin: &ny_propagate::layers::LinearLayer,
     input: &[String],
 ) -> EscalateResult<Vec<String>> {
-    let w = &lin.weight;
+    let w = lin.weight();
     if w.ncols() != input.len() {
         return Err(EscalateError::GraphShape(format!(
             "Linear expects {} inputs, got {}",
@@ -630,7 +643,7 @@ fn encode_linear(
                 format!("(* {} {term})", smt_rat(&rational(c)))
             });
         }
-        let bias = match &lin.bias {
+        let bias = match lin.bias() {
             Some(b) => finite("Linear bias", b[i])?,
             None => 0.0,
         };
@@ -822,7 +835,7 @@ fn eval_exact(h: &GraphNetwork, point: &[BigRational]) -> EscalateResult<Vec<Big
         let out: Vec<BigRational> = match node.layer() {
             Layer::Linear(lin) => {
                 let input = single_input(name, &ins)?;
-                let w = &lin.weight;
+                let w = lin.weight();
                 if w.ncols() != input.len() {
                     return Err(EscalateError::GraphShape(format!(
                         "Linear expects {} inputs, got {}",
@@ -834,7 +847,7 @@ fn eval_exact(h: &GraphNetwork, point: &[BigRational]) -> EscalateResult<Vec<Big
                     .into_iter()
                     .enumerate()
                     .map(|(i, row)| {
-                        let mut acc = match &lin.bias {
+                        let mut acc = match lin.bias() {
                             Some(b) => rational(finite("Linear bias", b[i])?),
                             None => BigRational::zero(),
                         };
@@ -1020,6 +1033,27 @@ mod tests {
 
     fn rat(n: i64, d: i64) -> BigRational {
         BigRational::new(BigInt::from(n), BigInt::from(d))
+    }
+
+    #[test]
+    fn ay_solver_command_has_explicit_memory_envelope() {
+        let mut command = Command::new("ay");
+        configure_solver_command(&mut command, Path::new("query.smt2"), Some(1_234));
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            arguments,
+            vec![
+                "solve".to_owned(),
+                "--memory".to_owned(),
+                AY_MEMORY_LIMIT_MIB.to_string(),
+                "-t".to_owned(),
+                "1234".to_owned(),
+                "query.smt2".to_owned(),
+            ]
+        );
     }
 
     #[test]

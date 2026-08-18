@@ -72,6 +72,7 @@ fn build_dual_alpha_layers(
             bias: Some(b2.into()),
             out_features: out_dim,
             in_features: hidden,
+            cert_err: Default::default(),
         },
         GpuCrownLayer::ActivationReluDualAlpha {
             lower_pos_slope,
@@ -85,6 +86,7 @@ fn build_dual_alpha_layers(
             bias: Some(b1.into()),
             out_features: hidden,
             in_features: in_dim,
+            cert_err: Default::default(),
         },
     ]
 }
@@ -206,6 +208,7 @@ fn test_crown_backward_dual_alpha_differs_from_symmetric() {
             bias: Some(vec![0.1, -0.1].into()),
             out_features: 2,
             in_features: 2,
+            cert_err: Default::default(),
         },
         GpuCrownLayer::Activation {
             lower_slope: vec![chord_0, chord_1],
@@ -219,6 +222,7 @@ fn test_crown_backward_dual_alpha_differs_from_symmetric() {
             bias: Some(vec![0.0, 0.1].into()),
             out_features: 2,
             in_features: 2,
+            cert_err: Default::default(),
         },
     ];
 

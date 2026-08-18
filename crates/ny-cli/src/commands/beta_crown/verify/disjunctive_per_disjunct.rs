@@ -50,7 +50,7 @@ pub(super) fn try_per_disjunct_multi_objective(
         }
     };
 
-    let remaining_timeout = ledger.remaining().unwrap_or(Duration::from_secs(u64::MAX));
+    let remaining_timeout = ledger.remaining_for_engine();
     if timeout > 0 && remaining_timeout.is_zero() {
         return Ok(BetaCrownResult {
             result: ny_propagate::BabVerificationStatus::Timeout,
@@ -63,11 +63,7 @@ pub(super) fn try_per_disjunct_multi_objective(
         });
     }
     let remaining_config = BetaCrownConfig {
-        timeout: if timeout == 0 {
-            config.timeout
-        } else {
-            remaining_timeout
-        },
+        timeout: remaining_timeout,
         ..config.clone()
     };
 

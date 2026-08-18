@@ -637,6 +637,19 @@ pub(super) fn try_backward_soa(
     deadline: Option<std::time::Instant>,
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
 ) -> Result<SoaBackwardOutcome> {
+    // The SoA Linear kernel is one stacked launch with no cooperative
+    // cancellation seam. Decline the optional fast lane whenever wall-clock
+    // authority is present; the caller restarts on the reference traversal,
+    // whose Linear arm uses the deadline-aware row-chunked API.
+    if let Some(deadline) = deadline {
+        if std::time::Instant::now() >= deadline {
+            return Err(NyError::DeadlineExceeded(
+                "SoA batched backward: deadline exceeded before fast-lane admission".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+
     let nodes_by_idx = build_nodes_by_idx(graph, plan)?;
     let network_input_dim = constrained_inputs[0].len();
     let min_chunk = par_min_chunk(n_domains);
@@ -1070,6 +1083,74 @@ mod tests {
         if let (Some(x), Some(y)) = (a.upper_a_err.as_ref(), b.upper_a_err.as_ref()) {
             cmp2(x, y, "upper_a_err");
         }
+    }
+
+    #[test]
+    fn soa_fast_lane_declines_any_deadline_scored_traversal() {
+        let mut graph = GraphNetwork::new();
+        graph
+            .try_add_node(GraphNode::from_input(
+                "out",
+                Layer::Linear(
+                    LinearLayer::new(ndarray::arr2(&[[1.0_f32]]), None)
+                        .expect("valid linear layer"),
+                ),
+            ))
+            .expect("node should add");
+        graph.set_output("out");
+        let plan = CrownDispatchPlan::build(&graph).expect("dispatch plan");
+
+        let outcome = try_backward_soa(
+            &graph,
+            &plan,
+            0,
+            &[],
+            &[],
+            &[],
+            &LinearBounds::identity(1),
+            &ny_core::NaiveCpuGemmEngine,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            None,
+        )
+        .expect("deadline-bearing SoA attempt should decline cleanly");
+
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn soa_fast_lane_preserves_expired_deadline_cause() {
+        let mut graph = GraphNetwork::new();
+        graph
+            .try_add_node(GraphNode::from_input(
+                "out",
+                Layer::Linear(
+                    LinearLayer::new(ndarray::arr2(&[[1.0_f32]]), None)
+                        .expect("valid linear layer"),
+                ),
+            ))
+            .expect("node should add");
+        graph.set_output("out");
+        let plan = CrownDispatchPlan::build(&graph).expect("dispatch plan");
+
+        let error = try_backward_soa(
+            &graph,
+            &plan,
+            0,
+            &[],
+            &[],
+            &[],
+            &LinearBounds::identity(1),
+            &ny_core::NaiveCpuGemmEngine,
+            Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(1))
+                    .expect("one millisecond fits before the current instant"),
+            ),
+            None,
+        )
+        .expect_err("expired deadline must not be reported as a structural decline");
+
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
     }
 
     /// The SoA slot insert+merge must store BIT-IDENTICAL state to the

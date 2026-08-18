@@ -115,7 +115,7 @@ fn explicit_stem_nodes_engage_legacy_intercept_and_bypass_mo_scorer_fix() {
         env.set("NY_MO_SCORER_FIX", "1");
 
         let fixed_width_pick = verifier
-            .select_graph_branch_multi(&graph, &domain, &unstable, &[], None)
+            .select_graph_branch_multi(&graph, &domain, &unstable, &[], &[0.0], None)
             .unwrap();
         assert_eq!(
             (fixed_width_pick.0.as_str(), fixed_width_pick.1),
@@ -126,7 +126,7 @@ fn explicit_stem_nodes_engage_legacy_intercept_and_bypass_mo_scorer_fix() {
 
         arm_sealed_stem_env(env, "Relu_6,Relu_9,Relu_12", "8");
         let stem_pick = verifier
-            .select_graph_branch_multi(&graph, &domain, &unstable, &[], None)
+            .select_graph_branch_multi(&graph, &domain, &unstable, &[], &[0.0], None)
             .unwrap();
         assert_eq!(
             (stem_pick.0.as_str(), stem_pick.1),
@@ -147,7 +147,7 @@ fn explicit_stem_nodes_fail_open_when_unscorable_or_depth_window_exhausted() {
         arm_sealed_stem_env(env, "Relu_9,Relu_12", "8");
 
         let no_named_candidate = verifier
-            .select_graph_branch_multi(&graph, &domain, &unstable, &[], None)
+            .select_graph_branch_multi(&graph, &domain, &unstable, &[], &[0.0], None)
             .unwrap();
         assert_eq!(
             (no_named_candidate.0.as_str(), no_named_candidate.1),
@@ -164,7 +164,7 @@ fn explicit_stem_nodes_fail_open_when_unscorable_or_depth_window_exhausted() {
         });
         arm_sealed_stem_env(env, "Relu_6,Relu_9,Relu_12", "1");
         let depth_exhausted = verifier
-            .select_graph_branch_multi(&graph, &domain, &unstable, &[], None)
+            .select_graph_branch_multi(&graph, &domain, &unstable, &[], &[0.0], None)
             .unwrap();
         assert_eq!(
             (depth_exhausted.0.as_str(), depth_exhausted.1),

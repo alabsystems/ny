@@ -284,7 +284,41 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
     // ibp_enhancement. Both default off (byte-identical historical kernel).
     verifier_config.input_split_stacked_rebound = stacked_rebound;
     verifier_config.input_split_batched_ibp_refresh = stacked_rebound && ibp_enhancement;
-    let verifier = BetaCrownVerifier::new(verifier_config);
+    let mut verifier = BetaCrownVerifier::new(verifier_config);
+    // This is a nested propagation adapter, so the caller's deadline is the
+    // complete authority for this rebound. `BetaCrownVerifier::new` normally
+    // anchors a fresh top-level timeout; restore the explicitly supplied value
+    // (including `None`) so unscored callers retain the historical batched GEMM
+    // path while finite-deadline callers remain on the pollable path.
+    //
+    // #cgan-row7 DIAGNOSTIC (2026-08-12). This assignment is the one change in
+    // `6f49a660` — the bisected first-bad commit for the cgan row-7
+    // `unsat -> timeout` regression — that lands in the input-split BaB family
+    // row 7 actually runs. A FINITE deadline here is a throughput cliff, not a
+    // neutral hand-off: `Conv2dLayer::propagate_ibp_with_engine_and_deadline`
+    // documents that with one set, "neither the caller engine nor faer's
+    // unpollable GEMM is entered" and dense convs fall back to a direct scalar
+    // CPU contraction. Row 7 spends ~584 s in this phase.
+    //
+    // `NY_INPUT_SPLIT_NESTED_DEADLINE=0` restores the pre-`6f49a660` shape for
+    // the A/B ONLY. It is diagnostic: dropping the deadline removes this
+    // rebound's interruptibility, so it must never be the shipped default.
+    // Declared as an OPT-OUT: the shipped arm is `true` (keep the deadline), and
+    // only an exact "0" disarms it, so `!as_bool()` is the drop. The chokepoint
+    // resolves any other present value back to the shipped default, which is the
+    // safe direction for a lever whose off-arm removes interruptibility.
+    use ny_levers::decls::dark_probes::{INPUT_SPLIT_NESTED_DEADLINE, INPUT_SPLIT_PROBE};
+    let drop_nested_deadline = !ny_levers::read(&INPUT_SPLIT_NESTED_DEADLINE)
+        .value
+        .as_bool();
+    verifier.config.alpha_config.deadline = if drop_nested_deadline { None } else { deadline };
+    if ny_levers::read(&INPUT_SPLIT_PROBE).value.as_bool() {
+        eprintln!(
+            "[input-split-rebound] domains={n} deadline_finite={} dropped={drop_nested_deadline} \
+             stacked_rebound={stacked_rebound}",
+            deadline.is_some()
+        );
+    }
 
     info!(
         domains = n,

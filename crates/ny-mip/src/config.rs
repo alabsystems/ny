@@ -23,11 +23,43 @@ pub enum MipBackend {
     AyProc,
 }
 
+/// Typed feasibility-session ingress policy.
+///
+/// The default preserves the historical environment-canary behavior.  The
+/// required variants are reserved for a caller that has already admitted a
+/// narrowly scoped direct-MIP experiment and must not silently fall through
+/// to NY's cloned phase-split or serial feasibility routes if the requested
+/// shared AY session cannot be formed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MipFeasibilityIngress {
+    /// Preserve the historical/default feasibility route, including the
+    /// exact `NY_MIP_SAFENLP_SHARED_PREFIX=1` canary when it is admissible.
+    #[default]
+    Historical,
+    /// Require one AY shared-binary-prefix session.  Any backend admission
+    /// decline is a solver error/unknown under the caller's existing clock;
+    /// no alternate MIP feasibility session may be launched.
+    RequireSafeNlpSharedBinaryPrefix,
+    /// Require one AY marked-margin shared-binary-prefix session.
+    ///
+    /// The caller must have explicitly marked its unique one-sided unsafe row.
+    /// A missing marker, backend decline, or incomplete solve is an
+    /// error/unknown under the existing clock; it never falls through to the
+    /// plain shared-prefix API or another feasibility session.
+    RequireSafeNlpMarkedMarginSharedBinaryPrefix,
+}
+
 /// Configuration for the MIP/LP solver.
 #[derive(Debug, Clone, Copy)]
 pub struct MipConfig {
     /// Which MIP solver backend to lower the IR to.
     pub backend: MipBackend,
+    /// How the final feasibility session must enter the backend.
+    ///
+    /// This is typed caller-local state rather than an environment mutation.
+    /// LP tightening and all historical callers leave it at
+    /// [`MipFeasibilityIngress::Historical`].
+    pub feasibility_ingress: MipFeasibilityIngress,
     /// Parallel phase-split racing width (designs/scip.md Phase C).
     ///
     /// Feasibility checks split the 2^k assignments of the k widest unstable
@@ -75,17 +107,69 @@ pub struct MipConfig {
     ///
     /// Reference: ay `crates/ay-milp/design/P3-SPEC.md` (`LpSession::obbt`).
     pub obbt_rounds: usize,
+    /// Per-node warm LP ceiling for AY's branch-and-bound engine.
+    ///
+    /// `None` is the historical/default behavior. A finite duration asks AY
+    /// to stop a stalled warm attempt at the earlier of this ceiling and the
+    /// outer solve deadline, then retry that node cold exactly once. The
+    /// value is typed and scoped to one solver session; it never extends the
+    /// outer deadline.
+    ///
+    /// Only exact neural Graph-MIP callers should set this field. LP
+    /// tightening, certified-linear proof replay, and other authority paths
+    /// leave it `None`.
+    pub ay_node_warm_time_limit: Option<std::time::Duration>,
+    /// Absolute caller-owned wall deadline for AY solves.
+    ///
+    /// `None` is the historical/default policy: a serial window-class solve
+    /// may raise [`Self::timeout_secs`] to `NY_MIP_WINDOW_TIMEOUT_SECS`.
+    /// `Some(deadline)` is a lexically scoped hard cap: every AY feasibility
+    /// solve, phase-split worker, cached re-solve, and optimization ends at
+    /// the earlier of this instant and its relative `timeout_secs`, and the
+    /// window floor is not reapplied.
+    ///
+    /// This is used when a caller carves preliminary work out of the same
+    /// historical solve envelope.  It is typed process-local state rather
+    /// than an environment mutation, and therefore cannot leak into an
+    /// unrelated solver.
+    pub ay_hard_deadline: Option<std::time::Instant>,
 }
 
 impl Default for MipConfig {
     fn default() -> Self {
         Self {
             backend: MipBackend::default(), // ay: the only production solver
-            parallel_split: 0,              // auto: split across available cores
-            timeout_secs: 300.0,            // VNN-COMP standard
-            max_tighten_per_layer: 0,       // tighten all unstable neurons
+            feasibility_ingress: MipFeasibilityIngress::default(),
+            parallel_split: 0,        // auto: split across available cores
+            timeout_secs: 300.0,      // VNN-COMP standard
+            max_tighten_per_layer: 0, // tighten all unstable neurons
             lp_tighten: false,
             obbt_rounds: 0, // single-pass per-neuron tighten unless opted in
+            ay_node_warm_time_limit: None,
+            ay_hard_deadline: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ay_node_warm_limit_defaults_off() {
+        assert_eq!(MipConfig::default().ay_node_warm_time_limit, None);
+    }
+
+    #[test]
+    fn ay_hard_deadline_defaults_off() {
+        assert_eq!(MipConfig::default().ay_hard_deadline, None);
+    }
+
+    #[test]
+    fn feasibility_ingress_defaults_historical() {
+        assert_eq!(
+            MipConfig::default().feasibility_ingress,
+            MipFeasibilityIngress::Historical
+        );
     }
 }

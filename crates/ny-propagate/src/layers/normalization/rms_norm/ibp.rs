@@ -19,7 +19,7 @@ use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{checked_dim_product, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, L2Constraint, RepairStrategy};
 
-use super::super::math_common::square_interval_bounds;
+use super::super::math_common::{outward_midpoint_radius, square_interval_bounds};
 
 use super::types::RmsNormLayer;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
@@ -165,6 +165,10 @@ impl RmsNormLayer {
     /// Computes the Jacobian at the center point, propagates input radii through
     /// the absolute Jacobian, then adds a second-order remainder for soundness.
     ///
+    /// This implementation is admitted only as heuristic analysis, not as
+    /// proof authority. The outward arithmetic below hardens its enclosure
+    /// behavior but does not change that provenance classification.
+    ///
     /// Reference: Jacobian from `math.rs` (verified against finite differences).
     /// Fix for #3098: replaces the unsound `max_radius / n` coupling correction.
     #[inline]
@@ -177,12 +181,9 @@ impl RmsNormLayer {
             ));
         }
         let norm_size = shape[ndim - 1];
-        let center = (input.lower() + input.upper()) * 0.5;
-        let radius = (input.upper() - input.lower()) * 0.5;
-
-        if center.iter().chain(radius.iter()).any(|&v| !v.is_finite()) {
+        let Some((center, radius)) = outward_midpoint_radius(input.lower(), input.upper()) else {
             return self.fallback_output_bounds(shape);
-        }
+        };
 
         let mut out_lower = input.lower().clone();
         let mut out_upper = input.upper().clone();

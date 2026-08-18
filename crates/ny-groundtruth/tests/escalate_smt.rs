@@ -5,33 +5,102 @@
 //! Route B integration tests: SMT escalation against a live `ay` solver
 //! (`docs/GEOMETRIC_GROUND_TRUTH_PLAN.md`).
 //!
-//! Every test degrades to a skip (with a stderr note) when no `ay` binary is
-//! reachable (`$NY_AY`, `PATH`, or the Trust stage2 sysroot), so the suite
-//! stays green on machines without the solver.
+//! The CROWN-side assertions run in the hermetic default suite. Live SMT
+//! conformance is compiled with `--features external-ay` and then requires an
+//! `ay` binary at the exact revision pinned by `ny-mip` (`$NY_AY`, `PATH`, or
+//! the Trust stage2 sysroot). A selected conformance lane fails on absence or
+//! revision drift; it never reports a skipped or vacuous pass.
 //!
-//! The centrepiece is [`crown_unknown_smt_proves_quadratic_dominance`]: a
+//! The centrepiece is [`live_ay_proves_crown_unknown_quadratic_dominance`]: a
 //! case where the CROWN relaxation of the quadratic ground-truth side is too
 //! loose to decide (`PowConstant` secant looseness at the *interior* binding
 //! point), but the exact QF_NRA query refutes the violation outright.
 
 use ndarray::{Array1, Array2};
 use ny_core::Bound;
+#[cfg(feature = "external-ay")]
+use ny_groundtruth::SmtVerdict;
 use ny_groundtruth::{
     signed_plane_distance, sphere_residual, verify_against_ground_truth, EscalateError,
-    EscalateOptions, GroundTruthOutcome, Relation, SmtEscalation, SmtVerdict,
+    EscalateOptions, GroundTruthOutcome, Relation, SmtEscalation,
 };
 use ny_propagate::layers::{LinearLayer, PowConstantLayer, ReLULayer};
 use ny_propagate::{GraphNetwork, GraphNode, Layer};
+#[cfg(feature = "external-ay")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "external-ay")]
+use std::process::Command;
 
-/// Locate `ay` or skip the test honestly.
-fn solver() -> Option<SmtEscalation> {
-    let located = SmtEscalation::locate();
-    if located.is_none() {
-        eprintln!(
-            "skipping SMT escalation test: no `ay` solver (set NY_AY, PATH, or rustup trust)"
-        );
+#[cfg(feature = "external-ay")]
+fn pinned_ay_revision() -> &'static str {
+    let manifest = include_str!("../../ny-mip/Cargo.toml");
+    let dependency = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("ay-milp ="))
+        .expect("ny-mip must declare ay-milp");
+    let revision = dependency
+        .split_once("rev = \"")
+        .and_then(|(_, tail)| tail.split_once('"'))
+        .map(|(revision, _)| revision)
+        .expect("ay-milp must remain revision-pinned");
+    assert_eq!(revision.len(), 40, "AY revision must be a full commit SHA");
+    revision
+}
+
+#[cfg(feature = "external-ay")]
+fn ay_build_commit(ay: &Path) -> Option<String> {
+    let output = Command::new(ay).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
     }
-    located
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("build.commit="))
+        .map(str::to_owned)
+}
+
+#[cfg(feature = "external-ay")]
+fn candidate_ay_paths() -> Vec<PathBuf> {
+    if let Some(explicit) = std::env::var_os("NY_AY") {
+        return vec![PathBuf::from(explicit)];
+    }
+
+    let mut candidates = vec![PathBuf::from("ay")];
+    let rustup_trust_ay = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .map(|root| root.join("toolchains/trust/bin/ay"));
+    candidates.extend(rustup_trust_ay);
+    candidates
+}
+
+/// Require the exact AY revision used by ny-mip. The external conformance lane
+/// is explicit, so selecting it without its dependency must fail.
+#[cfg(feature = "external-ay")]
+fn require_pinned_solver() -> SmtEscalation {
+    let expected = pinned_ay_revision();
+    let mut observed = Vec::new();
+    for candidate in candidate_ay_paths() {
+        match ay_build_commit(&candidate) {
+            Some(actual) if actual == expected => {
+                let workdir =
+                    std::env::temp_dir().join(format!("ny-gt-live-ay-{}", std::process::id()));
+                std::fs::create_dir_all(&workdir).expect("create live AY test workdir");
+                return SmtEscalation::with_solver(candidate, workdir);
+            }
+            Some(actual) => observed.push(format!("{}: {actual}", candidate.display())),
+            None => observed.push(format!(
+                "{}: unavailable or no build.commit",
+                candidate.display()
+            )),
+        }
+    }
+    panic!(
+        "live SMT test requires AY revision {expected}; set NY_AY to that binary \
+         (observed: {})",
+        observed.join(", ")
+    );
 }
 
 /// f(x) = w·(|x0| + |x1| + |x2|) + bias as a genuine 3 -> 6 -> 1 FC-ReLU
@@ -77,14 +146,31 @@ fn unit_box() -> Vec<Bound> {
     ]
 }
 
+fn plane_case() -> (GraphNetwork, GraphNetwork, Vec<Bound>) {
+    (
+        abs_net(1.0, 3.0),
+        signed_plane_distance([0.0, 0.0, 1.0], -0.5).expect("plane builds"),
+        unit_box(),
+    )
+}
+
+fn quadratic_dominance_case() -> (GraphNetwork, GraphNetwork, Vec<Bound>) {
+    (
+        abs_net(2.0, -0.75),
+        sphere_residual([0.0, 0.0, 0.0], 1.0).expect("sphere builds"),
+        vec![
+            Bound::new(-1.0, 1.0),
+            Bound::new(-1.0, 1.0),
+            Bound::new(0.0, 0.0),
+        ],
+    )
+}
+
 #[test]
-fn plane_case_crown_and_smt_agree() {
+fn plane_case_crown_verifies() {
     // M0-style case: f = |x0|+|x1|+|x2| + 3 dominates the plane g = x2 − 1/2
-    // with margin >= 5/2. CROWN proves it; the exact QF_LRA query must agree
-    // and return an Alethe certificate.
-    let f = abs_net(1.0, 3.0);
-    let g = signed_plane_distance([0.0, 0.0, 1.0], -0.5).expect("plane builds");
-    let bounds = unit_box();
+    // with margin >= 5/2. This assertion is independent of the live solver.
+    let (f, g, bounds) = plane_case();
 
     let crown =
         verify_against_ground_truth(&f, &g, Relation::Dominates, &bounds).expect("crown path runs");
@@ -92,8 +178,20 @@ fn plane_case_crown_and_smt_agree() {
         matches!(crown, GroundTruthOutcome::Verified { .. }),
         "CROWN must verify the plane case, got {crown:?}"
     );
+}
 
-    let Some(solver) = solver() else { return };
+#[test]
+#[cfg(feature = "external-ay")]
+fn live_ay_plane_case_agrees_with_crown() {
+    let (f, g, bounds) = plane_case();
+    let crown =
+        verify_against_ground_truth(&f, &g, Relation::Dominates, &bounds).expect("crown path runs");
+    assert!(
+        matches!(crown, GroundTruthOutcome::Verified { .. }),
+        "CROWN must verify the plane case, got {crown:?}"
+    );
+
+    let solver = require_pinned_solver();
     let verdict = solver
         .escalate(
             &f,
@@ -114,20 +212,14 @@ fn plane_case_crown_and_smt_agree() {
 }
 
 #[test]
-fn crown_unknown_smt_proves_quadratic_dominance() {
+fn quadratic_dominance_crown_is_unknown() {
     // f = 2(|x0|+|x1|+|x2|) − 3/4 vs g = ‖x‖² − 1 on [−1,1]² × {0}:
     // h(x) = Σ (2|xi| − xi²) + 1/4, minimum 1/4 > 0 at the box *centre*.
     // CROWN cannot prove it: the lower relaxation of the −xi² terms is the
     // secant (exact only at the endpoints, off by 1 at the interior binding
     // point) and the |xi| lower envelope is linear, so the certified lower
-    // bound is ≤ −3/4 + eps. The exact NRA query refutes h < 0 outright.
-    let f = abs_net(2.0, -0.75);
-    let g = sphere_residual([0.0, 0.0, 0.0], 1.0).expect("sphere builds");
-    let bounds = vec![
-        Bound::new(-1.0, 1.0),
-        Bound::new(-1.0, 1.0),
-        Bound::new(0.0, 0.0),
-    ];
+    // bound is ≤ −3/4 + eps.
+    let (f, g, bounds) = quadratic_dominance_case();
 
     let crown =
         verify_against_ground_truth(&f, &g, Relation::Dominates, &bounds).expect("crown path runs");
@@ -135,8 +227,21 @@ fn crown_unknown_smt_proves_quadratic_dominance() {
         matches!(crown, GroundTruthOutcome::Unknown { .. }),
         "CROWN must be too loose here (else the test lost its point), got {crown:?}"
     );
+}
 
-    let Some(solver) = solver() else { return };
+#[test]
+#[cfg(feature = "external-ay")]
+fn live_ay_proves_crown_unknown_quadratic_dominance() {
+    // The exact NRA query refutes h < 0 outright after CROWN remains unknown.
+    let (f, g, bounds) = quadratic_dominance_case();
+    let crown =
+        verify_against_ground_truth(&f, &g, Relation::Dominates, &bounds).expect("crown path runs");
+    assert!(
+        matches!(crown, GroundTruthOutcome::Unknown { .. }),
+        "CROWN must be too loose here (else the test lost its point), got {crown:?}"
+    );
+
+    let solver = require_pinned_solver();
     let verdict = solver
         .escalate(
             &f,
@@ -157,11 +262,12 @@ fn crown_unknown_smt_proves_quadratic_dominance() {
 }
 
 #[test]
-fn falsified_quadratic_returns_validated_witness() {
+#[cfg(feature = "external-ay")]
+fn live_ay_falsified_quadratic_returns_validated_witness() {
     // f = 2(|x0|+|x1|+|x2|) − 5/4 vs the same sphere: h(0) = −1/4 < 0, so
     // dominance is false. The sat model must validate in exact rational
     // arithmetic before being reported.
-    let Some(solver) = solver() else { return };
+    let solver = require_pinned_solver();
     let f = abs_net(2.0, -1.25);
     let g = sphere_residual([0.0, 0.0, 0.0], 1.0).expect("sphere builds");
     let bounds = unit_box();
@@ -205,9 +311,10 @@ fn falsified_quadratic_returns_validated_witness() {
 }
 
 #[test]
-fn absbound_escalation_proves_self_equivalence() {
+#[cfg(feature = "external-ay")]
+fn live_ay_absbound_escalation_proves_self_equivalence() {
     // |f − f| = 0 <= 1/2 everywhere: the AbsBound violation query is unsat.
-    let Some(solver) = solver() else { return };
+    let solver = require_pinned_solver();
     let f = abs_net(1.0, 0.0);
     let verdict = solver
         .escalate(
@@ -225,12 +332,13 @@ fn absbound_escalation_proves_self_equivalence() {
 }
 
 #[test]
-fn strict_margin_flag_flips_a_touching_case() {
+#[cfg(feature = "external-ay")]
+fn live_ay_strict_margin_flag_flips_a_touching_case() {
     // f = |x0|+|x1|+|x2| dominates g = plane(x2) − 0 ... f − g = Σ|xi| − x2
     // touches 0 exactly at x = 0. Non-strict dominance holds (unsat);
     // requiring a strict margin makes the violation h <= 0 satisfiable at 0,
     // which validates exactly.
-    let Some(solver) = solver() else { return };
+    let solver = require_pinned_solver();
     let f = abs_net(1.0, 0.0);
     let g = signed_plane_distance([0.0, 0.0, 1.0], 0.0).expect("plane builds");
     let bounds = unit_box();
@@ -274,10 +382,7 @@ fn strict_margin_flag_flips_a_touching_case() {
 fn unsupported_shapes_error_before_reaching_the_solver() {
     // No solver needed: these must fail at encoding time, so use a dummy
     // binary path — reaching the subprocess would be the bug.
-    let solver = SmtEscalation::with_solver(
-        std::path::PathBuf::from("/nonexistent/ay"),
-        std::env::temp_dir(),
-    );
+    let solver = SmtEscalation::with_solver(PathBuf::from("/nonexistent/ay"), std::env::temp_dir());
 
     // Fractional PowConstant exponent.
     let mut f = GraphNetwork::new();
@@ -321,151 +426,4 @@ fn unsupported_shapes_error_before_reaching_the_solver() {
         matches!(err, EscalateError::NonFiniteBounds { index: 1, .. }),
         "got {err:?}"
     );
-}
-
-/// Scale probe (run manually: `cargo test -p ny-groundtruth --test
-/// escalate_smt -- --ignored --nocapture`): where does the exact query stop
-/// being decidable in reasonable time? Widens the CROWN-can't case to
-/// 6k-neuron single-hidden-layer nets computing the same function
-/// (each ±eᵢ row repeated k times with readout weight 2/k), plus the full
-/// 3-D box. Results are documented in GEOMETRIC_GROUND_TRUTH_PLAN.md §Route B.
-#[test]
-#[ignore = "manual scale probe; prints timings"]
-fn scale_probe_report_where_ay_times_out() {
-    let Some(solver) = solver() else { return };
-    let g = sphere_residual([0.0, 0.0, 0.0], 1.0).expect("sphere builds");
-
-    // Full 3-D box at width 6 first (the baseline hard case).
-    let f = abs_net(2.0, -0.75);
-    let t0 = std::time::Instant::now();
-    let verdict = solver
-        .escalate(
-            &f,
-            &g,
-            Relation::Dominates,
-            &unit_box(),
-            &EscalateOptions {
-                timeout_ms: Some(120_000),
-                ..EscalateOptions::default()
-            },
-        )
-        .expect("escalation runs");
-    println!(
-        "width 6 (3-D box): {:?} in {:.1}s",
-        verdict_name(&verdict),
-        t0.elapsed().as_secs_f64()
-    );
-
-    for (k, bias, label) in [
-        (2_usize, -0.75, "tight margin 1/4"),
-        (4, -0.75, "tight margin 1/4"),
-        (8, -0.75, "tight margin 1/4"),
-        (16, -0.75, "tight margin 1/4"),
-        (2, 1.0, "generous margin 2"),
-        (8, 1.0, "generous margin 2"),
-        (16, 1.0, "generous margin 2"),
-    ] {
-        let width = 6 * k;
-        let f = wide_abs_net(k, bias);
-        let t0 = std::time::Instant::now();
-        let verdict = solver
-            .escalate(
-                &f,
-                &g,
-                Relation::Dominates,
-                &unit_box(),
-                &EscalateOptions {
-                    timeout_ms: Some(120_000),
-                    ..EscalateOptions::default()
-                },
-            )
-            .expect("escalation runs");
-        let detail = match &verdict {
-            SmtVerdict::Unknown { reason, .. } => format!(" ({reason})"),
-            _ => String::new(),
-        };
-        println!(
-            "width {width}, {label}: {:?}{detail} in {:.1}s",
-            verdict_name(&verdict),
-            t0.elapsed().as_secs_f64()
-        );
-    }
-
-    // The linear lane (plane g, QF_LRA) for comparison: same nets against
-    // g(x) = x2 − 4 (dominated with margin > 1/2 by every family member).
-    let plane = signed_plane_distance([0.0, 0.0, 1.0], -4.0).expect("plane builds");
-    for k in [2_usize, 8, 16, 64] {
-        let width = 6 * k;
-        let f = wide_abs_net(k, -0.75);
-        let t0 = std::time::Instant::now();
-        let verdict = solver
-            .escalate(
-                &f,
-                &plane,
-                Relation::Dominates,
-                &unit_box(),
-                &EscalateOptions {
-                    timeout_ms: Some(120_000),
-                    ..EscalateOptions::default()
-                },
-            )
-            .expect("escalation runs");
-        println!(
-            "width {width}, plane g (QF_LRA): {:?} in {:.1}s",
-            verdict_name(&verdict),
-            t0.elapsed().as_secs_f64()
-        );
-    }
-}
-
-fn verdict_name(v: &SmtVerdict) -> &'static str {
-    match v {
-        SmtVerdict::Proved { .. } => "Proved",
-        SmtVerdict::Falsified { .. } => "Falsified",
-        SmtVerdict::ViolationExists { .. } => "ViolationExists",
-        SmtVerdict::Unknown { .. } => "Unknown",
-        _ => "other",
-    }
-}
-
-/// The width-6k relative of `abs_net(2, bias)`: every ±eᵢ row appears k
-/// times with a *distinct* small hidden bias `j/16384` (all exactly f32), so
-/// no two neurons are identical and the encoder's CSE cannot collapse the
-/// query. The perturbation shifts f by at most `(2/k)·Σ|b_j| ≤ 72k/16384 <
-/// 0.071` for k ≤ 16, so with `bias = −3/4` true dominance survives with
-/// margin ≥ 1/4 − 0.071, and with `bias = 1` the margin is generous (≥ 1.9).
-fn wide_abs_net(k: usize, bias: f32) -> GraphNetwork {
-    let mut rows = Vec::with_capacity(6 * k * 3);
-    for _ in 0..k {
-        rows.extend_from_slice(&[
-            1.0, 0.0, 0.0, //
-            -1.0, 0.0, 0.0, //
-            0.0, 1.0, 0.0, //
-            0.0, -1.0, 0.0, //
-            0.0, 0.0, 1.0, //
-            0.0, 0.0, -1.0,
-        ]);
-    }
-    let w1 = Array2::from_shape_vec((6 * k, 3), rows).expect("shape");
-    #[allow(clippy::cast_precision_loss)]
-    let b1 = Array1::from_iter((0..6 * k).map(|j| j as f32 / 16384.0));
-    #[allow(clippy::cast_precision_loss)]
-    let w2 = Array2::from_shape_vec((1, 6 * k), vec![2.0 / k as f32; 6 * k]).expect("shape");
-    let mut g = GraphNetwork::new();
-    g.add_node(GraphNode::from_input(
-        "lin1",
-        Layer::Linear(LinearLayer::new(w1, Some(b1)).expect("valid linear")),
-    ));
-    g.add_node(GraphNode::new(
-        "relu",
-        Layer::ReLU(ReLULayer::new()),
-        vec!["lin1".to_string()],
-    ));
-    g.add_node(GraphNode::new(
-        "readout",
-        Layer::Linear(LinearLayer::new(w2, Some(Array1::from(vec![bias]))).expect("valid linear")),
-        vec!["relu".to_string()],
-    ));
-    g.set_output("readout");
-    g
 }

@@ -43,10 +43,10 @@
 //! ```
 
 mod dequant;
+mod file_data;
 mod info;
 mod load;
 mod metadata;
-mod mmap;
 mod parser;
 
 /// GGUF metadata inspection helper and parsed metadata summary type.

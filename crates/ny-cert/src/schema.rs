@@ -9,7 +9,7 @@
 //! `clean-elab/src/cert/external/verify.rs`. We emit string-encoded rationals
 //! (`"n"` / `"n/d"`), which Clean's `ExternalRational` deserializer accepts.
 
-use crate::rational::{Rat, RatError};
+use crate::rational::{ensure_healthy, Rat, RatError};
 use std::collections::BTreeMap;
 
 /// Constraint relation, serialized in Clean's lowercase form.
@@ -227,10 +227,12 @@ impl FarkasCertificate {
 /// Serialize an entailment certificate to Clean's canonical JSON.
 ///
 /// # Errors
-/// Infallible in practice: rationals are emitted as full bignum `"n"`/`"n/d"`
-/// strings (the former `i64` emission wall is gone — see `rational.rs`); the
-/// `Result` is kept for source compatibility with the i64-era callers.
+/// Rationals are emitted as full bignum `"n"`/`"n/d"` strings (the former
+/// `i64` emission wall is gone — see `rational.rs`). A poisoned rational arena
+/// is rejected even when a structurally sparse certificate would otherwise
+/// contain no rational fields.
 pub fn entailment_to_json(cert: &EntailmentCertificate) -> Result<serde_json::Value, RatError> {
+    ensure_healthy()?;
     // behavior-identical: explicit Vec::new()+push (not `.collect()`); the
     // premise count is input-derived and unbounded to the verifier, so a bulk
     // `.collect()` raises an UnboundedAllocation obligation. Same elements,
@@ -263,7 +265,9 @@ pub fn entailment_to_json(cert: &EntailmentCertificate) -> Result<serde_json::Va
         serde_json::Value::Array(multipliers),
     );
     certificate.insert("conclusion".to_owned(), cert.conclusion.to_json()?);
-    Ok(serde_json::Value::Object(certificate))
+    let value = serde_json::Value::Object(certificate);
+    ensure_healthy()?;
+    Ok(value)
 }
 
 /// Serialize one entailment certificate as a bare chain *step* (Clean's
@@ -311,9 +315,10 @@ fn entailment_step_json(cert: &EntailmentCertificate) -> Result<serde_json::Valu
 /// premises (the cut rule). NY emits and checks the linkage locally.
 ///
 /// # Errors
-/// Infallible in practice (full bignum emission; the `i64` wall is gone); the
-/// `Result` is kept for source compatibility with the i64-era callers.
+/// Full bignum values are supported; a poisoned rational arena is rejected,
+/// including for an empty chain.
 pub fn chain_to_json(steps: &[EntailmentCertificate]) -> Result<serde_json::Value, RatError> {
+    ensure_healthy()?;
     // behavior-identical: explicit Vec::new()+push (not `.collect()`); the step
     // count is input-derived and unbounded to the verifier, so a bulk
     // `.collect()` raises an UnboundedAllocation obligation. Same elements,
@@ -329,15 +334,18 @@ pub fn chain_to_json(steps: &[EntailmentCertificate]) -> Result<serde_json::Valu
         serde_json::Value::String("1.0".to_owned()),
     );
     chain.insert("steps".to_owned(), serde_json::Value::Array(steps));
-    Ok(serde_json::Value::Object(chain))
+    let value = serde_json::Value::Object(chain);
+    ensure_healthy()?;
+    Ok(value)
 }
 
 /// Serialize a Farkas certificate to Clean's canonical JSON.
 ///
 /// # Errors
-/// Infallible in practice (full bignum emission; the `i64` wall is gone); the
-/// `Result` is kept for source compatibility with the i64-era callers.
+/// Full bignum values are supported; a poisoned rational arena is rejected,
+/// including for an empty certificate.
 pub fn farkas_to_json(cert: &FarkasCertificate) -> Result<serde_json::Value, RatError> {
+    ensure_healthy()?;
     // behavior-identical: explicit Vec::new()+push (not `.collect()`); the
     // constraint count is input-derived and unbounded to the verifier, so a bulk
     // `.collect()` raises an UnboundedAllocation obligation. Same elements,
@@ -376,13 +384,23 @@ pub fn farkas_to_json(cert: &FarkasCertificate) -> Result<serde_json::Value, Rat
         "conclusion".to_owned(),
         serde_json::Value::String("contradiction".to_owned()),
     );
-    Ok(serde_json::Value::Object(certificate))
+    let value = serde_json::Value::Object(certificate);
+    ensure_healthy()?;
+    Ok(value)
 }
 
 #[cfg(test)]
 mod minimization_tests {
     use super::*;
     use crate::selfcheck::{check_entailment, check_farkas, CheckError};
+
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
 
     fn r(numerator: i128, denominator: i128) -> Rat {
         Rat::new(numerator, denominator).expect("valid test rational")
@@ -527,5 +545,18 @@ mod minimization_tests {
             farkas_to_json(&malformed_farkas).unwrap(),
             "arity-invalid Farkas certificate must not be rewritten"
         );
+    }
+
+    #[test]
+    fn public_json_emitters_refuse_poison_even_for_empty_payloads() {
+        let empty_farkas = FarkasCertificate {
+            constraints: Vec::new(),
+            multipliers: Vec::new(),
+        };
+        crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+
+        assert_eq!(chain_to_json(&[]), Err(RatError::Poisoned));
+        assert_eq!(farkas_to_json(&empty_farkas), Err(RatError::Poisoned));
     }
 }

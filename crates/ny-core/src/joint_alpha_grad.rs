@@ -343,6 +343,7 @@ fn fold_layer_forward_f64(
             bias,
             out_features,
             in_features,
+            ..
         } => {
             if *out_features != dim || weight.len() != out_features * in_features {
                 return None;
@@ -389,6 +390,7 @@ fn fold_layer_forward_f64(
             out_w,
             in_h,
             in_w,
+            ..
         } => {
             let oc = *out_channels;
             let ic = *in_channels;
@@ -560,6 +562,7 @@ fn fold_layer_forward(
             bias,
             out_features,
             in_features,
+            ..
         } => {
             if *out_features != dim || weight.len() != out_features * in_features {
                 return None;
@@ -608,6 +611,7 @@ fn fold_layer_forward(
             out_w,
             in_h,
             in_w,
+            ..
         } => {
             let oc = *out_channels;
             let ic = *in_channels;
@@ -830,6 +834,7 @@ fn adjoint_layer(
             bias,
             out_features,
             in_features,
+            ..
         } => {
             // Forward: A_out(din) = A_in(dout)·W ; b += A_in·bias.
             // Adjoint: Ā_in[i] = Σ_j Ā_out[j]·W[i,j] + bias[i]  (Ā_out has dim din).
@@ -871,6 +876,7 @@ fn adjoint_layer(
             out_w,
             in_h,
             in_w,
+            ..
         } => {
             // Forward: A_out(IC·IH·IW) = A_in(OC·OH·OW) ⊛ Wᵀ ; b += A_in·bias_exp.
             // Adjoint: gather — Ā_in[oc,oh,ow] = Σ_{ic,kh,kw} Ā_out[ic,ih,iw]·W + bias.
@@ -989,6 +995,7 @@ mod tests {
             bias: b,
             out_features: out,
             in_features: inp,
+            cert_err: Default::default(),
         }
     }
 
@@ -1053,7 +1060,8 @@ mod tests {
         eps: f32,
     ) -> f32 {
         // Perturb the target Activation's lower_slope[neuron] by ±eps and central-diff
-        // the summed lower bound (single spec here → sum == that row).
+        // the summed lower bound. For multiple specs this is the joint scalar
+        // objective whose adjoint sums the per-row alpha gradients.
         let perturb = |delta: f32| -> Vec<GpuResnetSegment> {
             let mut segs = segments.to_vec();
             let mut seen = 0usize;
@@ -1299,6 +1307,137 @@ mod tests {
                 "P branch grad must be nonzero"
             );
         }
+    }
+
+    #[test]
+    fn positive_weighted_nine_row_joint_matches_chunk_sum_and_fd() {
+        // Exercise the production MW decomposition boundary with one row more
+        // than the resident eight-row cap. Every base objective is scaled by a
+        // strictly positive simplex weight before it enters the adjoint.
+        let mut rng = Lcg(0x9A11_C0DE);
+        let (d0, d1, d2, output_dim) = (3usize, 4usize, 4usize, 3usize);
+        let l1: Vec<f32> = (0..d1).map(|i| -1.1 - 0.2 * i as f32).collect();
+        let u1: Vec<f32> = (0..d1).map(|i| 0.9 + 0.15 * i as f32).collect();
+        let l2: Vec<f32> = (0..d2).map(|i| -0.8 - 0.25 * i as f32).collect();
+        let u2: Vec<f32> = (0..d2).map(|i| 1.2 + 0.1 * i as f32).collect();
+        let x_l = vec![-1.0f32; d0];
+        let x_u = vec![1.0f32; d0];
+        let segs = vec![GpuResnetSegment::Chain(vec![
+            lin(&mut rng, output_dim, d2, 0.8, true),
+            relu(&[0.62, 0.47, 0.71, 0.38], &l2, &u2),
+            lin(&mut rng, d2, d1, 0.8, true),
+            relu(&[0.41, 0.58, 0.36, 0.69], &l1, &u1),
+            lin(&mut rng, d1, d0, 0.8, true),
+        ])];
+
+        const ROWS: usize = 9;
+        const CHUNK_ROWS: usize = 8;
+        let normalizer = (1..=ROWS).sum::<usize>() as f32;
+        let weights: Vec<f32> = (1..=ROWS).map(|row| row as f32 / normalizer).collect();
+        assert!(weights
+            .iter()
+            .all(|weight| weight.is_finite() && *weight > 0.0));
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        let mut weighted_seed = Vec::with_capacity(ROWS * output_dim);
+        for (row, &weight) in weights.iter().enumerate() {
+            for column in 0..output_dim {
+                // Alternating signs force distinct per-row relaxation choices;
+                // nonzero magnitudes also make positive-scale preservation
+                // observable rather than vacuous.
+                let sign = if (row + column).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let coefficient = sign * (0.35 + 0.06 * row as f32 + 0.04 * column as f32);
+                weighted_seed.push(weight * coefficient);
+            }
+        }
+        let seed_bias = vec![0.0f32; ROWS];
+
+        let full = joint_alpha_gradient(
+            &segs,
+            &weighted_seed,
+            &seed_bias,
+            ROWS,
+            output_dim,
+            &x_l,
+            &x_u,
+            JointGradConfig::default(),
+        )
+        .expect("nine-row weighted joint gradient");
+        assert_eq!(full.iter().map(Vec::len).collect::<Vec<_>>(), vec![d2, d1]);
+
+        let mut chunk_sum: Option<Vec<Vec<f32>>> = None;
+        for chunk in weighted_seed.chunks(CHUNK_ROWS * output_dim) {
+            let chunk_rows = chunk.len() / output_dim;
+            assert!(chunk_rows > 0 && chunk_rows <= CHUNK_ROWS);
+            assert_eq!(chunk.len(), chunk_rows * output_dim);
+            let chunk_gradient = joint_alpha_gradient(
+                &segs,
+                chunk,
+                &vec![0.0; chunk_rows],
+                chunk_rows,
+                output_dim,
+                &x_l,
+                &x_u,
+                JointGradConfig::default(),
+            )
+            .expect("bounded weighted chunk gradient");
+            match &mut chunk_sum {
+                Some(accumulated) => {
+                    assert_eq!(accumulated.len(), chunk_gradient.len());
+                    for (total, addend) in accumulated.iter_mut().zip(chunk_gradient) {
+                        assert_eq!(total.len(), addend.len());
+                        for (total, addend) in total.iter_mut().zip(addend) {
+                            *total += addend;
+                        }
+                    }
+                }
+                None => chunk_sum = Some(chunk_gradient),
+            }
+        }
+        let chunk_sum = chunk_sum.expect("8+1 decomposition must produce gradients");
+
+        let mut max_chunk_error = 0.0f32;
+        let mut max_fd_error = 0.0f32;
+        let mut max_scale = 0.0f32;
+        let mut nonzero = false;
+        for (fold_idx, neuron_count) in [(0usize, d2), (1usize, d1)] {
+            for neuron in 0..neuron_count {
+                let joint = full[fold_idx][neuron];
+                nonzero |= joint.abs() > 1e-4;
+                let chunked = chunk_sum[fold_idx][neuron];
+                max_chunk_error = max_chunk_error.max((joint - chunked).abs());
+                let fd = central_fd(
+                    &segs,
+                    &weighted_seed,
+                    &seed_bias,
+                    ROWS,
+                    output_dim,
+                    &x_l,
+                    &x_u,
+                    fold_idx,
+                    neuron,
+                    1e-3,
+                );
+                max_fd_error = max_fd_error.max((joint - fd).abs());
+                max_scale = max_scale.max(joint.abs()).max(fd.abs()).max(chunked.abs());
+            }
+        }
+        assert!(
+            nonzero,
+            "weighted fixture must exercise a nonzero alpha gradient"
+        );
+        assert!(
+            max_chunk_error <= 2e-6 + 2e-5 * max_scale,
+            "full nine-row joint vs 8+1 chunk sum max error {max_chunk_error} at scale {max_scale}"
+        );
+        assert!(
+            max_fd_error <= 5e-4 + 3e-2 * max_scale,
+            "weighted nine-row joint vs central FD max error {max_fd_error} at scale {max_scale}"
+        );
     }
 
     #[test]

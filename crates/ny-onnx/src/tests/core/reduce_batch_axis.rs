@@ -40,12 +40,12 @@ fn tensor_value_info(name: &str, shape: &[i64]) -> onnx_proto::ValueInfoProto {
     }
 }
 
-fn build_model(graph: onnx_proto::GraphProto) -> Vec<u8> {
+fn build_model(graph: onnx_proto::GraphProto, opset_version: i64) -> Vec<u8> {
     let model = onnx_proto::ModelProto {
         ir_version: 9,
         opset_import: vec![onnx_proto::OperatorSetIdProto {
             domain: String::new(),
-            version: 12,
+            version: opset_version,
         }],
         producer_name: "ny-onnx-fixture".to_string(),
         producer_version: String::new(),
@@ -70,7 +70,7 @@ fn attr_int(name: &str, value: i64) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
         r#type: onnx_proto::attribute_proto::AttributeType::Int as i32,
-        i: value,
+        i: Some(value),
         ..Default::default()
     }
 }
@@ -112,6 +112,7 @@ fn reduce_sum_axis1_on_retained_rank_runtime_tensor_matches_onnx_semantics() {
         ],
         name: "reduce_batch_axis_frac".to_string(),
         initializer: vec![],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 6])],
         output: vec![tensor_value_info("out", &[1, 6])],
         #[cfg(feature = "onnx-value-info")]
@@ -120,7 +121,7 @@ fn reduce_sum_axis1_on_retained_rank_runtime_tensor_matches_onnx_semantics() {
             tensor_value_info("sum", &[1, 1]),
         ],
     };
-    let bytes = build_model(graph);
+    let bytes = build_model(graph, 12);
 
     let model = load_onnx_bytes("reduce_batch_axis_frac.onnx", &bytes)
         .expect("ReduceSum(axes=[1]) model should load");
@@ -191,6 +192,7 @@ fn reduce_sum_axes_input_tensor_on_retained_rank_runtime_tensor() {
         ],
         name: "reduce_batch_axis_frac_opset13".to_string(),
         initializer: vec![axes_init],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 4])],
         output: vec![tensor_value_info("out", &[1, 4])],
         #[cfg(feature = "onnx-value-info")]
@@ -199,7 +201,7 @@ fn reduce_sum_axes_input_tensor_on_retained_rank_runtime_tensor() {
             tensor_value_info("sum", &[1, 1]),
         ],
     };
-    let bytes = build_model(graph);
+    let bytes = build_model(graph, 13);
 
     let model = load_onnx_bytes("reduce_batch_axis_frac_opset13.onnx", &bytes)
         .expect("opset-13 ReduceSum model should load");

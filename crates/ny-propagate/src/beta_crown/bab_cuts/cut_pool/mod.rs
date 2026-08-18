@@ -13,11 +13,9 @@
 //! iteration over `cuts`. Pool statistics track generation, eviction, and staleness.
 //!
 //! # Submodules
-//! - [`arelu`] — Arelu state builder for cut integration
 //! - [`merge`] — BICCOS-style cut merging and deduplication
 //! - [`proactive`] — Proactive cut generation (BICCOS-lite)
 
-mod arelu;
 mod merge;
 mod proactive;
 #[cfg(test)]

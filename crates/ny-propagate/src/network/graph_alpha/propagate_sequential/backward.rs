@@ -23,6 +23,7 @@ use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::time::Instant;
 use tracing::trace;
 
 use super::{
@@ -45,6 +46,7 @@ impl GraphNetwork {
             collect_gradients,
             mut bounds_without_oc,
         } = request;
+        check_sequential_backward_deadline(context.deadline, "before initialization")?;
         let mut linear_bounds = LinearBounds::identity(context.output_dim);
         let mut gradients = collect_gradients.then(|| {
             context
@@ -71,6 +73,7 @@ impl GraphNetwork {
             };
 
             for node_name in context.exec_order.iter().rev() {
+                check_sequential_backward_deadline(context.deadline, "between nodes")?;
                 let node = self.nodes.get(node_name).ok_or_else(|| {
                     NyError::InvalidSpec(format!("Node not found: {}", node_name))
                 })?;
@@ -93,9 +96,11 @@ impl GraphNetwork {
                     &mut linear_bounds,
                     &mut bounds_without_oc,
                 );
+                check_sequential_backward_deadline(context.deadline, "after node dispatch")?;
             }
         }
 
+        check_sequential_backward_deadline(context.deadline, "before input augmentation")?;
         maybe_apply_invprop_to_input(
             context.alpha_state,
             invprop_config,
@@ -103,6 +108,7 @@ impl GraphNetwork {
             &mut linear_bounds,
         );
 
+        check_sequential_backward_deadline(context.deadline, "before returning")?;
         Ok((linear_bounds, gradients, gradients_upper))
     }
 
@@ -130,6 +136,7 @@ impl GraphNetwork {
                 relu_name_to_idx,
                 alpha_state,
                 engine,
+                deadline,
             },
             invprop_config: None,
             output_constraints: None,
@@ -139,12 +146,8 @@ impl GraphNetwork {
         let (linear_bounds, _, _) = match self.sequential_backward_pass(backward_pass) {
             Ok(result) => result,
             // #3166: Catch both UnsupportedOp and UnsupportedConfiguration.
-            // #3795: DeadlineExceeded also falls back.
-            Err(
-                NyError::UnsupportedOp(_)
-                | NyError::UnsupportedConfiguration(_)
-                | NyError::DeadlineExceeded(_),
-            ) => {
+            // DeadlineExceeded remains structured verifier authority.
+            Err(NyError::UnsupportedOp(_) | NyError::UnsupportedConfiguration(_)) => {
                 return self
                     .propagate_crown_with_engine_and_deadline(input, engine, deadline)
                     .map(|r| r.bounds);
@@ -189,7 +192,11 @@ fn propagate_sequential_backward_node(
 ) -> Result<()> {
     match layer {
         Layer::Linear(linear) => {
-            let next = linear.propagate_linear_with_engine(linear_bounds, context.engine)?;
+            let next = linear.propagate_linear_with_engine_and_deadline(
+                linear_bounds,
+                context.engine,
+                context.deadline,
+            )?;
             if let Cow::Owned(next) = next {
                 *linear_bounds = next;
             }
@@ -241,7 +248,7 @@ fn propagate_sequential_backward_node(
         | Layer::SkipMerge(_) | Layer::OpaqueSkip(_) | Layer::MulBinary(_) | Layer::Where(_)
         | Layer::Div(_) | Layer::Atan2(_)
         | Layer::MinBinary(_) | Layer::MaxBinary(_) | Layer::ExpandLikeLastAxis(_)
-        | Layer::GELU(_) | Layer::SiLU(_) | Layer::Tanh(_) | Layer::Sigmoid(_) | Layer::Exp(_)
+        | Layer::GELU(_) | Layer::SiLU(_) | Layer::Tanh(_) | Layer::Sigmoid(_) | Layer::Erf(_) | Layer::Exp(_)
         | Layer::Log(_) | Layer::Sqrt(_) | Layer::Reciprocal(_) | Layer::Softplus(_) | Layer::HardSwish(_)
         | Layer::Mish(_) | Layer::Selu(_) | Layer::Softsign(_) | Layer::Arctan(_) | Layer::Tan(_)
         | Layer::Sin(_) | Layer::Cos(_) | Layer::Elu(_) | Layer::Celu(_) | Layer::LeakyReLU(_)
@@ -263,6 +270,7 @@ fn propagate_sequential_backward_node(
                 pre_activation,
                 node_name,
                 context.engine,
+                context.deadline,
             )?;
         }
     }
@@ -354,10 +362,15 @@ fn maybe_apply_invprop_to_node(
             }
         }
     }
-    let gammas_lower = gammas.lower_gammas().to_owned();
-    let gammas_upper = gammas.upper_gammas().to_owned();
-    *linear_bounds =
-        augment_bounds_with_constraints(linear_bounds, constraints, &gammas_lower, &gammas_upper);
+    let Some((gammas_lower, gammas_upper)) = gammas.checked_bound_gammas() else {
+        return;
+    };
+    *linear_bounds = augment_bounds_with_constraints(
+        linear_bounds,
+        constraints,
+        &gammas_lower.to_owned(),
+        &gammas_upper.to_owned(),
+    );
     trace!(
         "INVPROP: Applied constraint augmentation at layer {}",
         node_name
@@ -394,10 +407,15 @@ fn maybe_apply_invprop_to_input(
         return;
     };
 
-    let gammas_lower = gammas.lower_gammas().to_owned();
-    let gammas_upper = gammas.upper_gammas().to_owned();
-    *linear_bounds =
-        augment_bounds_with_constraints(linear_bounds, constraints, &gammas_lower, &gammas_upper);
+    let Some((gammas_lower, gammas_upper)) = gammas.checked_bound_gammas() else {
+        return;
+    };
+    *linear_bounds = augment_bounds_with_constraints(
+        linear_bounds,
+        constraints,
+        &gammas_lower.to_owned(),
+        &gammas_upper.to_owned(),
+    );
 }
 
 /// Propagate a generic layer backward in sequential alpha-CROWN context.
@@ -410,7 +428,10 @@ fn propagate_sequential_generic_layer_backward(
     pre_activation: &BoundedTensor,
     node_name: &str,
     engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
 ) -> Result<LinearBounds> {
+    check_sequential_backward_deadline(deadline, "before generic layer dispatch")?;
+
     // Conv layers: use engine-aware path for GPU acceleration (#3598).
     // Local macros deduplicate the clone-set-propagate pattern shared by
     // Conv1d/ConvTranspose1d (set_input_length) and Conv2d/ConvTranspose2d
@@ -426,7 +447,7 @@ fn propagate_sequential_generic_layer_backward(
                 })?;
             let mut conv = $conv.clone();
             conv.set_input_length(in_len);
-            conv.propagate_linear_with_engine(linear_bounds, engine)
+            conv.propagate_linear_with_engine_and_deadline(linear_bounds, engine, deadline)
                 .map(|cow| cow.into_owned())
         }};
     }
@@ -446,7 +467,7 @@ fn propagate_sequential_generic_layer_backward(
             };
             let mut conv = $conv.clone();
             conv.set_input_shape(in_h, in_w);
-            conv.propagate_linear_with_engine(linear_bounds, engine)
+            conv.propagate_linear_with_engine_and_deadline(linear_bounds, engine, deadline)
                 .map(|cow| cow.into_owned())
         }};
     }
@@ -457,25 +478,136 @@ fn propagate_sequential_generic_layer_backward(
         Layer::ConvTranspose2d(c) => conv2d_backward!(c),
         _ => layer.propagate_crown_backward(linear_bounds, Some(pre_activation)),
     };
+    check_sequential_backward_deadline(deadline, "after generic layer dispatch")?;
     match backward_result {
         Ok(lb) => Ok(lb),
         // #3166: Catch both UnsupportedOp and UnsupportedConfiguration.
-        // #3795: DeadlineExceeded also falls back.
+        // DeadlineExceeded and SoundnessRefusal are verifier authority and must
+        // remain structured rather than being relabeled UnsupportedOp.
         // #3813: ShapeMismatch from Dense Conv2d backward when graph restructuring
         // (e.g., RSPLITTER) changes intermediate dimensions — fallback to CROWN.
         // #2888: NumericalInstability from non-finite pre-activation bounds.
         Err(
             NyError::UnsupportedOp(_)
             | NyError::UnsupportedConfiguration(_)
-            | NyError::DeadlineExceeded(_)
             | NyError::ShapeMismatch { .. }
             | NyError::NumericalInstability(_),
         ) => Err(NyError::UnsupportedOp(layer.layer_type().to_string())),
+        Err(error @ (NyError::DeadlineExceeded(_) | NyError::SoundnessRefusal(_))) => Err(error),
         Err(e) => Err(NyError::InvalidSpec(format!(
             "Sequential α-CROWN failed at node '{}' ({}): {}",
             node_name,
             layer.layer_type(),
             e
         ))),
+    }
+}
+
+#[inline]
+fn check_sequential_backward_deadline(deadline: Option<Instant>, phase: &str) -> Result<()> {
+    if deadline.is_some_and(|value| Instant::now() >= value) {
+        Err(NyError::DeadlineExceeded(format!(
+            "sequential graph α-CROWN backward: deadline exceeded {phase}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::layers::{Conv2dLayer, LinearLayer};
+    use ndarray::{arr1, arr2, ArrayD, IxDyn};
+    use ny_test_utils::CountingGemmEngine;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn sequential_linear_refuses_expired_deadline_before_engine_launch() {
+        let input = BoundedTensor::new(arr1(&[-1.0f32]).into_dyn(), arr1(&[1.0f32]).into_dyn())
+            .expect("valid input bounds");
+        let node_bounds = HashMap::new();
+        let exec_order = Vec::new();
+        let relu_name_to_idx = HashMap::new();
+        let alpha_state =
+            AlphaState::from_preactivation_bounds(&[], &[]).expect("empty alpha state");
+        let engine = CountingGemmEngine::new();
+        let context = SequentialBackwardPassContext {
+            input: &input,
+            node_bounds: &node_bounds,
+            exec_order: &exec_order,
+            output_dim: 1,
+            relu_name_to_idx: &relu_name_to_idx,
+            alpha_state: &alpha_state,
+            engine: Some(&engine),
+            deadline: Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond fits before the current instant"),
+            ),
+        };
+        let layer =
+            Layer::Linear(LinearLayer::new(arr2(&[[1.0f32]]), None).expect("valid linear layer"));
+        let mut linear_bounds = LinearBounds::identity(1);
+        let mut gradients = None;
+        let mut gradients_upper = None;
+        let mut gradient_buffers = SequentialGradientBuffers {
+            collect_gradients: false,
+            gradients: &mut gradients,
+            gradients_upper: &mut gradients_upper,
+        };
+
+        let error = propagate_sequential_backward_node(
+            context,
+            "linear",
+            &layer,
+            &input,
+            &mut linear_bounds,
+            &mut gradient_buffers,
+        )
+        .expect_err("expired deadline must refuse the Linear dispatch");
+
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+        assert_eq!(
+            engine.gemm_calls(),
+            0,
+            "expired deadline must not launch the caller-provided engine"
+        );
+    }
+
+    #[test]
+    fn sequential_generic_conv_preserves_expired_deadline_before_engine_launch() {
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[1, 1, 1]), -1.0f32),
+            ArrayD::from_elem(IxDyn(&[1, 1, 1]), 1.0f32),
+        )
+        .expect("valid Conv2d input");
+        let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![1.0f32])
+            .expect("valid Conv2d kernel");
+        let layer = Layer::Conv2d(
+            Conv2dLayer::with_input_shape(kernel, None, (1, 1), (0, 0), 1, 1)
+                .expect("valid Conv2d layer"),
+        );
+        let engine = CountingGemmEngine::new();
+        let error = propagate_sequential_generic_layer_backward(
+            &layer,
+            &LinearBounds::identity(1),
+            &input,
+            "conv",
+            Some(&engine),
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond fits before the current instant"),
+            ),
+        )
+        .expect_err("expired Conv2d dispatch must remain structured");
+
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+        assert_eq!(
+            engine.gemm_calls(),
+            0,
+            "expired generic Conv2d must not launch the caller engine"
+        );
     }
 }

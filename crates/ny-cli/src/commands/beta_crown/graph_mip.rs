@@ -8,41 +8,30 @@
 // `ny_mip::MilpProblem`, assigning a block of MIP columns to each node's output
 // tensor. MaxPool / everything else is still rejected (later increments).
 //
-// SOUNDNESS: every emitted row is an EXACT encoding of the f64-affine op — no
-// relaxation is introduced beyond the big-M ReLU relaxation
+// SOUNDNESS: every emitted row is either an exact encoding of the real-affine
+// model loaded from f32 parameters or an explicitly outward relaxation. No
+// under-approximation is introduced beyond the sound big-M ReLU formulation
 // `ny_mip::encoder::encode_relu` already uses (keyed on the sound per-node
 // pre-activation bounds):
 //   * Linear   `y_i - Σ W_ij x_j = b_i`            (exact affine equality)
 //   * Conv2d   im2col → the SAME Linear equality rows (increment 4, exact —
 //              reuses `mip_preprocess::unfold_conv2d_to_linear`)
-//   * BatchNorm `y_i - a_c·x_i = b_c`   (increment 2, exact per-channel affine)
+//   * BatchNorm `y_i - a_c·x_i ∈ [b_c-e_i,b_c+e_i]` (certified fold-error band)
 //   * Add      `out_i - A_i - B_i = 0`  (increment 3, exact element-wise sum)
 //
-// DELTA box inflation (increment 4 — THE cifar100 soundness mechanism). Every
-// f64-affine equality above uses ny's f32-rounded weights/biases as exact
-// rational coefficients, so the MIP models the f64 semantics of the *f32* net.
-// Per `ny-mip/corpus/hard-six/tools/emit_hard_six.py` (the ground-truth cifar100
-// MIP generator), the measured f32-net vs f64-affine gap is ≤ 1.1e-5 at the
-// Gemm_56 output. We absorb it by inflating EVERY per-node intermediate box the
-// caller supplies by `DELTA = 1e-4` (`lo-DELTA, hi+DELTA`) before it becomes a
-// column bound or a ReLU big-M `[pl, pu]`. Box inflation only WEAKENS the model:
-// the inflated feasible set ⊇ (real f32 reachable set ∩ input box ∩ subdomain),
-// so an ay `unsat` still certifies the real f32 network under the same float
-// caveat ny's own bound-propagation paths carry (emit_hard_six.py header
-// "Soundness posture"). The network INPUT box is used exactly (NOT inflated),
-// matching emit_hard_six.py's `xl, xu = xin  # exact, NOT inflated`. This box
-// inflation is what lets BatchNorm keep its EXACT f32-folded equality row while
-// remaining sound against the real (pre-fold) affine — it absorbs the per-channel
-// `scale_err`/`bias_err` fold error, so the increment-1..3 fail-closed BN gate is
-// removed (a nonzero fold error ≤ DELTA no longer needs a range row).
+// DELTA box inflation (increment 4). Every supplied intermediate box is widened
+// by `DELTA = 1e-4` before becoming a column bound or ReLU big-M range. This can
+// only weaken those constraints; the network input box remains exact. DELTA is
+// not used as authority for arithmetic equalities: widening a column box does
+// not relax an equality row. Each operator must therefore be exact over the
+// loaded real-affine semantics or carry its own certified error band. BatchNorm
+// does the latter using `scale_err`/`bias_err`.
 //
 // On a Linear+ReLU chain with `delta == 0.0` the encoding stays byte-for-byte
 // equivalent to `ny_mip::encode_feedforward` (the increment-1 invariant); the
-// production path uses `delta == DELTA`. BatchNorm, Add, and Conv2d only add
-// equality rows / columns, so an ay `unsat` still certifies the subdomain (spec
-// §"Soundness contract"). BatchNorm is encoded standalone (one affine row per
-// element) rather than folded into an adjacent Linear/Conv — a standalone affine
-// row is already exact and much simpler; folding is a future zero-column
+// production path uses `delta == DELTA`. Add and Conv2d add exact equality rows;
+// BatchNorm adds a certified range row. BatchNorm is encoded standalone rather
+// than folded into an adjacent Linear/Conv; folding is a future zero-column
 // optimization, not a soundness requirement.
 //
 // Increment 5 — nn4sys mscn coverage (mscn_128d / mscn_128d_dual, all-UNSAT
@@ -100,7 +89,9 @@
 // keep the allow until the cifar100 full-depth call site lands.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+mod scored_sigmoid;
+
+use std::collections::{HashMap, HashSet as TargetNodeSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Mutex;
@@ -108,19 +99,41 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use ndarray::{Array1, Array2, ArrayD};
-use ny_core::Bound;
+use ny_core::{
+    dd::{next_down_f64, next_up_f64 as dd_next_up_f64},
+    Bound,
+};
 use ny_mip::ir::{Col, MilpProblem};
 use ny_mip::{
-    certify_linear_lower_bound_at_with_ay_admission, certify_linear_lower_bound_with_ay_admission,
+    certify_linear_lower_bound_at_with_ay_adaptive_five_leaf_comb_target_fsb_admission,
+    certify_linear_lower_bound_at_with_ay_admission,
+    certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_admission,
+    certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_compact_progressive_admission,
+    certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_range_logical_admission,
+    certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_selector_solve_profile_admission,
+    certify_linear_lower_bound_with_ay_admission,
+    solver::rank_canonical_relu_binaries_for_lower_form_full_babsr_union,
     CertifiedLinearLowerBound, CertifiedLinearLowerBoundConfig, CertifiedLinearLowerDecisionConfig,
     CertifiedLinearLowerWorkerAdmission, MipBackend, MipConfig, MipParts, MipResult, MipSolver,
     CERTIFIED_LINEAR_LOWER_HARD_MAX_TREE_LEAVES,
+    CERTIFIED_LINEAR_LOWER_SELECTOR_CHAIN_DISTRESS_PROBE_ITERS,
 };
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_onnx::{load_onnx_with_config, CompoundNodePolicy, GraphNetworkOptions, OnnxLoadConfig};
 use ny_propagate::imb::{
-    AyTailAffineReachabilityEnvelope, AyTailSharedInputReachabilityEnvelope,
-    AY_TAIL_AFFINE_REACHABILITY_ROWS,
+    AyTailAffineReachabilityEnvelope, AyTailRegionReluBounds, AyTailRegionSelectorEnvelope,
+    AyTailSharedInputReachabilityEnvelope, AY_TAIL_AFFINE_REACHABILITY_ROWS,
+    AY_TAIL_COMPACT_K16_INPUTS, AY_TAIL_COMPACT_K16_MAX_BANK_BYTES,
+    AY_TAIL_COMPACT_K16_SEAM_ELEMENTS, AY_TAIL_COMPACT_K16_SEAM_NODE, AY_TAIL_COMPACT_K16_SUPPORTS,
+    AY_TAIL_REGION_SELECTOR_BITS, AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+    AY_TAIL_REGION_SELECTOR_K4_INPUTS, AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS,
+    AY_TAIL_REGION_SELECTOR_K4_SUPPORTS, AY_TAIL_REGION_SELECTOR_MAX_RELU_BOUND_BYTES,
+    AY_TAIL_REGION_SELECTOR_MAX_RELU_BOUND_ELEMENTS,
+    AY_TAIL_REGION_SELECTOR_MAX_RELU_BOUND_RECORDS, AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHORS,
+    AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHOR_BYTES,
+    AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHOR_ELEMENTS,
+    AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHOR_NAME_BYTES, AY_TAIL_REGION_SELECTOR_REGIONS,
+    AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS,
 };
 use ny_propagate::layers::{
     BatchNormLayer, Conv2dLayer, GatherLayer, LinearLayer, ReduceSumLayer, SliceLayer,
@@ -128,6 +141,9 @@ use ny_propagate::layers::{
 use ny_propagate::shape::broadcast_shapes;
 use ny_propagate::types::BoundsProvenance;
 use ny_propagate::{AlphaCrownConfig, GraphNetwork, Layer, Network, Verifier, NETWORK_INPUT};
+use scored_sigmoid::{
+    CertifiedScoredF32Sigmoid, PinnedSigmoidOutputEnclosure, ScoredF32SigmoidPreimageSense,
+};
 use tracing::info;
 
 use super::mip_preprocess::unfold_conv2d_to_linear;
@@ -137,10 +153,10 @@ use super::mip_preprocess::unfold_conv2d_to_linear;
 /// Every per-node intermediate box the caller supplies is inflated by `±DELTA`
 /// before it becomes a column bound or a ReLU big-M `[pl, pu]`. The value
 /// (`1e-4`) is copied verbatim from `ny-mip/corpus/hard-six/tools/emit_hard_six.py`
-/// (`DELTA = 1e-4`), which measured the real gap at ≤ `1.1e-5`. Inflation only
-/// WEAKENS the model, so an ay `unsat` on the inflated MIP still certifies the
-/// real f32 network (module header §"DELTA box inflation"). The network INPUT
-/// box is used EXACTLY (not inflated), matching emit_hard_six.py.
+/// (`DELTA = 1e-4`). Inflation weakens only box and big-M constraints; it is not
+/// authority for arithmetic equalities. Operators remain exact or carry their
+/// own certified outward error band. The network input box is used exactly (not
+/// inflated), matching `emit_hard_six.py`.
 pub(crate) const DELTA: f64 = 1e-4;
 
 fn graph_mip_enabled_from_value(value: Option<&str>) -> bool {
@@ -179,7 +195,7 @@ const IMB_AY_TAIL_MAX_OUTPUTS: usize = 1_024;
 // the exact authority lane before AY saw an otherwise small 7,716-column,
 // 4,945-row encoding.  Admit that measured shape with a narrow power-of-two
 // ceiling; the independent column, row, and 20M-nnz caps still bound encoder
-// memory, while AY's 45-second solve deadline remains fail-closed.
+// memory, while AY's immutable mode-specific solve deadline remains fail-closed.
 const IMB_AY_TAIL_MAX_BINARIES: usize = 128;
 const IMB_AY_TAIL_MAX_COLS: usize = 131_072;
 const IMB_AY_TAIL_MAX_ROWS: usize = 131_072;
@@ -194,9 +210,10 @@ const IMB_AY_TAIL_AFFINE_ROWS: usize = 2 * AY_TAIL_AFFINE_REACHABILITY_ROWS;
 /// immutable envelope around that measured shape in addition to the global
 /// 20M-nnz model cap.
 const IMB_AY_TAIL_AFFINE_MAX_NNZ: usize = 16_384;
-/// The opt-in shared-input bank admits only the measured deterministic
-/// K=16→K=8→K=4 ladder. No environment value may widen this closed set.
-const IMB_AY_TAIL_SHARED_ALLOWED_SUPPORTS: [usize; 3] = [4, 8, 16];
+/// The opt-in shared-input bank admits only the closed K2/K4/K8/K16 set. The
+/// shared producer remains K4; K2 is reachable only through its distinct exact
+/// selector canary. No environment value may widen this set.
+const IMB_AY_TAIL_SHARED_ALLOWED_SUPPORTS: [usize; 4] = [2, 4, 8, 16];
 const IMB_AY_TAIL_SHARED_MAX_SUPPORTS: usize = 16;
 const IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS: usize = 16;
 const IMB_AY_TAIL_SHARED_MAX_ROWS: usize = 32;
@@ -209,9 +226,130 @@ const IMB_AY_TAIL_SHARED_MAX_NNZ: usize = 131_072;
 /// validated and request-bound separately; this byte cap does not claim to
 /// charge their owned storage.
 const IMB_AY_TAIL_SHARED_MAX_BANK_BYTES: usize = 256 * 1024;
+/// Dark, exact-shape caps for the compact CIFAR100 head executor. These mirror
+/// the sealed diagnostic contract but are enforced against a live opaque
+/// prefix-CROWN bank; the diagnostic JSON/logs are never parsed here.
+const COMPACT_TAIL_K16_MAX_BINARIES: usize = 96;
+const COMPACT_TAIL_K16_MAX_COLS: usize = 8_192;
+const COMPACT_TAIL_K16_MAX_ROWS: usize = 4_096;
+const COMPACT_TAIL_K16_MAX_NNZ: usize = 250_000;
+const COMPACT_TAIL_K16_MAX_INPUTS: usize = 4_096;
+const COMPACT_TAIL_K16_MAX_SEAM_ELEMENTS: usize = 256;
+const COMPACT_TAIL_K16_SOLVE_CAP_SECS: f64 = 5.0;
+const COMPACT_TAIL_K16_RELU_NODE: &str = "Relu_57";
+const COMPACT_TAIL_K16_OUTPUT_NODE: &str = "Gemm_58";
+const COMPACT_TAIL_K16_FIXED_SELECTOR_NEURONS: [usize; 4] = [45, 1, 93, 96];
+const COMPACT_TAIL_K16_TREE_LEAVES: usize = 16;
+/// Sixteen dense seam directions plus four sparse selector coefficients per
+/// row cost 32,832 nonzeros on the sealed 2,048-coordinate cGAN seam. Keep
+/// independent 2x headroom, far below the whole-tail 20M-nnz cap.
+const IMB_AY_TAIL_REGION_SELECTOR_MAX_NNZ: usize = 65_536;
+/// Four selector-to-original-input interval pairs, each with exactly two
+/// nonzeros (`x_d` and the corresponding low-bit-first selector).
+const IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_ROWS: usize = 2 * AY_TAIL_REGION_SELECTOR_BITS;
+const IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_NNZ: usize =
+    2 * IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_ROWS;
+/// Four ideal single-ReLU facets for both targeted selector regions, bounded
+/// by the tail lane's immutable unstable-ReLU ceiling.
+const IMB_AY_TAIL_REGION_RELU_MAX_ROWS: usize =
+    4 * AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS.len() * IMB_AY_TAIL_MAX_BINARIES;
+/// Each facet contains at most x/y/a plus all four selector bits.
+const IMB_AY_TAIL_REGION_RELU_MAX_NNZ: usize = 8_192;
 const IMB_AY_TAIL_SOLVE_CAP_SECS: f64 = 45.0;
+/// Selector-only cap qualified by the sealed r3 root-entailment replay.
+///
+/// Clause 0 needs 56.008 seconds on the corrected 23-binary model. A 65-second
+/// cap leaves measured scheduling margin while every non-selector authority
+/// lane retains its historical 45-second ceiling.
+const IMB_AY_TAIL_REGION_SELECTOR_SOLVE_CAP_SECS: f64 = 65.0;
 const IMB_AY_TAIL_DEADLINE_RESERVE_SECS: f64 = 0.05;
 const IMB_AY_TAIL_MIN_SOLVE_SECS: f64 = 0.25;
+const IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_CANDIDATES_PER_SCORE: usize = 4;
+const IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_MIN_CANDIDATES: usize = 4;
+const IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_MAX_CANDIDATES: usize =
+    2 * IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_CANDIDATES_PER_SCORE;
+const IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_RANK: usize = 1;
+const IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_HARD_VALUE: bool = true;
+
+fn imb_ay_tail_solve_budget_from_remaining_secs(remaining_secs: f64, cap_secs: f64) -> Option<f64> {
+    if !remaining_secs.is_finite() || !cap_secs.is_finite() || cap_secs < IMB_AY_TAIL_MIN_SOLVE_SECS
+    {
+        return None;
+    }
+    let total = (remaining_secs - IMB_AY_TAIL_DEADLINE_RESERVE_SECS).min(cap_secs);
+    (total.is_finite() && total >= IMB_AY_TAIL_MIN_SOLVE_SECS).then_some(total)
+}
+
+fn imb_ay_tail_solve_budget_secs(deadline: Instant, cap_secs: f64) -> Option<f64> {
+    imb_ay_tail_solve_budget_from_remaining_secs(
+        deadline
+            .checked_duration_since(Instant::now())?
+            .as_secs_f64(),
+        cap_secs,
+    )
+}
+
+fn imb_ay_tail_adaptive_five_comb_enabled_from_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn imb_ay_tail_adaptive_five_comb_enabled() -> bool {
+    imb_ay_tail_adaptive_five_comb_enabled_from_value(
+        std::env::var("NY_IMB_AY_TAIL_ADAPTIVE_FIVE_COMB")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn compact_tail_k16_enabled_from_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn compact_tail_k16_enabled() -> bool {
+    compact_tail_k16_enabled_from_value(std::env::var("NY_COMPACT_TAIL_K16").ok().as_deref())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImbAyTailSelectorSolvePolicy {
+    Default,
+    RangeLogical,
+    SolveProfile,
+    Conflict,
+}
+
+fn imb_ay_tail_selector_solve_policy_from_values(
+    range_crash: Option<&str>,
+    solve_profile: Option<&str>,
+) -> ImbAyTailSelectorSolvePolicy {
+    match (range_crash == Some("1"), solve_profile == Some("1")) {
+        (false, false) => ImbAyTailSelectorSolvePolicy::Default,
+        (true, false) => ImbAyTailSelectorSolvePolicy::RangeLogical,
+        (false, true) => ImbAyTailSelectorSolvePolicy::SolveProfile,
+        (true, true) => ImbAyTailSelectorSolvePolicy::Conflict,
+    }
+}
+
+fn imb_ay_tail_selector_solve_policy() -> ImbAyTailSelectorSolvePolicy {
+    let range_crash = std::env::var("NY_IMB_SELECTOR_RANGE_CRASH").ok();
+    let solve_profile = std::env::var("NY_IMB_SELECTOR_SOLVE_PROFILE").ok();
+    imb_ay_tail_selector_solve_policy_from_values(range_crash.as_deref(), solve_profile.as_deref())
+}
+
+fn imb_ay_tail_adaptive_five_comb_candidates(
+    problem: &MilpProblem,
+    objective: &[(Col, f64)],
+    binary_vars: &[Col],
+) -> Option<Vec<Col>> {
+    let candidates = rank_canonical_relu_binaries_for_lower_form_full_babsr_union(
+        problem,
+        objective,
+        binary_vars,
+        IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_CANDIDATES_PER_SCORE,
+    );
+    (IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_MIN_CANDIDATES..=IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_MAX_CANDIDATES)
+        .contains(&candidates.len())
+        .then_some(candidates)
+}
 
 fn imb_ay_tail_encoding_within_caps(cols: usize, rows: usize, binaries: usize) -> bool {
     cols <= IMB_AY_TAIL_MAX_COLS
@@ -219,19 +357,26 @@ fn imb_ay_tail_encoding_within_caps(cols: usize, rows: usize, binaries: usize) -
         && binaries <= IMB_AY_TAIL_MAX_BINARIES
 }
 
+fn compact_tail_k16_encoding_within_caps(cols: usize, rows: usize, binaries: usize) -> bool {
+    cols <= COMPACT_TAIL_K16_MAX_COLS
+        && rows <= COMPACT_TAIL_K16_MAX_ROWS
+        && binaries <= COMPACT_TAIL_K16_MAX_BINARIES
+}
+
 fn imb_ay_tail_input_within_caps(inputs: usize) -> bool {
     inputs != 0 && inputs <= IMB_AY_TAIL_MAX_INPUTS
 }
 
 fn next_up_f64(value: f64) -> f64 {
-    if value.is_nan() || value == f64::INFINITY {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > f64::INFINITY.to_bits() || bits == f64::INFINITY.to_bits() {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    let bits = value.to_bits();
-    if value > 0.0 {
+    if bits & 0x8000_0000_0000_0000 == 0 {
         f64::from_bits(bits + 1)
     } else {
         f64::from_bits(bits - 1)
@@ -298,6 +443,10 @@ enum ImbAyTailProofRequest<'a> {
     },
     SharedInputReachability {
         envelope: &'a AyTailSharedInputReachabilityEnvelope,
+        requested_lower: f32,
+    },
+    RegionSelector {
+        envelope: &'a AyTailRegionSelectorEnvelope,
         requested_lower: f32,
     },
 }
@@ -377,6 +526,26 @@ pub(super) fn imb_ay_tail_shared_input_reachability_certificate_exact_result(
         seam_box,
         objective,
         ImbAyTailProofRequest::SharedInputReachability {
+            envelope,
+            requested_lower,
+        },
+        deadline,
+    )
+}
+
+pub(super) fn imb_ay_tail_region_selector_certificate_exact_result(
+    tail: &GraphNetwork,
+    seam_box: &ny_tensor::BoundedTensor,
+    objective: &[f32],
+    envelope: &AyTailRegionSelectorEnvelope,
+    requested_lower: f32,
+    deadline: Instant,
+) -> Option<CertifiedLinearLowerBound> {
+    imb_ay_tail_certificate_exact_result_impl(
+        tail,
+        seam_box,
+        objective,
+        ImbAyTailProofRequest::RegionSelector {
             envelope,
             requested_lower,
         },
@@ -537,6 +706,31 @@ struct SharedInputReachabilityStats {
     bank_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedInputReachabilityCaps {
+    required_supports: Option<usize>,
+    max_latent_inputs: usize,
+    max_rows: usize,
+    max_added_nnz: usize,
+    max_bank_bytes: usize,
+}
+
+const LEGACY_SHARED_INPUT_CAPS: SharedInputReachabilityCaps = SharedInputReachabilityCaps {
+    required_supports: None,
+    max_latent_inputs: IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS,
+    max_rows: IMB_AY_TAIL_SHARED_MAX_ROWS,
+    max_added_nnz: IMB_AY_TAIL_SHARED_MAX_NNZ,
+    max_bank_bytes: IMB_AY_TAIL_SHARED_MAX_BANK_BYTES,
+};
+
+const COMPACT_K16_SHARED_INPUT_CAPS: SharedInputReachabilityCaps = SharedInputReachabilityCaps {
+    required_supports: Some(AY_TAIL_COMPACT_K16_SUPPORTS),
+    max_latent_inputs: COMPACT_TAIL_K16_MAX_INPUTS,
+    max_rows: 2 * AY_TAIL_COMPACT_K16_SUPPORTS,
+    max_added_nnz: COMPACT_TAIL_K16_MAX_NNZ,
+    max_bank_bytes: AY_TAIL_COMPACT_K16_MAX_BANK_BYTES,
+};
+
 fn shared_input_reachability_added_nnz(
     directions: &Array2<f32>,
     lower_a: &Array2<f32>,
@@ -573,9 +767,62 @@ fn shared_input_reachability_added_nnz(
     Some(total)
 }
 
-fn shared_input_reachability_stats(
+/// Exact sparse cost of the selector-only factored K2 bank:
+///
+/// ```text
+/// t_j - P_j y       = 0
+/// t_j - A^-_j x >= b^-_j
+/// t_j - A^+_j x <= b^+_j.
+/// ```
+///
+/// Each support direction is emitted once in the equality instead of once on
+/// each envelope side. The three `t_j` coefficients are included explicitly.
+/// This helper deliberately admits exactly K2; ordinary shared banks and the
+/// selector K4 lane retain the historical dense-row encoding.
+fn selector_k2_factored_shared_input_added_nnz(
+    directions: &Array2<f32>,
+    lower_a: &Array2<f32>,
+    upper_a: &Array2<f32>,
+) -> Option<usize> {
+    if directions.nrows() != AY_TAIL_REGION_SELECTOR_K2_SUPPORTS
+        || directions.nrows() != lower_a.nrows()
+        || directions.nrows() != upper_a.nrows()
+    {
+        return None;
+    }
+    let mut total = 0usize;
+    for row in 0..directions.nrows() {
+        let direction_nnz = directions
+            .row(row)
+            .iter()
+            .filter(|&&value| value != 0.0)
+            .count();
+        if direction_nnz == 0 {
+            return None;
+        }
+        let lower_input_nnz = lower_a
+            .row(row)
+            .iter()
+            .filter(|&&value| value != 0.0)
+            .count();
+        let upper_input_nnz = upper_a
+            .row(row)
+            .iter()
+            .filter(|&&value| value != 0.0)
+            .count();
+        total = total
+            .checked_add(direction_nnz)?
+            .checked_add(lower_input_nnz)?
+            .checked_add(upper_input_nnz)?
+            .checked_add(3)?;
+    }
+    Some(total)
+}
+
+fn shared_input_reachability_stats_with_caps(
     envelope: &AyTailSharedInputReachabilityEnvelope,
     seam_dim: usize,
+    caps: SharedInputReachabilityCaps,
 ) -> Option<SharedInputReachabilityStats> {
     let supports = envelope.directions().nrows();
     let root = envelope.certified_root_input();
@@ -584,9 +831,12 @@ fn shared_input_reachability_stats(
     let rows = supports.checked_mul(2)?;
     if !IMB_AY_TAIL_SHARED_ALLOWED_SUPPORTS.contains(&supports)
         || supports > IMB_AY_TAIL_SHARED_MAX_SUPPORTS
-        || rows > IMB_AY_TAIL_SHARED_MAX_ROWS
+        || caps
+            .required_supports
+            .is_some_and(|required| supports != required)
+        || rows > caps.max_rows
         || latent_inputs == 0
-        || latent_inputs > IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS
+        || latent_inputs > caps.max_latent_inputs
         || root.shape() != region.shape()
         || region.flatten().len() != latent_inputs
         || root.has_l2_constraint()
@@ -623,7 +873,7 @@ fn shared_input_reachability_stats(
         envelope.lower_a(),
         envelope.upper_a(),
     )?;
-    if added_nnz > IMB_AY_TAIL_SHARED_MAX_NNZ {
+    if added_nnz > caps.max_added_nnz {
         return None;
     }
 
@@ -640,7 +890,7 @@ fn shared_input_reachability_stats(
             .len()
             .checked_mul(size_of::<usize>())?,
     )?;
-    if bank_bytes != envelope.bank_bytes() || bank_bytes > IMB_AY_TAIL_SHARED_MAX_BANK_BYTES {
+    if bank_bytes != envelope.bank_bytes() || bank_bytes > caps.max_bank_bytes {
         return None;
     }
     Some(SharedInputReachabilityStats {
@@ -649,6 +899,41 @@ fn shared_input_reachability_stats(
         rows,
         added_nnz,
         bank_bytes,
+    })
+}
+
+fn shared_input_reachability_stats(
+    envelope: &AyTailSharedInputReachabilityEnvelope,
+    seam_dim: usize,
+) -> Option<SharedInputReachabilityStats> {
+    shared_input_reachability_stats_with_caps(envelope, seam_dim, LEGACY_SHARED_INPUT_CAPS)
+}
+
+fn selector_k2_factored_shared_input_stats(
+    envelope: &AyTailSharedInputReachabilityEnvelope,
+    seam_dim: usize,
+) -> Option<SharedInputReachabilityStats> {
+    // Reuse the mature payload/root/shape/byte validation, but replace only
+    // the selector K2 model census with the projection-equivalent factorization.
+    // The generic shared-bank and selector K4 paths still consume the original
+    // stats and encoder byte-for-byte.
+    let dense = shared_input_reachability_stats(envelope, seam_dim)?;
+    if dense.supports != AY_TAIL_REGION_SELECTOR_K2_SUPPORTS {
+        return None;
+    }
+    let rows = dense.supports.checked_mul(3)?;
+    let added_nnz = selector_k2_factored_shared_input_added_nnz(
+        envelope.directions(),
+        envelope.lower_a(),
+        envelope.upper_a(),
+    )?;
+    if rows > IMB_AY_TAIL_SHARED_MAX_ROWS || added_nnz > IMB_AY_TAIL_SHARED_MAX_NNZ {
+        return None;
+    }
+    Some(SharedInputReachabilityStats {
+        rows,
+        added_nnz,
+        ..dense
     })
 }
 
@@ -690,7 +975,7 @@ fn shared_input_region_is_inside(
 /// this helper's local preflight cannot leave a partially mutated model; the
 /// caller still performs whole-model caps after graph and bank encoding.
 #[allow(clippy::too_many_arguments)]
-fn add_shared_input_reachability_rows(
+fn add_shared_input_reachability_rows_with_caps(
     problem: &mut MilpProblem,
     seam_vars: &[Col],
     region_lower: &[f32],
@@ -700,6 +985,7 @@ fn add_shared_input_reachability_rows(
     lower_b: &Array1<f32>,
     upper_a: &Array2<f32>,
     upper_b: &Array1<f32>,
+    caps: SharedInputReachabilityCaps,
 ) -> Option<(Vec<Col>, usize)> {
     let supports = directions.nrows();
     let input_dim = region_lower.len();
@@ -707,16 +993,19 @@ fn add_shared_input_reachability_rows(
     let added_nnz = shared_input_reachability_added_nnz(directions, lower_a, upper_a)?;
     if !IMB_AY_TAIL_SHARED_ALLOWED_SUPPORTS.contains(&supports)
         || supports > IMB_AY_TAIL_SHARED_MAX_SUPPORTS
-        || rows > IMB_AY_TAIL_SHARED_MAX_ROWS
+        || caps
+            .required_supports
+            .is_some_and(|required| supports != required)
+        || rows > caps.max_rows
         || input_dim == 0
-        || input_dim > IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS
+        || input_dim > caps.max_latent_inputs
         || region_upper.len() != input_dim
         || seam_vars.len() != directions.ncols()
         || lower_a.shape() != [supports, input_dim]
         || upper_a.shape() != [supports, input_dim]
         || lower_b.len() != supports
         || upper_b.len() != supports
-        || added_nnz > IMB_AY_TAIL_SHARED_MAX_NNZ
+        || added_nnz > caps.max_added_nnz
         || directions.iter().any(|value| !value.is_finite())
         || lower_a.iter().any(|value| !value.is_finite())
         || upper_a.iter().any(|value| !value.is_finite())
@@ -778,16 +1067,244 @@ fn add_shared_input_reachability_rows(
     Some((latent_cols, added_nnz))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn add_shared_input_reachability_rows(
+    problem: &mut MilpProblem,
+    seam_vars: &[Col],
+    region_lower: &[f32],
+    region_upper: &[f32],
+    directions: &Array2<f32>,
+    lower_a: &Array2<f32>,
+    lower_b: &Array1<f32>,
+    upper_a: &Array2<f32>,
+    upper_b: &Array1<f32>,
+) -> Option<(Vec<Col>, usize)> {
+    add_shared_input_reachability_rows_with_caps(
+        problem,
+        seam_vars,
+        region_lower,
+        region_upper,
+        directions,
+        lower_a,
+        lower_b,
+        upper_a,
+        upper_b,
+        LEGACY_SHARED_INPUT_CAPS,
+    )
+}
+
+fn selector_factored_support_value_bounds(
+    problem: &MilpProblem,
+    seam_vars: &[Col],
+    directions: &Array2<f32>,
+) -> Option<Vec<(f64, f64)>> {
+    if seam_vars.len() != directions.ncols()
+        || seam_vars.iter().enumerate().any(|(index, col)| {
+            seam_vars[..index].contains(col)
+                || problem.cols().get(col.0).is_none_or(|spec| {
+                    !spec.lb.is_finite() || !spec.ub.is_finite() || spec.lb > spec.ub
+                })
+        })
+    {
+        return None;
+    }
+    directions
+        .rows()
+        .into_iter()
+        .map(|direction| {
+            let mut lower = 0.0_f64;
+            let mut upper = 0.0_f64;
+            for (&col, &coefficient) in seam_vars.iter().zip(direction.iter()) {
+                if !coefficient.is_finite() {
+                    return None;
+                }
+                if coefficient == 0.0 {
+                    continue;
+                }
+                let spec = &problem.cols()[col.0];
+                let coefficient = f64::from(coefficient);
+                let lower_endpoint = if coefficient > 0.0 { spec.lb } else { spec.ub };
+                let upper_endpoint = if coefficient > 0.0 { spec.ub } else { spec.lb };
+                let lower_product = next_down_f64(coefficient * lower_endpoint);
+                let upper_product = dd_next_up_f64(coefficient * upper_endpoint);
+                lower = next_down_f64(lower + lower_product);
+                upper = dd_next_up_f64(upper + upper_product);
+                if !lower.is_finite() || !upper.is_finite() {
+                    return None;
+                }
+            }
+            (lower <= upper).then_some((lower, upper))
+        })
+        .collect()
+}
+
+/// Add the selector K2 bank with one bounded support-value auxiliary per support.
+///
+/// Projection over `t_j` is exactly the historical dense formulation because
+/// the equality fixes `t_j = P_j y`. Its finite box is derived from the actual
+/// seam-column box with directed multiplication and accumulation. The bounds
+/// only remove values of `t_j` that the equality could never attain, while
+/// keeping structural dual residuals priceable by AY's exact weak-dual replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectorK2FactoredColumns {
+    latent: Vec<Col>,
+    support_values: [Col; AY_TAIL_REGION_SELECTOR_K2_SUPPORTS],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_selector_k2_factored_shared_input_rows(
+    problem: &mut MilpProblem,
+    seam_vars: &[Col],
+    region_lower: &[f32],
+    region_upper: &[f32],
+    directions: &Array2<f32>,
+    lower_a: &Array2<f32>,
+    lower_b: &Array1<f32>,
+    upper_a: &Array2<f32>,
+    upper_b: &Array1<f32>,
+) -> Option<(SelectorK2FactoredColumns, usize)> {
+    let supports = directions.nrows();
+    let input_dim = region_lower.len();
+    let rows = supports.checked_mul(3)?;
+    let added_nnz = selector_k2_factored_shared_input_added_nnz(directions, lower_a, upper_a)?;
+    if supports != AY_TAIL_REGION_SELECTOR_K2_SUPPORTS
+        || rows > IMB_AY_TAIL_SHARED_MAX_ROWS
+        || input_dim == 0
+        || input_dim > IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS
+        || region_upper.len() != input_dim
+        || seam_vars.len() != directions.ncols()
+        || lower_a.shape() != [supports, input_dim]
+        || upper_a.shape() != [supports, input_dim]
+        || lower_b.len() != supports
+        || upper_b.len() != supports
+        || added_nnz > IMB_AY_TAIL_SHARED_MAX_NNZ
+        || directions.iter().any(|value| !value.is_finite())
+        || lower_a.iter().any(|value| !value.is_finite())
+        || upper_a.iter().any(|value| !value.is_finite())
+        || lower_b.iter().any(|value| !value.is_finite())
+        || upper_b.iter().any(|value| !value.is_finite())
+        || region_lower
+            .iter()
+            .zip(region_upper)
+            .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+    {
+        return None;
+    }
+
+    let support_value_bounds: [(f64, f64); AY_TAIL_REGION_SELECTOR_K2_SUPPORTS] =
+        selector_factored_support_value_bounds(problem, seam_vars, directions)?
+            .try_into()
+            .ok()?;
+
+    // All fallible validation, directed enclosure work, and checked arithmetic
+    // precede the first model mutation, preserving transactional preflight.
+    let latent_cols: Vec<Col> = region_lower
+        .iter()
+        .zip(region_upper)
+        .map(|(&lower, &upper)| problem.add_col(0.0, f64::from(lower), f64::from(upper)))
+        .collect();
+    let support_value_cols =
+        support_value_bounds.map(|(lower, upper)| problem.add_col(0.0, lower, upper));
+    for (row, &support_value) in support_value_cols.iter().enumerate() {
+        let equality_terms = std::iter::once((support_value, 1.0))
+            .chain(
+                seam_vars
+                    .iter()
+                    .copied()
+                    .zip(directions.row(row).iter().copied())
+                    .filter_map(|(col, coefficient)| {
+                        (coefficient != 0.0).then_some((col, -f64::from(coefficient)))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        problem.add_row(0.0, 0.0, equality_terms);
+
+        let lower_terms = std::iter::once((support_value, 1.0))
+            .chain(
+                latent_cols
+                    .iter()
+                    .copied()
+                    .zip(lower_a.row(row).iter().copied())
+                    .filter_map(|(col, coefficient)| {
+                        (coefficient != 0.0).then_some((col, -f64::from(coefficient)))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        problem.add_row(f64::from(lower_b[row]), f64::INFINITY, lower_terms);
+
+        let upper_terms = std::iter::once((support_value, 1.0))
+            .chain(
+                latent_cols
+                    .iter()
+                    .copied()
+                    .zip(upper_a.row(row).iter().copied())
+                    .filter_map(|(col, coefficient)| {
+                        (coefficient != 0.0).then_some((col, -f64::from(coefficient)))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        problem.add_row(f64::NEG_INFINITY, f64::from(upper_b[row]), upper_terms);
+    }
+    Some((
+        SelectorK2FactoredColumns {
+            latent: latent_cols,
+            support_values: support_value_cols,
+        },
+        added_nnz,
+    ))
+}
+
+fn add_shared_input_reachability_envelope_with_caps(
+    problem: &mut MilpProblem,
+    seam_vars: &[Col],
+    envelope: &AyTailSharedInputReachabilityEnvelope,
+    caps: SharedInputReachabilityCaps,
+) -> Option<(Vec<Col>, SharedInputReachabilityStats)> {
+    let stats = shared_input_reachability_stats_with_caps(envelope, seam_vars.len(), caps)?;
+    let flat_region = envelope.region_input().flatten();
+    let region_lower = flat_region.lower().as_slice()?;
+    let region_upper = flat_region.upper().as_slice()?;
+    let (latent_cols, added_nnz) = add_shared_input_reachability_rows_with_caps(
+        problem,
+        seam_vars,
+        region_lower,
+        region_upper,
+        envelope.directions(),
+        envelope.lower_a(),
+        envelope.lower_b(),
+        envelope.upper_a(),
+        envelope.upper_b(),
+        caps,
+    )?;
+    if added_nnz != stats.added_nnz || latent_cols.len() != stats.latent_inputs {
+        return None;
+    }
+    Some((latent_cols, stats))
+}
+
 fn add_shared_input_reachability_envelope(
     problem: &mut MilpProblem,
     seam_vars: &[Col],
     envelope: &AyTailSharedInputReachabilityEnvelope,
 ) -> Option<(Vec<Col>, SharedInputReachabilityStats)> {
-    let stats = shared_input_reachability_stats(envelope, seam_vars.len())?;
+    add_shared_input_reachability_envelope_with_caps(
+        problem,
+        seam_vars,
+        envelope,
+        LEGACY_SHARED_INPUT_CAPS,
+    )
+}
+
+fn add_selector_k2_factored_shared_input_envelope(
+    problem: &mut MilpProblem,
+    seam_vars: &[Col],
+    envelope: &AyTailSharedInputReachabilityEnvelope,
+) -> Option<(SelectorK2FactoredColumns, SharedInputReachabilityStats)> {
+    let stats = selector_k2_factored_shared_input_stats(envelope, seam_vars.len())?;
     let flat_region = envelope.region_input().flatten();
     let region_lower = flat_region.lower().as_slice()?;
     let region_upper = flat_region.upper().as_slice()?;
-    let (latent_cols, added_nnz) = add_shared_input_reachability_rows(
+    let (columns, added_nnz) = add_selector_k2_factored_shared_input_rows(
         problem,
         seam_vars,
         region_lower,
@@ -798,10 +1315,1413 @@ fn add_shared_input_reachability_envelope(
         envelope.upper_a(),
         envelope.upper_b(),
     )?;
-    if added_nnz != stats.added_nnz || latent_cols.len() != stats.latent_inputs {
+    if added_nnz != stats.added_nnz || columns.latent.len() != stats.latent_inputs {
         return None;
     }
-    Some((latent_cols, stats))
+    Some((columns, stats))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionSelectorStats {
+    rows: usize,
+    bits: usize,
+    added_nnz: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FactoredK2RegionSelectorRows {
+    /// Source index for each regional premise. Indices 0 and 1 name the two
+    /// K2 bank support-value columns; later indices name `new_direction_rows`
+    /// in insertion order.
+    row_sources: [usize; AY_TAIL_REGION_SELECTOR_REGIONS],
+    /// Canonical selector-row representative for each exact direction absent
+    /// from the K2 bank.
+    new_direction_rows: Vec<usize>,
+    added_nnz: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RegionSelectorRowPlan {
+    Dense(RegionSelectorStats),
+    FactoredK2(Box<FactoredK2RegionSelectorRows>),
+}
+
+impl RegionSelectorRowPlan {
+    fn added_cols(&self) -> usize {
+        match self {
+            Self::Dense(_) => 0,
+            Self::FactoredK2(plan) => plan.new_direction_rows.len(),
+        }
+    }
+
+    fn added_rows(&self) -> Option<usize> {
+        AY_TAIL_REGION_SELECTOR_REGIONS.checked_add(self.added_cols())
+    }
+
+    fn added_nnz(&self) -> usize {
+        match self {
+            Self::Dense(stats) => stats.added_nnz,
+            Self::FactoredK2(plan) => plan.added_nnz,
+        }
+    }
+
+    fn provenance_name(&self) -> &'static str {
+        match self {
+            Self::Dense(_) => "dense",
+            Self::FactoredK2(_) => "factored-k2-exact-direction-reuse",
+        }
+    }
+
+    fn reused_rows(&self) -> usize {
+        match self {
+            Self::Dense(_) => 0,
+            Self::FactoredK2(plan) => plan
+                .row_sources
+                .iter()
+                .filter(|&&source| source < AY_TAIL_REGION_SELECTOR_K2_SUPPORTS)
+                .count(),
+        }
+    }
+}
+
+fn direction_rows_have_identical_f32_bits(
+    left: &Array2<f32>,
+    left_row: usize,
+    right: &Array2<f32>,
+    right_row: usize,
+) -> bool {
+    left.ncols() == right.ncols()
+        && left_row < left.nrows()
+        && right_row < right.nrows()
+        && left
+            .row(left_row)
+            .iter()
+            .zip(right.row(right_row))
+            .all(|(&a, &b)| a.to_bits() == b.to_bits())
+}
+
+/// Plan exact selector-direction reuse against the already-factored K2 bank.
+///
+/// Matching is deliberately bitwise, including signed zero. Unmatched
+/// selector rows are interned among themselves, so one bounded `t = P y`
+/// column/equality is added per distinct new direction. `None` is a benign
+/// dense fallback: the optimization is selected only when its exact sparse
+/// census is strictly smaller and remains inside the immutable selector cap.
+fn plan_factored_k2_region_selector_rows(
+    seam_dim: usize,
+    selector_directions: &Array2<f32>,
+    selector_coefficients: &Array2<f64>,
+    row_lowers: &Array1<f64>,
+    k2_directions: &Array2<f32>,
+) -> Option<FactoredK2RegionSelectorRows> {
+    let dense = region_selector_stats_from_rows(
+        seam_dim,
+        selector_directions,
+        selector_coefficients,
+        row_lowers,
+    )?;
+    if k2_directions.shape() != [AY_TAIL_REGION_SELECTOR_K2_SUPPORTS, seam_dim]
+        || k2_directions.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let mut row_sources = Vec::with_capacity(AY_TAIL_REGION_SELECTOR_REGIONS);
+    let mut new_direction_rows = Vec::new();
+    for selector_row in 0..AY_TAIL_REGION_SELECTOR_REGIONS {
+        let source = (0..AY_TAIL_REGION_SELECTOR_K2_SUPPORTS)
+            .find(|&support| {
+                direction_rows_have_identical_f32_bits(
+                    selector_directions,
+                    selector_row,
+                    k2_directions,
+                    support,
+                )
+            })
+            .or_else(|| {
+                new_direction_rows
+                    .iter()
+                    .position(|&representative| {
+                        direction_rows_have_identical_f32_bits(
+                            selector_directions,
+                            selector_row,
+                            selector_directions,
+                            representative,
+                        )
+                    })
+                    .map(|index| AY_TAIL_REGION_SELECTOR_K2_SUPPORTS + index)
+            })
+            .unwrap_or_else(|| {
+                let source = AY_TAIL_REGION_SELECTOR_K2_SUPPORTS + new_direction_rows.len();
+                new_direction_rows.push(selector_row);
+                source
+            });
+        row_sources.push(source);
+    }
+    let row_sources: [usize; AY_TAIL_REGION_SELECTOR_REGIONS] = row_sources.try_into().ok()?;
+
+    let selector_row_nnz =
+        selector_coefficients
+            .rows()
+            .into_iter()
+            .try_fold(0usize, |total, row| {
+                total
+                    .checked_add(1)?
+                    .checked_add(row.iter().filter(|&&value| value != 0.0).count())
+            })?;
+    let equality_nnz = new_direction_rows
+        .iter()
+        .try_fold(0usize, |total, &representative| {
+            total.checked_add(1)?.checked_add(
+                selector_directions
+                    .row(representative)
+                    .iter()
+                    .filter(|&&value| value != 0.0)
+                    .count(),
+            )
+        })?;
+    let added_nnz = selector_row_nnz.checked_add(equality_nnz)?;
+    let added_rows = AY_TAIL_REGION_SELECTOR_REGIONS.checked_add(new_direction_rows.len())?;
+    let added_cols = new_direction_rows.len();
+    if added_nnz >= dense.added_nnz
+        || added_nnz > IMB_AY_TAIL_REGION_SELECTOR_MAX_NNZ
+        || added_rows > IMB_AY_TAIL_MAX_ROWS
+        || added_cols > IMB_AY_TAIL_MAX_COLS
+    {
+        return None;
+    }
+    Some(FactoredK2RegionSelectorRows {
+        row_sources,
+        new_direction_rows,
+        added_nnz,
+    })
+}
+
+fn same_plain_bounded_tensor_bits(
+    left: &ny_tensor::BoundedTensor,
+    right: &ny_tensor::BoundedTensor,
+) -> bool {
+    left.shape() == right.shape()
+        && !left.has_l2_constraint()
+        && !right.has_l2_constraint()
+        && left
+            .lower()
+            .iter()
+            .zip(right.lower())
+            .all(|(&a, &b)| a.to_bits() == b.to_bits())
+        && left
+            .upper()
+            .iter()
+            .zip(right.upper())
+            .all(|(&a, &b)| a.to_bits() == b.to_bits())
+}
+
+fn compact_tail_k16_live_request_is_eligible(
+    tail: &GraphNetwork,
+    seam_box: &ny_tensor::BoundedTensor,
+    objective: &[f32],
+    envelope: &AyTailSharedInputReachabilityEnvelope,
+    requested_lower: f32,
+    enabled: bool,
+) -> bool {
+    let Some(relu) = tail.node(COMPACT_TAIL_K16_RELU_NODE) else {
+        return false;
+    };
+    let Some(output) = tail.node(COMPACT_TAIL_K16_OUTPUT_NODE) else {
+        return false;
+    };
+    enabled
+        && requested_lower.to_bits() == 0.0_f32.to_bits()
+        && tail.num_nodes() == 2
+        && tail.output_name() == COMPACT_TAIL_K16_OUTPUT_NODE
+        && matches!(relu.layer(), Layer::ReLU(_))
+        && matches!(relu.inputs(), [input] if input == NETWORK_INPUT)
+        && matches!(output.layer(), Layer::Linear(_))
+        && matches!(output.inputs(), [input] if input == COMPACT_TAIL_K16_RELU_NODE)
+        && envelope.seam_node() == AY_TAIL_COMPACT_K16_SEAM_NODE
+        && seam_box.flatten().len() == AY_TAIL_COMPACT_K16_SEAM_ELEMENTS
+        && seam_box.flatten().len() <= COMPACT_TAIL_K16_MAX_SEAM_ELEMENTS
+        && !seam_box.has_l2_constraint()
+        && objective.len() == AY_TAIL_COMPACT_K16_SEAM_ELEMENTS
+        && envelope.certified_root_input().flatten().len() == AY_TAIL_COMPACT_K16_INPUTS
+        && envelope.certified_root_input().flatten().len() <= COMPACT_TAIL_K16_MAX_INPUTS
+        && same_plain_bounded_tensor_bits(envelope.certified_root_input(), envelope.region_input())
+        && envelope.directions().shape()
+            == [
+                AY_TAIL_COMPACT_K16_SUPPORTS,
+                AY_TAIL_COMPACT_K16_SEAM_ELEMENTS,
+            ]
+        && envelope.bank_bytes() <= AY_TAIL_COMPACT_K16_MAX_BANK_BYTES
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionSelectorRootAnchorStats {
+    anchors: usize,
+    elements: usize,
+    payload_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionSelectorRootAnchorIntersectionStats {
+    payload: RegionSelectorRootAnchorStats,
+    unstable_before: usize,
+    unstable_after: usize,
+    tightened_elements: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionSelectorReluBoundPayloadStats {
+    records: usize,
+    elements: usize,
+    payload_bytes: usize,
+}
+
+fn finite_plain_root_anchor_box(bounds: &ny_tensor::BoundedTensor) -> bool {
+    !bounds.is_empty()
+        && !bounds.has_l2_constraint()
+        && bounds.lower().len() == bounds.upper().len()
+        && bounds
+            .lower()
+            .iter()
+            .zip(bounds.upper())
+            .all(|(&lower, &upper)| lower.is_finite() && upper.is_finite() && lower <= upper)
+}
+
+fn region_selector_root_anchor_payload_stats(
+    anchors: &[(&str, &ny_tensor::BoundedTensor)],
+) -> Option<RegionSelectorRootAnchorStats> {
+    if anchors.is_empty() || anchors.len() > AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHORS {
+        return None;
+    }
+    let mut previous_name: Option<&str> = None;
+    let mut elements = 0usize;
+    let mut payload_bytes = 0usize;
+    for &(name, bounds) in anchors {
+        if name.is_empty()
+            || name.len() > AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHOR_NAME_BYTES
+            || previous_name.is_some_and(|previous| previous >= name)
+            || !finite_plain_root_anchor_box(bounds)
+        {
+            return None;
+        }
+        previous_name = Some(name);
+        elements = elements.checked_add(bounds.len())?;
+        let endpoint_bytes = bounds.len().checked_mul(2)?.checked_mul(size_of::<f32>())?;
+        let shape_bytes = bounds.shape().len().checked_mul(size_of::<usize>())?;
+        payload_bytes = payload_bytes
+            .checked_add(name.len())?
+            .checked_add(shape_bytes)?
+            .checked_add(endpoint_bytes)?;
+    }
+    if elements > AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHOR_ELEMENTS
+        || payload_bytes > AY_TAIL_REGION_SELECTOR_MAX_ROOT_ANCHOR_BYTES
+    {
+        return None;
+    }
+    Some(RegionSelectorRootAnchorStats {
+        anchors: anchors.len(),
+        elements,
+        payload_bytes,
+    })
+}
+
+fn region_selector_relu_bound_payload_stats(
+    records: &[AyTailRegionReluBounds],
+    root_anchors: &[(&str, &ny_tensor::BoundedTensor)],
+) -> Option<RegionSelectorReluBoundPayloadStats> {
+    let expected_records = AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS
+        .len()
+        .checked_mul(root_anchors.len())?;
+    if root_anchors.is_empty()
+        || records.len() != expected_records
+        || records.len() > AY_TAIL_REGION_SELECTOR_MAX_RELU_BOUND_RECORDS
+    {
+        return None;
+    }
+
+    let mut elements = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut record_index = 0usize;
+    for &region_index in &AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS {
+        for &(root_name, root_bounds) in root_anchors {
+            let record = records.get(record_index)?;
+            let bounds = record.bounds();
+            if record.region_index() != region_index
+                || record.node_name() != root_name
+                || !shared_input_region_is_inside(root_bounds, bounds)
+            {
+                return None;
+            }
+            elements = elements.checked_add(bounds.len())?;
+            let endpoint_bytes = bounds.len().checked_mul(2)?.checked_mul(size_of::<f32>())?;
+            let shape_bytes = bounds.shape().len().checked_mul(size_of::<usize>())?;
+            payload_bytes = payload_bytes
+                .checked_add(size_of::<usize>())?
+                .checked_add(record.node_name().len())?
+                .checked_add(shape_bytes)?
+                .checked_add(endpoint_bytes)?;
+            record_index = record_index.checked_add(1)?;
+        }
+    }
+    if elements > AY_TAIL_REGION_SELECTOR_MAX_RELU_BOUND_ELEMENTS
+        || payload_bytes > AY_TAIL_REGION_SELECTOR_MAX_RELU_BOUND_BYTES
+    {
+        return None;
+    }
+    Some(RegionSelectorReluBoundPayloadStats {
+        records: records.len(),
+        elements,
+        payload_bytes,
+    })
+}
+
+fn tail_non_input_relu_source_names(tail: &GraphNetwork) -> Option<Vec<String>> {
+    let exec = tail.exec_order().ok()?;
+    let mut sources = Vec::new();
+    for name in exec {
+        let node = tail.node(name)?;
+        if !matches!(node.layer(), Layer::ReLU(_)) {
+            continue;
+        }
+        let [source] = node.inputs() else {
+            return None;
+        };
+        if source != NETWORK_INPUT && !sources.iter().any(|known| known == source) {
+            sources.push(source.clone());
+        }
+    }
+    sources.sort_unstable();
+    Some(sources)
+}
+
+fn preflight_region_selector_root_anchors(
+    tail: &GraphNetwork,
+    anchors: &[(&str, &ny_tensor::BoundedTensor)],
+) -> Option<RegionSelectorRootAnchorStats> {
+    let stats = region_selector_root_anchor_payload_stats(anchors)?;
+    let expected_sources = tail_non_input_relu_source_names(tail)?;
+    if expected_sources.is_empty()
+        || expected_sources.len() != anchors.len()
+        || expected_sources
+            .iter()
+            .zip(anchors)
+            .any(|(expected, (actual, _))| expected.as_str() != *actual)
+        || anchors.iter().any(|(name, _)| tail.node(name).is_none())
+    {
+        return None;
+    }
+    Some(stats)
+}
+
+fn inflated_unstable_count(bounds: &ny_tensor::BoundedTensor) -> Option<usize> {
+    finite_plain_root_anchor_box(bounds).then_some(())?;
+    bounds
+        .lower()
+        .iter()
+        .zip(bounds.upper())
+        .try_fold(0usize, |count, (&lower, &upper)| {
+            let unstable = f64::from(lower) - DELTA < 0.0 && f64::from(upper) + DELTA > 0.0;
+            count.checked_add(usize::from(unstable))
+        })
+}
+
+fn intersect_region_selector_root_anchors(
+    node_bounds: &mut HashMap<String, ny_tensor::BoundedTensor>,
+    anchors: &[(&str, &ny_tensor::BoundedTensor)],
+    expected_payload: RegionSelectorRootAnchorStats,
+) -> Option<RegionSelectorRootAnchorIntersectionStats> {
+    let payload = region_selector_root_anchor_payload_stats(anchors)?;
+    if payload != expected_payload {
+        return None;
+    }
+    let mut unstable_before = 0usize;
+    let mut unstable_after = 0usize;
+    let mut tightened_elements = 0usize;
+    let mut intersections = Vec::with_capacity(anchors.len());
+    for &(name, anchor) in anchors {
+        let seam_derived = node_bounds.get(name)?;
+        if seam_derived.shape() != anchor.shape() || !finite_plain_root_anchor_box(seam_derived) {
+            return None;
+        }
+        unstable_before = unstable_before.checked_add(inflated_unstable_count(seam_derived)?)?;
+        let (intersection, disjoint_elements) = seam_derived.intersection_per_element(anchor)?;
+        if disjoint_elements != 0 || !finite_plain_root_anchor_box(&intersection) {
+            return None;
+        }
+        unstable_after = unstable_after.checked_add(inflated_unstable_count(&intersection)?)?;
+        tightened_elements = tightened_elements.checked_add(
+            seam_derived
+                .lower()
+                .iter()
+                .zip(seam_derived.upper())
+                .zip(intersection.lower().iter().zip(intersection.upper()))
+                .filter(
+                    |((before_lower, before_upper), (after_lower, after_upper))| {
+                        before_lower.to_bits() != after_lower.to_bits()
+                            || before_upper.to_bits() != after_upper.to_bits()
+                    },
+                )
+                .count(),
+        )?;
+        intersections.push((name.to_string(), intersection));
+    }
+    for (name, intersection) in intersections {
+        node_bounds.insert(name, intersection);
+    }
+    Some(RegionSelectorRootAnchorIntersectionStats {
+        payload,
+        unstable_before,
+        unstable_after,
+        tightened_elements,
+    })
+}
+
+fn region_selector_stats_from_rows(
+    seam_dim: usize,
+    directions: &Array2<f32>,
+    selector_coefficients: &Array2<f64>,
+    row_lowers: &Array1<f64>,
+) -> Option<RegionSelectorStats> {
+    if seam_dim == 0
+        || directions.shape() != [AY_TAIL_REGION_SELECTOR_REGIONS, seam_dim]
+        || selector_coefficients.shape()
+            != [
+                AY_TAIL_REGION_SELECTOR_REGIONS,
+                AY_TAIL_REGION_SELECTOR_BITS,
+            ]
+        || row_lowers.len() != AY_TAIL_REGION_SELECTOR_REGIONS
+        || directions.iter().any(|value| !value.is_finite())
+        || selector_coefficients.iter().any(|value| !value.is_finite())
+        || row_lowers.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let mut added_nnz = 0usize;
+    for row in 0..AY_TAIL_REGION_SELECTOR_REGIONS {
+        let row_nnz = directions
+            .row(row)
+            .iter()
+            .filter(|&&value| value != 0.0)
+            .count()
+            .checked_add(
+                selector_coefficients
+                    .row(row)
+                    .iter()
+                    .filter(|&&value| value != 0.0)
+                    .count(),
+            )?;
+        if row_nnz == 0 {
+            return None;
+        }
+        added_nnz = added_nnz.checked_add(row_nnz)?;
+    }
+    if added_nnz > IMB_AY_TAIL_REGION_SELECTOR_MAX_NNZ {
+        return None;
+    }
+    Some(RegionSelectorStats {
+        rows: AY_TAIL_REGION_SELECTOR_REGIONS,
+        bits: AY_TAIL_REGION_SELECTOR_BITS,
+        added_nnz,
+    })
+}
+
+fn region_selector_stats(
+    envelope: &AyTailRegionSelectorEnvelope,
+    seam_box: &ny_tensor::BoundedTensor,
+) -> Option<RegionSelectorStats> {
+    let seam_dim = seam_box.flatten().len();
+    let root_input = envelope.certified_root_input();
+    let regions = envelope.region_inputs();
+    let root_anchors: Vec<_> = envelope
+        .root_tail_anchors()
+        .iter()
+        .map(|anchor| (anchor.node_name(), anchor.bounds()))
+        .collect();
+    if !same_plain_bounded_tensor_bits(seam_box, envelope.root_seam_box())
+        || regions.len() != AY_TAIL_REGION_SELECTOR_REGIONS
+        || root_input.has_l2_constraint()
+        || regions
+            .iter()
+            .any(|region| !shared_input_region_is_inside(root_input, region))
+        || envelope.prefix_floors().len() != AY_TAIL_REGION_SELECTOR_REGIONS
+        || envelope.global_seam_lowers().len() != AY_TAIL_REGION_SELECTOR_REGIONS
+        || envelope.big_m().len() != AY_TAIL_REGION_SELECTOR_REGIONS
+        || envelope
+            .prefix_floors()
+            .iter()
+            .any(|value| !value.is_finite())
+        || envelope
+            .global_seam_lowers()
+            .iter()
+            .any(|value| !value.is_finite())
+        || envelope
+            .big_m()
+            .iter()
+            .any(|&value| !value.is_finite() || value < 0.0)
+        || region_selector_relu_bound_payload_stats(envelope.regional_relu_bounds(), &root_anchors)
+            .is_none()
+    {
+        return None;
+    }
+    region_selector_stats_from_rows(
+        seam_dim,
+        envelope.directions(),
+        envelope.selector_coefficients(),
+        envelope.row_lowers(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RegionSelectorInputGateSpec {
+    latent_index: usize,
+    selector_bit: usize,
+    lower_gap_down: f64,
+    lower_bound: f64,
+    upper_gap_up: f64,
+    upper_bound: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RegionSelectorInputLiftPlan {
+    bank: SharedInputReachabilityStats,
+    gates: [RegionSelectorInputGateSpec; AY_TAIL_REGION_SELECTOR_BITS],
+    encoding: RegionSelectorInputLiftEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegionSelectorInputLiftEncoding {
+    /// Historical two dense rows per support. This remains the selector K4
+    /// path and is also the encoding used by ordinary shared-input requests.
+    Dense,
+    /// Selector-K2-only projection-equivalent support-value factorization.
+    FactoredK2,
+}
+
+impl RegionSelectorInputLiftEncoding {
+    fn auxiliary_cols(self, supports: usize) -> usize {
+        match self {
+            Self::Dense => 0,
+            Self::FactoredK2 => supports,
+        }
+    }
+
+    fn provenance_name(self) -> &'static str {
+        match self {
+            Self::Dense => "dense",
+            Self::FactoredK2 => "factored-k2-finite-t",
+        }
+    }
+}
+
+impl RegionSelectorInputLiftPlan {
+    fn added_cols(&self) -> Option<usize> {
+        self.bank
+            .latent_inputs
+            .checked_add(self.encoding.auxiliary_cols(self.bank.supports))
+    }
+}
+
+fn directed_selector_input_gaps(lower: f32, boundary: f32, upper: f32) -> Option<(f64, f64)> {
+    if !(lower.is_finite()
+        && boundary.is_finite()
+        && upper.is_finite()
+        && lower < boundary
+        && boundary < upper)
+    {
+        return None;
+    }
+    let lower_gap_down = next_down_f64(f64::from(boundary) - f64::from(lower));
+    let upper_gap_up = next_up_f64(f64::from(upper) - f64::from(boundary));
+    (lower_gap_down.is_finite()
+        && upper_gap_up.is_finite()
+        && lower_gap_down > 0.0
+        && upper_gap_up > 0.0)
+        .then_some((lower_gap_down, upper_gap_up))
+}
+
+/// The region payload itself is the topology authority: the shared boundary
+/// for bit `j` is read from region zero's upper endpoint in split dimension
+/// `[0,1,2,4][j]`, never recomputed as a midpoint. All 16 boxes must reproduce
+/// the exact little-endian Cartesian product bit-for-bit, and every unsplit
+/// coordinate must retain the exact root endpoints.
+fn plan_region_selector_input_gates(
+    root: &ny_tensor::BoundedTensor,
+    regions: &[ny_tensor::BoundedTensor],
+) -> Option<[RegionSelectorInputGateSpec; AY_TAIL_REGION_SELECTOR_BITS]> {
+    if regions.len() != AY_TAIL_REGION_SELECTOR_REGIONS
+        || root.has_l2_constraint()
+        || root.flatten().len() != AY_TAIL_REGION_SELECTOR_K4_INPUTS
+    {
+        return None;
+    }
+    let flat_root = root.flatten();
+    let root_lower = flat_root.lower().as_slice()?;
+    let root_upper = flat_root.upper().as_slice()?;
+    if root_lower.len() != AY_TAIL_REGION_SELECTOR_K4_INPUTS
+        || root_upper.len() != AY_TAIL_REGION_SELECTOR_K4_INPUTS
+    {
+        return None;
+    }
+    let mut seen_split = [false; AY_TAIL_REGION_SELECTOR_K4_INPUTS];
+    let mut boundaries = [0.0_f32; AY_TAIL_REGION_SELECTOR_BITS];
+    for (selector_bit, &latent_index) in AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS.iter().enumerate() {
+        if latent_index >= root_lower.len() || seen_split[latent_index] {
+            return None;
+        }
+        seen_split[latent_index] = true;
+        let boundary = *regions.first()?.flatten().upper().get(latent_index)?;
+        if !(root_lower[latent_index].is_finite()
+            && root_upper[latent_index].is_finite()
+            && boundary.is_finite()
+            && root_lower[latent_index] < boundary
+            && boundary < root_upper[latent_index])
+        {
+            return None;
+        }
+        boundaries[selector_bit] = boundary;
+    }
+    for (region_index, region) in regions.iter().enumerate() {
+        if region.shape() != root.shape() || region.has_l2_constraint() {
+            return None;
+        }
+        let flat = region.flatten();
+        let lower = flat.lower().as_slice()?;
+        let upper = flat.upper().as_slice()?;
+        if lower.len() != root_lower.len() || upper.len() != root_upper.len() {
+            return None;
+        }
+        for latent_index in 0..root_lower.len() {
+            let (expected_lower, expected_upper) = AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS
+                .iter()
+                .position(|&dim| dim == latent_index)
+                .map_or(
+                    (root_lower[latent_index], root_upper[latent_index]),
+                    |selector_bit| {
+                        if ((region_index >> selector_bit) & 1) == 0 {
+                            (root_lower[latent_index], boundaries[selector_bit])
+                        } else {
+                            (boundaries[selector_bit], root_upper[latent_index])
+                        }
+                    },
+                );
+            if lower[latent_index].to_bits() != expected_lower.to_bits()
+                || upper[latent_index].to_bits() != expected_upper.to_bits()
+            {
+                return None;
+            }
+        }
+    }
+
+    let mut gates = Vec::with_capacity(AY_TAIL_REGION_SELECTOR_BITS);
+    for (selector_bit, &latent_index) in AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS.iter().enumerate() {
+        let lower_bound = f64::from(root_lower[latent_index]);
+        let upper_bound = f64::from(boundaries[selector_bit]);
+        // Each binary32 endpoint is exactly representable in binary64. Widen
+        // the potentially inexact subtraction in the direction that relaxes
+        // the corresponding row:
+        //   x - gap_down*z >= L, x - gap_up*z <= S.
+        let (lower_gap_down, upper_gap_up) = directed_selector_input_gaps(
+            root_lower[latent_index],
+            boundaries[selector_bit],
+            root_upper[latent_index],
+        )?;
+        gates.push(RegionSelectorInputGateSpec {
+            latent_index,
+            selector_bit,
+            lower_gap_down,
+            lower_bound,
+            upper_gap_up,
+            upper_bound,
+        });
+    }
+    let gates: [RegionSelectorInputGateSpec; AY_TAIL_REGION_SELECTOR_BITS] =
+        gates.try_into().ok()?;
+    Some(gates)
+}
+
+/// Validate and price one complete selector-conditioned K2 or K4 lift before
+/// any model mutation. The two opaque fields are mutually exclusive and carry
+/// distinct schema identities.
+fn plan_region_selector_input_lift(
+    selector: &AyTailRegionSelectorEnvelope,
+    seam_dim: usize,
+) -> Option<RegionSelectorInputLiftPlan> {
+    let (lift, expected_supports, encoding) =
+        match (selector.selector_k2_lift(), selector.selector_k4_lift()) {
+            (Some(lift), None) => (
+                lift,
+                AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+                RegionSelectorInputLiftEncoding::FactoredK2,
+            ),
+            (None, Some(lift)) => (
+                lift,
+                AY_TAIL_REGION_SELECTOR_K4_SUPPORTS,
+                RegionSelectorInputLiftEncoding::Dense,
+            ),
+            (None, None) | (Some(_), Some(_)) => return None,
+        };
+    let root = selector.certified_root_input();
+    let regions = selector.region_inputs();
+    let bank = match encoding {
+        RegionSelectorInputLiftEncoding::Dense => shared_input_reachability_stats(lift, seam_dim)?,
+        RegionSelectorInputLiftEncoding::FactoredK2 => {
+            selector_k2_factored_shared_input_stats(lift, seam_dim)?
+        }
+    };
+    if selector.seam_node() != lift.seam_node()
+        || bank.supports != expected_supports
+        || bank.latent_inputs != AY_TAIL_REGION_SELECTOR_K4_INPUTS
+        || bank.rows
+            != match encoding {
+                RegionSelectorInputLiftEncoding::Dense => 2 * expected_supports,
+                RegionSelectorInputLiftEncoding::FactoredK2 => 3 * expected_supports,
+            }
+        || !same_plain_bounded_tensor_bits(root, lift.certified_root_input())
+        || !same_plain_bounded_tensor_bits(root, lift.region_input())
+        || lift
+            .support_indices()
+            .iter()
+            .enumerate()
+            .any(|(index, &support)| {
+                support >= AY_TAIL_REGION_SELECTOR_REGIONS
+                    || lift.support_indices()[..index].contains(&support)
+            })
+    {
+        return None;
+    }
+    let gates = plan_region_selector_input_gates(root, regions)?;
+    Some(RegionSelectorInputLiftPlan {
+        bank,
+        gates,
+        encoding,
+    })
+}
+
+fn add_region_selector_input_gate_rows(
+    problem: &mut MilpProblem,
+    latent_cols: &[Col],
+    selectors: [Col; AY_TAIL_REGION_SELECTOR_BITS],
+    root: &ny_tensor::BoundedTensor,
+    plan: &RegionSelectorInputLiftPlan,
+) -> Option<()> {
+    let flat_root = root.flatten();
+    let root_lower = flat_root.lower().as_slice()?;
+    let root_upper = flat_root.upper().as_slice()?;
+    if latent_cols.len() != AY_TAIL_REGION_SELECTOR_K4_INPUTS
+        || root_lower.len() != latent_cols.len()
+        || root_upper.len() != latent_cols.len()
+        || plan.gates.len() != AY_TAIL_REGION_SELECTOR_BITS
+        || plan.bank.latent_inputs != latent_cols.len()
+        || !matches!(
+            plan.bank.supports,
+            AY_TAIL_REGION_SELECTOR_K2_SUPPORTS | AY_TAIL_REGION_SELECTOR_K4_SUPPORTS
+        )
+        || !matches!(
+            (plan.encoding, plan.bank.supports),
+            (
+                RegionSelectorInputLiftEncoding::Dense,
+                AY_TAIL_REGION_SELECTOR_K4_SUPPORTS
+            ) | (
+                RegionSelectorInputLiftEncoding::FactoredK2,
+                AY_TAIL_REGION_SELECTOR_K2_SUPPORTS
+            )
+        )
+        || latent_cols
+            .iter()
+            .enumerate()
+            .any(|(index, col)| latent_cols[..index].contains(col) || selectors.contains(col))
+        || selectors
+            .iter()
+            .enumerate()
+            .any(|(index, col)| selectors[..index].contains(col))
+        || latent_cols.iter().enumerate().any(|(index, col)| {
+            problem.cols().get(col.0).is_none_or(|spec| {
+                spec.integer
+                    || spec.lb.to_bits() != f64::from(root_lower[index]).to_bits()
+                    || spec.ub.to_bits() != f64::from(root_upper[index]).to_bits()
+            })
+        })
+        || selectors.iter().any(|col| {
+            problem
+                .cols()
+                .get(col.0)
+                .is_none_or(|spec| !spec.integer || spec.lb != 0.0 || spec.ub != 1.0)
+        })
+        || plan.gates.iter().any(|gate| {
+            gate.latent_index >= latent_cols.len()
+                || gate.selector_bit >= selectors.len()
+                || !gate.lower_gap_down.is_finite()
+                || !gate.upper_gap_up.is_finite()
+                || !gate.lower_bound.is_finite()
+                || !gate.upper_bound.is_finite()
+                || gate.lower_gap_down <= 0.0
+                || gate.upper_gap_up <= 0.0
+        })
+    {
+        return None;
+    }
+    for gate in &plan.gates {
+        let latent = latent_cols[gate.latent_index];
+        let selector = selectors[gate.selector_bit];
+        problem.add_row(
+            gate.lower_bound,
+            f64::INFINITY,
+            vec![(latent, 1.0), (selector, -gate.lower_gap_down)],
+        );
+        problem.add_row(
+            f64::NEG_INFINITY,
+            gate.upper_bound,
+            vec![(latent, 1.0), (selector, -gate.upper_gap_up)],
+        );
+    }
+    Some(())
+}
+
+/// Add one canonical big-M regional premise per selector assignment.
+///
+/// Every shape, coefficient, bound, and local nnz cap is checked before the
+/// first selector column is created, so a local rejection cannot leave a
+/// partially mutated tail model. The four returned columns are low-bit first,
+/// matching the 16-region enumeration used by the envelope.
+fn add_region_selector_rows(
+    problem: &mut MilpProblem,
+    seam_vars: &[Col],
+    directions: &Array2<f32>,
+    selector_coefficients: &Array2<f64>,
+    row_lowers: &Array1<f64>,
+) -> Option<([Col; AY_TAIL_REGION_SELECTOR_BITS], RegionSelectorStats)> {
+    let stats = region_selector_stats_from_rows(
+        seam_vars.len(),
+        directions,
+        selector_coefficients,
+        row_lowers,
+    )?;
+    let selectors = std::array::from_fn(|_| problem.add_integer_col(0.0, 0.0, 1.0));
+    for row in 0..AY_TAIL_REGION_SELECTOR_REGIONS {
+        let terms: Vec<_> = seam_vars
+            .iter()
+            .copied()
+            .zip(directions.row(row).iter().copied())
+            .filter_map(|(col, coefficient)| {
+                (coefficient != 0.0).then_some((col, f64::from(coefficient)))
+            })
+            .chain(
+                selectors
+                    .iter()
+                    .copied()
+                    .zip(selector_coefficients.row(row).iter().copied())
+                    .filter(|(_, coefficient)| *coefficient != 0.0),
+            )
+            .collect();
+        problem.add_row(row_lowers[row], f64::INFINITY, terms);
+    }
+    Some((selectors, stats))
+}
+
+/// Add the K2-only exact direction-reuse selector formulation.
+///
+/// The two K2 support-value columns already satisfy `t_j = P_j y`. Every
+/// bit-identical selector direction can therefore replace its dense seam
+/// vector by one `t_j` coefficient. Each remaining unique direction receives
+/// one finitely bounded auxiliary and exact equality. Planning, column
+/// identity checks, outward bound construction, and complete sparse row
+/// materialization all finish before the first mutation.
+#[allow(clippy::too_many_arguments)]
+fn add_factored_k2_region_selector_rows(
+    problem: &mut MilpProblem,
+    seam_vars: &[Col],
+    k2_support_values: [Col; AY_TAIL_REGION_SELECTOR_K2_SUPPORTS],
+    selector_directions: &Array2<f32>,
+    selector_coefficients: &Array2<f64>,
+    row_lowers: &Array1<f64>,
+    k2_directions: &Array2<f32>,
+    expected: &FactoredK2RegionSelectorRows,
+) -> Option<(
+    [Col; AY_TAIL_REGION_SELECTOR_BITS],
+    FactoredK2RegionSelectorRows,
+)> {
+    let plan = plan_factored_k2_region_selector_rows(
+        seam_vars.len(),
+        selector_directions,
+        selector_coefficients,
+        row_lowers,
+        k2_directions,
+    )?;
+    if &plan != expected
+        || k2_support_values.iter().enumerate().any(|(index, col)| {
+            k2_support_values[..index].contains(col)
+                || seam_vars.contains(col)
+                || problem.cols().get(col.0).is_none_or(|spec| {
+                    spec.integer
+                        || !spec.lb.is_finite()
+                        || !spec.ub.is_finite()
+                        || spec.lb > spec.ub
+                })
+        })
+    {
+        return None;
+    }
+
+    let new_directions = Array2::from_shape_fn(
+        (plan.new_direction_rows.len(), seam_vars.len()),
+        |(row, col)| selector_directions[[plan.new_direction_rows[row], col]],
+    );
+    let new_bounds = selector_factored_support_value_bounds(problem, seam_vars, &new_directions)?;
+    if new_bounds.len() != plan.new_direction_rows.len() {
+        return None;
+    }
+
+    let first_new_support = problem.num_cols();
+    let selector_start = first_new_support.checked_add(new_bounds.len())?;
+    let final_cols = selector_start.checked_add(AY_TAIL_REGION_SELECTOR_BITS)?;
+    if final_cols > IMB_AY_TAIL_MAX_COLS {
+        return None;
+    }
+    let new_support_values: Vec<_> = (first_new_support..selector_start).map(Col).collect();
+    let selectors = std::array::from_fn(|bit| Col(selector_start + bit));
+    let all_support_values: Vec<_> = k2_support_values
+        .into_iter()
+        .chain(new_support_values.iter().copied())
+        .collect();
+    if plan
+        .row_sources
+        .iter()
+        .any(|&source| source >= all_support_values.len())
+    {
+        return None;
+    }
+
+    let equality_rows: Vec<_> = plan
+        .new_direction_rows
+        .iter()
+        .copied()
+        .zip(new_support_values.iter().copied())
+        .map(|(representative, support_value)| {
+            let terms = std::iter::once((support_value, 1.0))
+                .chain(
+                    seam_vars
+                        .iter()
+                        .copied()
+                        .zip(selector_directions.row(representative).iter().copied())
+                        .filter_map(|(col, coefficient)| {
+                            (coefficient != 0.0).then_some((col, -f64::from(coefficient)))
+                        }),
+                )
+                .collect::<Vec<_>>();
+            (0.0, 0.0, terms)
+        })
+        .collect();
+    let selector_rows: Vec<_> = (0..AY_TAIL_REGION_SELECTOR_REGIONS)
+        .map(|row| {
+            let terms = std::iter::once((all_support_values[plan.row_sources[row]], 1.0))
+                .chain(
+                    selectors
+                        .iter()
+                        .copied()
+                        .zip(selector_coefficients.row(row).iter().copied())
+                        .filter(|(_, coefficient)| *coefficient != 0.0),
+                )
+                .collect::<Vec<_>>();
+            (row_lowers[row], f64::INFINITY, terms)
+        })
+        .collect();
+    let materialized_nnz = equality_rows
+        .iter()
+        .chain(&selector_rows)
+        .try_fold(0usize, |total, (_, _, terms)| {
+            total.checked_add(terms.len())
+        })?;
+    let final_rows = problem
+        .num_rows()
+        .checked_add(equality_rows.len())?
+        .checked_add(selector_rows.len())?;
+    if materialized_nnz != plan.added_nnz || final_rows > IMB_AY_TAIL_MAX_ROWS {
+        return None;
+    }
+
+    // No fallible operation remains after this point.
+    for (&(lower, upper), expected_col) in new_bounds.iter().zip(&new_support_values) {
+        let actual = problem.add_col(0.0, lower, upper);
+        debug_assert_eq!(actual, *expected_col);
+    }
+    let actual_selectors = std::array::from_fn(|_| problem.add_integer_col(0.0, 0.0, 1.0));
+    debug_assert_eq!(actual_selectors, selectors);
+    for (lower, upper, terms) in equality_rows {
+        problem.add_row(lower, upper, terms);
+    }
+    for (lower, upper, terms) in selector_rows {
+        problem.add_row(lower, upper, terms);
+    }
+    Some((selectors, plan))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PlannedRegionReluRow {
+    lb: f64,
+    ub: f64,
+    terms: Vec<(Col, f64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionReluHullStats {
+    regions: usize,
+    unstable_relus: usize,
+    rows: usize,
+    added_nnz: usize,
+}
+
+fn directed_nonnegative_gap_up(upper: f64, lower: f64) -> Option<f64> {
+    if !upper.is_finite() || !lower.is_finite() || upper < lower {
+        return None;
+    }
+    let gap = upper - lower;
+    if !gap.is_finite() || gap < 0.0 {
+        return None;
+    }
+    if gap == 0.0 {
+        Some(0.0)
+    } else {
+        let widened = next_up_f64(gap);
+        widened.is_finite().then_some(widened)
+    }
+}
+
+fn directed_subtract_multiple_down(base: f64, amount: f64, count: usize) -> Option<f64> {
+    if !base.is_finite() || !amount.is_finite() || amount < 0.0 {
+        return None;
+    }
+    let mut result = base;
+    for _ in 0..count {
+        result = next_down_f64(result - amount);
+        if !result.is_finite() {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn directed_add_multiple_up(base: f64, amount: f64, count: usize) -> Option<f64> {
+    if !base.is_finite() || !amount.is_finite() || amount < 0.0 {
+        return None;
+    }
+    let mut result = base;
+    for _ in 0..count {
+        result = next_up_f64(result + amount);
+        if !result.is_finite() {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn push_finite_nonzero_term(terms: &mut Vec<(Col, f64)>, col: Col, coefficient: f64) -> Option<()> {
+    if !coefficient.is_finite() {
+        return None;
+    }
+    if coefficient != 0.0 {
+        terms.push((col, coefficient));
+    }
+    Some(())
+}
+
+/// Compile the four region-gated ideal facets for one globally unstable ReLU.
+///
+/// For canonical region bits `d = 0`, these are exactly
+/// `x∈[l,u]`, `y≤u·a`, and `y≤x-l(1-a)`. For every other assignment,
+/// `d≥1`; the directed-up gaps make each row redundant against the existing
+/// global `[L,U]` big-M formulation.
+#[allow(clippy::too_many_arguments)]
+fn plan_one_region_relu_hull(
+    x: Col,
+    y: Col,
+    activation: Col,
+    selectors: [Col; AY_TAIL_REGION_SELECTOR_BITS],
+    region_index: usize,
+    global_lower: f64,
+    global_upper: f64,
+    regional_lower: f64,
+    regional_upper: f64,
+) -> Option<[PlannedRegionReluRow; 4]> {
+    if region_index >= AY_TAIL_REGION_SELECTOR_REGIONS
+        || !global_lower.is_finite()
+        || !global_upper.is_finite()
+        || !regional_lower.is_finite()
+        || !regional_upper.is_finite()
+        || global_lower >= 0.0
+        || global_upper <= 0.0
+        || global_lower > regional_lower
+        || regional_lower > regional_upper
+        || regional_upper > global_upper
+    {
+        return None;
+    }
+    let lower_gap = directed_nonnegative_gap_up(regional_lower, global_lower)?;
+    let upper_gap = directed_nonnegative_gap_up(global_upper, regional_upper)?;
+    let one_bits = region_index.count_ones() as usize;
+    let lower_base = directed_subtract_multiple_down(regional_lower, lower_gap, one_bits)?;
+    let upper_base = directed_add_multiple_up(regional_upper, upper_gap, one_bits)?;
+    let relu_upper_base = directed_add_multiple_up(0.0, upper_gap, one_bits)?;
+    let relu_slope_base = directed_add_multiple_up(-regional_lower, lower_gap, one_bits)?;
+
+    let selector_sign = |bit_index: usize| {
+        if ((region_index >> bit_index) & 1) == 0 {
+            1.0
+        } else {
+            -1.0
+        }
+    };
+
+    let mut x_lower_terms = vec![(x, 1.0)];
+    let mut x_upper_terms = vec![(x, 1.0)];
+    let mut relu_upper_terms = vec![(y, 1.0)];
+    let mut relu_slope_terms = vec![(y, 1.0), (x, -1.0)];
+    push_finite_nonzero_term(&mut relu_upper_terms, activation, -regional_upper)?;
+    push_finite_nonzero_term(&mut relu_slope_terms, activation, -regional_lower)?;
+    for (bit_index, &selector) in selectors.iter().enumerate() {
+        let sign = selector_sign(bit_index);
+        push_finite_nonzero_term(&mut x_lower_terms, selector, lower_gap * sign)?;
+        push_finite_nonzero_term(&mut x_upper_terms, selector, -upper_gap * sign)?;
+        push_finite_nonzero_term(&mut relu_upper_terms, selector, -upper_gap * sign)?;
+        push_finite_nonzero_term(&mut relu_slope_terms, selector, -lower_gap * sign)?;
+    }
+    Some([
+        PlannedRegionReluRow {
+            lb: lower_base,
+            ub: f64::INFINITY,
+            terms: x_lower_terms,
+        },
+        PlannedRegionReluRow {
+            lb: f64::NEG_INFINITY,
+            ub: upper_base,
+            terms: x_upper_terms,
+        },
+        PlannedRegionReluRow {
+            lb: f64::NEG_INFINITY,
+            ub: relu_upper_base,
+            terms: relu_upper_terms,
+        },
+        PlannedRegionReluRow {
+            lb: f64::NEG_INFINITY,
+            ub: relu_slope_base,
+            terms: relu_slope_terms,
+        },
+    ])
+}
+
+fn plan_region_selector_relu_hulls(
+    tail: &GraphNetwork,
+    encoding: &GraphMipEncoding,
+    node_bounds: &HashMap<String, ny_tensor::BoundedTensor>,
+    records: &[AyTailRegionReluBounds],
+    root_anchors: &[(&str, &ny_tensor::BoundedTensor)],
+    selectors: [Col; AY_TAIL_REGION_SELECTOR_BITS],
+) -> Option<(Vec<PlannedRegionReluRow>, RegionReluHullStats)> {
+    region_selector_relu_bound_payload_stats(records, root_anchors)?;
+    if encoding.binary_vars.len() > IMB_AY_TAIL_MAX_BINARIES
+        || encoding.binary_vars.len() != encoding.binary_widths.len()
+        || encoding.binary_vars.len() != encoding.binary_keys.len()
+        || selectors
+            .iter()
+            .enumerate()
+            .any(|(index, selector)| selectors[..index].contains(selector))
+        || selectors.iter().any(|selector| {
+            encoding
+                .problem
+                .cols()
+                .get(selector.0)
+                .is_none_or(|spec| !spec.integer || spec.lb != 0.0 || spec.ub != 1.0)
+        })
+        || encoding
+            .binary_keys
+            .iter()
+            .enumerate()
+            .any(|(index, key)| encoding.binary_keys[..index].contains(key))
+    {
+        return None;
+    }
+
+    let expected_rows = encoding
+        .binary_vars
+        .len()
+        .checked_mul(AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS.len())?
+        .checked_mul(4)?;
+    if expected_rows > IMB_AY_TAIL_REGION_RELU_MAX_ROWS {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(expected_rows);
+    for &region_index in &AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS {
+        for ((&activation, (relu_name, neuron_index)), &width) in encoding
+            .binary_vars
+            .iter()
+            .zip(&encoding.binary_keys)
+            .zip(&encoding.binary_widths)
+        {
+            if !width.is_finite()
+                || width <= 0.0
+                || encoding
+                    .problem
+                    .cols()
+                    .get(activation.0)
+                    .is_none_or(|spec| !spec.integer || spec.lb != 0.0 || spec.ub != 1.0)
+            {
+                return None;
+            }
+            let relu = tail.node(relu_name)?;
+            if !matches!(relu.layer(), Layer::ReLU(_)) {
+                return None;
+            }
+            let [source_name] = relu.inputs() else {
+                return None;
+            };
+            if source_name == NETWORK_INPUT
+                || !root_anchors
+                    .iter()
+                    .any(|(name, _)| *name == source_name.as_str())
+            {
+                return None;
+            }
+            let regional = records.iter().find(|record| {
+                record.region_index() == region_index && record.node_name() == source_name
+            })?;
+            let global_flat = node_bounds.get(source_name)?.flatten();
+            let regional_flat = regional.bounds().flatten();
+            let global_lower = *global_flat.lower().get(*neuron_index)?;
+            let global_upper = *global_flat.upper().get(*neuron_index)?;
+            let regional_source_lower = *regional_flat.lower().get(*neuron_index)?;
+            let regional_source_upper = *regional_flat.upper().get(*neuron_index)?;
+            if !global_lower.is_finite()
+                || !global_upper.is_finite()
+                || !regional_source_lower.is_finite()
+                || !regional_source_upper.is_finite()
+            {
+                return None;
+            }
+
+            // Widen both certified enclosures by DELTA with directed f64
+            // rounding, then intersect the regional range with the global one.
+            // Both operands are supersets of the real pre-activation range, so
+            // their intersection remains sound.
+            let global_lower = next_down_f64(f64::from(global_lower) - DELTA);
+            let global_upper = next_up_f64(f64::from(global_upper) + DELTA);
+            let regional_lower =
+                global_lower.max(next_down_f64(f64::from(regional_source_lower) - DELTA));
+            let regional_upper =
+                global_upper.min(next_up_f64(f64::from(regional_source_upper) + DELTA));
+
+            let x = *encoding.node_cols.get(source_name)?.get(*neuron_index)?;
+            let y = *encoding.node_cols.get(relu_name)?.get(*neuron_index)?;
+            if encoding.problem.cols().get(x.0).is_none()
+                || encoding.problem.cols().get(y.0).is_none()
+                || x == y
+                || x == activation
+                || y == activation
+                || selectors.contains(&x)
+                || selectors.contains(&y)
+                || selectors.contains(&activation)
+            {
+                return None;
+            }
+            rows.extend(plan_one_region_relu_hull(
+                x,
+                y,
+                activation,
+                selectors,
+                region_index,
+                global_lower,
+                global_upper,
+                regional_lower,
+                regional_upper,
+            )?);
+        }
+    }
+
+    let added_nnz = rows
+        .iter()
+        .try_fold(0usize, |total, row| total.checked_add(row.terms.len()))?;
+    if rows.len() != expected_rows || added_nnz > IMB_AY_TAIL_REGION_RELU_MAX_NNZ {
+        return None;
+    }
+    Some((
+        rows,
+        RegionReluHullStats {
+            regions: AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS.len(),
+            unstable_relus: encoding.binary_vars.len(),
+            rows: expected_rows,
+            added_nnz,
+        },
+    ))
+}
+
+fn append_planned_region_relu_rows(problem: &mut MilpProblem, rows: Vec<PlannedRegionReluRow>) {
+    for row in rows {
+        problem.add_row(row.lb, row.ub, row.terms);
+    }
+}
+
+/// Add the preflighted regional ideal-ReLU facets. No column or integrality
+/// metadata is touched; malformed mappings and over-cap plans reject before
+/// the first row mutation.
+fn add_region_selector_relu_hulls(
+    encoding: &mut GraphMipEncoding,
+    tail: &GraphNetwork,
+    node_bounds: &HashMap<String, ny_tensor::BoundedTensor>,
+    records: &[AyTailRegionReluBounds],
+    root_anchors: &[(&str, &ny_tensor::BoundedTensor)],
+    selectors: [Col; AY_TAIL_REGION_SELECTOR_BITS],
+) -> Option<RegionReluHullStats> {
+    let (rows, stats) = plan_region_selector_relu_hulls(
+        tail,
+        encoding,
+        node_bounds,
+        records,
+        root_anchors,
+        selectors,
+    )?;
+    let columns_before = encoding.problem.num_cols();
+    let binaries_before = encoding.binary_vars.clone();
+    append_planned_region_relu_rows(&mut encoding.problem, rows);
+    (encoding.problem.num_cols() == columns_before && encoding.binary_vars == binaries_before)
+        .then_some(stats)
+}
+
+fn region_selector_fixed_tree_splits(
+    selectors_low_bit_first: [Col; AY_TAIL_REGION_SELECTOR_BITS],
+) -> [Col; AY_TAIL_REGION_SELECTOR_BITS] {
+    // AY interprets splits[0] as the most-significant assignment bit. Reverse
+    // the envelope's low-bit-first selector order so leaf index r activates
+    // the canonical row for region r.
+    std::array::from_fn(|index| selectors_low_bit_first[AY_TAIL_REGION_SELECTOR_BITS - 1 - index])
+}
+
+fn compact_tail_k16_fixed_tree_splits(encoding: &GraphMipEncoding) -> Option<[Col; 4]> {
+    if encoding.binary_vars.len() > COMPACT_TAIL_K16_MAX_BINARIES
+        || encoding.binary_vars.len() != encoding.binary_keys.len()
+        || encoding
+            .binary_keys
+            .iter()
+            .enumerate()
+            .any(|(index, key)| encoding.binary_keys[..index].contains(key))
+    {
+        return None;
+    }
+    let mut splits = Vec::with_capacity(COMPACT_TAIL_K16_FIXED_SELECTOR_NEURONS.len());
+    for neuron_index in COMPACT_TAIL_K16_FIXED_SELECTOR_NEURONS {
+        let position = encoding.binary_keys.iter().position(|(node, neuron)| {
+            node == COMPACT_TAIL_K16_RELU_NODE && *neuron == neuron_index
+        })?;
+        let split = *encoding.binary_vars.get(position)?;
+        let spec = encoding.problem.cols().get(split.0)?;
+        if !spec.integer || spec.lb != 0.0 || spec.ub != 1.0 || splits.contains(&split) {
+            return None;
+        }
+        splits.push(split);
+    }
+    splits.try_into().ok()
+}
+
+fn compact_tail_k16_replay_is_complete(tree_leaves: usize, ny_cert_replays: usize) -> bool {
+    tree_leaves == COMPACT_TAIL_K16_TREE_LEAVES && ny_cert_replays == COMPACT_TAIL_K16_TREE_LEAVES
 }
 
 #[cfg(test)]
@@ -913,8 +2833,47 @@ mod shared_input_reachability_tests {
     }
 
     #[test]
+    fn ordinary_shared_k2_retains_historical_dense_rows_without_auxiliaries() {
+        let mut problem = MilpProblem::new();
+        let seam = vec![
+            problem.add_col(0.0, -10.0, 10.0),
+            problem.add_col(0.0, -20.0, 20.0),
+        ];
+        let directions = Array2::from_shape_vec((2, 2), vec![1.0, -2.0, 0.5, 3.0]).unwrap();
+        let lower_a = Array2::from_shape_vec((2, 1), vec![4.0, -5.0]).unwrap();
+        let upper_a = Array2::from_shape_vec((2, 1), vec![6.0, -7.0]).unwrap();
+        let lower_b = Array1::from_vec(vec![8.0, -9.0]);
+        let upper_b = Array1::from_vec(vec![10.0, -11.0]);
+        let (latent, added_nnz) = add_shared_input_reachability_rows(
+            &mut problem,
+            &seam,
+            &[-1.0],
+            &[2.0],
+            &directions,
+            &lower_a,
+            &lower_b,
+            &upper_a,
+            &upper_b,
+        )
+        .expect("ordinary K2 shared bank remains supported");
+
+        assert_eq!(latent, vec![Col(2)]);
+        assert_eq!(problem.num_cols(), 3, "ordinary K2 adds only latent x");
+        assert_eq!(problem.num_rows(), 4, "ordinary K2 stays two rows/support");
+        assert_eq!(added_nnz, 12);
+        assert_eq!(
+            problem.rows()[0].coeffs,
+            vec![(0, 1.0), (1, -2.0), (2, -4.0)]
+        );
+        assert_eq!(
+            problem.rows()[1].coeffs,
+            vec![(0, 1.0), (1, -2.0), (2, -6.0)]
+        );
+    }
+
+    #[test]
     fn shared_caps_cover_measured_k16_and_reject_an_nnz_overrun() {
-        assert_eq!(IMB_AY_TAIL_SHARED_ALLOWED_SUPPORTS, [4, 8, 16]);
+        assert_eq!(IMB_AY_TAIL_SHARED_ALLOWED_SUPPORTS, [2, 4, 8, 16]);
         assert_eq!(IMB_AY_TAIL_SHARED_MAX_SUPPORTS, 16);
         assert_eq!(IMB_AY_TAIL_SHARED_MAX_ROWS, 32);
         assert_eq!(IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS, 16);
@@ -955,6 +2914,112 @@ mod shared_input_reachability_tests {
     }
 
     #[test]
+    fn compact_k16_rows_use_one_3072_column_latent_block_under_sealed_caps() {
+        let mut problem = MilpProblem::new();
+        let seam: Vec<_> = (0..AY_TAIL_COMPACT_K16_SEAM_ELEMENTS)
+            .map(|_| problem.add_col(0.0, -2.0, 2.0))
+            .collect();
+        let directions = Array2::ones((
+            AY_TAIL_COMPACT_K16_SUPPORTS,
+            AY_TAIL_COMPACT_K16_SEAM_ELEMENTS,
+        ));
+        let a = Array2::ones((AY_TAIL_COMPACT_K16_SUPPORTS, AY_TAIL_COMPACT_K16_INPUTS));
+        let b = Array1::zeros(AY_TAIL_COMPACT_K16_SUPPORTS);
+        let lower = vec![-1.0; AY_TAIL_COMPACT_K16_INPUTS];
+        let upper = vec![1.0; AY_TAIL_COMPACT_K16_INPUTS];
+
+        let (latent, nnz) = add_shared_input_reachability_rows_with_caps(
+            &mut problem,
+            &seam,
+            &lower,
+            &upper,
+            &directions,
+            &a,
+            &b,
+            &a,
+            &b,
+            COMPACT_K16_SHARED_INPUT_CAPS,
+        )
+        .expect("sealed compact K16 rows fit their executor census");
+        assert_eq!(latent.len(), AY_TAIL_COMPACT_K16_INPUTS);
+        assert_eq!(problem.num_cols(), 100 + AY_TAIL_COMPACT_K16_INPUTS);
+        assert_eq!(problem.num_rows(), 2 * AY_TAIL_COMPACT_K16_SUPPORTS);
+        assert_eq!(nnz, 101_504);
+        assert!(nnz <= COMPACT_TAIL_K16_MAX_NNZ);
+
+        let before = (problem.num_cols(), problem.num_rows());
+        assert!(
+            add_shared_input_reachability_rows(
+                &mut problem,
+                &seam,
+                &lower,
+                &upper,
+                &directions,
+                &a,
+                &b,
+                &a,
+                &b,
+            )
+            .is_none(),
+            "the legacy cGAN encoder cap remains byte-identically narrow"
+        );
+        assert_eq!((problem.num_cols(), problem.num_rows()), before);
+    }
+
+    #[test]
+    fn compact_gate_and_complete_replay_fail_closed() {
+        assert!(!compact_tail_k16_enabled_from_value(None));
+        for malformed in ["", "0", "true", " 1", "1 ", "01", "１"] {
+            assert!(!compact_tail_k16_enabled_from_value(Some(malformed)));
+        }
+        assert!(compact_tail_k16_enabled_from_value(Some("1")));
+
+        assert!(!compact_tail_k16_replay_is_complete(0, 1));
+        assert!(!compact_tail_k16_replay_is_complete(15, 15));
+        assert!(!compact_tail_k16_replay_is_complete(16, 15));
+        assert!(!compact_tail_k16_replay_is_complete(15, 16));
+        assert!(compact_tail_k16_replay_is_complete(16, 16));
+    }
+
+    #[test]
+    fn compact_fixed_tree_resolves_exact_named_unfixed_indicators_in_manifest_order() {
+        let mut problem = MilpProblem::new();
+        let cols: Vec<_> = (0..4)
+            .map(|_| problem.add_integer_col(0.0, 0.0, 1.0))
+            .collect();
+        let mut encoding = GraphMipEncoding {
+            problem,
+            input_vars: Vec::new(),
+            output_vars: Vec::new(),
+            binary_vars: cols.clone(),
+            binary_widths: vec![1.0; 4],
+            binary_keys: vec![
+                (COMPACT_TAIL_K16_RELU_NODE.to_owned(), 1),
+                (COMPACT_TAIL_K16_RELU_NODE.to_owned(), 96),
+                (COMPACT_TAIL_K16_RELU_NODE.to_owned(), 45),
+                (COMPACT_TAIL_K16_RELU_NODE.to_owned(), 93),
+            ],
+            node_cols: HashMap::new(),
+        };
+        assert_eq!(
+            compact_tail_k16_fixed_tree_splits(&encoding),
+            Some([cols[2], cols[0], cols[3], cols[1]])
+        );
+
+        encoding.binary_keys[1].1 = 95;
+        assert!(
+            compact_tail_k16_fixed_tree_splits(&encoding).is_none(),
+            "a stable/missing planned neuron must decline instead of retargeting"
+        );
+        encoding.binary_keys[1].1 = 96;
+        encoding.problem.fix_col(cols[3], 0.0);
+        assert!(
+            compact_tail_k16_fixed_tree_splits(&encoding).is_none(),
+            "a fixed selector is not silently accepted as an assignment split"
+        );
+    }
+
+    #[test]
     fn shared_region_must_be_a_finite_exact_shape_subset_of_root() {
         let root = box1(&[-1.0, -2.0], &[3.0, 4.0]);
         let inside = box1(&[-0.5, -2.0], &[2.0, 1.0]);
@@ -972,6 +3037,1381 @@ mod shared_input_reachability_tests {
     }
 }
 
+#[cfg(test)]
+mod region_selector_tests {
+    use super::*;
+    use ndarray::{arr1, arr2, array};
+    use num_rational::BigRational;
+    use ny_propagate::layers::ReLULayer;
+    use ny_propagate::GraphNode;
+
+    fn scalar_box(lower: f32, upper: f32) -> ny_tensor::BoundedTensor {
+        ny_tensor::BoundedTensor::new(array![lower].into_dyn(), array![upper].into_dyn())
+            .expect("valid scalar box")
+    }
+
+    fn box5(lower: [f32; 5], upper: [f32; 5]) -> ny_tensor::BoundedTensor {
+        ny_tensor::BoundedTensor::new(
+            Array1::from_vec(lower.to_vec()).into_dyn(),
+            Array1::from_vec(upper.to_vec()).into_dyn(),
+        )
+        .expect("valid five-dimensional box")
+    }
+
+    fn asymmetric_selector_k4_grid() -> (ny_tensor::BoundedTensor, Vec<ny_tensor::BoundedTensor>) {
+        let root_lower = [-4.0, 2.0, -9.0, 11.0, 0.0];
+        let root_upper = [8.0, 10.0, -1.0, 11.0, 20.0];
+        // Deliberately not midpoints: the producer's stored cell boundaries,
+        // rather than arithmetic reconstruction, are proof identity.
+        let boundaries = [-1.0, 3.0, -2.0, 17.0];
+        let root = box5(root_lower, root_upper);
+        let regions = (0..AY_TAIL_REGION_SELECTOR_REGIONS)
+            .map(|region_index| {
+                let mut lower = root_lower;
+                let mut upper = root_upper;
+                for (selector_bit, &latent_index) in
+                    AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS.iter().enumerate()
+                {
+                    if ((region_index >> selector_bit) & 1) == 0 {
+                        upper[latent_index] = boundaries[selector_bit];
+                    } else {
+                        lower[latent_index] = boundaries[selector_bit];
+                    }
+                }
+                box5(lower, upper)
+            })
+            .collect();
+        (root, regions)
+    }
+
+    #[test]
+    fn selector_k4_grid_is_exact_little_endian_and_uses_stored_boundaries() {
+        let (root, regions) = asymmetric_selector_k4_grid();
+        let gates = plan_region_selector_input_gates(&root, &regions).expect("canonical 2^4 grid");
+        let flat_root = root.flatten();
+        for (selector_bit, gate) in gates.iter().enumerate() {
+            let latent_index = AY_TAIL_REGION_SELECTOR_K4_SPLIT_DIMS[selector_bit];
+            let stored_boundary = regions[0].flatten().upper()[latent_index];
+            let midpoint =
+                (flat_root.lower()[latent_index] + flat_root.upper()[latent_index]) * 0.5;
+            assert_eq!(gate.selector_bit, selector_bit);
+            assert_eq!(gate.latent_index, latent_index);
+            assert_eq!(
+                gate.upper_bound.to_bits(),
+                f64::from(stored_boundary).to_bits()
+            );
+            assert_ne!(
+                stored_boundary.to_bits(),
+                midpoint.to_bits(),
+                "fixture must distinguish stored-boundary transport from midpoint recomputation"
+            );
+        }
+
+        for region_index in 0..AY_TAIL_REGION_SELECTOR_REGIONS {
+            let flat_region = regions[region_index].flatten();
+            for gate in &gates {
+                let bit = ((region_index >> gate.selector_bit) & 1) as f64;
+                let encoded_lower = gate.lower_bound + gate.lower_gap_down * bit;
+                let encoded_upper = gate.upper_bound + gate.upper_gap_up * bit;
+                assert!(
+                    encoded_lower <= f64::from(flat_region.lower()[gate.latent_index]),
+                    "directed lower row must contain region {region_index}"
+                );
+                assert!(
+                    encoded_upper >= f64::from(flat_region.upper()[gate.latent_index]),
+                    "directed upper row must contain region {region_index}"
+                );
+            }
+            assert_eq!(
+                flat_region.lower()[3].to_bits(),
+                flat_root.lower()[3].to_bits()
+            );
+            assert_eq!(
+                flat_region.upper()[3].to_bits(),
+                flat_root.upper()[3].to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn selector_k4_grid_rejects_misorder_msb_mapping_and_unsplit_drift() {
+        let (root, regions) = asymmetric_selector_k4_grid();
+
+        let mut swapped = regions.clone();
+        swapped.swap(1, 8);
+        assert!(plan_region_selector_input_gates(&root, &swapped).is_none());
+
+        let reverse_four_bits = |value: usize| value.reverse_bits() >> (usize::BITS - 4);
+        let msb_first: Vec<_> = (0..AY_TAIL_REGION_SELECTOR_REGIONS)
+            .map(|index| regions[reverse_four_bits(index)].clone())
+            .collect();
+        assert!(
+            plan_region_selector_input_gates(&root, &msb_first).is_none(),
+            "selectors stay low-bit-first; only AY tree splits are reversed"
+        );
+
+        let mut drifted = regions;
+        let flat = drifted[7].flatten();
+        let mut lower: Vec<_> = flat.lower().iter().copied().collect();
+        let upper: Vec<_> = flat.upper().iter().copied().collect();
+        lower[3] = f32::from_bits(lower[3].to_bits() - 1);
+        drifted[7] = box5(
+            lower.try_into().expect("five lowers"),
+            upper.try_into().expect("five uppers"),
+        );
+        assert!(
+            plan_region_selector_input_gates(&root, &drifted).is_none(),
+            "an unsplit coordinate must remain root-equal in every cell"
+        );
+    }
+
+    #[test]
+    fn selector_k4_gap_rounding_contains_exact_rational_differences() {
+        for (lower, boundary, upper) in [
+            (-4.0_f32, -1.0_f32, 8.0_f32),
+            (f32::MIN_POSITIVE, 1.0, f32::MAX),
+            (-f32::MAX, -1.0, 1.0),
+            (-1.0e-30, 1.0e-20, 1.0e10),
+        ] {
+            let (lower_gap, upper_gap) = directed_selector_input_gaps(lower, boundary, upper)
+                .expect("strict finite interval");
+            let rat = |value: f64| BigRational::from_float(value).expect("finite dyadic");
+            let exact_lower = rat(f64::from(boundary)) - rat(f64::from(lower));
+            let exact_upper = rat(f64::from(upper)) - rat(f64::from(boundary));
+            assert!(
+                rat(lower_gap) <= exact_lower,
+                "lower-row gap must round down"
+            );
+            assert!(rat(upper_gap) >= exact_upper, "upper-row gap must round up");
+            assert!(rat(f64::from(boundary)) - rat(lower_gap) >= rat(f64::from(lower)));
+            assert!(rat(f64::from(upper)) - rat(upper_gap) <= rat(f64::from(boundary)));
+        }
+    }
+
+    #[test]
+    fn selector_k4_rows_share_one_latent_block_and_gate_exact_columns() {
+        let (root, regions) = asymmetric_selector_k4_grid();
+        let gates = plan_region_selector_input_gates(&root, &regions).unwrap();
+        let mut problem = MilpProblem::new();
+        let mut seam = Vec::new();
+        for index in 0..AY_TAIL_REGION_SELECTOR_K4_SUPPORTS {
+            seam.push(problem.add_col(0.0, -10.0, 10.0));
+            let _dummy = problem.add_col(index as f64, -20.0, 20.0);
+        }
+        let flat_root = root.flatten();
+        let directions = Array2::eye(AY_TAIL_REGION_SELECTOR_K4_SUPPORTS);
+        let lower_a =
+            Array2::from_shape_fn((AY_TAIL_REGION_SELECTOR_K4_SUPPORTS, 5), |(row, col)| {
+                1.0 + (row * 5 + col) as f32
+            });
+        let upper_a = -&lower_a;
+        let biases = Array1::zeros(AY_TAIL_REGION_SELECTOR_K4_SUPPORTS);
+        let (latent, bank_nnz) = add_shared_input_reachability_rows(
+            &mut problem,
+            &seam,
+            flat_root.lower().as_slice().unwrap(),
+            flat_root.upper().as_slice().unwrap(),
+            &directions,
+            &lower_a,
+            &biases,
+            &upper_a,
+            &biases,
+        )
+        .expect("valid K4 rows");
+        assert_eq!(latent.len(), 5);
+        assert_eq!(problem.num_rows(), 8);
+        assert_eq!(problem.rows()[0].coeffs[0].0, seam[0].0);
+        for &col in &latent {
+            assert!(
+                problem.rows()[0]
+                    .coeffs
+                    .iter()
+                    .any(|(row_col, _)| *row_col == col.0),
+                "every K4 coefficient row reuses the one latent block"
+            );
+        }
+
+        let selectors = std::array::from_fn(|_| {
+            let _dummy = problem.add_col(0.0, -1.0, 1.0);
+            problem.add_integer_col(0.0, 0.0, 1.0)
+        });
+        let plan = RegionSelectorInputLiftPlan {
+            bank: SharedInputReachabilityStats {
+                supports: 4,
+                latent_inputs: 5,
+                rows: 8,
+                added_nnz: bank_nnz,
+                bank_bytes: 0,
+            },
+            gates,
+            encoding: RegionSelectorInputLiftEncoding::Dense,
+        };
+        let columns_before = problem.cols().to_vec();
+        let binary_count_before = columns_before.iter().filter(|spec| spec.integer).count();
+        add_region_selector_input_gate_rows(&mut problem, &latent, selectors, &root, &plan)
+            .expect("valid latent-selector mapping");
+        assert_eq!(problem.cols(), columns_before);
+        assert_eq!(
+            problem.cols().iter().filter(|spec| spec.integer).count(),
+            binary_count_before,
+            "gating adds no binary or continuous column"
+        );
+        assert_eq!(
+            problem.num_rows(),
+            8 + IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_ROWS
+        );
+        for (selector_bit, gate) in plan.gates.iter().enumerate() {
+            let lower_row = &problem.rows()[8 + 2 * selector_bit];
+            let upper_row = &problem.rows()[9 + 2 * selector_bit];
+            assert_eq!(
+                lower_row.coeffs,
+                vec![
+                    (latent[gate.latent_index].0, 1.0),
+                    (selectors[selector_bit].0, -gate.lower_gap_down),
+                ]
+            );
+            assert_eq!(
+                upper_row.coeffs,
+                vec![
+                    (latent[gate.latent_index].0, 1.0),
+                    (selectors[selector_bit].0, -gate.upper_gap_up),
+                ]
+            );
+        }
+
+        let rows_before = problem.num_rows();
+        let overlapping = [latent[0], selectors[1], selectors[2], selectors[3]];
+        assert!(add_region_selector_input_gate_rows(
+            &mut problem,
+            &latent,
+            overlapping,
+            &root,
+            &plan,
+        )
+        .is_none());
+        assert_eq!(
+            problem.num_rows(),
+            rows_before,
+            "bad column identity rejects transactionally"
+        );
+    }
+
+    #[test]
+    fn selector_k2_factored_rows_project_exactly_to_dense_bank() {
+        let directions =
+            Array2::from_shape_vec((2, 3), vec![1.0, -2.0, 0.0, 0.5, 0.0, 3.0]).unwrap();
+        let lower_a = Array2::from_shape_vec((2, 2), vec![4.0, -5.0, 0.0, 6.0]).unwrap();
+        let upper_a = Array2::from_shape_vec((2, 2), vec![-9.0, 10.0, 11.0, 0.0]).unwrap();
+        let lower_b = Array1::from_vec(vec![7.0, -8.0]);
+        let upper_b = Array1::from_vec(vec![12.0, -13.0]);
+        let mut dense = MilpProblem::new();
+        let dense_seam: Vec<_> = (0..3).map(|_| dense.add_col(0.0, -20.0, 20.0)).collect();
+        let (dense_latent, dense_nnz) = add_shared_input_reachability_rows(
+            &mut dense,
+            &dense_seam,
+            &[-2.0, -3.0],
+            &[4.0, 5.0],
+            &directions,
+            &lower_a,
+            &lower_b,
+            &upper_a,
+            &upper_b,
+        )
+        .expect("historical dense K2 reference");
+
+        let mut factored = MilpProblem::new();
+        let factored_seam: Vec<_> = (0..3).map(|_| factored.add_col(0.0, -20.0, 20.0)).collect();
+        let (factored_columns, factored_nnz) = add_selector_k2_factored_shared_input_rows(
+            &mut factored,
+            &factored_seam,
+            &[-2.0, -3.0],
+            &[4.0, 5.0],
+            &directions,
+            &lower_a,
+            &lower_b,
+            &upper_a,
+            &upper_b,
+        )
+        .expect("factored K2");
+
+        assert_eq!(dense_latent, factored_columns.latent);
+        assert_eq!(dense.num_cols(), 5);
+        assert_eq!(dense.num_rows(), 4);
+        assert_eq!(factored.num_cols(), 7);
+        assert_eq!(factored.num_rows(), 6);
+        assert_eq!(dense_nnz, 14);
+        assert_eq!(factored_nnz, 16);
+        let rational = |value: f64| BigRational::from_float(value).expect("finite dyadic");
+        for (support, support_value) in factored.cols()[5..7].iter().enumerate() {
+            assert!(support_value.lb.is_finite());
+            assert!(support_value.ub.is_finite());
+            assert!(support_value.lb <= support_value.ub);
+            assert!(!support_value.integer);
+            let exact_lower =
+                directions
+                    .row(support)
+                    .iter()
+                    .fold(rational(0.0), |sum, &coefficient| {
+                        let endpoint = if coefficient >= 0.0 { -20.0 } else { 20.0 };
+                        sum + rational(f64::from(coefficient)) * rational(endpoint)
+                    });
+            let exact_upper =
+                directions
+                    .row(support)
+                    .iter()
+                    .fold(rational(0.0), |sum, &coefficient| {
+                        let endpoint = if coefficient >= 0.0 { 20.0 } else { -20.0 };
+                        sum + rational(f64::from(coefficient)) * rational(endpoint)
+                    });
+            assert!(rational(support_value.lb) <= exact_lower);
+            assert!(rational(support_value.ub) >= exact_upper);
+        }
+
+        let evaluate = |row: &ny_mip::ir::RowSpec, values: &[BigRational]| {
+            row.coeffs
+                .iter()
+                .fold(rational(0.0), |sum, &(col, coefficient)| {
+                    sum + rational(coefficient) * &values[col]
+                })
+        };
+        let seam_values = [1.25_f64, -0.5, 2.0];
+        let latent_values = [-0.75_f64, 1.5];
+        let dense_values: Vec<_> = seam_values
+            .iter()
+            .chain(&latent_values)
+            .copied()
+            .map(rational)
+            .collect();
+        let mut factored_values = dense_values.clone();
+        for support in 0..AY_TAIL_REGION_SELECTOR_K2_SUPPORTS {
+            let support_value = directions
+                .row(support)
+                .iter()
+                .zip(&dense_values[..seam_values.len()])
+                .fold(rational(0.0), |sum, (&coefficient, value)| {
+                    sum + rational(f64::from(coefficient)) * value
+                });
+            factored_values.push(support_value);
+        }
+        for support in 0..AY_TAIL_REGION_SELECTOR_K2_SUPPORTS {
+            let equality = &factored.rows()[3 * support];
+            let factored_lower = &factored.rows()[3 * support + 1];
+            let factored_upper = &factored.rows()[3 * support + 2];
+            let dense_lower = &dense.rows()[2 * support];
+            let dense_upper = &dense.rows()[2 * support + 1];
+            assert_eq!(evaluate(equality, &factored_values), rational(0.0));
+            assert_eq!(
+                evaluate(factored_lower, &factored_values),
+                evaluate(dense_lower, &dense_values)
+            );
+            assert_eq!(
+                evaluate(factored_upper, &factored_values),
+                evaluate(dense_upper, &dense_values)
+            );
+            assert_eq!(factored_lower.lb.to_bits(), dense_lower.lb.to_bits());
+            assert_eq!(factored_lower.ub.to_bits(), dense_lower.ub.to_bits());
+            assert_eq!(factored_upper.lb.to_bits(), dense_upper.lb.to_bits());
+            assert_eq!(factored_upper.ub.to_bits(), dense_upper.ub.to_bits());
+        }
+    }
+
+    #[test]
+    fn selector_factored_support_bounds_enclose_exact_mixed_ulp_and_extreme_corners() {
+        let mut problem = MilpProblem::new();
+        let min_f64_subnormal = f64::from_bits(1);
+        let max_f32 = f64::from(f32::MAX);
+        let seam = vec![
+            problem.add_col(0.0, -max_f32, max_f32),
+            problem.add_col(0.0, 1.0, f64::from_bits(1.0_f64.to_bits() + 1)),
+            problem.add_col(0.0, -min_f64_subnormal, min_f64_subnormal),
+            problem.add_col(0.0, -3.0, 7.0),
+        ];
+        let min_f32_subnormal = f32::from_bits(1);
+        let directions = Array2::from_shape_vec(
+            (2, 4),
+            vec![
+                f32::MIN_POSITIVE,
+                -1.0,
+                f32::MAX,
+                -min_f32_subnormal,
+                1.0,
+                f32::from_bits(1.0_f32.to_bits() + 1),
+                -f32::MIN_POSITIVE,
+                min_f32_subnormal,
+            ],
+        )
+        .unwrap();
+        let bounds = selector_factored_support_value_bounds(&problem, &seam, &directions)
+            .expect("finite extreme box must receive a directed enclosure");
+        let rational = |value: f64| BigRational::from_float(value).expect("finite dyadic");
+        for (support, &(lower, upper)) in bounds.iter().enumerate() {
+            let mut exact_lower = rational(0.0);
+            let mut exact_upper = rational(0.0);
+            for (&col, &coefficient) in seam.iter().zip(directions.row(support).iter()) {
+                let spec = &problem.cols()[col.0];
+                let coefficient = f64::from(coefficient);
+                exact_lower += rational(coefficient)
+                    * rational(if coefficient >= 0.0 { spec.lb } else { spec.ub });
+                exact_upper += rational(coefficient)
+                    * rational(if coefficient >= 0.0 { spec.ub } else { spec.lb });
+            }
+            assert!(
+                rational(lower) <= exact_lower,
+                "support {support} lower bound excluded an exact corner"
+            );
+            assert!(
+                rational(upper) >= exact_upper,
+                "support {support} upper bound excluded an exact corner"
+            );
+            assert!(lower.is_finite() && upper.is_finite() && lower <= upper);
+        }
+    }
+
+    #[test]
+    fn selector_k2_factored_preflight_is_transactional() {
+        let mut problem = MilpProblem::new();
+        let seam = vec![problem.add_col(0.0, -1.0, 1.0)];
+        let directions = Array2::from_shape_vec((2, 1), vec![1.0, f32::NAN]).unwrap();
+        let a = Array2::zeros((2, 1));
+        let b = Array1::zeros(2);
+        let before = (problem.cols().to_vec(), problem.rows().to_vec());
+        assert!(add_selector_k2_factored_shared_input_rows(
+            &mut problem,
+            &seam,
+            &[-1.0],
+            &[1.0],
+            &directions,
+            &a,
+            &b,
+            &a,
+            &b,
+        )
+        .is_none());
+        assert_eq!(problem.cols(), before.0);
+        assert_eq!(problem.rows(), before.1);
+
+        let valid_directions = Array2::ones((2, 1));
+        let out_of_range = Col(problem.num_cols());
+        assert!(add_selector_k2_factored_shared_input_rows(
+            &mut problem,
+            &[out_of_range],
+            &[-1.0],
+            &[1.0],
+            &valid_directions,
+            &a,
+            &b,
+            &a,
+            &b,
+        )
+        .is_none());
+        let duplicate_directions = Array2::ones((2, 2));
+        assert!(add_selector_k2_factored_shared_input_rows(
+            &mut problem,
+            &[seam[0], seam[0]],
+            &[-1.0],
+            &[1.0],
+            &duplicate_directions,
+            &a,
+            &b,
+            &a,
+            &b,
+        )
+        .is_none());
+        assert_eq!(problem.cols(), before.0);
+        assert_eq!(problem.rows(), before.1);
+
+        let mut nonfinite_problem = MilpProblem::new();
+        let nonfinite = nonfinite_problem.add_col(0.0, f64::NEG_INFINITY, 1.0);
+        let nonfinite_before = (
+            nonfinite_problem.cols().to_vec(),
+            nonfinite_problem.rows().to_vec(),
+        );
+        assert!(add_selector_k2_factored_shared_input_rows(
+            &mut nonfinite_problem,
+            &[nonfinite],
+            &[-1.0],
+            &[1.0],
+            &valid_directions,
+            &a,
+            &b,
+            &a,
+            &b,
+        )
+        .is_none());
+        assert_eq!(nonfinite_problem.cols(), nonfinite_before.0);
+        assert_eq!(nonfinite_problem.rows(), nonfinite_before.1);
+
+        let mut unordered_problem = MilpProblem::new();
+        let unordered = unordered_problem.add_col(0.0, 2.0, -2.0);
+        let unordered_before = (
+            unordered_problem.cols().to_vec(),
+            unordered_problem.rows().to_vec(),
+        );
+        assert!(add_selector_k2_factored_shared_input_rows(
+            &mut unordered_problem,
+            &[unordered],
+            &[-1.0],
+            &[1.0],
+            &valid_directions,
+            &a,
+            &b,
+            &a,
+            &b,
+        )
+        .is_none());
+        assert_eq!(unordered_problem.cols(), unordered_before.0);
+        assert_eq!(unordered_problem.rows(), unordered_before.1);
+    }
+
+    #[test]
+    fn selector_k2_factored_lift_has_exact_sealed_model_delta() {
+        let (root, regions) = asymmetric_selector_k4_grid();
+        let gates = plan_region_selector_input_gates(&root, &regions)
+            .expect("canonical 16-cell selector topology");
+        let mut problem = MilpProblem::new();
+        let seam: Vec<_> = (0..2_048)
+            .map(|_| problem.add_col(0.0, -10.0, 10.0))
+            .collect();
+        let selectors = std::array::from_fn(|_| problem.add_integer_col(0.0, 0.0, 1.0));
+        let nnz = |problem: &MilpProblem| {
+            problem
+                .rows()
+                .iter()
+                .map(|row| row.coeffs.len())
+                .sum::<usize>()
+        };
+        let snapshot = (
+            problem.num_cols(),
+            problem.num_rows(),
+            nnz(&problem),
+            problem.cols().iter().filter(|spec| spec.integer).count(),
+        );
+
+        let flat_root = root.flatten();
+        let directions = Array2::ones((AY_TAIL_REGION_SELECTOR_K2_SUPPORTS, 2_048));
+        let lower_a: Array2<f32> = Array2::ones((
+            AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+            AY_TAIL_REGION_SELECTOR_K4_INPUTS,
+        ));
+        let upper_a = -&lower_a;
+        let biases = Array1::zeros(AY_TAIL_REGION_SELECTOR_K2_SUPPORTS);
+        let (columns, bank_nnz) = add_selector_k2_factored_shared_input_rows(
+            &mut problem,
+            &seam,
+            flat_root.lower().as_slice().unwrap(),
+            flat_root.upper().as_slice().unwrap(),
+            &directions,
+            &lower_a,
+            &biases,
+            &upper_a,
+            &biases,
+        )
+        .expect("factored production-shape K2 bank");
+        assert_eq!(bank_nnz, 4_122);
+        let plan = RegionSelectorInputLiftPlan {
+            bank: SharedInputReachabilityStats {
+                supports: AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+                latent_inputs: AY_TAIL_REGION_SELECTOR_K4_INPUTS,
+                rows: 3 * AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+                added_nnz: bank_nnz,
+                bank_bytes: 16_496,
+            },
+            gates,
+            encoding: RegionSelectorInputLiftEncoding::FactoredK2,
+        };
+        add_region_selector_input_gate_rows(&mut problem, &columns.latent, selectors, &root, &plan)
+            .expect("K2 bank and canonical selector grid share one latent block");
+
+        assert_eq!(plan.added_cols(), Some(7));
+        assert_eq!(problem.num_cols() - snapshot.0, 7);
+        assert_eq!(problem.num_rows() - snapshot.1, 14);
+        assert_eq!(nnz(&problem) - snapshot.2, 4_138);
+        assert_eq!(
+            problem.cols().iter().filter(|spec| spec.integer).count() - snapshot.3,
+            0,
+            "the K2 lift reuses all four selector binaries"
+        );
+        for support_value in &problem.cols()[snapshot.0 + 5..snapshot.0 + 7] {
+            assert!(support_value.lb.is_finite());
+            assert!(support_value.ub.is_finite());
+            assert!(support_value.lb <= -20_480.0);
+            assert!(support_value.ub >= 20_480.0);
+            assert!(
+                !support_value.integer,
+                "support-value auxiliaries stay continuous"
+            );
+        }
+
+        // Exact r7 clause-1 census: the base selector model before K2 was
+        // 7,588 columns / 4,834 solve rows / 494,033 nnz / 23 binaries.
+        // Keep both the formulation delta and resulting model census sealed.
+        let sealed_base = (7_588usize, 4_834usize, 494_033usize, 23usize);
+        let sealed_delta = (
+            problem.num_cols() - snapshot.0,
+            problem.num_rows() - snapshot.1,
+            nnz(&problem) - snapshot.2,
+            problem.cols().iter().filter(|spec| spec.integer).count() - snapshot.3,
+        );
+        assert_eq!(sealed_delta, (7, 14, 4_138, 0));
+        assert_eq!(
+            (
+                sealed_base.0 + sealed_delta.0,
+                sealed_base.1 + sealed_delta.1,
+                sealed_base.2 + sealed_delta.2,
+                sealed_base.3 + sealed_delta.3,
+            ),
+            (7_595, 4_848, 498_171, 23)
+        );
+    }
+
+    fn sealed_k2_selector_direction_payload(
+        seam_dim: usize,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f64>, Array1<f64>) {
+        let k2_directions = Array2::from_shape_fn(
+            (AY_TAIL_REGION_SELECTOR_K2_SUPPORTS, seam_dim),
+            |(support, col)| {
+                if support == 0 {
+                    1.0 + (col % 3) as f32
+                } else {
+                    -1.0 - (col % 5) as f32
+                }
+            },
+        );
+        let selector_directions =
+            Array2::from_shape_fn((AY_TAIL_REGION_SELECTOR_REGIONS, seam_dim), |(row, col)| {
+                if row == 6 {
+                    0.25 + (col % 7) as f32
+                } else {
+                    k2_directions[[row & 1, col]]
+                }
+            });
+        let selector_coefficients = Array2::ones((
+            AY_TAIL_REGION_SELECTOR_REGIONS,
+            AY_TAIL_REGION_SELECTOR_BITS,
+        ));
+        let row_lowers =
+            Array1::from_shape_fn(AY_TAIL_REGION_SELECTOR_REGIONS, |row| -100.0 - row as f64);
+        (
+            k2_directions,
+            selector_directions,
+            selector_coefficients,
+            row_lowers,
+        )
+    }
+
+    #[test]
+    fn selector_k2_direction_reuse_has_exact_sealed_census_and_projection() {
+        let seam_dim = 2_048;
+        let (k2_directions, selector_directions, selector_coefficients, row_lowers) =
+            sealed_k2_selector_direction_payload(seam_dim);
+        let dense = region_selector_stats_from_rows(
+            seam_dim,
+            &selector_directions,
+            &selector_coefficients,
+            &row_lowers,
+        )
+        .expect("sealed dense selector rows");
+        let planned = plan_factored_k2_region_selector_rows(
+            seam_dim,
+            &selector_directions,
+            &selector_coefficients,
+            &row_lowers,
+            &k2_directions,
+        )
+        .expect("15 reused rows and one unique direction must factor");
+        assert_eq!(dense.added_nnz, 32_832);
+        assert_eq!(planned.new_direction_rows, vec![6]);
+        assert_eq!(
+            planned
+                .row_sources
+                .iter()
+                .filter(|&&source| source < AY_TAIL_REGION_SELECTOR_K2_SUPPORTS)
+                .count(),
+            15
+        );
+        assert_eq!(planned.row_sources[6], 2);
+        assert_eq!(planned.added_nnz, 2_129);
+
+        let (root, regions) = asymmetric_selector_k4_grid();
+        let gates = plan_region_selector_input_gates(&root, &regions).unwrap();
+        let mut problem = MilpProblem::new();
+        let seam: Vec<_> = (0..seam_dim)
+            .map(|_| problem.add_col(0.0, -1.0, 1.0))
+            .collect();
+        let nnz = |problem: &MilpProblem| {
+            problem
+                .rows()
+                .iter()
+                .map(|row| row.coeffs.len())
+                .sum::<usize>()
+        };
+        let snapshot = (
+            problem.num_cols(),
+            problem.num_rows(),
+            nnz(&problem),
+            problem.cols().iter().filter(|spec| spec.integer).count(),
+        );
+        let flat_root = root.flatten();
+        let lower_a: Array2<f32> = Array2::ones((
+            AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+            AY_TAIL_REGION_SELECTOR_K4_INPUTS,
+        ));
+        let upper_a = -&lower_a;
+        let biases = Array1::zeros(AY_TAIL_REGION_SELECTOR_K2_SUPPORTS);
+        let (columns, bank_nnz) = add_selector_k2_factored_shared_input_rows(
+            &mut problem,
+            &seam,
+            flat_root.lower().as_slice().unwrap(),
+            flat_root.upper().as_slice().unwrap(),
+            &k2_directions,
+            &lower_a,
+            &biases,
+            &upper_a,
+            &biases,
+        )
+        .expect("valid sealed-shape K2 bank");
+        let (selectors, actual) = add_factored_k2_region_selector_rows(
+            &mut problem,
+            &seam,
+            columns.support_values,
+            &selector_directions,
+            &selector_coefficients,
+            &row_lowers,
+            &k2_directions,
+            &planned,
+        )
+        .expect("exact selector direction reuse");
+        let lift_plan = RegionSelectorInputLiftPlan {
+            bank: SharedInputReachabilityStats {
+                supports: AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+                latent_inputs: AY_TAIL_REGION_SELECTOR_K4_INPUTS,
+                rows: 3 * AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+                added_nnz: bank_nnz,
+                bank_bytes: 16_496,
+            },
+            gates,
+            encoding: RegionSelectorInputLiftEncoding::FactoredK2,
+        };
+        add_region_selector_input_gate_rows(
+            &mut problem,
+            &columns.latent,
+            selectors,
+            &root,
+            &lift_plan,
+        )
+        .unwrap();
+        assert_eq!(actual, planned);
+        assert_eq!(bank_nnz, 4_122);
+        assert_eq!(
+            (
+                problem.num_cols() - snapshot.0,
+                problem.num_rows() - snapshot.1,
+                nnz(&problem) - snapshot.2,
+                problem.cols().iter().filter(|spec| spec.integer).count() - snapshot.3,
+            ),
+            (12, 31, 6_267, 4)
+        );
+        let new_support = &problem.cols()[snapshot.0 + 7];
+        assert!(
+            !new_support.integer
+                && new_support.lb.is_finite()
+                && new_support.ub.is_finite()
+                && new_support.lb <= new_support.ub
+        );
+
+        // Clause-r7 arithmetic. The historical base census includes the dense
+        // selector bank. K2 adds (7,14,4,138,0); exact direction reuse then
+        // replaces 32,832 nnz by 2,129 while adding one column and equality.
+        let k2_delta = (7usize, 14usize, 4_138usize, 0usize);
+        let reuse_delta = (1usize, 1usize, 30_703usize, 0usize);
+        let sealed_dense_solve = (7_588usize, 4_834usize, 494_033usize, 23usize);
+        let sealed_dense_stored = (7_588usize, 4_835usize, 494_033usize, 23usize);
+        assert_eq!(
+            (
+                sealed_dense_solve.0 + k2_delta.0 + reuse_delta.0,
+                sealed_dense_solve.1 + k2_delta.1 + reuse_delta.1,
+                sealed_dense_solve.2 + k2_delta.2 - reuse_delta.2,
+                sealed_dense_solve.3 + k2_delta.3 + reuse_delta.3,
+            ),
+            (7_596, 4_849, 467_468, 23)
+        );
+        assert_eq!(sealed_dense_stored.1 + k2_delta.1 + reuse_delta.1, 4_850);
+
+        // Substitute exact dyadic `t = P y` values and compare every sparse
+        // selector row with the historical dense row at one nontrivial point.
+        let mut dense_problem = MilpProblem::new();
+        let dense_seam: Vec<_> = (0..seam_dim)
+            .map(|_| dense_problem.add_col(0.0, -1.0, 1.0))
+            .collect();
+        let (dense_selectors, _) = add_region_selector_rows(
+            &mut dense_problem,
+            &dense_seam,
+            &selector_directions,
+            &selector_coefficients,
+            &row_lowers,
+        )
+        .unwrap();
+        let rational = |value: f64| BigRational::from_float(value).unwrap();
+        let seam_values: Vec<_> = (0..seam_dim)
+            .map(|col| rational(if col & 1 == 0 { 0.25 } else { -0.5 }))
+            .collect();
+        let selector_values = [rational(1.0), rational(0.0), rational(1.0), rational(0.0)];
+        let mut dense_values = seam_values.clone();
+        dense_values.extend(selector_values.iter().cloned());
+        let mut factored_values = vec![rational(0.0); problem.num_cols()];
+        factored_values[..seam_dim].clone_from_slice(&seam_values);
+        for (support, &col) in columns.support_values.iter().enumerate() {
+            factored_values[col.0] = k2_directions
+                .row(support)
+                .iter()
+                .zip(&seam_values)
+                .fold(rational(0.0), |sum, (&coefficient, value)| {
+                    sum + rational(f64::from(coefficient)) * value
+                });
+        }
+        let new_support_col = Col(snapshot.0 + 7);
+        factored_values[new_support_col.0] = selector_directions
+            .row(6)
+            .iter()
+            .zip(&seam_values)
+            .fold(rational(0.0), |sum, (&coefficient, value)| {
+                sum + rational(f64::from(coefficient)) * value
+            });
+        for (&selector, value) in selectors.iter().zip(&selector_values) {
+            factored_values[selector.0] = value.clone();
+        }
+        let evaluate = |row: &ny_mip::ir::RowSpec, values: &[BigRational]| {
+            row.coeffs
+                .iter()
+                .fold(rational(0.0), |sum, &(col, coefficient)| {
+                    sum + rational(coefficient) * &values[col]
+                })
+        };
+        assert_eq!(
+            evaluate(&problem.rows()[6], &factored_values),
+            rational(0.0),
+            "the new direction equality is exact"
+        );
+        for row in 0..AY_TAIL_REGION_SELECTOR_REGIONS {
+            assert_eq!(
+                evaluate(&problem.rows()[7 + row], &factored_values),
+                evaluate(&dense_problem.rows()[row], &dense_values),
+                "selector row {row} changed after exact t substitution"
+            );
+        }
+        assert_eq!(
+            dense_selectors.map(|col| col.0 - dense_selectors[0].0),
+            selectors.map(|col| col.0 - selectors[0].0)
+        );
+    }
+
+    #[test]
+    fn selector_k2_direction_reuse_is_bitwise_and_dense_fallback_is_unchanged() {
+        let seam_dim = 8;
+        let mut k2_directions = Array2::from_shape_fn(
+            (AY_TAIL_REGION_SELECTOR_K2_SUPPORTS, seam_dim),
+            |(row, col)| (1 + row + col) as f32,
+        );
+        k2_directions[[0, 7]] = 0.0;
+        let mut selector_directions =
+            Array2::from_shape_fn((AY_TAIL_REGION_SELECTOR_REGIONS, seam_dim), |(_, col)| {
+                k2_directions[[0, col]]
+            });
+        selector_directions[[6, 7]] = -0.0;
+        let coefficients = Array2::ones((
+            AY_TAIL_REGION_SELECTOR_REGIONS,
+            AY_TAIL_REGION_SELECTOR_BITS,
+        ));
+        let lowers = Array1::zeros(AY_TAIL_REGION_SELECTOR_REGIONS);
+        let bitwise = plan_factored_k2_region_selector_rows(
+            seam_dim,
+            &selector_directions,
+            &coefficients,
+            &lowers,
+            &k2_directions,
+        )
+        .expect("signed-zero mismatch must be interned as a new exact direction");
+        assert_eq!(bitwise.new_direction_rows, vec![6]);
+        assert_eq!(bitwise.row_sources[6], 2);
+
+        let unique_selector_directions =
+            Array2::from_shape_fn((AY_TAIL_REGION_SELECTOR_REGIONS, 4), |(row, col)| {
+                (10 + row * 4 + col) as f32
+            });
+        let unique_k2 =
+            Array2::from_shape_fn((AY_TAIL_REGION_SELECTOR_K2_SUPPORTS, 4), |(row, col)| {
+                -((10 + row * 4 + col) as f32)
+            });
+        assert!(
+            plan_factored_k2_region_selector_rows(
+                4,
+                &unique_selector_directions,
+                &coefficients,
+                &lowers,
+                &unique_k2,
+            )
+            .is_none(),
+            "sixteen new equalities are larger than the canonical dense rows"
+        );
+
+        let mut expected_problem = MilpProblem::new();
+        let expected_seam: Vec<_> = (0..4)
+            .map(|_| expected_problem.add_col(0.0, -1.0, 1.0))
+            .collect();
+        let mut fallback_problem = expected_problem.clone();
+        let fallback_seam = expected_seam.clone();
+        let expected = add_region_selector_rows(
+            &mut expected_problem,
+            &expected_seam,
+            &unique_selector_directions,
+            &coefficients,
+            &lowers,
+        )
+        .unwrap();
+        let fallback = add_region_selector_rows(
+            &mut fallback_problem,
+            &fallback_seam,
+            &unique_selector_directions,
+            &coefficients,
+            &lowers,
+        )
+        .unwrap();
+        assert_eq!(fallback, expected);
+        assert_eq!(fallback_problem.cols(), expected_problem.cols());
+        assert_eq!(fallback_problem.rows(), expected_problem.rows());
+    }
+
+    #[test]
+    fn selector_k2_direction_reuse_rejects_bad_support_columns_transactionally() {
+        let (k2_directions, selector_directions, coefficients, lowers) =
+            sealed_k2_selector_direction_payload(8);
+        let planned = plan_factored_k2_region_selector_rows(
+            8,
+            &selector_directions,
+            &coefficients,
+            &lowers,
+            &k2_directions,
+        )
+        .unwrap();
+        let mut problem = MilpProblem::new();
+        let seam: Vec<_> = (0..8).map(|_| problem.add_col(0.0, -1.0, 1.0)).collect();
+        let valid = problem.add_col(0.0, -100.0, 100.0);
+        let nonfinite = problem.add_col(0.0, f64::NEG_INFINITY, 100.0);
+        let before = (problem.cols().to_vec(), problem.rows().to_vec());
+        assert!(add_factored_k2_region_selector_rows(
+            &mut problem,
+            &seam,
+            [valid, nonfinite],
+            &selector_directions,
+            &coefficients,
+            &lowers,
+            &k2_directions,
+            &planned,
+        )
+        .is_none());
+        assert_eq!(problem.cols(), before.0);
+        assert_eq!(problem.rows(), before.1);
+    }
+
+    fn two_relu_tail() -> GraphNetwork {
+        let mut tail = GraphNetwork::new();
+        let first =
+            LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).expect("valid first affine");
+        tail.add_node(GraphNode::from_input("pre_1", Layer::Linear(first)));
+        tail.add_node(GraphNode::new(
+            "relu_1",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["pre_1".to_string()],
+        ));
+        let second =
+            LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).expect("valid second affine");
+        tail.add_node(GraphNode::new(
+            "pre_2",
+            Layer::Linear(second),
+            vec!["relu_1".to_string()],
+        ));
+        tail.add_node(GraphNode::new(
+            "relu_2",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["pre_2".to_string()],
+        ));
+        tail.set_output("relu_2");
+        tail
+    }
+
+    #[test]
+    fn selector_rows_preserve_canonical_f64_payload_and_low_bit_order() {
+        let mut problem = MilpProblem::new();
+        let seam = [
+            problem.add_col(0.0, -10.0, 10.0),
+            problem.add_col(0.0, -20.0, 20.0),
+        ];
+        let mut directions = Array2::ones((AY_TAIL_REGION_SELECTOR_REGIONS, 2));
+        directions[[0, 0]] = 1.0;
+        directions[[0, 1]] = -2.0;
+        let mut selector_coefficients = Array2::zeros((
+            AY_TAIL_REGION_SELECTOR_REGIONS,
+            AY_TAIL_REGION_SELECTOR_BITS,
+        ));
+        selector_coefficients[[0, 0]] = 3.25;
+        selector_coefficients[[0, 2]] = -5.5;
+        let row_lowers =
+            Array1::from_iter((0..AY_TAIL_REGION_SELECTOR_REGIONS).map(|row| -100.0 - row as f64));
+
+        let (selectors, stats) = add_region_selector_rows(
+            &mut problem,
+            &seam,
+            &directions,
+            &selector_coefficients,
+            &row_lowers,
+        )
+        .expect("well-formed selector envelope rows");
+
+        assert_eq!(selectors, [Col(2), Col(3), Col(4), Col(5)]);
+        assert_eq!(
+            region_selector_fixed_tree_splits(selectors),
+            [Col(5), Col(4), Col(3), Col(2)]
+        );
+        assert_eq!(problem.num_cols(), 6);
+        assert_eq!(problem.num_rows(), AY_TAIL_REGION_SELECTOR_REGIONS);
+        assert_eq!(stats.rows, AY_TAIL_REGION_SELECTOR_REGIONS);
+        assert_eq!(stats.bits, AY_TAIL_REGION_SELECTOR_BITS);
+        assert_eq!(problem.rows()[0].lb, -100.0);
+        assert_eq!(problem.rows()[0].ub, f64::INFINITY);
+        assert_eq!(
+            problem.rows()[0].coeffs,
+            vec![(0, 1.0), (1, -2.0), (2, 3.25), (4, -5.5)]
+        );
+    }
+
+    #[test]
+    fn selector_rows_reject_before_mutation_on_bad_payload_or_nnz_cap() {
+        let mut problem = MilpProblem::new();
+        let seam = vec![problem.add_col(0.0, -1.0, 1.0)];
+        let directions = Array2::ones((AY_TAIL_REGION_SELECTOR_REGIONS, 1));
+        let mut malformed_coefficients = Array2::zeros((
+            AY_TAIL_REGION_SELECTOR_REGIONS,
+            AY_TAIL_REGION_SELECTOR_BITS,
+        ));
+        malformed_coefficients[[7, 2]] = f64::NAN;
+        let row_lowers = Array1::zeros(AY_TAIL_REGION_SELECTOR_REGIONS);
+        let before = (problem.num_cols(), problem.num_rows());
+        assert!(add_region_selector_rows(
+            &mut problem,
+            &seam,
+            &directions,
+            &malformed_coefficients,
+            &row_lowers,
+        )
+        .is_none());
+        assert_eq!((problem.num_cols(), problem.num_rows()), before);
+
+        let mut over_cap_problem = MilpProblem::new();
+        let over_cap_seam: Vec<_> = (0..4_097)
+            .map(|_| over_cap_problem.add_col(0.0, -1.0, 1.0))
+            .collect();
+        let over_cap_directions =
+            Array2::ones((AY_TAIL_REGION_SELECTOR_REGIONS, over_cap_seam.len()));
+        let coefficients = Array2::ones((
+            AY_TAIL_REGION_SELECTOR_REGIONS,
+            AY_TAIL_REGION_SELECTOR_BITS,
+        ));
+        let over_cap_before = (over_cap_problem.num_cols(), over_cap_problem.num_rows());
+        assert!(add_region_selector_rows(
+            &mut over_cap_problem,
+            &over_cap_seam,
+            &over_cap_directions,
+            &coefficients,
+            &row_lowers,
+        )
+        .is_none());
+        assert_eq!(
+            (over_cap_problem.num_cols(), over_cap_problem.num_rows()),
+            over_cap_before
+        );
+    }
+
+    fn planned_row_holds(row: &PlannedRegionReluRow, values: &[f64]) -> bool {
+        let lhs = row
+            .terms
+            .iter()
+            .map(|(col, coefficient)| coefficient * values[col.0])
+            .sum::<f64>();
+        lhs >= row.lb && lhs <= row.ub
+    }
+
+    #[test]
+    fn regional_relu_canonical_assignment_recovers_ideal_facets() {
+        let x = Col(0);
+        let y = Col(1);
+        let activation = Col(2);
+        let selectors = [Col(3), Col(4), Col(5), Col(6)];
+        let region_index = 1;
+        let rows = plan_one_region_relu_hull(
+            x,
+            y,
+            activation,
+            selectors,
+            region_index,
+            -2.0,
+            3.0,
+            -0.5,
+            1.0,
+        )
+        .expect("finite nested regional interval");
+        let selector_values = [1.0, 0.0, 0.0, 0.0];
+        let selector_sum = |row: &PlannedRegionReluRow| {
+            row.terms
+                .iter()
+                .filter(|(col, _)| selectors.contains(col))
+                .map(|(col, coefficient)| coefficient * selector_values[col.0 - selectors[0].0])
+                .sum::<f64>()
+        };
+        assert!(
+            rows[0].lb - selector_sum(&rows[0]) <= -0.5,
+            "canonical row is x >= l, widened only outward"
+        );
+        assert!(
+            rows[1].ub - selector_sum(&rows[1]) >= 1.0,
+            "canonical row is x <= u, widened only outward"
+        );
+        assert!(
+            rows[2].ub - selector_sum(&rows[2]) >= 0.0,
+            "canonical row is y <= u*a"
+        );
+        assert!(
+            rows[3].ub - selector_sum(&rows[3]) >= 0.5,
+            "canonical row is y <= x-l*(1-a)"
+        );
+
+        for (x_value, y_value, activation_value) in
+            [(-0.5, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)]
+        {
+            let values = [
+                x_value,
+                y_value,
+                activation_value,
+                selector_values[0],
+                selector_values[1],
+                selector_values[2],
+                selector_values[3],
+            ];
+            assert!(
+                rows.iter().all(|row| planned_row_holds(row, &values)),
+                "every exact regional ReLU graph point satisfies all four canonical facets"
+            );
+        }
+    }
+
+    #[test]
+    fn regional_relu_noncanonical_assignments_are_globally_redundant() {
+        let selectors = [Col(3), Col(4), Col(5), Col(6)];
+        let region_index = 1;
+        let rows = plan_one_region_relu_hull(
+            Col(0),
+            Col(1),
+            Col(2),
+            selectors,
+            region_index,
+            -2.0,
+            3.0,
+            -0.5,
+            1.0,
+        )
+        .expect("finite nested regional interval");
+        for assignment in 0..AY_TAIL_REGION_SELECTOR_REGIONS {
+            if assignment == region_index {
+                continue;
+            }
+            let selector_values: Vec<_> = (0..AY_TAIL_REGION_SELECTOR_BITS)
+                .map(|bit| ((assignment >> bit) & 1) as f64)
+                .collect();
+            for (x_value, y_value, activation_value) in [
+                (-2.0, 0.0, 0.0),
+                (-1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0),
+                (1.0, 1.0, 1.0),
+                (3.0, 3.0, 1.0),
+            ] {
+                let values = [
+                    x_value,
+                    y_value,
+                    activation_value,
+                    selector_values[0],
+                    selector_values[1],
+                    selector_values[2],
+                    selector_values[3],
+                ];
+                assert!(
+                    rows.iter().all(|row| planned_row_holds(row, &values)),
+                    "assignment {assignment} must retain every global ReLU extreme"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn regional_relu_rows_add_no_columns_or_binaries_and_reject_bad_ranges() {
+        let mut problem = MilpProblem::new();
+        let x = problem.add_col(0.0, -2.0, 3.0);
+        let y = problem.add_col(0.0, 0.0, 3.0);
+        let activation = problem.add_integer_col(0.0, 0.0, 1.0);
+        let selectors = std::array::from_fn(|_| problem.add_integer_col(0.0, 0.0, 1.0));
+        let planned =
+            plan_one_region_relu_hull(x, y, activation, selectors, 0, -2.0, 3.0, -0.5, 1.0)
+                .expect("valid regional hull");
+        let columns_before = problem.cols().to_vec();
+        append_planned_region_relu_rows(&mut problem, planned.into_iter().collect());
+        assert_eq!(problem.cols(), columns_before);
+        assert_eq!(problem.num_rows(), 4);
+        assert_eq!(
+            problem.cols().iter().filter(|spec| spec.integer).count(),
+            1 + AY_TAIL_REGION_SELECTOR_BITS
+        );
+
+        let before = (problem.num_cols(), problem.num_rows());
+        assert!(
+            plan_one_region_relu_hull(x, y, activation, selectors, 0, -2.0, 3.0, -2.5, 1.0,)
+                .is_none(),
+            "a regional interval outside the global enclosure fails preflight"
+        );
+        assert_eq!((problem.num_cols(), problem.num_rows()), before);
+    }
+
+    #[test]
+    fn selector_caps_cover_the_measured_dense_cgan_payload() {
+        let measured_nnz = AY_TAIL_REGION_SELECTOR_REGIONS * (2_048 + AY_TAIL_REGION_SELECTOR_BITS);
+        assert_eq!(measured_nnz, 32_832);
+        assert!(measured_nnz <= IMB_AY_TAIL_REGION_SELECTOR_MAX_NNZ);
+        assert_eq!(AY_TAIL_REGION_SELECTOR_REGIONS, 16);
+        assert_eq!(AY_TAIL_REGION_SELECTOR_BITS, 4);
+        let measured_rows = 4 * 2 * 19;
+        assert_eq!(measured_rows, 152);
+        assert!(measured_rows <= IMB_AY_TAIL_REGION_RELU_MAX_ROWS);
+        let measured_k4_bank_nnz = AY_TAIL_REGION_SELECTOR_K4_SUPPORTS * 2 * (2_048 + 5);
+        assert_eq!(measured_k4_bank_nnz, 16_424);
+        assert_eq!(
+            measured_k4_bank_nnz + IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_NNZ,
+            16_440
+        );
+        // Selector K2 emits one `t - P*y = 0` row plus two six-nnz
+        // `t - A*x` rows per support. K4 remains on the dense path above.
+        let measured_k2_bank_nnz =
+            AY_TAIL_REGION_SELECTOR_K2_SUPPORTS * ((2_048 + 1) + 2 * (5 + 1));
+        assert_eq!(measured_k2_bank_nnz, 4_122);
+        assert_eq!(
+            measured_k2_bank_nnz + IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_NNZ,
+            4_138
+        );
+        assert_eq!(3 * AY_TAIL_REGION_SELECTOR_K2_SUPPORTS, 6);
+        assert_eq!(
+            AY_TAIL_REGION_SELECTOR_K4_INPUTS + AY_TAIL_REGION_SELECTOR_K2_SUPPORTS,
+            7
+        );
+        assert_eq!(IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_ROWS, 8);
+    }
+
+    #[test]
+    fn selector_root_anchors_require_exact_tail_sources_and_tighten_transactionally() {
+        let tail = two_relu_tail();
+        let first = scalar_box(0.25, 1.0);
+        let second = scalar_box(-1.0, -0.25);
+        let anchors = [("pre_1", &first), ("pre_2", &second)];
+        let payload = preflight_region_selector_root_anchors(&tail, &anchors)
+            .expect("two canonical anchors exactly cover both tail ReLU sources");
+        assert_eq!(payload.anchors, 2);
+        assert_eq!(payload.elements, 2);
+
+        let mut node_bounds = HashMap::from([
+            ("pre_1".to_string(), scalar_box(-2.0, 2.0)),
+            ("pre_2".to_string(), scalar_box(-3.0, 3.0)),
+        ]);
+        let stats = intersect_region_selector_root_anchors(&mut node_bounds, &anchors, payload)
+            .expect("overlapping certified enclosures intersect");
+        assert_eq!(stats.unstable_before, 2);
+        assert_eq!(stats.unstable_after, 0);
+        assert_eq!(stats.tightened_elements, 2);
+        assert!(same_plain_bounded_tensor_bits(
+            node_bounds.get("pre_1").unwrap(),
+            &first,
+        ));
+        assert!(same_plain_bounded_tensor_bits(
+            node_bounds.get("pre_2").unwrap(),
+            &second,
+        ));
+    }
+
+    #[test]
+    fn selector_root_anchors_fail_closed_on_partial_shape_or_disjoint_payloads() {
+        let tail = two_relu_tail();
+        let first = scalar_box(0.25, 1.0);
+        let second = scalar_box(-1.0, -0.25);
+        assert!(
+            preflight_region_selector_root_anchors(&tail, &[("pre_1", &first)]).is_none(),
+            "partial ReLU-source coverage is not authority"
+        );
+        assert!(
+            preflight_region_selector_root_anchors(
+                &tail,
+                &[("pre_2", &second), ("pre_1", &first)],
+            )
+            .is_none(),
+            "non-canonical or duplicate identities are rejected"
+        );
+
+        let anchors = [("pre_1", &first), ("pre_2", &second)];
+        let payload = preflight_region_selector_root_anchors(&tail, &anchors).unwrap();
+        let mut wrong_shape = HashMap::from([
+            (
+                "pre_1".to_string(),
+                ny_tensor::BoundedTensor::new(array![[-2.0]].into_dyn(), array![[2.0]].into_dyn())
+                    .unwrap(),
+            ),
+            ("pre_2".to_string(), scalar_box(-3.0, 3.0)),
+        ]);
+        assert!(
+            intersect_region_selector_root_anchors(&mut wrong_shape, &anchors, payload).is_none()
+        );
+
+        let disjoint_first = scalar_box(3.0, 4.0);
+        let disjoint_anchors = [("pre_1", &disjoint_first), ("pre_2", &second)];
+        let disjoint_payload =
+            preflight_region_selector_root_anchors(&tail, &disjoint_anchors).unwrap();
+        let mut node_bounds = HashMap::from([
+            ("pre_1".to_string(), scalar_box(-2.0, 2.0)),
+            ("pre_2".to_string(), scalar_box(-3.0, 3.0)),
+        ]);
+        let before = node_bounds.clone();
+        assert!(intersect_region_selector_root_anchors(
+            &mut node_bounds,
+            &disjoint_anchors,
+            disjoint_payload,
+        )
+        .is_none());
+        assert!(same_plain_bounded_tensor_bits(
+            node_bounds.get("pre_1").unwrap(),
+            before.get("pre_1").unwrap(),
+        ));
+        assert!(same_plain_bounded_tensor_bits(
+            node_bounds.get("pre_2").unwrap(),
+            before.get("pre_2").unwrap(),
+        ));
+    }
+}
+
+fn try_acquire_imb_ay_tail_worker() -> Option<CertifiedLinearLowerWorkerAdmission> {
+    match CertifiedLinearLowerWorkerAdmission::try_acquire() {
+        Some(admission) => Some(admission),
+        None => {
+            eprintln!(
+                "[imb] AY-TAIL-CERT declined before encode: a prior exact AY worker is active"
+            );
+            None
+        }
+    }
+}
+
 fn imb_ay_tail_certificate_exact_result_impl(
     tail: &GraphNetwork,
     seam_box: &ny_tensor::BoundedTensor,
@@ -983,20 +4423,29 @@ fn imb_ay_tail_certificate_exact_result_impl(
         p,
         affine_envelope,
         shared_envelope,
+        region_selector_envelope,
         requested_lower,
         prefix_premise,
         proof_mode,
         residual_mode,
     ) = match request {
-        ImbAyTailProofRequest::Residual { p, requested_lower } => {
-            (Some(p), None, None, requested_lower, None, "residual", true)
-        }
+        ImbAyTailProofRequest::Residual { p, requested_lower } => (
+            Some(p),
+            None,
+            None,
+            None,
+            requested_lower,
+            None,
+            "residual",
+            true,
+        ),
         ImbAyTailProofRequest::Reachability {
             p,
             prefix_lower,
             requested_lower,
         } => (
             Some(p),
+            None,
             None,
             None,
             Some(requested_lower),
@@ -1011,6 +4460,7 @@ fn imb_ay_tail_certificate_exact_result_impl(
             None,
             Some(envelope),
             None,
+            None,
             Some(requested_lower),
             None,
             "affine-reachability",
@@ -1023,11 +4473,41 @@ fn imb_ay_tail_certificate_exact_result_impl(
             None,
             None,
             Some(envelope),
+            None,
             Some(requested_lower),
             None,
             "shared-input-reachability",
             false,
         ),
+        ImbAyTailProofRequest::RegionSelector {
+            envelope,
+            requested_lower,
+        } => (
+            None,
+            None,
+            None,
+            Some(envelope),
+            Some(requested_lower),
+            None,
+            "region-selector",
+            false,
+        ),
+    };
+    let compact_k16_mode = match (shared_envelope, requested_lower) {
+        (Some(envelope), Some(lower)) => compact_tail_k16_live_request_is_eligible(
+            tail,
+            seam_box,
+            objective,
+            envelope,
+            lower,
+            compact_tail_k16_enabled(),
+        ),
+        _ => false,
+    };
+    let proof_mode = if compact_k16_mode {
+        "compact-k16-shared-input"
+    } else {
+        proof_mode
     };
     if Instant::now() >= deadline {
         return None;
@@ -1081,7 +4561,13 @@ fn imb_ay_tail_certificate_exact_result_impl(
         }
     }
     let shared_stats = if let Some(envelope) = shared_envelope {
-        let Some(stats) = shared_input_reachability_stats(envelope, seam_box.flatten().len())
+        let caps = if compact_k16_mode {
+            COMPACT_K16_SHARED_INPUT_CAPS
+        } else {
+            LEGACY_SHARED_INPUT_CAPS
+        };
+        let Some(stats) =
+            shared_input_reachability_stats_with_caps(envelope, seam_box.flatten().len(), caps)
         else {
             eprintln!(
                 "[imb] AY-TAIL-CERT shared-input reachability declined before admission: \
@@ -1093,19 +4579,108 @@ fn imb_ay_tail_certificate_exact_result_impl(
     } else {
         None
     };
+    let region_selector_stats = if let Some(envelope) = region_selector_envelope {
+        let Some(stats) = region_selector_stats(envelope, seam_box) else {
+            eprintln!(
+                "[imb] AY-TAIL-CERT region selector declined before admission: \
+                     malformed, over-cap, or request/root seam mismatch"
+            );
+            return None;
+        };
+        Some(stats)
+    } else {
+        None
+    };
+    let region_selector_input_plan = if let Some(envelope) = region_selector_envelope {
+        if envelope.selector_k2_lift().is_some() || envelope.selector_k4_lift().is_some() {
+            let Some(plan) = plan_region_selector_input_lift(envelope, seam_box.flatten().len())
+            else {
+                eprintln!(
+                    "[imb] AY-TAIL-CERT region selector input lift declined before admission: \
+                     malformed bank or non-canonical 2^4 input grid"
+                );
+                return None;
+            };
+            Some(plan)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let region_selector_row_plan = match (region_selector_envelope, region_selector_stats) {
+        (Some(envelope), Some(dense)) => {
+            let factored = region_selector_input_plan
+                .as_ref()
+                .filter(|plan| plan.encoding == RegionSelectorInputLiftEncoding::FactoredK2)
+                .and_then(|_| envelope.selector_k2_lift())
+                .and_then(|lift| {
+                    plan_factored_k2_region_selector_rows(
+                        seam_box.flatten().len(),
+                        envelope.directions(),
+                        envelope.selector_coefficients(),
+                        envelope.row_lowers(),
+                        lift.directions(),
+                    )
+                });
+            Some(
+                factored.map_or(RegionSelectorRowPlan::Dense(dense), |plan| {
+                    RegionSelectorRowPlan::FactoredK2(Box::new(plan))
+                }),
+            )
+        }
+        (None, None) => None,
+        _ => return None,
+    };
+    let region_selector_root_anchors: Option<Vec<_>> = region_selector_envelope.map(|envelope| {
+        envelope
+            .root_tail_anchors()
+            .iter()
+            .map(|anchor| (anchor.node_name(), anchor.bounds()))
+            .collect()
+    });
+    let region_selector_root_anchor_stats =
+        if let Some(anchors) = region_selector_root_anchors.as_deref() {
+            let Some(stats) = preflight_region_selector_root_anchors(tail, anchors) else {
+                eprintln!(
+                    "[imb] AY-TAIL-CERT region selector declined before admission: \
+                     root anchors are malformed, over-cap, or do not exactly cover \
+                     non-input tail ReLU sources"
+                );
+                return None;
+            };
+            Some(stats)
+        } else {
+            None
+        };
+    let region_selector_relu_bound_stats = match (
+        region_selector_envelope,
+        region_selector_root_anchors.as_deref(),
+    ) {
+        (Some(envelope), Some(anchors)) => {
+            let Some(stats) =
+                region_selector_relu_bound_payload_stats(envelope.regional_relu_bounds(), anchors)
+            else {
+                eprintln!(
+                    "[imb] AY-TAIL-CERT region selector declined before admission: \
+                     regional ReLU boxes are malformed, over-cap, outside root anchors, \
+                     or do not exactly cover targeted regions"
+                );
+                return None;
+            };
+            Some(stats)
+        }
+        (None, None) => None,
+        _ => return None,
+    };
     // Reserve the process-wide exact worker *before* tail-local bounds and the
     // potentially 20M-nnz Graph-MIP are materialized. A worker detached at a
     // prior hard deadline retains this admission until its actual exit, so a
-    // retry sheds both solver threads and encoder/RSS work immediately.
-    let worker_admission = match CertifiedLinearLowerWorkerAdmission::try_acquire() {
-        Some(admission) => admission,
-        None => {
-            eprintln!(
-                "[imb] AY-TAIL-CERT declined before encode: a prior exact AY worker is active"
-            );
-            return None;
-        }
-    };
+    // retry sheds both solver threads and encoder/RSS work immediately. The
+    // selector's cheap request-bound name/payload/cap preflight above runs
+    // first, but its fresh bound collection, anchor intersection, encoding,
+    // and proof all remain inside this admission lease.
+    let worker_admission = try_acquire_imb_ay_tail_worker()?;
 
     let input_bounds = super::mip_preprocess::bounded_tensor_to_bounds(seam_box).ok()?;
     if !imb_ay_tail_input_within_caps(input_bounds.len()) {
@@ -1141,13 +4716,58 @@ fn imb_ay_tail_certificate_exact_result_impl(
         }
     }
 
-    // Build every downstream bound solely from the seam box. The residual mode
-    // remains universal over every point in that box. Reachability mode adds
-    // only its explicitly certified affine prefix premise below; a
-    // caller-supplied full-graph node box is never smuggled into either model.
-    let node_bounds = tail
+    // Rebuild every downstream bound from the seam box. Residual mode remains
+    // universal over every point in that box; reachability, affine, and shared
+    // modes add only their explicit prefix premises below and never consume a
+    // caller-supplied full-graph node map. The selector mode alone intersects
+    // its opaque, request-bound objective-independent root anchors below. Each
+    // such anchor encloses the corresponding tail intermediate for every real
+    // root execution, so the intersection retains every reachable execution
+    // while removing only seam-box spurious tail states.
+    let mut node_bounds = tail
         .collect_node_bounds_with_engine_and_deadline(seam_box, None, Some(deadline))
         .ok()?;
+    let region_selector_root_anchor_intersection = match (
+        region_selector_root_anchors.as_deref(),
+        region_selector_root_anchor_stats,
+    ) {
+        (Some(anchors), Some(expected_payload)) => {
+            let Some(stats) =
+                intersect_region_selector_root_anchors(&mut node_bounds, anchors, expected_payload)
+            else {
+                eprintln!(
+                    "[imb] AY-TAIL-CERT region selector declined before encode: \
+                         root-anchor shape mismatch, non-finite bound, or disjoint enclosure"
+                );
+                return None;
+            };
+            let projected_anchor_binaries = stats
+                .unstable_after
+                .checked_add(AY_TAIL_REGION_SELECTOR_BITS)?;
+            if projected_anchor_binaries > IMB_AY_TAIL_MAX_BINARIES {
+                eprintln!(
+                    "[imb] AY-TAIL-CERT region selector declined before encode: \
+                         anchored binaries {} + selector bits {} exceed {}",
+                    stats.unstable_after, AY_TAIL_REGION_SELECTOR_BITS, IMB_AY_TAIL_MAX_BINARIES,
+                );
+                return None;
+            }
+            eprintln!(
+                "[imb] AY-TAIL-CERT selector root anchors intersected: anchors={} \
+                     elements={} payload_bytes={} tightened_elements={} \
+                     anchored_unstable={}=>{}",
+                stats.payload.anchors,
+                stats.payload.elements,
+                stats.payload.payload_bytes,
+                stats.tightened_elements,
+                stats.unstable_before,
+                stats.unstable_after,
+            );
+            Some(stats)
+        }
+        (None, None) => None,
+        _ => return None,
+    };
     let flat_bounds = ibp_boxes_for_encoder(tail, &node_bounds);
     let estimated_nnz = super::graph_mip_leaf::estimate_encode_nnz(tail, &flat_bounds)?;
     let p_nnz = p.map_or(0, |values| {
@@ -1157,11 +4777,27 @@ fn imb_ay_tail_certificate_exact_result_impl(
     let premise_nnz = prefix_premise.map_or(0, |_| p_nnz);
     let affine_nnz = affine_envelope.map_or(Some(0), affine_reachability_added_nnz)?;
     let shared_nnz = shared_stats.map_or(0, |stats| stats.added_nnz);
+    let region_selector_nnz = region_selector_row_plan
+        .as_ref()
+        .map_or(0, RegionSelectorRowPlan::added_nnz);
+    let region_selector_input_nnz =
+        region_selector_input_plan
+            .as_ref()
+            .map_or(Some(0), |plan| {
+                plan.bank
+                    .added_nnz
+                    .checked_add(IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_NNZ)
+            })?;
+    let region_relu_hull_nnz =
+        region_selector_relu_bound_stats.map_or(0, |_| IMB_AY_TAIL_REGION_RELU_MAX_NNZ);
     let decision_nnz = objective_nnz.checked_add(if residual_mode { p_nnz } else { 0 })?;
     let projected_nnz = estimated_nnz
         .checked_add(premise_nnz)?
         .checked_add(affine_nnz)?
         .checked_add(shared_nnz)?
+        .checked_add(region_selector_nnz)?
+        .checked_add(region_selector_input_nnz)?
+        .checked_add(region_relu_hull_nnz)?
         .checked_add(decision_nnz)?;
     if projected_nnz > IMB_AY_TAIL_MAX_NNZ {
         eprintln!(
@@ -1179,6 +4815,15 @@ fn imb_ay_tail_certificate_exact_result_impl(
         Some(deadline),
     )
     .ok()?;
+    if let Some(stats) = region_selector_root_anchor_intersection {
+        eprintln!(
+            "[imb] AY-TAIL-CERT selector root-anchor binary census: \
+             anchored_unstable={}=>{} encoded_tail_binaries={}",
+            stats.unstable_before,
+            stats.unstable_after,
+            encoding.binary_vars.len(),
+        );
+    }
     if let Some(prefix_lower) = prefix_premise {
         let p = p?;
         let premise_terms: Vec<_> = encoding
@@ -1224,16 +4869,22 @@ fn imb_ay_tail_certificate_exact_result_impl(
         None
     };
     let shared_latent_cols = if let Some(envelope) = shared_envelope {
-        let (latent_cols, stats) = add_shared_input_reachability_envelope(
+        let caps = if compact_k16_mode {
+            COMPACT_K16_SHARED_INPUT_CAPS
+        } else {
+            LEGACY_SHARED_INPUT_CAPS
+        };
+        let (latent_cols, stats) = add_shared_input_reachability_envelope_with_caps(
             &mut encoding.problem,
             &encoding.input_vars,
             envelope,
+            caps,
         )?;
         if stats != shared_stats?
-            || latent_cols.len() > IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS
-            || stats.rows > IMB_AY_TAIL_SHARED_MAX_ROWS
-            || stats.added_nnz > IMB_AY_TAIL_SHARED_MAX_NNZ
-            || stats.bank_bytes > IMB_AY_TAIL_SHARED_MAX_BANK_BYTES
+            || latent_cols.len() > caps.max_latent_inputs
+            || stats.rows > caps.max_rows
+            || stats.added_nnz > caps.max_added_nnz
+            || stats.bank_bytes > caps.max_bank_bytes
         {
             return None;
         }
@@ -1250,20 +4901,223 @@ fn imb_ay_tail_certificate_exact_result_impl(
     } else {
         None
     };
+    let mut region_relu_hull_stats = None;
+    let region_selector_cols = if let Some(envelope) = region_selector_envelope {
+        let row_plan = region_selector_row_plan.as_ref()?;
+        let input_lift_extra_cols = region_selector_input_plan
+            .as_ref()
+            .map_or(Some(0), RegionSelectorInputLiftPlan::added_cols)?;
+        let input_lift_extra_rows = region_selector_input_plan.as_ref().map_or(0, |plan| {
+            plan.bank.rows + IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_ROWS
+        });
+        let projected_cols = encoding
+            .problem
+            .num_cols()
+            .checked_add(input_lift_extra_cols)?
+            .checked_add(row_plan.added_cols())?
+            .checked_add(AY_TAIL_REGION_SELECTOR_BITS)?;
+        let projected_rows = encoding
+            .problem
+            .num_rows()
+            .checked_add(input_lift_extra_rows)?
+            .checked_add(row_plan.added_rows()?)?
+            .checked_add(IMB_AY_TAIL_REGION_RELU_MAX_ROWS)?
+            .checked_add(1)?;
+        let projected_binaries = encoding
+            .binary_vars
+            .len()
+            .checked_add(AY_TAIL_REGION_SELECTOR_BITS)?;
+        if !imb_ay_tail_encoding_within_caps(projected_cols, projected_rows, projected_binaries) {
+            eprintln!(
+                "[imb] AY-TAIL-CERT region selector declined before row mutation: \
+                 projected_cols={projected_cols} projected_rows={projected_rows} \
+                 projected_binaries={projected_binaries}"
+            );
+            return None;
+        }
+        let mut selector_k2_support_values = None;
+        let selector_input_latent_cols = if let Some(plan) = region_selector_input_plan.as_ref() {
+            let (latent_cols, stats) = match plan.encoding {
+                RegionSelectorInputLiftEncoding::Dense => {
+                    let lift = envelope.selector_k4_lift()?;
+                    add_shared_input_reachability_envelope(
+                        &mut encoding.problem,
+                        &encoding.input_vars,
+                        lift,
+                    )?
+                }
+                RegionSelectorInputLiftEncoding::FactoredK2 => {
+                    let lift = envelope.selector_k2_lift()?;
+                    let (columns, stats) = add_selector_k2_factored_shared_input_envelope(
+                        &mut encoding.problem,
+                        &encoding.input_vars,
+                        lift,
+                    )?;
+                    selector_k2_support_values = Some(columns.support_values);
+                    (columns.latent, stats)
+                }
+            };
+            if stats != plan.bank
+                || latent_cols.len() != AY_TAIL_REGION_SELECTOR_K4_INPUTS
+                || plan.added_cols()? != input_lift_extra_cols
+            {
+                return None;
+            }
+            Some(latent_cols)
+        } else {
+            None
+        };
+        let selectors = match row_plan {
+            RegionSelectorRowPlan::Dense(expected) => {
+                let (selectors, stats) = add_region_selector_rows(
+                    &mut encoding.problem,
+                    &encoding.input_vars,
+                    envelope.directions(),
+                    envelope.selector_coefficients(),
+                    envelope.row_lowers(),
+                )?;
+                if &stats != expected
+                    || Some(stats) != region_selector_stats
+                    || stats.rows != AY_TAIL_REGION_SELECTOR_REGIONS
+                    || stats.bits != AY_TAIL_REGION_SELECTOR_BITS
+                    || stats.added_nnz > IMB_AY_TAIL_REGION_SELECTOR_MAX_NNZ
+                    || selector_k2_support_values.is_some()
+                        != matches!(
+                            region_selector_input_plan
+                                .as_ref()
+                                .map(|plan| plan.encoding),
+                            Some(RegionSelectorInputLiftEncoding::FactoredK2)
+                        )
+                {
+                    return None;
+                }
+                selectors
+            }
+            RegionSelectorRowPlan::FactoredK2(expected) => {
+                let lift = envelope.selector_k2_lift()?;
+                let (selectors, actual) = add_factored_k2_region_selector_rows(
+                    &mut encoding.problem,
+                    &encoding.input_vars,
+                    selector_k2_support_values?,
+                    envelope.directions(),
+                    envelope.selector_coefficients(),
+                    envelope.row_lowers(),
+                    lift.directions(),
+                    expected,
+                )?;
+                if actual != **expected || actual.added_nnz > IMB_AY_TAIL_REGION_SELECTOR_MAX_NNZ {
+                    return None;
+                }
+                selectors
+            }
+        };
+        if let (Some(latent_cols), Some(plan)) = (
+            selector_input_latent_cols.as_deref(),
+            region_selector_input_plan.as_ref(),
+        ) {
+            add_region_selector_input_gate_rows(
+                &mut encoding.problem,
+                latent_cols,
+                selectors,
+                envelope.certified_root_input(),
+                plan,
+            )?;
+        } else if selector_input_latent_cols.is_some() != region_selector_input_plan.is_some() {
+            return None;
+        }
+        let hull_stats = add_region_selector_relu_hulls(
+            &mut encoding,
+            tail,
+            &node_bounds,
+            envelope.regional_relu_bounds(),
+            region_selector_root_anchors.as_deref()?,
+            selectors,
+        )?;
+        if hull_stats.regions != AY_TAIL_REGION_SELECTOR_RELU_BOUND_REGIONS.len()
+            || hull_stats.unstable_relus != encoding.binary_vars.len()
+            || hull_stats.rows > IMB_AY_TAIL_REGION_RELU_MAX_ROWS
+            || hull_stats.added_nnz > IMB_AY_TAIL_REGION_RELU_MAX_NNZ
+        {
+            return None;
+        }
+        region_relu_hull_stats = Some(hull_stats);
+        eprintln!(
+            "[imb] AY-TAIL-CERT region-selector envelope encoded: regions={} \
+             bits={} rows={} nnz={} selector_direction_encoding={} \
+             selector_direction_reused_rows={} selector_direction_aux_cols={} \
+             regional_relu_records={} regional_relu_elements={} \
+             regional_relu_payload_bytes={} regional_relu_regions={} \
+             regional_relu_unstable={} regional_relu_rows={} regional_relu_nnz={} \
+             selector_k2={} selector_k4={} selector_input_supports={} \
+             selector_input_encoding={} selector_input_cols={} selector_input_rows={} \
+             selector_input_nnz={}",
+            AY_TAIL_REGION_SELECTOR_REGIONS,
+            AY_TAIL_REGION_SELECTOR_BITS,
+            row_plan.added_rows()?,
+            row_plan.added_nnz(),
+            row_plan.provenance_name(),
+            row_plan.reused_rows(),
+            row_plan.added_cols(),
+            region_selector_relu_bound_stats?.records,
+            region_selector_relu_bound_stats?.elements,
+            region_selector_relu_bound_stats?.payload_bytes,
+            hull_stats.regions,
+            hull_stats.unstable_relus,
+            hull_stats.rows,
+            hull_stats.added_nnz,
+            u8::from(envelope.selector_k2_lift().is_some()),
+            u8::from(envelope.selector_k4_lift().is_some()),
+            region_selector_input_plan
+                .as_ref()
+                .map_or(0, |plan| plan.bank.supports),
+            region_selector_input_plan
+                .as_ref()
+                .map_or("none", |plan| plan.encoding.provenance_name()),
+            region_selector_input_plan
+                .as_ref()
+                .and_then(RegionSelectorInputLiftPlan::added_cols)
+                .unwrap_or(0),
+            region_selector_input_plan.as_ref().map_or(0, |plan| {
+                plan.bank.rows + IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_ROWS
+            }),
+            region_selector_input_plan.as_ref().map_or(0, |plan| {
+                plan.bank.added_nnz + IMB_AY_TAIL_REGION_SELECTOR_INPUT_GATE_NNZ
+            }),
+        );
+        Some(selectors)
+    } else {
+        None
+    };
     let projected_rows = encoding.problem.num_rows().checked_add(1)?;
+    let projected_binaries = encoding
+        .binary_vars
+        .len()
+        .checked_add(region_selector_cols.as_ref().map_or(0, |cols| cols.len()))?;
     if p.is_some_and(|values| encoding.input_vars.len() != values.len())
         || encoding.output_vars.len() != objective.len()
         || affine_latent_cols
             .as_ref()
             .is_some_and(|cols| cols.len() > IMB_AY_TAIL_AFFINE_MAX_LATENT_INPUTS)
-        || shared_latent_cols
-            .as_ref()
-            .is_some_and(|cols| cols.len() > IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS)
+        || shared_latent_cols.as_ref().is_some_and(|cols| {
+            cols.len()
+                > if compact_k16_mode {
+                    COMPACT_K16_SHARED_INPUT_CAPS.max_latent_inputs
+                } else {
+                    IMB_AY_TAIL_SHARED_MAX_LATENT_INPUTS
+                }
+        })
+        || region_selector_cols.is_some() != region_relu_hull_stats.is_some()
         || !imb_ay_tail_encoding_within_caps(
             encoding.problem.num_cols(),
             projected_rows,
-            encoding.binary_vars.len(),
+            projected_binaries,
         )
+        || (compact_k16_mode
+            && !compact_tail_k16_encoding_within_caps(
+                encoding.problem.num_cols(),
+                projected_rows,
+                projected_binaries,
+            ))
     {
         eprintln!(
             "[imb] AY-TAIL-CERT declined after encode: cols={} encoded_rows={} \
@@ -1271,7 +5125,7 @@ fn imb_ay_tail_certificate_exact_result_impl(
             encoding.problem.num_cols(),
             encoding.problem.num_rows(),
             projected_rows,
-            encoding.binary_vars.len(),
+            projected_binaries,
             encoding.input_vars.len(),
             encoding.output_vars.len()
         );
@@ -1282,7 +5136,9 @@ fn imb_ay_tail_certificate_exact_result_impl(
         .rows()
         .iter()
         .try_fold(0usize, |total, row| total.checked_add(row.coeffs.len()))?;
-    if actual_nnz > IMB_AY_TAIL_MAX_NNZ {
+    if actual_nnz > IMB_AY_TAIL_MAX_NNZ
+        || (compact_k16_mode && actual_nnz > COMPACT_TAIL_K16_MAX_NNZ)
+    {
         return None;
     }
 
@@ -1309,34 +5165,189 @@ fn imb_ay_tail_certificate_exact_result_impl(
         return None;
     }
     let proof_nnz = actual_nnz.checked_add(terms.len())?;
-    if proof_nnz > IMB_AY_TAIL_MAX_NNZ {
+    if proof_nnz > IMB_AY_TAIL_MAX_NNZ || (compact_k16_mode && proof_nnz > COMPACT_TAIL_K16_MAX_NNZ)
+    {
         eprintln!(
             "[imb] AY-TAIL-CERT declined before proof: encoded+decision nnz \
              {proof_nnz} > {IMB_AY_TAIL_MAX_NNZ}"
         );
         return None;
     }
+    let compact_fixed_tree_splits = if compact_k16_mode {
+        let splits = compact_tail_k16_fixed_tree_splits(&encoding)?;
+        eprintln!(
+            "[imb] AY-TAIL-CERT compact K16 executor admitted: seam={} root_inputs={} \
+             supports={} selector_keys={:?} selector_cols={splits:?}",
+            AY_TAIL_COMPACT_K16_SEAM_ELEMENTS,
+            AY_TAIL_COMPACT_K16_INPUTS,
+            AY_TAIL_COMPACT_K16_SUPPORTS,
+            COMPACT_TAIL_K16_FIXED_SELECTOR_NEURONS,
+        );
+        Some(splits)
+    } else {
+        None
+    };
 
-    let remaining = deadline
-        .checked_duration_since(Instant::now())?
-        .as_secs_f64()
-        - IMB_AY_TAIL_DEADLINE_RESERVE_SECS;
-    let total = remaining.min(IMB_AY_TAIL_SOLVE_CAP_SECS);
-    if !total.is_finite() || total < IMB_AY_TAIL_MIN_SOLVE_SECS {
-        return None;
-    }
     let proof_t0 = Instant::now();
-    let proof_result = if let Some(lower) = requested_lower {
-        certify_linear_lower_bound_at_with_ay_admission(
+    let solve_cap_secs = if compact_k16_mode {
+        COMPACT_TAIL_K16_SOLVE_CAP_SECS
+    } else if region_selector_cols.is_some() {
+        IMB_AY_TAIL_REGION_SELECTOR_SOLVE_CAP_SECS
+    } else {
+        IMB_AY_TAIL_SOLVE_CAP_SECS
+    };
+    let mut total = imb_ay_tail_solve_budget_secs(deadline, solve_cap_secs)?;
+    let adaptive_five_comb_requested = !compact_k16_mode
+        && region_selector_cols.is_none()
+        && requested_lower.is_some()
+        && imb_ay_tail_adaptive_five_comb_enabled();
+    let adaptive_five_comb_candidates = if adaptive_five_comb_requested {
+        match imb_ay_tail_adaptive_five_comb_candidates(
+            &encoding.problem,
+            &terms,
+            &encoding.binary_vars,
+        ) {
+            Some(candidates) => {
+                eprintln!(
+                    "[imb] AY-TAIL-CERT authority route selected: \
+                         adaptive-five-comb-fsb candidates={} candidate_cols={candidates:?} \
+                         root_rank={} root_hard={} range_logical=1",
+                    candidates.len(),
+                    IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_RANK,
+                    u8::from(IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_HARD_VALUE),
+                );
+                Some(candidates)
+            }
+            None => {
+                eprintln!(
+                    "[imb] AY-TAIL-CERT authority route retained: standard-decision \
+                         reason=adaptive-five-comb-candidate-decline binaries={}",
+                    encoding.binary_vars.len(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if adaptive_five_comb_requested {
+        let Some(refreshed_total) = imb_ay_tail_solve_budget_secs(deadline, solve_cap_secs) else {
+            eprintln!(
+                "[imb] AY-TAIL-CERT proof declined after adaptive-five-comb ranking: \
+                 elapsed={:.3}s remaining below {:.3}s minimum",
+                proof_t0.elapsed().as_secs_f64(),
+                IMB_AY_TAIL_MIN_SOLVE_SECS,
+            );
+            return None;
+        };
+        total = refreshed_total;
+    }
+    let proof_result = if let Some(splits) = compact_fixed_tree_splits {
+        let lower = requested_lower?;
+        eprintln!(
+            "[imb] AY-TAIL-CERT authority route selected: \
+             compact-k16-fixed-tree-progressive splits={splits:?} leaves={} \
+             root_probe_ms=50 prefix_probe_ms=25",
+            COMPACT_TAIL_K16_TREE_LEAVES,
+        );
+        certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_compact_progressive_admission(
             &encoding.problem,
             &terms,
             lower,
+            &splits,
             CertifiedLinearLowerDecisionConfig {
                 proof_timeout_secs: total,
-                max_tree_leaves: CERTIFIED_LINEAR_LOWER_HARD_MAX_TREE_LEAVES,
+                max_tree_leaves: COMPACT_TAIL_K16_TREE_LEAVES,
             },
             worker_admission,
         )
+    } else if let Some(selectors) = region_selector_cols {
+        let solve_policy = imb_ay_tail_selector_solve_policy();
+        if solve_policy == ImbAyTailSelectorSolvePolicy::Conflict {
+            eprintln!(
+                "[imb] AY-TAIL-CERT proof declined: conflicting exact selector solve gates \
+                 NY_IMB_SELECTOR_RANGE_CRASH=1 and NY_IMB_SELECTOR_SOLVE_PROFILE=1"
+            );
+            return None;
+        }
+        let lower = requested_lower?;
+        let splits = region_selector_fixed_tree_splits(selectors);
+        let range_logical_crash = solve_policy != ImbAyTailSelectorSolvePolicy::Default;
+        let selector_solve_profile = solve_policy == ImbAyTailSelectorSolvePolicy::SolveProfile;
+        let chain_distress_probe_iters = selector_solve_profile
+            .then_some(CERTIFIED_LINEAR_LOWER_SELECTOR_CHAIN_DISTRESS_PROBE_ITERS);
+        eprintln!(
+            "[imb] AY-TAIL-CERT authority route selected: \
+             fixed-region-selector-tree splits={splits:?} leaves={} range_logical={} \
+             selector_solve_profile={} chain_distress_probe_iters={chain_distress_probe_iters:?}",
+            AY_TAIL_REGION_SELECTOR_REGIONS,
+            u8::from(range_logical_crash),
+            u8::from(selector_solve_profile),
+        );
+        let config = CertifiedLinearLowerDecisionConfig {
+            proof_timeout_secs: total,
+            max_tree_leaves: AY_TAIL_REGION_SELECTOR_REGIONS,
+        };
+        match solve_policy {
+            ImbAyTailSelectorSolvePolicy::Default => {
+                certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_admission(
+                    &encoding.problem,
+                    &terms,
+                    lower,
+                    &splits,
+                    config,
+                    worker_admission,
+                )
+            }
+            ImbAyTailSelectorSolvePolicy::RangeLogical => {
+                certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_range_logical_admission(
+                    &encoding.problem,
+                    &terms,
+                    lower,
+                    &splits,
+                    config,
+                    worker_admission,
+                )
+            }
+            ImbAyTailSelectorSolvePolicy::SolveProfile => {
+                certify_linear_lower_bound_at_with_ay_fixed_assignment_tree_selector_solve_profile_admission(
+                    &encoding.problem,
+                    &terms,
+                    lower,
+                    &splits,
+                    config,
+                    worker_admission,
+                )
+            }
+            ImbAyTailSelectorSolvePolicy::Conflict => unreachable!(
+                "conflicting selector solve gates return before proof construction"
+            ),
+        }
+    } else if let Some(lower) = requested_lower {
+        let config = CertifiedLinearLowerDecisionConfig {
+            proof_timeout_secs: total,
+            max_tree_leaves: CERTIFIED_LINEAR_LOWER_HARD_MAX_TREE_LEAVES,
+        };
+        if let Some(candidates) = adaptive_five_comb_candidates.as_deref() {
+            certify_linear_lower_bound_at_with_ay_adaptive_five_leaf_comb_target_fsb_admission(
+                &encoding.problem,
+                &terms,
+                lower,
+                candidates,
+                IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_RANK,
+                IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_HARD_VALUE,
+                config,
+                worker_admission,
+            )
+        } else {
+            certify_linear_lower_bound_at_with_ay_admission(
+                &encoding.problem,
+                &terms,
+                lower,
+                config,
+                worker_admission,
+            )
+        }
     } else {
         if total < 2.0 * IMB_AY_TAIL_MIN_SOLVE_SECS {
             return None;
@@ -1375,6 +5386,19 @@ fn imb_ay_tail_certificate_exact_result_impl(
             return None;
         }
     };
+    if compact_k16_mode
+        && !compact_tail_k16_replay_is_complete(
+            certified.ay_tree_leaves,
+            certified.ny_cert_farkas_replays,
+        )
+    {
+        eprintln!(
+            "[imb] AY-TAIL-CERT compact K16 proof declined: complete 16-leaf replay required, \
+             got tree_leaves={} ny_cert_replays={}",
+            certified.ay_tree_leaves, certified.ny_cert_farkas_replays,
+        );
+        return None;
+    }
     if Instant::now() >= deadline {
         return None;
     }
@@ -1385,7 +5409,7 @@ fn imb_ay_tail_certificate_exact_result_impl(
         encoding.problem.num_cols(),
         encoding.problem.num_rows(),
         proof_nnz,
-        encoding.binary_vars.len(),
+        projected_binaries,
         requested_lower.is_some(),
         certified.lower,
         proof_t0.elapsed().as_secs_f64(),
@@ -1487,7 +5511,53 @@ fn ay_margin_reframe_enabled() -> bool {
     ay_margin_reframe_enabled_from_value(std::env::var("NY_AY_MARGIN_REFRAME").ok().as_deref())
 }
 
+const AY_NODE_WARM_CAP_MAX_MILLIS: u64 = 60_000;
+
+/// Parse NY's typed AY warm-node ceiling for one exact neural Graph-MIP.
+///
+/// The three aligned binary metadata arrays are the neural-shape authority.
+/// Hand-built MILPs, fully phase-enumerated LPs, and malformed encodings do
+/// not carry this exact non-empty alignment and cannot arm the policy.
+/// Measurement syntax and runtime syntax are the same exact unsigned
+/// integer milliseconds; invalid, zero, and oversized values preserve the
+/// historical uncapped behavior.
+fn ay_node_warm_time_limit_from_value(
+    value: Option<&str>,
+    binary_keys_len: usize,
+    binary_vars_len: usize,
+    binary_widths_len: usize,
+) -> Option<Duration> {
+    if binary_vars_len == 0
+        || binary_keys_len != binary_vars_len
+        || binary_widths_len != binary_vars_len
+    {
+        return None;
+    }
+    let raw = value?;
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let millis = raw.parse::<u64>().ok()?;
+    (1..=AY_NODE_WARM_CAP_MAX_MILLIS)
+        .contains(&millis)
+        .then(|| Duration::from_millis(millis))
+}
+
 impl GraphMipEncoding {
+    /// Resolve the launch-time canary while exact neural metadata is present.
+    ///
+    /// Callers do this before consuming or folding the encoding. Folding may
+    /// discard the identity arrays, but a policy admitted by the pre-fold
+    /// neural shape remains valid for that exact restricted model.
+    pub(crate) fn ay_node_warm_time_limit(&self) -> Option<Duration> {
+        ay_node_warm_time_limit_from_value(
+            std::env::var("NY_AY_NODE_WARM_CAP_MS").ok().as_deref(),
+            self.binary_keys.len(),
+            self.binary_vars.len(),
+            self.binary_widths.len(),
+        )
+    }
+
     /// Convert into [`ny_mip::MipParts`] — the same shape `MipEncoder::into_parts`
     /// produces — so `MipSolver`'s phase-split racing / warm-start / certificate
     /// machinery (`check_feasibility_with_warm_start`) is REUSED, not rebuilt.
@@ -1630,6 +5700,51 @@ pub(crate) fn encode_graph_with_deadline(
     encode_graph_with_delta_and_deadline(graph, input_bounds, node_bounds, DELTA, deadline)
 }
 
+/// Encode exactly the ancestor closure of one declared-scalar graph node.
+///
+/// This is a dormant, target-aware preparation surface for the nn4sys
+/// dual-Sigmoid reduction. In particular, a caller may request the recognized
+/// B-arm logit without asking the exact Graph-MIP encoder to lower the
+/// non-ancestor A arm, either Sigmoid, or the final Sub. Merely constructing
+/// this encoding grants no proof authority and does not alter any ordinary
+/// Graph-MIP route.
+///
+/// The target must name an existing graph node whose declared output shape has
+/// exactly one element. The retained graph is the target's complete ancestor
+/// closure in the graph's canonical topological execution order. Missing
+/// retained edges, cycles, a stale/inconsistent topology, unsupported retained
+/// layers, malformed shapes, non-finite supplied bounds/coefficients, and
+/// deadline expiry all return `Err` before this result can be consumed.
+///
+/// [`encode_graph_with_deadline`] remains on the historical whole-graph path:
+/// this function is a separate explicit entry point and has no environment,
+/// preset, routing, solver, or verdict integration.
+pub(crate) fn encode_graph_to_scalar_target_with_deadline(
+    graph: &GraphNetwork,
+    input_bounds: &[Bound],
+    node_bounds: &HashMap<String, Vec<Bound>>,
+    target: &str,
+    deadline: Option<Instant>,
+) -> Result<GraphMipEncoding> {
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        bail!(
+            "target graph MIP encode deadline expired before planning target '{target}' \
+             (degrading cleanly)"
+        );
+    }
+    let (encoding, peeled) = encode_graph_impl(
+        graph,
+        input_bounds,
+        node_bounds,
+        DELTA,
+        false,
+        deadline,
+        Some(target),
+    )?;
+    debug_assert!(!peeled, "target-aware encoding never peels Sigmoid");
+    Ok(encoding)
+}
+
 /// [`encode_graph`] with an explicit box-inflation `delta`.
 ///
 /// # Arguments
@@ -1677,8 +5792,15 @@ fn encode_graph_with_delta_and_deadline(
     delta: f64,
     deadline: Option<Instant>,
 ) -> Result<GraphMipEncoding> {
-    let (encoding, peeled) =
-        encode_graph_impl(graph, input_bounds, node_bounds, delta, false, deadline)?;
+    let (encoding, peeled) = encode_graph_impl(
+        graph,
+        input_bounds,
+        node_bounds,
+        delta,
+        false,
+        deadline,
+        None,
+    )?;
     debug_assert!(!peeled, "peel disabled");
     Ok(encoding)
 }
@@ -1703,11 +5825,12 @@ pub(crate) fn encode_graph_peel_final_sigmoid(
     input_bounds: &[Bound],
     node_bounds: &HashMap<String, Vec<Bound>>,
 ) -> Result<(GraphMipEncoding, bool)> {
-    encode_graph_impl(graph, input_bounds, node_bounds, DELTA, true, None)
+    encode_graph_impl(graph, input_bounds, node_bounds, DELTA, true, None, None)
 }
 
 /// Shared implementation behind [`encode_graph_with_delta_and_deadline`]
-/// (peel = false) and [`encode_graph_peel_final_sigmoid`] (peel = true).
+/// (peel = false), [`encode_graph_peel_final_sigmoid`] (peel = true), and the
+/// explicit scalar-target preparation surface.
 /// Returns the encoding and whether a final Sigmoid was peeled. The optional
 /// `deadline` is checked once per node in the DAG walk (see
 /// [`encode_graph_with_deadline`]).
@@ -1718,9 +5841,19 @@ fn encode_graph_impl(
     delta: f64,
     peel_final_sigmoid: bool,
     deadline: Option<Instant>,
+    scalar_target: Option<&str>,
 ) -> Result<(GraphMipEncoding, bool)> {
     if !delta.is_finite() || delta < 0.0 {
         bail!("encode_graph: delta must be finite and non-negative, got {delta}");
+    }
+    if peel_final_sigmoid && scalar_target.is_some() {
+        bail!("encode_graph: final-Sigmoid peel and scalar target are mutually exclusive");
+    }
+    let retained = scalar_target
+        .map(|target| scalar_target_ancestor_closure(graph, target, deadline))
+        .transpose()?;
+    if scalar_target.is_some() {
+        validate_scalar_target_supplied_bounds(input_bounds, node_bounds, retained.as_ref())?;
     }
     let node_pre_activation_bounds = node_bounds;
     let mut problem = MilpProblem::new();
@@ -1781,6 +5914,12 @@ fn encode_graph_impl(
     };
 
     for name in exec_order {
+        if retained
+            .as_ref()
+            .is_some_and(|retained| !retained.contains(name))
+        {
+            continue;
+        }
         // Deadline check per node: the conv im2col unfolds dominate the encode
         // cost, so one check per node bounds the overrun to a single unfold.
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -2046,27 +6185,315 @@ fn encode_graph_impl(
 
     // The peeled final Sigmoid re-targets the encoding's output to its INPUT
     // node (the logit); otherwise the graph output is used unchanged.
-    let output_name = match &peeled_sigmoid {
-        Some((_, logit_name)) => logit_name.as_str(),
-        None => graph.output_name(),
+    let output_name = match (scalar_target, &peeled_sigmoid) {
+        (Some(target), None) => target,
+        (None, Some((_, logit_name))) => logit_name.as_str(),
+        (None, None) => graph.output_name(),
+        (Some(_), Some(_)) => unreachable!("mutually exclusive above"),
     };
     let output_vars = cols_of
         .get(output_name)
         .ok_or_else(|| anyhow!("output node '{output_name}' produced no columns"))?
         .clone();
 
-    Ok((
-        GraphMipEncoding {
-            problem,
-            input_vars,
-            output_vars,
-            binary_vars,
-            binary_widths,
-            binary_keys,
-            node_cols: cols_of,
-        },
-        peeled_sigmoid.is_some(),
-    ))
+    let encoding = GraphMipEncoding {
+        problem,
+        input_vars,
+        output_vars,
+        binary_vars,
+        binary_widths,
+        binary_keys,
+        node_cols: cols_of,
+    };
+    if let (Some(target), Some(retained)) = (scalar_target, retained.as_ref()) {
+        validate_scalar_target_encoding(graph, target, retained, &encoding, deadline)?;
+    }
+
+    Ok((encoding, peeled_sigmoid.is_some()))
+}
+
+/// Compute and validate the exact ancestor closure of a scalar target.
+///
+/// The recursive walk detects cycles and dangling RETAINED edges directly.
+/// The result is then checked against `GraphNetwork::exec_order`: filtering the
+/// canonical order by this set must put every retained parent before its
+/// consumer and the target last. This second check prevents a stale or
+/// otherwise inconsistent topology cache from silently changing column
+/// wiring.
+fn scalar_target_ancestor_closure(
+    graph: &GraphNetwork,
+    target: &str,
+    deadline: Option<Instant>,
+) -> Result<TargetNodeSet<String>> {
+    if target == NETWORK_INPUT {
+        bail!("target graph MIP: NETWORK_INPUT is not an encodable graph-node target");
+    }
+    let target_node = graph
+        .node(target)
+        .ok_or_else(|| anyhow!("target graph MIP: requested target node '{target}' is missing"))?;
+    let target_shape = graph.declared_shape(target).ok_or_else(|| {
+        anyhow!("target graph MIP: target '{target}' has no declared output shape (fail closed)")
+    })?;
+    let target_elements = checked_product(target_shape).ok_or_else(|| {
+        anyhow!(
+            "target graph MIP: target '{target}' declared shape {target_shape:?} overflows \
+             (fail closed)"
+        )
+    })?;
+    if target_elements != 1 {
+        bail!(
+            "target graph MIP: target '{target}' declared shape {target_shape:?} has \
+             {target_elements} elements, expected exactly one"
+        );
+    }
+    if target_node.name() != target {
+        bail!(
+            "target graph MIP: lookup key '{target}' returned mismatched node name '{}' \
+             (fail closed)",
+            target_node.name()
+        );
+    }
+
+    fn visit(
+        graph: &GraphNetwork,
+        name: &str,
+        target: &str,
+        deadline: Option<Instant>,
+        visiting: &mut TargetNodeSet<String>,
+        retained: &mut TargetNodeSet<String>,
+    ) -> Result<()> {
+        if retained.contains(name) {
+            return Ok(());
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            bail!(
+                "target graph MIP encode deadline expired while planning target '{target}' \
+                 at retained node '{name}'"
+            );
+        }
+        if !visiting.insert(name.to_string()) {
+            bail!("target graph MIP: cycle detected in retained ancestor closure at node '{name}'");
+        }
+        let node = graph.node(name).ok_or_else(|| {
+            anyhow!(
+                "target graph MIP: dangling retained edge references missing node '{name}' \
+                 while planning target '{target}'"
+            )
+        })?;
+        if node.name() != name {
+            bail!(
+                "target graph MIP: retained lookup key '{name}' returned mismatched node name \
+                 '{}' (fail closed)",
+                node.name()
+            );
+        }
+        for input in node.inputs() {
+            if input != NETWORK_INPUT {
+                visit(graph, input, target, deadline, visiting, retained)?;
+            }
+        }
+        if !visiting.remove(name) {
+            bail!("target graph MIP: internal retained-cycle state mismatch at node '{name}'");
+        }
+        retained.insert(name.to_string());
+        Ok(())
+    }
+
+    let mut retained = TargetNodeSet::new();
+    visit(
+        graph,
+        target,
+        target,
+        deadline,
+        &mut TargetNodeSet::new(),
+        &mut retained,
+    )?;
+
+    let exec_order = graph
+        .exec_order()
+        .map_err(|e| anyhow!("target graph MIP canonical exec_order failed: {e}"))?;
+    let mut seen = TargetNodeSet::with_capacity(retained.len());
+    let mut retained_in_order = 0usize;
+    let mut last_retained: Option<&str> = None;
+    for name in exec_order {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            bail!(
+                "target graph MIP encode deadline expired while validating canonical topology \
+                 for target '{target}'"
+            );
+        }
+        if !retained.contains(name) {
+            continue;
+        }
+        let node = graph.node(name).ok_or_else(|| {
+            anyhow!("target graph MIP: canonical exec_order references missing node '{name}'")
+        })?;
+        for input in node.inputs() {
+            if input != NETWORK_INPUT && (!retained.contains(input) || !seen.contains(input)) {
+                bail!(
+                    "target graph MIP: topology mismatch on retained edge '{input}' -> \
+                     '{name}' (parent absent or not ordered first)"
+                );
+            }
+        }
+        if !seen.insert(name.clone()) {
+            bail!("target graph MIP: duplicate retained node '{name}' in canonical exec_order");
+        }
+        retained_in_order += 1;
+        last_retained = Some(name);
+    }
+    if retained_in_order != retained.len() {
+        bail!(
+            "target graph MIP: canonical exec_order contains {retained_in_order} of {} retained \
+             nodes (topology mismatch)",
+            retained.len()
+        );
+    }
+    if last_retained != Some(target) {
+        bail!(
+            "target graph MIP: retained canonical order ends at {:?}, not target '{target}' \
+             (topology mismatch)",
+            last_retained
+        );
+    }
+    Ok(retained)
+}
+
+/// Target-only strict validation of caller-supplied numerical boxes.
+///
+/// Ordinary Graph-MIP deliberately keeps its historical handling unchanged.
+/// This dormant authority-preparation surface instead refuses every non-finite
+/// input endpoint and every non-finite box attached to a retained node.
+fn validate_scalar_target_supplied_bounds(
+    input_bounds: &[Bound],
+    node_bounds: &HashMap<String, Vec<Bound>>,
+    retained: Option<&TargetNodeSet<String>>,
+) -> Result<()> {
+    for (index, bound) in input_bounds.iter().enumerate() {
+        if !bound.lower().is_finite() || !bound.upper().is_finite() {
+            bail!(
+                "target graph MIP: input bound {index} is non-finite [{}, {}] (fail closed)",
+                bound.lower(),
+                bound.upper()
+            );
+        }
+    }
+    let retained =
+        retained.ok_or_else(|| anyhow!("target graph MIP: retained closure missing internally"))?;
+    for name in retained {
+        let Some(bounds) = node_bounds.get(name) else {
+            continue;
+        };
+        for (index, bound) in bounds.iter().enumerate() {
+            if !bound.lower().is_finite() || !bound.upper().is_finite() {
+                bail!(
+                    "target graph MIP: retained node '{name}' bound {index} is non-finite \
+                     [{}, {}] (fail closed)",
+                    bound.lower(),
+                    bound.upper()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Final target-only structural and numerical audit of the emitted encoding.
+fn validate_scalar_target_encoding(
+    graph: &GraphNetwork,
+    target: &str,
+    retained: &TargetNodeSet<String>,
+    encoding: &GraphMipEncoding,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        bail!(
+            "target graph MIP encode deadline expired after encoding target '{target}' \
+             (degrading cleanly)"
+        );
+    }
+    if encoding.output_vars.len() != 1 {
+        bail!(
+            "target graph MIP: target '{target}' produced {} columns despite its declared \
+             scalar shape (shape mismatch; fail closed)",
+            encoding.output_vars.len()
+        );
+    }
+    if encoding.node_cols.len() != retained.len() + 1
+        || !encoding.node_cols.contains_key(NETWORK_INPUT)
+    {
+        bail!(
+            "target graph MIP: encoded node set does not exactly equal retained closure + input \
+            (fail closed)"
+        );
+    }
+    if let Some(shape) = graph.declared_shape(NETWORK_INPUT) {
+        let elements = checked_product(shape).ok_or_else(|| {
+            anyhow!("target graph MIP: input declared shape {shape:?} overflows (fail closed)")
+        })?;
+        if elements != encoding.input_vars.len() {
+            bail!(
+                "target graph MIP: input declared shape {shape:?} has {elements} elements but \
+                 encoding has {} input columns (fail closed)",
+                encoding.input_vars.len()
+            );
+        }
+    }
+    for name in retained {
+        let cols = encoding.node_cols.get(name).ok_or_else(|| {
+            anyhow!("target graph MIP: retained node '{name}' produced no columns")
+        })?;
+        if let Some(shape) = graph.declared_shape(name) {
+            let elements = checked_product(shape).ok_or_else(|| {
+                anyhow!(
+                    "target graph MIP: retained node '{name}' declared shape {shape:?} \
+                     overflows (fail closed)"
+                )
+            })?;
+            if elements != cols.len() {
+                bail!(
+                    "target graph MIP: retained node '{name}' declared shape {shape:?} has \
+                     {elements} elements but encoding produced {} columns (fail closed)",
+                    cols.len()
+                );
+            }
+        }
+    }
+    for (index, col) in encoding.problem.cols().iter().enumerate() {
+        if !col.obj.is_finite()
+            || col.lb.is_nan()
+            || col.ub.is_nan()
+            || col.lb == f64::INFINITY
+            || col.ub == f64::NEG_INFINITY
+            || col.lb > col.ub
+        {
+            bail!(
+                "target graph MIP: malformed/non-finite column {index}: obj={} bounds=[{}, {}] \
+                 (fail closed)",
+                col.obj,
+                col.lb,
+                col.ub
+            );
+        }
+    }
+    for (index, row) in encoding.problem.rows().iter().enumerate() {
+        if row.lb.is_nan()
+            || row.ub.is_nan()
+            || row.lb == f64::INFINITY
+            || row.ub == f64::NEG_INFINITY
+            || row.lb > row.ub
+            || (!row.lb.is_finite() && !row.ub.is_finite())
+            || row.coeffs.iter().any(|(_, coeff)| !coeff.is_finite())
+        {
+            bail!(
+                "target graph MIP: malformed/non-finite row {index}: bounds=[{}, {}] \
+                 (fail closed)",
+                row.lb,
+                row.ub
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the single input node of a chain node to its (owned) output columns.
@@ -2193,7 +6620,7 @@ fn encode_linear_node(
     }
     let batch_rows = in_cols.len() / in_features;
     check_box_len(node_box, batch_rows * out_features, node_name)?;
-    let weight = &lin.weight; // Array2<f32>, shape [out_features, in_features]
+    let weight = lin.weight(); // Array2<f32>, shape [out_features, in_features]
 
     let mut out_cols = Vec::with_capacity(batch_rows * out_features);
     for r in 0..batch_rows {
@@ -2214,7 +6641,7 @@ fn encode_linear_node(
             coeffs.push((y, -1.0));
 
             // Equality: sum(W_ij x_j) - y_i = -b_i. Absent bias => b_i = 0.
-            let neg_b = match &lin.bias {
+            let neg_b = match lin.bias() {
                 Some(b) => -(b[i] as f64),
                 None => 0.0,
             };
@@ -2333,35 +6760,21 @@ fn unfold_conv_node(
     }
 }
 
-/// Encode a BatchNorm node as an EXACT per-channel affine (increment 2).
+/// Encode a BatchNorm node as a certified per-channel affine band (increment 2).
 ///
 /// At inference BatchNorm is `y_c = a_c·x_c + b_c` where the layer already bakes
 /// `a_c = γ_c/√(σ²_c+ε)` into [`BatchNormLayer::scale`] and
 /// `b_c = β_c − γ_c·μ_c/√(σ²_c+ε)` into [`BatchNormLayer::bias`] (both per
-/// channel). We emit ONE free output column and ONE equality row per element:
-/// `out_i − a_c·in_i = b_c`, i.e. `add_row(b_c, b_c, [(out_i, 1.0), (in_i, -a_c)])`.
+/// channel). For input bounds `[l_i,u_i]`, the layer's certified coefficient
+/// errors imply
+/// `|y_i - (a_c·x_i+b_c)| <= scale_err[c]·max(|l_i|,|u_i|)+bias_err[c]`.
+/// We therefore emit one free output column and one range row per element.
 ///
-/// This is standalone (not folded into an adjacent Linear/Conv) — an affine
-/// equality is already exact, and folding is a future zero-column optimization,
-/// not a soundness requirement. Using the baked f32 `scale`/`bias` (cast to f64)
-/// as exact rational coefficients is the SAME posture as `encode_linear_node`
-/// (which uses the f32 `weight`/`bias` as exact coefficients): the f32-folded
-/// affine IS the layer ny evaluates at inference.
-///
-/// SOUNDNESS (increment 4 — the fail-closed `scale_err`/`bias_err` gate is
-/// REMOVED). `scale`/`bias` are ny's f32-ROUNDED folded coefficients; the layer
-/// carries per-channel certified `scale_err`/`bias_err` bounding the gap to the
-/// pre-fold REAL affine. An exact equality row `out = scale·in + bias` alone
-/// could be TIGHTER than the real net by up to `scale_err·|in| + bias_err` per
-/// element (a false-UNSAT risk). That gap is now absorbed by the DELTA box
-/// inflation applied to EVERY downstream intermediate box (module header
-/// §"DELTA box inflation"; emit_hard_six.py measured the fold-inclusive f32↔f64
-/// gap ≤ 1.1e-5 < DELTA = 1e-4 and folds Conv+BN into the block affine under the
-/// same posture). Concretely: the inflated feasible set of this BN's consumers
-/// ⊇ the real reachable set, so an ay `unsat` still certifies the subdomain. We
-/// therefore keep the EXACT equality row and rely on the caller's inflated boxes,
-/// rather than fail-closing on nonzero fold error. (A `±inf` scale from a
-/// degenerate var+ε→0 channel is still refused — it would poison the row.)
+/// This is standalone (not folded into an adjacent Linear/Conv). When both
+/// error terms are zero, the row remains the historical exact equality. Every
+/// error calculation and row endpoint is rounded outward in f64. A malformed
+/// coefficient/error budget fails closed instead of emitting a potentially
+/// tighter row. A `±inf` scale from a degenerate channel is likewise refused.
 ///
 /// Channel mapping: columns are the tensor flattened row-major with the channel
 /// as the slowest-varying axis after a batch of 1 (`[C, spatial…]` → flat index
@@ -2394,24 +6807,30 @@ fn encode_batchnorm_node(
     // Row-major flatten of the per-channel affine coefficients (channel order).
     let scale: Vec<f32> = bn.scale.iter().copied().collect();
     let bias: Vec<f32> = bn.bias.iter().copied().collect();
-    if scale.len() != num_channels || bias.len() != num_channels {
+    let scale_err: Vec<f32> = bn.scale_err.iter().copied().collect();
+    let bias_err: Vec<f32> = bn.bias_err.iter().copied().collect();
+    if scale.len() != num_channels
+        || bias.len() != num_channels
+        || scale_err.len() != num_channels
+        || bias_err.len() != num_channels
+    {
         bail!(
-            "BatchNorm node '{node_name}': scale/bias length ({}, {}) != num_channels {num_channels}",
+            "BatchNorm node '{node_name}': scale/bias/error lengths ({}, {}, {}, {}) != \
+             num_channels {num_channels}",
             scale.len(),
-            bias.len()
+            bias.len(),
+            scale_err.len(),
+            bias_err.len()
         );
     }
-
-    // NOTE: the former fail-closed `scale_err`/`bias_err` gate is REMOVED
-    // (increment 4). The f32-fold error is now absorbed by the DELTA box
-    // inflation on every downstream intermediate box (see the fn-level SOUNDNESS
-    // doc and the module header). We keep the EXACT f32-folded equality row.
 
     let mut out_cols = Vec::with_capacity(n);
     for (i, &x) in in_cols.iter().enumerate() {
         let c = i / elements_per_channel; // channel of flat position i (batch = 1).
         let a_c = scale[c] as f64;
         let b_c = bias[c] as f64;
+        let se_c = scale_err[c] as f64;
+        let be_c = bias_err[c] as f64;
         // A non-finite coefficient (degenerate var+eps→0 channel → ±inf scale)
         // would poison the row / solver; fail closed rather than emit garbage.
         if !a_c.is_finite() || !b_c.is_finite() {
@@ -2420,12 +6839,37 @@ fn encode_batchnorm_node(
                  (scale={a_c}, bias={b_c})"
             );
         }
+        if !se_c.is_finite() || se_c < 0.0 || !be_c.is_finite() || be_c < 0.0 {
+            bail!(
+                "BatchNorm node '{node_name}' channel {c}: invalid affine error budget \
+                 (scale_err={se_c}, bias_err={be_c})"
+            );
+        }
         // Output column: free (±inf) unless the caller pinned this node's
         // DELTA-inflated intermediate box.
         let (lo, hi) = out_col_bounds(node_box, i, delta);
         let y = problem.add_col(0.0, lo, hi);
-        // Exact affine equality: out_i − a_c·in_i = b_c.
-        problem.add_row(b_c, b_c, [(y, 1.0), (x, -a_c)]);
+        let x_spec = &problem.cols()[x.0];
+        let x_magnitude = x_spec.lb.abs().max(x_spec.ub.abs());
+        let scale_widen = if se_c == 0.0 {
+            // Avoid `0 * infinity = NaN` for an unbounded input column.
+            0.0
+        } else {
+            (se_c * x_magnitude).next_up()
+        };
+        let widen = if scale_widen == 0.0 && be_c == 0.0 {
+            0.0
+        } else {
+            (scale_widen + be_c).next_up()
+        };
+        let (row_lo, row_hi) = if widen == 0.0 {
+            // Preserve exact/byte-identical rows for precomputed coefficients
+            // whose constructors certify zero fold error.
+            (b_c, b_c)
+        } else {
+            ((b_c - widen).next_down(), (b_c + widen).next_up())
+        };
+        problem.add_row(row_lo, row_hi, [(y, 1.0), (x, -a_c)]);
         out_cols.push(y);
     }
     Ok(out_cols)
@@ -3382,6 +7826,97 @@ fn encode_div_node(
 
 // ── increment 5: final-Sigmoid threshold rewrite ────────────────────────────
 
+/// The exact scalar output shape recognized by the first dual-Sigmoid slice:
+///
+/// ```text
+/// y = sigmoid(z_a) - sigmoid(z_b)
+/// ```
+///
+/// This is deliberately only structural metadata. Merely recognizing the
+/// topology does NOT authorize a proof: a future Graph-MIP caller must still
+/// prove that the A-arm sigmoid output is constant on the clause box, encode
+/// the B logit exactly, and replay the resulting solver certificate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DualSigmoidOutput {
+    pub output: String,
+    pub sigmoid_a: String,
+    pub logit_a: String,
+    pub sigmoid_b: String,
+    pub logit_b: String,
+}
+
+/// Return whether `name` has a declared scalar shape (any rank, exactly one
+/// element). Missing shapes and overflowing products decline the recognizer:
+/// the rewrite must never guess which vector coordinate a scalar VNN-LIB
+/// constraint refers to.
+fn has_declared_scalar_shape(graph: &GraphNetwork, name: &str) -> bool {
+    graph.declared_shape(name).and_then(|shape| {
+        shape
+            .iter()
+            .try_fold(1usize, |size, &dim| size.checked_mul(dim))
+    }) == Some(1)
+}
+
+/// Recognize the exact scalar topology
+/// `Sub(Sigmoid(z_a), Sigmoid(z_b))` at the graph output.
+///
+/// `Ok(None)` means an ordinary precondition miss; existing verification paths
+/// must remain unchanged. Once the output is a candidate `Sub`, malformed
+/// arity or dangling graph edges are an `Err` so future callers cannot silently
+/// reinterpret a corrupt near-match. Every involved tensor must have a
+/// declared one-element shape.
+///
+/// No numerical or solver authority is granted by this helper.
+pub(crate) fn recognize_scalar_dual_sigmoid_output(
+    graph: &GraphNetwork,
+) -> Result<Option<DualSigmoidOutput>> {
+    let output = graph.output_name();
+    let output_node = graph
+        .node(output)
+        .ok_or_else(|| anyhow!("dual-Sigmoid recognizer: output node '{output}' is missing"))?;
+    if !matches!(output_node.layer(), Layer::Sub(_)) {
+        return Ok(None);
+    }
+    let (sigmoid_a, sigmoid_b) = output_node
+        .require_binary_inputs()
+        .map_err(|e| anyhow!("dual-Sigmoid output Sub '{output}' has invalid arity: {e}"))?;
+    let sigmoid_a_node = graph.node(sigmoid_a).ok_or_else(|| {
+        anyhow!("dual-Sigmoid output Sub '{output}' has missing A input '{sigmoid_a}'")
+    })?;
+    let sigmoid_b_node = graph.node(sigmoid_b).ok_or_else(|| {
+        anyhow!("dual-Sigmoid output Sub '{output}' has missing B input '{sigmoid_b}'")
+    })?;
+    if !matches!(sigmoid_a_node.layer(), Layer::Sigmoid(_))
+        || !matches!(sigmoid_b_node.layer(), Layer::Sigmoid(_))
+    {
+        return Ok(None);
+    }
+    let logit_a = sigmoid_a_node
+        .require_unary_input()
+        .map_err(|e| anyhow!("dual-Sigmoid A node '{sigmoid_a}' has invalid Sigmoid arity: {e}"))?;
+    let logit_b = sigmoid_b_node
+        .require_unary_input()
+        .map_err(|e| anyhow!("dual-Sigmoid B node '{sigmoid_b}' has invalid Sigmoid arity: {e}"))?;
+    for (role, name) in [("A logit", logit_a), ("B logit", logit_b)] {
+        if name != NETWORK_INPUT && graph.node(name).is_none() {
+            bail!("dual-Sigmoid recognizer: {role} node '{name}' is missing");
+        }
+    }
+    if [output, sigmoid_a, logit_a, sigmoid_b, logit_b]
+        .iter()
+        .any(|name| !has_declared_scalar_shape(graph, name))
+    {
+        return Ok(None);
+    }
+    Ok(Some(DualSigmoidOutput {
+        output: output.to_string(),
+        sigmoid_a: sigmoid_a.to_string(),
+        logit_a: logit_a.to_string(),
+        sigmoid_b: sigmoid_b.to_string(),
+        logit_b: logit_b.to_string(),
+    }))
+}
+
 /// A sigmoid-space output threshold transformed into logit space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum LogitThreshold {
@@ -3487,6 +8022,148 @@ pub(crate) fn logit_lower_threshold(t: f64) -> Result<LogitThreshold> {
     Ok(LogitThreshold::Bound(logit_enclosure(t).0))
 }
 
+/// Orientation of the linear constraint produced on the unpinned B logit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DualSigmoidLogitSense {
+    /// `z_b <= rhs`.
+    Upper,
+    /// `z_b >= rhs`.
+    Lower,
+}
+
+/// A sound constant-A rewrite result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DualSigmoidPinnedRewrite {
+    /// Add this one-sided row to the exact B-logit encoding. A future caller
+    /// must additionally weaken `rhs` by the graph encoder's z-space `DELTA`.
+    Bound {
+        sense: DualSigmoidLogitSense,
+        rhs: f64,
+    },
+    /// The transformed B constraint is true for every finite real logit, so it
+    /// may be dropped. Dropping only enlarges the feasible set.
+    Vacuous,
+}
+
+/// One full f32 output-scale ULP for the final `Sub`.
+///
+/// Both sigmoid outputs lie in `[0, 1]`, so their exact difference lies in
+/// `[-1, 1]`; correctly rounded f32 subtraction has absolute error at most
+/// half an ULP there. A full `f32::EPSILON` is therefore conservative.
+const DUAL_SIGMOID_F32_SUB_ERR: f64 = f32::EPSILON as f64;
+
+/// One correctly-rounded subtraction moved one f64 ULP toward `-∞`.
+fn sub_down_f64(a: f64, b: f64) -> Result<f64> {
+    let value = a - b;
+    if value.is_nan() {
+        bail!("directed subtraction produced NaN from {a} - {b}");
+    }
+    Ok(value.next_down())
+}
+
+/// One correctly-rounded subtraction moved one f64 ULP toward `+∞`.
+fn sub_up_f64(a: f64, b: f64) -> Result<f64> {
+    let value = a - b;
+    if value.is_nan() {
+        bail!("directed subtraction produced NaN from {a} - {b}");
+    }
+    Ok(value.next_up())
+}
+
+/// One correctly-rounded addition moved one f64 ULP toward `+∞`.
+fn add_up_f64(a: f64, b: f64) -> Result<f64> {
+    let value = a + b;
+    if value.is_nan() {
+        bail!("directed addition produced NaN from {a} + {b}");
+    }
+    Ok(value.next_up())
+}
+
+/// Rewrite one scalar output constraint on
+/// `y = sigmoid(z_a) - sigmoid(z_b)` when the scored A-arm sigmoid output has
+/// the certified constant enclosure `a` and `b_sigmoid` is an exact,
+/// backend-qualified scored-f32 preimage evaluator.
+///
+/// The algebra and weakening directions are:
+///
+/// * `y <= t` implies `sigmoid_f32(z_b) >= a.lower - t - ε_sub`; after the
+///   final-Sub allowance, the proof-bearing scored preimage gives a LOWER row
+///   on `z_b` directly.
+/// * `y >= t` implies `sigmoid_f32(z_b) <= a.upper - t + ε_sub`; its scored
+///   preimage gives an UPPER row directly.
+///
+/// There is no empirical Sigmoid error constant and no second inverse-logit:
+/// the preimage search operates over exact scored binary32 outputs and widens
+/// the adjacent input rounding cell outward. Every subtraction/addition is
+/// rounded in the weakening direction first. Strict comparisons are weakened
+/// to non-strict rows. Backend mismatches, non-constant/non-`Y_0` constraints,
+/// NaN, saturation boundaries, and missing brackets fail closed.
+///
+/// This helper only prepares a threshold. It does not mutate an encoding and
+/// is not wired into Graph-MIP authority yet.
+fn rewrite_dual_sigmoid_constraint_with_pinned_a(
+    constraint: &OutputConstraint,
+    a: PinnedSigmoidOutputEnclosure,
+    b_sigmoid: &CertifiedScoredF32Sigmoid,
+) -> Result<DualSigmoidPinnedRewrite> {
+    use OutputConstraint as OC;
+    let (t, output_is_upper) = match constraint {
+        OC::LessEqConst(0, t) | OC::LessThanConst(0, t) => (*t, true),
+        OC::GreaterEqConst(0, t) | OC::GreaterThanConst(0, t) => (*t, false),
+        other => bail!(
+            "constant-A dual-Sigmoid rewrite supports only a constant bound on scalar Y_0; got \
+             {other:?}"
+        ),
+    };
+    if t.is_nan() {
+        bail!("dual-Sigmoid output threshold is NaN (fail closed)");
+    }
+    if a.backend() != b_sigmoid.backend() {
+        bail!("dual-Sigmoid A/B scored backend provenance mismatch (fail closed)");
+    }
+
+    let (sense, preimage_sense, q) = if output_is_upper {
+        // q <= exact(a.lower - t - ε_sub), hence requiring only scored
+        // `σ_b >= q` is never stricter.
+        let q = sub_down_f64(sub_down_f64(a.lower(), t)?, DUAL_SIGMOID_F32_SUB_ERR)?;
+        (
+            DualSigmoidLogitSense::Lower,
+            ScoredF32SigmoidPreimageSense::AtLeast,
+            q,
+        )
+    } else {
+        // q >= exact(a.upper - t + ε_sub), hence requiring only scored
+        // `σ_b <= q` is never stricter.
+        let q = add_up_f64(sub_up_f64(a.upper(), t)?, DUAL_SIGMOID_F32_SUB_ERR)?;
+        (
+            DualSigmoidLogitSense::Upper,
+            ScoredF32SigmoidPreimageSense::AtMost,
+            q,
+        )
+    };
+
+    let vacuous = match preimage_sense {
+        ScoredF32SigmoidPreimageSense::AtLeast if q <= 0.0 => true,
+        ScoredF32SigmoidPreimageSense::AtMost if q >= 1.0 => true,
+        _ => false,
+    };
+    if vacuous {
+        return Ok(DualSigmoidPinnedRewrite::Vacuous);
+    }
+    if !q.is_finite()
+        || matches!(preimage_sense, ScoredF32SigmoidPreimageSense::AtLeast) && q >= 1.0
+        || matches!(preimage_sense, ScoredF32SigmoidPreimageSense::AtMost) && q <= 0.0
+    {
+        bail!(
+            "constant-A dual-Sigmoid rewrite reaches a scored saturation boundary at {q}; \
+             fail closed"
+        );
+    }
+    let preimage = b_sigmoid.preimage(q, preimage_sense)?;
+    let rhs = preimage.rhs_for(b_sigmoid.backend(), preimage_sense, q)?;
+    Ok(DualSigmoidPinnedRewrite::Bound { sense, rhs })
+}
+
 // ── increment 5b: the BaB→MIP escalation call site (nn4sys mscn) ───────────
 
 /// Marker for a successful graph-MIP escalation: EVERY violation clause of the
@@ -3494,7 +8171,7 @@ pub(crate) fn logit_lower_threshold(t: f64) -> Result<LogitThreshold> {
 /// certificate, so the property holds (`unsat`).
 ///
 /// UNSAT-ONLY BY CONSTRUCTION (V1 soundness posture): this is the only value
-/// [`try_graph_mip_escalation`] can return and it cannot carry a
+/// `try_graph_mip_escalation` can return and it cannot carry a
 /// counterexample or output values — the caller is structurally unable to emit
 /// `sat` from this path (falsification stays the attack's job).
 #[derive(Debug)]
@@ -3840,7 +8517,7 @@ fn alpha_output_target(graph: &GraphNetwork) -> Option<String> {
 ///
 /// SOUNDNESS: this function NEVER synthesizes or tightens a bound itself — it
 /// only relays the collector's output. That collector is sound by
-/// construction: α parameters only STEER the CROWN relaxation (any α ∈ [0,1]
+/// construction: α parameters only STEER the CROWN relaxation (any α ∈ `[0, 1]`
 /// yields a valid relaxation), every iterate is a sound CROWN enclosure of
 /// the target node's reachable set, and the machinery keeps the
 /// elementwise-best across iterates with NaN/inversion fallbacks to the plain
@@ -4381,6 +9058,11 @@ pub(crate) fn try_graph_mip_escalation(
             }
         }
 
+        // Resolve the typed session policy while the exact neural identity
+        // metadata is still present. The fold deliberately discards it with
+        // the other per-node introspection.
+        let ay_node_warm_time_limit = enc.ay_node_warm_time_limit();
+
         // Increment 5c — FOLD provably-pinned columns into the row constants
         // (graph_mip_fold.rs: exact rational substitution, outward-only
         // rounding, fail-closed on anything inexact). The mscn clause boxes
@@ -4436,6 +9118,7 @@ pub(crate) fn try_graph_mip_escalation(
             backend,
             timeout_secs: solver_secs,
             parallel_split,
+            ay_node_warm_time_limit,
             ..MipConfig::default()
         };
         match MipSolver::new(parts, config).check_feasibility() {
@@ -4508,6 +9191,88 @@ pub(crate) fn try_graph_mip_escalation(
     Some(GraphMipCertifiedUnsat {
         num_outputs: spec.num_outputs,
     })
+}
+
+/// Emit a per-clause outcome table for the tracked real `mscn_128d` instance.
+///
+/// This is deliberately an explicit research harness, not a test: a timeout is
+/// useful measurement output but is not conformance evidence. Missing inputs,
+/// an invalid budget, or a disabled graph-MIP route remain hard command errors.
+pub(super) fn run_mscn_per_clause_table_research(bench_dir: &Path) -> Result<()> {
+    let onnx = bench_dir.join("onnx/mscn_128d.onnx");
+    let vnnlib = bench_dir.join("vnnlib/cardinality_0_1_128.vnnlib");
+    if !onnx.is_file() || !vnnlib.is_file() {
+        bail!(
+            "mscn-per-clause-128d requires {} and {}",
+            onnx.display(),
+            vnnlib.display()
+        );
+    }
+    if !graph_mip_enabled() {
+        bail!("Graph-MIP is disabled; unset NY_GRAPH_MIP or set NY_GRAPH_MIP=1");
+    }
+    let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib)?;
+    let clause_count = spec.output_constraint_clauses.len();
+    if clause_count == 0 {
+        bail!("{} parsed with zero violation clauses", vnnlib.display());
+    }
+    let budget = match std::env::var("NY_GRAPH_MIP_TEST_BUDGET") {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .map_err(|error| anyhow!("invalid NY_GRAPH_MIP_TEST_BUDGET={raw:?}: {error}"))?,
+        Err(std::env::VarError::NotPresent) => 10,
+        Err(error) => return Err(anyhow!("read NY_GRAPH_MIP_TEST_BUDGET: {error}")),
+    };
+    if budget == 0 {
+        bail!("NY_GRAPH_MIP_TEST_BUDGET must be nonzero");
+    }
+
+    let flat = spec.input_bounds.len();
+    if flat == 0 || flat % 11 != 0 {
+        bail!("mscn_128d input has {flat} elements; expected a nonempty [11, N] shape");
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+    for clause_index in 0..clause_count {
+        let mut single = spec.clone();
+        single.output_constraint_clauses =
+            vec![spec.output_constraint_clauses[clause_index].clone()];
+        if !spec.per_clause_input_bounds.is_empty() {
+            let bounds = spec
+                .per_clause_input_bounds
+                .get(clause_index)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{} has {} clause(s) but only {} per-clause input boxes",
+                        vnnlib.display(),
+                        clause_count,
+                        spec.per_clause_input_bounds.len()
+                    )
+                })?;
+            single.per_clause_input_bounds = vec![bounds.clone()];
+        }
+        let start = Instant::now();
+        let outcome = try_graph_mip_escalation(
+            &onnx,
+            &OnnxLoadConfig::default(),
+            &[11, flat / 11],
+            Some(&single),
+            MipBackend::Ay,
+            budget,
+        );
+        eprintln!(
+            "per-clause table: clause {}/{clause_count} -> {} in {:.2}s (budget {budget}s)",
+            clause_index + 1,
+            if outcome.is_some() {
+                "ROOT-CERTIFIED unsat"
+            } else {
+                "not certified (see info trail)"
+            },
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

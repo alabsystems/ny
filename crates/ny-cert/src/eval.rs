@@ -33,8 +33,9 @@ impl Relu1Problem {
     ///
     /// # Errors
     /// [`RatError::Dimension`] for a wrong-length point; propagates
-    /// exact-arithmetic overflow.
+    /// exact-rational arena failures.
     pub fn eval(&self, x: &[Rat]) -> Result<Rat, RatError> {
+        crate::rational::ensure_healthy()?;
         // Fail-CLOSED dimension guard (was a fail-loud `assert_eq!`): sound `Err`
         // on a mis-sized point instead of a panic the strict verifier can't
         // discharge (the length equality is interprocedural). Unreachable for
@@ -84,6 +85,7 @@ impl Relu1Problem {
                     .mul(a)?,
             )?;
         }
+        crate::rational::ensure_healthy()?;
         Ok(y)
     }
 
@@ -95,8 +97,9 @@ impl Relu1Problem {
     /// exceed the true minimum, hence must not exceed this sampled minimum.
     ///
     /// # Errors
-    /// Propagates exact-arithmetic overflow.
+    /// Propagates exact-rational arena failures.
     pub fn grid_min(&self, steps: u32) -> Result<Option<Rat>, RatError> {
+        crate::rational::ensure_healthy()?;
         let n = self.input_lower.len();
         if n == 0 {
             return Ok(None);
@@ -152,6 +155,7 @@ impl Relu1Problem {
                 *digit = 0;
             }
             if !advanced {
+                crate::rational::ensure_healthy()?;
                 return Ok(best);
             }
         }
@@ -172,8 +176,9 @@ impl Relu1Problem {
     /// [`grid_min`]: Self::grid_min
     ///
     /// # Errors
-    /// Propagates exact-arithmetic overflow.
+    /// Propagates exact-rational arena failures.
     pub fn exact_min(&self) -> Result<Option<Rat>, RatError> {
+        crate::rational::ensure_healthy()?;
         let n = self.input_lower.len();
         let candidates = match n {
             1 => self.candidates_1d(),
@@ -192,6 +197,7 @@ impl Relu1Problem {
                 _ => y,
             });
         }
+        crate::rational::ensure_healthy()?;
         Ok(best)
     }
 
@@ -338,6 +344,14 @@ fn point2(x0: Rat, x1: Rat) -> Vec<Rat> {
 mod tests {
     use super::*;
 
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
+
     fn r(n: i128, d: i128) -> Rat {
         Rat::new(n, d).unwrap()
     }
@@ -367,6 +381,29 @@ mod tests {
         assert_eq!(p.eval(&[Rat::ZERO, r(1, 1)]).unwrap(), r(7, 2));
         // At x = (0,-1): z=(-1,1), a=(0,1), y = 0 - 1 + 5/2 = 3/2.
         assert_eq!(p.eval(&[Rat::ZERO, r(-1, 1)]).unwrap(), r(3, 2));
+    }
+
+    #[test]
+    fn public_oracles_refuse_poison_on_degenerate_paths() {
+        let p = Relu1Problem {
+            w1: Vec::new(),
+            b1: Vec::new(),
+            w2: Vec::new(),
+            b2: Rat::ZERO,
+            input_lower: Vec::new(),
+            input_upper: Vec::new(),
+            alpha: None,
+        };
+        crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+
+        assert_eq!(p.eval(&[]), Err(RatError::Poisoned));
+        assert_eq!(p.grid_min(1), Err(RatError::Poisoned));
+        assert_eq!(p.exact_min(), Err(RatError::Poisoned));
+        assert!(matches!(
+            p.exact_min_nd(),
+            Err(crate::crown::CrownError::Rat(RatError::Poisoned))
+        ));
     }
 
     #[test]

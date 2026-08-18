@@ -191,7 +191,7 @@ fn test_graph_network_crown_with_layernorm() {
 
         // Forward through Linear
         let linear_out: Array1<f32> =
-            linear_layer.weight.dot(&x_sample) + linear_layer.bias.as_ref().unwrap();
+            linear_layer.weight().dot(&x_sample) + linear_layer.bias().unwrap();
 
         // Forward through LayerNorm
         let ln_out = ln.eval(&linear_out).unwrap();
@@ -368,9 +368,17 @@ fn test_graph_crown_ibp_layernorm_numerical_instability_falls_back_to_exact_ibp_
     use crate::layers::LayerNormCrownMode;
 
     let mut graph = GraphNetwork::new();
-    let layernorm = LayerNormLayer::new(arr1(&[1e35_f32, 1e35, 1e35]), arr1(&[0.0, 0.0, 0.0]), 0.0)
-        .expect("valid LayerNorm")
-        .with_crown_mode(LayerNormCrownMode::Sampling);
+    // Use the smallest supported authored epsilon.  A zero epsilon is now
+    // rejected at construction (correctly: a constant row has a zero
+    // denominator), while this valid epsilon still makes ny / sqrt(eps)
+    // overflow f32 and exercises the intended CROWN-to-IBP fallback.
+    let layernorm = LayerNormLayer::new(
+        arr1(&[1e35_f32, 1e35, 1e35]),
+        arr1(&[0.0, 0.0, 0.0]),
+        NORMALIZATION_MIN_EPS,
+    )
+    .expect("valid LayerNorm")
+    .with_crown_mode(LayerNormCrownMode::Sampling);
     graph.add_node(GraphNode::from_input(
         "layernorm",
         Layer::LayerNorm(layernorm),

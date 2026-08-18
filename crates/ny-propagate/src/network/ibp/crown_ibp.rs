@@ -45,6 +45,14 @@ pub(super) fn collect_core(
             fallback_events: vec![],
         });
     }
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        // This status-bearing collector cannot publish a borrowed/fresh IBP
+        // substitute without scanning or cloning every layer and constructing
+        // matching per-layer provenance. Preserve hard authority instead.
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP: deadline exceeded before forward-bound collection".to_string(),
+        ));
+    }
     if network.has_self_attention() {
         return Err(NyError::UnsupportedConfiguration(
             "SelfAttention requires a graph network; use GraphNetwork IBP or CROWN".to_string(),
@@ -66,7 +74,7 @@ pub(super) fn collect_core(
             );
             bounds
         }
-        None => super::forward::collect_ibp_bounds(network, input)?,
+        None => super::forward::collect_ibp_bounds_with_deadline(network, input, deadline)?,
     };
     let mut crown_ibp_bounds = Vec::with_capacity(n);
     let mut provenance = Vec::with_capacity(n);
@@ -82,11 +90,6 @@ pub(super) fn collect_core(
             needs_crown && !relu_stable_successor
         })
         .collect();
-    // Track whether deadline was exceeded — once exceeded, use IBP for all
-    // remaining layers (sound but looser). Same pattern as GraphNetwork DAG
-    // in graph_alpha/bounds/crown.rs (#3328).
-    let mut deadline_exceeded = false;
-
     // Per-node timing for CROWN-IBP collection (#3599).
     let collection_start = Instant::now();
     let mut crown_node_count = 0usize;
@@ -96,39 +99,13 @@ pub(super) fn collect_core(
     let mut shortcut_total_secs = 0.0f64;
 
     for (k, ibp_bound) in ibp_bounds.iter().enumerate() {
-        // Deadline check before each CROWN partial pass (#3328).
-        if !deadline_exceeded {
-            if let Some(d) = deadline {
-                if Instant::now() >= d {
-                    info!(
-                        "CROWN-IBP: deadline exceeded at layer {}/{}, remaining layers use IBP",
-                        k, n
-                    );
-                    deadline_exceeded = true;
-                }
-            }
-        }
-
-        if deadline_exceeded {
-            // Use IBP bounds directly — sound but looser than CROWN-IBP.
-            deadline_node_count += 1;
-            check_sequential_ibp_nan(
-                ibp_bound,
-                "Sequential CROWN-IBP",
-                k,
-                network.layers[k].layer_type(),
-            )?;
-            crown_ibp_bounds.push(ibp_bound.clone());
-            provenance.push(BoundsProvenance::ForwardFallback(
-                CrownIbpFallbackReason::DeadlineExceeded,
-            ));
-            fallback_events.push(CrownIbpFallbackEvent {
-                layer_index: k,
-                layer_type: network.layers[k].layer_type().to_string(),
-                reason: CrownIbpFallbackReason::DeadlineExceeded,
-                details: "deadline exceeded, using IBP bounds".to_string(),
-            });
-            continue;
+        // Once the global authority expires, this status-bearing API cannot
+        // clone the remaining owned IBP tensors and allocate their per-layer
+        // provenance. Preserve the typed deadline instead (#3328).
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(NyError::DeadlineExceeded(format!(
+                "CROWN-IBP: deadline exceeded before layer {k}/{n}"
+            )));
         }
 
         let node_start = Instant::now();
@@ -184,22 +161,9 @@ pub(super) fn collect_core(
                 Some(now + Duration::from_secs_f64(per_node_secs))
             });
             if deadline.is_some() && per_node_deadline.is_none() {
-                // Deadline truly expired between top-of-loop check and here.
-                deadline_node_count += 1;
-                debug!(
-                    "CROWN-IBP layer {k}/{n} ({}): deadline expired during budget computation, using forward bound",
-                    network.layers[k].layer_type(),
-                );
-                (
-                    ibp_bound.clone(),
-                    BoundsProvenance::ForwardFallback(
-                        CrownIbpFallbackReason::PerNodeDeadlineExceeded,
-                    ),
-                    Some((
-                        CrownIbpFallbackReason::PerNodeDeadlineExceeded,
-                        "deadline expired during budget computation".to_string(),
-                    )),
-                )
+                return Err(NyError::DeadlineExceeded(format!(
+                    "CROWN-IBP: deadline expired while budgeting layer {k}/{n}"
+                )));
             } else {
                 let partial_layers = &network.layers[0..=k];
                 let crown_bounds = propagate_crown_partial_with_engine(
@@ -313,6 +277,10 @@ pub(super) fn collect_core(
                         )
                     }
                     Err(NyError::DeadlineExceeded(msg)) => {
+                        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                            return Err(NyError::DeadlineExceeded(msg));
+                        }
+                        deadline_node_count += 1;
                         debug!(
                         "CROWN-IBP layer {} ({}): per-node deadline exceeded, using forward bound: {}",
                         k,
@@ -365,6 +333,11 @@ pub(super) fn collect_core(
                 ibp_bound,
             )?
         };
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(format!(
+                "CROWN-IBP: deadline exceeded before publishing layer {k}/{n}"
+            )));
+        }
         check_sequential_ibp_nan(
             &tightened,
             "Sequential CROWN-IBP",
@@ -392,6 +365,15 @@ pub(super) fn collect_core(
         crown_ibp_bounds.push(tightened);
         provenance.push(provenance_tag);
         if let Some((reason, details)) = fallback {
+            if ny_levers::read(&ny_levers::decls::diagnostics::DUMP_NODE_BOUNDS)
+                .value
+                .as_bool()
+            {
+                eprintln!(
+                    "[fb-event] layer={k} type={} reason={reason:?} details={details:?}",
+                    network.layers[k].layer_type()
+                );
+            }
             fallback_events.push(CrownIbpFallbackEvent {
                 layer_index: k,
                 layer_type: network.layers[k].layer_type().to_string(),
@@ -399,6 +381,12 @@ pub(super) fn collect_core(
                 details,
             });
         }
+    }
+
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP: deadline exceeded before collection publication".to_string(),
+        ));
     }
 
     // CROWN-IBP collection timing summary (#3599).
@@ -412,6 +400,34 @@ pub(super) fn collect_core(
         );
     }
 
+    // Temporary diagnostic (NY_DUMP_NODE_BOUNDS=1): per-layer bound summary at
+    // publication, for divergence hunting between binaries.
+    if ny_levers::read(&ny_levers::decls::diagnostics::DUMP_NODE_BOUNDS)
+        .value
+        .as_bool()
+    {
+        let probe_nanos = crate::layers::linear::crown_single::INCOMING_ERR_NANOS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let probe_calls = crate::layers::linear::crown_single::INCOMING_ERR_CALLS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[err-share] incoming_error_product: {probe_calls} calls, {:.3}s total",
+            probe_nanos as f64 / 1e9
+        );
+        for (idx, bt) in crown_ibp_bounds.iter().enumerate() {
+            let flat = bt.flatten();
+            let (mut lo, mut hi, mut w) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+            for (&l, &u) in flat.lower().iter().zip(flat.upper().iter()) {
+                lo = lo.min(l);
+                hi = hi.max(u);
+                w += f64::from(u) - f64::from(l);
+            }
+            eprintln!(
+                "[node-dump] layer={idx} len={} min_lo={lo:.4} max_hi={hi:.4} width_sum={w:.2}",
+                flat.len()
+            );
+        }
+    }
     Ok(CrownIbpBoundsResult {
         bounds: crown_ibp_bounds,
         provenance,

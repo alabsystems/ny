@@ -22,6 +22,7 @@
 //! High sensitivity layers are "choke points" for verification and
 //! may be problematic for quantization.
 
+use crate::analysis_error::validate_analysis_epsilon;
 use crate::{load_onnx, OnnxModel};
 use ndarray::{ArrayD, IxDyn};
 use ny_core::truncate_name;
@@ -264,6 +265,8 @@ pub fn analyze_sensitivity_model(
     model: &OnnxModel,
     config: &SensitivityConfig,
 ) -> Result<SensitivityResult, SensitivityError> {
+    validate_analysis_epsilon("sensitivity", config.epsilon)?;
+
     // Create input tensor
     let input = if let Some(ref inp) = config.input {
         inp.clone()

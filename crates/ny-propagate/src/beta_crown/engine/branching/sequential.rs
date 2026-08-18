@@ -700,7 +700,7 @@ impl BetaCrownVerifier {
             match layer {
                 Layer::Linear(linear) => {
                     // Linear backward: coeffs = coeffs @ W
-                    current_coeffs = current_coeffs.dot(&linear.weight);
+                    current_coeffs = current_coeffs.dot(linear.weight());
                 }
                 Layer::ReLU(_) => {
                     // For ReLU, record coefficients for all neurons
@@ -813,7 +813,7 @@ impl BetaCrownVerifier {
 
             match layer {
                 Layer::Linear(linear) => {
-                    current_coeffs = current_coeffs.dot(&linear.weight);
+                    current_coeffs = current_coeffs.dot(linear.weight());
                 }
                 Layer::ReLU(_) | Layer::Sign(_) => {
                     let flat = pre_bounds.flatten();
@@ -914,7 +914,7 @@ impl BetaCrownVerifier {
 
             match layer {
                 Layer::Linear(linear) => {
-                    current_coeffs = current_coeffs.dot(&linear.weight);
+                    current_coeffs = current_coeffs.dot(linear.weight());
                 }
                 Layer::ReLU(_) | Layer::Sign(_) => {
                     let flat = pre_bounds.flatten();

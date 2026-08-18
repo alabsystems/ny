@@ -86,7 +86,7 @@ fn test_onnx_loader_round_trip_simple_mlp() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_to_graph_network_skipped_multi_output_maps_all_outputs() {
+fn test_to_graph_network_skipped_identities_map_outputs_to_same_producer() {
     use crate::onnx_proto;
     use prost::Message;
     use std::path::Path;
@@ -147,18 +147,16 @@ fn test_to_graph_network_skipped_multi_output_maps_all_outputs() {
     let graph = onnx_proto::GraphProto {
         node: vec![
             node("relu1", "Relu", &["input"], &["relu_out"]),
-            // Use "Identity" (a known skip-op returning LayerType::Unknown) instead
-            // of "UnsupportedOp" which returns Err after #2931 soundness fix.
-            node(
-                "skip1",
-                "Identity",
-                &["relu_out"],
-                &["skip_out0", "skip_out1"],
-            ),
+            // Use two schema-valid Identity nodes (known skip-ops returning
+            // LayerType::Unknown). A single Identity may not declare multiple
+            // outputs under the ONNX schema.
+            node("skip0", "Identity", &["relu_out"], &["skip_out0"]),
+            node("skip1", "Identity", &["relu_out"], &["skip_out1"]),
             node("add1", "Add", &["skip_out0", "skip_out1"], &["add_out"]),
         ],
         name: "skip_multi_output".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("add_out", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -167,7 +165,9 @@ fn test_to_graph_network_skipped_multi_output_maps_all_outputs() {
 
     write_onnx_model(&path, graph);
 
-    let model = load_onnx(path.to_str().expect("Path should be UTF-8"))
+    let config = crate::OnnxLoadConfig::default()
+        .with_shape_inference_policy(crate::ShapeInferencePolicy::Skip);
+    let model = crate::load_onnx_with_config(path.to_str().expect("Path should be UTF-8"), &config)
         .expect("Failed to load skip_multi_output model");
     let graph = model
         .to_graph_network()
@@ -176,14 +176,16 @@ fn test_to_graph_network_skipped_multi_output_maps_all_outputs() {
     // Identity ops are wire-through: excluded from the layer list at load time
     // and traced via tensor_producer. Both outputs (skip_out0, skip_out1) map
     // back to the upstream producer (relu1). No OpaqueSkipLayer is created.
-    assert!(
-        graph.node("skip1").is_none(),
-        "Identity op should not appear as a graph node"
-    );
-    assert!(
-        graph.node("skip1__skip").is_none(),
-        "Wire-through Identity should not create OpaqueSkip node"
-    );
+    for identity in ["skip0", "skip1"] {
+        assert!(
+            graph.node(identity).is_none(),
+            "Identity op should not appear as a graph node"
+        );
+        assert!(
+            graph.node(&format!("{identity}__skip")).is_none(),
+            "Wire-through Identity should not create OpaqueSkip node"
+        );
+    }
 
     assert_eq!(
         graph.output_name(),
@@ -201,7 +203,7 @@ fn test_to_graph_network_skipped_multi_output_maps_all_outputs() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_to_graph_network_skipped_outputs_map_to_input() {
+fn test_to_graph_network_skipped_identities_map_outputs_to_input() {
     use crate::onnx_proto;
     use prost::Message;
     use std::path::Path;
@@ -261,13 +263,14 @@ fn test_to_graph_network_skipped_outputs_map_to_input() {
 
     let graph = onnx_proto::GraphProto {
         node: vec![
-            // Use "Identity" (a known skip-op returning LayerType::Unknown) instead
-            // of "UnsupportedOp" which returns Err after #2931 soundness fix.
-            node("skip1", "Identity", &["input"], &["skip_out0", "skip_out1"]),
+            // Two schema-valid Identity nodes exercise both wire-through edges.
+            node("skip0", "Identity", &["input"], &["skip_out0"]),
+            node("skip1", "Identity", &["input"], &["skip_out1"]),
             node("add1", "Add", &["skip_out0", "skip_out1"], &["add_out"]),
         ],
         name: "skip_outputs_map_to_input".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("add_out", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -276,7 +279,9 @@ fn test_to_graph_network_skipped_outputs_map_to_input() {
 
     write_onnx_model(&path, graph);
 
-    let model = load_onnx(path.to_str().expect("Path should be UTF-8"))
+    let config = crate::OnnxLoadConfig::default()
+        .with_shape_inference_policy(crate::ShapeInferencePolicy::Skip);
+    let model = crate::load_onnx_with_config(path.to_str().expect("Path should be UTF-8"), &config)
         .expect("Failed to load skip_outputs_map_to_input model");
     let graph = model
         .to_graph_network()
@@ -284,10 +289,12 @@ fn test_to_graph_network_skipped_outputs_map_to_input() {
 
     // Identity ops are wire-through: both outputs map back to the graph input
     // via tensor_producer. No OpaqueSkipLayer is created.
-    assert!(
-        graph.node("skip1__skip").is_none(),
-        "Wire-through Identity should not create OpaqueSkip node"
-    );
+    for identity in ["skip0", "skip1"] {
+        assert!(
+            graph.node(&format!("{identity}__skip")).is_none(),
+            "Wire-through Identity should not create OpaqueSkip node"
+        );
+    }
 
     let add_node = graph.node("add1").expect("add1 node should exist in graph");
     assert_eq!(

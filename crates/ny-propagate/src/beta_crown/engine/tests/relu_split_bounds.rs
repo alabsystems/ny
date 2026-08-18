@@ -75,6 +75,55 @@ fn test_relu_split_with_bounds_verified_matches_direct() {
     );
 }
 
+/// Caller-supplied bounds can prove the root before the normal bootstrap.
+/// Both public wrappers must still reject a quarantined cut-authority request.
+#[ntest::timeout(10000)]
+#[test]
+fn relu_split_with_precomputed_early_verified_rejects_cut_authority() {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu");
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+
+    let safe = BetaCrownVerifier::new(BetaCrownConfig {
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        ..Default::default()
+    });
+    let (node_bounds, output_bounds) = safe
+        .compute_initial_graph_bounds(&graph, &input, None)
+        .expect("safe precomputation");
+    let precomputed = GraphPrecomputedBounds::new(&node_bounds, &output_bounds);
+
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        enable_cuts: true,
+        ..Default::default()
+    });
+    let direct_error = verifier
+        .verify_graph_relu_split_with_bounds(&graph, &input, &[1.0], -0.5, &precomputed)
+        .expect_err("early-Verified precomputed path must reject cut authority");
+    let engine_error = verifier
+        .verify_graph_relu_split_with_bounds_with_engine(
+            &graph,
+            &input,
+            &[1.0],
+            -0.5,
+            &precomputed,
+            None,
+            None,
+        )
+        .expect_err("engine wrapper must share the same cut-authority quarantine");
+
+    for error in [direct_error, engine_error] {
+        assert!(
+            error
+                .to_string()
+                .contains("cut proof authority is quarantined"),
+            "expected quarantine error, got {error}"
+        );
+    }
+}
+
 /// Test that verify_graph_relu_split_with_bounds detects a violation,
 /// matching the direct path.
 ///
@@ -116,7 +165,7 @@ fn test_relu_split_with_bounds_violation_matches_direct() {
     assert!(
         matches!(
             result_direct.result,
-            BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::PotentialViolation { .. }
         ),
         "direct path: expected PotentialViolation, got {:?}",
         result_direct.result
@@ -124,7 +173,7 @@ fn test_relu_split_with_bounds_violation_matches_direct() {
     assert!(
         matches!(
             result_precomputed.result,
-            BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::PotentialViolation { .. }
         ),
         "precomputed path: expected PotentialViolation, got {:?}",
         result_precomputed.result
@@ -417,17 +466,12 @@ fn test_relu_split_with_bounds_shape_mismatch_error() {
 // Warmup deadline tests (#4260)
 // ============================================================
 
-/// Regression for #4260: `compute_initial_graph_bounds` with an expired deadline
-/// must not run uncapped root CROWN in the non-alpha path.
-///
-/// Before the fix, the non-alpha branch called
-/// `crown_backward_with_relaxation_and_deadline_and_truncation(..., None, ...)`
-/// ignoring the caller's deadline. With the fix, the bootstrap's
-/// `alpha_config.deadline` is threaded through so the expired deadline triggers
-/// an early bail to exact IBP bounds.
+/// `compute_initial_graph_bounds` returns bounds rather than a verifier status,
+/// so an already-expired request with no precollected map must preserve the
+/// typed deadline instead of starting a fresh uncapped IBP sweep.
 #[ntest::timeout(10000)]
 #[test]
-fn test_compute_initial_graph_bounds_honors_expired_deadline_4260() {
+fn test_compute_initial_graph_bounds_expired_deadline_refuses_fresh_fallback_4260() {
     use std::time::Instant;
 
     // Multi-layer graph so CROWN can produce tighter bounds than IBP.
@@ -444,31 +488,17 @@ fn test_compute_initial_graph_bounds_honors_expired_deadline_4260() {
     // call that used to drop the caller deadline.
     config.alpha_config.fix_interm_bounds = true;
     let verifier = BetaCrownVerifier::new(config);
-    let ibp_output = graph
-        .propagate_ibp(&input)
-        .expect("direct IBP output should succeed on the toy graph");
-
     // Test: expired deadline (1ms in the past).
     let expired = Some(
         Instant::now()
             .checked_sub(Duration::from_millis(1))
             .unwrap(),
     );
-    let (_exp_node, exp_output) = verifier
+    let error = verifier
         .compute_initial_graph_bounds(&graph, &input, expired)
-        .expect("expired deadline should still return bounds (IBP fallback)");
-
-    let exp_lower = exp_output.lower().iter().copied().collect::<Vec<_>>();
-    let exp_upper = exp_output.upper().iter().copied().collect::<Vec<_>>();
-    let ibp_lower = ibp_output.lower().iter().copied().collect::<Vec<_>>();
-    let ibp_upper = ibp_output.upper().iter().copied().collect::<Vec<_>>();
-
-    assert_eq!(
-        exp_lower, ibp_lower,
-        "expired deadline lower bounds must match direct IBP exactly"
-    );
-    assert_eq!(
-        exp_upper, ibp_upper,
-        "expired deadline upper bounds must match direct IBP exactly"
+        .expect_err("expired initial graph bounds must not launch fresh fallback work");
+    assert!(
+        matches!(error, ny_core::NyError::DeadlineExceeded(_)),
+        "expected typed deadline refusal, got {error:?}"
     );
 }

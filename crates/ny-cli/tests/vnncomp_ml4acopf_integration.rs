@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "external-vnncomp")]
+
 //! Integration tests covering real `ml4acopf_2024` benchmark assets.
 
 #[path = "common/vnncomp.rs"]

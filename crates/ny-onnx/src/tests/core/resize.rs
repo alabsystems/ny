@@ -7,8 +7,8 @@ use crate::load_onnx_bytes;
 use ndarray::ArrayD;
 use ny_core::LayerType;
 use ny_tensor::BoundedTensor;
+use ny_test_utils::workspace_root;
 use prost::Message;
-use std::path::Path;
 
 fn tensor_value_info(name: &str, shape: &[i64]) -> onnx_proto::ValueInfoProto {
     let dims = shape
@@ -46,7 +46,7 @@ fn resize_attribute(name: &str, value: &str) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
         r#type: onnx_proto::attribute_type::STRING,
-        s: value.as_bytes().to_vec(),
+        s: Some(value.as_bytes().to_vec()),
         ..Default::default()
     }
 }
@@ -72,6 +72,7 @@ fn test_load_resize_end_to_end() {
             tensor_f32("roi", &[0], &[]),
             tensor_f32("scales", &[4], &[1.0, 1.0, 2.0, 2.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 1, 2, 2])],
         output: vec![tensor_value_info("out", &[1, 1, 4, 4])],
         #[cfg(feature = "onnx-value-info")]
@@ -117,9 +118,17 @@ fn test_load_resize_end_to_end() {
 
 #[ntest::timeout(10000)]
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn test_cctsdb_yolo_no_longer_fails_at_resize() {
-    let path = Path::new("benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023/onnx/patch-1.onnx");
-    let result = load_onnx(path);
+    let path = workspace_root()
+        .join("benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023/onnx/patch-1.onnx");
+    assert!(
+        path.is_file(),
+        "CCTSDB YOLO ONNX benchmark fixture is missing at {}; \
+         run benchmarks/download_benchmarks.sh",
+        path.display()
+    );
+    let result = load_onnx(&path);
 
     match result {
         Ok(model) => {
@@ -144,11 +153,19 @@ fn test_cctsdb_yolo_no_longer_fails_at_resize() {
 
 #[ntest::timeout(10000)]
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn test_collins_yolo_no_longer_fails_at_resize() {
-    let path = Path::new(
-        "benchmarks/vnncomp2025/benchmarks/collins_aerospace_benchmark/onnx/yolov5nano_LRelu_640.onnx",
+    let path = workspace_root().join(
+        "benchmarks/vnncomp2025/benchmarks/collins_aerospace_benchmark/onnx/\
+         yolov5nano_LRelu_640.onnx",
     );
-    let result = load_onnx(path);
+    assert!(
+        path.is_file(),
+        "Collins YOLO ONNX benchmark fixture is missing at {}; \
+         run benchmarks/download_benchmarks.sh",
+        path.display()
+    );
+    let result = load_onnx(&path);
 
     match result {
         Ok(model) => {

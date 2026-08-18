@@ -67,8 +67,9 @@ fn absolute_difference_bounds(
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_seam_discontinuity_bounded_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // #3500 requirement 1: |sample[chunk_N, -1] - sample[chunk_N+1, 0]| < ε.
     //
     // Measures the raw seam discontinuity between two adjacent streaming

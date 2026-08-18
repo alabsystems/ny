@@ -486,11 +486,14 @@ impl BetaCrownVerifier {
 
         let mut new_layer_bounds = if self.config.use_crown_ibp {
             if use_crown_ibp_layer_bounds {
-                network.collect_crown_ibp_bounds_with_engine_and_deadline(
+                self.collect_sequential_crown_ibp_bounds_with_status(
+                    network,
                     &new_input_bounds,
+                    None,
                     engine,
                     deadline,
                 )?
+                .bounds
             } else {
                 network.collect_ibp_bounds_with_deadline(&new_input_bounds, deadline)?
             }

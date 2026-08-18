@@ -673,7 +673,14 @@ fn test_multi_objective_babsr_matches_single_objective_1857() {
     );
 
     let multi_choice = verifier
-        .select_graph_branch_multi(&graph, &multi_domain, &multi_unstable, &[], None)
+        .select_graph_branch_multi(
+            &graph,
+            &multi_domain,
+            &multi_unstable,
+            &[],
+            &[0.5, 0.5],
+            None,
+        )
         .unwrap();
     assert_eq!(multi_choice.0, "relu");
     assert_eq!(
@@ -682,6 +689,221 @@ fn test_multi_objective_babsr_matches_single_objective_1857() {
          Multi-objective picked neuron {} but single-objective picked neuron {}. \
          This indicates multi-objective path is ignoring BranchingHeuristic::BoundImpact.",
         multi_choice.1, single_choice.1,
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn multi_objective_branch_seed_uses_aggregation_critical_margin_row() {
+    // Each objective row points at a different unstable ReLU. Unequal
+    // thresholds make raw-bound selection disagree with proof-margin
+    // selection, while the two aggregation modes deliberately select opposite
+    // rows. This exercises the full domain -> selector -> signed-BaBSR path.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.add_node(GraphNode::new(
+        "output",
+        Layer::Linear(LinearLayer::new(arr2(&[[1.0, 0.0], [0.0, 1.0]]), None).unwrap()),
+        vec!["relu".to_string()],
+    ));
+    graph.set_output("output");
+
+    let input =
+        BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
+    let node_bounds = graph.collect_node_bounds(&input).unwrap();
+    let thresholds = [10.0, 0.0];
+    let objectives = vec![vec![-1.0, 0.0], vec![0.0, -1.0]];
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        branching_heuristic: BranchingHeuristic::BoundImpact,
+        ..Default::default()
+    });
+    let relu_nodes = vec!["relu".to_string()];
+
+    let pick = |aggregation| {
+        let domain = MultiObjectiveGraphBabDomain::root_with_aggregation(
+            node_bounds.clone(),
+            vec![(9.0, 20.0), (-2.0, 5.0)],
+            &input,
+            &thresholds,
+            false,
+            aggregation,
+        )
+        .unwrap();
+        let unstable = verifier.find_unstable_graph_neurons_multi(&graph, &domain, &relu_nodes);
+        verifier
+            .select_graph_branch_multi(&graph, &domain, &unstable, &objectives, &thresholds, None)
+            .unwrap()
+    };
+
+    // Margins are [-1, -2]: disjunction uses row 1 -> neuron 1;
+    // conjunction uses row 0 -> neuron 0.
+    assert_eq!(pick(ObjectiveAggregation::Disjunctive).1, 1);
+    assert_eq!(pick(ObjectiveAggregation::Conjunctive).1, 0);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn bounded_multi_objective_selector_is_intercept_only_and_deadline_polled() {
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+    graph.set_output("relu");
+    let input =
+        BoundedTensor::new(arr1(&[-1.0, -2.0]).into_dyn(), arr1(&[1.0, 3.0]).into_dyn()).unwrap();
+    let node_bounds = graph.collect_node_bounds(&input).unwrap();
+    let domain =
+        MultiObjectiveGraphBabDomain::root(node_bounds, vec![(-2.0, 3.0)], &input, &[0.0], false)
+            .unwrap();
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        branching_heuristic: BranchingHeuristic::BoundImpact,
+        ..Default::default()
+    });
+    let unstable =
+        verifier.find_unstable_graph_neurons_multi(&graph, &domain, &["relu".to_string()]);
+    let bounded_unstable = verifier
+        .find_unstable_graph_neurons_multi_bounded(
+            &graph,
+            &domain,
+            &["relu".to_string()],
+            Some(std::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .expect("bounded unstable discovery");
+    assert_eq!(bounded_unstable, unstable);
+
+    let selected = verifier
+        .select_graph_branch_multi_bounded_intercept(
+            &graph,
+            &domain,
+            &unstable,
+            Some(std::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .expect("bounded intercept selector");
+    assert_eq!((selected.0.as_str(), selected.1), ("relu", 1));
+
+    let expired = std::time::Instant::now()
+        .checked_sub(Duration::from_nanos(1))
+        .expect("one nanosecond is representable");
+    let error = verifier
+        .select_graph_branch_multi_bounded_intercept(&graph, &domain, &unstable, Some(expired))
+        .expect_err("expired bounded selection must not scan");
+    assert!(error.is_deadline_exceeded());
+    let discovery_error = verifier
+        .find_unstable_graph_neurons_multi_bounded(
+            &graph,
+            &domain,
+            &["relu".to_string()],
+            Some(expired),
+        )
+        .expect_err("expired bounded discovery must not scan");
+    assert!(discovery_error.is_deadline_exceeded());
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn auto_conjunctive_kfsb_reaches_critical_row_without_env_gate() {
+    // Intercept-only prefers wide neuron 0. The conjunction-critical output row
+    // is coefficient-dominated by neuron 1, so a neuron-1 result proves the
+    // typed auto policy reached the real kFSB selector rather than the
+    // historical fallback.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "linear1",
+        Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0, 0.0], [0.0, 1.0]]), Some(arr1(&[0.0, 0.0]))).unwrap(),
+        ),
+    ));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer),
+        vec!["linear1".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "linear2",
+        Layer::Linear(LinearLayer::new(arr2(&[[-5.0, -0.1], [-0.1, -5.0]]), None).unwrap()),
+        vec!["relu".to_string()],
+    ));
+    graph.set_output("linear2");
+
+    let input =
+        BoundedTensor::new(arr1(&[-3.0, -0.5]).into_dyn(), arr1(&[1.0, 0.5]).into_dyn()).unwrap();
+    let node_bounds = graph.collect_node_bounds(&input).unwrap();
+    let objectives = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+    let thresholds = [-98.0, 10.0];
+    let domain = MultiObjectiveGraphBabDomain::root_with_aggregation(
+        node_bounds,
+        vec![(-100.0, 0.0), (9.0, 20.0)],
+        &input,
+        &thresholds,
+        false,
+        ObjectiveAggregation::Conjunctive,
+    )
+    .unwrap();
+    assert_eq!(
+        domain.critical_objective_index(&thresholds).unwrap(),
+        Some(1),
+        "proof margins [-2, -1] make row 1 conjunction-critical"
+    );
+    let relu_nodes = vec!["relu".to_string()];
+
+    crate::tests::with_serialized_env_vars_removed(
+        &[
+            "NY_MO_SCORER_FIX",
+            "NY_BRANCH_LA",
+            "NY_BRANCH_LA_PROBE",
+            "NY_BRANCH_STEM",
+            "NY_MO_GATHER_SCORE",
+        ],
+        || {
+            let legacy = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 2,
+                kfsb_reduce_op: crate::beta_crown::config::KfsbReduceOp::Max,
+                beta_iterations: 0,
+                use_multi_objective_critical_kfsb: false,
+                ..Default::default()
+            });
+            let unstable = legacy.find_unstable_graph_neurons_multi(&graph, &domain, &relu_nodes);
+            assert_eq!(
+                legacy
+                    .select_graph_branch_multi(
+                        &graph,
+                        &domain,
+                        &unstable,
+                        &objectives,
+                        &thresholds,
+                        None,
+                    )
+                    .unwrap()
+                    .1,
+                0,
+                "default-off policy must preserve the cheap intercept fallback"
+            );
+
+            let auto_yolo = BetaCrownVerifier::new(BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::Kfsb,
+                fsb_candidates: 2,
+                kfsb_reduce_op: crate::beta_crown::config::KfsbReduceOp::Max,
+                beta_iterations: 0,
+                use_multi_objective_critical_kfsb: true,
+                ..Default::default()
+            });
+            let unstable =
+                auto_yolo.find_unstable_graph_neurons_multi(&graph, &domain, &relu_nodes);
+            assert_eq!(
+                auto_yolo
+                    .select_graph_branch_multi(
+                        &graph,
+                        &domain,
+                        &unstable,
+                        &objectives,
+                        &thresholds,
+                        None,
+                    )
+                    .unwrap()
+                    .1,
+                1,
+                "typed auto policy must run kFSB from the conjunction-critical row"
+            );
+        },
     );
 }
 
@@ -737,7 +959,14 @@ fn test_multi_objective_graph_babsr_matches_single_objective_bias_case_2513() {
     let multi_unstable =
         verifier.find_unstable_graph_neurons_multi(&graph, &multi_domain, &relu_nodes);
     let multi_choice = verifier
-        .select_graph_branch_multi(&graph, &multi_domain, &multi_unstable, &[], None)
+        .select_graph_branch_multi(
+            &graph,
+            &multi_domain,
+            &multi_unstable,
+            &[],
+            &[0.0, 0.0],
+            None,
+        )
         .unwrap();
 
     assert_eq!(single_choice.0, "relu");
@@ -1084,7 +1313,14 @@ fn test_select_graph_branch_multi_empty_unstable_returns_error_1915() {
 
     // Empty unstable list — must return Err, not panic.
     let empty_unstable: Vec<(String, usize)> = vec![];
-    let result = verifier.select_graph_branch_multi(&graph, &domain, &empty_unstable, &[], None);
+    let result = verifier.select_graph_branch_multi(
+        &graph,
+        &domain,
+        &empty_unstable,
+        &[],
+        &[0.0, 0.0],
+        None,
+    );
     assert!(
         result.is_err(),
         "empty unstable list must return Err for multi-objective branch selection (#1915)"
@@ -1683,7 +1919,7 @@ fn test_multi_objective_scorer_degeneracy_fixed_kfsb_fsb_width_differ() {
             let unstable = verifier.find_unstable_graph_neurons_multi(&graph, &domain, &relu_nodes);
             assert_eq!(unstable.len(), 2, "both neurons unstable ({heuristic:?})");
             let (node, neuron, score) = verifier
-                .select_graph_branch_multi(&graph, &domain, &unstable, &objectives, None)
+                .select_graph_branch_multi(&graph, &domain, &unstable, &objectives, &[0.0], None)
                 .unwrap();
             assert_eq!(node, "relu");
             assert!(

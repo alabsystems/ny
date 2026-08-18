@@ -40,7 +40,7 @@ impl BetaCrownVerifier {
                 GraphDomainResult::Violation => {
                     lifecycle.cuts_generated = cut_pool.total_generated;
                     return Ok(Some(
-                        lifecycle.build_result(BabVerificationStatus::PotentialViolation),
+                        lifecycle.build_result(BabVerificationStatus::potential_violation()),
                     ));
                 }
                 GraphDomainResult::Children(children) => {
@@ -70,7 +70,8 @@ impl BetaCrownVerifier {
                         if self.config.domain_is_violation(lower, upper, threshold) {
                             lifecycle.cuts_generated = cut_pool.total_generated;
                             return Ok(Some(
-                                lifecycle.build_result(BabVerificationStatus::PotentialViolation),
+                                lifecycle
+                                    .build_result(BabVerificationStatus::potential_violation()),
                             ));
                         }
                         lifecycle.unresolved_due_to_no_branch = true;

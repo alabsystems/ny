@@ -20,7 +20,7 @@
 //! a v2 that emits the same `CertifiedModuloCite` status from inside the verifier.
 
 use crate::cite_check::{citation_status, CitationStatus};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// The honest proof-carrying status of one function, composed from the tRustc
@@ -81,6 +81,13 @@ pub fn classify(
             reason: String::from("L0 safety obligations not all proved"),
         };
     }
+    if facts.l1_postcond_discharged && !facts.l1_postcond_captured {
+        return ProofCarryingStatus::Incomplete {
+            reason: String::from(
+                "inconsistent L1 evidence: discharged postcondition was not captured",
+            ),
+        };
+    }
     if facts.l1_postcond_discharged {
         return ProofCarryingStatus::CertifiedToAxioms;
     }
@@ -117,14 +124,31 @@ pub fn classify(
 
 /// Extract `function -> verdict` (e.g. "Verified" / "HasViolations") from a
 /// `targo trust survey` JSON value.
+///
+/// Malformed rows are ignored. Duplicate function rows are omitted entirely:
+/// accepting the last duplicate would let ordering decide which proof result
+/// is trusted, so callers must treat ambiguous survey evidence as absent.
 #[must_use]
 pub fn function_verdicts(survey: &serde_json::Value) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    let mut seen_names = HashSet::new();
     if let Some(fns) = survey["functions"].as_array() {
         for f in fns {
-            if let (Some(name), Some(verdict)) =
-                (f["function"].as_str(), f["summary"]["verdict"].as_str())
-            {
+            let Some(name) = f["function"].as_str() else {
+                continue;
+            };
+            // Any second named row is ambiguous, even if one row carries an
+            // invalid verdict. Filtering first would let `{Verified, Error}`
+            // retain trusted evidence simply because the conflicting row was
+            // malformed.
+            if !seen_names.insert(name.to_string()) {
+                out.remove(name);
+                continue;
+            }
+            let Some(verdict) = f["summary"]["verdict"].as_str() else {
+                continue;
+            };
+            if matches!(verdict, "Verified" | "HasViolations") {
                 out.insert(name.to_string(), verdict.to_string());
             }
         }
@@ -224,6 +248,30 @@ mod tests {
     }
 
     #[test]
+    fn fail_closed_on_empty_invalid_or_non_declaration_cite() {
+        let corpus = tempfile::tempdir().unwrap();
+        std::fs::write(
+            corpus.path().join("Exact.lean"),
+            "theorem carrier : True := by exact True.intro\n",
+        )
+        .unwrap();
+
+        for theorem in ["", "1carrier", "carrier-name", "True", "exact"] {
+            let status = classify(PROVED_CAPTURED, Some(theorem), corpus.path());
+            assert!(
+                matches!(status, ProofCarryingStatus::Incomplete { .. }),
+                "citation {theorem:?} must fail closed, got {status:?}"
+            );
+        }
+        assert_eq!(
+            classify(PROVED_CAPTURED, Some("carrier"), corpus.path()),
+            ProofCarryingStatus::CertifiedModuloCite {
+                theorem: "carrier".to_owned()
+            }
+        );
+    }
+
+    #[test]
     fn solver_discharged_is_certified_to_axioms() {
         let facts = FunctionFacts {
             l1_postcond_discharged: true,
@@ -237,6 +285,90 @@ mod tests {
             ),
             ProofCarryingStatus::CertifiedToAxioms
         );
+    }
+
+    #[test]
+    fn discharged_without_a_captured_postcondition_fails_closed() {
+        let facts = FunctionFacts {
+            l0_proved: true,
+            l1_postcond_captured: false,
+            l1_postcond_discharged: true,
+        };
+        assert!(matches!(
+            classify(facts, None, &clean_corpus_root()),
+            ProofCarryingStatus::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_survey_rows_are_ambiguous_and_omitted() {
+        let survey = serde_json::json!({
+            "functions": [
+                { "function": "f", "summary": { "verdict": "HasViolations" } },
+                { "function": "f", "summary": { "verdict": "Verified" } },
+                { "function": "g", "summary": { "verdict": "Verified" } }
+            ]
+        });
+        let verdicts = function_verdicts(&survey);
+        assert!(!verdicts.contains_key("f"));
+        assert_eq!(verdicts.get("g").map(String::as_str), Some("Verified"));
+
+        let mixed_validity = serde_json::json!({
+            "functions": [
+                { "function": "f", "summary": { "verdict": "Verified" } },
+                { "function": "f", "summary": { "verdict": "Error" } }
+            ]
+        });
+        assert!(
+            !function_verdicts(&mixed_validity).contains_key("f"),
+            "an invalid duplicate must still make trusted evidence ambiguous"
+        );
+    }
+
+    #[test]
+    fn duplicate_contract_evidence_never_certifies() {
+        let structural = serde_json::json!({
+            "functions": [
+                { "function": "f", "summary": { "verdict": "Verified" } }
+            ]
+        });
+        let contracts = serde_json::json!({
+            "functions": [
+                { "function": "f", "summary": { "verdict": "HasViolations" } },
+                { "function": "f", "summary": { "verdict": "Verified" } }
+            ]
+        });
+        let cite_map = vec![("f".to_string(), "farkas_premise_combination".to_string())];
+        let cert = compose_from_surveys(&structural, &contracts, &cite_map, &clean_corpus_root());
+        assert_eq!(
+            cert,
+            vec![("f".to_string(), ProofCarryingStatus::L0OnlyL1Open)]
+        );
+    }
+
+    #[test]
+    fn unknown_contract_verdict_does_not_count_as_captured_evidence() {
+        let structural = serde_json::json!({
+            "functions": [
+                { "function": "f", "summary": { "verdict": "Verified" } }
+            ]
+        });
+        for verdict in ["Error", "Skipped", "arbitrary"] {
+            let contracts = serde_json::json!({
+                "functions": [
+                    { "function": "f", "summary": { "verdict": verdict } }
+                ]
+            });
+            assert!(!function_verdicts(&contracts).contains_key("f"));
+            let cite_map = vec![("f".to_string(), "farkas_premise_combination".to_string())];
+            let cert =
+                compose_from_surveys(&structural, &contracts, &cite_map, &clean_corpus_root());
+            assert_eq!(
+                cert,
+                vec![("f".to_string(), ProofCarryingStatus::L0OnlyL1Open)],
+                "unrecognized verdict {verdict:?} must not become proof evidence"
+            );
+        }
     }
 
     #[test]

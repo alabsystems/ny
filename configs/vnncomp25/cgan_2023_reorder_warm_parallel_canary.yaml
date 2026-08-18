@@ -3,9 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Experimental cGAN row-7 canary. This deliberately mirrors cgan_2023.yaml
-# except for the two activation knobs under input_split:
+# except for the measured reordered-loop scheduling treatment:
+#   bab.batch_size: 8
 #   reorder_bab: true
 #   warm_parallel: true
+#
+# Batch 64 breadth-expanded to 319 domains with 0 verified in 120 s. Batch 8
+# reached 319 explored / 117 verified and reduced the mature queue from 104 to
+# about 90 in the same diagnostic window. This remains a default-off canary
+# until an exact official-budget row closes.
 #
 # It is not selected by the VNN-COMP cgan_2023 category automatically. A sealed
 # A/B must copy this file over vnncomp25/cgan_2023.yaml in an isolated config
@@ -15,18 +21,26 @@ general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
   csv_name: instances.csv
 
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  cgan_forward_alpha_surrogate: false
+
 attack:
   pgd_order: before
   pgd_restarts: 200
 
 bab:
-  batch_size: 64
+  batch_size: 8
   crown_ibp_per_node_cap_secs: 150
   phase_budget:
     disjunctive_pgd_fraction: 0.10
+    disjunctive_pgd_max_secs: 5
     attack_extension_fraction: 0.0
     initial_bounds_fraction: 0.45
     disjunctive_precheck_fraction: 0.85
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
   branching:
     method: input
     candidates: 5
@@ -34,7 +48,7 @@ bab:
     input_split:
       reorder_bab: true
       warm_parallel: true
-      alpha_iteration: 5
+      alpha_iteration: 1
       lr_alpha: 0.05
       ibp_enhancement: true
       stacked_rebound: true
@@ -44,6 +58,9 @@ bab:
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100
+    cgan_complete_crown_ibp_root: true
+    reference_refresh_max_secs: 12
+    forward_linear_deadline_fallback_to_ibp: true
   beta_crown:
     lr_alpha: 0.1
     lr_beta: 0.15

@@ -33,6 +33,21 @@ pub(crate) fn valid_disjunctive_layout(
     total == Some(row_count)
 }
 
+/// Verdict authority for one sign-normalized objective interval.
+///
+/// Lower-bound verification needs a finite certified lower endpoint, a finite
+/// threshold, and a non-malformed interval.  A `+inf` upper endpoint is a valid
+/// one-sided enclosure and is canonical for tail/recheck paths that compute
+/// only the proof-relevant lower bound; it must not erase that certificate.
+/// NaN and inverted intervals still fail closed.
+pub(super) fn objective_interval_verified(lower: f32, upper: f32, threshold: f32) -> bool {
+    lower.is_finite()
+        && !upper.is_nan()
+        && threshold.is_finite()
+        && lower <= upper
+        && lower > threshold
+}
+
 /// Disjunctive (OR-of-AND) domain check: clause satisfied if ANY row has
 /// finite `lower > threshold`; domain verified if EVERY clause satisfied.
 /// Mirrors `stop_criterion_general` (`auto_LiRPA/utils.py:115-137`). Part of #3740.
@@ -49,7 +64,9 @@ pub(crate) fn disjunctive_domain_verified(
         let clause_satisfied = obj_bounds[offset..offset + size]
             .iter()
             .zip(&thresholds[offset..offset + size])
-            .any(|((l, _u), &t)| l.is_finite() && *l > t);
+            .any(|(&(lower, upper), &threshold)| {
+                objective_interval_verified(lower, upper, threshold)
+            });
         if !clause_satisfied {
             return false;
         }

@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::bounds::{GradientMethod, GraphAlphaState};
+use crate::network::PrecomputedAlphaReferenceBounds;
 use crate::GraphNetwork;
 
 type RootBoundsValue = (
@@ -67,22 +68,36 @@ struct RootBoundsCacheEntry {
     value: Arc<RootBoundsValue>,
 }
 
+#[derive(Clone)]
+struct TypedReferenceMapCacheEntry {
+    key: RootBoundsCacheKey,
+    value: Arc<PrecomputedAlphaReferenceBounds>,
+}
+
 /// One-entry cache shared only by the deterministic restarts of ONE top-level
 /// grouped-disjunctive verification call.
 ///
-/// The CLI creates a fresh instance behind
+/// The CLI creates a fresh instance for explicitly typed cGAN roots or behind
 /// `NY_DISJUNCTIVE_RESTART_ROOT_CACHE=1`; it is dropped when that top-level
 /// call returns. A cache hit is exact reuse of a previously certified map and
 /// `GraphAlphaState`, never a newly computed or widened approximation. Any
-/// identity mismatch, non-deterministic SPSA root configuration, serialization
-/// failure, or poisoned lock fails closed to the original collection path.
+/// identity mismatch, non-deterministic SPSA/supplement root configuration,
+/// serialization failure, or poisoned lock fails closed to the original
+/// collection path.
 pub(crate) struct InputSplitRootBoundsCache {
     spec_identity: Arc<[u8]>,
     overall_deadline: Option<Instant>,
     entry: Mutex<Option<RootBoundsCacheEntry>>,
+    /// Deterministic typed reference map, kept separate from restart-sensitive
+    /// alpha/optimizer state. Used only when the whole-result cache must bypass
+    /// an RNG-consuming root.
+    typed_reference_entry: Mutex<Option<TypedReferenceMapCacheEntry>>,
     hits: AtomicUsize,
     misses: AtomicUsize,
     collections: AtomicUsize,
+    typed_reference_hits: AtomicUsize,
+    typed_reference_misses: AtomicUsize,
+    typed_reference_collections: AtomicUsize,
 }
 
 impl InputSplitRootBoundsCache {
@@ -91,9 +106,13 @@ impl InputSplitRootBoundsCache {
             spec_identity: Arc::from(spec_identity),
             overall_deadline,
             entry: Mutex::new(None),
+            typed_reference_entry: Mutex::new(None),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
             collections: AtomicUsize::new(0),
+            typed_reference_hits: AtomicUsize::new(0),
+            typed_reference_misses: AtomicUsize::new(0),
+            typed_reference_collections: AtomicUsize::new(0),
         }
     }
 
@@ -122,6 +141,16 @@ impl InputSplitRootBoundsCache {
         self.collections.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    fn typed_reference_hits(&self) -> usize {
+        self.typed_reference_hits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn typed_reference_collections(&self) -> usize {
+        self.typed_reference_collections.load(Ordering::Relaxed)
+    }
+
     fn lookup(&self, key: &RootBoundsCacheKey) -> Option<RootBoundsValue> {
         let Ok(guard) = self.entry.lock() else {
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +175,46 @@ impl InputSplitRootBoundsCache {
         *guard = Some(RootBoundsCacheEntry {
             key,
             value: Arc::new(clone_root_bounds_value(value)),
+        });
+    }
+
+    fn lookup_typed_reference(
+        &self,
+        key: &RootBoundsCacheKey,
+    ) -> Option<PrecomputedAlphaReferenceBounds> {
+        let Ok(guard) = self.typed_reference_entry.lock() else {
+            self.typed_reference_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let Some(entry) = guard.as_ref() else {
+            self.typed_reference_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if entry.key != *key {
+            self.typed_reference_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.typed_reference_hits.fetch_add(1, Ordering::Relaxed);
+        Some((*entry.value).clone())
+    }
+
+    fn note_typed_reference_collection(&self) -> usize {
+        self.typed_reference_collections
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    fn store_typed_reference(
+        &self,
+        key: RootBoundsCacheKey,
+        value: &PrecomputedAlphaReferenceBounds,
+    ) {
+        let Ok(mut guard) = self.typed_reference_entry.lock() else {
+            return;
+        };
+        *guard = Some(TypedReferenceMapCacheEntry {
+            key,
+            value: Arc::new(value.clone()),
         });
     }
 }
@@ -190,14 +259,8 @@ fn root_collection_options_identity(
     config: &BetaCrownConfig,
     engine: Option<&dyn GemmEngine>,
 ) -> Option<Vec<u8>> {
-    // SPSA is deliberately restart-seeded. Reusing seed 0's GraphAlphaState
-    // would defeat the multi-seed experiment, so fail closed to a miss.
-    if config.use_alpha_crown && config.alpha_config.gradient_method == GradientMethod::Spsa {
-        return None;
-    }
-
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"ny.disjunctive-root-cache.options.v1\0");
+    bytes.extend_from_slice(b"ny.disjunctive-root-cache.options.v2\0");
     bytes.push(u8::from(config.use_alpha_crown));
     bytes.push(u8::from(config.use_forward_bounds));
     bytes.push(u8::from(config.use_crown_ibp));
@@ -243,6 +306,7 @@ fn root_collection_options_identity(
         config.alpha_config.pruning_in_iteration_threshold,
         config.alpha_config.invprop.gamma_lr,
         config.alpha_config.start_save_best,
+        config.alpha_config.reference_refresh_fraction,
     ] {
         bytes.extend_from_slice(&value.to_bits().to_le_bytes());
     }
@@ -273,6 +337,31 @@ fn root_collection_options_identity(
             }
             bytes.extend_from_slice(&spec.threshold.to_bits().to_le_bytes());
             bytes.push(u8::from(spec.verify_upper_bound));
+        }
+        None => bytes.push(0),
+    }
+    // #root-alpha-margin: the ranking objective selects WHICH α the warmup returns,
+    // so two requests differing only in their margin rows yield different root α
+    // state. Without this discriminator the cache could serve one property's α for
+    // another's rows — the single wrong-verdict vector in that change.
+    //
+    // The `None` arm still pushes a byte, so every identity shifts relative to the
+    // pre-change build. That is harmless and deliberate: this key indexes an
+    // in-process `HashMap` built fresh each run, so a changed key can only ever cause
+    // a cold miss, never a stale hit. The version tag above is bumped in step so the
+    // change is explicit rather than implied by a silent layout shift.
+    match config.alpha_config.spec_ascent.as_ref() {
+        Some(ascent) => {
+            bytes.push(1);
+            push_len(&mut bytes, ascent.rows.len());
+            for row in &ascent.rows {
+                push_len(&mut bytes, row.objective.len());
+                for value in &row.objective {
+                    bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+                bytes.extend_from_slice(&row.threshold.to_bits().to_le_bytes());
+                bytes.push(u8::from(row.verify_upper_bound));
+            }
         }
         None => bytes.push(0),
     }
@@ -361,6 +450,63 @@ fn root_bounds_cache_key(
     })
 }
 
+/// Exact key for only the deterministic typed reference map. Unlike the
+/// whole-result key, this deliberately permits restart-seeded alpha methods
+/// and supplement-bearing operators: no alpha or optimizer state is stored in
+/// this tier. Eligibility is the same exact typed/Step-1 predicate used by
+/// alpha initialization, and every ordinary root returns `None`.
+fn typed_reference_map_cache_key(
+    cache: &InputSplitRootBoundsCache,
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    config: &BetaCrownConfig,
+    engine: Option<&dyn GemmEngine>,
+) -> Option<RootBoundsCacheKey> {
+    if !config.use_alpha_crown {
+        return None;
+    }
+    let exec_order = graph.exec_order().ok()?;
+    let typed = graph.cgan_complete_crown_ibp_root_eligible(&config.alpha_config, exec_order)
+        || graph.cgan_sparse_target_complete_root_eligible(&config.alpha_config, exec_order);
+    if !typed {
+        return None;
+    }
+    Some(RootBoundsCacheKey {
+        graph_scope: graph.cut_fold_scope(),
+        coverage: Arc::from(graph.crown_ibp_collection_cache_fingerprint(input, engine.is_some())),
+        options: Arc::from(root_collection_options_identity(config, engine)?),
+        spec: Arc::clone(&cache.spec_identity),
+    })
+}
+
+/// Collect the input-split ROOT node-bound map.
+///
+/// # CONTRACT FOR ANY FUTURE ARM THAT RETURNS `Some(map)` (#root-map-two-guards)
+///
+/// Every arm below currently returns `None` for the map. That is load-bearing:
+/// publishing a root-scope node-bound map is NOT verdict-neutral, and the two
+/// conditions that make it safe are NOT implied by each other. Establish BOTH
+/// before returning `Some`, or you will silently turn `unsat` into `unknown`.
+///
+/// 1. `config.input_split_ibp_enhancement` — the SCALAR lane only ever MERGES a
+///    supplied root map with the per-domain bounds. With the flag off it treats
+///    the map as a full OVERRIDE instead.
+///
+/// 2. `config.input_split_stacked_rebound` — the BATCHED dense-spec deferred
+///    rebound clones a supplied root map VERBATIM for every empty-history
+///    domain, and only merges per-domain refinements when this flag is also
+///    set. Publishing a root map with `stacked_rebound == false` therefore
+///    REPLACES each subdomain's own (tighter) CROWN-IBP intermediates with a
+///    root-scope map that was computed over the whole input box.
+///
+/// Discovered the hard way: a root LP/OBBT tightener built against this seam
+/// (preserved out-of-tree as tag `wip/lp-root-obbt`) was designed believing
+/// guard 1 alone sufficed. It does not. See
+/// `docs/RELAXATION_CAPABILITY_BUILD_2026-07-31.md`.
+///
+/// Note the map is only ever a TIGHTENING when both guards hold; the intersect
+/// must additionally be shrink-only and whole-node atomic, so a partially
+/// tightened node cannot mix scopes.
 pub(crate) fn collect_input_split_root_node_bounds(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -380,7 +526,19 @@ pub(crate) fn collect_input_split_root_node_bounds(
             .flatten()
             .map(|key| (cache, key))
     });
-    if restart_cache.is_some() && cache_key.is_none() {
+    let typed_reference_cache_key = cache_key
+        .is_none()
+        .then(|| {
+            restart_cache.and_then(|(cache, overall_deadline)| {
+                cache
+                    .deadline_matches(overall_deadline)
+                    .then(|| typed_reference_map_cache_key(cache, graph, input, config, engine))
+                    .flatten()
+                    .map(|key| (cache, key))
+            })
+        })
+        .flatten();
+    if restart_cache.is_some() && cache_key.is_none() && typed_reference_cache_key.is_none() {
         eprintln!(
             "[restart-root-cache] bypass mode={mode_label}; root collection is not exactly reusable"
         );
@@ -404,12 +562,85 @@ pub(crate) fn collect_input_split_root_node_bounds(
             cache.misses(),
         );
     }
+    let cached_typed_reference = if let Some((cache, key)) = typed_reference_cache_key.as_ref() {
+        match cache.lookup_typed_reference(key) {
+            Some(reference) => {
+                eprintln!(
+                    "[restart-root-cache] typed-map hit mode={mode_label} hit={} nodes={} \
+                     deadline_remaining={:.3}s; rebuilding alpha state",
+                    cache.typed_reference_hits.load(Ordering::Relaxed),
+                    reference.bounds.len(),
+                    initial_deadline
+                        .map(|deadline| deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_secs_f64())
+                        .unwrap_or(-1.0),
+                );
+                Some(reference)
+            }
+            None => {
+                let collection = cache.note_typed_reference_collection();
+                eprintln!(
+                    "[restart-root-cache] typed-map miss mode={mode_label} \
+                     collection={collection}; collecting deterministic reference"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     if config.use_alpha_crown {
         let mut alpha_config = config.alpha_config.clone();
         alpha_config.deadline = initial_deadline;
         info!("Computing α-CROWN initial bounds for {mode_label}...");
-        let (mut bounds, alpha_state) =
-            graph.collect_alpha_crown_bounds_dag_with_engine(input, &alpha_config, engine)?;
+        let precomputed_reference = match cached_typed_reference {
+            Some(reference) => Some(reference),
+            None if typed_reference_cache_key.is_some() => {
+                let exec_order = graph.exec_order()?;
+                // This collection was historically inside the DAG-alpha entry,
+                // whose L2 guard is disabled before Step 1. Preserve that exact
+                // producer contract when lifting only Step 1 into this cache.
+                let (bounds, source) = {
+                    let _l2_lever_off = crate::l2_lever_gate::L2LeverGuard::disabled();
+                    graph.collect_alpha_reference_bounds_with_engine_and_source(
+                        input,
+                        &alpha_config,
+                        engine,
+                        exec_order,
+                    )?
+                };
+                let reference = PrecomputedAlphaReferenceBounds { bounds, source };
+                if source.is_typed_cgan() {
+                    if let Some((cache, key)) = typed_reference_cache_key.as_ref() {
+                        cache.store_typed_reference(key.clone(), &reference);
+                        eprintln!(
+                            "[restart-root-cache] typed-map store mode={mode_label} nodes={} \
+                             alpha=false",
+                            reference.bounds.len(),
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "[restart-root-cache] typed-map declined mode={mode_label}; actual \
+                         reference source={source:?}, not caching"
+                    );
+                }
+                Some(reference)
+            }
+            None => None,
+        };
+        let (mut bounds, alpha_state) = match precomputed_reference {
+            Some(reference) => graph.collect_alpha_crown_bounds_dag_with_engine_and_reference(
+                input,
+                &alpha_config,
+                engine,
+                reference,
+            )?,
+            None => {
+                graph.collect_alpha_crown_bounds_dag_with_engine(input, &alpha_config, engine)?
+            }
+        };
         info!("α-CROWN produced {} intermediate bound sets", bounds.len());
         // Root JOINT per-target intermediate-bound α pass on the INPUT-SPLIT lanes
         // (#root-joint-interm-alpha; this fn is the single choke-point for the

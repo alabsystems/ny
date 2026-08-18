@@ -13,6 +13,7 @@ use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::debug;
 
+use crate::bounds::patches::PatchesMaterializationPurpose;
 use crate::Layer;
 
 use super::super::super::super::super::BetaCrownVerifier;
@@ -54,9 +55,13 @@ impl BetaCrownVerifier {
             return Ok(());
         }
 
-        let new_lb = {
-            let node_lb = node_cb.ensure_dense()?;
+        let propagated_owned = {
+            let node_lb = node_cb.ensure_dense_with_deadline_for_purpose(
+                params.deadline,
+                PatchesMaterializationPurpose::Other,
+            )?;
             if is_standard
+                && params.deadline.is_none()
                 && tracing::enabled!(tracing::Level::DEBUG)
                 && params.context.history.constraints.len() >= 12
             {
@@ -68,21 +73,43 @@ impl BetaCrownVerifier {
                     );
                 }
             }
-            let new_lb = linear
-                .propagate_linear_with_engine(node_lb, params.context.engine)
+            match linear
+                .propagate_linear_with_engine_and_deadline(
+                    node_lb,
+                    params.context.engine,
+                    params.deadline,
+                )
                 .map_err(|error| {
-                    NyError::InvalidSpec(format!(
-                        "Constrained CROWN failed at node '{}' (Linear): {}",
-                        current.node_name, error
-                    ))
-                })?;
-            match new_lb {
-                std::borrow::Cow::Borrowed(_) => node_lb.clone(),
-                std::borrow::Cow::Owned(lb) => lb,
+                    if error.is_deadline_exceeded() {
+                        error
+                    } else {
+                        NyError::InvalidSpec(format!(
+                            "Constrained CROWN failed at node '{}' (Linear): {}",
+                            current.node_name, error
+                        ))
+                    }
+                })? {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(lb) => Some(lb),
             }
         };
+        // A borrowed result is exactly the input relation. Move that carrier
+        // into publication instead of deep-cloning four potentially large
+        // arrays after the deadline-aware materialization transaction.
+        let new_lb = match propagated_owned {
+            None => node_cb.into_dense_with_deadline_for_purpose(
+                params.deadline,
+                PatchesMaterializationPurpose::Other,
+            )?,
+            Some(lb) => lb,
+        };
+        super::super::ensure_constrained_propagation_deadline(
+            params.deadline,
+            "after constrained linear propagation",
+        )?;
 
         if is_standard
+            && params.deadline.is_none()
             && tracing::enabled!(tracing::Level::DEBUG)
             && params.context.history.constraints.len() >= 12
         {
@@ -94,15 +121,22 @@ impl BetaCrownVerifier {
                 );
             }
         }
-
-        params.graph.accumulate_dense_bounds_to_input(
-            current.first_input,
-            new_lb,
-            &mut setup.state.node_crown_bounds,
-            setup.output_dim,
-            setup.input_dim,
-            &mut setup.state.input_accumulated,
+        super::super::ensure_constrained_propagation_deadline(
+            params.deadline,
+            "before constrained linear publication",
         )?;
+
+        params
+            .graph
+            .accumulate_dense_bounds_to_input_with_deadline(
+                current.first_input,
+                new_lb,
+                &mut setup.state.node_crown_bounds,
+                setup.output_dim,
+                setup.input_dim,
+                &mut setup.state.input_accumulated,
+                params.deadline,
+            )?;
         Ok(())
     }
 }

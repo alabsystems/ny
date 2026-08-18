@@ -17,7 +17,7 @@
 //! points (Linear layer) or for slope unfolding in activation layers.
 
 use ndarray::{ArrayD, IxDyn};
-use ny_core::{NyError, Result};
+use ny_core::{checked_shape_product, NyError, Result};
 
 /// Sliding window extraction (im2col) for image tensors.
 ///
@@ -46,8 +46,9 @@ use ny_core::{NyError, Result};
 ///
 /// # Errors
 ///
-/// Returns [`NyError::ShapeMismatch`] if the input is not 3D or 4D, or if
-/// the padded spatial dimensions are smaller than the kernel.
+/// Returns an error if the input is not 3D or 4D, the kernel or stride contains
+/// a zero dimension, the padded/output shape overflows, or the padded spatial
+/// dimensions are smaller than the kernel.
 ///
 /// # Reference
 ///
@@ -83,8 +84,29 @@ pub fn inplace_unfold(
     let (sh, sw) = stride;
     let (pad_left, pad_right, pad_top, pad_bottom) = padding;
 
-    let padded_h = height + pad_top + pad_bottom;
-    let padded_w = width + pad_left + pad_right;
+    if kh == 0 || kw == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "inplace_unfold requires a non-empty kernel, got {kernel_size:?}"
+        )));
+    }
+    if sh == 0 || sw == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "inplace_unfold requires non-zero stride, got {stride:?}"
+        )));
+    }
+
+    let padded_h = height
+        .checked_add(pad_top)
+        .and_then(|value| value.checked_add(pad_bottom))
+        .ok_or_else(|| {
+            NyError::InvalidSpec("inplace_unfold vertical padding overflows usize".to_string())
+        })?;
+    let padded_w = width
+        .checked_add(pad_left)
+        .and_then(|value| value.checked_add(pad_right))
+        .ok_or_else(|| {
+            NyError::InvalidSpec("inplace_unfold horizontal padding overflows usize".to_string())
+        })?;
 
     if padded_h < kh || padded_w < kw {
         return Err(NyError::ShapeMismatch {
@@ -93,8 +115,18 @@ pub fn inplace_unfold(
         });
     }
 
-    let out_h = (padded_h - kh) / sh + 1;
-    let out_w = (padded_w - kw) / sw + 1;
+    let out_h = (padded_h - kh)
+        .checked_div(sh)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InvalidSpec("inplace_unfold output height overflows usize".to_string())
+        })?;
+    let out_w = (padded_w - kw)
+        .checked_div(sw)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InvalidSpec("inplace_unfold output width overflows usize".to_string())
+        })?;
 
     // Output shape: (batch, out_h, out_w, C, kH, kW) or (out_h, out_w, C, kH, kW)
     let out_shape: Vec<usize> = if has_batch {
@@ -102,8 +134,22 @@ pub fn inplace_unfold(
     } else {
         vec![out_h, out_w, channels, kh, kw]
     };
-    let total_elems: usize = out_shape.iter().product();
-    let mut data = vec![0.0f32; total_elems];
+    let total_elems = checked_shape_product(&out_shape).ok_or_else(|| {
+        NyError::InvalidSpec(format!(
+            "inplace_unfold output shape product overflows: {out_shape:?}"
+        ))
+    })?;
+    if total_elems == 0 {
+        return ArrayD::from_shape_vec(IxDyn(&out_shape), Vec::new()).map_err(|e| {
+            NyError::InternalError(format!("inplace_unfold shape construction failed: {e}"))
+        });
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(total_elems).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "inplace_unfold output allocation failed for {total_elems} elements: {error}"
+        ))
+    })?;
 
     // Fill the output tensor by iterating over all window positions.
     // Memory layout: row-major (C-order) matching ndarray default.
@@ -117,46 +163,33 @@ pub fn inplace_unfold(
                             let ih_padded = oh * sh + ki;
                             let iw_padded = ow * sw + kj;
 
-                            // Map back to original image coordinates
-                            let ih = ih_padded as isize - pad_top as isize;
-                            let iw = iw_padded as isize - pad_left as isize;
-
-                            let value = if ih >= 0
-                                && (ih as usize) < height
-                                && iw >= 0
-                                && (iw as usize) < width
-                            {
-                                if has_batch {
-                                    image[[b, c, ih as usize, iw as usize].as_slice()]
-                                } else {
-                                    image[[c, ih as usize, iw as usize].as_slice()]
+                            // Map back to original image coordinates without signed
+                            // casts, which would wrap for padding above isize::MAX.
+                            let value = match (
+                                ih_padded.checked_sub(pad_top),
+                                iw_padded.checked_sub(pad_left),
+                            ) {
+                                (Some(ih), Some(iw)) if ih < height && iw < width => {
+                                    if has_batch {
+                                        image[[b, c, ih, iw].as_slice()]
+                                    } else {
+                                        image[[c, ih, iw].as_slice()]
+                                    }
                                 }
-                            } else {
-                                0.0 // Zero-padding
+                                _ => 0.0, // Zero-padding
                             };
 
-                            // Compute flat index in row-major order
-                            let flat_idx = if has_batch {
-                                b * (out_h * out_w * channels * kh * kw)
-                                    + oh * (out_w * channels * kh * kw)
-                                    + ow * (channels * kh * kw)
-                                    + c * (kh * kw)
-                                    + ki * kw
-                                    + kj
-                            } else {
-                                oh * (out_w * channels * kh * kw)
-                                    + ow * (channels * kh * kw)
-                                    + c * (kh * kw)
-                                    + ki * kw
-                                    + kj
-                            };
-                            data[flat_idx] = value;
+                            // The loop order is exactly ndarray's row-major output
+                            // order, so appending avoids a second set of overflow-prone
+                            // flat-index products.
+                            data.push(value);
                         }
                     }
                 }
             }
         }
     }
+    debug_assert_eq!(data.len(), total_elems);
 
     ArrayD::from_shape_vec(IxDyn(&out_shape), data).map_err(|e| {
         NyError::InternalError(format!("inplace_unfold shape construction failed: {e}"))
@@ -176,18 +209,31 @@ pub fn unfold_output_size(
     let (kh, kw) = kernel_size;
     let (sh, sw) = stride;
     let (pad_left, pad_right, pad_top, pad_bottom) = padding;
-    let padded_h = height + pad_top + pad_bottom;
-    let padded_w = width + pad_left + pad_right;
-    let out_h = if padded_h >= kh {
-        (padded_h - kh) / sh + 1
-    } else {
-        0
-    };
-    let out_w = if padded_w >= kw {
-        (padded_w - kw) / sw + 1
-    } else {
-        0
-    };
+
+    fn output_dim(
+        input: usize,
+        kernel: usize,
+        stride: usize,
+        pad_before: usize,
+        pad_after: usize,
+    ) -> usize {
+        if kernel == 0 || stride == 0 {
+            return 0;
+        }
+        let Some(padded) = input
+            .checked_add(pad_before)
+            .and_then(|value| value.checked_add(pad_after))
+        else {
+            return 0;
+        };
+        if padded < kernel {
+            return 0;
+        }
+        (padded - kernel) / stride + 1
+    }
+
+    let out_h = output_dim(height, kh, sh, pad_top, pad_bottom);
+    let out_w = output_dim(width, kw, sw, pad_left, pad_right);
     (out_h, out_w)
 }
 
@@ -383,5 +429,57 @@ mod tests {
             .into_dyn();
         // 5x5 kernel on 2x2 image with no padding → impossible
         assert!(inplace_unfold(&image, (5, 5), (1, 1), (0, 0, 0, 0)).is_err());
+    }
+
+    #[test]
+    fn test_unfold_rejects_zero_kernel_and_stride_without_panicking() {
+        let image = Array3::from_elem((1, 1, 1), 1.0).into_dyn();
+
+        assert!(inplace_unfold(&image, (0, 1), (1, 1), (0, 0, 0, 0)).is_err());
+        assert!(inplace_unfold(&image, (1, 1), (0, 1), (0, 0, 0, 0)).is_err());
+        assert_eq!(
+            unfold_output_size(1, 1, (0, 1), (1, 1), (0, 0, 0, 0)),
+            (0, 1)
+        );
+        assert_eq!(
+            unfold_output_size(1, 1, (1, 1), (0, 1), (0, 0, 0, 0)),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn test_unfold_rejects_padding_and_output_shape_overflow() {
+        let image = Array3::from_elem((1, 1, 1), 1.0).into_dyn();
+        assert!(inplace_unfold(&image, (1, 1), (1, 1), (usize::MAX, 0, 0, 0)).is_err());
+
+        let two_channels = Array3::from_elem((2, 1, 1), 1.0).into_dyn();
+        assert!(inplace_unfold(&two_channels, (1, 1), (1, 1), (0, usize::MAX - 1, 0, 0),).is_err());
+
+        assert_eq!(
+            unfold_output_size(1, 1, (1, 1), (1, 1), (usize::MAX, 0, 0, 0)),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn test_unfold_large_padding_does_not_wrap_through_isize() {
+        let image = Array3::from_elem((1, 1, 1), 7.0).into_dyn();
+        let large_pad = isize::MAX as usize + 1;
+
+        let result = inplace_unfold(&image, (1, 1), (usize::MAX, 1), (0, 0, large_pad, 0))
+            .expect("large valid padding must not wrap through a signed cast");
+
+        assert_eq!(result.shape(), &[1, 1, 1, 1, 1]);
+        assert_eq!(result[[0, 0, 0, 0, 0]], 0.0);
+    }
+
+    #[test]
+    fn test_unfold_zero_volume_returns_before_large_coordinate_loop() {
+        let image = Array3::<f32>::zeros((0, 1, 1)).into_dyn();
+        let result = inplace_unfold(&image, (1, 1), (1, 1), (0, 1_000_000, 0, 0))
+            .expect("zero-channel output is a valid empty tensor");
+
+        assert_eq!(result.shape(), &[1, 1_000_001, 0, 1, 1]);
+        assert!(result.is_empty());
     }
 }

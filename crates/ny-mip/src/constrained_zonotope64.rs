@@ -34,8 +34,13 @@ use ndarray::{Array2, ArrayView2};
 use num_rational::BigRational;
 use num_traits::{ToPrimitive, Zero};
 
+use crate::constrained_zonotope_call_budget::{
+    ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallBudgetError, ConstrainedZonotopeCallGate,
+    ConstrainedZonotopeCallOutcome, InertConstrainedZonotopeCallGate,
+};
 use crate::constrained_zonotope_dual::{
-    evaluate_constrained_zonotope64_dual, ConstrainedZonotopeDualBounds,
+    evaluate_constrained_zonotope64_dual, evaluate_constrained_zonotope64_dual_with_budget,
+    ConstrainedZonotopeDualBounds, ConstrainedZonotopeDualBudgetError,
     ConstrainedZonotopeDualError,
 };
 
@@ -186,6 +191,25 @@ pub enum ConstrainedZonotope64Error {
     Dual(#[from] ConstrainedZonotopeDualError),
 }
 
+/// Domain validation or cooperative call-firewall refusal while materializing
+/// a transform result.
+pub(crate) enum ConstrainedZonotope64CallGateError {
+    Domain(ConstrainedZonotope64Error),
+    Budget(ConstrainedZonotopeCallBudgetError),
+}
+
+impl From<ConstrainedZonotope64Error> for ConstrainedZonotope64CallGateError {
+    fn from(error: ConstrainedZonotope64Error) -> Self {
+        Self::Domain(error)
+    }
+}
+
+impl From<ConstrainedZonotopeCallBudgetError> for ConstrainedZonotope64CallGateError {
+    fn from(error: ConstrainedZonotopeCallBudgetError) -> Self {
+        Self::Budget(error)
+    }
+}
+
 impl ConstrainedZonotope64 {
     /// Validate and construct a general sparse constrained zonotope.
     ///
@@ -199,6 +223,37 @@ impl ConstrainedZonotope64 {
         rhs: Vec<f64>,
         box_remainder: Vec<f64>,
     ) -> Result<Self, ConstrainedZonotope64Error> {
+        let mut gate = InertConstrainedZonotopeCallGate;
+        match Self::try_new_with_call_gate(
+            center,
+            sparse_generators,
+            constraints,
+            rhs,
+            box_remainder,
+            &mut gate,
+        ) {
+            Ok(domain) => Ok(domain),
+            Err(ConstrainedZonotope64CallGateError::Domain(error)) => Err(error),
+            Err(ConstrainedZonotope64CallGateError::Budget(_)) => {
+                unreachable!("the inert constrained-zonotope constructor gate cannot refuse work")
+            }
+        }
+    }
+
+    /// Validate and construct a transform result while preserving the caller's
+    /// cooperative deadline-poll cadence. The caller owns admission,
+    /// peak-memory preflight, and the final publication checkpoint.
+    pub(crate) fn try_new_with_call_gate<G>(
+        center: Vec<f64>,
+        sparse_generators: Vec<Vec<(usize, f64)>>,
+        constraints: Array2<f64>,
+        rhs: Vec<f64>,
+        box_remainder: Vec<f64>,
+        gate: &mut G,
+    ) -> Result<Self, ConstrainedZonotope64CallGateError>
+    where
+        G: ConstrainedZonotopeCallGate,
+    {
         let value_dim = center.len();
         let alpha_dim = sparse_generators.len();
         let constraint_count = constraints.nrows();
@@ -208,21 +263,24 @@ impl ConstrainedZonotope64 {
                 field: "box_remainder",
                 expected: value_dim,
                 got: box_remainder.len(),
-            });
+            }
+            .into());
         }
         if constraints.ncols() != alpha_dim {
             return Err(ConstrainedZonotope64Error::Shape {
                 field: "constraints columns",
                 expected: alpha_dim,
                 got: constraints.ncols(),
-            });
+            }
+            .into());
         }
         if rhs.len() != constraint_count {
             return Err(ConstrainedZonotope64Error::Shape {
                 field: "rhs",
                 expected: constraint_count,
                 got: rhs.len(),
-            });
+            }
+            .into());
         }
 
         checked_resource_product(value_dim, alpha_dim, "value_dim * alpha_dim")?;
@@ -231,23 +289,27 @@ impl ConstrainedZonotope64 {
         if constraint_elements != constraints.len() {
             return Err(ConstrainedZonotope64Error::ResourceOverflow {
                 operation: "constraint matrix shape",
-            });
+            }
+            .into());
         }
 
-        validate_finite("center", center.iter().copied())?;
-        validate_finite("constraints", constraints.iter().copied())?;
-        validate_finite("rhs", rhs.iter().copied())?;
-        validate_finite("box_remainder", box_remainder.iter().copied())?;
+        validate_finite_with_call_gate("center", center.iter().copied(), gate)?;
+        validate_finite_with_call_gate("constraints", constraints.iter().copied(), gate)?;
+        validate_finite_with_call_gate("rhs", rhs.iter().copied(), gate)?;
+        validate_finite_with_call_gate("box_remainder", box_remainder.iter().copied(), gate)?;
         for (index, &remainder) in box_remainder.iter().enumerate() {
+            gate.charge_items(1, "constrained-zonotope remainder validation")?;
             if remainder < 0.0 {
-                return Err(ConstrainedZonotope64Error::NegativeRemainder { index });
+                return Err(ConstrainedZonotope64Error::NegativeRemainder { index }.into());
             }
         }
 
         let mut generators = Vec::new();
+        gate.checkpoint("constrained-zonotope generator-column allocation")?;
         try_reserve(&mut generators, alpha_dim, "sparse generator columns")?;
         let mut total_nnz = 0_usize;
         for (generator_index, entries) in sparse_generators.into_iter().enumerate() {
+            gate.charge_items(1, "constrained-zonotope generator-column validation")?;
             let column_start = total_nnz;
             total_nnz = total_nnz.checked_add(entries.len()).ok_or(
                 ConstrainedZonotope64Error::ResourceOverflow {
@@ -255,6 +317,7 @@ impl ConstrainedZonotope64 {
                 },
             )?;
             let mut validated = Vec::new();
+            gate.checkpoint("constrained-zonotope generator-entry allocation")?;
             try_reserve(
                 &mut validated,
                 entries.len(),
@@ -262,31 +325,36 @@ impl ConstrainedZonotope64 {
             )?;
             let mut previous_index = None;
             for (entry_index, (value_index, coefficient)) in entries.into_iter().enumerate() {
+                gate.charge_items(1, "constrained-zonotope generator-entry validation")?;
                 if value_index >= value_dim {
                     return Err(ConstrainedZonotope64Error::GeneratorIndexOutOfRange {
                         generator: generator_index,
                         entry: entry_index,
                         value_index,
                         value_dim,
-                    });
+                    }
+                    .into());
                 }
                 if previous_index.is_some_and(|previous| value_index <= previous) {
                     return Err(ConstrainedZonotope64Error::GeneratorOrder {
                         generator: generator_index,
                         entry: entry_index,
-                    });
+                    }
+                    .into());
                 }
                 if !coefficient.is_finite() {
                     return Err(ConstrainedZonotope64Error::NonFinite {
                         field: "generators",
                         index: column_start + entry_index,
-                    });
+                    }
+                    .into());
                 }
                 if coefficient == 0.0 {
                     return Err(ConstrainedZonotope64Error::ZeroSparseCoefficient {
                         generator: generator_index,
                         entry: entry_index,
-                    });
+                    }
+                    .into());
                 }
                 previous_index = Some(value_index);
                 validated.push(SparseGeneratorEntry64 {
@@ -466,6 +534,20 @@ impl ConstrainedZonotope64 {
         )?)
     }
 
+    /// Evaluate a supplied dual candidate behind the shared synchronous call
+    /// firewall.
+    pub fn evaluate_dual_with_budget(
+        &self,
+        direction: &[f64],
+        multipliers: &[f64],
+        budget: ConstrainedZonotopeCallBudget,
+    ) -> Result<
+        ConstrainedZonotopeCallOutcome<ConstrainedZonotopeDualBounds>,
+        ConstrainedZonotopeDualBudgetError,
+    > {
+        evaluate_constrained_zonotope64_dual_with_budget(self, direction, multipliers, budget)
+    }
+
     pub(crate) fn constraints_ref(&self) -> &Array2<f64> {
         &self.constraints
     }
@@ -478,6 +560,23 @@ fn validate_finite(
     for (index, value) in values.into_iter().enumerate() {
         if !value.is_finite() {
             return Err(ConstrainedZonotope64Error::NonFinite { field, index });
+        }
+    }
+    Ok(())
+}
+
+fn validate_finite_with_call_gate<G>(
+    field: &'static str,
+    values: impl IntoIterator<Item = f64>,
+    gate: &mut G,
+) -> Result<(), ConstrainedZonotope64CallGateError>
+where
+    G: ConstrainedZonotopeCallGate,
+{
+    for (index, value) in values.into_iter().enumerate() {
+        gate.charge_items(1, "constrained-zonotope finite-value validation")?;
+        if !value.is_finite() {
+            return Err(ConstrainedZonotope64Error::NonFinite { field, index }.into());
         }
     }
     Ok(())
@@ -591,9 +690,16 @@ fn ceil_nonnegative_rational_to_f64(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use ndarray::{array, Array2};
     use num_traits::Signed;
     use proptest::prelude::*;
+
+    use crate::constrained_zonotope_call_budget::{
+        ConstrainedZonotopeCallBudget, ConstrainedZonotopeCallTracker,
+        CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL,
+    };
 
     use super::*;
 
@@ -828,6 +934,40 @@ mod tests {
             Err(ConstrainedZonotope64Error::ResourceOverflow {
                 operation: "test product"
             })
+        ));
+    }
+
+    #[test]
+    fn budgeted_materialization_polls_inside_domain_validation() {
+        const ITEMS: usize = CONSTRAINED_ZONOTOPE_MAX_ITEMS_PER_POLL;
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let mut gate = ConstrainedZonotopeCallTracker::with_clock(
+            ConstrainedZonotopeCallBudget::new(deadline, 0, usize::MAX),
+            |checkpoint| {
+                if checkpoint == "constrained-zonotope finite-value validation" {
+                    deadline
+                } else {
+                    start
+                }
+            },
+        )
+        .unwrap();
+        let result = ConstrainedZonotope64::try_new_with_call_gate(
+            vec![0.0; ITEMS],
+            Vec::new(),
+            Array2::zeros((0, 0)),
+            Vec::new(),
+            vec![0.0; ITEMS],
+            &mut gate,
+        );
+        assert!(matches!(
+            result,
+            Err(ConstrainedZonotope64CallGateError::Budget(
+                ConstrainedZonotopeCallBudgetError::DeadlineExpired {
+                    checkpoint: "constrained-zonotope finite-value validation",
+                }
+            ))
         ));
     }
 

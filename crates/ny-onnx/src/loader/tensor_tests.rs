@@ -6,13 +6,13 @@
 
 use super::{
     extract_constant_tensor, onnx_elem_type_to_dtype, tensor_proto_to_array,
-    tensor_proto_to_loaded_tensor,
+    tensor_proto_to_loaded_tensor, value_info_to_tensor_spec,
 };
 use crate::loader::numeric_cast::{
     f64_to_f32_checked, i32_to_f32_warned, i64_to_f32_checked, i64_to_f32_warned,
 };
-use crate::onnx_proto::TensorProto;
 use crate::onnx_proto::{attribute_type, AttributeProto, NodeProto};
+use crate::onnx_proto::{TensorProto, TensorTypeProto, TypeProto, ValueInfoProto};
 use crate::DataType;
 use ny_core::NyError;
 
@@ -52,8 +52,6 @@ fn onnx_elem_type_to_dtype_maps_supported_types() {
         (1, DataType::Float32),
         (6, DataType::Int32),
         (7, DataType::Int64),
-        (10, DataType::Float16),
-        (11, DataType::Float32), // DOUBLE → Float32 downcast (#2781)
     ];
     for (elem_type, expected) in cases {
         let dtype = onnx_elem_type_to_dtype(elem_type).expect("supported type should parse");
@@ -131,11 +129,132 @@ fn tensor_proto_to_array_decodes_int8_raw_data() {
     assert_eq!(arr[[3]], 0.0);
 }
 
-/// DOUBLE raw_data is correctly decoded to f32 (with precision loss).
-/// Pre-existing handler; test added during self-audit for coverage.
+#[test]
+fn tensor_proto_to_loaded_tensor_decodes_uint16_raw_with_integer_provenance() {
+    let values = [0_u16, 1, 32_768, u16::MAX];
+    let raw = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let tensor = make_tensor_with_raw_data("u16", &[4], 4, raw);
+    let loaded = tensor_proto_to_loaded_tensor(&tensor).expect("should decode UINT16");
+
+    assert_eq!(
+        loaded.float_data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 1.0, 32_768.0, 65_535.0]
+    );
+    assert_eq!(
+        loaded
+            .integer_data
+            .expect("UINT16 must retain exact integer data")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![0, 1, 32_768, 65_535]
+    );
+    assert_eq!(loaded.integer_range, Some((0, 65_535)));
+}
+
+#[test]
+fn tensor_proto_to_loaded_tensor_decodes_int16_raw_with_integer_provenance() {
+    let values = [i16::MIN, -1, 0, i16::MAX];
+    let raw = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let tensor = make_tensor_with_raw_data("i16", &[4], 5, raw);
+    let loaded = tensor_proto_to_loaded_tensor(&tensor).expect("should decode INT16");
+
+    assert_eq!(
+        loaded.float_data.iter().copied().collect::<Vec<_>>(),
+        vec![-32_768.0, -1.0, 0.0, 32_767.0]
+    );
+    assert_eq!(
+        loaded
+            .integer_data
+            .expect("INT16 must retain exact integer data")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![-32_768, -1, 0, 32_767]
+    );
+    assert_eq!(loaded.integer_range, Some((-32_768, 32_767)));
+}
+
+#[test]
+fn tensor_proto_to_loaded_tensor_validates_widened_int16_payloads() {
+    let uint16 = TensorProto {
+        dims: vec![2],
+        data_type: 4,
+        name: "u16_wide".to_string(),
+        int32_data: vec![0, i32::from(u16::MAX)],
+        ..Default::default()
+    };
+    let loaded = tensor_proto_to_loaded_tensor(&uint16).expect("widened UINT16 should decode");
+    assert_eq!(loaded.integer_range, Some((0, 65_535)));
+
+    let mut invalid = uint16;
+    invalid.int32_data = vec![0, -1];
+    let error = match tensor_proto_to_loaded_tensor(&invalid) {
+        Err(error) => error,
+        Ok(_) => panic!("negative widened UINT16 must be rejected"),
+    };
+    assert!(error.to_string().contains("UINT16 int32_data value -1"));
+
+    let int16 = TensorProto {
+        dims: vec![2],
+        data_type: 5,
+        name: "i16_wide".to_string(),
+        int32_data: vec![i32::from(i16::MIN), i32::from(i16::MAX)],
+        ..Default::default()
+    };
+    let loaded = tensor_proto_to_loaded_tensor(&int16).expect("widened INT16 should decode");
+    assert_eq!(loaded.integer_range, Some((-32_768, 32_767)));
+
+    let mut invalid = int16;
+    invalid.int32_data = vec![i32::from(i16::MIN) - 1, 0];
+    let error = match tensor_proto_to_loaded_tensor(&invalid) {
+        Err(error) => error,
+        Ok(_) => panic!("out-of-range widened INT16 must be rejected"),
+    };
+    assert!(error.to_string().contains("INT16 int32_data value -32769"));
+}
+
+#[test]
+fn empty_integer_tensors_retain_typed_sidecar_and_range() {
+    let cases = [
+        (2, (0, 255)),
+        (3, (-128, 127)),
+        (4, (0, 65_535)),
+        (5, (-32_768, 32_767)),
+        (6, (i32::MIN as i64, i32::MAX as i64)),
+        (7, (i64::MIN, i64::MAX)),
+    ];
+    for (data_type, expected_range) in cases {
+        let tensor = TensorProto {
+            dims: vec![0, 3],
+            data_type,
+            name: format!("empty_{data_type}"),
+            ..Default::default()
+        };
+        let loaded = tensor_proto_to_loaded_tensor(&tensor)
+            .unwrap_or_else(|error| panic!("empty dtype {data_type} should decode: {error}"));
+        assert!(loaded.float_data.is_empty());
+        assert!(
+            loaded
+                .integer_data
+                .as_ref()
+                .is_some_and(|values| values.is_empty()),
+            "dtype {data_type} lost its empty integer sidecar"
+        );
+        assert_eq!(loaded.integer_range, Some(expected_range));
+    }
+}
+
+/// Exactly representable DOUBLE raw_data can be preserved as f32 constants.
 #[test]
 fn tensor_proto_to_array_decodes_double_raw_data() {
-    let values = [1.0f64, -0.5, std::f64::consts::PI];
+    let values = [1.0f64, -0.5, 1.5];
     let mut raw = Vec::new();
     for &v in &values {
         raw.extend_from_slice(&v.to_le_bytes());
@@ -143,15 +262,22 @@ fn tensor_proto_to_array_decodes_double_raw_data() {
     let tensor = make_tensor_with_raw_data("f64", &[3], 11, raw);
     let arr = tensor_proto_to_array(&tensor).expect("should decode DOUBLE");
     assert_eq!(arr.len(), 3);
-    // f64→f32 loses precision but values within f32 range should be close
     assert_eq!(arr[[0]], 1.0);
     assert_eq!(arr[[1]], -0.5);
+    assert_eq!(arr[[2]], 1.5);
+}
+
+#[test]
+fn tensor_proto_to_array_rejects_inexact_double_raw_data() {
+    let value = 16_777_217.0f64;
+    let tensor =
+        make_tensor_with_raw_data("rounded_double", &[1], 11, value.to_le_bytes().to_vec());
+    let err = tensor_proto_to_array(&tensor).expect_err("rounded DOUBLE must fail closed");
     assert!(
-        (arr[[2]] - std::f32::consts::PI).abs() < 1e-6,
-        "pi: expected ~{}, got {}",
-        std::f32::consts::PI,
-        arr[[2]]
+        err.to_string().contains("cannot be represented exactly"),
+        "{err}"
     );
+    assert!(err.to_string().contains("rounded_double"), "{err}");
 }
 
 #[test]
@@ -443,7 +569,7 @@ fn tensor_proto_to_array_rejects_out_of_range_uint8_int32_data() {
     }
 }
 
-/// Non-raw DOUBLE payload (double_data, tag 10) decodes with f64→f32 downcast.
+/// Non-raw DOUBLE payloads are accepted only when their values survive exactly.
 #[test]
 fn tensor_proto_to_array_decodes_double_data() {
     let tensor = TensorProto {
@@ -475,6 +601,106 @@ fn tensor_proto_to_array_rejects_mismatched_typed_field() {
         }
         other => unreachable!("unexpected error: {other:?}"),
     }
+}
+
+/// FLOAT payloads are only valid for FLOAT tensors. Previously this branch
+/// bypassed data_type validation and silently loaded an INT64 tensor as f32.
+#[test]
+fn tensor_proto_to_array_rejects_mismatched_float_data() {
+    let tensor = TensorProto {
+        dims: vec![1],
+        data_type: 7,
+        name: "mismatched_float".to_string(),
+        float_data: vec![4.0],
+        ..Default::default()
+    };
+    let err = tensor_proto_to_array(&tensor).unwrap_err();
+    match err {
+        NyError::ModelLoad(msg) => {
+            assert!(msg.contains("float_data"), "msg = {msg}");
+            assert!(msg.contains("data_type 7"), "msg = {msg}");
+        }
+        other => unreachable!("unexpected error: {other:?}"),
+    }
+}
+
+/// TensorProto uses exactly one data representation. Accepting two and picking
+/// by field precedence makes malformed files decode ambiguously.
+#[test]
+fn tensor_proto_to_array_rejects_multiple_payload_fields() {
+    let tensor = TensorProto {
+        dims: vec![1],
+        data_type: 1,
+        name: "ambiguous".to_string(),
+        raw_data: 1.0f32.to_le_bytes().to_vec(),
+        float_data: vec![2.0],
+        ..Default::default()
+    };
+    let err = tensor_proto_to_array(&tensor).unwrap_err();
+    match err {
+        NyError::ModelLoad(msg) => {
+            assert!(
+                msg.contains("multiple populated data fields"),
+                "msg = {msg}"
+            );
+            assert!(msg.contains("raw_data"), "msg = {msg}");
+            assert!(msg.contains("float_data"), "msg = {msg}");
+        }
+        other => unreachable!("unexpected error: {other:?}"),
+    }
+}
+
+/// ONNX stores typed FLOAT16/BFLOAT16 values as uint16 bit patterns widened
+/// into int32_data.
+#[test]
+fn tensor_proto_to_array_decodes_half_precision_int32_data() {
+    let fp16 = TensorProto {
+        dims: vec![3],
+        data_type: 10,
+        name: "fp16_typed".to_string(),
+        int32_data: [1.0f32, -0.5, f32::INFINITY]
+            .into_iter()
+            .map(|value| i32::from(half::f16::from_f32(value).to_bits()))
+            .collect(),
+        ..Default::default()
+    };
+    let fp16_array = tensor_proto_to_array(&fp16).expect("typed FLOAT16 should decode");
+    assert_eq!(
+        fp16_array.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, -0.5, f32::INFINITY]
+    );
+
+    let bf16 = TensorProto {
+        dims: vec![3],
+        data_type: 16,
+        name: "bf16_typed".to_string(),
+        int32_data: [1.0f32, -0.5, f32::NEG_INFINITY]
+            .into_iter()
+            .map(|value| i32::from(half::bf16::from_f32(value).to_bits()))
+            .collect(),
+        ..Default::default()
+    };
+    let bf16_array = tensor_proto_to_array(&bf16).expect("typed BFLOAT16 should decode");
+    assert_eq!(
+        bf16_array.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, -0.5, f32::NEG_INFINITY]
+    );
+}
+
+#[test]
+fn tensor_proto_to_array_rejects_out_of_range_half_bit_pattern() {
+    let tensor = TensorProto {
+        dims: vec![1],
+        data_type: 10,
+        name: "fp16_bad_bits".to_string(),
+        int32_data: vec![i32::from(u16::MAX) + 1],
+        ..Default::default()
+    };
+    let err = tensor_proto_to_array(&tensor).unwrap_err();
+    assert!(
+        err.to_string().contains("bit pattern") && err.to_string().contains("out of range"),
+        "msg = {err}"
+    );
 }
 
 /// A shape-carrying tensor with every data field empty must fail closed, never
@@ -514,6 +740,64 @@ fn tensor_proto_to_array_accepts_zero_element_tensor_without_data() {
     assert_eq!(arr.len(), 0);
 }
 
+/// Empty tensors still require a supported element type; otherwise unsupported
+/// metadata could bypass type validation solely because no payload is present.
+#[test]
+fn tensor_proto_to_array_rejects_unsupported_zero_element_tensor() {
+    let tensor = TensorProto {
+        dims: vec![0],
+        data_type: 99,
+        name: "empty_unknown".to_string(),
+        ..Default::default()
+    };
+    let err = tensor_proto_to_array(&tensor).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported ONNX data_type 99"),
+        "msg = {err}"
+    );
+}
+
+#[test]
+fn value_info_to_tensor_spec_rejects_missing_tensor_type() {
+    for value_info in [
+        ValueInfoProto {
+            name: "missing_type".to_string(),
+            r#type: None,
+        },
+        ValueInfoProto {
+            name: "non_tensor_type".to_string(),
+            r#type: Some(TypeProto { tensor_type: None }),
+        },
+    ] {
+        let err = value_info_to_tensor_spec(&value_info).unwrap_err();
+        assert!(
+            err.to_string().contains("missing tensor type metadata"),
+            "msg = {err}"
+        );
+        assert!(err.to_string().contains(&value_info.name), "msg = {err}");
+    }
+}
+
+#[test]
+fn value_info_to_tensor_spec_rejects_unknown_rank() {
+    let value_info = ValueInfoProto {
+        name: "unknown_rank".to_string(),
+        r#type: Some(TypeProto {
+            tensor_type: Some(TensorTypeProto {
+                elem_type: 1,
+                shape: None,
+            }),
+        }),
+    };
+
+    let err = value_info_to_tensor_spec(&value_info).unwrap_err();
+    assert!(
+        err.to_string().contains("missing tensor shape metadata"),
+        "msg = {err}"
+    );
+    assert!(err.to_string().contains(&value_info.name), "msg = {err}");
+}
+
 /// data_location=EXTERNAL keeps the payload outside the model file; loading it
 /// as if the inline fields were authoritative would fabricate data.
 #[test]
@@ -543,7 +827,8 @@ fn onnx_elem_type_to_dtype_rejects_unsupported_graph_dtypes() {
         (2, "UINT8"),
         (3, "INT8"),
         (9, "BOOL"),
-        // (11, DOUBLE) — now supported, mapped to Float32 (#2781)
+        (10, "FLOAT16"),
+        (11, "DOUBLE"),
         (16, "BFLOAT16"),
         (999, "Unknown ONNX element type"),
     ];

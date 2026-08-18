@@ -27,12 +27,67 @@ def _load_module():
 archive = _load_module()
 
 
+def _v3_lever_state() -> dict[str, object]:
+    levers = [
+        {
+            "name": "NY_ALPHA_ZERO_YIELD_FRAC",
+            "value": 0.25,
+            "source": "config",
+            "bucket": "debug",
+            "moat": "high",
+            "provenance": "measured",
+        },
+        {
+            "name": "NY_PHASE_TELEMETRY",
+            "value": True,
+            "source": "legacy_env",
+            "bucket": "debug",
+            "moat": "low",
+            "provenance": "unmeasured",
+            "env_utf8": True,
+        },
+    ]
+    return {
+        "status": "resolved",
+        "receipt": {
+            "schema": "ny-levers/receipt/v2",
+            "lever_count": len(levers),
+            "env_present": 1,
+            "env_accepted": 1,
+            "env_rejected": 0,
+            "levers": levers,
+        },
+    }
+
+
+def _v3_flight_record() -> dict[str, object]:
+    return {
+        "schema_version": 3,
+        "backend_kind": "cpu-only",
+        "backend_summary": "fixture",
+        "host": {},
+        "category": "acasxu_2023",
+        "budget_secs": 116,
+        "ambient_env": {"NY_PHASE_TELEMETRY": "1"},
+        "levers": _v3_lever_state(),
+        "events": [
+            {
+                "method": "run_complete",
+                "status": "complete",
+                "reason": "unsat",
+                "at_secs": 1.25,
+            }
+        ],
+    }
+
+
 def _archive(
     tmp_path: Path,
     result_file: Path,
     *,
     solver_verdict: str = "sat",
     instance_index: int = 7,
+    flight_file: Path | None = None,
 ) -> Path:
     artifact_root = tmp_path / "artifacts"
     start_manifest = artifact_root / "runs" / "20260718T120000Z-123" / "start.json"
@@ -86,6 +141,7 @@ def _archive(
         source_csv="reports/measured/acasxu_2023.csv",
         start_manifest=start_manifest,
         preflight_manifest=preflight_manifest,
+        flight_file=flight_file,
     )
 
 
@@ -141,15 +197,244 @@ def test_archives_non_sat_result_and_marks_validation_not_applicable(
     assert metadata["counterexample_validation"]["status"] == "not_applicable"
 
 
+def test_embeds_a_row_bound_flight_record_in_immutable_metadata(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "result.txt"
+    result_file.write_text("unsat\n", encoding="utf-8")
+    flight_file = tmp_path / "result.txt.flight.json"
+    record = {
+        "schema_version": 2,
+        "backend_kind": "cpu-only",
+        "backend_summary": "fixture",
+        "host": {},
+        "category": "acasxu_2023",
+        "budget_secs": 116,
+        "ambient_env": {"NY_INVPROP": "1", "OMP_NUM_THREADS": "1"},
+        "events": [
+            {
+                "method": "run_complete",
+                "status": "complete",
+                "reason": "unsat",
+                "at_secs": 1.25,
+            }
+        ],
+    }
+    flight_file.write_text(json.dumps(record), encoding="utf-8")
+
+    archived = _archive(
+        tmp_path,
+        result_file,
+        solver_verdict="unsat",
+        flight_file=flight_file,
+    )
+
+    metadata = json.loads(archived.with_suffix(".json").read_text(encoding="utf-8"))
+    captured = metadata["flight_record"]
+    assert captured["status"] == "captured"
+    assert captured["record"] == record
+    assert captured["size_bytes"] == len(flight_file.read_bytes())
+    assert (
+        captured["source_sha256"]
+        == archive.hashlib.sha256(flight_file.read_bytes()).hexdigest()
+    )
+
+
+def test_embeds_a_valid_v3_flight_record_with_resolved_levers(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "result.txt"
+    result_file.write_text("unsat\n", encoding="utf-8")
+    flight_file = tmp_path / "result.txt.flight.json"
+    record = _v3_flight_record()
+    flight_file.write_text(json.dumps(record), encoding="utf-8")
+
+    archived = _archive(
+        tmp_path,
+        result_file,
+        solver_verdict="unsat",
+        flight_file=flight_file,
+    )
+
+    metadata = json.loads(archived.with_suffix(".json").read_text(encoding="utf-8"))
+    assert metadata["flight_record"]["record"] == record
+
+
+def test_embeds_an_early_v3_flight_record_before_levers_materialize(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "result.txt"
+    result_file.write_text("unsat\n", encoding="utf-8")
+    flight_file = tmp_path / "result.txt.flight.json"
+    record = _v3_flight_record()
+    record["levers"] = {"status": "not_materialized"}
+    flight_file.write_text(json.dumps(record), encoding="utf-8")
+
+    archived = _archive(
+        tmp_path,
+        result_file,
+        solver_verdict="unsat",
+        flight_file=flight_file,
+    )
+
+    metadata = json.loads(archived.with_suffix(".json").read_text(encoding="utf-8"))
+    assert metadata["flight_record"]["record"] == record
+
+
+def test_embeds_a_v3_flight_record_with_explicit_invalid_config(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "result.txt"
+    result_file.write_text("unknown\n", encoding="utf-8")
+    flight_file = tmp_path / "result.txt.flight.json"
+    record = _v3_flight_record()
+    record["levers"] = {
+        "status": "invalid_config",
+        "reason": "alpha_zero_yield_frac must be finite and in range",
+    }
+    record["events"][-1]["reason"] = "unknown"
+    flight_file.write_text(json.dumps(record), encoding="utf-8")
+
+    archived = _archive(
+        tmp_path,
+        result_file,
+        solver_verdict="unknown",
+        flight_file=flight_file,
+    )
+
+    metadata = json.loads(archived.with_suffix(".json").read_text(encoding="utf-8"))
+    assert metadata["flight_record"]["record"] == record
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "missing_state",
+        "unknown_status",
+        "count_type",
+        "duplicate_name",
+        "invalid_source",
+        "invalid_source_type",
+        "inconsistent_env_counts",
+        "invalid_env_utf8",
+        "empty_registry",
+        "extra_entry_field",
+        "env_source_missing_ambient",
+        "config_with_env_evidence",
+        "invalid_name",
+        "unmeasured_default_on",
+        "guard_auto",
+        "empty_invalid_reason",
+    ),
+)
+def test_rejects_malformed_v3_lever_state(
+    tmp_path: Path, malformation: str
+) -> None:
+    result_file = tmp_path / "result.txt"
+    result_file.write_text("unsat\n", encoding="utf-8")
+    flight_file = tmp_path / "result.txt.flight.json"
+    record = _v3_flight_record()
+    receipt = record["levers"]["receipt"]
+    if malformation == "missing_state":
+        del record["levers"]
+    elif malformation == "unknown_status":
+        record["levers"] = {"status": "pending"}
+    elif malformation == "count_type":
+        receipt["lever_count"] = True
+    elif malformation == "duplicate_name":
+        receipt["levers"][1]["name"] = receipt["levers"][0]["name"]
+    elif malformation == "invalid_source":
+        receipt["levers"][1]["source"] = "env"
+    elif malformation == "invalid_source_type":
+        receipt["levers"][1]["source"] = []
+    elif malformation == "inconsistent_env_counts":
+        receipt["env_present"] = 0
+    elif malformation == "invalid_env_utf8":
+        receipt["levers"][1]["env_utf8"] = "yes"
+    elif malformation == "empty_registry":
+        receipt["levers"] = []
+        receipt["lever_count"] = 0
+        receipt["env_present"] = 0
+        receipt["env_accepted"] = 0
+    elif malformation == "extra_entry_field":
+        receipt["levers"][0]["unexpected"] = "not in receipt/v2"
+    elif malformation == "env_source_missing_ambient":
+        del record["ambient_env"]["NY_PHASE_TELEMETRY"]
+    elif malformation == "config_with_env_evidence":
+        receipt["levers"][0]["env_utf8"] = True
+    elif malformation == "invalid_name":
+        receipt["levers"][0]["name"] = "NY_lowercase"
+    elif malformation == "unmeasured_default_on":
+        receipt["levers"][1]["bucket"] = "default_on"
+    elif malformation == "guard_auto":
+        receipt["levers"][0]["provenance"] = "guard"
+        receipt["levers"][0]["bucket"] = "auto"
+    elif malformation == "empty_invalid_reason":
+        record["levers"] = {"status": "invalid_config", "reason": ""}
+    flight_file.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="flight record identity is invalid"):
+        _archive(
+            tmp_path,
+            result_file,
+            solver_verdict="unsat",
+            flight_file=flight_file,
+        )
+
+
+def test_rejects_a_flight_record_for_a_different_terminal_verdict(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "result.txt"
+    result_file.write_text("unsat\n", encoding="utf-8")
+    flight_file = tmp_path / "result.txt.flight.json"
+    flight_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "backend_kind": "cpu-only",
+                "backend_summary": "fixture",
+                "host": {},
+                "category": "acasxu_2023",
+                "budget_secs": 116,
+                "ambient_env": {},
+                "events": [
+                    {
+                        "method": "run_complete",
+                        "status": "complete",
+                        "reason": "sat",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="terminal verdict"):
+        _archive(
+            tmp_path,
+            result_file,
+            solver_verdict="unsat",
+            flight_file=flight_file,
+        )
+
+
 def test_archives_empty_timeout_result_bytes(tmp_path: Path) -> None:
     result_file = tmp_path / "result.txt"
     result_file.write_bytes(b"")
+    flight_file = tmp_path / "result.txt.flight.json"
 
-    archived = _archive(tmp_path, result_file, solver_verdict="timeout")
+    archived = _archive(
+        tmp_path,
+        result_file,
+        solver_verdict="timeout",
+        flight_file=flight_file,
+    )
 
     assert archived.read_bytes() == b""
     metadata = json.loads(archived.with_suffix(".json").read_text(encoding="utf-8"))
     assert metadata["raw_result_sha256"] == archive.hashlib.sha256(b"").hexdigest()
+    assert metadata["flight_record"] == {"status": "missing"}
 
 
 def test_preflight_rejects_transient_input_swap_and_restore(tmp_path: Path) -> None:

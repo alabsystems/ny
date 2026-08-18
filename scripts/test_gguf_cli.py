@@ -14,14 +14,13 @@ import subprocess
 import sys
 import tempfile
 
-import numpy as np
-
-# Ensure gguf is available
+# Ensure the optional GGUF test stack is available.
 try:
+    import numpy as np
     from gguf import GGUFWriter
     from gguf.constants import GGMLQuantizationType
-except ImportError:
-    print("SKIP: gguf package required (pip install gguf)")
+except ImportError as exc:
+    print(f"SKIP: numpy and gguf packages required: {exc}")
     sys.exit(0)
 
 
@@ -359,7 +358,7 @@ def test_quantized_gguf_load():
     return True
 
 
-def test_quantized_types():
+def test_quantized_types() -> bool | None:
     """Test loading multiple quantized types."""
     print("\n=== Test: Multiple quantized types ===")
 
@@ -393,8 +392,8 @@ def test_quantized_types():
                     print(f"FAIL (code={code})")
                     results.append((name, False))
             except Exception as e:
-                print(f"SKIP (gguf writer error: {e})")
-                results.append((name, None))
+                print(f"FAIL (gguf writer error: {e})")
+                results.append((name, False))
 
     # Report results
     passed = sum(1 for _, r in results if r is True)
@@ -406,6 +405,9 @@ def test_quantized_types():
     if failed > 0:
         print(f"FAIL: {failed} quantized types failed")
         return False
+    if skipped > 0:
+        print("SKIP: At least one requested quantized type could not be written")
+        return None
 
     print("PASS")
     return True
@@ -429,22 +431,32 @@ def main():
 
     passed = 0
     failed = 0
+    skipped = 0
     for test in tests:
         try:
-            if test():
+            result = test()
+            if result is True:
                 passed += 1
-            else:
+            elif result is False:
                 failed += 1
+            else:
+                skipped += 1
         except Exception as e:
             print(f"ERROR: {e}")
             failed += 1
 
     print("\n" + "=" * 50)
-    print(f"Results: {passed}/{len(tests)} passed")
+    print(
+        f"Results: {passed} passed, {failed} failed, "
+        f"{skipped} skipped ({len(tests)} total)"
+    )
 
     if failed > 0:
         print(f"FAILED: {failed} tests failed")
         sys.exit(1)
+    if skipped > 0:
+        print("All runnable tests passed; skipped cases were not counted as passes.")
+        sys.exit(0)
     else:
         print("All tests passed!")
         sys.exit(0)

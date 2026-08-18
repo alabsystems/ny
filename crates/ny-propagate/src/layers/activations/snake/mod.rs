@@ -115,7 +115,10 @@ impl SnakeLayer {
 
 /// Evaluate snake(x) = x + (1/a) * sin²(a*x) in f64 for precision.
 pub(crate) fn snake_eval_f64(x: f64, a: f64) -> f64 {
-    if a.abs() < 1e-15 {
+    // Only the exact zero-frequency limit is identity. Any nonzero binary32
+    // alpha can still accumulate an O(1/|a|) residual at a sufficiently large
+    // input, so a magnitude cutoff is not a sound semantic shortcut.
+    if a == 0.0 {
         return x;
     }
     let sin_ax = (a * x).sin();
@@ -300,25 +303,54 @@ fn enumerate_periodic_points(
 
 /// Analytical linear relaxation for Snake on interval [l, u].
 ///
-/// Uses chord from endpoints plus analytical deviation bounds.
-/// For point intervals: tangent at l. For degenerate a: identity.
+/// Uses chord from endpoints plus analytical deviation bounds. Narrow intervals
+/// take the exact monotone enclosure; small `|a|` and unresolvable phase take
+/// the universal band.
+///
+/// THE THRESHOLDS HERE ARE RELATIVE TO `a`, NOT ABSOLUTE. Every earlier
+/// violation this function had came from an absolute cutoff applied to a
+/// function whose only intrinsic scale is `1/a`: `|a| < 1e-8 ⇒ identity` (the
+/// deviation is `1/|a|` there, not zero) and `u - l < 1e-8 ⇒ tangent` (at
+/// `a = 1e8` that width is a full radian of oscillation, not a point). Both are
+/// now decided against `a`.
 pub(crate) fn snake_linear_relaxation(l: f32, u: f32, a: f32) -> LinearRelaxation {
     if l.is_nan() || u.is_nan() || a.is_nan() {
         return LinearRelaxation::nan_fallback();
     }
+    let l64 = f64::from(l);
+    let u64 = f64::from(u);
+    let a64 = f64::from(a);
+
+    // The band relaxation is sound for EVERY `a` and every interval; it is only
+    // loose. So it is the answer in both regimes where the oscillation term
+    // cannot be pinned down: `|a|` too small for the identity limit to have
+    // arrived, and `|a·x|` too large for `sin` to have a meaningful argument.
     if a.abs() < 1e-8 {
-        return LinearRelaxation::identity();
+        return snake_band_relaxation(l, u, a);
     }
+    // Ordered BEFORE the phase check on purpose: an unbounded side makes
+    // `|a·x|` unresolvable by construction, and the constant-bound shape that
+    // #3083 pinned is what callers of a half-infinite domain expect.
+    // `snake_infinite_relaxation` makes its own phase check for its one finite
+    // endpoint.
     if l.is_infinite() || u.is_infinite() {
         return snake_infinite_relaxation(l, u, a);
     }
+    if phase_is_beyond_f64_resolution(a64, l64, u64) {
+        return snake_band_relaxation(l, u, a);
+    }
 
-    let l64 = l as f64;
-    let u64 = u as f64;
-    let a64 = a as f64;
-
-    if (u64 - l64).abs() < 1e-8 {
-        return snake_tangent_relaxation(l64, a64, l, u);
+    // A point interval, and any interval too narrow to take a chord across
+    // without amplifying the endpoint cancellation, gets the EXACT enclosure
+    // instead of a line: `f' = 1 + sin(2ax) ≥ 0` everywhere, so `f` is
+    // non-decreasing and `f([l, u]) = [f(l), f(u))]`. A tangent line used to be
+    // returned here, which is not an enclosure of a non-convex function over a
+    // non-degenerate interval, and at `|l| ~ 1e12` its `intercept = y - slope·l`
+    // also cancelled away most of its own significance on the way back to f32.
+    // `1e-8 / |a|` is the width in x of a fixed small phase, so this stays a
+    // point test as `a` grows instead of quietly becoming a full period.
+    if (u64 - l64).abs() < 1e-8 / a64.abs() {
+        return snake_monotone_enclosure(l64, u64, a64);
     }
 
     let fl = snake_eval_f64(l64, a64);
@@ -339,10 +371,112 @@ pub(crate) fn snake_linear_relaxation(l: f32, u: f32, a: f32) -> LinearRelaxatio
     )
 }
 
+/// Whether `sin(a·x)` has any meaning at this scale.
+///
+/// `a` and `x` are exact f32 values, so `a64 * x64` is one correctly-rounded
+/// product — but its ABSOLUTE error is `|a·x|·2^-53`, and that is an error in
+/// RADIANS. Past roughly `2^43` the angle is uncertain by more than a
+/// milliradian; past `2^52` its ulp exceeds a full radian and `sin` of it
+/// carries no information about the true phase at all. Every branch that
+/// evaluates `sin` must refuse those inputs rather than relax around a number
+/// the hardware invented — the audit's `a = 2.96e35` witness had `|a·x| ≈ 2e27`.
+fn phase_is_beyond_f64_resolution(a64: f64, l64: f64, u64: f64) -> bool {
+    const MAX_RESOLVABLE_PHASE: f64 = 8.796_093_022_208e12; // 2^43
+    let max_abs_x = l64.abs().max(u64.abs());
+    // `!(<=)` rather than `>`: a NaN product must count as unresolvable, and
+    // `>` would answer `false` for it.
+    !matches!(
+        (a64.abs() * max_abs_x).partial_cmp(&MAX_RESOLVABLE_PHASE),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    )
+}
+
+/// The EXACT enclosure of Snake over `[l, u]`, as two constants.
+///
+/// `f'(x) = 1 + sin(2ax) ≥ 0` for every real `a` and `x`, so Snake is
+/// non-decreasing everywhere and `f([l, u]) = [f(l), f(u)]` — there is nothing
+/// to relax. Constants carry no correlation with `x` downstream, which is why
+/// this is reserved for intervals narrow enough that the correlation is worth
+/// nothing anyway; in exchange it has no cancellation to widen for, unlike a
+/// line whose intercept must undo `slope · l`.
+fn snake_monotone_enclosure(l64: f64, u64: f64, a64: f64) -> LinearRelaxation {
+    let fl = snake_eval_f64(l64, a64);
+    let fu = snake_eval_f64(u64, a64);
+    // One f32 ulp outward covers the f64 evaluation error by ~9 orders of
+    // magnitude; `next_down(nearest(v)) < v < next_up(nearest(v))` holds because
+    // the nearest f32 is within half an ulp.
+    LinearRelaxation::new(0.0, next_down_f32(fl as f32), 0.0, next_up_f32(fu as f32))
+}
+
+/// Slope-1 relaxation carrying the full deviation band — sound for any `a`.
+///
+/// The small-`|a|` branch previously returned [`LinearRelaxation::identity`]
+/// outright, on the reading that Snake degenerates to `f(x) = x` as `a → 0`. It
+/// does not.
+/// The module header states the true range — `f(x) ∈ [x, x + 1/a]` — and that
+/// band WIDENS as `a` shrinks. At `a = 1e-9` the identity line can sit `1e9`
+/// below the function, and the field-wide envelope audit found exactly that:
+/// 117 violations, the worst `6.8e8` low at `l = u = -1e12`. An upper envelope
+/// beneath the function is the false-proof direction.
+///
+/// The deviation is `d(x) = sin²(ax)/a`, and `sin²(t) ≤ min(1, t²)` gives
+///
+/// ```text
+///     |d(x)| ≤ D = min(1/|a|, |a|·M²),   M = max(|l|, |u|)
+/// ```
+///
+/// Both arms of that minimum matter. `1/|a|` is what bounds the oscillation once
+/// `|a·x|` is large enough to complete a period — the regime the shortcut got
+/// wrong. `|a|·M²` is what keeps ordinary inputs sharp: at `M = 1`, `a = 1e-9`
+/// the band is `1e-9`, so this stays the identity relaxation to within an ULP
+/// wherever the old code was actually right.
+///
+/// `d` is single-signed — it takes the sign of `a`, since `sin² ≥ 0` — so the
+/// band is one-sided and only the intercept on that side moves.
+fn snake_band_relaxation(l: f32, u: f32, a: f32) -> LinearRelaxation {
+    let a64 = f64::from(a);
+    // `M` may be infinite (this branch is reached before the infinite-bound
+    // check). Then `|a|·M²` is infinite and the minimum is `1/|a|`, which is
+    // the correct finite band — a strictly better answer than the constant
+    // bounds `snake_infinite_relaxation` would have given.
+    let m = f64::from(l.abs().max(u.abs()));
+    let deviation = if a64 == 0.0 {
+        // The exact limit: `sin²(0·x)/a` is `0/0` in arithmetic but `0` in the
+        // limit, because `sin²(ax) ≤ a²x²` vanishes faster than `a`.
+        0.0
+    } else {
+        (1.0 / a64.abs()).min(a64.abs() * m * m)
+    };
+    // Round the band OUTWARD. `next_up_f32` of a rounded-to-nearest f32 is a
+    // sound cover of the f64 value; the slope is exactly 1, so it contributes
+    // no error of its own to widen for.
+    let band = next_up_f32(deviation as f32);
+    if a64 < 0.0 {
+        // `d ≤ 0`: the function sits at or BELOW the identity line.
+        LinearRelaxation::new(1.0, next_down_f32(-band), 1.0, 0.0)
+    } else {
+        LinearRelaxation::new(1.0, 0.0, 1.0, band)
+    }
+}
+
 /// Relaxation for infinite input bounds. Sound constant bounds.
+///
+/// The finite endpoint is evaluated through `sin`, so it gets the same phase
+/// check every other `sin`-evaluating branch gets — an unbounded side does not
+/// excuse relaxing around a phase the hardware invented. When the check refuses,
+/// the universal band is still available and is in fact TIGHTER here than the
+/// constants below, since it replaces an infinite side with `x ± 1/|a|`.
 fn snake_infinite_relaxation(l: f32, _u: f32, a: f32) -> LinearRelaxation {
     if l.is_infinite() && _u.is_infinite() {
         return LinearRelaxation::new(0.0, f32::NEG_INFINITY, 0.0, f32::INFINITY);
+    }
+    let finite_endpoint = if l.is_infinite() { _u } else { l };
+    if phase_is_beyond_f64_resolution(
+        f64::from(a),
+        f64::from(finite_endpoint),
+        f64::from(finite_endpoint),
+    ) {
+        return snake_band_relaxation(l, _u, a);
     }
     if l.is_infinite() {
         let fu = snake_eval_f64(_u as f64, a as f64);
@@ -352,22 +486,6 @@ fn snake_infinite_relaxation(l: f32, _u: f32, a: f32) -> LinearRelaxation {
     // Lower bound = constant f(l), upper bound = +inf.
     let fl = snake_eval_f64(l as f64, a as f64);
     LinearRelaxation::new(0.0, next_down_f32(fl as f32), 0.0, f32::INFINITY)
-}
-
-/// Tangent-line relaxation for point intervals (l ≈ u).
-fn snake_tangent_relaxation(l64: f64, a64: f64, l: f32, u: f32) -> LinearRelaxation {
-    let y = snake_eval_f64(l64, a64);
-    let slope = 1.0 + (2.0 * a64 * l64).sin();
-    let intercept = y - slope * l64;
-    let slope_f32 = slope as f32;
-    let slope_err =
-        next_up_f32(((slope - slope_f32 as f64).abs() * l.abs().max(u.abs()) as f64) as f32);
-    LinearRelaxation::new(
-        slope_f32,
-        next_down_f32((intercept as f32) - slope_err),
-        slope_f32,
-        next_up_f32((intercept as f32) + slope_err),
-    )
 }
 
 impl SnakeLayer {

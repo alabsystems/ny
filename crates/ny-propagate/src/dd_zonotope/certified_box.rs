@@ -55,6 +55,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use ny_core::f32_to_f64_exact;
 use ny_tensor::BoundedTensor;
 
 /// A registered exact-decimal input box plus the identity of the f32 box it
@@ -211,7 +212,7 @@ pub(crate) fn lookup(input: &BoundedTensor) -> Option<ExactBox> {
         if !cl.is_finite() || !cu.is_finite() || cl > cu {
             return None;
         }
-        if cl < f64::from(f32_lower[i]) || cu > f64::from(f32_upper[i]) {
+        if cl < f32_to_f64_exact(f32_lower[i]) || cu > f32_to_f64_exact(f32_upper[i]) {
             return None;
         }
         let (chi, clo, cerr, hw) = (
@@ -237,7 +238,7 @@ pub(crate) fn lookup(input: &BoundedTensor) -> Option<ExactBox> {
         if !lo_recon.is_finite() || !hi_recon.is_finite() {
             return None;
         }
-        if lo_recon < f64::from(f32_lower[i]) || hi_recon > f64::from(f32_upper[i]) {
+        if lo_recon < f32_to_f64_exact(f32_lower[i]) || hi_recon > f32_to_f64_exact(f32_upper[i]) {
             return None;
         }
     }

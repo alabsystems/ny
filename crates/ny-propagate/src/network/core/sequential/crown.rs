@@ -13,21 +13,28 @@ pub(crate) use bounds_validation::has_degraded_bounds;
 
 // CROWN output tightening via forward-bound intersection (Packet 2, #3880).
 mod tighten;
-pub(crate) use tighten::{tighten_crown_output, tighten_crown_output_with_provenance};
+pub(crate) use tighten::{
+    tighten_crown_output, tighten_crown_output_with_deadline,
+    tighten_crown_output_with_provenance_and_deadline,
+};
 
 // GPU layer extraction and static cache helpers (Packet 3 of crown.rs decomposition).
 mod gpu_extraction;
 pub(crate) use gpu_extraction::{
-    apply_bn_werr_to_host_relu, extract_relu_gpu_layer_with_alpha, try_extract_batch_norm_conv1x1,
-    try_extract_single_gpu_layer, GpuCrownStaticCache,
+    apply_bn_werr_to_host_relu, extract_relu_gpu_layer_with_alpha, gpu_relu_affine_cell,
+    try_extract_batch_norm_conv1x1, try_extract_single_gpu_layer, GpuCrownStaticCache,
+    GpuReluAffineVariant,
 };
 
 // Dense backward-step dispatch and materialization budget helpers (Packet 4, #4162).
 mod backward_step;
 
 // Patches backward step dispatch (Packet 1 of crown.rs three-module extraction, #4005).
-mod patches_step;
-pub(crate) use patches_step::crown_backward_step_patches;
+pub(crate) mod patches_step;
+pub(crate) use patches_step::{
+    crown_backward_step_patches, crown_backward_step_patches_spec_crown,
+    crown_backward_step_patches_with_deadline_authority, SpecPatchesStepError,
+};
 
 // Public CROWN entry-point wrappers (Packet B of #4233 crown.rs decomposition).
 mod entry_points;
@@ -38,20 +45,22 @@ mod sdp;
 // Batched N-D CROWN propagation (Packet D of #4233 crown.rs decomposition).
 mod batched;
 
-use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
+use crate::bounds::patches::{CrownBounds, PatchesLinearBounds, PatchesMaterializationPurpose};
 use crate::bounds::LinearBounds;
 use crate::contiguous_flat_slice;
 use crate::layers::Layer;
 use crate::types::CrownIbpFallbackReason;
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{GemmEngine, NyError, Result};
-use ny_tensor::{BoundedTensor, RepairStrategy};
+use ny_tensor::BoundedTensor;
+use std::mem::size_of;
 use std::time::Instant;
 use tracing::{debug, info, instrument};
 
 use super::Network;
 use backward_step::{
-    crown_backward_step, dense_identity_budget_estimate, dense_materialization_budget_estimate,
+    crown_backward_step, crown_backward_step_with_dispatch_boundary,
+    dense_identity_budget_estimate, dense_materialization_budget_estimate,
     guard_dense_materialization_budget, log_dense_materialization_budget_fallback,
 };
 use gpu_extraction::extract_gpu_crown_layers_cached;
@@ -76,6 +85,83 @@ pub(crate) enum CrownStepResult {
     IbpFallback(CrownStepFallback),
 }
 
+/// Materialize a terminal Patches carrier while classifying only a structured
+/// host-memory refusal as an established forward-bound fallback. Shape,
+/// numerical, deadline, and internal errors remain typed.
+pub(crate) fn materialize_terminal_crown_bounds(
+    bounds: CrownBounds,
+) -> Result<Option<LinearBounds>> {
+    materialize_terminal_crown_bounds_with_deadline(bounds, None)
+}
+
+/// Deadline-aware terminal materialization.  The same absolute authority used
+/// by the backward walk covers validation, allocation, scatter, numeric
+/// firewalls, and publication.  A deadline refusal is deliberately not mapped
+/// to the memory fallback: callers must preserve its distinct terminal policy.
+pub(crate) fn materialize_terminal_crown_bounds_with_deadline(
+    bounds: CrownBounds,
+    deadline: Option<Instant>,
+) -> Result<Option<LinearBounds>> {
+    match bounds.into_dense_with_deadline_for_purpose(
+        deadline,
+        PatchesMaterializationPurpose::NetworkInputTerminal,
+    ) {
+        Ok(bounds) => Ok(Some(bounds)),
+        Err(NyError::CpuMemoryExceeded { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[inline]
+fn check_gpu_crown_deadline(deadline: Option<Instant>, phase: &str) -> Result<()> {
+    if deadline.is_some_and(|value| Instant::now() >= value) {
+        Err(NyError::DeadlineExceeded(format!(
+            "sequential full-GPU CROWN backward: deadline exceeded {phase}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_crown_publication_deadline(deadline: Option<Instant>, phase: &'static str) -> Result<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        Err(NyError::DeadlineExceeded(format!(
+            "CROWN: deadline exceeded {phase}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Clone an already-computed forward fallback without hiding an
+/// uninterruptible endpoint-pair copy inside a finite CROWN request. The
+/// no-deadline route keeps the historical `Clone` implementation exactly.
+fn clone_crown_forward_fallback(
+    bounds: &BoundedTensor,
+    deadline: Option<Instant>,
+) -> Result<BoundedTensor> {
+    if deadline.is_some() {
+        tighten::clone_forward_bounds_with_deadline(bounds, deadline)
+    } else {
+        Ok(bounds.clone())
+    }
+}
+
+/// Allocate the dense identity seed without making allocation failure a
+/// process abort. The GPU lane is optional; overflow or allocator refusal must
+/// select the already-materialized CPU CROWN path below.
+fn try_gpu_identity_spec(output_dim: usize) -> Option<Vec<f32>> {
+    let elements = output_dim.checked_mul(output_dim)?;
+    let mut spec = Vec::new();
+    spec.try_reserve_exact(elements).ok()?;
+    spec.resize(elements, 0.0);
+    for row in 0..output_dim {
+        let diagonal = row.checked_mul(output_dim)?.checked_add(row)?;
+        spec[diagonal] = 1.0;
+    }
+    Some(spec)
+}
+
 impl Network {
     /// Core CROWN implementation with optional pre-computed IBP bounds (#3397).
     #[instrument(skip(self, input, precomputed_ibp, engine, deadline), fields(num_layers = self.layers.len(), input_shape = ?input.shape()))]
@@ -94,20 +180,40 @@ impl Network {
         // passes are gated off. Sound; restored on drop. See `crate::l2_lever_gate`.
         let _l2_lever_off = crate::l2_lever_gate::L2LeverGuard::disabled();
         if self.layers.is_empty() {
-            return Ok(input.clone());
+            return clone_crown_forward_fallback(input, deadline);
         }
+        // Deadline check before expensive CROWN-IBP collection (#3328). An
+        // owned precomputed IBP vector already contains the certified output,
+        // so that result can be moved out in O(1) without doing any post-expiry
+        // work. A fresh request has no such publishable artifact and remains a
+        // typed deadline refusal.
+        let precomputed_ibp = if deadline.is_some_and(|d| Instant::now() >= d) {
+            match precomputed_ibp {
+                Some(mut bounds) => {
+                    if bounds.len() != self.layers.len() {
+                        return Err(NyError::InvalidSpec(format!(
+                            "pre-computed IBP bounds have {} entries, expected {} (one per layer)",
+                            bounds.len(),
+                            self.layers.len()
+                        )));
+                    }
+                    return bounds.pop().ok_or_else(|| {
+                        NyError::InvalidSpec("No pre-computed layer bounds supplied".to_string())
+                    });
+                }
+                None => {
+                    return Err(NyError::DeadlineExceeded(
+                        "CROWN: deadline exceeded before CROWN-IBP collection".into(),
+                    ));
+                }
+            }
+        } else {
+            precomputed_ibp
+        };
         if self.has_self_attention() {
             return Err(NyError::UnsupportedConfiguration(
                 "SelfAttention requires a graph network; use GraphNetwork IBP or CROWN".to_string(),
             ));
-        }
-
-        // Deadline check before expensive CROWN-IBP collection (#3328).
-        if let Some(d) = deadline {
-            if Instant::now() >= d {
-                info!("CROWN: deadline exceeded before CROWN-IBP collection, falling back to IBP");
-                return self.propagate_ibp(input);
-            }
         }
 
         // Step 1: Collect CROWN-IBP intermediate bounds.
@@ -169,7 +275,14 @@ impl Network {
         crown_backward_layers: Option<usize>,
     ) -> Result<BoundedTensor> {
         if self.layers.is_empty() {
-            return Ok(input.clone());
+            return clone_crown_forward_fallback(input, deadline);
+        }
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            // `layer_bounds` is borrowed. Publishing its output would require
+            // an O(output) clone, which cannot begin after authority expires.
+            return Err(NyError::DeadlineExceeded(
+                "CROWN: deadline exceeded before borrowed layer-bound propagation".into(),
+            ));
         }
         if self.has_self_attention() {
             return Err(NyError::UnsupportedConfiguration(
@@ -183,7 +296,6 @@ impl Network {
                 self.layers.len()
             )));
         }
-
         let output_bounds = layer_bounds
             .last()
             .ok_or_else(|| NyError::InvalidSpec("No layer bounds computed".to_string()))?;
@@ -219,7 +331,19 @@ impl Network {
                 "CROWN: Patches mode — 3D spatial output {:?} with Conv2d",
                 spatial
             );
-            CrownBounds::Patches(Box::new(PatchesLinearBounds::identity(spatial, spatial)))
+            let seed = match PatchesLinearBounds::try_identity_with_deadline(
+                spatial, spatial, deadline, 0,
+            ) {
+                Ok(seed) => seed,
+                Err(error) if error.is_deadline_exceeded() || error.is_cpu_memory_exceeded() => {
+                    debug!(
+                        "CROWN: Patches identity admission refused ({error}); reusing CROWN-IBP output bounds"
+                    );
+                    return clone_crown_forward_fallback(output_bounds, deadline);
+                }
+                Err(error) => return Err(error),
+            };
+            CrownBounds::Patches(Box::new(seed))
         } else {
             debug!(
                 "CROWN: Dense mode — output_shape {:?}, has_conv2d={}",
@@ -229,9 +353,16 @@ impl Network {
                 dense_identity_budget_estimate("initial_dense_identity", output_dim)
             {
                 log_dense_materialization_budget_fallback("CROWN", estimate, None, None);
-                return self.propagate_ibp(input);
+                return clone_crown_forward_fallback(output_bounds, deadline);
             }
-            CrownBounds::Dense(LinearBounds::identity(output_dim))
+            CrownBounds::Dense(LinearBounds::try_identity_with_deadline(
+                output_dim,
+                deadline,
+                output_bounds
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_mul(size_of::<f32>()),
+            )?)
         };
 
         // GPU fast-path (#3397): if the engine supports full GPU CROWN backward and all
@@ -242,103 +373,150 @@ impl Network {
         // so this whole GPU f32 fast-path is bypassed and the proven-sound CPU
         // backward+concretize loop below decides the bound. See `sound_gpu_gate`.
         if !crown_bounds.is_patches() {
-            if let Some((gpu, use_sound)) = crate::sound_gpu_gate::gpu_crown_backward_route(engine)
-            {
-                if let Some(gpu_layers) = extract_gpu_crown_layers_cached(
+            'gpu_fast_path: {
+                // The backend deadline contract begins at device dispatch, but
+                // this optional lane first extracts every layer, may copy both
+                // input endpoint arrays, and builds an O(output_dim^2) host
+                // identity. Under FINITE authority the route below therefore
+                // consults only ALREADY-MATERIALIZED backends (the caller's
+                // engine, or a process-global slot prewarmed at qualification
+                // time — `Some(deadline)` never invokes a lazy factory, see
+                // `select_lazy_backend_for_deadline`), and admission
+                // additionally requires a SOUND backend that honors
+                // cooperative cancellation (#charged-metal-engagement): the
+                // unpollable host stretches are bracketed by the explicit
+                // checkpoints below and the device walk polls the leased
+                // deadline between work units. A backend that leaves the
+                // cooperative-deadline capability at its default (e.g. the
+                // CUDA engine, whose claim is deliberately narrow) is refused
+                // under a deadline exactly as the earlier blanket skip did —
+                // fail-closed to the deadline-aware CPU path, byte-identical
+                // bounds for those hosts. The no-deadline GPU route remains
+                // unchanged.
+                let Some((gpu, use_sound)) =
+                    crate::sound_gpu_gate::gpu_crown_backward_route_with_deadline(engine, deadline)
+                else {
+                    break 'gpu_fast_path;
+                };
+                if deadline.is_some() && !use_sound {
+                    debug!(
+                        "CROWN: GPU fast-path skipped — finite authority admits only a sound backend"
+                    );
+                    break 'gpu_fast_path;
+                }
+                // A finite verifier deadline may enter this multi-dispatch fast
+                // path only when the exact routed backend advertises cooperative
+                // cancellation. Otherwise skip it and use the deadline-aware CPU
+                // backward below. Do not route a second time when installing the
+                // lease: a process-global sound backend may differ from `engine`.
+                if !crate::sound_gpu_gate::gpu_crown_backend_honors_deadline(gpu, deadline) {
+                    debug!(
+                        "CROWN: GPU fast-path skipped — routed backend does not honor deadlines"
+                    );
+                    break 'gpu_fast_path;
+                }
+                if check_gpu_crown_deadline(deadline, "before layer extraction").is_err() {
+                    debug!("CROWN: GPU fast-path deadline refusal; falling back to CPU");
+                    break 'gpu_fast_path;
+                }
+                let Some(gpu_layers) = extract_gpu_crown_layers_cached(
                     &self.layers,
                     layer_bounds,
                     input,
                     &self.gpu_crown_cache,
-                ) {
-                    debug!(
-                        "CROWN: GPU fast-path — {} layers all supported, {} specs",
-                        gpu_layers.len(),
-                        output_dim
-                    );
-                    let input_lower = contiguous_flat_slice(input.lower());
-                    let input_upper = contiguous_flat_slice(input.upper());
-
-                    // Build identity spec matrix: each row i has 1.0 at column i, 0.0 elsewhere.
-                    // This propagates bounds for every output neuron independently.
-                    let mut spec = vec![0.0f32; output_dim * output_dim];
-                    for i in 0..output_dim {
-                        spec[i * output_dim + i] = 1.0;
-                    }
-
-                    // Under the soundness gate `use_sound` is true: decide the
-                    // bound on the SOUND GPU-resident backward (certified enclosure).
-                    // Otherwise the existing fast (unsound) path. Either way, an
-                    // Err or NaN below falls through to the proven CPU sound loop.
-                    let gpu_result = if use_sound {
-                        gpu.crown_backward_gpu_sound(
-                            &gpu_layers,
-                            &spec,
-                            output_dim,
-                            &input_lower,
-                            &input_upper,
-                        )
-                    } else {
-                        gpu.crown_backward_gpu(
-                            &gpu_layers,
-                            &spec,
-                            output_dim,
-                            &input_lower,
-                            &input_upper,
-                        )
-                    };
-                    match gpu_result {
-                        Ok(result) => {
-                            // Raw-NaN pre-check (#3757): Widen repair maps NaN to ±inf,
-                            // which would erase the signal before tighten_crown_output()
-                            // can reject the whole GPU result.
-                            let has_nan = result
-                                .lower_bounds
-                                .iter()
-                                .chain(result.upper_bounds.iter())
-                                .any(|v| v.is_nan());
-                            if has_nan {
-                                info!("CROWN: NaN in raw GPU bounds, falling back to CPU");
-                            } else {
-                                let lower = ArrayD::from_shape_vec(
-                                    IxDyn(&output_shape),
-                                    result.lower_bounds,
-                                )
-                                .map_err(|e| {
-                                    NyError::InvalidSpec(format!("GPU CROWN reshape: {e}"))
-                                })?;
-                                let upper = ArrayD::from_shape_vec(
-                                    IxDyn(&output_shape),
-                                    result.upper_bounds,
-                                )
-                                .map_err(|e| {
-                                    NyError::InvalidSpec(format!("GPU CROWN reshape: {e}"))
-                                })?;
-
-                                let crown_output = BoundedTensor::new_repaired(
-                                    lower,
-                                    upper,
-                                    RepairStrategy::Widen,
-                                )?;
-                                info!(
-                                    "CROWN: GPU backward succeeded — {} specs × {} layers",
-                                    output_dim,
-                                    gpu_layers.len()
-                                );
-                                return tighten_crown_output(
-                                    crown_output,
-                                    output_bounds,
-                                    "CROWN-GPU",
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            info!("CROWN: GPU backward failed ({}), falling back to CPU", e);
-                            // Fall through to CPU backward loop below
-                        }
-                    }
-                } else {
+                ) else {
                     debug!("CROWN: GPU fast-path skipped — unsupported layer types");
+                    break 'gpu_fast_path;
+                };
+                debug!(
+                    "CROWN: GPU fast-path — {} layers all supported, {} specs",
+                    gpu_layers.len(),
+                    output_dim
+                );
+                let input_lower = contiguous_flat_slice(input.lower());
+                let input_upper = contiguous_flat_slice(input.upper());
+
+                // Build identity spec matrix: each row i has 1.0 at column i.
+                // Overflow/OOM is an optional-lane refusal, not a verifier error.
+                let Some(spec) = try_gpu_identity_spec(output_dim) else {
+                    info!("CROWN: GPU identity allocation refused, falling back to CPU");
+                    break 'gpu_fast_path;
+                };
+
+                if check_gpu_crown_deadline(deadline, "before backend launch").is_err() {
+                    debug!("CROWN: GPU launch deadline refusal; falling back to CPU");
+                    break 'gpu_fast_path;
                 }
+                let _gpu_deadline_scope =
+                    crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, deadline);
+
+                // Under the soundness gate `use_sound` is true. Every backend
+                // error and every malformed payload is a whole-result refusal;
+                // the proven CPU loop below remains the sole fallback authority.
+                let gpu_result = if use_sound {
+                    gpu.crown_backward_gpu_sound(
+                        &gpu_layers,
+                        &spec,
+                        output_dim,
+                        &input_lower,
+                        &input_upper,
+                    )
+                } else {
+                    gpu.crown_backward_gpu(
+                        &gpu_layers,
+                        &spec,
+                        output_dim,
+                        &input_lower,
+                        &input_upper,
+                    )
+                };
+                if check_gpu_crown_deadline(deadline, "after backend launch").is_err() {
+                    debug!("CROWN: GPU completion missed deadline; falling back to CPU");
+                    break 'gpu_fast_path;
+                }
+                let result = match gpu_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        info!(
+                            "CROWN: GPU backward failed ({}), falling back to CPU",
+                            error
+                        );
+                        break 'gpu_fast_path;
+                    }
+                };
+                if !crate::sound_gpu_gate::gpu_crown_result_is_publishable(&result, output_dim) {
+                    info!("CROWN: malformed GPU bounds, falling back to CPU");
+                    break 'gpu_fast_path;
+                }
+
+                let (Ok(lower), Ok(upper)) = (
+                    ArrayD::from_shape_vec(IxDyn(&output_shape), result.lower_bounds),
+                    ArrayD::from_shape_vec(IxDyn(&output_shape), result.upper_bounds),
+                ) else {
+                    info!("CROWN: GPU result reshape refused, falling back to CPU");
+                    break 'gpu_fast_path;
+                };
+                let Ok(crown_output) = BoundedTensor::new(lower, upper) else {
+                    info!("CROWN: GPU result validation refused, falling back to CPU");
+                    break 'gpu_fast_path;
+                };
+                info!(
+                    "CROWN: GPU backward succeeded — {} specs × {} layers",
+                    output_dim,
+                    gpu_layers.len()
+                );
+                return match tighten_crown_output_with_deadline(
+                    crown_output,
+                    output_bounds,
+                    "CROWN-GPU",
+                    deadline,
+                ) {
+                    Ok(bounds) => Ok(bounds),
+                    Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {
+                        clone_crown_forward_fallback(output_bounds, deadline)
+                    }
+                    Err(error) => Err(error),
+                };
             }
         }
 
@@ -355,7 +533,7 @@ impl Network {
                         i,
                         self.layers.len()
                     );
-                    return Ok(output_bounds.clone());
+                    return clone_crown_forward_fallback(output_bounds, deadline);
                 }
             }
 
@@ -371,14 +549,46 @@ impl Network {
                     "truncated_concretization",
                 )? {
                     log_dense_materialization_budget_fallback("CROWN", estimate, None, None);
-                    return Ok(output_bounds.clone());
+                    return clone_crown_forward_fallback(output_bounds, deadline);
                 }
                 let truncation_bounds = &layer_bounds[i];
-                let crown_output = crown_bounds
-                    .into_dense()?
-                    .concretize_sound(truncation_bounds)
-                    .reshape(&output_shape)?;
-                return tighten_crown_output(crown_output, output_bounds, "CROWN");
+                let dense =
+                    match materialize_terminal_crown_bounds_with_deadline(crown_bounds, deadline) {
+                        Ok(Some(bounds)) => bounds,
+                        Ok(None) | Err(NyError::DeadlineExceeded(_)) => {
+                            return clone_crown_forward_fallback(output_bounds, deadline);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let crown_output =
+                    match dense.concretize_sound_with_deadline(truncation_bounds, deadline) {
+                        Ok(bounds) => bounds,
+                        Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {
+                            return clone_crown_forward_fallback(output_bounds, deadline);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let crown_output = match crown_output.into_reshape_with_poll(&output_shape, || {
+                    check_crown_publication_deadline(deadline, "during truncated reshape")
+                }) {
+                    Ok(bounds) => bounds,
+                    Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {
+                        return clone_crown_forward_fallback(output_bounds, deadline);
+                    }
+                    Err(error) => return Err(error),
+                };
+                return match tighten_crown_output_with_deadline(
+                    crown_output,
+                    output_bounds,
+                    "CROWN",
+                    deadline,
+                ) {
+                    Ok(bounds) => Ok(bounds),
+                    Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {
+                        clone_crown_forward_fallback(output_bounds, deadline)
+                    }
+                    Err(error) => Err(error),
+                };
             }
 
             debug!(
@@ -409,7 +619,7 @@ impl Network {
                         "CROWN: {} — reusing CROWN-IBP output bounds",
                         fallback.details
                     );
-                    return Ok(output_bounds.clone());
+                    return clone_crown_forward_fallback(output_bounds, deadline);
                 }
             }
 
@@ -444,15 +654,41 @@ impl Network {
         {
             // Reuse already-computed output_bounds instead of re-running IBP (#3397).
             log_dense_materialization_budget_fallback("CROWN", estimate, None, None);
-            return Ok(output_bounds.clone());
+            return clone_crown_forward_fallback(output_bounds, deadline);
         }
-        let linear_bounds = crown_bounds.into_dense()?;
-        let crown_output = linear_bounds
-            .concretize_sound(input)
-            .reshape(&output_shape)?;
+        let linear_bounds =
+            match materialize_terminal_crown_bounds_with_deadline(crown_bounds, deadline) {
+                Ok(Some(bounds)) => bounds,
+                Ok(None) | Err(NyError::DeadlineExceeded(_)) => {
+                    return clone_crown_forward_fallback(output_bounds, deadline);
+                }
+                Err(error) => return Err(error),
+            };
+        let crown_output = match linear_bounds.concretize_sound_with_deadline(input, deadline) {
+            Ok(bounds) => bounds,
+            Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {
+                return clone_crown_forward_fallback(output_bounds, deadline);
+            }
+            Err(error) => return Err(error),
+        };
+        let crown_output = match crown_output.into_reshape_with_poll(&output_shape, || {
+            check_crown_publication_deadline(deadline, "during final reshape")
+        }) {
+            Ok(bounds) => bounds,
+            Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {
+                return clone_crown_forward_fallback(output_bounds, deadline);
+            }
+            Err(error) => return Err(error),
+        };
 
         // Step 5+6: Degrade check + forward-bound tightening (#3043 dedup).
-        tighten_crown_output(crown_output, output_bounds, "CROWN")
+        match tighten_crown_output_with_deadline(crown_output, output_bounds, "CROWN", deadline) {
+            Ok(bounds) => Ok(bounds),
+            Err(NyError::CpuMemoryExceeded { .. } | NyError::DeadlineExceeded(_)) => {
+                clone_crown_forward_fallback(output_bounds, deadline)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

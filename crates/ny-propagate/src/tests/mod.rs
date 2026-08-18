@@ -25,6 +25,7 @@ mod soundness_audit_wave3;
 mod speaker_embedding_distance;
 mod streaming_boundary;
 mod streaming_boundary_seam;
+mod sub_backward_enclosure;
 mod tile;
 mod transformer;
 mod verifier;

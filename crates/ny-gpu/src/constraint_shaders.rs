@@ -248,29 +248,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             CONSTRAINT_HEADER_WGSL
         );
 
-        // Use wgpu to validate the shader compiles
-        pollster::block_on(async {
-            let instance = wgpu::Instance::default();
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::LowPower,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                })
-                .await
-                .expect("Failed to find adapter");
-
-            let (device, _queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor::default())
-                .await
-                .expect("Failed to create device");
-
-            // This will panic if WGSL is invalid
-            let _shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("constraint_shader_test"),
-                source: wgpu::ShaderSource::Wgsl(full_shader.into()),
-            });
-        });
+        naga::front::wgsl::parse_str(&full_shader)
+            .unwrap_or_else(|error| panic!("constraint shader must parse as WGSL: {error}"));
     }
 
     #[test]

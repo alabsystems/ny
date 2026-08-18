@@ -4,8 +4,20 @@
 
 use super::patches_target::patches_dense_fallback_details;
 use super::*;
-use crate::network::core::try_dense_spatial_patches_reentry;
+use crate::bounds::patches::PatchesMaterializationPurpose;
+use crate::network::core::graph::backward_helpers::try_dense_spatial_patches_reentry_with_deadline_authority;
 use crate::network::core::GraphNode;
+use std::mem::size_of;
+
+/// Transfer a successful terminal step into the accumulator without cloning a
+/// potentially large Patches tensor. Callers return immediately after this
+/// publication; fallible propagation completes before the move.
+fn take_successful_patches_result(node_cb: &mut CrownBounds) -> CrownBounds {
+    std::mem::replace(
+        node_cb,
+        CrownBounds::Dense(crate::bounds::LinearBounds::identity(0)),
+    )
+}
 
 #[cfg(test)]
 pub(super) fn initial_target_crown_bounds(
@@ -24,7 +36,9 @@ pub(super) fn initial_target_crown_bounds(
         target_bounds,
         target_contract,
         false,
+        None,
     )
+    .expect("legacy no-deadline target identity construction")
 }
 
 /// Variant of `initial_target_crown_bounds` that accepts a patches override.
@@ -42,7 +56,8 @@ pub(super) fn initial_target_crown_bounds_with_override(
     target_bounds: &BoundedTensor,
     target_contract: &GraphTargetShapeContract,
     collector_patches_override: bool,
-) -> (bool, CrownBounds) {
+    deadline: Option<std::time::Instant>,
+) -> Result<(bool, CrownBounds)> {
     let allow_patches = target_allows_patches_start(
         graph,
         target_node,
@@ -53,14 +68,22 @@ pub(super) fn initial_target_crown_bounds_with_override(
     );
     let initial_bounds = if allow_patches && target_bounds.shape().len() == 3 {
         let shape = target_bounds.shape();
-        CrownBounds::Patches(Box::new(PatchesLinearBounds::identity(
-            (shape[0], shape[1], shape[2]),
-            (shape[0], shape[1], shape[2]),
-        )))
+        let spatial = (shape[0], shape[1], shape[2]);
+        CrownBounds::Patches(Box::new(PatchesLinearBounds::try_identity_with_deadline(
+            spatial, spatial, deadline, 0,
+        )?))
     } else {
-        CrownBounds::Dense(target_contract.identity_linear_bounds())
+        CrownBounds::Dense(
+            target_contract.identity_linear_bounds_with_deadline(
+                deadline,
+                target_bounds
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_mul(size_of::<f32>()),
+            )?,
+        )
     };
-    (allow_patches, initial_bounds)
+    Ok((allow_patches, initial_bounds))
 }
 
 /// Patches-start predicate shared by `initial_target_crown_bounds_with_override`
@@ -89,9 +112,8 @@ pub(super) fn target_allows_patches_start(
     // path. The per-node lower alpha is now applied in patches representation
     // (`ReLULayer::propagate_patches_with_alpha`, wired into
     // `try_patches_target_step_core`), so an alpha_state no longer forces Dense.
-    // Gated behind NY_CONV_PATCHES_COLLECT so gate-OFF is byte-identical: with
-    // the env unset, `alpha_state.is_some()` still forces Dense exactly as
-    // before.
+    // Gated behind NY_CONV_PATCHES_COLLECT (default-ON); setting it to `0`
+    // restores the old behavior where `alpha_state.is_some()` forces Dense.
     let alpha_ok = alpha_state.is_none() || conv_patches_collect_alpha_enabled();
     patches_mode
         && alpha_ok
@@ -100,11 +122,10 @@ pub(super) fn target_allows_patches_start(
 }
 
 /// `NY_CONV_PATCHES_COLLECT` gate for the patches-mode alpha-CROWN path
-/// (#conv-patches-collect alpha). Mirrors the `budget_policy` env check verbatim
-/// so the aggregate-budget raise and this gate relaxation share one
-/// interpretation of the flag (set and non-`"0"`/non-empty).
+/// (#conv-patches-collect alpha). Delegates to the one shared predicate so the
+/// aggregate-budget raise, the padded compose and this gate cannot drift apart.
 pub(super) fn conv_patches_collect_alpha_enabled() -> bool {
-    std::env::var_os("NY_CONV_PATCHES_COLLECT").is_some_and(|v| v != "0" && !v.is_empty())
+    crate::util::conv_patches_collect_enabled()
 }
 
 pub(super) fn resolve_preactivation<'a>(
@@ -128,6 +149,51 @@ pub(super) fn resolve_preactivation<'a>(
     }
 }
 
+/// Patches-native backward step for a **multi-input** node (#conv-crown-residual).
+///
+/// Only elementwise 2-input `Add`/`Sub` is consumable in patches form, and only
+/// via [`try_apply_patches_residual_passthrough_with_deadline`], which duplicates the relation
+/// down both branches (negated-and-swapped on the right for `Sub`), routes the
+/// original bias exactly once, and leaves the branches to be summed by
+/// `CrownMergeAccumulator::merge_crown_with_deadline` where they rejoin.
+///
+/// This is deliberately NOT `try_patches_target_step_core`: that function ends
+/// in the generic single-input dispatch, which accumulates the whole relation to
+/// `first_input_name`. For a 2-input node that would silently drop the second
+/// operand's contribution — an unsound (too-tight) bound. Anything the
+/// passthrough declines returns `Ok(false)` and takes the dense path, which
+/// already handles multi-input nodes correctly.
+pub(super) fn try_patches_residual_target_step(
+    graph: &GraphNetwork,
+    label: &str,
+    node: &GraphNode,
+    node_cb: &mut CrownBounds,
+    ibp_bounds: &std::collections::HashMap<String, BoundedTensor>,
+    node_crown_bounds: &mut crate::network::CrownMergeAccumulator,
+    target_dim: usize,
+    input_dim: usize,
+    input_accumulated: &mut bool,
+    per_node_deadline: Option<std::time::Instant>,
+    deadline_is_hard: bool,
+) -> Result<bool> {
+    if !matches!(node_cb, CrownBounds::Patches(_)) {
+        return Ok(false);
+    }
+    crate::network::core::graph::backward_helpers::try_apply_patches_residual_passthrough_with_deadline_authority(
+        graph,
+        node,
+        node_cb,
+        ibp_bounds,
+        node_crown_bounds,
+        target_dim,
+        input_dim,
+        input_accumulated,
+        label,
+        per_node_deadline,
+        deadline_is_hard,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_patches_target_step_core(
     graph: &GraphNetwork,
@@ -144,20 +210,30 @@ pub(super) fn try_patches_target_step_core(
     input_accumulated: &mut bool,
     engine: Option<&dyn ny_core::GemmEngine>,
     per_node_deadline: Option<std::time::Instant>,
+    deadline_is_hard: bool,
     collector_patches_override: bool,
     alpha_state: Option<&GraphAlphaState>,
 ) -> Result<bool> {
     // Gate re-entry with use_patches_mode: matrix mode skips re-entry (abcrown.py:228-231).
     // Exception: collector_patches_override allows re-entry in the CROWN-IBP collector (#3813).
     let patches_mode = graph.use_patches_mode || collector_patches_override;
-    try_dense_spatial_patches_reentry(node_cb, node, node_name, ibp_bounds, patches_mode, label);
+    try_dense_spatial_patches_reentry_with_deadline_authority(
+        node_cb,
+        node,
+        node_name,
+        ibp_bounds,
+        patches_mode,
+        label,
+        per_node_deadline,
+        deadline_is_hard,
+    );
 
     if !matches!(node_cb, CrownBounds::Patches(_)) {
         return Ok(false);
     }
 
     // Patches residual passthrough for Add/Sub (#4382)
-    if crate::network::core::graph::backward_helpers::try_apply_patches_residual_passthrough(
+    if crate::network::core::graph::backward_helpers::try_apply_patches_residual_passthrough_with_deadline_authority(
         graph,
         node,
         node_cb,
@@ -167,6 +243,8 @@ pub(super) fn try_patches_target_step_core(
         input_dim,
         input_accumulated,
         label,
+        per_node_deadline,
+        deadline_is_hard,
     )? {
         return Ok(true);
     }
@@ -185,47 +263,74 @@ pub(super) fn try_patches_target_step_core(
     // dense path below — never a tighter-than-true bound. Only entered under the
     // relaxed `target_allows_patches_start` gate (NY_CONV_PATCHES_COLLECT), so
     // gate-OFF never reaches here with a `Some` alpha_state.
-    if let Layer::ReLU(relu) = &node.layer {
-        if let Some(alpha) = alpha_state.and_then(|s| s.alpha(node_name)) {
-            let alpha_expanded = alpha_state
-                .map(|s| s.expand_alpha(node_name, alpha))
-                .unwrap_or_else(|| alpha.clone());
-            // Scope the immutable borrow of `node_cb` (via `pb`) to just the
-            // backward call, which returns owned bounds — so the reassignment
-            // `*node_cb = result` below does not conflict with the borrow.
-            let alpha_result = if let CrownBounds::Patches(pb) = &*node_cb {
-                Some(relu.propagate_patches_with_alpha(pb, pre_activation, &alpha_expanded))
-            } else {
-                None
-            };
-            match alpha_result {
-                Some(Ok((result, _grad))) => {
-                    *node_cb = result;
-                    graph.accumulate_crown_bounds_to_input(
-                        first_input_name,
-                        node_cb.clone(),
-                        node_crown_bounds,
-                        target_dim,
-                        input_dim,
-                        input_accumulated,
-                    )?;
-                    return Ok(true);
-                }
-                Some(Err(err)) if err.is_deadline_exceeded() => return Err(err),
-                Some(Err(err)) => {
-                    debug!(
-                        "{}: Patches ReLU alpha for '{}' failed ({}); \
+    // The alpha-specific Patches relaxation has no cooperative deadline seam;
+    // under hard finite authority skip it before alpha expansion or geometry scans
+    // and let the ordinary deadline-aware Anchored ReLU dispatcher below run.
+    //
+    // #dag-alpha-patches-expiry SET-MATE. Twin of nonlinear.rs:327 — same defect
+    // (skipping does not merely densify, it DISCARDS the optimized alpha and
+    // reverts the node to its heuristic slope), same lever, same contract:
+    // byte-identical to `!deadline_is_hard` when the lever is off.
+    //
+    // Gated together with its set-mates deliberately. The repo has the receipt
+    // for fixing these one at a time: "the Conv2d decline disappears and the
+    // SAME decline reappears one node later ... until all five sites sharing the
+    // predicate are switched together" (REGRESSION_FC_UNSAT_LOST_2026-08-14).
+    // Measured again today — gating only nonlinear.rs left its engagement probe
+    // at ZERO, because the carrier was already Dense from the residual fan-out
+    // decline upstream (backward_helpers.rs).
+    if !crate::network::core::graph::backward_helpers::patches_finite_authority_refuses(
+        deadline_is_hard,
+        per_node_deadline,
+    ) {
+        if let Layer::ReLU(relu) = &node.layer {
+            if let Some(alpha) = alpha_state.and_then(|s| s.alpha(node_name)) {
+                let alpha_expanded = alpha_state
+                    .map(|s| s.expand_alpha(node_name, alpha))
+                    .unwrap_or_else(|| alpha.clone());
+                // Scope the immutable borrow of `node_cb` (via `pb`) to just the
+                // backward call, which returns owned bounds — so the reassignment
+                // `*node_cb = result` below does not conflict with the borrow.
+                let alpha_result = if let CrownBounds::Patches(pb) = &*node_cb {
+                    Some(relu.propagate_patches_with_alpha(pb, pre_activation, &alpha_expanded))
+                } else {
+                    None
+                };
+                match alpha_result {
+                    Some(Ok((result, _grad))) => {
+                        *node_cb = result;
+                        graph.accumulate_crown_bounds_to_input_with_deadline_authority(
+                            first_input_name,
+                            take_successful_patches_result(node_cb),
+                            node_crown_bounds,
+                            target_dim,
+                            input_dim,
+                            input_accumulated,
+                            per_node_deadline,
+                            deadline_is_hard,
+                        )?;
+                        return Ok(true);
+                    }
+                    Some(Err(err))
+                        if err.is_deadline_exceeded() || err.is_cpu_memory_exceeded() =>
+                    {
+                        return Err(err);
+                    }
+                    Some(Err(err)) => {
+                        debug!(
+                            "{}: Patches ReLU alpha for '{}' failed ({}); \
                          degrading to non-alpha patches/dense",
-                        label, node_name, err
-                    );
-                    // Fall through to the heuristic patches step (still sound).
+                            label, node_name, err
+                        );
+                        // Fall through to the heuristic patches step (still sound).
+                    }
+                    None => {}
                 }
-                None => {}
             }
         }
     }
 
-    match crown_backward_step_patches(
+    match crown_backward_step_patches_with_deadline_authority(
         &node.layer,
         node_cb,
         pre_activation,
@@ -233,15 +338,18 @@ pub(super) fn try_patches_target_step_core(
         0,
         label,
         per_node_deadline,
+        deadline_is_hard,
     ) {
         Ok(CrownStepResult::Continue) => {
-            graph.accumulate_crown_bounds_to_input(
+            graph.accumulate_crown_bounds_to_input_with_deadline_authority(
                 first_input_name,
-                node_cb.clone(),
+                take_successful_patches_result(node_cb),
                 node_crown_bounds,
                 target_dim,
                 input_dim,
                 input_accumulated,
+                per_node_deadline,
+                deadline_is_hard,
             )?;
             Ok(true)
         }
@@ -267,10 +375,13 @@ pub(super) fn try_patches_target_step_core(
                     "{label}: {details}"
                 )));
             }
-            node_cb.ensure_dense()?;
+            node_cb.ensure_dense_with_deadline_for_purpose(
+                per_node_deadline,
+                PatchesMaterializationPurpose::Other,
+            )?;
             Ok(false)
         }
-        Err(err) if err.is_deadline_exceeded() => Err(err),
+        Err(err) if err.is_deadline_exceeded() || err.is_cpu_memory_exceeded() => Err(err),
         Err(err) => {
             debug!(
                 "{}: Patches dispatch for {} ({}) failed: {}, falling back to Dense",
@@ -287,7 +398,10 @@ pub(super) fn try_patches_target_step_core(
                     "{label}: {details}"
                 )));
             }
-            node_cb.ensure_dense()?;
+            node_cb.ensure_dense_with_deadline_for_purpose(
+                per_node_deadline,
+                PatchesMaterializationPurpose::Other,
+            )?;
             Ok(false)
         }
     }
@@ -296,8 +410,53 @@ pub(super) fn try_patches_target_step_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bounds::patches::{PatchGeometry, PatchesData, PatchesLinearBounds};
     use crate::layers::{Conv2dLayer, ReLULayer};
-    use ndarray::{arr1, ArrayD, IxDyn};
+    use ndarray::{arr1, Array1, ArrayD, IxDyn};
+
+    #[test]
+    fn successful_target_step_moves_materialized_patches_allocation() {
+        let side = |fill| PatchesData {
+            coeff_err: None,
+            patches: Some(ArrayD::from_elem(IxDyn(&[1, 1, 1, 1, 1, 1]), fill)),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+            identity: false,
+            output_shape: (1, 1, 1),
+            input_shape: (1, 1, 1),
+            unstable_idx: None,
+        };
+        let mut source = CrownBounds::Patches(Box::new(PatchesLinearBounds {
+            row_count: 1,
+            lower_a: side(0.25),
+            lower_b: Array1::zeros(1),
+            upper_a: side(0.75),
+            upper_b: Array1::zeros(1),
+        }));
+        let CrownBounds::Patches(source_patches) = &source else {
+            unreachable!();
+        };
+        let source_ptr = source_patches
+            .lower_a
+            .patches
+            .as_ref()
+            .expect("materialized lower patches")
+            .as_ptr();
+
+        let moved = take_successful_patches_result(&mut source);
+        let CrownBounds::Patches(moved_patches) = moved else {
+            panic!("successful target publication changed carrier type");
+        };
+        assert_eq!(
+            moved_patches
+                .lower_a
+                .patches
+                .as_ref()
+                .expect("moved lower patches")
+                .as_ptr(),
+            source_ptr,
+        );
+        assert!(matches!(source, CrownBounds::Dense(ref bounds) if bounds.num_outputs() == 0));
+    }
 
     #[test]
     fn test_initial_target_crown_bounds_skips_patches_in_matrix_mode_3813() {

@@ -10,8 +10,9 @@ use super::super::fixtures::{
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_crown_avoice_talker_attention_centroid_monotonicity_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, _) = talker_attention_softmax_output_graph();
     let input = bounded_hidden_states_input(TALKER_ATTENTION_SEQ_LEN, TALKER_ATTENTION_EPSILON);
 
@@ -78,8 +79,9 @@ fn test_graph_crown_avoice_talker_attention_centroid_monotonicity_3497() {
 /// Reference: designs/2026-03-11-issue-3497-centroid-monotonicity-verification-path.md Phase 2
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_centroid_monotonicity_epsilon_sweep_avoice_talker_attention_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, _) = talker_attention_softmax_output_graph();
 
     // Geometric sweep bracketing the measured critical epsilon 2.76e-6,

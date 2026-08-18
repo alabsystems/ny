@@ -119,8 +119,9 @@ const CENTER_INDEPENDENCE_EPSILON: f32 = 1e-7;
 /// Phase 5: center independence with identity RoPE (cos=1, sin=0).
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_centroid_monotonicity_center_independence_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, _) = talker_attention_softmax_output_graph();
     let (passing, failing) = run_center_independence_sweep(
         &graph,
@@ -130,45 +131,6 @@ fn test_centroid_monotonicity_center_independence_3497() {
     );
     assert_center_independence(
         "center_independence",
-        &passing,
-        &failing,
-        CENTER_SWEEP.len(),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Phase 7: Center independence with real RoPE (#3497)
-//
-// Phase 5 demonstrated center independence with identity RoPE (cos=1, sin=0).
-// The paper-citable result uses real Qwen3-TTS RoPE tables with the current
-// avoice `rope_theta=1_000_000`. This phase extends the non-vacuousness
-// characterization to real RoPE.
-// ---------------------------------------------------------------------------
-
-/// Phase 7: center independence with real Qwen3-TTS RoPE.
-///
-/// Same center sweep as Phase 5, but using position-dependent RoPE tables.
-/// The original claim ("real RoPE passes 3/6 centers at eps=1e-3") was
-/// measured against the pre-June-2026 export.
-#[ignore = "property false on the 2026-06-03 talker_attention_layer0.onnx re-export: at the EXACT \
-            point (eps=0, no relaxation) every non-zero center in the sweep violates centroid \
-            monotonicity under real Qwen3-TTS RoPE — measured 2026-07-19: center=±0.01 → 9 \
-            violations max_gap=+0.415, center=±0.1 → 11 violations max_gap=+0.453, center=0.5 → \
-            11 violations max_gap=+0.454 (zero center still certifies, max_gap=-0.4998 at \
-            eps=1e-7). No verifier tightening can certify a property whose ground truth fails; \
-            re-enable only after a re-export restores it or the acceptance bar is redefined"]
-#[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
-#[test]
-fn test_centroid_monotonicity_center_independence_real_rope_3497() {
-    let (graph, _) = talker_attention_softmax_output_graph_real_rope();
-    let (passing, failing) = run_center_independence_sweep(
-        &graph,
-        "center_independence_real_rope",
-        CENTER_SWEEP,
-        CENTER_INDEPENDENCE_EPSILON,
-    );
-    assert_center_independence(
-        "center_independence_real_rope",
         &passing,
         &failing,
         CENTER_SWEEP.len(),

@@ -1,0 +1,23 @@
+# Research containment (`wsl24-20g`) for a 24 GiB WSL2 VM on a 31 GiB desktop.
+#
+# Install as ~/.config/systemd/user/ny-build.slice — see install-user-slices.sh —
+# and select it with NY_MEASURE_CONTAINMENT_PROFILE=wsl24-20g.
+#
+# Same policy shape as gb10-80g at the same high:max ratio, sized so the limits
+# are genuinely enforceable here: a 20 GiB hard cap leaves headroom for the
+# rest of the VM. Requires `memory=24GB` and `swap=8GB` in %USERPROFILE%\.wslconfig.
+#
+# Runs under this profile are a LOWER BOUND on the same code under gb10-80g,
+# not an equivalent result. Do not compare CSVs across profiles.
+[Unit]
+Description=ny build and measurement containment (wsl24-20g)
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=17179869184
+MemoryMax=21474836480
+MemorySwapMax=8589934592
+TasksAccounting=yes
+TasksMax=4096
+CPUAccounting=yes
+CPUQuota=1000%

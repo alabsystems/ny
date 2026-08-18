@@ -1108,16 +1108,18 @@ fn simplex_v_envelope(
 /// Largest f64 strictly LESS than a finite `x` by one ULP (outward DOWN rounding).
 #[inline]
 fn next_down_f64(x: f64) -> f64 {
-    if !x.is_finite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return -f64::from_bits(1);
     }
-    if x > 0.0 {
-        f64::from_bits(x.to_bits() - 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits - 1)
     } else {
-        f64::from_bits(x.to_bits() + 1)
+        f64::from_bits(bits + 1)
     }
 }
 
@@ -1127,13 +1129,16 @@ fn next_down_f64(x: f64) -> f64 {
 /// the smallest positive subnormal so a zero magnitude still rounds outward.
 #[inline]
 fn next_up_f64(x: f64) -> f64 {
-    if !x.is_finite() || x < 0.0 {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() || (bits & 0x8000_0000_0000_0000 != 0 && magnitude != 0)
+    {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    f64::from_bits(x.to_bits() + 1)
+    f64::from_bits(bits + 1)
 }
 
 /// Flattened, contiguous lower/upper as owned `Vec<f32>` (rejects non-contiguous).

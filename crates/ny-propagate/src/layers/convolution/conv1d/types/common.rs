@@ -10,11 +10,11 @@
 //! zeroing, and bias finalization. This module centralizes that scaffold
 //! so each type file only contains the kernel-specific math.
 
-use ndarray::{s, Array1, Array2, ArrayD, ArrayView3, IxDyn};
+use ndarray::{Array1, Array2, ArrayD, ArrayView3, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32};
 use tracing::debug;
 
+use crate::layers::convolution::crown_helpers::compute_conv_bias_rows_f64;
 use crate::{contiguous_flat_slice_mut, BatchedLinearBounds};
 
 /// Pre-computed batch geometry for a Conv1d backward pass.
@@ -118,7 +118,8 @@ pub(super) fn zero_nonfinite_rows(
 /// non-finite A-matrix rows.
 ///
 /// When `bias` is `Some`, accumulates `sum_c sum_l A[c*out_len+l] * bias[c]`
-/// in f64, applies NaN guards, and overrides non-finite rows to ±inf.
+/// in directed f64, folds incoming coefficient error outward through
+/// `sum A_err * |bias|`, and overrides non-finite rows to ±inf.
 /// When `bias` is `None`, clones the input bias and only applies non-finite
 /// overrides.
 #[allow(clippy::too_many_arguments)]
@@ -133,83 +134,68 @@ pub(super) fn finalize_bias_bounds(
     lower_nonfinite_rows: &[bool],
     upper_nonfinite_rows: &[bool],
 ) -> Result<(ArrayD<f32>, ArrayD<f32>)> {
-    let total_batch = ctx.total_batch;
-    let out_dim = ctx.out_dim;
     let total_rows = ctx.total_rows;
 
     if let Some(bias) = bias {
-        let lower_b_3d = bounds
+        let lower_a_2d = lower_a_3d
+            .into_shape_with_order((total_rows, ctx.mid_dim))
+            .map_err(|_| NyError::InvalidSpec("Cannot flatten lower_a".to_string()))?;
+        let upper_a_2d = upper_a_3d
+            .into_shape_with_order((total_rows, ctx.mid_dim))
+            .map_err(|_| NyError::InvalidSpec("Cannot flatten upper_a".to_string()))?;
+        let lower_a_err_2d = bounds
+            .lower_a_err
+            .as_ref()
+            .map(|err| {
+                err.view()
+                    .into_shape_with_order((total_rows, ctx.mid_dim))
+                    .map_err(|_| NyError::InvalidSpec("Cannot flatten lower_a_err".to_string()))
+            })
+            .transpose()?;
+        let upper_a_err_2d = bounds
+            .upper_a_err
+            .as_ref()
+            .map(|err| {
+                err.view()
+                    .into_shape_with_order((total_rows, ctx.mid_dim))
+                    .map_err(|_| NyError::InvalidSpec("Cannot flatten upper_a_err".to_string()))
+            })
+            .transpose()?;
+        let lower_b_1d = bounds
             .lower_b
             .view()
-            .into_shape_with_order((total_batch, out_dim))
+            .into_shape_with_order(total_rows)
             .map_err(|_| NyError::InvalidSpec("Cannot reshape lower_b".to_string()))?;
-        let upper_b_3d = bounds
+        let upper_b_1d = bounds
             .upper_b
             .view()
-            .into_shape_with_order((total_batch, out_dim))
+            .into_shape_with_order(total_rows)
             .map_err(|_| NyError::InvalidSpec("Cannot reshape upper_b".to_string()))?;
 
-        let mut new_lower_b = Array2::<f64>::zeros((total_batch, out_dim));
-        let mut new_upper_b = Array2::<f64>::zeros((total_batch, out_dim));
-
-        for b in 0..total_batch {
-            for d in 0..out_dim {
-                let mut lower_sum = 0.0_f64;
-                let mut upper_sum = 0.0_f64;
-
-                for c in 0..out_c {
-                    let spatial_start = c * out_len;
-                    let spatial_end = spatial_start + out_len;
-
-                    let lower_spatial_sum: f64 = lower_a_3d
-                        .slice(s![b, d, spatial_start..spatial_end])
-                        .iter()
-                        .map(|&v| v as f64)
-                        .sum();
-                    let upper_spatial_sum: f64 = upper_a_3d
-                        .slice(s![b, d, spatial_start..spatial_end])
-                        .iter()
-                        .map(|&v| v as f64)
-                        .sum();
-
-                    lower_sum += lower_spatial_sum * bias[c] as f64;
-                    upper_sum += upper_spatial_sum * bias[c] as f64;
-                }
-
-                // NaN guard: inf + (-inf) → conservative bounds.
-                // Same pattern as BatchedLinearBounds::compose().
-                let lb_sum = lower_b_3d[[b, d]] as f64 + lower_sum;
-                let ub_sum = upper_b_3d[[b, d]] as f64 + upper_sum;
-                new_lower_b[[b, d]] = if lb_sum.is_nan() {
-                    f64::NEG_INFINITY
-                } else {
-                    lb_sum
-                };
-                new_upper_b[[b, d]] = if ub_sum.is_nan() {
-                    f64::INFINITY
-                } else {
-                    ub_sum
-                };
-            }
-        }
+        let (mut new_lower_b, mut new_upper_b) = compute_conv_bias_rows_f64(
+            lower_a_2d,
+            lower_a_err_2d,
+            lower_b_1d,
+            upper_a_2d,
+            upper_a_err_2d,
+            upper_b_1d,
+            bias,
+            out_c,
+            out_len,
+        )?;
 
         // #3256: Override bias for non-finite A-matrix rows.
-        for b in 0..total_batch {
-            for d in 0..out_dim {
-                let row_idx = b * out_dim + d;
-                if lower_nonfinite_rows[row_idx] {
-                    new_lower_b[[b, d]] = f64::NEG_INFINITY;
-                }
-                if upper_nonfinite_rows[row_idx] {
-                    new_upper_b[[b, d]] = f64::INFINITY;
-                }
+        for row_idx in 0..total_rows {
+            if lower_nonfinite_rows[row_idx] {
+                new_lower_b[row_idx] = f32::NEG_INFINITY;
+            }
+            if upper_nonfinite_rows[row_idx] {
+                new_upper_b[row_idx] = f32::INFINITY;
             }
         }
 
-        let new_lower_b_f32 = new_lower_b.mapv(|v| next_down_f32(v as f32));
-        let new_upper_b_f32 = new_upper_b.mapv(|v| next_up_f32(v as f32));
-        let (new_lower_b_vec, _) = new_lower_b_f32.into_raw_vec_and_offset();
-        let (new_upper_b_vec, _) = new_upper_b_f32.into_raw_vec_and_offset();
+        let (new_lower_b_vec, _) = new_lower_b.into_raw_vec_and_offset();
+        let (new_upper_b_vec, _) = new_upper_b.into_raw_vec_and_offset();
         Ok((
             ArrayD::from_shape_vec(IxDyn(&ctx.out_b_shape), new_lower_b_vec)
                 .map_err(|_| NyError::InvalidSpec("Cannot reshape new_lower_b".to_string()))?,

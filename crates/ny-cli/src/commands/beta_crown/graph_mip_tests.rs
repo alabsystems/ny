@@ -33,6 +33,239 @@ use ny_propagate::{GraphNetwork, GraphNode, Layer, Verifier, NETWORK_INPUT};
 static IMB_AY_TAIL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn imb_ay_tail_selector_budget_is_larger_but_outer_deadline_still_wins() {
+    assert_eq!(
+        imb_ay_tail_solve_budget_from_remaining_secs(100.0, IMB_AY_TAIL_SOLVE_CAP_SECS),
+        Some(45.0)
+    );
+    assert_eq!(
+        imb_ay_tail_solve_budget_from_remaining_secs(
+            100.0,
+            IMB_AY_TAIL_REGION_SELECTOR_SOLVE_CAP_SECS,
+        ),
+        Some(65.0)
+    );
+    let short = imb_ay_tail_solve_budget_from_remaining_secs(
+        10.0,
+        IMB_AY_TAIL_REGION_SELECTOR_SOLVE_CAP_SECS,
+    )
+    .expect("a short outer deadline still leaves a valid proof slice");
+    assert!((short - 9.95).abs() < f64::EPSILON);
+    assert!(
+        imb_ay_tail_solve_budget_from_remaining_secs(
+            IMB_AY_TAIL_MIN_SOLVE_SECS,
+            IMB_AY_TAIL_REGION_SELECTOR_SOLVE_CAP_SECS,
+        )
+        .is_none(),
+        "the immutable reserve must be charged before the minimum-slice gate"
+    );
+    assert!(imb_ay_tail_solve_budget_from_remaining_secs(
+        f64::NAN,
+        IMB_AY_TAIL_REGION_SELECTOR_SOLVE_CAP_SECS,
+    )
+    .is_none());
+}
+
+#[test]
+fn imb_ay_tail_adaptive_five_comb_gate_is_default_off_and_exact() {
+    assert!(!imb_ay_tail_adaptive_five_comb_enabled_from_value(None));
+    assert!(imb_ay_tail_adaptive_five_comb_enabled_from_value(Some("1")));
+    for malformed_or_off in ["", "0", "00", "true", "TRUE", " 1", "1 ", "+1", "１"] {
+        assert!(
+            !imb_ay_tail_adaptive_five_comb_enabled_from_value(Some(malformed_or_off)),
+            "only the exact literal 1 may enable the authority route"
+        );
+    }
+    assert_eq!(IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_CANDIDATES_PER_SCORE, 4);
+    assert_eq!(IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_MIN_CANDIDATES, 4);
+    assert_eq!(IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_MAX_CANDIDATES, 8);
+    assert_eq!(IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_RANK, 1);
+    const { assert!(IMB_AY_TAIL_ADAPTIVE_FIVE_COMB_ROOT_HARD_VALUE) };
+}
+
+#[test]
+fn ay_node_warm_cap_parser_is_exact_bounded_and_neural_shape_gated() {
+    let parse = |raw| ay_node_warm_time_limit_from_value(raw, 1, 1, 1);
+    assert_eq!(parse(Some("5000")), Some(Duration::from_secs(5)));
+    assert_eq!(parse(Some("00001")), Some(Duration::from_millis(1)));
+    assert_eq!(
+        parse(Some("60000")),
+        Some(Duration::from_mins(1)),
+        "the reviewed ceiling is inclusive"
+    );
+
+    for raw in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("+5000"),
+        Some("-1"),
+        Some("60001"),
+        Some("5.0"),
+        Some(" 5000"),
+        Some("5000 "),
+        Some("NaN"),
+    ] {
+        assert_eq!(parse(raw), None, "unexpected cap for {raw:?}");
+    }
+
+    for (keys, vars, widths) in [(0, 1, 1), (1, 0, 0), (1, 1, 0), (1, 1, 2), (2, 1, 1)] {
+        assert_eq!(
+            ay_node_warm_time_limit_from_value(Some("5000"), keys, vars, widths),
+            None,
+            "misaligned metadata ({keys}, {vars}, {widths}) must fail closed"
+        );
+    }
+}
+
+#[test]
+fn imb_ay_tail_selector_solve_gates_are_exact_and_conflict_fails_closed() {
+    use ImbAyTailSelectorSolvePolicy::{Conflict, Default, RangeLogical, SolveProfile};
+
+    assert_eq!(
+        imb_ay_tail_selector_solve_policy_from_values(None, None),
+        Default
+    );
+    assert_eq!(
+        imb_ay_tail_selector_solve_policy_from_values(Some("1"), None),
+        RangeLogical
+    );
+    assert_eq!(
+        imb_ay_tail_selector_solve_policy_from_values(None, Some("1")),
+        SolveProfile
+    );
+    assert_eq!(
+        imb_ay_tail_selector_solve_policy_from_values(Some("1"), Some("1")),
+        Conflict,
+        "two exact selector solve gates must fail closed without precedence"
+    );
+
+    for malformed_or_off in ["", "0", "00", "true", "TRUE", " 1", "1 ", "+1", "１"] {
+        assert_eq!(
+            imb_ay_tail_selector_solve_policy_from_values(Some(malformed_or_off), None),
+            Default,
+            "only exact 1 may enable selector-session crash advice"
+        );
+        assert_eq!(
+            imb_ay_tail_selector_solve_policy_from_values(None, Some(malformed_or_off)),
+            Default,
+            "only exact 1 may enable the selector solve profile"
+        );
+        assert_eq!(
+            imb_ay_tail_selector_solve_policy_from_values(Some("1"), Some(malformed_or_off)),
+            RangeLogical,
+            "a malformed profile value cannot shadow the exact range-only gate"
+        );
+        assert_eq!(
+            imb_ay_tail_selector_solve_policy_from_values(Some(malformed_or_off), Some("1")),
+            SolveProfile,
+            "a malformed range value cannot shadow the exact solve-profile gate"
+        );
+    }
+}
+
+fn add_adaptive_five_comb_candidate(problem: &mut MilpProblem, producer_bias: f64) -> (Col, Col) {
+    let source = problem.add_col(0.0, -4.0, 4.0);
+    let preactivation = problem.add_col(0.0, f64::NEG_INFINITY, f64::INFINITY);
+    problem.add_row(
+        producer_bias,
+        producer_bias,
+        [(preactivation, 1.0), (source, -1.0)],
+    );
+    let output = problem.add_col(0.0, 0.0, 1.0);
+    let binary = problem.add_integer_col(0.0, 0.0, 1.0);
+    problem.add_row(0.0, f64::INFINITY, [(output, 1.0), (preactivation, -1.0)]);
+    problem.add_row(
+        f64::NEG_INFINITY,
+        1.0,
+        [(output, 1.0), (preactivation, -1.0), (binary, 1.0)],
+    );
+    problem.add_row(f64::NEG_INFINITY, 0.0, [(output, 1.0), (binary, -1.0)]);
+    (output, binary)
+}
+
+#[test]
+fn imb_ay_tail_adaptive_five_comb_uses_exact_full4_intercept4_candidate_union() {
+    let mut problem = MilpProblem::new();
+    let mut full_only_outputs = Vec::new();
+    let mut intercept_outputs = Vec::new();
+    let mut full_only_binaries = Vec::new();
+    let mut intercept_binaries = Vec::new();
+    for _ in 0..4 {
+        let (output, binary) = add_adaptive_five_comb_candidate(&mut problem, 2.0);
+        full_only_outputs.push(output);
+        full_only_binaries.push(binary);
+    }
+    for _ in 0..4 {
+        let (output, binary) = add_adaptive_five_comb_candidate(&mut problem, 0.0);
+        intercept_outputs.push(output);
+        intercept_binaries.push(binary);
+    }
+    let objective_col = problem.add_col(0.0, f64::NEG_INFINITY, f64::INFINITY);
+    let mut definition = Vec::with_capacity(9);
+    definition.push((objective_col, 1.0));
+    definition.extend(
+        full_only_outputs
+            .iter()
+            .copied()
+            .map(|output| (output, -1.0)),
+    );
+    definition.extend(
+        intercept_outputs
+            .iter()
+            .copied()
+            .map(|output| (output, 1.0)),
+    );
+    problem.add_row(0.0, 0.0, definition);
+    let binary_vars: Vec<_> = full_only_binaries
+        .iter()
+        .chain(&intercept_binaries)
+        .copied()
+        .collect();
+    let actual_sparse_objective = [(objective_col, 1.0)];
+
+    let candidates =
+        imb_ay_tail_adaptive_five_comb_candidates(&problem, &actual_sparse_objective, &binary_vars)
+            .expect("four full-BaBSR plus four intercept candidates");
+    assert_eq!(candidates.len(), 8);
+    assert_eq!(&candidates[..4], full_only_binaries.as_slice());
+    assert_eq!(&candidates[4..], intercept_binaries.as_slice());
+
+    assert!(
+        imb_ay_tail_adaptive_five_comb_candidates(
+            &problem,
+            &actual_sparse_objective,
+            &binary_vars[..3],
+        )
+        .is_none(),
+        "fewer than four ranked candidates must retain the standard route"
+    );
+    assert!(
+        imb_ay_tail_adaptive_five_comb_candidates(
+            &problem,
+            &actual_sparse_objective,
+            &[
+                binary_vars[0],
+                binary_vars[0],
+                binary_vars[1],
+                binary_vars[2]
+            ],
+        )
+        .is_none(),
+        "duplicate binary metadata must fail closed"
+    );
+    assert!(
+        imb_ay_tail_adaptive_five_comb_candidates(
+            &problem,
+            &[(objective_col, 1.0), (objective_col, -1.0)],
+            &binary_vars,
+        )
+        .is_none(),
+        "malformed sparse objective identities must fail closed"
+    );
+}
+
+#[test]
 fn imb_ay_tail_encoding_cap_admits_measured_cgan_tail_only_within_hard_limits() {
     // Exact sealed row-5 observation at the Relu_17 seam.  This regression
     // guards against silently restoring the pre-AY 64-binary rejection.
@@ -561,8 +794,8 @@ fn graph_chain_encoding_matches_feedforward() {
 
 // ── nn4sys mscn: empirical layer-variant introspection ──────────────────────
 
-/// Path to the vnncomp2026 nn4sys onnx directory (skip the test when absent —
-/// benchmark checkouts are not part of the repo).
+/// Path to the vnncomp2026 nn4sys ONNX directory. External-fixture tests live
+/// in the explicit conformance lane and report the staging command if missing.
 const NN4SYS_ONNX_DIR: &str = "benchmarks/vnncomp2026/benchmarks/nn4sys/1.0/onnx";
 
 fn nn4sys_onnx_path(file: &str) -> Option<std::path::PathBuf> {
@@ -570,24 +803,52 @@ fn nn4sys_onnx_path(file: &str) -> Option<std::path::PathBuf> {
     // the workspace root. Try both.
     for base in ["../..", "."] {
         let p = Path::new(base).join(NN4SYS_ONNX_DIR).join(file);
-        if p.exists() {
+        if p.is_file() {
             return Some(p);
         }
     }
     None
 }
 
-/// EMPIRICAL introspection (not an assertion test): prints every node's Layer
-/// variant + inputs + declared shape for the two mscn cardinality models, so
-/// the encoder's op coverage is grounded in what ny's loader ACTUALLY produces
-/// rather than in the raw ONNX op list. Run with `-- --nocapture`.
+fn require_external_vnncomp_fixture(path: std::path::PathBuf) -> std::path::PathBuf {
+    assert!(
+        path.is_file(),
+        "external VNN-COMP benchmark fixture missing: {}; run \
+         benchmarks/download_benchmarks.sh",
+        path.display()
+    );
+    path
+}
+
+fn require_nn4sys_onnx(file: &str) -> std::path::PathBuf {
+    nn4sys_onnx_path(file).unwrap_or_else(|| {
+        panic!(
+            "external VNN-COMP benchmark fixture missing: {NN4SYS_ONNX_DIR}/{file}; run \
+             benchmarks/download_benchmarks.sh"
+        )
+    })
+}
+
+fn require_nn4sys_vnnlib(onnx: &Path, file: &str) -> std::path::PathBuf {
+    let category_dir = onnx.parent().and_then(Path::parent).unwrap_or_else(|| {
+        panic!(
+            "cannot derive nn4sys category directory from {}",
+            onnx.display()
+        )
+    });
+    require_external_vnncomp_fixture(category_dir.join("vnnlib").join(file))
+}
+
+/// External inventory conformance for the two mscn cardinality models. Prints
+/// every node for diagnosis and requires the loaded graphs to retain the
+/// affine, reduction, and index-plumbing families that Graph-MIP is meant to
+/// encode. A loader regression to an empty or structurally incomplete graph
+/// must not be reported as a green diagnostic.
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_introspect_layer_variants() {
     for file in ["mscn_128d.onnx", "mscn_128d_dual.onnx"] {
-        let Some(path) = nn4sys_onnx_path(file) else {
-            eprintln!("mscn_introspect_layer_variants: {file} not found; skipping");
-            continue;
-        };
+        let path = require_nn4sys_onnx(file);
         let graph = crate::commands::vnncomp::load_graph_network(&path)
             .unwrap_or_else(|e| panic!("load_graph_network({file}): {e}"));
         eprintln!("==== {file} ====");
@@ -597,16 +858,30 @@ fn mscn_introspect_layer_variants() {
             graph.output_name()
         );
         let exec = graph.exec_order().expect("exec_order");
+        assert!(!exec.is_empty(), "{file}: execution order must be nonempty");
+        assert!(
+            exec.iter().any(|name| name == graph.output_name()),
+            "{file}: output node must occur in execution order"
+        );
+        let mut affine = 0usize;
+        let mut reductions = 0usize;
+        let mut index_plumbing = 0usize;
         for name in exec {
             let node = graph.node(name).expect("node");
             let layer = node.layer();
+            match layer {
+                Layer::Linear(_) | Layer::MatMul(_) => affine += 1,
+                Layer::ReduceSum(_) => reductions += 1,
+                Layer::Slice(_) | Layer::Gather(_) | Layer::Concat(_) => index_plumbing += 1,
+                _ => {}
+            }
             let detail = match layer {
                 Layer::Linear(l) => {
                     format!(
                         "in={} out={} bias={}",
                         l.in_features(),
                         l.out_features(),
-                        l.bias.is_some()
+                        l.bias().is_some()
                     )
                 }
                 Layer::Slice(s) => format!("axis={} start={} end={}", s.axis, s.start, s.end),
@@ -637,6 +912,15 @@ fn mscn_introspect_layer_variants() {
                 graph.declared_shape(name)
             );
         }
+        assert!(affine > 0, "{file}: expected at least one affine node");
+        assert!(
+            reductions > 0,
+            "{file}: expected at least one reduction node"
+        );
+        assert!(
+            index_plumbing > 0,
+            "{file}: expected at least one slice/gather/concat node"
+        );
     }
 }
 
@@ -656,10 +940,6 @@ fn graph_mip_gate_defaults_on() {
         !graph_mip_enabled_from_value(Some("0")),
         "explicit zero is the off switch"
     );
-}
-
-fn graph_mip_manual_probe_enabled() -> bool {
-    std::env::var("NY_GRAPH_MIP").ok().as_deref() == Some("1")
 }
 
 #[test]
@@ -839,6 +1119,38 @@ fn graph_batchnorm_rows_are_exact_affine_and_feasible() {
         !point_is_feasible(&g.problem, &bad, 1e-6),
         "a perturbed BN output must be rejected"
     );
+}
+
+#[test]
+fn graph_batchnorm_row_outwardly_covers_certified_fold_error() {
+    let bn = BatchNormLayer {
+        scale: ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap(),
+        bias: ArrayD::from_shape_vec(IxDyn(&[1]), vec![2.0]).unwrap(),
+        scale_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.25]).unwrap(),
+        bias_err: ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.5]).unwrap(),
+        num_channels: 1,
+        channel_axis_hint: None,
+    };
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::new(
+        "bn",
+        Layer::BatchNorm(bn),
+        vec![NETWORK_INPUT.to_string()],
+    ));
+    graph.set_output("bn");
+
+    let encoded = encode_graph_with_delta(&graph, &[Bound::new(-4.0, 3.0)], &HashMap::new(), 0.0)
+        .expect("encode BatchNorm error band");
+    let row = &encoded.problem.rows()[0];
+    let widen = ((0.25_f64 * 4.0).next_up() + 0.5).next_up();
+    assert_eq!(row.lb, (2.0 - widen).next_down());
+    assert_eq!(row.ub, (2.0 + widen).next_up());
+    assert!(row.lb < row.ub, "nonzero fold error must relax equality");
+
+    // Extremal real coefficients allowed by the stored certificates remain in
+    // the MIP feasible set at the largest-magnitude input face.
+    assert!(point_is_feasible(&encoded.problem, &[-4.0, -3.5], 0.0));
+    assert!(point_is_feasible(&encoded.problem, &[-4.0, -0.5], 0.0));
 }
 
 // ── increment 3: residual Add (the DAG piece) ───────────────────────────────
@@ -1055,14 +1367,14 @@ fn graph_conv2d_unfolds_to_linear_rows_and_is_feasible() {
     // forward pass is feasible; a perturbed conv output is rejected. conv(x) is
     // the unfolded-Linear forward (im2col correctness is covered by
     // mip_preprocess::tests::test_unfold_conv2d_identity_no_padding).
-    let ref_bias = lin_ref.bias.clone().unwrap_or_else(|| Array1::zeros(4));
+    let ref_bias = lin_ref.bias().cloned().unwrap_or_else(|| Array1::zeros(4));
     let samples: [Vec<f64>; 3] = [
         vec![0.75; 9],
         vec![0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5],
         vec![1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0],
     ];
     for x in samples.iter() {
-        let conv_out = linear_fwd(&lin_ref.weight, &ref_bias, x); // 4 = conv(x)
+        let conv_out = linear_fwd(lin_ref.weight(), &ref_bias, x); // 4 = conv(x)
         let head = linear_fwd(&w_lin, &b_lin, &conv_out); // ReLU pass-through
         let mut assign = Vec::new();
         assign.extend_from_slice(x);
@@ -2156,6 +2468,731 @@ fn logit_threshold_transform_is_outward_and_tight() {
     }
 }
 
+/// Scalar `Sub(Sigmoid(z_a), Sigmoid(z_b))` fixture for the recognition-only
+/// dual-Sigmoid slice. Both arms share the input here; recognition is purely
+/// structural and intentionally grants no constancy/proof authority.
+fn scalar_dual_sigmoid_graph() -> GraphNetwork {
+    let identity =
+        || LinearLayer::new(Array2::from_shape_vec((1, 1), vec![1.0]).unwrap(), None).unwrap();
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("z_a", Layer::Linear(identity())));
+    graph.add_node(GraphNode::new(
+        "sigmoid_a",
+        Layer::Sigmoid(SigmoidLayer::new()),
+        vec!["z_a".to_string()],
+    ));
+    graph.add_node(GraphNode::from_input("z_b", Layer::Linear(identity())));
+    graph.add_node(GraphNode::new(
+        "sigmoid_b",
+        Layer::Sigmoid(SigmoidLayer::new()),
+        vec!["z_b".to_string()],
+    ));
+    graph.add_node(GraphNode::binary(
+        "difference",
+        Layer::Sub(SubLayer),
+        "sigmoid_a",
+        "sigmoid_b",
+    ));
+    graph.set_output("difference");
+    for name in [
+        NETWORK_INPUT,
+        "z_a",
+        "sigmoid_a",
+        "z_b",
+        "sigmoid_b",
+        "difference",
+    ] {
+        graph.set_declared_shape(name, vec![1]);
+    }
+    graph
+}
+
+#[test]
+fn scalar_target_encoder_excludes_dead_dual_sigmoid_arms_and_output() {
+    let graph = scalar_dual_sigmoid_graph();
+    let encoded = encode_graph_to_scalar_target_with_deadline(
+        &graph,
+        &[Bound::new(-1.0, 1.0)],
+        &HashMap::new(),
+        "z_b",
+        Some(Instant::now() + Duration::from_secs(1)),
+    )
+    .expect("the exact B-logit ancestor closure must encode");
+
+    assert_eq!(encoded.output_vars, encoded.node_cols["z_b"]);
+    assert_eq!(encoded.output_vars.len(), 1);
+    assert_eq!(
+        encoded
+            .node_cols
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([NETWORK_INPUT.to_string(), "z_b".to_string()])
+    );
+    for excluded in ["z_a", "sigmoid_a", "sigmoid_b", "difference"] {
+        assert!(
+            !encoded.node_cols.contains_key(excluded),
+            "dead/non-ancestor node '{excluded}' must not be encoded"
+        );
+    }
+    assert_eq!(encoded.problem.num_cols(), 2, "input + scalar B logit");
+    assert_eq!(encoded.problem.num_rows(), 1, "one exact Linear row");
+
+    let ordinary =
+        encode_graph_with_deadline(&graph, &[Bound::new(-1.0, 1.0)], &HashMap::new(), None);
+    assert!(
+        ordinary.is_err(),
+        "the ordinary whole-graph encoder must remain unchanged and reject mid-graph Sigmoids"
+    );
+}
+
+fn scalar_supported_target_graph() -> GraphNetwork {
+    let identity =
+        || LinearLayer::new(Array2::from_shape_vec((1, 1), vec![1.0]).unwrap(), None).unwrap();
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("hidden", Layer::Linear(identity())));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer::new()),
+        vec!["hidden".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "out",
+        Layer::Linear(identity()),
+        vec!["relu".to_string()],
+    ));
+    graph.set_output("out");
+    for name in [NETWORK_INPUT, "hidden", "relu", "out"] {
+        graph.set_declared_shape(name, vec![1]);
+    }
+    graph
+}
+
+#[test]
+fn scalar_target_full_closure_is_byte_identical_to_ordinary_encoder() {
+    let graph = scalar_supported_target_graph();
+    let input = [Bound::new(-1.0, 1.0)];
+    let node_bounds = HashMap::from([("hidden".to_string(), vec![Bound::new(-1.0, 1.0)])]);
+
+    let ordinary = encode_graph_with_deadline(&graph, &input, &node_bounds, None)
+        .expect("ordinary whole-graph encoding");
+    let targeted =
+        encode_graph_to_scalar_target_with_deadline(&graph, &input, &node_bounds, "out", None)
+            .expect("full scalar target closure");
+
+    assert_eq!(targeted.problem.cols(), ordinary.problem.cols());
+    assert_eq!(targeted.problem.rows(), ordinary.problem.rows());
+    assert_eq!(targeted.problem.margin_row(), ordinary.problem.margin_row());
+    assert_eq!(targeted.input_vars, ordinary.input_vars);
+    assert_eq!(targeted.output_vars, ordinary.output_vars);
+    assert_eq!(targeted.binary_vars, ordinary.binary_vars);
+    assert_eq!(targeted.binary_widths, ordinary.binary_widths);
+    assert_eq!(targeted.binary_keys, ordinary.binary_keys);
+    assert_eq!(targeted.node_cols, ordinary.node_cols);
+}
+
+#[test]
+fn scalar_target_encoder_fails_closed_on_malformed_retained_surface() {
+    let input = [Bound::new(-1.0, 1.0)];
+    let good = scalar_supported_target_graph();
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &good,
+            &input,
+            &HashMap::new(),
+            "missing",
+            None
+        )
+        .is_err(),
+        "missing target"
+    );
+
+    let mut non_scalar = good.clone();
+    non_scalar.set_declared_shape("out", vec![2]);
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &non_scalar,
+            &input,
+            &HashMap::new(),
+            "out",
+            None
+        )
+        .is_err(),
+        "non-scalar target"
+    );
+
+    let identity =
+        || LinearLayer::new(Array2::from_shape_vec((1, 1), vec![1.0]).unwrap(), None).unwrap();
+    let mut dangling = GraphNetwork::new();
+    dangling.add_node(GraphNode::new(
+        "target",
+        Layer::Linear(identity()),
+        vec!["missing_parent".to_string()],
+    ));
+    dangling.set_output("target");
+    dangling.set_declared_shape("target", vec![1]);
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &dangling,
+            &input,
+            &HashMap::new(),
+            "target",
+            None
+        )
+        .is_err(),
+        "dangling retained edge"
+    );
+
+    let mut cyclic = GraphNetwork::new();
+    cyclic.add_node(GraphNode::new(
+        "a",
+        Layer::Flatten(FlattenLayer::new(1)),
+        vec!["b".to_string()],
+    ));
+    cyclic.add_node(GraphNode::new(
+        "b",
+        Layer::Flatten(FlattenLayer::new(1)),
+        vec!["a".to_string()],
+    ));
+    cyclic.set_output("a");
+    cyclic.set_declared_shape("a", vec![1]);
+    cyclic.set_declared_shape("b", vec![1]);
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(&cyclic, &input, &HashMap::new(), "a", None)
+            .is_err(),
+        "cycle/topology mismatch"
+    );
+
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &scalar_dual_sigmoid_graph(),
+            &input,
+            &HashMap::new(),
+            "sigmoid_b",
+            None
+        )
+        .is_err(),
+        "unsupported retained Sigmoid"
+    );
+
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &good,
+            &input,
+            &HashMap::new(),
+            "out",
+            Some(Instant::now())
+        )
+        .is_err(),
+        "expired deadline"
+    );
+
+    let mut lying_shape = GraphNetwork::new();
+    lying_shape.add_node(GraphNode::from_input(
+        "target",
+        Layer::Linear(
+            LinearLayer::new(
+                Array2::from_shape_vec((2, 1), vec![1.0, -1.0]).unwrap(),
+                None,
+            )
+            .unwrap(),
+        ),
+    ));
+    lying_shape.set_output("target");
+    lying_shape.set_declared_shape(NETWORK_INPUT, vec![1]);
+    lying_shape.set_declared_shape("target", vec![1]);
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &lying_shape,
+            &input,
+            &HashMap::new(),
+            "target",
+            None
+        )
+        .is_err(),
+        "declared scalar shape contradicts encoded width"
+    );
+
+    let non_finite_input = [Bound::new_allow_infinite(f32::NEG_INFINITY, 1.0)];
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &good,
+            &non_finite_input,
+            &HashMap::new(),
+            "out",
+            None
+        )
+        .is_err(),
+        "non-finite target input box"
+    );
+
+    let mut non_finite_weight = GraphNetwork::new();
+    non_finite_weight.add_node(GraphNode::from_input(
+        "target",
+        Layer::Linear(
+            LinearLayer::new(
+                Array2::from_shape_vec((1, 1), vec![f32::INFINITY]).unwrap(),
+                None,
+            )
+            .unwrap(),
+        ),
+    ));
+    non_finite_weight.set_output("target");
+    non_finite_weight.set_declared_shape(NETWORK_INPUT, vec![1]);
+    non_finite_weight.set_declared_shape("target", vec![1]);
+    assert!(
+        encode_graph_to_scalar_target_with_deadline(
+            &non_finite_weight,
+            &input,
+            &HashMap::new(),
+            "target",
+            None
+        )
+        .is_err(),
+        "non-finite retained affine coefficient"
+    );
+}
+
+#[test]
+fn dual_sigmoid_recognizer_accepts_only_exact_scalar_shape() {
+    let graph = scalar_dual_sigmoid_graph();
+    assert_eq!(
+        recognize_scalar_dual_sigmoid_output(&graph).unwrap(),
+        Some(DualSigmoidOutput {
+            output: "difference".to_string(),
+            sigmoid_a: "sigmoid_a".to_string(),
+            logit_a: "z_a".to_string(),
+            sigmoid_b: "sigmoid_b".to_string(),
+            logit_b: "z_b".to_string(),
+        })
+    );
+
+    // A normal topology miss declines without changing any existing path.
+    let mut final_sigmoid = graph.clone();
+    final_sigmoid.set_output("sigmoid_a");
+    assert_eq!(
+        recognize_scalar_dual_sigmoid_output(&final_sigmoid).unwrap(),
+        None
+    );
+
+    // A Sub whose B input is not a Sigmoid is not the recognized identity.
+    let mut one_sigmoid = graph.clone();
+    one_sigmoid.add_node(GraphNode::binary(
+        "one_sigmoid",
+        Layer::Sub(SubLayer),
+        "sigmoid_a",
+        "z_b",
+    ));
+    one_sigmoid.set_output("one_sigmoid");
+    one_sigmoid.set_declared_shape("one_sigmoid", vec![1]);
+    assert_eq!(
+        recognize_scalar_dual_sigmoid_output(&one_sigmoid).unwrap(),
+        None
+    );
+
+    // Vector and shape-unknown near-matches decline: the scalar Y_0 rewrite
+    // must never guess a coordinate.
+    let mut vector = graph;
+    vector.set_declared_shape("difference", vec![2]);
+    assert_eq!(recognize_scalar_dual_sigmoid_output(&vector).unwrap(), None);
+    let mut missing_shape = scalar_dual_sigmoid_graph();
+    missing_shape.add_node(GraphNode::binary(
+        "shape_unknown",
+        Layer::Sub(SubLayer),
+        "sigmoid_a",
+        "sigmoid_b",
+    ));
+    missing_shape.set_output("shape_unknown");
+    assert_eq!(
+        recognize_scalar_dual_sigmoid_output(&missing_shape).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn dual_sigmoid_recognizer_rejects_malformed_near_matches() {
+    let mut bad_sub = scalar_dual_sigmoid_graph();
+    bad_sub.add_node(GraphNode::new(
+        "bad_sub",
+        Layer::Sub(SubLayer),
+        vec![
+            "sigmoid_a".to_string(),
+            "sigmoid_b".to_string(),
+            "sigmoid_a".to_string(),
+        ],
+    ));
+    bad_sub.set_output("bad_sub");
+    bad_sub.set_declared_shape("bad_sub", vec![1]);
+    assert!(
+        recognize_scalar_dual_sigmoid_output(&bad_sub).is_err(),
+        "a candidate Sub with extra inputs must fail closed"
+    );
+
+    let mut bad_sigmoid = GraphNetwork::new();
+    let identity =
+        || LinearLayer::new(Array2::from_shape_vec((1, 1), vec![1.0]).unwrap(), None).unwrap();
+    bad_sigmoid.add_node(GraphNode::from_input("z_a", Layer::Linear(identity())));
+    bad_sigmoid.add_node(GraphNode::from_input("z_b", Layer::Linear(identity())));
+    bad_sigmoid.add_node(GraphNode::new(
+        "sigmoid_a",
+        Layer::Sigmoid(SigmoidLayer::new()),
+        vec!["z_a".to_string(), "z_b".to_string()],
+    ));
+    bad_sigmoid.add_node(GraphNode::new(
+        "sigmoid_b",
+        Layer::Sigmoid(SigmoidLayer::new()),
+        vec!["z_b".to_string()],
+    ));
+    bad_sigmoid.add_node(GraphNode::binary(
+        "difference",
+        Layer::Sub(SubLayer),
+        "sigmoid_a",
+        "sigmoid_b",
+    ));
+    bad_sigmoid.set_output("difference");
+    for name in [
+        NETWORK_INPUT,
+        "z_a",
+        "sigmoid_a",
+        "z_b",
+        "sigmoid_b",
+        "difference",
+    ] {
+        bad_sigmoid.set_declared_shape(name, vec![1]);
+    }
+    assert!(
+        recognize_scalar_dual_sigmoid_output(&bad_sigmoid).is_err(),
+        "a candidate Sigmoid with extra inputs must fail closed"
+    );
+
+    let mut dangling = scalar_dual_sigmoid_graph();
+    dangling.add_node(GraphNode::binary(
+        "dangling",
+        Layer::Sub(SubLayer),
+        "missing_sigmoid",
+        "sigmoid_b",
+    ));
+    dangling.set_output("dangling");
+    dangling.set_declared_shape("dangling", vec![1]);
+    assert!(
+        recognize_scalar_dual_sigmoid_output(&dangling).is_err(),
+        "a dangling candidate edge must fail closed"
+    );
+}
+
+#[cfg(feature = "external-vnncomp")]
+#[test]
+fn mscn_dual_sigmoid_recognizer_matches_real_model() {
+    let onnx = require_nn4sys_onnx("mscn_128d_dual.onnx");
+    let graph = crate::commands::vnncomp::load_graph_network(&onnx)
+        .expect("load real mscn_128d_dual graph");
+    let recognized = recognize_scalar_dual_sigmoid_output(&graph)
+        .expect("real graph must be structurally well formed")
+        .expect("real mscn_128d_dual output must match scalar Sub(Sigmoid, Sigmoid)");
+    assert_eq!(recognized.output, graph.output_name());
+    assert_ne!(
+        recognized.logit_a, recognized.logit_b,
+        "the dual arms must remain distinct"
+    );
+}
+
+#[cfg(feature = "external-vnncomp")]
+#[test]
+fn mscn_dual_scalar_target_closure_matches_real_topologies_when_enabled() {
+    let override_dir =
+        std::env::var_os("NY_NN4SYS_TARGET_ENCODER_ONNX_DIR").map(std::path::PathBuf::from);
+    for file in ["mscn_128d_dual.onnx", "mscn_2048d_dual.onnx"] {
+        let onnx = override_dir
+            .as_ref()
+            .map(|dir| dir.join(file))
+            .unwrap_or_else(|| require_nn4sys_onnx(file));
+        let onnx = require_external_vnncomp_fixture(onnx);
+        let graph = crate::commands::vnncomp::load_graph_network(&onnx)
+            .unwrap_or_else(|error| panic!("load {}: {error:#}", onnx.display()));
+        let recognized = recognize_scalar_dual_sigmoid_output(&graph)
+            .expect("real dual graph must be structurally valid")
+            .expect("real dual graph must match Sub(Sigmoid(A), Sigmoid(B))");
+        let retained = scalar_target_ancestor_closure(
+            &graph,
+            &recognized.logit_b,
+            Some(Instant::now() + Duration::from_secs(30)),
+        )
+        .expect("real B-logit closure must be a valid scalar target topology");
+        assert!(retained.contains(&recognized.logit_b));
+        for excluded in [
+            &recognized.logit_a,
+            &recognized.sigmoid_a,
+            &recognized.sigmoid_b,
+            &recognized.output,
+        ] {
+            assert!(
+                !retained.contains(excluded),
+                "real {file}: non-ancestor A/Sigmoid/Sub node '{excluded}' must be excluded"
+            );
+        }
+    }
+}
+
+#[test]
+fn dual_sigmoid_pinned_a_rewrite_has_correct_orientation_and_rounding() {
+    use ny_onnx::vnnlib::OutputConstraint as OC;
+
+    let backend = CertifiedScoredF32Sigmoid::correctly_rounded_real_v1();
+    let a = PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(backend.backend(), 0.75, 0.75)
+        .unwrap();
+    let lower_b =
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::LessEqConst(0, 0.1), a, &backend)
+            .unwrap();
+    let DualSigmoidPinnedRewrite::Bound { sense, rhs } = lower_b else {
+        panic!("0.75 - sigmoid(z_b) <= 0.1 must produce a finite lower bound");
+    };
+    assert_eq!(sense, DualSigmoidLogitSense::Lower);
+    let lower_q = sub_down_f64(sub_down_f64(0.75, 0.1).unwrap(), DUAL_SIGMOID_F32_SUB_ERR).unwrap();
+    let exact_lower = backend
+        .preimage(lower_q, ScoredF32SigmoidPreimageSense::AtLeast)
+        .unwrap()
+        .rhs_for(
+            backend.backend(),
+            ScoredF32SigmoidPreimageSense::AtLeast,
+            lower_q,
+        )
+        .unwrap();
+    assert_eq!(
+        rhs.to_bits(),
+        exact_lower.to_bits(),
+        "rewrite must consume the exact scored-f32 lower preimage"
+    );
+
+    let upper_b =
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::GreaterEqConst(0, 0.1), a, &backend)
+            .unwrap();
+    let DualSigmoidPinnedRewrite::Bound { sense, rhs } = upper_b else {
+        panic!("0.75 - sigmoid(z_b) >= 0.1 must produce a finite upper bound");
+    };
+    assert_eq!(sense, DualSigmoidLogitSense::Upper);
+    let upper_q = add_up_f64(sub_up_f64(0.75, 0.1).unwrap(), DUAL_SIGMOID_F32_SUB_ERR).unwrap();
+    let exact_upper = backend
+        .preimage(upper_q, ScoredF32SigmoidPreimageSense::AtMost)
+        .unwrap()
+        .rhs_for(
+            backend.backend(),
+            ScoredF32SigmoidPreimageSense::AtMost,
+            upper_q,
+        )
+        .unwrap();
+    assert_eq!(
+        rhs.to_bits(),
+        exact_upper.to_bits(),
+        "rewrite must consume the exact scored-f32 upper preimage"
+    );
+
+    // Strict comparisons are safely weakened to the same non-strict senses.
+    assert!(matches!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::LessThanConst(0, 0.1), a, &backend)
+            .unwrap(),
+        DualSigmoidPinnedRewrite::Bound {
+            sense: DualSigmoidLogitSense::Lower,
+            ..
+        }
+    ));
+    assert!(matches!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::GreaterThanConst(0, 0.1), a, &backend)
+            .unwrap(),
+        DualSigmoidPinnedRewrite::Bound {
+            sense: DualSigmoidLogitSense::Upper,
+            ..
+        }
+    ));
+
+    // A non-degenerate certified enclosure catches the critical endpoint
+    // direction: `y <= t` must use A.lower, while `y >= t` must use A.upper.
+    let wide_a =
+        PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(backend.backend(), 0.25, 0.75)
+            .unwrap();
+    let DualSigmoidPinnedRewrite::Bound {
+        sense: DualSigmoidLogitSense::Lower,
+        rhs: lower_rhs,
+    } = rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::LessEqConst(0, 0.1), wide_a, &backend)
+        .unwrap()
+    else {
+        panic!("wide A enclosure <= rewrite must produce a lower B-logit bound");
+    };
+    assert!(
+        lower_rhs < -1.0,
+        "lower rewrite must be derived from A.lower=0.25, not A.upper=0.75"
+    );
+    let DualSigmoidPinnedRewrite::Bound {
+        sense: DualSigmoidLogitSense::Upper,
+        rhs: upper_rhs,
+    } = rewrite_dual_sigmoid_constraint_with_pinned_a(
+        &OC::GreaterEqConst(0, 0.1),
+        wide_a,
+        &backend,
+    )
+    .unwrap()
+    else {
+        panic!("wide A enclosure >= rewrite must produce an upper B-logit bound");
+    };
+    assert!(
+        upper_rhs > 0.5,
+        "upper rewrite must be derived from A.upper=0.75, not A.lower=0.25"
+    );
+}
+
+#[test]
+fn dual_sigmoid_pinned_a_rewrite_boundaries_fail_closed() {
+    use ny_onnx::vnnlib::OutputConstraint as OC;
+
+    let backend = CertifiedScoredF32Sigmoid::correctly_rounded_real_v1();
+    let id = backend.backend();
+    assert!(PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(id, f32::NAN, 0.5).is_err());
+    assert!(PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(id, 0.6, 0.5).is_err());
+    assert!(PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(
+        id,
+        f32::from_bits(0x8000_0001),
+        0.5
+    )
+    .is_err());
+    assert!(PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(
+        id,
+        0.5,
+        f32::from_bits(0x3f80_0001)
+    )
+    .is_err());
+
+    let a = PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(id, 0.4, 0.4).unwrap();
+    assert_eq!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::LessEqConst(0, 0.5), a, &backend)
+            .unwrap(),
+        DualSigmoidPinnedRewrite::Vacuous
+    );
+    assert_eq!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::GreaterEqConst(0, -0.7), a, &backend)
+            .unwrap(),
+        DualSigmoidPinnedRewrite::Vacuous
+    );
+
+    // The opposite edges look impossible for the real sigmoid, but f32 may
+    // saturate to 0/1. They must decline, never become proof authority.
+    assert!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::LessEqConst(0, -0.7), a, &backend)
+            .is_err()
+    );
+    assert!(rewrite_dual_sigmoid_constraint_with_pinned_a(
+        &OC::GreaterEqConst(0, 0.5),
+        a,
+        &backend
+    )
+    .is_err());
+    assert!(rewrite_dual_sigmoid_constraint_with_pinned_a(
+        &OC::LessEqConst(0, f64::NEG_INFINITY),
+        a,
+        &backend,
+    )
+    .is_err());
+    assert!(rewrite_dual_sigmoid_constraint_with_pinned_a(
+        &OC::GreaterEqConst(0, f64::INFINITY),
+        a,
+        &backend,
+    )
+    .is_err());
+    assert_eq!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(
+            &OC::LessEqConst(0, f64::INFINITY),
+            a,
+            &backend,
+        )
+        .unwrap(),
+        DualSigmoidPinnedRewrite::Vacuous
+    );
+    assert_eq!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(
+            &OC::GreaterEqConst(0, f64::NEG_INFINITY),
+            a,
+            &backend,
+        )
+        .unwrap(),
+        DualSigmoidPinnedRewrite::Vacuous
+    );
+
+    assert!(rewrite_dual_sigmoid_constraint_with_pinned_a(
+        &OC::LessEqConst(0, f64::NAN),
+        a,
+        &backend
+    )
+    .is_err());
+    assert!(
+        rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::LessEqConst(1, 0.0), a, &backend)
+            .is_err()
+    );
+    assert!(rewrite_dual_sigmoid_constraint_with_pinned_a(&OC::LessEq(0, 1), a, &backend).is_err());
+}
+
+/// Deterministic property sweep: satisfying samples from the exact,
+/// backend-qualified scored-f32 evaluator must survive the directed preimage
+/// rewrite in both orientations. No empirical evaluation-error injection is
+/// admitted.
+#[test]
+fn dual_sigmoid_pinned_a_rewrite_contains_satisfying_samples() {
+    use ny_onnx::vnnlib::OutputConstraint as OC;
+
+    let backend = CertifiedScoredF32Sigmoid::correctly_rounded_real_v1();
+    let mut state = 0xD1B5_4A32_D192_ED03_u64;
+    let mut unit = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+
+    for sample in 0..8 {
+        let a_scored = unit() as f32;
+        let a_value = a_scored as f64;
+        let z_b = (-16.0 + 32.0 * unit()) as f32;
+        let b_scored = backend.pinned_output(z_b).unwrap().lower() as f32;
+        let slack = if sample % 5 == 0 {
+            f64::from(f32::EPSILON)
+        } else {
+            0.05 * unit()
+        };
+        let y = (a_scored - b_scored) as f64;
+        let a = PinnedSigmoidOutputEnclosure::from_test_exact_endpoints(
+            backend.backend(),
+            a_value as f32,
+            a_value as f32,
+        )
+        .unwrap();
+
+        let lower_rewrite = rewrite_dual_sigmoid_constraint_with_pinned_a(
+            &OC::LessEqConst(0, y + slack),
+            a,
+            &backend,
+        )
+        .unwrap_or_else(|e| panic!("sample {sample}: satisfying <= declined: {e:#}"));
+        if let DualSigmoidPinnedRewrite::Bound { sense, rhs } = lower_rewrite {
+            assert_eq!(sense, DualSigmoidLogitSense::Lower);
+            assert!(
+                f64::from(z_b) >= rhs,
+                "sample {sample}: satisfying <= point z_b={z_b} was cut by lower rhs {rhs}"
+            );
+        }
+
+        let upper_rewrite = rewrite_dual_sigmoid_constraint_with_pinned_a(
+            &OC::GreaterEqConst(0, y - slack),
+            a,
+            &backend,
+        )
+        .unwrap_or_else(|e| panic!("sample {sample}: satisfying >= declined: {e:#}"));
+        if let DualSigmoidPinnedRewrite::Bound { sense, rhs } = upper_rewrite {
+            assert_eq!(sense, DualSigmoidLogitSense::Upper);
+            assert!(
+                f64::from(z_b) <= rhs,
+                "sample {sample}: satisfying >= point z_b={z_b} was cut by upper rhs {rhs}"
+            );
+        }
+    }
+}
+
 // ── nn4sys mscn: point-eval parity (the critical oracle) ────────────────────
 
 /// Parse a nn4sys cardinality vnnlib: the (shared) input box from the
@@ -2293,9 +3330,9 @@ fn mscn_f64_walk(
                 let mut out = Vec::with_capacity(rows * n_out);
                 for r in 0..rows {
                     for i in 0..n_out {
-                        let mut s = l.bias.as_ref().map(|b| b[i] as f64).unwrap_or(0.0);
+                        let mut s = l.bias().map(|b| b[i] as f64).unwrap_or(0.0);
                         for j in 0..n_in {
-                            s += (l.weight[[i, j]] as f64) * v[r * n_in + j];
+                            s += (l.weight()[[i, j]] as f64) * v[r * n_in + j];
                         }
                         out.push(s);
                     }
@@ -2509,21 +3546,11 @@ fn first_violation(problem: &MilpProblem, assign: &[f64], tol: f64) -> Option<St
 ///       walk — false-UNSAT risk is a trajectory the MIP excludes);
 ///   (3) + (4) the σ-space property and the logit-space transformed property
 ///       classify the point identically (validates the sigmoid peel rewrite).
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_point_eval_parity_128d() {
-    let Some(onnx) = nn4sys_onnx_path("mscn_128d.onnx") else {
-        eprintln!("mscn_point_eval_parity_128d: model not found; skipping");
-        return;
-    };
-    let vnnlib = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_0_1_128.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib.exists() {
-        eprintln!("mscn_point_eval_parity_128d: vnnlib not found; skipping");
-        return;
-    }
+    let onnx = require_nn4sys_onnx("mscn_128d.onnx");
+    let vnnlib = require_nn4sys_vnnlib(&onnx, "cardinality_0_1_128.vnnlib");
     let graph = crate::commands::vnncomp::load_graph_network(&onnx).expect("load mscn_128d");
     let input_shape = [11usize, 14];
     let (raw_box, y_upper_t, y_lower_t) = parse_cardinality_vnnlib(&vnnlib, 11 * 14);
@@ -2654,23 +3681,13 @@ fn mscn_point_eval_parity_128d() {
 ///       in the folded MIP (tol 1e-6);
 ///   (3) a perturbed logit is INFEASIBLE in the folded MIP (the fold must
 ///       not have weakened the system into vacuity).
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_fold_parity_128d() {
     use super::super::graph_mip_fold::{fold_pinned_columns, FoldOutcome};
 
-    let Some(onnx) = nn4sys_onnx_path("mscn_128d.onnx") else {
-        eprintln!("mscn_fold_parity_128d: model not found; skipping");
-        return;
-    };
-    let vnnlib = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_0_1_128.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib.exists() {
-        eprintln!("mscn_fold_parity_128d: vnnlib not found; skipping");
-        return;
-    }
+    let onnx = require_nn4sys_onnx("mscn_128d.onnx");
+    let vnnlib = require_nn4sys_vnnlib(&onnx, "cardinality_0_1_128.vnnlib");
     let graph = crate::commands::vnncomp::load_graph_network(&onnx).expect("load mscn_128d");
     let input_shape = [11usize, 14];
     let (raw_box, _, _) = parse_cardinality_vnnlib(&vnnlib, 11 * 14);
@@ -2844,21 +3861,11 @@ fn crown_tightened_node_bounds_expired_deadline_is_ibp_identity() {
 ///       plain-IBP boxes from the same collection seed (the entire point of
 ///       inc5d: smaller big-M ⇒ root-LP-certifiable clauses), and every
 ///       ReLU pre-activation key the IBP path supplied survives.
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_crown_bounds_parity_128d() {
-    let Some(onnx) = nn4sys_onnx_path("mscn_128d.onnx") else {
-        eprintln!("mscn_crown_bounds_parity_128d: model not found; skipping");
-        return;
-    };
-    let vnnlib = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_0_1_128.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib.exists() {
-        eprintln!("mscn_crown_bounds_parity_128d: vnnlib not found; skipping");
-        return;
-    }
+    let onnx = require_nn4sys_onnx("mscn_128d.onnx");
+    let vnnlib = require_nn4sys_vnnlib(&onnx, "cardinality_0_1_128.vnnlib");
     let graph = crate::commands::vnncomp::load_graph_network(&onnx).expect("load mscn_128d");
     let input_shape = [11usize, 14];
     let (raw_box, _, _) = parse_cardinality_vnnlib(&vnnlib, 11 * 14);
@@ -2993,21 +4000,11 @@ fn mscn_crown_bounds_parity_128d() {
 ///       the system into vacuity);
 ///   (3) the α machinery produced a bound at all and it is consistent with
 ///       (non-disjoint from) the encoder's own output column bound.
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_alpha_row_parity_128d() {
-    let Some(onnx) = nn4sys_onnx_path("mscn_128d.onnx") else {
-        eprintln!("mscn_alpha_row_parity_128d: model not found; skipping");
-        return;
-    };
-    let vnnlib = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_0_1_128.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib.exists() {
-        eprintln!("mscn_alpha_row_parity_128d: vnnlib not found; skipping");
-        return;
-    }
+    let onnx = require_nn4sys_onnx("mscn_128d.onnx");
+    let vnnlib = require_nn4sys_vnnlib(&onnx, "cardinality_0_1_128.vnnlib");
     let graph = crate::commands::vnncomp::load_graph_network(&onnx).expect("load mscn_128d");
     let input_shape = [11usize, 14];
     let (raw_box, _, _) = parse_cardinality_vnnlib(&vnnlib, 11 * 14);
@@ -3101,21 +4098,11 @@ fn mscn_alpha_row_parity_128d() {
 /// final, so the exact encoder must FAIL CLOSED on them (this is precisely
 /// what still blocks mscn_128d_dual coverage; documented in the module
 /// header).
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_dual_fails_closed_on_nonfinal_sigmoid() {
-    let Some(onnx) = nn4sys_onnx_path("mscn_128d_dual.onnx") else {
-        eprintln!("mscn_dual_fails_closed_on_nonfinal_sigmoid: model not found; skipping");
-        return;
-    };
-    let vnnlib = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_1_10450_128_dual.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib.exists() {
-        eprintln!("mscn_dual_fails_closed_on_nonfinal_sigmoid: vnnlib not found; skipping");
-        return;
-    }
+    let onnx = require_nn4sys_onnx("mscn_128d_dual.onnx");
+    let vnnlib = require_nn4sys_vnnlib(&onnx, "cardinality_1_10450_128_dual.vnnlib");
     let graph = crate::commands::vnncomp::load_graph_network(&onnx).expect("load dual");
     let input_shape = [22usize, 14];
     let (raw_box, _, _) = parse_cardinality_vnnlib(&vnnlib, 22 * 14);
@@ -3389,12 +4376,12 @@ fn alpha_output_rows_fail_open_on_disjoint_and_mismatch() {
 /// kill switch is set. Production dispatch uses the strict planner instead.
 #[test]
 fn graph_mip_escalation_noop_when_gate_off() {
-    if graph_mip_enabled() {
-        eprintln!(
-            "graph_mip_escalation_noop_when_gate_off: set NY_GRAPH_MIP=0 to exercise; skipping"
-        );
-        return;
-    }
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _gate = ny_test_utils::env::ScopedEnvVar::set("NY_GRAPH_MIP", "0");
+    assert!(
+        !graph_mip_enabled(),
+        "the scoped kill switch must disable Graph-MIP"
+    );
     let spec = VnnLibSpec::new();
     let out = try_graph_mip_escalation(
         Path::new("/nonexistent/model.onnx"),
@@ -3413,30 +4400,18 @@ fn graph_mip_escalation_noop_when_gate_off() {
 /// run per-clause IBP, encode, solve on ay, and return the certified-unsat
 /// marker ONLY if BOTH clauses came back `Unsat { certified: true }`.
 ///
-/// MANUAL-PROBE GATE — runs only with explicit `NY_GRAPH_MIP=1`, so the
-/// default-on production policy does not make CI consume a local corpus.
-/// Run manually:
-///   NY_GRAPH_MIP=1 cargo test --release -p ny-cli --features mip \
+/// This lives in the explicit external-corpus lane. Run manually:
+///   cargo test --release -p ny-cli --features 'mip external-vnncomp' \
 ///     mscn_escalation_certifies_real_instance -- --nocapture
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_escalation_certifies_real_instance() {
-    if !graph_mip_manual_probe_enabled() {
-        eprintln!("mscn_escalation_certifies_real_instance: NY_GRAPH_MIP != 1; skipping");
-        return;
-    }
-    let Some(onnx) = nn4sys_onnx_path("mscn_128d.onnx") else {
-        eprintln!("mscn_escalation_certifies_real_instance: model not found; skipping");
-        return;
-    };
-    let vnnlib_path = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_0_1_128.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib_path.exists() {
-        eprintln!("mscn_escalation_certifies_real_instance: vnnlib not found; skipping");
-        return;
-    }
+    let onnx = require_nn4sys_onnx("mscn_128d.onnx");
+    let vnnlib_path = require_nn4sys_vnnlib(&onnx, "cardinality_0_1_128.vnnlib");
+    assert!(
+        graph_mip_enabled(),
+        "Graph-MIP is disabled; unset NY_GRAPH_MIP or set NY_GRAPH_MIP=1"
+    );
     let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib_path).expect("parse vnnlib");
     assert!(
         !spec.output_constraint_clauses.is_empty(),
@@ -3475,45 +4450,31 @@ fn mscn_escalation_certifies_real_instance() {
         elapsed.as_secs_f64(),
         out
     );
-    // The path must never panic and never fabricate a sat. `None` is the
-    // fail-closed outcome when ay cannot decide a clause within its slice
-    // (measured 2026-07: one mscn_128d clause exceeds a 30s ay slice — see
-    // the info! trail); `Some` is the certified-unsat outcome and must carry
-    // the spec's output arity.
-    match out {
-        Some(unsat) => assert_eq!(unsat.num_outputs, 1),
-        None => eprintln!(
-            "mscn_escalation_certifies_real_instance: escalation fell back (ay did not certify \
-             within budget) — fail-closed outcome, see log for the stalling clause"
-        ),
-    }
+    let unsat = out.unwrap_or_else(|| {
+        panic!(
+            "mscn_escalation_certifies_real_instance: graph-MIP did not certify the tracked \
+             all-unsat instance within its {budget}s conformance budget; a sound fallback is \
+             acceptable in production but is not a passing solve-regression test"
+        )
+    });
+    assert_eq!(unsat.num_outputs, 1);
 }
 
 /// inc5d probe — the SAME end-to-end escalation contract on the larger
 /// mscn_2048d model + its smallest-clause-count instance
-/// (cardinality_0_1_2048, 2 clauses, official budget 20s). ENV-GATED like the
-/// 128d probe; run manually:
-///   NY_GRAPH_MIP=1 cargo test --release -p ny-cli --features mip \
+/// (cardinality_0_1_2048, 2 clauses, official budget 20s). It lives in the
+/// explicit external-corpus lane; run manually:
+///   cargo test --release -p ny-cli --features 'mip external-vnncomp' \
 ///     mscn_escalation_2048d_probe -- --nocapture
+#[cfg(feature = "external-vnncomp")]
 #[test]
 fn mscn_escalation_2048d_probe() {
-    if !graph_mip_manual_probe_enabled() {
-        eprintln!("mscn_escalation_2048d_probe: NY_GRAPH_MIP != 1; skipping");
-        return;
-    }
-    let Some(onnx) = nn4sys_onnx_path("mscn_2048d.onnx") else {
-        eprintln!("mscn_escalation_2048d_probe: model not found; skipping");
-        return;
-    };
-    let vnnlib_path = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_0_1_2048.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib_path.exists() {
-        eprintln!("mscn_escalation_2048d_probe: vnnlib not found; skipping");
-        return;
-    }
+    let onnx = require_nn4sys_onnx("mscn_2048d.onnx");
+    let vnnlib_path = require_nn4sys_vnnlib(&onnx, "cardinality_0_1_2048.vnnlib");
+    assert!(
+        graph_mip_enabled(),
+        "Graph-MIP is disabled; unset NY_GRAPH_MIP or set NY_GRAPH_MIP=1"
+    );
     let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib_path).expect("parse vnnlib");
     assert!(
         !spec.output_constraint_clauses.is_empty(),
@@ -3553,89 +4514,12 @@ fn mscn_escalation_2048d_probe() {
         elapsed.as_secs_f64(),
         out
     );
-    match out {
-        Some(unsat) => assert_eq!(unsat.num_outputs, 1),
-        None => eprintln!(
-            "mscn_escalation_2048d_probe: escalation fell back (fail-closed outcome; see the \
-             info! trail for the stalling clause)"
-        ),
-    }
-}
-
-/// inc5d measurement probe — the PER-CLAUSE outcome table for mscn_128d +
-/// cardinality_0_1_128. The production escalation fail-closes at the FIRST
-/// non-certified clause, so later clauses never get measured; this probe runs
-/// each clause as its own single-clause escalation to attribute
-/// root-certified vs branched-uncertified vs timeout per clause (the decisive
-/// inc5d metric). Measurement-only: single-clause escalation outcomes are
-/// never combined into a verdict here. ENV-GATED like the other probes:
-///   NY_GRAPH_MIP=1 cargo test --release -p ny-cli --features mip \
-///     mscn_escalation_per_clause_table_128d -- --nocapture
-/// `NY_GRAPH_MIP_TEST_BUDGET` = per-clause budget seconds (default 10 = the
-/// official 20s instance budget split over its 2 clauses).
-#[test]
-fn mscn_escalation_per_clause_table_128d() {
-    if !graph_mip_manual_probe_enabled() {
-        eprintln!("mscn_escalation_per_clause_table_128d: NY_GRAPH_MIP != 1; skipping");
-        return;
-    }
-    let Some(onnx) = nn4sys_onnx_path("mscn_128d.onnx") else {
-        eprintln!("mscn_escalation_per_clause_table_128d: model not found; skipping");
-        return;
-    };
-    let vnnlib_path = onnx
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("vnnlib/cardinality_0_1_128.vnnlib"))
-        .expect("vnnlib path");
-    if !vnnlib_path.exists() {
-        eprintln!("mscn_escalation_per_clause_table_128d: vnnlib not found; skipping");
-        return;
-    }
-    let spec = ny_onnx::vnnlib::load_vnnlib(&vnnlib_path).expect("parse vnnlib");
-    let n = spec.output_constraint_clauses.len();
-    assert!(
-        n > 0,
-        "cardinality instance must parse to violation clauses"
-    );
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(
-            if std::env::var("NY_GRAPH_MIP_TEST_DEBUG").ok().as_deref() == Some("1") {
-                tracing::Level::DEBUG
-            } else {
-                tracing::Level::INFO
-            },
+    let unsat = out.unwrap_or_else(|| {
+        panic!(
+            "mscn_escalation_2048d_probe: graph-MIP did not certify the tracked all-unsat \
+             instance within its {budget}s official budget; a measurement-only fallback cannot \
+             pass a solve-regression test"
         )
-        .with_test_writer()
-        .try_init();
-    let budget: u64 = std::env::var("NY_GRAPH_MIP_TEST_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    for k in 0..n {
-        let mut single = spec.clone();
-        single.output_constraint_clauses = vec![spec.output_constraint_clauses[k].clone()];
-        if !spec.per_clause_input_bounds.is_empty() {
-            single.per_clause_input_bounds = vec![spec.per_clause_input_bounds[k].clone()];
-        }
-        let start = Instant::now();
-        let out = try_graph_mip_escalation(
-            &onnx,
-            &OnnxLoadConfig::default(),
-            &[11, 14],
-            Some(&single),
-            MipBackend::Ay,
-            budget,
-        );
-        eprintln!(
-            "per-clause table: clause {}/{n} -> {} in {:.2}s (budget {budget}s)",
-            k + 1,
-            if out.is_some() {
-                "ROOT-CERTIFIED unsat"
-            } else {
-                "not certified (see info trail)"
-            },
-            start.elapsed().as_secs_f64()
-        );
-    }
+    });
+    assert_eq!(unsat.num_outputs, 1);
 }

@@ -2,8 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fast SOUND interval matrix product: Rump midpoint-radius form on plain
-//! f64 GEMMs (#f64-blas-gemm).
+//! Fast SOUND interval matrix product: Rump midpoint-radius form on
+//! probed-thread f64 GEMMs (#f64-blas-gemm).
 //!
 //! # Why
 //!
@@ -12,13 +12,17 @@
 //! interval matmul is a per-element corner-product triple loop (~28ms/node);
 //! the box-refinement screen evaluates thousands of leaves, so the cell
 //! matmul dominates once the CROWN-cost gate sheds CROWN. This module
-//! replaces the O(m·n·k) scalar interval loop with 3-4 plain f64 GEMMs
-//! (ndarray `.dot()` — Apple Accelerate BLAS on macOS via the workspace
-//! `blas-src` route, `matrixmultiply` elsewhere) plus O(m·n + m·k + k·n)
-//! elementwise work, and remains a SOUND enclosure. It fires only for FAT
-//! left operands (see [`FAST_GEMM_MIN_ROWS`]): thin batches are memory-bound
-//! on the weight and stay on the cell's unrolled scalar loop, which reads
-//! the f32 weight exactly once.
+//! replaces the O(m·n·k) scalar interval loop with 3-4 plain f64 GEMMs plus
+//! O(m·n + m·k + k·n) elementwise work, and remains a SOUND enclosure. The
+//! GEMMs deliberately do **not** use `ndarray::dot`: this workspace enables
+//! threaded `matrixmultiply` and Apple Accelerate BLAS, whose private worker
+//! threads expose no way to prove their FTZ/DAZ state. [`probed_matmul`]
+//! instead partitions output rows over Rayon and probes the active binary64
+//! environment on every worker immediately before its left-to-right dot
+//! products. Any failed probe declines the kernel and callers use the scalar
+//! path on their already-probed thread. It fires only for FAT left operands
+//! (see [`FAST_GEMM_MIN_ROWS`]); thin batches stay on the cell's unrolled
+//! scalar loop, which reads the f32 weight exactly once.
 //!
 //! # The math (Rump 1999, midpoint-radius interval GEMM)
 //!
@@ -45,11 +49,10 @@
 //! Numerical Algorithms*, sec. 3.5): a length-k dot product computed in f64
 //! round-to-nearest — in ANY summation order, with or without FMA — satisfies
 //! `|fl(x·y) - x·y| <= γ_k · Σ|x_i||y_i|`. This covers conventional (blocked,
-//! vectorized, threaded-by-partition) GEMMs: Accelerate's dgemm and
-//! `matrixmultiply` both compute each output entry as a reordered dot product
-//! of the exact inputs, so the bound applies per entry. (It would NOT cover a
-//! Strassen-type algorithm, which computes entries from rounded linear
-//! combinations; neither backend uses one.)
+//! vectorized or threaded-by-output-partition) GEMMs. [`probed_matmul`] uses
+//! the simple left-to-right fold explicitly, so it introduces no hidden
+//! reduction order, Strassen-style rounded combinations, or unqualified
+//! backend workers.
 //!
 //! Computed quantities (2-4 GEMMs; `Q`/`S` are skipped when the respective
 //! radius is exactly zero, e.g. the constant weight side of Linear):
@@ -100,7 +103,7 @@
 //! base = fl(Q + S)                       >= (Q+S)(1-u)
 //! t    = fl(P + base)                    >= (P+Q+S)(1-u)^2
 //! e    = up2( fl(γ' · t) )               >= γ'·(P+Q+S)·(1-u)^2,  γ' = γ_{4k+16}
-//! η    = (4k+16)·2^-1074                 (subnormal-underflow guard, below)
+//! η    = (12k+32)·2^-1074                (subnormal-operation guard, below)
 //! r    = up2( fl(base + e + η) )         >= base + e + η
 //! lo   = next_down( fl(Cm - r) )         <= Cm - r
 //! hi   = next_up  ( fl(Cm + r) )         >= Cm + r
@@ -128,17 +131,16 @@
 //! irrelevant against the 1e-5-scale mscn margins, and the tightness test
 //! bounds it globally at < 2x scalar width on mscn-shaped boxes).
 //!
-//! The `η` term: the γ model `fl(x·y) = (x·y)(1+δ)` fails when a MULTIPLY
-//! result is subnormal — there `fl(x·y) = (x·y)(1+δ) + η_i` with
-//! `|η_i| <= 2^-1075` (half an ulp of the subnormal grid; float ADDITIONS
-//! whose result is subnormal are EXACT, Hauser's theorem, so only multiplies
-//! contribute). At most `k` multiplies per entry in each of the <= 4 GEMMs
-//! (plus the `γ'·t` multiply) can underflow, shifting `Cm` by <= `k·2^-1075`
-//! and under-reporting each of `P`, `Q`, `S` by <= `k·2^-1075` (the directed
-//! rank-1 `P̂` never under-reports, but the guard is kept uniform), so adding
-//! the ABSOLUTE guard `η = (4k+16)·2^-1074` (2x margin) to the radius
-//! restores the enclosure in the subnormal regime; it is ~1e-320 at
-//! k = 2048 — invisible at normal magnitudes.
+//! The `η` term: a purely relative γ model is insufficient whenever an exact
+//! elementary result lies in the subnormal range. Each of the <= 4 GEMMs
+//! performs `k` multiplies and `k` reduction adds per entry (<= `8k`
+//! operations total). We charge a full minimum subnormal for every one, then
+//! reserve another `4k+32` operations for magnitude, midpoint/radius, and
+//! final radius assembly. Thus the ABSOLUTE guard
+//! `η = (12k+32)·2^-1074` covers product underflow, cancellation/addition
+//! underflow, and any under-reporting of `P`, `Q`, or `S`; directed `next_up`
+//! steps still cover their local operations independently. The floor is
+//! ~1e-319 at `k = 2048`, invisible at normal magnitudes.
 //!
 //! Hence `[lo, hi] ⊇ Cm ± (R* + underflow) ⊇ [A]·[B]` — the true interval
 //! product — for every entry. The midpoint/radius input split itself is made
@@ -154,34 +156,76 @@
 //! `NY_F64_BLAS=0` disables the fast path everywhere (callers check
 //! [`fast_gemm_enabled`]); shapes with `m·n·k <=` [`FAST_GEMM_MIN_VOLUME`]
 //! or fewer than [`FAST_GEMM_MIN_ROWS`] left-side rows keep the scalar path
-//! — MEASURED on the nn4sys mscn shapes the kernel's weight-sized f64
-//! array traffic makes it SLOWER than the one-pass scalar loop for thin
-//! batches (see [`FAST_GEMM_MIN_ROWS`]); the thin-batch production shapes
-//! are served by the unrolled scalar Linear loop in the cell instead.
+//! because the kernel's multiple weight-sized f64 passes are not worthwhile
+//! for thin batches (see [`FAST_GEMM_MIN_ROWS`]); those shapes are served by
+//! the unrolled scalar Linear loop in the cell instead. The environment
+//! variable retains its historical name even though certified arithmetic no
+//! longer dispatches to an opaque BLAS backend.
 
 use ndarray::{Array2, ArrayView2, Zip};
+use rayon::prelude::*;
 
-use super::graph_ibp_f64_cell::{gamma_n, widen_up_n};
+use super::graph_ibp_f64_cell::{
+    gamma_n, operation_underflow_floor, require_f64_interval_proof_environment, widen_up_n,
+};
 
 /// Minimum `m·n·k` volume for the fast path: below this the midpoint/radius
 /// conversion + 3-4 GEMM dispatch overhead beats the scalar loop's locality.
 pub(super) const FAST_GEMM_MIN_VOLUME: usize = 32_768;
 
-/// Minimum LEFT-side row count `m` for the fast path. MEASURED (mscn_2048d
-/// shapes, Apple M-series, `bench_linear_fast_vs_scalar_mscn_shapes`): the
-/// kernel's cost is dominated by its 3-4 weight-sized array builds + GEMM
-/// passes (f64 traffic ~6x the scalar loop's single one-pass read of the f32
-/// weight), so it is FLAT in `m` (~39ms at k=n=2048) while the scalar loop
-/// is linear in `m` (~3.2ms/row): fast is 2-12x SLOWER for m <= 6 (the
-/// dominant nn4sys mscn per-clause-box shapes, m in {1,2,3,6}), breaks even
-/// around m ~ 12, and wins 1.8x at m=22, 4.9x at m=64, ~150x+ at m=128.
-/// 16 keeps every measured win and none of the regressions.
+/// Minimum LEFT-side row count `m` for the fast path. The Rump form makes
+/// multiple weight-sized f64 passes, so thin per-clause-box shapes
+/// (`m ∈ {1,2,3,6}`) stay on the one-pass scalar interval loop. At `m >= 16`
+/// the rows also expose enough independent work for [`probed_matmul`] to use
+/// the qualified Rayon pool.
 pub(super) const FAST_GEMM_MIN_ROWS: usize = 16;
 
 /// Batteries-included default-ON; `NY_F64_BLAS=0` is the kill-switch that
 /// restores the scalar interval matmul everywhere.
 pub(super) fn fast_gemm_enabled() -> bool {
     !std::env::var("NY_F64_BLAS").is_ok_and(|v| v == "0")
+}
+
+/// Matrix product whose arithmetic runs only on threads that just passed the
+/// required binary64 round-to-nearest/gradual-underflow probe.
+///
+/// The workspace's `ndarray::dot` may dispatch to private
+/// `matrixmultiply-threading` or Accelerate workers. Their FP control state
+/// cannot be inspected, so proof arithmetic cannot use that route. This
+/// implementation gives each output row to Rayon; every executing worker
+/// probes immediately before its left-to-right length-`k` folds. `None`
+/// means a shape/size error or an unsafe worker environment.
+fn probed_matmul(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+    let (m, k) = a.dim();
+    let (kb, n) = b.dim();
+    if k != kb {
+        return None;
+    }
+    let a_standard = a.as_standard_layout();
+    let b_standard = b.as_standard_layout();
+    let a = a_standard.as_slice()?;
+    let b = b_standard.as_slice()?;
+    let len = m.checked_mul(n)?;
+    if len == 0 {
+        return Array2::from_shape_vec((m, n), Vec::new()).ok();
+    }
+
+    let mut output = vec![0.0_f64; len];
+    output
+        .par_chunks_mut(n)
+        .enumerate()
+        .try_for_each(|(i, row)| -> Option<()> {
+            require_f64_interval_proof_environment().ok()?;
+            let a_row = &a[i * k..(i + 1) * k];
+            for (l, &a_value) in a_row.iter().enumerate() {
+                let b_row = &b[l * n..(l + 1) * n];
+                for (value, &b_value) in row.iter_mut().zip(b_row) {
+                    *value += a_value * b_value;
+                }
+            }
+            Some(())
+        })?;
+    Array2::from_shape_vec((m, n), output).ok()
 }
 
 /// Outward-safe midpoint/radius split of `[lo, hi]`:
@@ -264,6 +308,7 @@ pub(super) fn rump_interval_matmul(
     b_lo: ArrayView2<'_, f64>,
     b_hi: ArrayView2<'_, f64>,
 ) -> Option<(Array2<f64>, Array2<f64>)> {
+    require_f64_interval_proof_environment().ok()?;
     let (m, k) = a_lo.dim();
     let (kb, n) = b_lo.dim();
     if a_hi.dim() != (m, k) || b_hi.dim() != (kb, n) || k != kb {
@@ -280,30 +325,34 @@ pub(super) fn rump_interval_matmul(
         // operands: same rowsums, same (exact) column maxima, same GEMMs.
         let rs = abs_rowsums_up(&am)?;
         let cmax = abs_colmax(&bm_abs.view());
-        let s = if a_point { None } else { Some(ar.dot(&bm_abs)) };
-        let cm = am.dot(&bm);
+        let s = if a_point {
+            None
+        } else {
+            Some(probed_matmul(ar.view(), bm_abs.view())?)
+        };
+        let cm = probed_matmul(am.view(), bm.view())?;
         return rump_combine(&cm, |i, j| (rs[i] * cmax[j]).next_up(), None, s, k);
     }
 
     let am_abs = am.mapv(f64::abs);
     // GEMM: Q = fl(|Am| @ Br).
-    let q = Some(am_abs.dot(&br));
+    let q = Some(probed_matmul(am_abs.view(), br.view())?);
     // GEMM (skipped for a point A): S = fl(Ar @ Bs), Bs >= |Bm| + Br real.
     let s = if a_point {
         None
     } else if b_point {
         // Br == 0 exactly: |Bm| + Br = |Bm|, no rounding.
-        Some(ar.dot(&bm_abs))
+        Some(probed_matmul(ar.view(), bm_abs.view())?)
     } else {
         let bs = Zip::from(&bm_abs)
             .and(&br)
             .map_collect(|&mb, &rb| (mb + rb).next_up());
-        Some(ar.dot(&bs))
+        Some(probed_matmul(ar.view(), bs.view())?)
     };
     // GEMM: midpoint product Cm = fl(Am @ Bm).
-    let cm = am.dot(&bm);
+    let cm = probed_matmul(am.view(), bm.view())?;
     // GEMM: P = fl(|Am| @ |Bm|) — magnitude base of the Higham term.
-    let p = am_abs.dot(&bm_abs);
+    let p = probed_matmul(am_abs.view(), bm_abs.view())?;
     let p_s = p.as_slice()?;
     rump_combine(&cm, |i, j| p_s[i * n + j], q, s, k)
 }
@@ -327,6 +376,7 @@ pub(super) fn rump_interval_matmul_point_b(
     bm_abs: ArrayView2<'_, f64>,
     bm_colmax: &[f64],
 ) -> Option<(Array2<f64>, Array2<f64>)> {
+    require_f64_interval_proof_environment().ok()?;
     let (m, k) = a_lo.dim();
     let (kb, n) = bm.dim();
     if a_hi.dim() != (m, k) || bm_abs.dim() != (kb, n) || k != kb || bm_colmax.len() != n {
@@ -335,8 +385,12 @@ pub(super) fn rump_interval_matmul_point_b(
     let (am, ar, a_point) = split_mid_rad(&a_lo, &a_hi)?;
     let rs = abs_rowsums_up(&am)?;
     // Q skipped (Br == 0); S = fl(Ar @ |Bm|) unless A is also a point.
-    let s = if a_point { None } else { Some(ar.dot(&bm_abs)) };
-    let cm = am.dot(&bm);
+    let s = if a_point {
+        None
+    } else {
+        Some(probed_matmul(ar.view(), bm_abs)?)
+    };
+    let cm = probed_matmul(am.view(), bm)?;
     rump_combine(&cm, |i, j| (rs[i] * bm_colmax[j]).next_up(), None, s, k)
 }
 
@@ -357,19 +411,23 @@ fn rump_combine(
     // γ' = γ_{4k+16}: covers the γ_k dot-product bound of every GEMM, all
     // O(1) elementwise roundings, AND the scalar reference path's own fl
     // slack so the fast interval contains the scalar one (module docs).
-    let gamma = gamma_n(4 * k + 16).ok()?;
+    let relative_guard_terms = k.checked_mul(4)?.checked_add(16)?;
+    let gamma = gamma_n(relative_guard_terms).ok()?;
     let (m, n) = cm.dim();
 
     let cm_s = cm.as_slice()?;
     let q_s = q.as_ref().and_then(|a| a.as_slice());
     let s_s = s.as_ref().and_then(|a| a.as_slice());
     if q.is_some() != q_s.is_some() || s.is_some() != s_s.is_some() {
-        return None; // owned dot() results are contiguous; defensive only
+        return None; // owned probed-matmul results are contiguous; defensive only
     }
 
-    // Absolute subnormal-underflow guard (module docs): integer multiple of
-    // 2^-1074, so this product is exact.
-    let eta = (4 * k + 16) as f64 * 5e-324;
+    // Every one of the <=4 dots performs k multiplies and k reduction adds.
+    // The extra 4k+32 charge covers magnitude and radius assembly. Keep this
+    // separate from the tighter relative γ count: the absolute floor costs
+    // nothing at normal magnitudes and must cover operations, not just terms.
+    let underflow_operations = k.checked_mul(12)?.checked_add(32)?;
+    let eta = operation_underflow_floor(underflow_operations).ok()?;
 
     let mut lo = vec![0.0f64; m * n];
     let mut hi = vec![0.0f64; m * n];
@@ -418,6 +476,19 @@ mod tests {
         fn range(&mut self, lo: usize, hi: usize) -> usize {
             lo + (self.next_unit() * (hi - lo + 1) as f64) as usize
         }
+    }
+
+    #[test]
+    fn probed_matmul_uses_the_documented_left_to_right_fold() {
+        let a =
+            Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, -4.0, 5.0, -6.0]).expect("shape");
+        let b =
+            Array2::from_shape_vec((3, 2), vec![7.0, 8.0, -9.0, 10.0, 11.0, -12.0]).expect("shape");
+        let product = probed_matmul(a.view(), b.view()).expect("qualified worker product");
+        assert_eq!(
+            product,
+            Array2::from_shape_vec((2, 2), vec![22.0, -8.0, -139.0, 90.0]).unwrap()
+        );
     }
 
     /// Random interval matrix: mixed signs, magnitude scale `scale`,
@@ -881,279 +952,5 @@ mod tests {
         let s = Array2::from_elem((1, 1), 3e-323);
         let (mid, rad, _) = split_mid_rad(&s.view(), &s.view()).unwrap();
         assert!(mid[[0, 0]] - rad[[0, 0]] <= 3e-323 && 3e-323 <= mid[[0, 0]] + rad[[0, 0]]);
-    }
-
-    /// Timing probe (ignored; run explicitly with --ignored --nocapture):
-    /// per-GEMM speedup of the Rump kernel vs the scalar interval matmul on
-    /// an mscn_2048d-shaped Linear (point B) and a live x live MatMul.
-    #[test]
-    #[ignore = "manual timing probe"]
-    fn bench_rump_vs_scalar_2048() {
-        use std::time::Instant;
-        let mut rng = Rng(0xB7E151628AED2A6A);
-        for &(m, k, n, point_b) in &[
-            (128usize, 2048usize, 2048usize, true),
-            (128, 2048, 2048, false),
-            (11, 2048, 512, true),
-        ] {
-            let (a_lo, a_hi) = random_interval(&mut rng, m, k, 1.0, 0.0);
-            let (b_lo, b_hi) = if point_b {
-                let (b, _) = random_interval(&mut rng, k, n, 1.0, 1.0);
-                (b.clone(), b)
-            } else {
-                random_interval(&mut rng, k, n, 1.0, 0.0)
-            };
-            let t0 = Instant::now();
-            let reps = 5;
-            for _ in 0..reps {
-                let out = rump_interval_matmul(a_lo.view(), a_hi.view(), b_lo.view(), b_hi.view())
-                    .unwrap();
-                std::hint::black_box(out);
-            }
-            let fast = t0.elapsed() / reps;
-            let t1 = Instant::now();
-            let out = scalar_reference(&a_lo, &a_hi, &b_lo, &b_hi);
-            std::hint::black_box(out);
-            let scalar = t1.elapsed();
-            println!(
-                "[{m}x{k}x{n} point_b={point_b}] fast {fast:?} scalar {scalar:?} speedup {:.1}x",
-                scalar.as_secs_f64() / fast.as_secs_f64()
-            );
-        }
-    }
-
-    /// EXTERNAL EXACT-RATIONAL ORACLE DUMP (adversarial-verifier probe for
-    /// #rank1-radius and the Accelerate-dgemm FTZ question): run explicitly
-    /// with `--ignored` and `NY_GEMM_ORACLE_DUMP=<path>`; emits hex-exact
-    /// inputs and kernel outputs for adversarial interval matrices —
-    /// subnormal-product regimes (the FTZ tripwire: a flush-to-zero dgemm
-    /// would break enclosure here by ~13 orders of magnitude vs the η
-    /// guard), denormal inputs, huge dynamic range, negative zeros, unit
-    /// production shapes at k = 2048 — for exact containment verification
-    /// against the true rational interval product by an external checker.
-    #[test]
-    #[ignore = "external-oracle dump; needs NY_GEMM_ORACLE_DUMP"]
-    fn rump_oracle_dump_adversarial() {
-        use std::io::Write as _;
-        let Ok(path) = std::env::var("NY_GEMM_ORACLE_DUMP") else {
-            eprintln!("NY_GEMM_ORACLE_DUMP unset; skipping");
-            return;
-        };
-        let mut f = std::fs::File::create(&path).expect("dump file");
-        let mut rng = Rng(0xAD5E_2026_0717);
-
-        let hex = |a: &Array2<f64>| -> String {
-            a.iter()
-                .map(|v| format!("{:016x}", v.to_bits()))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let dump = |name: &str,
-                    a_lo: &Array2<f64>,
-                    a_hi: &Array2<f64>,
-                    b_lo: &Array2<f64>,
-                    b_hi: &Array2<f64>,
-                    must_accept: bool,
-                    f: &mut std::fs::File| {
-            let (m, k) = a_lo.dim();
-            let n = b_lo.dim().1;
-            match rump_interval_matmul(a_lo.view(), a_hi.view(), b_lo.view(), b_hi.view()) {
-                Some((lo, hi)) => {
-                    writeln!(f, "CASE {name} {m} {k} {n}").unwrap();
-                    writeln!(f, "ALO {}", hex(a_lo)).unwrap();
-                    writeln!(f, "AHI {}", hex(a_hi)).unwrap();
-                    writeln!(f, "BLO {}", hex(b_lo)).unwrap();
-                    writeln!(f, "BHI {}", hex(b_hi)).unwrap();
-                    writeln!(f, "LO {}", hex(&lo)).unwrap();
-                    writeln!(f, "HI {}", hex(&hi)).unwrap();
-                }
-                None => {
-                    assert!(!must_accept, "{name}: kernel declined a production shape");
-                    writeln!(f, "DECLINED {name} {m} {k} {n}").unwrap();
-                }
-            }
-        };
-
-        // 1. FTZ tripwire: point x point, every product subnormal
-        //    (~0.9e-308), k = 2048 sums to ~1.8e-305 (normal). A flushing
-        //    dgemm computes Cm = 0 with radius ~1e-317 — exact containment
-        //    then FAILS. Non-flushing IEEE dgemm stays enclosing.
-        {
-            let (m, k, n) = (17usize, 2048usize, 4usize);
-            let mut a = Array2::<f64>::zeros((m, k));
-            let mut b = Array2::<f64>::zeros((k, n));
-            for v in a.iter_mut() {
-                *v = 1e-154 * (0.5 + rng.next_unit());
-            }
-            for v in b.iter_mut() {
-                *v = 0.9e-154
-                    * (0.5 + rng.next_unit())
-                    * if rng.next_unit() < 0.5 { -1.0 } else { 1.0 };
-            }
-            dump(
-                "ftz_subnormal_products",
-                &a,
-                &a.clone(),
-                &b,
-                &b.clone(),
-                true,
-                &mut f,
-            );
-        }
-        // 2. Denormal inputs with interval radii, k = 2048.
-        {
-            let (m, k, n) = (17usize, 2048usize, 4usize);
-            let mut a_lo = Array2::<f64>::zeros((m, k));
-            let mut a_hi = Array2::<f64>::zeros((m, k));
-            for (l, h) in a_lo.iter_mut().zip(a_hi.iter_mut()) {
-                let c = 1e-310 * (rng.next_unit() * 2.0 - 1.0);
-                let w = 1e-312 * rng.next_unit();
-                *l = c - w;
-                *h = c + w;
-            }
-            let mut b_lo = Array2::<f64>::zeros((k, n));
-            let mut b_hi = Array2::<f64>::zeros((k, n));
-            for (l, h) in b_lo.iter_mut().zip(b_hi.iter_mut()) {
-                let c = 5e-324 * ((rng.next_unit() * 1e4) as i64 as f64);
-                let w = 5e-324 * ((rng.next_unit() * 10.0) as i64 as f64);
-                *l = c - w;
-                *h = c + w;
-            }
-            dump("denormal_inputs", &a_lo, &a_hi, &b_lo, &b_hi, true, &mut f);
-        }
-        // 3. Huge dynamic range (1e-150..1e150 magnitudes; products stay
-        //    finite), intervals on both sides, k = 256.
-        {
-            let (m, k, n) = (8usize, 256usize, 6usize);
-            let mag = |rng: &mut Rng| {
-                let e = rng.next_unit() * 300.0 - 150.0;
-                let s = if rng.next_unit() < 0.5 { -1.0 } else { 1.0 };
-                s * 10f64.powf(e)
-            };
-            let mut a_lo = Array2::<f64>::zeros((m, k));
-            let mut a_hi = Array2::<f64>::zeros((m, k));
-            for (l, h) in a_lo.iter_mut().zip(a_hi.iter_mut()) {
-                let c = mag(&mut rng);
-                let w = c.abs() * rng.next_unit() * 0.3;
-                *l = c - w;
-                *h = c + w;
-            }
-            let mut b_lo = Array2::<f64>::zeros((k, n));
-            let mut b_hi = Array2::<f64>::zeros((k, n));
-            for (l, h) in b_lo.iter_mut().zip(b_hi.iter_mut()) {
-                let c = mag(&mut rng);
-                let w = c.abs() * rng.next_unit() * 0.3;
-                *l = c - w;
-                *h = c + w;
-            }
-            dump("huge_range", &a_lo, &a_hi, &b_lo, &b_hi, false, &mut f);
-        }
-        // 4. Negative zeros: -0.0 mids mixed with tiny magnitudes.
-        {
-            let (m, k, n) = (4usize, 64usize, 4usize);
-            let mut a = Array2::<f64>::zeros((m, k));
-            for v in a.iter_mut() {
-                *v = match (rng.next_unit() * 4.0) as u32 {
-                    0 => -0.0,
-                    1 => 0.0,
-                    2 => -5e-324,
-                    _ => 1e-300 * (rng.next_unit() * 2.0 - 1.0),
-                };
-            }
-            let mut b = Array2::<f64>::zeros((k, n));
-            for v in b.iter_mut() {
-                *v = match (rng.next_unit() * 4.0) as u32 {
-                    0 => -0.0,
-                    1 => 5e-324,
-                    2 => -1e-160,
-                    _ => rng.next_unit() * 2.0 - 1.0,
-                };
-            }
-            dump("neg_zero", &a, &a.clone(), &b, &b.clone(), true, &mut f);
-        }
-        // 5. Production-like unit scale, wide intervals, k = 2048 — plus the
-        //    cancellation variant (mids alternate sign, Cm ~ 0, P* huge).
-        {
-            let (m, k, n) = (17usize, 2048usize, 4usize);
-            let (a_lo, a_hi) = random_interval(&mut rng, m, k, 1.0, 0.2);
-            let (b_lo, b_hi) = random_interval(&mut rng, k, n, 1.0, 0.5);
-            dump("unit_wide", &a_lo, &a_hi, &b_lo, &b_hi, true, &mut f);
-
-            let mut a2 = Array2::<f64>::zeros((m, k));
-            for (i, v) in a2.iter_mut().enumerate() {
-                *v = if i % 2 == 0 {
-                    1.0 + rng.next_unit() * 1e-3
-                } else {
-                    -1.0 - rng.next_unit() * 1e-3
-                };
-            }
-            let mut b2 = Array2::<f64>::zeros((k, n));
-            for v in b2.iter_mut() {
-                *v = 1.0 + rng.next_unit() * 1e-3;
-            }
-            dump(
-                "cancellation",
-                &a2,
-                &a2.clone(),
-                &b2,
-                &b2.clone(),
-                true,
-                &mut f,
-            );
-        }
-        // 6. f32-sourced point weight through BOTH entries (the production
-        //    mscn shape): generic + prepared point-B must both enclose.
-        {
-            let (m, k, n) = (17usize, 2048usize, 4usize);
-            let (a_lo, a_hi) = random_interval(&mut rng, m, k, 2.0, 0.1);
-            let mut b = Array2::<f64>::zeros((k, n));
-            for v in b.iter_mut() {
-                *v = f64::from(((rng.next_unit() * 2.0 - 1.0) * 3.0) as f32);
-            }
-            dump(
-                "f32_weight_generic",
-                &a_lo,
-                &a_hi,
-                &b,
-                &b.clone(),
-                true,
-                &mut f,
-            );
-            let b_abs = b.mapv(f64::abs);
-            let cmax = abs_colmax(&b_abs.view());
-            let (lo, hi) = rump_interval_matmul_point_b(
-                a_lo.view(),
-                a_hi.view(),
-                b.view(),
-                b_abs.view(),
-                &cmax,
-            )
-            .expect("point_b entry declined the production shape");
-            writeln!(f, "CASE f32_weight_point_b {m} {k} {n}").unwrap();
-            writeln!(f, "ALO {}", hex(&a_lo)).unwrap();
-            writeln!(f, "AHI {}", hex(&a_hi)).unwrap();
-            writeln!(f, "BLO {}", hex(&b)).unwrap();
-            writeln!(f, "BHI {}", hex(&b)).unwrap();
-            writeln!(f, "LO {}", hex(&lo)).unwrap();
-            writeln!(f, "HI {}", hex(&hi)).unwrap();
-        }
-        // 7. Random fuzz shapes across magnitude scales.
-        for round in 0..24 {
-            let m = rng.range(1, 24);
-            let k = rng.range(1, 300);
-            let n = rng.range(1, 12);
-            let scale = 10f64.powf(rng.next_unit() * 40.0 - 20.0);
-            let (a_lo, a_hi) = random_interval(&mut rng, m, k, scale, 0.3);
-            let (b_lo, b_hi) = random_interval(&mut rng, k, n, 1.0 / scale.max(1e-6), 0.6);
-            dump(
-                &format!("fuzz_{round}"),
-                &a_lo,
-                &a_hi,
-                &b_lo,
-                &b_hi,
-                false,
-                &mut f,
-            );
-        }
     }
 }

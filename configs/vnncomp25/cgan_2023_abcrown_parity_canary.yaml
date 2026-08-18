@@ -3,20 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Default-off cGAN occurrence-7 canary aligned with alpha-beta-CROWN's current
-# vnncomp23/cgan.yaml recipe (upstream e5c7e17, fetched 2026-07-22). It mirrors
-# cgan_2023.yaml except for six explicit treatment fields:
+# vnncomp23/cgan.yaml recipe (judged submission bbd6bb2, audited 2026-07-30).
+# It mirrors cgan_2023.yaml except for seven explicit treatment fields:
 #   general.device: wgpu                 (NY's GPU analogue of upstream CUDA)
 #   general.conv_mode: matrix
 #   solver.bound_prop_method: crown
 #   attack.pgd_restarts: 100
 #   input_split.sb_coeff_thresh: 1.0e-2
 #   input_split.reorder_bab: true
+#   input_split.adv_check: 0
 #
 # NY deliberately retains batch_size=64 and stacked_rebound=true: upstream
 # starts at one domain but dynamically enlarges its CUDA batch, while NY has no
 # equivalent auto-enlarger and has measured batch-64 stacking as its faster
-# sound execution surface. Plain CROWN disables alpha authority, so the copied
-# alpha_iteration=5 is inert in this treatment.
+# sound execution surface. Plain CROWN disables alpha authority, and the
+# input-split warm-step count remains aligned with production.
 #
 # This file is not selected automatically. A sealed A/B must substitute it for
 # vnncomp25/cgan_2023.yaml in an isolated, provenance-bound config tree.
@@ -26,6 +27,11 @@ general:
   csv_name: instances.csv
   device: wgpu
   conv_mode: matrix
+
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  cgan_forward_alpha_surrogate: false
 
 solver:
   bound_prop_method: crown
@@ -39,9 +45,12 @@ bab:
   crown_ibp_per_node_cap_secs: 150
   phase_budget:
     disjunctive_pgd_fraction: 0.10
+    disjunctive_pgd_max_secs: 5
     attack_extension_fraction: 0.0
     initial_bounds_fraction: 0.45
     disjunctive_precheck_fraction: 0.85
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
   branching:
     method: input
     candidates: 5
@@ -49,7 +58,12 @@ bab:
     input_split:
       sb_coeff_thresh: 1.0e-2
       reorder_bab: true
-      alpha_iteration: 5
+      # Counterintuitive sentinel: 0 ENABLES periodic SAT-only probes from the
+      # first BaB iteration; -1 disables them. Upstream's default is 0. With
+      # pgd_order=before, its auto gate attacks the worst queued input domains
+      # during BaB (5 restarts x 5 steps).
+      adv_check: 0
+      alpha_iteration: 1
       lr_alpha: 0.05
       ibp_enhancement: true
       stacked_rebound: true
@@ -59,6 +73,9 @@ bab:
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100
+    cgan_complete_crown_ibp_root: true
+    reference_refresh_max_secs: 12
+    forward_linear_deadline_fallback_to_ibp: true
   beta_crown:
     lr_alpha: 0.1
     lr_beta: 0.15

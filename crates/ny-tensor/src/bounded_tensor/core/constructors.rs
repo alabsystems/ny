@@ -8,6 +8,7 @@ use ndarray::{ArrayD, Axis, IxDyn};
 use ny_core::{NyError, Result};
 use tracing::debug;
 
+use super::allocation_provenance::TrackedArrayD;
 use super::inversion_repair::{repair_inverted_bounds_nd, InversionRepair};
 use super::BoundedTensor;
 
@@ -67,14 +68,14 @@ impl BoundedTensor {
             ));
         }
         let bounds_valid = ndarray::Zip::from(&lower)
-            .and(&self.upper)
+            .and(self.upper.as_array())
             .all(|&l, &u| l <= u);
         if !bounds_valid {
             return Err(NyError::InvalidSpec(
                 "BoundedTensor::set_lower: found lower > upper (inverted bounds)".to_string(),
             ));
         }
-        self.lower = lower;
+        self.lower = TrackedArrayD::new(lower);
         Ok(())
     }
 
@@ -92,7 +93,7 @@ impl BoundedTensor {
                 "BoundedTensor::set_upper: upper bounds contain NaN or Inf".to_string(),
             ));
         }
-        let bounds_valid = ndarray::Zip::from(&self.lower)
+        let bounds_valid = ndarray::Zip::from(self.lower.as_array())
             .and(&upper)
             .all(|&l, &u| l <= u);
         if !bounds_valid {
@@ -100,7 +101,7 @@ impl BoundedTensor {
                 "BoundedTensor::set_upper: found lower > upper (inverted bounds)".to_string(),
             ));
         }
-        self.upper = upper;
+        self.upper = TrackedArrayD::new(upper);
         Ok(())
     }
 
@@ -128,12 +129,9 @@ impl BoundedTensor {
             )));
         }
 
-        self.lower
-            .index_axis_mut(Axis(axis), index)
-            .fill(f32::INFINITY);
+        self.lower.fill_axis_index(Axis(axis), index, f32::INFINITY);
         self.upper
-            .index_axis_mut(Axis(axis), index)
-            .fill(f32::NEG_INFINITY);
+            .fill_axis_index(Axis(axis), index, f32::NEG_INFINITY);
         Ok(())
     }
 
@@ -166,11 +164,7 @@ impl BoundedTensor {
             ));
         }
 
-        Ok(Self {
-            lower,
-            upper,
-            l2: None,
-        })
+        Ok(Self::from_parts_with_l2(lower, upper, None))
     }
 
     /// Like [`Self::new`] but allows infinite endpoints. Rejects NaN and inverted bounds.
@@ -200,11 +194,65 @@ impl BoundedTensor {
                     .to_string(),
             ));
         }
-        Ok(Self {
-            lower,
-            upper,
-            l2: None,
-        })
+        Ok(Self::from_parts_with_l2(lower, upper, None))
+    }
+
+    /// Like [`Self::new_allow_infinite`], with cooperative polling during each
+    /// linear validation scan.
+    ///
+    /// `poll` runs at entry, after at most every 4,096 inspected values, and
+    /// before publication. A poll error leaves both owned arrays local to this
+    /// call and publishes no partially validated tensor.
+    pub fn new_allow_infinite_with_poll<F>(
+        lower: ArrayD<f32>,
+        upper: ArrayD<f32>,
+        mut poll: F,
+    ) -> Result<Self>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        if lower.shape() != upper.shape() {
+            return Err(NyError::shape_mismatch(
+                lower.shape().to_vec(),
+                upper.shape().to_vec(),
+            ));
+        }
+        for (index, &value) in lower.iter().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            if value.is_nan() {
+                return Err(NyError::NumericalInstability(
+                    "BoundedTensor::new_allow_infinite: lower bounds contain NaN".to_string(),
+                ));
+            }
+        }
+        for (index, &value) in upper.iter().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            if value.is_nan() {
+                return Err(NyError::NumericalInstability(
+                    "BoundedTensor::new_allow_infinite: upper bounds contain NaN".to_string(),
+                ));
+            }
+        }
+        for (index, (&lower_value, &upper_value)) in lower.iter().zip(upper.iter()).enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            if lower_value > upper_value {
+                return Err(NyError::InvalidSpec(
+                    "BoundedTensor::new_allow_infinite: found lower > upper (inverted bounds)"
+                        .to_string(),
+                ));
+            }
+        }
+        poll()?;
+        Ok(Self::from_parts_with_l2(lower, upper, None))
     }
 
     /// Create conservative `[-inf, +inf]` bounds for every element of `shape`.
@@ -216,11 +264,65 @@ impl BoundedTensor {
         let shape = IxDyn(shape);
         let lower = ArrayD::from_elem(shape.clone(), f32::NEG_INFINITY);
         let upper = ArrayD::from_elem(shape, f32::INFINITY);
-        Self {
-            lower,
-            upper,
-            l2: None,
+        Self::from_parts_with_l2(lower, upper, None)
+    }
+
+    /// Create conservative `[-inf, +inf]` bounds while cooperatively polling.
+    ///
+    /// Allocator calls themselves are not preemptible. Initialization is split
+    /// into bounded chunks, and a poll error prevents publication.
+    pub fn new_conservative_with_poll<F>(shape: &[usize], mut poll: F) -> Result<Self>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        let elements = ny_core::checked_shape_product(shape).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::new_conservative_with_poll: shape product overflow: {shape:?}"
+            ))
+        })?;
+        let mut lower_values = Vec::new();
+        let mut upper_values = Vec::new();
+        lower_values.try_reserve_exact(elements).map_err(|error| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::new_conservative_with_poll: lower allocation failed for \
+                 {elements} elements: {error}"
+            ))
+        })?;
+        poll()?;
+        upper_values.try_reserve_exact(elements).map_err(|error| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::new_conservative_with_poll: upper allocation failed for \
+                 {elements} elements: {error}"
+            ))
+        })?;
+        poll()?;
+
+        while lower_values.len() < elements {
+            let chunk = (elements - lower_values.len()).min(POLL_ELEMENTS);
+            lower_values.extend(std::iter::repeat_n(f32::NEG_INFINITY, chunk));
+            poll()?;
         }
+        while upper_values.len() < elements {
+            let chunk = (elements - upper_values.len()).min(POLL_ELEMENTS);
+            upper_values.extend(std::iter::repeat_n(f32::INFINITY, chunk));
+            poll()?;
+        }
+
+        let lower = ArrayD::from_shape_vec(IxDyn(shape), lower_values).map_err(|error| {
+            NyError::InternalError(format!(
+                "BoundedTensor::new_conservative_with_poll: lower reshape failed: {error}"
+            ))
+        })?;
+        let upper = ArrayD::from_shape_vec(IxDyn(shape), upper_values).map_err(|error| {
+            NyError::InternalError(format!(
+                "BoundedTensor::new_conservative_with_poll: upper reshape failed: {error}"
+            ))
+        })?;
+        poll()?;
+        Ok(Self::from_parts_with_l2(lower, upper, None))
     }
 
     /// Create a concrete tensor (lower == upper). Returns `Err` if `values` contains NaN or Inf.
@@ -230,11 +332,54 @@ impl BoundedTensor {
                 "BoundedTensor::concrete: values contain NaN or Inf".to_string(),
             ));
         }
-        Ok(Self {
-            lower: values.clone(),
-            upper: values,
-            l2: None,
-        })
+        Ok(Self::from_parts_with_l2(values.clone(), values, None))
+    }
+
+    /// Create a concrete tensor while cooperatively polling validation and copy.
+    ///
+    /// This preserves [`Self::concrete`]'s validation error and element values.
+    /// Allocator calls themselves are not preemptible.
+    pub fn concrete_with_poll<F>(values: ArrayD<f32>, mut poll: F) -> Result<Self>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        for (index, &value) in values.iter().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            if value.is_nan() || value.is_infinite() {
+                return Err(NyError::NumericalInstability(
+                    "BoundedTensor::concrete: values contain NaN or Inf".to_string(),
+                ));
+            }
+        }
+
+        let elements = values.len();
+        let mut lower_values = Vec::new();
+        lower_values.try_reserve_exact(elements).map_err(|error| {
+            NyError::InvalidSpec(format!(
+                "BoundedTensor::concrete_with_poll: allocation failed for {elements} elements: \
+                 {error}"
+            ))
+        })?;
+        poll()?;
+        for (index, &value) in values.iter().enumerate() {
+            if index.is_multiple_of(POLL_ELEMENTS) {
+                poll()?;
+            }
+            lower_values.push(value);
+        }
+        let lower =
+            ArrayD::from_shape_vec(IxDyn(values.shape()), lower_values).map_err(|error| {
+                NyError::InternalError(format!(
+                    "BoundedTensor::concrete_with_poll: lower reshape failed: {error}"
+                ))
+            })?;
+        poll()?;
+        Ok(Self::from_parts_with_l2(lower, values, None))
     }
 
     /// Create bounds as `[value - epsilon, value + epsilon]`. Returns `Err` if values contain
@@ -251,25 +396,23 @@ impl BoundedTensor {
                 epsilon
             )));
         }
-        Ok(Self {
-            lower: values.mapv(|v| {
-                let r = v - epsilon;
-                if r.is_infinite() {
-                    f32::MIN
-                } else {
-                    r
-                }
-            }),
-            upper: values.mapv(|v| {
-                let r = v + epsilon;
-                if r.is_infinite() {
-                    f32::MAX
-                } else {
-                    r
-                }
-            }),
-            l2: None,
-        })
+        let lower = values.mapv(|v| {
+            let r = v - epsilon;
+            if r.is_infinite() {
+                f32::MIN
+            } else {
+                r
+            }
+        });
+        let upper = values.mapv(|v| {
+            let r = v + epsilon;
+            if r.is_infinite() {
+                f32::MAX
+            } else {
+                r
+            }
+        });
+        Ok(Self::from_parts_with_l2(lower, upper, None))
     }
 
     /// Internal shape-only constructor shared by all `new_unchecked` variants.
@@ -282,11 +425,7 @@ impl BoundedTensor {
                 upper.shape().to_vec(),
             ));
         }
-        Ok(Self {
-            lower,
-            upper,
-            l2: None,
-        })
+        Ok(Self::from_parts_with_l2(lower, upper, None))
     }
 
     /// Bypass NaN/Inf/ordering checks. Only validates shape.
@@ -341,11 +480,7 @@ impl BoundedTensor {
         let (result_lower, result_upper) = Self::sanitize_and_order(lower, upper, clamp_val);
 
         debug_assert_eq!(result_lower.shape(), &original_shape[..]);
-        Ok(Self {
-            lower: result_lower,
-            upper: result_upper,
-            l2: None,
-        })
+        Ok(Self::from_parts_with_l2(result_lower, result_upper, None))
     }
 
     /// Sanitize this tensor by clamping NaN/Inf values.
@@ -356,8 +491,11 @@ impl BoundedTensor {
     /// See [`Self::new_sanitized`] for details on the clamping behavior.
     #[inline]
     pub fn sanitize(&self, clamp_val: f32) -> Self {
-        let (lower, upper) =
-            Self::sanitize_and_order(self.lower.clone(), self.upper.clone(), clamp_val);
+        let (lower, upper) = Self::sanitize_and_order(
+            self.lower.as_array().clone(),
+            self.upper.as_array().clone(),
+            clamp_val,
+        );
 
         // KEEP unchecked: sanitize_and_order() preserves shape and repairs
         // non-finite / inverted entries before reconstruction.
@@ -421,13 +559,120 @@ impl BoundedTensor {
                     );
                 }
                 let (lower, upper) = Self::fix_inverted(lower, upper);
-                Ok(Self {
-                    lower,
-                    upper,
-                    l2: None,
-                })
+                Ok(Self::from_parts_with_l2(lower, upper, None))
             }
         }
+    }
+
+    /// Construct bounds with the same repair semantics as [`Self::new_repaired`],
+    /// invoking `poll` before entry, between bounded scan chunks, and immediately
+    /// before publishing the tensor.
+    ///
+    /// This is intended for deadline-authoritative propagation paths where the
+    /// otherwise-linear NaN/order validation must itself remain cancellable.
+    /// `poll` may return any caller-selected error (typically
+    /// `NyError::DeadlineExceeded`).
+    pub fn new_repaired_with_poll<F>(
+        mut lower: ArrayD<f32>,
+        mut upper: ArrayD<f32>,
+        strategy: RepairStrategy,
+        mut poll: F,
+    ) -> Result<Self>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        const POLL_ELEMENTS: usize = 4_096;
+
+        poll()?;
+        if lower.shape() != upper.shape() {
+            return Err(NyError::shape_mismatch(
+                lower.shape().to_vec(),
+                upper.shape().to_vec(),
+            ));
+        }
+
+        match strategy {
+            RepairStrategy::Strict => {
+                // Preserve `Self::new`'s observable validation order exactly:
+                // all lower finiteness, then all upper finiteness, then ordering.
+                for (index, &lower_value) in lower.iter().enumerate() {
+                    if index.is_multiple_of(POLL_ELEMENTS) {
+                        poll()?;
+                    }
+                    if lower_value.is_nan() || lower_value.is_infinite() {
+                        return Err(NyError::NumericalInstability(
+                            "BoundedTensor::new: lower bounds contain NaN or Inf".to_string(),
+                        ));
+                    }
+                }
+                for (index, &upper_value) in upper.iter().enumerate() {
+                    if index.is_multiple_of(POLL_ELEMENTS) {
+                        poll()?;
+                    }
+                    if upper_value.is_nan() || upper_value.is_infinite() {
+                        return Err(NyError::NumericalInstability(
+                            "BoundedTensor::new: upper bounds contain NaN or Inf".to_string(),
+                        ));
+                    }
+                }
+                for (index, (&lower_value, &upper_value)) in
+                    lower.iter().zip(upper.iter()).enumerate()
+                {
+                    if index.is_multiple_of(POLL_ELEMENTS) {
+                        poll()?;
+                    }
+                    if lower_value > upper_value {
+                        return Err(NyError::InvalidSpec(
+                            "BoundedTensor::new: found lower > upper (inverted bounds)".to_string(),
+                        ));
+                    }
+                }
+            }
+            RepairStrategy::Conservative | RepairStrategy::Widen => {
+                // Preserve `new_repaired`'s three passes exactly: repair every
+                // lower NaN, repair every upper NaN, then swap inversions.
+                let mut repair_count = 0usize;
+                for (index, lower_value) in lower.iter_mut().enumerate() {
+                    if index.is_multiple_of(POLL_ELEMENTS) {
+                        poll()?;
+                    }
+                    if lower_value.is_nan() {
+                        *lower_value = f32::NEG_INFINITY;
+                        repair_count += 1;
+                    }
+                }
+                for (index, upper_value) in upper.iter_mut().enumerate() {
+                    if index.is_multiple_of(POLL_ELEMENTS) {
+                        poll()?;
+                    }
+                    if upper_value.is_nan() {
+                        *upper_value = f32::INFINITY;
+                        repair_count += 1;
+                    }
+                }
+                for (index, (lower_value, upper_value)) in
+                    lower.iter_mut().zip(upper.iter_mut()).enumerate()
+                {
+                    if index.is_multiple_of(POLL_ELEMENTS) {
+                        poll()?;
+                    }
+                    if *lower_value > *upper_value {
+                        std::mem::swap(lower_value, upper_value);
+                    }
+                }
+                if repair_count > 0 {
+                    debug!(
+                        repair_count,
+                        ?strategy,
+                        "BoundedTensor::new_repaired_with_poll: repaired {} NaN elements",
+                        repair_count
+                    );
+                }
+            }
+        }
+
+        poll()?;
+        Ok(Self::from_parts_with_l2(lower, upper, None))
     }
 
     /// Fix inverted bounds by swapping elements where lower > upper.

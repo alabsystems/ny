@@ -13,11 +13,43 @@
 //! layers as 1-Lipschitz and only flags itself via `is_sound`.
 
 use anyhow::{Context, Result};
-use ny_api::lipschitz::certify_upper_bound;
+use ny_api::lipschitz::{certify_upper_bound, SoundLipschitz};
 use ny_api::probabilistic::estimate_lipschitz_from_network;
 use ny_onnx::load_onnx;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::Path;
+
+fn sound_certificate_json(sound: &SoundLipschitz) -> Result<Value> {
+    let bound_exact = sound
+        .bound
+        .to_clean_string()
+        .context("exact Lipschitz bound is unavailable")?;
+    let per_layer = sound
+        .per_layer
+        .iter()
+        .map(|layer| -> Result<Value> {
+            let squared_bound_exact = layer.squared_bound.to_clean_string().with_context(|| {
+                format!(
+                    "exact squared Lipschitz bound is unavailable for layer {}",
+                    layer.index
+                )
+            })?;
+            Ok(json!({
+                "index": layer.index,
+                "layer_type": layer.layer_type,
+                "norm_kind": format!("{:?}", layer.norm_kind),
+                "squared_bound_exact": squared_bound_exact,
+                "bound_approx": layer.bound.to_f64_approx(),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(json!({
+        "bound_exact": bound_exact,
+        "bound_approx": sound.bound_approx(),
+        "per_layer": per_layer,
+    }))
+}
 
 /// Handle the `ny lipschitz` command.
 pub(crate) fn handle_lipschitz_command(model: &Path, json_output: bool) -> Result<()> {
@@ -32,16 +64,12 @@ pub(crate) fn handle_lipschitz_command(model: &Path, json_output: bool) -> Resul
 
     if json_output {
         let sound_json = match &sound {
-            Ok(s) => json!({
-                "bound_exact": s.bound.to_clean_string().unwrap_or_default(),
-                "bound_approx": s.bound_approx(),
-                "per_layer": s.per_layer.iter().map(|l| json!({
-                    "index": l.index,
-                    "layer_type": l.layer_type,
-                    "norm_kind": format!("{:?}", l.norm_kind),
-                    "squared_bound_exact": l.squared_bound.to_clean_string().unwrap_or_default(),
-                    "bound_approx": l.bound.to_f64_approx(),
-                })).collect::<Vec<_>>(),
+            Ok(s) => sound_certificate_json(s).unwrap_or_else(|e| {
+                json!({
+                    "error": format!(
+                        "exact certificate serialization failed (fails closed): {e:#}"
+                    )
+                })
             }),
             Err(e) => json!({ "error": e.to_string() }),
         };
@@ -66,27 +94,34 @@ pub(crate) fn handle_lipschitz_command(model: &Path, json_output: bool) -> Resul
 
     println!("Model: {}", model.display());
     match &sound {
-        Ok(s) => {
-            println!("SOUND certified Lipschitz upper bound (l2 -> l2):");
-            println!(
-                "  bound  ~= {:.6e}  (certified upper bound)",
-                s.bound_approx()
-            );
-            let exact = s.bound.to_clean_string().unwrap_or_default();
-            if exact.len() <= 64 {
-                println!("  bound   = {exact}  (exact rational)");
-            }
-            println!("  per-layer:");
-            for l in &s.per_layer {
+        Ok(s) => match s.bound.to_clean_string() {
+            Ok(exact) => {
+                println!("SOUND certified Lipschitz upper bound (l2 -> l2):");
                 println!(
-                    "    [{:>3}] {:<12} {:?}: bound ~= {:.6e}",
-                    l.index,
-                    l.layer_type,
-                    l.norm_kind,
-                    l.bound.to_f64_approx()
+                    "  bound  ~= {:.6e}  (certified upper bound)",
+                    s.bound_approx()
+                );
+                if exact.len() <= 64 {
+                    println!("  bound   = {exact}  (exact rational)");
+                }
+                println!("  per-layer:");
+                for l in &s.per_layer {
+                    println!(
+                        "    [{:>3}] {:<12} {:?}: bound ~= {:.6e}",
+                        l.index,
+                        l.layer_type,
+                        l.norm_kind,
+                        l.bound.to_f64_approx()
+                    );
+                }
+            }
+            Err(e) => {
+                println!(
+                    "SOUND certificate: unavailable (fails closed): \
+                     exact rational serialization failed: {e}"
                 );
             }
-        }
+        },
         Err(e) => {
             println!("SOUND certificate: unavailable (fails closed): {e}");
         }

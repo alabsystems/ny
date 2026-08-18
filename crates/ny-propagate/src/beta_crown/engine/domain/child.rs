@@ -163,30 +163,50 @@ impl BetaCrownVerifier {
             };
 
         // Tighten intermediate bounds using split constraints (clip_interm_domain)
+        // CAPABILITY GATE (see `clip::sequential_clip_interm_domain_supported`).
+        // A preset may REQUEST clip_interm_domain on the sequential engine, where
+        // the feature is quarantined; the contract is that the request is SKIPPED,
+        // so BaB branches exactly as if the flag were off. Skipping an optional
+        // bound-tightening is sound (bounds remain valid, just less tight) —
+        // erroring out every child is what silently converted provable instances
+        // into `unknown`, because this gate fires for every child at depth > 0,
+        // i.e. every child, so the search collapsed at the root.
+        //
+        // DEFENCE IN DEPTH: `apply_clip_interm_domain` independently returns the
+        // caller's bounds unchanged when the capability is unsupported, so dropping
+        // this conjunct costs throughput but cannot re-break the search. Both halves
+        // are covered by `engine::tests::clip_interm_domain_gate`. When the
+        // provenance-preserving conversion lands, that predicate flips to true and
+        // this arm starts applying the tightening for real.
+        // #clip-interm-notice: the skip notice lives inside
+        // `apply_clip_interm_domain`, but this gate means that function is never
+        // entered in production — so a preset requesting the feature got NOTHING
+        // and was told nothing. `configs/vnncomp25/relusplitter.yaml:85` sets it.
+        // Fire the (once-per-process) notice here, where the request is actually
+        // declined. Logging only: no bound, verdict or control flow changes.
+        if self.config.enable_clip_interm_domain
+            && !super::clip::sequential_clip_interm_domain_supported()
+        {
+            super::clip::warn_sequential_clip_interm_skipped_once();
+        }
         let new_layer_bounds = if self.config.enable_clip_interm_domain
+            && super::clip::sequential_clip_interm_domain_supported()
             && new_history.depth() > 0
             && !intermediate_bounds.is_empty()
         {
-            match self.apply_clip_interm_domain(
+            let bounds = self.apply_clip_interm_domain(
+                network,
                 &new_history,
                 new_layer_bounds,
                 &intermediate_bounds,
                 input,
                 parent.input_bounds.as_deref(),
-            ) {
-                Ok(bounds) => {
-                    if self.config.clip_interm_prune && has_infeasible_layer_bounds(&bounds) {
-                        debug!("clip_interm_domain pruned domain with infeasible bounds");
-                        return Ok(None);
-                    }
-                    bounds
-                }
-                Err(err) if self.config.clip_interm_prune => {
-                    debug!("clip_interm_domain pruned infeasible domain: {}", err);
-                    return Ok(None);
-                }
-                Err(err) => return Err(err),
+            )?;
+            if self.config.clip_interm_prune && has_infeasible_layer_bounds(&bounds) {
+                debug!("clip_interm_domain pruned domain with infeasible bounds");
+                return Ok(None);
             }
+            bounds
         } else {
             new_layer_bounds
         };

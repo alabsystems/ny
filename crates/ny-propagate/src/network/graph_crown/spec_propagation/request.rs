@@ -10,10 +10,12 @@
 
 use crate::batched_domain::CachedLinearBounds;
 use crate::bounds::{GraphAlphaState, LinearBounds};
+use crate::network::graph_alpha::resnet_decompose::DeadlineBoundedResnetRowsResult;
+use crate::network::ResnetSegmentSkeleton;
 use crate::types::CrownBackwardResult;
 use crate::MulBinaryRelaxationMode;
 
-use ny_core::{GemmEngine, Result};
+use ny_core::{GemmEngine, Result, DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS};
 use ny_tensor::BoundedTensor;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -30,7 +32,7 @@ use crate::network::core::GraphNetwork;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let result = SpecCrownRequest::new(&graph, &input, &spec, engine)
 ///     .node_bounds(&node_bounds)
 ///     .deadline_opt(Some(deadline))
@@ -233,6 +235,179 @@ impl<'a> SpecCrownRequest<'a> {
         self.capture_linear_cache = true;
         let (result, _linear, cache) = self.execute()?;
         Ok((result.bounds, cache))
+    }
+
+    /// Attempt exactly one fresh-slope, certified GPU-resident ResNet backward.
+    ///
+    /// This is deliberately narrower than [`Self::run`]: it never enters the
+    /// forward-linear candidates or the CPU fallback, and its return type cannot
+    /// publish an input-linear map or [`CachedLinearBounds`]. `Ok(None)` is the
+    /// fail-closed result for an unavailable/unsupported sound GPU route.
+    ///
+    /// Callers must provide already-certified node bounds and a private deadline.
+    /// Supplying any state that this narrow route would otherwise have to ignore
+    /// (alpha, cache capture, truncation, reference bounds, MulBinary alpha, or a
+    /// multi-neuron pool) declines the request instead. Passing `None` for alpha
+    /// to the ResNet extractor selects its fresh adaptive ReLU slopes.
+    pub(crate) fn run_fresh_slope_sound_gpu_bounds_only(self) -> Result<Option<BoundedTensor>> {
+        let Some(node_bounds) = self.precomputed_node_bounds else {
+            return Ok(None);
+        };
+        let Some(deadline) = self.deadline else {
+            return Ok(None);
+        };
+        if self.spec_matrix.nrows() != 1
+            || !super::core::spec_root_gpu_enabled()
+            || Instant::now() >= deadline
+            || self.reference_node_bounds.is_some()
+            || self.alpha_state.is_some()
+            || self.mul_binary_alphas.is_some()
+            || self.crown_backward_layers.is_some()
+            || self.capture_linear_cache
+            || self.wants_input_linear
+            || self.mn_pool.is_some_and(|pool| !pool.is_empty())
+            || self.mul_binary_relaxation != MulBinaryRelaxationMode::default()
+        {
+            return Ok(None);
+        }
+
+        let exec_order = self.graph.exec_order()?;
+        let output_node_name = super::setup::resolve_output_contract(
+            self.graph,
+            exec_order,
+            node_bounds,
+            self.spec_matrix.ncols(),
+        )?;
+        let seed = LinearBounds::from_spec_matrix(self.spec_matrix.clone())?;
+        crate::network::graph_alpha::resnet_decompose::
+            try_resnet_gpu_suffix_single_row_with_deadline(
+                self.graph,
+                self.input,
+                output_node_name,
+                node_bounds,
+                node_bounds,
+                self.engine,
+                deadline,
+                &seed,
+            )
+    }
+
+    /// Attempt one alpha-bearing, certified GPU-resident ResNet backward.
+    ///
+    /// This is the state-paired twin of
+    /// [`Self::run_fresh_slope_sound_gpu_bounds_only`].  It accepts exactly one
+    /// explicit alpha state and otherwise keeps the same narrow contract: one
+    /// row, certified node bounds, a mandatory private deadline, the dedicated
+    /// call-local GPU API, and no cache/linear/fallback publication.
+    pub(crate) fn run_alpha_sound_gpu_bounds_only(self) -> Result<Option<BoundedTensor>> {
+        let Some(node_bounds) = self.precomputed_node_bounds else {
+            return Ok(None);
+        };
+        let Some(alpha_state) = self.alpha_state else {
+            return Ok(None);
+        };
+        let Some(deadline) = self.deadline else {
+            return Ok(None);
+        };
+        if self.spec_matrix.nrows() != 1
+            || !super::core::spec_root_gpu_enabled()
+            || Instant::now() >= deadline
+            || self.reference_node_bounds.is_some()
+            || self.mul_binary_alphas.is_some()
+            || self.crown_backward_layers.is_some()
+            || self.capture_linear_cache
+            || self.wants_input_linear
+            || self.mn_pool.is_some_and(|pool| !pool.is_empty())
+            || self.mul_binary_relaxation != MulBinaryRelaxationMode::default()
+        {
+            return Ok(None);
+        }
+
+        let exec_order = self.graph.exec_order()?;
+        let output_node_name = super::setup::resolve_output_contract(
+            self.graph,
+            exec_order,
+            node_bounds,
+            self.spec_matrix.ncols(),
+        )?;
+        let seed = LinearBounds::from_spec_matrix(self.spec_matrix.clone())?;
+        crate::network::graph_alpha::resnet_decompose::
+            try_resnet_gpu_suffix_single_row_with_alpha_and_deadline(
+                self.graph,
+                self.input,
+                output_node_name,
+                node_bounds,
+                node_bounds,
+                alpha_state,
+                self.engine,
+                deadline,
+                &seed,
+            )
+    }
+
+    /// Attempt one alpha-bearing, certified GPU-resident ResNet backward for a
+    /// bounded batch of `2..=8` specification rows.
+    ///
+    /// This is an additive sibling of
+    /// [`Self::run_alpha_sound_gpu_bounds_only`], not a replacement for it.
+    /// The one-row critical route therefore keeps its exact legacy entry and
+    /// dispatch, while active-set callers can certify a complete small row
+    /// vector in one call-local backend transaction.
+    ///
+    /// `skeleton` is mandatory and strict: it must match this graph and the
+    /// resolved output suffix, and its per-state fold must succeed. A mismatch
+    /// refuses instead of falling back to a fresh extraction, so the returned
+    /// segments are exactly those used by the bounded backend call and can be
+    /// reused by a caller's host replay.
+    #[allow(dead_code)] // Phase-1 plumbing: the follow-up root integration consumes this entry.
+    pub(crate) fn run_alpha_sound_gpu_bounded_rows_only(
+        self,
+        skeleton: &ResnetSegmentSkeleton,
+    ) -> Result<Option<DeadlineBoundedResnetRowsResult>> {
+        let Some(node_bounds) = self.precomputed_node_bounds else {
+            return Ok(None);
+        };
+        let Some(alpha_state) = self.alpha_state else {
+            return Ok(None);
+        };
+        let Some(deadline) = self.deadline else {
+            return Ok(None);
+        };
+        if !(2..=DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS).contains(&self.spec_matrix.nrows())
+            || !super::core::spec_root_gpu_enabled()
+            || Instant::now() >= deadline
+            || self.reference_node_bounds.is_some()
+            || self.mul_binary_alphas.is_some()
+            || self.crown_backward_layers.is_some()
+            || self.capture_linear_cache
+            || self.wants_input_linear
+            || self.mn_pool.is_some_and(|pool| !pool.is_empty())
+            || self.mul_binary_relaxation != MulBinaryRelaxationMode::default()
+        {
+            return Ok(None);
+        }
+
+        let exec_order = self.graph.exec_order()?;
+        let output_node_name = super::setup::resolve_output_contract(
+            self.graph,
+            exec_order,
+            node_bounds,
+            self.spec_matrix.ncols(),
+        )?;
+        let seed = LinearBounds::from_spec_matrix(self.spec_matrix.clone())?;
+        crate::network::graph_alpha::resnet_decompose::
+            try_resnet_gpu_suffix_bounded_rows_with_alpha_and_deadline(
+                self.graph,
+                self.input,
+                output_node_name,
+                node_bounds,
+                node_bounds,
+                alpha_state,
+                skeleton,
+                self.engine,
+                deadline,
+                &seed,
+            )
     }
 
     /// Execute and return the full triple for callers that need all outputs.

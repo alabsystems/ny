@@ -119,8 +119,9 @@ pub(super) fn prefix_ibp_boundary_fixtures() -> BoundaryFixture {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_prefix_ibp_crossfade_energy_bounded_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // #3500 acceptance criterion 2: Prove crossfade energy stays in
     // [0.5, 1.5] of steady-state energy. Real Kokoro weights, prefix subgraph.
     //
@@ -207,8 +208,9 @@ fn test_prefix_ibp_crossfade_energy_bounded_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_prefix_ibp_crossfade_phase_alignment_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // #3500 acceptance criterion 3: Prove phase alignment of overlapping
     // regions. Real Kokoro weights, prefix subgraph.
     //
@@ -276,8 +278,9 @@ fn test_prefix_ibp_crossfade_phase_alignment_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_prefix_ibp_crossfade_convex_combination_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // Convex combination invariant: since fade_out[i] + fade_in[i] = 1 and
     // both weights are non-negative, the crossfade output at each sample must
     // lie within the hull of the two chunk intervals.
@@ -332,8 +335,9 @@ fn test_prefix_ibp_crossfade_convex_combination_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_crossfade_energy_bounded_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // #3500: Two-chunk crossfade energy with different feature centers.
     //
     // chunk_A (center=0.0) represents the outgoing streaming chunk.
@@ -402,8 +406,9 @@ fn test_two_chunk_crossfade_energy_bounded_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_crossfade_phase_alignment_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // #3500: Phase alignment with different feature centers.
     //
     // The crossfade interval width at each sample must not exceed the max
@@ -444,8 +449,9 @@ fn test_two_chunk_crossfade_phase_alignment_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_crossfade_convex_combination_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // Convex combination with different feature centers: crossfade output at
     // each sample must lie within the hull of the two chunk intervals, even
     // when the chunks have different output distributions.
@@ -478,8 +484,9 @@ fn test_two_chunk_crossfade_convex_combination_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_two_chunk_crossfade_bounds_differ_from_same_center_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // Verify that the two-chunk test is actually exercising different code
     // paths: the boundary bounds from center=0.0 and center=0.1 should
     // produce measurably different outputs through the real vocoder weights.

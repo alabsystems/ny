@@ -82,6 +82,24 @@ impl DdZono {
         self.gens.len()
     }
 
+    /// Validate the shape/value layout before any transformer performs indexed
+    /// access. A malformed internal state must cause the default-on lane to
+    /// refuse, never panic or let a short generator silently truncate a zip.
+    pub(crate) fn has_valid_layout(&self) -> bool {
+        let Some(shape_numel) = self
+            .shape
+            .iter()
+            .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        else {
+            return false;
+        };
+        let n = self.center.len();
+        shape_numel == n
+            && self.ec.len() == n
+            && self.eg.len() == n
+            && self.gens.iter().all(|generator| generator.len() == n)
+    }
+
     /// Approximate live bytes held by this state.
     pub(crate) fn bytes(&self) -> usize {
         let n = self.numel();
@@ -148,7 +166,8 @@ impl DdZono {
     /// True when every stored quantity is finite (a non-finite entry makes the
     /// certificate meaningless, so consumers must refuse).
     pub(crate) fn all_finite(&self) -> bool {
-        self.center.iter().all(|c| c.is_finite())
+        self.has_valid_layout()
+            && self.center.iter().all(|c| c.is_finite())
             && self.ec.iter().all(|v| v.is_finite() && *v >= 0.0)
             && self.eg.iter().all(|v| v.is_finite() && *v >= 0.0)
             && self.gens.iter().all(|g| g.iter().all(|v| v.is_finite()))
@@ -168,5 +187,35 @@ impl DdZono {
     /// Reshape / Squeeze / Unsqueeze).
     pub(crate) fn reshape(&mut self, shape: Vec<usize>) {
         self.shape = shape;
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use ny_core::dd::Dd;
+
+    use super::DdZono;
+
+    fn state(shape: Vec<usize>, n: usize) -> DdZono {
+        DdZono {
+            shape,
+            center: vec![Dd::ZERO; n],
+            gens: vec![vec![0.0; n]],
+            ec: vec![0.0; n],
+            eg: vec![0.0; n],
+        }
+    }
+
+    #[test]
+    fn layout_validation_rejects_shape_overflow_and_short_channels() {
+        assert!(state(vec![2, 3], 6).has_valid_layout());
+
+        let mut malformed = state(vec![2, 3], 6);
+        malformed.gens[0].pop();
+        assert!(!malformed.has_valid_layout());
+        assert!(!malformed.all_finite());
+
+        let overflowing = state(vec![usize::MAX, 2], 0);
+        assert!(!overflowing.has_valid_layout());
     }
 }

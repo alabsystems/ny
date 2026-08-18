@@ -79,3 +79,63 @@ fn test_profile_error_round_trips_ny_error_variant() {
         ),
     }
 }
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_profile_graph_rejects_invalid_epsilon_with_custom_input() {
+    use ndarray::arr1;
+    use ny_tensor::BoundedTensor;
+
+    let input = BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+        .expect("bounded input");
+    let config = ProfileConfig {
+        epsilon: f32::NAN,
+        continue_after_overflow: true,
+        input: Some(input),
+    };
+
+    let err = profile_bounds_graph(&ny_propagate::GraphNetwork::new(), &config, &[1])
+        .expect_err("invalid epsilon must fail before graph analysis");
+    assert!(err.to_string().contains("epsilon"), "err = {err}");
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_profile_graph_marks_fallback_after_propagation_failure_as_overflow() {
+    use ndarray::{arr1, arr2};
+    use ny_propagate::layers::{Layer, LinearLayer, ReLULayer};
+    use ny_propagate::{GraphNetwork, GraphNode};
+    use ny_tensor::BoundedTensor;
+
+    let mut graph = GraphNetwork::new();
+    let linear = LinearLayer::new(arr2(&[[1.0_f32, 0.0]]), None).expect("valid linear fixture");
+    graph.add_node(GraphNode::from_input("linear", Layer::Linear(linear)));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer::new()),
+        vec!["linear".to_string()],
+    ));
+    graph.set_output("relu");
+
+    // The layer expects two inputs, while this deliberately malformed
+    // analysis input has one. Diagnostic continuation may retain the input
+    // bounds, but the resulting layer must never be reported as tight/safe.
+    let input = BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+        .expect("bounded input");
+    let config = ProfileConfig {
+        epsilon: 0.5,
+        continue_after_overflow: true,
+        input: Some(input),
+    };
+
+    let result =
+        profile_bounds_graph(&graph, &config, &[1]).expect("diagnostic continuation succeeds");
+    assert_eq!(result.overflow_at_layer, Some(0));
+    assert_eq!(result.layers[0].status, BoundStatus::Overflow);
+    assert_eq!(
+        result.layers[1].status,
+        BoundStatus::Overflow,
+        "a descendant computed from substituted fallback bounds must remain failed"
+    );
+    assert_eq!(result.difficulty_score, 100.0);
+}

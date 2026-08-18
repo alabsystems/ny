@@ -23,19 +23,50 @@ attack:
 bab:
   batch_size: 8
   auto_enlarge_batch_size: true
+  # #ml4acopf-bab-queue-mem — REQUIRED companion to alpha_crown.fix_interm_bounds
+  # below. Byte cap on the resident graph ReLU-split BaB queue.
+  #
+  # WHY: one GraphBabDomain owns a full copy of the per-node bounds map plus its
+  # per-neuron α state. MEASURED per-domain footprint on this benchmark:
+  # 14_ieee-linear-residual 0.107 MB, 118_ieee_ml4acopf 0.159 MB,
+  # 300_ieee_ml4acopf 0.368 MB, 118_ieee-linear-residual 1.372 MB,
+  # 118_ieee-linear-nonresidual 1.613 MB. The shipped limits are COUNT based
+  # (max_domains = 100,000; max_queue_size = 500,000 and that one is not even
+  # wired to this heap), so on 118_ieee-linear-residual the queue is authorized
+  # to reach 100,000 x 1.372 MB = 137 GB and the host OOM-killer arrives first:
+  # MEASURED 116.3 GiB RSS at 81,920 resident domains, rc=137 (SIGKILL), with
+  # the queue accounting for 96% of the footprint (112.44 GB of domain state vs
+  # 117.32 GB RSS) while the whole O(N²) CROWN-IBP/α intermediate machinery
+  # peaks at 2.86 GiB.
+  #
+  # 2 GiB is the queue cap; a popped wave may hold a further 1/4 of it, so the
+  # transient (queue + wave + that wave's children) peak is ~1.75x = 3.5 GiB.
+  # MEASURED with this value on 118_ieee-linear-residual / 118_ieee_prop2 at the
+  # official 600 s budget: steady-state queue 1,366-1,370 domains, 1.878 GB of
+  # domain state, 391 domains evicted per wave, `unknown` rc=0 in 310.9 s at a
+  # 3.77 GiB peak — versus rc=137 (SIGKILL) at 116.3 GiB without it.
+  #
+  # SOUND: eviction never touches a bound. It only drops unexplored, unverified
+  # sub-boxes, which latches `unresolved_due_to_eviction` and forces the run to
+  # `unknown` instead of `Verified`. It costs completeness, never soundness.
+  #
+  # COSTS NOTHING HERE: the instances this benchmark actually converts resolve at
+  # the root (0 BaB waves) or branch serially at queue_len = 1, so the cap never
+  # engages on them — MEASURED A/B, unlimited vs capped, same verdicts.
+  max_queue_bytes: 2147483648
   min_batch_size_ratio: 0.0
   early_stop_patience: 200
   branching:
-    # method: input keeps the (sound) input-box split as the active runtime path.
-    # ml4acopf's element-wise variable*variable power-flow products
-    # (Layer::MulBinary) are now ALSO branchable via the GenBaB nonlinear-split
+    # method: nonlinear selects GenBaB branching (mirrors alpha-beta-CROWN's
+    # ml4acopf.yaml). ml4acopf's element-wise variable*variable power-flow
+    # products (Layer::MulBinary) are branched via the GenBaB nonlinear-split
     # path: each Mul input is scored by the McCormick envelope gap
     # (ux-lx)(uy-ly)/4 and the wider input axis is split, letting BaB close the
-    # bilinear relaxation gap. Switching this to a GenBaB heuristic additionally
-    # needs the ny-cli preset->BranchingHeuristic::GenBaB wiring (out of the
-    # ny-propagate scope). SOUND either way: branching only picks which sound
-    # sub-box to bound next, never a verdict.
-    method: input
+    # bilinear relaxation gap. Input splitting cannot touch this nonlinear
+    # product frontier (measured: method: input yields unknown on abc-solvable
+    # instances; see #ml4acopf-genbab). SOUND either way: branching only picks
+    # which sound sub-box to bound next, never a verdict.
+    method: nonlinear
     candidates: 100
     reduceop: max
     nonlinear_split:
@@ -45,6 +76,45 @@ bab:
     lr_alpha: 0.2
     lr_decay: 0.99
     iterations: 200
+    # Recompute INTERMEDIATE node bounds with CROWN-IBP instead of reusing the
+    # cheap IBP forward pass (α,β-CROWN's fix_interm_bounds=False; the ny CLI
+    # flag is --crown-ibp-intermediates).
+    #
+    # MEASURED on 14_ieee_ml4acopf-linear-residual / prop9: the input box is
+    # tiny (mean width 0.0015) and the true Y_159 range over it is
+    # [-0.00236, -0.00068] (ORT, 4000 samples) against a ±0.01 property. With
+    # IBP intermediates the ROOT objective bound is [-2.2110631, 3.6205366] —
+    # ~3,400x wider than truth, and BaB cannot close that: branching refines
+    # the INPUT box, not the intermediate relaxations that produced the gap.
+    # With CROWN-IBP intermediates the same root tightens to
+    # [-0.00013195918, 0.003164109], which discharges both disjunctive clauses
+    # outright. This benchmark's 94-node DAG is small enough that the O(N²)
+    # per-node sweep is affordable inside the 600 s budget.
+    #
+    # SOUND either way: both modes produce valid outer bounds; this only
+    # chooses how much work is spent tightening them.
+    #
+    # RELEASED 2026-07-26 (#ml4acopf-bab-queue-mem). This key was HELD because
+    # 118_ieee_ml4acopf-linear-residual / 118_ieee_prop2 peaked at 111.7 GiB RSS
+    # and was SIGKILLed (rc=137) on this 121 GiB box whenever it was set.
+    #
+    # The blowup was NOT in the CROWN-IBP sweep. Phase-split measurement (RSS
+    # sampler vs log timestamps) put the whole pre-BaB pipeline — model load,
+    # CROWN-IBP reference collection, the α-CROWN loop and the post-optimisation
+    # O(N²) `collect_crown_bounds_with_alpha` sweep — at 2.86 GiB, i.e. 2.4% of
+    # peak; the remaining 97.6% was an UNBOUNDED branch-and-bound domain queue.
+    # This key is the ENABLER, not the allocator: it makes the root bound finite,
+    # which lets a hopeless BaB actually run (with fix_interm_bounds: true the
+    # same instance dies in the first wave on NaN/±inf bounds after 1.4 s).
+    # `bab.max_queue_bytes` above bounds that queue; with it, the same instance
+    # runs to a clean `unknown` (rc=0) in 310.9 s at a 3.77 GiB peak.
+    #
+    # MEASURED 2026-07-25: with this key set, the full 69-instance sweep solves
+    # 44/69 (vs 3/31 banked) with ZERO ground-truth mismatches.
+    # The ~89 normalized points in this category are inseparable from this key:
+    # the objective-direction repair alone converts nothing here (prop9/prop14
+    # stay unknown without it).
+    fix_interm_bounds: false
   beta_crown:
     lr_alpha: 0.5
     lr_beta: 0.5

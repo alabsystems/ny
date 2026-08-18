@@ -58,20 +58,54 @@ mod dispatch_coverage_tests;
 
 // Re-export core types
 pub(crate) use alpha_crown::NetworkAlphaCrownExt;
+#[cfg(test)]
+pub(crate) use core::extract_relu_gpu_layer_with_alpha;
 pub use core::graph::crown_block_wise::LayerNormValidationStats;
 pub use core::graph::crown_block_wise::{BlockSpec, BlockSpecEntry, BlockWiseCrownResult};
 pub(crate) use core::graph::dispatch_plan::CrownDispatchPlan;
 pub(crate) use core::graph::merge_accumulator::CrownMergeAccumulator;
-pub(crate) use core::{
-    apply_dense_backward_dispatch_result, crown_backward_step_patches,
-    try_extract_single_gpu_layer, CrownStepResult,
+pub use core::graph::{
+    forward_linear_admission_record, forward_linear_measured_rate, ForwardLinearAdmissionRecord,
+    ForwardLinearRateObservation,
+};
+pub(crate) use core::graph::{
+    TrackedStringMap, TrackedStringMapAllocationFactV1, TRACKED_STRING_MAP_ALLOCATION_MODEL_V1,
 };
 pub use core::{
-    GraphNetwork, GraphNode, Network, SoftmaxComplexReport, VggMaxPoolRewriteMode,
-    VggMaxPoolRewriteReport, ZonotopePropagationOptions, ZonotopeSoftmaxMode, NETWORK_INPUT,
-    SOFTMAX_COMPLEX_SHIFT_GUARD,
+    compose_one_axis_dnf_observations, GraphNetwork, GraphNode, Network, OneAxisAffineCertificate,
+    OneAxisAlgebraClass, OneAxisAlgebraReport, OneAxisConstraintRelation, OneAxisCoreGuard,
+    OneAxisDecline, OneAxisDeclineReason, OneAxisExactProblem, OneAxisGroupedContextCertificate,
+    OneAxisGroupedMemberCertificate, OneAxisGroupedPhaseAttempt, OneAxisGroupedPhaseCertificate,
+    OneAxisGroupedPhaseLimits, OneAxisGroupedReplayResult, OneAxisOutputConstraint,
+    OneAxisPeeledConstraint, OneAxisPhaseAttempt, OneAxisPhaseCellCertificate,
+    OneAxisPhaseCertificate, OneAxisPhaseDecline, OneAxisPhaseDeclineReason, OneAxisPhaseLimits,
+    OneAxisPhaseObservation, OneAxisRational, OneAxisReplayResult, OneAxisWrapperEnclosure,
+    SoftmaxComplexReport, VggMaxPoolRewriteMode, VggMaxPoolRewriteReport,
+    ZonotopePropagationOptions, ZonotopeSoftmaxMode, NETWORK_INPUT,
+    ONE_AXIS_GROUPED_PHASE_CERTIFICATE_VERSION, ONE_AXIS_MAX_EDGES, ONE_AXIS_MAX_NODES,
+    ONE_AXIS_MAX_RANK, ONE_AXIS_MAX_TENSOR_ELEMENTS, ONE_AXIS_MAX_TOTAL_ELEMENTS,
+    ONE_AXIS_PHASE_CERTIFICATE_VERSION, SOFTMAX_COMPLEX_SHIFT_GUARD,
+};
+pub(crate) use core::{crown_backward_step_patches, try_extract_single_gpu_layer, CrownStepResult};
+pub(crate) use core::{gpu_relu_affine_cell, GpuReluAffineVariant};
+pub(crate) use graph_alpha::atomic_cuda_margin_step::{
+    root_alpha_cuda_margin_step_enabled, AtomicCudaMarginStepCommit, AtomicCudaMarginStepOutcome,
+    AtomicCudaMarginStepRequest,
+};
+pub(crate) use graph_alpha::atomic_cuda_rows::{
+    root_alpha_cuda_rows_enabled, AtomicCudaRowsCommit, AtomicCudaRowsOutcome,
+    AtomicCudaRowsRefusal, AtomicCudaRowsRequest,
+};
+pub use graph_alpha::budget_policy::{
+    collector_walk_admission_record, CollectorWalkAdmissionRecord,
 };
 pub(crate) use graph_alpha::merge_reference_bound_maps;
+/// #root-joint-demand-rank: the CROWN-IBP collector's demand selector (which
+/// nodes need tightened bounds), consumed by the armed root-joint interm-α
+/// target ranking so both lanes agree on what "DEMANDED" means.
+pub(crate) use graph_alpha::nodes_requiring_crown_tightening;
+// #attr-branch: the branching selector reads the root gap-attribution prior.
+pub(crate) use graph_alpha::gap_attribution;
 /// #metaroom-chain-wide: chain-permitting extraction + its opt-in gate for the BaB
 /// batched β lane (pure conv-chain suffixes → `[Chain(layers)]`, dark by default).
 pub(crate) use graph_alpha::resnet_decompose::bab_chain_wide_enabled;
@@ -79,6 +113,9 @@ pub(crate) use graph_alpha::resnet_decompose::bab_chain_wide_enabled;
 /// beta backward (#unsat-keystone step 4). Returns segments + fold-order ReLU names.
 pub(crate) use graph_alpha::resnet_decompose::extract_gpu_resnet_segments_with_relu_names;
 pub(crate) use graph_alpha::resnet_decompose::extract_gpu_segments_with_relu_names_ext;
+/// #clip-gather-probe L3: telemetry-only label naming WHICH `None` exit the last
+/// segment extraction on this thread took. Never read by any decision.
+pub(crate) use graph_alpha::resnet_decompose::extract_segments_last_refusal;
 pub(crate) use graph_alpha::resnet_decompose::resnet_beta_gpu_batched_enabled;
 /// Opt-out gate (default ON) for the beta-capable GPU resnet per-domain backward,
 /// shared by the three beta_crown injection sites (#unsat-keystone step 4).
@@ -93,6 +130,14 @@ pub(crate) use graph_alpha::resnet_decompose::resnet_refold_guard_enabled;
 pub(crate) use graph_alpha::resnet_skeleton::build_resnet_segment_skeleton;
 pub(crate) use graph_alpha::resnet_skeleton::extract_skeleton_enabled;
 pub(crate) use graph_alpha::resnet_skeleton::ResnetSegmentSkeleton;
+/// #root-alpha-margin effective gate (typed preset default plus env override),
+/// read by the multi-objective root to decide whether to hand the warmup a spec
+/// objective for ranking its alpha iterates.
+pub(crate) use graph_alpha::root_alpha_margin_enabled_with;
+#[cfg(test)]
+pub(crate) use graph_alpha::CganCompleteCollectionEntryCounter;
+pub(crate) use graph_alpha::GraphAlphaCollectionOutcome;
+pub(crate) use graph_alpha::PrecomputedAlphaReferenceBounds;
 #[cfg(test)]
 pub(crate) use graph_builder::AttentionGraphBuilder;
 pub(crate) use graph_crown::spec_propagation::collect_intermediate_bounds;
@@ -102,7 +147,8 @@ pub(crate) use graph_crown::GraphNetworkCrownExt;
 /// surrogate. Thread-local; ramped by the falsify lanes to crack tight BNN
 /// boxes. Soundness-neutral — β never feeds a verdict.
 pub use graph_crown::{
-    attack_sign_beta, set_attack_sign_beta, AttackSignBetaGuard, DEFAULT_ATTACK_SIGN_BETA,
+    attack_sign_beta, set_attack_sign_beta, smooth_sign_forward_enabled, AttackSignBetaGuard,
+    AttackSteWindowsGuard, DEFAULT_ATTACK_SIGN_BETA,
 };
 pub(crate) use graph_crown::{backward_div_to_numerator, DivBackwardResult};
 /// Batched point-VJP plan + CPU mask capture for the one-wide-GPU-pass exact
@@ -111,14 +157,18 @@ pub use graph_crown::{
     point_vjp_forward_masks, point_vjp_resnet_forward_masks, PointVjpBatchPlan, PointVjpResnetPlan,
     PointVjpWavePlan,
 };
+pub use graph_ibp_f64_mvf::{
+    centered_seed_axis_indices_f32, PointPhaseEventDiagnostics, ReluPhaseEventCandidate,
+};
 
 // Re-export forward-bound tightening — lives in core/ as a shared utility (#2380)
 pub(crate) use core::tighten_crown_with_forward_bounds;
 // Re-export post-concretization tightening for fast.rs and streaming (#3043).
 // Subsumes the separate has_degraded_bounds re-export (#3082).
 pub(crate) use core::tighten_crown_output;
+pub(crate) use core::tighten_crown_output_with_deadline;
 // Re-export provenance-tracking variant for graph_crown (#3043).
-pub(crate) use core::tighten_crown_output_with_provenance;
+pub(crate) use core::tighten_crown_output_with_provenance_and_deadline;
 // Compatibility re-export: ny-build imports ny_propagate::network::broadcast_shapes.
 // Canonical location is now crate::shape::broadcast_shapes.
 pub use crate::shape::broadcast_shapes;

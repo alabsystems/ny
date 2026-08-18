@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     checked_shape_product, nan_propagating_max, nan_propagating_min, Bound, LayerOutput, NyError,
@@ -236,7 +236,7 @@ impl Counterexample {
 /// `[lower, upper]` interval for every tensor element, alongside the shape it
 /// describes. The historical scalar summary is still available via
 /// [`scalar_summary`](Self::scalar_summary) but is now opt-in, not forced.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PerElementBounds {
     /// Lower endpoints, one per element (row-major).
     pub lower: Vec<f32>,
@@ -244,6 +244,22 @@ pub struct PerElementBounds {
     pub upper: Vec<f32>,
     /// Shape these bounds describe; its product equals `lower.len()`.
     pub shape: Vec<usize>,
+}
+
+/// Deserialize through [`PerElementBounds::try_new`] so persisted bounds cannot
+/// bypass the length, shape-product, or interval-order invariants.
+impl<'de> Deserialize<'de> for PerElementBounds {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct PerElementBoundsRaw {
+            lower: Vec<f32>,
+            upper: Vec<f32>,
+            shape: Vec<usize>,
+        }
+
+        let raw = PerElementBoundsRaw::deserialize(deserializer)?;
+        Self::try_new(raw.lower, raw.upper, raw.shape).map_err(serde::de::Error::custom)
+    }
 }
 
 impl PerElementBounds {
@@ -458,5 +474,29 @@ mod tests {
         let json = serde_json::to_string(&cx).expect("serialize");
         let back: Counterexample = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(cx, back);
+    }
+
+    #[test]
+    fn per_element_bounds_deserialize_validates_invariants() {
+        for json in [
+            r#"{"lower":[0.0],"upper":[],"shape":[1]}"#,
+            r#"{"lower":[0.0],"upper":[1.0],"shape":[2]}"#,
+            r#"{"lower":[1.0],"upper":[0.0],"shape":[1]}"#,
+            r#"{"lower":[],"upper":[],"shape":[18446744073709551615,2]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PerElementBounds>(json).is_err(),
+                "invalid serialized bounds must be rejected: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_element_bounds_round_trip_preserves_valid_data() {
+        let bounds =
+            PerElementBounds::try_new(vec![-1.0, 0.0], vec![1.0, 2.0], vec![1, 2]).unwrap();
+        let json = serde_json::to_string(&bounds).expect("serialize");
+        let restored: PerElementBounds = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, bounds);
     }
 }

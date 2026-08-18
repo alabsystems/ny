@@ -43,6 +43,57 @@ impl GraphAlphaState {
         expanded
     }
 
+    /// Checked channel-to-spatial expansion for proof-adjacent optional lanes.
+    ///
+    /// The historical [`Self::expand_alpha`] assumes metadata minted by
+    /// `add_relu_node` and indexes `shape[0]`/`alpha[c]` directly.  A dark
+    /// experiment must not turn malformed imported metadata into a panic, an
+    /// overflowed allocation, or a partially transported state.  This face
+    /// therefore validates the complete shape/parameter identity and declines
+    /// atomically.
+    pub(crate) fn try_expand_alpha(
+        &self,
+        node_name: &str,
+        alpha: &Array1<f32>,
+        expected_shape: &[usize],
+    ) -> Option<Array1<f32>> {
+        let expected_len = expected_shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| {
+                (dimension != 0)
+                    .then_some(())
+                    .and_then(|()| product.checked_mul(dimension))
+            })?;
+        let Some(shape) = self.spatial_shapes.get(node_name) else {
+            return (alpha.len() == expected_len && alpha.iter().all(|value| value.is_finite()))
+                .then(|| alpha.clone());
+        };
+        if shape.as_slice() != expected_shape {
+            return None;
+        }
+        let (&channels, spatial_shape) = shape.split_first()?;
+        if channels == 0
+            || spatial_shape.contains(&0)
+            || alpha.len() != channels
+            || alpha.iter().any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let spatial = spatial_shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))?;
+        let total = channels.checked_mul(spatial)?;
+        if total != expected_len {
+            return None;
+        }
+        let mut values = Vec::new();
+        values.try_reserve_exact(total).ok()?;
+        for &value in alpha {
+            values.extend(std::iter::repeat_n(value, spatial));
+        }
+        (values.len() == total).then(|| Array1::from_vec(values))
+    }
+
     /// Reduce per-neuron gradient [C*H*W] to per-channel [C] by summing spatial dims.
     ///
     /// If the node uses full alpha (no spatial_shape entry), returns a clone.
@@ -73,6 +124,48 @@ impl GraphAlphaState {
             reduced[c] = sum;
         }
         reduced
+    }
+
+    /// #channel-alpha-grad: MEASURED-shape key for the spatial→channel
+    /// gradient reduction `dL/dα_c = Σ_{h,w} dL/dα_{c,h,w}` (the exact chain
+    /// rule through the channel-shared α broadcast: moving α_c moves EVERY
+    /// spatial position of channel c, so the true derivative is the spatial
+    /// sum).
+    ///
+    /// Returns `Some((channels, spatial))` exactly when every measured shape
+    /// reconciles:
+    /// - this node has recorded conv geometry (`spatial_shapes[node]`),
+    /// - the STORED α vector has length `channels == spatial_shapes[node][0]`,
+    /// - `alpha_len == channels` (the caller's target layout IS the stored α),
+    /// - `grad_len == channels · Π spatial_shapes[node][1..]` (checked mul),
+    /// - the reduction is not the identity (`grad_len != alpha_len`).
+    ///
+    /// Never keyed on a config flag. `None` ⇒ the layouts do not reconcile
+    /// and the caller must keep its existing typed refusal.
+    #[must_use]
+    pub(crate) fn channel_reduction_geometry(
+        &self,
+        node_name: &str,
+        alpha_len: usize,
+        grad_len: usize,
+    ) -> Option<(usize, usize)> {
+        let shape = self.spatial_shapes.get(node_name)?;
+        let (&channels, spatial_shape) = shape.split_first()?;
+        if channels == 0 || spatial_shape.is_empty() || spatial_shape.contains(&0) {
+            return None;
+        }
+        let spatial = spatial_shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))?;
+        let total = channels.checked_mul(spatial)?;
+        if alpha_len != channels
+            || self.alphas.get(node_name).map(Array1::len) != Some(channels)
+            || grad_len != total
+            || grad_len == alpha_len
+        {
+            return None;
+        }
+        Some((channels, spatial))
     }
 
     /// (total, interior) counts of the raw ReLU lower alphas — interior means

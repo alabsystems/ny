@@ -418,6 +418,7 @@ fn apply_branch_forward(
                 bias,
                 out_features,
                 in_features,
+                ..
             } => {
                 if buf.len() != *in_features {
                     return Err(NyError::shape_mismatch(vec![*in_features], vec![buf.len()]));

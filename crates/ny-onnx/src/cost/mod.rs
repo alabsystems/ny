@@ -23,8 +23,9 @@ pub use timing::{
 pub use types::{CostError, CostResult, LayerCost};
 
 #[cfg(test)]
+#[cfg_attr(not(feature = "external-avoice"), allow(dead_code, unused_imports))]
 mod tests;
 #[cfg(test)]
 mod tests_missing_shapes;
-#[cfg(test)]
+#[cfg(all(test, feature = "external-avoice"))]
 mod tests_real_export_fallback;

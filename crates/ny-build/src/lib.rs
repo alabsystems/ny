@@ -42,7 +42,8 @@ pub(crate) use layernorm_mode::layernorm_mode_from_attrs;
 pub use mixed_precision::MixedPrecisionPolicy;
 pub use model_types::{
     is_multi_output_split, resolve_dynamic_dim, resolve_dynamic_shape, AttributeValue, DataType,
-    LayerSpec, Network, TensorSpec, WeightRef,
+    LayerSpec, Network, TensorSpec, WeightRef, EXPAND_LIVE_SHAPE_REFERENCE_ATTR,
+    INTERNAL_CT_INSTANCE_NORM_ATTR, PAD_PRESERVE_ALL_AXES_ATTR,
 };
 pub use propagate::{
     build_propagate_network, build_propagate_network_indexed, PropagateNetworkOptions,

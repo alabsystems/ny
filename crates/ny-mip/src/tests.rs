@@ -6,35 +6,64 @@ use crate::config::{MipBackend, MipConfig};
 use crate::encoder::encode_feedforward;
 use crate::solver::{MipResult, MipSolver};
 use ny_core::Bound;
+#[cfg(feature = "external-ay")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "external-ay")]
+use std::process::Command;
 
-/// Every backend available to this build+environment. Solve-based tests run
-/// against each so all backends are held to identical verdict contracts.
-///
-/// ay (the production backend, docs/SOLVER_POLICY.md) is in-process and
-/// always available. AyProc (the frozen P0 subprocess lane) is included when
-/// the external binary is reachable ($NY_AY/$PATH) and skipped loudly
-/// otherwise. (HiGHS was deleted at LG3.)
-fn all_backends() -> Vec<MipBackend> {
-    let mut backends = vec![MipBackend::Ay];
-    if ay_available() {
-        backends.push(MipBackend::AyProc);
-    } else {
-        eprintln!("SKIP ay-proc backend: no ay binary on $NY_AY/$PATH");
-    }
-    backends
+/// Backends exercised by the default suite. The production AY backend is
+/// in-process and always available.
+fn default_test_backends() -> [MipBackend; 1] {
+    [MipBackend::Ay]
 }
 
-/// Is the external ay binary reachable?
-pub(crate) fn ay_available() -> bool {
-    let mut cmd = match std::env::var_os("NY_AY") {
-        Some(path) => std::process::Command::new(path),
-        None => std::process::Command::new("ay"),
-    };
-    cmd.arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+#[cfg(feature = "external-ay")]
+fn pinned_ay_revision() -> &'static str {
+    let manifest = include_str!("../Cargo.toml");
+    let dependency = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("ay-milp ="))
+        .expect("ny-mip must declare ay-milp");
+    let revision = dependency
+        .split_once("rev = \"")
+        .and_then(|(_, tail)| tail.split_once('"'))
+        .map(|(revision, _)| revision)
+        .expect("ay-milp must remain revision-pinned");
+    assert_eq!(revision.len(), 40, "AY revision must be a full commit SHA");
+    revision
+}
+
+#[cfg(feature = "external-ay")]
+fn selected_ay() -> PathBuf {
+    std::env::var_os("NY_AY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ay"))
+}
+
+#[cfg(feature = "external-ay")]
+fn ay_build_commit(ay: &Path) -> Option<String> {
+    let output = Command::new(ay).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("build.commit="))
+        .map(str::to_owned)
+}
+
+#[cfg(feature = "external-ay")]
+fn require_pinned_ay_proc() {
+    let ay = selected_ay();
+    let expected = pinned_ay_revision();
+    let actual = ay_build_commit(&ay);
+    assert_eq!(
+        actual.as_deref(),
+        Some(expected),
+        "AyProc contract test requires pinned AY revision {expected} at {}; \
+         set NY_AY to the pinned executable (got {actual:?})",
+        ay.display()
+    );
 }
 
 /// Default config pinned to a specific backend.
@@ -92,9 +121,7 @@ fn test_encode_small_network() {
     assert_eq!(encoder.num_binary_vars(), 1);
 }
 
-#[test]
-#[ntest::timeout(30_000)]
-fn test_feasibility_sat() {
+fn assert_feasibility_sat_for(backends: impl IntoIterator<Item = MipBackend>) {
     // Network with input [0,1]^2 should be feasible (non-empty input region).
     let (weights, biases, layer_dims) = small_network();
     let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
@@ -104,7 +131,7 @@ fn test_feasibility_sat() {
         Bound::new(-1.0, 1.0),
     ]];
 
-    for backend in all_backends() {
+    for backend in backends {
         let encoder = encode_feedforward(
             &weights,
             &biases,
@@ -141,7 +168,11 @@ fn test_feasibility_sat() {
 
 #[test]
 #[ntest::timeout(30_000)]
-fn test_feasibility_linear_network() {
+fn test_feasibility_sat() {
+    assert_feasibility_sat_for(default_test_backends());
+}
+
+fn assert_feasibility_linear_network_for(backends: impl IntoIterator<Item = MipBackend>) {
     // Trivial 1-layer network: y = 2*x + 3, input [0,1]
     let weights = vec![vec![2.0]];
     let biases = vec![vec![3.0]];
@@ -149,7 +180,7 @@ fn test_feasibility_linear_network() {
     let input_bounds = vec![Bound::new(0.0, 1.0)];
     let intermediate_bounds: Vec<Vec<Bound>> = vec![];
 
-    for backend in all_backends() {
+    for backend in backends {
         let encoder = encode_feedforward(
             &weights,
             &biases,
@@ -186,6 +217,12 @@ fn test_feasibility_linear_network() {
 
 #[test]
 #[ntest::timeout(30_000)]
+fn test_feasibility_linear_network() {
+    assert_feasibility_linear_network_for(default_test_backends());
+}
+
+#[test]
+#[ntest::timeout(30_000)]
 fn test_all_active_relu() {
     // When all pre-activation bounds are positive, no binary variables needed.
     let weights = vec![
@@ -214,9 +251,7 @@ fn test_all_active_relu() {
     assert_eq!(encoder.num_binary_vars(), 0);
 }
 
-#[test]
-#[ntest::timeout(30_000)]
-fn test_all_inactive_relu() {
+fn assert_all_inactive_relu_for(backends: impl IntoIterator<Item = MipBackend>) {
     // When all pre-activation bounds are negative, ReLU output is zero.
     let weights = vec![vec![1.0, 0.0, 0.0, 1.0], vec![1.0, 0.0, 0.0, 1.0]];
     let biases = vec![
@@ -228,7 +263,7 @@ fn test_all_inactive_relu() {
     // Pre-activation: x-5 in [-5,-4] -- always negative
     let intermediate_bounds = vec![vec![Bound::new(-5.0, -4.0), Bound::new(-5.0, -4.0)]];
 
-    for backend in all_backends() {
+    for backend in backends {
         let encoder = encode_feedforward(
             &weights,
             &biases,
@@ -262,7 +297,11 @@ fn test_all_inactive_relu() {
 
 #[test]
 #[ntest::timeout(30_000)]
-fn test_output_constraint_leq() {
+fn test_all_inactive_relu() {
+    assert_all_inactive_relu_for(default_test_backends());
+}
+
+fn assert_output_constraint_leq_for(backends: impl IntoIterator<Item = MipBackend>) {
     // Network: 2 inputs -> 3 hidden (ReLU) -> 2 outputs.
     // Add constraint: output[0] <= output[1] (unsafe region).
     // At input (0,0): hidden = ReLU([0, 0, -1]) = [0, 0, 0], output = [0, 0].
@@ -275,7 +314,7 @@ fn test_output_constraint_leq() {
         Bound::new(-1.0, 1.0),
     ]];
 
-    for backend in all_backends() {
+    for backend in backends {
         let mut encoder = encode_feedforward(
             &weights,
             &biases,
@@ -302,7 +341,11 @@ fn test_output_constraint_leq() {
 
 #[test]
 #[ntest::timeout(30_000)]
-fn test_output_constraint_geq_const_unsat() {
+fn test_output_constraint_leq() {
+    assert_output_constraint_leq_for(default_test_backends());
+}
+
+fn assert_output_constraint_geq_const_unsat_for(backends: impl IntoIterator<Item = MipBackend>) {
     // Trivial network: y = 2*x + 3, input x in [0, 1].
     // Output y in [3, 5].
     // Unsafe constraint: y >= 10.0. This is infeasible → UNSAT → verified safe.
@@ -312,7 +355,7 @@ fn test_output_constraint_geq_const_unsat() {
     let input_bounds = vec![Bound::new(0.0, 1.0)];
     let intermediate_bounds: Vec<Vec<Bound>> = vec![];
 
-    for backend in all_backends() {
+    for backend in backends {
         let mut encoder = encode_feedforward(
             &weights,
             &biases,
@@ -339,7 +382,11 @@ fn test_output_constraint_geq_const_unsat() {
 
 #[test]
 #[ntest::timeout(30_000)]
-fn test_output_constraint_leq_const_sat() {
+fn test_output_constraint_geq_const_unsat() {
+    assert_output_constraint_geq_const_unsat_for(default_test_backends());
+}
+
+fn assert_output_constraint_leq_const_sat_for(backends: impl IntoIterator<Item = MipBackend>) {
     // Trivial network: y = 2*x + 3, input x in [0, 1].
     // Output y in [3, 5].
     // Unsafe constraint: y <= 4.0. Satisfiable when x in [0, 0.5] → SAT.
@@ -349,7 +396,7 @@ fn test_output_constraint_leq_const_sat() {
     let input_bounds = vec![Bound::new(0.0, 1.0)];
     let intermediate_bounds: Vec<Vec<Bound>> = vec![];
 
-    for backend in all_backends() {
+    for backend in backends {
         let mut encoder = encode_feedforward(
             &weights,
             &biases,
@@ -385,6 +432,25 @@ fn test_output_constraint_leq_const_sat() {
             other => panic!("{backend:?}: expected SAT, got {other:?}"),
         }
     }
+}
+
+#[test]
+#[ntest::timeout(30_000)]
+fn test_output_constraint_leq_const_sat() {
+    assert_output_constraint_leq_const_sat_for(default_test_backends());
+}
+
+#[test]
+#[cfg(feature = "external-ay")]
+#[ntest::timeout(120_000)]
+fn ay_proc_core_solver_contract_matrix() {
+    require_pinned_ay_proc();
+    assert_feasibility_sat_for([MipBackend::AyProc]);
+    assert_feasibility_linear_network_for([MipBackend::AyProc]);
+    assert_all_inactive_relu_for([MipBackend::AyProc]);
+    assert_output_constraint_leq_for([MipBackend::AyProc]);
+    assert_output_constraint_geq_const_unsat_for([MipBackend::AyProc]);
+    assert_output_constraint_leq_const_sat_for([MipBackend::AyProc]);
 }
 
 #[test]
@@ -485,10 +551,7 @@ fn build_small_network_warm_start(x0: f64, x1: f64, num_cols: usize) -> Vec<f64>
     ws
 }
 
-/// #3865: Warm-started and cold solves return the same verdict on a small network.
-#[test]
-#[ntest::timeout(30_000)]
-fn warm_start_and_cold_solve_agree_on_verdict_3865() {
+fn assert_warm_start_and_cold_solve_agree(backend: MipBackend) {
     let (weights, biases, layer_dims) = small_network();
     let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
     let intermediate_bounds = vec![vec![
@@ -497,88 +560,104 @@ fn warm_start_and_cold_solve_agree_on_verdict_3865() {
         Bound::new(-1.0, 1.0),
     ]];
 
-    for backend in all_backends() {
-        // Cold solve
-        let encoder_cold = encode_feedforward(
-            &weights,
-            &biases,
-            &layer_dims,
-            &input_bounds,
-            &intermediate_bounds,
-        )
-        .expect("encoding should succeed");
-        let parts_cold = encoder_cold.into_parts();
-        let num_cols = parts_cold.num_cols;
-        let solver_cold = MipSolver::new(parts_cold, config_for(backend));
-        let cold_result = solver_cold
-            .check_feasibility()
-            .expect("cold solve should succeed");
+    // Cold solve.
+    let encoder_cold = encode_feedforward(
+        &weights,
+        &biases,
+        &layer_dims,
+        &input_bounds,
+        &intermediate_bounds,
+    )
+    .expect("encoding should succeed");
+    let parts_cold = encoder_cold.into_parts();
+    let num_cols = parts_cold.num_cols;
+    let solver_cold = MipSolver::new(parts_cold, config_for(backend));
+    let cold_result = solver_cold
+        .check_feasibility()
+        .expect("cold solve should succeed");
 
-        // Warm-started solve with candidate [0.5, 0.5]
-        let encoder_warm = encode_feedforward(
-            &weights,
-            &biases,
-            &layer_dims,
-            &input_bounds,
-            &intermediate_bounds,
-        )
-        .expect("encoding should succeed");
-        let parts_warm = encoder_warm.into_parts();
-        let solver_warm = MipSolver::new(parts_warm, config_for(backend));
-        let warm_start = build_small_network_warm_start(0.5, 0.5, num_cols);
-        let warm_result = solver_warm
-            .check_feasibility_with_warm_start(Some(&warm_start))
-            .expect("warm solve should succeed");
+    // Warm-started solve with candidate [0.5, 0.5].
+    let encoder_warm = encode_feedforward(
+        &weights,
+        &biases,
+        &layer_dims,
+        &input_bounds,
+        &intermediate_bounds,
+    )
+    .expect("encoding should succeed");
+    let parts_warm = encoder_warm.into_parts();
+    let solver_warm = MipSolver::new(parts_warm, config_for(backend));
+    let warm_start = build_small_network_warm_start(0.5, 0.5, num_cols);
+    let warm_result = solver_warm
+        .check_feasibility_with_warm_start(Some(&warm_start))
+        .expect("warm solve should succeed");
 
-        assert!(
-            matches!(cold_result, MipResult::Sat { .. }),
-            "{backend:?} cold: {:?}",
-            cold_result
-        );
-        assert!(
-            matches!(warm_result, MipResult::Sat { .. }),
-            "{backend:?} warm: {:?}",
-            warm_result
-        );
-    }
+    assert!(
+        matches!(cold_result, MipResult::Sat { .. }),
+        "{backend:?} cold: {:?}",
+        cold_result
+    );
+    assert!(
+        matches!(warm_result, MipResult::Sat { .. }),
+        "{backend:?} warm: {:?}",
+        warm_result
+    );
+}
+
+/// #3865: Warm-started and cold solves return the same verdict on a small network.
+#[test]
+#[ntest::timeout(30_000)]
+fn warm_start_and_cold_solve_agree_on_verdict_3865() {
+    assert_warm_start_and_cold_solve_agree(MipBackend::Ay);
+}
+
+fn assert_wrong_length_warm_start_falls_back(backend: MipBackend) {
+    let (weights, biases, layer_dims) = small_network();
+    let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
+    let intermediate_bounds = vec![vec![
+        Bound::new(0.0, 1.0),
+        Bound::new(0.0, 1.0),
+        Bound::new(-1.0, 1.0),
+    ]];
+
+    let encoder = encode_feedforward(
+        &weights,
+        &biases,
+        &layer_dims,
+        &input_bounds,
+        &intermediate_bounds,
+    )
+    .expect("encoding should succeed");
+    let parts = encoder.into_parts();
+    let solver = MipSolver::new(parts, config_for(backend));
+
+    // Provide a wrong-length warm-start vector (should fall back to cold).
+    let wrong_length = vec![0.0f64; 3]; // too short
+    let result = solver
+        .check_feasibility_with_warm_start(Some(&wrong_length))
+        .expect("solve should succeed even with rejected warm-start");
+
+    assert!(
+        matches!(result, MipResult::Sat { .. }),
+        "{backend:?}: should still find SAT via cold-solve fallback, got {:?}",
+        result
+    );
 }
 
 /// #3865: Warm-start with wrong-length vector falls back to cold solve gracefully.
 #[test]
 #[ntest::timeout(30_000)]
 fn warm_start_wrong_length_falls_back_to_cold_solve_3865() {
-    let (weights, biases, layer_dims) = small_network();
-    let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
-    let intermediate_bounds = vec![vec![
-        Bound::new(0.0, 1.0),
-        Bound::new(0.0, 1.0),
-        Bound::new(-1.0, 1.0),
-    ]];
+    assert_wrong_length_warm_start_falls_back(MipBackend::Ay);
+}
 
-    for backend in all_backends() {
-        let encoder = encode_feedforward(
-            &weights,
-            &biases,
-            &layer_dims,
-            &input_bounds,
-            &intermediate_bounds,
-        )
-        .expect("encoding should succeed");
-        let parts = encoder.into_parts();
-        let solver = MipSolver::new(parts, config_for(backend));
-
-        // Provide a wrong-length warm-start vector (should fall back to cold)
-        let wrong_length = vec![0.0f64; 3]; // too short
-        let result = solver
-            .check_feasibility_with_warm_start(Some(&wrong_length))
-            .expect("solve should succeed even with rejected warm-start");
-
-        assert!(
-            matches!(result, MipResult::Sat { .. }),
-            "{backend:?}: should still find SAT via cold-solve fallback, got {:?}",
-            result
-        );
-    }
+#[test]
+#[cfg(feature = "external-ay")]
+#[ntest::timeout(60_000)]
+fn ay_proc_warm_start_contracts_3865() {
+    require_pinned_ay_proc();
+    assert_warm_start_and_cold_solve_agree(MipBackend::AyProc);
+    assert_wrong_length_warm_start_falls_back(MipBackend::AyProc);
 }
 
 /// #3865: num_cols in MipParts matches the encoder's column count.
@@ -638,10 +717,10 @@ fn binary_widths_align_with_binary_vars() {
 }
 
 // ---------------------------------------------------------------------------
-// Backend verdict-equality property test (designs/scip.md validation plan):
-// random tiny FC+ReLU nets must get the exact same Sat/Unsat verdict from
-// every compiled backend. Any disagreement is a soundness red flag in one of
-// the lowerings and fails the suite.
+// Backend verdict property tests (designs/scip.md validation plan): the
+// in-process production backend runs by default. The `external-ay` AyProc lane
+// compares the frozen subprocess lowering against it and hard-requires the
+// exact pinned binary when explicitly selected.
 // ---------------------------------------------------------------------------
 
 /// Sound interval (IBP) pre-activation bounds for the tiny test nets, computed
@@ -703,81 +782,127 @@ fn verdict_label(result: &MipResult) -> &'static str {
     }
 }
 
+fn solve_random_tiny_net(
+    in_dim: usize,
+    hidden_dim: usize,
+    weight_seed: &[f64],
+    bias_seed: &[f64],
+    threshold: f64,
+    backend: MipBackend,
+) -> MipResult {
+    let out_dim = 1usize;
+    let layer_dims = vec![in_dim, hidden_dim, out_dim];
+    let w0: Vec<f64> = (0..hidden_dim * in_dim)
+        .map(|k| weight_seed[k % weight_seed.len()])
+        .collect();
+    let w1: Vec<f64> = (0..out_dim * hidden_dim)
+        .map(|k| weight_seed[(k + 7) % weight_seed.len()])
+        .collect();
+    let b0: Vec<f64> = (0..hidden_dim)
+        .map(|k| bias_seed[k % bias_seed.len()])
+        .collect();
+    let b1: Vec<f64> = (0..out_dim)
+        .map(|k| bias_seed[(k + 3) % bias_seed.len()])
+        .collect();
+    let weights = vec![w0, w1];
+    let biases = vec![b0, b1];
+    let input_bounds = vec![Bound::new(0.0, 1.0); in_dim];
+    let intermediate_bounds =
+        ibp_intermediate_bounds(&weights, &biases, &layer_dims, &input_bounds);
+
+    let mut encoder = encode_feedforward(
+        &weights,
+        &biases,
+        &layer_dims,
+        &input_bounds,
+        &intermediate_bounds,
+    )
+    .expect("encoding should succeed");
+    encoder
+        .constrain_output_geq_const(0, threshold)
+        .expect("constraint should succeed");
+    let solver = MipSolver::new(encoder.into_parts(), config_for(backend));
+    solver.check_feasibility().expect("solve should succeed")
+}
+
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig {
-        cases: 24, // each case is 1 MIP solve per backend; keep the suite fast
+        cases: 24,
         ..proptest::prelude::ProptestConfig::default()
     })]
 
-    /// HiGHS and SCIP (when compiled) must agree exactly on Sat/Unsat for
-    /// random tiny 2-layer FC+ReLU nets with a `output[0] >= t` property.
+    /// The always-available in-process AY backend must decide random tiny
+    /// 2-layer FC+ReLU nets with an `output[0] >= t` property.
     #[test]
-    fn backends_agree_on_random_tiny_nets(
+    fn in_process_ay_decides_random_tiny_nets(
         in_dim in 1usize..=3,
         hidden_dim in 2usize..=5,
         weight_seed in proptest::collection::vec(-2.0f64..2.0, 40),
         bias_seed in proptest::collection::vec(-1.0f64..1.0, 12),
         threshold in -4.0f64..4.0,
     ) {
-        // Assemble a [in_dim, hidden_dim, 1] net from the seeds.
-        let out_dim = 1usize;
-        let layer_dims = vec![in_dim, hidden_dim, out_dim];
-        let w0: Vec<f64> = (0..hidden_dim * in_dim)
-            .map(|k| weight_seed[k % weight_seed.len()])
-            .collect();
-        let w1: Vec<f64> = (0..out_dim * hidden_dim)
-            .map(|k| weight_seed[(k + 7) % weight_seed.len()])
-            .collect();
-        let b0: Vec<f64> = (0..hidden_dim).map(|k| bias_seed[k % bias_seed.len()]).collect();
-        let b1: Vec<f64> = (0..out_dim).map(|k| bias_seed[(k + 3) % bias_seed.len()]).collect();
-        let weights = vec![w0, w1];
-        let biases = vec![b0, b1];
-        let input_bounds = vec![Bound::new(0.0, 1.0); in_dim];
-        let intermediate_bounds =
-            ibp_intermediate_bounds(&weights, &biases, &layer_dims, &input_bounds);
+        let result = solve_random_tiny_net(
+            in_dim,
+            hidden_dim,
+            &weight_seed,
+            &bias_seed,
+            threshold,
+            MipBackend::Ay,
+        );
+        proptest::prop_assert!(
+            !matches!(result, MipResult::Timeout | MipResult::Error(_)),
+            "in-process AY must decide a tiny net, got {result:?}"
+        );
+    }
 
-        let mut verdicts = Vec::new();
-        for backend in all_backends() {
-            let mut encoder = encode_feedforward(
-                &weights,
-                &biases,
-                &layer_dims,
-                &input_bounds,
-                &intermediate_bounds,
-            )
-            .expect("encoding should succeed");
-            encoder
-                .constrain_output_geq_const(0, threshold)
-                .expect("constraint should succeed");
-            let solver = MipSolver::new(encoder.into_parts(), config_for(backend));
-            let result = solver.check_feasibility().expect("solve should succeed");
-            proptest::prop_assert!(
-                !matches!(result, MipResult::Timeout | MipResult::Error(_)),
-                "{backend:?}: tiny net must decide, got {result:?}"
-            );
-            verdicts.push((backend, verdict_label(&result)));
-        }
-
-        // All compiled backends agree exactly.
-        for window in verdicts.windows(2) {
-            proptest::prop_assert_eq!(
-                window[0].1,
-                window[1].1,
-                "backend verdict disagreement: {:?}",
-                &verdicts
-            );
-        }
+    /// The frozen subprocess lane must agree with the production in-process AY
+    /// backend. An explicit run requires the exact pinned AY executable.
+    #[test]
+    #[cfg(feature = "external-ay")]
+    fn ay_proc_agrees_with_in_process_on_random_tiny_nets(
+        in_dim in 1usize..=3,
+        hidden_dim in 2usize..=5,
+        weight_seed in proptest::collection::vec(-2.0f64..2.0, 40),
+        bias_seed in proptest::collection::vec(-1.0f64..1.0, 12),
+        threshold in -4.0f64..4.0,
+    ) {
+        require_pinned_ay_proc();
+        let in_process = solve_random_tiny_net(
+            in_dim,
+            hidden_dim,
+            &weight_seed,
+            &bias_seed,
+            threshold,
+            MipBackend::Ay,
+        );
+        let subprocess = solve_random_tiny_net(
+            in_dim,
+            hidden_dim,
+            &weight_seed,
+            &bias_seed,
+            threshold,
+            MipBackend::AyProc,
+        );
+        proptest::prop_assert!(
+            !matches!(subprocess, MipResult::Timeout | MipResult::Error(_)),
+            "AyProc must decide a tiny net, got {subprocess:?}"
+        );
+        proptest::prop_assert_eq!(
+            verdict_label(&in_process),
+            verdict_label(&subprocess),
+            "in-process/AyProc verdict disagreement: in_process={:?}, subprocess={:?}",
+            in_process,
+            subprocess
+        );
     }
 }
 
-/// Phase-split racing agrees with the serial solve on both fixtures and every
-/// compiled backend (designs/scip.md Phase C validation): sat stays sat with a
+/// Phase-split racing agrees with the serial solve on both fixtures for a
+/// selected backend (designs/scip.md Phase C validation): sat stays sat with a
 /// valid witness, unsat stays unsat. parallel_split=16 forces the maximum
 /// split (capped by the fixture's binary count); parallel_split=1 is the
 /// serial disable path.
-#[test]
-#[ntest::timeout(60_000)]
-fn split_and_serial_solves_agree_on_fixtures() {
+fn assert_split_and_serial_solves_agree(backend: MipBackend) {
     let (weights, biases, layer_dims) = small_network();
     let input_bounds = vec![Bound::new(0.0, 1.0), Bound::new(0.0, 1.0)];
     let intermediate_bounds = vec![vec![
@@ -786,54 +911,66 @@ fn split_and_serial_solves_agree_on_fixtures() {
         Bound::new(-1.0, 1.0), // one unstable binary -> k=1 -> 2 subproblems
     ]];
 
-    for backend in all_backends() {
-        for &(unsafe_threshold, expect_sat) in &[(1.5f64, true), (10.0f64, false)] {
-            let mut verdicts = Vec::new();
-            for parallel_split in [1usize, 16usize] {
-                let mut encoder = encode_feedforward(
-                    &weights,
-                    &biases,
-                    &layer_dims,
-                    &input_bounds,
-                    &intermediate_bounds,
-                )
-                .expect("encoding should succeed");
-                // output[1] = x2 + relu(x1+x2-1) has range [0, 2].
-                encoder
-                    .constrain_output_geq_const(1, unsafe_threshold)
-                    .expect("constraint should succeed");
-                let config = MipConfig {
-                    parallel_split,
-                    ..config_for(backend)
-                };
-                let solver = MipSolver::new(encoder.into_parts(), config);
-                let result = solver.check_feasibility().expect("solve should succeed");
-                if expect_sat {
-                    match &result {
-                        MipResult::Sat { input_values, .. } => {
-                            for &v in input_values {
-                                assert!(
-                                    (-1e-8..=1.0 + 1e-8).contains(&v),
-                                    "{backend:?} split={parallel_split}: witness {v} out of box"
-                                );
-                            }
+    for &(unsafe_threshold, expect_sat) in &[(1.5f64, true), (10.0f64, false)] {
+        let mut verdicts = Vec::new();
+        for parallel_split in [1usize, 16usize] {
+            let mut encoder = encode_feedforward(
+                &weights,
+                &biases,
+                &layer_dims,
+                &input_bounds,
+                &intermediate_bounds,
+            )
+            .expect("encoding should succeed");
+            // output[1] = x2 + relu(x1+x2-1) has range [0, 2].
+            encoder
+                .constrain_output_geq_const(1, unsafe_threshold)
+                .expect("constraint should succeed");
+            let config = MipConfig {
+                parallel_split,
+                ..config_for(backend)
+            };
+            let solver = MipSolver::new(encoder.into_parts(), config);
+            let result = solver.check_feasibility().expect("solve should succeed");
+            if expect_sat {
+                match &result {
+                    MipResult::Sat { input_values, .. } => {
+                        for &v in input_values {
+                            assert!(
+                                (-1e-8..=1.0 + 1e-8).contains(&v),
+                                "{backend:?} split={parallel_split}: witness {v} out of box"
+                            );
                         }
-                        other => panic!(
-                            "{backend:?} split={parallel_split}: expected SAT, got {other:?}"
-                        ),
                     }
-                } else {
-                    assert!(
-                        matches!(result, MipResult::Unsat { .. }),
-                        "{backend:?} split={parallel_split}: expected UNSAT, got {result:?}"
-                    );
+                    other => {
+                        panic!("{backend:?} split={parallel_split}: expected SAT, got {other:?}")
+                    }
                 }
-                verdicts.push(verdict_label(&result));
+            } else {
+                assert!(
+                    matches!(result, MipResult::Unsat { .. }),
+                    "{backend:?} split={parallel_split}: expected UNSAT, got {result:?}"
+                );
             }
-            assert_eq!(
-                verdicts[0], verdicts[1],
-                "{backend:?}: split/serial verdict divergence at threshold {unsafe_threshold}"
-            );
+            verdicts.push(verdict_label(&result));
         }
+        assert_eq!(
+            verdicts[0], verdicts[1],
+            "{backend:?}: split/serial verdict divergence at threshold {unsafe_threshold}"
+        );
     }
+}
+
+#[test]
+#[ntest::timeout(60_000)]
+fn split_and_serial_solves_agree_on_fixtures() {
+    assert_split_and_serial_solves_agree(MipBackend::Ay);
+}
+
+#[test]
+#[cfg(feature = "external-ay")]
+#[ntest::timeout(60_000)]
+fn ay_proc_split_and_serial_solves_agree_on_fixtures() {
+    require_pinned_ay_proc();
+    assert_split_and_serial_solves_agree(MipBackend::AyProc);
 }

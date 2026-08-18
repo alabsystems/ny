@@ -17,6 +17,8 @@ Tests ny's handling of:
 This validates P0 Correctness for numerical robustness.
 """
 
+import json
+import math
 import os
 import subprocess
 import sys
@@ -54,7 +56,8 @@ def run_ny_verify(model_path: str, epsilon: float = 0.01) -> dict:
     """Run ny verify and capture result."""
     cmd = [
         "cargo", "run", "--release", "--bin", "ny", "--",
-        "verify", model_path, "--epsilon", str(epsilon)
+        "verify", model_path, "--epsilon", str(epsilon), "--json",
+        "--strict", "--require-sound",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT,
                            env={**os.environ, "RUST_LOG": "error"})
@@ -63,6 +66,50 @@ def run_ny_verify(model_path: str, epsilon: float = 0.01) -> dict:
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
+
+
+def verification_completed(result: dict) -> bool:
+    """Require a valid status/exit contract and two finite output bounds."""
+    stdout = result["stdout"].strip()
+    json_start = stdout.find("{")
+    if json_start < 0 or "panic" in result["stderr"].lower():
+        return False
+    try:
+        data = json.loads(stdout[json_start:])
+    except json.JSONDecodeError:
+        return False
+
+    aliases = {"safe": "verified", "violated": "falsified"}
+    raw_status = str(data.get("property_status", data.get("status", ""))).lower()
+    status = aliases.get(raw_status, raw_status)
+    expected_codes = {
+        "verified": 0,
+        "falsified": 1,
+        "unknown": 2,
+        "timeout": 3,
+    }
+    bounds = data.get("output_bounds")
+    soundness = data.get("soundness")
+    try:
+        bounds_valid = (
+            isinstance(bounds, list)
+            and len(bounds) == 2
+            and all(
+                math.isfinite(float(bound["lower"]))
+                and math.isfinite(float(bound["upper"]))
+                and float(bound["lower"]) <= float(bound["upper"])
+                for bound in bounds
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        bounds_valid = False
+    return (
+        status == "verified"
+        and result["returncode"] == expected_codes["verified"]
+        and isinstance(soundness, dict)
+        and soundness.get("mode") == "sound"
+        and bounds_valid
+    )
 
 
 def test_large_weights():
@@ -75,14 +122,13 @@ def test_large_weights():
 
     try:
         result = run_ny_verify(model_path, epsilon=0.001)
-        no_panic = "panic" not in result["stderr"].lower()
-        if result["returncode"] == 0 and no_panic:
+        if verification_completed(result):
             print("  PASS: Handled large weights")
             return True
-        if no_panic:
-            print("  PASS: Graceful error (no panic)")
-            return True
-        print("  FAIL: Panic detected")
+        print(
+            f"  FAIL: ny did not complete verification "
+            f"(code={result['returncode']}, stderr={result['stderr'][:100]!r})"
+        )
         return False
     finally:
         os.unlink(model_path)
@@ -98,10 +144,10 @@ def test_small_weights():
 
     try:
         result = run_ny_verify(model_path, epsilon=0.001)
-        if "panic" not in result["stderr"].lower():
-            print("  PASS: Handled small weights without panic")
+        if verification_completed(result):
+            print("  PASS: Handled small weights")
             return True
-        print("  FAIL: Panic on small weights")
+        print(f"  FAIL: ny did not complete verification (code={result['returncode']})")
         return False
     finally:
         os.unlink(model_path)
@@ -117,11 +163,8 @@ def test_zero_weights():
 
     try:
         result = run_ny_verify(model_path, epsilon=0.01)
-        if "Verified" in result["stdout"]:
+        if verification_completed(result):
             print("  PASS: Zero weights verified")
-            return True
-        if "panic" not in result["stderr"].lower():
-            print("  PASS: Handled zero weights without panic")
             return True
         print(f"  FAIL: {result['stderr'][:100]}")
         return False
@@ -139,10 +182,10 @@ def test_mixed_magnitudes():
 
     try:
         result = run_ny_verify(model_path, epsilon=0.001)
-        if "panic" not in result["stderr"].lower():
-            print("  PASS: Handled mixed magnitudes without panic")
+        if verification_completed(result):
+            print("  PASS: Handled mixed magnitudes")
             return True
-        print("  FAIL: Panic on mixed magnitudes")
+        print(f"  FAIL: ny did not complete verification (code={result['returncode']})")
         return False
     finally:
         os.unlink(model_path)
@@ -158,7 +201,7 @@ def test_normal_model():
 
     try:
         result = run_ny_verify(model_path, epsilon=0.01)
-        if "Verified" in result["stdout"]:
+        if verification_completed(result):
             print("  PASS: Normal model verified")
             return True
         print(f"  FAIL: {result['stdout']}")
@@ -179,13 +222,13 @@ def test_epsilon_edge_cases():
     try:
         # Very small epsilon
         r1 = run_ny_verify(model_path, epsilon=1e-10)
-        passed = "Verified" in r1["stdout"] or "panic" not in r1["stderr"].lower()
+        passed = verification_completed(r1)
         print(f"  {'PASS' if passed else 'FAIL'}: Very small epsilon (1e-10)")
         results.append(passed)
 
         # Large epsilon
         r2 = run_ny_verify(model_path, epsilon=100.0)
-        passed = "panic" not in r2["stderr"].lower()
+        passed = verification_completed(r2)
         print(f"  {'PASS' if passed else 'FAIL'}: Large epsilon (100.0)")
         results.append(passed)
 
@@ -204,13 +247,10 @@ def test_negative_weights():
 
     try:
         result = run_ny_verify(model_path, epsilon=0.01)
-        if "Verified" in result["stdout"]:
+        if verification_completed(result):
             print("  PASS: Negative weights verified")
             return True
-        if "panic" not in result["stderr"].lower():
-            print("  PASS: No panic with negative weights")
-            return True
-        print("  FAIL: Panic with negative weights")
+        print(f"  FAIL: ny did not complete verification (code={result['returncode']})")
         return False
     finally:
         os.unlink(model_path)

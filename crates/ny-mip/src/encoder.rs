@@ -10,7 +10,8 @@
 // Big-M formulation matches 's encode_relu_bigm (layers.rs:298).
 
 use crate::error::MipError;
-use crate::ir::{Col, MilpProblem};
+use crate::ir::{Col, MilpProblem, Row};
+use num_rational::BigRational;
 use ny_core::Bound;
 
 type Result<T> = std::result::Result<T, MipError>;
@@ -56,6 +57,42 @@ impl MipEncoder {
                 )));
             }
             let col = problem.add_col(0.0, b.lower() as f64, b.upper() as f64);
+            input_vars.push(col);
+        }
+
+        Ok(Self {
+            current_vars: input_vars.clone(),
+            input_vars,
+            output_vars: Vec::new(),
+            binary_vars: Vec::new(),
+            binary_widths: Vec::new(),
+            problem,
+        })
+    }
+
+    /// Create an encoder with binary64 input bounds preserved exactly.
+    ///
+    /// This is the authority-preserving constructor for frontends whose source
+    /// property stores finite binary64 endpoints. Routing those endpoints
+    /// through [`Bound`] would first widen/narrow them to binary32 and can erase
+    /// a small exact-LP separation. The ordinary [`Self::new`] behavior remains
+    /// unchanged for existing callers.
+    pub fn new_with_f64_bounds(input_bounds: &[(f64, f64)]) -> Result<Self> {
+        let mut problem = MilpProblem::new();
+        let mut input_vars = Vec::with_capacity(input_bounds.len());
+
+        for (i, &(lower, upper)) in input_bounds.iter().enumerate() {
+            if !lower.is_finite() || !upper.is_finite() {
+                return Err(MipError::InvalidBounds(format!(
+                    "non-finite bound for input variable {i}: [{lower}, {upper}]"
+                )));
+            }
+            if lower > upper {
+                return Err(MipError::InvalidBounds(format!(
+                    "inverted bound for input variable {i}: {lower} > {upper}"
+                )));
+            }
+            let col = problem.add_col(0.0, lower, upper);
             input_vars.push(col);
         }
 
@@ -199,49 +236,153 @@ impl MipEncoder {
         Ok(())
     }
 
+    /// Encode the exact continuous Planet outer relaxation of a ReLU layer.
+    ///
+    /// Stable coordinates retain the exact encodings used by [`Self::encode_relu`].
+    /// For an unstable coordinate with finite `l < 0 < u`, this adds no binary
+    /// variable and encodes the convex hull
+    ///
+    /// ```text
+    /// y >= 0
+    /// y >= x
+    /// (u - l)y - ux <= -ul.
+    /// ```
+    ///
+    /// The first inequality is the lower bound of the new `y` column. The two
+    /// arithmetic expressions in the upper-hull row are formed as exact
+    /// rationals first. If the corresponding binary64 subtraction or product
+    /// changes that exact value, the whole layer is rejected before the
+    /// encoder is mutated. This is intentionally stricter than an outward
+    /// rounded relaxation: an exact Farkas replay must describe precisely the
+    /// hull that this API claims to have encoded.
+    pub fn encode_relu_continuous_outer(
+        &mut self,
+        pre_activation_bounds: &[(f64, f64)],
+    ) -> Result<()> {
+        let n = self.current_vars.len();
+        if pre_activation_bounds.len() != n {
+            return Err(MipError::Encoding(format!(
+                "continuous ReLU bounds dimension mismatch: {} vars, {} bounds",
+                n,
+                pre_activation_bounds.len()
+            )));
+        }
+
+        // Validate every exact coefficient before adding any column or row so
+        // an inexact late coordinate cannot leave a partially encoded layer.
+        let plans = pre_activation_bounds
+            .iter()
+            .enumerate()
+            .map(|(index, &(lower, upper))| continuous_relu_plan(index, lower, upper))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut new_vars = Vec::with_capacity(n);
+        for (x_var, plan) in self.current_vars.iter().copied().zip(plans) {
+            match plan {
+                ContinuousReluPlan::Active => new_vars.push(x_var),
+                ContinuousReluPlan::Inactive => {
+                    let y_var = self.problem.add_col(0.0, 0.0, 0.0);
+                    new_vars.push(y_var);
+                }
+                ContinuousReluPlan::Unstable {
+                    upper,
+                    width,
+                    upper_rhs,
+                } => {
+                    // y >= 0 is represented by the exact column lower bound.
+                    let y_var = self.problem.add_col(0.0, 0.0, upper);
+
+                    // y >= x.
+                    self.problem
+                        .add_row(0.0, f64::INFINITY, [(y_var, 1.0), (x_var, -1.0)]);
+
+                    // (u-l)y - ux <= -ul.
+                    self.problem.add_row(
+                        f64::NEG_INFINITY,
+                        upper_rhs,
+                        [(y_var, width), (x_var, -upper)],
+                    );
+                    new_vars.push(y_var);
+                }
+            }
+        }
+
+        self.current_vars = new_vars;
+        Ok(())
+    }
+
     /// Mark the current frontier as output variables.
     pub fn finalize(&mut self) {
         self.output_vars = self.current_vars.clone();
     }
 
-    /// Add constraint: output[i] <= output[j].
+    /// Add constraint: `output[i] <= output[j]`.
     ///
     /// Encodes as: Y_i - Y_j <= 0.
     /// Used for VNNLIB LessEq(i, j) constraints.
     pub fn constrain_output_leq(&mut self, i: usize, j: usize) -> Result<()> {
-        let (yi, yj) = self.output_pair(i, j)?;
-        self.problem
-            .add_row(f64::NEG_INFINITY, 0.0, [(yi, 1.0), (yj, -1.0)]);
+        self.constrain_output_leq_row(i, j)?;
         Ok(())
     }
 
-    /// Add constraint: output[i] >= output[j].
+    /// Add `output[i] <= output[j]` and return the exact emitted row.
+    ///
+    /// The row identity lets an explicitly gated caller optimize this same
+    /// one-sided unsafe-region constraint for a robust SAT candidate without
+    /// guessing from row shape.  It grants no verdict authority.
+    pub fn constrain_output_leq_row(&mut self, i: usize, j: usize) -> Result<Row> {
+        let (yi, yj) = self.output_pair(i, j)?;
+        Ok(self
+            .problem
+            .add_row(f64::NEG_INFINITY, 0.0, [(yi, 1.0), (yj, -1.0)]))
+    }
+
+    /// Add constraint: `output[i] >= output[j]`.
     ///
     /// Encodes as: Y_i - Y_j >= 0.
     /// Used for VNNLIB GreaterEq(i, j) constraints.
     pub fn constrain_output_geq(&mut self, i: usize, j: usize) -> Result<()> {
-        let (yi, yj) = self.output_pair(i, j)?;
-        self.problem
-            .add_row(0.0, f64::INFINITY, [(yi, 1.0), (yj, -1.0)]);
+        self.constrain_output_geq_row(i, j)?;
         Ok(())
     }
 
-    /// Add constraint: output[i] <= constant.
+    /// Add `output[i] >= output[j]` and return the exact emitted row.
+    ///
+    /// See [`Self::constrain_output_leq_row`] for the witness-only use of this
+    /// identity.
+    pub fn constrain_output_geq_row(&mut self, i: usize, j: usize) -> Result<Row> {
+        let (yi, yj) = self.output_pair(i, j)?;
+        Ok(self
+            .problem
+            .add_row(0.0, f64::INFINITY, [(yi, 1.0), (yj, -1.0)]))
+    }
+
+    /// Add constraint: `output[i] <= constant`.
     ///
     /// Used for VNNLIB LessEqConst(i, c) constraints.
     pub fn constrain_output_leq_const(&mut self, i: usize, val: f64) -> Result<()> {
-        let yi = self.output_var(i)?;
-        self.problem.add_row(f64::NEG_INFINITY, val, [(yi, 1.0)]);
+        self.constrain_output_leq_const_row(i, val)?;
         Ok(())
     }
 
-    /// Add constraint: output[i] >= constant.
+    /// Add `output[i] <= val` and return the exact emitted row.
+    pub fn constrain_output_leq_const_row(&mut self, i: usize, val: f64) -> Result<Row> {
+        let yi = self.output_var(i)?;
+        Ok(self.problem.add_row(f64::NEG_INFINITY, val, [(yi, 1.0)]))
+    }
+
+    /// Add constraint: `output[i] >= constant`.
     ///
     /// Used for VNNLIB GreaterEqConst(i, c) constraints.
     pub fn constrain_output_geq_const(&mut self, i: usize, val: f64) -> Result<()> {
-        let yi = self.output_var(i)?;
-        self.problem.add_row(val, f64::INFINITY, [(yi, 1.0)]);
+        self.constrain_output_geq_const_row(i, val)?;
         Ok(())
+    }
+
+    /// Add `output[i] >= val` and return the exact emitted row.
+    pub fn constrain_output_geq_const_row(&mut self, i: usize, val: f64) -> Result<Row> {
+        let yi = self.output_var(i)?;
+        Ok(self.problem.add_row(val, f64::INFINITY, [(yi, 1.0)]))
     }
 
     /// Look up a single output variable by index.
@@ -287,6 +428,76 @@ impl MipEncoder {
     pub fn output_vars(&self) -> &[Col] {
         &self.output_vars
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ContinuousReluPlan {
+    Active,
+    Inactive,
+    Unstable {
+        upper: f64,
+        width: f64,
+        upper_rhs: f64,
+    },
+}
+
+fn continuous_relu_plan(index: usize, lower: f64, upper: f64) -> Result<ContinuousReluPlan> {
+    let exact_lower = BigRational::from_float(lower).ok_or_else(|| {
+        MipError::InvalidBounds(format!(
+            "non-finite continuous ReLU lower bound at coordinate {index}: {lower}"
+        ))
+    })?;
+    let exact_upper = BigRational::from_float(upper).ok_or_else(|| {
+        MipError::InvalidBounds(format!(
+            "non-finite continuous ReLU upper bound at coordinate {index}: {upper}"
+        ))
+    })?;
+    if lower > upper {
+        return Err(MipError::InvalidBounds(format!(
+            "inverted continuous ReLU bound at coordinate {index}: {lower} > {upper}"
+        )));
+    }
+    if lower >= 0.0 {
+        return Ok(ContinuousReluPlan::Active);
+    }
+    if upper <= 0.0 {
+        return Ok(ContinuousReluPlan::Inactive);
+    }
+
+    let exact_width = &exact_upper - &exact_lower;
+    let width = upper - lower;
+    require_exact_binary64_result(width, &exact_width, index, "unstable ReLU width u-l")?;
+
+    let exact_upper_rhs = -(&exact_upper * &exact_lower);
+    let upper_rhs = -(upper * lower);
+    require_exact_binary64_result(
+        upper_rhs,
+        &exact_upper_rhs,
+        index,
+        "unstable ReLU product -u*l",
+    )?;
+
+    Ok(ContinuousReluPlan::Unstable {
+        upper,
+        width,
+        upper_rhs,
+    })
+}
+
+fn require_exact_binary64_result(
+    encoded: f64,
+    exact: &BigRational,
+    index: usize,
+    expression: &str,
+) -> Result<()> {
+    if !encoded.is_finite()
+        || BigRational::from_float(encoded).is_none_or(|round_trip| round_trip != *exact)
+    {
+        return Err(MipError::Encoding(format!(
+            "{expression} at coordinate {index} is not exactly representable as finite f64"
+        )));
+    }
+    Ok(())
 }
 
 /// Extracted parts of an encoded MIP problem.
@@ -372,4 +583,142 @@ pub fn encode_feedforward(
 
     encoder.finalize();
     Ok(encoder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_holds(row: &crate::ir::RowSpec, values: &[f64]) -> bool {
+        let value = row
+            .coeffs
+            .iter()
+            .map(|&(column, coefficient)| coefficient * values[column])
+            .sum::<f64>();
+        value >= row.lb && value <= row.ub
+    }
+
+    #[test]
+    fn f64_input_constructor_preserves_nonrepresentable_endpoints() {
+        let lower = 0.1_f64;
+        let upper = lower.next_up();
+        assert_ne!(f64::from(lower as f32).to_bits(), lower.to_bits());
+
+        let encoder = MipEncoder::new_with_f64_bounds(&[(lower, upper)])
+            .expect("finite ordered binary64 box");
+        let parts = encoder.into_parts();
+        assert_eq!(parts.problem.cols()[0].lb.to_bits(), lower.to_bits());
+        assert_eq!(parts.problem.cols()[0].ub.to_bits(), upper.to_bits());
+    }
+
+    #[test]
+    fn f64_input_constructor_rejects_nan_and_inversion() {
+        assert!(MipEncoder::new_with_f64_bounds(&[(f64::NAN, 1.0)]).is_err());
+        assert!(MipEncoder::new_with_f64_bounds(&[(f64::NEG_INFINITY, 1.0)]).is_err());
+        assert!(MipEncoder::new_with_f64_bounds(&[(0.0, f64::INFINITY)]).is_err());
+        assert!(MipEncoder::new_with_f64_bounds(&[(f64::INFINITY, f64::INFINITY)]).is_err());
+        assert!(MipEncoder::new_with_f64_bounds(&[(2.0, 1.0)]).is_err());
+    }
+
+    #[test]
+    fn continuous_relu_outer_contains_graph_and_has_no_binary() {
+        let mut encoder = MipEncoder::new_with_f64_bounds(&[(-2.0, 3.0)]).unwrap();
+        encoder
+            .encode_relu_continuous_outer(&[(-2.0, 3.0)])
+            .unwrap();
+        encoder.finalize();
+        let parts = encoder.into_parts();
+
+        assert!(parts.binary_vars.is_empty());
+        assert_eq!(parts.problem.num_cols(), 2);
+        assert_eq!(parts.problem.num_rows(), 2);
+        assert_eq!(parts.problem.cols()[parts.output_vars[0].0].lb, 0.0);
+        assert_eq!(parts.problem.cols()[parts.output_vars[0].0].ub, 3.0);
+
+        for (x, y) in [(-2.0, 0.0), (-1.0, 0.0), (0.0, 0.0), (1.0, 1.0), (3.0, 3.0)] {
+            let values = [x, y];
+            assert!(
+                parts
+                    .problem
+                    .rows()
+                    .iter()
+                    .all(|row| row_holds(row, &values)),
+                "ReLU graph point ({x}, {y}) must lie in its outer hull"
+            );
+        }
+        assert!(
+            parts
+                .problem
+                .rows()
+                .iter()
+                .all(|row| row_holds(row, &[0.0, 1.0])),
+            "the relaxation must retain a genuine convex-hull interior point"
+        );
+        assert!(
+            !parts
+                .problem
+                .rows()
+                .iter()
+                .all(|row| row_holds(row, &[0.0, 1.25])),
+            "the Planet upper facet must exclude points above the hull"
+        );
+    }
+
+    #[test]
+    fn continuous_relu_outer_keeps_zero_boundary_phases_exact() {
+        let mut encoder =
+            MipEncoder::new_with_f64_bounds(&[(0.0, 2.0), (-2.0, 0.0), (0.0, 0.0)]).unwrap();
+        encoder
+            .encode_relu_continuous_outer(&[(0.0, 2.0), (-2.0, 0.0), (0.0, 0.0)])
+            .unwrap();
+        encoder.finalize();
+        let parts = encoder.into_parts();
+
+        assert_eq!(parts.problem.num_rows(), 0);
+        assert_eq!(parts.problem.num_cols(), 4);
+        assert_eq!(parts.output_vars[0], parts.input_vars[0]);
+        assert_ne!(parts.output_vars[1], parts.input_vars[1]);
+        assert_eq!(parts.problem.cols()[parts.output_vars[1].0].lb, 0.0);
+        assert_eq!(parts.problem.cols()[parts.output_vars[1].0].ub, 0.0);
+        assert_eq!(parts.output_vars[2], parts.input_vars[2]);
+        assert!(parts.binary_vars.is_empty());
+    }
+
+    #[test]
+    fn continuous_relu_outer_rejects_inexact_arithmetic_atomically() {
+        let just_above_one = 1.0_f64.next_up();
+        let mut inexact_product =
+            MipEncoder::new_with_f64_bounds(&[(-1.0, 1.0), (-just_above_one, just_above_one)])
+                .unwrap();
+        let error = inexact_product
+            .encode_relu_continuous_outer(&[(-1.0, 1.0), (-just_above_one, just_above_one)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("product -u*l"), "unexpected error: {error}");
+        let parts = inexact_product.into_parts();
+        assert_eq!(parts.problem.num_cols(), 2);
+        assert_eq!(parts.problem.num_rows(), 0);
+
+        let mut inexact_width =
+            MipEncoder::new_with_f64_bounds(&[(-f64::MAX, f64::MIN_POSITIVE)]).unwrap();
+        let error = inexact_width
+            .encode_relu_continuous_outer(&[(-f64::MAX, f64::MIN_POSITIVE)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("width u-l"), "unexpected error: {error}");
+        let parts = inexact_width.into_parts();
+        assert_eq!(parts.problem.num_cols(), 1);
+        assert_eq!(parts.problem.num_rows(), 0);
+    }
+
+    #[test]
+    fn continuous_relu_outer_accepts_exact_binary32_hull_arithmetic() {
+        let lower = f64::from(-0.1_f32);
+        let upper = f64::from(0.2_f32);
+        let mut encoder = MipEncoder::new_with_f64_bounds(&[(lower, upper)]).unwrap();
+        encoder
+            .encode_relu_continuous_outer(&[(lower, upper)])
+            .expect("binary32 product and nearby difference fit exactly in binary64");
+        assert_eq!(encoder.num_binary_vars(), 0);
+    }
 }

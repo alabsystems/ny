@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use super::super::JsonCliError;
 use super::model_load::VerifiableNetwork;
+use crate::commands::backend::ProofBackendReceipt;
 use crate::BackendArg;
 
 /// Run layer-by-layer mode, streaming per-node bounds.
@@ -25,6 +26,7 @@ pub(crate) fn run_layer_by_layer(
     progress: bool,
     progress_json: bool,
     json: bool,
+    backend_receipt: &ProofBackendReceipt,
 ) -> Result<()> {
     let effective_shape = spec_input_shape.ok_or_else(|| {
         JsonCliError::new(
@@ -39,7 +41,7 @@ pub(crate) fn run_layer_by_layer(
         VerifiableNetwork::Sequential(_net) => {
             let message =
                 "Layer-by-layer mode is only supported for native models (GraphNetwork). \
-                Hint: use --native flag with PyTorch/SafeTensors/GGUF models.";
+                Hint: use --native with PyTorch/SafeTensors/CoreML/GGUF models.";
             Err(JsonCliError::new("unsupported_model_format", message).into())
         }
         VerifiableNetwork::Graph(graph) => run_layer_by_layer_graph(
@@ -49,6 +51,7 @@ pub(crate) fn run_layer_by_layer(
             progress,
             progress_json,
             json,
+            backend_receipt,
         ),
     }
 }
@@ -60,6 +63,7 @@ fn run_layer_by_layer_graph(
     progress: bool,
     progress_json: bool,
     json: bool,
+    backend_receipt: &ProofBackendReceipt,
 ) -> Result<()> {
     let start = Instant::now();
     let show_progress = progress || progress_json;
@@ -143,6 +147,7 @@ fn run_layer_by_layer_graph(
                 "total_nodes": result.total_nodes,
                 "degraded_at_node": result.degraded_at_node,
                 "elapsed_ms": elapsed.as_millis(),
+                "backend_receipt": super::result::backend_receipt_json(backend_receipt),
                 "nodes": nodes_json
             })
         );
@@ -167,6 +172,7 @@ pub(crate) fn run_block_wise(
     max_blocks: usize,
     checkpoint: Option<&Path>,
     json: bool,
+    backend_receipt: &ProofBackendReceipt,
 ) -> Result<()> {
     let effective_shape = spec_input_shape.ok_or_else(|| {
         JsonCliError::new(
@@ -180,7 +186,7 @@ pub(crate) fn run_block_wise(
     match network {
         VerifiableNetwork::Sequential(_net) => {
             let message = "Block-wise mode is only supported for native models (GraphNetwork). \
-                Hint: use --native flag with PyTorch/SafeTensors/GGUF models.";
+                Hint: use --native with PyTorch/SafeTensors/CoreML/GGUF models.";
             Err(JsonCliError::new("unsupported_model_format", message).into())
         }
         VerifiableNetwork::Graph(graph) => run_block_wise_graph(
@@ -195,6 +201,7 @@ pub(crate) fn run_block_wise(
             max_blocks,
             checkpoint,
             json,
+            backend_receipt,
         ),
     }
 }
@@ -212,6 +219,7 @@ fn run_block_wise_graph(
     max_blocks: usize,
     checkpoint: Option<&Path>,
     json: bool,
+    backend_receipt: &ProofBackendReceipt,
 ) -> Result<()> {
     let start = Instant::now();
     let show_progress = progress || progress_json;
@@ -237,6 +245,7 @@ fn run_block_wise_graph(
                             "mode": "block_wise",
                             "method": "ibp+zonotope",
                             "resumed_from_checkpoint": true,
+                            "backend_receipt": super::result::backend_receipt_json(backend_receipt),
                             "total_blocks": result.total_blocks,
                             "max_sensitivity": result.max_sensitivity,
                             "degraded_blocks": result.degraded_blocks
@@ -364,7 +373,7 @@ fn run_block_wise_graph(
     let elapsed = start.elapsed();
 
     if json {
-        print_block_wise_json(&result, elapsed);
+        print_block_wise_json(&result, elapsed, backend_receipt);
     } else {
         println!("{}", result.summary());
         println!("\nElapsed: {:.2?}", elapsed);
@@ -372,7 +381,11 @@ fn run_block_wise_graph(
     Ok(())
 }
 
-fn print_block_wise_json(result: &ny_propagate::BlockWiseResult, elapsed: std::time::Duration) {
+fn print_block_wise_json(
+    result: &ny_propagate::BlockWiseResult,
+    elapsed: std::time::Duration,
+    backend_receipt: &ProofBackendReceipt,
+) {
     let blocks_json: Vec<_> = result
         .blocks
         .iter()
@@ -427,6 +440,7 @@ fn print_block_wise_json(result: &ny_propagate::BlockWiseResult, elapsed: std::t
         serde_json::json!({
             "mode": "block_wise",
             "method": "ibp+zonotope",
+            "backend_receipt": super::result::backend_receipt_json(backend_receipt),
             "block_epsilon": result.block_epsilon,
             "total_blocks": result.total_blocks,
             "summary": {

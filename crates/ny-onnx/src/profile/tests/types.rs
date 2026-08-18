@@ -111,6 +111,16 @@ fn test_bound_status_from_width_boundary_values() {
 
 #[ntest::timeout(10000)]
 #[test]
+fn test_bound_status_handles_zero_radius_without_nan_classification() {
+    assert_eq!(BoundStatus::from_width(0.0, 0.0), BoundStatus::Tight);
+    assert_eq!(
+        BoundStatus::from_width(f32::MIN_POSITIVE, 0.0),
+        BoundStatus::VeryWide
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
 fn test_layer_profile_is_choke_point() {
     let layer = LayerProfile {
         name: "test".to_string(),

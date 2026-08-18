@@ -4,12 +4,33 @@
 
 //! CROWN concretize pipeline creation, split from crown_pipelines.rs for size.
 
-use std::borrow::Cow;
-
 use super::shaders::{CROWN_CONCRETIZE_SHADER, CROWN_CONCRETIZE_SOUND_SHADER};
 use super::WgpuDevice;
 
 impl WgpuDevice {
+    /// Cached SOUND concretization pipeline. Verdict qualification initializes
+    /// this before publishing authority; ordinary non-authoritative callers
+    /// retain the prior lazy behavior.
+    pub(in crate::wgpu_device) fn sound_concretize_pipeline(
+        &self,
+    ) -> &(wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        self.sound_concretize_pipeline.get_or_init(|| {
+            Self::create_crown_concretize_sound_pipeline(
+                &self.device,
+                self.denorm_preserve_enabled(),
+            )
+        })
+    }
+
+    /// Return the SOUND concretization pipeline only when qualification or a
+    /// prior checked call has already materialized it. Authoritative sweep
+    /// admission uses this to refuse rather than compile after acceptance.
+    pub(in crate::wgpu_device) fn sound_concretize_pipeline_cached(
+        &self,
+    ) -> Option<&(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
+        self.sound_concretize_pipeline.get()
+    }
+
     /// Pipeline for the SOUND concretize shader (binding 8 = packed
     /// lower|upper coefficient-error matrices). Mirrors
     /// `create_crown_concretize_pipeline` with packed bias/err buffers to stay
@@ -21,11 +42,14 @@ impl WgpuDevice {
     #[allow(dead_code)]
     pub(crate) fn create_crown_concretize_sound_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("crown_concretize_sound_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CROWN_CONCRETIZE_SOUND_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "crown_concretize_sound_shader",
+            CROWN_CONCRETIZE_SOUND_SHADER,
+        );
         let storage_ro = wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
             has_dynamic_offset: false,
@@ -83,11 +107,14 @@ impl WgpuDevice {
 impl WgpuDevice {
     pub(super) fn create_crown_concretize_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("crown_concretize_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CROWN_CONCRETIZE_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "crown_concretize_shader",
+            CROWN_CONCRETIZE_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("crown_concretize_bind_group_layout"),

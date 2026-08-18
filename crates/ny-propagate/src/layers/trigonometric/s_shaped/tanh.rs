@@ -63,13 +63,17 @@ pub(super) fn tanh_d_f64(x: f64) -> f64 {
     1.0 - t * t
 }
 
+fn tanh_tables() -> &'static SShapedPrecomputeTables {
+    static TABLES: OnceLock<SShapedPrecomputeTables> = OnceLock::new();
+    TABLES.get_or_init(|| SShapedPrecomputeTables::new(tanh_f64, tanh_d_f64))
+}
+
 fn tanh_constant_relaxation() -> LinearRelaxation {
     LinearRelaxation::constant(-1.0 - S_SHAPED_RELAX_EPS, 1.0 + S_SHAPED_RELAX_EPS)
 }
 
 pub(crate) fn tanh_crossing_default_tangents(l: f32, u: f32) -> (f32, f32) {
-    static TABLES: OnceLock<SShapedPrecomputeTables> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| SShapedPrecomputeTables::new(tanh_f64, tanh_d_f64));
+    let tables = tanh_tables();
     (tables.lower_tangent(u, l), tables.upper_tangent(l, u))
 }
 
@@ -77,8 +81,7 @@ pub(crate) fn tanh_crossing_default_tangents(l: f32, u: f32) -> (f32, f32) {
 /// Since tanh is monotonically increasing and S-shaped (concave for x > 0, convex for x < 0),
 /// we use precomputed tangent points and chord/tangent case splits.
 pub(crate) fn tanh_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
-    static TABLES: OnceLock<SShapedPrecomputeTables> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| SShapedPrecomputeTables::new(tanh_f64, tanh_d_f64));
+    let tables = tanh_tables();
     s_shaped_linear_relaxation(l, u, tanh_f64, tanh_d_f64, tables, tanh_constant_relaxation)
 }
 

@@ -96,6 +96,8 @@ pub enum LayerType {
     SiLU,
     Sigmoid,
     Tanh,
+    /// Gaussian error function: y = erf(x)
+    Erf,
     /// Softplus: ln(1 + exp(x))
     Softplus,
     Softmax,
@@ -152,7 +154,7 @@ pub enum LayerType {
     Floor,
     /// Ceil: y = ceil(x) - rounds towards positive infinity
     Ceil,
-    /// Round: y = round(x) - rounds to nearest integer (0.5 rounds away from zero)
+    /// Round: y = round(x) - ONNX uses ties to even; bounds also cover half-away runtimes
     Round,
     /// Trunc: y = trunc(x) - rounds toward zero (fractional part discarded).
     /// Produced by ONNX Cast with an integer target dtype on non-constant
@@ -341,6 +343,7 @@ impl fmt::Display for LayerType {
             LayerType::SiLU => write!(f, "SiLU"),
             LayerType::Sigmoid => write!(f, "Sigmoid"),
             LayerType::Tanh => write!(f, "Tanh"),
+            LayerType::Erf => write!(f, "Erf"),
             LayerType::Softplus => write!(f, "Softplus"),
             LayerType::Softmax => write!(f, "Softmax"),
             LayerType::CausalSoftmax => write!(f, "CausalSoftmax"),
@@ -452,6 +455,7 @@ impl FromStr for LayerType {
             "SiLU" => LayerType::SiLU,
             "Sigmoid" => LayerType::Sigmoid,
             "Tanh" => LayerType::Tanh,
+            "Erf" => LayerType::Erf,
             "Softplus" => LayerType::Softplus,
             "Softmax" => LayerType::Softmax,
             "CausalSoftmax" => LayerType::CausalSoftmax,

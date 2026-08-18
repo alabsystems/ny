@@ -3,8 +3,10 @@
 
 The measurement sweep historically retained only the first result line. This
 helper stores the complete raw bytes plus content hashes for the exact ONNX and
-VNN-LIB inputs under an immutable, content-addressed instance directory. SAT
-results additionally fail closed unless the raw result contains an assignment.
+VNN-LIB inputs under an immutable, content-addressed instance directory. When
+NY emitted a flight sidecar, its validated structured record is embedded in the
+immutable row metadata as well. SAT results additionally fail closed unless the
+raw result contains an assignment.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -21,6 +24,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+MAX_FLIGHT_RECORD_BYTES = 16 * 1024 * 1024
+FLIGHT_SCHEMA_VERSION = 3
+SUPPORTED_FLIGHT_SCHEMA_VERSIONS = frozenset({2, FLIGHT_SCHEMA_VERSION})
+LEVER_RECEIPT_SCHEMA = "ny-levers/receipt/v2"
+LEVER_SOURCES = frozenset(
+    {"default", "config", "legacy_env", "legacy_env_rejected"}
+)
+LEVER_BUCKETS = frozenset({"default_on", "auto", "cli", "debug"})
+LEVER_MOATS = frozenset({"none", "low", "high"})
+LEVER_PROVENANCE = frozenset(
+    {"value_neutral", "measured", "unmeasured", "guard"}
+)
+LEVER_NAME = re.compile(r"^NY_[A-Z0-9_]+$")
 V1_INPUT_ASSIGNMENT = re.compile(
     r"\(\s*X_\d+\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?\s*\)"
 )
@@ -662,6 +678,238 @@ def _config_inputs_identity(start: dict[str, object]) -> dict[str, object] | Non
     return {key: config_inputs[key] for key in required}
 
 
+def _valid_lever_value(value: object) -> bool:
+    """Whether ``value`` is one of the scalar shapes emitted by ny-levers."""
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if type(value) is int:
+        return 0 <= value <= (1 << 64) - 1
+    return type(value) is float and math.isfinite(value)
+
+
+def _valid_v3_lever_state(
+    value: object, *, ambient_env: object
+) -> bool:
+    """Validate the versioned, count-consistent Phase-0c lever envelope."""
+    if not isinstance(value, dict) or not isinstance(value.get("status"), str):
+        return False
+    if value["status"] == "not_materialized":
+        return set(value) == {"status"}
+    if value["status"] == "invalid_config":
+        return (
+            set(value) == {"status", "reason"}
+            and isinstance(value["reason"], str)
+            and bool(value["reason"])
+        )
+    if value["status"] != "resolved" or set(value) != {"status", "receipt"}:
+        return False
+
+    receipt = value["receipt"]
+    expected_fields = {
+        "schema",
+        "lever_count",
+        "env_present",
+        "env_accepted",
+        "env_rejected",
+        "levers",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_fields:
+        return False
+    if receipt["schema"] != LEVER_RECEIPT_SCHEMA:
+        return False
+    count_fields = (
+        "lever_count",
+        "env_present",
+        "env_accepted",
+        "env_rejected",
+    )
+    if any(
+        type(receipt[field]) is not int or receipt[field] < 0
+        for field in count_fields
+    ):
+        return False
+    levers = receipt["levers"]
+    if (
+        not isinstance(levers, list)
+        or not levers
+        or receipt["lever_count"] != len(levers)
+        or not isinstance(ambient_env, dict)
+    ):
+        return False
+
+    names: set[str] = set()
+    source_counts = {"legacy_env": 0, "legacy_env_rejected": 0}
+    required_entry_fields = {
+        "name",
+        "value",
+        "source",
+        "bucket",
+        "moat",
+        "provenance",
+    }
+    optional_entry_fields = {"rejected_raw", "env_utf8"}
+    for entry in levers:
+        if (
+            not isinstance(entry, dict)
+            or not required_entry_fields <= set(entry)
+            or not set(entry) <= required_entry_fields | optional_entry_fields
+        ):
+            return False
+        name = entry["name"]
+        source = entry["source"]
+        if (
+            not isinstance(name, str)
+            or LEVER_NAME.fullmatch(name) is None
+            or name in names
+        ):
+            return False
+        if not isinstance(source, str) or source not in LEVER_SOURCES:
+            return False
+        if (
+            not isinstance(entry["bucket"], str)
+            or entry["bucket"] not in LEVER_BUCKETS
+            or not isinstance(entry["moat"], str)
+            or entry["moat"] not in LEVER_MOATS
+        ):
+            return False
+        if (
+            not isinstance(entry["provenance"], str)
+            or entry["provenance"] not in LEVER_PROVENANCE
+        ):
+            return False
+        if (
+            entry["provenance"] == "unmeasured"
+            and entry["bucket"] == "default_on"
+        ) or (
+            entry["provenance"] == "guard" and entry["bucket"] == "auto"
+        ):
+            return False
+        if not _valid_lever_value(entry["value"]):
+            return False
+        env_backed = source in source_counts
+        if env_backed != (name in ambient_env):
+            return False
+        if source == "legacy_env":
+            if set(entry) & {"rejected_raw"} or type(entry.get("env_utf8")) is not bool:
+                return False
+        elif source == "legacy_env_rejected":
+            if (
+                not isinstance(entry.get("rejected_raw"), str)
+                or type(entry.get("env_utf8")) is not bool
+                or entry["rejected_raw"] != ambient_env[name]
+            ):
+                return False
+        elif set(entry) & optional_entry_fields:
+            return False
+        names.add(name)
+        if source in source_counts:
+            source_counts[source] += 1
+
+    accepted = source_counts["legacy_env"]
+    rejected = source_counts["legacy_env_rejected"]
+    return (
+        receipt["env_accepted"] == accepted
+        and receipt["env_rejected"] == rejected
+        and receipt["env_present"] == accepted + rejected
+    )
+
+
+def _capture_flight_record(
+    path: Path | None,
+    *,
+    category: str,
+    timeout_seconds: int,
+    solver_verdict: str,
+) -> dict[str, object]:
+    """Capture a row-bound flight record, or state explicitly that none exists."""
+    if path is None:
+        return {"status": "not_requested"}
+    if path.is_symlink():
+        raise ValueError(f"flight record must not be a symlink: {path}")
+    if not path.exists():
+        return {"status": "missing"}
+    if not path.is_file():
+        raise ValueError(f"flight record is not a regular file: {path}")
+    before = _stat_fingerprint(path.stat())
+    if before["size_bytes"] > MAX_FLIGHT_RECORD_BYTES:
+        raise ValueError(f"flight record is oversized: {path}")
+    data = path.read_bytes()
+    if _stat_fingerprint(path.stat()) != before:
+        raise ValueError(f"flight record changed while captured: {path}")
+    try:
+        record = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"flight record is not valid JSON: {path}: {error}") from error
+    if not isinstance(record, dict):
+        raise ValueError(f"flight record is not a JSON object: {path}")
+    schema_version = record.get("schema_version")
+    schema_valid = (
+        type(schema_version) is int
+        and schema_version in SUPPORTED_FLIGHT_SCHEMA_VERSIONS
+        and (
+            schema_version != FLIGHT_SCHEMA_VERSION
+            or _valid_v3_lever_state(
+                record.get("levers"), ambient_env=record.get("ambient_env")
+            )
+        )
+    )
+    ambient_env = record.get("ambient_env")
+    events = record.get("events")
+    if (
+        not schema_valid
+        or not isinstance(record.get("backend_kind"), str)
+        or not isinstance(record.get("backend_summary"), str)
+        or not isinstance(record.get("host"), dict)
+        or record.get("category") != category
+        or type(record.get("budget_secs")) is not int
+        or record.get("budget_secs") != timeout_seconds
+        or not isinstance(ambient_env, dict)
+        or not all(
+            isinstance(name, str)
+            and isinstance(value, str)
+            and (name.startswith("NY_") or name == "OMP_NUM_THREADS")
+            for name, value in ambient_env.items()
+        )
+        or not isinstance(events, list)
+        or not all(
+            isinstance(event, dict)
+            and isinstance(event.get("method"), str)
+            and event.get("status") in {"ran", "skipped", "not_reached", "complete"}
+            and (event.get("reason") is None or isinstance(event.get("reason"), str))
+            and (
+                event.get("at_secs") is None
+                or (
+                    type(event.get("at_secs")) in {int, float} and event["at_secs"] >= 0
+                )
+            )
+            for event in events
+        )
+    ):
+        raise ValueError(f"flight record identity is invalid: {path}")
+    terminal = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("method") == "run_complete"
+        and event.get("status") == "complete"
+    ]
+    if (
+        len(terminal) != 1
+        or terminal[0].get("reason") != solver_verdict
+        or not events
+        or events[-1] is not terminal[0]
+    ):
+        raise ValueError(
+            f"flight record terminal verdict does not match {solver_verdict!r}: {path}"
+        )
+    return {
+        "status": "captured",
+        "source_sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+        "record": record,
+    }
+
+
 def archive_result(
     *,
     result_file: Path,
@@ -681,6 +929,7 @@ def archive_result(
     source_csv: str,
     start_manifest: Path,
     preflight_manifest: Path,
+    flight_file: Path | None = None,
 ) -> Path:
     """Archive one complete raw result and return its result-artifact path."""
     for label, component in (("run ID", run_id), ("category", category)):
@@ -695,6 +944,17 @@ def archive_result(
     solver_verdict = solver_verdict.lower()
     data = result_file.read_bytes()
     solver_log_data = solver_log_file.read_bytes()
+    if (
+        flight_file is not None
+        and flight_file.absolute() != Path(f"{result_file}.flight.json").absolute()
+    ):
+        raise ValueError("flight record is not adjacent to its result scratch file")
+    flight_record = _capture_flight_record(
+        flight_file,
+        category=category,
+        timeout_seconds=timeout_seconds,
+        solver_verdict=solver_verdict,
+    )
     lines = data.splitlines()
     first_line = b"".join(lines[0].split()).lower() if lines else b""
     if solver_verdict == "sat" and first_line != b"sat":
@@ -809,6 +1069,11 @@ def archive_result(
             raise ValueError(f"artifact verdict mismatch: {metadata_path}")
         if existing_metadata.get("solver_exit_status") != solver_exit_status:
             raise ValueError(f"artifact solver exit-status mismatch: {metadata_path}")
+        if (
+            existing_metadata.get("flight_record", {"status": "not_requested"})
+            != flight_record
+        ):
+            raise ValueError(f"artifact flight-record mismatch: {metadata_path}")
         existing_onnx = existing_metadata.get("onnx")
         existing_vnnlib = existing_metadata.get("vnnlib")
         if (
@@ -851,6 +1116,7 @@ def archive_result(
             "size_bytes": len(solver_log_data),
             "stream": "combined_stdout_stderr",
         },
+        "flight_record": flight_record,
         "input_hash_cache": cache_path.relative_to(artifact_root).as_posix(),
         "input_preflight": {
             "artifact": preflight_manifest.resolve()
@@ -911,6 +1177,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-csv", required=True)
     parser.add_argument("--start-manifest", type=Path, required=True)
     parser.add_argument("--preflight-manifest", type=Path, required=True)
+    parser.add_argument("--flight-file", type=Path)
     return parser
 
 
@@ -934,6 +1201,7 @@ def main() -> int:
         source_csv=args.source_csv,
         start_manifest=args.start_manifest,
         preflight_manifest=args.preflight_manifest,
+        flight_file=args.flight_file,
     )
     print(archived)
     return 0

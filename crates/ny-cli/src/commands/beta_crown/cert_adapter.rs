@@ -15,11 +15,13 @@
 //!
 //! ## Soundness / scope invariants
 //!
-//! * **The certificate NEVER changes the runtime verdict.** If we cannot
-//!   certify (ineligible architecture, exact-arithmetic overflow, or the
+//! * **Certificate emission NEVER upgrades the runtime verdict.** If we cannot
+//!   certify (ineligible architecture, a rational-arena failure, or the
 //!   property is above the exact plain-CROWN bound), we omit the sidecar and
-//!   log — the β-CROWN verdict remains the single source of truth. Emission is
-//!   wrapped so an adapter bug can only *fail to emit*, never abort a run.
+//!   log. The typed pre-verification artifact request may conservatively
+//!   disable a verdict-only proof lane whose proof cannot be exported.
+//!   Emission is wrapped so an adapter bug can only *fail to emit*, never abort
+//!   a run.
 //! * **The reconstructed claim is "safe ⟺ margin ≥ 0".** We fold the property's
 //!   threshold and direction into a scalar margin, then `certify(0)`. If we
 //!   picked the direction wrong, `certify` simply fails on a genuinely-safe
@@ -28,7 +30,7 @@
 //! * **Weights are converted to rationals EXACTLY** via their dyadic IEEE-754
 //!   value (no rounding), so the certificate attests the f32-realised network
 //!   the verifier actually ran on — it is faithful to the verified object.
-//! * **Emission is gated by [`ProofOpts`]:** ON by default, OFF in competition
+//! * **Emission is gated by `ProofOpts`:** ON by default, OFF in competition
 //!   mode (the VNN-COMP scored entry point), where the exact-arithmetic pass is
 //!   pure overhead.
 
@@ -44,51 +46,19 @@ use super::dispatch::DispatchContext;
 use super::BetaCrownModel;
 
 /// Upper bound on the total neuron count we attempt to certify. Exact rational
-/// CROWN over a large net risks i128 overflow and very large denominators;
-/// above this we skip (non-fatal). Pure-FC eligible categories (sat_relu,
-/// soundnessbench, small ACAS-style nets) sit well under this.
+/// CROWN over a large net can create very large intermediate values and consume
+/// excessive time/memory; above this we skip (non-fatal). Pure-FC eligible
+/// categories (sat_relu, soundnessbench, small ACAS-style nets) sit well under
+/// this.
 const MAX_CERT_NEURONS: usize = 8192;
 
 /// Convert an `f32` to its EXACT dyadic rational value (no rounding).
 ///
 /// IEEE-754 binary32 values are exactly dyadic (`m · 2^e`), so this is lossless.
-/// Returns `None` for non-finite inputs or when the value does not fit the
-/// rational's i128 numerator/denominator (extreme magnitudes / tiny
-/// subnormals) — the caller then skips certification (sound: no cert emitted).
+/// Returns `None` for non-finite inputs or a poisoned exact-rational arena; the
+/// caller then skips certification (sound: no cert emitted).
 fn f32_to_rat(f: f32) -> Option<Rat> {
-    if !f.is_finite() {
-        return None;
-    }
-    if f == 0.0 {
-        return Some(Rat::ZERO);
-    }
-    let bits = f.to_bits();
-    let sign: i128 = if bits >> 31 == 0 { 1 } else { -1 };
-    let exp_field = ((bits >> 23) & 0xff) as i32;
-    let frac = (bits & 0x007f_ffff) as i128;
-    // value = mantissa · 2^e2
-    let (mantissa, e2) = if exp_field == 0 {
-        // subnormal: value = frac · 2^(-126-23)
-        (frac, -126 - 23)
-    } else {
-        // normal: value = (2^23 + frac) · 2^(exp_field-127-23)
-        ((1i128 << 23) | frac, exp_field - 127 - 23)
-    };
-    let signed = sign * mantissa;
-    if e2 >= 0 {
-        if e2 > 100 {
-            return None; // would overflow i128
-        }
-        let num = signed.checked_mul(1i128 << e2)?;
-        Rat::new(num, 1).ok()
-    } else {
-        let shift = (-e2) as u32;
-        if shift > 120 {
-            return None; // denominator 2^shift would overflow i128
-        }
-        let den = 1i128.checked_shl(shift)?;
-        Rat::new(signed, den).ok()
-    }
+    Rat::from_f32_exact(f)
 }
 
 /// Convert a slice of `f32` to exact rationals, or `None` if any does not fit.
@@ -121,7 +91,7 @@ fn extract_fc_relu_stack(network: &ny_propagate::Network) -> Result<FcReluStack<
                 if expect_relu {
                     return Err("two Linear layers with no ReLU between them".to_string());
                 }
-                linears.push((&lin.weight, lin.bias.as_ref()));
+                linears.push((lin.weight(), lin.bias()));
                 expect_relu = true;
             }
             Layer::ReLU(_) => {
@@ -152,38 +122,10 @@ fn extract_fc_relu_stack(network: &ny_propagate::Network) -> Result<FcReluStack<
     })
 }
 
-/// Convert an `f64` to its EXACT dyadic rational value, or `None` if it does
-/// not fit i128 (extreme magnitude / tiny subnormal). VNN-LIB constants are
-/// parsed as `f64`; "nice" thresholds (0, 1, small decimals, ε values) fit.
+/// Convert an `f64` to its EXACT dyadic rational value. VNN-LIB constants are
+/// parsed as `f64`; non-finite values and a poisoned arena fail closed.
 fn f64_to_rat(f: f64) -> Option<Rat> {
-    if !f.is_finite() {
-        return None;
-    }
-    if f == 0.0 {
-        return Some(Rat::ZERO);
-    }
-    let bits = f.to_bits();
-    let sign: i128 = if bits >> 63 == 0 { 1 } else { -1 };
-    let exp_field = ((bits >> 52) & 0x7ff) as i32;
-    let frac = (bits & 0x000f_ffff_ffff_ffff) as i128;
-    let (mantissa, e2) = if exp_field == 0 {
-        (frac, -1022 - 52)
-    } else {
-        ((1i128 << 52) | frac, exp_field - 1023 - 52)
-    };
-    let signed = sign * mantissa;
-    if e2 >= 0 {
-        if e2 > 70 {
-            return None;
-        }
-        Rat::new(signed.checked_mul(1i128 << e2)?, 1).ok()
-    } else {
-        let shift = (-e2) as u32;
-        if shift > 120 {
-            return None;
-        }
-        Rat::new(signed, 1i128.checked_shl(shift)?).ok()
-    }
+    Rat::from_f64_exact(f)
 }
 
 /// A single linear output inequality `margin(x) > 0` whose truth over the whole
@@ -355,7 +297,7 @@ fn build_problem_for_margin(
 }
 
 /// Emit a proof-carrying certificate sidecar for a `Verified` verdict, if
-/// enabled by [`ProofOpts`] and the network/property are eligible.
+/// enabled by `ProofOpts` and the network/property are eligible.
 ///
 /// This is intentionally **infallible from the caller's perspective**: every
 /// failure path logs and returns, so it can never abort a verification run or
@@ -535,19 +477,25 @@ pub(super) fn maybe_emit_certificate(
         let entailment_json = match schema::entailment_to_json(&certified.entailment) {
             Ok(j) => j,
             Err(e) => {
-                info!("cert: skipped (entailment not i64-serialisable: {e})");
+                info!("cert: skipped (entailment not serialisable: {e})");
                 return;
             }
         };
         let farkas_json = match schema::farkas_to_json(&certified.farkas) {
             Ok(j) => j,
             Err(e) => {
-                info!("cert: skipped (farkas not i64-serialisable: {e})");
+                info!("cert: skipped (farkas not serialisable: {e})");
                 return;
             }
         };
 
-        let lb = &certified.lower_bound;
+        let lower_bound = match certified.lower_bound.checked_parts() {
+            Ok((num, den)) => format!("{num}/{den}"),
+            Err(e) => {
+                warn!("cert: skipped (exact lower bound not serialisable: {e})");
+                return;
+            }
+        };
         let payload = serde_json::json!({
             "format": "ny-cert/crown-deep/v1",
             "claim": format!(
@@ -557,7 +505,7 @@ pub(super) fn maybe_emit_certificate(
             "model": ctx.model_path.display().to_string(),
             "property": ctx.property.as_ref().map(|p| p.display().to_string()),
             "discharged_margin": margin.label,
-            "exact_lower_bound": format!("{}/{}", lb.num(), lb.den()),
+            "exact_lower_bound": lower_bound,
             "depth": problem.depth(),
             "entailment": entailment_json,
             "farkas": farkas_json,
@@ -577,11 +525,10 @@ pub(super) fn maybe_emit_certificate(
         };
         match std::fs::write(&out_path, text) {
             Ok(()) => info!(
-                "cert: wrote machine-checkable certificate (proves {}; {} hidden layers; exact bound {}/{}) to {}",
+                "cert: wrote machine-checkable certificate (proves {}; {} hidden layers; exact bound {}) to {}",
                 margin.label,
                 problem.depth(),
-                lb.num(),
-                lb.den(),
+                lower_bound,
                 out_path.display()
             ),
             Err(e) => warn!("cert: failed to write sidecar to {}: {e}", out_path.display()),
@@ -603,12 +550,9 @@ mod tests {
         assert_eq!(f32_to_rat(-0.25), Rat::new(-1, 4).ok());
         assert_eq!(f32_to_rat(3.0), Rat::new(3, 1).ok());
         // f32(0.1) = 13421773 / 2^27 exactly (the nearest binary32 to 0.1).
-        let r = f32_to_rat(0.1f32).expect("0.1 fits i128");
+        let r = f32_to_rat(0.1f32).expect("finite binary32 is exactly representable");
         // f32(0.1) is the already-reduced dyadic 13421773 / 2^27.
-        assert_eq!(
-            r,
-            Rat::new(13_421_773, 134_217_728).expect("dyadic fits i128")
-        );
+        assert_eq!(r, Rat::new(13_421_773, 134_217_728).expect("valid dyadic"));
         assert!(f32_to_rat(f32::INFINITY).is_none());
         assert!(f32_to_rat(f32::NAN).is_none());
     }
@@ -668,49 +612,74 @@ mod tests {
     #[test]
     fn proof_opts_resolves_competition_mode() {
         use crate::commands::beta_crown::ProofOpts;
+        use ny_propagate::VerificationArtifactAuthority;
+
         // Default: proof ON.
-        assert!(ProofOpts::default().should_emit_certificate());
+        let default = ProofOpts::default();
+        assert!(default.should_emit_certificate());
+        assert_eq!(
+            default.verification_artifact_authority(),
+            VerificationArtifactAuthority::CertificateExport
+        );
         // Competition mode: proof OFF.
-        assert!(!ProofOpts {
+        let competition = ProofOpts {
             competition_mode: true,
             ..Default::default()
-        }
-        .should_emit_certificate());
+        };
+        assert!(!competition.should_emit_certificate());
+        assert_eq!(
+            competition.verification_artifact_authority(),
+            VerificationArtifactAuthority::VerdictOnly
+        );
         // Explicit --emit-certificate wins over competition mode.
-        assert!(ProofOpts {
+        let forced_export = ProofOpts {
             competition_mode: true,
             emit_certificate: Some(true),
             ..Default::default()
-        }
-        .should_emit_certificate());
+        };
+        assert!(forced_export.should_emit_certificate());
+        assert_eq!(
+            forced_export.verification_artifact_authority(),
+            VerificationArtifactAuthority::CertificateExport
+        );
         // Explicit --no-certificate wins outside competition mode.
-        assert!(!ProofOpts {
+        let forced_verdict = ProofOpts {
             emit_certificate: Some(false),
             ..Default::default()
-        }
-        .should_emit_certificate());
+        };
+        assert!(!forced_verdict.should_emit_certificate());
+        assert_eq!(
+            forced_verdict.verification_artifact_authority(),
+            VerificationArtifactAuthority::VerdictOnly
+        );
     }
 
-    /// The GPU CROWN soundness gate is ENGAGED by default (#gpu-crown-sound-default):
-    /// a verifier decides no verdict on an unsound bound unless the user KNOWINGLY
-    /// opts into speed, and competition mode can never opt out.
+    /// The GPU CROWN soundness gate is unconditional; compatibility flags and
+    /// competition mode cannot disengage it.
     #[test]
     fn gpu_crown_gate_defaults_to_sound() {
         use crate::commands::beta_crown::ProofOpts;
         // Default interactive run: gate ON (sound).
         assert!(ProofOpts::default().sound_gpu_crown_required());
-        // Explicit speed opt-out: gate OFF (fast, unsound f32 GPU CROWN allowed).
-        assert!(!ProofOpts {
+        // The removed compatibility flag cannot weaken the gate.
+        assert!(ProofOpts {
             allow_unsound_gpu_crown: true,
             ..Default::default()
         }
         .sound_gpu_crown_required());
-        // Competition mode forces sound even if the (nonsensical here) opt-out is set.
+        // Competition mode is sound under the same unconditional policy.
         assert!(ProofOpts {
             competition_mode: true,
             allow_unsound_gpu_crown: true,
             ..Default::default()
         }
         .sound_gpu_crown_required());
+        let error = ProofOpts {
+            allow_unsound_gpu_crown: true,
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("the removed unsound opt-out must fail before verification work");
+        assert!(error.to_string().contains("is disabled"));
     }
 }

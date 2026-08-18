@@ -9,8 +9,8 @@ use tracing::debug;
 
 use super::super::{AttributeValue, ConvertContext, LayerSpec};
 use super::{
-    adjust_constant_slice_axis, lookup_constant_value, normalize_slice_bound,
-    parse_integral_constant_value, propagate_constant_through_layer, resolve_constant_axis,
+    adjust_constant_slice_axis, lookup_constant_value, lookup_integral_constant_values,
+    normalize_slice_bound, propagate_constant_through_layer, resolve_constant_axis,
 };
 
 impl ConvertContext<'_> {
@@ -54,32 +54,33 @@ impl ConvertContext<'_> {
         let axes: Vec<i64> = if let Some(AttributeValue::Ints(axes)) = spec.attributes.get("axes") {
             axes.clone()
         } else if spec.inputs.len() >= 2 {
-            let axes_tensor =
-                lookup_constant_value(self.weights, evaluated_constants, &spec.inputs[1])?;
-            axes_tensor.iter().map(|&value| value as i64).collect()
+            lookup_integral_constant_values(
+                self.weights,
+                evaluated_constants,
+                spec,
+                &spec.inputs[1],
+                "axis",
+                false,
+            )?
+            .0
         } else {
             return None;
         };
         let ndim = data.ndim();
         let mut resolved: Vec<usize> = axes
             .iter()
-            .filter_map(|&axis| {
-                let axis = if axis < 0 {
-                    (ndim as i64 + axis) as usize
-                } else {
-                    axis as usize
-                };
-                (axis < ndim && data.shape()[axis] == 1).then_some(axis)
+            .map(|&axis| {
+                let axis = resolve_constant_axis(spec, "Squeeze", ndim, axis)?;
+                (data.shape()[axis] == 1).then_some(axis)
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
         resolved.sort_unstable();
-        resolved.dedup();
+        if resolved.windows(2).any(|window| window[0] == window[1]) {
+            return None;
+        }
         let mut shape: Vec<usize> = data.shape().to_vec();
         for &axis in resolved.iter().rev() {
             shape.remove(axis);
-        }
-        if shape.is_empty() {
-            shape.push(1);
         }
         debug!(
             "Evaluating {} as Squeeze: {:?} -> {:?}",
@@ -107,10 +108,24 @@ impl ConvertContext<'_> {
         ) {
             (*axis, *start, *end)
         } else if spec.inputs.len() >= 3 {
-            let starts =
-                lookup_constant_value(self.weights, evaluated_constants, spec.inputs.get(1)?)?;
-            let ends =
-                lookup_constant_value(self.weights, evaluated_constants, spec.inputs.get(2)?)?;
+            let starts_name = spec.inputs.get(1)?;
+            let ends_name = spec.inputs.get(2)?;
+            let (starts, _) = lookup_integral_constant_values(
+                self.weights,
+                evaluated_constants,
+                spec,
+                starts_name,
+                "start",
+                false,
+            )?;
+            let (ends, _) = lookup_integral_constant_values(
+                self.weights,
+                evaluated_constants,
+                spec,
+                ends_name,
+                "end",
+                true,
+            )?;
             if starts.len() != 1 || ends.len() != 1 {
                 debug!(
                     "Slice {} constant evaluation only supports single-axis slicing",
@@ -120,7 +135,14 @@ impl ConvertContext<'_> {
             }
 
             let axis = if let Some(axis_name) = spec.inputs.get(3).filter(|name| !name.is_empty()) {
-                let axes = lookup_constant_value(self.weights, evaluated_constants, axis_name)?;
+                let (axes, _) = lookup_integral_constant_values(
+                    self.weights,
+                    evaluated_constants,
+                    spec,
+                    axis_name,
+                    "axis",
+                    false,
+                )?;
                 if axes.len() != 1 {
                     debug!(
                         "Slice {} constant evaluation only supports one axis entry",
@@ -128,13 +150,20 @@ impl ConvertContext<'_> {
                     );
                     return None;
                 }
-                parse_integral_constant_value(spec, "axis", axes.iter().next().copied()?, false)?
+                axes[0]
             } else {
                 0
             };
 
             if let Some(step_name) = spec.inputs.get(4).filter(|name| !name.is_empty()) {
-                let steps = lookup_constant_value(self.weights, evaluated_constants, step_name)?;
+                let (steps, _) = lookup_integral_constant_values(
+                    self.weights,
+                    evaluated_constants,
+                    spec,
+                    step_name,
+                    "step",
+                    false,
+                )?;
                 if steps.len() != 1 {
                     debug!(
                         "Slice {} constant evaluation only supports one step entry",
@@ -142,12 +171,7 @@ impl ConvertContext<'_> {
                     );
                     return None;
                 }
-                let step = parse_integral_constant_value(
-                    spec,
-                    "step",
-                    steps.iter().next().copied()?,
-                    false,
-                )?;
+                let step = steps[0];
                 if step != 1 {
                     debug!(
                         "Slice {} constant evaluation only supports step=1 (got {})",
@@ -157,16 +181,7 @@ impl ConvertContext<'_> {
                 }
             }
 
-            (
-                axis,
-                parse_integral_constant_value(
-                    spec,
-                    "start",
-                    starts.iter().next().copied()?,
-                    false,
-                )?,
-                parse_integral_constant_value(spec, "end", ends.iter().next().copied()?, true)?,
-            )
+            (axis, starts[0], ends[0])
         } else {
             return None;
         };
@@ -241,8 +256,14 @@ impl ConvertContext<'_> {
             return None;
         }
         let data = lookup_constant_value(self.weights, evaluated_constants, &spec.inputs[0])?;
-        let indices_raw =
-            lookup_constant_value(self.weights, evaluated_constants, &spec.inputs[1])?;
+        let (indices_raw, indices_shape) = lookup_integral_constant_values(
+            self.weights,
+            evaluated_constants,
+            spec,
+            &spec.inputs[1],
+            "index",
+            false,
+        )?;
 
         let onnx_axis = spec
             .attributes
@@ -257,16 +278,7 @@ impl ConvertContext<'_> {
         let axis_len = data.shape()[axis] as i64;
 
         let mut indices_i64 = Vec::with_capacity(indices_raw.len());
-        for &v in indices_raw.iter() {
-            if !v.is_finite() {
-                debug!(
-                    "Gather {} indices contain NaN/Inf at value {}",
-                    spec.name, v
-                );
-                return None;
-            }
-            let rounded = v.round();
-            let idx = rounded as i64;
+        for idx in indices_raw {
             let normalized = if idx < 0 { axis_len + idx } else { idx };
             if normalized < 0 || normalized >= axis_len {
                 debug!(
@@ -278,7 +290,7 @@ impl ConvertContext<'_> {
             indices_i64.push(normalized as usize);
         }
 
-        if indices_raw.shape().is_empty() {
+        if indices_shape.is_empty() {
             if indices_i64.len() != 1 {
                 debug!(
                     "Gather {} scalar indices expected 1 element, got {}",
@@ -292,10 +304,9 @@ impl ConvertContext<'_> {
         }
 
         let selected = data.select(Axis(axis), &indices_i64);
-        let mut output_shape =
-            Vec::with_capacity(data.shape().len() - 1 + indices_raw.shape().len());
+        let mut output_shape = Vec::with_capacity(data.shape().len() - 1 + indices_shape.len());
         output_shape.extend_from_slice(&data.shape()[..axis]);
-        output_shape.extend_from_slice(indices_raw.shape());
+        output_shape.extend_from_slice(&indices_shape);
         output_shape.extend_from_slice(&data.shape()[axis + 1..]);
 
         debug!(
@@ -303,7 +314,7 @@ impl ConvertContext<'_> {
             spec.name,
             axis,
             data.shape(),
-            indices_raw.shape(),
+            indices_shape,
             output_shape
         );
 
@@ -323,42 +334,60 @@ impl ConvertContext<'_> {
         // The input must have a known static shape in tensor_shapes.
         let input_name = spec.inputs.first()?;
         let input_shape = self.tensor_shapes.get(input_name)?;
+        // Non-positive dimensions are ny's unresolved-shape markers. Folding
+        // one into a literal Shape tensor would replace its runtime extent
+        // with -1/0 and corrupt downstream shape expressions.
+        if input_shape.iter().any(|&dim| dim <= 0) {
+            debug!(
+                "Shape {} constant evaluation declined for dynamic shape {:?}",
+                spec.name, input_shape
+            );
+            return None;
+        }
 
         // Convert the shape to a 1-D f32 array (matching ONNX Shape output dtype).
         // ONNX Shape opset>=15 supports optional start/end attributes for range slicing.
-        let start = spec
+        let raw_start = spec
             .attributes
             .get("start")
             .and_then(|value| match value {
                 AttributeValue::Int(v) => Some(*v),
                 _ => None,
             })
-            .unwrap_or(0) as usize;
-        let end = spec
+            .unwrap_or(0);
+        let raw_end = spec
             .attributes
             .get("end")
             .and_then(|value| match value {
                 AttributeValue::Int(v) => Some(*v),
                 _ => None,
             })
-            .unwrap_or(input_shape.len() as i64) as usize;
+            .unwrap_or(input_shape.len() as i64);
 
-        let end = end.min(input_shape.len());
-        if start > end || start >= input_shape.len() {
-            debug!(
-                "Shape {} constant evaluation: invalid range start={} end={} for shape len={}",
-                spec.name,
-                start,
-                end,
-                input_shape.len()
-            );
-            return None;
+        // Shape-15 normalizes negative bounds relative to the input rank, then
+        // clamps both endpoints into [0, rank]. Saturating addition also keeps
+        // hostile INT64_MIN attributes from overflowing in debug builds.
+        let rank = input_shape.len() as i64;
+        let normalize_bound = |bound: i64| {
+            if bound < 0 {
+                rank.saturating_add(bound).clamp(0, rank)
+            } else {
+                bound.min(rank)
+            }
+        };
+        let start = normalize_bound(raw_start) as usize;
+        let end = normalize_bound(raw_end) as usize;
+        if start > end {
+            return ArrayD::from_shape_vec(IxDyn(&[0]), Vec::new()).ok();
         }
 
         let shape_slice: Vec<f32> = input_shape[start..end]
             .iter()
-            .map(|&dim| dim as f32)
-            .collect();
+            .map(|&dim| {
+                super::super::i64_to_f32_checked(dim, &format!("Shape {} dimension", spec.name))
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()?;
         debug!(
             "Evaluating Shape {} -> {:?} (dims {} to {})",
             spec.name, shape_slice, start, end
@@ -383,12 +412,18 @@ impl ConvertContext<'_> {
             }
             axes[0]
         } else if spec.inputs.len() >= 2 {
-            let axes_tensor =
-                lookup_constant_value(self.weights, evaluated_constants, &spec.inputs[1])?;
-            if axes_tensor.len() != 1 {
+            let (axes, _) = lookup_integral_constant_values(
+                self.weights,
+                evaluated_constants,
+                spec,
+                &spec.inputs[1],
+                "axis",
+                false,
+            )?;
+            if axes.len() != 1 {
                 return None;
             }
-            axes_tensor.iter().next().copied()? as i64
+            axes[0]
         } else {
             return None;
         };
@@ -422,9 +457,14 @@ impl ConvertContext<'_> {
         spec: &LayerSpec,
         evaluated_constants: &HashMap<String, ArrayD<f32>>,
     ) -> Option<ArrayD<f32>> {
-        // Cast: identity for f32 bounds (all computation is in f32).
-        // Just return the input as-is.
-        if spec.inputs.is_empty() {
+        // Only an ONNX Cast *to* FLOAT32 is an identity in NY's f32 carrier.
+        // Integer, boolean, and lower-precision targets change values and must
+        // not be materialized by copying the source tensor.
+        if spec.inputs.len() != 1
+            || spec.outputs.len() != 1
+            || spec.attributes.len() != 1
+            || !matches!(spec.attributes.get("to"), Some(AttributeValue::Int(1)))
+        {
             return None;
         }
         lookup_constant_value(self.weights, evaluated_constants, &spec.inputs[0])
@@ -441,23 +481,6 @@ impl ConvertContext<'_> {
             let layer = self.convert_layer(spec).ok()?;
             if let Some(output) = propagate_constant_through_layer(&layer, input, &spec.name) {
                 return Some(output);
-            }
-        }
-        if spec.inputs.is_empty() {
-            if let Some(AttributeValue::Float(value)) = spec.attributes.get("value") {
-                if let Some(shape) = self.tensor_shapes.get(&spec.outputs[0]) {
-                    let shape_usize: Vec<usize> = shape
-                        .iter()
-                        .filter_map(|&dim| if dim > 0 { Some(dim as usize) } else { None })
-                        .collect();
-                    if shape_usize.len() == shape.len() {
-                        debug!(
-                            "Evaluating {} as constant fill(shape={:?}, value={})",
-                            spec.name, shape_usize, value
-                        );
-                        return Some(ArrayD::from_elem(IxDyn(&shape_usize), *value));
-                    }
-                }
             }
         }
         debug!(

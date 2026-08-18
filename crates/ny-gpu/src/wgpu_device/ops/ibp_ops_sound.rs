@@ -166,14 +166,16 @@ impl WgpuDevice {
         k: usize,
         n: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let kk = k + 3;
+        let kk = k.checked_add(3).ok_or_else(|| {
+            ny_core::NyError::InvalidSpec("matmul sound reduction length overflow".into())
+        })?;
         let params = MatmulIbpSoundParams {
             batch_size: gpu_checked_u32(batch, "matmul sound batch")?,
             m: gpu_checked_u32(m, "matmul sound m")?,
             k: gpu_checked_u32(k, "matmul sound k")?,
             n: gpu_checked_u32(n, "matmul sound n")?,
-            gamma_k: gamma_k_f32(kk),
-            slack: combine_slack_f32(kk),
+            gamma_k: gamma_k_f32(kk)?,
+            slack: combine_slack_f32(kk)?,
             additive: ftz_safe_underflow_floor(gpu_checked_u32(kk, "matmul sound k+3")?),
             _pad: 0,
         };
@@ -347,8 +349,8 @@ impl WgpuDevice {
             pad_h: gpu_checked_u32(pad_h, "avgpool sound p_h")?,
             pad_w: gpu_checked_u32(pad_w, "avgpool sound p_w")?,
             count_include_pad: u32::from(count_include_pad),
-            gamma_k: gamma_k_f32(kk),
-            slack: combine_slack_f32(kk),
+            gamma_k: gamma_k_f32(kk)?,
+            slack: combine_slack_f32(kk)?,
             additive: ftz_safe_underflow_floor(gpu_checked_u32(kk, "avgpool sound k")?),
         };
         let pipe = &self.ibp_sound_pipelines().avgpool;

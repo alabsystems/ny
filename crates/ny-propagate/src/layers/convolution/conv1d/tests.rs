@@ -4,7 +4,7 @@
 
 use ny_core::{NaiveCpuGemmEngine, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
-use ny_test_utils::CountingGemmEngine;
+use ny_test_utils::{assert_bounded_tensor_close, CountingGemmEngine};
 
 use super::*;
 use crate::layers::common::BoundPropagation;
@@ -925,6 +925,27 @@ fn conv1d_output_length_underflow_returns_error() -> Result<()> {
     Ok(())
 }
 
+#[ntest::timeout(10000)]
+#[test]
+fn conv1d_output_length_checked_arithmetic_rejects_overflow() -> Result<()> {
+    let kernel = ArrayD::from_elem(IxDyn(&[1, 1, 2]), 1.0_f32);
+    let conv = Conv1dLayer::new_full(kernel.clone(), None, 1, 0, usize::MAX, 1)?;
+    assert!(
+        matches!(conv.output_length(2), Err(NyError::InvalidSpec(_))),
+        "Conv1d effective-kernel overflow must return an error"
+    );
+
+    let transpose = ConvTranspose1dLayer::new_full(kernel, None, usize::MAX, 0, usize::MAX, 1)?;
+    assert!(
+        matches!(
+            transpose.output_length(usize::MAX),
+            Err(NyError::InvalidSpec(_))
+        ),
+        "ConvTranspose1d expanded-length overflow must return an error"
+    );
+    Ok(())
+}
+
 /// Regression test for #2828: Conv1d valid stride=1 is accepted.
 #[ntest::timeout(10000)]
 #[test]
@@ -1235,6 +1256,91 @@ fn conv1d_out_channels_not_divisible_by_groups_rejected() {
     assert!(
         matches!(err, NyError::InvalidSpec(ref msg) if msg.contains("divisible")),
         "expected InvalidSpec about divisibility, got: {err:?}"
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv1d_zero_kernel_dimensions_rejected() {
+    for shape in [[0, 1, 1], [1, 0, 1], [1, 1, 0]] {
+        let kernel = ArrayD::zeros(IxDyn(&shape));
+        let error = Conv1dLayer::new_full(kernel, None, 1, 0, 1, 1)
+            .expect_err("zero Conv1d kernel dimension must be rejected");
+        assert!(
+            matches!(error, NyError::InvalidSpec(ref message) if message.contains("nonzero")),
+            "expected nonzero-dimension error for {shape:?}, got {error:?}"
+        );
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn conv1d_total_input_channels_overflow_rejected() {
+    let kernel = ArrayD::zeros(IxDyn(&[1, 2, 1]));
+    let error = Conv1dLayer::new_full(kernel, None, 1, 0, 1, usize::MAX)
+        .expect_err("total input-channel overflow must be rejected");
+    assert!(
+        matches!(error, NyError::InvalidSpec(ref message) if message.contains("overflow")),
+        "expected input-channel overflow error, got {error:?}"
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn convtranspose1d_zero_kernel_dimensions_rejected() {
+    for shape in [[0, 1, 1], [1, 0, 1], [1, 1, 0]] {
+        let kernel = ArrayD::zeros(IxDyn(&shape));
+        let error = ConvTranspose1dLayer::new_full(kernel, None, 1, 0, 1, 1)
+            .expect_err("zero ConvTranspose1d kernel dimension must be rejected");
+        assert!(
+            matches!(error, NyError::InvalidSpec(ref message) if message.contains("nonzero")),
+            "expected nonzero-dimension error for {shape:?}, got {error:?}"
+        );
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_conv1d_revalidates_publicly_mutable_geometry() {
+    let input =
+        BoundedTensor::concrete(ArrayD::zeros(IxDyn(&[1, 1]))).expect("concrete input bounds");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    let mut conv =
+        Conv1dLayer::new_full(ArrayD::zeros(IxDyn(&[1, 2, 1])), None, 1, 0, 1, 1).expect("conv");
+    conv.groups = usize::MAX;
+    let conv_error = conv
+        .propagate_ibp_with_engine_and_deadline(&input, None, Some(deadline))
+        .expect_err("mutated Conv1d geometry must return a structured error");
+    assert!(
+        matches!(conv_error, NyError::InvalidSpec(ref message) if message.contains("overflow")),
+        "expected Conv1d geometry overflow, got {conv_error:?}"
+    );
+    let conv_sound_error = conv
+        .propagate_ibp_sound_with_engine(&input, None)
+        .expect_err("sound Conv1d must revalidate mutated geometry without a deadline");
+    assert!(
+        matches!(conv_sound_error, NyError::InvalidSpec(ref message) if message.contains("overflow")),
+        "expected sound Conv1d geometry overflow, got {conv_sound_error:?}"
+    );
+
+    let mut transpose =
+        ConvTranspose1dLayer::new_full(ArrayD::zeros(IxDyn(&[1, 2, 1])), None, 1, 0, 1, 1)
+            .expect("transpose");
+    transpose.groups = usize::MAX;
+    let transpose_error = transpose
+        .propagate_ibp_with_engine_and_deadline(&input, None, Some(deadline))
+        .expect_err("mutated ConvTranspose1d geometry must return a structured error");
+    assert!(
+        matches!(transpose_error, NyError::InvalidSpec(ref message) if message.contains("divisible")),
+        "expected ConvTranspose1d geometry error, got {transpose_error:?}"
+    );
+    let transpose_sound_error = transpose
+        .propagate_ibp_sound_with_engine(&input, None)
+        .expect_err("sound ConvTranspose1d must revalidate mutated geometry without a deadline");
+    assert!(
+        matches!(transpose_sound_error, NyError::InvalidSpec(ref message) if message.contains("divisible")),
+        "expected sound ConvTranspose1d geometry error, got {transpose_sound_error:?}"
     );
 }
 
@@ -1654,6 +1760,526 @@ fn assert_linear_bounds_parity(
             with_engine.upper_b[r],
         );
     }
+}
+
+#[test]
+fn finite_deadline_conv1d_paths_refuse_generic_engine_and_preserve_parity() -> Result<()> {
+    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    for (label, baseline, finite, calls) in {
+        let conv = make_conv1d(2.0, Some(0.25), 3);
+        let conv_bounds = LinearBounds::identity(3);
+        let conv_baseline = conv
+            .propagate_linear_with_engine(&conv_bounds, None)?
+            .into_owned();
+        let conv_engine = CountingGemmEngine::new();
+        let conv_finite = conv
+            .propagate_linear_with_engine_and_deadline(&conv_bounds, Some(&conv_engine), deadline)?
+            .into_owned();
+
+        let transpose = make_convtranspose1d(-1.5, Some(0.5), 3);
+        let transpose_bounds = LinearBounds::identity(3);
+        let transpose_baseline = transpose
+            .propagate_linear_with_engine(&transpose_bounds, None)?
+            .into_owned();
+        let transpose_engine = CountingGemmEngine::new();
+        let transpose_finite = transpose
+            .propagate_linear_with_engine_and_deadline(
+                &transpose_bounds,
+                Some(&transpose_engine),
+                deadline,
+            )?
+            .into_owned();
+        [
+            (
+                "Conv1d finite deadline",
+                conv_baseline,
+                conv_finite,
+                conv_engine.gemm_calls(),
+            ),
+            (
+                "ConvTranspose1d finite deadline",
+                transpose_baseline,
+                transpose_finite,
+                transpose_engine.gemm_calls(),
+            ),
+        ]
+    } {
+        assert_eq!(
+            calls, 0,
+            "{label}: finite deadline must not enter caller GemmEngine"
+        );
+        assert_linear_bounds_parity(&baseline, &finite, TOL, label);
+    }
+
+    let expired = Some(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("Instant epoch is at least one millisecond old"),
+    );
+    let engine = CountingGemmEngine::new();
+    let conv_error = make_conv1d(1.0, None, 3)
+        .propagate_linear_with_engine_and_deadline(
+            &LinearBounds::identity(3),
+            Some(&engine),
+            expired,
+        )
+        .expect_err("expired Conv1d authority must refuse before dispatch");
+    assert!(matches!(conv_error, NyError::DeadlineExceeded(_)));
+    let transpose_error = make_convtranspose1d(1.0, None, 3)
+        .propagate_linear_with_engine_and_deadline(
+            &LinearBounds::identity(3),
+            Some(&engine),
+            expired,
+        )
+        .expect_err("expired ConvTranspose1d authority must refuse before dispatch");
+    assert!(matches!(transpose_error, NyError::DeadlineExceeded(_)));
+    assert_eq!(engine.gemm_calls(), 0);
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_conv1d_ibp_refuses_generic_engine_and_preserves_parity() -> Result<()> {
+    let lower = ArrayD::from_shape_vec(
+        IxDyn(&[2, 6]),
+        (0..12).map(|i| -1.0 + i as f32 * 0.05).collect(),
+    )
+    .expect("lower");
+    let upper = ArrayD::from_shape_vec(
+        IxDyn(&[2, 6]),
+        (0..12).map(|i| 0.5 + i as f32 * 0.1).collect(),
+    )
+    .expect("upper");
+    let input = BoundedTensor::new(lower, upper)?;
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[2, 2, 3]),
+        vec![
+            0.5, -0.25, 0.75, -0.1, 0.2, 0.3, -0.4, 0.6, 0.1, 0.8, -0.5, 0.25,
+        ],
+    )
+    .expect("kernel");
+    let conv = Conv1dLayer::new_full(kernel.clone(), Some(array![0.2_f32, -0.3]), 1, 1, 1, 1)?;
+    let transpose =
+        ConvTranspose1dLayer::new_full(kernel, Some(array![0.1_f32, -0.2]), 1, 1, 1, 1)?;
+    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+
+    let conv_expected = conv.propagate_ibp_sound_with_engine(&input, None)?;
+    let conv_engine = CountingGemmEngine::new();
+    let conv_actual =
+        conv.propagate_ibp_sound_with_engine_and_deadline(&input, Some(&conv_engine), deadline)?;
+    assert_eq!(
+        conv_engine.gemm_calls(),
+        0,
+        "finite Conv1d IBP must refuse the generic engine"
+    );
+    assert_bounded_tensor_close(
+        &conv_actual,
+        &conv_expected,
+        1e-4,
+        "finite Conv1d certified IBP",
+    );
+
+    let transpose_expected = transpose.propagate_ibp_sound_with_engine(&input, None)?;
+    let transpose_engine = CountingGemmEngine::new();
+    let transpose_actual = transpose.propagate_ibp_sound_with_engine_and_deadline(
+        &input,
+        Some(&transpose_engine),
+        deadline,
+    )?;
+    assert_eq!(
+        transpose_engine.gemm_calls(),
+        0,
+        "finite ConvTranspose1d IBP must refuse the generic engine"
+    );
+    assert_bounded_tensor_close(
+        &transpose_actual,
+        &transpose_expected,
+        1e-4,
+        "finite ConvTranspose1d certified IBP",
+    );
+
+    let historical_engine = CountingGemmEngine::new();
+    conv.propagate_ibp_sound_with_engine_and_deadline(&input, Some(&historical_engine), None)?;
+    assert!(
+        historical_engine.gemm_calls() > 0,
+        "deadline=None must preserve historical Conv1d engine dispatch"
+    );
+
+    let expired = Some(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("Instant supports a 1ms subtraction"),
+    );
+    let expired_engine = CountingGemmEngine::new();
+    let conv_error = conv
+        .propagate_ibp_sound_with_engine_and_deadline(&input, Some(&expired_engine), expired)
+        .expect_err("expired Conv1d IBP must abort");
+    assert!(matches!(conv_error, NyError::DeadlineExceeded(_)));
+    let transpose_error = transpose
+        .propagate_ibp_sound_with_engine_and_deadline(&input, Some(&expired_engine), expired)
+        .expect_err("expired ConvTranspose1d IBP must abort");
+    assert!(matches!(transpose_error, NyError::DeadlineExceeded(_)));
+    assert_eq!(expired_engine.gemm_calls(), 0);
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_batched_grouped_dilated_conv1d_ibp_matches_historical() -> Result<()> {
+    let lower = ArrayD::from_shape_vec(
+        IxDyn(&[2, 2, 7]),
+        (0..28).map(|i| -0.8 + i as f32 * 0.025).collect(),
+    )
+    .expect("lower");
+    let upper = ArrayD::from_shape_vec(
+        IxDyn(&[2, 2, 7]),
+        (0..28).map(|i| 0.4 + i as f32 * 0.04).collect(),
+    )
+    .expect("upper");
+    let input = BoundedTensor::new(lower, upper)?;
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[2, 1, 3]), vec![0.5, -0.25, 0.75, -0.4, 0.6, 0.1])
+        .expect("kernel");
+    let conv = Conv1dLayer::new_full(kernel.clone(), Some(array![0.2_f32, -0.3]), 1, 2, 2, 2)?;
+    let transpose =
+        ConvTranspose1dLayer::new_full(kernel, Some(array![0.1_f32, -0.2]), 1, 2, 2, 2)?;
+    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let engine = CountingGemmEngine::new();
+
+    let conv_expected = conv.propagate_ibp_sound_with_engine(&input, None)?;
+    let conv_actual =
+        conv.propagate_ibp_sound_with_engine_and_deadline(&input, Some(&engine), deadline)?;
+    assert_bounded_tensor_close(
+        &conv_actual,
+        &conv_expected,
+        1e-4,
+        "finite batched grouped dilated Conv1d IBP",
+    );
+
+    let transpose_expected = transpose.propagate_ibp_sound_with_engine(&input, None)?;
+    let transpose_actual =
+        transpose.propagate_ibp_sound_with_engine_and_deadline(&input, Some(&engine), deadline)?;
+    assert_bounded_tensor_close(
+        &transpose_actual,
+        &transpose_expected,
+        1e-4,
+        "finite batched grouped dilated ConvTranspose1d IBP",
+    );
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite batched grouped 1D convolutions must refuse the generic engine"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_conv1d_ibp_keeps_certified_cancellation_enclosure() -> Result<()> {
+    let input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[1, 3]), vec![1.0_f32; 3]).expect("Conv1d input"),
+    )?;
+    let conv = Conv1dLayer::new_full(
+        ArrayD::from_shape_vec(
+            IxDyn(&[1, 1, 3]),
+            vec![16_777_216.0_f32, 1.0, -16_777_216.0],
+        )
+        .expect("Conv1d kernel"),
+        None,
+        1,
+        0,
+        1,
+        1,
+    )?;
+    let engine = CountingGemmEngine::new();
+    let finite = conv.propagate_ibp_sound_with_engine_and_deadline(
+        &input,
+        Some(&engine),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+    )?;
+    assert_eq!(engine.gemm_calls(), 0);
+    assert!(
+        finite.lower()[[0, 0]] <= 1.0 && finite.upper()[[0, 0]] >= 1.0,
+        "finite Conv1d certified bounds must enclose the exact sum 1.0, got [{}, {}]",
+        finite.lower()[[0, 0]],
+        finite.upper()[[0, 0]]
+    );
+
+    let transpose_input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[3, 1]), vec![1.0_f32; 3]).expect("ConvTranspose1d input"),
+    )?;
+    let transpose = ConvTranspose1dLayer::new_full(
+        ArrayD::from_shape_vec(
+            IxDyn(&[3, 1, 1]),
+            vec![16_777_216.0_f32, 1.0, -16_777_216.0],
+        )
+        .expect("ConvTranspose1d kernel"),
+        None,
+        1,
+        0,
+        1,
+        1,
+    )?;
+    let transpose_engine = CountingGemmEngine::new();
+    let finite = transpose.propagate_ibp_sound_with_engine_and_deadline(
+        &transpose_input,
+        Some(&transpose_engine),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+    )?;
+    assert_eq!(transpose_engine.gemm_calls(), 0);
+    assert!(
+        finite.lower()[[0, 0]] <= 1.0 && finite.upper()[[0, 0]] >= 1.0,
+        "finite ConvTranspose1d certified bounds must enclose the exact sum 1.0, got [{}, {}]",
+        finite.lower()[[0, 0]],
+        finite.upper()[[0, 0]]
+    );
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn certified_conv1d_ibp_encloses_product_underflow_with_or_without_deadline() -> Result<()> {
+    // Each exact product is 2^-150, below the binary32 subnormal midpoint.
+    // Five terms sum to 5*2^-150 = 2.5*2^-149, which the old relative-only
+    // Higham certificate excluded after both y and S rounded/flushed to zero.
+    let x = f32::MIN_POSITIVE; // 2^-126, normal: DAZ cannot erase the source.
+    let w = f32::from_bits(103_u32 << 23); // 2^-24, normal.
+    let exact_product = f64::from_bits((1_023_u64 - 150) << 52);
+    let exact_sum = 5.0_f64 * exact_product;
+
+    let conv_input = BoundedTensor::concrete(ArrayD::from_elem(IxDyn(&[1, 5]), x))?;
+    let conv = Conv1dLayer::new_full(ArrayD::from_elem(IxDyn(&[1, 1, 5]), w), None, 1, 0, 1, 1)?;
+    let plain = conv.propagate_ibp(&conv_input)?;
+    assert_eq!(plain.lower()[[0, 0]], 0.0);
+    assert_eq!(plain.upper()[[0, 0]], 0.0);
+    for deadline in [
+        None,
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+    ] {
+        let certified =
+            conv.propagate_ibp_sound_with_engine_and_deadline(&conv_input, None, deadline)?;
+        assert!(
+            f64::from(certified.lower()[[0, 0]]) <= exact_sum
+                && f64::from(certified.upper()[[0, 0]]) >= exact_sum,
+            "Conv1d [1,1,5] certificate excluded exact 5*2^-150: [{}, {}]",
+            certified.lower()[[0, 0]],
+            certified.upper()[[0, 0]]
+        );
+    }
+
+    let transpose_input = BoundedTensor::concrete(ArrayD::from_elem(IxDyn(&[5, 1]), x))?;
+    let transpose =
+        ConvTranspose1dLayer::new_full(ArrayD::from_elem(IxDyn(&[5, 1, 1]), w), None, 1, 0, 1, 1)?;
+    let plain = transpose.propagate_ibp(&transpose_input)?;
+    assert_eq!(plain.lower()[[0, 0]], 0.0);
+    assert_eq!(plain.upper()[[0, 0]], 0.0);
+    for deadline in [
+        None,
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+    ] {
+        let certified = transpose.propagate_ibp_sound_with_engine_and_deadline(
+            &transpose_input,
+            None,
+            deadline,
+        )?;
+        assert!(
+            f64::from(certified.lower()[[0, 0]]) <= exact_sum
+                && f64::from(certified.upper()[[0, 0]]) >= exact_sum,
+            "ConvTranspose1d [5,1,1] certificate excluded exact 5*2^-150: [{}, {}]",
+            certified.lower()[[0, 0]],
+            certified.upper()[[0, 0]]
+        );
+    }
+    Ok(())
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_non_depthwise_grouped_stride2_conv1d_ibp_matches_historical() -> Result<()> {
+    const BATCH: usize = 2;
+    const IN_CHANNELS: usize = 4;
+    const OUT_CHANNELS: usize = 6;
+    const GROUPS: usize = 2;
+
+    let conv_input = BoundedTensor::new(
+        ArrayD::from_shape_vec(
+            IxDyn(&[BATCH, IN_CHANNELS, 11]),
+            (0..BATCH * IN_CHANNELS * 11)
+                .map(|index| -1.0 + index as f32 * 0.005)
+                .collect(),
+        )
+        .expect("Conv1d grouped lower"),
+        ArrayD::from_shape_vec(
+            IxDyn(&[BATCH, IN_CHANNELS, 11]),
+            (0..BATCH * IN_CHANNELS * 11)
+                .map(|index| 0.25 + index as f32 * 0.01)
+                .collect(),
+        )
+        .expect("Conv1d grouped upper"),
+    )?;
+    let conv_kernel = ArrayD::from_shape_vec(
+        IxDyn(&[OUT_CHANNELS, IN_CHANNELS / GROUPS, 3]),
+        (0..OUT_CHANNELS * (IN_CHANNELS / GROUPS) * 3)
+            .map(|index| (index as f32 - 17.0) * 0.04)
+            .collect(),
+    )
+    .expect("Conv1d grouped kernel");
+    let conv = Conv1dLayer::new_full(
+        conv_kernel,
+        Some(array![0.1_f32, -0.2, 0.3, -0.4, 0.5, -0.6]),
+        2,
+        1,
+        1,
+        GROUPS,
+    )?;
+
+    let transpose_input = BoundedTensor::new(
+        ArrayD::from_shape_vec(
+            IxDyn(&[BATCH, IN_CHANNELS, 6]),
+            (0..BATCH * IN_CHANNELS * 6)
+                .map(|index| -0.75 + index as f32 * 0.01)
+                .collect(),
+        )
+        .expect("ConvTranspose1d grouped lower"),
+        ArrayD::from_shape_vec(
+            IxDyn(&[BATCH, IN_CHANNELS, 6]),
+            (0..BATCH * IN_CHANNELS * 6)
+                .map(|index| 0.5 + index as f32 * 0.015)
+                .collect(),
+        )
+        .expect("ConvTranspose1d grouped upper"),
+    )?;
+    let transpose_kernel = ArrayD::from_shape_vec(
+        IxDyn(&[IN_CHANNELS, OUT_CHANNELS / GROUPS, 3]),
+        (0..IN_CHANNELS * (OUT_CHANNELS / GROUPS) * 3)
+            .map(|index| (13.0 - index as f32) * 0.035)
+            .collect(),
+    )
+    .expect("ConvTranspose1d grouped kernel");
+    let transpose = ConvTranspose1dLayer::new_full(
+        transpose_kernel,
+        Some(array![0.2_f32, -0.1, 0.4, -0.3, 0.6, -0.5]),
+        2,
+        1,
+        1,
+        GROUPS,
+    )?;
+
+    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let engine = CountingGemmEngine::new();
+    let conv_expected = conv.propagate_ibp_sound_with_engine(&conv_input, None)?;
+    let conv_actual =
+        conv.propagate_ibp_sound_with_engine_and_deadline(&conv_input, Some(&engine), deadline)?;
+    assert_bounded_tensor_close(
+        &conv_actual,
+        &conv_expected,
+        1e-4,
+        "non-depthwise groups=2 stride=2 Conv1d certified IBP",
+    );
+
+    let transpose_expected = transpose.propagate_ibp_sound_with_engine(&transpose_input, None)?;
+    let transpose_actual = transpose.propagate_ibp_sound_with_engine_and_deadline(
+        &transpose_input,
+        Some(&engine),
+        deadline,
+    )?;
+    assert_bounded_tensor_close(
+        &transpose_actual,
+        &transpose_expected,
+        1e-4,
+        "non-depthwise groups=2 stride=2 ConvTranspose1d certified IBP",
+    );
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite non-depthwise grouped stride-2 paths must refuse the generic engine"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn finite_deadline_large_conv1d_ibp_work_aborts_cooperatively() -> Result<()> {
+    const CHANNELS: usize = 16;
+    const INPUT_LEN: usize = 8_192;
+    const KERNEL_LEN: usize = 15;
+    let input = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[CHANNELS, INPUT_LEN])),
+        ArrayD::ones(IxDyn(&[CHANNELS, INPUT_LEN])),
+    )?;
+    let kernel = ArrayD::ones(IxDyn(&[CHANNELS, CHANNELS, KERNEL_LEN]));
+    let conv = Conv1dLayer::new_full(kernel.clone(), None, 1, 0, 1, 1)?;
+    let transpose = ConvTranspose1dLayer::new_full(kernel, None, 1, 0, 1, 1)?;
+    let engine = CountingGemmEngine::new();
+
+    let conv_error = conv
+        .propagate_ibp_sound_with_engine_and_deadline(
+            &input,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(2)),
+        )
+        .expect_err("large Conv1d work must observe its finite deadline");
+    assert!(matches!(conv_error, NyError::DeadlineExceeded(_)));
+
+    let transpose_error = transpose
+        .propagate_ibp_sound_with_engine_and_deadline(
+            &input,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(2)),
+        )
+        .expect_err("large ConvTranspose1d work must observe its finite deadline");
+    assert!(matches!(transpose_error, NyError::DeadlineExceeded(_)));
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite large Conv1d work must never enter the generic engine"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn finite_deadline_zero_output_channel_convtranspose1d_polls_input_traversal() {
+    const INPUT_LEN: usize = 1_000_000;
+    let lower = ArrayD::zeros(IxDyn(&[1, INPUT_LEN]));
+    let upper = ArrayD::ones(IxDyn(&[1, INPUT_LEN]));
+    let kernel = ArrayD::zeros(IxDyn(&[1, 0, 1]));
+
+    let started = std::time::Instant::now();
+    let ordinary_error = conv1d_transpose_ibp_forward_with_deadline(
+        lower.view(),
+        upper.view(),
+        &kernel,
+        1,
+        0,
+        1,
+        1,
+        std::time::Instant::now() + std::time::Duration::from_millis(2),
+    )
+    .expect_err("zero-output-channel ordinary scatter must poll input traversal");
+    assert!(matches!(ordinary_error, NyError::DeadlineExceeded(_)));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "ordinary zero-output-channel traversal did not abort promptly"
+    );
+
+    let started = std::time::Instant::now();
+    let certified_error = conv1d_transpose_ibp_certified_forward(
+        lower.view(),
+        upper.view(),
+        &kernel,
+        None,
+        1,
+        0,
+        1,
+        1,
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(2)),
+    )
+    .expect_err("zero-output-channel certified scatter must poll input traversal");
+    assert!(matches!(certified_error, NyError::DeadlineExceeded(_)));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "certified zero-output-channel traversal did not abort promptly"
+    );
 }
 
 /// Conv1d CROWN backward: engine=None matches engine=Some(NaiveCpuGemmEngine).

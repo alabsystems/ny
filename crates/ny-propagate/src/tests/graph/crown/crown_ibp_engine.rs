@@ -214,8 +214,12 @@ fn test_crown_ibp_dag_engine_parity_simple_3549() {
         let (graph, input) = build_two_linear_relu_graph();
 
         let baseline = graph.collect_crown_ibp_bounds_dag(&input).unwrap();
+        // Clone resets the input-keyed collection cache so the engine-aware
+        // call cannot reuse the baseline's engine-agnostic entry.
+        #[allow(clippy::redundant_clone)]
+        let engine_graph = graph.clone();
         let engine = CountingGemmEngine::new();
-        let with_engine = graph
+        let with_engine = engine_graph
             .collect_crown_ibp_bounds_dag_with_engine(&input, Some(&engine))
             .unwrap();
 
@@ -242,8 +246,12 @@ fn test_crown_ibp_dag_deadline_engine_parity_simple_3549() {
         let baseline = graph
             .collect_crown_ibp_bounds_dag_with_deadline(&input, deadline)
             .unwrap();
+        // Clone resets the input-keyed collection cache so the engine-aware
+        // call cannot reuse the baseline's engine-agnostic entry.
+        #[allow(clippy::redundant_clone)]
+        let engine_graph = graph.clone();
         let engine = CountingGemmEngine::new();
-        let with_engine = graph
+        let with_engine = engine_graph
             .collect_crown_ibp_bounds_dag_with_deadline_and_engine(&input, deadline, Some(&engine))
             .unwrap();
 
@@ -264,6 +272,10 @@ fn test_crown_ibp_dag_deadline_engine_parity_simple_3549() {
 
 /// #3718/#3499 regression: the engine-aware precomputed-IBP collector used by the
 /// ECAPA stage-local helper must preserve bounds and provenance on Conv1d DAGs.
+///
+/// Generic `GemmEngine` implementations have no cooperative-deadline contract,
+/// so engine dispatch is exercised without a deadline. Finite-deadline refusal
+/// is covered by the Conv1d layer deadline tests.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_dag_precomputed_engine_parity_conv1d_3718() {
@@ -272,18 +284,18 @@ fn test_crown_ibp_dag_precomputed_engine_parity_conv1d_3718() {
 
         let ibp_bounds = graph.collect_node_bounds(&input).unwrap();
         let baseline = graph
-            .collect_crown_ibp_bounds_dag_with_precomputed_ibp(
-                &input,
-                ibp_bounds.clone(),
-                Some(Instant::now() + Duration::from_mins(1)),
-            )
+            .collect_crown_ibp_bounds_dag_with_precomputed_ibp(&input, ibp_bounds.clone(), None)
             .unwrap();
+        // Clone resets the input-keyed collection cache so the engine-aware
+        // call cannot reuse the baseline's engine-agnostic entry.
+        #[allow(clippy::redundant_clone)]
+        let engine_graph = graph.clone();
         let engine = CountingGemmEngine::new();
-        let with_engine = graph
+        let with_engine = engine_graph
             .collect_crown_ibp_bounds_dag_with_precomputed_ibp_and_engine(
                 &input,
                 ibp_bounds,
-                Some(Instant::now() + Duration::from_mins(1)),
+                None,
                 Some(&engine),
             )
             .unwrap();
@@ -315,6 +327,10 @@ fn test_crown_ibp_dag_precomputed_engine_parity_conv1d_3718() {
 
 /// #3811 regression: width-threshold precomputed CROWN-IBP must still thread
 /// the supplied engine instead of hardcoding the CPU-only collector path.
+///
+/// Generic `GemmEngine` implementations have no cooperative-deadline contract,
+/// so engine dispatch is exercised without a deadline. Finite-deadline refusal
+/// is covered by the Conv1d layer deadline tests.
 #[ntest::timeout(10000)]
 #[test]
 fn test_crown_ibp_dag_precomputed_width_threshold_engine_parity_conv1d_3811() {
@@ -326,7 +342,7 @@ fn test_crown_ibp_dag_precomputed_width_threshold_engine_parity_conv1d_3811() {
             .collect_crown_ibp_bounds_dag_with_precomputed_ibp_and_width_threshold(
                 &input,
                 ibp_bounds.clone(),
-                Some(Instant::now() + Duration::from_mins(1)),
+                None,
                 0.0,
             )
             .unwrap();
@@ -335,7 +351,7 @@ fn test_crown_ibp_dag_precomputed_width_threshold_engine_parity_conv1d_3811() {
             .collect_crown_ibp_bounds_dag_with_precomputed_ibp_and_engine_and_width_threshold(
                 &input,
                 ibp_bounds,
-                Some(Instant::now() + Duration::from_mins(1)),
+                None,
                 Some(&engine),
                 0.0,
             )
@@ -382,8 +398,12 @@ fn test_crown_ibp_dag_engine_parity_two_block_ffn_3549() {
         let input = BoundedTensor::from_epsilon(ArrayD::zeros(IxDyn(&[hidden])), epsilon).unwrap();
 
         let baseline = graph.collect_crown_ibp_bounds_dag(&input).unwrap();
+        // Clone resets the input-keyed collection cache so the engine-aware
+        // call cannot reuse the baseline's engine-agnostic entry.
+        #[allow(clippy::redundant_clone)]
+        let engine_graph = graph.clone();
         let engine = CountingGemmEngine::new();
-        let with_engine = graph
+        let with_engine = engine_graph
             .collect_crown_ibp_bounds_dag_with_engine(&input, Some(&engine))
             .unwrap();
 

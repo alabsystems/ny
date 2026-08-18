@@ -375,30 +375,34 @@ fn mul_up(a: f64, b: f64) -> f64 {
 }
 
 fn next_down_f64(value: f64) -> f64 {
-    if value.is_nan() || value == f64::NEG_INFINITY {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > f64::INFINITY.to_bits() || bits == f64::NEG_INFINITY.to_bits() {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return -f64::from_bits(1);
     }
-    if value > 0.0 {
-        f64::from_bits(value.to_bits() - 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits - 1)
     } else {
-        f64::from_bits(value.to_bits() + 1)
+        f64::from_bits(bits + 1)
     }
 }
 
 fn next_up_f64(value: f64) -> f64 {
-    if value.is_nan() || value == f64::INFINITY {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > f64::INFINITY.to_bits() || bits == f64::INFINITY.to_bits() {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    if value > 0.0 {
-        f64::from_bits(value.to_bits() + 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits + 1)
     } else {
-        f64::from_bits(value.to_bits() - 1)
+        f64::from_bits(bits - 1)
     }
 }
 
@@ -428,7 +432,7 @@ mod tests {
     use num_traits::ToPrimitive;
 
     fn exact(value: f32) -> BigRational {
-        BigRational::from_float(f64::from(value)).expect("finite f32")
+        BigRational::from_float(value).expect("finite f32")
     }
 
     fn exact_dual_min(
@@ -688,35 +692,5 @@ mod tests {
         .expect_err("expiry at the final row poll must refuse the result");
         assert!(err.to_string().contains("row completion"));
         assert_eq!(polls, 2);
-    }
-
-    /// Diagnostic cost model for the proposed TinyImageNet selective lane:
-    /// eight domains, twenty objectives, four same-layer split constraints,
-    /// and a 3x64x64 input. Ignored in the normal suite; run explicitly with
-    /// `cargo test -p ny-propagate tiny_selective_certificate_cost -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "diagnostic Tiny-shaped cost benchmark"]
-    fn tiny_selective_certificate_cost() {
-        let (batch, rows, constraints, dim) = (8usize, 20usize, 4usize, 3 * 64 * 64);
-        let lo = Array2::from_elem((batch, dim), -1.0f32).into_dyn();
-        let hi = Array2::from_elem((batch, dim), 1.0f32).into_dyn();
-        let objective = Array3::from_shape_fn((batch, rows, dim), |(_, r, j)| {
-            (((r * 17 + j * 13) % 31) as f32 - 15.0) / 256.0
-        })
-        .into_dyn();
-        let a = Array3::from_shape_fn((batch, constraints, dim), |(b, k, j)| {
-            (((b * 11 + k * 7 + j * 5) % 23) as f32 - 11.0) / 512.0
-        });
-        let bias = Array2::from_elem((batch, constraints), -0.25f32);
-        let beta = Array3::from_elem((batch, rows, constraints), 0.125f32);
-        let started = Instant::now();
-        let result = certify_dual_witness(&lo, &hi, &objective, &a, &bias, &beta, -1.0, None)
-            .expect("synthetic Tiny certificate");
-        eprintln!(
-            "tiny-selective certificate: batch={batch} rows={rows} constraints={constraints} dim={dim} elapsed={:.3}s",
-            started.elapsed().as_secs_f64()
-        );
-        assert_eq!(result.shape(), &[batch, rows]);
-        assert!(result.iter().all(|v| v.is_finite()));
     }
 }

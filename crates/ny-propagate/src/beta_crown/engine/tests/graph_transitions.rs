@@ -583,7 +583,7 @@ fn test_multi_objective_depth_increments() -> Result<()> {
     Ok(())
 }
 
-/// Multi-objective with_constraint returns None for non-ReLU node.
+/// Multi-objective with_constraint fails closed for a non-ReLU split node.
 #[ntest::timeout(10000)]
 #[test]
 fn test_multi_objective_rejects_non_relu() -> Result<()> {
@@ -596,10 +596,12 @@ fn test_multi_objective_rejects_non_relu() -> Result<()> {
         score: 1.0,
     };
 
+    let error = root
+        .with_constraint(&graph, bad, true, &thresholds)
+        .expect_err("multi-objective constraint on a linear node must fail");
     assert!(
-        root.with_constraint(&graph, bad, true, &thresholds)?
-            .is_none(),
-        "multi-objective constraint on linear node should return None"
+        matches!(error, ny_core::NyError::InternalError(_)),
+        "structural split inconsistency must be an internal error: {error}"
     );
     Ok(())
 }

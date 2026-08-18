@@ -32,7 +32,10 @@ pub struct GroupNormLayer {
     pub num_groups: usize,
     /// Small constant for numerical stability
     pub eps: f32,
-    /// Use forward mode for IBP: compute mean/std from center point.
+    /// Use forward mode for IBP: compute mean/std from the center point.
+    ///
+    /// This is a heuristic analysis mode and is not admitted as proof
+    /// authority; use conservative IBP for certified verification.
     /// Default: false (use conservative IBP)
     pub forward_mode: bool,
     /// CROWN linearization mode.

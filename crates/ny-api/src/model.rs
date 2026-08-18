@@ -28,5 +28,6 @@ pub use ny_build::Network as NetworkSpec;
 pub use ny_build::{
     AttributeValue, CompoundNodePolicy, DataType, GraphModel, GraphModelBuilder,
     GraphNetworkOptions, LayerSpec, MissingOutputPolicy, TensorSpec, WeightRef, WeightStore,
+    EXPAND_LIVE_SHAPE_REFERENCE_ATTR,
 };
 pub use ny_core::LayerType;

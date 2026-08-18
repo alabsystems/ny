@@ -15,6 +15,7 @@ use super::eval::{
     gelu_derivative_tanh_f64, gelu_erf_f64, gelu_tanh_f64, gelu_tanh_inflection_point,
 };
 use super::GeluApproximation;
+use ny_core::{f32_affine_eval_error, f64_to_f32_down, f64_to_f32_up};
 use ny_tensor::{next_down_f32, next_up_f32};
 
 /// sqrt(2) constant used for case-splitting in GELU relaxation.
@@ -382,12 +383,11 @@ pub(crate) fn gelu_tangent_at(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
     // The f32 slope differs from f64 by up to 1 ULP. Over the interval [-max_abs_x, max_abs_x],
     // this contributes at most |slope64 - slope_f32| * max_abs_x to the bound error.
     let slope_f32 = slope64 as f32;
-    let slope_err = next_up_f32(((slope64 - slope_f32 as f64).abs() * max_abs_x as f64) as f32);
-    let intercept_f32 = intercept64 as f32;
+    let eval_err = f32_affine_eval_error(slope64, slope_f32, intercept64, max_abs_x);
     (
         slope_f32,
-        next_down_f32(intercept_f32 - slope_err),
-        next_up_f32(intercept_f32 + slope_err),
+        next_down_f32(f64_to_f32_down(intercept64 - eval_err)),
+        next_up_f32(f64_to_f32_up(intercept64 + eval_err)),
     )
 }
 
@@ -402,12 +402,11 @@ pub(crate) fn gelu_tanh_tangent_at(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
     let intercept64 = gelu_tanh_f64(d64) - slope64 * d64;
 
     let slope_f32 = slope64 as f32;
-    let slope_err = next_up_f32(((slope64 - slope_f32 as f64).abs() * max_abs_x as f64) as f32);
-    let intercept_f32 = intercept64 as f32;
+    let eval_err = f32_affine_eval_error(slope64, slope_f32, intercept64, max_abs_x);
     (
         slope_f32,
-        next_down_f32(intercept_f32 - slope_err),
-        next_up_f32(intercept_f32 + slope_err),
+        next_down_f32(f64_to_f32_down(intercept64 - eval_err)),
+        next_up_f32(f64_to_f32_up(intercept64 + eval_err)),
     )
 }
 

@@ -256,8 +256,9 @@ pub(crate) fn bounded_kokoro_features_input_centered(
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_kokoro_vocoder_fixture_contract_fallback_matches_constants_3917() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     assert_eq!(
         kokoro_vocoder_min_fixed_aux_t(),
         KOKORO_VOCODER_MIN_FIXED_AUX_T,

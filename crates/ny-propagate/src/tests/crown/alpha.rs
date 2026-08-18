@@ -279,13 +279,176 @@ fn test_alpha_crown_invprop_gamma_ascent_reaches_infeasibility() {
         bounds_on.lower()[[0]],
         bounds_on.upper()[[0]]
     );
-    // Optimization OFF: gamma stays 0 => feasible baseline [5,6], no false HOLD.
+    // Optimization OFF: gamma stays 0 => feasible baseline [0,1], no false HOLD.
     assert!(
         bounds_off.lower()[[0]] <= bounds_off.upper()[[0]] + 1e-4,
         "gamma=0 must stay feasible (no infeasibility): got [{}, {}]",
         bounds_off.lower()[[0]],
         bounds_off.upper()[[0]]
     );
+}
+
+/// A feasible assume-violation iterate is conditional evidence, not a global
+/// output box. Native sequential alpha-CROWN must retain only unconditioned
+/// iterates unless the conditional region is proved infeasible.
+#[ntest::timeout(30000)]
+#[test]
+fn test_native_invprop_nonempty_region_preserves_box_soundness() {
+    let mut network = Network::new();
+    network.add_layer(Layer::Linear(
+        LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).unwrap(),
+    ));
+    network.add_layer(Layer::ReLU(ReLULayer));
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    // {relu(x) <= 0.5} is nonempty and proper inside the full output range [0, 1].
+    let constraints = OutputConstraints::new(arr2(&[[1.0]]), arr1(&[0.5]), true).unwrap();
+    let config = AlphaCrownConfig {
+        iterations: 8,
+        invprop: InvpropConfig {
+            enabled: true,
+            optimize_gammas: true,
+            gamma_lr: 0.5,
+            ..Default::default()
+        },
+        output_constraints: Some(constraints),
+        ..Default::default()
+    };
+
+    let bounds =
+        NetworkAlphaCrownExt::propagate_alpha_crown_with_config_impl(&network, &input, &config)
+            .unwrap();
+    for i in 0..=100 {
+        let x = -1.0 + 2.0 * i as f32 / 100.0;
+        let y = x.max(0.0);
+        assert!(
+            y >= bounds.lower()[[0]] - 1e-5 && y <= bounds.upper()[[0]] + 1e-5,
+            "relu({x})={y} outside [{}, {}]",
+            bounds.lower()[[0]],
+            bounds.upper()[[0]],
+        );
+    }
+}
+
+/// Pure-linear native networks must not take the historical no-ReLU CROWN
+/// early return when output-seed INVPROP is admissible. The conjunction below
+/// is individually feasible row-by-row but jointly empty:
+/// `x <= -0.5 && -x <= -0.5` on `x in [-1, 1]`.
+#[ntest::timeout(30000)]
+#[test]
+fn test_native_pure_linear_invprop_proves_coupled_empty_region() {
+    let mut network = Network::new();
+    network.add_layer(Layer::Linear(
+        LinearLayer::new(arr2(&[[1.0], [-1.0]]), Some(arr1(&[0.0, 0.0]))).unwrap(),
+    ));
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    let constraints = OutputConstraints::new(Array2::eye(2), arr1(&[-0.5, -0.5]), true).unwrap();
+    let config = AlphaCrownConfig {
+        iterations: 20,
+        invprop: InvpropConfig {
+            enabled: true,
+            optimize_gammas: true,
+            gamma_lr: 2.0,
+            ..Default::default()
+        },
+        output_constraints: Some(constraints),
+        ..Default::default()
+    };
+
+    let bounds =
+        NetworkAlphaCrownExt::propagate_alpha_crown_with_config_impl(&network, &input, &config)
+            .unwrap();
+    assert!(
+        bounds
+            .lower()
+            .iter()
+            .zip(bounds.upper())
+            .any(|(l, u)| l > u),
+        "pure-linear INVPROP should certify the empty coupled region, got {:?}",
+        bounds
+    );
+}
+
+/// A feasible conditioned gamma iterate is not a global output enclosure. This
+/// pure-linear route must return the unconditioned box unless it obtains a typed
+/// finite-inversion proof.
+#[ntest::timeout(30000)]
+#[test]
+fn test_native_pure_linear_invprop_nonempty_region_preserves_global_box() {
+    let mut network = Network::new();
+    network.add_layer(Layer::Linear(
+        LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).unwrap(),
+    ));
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    let constraints = OutputConstraints::le_threshold(1, 0, 0.25).unwrap();
+    let config = AlphaCrownConfig {
+        iterations: 20,
+        invprop: InvpropConfig {
+            enabled: true,
+            optimize_gammas: true,
+            gamma_lr: 2.0,
+            ..Default::default()
+        },
+        output_constraints: Some(constraints),
+        ..Default::default()
+    };
+
+    let bounds =
+        NetworkAlphaCrownExt::propagate_alpha_crown_with_config_impl(&network, &input, &config)
+            .unwrap();
+    assert!(bounds.lower()[[0]] <= bounds.upper()[[0]]);
+    for i in 0..=100 {
+        let x = -1.0 + 2.0 * i as f32 / 100.0;
+        assert!(
+            x >= bounds.lower()[[0]] - 1.0e-5 && x <= bounds.upper()[[0]] + 1.0e-5,
+            "x={x} outside returned global [{}, {}]",
+            bounds.lower()[[0]],
+            bounds.upper()[[0]]
+        );
+    }
+}
+
+/// `LayerGammas.gammas` is public optimizer state. A malformed leading axis
+/// must fail closed at every native production fold site instead of panicking
+/// while slicing the absent upper-gamma plane.
+#[ntest::timeout(10000)]
+#[test]
+fn test_native_invprop_malformed_gamma_bound_axis_fails_closed() {
+    let mut network = Network::new();
+    network.add_layer(Layer::Linear(
+        LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).unwrap(),
+    ));
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+    let layer_bounds = network.collect_crown_ibp_bounds(&input).unwrap();
+    let mut malformed_state = AlphaState::from_preactivation_bounds(&[], &[]).unwrap();
+    malformed_state
+        .init_invprop_state(OutputConstraints::le_threshold(1, 0, 0.25).unwrap(), 1)
+        .unwrap();
+    let mut malformed = LayerGammas::new(1, 1, false);
+    malformed.gammas = ndarray::Array3::zeros((1, 1, 1));
+    let invprop = malformed_state.invprop_mut().unwrap();
+    invprop.add_layer_gammas(invprop::INVPROP_OUTPUT_SEED.to_string(), malformed.clone());
+    invprop.add_layer_gammas("/layer.0".to_string(), malformed.clone());
+    invprop.add_layer_gammas(NETWORK_INPUT.to_string(), malformed);
+
+    let malformed_bounds = NetworkAlphaCrownExt::propagate_alpha_crown_single_pass_impl(
+        &network,
+        &input,
+        &layer_bounds,
+        &malformed_state,
+        None,
+    )
+    .unwrap();
+    let baseline_state = AlphaState::from_preactivation_bounds(&[], &[]).unwrap();
+    let baseline_bounds = NetworkAlphaCrownExt::propagate_alpha_crown_single_pass_impl(
+        &network,
+        &input,
+        &layer_bounds,
+        &baseline_state,
+        None,
+    )
+    .unwrap();
+    assert_eq!(malformed_bounds.lower(), baseline_bounds.lower());
+    assert_eq!(malformed_bounds.upper(), baseline_bounds.upper());
 }
 
 /// Regression for #1803/#2977: α-CROWN ReLU NaN guard now rejects non-finite

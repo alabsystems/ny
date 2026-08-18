@@ -55,8 +55,9 @@ fn kokoro_prefix_region_spec(
 /// Part of #3520 Packet D.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_kokoro_prefix_training_signal_smoke_3520() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let dynamic_t = KOKORO_VOCODER_MIN_FIXED_AUX_T;
     let epsilon = 1e-3;
     let model = load_kokoro_vocoder_with_fixed_aux(dynamic_t);
@@ -135,8 +136,9 @@ fn test_kokoro_prefix_training_signal_smoke_3520() {
 /// Part of #3520 Packet D.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_kokoro_prefix_training_signal_ranking_3520() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let dynamic_t = KOKORO_VOCODER_MIN_FIXED_AUX_T;
     let model = load_kokoro_vocoder_with_fixed_aux(dynamic_t);
 

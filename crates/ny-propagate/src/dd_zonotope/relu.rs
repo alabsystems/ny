@@ -53,6 +53,7 @@
 
 use ny_core::dd::{dd_add_f64, dd_mul_f64, next_up_f64, U_DD, U_F64};
 
+use super::affine::{affine_underflow_operation_counts, operation_underflow_floor};
 use super::state::{err_up, DdZono};
 
 /// Fold a relaxation term into the interval channel when it is no larger than
@@ -88,7 +89,17 @@ pub(crate) struct RelaxOutcome {
 /// Returns `None` when any certified bound is non-finite (the certificate is
 /// then meaningless and the caller must refuse, never publish).
 pub(crate) fn apply_relu(z: &mut DdZono) -> Option<RelaxOutcome> {
+    if !z.has_valid_layout() {
+        return None;
+    }
     let n = z.numel();
+    // A crossing ReLU rescales every live generator and performs two
+    // double-double center operations. Reuse the conservative one-term affine
+    // budgets so aggregate subnormal products cannot vanish from the channel.
+    let (center_operations, generator_operations) =
+        affine_underflow_operation_counts(1, z.n_gens()).ok()?;
+    let center_underflow = operation_underflow_floor(center_operations).ok()?;
+    let generator_underflow = operation_underflow_floor(generator_operations).ok()?;
     let rad = z.radius();
     let (lo, up) = z.concretize_with_radius(&rad);
     // Fold budget: the NON-RADIUS half-width actually used by the
@@ -128,10 +139,13 @@ pub(crate) fn apply_relu(z: &mut DdZono) -> Option<RelaxOutcome> {
         z.center[i] = newc;
         // lam * ec transports the incoming center error (contraction, lam<=1);
         // U_DD * (|c| + 2mu) pays for the two double-double ops just performed.
-        let mut ec_i = err_up(lam * z.ec[i] + U_DD * (abs_c + 2.0 * mu));
+        let crossing = lam > 0.0 && lam < 1.0;
+        let center_floor = if crossing { center_underflow } else { 0.0 };
+        let generator_floor = if crossing { generator_underflow } else { 0.0 };
+        let mut ec_i = err_up(lam * z.ec[i] + U_DD * (abs_c + 2.0 * mu) + center_floor);
         // lam * eg transports the generator error; U_F64 * lam * rad pays for
         // the f64 rounding of the `gens[j][i] *= lam` rescale below.
-        let eg_i = err_up(lam * z.eg[i] + U_F64 * lam * rad[i]);
+        let eg_i = err_up(lam * z.eg[i] + U_F64 * lam * rad[i] + generator_floor);
 
         if mu > 0.0 {
             if mu <= FOLD_RATIO * err[i] {

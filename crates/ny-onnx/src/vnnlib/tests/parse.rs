@@ -145,22 +145,18 @@ fn test_parse_acasxu_property() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_load_real_vnnlib() {
-    // Try to load an actual VNN-LIB file if available
-    let test_paths = [
-        "../../research/repos/nnenum/examples/test/test_prop.vnnlib",
-        "../../research/repos/nnenum/examples/acasxu/data/prop_2.vnnlib",
-    ];
-
-    for path in test_paths {
-        let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-        if full_path.exists() {
-            let spec = load_vnnlib(&full_path).unwrap();
-            assert!(spec.num_inputs > 0);
-            assert!(spec.num_outputs > 0);
-            assert!(spec.has_valid_bounds());
-            println!("Loaded {}: {}", path, spec.describe());
-        }
-    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/models/acasxu_prop2.vnnlib");
+    assert!(
+        path.is_file(),
+        "tracked VNN-LIB test fixture is missing at {}",
+        path.display()
+    );
+    let spec = load_vnnlib(&path).unwrap();
+    assert!(spec.num_inputs > 0);
+    assert!(spec.num_outputs > 0);
+    assert!(spec.has_valid_bounds());
+    println!("Loaded {}: {}", path.display(), spec.describe());
 }
 
 #[ntest::timeout(10000)]

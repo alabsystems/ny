@@ -14,7 +14,7 @@
 //!
 //! Part of #3463
 
-use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
+use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesLinearBounds};
 use crate::layers::common::PatchesPropagation;
 use crate::layers::convolution::conv2d::Conv2dLayer;
 use crate::layers::BoundPropagation;
@@ -91,9 +91,11 @@ fn test_conv2d_patches_backward_identity_creates_kernel_patches() {
         lower_patches[[1, 0, 1, 0, 0, 0]]
     );
 
-    // Stride and padding should match the conv
-    assert_eq!(result.lower_a.stride, (1, 1));
-    assert_eq!(result.lower_a.padding, (0, 0, 0, 0));
+    // Geometry should match the conv.
+    assert_eq!(
+        result.lower_a.geometry,
+        PatchGeometry::affine((1, 1), (0, 0, 0, 0))
+    );
 
     // Identity is cleared
     assert!(!result.lower_a.identity);
@@ -264,9 +266,10 @@ fn test_conv2d_patches_backward_stride_composition() {
         panic!("expected Patches output");
     };
 
-    // Stride should be (2, 2) from the conv
-    assert_eq!(result.lower_a.stride, (2, 2));
-    assert_eq!(result.upper_a.stride, (2, 2));
+    // Stride should be (2, 2) from the conv.
+    let expected_geometry = PatchGeometry::affine((2, 2), (0, 0, 0, 0));
+    assert_eq!(result.lower_a.geometry, expected_geometry);
+    assert_eq!(result.upper_a.geometry, expected_geometry);
 
     // Patches shape: (1, 2, 2, 1, 1, 1) — kernel is 1x1
     let patches = result.lower_a.patches.as_ref().expect("patches");
@@ -293,7 +296,10 @@ fn test_conv2d_patches_backward_padding_composition() {
     // Either way, verify the result is valid
     match result {
         CrownBounds::Patches(ref pb) => {
-            assert_eq!(pb.lower_a.padding, (1, 1, 1, 1));
+            assert_eq!(
+                pb.lower_a.geometry,
+                PatchGeometry::affine((1, 1), (1, 1, 1, 1))
+            );
         }
         CrownBounds::Dense(ref lb) => {
             // Dense fallback is expected when kernel covers entire input.
@@ -301,6 +307,25 @@ fn test_conv2d_patches_backward_padding_composition() {
             assert_eq!(lb.lower_a.shape(), &[9, 9]);
         }
     }
+}
+
+#[test]
+fn test_conv2d_patches_typed_refuses_anchored_geometry() {
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![1.0_f32]).unwrap();
+    let mut conv = Conv2dLayer::new(kernel, None, (1, 1), (0, 0)).unwrap();
+    conv.set_input_shape(2, 2);
+    let mut bounds = PatchesLinearBounds::identity((1, 2, 2), (1, 2, 2));
+    let anchored = PatchGeometry::anchored(vec![0, 1], vec![0, 1]).unwrap();
+    bounds.lower_a.geometry = anchored.clone();
+    bounds.upper_a.geometry = anchored;
+
+    let error = conv
+        .propagate_patches(&bounds)
+        .expect_err("Conv2d is not yet implemented for anchored geometry");
+    assert!(matches!(
+        error,
+        ny_core::NyError::UnsupportedConfiguration(_)
+    ));
 }
 
 #[test]
@@ -400,13 +425,9 @@ fn test_conv2d_patches_backward_grouped_non_identity_spatial_dense_parity() {
             .shape(),
         &[2, 2, 2, 4, 4, 4]
     );
-    assert_eq!(
-        (
-            patches_after_both.lower_a.stride,
-            patches_after_both.upper_a.stride
-        ),
-        ((2, 2), (2, 2))
-    );
+    let expected_geometry = PatchGeometry::affine((2, 2), (0, 0, 0, 0));
+    assert_eq!(patches_after_both.lower_a.geometry, expected_geometry);
+    assert_eq!(patches_after_both.upper_a.geometry, expected_geometry);
     let patches_dense = patches_after_both.to_dense().unwrap();
 
     assert_linear_bounds_close(&dense_after_both, &patches_dense, 1e-6, "grouped_spatial");
@@ -448,7 +469,7 @@ fn test_conv2d_patches_backward_multi_row_dense_parity_3813() {
 /// `out_c % groups != 0` makes `out_c_per_group = out_c / groups` truncate so that
 /// `group_idx = oc / out_c_per_group` exceeds `groups - 1`, pushing the derived
 /// input-channel index `ic = group_idx * in_c_per_group + ic_local` past `in_c`
-/// and panicking on `patches[[.., ic, ..]]`. With the guard it is a ShapeMismatch.
+/// and panicking on `patches[[.., ic, ..]]`. With the guard it is an InvalidSpec.
 #[test]
 fn test_conv2d_patches_inconsistent_groups_out_c_not_divisible_returns_error() {
     // Valid 4-out, groups=2 layer: kernel (4, 2, 1, 1), in_c = 2*2 = 4.
@@ -465,13 +486,13 @@ fn test_conv2d_patches_inconsistent_groups_out_c_not_divisible_returns_error() {
     let identity_bounds = PatchesLinearBounds::identity((4, 2, 2), (4, 2, 2));
     let result = conv.propagate_patches(&identity_bounds);
     assert!(
-        matches!(result, Err(ny_core::NyError::ShapeMismatch { .. })),
-        "expected ShapeMismatch for non-divisible groups, got {result:?}"
+        matches!(result, Err(ny_core::NyError::InvalidSpec(_))),
+        "expected InvalidSpec for non-divisible groups, got {result:?}"
     );
 }
 
 /// Crash guard: `groups == 0` would divide by zero at `out_c / groups`. The guard
-/// must reject it with a clean ShapeMismatch instead of panicking.
+/// must reject it with a clean InvalidSpec instead of panicking.
 #[test]
 fn test_conv2d_patches_inconsistent_groups_zero_returns_error() {
     let kernel = ArrayD::from_shape_vec(IxDyn(&[2, 1, 1, 1]), vec![1.0_f32, 2.0]).unwrap();
@@ -482,7 +503,7 @@ fn test_conv2d_patches_inconsistent_groups_zero_returns_error() {
     let identity_bounds = PatchesLinearBounds::identity((2, 2, 2), (1, 2, 2));
     let result = conv.propagate_patches(&identity_bounds);
     assert!(
-        matches!(result, Err(ny_core::NyError::ShapeMismatch { .. })),
-        "expected ShapeMismatch for groups == 0, got {result:?}"
+        matches!(result, Err(ny_core::NyError::InvalidSpec(_))),
+        "expected InvalidSpec for groups == 0, got {result:?}"
     );
 }

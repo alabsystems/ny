@@ -2,7 +2,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
 use ny_propagate::layers::GatherLayer;
 use ny_propagate::Layer;
@@ -67,11 +66,11 @@ impl ConvertContext<'_> {
         let mut indices_shape: Vec<usize> = Vec::new();
         let mut indices_shape_unknown = false;
 
-        if let Some(indices_arr) = self.weights.get(indices_name) {
+        if let Some(indices_arr) =
+            self.discrete_constant_i64(indices_name, &format!("Gather {} indices", spec.name))?
+        {
             indices_shape = indices_arr.shape().to_vec();
-            indices = Some(parse_indices_i64(indices_arr).map_err(|e| {
-                NyError::ModelLoad(format!("Gather {} indices error: {}", spec.name, e))
-            })?);
+            indices = Some(indices_arr);
             debug!(
                 "Converting Gather '{}' with constant indices shape {:?}",
                 spec.name, indices_shape
@@ -135,17 +134,14 @@ impl ConvertContext<'_> {
             return Ok(None);
         }
 
-        let indices_arr = match self.weights.get(indices_name) {
+        let indices_arr = match self.discrete_constant_i64(
+            indices_name,
+            &format!("Gather {} runtime shape-query indices", spec.name),
+        )? {
             Some(arr) if arr.len() == 1 => arr,
             _ => return Ok(None),
         };
-        let indices = parse_indices_i64(indices_arr).map_err(|e| {
-            NyError::ModelLoad(format!(
-                "Gather {} runtime shape-query indices error: {}",
-                spec.name, e
-            ))
-        })?;
-        let gathered_index = match indices.iter().next().copied() {
+        let gathered_index = match indices_arr.iter().next().copied() {
             Some(idx) => idx,
             None => return Ok(None),
         };
@@ -178,28 +174,6 @@ impl ConvertContext<'_> {
             indices_shape,
         ))))
     }
-}
-
-fn parse_indices_i64(arr: &ArrayD<f32>) -> Result<ArrayD<i64>> {
-    let mut values = Vec::with_capacity(arr.len());
-    for &v in arr.iter() {
-        if !v.is_finite() {
-            return Err(NyError::InvalidSpec(
-                "Gather indices contain NaN/Inf".to_string(),
-            ));
-        }
-        let rounded = v.round();
-        if (v - rounded).abs() > 1e-6 {
-            return Err(NyError::InvalidSpec(format!(
-                "Gather indices must be integers; got {}",
-                v
-            )));
-        }
-        values.push(rounded as i64);
-    }
-
-    ArrayD::from_shape_vec(IxDyn(arr.shape()), values)
-        .map_err(|e| NyError::InvalidSpec(format!("Gather indices reshape failed: {}", e)))
 }
 
 fn shape_i64_to_usize(shape: &[i64]) -> (Vec<usize>, bool) {
@@ -433,6 +407,43 @@ mod tests {
         assert!(
             err.to_string().contains("integers"),
             "Expected integer requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn gather_adjacent_non_integer_indices_rejected() {
+        for value in [
+            f32::from_bits(1.0_f32.to_bits() - 1),
+            f32::from_bits(1.0_f32.to_bits() + 1),
+        ] {
+            let mut ws = WeightStore::new();
+            ws.insert("indices".to_string(), arr1(&[value]).into_dyn());
+            let shapes = HashMap::from([("data".to_string(), vec![1_i64, 8])]);
+            let constants = HashSet::new();
+            let m = make_context_with_shape_constants(&ws, &shapes, &constants);
+            assert!(m.convert_gather(&gather_spec("g_adjacent", 1)).is_err());
+        }
+    }
+
+    #[test]
+    fn gather_prefers_exact_integer_indices_over_lossy_float_mirror() {
+        let mut ws = WeightStore::new();
+        let exact = 16_777_217_i64;
+        ws.insert("indices".to_string(), arr1(&[exact as f32]).into_dyn());
+        ws.insert_integers("indices".to_string(), arr1(&[exact]).into_dyn());
+        let shapes = HashMap::from([("data".to_string(), vec![1_i64, 8])]);
+        let constants = HashSet::new();
+        let m = make_context_with_shape_constants(&ws, &shapes, &constants);
+        let layer = m
+            .convert_gather(&gather_spec("g_exact", 1))
+            .expect("exact integer payload should be accepted");
+        let Layer::Gather(gather) = layer else {
+            panic!("expected Gather layer");
+        };
+        assert_eq!(
+            gather.constant_indices().and_then(|values| values.first()),
+            Some(&exact),
+            "the rounded f32 mirror must not replace the exact ONNX index"
         );
     }
 

@@ -162,6 +162,9 @@ def load_candidate_rows(paths: list[Path]) -> dict[tuple[str, str], list[Candida
         "detail",
     }
     for path in paths:
+        if not path.is_file():
+            LOG.warning("candidate artifact is missing: %s", path)
+            continue
         with path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             missing = required.difference(reader.fieldnames or [])
@@ -192,7 +195,12 @@ def select_observed_row(
     allow_sole_candidate_source_fallback: bool = True,
 ) -> SelectionResult:
     if not candidates:
-        return SelectionResult(candidate=None, reasons=("missing_row",), selection_mode=None)
+        reason = (
+            "source_artifact_missing"
+            if spec.source_artifact is not None
+            else "missing_row"
+        )
+        return SelectionResult(candidate=None, reasons=(reason,), selection_mode=None)
 
     if spec.source_artifact is not None:
         sourced = [

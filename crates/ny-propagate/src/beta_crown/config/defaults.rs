@@ -60,6 +60,14 @@ pub(crate) fn default_input_split_touch_zero_score() -> f32 {
     0.0
 }
 
+/// Maximum deferred-rebound tranche for the authenticated affine-conic lane.
+///
+/// A small tranche returns freshly bounded domains to the priority heap before
+/// the next pop and also bounds the live per-domain affine matrices.
+pub(crate) fn default_input_split_conic_queue_refresh_batch_size() -> usize {
+    512
+}
+
 pub(crate) fn default_input_split_sb_margin_weight() -> f32 {
     1.0
 }
@@ -184,7 +192,7 @@ pub(crate) fn default_clip_neuron_selection_ratio() -> f32 {
 }
 
 pub(crate) fn default_clip_interm_topk() -> usize {
-    3 // Matches alpha-beta-CROWN topk_objective default
+    3 // Preserve NY's public/API default; scored presets opt into larger values explicitly.
 }
 
 /// Root dense-head CROWN intermediate pass wall-clock cap.
@@ -229,6 +237,13 @@ pub(crate) fn default_root_sparse_interm_crown_max_rows() -> usize {
 /// Maximum number of convolutional targets processed deepest-first at root.
 pub(crate) fn default_root_sparse_interm_crown_max_targets() -> usize {
     4
+}
+
+/// One row window: byte-identical to the historical single comprehensive sweep.
+/// Raising it trades wall clock for root coverage; every extra window is an
+/// independent atomic shrink-only sweep, so stopping early is always safe.
+pub(crate) fn default_root_comprehensive_gpu_interm_chunks() -> usize {
+    1
 }
 
 pub(crate) fn default_use_analytical_beta_gradients() -> bool {

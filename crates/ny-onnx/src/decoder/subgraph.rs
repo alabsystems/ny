@@ -2,16 +2,19 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decoder subgraph extraction for compositional verification.
+//! Decoder subgraph extraction for structural analysis.
 //!
-//! Extracts attention, MLP, and cross-attention subgraphs from decoder blocks
-//! as GraphNetwork instances for independent bound propagation.
+//! Reconstructs causal self-attention graphs as heuristic `GraphNetwork`
+//! artifacts. MLP extraction lives in the sibling module. Cross-attention
+//! extraction fails closed because `GraphNetwork` lacks a multi-input contract.
+//! These artifacts are not proven equivalent to the loaded ONNX graph and must
+//! not authorize a verdict.
 
 use crate::LayerSpec;
 use ndarray::ArrayD;
 use ny_core::{LayerType, NyError, Result};
 use ny_propagate::{
-    layers::{CausalSoftmaxLayer, MatMulLayer, ReshapeLayer, SoftmaxLayer, TransposeLayer},
+    layers::{CausalSoftmaxLayer, MatMulLayer, ReshapeLayer, TransposeLayer},
     GraphNetwork, GraphNode, Layer,
 };
 use std::collections::HashMap;
@@ -64,10 +67,13 @@ impl DecoderModel {
         evaluated
     }
 
-    /// Extract the causal self-attention subgraph for compositional verification.
+    /// Reconstruct a causal self-attention graph for structural analysis.
     ///
     /// This extracts: norm1 → Q/K/V projections → causal attention → output projection
     /// The output is the attention delta to be added to the residual.
+    ///
+    /// The result uses a heuristic head-count hint and is not proof-equivalent
+    /// to the loaded ONNX graph. Bounds from it must not authorize a verdict.
     ///
     /// # Arguments
     /// * `block_index` - Index of the decoder block (0 for single-block models)
@@ -75,6 +81,8 @@ impl DecoderModel {
     /// # Returns
     /// GraphNetwork representing the attention subgraph.
     pub fn causal_attention_subgraph(&self, block_index: usize) -> Result<GraphNetwork> {
+        self.block_info(block_index)?;
+
         // Determine naming pattern based on structure
         let prefix = if self.num_blocks == 1 && !self.has_layer("/blocks.0/self_attn/q_proj/MatMul")
         {
@@ -397,198 +405,24 @@ impl DecoderModel {
         Ok(())
     }
 
-    /// Extract cross-attention subgraph for encoder-decoder models.
+    /// Cross-attention reconstruction is unavailable.
     ///
-    /// This extracts: norm_cross → Q projection (from decoder) + K/V projections (from encoder)
-    /// → cross attention (no causal mask) → output projection
-    ///
-    /// # Arguments
-    /// * `block_index` - Index of the decoder block
-    ///
-    /// # Returns
-    /// GraphNetwork representing the cross-attention subgraph.
-    /// The graph expects two inputs: "_input" (decoder hidden state) and "_encoder" (encoder output).
+    /// `GraphNetwork` has a single external-input propagation contract, while
+    /// cross-attention requires independent decoder and encoder inputs. Return
+    /// no graph until a sound multi-input representation exists.
     pub fn cross_attention_subgraph(&self, block_index: usize) -> Result<GraphNetwork> {
-        // Check if this block has cross-attention
-        let block_info = self
-            .structure
-            .blocks
-            .get(block_index)
-            .ok_or_else(|| NyError::InvalidSpec(format!("Block {} not found", block_index)))?;
+        let block_info = self.block_info(block_index)?;
 
         if !block_info.has_cross_attention {
             return Err(NyError::InvalidSpec(format!(
-                "Block {} does not have cross-attention",
-                block_index
+                "decoder block {block_index} does not have cross-attention"
             )));
         }
-
-        // Determine naming pattern
-        let prefix =
-            if self.num_blocks == 1 && !self.has_layer("/blocks.0/cross_attn/q_proj/MatMul") {
-                String::new()
-            } else {
-                format!("/blocks.{}", block_index)
-            };
-
-        let norm_cross_prefix = if prefix.is_empty() {
-            "/norm_cross/".to_string()
-        } else {
-            format!("{}/norm_cross/", prefix)
-        };
-
-        let cross_attn_prefix = if prefix.is_empty() {
-            "/cross_attn".to_string()
-        } else {
-            format!("{}/cross_attn", prefix)
-        };
-
-        // Layer names
-        let q_matmul = format!("{}/q_proj/MatMul", cross_attn_prefix);
-        let q_add = format!("{}/q_proj/Add", cross_attn_prefix);
-        let k_matmul = format!("{}/k_proj/MatMul", cross_attn_prefix);
-        let k_add = format!("{}/k_proj/Add", cross_attn_prefix);
-        let v_matmul = format!("{}/v_proj/MatMul", cross_attn_prefix);
-        let v_add = format!("{}/v_proj/Add", cross_attn_prefix);
-        let attn_scores = format!("{}/MatMul", cross_attn_prefix);
-        let attn_softmax = format!("{}/Softmax", cross_attn_prefix);
-        let attn_ctx = format!("{}/MatMul_1", cross_attn_prefix);
-        let out_matmul = format!("{}/out_proj/MatMul", cross_attn_prefix);
-        let out_add = format!("{}/out_proj/Add", cross_attn_prefix);
-
-        let q_src = if self.has_layer(&q_add) {
-            &q_add
-        } else {
-            &q_matmul
-        };
-        let k_src = if self.has_layer(&k_add) {
-            &k_add
-        } else {
-            &k_matmul
-        };
-        let v_src = if self.has_layer(&v_add) {
-            &v_add
-        } else {
-            &v_matmul
-        };
-
-        let hidden_dim = self.hidden_dim;
-        let head_dim = self.structure.head_dim;
-        let qkv_target_shape = vec![0, 0, self.num_heads as i64, head_dim as i64];
-        let qkv_perm = vec![0, 2, 1, 3];
-
-        let mut graph = GraphNetwork::new();
-        let mut tensor_to_node: HashMap<String, String> = HashMap::new();
-
-        // Build layer name set: norm_cross chain + Q/K/V projections.
-        let mut all_cross_layers: std::collections::HashSet<String> =
-            [&q_matmul, &q_add, &k_matmul, &k_add, &v_matmul, &v_add]
-                .iter()
-                .filter(|s| self.has_layer(s))
-                .map(|s| (*s).clone())
-                .collect();
-        all_cross_layers.extend(
-            self.model
-                .network
-                .layers
-                .iter()
-                .filter(|l| l.name.starts_with(&norm_cross_prefix))
-                .map(|l| l.name.clone()),
-        );
-
-        // Pre-evaluate constant chains (#3317).
-        let evaluated_constants = self.evaluate_model_constants();
-
-        // K/V layer names for _encoder remapping
-        let kv_names: std::collections::HashSet<&str> = [k_src, &k_matmul, v_src, &v_matmul]
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-
-        for spec in &self.model.network.layers {
-            if !all_cross_layers.contains(&spec.name) {
-                continue;
-            }
-            let layer = self.convert_layer_with_constants(spec, &evaluated_constants)?;
-            let mut input_nodes = self.find_input_nodes_decoder(
-                spec,
-                &layer,
-                &tensor_to_node,
-                &self.model.constant_tensors,
-                &evaluated_constants,
-            );
-            // K/V projections take encoder output, not decoder hidden state
-            if kv_names.contains(spec.name.as_str()) {
-                for node in &mut input_nodes {
-                    if node == "_input" {
-                        *node = "_encoder".to_string();
-                    }
-                }
-            }
-            graph.try_add_node(GraphNode::new(spec.name.clone(), layer, input_nodes))?;
-            if let Some(output_name) = spec.outputs.first() {
-                tensor_to_node.insert(output_name.clone(), spec.name.clone());
-            }
-            if spec.name == *q_src || spec.name == *k_src || spec.name == *v_src {
-                Self::add_qkv_shape_transform(
-                    &mut graph,
-                    &spec.name,
-                    &qkv_target_shape,
-                    &qkv_perm,
-                )?;
-            }
-        }
-
-        // Attention core: Q@K^T (scaled) → Softmax (no causal mask) → Attn@V
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let q_transpose = format!("{}::__transpose_bhsd", q_src);
-        let k_transpose = format!("{}::__transpose_bhsd", k_src);
-        let v_transpose = format!("{}::__transpose_bhsd", v_src);
-
-        graph.try_add_node(GraphNode::new(
-            attn_scores.clone(),
-            Layer::MatMul(MatMulLayer::new(true, Some(scale))),
-            vec![q_transpose, k_transpose],
-        ))?;
-        graph.try_add_node(GraphNode::new(
-            attn_softmax.clone(),
-            Layer::Softmax(SoftmaxLayer::new(-1)),
-            vec![attn_scores],
-        ))?;
-        graph.try_add_node(GraphNode::new(
-            attn_ctx.clone(),
-            Layer::MatMul(MatMulLayer::new(false, None)),
-            vec![attn_softmax, v_transpose],
-        ))?;
-
-        // Transpose and reshape back to (B, S, hidden_dim)
-        let ctx_transpose_name = format!("{}::__transpose_bshd", attn_ctx);
-        let ctx_reshape_name = format!("{}::__reshape_bsd", attn_ctx);
-        graph.try_add_node(GraphNode::new(
-            ctx_transpose_name.clone(),
-            Layer::Transpose(TransposeLayer::new(vec![0, 2, 1, 3])),
-            vec![attn_ctx],
-        ))?;
-        graph.try_add_node(GraphNode::new(
-            ctx_reshape_name.clone(),
-            Layer::Reshape(ReshapeLayer::new(vec![0, 0, hidden_dim as i64])),
-            vec![ctx_transpose_name],
-        ))?;
-
-        self.add_output_projection(
-            &mut graph,
-            &mut tensor_to_node,
-            &out_matmul,
-            &out_add,
-            &ctx_reshape_name,
-        )?;
-
-        info!(
-            "Built cross-attention subgraph for block {} with {} nodes",
-            block_index,
-            graph.num_nodes()
-        );
-
-        Ok(graph)
+        Err(NyError::UnsupportedConfiguration(
+            "cross-attention subgraph extraction requires two independent external inputs, but \
+             GraphNetwork currently has a single-input propagation contract; no graph or bounds \
+             were produced"
+                .to_string(),
+        ))
     }
 }

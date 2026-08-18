@@ -8,7 +8,7 @@
 
 use faer::Mat;
 use ndarray::ArrayD;
-use ny_core::{NyError, Result};
+use ny_core::{checked_shape_product, NyError, Result};
 
 use crate::faer_parallelism::mat_mul;
 
@@ -27,13 +27,13 @@ pub(crate) fn conv2d_transpose_forward(
     output_padding: (usize, usize),
 ) -> Result<ArrayD<f32>> {
     // Guard: ndim checks prevent panic on shape indexing (#2920 WP-B).
-    if input.ndim() < 3 {
+    if input.ndim() != 3 {
         return Err(NyError::ShapeMismatch {
             expected: vec![3],
             got: vec![input.ndim()],
         });
     }
-    if kernel.ndim() < 4 {
+    if kernel.ndim() != 4 {
         return Err(NyError::ShapeMismatch {
             expected: vec![4],
             got: vec![kernel.ndim()],
@@ -49,6 +49,12 @@ pub(crate) fn conv2d_transpose_forward(
     let kh = kernel.shape()[2];
     let kw = kernel.shape()[3];
 
+    if ker_in_c == 0 || out_c == 0 || kh == 0 || kw == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "conv2d_transpose_forward: kernel dimensions must be nonzero, got {:?}",
+            kernel.shape()
+        )));
+    }
     if in_c != ker_in_c {
         return Err(NyError::ShapeMismatch {
             expected: vec![ker_in_c],
@@ -61,15 +67,42 @@ pub(crate) fn conv2d_transpose_forward(
     let (dh, dw) = dilation;
     let (oph, opw) = output_padding;
 
+    if sh == 0 || sw == 0 {
+        return Err(NyError::InvalidSpec(format!(
+            "conv2d_transpose_forward: stride must be >= 1, got ({sh},{sw})"
+        )));
+    }
     if dh == 0 || dw == 0 {
         return Err(NyError::InvalidSpec(format!(
             "conv2d_transpose_forward: dilation must be >= 1, got ({dh},{dw})"
         )));
     }
+    if oph >= sh || opw >= sw {
+        return Err(NyError::UnsupportedConfiguration(format!(
+            "conv2d_transpose_forward: output_padding ({oph},{opw}) must be < stride \
+             ({sh},{sw}) per dimension"
+        )));
+    }
 
     // Effective (dilated) kernel span: dilation*(kernel-1) + 1.
-    let eff_kh = dh * (kh - 1) + 1;
-    let eff_kw = dw * (kw - 1) + 1;
+    let eff_kh = kh
+        .checked_sub(1)
+        .and_then(|extent| extent.checked_mul(dh))
+        .and_then(|extent| extent.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InvalidSpec(
+                "conv2d_transpose_forward: effective kernel height overflow".to_string(),
+            )
+        })?;
+    let eff_kw = kw
+        .checked_sub(1)
+        .and_then(|extent| extent.checked_mul(dw))
+        .and_then(|extent| extent.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InvalidSpec(
+                "conv2d_transpose_forward: effective kernel width overflow".to_string(),
+            )
+        })?;
 
     // Checked arithmetic: (in_h - 1) * sh + eff_kh - 2 * ph + output_padding_h
     // Guard against underflow when in_h=0 or 2*ph > (in_h-1)*sh + eff_kh + oph.
@@ -93,8 +126,12 @@ pub(crate) fn conv2d_transpose_forward(
                 "conv2d_transpose_forward: width overflow: in_w={in_w}, sw={sw}, kw={kw}"
             ))
         })?;
-    let double_ph = 2 * ph;
-    let double_pw = 2 * pw;
+    let double_ph = ph.checked_mul(2).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: padding height overflow".to_string())
+    })?;
+    let double_pw = pw.checked_mul(2).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: padding width overflow".to_string())
+    })?;
     if expanded_h < double_ph || expanded_w < double_pw {
         return Err(NyError::InvalidSpec(format!(
             "conv2d_transpose_forward: output size underflow: \
@@ -129,12 +166,34 @@ pub(crate) fn conv2d_transpose_forward(
     // covers exactly this K-term f32 error, so the sound node bound is unchanged.
     // No margin/soundness code is touched here — only how the (already-non-sound-
     // on-its-own) point forward map is computed.
-    let out_spatial = out_h * out_w;
-    let mut output_flat = vec![0.0f32; out_c * out_spatial];
+    let out_spatial = out_h.checked_mul(out_w).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: output spatial overflow".to_string())
+    })?;
+    let output_len = out_c.checked_mul(out_spatial).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: output size overflow".to_string())
+    })?;
+    let mut output_flat = vec![0.0f32; output_len];
 
-    let in_spatial = in_h * in_w;
-    let kernel_spatial = kh * kw;
-    let cols = out_c * kernel_spatial;
+    let in_spatial = in_h.checked_mul(in_w).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: input spatial overflow".to_string())
+    })?;
+    let kernel_spatial = kh.checked_mul(kw).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: kernel spatial overflow".to_string())
+    })?;
+    let cols = out_c.checked_mul(kernel_spatial).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: kernel matrix width overflow".to_string())
+    })?;
+    checked_shape_product(&[in_spatial, in_c]).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: input matrix size overflow".to_string())
+    })?;
+    checked_shape_product(&[in_c, cols]).ok_or_else(|| {
+        NyError::InvalidSpec("conv2d_transpose_forward: kernel matrix size overflow".to_string())
+    })?;
+    checked_shape_product(&[in_spatial, cols]).ok_or_else(|| {
+        NyError::InvalidSpec(
+            "conv2d_transpose_forward: contribution matrix size overflow".to_string(),
+        )
+    })?;
 
     // A = inputᵀ : (in_h·in_w, in_c). A[ih·in_w+iw, ic] = input[ic,ih,iw].
     // Zero-sized dims (in_spatial==0 or in_c==0) yield an empty matrix and the
@@ -158,7 +217,12 @@ pub(crate) fn conv2d_transpose_forward(
     // contrib = A·B : (in_h·in_w, out_c·kh·kw). Row-major flatten for a
     // cache-friendly col2im scatter (faer's Mat is column-major).
     let contrib = mat_mul(&a, &b);
-    let mut contrib_rm = Vec::with_capacity(in_spatial * cols);
+    let contrib_len = in_spatial.checked_mul(cols).ok_or_else(|| {
+        NyError::InvalidSpec(
+            "conv2d_transpose_forward: contribution matrix size overflow".to_string(),
+        )
+    })?;
+    let mut contrib_rm = Vec::with_capacity(contrib_len);
     for r in 0..in_spatial {
         for c in 0..cols {
             contrib_rm.push(contrib[(r, c)]);
@@ -174,18 +238,24 @@ pub(crate) fn conv2d_transpose_forward(
                 let oc_col_base = oc * kernel_spatial;
                 let oc_out_base = oc * out_spatial;
                 for kh_idx in 0..kh {
-                    let oh = (ih * sh + kh_idx * dh) as isize - ph as isize;
-                    if oh < 0 || oh >= out_h as isize {
+                    let oh = ih
+                        .checked_mul(sh)
+                        .and_then(|base| kh_idx.checked_mul(dh)?.checked_add(base))
+                        .and_then(|padded| padded.checked_sub(ph))
+                        .filter(|&index| index < out_h);
+                    let Some(oh) = oh else {
                         continue;
-                    }
-                    let oh_out_base = oc_out_base + oh as usize * out_w;
+                    };
+                    let oh_out_base = oc_out_base + oh * out_w;
                     let col_row_base = row_base + oc_col_base + kh_idx * kw;
                     for kw_idx in 0..kw {
-                        let ow = (iw * sw + kw_idx * dw) as isize - pw as isize;
-                        // SAFETY(as usize): guard ensures oh/ow in [0,out_h)/[0,out_w).
-                        if ow >= 0 && ow < out_w as isize {
-                            output_flat[oh_out_base + ow as usize] +=
-                                contrib_rm[col_row_base + kw_idx];
+                        let ow = iw
+                            .checked_mul(sw)
+                            .and_then(|base| kw_idx.checked_mul(dw)?.checked_add(base))
+                            .and_then(|padded| padded.checked_sub(pw))
+                            .filter(|&index| index < out_w);
+                        if let Some(ow) = ow {
+                            output_flat[oh_out_base + ow] += contrib_rm[col_row_base + kw_idx];
                         }
                     }
                 }

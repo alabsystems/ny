@@ -50,6 +50,11 @@ general:
   device: wgpu
   conv_mode: matrix
 
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  cgan_forward_alpha_surrogate: false
+
 solver:
   bound_prop_method: crown
 
@@ -62,9 +67,12 @@ bab:
   crown_ibp_per_node_cap_secs: 150
   phase_budget:
     disjunctive_pgd_fraction: 0.10
+    disjunctive_pgd_max_secs: 5
     attack_extension_fraction: 0.0
     initial_bounds_fraction: 0.45
     disjunctive_precheck_fraction: 0.85
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
   branching:
     method: relu
     candidates: 5
@@ -75,6 +83,9 @@ bab:
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100
+    cgan_complete_crown_ibp_root: true
+    reference_refresh_max_secs: 12
+    forward_linear_deadline_fallback_to_ibp: true
   beta_crown:
     lr_alpha: 0.1
     lr_beta: 0.15

@@ -12,7 +12,11 @@
 # - INVPROP helps refine intermediate layers
 
 general:
-  root_path: ../../vnncomp2024_benchmarks/benchmarks/yolo_2023
+  # Repointed 2026-07-29: the pre-relocation `../../vnncomp2024_benchmarks/...`
+  # spelling has not existed in this repo since the checkouts moved under
+  # `benchmarks/`, so every instance of this preset resolved to a missing input.
+  # Found by preset::model_load_smoke_tests' stale-root-path check.
+  root_path: ../../benchmarks/vnncomp2024/benchmarks/yolo_2023
   csv_name: instances.csv
   loss_reduction_func: max  # Focus on easiest domain to save memory
 

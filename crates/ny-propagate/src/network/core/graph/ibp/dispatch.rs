@@ -429,6 +429,42 @@ pub(crate) fn check_nan_firewall(
     Ok(())
 }
 
+/// Pollable counterpart to [`check_nan_firewall`].
+///
+/// The NaN policy and diagnostic are identical. A poll error aborts the scan
+/// before the bounds can be cached by a deadline-authoritative caller.
+pub(crate) fn check_nan_firewall_with_poll<F>(
+    bounds: &BoundedTensor,
+    context: &str,
+    node_name: &str,
+    layer_type: &str,
+    mut poll: F,
+) -> Result<()>
+where
+    F: FnMut() -> Result<()>,
+{
+    const POLL_ELEMENTS: usize = 4_096;
+
+    poll()?;
+    for (index, value) in bounds
+        .lower()
+        .iter()
+        .chain(bounds.upper().iter())
+        .enumerate()
+    {
+        if index.is_multiple_of(POLL_ELEMENTS) {
+            poll()?;
+        }
+        if value.is_nan() {
+            return Err(NyError::NumericalInstability(format!(
+                "{}: NaN bounds at node '{}' ({})",
+                context, node_name, layer_type
+            )));
+        }
+    }
+    poll()
+}
+
 /// Keep the per-element tighter of a zonotope result and the plain IBP result
 /// for the same graph node.
 ///
@@ -448,5 +484,22 @@ pub(crate) fn intersect_zonotope_ibp(zono: BoundedTensor, ibp: BoundedTensor) ->
     match zono.intersection_per_element(&ibp) {
         Some((tightened, _disjoint)) => tightened,
         None => zono,
+    }
+}
+
+/// Pollable counterpart to [`intersect_zonotope_ibp`].
+///
+/// A poll error prevents publication of a partially constructed intersection.
+pub(crate) fn intersect_zonotope_ibp_with_poll<F>(
+    zono: BoundedTensor,
+    ibp: BoundedTensor,
+    poll: F,
+) -> Result<BoundedTensor>
+where
+    F: FnMut() -> Result<()>,
+{
+    match zono.intersection_per_element_with_poll(&ibp, poll)? {
+        Some((tightened, _disjoint)) => Ok(tightened),
+        None => Ok(zono),
     }
 }

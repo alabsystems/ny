@@ -155,8 +155,7 @@ fn broadcast_bias_to_shape(bias: &ArrayD<f32>, target_shape: &[usize]) -> Option
 fn layer_bias_tensor(layer: &Layer, target_shape: &[usize]) -> Option<ArrayD<f32>> {
     match layer {
         Layer::Linear(linear) => linear
-            .bias
-            .as_ref()
+            .bias()
             .map(|bias| bias.clone().into_dyn())
             .and_then(|bias| broadcast_bias_to_shape(&bias, target_shape)),
         Layer::Conv1d(conv) => conv

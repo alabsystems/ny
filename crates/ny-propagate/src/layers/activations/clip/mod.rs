@@ -49,22 +49,35 @@ impl BoundPropagation for ClipLayer {
     /// - upper_bound = clip(u, min, max)
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
-        // Guard: non-finite input bounds → NaN propagates through f32::clamp,
-        // producing NaN output that BoundedTensor::new rejects with a confusing
-        // error. CROWN path guards at clip_linear_relaxation:93. Pattern: SELU
-        // guard at selu.rs:47-53.
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // Guard: NaN input bounds propagate through f32::clamp, producing NaN
+        // output. NaN ONLY — ±Inf is a legitimate input here. An upstream node
+        // that failed closed to an OpaqueSkip hands its consumers `[-inf, +inf]`
+        // (`OpaqueSkipLayer::unbounded_like` builds exactly that); rejecting it
+        // as `NumericalInstability` aborted the WHOLE graph-IBP pass, because
+        // that variant is not in `is_degradable_error`. Pattern: AddConstant
+        // (add_constant.rs:69-79). CROWN path guards separately at
+        // clip_linear_relaxation:124.
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "Clip IBP: non-finite input bounds".to_string(),
+                "Clip IBP: NaN input bounds".to_string(),
             ));
         }
         let min_val = self.min;
         let max_val = self.max;
         let lower = input.lower().mapv(|v| v.clamp(min_val, max_val));
         let upper = input.upper().mapv(|v| v.clamp(min_val, max_val));
-        BoundedTensor::new(lower, upper)
+        // `new_allow_infinite`, not the strict `new`: `f32::clamp` is pure
+        // comparison, never arithmetic, so none of the NaN-producing inf
+        // patterns (inf - inf, 0 * inf, inf / inf) exists here and no repair is
+        // needed. With finite min/max an infinite endpoint saturates to the
+        // clip range, so a fully tainted `[-inf, +inf]` input recovers the
+        // EXACT output range [min, max] — Clip is a taint sink, not just a
+        // pass-through. `new_allow_infinite` is still required because
+        // `validate_clip_bounds` permits ±Inf min/max (it rejects only NaN and
+        // min > max), in which case the saturated output is itself infinite.
+        // NaN can only come from a NaN input, which the guard above rejects,
+        // and NaN reaching here anyway still hard-errors in this constructor.
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
 
     impl_elementwise_activation!(
@@ -177,3 +190,8 @@ fn clip_linear_relaxation(l: f32, u: f32, min_val: f32, max_val: f32) -> LinearR
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn audit_clip_relax(l: f32, u: f32, min_val: f32, max_val: f32) -> LinearRelaxation {
+    clip_linear_relaxation(l, u, min_val, max_val)
+}

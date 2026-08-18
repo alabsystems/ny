@@ -10,7 +10,7 @@
 //! ## Submodules
 //!
 //! - [`shape_inference`]: Conv input spatial dimension inference from flat shapes
-//! - [`relu_backward`]: Production ReLU backward with α, β, and arelu_cut
+//! - [`relu_backward`]: Production ReLU backward with α and β
 //! - [`layer_dispatch`]: Layer-type dispatch for backward propagation
 //! - [`legacy`]: Test-only β-only backward passes and relaxation recording
 

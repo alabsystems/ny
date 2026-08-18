@@ -212,10 +212,12 @@ fn parse_output_padding_attr(
 }
 
 /// Read the ONNX `output_shape` spatial dimensions for a ConvTranspose layer,
-/// if present and non-empty.
+/// if present.
 ///
-/// `output_shape` may be given as the full spatial output size. When set, it is
-/// an alternative to `output_padding`; ONNX derives output_padding from it.
+/// ONNX defines exactly one entry per spatial axis; batch and channel
+/// dimensions must not be included.  This parser is intentionally strict even
+/// though conversion currently rejects the attribute: accepting a full NCHW
+/// shape here would authenticate a malformed source model.
 fn parse_output_shape_attr(
     spec: &LayerSpec,
     op_name: &str,
@@ -223,30 +225,25 @@ fn parse_output_shape_attr(
 ) -> Result<Option<Vec<usize>>> {
     let raw_values: Vec<i64> = match spec.attributes.get("output_shape") {
         None => return Ok(None),
-        Some(AttributeValue::Ints(v)) if v.is_empty() => return Ok(None),
         Some(AttributeValue::Ints(v)) => v.clone(),
-        Some(AttributeValue::Int(v)) => vec![*v],
         Some(_) => {
             return Err(NyError::ModelLoad(format!(
-                "{} layer {} has invalid output_shape attribute type",
+                "{} layer {} has invalid output_shape attribute type; ONNX requires INTS",
                 op_name, spec.name
             )));
         }
     };
 
-    // output_shape may include leading batch/channel dims (rank = 2 + spatial)
-    // or just the spatial dims. Take the trailing `spatial_rank` entries.
-    if raw_values.len() < spatial_rank {
+    if raw_values.len() != spatial_rank {
         return Err(NyError::ModelLoad(format!(
-            "{} layer {} has output_shape length {}, expected at least {}",
+            "{} layer {} has output_shape length {}, expected exactly {} spatial dimensions (batch/channel dimensions must not be included)",
             op_name,
             spec.name,
             raw_values.len(),
             spatial_rank
         )));
     }
-    let spatial = &raw_values[raw_values.len() - spatial_rank..];
-    let parsed = spatial
+    let parsed = raw_values
         .iter()
         .map(|&v| parse_non_negative_usize(v, op_name, &spec.name, "output_shape"))
         .collect::<Result<Vec<usize>>>()?;
@@ -356,8 +353,7 @@ impl ConvertContext<'_> {
             });
         }
 
-        let bias = if spec.inputs.len() >= 3 {
-            let bias_name = &spec.inputs[2];
+        let bias = if let Some(bias_name) = spec.inputs.get(2).filter(|name| !name.is_empty()) {
             let bias_arr = self
                 .constant_value(bias_name)
                 .ok_or_else(|| NyError::ModelLoad(format!("Bias {} not found", bias_name)))?;
@@ -413,8 +409,7 @@ impl ConvertContext<'_> {
             });
         }
 
-        let bias = if spec.inputs.len() >= 3 {
-            let bias_name = &spec.inputs[2];
+        let bias = if let Some(bias_name) = spec.inputs.get(2).filter(|name| !name.is_empty()) {
             let bias_arr = self
                 .constant_value(bias_name)
                 .ok_or_else(|| NyError::ModelLoad(format!("Bias {} not found", bias_name)))?;
@@ -461,62 +456,10 @@ impl ConvertContext<'_> {
         spec: &LayerSpec,
         spatial_rank: usize,
     ) -> Result<()> {
-        // output_padding and output_shape are now supported (threaded through the
-        // layer struct / propagation); only auto_pad remains unsupported.
+        // output_padding is threaded through the 2D layer. output_shape is
+        // checked separately because its ONNX pad-generation semantics are not
+        // represented by the symmetric-padding layer.
         self.ensure_supported_conv_attributes(spec, "ConvTranspose", spatial_rank)
-    }
-
-    /// Resolve the per-dimension `output_padding` for a ConvTranspose layer,
-    /// preferring an explicit `output_padding` attribute, otherwise deriving it
-    /// from `output_shape` if given.
-    ///
-    /// Given `output_shape`, ONNX derives:
-    ///   output_padding = output_shape
-    ///       - (stride*(in-1) + dilation*(kernel-1) + 1 - 2*pad)
-    /// Reference: ONNX ConvTranspose operator spec.
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_output_padding(
-        spec: &LayerSpec,
-        op_name: &str,
-        spatial_rank: usize,
-        input_spatial: &[Option<usize>],
-        kernel_spatial: &[usize],
-        stride: &[usize],
-        padding: &[usize],
-        dilation: &[usize],
-    ) -> Result<Vec<usize>> {
-        let explicit = parse_output_padding_attr(spec, op_name, spatial_rank)?;
-        let Some(output_shape) = parse_output_shape_attr(spec, op_name, spatial_rank)? else {
-            return Ok(explicit);
-        };
-
-        // Derive output_padding from output_shape. Requires known input dims.
-        let mut derived = vec![0usize; spatial_rank];
-        for d in 0..spatial_rank {
-            let in_dim = input_spatial[d].ok_or_else(|| {
-                NyError::UnsupportedConfiguration(format!(
-                    "{} layer {} specifies output_shape but input spatial dim {} is unknown; \
-                     cannot derive output_padding",
-                    op_name, spec.name, d
-                ))
-            })?;
-            let eff_k = dilation[d] * (kernel_spatial[d] - 1) + 1;
-            let base = stride[d] * (in_dim.saturating_sub(1)) + eff_k;
-            let base = base.checked_sub(2 * padding[d]).ok_or_else(|| {
-                NyError::ModelLoad(format!(
-                    "{} layer {} output_shape derivation underflow in dim {}",
-                    op_name, spec.name, d
-                ))
-            })?;
-            if output_shape[d] < base {
-                return Err(NyError::ModelLoad(format!(
-                    "{} layer {} output_shape {} is smaller than minimum output {} in dim {}",
-                    op_name, spec.name, output_shape[d], base, d
-                )));
-            }
-            derived[d] = output_shape[d] - base;
-        }
-        Ok(derived)
     }
     pub(crate) fn convert_conv_transpose1d(&self, spec: &LayerSpec) -> Result<Layer> {
         if spec.inputs.len() < 2 {
@@ -559,8 +502,7 @@ impl ConvertContext<'_> {
             });
         }
 
-        let bias = if spec.inputs.len() >= 3 {
-            let bias_name = &spec.inputs[2];
+        let bias = if let Some(bias_name) = spec.inputs.get(2).filter(|name| !name.is_empty()) {
             let bias_arr = self
                 .constant_value(bias_name)
                 .ok_or_else(|| NyError::ModelLoad(format!("Bias {} not found", bias_name)))?;
@@ -604,6 +546,22 @@ impl ConvertContext<'_> {
         }
 
         self.ensure_conv_transpose_attributes(spec, 2)?;
+        if parse_output_shape_attr(spec, "ConvTranspose2d", 2)?.is_some() {
+            return Err(NyError::UnsupportedConfiguration(format!(
+                "ConvTranspose2d layer {} specifies output_shape; ONNX auto-generates potentially asymmetric start/end pads for output_shape, which ny's symmetric-padding layer does not represent",
+                spec.name
+            )));
+        }
+        // `ConvTranspose2dLayer` currently models only the dense groups=1 ONNX
+        // layout. Silently dropping a larger `group` would reinterpret
+        // `[C_in, C_out/group, kH, kW]` as a dense kernel and is unsound.
+        let groups = Self::parse_group_attr(spec, "ConvTranspose2d")?;
+        if groups != 1 {
+            return Err(NyError::UnsupportedConfiguration(format!(
+                "ConvTranspose2d layer {} uses group={groups}; grouped ConvTranspose2d is not supported",
+                spec.name
+            )));
+        }
         let dilation_values = parse_dilation_attr(spec, "ConvTranspose2d", 2)?;
         let dilation = (dilation_values[0], dilation_values[1]);
 
@@ -619,8 +577,7 @@ impl ConvertContext<'_> {
             });
         }
 
-        let bias = if spec.inputs.len() >= 3 {
-            let bias_name = &spec.inputs[2];
+        let bias = if let Some(bias_name) = spec.inputs.get(2).filter(|name| !name.is_empty()) {
             let bias_arr = self
                 .constant_value(bias_name)
                 .ok_or_else(|| NyError::ModelLoad(format!("Bias {} not found", bias_name)))?;
@@ -639,19 +596,7 @@ impl ConvertContext<'_> {
         let stride = (stride_values[0], stride_values[1]);
         let padding = parse_symmetric_padding_2d(spec, "ConvTranspose2d")?;
 
-        // Kernel layout for ONNX ConvTranspose: (in_c, out_c, kh, kw).
-        let kernel_spatial = [kernel.shape()[2], kernel.shape()[3]];
-        let input_spatial = self.infer_conv2d_input_spatial(&spec.inputs[0]);
-        let output_padding_values = Self::resolve_output_padding(
-            spec,
-            "ConvTranspose2d",
-            2,
-            &input_spatial,
-            &kernel_spatial,
-            &stride_values,
-            &[padding.0, padding.1],
-            &dilation_values,
-        )?;
+        let output_padding_values = parse_output_padding_attr(spec, "ConvTranspose2d", 2)?;
         let output_padding = (output_padding_values[0], output_padding_values[1]);
 
         debug!(
@@ -823,6 +768,20 @@ mod tests {
 
     #[ntest::timeout(10000)]
     #[test]
+    fn conv2d_empty_optional_bias_placeholder_means_no_bias() {
+        let (ws, mut spec) = conv2d_spec(HashMap::new());
+        spec.inputs[2].clear();
+        let layer = make_context(&ws)
+            .convert_conv2d(&spec)
+            .expect("an empty optional ONNX B placeholder is omission");
+        let Layer::Conv2d(conv) = layer else {
+            panic!("expected Conv2d layer");
+        };
+        assert!(conv.bias.is_none());
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
     fn conv2d_non_unit_dilation_is_accepted() {
         let mut attrs = HashMap::new();
         attrs.insert("dilations".to_string(), AttributeValue::Ints(vec![2, 3]));
@@ -899,10 +858,12 @@ mod tests {
 
     #[ntest::timeout(10000)]
     #[test]
-    fn conv_transpose2d_output_shape_derives_output_padding() {
+    fn conv_transpose2d_valid_spatial_output_shape_is_rejected_fail_closed() {
         use std::collections::HashMap as Map;
-        // Kernel [3,2,3,3]: in_c=3, out_c=2, kh=kw=3. Input spatial 4x4, stride 2,
-        // pad 0, dilation 1 → base output = 2*(4-1)+3 = 9. output_shape 10 → op=1.
+        // This is a valid ONNX spatial-only output_shape. ONNX uses it to
+        // auto-generate start/end pads; treating the size delta as
+        // output_padding would produce different values when those pads are
+        // asymmetric.
         let mut attrs = HashMap::new();
         attrs.insert("strides".to_string(), AttributeValue::Ints(vec![2, 2]));
         attrs.insert(
@@ -913,13 +874,35 @@ mod tests {
         let tensor_shapes: Map<String, Vec<i64>> =
             Map::from([("input".to_string(), vec![1, 3, 4, 4])]);
         let context = make_context_with_shapes(&ws, &tensor_shapes);
-        let layer = context
+        let error = context
             .convert_conv_transpose2d(&spec)
-            .expect("output_shape should derive output_padding");
-        match layer {
-            Layer::ConvTranspose2d(conv) => assert_eq!(conv.output_padding, (1, 1)),
-            other => panic!("expected ConvTranspose2d layer, got {other:?}"),
-        }
+            .expect_err("output_shape pad generation must fail closed");
+        assert!(
+            matches!(error, NyError::UnsupportedConfiguration(ref message)
+                if message.contains("output_shape")
+                    && message.contains("potentially asymmetric")),
+            "expected fail-closed output_shape refusal, got: {error:?}"
+        );
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv_transpose2d_output_shape_must_not_include_batch_or_channels() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "output_shape".to_string(),
+            AttributeValue::Ints(vec![1, 2, 10, 10]),
+        );
+        let (ws, spec) = conv_transpose2d_spec(attrs);
+        let error = make_context(&ws)
+            .convert_conv_transpose2d(&spec)
+            .expect_err("NCHW output_shape is not valid ONNX ConvTranspose syntax");
+        assert!(
+            matches!(error, NyError::ModelLoad(ref message)
+                if message.contains("expected exactly 2 spatial dimensions")
+                    && message.contains("batch/channel")),
+            "expected strict spatial-only output_shape error, got: {error:?}"
+        );
     }
 
     #[ntest::timeout(10000)]
@@ -943,6 +926,27 @@ mod tests {
             }
             _ => panic!("expected Conv2d layer"),
         }
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn conv_transpose2d_grouped_convolution_is_rejected_fail_closed() {
+        let mut attrs = HashMap::new();
+        attrs.insert("group".to_string(), AttributeValue::Int(2));
+        let (ws, spec) = conv_transpose2d_spec(attrs);
+        let context = make_context(&ws);
+        let err = context
+            .convert_conv_transpose2d(&spec)
+            .expect_err("grouped ConvTranspose2d must not be reinterpreted as dense");
+        assert!(
+            matches!(
+                err,
+                NyError::UnsupportedConfiguration(ref message)
+                    if message.contains("group=2")
+                        && message.contains("grouped ConvTranspose2d is not supported")
+            ),
+            "expected fail-closed grouped ConvTranspose2d refusal, got: {err:?}"
+        );
     }
 
     #[ntest::timeout(10000)]

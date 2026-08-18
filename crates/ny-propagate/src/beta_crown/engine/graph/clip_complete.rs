@@ -29,8 +29,8 @@ use crate::batched_domain::CachedLinearBounds;
 use crate::beta_crown::branching::GraphSplitHistory;
 use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::clip_interm_domain::{
-    merge_bounds, sort_out_constraints, tighten_with_constraints, PreprocessedConstraints,
-    SplitConstraints,
+    merge_bounds, sort_out_constraints, sub_f32_down, tighten_with_constraints,
+    PreprocessedConstraints, SplitConstraints,
 };
 use crate::cmp_utils::nan_last_descending_cmp;
 use crate::GraphNetwork;
@@ -62,6 +62,15 @@ pub(in crate::beta_crown::engine) fn build_graph_complete_clip_node_bounds(
 ) -> Result<Option<HashMap<String, BoundedTensor>>> {
     if thresholds.is_empty() {
         return Ok(None);
+    }
+    // This legacy input-split adapter depends on f32 forward-affine rows that
+    // lack end-to-end coefficient-error provenance. Preserve the already-clipped
+    // input box and populate the deferred child cache with plain IBP bounds, but
+    // do not tighten hidden bounds from those uncertified rows.
+    if !super::clip_alpha::legacy_forward_affine_clipping_authorized() {
+        return Ok(Some(
+            graph.collect_node_bounds_with_engine(constrained_input, engine)?,
+        ));
     }
 
     let mut bounds_cache = graph.collect_node_bounds_with_engine(constrained_input, engine)?;
@@ -143,9 +152,23 @@ fn build_graph_complete_spec_constraints(
         }
     }));
 
+    let mut constraint_bias = Array1::<f32>::zeros(thresholds.len());
+    for ((out, &bias), &threshold) in constraint_bias
+        .iter_mut()
+        .zip(b_vector.iter())
+        .zip(threshold_values.iter())
+    {
+        *out = sub_f32_down(bias, threshold).ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "graph complete-clip constraints require finite bias and threshold, got \
+                 {bias} and {threshold}"
+            ))
+        })?;
+    }
+
     Ok(SplitConstraints {
         a_matrix,
-        b_vector: &b_vector - &threshold_values,
+        b_vector: constraint_bias,
         num_constraints: thresholds.len(),
     })
 }
@@ -478,7 +501,32 @@ mod tests {
     }
 
     #[test]
-    fn test_build_graph_complete_clip_node_bounds_tightens_hidden_cache() {
+    fn graph_spec_constraint_bias_is_rounded_outward() {
+        let bounds = LinearBounds {
+            lower_a: arr2(&[[1.0_f32]]),
+            lower_b: arr1(&[1.0_f32]),
+            upper_a: arr2(&[[1.0_f32]]),
+            upper_b: arr1(&[1.0_f32]),
+            lower_a_err: None,
+            upper_a_err: None,
+        };
+        // 1 - 2^-25 lies halfway between adjacent f32 values. A plain f32
+        // subtraction rounds back up to 1, which would make the necessary
+        // constraint too strict. The graph adapter must choose the lower
+        // representable endpoint.
+        let threshold = f32::from_bits((1.0_f32 / (1_u32 << 25) as f32).to_bits());
+        let constraints =
+            build_graph_complete_spec_constraints(&bounds, &[threshold], false).unwrap();
+        let exact = f64::from(1.0_f32) - f64::from(threshold);
+        assert!(f64::from(constraints.b_vector[0]) <= exact);
+        assert_eq!(
+            constraints.b_vector[0],
+            sub_f32_down(1.0, threshold).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_build_graph_complete_clip_node_bounds_uses_ibp_when_affine_authority_is_quarantined() {
         let graph = two_stage_identity_graph();
         let input =
             BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn()).unwrap();
@@ -500,22 +548,18 @@ mod tests {
             -1.0,
             None,
         )
-        .unwrap()
-        .expect("active spec constraint should produce child-local node bounds");
-
+        .unwrap();
+        let bounds_cache =
+            bounds_cache.expect("the deferred child should retain a sound IBP bounds cache");
         let hidden = bounds_cache
             .get("hidden")
-            .expect("hidden node bounds should be present")
+            .expect("IBP should populate the hidden-node cache")
             .flatten();
+        assert!(hidden.lower()[[0]] <= -1.0);
+        assert!(hidden.upper()[[0]] >= 1.0);
         assert!(
-            hidden.upper()[[0]] <= 0.21,
-            "spec-derived graph complete clipping should tighten hidden upper bound to the threshold region, got {}",
-            hidden.upper()[[0]]
-        );
-        assert!(
-            hidden.lower()[[0]] >= -1.01,
-            "tightening should preserve the sound lower bound, got {}",
-            hidden.lower()[[0]]
+            hidden.upper()[[0]] > 0.21,
+            "the quarantined affine constraint must not tighten the IBP cache"
         );
     }
 }

@@ -71,7 +71,14 @@ pub fn elementwise_binary_ibp(
         let upper = ndarray::ArrayD::from_shape_vec(IxDyn(&shape), out_upper)
             .map_err(|e| NyError::UnsupportedConfiguration(format!("{}: {}", op_name, e)))?;
 
-        BoundedTensor::new(lower, upper)
+        // OpaqueSkip taint (#opaque-skip-six-sites): an upstream OpaqueSkip
+        // legitimately emits ±Inf endpoints. min/max are pure selections — no
+        // inf arithmetic (no inf-inf, 0*inf, inf/inf) — so non-NaN operands can
+        // never combine into NaN; ±Inf flows through unchanged and is a sound
+        // endpoint. A NaN output therefore implies a NaN INPUT (the guard above
+        // propagates it) — a real bug — which `new_allow_infinite` still
+        // rejects as a hard error (#3147 tests below keep exercising that).
+        BoundedTensor::new_allow_infinite(lower, upper)
     } else {
         // Broadcasting path
         let target_shape = broadcast_shapes(input_a.shape(), input_b.shape()).ok_or_else(|| {
@@ -126,7 +133,10 @@ pub fn elementwise_binary_ibp(
         let upper = ndarray::ArrayD::from_shape_vec(IxDyn(&target_shape), out_upper)
             .map_err(|e| NyError::UnsupportedConfiguration(format!("{}: {}", op_name, e)))?;
 
-        BoundedTensor::new(lower, upper)
+        // OpaqueSkip taint (#opaque-skip-six-sites): same reasoning as the
+        // same-shape path above — min/max cannot manufacture NaN from ±Inf,
+        // so allow clean ±Inf and keep NaN (⇒ NaN input) a hard error.
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
 }
 
@@ -320,6 +330,46 @@ mod tests {
         assert!(
             result.is_err(),
             "NaN must propagate through broadcast path → Err"
+        );
+    }
+
+    // ── OpaqueSkip taint probes (#opaque-skip-six-sites) ──────────────
+
+    /// A ±Inf operand (upstream OpaqueSkip) must propagate through Min/Max as
+    /// widened bounds — min/max cannot manufacture NaN from ±Inf — instead of
+    /// aborting graph IBP with NumericalInstability.
+    #[test]
+    fn test_ibp_opaque_skip_inf_input_flows() {
+        let a = BoundedTensor::new_allow_infinite(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NEG_INFINITY, f32::NEG_INFINITY])
+                .unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, f32::INFINITY]).unwrap(),
+        )
+        .unwrap();
+        let b = make_bt(&[1.0, 2.0], &[3.0, 4.0]);
+
+        // Min: lower widens to -inf, upper is capped by the finite operand.
+        let min_out = elementwise_binary_ibp(&a, &b, nan_propagating_min, "Min")
+            .expect("±inf operand must propagate through Min");
+        assert_eq!(min_out.lower()[0], f32::NEG_INFINITY);
+        assert_eq!(min_out.upper()[0], 3.0);
+
+        // Max: lower is floored by the finite operand, upper widens to +inf.
+        let max_out = elementwise_binary_ibp(&a, &b, nan_propagating_max, "Max")
+            .expect("±inf operand must propagate through Max");
+        assert_eq!(max_out.lower()[0], 1.0);
+        assert_eq!(max_out.upper()[0], f32::INFINITY);
+    }
+
+    /// NaN input (a real bug, not OpaqueSkip taint) must still hard-error:
+    /// `new_allow_infinite` rejects NaN. Complements the #3147 tests above.
+    #[test]
+    fn test_ibp_nan_input_still_errors_after_inf_migration() {
+        let a = make_bt_unchecked(&[f32::NAN], &[2.0]);
+        let b = make_bt(&[1.0], &[3.0]);
+        assert!(
+            elementwise_binary_ibp(&a, &b, nan_propagating_min, "Min").is_err(),
+            "NaN input must remain a hard error after the ±inf migration"
         );
     }
 

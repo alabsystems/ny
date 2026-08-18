@@ -81,12 +81,13 @@ fn print_welcome() {
     println!(
         "
   A verifier answers one question about a model: can it EVER violate a
-  property? You give ny a network and a property; it returns one of three
+  property? You give ny a network and a property; it returns one of four
   answers, and it never guesses:
 
     verified     the property holds for every input in the region
     falsified    the property can be violated — here is a concrete input
     unknown      ny could not settle it within its methods or limits
+    timeout      ny reached the requested time limit before settling it
 
   Courses — each is a short read, and every command shown is real:
 
@@ -155,7 +156,8 @@ fn basics() {
       ny beta-crown tests/models/crossing_relu.nnet \\
         -p tests/models/crossing_relu_unsafe.vnnlib    # → VIOLATED, exit 1
 
-  Exit codes: 0 proved, 1 falsified, 2 unknown, 3 timeout."
+  Exit codes: 0 proved, 1 falsified, 2 unknown, 3 timeout, 4 operational error.
+  `verify --allow-unknown` explicitly maps only unknown to 0; timeout stays 3."
     );
 
     heading("Basics · 5/5 — ny does not ask you to trust it");
@@ -193,7 +195,11 @@ fn robustness() {
       ny vnncomp v1 acasxu_2023 model.onnx prop.vnnlib out.txt 116
 
   In CI, drive the build off the exit code (0 proved, 1 falsified, 2 unknown,
-  3 timeout), or use the Python pytest plugin:
+  3 timeout, 4 invalid invocation or operational error), or use the Python
+  pytest plugin:
+
+      # Explicitly accept an unresolved completed result; timeout still exits 3.
+      ny verify model.onnx -p prop.vnnlib --allow-unknown
 
       from ny_pytest import assert_verified
       assert_verified(\"model.onnx\", \"prop.vnnlib\")     # fails the test on a counterexample
@@ -226,7 +232,8 @@ fn certificates() {
 
   Related evidence:
       ny lipschitz model.onnx        sound certified global Lipschitz bound
-      ny gt verify spec model.onnx --escalate smt   exact SMT check via the ay solver
+      ny gt verify model.onnx spec.gt.json --property dominates \\
+        --input-bounds=\"-1,1\" --escalate smt   exact SMT check via the ay solver
 "
     );
 }
@@ -236,7 +243,7 @@ fn features() {
     println!(
         "
   Verification
-      ny verify        incomplete bounds (ibp | crown | alpha | beta)
+      ny verify        incomplete bounds (ibp | crown | alpha; beta is sequential-only)
       ny beta-crown    complete branch-and-bound; returns proofs or counterexamples
       ny vnncomp       run one VNN-COMP instance under the competition protocol
       ny gt            verify against a geometric ground-truth spec (exact SMT escalation)
@@ -318,7 +325,8 @@ fn run_and_show(exe: &Path, model: &Path, prop: &Path, label: &str) {
                 1 => "falsified",
                 2 => "unknown",
                 3 => "timeout",
-                _ => "error",
+                4 => "operational error",
+                _ => "unexpected exit",
             };
             println!("      (exit {code} → {verdict})");
         }

@@ -201,8 +201,9 @@ fn log_crown_ibp_acceptance(result: &CosineDistanceResult) {
 /// get tightened within the 600s cargo wrapper timeout.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_speaker_cosine_crown_ibp_tightened_intermediates_improve_distance_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let t_start = Instant::now();
     let (dot_graph, norm_sq_graph, _) = cosine_head::build_speaker_cosine_component_graphs();
     let model = shared::avoice_speaker_encoder();

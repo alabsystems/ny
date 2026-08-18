@@ -541,14 +541,103 @@ fn test_ibp_nan_input_upper_rejected_3278() {
     assert!(matches!(err, NyError::NumericalInstability(_)));
 }
 
+/// #3278 originally rejected ±Inf here too. That was wrong: ±Inf is what an
+/// upstream OpaqueSkip legitimately emits, and `NumericalInstability` is not
+/// degradable, so one tainted element aborted the whole graph-IBP pass. Clip
+/// must now widen instead — and because it saturates, `[-inf, +inf]` in yields
+/// the exact `[min, max]` out.
 #[test]
-fn test_ibp_inf_input_rejected_3278() {
+fn test_ibp_inf_input_propagates_widened_3278() {
     let clip = ClipLayer::new(0.0, 6.0);
-    let input = BoundedTensor::new_unchecked(
+    let input = BoundedTensor::new_allow_infinite(
         ArrayD::from_elem(ndarray::IxDyn(&[1]), f32::NEG_INFINITY),
         ArrayD::from_elem(ndarray::IxDyn(&[1]), f32::INFINITY),
     )
     .unwrap();
-    let err = clip.propagate_ibp(&input).expect_err("Inf input");
+    let out = clip
+        .propagate_ibp(&input)
+        .expect("a tainted element must widen, not abort the pass");
+    assert_eq!(out.lower()[[0]], 0.0);
+    assert_eq!(out.upper()[[0]], 6.0);
+}
+
+// ── OpaqueSkip taint propagation (#3278 follow-up) ─────────────────────
+
+/// Probe: a mixed tensor where one element carries an upstream OpaqueSkip's
+/// `[-inf, +inf]` and the other is a normal finite interval. The tainted
+/// element must saturate to the clip range; the finite element is unchanged.
+#[test]
+fn test_ibp_opaque_skip_taint_widens_only_tainted_element() {
+    let clip = ClipLayer::new(-1.0, 1.0);
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_shape_vec(ndarray::IxDyn(&[2]), vec![f32::NEG_INFINITY, -0.5]).unwrap(),
+        ArrayD::from_shape_vec(ndarray::IxDyn(&[2]), vec![f32::INFINITY, 0.5]).unwrap(),
+    )
+    .unwrap();
+    let out = clip
+        .propagate_ibp(&input)
+        .expect("[-inf, +inf] is a sound enclosure, not an error");
+
+    assert_eq!(out.lower()[[0]], -1.0);
+    assert_eq!(out.upper()[[0]], 1.0);
+    assert_eq!(out.lower()[[1]], -0.5);
+    assert_eq!(out.upper()[[1]], 0.5);
+}
+
+/// Soundness: the saturated output must still enclose clip over the whole
+/// (unbounded) input interval.
+#[test]
+fn test_ibp_inf_input_output_encloses_true_range() {
+    let (min_val, max_val) = (0.0f32, 6.0f32);
+    let clip = ClipLayer::new(min_val, max_val);
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_elem(ndarray::IxDyn(&[1]), f32::NEG_INFINITY),
+        ArrayD::from_elem(ndarray::IxDyn(&[1]), f32::INFINITY),
+    )
+    .unwrap();
+    let out = clip.propagate_ibp(&input).unwrap();
+    for x in [-1e30f32, -100.0, -1.0, 0.0, 3.0, 6.0, 100.0, 1e30] {
+        let y = x.clamp(min_val, max_val);
+        assert!(
+            out.lower()[[0]] <= y,
+            "lower {} > clip({x})={y}",
+            out.lower()[[0]]
+        );
+        assert!(
+            out.upper()[[0]] >= y,
+            "upper {} < clip({x})={y}",
+            out.upper()[[0]]
+        );
+    }
+}
+
+/// An infinite clip bound keeps the taint infinite — this is exactly why the
+/// output uses `new_allow_infinite` and not the strict constructor.
+#[test]
+fn test_ibp_infinite_clip_bound_keeps_output_infinite() {
+    let clip = ClipLayer::try_new(f32::NEG_INFINITY, 6.0).expect("infinite min is permitted");
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_elem(ndarray::IxDyn(&[1]), f32::NEG_INFINITY),
+        ArrayD::from_elem(ndarray::IxDyn(&[1]), f32::INFINITY),
+    )
+    .unwrap();
+    let out = clip.propagate_ibp(&input).expect("must not abort");
+    assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+    assert_eq!(out.upper()[[0]], 6.0);
+}
+
+/// The relaxation must NOT relax the NaN firewall: NaN from finite inputs
+/// (or any NaN endpoint) is still a hard error.
+#[test]
+fn test_ibp_nan_still_rejected_after_inf_relaxation() {
+    let clip = ClipLayer::new(0.0, 6.0);
+    let input = BoundedTensor::new_unchecked(
+        ArrayD::from_shape_vec(ndarray::IxDyn(&[2]), vec![f32::NEG_INFINITY, f32::NAN]).unwrap(),
+        ArrayD::from_shape_vec(ndarray::IxDyn(&[2]), vec![f32::INFINITY, 1.0]).unwrap(),
+    )
+    .unwrap();
+    let err = clip
+        .propagate_ibp(&input)
+        .expect_err("NaN must not be absorbed alongside a tainted element");
     assert!(matches!(err, NyError::NumericalInstability(_)));
 }

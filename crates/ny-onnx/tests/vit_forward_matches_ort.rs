@@ -1,5 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
+
+#![cfg(feature = "external-vnncomp")]
 //
 // Semantics-preservation check for the batch-dim resolution + Shape const-fold
 // on the ViT (vit_2023 pgd_2_3_16) transformer.
@@ -23,7 +25,6 @@
 // wrong shape-fold would corrupt. A broken fold makes these tight nodes diverge
 // (and the reshape/transpose ranks wrong); a sound fold keeps them bit-for-bit
 // on ORT, with the only slack confined to the `BilinearCrown` MatMul nodes.
-
 #![cfg(feature = "ort")]
 
 use ndarray::{ArrayD, IxDyn};
@@ -45,11 +46,13 @@ fn is_relaxed_layer(layer_type: &str) -> bool {
 }
 
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn vit_loads_with_static_attention_shapes_and_preserves_function() {
-    if !std::path::Path::new(MODEL).exists() {
-        eprintln!("ViT benchmark model not present; skipping");
-        return;
-    }
+    assert!(
+        std::path::Path::new(MODEL).is_file(),
+        "ViT benchmark model fixture is missing at {MODEL}; \
+         run benchmarks/download_benchmarks.sh"
+    );
 
     // Deterministic concrete inputs across the network's normalized range.
     let cases: Vec<Vec<f32>> = vec![

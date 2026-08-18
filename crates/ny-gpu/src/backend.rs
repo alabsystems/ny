@@ -4,11 +4,25 @@
 
 use crate::accelerated::{AcceleratedBoundPropagation, AcceleratedDevice};
 #[cfg(feature = "wgpu")]
-use crate::wgpu_device::WgpuDevice;
+use crate::wgpu_device::{
+    WgpuBabBoundQualificationError, WgpuBabBoundVerdictRequest, WgpuDevice,
+    WgpuVerdictQualificationError, WgpuVerdictReport, WgpuVerdictRequest,
+    PRODUCTION_WGPU_VERDICT_AUTHORITY_ENABLED,
+};
+#[cfg(feature = "wgpu")]
+use crate::WgpuChargedVerdictRequest;
 use ndarray::{Array1, Array2};
 use ny_core::{GemmEngine, NyError, Result};
 use ny_propagate::GraphNetwork;
 use ny_tensor::BoundedTensor;
+
+#[cfg(feature = "wgpu")]
+fn wgpu_proof_quarantine(operation: &str) -> NyError {
+    NyError::UnsupportedConfiguration(format!(
+        "WGPU {operation} is quarantined from the public ComputeDevice proof adapter; \
+         only CROWN backward is exposed on an explicitly qualified proof device"
+    ))
+}
 
 /// Backend selection for compute operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,19 +84,81 @@ pub const fn wgpu_backend_compiled() -> bool {
     cfg!(feature = "wgpu")
 }
 
-/// Runtime probe: is a real (hardware) GPU adapter available to wgpu?
+/// Whether this build contains the reviewed WGPU proof-qualification path.
 ///
-/// Complements [`wgpu_backend_compiled`] as the AUTO-backend capability hint
-/// when the `GPU_AVAILABLE` env var is unset, so the hint cannot be lost across
-/// the prepare/run script process boundary (#vnncomp-gpu-routing). Costs one
-/// adapter enumeration (no device or pipeline init). Software rasterizers
-/// (llvmpipe/SwiftShader report `DeviceType::Cpu`) return `false` — preferring
-/// wgpu on those would be a slowdown, not an acceleration. Like the env hint,
-/// this only feeds the default backend *preference*; it never forces GPU use
-/// nor changes a verdict.
+/// This is a build/source capability only, not authority for any device.
+/// [`ComputeDevice::new(Backend::Wgpu)`] remains unarmed. A caller must consume
+/// [`WgpuVerdictRequest`] through [`ComputeDevice::new_for_proof`], and the
+/// exact returned device gains CROWN authority only after all five live rungs
+/// pass. Every other WGPU proof route remains quarantined operation by operation.
+///
+/// CORRECTED 2026-08-04: this used to end "and, on this host, because WGSL has
+/// no f64". WGSL indeed has no f64, but that is NOT a reason to withhold
+/// authority — the sound-resident lane certifies its error in pure f32 (Higham
+/// `γ_k·S` with outward-rounded host uniforms), and the EFT/double-single
+/// channel supplies an f64-grade compensated residual without f64. Its two
+/// primitives measured bit-exact on an Apple M5 Max/Metal adapter on 2026-08-04
+/// (509/509 and 307/307 lanes, 0 ULP). Bit-exact primitives are necessary and
+/// NOT sufficient; see `docs/METAL_EFT_VIABLE_2026-08-04.md`.
+///
+#[must_use]
+pub const fn wgpu_proof_authority() -> bool {
+    #[cfg(feature = "wgpu")]
+    {
+        PRODUCTION_WGPU_VERDICT_AUTHORITY_ENABLED
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        false
+    }
+}
+
+/// #flush-charge: whether this build's CHARGED-flush WGPU verdict gate is open.
+///
+/// Read-only exposure of `PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED`
+/// (`ops/sound_authority.rs`) so backend reporting can narrate the charged
+/// route's state without constructing a device. Like [`wgpu_proof_authority`],
+/// this is a build/source capability only and grants nothing: charged authority
+/// still requires the explicit typed request
+/// ([`crate::WgpuChargedVerdictRequest`] through
+/// [`ComputeDevice::new_for_proof_flush_charged`]) AND the complete live
+/// pure-flush admission ladder on the exact returned device. `false` here means
+/// the charged constructor refuses unconditionally.
+#[must_use]
+pub const fn wgpu_charged_proof_authority() -> bool {
+    #[cfg(feature = "wgpu")]
+    {
+        crate::wgpu_device::PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        false
+    }
+}
+
+/// Read-only hardware identity returned by the WGPU adapter enumeration probe.
+///
+/// The probe does not create a device, compile a pipeline, or grant proof
+/// authority.  Keeping the formatted identity alongside the hardware/software
+/// classification lets default-dark routing diagnostics bind measurements to
+/// the actual Metal/Vulkan/DX12 adapter even when info-level logs are disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WgpuAdapterProvenance {
+    /// Whether the selected adapter is hardware rather than a CPU rasterizer.
+    pub hardware_available: bool,
+    /// Stable human-readable adapter identity or the fail-closed probe reason.
+    pub description: String,
+}
+
+#[cfg(feature = "wgpu")]
+fn adapter_device_type_is_hardware(device_type: wgpu::DeviceType) -> bool {
+    device_type != wgpu::DeviceType::Cpu
+}
+
+/// Enumerate the preferred WGPU adapter without constructing a device.
 #[cfg(feature = "wgpu")]
 #[must_use]
-pub fn wgpu_adapter_available() -> bool {
+pub fn wgpu_adapter_provenance() -> WgpuAdapterProvenance {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -95,32 +171,72 @@ pub fn wgpu_adapter_available() -> bool {
     match adapter {
         Ok(adapter) => {
             let info = adapter.get_info();
-            let hardware = info.device_type != wgpu::DeviceType::Cpu;
-            tracing::info!(
-                "GPU adapter probe: {} ({:?}, {:?}) => hardware GPU {}",
-                info.name,
-                info.device_type,
-                info.backend,
-                if hardware {
-                    "available"
-                } else {
-                    "unavailable (software adapter)"
-                }
-            );
-            hardware
+            WgpuAdapterProvenance {
+                hardware_available: adapter_device_type_is_hardware(info.device_type),
+                description: format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend),
+            }
         }
-        Err(e) => {
-            tracing::info!("GPU adapter probe: no adapter ({e}); using CPU");
-            false
+        Err(error) => WgpuAdapterProvenance {
+            hardware_available: false,
+            description: format!("no adapter ({error})"),
+        },
+    }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod adapter_capability_tests {
+    use super::adapter_device_type_is_hardware;
+
+    #[test]
+    fn cpu_adapter_is_hermetically_classified_unavailable() {
+        assert!(!adapter_device_type_is_hardware(wgpu::DeviceType::Cpu));
+    }
+
+    #[test]
+    fn gpu_adapter_types_are_hermetically_classified_available() {
+        for device_type in [
+            wgpu::DeviceType::IntegratedGpu,
+            wgpu::DeviceType::DiscreteGpu,
+            wgpu::DeviceType::VirtualGpu,
+        ] {
+            assert!(adapter_device_type_is_hardware(device_type));
         }
     }
 }
 
-/// No-wgpu builds have no adapter to probe.
+/// No-wgpu builds retain explicit provenance for the unavailable adapter.
 #[cfg(not(feature = "wgpu"))]
 #[must_use]
+pub fn wgpu_adapter_provenance() -> WgpuAdapterProvenance {
+    WgpuAdapterProvenance {
+        hardware_available: false,
+        description: "wgpu backend not compiled".to_string(),
+    }
+}
+
+/// Runtime probe: is a real (hardware) GPU adapter available to wgpu?
+///
+/// Complements [`wgpu_backend_compiled`] as the AUTO-backend capability hint
+/// when the `GPU_AVAILABLE` env var is unset, so the hint cannot be lost across
+/// the prepare/run script process boundary (#vnncomp-gpu-routing). Costs one
+/// adapter enumeration (no device or pipeline init). Software rasterizers
+/// (llvmpipe/SwiftShader report `DeviceType::Cpu`) return `false` — preferring
+/// wgpu on those would be a slowdown, not an acceleration. Like the env hint,
+/// this only feeds the default backend *preference*; it never forces GPU use
+/// nor changes a verdict.
+#[must_use]
 pub fn wgpu_adapter_available() -> bool {
-    false
+    let probe = wgpu_adapter_provenance();
+    tracing::info!(
+        "GPU adapter probe: {} => hardware GPU {}",
+        probe.description,
+        if probe.hardware_available {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+    probe.hardware_available
 }
 
 /// Process-shared CPU-variant [`ComputeDevice`], for handing an engine to
@@ -157,6 +273,77 @@ impl ComputeDevice {
         }
     }
 
+    /// Create one explicitly qualified WGPU proof device.
+    ///
+    /// This constructor creates exactly one WGPU context, eagerly evaluates all
+    /// five authority rungs on it, and returns that same device only when the
+    /// complete report passes. The typed error preserves both the report and
+    /// any underlying NY device/probe error. Only the CROWN-backward trait seam
+    /// is opened; GEMM, convolution, IBP, and DAG accessors stay quarantined.
+    #[cfg(feature = "wgpu")]
+    pub fn new_for_proof(
+        request: WgpuVerdictRequest,
+    ) -> std::result::Result<Self, WgpuVerdictQualificationError> {
+        WgpuDevice::new_for_verdict(request).map(|device| Self::Wgpu(Box::new(device)))
+    }
+
+    /// Create one explicitly retained-BaB-qualified WGPU proof device.
+    ///
+    /// This distinct router consumes [`WgpuBabBoundVerdictRequest`]; ordinary,
+    /// full-verdict, and charged constructors cannot drift into retained-BaB
+    /// authority. Production currently refuses in a static preflight before
+    /// device creation because all retained-BaB implementation gates are dark.
+    #[cfg(feature = "wgpu")]
+    pub fn new_for_proof_bab_bound(
+        request: WgpuBabBoundVerdictRequest,
+    ) -> std::result::Result<Self, WgpuBabBoundQualificationError> {
+        WgpuDevice::new_for_verdict_bab_bound(request).map(|device| Self::Wgpu(Box::new(device)))
+    }
+
+    /// #flush-charge: create one explicitly CHARGED-flush qualified WGPU proof
+    /// device (see `WgpuDevice::new_for_verdict_flush_charged`).
+    ///
+    /// A separate typed request keeps every existing `new_for_proof` call site
+    /// out of charged mode. Admits only when the reviewed charged source gate
+    /// is open (it is, since the 2026-08-13 review) AND the adapter measures
+    /// PURE-FLUSH with rungs 1/4/5 passing and rung 3 failing; refuses typed,
+    /// with the complete report, otherwise. Only the
+    /// CROWN-backward trait seam opens; GEMM, convolution, IBP, and DAG
+    /// accessors stay quarantined exactly as for the fully qualified device.
+    #[cfg(feature = "wgpu")]
+    pub fn new_for_proof_flush_charged(
+        request: WgpuChargedVerdictRequest,
+    ) -> std::result::Result<Self, WgpuVerdictQualificationError> {
+        WgpuDevice::new_for_verdict_flush_charged(request)
+            .map(|device| Self::Wgpu(Box::new(device)))
+    }
+
+    /// #flush-charge TEST-SCOPED wrapper over
+    /// `WgpuDevice::test_only_new_flush_charged_for_acceptance_evidence`.
+    /// Compiled out of every production build (`cfg(any(test, feature =
+    /// "gpu-tests"))`; the `gpu-tests` feature exists only for real-adapter
+    /// test invocations and no production crate enables it), so no production
+    /// caller can name or reach it. See the device-level constructor's docs
+    /// for the acceptance-evidence contract; production admission still goes
+    /// only through `new_for_proof_flush_charged` and its full live ladder.
+    #[cfg(all(feature = "wgpu", any(test, feature = "gpu-tests")))]
+    pub fn test_only_new_for_proof_flush_charged_acceptance_evidence(
+    ) -> std::result::Result<Self, WgpuVerdictQualificationError> {
+        WgpuDevice::test_only_new_flush_charged_for_acceptance_evidence()
+            .map(|device| Self::Wgpu(Box::new(device)))
+    }
+
+    /// Successful WGPU verdict report attached to this exact proof device.
+    /// Returns `None` for CPU and ordinary/unqualified WGPU devices.
+    #[cfg(feature = "wgpu")]
+    #[must_use]
+    pub fn wgpu_verdict_report(&self) -> Option<&WgpuVerdictReport> {
+        match self {
+            Self::Cpu(_) => None,
+            Self::Wgpu(device) => device.verdict_report(),
+        }
+    }
+
     /// Get the backend type of this device.
     pub fn backend(&self) -> Backend {
         match self {
@@ -189,7 +376,7 @@ impl ComputeDevice {
         match self {
             ComputeDevice::Cpu(d) => d.attention_ibp(q, k, v, scale),
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.attention_ibp(q, k, v, scale),
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("attention IBP")),
         }
     }
 
@@ -209,7 +396,7 @@ impl ComputeDevice {
         match self {
             ComputeDevice::Cpu(d) => d.causal_attention_ibp(q, k, v, scale),
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.causal_attention_ibp(q, k, v, scale),
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("causal-attention IBP")),
         }
     }
 
@@ -228,7 +415,7 @@ impl ComputeDevice {
         match self {
             ComputeDevice::Cpu(d) => d.cross_attention_ibp(q, k, v, scale),
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.cross_attention_ibp(q, k, v, scale),
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("cross-attention IBP")),
         }
     }
 }
@@ -241,6 +428,22 @@ impl ComputeDevice {
 const CPU_FAST_F32_GEMM_MIN_MACS: usize = 1 << 24;
 
 impl GemmEngine for ComputeDevice {
+    fn backend_provenance(&self) -> &'static str {
+        match self {
+            ComputeDevice::Cpu(_) => "compute-device-cpu",
+            #[cfg(feature = "wgpu")]
+            ComputeDevice::Wgpu(device) if device.sound_gpu_authority_cached() => {
+                "wgpu-qualified-crown"
+            }
+            #[cfg(feature = "wgpu")]
+            ComputeDevice::Wgpu(device) if device.charged_flush_authority_cached().is_some() => {
+                "wgpu-qualified-crown-flush-charged"
+            }
+            #[cfg(feature = "wgpu")]
+            ComputeDevice::Wgpu(_) => "wgpu-quarantined",
+        }
+    }
+
     fn gemm_f32(
         &self,
         _m: usize,
@@ -266,21 +469,7 @@ impl GemmEngine for ComputeDevice {
                 ))
             }
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => {
-                // No MACs gate here: this substitutes cuBLAS for the wgpu WGSL
-                // shader (never for CPU — the caller already chose the engine
-                // path), and cuBLAS is measured faster than the shader at every
-                // shape (floors ~17 µs vs ~63 µs; 2–3.4× at hotspot sizes).
-                // Numerics stay IEEE RN-f32 (the accelerator's contract), which
-                // the verdict-feeding IBP call sites certify with
-                // order-independent ULP widening. Err falls back to the shader.
-                if let Some(Ok(c)) =
-                    ny_propagate::fast_f32_gemm::with_engine(|e| e.gemm_f32(_m, _k, _n, _a, _b))
-                {
-                    return Ok(c);
-                }
-                d.gemm_f32(_m, _k, _n, _a, _b)
-            }
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("GEMM")),
         }
     }
 
@@ -309,14 +498,7 @@ impl GemmEngine for ComputeDevice {
                 ))
             }
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => {
-                if let Some(Ok(c)) = ny_propagate::fast_f32_gemm::with_engine(|e| {
-                    e.gemm_f32_fast(_m, _k, _n, _a, _b)
-                }) {
-                    return Ok(c);
-                }
-                d.gemm_f32(_m, _k, _n, _a, _b)
-            }
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("fast GEMM")),
         }
     }
 
@@ -328,7 +510,7 @@ impl GemmEngine for ComputeDevice {
     ) -> Result<Vec<f32>> {
         match self {
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.conv_transpose_2d(_a_reshaped, _weight_col, _params),
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("transpose convolution")),
             _ => Err(NyError::UnsupportedOp(
                 "conv_transpose_2d not supported by this backend".into(),
             )),
@@ -343,12 +525,9 @@ impl GemmEngine for ComputeDevice {
         _params: &ny_core::ConvTranspose2dParams,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         match self {
-            // Route to the WgpuDevice fused plan cache (weight uploaded once, lower
-            // and upper fused into ONE 2*S dispatch). Without this forward the enum
-            // hit the trait default (two separate dispatches) — #4276 T1.0.
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => {
-                d.conv_transpose_2d_pair_cached(_a_lower, _a_upper, _weight_col, _params)
+            ComputeDevice::Wgpu(_) => {
+                Err(wgpu_proof_quarantine("cached transpose-convolution pair"))
             }
             _ => {
                 let lower = self.conv_transpose_2d(_a_lower, _weight_col, _params)?;
@@ -360,37 +539,22 @@ impl GemmEngine for ComputeDevice {
 
     fn as_gpu_crown_backward(&self) -> Option<&dyn ny_core::GpuCrownBackward> {
         match self {
+            ComputeDevice::Cpu(_) => None,
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.as_gpu_crown_backward(),
-            _ => None,
+            ComputeDevice::Wgpu(device) => device.as_gpu_crown_backward(),
         }
     }
 
     fn as_gpu_ibp_forward(&self) -> Option<&dyn ny_core::GpuIbpForward> {
-        match self {
-            #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.as_gpu_ibp_forward(),
-            _ => None,
-        }
+        None
     }
 
     fn as_gpu_ibp_forward_ext(&self) -> Option<&dyn ny_core::GpuIbpForwardExt> {
-        match self {
-            #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.as_gpu_ibp_forward_ext(),
-            _ => None,
-        }
+        None
     }
 
     fn as_gpu_dag_ibp_forward_ext(&self) -> Option<&dyn ny_core::GpuDagIbpForwardExt> {
-        match self {
-            // Forward the cached graph-DAG GPU-resident IBP planner. Without this the
-            // enum returned the trait default `None`, silently CPU-falling the whole
-            // GPU-resident DAG IBP forward path (#4276, #4318 T1.0).
-            #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.as_gpu_dag_ibp_forward_ext(),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -404,7 +568,7 @@ impl AcceleratedBoundPropagation for ComputeDevice {
         match self {
             ComputeDevice::Cpu(d) => d.linear_ibp(input, weight, bias),
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.linear_ibp(input, weight, bias),
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("linear IBP")),
         }
     }
 
@@ -416,7 +580,7 @@ impl AcceleratedBoundPropagation for ComputeDevice {
         match self {
             ComputeDevice::Cpu(d) => d.matmul_ibp(input_a, input_b),
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.matmul_ibp(input_a, input_b),
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("matrix-multiply IBP")),
         }
     }
 
@@ -428,7 +592,7 @@ impl AcceleratedBoundPropagation for ComputeDevice {
         match self {
             ComputeDevice::Cpu(d) => d.crown_per_position_parallel(graph, input),
             #[cfg(feature = "wgpu")]
-            ComputeDevice::Wgpu(d) => d.crown_per_position_parallel(graph, input),
+            ComputeDevice::Wgpu(_) => Err(wgpu_proof_quarantine("parallel CROWN")),
         }
     }
 }
@@ -465,10 +629,31 @@ mod fast_f32_seam_tests {
 
     /// Cpu-variant routing: >= the MACs gate goes to the installed accelerator,
     /// below it keeps the historical Err (callers use their own CPU paths).
-    /// One test covers both directions because the fast_f32_gemm global is
-    /// process-wide and install order across tests is not guaranteed.
+    /// The assertion body runs in an exact-test child because the
+    /// `fast_f32_gemm` registry is process-wide and immutable after first use.
     #[test]
     fn cpu_variant_offloads_large_f32_gemm_and_rejects_small() {
+        const CHILD_MARKER: &str = "NY_GPU_FAST_F32_SEAM_CHILD";
+        const TEST_NAME: &str =
+            "backend::fast_f32_seam_tests::cpu_variant_offloads_large_f32_gemm_and_rejects_small";
+
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("locate ny-gpu unit-test executable"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .output()
+            .expect("spawn isolated fast-f32 seam test");
+            assert!(
+                output.status.success(),
+                "isolated fast-f32 seam test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
         let engine = Arc::new(CountingGemm {
             hits: AtomicUsize::new(0),
         });
@@ -485,12 +670,10 @@ mod fast_f32_seam_tests {
         assert_eq!(engine.hits.load(Ordering::SeqCst), 0);
 
         // Large: 256^3 = 2^24 MACs = exactly the gate; must route to the engine.
-        // (Skip gracefully if another test materialized the global as None
-        // before our install — process-global OnceLock, order-dependent.)
-        if ny_propagate::fast_f32_gemm::with_engine(|_| ()).is_none() {
-            eprintln!("skipping: fast_f32_gemm global already materialized empty");
-            return;
-        }
+        assert!(
+            ny_propagate::fast_f32_gemm::with_engine(|_| ()).is_some(),
+            "isolated test must install the counting fast-f32 engine"
+        );
         let dim = 256;
         let a = vec![0.5f32; dim * dim];
         let b = vec![2.0f32; dim * dim];
@@ -506,33 +689,92 @@ mod fast_f32_seam_tests {
     }
 }
 
+#[cfg(all(test, feature = "wgpu"))]
+mod bab_bound_api_routing_tests {
+    use super::*;
+
+    #[test]
+    fn distinct_bab_router_refuses_before_gpu_initialization_while_default_dark() {
+        let result = ComputeDevice::new_for_proof_bab_bound(WgpuBabBoundVerdictRequest::new());
+        let error = match result {
+            Ok(_) => panic!("default-dark retained-BaB router unexpectedly created a device"),
+            Err(error) => error,
+        };
+        assert!(error.verdict_report().is_none());
+        assert!(error.to_string().contains("source gate is closed"));
+    }
+
+    #[test]
+    fn explicit_request_and_router_signatures_are_not_generic_verdict_routes() {
+        let _device_constructor: fn(
+            WgpuBabBoundVerdictRequest,
+        ) -> std::result::Result<
+            WgpuDevice,
+            WgpuBabBoundQualificationError,
+        > = WgpuDevice::new_for_verdict_bab_bound;
+        let _router: fn(
+            WgpuBabBoundVerdictRequest,
+        )
+            -> std::result::Result<ComputeDevice, WgpuBabBoundQualificationError> =
+            ComputeDevice::new_for_proof_bab_bound;
+        let _ordinary: fn(Backend) -> Result<ComputeDevice> = ComputeDevice::new;
+        let _full: fn(
+            WgpuVerdictRequest,
+        )
+            -> std::result::Result<ComputeDevice, WgpuVerdictQualificationError> =
+            ComputeDevice::new_for_proof;
+    }
+}
+
 #[cfg(all(test, feature = "gpu-tests"))]
 mod dag_ibp_routing_tests {
     use super::*;
 
-    /// The `ComputeDevice` enum must FORWARD the optional GPU-resident accessors to
-    /// its wgpu backend. Before #4276/#4318 T1.0 it dropped
-    /// `as_gpu_dag_ibp_forward_ext` (→ trait default `None`) and
-    /// `conv_transpose_2d_pair_cached` (→ default two-dispatch), so a GPU-resident
-    /// DAG IBP forward silently ran on the CPU even with a GPU present. Assert the
-    /// wgpu variant now reports the planner; the sibling ext accessors are checked as
-    /// a routing sanity net against a future re-drop.
+    /// Ordinary construction is never proof authority, even on a conformant
+    /// adapter and regardless of ambient process state.
     #[test]
-    fn compute_device_wgpu_forwards_gpu_resident_accessors() {
-        let device = match ComputeDevice::new(Backend::Wgpu) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("skipping: no wgpu device available ({e})");
-                return;
+    fn ordinary_compute_device_wgpu_quarantines_all_gpu_resident_accessors() {
+        let device = ComputeDevice::new(Backend::Wgpu)
+            .expect("live WGPU quarantine test requires a usable device");
+        assert_eq!(device.backend_provenance(), "wgpu-quarantined");
+        assert!(device.wgpu_verdict_report().is_none());
+        assert!(device.as_gpu_dag_ibp_forward_ext().is_none());
+        assert!(device.as_gpu_ibp_forward().is_none());
+        assert!(device.as_gpu_ibp_forward_ext().is_none());
+        assert!(device.as_gpu_crown_backward().is_none());
+        match &device {
+            ComputeDevice::Wgpu(device) => {
+                assert!(
+                    !ny_core::GpuCrownBackward::provides_sound_gpu_bab_bound_phase(device.as_ref())
+                );
+                assert!(
+                    ny_core::GpuCrownBackward::gpu_bab_bound_numerical_tcb(device.as_ref())
+                        .is_none()
+                );
             }
-        };
-        assert!(
-            device.as_gpu_dag_ibp_forward_ext().is_some(),
-            "ComputeDevice::Wgpu must forward the graph-DAG GPU-resident IBP planner \
-             (was None pre-T1.0 → silent CPU fallback)"
-        );
-        assert!(device.as_gpu_ibp_forward().is_some());
-        assert!(device.as_gpu_ibp_forward_ext().is_some());
-        assert!(device.as_gpu_crown_backward().is_some());
+            ComputeDevice::Cpu(_) => unreachable!("requested WGPU backend"),
+        }
+    }
+
+    /// A qualified proof device opens exactly the CROWN accessor. All broader
+    /// engine and resident-forward surfaces remain closed.
+    #[test]
+    fn qualified_compute_device_opens_only_crown_backward() {
+        let device = ComputeDevice::new_for_proof(WgpuVerdictRequest::new())
+            .expect("gpu-tests proof routing requires a conformant WGPU adapter");
+        let report = device
+            .wgpu_verdict_report()
+            .expect("qualified ComputeDevice must retain its report");
+        assert!(report.qualified());
+        assert_eq!(device.backend_provenance(), "wgpu-qualified-crown");
+        let crown = device
+            .as_gpu_crown_backward()
+            .expect("qualified WGPU exposes ordinary sound CROWN");
+        assert!(!crown.provides_sound_gpu_bab_bound_phase());
+        assert!(crown.gpu_bab_bound_numerical_tcb().is_none());
+        assert!(device.as_gpu_dag_ibp_forward_ext().is_none());
+        assert!(device.as_gpu_ibp_forward().is_none());
+        assert!(device.as_gpu_ibp_forward_ext().is_none());
+        assert!(device.gemm_f32(1, 1, 1, &[1.0], &[1.0]).is_err());
     }
 }

@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use ndarray::{ArrayD, IxDyn};
 use prost::Message;
 
 use super::{
@@ -43,6 +44,61 @@ fn test_estimate_model_cost_single_linear_counts_flops_and_memory() {
     assert_eq!(result.layers[0].parameter_input_bytes, 36);
     assert_eq!(result.layers[0].total_tensor_traffic_bytes, 56);
     assert_eq!(result.layers[0].timing_family, "dense_mac");
+}
+
+#[test]
+fn test_estimate_model_cost_skips_importer_folded_constant_layer() {
+    let mut weights = WeightStore::new();
+    for name in ["weight_a", "weight_b", "folded_mm"] {
+        weights.insert(name.to_string(), ArrayD::zeros(IxDyn(&[1, 1])));
+    }
+    let model = OnnxModel::empty_with_network(
+        Network {
+            name: "folded_constant_cost".to_string(),
+            inputs: vec![TensorSpec {
+                name: "input".to_string(),
+                shape: vec![1, 2],
+                dtype: DataType::Float32,
+            }],
+            outputs: vec![TensorSpec {
+                name: "output".to_string(),
+                shape: vec![1, 2],
+                dtype: DataType::Float32,
+            }],
+            layers: vec![
+                LayerSpec {
+                    name: "folded_matmul".to_string(),
+                    layer_type: LayerType::MatMul,
+                    inputs: vec!["weight_a".to_string(), "weight_b".to_string()],
+                    outputs: vec!["folded_mm".to_string()],
+                    weights: None,
+                    attributes: std::collections::HashMap::new(),
+                },
+                LayerSpec {
+                    name: "runtime_relu".to_string(),
+                    layer_type: LayerType::ReLU,
+                    inputs: vec!["input".to_string()],
+                    outputs: vec!["output".to_string()],
+                    weights: None,
+                    attributes: std::collections::HashMap::new(),
+                },
+            ],
+            param_count: 3,
+        },
+        weights,
+    )
+    .with_tensor_shapes(std::collections::HashMap::from([
+        ("input".to_string(), vec![1, 2]),
+        ("output".to_string(), vec![1, 2]),
+        ("folded_mm".to_string(), vec![1, 1]),
+    ]));
+
+    let result =
+        estimate_model_cost(&model).expect("constant-only layer should have zero runtime cost");
+
+    assert_eq!(result.layers.len(), 1);
+    assert_eq!(result.layers[0].name, "runtime_relu");
+    assert_eq!(result.total_flops, 2);
 }
 
 #[ntest::timeout(10000)]
@@ -631,6 +687,7 @@ fn concretize_all_dynamic_dims(proto: &mut onnx_proto::ModelProto, default_value
     };
     set_dims(&mut graph.input);
     set_dims(&mut graph.output);
+    #[cfg(feature = "onnx-value-info")]
     set_dims(&mut graph.value_info);
 }
 
@@ -772,8 +829,9 @@ fn run_real_export_timing_smoke(
 
 #[ntest::timeout(60000)]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_speaker_encoder_timing_profile_smoke_3498() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = load_speaker_encoder_timing_model();
     let (cost, timing) = run_real_export_timing_smoke(&model, "speaker encoder");
 
@@ -802,8 +860,9 @@ fn test_avoice_speaker_encoder_timing_profile_smoke_3498() {
 
 #[ntest::timeout(60000)]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_talker_attention_timing_profile_smoke_3498() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let model = load_talker_attention_timing_model();
     let (cost, timing) = run_real_export_timing_smoke(&model, "talker attention");
 
@@ -829,8 +888,9 @@ fn test_avoice_talker_attention_timing_profile_smoke_3498() {
 
 #[ntest::timeout(60000)]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_kokoro_vocoder_timing_profile_smoke_3498() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let model = load_kokoro_vocoder_timing_model();
     let (cost, timing) = run_real_export_timing_smoke(&model, "kokoro vocoder");
 
@@ -855,8 +915,9 @@ fn test_avoice_kokoro_vocoder_timing_profile_smoke_3498() {
 
 #[ntest::timeout(120000)]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_duration_predictor_timing_profile_smoke_3498() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_duration_predictor.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_duration_predictor.onnx");
     let model = load_duration_predictor_timing_model();
     let (cost, timing) = run_real_export_timing_smoke(&model, "duration predictor");
 

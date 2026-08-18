@@ -26,6 +26,10 @@ mod disjunctive_multi_clause;
 /// Lane hooks for the lsnc certified f64 tail pass
 /// (docs/LSNC_F64_TAIL_DESIGN.md; gate `NY_F64_TAIL=1`, default OFF).
 mod f64_tail;
+/// Default-dark exact-domain Clip-and-Verify route.  The bound-producing
+/// callback is invoked on one domain at a time and the returned planes stay
+/// paired with that exact source box, preventing parent-plane reuse.
+mod fresh_domain_clip;
 pub(crate) mod grouped_semantics;
 pub(crate) mod ibp_prescreen;
 mod ibp_prescreen_flat;
@@ -37,8 +41,10 @@ mod multi_objective;
 pub(crate) mod parent_clip;
 pub(crate) mod root_bounds;
 /// Saturation-Escape Branching (SEB) advisory input-split scorer
-/// (docs/SATURATION_ESCAPE_BRANCHING_DESIGN.md; gate `NY_SAT_ESCAPE_BRANCH=1`,
-/// default OFF). Advisory only — reorders which dims to split, never a bound.
+/// (docs/SATURATION_ESCAPE_BRANCHING_DESIGN.md; preset
+/// `bab.branching.input_split.sat_escape_branch`, env `NY_SAT_ESCAPE_BRANCH`
+/// override, default OFF). Advisory only — reorders which dims to split,
+/// never a bound.
 pub(crate) mod sat_escape;
 pub(crate) mod shared;
 pub(crate) mod shared_specs;

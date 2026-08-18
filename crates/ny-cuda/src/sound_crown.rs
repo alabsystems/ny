@@ -28,9 +28,12 @@
 //! A size-gate keeps small nets (where the GPU launch/transfer dominates the tiny
 //! GEMMs) on the proven CPU path via `UnsupportedOp`.
 
+use ny_core::{dd::two_sum, dd_selfcheck::dd_selfcheck_ok};
 use ny_core::{
     GemmEngine, GpuCrownLayer, GpuCrownResult, GpuCrownSeed, GpuCrownTrajectoryResult,
-    GpuResidentCoeffBatched, GpuResnetBatchedDomainRef, GpuResnetSegment, NyError, Result,
+    GpuResidentCoeffBatched, GpuResnetBatchedDomainRef, GpuResnetSegment, NyError,
+    ResidentLowerCutCarrier, ResidentLowerCutChannel, Result,
+    DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
 };
 
 /// f64 unit roundoff, 2⁻⁵³ (exact).
@@ -69,14 +72,17 @@ fn layer_skeleton_matches(a: &GpuCrownLayer, b: &GpuCrownLayer) -> bool {
                 bias: ba,
                 out_features: oa,
                 in_features: ia,
+                cert_err: cea,
             },
             Linear {
                 weight: wb,
                 bias: bb,
                 out_features: ob,
                 in_features: ib,
+                cert_err: ceb,
             },
-        ) => oa == ob && ia == ib && arc_slice_eq(wa, wb) && arc_opt_slice_eq(ba, bb),
+            // #cert-err is part of the SKELETON — see the ny-gpu twin of this fn.
+        ) => oa == ob && ia == ib && cea == ceb && arc_slice_eq(wa, wb) && arc_opt_slice_eq(ba, bb),
         (
             Activation {
                 num_neurons: na, ..
@@ -101,6 +107,7 @@ fn layer_skeleton_matches(a: &GpuCrownLayer, b: &GpuCrownLayer) -> bool {
                 out_w: owa,
                 in_h: iha,
                 in_w: iwa,
+                cert_err: cea,
             },
             Conv2d {
                 weight_col: wb,
@@ -117,9 +124,12 @@ fn layer_skeleton_matches(a: &GpuCrownLayer, b: &GpuCrownLayer) -> bool {
                 out_w: owb,
                 in_h: ihb,
                 in_w: iwb,
+                cert_err: ceb,
             },
+            // #cert-err is part of the SKELETON (see the Linear arm above).
         ) => {
-            oca == ocb
+            cea == ceb
+                && oca == ocb
                 && ica == icb
                 && kha == khb
                 && kwa == kwb
@@ -335,7 +345,7 @@ fn up(x: f64) -> f32 {
 /// One SOUND f64-native linear step: `a_new = fl_f64(a@w)` (kept f64) with
 /// certified f64 error bounding `|a_new − a_exact@w|` for every exact coefficient
 /// in `[a − a_err, a + a_err]`. `a`/`a_err` are f64; `w` is the f32 weight.
-fn linear_step_f64<E: GemmEngine + ?Sized>(
+pub(crate) fn linear_step_f64<E: GemmEngine + ?Sized>(
     eng: &E,
     m: usize,
     k: usize,
@@ -365,7 +375,7 @@ fn linear_step_f64<E: GemmEngine + ?Sized>(
 /// analogue of `ny_core::crown_activation_error_step`. Returns
 /// `(new_lower_a, new_upper_a, new_lower_err, new_upper_err)`, all f64.
 #[allow(clippy::too_many_arguments)]
-fn activation_step_f64(
+pub(crate) fn activation_step_f64(
     num_outputs: usize,
     num_neurons: usize,
     lower_a: &[f64],
@@ -454,7 +464,7 @@ fn bias_fold_f64(
 
 /// SOUND f64 concretization → outward-rounded f32 `(lower, upper)` per spec.
 #[allow(clippy::too_many_arguments)]
-fn concretize_f64(
+pub(crate) fn concretize_f64(
     num_specs: usize,
     dim: usize,
     lower_a: &[f64],
@@ -470,9 +480,42 @@ fn concretize_f64(
 ) -> (Vec<f32>, Vec<f32>) {
     let gamma = gamma_k_f64(8 * dim + 8);
     let additive = 8.0 * ((dim + 1) as f64) * ETA64;
+    // #cuda-sentinel-guard: mirror the wgpu concretize preflight
+    // (`ny_propagate::bounds::concretize`, which degrades a row to ±infinity as
+    // soon as one coefficient fails `is_crown_coeff_safe`). Without this, a
+    // finite overflow-transport sentinel that reaches here is LAUNDERED: the row
+    // publishes an ordinary finite bound with no degrade, which is a tightening
+    // by an unproven path. Measured asymmetry — wgpu guards, CUDA did not.
+    //
+    // Dark-gated and default OFF (byte-identical unset) because it changes
+    // verdict-path arithmetic on a backend that cannot be exercised on this
+    // host. It only ever WIDENS (finite → ±inf), so arming it can lose a
+    // verdict but can never create a wrong one. Whoever has an NVIDIA box
+    // should arm and measure it.
+    let guard = std::env::var("NY_CUDA_CONCRETIZE_SENTINEL_GUARD")
+        .ok()
+        .is_some_and(|v| v == "1");
     let mut lo = vec![0.0f32; num_specs];
     let mut hi = vec![0.0f32; num_specs];
     for s in 0..num_specs {
+        if guard {
+            let row = s * dim;
+            let unsafe_row = !ny_core::is_crown_coeff_safe_f64(lb[s])
+                || !ny_core::is_crown_coeff_safe_f64(ub[s])
+                || !ny_core::is_crown_coeff_safe_f64(lb_err[s])
+                || !ny_core::is_crown_coeff_safe_f64(ub_err[s])
+                || (0..dim).any(|i| {
+                    !ny_core::is_crown_coeff_safe_f64(lower_a[row + i])
+                        || !ny_core::is_crown_coeff_safe_f64(upper_a[row + i])
+                        || !ny_core::is_crown_coeff_safe_f64(lower_err[row + i])
+                        || !ny_core::is_crown_coeff_safe_f64(upper_err[row + i])
+                });
+            if unsafe_row {
+                lo[s] = f32::NEG_INFINITY;
+                hi[s] = f32::INFINITY;
+                continue;
+            }
+        }
         let mut lacc = lb[s] - lb_err[s];
         let mut labs = lb[s].abs() + lb_err[s].abs();
         let mut uacc = ub[s] + ub_err[s];
@@ -706,12 +749,146 @@ fn empty_resident_coeff() -> GpuResidentCoeffBatched {
 /// Used to make the f64 bookkeeping additions below directed, rather than
 /// assuming their round-to-nearest result rounded upward.
 fn next_up_nonnegative_f64(x: f64) -> f64 {
-    debug_assert!(x.is_finite() && x >= 0.0);
-    if x == 0.0 {
-        f64::from_bits(1)
-    } else {
-        f64::from_bits(x.to_bits() + 1)
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude == 0 {
+        return f64::from_bits(1);
     }
+    if magnitude > 0x7ff0_0000_0000_0000 || bits >> 63 != 0 {
+        return f64::INFINITY;
+    }
+    if magnitude == 0x7ff0_0000_0000_0000 {
+        return x;
+    }
+    f64::from_bits(bits + 1)
+}
+
+/// Add one exact-certified lower-cut channel to a resident f64 center/error
+/// pair.
+///
+/// The carrier's `source_abs_error` already encloses its f32×f32 products,
+/// reduction, and final f64→f32 conversion.  The resident mutation itself is a
+/// binary64 add. [`two_sum`] exposes that add's exact residual, and both error
+/// additions are directed upward one binary64 ULP.  This is deliberately
+/// separate from [`merge_add`]: cut source error is proof-bearing input and may
+/// never be silently treated as an exact coefficient.
+fn add_lower_cut_channel_f64(
+    center: &mut f64,
+    abs_error: &mut f64,
+    channel: ResidentLowerCutChannel,
+) -> Result<()> {
+    if !dd_selfcheck_ok() {
+        return Err(NyError::SoundnessRefusal(
+            "cuda resident cut shadow: IEEE error-free-transform self-check failed".into(),
+        ));
+    }
+    if !center.is_finite()
+        || !abs_error.is_finite()
+        || *abs_error < 0.0
+        || !channel.value().is_finite()
+        || !channel.source_abs_error().is_finite()
+        || channel.source_abs_error() < 0.0
+    {
+        return Err(NyError::NumericalInstability(
+            "cuda resident cut shadow: invalid center/error channel".into(),
+        ));
+    }
+
+    let (sum, residual) = two_sum(*center, f64::from(channel.value()));
+    if !sum.is_finite() || !residual.is_finite() {
+        return Err(NyError::NumericalInstability(
+            "cuda resident cut shadow: coefficient mutation overflowed".into(),
+        ));
+    }
+
+    let add_error_up = |left: f64, right: f64| -> Result<f64> {
+        if !left.is_finite() || !right.is_finite() || left < 0.0 || right < 0.0 {
+            return Err(NyError::NumericalInstability(
+                "cuda resident cut shadow: invalid error accumulation".into(),
+            ));
+        }
+        let total = left + right;
+        if !total.is_finite() {
+            return Err(NyError::NumericalInstability(
+                "cuda resident cut shadow: error accumulation overflowed".into(),
+            ));
+        }
+        Ok(if total == 0.0 {
+            0.0
+        } else {
+            next_up_nonnegative_f64(total)
+        })
+    };
+
+    let source_error = f64::from(channel.source_abs_error());
+    let error = add_error_up(*abs_error, source_error)?;
+    *abs_error = add_error_up(error, residual.abs())?;
+    *center = sum;
+    Ok(())
+}
+
+/// Apply one complete carrier channel family to the target lower frontier.
+///
+/// `post=true` selects the post-activation half and is called before the ReLU
+/// relaxation. `post=false` selects the pre-activation half and is called after
+/// it. Every row and both ordered neurons are applied or the complete scratch
+/// fold fails; there is no partial publication surface.
+fn apply_lower_cut_coefficients_f64(
+    lower_a: &mut [f64],
+    lower_err: &mut [f64],
+    num_specs: usize,
+    width: usize,
+    carrier: &ResidentLowerCutCarrier,
+    post: bool,
+) -> Result<()> {
+    let expected = num_specs.checked_mul(width).ok_or_else(|| {
+        NyError::InvalidSpec("cuda resident cut shadow: coefficient shape overflow".into())
+    })?;
+    if lower_a.len() != expected
+        || lower_err.len() != expected
+        || carrier.rows().len() != num_specs
+        || carrier.target_width() != width
+    {
+        return Err(NyError::InvalidSpec(
+            "cuda resident cut shadow: target coefficient shape mismatch".into(),
+        ));
+    }
+    let pair = carrier.ordered_neurons();
+    for (row_index, row) in carrier.rows().iter().enumerate() {
+        let channels = if post { row.post() } else { row.pre() };
+        for pair_position in 0..2 {
+            let column = pair[pair_position];
+            if column >= width {
+                return Err(NyError::InvalidSpec(
+                    "cuda resident cut shadow: target neuron is outside resident width".into(),
+                ));
+            }
+            let index = row_index * width + column;
+            add_lower_cut_channel_f64(
+                &mut lower_a[index],
+                &mut lower_err[index],
+                channels[pair_position],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply the carrier's lower bias exactly once, after the target relaxation.
+fn apply_lower_cut_bias_f64(
+    lb: &mut [f64],
+    lb_err: &mut [f64],
+    carrier: &ResidentLowerCutCarrier,
+) -> Result<()> {
+    if lb.len() != carrier.rows().len() || lb_err.len() != carrier.rows().len() {
+        return Err(NyError::InvalidSpec(
+            "cuda resident cut shadow: bias row shape mismatch".into(),
+        ));
+    }
+    for (row_index, row) in carrier.rows().iter().enumerate() {
+        add_lower_cut_channel_f64(&mut lb[row_index], &mut lb_err[row_index], row.bias())?;
+    }
+    Ok(())
 }
 
 /// Convert one f64 center/error enclosure into the public f32 center/error
@@ -884,6 +1061,12 @@ struct ActAux<'a> {
     relu_grads: Vec<Vec<f32>>,
     /// OUT: per-ReLU gathered pre-transform lower-A values, row-major `specs × |idx|`.
     beta_gather: Vec<Vec<f32>>,
+    /// Complete lower-only cut carrier for one target activation.  It is
+    /// observation-only and call-local; ordinary beta/gradient constructors
+    /// always leave it absent.
+    lower_cut: Option<&'a ResidentLowerCutCarrier>,
+    /// Proves the target activation was encountered exactly once in this fold.
+    lower_cut_applied: bool,
     /// Shared fold cursor (advances once per Activation).
     cursor: usize,
 }
@@ -896,6 +1079,8 @@ impl<'a> ActAux<'a> {
             beta_gather_idx: None,
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
+            lower_cut: None,
+            lower_cut_applied: false,
             cursor: 0,
         }
     }
@@ -906,6 +1091,8 @@ impl<'a> ActAux<'a> {
             beta_gather_idx: None,
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
+            lower_cut: None,
+            lower_cut_applied: false,
             cursor: 0,
         }
     }
@@ -916,6 +1103,8 @@ impl<'a> ActAux<'a> {
             beta_gather_idx: Some(gather_idx),
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
+            lower_cut: None,
+            lower_cut_applied: false,
             cursor: 0,
         }
     }
@@ -931,6 +1120,8 @@ impl<'a> ActAux<'a> {
             beta_gather_idx: Some(gather_idx),
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
+            lower_cut: None,
+            lower_cut_applied: false,
             cursor: 0,
         }
     }
@@ -942,6 +1133,21 @@ impl<'a> ActAux<'a> {
             beta_gather_idx: None,
             relu_grads: Vec::new(),
             beta_gather: Vec::new(),
+            lower_cut: None,
+            lower_cut_applied: false,
+            cursor: 0,
+        }
+    }
+
+    fn beta_cut(signed: &'a [Vec<f32>], carrier: &'a ResidentLowerCutCarrier) -> Self {
+        ActAux {
+            beta_signed: Some(signed),
+            grad_pre_lower: None,
+            beta_gather_idx: None,
+            relu_grads: Vec::new(),
+            beta_gather: Vec::new(),
+            lower_cut: Some(carrier),
+            lower_cut_applied: false,
             cursor: 0,
         }
     }
@@ -959,6 +1165,14 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
     num_specs: usize,
     aux: &mut Option<ActAux<'_>>,
 ) -> Result<Frontier> {
+    eng.poll_crown_backward_deadline()?;
+    // #cert-err fail-closed: this is the single inner walk behind EVERY CUDA
+    // sound CROWN entry, and it charges only its own rounding against weights
+    // it treats as exact. A layer that declares a BN-fold `CertifiedWeightError`
+    // needs the `w_rel`/`bias_abs_err` charge the wgpu resident walk implements;
+    // until this walk implements it too, refuse rather than publish a radius
+    // that silently omits those terms.
+    ny_core::refuse_uncharged_certified_weight_error(layers, "cuda backward_layers_f64")?;
     let Frontier {
         mut lower_a,
         mut upper_a,
@@ -972,12 +1186,14 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
     } = f;
 
     for layer in layers {
+        eng.poll_crown_backward_deadline()?;
         match layer {
             GpuCrownLayer::Linear {
                 weight,
                 bias,
                 out_features,
                 in_features,
+                ..
             } => {
                 if dim != *out_features {
                     return Err(NyError::shape_mismatch(vec![*out_features], vec![dim]));
@@ -1055,6 +1271,39 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                     ));
                 }
                 let specs_per_domain = num_specs / activation_domains;
+                let apply_cut_here = aux.as_ref().is_some_and(|state| {
+                    state
+                        .lower_cut
+                        .is_some_and(|carrier| carrier.target_activation() == state.cursor)
+                });
+                if apply_cut_here {
+                    let state = aux.as_mut().ok_or_else(|| {
+                        NyError::InternalError(
+                            "cuda resident cut shadow: missing activation state".into(),
+                        )
+                    })?;
+                    if state.lower_cut_applied {
+                        return Err(NyError::SoundnessRefusal(
+                            "cuda resident cut shadow: target activation was applied twice".into(),
+                        ));
+                    }
+                    let carrier = state.lower_cut.ok_or_else(|| {
+                        NyError::InternalError(
+                            "cuda resident cut shadow: missing lower-cut carrier".into(),
+                        )
+                    })?;
+                    // Post channels participate in sign selection, intercept,
+                    // and slope composition, so they must land before any part
+                    // of this ReLU relaxation.
+                    apply_lower_cut_coefficients_f64(
+                        &mut lower_a,
+                        &mut lower_err,
+                        num_specs,
+                        *num_neurons,
+                        carrier,
+                        true,
+                    )?;
+                }
                 // Intercept fold: sign-routed `Σ_i a·intercept` into the running
                 // bound. As in `bias_fold_f64`, the fold's own f64 rounding is
                 // certified by `γ_{n+1}` over the computed magnitudes (incoming
@@ -1169,6 +1418,30 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                 upper_a = nua;
                 lower_err = nle;
                 upper_err = nue;
+                if apply_cut_here {
+                    let state = aux.as_mut().ok_or_else(|| {
+                        NyError::InternalError(
+                            "cuda resident cut shadow: missing activation state".into(),
+                        )
+                    })?;
+                    let carrier = state.lower_cut.ok_or_else(|| {
+                        NyError::InternalError(
+                            "cuda resident cut shadow: missing lower-cut carrier".into(),
+                        )
+                    })?;
+                    // Pre channels bypass the ReLU relaxation. The bias belongs
+                    // to the same Lagrangian row and is charged once here.
+                    apply_lower_cut_coefficients_f64(
+                        &mut lower_a,
+                        &mut lower_err,
+                        num_specs,
+                        *num_neurons,
+                        carrier,
+                        false,
+                    )?;
+                    apply_lower_cut_bias_f64(&mut lb, &mut lb_err, carrier)?;
+                    state.lower_cut_applied = true;
+                }
                 // β-CROWN split-constraint dual, folded into the POST-slope
                 // coefficient. Sound for ANY β≥0 (a valid Lagrangian dual); the f64
                 // add is over-bounded outward (U64·|·|) into the certified error.
@@ -1218,6 +1491,7 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                 out_w,
                 in_h,
                 in_w,
+                ..
             } => {
                 let (oc, ic, kh, kw) = (*out_channels, *in_channels, *kernel_h, *kernel_w);
                 let out_d = oc * out_h * out_w;
@@ -1289,6 +1563,7 @@ fn backward_layers_f64<E: GemmEngine + ?Sized>(
                 ));
             }
         }
+        eng.poll_crown_backward_deadline()?;
     }
 
     Ok(Frontier {
@@ -1435,7 +1710,9 @@ fn resnet_fold_f64_core<E: GemmEngine + ?Sized>(
         dim,
     };
 
+    eng.poll_crown_backward_deadline()?;
     for seg in segments {
+        eng.poll_crown_backward_deadline()?;
         match seg {
             GpuResnetSegment::Chain(layers) => {
                 f = backward_layers_f64(eng, layers, f, num_specs, aux)?;
@@ -1510,6 +1787,7 @@ fn resnet_fold_f64_core<E: GemmEngine + ?Sized>(
                 f = bf;
             }
         }
+        eng.poll_crown_backward_deadline()?;
     }
 
     // Every present per-ReLU aux list must be consumed exactly once (fold-order
@@ -1533,6 +1811,12 @@ fn resnet_fold_f64_core<E: GemmEngine + ?Sized>(
         if let Some(g) = a.beta_gather_idx {
             check("gather_idx", g.len())?;
         }
+        if a.lower_cut.is_some() && !a.lower_cut_applied {
+            return Err(NyError::SoundnessRefusal(
+                "cuda resident cut shadow: target activation was not encountered exactly once"
+                    .into(),
+            ));
+        }
     }
 
     Ok(f)
@@ -1550,12 +1834,10 @@ fn resnet_backward_f64_core<E: GemmEngine + ?Sized>(
     aux: &mut Option<ActAux<'_>>,
 ) -> Result<GpuCrownResult> {
     let f = resnet_fold_f64_core(eng, segments, seed, aux)?;
-    Ok(concretize_frontier(
-        &f,
-        seed.num_specs,
-        input_lower,
-        input_upper,
-    ))
+    eng.poll_crown_backward_deadline()?;
+    let result = concretize_frontier(&f, seed.num_specs, input_lower, input_upper);
+    eng.poll_crown_backward_deadline()?;
+    Ok(result)
 }
 
 struct WideResnetBatch {
@@ -1605,6 +1887,425 @@ fn validate_wide_segments_finite(segments: &[GpuResnetSegment]) -> bool {
         GpuResnetSegment::Chain(l) | GpuResnetSegment::Residual(l) => layers_ok(l),
         GpuResnetSegment::ResidualProj(f, p) => layers_ok(f) && layers_ok(p),
     })
+}
+
+const BOUNDED_ROWS_VALIDATION_CHUNK: usize = 1 << 16;
+
+fn bounded_rows_invalid(message: impl Into<String>) -> NyError {
+    NyError::InvalidSpec(format!(
+        "cuda deadline-bounded rows resnet CROWN: {}",
+        message.into()
+    ))
+}
+
+fn bounded_rows_product(values: &[usize], label: &str) -> Result<usize> {
+    values.iter().try_fold(1usize, |product, &value| {
+        product
+            .checked_mul(value)
+            .ok_or_else(|| bounded_rows_invalid(format!("{label} size overflow")))
+    })
+}
+
+fn validate_bounded_rows_finite<E: GemmEngine + ?Sized>(
+    eng: &E,
+    values: &[f32],
+    label: &str,
+) -> Result<()> {
+    for chunk in values.chunks(BOUNDED_ROWS_VALIDATION_CHUNK) {
+        eng.poll_crown_backward_deadline()?;
+        if chunk.iter().any(|value| !value.is_finite()) {
+            return Err(NyError::NumericalInstability(format!(
+                "cuda deadline-bounded rows resnet CROWN: non-finite {label}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bounded_rows_conv_geometry(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    output: usize,
+    axis: &str,
+) -> Result<()> {
+    if input == 0 || kernel == 0 || stride == 0 || output == 0 {
+        return Err(bounded_rows_invalid(format!(
+            "zero {axis} convolution dimension or stride"
+        )));
+    }
+    let doubled_padding = padding
+        .checked_mul(2)
+        .ok_or_else(|| bounded_rows_invalid(format!("{axis} padding overflow")))?;
+    let padded_input = input
+        .checked_add(doubled_padding)
+        .ok_or_else(|| bounded_rows_invalid(format!("{axis} padded input overflow")))?;
+    if padded_input < kernel {
+        return Err(bounded_rows_invalid(format!(
+            "{axis} kernel exceeds padded input"
+        )));
+    }
+    let expected_output = (padded_input - kernel) / stride + 1;
+    if output != expected_output {
+        return Err(bounded_rows_invalid(format!(
+            "{axis} convolution output mismatch: expected {expected_output}, got {output}"
+        )));
+    }
+    let max_coordinate = (output - 1)
+        .checked_mul(stride)
+        .and_then(|value| value.checked_add(kernel - 1))
+        .ok_or_else(|| bounded_rows_invalid(format!("{axis} coordinate overflow")))?;
+    if max_coordinate > isize::MAX as usize || padding > isize::MAX as usize {
+        return Err(bounded_rows_invalid(format!(
+            "{axis} convolution coordinate exceeds isize"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_bounded_rows_layer<E: GemmEngine + ?Sized>(
+    eng: &E,
+    layer: &GpuCrownLayer,
+    current_dim: usize,
+    activation_dims: &mut Vec<usize>,
+) -> Result<usize> {
+    eng.poll_crown_backward_deadline()?;
+    match layer {
+        GpuCrownLayer::Linear {
+            weight,
+            bias,
+            out_features,
+            in_features,
+            ..
+        } => {
+            if *out_features == 0 || *in_features == 0 || current_dim != *out_features {
+                return Err(bounded_rows_invalid(format!(
+                    "malformed linear dimensions: frontier={current_dim}, out={out_features}, in={in_features}"
+                )));
+            }
+            let expected_weight =
+                bounded_rows_product(&[*out_features, *in_features], "linear weight")?;
+            if weight.len() != expected_weight
+                || bias
+                    .as_ref()
+                    .is_some_and(|values| values.len() != *out_features)
+            {
+                return Err(bounded_rows_invalid(
+                    "malformed linear weight or bias shape",
+                ));
+            }
+            validate_bounded_rows_finite(eng, weight, "linear weight")?;
+            if let Some(bias) = bias {
+                validate_bounded_rows_finite(eng, bias, "linear bias")?;
+            }
+            Ok(*in_features)
+        }
+        GpuCrownLayer::Activation {
+            lower_slope,
+            upper_slope,
+            lower_intercept,
+            upper_intercept,
+            num_neurons,
+        } => {
+            if *num_neurons == 0
+                || current_dim != *num_neurons
+                || lower_slope.len() != *num_neurons
+                || upper_slope.len() != *num_neurons
+                || lower_intercept.len() != *num_neurons
+                || upper_intercept.len() != *num_neurons
+            {
+                return Err(bounded_rows_invalid(
+                    "malformed single-domain activation table",
+                ));
+            }
+            validate_bounded_rows_finite(eng, lower_slope, "activation lower slope")?;
+            validate_bounded_rows_finite(eng, upper_slope, "activation upper slope")?;
+            validate_bounded_rows_finite(eng, lower_intercept, "activation lower intercept")?;
+            validate_bounded_rows_finite(eng, upper_intercept, "activation upper intercept")?;
+            activation_dims.push(*num_neurons);
+            Ok(*num_neurons)
+        }
+        GpuCrownLayer::Conv2d {
+            weight_col,
+            bias_expanded,
+            out_channels,
+            in_channels,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+            out_h,
+            out_w,
+            in_h,
+            in_w,
+            ..
+        } => {
+            if *out_channels == 0 || *in_channels == 0 {
+                return Err(bounded_rows_invalid("zero convolution channel count"));
+            }
+            validate_bounded_rows_conv_geometry(
+                *in_h, *kernel_h, *stride_h, *pad_h, *out_h, "height",
+            )?;
+            validate_bounded_rows_conv_geometry(
+                *in_w, *kernel_w, *stride_w, *pad_w, *out_w, "width",
+            )?;
+            let output_dim =
+                bounded_rows_product(&[*out_channels, *out_h, *out_w], "convolution output")?;
+            let input_dim =
+                bounded_rows_product(&[*in_channels, *in_h, *in_w], "convolution input")?;
+            let expected_weight = bounded_rows_product(
+                &[*out_channels, *in_channels, *kernel_h, *kernel_w],
+                "convolution weight",
+            )?;
+            if current_dim != output_dim
+                || weight_col.len() != expected_weight
+                || bias_expanded
+                    .as_ref()
+                    .is_some_and(|values| values.len() != output_dim)
+            {
+                return Err(bounded_rows_invalid(
+                    "malformed convolution frontier, weight, or bias shape",
+                ));
+            }
+            // Prove every unchecked workspace product in the shared fold is
+            // representable before it can allocate or index.
+            bounded_rows_product(
+                &[2 * DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS, output_dim],
+                "convolution output workspace",
+            )?;
+            bounded_rows_product(
+                &[2 * DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS, input_dim],
+                "convolution input workspace",
+            )?;
+            validate_bounded_rows_finite(eng, weight_col, "convolution weight")?;
+            if let Some(bias) = bias_expanded {
+                validate_bounded_rows_finite(eng, bias, "convolution bias")?;
+            }
+            Ok(input_dim)
+        }
+        _ => Err(NyError::UnsupportedOp(
+            "cuda deadline-bounded rows resnet CROWN supports only Linear/Activation/Conv2d layers"
+                .into(),
+        )),
+    }
+}
+
+fn validate_bounded_rows_chain<E: GemmEngine + ?Sized>(
+    eng: &E,
+    layers: &[GpuCrownLayer],
+    start_dim: usize,
+    activation_dims: &mut Vec<usize>,
+) -> Result<usize> {
+    if layers.is_empty() {
+        return Err(bounded_rows_invalid("empty segment branch"));
+    }
+    layers.iter().try_fold(start_dim, |current_dim, layer| {
+        validate_bounded_rows_layer(eng, layer, current_dim, activation_dims)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_deadline_bounded_rows_resnet_request<E: GemmEngine + ?Sized>(
+    eng: &E,
+    segments: &[GpuResnetSegment],
+    seed: &GpuCrownSeed,
+    input_lower: &[f32],
+    input_upper: &[f32],
+    frontier_abs: &[Vec<f32>],
+    node_abs: &[Vec<f32>],
+) -> Result<()> {
+    eng.poll_crown_backward_deadline()?;
+    if !(2..=DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS).contains(&seed.num_specs) {
+        return Err(bounded_rows_invalid(format!(
+            "row count must be in 2..={}, got {}",
+            DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS, seed.num_specs
+        )));
+    }
+    if segments.is_empty() || seed.current_dim == 0 {
+        return Err(bounded_rows_invalid(
+            "empty segment list or zero seed width",
+        ));
+    }
+    let expected_seed_a =
+        bounded_rows_product(&[seed.num_specs, seed.current_dim], "seed coefficient")?;
+    if seed.lower_a.len() != expected_seed_a
+        || seed.upper_a.len() != expected_seed_a
+        || seed.lower_b.len() != seed.num_specs
+        || seed.upper_b.len() != seed.num_specs
+    {
+        return Err(bounded_rows_invalid("malformed seed shape"));
+    }
+    validate_bounded_rows_finite(eng, &seed.lower_a, "seed lower coefficients")?;
+    validate_bounded_rows_finite(eng, &seed.upper_a, "seed upper coefficients")?;
+    validate_bounded_rows_finite(eng, &seed.lower_b, "seed lower biases")?;
+    validate_bounded_rows_finite(eng, &seed.upper_b, "seed upper biases")?;
+
+    let mut current_dim = seed.current_dim;
+    let mut activation_dims = Vec::new();
+    for (segment_index, segment) in segments.iter().enumerate() {
+        eng.poll_crown_backward_deadline()?;
+        current_dim = match segment {
+            GpuResnetSegment::Chain(layers) => {
+                validate_bounded_rows_chain(eng, layers, current_dim, &mut activation_dims)?
+            }
+            GpuResnetSegment::Residual(layers) => {
+                let branch_dim =
+                    validate_bounded_rows_chain(eng, layers, current_dim, &mut activation_dims)?;
+                if branch_dim != current_dim {
+                    return Err(bounded_rows_invalid(format!(
+                        "identity residual dimension mismatch: branch={branch_dim}, skip={current_dim}"
+                    )));
+                }
+                branch_dim
+            }
+            GpuResnetSegment::ResidualProj(f_branch, p_branch) => {
+                let f_dim =
+                    validate_bounded_rows_chain(eng, f_branch, current_dim, &mut activation_dims)?;
+                let p_dim =
+                    validate_bounded_rows_chain(eng, p_branch, current_dim, &mut activation_dims)?;
+                if f_dim != p_dim {
+                    return Err(bounded_rows_invalid(format!(
+                        "projection residual branch mismatch: F={f_dim}, P={p_dim}"
+                    )));
+                }
+                f_dim
+            }
+        };
+        if !frontier_abs.is_empty() {
+            let values = frontier_abs.get(segment_index).ok_or_else(|| {
+                bounded_rows_invalid("frontier-abs table is shorter than the segment list")
+            })?;
+            if values.len() != current_dim {
+                return Err(bounded_rows_invalid(format!(
+                    "frontier-abs width mismatch at segment {segment_index}: expected {current_dim}, got {}",
+                    values.len()
+                )));
+            }
+            validate_bounded_rows_finite(eng, values, "frontier-abs value")?;
+        }
+    }
+    if !frontier_abs.is_empty() && frontier_abs.len() != segments.len() {
+        return Err(bounded_rows_invalid(
+            "frontier-abs table length does not match the segment list",
+        ));
+    }
+
+    if !node_abs.is_empty() {
+        if node_abs.len() != activation_dims.len() {
+            return Err(bounded_rows_invalid(
+                "node-abs table length does not match the activation fold",
+            ));
+        }
+        for (index, (values, expected_dim)) in node_abs.iter().zip(activation_dims).enumerate() {
+            if values.len() != expected_dim {
+                return Err(bounded_rows_invalid(format!(
+                    "node-abs width mismatch at activation {index}: expected {expected_dim}, got {}",
+                    values.len()
+                )));
+            }
+            validate_bounded_rows_finite(eng, values, "node-abs value")?;
+        }
+    }
+
+    if input_lower.len() != current_dim || input_upper.len() != current_dim {
+        return Err(bounded_rows_invalid(format!(
+            "input box width mismatch: expected {current_dim}, got lower={} upper={}",
+            input_lower.len(),
+            input_upper.len()
+        )));
+    }
+    validate_bounded_rows_finite(eng, input_lower, "input lower bound")?;
+    validate_bounded_rows_finite(eng, input_upper, "input upper bound")?;
+    if input_lower
+        .iter()
+        .zip(input_upper)
+        .any(|(&lower, &upper)| lower > upper)
+    {
+        return Err(bounded_rows_invalid("inverted input interval"));
+    }
+    eng.poll_crown_backward_deadline()
+}
+
+fn validate_deadline_bounded_rows_resnet_result(
+    rows: usize,
+    result: &GpuCrownResult,
+) -> Result<()> {
+    if result.lower_bounds.len() != rows || result.upper_bounds.len() != rows {
+        return Err(bounded_rows_invalid(format!(
+            "result shape mismatch: expected {rows}, got lower={} upper={}",
+            result.lower_bounds.len(),
+            result.upper_bounds.len()
+        )));
+    }
+    if result
+        .lower_bounds
+        .iter()
+        .zip(&result.upper_bounds)
+        .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+    {
+        return Err(NyError::NumericalInstability(
+            "cuda deadline-bounded rows resnet CROWN: result intervals must be finite and ordered"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_deadline_bounded_beta_table<E: GemmEngine + ?Sized>(
+    eng: &E,
+    segments: &[GpuResnetSegment],
+    beta_signed: &[Vec<f32>],
+) -> Result<()> {
+    fn validate_chain<E: GemmEngine + ?Sized>(
+        eng: &E,
+        layers: &[GpuCrownLayer],
+        beta_signed: &[Vec<f32>],
+        cursor: &mut usize,
+    ) -> Result<()> {
+        for layer in layers {
+            eng.poll_crown_backward_deadline()?;
+            if let GpuCrownLayer::Activation { num_neurons, .. } = layer {
+                let values = beta_signed.get(*cursor).ok_or_else(|| {
+                    bounded_rows_invalid("beta table is shorter than the activation fold")
+                })?;
+                if values.len() != *num_neurons {
+                    return Err(bounded_rows_invalid(format!(
+                        "beta width mismatch at activation {}: expected {}, got {}",
+                        *cursor,
+                        *num_neurons,
+                        values.len()
+                    )));
+                }
+                validate_bounded_rows_finite(eng, values, "beta value")?;
+                *cursor += 1;
+            }
+        }
+        Ok(())
+    }
+
+    let mut cursor = 0usize;
+    for segment in segments {
+        eng.poll_crown_backward_deadline()?;
+        match segment {
+            GpuResnetSegment::Chain(layers) | GpuResnetSegment::Residual(layers) => {
+                validate_chain(eng, layers, beta_signed, &mut cursor)?;
+            }
+            GpuResnetSegment::ResidualProj(function, projection) => {
+                validate_chain(eng, function, beta_signed, &mut cursor)?;
+                validate_chain(eng, projection, beta_signed, &mut cursor)?;
+            }
+        }
+    }
+    if cursor != beta_signed.len() {
+        return Err(bounded_rows_invalid(format!(
+            "beta table length mismatch: consumed {cursor}, got {}",
+            beta_signed.len()
+        )));
+    }
+    eng.poll_crown_backward_deadline()
 }
 
 /// Assemble domain-major rows for Hydra's CUDA proof forest.  This is all
@@ -1824,6 +2525,7 @@ fn update_wide_memory_shape(layers: &[GpuCrownLayer], shape: &mut WideMemoryShap
                 bias,
                 out_features,
                 in_features,
+                ..
             } => {
                 shape.max_work_width = shape.max_work_width.max(*out_features).max(*in_features);
                 shape.max_weight_elems = shape.max_weight_elems.max(
@@ -2510,6 +3212,69 @@ pub(crate) fn crown_backward_gpu_resnet_sound_impl<E: GemmEngine + ?Sized>(
     resnet_backward_f64_core(eng, segments, seed, input_lower, input_upper, &mut None)
 }
 
+/// Dedicated one-row sibling for a call-local deadline-bearing CUDA adapter.
+///
+/// The ordinary entry's [`MIN_RESIDENT_MACS`] threshold is only a throughput
+/// policy. The critical-row experiment deliberately requests one row, so it
+/// must bypass that policy without weakening the structural or numerical
+/// checks in the shared sound f64 core. The adapter supplies bounded f64
+/// triplets and cooperative host-fold polling; this entry independently refuses
+/// every wider seed.
+pub(crate) fn crown_backward_gpu_resnet_sound_single_row_with_deadline_impl<
+    E: GemmEngine + ?Sized,
+>(
+    eng: &E,
+    segments: &[GpuResnetSegment],
+    seed: &GpuCrownSeed,
+    input_lower: &[f32],
+    input_upper: &[f32],
+) -> Result<GpuCrownResult> {
+    if seed.num_specs != 1 {
+        return Err(NyError::UnsupportedOp(
+            "cuda deadline-bounded resnet sound CROWN requires exactly one specification row"
+                .into(),
+        ));
+    }
+    resnet_backward_f64_core(eng, segments, seed, input_lower, input_upper, &mut None)
+}
+
+/// Dedicated K-row sibling for the call-local deadline-bearing CUDA adapter.
+///
+/// The public trait surface delegates K=1 to the historical single-row entry,
+/// so this additive core accepts exactly `2..=8`. It bypasses only the ordinary
+/// throughput size-gate. All request data is validated before the first GEMM,
+/// the shared sound f64 fold polls through the adapter, and the returned vector
+/// is independently required to contain one finite, ordered interval per row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn crown_backward_gpu_resnet_sound_bounded_rows_with_deadline_impl<
+    E: GemmEngine + ?Sized,
+>(
+    eng: &E,
+    segments: &[GpuResnetSegment],
+    seed: &GpuCrownSeed,
+    input_lower: &[f32],
+    input_upper: &[f32],
+    frontier_abs: &[Vec<f32>],
+    node_abs: &[Vec<f32>],
+) -> Result<GpuCrownResult> {
+    validate_deadline_bounded_rows_resnet_request(
+        eng,
+        segments,
+        seed,
+        input_lower,
+        input_upper,
+        frontier_abs,
+        node_abs,
+    )?;
+    eng.poll_crown_backward_deadline()?;
+    let result =
+        resnet_backward_f64_core(eng, segments, seed, input_lower, input_upper, &mut None)?;
+    eng.poll_crown_backward_deadline()?;
+    validate_deadline_bounded_rows_resnet_result(seed.num_specs, &result)?;
+    eng.poll_crown_backward_deadline()?;
+    Ok(result)
+}
+
 /// SOUND f64-native GPU-resident β-CROWN RESNET seeded backward (T1.3): the
 /// [`crown_backward_gpu_resnet_sound_impl`] path with the per-domain β-CROWN split
 /// dual `beta_signed` (per-ReLU `β·sign`, fold order: each branch's Activations in
@@ -2537,6 +3302,141 @@ pub(crate) fn crown_backward_gpu_resnet_sound_beta_impl<E: GemmEngine + ?Sized>(
         input_upper,
         &mut Some(ActAux::beta(beta_signed)),
     )
+}
+
+/// Dedicated `2..=8` row beta-CROWN sibling for a call-local deadline-bearing
+/// CUDA adapter.
+///
+/// This bypasses only the ordinary throughput size-gate. The complete request,
+/// including the per-activation beta table, is validated before the shared
+/// sound f64 fold. The adapter bounds every DGEMM and the fold polls it between
+/// layers; no partial result is returned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn crown_backward_gpu_resnet_sound_beta_bounded_rows_with_deadline_impl<
+    E: GemmEngine + ?Sized,
+>(
+    eng: &E,
+    segments: &[GpuResnetSegment],
+    seed: &GpuCrownSeed,
+    input_lower: &[f32],
+    input_upper: &[f32],
+    beta_signed: &[Vec<f32>],
+    frontier_abs: &[Vec<f32>],
+    node_abs: &[Vec<f32>],
+) -> Result<GpuCrownResult> {
+    validate_deadline_bounded_rows_resnet_request(
+        eng,
+        segments,
+        seed,
+        input_lower,
+        input_upper,
+        frontier_abs,
+        node_abs,
+    )?;
+    validate_deadline_bounded_beta_table(eng, segments, beta_signed)?;
+    eng.poll_crown_backward_deadline()?;
+    let result = resnet_backward_f64_core(
+        eng,
+        segments,
+        seed,
+        input_lower,
+        input_upper,
+        &mut Some(ActAux::beta(beta_signed)),
+    )?;
+    eng.poll_crown_backward_deadline()?;
+    validate_deadline_bounded_rows_resnet_result(seed.num_specs, &result)?;
+    eng.poll_crown_backward_deadline()?;
+    Ok(result)
+}
+
+/// Observation-only Cut-CROWN sibling of
+/// [`crown_backward_gpu_resnet_sound_beta_impl`].
+///
+/// This executes the same optimized f64 resident fold with one complete,
+/// already-authorized arithmetic carrier threaded through its activation
+/// cursor. All coefficient/bias mutation is confined to the fold's owned
+/// frontier. Therefore any validation, numeric, or deadline error drops the
+/// complete scratch result and cannot publish a partial bound or coefficient
+/// cache.
+pub(crate) fn crown_backward_gpu_resnet_sound_beta_cut_shadow_impl<E: GemmEngine + ?Sized>(
+    eng: &E,
+    segments: &[GpuResnetSegment],
+    seed: &GpuCrownSeed,
+    input_lower: &[f32],
+    input_upper: &[f32],
+    beta_signed: &[Vec<f32>],
+    carrier: &ResidentLowerCutCarrier,
+    deadline: std::time::Instant,
+) -> Result<GpuCrownResult> {
+    let activation_widths = resident_activation_widths(segments)?;
+    let target_width = activation_widths
+        .get(carrier.target_activation())
+        .copied()
+        .ok_or_else(|| {
+            NyError::InvalidSpec(
+                "cuda resident cut shadow: target activation is outside the fold".into(),
+            )
+        })?;
+    carrier.validate_for_call(
+        activation_widths.len(),
+        target_width,
+        seed.num_specs,
+        deadline,
+    )?;
+    if resnet_max_macs(segments, seed.num_specs) < MIN_RESIDENT_MACS {
+        return Err(NyError::UnsupportedOp(
+            "cuda cut-shadow resnet CROWN: net below GPU size-gate".into(),
+        ));
+    }
+    eng.poll_crown_backward_deadline()?;
+
+    let mut aux = Some(ActAux::beta_cut(beta_signed, carrier));
+    let bounds = resnet_backward_f64_core(eng, segments, seed, input_lower, input_upper, &mut aux)?;
+    eng.poll_crown_backward_deadline()?;
+    if !aux.as_ref().is_some_and(|state| state.lower_cut_applied) {
+        return Err(NyError::SoundnessRefusal(
+            "cuda resident cut shadow: complete target mutation was not observed".into(),
+        ));
+    }
+    Ok(bounds)
+}
+
+fn resident_activation_widths(segments: &[GpuResnetSegment]) -> Result<Vec<usize>> {
+    let mut widths = Vec::new();
+    let mut visit = |layers: &[GpuCrownLayer]| -> Result<()> {
+        for layer in layers {
+            match layer {
+                GpuCrownLayer::Activation { num_neurons, .. }
+                | GpuCrownLayer::ActivationReluDualAlpha { num_neurons, .. } => {
+                    if *num_neurons == 0 {
+                        return Err(NyError::InvalidSpec(
+                            "cuda resident cut shadow: zero-width activation".into(),
+                        ));
+                    }
+                    widths.push(*num_neurons);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    };
+    for segment in segments {
+        match segment {
+            GpuResnetSegment::Chain(layers) | GpuResnetSegment::Residual(layers) => {
+                visit(layers)?;
+            }
+            GpuResnetSegment::ResidualProj(function, projection) => {
+                visit(function)?;
+                visit(projection)?;
+            }
+        }
+    }
+    if widths.is_empty() {
+        return Err(NyError::InvalidSpec(
+            "cuda resident cut shadow: decomposition has no activation".into(),
+        ));
+    }
+    Ok(widths)
 }
 
 /// Guard-only form of [`crown_backward_gpu_resnet_sound_beta_impl`].
@@ -2628,6 +3528,186 @@ pub(crate) fn crown_backward_gpu_resnet_sound_beta_batched_impl<E: GemmEngine + 
 ) -> Result<Vec<GpuCrownResult>> {
     resnet_backward_f64_wide_chunked(eng, domains, seed, &[], &[], false)
         .map(|(bounds, _, _, _)| bounds)
+}
+
+/// Coefficient-capturing sibling used by Complete Clipping.
+///
+/// The downloaded affine frontier is checked by a second, independently
+/// assembled wide fold before it leaves the CUDA boundary.  The replay reverses
+/// both the domain axis and the seed-row axis, then maps every scalar result and
+/// every coefficient/error/bias cell back to the primary layout.  This catches
+/// exactly the two layout mistakes that are catastrophic for clipping (using
+/// another child's row or another objective's row).  Any bit disagreement
+/// refuses coefficient authority; the caller can still fall back to the
+/// ordinary bound-only path.
+#[allow(dead_code)] // quarantined at the public backend boundary; retained with its oracles for repair
+pub(crate) fn crown_backward_gpu_resnet_sound_beta_batched_coeff_impl<E: GemmEngine + ?Sized>(
+    eng: &E,
+    domains: &[GpuResnetBatchedDomainRef<'_>],
+    seed: &GpuCrownSeed,
+) -> Result<(Vec<GpuCrownResult>, GpuResidentCoeffBatched)> {
+    if domains.is_empty() || seed.num_specs == 0 {
+        return Err(NyError::InvalidSpec(
+            "cuda coeff differential: empty domain or seed batch".into(),
+        ));
+    }
+
+    let (bounds, _, _, coeff) =
+        resnet_backward_f64_wide_chunked(eng, domains, seed, &[], &[], true)?;
+    let coeff = coeff.ok_or_else(|| {
+        NyError::InternalError("cuda coeff differential: primary capture missing".into())
+    })?;
+    validate_resident_coeff(&coeff)?;
+
+    let reversed_seed = reverse_seed_rows(seed)?;
+    let reversed_domains: Vec<GpuResnetBatchedDomainRef<'_>> = domains
+        .iter()
+        .rev()
+        .map(|domain| GpuResnetBatchedDomainRef {
+            segments: domain.segments,
+            input_lower: domain.input_lower,
+            input_upper: domain.input_upper,
+            beta_signed: domain.beta_signed,
+            frontier_abs: domain.frontier_abs,
+            node_abs: domain.node_abs,
+        })
+        .collect();
+    let (replay_bounds, _, _, replay_coeff) =
+        resnet_backward_f64_wide_chunked(eng, &reversed_domains, &reversed_seed, &[], &[], true)?;
+    let replay_coeff = replay_coeff.ok_or_else(|| {
+        NyError::InternalError("cuda coeff differential: replay capture missing".into())
+    })?;
+    validate_resident_coeff(&replay_coeff)?;
+    validate_reversed_coeff_replay(
+        &bounds,
+        &coeff,
+        &replay_bounds,
+        &replay_coeff,
+        domains.len(),
+        seed.num_specs,
+    )?;
+    Ok((bounds, coeff))
+}
+
+fn reverse_seed_rows(seed: &GpuCrownSeed) -> Result<GpuCrownSeed> {
+    let rows = seed.num_specs;
+    let dim = seed.current_dim;
+    let cells = rows
+        .checked_mul(dim)
+        .ok_or_else(|| NyError::InvalidSpec("cuda coeff differential: seed overflow".into()))?;
+    if seed.lower_a.len() != cells
+        || seed.upper_a.len() != cells
+        || seed.lower_b.len() != rows
+        || seed.upper_b.len() != rows
+    {
+        return Err(NyError::InvalidSpec(
+            "cuda coeff differential: malformed seed".into(),
+        ));
+    }
+    let mut lower_a = vec![0.0f32; cells];
+    let mut upper_a = vec![0.0f32; cells];
+    let mut lower_b = vec![0.0f32; rows];
+    let mut upper_b = vec![0.0f32; rows];
+    for replay_row in 0..rows {
+        let source_row = rows - 1 - replay_row;
+        let replay_start = replay_row * dim;
+        let source_start = source_row * dim;
+        lower_a[replay_start..replay_start + dim]
+            .copy_from_slice(&seed.lower_a[source_start..source_start + dim]);
+        upper_a[replay_start..replay_start + dim]
+            .copy_from_slice(&seed.upper_a[source_start..source_start + dim]);
+        lower_b[replay_row] = seed.lower_b[source_row];
+        upper_b[replay_row] = seed.upper_b[source_row];
+    }
+    Ok(GpuCrownSeed {
+        lower_a: lower_a.into(),
+        upper_a: upper_a.into(),
+        lower_b: lower_b.into(),
+        upper_b: upper_b.into(),
+        num_specs: rows,
+        current_dim: dim,
+    })
+}
+
+fn validate_reversed_coeff_replay(
+    primary_bounds: &[GpuCrownResult],
+    primary: &GpuResidentCoeffBatched,
+    replay_bounds: &[GpuCrownResult],
+    replay: &GpuResidentCoeffBatched,
+    domains: usize,
+    rows: usize,
+) -> Result<()> {
+    let expected_rows = domains.checked_mul(rows).ok_or_else(|| {
+        NyError::InvalidSpec("cuda coeff differential: row count overflow".into())
+    })?;
+    if primary_bounds.len() != domains
+        || replay_bounds.len() != domains
+        || primary.dim != replay.dim
+        || primary.num_specs != expected_rows
+        || replay.num_specs != expected_rows
+        || primary.num_specs_per_dom != rows
+        || replay.num_specs_per_dom != rows
+    {
+        return Err(NyError::InvalidSpec(
+            "cuda coeff differential: primary/replay shape mismatch".into(),
+        ));
+    }
+
+    let mismatch = || {
+        NyError::NumericalInstability(
+            "cuda coeff differential: reversed all-row replay mismatch".into(),
+        )
+    };
+    let same = |a: f32, b: f32| a.to_bits() == b.to_bits();
+    for domain in 0..domains {
+        let replay_domain = domains - 1 - domain;
+        let pb = &primary_bounds[domain];
+        let rb = &replay_bounds[replay_domain];
+        if pb.lower_bounds.len() != rows
+            || pb.upper_bounds.len() != rows
+            || rb.lower_bounds.len() != rows
+            || rb.upper_bounds.len() != rows
+        {
+            return Err(NyError::InvalidSpec(
+                "cuda coeff differential: bound row shape mismatch".into(),
+            ));
+        }
+        for row in 0..rows {
+            let replay_row = rows - 1 - row;
+            if !same(pb.lower_bounds[row], rb.lower_bounds[replay_row])
+                || !same(pb.upper_bounds[row], rb.upper_bounds[replay_row])
+            {
+                return Err(mismatch());
+            }
+            let primary_flat = domain * rows + row;
+            let replay_flat = replay_domain * rows + replay_row;
+            for (left, right) in [
+                (&primary.lower_b, &replay.lower_b),
+                (&primary.upper_b, &replay.upper_b),
+                (&primary.lower_b_err, &replay.lower_b_err),
+                (&primary.upper_b_err, &replay.upper_b_err),
+            ] {
+                if !same(left[primary_flat], right[replay_flat]) {
+                    return Err(mismatch());
+                }
+            }
+            let primary_start = primary_flat * primary.dim;
+            let replay_start = replay_flat * replay.dim;
+            for column in 0..primary.dim {
+                for (left, right) in [
+                    (&primary.lower_a, &replay.lower_a),
+                    (&primary.upper_a, &replay.upper_a),
+                    (&primary.lower_err, &replay.lower_err),
+                    (&primary.upper_err, &replay.upper_err),
+                ] {
+                    if !same(left[primary_start + column], right[replay_start + column]) {
+                        return Err(mismatch());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Gradient-capturing sibling used by the production wide β-ascent loop.  β
@@ -2775,8 +3855,17 @@ pub(crate) fn crown_backward_gpu_sound_impl<E: GemmEngine + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CudaGemmEngine;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn nonnegative_successor_classifies_subnormals_by_bits() {
+        assert_eq!(next_up_nonnegative_f64(f64::from_bits(7)).to_bits(), 8);
+        assert_eq!(
+            next_up_nonnegative_f64(f64::from_bits(0x8000_0000_0000_0000)).to_bits(),
+            1
+        );
+        assert_eq!(next_up_nonnegative_f64(f64::NAN), f64::INFINITY);
+    }
 
     #[derive(Default)]
     struct RecordingCpuGemm {
@@ -2825,6 +3914,7 @@ mod tests {
             bias: Some(Arc::from(vec![0.1, -0.2])),
             out_features: 2,
             in_features: 2,
+            cert_err: Default::default(),
         };
         let d = domain as f32;
         let activation = GpuCrownLayer::Activation {
@@ -2839,6 +3929,7 @@ mod tests {
             bias: Some(Arc::from(vec![0.05, 0.12])),
             out_features: 2,
             in_features: 2,
+            cert_err: Default::default(),
         };
         OwnedDomain {
             segments: vec![GpuResnetSegment::Chain(vec![output, activation, input])],
@@ -2846,6 +3937,487 @@ mod tests {
             hi: vec![0.9 + 0.05 * d, 1.2 - 0.1 * d],
             beta: vec![vec![0.03 * (d + 1.0), -0.02 * d]],
         }
+    }
+
+    fn cut_channel(value: f32, source_abs_error: f32) -> ResidentLowerCutChannel {
+        ResidentLowerCutChannel::try_new(value, source_abs_error)
+            .expect("finite resident cut test channel")
+    }
+
+    fn diamond_cut_carrier(
+        deadline: std::time::Instant,
+        bias_source_abs_error: f32,
+    ) -> ResidentLowerCutCarrier {
+        ResidentLowerCutCarrier::try_new(
+            0,
+            2,
+            [0, 1],
+            vec![ny_core::ResidentLowerCutRow::try_new(
+                vec![1.0],
+                [cut_channel(-0.5, 0.0), cut_channel(-0.5, 0.0)],
+                [cut_channel(1.0, 0.0), cut_channel(1.0, 0.0)],
+                cut_channel(-1.0, bias_source_abs_error),
+            )
+            .expect("complete diamond row")],
+            deadline,
+        )
+        .expect("complete diamond carrier")
+    }
+
+    fn diamond_cut_fixture() -> (Vec<GpuResnetSegment>, GpuCrownSeed, Vec<Vec<f32>>) {
+        let activation = GpuCrownLayer::Activation {
+            lower_slope: vec![0.0, 0.0],
+            upper_slope: vec![0.5, 0.5],
+            lower_intercept: vec![0.0, 0.0],
+            upper_intercept: vec![1.0, 1.0],
+            num_neurons: 2,
+        };
+        let input = GpuCrownLayer::Linear {
+            weight: Arc::from([1.0_f32, 1.0, 1.0, -1.0]),
+            bias: Some(Arc::from([0.0_f32, 0.0])),
+            out_features: 2,
+            in_features: 2,
+            cert_err: Default::default(),
+        };
+        let seed = GpuCrownSeed {
+            lower_a: Arc::from([-1.0_f32, -1.0]),
+            upper_a: Arc::from([-1.0_f32, -1.0]),
+            lower_b: Arc::from([0.0_f32]),
+            upper_b: Arc::from([0.0_f32]),
+            num_specs: 1,
+            current_dim: 2,
+        };
+        (
+            vec![GpuResnetSegment::Chain(vec![activation, input])],
+            seed,
+            vec![vec![0.0, 0.0]],
+        )
+    }
+
+    fn residual_proj_cut_fixture() -> (Vec<GpuResnetSegment>, GpuCrownSeed, Vec<Vec<f32>>) {
+        let exact_activation = |width| GpuCrownLayer::Activation {
+            lower_slope: vec![1.0; width],
+            upper_slope: vec![1.0; width],
+            lower_intercept: vec![0.0; width],
+            upper_intercept: vec![0.0; width],
+            num_neurons: width,
+        };
+        let triangle_activation = GpuCrownLayer::Activation {
+            lower_slope: vec![0.0, 0.0],
+            upper_slope: vec![0.5, 0.5],
+            lower_intercept: vec![0.0, 0.0],
+            upper_intercept: vec![1.0, 1.0],
+            num_neurons: 2,
+        };
+
+        // Backward fold order is F([act width 2, linear 2→3, act width 3,
+        // linear 3→2]) followed by P([act width 2, linear 2→2]). The zero F
+        // weights isolate cursor placement from the projection's diamond
+        // arithmetic while retaining two differently-sized F activations.
+        let function = vec![
+            exact_activation(2),
+            GpuCrownLayer::Linear {
+                weight: Arc::from(vec![0.0_f32; 2 * 3]),
+                bias: None,
+                out_features: 2,
+                in_features: 3,
+                cert_err: Default::default(),
+            },
+            exact_activation(3),
+            GpuCrownLayer::Linear {
+                weight: Arc::from(vec![0.0_f32; 3 * 2]),
+                bias: None,
+                out_features: 3,
+                in_features: 2,
+                cert_err: Default::default(),
+            },
+        ];
+        let projection = vec![
+            triangle_activation,
+            GpuCrownLayer::Linear {
+                weight: Arc::from([1.0_f32, 1.0, 1.0, -1.0]),
+                bias: None,
+                out_features: 2,
+                in_features: 2,
+                cert_err: Default::default(),
+            },
+        ];
+        let seed = GpuCrownSeed {
+            lower_a: Arc::from([-1.0_f32, -1.0]),
+            upper_a: Arc::from([-1.0_f32, -1.0]),
+            lower_b: Arc::from([0.0_f32]),
+            upper_b: Arc::from([0.0_f32]),
+            num_specs: 1,
+            current_dim: 2,
+        };
+        (
+            vec![GpuResnetSegment::ResidualProj(function, projection)],
+            seed,
+            vec![vec![0.0; 2], vec![0.0; 3], vec![0.0; 2]],
+        )
+    }
+
+    #[test]
+    fn cut_shadow_f64_fold_applies_post_pre_and_bias_once() {
+        let (segments, seed, beta) = diamond_cut_fixture();
+        let engine = RecordingCpuGemm::default();
+        let baseline = resnet_backward_f64_core(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &mut Some(ActAux::beta(&beta)),
+        )
+        .expect("diamond baseline");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let carrier = diamond_cut_carrier(deadline, 0.0);
+        let mut aux = Some(ActAux::beta_cut(&beta, &carrier));
+        let shadow = resnet_backward_f64_core(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &mut aux,
+        )
+        .expect("diamond cut shadow");
+
+        assert!(aux.is_some_and(|state| state.lower_cut_applied));
+        assert!(
+            (-3.0 - 8.0 * f32::EPSILON..=-3.0).contains(&baseline.lower_bounds[0]),
+            "independent triangle baseline must enclose -3"
+        );
+        assert!(
+            (-2.0 - 8.0 * f32::EPSILON..=-2.0).contains(&shadow.lower_bounds[0]),
+            "post cancellation + pre pair + one bias must enclose -2, got {}",
+            shadow.lower_bounds[0]
+        );
+        assert!(shadow.lower_bounds[0] > baseline.lower_bounds[0] + 0.99);
+        assert_eq!(
+            shadow.upper_bounds[0].to_bits(),
+            baseline.upper_bounds[0].to_bits(),
+            "lower-only carrier must not perturb the upper channel"
+        );
+    }
+
+    #[test]
+    fn cut_shadow_f64_fold_charges_source_error_outward() {
+        let (segments, seed, beta) = diamond_cut_fixture();
+        let engine = RecordingCpuGemm::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let exact = diamond_cut_carrier(deadline, 0.0);
+        let charged = diamond_cut_carrier(deadline, 0.25);
+        let exact_bound = resnet_backward_f64_core(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &mut Some(ActAux::beta_cut(&beta, &exact)),
+        )
+        .expect("exact-source cut shadow");
+        let charged_bound = resnet_backward_f64_core(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &mut Some(ActAux::beta_cut(&beta, &charged)),
+        )
+        .expect("charged-source cut shadow");
+        assert!(
+            charged_bound.lower_bounds[0] <= exact_bound.lower_bounds[0] - 0.25,
+            "source uncertainty must weaken the lower bound outward"
+        );
+        assert_eq!(
+            charged_bound.upper_bounds[0].to_bits(),
+            exact_bound.upper_bounds[0].to_bits()
+        );
+    }
+
+    #[test]
+    fn cut_shadow_residual_proj_cursor_visits_f_then_p_without_reset() {
+        let (segments, seed, beta) = residual_proj_cut_fixture();
+        let engine = RecordingCpuGemm::default();
+        let baseline = resnet_backward_f64_core(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &mut Some(ActAux::beta(&beta)),
+        )
+        .expect("ResidualProj baseline");
+        assert!(
+            (-3.0 - 16.0 * f32::EPSILON..=-3.0).contains(&baseline.lower_bounds[0]),
+            "isolated projection diamond must enclose -3, got {}",
+            baseline.lower_bounds[0]
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let zero = cut_channel(0.0, 0.0);
+        // Cursor 1 is F's second activation and uniquely has width 3. A cursor
+        // reset, P-before-F traversal, or width-table drift must reject this
+        // carrier instead of silently applying its one bias at another ReLU.
+        let f_cursor_marker = ResidentLowerCutCarrier::try_new(
+            1,
+            3,
+            [0, 2],
+            vec![ny_core::ResidentLowerCutRow::try_new(
+                vec![1.0],
+                [zero, zero],
+                [zero, zero],
+                cut_channel(-1.0, 0.0),
+            )
+            .expect("complete F cursor marker")],
+            deadline,
+        )
+        .expect("F cursor carrier");
+        let mut f_aux = Some(ActAux::beta_cut(&beta, &f_cursor_marker));
+        let f_marked = resnet_backward_f64_core(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &mut f_aux,
+        )
+        .expect("F cursor cut fold");
+        assert!(f_aux.is_some_and(|state| state.lower_cut_applied));
+        assert!(
+            (-4.0 - 16.0 * f32::EPSILON..=-4.0).contains(&f_marked.lower_bounds[0]),
+            "F cursor marker bias must be applied exactly once, got {}",
+            f_marked.lower_bounds[0]
+        );
+
+        // Cursor 2 is P's width-2 activation, after both F activations. The
+        // diamond carrier must tighten only the projection contribution from
+        // approximately -3 to -2.
+        let p_diamond = ResidentLowerCutCarrier::try_new(
+            2,
+            2,
+            [0, 1],
+            vec![ny_core::ResidentLowerCutRow::try_new(
+                vec![1.0],
+                [cut_channel(-0.5, 0.0), cut_channel(-0.5, 0.0)],
+                [cut_channel(1.0, 0.0), cut_channel(1.0, 0.0)],
+                cut_channel(-1.0, 0.0),
+            )
+            .expect("complete P diamond row")],
+            deadline,
+        )
+        .expect("P cursor carrier");
+        let mut p_aux = Some(ActAux::beta_cut(&beta, &p_diamond));
+        let p_cut = resnet_backward_f64_core(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &mut p_aux,
+        )
+        .expect("P cursor cut fold");
+        assert!(p_aux.is_some_and(|state| state.lower_cut_applied));
+        assert!(
+            (-2.0 - 16.0 * f32::EPSILON..=-2.0).contains(&p_cut.lower_bounds[0]),
+            "P diamond must land after both F activations and enclose -2, got {}",
+            p_cut.lower_bounds[0]
+        );
+        assert_eq!(
+            f_marked.upper_bounds[0].to_bits(),
+            baseline.upper_bounds[0].to_bits(),
+            "F cursor marker is lower-only"
+        );
+        assert_eq!(
+            p_cut.upper_bounds[0].to_bits(),
+            baseline.upper_bounds[0].to_bits(),
+            "P cursor diamond is lower-only"
+        );
+    }
+
+    #[test]
+    fn cut_shadow_expired_carrier_refuses_before_any_fold_dispatch() {
+        let (segments, seed, beta) = diamond_cut_fixture();
+        let engine = RecordingCpuGemm::default();
+        let deadline = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second of monotonic history");
+        let carrier = diamond_cut_carrier(deadline, 0.0);
+        let error = crown_backward_gpu_resnet_sound_beta_cut_shadow_impl(
+            &engine,
+            &segments,
+            &seed,
+            &[-1.0, -1.0],
+            &[1.0, 1.0],
+            &beta,
+            &carrier,
+            deadline,
+        )
+        .expect_err("expired complete carrier must refuse");
+        assert!(error.is_deadline_exceeded());
+        assert!(
+            engine.calls.lock().expect("recording lock").is_empty(),
+            "expired carrier must refuse before any GEMM dispatch"
+        );
+    }
+
+    fn differential_fixture(
+        domains: usize,
+        rows: usize,
+        dim: usize,
+    ) -> (
+        Vec<GpuCrownResult>,
+        GpuResidentCoeffBatched,
+        Vec<GpuCrownResult>,
+        GpuResidentCoeffBatched,
+    ) {
+        let total = domains * rows;
+        let mut primary = GpuResidentCoeffBatched {
+            lower_a: vec![0.0; total * dim],
+            upper_a: vec![0.0; total * dim],
+            lower_err: vec![0.0; total * dim],
+            upper_err: vec![0.0; total * dim],
+            lower_b: vec![0.0; total],
+            upper_b: vec![0.0; total],
+            lower_b_err: vec![0.0; total],
+            upper_b_err: vec![0.0; total],
+            dim,
+            num_specs: total,
+            num_specs_per_dom: rows,
+        };
+        let mut primary_bounds = Vec::with_capacity(domains);
+        for domain in 0..domains {
+            let mut lower_bounds = Vec::with_capacity(rows);
+            let mut upper_bounds = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let flat = domain * rows + row;
+                let base = (100 * domain + 10 * row) as f32;
+                primary.lower_b[flat] = base + 0.1;
+                primary.upper_b[flat] = base + 0.2;
+                primary.lower_b_err[flat] = base + 0.3;
+                primary.upper_b_err[flat] = base + 0.4;
+                lower_bounds.push(base + 0.5);
+                upper_bounds.push(base + 0.6);
+                for column in 0..dim {
+                    let value = base + column as f32;
+                    let cell = flat * dim + column;
+                    primary.lower_a[cell] = value + 1.0;
+                    primary.upper_a[cell] = value + 2.0;
+                    primary.lower_err[cell] = value + 3.0;
+                    primary.upper_err[cell] = value + 4.0;
+                }
+            }
+            primary_bounds.push(GpuCrownResult {
+                lower_bounds,
+                upper_bounds,
+            });
+        }
+
+        let mut replay = empty_resident_coeff();
+        replay.dim = dim;
+        replay.num_specs = total;
+        replay.num_specs_per_dom = rows;
+        replay.lower_a.resize(total * dim, 0.0);
+        replay.upper_a.resize(total * dim, 0.0);
+        replay.lower_err.resize(total * dim, 0.0);
+        replay.upper_err.resize(total * dim, 0.0);
+        replay.lower_b.resize(total, 0.0);
+        replay.upper_b.resize(total, 0.0);
+        replay.lower_b_err.resize(total, 0.0);
+        replay.upper_b_err.resize(total, 0.0);
+        let mut replay_bounds: Vec<GpuCrownResult> = (0..domains)
+            .map(|_| GpuCrownResult {
+                lower_bounds: vec![0.0; rows],
+                upper_bounds: vec![0.0; rows],
+            })
+            .collect();
+        for domain in 0..domains {
+            for row in 0..rows {
+                let source = domain * rows + row;
+                let replay_domain = domains - 1 - domain;
+                let replay_row = rows - 1 - row;
+                let target = replay_domain * rows + replay_row;
+                replay.lower_b[target] = primary.lower_b[source];
+                replay.upper_b[target] = primary.upper_b[source];
+                replay.lower_b_err[target] = primary.lower_b_err[source];
+                replay.upper_b_err[target] = primary.upper_b_err[source];
+                replay_bounds[replay_domain].lower_bounds[replay_row] =
+                    primary_bounds[domain].lower_bounds[row];
+                replay_bounds[replay_domain].upper_bounds[replay_row] =
+                    primary_bounds[domain].upper_bounds[row];
+                for column in 0..dim {
+                    let source_cell = source * dim + column;
+                    let target_cell = target * dim + column;
+                    replay.lower_a[target_cell] = primary.lower_a[source_cell];
+                    replay.upper_a[target_cell] = primary.upper_a[source_cell];
+                    replay.lower_err[target_cell] = primary.lower_err[source_cell];
+                    replay.upper_err[target_cell] = primary.upper_err[source_cell];
+                }
+            }
+        }
+        (primary_bounds, primary, replay_bounds, replay)
+    }
+
+    #[test]
+    fn coeff_differential_accepts_exact_domain_and_row_permutation() {
+        let (bounds, coeff, replay_bounds, replay) = differential_fixture(3, 2, 4);
+        validate_reversed_coeff_replay(&bounds, &coeff, &replay_bounds, &replay, 3, 2)
+            .expect("exact reversed replay");
+    }
+
+    #[test]
+    fn coeff_differential_rejects_one_ulp_tamper_in_every_channel_class() {
+        let (bounds, coeff, replay_bounds, replay) = differential_fixture(2, 3, 2);
+        let reject = |mut candidate: GpuResidentCoeffBatched| {
+            assert!(validate_reversed_coeff_replay(
+                &bounds,
+                &coeff,
+                &replay_bounds,
+                &candidate,
+                2,
+                3,
+            )
+            .is_err());
+            // Keep the mutable borrow local to each invocation.
+            candidate.lower_a.clear();
+        };
+
+        let mut candidate = replay;
+        candidate.lower_a[0] = f32::from_bits(candidate.lower_a[0].to_bits() + 1);
+        reject(candidate);
+
+        let (_, _, _replay_bounds, mut replay) = differential_fixture(2, 3, 2);
+        replay.upper_b[1] = f32::from_bits(replay.upper_b[1].to_bits() + 1);
+        reject(replay);
+
+        let (_, _, mut replay_bounds, replay) = differential_fixture(2, 3, 2);
+        replay_bounds[0].lower_bounds[0] =
+            f32::from_bits(replay_bounds[0].lower_bounds[0].to_bits() + 1);
+        assert!(
+            validate_reversed_coeff_replay(&bounds, &coeff, &replay_bounds, &replay, 2, 3,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reverse_seed_rows_reverses_coefficients_and_biases_together() {
+        let seed = GpuCrownSeed {
+            lower_a: Arc::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            upper_a: Arc::from(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+            lower_b: Arc::from(vec![13.0, 14.0, 15.0]),
+            upper_b: Arc::from(vec![16.0, 17.0, 18.0]),
+            num_specs: 3,
+            current_dim: 2,
+        };
+        let reversed = reverse_seed_rows(&seed).expect("valid seed");
+        assert_eq!(reversed.lower_a.as_ref(), &[5.0, 6.0, 3.0, 4.0, 1.0, 2.0]);
+        assert_eq!(
+            reversed.upper_a.as_ref(),
+            &[11.0, 12.0, 9.0, 10.0, 7.0, 8.0]
+        );
+        assert_eq!(reversed.lower_b.as_ref(), &[15.0, 14.0, 13.0]);
+        assert_eq!(reversed.upper_b.as_ref(), &[18.0, 17.0, 16.0]);
     }
 
     struct OwnedResidualDomain {
@@ -2882,6 +4454,7 @@ mod tests {
                 bias: Some(Arc::from(bias)),
                 out_features,
                 in_features,
+                cert_err: Default::default(),
             };
         let conv1x1 = |weight: Vec<f32>, bias: Vec<f32>| GpuCrownLayer::Conv2d {
             weight_col: Arc::from(weight),
@@ -2898,6 +4471,7 @@ mod tests {
             out_w: 1,
             in_h: 1,
             in_w: 1,
+            cert_err: Default::default(),
         };
 
         // Backward order: output chain, identity residual, projection residual,
@@ -2970,6 +4544,7 @@ mod tests {
             bias: Some(Arc::from(vec![0.0; 100])),
             out_features: 100,
             in_features: 2048,
+            cert_err: Default::default(),
         };
         let activation = GpuCrownLayer::Activation {
             lower_slope: vec![0.0; 55_460],
@@ -2993,6 +4568,7 @@ mod tests {
             out_w: 32,
             in_h: 34,
             in_w: 34,
+            cert_err: Default::default(),
         };
         CifarWideEstimatorFixture {
             segments: vec![GpuResnetSegment::Chain(vec![
@@ -3254,21 +4830,421 @@ mod tests {
         );
     }
 
-    /// Device qualification for the public trait seam used by the production
-    /// guard. This is intentionally below `MIN_RESIDENT_MACS`: the ordinary
-    /// entry must refuse it, while the refold oracle must execute on CUDA and
-    /// agree with the same sound core on the recording CPU engine.
     #[test]
-    fn cuda_refold_oracle_executes_on_device_below_size_gate() {
-        use ny_core::GpuCrownBackward;
-
-        let engine = match CudaGemmEngine::new() {
-            Ok(engine) => engine,
-            Err(error) => {
-                eprintln!("skipping CUDA refold-oracle test (no device): {error}");
-                return;
-            }
+    fn deadline_bounded_beta_rows_match_the_sound_serial_fold_and_validate_beta_first() {
+        let engine = RecordingCpuGemm::default();
+        let domain = tiny_wide_domain(0);
+        let seed = GpuCrownSeed {
+            lower_a: Arc::from(vec![1.0, 0.0, 0.0, 1.0]),
+            upper_a: Arc::from(vec![1.0, 0.0, 0.0, 1.0]),
+            lower_b: Arc::from(vec![0.0, 0.0]),
+            upper_b: Arc::from(vec![0.0, 0.0]),
+            num_specs: 2,
+            current_dim: 2,
         };
+        let expected = crown_backward_gpu_resnet_sound_beta_refold_oracle_impl(
+            &engine,
+            &domain.segments,
+            &seed,
+            &domain.lo,
+            &domain.hi,
+            &domain.beta,
+        )
+        .expect("sound serial beta oracle");
+        engine.calls.lock().expect("recording lock").clear();
+
+        let bounded = crown_backward_gpu_resnet_sound_beta_bounded_rows_with_deadline_impl(
+            &engine,
+            &domain.segments,
+            &seed,
+            &domain.lo,
+            &domain.hi,
+            &domain.beta,
+            &[],
+            &[],
+        )
+        .expect("bounded beta fold");
+        assert_eq!(bounded, expected);
+        assert_eq!(
+            engine.calls.lock().expect("recording lock").len(),
+            6,
+            "two affine layers x three certified-error GEMMs"
+        );
+
+        let reject_beta_before_gemm = |beta: &[Vec<f32>]| {
+            engine.calls.lock().expect("recording lock").clear();
+            let error = crown_backward_gpu_resnet_sound_beta_bounded_rows_with_deadline_impl(
+                &engine,
+                &domain.segments,
+                &seed,
+                &domain.lo,
+                &domain.hi,
+                beta,
+                &[],
+                &[],
+            )
+            .expect_err("a malformed beta table must fail before the fold");
+            assert!(
+                engine.calls.lock().expect("recording lock").is_empty(),
+                "invalid beta must not launch a GEMM: {error}"
+            );
+            error
+        };
+        assert!(matches!(
+            reject_beta_before_gemm(&[vec![f32::NAN, 0.0]]),
+            NyError::NumericalInstability(_)
+        ));
+        for malformed in [
+            Vec::<Vec<f32>>::new(),
+            vec![vec![0.0]],
+            vec![vec![0.0, 0.0], vec![0.0, 0.0]],
+        ] {
+            assert!(matches!(
+                reject_beta_before_gemm(&malformed),
+                NyError::InvalidSpec(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn deadline_single_row_resnet_bypasses_only_the_performance_gate() {
+        let engine = RecordingCpuGemm::default();
+        let domain = tiny_wide_domain(0);
+        let one_row = GpuCrownSeed {
+            lower_a: Arc::from(vec![1.0, 0.0]),
+            upper_a: Arc::from(vec![1.0, 0.0]),
+            lower_b: Arc::from(vec![0.0]),
+            upper_b: Arc::from(vec![0.0]),
+            num_specs: 1,
+            current_dim: 2,
+        };
+
+        let ordinary = crown_backward_gpu_resnet_sound_impl(
+            &engine,
+            &domain.segments,
+            &one_row,
+            &domain.lo,
+            &domain.hi,
+        )
+        .expect_err("ordinary one-row entry must retain the small-work gate");
+        assert!(matches!(ordinary, NyError::UnsupportedOp(_)));
+        assert!(engine.calls.lock().expect("recording lock").is_empty());
+
+        let result = crown_backward_gpu_resnet_sound_single_row_with_deadline_impl(
+            &engine,
+            &domain.segments,
+            &one_row,
+            &domain.lo,
+            &domain.hi,
+        )
+        .expect("dedicated one-row entry must reach the shared sound fold");
+        assert_eq!(result.lower_bounds.len(), 1);
+        assert_eq!(result.upper_bounds.len(), 1);
+        assert!(result.lower_bounds[0].is_finite());
+        assert!(result.upper_bounds[0].is_finite());
+        assert_eq!(
+            engine.calls.lock().expect("recording lock").len(),
+            6,
+            "two affine layers x three certified-error GEMMs"
+        );
+
+        engine.calls.lock().expect("recording lock").clear();
+        let two_rows = GpuCrownSeed {
+            lower_a: Arc::from(vec![1.0, 0.0, 0.0, 1.0]),
+            upper_a: Arc::from(vec![1.0, 0.0, 0.0, 1.0]),
+            lower_b: Arc::from(vec![0.0, 0.0]),
+            upper_b: Arc::from(vec![0.0, 0.0]),
+            num_specs: 2,
+            current_dim: 2,
+        };
+        let error = crown_backward_gpu_resnet_sound_single_row_with_deadline_impl(
+            &engine,
+            &domain.segments,
+            &two_rows,
+            &domain.lo,
+            &domain.hi,
+        )
+        .expect_err("dedicated entry must refuse every multi-row seed");
+        assert!(matches!(error, NyError::UnsupportedOp(_)));
+        assert!(
+            engine.calls.lock().expect("recording lock").is_empty(),
+            "multi-row refusal must occur before GEMM dispatch"
+        );
+    }
+
+    fn bounded_rows_seed(rows: usize) -> GpuCrownSeed {
+        let mut a = Vec::with_capacity(rows * 2);
+        let mut b = Vec::with_capacity(rows);
+        for row in 0..rows {
+            a.extend_from_slice(&[1.0 - 0.08 * row as f32, -0.25 + 0.04 * row as f32]);
+            b.push(0.01 * row as f32);
+        }
+        GpuCrownSeed {
+            lower_a: Arc::from(a.clone()),
+            upper_a: Arc::from(a),
+            lower_b: Arc::from(b.clone()),
+            upper_b: Arc::from(b),
+            num_specs: rows,
+            current_dim: 2,
+        }
+    }
+
+    fn one_seed_row(seed: &GpuCrownSeed, row: usize) -> GpuCrownSeed {
+        let start = row * seed.current_dim;
+        let end = start + seed.current_dim;
+        GpuCrownSeed {
+            lower_a: Arc::from(seed.lower_a[start..end].to_vec()),
+            upper_a: Arc::from(seed.upper_a[start..end].to_vec()),
+            lower_b: Arc::from(vec![seed.lower_b[row]]),
+            upper_b: Arc::from(vec![seed.upper_b[row]]),
+            num_specs: 1,
+            current_dim: seed.current_dim,
+        }
+    }
+
+    #[test]
+    fn deadline_bounded_eight_rows_match_serial_single_row_sound_core() {
+        let domain = tiny_wide_domain(0);
+        let seed = bounded_rows_seed(DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS);
+        let wide_engine = RecordingCpuGemm::default();
+        let wide = crown_backward_gpu_resnet_sound_bounded_rows_with_deadline_impl(
+            &wide_engine,
+            &domain.segments,
+            &seed,
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        )
+        .expect("the bounded K=8 sound fold must execute");
+        assert_eq!(
+            wide_engine.calls.lock().expect("recording lock").len(),
+            6,
+            "two affine layers must use one three-GEMM transaction each for the whole batch"
+        );
+
+        let serial_engine = RecordingCpuGemm::default();
+        let mut serial_lower = Vec::with_capacity(seed.num_specs);
+        let mut serial_upper = Vec::with_capacity(seed.num_specs);
+        for row in 0..seed.num_specs {
+            let result = crown_backward_gpu_resnet_sound_single_row_with_deadline_impl(
+                &serial_engine,
+                &domain.segments,
+                &one_seed_row(&seed, row),
+                &domain.lo,
+                &domain.hi,
+            )
+            .expect("serial one-row sound oracle");
+            serial_lower.push(result.lower_bounds[0]);
+            serial_upper.push(result.upper_bounds[0]);
+        }
+        assert_eq!(wide.lower_bounds, serial_lower);
+        assert_eq!(wide.upper_bounds, serial_upper);
+        assert_eq!(
+            serial_engine.calls.lock().expect("recording lock").len(),
+            6 * seed.num_specs,
+            "serial oracle must execute one complete fold per row"
+        );
+    }
+
+    #[test]
+    fn deadline_bounded_rows_reject_invalid_requests_before_any_gemm() {
+        let domain = tiny_wide_domain(0);
+        let reject = |segments: &[GpuResnetSegment],
+                      seed: &GpuCrownSeed,
+                      lower: &[f32],
+                      upper: &[f32],
+                      frontier_abs: &[Vec<f32>],
+                      node_abs: &[Vec<f32>]| {
+            let engine = RecordingCpuGemm::default();
+            crown_backward_gpu_resnet_sound_bounded_rows_with_deadline_impl(
+                &engine,
+                segments,
+                seed,
+                lower,
+                upper,
+                frontier_abs,
+                node_abs,
+            )
+            .expect_err("malformed bounded-row request must refuse");
+            assert!(
+                engine.calls.lock().expect("recording lock").is_empty(),
+                "request validation must complete before the first GEMM"
+            );
+        };
+
+        reject(
+            &domain.segments,
+            &bounded_rows_seed(0),
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        );
+        reject(
+            &domain.segments,
+            &bounded_rows_seed(DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS + 1),
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        );
+
+        let mut malformed_seed = bounded_rows_seed(2);
+        malformed_seed.lower_a = Arc::from(vec![0.0; 3]);
+        reject(
+            &domain.segments,
+            &malformed_seed,
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        );
+
+        let mut non_finite_seed = bounded_rows_seed(2);
+        non_finite_seed.upper_b = Arc::from(vec![0.0, f32::NAN]);
+        reject(
+            &domain.segments,
+            &non_finite_seed,
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        );
+
+        let mut malformed_segments = domain.segments.clone();
+        let GpuResnetSegment::Chain(layers) = &mut malformed_segments[0] else {
+            panic!("tiny fixture is a chain");
+        };
+        let GpuCrownLayer::Linear { bias, .. } = &mut layers[0] else {
+            panic!("tiny fixture starts with a linear layer");
+        };
+        *bias = Some(Arc::from(vec![0.0]));
+        reject(
+            &malformed_segments,
+            &bounded_rows_seed(2),
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        );
+
+        let mut non_finite_segments = domain.segments.clone();
+        let GpuResnetSegment::Chain(layers) = &mut non_finite_segments[0] else {
+            panic!("tiny fixture is a chain");
+        };
+        let GpuCrownLayer::Activation { lower_slope, .. } = &mut layers[1] else {
+            panic!("tiny fixture contains an activation");
+        };
+        lower_slope[0] = f32::INFINITY;
+        reject(
+            &non_finite_segments,
+            &bounded_rows_seed(2),
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        );
+
+        reject(
+            &domain.segments,
+            &bounded_rows_seed(2),
+            &[1.0, -0.7],
+            &[0.0, 1.2],
+            &[],
+            &[],
+        );
+        reject(
+            &domain.segments,
+            &bounded_rows_seed(2),
+            &[f32::NAN, -0.7],
+            &domain.hi,
+            &[],
+            &[],
+        );
+        reject(
+            &domain.segments,
+            &bounded_rows_seed(2),
+            &domain.lo,
+            &domain.hi,
+            &[vec![0.0]],
+            &[],
+        );
+        reject(
+            &domain.segments,
+            &bounded_rows_seed(2),
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[vec![0.0]],
+        );
+    }
+
+    #[test]
+    fn deadline_bounded_rows_reject_malformed_results() {
+        for result in [
+            GpuCrownResult {
+                lower_bounds: vec![0.0],
+                upper_bounds: vec![1.0, 2.0],
+            },
+            GpuCrownResult {
+                lower_bounds: vec![0.0, f32::NAN],
+                upper_bounds: vec![1.0, 2.0],
+            },
+            GpuCrownResult {
+                lower_bounds: vec![0.0, 3.0],
+                upper_bounds: vec![1.0, 2.0],
+            },
+        ] {
+            validate_deadline_bounded_rows_resnet_result(2, &result)
+                .expect_err("malformed result must never be published");
+        }
+    }
+
+    #[test]
+    fn deadline_bounded_rows_poll_before_dispatch() {
+        struct ExpiredEngine;
+
+        impl GemmEngine for ExpiredEngine {
+            fn gemm_f32(
+                &self,
+                _m: usize,
+                _k: usize,
+                _n: usize,
+                _a: &[f32],
+                _b: &[f32],
+            ) -> Result<Vec<f32>> {
+                unreachable!("an expired request must not dispatch")
+            }
+
+            fn poll_crown_backward_deadline(&self) -> Result<()> {
+                Err(NyError::DeadlineExceeded(
+                    "injected bounded-row deadline".into(),
+                ))
+            }
+        }
+
+        let domain = tiny_wide_domain(0);
+        let error = crown_backward_gpu_resnet_sound_bounded_rows_with_deadline_impl(
+            &ExpiredEngine,
+            &domain.segments,
+            &bounded_rows_seed(2),
+            &domain.lo,
+            &domain.hi,
+            &[],
+            &[],
+        )
+        .expect_err("expired request");
+        assert!(error.is_deadline_exceeded());
+    }
+
+    /// The refold oracle intentionally bypasses only `MIN_RESIDENT_MACS`: the
+    /// ordinary entry refuses the same request while the oracle executes the
+    /// identical sound core. This is an algorithm/policy test, so a recording
+    /// engine covers it on every host instead of tying it to CUDA availability.
+    #[test]
+    fn refold_oracle_executes_below_size_gate_and_matches_sound_core() {
+        let engine = RecordingCpuGemm::default();
         let domain = tiny_wide_domain(1);
         let seed = GpuCrownSeed {
             lower_a: Arc::from(vec![1.0, 0.0, 0.0, 1.0]),
@@ -3279,31 +5255,28 @@ mod tests {
             current_dim: 2,
         };
 
-        let ordinary = engine.crown_backward_gpu_resnet_sound_beta(
+        let ordinary = crown_backward_gpu_resnet_sound_beta_impl(
+            &engine,
             &domain.segments,
             &seed,
             &domain.lo,
             &domain.hi,
             &domain.beta,
-            &[],
-            &[],
         );
         assert!(
             matches!(ordinary, Err(NyError::UnsupportedOp(_))),
             "ordinary below-gate CUDA entry must retain its dispatch policy"
         );
 
-        let device = engine
-            .crown_backward_gpu_resnet_sound_beta_refold_oracle(
-                &domain.segments,
-                &seed,
-                &domain.lo,
-                &domain.hi,
-                &domain.beta,
-                &[],
-                &[],
-            )
-            .expect("refold oracle must execute the sound serial core on CUDA");
+        let bypassed = crown_backward_gpu_resnet_sound_beta_refold_oracle_impl(
+            &engine,
+            &domain.segments,
+            &seed,
+            &domain.lo,
+            &domain.hi,
+            &domain.beta,
+        )
+        .expect("refold oracle must execute the sound serial core");
         let cpu = crown_backward_gpu_resnet_sound_beta_refold_oracle_impl(
             &RecordingCpuGemm::default(),
             &domain.segments,
@@ -3316,16 +5289,20 @@ mod tests {
         let close = |a: f32, b: f32| {
             a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-3 * (1.0 + a.abs().max(b.abs()))
         };
-        assert_eq!(device.lower_bounds.len(), cpu.lower_bounds.len());
-        assert_eq!(device.upper_bounds.len(), cpu.upper_bounds.len());
         assert!(
-            device
+            !engine.calls.lock().expect("recording lock").is_empty(),
+            "the below-gate refold must execute GEMM rather than returning a stub"
+        );
+        assert_eq!(bypassed.lower_bounds.len(), cpu.lower_bounds.len());
+        assert_eq!(bypassed.upper_bounds.len(), cpu.upper_bounds.len());
+        assert!(
+            bypassed
                 .lower_bounds
                 .iter()
                 .zip(cpu.lower_bounds.iter())
-                .chain(device.upper_bounds.iter().zip(cpu.upper_bounds.iter()))
+                .chain(bypassed.upper_bounds.iter().zip(cpu.upper_bounds.iter()))
                 .all(|(&a, &b)| close(a, b)),
-            "device refold must meet the production wide/serial comparison contract"
+            "refold must meet the production wide/serial comparison contract"
         );
     }
 
@@ -3686,14 +5663,8 @@ mod tests {
     /// `(lower, upper)` must enclose every sampled forward output. Uses the
     /// gate-free core (the test net is intentionally small).
     #[test]
-    fn cuda_sound_crown_f64_linear_only_encloses_forward() {
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping (no CUDA device): {e}");
-                return;
-            }
-        };
+    fn sound_crown_f64_linear_only_encloses_forward() {
+        let eng = RecordingCpuGemm::default();
         let mut state: u64 = 0x50FA_1234;
         let mut rng = || {
             state = state
@@ -3713,12 +5684,14 @@ mod tests {
                     bias: Some(Arc::from(b2.clone().into_boxed_slice())),
                     out_features: dout,
                     in_features: dh,
+                    cert_err: Default::default(),
                 },
                 GpuCrownLayer::Linear {
                     weight: Arc::from(w1.clone().into_boxed_slice()),
                     bias: Some(Arc::from(b1.clone().into_boxed_slice())),
                     out_features: dh,
                     in_features: din,
+                    cert_err: Default::default(),
                 },
             ];
             let mut spec = vec![0.0f32; dout * dout];
@@ -3777,14 +5750,8 @@ mod tests {
     /// upper[s]`. Uses the gate-free seeded core (the test net is intentionally
     /// small). T1.3.
     #[test]
-    fn cuda_seeded_sound_crown_f64_encloses_frontier() {
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping (no CUDA device): {e}");
-                return;
-            }
-        };
+    fn seeded_sound_crown_f64_encloses_frontier() {
+        let eng = RecordingCpuGemm::default();
         let mut state: u64 = 0x0DDF_ACE5;
         let mut rng = || {
             state = state
@@ -3804,12 +5771,14 @@ mod tests {
                     bias: Some(Arc::from(b2.clone().into_boxed_slice())),
                     out_features: dout,
                     in_features: dh,
+                    cert_err: Default::default(),
                 },
                 GpuCrownLayer::Linear {
                     weight: Arc::from(w1.clone().into_boxed_slice()),
                     bias: Some(Arc::from(b1.clone().into_boxed_slice())),
                     out_features: dh,
                     in_features: din,
+                    cert_err: Default::default(),
                 },
             ];
             // Random alpha-suffix frontier (distinct lower & upper rows + biases).
@@ -3887,15 +5856,9 @@ mod tests {
     /// branch ⇒ exact concrete forward, no ReLU relaxation to set up. Gate-free core.
     /// T1.3.
     #[test]
-    fn cuda_resnet_identity_sound_f64_encloses_frontier() {
+    fn resnet_identity_sound_f64_encloses_frontier() {
         use ny_core::GpuResnetSegment;
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping (no CUDA device): {e}");
-                return;
-            }
-        };
+        let eng = RecordingCpuGemm::default();
         let mut state: u64 = 0xBEEF_5AFE;
         let mut rng = || {
             state = state
@@ -3913,6 +5876,7 @@ mod tests {
                 bias: Some(Arc::from(bf.clone().into_boxed_slice())),
                 out_features: d,
                 in_features: d,
+                cert_err: Default::default(),
             }])];
             let num_specs = 3usize;
             let la: Vec<f32> = (0..num_specs * d).map(|_| rng()).collect();
@@ -3975,15 +5939,9 @@ mod tests {
     /// `ResidualProj` merge `A_z = backward_F(A) + backward_P(A)` with the outer bias
     /// counted once. Gate-free core. T1.3.
     #[test]
-    fn cuda_resnet_proj_sound_f64_encloses_frontier() {
+    fn resnet_proj_sound_f64_encloses_frontier() {
         use ny_core::GpuResnetSegment;
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping (no CUDA device): {e}");
-                return;
-            }
-        };
+        let eng = RecordingCpuGemm::default();
         let mut state: u64 = 0x1DEA_C0DE;
         let mut rng = || {
             state = state
@@ -4004,12 +5962,14 @@ mod tests {
                     bias: Some(Arc::from(bf.clone().into_boxed_slice())),
                     out_features: dout,
                     in_features: din,
+                    cert_err: Default::default(),
                 }],
                 vec![GpuCrownLayer::Linear {
                     weight: Arc::from(wp.clone().into_boxed_slice()),
                     bias: Some(Arc::from(bp.clone().into_boxed_slice())),
                     out_features: dout,
                     in_features: din,
+                    cert_err: Default::default(),
                 }],
             )];
             let num_specs = 3usize;
@@ -4079,15 +6039,9 @@ mod tests {
     /// active constraint only widens ⇒ sound). β=0 must reproduce the base EXACTLY.
     /// T1.3.
     #[test]
-    fn cuda_resnet_beta_fold_is_applied_soundly() {
+    fn resnet_beta_fold_is_applied_soundly() {
         use ny_core::{GpuCrownLayer as L, GpuResnetSegment};
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping (no CUDA device): {e}");
-                return;
-            }
-        };
+        let eng = RecordingCpuGemm::default();
         let d = 4usize;
         // Stable-active ReLU: relu(x) = x for x >= 0. slope 1, intercept 0.
         let relu = L::Activation {
@@ -4223,15 +6177,9 @@ mod tests {
     /// leave the BOUNDS identical to the base/beta path. Non-soundness-critical, but
     /// the layout must match the CPU gradient rule. T1.3.
     #[test]
-    fn cuda_resnet_grad_and_beta_grad_capture_layout() {
+    fn resnet_grad_and_beta_grad_capture_layout() {
         use ny_core::{GpuCrownLayer as L, GpuResnetSegment};
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping (no CUDA device): {e}");
-                return;
-            }
-        };
+        let eng = RecordingCpuGemm::default();
         let d = 4usize;
         let relu = L::Activation {
             lower_slope: vec![1.0f32; d],
@@ -4311,14 +6259,8 @@ mod tests {
     /// sampled input. Exercises the reshape→GEMM→col2im transposed-conv + bias fold +
     /// certified error. Gate-free core (small net). T1.3 conv.
     #[test]
-    fn cuda_conv_sound_f64_encloses_forward() {
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping (no CUDA device): {e}");
-                return;
-            }
-        };
+    fn conv_sound_f64_encloses_forward() {
+        let eng = RecordingCpuGemm::default();
         let mut state: u64 = 0xC02F_1234;
         let mut rng = || {
             state = state
@@ -4352,6 +6294,7 @@ mod tests {
                 out_w: ow,
                 in_h: ih,
                 in_w: iw,
+                cert_err: Default::default(),
             }];
             // Full identity seed: one spec per conv-output neuron.
             let mut spec = vec![0.0f32; out_d * out_d];
@@ -4425,21 +6368,107 @@ mod tests {
     /// The size-gate routes tiny nets to CPU (`UnsupportedOp`).
     #[test]
     fn size_gate_rejects_small_nets() {
-        let eng = match CudaGemmEngine::new() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+        let eng = RecordingCpuGemm::default();
         let layers = vec![GpuCrownLayer::Linear {
             weight: Arc::from(vec![0.1f32; 4 * 4].into_boxed_slice()),
             bias: None,
             out_features: 4,
             in_features: 4,
+            cert_err: Default::default(),
         }];
         let spec = vec![1.0f32; 4 * 4];
         let r = crown_backward_gpu_sound_impl(&eng, &layers, &spec, 4, &[0.0; 4], &[1.0; 4]);
         assert!(
             matches!(r, Err(NyError::UnsupportedOp(_))),
             "tiny net must hit the size-gate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cuda_sentinel_guard_tests {
+    use super::concretize_f64;
+    use ny_test_utils::env::{with_serialized_env_vars, with_serialized_env_vars_removed};
+
+    const GUARD_KEY: &str = "NY_CUDA_CONCRETIZE_SENTINEL_GUARD";
+
+    /// One spec, one dim; every argument safe except the coefficient under test.
+    fn run(lower_a: f64, guard: bool) -> (f32, f32) {
+        // The knob is process-global, so every mutation goes through the blessed
+        // serialized helper (the crate-wide env wall): it holds the process env lock
+        // for the call and restores the pre-test value on the way out, including on
+        // panic. The previous hand-rolled set/remove pair relied on this module
+        // running serially and left the key CLEARED rather than restored.
+        let call = || {
+            let out = concretize_f64(
+                1,
+                1,
+                &[lower_a],
+                &[1.0],
+                &[0.0],
+                &[0.0],
+                &[-1.0],
+                &[1.0],
+                &[0.0],
+                &[0.0],
+                &[0.0],
+                &[0.0],
+            );
+            (out.0[0], out.1[0])
+        };
+        if guard {
+            with_serialized_env_vars(&[(GUARD_KEY, "1")], call)
+        } else {
+            with_serialized_env_vars_removed(&[GUARD_KEY], call)
+        }
+    }
+
+    /// #cuda-sentinel-guard: unset, behaviour is exactly the shipped arithmetic.
+    #[test]
+    fn guard_off_is_byte_identical_for_safe_and_sentinel_rows() {
+        let (lo_safe, hi_safe) = run(1.0, false);
+        assert!(lo_safe.is_finite() && hi_safe.is_finite());
+        // A sentinel-magnitude coefficient is LAUNDERED with the guard off:
+        // it still publishes a finite bound. This test pins the defect so the
+        // fix cannot be silently reverted.
+        let (lo_bad, hi_bad) = run(f64::from(ny_core::CROWN_COEFF_MAX) * 2.0, false);
+        assert!(
+            lo_bad.is_finite() || hi_bad.is_finite(),
+            "guard-off must reproduce the shipped (laundering) behaviour"
+        );
+    }
+
+    /// Armed, an unsafe coefficient degrades the whole row to ±infinity —
+    /// mirroring the wgpu concretize preflight. Strictly a widening.
+    #[test]
+    fn guard_on_degrades_a_sentinel_row_to_infinity() {
+        let (lo, hi) = run(f64::from(ny_core::CROWN_COEFF_MAX) * 2.0, true);
+        assert_eq!(
+            lo,
+            f32::NEG_INFINITY,
+            "unsafe coefficient must degrade low side"
+        );
+        assert_eq!(
+            hi,
+            f32::INFINITY,
+            "unsafe coefficient must degrade high side"
+        );
+    }
+
+    /// Armed, a safe row is untouched: the guard must not widen ordinary rows.
+    #[test]
+    fn guard_on_leaves_safe_rows_alone() {
+        let (lo_off, hi_off) = run(1.0, false);
+        let (lo_on, hi_on) = run(1.0, true);
+        assert_eq!(
+            lo_off.to_bits(),
+            lo_on.to_bits(),
+            "safe row must be bit-identical"
+        );
+        assert_eq!(
+            hi_off.to_bits(),
+            hi_on.to_bits(),
+            "safe row must be bit-identical"
         );
     }
 }

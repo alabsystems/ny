@@ -62,3 +62,20 @@ bab:
   phase_budget:
     initial_bounds_fraction: 1.0
     post_bab_pgd_fraction: 0.10
+    # #attack-floor: the tiny-budget rule caps every attack phase at 15% of a
+    # <= 30s budget, i.e. 3.0s of lsnc's 20s internal budget. MEASURED on this
+    # category that cap is pure loss:
+    #  * BaB has NEVER produced an unsat here (0/80 rows, this ledger and the
+    #    preset note above); on quadrotor2d_state_34 it doubles its input-split
+    #    queue to 30,762 domains and then dies INSIDE a batch on the wall
+    #    deadline, so `verify_multi_clause_disjunction` returns Err and the run
+    #    yields NO verdict at all (not even a near-miss witness to seed the
+    #    post-BaB lane, which on this net is dead anyway — the model is outside
+    #    the exact-gradient fragment).
+    #  * The disjunctive PGD lands state_34's ORT-confirmed counterexample at
+    #    ~4.54s into the phase — 1.54s past the cap. MEASURED cliff: a 4s floor
+    #    still returns `unknown` 2/2, a 5s floor returns `sat` 3/3. 8s is chosen
+    #    over 5s for headroom on a shared box (~76% vs ~10%); the floor is
+    #    clamped to total/2, so BaB still keeps 10s of the 18s it had and the
+    #    whole-category sweep shows no row paying for it (0 unsat either way).
+    disjunctive_pgd_min_secs: 8

@@ -23,6 +23,7 @@
 //! - guard style inside an existing serialization scope (e.g. a GPU serial
 //!   guard): [`lock_env`] + [`ScopedEnvVar::set`] / [`ScopedEnvVar::unset`]
 
+use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// One process-wide lock for all environment mutation in a test binary.
@@ -50,13 +51,22 @@ pub fn lock_env() -> MutexGuard<'static, ()> {
 /// deadlock the multi-guard helpers.)
 pub struct ScopedEnvVar {
     key: String,
-    previous: Option<String>,
+    previous: Option<OsString>,
 }
 
 impl ScopedEnvVar {
     /// Set `key=value` for the guard's lifetime.
     pub fn set(key: &str, value: &str) -> Self {
-        let previous = std::env::var(key).ok();
+        Self::set_os(key, OsStr::new(value))
+    }
+
+    /// Set `key=value` without requiring `value` to be Unicode.
+    ///
+    /// This is primarily a test seam for exact-byte environment parsers. It
+    /// also ensures a pre-existing non-Unicode value is restored rather than
+    /// being mistaken for an absent variable.
+    pub fn set_os(key: &str, value: &OsStr) -> Self {
+        let previous = std::env::var_os(key);
         // Blessed choke point: serialized by lock_env()/with_* callers and
         // restored on drop — the one place raw set_var is allowed.
         // (`env_mutation` is the Trust toolchain's deny-by-default env wall;
@@ -72,7 +82,7 @@ impl ScopedEnvVar {
 
     /// Remove `key` for the guard's lifetime.
     pub fn unset(key: &str) -> Self {
-        let previous = std::env::var(key).ok();
+        let previous = std::env::var_os(key);
         // Blessed choke point: serialized by lock_env()/with_* callers and
         // restored on drop — the one place raw remove_var is allowed.
         // (`env_mutation`: Trust-only deny-by-default env wall.)
@@ -110,6 +120,17 @@ pub fn with_serialized_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T)
     f()
 }
 
+/// Run `f` with possibly non-Unicode environment values, serialized and
+/// restored on scope exit.
+pub fn with_serialized_env_vars_os<T>(vars: &[(&str, &OsStr)], f: impl FnOnce() -> T) -> T {
+    let _env_lock = lock_env();
+    let _guards: Vec<_> = vars
+        .iter()
+        .map(|(key, value)| ScopedEnvVar::set_os(key, value))
+        .collect();
+    f()
+}
+
 /// Run `f` with `vars` removed from the environment, serialized behind the
 /// process-wide env lock; previous values are restored afterwards.
 pub fn with_serialized_env_vars_removed<T>(vars: &[&str], f: impl FnOnce() -> T) -> T {
@@ -124,13 +145,13 @@ pub fn with_serialized_env_vars_removed<T>(vars: &[&str], f: impl FnOnce() -> T)
 /// Every key touched through the editor is captured once on first touch and
 /// restored when the [`with_env_edits`] scope ends (also on panic).
 pub struct EnvEditor {
-    saved: Vec<(String, Option<String>)>,
+    saved: Vec<(String, Option<OsString>)>,
 }
 
 impl EnvEditor {
     fn save_once(&mut self, key: &str) {
         if !self.saved.iter().any(|(k, _)| k == key) {
-            self.saved.push((key.to_owned(), std::env::var(key).ok()));
+            self.saved.push((key.to_owned(), std::env::var_os(key)));
         }
     }
 
@@ -227,5 +248,28 @@ mod tests {
         with_serialized_env_vars_removed(&[key], || {
             assert!(std::env::var(key).is_err());
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_edits_restore_non_utf8_values_exactly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = lock_env();
+        let key = "NY_TEST_UTILS_ENV_NON_UTF8_RESTORE";
+        let raw = OsString::from_vec(vec![b'1', 0xff]);
+
+        {
+            let _outer = ScopedEnvVar::set_os(key, &raw);
+            assert_eq!(std::env::var_os(key).as_deref(), Some(raw.as_os_str()));
+            {
+                let _inner = ScopedEnvVar::set(key, "temporary");
+                assert_eq!(
+                    std::env::var_os(key).as_deref(),
+                    Some(OsStr::new("temporary"))
+                );
+            }
+            assert_eq!(std::env::var_os(key).as_deref(), Some(raw.as_os_str()));
+        }
     }
 }

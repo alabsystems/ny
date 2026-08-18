@@ -280,7 +280,7 @@ impl GraphNetwork {
             // Linear layer: z = W @ z + b
             Layer::Linear(linear) => {
                 let input_z = get_unary_zonotope()?;
-                input_z.linear(&linear.weight, linear.bias.as_ref())
+                input_z.linear(linear.weight(), linear.bias())
             }
 
             // AddConstant: z + c

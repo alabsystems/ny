@@ -6,7 +6,7 @@
 
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_tensor::{div_down_f32, div_up_f32, BoundedTensor};
 use std::borrow::Cow;
 
 use super::common::DIV_CONSTANT_EPS;
@@ -169,20 +169,30 @@ impl BoundPropagation for DivConstantLayer {
                 ));
             }
 
-            // Compute in f64 with directed rounding for soundness (#1483).
-            let l64 = l as f64;
-            let u64 = u as f64;
-            let c64 = c_val as f64;
+            // Directed division (#1483). `div_down_f32`/`div_up_f32` certify
+            // the f64 quotient with its own exact fma remainder and then narrow
+            // in the correct direction, so they step only when the division
+            // actually rounded — unlike the previous
+            // `next_down_f32((l64 / c64) as f32)`, which gave away a full ULP
+            // even for exact quotients and returns an infinity as a finite
+            // bound on overflow.
             if c_val > 0.0 {
-                out_lower[idx.clone()] = next_down_f32((l64 / c64) as f32);
-                out_upper[idx] = next_up_f32((u64 / c64) as f32);
+                out_lower[idx.clone()] = div_down_f32(l, c_val);
+                out_upper[idx] = div_up_f32(u, c_val);
             } else {
-                out_lower[idx.clone()] = next_down_f32((u64 / c64) as f32);
-                out_upper[idx] = next_up_f32((l64 / c64) as f32);
+                out_lower[idx.clone()] = div_down_f32(u, c_val);
+                out_upper[idx] = div_up_f32(l, c_val);
             }
         }
 
-        BoundedTensor::new(out_lower, out_upper)
+        // OpaqueSkip taint (#opaque-skip-six-sites): an upstream OpaqueSkip
+        // legitimately emits ±Inf endpoints. The divisor is validated finite
+        // with |c| >= DIV_CONSTANT_EPS both at construction and per element
+        // above, so `±inf / c` passes through `div_down_f32`/`div_up_f32` as
+        // clean ±Inf and the NaN-producing quotient patterns (inf/inf, 0/0)
+        // are unreachable. A NaN here therefore implies a NaN INPUT — a real
+        // bug — which `new_allow_infinite` still rejects as a hard error.
+        BoundedTensor::new_allow_infinite(out_lower, out_upper)
     }
 
     #[inline]
@@ -229,5 +239,52 @@ impl DivConstantLayer {
     ) -> Result<BatchedLinearBounds> {
         // Division by c is multiplication by 1/c
         self.as_mul_layer()?.propagate_linear_batched(bounds)
+    }
+}
+
+/// OpaqueSkip taint probes (#opaque-skip-six-sites): the IBP output
+/// constructor must let the legitimate ±Inf an upstream OpaqueSkip emits flow
+/// through as widened bounds, while NaN inputs remain a hard error.
+#[cfg(test)]
+mod opaque_skip_taint_tests {
+    use super::*;
+
+    fn opaque_input() -> BoundedTensor {
+        BoundedTensor::new_allow_infinite(
+            ArrayD::from_elem(IxDyn(&[2]), f32::NEG_INFINITY),
+            ArrayD::from_elem(IxDyn(&[2]), f32::INFINITY),
+        )
+        .unwrap()
+    }
+
+    /// [-inf, +inf] / c must propagate as [-inf, +inf] for both divisor signs,
+    /// not abort with NumericalInstability. The divisor is finite and bounded
+    /// away from zero, so inf/inf and 0/0 NaN patterns are unreachable.
+    #[test]
+    fn test_ibp_opaque_skip_inf_input_flows() {
+        for divisor in [2.0_f32, -2.0] {
+            let layer = DivConstantLayer::scalar(divisor);
+            let out = layer
+                .propagate_ibp(&opaque_input())
+                .expect("±inf input must propagate through x / c");
+            assert_eq!(out.lower()[[0]], f32::NEG_INFINITY, "divisor {divisor}");
+            assert_eq!(out.upper()[[1]], f32::INFINITY, "divisor {divisor}");
+        }
+    }
+
+    /// NaN input (a real bug, not OpaqueSkip taint) must still hard-error:
+    /// `new_allow_infinite` rejects NaN.
+    #[test]
+    fn test_ibp_nan_input_still_errors() {
+        let layer = DivConstantLayer::scalar(2.0);
+        let input = BoundedTensor::new_unchecked(
+            ArrayD::from_elem(IxDyn(&[1]), f32::NAN),
+            ArrayD::from_elem(IxDyn(&[1]), 1.0_f32),
+        )
+        .unwrap();
+        assert!(
+            layer.propagate_ibp(&input).is_err(),
+            "NaN input must remain a hard error"
+        );
     }
 }

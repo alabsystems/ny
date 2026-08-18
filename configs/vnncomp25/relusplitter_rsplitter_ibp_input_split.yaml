@@ -26,6 +26,7 @@ solver:
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 50
 
 bab:

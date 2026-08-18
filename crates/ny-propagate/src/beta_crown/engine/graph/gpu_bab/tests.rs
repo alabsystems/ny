@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for GPU BaB verify_graph_gpu_domain_list entry point.
+//! Tests for DomainList BaB verify_graph_gpu_domain_list entry point.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,13 +15,15 @@ use ny_test_utils::CountingGemmEngine;
 
 use super::check::BabLoopState;
 use super::init::{cache_input_split_linear_bounds, InputSplitBootstrap};
+use super::initial_bounds_deadline_status;
 use super::input_split::{process_input_split_batch, InputSplitOutcome};
 use super::input_split_support::build_parent_contexts;
 use crate::batched_domain::{
     BatchedDomainOptions, DomainList, DomainListConfig, DomainMetadata, PickedDomains,
+    ProcessedDomains,
 };
 use crate::beta_crown::branching::BranchingHeuristic;
-use crate::beta_crown::config::{BetaCrownConfig, InputClipType, PhaseBudgetConfig};
+use crate::beta_crown::config::{BetaCrownConfig, ConvMode, InputClipType, PhaseBudgetConfig};
 use crate::beta_crown::engine::graph::input_split::adv_check::ADV_CHECK_INTERVAL;
 use crate::beta_crown::engine::graph::input_split::shared::{
     compute_crown_or_ibp_bounds, graph_spec_ibp_fallback,
@@ -81,43 +83,15 @@ fn easy_verify_graph() -> GraphNetwork {
     graph
 }
 
-/// Construct a graph where fresh spec-guided CROWN is tighter than plain IBP
-/// for the same root domain. This lets the tests distinguish the IBP root
-/// pre-screen path from the full bootstrap path.
+/// Construct a graph where spec-guided CROWN proves the correlation between
+/// two identical outputs while plain output-interval IBP cannot.  The exact
+/// objective is `x - x = 0`; IBP sees `[-1, 1] - [-1, 1] = [-2, 2]`.
 fn reference_gap_graph_3870() -> GraphNetwork {
-    let w1 = arr2(&[[1.2_f32, -0.8], [-0.6, 1.1], [0.9, 0.7], [-0.7, 0.4]]);
-    let b1 = arr1(&[0.1_f32, -0.05, 0.0, 0.12]);
-    let w2 = arr2(&[[0.8_f32, -0.5, 0.6, -0.2], [-0.3, 0.9, -0.4, 0.7]]);
-    let b2 = arr1(&[0.05_f32, -0.08]);
-    let w3 = arr2(&[[1.0_f32, -0.2], [-0.4, 0.9]]);
-    let b3 = arr1(&[0.02_f32, -0.03]);
-
+    let duplicate = LinearLayer::new(arr2(&[[1.0_f32], [1.0_f32]]), None)
+        .expect("valid duplicate-output layer");
     let mut graph = GraphNetwork::new();
-    graph.add_node(GraphNode::from_input(
-        "linear1",
-        Layer::Linear(LinearLayer::new(w1, Some(b1)).expect("valid linear1")),
-    ));
-    graph.add_node(GraphNode::new(
-        "relu1",
-        Layer::ReLU(ReLULayer),
-        vec!["linear1".to_string()],
-    ));
-    graph.add_node(GraphNode::new(
-        "linear2",
-        Layer::Linear(LinearLayer::new(w2, Some(b2)).expect("valid linear2")),
-        vec!["relu1".to_string()],
-    ));
-    graph.add_node(GraphNode::new(
-        "relu2",
-        Layer::ReLU(ReLULayer),
-        vec!["linear2".to_string()],
-    ));
-    graph.add_node(GraphNode::new(
-        "linear3",
-        Layer::Linear(LinearLayer::new(w3, Some(b3)).expect("valid linear3")),
-        vec!["relu2".to_string()],
-    ));
-    graph.set_output("linear3");
+    graph.add_node(GraphNode::from_input("duplicate", Layer::Linear(duplicate)));
+    graph.set_output("duplicate");
     graph
 }
 
@@ -260,6 +234,41 @@ fn empty_input_split_domain_list(input_shape: Vec<usize>) -> Result<DomainList> 
         initial_capacity: 8,
         max_queue_size: 0,
     })
+}
+
+#[test]
+fn domain_list_eviction_latch_prevents_verified_exhaustion() -> Result<()> {
+    let mut domain_list = DomainList::new(DomainListConfig {
+        traversal: TreeTraversal::BreadthFirst,
+        layer_names: Vec::new(),
+        layer_shapes: HashMap::new(),
+        input_shape: vec![1],
+        initial_capacity: 2,
+        max_queue_size: 1,
+    })?;
+    domain_list.configure_queue_eviction(0, false)?;
+    domain_list.add(ProcessedDomains {
+        layer_lowers: HashMap::new(),
+        layer_uppers: HashMap::new(),
+        input_lowers: ArrayD::from_shape_vec(IxDyn(&[2, 1]), vec![-1.0, -0.5]).unwrap(),
+        input_uppers: ArrayD::from_shape_vec(IxDyn(&[2, 1]), vec![1.0, 0.5]).unwrap(),
+        global_lbs: vec![-1.0, -0.5],
+        global_ubs: vec![1.0, 0.5],
+        metadata: vec![
+            DomainMetadata::root(-1.0, 1.0)?,
+            DomainMetadata::root(-0.5, 0.5)?,
+        ],
+        keep_mask: vec![true, true],
+    })?;
+    assert_eq!(domain_list.evicted_count(), 1);
+
+    let mut state = BabLoopState::new(Instant::now());
+    super::latch_domain_list_eviction(&domain_list, &mut state);
+    assert!(matches!(
+        state.build_final_result().result,
+        BabVerificationStatus::Unknown { .. }
+    ));
+    Ok(())
 }
 
 fn picked_domains_3870(
@@ -470,7 +479,35 @@ fn gpu_bab_ibp_prescreen_returns_verified_early_3870() -> Result<()> {
     Ok(())
 }
 
+/// The GPU DomainList input-split IBP pre-screen can return Verified before
+/// its downstream bootstrap.  Configuration quarantine must run first.
 #[ntest::timeout(10000)]
+#[test]
+fn gpu_ibp_prescreen_early_verified_rejects_cut_authority() -> Result<()> {
+    let graph = easy_verify_graph();
+    let input =
+        ny_tensor::BoundedTensor::new(arr1(&[1.0_f32]).into_dyn(), arr1(&[2.0_f32]).into_dyn())?;
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        branching_heuristic: BranchingHeuristic::InputSplit,
+        input_split_ibp_enhancement: true,
+        enable_cuts: true,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    });
+
+    let error = verifier
+        .verify_graph_gpu_domain_list(&graph, &input, &[1.0], -1.0, None, None)
+        .expect_err("IBP would verify, but quarantined cut authority must reject first");
+    assert!(
+        error
+            .to_string()
+            .contains("cut proof authority is quarantined"),
+        "expected quarantine error, got {error}"
+    );
+    Ok(())
+}
+
+#[ntest::timeout(60000)]
 #[test]
 fn domain_list_input_split_adaptive_route_matches_config_off_result() -> Result<()> {
     let _env_lock = ny_test_utils::env::lock_env();
@@ -487,7 +524,13 @@ fn domain_list_input_split_adaptive_route_matches_config_off_result() -> Result<
         batch_size: 1,
         max_domains: 16,
         max_depth: 4,
-        timeout: Duration::from_secs(5),
+        // This is a route-parity test, not a five-second throughput test.  A
+        // short product deadline can race the adaptive route's larger CROWN
+        // passes and turn the expected max-domain result into Timeout on a
+        // loaded host.  Keep the verifier deadline outside the test harness's
+        // bounded execution window so termination is governed by the explicit
+        // domain/depth limits below.
+        timeout: Duration::from_mins(2),
         ..Default::default()
     };
     let gate_dark = ny_test_utils::env::ScopedEnvVar::set(gate_name, "0");
@@ -561,6 +604,26 @@ fn gpu_bab_alpha_warmup_deadline_returns_unknown_4413() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn gpu_bab_initial_deadline_status_distinguishes_phase_and_global_expiry() {
+    let now = Instant::now();
+    let spent = now
+        .checked_sub(Duration::from_millis(1))
+        .expect("system uptime exceeds one millisecond");
+    let live = now + Duration::from_secs(1);
+
+    assert_eq!(
+        initial_bounds_deadline_status(now, Some(spent), Some(spent)),
+        BabVerificationStatus::Timeout,
+        "an exhausted overall BaB budget is a verifier timeout"
+    );
+    assert!(matches!(
+        initial_bounds_deadline_status(now, Some(spent), Some(live)),
+        BabVerificationStatus::Unknown { reason }
+            if reason.contains("Initial-bound warmup exceeded its deadline cap")
+    ));
+}
+
 #[ntest::timeout(10000)]
 #[test]
 fn graph_spec_ibp_fallback_threads_engine_and_reuses_cache_4174() -> Result<()> {
@@ -620,7 +683,6 @@ fn graph_spec_ibp_fallback_threads_engine_and_reuses_cache_4174() -> Result<()> 
 /// Reference bounds for the IBP-enhancement toggle test.
 struct IbpToggleReference {
     ibp_bounds: ny_tensor::BoundedTensor,
-    fresh_crown_bounds: ny_tensor::BoundedTensor,
     threshold: f32,
 }
 
@@ -633,6 +695,7 @@ fn build_ibp_toggle_reference(
         branching_heuristic: BranchingHeuristic::InputSplit,
         input_split_ibp_enhancement: true,
         use_alpha_crown: false,
+        conv_mode: ConvMode::Matrix,
         timeout: Duration::from_secs(5),
         ..Default::default()
     };
@@ -640,28 +703,9 @@ fn build_ibp_toggle_reference(
     let configured_graph = verifier.configured_graph_for_crown(graph);
     let (ibp_bounds, _) =
         graph_spec_ibp_fallback(&configured_graph, input, spec_matrix, None, None)?;
-    let (fresh_crown_bounds, _) = compute_crown_or_ibp_bounds(
-        &configured_graph,
-        input,
-        spec_matrix,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-    )?;
-    let ibp_w = ibp_bounds.upper()[[0]] - ibp_bounds.lower()[[0]];
-    let crown_w = fresh_crown_bounds.upper()[[0]] - fresh_crown_bounds.lower()[[0]];
-    assert!(
-        crown_w + 1e-6 < ibp_w,
-        "test graph must distinguish CROWN from IBP"
-    );
     let threshold = ibp_bounds.lower()[[0]] - 1e-3;
     Ok(IbpToggleReference {
         ibp_bounds,
-        fresh_crown_bounds,
         threshold,
     })
 }
@@ -670,12 +714,10 @@ fn build_ibp_toggle_reference(
 #[test]
 fn gpu_bab_ibp_prescreen_skipped_when_enhancement_off_3870() -> Result<()> {
     let graph = reference_gap_graph_3870();
-    let input = ny_tensor::BoundedTensor::new(
-        arr1(&[-0.35_f32, -0.65_f32]).into_dyn(),
-        arr1(&[0.55_f32, 0.15_f32]).into_dyn(),
-    )?;
-    let objective = [1.0_f32, -0.35_f32];
-    let spec_matrix = arr2(&[[1.0_f32, -0.35_f32]]);
+    let input =
+        ny_tensor::BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())?;
+    let objective = [1.0_f32, -1.0_f32];
+    let spec_matrix = arr2(&[[1.0_f32, -1.0_f32]]);
     let reference = build_ibp_toggle_reference(&graph, &input, &spec_matrix)?;
 
     // IBP pre-screen path: ibp_enhancement=true should match IBP bounds.
@@ -683,15 +725,17 @@ fn gpu_bab_ibp_prescreen_skipped_when_enhancement_off_3870() -> Result<()> {
         branching_heuristic: BranchingHeuristic::InputSplit,
         input_split_ibp_enhancement: true,
         use_alpha_crown: false,
+        conv_mode: ConvMode::Matrix,
         timeout: Duration::from_secs(5),
         ..Default::default()
     });
+    let pre_screen_engine = CountingGemmEngine::new();
     let pre_result = pre_screen.verify_graph_gpu_domain_list(
         &graph,
         &input,
         &objective,
         reference.threshold,
-        None,
+        Some(&pre_screen_engine),
         None,
     )?;
     assert_eq!(pre_result.result, BabVerificationStatus::Verified);
@@ -700,39 +744,49 @@ fn gpu_bab_ibp_prescreen_skipped_when_enhancement_off_3870() -> Result<()> {
         .as_ref()
         .expect("IBP pre-screen bounds");
     assert_scalar_bounds_close(pre_bounds, &reference.ibp_bounds, 1e-5, "pre-screen");
+    let pre_screen_gemms = pre_screen_engine.gemm_calls();
+    assert!(
+        pre_screen_gemms > 0,
+        "IBP pre-screen must execute the graph"
+    );
 
-    // Full CROWN path: ibp_enhancement=false must produce tighter-than-IBP bounds.
+    // With enhancement disabled, the entry must not return from the cheap IBP
+    // pre-screen.  The engine-backed full bootstrap is deterministic for this
+    // one-layer fixture and must preserve the exact duplicated-output
+    // correlation, which distinguishes the route without a measured heuristic
+    // tightness tolerance.
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
         branching_heuristic: BranchingHeuristic::InputSplit,
         input_split_ibp_enhancement: false,
         use_alpha_crown: false,
-        timeout: Duration::from_secs(5),
+        conv_mode: ConvMode::Matrix,
+        timeout: Duration::from_secs(1),
         ..Default::default()
     });
+    let full_engine = CountingGemmEngine::new();
     let result = verifier.verify_graph_gpu_domain_list(
         &graph,
         &input,
         &objective,
         reference.threshold,
-        None,
+        Some(&full_engine),
         None,
     )?;
     assert_eq!(result.result, BabVerificationStatus::Verified);
-    let bounds = result
+    let full_bounds = result
         .output_bounds
         .as_ref()
         .expect("full bootstrap bounds");
-    // GPU BaB bootstrap computes CROWN with IBP reference bounds for intermediate
-    // layers (via compute_initial_bounds → compute_crown_or_ibp_bounds with
-    // reference_bounds=Some(ibp)), which relaxes unstable neuron bounds differently
-    // from standalone CROWN (reference_bounds=None). The gap is O(eps * depth)
-    // where eps is the IBP-to-CROWN gap at each layer. For this 3-layer test
-    // graph, measured gap is ~0.02 on upper bound (1.5178 vs 1.4975), 0.0 on
-    // lower. Tolerance 0.025 = 1.25x observed gap. Re: Prover #3870 comment.
-    assert_scalar_bounds_close(bounds, &reference.fresh_crown_bounds, 0.025, "bootstrap");
-    let crown_w = bounds.upper()[[0]] - bounds.lower()[[0]];
-    let ibp_w = reference.ibp_bounds.upper()[[0]] - reference.ibp_bounds.lower()[[0]];
-    assert!(crown_w + 1e-4 < ibp_w, "CROWN must be tighter than IBP");
+    assert!(
+        full_bounds.lower()[[0]].abs() <= 1e-5 && full_bounds.upper()[[0]].abs() <= 1e-5,
+        "enhancement-off route must preserve the exact x-x correlation through CROWN: [{}, {}]",
+        full_bounds.lower()[[0]],
+        full_bounds.upper()[[0]]
+    );
+    assert!(
+        full_engine.gemm_calls() >= pre_screen_gemms,
+        "full bootstrap unexpectedly performed less graph work than the IBP pre-screen"
+    );
 
     Ok(())
 }

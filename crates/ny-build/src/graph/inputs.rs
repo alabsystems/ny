@@ -2,10 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::helpers::{resolve_tensor_node_name, resolve_tensor_node_name_via_first_producer};
+use super::helpers::resolve_tensor_node_name;
 use crate::{LayerSpec, WeightStore};
 use ndarray::ArrayD;
-use ny_core::{LayerType, NyError, Result};
+use ny_core::{NyError, Result};
 use ny_propagate::Layer;
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
@@ -37,7 +37,6 @@ pub(super) fn find_graph_input_nodes(
     // constant + activation inputs internally, so we only need graph connections
     // for the activation (non-constant) inputs.
     let is_concat = matches!(layer, Layer::Concat(_));
-    let is_expand_like_last_axis = matches!(layer, Layer::ExpandLikeLastAxis(_));
     let is_embedded_parameter_unary = matches!(
         layer,
         Layer::LayerNorm(_)
@@ -46,28 +45,6 @@ pub(super) fn find_graph_input_nodes(
             | Layer::GroupNorm(_)
             | Layer::BatchNorm(_)
     );
-
-    // Variable-start Slice of an arithmetic progression lowered to an exact
-    // affine Linear (#cctsdb B3a): the layer's math is a function of the
-    // STARTS operand alone (out[k] = step*starts + const_k); data is an
-    // embedded constant and `ends` is redundant with the static extent baked
-    // into the weight shape. Wire ONLY inputs[1] (starts).
-    if spec.layer_type == LayerType::Slice && matches!(layer, Layer::Linear(_)) {
-        let starts_name = spec.inputs.get(1).ok_or_else(|| {
-            NyError::ModelLoad(format!(
-                "Slice '{}' lowered to affine Linear but has no starts input",
-                spec.name
-            ))
-        })?;
-        let node_name = resolve_tensor_node_name(starts_name, tensor_to_node, tensor_producer)
-            .ok_or_else(|| {
-                NyError::ModelLoad(format!(
-                    "Slice '{}' (affine Linear) references unresolvable starts tensor '{}'",
-                    spec.name, starts_name
-                ))
-            })?;
-        return Ok(vec![node_name]);
-    }
 
     // Filter to activation inputs only.
     // - Weights are always baked into the layer (filtered for all ops)
@@ -81,24 +58,9 @@ pub(super) fn find_graph_input_nodes(
         spec.inputs
             .iter()
             .filter(|name| {
-                // The shape-side input may be pre-evaluated into the weight store,
-                // but for ExpandLikeLastAxis it still names the live reference path.
-                if is_expand_like_last_axis
-                    && spec
-                        .inputs
-                        .get(1)
-                        .is_some_and(|shape_name| shape_name == *name)
-                {
-                    return true;
-                }
                 // Always filter out weights (they're baked into the layer)
                 if weights.get(name).is_some() {
                     return false;
-                }
-                // ExpandLikeLastAxis uses the shape-side input as a live reference
-                // tensor, even when the Shape(reference) value was pre-evaluated.
-                if is_expand_like_last_axis {
-                    return true;
                 }
                 // Filter out evaluated constants (they're already embedded in the layer).
                 if evaluated_constants.contains_key(*name) {
@@ -188,17 +150,7 @@ pub(super) fn find_graph_input_nodes(
     } else if layer.is_binary() {
         // Binary ops (MatMul with two bounded inputs, Add with two activations)
         // need two input nodes
-        for (idx, input_tensor) in activation_inputs.iter().take(2).enumerate() {
-            if is_expand_like_last_axis && idx == 1 {
-                if let Some(node_name) = resolve_tensor_node_name_via_first_producer(
-                    input_tensor,
-                    tensor_to_node,
-                    tensor_producer,
-                ) {
-                    input_nodes.push(node_name);
-                    continue;
-                }
-            }
+        for input_tensor in activation_inputs.iter().take(2) {
             input_nodes.push(resolve(input_tensor)?);
         }
         // If we only found one activation input, it's a unary operation

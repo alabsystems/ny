@@ -9,8 +9,8 @@
 
 use crate::layers::Layer;
 use crate::network::core::graph::ibp::dispatch::{
-    check_nan_firewall, dispatch_ibp_resolved, intersect_zonotope_ibp, resolve_node_inputs,
-    ResolvedInputs,
+    check_nan_firewall, check_nan_firewall_with_poll, dispatch_ibp_resolved,
+    intersect_zonotope_ibp, intersect_zonotope_ibp_with_poll, resolve_node_inputs, ResolvedInputs,
 };
 use crate::network::core::graph::ibp::gpu_plan::try_lower_graph_dag;
 
@@ -39,7 +39,8 @@ pub(crate) trait GraphNetworkIbpExt {
     ) -> Result<BoundedTensor>;
 
     /// Propagate bounds through the graph using IBP with an optional GEMM engine,
-    /// aborting with `DeadlineExceeded` between nodes once the deadline passes.
+    /// aborting with `DeadlineExceeded` between nodes and cooperatively within
+    /// deadline-aware convolution nodes once the deadline passes.
     fn propagate_ibp_with_engine_and_deadline_impl(
         &self,
         input: &BoundedTensor,
@@ -61,11 +62,13 @@ pub(crate) trait GraphNetworkIbpExt {
     /// The widening applied depends on how the node accumulates:
     /// - Linear (CERTIFIED): `in_features + 2` ULPs (Higham Thm 3.1 over the two
     ///   matmuls, the combine and the bias).
-    /// - Conv1d / Conv2d / ConvTranspose1d / ConvTranspose2d (CERTIFIED): the
-    ///   node's own `propagate_ibp_sound_with_engine`, which folds in the certified
-    ///   `up(γ_{K+2}·S + 2u·|y|)` Higham term for its `K`-product window sum. The
-    ///   generic 1-ULP widening below is NOT sufficient here — an f32 window sum
-    ///   can lose far more than 1 ULP of the RESULT to cancellation.
+    /// - Conv1d / ConvTranspose1d (CERTIFIED): the node's ordinary result hulled
+    ///   with a bit-decoded, outward-directed f64 interval contraction. This
+    ///   covers cancellation and binary32 product underflow independently of
+    ///   FTZ/DAZ.
+    /// - Conv2d / ConvTranspose2d (CERTIFIED): the node's own
+    ///   `propagate_ibp_sound_with_engine`, which folds in its certified
+    ///   coefficient-abssum/Higham error for the window sum.
     /// - AveragePool (CERTIFIED): `AveragePoolLayer::propagate_ibp_sound`, which
     ///   folds in the certified `γ⁶⁴_{k+1}·S/d` Higham term for its `k`-term f64
     ///   window sum (uniform `+1/k` weights). The plain forward's outward 1-ULP
@@ -121,6 +124,106 @@ pub(crate) trait GraphNetworkIbpExt {
 enum LeadingAxisMode {
     Plain,
     PreserveLeadingAxis,
+}
+
+const GRAPH_IBP_POLL_ELEMENTS: usize = 4_096;
+
+#[inline]
+fn check_graph_ibp_deadline(deadline: Instant, node_name: &str, stage: &str) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(NyError::DeadlineExceeded(format!(
+            "Graph IBP forward: deadline exceeded {stage} for node '{node_name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn summarize_bounds(bounds: &BoundedTensor) -> (f32, f32, bool, bool, bool) {
+    const MAX_BOUND: f32 = f32::MAX / 2.0;
+    let mut max_width = 0.0_f32;
+    let mut max_abs = 0.0_f32;
+    let mut saturated = false;
+    let mut has_nan = false;
+    let mut has_non_finite = false;
+
+    for (&lower, &upper) in bounds.lower().iter().zip(bounds.upper().iter()) {
+        if lower.is_nan() || upper.is_nan() {
+            has_nan = true;
+        }
+        if !lower.is_finite() || !upper.is_finite() {
+            has_non_finite = true;
+        }
+        let width = upper - lower;
+        if width.is_finite() {
+            max_width = max_width.max(width);
+        } else {
+            has_non_finite = true;
+        }
+        max_abs = max_abs.max(lower.abs()).max(upper.abs());
+        if lower <= -0.999 * MAX_BOUND || upper >= 0.999 * MAX_BOUND {
+            saturated = true;
+        }
+    }
+
+    (max_width, max_abs, saturated, has_nan, has_non_finite)
+}
+
+fn summarize_bounds_with_poll<F>(
+    bounds: &BoundedTensor,
+    mut poll: F,
+) -> Result<(f32, f32, bool, bool, bool)>
+where
+    F: FnMut() -> Result<()>,
+{
+    const MAX_BOUND: f32 = f32::MAX / 2.0;
+    let mut max_width = 0.0_f32;
+    let mut max_abs = 0.0_f32;
+    let mut saturated = false;
+    let mut has_nan = false;
+    let mut has_non_finite = false;
+
+    poll()?;
+    for (index, (&lower, &upper)) in bounds.lower().iter().zip(bounds.upper().iter()).enumerate() {
+        if index.is_multiple_of(GRAPH_IBP_POLL_ELEMENTS) {
+            poll()?;
+        }
+        if lower.is_nan() || upper.is_nan() {
+            has_nan = true;
+        }
+        if !lower.is_finite() || !upper.is_finite() {
+            has_non_finite = true;
+        }
+        let width = upper - lower;
+        if width.is_finite() {
+            max_width = max_width.max(width);
+        } else {
+            has_non_finite = true;
+        }
+        max_abs = max_abs.max(lower.abs()).max(upper.abs());
+        if lower <= -0.999 * MAX_BOUND || upper >= 0.999 * MAX_BOUND {
+            saturated = true;
+        }
+    }
+    poll()?;
+
+    Ok((max_width, max_abs, saturated, has_nan, has_non_finite))
+}
+
+fn concrete_center_with_deadline(
+    bounds: &BoundedTensor,
+    deadline: Option<Instant>,
+    node_name: &str,
+    stage: &str,
+) -> Result<BoundedTensor> {
+    if let Some(deadline) = deadline {
+        let center =
+            bounds.center_with_poll(|| check_graph_ibp_deadline(deadline, node_name, stage))?;
+        BoundedTensor::concrete_with_poll(center, || {
+            check_graph_ibp_deadline(deadline, node_name, stage)
+        })
+    } else {
+        BoundedTensor::concrete(bounds.center())
+    }
 }
 
 impl GraphNetworkIbpExt for GraphNetwork {
@@ -241,7 +344,12 @@ fn propagate_concrete_point_core(
 ) -> Result<BoundedTensor> {
     // Start from the box center (callers pass a degenerate box; a point forward is
     // only defined at the center).
-    let point = BoundedTensor::concrete(input.center())?;
+    let point = concrete_center_with_deadline(
+        input,
+        deadline,
+        "<network input>",
+        "while centering the concrete input",
+    )?;
 
     // DAG-lowerable fast path — keep the cached-plan / GPU-resident hot path (#4276).
     // `try_lower_graph_dag` accepts ONLY affine + ReLU ops (Linear, Conv2d, Add,
@@ -271,7 +379,12 @@ fn propagate_concrete_point_core(
             deadline,
             false,
         )?;
-        return BoundedTensor::concrete(out.center());
+        return concrete_center_with_deadline(
+            &out,
+            deadline,
+            "<network output>",
+            "while centering the concrete output",
+        );
     }
 
     propagate_ibp_core_inner(
@@ -337,7 +450,11 @@ fn propagate_ibp_core_inner(
     // Each sound op emits `[low − r_lo, high + r_hi] ⊇` its predecessors' truth, so
     // by induction over topological order the returned box ⊇ both the true range and
     // the CPU sound bound.
-    if !collapse_to_center && sound && leading_axis_mode == LeadingAxisMode::Plain {
+    if deadline.is_none()
+        && !collapse_to_center
+        && sound
+        && leading_axis_mode == LeadingAxisMode::Plain
+    {
         if let Some((ext, use_sound)) = crate::sound_gpu_gate::gpu_dag_ibp_forward_route(engine) {
             if use_sound {
                 if let Some(plan_desc) = try_lower_graph_dag(network, input.shape()) {
@@ -388,7 +505,11 @@ fn propagate_ibp_core_inner(
     // Falls back silently to the CPU graph loop on None or any error.
     // Skipped entirely when collapsing to center: the fast path returns a single
     // whole-box result with no per-node hook to re-center.
-    if !collapse_to_center && !sound && leading_axis_mode == LeadingAxisMode::Plain {
+    if deadline.is_none()
+        && !collapse_to_center
+        && !sound
+        && leading_axis_mode == LeadingAxisMode::Plain
+    {
         if let Some(engine) = engine {
             if let Some(ext) = engine.as_gpu_dag_ibp_forward_ext() {
                 if let Some(plan_desc) = try_lower_graph_dag(network, input.shape()) {
@@ -457,36 +578,6 @@ fn propagate_ibp_core_inner(
         }
     }
 
-    fn summarize_bounds(bounds: &BoundedTensor) -> (f32, f32, bool, bool, bool) {
-        const MAX_BOUND: f32 = f32::MAX / 2.0;
-        let mut max_width = 0.0_f32;
-        let mut max_abs = 0.0_f32;
-        let mut saturated = false;
-        let mut has_nan = false;
-        let mut has_non_finite = false;
-
-        for (&l, &u) in bounds.lower().iter().zip(bounds.upper().iter()) {
-            if l.is_nan() || u.is_nan() {
-                has_nan = true;
-            }
-            if !l.is_finite() || !u.is_finite() {
-                has_non_finite = true;
-            }
-            let width = u - l;
-            if width.is_finite() {
-                max_width = max_width.max(width);
-            } else {
-                has_non_finite = true;
-            }
-            max_abs = max_abs.max(l.abs()).max(u.abs());
-            if l <= -0.999 * MAX_BOUND || u >= 0.999 * MAX_BOUND {
-                saturated = true;
-            }
-        }
-
-        (max_width, max_abs, saturated, has_nan, has_non_finite)
-    }
-
     // Get execution order
     let exec_order = network.exec_order()?;
 
@@ -532,6 +623,23 @@ fn propagate_ibp_core_inner(
         BoundedTensor::new_allow_infinite(lower, upper)
     }
 
+    /// Preserve the historical allocation/validation path without a deadline;
+    /// finite-deadline callers initialize each endpoint in bounded chunks.
+    fn unbounded_of_shape_with_deadline(
+        shape: &[usize],
+        deadline: Option<Instant>,
+        node_name: &str,
+        stage: &str,
+    ) -> Result<BoundedTensor> {
+        if let Some(deadline) = deadline {
+            BoundedTensor::new_conservative_with_poll(shape, || {
+                check_graph_ibp_deadline(deadline, node_name, stage)
+            })
+        } else {
+            unbounded_of_shape(shape)
+        }
+    }
+
     /// Errors that the tainted-node degrade path may recover from.
     /// DeadlineExceeded and numerical errors at untainted nodes must abort.
     fn is_degradable_error(error: &NyError) -> bool {
@@ -547,11 +655,10 @@ fn propagate_ibp_core_inner(
 
     // Process nodes in topological order
     for node_name in exec_order {
-        // Wall-clock deadline enforcement between nodes (#4321): deep conv graphs
-        // (e.g. TinyImageNet ResNet) can spend tens of seconds in a single IBP
-        // forward pass, overrunning the verifier's own timeout and getting killed
-        // externally with no JSON verdict. Aborting here lets the caller surface a
-        // graceful Timeout/Unknown. Sound: only ever short-circuits to an error.
+        // Wall-clock deadline enforcement between nodes (#4321), supplemented by
+        // cooperative polling inside deadline-aware convolution nodes. Aborting
+        // here lets the caller surface a graceful Timeout/Unknown. Sound: only
+        // ever short-circuits to an error.
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(NyError::DeadlineExceeded(format!(
                 "Graph IBP forward: deadline exceeded before node '{}'",
@@ -644,47 +751,106 @@ fn propagate_ibp_core_inner(
                 node_name,
                 node.layer.layer_type()
             );
-            network
-                .declared_shape(node_name)
-                .map(unbounded_of_shape)
-                .expect("checked is_some above")
+            unbounded_of_shape_with_deadline(
+                network
+                    .declared_shape(node_name)
+                    .expect("checked is_some above"),
+                deadline,
+                node_name,
+                "while creating a tainted shape-value fallback",
+            )
         } else {
             let computed = (|| -> Result<BoundedTensor> {
                 let output_bounds = match resolved {
                     ResolvedInputs::Unary(input_bounds) => match (&node.layer, leading_axis_mode) {
-                        (Layer::Linear(linear), _) => {
-                            linear.propagate_ibp_with_engine(&input_bounds, engine)?
-                        }
-                        // Conv family sound path: the f32 window-sum needs each layer's
-                        // certified Higham error term, NOT the generic 1-ULP widening applied
-                        // below (which cannot cover cancellation). See each layer's
-                        // `propagate_ibp_sound_with_engine`.
+                        (Layer::Linear(linear), _) => linear
+                            .propagate_ibp_with_engine_and_deadline(
+                                &input_bounds,
+                                engine,
+                                deadline,
+                            )?,
+                        // Conv family sound path: the f32 window sum needs each
+                        // layer's own certificate, NOT the generic 1-ULP
+                        // widening below. The 1D variants use a directed-f64
+                        // interval contraction; Conv2d uses the certified f64
+                        // dual-accumulator kernel under a finite deadline
+                        // (#cgan-conv-ibp-magnitude-floor) and its
+                        // coefficient-abssum construction otherwise;
+                        // ConvTranspose2d keeps its abssum construction.
                         (Layer::Conv1d(conv), _) => {
-                            if sound {
-                                conv.propagate_ibp_sound_with_engine(&input_bounds, engine)?
+                            if sound || deadline.is_some() {
+                                conv.propagate_ibp_sound_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             } else {
-                                conv.propagate_ibp_with_engine(&input_bounds, engine)?
+                                conv.propagate_ibp_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             }
                         }
                         (Layer::Conv2d(conv), _) => {
-                            if sound {
-                                conv.propagate_ibp_sound_with_engine(&input_bounds, engine)?
+                            if sound || deadline.is_some() {
+                                // A finite-deadline graph IBP result can still
+                                // feed verifier root decisions. Plain f32
+                                // Conv2d under-encloses under cancellation, so
+                                // the deadline route must carry a certificate
+                                // as well as avoiding opaque engine/faer work.
+                                // Under a finite deadline that certificate is
+                                // the f64 dual-accumulator kernel — strictly
+                                // tighter than the old gamma*S widening whose
+                                // magnitude-scaled floor stopped cgan BaB trees
+                                // from closing (#cgan-conv-ibp-magnitude-floor).
+                                // `deadline=None && !sound` retains the
+                                // historical fast path.
+                                conv.propagate_ibp_sound_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             } else {
-                                conv.propagate_ibp_with_engine(&input_bounds, engine)?
+                                conv.propagate_ibp_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             }
                         }
                         (Layer::ConvTranspose1d(conv), _) => {
-                            if sound {
-                                conv.propagate_ibp_sound_with_engine(&input_bounds, engine)?
+                            if sound || deadline.is_some() {
+                                conv.propagate_ibp_sound_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             } else {
-                                conv.propagate_ibp_with_engine(&input_bounds, engine)?
+                                conv.propagate_ibp_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             }
                         }
                         (Layer::ConvTranspose2d(conv), _) => {
-                            if sound {
-                                conv.propagate_ibp_sound_with_engine(&input_bounds, engine)?
+                            if sound || deadline.is_some() {
+                                // A finite-deadline graph result can feed root
+                                // decisions, so use the certified directed-f64
+                                // route and never enter the unpolled legacy
+                                // transpose forward under that authority.
+                                conv.propagate_ibp_sound_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             } else {
-                                conv.propagate_ibp_with_engine(&input_bounds, engine)?
+                                conv.propagate_ibp_with_engine_and_deadline(
+                                    &input_bounds,
+                                    engine,
+                                    deadline,
+                                )?
                             }
                         }
                         // AveragePool sound path: the plain forward accumulates each
@@ -749,7 +915,19 @@ fn propagate_ibp_core_inner(
                                     // still capturing the correlation gains where the
                                     // zonotope wins. Soundness: intersection of two valid
                                     // bounds is valid (#swiglu-intersect).
-                                    Some(zono) => intersect_zonotope_ibp(zono, ibp),
+                                    Some(zono) => {
+                                        if let Some(deadline) = deadline {
+                                            intersect_zonotope_ibp_with_poll(zono, ibp, || {
+                                                check_graph_ibp_deadline(
+                                                    deadline,
+                                                    node_name,
+                                                    "while intersecting zonotope bounds",
+                                                )
+                                            })?
+                                        } else {
+                                            intersect_zonotope_ibp(zono, ibp)
+                                        }
+                                    }
                                     None => ibp,
                                 }
                             }
@@ -769,14 +947,34 @@ fn propagate_ibp_core_inner(
                 // whenever the producer/structure is not a constant-weighted softmax
                 // contraction. See `ibp::dfl_envelope`.
                 let output_bounds = if matches!(&node.layer, Layer::Linear(_) | Layer::MatMul(_)) {
-                    match network.try_dfl_simplex_envelope(
-                        node,
-                        &output_bounds,
-                        input,
-                        &bounds_cache,
-                    )? {
-                        Some(tightened) => tightened,
-                        None => output_bounds,
+                    if let Some(deadline) = deadline {
+                        // The optional DFL recognizer/envelope currently scans,
+                        // allocates, and (for the perturbed-MatMul case) sorts
+                        // without a cooperative polling contract. Refuse that
+                        // tightening under finite authority; the untightened
+                        // IBP box remains sound. Keep the `None` arm byte-for-byte
+                        // on the historical helper path below.
+                        check_graph_ibp_deadline(
+                            deadline,
+                            node_name,
+                            "before refusing unpolled DFL simplex-envelope postprocessing",
+                        )?;
+                        debug!(
+                            "GraphNetwork IBP: node '{}' finite deadline; skipping optional \
+                             unpolled DFL simplex-envelope postprocessing",
+                            node_name
+                        );
+                        output_bounds
+                    } else {
+                        match network.try_dfl_simplex_envelope(
+                            node,
+                            &output_bounds,
+                            input,
+                            &bounds_cache,
+                        )? {
+                            Some(tightened) => tightened,
+                            None => output_bounds,
+                        }
                     }
                 } else {
                     output_bounds
@@ -792,7 +990,14 @@ fn propagate_ibp_core_inner(
                     node_name,
                     node.layer.layer_type()
                 );
-                computed.and_then(|bounds| unbounded_of_shape(bounds.shape()))
+                computed.and_then(|bounds| {
+                    unbounded_of_shape_with_deadline(
+                        bounds.shape(),
+                        deadline,
+                        node_name,
+                        "while creating a tainted shape-value fallback",
+                    )
+                })
             } else {
                 computed
             }
@@ -826,7 +1031,12 @@ fn propagate_ibp_core_inner(
                         None => return Err(e),
                     },
                 };
-                unbounded_of_shape(&shape)?
+                unbounded_of_shape_with_deadline(
+                    &shape,
+                    deadline,
+                    node_name,
+                    "while creating a tainted error fallback",
+                )?
             }
             Err(e) => return Err(e),
         };
@@ -834,8 +1044,8 @@ fn propagate_ibp_core_inner(
         // Apply directed rounding for soundness: lower bounds down, upper bounds up.
         // Linear layers use n-ULP rounding proportional to dot product size; all other
         // layers use 1-ULP rounding. The conv family and AveragePool already carry
-        // their certified Higham terms from the sound forward above, so their extra
-        // ULP here is redundant but harmless (widening only ever loosens).
+        // their own certified rounding enclosures from the sound forward above, so
+        // their extra ULP here is redundant but harmless (widening only ever loosens).
         let mut output_bounds = output_bounds;
         if sound {
             match &node.layer {
@@ -843,16 +1053,45 @@ fn propagate_ibp_core_inner(
                     let rounding_ulps = u32::try_from(linear.in_features())
                         .unwrap_or(u32::MAX)
                         .saturating_add(2);
-                    output_bounds.round_for_soundness_n_ulps_inplace(rounding_ulps);
+                    if let Some(deadline) = deadline {
+                        output_bounds.round_for_soundness_n_ulps_inplace_with_poll(
+                            rounding_ulps,
+                            || {
+                                check_graph_ibp_deadline(
+                                    deadline,
+                                    node_name,
+                                    "while applying soundness rounding",
+                                )
+                            },
+                        )?;
+                    } else {
+                        output_bounds.round_for_soundness_n_ulps_inplace(rounding_ulps);
+                    }
                 }
                 _ => {
-                    output_bounds.round_for_soundness_inplace();
+                    if let Some(deadline) = deadline {
+                        output_bounds.round_for_soundness_inplace_with_poll(|| {
+                            check_graph_ibp_deadline(
+                                deadline,
+                                node_name,
+                                "while applying soundness rounding",
+                            )
+                        })?;
+                    } else {
+                        output_bounds.round_for_soundness_inplace();
+                    }
                 }
             }
         }
 
         let (max_width, max_abs, saturated, has_nan, has_non_finite) =
-            summarize_bounds(&output_bounds);
+            if let Some(deadline) = deadline {
+                summarize_bounds_with_poll(&output_bounds, || {
+                    check_graph_ibp_deadline(deadline, node_name, "while summarizing output bounds")
+                })?
+            } else {
+                summarize_bounds(&output_bounds)
+            };
         debug!(
             "GraphNetwork IBP: {} ({}) shape {:?} max_width {:.2e} max_abs {:.2e} saturated={} nan={} non_finite={}",
             node_name,
@@ -882,36 +1121,60 @@ fn propagate_ibp_core_inner(
                 node_name,
                 node.layer.layer_type()
             );
-            match network.declared_shape(node_name) {
-                Some(shape) => unbounded_of_shape(shape)?,
-                None => unbounded_of_shape(output_bounds.shape())?,
-            }
+            let shape = network
+                .declared_shape(node_name)
+                .unwrap_or_else(|| output_bounds.shape());
+            unbounded_of_shape_with_deadline(
+                shape,
+                deadline,
+                node_name,
+                "while creating a tainted NaN fallback",
+            )?
         } else {
             output_bounds
         };
 
         // NaN firewall (#2563, #2706). summarize_bounds already detected NaN;
         // use shared helper to enforce consistent error policy.
-        check_nan_firewall(
-            &output_bounds,
-            if sound {
-                "GraphNetwork IBP (sound)"
-            } else {
-                "GraphNetwork IBP"
-            },
-            node_name,
-            node.layer.layer_type(),
-        )?;
+        let firewall_context = if sound {
+            "GraphNetwork IBP (sound)"
+        } else {
+            "GraphNetwork IBP"
+        };
+        if let Some(deadline) = deadline {
+            check_nan_firewall_with_poll(
+                &output_bounds,
+                firewall_context,
+                node_name,
+                node.layer.layer_type(),
+                || check_graph_ibp_deadline(deadline, node_name, "while checking the NaN firewall"),
+            )?;
+        } else {
+            check_nan_firewall(
+                &output_bounds,
+                firewall_context,
+                node_name,
+                node.layer.layer_type(),
+            )?;
+        }
 
         // Collapse to the interval center so a point input stays a point and the
         // per-node soundness widening cannot be amplified by downstream nodes
         // (#cgan-eval). Only for the non-soundness-critical point forward.
         let output_bounds = if collapse_to_center {
-            BoundedTensor::concrete(output_bounds.center())?
+            concrete_center_with_deadline(
+                &output_bounds,
+                deadline,
+                node_name,
+                "while centering the node output",
+            )?
         } else {
             output_bounds
         };
 
+        if let Some(deadline) = deadline {
+            check_graph_ibp_deadline(deadline, node_name, "before caching the node output")?;
+        }
         bounds_cache.insert(node_name.clone(), output_bounds);
     }
 
@@ -942,10 +1205,104 @@ fn propagate_ibp_core_inner(
              restore strict behavior.",
             effective_output
         );
-        return match network.declared_shape(effective_output) {
-            Some(shape) => unbounded_of_shape(shape),
-            None => unbounded_of_shape(result.shape()),
-        };
+        let shape = network
+            .declared_shape(effective_output)
+            .unwrap_or_else(|| result.shape());
+        return unbounded_of_shape_with_deadline(
+            shape,
+            deadline,
+            effective_output,
+            "while creating a tainted output fallback",
+        );
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod postprocessing_tests {
+    use super::{summarize_bounds, summarize_bounds_with_poll};
+    use crate::network::core::graph::ibp::dispatch::{
+        check_nan_firewall, check_nan_firewall_with_poll,
+    };
+    use ndarray::{ArrayD, IxDyn};
+    use ny_core::NyError;
+    use ny_tensor::BoundedTensor;
+
+    #[test]
+    fn pollable_summary_matches_and_cancels_before_publication_8193_elements() {
+        let bounds = BoundedTensor::new(
+            ArrayD::from_shape_fn(IxDyn(&[8_193]), |index| -3.0_f32 + index[0] as f32 * 0.0001),
+            ArrayD::from_shape_fn(IxDyn(&[8_193]), |index| 5.0_f32 + index[0] as f32 * 0.0002),
+        )
+        .expect("bounds");
+        let expected = summarize_bounds(&bounds);
+        let mut polls = 0usize;
+        let actual = summarize_bounds_with_poll(&bounds, || {
+            polls += 1;
+            Ok(())
+        })
+        .expect("pollable summary");
+        assert_eq!(actual, expected);
+        assert_eq!(polls, 5);
+
+        let mut injected_polls = 0usize;
+        let error = summarize_bounds_with_poll(&bounds, || {
+            injected_polls += 1;
+            if injected_polls == 5 {
+                Err(NyError::DeadlineExceeded(
+                    "injected summary publication poll".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("final poll must prevent publication");
+        assert!(matches!(error, NyError::DeadlineExceeded(_)));
+        assert_eq!(injected_polls, 5);
+    }
+
+    #[test]
+    fn pollable_nan_firewall_matches_and_polls_8193_elements() {
+        let bounds = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[8_193]), -1.0),
+            ArrayD::from_elem(IxDyn(&[8_193]), 1.0),
+        )
+        .expect("bounds");
+        check_nan_firewall(&bounds, "test", "node", "Identity").expect("ordinary firewall");
+        let mut polls = 0usize;
+        check_nan_firewall_with_poll(&bounds, "test", "node", "Identity", || {
+            polls += 1;
+            Ok(())
+        })
+        .expect("pollable firewall");
+        assert_eq!(polls, 7);
+
+        let mut injected_polls = 0usize;
+        let error = check_nan_firewall_with_poll(&bounds, "test", "node", "Identity", || {
+            injected_polls += 1;
+            if injected_polls == 7 {
+                Err(NyError::DeadlineExceeded(
+                    "injected firewall publication poll".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("final poll must prevent publication");
+        assert!(matches!(error, NyError::DeadlineExceeded(_)));
+        assert_eq!(injected_polls, 7);
+    }
+
+    #[test]
+    fn pollable_nan_firewall_preserves_nan_error() {
+        let lower = ArrayD::from_elem(IxDyn(&[8_193]), -1.0);
+        let mut upper = ArrayD::from_elem(IxDyn(&[8_193]), 1.0);
+        upper[[8_192]] = f32::NAN;
+        let bounds = BoundedTensor::new_unchecked(lower, upper).expect("test-only NaN bounds");
+        let expected = check_nan_firewall(&bounds, "test", "node", "Identity")
+            .expect_err("ordinary firewall must reject NaN");
+        let actual = check_nan_firewall_with_poll(&bounds, "test", "node", "Identity", || Ok(()))
+            .expect_err("pollable firewall must reject NaN");
+        assert_eq!(actual.to_string(), expected.to_string());
+    }
 }

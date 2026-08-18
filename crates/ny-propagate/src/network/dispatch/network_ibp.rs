@@ -11,7 +11,7 @@ use crate::network::ibp::NetworkIbpExt;
 use crate::network::Network;
 use crate::types::CrownIbpBoundsResult;
 
-use ny_core::{GemmEngine, Result};
+use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use std::time::Instant;
 
@@ -222,8 +222,9 @@ impl Network {
 
     /// Run CROWN-IBP with deadline enforcement (#3328).
     ///
-    /// When deadline is exceeded during the per-layer CROWN backward passes,
-    /// remaining layers fall back to IBP bounds (sound but looser).
+    /// A local per-layer budget may select an IBP bound while the caller's
+    /// deadline remains live. Exhausting the caller deadline itself is a typed
+    /// refusal: the collector never clones remaining bounds after expiry.
     pub fn collect_crown_ibp_bounds_with_engine_and_deadline(
         &self,
         input: &BoundedTensor,
@@ -249,6 +250,19 @@ impl Network {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<Vec<BoundedTensor>> {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            if precomputed_ibp.len() != self.layers().len() {
+                return Err(NyError::InvalidSpec(format!(
+                    "pre-computed IBP bounds have {} entries, expected {} (one per layer)",
+                    precomputed_ibp.len(),
+                    self.layers().len()
+                )));
+            }
+            // This bounds-only API owns the complete certified vector. Moving
+            // it to the caller is O(1) and requires no post-expiry scan, clone,
+            // or fallback computation.
+            return Ok(precomputed_ibp);
+        }
         Ok(
             NetworkIbpExt::collect_crown_ibp_bounds_with_precomputed_ibp_impl(
                 self,

@@ -7,7 +7,6 @@
 mod bound_compute;
 mod gradients;
 mod intermediate_merge;
-mod objective;
 mod optimize_loop;
 mod validate;
 

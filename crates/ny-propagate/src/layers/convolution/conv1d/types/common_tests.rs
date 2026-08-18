@@ -127,3 +127,38 @@ fn test_finalize_bias_bounds_finite_no_nan_4204() {
     assert!((lb - 0.65).abs() < 0.01, "lower_b ≈ 0.65, got {lb}");
     assert!((ub - (-0.05)).abs() < 0.01, "upper_b ≈ -0.05, got {ub}");
 }
+
+#[test]
+fn finalize_bias_bounds_folds_incoming_coefficient_error() {
+    let mut bounds = BatchedLinearBounds::new(
+        ArrayD::zeros(IxDyn(&[1, 1, 1])),
+        ArrayD::zeros(IxDyn(&[1, 1])),
+        ArrayD::zeros(IxDyn(&[1, 1, 1])),
+        ArrayD::zeros(IxDyn(&[1, 1])),
+        vec![1, 1],
+        vec![1, 1],
+    )
+    .expect("valid bounds");
+    bounds.set_coeff_err(
+        ArrayD::ones(IxDyn(&[1, 1, 1])),
+        ArrayD::ones(IxDyn(&[1, 1, 1])),
+    );
+
+    let ctx = ctx_1x1(1);
+    let a = Array2::zeros((1, 1));
+    let a3 = a.view().into_shape_with_order((1, 1, 1)).expect("reshape");
+    let bias = Array1::from_vec(vec![1.0]);
+
+    let (new_lb, new_ub) =
+        finalize_bias_bounds(&bounds, &ctx, 1, 1, a3, a3, Some(&bias), &[false], &[false])
+            .expect("bias fold");
+
+    assert!(
+        new_lb[[0, 0]] <= -1.0,
+        "lower bias must include coefficient error"
+    );
+    assert!(
+        new_ub[[0, 0]] >= 1.0,
+        "upper bias must include coefficient error"
+    );
+}

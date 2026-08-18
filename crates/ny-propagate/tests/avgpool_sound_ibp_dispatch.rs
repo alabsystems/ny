@@ -142,7 +142,7 @@ fn sequential_collect_sound_ibp_dispatches_avgpool_to_certified_forward() {
 // ---------------------------------------------------------------------------
 
 fn rat(v: f32) -> BigRational {
-    BigRational::from_float(f64::from(v)).expect("finite test value")
+    BigRational::from_float(v).expect("finite test value")
 }
 
 /// Exact rational average pool of one endpoint array (3D (C, H, W) only), in the

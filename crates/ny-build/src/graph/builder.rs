@@ -7,7 +7,7 @@ use super::helpers::{
     declared_output_shape, evaluate_constant_split_outputs, find_activation_inputs,
     handle_split_layer, internal_shape_from_onnx_shape, map_outputs_to_activation_inputs_or_input,
     map_outputs_to_node, map_skipped_outputs, model_is_unbatched, resolve_tensor_node_name,
-    resolve_tensor_node_name_via_first_producer, SplitBuildContext, SplitGraphBuildOutcome,
+    SplitBuildContext, SplitGraphBuildOutcome,
 };
 use super::inputs::find_graph_input_nodes;
 use super::normalization_fusion::try_instance_norm_fusion;
@@ -17,7 +17,7 @@ use crate::graph_options::GraphNetworkOptions;
 use crate::{is_multi_output_split, ConvertContext, LayerSpec, TensorSpec, WeightStore};
 use ndarray::ArrayD;
 use ny_core::{LayerType, NyError, Result};
-use ny_propagate::layers::{ExpandLikeLastAxisLayer, SqueezeLayer, WhereLayer};
+use ny_propagate::layers::{SqueezeLayer, WhereLayer};
 use ny_propagate::{GraphNetwork, GraphNode, Layer};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
@@ -51,22 +51,6 @@ fn layer_type_embeds_parameter_inputs(layer_type: &LayerType) -> bool {
             | LayerType::GroupNorm
             | LayerType::BatchNorm
     )
-}
-
-fn can_lower_expand_with_live_shape_reference(
-    spec: &LayerSpec,
-    context: &ConvertContext<'_>,
-    tensor_to_node: &HashMap<String, String>,
-    tensor_producer: &HashMap<String, String>,
-) -> bool {
-    if spec.layer_type != LayerType::Expand || spec.inputs.len() < 2 {
-        return false;
-    }
-    let data_name = &spec.inputs[0];
-    let shape_name = &spec.inputs[1];
-    !context.is_constant(data_name)
-        && resolve_tensor_node_name_via_first_producer(shape_name, tensor_to_node, tensor_producer)
-            .is_some()
 }
 
 /// Build a DAG-based [`GraphNetwork`] from model specification data.
@@ -448,21 +432,6 @@ pub fn build_graph_network(
                     "{}; use GraphNetworkOptions::permissive() to allow skipping",
                     msg
                 )));
-            }
-            Err(NyError::UnsupportedOp(msg))
-                if msg.contains("constant-side Expand")
-                    && can_lower_expand_with_live_shape_reference(
-                        spec,
-                        &context,
-                        &tensor_to_node,
-                        data.tensor_producer,
-                    ) =>
-            {
-                debug!(
-                    "Lowering Expand '{}' with pre-evaluated Shape(reference) to ExpandLikeLastAxis: {}",
-                    spec.name, msg
-                );
-                Layer::ExpandLikeLastAxis(ExpandLikeLastAxisLayer::new())
             }
             Err(NyError::UnsupportedOp(msg)) => {
                 // Skip unsupported layers — insert OpaqueSkipLayer for conservative [-inf, +inf] bounds.

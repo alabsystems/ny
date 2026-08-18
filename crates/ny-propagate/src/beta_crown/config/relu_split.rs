@@ -66,21 +66,32 @@ impl BetaCrownConfig {
     /// Compute effective split depth based on queue size and batch size.
     ///
     /// When the BaB queue is smaller than `batch_size * min_batch_fill_ratio`,
-    /// increase depth so that `queue_size * 2^depth >= min_batch`. This keeps
-    /// GPU batches full by creating more child domains per iteration.
+    /// increase depth using alpha-beta-CROWN's integer
+    /// `log2(min_batch / queue_size)` rule. This creates more child domains per
+    /// iteration without overshooting to the next power of two.
     ///
     /// Returns 1 when multi-depth is disabled (`max_relu_split_depth <= 1`)
     /// or when the queue is already large enough.
     ///
     /// Reference: alpha-beta-CROWN `get_split_depth()` in `bab.py:40-48`.
     pub fn effective_relu_split_depth(&self, queue_size: usize) -> usize {
-        let min_batch = (self.batch_size as f32 * self.min_batch_fill_ratio) as usize;
-        if queue_size >= min_batch || self.max_relu_split_depth <= 1 {
+        let min_batch = self.batch_size as f64 * self.min_batch_fill_ratio as f64;
+        if self.max_relu_split_depth <= 1
+            || !min_batch.is_finite()
+            || min_batch <= 0.0
+            || queue_size as f64 >= min_batch
+        {
             return 1;
         }
-        // depth = ceil(log2(min_batch / queue_size))
-        let ratio = (min_batch as f32) / (queue_size.max(1) as f32);
-        let depth = ratio.log2().ceil() as usize;
-        depth.clamp(1, self.max_relu_split_depth)
+        // Match alpha-beta-CROWN's `int(log(...)/log(2))`: Python's `int`
+        // truncates this positive value, i.e. floor(log2(ratio)).  In
+        // particular, batch=1 with the reference CIFAR settings
+        // (256 * 0.1 = 25.6) selects depth 4, not depth 5.
+        let ratio = min_batch / queue_size.max(1) as f64;
+        let depth = ratio.log2().floor() as usize;
+        // `GraphBabDomain::with_multi_constraints` independently rejects
+        // deeper truth tables; clamp here so every caller shares that resource
+        // ceiling before allocating `2^depth` children.
+        depth.clamp(1, self.max_relu_split_depth.min(10))
     }
 }

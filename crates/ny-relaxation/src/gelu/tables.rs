@@ -16,6 +16,7 @@ use super::eval::{
 };
 use crate::rounding::{next_down_f32, next_up_f32};
 use crate::types::GeluApproximation;
+use ny_core::{f32_affine_eval_error, f64_to_f32_down, f64_to_f32_up};
 
 /// sqrt(2) constant used for case-splitting in GELU relaxation.
 pub(crate) const SQRT_2: f32 = std::f32::consts::SQRT_2;
@@ -363,17 +364,12 @@ pub(crate) fn gelu_tangent_at(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
     let slope64 = gelu_derivative_erf_f64(d64);
     let intercept64 = gelu_erf_f64(d64) - slope64 * d64;
 
-    // Directed rounding: absorb f64→f32 slope truncation error.
     let slope_f32 = slope64 as f32;
-    let slope_err = next_up_f32(((slope64 - slope_f32 as f64).abs() * max_abs_x as f64) as f32);
-    // Account for f32 multiplication rounding: `slope * x` has error up to
-    // |slope| * |x| * f32::EPSILON. Same fix as sqrt.rs (#4368).
-    let mul_err = next_up_f32((slope_f32.abs() * max_abs_x) * f32::EPSILON);
-    let intercept_f32 = intercept64 as f32;
+    let eval_err = f32_affine_eval_error(slope64, slope_f32, intercept64, max_abs_x);
     (
         slope_f32,
-        next_down_f32(intercept_f32 - slope_err - mul_err),
-        next_up_f32(intercept_f32 + slope_err + mul_err),
+        next_down_f32(f64_to_f32_down(intercept64 - eval_err)),
+        next_up_f32(f64_to_f32_up(intercept64 + eval_err)),
     )
 }
 
@@ -388,13 +384,11 @@ pub(crate) fn gelu_tanh_tangent_at(d: f32, max_abs_x: f32) -> (f32, f32, f32) {
     let intercept64 = gelu_tanh_f64(d64) - slope64 * d64;
 
     let slope_f32 = slope64 as f32;
-    let slope_err = next_up_f32(((slope64 - slope_f32 as f64).abs() * max_abs_x as f64) as f32);
-    let mul_err = next_up_f32((slope_f32.abs() * max_abs_x) * f32::EPSILON);
-    let intercept_f32 = intercept64 as f32;
+    let eval_err = f32_affine_eval_error(slope64, slope_f32, intercept64, max_abs_x);
     (
         slope_f32,
-        next_down_f32(intercept_f32 - slope_err - mul_err),
-        next_up_f32(intercept_f32 + slope_err + mul_err),
+        next_down_f32(f64_to_f32_down(intercept64 - eval_err)),
+        next_up_f32(f64_to_f32_up(intercept64 + eval_err)),
     )
 }
 

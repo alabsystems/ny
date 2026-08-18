@@ -4,6 +4,8 @@
 
 use super::super::layer::SoftmaxLayer;
 use super::super::utils;
+use super::sound::{softmax_objective_envelope_gate, with_softmax_objective_envelope_for_test};
+use crate::layers::softmax::bounds::constant_bounds_from_output;
 use crate::{BatchedLinearBounds, LinearBounds};
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use ny_core::VerificationSoundnessMode;
@@ -50,6 +52,197 @@ fn assert_lse_bounds_enclose_vertices(
                 i,
                 ub,
                 softmax[i]
+            );
+        }
+    }
+}
+
+// Audited logit-box endpoints, recorded at the precision they were audited at.
+// Truncating a literal moves the fixture's box and silently re-points every
+// envelope soundness/dominance assertion below at a different problem.
+#[allow(clippy::excessive_precision)]
+const OBJECTIVE_ENVELOPE_LOGIT_LOWER: [f32; 5] = [
+    -2.320_387,
+    -1.335_145_2,
+    -1.678_693,
+    2.556_615_1,
+    0.226_314_49,
+];
+const OBJECTIVE_ENVELOPE_LOGIT_UPPER: [f32; 5] = [
+    -2.171_673_3,
+    -1.209_960_5,
+    -1.465_777_4,
+    2.670_337_2,
+    0.479_345_98,
+];
+
+// Audited split-direction witnesses, plus deterministic both-LSE and
+// both-constant witnesses over the same logit box.
+const OBJECTIVE_ENVELOPE_ROWS: [[f32; 5]; 4] = [
+    [-2.759_585, -4.884_014, 3.840_507, -4.971, 4.705_489],
+    [3.781_244, 4.281_342, -2.547_796, 4.963_99, -4.977_438],
+    [1.0, 1.0, 1.0, 1.0, 1.0],
+    [
+        -3.202_033_5,
+        -3.738_530_4,
+        -0.248_358_38,
+        3.513_572_2,
+        -4.946_847,
+    ],
+];
+
+fn objective_envelope_fixture() -> (SoftmaxLayer, BoundedTensor, LinearBounds) {
+    let layer = SoftmaxLayer::new(-1);
+    let pre = BoundedTensor::new(
+        Array1::from_vec(OBJECTIVE_ENVELOPE_LOGIT_LOWER.to_vec()).into_dyn(),
+        Array1::from_vec(OBJECTIVE_ENVELOPE_LOGIT_UPPER.to_vec()).into_dyn(),
+    )
+    .expect("objective-envelope logit box");
+    let rows: Vec<f32> = OBJECTIVE_ENVELOPE_ROWS.into_iter().flatten().collect();
+    let a = Array2::from_shape_vec((4, 5), rows).expect("four objective rows");
+    let bounds = LinearBounds::new(a.clone(), Array1::zeros(4), a, Array1::zeros(4))
+        .expect("objective-envelope incoming bounds");
+    (layer, pre, bounds)
+}
+
+fn objective_envelope_candidates(
+    layer: &SoftmaxLayer,
+    pre: &BoundedTensor,
+    bounds: &LinearBounds,
+) -> (LinearBounds, LinearBounds, LinearBounds) {
+    let pre_lower = pre
+        .lower()
+        .clone()
+        .into_dimensionality::<ndarray::Ix1>()
+        .expect("1-D lower");
+    let pre_upper = pre
+        .upper()
+        .clone()
+        .into_dimensionality::<ndarray::Ix1>()
+        .expect("1-D upper");
+    let lse = with_softmax_objective_envelope_for_test(false, || {
+        layer.propagate_linear_with_bounds_1d_sound(bounds, &pre_lower, &pre_upper)
+    })
+    .expect("LSE candidate");
+    let softmax_box = SoftmaxLayer::propagate_ibp_with_axis(pre, 0).expect("exact 1-D IBP");
+    let constant = constant_bounds_from_output(bounds, &softmax_box).expect("constant candidate");
+    let envelope = with_softmax_objective_envelope_for_test(true, || {
+        layer.propagate_linear_with_bounds_1d_sound(bounds, &pre_lower, &pre_upper)
+    })
+    .expect("objective envelope");
+    (lse, constant, envelope)
+}
+
+fn assert_lower_row_exact(actual: &LinearBounds, expected: &LinearBounds, row: usize) {
+    assert_eq!(actual.lower_a.row(row), expected.lower_a.row(row));
+    assert_eq!(
+        actual.lower_b[row].to_bits(),
+        expected.lower_b[row].to_bits()
+    );
+}
+
+fn assert_upper_row_exact(actual: &LinearBounds, expected: &LinearBounds, row: usize) {
+    assert_eq!(actual.upper_a.row(row), expected.upper_a.row(row));
+    assert_eq!(
+        actual.upper_b[row].to_bits(),
+        expected.upper_b[row].to_bits()
+    );
+}
+
+fn grouped_objective_envelope_fixture(shape: &[usize]) -> (BoundedTensor, LinearBounds) {
+    let num_groups = shape.iter().product::<usize>() / 5;
+    let mut lower = Vec::with_capacity(num_groups * 5);
+    let mut upper = Vec::with_capacity(num_groups * 5);
+    for _ in 0..num_groups {
+        lower.extend_from_slice(&OBJECTIVE_ENVELOPE_LOGIT_LOWER);
+        upper.extend_from_slice(&OBJECTIVE_ENVELOPE_LOGIT_UPPER);
+    }
+    let pre = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(shape), lower).expect("grouped lower shape"),
+        ArrayD::from_shape_vec(IxDyn(shape), upper).expect("grouped upper shape"),
+    )
+    .expect("grouped logit box");
+
+    let mut rows = Vec::with_capacity(4 * num_groups * 5);
+    for objective in OBJECTIVE_ENVELOPE_ROWS {
+        for _ in 0..num_groups {
+            rows.extend_from_slice(&objective);
+        }
+    }
+    let a = Array2::from_shape_vec((4, num_groups * 5), rows).expect("grouped objectives");
+    let bounds = LinearBounds::new(a.clone(), Array1::zeros(4), a, Array1::zeros(4))
+        .expect("grouped incoming bounds");
+    (pre, bounds)
+}
+
+fn assert_grouped_envelope_dominates_and_is_sound(
+    baseline: &LinearBounds,
+    envelope: &LinearBounds,
+    pre: &BoundedTensor,
+) {
+    let baseline_concrete = baseline.concretize_sound(pre);
+    let envelope_concrete = envelope.concretize_sound(pre);
+    let mut strict = false;
+    for row in 0..4 {
+        let baseline_lower = baseline_concrete.lower()[[row]];
+        let baseline_upper = baseline_concrete.upper()[[row]];
+        let envelope_lower = envelope_concrete.lower()[[row]];
+        let envelope_upper = envelope_concrete.upper()[[row]];
+        assert!(
+            envelope_lower + 1e-6 >= baseline_lower,
+            "row {row}: envelope lower {envelope_lower} < LSE lower {baseline_lower}"
+        );
+        assert!(
+            envelope_upper <= baseline_upper + 1e-6,
+            "row {row}: envelope upper {envelope_upper} > LSE upper {baseline_upper}"
+        );
+        strict |= envelope_lower > baseline_lower + 1e-5 || envelope_upper + 1e-5 < baseline_upper;
+    }
+    assert!(
+        strict,
+        "grouped envelope did not make any strict improvement"
+    );
+
+    let lower: Vec<f32> = pre.lower().iter().copied().collect();
+    let upper: Vec<f32> = pre.upper().iter().copied().collect();
+    let num_groups = lower.len() / 5;
+    for mask in 0..(1usize << lower.len()) {
+        let sample: Vec<f32> = (0..lower.len())
+            .map(|idx| {
+                if (mask >> idx) & 1 == 1 {
+                    upper[idx]
+                } else {
+                    lower[idx]
+                }
+            })
+            .collect();
+        let mut softmax_groups = Vec::with_capacity(sample.len());
+        for group in 0..num_groups {
+            let start = group * 5;
+            let values = Array1::from_vec(sample[start..start + 5].to_vec());
+            softmax_groups.extend(utils::softmax_1d(&values));
+        }
+        let sample = Array1::from_vec(sample);
+        for (row, objective) in OBJECTIVE_ENVELOPE_ROWS.iter().enumerate() {
+            let true_value: f32 = softmax_groups
+                .chunks_exact(5)
+                .map(|group| {
+                    group
+                        .iter()
+                        .zip(objective)
+                        .map(|(&value, &coefficient)| value * coefficient)
+                        .sum::<f32>()
+                })
+                .sum();
+            let lower_bound = envelope.lower_a.row(row).dot(&sample) + envelope.lower_b[row];
+            let upper_bound = envelope.upper_a.row(row).dot(&sample) + envelope.upper_b[row];
+            assert!(
+                lower_bound <= true_value + 1e-3,
+                "row {row}, mask {mask}: lower {lower_bound} > true {true_value}"
+            );
+            assert!(
+                upper_bound + 1e-3 >= true_value,
+                "row {row}, mask {mask}: upper {upper_bound} < true {true_value}"
             );
         }
     }
@@ -132,6 +325,166 @@ fn lse_affine_bounds_point_interval() {
 // =========================================================================
 // propagate_linear_with_bounds — 1D sound
 // =========================================================================
+
+#[test]
+fn objective_envelope_gate_is_exact_string_and_default_dark() {
+    assert!(!softmax_objective_envelope_gate(None));
+    assert!(!softmax_objective_envelope_gate(Some("")));
+    assert!(!softmax_objective_envelope_gate(Some("0")));
+    assert!(!softmax_objective_envelope_gate(Some("true")));
+    assert!(!softmax_objective_envelope_gate(Some("01")));
+    assert!(softmax_objective_envelope_gate(Some("1")));
+}
+
+#[test]
+fn objective_envelope_audit_fixture_exercises_all_four_row_choices() {
+    let (layer, pre, bounds) = objective_envelope_fixture();
+    let (lse, constant, envelope) = objective_envelope_candidates(&layer, &pre, &bounds);
+
+    // Row 0 is the audited constant-lower / affine-upper witness.
+    assert_lower_row_exact(&envelope, &constant, 0);
+    assert_upper_row_exact(&envelope, &lse, 0);
+    // Row 1 is the audited affine-lower / constant-upper witness.
+    assert_lower_row_exact(&envelope, &lse, 1);
+    assert_upper_row_exact(&envelope, &constant, 1);
+    // Equal positive weights exploit sum(softmax)=1 and retain LSE on both
+    // sides for this fixture; row 3 is independently constant on both sides.
+    assert_lower_row_exact(&envelope, &lse, 2);
+    assert_upper_row_exact(&envelope, &lse, 2);
+    assert_lower_row_exact(&envelope, &constant, 3);
+    assert_upper_row_exact(&envelope, &constant, 3);
+
+    // Non-vacuity: every direction above genuinely distinguishes candidates.
+    for row in 0..4 {
+        assert_ne!(lse.lower_a.row(row), constant.lower_a.row(row));
+        assert_ne!(lse.upper_a.row(row), constant.upper_a.row(row));
+    }
+
+    let lse_concrete = lse.concretize_sound(&pre);
+    let constant_concrete = constant.concretize_sound(&pre);
+    let envelope_concrete = envelope.concretize_sound(&pre);
+    for row in 0..4 {
+        assert!(
+            envelope_concrete.lower()[[row]] >= lse_concrete.lower()[[row]]
+                && envelope_concrete.lower()[[row]] >= constant_concrete.lower()[[row]],
+            "row {row}: envelope lower did not dominate both candidates"
+        );
+        assert!(
+            envelope_concrete.upper()[[row]] <= lse_concrete.upper()[[row]]
+                && envelope_concrete.upper()[[row]] <= constant_concrete.upper()[[row]],
+            "row {row}: envelope upper did not dominate both candidates"
+        );
+    }
+}
+
+#[test]
+fn objective_envelope_default_off_is_bit_identical_to_lse_composition() {
+    let (layer, pre, bounds) = objective_envelope_fixture();
+    let pre_lower = pre
+        .lower()
+        .clone()
+        .into_dimensionality::<ndarray::Ix1>()
+        .unwrap();
+    let pre_upper = pre
+        .upper()
+        .clone()
+        .into_dimensionality::<ndarray::Ix1>()
+        .unwrap();
+    let (lower_a, lower_b, upper_a, upper_b) = layer
+        .softmax_lse_affine_bounds(&pre_lower, &pre_upper)
+        .expect("fixture has a finite LSE relaxation");
+    let historical = layer
+        .apply_affine_bounds(&bounds, &lower_a, &lower_b, &upper_a, &upper_b)
+        .expect("historical LSE composition");
+    let gated_off = with_softmax_objective_envelope_for_test(false, || {
+        layer.propagate_linear_with_bounds_1d_sound(&bounds, &pre_lower, &pre_upper)
+    })
+    .expect("default-off composition");
+
+    assert_eq!(gated_off.lower_a, historical.lower_a);
+    assert_eq!(gated_off.upper_a, historical.upper_a);
+    assert_eq!(
+        gated_off.lower_b.mapv(f32::to_bits),
+        historical.lower_b.mapv(f32::to_bits)
+    );
+    assert_eq!(
+        gated_off.upper_b.mapv(f32::to_bits),
+        historical.upper_b.mapv(f32::to_bits)
+    );
+}
+
+#[test]
+fn objective_envelope_randomized_soundness_and_local_dominance() {
+    fn next_unit(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((*state >> 40) as u32) as f32 / ((1u32 << 24) - 1) as f32
+    }
+
+    let layer = SoftmaxLayer::new(-1);
+    let mut state = 0x5eed_5eed_cafe_babe_u64;
+    for case in 0..64 {
+        let mut lower = Array1::<f32>::zeros(3);
+        let mut upper = Array1::<f32>::zeros(3);
+        for idx in 0..3 {
+            lower[idx] = -3.0 + 6.0 * next_unit(&mut state);
+            upper[idx] = lower[idx] + 0.02 + 0.98 * next_unit(&mut state);
+        }
+        let pre = BoundedTensor::new(lower.clone().into_dyn(), upper.clone().into_dyn()).unwrap();
+
+        let mut a = Array2::<f32>::zeros((6, 3));
+        let mut bias = Array1::<f32>::zeros(6);
+        for row in 0..6 {
+            for col in 0..3 {
+                a[[row, col]] = -5.0 + 10.0 * next_unit(&mut state);
+            }
+            bias[row] = -1.0 + 2.0 * next_unit(&mut state);
+        }
+        let incoming = LinearBounds::new(a.clone(), bias.clone(), a, bias).unwrap();
+        let (lse, constant, envelope) = objective_envelope_candidates(&layer, &pre, &incoming);
+        let lse_concrete = lse.concretize_sound(&pre);
+        let constant_concrete = constant.concretize_sound(&pre);
+        let envelope_concrete = envelope.concretize_sound(&pre);
+
+        for row in 0..6 {
+            assert!(
+                envelope_concrete.lower()[[row]] >= lse_concrete.lower()[[row]]
+                    && envelope_concrete.lower()[[row]] >= constant_concrete.lower()[[row]],
+                "case {case}, row {row}: lower envelope lost local dominance"
+            );
+            assert!(
+                envelope_concrete.upper()[[row]] <= lse_concrete.upper()[[row]]
+                    && envelope_concrete.upper()[[row]] <= constant_concrete.upper()[[row]],
+                "case {case}, row {row}: upper envelope lost local dominance"
+            );
+        }
+
+        for mask in 0..8usize {
+            let sample = Array1::from_shape_fn(3, |idx| {
+                if (mask >> idx) & 1 == 1 {
+                    upper[idx]
+                } else {
+                    lower[idx]
+                }
+            });
+            let softmax = utils::softmax_1d(&sample);
+            for row in 0..6 {
+                let true_value = incoming.lower_a.row(row).dot(&softmax) + incoming.lower_b[row];
+                let lower_bound = envelope.lower_a.row(row).dot(&sample) + envelope.lower_b[row];
+                let upper_bound = envelope.upper_a.row(row).dot(&sample) + envelope.upper_b[row];
+                assert!(
+                    lower_bound <= true_value + 2e-3,
+                    "case {case}, row {row}, mask {mask}: lower {lower_bound} > true {true_value}"
+                );
+                assert!(
+                    upper_bound + 2e-3 >= true_value,
+                    "case {case}, row {row}, mask {mask}: upper {upper_bound} < true {true_value}"
+                );
+            }
+        }
+    }
+}
 
 #[test]
 fn crown_1d_sound_bounds_contain_samples() {
@@ -526,6 +879,38 @@ fn crown_2d_colwise_sound() {
 }
 
 #[test]
+fn objective_envelope_routes_through_explicit_axis_1_2d() {
+    let layer = SoftmaxLayer::new(1);
+    let (pre, bounds) = grouped_objective_envelope_fixture(&[2, 5]);
+    let baseline = with_softmax_objective_envelope_for_test(false, || {
+        layer.propagate_linear_with_bounds(&bounds, &pre, VerificationSoundnessMode::Sound)
+    })
+    .expect("axis=1 baseline");
+    let envelope = with_softmax_objective_envelope_for_test(true, || {
+        layer.propagate_linear_with_bounds(&bounds, &pre, VerificationSoundnessMode::Sound)
+    })
+    .expect("axis=1 envelope");
+
+    assert_grouped_envelope_dominates_and_is_sound(&baseline, &envelope, &pre);
+}
+
+#[test]
+fn objective_envelope_routes_through_explicit_axis_2_nd() {
+    let layer = SoftmaxLayer::new(2);
+    let (pre, bounds) = grouped_objective_envelope_fixture(&[1, 2, 5]);
+    let baseline = with_softmax_objective_envelope_for_test(false, || {
+        layer.propagate_linear_with_bounds(&bounds, &pre, VerificationSoundnessMode::Sound)
+    })
+    .expect("axis=2 baseline");
+    let envelope = with_softmax_objective_envelope_for_test(true, || {
+        layer.propagate_linear_with_bounds(&bounds, &pre, VerificationSoundnessMode::Sound)
+    })
+    .expect("axis=2 envelope");
+
+    assert_grouped_envelope_dominates_and_is_sound(&baseline, &envelope, &pre);
+}
+
+#[test]
 fn crown_2d_empty_rows_preserves_bias_and_stays_finite() {
     let layer = SoftmaxLayer::new(-1); // axis=-1 -> row-wise, num_groups=rows
     let pre = BoundedTensor::new(
@@ -876,6 +1261,105 @@ fn batched_crown_sound_basic() {
         result.upper_a.iter().all(|v| v.is_finite()),
         "batched sound upper_a has non-finite"
     );
+}
+
+#[test]
+fn objective_envelope_routes_through_batched_sound_path() {
+    let layer = SoftmaxLayer::new(-1);
+    let mut lower = Vec::with_capacity(10);
+    let mut upper = Vec::with_capacity(10);
+    for _ in 0..2 {
+        lower.extend_from_slice(&OBJECTIVE_ENVELOPE_LOGIT_LOWER);
+        upper.extend_from_slice(&OBJECTIVE_ENVELOPE_LOGIT_UPPER);
+    }
+    let pre = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[2, 5]), lower).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[2, 5]), upper).unwrap(),
+    )
+    .unwrap();
+
+    let mut a = ArrayD::zeros(IxDyn(&[2, 4, 5]));
+    for batch in 0..2 {
+        for row in 0..4 {
+            for col in 0..5 {
+                a[[batch, row, col]] = OBJECTIVE_ENVELOPE_ROWS[row][col];
+            }
+        }
+    }
+    let incoming = BatchedLinearBounds::from_parts_unchecked(
+        a.clone(),
+        ArrayD::zeros(IxDyn(&[2, 4])),
+        a,
+        ArrayD::zeros(IxDyn(&[2, 4])),
+        vec![2, 5],
+        vec![2, 4],
+    );
+    let baseline = with_softmax_objective_envelope_for_test(false, || {
+        layer.propagate_linear_batched_with_bounds(
+            &incoming,
+            &pre,
+            VerificationSoundnessMode::Sound,
+        )
+    })
+    .expect("batched baseline");
+    let envelope = with_softmax_objective_envelope_for_test(true, || {
+        layer.propagate_linear_batched_with_bounds(
+            &incoming,
+            &pre,
+            VerificationSoundnessMode::Sound,
+        )
+    })
+    .expect("batched envelope");
+    let baseline_concrete = baseline
+        .concretize_sound(&pre)
+        .expect("baseline concretize");
+    let envelope_concrete = envelope
+        .concretize_sound(&pre)
+        .expect("envelope concretize");
+
+    let mut strict = false;
+    for batch in 0..2 {
+        for row in 0..4 {
+            let baseline_lower = baseline_concrete.lower()[[batch, row]];
+            let baseline_upper = baseline_concrete.upper()[[batch, row]];
+            let envelope_lower = envelope_concrete.lower()[[batch, row]];
+            let envelope_upper = envelope_concrete.upper()[[batch, row]];
+            assert!(envelope_lower >= baseline_lower);
+            assert!(envelope_upper <= baseline_upper);
+            strict |= envelope_lower > baseline_lower || envelope_upper < baseline_upper;
+        }
+
+        for mask in 0..32usize {
+            let logits = Array1::from_shape_fn(5, |idx| {
+                if (mask >> idx) & 1 == 1 {
+                    OBJECTIVE_ENVELOPE_LOGIT_UPPER[idx]
+                } else {
+                    OBJECTIVE_ENVELOPE_LOGIT_LOWER[idx]
+                }
+            });
+            let softmax = utils::softmax_1d(&logits);
+            for (row, objective) in OBJECTIVE_ENVELOPE_ROWS.iter().enumerate() {
+                let true_value: f32 = objective
+                    .iter()
+                    .zip(softmax.iter())
+                    .map(|(&coefficient, &value)| coefficient * value)
+                    .sum();
+                let lower_bound = envelope
+                    .lower_a
+                    .slice(ndarray::s![batch, row, ..])
+                    .dot(&logits)
+                    + envelope.lower_b[[batch, row]];
+                let upper_bound = envelope
+                    .upper_a
+                    .slice(ndarray::s![batch, row, ..])
+                    .dot(&logits)
+                    + envelope.upper_b[[batch, row]];
+                assert!(lower_bound <= true_value + 1e-3);
+                assert!(upper_bound + 1e-3 >= true_value);
+            }
+        }
+    }
+    assert!(strict, "batched envelope made no strict improvement");
 }
 
 #[test]
@@ -1322,6 +1806,67 @@ fn assert_flat_grouped_vertex_soundness(
 // =========================================================================
 // Flat-grouped softmax CROWN backward — tests
 // =========================================================================
+
+#[test]
+fn objective_envelope_routes_through_flat_grouped_sound_path() {
+    let layer = SoftmaxLayer::new(-1);
+    let (pre, linear) = grouped_objective_envelope_fixture(&[2, 5]);
+    let a_values: Vec<f32> = linear.lower_a.iter().copied().collect();
+    let incoming = BatchedLinearBounds::from_parts_unchecked(
+        linear.lower_a.clone().into_dyn(),
+        linear.lower_b.clone().into_dyn(),
+        linear.upper_a.clone().into_dyn(),
+        linear.upper_b.into_dyn(),
+        vec![2, 5],
+        vec![4],
+    );
+    let baseline = with_softmax_objective_envelope_for_test(false, || {
+        layer.propagate_linear_batched_with_bounds(
+            &incoming,
+            &pre,
+            VerificationSoundnessMode::Sound,
+        )
+    })
+    .expect("flat-grouped baseline");
+    let envelope = with_softmax_objective_envelope_for_test(true, || {
+        layer.propagate_linear_batched_with_bounds(
+            &incoming,
+            &pre,
+            VerificationSoundnessMode::Sound,
+        )
+    })
+    .expect("flat-grouped envelope");
+    let baseline_concrete = baseline
+        .concretize_sound(&pre)
+        .expect("baseline concretize");
+    let envelope_concrete = envelope
+        .concretize_sound(&pre)
+        .expect("envelope concretize");
+
+    let mut strict = false;
+    for row in 0..4 {
+        let baseline_lower = baseline_concrete.lower()[[row]];
+        let baseline_upper = baseline_concrete.upper()[[row]];
+        let envelope_lower = envelope_concrete.lower()[[row]];
+        let envelope_upper = envelope_concrete.upper()[[row]];
+        assert!(envelope_lower + 1e-6 >= baseline_lower);
+        assert!(envelope_upper <= baseline_upper + 1e-6);
+        strict |= envelope_lower > baseline_lower + 1e-5 || envelope_upper + 1e-5 < baseline_upper;
+    }
+    assert!(strict, "flat-grouped envelope made no strict improvement");
+
+    assert_flat_grouped_vertex_soundness(
+        &envelope,
+        &a_values,
+        &[0.0; 4],
+        &OBJECTIVE_ENVELOPE_LOGIT_LOWER.repeat(2),
+        &OBJECTIVE_ENVELOPE_LOGIT_UPPER.repeat(2),
+        2,
+        5,
+        4,
+        1e-3,
+    );
+}
 
 /// Test 3: Flat-grouped heuristic basic — lower <= upper, finite, correct shape.
 ///

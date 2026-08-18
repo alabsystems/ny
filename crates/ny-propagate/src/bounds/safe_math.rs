@@ -10,6 +10,11 @@ use ny_core::{NyError, Result};
 // Re-export NaN-propagating helpers from ny_core (canonical home per #2654).
 pub use ny_core::{nan_propagating_max_zero, nan_propagating_min_zero};
 
+pub(crate) use ny_core::f32_to_f64_exact as f32_to_f64_exact_for_bounds;
+pub(crate) use ny_core::{
+    f64_to_f32_down as f64_to_f32_down_for_bounds, f64_to_f32_up as f64_to_f32_up_for_bounds,
+};
+
 /// Safe multiplication for bound computation.
 ///
 /// In interval arithmetic, a coefficient of 0 means no contribution,
@@ -156,6 +161,23 @@ pub fn safe_mul_pair_for_bounds(a: f32, b: f32) -> f32 {
     }
 }
 
+/// Binary64 product of two binary32 bit patterns, including subnormals.
+///
+/// Every finite binary32 product is exact in binary64 (at most 48 significant
+/// bits), and the smallest nonzero product, 2^-298, is a normal binary64
+/// number. Exact-zero detection is bit based so DAZ cannot reinterpret a
+/// nonzero binary32 subnormal as zero.
+#[inline]
+fn safe_mul_pair_f64_exact_for_bounds(a: f32, b: f32) -> f64 {
+    let a_is_zero = a.to_bits() & 0x7fff_ffff == 0;
+    let b_is_zero = b.to_bits() & 0x7fff_ffff == 0;
+    if a_is_zero || b_is_zero {
+        0.0
+    } else {
+        f32_to_f64_exact_for_bounds(a) * f32_to_f64_exact_for_bounds(b)
+    }
+}
+
 /// Interval multiplication for bound composition.
 ///
 /// Computes the interval [lower, upper] that bounds all products a * b
@@ -169,19 +191,16 @@ pub fn safe_mul_pair_for_bounds(a: f32, b: f32) -> f32 {
 /// ENSURES: Returns (-inf, +inf) if any input is NaN (conservative fallback).
 /// ENSURES: Result is always a well-formed interval (`lower <= upper`).
 ///
-/// SOUNDNESS (#concretize-soundness-hardening): the four corner products are
-/// computed with round-to-nearest f32 multiplication, so each corner can land up to
-/// 0.5 ULP *inside* the true product. Taking the min/max of round-to-nearest corners
-/// alone is therefore NOT a sound enclosure: the returned `lower` could be slightly
-/// above the true minimum product and `upper` slightly below the true maximum. We
-/// close this by rounding the final `lower` DOWN and `upper` UP by one f32 ULP
-/// (`next_down_f32`/`next_up_f32`); one ULP outward fully covers the ≤0.5-ULP inward
-/// rounding of the corner that produced each endpoint. This matters because finite
-/// verdict-path callers exist — the bilinear N-D CROWN compose
+/// SOUNDNESS (#concretize-soundness-hardening): the four binary32 corner bit
+/// patterns are decoded directly and multiplied exactly in binary64. Direct
+/// decoding is required because DAZ can otherwise erase a binary32 subnormal
+/// before conversion or multiplication (for example 2^-149 * 2^120 = 2^-29).
+/// The exact binary64 endpoints are converted outward to binary32 and widened by
+/// one additional binary32 ULP, preserving the historical conservative contract.
+/// This matters because finite verdict-path callers exist — the bilinear N-D CROWN compose
 /// (`layers/binary_ops/bilinear/nd_compose.rs`) and the bilinear interval relaxation
 /// (`layers/binary_ops/bilinear/relaxation/interval.rs`) feed the returned products
-/// (after an exact f32→f64 promotion and accumulation) into verdict bias bounds, and
-/// the prior round-to-nearest-only result was a latent inward-bias footgun there.
+/// into verdict bias bounds.
 #[inline]
 pub fn interval_mul_for_bounds(a_l: f32, a_u: f32, b_l: f32, b_u: f32) -> (f32, f32) {
     if a_l.is_nan() || a_u.is_nan() || b_l.is_nan() || b_u.is_nan() {
@@ -189,10 +208,10 @@ pub fn interval_mul_for_bounds(a_l: f32, a_u: f32, b_l: f32, b_u: f32) -> (f32, 
     }
 
     let products = [
-        safe_mul_pair_for_bounds(a_l, b_l),
-        safe_mul_pair_for_bounds(a_l, b_u),
-        safe_mul_pair_for_bounds(a_u, b_l),
-        safe_mul_pair_for_bounds(a_u, b_u),
+        safe_mul_pair_f64_exact_for_bounds(a_l, b_l),
+        safe_mul_pair_f64_exact_for_bounds(a_l, b_u),
+        safe_mul_pair_f64_exact_for_bounds(a_u, b_l),
+        safe_mul_pair_f64_exact_for_bounds(a_u, b_u),
     ];
 
     // Treat all-infinite products as unbounded to avoid +inf lower bounds in compositions.
@@ -212,18 +231,17 @@ pub fn interval_mul_for_bounds(a_l: f32, a_u: f32, b_l: f32, b_u: f32) -> (f32, 
         }
     }
 
-    // Handle NaN from unexpected sources (shouldn't happen with safe_mul_pair_for_bounds)
+    // Handle NaN from unexpected sources (the input check above should catch all).
     if lower.is_nan() || upper.is_nan() {
         return (f32::NEG_INFINITY, f32::INFINITY);
     }
 
-    // Directed OUTWARD rounding on the final endpoints: each corner product rounded
-    // to nearest (≤0.5 ULP inward); one ULP outward makes the interval a sound
-    // enclosure of the true product range. next_*_f32 are no-ops on ±inf, so an
-    // all-infinite-but-mixed-sign result (e.g. lower=-inf) is unaffected.
+    // First convert the exact binary64 products outward without relying on a
+    // binary32 subnormal result, then retain the helper's historical extra ULP
+    // of widening. next_*_f32 are no-ops on infinities.
     (
-        ny_tensor::next_down_f32(lower),
-        ny_tensor::next_up_f32(upper),
+        ny_tensor::next_down_f32(f64_to_f32_down_for_bounds(lower)),
+        ny_tensor::next_up_f32(f64_to_f32_up_for_bounds(upper)),
     )
 }
 
@@ -367,6 +385,26 @@ mod tests {
             f64::NEG_INFINITY
         );
         assert_eq!(safe_mul_for_bounds_f64(3.0, 4.0), 12.0);
+    }
+
+    #[test]
+    fn interval_mul_decodes_subnormal_operands_bit_exactly() {
+        let tiny = f32::from_bits(1);
+        let large = 2.0_f32.powi(120);
+        let exact_tiny = 2.0_f64.powi(-149);
+        let exact_product = 2.0_f64.powi(-29);
+
+        assert_eq!(f32_to_f64_exact_for_bounds(tiny), exact_tiny);
+
+        let (lower, upper) = interval_mul_for_bounds(tiny, tiny, large, large);
+        assert!(
+            f32_to_f64_exact_for_bounds(lower) <= exact_product,
+            "lower {lower:e} excludes exact product {exact_product:e}"
+        );
+        assert!(
+            f32_to_f64_exact_for_bounds(upper) >= exact_product,
+            "upper {upper:e} excludes exact product {exact_product:e}"
+        );
     }
 
     /// NaN in any input widens to the saturating interval (matches

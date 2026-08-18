@@ -14,6 +14,20 @@ pub(super) fn ibp_check_vnnlib_safe(
     ibp_upper: &[f32],
     vnnlib: &ny_onnx::vnnlib::VnnLibSpec,
 ) -> bool {
+    // This helper is verdict-authoritative: malformed enclosures must never be
+    // interpreted as refuting an unsafe clause. In particular, IEEE infinities
+    // and inverted intervals can make the raw comparisons below true.
+    if ibp_lower.is_empty()
+        || ibp_lower.len() != ibp_upper.len()
+        || ibp_lower.len() != vnnlib.num_outputs
+        || ibp_lower
+            .iter()
+            .zip(ibp_upper)
+            .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+    {
+        return false;
+    }
+
     // Check per-clause constraints.
     // For disjunctive unsafe region (OR of clauses): SAFE iff ALL clauses are violated.
     // For conjunctive unsafe region (AND of clauses): SAFE iff ANY clause is violated.
@@ -22,12 +36,22 @@ pub(super) fn ibp_check_vnnlib_safe(
         return false;
     }
 
+    use ny_onnx::vnnlib::OutputConstraint;
+    if clauses.iter().flatten().any(|constraint| match constraint {
+        OutputConstraint::LessEqConst(_, c)
+        | OutputConstraint::LessThanConst(_, c)
+        | OutputConstraint::GreaterEqConst(_, c)
+        | OutputConstraint::GreaterThanConst(_, c) => !c.is_finite(),
+        _ => false,
+    }) {
+        return false;
+    }
+
     let clause_results: Vec<bool> = clauses
         .iter()
         .map(|clause| {
             // A clause is violated (safe) if ANY constraint in the clause is impossible.
             clause.iter().any(|c| {
-                use ny_onnx::vnnlib::OutputConstraint;
                 match c {
                     // UNSAFE: Y_i <= Y_j → violated when lower[i] > upper[j]
                     OutputConstraint::LessEq(i, j) => {
@@ -54,27 +78,22 @@ pub(super) fn ibp_check_vnnlib_safe(
                             && ibp_upper[*i] <= ibp_lower[*j]
                     }
                     // UNSAFE: Y_i <= c → violated when lower[i] > c
-                    // Directed rounding: round c UP so refutation is conservative.
-                    // Matches disjunctive_precheck.rs directed rounding convention.
+                    // f32 endpoints embed exactly in f64, so compare against
+                    // the exact VNNLIB threshold without a lossy f32 cast.
                     OutputConstraint::LessEqConst(i, c) => {
-                        let c_f32 = ny_tensor::next_up_f32(*c as f32);
-                        *i < ibp_lower.len() && ibp_lower[*i] > c_f32
+                        *i < ibp_lower.len() && f64::from(ibp_lower[*i]) > *c
                     }
                     // UNSAFE: Y_i < c → violated when lower[i] >= c
                     OutputConstraint::LessThanConst(i, c) => {
-                        let c_f32 = ny_tensor::next_up_f32(*c as f32);
-                        *i < ibp_lower.len() && ibp_lower[*i] >= c_f32
+                        *i < ibp_lower.len() && f64::from(ibp_lower[*i]) >= *c
                     }
                     // UNSAFE: Y_i >= c → violated when upper[i] < c
-                    // Directed rounding: round c DOWN so refutation is conservative.
                     OutputConstraint::GreaterEqConst(i, c) => {
-                        let c_f32 = ny_tensor::next_down_f32(*c as f32);
-                        *i < ibp_upper.len() && ibp_upper[*i] < c_f32
+                        *i < ibp_upper.len() && f64::from(ibp_upper[*i]) < *c
                     }
                     // UNSAFE: Y_i > c → violated when upper[i] <= c
                     OutputConstraint::GreaterThanConst(i, c) => {
-                        let c_f32 = ny_tensor::next_down_f32(*c as f32);
-                        *i < ibp_upper.len() && ibp_upper[*i] <= c_f32
+                        *i < ibp_upper.len() && f64::from(ibp_upper[*i]) <= *c
                     }
                     _ => false, // unknown constraint variants cannot be proven violated
                 }

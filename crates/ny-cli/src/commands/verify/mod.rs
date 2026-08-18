@@ -28,13 +28,48 @@ use ny_propagate::Verifier;
 use std::sync::Arc;
 use tracing::info;
 
-#[cfg(test)]
 use crate::BackendArg;
 
 mod f64_verify;
 
 pub(crate) fn handle_verify_command(config: VerificationConfig) -> Result<()> {
-    let resolved = options::resolve_effective_backend(config.backend, config.gpu, config.json);
+    let requested_method = options::parse_method(&config.method)?;
+    let supports_wgpu_proof = options::supports_qualified_wgpu_proof(
+        requested_method,
+        config.layer_by_layer,
+        config.use_block_wise(),
+        config.double_fp,
+    );
+    let resolved = options::resolve_effective_backend(
+        config.backend,
+        config.backend_automatic,
+        config.gpu,
+        config.json,
+        supports_wgpu_proof,
+    )?;
+    // `main` deliberately defers this lazy auxiliary factory for proof-capable
+    // commands. Install it only for a genuine CPU request; a retained WGPU
+    // proof context owns the adapter alone, while a WGPU fallback receipt must
+    // remain a real CPU execution rather than silently opening an auxiliary
+    // WGPU context after qualification/mode admission refused.
+    if resolved.receipt.requested == BackendArg::Cpu
+        && !resolved.use_gpu
+        && !crate::compute_backend::detect().wgpu_probe_skipped
+    {
+        ny_propagate::fl_value_gemm::set_fl_value_gemm_factory(|| {
+            match ny_gpu::FlValueGemmDevice::new_wgpu() {
+                Ok(device) => Some(Arc::new(device) as Arc<dyn GemmEngine>),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "verify FL-value wgpu engine unavailable; certified value GEMMs \
+                         keep their CPU tiers"
+                    );
+                    None
+                }
+            }
+        });
+    }
     handle_verify_command_with_resolved_backend(config, resolved)
 }
 
@@ -62,6 +97,7 @@ where
         use_block_wise,
         config.allow_heuristic_logsoftmax,
         config.allow_heuristic_softmax,
+        config.max_blocks,
     )?;
 
     let effective_method = options::resolve_effective_method(
@@ -75,6 +111,7 @@ where
         backend: effective_backend,
         use_gpu,
         device,
+        receipt: backend_receipt,
     } = resolved;
 
     let propagation_config = options::build_config(
@@ -95,6 +132,19 @@ where
     let use_native = model_load::should_use_native(&config.model, config.native, is_nnet);
     model_load::validate_mode_model_compat(config.layer_by_layer, use_block_wise, use_native)?;
 
+    // Every currently supported non-NNet loader produces a GraphNetwork.
+    // `Verifier::verify_graph` has a BetaCrown compatibility branch, but that
+    // branch only computes alpha-CROWN/CROWN bounds and does not perform
+    // branch-and-bound. Refuse before loading instead of silently running a
+    // different method. NNet uses the real sequential β-CROWN implementation.
+    if requested_method == ny_propagate::PropagationMethod::BetaCrown && !is_nnet {
+        anyhow::bail!(
+            "`ny verify --method beta` is not supported for graph-backed models \
+             (including ONNX); use `ny beta-crown MODEL -p PROPERTY` for complete \
+             graph branch-and-bound verification"
+        );
+    }
+
     let loaded = model_load::load_model(
         &config.model,
         config.native,
@@ -110,6 +160,7 @@ where
     let input_shape = loaded.input_shape;
     let output_dim = loaded.output_dim;
     let preloaded_vnnlib = loaded.preloaded_vnnlib;
+    let applied_terminal_peel = loaded.applied_terminal_peel;
 
     // --- Phase 3: Apply soundness mode flags ---
 
@@ -124,7 +175,21 @@ where
     // --- Phase 4: Build verification spec ---
 
     let verifier = match device {
-        Some(device) => Verifier::new_with_engine(propagation_config, Arc::new(device)),
+        Some(device) => {
+            let engine: Arc<dyn GemmEngine> = Arc::new(device);
+            // #charged-metal-engagement: publish the exact qualified proof
+            // device into the process-global sound CROWN slots so the
+            // deadline-preinitialized routes and borrow-only consumers can
+            // see it. Fail-closed no-op unless the receipt proves live
+            // qualification AND the engine advertises the sound accessor
+            // (test-injected devices refuse), so CPU/refused resolutions
+            // remain byte-identical.
+            crate::commands::backend::register_qualified_wgpu_proof_engine(
+                &backend_receipt,
+                &engine,
+            );
+            Verifier::new_with_engine(propagation_config, engine)
+        }
         None => Verifier::new(propagation_config),
     };
 
@@ -157,6 +222,7 @@ where
             config.progress,
             config.progress_json,
             config.json,
+            &backend_receipt,
         );
     }
 
@@ -173,6 +239,7 @@ where
             config.max_blocks,
             config.checkpoint.as_deref(),
             config.json,
+            &backend_receipt,
         );
     }
 
@@ -194,6 +261,8 @@ where
             config.strict,
             config.allow_unknown,
             config.json,
+            applied_terminal_peel,
+            &backend_receipt,
         );
     }
 
@@ -204,7 +273,7 @@ where
         &spec,
         &verifier,
         requested_method,
-        effective_backend,
+        &backend_receipt,
         config.epsilon,
         vnnlib_spec.as_ref(),
         config.property.as_deref(),
@@ -212,6 +281,7 @@ where
         config.require_sound,
         config.allow_unknown,
         config.json,
+        applied_terminal_peel,
     )
 }
 
@@ -228,6 +298,12 @@ where
         config.backend,
         config.gpu,
         config.json,
+        options::supports_qualified_wgpu_proof(
+            options::parse_method(&config.method)?,
+            config.layer_by_layer,
+            config.use_block_wise(),
+            config.double_fp,
+        ),
         build_device,
     );
     handle_verify_command_with_resolved_backend(config, resolved)
@@ -259,7 +335,7 @@ mod tests {
         }
     }
 
-    fn assert_verify_command_threads_stored_engine(model_name: &str) {
+    fn verify_command_counting_engine_calls(model_name: &str) -> usize {
         let model_path = test_models_dir().join(model_name);
         require_model(&model_path);
 
@@ -267,7 +343,7 @@ mod tests {
         handle_verify_command_with_backend_factory(
             VerificationConfig::builder(model_path, 0.01, "crown".to_string())
                 .verification(crate::MulBinaryRelaxationArg::Mccormick, 10, 1e-4, 5)
-                .backend(BackendArg::Wgpu, false)
+                .backend_request(BackendArg::Wgpu, false, false)
                 .layernorm(
                     false,
                     crate::LayerNormModeArg::IbpValidated,
@@ -283,23 +359,31 @@ mod tests {
         )
         .expect("verify command should preserve the counting GEMM backend");
 
-        let calls = gemm_calls.load(Ordering::SeqCst);
-        assert!(
-            calls > 0,
-            "#3643 regression: verify command should keep the stored GEMM engine alive through verify(); got {calls} GEMM calls"
+        gemm_calls.load(Ordering::SeqCst)
+    }
+
+    #[ntest::timeout(10000)]
+    #[test]
+    fn test_handle_verify_command_refuses_opaque_gemm_for_deadline_scored_sequential_crown_4321() {
+        let calls = verify_command_counting_engine_calls("simple_2layer.nnet");
+        assert_eq!(
+            calls, 0,
+            "#4321 regression: a finite-deadline sequential CROWN fold must not launch a generic GEMM engine without a cooperative cancellation contract"
         );
     }
 
+    /// #3866: a successfully qualified proof device must survive option
+    /// resolution, model loading, verifier construction, and graph dispatch.
+    /// The injected factory stands for the typed `new_for_proof` constructor;
+    /// unlike a real adapter it is hermetic and lets this test observe the
+    /// engine at the propagation seam.
     #[ntest::timeout(10000)]
     #[test]
-    fn test_handle_verify_command_threads_stored_engine_through_sequential_standard_verification_3643(
-    ) {
-        assert_verify_command_threads_stored_engine("simple_2layer.nnet");
-    }
-
-    #[ntest::timeout(10000)]
-    #[test]
-    fn test_handle_verify_command_threads_stored_engine_through_graph_standard_verification_3866() {
-        assert_verify_command_threads_stored_engine("linear_relu.onnx");
+    fn test_verify_command_retains_the_qualified_proof_device_3866() {
+        let calls = verify_command_counting_engine_calls("linear_relu.onnx");
+        assert!(
+            calls > 0,
+            "the qualified proof device was lost before graph propagation"
+        );
     }
 }

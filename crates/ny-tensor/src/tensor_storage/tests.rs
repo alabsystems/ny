@@ -339,3 +339,66 @@ fn test_queue_tensor_wrapped_returns_err() {
         "tensor() should reject wrapped queue buffers, got {result:?}"
     );
 }
+
+#[test]
+fn test_zero_sized_entries_round_trip_without_panicking() {
+    let data = ArrayD::zeros(IxDyn(&[3, 0]));
+
+    let mut stack = StackTensorStorage::with_options(&[0, 0], 4, 16).unwrap();
+    stack.append(&data).unwrap();
+    assert_eq!(stack.len(), 3);
+    assert_eq!(stack.pop(3).unwrap().shape(), &[3, 0]);
+
+    let mut queue = QueueTensorStorage::with_options(&[0, 0], 4, 16).unwrap();
+    queue.append(&data).unwrap();
+    assert_eq!(queue.len(), 3);
+    assert_eq!(queue.pop(3).unwrap().shape(), &[3, 0]);
+}
+
+#[test]
+fn test_initial_storage_size_overflow_returns_error() {
+    assert!(StackTensorStorage::with_options(&[0, usize::MAX], 2, 16).is_err());
+    assert!(QueueTensorStorage::with_options(&[0, usize::MAX], 2, 16).is_err());
+}
+
+#[test]
+fn test_reorder_element_count_overflow_returns_error() {
+    // Construct deliberately corrupted internals to exercise the defensive
+    // arithmetic. Public constructors cannot materialize this state.
+    let mut stack = StackTensorStorage {
+        storage: Vec::new(),
+        shape: vec![2, usize::MAX],
+        element_shape: vec![usize::MAX],
+        elements_per_entry: usize::MAX,
+        num_used: 2,
+        current_capacity: 2,
+        switching_size: 16,
+    };
+    assert!(stack.reorder(2, &[0, 1]).is_err());
+
+    let mut queue = QueueTensorStorage {
+        storage: Vec::new(),
+        shape: vec![2, usize::MAX],
+        element_shape: vec![usize::MAX],
+        elements_per_entry: usize::MAX,
+        num_used: 2,
+        current_capacity: 2,
+        usage_start: 0,
+        switching_size: 16,
+    };
+    assert!(queue.reorder(2, &[0, 1]).is_err());
+}
+
+#[test]
+fn test_append_validates_rank_and_empty_batch_shape() {
+    let scalar = ArrayD::from_elem(IxDyn(&[]), 1.0);
+    let wrong_empty_batch = ArrayD::zeros(IxDyn(&[0, 3]));
+
+    let mut stack = StackTensorStorage::with_options(&[0, 2], 4, 16).unwrap();
+    assert!(stack.append(&scalar).is_err());
+    assert!(stack.append(&wrong_empty_batch).is_err());
+
+    let mut queue = QueueTensorStorage::with_options(&[0, 2], 4, 16).unwrap();
+    assert!(queue.append(&scalar).is_err());
+    assert!(queue.append(&wrong_empty_batch).is_err());
+}

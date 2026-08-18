@@ -22,6 +22,17 @@ use crate::{
 use super::super::backward::{BackwardCrownResult, BackwardMode, BackwardParams};
 use super::super::lookups::build_constraint_lookups;
 use super::super::patches::ConstrainedPatchesPolicy;
+
+pub(super) fn no_deadline_verifier() -> BetaCrownVerifier {
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    // These regressions compare the historical Dense and selective-Patches
+    // implementations. `new` anchors the ordinary verifier timeout as a finite
+    // authority, which selects the separate cooperative-closure policy rather
+    // than either implementation under comparison.
+    verifier.config.alpha_config.deadline = None;
+    verifier
+}
+
 pub(super) fn build_two_conv_relu_graph_3813() -> GraphNetwork {
     let conv1_kernel =
         ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![0.45_f32, -0.2, 0.7, 0.35])
@@ -237,7 +248,7 @@ pub(super) fn assert_storing_intermediate_capture_3813(intermediate: &GraphAlpha
 
 #[test]
 fn test_constrained_patches_matches_dense_baseline_3813() {
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let verifier = no_deadline_verifier();
     let graph = build_two_conv_relu_graph_3813();
     let input = build_two_conv_relu_input_3813();
     let history = GraphSplitHistory::new();
@@ -274,7 +285,7 @@ fn test_constrained_patches_matches_dense_baseline_3813() {
 
 #[test]
 fn test_constrained_patches_alpha_matches_dense_baseline_3813() {
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let verifier = no_deadline_verifier();
     let graph = build_two_conv_relu_graph_3813();
     let input = build_two_conv_relu_input_3813();
     let history = GraphSplitHistory::new();
@@ -314,7 +325,7 @@ fn test_constrained_patches_alpha_matches_dense_baseline_3813() {
 
 #[test]
 fn test_constrained_patches_beta_matches_dense_baseline_3813() {
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let verifier = no_deadline_verifier();
     let graph = build_two_conv_relu_graph_3813();
     let input = build_two_conv_relu_input_3813();
     let history = GraphSplitHistory::new().with_constraint(GraphNeuronConstraint {
@@ -370,7 +381,7 @@ fn test_constrained_patches_beta_matches_dense_baseline_3813() {
 
 #[test]
 fn test_constrained_patches_ignore_unrelated_beta_entries_for_relu_densification_4138() {
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let verifier = no_deadline_verifier();
     let graph = build_large_two_conv_relu_graph_4138();
     let input = build_large_two_conv_relu_input_4138();
     let history = GraphSplitHistory::new().with_constraint(GraphNeuronConstraint {
@@ -418,7 +429,7 @@ fn test_constrained_patches_ignore_unrelated_beta_entries_for_relu_densification
 
 #[test]
 fn test_constrained_patches_reduce_gemm_calls_3813() {
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let verifier = no_deadline_verifier();
     let graph = build_two_conv_relu_graph_3813();
     let input = build_two_conv_relu_input_3813();
     let history = GraphSplitHistory::new();
@@ -466,7 +477,7 @@ fn test_constrained_patches_reduce_gemm_calls_3813() {
 
 #[test]
 fn test_constrained_patches_storing_intermediates_preserves_dense_relu_storage_3813() {
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let verifier = no_deadline_verifier();
     let graph = build_two_conv_relu_graph_3813();
     let input = build_two_conv_relu_input_3813();
     let history = GraphSplitHistory::new().with_constraint(GraphNeuronConstraint {

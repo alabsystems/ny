@@ -118,6 +118,7 @@ pub(super) fn timing_family(
         | LayerType::Cos
         | LayerType::Tan
         | LayerType::Arctan
+        | LayerType::Erf
         | LayerType::Mish
         | LayerType::GELU
         | LayerType::ReLU

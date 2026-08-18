@@ -95,11 +95,41 @@ fn merge_soundness(stages: &[PipelineStage]) -> SoundnessProvenance {
 /// Verifier for sequential multi-model pipelines.
 ///
 /// Usage:
-/// ```ignore
+/// ```rust
+/// use ndarray::arr1;
+/// use ny_core::{MethodUsed, SoundnessProvenance};
+/// use ny_propagate::{BoundCertificate, PipelineVerifier};
+/// use ny_tensor::BoundedTensor;
+///
+/// # fn main() -> ny_core::Result<()> {
+/// let encoder_input = BoundedTensor::new(
+///     arr1(&[-1.0]).into_dyn(),
+///     arr1(&[1.0]).into_dyn(),
+/// )?;
+/// let encoder_output = BoundedTensor::new(
+///     arr1(&[0.0]).into_dyn(),
+///     arr1(&[1.0]).into_dyn(),
+/// )?;
+/// let encoder_cert = BoundCertificate::try_new(
+///     "encoder",
+///     encoder_output.clone(),
+///     MethodUsed::Ibp,
+///     SoundnessProvenance::sound(),
+/// )?;
+/// let decoder_cert = BoundCertificate::try_new(
+///     "decoder",
+///     encoder_output.clone(),
+///     MethodUsed::Ibp,
+///     SoundnessProvenance::sound(),
+/// )?;
+///
 /// let mut pipeline = PipelineVerifier::new();
-/// pipeline.push_stage(encoder_input_bounds, encoder_cert)?;
-/// pipeline.push_stage(decoder_input_bounds, decoder_cert)?;
+/// pipeline.push_stage(encoder_input, encoder_cert)?;
+/// pipeline.push_stage(encoder_output, decoder_cert)?;
 /// let cert = pipeline.finalize()?;
+/// assert_eq!(cert.stages().len(), 2);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Default)]
 pub struct PipelineVerifier {

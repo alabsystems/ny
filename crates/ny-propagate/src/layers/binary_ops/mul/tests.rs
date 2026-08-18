@@ -1864,3 +1864,107 @@ fn test_mccormick_coeff_err_broadcast_absorption_aw_soundness() -> Result<()> {
     );
     Ok(())
 }
+
+/// FALSE-BOUND regression for the MulBinary McCormick planes
+/// (#mulbinary-mccormick-f32, `docs/MULBINARY_MCCORMICK_F32_CANCELLATION_2026-07-28.md`).
+///
+/// The coefficients used to be built in f32:
+/// ```text
+/// let beta_l = (x_l - x_u) * r_l + x_u;
+/// ```
+/// Once `|x_l| < ulp(x_u)`, `fl(x_l - x_u)` returns `-x_u` and the `+ x_u`
+/// round-trip yields `0`, so `beta_l` COLLAPSES from `x_l` to `0` and the
+/// "lower" plane rises above the true product. Measured pre-fix on
+/// `x=[-1, 2^24]`, `y=[1, 100]`, `r_l=1`: claimed lower bound `-1` at corner
+/// `(-1, 100)` where the true product is `-100`.
+///
+/// `plane - product` is BILINEAR, so its extremum over the box is attained at a
+/// corner; checking the four corners is therefore an EXACT enclosure test, not a
+/// sampled one.
+#[test]
+fn mccormick_planes_enclose_under_catastrophic_cancellation() {
+    // (x_l, x_u, y_l, y_u) cases spanning the cancellation regime and ordinary use.
+    let cases = [
+        (-1.0f32, 16_777_216.0f32, 1.0f32, 100.0f32), // total collapse of beta_l
+        (-0.026_068_168, 1_153_335.9, 7_220.358, 148_963.05), // wide asymmetric
+        (-0.5, 340_000.0, -2.1, 9_700.0),             // both operands wide
+        (-1.0, 2.0, 1.0, 3.0),                        // benign control
+        (1e-30, 1e30, -1e20, 1e20),                   // extreme exponent spread
+    ];
+    for &(x_l, x_u, y_l, y_u) in &cases {
+        for &r in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let (a_l, b_l, n_l, a_u, b_u, n_u) =
+                MulBinaryLayer::compute_interpolated_coefficients(x_l, x_u, y_l, y_u, r, r);
+            for &(cx, cy) in &[(x_l, y_l), (x_l, y_u), (x_u, y_l), (x_u, y_u)] {
+                let prod = f64::from(cx) * f64::from(cy);
+                let lower = f64::from(a_l) * f64::from(cx)
+                    + f64::from(b_l) * f64::from(cy)
+                    + f64::from(n_l);
+                let upper = f64::from(a_u) * f64::from(cx)
+                    + f64::from(b_u) * f64::from(cy)
+                    + f64::from(n_u);
+                assert!(
+                    lower <= prod,
+                    "LOWER plane exceeds product: x=[{x_l:e},{x_u:e}] y=[{y_l:e},{y_u:e}] r={r} \
+                     corner=({cx:e},{cy:e}) plane={lower:e} > prod={prod:e} (by {:e})",
+                    lower - prod
+                );
+                assert!(
+                    upper >= prod,
+                    "UPPER plane below product: x=[{x_l:e},{x_u:e}] y=[{y_l:e},{y_u:e}] r={r} \
+                     corner=({cx:e},{cy:e}) plane={upper:e} < prod={prod:e} (by {:e})",
+                    prod - upper
+                );
+            }
+        }
+    }
+}
+
+/// TEETH for [`mccormick_planes_enclose_under_catastrophic_cancellation`].
+///
+/// A regression test that passes against the broken implementation pins nothing.
+/// This reproduces the OLD f32 construction verbatim and asserts the enclosure
+/// check FAILS on it — so we know the assertions above have force.
+#[test]
+fn mccormick_f32_construction_is_actually_caught() {
+    // Verbatim pre-fix arithmetic (all f32).
+    fn legacy_f32(x_l: f32, x_u: f32, y_l: f32, y_u: f32, r_l: f32) -> (f32, f32, f32) {
+        let alpha_l = (y_l - y_u) * r_l + y_u;
+        let beta_l = (x_l - x_u) * r_l + x_u;
+        let ny_l = (y_u * x_u - y_l * x_l) * r_l - y_u * x_u;
+        (alpha_l, beta_l, ny_l)
+    }
+    let (x_l, x_u, y_l, y_u, r) = (-1.0f32, 16_777_216.0f32, 1.0f32, 100.0f32, 1.0f32);
+
+    let (a, b, n) = legacy_f32(x_l, x_u, y_l, y_u, r);
+    assert_eq!(b, 0.0, "precondition: legacy f32 collapses beta_l to zero");
+    let worst_legacy = [(x_l, y_l), (x_l, y_u), (x_u, y_l), (x_u, y_u)]
+        .iter()
+        .map(|&(cx, cy)| {
+            f64::from(a) * f64::from(cx) + f64::from(b) * f64::from(cy) + f64::from(n)
+                - f64::from(cx) * f64::from(cy)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        worst_legacy > 0.0,
+        "TEETH FAILURE: the legacy f32 construction must violate enclosure, got {worst_legacy:e}"
+    );
+
+    // The shipped implementation must NOT violate on the same input.
+    let (a2, b2, n2) = {
+        let (a_l, b_l, n_l, ..) =
+            MulBinaryLayer::compute_interpolated_coefficients(x_l, x_u, y_l, y_u, r, r);
+        (a_l, b_l, n_l)
+    };
+    let worst_fixed = [(x_l, y_l), (x_l, y_u), (x_u, y_l), (x_u, y_u)]
+        .iter()
+        .map(|&(cx, cy)| {
+            f64::from(a2) * f64::from(cx) + f64::from(b2) * f64::from(cy) + f64::from(n2)
+                - f64::from(cx) * f64::from(cy)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        worst_fixed <= 0.0,
+        "fixed construction still violates enclosure by {worst_fixed:e}"
+    );
+}

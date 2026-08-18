@@ -84,17 +84,26 @@ impl ConvTranspose1dLayer {
             });
         }
         let in_channels = kernel.shape()[0];
+        let output_channels_per_group = kernel.shape()[1];
+        let kernel_size = kernel.shape()[2];
+        if in_channels == 0 || output_channels_per_group == 0 || kernel_size == 0 {
+            return Err(NyError::InvalidSpec(format!(
+                "ConvTranspose1d kernel dimensions must be nonzero, got {:?}",
+                kernel.shape()
+            )));
+        }
         if !in_channels.is_multiple_of(groups) {
             return Err(NyError::InvalidSpec(format!(
                 "ConvTranspose1d in_channels ({in_channels}) must be divisible by groups ({groups})"
             )));
         }
-        let out_channels = kernel.shape()[1].checked_mul(groups).ok_or_else(|| {
-            NyError::InvalidSpec(format!(
-                "ConvTranspose1d output channels overflow: {} * {groups}",
-                kernel.shape()[1]
+        let out_channels = output_channels_per_group
+            .checked_mul(groups)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                "ConvTranspose1d output channels overflow: {output_channels_per_group} * {groups}"
             ))
-        })?;
+            })?;
         if let Some(ref b) = bias {
             if b.len() != out_channels {
                 return Err(NyError::ShapeMismatch {
@@ -167,14 +176,31 @@ impl ConvTranspose1dLayer {
     /// Returns an error if the arithmetic would underflow (e.g. kernel < 2*padding).
     pub fn output_length(&self, input_len: usize) -> Result<usize> {
         let k = self.kernel_size();
-        let effective_k = self.dilation * (k - 1) + 1;
-        let expanded = (input_len.saturating_sub(1))
-            .checked_mul(self.stride)
+        if self.stride == 0 || self.dilation == 0 || k == 0 {
+            return Err(NyError::InvalidSpec(
+                "ConvTranspose1d output length requires nonzero stride, dilation, and kernel \
+                 length"
+                    .to_string(),
+            ));
+        }
+        let effective_k = k
+            .checked_sub(1)
+            .and_then(|extent| extent.checked_mul(self.dilation))
+            .and_then(|extent| extent.checked_add(1))
+            .ok_or_else(|| {
+                NyError::InvalidSpec("ConvTranspose1d effective kernel overflow".to_string())
+            })?;
+        let expanded = input_len
+            .checked_sub(1)
+            .and_then(|extent| extent.checked_mul(self.stride))
             .and_then(|v| v.checked_add(effective_k))
             .ok_or_else(|| {
                 NyError::InvalidSpec("ConvTranspose1d output length overflow".to_string())
             })?;
-        let double_pad = 2 * self.padding;
+        let double_pad = self
+            .padding
+            .checked_mul(2)
+            .ok_or_else(|| NyError::InvalidSpec("ConvTranspose1d padding overflow".to_string()))?;
         if expanded < double_pad {
             return Err(NyError::InvalidSpec(format!(
                 "ConvTranspose1d output length underflow: \
@@ -442,6 +468,7 @@ impl ConvTranspose1dLayer {
             kernel_l1,
             n_contraction,
             None,
+            None,
         );
         let mut upper_err_2d = batched_conv_coeff_err(
             &upper_a_2d,
@@ -450,6 +477,7 @@ impl ConvTranspose1dLayer {
             coeff_f64_u.as_ref().filter(|_| upper_recompute_ok),
             kernel_l1,
             n_contraction,
+            None,
             None,
         );
         if lower_recompute_failed {

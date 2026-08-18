@@ -13,7 +13,7 @@ use crate::network::core::GraphNetwork;
 use crate::network::graph_alpha::alpha_projection::graph_alpha_state_from_sequential;
 use crate::network::graph_alpha::invprop_backward::take_best_bounds;
 use crate::network::graph_alpha::propagate_helpers::{
-    bounds_infeasible, clamp_inverted_best_bounds, update_elementwise_best_bounds,
+    clamp_inverted_best_bounds, update_elementwise_best_bounds,
 };
 use crate::network::graph_alpha::reference_bounds::GraphAlphaReferenceBounds;
 use crate::network::graph_alpha::sequential_gradients;
@@ -68,7 +68,6 @@ impl GraphNetwork {
         let mut prev_best_lower_sum = best_lower_sum;
         let mut no_improve_iters = 0usize;
         let mut lr = config.learning_rate;
-        let mut infeasible_bounds: Option<BoundedTensor> = None;
         let mut total_gradient_skips = 0usize;
 
         for iter in 0..config.iterations {
@@ -92,6 +91,7 @@ impl GraphNetwork {
                         relu_name_to_idx,
                         alpha_state,
                         engine,
+                        deadline: config.deadline,
                     },
                     invprop_config: if invprop_enabled {
                         Some(&config.invprop)
@@ -105,11 +105,8 @@ impl GraphNetwork {
                 let (linear_bounds, gradients, gradients_upper_opt) =
                     match self.sequential_backward_pass(backward_pass) {
                         Ok(result) => result,
-                        Err(
-                            NyError::UnsupportedOp(_)
-                            | NyError::UnsupportedConfiguration(_)
-                            | NyError::DeadlineExceeded(_),
-                        ) => {
+                        // DeadlineExceeded remains structured verifier authority.
+                        Err(NyError::UnsupportedOp(_) | NyError::UnsupportedConfiguration(_)) => {
                             return self
                                 .propagate_crown_with_engine_and_deadline(
                                     input,
@@ -136,15 +133,6 @@ impl GraphNetwork {
                 if let Some(bounds_no_oc) = bounds_without_oc {
                     let no_oc_bounds = bounds_no_oc.concretize_sound(input);
                     concrete_bounds = take_best_bounds(&concrete_bounds, &no_oc_bounds);
-                }
-
-                if let Some(ref mut state) = alpha_state.invprop_state {
-                    if bounds_infeasible(&concrete_bounds) {
-                        state.mark_infeasible(0)?;
-                        state.apply_infeasible_mask(&mut concrete_bounds);
-                        infeasible_bounds = Some(concrete_bounds);
-                        break;
-                    }
                 }
 
                 // Skip during warmup window to avoid locking in noisy early-iteration bounds.
@@ -338,10 +326,6 @@ impl GraphNetwork {
                 "{label}: skipped {total_gradient_skips}/{} gradient updates (non-finite)",
                 config.iterations * alpha_state.alphas.len()
             );
-        }
-
-        if let Some(bounds) = infeasible_bounds {
-            return Ok(bounds);
         }
 
         let has_nan = best_lower.iter().any(|value| value.is_nan())

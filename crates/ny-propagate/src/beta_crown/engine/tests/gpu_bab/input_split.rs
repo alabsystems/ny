@@ -84,7 +84,7 @@ fn test_gpu_bab_input_split_adv_check_finds_root_counterexample_3870() {
     assert!(
         matches!(
             with_adv_result.result,
-            BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::PotentialViolation { .. }
         ),
         "adv_check should find a concrete root-domain counterexample, got {:?}",
         with_adv_result.result
@@ -96,7 +96,7 @@ fn test_gpu_bab_input_split_adv_check_finds_root_counterexample_3870() {
     assert!(
         matches!(
             without_adv_result.result,
-            BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::PotentialViolation { .. }
         ),
         "the same property should still be violated without adv_check, got {:?}",
         without_adv_result.result

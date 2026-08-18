@@ -42,29 +42,45 @@ pub struct NormalizationRowStats {
     pub total_rows: usize,
 }
 
-/// Details from GPU-accelerated compositional verification.
+/// Execution details returned by GPU-aware compositional APIs.
+///
+/// The `used_*` fields report execution, not requested configuration. The
+/// current Whisper encoder compatibility backend runs CPU graph IBP, reports
+/// both flags as `false`, leaves normalization stats empty, and aliases all
+/// stage widths to the final graph output width. The decoder compatibility APIs
+/// currently fail closed and do not construct this type.
 #[derive(Debug, Clone)]
 pub struct GpuCompositionalDetails {
-    /// Max width of attention delta bounds
+    /// Reported max width of attention delta bounds.
     pub attention_delta_width: f32,
-    /// Max width after first residual (x + attn_delta)
+    /// Reported max width after the first residual.
     pub x_attn_width: f32,
-    /// Max width of MLP delta bounds
+    /// Reported max width of the MLP delta.
     pub mlp_delta_width: f32,
-    /// Final output width
+    /// Final output width.
     pub output_width: f32,
-    /// Whether GPU was used for attention
+    /// Whether the intermediate-looking stage widths are actual measurements.
+    ///
+    /// False for the Whisper full-graph IBP compatibility fallback, whose
+    /// stage fields alias `output_width`.
+    pub stage_metrics_available: bool,
+    /// Whether attention actually executed on a GPU.
     pub used_gpu_attention: bool,
-    /// Whether zonotope was used for attention (correlation-aware bounds)
+    /// Whether attention actually used zonotope propagation.
     pub used_zonotope_attention: bool,
-    /// Sequence length of input
+    /// Sequence length of the input.
     pub seq_len: usize,
-    /// Per-LayerNorm site row-collapse stats (empty when `use_crown_block_wise` is false).
-    /// Part of #318.
+    /// Per-LayerNorm row-collapse stats from an executed block-wise CROWN lane.
+    ///
+    /// Empty when that lane did not execute, including every current Whisper
+    /// encoder compatibility fallback.
     pub normalization_row_stats: Vec<NormalizationRowStats>,
 }
 
-/// Details from compositional verification showing intermediate bound widths.
+/// Details returned by the compositional compatibility API.
+///
+/// The current Whisper encoder backend executes one complete graph-IBP pass,
+/// so its three intermediate-looking fields all alias `output_width`.
 #[derive(Debug, Clone)]
 pub struct CompositionalVerificationDetails {
     /// Max width of attention delta bounds
@@ -75,164 +91,137 @@ pub struct CompositionalVerificationDetails {
     pub mlp_delta_width: f32,
     /// Final output width
     pub output_width: f32,
+    /// Whether the intermediate-looking stage widths are actual measurements.
+    ///
+    /// False for the current Whisper full-graph IBP compatibility fallback.
+    pub stage_metrics_available: bool,
 }
 
-/// Details from multi-block sequential verification.
+/// Details produced by an executing multi-block sequential verifier.
+///
+/// Sequential Whisper verification is currently unavailable and returns
+/// [`ny_core::NyError::UnsupportedConfiguration`] instead of constructing this
+/// type.
 #[derive(Debug, Clone)]
 pub struct MultiBlockDetails {
-    /// Number of blocks verified
+    /// Number of blocks in the verification request.
     pub num_blocks: usize,
-    /// Per-block details (attention/MLP widths for each block)
+    /// Per-block attention/MLP details.
     pub block_details: Vec<GpuCompositionalDetails>,
-    /// Whether stem was included
+    /// Whether the stem was included.
     pub included_stem: bool,
-    /// Whether final LayerNorm (ln_post) was included
+    /// Whether the final LayerNorm was included.
     pub included_ln_post: bool,
-    /// Total verification time in milliseconds
+    /// Total verification time in milliseconds.
     pub total_time_ms: u64,
-    /// Output width after stem (if included)
+    /// Output width after the stem, if included.
     pub stem_output_width: Option<f32>,
-    /// Output width after ln_post (if included)
+    /// Output width after the final LayerNorm, if included.
     pub ln_post_output_width: Option<f32>,
-    /// Final output width
+    /// Final output width.
     pub final_output_width: f32,
-    /// Number of blocks actually completed (may be < num_blocks if early termination)
+    /// Number of blocks actually completed.
     pub blocks_completed: usize,
-    /// Whether early termination occurred due to bound overflow
+    /// Whether execution terminated early due to bound overflow.
     pub early_terminated: bool,
-    /// Block index where overflow was first detected (if any)
+    /// Block index where overflow was first detected.
     pub overflow_at_block: Option<usize>,
-    /// Reason for early termination (if applicable)
+    /// Reason for early termination, if applicable.
     pub termination_reason: Option<String>,
 }
 
-/// Configuration for multi-block sequential verification.
+/// Compatibility configuration for Whisper block and sequential verification.
 ///
-/// # Default Configuration
+/// The current direct-block backend runs conservative CPU graph IBP.
+/// Sequential verification is unavailable and returns
+/// `UnsupportedConfiguration`. GPU, heuristic LayerNorm, zonotope, LayerNorm
+/// CROWN, block-wise CROWN, and overflow-control fields are retained requests.
+/// Non-default values for those unavailable requests are rejected by the
+/// direct-block backend rather than silently selecting another execution lane.
 ///
-/// The default config uses forward-mode LayerNorm (`layernorm_forward_mode: true`),
-/// which provides dramatically tighter bounds (up to 1e31x improvement on multi-block
-/// transformers) compared to conservative mode. This is appropriate for typical
-/// verification scenarios with small perturbations (eps < 0.1).
-///
-/// When zonotope attention is enabled, the attention-prefix seam in
-/// `verify_block_compositional_gpu_with_config()` stays pinned to the
-/// conservative attention LayerNorm output as part of `#318`. Forward mode still
-/// applies to the suffix graph and the rest of the block.
-///
-/// When `use_crown_block_wise` is enabled, the MLP-side LayerNorm inside
-/// `verify_block_compositional_gpu_with_config()` is also pinned to
-/// conservative semantics. `layernorm_forward_mode` continues to govern the
-/// attention side and the non-block-wise MLP path.
-///
-/// For users requiring strictly mathematically sound bounds (at the cost of
-/// potentially useless results due to bound explosion), use `MultiBlockConfig::conservative()`.
+/// Direct block defaults are conservative. Forward-mode LayerNorm remains in
+/// the configuration for API compatibility but is rejected because its
+/// heuristic bounds have no machine-readable soundness provenance.
 ///
 /// # Factory Methods
 ///
-/// - `default()` - Forward-mode LayerNorm for practical verification (recommended)
-/// - `conservative()` - Strictly sound bounds, may explode on multi-block transformers
-/// - `strict()` - Like default but terminates early on overflow
-/// - `diagnostic()` - Continues through overflow for analysis
-/// - `tightest_attention()` - Forward-mode block config + zonotope attention with a conservative attention-prefix seam
-/// - `deep_transformer()` - `tightest_attention()` preset retained for deep-stack workflows
-/// - `sound_tight()` - Conservative LayerNorm across the full block + zonotope attention
+/// - `default()` - Conservative LayerNorm for direct block IBP
+/// - `conservative()` - Conservative LayerNorm for direct block IBP
+/// - `strict()` - Conservative preset with retained overflow requests
+/// - `diagnostic()` - Conservative preset with retained overflow requests
+/// - `tightest_attention()` - Heuristic forward-mode config with a retained zonotope request
+/// - `deep_transformer()` - Heuristic forward-mode deep-stack preset
+/// - `sound_tight()` - Conservative LayerNorm with a retained zonotope request
 #[derive(Debug, Clone)]
 pub struct MultiBlockConfig {
-    /// Maximum allowed bound width before early termination.
-    /// If bounds exceed this threshold, verification stops and returns Unknown.
-    /// Default: f32::MAX (no threshold - continue until overflow)
+    /// Retained maximum-width request for a future sequential backend.
+    ///
+    /// A non-default value is rejected by the current direct-block backend.
+    /// Default: `f32::MAX`.
     pub max_bound_width: f32,
-    /// Whether to terminate early when NaN or Infinity is detected in bounds.
-    /// Default: false (preserves original behavior of `verify_encoder_sequential`)
+    /// Retained overflow-termination request for a future sequential backend.
+    ///
+    /// A true value is rejected by the current direct-block backend. Default: false.
     pub terminate_on_overflow: bool,
-    /// Whether to continue verification even after overflow (for diagnostics).
-    /// When true, bounds will be clamped to prevent NaN propagation.
-    /// Default: false (stop on first overflow for soundness)
+    /// Retained continue-after-overflow request for a future sequential backend.
+    ///
+    /// A true value is rejected by the current direct-block backend. Default: false.
     pub continue_after_overflow: bool,
-    /// Bound value to clamp to when continue_after_overflow is true.
-    /// Default: 1e30
+    /// Retained overflow clamp value for a future sequential backend.
+    ///
+    /// A non-default value is rejected by the current direct-block backend.
+    /// Default: `1e30`.
     pub overflow_clamp_value: f32,
-    /// Use forward mode for LayerNorm IBP: compute mean/std from center point.
-    /// This dramatically reduces bound explosion (up to 1e31x tighter bounds on
-    /// multi-block transformers) but may not be perfectly sound for large perturbations.
+    /// Retained heuristic LayerNorm forward-mode request.
     ///
-    /// When `use_zonotope_attention` is enabled, the attention-prefix seam inside
-    /// `verify_block_compositional_gpu_with_config()` still uses the conservative
-    /// attention LayerNorm output for the shared-source zonotope suffix. This flag
-    /// continues to control the non-zonotope paths, the zonotope suffix graph, and
-    /// the rest of the block.
-    ///
-    /// When `use_crown_block_wise` is also enabled,
-    /// `verify_block_compositional_gpu_with_config()` keeps the MLP-side
-    /// LayerNorm conservative by design for `#318` stability. In
-    /// `verify_encoder_sequential_with_config()`, later blocks are also forced
-    /// to conservative LayerNorm before the block verifier runs, so this flag's
-    /// attention-side effect is limited to direct block calls and block 0.
-    ///
-    /// Default: true (forward mode for practical verification)
+    /// The current direct-block backend rejects `true` and returns no bounds;
+    /// untagged heuristic bounds must not escape a verification-named API.
+    /// Sequential verification is unavailable. Default: false.
     pub layernorm_forward_mode: bool,
-    /// LayerNorm CROWN mode for per-position CROWN in the MLP subgraph.
-    /// `Cut` is strictly sound; `Sampling` uses heuristic sampling and is not
-    /// provably sound. Default: Cut.
+    /// Retained LayerNorm CROWN request.
+    ///
+    /// The current direct-block backend does not execute CROWN, so a value
+    /// other than the compatibility default is rejected. Default: `Cut`.
     pub layernorm_crown_mode: LayerNormCrownMode,
-    /// Use zonotope propagation for the attention suffix instead of pure IBP.
-    /// Zonotopes track Q/K correlations through shared error symbols, giving
-    /// tighter bounds for Q@K^T. The zonotope path currently roots that suffix
-    /// at a conservative attention LayerNorm seam, then applies the configured
-    /// LayerNorm mode to the suffix graph and the rest of the block. Provides
-    /// additional tightening over pure forward-mode attention IBP at extra cost.
-    /// Default: false (forward-mode LN provides the bulk of improvement)
+    /// Request zonotope propagation for a future attention backend.
+    ///
+    /// The current [`WhisperModel`](super::WhisperModel) compatibility backend
+    /// rejects this request and returns no bounds. The field remains in the
+    /// public configuration surface for API compatibility.
+    /// Default: false.
     pub use_zonotope_attention: bool,
     /// Compatibility knob for future sequential zonotope backends.
     ///
-    /// The current compositional Whisper verifier already rebuilds zonotope
-    /// attention from each block's interval-valued input, so toggling this flag
-    /// does not change today's results. It remains in the public config surface
-    /// so a future shared-zonotope multi-block backend can opt into explicit
+    /// The current compatibility backend has no zonotope execution lane, so a
+    /// true value is rejected. The field remains in the public config surface
+    /// so a future backend can opt into explicit
     /// block-boundary resets without another API break.
-    /// Default: true (preserve the intended deep-transformer preset)
+    /// Default: false.
     pub reset_zonotope_between_blocks: bool,
-    /// Enable decomposed-normalization CROWN inside the compositional block
-    /// verifier's MLP subgraph.
-    /// When true, `verify_block_compositional_gpu_with_config()` switches the
-    /// MLP leg to `propagate_crown_within_graph_per_position_with_stats()`
-    /// while attention still runs through the compositional IBP/zonotope
-    /// routes. `verify_encoder_sequential_with_config()` intentionally keeps
-    /// using the compositional block verifier because full-block CROWN through
-    /// Whisper attention still degenerates at MatMul boundaries.
-    /// Part of #318.
-    /// Default: false
+    /// Request decomposed-normalization CROWN for a future compositional MLP
+    /// backend. The current `WhisperModel` compatibility backend rejects this
+    /// request and returns no bounds. Default: false.
     pub use_crown_block_wise: bool,
 }
 
 impl Default for MultiBlockConfig {
     fn default() -> Self {
-        // Default uses forward-mode LayerNorm for dramatically tighter bounds.
-        // This provides up to 1e31x improvement on multi-block transformers.
-        // For strictly sound (but potentially useless) bounds, use conservative().
         Self {
             max_bound_width: f32::MAX,
-            terminate_on_overflow: false, // Match original verify_encoder_sequential
-            continue_after_overflow: false, // Don't clamp, just let NaN propagate
+            terminate_on_overflow: false,
+            continue_after_overflow: false,
             overflow_clamp_value: 1e30,
-            layernorm_forward_mode: true, // Forward mode for practical verification
+            layernorm_forward_mode: false,
             layernorm_crown_mode: LayerNormCrownMode::Cut,
-            use_zonotope_attention: false, // IBP is sufficient with forward-mode LN
-            reset_zonotope_between_blocks: true, // Compatibility default for future zonotope reuse
+            use_zonotope_attention: false,
+            reset_zonotope_between_blocks: false,
             use_crown_block_wise: false,
         }
     }
 }
 
 impl MultiBlockConfig {
-    /// Create a conservative config with strictly sound LayerNorm bounds.
-    ///
-    /// WARNING: Conservative mode causes extreme bound explosion on multi-block
-    /// transformers (bounds grow ~10^10 per block). Use only when strict mathematical
-    /// soundness is required and you accept that results may be useless.
-    ///
-    /// For practical verification, use `default()` which enables forward-mode LayerNorm.
+    /// Create a direct-block graph-IBP config with conservative LayerNorm bounds.
     pub fn conservative() -> Self {
         Self {
             max_bound_width: f32::MAX,
@@ -247,17 +236,17 @@ impl MultiBlockConfig {
         }
     }
 
-    /// Create a strict config that terminates early on any overflow.
+    /// Create a conservative config carrying unavailable strict-overflow requests.
     ///
-    /// Uses forward-mode LayerNorm (like default) but stops verification
-    /// if bounds exceed 1e20 or become NaN/Infinity.
+    /// Sequential verification is currently unavailable, and the current
+    /// direct-block backend rejects the non-default overflow fields.
     pub fn strict() -> Self {
         Self {
             max_bound_width: 1e20,
             terminate_on_overflow: true,
             continue_after_overflow: false,
             overflow_clamp_value: 1e30,
-            layernorm_forward_mode: true, // Forward mode for practical bounds
+            layernorm_forward_mode: false,
             layernorm_crown_mode: LayerNormCrownMode::Cut,
             use_zonotope_attention: false,
             reset_zonotope_between_blocks: false,
@@ -265,10 +254,10 @@ impl MultiBlockConfig {
         }
     }
 
-    /// Create a diagnostic config that continues through overflow for analysis.
+    /// Create a conservative config carrying unavailable diagnostic requests.
     ///
-    /// Uses conservative LayerNorm (not forward mode) to help diagnose bound
-    /// explosion patterns. Bounds are clamped to prevent NaN propagation.
+    /// Sequential verification is currently unavailable, and the current
+    /// direct-block backend rejects the non-default overflow fields.
     pub fn diagnostic() -> Self {
         Self {
             max_bound_width: f32::MAX,
@@ -283,24 +272,19 @@ impl MultiBlockConfig {
         }
     }
 
-    /// Alias for `default()` - forward-mode LayerNorm for tight bounds.
-    ///
-    /// Note: As of iteration #323, forward-mode LayerNorm is the default.
-    /// This method is retained for backwards compatibility.
+    /// Create the legacy heuristic forward-mode configuration.
     #[deprecated(
         since = "0.1.0",
-        note = "Use default() instead - forward-mode LN is now the default"
+        note = "Heuristic LayerNorm is unavailable; use MultiBlockConfig::conservative()"
     )]
     pub fn tight_bounds() -> Self {
-        Self::default()
+        Self::default().with_layernorm_forward_mode(true)
     }
 
-    /// Create a config optimized for tightest attention bounds using zonotope.
-    /// Uses forward-mode LayerNorm for the block overall, but keeps the
-    /// zonotope attention prefix seam conservative in
-    /// `verify_block_compositional_gpu_with_config()`. The sequential verifier
-    /// already rebuilds zonotope state per block, so the reset flag is
-    /// currently a compatibility knob rather than an active transformation.
+    /// Create a heuristic forward-mode config carrying the retained zonotope request.
+    ///
+    /// No current backend accepts this preset: sequential verification is
+    /// unavailable and direct-block verification rejects its zonotope request.
     pub fn tightest_attention() -> Self {
         Self {
             max_bound_width: f32::MAX,
@@ -315,15 +299,11 @@ impl MultiBlockConfig {
         }
     }
 
-    /// Create a config optimized for deep transformers (28+ layers).
-    /// Uses the same conservative zonotope attention prefix seam as
-    /// `tightest_attention()`. In the current compositional verifier this is
-    /// behaviorally identical, because each block already reconstructs a fresh
-    /// zonotope from its interval input.
+    /// Create a legacy heuristic forward-mode deep-transformer config.
     ///
-    /// Recommended for:
-    /// - Qwen3, LLaMA, GPT models with many decoder layers
-    /// - Models where bounds saturate before reaching the final layer
+    /// No current backend accepts this preset: sequential verification is
+    /// unavailable and direct-block verification rejects its zonotope/reset
+    /// requests.
     pub fn deep_transformer() -> Self {
         Self {
             max_bound_width: f32::MAX,
@@ -338,11 +318,11 @@ impl MultiBlockConfig {
         }
     }
 
-    /// Create a sound config that still applies zonotope tightening.
+    /// Create a conservative LayerNorm config carrying the zonotope request.
     ///
-    /// Uses conservative (sound) LayerNorm bounds across the full block and
-    /// enables zonotope attention. The reset flag stays enabled as a
-    /// compatibility default for future shared-zonotope sequential backends.
+    /// No current backend accepts this preset: sequential verification is
+    /// unavailable and direct-block verification rejects its zonotope/reset
+    /// requests.
     pub fn sound_tight() -> Self {
         Self {
             max_bound_width: f32::MAX,
@@ -357,39 +337,43 @@ impl MultiBlockConfig {
         }
     }
 
-    /// Set maximum bound width threshold.
+    /// Set the retained maximum-width request.
+    ///
+    /// The current direct-block backend rejects non-default values, and
+    /// sequential verification is unavailable.
     pub fn with_max_width(mut self, max_width: f32) -> Self {
         self.max_bound_width = max_width;
         self
     }
 
-    /// Enable or disable forward mode for LayerNorm IBP.
-    /// Forward mode uses center point for mean/std, giving dramatically tighter bounds.
-    /// When zonotope attention is enabled, this does not relax the conservative
-    /// attention-prefix seam. When `use_crown_block_wise` is enabled, the
-    /// direct block verifier still keeps the MLP-side LayerNorm conservative
-    /// even if this flag is `true`; multi-block encoder runs additionally force
-    /// later blocks to conservative LayerNorm before dispatch.
+    /// Set the retained heuristic LayerNorm forward-mode request.
+    ///
+    /// The current direct-block backend rejects `true` without returning
+    /// bounds. Sequential verification is also unavailable.
     pub fn with_layernorm_forward_mode(mut self, enabled: bool) -> Self {
         self.layernorm_forward_mode = enabled;
         self
     }
 
-    /// Set LayerNorm CROWN mode for per-position CROWN in the MLP subgraph.
+    /// Set the retained LayerNorm CROWN request.
+    ///
+    /// The current direct-block backend rejects non-default values.
     pub fn with_layernorm_crown_mode(mut self, mode: LayerNormCrownMode) -> Self {
         self.layernorm_crown_mode = mode;
         self
     }
 
-    /// Enable or disable early termination on overflow (NaN/Infinity).
+    /// Set the retained overflow-termination request.
+    ///
+    /// The current direct-block backend rejects a true value.
     pub fn with_terminate_on_overflow(mut self, terminate: bool) -> Self {
         self.terminate_on_overflow = terminate;
         self
     }
 
-    /// Enable or disable zonotope propagation for the attention suffix graph.
-    /// Zonotopes track Q/K correlations for tighter Q@K^T bounds while keeping
-    /// the attention-prefix seam conservative.
+    /// Enable or disable the retained zonotope-attention request.
+    ///
+    /// The current direct-block backend rejects a true value.
     pub fn with_zonotope_attention(mut self, enabled: bool) -> Self {
         self.use_zonotope_attention = enabled;
         self
@@ -398,23 +382,54 @@ impl MultiBlockConfig {
     /// Enable or disable the compatibility reset flag for future shared-zonotope
     /// sequential backends.
     ///
-    /// The current compositional Whisper verifier already rebuilds zonotope
-    /// attention from interval bounds at each block, so toggling this flag
-    /// currently has no behavioral effect.
+    /// The current direct-block backend rejects a true value.
     pub fn with_reset_zonotope_between_blocks(mut self, enabled: bool) -> Self {
         self.reset_zonotope_between_blocks = enabled;
         self
     }
 
-    /// Enable or disable the decomposed-norm CROWN path for the compositional
-    /// verifier's MLP subgraph.
-    /// This does not switch Whisper encoder verification to a full attention +
-    /// MLP backward CROWN pass; it only changes the MLP leg inside
-    /// `verify_block_compositional_gpu_with_config()`, where the MLP-side
-    /// LayerNorm stays conservative while the attention side keeps the caller's
-    /// block-local policy. Part of #318.
+    /// Enable or disable the retained block-wise-CROWN request.
+    ///
+    /// The current direct-block backend rejects a true value.
     pub fn with_crown_block_wise(mut self, enabled: bool) -> Self {
         self.use_crown_block_wise = enabled;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_conservative_layernorm(config: &MultiBlockConfig, label: &str) {
+        assert!(
+            !config.layernorm_forward_mode,
+            "{label} must not silently opt into heuristic LayerNorm"
+        );
+        assert_eq!(config.layernorm_crown_mode, LayerNormCrownMode::Cut);
+        assert!(!config.use_zonotope_attention);
+        assert!(!config.reset_zonotope_between_blocks);
+        assert!(!config.use_crown_block_wise);
+    }
+
+    #[test]
+    fn default_and_conservative_presets_pin_safe_direct_block_requests() {
+        for (label, config) in [
+            ("default", MultiBlockConfig::default()),
+            ("conservative", MultiBlockConfig::conservative()),
+        ] {
+            assert_conservative_layernorm(&config, label);
+            assert_eq!(config.max_bound_width, f32::MAX);
+            assert!(!config.terminate_on_overflow);
+            assert!(!config.continue_after_overflow);
+            assert_eq!(config.overflow_clamp_value, 1e30);
+        }
+    }
+
+    #[test]
+    fn strict_preset_does_not_enable_heuristic_layernorm() {
+        let config = MultiBlockConfig::strict();
+        assert_conservative_layernorm(&config, "strict");
+        assert!(config.terminate_on_overflow);
     }
 }

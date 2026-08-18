@@ -4,7 +4,7 @@
 
 use ndarray::{ArrayD, Axis, IxDyn};
 use ny_core::{checked_shape_product, nan_propagating_max, NyError, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use crate::BoundedTensor;
 
@@ -21,7 +21,7 @@ use crate::BoundedTensor;
 /// Zonotope: x = 1.0 + 0.1·e₁   where e₁ ∈ [-1, 1]
 /// coeffs = [[1.0], [0.1]]  (shape: 2×1)
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ZonotopeTensor {
     /// Combined center and error coefficients.
     /// Shape: (1 + n_error_terms, ...element_shape)
@@ -32,6 +32,37 @@ pub struct ZonotopeTensor {
 
     /// Shape of each element tensor (excludes the error term dimension).
     pub(crate) element_shape: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+struct SerializedZonotopeTensor {
+    coeffs: ArrayD<f32>,
+    n_error_terms: usize,
+    element_shape: Vec<usize>,
+}
+
+impl<'de> Deserialize<'de> for ZonotopeTensor {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let serialized = SerializedZonotopeTensor::deserialize(deserializer)?;
+        let zonotope = Self::new(serialized.coeffs).map_err(D::Error::custom)?;
+        if serialized.n_error_terms != zonotope.n_error_terms
+            || serialized.element_shape != zonotope.element_shape
+        {
+            return Err(D::Error::custom(format!(
+                "ZonotopeTensor serialized metadata does not match coefficient shape: \
+                 expected n_error_terms={} and element_shape={:?}, got \
+                 n_error_terms={} and element_shape={:?}",
+                zonotope.n_error_terms,
+                zonotope.element_shape,
+                serialized.n_error_terms,
+                serialized.element_shape
+            )));
+        }
+        Ok(zonotope)
+    }
 }
 
 impl ZonotopeTensor {
@@ -47,7 +78,13 @@ impl ZonotopeTensor {
             ));
         }
 
-        let n_error_terms = shape[0].saturating_sub(1);
+        if shape[0] == 0 {
+            return Err(NyError::InvalidSpec(
+                "Zonotope coeffs must contain a center row".to_string(),
+            ));
+        }
+
+        let n_error_terms = shape[0] - 1;
         let element_shape = shape[1..].to_vec();
 
         Ok(Self {
@@ -141,5 +178,56 @@ impl ZonotopeTensor {
     /// Check if bounds have exploded to infinity.
     pub fn has_unbounded(&self) -> bool {
         self.coeffs.iter().any(|v| v.is_infinite())
+    }
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+    use ndarray::arr1;
+
+    #[derive(Serialize)]
+    struct RawZonotopeTensor {
+        coeffs: ArrayD<f32>,
+        n_error_terms: usize,
+        element_shape: Vec<usize>,
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_valid_zonotope() {
+        let zonotope = ZonotopeTensor::from_input_shared(&arr1(&[1.0, 2.0]).into_dyn(), 0.25);
+
+        let encoded = serde_json::to_string(&zonotope).expect("serialize");
+        let decoded: ZonotopeTensor = serde_json::from_str(&encoded).expect("deserialize");
+
+        assert_eq!(decoded.coeffs(), zonotope.coeffs());
+        assert_eq!(decoded.n_error_terms(), zonotope.n_error_terms());
+        assert_eq!(decoded.shape(), zonotope.shape());
+    }
+
+    #[test]
+    fn new_and_serde_reject_missing_center_row() {
+        let coeffs = ArrayD::zeros(IxDyn(&[0, 2]));
+        assert!(ZonotopeTensor::new(coeffs.clone()).is_err());
+
+        let raw = RawZonotopeTensor {
+            coeffs,
+            n_error_terms: 0,
+            element_shape: vec![2],
+        };
+        let encoded = serde_json::to_string(&raw).expect("serialize malformed fixture");
+        assert!(serde_json::from_str::<ZonotopeTensor>(&encoded).is_err());
+    }
+
+    #[test]
+    fn serde_rejects_stale_shape_metadata() {
+        let raw = RawZonotopeTensor {
+            coeffs: ArrayD::zeros(IxDyn(&[2, 3])),
+            n_error_terms: 7,
+            element_shape: vec![99],
+        };
+        let encoded = serde_json::to_string(&raw).expect("serialize malformed fixture");
+
+        assert!(serde_json::from_str::<ZonotopeTensor>(&encoded).is_err());
     }
 }

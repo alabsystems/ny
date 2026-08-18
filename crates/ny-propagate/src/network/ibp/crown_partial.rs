@@ -16,7 +16,10 @@ use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
 use crate::bounds::LinearBounds;
 use crate::contiguous_flat_slice;
 use crate::layers::{BoundPropagation, Layer};
-use crate::network::core::{crown_backward_step_patches, CrownStepFallback, CrownStepResult};
+use crate::network::core::{
+    crown_backward_step_patches, materialize_terminal_crown_bounds_with_deadline,
+    CrownStepFallback, CrownStepResult,
+};
 use crate::network::crown_memory::{cpu_crown_dense_budget_bytes, DenseMaterializationEstimate};
 use ndarray::{Array1, Array2};
 use ny_core::{GemmEngine, NyError, Result};
@@ -27,6 +30,42 @@ use tracing::debug;
 pub(super) enum PartialCrownPropagationResult {
     Crown(Box<BoundedTensor>),
     ForwardFallback(CrownStepFallback),
+}
+
+/// Publish a completed CPU CROWN result only while its node budget is live.
+///
+/// The backward loop polls the deadline between layers, but concretization and
+/// sparse post-processing can themselves cross the cutoff. Treat that late
+/// result exactly like any other per-node timeout so the collection caller
+/// keeps the sound forward bound instead.
+fn publish_concretized_crown(
+    result: BoundedTensor,
+    deadline: Option<Instant>,
+    completed_at: Instant,
+) -> Result<BoundedTensor> {
+    if deadline.is_some_and(|limit| completed_at >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP partial: per-node deadline exceeded after concretization".to_string(),
+        ));
+    }
+    Ok(result)
+}
+
+fn concretization_memory_fallback(error: &NyError) -> Option<CrownStepFallback> {
+    matches!(error, NyError::CpuMemoryExceeded { .. }).then(|| CrownStepFallback {
+        reason: crate::types::CrownIbpFallbackReason::MemoryBudgetExceeded,
+        details: format!("CROWN-IBP partial concretization exceeded its CPU budget: {error}"),
+    })
+}
+
+fn check_partial_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        Err(NyError::DeadlineExceeded(
+            "CROWN-IBP partial: deadline exceeded during final reshape".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Propagate CROWN bounds through a partial network (subset of layers).
@@ -46,6 +85,11 @@ pub(super) fn propagate_crown_partial_with_engine(
     engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
 ) -> Result<PartialCrownPropagationResult> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP partial: deadline exceeded before entry".to_string(),
+        ));
+    }
     if layers.is_empty() {
         return Ok(PartialCrownPropagationResult::Crown(Box::new(
             input.clone(),
@@ -75,9 +119,12 @@ pub(super) fn propagate_crown_partial_with_engine(
     // GPU fast path (#3599 Phase 1): dispatch the entire per-node backward to GPU
     // when all layers in the sub-network are GPU-extractable. This avoids the
     // CPU-bound Patches/Dense backward loop and host-side concretization.
-    // Note: the GPU fast path is faster than CPU backward, so we do NOT skip it
-    // when a deadline is set. Per-layer deadline checks in the CPU fallback loop
-    // handle timeout if the GPU path is not available (#4413).
+    // A finite request deliberately skips this optional GPU route. Although a
+    // backend can advertise cooperative device cancellation, the legacy host
+    // preparation still extracts/copies every layer and input endpoint and
+    // builds the full (or sparse) specification matrix without cooperative
+    // polls. The CPU Patches/Dense path below observes the same absolute
+    // deadline through its admitted materialization boundaries.
     // Soundness gate (#vnncomp-gpu-crown-soundness): under the gate, route to the
     // SOUND GPU-resident backward (`use_sound = true`) when the engine advertises
     // it — that path carries the certified `γ_n·S` coefficient-rounding error
@@ -86,19 +133,43 @@ pub(super) fn propagate_crown_partial_with_engine(
     // loop. Without the gate (`use_sound = false`) the existing fast unsound path
     // runs. Either way an `Err`/NaN inside falls back to the proven CPU loop below.
     // See `sound_gpu_gate`.
-    if let Some((gpu, use_sound)) = crate::sound_gpu_gate::gpu_crown_backward_route(engine) {
-        if let Some(gpu_result) = try_gpu_crown_partial_backward(
-            layers,
-            prior_bounds,
-            input,
-            gpu,
-            use_sound,
-            output_dim,
-            &output_shape,
-            &output_bounds,
-        )? {
-            return Ok(gpu_result);
+    let gpu_route = deadline
+        .is_none()
+        .then(|| crate::sound_gpu_gate::gpu_crown_backward_route_with_deadline(engine, deadline));
+    if let Some(Some((gpu, use_sound))) = gpu_route {
+        if crate::sound_gpu_gate::gpu_crown_backend_honors_deadline(gpu, deadline) {
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return Err(NyError::DeadlineExceeded(
+                    "CROWN-IBP partial: deadline exceeded before GPU dispatch".to_string(),
+                ));
+            }
+            let _gpu_deadline_scope =
+                crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, deadline);
+            let gpu_result = try_gpu_crown_partial_backward(
+                layers,
+                prior_bounds,
+                input,
+                gpu,
+                use_sound,
+                output_dim,
+                &output_shape,
+                &output_bounds,
+                deadline,
+            )?;
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return Err(NyError::DeadlineExceeded(
+                    "CROWN-IBP partial: deadline exceeded after GPU dispatch".to_string(),
+                ));
+            }
+            if let Some(gpu_result) = gpu_result {
+                return Ok(gpu_result);
+            }
         }
+    }
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(
+            "CROWN-IBP partial: deadline exceeded before CPU fallback".to_string(),
+        ));
     }
 
     // Initialize CROWN bounds — use Patches mode when the output is 3D spatial
@@ -115,15 +186,28 @@ pub(super) fn propagate_crown_partial_with_engine(
     // Phase 2 (#3599): track unstable indices for Dense sparse mode.
     // When set, only unstable neurons have spec rows in the backward pass.
     let mut dense_unstable_indices: Option<Vec<usize>> = None;
+    // Flat output positions the SPARSE PATCHES seed actually tracks. The merge
+    // below must know these positionally: an untracked neuron's concretized
+    // bound is `[bias, bias]`, which is indistinguishable by value from a
+    // tracked neuron that legitimately lands there. See
+    // `merge_sparse_crown_with_ibp`.
+    let mut patches_tracked_flat: Option<Vec<usize>> = None;
     let mut crown_bounds = if has_conv2d && output_shape.len() == 3 {
         let spatial = (output_shape[0], output_shape[1], output_shape[2]);
         // Try sparse patches from IBP output bounds
-        let sparse_patches = crate::bounds::patches::UnstableIdx::from_ibp_bounds(
-            output_bounds.lower().as_slice().unwrap_or(&[]),
-            output_bounds.upper().as_slice().unwrap_or(&[]),
-            spatial,
-            0.9,
-        );
+        // Sparse discovery and seed construction retain legacy infallible
+        // `Vec` growth and full endpoint scans. Keep finite authority on the
+        // admitted full virtual-identity route; no-deadline behavior is exact.
+        let sparse_patches = if deadline.is_none() {
+            crate::bounds::patches::UnstableIdx::from_ibp_bounds(
+                output_bounds.lower().as_slice().unwrap_or(&[]),
+                output_bounds.upper().as_slice().unwrap_or(&[]),
+                spatial,
+                0.9,
+            )
+        } else {
+            None
+        };
         if let Some(unstable_idx) = sparse_patches {
             let n = unstable_idx.len();
             let total = spatial.0 * spatial.1 * spatial.2;
@@ -135,6 +219,13 @@ pub(super) fn propagate_crown_partial_with_engine(
                 spatial,
             );
             is_sparse_mode = true;
+            // Capture the tracked positions BEFORE the seed consumes the index
+            // set; the merge after concretization needs them.
+            patches_tracked_flat = Some(
+                (0..unstable_idx.len())
+                    .map(|i| unstable_idx.flat_index(i, spatial.1, spatial.2))
+                    .collect(),
+            );
             CrownBounds::Patches(Box::new(PatchesLinearBounds::sparse_identity(
                 spatial,
                 spatial,
@@ -146,7 +237,23 @@ pub(super) fn propagate_crown_partial_with_engine(
                 spatial
             );
             is_sparse_mode = false;
-            CrownBounds::Patches(Box::new(PatchesLinearBounds::identity(spatial, spatial)))
+            let seed = match PatchesLinearBounds::try_identity_with_deadline(
+                spatial, spatial, deadline, 0,
+            ) {
+                Ok(seed) => seed,
+                Err(error @ NyError::CpuMemoryExceeded { .. }) => {
+                    return Ok(PartialCrownPropagationResult::ForwardFallback(
+                        CrownStepFallback {
+                            reason: crate::types::CrownIbpFallbackReason::MemoryBudgetExceeded,
+                            details: format!(
+                                "CROWN-IBP partial identity seed exceeded its CPU budget: {error}"
+                            ),
+                        },
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            CrownBounds::Patches(Box::new(seed))
         }
     } else {
         is_sparse_mode = false;
@@ -266,7 +373,18 @@ pub(super) fn propagate_crown_partial_with_engine(
     )? {
         return Ok(PartialCrownPropagationResult::ForwardFallback(fallback));
     }
-    let linear_bounds = crown_bounds.into_dense()?;
+    let Some(linear_bounds) =
+        materialize_terminal_crown_bounds_with_deadline(crown_bounds, deadline)?
+    else {
+        return Ok(PartialCrownPropagationResult::ForwardFallback(
+            CrownStepFallback {
+                reason: crate::types::CrownIbpFallbackReason::MemoryBudgetExceeded,
+                details:
+                    "CROWN-IBP partial final Patches materialization exceeded its full peak budget"
+                        .to_string(),
+            },
+        ));
+    };
     let dense_secs = dense_start.elapsed().as_secs_f64();
 
     // Concretize linear bounds with input bounds and reshape to the IBP output shape.
@@ -280,7 +398,15 @@ pub(super) fn propagate_crown_partial_with_engine(
     // not output_dim. Scatter CROWN bounds to unstable positions; use IBP for
     // stable neurons where CROWN tightening has no benefit (exact ReLU relaxation).
     if let Some(ref idx) = dense_unstable_indices {
-        let sparse_crown = linear_bounds.concretize_sound(input);
+        let sparse_crown = match linear_bounds.concretize_sound_with_deadline(input, deadline) {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                if let Some(fallback) = concretization_memory_fallback(&error) {
+                    return Ok(PartialCrownPropagationResult::ForwardFallback(fallback));
+                }
+                return Err(error);
+            }
+        };
         let crown_lower = contiguous_flat_slice(sparse_crown.lower());
         let crown_upper = contiguous_flat_slice(sparse_crown.upper());
         let concretize_secs = concretize_start.elapsed().as_secs_f64();
@@ -291,20 +417,28 @@ pub(super) fn propagate_crown_partial_with_engine(
                 layers.len(),
             );
         }
-        return Ok(PartialCrownPropagationResult::Crown(Box::new(
-            scatter_sparse_crown_into_ibp(
-                &crown_lower,
-                &crown_upper,
-                &output_bounds,
-                idx,
-                &output_shape,
-            )?,
-        )));
+        let crown_result = scatter_sparse_crown_into_ibp(
+            &crown_lower,
+            &crown_upper,
+            &output_bounds,
+            idx,
+            &output_shape,
+        )?;
+        let crown_result = publish_concretized_crown(crown_result, deadline, Instant::now())?;
+        return Ok(PartialCrownPropagationResult::Crown(Box::new(crown_result)));
     }
 
-    let crown_result = linear_bounds
-        .concretize_sound(input)
-        .reshape(&output_shape)?;
+    let crown_result = match linear_bounds.concretize_sound_with_deadline(input, deadline) {
+        Ok(bounds) => bounds,
+        Err(error) => {
+            if let Some(fallback) = concretization_memory_fallback(&error) {
+                return Ok(PartialCrownPropagationResult::ForwardFallback(fallback));
+            }
+            return Err(error);
+        }
+    };
+    let crown_result =
+        crown_result.into_reshape_with_poll(&output_shape, || check_partial_deadline(deadline))?;
     let concretize_secs = concretize_start.elapsed().as_secs_f64();
 
     // Per-partial-pass timing (#3599): log when significant.
@@ -327,11 +461,44 @@ pub(super) fn propagate_crown_partial_with_engine(
     // neurons (sparse rows). Stable neurons got zero rows, producing [0, 0] bounds
     // after concretization. Replace those with IBP bounds, which are already tight
     // for stable neurons (all positive or all negative).
-    if is_sparse_mode {
-        Ok(PartialCrownPropagationResult::Crown(Box::new(
-            merge_sparse_crown_with_ibp(&crown_result, &output_bounds)?,
-        )))
+    let crown_result = if is_sparse_mode {
+        // Fail closed if the tracked-index set is somehow absent: without it the
+        // merge cannot tell tracked from untracked, and guessing by value is the
+        // defect this threading exists to remove.
+        let tracked = patches_tracked_flat.as_deref().ok_or_else(|| {
+            NyError::InternalError(
+                "sparse CROWN merge: sparse mode without a tracked-index set".into(),
+            )
+        })?;
+        merge_sparse_crown_with_ibp(&crown_result, &output_bounds, tracked)?
     } else {
-        Ok(PartialCrownPropagationResult::Crown(Box::new(crown_result)))
+        crown_result
+    };
+    let crown_result = publish_concretized_crown(crown_result, deadline, Instant::now())?;
+    Ok(PartialCrownPropagationResult::Crown(Box::new(crown_result)))
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use ndarray::arr1;
+    use std::time::Duration;
+
+    #[test]
+    fn valid_result_completed_after_deadline_is_rejected() {
+        let valid = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+        let deadline = Instant::now();
+        let completed_at = deadline + Duration::from_nanos(1);
+
+        let error = match publish_concretized_crown(valid, Some(deadline), completed_at) {
+            Ok(_) => panic!("a valid but late CROWN result must not be published"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, NyError::DeadlineExceeded(ref message)
+                if message.contains("after concretization")),
+            "late CROWN result should fail open as DeadlineExceeded, got {error:?}"
+        );
     }
 }

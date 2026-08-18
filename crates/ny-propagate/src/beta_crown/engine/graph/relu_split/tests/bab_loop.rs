@@ -6,6 +6,10 @@ use std::time::Instant;
 
 use crate::beta_crown::bab_cuts::GraphCutPool;
 use crate::beta_crown::config::BetaCrownConfig;
+use crate::beta_crown::engine::graph::adaptive_microbatch::{
+    AdaptiveBatchRoute, AdaptiveMicrobatchController, MicrobatchMemoryBudget,
+    MicrobatchRefusalReason, OrderedBatchCursor, RefusalAction,
+};
 use crate::beta_crown::engine::graph::shared::state::GraphBabLifecycle;
 use crate::beta_crown::result::BabVerificationStatus;
 use crate::beta_crown::BetaCrownVerifier;
@@ -15,6 +19,7 @@ use crate::{GraphNetwork, Layer, ReLULayer};
 use ndarray::{arr1, arr2};
 use std::time::Duration;
 
+use super::super::bab_loop::ReluSplitWavePlan;
 use super::super::domain_filter::PreFilterOutcome;
 use super::test_domain;
 
@@ -87,6 +92,48 @@ fn graph_relu_split_adaptive_route_preserves_legacy_result_and_accounting() {
     assert_eq!(preset_legacy.max_depth_reached, legacy.max_depth_reached);
 }
 
+#[test]
+fn adaptive_refusal_backoff_preserves_outer_wave_split_depth() {
+    let config = BetaCrownConfig {
+        batch_size: 64,
+        min_batch_fill_ratio: 1.0,
+        max_relu_split_depth: 6,
+        ..Default::default()
+    };
+    let outer_wave_width = 8;
+    let wave_plan = ReluSplitWavePlan::new(&config, outer_wave_width);
+    assert_eq!(wave_plan.split_depth(), 3);
+
+    let mut controller = AdaptiveMicrobatchController::new(
+        AdaptiveBatchRoute::GraphReluSplit,
+        outer_wave_width,
+        1,
+        MicrobatchMemoryBudget::fixed(1_000_000, 0),
+    );
+    let cursor = OrderedBatchCursor::new(outer_wave_width);
+    assert_eq!(cursor.next_range(controller.current()), 0..8);
+    assert!(matches!(
+        controller.on_refusal(MicrobatchRefusalReason::DeviceAllocation),
+        RefusalAction::Retry {
+            previous: 8,
+            next: 4
+        }
+    ));
+
+    let retry = cursor.next_range(controller.current());
+    assert_eq!(retry, 0..4, "refusal must retry the same ordered prefix");
+    assert_eq!(
+        wave_plan.split_depth(),
+        3,
+        "retry must retain the outer wave's branch expansion"
+    );
+    assert_eq!(
+        config.effective_relu_split_depth(retry.len()),
+        4,
+        "this fixture must detect accidental recomputation from the retry width"
+    );
+}
+
 /// Root lower bound above threshold -> Verified (default verify_upper_bound=false).
 #[ntest::timeout(5000)]
 #[test]
@@ -121,7 +168,7 @@ fn test_check_root_early_exit_violation_upper_below_threshold() {
 
     let r = result.expect("should return Some for violation");
     assert!(
-        matches!(r.result, BabVerificationStatus::PotentialViolation),
+        matches!(r.result, BabVerificationStatus::PotentialViolation { .. }),
         "upper(-1.0) < threshold(3.0) should be violation, got {:?}",
         r.result
     );
@@ -219,7 +266,7 @@ fn test_check_root_early_exit_verify_upper_mode_violation() {
 
     let r = result.expect("should return Some for violation (upper mode)");
     assert!(
-        matches!(r.result, BabVerificationStatus::PotentialViolation),
+        matches!(r.result, BabVerificationStatus::PotentialViolation { .. }),
         "lower(5.0) >= threshold(3.0) with verify_upper=true should be violation, got {:?}",
         r.result
     );

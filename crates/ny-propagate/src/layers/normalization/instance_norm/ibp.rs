@@ -23,7 +23,9 @@ use ndarray::{ArrayD, IxDyn};
 use ny_core::{checked_dim_product, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 
-use super::super::math_common::{compute_batch_prefix, square_interval_bounds};
+use super::super::math_common::{
+    compute_batch_prefix, outward_midpoint_radius, square_interval_bounds,
+};
 
 use super::types::InstanceNorm1dLayer;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
@@ -92,9 +94,12 @@ impl InstanceNorm1dLayer {
     /// Forward-mode IBP for InstanceNorm1d using Jacobian-based propagation.
     ///
     /// Computes the Jacobian at the center point (midpoint of bounds), then
-    /// propagates input radii through the absolute Jacobian to get sound
-    /// first-order output radii. A second-order remainder term is added to
-    /// account for curvature (the Jacobian varies across the input interval).
+    /// propagates input radii through the absolute Jacobian and adds a
+    /// second-order remainder term for curvature.
+    ///
+    /// This implementation is admitted only as heuristic analysis, not as
+    /// proof authority. The outward arithmetic below hardens its enclosure
+    /// behavior but does not change that provenance classification.
     ///
     /// ## Math (per-channel, time dimension T)
     ///
@@ -115,13 +120,9 @@ impl InstanceNorm1dLayer {
         let num_channels = shape[ndim - 2];
         let time_len = shape[ndim - 1];
 
-        let center = (input.lower() + input.upper()) * 0.5;
-        let radius = (input.upper() - input.lower()) * 0.5;
-
-        let has_nonfinite = center.iter().chain(radius.iter()).any(|&v| !v.is_finite());
-        if has_nonfinite {
+        let Some((center, radius)) = outward_midpoint_radius(input.lower(), input.upper()) else {
             return self.fallback_output_bounds(shape);
-        }
+        };
 
         let mut out_lower = input.lower().clone();
         let mut out_upper = input.upper().clone();

@@ -98,7 +98,7 @@ fn test_constant_of_shape_preserves_non_batch_singleton_axis_for_vit_cls_token_3
 }
 
 #[test]
-fn test_constant_of_shape_fill_value_from_float_attribute() {
+fn test_constant_of_shape_rejects_non_schema_float_attribute() {
     let graph = GraphProto {
         node: vec![node(
             "cos",
@@ -115,10 +115,86 @@ fn test_constant_of_shape_fill_value_from_float_attribute() {
 
     fold(&graph, &mut weights);
 
-    let out = weights.get("out").expect("missing ConstantOfShape output");
-    // Same as above: [1, 2] → [2] from unbatched squeeze.
-    assert_eq!(out.shape(), &[2]);
-    assert!(out.iter().all(|v| (*v - 2.25).abs() < 1.0e-6));
+    assert!(!weights.contains_key("out"));
+}
+
+#[test]
+fn test_constant_of_shape_integer_fill_is_not_lossily_folded() {
+    let value_tensor = crate::onnx_proto::TensorProto {
+        dims: Vec::new(),
+        data_type: 7,
+        name: "integer_fill".to_string(),
+        int64_data: vec![16_777_217],
+        ..Default::default()
+    };
+    let graph = GraphProto {
+        node: vec![node(
+            "cos",
+            "ConstantOfShape",
+            &["shape"],
+            &["out"],
+            vec![attr_tensor("value", value_tensor)],
+        )],
+        ..Default::default()
+    };
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "shape".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap(),
+    );
+    fold(&graph, &mut weights);
+    assert!(!weights.contains_key("out"));
+}
+
+/// The `Tensor.expand` idiom in ml4acopf_2024's plain models opens with
+/// `ConstantOfShape([2], value = INT64 1)`. The fold must materialize it with
+/// an EXACT i64 sidecar and the INT64 range, because the whole cone downstream
+/// (`Mul` by -1, `Equal`, `Where`) is evaluated on the typed integer path and
+/// declines rather than falling back to the lossy f32 view.
+#[test]
+fn test_constant_of_shape_exact_integer_fill_keeps_its_i64_payload() {
+    let value_tensor = crate::onnx_proto::TensorProto {
+        dims: Vec::new(),
+        data_type: 7,
+        name: "integer_fill".to_string(),
+        int64_data: vec![1],
+        ..Default::default()
+    };
+    let graph = GraphProto {
+        node: vec![node(
+            "cos",
+            "ConstantOfShape",
+            &["shape"],
+            &["out"],
+            vec![attr_tensor("value", value_tensor)],
+        )],
+        ..Default::default()
+    };
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "shape".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![2.0]).unwrap(),
+    );
+    fold(&graph, &mut weights);
+
+    assert_eq!(
+        weights
+            .get("out")
+            .map(|values| values.iter().copied().collect::<Vec<_>>()),
+        Some(vec![1.0_f32, 1.0])
+    );
+    assert_eq!(
+        weights
+            .get_integers("out")
+            .map(|values| values.iter().copied().collect::<Vec<_>>()),
+        Some(vec![1_i64, 1]),
+        "an INT64 fill must publish its exact integer sidecar, not only an f32 mirror"
+    );
+    assert_eq!(
+        weights.get_integer_range("out"),
+        Some((i64::MIN, i64::MAX)),
+        "the authored INT64 range is what selects the exact integer fold path downstream"
+    );
 }
 
 #[test]

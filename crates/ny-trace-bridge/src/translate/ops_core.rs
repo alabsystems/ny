@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use ndarray::{ArrayD, Axis, IxDyn};
 use ny_build::{AttributeValue, DataType, LayerSpec, WeightRef};
-use ny_core::{LayerType, NyError, Result};
+use ny_core::{checked_shape_product, LayerType, NyError, Result};
 
 use crate::schema::{DType, TraceActivation, TraceOp, WeightPayload};
 
@@ -28,10 +28,35 @@ use super::{
     shape_to_i64, simple_spec, validate_eps, weight_f32, Ctx, NodeOutput,
 };
 
-// Maximum safe input for f32 `exp()` before overflow to infinity.
-// `exp(88.0) ≈ 1.65e38` (within `f32::MAX ≈ 3.4e38`); `exp(89.0)` overflows.
-// Used as a domain constraint for the pre-Exp / pre-Softplus / pre-Mish Clip.
-const EXP_SAFE_UPPER: f32 = 88.0;
+/// Cap translator-owned dense materializations so compact malformed traces
+/// cannot force unbounded allocations. Matches ny-onnx constant folding.
+const MAX_MATERIALIZED_ELEMENTS: usize = 10_000_000;
+
+/// Fallibly materialize a dense f32 array after checked shape/cap validation.
+fn materialize_filled_array(shape: &[usize], value: f32, context: &str) -> Result<ArrayD<f32>> {
+    let elements = checked_shape_product(shape).ok_or_else(|| {
+        NyError::ModelLoad(format!(
+            "{context}: shape {shape:?} has a dimension product that overflows usize"
+        ))
+    })?;
+    if elements > MAX_MATERIALIZED_ELEMENTS {
+        return Err(NyError::ModelLoad(format!(
+            "{context}: shape {shape:?} requires {elements} elements, exceeding the {MAX_MATERIALIZED_ELEMENTS}-element materialization limit"
+        )));
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(elements).map_err(|error| {
+        NyError::ModelLoad(format!(
+            "{context}: allocation failed for {elements} elements: {error}"
+        ))
+    })?;
+    data.resize(elements, value);
+    ArrayD::from_shape_vec(IxDyn(shape), data).map_err(|error| {
+        NyError::ModelLoad(format!(
+            "{context}: shape {shape:?} could not be materialized: {error}"
+        ))
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Constant / input translators
@@ -62,7 +87,7 @@ pub(super) fn translate_constant(
     ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
     let val_f32 = checked_f64_to_f32(value, "Constant")?;
-    let arr = ArrayD::from_elem(IxDyn(output_shape), val_f32);
+    let arr = materialize_filled_array(output_shape, val_f32, "Constant")?;
     ctx.insert_weight(output_tensor, arr)?;
     Ok(NodeOutput::none())
 }
@@ -81,8 +106,11 @@ pub(super) fn translate_constant_weight(
 // Activation translators
 // ---------------------------------------------------------------------------
 
-/// Translate a simple unary activation, with domain-clip injection for the
-/// overflow-prone Exp / Softplus / Mish family.
+/// Translate a simple unary activation without changing its input domain.
+///
+/// In particular, Exp/Softplus/Mish must not be preceded by a Clamp: doing so
+/// changes valid values above the f32 exponential threshold. Their propagation
+/// layers either evaluate stably or fail closed on an unsafe domain.
 pub(super) fn translate_unary_activation(
     op: &TraceOp,
     name: &str,
@@ -90,11 +118,6 @@ pub(super) fn translate_unary_activation(
     output_tensor: &str,
 ) -> Result<NodeOutput> {
     let data_input = first_input(input_tensors, op_name(op))?;
-
-    // Exp/Softplus/Mish: inject Clip(-88, 88) before the activation. For any x
-    // where the result is finite, x ∈ (-∞, 88]; clipping only excludes the
-    // infeasible region where the inner exp() overflows. Sound bound tightening.
-    let clipped = matches!(op, TraceOp::Exp | TraceOp::Softplus | TraceOp::Mish);
 
     let layer_type = match op {
         TraceOp::Relu => LayerType::ReLU,
@@ -128,38 +151,13 @@ pub(super) fn translate_unary_activation(
         }
     };
 
-    if clipped {
-        let clip_name = format!("{name}_domain_clip");
-        let clip_out = format!("{clip_name}_out");
-        let mut clip_attrs = HashMap::new();
-        clip_attrs.insert("min".to_string(), AttributeValue::Float(-EXP_SAFE_UPPER));
-        clip_attrs.insert("max".to_string(), AttributeValue::Float(EXP_SAFE_UPPER));
-        let clip_spec = simple_spec(
-            &clip_name,
-            LayerType::Clip,
-            vec![data_input],
-            &clip_out,
-            clip_attrs,
-        );
-        let act_spec = simple_spec(
-            name,
-            layer_type,
-            vec![clip_out],
-            output_tensor,
-            HashMap::new(),
-        );
-        Ok(NodeOutput {
-            specs: vec![clip_spec, act_spec],
-        })
-    } else {
-        Ok(NodeOutput::one(simple_spec(
-            name,
-            layer_type,
-            vec![data_input],
-            output_tensor,
-            HashMap::new(),
-        )))
-    }
+    Ok(NodeOutput::one(simple_spec(
+        name,
+        layer_type,
+        vec![data_input],
+        output_tensor,
+        HashMap::new(),
+    )))
 }
 
 /// Translate GELU with the given `approximate` mode ("tanh" or "none").
@@ -258,9 +256,9 @@ pub(super) fn translate_clamp(
 
 /// Translate an identity op via `Add + 0.0`.
 ///
-/// Used for ops that don't change numerical values (Dropout in eval mode,
-/// ToDtype upcasts).
-fn translate_identity_add_zero(
+/// Used for ops that are semantically guaranteed not to change numerical
+/// values, such as Dropout in eval mode and `Powf` with exponent 1.
+pub(super) fn translate_identity_add_zero(
     name: &str,
     op_desc: &str,
     input_tensors: &[String],
@@ -289,50 +287,20 @@ pub(super) fn translate_dropout(
     translate_identity_add_zero(name, "Dropout", input_tensors, output_tensor, ctx)
 }
 
-/// Translate `TraceOp::ToDtype` — Clip for downcasts, identity for upcasts.
+/// Refuse `TraceOp::ToDtype` casts.
 ///
-/// All float dtypes share f32 storage in the traced values, so for bound
-/// propagation a cast never changes the number NY sees. F16/BF16 downcasts are
-/// still modeled as a Clamp to the target's representable range (values beyond
-/// it would become Inf on real low-precision hardware) and counted in
-/// [`Translation::dtype_cast_count`]; ULP-level widening is a certificate-time
-/// concern, not a graph-layer one. Everything else is an `Add + 0.0` identity —
-/// deliberately NOT `LayerType::Cast`, which the graph-build backend rejects on
-/// a non-constant data path and would degrade into a vacuous opaque layer.
-/// Clamp values mirror NN's `translate_to_dtype` exactly.
+/// The wire format records only the target dtype. Without the source dtype,
+/// even an F32/F64 target may be a precision-losing cast. The bridge therefore
+/// cannot prove that any `ToDtype` is an identity and has no sound lowering for
+/// it.
 pub(super) fn translate_to_dtype(
-    name: &str,
     target_dtype: DType,
     input_tensors: &[String],
-    output_tensor: &str,
-    ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
-    if input_tensors.is_empty() {
-        return Err(NyError::InternalError("ToDtype has no inputs".to_string()));
-    }
-    match target_dtype {
-        DType::F16 | DType::Bf16 => {
-            // Downcast: model precision loss via Clamp to representable range.
-            // F16 max: 65504.0, BF16 max: ~3.389e38.
-            ctx.dtype_cast_count += 1;
-            let range = match target_dtype {
-                DType::F16 => 65504.0_f64,
-                _ => 3.389e38_f64, // BF16 max
-            };
-            translate_clamp(
-                name,
-                Some(-range),
-                Some(range),
-                input_tensors.to_vec(),
-                output_tensor,
-            )
-        }
-        _ => {
-            // Upcast or same-width: identity for bounds (all float dtypes share
-            // f32 storage in the traced values).
-            translate_identity_add_zero(name, "ToDtype upcast", input_tensors, output_tensor, ctx)
-        }
-    }
+    let _ = first_input(input_tensors, "ToDtype")?;
+    Err(NyError::UnsupportedOp(format!(
+        "ToDtype target {target_dtype:?} cannot be soundly lowered because the trace does not record the source dtype"
+    )))
 }
 
 /// Translate `TraceOp::Elu { alpha }`.
@@ -477,7 +445,7 @@ pub(super) fn translate_named_activation(
         TraceActivation::Tanh => LayerType::Tanh,
         TraceActivation::Log => LayerType::Log,
         TraceActivation::Exp => {
-            // Route through the unary path to pick up the domain-clip.
+            // Share the direct Exp lowering and its fail-closed propagation.
             return translate_unary_activation(&TraceOp::Exp, name, input_tensors, output_tensor);
         }
         TraceActivation::Mish => {
@@ -827,11 +795,15 @@ fn expand_dilated_conv1d_kernel(kernel: &ArrayD<f32>, dilation: usize) -> Result
     }
     let shape = kernel.shape();
     let (out_c, in_c, k) = (shape[0], shape[1], shape[2]);
-    let new_k = (k - 1)
+    let taps_minus_one = k.checked_sub(1).ok_or_else(|| {
+        NyError::ModelLoad("Conv1d dilation expansion requires a non-empty kernel".to_string())
+    })?;
+    let new_k = taps_minus_one
         .checked_mul(dilation)
         .and_then(|v| v.checked_add(1))
         .ok_or_else(|| NyError::InternalError("Conv1d dilation expansion overflow".to_string()))?;
-    let mut expanded = ArrayD::<f32>::zeros(IxDyn(&[out_c, in_c, new_k]));
+    let expanded_shape = [out_c, in_c, new_k];
+    let mut expanded = materialize_filled_array(&expanded_shape, 0.0, "Conv1d dilation expansion")?;
     for o in 0..out_c {
         for i in 0..in_c {
             for tap in 0..k {
@@ -1096,16 +1068,22 @@ pub(super) fn translate_instance_norm(
     let beta_name = format!("{name}_beta");
     ctx.insert_weight(
         &gamma_name,
-        ArrayD::from_elem(IxDyn(&[num_channels]), 1.0_f32),
+        materialize_filled_array(&[num_channels], 1.0, "InstanceNorm gamma")?,
     )?;
     ctx.insert_weight(
         &beta_name,
-        ArrayD::from_elem(IxDyn(&[num_channels]), 0.0_f32),
+        materialize_filled_array(&[num_channels], 0.0, "InstanceNorm beta")?,
     )?;
 
     let data_input = first_input(input_tensors, "InstanceNorm")?;
     let mut attrs = HashMap::new();
     attrs.insert("epsilon".to_string(), AttributeValue::Float(eps_f32));
+    if output_shape.len() == 2 {
+        attrs.insert(
+            ny_build::INTERNAL_CT_INSTANCE_NORM_ATTR.to_string(),
+            AttributeValue::Int(1),
+        );
+    }
     Ok(NodeOutput::one(simple_spec(
         name,
         LayerType::InstanceNorm,
@@ -1221,11 +1199,19 @@ pub(super) fn translate_group_norm(
     let beta_name = format!("{in_name}_beta");
     ctx.insert_weight(
         &gamma_name,
-        ArrayD::from_elem(IxDyn(&[channels_per_group]), 1.0_f32),
+        materialize_filled_array(
+            &[channels_per_group],
+            1.0,
+            "GroupNorm synthetic InstanceNorm gamma",
+        )?,
     )?;
     ctx.insert_weight(
         &beta_name,
-        ArrayD::from_elem(IxDyn(&[channels_per_group]), 0.0_f32),
+        materialize_filled_array(
+            &[channels_per_group],
+            0.0,
+            "GroupNorm synthetic InstanceNorm beta",
+        )?,
     )?;
     let mut in_attrs = HashMap::new();
     in_attrs.insert("epsilon".to_string(), AttributeValue::Float(eps_f32));
@@ -1329,14 +1315,20 @@ pub(super) fn try_constant_fold_unary(
         // stable only since 1.77).
         TraceOp::Round => round_ties_even,
         TraceOp::Neg => |v| -v,
-        TraceOp::Softplus => |v| v.exp().ln_1p(),
+        TraceOp::Softplus => |v| {
+            if v > 0.0 {
+                v + (-v).exp().ln_1p()
+            } else {
+                v.exp().ln_1p()
+            }
+        },
         _ => return None,
     };
 
     let result_arr = input_arr.mapv(fold_fn);
-    if result_arr.iter().any(|v| v.is_nan()) {
+    if result_arr.iter().any(|v| !v.is_finite()) {
         return Some(Err(NyError::NumericalInstability(format!(
-            "constant fold of {} produced NaN",
+            "constant fold of {} produced a non-finite value",
             op_name(op)
         ))));
     }
@@ -1396,9 +1388,9 @@ pub(super) fn try_constant_fold_binary(
         }
     };
 
-    if result_arr.iter().any(|v| v.is_nan()) {
+    if result_arr.iter().any(|v| !v.is_finite()) {
         return Some(Err(NyError::NumericalInstability(format!(
-            "constant fold of {} produced NaN",
+            "constant fold of {} produced a non-finite value",
             op_name(op)
         ))));
     }
@@ -1515,7 +1507,11 @@ pub(super) fn try_constant_fold_matmul(
     let mut result_shape = out_batch.clone();
     result_shape.push(m);
     result_shape.push(n);
-    let mut result = ArrayD::<f32>::zeros(IxDyn(&result_shape));
+    let mut result =
+        match materialize_filled_array(&result_shape, 0.0, "constant fold of MatMul output") {
+            Ok(result) => result,
+            Err(error) => return Some(Err(error)),
+        };
 
     let lhs_offset = out_batch.len().saturating_sub(lhs_batch.len());
     let rhs_offset = out_batch.len().saturating_sub(rhs_batch.len());
@@ -1583,9 +1579,9 @@ pub(super) fn try_constant_fold_matmul(
         result = result.index_axis_move(Axis(last_axis), 0);
     }
 
-    if result.iter().any(|v| v.is_nan()) {
+    if result.iter().any(|v| !v.is_finite()) {
         return Some(Err(NyError::NumericalInstability(
-            "constant fold of MatMul produced NaN".to_string(),
+            "constant fold of MatMul produced a non-finite value".to_string(),
         )));
     }
     Some(

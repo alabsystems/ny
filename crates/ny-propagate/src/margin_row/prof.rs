@@ -5,9 +5,9 @@
 //! Zero-when-off phase profiler for the margin-row BaB (#twinwall).
 //!
 //! Coarse wall-clock accounting of the tree-loop hot phases, gated by
-//! `NY_MARGIN_ROW_PROFILE=1`. Timers only READ the clock: they never touch a
-//! coefficient, bound, or verdict, so enabling the profiler cannot move the
-//! moat. Aggregation is a fixed array of atomics keyed by [`Phase`]; the
+//! `NY_MARGIN_ROW_PROFILE=1`. Timers do not directly supply a coefficient or
+//! bound, but their clock reads and atomic updates can perturb a
+//! deadline-sensitive verdict path. Aggregation is a fixed array of atomics keyed by [`Phase`]; the
 //! phases are entered from the (single) tree-loop driver thread, so contention
 //! is nil even though each phase internally fans out over rayon.
 
@@ -62,17 +62,38 @@ const ZERO: AtomicU64 = AtomicU64::new(0);
 static NS: [AtomicU64; NPHASE] = [ZERO; NPHASE];
 static CNT: [AtomicU64; NPHASE] = [ZERO; NPHASE];
 
-static ON: OnceLock<bool> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// True when `NY_MARGIN_ROW_PROFILE=1` (checked once).
+/// Latched RAW env string (lever-debt batch B1 preparation), read once through
+/// the ny-levers chokepoint's raw view. [`Timer::start`] and [`bump`] sit in
+/// the tree-loop hot path, so the STRING is latched; the DECISION is derived
+/// per call in [`enabled`]. This remains process-wide; Phase 2 must replace it
+/// with an injected per-run `LeverSet`.
+fn env_raw() -> Option<&'static str> {
+    static RAW: OnceLock<Option<String>> = OnceLock::new();
+    RAW.get_or_init(|| ny_levers::read_raw(&ny_levers::decls::telemetry::MARGIN_ROW_PROFILE))
+        .as_deref()
+}
+
+/// True when `NY_MARGIN_ROW_PROFILE=1` (exact `"1"`, derived per call from the
+/// latched raw string). Also refreshes the `ACTIVE` mirror that [`bump`]
+/// polls lock-free.
 #[inline]
 pub fn enabled() -> bool {
-    *ON.get_or_init(|| {
-        let on = std::env::var("NY_MARGIN_ROW_PROFILE").ok().as_deref() == Some("1");
-        ACTIVE.store(on, Ordering::Relaxed);
-        on
-    })
+    let on = env_raw() == Some("1");
+    ACTIVE.store(on, Ordering::Relaxed);
+    on
+}
+
+/// TEST-ONLY: force the `ACTIVE` mirror that [`bump`] polls.
+///
+/// The env latch is a process-wide `OnceLock`, so a test that needs to observe
+/// the gated counters cannot get there by setting the variable. This touches
+/// only the mirror — [`enabled`] still recomputes it from the latched string on
+/// its next call, so no production path can be affected.
+#[cfg(all(test, feature = "gpu-tests"))]
+pub(crate) fn force_active_for_test(on: bool) {
+    ACTIVE.store(on, Ordering::Relaxed);
 }
 
 /// RAII phase timer. `None` (and no allocation) when the profiler is off.
@@ -125,8 +146,48 @@ pub enum Counter {
     EpochAttempt = 6,
     /// Tier-2 epoch closed its subtree.
     EpochClosed = 7,
+    /// GPU seam produced an AUTHORITATIVE pass (#margin-row-gpu).
+    GpuSeamOk = 8,
+    /// GPU seam refused; the caller ran the exact CPU pass (#margin-row-gpu).
+    GpuSeamRefused = 9,
+    /// GPU seam refused specifically because a SOUNDNESS GUARD tripped — the
+    /// certified-error floor or the realization probe (#margin-row-gpu).
+    ///
+    /// This counter must stay at zero on a healthy device. A nonzero value is
+    /// not a performance note; it means a dispatched certified payload failed a
+    /// necessary condition and the seam must not be trusted until it is
+    /// explained.
+    GpuSeamGuardTrip = 10,
+    /// DOMAIN-BATCHED certified GPU dispatches that published
+    /// (#margin-row-gpu-batch). ONE increment per wide call, not per domain.
+    ///
+    /// This is the counter that distinguishes "the batched lane fired" from
+    /// "the batched lane silently never ran" — the failure mode that cost a
+    /// measurement cycle on the per-pass seam. Batched work does NOT bump
+    /// `gpu_seam_ok`: that counter stays the per-pass seam's, so the two lanes
+    /// remain separable in one profile.
+    GpuBatchOk = 11,
+    /// Domains SERVED by a published batched dispatch. `gpu_batch_domains /
+    /// gpu_batch_ok` is the achieved mean batch width — the number the whole
+    /// lane exists to raise, and the one to read before believing any timing.
+    GpuBatchDomains = 12,
+    /// Batched attempts that refused. Typed capacity refusals may be retried at
+    /// a narrower width; a terminal refusal falls back to the per-pass seam and
+    /// then to the exact CPU walk for those domains.
+    GpuBatchRefused = 13,
+    /// A batched dispatch was discarded because a SOUNDNESS GUARD tripped on
+    /// one of its domains — that domain's certified-error floor or realization
+    /// probe (#margin-row-gpu-batch).
+    ///
+    /// Like [`Counter::GpuSeamGuardTrip`] this must stay at zero on a healthy
+    /// device, and it is recorded regardless of the profiling gate.
+    GpuBatchGuardTrip = 14,
+    /// Margin-row coefficient-batch trait calls attempted. This is deliberately
+    /// separate from `ny_core::wide_lane_telemetry`, whose denominator belongs
+    /// to the graph/BaB internal wide lane.
+    GpuBatchAttempts = 15,
 }
-const NCTR: usize = 8;
+const NCTR: usize = 16;
 const CTR_NAMES: [&str; NCTR] = [
     "lru_hit",
     "lru_miss",
@@ -136,6 +197,14 @@ const CTR_NAMES: [&str; NCTR] = [
     "frontier_popped",
     "epoch_attempt",
     "epoch_closed",
+    "gpu_seam_ok",
+    "gpu_seam_refused",
+    "gpu_seam_guard_trip",
+    "gpu_batch_ok",
+    "gpu_batch_domains",
+    "gpu_batch_refused",
+    "gpu_batch_guard_trip",
+    "gpu_batch_attempts",
 ];
 static CTRS: [AtomicU64; NCTR] = [ZERO; NCTR];
 
@@ -145,6 +214,23 @@ pub fn bump(c: Counter, n: u64) {
     if ACTIVE.load(Ordering::Relaxed) {
         CTRS[c as usize].fetch_add(n, Ordering::Relaxed);
     }
+}
+
+/// Increment an event counter REGARDLESS of the profiling gate.
+///
+/// Reserved for counters whose value is a SOUNDNESS signal rather than a
+/// performance note ([`Counter::GpuSeamGuardTrip`],
+/// [`Counter::GpuBatchGuardTrip`]): a guard trip must be observable in an
+/// ordinary production run, not only under `NY_MARGIN_ROW_PROFILE=1`.
+#[inline]
+pub fn bump_always(c: Counter, n: u64) {
+    CTRS[c as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Read one event counter.
+#[inline]
+pub fn counter(c: Counter) -> u64 {
+    CTRS[c as usize].load(Ordering::Relaxed)
 }
 
 /// Reset all counters (call at the start of a profiled run).

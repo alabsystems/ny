@@ -50,6 +50,15 @@ fn write_minimal_whisper_safetensors(
     path
 }
 
+fn write_single_safetensor(path: &std::path::Path, name: &str, value: f32) {
+    let values = [value];
+    let view = TensorView::new(Dtype::F32, vec![1], bytemuck::cast_slice(&values))
+        .expect("single-tensor view");
+    let tensors = BTreeMap::from([(name.to_string(), view)]);
+    let data = serialize(tensors, None).expect("serialize single-tensor shard");
+    std::fs::write(path, data).expect("write single-tensor shard");
+}
+
 fn write_whisper_fixture(
     hidden_dim: usize,
     num_heads: usize,
@@ -420,6 +429,20 @@ fn test_native_model_load_from_hf_directory() {
     assert_eq!(native_model.config.hidden_dim, 2);
     assert_eq!(native_model.config.num_heads, Some(1));
     assert_eq!(native_model.config.num_layers, Some(0));
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_sharded_safetensors_reject_duplicate_tensor_names() {
+    let dir = tempdir().expect("tempdir");
+    write_config_json(dir.path(), "{}");
+    write_single_safetensor(&dir.path().join("model-00001.safetensors"), "weight", 1.0);
+    write_single_safetensor(&dir.path().join("model-00002.safetensors"), "weight", 2.0);
+
+    let err = load_weights(dir.path())
+        .expect_err("duplicate names must not be resolved by shard ordering");
+    assert!(err.to_string().contains("Duplicate tensor"), "err = {err}");
+    assert!(err.to_string().contains("weight"), "err = {err}");
 }
 
 #[ntest::timeout(10000)]

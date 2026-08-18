@@ -15,6 +15,41 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD = REPO_ROOT / "scripts" / "ny-safe-gpu-run"
+ATTESTED_VMEM_KIB = 167_772_160
+ATTESTED_VMEM_BYTES = ATTESTED_VMEM_KIB * 1024
+
+
+def _guard_test_environment(tmp_path: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["NY_GPU_LOCK_PATH"] = str(tmp_path / "gpu.lock")
+    # The production default intentionally reserves 64 GiB. These integration
+    # tests exercise process/cgroup behavior and must not depend on the size of
+    # the host's temporary filesystem.
+    env["NY_BUILD_MIN_FREE_KIB"] = "1"
+    return env
+
+
+def _fake_systemd_run(tmp_path: Path, env: dict[str, str]) -> Path:
+    """Capture the transient-unit argv without requiring a user systemd."""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    argument_log = tmp_path / "systemd-run.args"
+    fake = fake_bin / "systemd-run"
+    fake.write_text(
+        "#!/bin/sh\n"
+        ': > "$NY_SAFE_SYSTEMD_RUN_LOG"\n'
+        'for argument do printf "%s\\n" "$argument" '
+        '>> "$NY_SAFE_SYSTEMD_RUN_LOG"; done\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_flock.chmod(0o755)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["XDG_RUNTIME_DIR"] = str(tmp_path)
+    env["NY_SAFE_SYSTEMD_RUN_LOG"] = str(argument_log)
+    return argument_log
 
 
 def _require_user_systemd() -> None:
@@ -36,12 +71,14 @@ def _require_user_systemd() -> None:
             capture_output=True,
             check=False,
         )
-    except FileNotFoundError:
-        pytest.skip("systemd-run is unavailable on this host")
-    if probe.returncode != 0:
-        pytest.skip(
-            f"user systemd transient services unavailable: {probe.stderr.strip()}"
-        )
+    except FileNotFoundError as error:
+        raise AssertionError(
+            "systemd-run is required for ny-safe-gpu-run integration tests"
+        ) from error
+    assert probe.returncode == 0, (
+        "user systemd transient services are required for ny-safe-gpu-run "
+        f"integration tests: {probe.stderr.strip()}"
+    )
 
 
 def _pid_alive(pid: int) -> bool:
@@ -54,18 +91,24 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def test_guard_preserves_environment_status_and_attests_limits(tmp_path: Path) -> None:
+def external_guard_preserves_environment_status_and_attests_limits(
+    tmp_path: Path,
+) -> None:
     _require_user_systemd()
-    env = os.environ.copy()
+    env = _guard_test_environment(tmp_path)
     env["NY_SAFE_TEST_VALUE"] = "spaces * remain literal"
-    env["NY_GPU_LOCK_PATH"] = str(tmp_path / "gpu.lock")
     result = subprocess.run(
         [
             str(GUARD),
             "/bin/bash",
             "-c",
-            'printf "vmem=%s\\nvalue=%s\\n" "$(ulimit -v)" "$NY_SAFE_TEST_VALUE"; '
-            "cat /proc/self/cgroup; exit 23",
+            'cgroup="$(sed -n \'s/^0:://p\' /proc/self/cgroup)"; '
+            'printf "vmem=%s\\nvalue=%s\\nmembership=%s\\n" '
+            '"$(ulimit -v)" "$NY_SAFE_TEST_VALUE" "$cgroup"; '
+            "grep '^Max address space' /proc/self/limits; "
+            "for control in memory.high memory.max memory.swap.max pids.max cpu.max; do "
+            'printf "%s=" "$control"; cat "/sys/fs/cgroup${cgroup}/${control}"; done; '
+            "exit 23",
         ],
         cwd=tmp_path,
         env=env,
@@ -75,15 +118,104 @@ def test_guard_preserves_environment_status_and_attests_limits(tmp_path: Path) -
     )
 
     assert result.returncode == 23, result.stderr
-    assert "vmem=83886080" in result.stdout
+    assert f"vmem={ATTESTED_VMEM_KIB}" in result.stdout
+    rlimit_fields = next(
+        line.split()
+        for line in result.stdout.splitlines()
+        if line.startswith("Max address space")
+    )
+    assert rlimit_fields == [
+        "Max",
+        "address",
+        "space",
+        str(ATTESTED_VMEM_BYTES),
+        str(ATTESTED_VMEM_BYTES),
+        "bytes",
+    ]
     assert "value=spaces * remain literal" in result.stdout
     assert "/ny-build.slice/" in result.stdout
+    assert "memory.high=68719476736" in result.stdout
+    assert "memory.max=85899345920" in result.stdout
+    assert "memory.swap.max=8589934592" in result.stdout
+    assert "pids.max=4096" in result.stdout
+    assert "cpu.max=1000000 100000" in result.stdout
 
 
-def test_guard_preserves_literal_argument_boundaries(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("profile", "memory_high", "memory_max"),
+    [
+        (None, "68719476736", "85899345920"),
+        ("gb10-80g", "68719476736", "85899345920"),
+        ("wsl24-20g", "17179869184", "21474836480"),
+    ],
+)
+def test_guard_applies_exact_reviewed_profile_to_leaf_service(
+    tmp_path: Path,
+    profile: str | None,
+    memory_high: str,
+    memory_max: str,
+) -> None:
+    env = _guard_test_environment(tmp_path)
+    if profile is None:
+        env.pop("NY_MEASURE_CONTAINMENT_PROFILE", None)
+    else:
+        env["NY_MEASURE_CONTAINMENT_PROFILE"] = profile
+    argument_log = _fake_systemd_run(tmp_path, env)
+
+    result = subprocess.run(
+        [str(GUARD), "/bin/true"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = argument_log.read_text(encoding="utf-8").splitlines()
+    high_properties = [
+        argument
+        for argument in arguments
+        if argument.startswith("--property=MemoryHigh=")
+    ]
+    max_properties = [
+        argument
+        for argument in arguments
+        if argument.startswith("--property=MemoryMax=")
+    ]
+    assert high_properties == [f"--property=MemoryHigh={memory_high}"]
+    assert max_properties == [f"--property=MemoryMax={memory_max}"]
+    assert arguments[-2:] == [str(ATTESTED_VMEM_KIB), "/bin/true"]
+
+
+@pytest.mark.parametrize(
+    "profile",
+    ["", "20g", "GB10-80G", "wsl24-20g "],
+)
+def test_guard_rejects_unknown_containment_profile_before_launch(
+    tmp_path: Path, profile: str
+) -> None:
+    env = _guard_test_environment(tmp_path)
+    env["NY_MEASURE_CONTAINMENT_PROFILE"] = profile
+    argument_log = _fake_systemd_run(tmp_path, env)
+
+    result = subprocess.run(
+        [str(GUARD), "/bin/true"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "NY_MEASURE_CONTAINMENT_PROFILE" in result.stderr
+    assert not argument_log.exists(), "an invalid profile reached systemd-run"
+
+
+def external_guard_preserves_literal_argument_boundaries(tmp_path: Path) -> None:
     _require_user_systemd()
-    env = os.environ.copy()
-    env["NY_GPU_LOCK_PATH"] = str(tmp_path / "gpu.lock")
+    env = _guard_test_environment(tmp_path)
     arguments = [
         "",
         "spaces * remain literal",
@@ -111,7 +243,7 @@ def test_guard_preserves_literal_argument_boundaries(tmp_path: Path) -> None:
     assert json.loads(result.stdout) == arguments
 
 
-def test_sigterm_kills_the_complete_guarded_process_tree(tmp_path: Path) -> None:
+def external_sigterm_kills_the_complete_guarded_process_tree(tmp_path: Path) -> None:
     _require_user_systemd()
     pid_file = tmp_path / "child.pid"
     descendant_pid_file = tmp_path / "descendant.pid"
@@ -123,8 +255,7 @@ def test_sigterm_kills_the_complete_guarded_process_tree(tmp_path: Path) -> None
         f"trap 'echo term > {term_file}; exit 0' TERM; "
         "wait"
     )
-    env = os.environ.copy()
-    env["NY_GPU_LOCK_PATH"] = str(tmp_path / "gpu.lock")
+    env = _guard_test_environment(tmp_path)
     process = subprocess.Popen(
         [str(GUARD), "/bin/bash", "-c", child_script],
         cwd=tmp_path,
@@ -160,7 +291,14 @@ def test_sigterm_kills_the_complete_guarded_process_tree(tmp_path: Path) -> None
 
 @pytest.mark.parametrize(
     "limit",
-    ["0", "83886081", "999999999999999999999999", "not-an-integer"],
+    [
+        "0",
+        "167772161",
+        "unlimited",
+        "-1",
+        "999999999999999999999999",
+        "not-an-integer",
+    ],
 )
 def test_guard_rejects_unsafe_address_space_limits(limit: str) -> None:
     env = os.environ.copy()

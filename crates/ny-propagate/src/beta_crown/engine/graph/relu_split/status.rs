@@ -34,7 +34,7 @@ impl BetaCrownVerifier {
             .config
             .domain_is_violation(root_lower, root_upper, threshold)
         {
-            Some((BabVerificationStatus::PotentialViolation, 0))
+            Some((BabVerificationStatus::potential_violation(), 0))
         } else {
             None
         };

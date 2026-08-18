@@ -29,7 +29,7 @@ use tracing::debug;
 
 use crate::batched_domain::CachedLinearBounds;
 use crate::beta_crown::branching::GraphSplitHistory;
-use crate::beta_crown::domain::GraphCrownContext;
+use crate::beta_crown::domain::{GraphCrownContext, NodeBoundsView};
 use crate::beta_crown::state::GraphBetaState;
 use crate::layers::common::BoundPropagation;
 use crate::{GraphNetwork, Layer, NETWORK_INPUT};
@@ -40,6 +40,18 @@ use crate::beta_crown::engine::graph::{DomainCrownResult, DomainCrownResultWithI
 use backward::{BackwardMode, BackwardParams};
 use lookups::{apply_genbab_pre_constraints, apply_pre_constraints, build_constraint_lookups};
 pub(in crate::beta_crown::engine::graph::propagation) use patches::ConstrainedPatchesPolicy;
+
+fn ensure_constrained_propagation_deadline(
+    deadline: Option<std::time::Instant>,
+    stage: &str,
+) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(NyError::DeadlineExceeded(format!(
+            "constrained CROWN: deadline exceeded {stage}"
+        )));
+    }
+    Ok(())
+}
 
 /// #cone-delta gate. `NY_CONE_REFRESH=1` enables delta seeding of the
 /// constrained forward pass (recompute only the cone of the constraints added
@@ -84,8 +96,29 @@ impl BetaCrownVerifier {
         std::collections::HashMap<String, Arc<BoundedTensor>>,
         Option<CachedLinearBounds>,
     )> {
+        let deadline = self.effective_graph_bab_deadline();
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "before constrained forward preparation",
+        )?;
         let (mut bounds_cache, constrained_input, exec_order) =
             self.prepare_constrained_graph_bounds(graph, input, context, beta_state, objective)?;
+
+        ensure_constrained_propagation_deadline(deadline, "before Complete Clip")?;
+        self.maybe_apply_complete_clip_root_bank(
+            graph,
+            context,
+            beta_state,
+            objective,
+            None,
+            &constrained_input,
+            &exec_order,
+            &mut bounds_cache,
+        );
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "after Complete Clip and before constrained backward preparation",
+        )?;
 
         // #1817 diagnostic: dump forward bounds after constraint tightening when fully constrained
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -116,6 +149,7 @@ impl BetaCrownVerifier {
             debug!("[#1817 exec] order: {:?}", exec_order);
         }
 
+        ensure_constrained_propagation_deadline(deadline, "before constrained backward dispatch")?;
         // Delegate to shared backward CROWN core (standard mode: no intermediate storage).
         let params = BackwardParams {
             graph,
@@ -127,8 +161,8 @@ impl BetaCrownVerifier {
             spec_matrix: None,
             seed_cache,
             capture_linear_bounds,
-            deadline: self.config.alpha_config.deadline, // #3795: thread BaB deadline
-            patches_policy: ConstrainedPatchesPolicy::selective_matrix_reentry(),
+            deadline, // #3795: thread BaB deadline
+            patches_policy: ConstrainedPatchesPolicy::for_engine(context.engine),
         };
         let result =
             self.backward_crown_constrained(&params, &mut bounds_cache, BackwardMode::Standard)?;
@@ -168,6 +202,28 @@ impl BetaCrownVerifier {
         )
     }
 
+    /// Read-only compatibility face for a provenance-tracked node-bound map.
+    pub(in crate::beta_crown::engine::graph) fn compute_constrained_forward_bounds_from_view(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        history: &GraphSplitHistory,
+        base_bounds: Option<NodeBoundsView<'_>>,
+        delta_seeds: Option<&[String]>,
+    ) -> Result<(
+        std::collections::HashMap<String, Arc<BoundedTensor>>,
+        BoundedTensor,
+    )> {
+        self.compute_constrained_forward_bounds_view_inner(
+            graph,
+            input,
+            history,
+            base_bounds,
+            delta_seeds,
+            true,
+        )
+    }
+
     /// Inner implementation of [`Self::compute_constrained_forward_bounds`].
     ///
     /// `enable_upstream_cache` gates the upstream-bound inheritance optimization.
@@ -187,6 +243,42 @@ impl BetaCrownVerifier {
         std::collections::HashMap<String, Arc<BoundedTensor>>,
         BoundedTensor,
     )> {
+        self.compute_constrained_forward_bounds_view_inner(
+            graph,
+            input,
+            history,
+            base_bounds.map(NodeBoundsView::from_hash_map),
+            delta_seeds,
+            enable_upstream_cache,
+        )
+    }
+
+    fn compute_constrained_forward_bounds_view_inner(
+        &self,
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        history: &GraphSplitHistory,
+        base_bounds: Option<NodeBoundsView<'_>>,
+        delta_seeds: Option<&[String]>,
+        enable_upstream_cache: bool,
+    ) -> Result<(
+        std::collections::HashMap<String, Arc<BoundedTensor>>,
+        BoundedTensor,
+    )> {
+        let deadline = self.effective_graph_bab_deadline();
+        // #layer-deadline-suppression: the per-node LOOP keeps `deadline`; the
+        // layer kernels get `None` only inside an explicitly scoped advisory
+        // caller. See `suppress_layer_deadline_scoped` for the soundness
+        // argument (a-priori gamma certificate, looser-or-equal, never tighter).
+        let layer_deadline = if self
+            .complete_clip_deadline_overrides
+            .layer_deadline_suppressed()
+        {
+            None
+        } else {
+            deadline
+        };
+        ensure_constrained_propagation_deadline(deadline, "before constrained forward bounds")?;
         let exec_order = graph.exec_order()?;
         let reusing_inherited_bounds = base_bounds.is_some();
 
@@ -205,8 +297,12 @@ impl BetaCrownVerifier {
                     .map(|(k, v)| (k.clone(), Arc::clone(v)))
                     .collect()
             } else {
-                graph
-                    .collect_node_bounds(input)?
+                let initial_bounds = if deadline.is_some() {
+                    graph.collect_node_bounds_with_engine_and_deadline(input, None, deadline)?
+                } else {
+                    graph.collect_node_bounds(input)?
+                };
+                initial_bounds
                     .into_iter()
                     .map(|(k, v)| (k, Arc::new(v)))
                     .collect()
@@ -301,6 +397,10 @@ impl BetaCrownVerifier {
 
         // Apply constraint tightening to bounds cache
         for node_name in exec_order {
+            ensure_constrained_propagation_deadline(
+                deadline,
+                &format!("before constrained forward node '{node_name}'"),
+            )?;
             // Reuse the inherited (parent) bound verbatim for nodes the split
             // provably cannot affect. The seed already lives in `bounds_cache`.
             if let Some(downstream) = &affected_downstream {
@@ -592,13 +692,47 @@ impl BetaCrownVerifier {
                             ))
                             })?
                     };
-                    node.layer.propagate_ibp(node_input).map_err(|e| {
-                        NyError::InternalError(format!(
-                            "Constraint forward: unary IBP failed at node '{}' ({}): {}",
-                            node_name,
-                            node.layer.layer_type(),
+                    let propagated = match &node.layer {
+                        // Constrained child bounds feed later ReLU phase decisions and
+                        // are intersected into the inherited sound enclosure. Plain
+                        // f32 Conv2d IBP can under-enclose under cancellation, so this
+                        // must retain the certified Higham/abssum widening as well as
+                        // the finite-deadline pollable route.
+                        // #layer-deadline-suppression: a finite LAYER deadline
+                        // routes Conv2d to the certified-f64 five-deep scalar loop
+                        // (IxDyn indexing, poll every 4096 taps) instead of im2col
+                        // + faer GEMM -- measured at ~91x on this model family.
+                        // `None` keeps a certificate: the sound IBP then uses the
+                        // f32 GEMM PLUS the |W|*max(|l|,|u|) abssum pass and the
+                        // gamma_{K+2}^{f32}*S_safe + 2u*|y| outward widening, i.e.
+                        // the a-priori certificate rather than the measured-f64
+                        // one. Sound and LOOSER-OR-EQUAL, never tighter.
+                        Layer::Conv2d(conv) => conv.propagate_ibp_sound_with_engine_and_deadline(
+                            node_input,
+                            None,
+                            layer_deadline,
+                        ),
+                        // N-D Linear IBP otherwise enters four opaque faer
+                        // products. The finite helper caps all geometry and
+                        // polls its direct f64 contractions.
+                        Layer::Linear(linear) => linear.propagate_ibp_with_engine_and_deadline(
+                            node_input,
+                            None,
+                            layer_deadline,
+                        ),
+                        _ => node.layer.propagate_ibp(node_input),
+                    };
+                    propagated.map_err(|e| {
+                        if e.is_deadline_exceeded() {
                             e
-                        ))
+                        } else {
+                            NyError::InternalError(format!(
+                                "Constraint forward: unary IBP failed at node '{}' ({}): {}",
+                                node_name,
+                                node.layer.layer_type(),
+                                e
+                            ))
+                        }
                     })?
                 };
                 // Per-element intersection of re-propagated bounds with original CROWN-IBP
@@ -624,6 +758,10 @@ impl BetaCrownVerifier {
             bounds_cache.insert(node_name.clone(), Arc::new(output_bounds));
         }
 
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "before publishing constrained forward bounds",
+        )?;
         Ok((bounds_cache, constrained_input))
     }
 
@@ -658,7 +796,7 @@ impl BetaCrownVerifier {
         delta_seeds: Option<&'d [String]>,
         full_seeds: &[String],
         exec_order: &[String],
-        base_bounds: Option<&std::collections::HashMap<String, Arc<BoundedTensor>>>,
+        base_bounds: Option<NodeBoundsView<'_>>,
     ) -> Option<&'d [String]> {
         let delta = delta_seeds?;
         let base = base_bounds?;
@@ -699,8 +837,28 @@ impl BetaCrownVerifier {
         beta_state: Option<&GraphBetaState>,
         objective: Option<&[f32]>,
     ) -> Result<DomainCrownResultWithIntermediates> {
+        let deadline = self.effective_graph_bab_deadline();
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "before constrained forward preparation",
+        )?;
         let (mut bounds_cache, constrained_input, exec_order) =
             self.prepare_constrained_graph_bounds(graph, input, context, beta_state, objective)?;
+        ensure_constrained_propagation_deadline(deadline, "before Complete Clip")?;
+        self.maybe_apply_complete_clip_root_bank(
+            graph,
+            context,
+            beta_state,
+            objective,
+            None,
+            &constrained_input,
+            &exec_order,
+            &mut bounds_cache,
+        );
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "after Complete Clip and before constrained backward preparation",
+        )?;
 
         // Build constraint lookups for backward pass (needed to identify constrained ReLUs
         // for intermediate A-matrix storage).
@@ -710,6 +868,7 @@ impl BetaCrownVerifier {
             graph,
         )?;
 
+        ensure_constrained_propagation_deadline(deadline, "before constrained backward dispatch")?;
         // Delegate to shared backward CROWN core (storing intermediates mode).
         let params = BackwardParams {
             graph,
@@ -721,8 +880,8 @@ impl BetaCrownVerifier {
             spec_matrix: None,
             seed_cache: None,
             capture_linear_bounds: false,
-            deadline: self.config.alpha_config.deadline, // #3795: thread BaB deadline
-            patches_policy: ConstrainedPatchesPolicy::selective_matrix_reentry(),
+            deadline, // #3795: thread BaB deadline
+            patches_policy: ConstrainedPatchesPolicy::for_engine(context.engine),
         };
         let result = self.backward_crown_constrained(
             &params,

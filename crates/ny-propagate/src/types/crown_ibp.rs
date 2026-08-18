@@ -39,30 +39,94 @@ pub enum CrownIbpFallbackReason {
     /// Node not in the demand-driven selection set; no downstream nonlinear consumer
     /// requires tightened bounds at this producer (#3775).
     DemandDrivenSkip,
+    /// Every demanded row consumed exclusively by ReLU successors is already
+    /// stable under forward IBP, so backward CROWN has no unstable relaxation
+    /// row to tighten.
+    ///
+    /// This is a structural, deterministic skip rather than a degradation or a
+    /// time-budget truncation: the stored forward bound is the intended sound
+    /// reference for the omitted rows. It must remain excluded from
+    /// time-truncation completeness checks and degradation warning summaries.
+    StableReluRowsSkipped,
+    /// Sparse ReLU rows existed, but none lay in the current objective's
+    /// backward influence cone. The collector retained sound IBP bounds because
+    /// no selected row can affect the published objective.
+    ///
+    /// Like `StableReluRowsSkipped`, this is a deterministic structural skip,
+    /// not a time/resource degradation. It is kept distinct so diagnostics do
+    /// not falsely claim that every demanded ReLU row was phase-stable.
+    ObjectiveConeRowsSkipped,
+    /// CROWN COMPLETED for this node and returned a VACUOUS relation: it lost
+    /// finiteness on ~every element the forward IBP pass had bounded, and
+    /// materially tightened ~none of them (#crown-honest-provenance).
+    ///
+    /// This is what used to be recorded as `BoundsProvenance::Crown`. Measured on
+    /// TinyYOLO / yolo_2023 (2026-07-29): four of eight demanded targets reported
+    /// `Crown` while having concretized to `[-inf, inf]`, which is why a 20x
+    /// per-node cap sweep and a 300 -> 900 s budget increase both left the root
+    /// bound BYTE-IDENTICAL. More budget bought more of a computation that was
+    /// returning nothing, and nothing in NY could see that.
+    ///
+    /// The STORED BOUND is unchanged by this tag (it is the same IBP-dominated
+    /// intersection); only the quality claim is corrected.
+    ///
+    /// DETERMINISTIC, not time-based: finiteness is a pure function of
+    /// (graph, input, options). This reason must therefore NOT be added to
+    /// `crown_ibp_result_is_complete`'s time-reason list -- a collection carrying
+    /// it is still complete and still cacheable.
+    CrownVacuousResult,
+    /// The collector REFUSED to start this target's backward walk because its
+    /// MACs-based cost estimate exceeded the node's per-node time share
+    /// (#cprime-admission).
+    ///
+    /// Estimate-then-refuse replaces start-then-burn: measured on
+    /// tinyimagenet (2026-08-02), Conv_17 burned 150.29 s of its share and
+    /// delivered zero completed backward steps before degrading to the same
+    /// IBP bound a refusal produces in ~0 s. Refusal never consumes the
+    /// share, so the unspent time rolls forward to later demanded targets
+    /// that fit — the opposite of the floor-inflation failure (floor100
+    /// smoke, −7905), which granted time instead of freeing it.
+    ///
+    /// TIME-CLASS, like `PerNodeDeadlineExceeded`: the decision depends on
+    /// the live share, so a re-run with more budget can admit the walk. It
+    /// therefore belongs in `crown_ibp_result_is_complete`'s time-reason
+    /// list and is a degradation (not a structural skip) in summaries.
+    WalkCostRefused,
+    /// A deadline-bounded objective-row collector completed at least zero but
+    /// fewer than all CROWN chunks. Fully completed rows were retained and
+    /// intersected with the certified forward box; every unfinished (and every
+    /// late in-flight) row remained exactly at that forward box.
+    ///
+    /// This is deliberately a fallback provenance, not `Crown`: the hybrid
+    /// bound is sound and can be tighter on completed rows, but the target
+    /// collection was truncated and must not acquire complete-cache or
+    /// proof-authority status. The associated fallback event records the exact
+    /// completed/total row counts.
+    ///
+    /// Kept at the end of this serialized enum so adding it does not renumber
+    /// any pre-existing variant in non-self-describing serde formats.
+    PartialCrownRowsDeadlineExceeded,
 }
 
-/// Preset-configurable overrides for the graph CROWN-IBP collector's per-node
+/// Preset-configurable overrides for CROWN-IBP collectors' per-node
 /// time-budget policy (#4413, #cgan-bn11-budget).
 ///
-/// The collector splits the remaining warmup deadline equally across the
-/// remaining tightening targets, clamps the share to a hard cap, and skips a
-/// node (sound IBP fallback) when its share falls below a floor. Both knobs
-/// were compile-time constants (`2.0 s` floor, `12.0 s` cap); benchmarks whose
-/// dominant node needs a long chunked backward (cgan_2023's 28,800-dim
-/// BatchNormalization_11: ~143 s measured for the full 7-node collection) can
-/// now raise the cap through their preset.
+/// The collector assigns a remaining-deadline share to each tightening target
+/// and skips a node (sound IBP fallback) when its share falls below a floor.
+/// An explicit cap clamps that share. Without one, the cap is adaptive: 25% of
+/// the remaining collection budget, clamped to 12–600 seconds. Explicit caps
+/// are dimension-scaled above the 28,800-row reference width.
 ///
-/// `None` fields keep the built-in constants — semantics are byte-identical
-/// when unset. Values must be finite and > 0; anything else is ignored in
-/// favor of the default (fail-closed to the historical policy).
+/// The historical `2.0 s` floor remains the default. Values must be finite and
+/// > 0; anything else is ignored in favor of the default policy.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct CrownIbpPerNodeTimeBudget {
     /// Minimum useful per-node share in seconds; below it the node is skipped
     /// to IBP. `None` = built-in `MIN_PER_NODE_BUDGET_SECS` (2.0).
     #[serde(default)]
     pub floor_secs: Option<f64>,
-    /// Hard cap on the equal-share per-node budget in seconds.
-    /// `None` = built-in `MAX_GLOBAL_PER_NODE_BUDGET_SECS` (12.0).
+    /// Explicit base cap on a per-node budget in seconds. `None` selects the
+    /// adaptive remaining-budget cap described above.
     #[serde(default)]
     pub cap_secs: Option<f64>,
 }
@@ -75,7 +139,12 @@ pub struct CrownIbpPerNodeTimeBudget {
 pub enum BoundsProvenance {
     /// Bound was produced by CROWN (or CROWN∩IBP) without fallback substitution.
     Crown,
-    /// Bound was substituted with forward bounds due to a CROWN fallback condition.
+    /// Bound remains fallback-grade due to a CROWN fallback condition.
+    ///
+    /// Usually this is the forward bound exactly. The
+    /// `PartialCrownRowsDeadlineExceeded` case may retain fully completed CROWN
+    /// rows after intersecting them with the forward bound, but it intentionally
+    /// remains in this arm because the target collection did not complete.
     ForwardFallback(CrownIbpFallbackReason),
 }
 
@@ -196,5 +265,34 @@ impl GraphCrownIbpBoundsResult {
     /// Provenance tag for a specific node.
     pub fn provenance_for_node(&self, node_name: &str) -> Option<BoundsProvenance> {
         self.provenance.get(node_name).copied()
+    }
+
+    /// Whether every target requested by the collector completed its CROWN
+    /// computation.
+    ///
+    /// Structural omissions are not requested work: demand-pruned nodes,
+    /// already-stable ReLU rows, and rows outside the objective cone are
+    /// intentionally left at their certified forward bounds. A vacuous CROWN
+    /// result also completed (it simply failed to improve that bound). Every
+    /// other fallback means some requested target was not completed and must
+    /// keep an explicit partial status even though the returned map is sound.
+    pub fn all_requested_crown_targets_completed(&self) -> bool {
+        fn reason_is_completed_or_structural(reason: CrownIbpFallbackReason) -> bool {
+            matches!(
+                reason,
+                CrownIbpFallbackReason::DemandDrivenSkip
+                    | CrownIbpFallbackReason::StableReluRowsSkipped
+                    | CrownIbpFallbackReason::ObjectiveConeRowsSkipped
+                    | CrownIbpFallbackReason::CrownVacuousResult
+            )
+        }
+
+        self.provenance.values().all(|provenance| match provenance {
+            BoundsProvenance::Crown => true,
+            BoundsProvenance::ForwardFallback(reason) => reason_is_completed_or_structural(*reason),
+        }) && self
+            .fallback_events
+            .iter()
+            .all(|event| reason_is_completed_or_structural(event.reason))
     }
 }

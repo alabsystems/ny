@@ -50,6 +50,7 @@ use ny_propagate::{GraphNetwork, PgdConfig, PgdStepState, PointVjpWavePlan};
 use ny_tensor::BoundedTensor;
 use std::time::Instant;
 
+use super::attack_stall::AttackStallPolicy;
 use super::graph_pgd::{
     best_clause_bottleneck_margin, best_disjunctive_target, emit_graph_pgd_status,
     ranked_disjunctive_targets, GraphDisjunctiveAttackOutcome, GraphPgdTarget,
@@ -79,6 +80,11 @@ fn vjp_batch_width() -> usize {
 /// (candidate, margin telemetry, budget accounting) and reports whether the
 /// batched lane completed or the sequential loop should run. Returns
 /// `FallbackToSequential` (never `Err`) on any capability miss.
+///
+/// `stall` (#attack-stall) is the adaptive cutoff policy for this phase;
+/// [`AttackStallPolicy::disabled`] (the default) keeps the lane byte-identical
+/// to before the cutoff existed.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     graph: &GraphNetwork,
     input: &BoundedTensor,
@@ -86,10 +92,17 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     pgd_config: &PgdConfig,
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
+    stall: AttackStallPolicy,
     outcome: &mut GraphDisjunctiveAttackOutcome,
 ) -> Result<DisjVjpBatchedOutcome> {
     use DisjVjpBatchedOutcome::{Completed, FallbackToSequential};
 
+    // A deferred/zero slice must not pay the potentially large exact-VJP plan
+    // construction cost before discovering that no attack time exists.
+    if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
+        outcome.hit_deadline = true;
+        return Ok(Completed);
+    }
     if std::env::var("NY_PGD_VJP_BATCH").ok().as_deref() == Some("0") {
         return Ok(FallbackToSequential);
     }
@@ -111,6 +124,9 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
 
     let diag = std::env::var("NY_PGD_DIAG").ok().as_deref() == Some("1");
     let attack_start = Instant::now();
+    // #attack-stall: probe window sized from THIS phase's own slice
+    // (deadline - attack_start), so the policy carries no absolute constant.
+    let mut stall_monitor = stall.monitor(attack_start, pgd_config.deadline);
     let deadline_hit = || pgd_config.deadline.is_some_and(|d| Instant::now() >= d);
     let total_restarts = pgd_config.num_restarts.max(1);
     let width = vjp_batch_width();
@@ -131,6 +147,17 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
         let clean_out = evaluate_graph(graph, &clean_point, gemm_engine)?;
         if let Some(m) = best_clause_bottleneck_margin(&clean_out, clauses) {
             outcome.best_margin = outcome.best_margin.max(m);
+            // #attack-stall: anchor the first probe window at the clean point —
+            // the start of the ascent. This first observation can never cut (no
+            // window has elapsed yet); it only fixes the baseline the window is
+            // judged against. `is_armed()` keeps the unarmed path free.
+            if stall_monitor.is_armed() {
+                stall_monitor.observe(
+                    m,
+                    super::disjunctive_pgd::noise_scaled_margin(&clean_out),
+                    attack_start,
+                );
+            }
         }
         if satisfied(&clean_out) {
             // The clean image itself violates the property.
@@ -232,11 +259,38 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
 
             // Candidate screen + per-restart BEST-DISJUNCT spec rows.
             let mut spec_rows: Vec<f32> = Vec::with_capacity(k * plan.output_dim());
+            // One clock read for the whole wave-step: every lane's margin is
+            // observed at the same instant, which is what the running max means.
+            // `None` when the cutoff is unarmed — the default path does not
+            // even read the clock here.
+            let step_now = stall_monitor.is_armed().then(Instant::now);
             for kk in 0..k {
                 let out_arr =
                     ArrayD::from_shape_vec(IxDyn(&[plan.output_dim()]), outputs[kk].clone())?;
                 if let Some(m) = best_clause_bottleneck_margin(&out_arr, clauses) {
                     outcome.best_margin = outcome.best_margin.max(m);
+                    // #attack-stall: a full probe window in which the running
+                    // max did not rise past the confirmation noise floor ⇒ the
+                    // ascent has plateaued across every lane in flight. Stop
+                    // GENERATING candidates; the caller sees the same "no
+                    // counterexample" it sees from a finished attack, and BaB
+                    // re-bases on the reclaimed remaining budget.
+                    if let Some(now) = step_now {
+                        if stall_monitor.observe(
+                            m,
+                            super::disjunctive_pgd::noise_scaled_margin(&out_arr),
+                            now,
+                        ) {
+                            outcome.stalled_out = true;
+                            super::attack_stall::report_stall_cut(
+                                json,
+                                diag,
+                                format_args!("wave {restart_base} step {step} lane {kk}"),
+                                stall_monitor.best_margin(),
+                            );
+                            return Ok(Completed);
+                        }
+                    }
                 }
                 if satisfied(&out_arr) {
                     // #batched-vjp-resnet screen hardening: the TEMPLATE forward
@@ -377,11 +431,32 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
         // Post-wave final check at the last points (one more batched forward).
         let points: Vec<Vec<f32>> = xs.iter().map(|x| x.iter().copied().collect()).collect();
         if let Ok((_m, outputs)) = plan.forward_masks(&points) {
+            let wave_end = stall_monitor.is_armed().then(Instant::now);
             for kk in 0..k {
                 let out_arr =
                     ArrayD::from_shape_vec(IxDyn(&[plan.output_dim()]), outputs[kk].clone())?;
                 if let Some(m) = best_clause_bottleneck_margin(&out_arr, clauses) {
                     outcome.best_margin = outcome.best_margin.max(m);
+                    // #attack-stall: these points count too — the monitor's
+                    // running max must see every point `outcome.best_margin`
+                    // sees, or a missed improvement would make a cut MORE
+                    // likely than the evidence supports.
+                    if let Some(now) = wave_end {
+                        if stall_monitor.observe(
+                            m,
+                            super::disjunctive_pgd::noise_scaled_margin(&out_arr),
+                            now,
+                        ) {
+                            outcome.stalled_out = true;
+                            super::attack_stall::report_stall_cut(
+                                json,
+                                diag,
+                                format_args!("wave {restart_base} final check"),
+                                stall_monitor.best_margin(),
+                            );
+                            return Ok(Completed);
+                        }
+                    }
                 }
                 if satisfied(&out_arr) {
                     // Same exact-forward re-screen as the in-loop candidate path
@@ -435,4 +510,32 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
         ),
     );
     Ok(Completed)
+}
+
+fn exact_vjp_slice_expired(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|limit| now >= limit)
+}
+
+#[cfg(test)]
+mod deadline_admission_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn expired_or_zero_slice_is_rejected_before_plan_construction() {
+        let now = Instant::now();
+        assert!(exact_vjp_slice_expired(Some(now), now));
+        assert!(exact_vjp_slice_expired(
+            Some(
+                now.checked_sub(Duration::from_nanos(1))
+                    .expect("an Instant one nanosecond earlier must be representable"),
+            ),
+            now
+        ));
+        assert!(!exact_vjp_slice_expired(None, now));
+        assert!(!exact_vjp_slice_expired(
+            Some(now + Duration::from_secs(1)),
+            now
+        ));
+    }
 }

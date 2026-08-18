@@ -152,13 +152,24 @@ impl DivLayer {
 
             let (out_lower, out_upper) =
                 div_bounds_elementwise(&a_lower, &a_upper, &b_lower, &b_upper);
-            return BoundedTensor::new(out_lower, out_upper);
+            // OpaqueSkip taint (#opaque-skip-six-sites): see the same-shape
+            // path below for why clean ±Inf can flow but NaN stays a hard error.
+            return BoundedTensor::new_allow_infinite(out_lower, out_upper);
         };
 
         validate_positive_divisor_bounds(&b_lower, &b_upper)?;
 
         let (out_lower, out_upper) = div_bounds_elementwise(&a_lower, &a_upper, &b_lower, &b_upper);
-        BoundedTensor::new(out_lower, out_upper)
+        // OpaqueSkip taint (#opaque-skip-six-sites): an upstream OpaqueSkip
+        // legitimately emits ±Inf endpoints on the NUMERATOR. The divisor is
+        // hard-validated finite and strictly positive above (a ±Inf-tainted
+        // divisor errors there with InvalidSpec, which graph IBP's tainted-node
+        // path degrades to [-inf, +inf]), so the NaN-producing quotient
+        // patterns (inf/inf, x/0) are unreachable in `div_bounds_elementwise`:
+        // ±inf / finite-positive is clean ±Inf. A NaN here therefore implies a
+        // NaN INPUT — a real bug — which `new_allow_infinite` still rejects as
+        // a hard error.
+        BoundedTensor::new_allow_infinite(out_lower, out_upper)
     }
 
     /// CROWN backward propagation for Div is not implemented.
@@ -351,5 +362,61 @@ mod tests {
             .propagate_linear_binary(&bounds)
             .expect_err("div CROWN not implemented");
         assert!(matches!(err, NyError::UnsupportedOp(_)));
+    }
+
+    // ── OpaqueSkip taint probes (#opaque-skip-six-sites) ──────────────
+
+    /// A ±Inf NUMERATOR (upstream OpaqueSkip) over a validated finite positive
+    /// divisor must propagate as widened bounds, not abort with
+    /// NumericalInstability.
+    #[test]
+    fn test_ibp_opaque_skip_inf_numerator_flows() {
+        let layer = DivLayer;
+        let a = BoundedTensor::new_allow_infinite(
+            ArrayD::from_elem(IxDyn(&[2]), f32::NEG_INFINITY),
+            ArrayD::from_elem(IxDyn(&[2]), f32::INFINITY),
+        )
+        .unwrap();
+        let b = make_bt(&[1.0, 2.0], &[2.0, 4.0]);
+        let result = layer
+            .propagate_ibp_binary(&a, &b)
+            .expect("±inf numerator must propagate");
+        assert_eq!(result.lower()[0], f32::NEG_INFINITY);
+        assert_eq!(result.upper()[1], f32::INFINITY);
+    }
+
+    /// NaN numerator (a real bug, not OpaqueSkip taint) must still hard-error:
+    /// `new_allow_infinite` rejects NaN.
+    #[test]
+    fn test_ibp_nan_numerator_still_errors() {
+        let layer = DivLayer;
+        let a = BoundedTensor::new_unchecked(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NAN]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.0]).unwrap(),
+        )
+        .unwrap();
+        let b = make_bt(&[1.0], &[2.0]);
+        assert!(
+            layer.propagate_ibp_binary(&a, &b).is_err(),
+            "NaN numerator must remain a hard error"
+        );
+    }
+
+    /// A ±Inf-tainted DIVISOR still errors at the divisor gate (InvalidSpec,
+    /// which the tainted-node graph-IBP path degrades) — the inf/inf NaN
+    /// pattern never reaches the interval arithmetic.
+    #[test]
+    fn test_ibp_inf_divisor_still_rejected() {
+        let layer = DivLayer;
+        let a = make_bt(&[1.0], &[2.0]);
+        let b = BoundedTensor::new_allow_infinite(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NEG_INFINITY]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::INFINITY]).unwrap(),
+        )
+        .unwrap();
+        let err = layer
+            .propagate_ibp_binary(&a, &b)
+            .expect_err("non-finite divisor must still be rejected");
+        assert!(matches!(err, NyError::InvalidSpec(_)));
     }
 }

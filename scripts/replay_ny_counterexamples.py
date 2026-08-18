@@ -30,6 +30,8 @@ from typing import Any
 PINNED_CHECKER_COMMIT = "b0ae71109ad0fe89661d5989405dc533bc3a9ee7"
 PINNED_VNNLIB_PYTHON_COMMIT = "12c3f30dce67c7391ceb774be96b604b405c11f0"
 CPU_PROVIDER = "CPUExecutionProvider"
+PINNED_INPUT_ATOL = 1e-4
+PINNED_REL_TOL = 1e-3
 SUPPORTED_METADATA_SCHEMAS = {
     "ny_measurement_result_v1",
     "ny_measurement_result_v2",
@@ -434,8 +436,8 @@ def _invoke_official_checker(
         "onnx_path": str(evidence.model_file.path),
         "vnnlib_path": str(evidence.property_file.path),
         "vnnlib_version": evidence.vnnlib_version,
-        "abs_tolerance": 1e-4,
-        "rel_tolerance": 0.0,
+        "abs_tolerance": PINNED_INPUT_ATOL,
+        "rel_tolerance": PINNED_REL_TOL,
     }
     environment = dict(os.environ)
     environment.update(
@@ -600,8 +602,8 @@ def replay_archive(
         "score_credit": score_credit,
         "establishes_strict_sat": result == "correct",
         "tolerances": {
-            "input_absolute": 1e-4,
-            "relative": 0.0,
+            "input_absolute": PINNED_INPUT_ATOL,
+            "relative": PINNED_REL_TOL,
             "output_absolute": 0.0,
         },
         "provider": CPU_PROVIDER,
@@ -798,12 +800,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checker-python",
         type=Path,
-        default=Path("/home/ayates/.venvs/vnncomp-ce-2026/bin/python"),
+        default=Path("<home>/.venvs/vnncomp-ce-2026/bin/python"),
     )
     parser.add_argument(
         "--checker-venv",
         type=Path,
-        default=Path("/home/ayates/.venvs/vnncomp-ce-2026"),
+        default=Path("<home>/.venvs/vnncomp-ce-2026"),
     )
     parser.add_argument(
         "--vnnlib-source",

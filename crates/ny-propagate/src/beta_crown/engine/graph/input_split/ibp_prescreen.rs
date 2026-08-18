@@ -237,15 +237,20 @@ pub(super) fn validate_prescreen_layout(
 }
 
 fn conjunctive_multi_obj_verified(obj_bounds: &[(f32, f32)], thresholds: &[f32]) -> bool {
+    if obj_bounds.is_empty() || obj_bounds.len() != thresholds.len() {
+        return false;
+    }
     obj_bounds
         .iter()
         .zip(thresholds.iter())
-        .any(|((lower, _upper), &threshold)| lower.is_finite() && *lower > threshold)
+        .any(|(&(lower, upper), &threshold)| {
+            super::grouped_semantics::objective_interval_verified(lower, upper, threshold)
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use ndarray::{arr1, arr2};
+    use ndarray::{arr1, arr2, ArrayD, IxDyn};
     use ny_test_utils::CountingGemmEngine;
 
     use super::*;
@@ -254,7 +259,7 @@ mod tests {
         extract_obj_bounds, graph_spec_ibp_fallback,
     };
     use crate::beta_crown::engine::tensor_ext::BoundedTensorExt;
-    use crate::layers::{Layer, LinearLayer, ReLULayer};
+    use crate::layers::{BatchNormLayer, Layer, LinearLayer, ReLULayer};
     use crate::{GraphNetwork, GraphNode};
 
     fn build_prescreen_graph_4353() -> GraphNetwork {
@@ -281,6 +286,157 @@ mod tests {
         ));
         graph.set_output("linear2");
         graph
+    }
+
+    /// Diagnostic-only necessary-condition oracle for removing an operator from
+    /// `is_input_split_batch_stack_safe`'s deny-list.
+    ///
+    /// It deliberately bypasses the production guard, propagates all child boxes
+    /// once with a fresh leading domain axis, and compares every node/domain slice
+    /// with the ordinary per-domain propagation.  A stacked bound may be wider,
+    /// but it must never under-cover the sound per-domain baseline.  Shape drift
+    /// and either direction of under-coverage are reported with node/domain
+    /// provenance.
+    ///
+    /// Passing this oracle does NOT authorize relaxed clipping (or any verdict):
+    /// it is only the smallest falsifier for the axis-transparency premise.  The
+    /// existing production guard remains authoritative until the full CGAN
+    /// parent-plane/re-bound proof obligations are separately discharged.
+    fn batch_stack_enclosure_oracle(
+        graph: &GraphNetwork,
+        child_inputs: &[&BoundedTensor],
+    ) -> Result<Vec<String>> {
+        let stacked_input = stack_child_input_refs(child_inputs)?;
+        let stacked_bounds = graph.collect_node_bounds(&stacked_input)?;
+        let per_domain_bounds: Vec<_> = child_inputs
+            .iter()
+            .map(|child| graph.collect_node_bounds(child))
+            .collect::<Result<_>>()?;
+        let mut failures = Vec::new();
+
+        for node_name in graph.exec_order()? {
+            let stacked = stacked_bounds.get(node_name).ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                    "batch-stack oracle: missing stacked node {node_name}"
+                ))
+            })?;
+            if stacked.shape().first().copied() != Some(child_inputs.len()) {
+                failures.push(format!(
+                    "{node_name}: stacked shape {:?} has no leading domain axis of size {}",
+                    stacked.shape(),
+                    child_inputs.len()
+                ));
+                continue;
+            }
+
+            for (domain_idx, domain_bounds) in per_domain_bounds.iter().enumerate() {
+                let per_domain = domain_bounds.get(node_name).ok_or_else(|| {
+                    NyError::InvalidSpec(format!(
+                        "batch-stack oracle: missing node {node_name} in domain {domain_idx}"
+                    ))
+                })?;
+                let stacked_lower = stacked.lower().index_axis(Axis(0), domain_idx);
+                let stacked_upper = stacked.upper().index_axis(Axis(0), domain_idx);
+                if stacked_lower.shape() != per_domain.shape() {
+                    failures.push(format!(
+                        "{node_name} domain {domain_idx}: stacked slice shape {:?} != per-domain shape {:?}",
+                        stacked_lower.shape(),
+                        per_domain.shape()
+                    ));
+                    continue;
+                }
+
+                for (flat_idx, (((&stacked_l, &stacked_u), &domain_l), &domain_u)) in stacked_lower
+                    .iter()
+                    .zip(stacked_upper.iter())
+                    .zip(per_domain.lower().iter())
+                    .zip(per_domain.upper().iter())
+                    .enumerate()
+                {
+                    if stacked_l > domain_l {
+                        failures.push(format!(
+                            "{node_name} domain {domain_idx} flat {flat_idx}: lower undercoverage \
+                             stacked={stacked_l} > per-domain={domain_l}"
+                        ));
+                        break;
+                    }
+                    if stacked_u < domain_u {
+                        failures.push(format!(
+                            "{node_name} domain {domain_idx} flat {flat_idx}: upper undercoverage \
+                             stacked={stacked_u} < per-domain={domain_u}"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(failures)
+    }
+
+    fn batch_norm_only_graph() -> GraphNetwork {
+        let bn = BatchNormLayer::from_scale_bias(
+            arr1(&[1.0_f32, 10.0]).into_dyn(),
+            arr1(&[0.0_f32, 0.0]).into_dyn(),
+        )
+        .expect("valid BatchNorm");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("bn", Layer::BatchNorm(bn)));
+        graph.set_output("bn");
+        graph
+    }
+
+    #[test]
+    fn test_batch_stack_oracle_accepts_cgan_rank3_chw_to_rank4_nchw_batchnorm() {
+        // CGAN's surviving BatchNorm nodes consume squeezed [C,H,W] tensors.
+        // Stacking N domains produces unambiguous rank-4 [N,C,H,W], whose
+        // shape-aware BatchNorm path must match independent [C,H,W] runs even
+        // at the adversarial N == C extent collision.
+        let graph = batch_norm_only_graph();
+        let child = |offset: f32| {
+            let lower = ArrayD::from_shape_vec(
+                IxDyn(&[2, 2, 3]),
+                (0..12).map(|idx| offset + idx as f32 / 8.0).collect(),
+            )
+            .expect("valid lower");
+            let upper = lower.mapv(|value| value + 0.25);
+            BoundedTensor::new(lower, upper).expect("valid child")
+        };
+        let child_a = child(-1.0);
+        let child_b = child(2.0);
+
+        let failures = batch_stack_enclosure_oracle(&graph, &[&child_a, &child_b])
+            .expect("oracle should execute");
+        assert!(
+            failures.is_empty(),
+            "rank3 CHW -> rank4 NCHW BatchNorm stacking under-covered: {failures:#?}"
+        );
+        assert!(
+            !graph.is_input_split_batch_stack_safe(),
+            "a passing necessary-condition oracle must not lift the production guard"
+        );
+    }
+
+    #[test]
+    fn test_batch_stack_oracle_falsifies_ambiguous_rank2_cl_to_rank3_ncl_batchnorm() {
+        // A squeezed rank-2 [C,L] tensor becomes rank-3 [N,C,L].  When N == C,
+        // rank-3 shape alone is ambiguous and the current squeezed-layout rule
+        // chooses axis 0, scaling per DOMAIN instead of per channel.  Keep this
+        // negative witness: it proves a blanket BatchNorm allow-list would be
+        // unsound even though CGAN's rank3->rank4 shape is transparent.
+        let graph = batch_norm_only_graph();
+        let point = ArrayD::from_elem(IxDyn(&[2, 3]), 1.0_f32);
+        let child_a = BoundedTensor::new(point.clone(), point.clone()).expect("valid child_a");
+        let child_b = BoundedTensor::new(point.clone(), point).expect("valid child_b");
+
+        let failures = batch_stack_enclosure_oracle(&graph, &[&child_a, &child_b])
+            .expect("oracle should execute");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("bn domain 0")
+                    && failure.contains("upper undercoverage")),
+            "oracle did not expose N==C rank-3 BatchNorm axis ambiguity: {failures:#?}"
+        );
     }
 
     #[test]

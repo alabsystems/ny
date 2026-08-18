@@ -517,7 +517,7 @@ fn test_layernorm_ibp_rejects_nonfinite_input() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_layernorm_forward_mode_fallback_on_center_overflow() {
+fn test_layernorm_forward_mode_large_finite_point_avoids_center_overflow() {
     let hidden = 4;
     let ln = LayerNormLayer::new_default(hidden, 1e-5)
         .unwrap()
@@ -528,23 +528,32 @@ fn test_layernorm_forward_mode_fallback_on_center_overflow() {
     let input = BoundedTensor::new(lower, upper).unwrap();
 
     let out = ln.propagate_ibp(&input).unwrap();
+    let evaluated = ln
+        .eval(&Array1::from_elem(hidden, f32::MAX))
+        .expect("large finite point evaluation");
     assert!(
         out.lower()
             .iter()
             .chain(out.upper().iter())
             .all(|&v| v.is_finite()),
-        "fallback output should be finite, got lower={:?} upper={:?}",
+        "output should be finite, got lower={:?} upper={:?}",
         out.lower(),
         out.upper()
     );
-
-    let expected = ((hidden as f32) - 1.0).sqrt();
-    for &v in out.lower().iter() {
-        assert!((v + expected).abs() < 1e-6);
+    for i in 0..hidden {
+        assert!(
+            out.lower()[[0, i]] <= evaluated[i] && evaluated[i] <= out.upper()[[0, i]],
+            "dim {i}: [{}, {}] excludes {}",
+            out.lower()[[0, i]],
+            out.upper()[[0, i]],
+            evaluated[i]
+        );
     }
-    for &v in out.upper().iter() {
-        assert!((v - expected).abs() < 1e-6);
-    }
+    assert!(
+        out.max_width() < 1e-3,
+        "a point interval should avoid the old overflow fallback: width={}",
+        out.max_width()
+    );
 }
 
 #[ntest::timeout(10000)]

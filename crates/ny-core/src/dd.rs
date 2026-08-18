@@ -310,14 +310,15 @@ pub fn gamma_n_at(n: usize, u: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn next_up_f64(x: f64) -> f64 {
-    if x.is_nan() || x.is_infinite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    let bits = x.to_bits();
-    if x.is_sign_positive() {
+    if bits & 0x8000_0000_0000_0000 == 0 {
         f64::from_bits(bits + 1)
     } else {
         f64::from_bits(bits - 1)
@@ -328,14 +329,15 @@ pub fn next_up_f64(x: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn next_down_f64(x: f64) -> f64 {
-    if x.is_nan() || x.is_infinite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(0x8000_0000_0000_0001);
     }
-    let bits = x.to_bits();
-    if x.is_sign_positive() {
+    if bits & 0x8000_0000_0000_0000 == 0 {
         f64::from_bits(bits - 1)
     } else {
         f64::from_bits(bits + 1)
@@ -497,5 +499,11 @@ mod tests {
         assert!(next_up_f64(0.0) > 0.0);
         assert!(next_down_f64(0.0) < 0.0);
         assert!(next_up_f64(f64::INFINITY).is_infinite());
+        let positive = f64::from_bits(7);
+        let negative = f64::from_bits(0x8000_0000_0000_0007);
+        assert_eq!(next_up_f64(positive).to_bits(), 8);
+        assert_eq!(next_down_f64(positive).to_bits(), 6);
+        assert_eq!(next_up_f64(negative).to_bits(), 0x8000_0000_0000_0006);
+        assert_eq!(next_down_f64(negative).to_bits(), 0x8000_0000_0000_0008);
     }
 }

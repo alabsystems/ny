@@ -12,7 +12,7 @@ set -uo pipefail
 
 # This runbook deliberately builds and executes long-lived GPU jobs. Re-enter
 # it through the installed host guard before touching Cargo or CUDA so every
-# invocation gets the 80-GiB address-space ceiling, host OOM backstop, lazy CUDA
+# invocation gets the 160-GiB address-space ceiling, host OOM backstop, lazy CUDA
 # loading, bounded build/test parallelism, and the cross-agent GPU lock. The
 # marker requests one re-entry, but is never accepted as proof of containment.
 # The child must independently observe the exact validated RLIMIT_AS and the
@@ -22,15 +22,17 @@ if ! command -v ny-safe-gpu-run >/dev/null 2>&1; then
   echo "ERROR: ny-safe-gpu-run is required for M7 validation; refusing an unguarded GPU run." >&2
   exit 2
 fi
-current_vmem_kib="$(ulimit -v)"
+current_vmem_soft_kib="$(builtin ulimit -Sv)"
+current_vmem_hard_kib="$(builtin ulimit -Hv)"
 guard_attested=0
-if [ "${current_vmem_kib}" = "83886080" ] \
+if [ "${current_vmem_soft_kib}" = "167772160" ] \
+  && [ "${current_vmem_hard_kib}" = "167772160" ] \
   && grep -q '/ny-build.slice/' /proc/self/cgroup 2>/dev/null; then
   guard_attested=1
 fi
 if [ "${guard_attested}" != "1" ]; then
   if [ "${NY_M7_SAFE_GPU_WRAPPED:-0}" = "1" ]; then
-    echo "ERROR: NY_M7_SAFE_GPU_WRAPPED was set without the required 80-GiB/slice attestation." >&2
+    echo "ERROR: NY_M7_SAFE_GPU_WRAPPED was set without the required 160-GiB/slice attestation." >&2
     exit 2
   fi
   export NY_M7_SAFE_GPU_WRAPPED=1
@@ -46,7 +48,12 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=1; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 say "1. PREFLIGHT — CUDA present"
-if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; ok "nvidia-smi"; else bad "nvidia-smi absent — not a CUDA host"; fi
+if command -v nvidia-smi >/dev/null 2>&1 \
+  && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; then
+  ok "nvidia-smi"
+else
+  echo "  nvidia-smi unavailable or NVML failed; deferring to the Driver API device tests"
+fi
 shopt -s nullglob
 cublas_candidates=(
   /usr/lib/*-linux-gnu/libcublas.so*
@@ -73,17 +80,24 @@ else
   bad "build failed"
   exit 1
 fi
-# The device-gated #[test]s in ny-cuda/src/lib.rs self-skip on non-CUDA and go
-# live here: engine construct, gemm f32/f64 vs CPU, layout, math-mode pin, ATS.
-# NOTE (fixed on-device, GB10 2026-07-21): the `cuda` feature lives on ny-cli
-# (`cuda = ["dep:ny-cuda"]`); the ny-cuda crate itself has no such feature, so
-# `--features cuda` here made cargo abort before a single test ran.
-cargo test --release -p ny-cuda -- --nocapture 2>&1 | tee /tmp/m7_devtests.log | grep -E "test result|device|SKIP|FAILED"
+# `ny-cuda` no longer has an ignored hardware tier. Its explicit admission
+# seam hard-fails when this selected NVIDIA validation host cannot qualify, so
+# one Cargo invocation covers both hermetic contracts and live device probes.
+# The `cuda` feature lives on ny-cli (`cuda = ["dep:ny-cuda"]`); the ny-cuda
+# crate itself intentionally has no feature by that name.
+cargo test --locked --release -p ny-cuda -- --nocapture \
+  2>&1 | tee /tmp/m7_devtests.log | grep -E "test result|device|FAILED"
 device_test_status="${PIPESTATUS[0]}"
-if [ "${device_test_status}" -eq 0 ] && grep -q "test result: ok" /tmp/m7_devtests.log; then
-  ok "ny-cuda device tests"
-else
+if [ "${device_test_status}" -ne 0 ] || ! grep -q "test result: ok" /tmp/m7_devtests.log; then
   bad "ny-cuda device tests did not all pass (cargo status ${device_test_status})"
+elif ! grep -q "Sgemm+Dgemm known-answer probes BIT-EXACT" /tmp/m7_devtests.log; then
+  bad "ny-cuda device tests did not exercise the on-device IEEE known-answer path"
+elif ! grep -Eq \
+  'host_ptr_zero_copy = true \(pageable path EXERCISED\)|deadline_f64_transport=explicit-device-copy \(device-copy path EXERCISED\)' \
+  /tmp/m7_devtests.log; then
+  bad "ny-cuda device tests did not exercise the f64 GEMM device path"
+else
+  ok "ny-cuda device tests (IEEE known-answer + f64 GEMM path exercised)"
 fi
 
 BIN="$REPO/target/release/ny"
@@ -102,7 +116,7 @@ CORPUS=$(
     awk -F, -v c="$cat" 'NR>1 && ($5=="unsat"||$5=="sat"){print c","$2","$3","$5}' "reports/measured/$cat.csv" 2>/dev/null | head -8
   done
 )
-NCHK=0; NFLIP=0
+NCHK=0; NFLIP=0; NINCONCLUSIVE=0
 while IFS=, read -r cat onnx vn truth; do
   [ -z "${cat:-}" ] && continue
   o="$BM/$cat/$onnx"; v="$BM/$cat/$vn"
@@ -112,11 +126,19 @@ while IFS=, read -r cat onnx vn truth; do
   NY_NO_CUDA=1 OMP_NUM_THREADS=1 "$BIN" vnncomp v1 "$cat" "$o" "$v" /tmp/cpu.txt "$bud" >/dev/null 2>&1; vcpu=$(head -1 /tmp/cpu.txt 2>/dev/null)
   OMP_NUM_THREADS=1          "$BIN" vnncomp v1 "$cat" "$o" "$v" /tmp/m7.txt  "$bud" >/dev/null 2>&1; vm7=$(head -1 /tmp/m7.txt 2>/dev/null)
   NCHK=$((NCHK+1))
-  if { [ "$vm7" = sat ] || [ "$vm7" = unsat ]; } && [ "$vm7" != "$truth" ]; then bad "MOAT VIOLATION $cat/$(basename "$vn"): M7=$vm7 truth=$truth"; NFLIP=$((NFLIP+1))
-  elif { [ "$vcpu" = sat ] || [ "$vcpu" = unsat ]; } && [ "$vm7" != "$vcpu" ] && { [ "$vm7" = sat ] || [ "$vm7" = unsat ]; }; then bad "M7/CPU DISAGREE $cat/$(basename "$vn"): M7=$vm7 CPU=$vcpu"; NFLIP=$((NFLIP+1))
+  if ! { [ "$vm7" = sat ] || [ "$vm7" = unsat ]; } \
+    || ! { [ "$vcpu" = sat ] || [ "$vcpu" = unsat ]; }; then
+    bad "MOAT INCONCLUSIVE $cat/$(basename "$vn"): M7=$vm7 CPU=$vcpu truth=$truth"
+    NINCONCLUSIVE=$((NINCONCLUSIVE+1))
+  elif [ "$vm7" != "$truth" ]; then bad "MOAT VIOLATION $cat/$(basename "$vn"): M7=$vm7 truth=$truth"; NFLIP=$((NFLIP+1))
+  elif [ "$vm7" != "$vcpu" ]; then bad "M7/CPU DISAGREE $cat/$(basename "$vn"): M7=$vm7 CPU=$vcpu"; NFLIP=$((NFLIP+1))
   else printf '  ok  %s/%s  M7=%s CPU=%s truth=%s\n' "$cat" "$(basename "$vn")" "$vm7" "$vcpu" "$truth"; fi
 done <<< "$CORPUS"
-if [ "$NFLIP" -eq 0 ] && [ "$NCHK" -gt 0 ]; then ok "MOAT firewall: $NCHK rows, 0 flips/violations"; else bad "MOAT firewall: $NFLIP violations in $NCHK rows"; fi
+if [ "$NFLIP" -eq 0 ] && [ "$NINCONCLUSIVE" -eq 0 ] && [ "$NCHK" -gt 0 ]; then
+  ok "MOAT firewall: $NCHK decided rows, 0 flips/violations"
+else
+  bad "MOAT firewall: $NFLIP violations, $NINCONCLUSIVE inconclusive in $NCHK rows"
+fi
 
 if [ "$FAIL" -ne 0 ]; then
   say "ABORT — a gate failed. M7 must NOT be enabled in a verdict-emitting binary."

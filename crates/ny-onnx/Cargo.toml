@@ -8,6 +8,24 @@ repository.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 
+[[example]]
+name = "cut_fold_cifar100_resident"
+required-features = ["wgpu"]
+
+[[example]]
+name = "vit-zero-width-node-bisect"
+path = "examples/vit_zero_width_node_bisect.rs"
+required-features = ["external-vnncomp"]
+test = false
+
+[[test]]
+name = "cctsdb_cast_admission_loads"
+required-features = ["external-vnncomp"]
+
+[[test]]
+name = "ml4acopf_literal_cone_loads"
+required-features = ["external-vnncomp"]
+
 [lints]
 workspace = true
 
@@ -17,6 +35,21 @@ onnx-value-info = []
 benchmarks = []
 ort = ["dep:ort"]
 wgpu = ["ny-gpu/wgpu"]
+# Real exported models, competition corpora, and accelerator hardware are
+# conformance inputs rather than unit-test fixtures.  Their tests are
+# registered only when the corresponding lane is selected explicitly through
+# `ny_onnx_conformance`; unlike libtest `ignore`, an enabled lane fails hard
+# when an input is absent.
+external-avoice = []
+external-whisper = []
+external-vnncomp = []
+external-wgpu = ["wgpu"]
+external-conformance = [
+    "external-avoice",
+    "external-whisper",
+    "external-vnncomp",
+    "external-wgpu",
+]
 internal-test-utils = []
 pytorch = ["dep:candle-core", "dep:zip"]
 coreml = ["dep:coreml-proto"]
@@ -24,6 +57,7 @@ gguf = ["dep:gguf"]
 
 [dependencies]
 ny-core = { path = "../ny-core" }
+ny-levers = { path = "../ny-levers" }
 ny-tensor = { path = "../ny-tensor" }
 ny-propagate = { path = "../ny-propagate" }
 ny-gpu = { path = "../ny-gpu", default-features = false }
@@ -38,6 +72,9 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha1.workspace = true
+cap-std.workspace = true
+cap-fs-ext.workspace = true
 ort = { workspace = true, optional = true }
 npyz.workspace = true
 candle-core = { workspace = true, optional = true }
@@ -45,9 +82,13 @@ zip = { workspace = true, optional = true }
 coreml-proto = { workspace = true, optional = true }
 # GGUF format support (for llama.cpp models)
 gguf = { workspace = true, optional = true }
-# Memory-mapped file I/O (for efficient large model loading)
-memmap2.workspace = true
 flate2 = "1.0"
+# Real file identity — (volume serial, file index) on Windows via
+# GetFileInformationByHandle, (dev, ino) on Unix. std exposes the Windows half
+# only behind the unstable `windows_by_handle` feature, and the stable
+# substitute (creation_time) cannot see an NTFS-tunnelled replacement. Already
+# in the dependency graph behind walkdir.
+same-file = "1.0"
 tempfile.workspace = true
 num-bigint.workspace = true
 num-rational.workspace = true

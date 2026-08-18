@@ -1,0 +1,59 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Default-dark cGAN root-collector canary. This is not selected by the
+# production category resolver. A sealed A/B must substitute this file for
+# vnncomp25/cgan_2023.yaml in an isolated configuration tree.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
+  csv_name: instances.csv
+
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  cgan_forward_alpha_surrogate: false
+
+attack:
+  pgd_order: before
+  pgd_restarts: 200
+
+bab:
+  batch_size: 64
+  crown_ibp_per_node_cap_secs: 150
+  phase_budget:
+    disjunctive_pgd_fraction: 0.10
+    disjunctive_pgd_max_secs: 5
+    attack_extension_fraction: 0.0
+    # Give the one target-complete root collection the same treatment window
+    # as the successful historical route hypothesis.
+    initial_bounds_fraction: 0.85
+    disjunctive_precheck_fraction: 0.85
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      reorder_bab: false
+      alpha_iteration: 1
+      lr_alpha: 0.05
+      ibp_enhancement: true
+      stacked_rebound: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+    fix_interm_bounds: false
+    cgan_sparse_target_complete_root: true
+    cgan_complete_crown_ibp_root: true
+    reference_refresh_max_secs: 12
+    forward_linear_deadline_fallback_to_ibp: true
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

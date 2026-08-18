@@ -34,12 +34,24 @@ fn layerless_config(max_queue_size: usize) -> DomainListConfig {
 }
 
 fn processed_batch(lbs: Vec<f32>, ubs: Vec<f32>) -> ProcessedDomains {
-    let n = lbs.len();
-    assert_eq!(n, ubs.len());
+    assert_eq!(lbs.len(), ubs.len());
     let metadata_vec: Vec<DomainMetadata> = lbs
         .iter()
         .zip(&ubs)
         .map(|(&lb, &ub)| metadata(lb, ub, 1))
+        .collect();
+    processed_metadata(metadata_vec)
+}
+
+fn processed_metadata(metadata_vec: Vec<DomainMetadata>) -> ProcessedDomains {
+    let n = metadata_vec.len();
+    let lbs = metadata_vec
+        .iter()
+        .map(DomainMetadata::lower_bound)
+        .collect();
+    let ubs = metadata_vec
+        .iter()
+        .map(DomainMetadata::upper_bound)
         .collect();
     ProcessedDomains {
         layer_lowers: HashMap::new(),
@@ -89,6 +101,7 @@ fn test_add_over_queue_cap_evicts_highest_lower_bound_and_records_count() {
 #[test]
 fn test_queue_cap_zero_disables_eviction() {
     let mut list = DomainList::new(layerless_config(0)).unwrap();
+    list.configure_queue_eviction(0, false).unwrap();
 
     list.add(processed_batch(
         vec![-0.8, 0.5, -0.1, -0.3],
@@ -98,6 +111,142 @@ fn test_queue_cap_zero_disables_eviction() {
 
     assert_eq!(list.len(), 4);
     assert_eq!(list.evicted_count(), 0);
+}
+
+/// Byte enforcement is installed before add and shares the existing queue
+/// compaction/latch path. Zero count cap still means unlimited by count.
+#[ntest::timeout(10000)]
+#[test]
+fn test_byte_cap_evicts_on_add_and_records_count() {
+    let mut list = DomainList::new(layerless_config(0)).unwrap();
+    let two_rows = list.estimated_bytes_per_domain().saturating_mul(2);
+    list.configure_queue_eviction(two_rows, false).unwrap();
+
+    list.add(processed_batch(
+        vec![-0.8, 0.5, -0.1, -0.3],
+        vec![0.2, 1.5, 0.9, 0.7],
+    ))
+    .unwrap();
+
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.evicted_count(), 2);
+    assert!(list.estimated_resident_bytes() <= two_rows);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_count_and_byte_caps_use_the_tighter_limit() {
+    let mut count_tighter = DomainList::new(layerless_config(2)).unwrap();
+    let row_bytes = count_tighter.estimated_bytes_per_domain();
+    count_tighter
+        .configure_queue_eviction(row_bytes.saturating_mul(4), false)
+        .unwrap();
+    count_tighter
+        .add(processed_batch(
+            vec![-0.8, 0.5, -0.1, -0.3, 0.2],
+            vec![0.2, 1.5, 0.9, 0.7, 1.2],
+        ))
+        .unwrap();
+    assert_eq!(count_tighter.len(), 2);
+
+    let mut bytes_tighter = DomainList::new(layerless_config(5)).unwrap();
+    let row_bytes = bytes_tighter.estimated_bytes_per_domain();
+    bytes_tighter
+        .configure_queue_eviction(row_bytes.saturating_mul(2), false)
+        .unwrap();
+    bytes_tighter
+        .add(processed_batch(
+            vec![-0.8, 0.5, -0.1, -0.3, 0.2],
+            vec![0.2, 1.5, 0.9, 0.7, 1.2],
+        ))
+        .unwrap();
+    assert_eq!(bytes_tighter.len(), 2);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_byte_cap_below_one_row_keeps_one_domain_for_progress() {
+    let mut list = DomainList::new(layerless_config(0)).unwrap();
+    list.configure_queue_eviction(1, false).unwrap();
+    list.add(processed_batch(vec![-0.8, 0.5, -0.1], vec![0.2, 1.5, 0.9]))
+        .unwrap();
+
+    assert_eq!(list.len(), 1);
+    assert_eq!(list.evicted_count(), 2);
+    assert!(list.estimated_resident_bytes() > 1);
+}
+
+/// The active verification sense controls eviction priority. Upper-bound
+/// verification must retain the largest upper bounds, matching the CPU heap.
+#[ntest::timeout(10000)]
+#[test]
+fn test_upper_mode_eviction_keeps_highest_upper_bounds() {
+    let mut list = DomainList::new(layerless_config(2)).unwrap();
+    list.configure_queue_eviction(0, true).unwrap();
+
+    list.add(processed_batch(
+        vec![-0.1, -0.8, -0.3, 0.2],
+        vec![0.5, 3.0, 1.0, 2.0],
+    ))
+    .unwrap();
+
+    let picked = list
+        .pick_out_batched(2, BatchedDomainOptions::default())
+        .unwrap();
+    assert_eq!(picked.global_ubs, vec![3.0, 2.0]);
+    assert_eq!(list.evicted_count(), 2);
+}
+
+/// Metadata grows with depth, cached state, and split histories. The byte cap
+/// must be recomputed by each add rather than frozen from the root row.
+#[ntest::timeout(10000)]
+#[test]
+fn test_byte_cap_recomputes_after_metadata_growth() {
+    let mut list = DomainList::new(layerless_config(0)).unwrap();
+    list.add(processed_batch(
+        vec![-0.8, 0.5, -0.1, -0.3],
+        vec![0.2, 1.5, 0.9, 0.7],
+    ))
+    .unwrap();
+    let root_sized_budget = list.estimated_resident_bytes();
+    list.configure_queue_eviction(root_sized_budget, false)
+        .unwrap();
+    assert_eq!(list.len(), 4);
+
+    let large_history = |lower_bound: f32| DomainMetadata {
+        lower_bound,
+        upper_bound: 1.0,
+        depth: 128,
+        constraints: (0..128)
+            .map(|index| {
+                (
+                    format!("very_long_relu_node_name_{index:04}_{}", "x".repeat(128)),
+                    index,
+                    index % 2 == 0,
+                    None,
+                )
+            })
+            .collect(),
+        cached_la: None,
+        needs_bounding: false,
+        alpha_state: None,
+        node_bounds_override: None,
+    };
+    list.add(processed_metadata(vec![
+        large_history(-10.0),
+        large_history(-9.0),
+    ]))
+    .unwrap();
+
+    assert!(
+        list.len() < 4,
+        "heavier child metadata must tighten the resident frontier"
+    );
+    assert!(
+        list.len() == 1 || list.estimated_resident_bytes() <= root_sized_budget,
+        "the only permitted over-budget case is the one-domain progress floor"
+    );
+    assert!(list.evicted_count() > 0);
 }
 
 /// The eviction count accumulates across `add` calls: any nonzero total

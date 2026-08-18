@@ -10,7 +10,44 @@ if [[ "$#" -eq 0 ]]; then
     exit 2
 fi
 
-readonly max_vmem_limit_kib=83886080
+# Keep the address-space guard finite, but do not confuse virtual mappings with
+# charged memory. CUDA/ONNX Runtime reserve about 53.5 GiB before useful work;
+# a sealed CIFAR100 BaB run reached 79.67 GiB of virtual size while its cgroup
+# peaked at only 24.36 GiB. At 160 GiB that run retains 80.33 GiB of VA
+# headroom, so the gb10 lane's remaining charged-memory budget is narrower.
+# The finite ceiling still catches a runaway per-process mmap/reservation loop;
+# MemoryHigh/MemoryMax below remain the aggregate physical-memory backstop.
+readonly max_vmem_limit_kib=167772160
+# Exact scorecard policy. Apply the selected reviewed profile to every
+# transient service so measurement safety and comparability do not depend on
+# host-installed slice drop-ins. The scorecard independently attests these
+# leaf values, so accepting an unknown profile or silently retaining the 64/80
+# GiB cgroup defaults for the 16/20 GiB lane would make that lane unusable.
+containment_profile="${NY_MEASURE_CONTAINMENT_PROFILE-gb10-80g}"
+containment_memory_high_bytes=""
+containment_memory_max_bytes=""
+case "${containment_profile}" in
+    gb10-80g)
+        containment_memory_high_bytes=68719476736
+        containment_memory_max_bytes=85899345920
+        ;;
+    wsl24-20g)
+        containment_memory_high_bytes=17179869184
+        containment_memory_max_bytes=21474836480
+        ;;
+    *)
+        echo "ny-safe-gpu-run: NY_MEASURE_CONTAINMENT_PROFILE must be exactly" \
+            "gb10-80g or wsl24-20g" >&2
+        exit 2
+        ;;
+esac
+readonly containment_profile
+readonly containment_memory_high_bytes
+readonly containment_memory_max_bytes
+readonly containment_swap_max_bytes=8589934592
+readonly containment_pids_max=4096
+readonly containment_cpu_quota_percent=1000%
+readonly containment_cpu_quota_period=100ms
 vmem_limit_kib="${NY_GPU_VMEM_LIMIT_KIB:-${max_vmem_limit_kib}}"
 case "${vmem_limit_kib}" in
     ''|*[!0-9]*)
@@ -37,7 +74,7 @@ fi
 # hundreds of GiB across repeated private builds and fail only after doing all
 # compile work. The probe follows CARGO_TARGET_DIR when one is explicit and
 # falls back to the working directory's filesystem.
-readonly default_build_min_free_kib=33554432 # 32 GiB
+readonly default_build_min_free_kib=67108864 # 64 GiB
 readonly max_build_min_free_kib=1073741824   # 1 TiB sanity ceiling
 build_min_free_kib="${NY_BUILD_MIN_FREE_KIB:-${default_build_min_free_kib}}"
 case "${build_min_free_kib}" in
@@ -129,7 +166,7 @@ fi
 # command exit status and stdio; `--expand-environment=no` preserves literal
 # shell arguments. Exported variables are copied by name so build credentials
 # and task-specific configuration retain the same semantics as direct exec.
-unit="ny-safe-gpu-${UID}-${BASHPID}-${RANDOM}.service"
+unit="ny-safe-gpu-${UID}-${BASHPID:-$$}-${RANDOM}.service"
 environment_args=()
 while IFS= read -r variable; do
     [[ "${variable}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
@@ -199,6 +236,12 @@ systemd-run --user --wait --collect --pipe --quiet --same-dir \
     --expand-environment=no \
     --unit="${unit}" \
     --slice=ny-build.slice \
+    --property=MemoryHigh="${containment_memory_high_bytes}" \
+    --property=MemoryMax="${containment_memory_max_bytes}" \
+    --property=MemorySwapMax="${containment_swap_max_bytes}" \
+    --property=TasksMax="${containment_pids_max}" \
+    --property=CPUQuota="${containment_cpu_quota_percent}" \
+    --property=CPUQuotaPeriodSec="${containment_cpu_quota_period}" \
     --property=OOMPolicy=kill \
     --property=KillMode=control-group \
     --property=TimeoutStopSec=5s \

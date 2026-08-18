@@ -278,21 +278,16 @@ fn blocked_zero_symbol_star_and_bias_center_only() {
 
 #[test]
 fn malformed_zero_coefficient_rows_fail_closed_without_panicking() {
-    // This malformed value is constructible through the historical
-    // `ZonotopeTensor::new` contract: the leading zero saturates alpha_dim to zero,
-    // but there is no center row to execute. The blocked planner must inspect the
-    // backing shape instead of inventing `alpha_dim + 1 == 1` row.
-    let zono = ZonotopeTensor::new(ArrayD::zeros(IxDyn(&[0, 1, 2, 2]))).unwrap();
-    let star = Star::new(zono, Array2::zeros((0, 0)), Array1::zeros(0)).unwrap();
-    let weight = Array4::ones((1, 1, 1, 1));
-
+    // Reject this malformed value at the type boundary. Historically `new`
+    // saturated the leading zero to alpha_dim=0 even though no center row
+    // existed, leaving every center-indexing operation vulnerable to a panic.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        star.conv2d_blocked_unwired(&weight, None, (1, 1), (0, 0), unrestricted(1))
+        ZonotopeTensor::new(ArrayD::zeros(IxDyn(&[0, 1, 2, 2])))
     }));
-    assert!(outcome.is_ok(), "malformed backing reached a panic");
+    assert!(outcome.is_ok(), "malformed construction reached a panic");
     assert!(matches!(
         outcome.unwrap(),
-        Err(NyError::InvalidSpec(message)) if message.contains("at least one center row")
+        Err(NyError::InvalidSpec(message)) if message.contains("center row")
     ));
 }
 

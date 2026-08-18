@@ -10,7 +10,7 @@
 use ny_core::{checked_dim_product, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 
-use super::super::math_common::compute_batch_prefix;
+use super::super::math_common::{compute_batch_prefix, outward_midpoint_radius};
 use super::types::GroupNormLayer;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
 
@@ -18,7 +18,8 @@ impl GroupNormLayer {
     /// Forward-mode IBP for one group: compute per-element output bounds.
     ///
     /// Uses first-order Taylor expansion around center point with second-order
-    /// remainder bound. Returns (lower, upper) vectors of length group_size.
+    /// remainder bound. This path is admitted only as heuristic analysis, not
+    /// proof authority. Returns (lower, upper) vectors of length group_size.
     fn ibp_forward_mode_group(
         &self,
         center_vals: &[f32],
@@ -228,12 +229,9 @@ impl GroupNormLayer {
         let cpg = self.channels_per_group();
         let group_size = cpg * time_len;
 
-        let center = (input.lower() + input.upper()) * 0.5;
-        let radius = (input.upper() - input.lower()) * 0.5;
-
-        if center.iter().chain(radius.iter()).any(|&v| !v.is_finite()) {
+        let Some((center, radius)) = outward_midpoint_radius(input.lower(), input.upper()) else {
             return self.fallback_output_bounds(shape);
-        }
+        };
 
         let mut out_lower = input.lower().clone();
         let mut out_upper = input.upper().clone();

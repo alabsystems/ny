@@ -75,7 +75,7 @@ proptest! {
     #[test]
     fn two_sum_is_error_free(a in value(), b in value()) {
         let (s, e) = two_sum(a, b);
-        prop_assume!(s.is_finite() && e.is_finite());
+        prop_assert!(s.is_finite() && e.is_finite(), "bounded two_sum input produced non-finite output");
         prop_assert_eq!(exact(a) + exact(b), exact(s) + exact(e));
     }
 
@@ -84,7 +84,7 @@ proptest! {
     #[test]
     fn two_prod_is_error_free(a in value(), b in value()) {
         let (p, e) = two_prod(a, b);
-        prop_assume!(p.is_finite() && e.is_finite());
+        prop_assert!(p.is_finite() && e.is_finite(), "bounded two_prod input produced non-finite output");
         prop_assert_eq!(exact(a) * exact(b), exact(p) + exact(e));
     }
 
@@ -108,7 +108,7 @@ proptest! {
             abs_product_sum += prod.abs();
             exact_sum += prod;
         }
-        prop_assume!(acc.is_finite());
+        prop_assert!(acc.is_finite(), "bounded DD dot input produced non-finite output");
 
         // The represented double-double value is hi + lo, exactly.
         let got = exact(acc.hi) + exact(acc.lo);
@@ -127,10 +127,10 @@ proptest! {
     #[test]
     fn dd_to_f64_is_nearest(a in value(), b in value(), c in value()) {
         let acc = dd_fma(dd_fma(Dd::zero(), a, b), c, 1.0);
-        prop_assume!(acc.is_finite());
+        prop_assert!(acc.is_finite(), "bounded DD FMA input produced non-finite output");
         let exact_val = exact(a) * exact(b) + exact(c);
         let got = acc.to_f64();
-        prop_assume!(got.is_finite());
+        prop_assert!(got.is_finite(), "finite DD value converted to non-finite f64");
 
         let d_got = (exact(got) - &exact_val).abs();
         for neighbour in [next_up(got), next_down(got)] {

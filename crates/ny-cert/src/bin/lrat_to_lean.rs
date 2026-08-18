@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `lrat_to_lean` — transcribe a DIMACS CNF + LRAT refutation into a
 //! self-contained Lean 4 instance file for NY's `NyProof` overlay.
 //!

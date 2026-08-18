@@ -27,18 +27,22 @@ pub fn relu_crown_relaxation(lower: f32, upper: f32) -> (f32, f32, f32, f32) {
         (0.0, 0.0, 0.0, 0.0)
     } else {
         fn next_up_nonneg(x: f32) -> f32 {
-            if !x.is_finite() {
+            let bits = x.to_bits();
+            let magnitude = bits & 0x7fff_ffff;
+            if magnitude >= 0x7f80_0000 {
                 return x;
             }
-            if x <= 0.0 {
+            debug_assert_eq!(bits >> 31, 0, "expected a non-negative value");
+            if magnitude == 0 {
                 return f32::from_bits(1);
             }
-            f32::from_bits(x.to_bits() + 1)
+            f32::from_bits(bits + 1)
         }
 
         #[inline]
         fn is_denormal(x: f32) -> bool {
-            x != 0.0 && x.abs() < f32::MIN_POSITIVE
+            let magnitude = x.to_bits() & 0x7fff_ffff;
+            magnitude != 0 && magnitude < f32::MIN_POSITIVE.to_bits()
         }
 
         const RATIO_THRESHOLD: f32 = 1e-30;

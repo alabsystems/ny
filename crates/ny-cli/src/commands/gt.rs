@@ -29,7 +29,7 @@
 //!   *validated* witness). The engine that decided is always reported.
 //!
 //! Exit codes: 0 = property proved, 1 = falsified with a witness, 2 = unknown
-//! (sound non-answer).
+//! (sound non-answer), 4 = invalid invocation or operational error.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
@@ -666,7 +666,7 @@ mod tests {
             domain: String::new(),
             attribute: vec![AttributeProto {
                 name: "transB".to_string(),
-                i: 1,
+                i: Some(1),
                 r#type: ny_onnx::onnx_proto::attribute_type::INT,
                 ..Default::default()
             }],
@@ -706,6 +706,7 @@ mod tests {
             ],
             name: "cylinder_surrogate".to_string(),
             initializer: vec![w1, b1, w2, b2],
+            sparse_initializer: Vec::new(),
             input: vec![f32_value_info("input", &[1, 3])],
             output: vec![f32_value_info("output", &[1, 1])],
             value_info: Vec::new(),
@@ -938,6 +939,7 @@ mod tests {
     /// f(x) = |x0 − 0.5| + |x1 + 0.25| − 8 as ONNX: same absolute-value pair
     /// structure as [`surrogate_onnx_bytes`] with the read-out bias lowered
     /// so the CROWN margin goes negative while true dominance survives.
+    #[cfg(feature = "external-ay")]
     fn tight_surrogate_onnx_bytes() -> Vec<u8> {
         let w1 = f32_tensor(
             "w1",
@@ -967,6 +969,7 @@ mod tests {
             ],
             name: "tight_cylinder_surrogate".to_string(),
             initializer: vec![w1, b1, w2, b2],
+            sparse_initializer: Vec::new(),
             input: vec![f32_value_info("input", &[1, 3])],
             output: vec![f32_value_info("output", &[1, 1])],
             value_info: Vec::new(),
@@ -1000,6 +1003,7 @@ mod tests {
             node: vec![gemm("gemm", "input", "w", "b", "output")],
             name: "plane_surrogate".to_string(),
             initializer: vec![w, b],
+            sparse_initializer: Vec::new(),
             input: vec![f32_value_info("input", &[1, 3])],
             output: vec![f32_value_info("output", &[1, 1])],
             value_info: Vec::new(),
@@ -1071,6 +1075,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "external-ay")]
     fn escalate_smt_decides_what_crown_cannot() {
         // Route B end to end through the CLI path. With u = x0 − 0.5 and
         // v = x1 + 0.25 (both ranging over [−1, 1] on SURROGATE_BOX):
@@ -1078,10 +1083,8 @@ mod tests {
         //   holds), but CROWN's certified lower bound is −1 (the −t² secant
         //   relaxation is loose at the interior binding point t = 0), so the
         //   float path is Unknown (exit 2). The exact SMT query is unsat.
-        if SmtEscalation::locate().is_none() {
-            eprintln!("skipping: no `ay` solver (set NY_AY or PATH)");
-            return;
-        }
+        SmtEscalation::locate()
+            .expect("external-ay conformance requires pinned ay via NY_AY or PATH");
         let dir = tempfile::tempdir().expect("tempdir");
         let model = dir.path().join("tight_surrogate.onnx");
         std::fs::write(&model, tight_surrogate_onnx_bytes()).expect("write onnx");

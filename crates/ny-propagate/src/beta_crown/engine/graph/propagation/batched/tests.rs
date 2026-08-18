@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 use ndarray::{arr1, arr2, Array1, Array2};
 use ny_core::NaiveCpuGemmEngine;
-use ny_tensor::{next_down_f32, next_up_f32};
 
 use super::{
     indexed_pending::IndexedPendingLinearBounds, BatchedBackwardContext, BetaCrownVerifier,
 };
 use crate::batched_domain::{BatchedDomains, CachedLinearBounds};
 use crate::beta_crown::{BetaCrownConfig, GraphBabDomain, GraphNeuronConstraint};
+use crate::network::{backward_div_to_numerator, DivBackwardResult};
 use crate::{
     AddLayer, BoundedTensor, ConcatLayer, DivLayer, GraphNetwork, GraphNode, Layer, LinearBounds,
     LinearLayer, OpaqueSkipLayer, ReLULayer, SigmoidLayer, NETWORK_INPUT,
@@ -531,6 +531,16 @@ fn test_dispatch_node_backward_div_reuses_positive_denominator_helper_4354() {
     )
     .expect("div output bounds");
 
+    let DivBackwardResult::PropagateNumerator(expected) = backward_div_to_numerator(
+        &node_lb,
+        &constrained_input,
+        &denominator_bounds,
+        &div_output_bounds,
+    )
+    .expect("direct positive-denominator Div helper should propagate the numerator") else {
+        panic!("direct positive-denominator Div helper unexpectedly concretized the node");
+    };
+
     let constrained_inputs = vec![constrained_input];
     let bounds_caches = [HashMap::from([
         ("den".to_string(), Arc::new(denominator_bounds)),
@@ -567,16 +577,12 @@ fn test_dispatch_node_backward_div_reuses_positive_denominator_helper_4354() {
         .and_then(|opt| opt.as_ref())
         .expect("expected propagated bounds for numerator/_input");
 
-    assert_eq!(
-        input_lb.lower_a,
-        arr2(&[[next_down_f32(0.375_f32), next_down_f32(-0.75_f32),]])
-    );
-    assert_eq!(
-        input_lb.upper_a,
-        arr2(&[[next_up_f32(0.5625_f32), next_up_f32(-0.375_f32),]])
-    );
-    assert_eq!(input_lb.lower_b, arr1(&[0.5_f32 - next_up_f32(1.25_f32)]));
-    assert_eq!(input_lb.upper_b, arr1(&[0.75_f32 + next_up_f32(1.125_f32)]));
+    assert_eq!(input_lb.lower_a, expected.lower_a);
+    assert_eq!(input_lb.upper_a, expected.upper_a);
+    assert_eq!(input_lb.lower_b, expected.lower_b);
+    assert_eq!(input_lb.upper_b, expected.upper_b);
+    assert_eq!(input_lb.lower_a_err, expected.lower_a_err);
+    assert_eq!(input_lb.upper_a_err, expected.upper_a_err);
     assert!(
         node_linear_bounds.input_accumulated()[0],
         "propagating Div numerator to _input should mark input_accumulated",
@@ -932,4 +938,79 @@ fn refold_rows_match_contract() {
     ));
     // Length mismatch fails closed.
     assert!(!super::refold_rows_match(&wide, &gcr(vec![1.0], vec![3.0])));
+}
+
+/// #wide-decline-tally WIRING PIN (CPU-only).
+///
+/// The tally is worthless if a refusal can slip through unlabelled: an entry that
+/// returns `None` without naming a reason reads, in the `[wide-lane]` report, as
+/// "there were simply no candidate batches" — the exact ambiguity this work
+/// exists to remove. So pin the invariant directly on the production entry:
+/// a declined candidate ALWAYS bumps the candidate counter AND at least one
+/// decline reason.
+///
+/// The fixture is a ReLU-only (non-conv) graph, so the entry cannot reach the
+/// GPU seam. Which reason wins depends on whether this host has a sound GPU
+/// backend registered (`entry_no_sound_backend` vs `entry_graph_not_conv`), so
+/// the assertion is on "some reason was recorded", not on a host-specific one.
+#[test]
+fn wide_entry_records_a_reason_for_every_declined_candidate() {
+    use ny_core::wide_lane_telemetry::{
+        reset_wide_lane_telemetry_for_tests, wide_lane_candidate_count, wide_lane_decline_tally,
+    };
+
+    let graph = build_single_relu_graph_for_batched_mode_tests();
+    let input =
+        BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).expect("valid input");
+    let node_bounds = graph
+        .collect_node_bounds(&input)
+        .expect("graph bounds should collect");
+    let cache: HashMap<String, Arc<BoundedTensor>> = node_bounds
+        .into_iter()
+        .map(|(name, bt)| (name, Arc::new(bt)))
+        .collect();
+
+    let n_domains = 2usize;
+    let cache_refs: Vec<&HashMap<String, Arc<BoundedTensor>>> = vec![&cache; n_domains];
+    let inputs: Vec<BoundedTensor> = vec![input; n_domains];
+    let betas: Vec<Option<&crate::beta_crown::state::GraphBetaState>> = vec![None; n_domains];
+    let alphas: Vec<Option<&crate::beta_crown::state::GraphDomainAlphaState>> =
+        vec![None; n_domains];
+
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    reset_wide_lane_telemetry_for_tests();
+    let declined = verifier.try_gpu_beta_batched_resnet_opt(
+        &graph,
+        "linear2",
+        1,
+        &[1.0_f32],
+        1,
+        n_domains,
+        &cache_refs,
+        &inputs,
+        &betas,
+        &alphas,
+        &NaiveCpuGemmEngine,
+        "tally-wiring-pin",
+        None,
+        false,
+    );
+
+    assert!(
+        declined.is_none(),
+        "a ReLU-only graph has no conv suffix, so the resnet wide entry must decline"
+    );
+    // `>=` not `==`: the counters are process-global and cargo runs this crate's
+    // tests in parallel, so a sibling test may also have entered the lane.
+    assert!(
+        wide_lane_candidate_count() >= 1,
+        "every call must count itself as a candidate — the report's denominator"
+    );
+    let tally = wide_lane_decline_tally();
+    assert!(
+        !tally.is_empty(),
+        "a declined candidate must name a reason; an unlabelled `None` is exactly \
+         the blind spot this tally removes"
+    );
+    reset_wide_lane_telemetry_for_tests();
 }

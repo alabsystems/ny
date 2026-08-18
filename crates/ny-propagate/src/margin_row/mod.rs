@@ -29,6 +29,7 @@
 pub mod bab;
 pub mod bounds;
 pub mod engine;
+pub(crate) mod gpu_seam;
 pub mod hyperplane_probe;
 pub mod net;
 pub mod prof;
@@ -74,6 +75,30 @@ pub use spec::{TwinOpSpec, TwinSpec};
 /// `NY_MARGIN_ROW_CONCURRENT=1` and a GPU-device preset; it is off by default.
 pub fn margin_row_bab_enabled() -> bool {
     true
+}
+
+/// Typed preset route for the SOUND f32 root tableau (`margin_row.root_f32`).
+///
+/// Set ONCE by the CLI from the category preset before any lane runs; read by
+/// [`root::RootGates::build_retaining`] alongside `NY_MARGIN_ROW_ROOT_F32`.
+/// This exists because the f32 gate lives four crates below the preset loader
+/// and the workspace forbids writing process environment from code.
+///
+/// SOUNDNESS: arming it can only LOOSEN the root tableau — the f32 rounding is
+/// charged into a certified additive concretize slack that is subtracted from
+/// every lower endpoint and added to every upper one. A wrong value here costs
+/// proofs; it cannot manufacture one. The lane itself remains fail-closed
+/// (`Unsat` or `Unknown` only).
+static ROOT_F32_PRESET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm/disarm the typed preset route for the f32 root tableau.
+pub fn set_root_f32_preset(on: bool) {
+    ROOT_F32_PRESET.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is the typed preset route armed?
+pub(crate) fn root_f32_preset() -> bool {
+    ROOT_F32_PRESET.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// End-to-end lane: compile, build certified root gates, run the BaB.

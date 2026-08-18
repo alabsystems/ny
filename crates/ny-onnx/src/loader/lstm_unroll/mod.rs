@@ -13,10 +13,12 @@
 //!
 //! Supported scope:
 //! - Forward and bidirectional directions (no reverse-only)
-//! - No peepholes (P input ignored)
+//! - No sequence lengths or peepholes (non-empty optional inputs are rejected)
 //! - Default activations (Sigmoid, Tanh, Tanh)
 //! - Requires concrete (non-dynamic) sequence length
 //! - layout=0 (seq_first) and layout=1 (batch_first)
+//! - Bidirectional final-state outputs only; the four-dimensional sequence
+//!   output is rejected until it can be preserved exactly
 //!
 //! Bidirectional LSTM: the ONNX spec stores weights as `[num_directions, ...]`.
 //! We split by direction, unroll forward (t=0→T-1) and reverse (t=T-1→0)
@@ -37,9 +39,13 @@ mod tests_bilstm;
 
 use crate::onnx_proto;
 use crate::WeightStore;
+use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
-use weights::{find_tensor_shape, precompute_lstm_weights, store_lstm_slice_params};
+use super::const_fold::is_standard_onnx_domain;
+use weights::{
+    find_tensor_shape, precompute_lstm_weights, prepare_lstm_weights, store_lstm_slice_params,
+};
 
 /// Configuration extracted from an LSTM node.
 struct LstmConfig {
@@ -102,14 +108,37 @@ pub(super) fn lower_lstm_nodes(
     graph_value_info: &[onnx_proto::ValueInfoProto],
     inferred_shapes: &std::collections::HashMap<String, Vec<i64>>,
 ) {
-    if !nodes.iter().any(|n| n.op_type == "LSTM") {
+    if !nodes
+        .iter()
+        .any(|n| n.op_type == "LSTM" && is_standard_onnx_domain(&n.domain))
+    {
         return;
+    }
+
+    // Generated constants live only in WeightStore, not GraphProto.initializer.
+    // Reserve every authored value name up front so a synthesized constant can
+    // never shadow a runtime input or another node's value.
+    let mut authored_value_names: HashSet<String> = graph_inputs
+        .iter()
+        .chain(graph_value_info)
+        .map(|value| value.name.clone())
+        .filter(|name| !name.is_empty())
+        .collect();
+    for authored_node in nodes.iter() {
+        authored_value_names.extend(
+            authored_node
+                .input
+                .iter()
+                .chain(&authored_node.output)
+                .filter(|name| !name.is_empty())
+                .cloned(),
+        );
     }
 
     let mut lowered = Vec::with_capacity(nodes.len());
 
     for node in nodes.drain(..) {
-        if node.op_type != "LSTM" {
+        if node.op_type != "LSTM" || !is_standard_onnx_domain(&node.domain) {
             lowered.push(node);
             continue;
         }
@@ -120,6 +149,7 @@ pub(super) fn lower_lstm_nodes(
             graph_inputs,
             graph_value_info,
             inferred_shapes,
+            &authored_value_names,
         ) {
             Ok(new_nodes) => {
                 info!(
@@ -149,6 +179,7 @@ fn unroll_lstm_node(
     graph_inputs: &[onnx_proto::ValueInfoProto],
     graph_value_info: &[onnx_proto::ValueInfoProto],
     inferred_shapes: &std::collections::HashMap<String, Vec<i64>>,
+    authored_value_names: &HashSet<String>,
 ) -> Result<Vec<onnx_proto::NodeProto>, String> {
     let config = read_lstm_config(
         node,
@@ -156,6 +187,7 @@ fn unroll_lstm_node(
         graph_value_info,
         weights,
         inferred_shapes,
+        authored_value_names,
     )?;
 
     let mut new_nodes = Vec::new();
@@ -215,10 +247,15 @@ fn unroll_bidirectional(
     let fwd_base = format!("{}_fwd", config.base);
     let rev_base = format!("{}_rev", config.base);
 
-    let fwd_wn = precompute_lstm_weights(config, node, weights, 0, &fwd_base)?;
+    // Prepare both directions before committing either one. If an exact-real
+    // arithmetic certificate fails in the reverse direction, the authored
+    // graph remains untouched rather than receiving a partial lowering.
+    let fwd_prepared = prepare_lstm_weights(config, node, weights, 0, &fwd_base)?;
+    let rev_prepared = prepare_lstm_weights(config, node, weights, 1, &rev_base)?;
+    let fwd_wn = fwd_prepared.store(weights);
     store_lstm_slice_params(config, weights, &fwd_base);
 
-    let rev_wn = precompute_lstm_weights(config, node, weights, 1, &rev_base)?;
+    let rev_wn = rev_prepared.store(weights);
     store_lstm_slice_params(config, weights, &rev_base);
 
     // Forward direction: t = 0, 1, ..., T-1
@@ -360,32 +397,10 @@ fn read_lstm_config(
     graph_value_info: &[onnx_proto::ValueInfoProto],
     weights: &WeightStore,
     inferred_shapes: &std::collections::HashMap<String, Vec<i64>>,
+    authored_value_names: &HashSet<String>,
 ) -> Result<LstmConfig, String> {
-    let hidden_size = node
-        .attribute
-        .iter()
-        .find(|a| a.name == "hidden_size")
-        .map(|a| a.i as usize)
-        .ok_or("missing hidden_size attribute")?;
-
-    let direction = node
-        .attribute
-        .iter()
-        .find(|a| a.name == "direction")
-        .and_then(|a| std::str::from_utf8(&a.s).ok())
-        .unwrap_or("forward");
-    let num_directions = match direction {
-        "forward" => 1,
-        "bidirectional" => 2,
-        other => return Err(format!("unsupported LSTM direction '{other}'")),
-    };
-
-    let layout = node
-        .attribute
-        .iter()
-        .find(|a| a.name == "layout")
-        .map(|a| a.i)
-        .unwrap_or(0);
+    validate_lstm_signature(node)?;
+    let (hidden_size, num_directions, layout) = read_lstm_attributes(node)?;
 
     let x_name = node
         .input
@@ -407,7 +422,7 @@ fn read_lstm_config(
         ));
     }
 
-    let (seq_len, _batch_size, input_size) = if layout == 0 {
+    let (seq_len, batch_size, input_size) = if layout == 0 {
         (x_shape[0], x_shape[1], x_shape[2])
     } else {
         (x_shape[1], x_shape[0], x_shape[2])
@@ -417,6 +432,24 @@ fn read_lstm_config(
             "LSTM requires concrete sequence length, got {seq_len}"
         ));
     }
+    if batch_size <= 0 {
+        return Err(format!(
+            "LSTM requires a concrete positive batch size, got {batch_size}"
+        ));
+    }
+    if input_size <= 0 {
+        return Err(format!(
+            "LSTM requires a concrete positive input size, got {input_size}"
+        ));
+    }
+
+    let seq_len = usize::try_from(seq_len)
+        .map_err(|_| "LSTM sequence length does not fit usize".to_string())?;
+    let batch_size = usize::try_from(batch_size)
+        .map_err(|_| "LSTM batch size does not fit usize".to_string())?;
+    let input_size = usize::try_from(input_size)
+        .map_err(|_| "LSTM input size does not fit usize".to_string())?;
+    validate_exact_index_dimensions(hidden_size, seq_len, batch_size, input_size)?;
 
     let base = if node.name.is_empty() {
         node.output
@@ -428,16 +461,10 @@ fn read_lstm_config(
         node.name.clone()
     };
 
-    let batch_size = if _batch_size > 0 {
-        _batch_size as usize
-    } else {
-        1
-    };
-
-    Ok(LstmConfig {
+    let config = LstmConfig {
         hidden_size,
-        input_size: input_size as usize,
-        seq_len: seq_len as usize,
+        input_size,
+        seq_len,
         layout,
         base,
         domain: node.domain.clone(),
@@ -446,5 +473,217 @@ fn read_lstm_config(
         y_name: node.output.first().filter(|s| !s.is_empty()).cloned(),
         y_h_name: node.output.get(1).filter(|s| !s.is_empty()).cloned(),
         y_c_name: node.output.get(2).filter(|s| !s.is_empty()).cloned(),
-    })
+    };
+
+    if config.num_directions == 2 && config.y_name.is_some() {
+        return Err(
+            "bidirectional LSTM sequence output Y requires exact four-dimensional ONNX layout, which is not yet supported"
+                .to_string(),
+        );
+    }
+
+    validate_synthesized_weight_names(&config, weights, authored_value_names)?;
+    Ok(config)
+}
+
+fn validate_synthesized_weight_names(
+    config: &LstmConfig,
+    weights: &WeightStore,
+    authored_value_names: &HashSet<String>,
+) -> Result<(), String> {
+    let direction_bases = if config.num_directions == 1 {
+        vec![config.base.clone()]
+    } else {
+        vec![
+            format!("{}_fwd", config.base),
+            format!("{}_rev", config.base),
+        ]
+    };
+    let mut synthesized = Vec::new();
+    for base in direction_bases {
+        for suffix in [
+            "W_T",
+            "R_T",
+            "bias",
+            "h0",
+            "c0",
+            "h0_hR",
+            "x_reshape",
+            "gate_axis",
+            "gate_step",
+            "time_axis",
+            "time_step",
+        ] {
+            synthesized.push(format!("{base}__lstm_{suffix}"));
+        }
+        for label in ["i", "o", "f", "c"] {
+            synthesized.push(format!("{base}__lstm_gate_{label}_start"));
+            synthesized.push(format!("{base}__lstm_gate_{label}_end"));
+        }
+        for timestep in 0..config.seq_len {
+            synthesized.push(format!("{base}__lstm_t{timestep}_start"));
+            synthesized.push(format!("{base}__lstm_t{timestep}_end"));
+        }
+    }
+
+    if let Some(name) = synthesized
+        .into_iter()
+        .find(|name| weights.contains_key(name) || authored_value_names.contains(name))
+    {
+        return Err(format!(
+            "LSTM lowering would shadow authored value '{name}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lstm_signature(node: &onnx_proto::NodeProto) -> Result<(), String> {
+    if !(3..=8).contains(&node.input.len()) {
+        return Err(format!(
+            "LSTM requires between three and eight inputs, got {}",
+            node.input.len()
+        ));
+    }
+    for (index, label) in [(0, "X"), (1, "W"), (2, "R")] {
+        if node.input.get(index).is_none_or(String::is_empty) {
+            return Err(format!("LSTM missing required {label} input[{index}]"));
+        }
+    }
+    if node.input.get(4).is_some_and(|name| !name.is_empty()) {
+        return Err("LSTM sequence_lens input[4] is not supported".to_string());
+    }
+    if node.input.get(7).is_some_and(|name| !name.is_empty()) {
+        return Err("LSTM peephole P input[7] is not supported".to_string());
+    }
+    if node.output.len() > 3 {
+        return Err(format!(
+            "LSTM permits at most three outputs, got {}",
+            node.output.len()
+        ));
+    }
+    Ok(())
+}
+
+fn read_lstm_attributes(node: &onnx_proto::NodeProto) -> Result<(usize, usize, i64), String> {
+    let mut names = HashSet::new();
+    for attribute in &node.attribute {
+        if !names.insert(attribute.name.as_str()) {
+            return Err(format!(
+                "LSTM has duplicate '{}' attributes",
+                attribute.name
+            ));
+        }
+    }
+
+    let mut hidden_size = None;
+    let mut num_directions = 1_usize;
+    let mut layout = 0_i64;
+    for attribute in &node.attribute {
+        match attribute.name.as_str() {
+            "hidden_size" => {
+                require_attribute_type(attribute, onnx_proto::attribute_type::INT)?;
+                if attribute.i_value() <= 0 {
+                    return Err(format!(
+                        "LSTM hidden_size must be positive, got {}",
+                        attribute.i_value()
+                    ));
+                }
+                hidden_size = Some(usize::try_from(attribute.i_value()).map_err(|_| {
+                    format!(
+                        "LSTM hidden_size {} does not fit usize",
+                        attribute.i_value()
+                    )
+                })?);
+            }
+            "direction" => {
+                require_attribute_type(attribute, onnx_proto::attribute_type::STRING)?;
+                let direction = std::str::from_utf8(attribute.s_value())
+                    .map_err(|_| "LSTM direction must be valid UTF-8".to_string())?;
+                num_directions = match direction {
+                    "forward" => 1,
+                    "bidirectional" => 2,
+                    other => return Err(format!("unsupported LSTM direction '{other}'")),
+                };
+            }
+            "layout" => {
+                require_attribute_type(attribute, onnx_proto::attribute_type::INT)?;
+                if !matches!(attribute.i_value(), 0 | 1) {
+                    return Err(format!(
+                        "LSTM layout must be 0 or 1, got {}",
+                        attribute.i_value()
+                    ));
+                }
+                layout = attribute.i_value();
+            }
+            "input_forget" => {
+                require_attribute_type(attribute, onnx_proto::attribute_type::INT)?;
+                if attribute.i_value() != 0 {
+                    return Err(format!(
+                        "unsupported LSTM input_forget={}, only the default 0 is supported",
+                        attribute.i_value()
+                    ));
+                }
+            }
+            "activations" => {
+                require_attribute_type(attribute, onnx_proto::attribute_type::STRINGS)?;
+                return Err(
+                    "explicit LSTM activations are not supported; omit the attribute to use Sigmoid/Tanh/Tanh"
+                        .to_string(),
+                );
+            }
+            "activation_alpha" | "activation_beta" => {
+                require_attribute_type(attribute, onnx_proto::attribute_type::FLOATS)?;
+                return Err(format!("LSTM {} is not supported", attribute.name));
+            }
+            "clip" => {
+                require_attribute_type(attribute, onnx_proto::attribute_type::FLOAT)?;
+                return Err("LSTM clip is not supported".to_string());
+            }
+            other => return Err(format!("unknown LSTM attribute '{other}'")),
+        }
+    }
+
+    Ok((
+        hidden_size.ok_or("missing hidden_size attribute")?,
+        num_directions,
+        layout,
+    ))
+}
+
+fn require_attribute_type(
+    attribute: &onnx_proto::AttributeProto,
+    expected: i32,
+) -> Result<(), String> {
+    if attribute.r#type != expected {
+        return Err(format!(
+            "LSTM attribute '{}' has type {}, expected {}",
+            attribute.name, attribute.r#type, expected
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_index_dimensions(
+    hidden_size: usize,
+    seq_len: usize,
+    batch_size: usize,
+    input_size: usize,
+) -> Result<(), String> {
+    const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
+    let gate_size = hidden_size
+        .checked_mul(4)
+        .ok_or("LSTM gate dimension overflows usize")?;
+    for (label, value) in [
+        ("sequence length", seq_len),
+        ("batch size", batch_size),
+        ("input size", input_size),
+        ("gate size", gate_size),
+    ] {
+        if value > MAX_EXACT_F32_INTEGER {
+            return Err(format!(
+                "LSTM {label} {value} cannot be represented exactly by synthesized FLOAT slice/shape constants"
+            ));
+        }
+    }
+    Ok(())
 }

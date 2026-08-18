@@ -108,14 +108,24 @@ fn test_range_integer_constant_fold() {
             int64_initializer("limit", &[], &[5]),
             int64_initializer("delta", &[], &[1]),
         ],
-        output: vec![tensor_value_info("seq", &[5])],
-        node: vec![node(
-            "range",
-            "Range",
-            &["start", "limit", "delta"],
-            &["seq"],
-            Vec::new(),
-        )],
+        output: vec![tensor_value_info("out", &[5])],
+        node: vec![
+            node(
+                "range",
+                "Range",
+                &["start", "limit", "delta"],
+                &["seq"],
+                Vec::new(),
+            ),
+            node("seq_shape", "Shape", &["seq"], &["shape"], Vec::new()),
+            node(
+                "materialize",
+                "ConstantOfShape",
+                &["shape"],
+                &["out"],
+                Vec::new(),
+            ),
+        ],
         ..Default::default()
     };
     let bytes = model_from_graph(graph);
@@ -140,14 +150,24 @@ fn test_range_step_two_constant_fold() {
             int64_initializer("limit", &[], &[10]),
             int64_initializer("delta", &[], &[2]),
         ],
-        output: vec![tensor_value_info("seq", &[5])],
-        node: vec![node(
-            "range",
-            "Range",
-            &["start", "limit", "delta"],
-            &["seq"],
-            Vec::new(),
-        )],
+        output: vec![tensor_value_info("out", &[5])],
+        node: vec![
+            node(
+                "range",
+                "Range",
+                &["start", "limit", "delta"],
+                &["seq"],
+                Vec::new(),
+            ),
+            node("seq_shape", "Shape", &["seq"], &["shape"], Vec::new()),
+            node(
+                "materialize",
+                "ConstantOfShape",
+                &["shape"],
+                &["out"],
+                Vec::new(),
+            ),
+        ],
         ..Default::default()
     };
     let bytes = model_from_graph(graph);
@@ -208,7 +228,7 @@ fn test_constant_of_shape_then_range_combined() {
         ],
         output: vec![
             tensor_value_info("cos_out", &[2, 3]),
-            tensor_value_info("seq", &[6]),
+            tensor_value_info("seq_out", &[6]),
         ],
         node: vec![
             node(
@@ -223,6 +243,14 @@ fn test_constant_of_shape_then_range_combined() {
                 "Range",
                 &["start", "limit", "delta"],
                 &["seq"],
+                Vec::new(),
+            ),
+            node("seq_shape", "Shape", &["seq"], &["shape"], Vec::new()),
+            node(
+                "seq_materialize",
+                "ConstantOfShape",
+                &["shape"],
+                &["seq_out"],
                 Vec::new(),
             ),
         ],
@@ -313,14 +341,24 @@ fn test_range_empty_sequence_constant_fold() {
             int64_initializer("limit", &[], &[5]),
             int64_initializer("delta", &[], &[1]),
         ],
-        output: vec![tensor_value_info("seq", &[0])],
-        node: vec![node(
-            "range",
-            "Range",
-            &["start", "limit", "delta"],
-            &["seq"],
-            Vec::new(),
-        )],
+        output: vec![tensor_value_info("out", &[0])],
+        node: vec![
+            node(
+                "range",
+                "Range",
+                &["start", "limit", "delta"],
+                &["seq"],
+                Vec::new(),
+            ),
+            node("seq_shape", "Shape", &["seq"], &["shape"], Vec::new()),
+            node(
+                "materialize",
+                "ConstantOfShape",
+                &["shape"],
+                &["out"],
+                Vec::new(),
+            ),
+        ],
         ..Default::default()
     };
     let bytes = model_from_graph(graph);

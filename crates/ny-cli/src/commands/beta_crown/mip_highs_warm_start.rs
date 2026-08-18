@@ -2,18 +2,18 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// Dense warm-start vector builder for HiGHS MIP solving.
+// Dense warm-start vector builder for MIP solving.
 //
 // Replays the MIP encoder's column creation order and forward-propagates a PGD
 // candidate through the stripped feedforward network to produce a full primal
-// column vector for HiGHS's `try_set_solution()` API.
+// column vector for the backend warm-start API.
 //
 // Part of #3865.
 
 use ndarray::ArrayD;
 use ny_core::Bound;
 
-/// Build a dense HiGHS primal column vector from a PGD candidate input.
+/// Build a dense MIP primal column vector from a PGD candidate input.
 ///
 /// Replays the encoder's column creation order (see `encode_feedforward`,
 /// `encode_linear`, `encode_relu` in `ny-mip/src/encoder.rs`) and fills in

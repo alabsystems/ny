@@ -9,7 +9,7 @@ use super::block_index::{
 };
 use super::scope::detect_block_scope;
 use crate::Network;
-use ny_core::{LayerType, Result};
+use ny_core::{LayerType, NyError, Result};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
@@ -56,6 +56,14 @@ pub(crate) fn parse_whisper_structure(network: &Network) -> Result<WhisperEncode
     }
 
     blocks.sort_by_key(|block| block.index);
+    for (expected, block) in blocks.iter().enumerate() {
+        if block.index != expected {
+            return Err(NyError::InvalidSpec(format!(
+                "Whisper block indices must be contiguous from zero; expected {expected}, got {}",
+                block.index
+            )));
+        }
+    }
     let mut stem_end_idx = blocks
         .first()
         .map(|block| block.start_layer_idx)

@@ -10,6 +10,7 @@
 //! Part of #1475, #114.
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use ny_onnx::vnnlib::load_vnnlib;
 use ny_onnx::{is_multi_output_split, load_onnx, OnnxModel};
 use serde::{Deserialize, Serialize};
@@ -135,6 +136,26 @@ impl Default for VnncompAuditArgs {
     }
 }
 
+/// VNN-LIB corpus version used by versioned VNN-COMP benchmark layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+pub(crate) enum VnnlibVersion {
+    #[serde(rename = "1.0")]
+    #[value(name = "1.0")]
+    V1,
+    #[serde(rename = "2.0")]
+    #[value(name = "2.0")]
+    V2,
+}
+
+impl VnnlibVersion {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "1.0",
+            Self::V2 => "2.0",
+        }
+    }
+}
+
 /// Discover benchmark categories for a given year.
 pub(crate) fn discover_categories(year: u32) -> Result<Vec<(String, PathBuf)>> {
     let bench_dir = get_benchmark_dir(year)?;
@@ -177,29 +198,96 @@ fn get_benchmark_dir(year: u32) -> Result<PathBuf> {
 }
 
 /// Find the instances CSV for a category.
-fn find_instances_csv(category_dir: &Path) -> Option<PathBuf> {
-    let mut stack = vec![category_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path())
-            .collect();
-        entries.sort();
+///
+/// A top-level `instances.csv` is authoritative: setup scripts can unpack
+/// unrelated payloads with that name below data directories. Otherwise only
+/// direct version children are considered. Parallel version lists are never
+/// guessed between.
+pub(crate) fn instances_csv_for(
+    category_dir: &Path,
+    version: Option<VnnlibVersion>,
+) -> Result<Option<PathBuf>> {
+    fn lists_in(dir: &Path) -> Result<Vec<PathBuf>> {
+        let exact = dir.join("instances.csv");
+        if exact.is_file() {
+            return Ok(vec![exact]);
+        }
 
-        for path in entries {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if path.is_file() && (name.ends_with("_instances.csv") || name == "instances.csv") {
-                    return Some(path);
-                }
-            }
-            if path.is_dir() {
-                stack.push(path);
+        let mut legacy = Vec::new();
+        for entry in std::fs::read_dir(dir)
+            .with_context(|| format!("read benchmark category directory {}", dir.display()))?
+        {
+            let path = entry?.path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_instances.csv"))
+            {
+                legacy.push(path);
             }
         }
+        legacy.sort();
+        Ok(legacy)
     }
 
-    None
+    let render_candidates = |candidates: &[PathBuf]| {
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if let Some(version) = version {
+        let selected_dir = category_dir.join(version.as_str());
+        let candidates = if selected_dir.is_dir() {
+            lists_in(&selected_dir)?
+        } else {
+            Vec::new()
+        };
+        return match candidates.as_slice() {
+            [only] => Ok(Some(only.clone())),
+            [] => anyhow::bail!(
+                "requested VNN-LIB version {} has no instances.csv under {}",
+                version.as_str(),
+                category_dir.display()
+            ),
+            _ => anyhow::bail!(
+                "VNN-LIB version {} has multiple instance lists under {}: {}",
+                version.as_str(),
+                selected_dir.display(),
+                render_candidates(&candidates)
+            ),
+        };
+    }
+
+    // Flat layouts are authoritative even if setup unpacked nested files.
+    let top_level = category_dir.join("instances.csv");
+    if top_level.is_file() {
+        return Ok(Some(top_level));
+    }
+
+    let mut candidates = lists_in(category_dir)?;
+    for known_version in [VnnlibVersion::V1, VnnlibVersion::V2] {
+        let path = category_dir.join(known_version.as_str());
+        if path.is_dir() {
+            candidates.extend(lists_in(&path)?);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        _ => anyhow::bail!(
+            "multiple VNN-COMP instance lists found under {}: {}; pass \
+             --vnnlib-version 1.0 or --vnnlib-version 2.0",
+            category_dir.display(),
+            render_candidates(&candidates)
+        ),
+    }
 }
 
 /// Parse first instance from instances CSV.
@@ -221,7 +309,8 @@ fn parse_first_instance(
             continue;
         }
 
-        let parts = split_csv_line(trimmed);
+        let parts = parse_csv_line(trimmed)
+            .with_context(|| format!("invalid CSV row in {}", csv_path.display()))?;
         if parts.len() < 2 {
             continue;
         }
@@ -264,35 +353,85 @@ fn parse_first_instance(
     }
 }
 
-fn split_csv_line(line: &str) -> Vec<String> {
+/// Parse one CSV line, honoring quoted fields and rejecting malformed quoting.
+///
+/// Shared with `ny benchmarks run`: the paired/relational ONNX field embeds
+/// commas inside quotes, so a plain `split(',')` corrupts those rows.
+///
+/// Benchmark paths cannot contain record separators in the VNN-COMP protocol,
+/// so this deliberately parses exactly one physical line rather than accepting
+/// multiline CSV fields.
+pub(crate) fn parse_csv_line(line: &str) -> Result<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Start,
+        Unquoted,
+        Quoted,
+        AfterQuote,
+    }
+
     let mut fields = Vec::new();
     let mut field = String::new();
-    let mut in_quotes = false;
+    let mut state = State::Start;
     let mut chars = line.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        match ch {
-            '"' => {
-                if in_quotes && chars.peek() == Some(&'"') {
+        match state {
+            State::Start => match ch {
+                ',' => {
+                    fields.push(String::new());
+                }
+                '"' => {
+                    state = State::Quoted;
+                }
+                '\n' | '\r' => anyhow::bail!("CSV record contains a line separator"),
+                _ => {
+                    field.push(ch);
+                    state = State::Unquoted;
+                }
+            },
+            State::Unquoted => match ch {
+                ',' => {
+                    fields.push(field.trim().to_string());
+                    field.clear();
+                    state = State::Start;
+                }
+                '"' => anyhow::bail!("quote appears inside an unquoted CSV field"),
+                '\n' | '\r' => anyhow::bail!("CSV record contains a line separator"),
+                _ => field.push(ch),
+            },
+            State::Quoted => match ch {
+                '"' if chars.peek() == Some(&'"') => {
                     field.push('"');
                     chars.next();
-                } else {
-                    in_quotes = !in_quotes;
                 }
-            }
-            ',' if !in_quotes => {
-                fields.push(field.trim().to_string());
-                field.clear();
-            }
-            _ => field.push(ch),
+                '"' => state = State::AfterQuote,
+                '\n' | '\r' => anyhow::bail!("CSV record contains a line separator"),
+                _ => field.push(ch),
+            },
+            State::AfterQuote => match ch {
+                ',' => {
+                    fields.push(field.trim().to_string());
+                    field.clear();
+                    state = State::Start;
+                }
+                ch if ch.is_whitespace() => {}
+                _ => anyhow::bail!("non-whitespace data follows a closing CSV quote"),
+            },
         }
     }
 
+    if matches!(state, State::Quoted) {
+        anyhow::bail!("unterminated quoted CSV field");
+    }
     fields.push(field.trim().to_string());
-    fields
+    Ok(fields)
 }
 
-fn network_paths(field: &str) -> Vec<String> {
+/// Extract every `*.onnx` path embedded in an instance-CSV model field,
+/// including the paired/relational python-literal form. Shared with
+/// `ny benchmarks reseed`.
+pub(crate) fn network_paths(field: &str) -> Vec<String> {
     let trimmed = field.trim();
     let mut paths = Vec::new();
     let mut rest = trimmed;
@@ -379,9 +518,24 @@ fn audit_category(name: &str, path: &Path, year: u32) -> CategoryAuditResult {
     let start = Instant::now();
 
     // Find instances CSV
-    let csv_path = match find_instances_csv(path) {
-        Some(p) => p,
-        None => {
+    let csv_path = match instances_csv_for(path, None) {
+        Ok(Some(p)) => p,
+        Err(error) => {
+            return CategoryAuditResult {
+                name: name.to_string(),
+                year,
+                instance_count: 0,
+                status: CategoryStatus::UnsupportedLoad {
+                    reason: error.to_string(),
+                },
+                sample_model: None,
+                sample_property: None,
+                test_time_ms: start.elapsed().as_millis() as u64,
+                operators: vec![],
+                error_details: Some(error.to_string()),
+            };
+        }
+        Ok(None) => {
             // Try to find any ONNX model directly
             let has_onnx = std::fs::read_dir(path)
                 .map(|entries| {
@@ -1032,13 +1186,126 @@ mod tests {
     }
 
     #[test]
-    fn test_split_csv_line_preserves_quoted_model_tuple() {
-        let fields = split_csv_line(
+    fn test_parse_csv_line_preserves_quoted_model_tuple() {
+        let fields = parse_csv_line(
             "\"[('f', 'onnx/original/model.onnx'), ('g', 'onnx/perturbed/model.onnx')]\",./vnnlib/instance_0.vnnlib,100",
-        );
+        )
+        .expect("valid CSV");
 
         assert_eq!(fields.len(), 3);
         assert_eq!(first_network_path(&fields[0]), "onnx/original/model.onnx");
         assert_eq!(fields[1], "./vnnlib/instance_0.vnnlib");
+    }
+
+    #[test]
+    fn parse_csv_line_rejects_malformed_quoting() {
+        assert!(parse_csv_line("\"unterminated,p.vnnlib,10").is_err());
+        assert!(parse_csv_line("bad\"quote,p.vnnlib,10").is_err());
+        assert!(parse_csv_line("\"closed\"junk,p.vnnlib,10").is_err());
+    }
+
+    #[test]
+    fn instances_csv_resolver_preserves_unambiguous_flat_layout() {
+        let category = tempfile::tempdir().expect("category");
+        let expected = category.path().join("instances.csv");
+        std::fs::write(&expected, "m.onnx,p.vnnlib,10\n").expect("instances");
+
+        assert_eq!(
+            instances_csv_for(category.path(), None).expect("resolve"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn instances_csv_resolver_treats_top_level_list_as_authoritative() {
+        let category = tempfile::tempdir().expect("category");
+        let expected = category.path().join("instances.csv");
+        std::fs::write(&expected, "m.onnx,p.vnnlib,10\n").expect("instances");
+        std::fs::create_dir(category.path().join("vnnlib")).expect("payload directory");
+        std::fs::write(
+            category.path().join("vnnlib/instances.csv"),
+            "payload,not,a-list\n",
+        )
+        .expect("payload");
+
+        assert_eq!(
+            instances_csv_for(category.path(), None).expect("resolve"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn instances_csv_resolver_ignores_nested_payload_lists() {
+        let category = tempfile::tempdir().expect("category");
+        std::fs::create_dir(category.path().join("vnnlib")).expect("payload directory");
+        std::fs::write(
+            category.path().join("vnnlib/instances.csv"),
+            "payload,not,a-list\n",
+        )
+        .expect("payload");
+
+        assert_eq!(
+            instances_csv_for(category.path(), None).expect("resolve"),
+            None
+        );
+    }
+
+    #[test]
+    fn instances_csv_resolver_rejects_parallel_versions_without_selector() {
+        let category = tempfile::tempdir().expect("category");
+        for version in ["1.0", "2.0"] {
+            std::fs::create_dir(category.path().join(version)).expect("version directory");
+            std::fs::write(
+                category.path().join(version).join("instances.csv"),
+                "m.onnx,p.vnnlib,10\n",
+            )
+            .expect("instances");
+        }
+
+        let error = instances_csv_for(category.path(), None)
+            .expect_err("parallel versions must be ambiguous");
+        // The message renders paths with `Path::display`, i.e. the HOST
+        // separator, so normalize before matching POSIX-shaped needles.
+        let message = error.to_string().replace('\\', "/");
+        assert!(message.contains("--vnnlib-version"));
+        assert!(message.contains("1.0/instances.csv"));
+        assert!(message.contains("2.0/instances.csv"));
+    }
+
+    #[test]
+    fn instances_csv_resolver_selects_requested_version_only() {
+        let category = tempfile::tempdir().expect("category");
+        for version in ["1.0", "2.0"] {
+            std::fs::create_dir(category.path().join(version)).expect("version directory");
+            std::fs::write(
+                category.path().join(version).join("instances.csv"),
+                "m.onnx,p.vnnlib,10\n",
+            )
+            .expect("instances");
+        }
+
+        assert_eq!(
+            instances_csv_for(category.path(), Some(VnnlibVersion::V1)).expect("select 1.0"),
+            Some(category.path().join("1.0/instances.csv"))
+        );
+        assert_eq!(
+            instances_csv_for(category.path(), Some(VnnlibVersion::V2)).expect("select 2.0"),
+            Some(category.path().join("2.0/instances.csv"))
+        );
+    }
+
+    #[test]
+    fn instances_csv_resolver_never_falls_back_from_missing_requested_version() {
+        let category = tempfile::tempdir().expect("category");
+        std::fs::create_dir(category.path().join("1.0")).expect("version directory");
+        std::fs::write(
+            category.path().join("1.0/instances.csv"),
+            "m.onnx,p.vnnlib,10\n",
+        )
+        .expect("instances");
+
+        let error = instances_csv_for(category.path(), Some(VnnlibVersion::V2))
+            .expect_err("a requested version must never fall back");
+        assert!(error.to_string().contains("version 2.0"));
     }
 }

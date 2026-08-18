@@ -16,6 +16,7 @@ mod aggregate;
 mod bab_loop;
 mod child_eval;
 mod domain_filter;
+pub(super) mod queue_budget;
 mod split;
 mod status;
 
@@ -116,6 +117,7 @@ impl BetaCrownVerifier {
         std::collections::HashMap<String, BoundedTensor>,
         BoundedTensor,
     )> {
+        self.config.validate()?;
         let graph = self.configured_graph_for_crown(graph);
         let graph = &graph;
         let engine = self.engine();

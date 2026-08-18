@@ -383,7 +383,7 @@ fn test_layernorm_crown_propagation_through_network() {
                 .view()
                 .into_dimensionality::<ndarray::Ix1>()
                 .unwrap(),
-        ) + linear.bias.as_ref().unwrap();
+        ) + linear.bias().unwrap();
 
         // Forward through LayerNorm
         let ln_out = ln.eval(&linear_out).unwrap();

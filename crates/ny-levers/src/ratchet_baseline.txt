@@ -1,0 +1,68 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# RATCHET BASELINE — raw `NY_*` process-environment reads in crates/**/*.rs.
+#
+# Counted by crates/ny-levers/tests/ratchet.rs as occurrences of the exact
+# substrings `env::var("NY_` and `env::var_os("NY_`, skipping any path
+# containing "/target/", "/.lake/" or "/proofs/lean/".
+#
+# This number may only ever go DOWN. It is not a budget to spend: the canonical
+# gate requires an exact match, and every migration of a counted occurrence
+# into ny-levers lowers this file in the SAME commit. This net-count tripwire
+# deliberately does not claim to see aliases, wrappers, multiline calls, or a
+# same-count substitution. See docs/LEVER_DEBT_EXECUTION_PLAN_2026-08-11.md
+# phase 0b; the plan's target for these two direct-literal forms is 0.
+#
+# 2026-08-11  851   Phase 0 landing measurement (743 var + 108 var_os across
+#                   227 files). The design snapshot records 853 at commit
+#                   baa56fc9 using `git grep -o -E` over tracked files; that
+#                   different commit and scope explain the two-read delta.
+#                   This file records what THIS test measures, at the tree it
+#                   measures it on.
+# 2026-08-11  851   Alpha-zero-yield presence hardening changed one direct
+#                   literal read from `var` to `var_os`: 742 var + 109 var_os,
+#                   still across 227 files. Total debt is unchanged.
+# 2026-08-11  830   Phase 1 wave 1 (-1: NY_MN_HEAD_F64_MEASURE_ARM deleted,
+#                   ny-core/head_f64_fold.rs, zero callers) + B1 parser/
+#                   declaration prep (-20: the 7 telemetry-latch files now
+#                   use dynamic-name chokepoints/raw-string latches;
+#                   NY_MIP_TRACE's 14 per-call reads collapsed into one
+#                   helper). Runtime sites do not yet consume a per-run
+#                   LeverSet, so this is not Phase 2 completion.
+# 2026-08-11  829   Centralized all three reads of the two collection-policy
+#                   overrides added around the wave boundary. The prior tree
+#                   had one MAX_DIM read; current main added a second MAX_DIM
+#                   reader and the walk-record opt-out, so removing all three
+#                   makes the net ratchet one lower than 830. Incoming main
+#                   also added NY_CLIP_HOST_MEAN_LA and this change routes it
+#                   through the same chokepoint, a net-zero add/remove. Final:
+#                   734 var + 95 var_os. Runtime consumers remain migration-prep readers.
+# 2026-08-11  828   `NY_BENCH_ROOT` / `NY_BENCH_ROOT_2026` consolidated. Three
+#                   ny-onnx corpus tests carried near-identical `benchmark_root()`
+#                   copies and a fourth arrived with the 2026 tree, taking the
+#                   count to 830 (+1). Rather than raise the baseline — which
+#                   this file forbids — the four copies became one shared
+#                   `tests/common/mod.rs` helper with a dynamic-name read, the
+#                   same chokepoint shape the wave-1 telemetry latches used. Net
+#                   -1 against 829: 735 var + 93 var_os.
+# 2026-08-11  827   Governed the new wide-subgroup and authoritative-deadline
+#                   chunk selectors plus BOTH readers of the existing global
+#                   wide-kernel kill switch. Incoming main added three counted
+#                   reads (828 -> 831); migrating all four sites through typed
+#                   declarations makes the resulting debt one lower than the
+#                   prior baseline: 734 var + 93 var_os.
+# 2026-08-12  826   Declared the default-dark NY_ALPHA_ENVELOPE_GRAD experiment
+#                   and routed its root-alpha reader through the typed Boolean
+#                   chokepoint: 733 var + 93 var_os.
+# 2026-08-12  823   Governed the three resident-GPU readers of the shared
+#                   segment-composition diagnostic probe through one typed
+#                   declaration while preserving its exact live-read parser:
+#                   730 var + 93 var_os.
+# 2026-08-13  821   Governed the two CLI startup-admission reads of
+#                   `NY_CUDA_DISCRETE_MODE` through its typed, exact-one
+#                   declaration. The authoritative ny-cuda parser remains
+#                   direct and fail-closed because it must reject every value
+#                   other than exact 0 or 1: 727 var + 94 var_os.
+821

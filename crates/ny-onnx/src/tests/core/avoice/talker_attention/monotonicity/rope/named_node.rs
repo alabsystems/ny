@@ -56,8 +56,9 @@ fn assert_monotonicity_stats_no_looser(
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_real_rope_softmax_crown_ibp_named_node_metrics_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, softmax_name) = talker_attention_softmax_output_graph_real_rope();
     let input = bounded_hidden_states_input(TALKER_ATTENTION_SEQ_LEN, TALKER_ATTENTION_EPSILON);
 

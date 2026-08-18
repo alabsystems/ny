@@ -13,8 +13,9 @@ use super::*;
 /// Part of #3654.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_talker_softmax_range_verifier_smoke_3654() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (softmax_graph, softmax_name, input, output_size) =
         talker_verifier::talker_softmax_verifier_setup();
 
@@ -49,8 +50,9 @@ fn test_avoice_talker_softmax_range_verifier_smoke_3654() {
 /// Part of #4061.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_talker_softmax_impossible_spec_verifier_smoke_4061() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let label = "talker softmax impossible-spec IBP verifier smoke";
     let (softmax_graph, _softmax_name, input, output_size) =
         talker_verifier::talker_softmax_verifier_setup();

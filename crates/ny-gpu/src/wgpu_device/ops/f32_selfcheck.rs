@@ -2,14 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-adapter IEEE-754 f32-model self-check that AUTHORIZES the authoritative
-//! sound-GPU verdict path (#gpu-f32-selfcheck).
+//! Per-adapter IEEE-754 f32-model diagnostic and future capability prerequisite
+//! (#gpu-f32-selfcheck).
 //!
 //! # Why this exists (soundness)
 //!
-//! NY's sound GPU-resident CROWN/IBP kernels are DIRECTLY authoritative for
-//! `unsat`-via-bound verdicts (no CPU f64 re-check of the returned bound). Their
-//! enclosure is sound BY CONSTRUCTION on any conformant IEEE-754 f32 backend:
+//! Candidate sound GPU-resident CROWN/IBP kernels rely on a conformant
+//! IEEE-754 f32 backend:
 //! Higham `γ_k` reduction radii, NORMAL-range (FTZ-safe) underflow floors, and
 //! integer-bitcast directed rounding (`round_up_pos(x) = bitcast<f32>(bitcast<u32>(x)
 //! + 1u)`). The ONE residual assumption is that the LIVE GPU adapter actually
@@ -19,16 +18,56 @@
 //!     rounding, and
 //!   * IEEE bit-exact `bitcast<u32>` / `bitcast<f32>`.
 //!
-//! On Metal (Apple Silicon) that holds. On a hypothetical NVIDIA/Vulkan driver it
-//! SHOULD hold but must be VERIFIED per-adapter, not assumed (see
+//! This probe checks that prerequisite per adapter rather than assuming it (see
 //! `docs/F32_ABSSUM_SEAM.md` §5.1 on the cuBLAS-TF32 concern). This module runs a
 //! tiny one-time compute shader that measures those exact primitives and compares
 //! the on-device bit patterns byte-for-byte against a CPU reference. On ANY mismatch,
-//! readback error, or dispatch error it returns `false` (CONSERVATIVE, fail-closed) —
-//! and [`WgpuDevice::provides_sound_gpu_crown`] / `_ibp` / `_dag_ibp` then advertise
-//! `false`, so the soundness gate routes verdicts to the proven-sound CPU `f64+γ·S`
-//! fallback instead. The self-check is itself soundness-critical, so it trusts NO GPU
-//! value it has not bit-checked against a CPU reference.
+//! readback error, or dispatch error it returns `false` (conservative and fail-closed).
+//! A passing result is necessary but not sufficient for verdict authority.
+//!
+//! # Where this probe's result is CONSUMED (updated #gpu-typed-authority)
+//!
+//! This is rung 1 of the qualification ladder in `ops/sound_authority.rs`.
+//! The U1/U3/U4/U5/U6 ledger and B0 review are discharged and the raw-device
+//! source gate is open. The typed explicit verdict constructor plus all five
+//! passing live probes may therefore expose the exact `WgpuDevice` sound-CROWN
+//! seam; this rung alone never grants authority. Ordinary device construction
+//! remains unarmed.
+//!
+//! `provides_sound_gpu_ibp` and `provides_sound_gpu_dag_ibp` DO remain
+//! unconditionally `false`. The retained diagnostic ladder pertains to the
+//! CROWN backward seam, which is the only one with a compensated-error channel.
+//!
+//! # The alleged contradiction with `crown_partial_gpu.rs` — RESOLVED, there is none
+//!
+//! `docs/MACOS_ACCELERATION_RESEARCH_2026-08-01.md` flagged this header's former
+//! claim ("WGPU remains unconditionally quarantined; all `provides_sound_gpu_*`
+//! return `false`") as contradicted by a "live sound-resident dispatch" at
+//! `ny-propagate .../network/ibp/crown_partial_gpu.rs:150-160`. Traced
+//! 2026-08-04: **both statements were true and there was no contradiction.**
+//! That dispatch is `if use_sound { crown_backward_gpu_sound(..) } else {
+//! crown_backward_gpu(..) }`, and `use_sound` is not a local decision — it is the
+//! second element of the tuple returned by `gpu_crown_backward_route_with_deadline`,
+//! which grants `true` only after `.filter(|g| g.provides_sound_gpu_crown())`.
+//! At that checkpoint the sound-resident dispatch was reachable **on CUDA** and
+//! statically unreachable on wgpu, so there was no quarantine leak. Since the
+//! 2026-08-11 B0 review, a `WgpuDevice` can pass the same filter only after its
+//! typed explicit constructor records a complete passing live ladder. The
+//! `ComputeDevice` proof constructor delegates only that qualified CROWN
+//! accessor. No unfiltered sound dispatch exists.
+//!
+//! # "WGSL has no f64" is NOT an authority blocker
+//!
+//! Struck across the tree 2026-08-04. The literal fact is true, but the sound
+//! lane's certified error term has never needed f64: it is Higham `γ_k·S` in
+//! pure f32 with host-side outward-rounded uniforms (`sound_consts.rs:13` —
+//! "no f64 ever enters a WGSL body"), and the EFT channel adds an f64-grade
+//! compensated residual, whose two primitives measured bit-exact on an Apple
+//! M5 Max / Metal adapter on 2026-08-04 (fma TwoProduct 509/509 lanes,
+//! fma-barrier TwoSum 307/307, 0.000e0 ULP). Bit-exact primitives are NOT
+//! verdict authority. The later U1/U3/U4/U5/U6 discharges and B0 decision are
+//! recorded in `ops/sound_authority.rs` and
+//! `docs/CURRENT_STATE_2026-08-10.md`.
 //!
 //! # The probe (shader [`IEEE_F32_SELFCHECK_SHADER`], one single-thread dispatch)
 //! Every operand is read from a storage buffer at runtime so the shader compiler
@@ -79,7 +118,7 @@ struct F32SelfCheckParams {
 /// Input operand bit patterns (host-provided; read at runtime by the shader). The
 /// CPU reference below recomputes every expectation from these SAME bits, so there
 /// is one source of truth for the operands.
-const INP: [u32; 10] = [
+const INP: [u32; 11] = [
     0x3F80_0000, // [0] 1.0
     0x3400_0000, // [1] 2^-23  (ULP of 1.0)
     0x3F80_0800, // [2] 1 + 2^-12
@@ -89,15 +128,16 @@ const INP: [u32; 10] = [
     0x3400_0000, // 2^-23 (tiny positive)
     0x0C00_0000, // 2^-103 (small NORMAL — survives FTZ; not a subnormal)
     0x7148_1CC8, // ~9.9e29 (large finite)
+    0x0000_0001, // smallest positive subnormal → normal FTZ-safe floor
     0x0000_0000, // +0.0  → round_up_pos returns 0
-    0xBF80_0000, // -1.0  → x ≤ 0 → round_up_pos returns 0
+    0xBF80_0000, // -1.0  → negative input returns 0
 ];
 const ACC_ITERS: u32 = 16;
-const N_ROUND: u32 = 6;
+const N_ROUND: u32 = 7;
 const ROUND_BASE: u32 = 4;
 const OUT_ROUND_BASE: u32 = 3;
 /// 3 scalar probes (add/prod/acc) + `N_ROUND` directed-rounding + 1 FMA.
-const OUT_LEN: usize = OUT_ROUND_BASE as usize + N_ROUND as usize + 1; // = 10
+const OUT_LEN: usize = OUT_ROUND_BASE as usize + N_ROUND as usize + 1; // = 11
 
 /// Generous within-model tolerance for the FMA/`a*b+c` probe. The legitimate spread
 /// between an FMA (single rounding) and a two-step (double rounding) evaluation of
@@ -117,10 +157,14 @@ struct Params { acc_iters: u32, n_round: u32, round_base: u32, out_round_base: u
 @group(0) @binding(2) var<storage, read_write>  outp: array<u32>;
 
 // Byte-identical to shaders.rs IBP_SOUND_PRELUDE::round_up_pos (the load-bearing
-// outward-rounding primitive): smallest f32 >= x for x >= 0 via the +1-ULP bitcast.
+// outward-rounding primitive): a bit-classified successor with a normal FTZ floor.
 fn round_up_pos(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
-    return bitcast<f32>(bitcast<u32>(x) + 1u);
+    let bits = bitcast<u32>(x);
+    let magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) { return x; }
+    if ((bits & 0x80000000u) != 0u || magnitude == 0u) { return 0.0; }
+    if (magnitude < 0x00800000u) { return 1.1754944e-38; }
+    return bitcast<f32>(bits + 1u);
 }
 
 @compute @workgroup_size(1)
@@ -176,6 +220,12 @@ fn selfcheck_forced_to_fail() -> bool {
     TEST_FORCE_FAIL.load(Ordering::Relaxed) || env_forces_fail()
 }
 
+/// Never-opening visibility for higher-level authority predicates. The hook
+/// can only revoke a previously measured prerequisite.
+pub(crate) fn probe_forced_to_fail() -> bool {
+    selfcheck_forced_to_fail()
+}
+
 /// Test hook: force / release a self-check failure to exercise the fail-safe route
 /// without a non-conformant adapter. Process-global; tests hold `gpu_test_serial_guard`
 /// while it is set so it cannot leak into a concurrent test. Gated to the gpu-tests
@@ -185,25 +235,29 @@ pub(crate) fn set_force_f32_selfcheck_fail(force: bool) {
     TEST_FORCE_FAIL.store(force, Ordering::Relaxed);
 }
 
-/// CPU reference for the WGSL `round_up_pos` (mirrors it EXACTLY): 0 for `x ≤ 0`,
-/// else the +1-ULP bit pattern.
+/// CPU reference for the WGSL `round_up_pos` (mirrors its integer classification
+/// exactly, including the normal floor for a positive nonzero subnormal).
 fn round_up_pos_ref(bits: u32) -> u32 {
-    let x = f32::from_bits(bits);
-    if x <= 0.0 {
-        0
-    } else {
-        bits.wrapping_add(1)
+    let magnitude = bits & 0x7fff_ffff;
+    if magnitude >= 0x7f80_0000 {
+        return bits;
     }
+    if bits & 0x8000_0000 != 0 || magnitude == 0 {
+        return 0;
+    }
+    if magnitude < 0x0080_0000 {
+        return 0x0080_0000;
+    }
+    bits + 1
 }
 
 impl WgpuDevice {
-    /// One-time per-adapter authorization for the authoritative sound-GPU verdict
-    /// path: `true` ⇒ this adapter provably executes WGSL f32 at true `u = 2^-24`
-    /// with bit-exact `bitcast` directed rounding (probe details in the module doc);
-    /// `false` ⇒ a probe mismatched / faulted, so the sound-GPU path is DISABLED and
-    /// verdicts fall back to the CPU `f64+γ·S` sound path (fail-safe, never a wrong
-    /// verdict). The probe runs EXACTLY once per device (cached); this method is the
-    /// cheap cached read consulted by `provides_sound_gpu_crown` / `_ibp` / `_dag_ibp`.
+    /// One-time per-adapter f32 conformance diagnostic.
+    ///
+    /// `true` proves only the tested arithmetic primitives. It does not
+    /// authorize verdict use: the independent WGPU production-authority
+    /// quarantine remains engaged regardless. The result is cached once per
+    /// device.
     pub(crate) fn verify_ieee_f32_model(&self) -> bool {
         // Fail-safe override (tests + operators): report failure without consulting —
         // or polluting — the cached real result, so the fallback path is exercised.
@@ -215,6 +269,17 @@ impl WgpuDevice {
             .get_or_init(|| self.run_ieee_f32_selfcheck())
     }
 
+    /// Never-initializing cached read of [`Self::verify_ieee_f32_model`], for
+    /// call sites already INSIDE a GPU-checked section (first-initializing the
+    /// probe there would self-deadlock on the enclosing lock — same hazard the
+    /// EFT gate documents). Uninitialized ⇒ `false` (fail-closed).
+    pub(crate) fn f32_model_cached(&self) -> bool {
+        if selfcheck_forced_to_fail() {
+            return false;
+        }
+        self.f32_selfcheck.get().copied().unwrap_or(false)
+    }
+
     /// Run (and log) the one-time probe. CONSERVATIVE: any mismatch OR GPU error → `false`.
     fn run_ieee_f32_selfcheck(&self) -> bool {
         match self.run_gpu_checked("verify_ieee_f32_model", || self.ieee_f32_selfcheck_inner()) {
@@ -224,9 +289,8 @@ impl WgpuDevice {
                     target: "ny_gpu::wgpu",
                     adapter = %self.adapter_info.name,
                     backend = ?self.adapter_info.backend,
-                    "IEEE-754 f32-model self-check FAILED (a probe mismatched the CPU reference): \
-                     DISABLING the authoritative sound-GPU verdict path on this adapter; verdicts \
-                     fall back to the CPU f64+γ·S sound path (fail-safe, never a wrong verdict)"
+                    "IEEE-754 f32-model diagnostic FAILED (a probe mismatched the CPU reference); \
+                     refusing raw WGPU CROWN qualification"
                 );
                 false
             }
@@ -236,8 +300,8 @@ impl WgpuDevice {
                     adapter = %self.adapter_info.name,
                     backend = ?self.adapter_info.backend,
                     error = %e,
-                    "IEEE-754 f32-model self-check could not run (GPU dispatch/readback error): \
-                     DISABLING the authoritative sound-GPU verdict path (fail-safe to CPU sound)"
+                    "IEEE-754 f32-model diagnostic could not run (GPU dispatch/readback error); \
+                     refusing raw WGPU CROWN qualification"
                 );
                 false
             }
@@ -403,6 +467,7 @@ mod tests {
         assert_eq!(acc.to_bits(), 0x3F80_0010, "1.0 + 16*2^-23");
         // Directed-rounding references.
         assert_eq!(round_up_pos_ref(0x3F80_0000), 0x3F80_0001); // 1.0 -> next up
+        assert_eq!(round_up_pos_ref(0x0000_0001), 0x0080_0000); // subnormal -> normal floor
         assert_eq!(round_up_pos_ref(0x0000_0000), 0x0000_0000); // +0.0 -> 0
         assert_eq!(round_up_pos_ref(0xBF80_0000), 0x0000_0000); // -1.0 -> 0
     }
@@ -410,7 +475,7 @@ mod tests {
     /// `OUT_LEN` matches the shader's write layout (3 scalars + N_ROUND + 1 FMA).
     #[test]
     fn out_len_matches_layout() {
-        assert_eq!(OUT_LEN, 10);
+        assert_eq!(OUT_LEN, 11);
         assert_eq!(OUT_ROUND_BASE as usize + N_ROUND as usize, OUT_LEN - 1);
         assert_eq!(ROUND_BASE as usize + N_ROUND as usize, INP.len());
     }
@@ -432,11 +497,10 @@ mod gpu_tests {
         }
     }
 
-    /// On THIS (Metal) adapter the probe PASSES: `verify_ieee_f32_model()` is `true`
-    /// and all three `provides_sound_gpu_*` predicates stay `true` — the authoritative
-    /// Metal sound path is NOT regressed.
+    /// The hardware f32 probe may pass, but without an explicit request and the
+    /// complete ladder the default raw route remains unavailable.
     #[test]
-    fn metal_adapter_passes_selfcheck_and_keeps_sound_path() {
+    fn passing_selfcheck_alone_does_not_bypass_full_qualification() {
         let _serial = gpu_test_serial_guard();
         let device = require_device();
 
@@ -444,9 +508,9 @@ mod gpu_tests {
             device.verify_ieee_f32_model(),
             "the Metal adapter must PASS the IEEE-754 f32-model self-check"
         );
-        assert!(device.provides_sound_gpu_crown());
-        assert!(device.provides_sound_gpu_ibp());
-        assert!(device.provides_sound_gpu_dag_ibp());
+        assert!(!device.provides_sound_gpu_crown());
+        assert!(!device.provides_sound_gpu_ibp());
+        assert!(!device.provides_sound_gpu_dag_ibp());
 
         // The gate's exact filter still exposes the sound GPU CROWN backward.
         // (Kept as the route's literal `.filter(...)` chain, bound to a local so the
@@ -456,8 +520,8 @@ mod gpu_tests {
             .as_gpu_crown_backward()
             .filter(|g| g.provides_sound_gpu_crown());
         assert!(
-            routed.is_some(),
-            "a passing adapter must remain routable as the sound GPU CROWN backward"
+            routed.is_none(),
+            "one passing rung must not bypass the full WGPU qualification"
         );
     }
 
@@ -494,6 +558,6 @@ mod gpu_tests {
             device.verify_ieee_f32_model(),
             "releasing the override restores the real (passing) Metal result"
         );
-        assert!(device.provides_sound_gpu_crown());
+        assert!(!device.provides_sound_gpu_crown());
     }
 }

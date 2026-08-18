@@ -4,12 +4,14 @@
 
 //! Initial bound computation helpers.
 
-use ny_core::{GemmEngine, Result};
+use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::debug;
 
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::network::ibp::helpers::crown_ibp_partial_node_count;
+use crate::network::ibp::NetworkIbpExt;
+use crate::types::CrownIbpBoundsResult;
 use crate::Network;
 
 use super::tensor_ext::BoundedTensorExt;
@@ -40,6 +42,37 @@ pub(in crate::beta_crown::engine) fn crown_ibp_budget_exceeded(
 }
 
 impl BetaCrownVerifier {
+    /// Collect sequential CROWN-IBP bounds with this verifier's configured
+    /// per-node floor/cap. Both the fresh-IBP and precomputed-IBP paths pass
+    /// through this helper so preset policy is not replaced by the
+    /// backwards-compatible `Network` API default.
+    pub(in crate::beta_crown::engine) fn collect_sequential_crown_ibp_bounds_with_status(
+        &self,
+        network: &Network,
+        input: &BoundedTensor,
+        precomputed_ibp: Option<Vec<BoundedTensor>>,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<CrownIbpBoundsResult> {
+        let per_node_time_budget = self.config.crown_ibp_per_node_time_budget();
+        match precomputed_ibp {
+            Some(ibp_bounds) => network
+                .collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_impl(
+                    input,
+                    ibp_bounds,
+                    engine,
+                    deadline,
+                    &per_node_time_budget,
+                ),
+            None => network.collect_crown_ibp_bounds_with_engine_deadline_budget_and_status_impl(
+                input,
+                engine,
+                deadline,
+                &per_node_time_budget,
+            ),
+        }
+    }
+
     /// Intersect the sequential α-CROWN root bound with the `GraphNetwork`
     /// α-CROWN bound for the equivalent network, returning the tighter (sound)
     /// bound. See call site in `compute_initial_bounds_and_layer_bounds_engine`
@@ -139,6 +172,11 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<std::time::Instant>,
     ) -> Result<InitialBoundsComputation> {
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(
+                "sequential beta-CROWN: deadline exceeded before initial-bound setup".to_string(),
+            ));
+        }
         let mut cached_ibp_bounds = None;
         let budget_exceeded = crown_ibp_budget_exceeded(&self.config, network);
         let use_crown_ibp_layer_bounds = self.config.use_crown_ibp && !budget_exceeded;
@@ -174,6 +212,7 @@ impl BetaCrownVerifier {
                     );
                     cached_ibp_bounds = Some(ibp_layer_bounds);
                 }
+                Err(err @ NyError::DeadlineExceeded(_)) => return Err(err),
                 Err(err) => {
                     debug!("IBP fast-path failed: {}, proceeding to CROWN", err);
                 }
@@ -181,11 +220,16 @@ impl BetaCrownVerifier {
         }
 
         let mut cached_root_layer_bounds = match (use_crown_ibp_layer_bounds, cached_ibp_bounds) {
-            (true, Some(ibp_bounds)) => {
-                Some(network.collect_crown_ibp_bounds_with_precomputed_ibp(
-                    input, ibp_bounds, engine, deadline,
-                )?)
-            }
+            (true, Some(ibp_bounds)) => Some(
+                self.collect_sequential_crown_ibp_bounds_with_status(
+                    network,
+                    input,
+                    Some(ibp_bounds),
+                    engine,
+                    deadline,
+                )?
+                .bounds,
+            ),
             (_, Some(ibp_bounds)) => Some(ibp_bounds),
             (_, None) => None,
         };
@@ -298,7 +342,10 @@ impl BetaCrownVerifier {
         let root_layer_bounds = if let Some(layer_bounds) = cached_root_layer_bounds.take() {
             layer_bounds
         } else if use_crown_ibp_layer_bounds {
-            network.collect_crown_ibp_bounds_with_engine_and_deadline(input, engine, deadline)?
+            self.collect_sequential_crown_ibp_bounds_with_status(
+                network, input, None, engine, deadline,
+            )?
+            .bounds
         } else {
             network.collect_ibp_bounds_with_deadline(input, deadline)?
         };

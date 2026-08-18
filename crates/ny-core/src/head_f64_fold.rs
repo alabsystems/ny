@@ -40,9 +40,6 @@
 //! never enters the fold arm, so it is byte-identical (the fold is `None` ⇒ the
 //! `sound_f64_branch` Activation arm is untouched).
 
-// Blessed env access (2026-07-21): reads process-global env under the same
-// deny-by-default ENV lint discipline as `resident_cut_fold` (read-only gate).
-#![allow(unknown_lints)]
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -124,26 +121,6 @@ pub fn head_f64_fold_enabled() -> bool {
     false
 }
 
-/// RESEARCH-MEASUREMENT reader arm (dark, default-off, `NY_MN_HEAD_F64_MEASURE_ARM=1`).
-///
-/// Separate from the production authority gate [`head_f64_fold_enabled`] (which
-/// stays hard-quarantined at `false`). This arms ONLY the registry READER, and is
-/// intended to be paired with `NY_MN_HEAD_F64_CERTIFIED_MEASURE=1`, under which the
-/// registered facets come from the EXACT support checker
-/// (`certified_coupling_facets_exact`) — precisely the "directed/exact support
-/// checker proves the stored half-space contains all four ReLU orthants" that the
-/// quarantine names as the re-authorization bar. Sound by construction: the fold is
-/// monotone-`max`-merged into `best_lo[critical]` (can only RAISE the certified
-/// lower bound, never above the true margin). This is a measurement lane, NOT a
-/// production verdict re-authorization — production (`NY_MN_HEAD_FACET`) stays
-/// `head_f64_fold_enabled()==false`.
-pub fn head_f64_measure_arm_enabled() -> bool {
-    matches!(
-        std::env::var("NY_MN_HEAD_F64_MEASURE_ARM").ok().as_deref(),
-        Some("1")
-    )
-}
-
 /// Register (or replace) the HEAD fold β-grid. Called ONCE at root, before the
 /// wide lane runs (mirrors `set_resident_cut_fold`).
 pub fn set_head_f64_folds(folds: Vec<HeadF64Fold>) {
@@ -159,11 +136,12 @@ pub fn clear_head_f64_folds() {
     }
 }
 
-/// The active HEAD fold β-grid, or `None` (zero-cost untouched path) unless the
-/// gate is set AND an entry is registered. Returns an `Arc` so the per-subdomain
-/// recovery reads it without cloning the maps.
+/// The active proof-path HEAD fold β-grid.
+///
+/// Production authority is hard-quarantined, so the public registry cannot
+/// publish a fold into certificate-bearing recovery.
 pub fn active_head_f64_folds() -> Option<Arc<[HeadF64Fold]>> {
-    if !head_f64_fold_enabled() && !head_f64_measure_arm_enabled() {
+    if !head_f64_fold_enabled() {
         return None;
     }
     registry().read().ok()?.clone()
@@ -204,10 +182,9 @@ mod tests {
     }
 
     #[test]
-    fn measure_arm_reader_arms_only_under_its_own_var() {
+    fn registry_cannot_acquire_proof_authority() {
         ny_test_utils::env::with_env_edits(|env| {
             env.remove("NY_MN_HEAD_FACET");
-            env.remove("NY_MN_HEAD_F64_MEASURE_ARM");
             let mut post = HashMap::new();
             post.insert(3u32, (0.5f64, 1e-16f64));
             set_head_f64_folds(vec![HeadF64Fold {
@@ -220,18 +197,19 @@ mod tests {
                 bias_err: 3e-16,
             }]);
             // Production authority stays quarantined; the production var does NOT
-            // arm the reader (byte-identical to today).
+            // arm the reader (byte-identical to today), and public registry data
+            // cannot acquire proof-path authority.
             env.set("NY_MN_HEAD_FACET", "1");
             assert!(!head_f64_fold_enabled());
-            assert!(!head_f64_measure_arm_enabled());
             assert!(active_head_f64_folds().is_none());
-
-            // The dedicated measurement var arms the READER (and only the reader);
-            // the production gate remains false.
-            env.set("NY_MN_HEAD_F64_MEASURE_ARM", "1");
-            assert!(head_f64_measure_arm_enabled());
-            assert!(!head_f64_fold_enabled());
-            assert!(active_head_f64_folds().is_some());
+            assert!(
+                registry()
+                    .read()
+                    .expect("head-f64 registry lock")
+                    .as_ref()
+                    .is_some(),
+                "raw research entry should remain registered"
+            );
 
             clear_head_f64_folds();
             assert!(active_head_f64_folds().is_none());

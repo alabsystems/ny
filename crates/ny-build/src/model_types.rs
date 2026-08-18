@@ -71,6 +71,37 @@ pub fn is_multi_output_split(spec: &LayerSpec) -> bool {
     spec.layer_type == LayerType::Slice && spec.outputs.len() > 1
 }
 
+/// Internal source-semantics certificate for the narrow dynamic Expand
+/// lowering.  A producer may attach this only after proving that input 1 has
+/// been normalized from the complete `Shape(reference)` value to the named
+/// live `reference` tensor, and that the authored broadcast is exactly
+/// `[..., 1] -> [..., T]`.
+///
+/// This is deliberately not an ordinary ONNX attribute.  Raw ONNX loading
+/// creates it only from an authenticated Shape edge; format-neutral graph
+/// producers that use it are responsible for providing the same contract.
+pub const EXPAND_LIVE_SHAPE_REFERENCE_ATTR: &str = "__ny_expand_live_shape_reference";
+
+/// Internal layout certificate for an [`LayerSpec`] `InstanceNorm` whose
+/// activation is already in ny's native `[C, T]` layout.
+///
+/// Standard ONNX `InstanceNormalization` is authored as `[N, C, T]`; the
+/// converter normally requires that rank so a higher-rank spatial tensor
+/// cannot be misread by the monolithic 1-D implementation.  Format-neutral
+/// producers may set this integer attribute to `1` only when the recorded
+/// activation shape is exactly `[C, T]`.  Raw ONNX schema validation rejects
+/// this non-standard attribute.
+pub const INTERNAL_CT_INSTANCE_NORM_ATTR: &str = "__ny_internal_ct_instance_norm";
+
+/// Internal layout certificate for a [`LayerSpec`] `Pad` whose recorded axes
+/// are all runtime data axes and therefore must not lose a leading batch pair.
+///
+/// Standard ONNX models use the converter's batch-stripping convention.
+/// Format-neutral producers whose tensors are already in native trace layout
+/// may set this integer attribute to `1`; raw ONNX schema validation rejects
+/// this non-standard attribute.
+pub const PAD_PRESERVE_ALL_AXES_ATTR: &str = "__ny_pad_preserve_all_axes";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AttributeValue {
     Float(f32),

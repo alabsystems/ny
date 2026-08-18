@@ -2,20 +2,23 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decoder transformer model loading and compositional verification.
+//! Decoder transformer model loading and structural analysis.
 //!
-//! Supports both decoder-only models (like LLaMA) and encoder-decoder decoder blocks
-//! (like Whisper decoder). Compositional verification decomposes each block into
-//! independently verifiable subgraphs (attention + MLP) connected via residual streams.
+//! Decoder-only and encoder-decoder block patterns can be loaded for inspection.
+//! Causal self-attention and MLP helpers return structural artifacts;
+//! cross-attention extraction fails closed until `GraphNetwork` has a sound
+//! multi-input contract. All verification compatibility methods fail closed:
+//! decoder attention semantics are not yet proven equivalent to the loaded ONNX
+//! graph, so they return no bounds or verification details.
 
 use crate::OnnxModel;
+use ny_core::{NyError, Result};
 
 mod gpu;
 mod structure;
 mod subgraph;
 mod subgraph_mlp;
 mod verify;
-mod weights;
 
 pub use structure::load_decoder;
 
@@ -33,15 +36,17 @@ pub struct DecoderBlockInfo {
 pub struct DecoderStructure {
     /// Information about each decoder block.
     pub blocks: Vec<DecoderBlockInfo>,
-    /// Number of attention heads.
+    /// Heuristic attention-head hint for structural analysis only.
+    ///
+    /// This value is not admitted as verified graph semantics.
     pub num_heads: usize,
     /// Hidden dimension.
     pub hidden_dim: usize,
-    /// Head dimension (hidden_dim / num_heads).
+    /// Heuristic head dimension (`hidden_dim / num_heads`) for analysis only.
     pub head_dim: usize,
 }
 
-/// Decoder model with compositional verification support.
+/// Decoder model with structural-analysis and fail-closed verification APIs.
 pub struct DecoderModel {
     /// The underlying ONNX model.
     pub model: OnnxModel,
@@ -51,11 +56,24 @@ pub struct DecoderModel {
     pub num_blocks: usize,
     /// Hidden dimension.
     pub hidden_dim: usize,
-    /// Number of attention heads.
+    /// Heuristic attention-head hint for structural analysis only.
+    ///
+    /// This value is not admitted as verified graph semantics.
     pub num_heads: usize,
 }
 
-/// Details from compositional decoder block verification.
+impl DecoderModel {
+    /// Resolve a parsed block by its declared index.
+    pub(super) fn block_info(&self, block_index: usize) -> Result<&DecoderBlockInfo> {
+        self.structure
+            .blocks
+            .iter()
+            .find(|block| block.index == block_index)
+            .ok_or_else(|| NyError::InvalidSpec(format!("decoder block {block_index} not found")))
+    }
+}
+
+/// Reserved details type for future compositional decoder verification.
 #[derive(Debug, Clone)]
 pub struct DecoderVerificationDetails {
     /// Max width of attention delta bounds.

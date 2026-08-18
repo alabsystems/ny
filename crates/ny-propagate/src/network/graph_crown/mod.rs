@@ -35,7 +35,8 @@ mod utils;
 
 // ATTACK-only soft-sign β (sharpness) ramp control for the point-VJP Sign arm.
 pub use point_vjp::{
-    attack_sign_beta, set_attack_sign_beta, AttackSignBetaGuard, DEFAULT_ATTACK_SIGN_BETA,
+    attack_sign_beta, set_attack_sign_beta, smooth_sign_forward_enabled, AttackSignBetaGuard,
+    AttackSteWindowsGuard, DEFAULT_ATTACK_SIGN_BETA,
 };
 pub use point_vjp_batched::{point_vjp_forward_masks, PointVjpBatchPlan};
 pub use point_vjp_batched_resnet::{

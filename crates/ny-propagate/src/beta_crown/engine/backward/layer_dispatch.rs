@@ -5,9 +5,9 @@
 //! Layer-type backward dispatch for β-CROWN with α,β parameters.
 //!
 //! Dispatches backward propagation to the appropriate layer handler based on
-//! layer type. For ReLU layers, uses the α,β (and optionally arelu_cut)
-//! backward pass. For other layers, delegates to the layer's own CROWN
-//! backward implementation, with IBP fallback for unsupported layers.
+//! layer type. For ReLU layers, uses the α,β backward pass. For other layers,
+//! delegates to the layer's own CROWN backward implementation, with IBP
+//! fallback for unsupported layers.
 
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::warn;
 
-use crate::beta_crown::state::{AreluState, BetaState, DomainAlphaState};
+use crate::beta_crown::state::{BetaState, DomainAlphaState};
 use crate::{BoundPropagation, Layer, LinearBounds};
 
 use super::super::BetaCrownVerifier;
@@ -24,10 +24,12 @@ use super::super::BetaCrownVerifier;
 impl BetaCrownVerifier {
     /// Backward propagation through a single layer with both α and β parameters.
     ///
-    /// When `arelu_state` is provided and contains cut data for this layer,
-    /// uses the arelu_cut algorithm to tighten ReLU bounds during backward pass.
+    /// ReLU layers take the plain α,β relaxation: there is no cut-aware branch.
+    /// The `arelu_cut` fold that used to be selected here was deleted with the
+    /// rest of the uncertified cut machinery — see
+    /// `BetaCrownConfig::cut_proof_authority_enabled()`.
     // Justification: Layer backward propagation needs layer, bounds, constraints,
-    // beta/alpha/arelu state, layer index, and engine — full BaB verification context.
+    // beta/alpha state, layer index, and engine — full BaB verification context.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::beta_crown::engine) fn propagate_layer_backward_with_alpha_beta(
         &self,
@@ -37,7 +39,6 @@ impl BetaCrownVerifier {
         constraints: Option<&HashMap<usize, bool>>,
         beta_state: &BetaState,
         alpha_state: &DomainAlphaState,
-        arelu_state: Option<&AreluState>,
         layer_idx: usize,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<LinearBounds> {
@@ -45,31 +46,14 @@ impl BetaCrownVerifier {
             Layer::Linear(linear) => linear
                 .propagate_linear_with_engine(output_bounds, engine)
                 .map(|cow| cow.into_owned()),
-            Layer::ReLU(_) => {
-                // Use arelu_cut integration if cuts are active for this layer
-                if let Some(arelu) = arelu_state {
-                    if arelu.has_cut_mask.contains_key(&layer_idx) {
-                        return self.relu_backward_with_alpha_beta_arelu(
-                            output_bounds,
-                            pre_bounds,
-                            constraints,
-                            beta_state,
-                            alpha_state,
-                            arelu,
-                            layer_idx,
-                        );
-                    }
-                }
-                // Fall back to standard backward pass
-                self.relu_backward_with_alpha_beta(
-                    output_bounds,
-                    pre_bounds,
-                    constraints,
-                    beta_state,
-                    alpha_state,
-                    layer_idx,
-                )
-            }
+            Layer::ReLU(_) => self.relu_backward_with_alpha_beta(
+                output_bounds,
+                pre_bounds,
+                constraints,
+                beta_state,
+                alpha_state,
+                layer_idx,
+            ),
             Layer::Flatten(_) | Layer::Reshape(_) | Layer::ExpandLikeLastAxis(_) => {
                 Ok(output_bounds.clone())
             }
@@ -103,7 +87,7 @@ impl BetaCrownVerifier {
             Layer::MaxPool2d(pool) => pool.propagate_linear_with_bounds(output_bounds, pre_bounds),
             Layer::Conv2d(conv) => {
                 let input_shape = pre_bounds.shape();
-                let in_c = conv.in_channels();
+                let in_c = conv.try_in_channels()?;
                 let (in_h, in_w) = Self::infer_conv2d_input_hw(input_shape, in_c, "Conv2d")?;
 
                 let mut conv_with_shape = conv.clone();
@@ -121,7 +105,7 @@ impl BetaCrownVerifier {
             }
             Layer::ConvTranspose2d(conv) => {
                 let input_shape = pre_bounds.shape();
-                let in_c = conv.in_channels();
+                let in_c = conv.try_in_channels()?;
                 let (in_h, in_w) =
                     Self::infer_conv2d_input_hw(input_shape, in_c, "ConvTranspose2d")?;
 
@@ -196,6 +180,7 @@ impl BetaCrownVerifier {
             | Layer::SiLU(_)
             | Layer::Tanh(_)
             | Layer::Sigmoid(_)
+            | Layer::Erf(_)
             | Layer::Exp(_)
             | Layer::Log(_)
             | Layer::Sqrt(_)

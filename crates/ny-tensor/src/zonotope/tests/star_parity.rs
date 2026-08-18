@@ -328,7 +328,8 @@ fn conv2d_rejects_invalid_geometry_without_panicking() {
 }
 
 #[test]
-fn bounds_lp_is_stub_returning_err() {
+#[allow(deprecated)]
+fn deprecated_bounds_lp_fails_explicitly() {
     // bounds_lp cannot be implemented in ny-tensor (would require ny-tensor → ny-mip,
     // reversing the ny-mip → ny-tensor edge). It must return an explanatory error.
     let center = ndarray::arr1(&[0.0_f32]).into_dyn();

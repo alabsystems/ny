@@ -40,6 +40,11 @@ pub struct GraphProto {
     pub name: String,
     #[prost(message, repeated, tag = "5")]
     pub initializer: Vec<TensorProto>,
+    /// Sparse initializers are modeled so the loader can reject them before
+    /// silently changing graph semantics. NY does not yet lower sparse tensor
+    /// storage.
+    #[prost(message, repeated, tag = "15")]
+    pub sparse_initializer: Vec<SparseTensorProto>,
     #[prost(message, repeated, tag = "11")]
     pub input: Vec<ValueInfoProto>,
     #[prost(message, repeated, tag = "12")]
@@ -84,6 +89,7 @@ mod tests {
             node: Vec::new(),
             name: String::new(),
             initializer: Vec::new(),
+            sparse_initializer: Vec::new(),
             input: Vec::new(),
             output: Vec::new(),
             value_info: vec![info.clone()],
@@ -100,11 +106,23 @@ mod tests {
             node: Vec::new(),
             name: String::new(),
             initializer: Vec::new(),
+            sparse_initializer: Vec::new(),
             input: Vec::new(),
             output: Vec::new(),
         };
         assert!(graph.value_info().is_empty());
     }
+}
+
+/// ONNX sparse tensor storage.
+#[derive(Clone, PartialEq, Message)]
+pub struct SparseTensorProto {
+    #[prost(message, optional, tag = "1")]
+    pub values: Option<TensorProto>,
+    #[prost(message, optional, tag = "2")]
+    pub indices: Option<TensorProto>,
+    #[prost(int64, repeated, tag = "3")]
+    pub dims: Vec<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -129,6 +147,10 @@ pub struct TensorProto {
     pub dims: Vec<i64>,
     #[prost(int32, tag = "2")]
     pub data_type: i32,
+    /// Deprecated partial-tensor segment metadata. NY models only complete
+    /// tensors and rejects this field when present.
+    #[prost(message, optional, tag = "3")]
+    pub segment: Option<TensorSegmentProto>,
     #[prost(string, tag = "8")]
     pub name: String,
     #[prost(bytes = "vec", tag = "9")]
@@ -147,11 +169,34 @@ pub struct TensorProto {
     pub int64_data: Vec<i64>,
     #[prost(double, repeated, tag = "10")]
     pub double_data: Vec<f64>,
-    /// TensorProto.DataLocation: 0 = DEFAULT (inline), 1 = EXTERNAL (payload
-    /// in side files listed in external_data, which this schema does not
-    /// model — loaders must reject non-zero values).
+    #[prost(bytes = "vec", repeated, tag = "6")]
+    pub string_data: Vec<Vec<u8>>,
+    #[prost(uint64, repeated, tag = "11")]
+    pub uint64_data: Vec<u64>,
+    /// Key/value metadata for an external raw-data payload.
+    #[prost(message, repeated, tag = "13")]
+    pub external_data: Vec<StringStringEntryProto>,
+    /// TensorProto.DataLocation: 0 = DEFAULT (inline), 1 = EXTERNAL.
     #[prost(int32, tag = "14")]
     pub data_location: i32,
+}
+
+/// Deprecated TensorProto segment range.
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct TensorSegmentProto {
+    #[prost(int64, tag = "1")]
+    pub begin: i64,
+    #[prost(int64, tag = "2")]
+    pub end: i64,
+}
+
+/// ONNX's protobuf-compatible string map entry.
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct StringStringEntryProto {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]
@@ -206,20 +251,68 @@ pub mod tensor_shape_proto {
 pub struct AttributeProto {
     #[prost(string, tag = "1")]
     pub name: String,
-    #[prost(float, tag = "2")]
-    pub f: f32,
-    #[prost(int64, tag = "3")]
-    pub i: i64,
-    #[prost(bytes = "vec", tag = "4")]
-    pub s: Vec<u8>,
-    #[prost(message, optional, tag = "5")]
-    pub t: Option<TensorProto>,
+    /// Attribute reference used only by nodes in a FunctionProto body. A
+    /// reference carries no local payload; graph attributes in a ModelProto
+    /// must not use it.
+    #[prost(string, tag = "21")]
+    pub ref_attr_name: String,
+    #[prost(string, tag = "13")]
+    pub doc_string: String,
     #[prost(int32, tag = "20")]
     pub r#type: i32,
+    // These scalar fields are optional so an explicitly encoded inactive
+    // default remains distinguishable from an absent wire tag. ONNX permits a
+    // selected scalar at its proto3 default to omit the payload tag.
+    #[prost(float, optional, tag = "2")]
+    pub f: Option<f32>,
+    #[prost(int64, optional, tag = "3")]
+    pub i: Option<i64>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub s: Option<Vec<u8>>,
+    #[prost(message, optional, tag = "5")]
+    pub t: Option<TensorProto>,
+    #[prost(message, optional, tag = "6")]
+    pub g: Option<GraphProto>,
+    #[prost(message, optional, tag = "22")]
+    pub sparse_tensor: Option<SparseTensorProto>,
+    #[prost(message, optional, tag = "14")]
+    pub tp: Option<TypeProto>,
     #[prost(float, repeated, tag = "7")]
     pub floats: Vec<f32>,
     #[prost(int64, repeated, tag = "8")]
     pub ints: Vec<i64>,
+    #[prost(bytes = "vec", repeated, tag = "9")]
+    pub strings: Vec<Vec<u8>>,
+    #[prost(message, repeated, tag = "10")]
+    pub tensors: Vec<TensorProto>,
+    #[prost(message, repeated, tag = "11")]
+    pub graphs: Vec<GraphProto>,
+    #[prost(message, repeated, tag = "23")]
+    pub sparse_tensors: Vec<SparseTensorProto>,
+    #[prost(message, repeated, tag = "15")]
+    pub type_protos: Vec<TypeProto>,
+}
+
+impl AttributeProto {
+    /// Returns the validated FLOAT payload.
+    ///
+    /// Proto3 may omit the selected scalar's wire tag when its value is zero;
+    /// ONNX defines that omission as the corresponding scalar default.
+    pub fn f_value(&self) -> f32 {
+        self.f.unwrap_or_default()
+    }
+
+    /// Returns the validated INT payload, including ONNX's encoded-default zero
+    /// when the selected scalar's proto3 wire tag is absent.
+    pub fn i_value(&self) -> i64 {
+        self.i.unwrap_or_default()
+    }
+
+    /// Returns the validated STRING payload. As with numeric scalars, an
+    /// omitted selected field denotes its proto3 default (the empty string).
+    pub fn s_value(&self) -> &[u8] {
+        self.s.as_deref().unwrap_or_default()
+    }
 }
 
 pub mod attribute_proto {

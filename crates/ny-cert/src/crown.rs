@@ -39,7 +39,7 @@
 //! corresponding inequality. The accumulated combination is exactly
 //! `−y ≤ −m`, where `m` is the CROWN lower bound on `y`.
 
-use crate::rational::{Rat, RatError};
+use crate::rational::{poisoned, Rat, RatError};
 use crate::schema::{ConstraintKind, EntailmentCertificate, FarkasCertificate, LinearConstraint};
 // Contracts are written as the BARE `#[ensures]` (see `selfcheck.rs` for the full
 // rationale): under tRustc contract verification (`--cfg trust_verify`) it is the
@@ -154,8 +154,9 @@ impl Relu1Problem {
     /// Interval-bound-propagation pre-activation bounds `lⱼ, uⱼ` for each unit.
     ///
     /// # Errors
-    /// Propagates exact-arithmetic overflow.
+    /// Propagates exact-rational arena failures.
     pub fn preact_bounds(&self) -> Result<(Vec<Rat>, Vec<Rat>), CrownError> {
+        crate::rational::ensure_healthy()?;
         self.validate()?;
         // `Vec::new()` (not `with_capacity(hidden_dim())`): the capacity hint
         // on a havoc-unbounded `w1.len()` carries a hardened allocation
@@ -169,6 +170,7 @@ impl Relu1Problem {
             lo.push(zl);
             hi.push(zu);
         }
+        crate::rational::ensure_healthy()?;
         Ok((lo, hi))
     }
 
@@ -200,7 +202,7 @@ impl Relu1Problem {
     ///
     /// # Errors
     /// Returns [`CrownError`] on dimension mismatch, an out-of-range α, an
-    /// infeasible threshold, or exact-arithmetic overflow.
+    /// infeasible threshold, or an exact-arithmetic/arena failure.
     ///
     /// The `#[ensures]` states the locally-provable producer well-formedness
     /// invariant: on `Ok` the emitted entailment certificate is a valid Farkas
@@ -220,6 +222,9 @@ impl Relu1Problem {
     // returns ARE the proof shape (see the extract-then-guard comment).
     #[allow(clippy::question_mark)]
     pub fn certify(&self, threshold: Rat) -> Result<CertifiedRelu1, CrownError> {
+        if poisoned() {
+            return Err(crate::err_barrier(CrownError::Rat(RatError::Poisoned)));
+        }
         // Extract-then-guard: makes the `#[ensures]` locally provable. The
         // match only EXTRACTS (the Err arm returns early), the arity guard is
         // straight-line, and the tail is a plain `Ok(c)` — so every return
@@ -235,8 +240,16 @@ impl Relu1Problem {
             // `crate::err_barrier` (identity, `#[inline(never)]`): a fresh in-body
             // `Err` aggregate, not a whole-`Result` forward the return-grounding
             // lane cannot see (nor a const-promoted+merged unit variant).
-            Err(e) => return Err(crate::err_barrier(e)),
+            Err(e) => {
+                if poisoned() {
+                    return Err(crate::err_barrier(CrownError::Rat(RatError::Poisoned)));
+                }
+                return Err(crate::err_barrier(e));
+            }
         };
+        if poisoned() {
+            return Err(crate::err_barrier(CrownError::Rat(RatError::Poisoned)));
+        }
         if c.entailment.premises.len() != c.entailment.multipliers.len() {
             return Err(crate::err_barrier(CrownError::Dimension(
                 "certificate premise/multiplier arity mismatch".into(),
@@ -598,5 +611,46 @@ impl Relu1Problem {
             preact_lower: lo,
             preact_upper: hi,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PoisonReset;
+
+    impl Drop for PoisonReset {
+        fn drop(&mut self) {
+            crate::rational::set_poisoned_for_test(false);
+        }
+    }
+
+    #[test]
+    fn certify_refuses_poison_before_a_degenerate_identity_only_path() {
+        // With no inputs or hidden units and zero bias, the legacy path can
+        // assemble a structural certificate using only ZERO/ONE handles.
+        // Poison must therefore be checked explicitly rather than relying on
+        // a nontrivial arithmetic operation to notice it.
+        let problem = Relu1Problem {
+            w1: Vec::new(),
+            b1: Vec::new(),
+            w2: Vec::new(),
+            b2: Rat::ZERO,
+            input_lower: Vec::new(),
+            input_upper: Vec::new(),
+            alpha: None,
+        };
+        crate::rational::set_poisoned_for_test(true);
+        let _reset = PoisonReset;
+
+        assert!(matches!(
+            problem.preact_bounds(),
+            Err(CrownError::Rat(RatError::Poisoned))
+        ));
+        assert!(matches!(
+            problem.certify(Rat::ZERO),
+            Err(CrownError::Rat(RatError::Poisoned))
+        ));
     }
 }

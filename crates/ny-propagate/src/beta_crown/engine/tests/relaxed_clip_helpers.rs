@@ -44,6 +44,18 @@ fn test_any_verified_false_shape_mismatch() {
 }
 
 #[test]
+fn test_any_verified_rejects_nonfinite_authority() {
+    assert!(!BetaCrownVerifier::any_verified(
+        &arr2(&[[f32::INFINITY]]),
+        &arr2(&[[0.0]]),
+    ));
+    assert!(!BetaCrownVerifier::any_verified(
+        &arr2(&[[1.0]]),
+        &arr2(&[[f32::NEG_INFINITY]]),
+    ));
+}
+
+#[test]
 fn test_any_verified_multi_batch_finds_any() {
     // Batch 0: both below; Batch 1: one exceeds -> true
     let dm_lb = arr2(&[[0.1, 0.2], [0.8, 0.3]]);

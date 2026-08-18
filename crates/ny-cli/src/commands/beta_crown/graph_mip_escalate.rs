@@ -18,10 +18,11 @@
 //      (a lane that never precomputed) is a budgeted recompute performed.
 //   2. Flatten `HashMap<String, BoundedTensor>` → `HashMap<String, Vec<Bound>>`
 //      (the encoder's shape; ReLU reads its affine producer's box).
-//   3. `encode_graph` (exact rows + DELTA box inflation) → `MipParts` → the
-//      existing `MipSolver` certificate machinery. Whole-net solves are
-//      deliberately serial: automatic phase splitting clones the complete IR
-//      once per sibling and defeats the pre-encode memory cap.
+//   3. `encode_graph` (exact-or-certified-outward operator rows + DELTA box
+//      inflation) → `MipParts` → the existing `MipSolver` certificate
+//      machinery. Whole-net solves are deliberately serial: automatic phase
+//      splitting clones the complete IR once per sibling and defeats the
+//      pre-encode memory cap.
 //   4. VNN-LIB spec stamping per clause (disjunctive: one solve per clause).
 //   5. SOUNDNESS GATES, both stricter than the sequential lane:
 //      * any Sat witness is clamped into the box and revalidated through the
@@ -53,7 +54,7 @@ use super::dispatch::{
 use super::graph_mip::{graph_mip_enabled, GraphMipEncoding};
 use super::mip_highs::{clamp_witness_to_box, mip_constraint_margin, print_result};
 use super::mip_preprocess::bounded_tensor_to_bounds;
-use super::output::verification_result_exit_code;
+use super::output::{verification_result_exit_code, EffectiveTreatmentProjection};
 use crate::{CompleteVerifierArg, MipSolverArg};
 
 // ===========================================================================
@@ -139,11 +140,16 @@ pub(super) fn graph_mip_max_binaries() -> usize {
 /// for every sibling. The 5M-NNZ admission cap bounds one encode, not that
 /// multiplicative clone set. Use the existing explicit serial setting (`1`)
 /// so the pre-encode cap remains an enforced one-model memory envelope.
-fn graph_mip_solver_config(backend: MipBackend, timeout_secs: f64) -> MipConfig {
+fn graph_mip_solver_config(
+    backend: MipBackend,
+    timeout_secs: f64,
+    ay_node_warm_time_limit: Option<std::time::Duration>,
+) -> MipConfig {
     MipConfig {
         backend,
         parallel_split: 1,
         timeout_secs,
+        ay_node_warm_time_limit,
         ..MipConfig::default()
     }
 }
@@ -174,6 +180,8 @@ fn graph_mip_policy_admitted(
 /// reporting (a verdict — possibly Timeout — was printed with the MIP method),
 /// `Ok(false)` when ineligible (caller reports the BaB verdict unchanged), and
 /// `Err` on an internal failure (caller logs + degrades to the BaB verdict).
+#[cfg(test)]
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_graph_mip_escalation(
     graph: &GraphNetwork,
@@ -182,11 +190,53 @@ pub(super) fn try_graph_mip_escalation(
     verifier: &BetaCrownVerifier,
     complete_verifier: CompleteVerifierArg,
     bab_status: &BabVerificationStatus,
-    mip_timeout: u64,
+    deadline: std::time::Instant,
     mip_solver: MipSolverArg,
     property: Option<&Path>,
+    model: Option<&Path>,
     epsilon: f32,
     threshold: f32,
+    reporting_start: std::time::Instant,
+    json: bool,
+) -> Result<bool> {
+    try_graph_mip_escalation_with_treatment(
+        graph,
+        input,
+        vnnlib,
+        verifier,
+        complete_verifier,
+        bab_status,
+        deadline,
+        mip_solver,
+        property,
+        model,
+        epsilon,
+        threshold,
+        reporting_start,
+        None,
+        json,
+    )
+}
+
+/// Production entry that carries the already-resolved treatment projection to
+/// a Graph-MIP verdict. The compatibility wrapper above keeps direct unit tests
+/// and non-reporting callers source-stable.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_graph_mip_escalation_with_treatment(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    vnnlib: &VnnLibSpec,
+    verifier: &BetaCrownVerifier,
+    complete_verifier: CompleteVerifierArg,
+    bab_status: &BabVerificationStatus,
+    deadline: std::time::Instant,
+    mip_solver: MipSolverArg,
+    property: Option<&Path>,
+    model: Option<&Path>,
+    epsilon: f32,
+    threshold: f32,
+    reporting_start: std::time::Instant,
+    effective_treatment: Option<&EffectiveTreatmentProjection>,
     json: bool,
 ) -> Result<bool> {
     if !graph_mip_enabled() {
@@ -218,6 +268,9 @@ pub(super) fn try_graph_mip_escalation(
     // guaranteed not to encode. `NY_GRAPH_MIP_MIN_SLICE_S` (default 20 s) is
     // the floor. This is scheduling-only: the existing decline is unchanged.
     let min_slice = graph_mip_min_slice_secs();
+    let mip_timeout = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
     if !graph_mip_slice_admitted(mip_timeout, min_slice) {
         // Preserve the one-shot mailbox lifecycle from the former ordering:
         // decline before any bounds work, but release an already-stashed map
@@ -241,12 +294,19 @@ pub(super) fn try_graph_mip_escalation(
         None => {
             // Budget the recompute to a fraction of the MIP slice so a slow
             // bound pass cannot eat the whole escalation budget.
-            let bounds_budget = (mip_timeout / 4).clamp(5, 60);
+            let live_remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs();
+            if live_remaining == 0 {
+                return Ok(false);
+            }
+            let bounds_budget = (live_remaining / 4).clamp(1, 60);
             info!(
                 "Graph-MIP: no stashed bounds for this box; recomputing (budget {bounds_budget}s)"
             );
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(bounds_budget);
+            let deadline = (std::time::Instant::now()
+                + std::time::Duration::from_secs(bounds_budget))
+            .min(deadline);
             let (nb, _out) = verifier
                 .compute_initial_graph_bounds(graph, input, Some(deadline))
                 .map_err(|e| anyhow!("Graph-MIP bound recompute failed: {e}"))?;
@@ -311,8 +371,14 @@ pub(super) fn try_graph_mip_escalation(
         }
     }
 
+    let solve_timeout = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
+    if solve_timeout == 0 {
+        return Ok(false);
+    }
     info!(
-        "BaB inconclusive ({:?}), escalating GRAPH model to MIP with {mip_timeout}s budget (default-on Graph-MIP)",
+        "BaB inconclusive ({:?}), escalating GRAPH model to MIP with {solve_timeout}s remaining (default-on Graph-MIP)",
         bab_status
     );
     verify_graph_with_mip(
@@ -320,11 +386,14 @@ pub(super) fn try_graph_mip_escalation(
         input,
         vnnlib,
         &flat_bounds,
-        mip_timeout,
+        deadline,
         mip_solver,
         property,
+        model,
         epsilon,
         threshold,
+        reporting_start,
+        effective_treatment,
         json,
     )?;
     Ok(true)
@@ -348,11 +417,14 @@ fn verify_graph_with_mip(
     input: &BoundedTensor,
     vnnlib: &VnnLibSpec,
     node_bounds: &HashMap<String, Vec<Bound>>,
-    mip_timeout: u64,
+    deadline: std::time::Instant,
     mip_solver: MipSolverArg,
     property: Option<&Path>,
+    model: Option<&Path>,
     epsilon: f32,
     threshold: f32,
+    reporting_start: std::time::Instant,
+    effective_treatment: Option<&EffectiveTreatmentProjection>,
     json: bool,
 ) -> Result<()> {
     let backend = mip_solver.mip_backend();
@@ -360,17 +432,19 @@ fn verify_graph_with_mip(
         println!("\nRunning Graph-MIP verification (ay solver, serial whole-net model)...");
     }
     let start = std::time::Instant::now();
+    if start >= deadline {
+        anyhow::bail!("Graph-MIP deadline exhausted before encoding");
+    }
 
     let input_bounds = bounded_tensor_to_bounds(input)?;
     // Encode under the slice deadline (live-run residual): the DAG walk checks
     // it per node and bails cleanly (degrading to the BaB verdict) instead of
     // running through the watchdog mid-encode.
-    let encode_deadline = start + std::time::Duration::from_secs(mip_timeout);
     let base = super::graph_mip::encode_graph_with_deadline(
         graph,
         &input_bounds,
         node_bounds,
-        Some(encode_deadline),
+        Some(deadline),
     )?;
     let num_outputs = vnnlib.num_outputs;
     if !json {
@@ -382,8 +456,9 @@ fn verify_graph_with_mip(
         );
     }
 
-    // Budget the solve slice from what remains after encoding.
-    let solve_budget = (mip_timeout as f64 - start.elapsed().as_secs_f64()).max(1.0);
+    if std::time::Instant::now() >= deadline {
+        anyhow::bail!("Graph-MIP deadline exhausted during encoding");
+    }
 
     let clauses: Vec<Vec<OutputConstraint>> = if vnnlib.output_constraint_clauses.is_empty() {
         vec![vnnlib.output_constraints.clone()]
@@ -398,7 +473,7 @@ fn verify_graph_with_mip(
             input,
             &base,
             &clauses,
-            solve_budget,
+            deadline,
             backend,
             num_outputs,
             json,
@@ -411,21 +486,56 @@ fn verify_graph_with_mip(
             enc.add_output_constraint(c)?;
         }
         let constraints: Vec<OutputConstraint> = all.into_iter().cloned().collect();
-        let solver = MipSolver::new(
-            enc.into_parts(),
-            graph_mip_solver_config(backend, solve_budget),
-        );
-        let mip_result = solver
-            .check_feasibility()
-            .map_err(|e| anyhow!("Graph-MIP solve failed: {e}"))?;
+        let live_timeout = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64();
+        let mip_result = if live_timeout <= 0.0 {
+            MipResult::Timeout
+        } else {
+            let ay_node_warm_time_limit = enc.ay_node_warm_time_limit();
+            let solver = MipSolver::new(
+                enc.into_parts(),
+                graph_mip_solver_config(backend, live_timeout, ay_node_warm_time_limit),
+            );
+            solver
+                .check_feasibility()
+                .map_err(|e| anyhow!("Graph-MIP solve failed: {e}"))?
+        };
         map_graph_mip_result(mip_result, graph, input, &constraints, num_outputs)
     };
 
-    let elapsed = start.elapsed();
-    print_result(
-        &result, property, epsilon, threshold, elapsed, backend, json,
+    let result = if std::time::Instant::now() >= deadline {
+        VerificationResult::Timeout {
+            provenance: Default::default(),
+            partial_bounds: Some(vec![
+                Bound::new_allow_infinite(
+                    f32::NEG_INFINITY,
+                    f32::INFINITY
+                );
+                num_outputs
+            ]),
+            actual_method: Some(ny_core::MethodUsed::MipHiGHS),
+        }
+    } else {
+        result
+    };
+    let elapsed = reporting_start.elapsed();
+    let publication_refused = print_result(
+        &result,
+        property,
+        model,
+        epsilon,
+        threshold,
+        elapsed,
+        backend,
+        effective_treatment,
+        json,
     )?;
-    let exit_code = verification_result_exit_code(&result);
+    let exit_code = if publication_refused {
+        crate::commands::verify::exit_codes::UNKNOWN
+    } else {
+        verification_result_exit_code(&result)
+    };
     if exit_code != crate::commands::verify::exit_codes::VERIFIED && !super::output::is_capturing()
     {
         std::process::exit(exit_code);
@@ -443,12 +553,11 @@ fn solve_graph_disjunctive(
     input: &BoundedTensor,
     base: &GraphMipEncoding,
     clauses: &[Vec<OutputConstraint>],
-    solve_budget: f64,
+    deadline: std::time::Instant,
     backend: MipBackend,
     num_outputs: usize,
     json: bool,
 ) -> Result<VerificationResult> {
-    let overall_start = std::time::Instant::now();
     let num_clauses = clauses.len();
     if !json {
         println!("  Disjunctive property: {num_clauses} clauses, solving independently...");
@@ -457,22 +566,29 @@ fn solve_graph_disjunctive(
     let mut undecided_reason: Option<String> = None;
 
     for (idx, clause) in clauses.iter().enumerate() {
-        let elapsed = overall_start.elapsed().as_secs_f64();
-        if elapsed >= solve_budget {
+        if std::time::Instant::now() >= deadline {
             all_certified_unsat = false;
             undecided_reason = Some("budget exhausted before all clauses solved".into());
             break;
         }
-        let remaining = solve_budget - elapsed;
-        let clause_timeout = remaining / (num_clauses - idx).max(1) as f64;
 
         let mut enc = base.clone();
         for c in clause {
             enc.add_output_constraint(c)?;
         }
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64();
+        if remaining <= 0.0 {
+            all_certified_unsat = false;
+            undecided_reason = Some("budget exhausted while preparing a clause".into());
+            break;
+        }
+        let clause_timeout = remaining / (num_clauses - idx).max(1) as f64;
+        let ay_node_warm_time_limit = enc.ay_node_warm_time_limit();
         let solver = MipSolver::new(
             enc.into_parts(),
-            graph_mip_solver_config(backend, clause_timeout),
+            graph_mip_solver_config(backend, clause_timeout, ay_node_warm_time_limit),
         );
         let mip_result = solver
             .check_feasibility()
@@ -708,9 +824,11 @@ mod resource_tests {
     #[test]
     fn whole_net_solver_config_enforces_one_model_at_a_time() {
         for (backend, timeout_secs) in [(MipBackend::Ay, 30.0), (MipBackend::AyProc, 7.5)] {
-            let config = graph_mip_solver_config(backend, timeout_secs);
+            let node_warm_limit = Some(std::time::Duration::from_secs(5));
+            let config = graph_mip_solver_config(backend, timeout_secs, node_warm_limit);
             assert_eq!(config.backend, backend);
             assert_eq!(config.timeout_secs, timeout_secs);
+            assert_eq!(config.ay_node_warm_time_limit, node_warm_limit);
             assert_eq!(
                 config.parallel_split, 1,
                 "whole-net Graph-MIP must not clone the full IR into sibling solves"

@@ -11,14 +11,21 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_SCRIPT = REPO_ROOT / "scripts" / "benchmark_vnncomp_all.sh"
 AGGREGATOR_SCRIPT = REPO_ROOT / "scripts" / "aggregate_vnncomp_results.py"
 
 
-def _write_category_fixture(tmp_path: Path, category: str, *, year: int = 2025) -> None:
+def _write_category_fixture(
+    tmp_path: Path,
+    category: str,
+    *,
+    year: int = 2025,
+    version: str | None = None,
+) -> None:
     category_dir = tmp_path / "benchmarks" / f"vnncomp{year}" / "benchmarks" / category
+    if version is not None:
+        category_dir /= version
     category_dir.mkdir(parents=True, exist_ok=True)
     (category_dir / "instances.csv").write_text(
         "model.onnx,prop.vnnlib,2\n",
@@ -122,6 +129,64 @@ def test_benchmark_vnncomp_all_records_failed_category_without_reusing_stale_csv
     assert not (tmp_path / "metrics" / "benchmarks" / "vnncomp_latest.json").exists(), (
         "canonical metrics latest should not be written for failed partial runs"
     )
+
+
+def test_benchmark_vnncomp_all_records_successful_child_without_report_as_failed(
+    tmp_path: Path,
+) -> None:
+    _write_category_fixture(tmp_path, "missingreport")
+    _install_runner_harness(
+        tmp_path,
+        child_body=textwrap.dedent(
+            """\
+            #!/bin/sh
+            echo "child completed without publishing a report"
+            exit 0
+            """
+        ),
+    )
+
+    result = _run_runner(tmp_path, "--categories", "missingreport")
+
+    assert result.returncode == 0, (
+        "a missing child report should be represented in the aggregate summary, "
+        f"not abort the runner: {result.stderr}"
+    )
+    summary = _load_summary(tmp_path)
+    assert summary["categories"] == {}, summary
+    assert summary["failed"] == {
+        "missingreport": {"exit_code": 0, "reason": "no report path in output"}
+    }, summary
+
+
+def test_benchmark_vnncomp_all_rejects_report_path_traversal(
+    tmp_path: Path,
+) -> None:
+    _write_category_fixture(tmp_path, "traversal")
+    _install_runner_harness(
+        tmp_path,
+        child_body=textwrap.dedent(
+            """\
+            #!/bin/sh
+            mkdir -p reports/benchmarks
+            printf 'model,property,timeout,result,elapsed,domains\n' \
+                > reports/escaped.csv
+            echo "Report: reports/benchmarks/../escaped.csv"
+            """
+        ),
+    )
+
+    result = _run_runner(tmp_path, "--categories", "traversal")
+
+    assert result.returncode == 0, result.stderr
+    summary = _load_summary(tmp_path)
+    assert summary["categories"] == {}, summary
+    assert summary["failed"] == {
+        "traversal": {
+            "exit_code": 0,
+            "reason": "report path outside reports/benchmarks/",
+        }
+    }, summary
 
 
 def test_benchmark_vnncomp_all_excludes_current_csv_from_validation_failure(
@@ -294,8 +359,8 @@ def test_benchmark_vnncomp_all_allows_explicit_runtime_limited_probe(
     assert "vit_2023" in supported_section, (
         f"explicit category selection should still allow vit_2023 probes, got: {result.stdout}"
     )
-    assert "vit_2023" in skipped_section, (
-        "skip metadata should remain visible so explicit probes still report the known blocker"
+    assert "vit_2023" not in skipped_section, (
+        "an explicitly attempted category must not also be reported as skipped"
     )
 
 
@@ -328,9 +393,228 @@ def test_benchmark_vnncomp_all_keeps_current_head_measured_categories_supported(
         assert supported_line is not None, (
             f"{category} should remain in the runnable default set, got: {result.stdout}"
         )
-        assert "1 instances" in supported_line and "NOT FOUND" not in supported_line, (
+        assert "1 instances" in supported_line, (
+            f"{category} should resolve to a real runnable fixture line, got: {supported_line!r}"
+        )
+        assert "NOT FOUND" not in supported_line, (
             f"{category} should resolve to a real runnable fixture line, got: {supported_line!r}"
         )
         assert category not in skipped_section, (
             f"{category} should not regress back into skipped categories, got: {result.stdout}"
         )
+
+
+def test_benchmark_vnncomp_all_2026_defaults_partition_official_categories(
+    tmp_path: Path,
+) -> None:
+    _install_runner_harness(
+        tmp_path,
+        child_body=textwrap.dedent(
+            """\
+            #!/bin/sh
+            exit 0
+            """
+        ),
+    )
+
+    result = _run_runner(tmp_path, "--year", "2026", "--dry-run")
+
+    assert result.returncode == 0, f"2026 dry run failed unexpectedly: {result.stderr}"
+    supported_section, skipped_section = result.stdout.split("=== Skipped Categories ===", 1)
+    supported = {
+        line.split()[0]
+        for line in supported_section.splitlines()
+        if line.startswith("  ") and len(line.split()) >= 2
+    }
+    skipped = {
+        line.split()[0]
+        for line in skipped_section.splitlines()
+        if line.startswith("  ") and len(line.split()) >= 2
+    }
+    official = {
+        "acasxu_2023",
+        "adaptive_cruise_control_non_linear_2026",
+        "cctsdb_yolo_2023",
+        "cersyve",
+        "cgan2026",
+        "challenging_certified_training_2026",
+        "cifar100_2024",
+        "collins_aerospace_benchmark",
+        "collins_rul_cnn_2022",
+        "cora_2024",
+        "dist_shift_2023",
+        "isomorphic_acasxu_2026",
+        "linearizenn_2024",
+        "lsnc_relu",
+        "malbeware",
+        "metaroom_2023",
+        "ml4acopf_2024",
+        "monotonic_acasxu_2026",
+        "nn4sys",
+        "relusplitter_2026",
+        "safenlp_2024",
+        "sat_relu",
+        "smart_turn_multimodal_2026",
+        "soundnessbench_2026",
+        "tinyimagenet_2024",
+        "tllverifybench_2023",
+        "traffic_signs_recognition_2023",
+        "vggnet16_2022",
+        "vit_2023",
+        "yolo_2023",
+    }
+
+    assert supported.isdisjoint(skipped), (
+        f"2026 categories cannot be both attempted and skipped: {supported & skipped}"
+    )
+    assert supported | skipped == official, (
+        f"2026 default scope drifted: missing={official - supported - skipped}, "
+        f"extra={(supported | skipped) - official}"
+    )
+    assert "cgan2026" in supported
+    assert "relusplitter_2026" in supported
+    assert "cgan_2023" not in supported
+    assert "relusplitter" not in supported
+    assert "soundnessbench_2026" in skipped
+    assert "soundnessbench" not in skipped
+
+
+def test_benchmark_vnncomp_all_2026_routes_version_root_preset_and_tracker(
+    tmp_path: Path,
+) -> None:
+    category = "cgan2026"
+    _write_category_fixture(tmp_path, category, year=2026, version="1.0")
+    preset = tmp_path / "configs" / "vnncomp26" / f"{category}.yaml"
+    preset.parent.mkdir(parents=True, exist_ok=True)
+    preset.write_text("general: {}\n", encoding="utf-8")
+
+    _install_runner_harness(
+        tmp_path,
+        child_body=textwrap.dedent(
+            """\
+            #!/bin/sh
+            printf '%s\\n%s\\n%s\\n%s\\n' \\
+              "$BENCH_ROOT" "$BENCH_DIR" "$PRESET_PATH_OVERRIDE" "${2:-}" > child_env.txt
+            mkdir -p reports/benchmarks
+            report="reports/benchmarks/${1}_20260729_120000.csv"
+            printf 'model,property,timeout,result,elapsed,domains\\n' > "$report"
+            printf 'model.onnx,prop.vnnlib,2,verified,0.5,3\\n' >> "$report"
+            echo "Report: $report"
+            """
+        ),
+        aggregator_body=textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json
+            import sys
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            Path("aggregator_args.json").write_text(json.dumps(args), encoding="utf-8")
+            output = Path(args[args.index("--output") + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps({
+                "total_instances": 1,
+                "categories_attempted": 1,
+                "total_score": 1,
+                "overall_solve_rate": 100.0,
+                "publication_scope": "timestamp_only",
+            }) + "\\n", encoding="utf-8")
+            """
+        ),
+    )
+
+    result = _run_runner(tmp_path, "--year", "2026", "--categories", category)
+
+    assert result.returncode == 0, f"2026 routed run failed: {result.stderr}"
+    child_env = (tmp_path / "child_env.txt").read_text(encoding="utf-8").splitlines()
+    assert child_env == [
+        "benchmarks/vnncomp2026/benchmarks",
+        f"benchmarks/vnncomp2026/benchmarks/{category}/1.0",
+        f"configs/vnncomp26/{category}.yaml",
+        "--competition-wrapper",
+    ]
+    aggregator_args = json.loads((tmp_path / "aggregator_args.json").read_text(encoding="utf-8"))
+    assert aggregator_args[aggregator_args.index("--year") + 1] == "2026"
+    assert aggregator_args[aggregator_args.index("--tracker-year") + 1] == "2026"
+
+
+def test_benchmark_vnncomp_all_2026_can_explicitly_retain_diagnostic_surface(
+    tmp_path: Path,
+) -> None:
+    _install_runner_harness(
+        tmp_path,
+        child_body="#!/bin/sh\nexit 0\n",
+    )
+
+    result = _run_runner(
+        tmp_path,
+        "--year",
+        "2026",
+        "--diagnostic-beta-crown",
+        "--dry-run",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Surface:    beta-crown diagnostic (not eligible for score claims)" in result.stdout
+    assert "ny vnncomp competition wrapper" not in result.stdout
+
+
+def test_benchmark_vnncomp_all_2026_uses_v2_for_v2_only_extended_category(
+    tmp_path: Path,
+) -> None:
+    category = "isomorphic_acasxu_2026"
+    _write_category_fixture(tmp_path, category, year=2026, version="2.0")
+    _install_runner_harness(
+        tmp_path,
+        child_body=textwrap.dedent(
+            """\
+            #!/bin/sh
+            exit 0
+            """
+        ),
+    )
+
+    result = _run_runner(
+        tmp_path,
+        "--year",
+        "2026",
+        "--dry-run",
+        "--categories",
+        category,
+    )
+
+    assert result.returncode == 0, f"2026 V2 dry run failed: {result.stderr}"
+    supported_section, skipped_section = result.stdout.split("=== Skipped Categories ===", 1)
+    category_line = next(
+        line for line in supported_section.splitlines() if category in line
+    )
+    assert "1 instances" in category_line
+    assert "NOT FOUND" not in category_line
+    assert category not in skipped_section
+
+
+def test_benchmark_vnncomp_all_2026_never_falls_back_to_unversioned_copy(
+    tmp_path: Path,
+) -> None:
+    category = "isomorphic_acasxu_2026"
+    _write_category_fixture(tmp_path, category, year=2026)
+    _install_runner_harness(
+        tmp_path,
+        child_body="#!/bin/sh\nexit 0\n",
+    )
+
+    result = _run_runner(
+        tmp_path,
+        "--year",
+        "2026",
+        "--dry-run",
+        "--categories",
+        category,
+    )
+
+    assert result.returncode == 0, result.stderr
+    category_line = next(line for line in result.stdout.splitlines() if category in line)
+    assert "NOT FOUND" in category_line, (
+        "a 2.0-only category must not use an unversioned local manifest"
+    )

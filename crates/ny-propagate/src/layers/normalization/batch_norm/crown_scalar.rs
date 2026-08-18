@@ -5,14 +5,15 @@
 //! Scalar CROWN backward propagation for BatchNorm.
 
 use ndarray::{Array2, Axis, Zip};
-use ny_core::Result;
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
+use ny_core::{f32_to_f64_exact, f64_to_f32_down, f64_to_f32_up, Result};
+use ny_tensor::{next_up_f32, BoundedTensor};
 
-use super::math::detect_input_layout;
+use super::math::{detect_input_layout, nonnegative_add_up, nonnegative_mul_up};
 use super::types::BatchNormLayer;
 #[cfg(test)]
 use crate::bounds::safe_mul_for_bounds;
-use crate::bounds::safe_mul_for_bounds_f64;
+use crate::bounds::{certified_affine_sum_f32, safe_mul_for_bounds_f64, OutwardDirection};
+use crate::layers::linear::bias::{add_f64_down, add_f64_up};
 use crate::LinearBounds;
 
 /// One unit roundoff for round-to-nearest f32 (`2^-24`); the fresh multiply-error
@@ -43,24 +44,29 @@ impl BatchNormLayer {
     ///     broadcast `Zip`,
     ///   * the bias-fold + OUTWARD widen accumulation reads each output row via a
     ///     single contiguous row view instead of re-indexing the 2D matrix, and
-    ///     keeps the identical f64 accumulation ORDER and `safe_mul_for_bounds_f64`
-    ///     / directed-rounding used by the scalar loop.
+    ///     uses the same certified double-double reduction and directed error
+    ///     arithmetic as the scalar oracle.
     ///
     /// SOUNDNESS: the outward error/margin terms (`scale_err`/`bias_err`/`w_err`,
     /// the coefficient-error widen, and the fresh multiply-rounding) are
-    /// accumulated in f64 in exactly the same order with the same
-    /// `safe_mul_for_bounds_f64` (0·∞ = 0) and the same OUTWARD `next_down_f32` /
-    /// `next_up_f32` rounding as before. The result is bit-identical, so the
-    /// bound is neither tightened nor loosened.
+    /// accumulated outward. The finite affine dot uses a certified
+    /// double-double reduction so cancellation remains tight; the nonnegative
+    /// error reductions direct every binary64 operation upward.
     pub fn propagate_linear_with_bounds(
         &self,
         bounds: &LinearBounds,
         pre_activation: &BoundedTensor,
     ) -> Result<LinearBounds> {
+        self.validate_affine_parameters()?;
         let shape = pre_activation.shape();
         let num_inputs = bounds.num_inputs();
         let num_outputs = bounds.num_outputs();
-        let layout = detect_input_layout(shape, self.num_channels, Some(num_inputs))?;
+        let layout = detect_input_layout(
+            shape,
+            self.num_channels,
+            Some(num_inputs),
+            self.channel_axis_hint,
+        )?;
         let (expanded_scale, expanded_bias) = self.expand_scale_bias(&layout);
 
         // Per-input-position error weight `w_err[i] = scale_err·xmag_i + bias_err`,
@@ -83,16 +89,20 @@ impl BatchNormLayer {
                     .unwrap_or(0.0)
                     .abs()
                     .max(pre_u.get(i).copied().unwrap_or(0.0).abs());
-                safe_mul_for_bounds_f64(xmag as f64, expanded_scale_err[i] as f64)
-                    + expanded_bias_err[i] as f64
+                nonnegative_add_up(
+                    nonnegative_mul_up(
+                        f32_to_f64_exact(xmag),
+                        f32_to_f64_exact(expanded_scale_err[i]),
+                    ),
+                    f32_to_f64_exact(expanded_bias_err[i]),
+                )
             })
             .collect();
 
-        // Per-input-column f64 constants, hoisted out of the row loop. These are
-        // bit-identical to reading `expanded_bias[i] as f64` (and its abs) inside
-        // the loop, so the accumulation below is unchanged.
-        let bias_f64: Vec<f64> = expanded_bias.iter().map(|&b| b as f64).collect();
-        let abs_bias_f64: Vec<f64> = bias_f64.iter().map(|&b| b.abs()).collect();
+        let abs_bias_f64: Vec<f64> = expanded_bias
+            .iter()
+            .map(|&b| f32_to_f64_exact(b).abs())
+            .collect();
 
         // Compute bias contributions BEFORE scaling (using original matrices).
         // Accumulate in f64 to avoid cancellation when many channels contribute.
@@ -109,48 +119,60 @@ impl BatchNormLayer {
         let in_upper_err = bounds.upper_a_err();
         let lower_a = bounds.lower_a();
         let upper_a = bounds.upper_a();
-        let mut new_lower_b_f64 = bounds.lower_b().mapv(|x| x as f64);
-        let mut new_upper_b_f64 = bounds.upper_b().mapv(|x| x as f64);
+        let mut new_lower_b_f64 = bounds.lower_b().mapv(f32_to_f64_exact);
+        let mut new_upper_b_f64 = bounds.upper_b().mapv(f32_to_f64_exact);
 
-        // Per-output-row f64 accumulation. Row-slice access (contiguous for the
-        // C-order coefficient matrices) replaces the original `A[[out, i]]`
-        // double-indexing; the arithmetic — accumulation ORDER,
-        // `safe_mul_for_bounds_f64` (0·∞ = 0), f64 promotion, and the OUTWARD
-        // widen (`-=` lower / `+=` upper) — is byte-for-byte the scalar loop.
+        // Per-output-row certified accumulation. Row-slice access (contiguous
+        // for the C-order coefficient matrices) replaces repeated 2D indexing.
         for out_row in 0..num_outputs {
             let la = lower_a.row(out_row);
             let ua = upper_a.row(out_row);
             let el_row = in_lower_err.map(|e| e.row(out_row));
             let eu_row = in_upper_err.map(|e| e.row(out_row));
 
-            let mut lower_acc = new_lower_b_f64[out_row];
-            let mut upper_acc = new_upper_b_f64[out_row];
+            // Every finite binary32 coefficient/bias product is exact in f64,
+            // but a plain f64 `sum` can still erase a tiny residual under
+            // catastrophic cancellation.  The shared certified reducer uses a
+            // self-checked double-double accumulator plus an outward envelope,
+            // and falls back to per-add directed f64 arithmetic for non-finite
+            // inputs.  This is both sound and substantially tighter than
+            // directing every finite add independently.
+            let lower_acc = certified_affine_sum_f32(
+                bounds.lower_b()[out_row],
+                la.iter().copied().zip(expanded_bias.iter().copied()),
+                OutwardDirection::Lower,
+            );
+            let upper_acc = certified_affine_sum_f32(
+                bounds.upper_b()[out_row],
+                ua.iter().copied().zip(expanded_bias.iter().copied()),
+                OutwardDirection::Upper,
+            );
             let mut widen_lower = 0.0f64;
             let mut widen_upper = 0.0f64;
             for i in 0..num_inputs {
-                let la_i = la[i] as f64;
-                let ua_i = ua[i] as f64;
-                // safe_mul_for_bounds_f64 gives 0*inf=0 so a degenerate Inf/NaN
-                // bias (BatchNorm channel with var+eps ~= 0) does not turn a zero
-                // coefficient into NaN. Nonzero coefficient times an Inf bias
-                // yields a ±Inf bias contribution, which concretize handles
-                // soundly via the Inf-bias short-circuit.
-                lower_acc += safe_mul_for_bounds_f64(la_i, bias_f64[i]);
-                upper_acc += safe_mul_for_bounds_f64(ua_i, bias_f64[i]);
-
-                let el = el_row.as_ref().map_or(0.0, |e| e[i] as f64);
-                let eu = eu_row.as_ref().map_or(0.0, |e| e[i] as f64);
+                let la_i = f32_to_f64_exact(la[i]);
+                let ua_i = f32_to_f64_exact(ua[i]);
+                let el = el_row.as_ref().map_or(0.0, |e| f32_to_f64_exact(e[i]));
+                let eu = eu_row.as_ref().map_or(0.0, |e| f32_to_f64_exact(e[i]));
                 let abs_bias = abs_bias_f64[i];
                 // Outward precompute-error margin over the true-coefficient
                 // magnitude (|a|+e), plus the bias-contribution uncertainty
-                // e·|bias_i| (0·∞ = 0 safe).
-                widen_lower += safe_mul_for_bounds_f64(la_i.abs() + el, w_err[i])
-                    + safe_mul_for_bounds_f64(el, abs_bias);
-                widen_upper += safe_mul_for_bounds_f64(ua_i.abs() + eu, w_err[i])
-                    + safe_mul_for_bounds_f64(eu, abs_bias);
+                // e·|bias_i| (0·∞ = 0 safe). Every operation in this
+                // non-negative reduction is rounded upward; a final f32 cast
+                // alone cannot repair an f64 reduction that under-accumulated.
+                let lower_term = nonnegative_add_up(
+                    nonnegative_mul_up(nonnegative_add_up(la_i.abs(), el), w_err[i]),
+                    nonnegative_mul_up(el, abs_bias),
+                );
+                let upper_term = nonnegative_add_up(
+                    nonnegative_mul_up(nonnegative_add_up(ua_i.abs(), eu), w_err[i]),
+                    nonnegative_mul_up(eu, abs_bias),
+                );
+                widen_lower = nonnegative_add_up(widen_lower, lower_term);
+                widen_upper = nonnegative_add_up(widen_upper, upper_term);
             }
-            new_lower_b_f64[out_row] = lower_acc - widen_lower;
-            new_upper_b_f64[out_row] = upper_acc + widen_upper;
+            new_lower_b_f64[out_row] = add_f64_down(lower_acc, -widen_lower);
+            new_upper_b_f64[out_row] = add_f64_up(upper_acc, widen_upper);
         }
 
         // Scale coefficient matrices column-wise by scale (affine substitution).
@@ -245,9 +267,9 @@ impl BatchNormLayer {
 
         LinearBounds::new_or_conservative_with_err(
             new_lower_a,
-            new_lower_b_f64.mapv(|x| next_down_f32(x as f32)),
+            new_lower_b_f64.mapv(f64_to_f32_down),
             new_upper_a,
-            new_upper_b_f64.mapv(|x| next_up_f32(x as f32)),
+            new_upper_b_f64.mapv(f64_to_f32_up),
             lower_err,
             upper_err,
         )
@@ -265,10 +287,16 @@ impl BatchNormLayer {
         bounds: &LinearBounds,
         pre_activation: &BoundedTensor,
     ) -> Result<LinearBounds> {
+        self.validate_affine_parameters()?;
         let shape = pre_activation.shape();
         let num_inputs = bounds.num_inputs();
         let num_outputs = bounds.num_outputs();
-        let layout = detect_input_layout(shape, self.num_channels, Some(num_inputs))?;
+        let layout = detect_input_layout(
+            shape,
+            self.num_channels,
+            Some(num_inputs),
+            self.channel_axis_hint,
+        )?;
         let (expanded_scale, expanded_bias) = self.expand_scale_bias(&layout);
 
         let (expanded_scale_err, expanded_bias_err) = self.expand_errs(&layout);
@@ -282,41 +310,52 @@ impl BatchNormLayer {
                     .unwrap_or(0.0)
                     .abs()
                     .max(pre_u.get(i).copied().unwrap_or(0.0).abs());
-                safe_mul_for_bounds_f64(xmag as f64, expanded_scale_err[i] as f64)
-                    + expanded_bias_err[i] as f64
+                nonnegative_add_up(
+                    nonnegative_mul_up(
+                        f32_to_f64_exact(xmag),
+                        f32_to_f64_exact(expanded_scale_err[i]),
+                    ),
+                    f32_to_f64_exact(expanded_bias_err[i]),
+                )
             })
             .collect();
 
         let in_lower_err = bounds.lower_a_err();
         let in_upper_err = bounds.upper_a_err();
-        let mut new_lower_b_f64 = bounds.lower_b().mapv(|x| x as f64);
-        let mut new_upper_b_f64 = bounds.upper_b().mapv(|x| x as f64);
+        let mut new_lower_b_f64 = bounds.lower_b().mapv(f32_to_f64_exact);
+        let mut new_upper_b_f64 = bounds.upper_b().mapv(f32_to_f64_exact);
         for out_row in 0..num_outputs {
+            let lower_acc = certified_affine_sum_f32(
+                bounds.lower_b()[out_row],
+                (0..num_inputs).map(|i| (bounds.lower_a()[[out_row, i]], expanded_bias[i])),
+                OutwardDirection::Lower,
+            );
+            let upper_acc = certified_affine_sum_f32(
+                bounds.upper_b()[out_row],
+                (0..num_inputs).map(|i| (bounds.upper_a()[[out_row, i]], expanded_bias[i])),
+                OutwardDirection::Upper,
+            );
             let mut widen_lower = 0.0f64;
             let mut widen_upper = 0.0f64;
             for i in 0..num_inputs {
-                new_lower_b_f64[out_row] += safe_mul_for_bounds_f64(
-                    bounds.lower_a()[[out_row, i]] as f64,
-                    expanded_bias[i] as f64,
+                let la = f32_to_f64_exact(bounds.lower_a()[[out_row, i]]);
+                let ua = f32_to_f64_exact(bounds.upper_a()[[out_row, i]]);
+                let el = in_lower_err.map_or(0.0, |e| f32_to_f64_exact(e[[out_row, i]]));
+                let eu = in_upper_err.map_or(0.0, |e| f32_to_f64_exact(e[[out_row, i]]));
+                let abs_bias = f32_to_f64_exact(expanded_bias[i]).abs();
+                let lower_term = nonnegative_add_up(
+                    nonnegative_mul_up(nonnegative_add_up(la.abs(), el), w_err[i]),
+                    nonnegative_mul_up(el, abs_bias),
                 );
-                new_upper_b_f64[out_row] += safe_mul_for_bounds_f64(
-                    bounds.upper_a()[[out_row, i]] as f64,
-                    expanded_bias[i] as f64,
+                let upper_term = nonnegative_add_up(
+                    nonnegative_mul_up(nonnegative_add_up(ua.abs(), eu), w_err[i]),
+                    nonnegative_mul_up(eu, abs_bias),
                 );
-                let el = in_lower_err.map_or(0.0, |e| e[[out_row, i]] as f64);
-                let eu = in_upper_err.map_or(0.0, |e| e[[out_row, i]] as f64);
-                let abs_bias = (expanded_bias[i] as f64).abs();
-                widen_lower += safe_mul_for_bounds_f64(
-                    (bounds.lower_a()[[out_row, i]] as f64).abs() + el,
-                    w_err[i],
-                ) + safe_mul_for_bounds_f64(el, abs_bias);
-                widen_upper += safe_mul_for_bounds_f64(
-                    (bounds.upper_a()[[out_row, i]] as f64).abs() + eu,
-                    w_err[i],
-                ) + safe_mul_for_bounds_f64(eu, abs_bias);
+                widen_lower = nonnegative_add_up(widen_lower, lower_term);
+                widen_upper = nonnegative_add_up(widen_upper, upper_term);
             }
-            new_lower_b_f64[out_row] -= widen_lower;
-            new_upper_b_f64[out_row] += widen_upper;
+            new_lower_b_f64[out_row] = add_f64_down(lower_acc, -widen_lower);
+            new_upper_b_f64[out_row] = add_f64_up(upper_acc, widen_upper);
         }
 
         let mut new_lower_a = bounds.lower_a().clone();
@@ -348,9 +387,9 @@ impl BatchNormLayer {
 
         LinearBounds::new_or_conservative_with_err(
             new_lower_a,
-            new_lower_b_f64.mapv(|x| next_down_f32(x as f32)),
+            new_lower_b_f64.mapv(f64_to_f32_down),
             new_upper_a,
-            new_upper_b_f64.mapv(|x| next_up_f32(x as f32)),
+            new_upper_b_f64.mapv(f64_to_f32_up),
             lower_err,
             upper_err,
         )

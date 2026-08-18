@@ -10,10 +10,14 @@
 //!
 //! Part of #3463
 
-use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds, UnstableIdx};
+use crate::bounds::patches::{
+    CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds, UnstableIdx,
+};
 use crate::layers::activations::relu::relu_linear_relaxation;
 use crate::layers::common::{
     crown_relu_backward_patches_with_alpha, crown_relu_backward_patches_with_alpha_bound_only,
+    crown_relu_backward_patches_with_alpha_in_place_with_poll_for_test,
+    prepare_crown_relu_backward_patches_with_alpha_in_place,
 };
 use ndarray::{array, ArrayD, IxDyn};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
@@ -43,102 +47,113 @@ use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 /// upper_b = -0.5 + 0.0 + 3.0 = 2.5
 ///
 /// Gradient: la0=1.5>0, crossing → 1.5*(-1.0)=-1.5;  la1=-2.0≤0 → 0.0
+/// #patches-eager-err: pins the UNFOLDED kernel. Every expectation below is
+/// derived from the patches/relaxation arithmetic itself; the eager error fold
+/// is a POLICY applied at the ReLU backward call sites that widens the bias
+/// outward on top of that arithmetic. Asserting the derivation with the fold off
+/// keeps this test measuring what it was written to measure instead of
+/// re-pinning it to constants the derivation no longer explains. The default
+/// (folded) configuration is covered by
+/// `eager_fold_never_tightens_against_the_unfolded_path` and
+/// `eager_fold_discharges_coeff_err_into_the_bias_by_default`.
 #[test]
 fn test_crown_relu_backward_patches_with_alpha_dense_crossing_neurons() {
-    let bounds = PatchesLinearBounds {
-        row_count: 1,
-        lower_a: PatchesData {
-            coeff_err: None,
-            patches: Some(
-                ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![1.5_f32, -2.0]).unwrap(),
-            ),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
-            identity: false,
-            output_shape: (1, 1, 1),
-            input_shape: (1, 1, 2),
-            unstable_idx: None,
-        },
-        lower_b: array![0.25_f32],
-        upper_a: PatchesData {
-            coeff_err: None,
-            patches: Some(
-                ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![-0.75_f32, 3.0]).unwrap(),
-            ),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
-            identity: false,
-            output_shape: (1, 1, 1),
-            input_shape: (1, 1, 2),
-            unstable_idx: None,
-        },
-        upper_b: array![-0.5_f32],
-    };
-    let pre_activation = BoundedTensor::new(
-        array![-1.0_f32, -2.0].into_dyn(),
-        array![3.0_f32, 2.0].into_dyn(),
-    )
-    .unwrap();
-    let alpha = array![0.5_f32, 0.25];
+    crate::bounds::patches::test_override::with_eager_err(false, || {
+        let bounds = PatchesLinearBounds {
+            row_count: 1,
+            lower_a: PatchesData {
+                coeff_err: None,
+                patches: Some(
+                    ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![1.5_f32, -2.0])
+                        .unwrap(),
+                ),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+                identity: false,
+                output_shape: (1, 1, 1),
+                input_shape: (1, 1, 2),
+                unstable_idx: None,
+            },
+            lower_b: array![0.25_f32],
+            upper_a: PatchesData {
+                coeff_err: None,
+                patches: Some(
+                    ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![-0.75_f32, 3.0])
+                        .unwrap(),
+                ),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+                identity: false,
+                output_shape: (1, 1, 1),
+                input_shape: (1, 1, 2),
+                unstable_idx: None,
+            },
+            upper_b: array![-0.5_f32],
+        };
+        let pre_activation = BoundedTensor::new(
+            array![-1.0_f32, -2.0].into_dyn(),
+            array![3.0_f32, 2.0].into_dyn(),
+        )
+        .unwrap();
+        let alpha = array![0.5_f32, 0.25];
 
-    let (result, gradient) =
-        crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
-    let bound_only =
-        crown_relu_backward_patches_with_alpha_bound_only(&bounds, &pre_activation, &alpha)
-            .unwrap();
-    let CrownBounds::Patches(result) = result else {
-        panic!("expected patches output");
-    };
-    let CrownBounds::Patches(bound_only) = bound_only else {
-        panic!("expected bound-only patches output");
-    };
+        let (result, gradient) =
+            crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
+        let bound_only =
+            crown_relu_backward_patches_with_alpha_bound_only(&bounds, &pre_activation, &alpha)
+                .unwrap();
+        let CrownBounds::Patches(result) = result else {
+            panic!("expected patches output");
+        };
+        let CrownBounds::Patches(bound_only) = bound_only else {
+            panic!("expected bound-only patches output");
+        };
 
-    assert_eq!(
-        bound_only.lower_a.patches.as_ref(),
-        result.lower_a.patches.as_ref()
-    );
-    assert_eq!(
-        bound_only.lower_a.coeff_err.as_ref(),
-        result.lower_a.coeff_err.as_ref()
-    );
-    assert_eq!(bound_only.lower_b, result.lower_b);
-    assert_eq!(
-        bound_only.upper_a.patches.as_ref(),
-        result.upper_a.patches.as_ref()
-    );
-    assert_eq!(
-        bound_only.upper_a.coeff_err.as_ref(),
-        result.upper_a.coeff_err.as_ref()
-    );
-    assert_eq!(bound_only.upper_b, result.upper_b);
+        assert_eq!(
+            bound_only.lower_a.patches.as_ref(),
+            result.lower_a.patches.as_ref()
+        );
+        assert_eq!(
+            bound_only.lower_a.coeff_err.as_ref(),
+            result.lower_a.coeff_err.as_ref()
+        );
+        assert_eq!(bound_only.lower_b, result.lower_b);
+        assert_eq!(
+            bound_only.upper_a.patches.as_ref(),
+            result.upper_a.patches.as_ref()
+        );
+        assert_eq!(
+            bound_only.upper_a.coeff_err.as_ref(),
+            result.upper_a.coeff_err.as_ref()
+        );
+        assert_eq!(bound_only.upper_b, result.upper_b);
 
-    let lower_patches = result.lower_a.patches.as_ref().expect("lower patches");
-    let upper_patches = result.upper_a.patches.as_ref().expect("upper patches");
+        let lower_patches = result.lower_a.patches.as_ref().expect("lower patches");
+        let upper_patches = result.upper_a.patches.as_ref().expect("upper patches");
 
-    let n1_relax = relu_linear_relaxation(-2.0, 2.0);
+        let n1_relax = relu_linear_relaxation(-2.0, 2.0);
 
-    // Coefficient assertions (directed rounding).
-    assert_eq!(lower_patches[[0, 0, 0, 0, 0, 0]], next_down_f32(0.75));
-    assert_eq!(
-        lower_patches[[0, 0, 0, 0, 0, 1]],
-        next_down_f32(-2.0 * n1_relax.upper_slope)
-    );
-    assert_eq!(upper_patches[[0, 0, 0, 0, 0, 0]], next_up_f32(-0.375));
-    assert_eq!(
-        upper_patches[[0, 0, 0, 0, 0, 1]],
-        next_up_f32(3.0 * n1_relax.upper_slope)
-    );
+        // Coefficient assertions (directed rounding).
+        assert_eq!(lower_patches[[0, 0, 0, 0, 0, 0]], next_down_f32(0.75));
+        assert_eq!(
+            lower_patches[[0, 0, 0, 0, 0, 1]],
+            next_down_f32(-2.0 * n1_relax.upper_slope)
+        );
+        assert_eq!(upper_patches[[0, 0, 0, 0, 0, 0]], next_up_f32(-0.375));
+        assert_eq!(
+            upper_patches[[0, 0, 0, 0, 0, 1]],
+            next_up_f32(3.0 * n1_relax.upper_slope)
+        );
 
-    // Bias assertions (f64 accumulation → next_down/next_up).
-    let expected_lower_b = 0.25_f64 + (-2.0_f64) * n1_relax.upper_intercept as f64;
-    let expected_upper_b = -0.5_f64 + 3.0_f64 * n1_relax.upper_intercept as f64;
-    assert_eq!(result.lower_b[0], next_down_f32(expected_lower_b as f32));
-    assert_eq!(result.upper_b[0], next_up_f32(expected_upper_b as f32));
+        // Bias assertions (f64 accumulation → next_down/next_up).
+        let expected_lower_b = 0.25_f64 + (-2.0_f64) * n1_relax.upper_intercept as f64;
+        let expected_upper_b = -0.5_f64 + 3.0_f64 * n1_relax.upper_intercept as f64;
+        assert_eq!(result.lower_b[0], next_down_f32(expected_lower_b as f32));
+        assert_eq!(result.upper_b[0], next_up_f32(expected_upper_b as f32));
 
-    // Gradient: d(lower_bound_sum)/d(alpha[i]).
-    // Only positive lower-A coefficients on crossing neurons contribute.
-    assert_eq!(gradient[0], -1.5); // la0=1.5 * pre_lower[0]=-1.0
-    assert_eq!(gradient[1], 0.0); // la1=-2.0 ≤ 0, no contribution
+        // Gradient: d(lower_bound_sum)/d(alpha[i]).
+        // Only positive lower-A coefficients on crossing neurons contribute.
+        assert_eq!(gradient[0], -1.5); // la0=1.5 * pre_lower[0]=-1.0
+        assert_eq!(gradient[1], 0.0); // la1=-2.0 ≤ 0, no contribution
+    });
 }
 
 /// Mixed neuron states: one always-active, one crossing.
@@ -163,69 +178,79 @@ fn test_crown_relu_backward_patches_with_alpha_dense_crossing_neurons() {
 /// upper_b = 0.0
 ///
 /// Gradient: la0=2.0>0 but n0 not crossing → 0;  la1=1.5>0, n1 crossing → 1.5*(-2.0)=-3.0
+/// #patches-eager-err: pins the UNFOLDED kernel. Every expectation below is
+/// derived from the patches/relaxation arithmetic itself; the eager error fold
+/// is a POLICY applied at the ReLU backward call sites that widens the bias
+/// outward on top of that arithmetic. Asserting the derivation with the fold off
+/// keeps this test measuring what it was written to measure instead of
+/// re-pinning it to constants the derivation no longer explains. The default
+/// (folded) configuration is covered by
+/// `eager_fold_never_tightens_against_the_unfolded_path` and
+/// `eager_fold_discharges_coeff_err_into_the_bias_by_default`.
 #[test]
 fn test_crown_relu_backward_patches_with_alpha_dense_active_plus_crossing() {
-    let bounds = PatchesLinearBounds {
-        row_count: 1,
-        lower_a: PatchesData {
-            coeff_err: None,
-            patches: Some(
-                ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![2.0_f32, 1.5]).unwrap(),
-            ),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
-            identity: false,
-            output_shape: (1, 1, 1),
-            input_shape: (1, 1, 2),
-            unstable_idx: None,
-        },
-        lower_b: array![0.0_f32],
-        upper_a: PatchesData {
-            coeff_err: None,
-            patches: Some(
-                ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![1.0_f32, -0.5]).unwrap(),
-            ),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
-            identity: false,
-            output_shape: (1, 1, 1),
-            input_shape: (1, 1, 2),
-            unstable_idx: None,
-        },
-        upper_b: array![0.0_f32],
-    };
-    let pre_activation = BoundedTensor::new(
-        array![1.0_f32, -2.0].into_dyn(),
-        array![3.0_f32, 2.0].into_dyn(),
-    )
-    .unwrap();
-    let alpha = array![0.5_f32, 0.75];
+    crate::bounds::patches::test_override::with_eager_err(false, || {
+        let bounds = PatchesLinearBounds {
+            row_count: 1,
+            lower_a: PatchesData {
+                coeff_err: None,
+                patches: Some(
+                    ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![2.0_f32, 1.5]).unwrap(),
+                ),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+                identity: false,
+                output_shape: (1, 1, 1),
+                input_shape: (1, 1, 2),
+                unstable_idx: None,
+            },
+            lower_b: array![0.0_f32],
+            upper_a: PatchesData {
+                coeff_err: None,
+                patches: Some(
+                    ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 2]), vec![1.0_f32, -0.5])
+                        .unwrap(),
+                ),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+                identity: false,
+                output_shape: (1, 1, 1),
+                input_shape: (1, 1, 2),
+                unstable_idx: None,
+            },
+            upper_b: array![0.0_f32],
+        };
+        let pre_activation = BoundedTensor::new(
+            array![1.0_f32, -2.0].into_dyn(),
+            array![3.0_f32, 2.0].into_dyn(),
+        )
+        .unwrap();
+        let alpha = array![0.5_f32, 0.75];
 
-    let (result, gradient) =
-        crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
-    let CrownBounds::Patches(result) = result else {
-        panic!("expected patches output");
-    };
+        let (result, gradient) =
+            crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
+        let CrownBounds::Patches(result) = result else {
+            panic!("expected patches output");
+        };
 
-    let lower_patches = result.lower_a.patches.as_ref().expect("lower patches");
-    let upper_patches = result.upper_a.patches.as_ref().expect("upper patches");
+        let lower_patches = result.lower_a.patches.as_ref().expect("lower patches");
+        let upper_patches = result.upper_a.patches.as_ref().expect("upper patches");
 
-    // Always-active neuron: identity composition (alpha[0] not used).
-    assert_eq!(lower_patches[[0, 0, 0, 0, 0, 0]], next_down_f32(2.0));
-    assert_eq!(upper_patches[[0, 0, 0, 0, 0, 0]], next_up_f32(1.0));
+        // Always-active neuron: identity composition (alpha[0] not used).
+        assert_eq!(lower_patches[[0, 0, 0, 0, 0, 0]], next_down_f32(2.0));
+        assert_eq!(upper_patches[[0, 0, 0, 0, 0, 0]], next_up_f32(1.0));
 
-    // Crossing neuron: alpha=0.75 used for lower slope.
-    assert_eq!(lower_patches[[0, 0, 0, 0, 0, 1]], next_down_f32(1.125));
-    // Upper uses lower relaxation (ua1=-0.5 negative → flip direction).
-    assert_eq!(upper_patches[[0, 0, 0, 0, 0, 1]], next_up_f32(-0.375));
+        // Crossing neuron: alpha=0.75 used for lower slope.
+        assert_eq!(lower_patches[[0, 0, 0, 0, 0, 1]], next_down_f32(1.125));
+        // Upper uses lower relaxation (ua1=-0.5 negative → flip direction).
+        assert_eq!(upper_patches[[0, 0, 0, 0, 0, 1]], next_up_f32(-0.375));
 
-    // Bias: zero intercepts from identity + zero lower_intercept.
-    assert_eq!(result.lower_b[0], next_down_f32(0.0));
-    assert_eq!(result.upper_b[0], next_up_f32(0.0));
+        // Bias: zero intercepts from identity + zero lower_intercept.
+        assert_eq!(result.lower_b[0], next_down_f32(0.0));
+        assert_eq!(result.upper_b[0], next_up_f32(0.0));
 
-    // Gradient: only crossing neurons with positive lower-A contribute.
-    assert_eq!(gradient[0], 0.0); // n0 always-active, no gradient
-    assert_eq!(gradient[1], -3.0); // la1=1.5 * pre_lower[1]=-2.0
+        // Gradient: only crossing neurons with positive lower-A contribute.
+        assert_eq!(gradient[0], 0.0); // n0 always-active, no gradient
+        assert_eq!(gradient[1], -3.0); // la1=1.5 * pre_lower[1]=-2.0
+    });
 }
 
 /// Sparse identity patches delegate to Dense propagate_linear_with_alpha.
@@ -367,8 +392,13 @@ fn reference_patches_alpha(
     let shape = lower_patches.shape();
     let (in_c, kh, kw) = (shape[3], shape[4], shape[5]);
 
-    let (sh, sw) = bounds.lower_a.stride;
-    let (pad_left, _pr, pad_top, _pb) = bounds.lower_a.padding;
+    let geometry = bounds
+        .lower_a
+        .geometry
+        .require_affine("alpha reference fixture")
+        .expect("reference fixture uses affine geometry");
+    let (sh, sw) = geometry.stride();
+    let (pad_left, _pr, pad_top, _pb) = geometry.padding();
 
     let mut new_lower_patches = ArrayD::<f32>::zeros(lower_patches.raw_dim());
     let mut new_upper_patches = ArrayD::<f32>::zeros(upper_patches.raw_dim());
@@ -475,278 +505,300 @@ fn assert_bits_eq(label: &str, a: &[f32], b: &[f32]) {
 /// Build a random dense (6-D) patches-mode ReLU input and assert the optimized
 /// production function is bit-identical to the indexed reference across a range
 /// of geometries, strides, paddings, and pre-activation regimes.
+/// #eager-err-test-override: pinned to the UNFOLDED kernel. This moat compares
+/// the optimized alpha kernel against the hand-written reference below, which
+/// models the KERNEL, not the eager-error fold policy layered on top of it at
+/// the patches ReLU backward call sites. Teaching the reference to fold would
+/// make this assert only that the implementation equals itself. The folded
+/// configuration is covered by `eager_fold_never_tightens_against_the_unfolded_path`.
 #[test]
 fn test_patches_alpha_optimized_matches_indexed_reference_bit_identical() {
-    let mut rng = Lcg::new(0xC0FF_EE12_3456_789A);
+    crate::bounds::patches::test_override::with_eager_err(false, || {
+        let mut rng = Lcg::new(0xC0FF_EE12_3456_789A);
 
-    // (out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)
-    let configs: &[(
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-    )] = &[
-        (1, 1, 1, 1, 1, 2, 1, 2, 1, 0, 0), // matches existing dense test geometry
-        (2, 3, 3, 2, 3, 3, 1, 1, 1, 0, 0), // 1x1, no stride/pad
-        (3, 4, 4, 2, 6, 6, 3, 3, 1, 1, 1), // 3x3 kernel, padding
-        (2, 2, 2, 3, 5, 5, 3, 3, 2, 1, 1), // stride 2 + padding
-        (1, 3, 5, 1, 3, 5, 1, 1, 1, 0, 0), // non-square spatial
-    ];
+        // (out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)
+        let configs: &[(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        )] = &[
+            (1, 1, 1, 1, 1, 2, 1, 2, 1, 0, 0), // matches existing dense test geometry
+            (2, 3, 3, 2, 3, 3, 1, 1, 1, 0, 0), // 1x1, no stride/pad
+            (3, 6, 6, 2, 6, 6, 3, 3, 1, 1, 1), // 3x3 kernel, padding
+            (2, 3, 3, 3, 5, 5, 3, 3, 2, 1, 1), // stride 2 + padding
+            (1, 3, 5, 1, 3, 5, 1, 1, 1, 0, 0), // non-square spatial
+        ];
 
-    for (cfg_idx, &(out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)) in
-        configs.iter().enumerate()
-    {
-        // Iterate over several pre-activation regimes to exercise every branch:
-        // 0=straddling, 1=all positive (identity), 2=all negative (zero), 3=mixed.
-        for regime in 0..4 {
-            let num_outputs = out_c * out_h * out_w;
-            let num_in = in_c * in_h * in_w;
+        for (cfg_idx, &(out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)) in
+            configs.iter().enumerate()
+        {
+            // Iterate over several pre-activation regimes to exercise every branch:
+            // 0=straddling, 1=all positive (identity), 2=all negative (zero), 3=mixed.
+            for regime in 0..4 {
+                let num_outputs = out_c * out_h * out_w;
+                let num_in = in_c * in_h * in_w;
 
-            let lower_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
-                .map(|_| rng.f32_in(-3.0, 3.0))
-                .collect();
-            let upper_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
-                .map(|_| rng.f32_in(-3.0, 3.0))
-                .collect();
+                let lower_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
+                    .map(|_| rng.f32_in(-3.0, 3.0))
+                    .collect();
+                let upper_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
+                    .map(|_| rng.f32_in(-3.0, 3.0))
+                    .collect();
 
-            let lower_patches =
-                ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), lower_vec)
-                    .unwrap();
-            let upper_patches =
-                ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), upper_vec)
-                    .unwrap();
+                let lower_patches =
+                    ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), lower_vec)
+                        .unwrap();
+                let upper_patches =
+                    ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), upper_vec)
+                        .unwrap();
 
-            let lower_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
-            let upper_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
+                let lower_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
+                let upper_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
 
-            let bounds = PatchesLinearBounds {
-                row_count: num_outputs,
-                lower_a: PatchesData {
-                    coeff_err: None,
-                    patches: Some(lower_patches),
-                    stride: (stride, stride),
-                    padding: (pad_l, pad_l, pad_t, pad_t),
-                    identity: false,
-                    output_shape: (out_c, out_h, out_w),
-                    input_shape: (in_c, in_h, in_w),
-                    unstable_idx: None,
-                },
-                lower_b: Array1::from_vec(lower_b),
-                upper_a: PatchesData {
-                    coeff_err: None,
-                    patches: Some(upper_patches),
-                    stride: (stride, stride),
-                    padding: (pad_l, pad_l, pad_t, pad_t),
-                    identity: false,
-                    output_shape: (out_c, out_h, out_w),
-                    input_shape: (in_c, in_h, in_w),
-                    unstable_idx: None,
-                },
-                upper_b: Array1::from_vec(upper_b),
-            };
+                let bounds = PatchesLinearBounds {
+                    row_count: num_outputs,
+                    lower_a: PatchesData {
+                        coeff_err: None,
+                        patches: Some(lower_patches),
+                        geometry: PatchGeometry::affine(
+                            (stride, stride),
+                            (pad_l, pad_l, pad_t, pad_t),
+                        ),
+                        identity: false,
+                        output_shape: (out_c, out_h, out_w),
+                        input_shape: (in_c, in_h, in_w),
+                        unstable_idx: None,
+                    },
+                    lower_b: Array1::from_vec(lower_b),
+                    upper_a: PatchesData {
+                        coeff_err: None,
+                        patches: Some(upper_patches),
+                        geometry: PatchGeometry::affine(
+                            (stride, stride),
+                            (pad_l, pad_l, pad_t, pad_t),
+                        ),
+                        identity: false,
+                        output_shape: (out_c, out_h, out_w),
+                        input_shape: (in_c, in_h, in_w),
+                        unstable_idx: None,
+                    },
+                    upper_b: Array1::from_vec(upper_b),
+                };
 
-            // Pre-activation bounds per regime.
-            let mut pl = vec![0.0f32; num_in];
-            let mut pu = vec![0.0f32; num_in];
-            for i in 0..num_in {
-                match regime {
-                    1 => {
-                        pl[i] = rng.f32_in(0.1, 2.0);
-                        pu[i] = pl[i] + rng.f32_in(0.1, 2.0);
-                    }
-                    2 => {
-                        pu[i] = rng.f32_in(-2.0, -0.1);
-                        pl[i] = pu[i] - rng.f32_in(0.1, 2.0);
-                    }
-                    3 => {
-                        // Mix: alternate straddling / stable per neuron.
-                        if i % 2 == 0 {
-                            pl[i] = rng.f32_in(-2.0, -0.1);
-                            pu[i] = rng.f32_in(0.1, 2.0);
-                        } else {
-                            pl[i] = rng.f32_in(0.1, 1.0);
-                            pu[i] = pl[i] + rng.f32_in(0.1, 1.0);
+                // Pre-activation bounds per regime.
+                let mut pl = vec![0.0f32; num_in];
+                let mut pu = vec![0.0f32; num_in];
+                for i in 0..num_in {
+                    match regime {
+                        1 => {
+                            pl[i] = rng.f32_in(0.1, 2.0);
+                            pu[i] = pl[i] + rng.f32_in(0.1, 2.0);
+                        }
+                        2 => {
+                            pu[i] = rng.f32_in(-2.0, -0.1);
+                            pl[i] = pu[i] - rng.f32_in(0.1, 2.0);
+                        }
+                        3 => {
+                            // Mix: alternate straddling / stable per neuron.
+                            if i % 2 == 0 {
+                                pl[i] = rng.f32_in(-2.0, -0.1);
+                                pu[i] = rng.f32_in(0.1, 2.0);
+                            } else {
+                                pl[i] = rng.f32_in(0.1, 1.0);
+                                pu[i] = pl[i] + rng.f32_in(0.1, 1.0);
+                            }
+                        }
+                        _ => {
+                            // Straddling: l < 0 < u for all.
+                            pl[i] = rng.f32_in(-3.0, -0.1);
+                            pu[i] = rng.f32_in(0.1, 3.0);
                         }
                     }
-                    _ => {
-                        // Straddling: l < 0 < u for all.
-                        pl[i] = rng.f32_in(-3.0, -0.1);
-                        pu[i] = rng.f32_in(0.1, 3.0);
-                    }
                 }
+
+                let pre_activation = BoundedTensor::new(
+                    Array1::from_vec(pl.clone()).into_dyn(),
+                    Array1::from_vec(pu.clone()).into_dyn(),
+                )
+                .unwrap();
+
+                // Vary alpha across [0, 1] (and a few exact 0.0 / 1.0 endpoints).
+                let alpha_vec: Vec<f32> = (0..num_in)
+                    .map(|i| match i % 3 {
+                        0 => 0.0,
+                        1 => 1.0,
+                        _ => rng.f32_in(0.0, 1.0),
+                    })
+                    .collect();
+                let alpha = Array1::from_vec(alpha_vec);
+
+                let (result, gradient) =
+                    crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha)
+                        .unwrap();
+                let CrownBounds::Patches(result) = result else {
+                    panic!("config {cfg_idx} regime {regime}: expected Patches output");
+                };
+
+                let (ref_lp, ref_lb, ref_up, ref_ub, ref_grad) =
+                    reference_patches_alpha(&bounds, &pl, &pu, alpha.as_slice().unwrap());
+
+                let opt_lp = result.lower_a.patches.as_ref().unwrap();
+                let opt_up = result.upper_a.patches.as_ref().unwrap();
+
+                let tag = format!("cfg {cfg_idx} regime {regime}");
+                assert_bits_eq(
+                    &format!("{tag} lower_patches"),
+                    opt_lp.as_slice().unwrap(),
+                    ref_lp.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} upper_patches"),
+                    opt_up.as_slice().unwrap(),
+                    ref_up.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} lower_b"),
+                    result.lower_b.as_slice().unwrap(),
+                    ref_lb.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} upper_b"),
+                    result.upper_b.as_slice().unwrap(),
+                    ref_ub.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} gradient"),
+                    gradient.as_slice().unwrap(),
+                    ref_grad.as_slice().unwrap(),
+                );
+
+                // Output geometry must be preserved.
+                assert_eq!(
+                    result.lower_a.geometry,
+                    PatchGeometry::affine((stride, stride), (pad_l, pad_l, pad_t, pad_t))
+                );
+                assert_eq!(result.lower_a.output_shape, (out_c, out_h, out_w));
+                assert_eq!(result.lower_a.input_shape, (in_c, in_h, in_w));
             }
-
-            let pre_activation = BoundedTensor::new(
-                Array1::from_vec(pl.clone()).into_dyn(),
-                Array1::from_vec(pu.clone()).into_dyn(),
-            )
-            .unwrap();
-
-            // Vary alpha across [0, 1] (and a few exact 0.0 / 1.0 endpoints).
-            let alpha_vec: Vec<f32> = (0..num_in)
-                .map(|i| match i % 3 {
-                    0 => 0.0,
-                    1 => 1.0,
-                    _ => rng.f32_in(0.0, 1.0),
-                })
-                .collect();
-            let alpha = Array1::from_vec(alpha_vec);
-
-            let (result, gradient) =
-                crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
-            let CrownBounds::Patches(result) = result else {
-                panic!("config {cfg_idx} regime {regime}: expected Patches output");
-            };
-
-            let (ref_lp, ref_lb, ref_up, ref_ub, ref_grad) =
-                reference_patches_alpha(&bounds, &pl, &pu, alpha.as_slice().unwrap());
-
-            let opt_lp = result.lower_a.patches.as_ref().unwrap();
-            let opt_up = result.upper_a.patches.as_ref().unwrap();
-
-            let tag = format!("cfg {cfg_idx} regime {regime}");
-            assert_bits_eq(
-                &format!("{tag} lower_patches"),
-                opt_lp.as_slice().unwrap(),
-                ref_lp.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} upper_patches"),
-                opt_up.as_slice().unwrap(),
-                ref_up.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} lower_b"),
-                result.lower_b.as_slice().unwrap(),
-                ref_lb.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} upper_b"),
-                result.upper_b.as_slice().unwrap(),
-                ref_ub.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} gradient"),
-                gradient.as_slice().unwrap(),
-                ref_grad.as_slice().unwrap(),
-            );
-
-            // Output geometry must be preserved.
-            assert_eq!(result.lower_a.stride, (stride, stride));
-            assert_eq!(result.lower_a.padding, (pad_l, pad_l, pad_t, pad_t));
-            assert_eq!(result.lower_a.output_shape, (out_c, out_h, out_w));
-            assert_eq!(result.lower_a.input_shape, (in_c, in_h, in_w));
         }
-    }
+    });
 }
 
 /// Identity-input equivalence: when `lower_a`/`upper_a` are virtual identity,
 /// the optimized path materializes them and must still match a reference built
 /// from the explicitly-materialized identity tensors.
+/// #eager-err-test-override: pinned to the UNFOLDED kernel. This moat compares
+/// the optimized alpha kernel against the hand-written reference below, which
+/// models the KERNEL, not the eager-error fold policy layered on top of it at
+/// the patches ReLU backward call sites. Teaching the reference to fold would
+/// make this assert only that the implementation equals itself. The folded
+/// configuration is covered by `eager_fold_never_tightens_against_the_unfolded_path`.
 #[test]
 fn test_patches_alpha_optimized_identity_input_matches_reference() {
-    // Square identity patches (out_c == in_c) so materialize_identity is exact.
-    let (c, h, w) = (3usize, 4usize, 4usize);
-    let num_outputs = c * h * w;
-    let num_in = c * h * w;
+    crate::bounds::patches::test_override::with_eager_err(false, || {
+        // Square identity patches (out_c == in_c) so materialize_identity is exact.
+        let (c, h, w) = (3usize, 4usize, 4usize);
+        let num_outputs = c * h * w;
+        let num_in = c * h * w;
 
-    let identity = PatchesData {
-        coeff_err: None,
-        patches: None,
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
-        identity: true,
-        output_shape: (c, h, w),
-        input_shape: (c, h, w),
-        unstable_idx: None,
-    };
-    let bounds = PatchesLinearBounds {
-        row_count: num_outputs,
-        lower_a: identity.clone(),
-        lower_b: Array1::zeros(num_outputs),
-        upper_a: identity,
-        upper_b: Array1::zeros(num_outputs),
-    };
+        let identity = PatchesData {
+            coeff_err: None,
+            patches: None,
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+            identity: true,
+            output_shape: (c, h, w),
+            input_shape: (c, h, w),
+            unstable_idx: None,
+        };
+        let bounds = PatchesLinearBounds {
+            row_count: num_outputs,
+            lower_a: identity.clone(),
+            lower_b: Array1::zeros(num_outputs),
+            upper_a: identity,
+            upper_b: Array1::zeros(num_outputs),
+        };
 
-    // Mix of regimes per neuron.
-    let mut rng = Lcg::new(0x1234_5678_9ABC_DEF0);
-    let mut pl = vec![0.0f32; num_in];
-    let mut pu = vec![0.0f32; num_in];
-    for i in 0..num_in {
-        match i % 3 {
-            0 => {
-                pl[i] = rng.f32_in(-2.0, -0.1);
-                pu[i] = rng.f32_in(0.1, 2.0);
-            }
-            1 => {
-                pl[i] = rng.f32_in(0.1, 1.0);
-                pu[i] = pl[i] + rng.f32_in(0.1, 1.0);
-            }
-            _ => {
-                pu[i] = rng.f32_in(-2.0, -0.1);
-                pl[i] = pu[i] - rng.f32_in(0.1, 1.0);
+        // Mix of regimes per neuron.
+        let mut rng = Lcg::new(0x1234_5678_9ABC_DEF0);
+        let mut pl = vec![0.0f32; num_in];
+        let mut pu = vec![0.0f32; num_in];
+        for i in 0..num_in {
+            match i % 3 {
+                0 => {
+                    pl[i] = rng.f32_in(-2.0, -0.1);
+                    pu[i] = rng.f32_in(0.1, 2.0);
+                }
+                1 => {
+                    pl[i] = rng.f32_in(0.1, 1.0);
+                    pu[i] = pl[i] + rng.f32_in(0.1, 1.0);
+                }
+                _ => {
+                    pu[i] = rng.f32_in(-2.0, -0.1);
+                    pl[i] = pu[i] - rng.f32_in(0.1, 1.0);
+                }
             }
         }
-    }
-    let pre_activation = BoundedTensor::new(
-        Array1::from_vec(pl.clone()).into_dyn(),
-        Array1::from_vec(pu.clone()).into_dyn(),
-    )
-    .unwrap();
-    let alpha = Array1::from_vec((0..num_in).map(|i| (i as f32 % 7.0) / 7.0).collect());
+        let pre_activation = BoundedTensor::new(
+            Array1::from_vec(pl.clone()).into_dyn(),
+            Array1::from_vec(pu.clone()).into_dyn(),
+        )
+        .unwrap();
+        let alpha = Array1::from_vec((0..num_in).map(|i| (i as f32 % 7.0) / 7.0).collect());
 
-    let (result, gradient) =
-        crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
-    let CrownBounds::Patches(result) = result else {
-        panic!("expected Patches output");
-    };
+        let (result, gradient) =
+            crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
+        let CrownBounds::Patches(result) = result else {
+            panic!("expected Patches output");
+        };
 
-    // Reference: materialize the identity tensors, then run the indexed reference
-    // over a bounds struct holding the materialized patches.
-    let lower_mat = bounds.lower_a.materialize_identity();
-    let upper_mat = bounds.upper_a.materialize_identity();
-    let ref_bounds = PatchesLinearBounds {
-        row_count: num_outputs,
-        lower_a: lower_mat,
-        lower_b: Array1::zeros(num_outputs),
-        upper_a: upper_mat,
-        upper_b: Array1::zeros(num_outputs),
-    };
-    let (ref_lp, ref_lb, ref_up, ref_ub, ref_grad) =
-        reference_patches_alpha(&ref_bounds, &pl, &pu, alpha.as_slice().unwrap());
+        // Reference: materialize the identity tensors, then run the indexed reference
+        // over a bounds struct holding the materialized patches.
+        let lower_mat = bounds.lower_a.materialize_identity();
+        let upper_mat = bounds.upper_a.materialize_identity();
+        let ref_bounds = PatchesLinearBounds {
+            row_count: num_outputs,
+            lower_a: lower_mat,
+            lower_b: Array1::zeros(num_outputs),
+            upper_a: upper_mat,
+            upper_b: Array1::zeros(num_outputs),
+        };
+        let (ref_lp, ref_lb, ref_up, ref_ub, ref_grad) =
+            reference_patches_alpha(&ref_bounds, &pl, &pu, alpha.as_slice().unwrap());
 
-    assert_bits_eq(
-        "identity lower_patches",
-        result.lower_a.patches.as_ref().unwrap().as_slice().unwrap(),
-        ref_lp.as_slice().unwrap(),
-    );
-    assert_bits_eq(
-        "identity upper_patches",
-        result.upper_a.patches.as_ref().unwrap().as_slice().unwrap(),
-        ref_up.as_slice().unwrap(),
-    );
-    assert_bits_eq(
-        "identity lower_b",
-        result.lower_b.as_slice().unwrap(),
-        ref_lb.as_slice().unwrap(),
-    );
-    assert_bits_eq(
-        "identity upper_b",
-        result.upper_b.as_slice().unwrap(),
-        ref_ub.as_slice().unwrap(),
-    );
-    assert_bits_eq(
-        "identity gradient",
-        gradient.as_slice().unwrap(),
-        ref_grad.as_slice().unwrap(),
-    );
+        assert_bits_eq(
+            "identity lower_patches",
+            result.lower_a.patches.as_ref().unwrap().as_slice().unwrap(),
+            ref_lp.as_slice().unwrap(),
+        );
+        assert_bits_eq(
+            "identity upper_patches",
+            result.upper_a.patches.as_ref().unwrap().as_slice().unwrap(),
+            ref_up.as_slice().unwrap(),
+        );
+        assert_bits_eq(
+            "identity lower_b",
+            result.lower_b.as_slice().unwrap(),
+            ref_lb.as_slice().unwrap(),
+        );
+        assert_bits_eq(
+            "identity upper_b",
+            result.upper_b.as_slice().unwrap(),
+            ref_ub.as_slice().unwrap(),
+        );
+        assert_bits_eq(
+            "identity gradient",
+            gradient.as_slice().unwrap(),
+            ref_grad.as_slice().unwrap(),
+        );
+    });
 }
 
 // =====================================================================
@@ -806,8 +858,13 @@ fn reference_patches_alpha_with_err(
     let shape = lower_patches.shape();
     let (in_c, kh, kw) = (shape[3], shape[4], shape[5]);
 
-    let (sh, sw) = bounds.lower_a.stride;
-    let (pad_left, _pr, pad_top, _pb) = bounds.lower_a.padding;
+    let geometry = bounds
+        .lower_a
+        .geometry
+        .require_affine("alpha reference fixture")
+        .expect("reference fixture uses affine geometry");
+    let (sh, sw) = geometry.stride();
+    let (pad_left, _pr, pad_top, _pb) = geometry.padding();
 
     let mut new_lower_patches = ArrayD::<f32>::zeros(lower_patches.raw_dim());
     let mut new_upper_patches = ArrayD::<f32>::zeros(upper_patches.raw_dim());
@@ -1018,202 +1075,216 @@ fn reference_patches_alpha_with_err(
 /// Spec §7.4 T2 pin: 6D geometries WITH nonzero incoming errs — production
 /// output must be bit-identical to the in-test transcription of the CURRENT
 /// 6D coeff_err rule (errs, biases, patch tensors, gradient).
+/// #patches-eager-err: pins the UNFOLDED kernel. Every expectation below is
+/// derived from the patches/relaxation arithmetic itself; the eager error fold
+/// is a POLICY applied at the ReLU backward call sites that widens the bias
+/// outward on top of that arithmetic. Asserting the derivation with the fold off
+/// keeps this test measuring what it was written to measure instead of
+/// re-pinning it to constants the derivation no longer explains. The default
+/// (folded) configuration is covered by
+/// `eager_fold_never_tightens_against_the_unfolded_path` and
+/// `eager_fold_discharges_coeff_err_into_the_bias_by_default`.
 #[test]
 fn test_patches_alpha_6d_coeff_err_regression_bit_identical() {
-    let mut rng = Lcg::new(0xA11C_E5D4_71B2_9F03);
+    crate::bounds::patches::test_override::with_eager_err(false, || {
+        let mut rng = Lcg::new(0xA11C_E5D4_71B2_9F03);
 
-    // Same geometry family as the optimized-vs-reference test above.
-    // (out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)
-    let configs: &[(
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-    )] = &[
-        (1, 1, 1, 1, 1, 2, 1, 2, 1, 0, 0),
-        (2, 3, 3, 2, 3, 3, 1, 1, 1, 0, 0),
-        (3, 4, 4, 2, 6, 6, 3, 3, 1, 1, 1),
-        (2, 2, 2, 3, 5, 5, 3, 3, 2, 1, 1),
-        (1, 3, 5, 1, 3, 5, 1, 1, 1, 0, 0),
-    ];
+        // Same geometry family as the optimized-vs-reference test above.
+        // (out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)
+        let configs: &[(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        )] = &[
+            (1, 1, 1, 1, 1, 2, 1, 2, 1, 0, 0),
+            (2, 3, 3, 2, 3, 3, 1, 1, 1, 0, 0),
+            (3, 6, 6, 2, 6, 6, 3, 3, 1, 1, 1),
+            (2, 3, 3, 3, 5, 5, 3, 3, 2, 1, 1),
+            (1, 3, 5, 1, 3, 5, 1, 1, 1, 0, 0),
+        ];
 
-    for (cfg_idx, &(out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)) in
-        configs.iter().enumerate()
-    {
-        for regime in 0..4 {
-            let num_outputs = out_c * out_h * out_w;
-            let num_in = in_c * in_h * in_w;
+        for (cfg_idx, &(out_c, out_h, out_w, in_c, in_h, in_w, kh, kw, stride, pad_l, pad_t)) in
+            configs.iter().enumerate()
+        {
+            for regime in 0..4 {
+                let num_outputs = out_c * out_h * out_w;
+                let num_in = in_c * in_h * in_w;
 
-            let lower_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
-                .map(|_| rng.f32_in(-3.0, 3.0))
-                .collect();
-            let upper_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
-                .map(|_| rng.f32_in(-3.0, 3.0))
-                .collect();
+                let lower_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
+                    .map(|_| rng.f32_in(-3.0, 3.0))
+                    .collect();
+                let upper_vec: Vec<f32> = (0..num_outputs * in_c * kh * kw)
+                    .map(|_| rng.f32_in(-3.0, 3.0))
+                    .collect();
 
-            let lower_patches =
-                ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), lower_vec)
-                    .unwrap();
-            let upper_patches =
-                ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), upper_vec)
-                    .unwrap();
+                let lower_patches =
+                    ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), lower_vec)
+                        .unwrap();
+                let upper_patches =
+                    ArrayD::from_shape_vec(IxDyn(&[out_c, out_h, out_w, in_c, kh, kw]), upper_vec)
+                        .unwrap();
 
-            let lower_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
-            let upper_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
+                let lower_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
+                let upper_b: Vec<f32> = (0..num_outputs).map(|_| rng.f32_in(-1.0, 1.0)).collect();
 
-            // Nonzero incoming coeff_err on both sides, with exact-zero rows
-            // sprinkled in so the `oe == 0` short-circuit is also pinned.
-            let lower_err: Vec<f32> = (0..num_outputs)
-                .map(|j| {
-                    if j % 5 == 4 {
-                        0.0
-                    } else {
-                        rng.f32_in(1e-6, 1e-3)
-                    }
-                })
-                .collect();
-            let upper_err: Vec<f32> = (0..num_outputs)
-                .map(|j| {
-                    if j % 7 == 3 {
-                        0.0
-                    } else {
-                        rng.f32_in(1e-6, 2e-3)
-                    }
-                })
-                .collect();
-
-            let bounds = PatchesLinearBounds {
-                row_count: num_outputs,
-                lower_a: PatchesData {
-                    coeff_err: Some(Array1::from_vec(lower_err)),
-                    patches: Some(lower_patches),
-                    stride: (stride, stride),
-                    padding: (pad_l, pad_l, pad_t, pad_t),
-                    identity: false,
-                    output_shape: (out_c, out_h, out_w),
-                    input_shape: (in_c, in_h, in_w),
-                    unstable_idx: None,
-                },
-                lower_b: Array1::from_vec(lower_b),
-                upper_a: PatchesData {
-                    coeff_err: Some(Array1::from_vec(upper_err)),
-                    patches: Some(upper_patches),
-                    stride: (stride, stride),
-                    padding: (pad_l, pad_l, pad_t, pad_t),
-                    identity: false,
-                    output_shape: (out_c, out_h, out_w),
-                    input_shape: (in_c, in_h, in_w),
-                    unstable_idx: None,
-                },
-                upper_b: Array1::from_vec(upper_b),
-            };
-
-            let mut pl = vec![0.0f32; num_in];
-            let mut pu = vec![0.0f32; num_in];
-            for i in 0..num_in {
-                match regime {
-                    1 => {
-                        pl[i] = rng.f32_in(0.1, 2.0);
-                        pu[i] = pl[i] + rng.f32_in(0.1, 2.0);
-                    }
-                    2 => {
-                        pu[i] = rng.f32_in(-2.0, -0.1);
-                        pl[i] = pu[i] - rng.f32_in(0.1, 2.0);
-                    }
-                    3 => {
-                        if i % 2 == 0 {
-                            pl[i] = rng.f32_in(-2.0, -0.1);
-                            pu[i] = rng.f32_in(0.1, 2.0);
+                // Nonzero incoming coeff_err on both sides, with exact-zero rows
+                // sprinkled in so the `oe == 0` short-circuit is also pinned.
+                let lower_err: Vec<f32> = (0..num_outputs)
+                    .map(|j| {
+                        if j % 5 == 4 {
+                            0.0
                         } else {
-                            pl[i] = rng.f32_in(0.1, 1.0);
-                            pu[i] = pl[i] + rng.f32_in(0.1, 1.0);
+                            rng.f32_in(1e-6, 1e-3)
+                        }
+                    })
+                    .collect();
+                let upper_err: Vec<f32> = (0..num_outputs)
+                    .map(|j| {
+                        if j % 7 == 3 {
+                            0.0
+                        } else {
+                            rng.f32_in(1e-6, 2e-3)
+                        }
+                    })
+                    .collect();
+
+                let bounds = PatchesLinearBounds {
+                    row_count: num_outputs,
+                    lower_a: PatchesData {
+                        coeff_err: Some(Array1::from_vec(lower_err)),
+                        patches: Some(lower_patches),
+                        geometry: PatchGeometry::affine(
+                            (stride, stride),
+                            (pad_l, pad_l, pad_t, pad_t),
+                        ),
+                        identity: false,
+                        output_shape: (out_c, out_h, out_w),
+                        input_shape: (in_c, in_h, in_w),
+                        unstable_idx: None,
+                    },
+                    lower_b: Array1::from_vec(lower_b),
+                    upper_a: PatchesData {
+                        coeff_err: Some(Array1::from_vec(upper_err)),
+                        patches: Some(upper_patches),
+                        geometry: PatchGeometry::affine(
+                            (stride, stride),
+                            (pad_l, pad_l, pad_t, pad_t),
+                        ),
+                        identity: false,
+                        output_shape: (out_c, out_h, out_w),
+                        input_shape: (in_c, in_h, in_w),
+                        unstable_idx: None,
+                    },
+                    upper_b: Array1::from_vec(upper_b),
+                };
+
+                let mut pl = vec![0.0f32; num_in];
+                let mut pu = vec![0.0f32; num_in];
+                for i in 0..num_in {
+                    match regime {
+                        1 => {
+                            pl[i] = rng.f32_in(0.1, 2.0);
+                            pu[i] = pl[i] + rng.f32_in(0.1, 2.0);
+                        }
+                        2 => {
+                            pu[i] = rng.f32_in(-2.0, -0.1);
+                            pl[i] = pu[i] - rng.f32_in(0.1, 2.0);
+                        }
+                        3 => {
+                            if i % 2 == 0 {
+                                pl[i] = rng.f32_in(-2.0, -0.1);
+                                pu[i] = rng.f32_in(0.1, 2.0);
+                            } else {
+                                pl[i] = rng.f32_in(0.1, 1.0);
+                                pu[i] = pl[i] + rng.f32_in(0.1, 1.0);
+                            }
+                        }
+                        _ => {
+                            pl[i] = rng.f32_in(-3.0, -0.1);
+                            pu[i] = rng.f32_in(0.1, 3.0);
                         }
                     }
-                    _ => {
-                        pl[i] = rng.f32_in(-3.0, -0.1);
-                        pu[i] = rng.f32_in(0.1, 3.0);
-                    }
                 }
-            }
 
-            let pre_activation = BoundedTensor::new(
-                Array1::from_vec(pl.clone()).into_dyn(),
-                Array1::from_vec(pu.clone()).into_dyn(),
-            )
-            .unwrap();
+                let pre_activation = BoundedTensor::new(
+                    Array1::from_vec(pl.clone()).into_dyn(),
+                    Array1::from_vec(pu.clone()).into_dyn(),
+                )
+                .unwrap();
 
-            let alpha_vec: Vec<f32> = (0..num_in)
-                .map(|i| match i % 3 {
-                    0 => 0.0,
-                    1 => 1.0,
-                    _ => rng.f32_in(0.0, 1.0),
-                })
-                .collect();
-            let alpha = Array1::from_vec(alpha_vec);
+                let alpha_vec: Vec<f32> = (0..num_in)
+                    .map(|i| match i % 3 {
+                        0 => 0.0,
+                        1 => 1.0,
+                        _ => rng.f32_in(0.0, 1.0),
+                    })
+                    .collect();
+                let alpha = Array1::from_vec(alpha_vec);
 
-            let (result, gradient) =
-                crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha).unwrap();
-            let CrownBounds::Patches(result) = result else {
-                panic!("cfg {cfg_idx} regime {regime}: expected Patches output");
-            };
+                let (result, gradient) =
+                    crown_relu_backward_patches_with_alpha(&bounds, &pre_activation, &alpha)
+                        .unwrap();
+                let CrownBounds::Patches(result) = result else {
+                    panic!("cfg {cfg_idx} regime {regime}: expected Patches output");
+                };
 
-            let (ref_lp, ref_lb, ref_up, ref_ub, ref_grad, ref_le, ref_ue) =
-                reference_patches_alpha_with_err(&bounds, &pl, &pu, alpha.as_slice().unwrap());
+                let (ref_lp, ref_lb, ref_up, ref_ub, ref_grad, ref_le, ref_ue) =
+                    reference_patches_alpha_with_err(&bounds, &pl, &pu, alpha.as_slice().unwrap());
 
-            let opt_le =
-                result.lower_a.coeff_err.as_ref().unwrap_or_else(|| {
+                let opt_le = result.lower_a.coeff_err.as_ref().unwrap_or_else(|| {
                     panic!("cfg {cfg_idx} regime {regime}: lower coeff_err None")
                 });
-            let opt_ue =
-                result.upper_a.coeff_err.as_ref().unwrap_or_else(|| {
+                let opt_ue = result.upper_a.coeff_err.as_ref().unwrap_or_else(|| {
                     panic!("cfg {cfg_idx} regime {regime}: upper coeff_err None")
                 });
 
-            let tag = format!("err cfg {cfg_idx} regime {regime}");
-            assert_bits_eq(
-                &format!("{tag} lower coeff_err"),
-                opt_le.as_slice().unwrap(),
-                ref_le.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} upper coeff_err"),
-                opt_ue.as_slice().unwrap(),
-                ref_ue.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} lower_b"),
-                result.lower_b.as_slice().unwrap(),
-                ref_lb.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} upper_b"),
-                result.upper_b.as_slice().unwrap(),
-                ref_ub.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} lower_patches"),
-                result.lower_a.patches.as_ref().unwrap().as_slice().unwrap(),
-                ref_lp.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} upper_patches"),
-                result.upper_a.patches.as_ref().unwrap().as_slice().unwrap(),
-                ref_up.as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                &format!("{tag} gradient"),
-                gradient.as_slice().unwrap(),
-                ref_grad.as_slice().unwrap(),
-            );
+                let tag = format!("err cfg {cfg_idx} regime {regime}");
+                assert_bits_eq(
+                    &format!("{tag} lower coeff_err"),
+                    opt_le.as_slice().unwrap(),
+                    ref_le.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} upper coeff_err"),
+                    opt_ue.as_slice().unwrap(),
+                    ref_ue.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} lower_b"),
+                    result.lower_b.as_slice().unwrap(),
+                    ref_lb.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} upper_b"),
+                    result.upper_b.as_slice().unwrap(),
+                    ref_ub.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} lower_patches"),
+                    result.lower_a.patches.as_ref().unwrap().as_slice().unwrap(),
+                    ref_lp.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} upper_patches"),
+                    result.upper_a.patches.as_ref().unwrap().as_slice().unwrap(),
+                    ref_up.as_slice().unwrap(),
+                );
+                assert_bits_eq(
+                    &format!("{tag} gradient"),
+                    gradient.as_slice().unwrap(),
+                    ref_grad.as_slice().unwrap(),
+                );
+            }
         }
-    }
+    });
 }
 
 // =====================================================================
@@ -1248,8 +1319,7 @@ fn make_alpha_7d_bounds(
         lower_a: PatchesData {
             coeff_err: lower_err,
             patches: Some(ArrayD::from_shape_vec(IxDyn(shape7), lower_vec).unwrap()),
-            stride: (1, 1),
-            padding,
+            geometry: PatchGeometry::affine((1, 1), padding),
             identity: false,
             output_shape,
             input_shape,
@@ -1259,8 +1329,7 @@ fn make_alpha_7d_bounds(
         upper_a: PatchesData {
             coeff_err: upper_err,
             patches: Some(ArrayD::from_shape_vec(IxDyn(shape7), upper_vec).unwrap()),
-            stride: (1, 1),
-            padding,
+            geometry: PatchGeometry::affine((1, 1), padding),
             identity: false,
             output_shape,
             input_shape,
@@ -1315,14 +1384,17 @@ fn check_alpha_7d_side(
     };
     let old_patches = side_in.patches.as_ref().unwrap();
     let new_patches = side_out.patches.as_ref().unwrap();
-    let err_out = side_out
-        .coeff_err
-        .as_ref()
-        .unwrap_or_else(|| panic!("{tag}: 7D output must carry coeff_err Some"));
-    assert_eq!(err_out.len(), input.row_count, "{tag}: err length");
+    let err_out = side_out.coeff_err.as_ref();
+    if let Some(err_out) = err_out {
+        assert_eq!(err_out.len(), input.row_count, "{tag}: err length");
+    }
 
-    let (sh, sw) = side_in.stride;
-    let (pad_left, _pr, pad_top, _pb) = side_in.padding;
+    let geometry = side_in
+        .geometry
+        .require_affine("7D alpha oracle fixture")
+        .expect("oracle fixture uses affine geometry");
+    let (sh, sw) = geometry.stride();
+    let (pad_left, _pr, pad_top, _pb) = geometry.padding();
     let (out_c, out_h, out_w) = side_in.output_shape;
     let (in_c_shape, in_h, in_w) = side_in.input_shape;
     let shp = old_patches.shape();
@@ -1337,13 +1409,18 @@ fn check_alpha_7d_side(
             .coeff_err
             .as_ref()
             .map_or(0.0f64, |a| f64::from(a[row]));
-        let err_r = f64::from(err_out[row]);
-        assert!(
-            err_r.is_finite() && err_r >= 0.0,
-            "{tag} row {row}: err must be finite and >= 0, got {err_r}"
-        );
+        let err_r = err_out.map(|err| f64::from(err[row]));
+        if let Some(err_r) = err_r {
+            assert!(
+                err_r.is_finite() && err_r >= 0.0,
+                "{tag} row {row}: err must be finite and >= 0, got {err_r}"
+            );
+        }
         // Worst-case true intercept fold (min for lower / max for upper).
         let mut fold_extreme = f64::from(old_b[row]);
+        let sample_fractions = [0.0f64, 1.0, 0.5, 0.25, 0.75];
+        let mut stored_eval = [f64::from(new_b[row]); 5];
+        let mut true_extreme = [f64::from(old_b[row]); 5];
         for oc in 0..out_c {
             for oh in 0..out_h {
                 for ow in 0..out_w {
@@ -1399,18 +1476,61 @@ fn check_alpha_7d_side(
                                     };
                                     let ctrue = c * f64::from(slope);
                                     let dev = (stored - ctrue).abs();
-                                    assert!(
-                                        err_r >= dev,
-                                        "{tag} row {row} tap \
-                                         ({oc},{oh},{ow},{ic},{ki},{kj}) cand {c}: \
-                                         err {err_r:e} < |stored {stored:e} - true \
-                                         {ctrue:e}| = {dev:e}"
-                                    );
+                                    if let Some(err_r) = err_r {
+                                        assert!(
+                                            err_r >= dev,
+                                            "{tag} row {row} tap \
+                                             ({oc},{oh},{ow},{ic},{ki},{kj}) cand {c}: \
+                                             err {err_r:e} < |stored {stored:e} - true \
+                                             {ctrue:e}| = {dev:e}"
+                                        );
+                                    }
                                     let contrib = c * f64::from(intercept);
                                     contrib_min = contrib_min.min(contrib);
                                     contrib_max = contrib_max.max(contrib);
                                 }
                                 fold_extreme += if is_lower { contrib_min } else { contrib_max };
+
+                                if err_r.is_none() {
+                                    for (sample, &fraction) in sample_fractions.iter().enumerate() {
+                                        let y = f64::from(pre_lower[input_flat])
+                                            + fraction
+                                                * f64::from(
+                                                    pre_upper[input_flat] - pre_lower[input_flat],
+                                                );
+                                        stored_eval[sample] += stored * y;
+                                        let mut tap_extreme = if is_lower {
+                                            f64::INFINITY
+                                        } else {
+                                            f64::NEG_INFINITY
+                                        };
+                                        for &c in &cands {
+                                            let (slope, intercept) = if c > 0.0 {
+                                                if is_lower {
+                                                    (r.lower_slope, r.lower_intercept)
+                                                } else {
+                                                    (r.upper_slope, r.upper_intercept)
+                                                }
+                                            } else if c < 0.0 {
+                                                if is_lower {
+                                                    (r.upper_slope, r.upper_intercept)
+                                                } else {
+                                                    (r.lower_slope, r.lower_intercept)
+                                                }
+                                            } else {
+                                                (0.0f32, 0.0f32)
+                                            };
+                                            let contribution =
+                                                c * (f64::from(slope) * y + f64::from(intercept));
+                                            tap_extreme = if is_lower {
+                                                tap_extreme.min(contribution)
+                                            } else {
+                                                tap_extreme.max(contribution)
+                                            };
+                                        }
+                                        true_extreme[sample] += tap_extreme;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1431,6 +1551,27 @@ fn check_alpha_7d_side(
                 new_b[row],
                 fold_extreme
             );
+        }
+        if err_r.is_none() {
+            for sample in 0..sample_fractions.len() {
+                if is_lower {
+                    assert!(
+                        stored_eval[sample] <= true_extreme[sample],
+                        "{tag} row {row} sample {sample}: eager lower expression {} \
+                         exceeds oracle {}",
+                        stored_eval[sample],
+                        true_extreme[sample]
+                    );
+                } else {
+                    assert!(
+                        stored_eval[sample] >= true_extreme[sample],
+                        "{tag} row {row} sample {sample}: eager upper expression {} \
+                         undershoots oracle {}",
+                        stored_eval[sample],
+                        true_extreme[sample]
+                    );
+                }
+            }
         }
     }
 }
@@ -1506,11 +1647,12 @@ fn test_patches_alpha_7d_coeff_err_covers_true_deviation() {
     .unwrap();
     let alpha = Array1::from_vec(alpha_vec);
 
-    // Padding (1,1,1,1) with 2x2 input: corner taps go out of bounds.
+    // Asymmetric padding keeps the declared 2x2 output geometry valid while
+    // still placing top/left corner taps out of bounds.
     let bounds = make_alpha_7d_bounds(
         &shape7,
         (in_c, in_h, in_w),
-        (1, 1, 1, 1),
+        (1, 0, 1, 0),
         lower_vec.clone(),
         upper_vec.clone(),
         lower_b.clone(),
@@ -1541,12 +1683,36 @@ fn test_patches_alpha_7d_coeff_err_covers_true_deviation() {
         &pu,
         alpha.as_slice().unwrap(),
     );
+    let mut eager_result = result.clone();
+    eager_result.fold_coeff_err_over_box_eager_with_policy(&pre, true);
+    assert!(
+        eager_result.lower_a.coeff_err.is_none() && eager_result.upper_a.coeff_err.is_none(),
+        "valid 7D alpha-ReLU carrier must discharge under the explicit gate"
+    );
+    check_alpha_7d_side(
+        "T1 eager lower",
+        true,
+        &bounds,
+        &eager_result,
+        &pl,
+        &pu,
+        alpha.as_slice().unwrap(),
+    );
+    check_alpha_7d_side(
+        "T1 eager upper",
+        false,
+        &bounds,
+        &eager_result,
+        &pl,
+        &pu,
+        alpha.as_slice().unwrap(),
+    );
 
     // --- Sub-case: None-in ---
     let bounds_none = make_alpha_7d_bounds(
         &shape7,
         (in_c, in_h, in_w),
-        (1, 1, 1, 1),
+        (1, 0, 1, 0),
         lower_vec,
         upper_vec,
         lower_b,
@@ -1700,8 +1866,7 @@ fn test_patches_alpha_mixed_ndim_pair_rejected() {
             lower_a: PatchesData {
                 coeff_err: None,
                 patches: Some(ArrayD::from_shape_vec(IxDyn(ls), lv.clone()).unwrap()),
-                stride: (1, 1),
-                padding: (0, 0, 0, 0),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: false,
                 output_shape: (1, 1, 2),
                 input_shape: (1, 1, 3),
@@ -1711,8 +1876,7 @@ fn test_patches_alpha_mixed_ndim_pair_rejected() {
             upper_a: PatchesData {
                 coeff_err: None,
                 patches: Some(ArrayD::from_shape_vec(IxDyn(us), uv.clone()).unwrap()),
-                stride: (1, 1),
-                padding: (0, 0, 0, 0),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: false,
                 output_shape: (1, 1, 2),
                 input_shape: (1, 1, 3),
@@ -1924,6 +2088,534 @@ fn test_patches_alpha_7d_nonfinite_incoming_err_poisons_row() {
 }
 
 // =====================================================================
+// Default-dark owned 7D alpha-ReLU M1.
+// =====================================================================
+
+fn run_owned_alpha_relu_in_place(
+    bounds: &PatchesLinearBounds,
+    pre: &BoundedTensor,
+    alpha: &Array1<f32>,
+) -> CrownBounds {
+    run_owned_alpha_relu_in_place_with_eager_policy(bounds, pre, alpha, false)
+}
+
+fn run_owned_alpha_relu_in_place_with_eager_policy(
+    bounds: &PatchesLinearBounds,
+    pre: &BoundedTensor,
+    alpha: &Array1<f32>,
+    allow_eager_7d: bool,
+) -> CrownBounds {
+    let plan = prepare_crown_relu_backward_patches_with_alpha_in_place(
+        bounds,
+        pre,
+        alpha,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    crown_relu_backward_patches_with_alpha_in_place_with_poll_for_test(
+        Box::new(bounds.clone()),
+        plan,
+        pre,
+        allow_eager_7d,
+        || Ok(()),
+    )
+    .unwrap()
+}
+
+fn assert_owned_alpha_bounds_bitwise(label: &str, actual: &CrownBounds, expected: &CrownBounds) {
+    let (CrownBounds::Patches(actual), CrownBounds::Patches(expected)) = (actual, expected) else {
+        panic!("{label}: expected Patches on both sides");
+    };
+    assert_eq!(actual.row_count, expected.row_count, "{label}: row count");
+    assert_eq!(
+        actual.lower_a.geometry, expected.lower_a.geometry,
+        "{label}: lower geometry"
+    );
+    assert_eq!(
+        actual.upper_a.geometry, expected.upper_a.geometry,
+        "{label}: upper geometry"
+    );
+    assert_eq!(
+        actual.lower_a.output_shape, expected.lower_a.output_shape,
+        "{label}: lower output shape"
+    );
+    assert_eq!(
+        actual.upper_a.output_shape, expected.upper_a.output_shape,
+        "{label}: upper output shape"
+    );
+    assert_eq!(
+        actual.lower_a.input_shape, expected.lower_a.input_shape,
+        "{label}: lower input shape"
+    );
+    assert_eq!(
+        actual.upper_a.input_shape, expected.upper_a.input_shape,
+        "{label}: upper input shape"
+    );
+    assert!(!actual.lower_a.identity && !actual.upper_a.identity);
+    assert!(actual.lower_a.unstable_idx.is_none() && actual.upper_a.unstable_idx.is_none());
+
+    let actual_lower = actual.lower_a.patches.as_ref().unwrap();
+    let expected_lower = expected.lower_a.patches.as_ref().unwrap();
+    let actual_upper = actual.upper_a.patches.as_ref().unwrap();
+    let expected_upper = expected.upper_a.patches.as_ref().unwrap();
+    assert_eq!(
+        actual_lower.shape(),
+        expected_lower.shape(),
+        "{label}: lower raw shape"
+    );
+    assert_eq!(
+        actual_upper.shape(),
+        expected_upper.shape(),
+        "{label}: upper raw shape"
+    );
+    assert_bits_eq(
+        &format!("{label}: lower patches"),
+        actual_lower.as_slice().unwrap(),
+        expected_lower.as_slice().unwrap(),
+    );
+    assert_bits_eq(
+        &format!("{label}: upper patches"),
+        actual_upper.as_slice().unwrap(),
+        expected_upper.as_slice().unwrap(),
+    );
+    assert_bits_eq(
+        &format!("{label}: lower bias"),
+        actual.lower_b.as_slice().unwrap(),
+        expected.lower_b.as_slice().unwrap(),
+    );
+    assert_bits_eq(
+        &format!("{label}: upper bias"),
+        actual.upper_b.as_slice().unwrap(),
+        expected.upper_b.as_slice().unwrap(),
+    );
+    assert_bits_eq(
+        &format!("{label}: lower coeff_err"),
+        actual
+            .lower_a
+            .coeff_err
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap(),
+        expected
+            .lower_a
+            .coeff_err
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap(),
+    );
+    assert_bits_eq(
+        &format!("{label}: upper coeff_err"),
+        actual
+            .upper_a
+            .coeff_err
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap(),
+        expected
+            .upper_a
+            .coeff_err
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap(),
+    );
+}
+
+fn owned_alpha_mixed_fixture(
+    lower_err: Option<Array1<f32>>,
+    upper_err: Option<Array1<f32>>,
+) -> (PatchesLinearBounds, BoundedTensor, Array1<f32>) {
+    let shape = [2usize, 1, 2, 2, 1, 2, 2];
+    let coefficient_count: usize = shape.iter().product();
+    let lower: Vec<f32> = (0..coefficient_count)
+        .map(|index| match index % 7 {
+            0 => -0.0,
+            1 => 0.75,
+            2 => -1.25,
+            3 => 0.0,
+            4 => 1.0 / 3.0,
+            5 => -0.625,
+            _ => 1.5,
+        })
+        .collect();
+    let upper: Vec<f32> = (0..coefficient_count)
+        .map(|index| match index % 6 {
+            0 => 0.5,
+            1 => -0.25,
+            2 => 0.0,
+            3 => -1.5,
+            4 => 0.875,
+            _ => -0.0,
+        })
+        .collect();
+    let bounds = make_alpha_7d_bounds(
+        &shape,
+        (1, 2, 2),
+        (1, 0, 1, 0),
+        lower,
+        upper,
+        vec![0.375, -0.625],
+        vec![0.5, -0.125],
+        lower_err,
+        upper_err,
+    );
+    let pre = BoundedTensor::new(
+        Array1::from_vec(vec![-1.0, 0.25, -1.5, -0.75]).into_dyn(),
+        Array1::from_vec(vec![2.0, 1.25, -0.2, 0.5]).into_dyn(),
+    )
+    .unwrap();
+    let alpha = Array1::from_vec(vec![0.25, 1.0, 0.0, 0.7]);
+    (bounds, pre, alpha)
+}
+
+#[test]
+fn historical_alpha_patches_rejects_mismatched_side_geometry() {
+    let (mut bounds, pre, alpha) = owned_alpha_mixed_fixture(None, None);
+    // Keep each side independently valid for the 2x2 output and 2x2 kernel;
+    // only their exact input-coordinate mappings differ.
+    bounds.upper_a.geometry = PatchGeometry::affine((1, 1), (0, 1, 0, 1));
+    let error = crown_relu_backward_patches_with_alpha(&bounds, &pre, &alpha)
+        .expect_err("alpha composition must authenticate one shared geometry");
+    assert!(matches!(error, NyError::InvalidSpec(_)), "{error:?}");
+
+    let (mut bounds, pre, alpha) = owned_alpha_mixed_fixture(None, None);
+    bounds.upper_a.patches = Some(
+        bounds
+            .upper_a
+            .patches
+            .take()
+            .unwrap()
+            .into_shape_with_order(IxDyn(&[2, 1, 2, 2, 1, 1, 4]))
+            .unwrap(),
+    );
+    let error = crown_relu_backward_patches_with_alpha(&bounds, &pre, &alpha)
+        .expect_err("alpha composition must authenticate equal coefficient tensor shapes");
+    assert!(matches!(error, NyError::ShapeMismatch { .. }), "{error:?}");
+}
+
+#[test]
+fn historical_alpha_patches_typed_refuses_anchored_geometry() {
+    let (mut bounds, pre, alpha) = owned_alpha_mixed_fixture(None, None);
+    let anchored = PatchGeometry::anchored(vec![0, 1], vec![0, 1]).unwrap();
+    bounds.lower_a.geometry = anchored.clone();
+    bounds.upper_a.geometry = anchored;
+
+    let error = crown_relu_backward_patches_with_alpha(&bounds, &pre, &alpha)
+        .expect_err("alpha-ReLU composition is not yet implemented for anchored geometry");
+    assert!(
+        matches!(error, NyError::UnsupportedConfiguration(_)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn historical_alpha_patches_rejects_short_6d_error_and_sanitizes_nan() {
+    let make_explicit_identity = || {
+        let mut bounds = PatchesLinearBounds::identity((1, 1, 1), (1, 1, 1));
+        bounds.lower_a = bounds.lower_a.materialize_identity();
+        bounds.upper_a = bounds.upper_a.materialize_identity();
+        bounds
+    };
+    let pre = BoundedTensor::new(array![-1.0_f32].into_dyn(), array![1.0].into_dyn()).unwrap();
+    let alpha = array![0.5_f32];
+
+    let mut short = make_explicit_identity();
+    short.upper_a.coeff_err = Some(Array1::from_vec(vec![]));
+    let error = crown_relu_backward_patches_with_alpha(&short, &pre, &alpha)
+        .expect_err("a short 6D alpha error receipt must be rejected");
+    assert!(matches!(error, NyError::ShapeMismatch { .. }), "{error:?}");
+
+    crate::bounds::patches::test_override::with_eager_err(false, || {
+        let mut poisoned = make_explicit_identity();
+        poisoned.lower_a.coeff_err = Some(Array1::from_vec(vec![f32::NAN]));
+        let (result, _) = crown_relu_backward_patches_with_alpha(&poisoned, &pre, &alpha)
+            .expect("NaN error must degrade outward rather than disappear");
+        let CrownBounds::Patches(result) = result else {
+            panic!("expected Patches result");
+        };
+        assert_eq!(result.lower_a.coeff_err.as_ref().unwrap()[0], f32::INFINITY);
+        assert_eq!(result.lower_b[0], f32::NEG_INFINITY);
+    });
+}
+
+#[test]
+fn owned_alpha_relu_in_place_matches_historical_bitwise_with_padding_and_coeff_err() {
+    let (bounds, pre, alpha) = owned_alpha_mixed_fixture(
+        Some(Array1::from_vec(vec![1.0e-3, 2.0e-3])),
+        Some(Array1::from_vec(vec![5.0e-4, 1.5e-3])),
+    );
+    let expected =
+        crown_relu_backward_patches_with_alpha_bound_only(&bounds, &pre, &alpha).unwrap();
+    let actual = run_owned_alpha_relu_in_place(&bounds, &pre, &alpha);
+    assert_owned_alpha_bounds_bitwise("owned alpha parity", &actual, &expected);
+
+    let CrownBounds::Patches(actual) = actual else {
+        unreachable!();
+    };
+    // Row 0 / output (0,0) / tap (0,0) maps into top-left padding.
+    assert_eq!(
+        actual.lower_a.patches.as_ref().unwrap()[[0, 0, 0, 0, 0, 0, 0]].to_bits(),
+        0.0f32.to_bits()
+    );
+    assert_eq!(
+        actual.upper_a.patches.as_ref().unwrap()[[0, 0, 0, 0, 0, 0, 0]].to_bits(),
+        0.0f32.to_bits()
+    );
+}
+
+#[test]
+fn owned_alpha_relu_in_place_composes_eager_7d_discharge_after_transform() {
+    let (bounds, pre, alpha) = owned_alpha_mixed_fixture(
+        Some(Array1::from_vec(vec![1.0e-3, 2.0e-3])),
+        Some(Array1::from_vec(vec![5.0e-4, 1.5e-3])),
+    );
+
+    // Build the oracle as two explicit operations: the owned alpha transform
+    // with eager discharge disabled, followed by the reviewed 7D fold against
+    // this ReLU's pre-activation box. Both policy choices are injected directly
+    // so this test is independent of process-global environment OnceLocks.
+    let off = run_owned_alpha_relu_in_place_with_eager_policy(&bounds, &pre, &alpha, false);
+    let CrownBounds::Patches(mut expected) = off.clone() else {
+        unreachable!();
+    };
+    expected.fold_coeff_err_over_box_eager_with_policy(&pre, true);
+
+    let actual = run_owned_alpha_relu_in_place_with_eager_policy(&bounds, &pre, &alpha, true);
+    let CrownBounds::Patches(actual) = actual else {
+        unreachable!();
+    };
+    assert!(
+        actual.lower_a.coeff_err.is_none() && actual.upper_a.coeff_err.is_none(),
+        "valid 7D activation error must be retired at the owned publication seam"
+    );
+    assert_bits_eq(
+        "owned eager lower patches",
+        actual.lower_a.patches.as_ref().unwrap().as_slice().unwrap(),
+        expected
+            .lower_a
+            .patches
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap(),
+    );
+    assert_bits_eq(
+        "owned eager upper patches",
+        actual.upper_a.patches.as_ref().unwrap().as_slice().unwrap(),
+        expected
+            .upper_a
+            .patches
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap(),
+    );
+    assert_bits_eq(
+        "owned eager lower bias",
+        actual.lower_b.as_slice().unwrap(),
+        expected.lower_b.as_slice().unwrap(),
+    );
+    assert_bits_eq(
+        "owned eager upper bias",
+        actual.upper_b.as_slice().unwrap(),
+        expected.upper_b.as_slice().unwrap(),
+    );
+
+    let CrownBounds::Patches(off) = off else {
+        unreachable!();
+    };
+    assert!(
+        actual
+            .lower_b
+            .iter()
+            .zip(off.lower_b.iter())
+            .all(|(&on, &before)| on <= before),
+        "lower bias must move only outward"
+    );
+    assert!(
+        actual
+            .upper_b
+            .iter()
+            .zip(off.upper_b.iter())
+            .all(|(&on, &before)| on >= before),
+        "upper bias must move only outward"
+    );
+}
+
+#[test]
+fn owned_alpha_relu_in_place_matches_historical_nonfinite_row_poison() {
+    let (mut bounds, pre, alpha) = owned_alpha_mixed_fixture(
+        Some(Array1::from_vec(vec![1.0e-3, 2.0e-3])),
+        Some(Array1::from_vec(vec![5.0e-4, 1.5e-3])),
+    );
+    bounds.lower_a.patches.as_mut().unwrap()[[0, 0, 0, 1, 0, 1, 1]] = f32::INFINITY;
+    bounds.upper_a.patches.as_mut().unwrap()[[1, 0, 1, 1, 0, 1, 1]] = f32::NEG_INFINITY;
+
+    let expected =
+        crown_relu_backward_patches_with_alpha_bound_only(&bounds, &pre, &alpha).unwrap();
+    let actual = run_owned_alpha_relu_in_place(&bounds, &pre, &alpha);
+    assert_owned_alpha_bounds_bitwise("owned alpha nonfinite", &actual, &expected);
+}
+
+#[test]
+fn owned_alpha_relu_in_place_matches_historical_invalid_coeff_err_poison() {
+    let (bounds, pre, alpha) = owned_alpha_mixed_fixture(
+        Some(Array1::from_vec(vec![f32::NAN, 1.0e-3])),
+        Some(Array1::from_vec(vec![1.0e-3, -1.0])),
+    );
+    let expected =
+        crown_relu_backward_patches_with_alpha_bound_only(&bounds, &pre, &alpha).unwrap();
+    let actual = run_owned_alpha_relu_in_place(&bounds, &pre, &alpha);
+    assert_owned_alpha_bounds_bitwise("owned alpha coeff_err poison", &actual, &expected);
+}
+
+#[test]
+fn owned_alpha_relu_preparation_rejects_malformed_inputs_before_consumption() {
+    let (bounds, pre, alpha) = owned_alpha_mixed_fixture(
+        Some(Array1::from_vec(vec![1.0e-3, 2.0e-3])),
+        Some(Array1::from_vec(vec![5.0e-4, 1.5e-3])),
+    );
+    let original_lower = bounds
+        .lower_a
+        .patches
+        .as_ref()
+        .unwrap()
+        .as_slice()
+        .unwrap()
+        .to_vec();
+
+    let mut metadata_mismatch = bounds.clone();
+    metadata_mismatch.upper_a.input_shape = (1, 2, 3);
+    let error = match prepare_crown_relu_backward_patches_with_alpha_in_place(
+        &metadata_mismatch,
+        &pre,
+        &alpha,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("mismatched side metadata must be refused before consumption"),
+    };
+    assert!(matches!(error, NyError::ShapeMismatch { .. }));
+
+    let mut bad_error_len = bounds.clone();
+    bad_error_len.lower_a.coeff_err = Some(Array1::from_vec(vec![1.0e-3]));
+    let error = match prepare_crown_relu_backward_patches_with_alpha_in_place(
+        &bad_error_len,
+        &pre,
+        &alpha,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("wrong coeff_err length must be refused before consumption"),
+    };
+    assert!(matches!(error, NyError::ShapeMismatch { .. }));
+
+    let mut anchored_bounds = bounds.clone();
+    let anchored = PatchGeometry::anchored(vec![0, 1], vec![0, 1]).unwrap();
+    anchored_bounds.lower_a.geometry = anchored.clone();
+    anchored_bounds.upper_a.geometry = anchored;
+    let error = match prepare_crown_relu_backward_patches_with_alpha_in_place(
+        &anchored_bounds,
+        &pre,
+        &alpha,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("owned alpha-ReLU is not yet implemented for anchored geometry"),
+    };
+    assert!(matches!(error, NyError::UnsupportedConfiguration(_)));
+
+    let mut invalid_alpha = alpha;
+    invalid_alpha[0] = f32::NAN;
+    let error = match prepare_crown_relu_backward_patches_with_alpha_in_place(
+        &bounds,
+        &pre,
+        &invalid_alpha,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("non-finite alpha must be refused before consumption"),
+    };
+    assert!(matches!(error, NyError::InvalidSpec(_)));
+
+    assert_bits_eq(
+        "preparation leaves borrowed carrier unchanged",
+        bounds.lower_a.patches.as_ref().unwrap().as_slice().unwrap(),
+        &original_lower,
+    );
+}
+
+#[test]
+fn owned_alpha_relu_deadline_is_structured_before_and_during_owned_transform() {
+    let (bounds, pre, alpha) = owned_alpha_mixed_fixture(None, None);
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .unwrap();
+    let error = match prepare_crown_relu_backward_patches_with_alpha_in_place(
+        &bounds, &pre, &alpha, expired,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("expired preparation must fail before ownership transfer"),
+    };
+    assert!(error.is_deadline_exceeded());
+
+    // A 4,097-coordinate row crosses the production 4,096-coordinate poll
+    // boundary. The injected third poll fails after coefficients have begun
+    // transforming, exercising the consume-and-drop error contract.
+    let shape = [1usize, 1, 1, 1, 1, 1, 4_097];
+    let long_bounds = make_alpha_7d_bounds(
+        &shape,
+        (1, 1, 4_097),
+        (0, 0, 0, 0),
+        vec![0.75; 4_097],
+        vec![-0.5; 4_097],
+        vec![0.25],
+        vec![-0.5],
+        Some(Array1::from_vec(vec![1.0e-4])),
+        Some(Array1::from_vec(vec![2.0e-4])),
+    );
+    let long_pre = BoundedTensor::new(
+        Array1::from_vec(vec![-1.0; 4_097]).into_dyn(),
+        Array1::from_vec(vec![2.0; 4_097]).into_dyn(),
+    )
+    .unwrap();
+    let long_alpha = Array1::from_vec(vec![0.5; 4_097]);
+    let plan = prepare_crown_relu_backward_patches_with_alpha_in_place(
+        &long_bounds,
+        &long_pre,
+        &long_alpha,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    let polls = std::cell::Cell::new(0usize);
+    let error = match crown_relu_backward_patches_with_alpha_in_place_with_poll_for_test(
+        Box::new(long_bounds),
+        plan,
+        &long_pre,
+        false,
+        || {
+            let next = polls.get() + 1;
+            polls.set(next);
+            if next >= 3 {
+                Err(NyError::DeadlineExceeded(
+                    "injected owned alpha-ReLU deadline".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("in-loop deadline must drop the owned carrier"),
+    };
+    assert!(error.is_deadline_exceeded());
+    assert_eq!(polls.get(), 3);
+}
+
+// =====================================================================
 // Operator parity: patches-mode alpha-CROWN == dense-mode alpha-CROWN.
 //
 // The wiring landed in `try_patches_target_step_core` (#conv-patches-collect
@@ -2025,8 +2717,7 @@ fn test_patches_alpha_matches_dense_alpha_operator_conv_seed() {
                     )
                     .unwrap(),
                 ),
-                stride: (1, 1),
-                padding: (0, 0, 0, 0),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: false,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (in_c, in_h, in_w),
@@ -2042,8 +2733,7 @@ fn test_patches_alpha_matches_dense_alpha_operator_conv_seed() {
                     )
                     .unwrap(),
                 ),
-                stride: (1, 1),
-                padding: (0, 0, 0, 0),
+                geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
                 identity: false,
                 output_shape: (out_c, out_h, out_w),
                 input_shape: (in_c, in_h, in_w),

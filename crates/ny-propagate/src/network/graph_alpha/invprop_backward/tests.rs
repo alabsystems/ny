@@ -233,15 +233,116 @@ fn test_augment_gamma_zero_is_identity() {
     let rhs = arr1(&[0.0]);
     let constraints = OutputConstraints::new(a_matrix, rhs, true).unwrap();
 
-    let zeros = arr2(&[[0.0, 0.0, 0.0]]);
+    // Include -0.0: it is a valid zero multiplier and must take the same fast
+    // identity path without normalizing any bits in the returned seed.
+    let zeros = arr2(&[[0.0, -0.0, 0.0]]);
     let augmented = augment_bounds_with_constraints(&bounds, &constraints, &zeros, &zeros);
 
-    assert_eq!(augmented.lower_a, bounds.lower_a);
-    assert_eq!(augmented.upper_a, bounds.upper_a);
-    assert_eq!(augmented.lower_b, bounds.lower_b);
-    assert_eq!(augmented.upper_b, bounds.upper_b);
+    let same_bits = |left: &ArrayD<f32>, right: &ArrayD<f32>| {
+        left.shape() == right.shape()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(&lhs, &rhs)| lhs.to_bits() == rhs.to_bits())
+    };
+    assert!(same_bits(
+        &augmented.lower_a.clone().into_dyn(),
+        &bounds.lower_a.clone().into_dyn()
+    ));
+    assert!(same_bits(
+        &augmented.upper_a.clone().into_dyn(),
+        &bounds.upper_a.clone().into_dyn()
+    ));
+    assert!(same_bits(
+        &augmented.lower_b.clone().into_dyn(),
+        &bounds.lower_b.clone().into_dyn()
+    ));
+    assert!(same_bits(
+        &augmented.upper_b.clone().into_dyn(),
+        &bounds.upper_b.into_dyn()
+    ));
     // No err attached when nothing was folded.
     assert!(augmented.lower_a_err.is_none() && augmented.upper_a_err.is_none());
+}
+
+/// The dual proof requires finite nonnegative multipliers. Malformed internal
+/// gamma state must preserve the identity seed exactly instead of relying on
+/// downstream NaN repair or accidentally inverting a constraint.
+#[ntest::timeout(10000)]
+#[test]
+fn test_augment_invalid_gamma_fails_closed() {
+    let bounds = LinearBounds::identity(2);
+    let constraints = OutputConstraints::new(arr2(&[[1.0, -1.0]]), arr1(&[0.25]), true).unwrap();
+
+    for invalid in [-0.25_f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let invalid_lower = arr2(&[[invalid, 0.5]]);
+        let valid_upper = arr2(&[[0.5, 0.5]]);
+        let augmented =
+            augment_bounds_with_constraints(&bounds, &constraints, &invalid_lower, &valid_upper);
+
+        assert_eq!(augmented.lower_a, bounds.lower_a, "invalid={invalid:?}");
+        assert_eq!(augmented.upper_a, bounds.upper_a, "invalid={invalid:?}");
+        assert_eq!(augmented.lower_b, bounds.lower_b, "invalid={invalid:?}");
+        assert_eq!(augmented.upper_b, bounds.upper_b, "invalid={invalid:?}");
+        assert!(augmented.lower_a_err.is_none(), "invalid={invalid:?}");
+        assert!(augmented.upper_a_err.is_none(), "invalid={invalid:?}");
+
+        let valid_lower = arr2(&[[0.5, 0.5]]);
+        let invalid_upper = arr2(&[[0.5, invalid]]);
+        let augmented =
+            augment_bounds_with_constraints(&bounds, &constraints, &valid_lower, &invalid_upper);
+        assert_eq!(augmented.lower_a, bounds.lower_a, "invalid={invalid:?}");
+        assert_eq!(augmented.upper_a, bounds.upper_a, "invalid={invalid:?}");
+        assert_eq!(augmented.lower_b, bounds.lower_b, "invalid={invalid:?}");
+        assert_eq!(augmented.upper_b, bounds.upper_b, "invalid={invalid:?}");
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_augment_nonfinite_constraint_system_fails_closed() {
+    let bounds = LinearBounds::identity(2);
+    let base = OutputConstraints::new(arr2(&[[1.0, -1.0]]), arr1(&[0.25]), true).unwrap();
+    let gammas = arr2(&[[0.5, 0.5]]);
+
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut matrix_invalid = base.clone();
+        matrix_invalid.a_matrix[[0, 1]] = invalid;
+        let augmented = augment_bounds_with_constraints(&bounds, &matrix_invalid, &gammas, &gammas);
+        assert_eq!(augmented.lower_a, bounds.lower_a, "matrix={invalid:?}");
+        assert_eq!(augmented.upper_a, bounds.upper_a, "matrix={invalid:?}");
+        assert_eq!(augmented.lower_b, bounds.lower_b, "matrix={invalid:?}");
+        assert_eq!(augmented.upper_b, bounds.upper_b, "matrix={invalid:?}");
+
+        let mut rhs_invalid = base.clone();
+        rhs_invalid.rhs[0] = invalid;
+        let augmented = augment_bounds_with_constraints(&bounds, &rhs_invalid, &gammas, &gammas);
+        assert_eq!(augmented.lower_a, bounds.lower_a, "rhs={invalid:?}");
+        assert_eq!(augmented.upper_a, bounds.upper_a, "rhs={invalid:?}");
+        assert_eq!(augmented.lower_b, bounds.lower_b, "rhs={invalid:?}");
+        assert_eq!(augmented.upper_b, bounds.upper_b, "rhs={invalid:?}");
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_augment_changed_identity_seed_records_execution() {
+    let _telemetry_lock = crate::execution_telemetry::TEST_LOCK
+        .lock()
+        .expect("telemetry test lock");
+    let _run = crate::execution_telemetry::begin_run();
+    let bounds = LinearBounds::identity(1);
+    let constraints = OutputConstraints::new(arr2(&[[1.0]]), arr1(&[0.25]), true).unwrap();
+
+    let augmented =
+        augment_bounds_with_constraints(&bounds, &constraints, &arr2(&[[0.5]]), &arr2(&[[0.5]]));
+    assert_ne!(augmented.lower_a, bounds.lower_a);
+
+    let observations = crate::execution_telemetry::snapshot();
+    assert!(observations.invprop.observed);
+    assert!(observations.invprop.nonzero_output_seed_folds >= 1);
+    assert_eq!(observations.invprop.nonzero_evaluated_output_seed_folds, 0);
+    assert!(!observations.invprop.attribution_conflict);
 }
 
 /// Stage-0 oracle: non-conjunction constraints fail closed (core-level guard, not
@@ -401,6 +502,76 @@ fn test_augment_bounds_shared_gammas() {
     // A-term folded on the two constrained columns.
     assert!((augmented.lower_a[[0, 0]] - 1.5).abs() < 1e-6);
     assert!((augmented.lower_a[[1, 1]] - 1.3).abs() < 1e-6);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_augment_large_small_large_coefficient_cancellation_is_enclosed() {
+    let bounds = LinearBounds::identity(1);
+    let magnitude = 2.0_f32.powi(60);
+    let constraints = OutputConstraints::new(
+        arr2(&[[magnitude], [-1.0], [-magnitude]]),
+        arr1(&[0.0, 0.0, 0.0]),
+        true,
+    )
+    .unwrap();
+    let gammas = arr2(&[[1.0], [1.0], [1.0]]);
+
+    let augmented = augment_bounds_with_constraints(&bounds, &constraints, &gammas, &gammas);
+    let lower_error = augmented
+        .lower_a_err
+        .as_ref()
+        .expect("cancellation must materialize coefficient error")[[0, 0]];
+    let upper_error = augmented
+        .upper_a_err
+        .as_ref()
+        .expect("cancellation must materialize coefficient error")[[0, 0]];
+    // Exact real coefficients are 1 + (M - 1 - M) = 0 (lower) and
+    // 1 - (M - 1 - M) = 2 (upper), even though the f64 reduction loses 1.
+    assert!(
+        f64::from(lower_error) >= f64::from(augmented.lower_a[[0, 0]]).abs(),
+        "stored lower center/error do not enclose exact zero"
+    );
+    assert!(
+        f64::from(upper_error) >= (f64::from(augmented.upper_a[[0, 0]]) - 2.0).abs(),
+        "stored upper center/error do not enclose exact two"
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_augment_large_small_large_bias_cancellation_is_outward() {
+    let bounds = LinearBounds::identity(1);
+    let magnitude = 2.0_f32.powi(60);
+    let constraints = OutputConstraints::new(
+        arr2(&[[0.0], [0.0], [0.0]]),
+        arr1(&[magnitude, 1.0, -magnitude]),
+        true,
+    )
+    .unwrap();
+    let gammas = arr2(&[[1.0], [1.0], [1.0]]);
+
+    let augmented = augment_bounds_with_constraints(&bounds, &constraints, &gammas, &gammas);
+    // Exact lower/upper deltas are -1/+1. A plain f64 reduction in this order
+    // produces zero; the published endpoints must still enclose the exact sum.
+    assert!(augmented.lower_b[0] <= -1.0);
+    assert!(augmented.upper_b[0] >= 1.0);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_augment_bias_overflow_converts_directionally() {
+    let bounds = LinearBounds::identity(1);
+    let constraints = OutputConstraints::new(arr2(&[[0.0]]), arr1(&[-f32::MAX]), true).unwrap();
+    let gammas = arr2(&[[f32::MAX]]);
+
+    let augmented = augment_bounds_with_constraints(&bounds, &constraints, &gammas, &gammas);
+    // Exact lower delta is positive beyond f32::MAX: +Inf would be inward as a
+    // lower endpoint, so directed-down conversion must saturate at f32::MAX.
+    assert_eq!(augmented.lower_b[0], f32::MAX);
+    // Exact upper delta is negative beyond -f32::MAX: -Inf would be inward as
+    // an upper endpoint, so directed-up conversion must saturate at -f32::MAX.
+    assert_eq!(augmented.upper_b[0], -f32::MAX);
 }
 
 #[ntest::timeout(10000)]

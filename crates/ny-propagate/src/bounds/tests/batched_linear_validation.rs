@@ -10,6 +10,7 @@
 
 use crate::bounds::BatchedLinearBounds;
 use ndarray::{ArrayD, IxDyn};
+use ny_core::NyError;
 
 /// Helper to create a simple [out_dim, in_dim] coefficient array.
 fn coeff(data: &[f32], out_dim: usize, in_dim: usize) -> ArrayD<f32> {
@@ -183,10 +184,9 @@ fn test_batched_linear_bounds_new_rejects_mismatched_a_shapes() {
         vec![1],
     )
     .unwrap_err();
-    let msg = err.to_string();
     assert!(
-        msg.contains("lower_a shape") && msg.contains("upper_a shape"),
-        "expected A shape mismatch error, got: {msg}"
+        matches!(&err, NyError::ShapeMismatch { expected, got } if expected.as_slice() == [1, 2] && got.as_slice() == [2, 2]),
+        "expected structural A ShapeMismatch, got: {err}"
     );
 }
 
@@ -203,10 +203,9 @@ fn test_batched_linear_bounds_new_rejects_mismatched_b_shapes() {
         vec![1],
     )
     .unwrap_err();
-    let msg = err.to_string();
     assert!(
-        msg.contains("lower_b shape") && msg.contains("upper_b shape"),
-        "expected bias shape mismatch error, got: {msg}"
+        matches!(&err, NyError::ShapeMismatch { expected, got } if expected.as_slice() == [1] && got.as_slice() == [2]),
+        "expected paired-bias ShapeMismatch, got: {err}"
     );
 }
 
@@ -223,10 +222,9 @@ fn test_batched_linear_bounds_new_rejects_wrong_bias_dims() {
         vec![2],
     )
     .unwrap_err();
-    let msg = err.to_string();
     assert!(
-        msg.contains("lower_b shape") && msg.contains("expected"),
-        "expected bias/A shape mismatch error, got: {msg}"
+        matches!(&err, NyError::ShapeMismatch { expected, got } if expected.as_slice() == [2] && got.as_slice() == [3]),
+        "expected bias/A ShapeMismatch, got: {err}"
     );
 }
 

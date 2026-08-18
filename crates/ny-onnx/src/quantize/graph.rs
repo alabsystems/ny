@@ -13,6 +13,7 @@ use super::{
     build_layer_quantization, make_default_input, tally_layer_quantization, QuantizeConfig,
     QuantizeError, QuantizeResult,
 };
+use crate::analysis_error::validate_analysis_epsilon;
 
 /// Analyze quantization safety of a `GraphNetwork`.
 pub fn analyze_quantization_graph(
@@ -34,6 +35,8 @@ pub(super) fn analyze_quantization_graph_with_input(
     input: &BoundedTensor,
     config: &QuantizeConfig,
 ) -> Result<QuantizeResult, QuantizeError> {
+    validate_analysis_epsilon("quantize/graph", config.epsilon)?;
+
     info!(
         "Starting graph quantization analysis with input shape {:?}, epsilon {}",
         input.shape(),

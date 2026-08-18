@@ -236,8 +236,9 @@ fn assert_kokoro_property_matches_oracle(
 /// Part of #3755.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_kokoro_deep_prefix_training_signal_property_smoke_3755() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let fixture = build_kokoro_property_sweep_fixture();
 
     assert_eq!(fixture.report.regions.len(), 1, "expected 1 scored region");

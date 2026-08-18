@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! CPU fallback execution path for GPU BaB.
+//! CPU fallback execution path for DomainList BaB.
 //!
 //! When no GPU engine is available (`engine=None`), domains are materialized
 //! and processed in parallel on the CPU using rayon. Each domain goes through
@@ -148,7 +148,7 @@ pub(crate) fn process_cpu_fallback_batch(
                 // #1852: propagation failed — sub-region unexplored.
                 // Must not return Verified while any domain has this status.
                 warn!(
-                    "GPU BaB: propagation failure in sequential fallback path — domain unresolved"
+                    "DomainList BaB: propagation failure in sequential fallback path — domain unresolved"
                 );
                 state.unresolved_due_to_propagation_failure = true;
             }

@@ -14,13 +14,14 @@ mod screen_child;
 
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ndarray::Array2;
 use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::info;
 
+use crate::beta_crown::branching::BranchingHeuristic;
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
 use crate::bounds::GraphAlphaState;
@@ -33,6 +34,7 @@ use super::batching::{
     pop_multi_obj_input_domain_batch,
 };
 use super::build_batches::compute_crown_or_ibp_bounds_in_build_batches;
+use super::fresh_domain_clip::FreshDomainClipTelemetry;
 use super::grouped_semantics::{
     disjunctive_domain_priority, disjunctive_domain_verified, valid_disjunctive_layout,
 };
@@ -40,8 +42,8 @@ use super::metrics::{should_log_batch, InputSplitBatchSummary};
 use super::mul_binary::maybe_optimize_mul_binary_alphas;
 use super::root_bounds::collect_input_split_root_node_bounds;
 use super::shared::{
-    compute_crown_or_ibp_bounds_with_node_bounds, extract_obj_bounds, MultiObjBounds,
-    MultiObjInputDomain,
+    compute_crown_or_ibp_bounds_with_node_bounds, extract_obj_bounds, graph_spec_ibp_fallback,
+    MultiObjBounds, MultiObjInputDomain,
 };
 use crate::beta_crown::engine::BetaCrownVerifier;
 
@@ -49,6 +51,24 @@ fn format_optional_seconds(value: Option<f64>) -> String {
     value
         .map(|seconds| format!("{seconds:.3}"))
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+/// Resolve the BaB wall slice for grouped disjunctive input splitting.
+///
+/// A caller-supplied deadline is already an authoritative phase boundary (the
+/// CLI ledger has reserved its post-BaB slice). Only the convenience path with
+/// no deadline derives that reservation from the configured timeout.
+#[inline]
+fn disjunctive_multi_clause_bab_timeout(
+    configured_timeout: Duration,
+    post_bab_pgd_fraction: f32,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    match deadline {
+        Some(deadline) => deadline.saturating_duration_since(now),
+        None => configured_timeout.mul_f32(1.0 - post_bab_pgd_fraction.clamp(0.0, 0.5)),
+    }
 }
 
 #[inline]
@@ -95,6 +115,44 @@ fn should_disable_disjunctive_relaxed_clip(
     // sound level-set clip requires a per-domain, non-batch-stacked bound source,
     // not this reused one. Keeping the sound disable.
     relaxed_clip_enabled && !batch_stack_safe
+}
+
+/// Arm only the mechanically sealed current-domain route.
+///
+/// Batch-safe graphs retain the established child clip. Batch-unsafe graphs
+/// keep that legacy route disabled and may opt into this distinct
+/// non-domain-stacked full-spec path, provided the typed config selected the
+/// exact reordered/IBP-enhanced relaxed lifecycle validated by
+/// `BetaCrownConfig::validate`.
+#[inline]
+fn should_enable_fresh_domain_clip(config: &BetaCrownConfig, batch_stack_safe: bool) -> bool {
+    config.input_split_fresh_domain_clip
+        && matches!(config.branching_heuristic, BranchingHeuristic::InputSplit)
+        && config.enable_relaxed_clip
+        && matches!(
+            config.input_clip_type,
+            crate::beta_crown::config::InputClipType::Relaxed
+        )
+        && config.reorder_bab
+        && config.input_split_ibp_enhancement
+        && config.relaxed_clip_iterations > 0
+        && !batch_stack_safe
+}
+
+/// Build the verifier configuration used after the run-local dispatcher has
+/// decided which clip route, if any, is authorized.
+///
+/// Both typed flags are cleared because the processing verifier itself runs
+/// neither config-owned route: legacy child clipping is forbidden for this
+/// graph class, while fresh current-domain authorization is carried solely by
+/// the run-local telemetry capability.  Keeping the typed fresh flag here would
+/// leave an internally invalid `BetaCrownConfig` after disabling the legacy
+/// flag it depends on.
+fn config_with_disjunctive_clip_routes_disabled(config: &BetaCrownConfig) -> BetaCrownConfig {
+    let mut config = config.clone();
+    config.enable_relaxed_clip = false;
+    config.input_split_fresh_domain_clip = false;
+    config
 }
 
 fn maybe_emit_batch_summary(
@@ -171,6 +229,12 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Option<BetaCrownResult> {
+        // This public hook can return a final verdict before any of the normal
+        // graph-verifier ingresses run. Reject quarantined/invalid
+        // configuration before even consulting process-global IMB gates.
+        if self.config.validate().is_err() {
+            return None;
+        }
         let imb_early_on = crate::imb::enabled()
             && matches!(std::env::var("NY_IMB_WIRE").ok().as_deref(), Some("1"))
             && !matches!(std::env::var("NY_IMB_EARLY").ok().as_deref(), Some("0"));
@@ -200,7 +264,10 @@ impl BetaCrownVerifier {
         deadline: Option<Instant>,
         imb_early_on: bool,
     ) -> Option<BetaCrownResult> {
-        if !imb_early_on
+        // Defense in depth for the gate-injected implementation: future
+        // internal callers and tests must not bypass the public preflight.
+        if self.config.validate().is_err()
+            || !imb_early_on
             || !valid_disjunctive_layout(objectives.len(), thresholds.len(), clause_sizes)
         {
             return None;
@@ -326,7 +393,8 @@ impl BetaCrownVerifier {
         // (box-infeasibility + the `concretize_postclip_lower_bounds` grouped
         // check) using the parent's REUSED CROWN linear bounds. On the
         // batch-stack-UNSAFE disjunctive tracks (lsnc_relu's MulBinary/Gather
-        // difference nets, cgan's Relu->BatchNorm, linearizenn's Concat/Slice)
+        // difference nets, cgan's still-shape-unqualified Relu->BatchNorm,
+        // linearizenn's Concat/Slice)
         // those reused bounds are NOT a sound lower bound over the clipped
         // sub-box — decisively reproduced on lsnc quadrotor2d_state_34: over the
         // sub-box around the ORT counterexample X the clip's concretize claims
@@ -356,10 +424,31 @@ impl BetaCrownVerifier {
             graph.is_input_split_batch_stack_safe(),
             self.config.enable_relaxed_clip,
         );
+        let fresh_domain_clip_armed =
+            should_enable_fresh_domain_clip(&self.config, graph.is_input_split_batch_stack_safe());
+        crate::execution_telemetry::record_fresh_domain_clip_route(
+            self.config.input_split_fresh_domain_clip,
+            fresh_domain_clip_armed,
+        );
+        if self.config.input_split_fresh_domain_clip {
+            eprintln!(
+                "NY_FRESH_DOMAIN_CLIP route=grouped-disjunctive-current-domain \
+                 status={} batch_stack_safe={} reorder_bab={} ibp_enhancement={}",
+                if fresh_domain_clip_armed {
+                    "armed"
+                } else {
+                    "inactive"
+                },
+                graph.is_input_split_batch_stack_safe(),
+                self.config.reorder_bab,
+                self.config.input_split_ibp_enhancement,
+            );
+        }
+        let fresh_domain_clip_telemetry = FreshDomainClipTelemetry::new(fresh_domain_clip_armed);
         let clip_disabled_verifier;
         let bab: &BetaCrownVerifier = if disable_clip_unsound_class {
-            let mut cfg = self.config.clone();
-            cfg.enable_relaxed_clip = false;
+            let cfg = config_with_disjunctive_clip_routes_disabled(&self.config);
+            debug_assert!(cfg.validate().is_ok());
             clip_disabled_verifier = self.with_config_from(cfg);
             &clip_disabled_verifier
         } else {
@@ -462,27 +551,28 @@ impl BetaCrownVerifier {
 
         let now = Instant::now();
         let mut lifecycle = GraphBabLifecycle::new(now);
-        // When a wall-clock deadline is provided (#4321), derive the effective
-        // timeout from remaining time instead of the configured timeout.
+        // A supplied absolute deadline is already the ledger-reserved BaB
+        // boundary. Applying post_bab_pgd_fraction again here would reserve the
+        // same post-BaB slice twice and make leaf deadlines unreachable.
         let pgd_frac = self
             .config
             .phase_budget
             .post_bab_pgd_fraction
             .clamp(0.0, 0.5);
-        let effective_total = match deadline {
-            Some(dl) => dl.saturating_duration_since(now),
-            None => self.config.timeout,
-        };
-        let bab_timeout = effective_total.mul_f32(1.0 - pgd_frac);
+        let bab_timeout =
+            disjunctive_multi_clause_bab_timeout(self.config.timeout, pgd_frac, deadline, now);
         let initial_deadline = {
             let frac = self
                 .config
                 .phase_budget
                 .initial_bounds_fraction
                 .clamp(0.0, 1.0);
-            Some(now + bab_timeout.mul_f32(frac))
+            Some(GraphBabLifecycle::fail_closed_deadline(
+                now,
+                bab_timeout.mul_f32(frac),
+            ))
         };
-        let crown_deadline = Some(now + bab_timeout);
+        let crown_deadline = Some(GraphBabLifecycle::fail_closed_deadline(now, bab_timeout));
         let mut domains_verified_by_clip = 0usize;
 
         let (root_node_bounds, root_alpha_state): (
@@ -498,6 +588,41 @@ impl BetaCrownVerifier {
             self.disjunctive_restart_root_cache(objectives, thresholds, clause_sizes, deadline)
                 .map(|cache| (cache, deadline)),
         )?;
+
+        // The root collector's map includes a certified enclosure for the output
+        // node. In particular, the complete cGAN transaction can make that box
+        // decisive even when a subsequent spec-CROWN backward is looser. Project
+        // the already-paid-for output box through the exact packed spec and apply
+        // the ordinary grouped stop criterion before starting any further root or
+        // child work. `graph_spec_ibp_fallback` is the existing verdict-safe
+        // reduction: it sanitizes non-finite values and accumulates in f64 with
+        // outward f32 rounding. Any malformed-map error simply retains the
+        // historical spec-CROWN path below.
+        if let Some(root_map) = root_node_bounds.as_ref() {
+            match graph_spec_ibp_fallback(graph, input, &spec_matrix, engine, Some(root_map))
+                .and_then(|(bounds, _linear)| extract_obj_bounds(&bounds, num_specs))
+            {
+                Ok(root_map_obj_bounds)
+                    if disjunctive_domain_verified(
+                        &root_map_obj_bounds,
+                        thresholds,
+                        clause_sizes,
+                    ) =>
+                {
+                    info!(
+                        "[disjunctive-multi-clause] certified root-map output box verifies all clauses; skipping fresh spec-CROWN and child bounding"
+                    );
+                    lifecycle.domains_explored = 1;
+                    lifecycle.domains_verified = 1;
+                    return Ok(lifecycle.build_result(BabVerificationStatus::Verified));
+                }
+                Ok(_) => {}
+                Err(err) => tracing::debug!(
+                    error = %err,
+                    "root-map clause retest declined; retaining fresh spec-CROWN path"
+                ),
+            }
+        }
 
         // Phase 4 (#3439): MulBinary SPSA alpha optimization.
         let mul_binary_alphas_multi = maybe_optimize_mul_binary_alphas(
@@ -763,6 +888,7 @@ impl BetaCrownVerifier {
                 &compute_bounds,
                 warm_compute_bounds_opt,
                 &warm_alpha_telemetry,
+                &fresh_domain_clip_telemetry,
                 mul_binary_alphas_multi.as_ref(),
                 bab_timeout,
                 &mut queue,
@@ -799,6 +925,45 @@ impl BetaCrownVerifier {
         }
 
         Ok(lifecycle.build_final_result())
+    }
+}
+
+#[cfg(test)]
+mod deadline_budget_tests {
+    use super::*;
+
+    #[test]
+    fn supplied_deadline_is_preserved_without_a_second_post_bab_reservation() {
+        let now = Instant::now();
+        let remaining = Duration::new(73, 123_456_789);
+        let deadline = now + remaining;
+
+        let timeout = disjunctive_multi_clause_bab_timeout(
+            Duration::from_secs(100),
+            0.25,
+            Some(deadline),
+            now,
+        );
+
+        assert_eq!(timeout, remaining);
+        assert_eq!(now + timeout, deadline);
+        assert!(
+            now + timeout <= deadline,
+            "derived boundary must never be later"
+        );
+    }
+
+    #[test]
+    fn absent_deadline_reserves_post_bab_slice_from_configured_timeout() {
+        assert_eq!(
+            disjunctive_multi_clause_bab_timeout(
+                Duration::from_secs(100),
+                0.25,
+                None,
+                Instant::now(),
+            ),
+            Duration::from_secs(75)
+        );
     }
 }
 
@@ -874,7 +1039,15 @@ mod warm_alpha_gate_tests {
 
 #[cfg(test)]
 mod relaxed_clip_safety_tests {
-    use super::should_disable_disjunctive_relaxed_clip;
+    use super::{
+        config_with_disjunctive_clip_routes_disabled, should_disable_disjunctive_relaxed_clip,
+        should_enable_fresh_domain_clip,
+    };
+    use crate::beta_crown::branching::BranchingHeuristic;
+    use crate::beta_crown::config::{BetaCrownConfig, InputClipType};
+    use crate::beta_crown::engine::graph::input_split::fresh_domain_clip::FreshDomainClipTelemetry;
+    use crate::layers::{GatherLayer, Layer, ReLULayer};
+    use crate::{GraphNetwork, GraphNode};
 
     #[test]
     fn batch_unsafe_graph_disables_relaxed_clip_regardless_of_clause_count() {
@@ -906,6 +1079,121 @@ mod relaxed_clip_safety_tests {
                 false
             ));
         }
+    }
+
+    #[test]
+    fn fresh_domain_clip_gate_is_typed_default_dark_and_batch_unsafe_only() {
+        let armed = BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            reorder_bab: true,
+            input_split_ibp_enhancement: true,
+            enable_relaxed_clip: true,
+            input_clip_type: InputClipType::Relaxed,
+            input_split_fresh_domain_clip: true,
+            ..Default::default()
+        };
+        assert!(should_enable_fresh_domain_clip(&armed, false));
+        assert!(!should_enable_fresh_domain_clip(&armed, true));
+        assert!(!should_enable_fresh_domain_clip(
+            &BetaCrownConfig::default(),
+            false
+        ));
+
+        for incompatible in [
+            BetaCrownConfig {
+                branching_heuristic: BranchingHeuristic::LargestBoundWidth,
+                ..armed.clone()
+            },
+            BetaCrownConfig {
+                reorder_bab: false,
+                ..armed.clone()
+            },
+            BetaCrownConfig {
+                input_split_ibp_enhancement: false,
+                ..armed.clone()
+            },
+            BetaCrownConfig {
+                enable_relaxed_clip: false,
+                ..armed.clone()
+            },
+            BetaCrownConfig {
+                input_clip_type: InputClipType::Complete,
+                ..armed.clone()
+            },
+            BetaCrownConfig {
+                relaxed_clip_iterations: 0,
+                ..armed
+            },
+        ] {
+            assert!(!should_enable_fresh_domain_clip(&incompatible, false));
+        }
+    }
+
+    #[test]
+    fn effective_batch_unsafe_processing_config_remains_valid() {
+        let requested = BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            reorder_bab: true,
+            input_split_ibp_enhancement: true,
+            enable_relaxed_clip: true,
+            input_clip_type: InputClipType::Relaxed,
+            input_split_fresh_domain_clip: true,
+            ..Default::default()
+        };
+        requested.validate().expect("requested route must be valid");
+
+        let effective = config_with_disjunctive_clip_routes_disabled(&requested);
+        assert!(!effective.enable_relaxed_clip);
+        assert!(!effective.input_split_fresh_domain_clip);
+        effective
+            .validate()
+            .expect("effective processing verifier must remain valid");
+    }
+
+    #[test]
+    fn typed_request_on_real_gather_graph_arms_only_run_local_capability() {
+        // Gather on an absolute axis is the concrete LSNC graph class whose
+        // prepended domain axis makes domain stacking unsafe.
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+        graph.add_node(GraphNode::new(
+            "gather",
+            Layer::Gather(GatherLayer::new(0, None, vec![2])),
+            vec!["relu".to_string()],
+        ));
+        graph.set_output("gather");
+        assert!(!graph.is_input_split_batch_stack_safe());
+
+        let mut safe_graph = GraphNetwork::new();
+        safe_graph.add_node(GraphNode::from_input("relu", Layer::ReLU(ReLULayer)));
+        safe_graph.set_output("relu");
+        assert!(safe_graph.is_input_split_batch_stack_safe());
+
+        let requested = BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            reorder_bab: true,
+            input_split_ibp_enhancement: true,
+            enable_relaxed_clip: true,
+            input_clip_type: InputClipType::Relaxed,
+            input_split_fresh_domain_clip: true,
+            ..Default::default()
+        };
+        requested.validate().expect("typed request must validate");
+        let armed =
+            should_enable_fresh_domain_clip(&requested, graph.is_input_split_batch_stack_safe());
+        assert!(!should_enable_fresh_domain_clip(
+            &requested,
+            safe_graph.is_input_split_batch_stack_safe(),
+        ));
+        let capability = FreshDomainClipTelemetry::new(armed);
+        assert!(capability.enabled());
+
+        let effective = config_with_disjunctive_clip_routes_disabled(&requested);
+        assert!(!effective.enable_relaxed_clip);
+        assert!(!effective.input_split_fresh_domain_clip);
+        effective
+            .validate()
+            .expect("capability-bearing processing config stays internally valid");
     }
 }
 
@@ -972,5 +1260,37 @@ mod imb_early_layout_tests {
     #[test]
     fn armed_early_imb_rejects_clause_total_overflow() {
         assert_armed_preflight_rejects(&[vec![1.0]], &[0.0], &[usize::MAX, 1]);
+    }
+
+    #[test]
+    fn armed_early_imb_rejects_quarantined_cut_config_before_attempt() {
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            enable_cuts: true,
+            ..BetaCrownConfig::default()
+        });
+        let graph = GraphNetwork::new();
+        let input = BoundedTensor::new(array![0.0].into_dyn(), array![1.0].into_dyn())
+            .expect("valid test input");
+        crate::imb::reset_early_attempted();
+
+        let result = verifier.try_imb_early_disjunctive_with_gate(
+            &graph,
+            &input,
+            &[vec![1.0]],
+            &[0.0],
+            &[1],
+            None,
+            None,
+            true,
+        );
+
+        assert!(
+            result.is_none(),
+            "quarantined cut configuration must never publish an early verdict"
+        );
+        assert!(
+            !crate::imb::early_attempted(),
+            "invalid configuration must be refused before gate or graph work"
+        );
     }
 }

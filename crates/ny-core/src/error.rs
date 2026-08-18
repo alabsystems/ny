@@ -157,6 +157,23 @@ pub enum NyError {
         budget_bytes: usize,
     },
 
+    /// A multi-domain GPU request is wider than a device-safe pre-dispatch
+    /// capacity check permits.
+    ///
+    /// Unlike a generic backend failure, this is safe for a caller to retry at
+    /// a smaller batch width because implementations MUST return it before
+    /// submitting any work for the accepted request. It must not be used for a
+    /// deadline, validation, firewall, or device-execution failure.
+    #[error(
+        "GPU batch capacity exceeded at {site}: requested {requested} {unit}, capacity {capacity}"
+    )]
+    GpuBatchCapacityExceeded {
+        requested: usize,
+        capacity: usize,
+        unit: &'static str,
+        site: &'static str,
+    },
+
     /// CPU dense-materialization budget exceeded (#3550).
     ///
     /// Returned when the estimated CPU memory for a batched dense identity or
@@ -250,6 +267,14 @@ impl NyError {
     /// the affected target degrades to sound IBP bounds instead of aborting.
     pub fn is_cpu_memory_exceeded(&self) -> bool {
         matches!(self, NyError::CpuMemoryExceeded { .. })
+    }
+
+    /// Returns true only for a pre-dispatch multi-domain capacity refusal.
+    ///
+    /// Callers may narrow and retry this variant. Every other GPU error is a
+    /// terminal failure of that optional lane.
+    pub fn is_gpu_batch_capacity_exceeded(&self) -> bool {
+        matches!(self, NyError::GpuBatchCapacityExceeded { .. })
     }
 
     /// Returns true if this error represents an infeasible domain.

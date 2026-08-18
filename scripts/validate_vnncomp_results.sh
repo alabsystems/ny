@@ -136,11 +136,11 @@ REPORT="$REPORT_DIR/validation_${TIMESTAMP}.txt"
 # Build associative arrays via temp files
 NY_TMPF=$(mktemp)
 REF_TMPF=$(mktemp)
-trap "rm -f $NY_TMPF $REF_TMPF" EXIT
+trap 'rm -f "$NY_TMPF" "$REF_TMPF"' EXIT
 
 NY_HEADER=$(head -1 "$NY_CSV" | tr -d '\r')
 if echo "$NY_HEADER" | grep -q "^schema_version,"; then
-    tail -n +2 "$NY_CSV" | tr -d '\r' | while IFS=',' read -r schema lane subject_kind subject_id comparison_key category workload model_path property_path preset_path backend timeout status actual_method wall_seconds domains_explored output_width_sum profile_artifact_path notes; do
+    tail -n +2 "$NY_CSV" | tr -d '\r' | while IFS=',' read -r _ lane _ _ _ _ _ model_path property_path _ _ _ status _; do
         if [[ "$lane" != "vnncomp_single_backend" ]]; then
             continue
         fi
@@ -177,7 +177,7 @@ elif [[ "$REF_FORMAT" == "ny" ]]; then
     done | sort > "$REF_TMPF"
 elif [[ "$REF_FORMAT" == "ny_v1" ]]; then
     # backend_benchmark_row_v1 single-backend rows
-    tail -n +2 "$REF_CSV" | tr -d '\r' | while IFS=',' read -r schema lane subject_kind subject_id comparison_key category workload model_path property_path preset_path backend timeout status actual_method wall_seconds domains_explored output_width_sum profile_artifact_path notes; do
+    tail -n +2 "$REF_CSV" | tr -d '\r' | while IFS=',' read -r _ lane _ _ _ _ _ model_path property_path _ _ _ status _; do
         if [[ "$lane" != "vnncomp_single_backend" ]]; then
             continue
         fi
@@ -188,7 +188,7 @@ elif [[ "$REF_FORMAT" == "ny_v1" ]]; then
     done | sort > "$REF_TMPF"
 elif [[ "$REF_FORMAT" == "harness" ]]; then
     # VNN-COMP harness: category,onnx_path,vnnlib_path,prepare_runtime,result,runtime
-    tail -n +2 "$REF_CSV" | tr -d '\r' | while IFS=',' read -r cat onnx vnnlib prep result runtime; do
+    tail -n +2 "$REF_CSV" | tr -d '\r' | while IFS=',' read -r _ onnx vnnlib _ result _; do
         m=$(model_key "$onnx")
         p=$(property_key "$vnnlib")
         r=$(normalize_result "$result")
@@ -209,11 +209,11 @@ if [[ -n "$NY_AMBIGUOUS" || -n "$REF_AMBIGUOUS" ]]; then
     echo "ERROR: conflicting verdicts share an instance key; no comparison is trustworthy." >&2
     if [[ -n "$NY_AMBIGUOUS" ]]; then
         echo "  ny ($NY_CSV):" >&2
-        echo "$NY_AMBIGUOUS" | sed 's/^/    /' >&2
+        printf '    %s\n' "${NY_AMBIGUOUS//$'\n'/$'\n    '}" >&2
     fi
     if [[ -n "$REF_AMBIGUOUS" ]]; then
         echo "  reference ($REF_CSV):" >&2
-        echo "$REF_AMBIGUOUS" | sed 's/^/    /' >&2
+        printf '    %s\n' "${REF_AMBIGUOUS//$'\n'/$'\n    '}" >&2
     fi
     exit 2
 fi
@@ -266,7 +266,7 @@ done < "$NY_TMPF"
 
 # Count reference-only instances
 REF_ONLY=0
-while IFS='|' read -r r_model r_prop r_result; do
+while IFS='|' read -r r_model r_prop _; do
     if ! awk -F'|' -v m="${r_model}" -v p="${r_prop}" '$1==m && $2==p {found=1; exit} END {exit !found}' "$NY_TMPF"; then
         REF_ONLY=$((REF_ONLY + 1))
     fi
@@ -295,13 +295,28 @@ if [[ "$DISAGREE_CRITICAL" -gt 0 ]]; then
         if [[ -f "$CLASSIFIER_SCRIPT" ]] && command -v python3 >/dev/null 2>&1; then
             tee_line ""
             tee_line "Running replay classifier..."
-            python3 "$CLASSIFIER_SCRIPT" \
-                --ny-csv "$NY_CSV" \
-                --reference-csv "$REF_CSV" \
-                --ny-binary "${NY_BINARY:-./target/release/ny}" \
-                --output-json "$CLASSIFIER_JSON" \
-                --timeout "${CLASSIFIER_TIMEOUT:-120}" \
-                2>&1 | while IFS= read -r line; do tee_line "$line"; done || true
+            CLASSIFIER_STATUS=0
+            if python3 "$CLASSIFIER_SCRIPT" \
+                    --ny-csv "$NY_CSV" \
+                    --reference-csv "$REF_CSV" \
+                    --ny-binary "${NY_BINARY:-./target/release/ny}" \
+                    --output-json "$CLASSIFIER_JSON" \
+                    --timeout "${CLASSIFIER_TIMEOUT:-120}" \
+                    2>&1 | while IFS= read -r line; do tee_line "$line"; done
+            then
+                CLASSIFIER_STATUS=0
+            else
+                CLASSIFIER_STATUS=$?
+            fi
+            case "$CLASSIFIER_STATUS" in
+                0) ;;
+                1)
+                    tee_line "Classifier status: unresolved replay failure(s) (exit 1)"
+                    ;;
+                *)
+                    tee_line "Classifier status: execution failed (exit $CLASSIFIER_STATUS)"
+                    ;;
+            esac
             if [[ -f "$CLASSIFIER_JSON" ]]; then
                 tee_line "Classifier artifact: $CLASSIFIER_JSON"
             fi

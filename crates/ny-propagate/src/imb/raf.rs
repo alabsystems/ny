@@ -38,10 +38,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ny_core::dd::{next_down_f64, next_up_f64};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use ndarray::{ArrayD, IxDyn};
 
+use crate::bounds::{certified_affine_sum_f32, OutwardDirection};
 use crate::layers::{BoundPropagation, Layer};
 use crate::{GraphNetwork, NETWORK_INPUT};
 
@@ -82,19 +84,22 @@ fn raf_concretize(
     let mut lo = vec![0.0f32; dim];
     let mut hi = vec![0.0f32; dim];
     for i in 0..dim {
-        let mut acc_lo = rem_lo[i] as f64;
-        let mut acc_hi = rem_hi[i] as f64;
-        for k in 0..nf {
-            let a = a_cols[k][i] as f64;
-            let (xl, xu) = (xl_f[k] as f64, xu_f[k] as f64);
-            if a >= 0.0 {
-                acc_lo += a * xl;
-                acc_hi += a * xu;
-            } else {
-                acc_lo += a * xu;
-                acc_hi += a * xl;
-            }
-        }
+        let acc_lo = certified_affine_sum_f32(
+            rem_lo[i],
+            (0..nf).map(|k| {
+                let a = a_cols[k][i];
+                (a, if a >= 0.0 { xl_f[k] } else { xu_f[k] })
+            }),
+            OutwardDirection::Lower,
+        );
+        let acc_hi = certified_affine_sum_f32(
+            rem_hi[i],
+            (0..nf).map(|k| {
+                let a = a_cols[k][i];
+                (a, if a >= 0.0 { xu_f[k] } else { xl_f[k] })
+            }),
+            OutwardDirection::Upper,
+        );
         lo[i] = next_down_f32(acc_lo as f32);
         hi[i] = next_up_f32(acc_hi as f32);
     }
@@ -254,14 +259,17 @@ pub(super) fn raf_forward(
             let mut rlo = rrf.lower().as_slice()?.to_vec();
             let mut rhi = rrf.upper().as_slice()?.to_vec();
             for i in 0..out_dim {
-                let mut slack = 0.0f64;
-                for k in 0..nf {
-                    let m = (xl_f[k].abs()).max(xu_f[k].abs()) as f64;
-                    slack += a_err[k][i] as f64 * m;
-                }
+                let slack = certified_affine_sum_f32(
+                    0.0,
+                    (0..nf).map(|k| {
+                        let magnitude = xl_f[k].abs().max(xu_f[k].abs());
+                        (a_err[k][i], magnitude)
+                    }),
+                    OutwardDirection::Upper,
+                );
                 if slack.is_finite() && slack > 0.0 {
-                    rlo[i] = next_down_f32((rlo[i] as f64 - slack) as f32);
-                    rhi[i] = next_up_f32((rhi[i] as f64 + slack) as f32);
+                    rlo[i] = next_down_f32(next_down_f64(rlo[i] as f64 - slack) as f32);
+                    rhi[i] = next_up_f32(next_up_f64(rhi[i] as f64 + slack) as f32);
                 }
             }
 
@@ -283,4 +291,29 @@ pub(super) fn raf_forward(
         prev = name.clone();
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raf_concretize;
+
+    #[test]
+    fn concretize_survives_cancellation_larger_than_final_f32_ulp() {
+        let large = 2.0_f32.powi(50);
+        let columns = vec![vec![large], vec![1.0], vec![-large]];
+        let (lower, upper) = raf_concretize(
+            &columns,
+            &[0.0],
+            &[0.0],
+            &[large, 1.0, large],
+            &[large, 1.0, large],
+        );
+
+        assert!(lower[0] <= 1.0);
+        assert!(
+            upper[0] >= 1.0,
+            "RAF upper {} must enclose exact 2^100 + 1 - 2^100",
+            upper[0]
+        );
+    }
 }

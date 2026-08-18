@@ -25,8 +25,9 @@ const DIRECT_BOUNDARY_CROWN_IBP_BUDGET_SECS: u64 = 30;
 /// Verify that raw-input prefix graphs can be extracted for all three ECAPA
 /// block outputs, rooted at NETWORK_INPUT rather than at the preceding stage.
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_raw_input_prefix_graphs_extracted_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let graph = avoice_speaker_encoder_graph();
     let boundary =
         discover_ecapa_composition_boundary(graph).expect("MFA boundary discovery should succeed");
@@ -72,8 +73,9 @@ fn test_ecapa_raw_input_prefix_graphs_extracted_3499() {
 /// Acceptance criterion 1.
 #[cfg_attr(not(debug_assertions), ntest::timeout(1800000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_direct_boundary_mfa_no_looser_than_stage_local_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = bounded_speaker_encoder_cosine_input(
@@ -204,8 +206,9 @@ fn assert_cosine_no_worse(
 /// no worse than the current interval-stage cosine packet.
 #[cfg_attr(not(debug_assertions), ntest::timeout(1800000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_direct_boundary_cosine_no_worse_than_stage_local_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
     let input = bounded_speaker_encoder_cosine_input(

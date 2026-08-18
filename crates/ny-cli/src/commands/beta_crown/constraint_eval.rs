@@ -5,7 +5,7 @@
 //! Shared constraint evaluation helpers for VNN-LIB verification.
 //!
 //! Provides evaluation functions that consume the planning types from
-//! [`constraint_plan`] and produce verification results. Used by both
+//! `constraint_plan` and produce verification results. Used by both
 //! `beta_crown verify` and `bench_acasxu` to eliminate duplicated
 //! evaluation logic.
 //!
@@ -20,21 +20,24 @@ use super::constraint_plan::ConstantConstraintParams;
 
 /// Compute the effective threshold for constant-constraint verification.
 ///
-/// When verifying a lower bound (`verify_upper == false`), the threshold
-/// is negated because the verification framework always checks `output > threshold`.
-/// Negating converts `lower(Y) > c` to `lower(-Y) > -c`.
+/// Both modes verify the original scalar output directly:
+///
+/// - unsafe `Y >= c`: upper-bound mode proves `upper(Y) < c`;
+/// - unsafe `Y <= c`: lower-bound mode proves `lower(Y) > c`.
+///
+/// The planning layer already rounds `c` toward the stricter proof endpoint.
+/// Negating either the threshold or the objective in lower-bound mode would
+/// change the obligation and can turn an actually unsafe `Y <= c` region into
+/// a false safety proof.
 pub(crate) fn compute_effective_threshold(params: &ConstantConstraintParams) -> f32 {
-    if params.verify_upper {
-        params.threshold
-    } else {
-        -params.threshold
-    }
+    params.threshold
 }
 
 /// Build a one-hot objective vector for constant-constraint verification.
 ///
 /// Returns a vector of length `num_outputs` with `1.0` at the target output
-/// index (for upper bound verification) or `-1.0` (for lower bound).
+/// index in both modes. The verifier configuration selects either
+/// `upper(Y) < c` or `lower(Y) > c`.
 /// Used by graph/GPU BaB paths that take a flat objective vector.
 pub(crate) fn build_constant_objective(
     params: &ConstantConstraintParams,
@@ -42,8 +45,6 @@ pub(crate) fn build_constant_objective(
 ) -> Vec<f32> {
     let mut objective = vec![0.0f32; num_outputs];
     if params.output_idx < objective.len() {
-        // For graph dispatch, always use +1.0 — the threshold negation
-        // in compute_effective_threshold handles the sign.
         objective[params.output_idx] = 1.0;
     }
     objective
@@ -51,9 +52,8 @@ pub(crate) fn build_constant_objective(
 
 /// Build a specification layer for constant-constraint sequential verification.
 ///
-/// Returns a coefficient vector selecting the target output with appropriate sign:
-/// - `verify_upper == true`: `coeffs[idx] = 1.0` (select output directly)
-/// - `verify_upper == false`: `coeffs[idx] = -1.0` (negate for lower bound check)
+/// Returns a coefficient vector selecting the target output directly in both
+/// modes. Direction belongs exclusively to `BetaCrownConfig::verify_upper_bound`.
 ///
 /// This is used by sequential (non-graph) paths that append a LinearLayer to
 /// the network. Graph paths use [`build_constant_objective`] instead.
@@ -63,7 +63,7 @@ pub(crate) fn build_constant_spec_coeffs(
 ) -> Vec<f32> {
     let mut coeffs = vec![0.0f32; num_outputs];
     if params.output_idx < coeffs.len() {
-        coeffs[params.output_idx] = if params.verify_upper { 1.0 } else { -1.0 };
+        coeffs[params.output_idx] = 1.0;
     }
     coeffs
 }
@@ -76,7 +76,7 @@ pub(crate) fn build_constant_spec_coeffs(
 /// BaB verification can check `c @ Y > threshold`.
 ///
 /// Used for both constant constraints (via [`build_constant_spec_coeffs`])
-/// and relational constraints (via [`RelationalObjective::spec_coeffs`]).
+/// and relational constraints (via `RelationalObjective::spec_coeffs`).
 pub(crate) fn augment_network_with_spec(
     network: &Network,
     spec_coeffs: Vec<f32>,
@@ -128,7 +128,7 @@ pub(crate) fn aggregate_conjunctive(
                 );
             }
             BabVerificationStatus::Violated { .. }
-            | BabVerificationStatus::PotentialViolation
+            | BabVerificationStatus::PotentialViolation { .. }
             | BabVerificationStatus::Unknown { .. } => {
                 // Constraint may hold; continue checking others
             }
@@ -166,7 +166,7 @@ mod tests {
             verify_upper: false,
             output_idx: 0,
         };
-        assert!((compute_effective_threshold(&params) - (-3.99)).abs() < 1e-6);
+        assert!((compute_effective_threshold(&params) - 3.99).abs() < 1e-6);
     }
 
     #[test]
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_build_constant_objective_lower_bound() {
-        // Graph paths always use +1.0 — sign is handled by threshold negation
+        // Graph paths always select the original output; the mode checks lower > c.
         let params = ConstantConstraintParams {
             threshold: 1.0,
             verify_upper: false,
@@ -211,7 +211,7 @@ mod tests {
             output_idx: 2,
         };
         let coeffs = build_constant_spec_coeffs(&params, 5);
-        assert_eq!(coeffs, vec![0.0, 0.0, -1.0, 0.0, 0.0]);
+        assert_eq!(coeffs, vec![0.0, 0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -283,7 +283,7 @@ mod tests {
                 100,
                 0,
             ),
-            (BabVerificationStatus::PotentialViolation, 50, 0),
+            (BabVerificationStatus::potential_violation(), 50, 0),
         ];
         let (status, domains, _) = aggregate_conjunctive(&results);
         assert!(matches!(status, BabVerificationStatus::Unknown { .. }));
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn test_aggregate_conjunctive_verified_after_unknown() {
         let results = vec![
-            (BabVerificationStatus::PotentialViolation, 100, 0),
+            (BabVerificationStatus::potential_violation(), 100, 0),
             (
                 BabVerificationStatus::Unknown {
                     reason: "x".to_string(),
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn test_aggregate_parity_all_non_terminating_continue_1881() {
         let results = vec![
-            (BabVerificationStatus::PotentialViolation, 10, 0),
+            (BabVerificationStatus::potential_violation(), 10, 0),
             (
                 BabVerificationStatus::Violated {
                     counterexample: vec![],
@@ -411,7 +411,9 @@ mod tests {
         assert_eq!(coeffs[4], 0.0);
     }
 
-    /// #1881: spec coefficients parity — sequential constant lower-bound.
+    /// The lower-bound lane must still select `+Y`: its mode proves
+    /// `lower(Y) > c`. The historical `-Y > -c`/lower-mode combination proved
+    /// the opposite inequality and could falsely verify an unsafe region.
     #[test]
     fn test_spec_coeffs_parity_constant_lower_1881() {
         let params = ConstantConstraintParams {
@@ -420,18 +422,15 @@ mod tests {
             output_idx: 0,
         };
         let coeffs = build_constant_spec_coeffs(&params, 5);
-        // Old inline: coeffs[0] = -1.0 (verify_upper is false)
-        assert_eq!(coeffs[0], -1.0);
-        // Effective threshold should be negated
+        assert_eq!(coeffs[0], 1.0);
         let eff = compute_effective_threshold(&params);
-        assert!((eff - (-3.99)).abs() < 1e-6);
+        assert!((eff - 3.99).abs() < 1e-6);
     }
 
     /// #1881: graph objective parity — constant constraint always uses +1.0.
     ///
-    /// The old verify_constant_gpu_bab built: `objective[output_idx] = 1.0`
-    /// regardless of verify_upper. Threshold negation handled the sign.
-    /// Verify `build_constant_objective` matches this.
+    /// Both graph modes select `+Y`; the verifier mode, not threshold/objective
+    /// negation, determines which complement is proved.
     #[test]
     fn test_graph_objective_parity_constant_1881() {
         // Upper bound: objective should be +1.0
@@ -443,7 +442,7 @@ mod tests {
         let obj_upper = build_constant_objective(&upper, 5);
         assert_eq!(obj_upper[2], 1.0);
 
-        // Lower bound: objective should ALSO be +1.0 (sign via threshold)
+        // Lower bound: objective and threshold stay in the original Y space.
         let lower = ConstantConstraintParams {
             threshold: 3.99,
             verify_upper: false,
@@ -452,8 +451,9 @@ mod tests {
         let obj_lower = build_constant_objective(&lower, 5);
         assert_eq!(
             obj_lower[2], 1.0,
-            "Graph objective always +1.0, sign via threshold"
+            "Graph objective must select the original output in both modes"
         );
+        assert_eq!(compute_effective_threshold(&lower), 3.99);
     }
 
     /// #1881: augmented network parity — spec layer has correct shape.

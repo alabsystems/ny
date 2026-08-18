@@ -7,7 +7,7 @@ use super::{
     finalize_relational_status, verify_relational_constraints, AggregationMode, BetaCrownModel,
 };
 use ndarray::{arr1, arr2, Array1, Array2};
-use ny_onnx::vnnlib::{parse_vnnlib, VnnLibSpec};
+use ny_onnx::vnnlib::{parse_vnnlib, OutputConstraint, VnnLibSpec};
 use ny_propagate::{
     beta_crown::{BetaCrownConfig, BranchingHeuristic},
     layers::LinearLayer,
@@ -433,15 +433,59 @@ fn check_unsafe_counterexample_one_fails_3209() {
 /// comparing against 0.0.
 #[test]
 fn check_unsafe_counterexample_oob_index_rejected_4375() {
-    use ndarray::ArrayD;
     use ny_onnx::vnnlib::OutputConstraint;
 
-    let output: ArrayD<f32> = arr1(&[1.0]).into_dyn();
+    let output: ndarray::ArrayD<f32> = arr1(&[1.0]).into_dyn();
     let constraints = vec![OutputConstraint::GreaterEqConst(1, 0.0)];
 
     assert!(
         !check_unsafe_counterexample(&output, &constraints),
         "out-of-range output coordinates must not confirm an unsafe counterexample"
+    );
+}
+
+#[test]
+fn check_unsafe_counterexample_rejects_nonfinite_or_empty_outputs() {
+    let constraint = [OutputConstraint::LessEqConst(0, 2.0)];
+    for values in [
+        vec![],
+        vec![f32::NAN],
+        vec![f32::INFINITY],
+        vec![1.0, f32::NEG_INFINITY],
+    ] {
+        let output =
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[values.len()]), values).unwrap();
+        assert!(!check_unsafe_counterexample(&output, &constraint));
+    }
+}
+
+#[test]
+fn check_unsafe_counterexample_rejects_nonfinite_constants() {
+    let output: ndarray::ArrayD<f32> = arr1(&[1.0]).into_dyn();
+    for constant in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(!check_unsafe_counterexample(
+            &output,
+            &[OutputConstraint::LessEqConst(0, constant)]
+        ));
+    }
+}
+
+#[test]
+fn check_unsafe_counterexample_compares_constants_in_exact_f64() {
+    let output: ndarray::ArrayD<f32> = arr1(&[1.0]).into_dyn();
+    let just_below_one = f64::from_bits(1.0_f64.to_bits() - 1);
+    let just_above_one = f64::from_bits(1.0_f64.to_bits() + 1);
+
+    assert!(
+        !check_unsafe_counterexample(&output, &[OutputConstraint::LessEqConst(0, just_below_one)]),
+        "rounding the f64 threshold up to f32 would accept a false <= witness"
+    );
+    assert!(
+        !check_unsafe_counterexample(
+            &output,
+            &[OutputConstraint::GreaterEqConst(0, just_above_one)]
+        ),
+        "rounding the f64 threshold down to f32 would accept a false >= witness"
     );
 }
 

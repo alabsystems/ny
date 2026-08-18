@@ -9,13 +9,13 @@
 
 use anyhow::Result;
 use ndarray::{ArrayD, IxDyn};
-use ny_core::GemmEngine;
-use ny_onnx::vnnlib::VnnLibSpec;
+use ny_core::{f64_to_f32_down, GemmEngine};
+use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_propagate::{
-    BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier, GraphNetwork,
-    GraphPrecomputedBounds,
+    BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier,
+    ConjunctiveProofObjectives, GraphNetwork, GraphPrecomputedBounds,
 };
-use ny_tensor::{next_down_f32, BoundedTensor};
+use ny_tensor::BoundedTensor;
 
 use super::attack_budget::graph_upfront_pgd_budget;
 use super::constraint_iter::{iterate_constraints, ConstraintIterConfig};
@@ -24,6 +24,59 @@ use super::dispatch_graph_constraint;
 use super::graph_pgd::{evaluate_graph, try_graph_pgd_upfront_with_config};
 use super::phase_budget::PhaseBudgetLedger;
 use super::{build_multi_objectives, classify_constraints, AggregationMode};
+
+/// Build the CLI's narrowly authenticated synthetic-objective plan for the
+/// graph input-split lane. Route semantics (graph + conjunction + input
+/// splitting) are established by the call site; this helper shares the
+/// config/authority predicate with the verifier's typed proof boundary and
+/// fails closed on source-property AST or normalized-row drift.
+fn exact_conic_proof_objectives(
+    config: &BetaCrownConfig,
+    vnnlib: &VnnLibSpec,
+    objectives: &[Vec<f32>],
+    thresholds: &[f32],
+) -> Option<ConjunctiveProofObjectives> {
+    if !config.input_split_conic_objective_eligible() || !exact_cersyve_conjunctive_spec(vnnlib) {
+        return None;
+    }
+    ConjunctiveProofObjectives::try_exact_two_row_zero_threshold_unit_conic(objectives, thresholds)
+}
+
+/// Authenticate the original property AST before any normalized f32 row can
+/// acquire derived-objective authority. This deliberately recognizes the
+/// parser-real, non-strict Cersyve form only; algebraically similar programmatic
+/// or strict properties remain on the historical path.
+fn exact_cersyve_conjunctive_spec(vnnlib: &VnnLibSpec) -> bool {
+    fn exact_atoms(atoms: &[OutputConstraint]) -> bool {
+        matches!(
+            atoms,
+            [
+                OutputConstraint::LessEqConst(0, first),
+                OutputConstraint::GreaterEqConst(1, second),
+            // IEEE zero signs carry no property meaning. Ordinary equality
+            // admits both spellings while rejecting NaN and every nonzero.
+            ] if *first == 0.0f64 && *second == 0.0f64
+        )
+    }
+
+    vnnlib.num_outputs == 2
+        && !vnnlib.is_disjunction
+        && exact_atoms(&vnnlib.output_constraints)
+        && matches!(
+            vnnlib.output_constraint_clauses.as_slice(),
+            [clause] if exact_atoms(clause)
+        )
+        && vnnlib.per_clause_input_bounds.is_empty()
+        && vnnlib.dual_network.is_none()
+}
+
+fn admits_graph_upfront_pgd(
+    run_upfront_pgd: bool,
+    is_disjunction: bool,
+    clause_count: usize,
+) -> bool {
+    run_upfront_pgd && (!is_disjunction || clause_count <= 1)
+}
 
 /// Verify graph model with relational constraints.
 // Justification: Graph verification requires model, bounds, constraints, config,
@@ -37,15 +90,23 @@ pub(super) fn verify_graph_relational(
     verifier: &BetaCrownVerifier,
     use_relu_split: bool,
     gpu_bab: bool,
+    run_upfront_pgd: bool,
     timeout: u64,
     gemm_engine: Option<&dyn GemmEngine>,
+    // #attack-steering-conjunctive: falsification-only accelerator channel.
+    // Reaches ONLY the upfront graph PGD below; every bound/BaB consumer in
+    // this function keeps `gemm_engine` (the quarantined proof handle).
+    attack_engine_source: crate::commands::beta_crown::attack_arming::AttackEngineSource<'_>,
     json: bool,
+    ledger: &PhaseBudgetLedger,
 ) -> Result<BetaCrownResult> {
     // Classify constraints via shared planning module (#1881)
     let classification = classify_constraints(vnnlib);
     let total_constraint_count = vnnlib.output_constraints.len();
     let is_disjunction = classification.aggregation == AggregationMode::Disjunctive;
-    let ledger = PhaseBudgetLedger::new(timeout, config.phase_budget.clone());
+    // The caller has already applied static MIP eligibility to its
+    // authoritative ledger. Keep that start time and reservation policy intact.
+    ledger.emit_telemetry("graph-enter");
     let start_time = std::time::Instant::now();
 
     // Early PGD attack for graph networks before expensive α-CROWN computation.
@@ -58,16 +119,47 @@ pub(super) fn verify_graph_relational(
     //
     // Reserve (1 - upfront_pgd_fraction) of timeout for CROWN + BaB (#3781).
     // Graph PGD can be expensive on large models.
-    let is_single_clause = vnnlib.output_constraint_clauses.len() <= 1;
-    if config.enable_pgd_attack && (!is_disjunction || is_single_clause) {
+    if admits_graph_upfront_pgd(
+        run_upfront_pgd,
+        is_disjunction,
+        vnnlib.output_constraint_clauses.len(),
+    ) {
         let (pgd_restarts, pgd_steps) = graph_upfront_pgd_budget(config);
         let pgd_deadline = ledger.upfront_pgd_deadline();
+        // #attack-steering-conjunctive: take the falsification accelerator (a
+        // non-blocking take: `None` while arming / when disarmed) and prefer it
+        // over the proof handle. `b030e2a8` restored this channel for the
+        // DISJUNCTIVE lane only; the conjunctive graph lane below kept reading
+        // the proof `gemm_engine`, which `1ede1d30` hard-`None`d — so on every
+        // host the batched exact-VJP wave (`graph_pgd_vjp_batched.rs`, gated on
+        // `as_gpu_crown_backward`) statically declined and this lane fell to the
+        // sequential exact-gradient loop. MEASURED on soundnessbench model_0 at
+        // the official 150 s budget: 8 sequential restart-steps in the whole
+        // 121 s upfront slice, versus the batched wave's ~690 steps × 52 lanes.
+        // Verdict-neutral: gradients only choose WHERE to look, and every
+        // candidate still passes `revalidate_graph_counterexample`.
+        //
+        // #attack-steering-arming-race: this lane takes the engine ONCE, and
+        // its slice is the bulk of the instance, so a not-yet-armed engine
+        // would be lost for the whole slice. Wait at most 1% of this lane's
+        // OWN slice (hard cap 500 ms) for arming to settle — on a near-wall
+        // row whose attack window is milliseconds the wait is proportionally
+        // invisible, which is the property A6 protects.
+        let arming_grace = pgd_deadline
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()) / 100)
+            .unwrap_or(std::time::Duration::from_millis(500))
+            .min(std::time::Duration::from_millis(500));
+        let attack_take = attack_engine_source.take_within(arming_grace);
+        let attack_engine = attack_take
+            .as_ref()
+            .map(|taken| taken.as_gemm())
+            .or(gemm_engine);
         if let Some((counterexample, output)) = try_graph_pgd_upfront_with_config(
             graph,
             input,
             vnnlib,
             beta_crown_pgd_config(config, pgd_restarts, pgd_steps, pgd_deadline),
-            gemm_engine,
+            attack_engine,
             json,
         )? {
             return Ok(BetaCrownResult {
@@ -93,8 +185,9 @@ pub(super) fn verify_graph_relational(
         .per_clause_timeout(total_constraint_count, is_disjunction)
         .unwrap_or(std::time::Duration::from_secs(timeout));
 
-    // Certified sparse-input double-double zonotope (#dd-zonotope, dark
-    // `NY_DD_ZONOTOPE=1`, default-OFF).
+    // Certified sparse-input double-double zonotope (#dd-zonotope, default-ON;
+    // `NY_DD_ZONOTOPE=0` is the kill switch). Its structural detector still
+    // declines ordinary small-input models before doing proof work.
     //
     // This sits AHEAD of both the multi-objective and per-constraint branches
     // because `vggnet16_2022` specs carry exactly ONE output constraint, so the
@@ -110,7 +203,8 @@ pub(super) fn verify_graph_relational(
     // unchanged, so gate-off is byte-identical. See
     // `ny_propagate::dd_zonotope` for the soundness contract.
     if ny_propagate::dd_zonotope::dd_zonotope_enabled() {
-        if let Some(result) = try_dd_zonotope_root(graph, input, vnnlib, &ledger, start_time, json)?
+        if let Some(result) =
+            try_dd_zonotope_root(graph, input, vnnlib, config, ledger, start_time, json)?
         {
             return Ok(result);
         }
@@ -149,6 +243,7 @@ pub(super) fn verify_graph_relational(
         }
 
         let multi_verifier = verifier.with_config_from(config.clone());
+        ledger.emit_telemetry("graph-multi-objective-handoff");
         let bab_deadline = ledger.bab_deadline();
         let result = if conjunctive {
             if use_relu_split {
@@ -157,6 +252,30 @@ pub(super) fn verify_graph_relational(
                     input,
                     &objectives,
                     &thresholds,
+                    gemm_engine,
+                    bab_deadline,
+                )?
+            } else if let Some(proof_objectives) =
+                exact_conic_proof_objectives(config, vnnlib, &objectives, &thresholds)
+            {
+                tracing::info!(
+                    treatment = "input_split_selective_direct_and_affine_conic_closure",
+                    configured = true,
+                    route_eligible = true,
+                    source_ast_mutated = false,
+                    materialized_derived_rows = proof_objectives.len() - objectives.len(),
+                    source_crown_rows = objectives.len(),
+                    available_derived_rows = proof_objectives.len() - objectives.len(),
+                    direct_strategy = "selective_root_and_ranked_microbatches",
+                    original_rows = objectives.len(),
+                    proof_rows = proof_objectives.len(),
+                    provenance = ?proof_objectives.provenance(),
+                    "admitted exact authenticated affine conic closure"
+                );
+                multi_verifier.verify_graph_input_split_conjunctive_proof_objectives(
+                    graph,
+                    input,
+                    &proof_objectives,
                     gemm_engine,
                     bab_deadline,
                 )?
@@ -323,13 +442,23 @@ fn try_dd_zonotope_root(
     graph: &GraphNetwork,
     input: &BoundedTensor,
     vnnlib: &VnnLibSpec,
+    config: &BetaCrownConfig,
     ledger: &PhaseBudgetLedger,
     start_time: std::time::Instant,
     json: bool,
 ) -> Result<Option<BetaCrownResult>> {
     use ny_propagate::dd_zonotope::{dd_zonotope_margins, DdZonoConfig, DdZonoPlan};
 
-    let cfg = DdZonoConfig::from_env();
+    // Admission caps only (#metaroom-ddzono): the category preset may resize
+    // the detector's blast-radius/resource caps (no preset section leaves them
+    // byte-identical); explicitly set env knobs keep precedence, and the
+    // soundness gates are not preset-reachable.
+    let cfg = DdZonoConfig::from_env().with_admission_overrides(
+        config.dd_zonotope_min_input_numel,
+        config.dd_zonotope_max_k,
+        config.dd_zonotope_max_generators,
+        config.dd_zonotope_collect_interm,
+    );
     let Some(plan) = DdZonoPlan::detect(graph, input, &cfg) else {
         if !json {
             println!("[dd-zonotope] detector declined; continuing with the standard pipeline");
@@ -424,15 +553,16 @@ fn try_dd_zonotope_root(
 
     // VERDICT with the explicit safety factor on the certified rounding
     // channel: the property must still hold when that channel is inflated by
-    // `cfg.safety_factor` (default 2x). The `f64 -> f32` narrowing rounds
-    // OUTWARD (`next_down_f32`) so a nearest-mode cast can never round a
-    // certified lower bound UP across the threshold. `objectives.len() ==
+    // `cfg.safety_factor` (default 2x). The bit-classified `f64 -> f32`
+    // narrowing rounds OUTWARD, so neither the hardware rounding mode nor
+    // FTZ/DAZ can round a certified lower bound UP across the threshold.
+    // `objectives.len() ==
     // thresholds.len()` was checked on entry, and `evaluate_objectives` emits
     // one margin per objective, so the three lengths agree here.
     let all_verified = margin.lower.len() == thresholds.len()
         && thresholds.iter().enumerate().all(|(i, &t)| {
             let lo = margin.lower_with_safety(i, cfg.safety_factor);
-            lo.is_finite() && next_down_f32(lo as f32) > t
+            lo.is_finite() && f64_to_f32_down(lo) > t
         });
     if !all_verified {
         if !json {
@@ -469,4 +599,187 @@ fn build_dd_output_bounds(
     let lower = ArrayD::from_shape_vec(shape.clone(), margin.output_lower.clone()).ok()?;
     let upper = ArrayD::from_shape_vec(shape, margin.output_upper.clone()).ok()?;
     BoundedTensor::new(lower, upper).ok()
+}
+
+#[cfg(test)]
+mod conic_proof_objective_tests {
+    use super::*;
+    use ny_onnx::vnnlib::{
+        parse_vnnlib, DualNetworkProperty, DualNetworkSpec, DualNetworkValidation,
+    };
+    use ny_propagate::VerificationArtifactAuthority;
+
+    fn exact_rows() -> (Vec<Vec<f32>>, Vec<f32>) {
+        (vec![vec![1.0, 0.0], vec![0.0, -1.0]], vec![0.0, -0.0])
+    }
+
+    #[test]
+    fn zero_upfront_slice_declines_before_exact_vjp_plan_construction() {
+        assert!(!admits_graph_upfront_pgd(false, false, 1));
+        assert!(!admits_graph_upfront_pgd(false, true, 1));
+        assert!(!admits_graph_upfront_pgd(false, true, 2));
+        assert!(admits_graph_upfront_pgd(true, false, 1));
+    }
+
+    fn exact_spec() -> VnnLibSpec {
+        let atoms = vec![
+            OutputConstraint::LessEqConst(0, 0.0),
+            OutputConstraint::GreaterEqConst(1, 0.0),
+        ];
+        let mut spec = VnnLibSpec::new();
+        spec.num_outputs = 2;
+        spec.output_constraints = atoms.clone();
+        spec.output_constraint_clauses = vec![atoms];
+        spec
+    }
+
+    fn placeholder_dual_network() -> DualNetworkSpec {
+        DualNetworkSpec {
+            networks: Vec::new(),
+            property: DualNetworkProperty::EpsilonEquivalence { epsilon: 0.0 },
+            shared_input_coupling: false,
+            f_input_bounds: Vec::new(),
+            g_input_bounds: Vec::new(),
+            validation: DualNetworkValidation {
+                input_equalities: Vec::new(),
+                f_input_ge_g_input: Vec::new(),
+                g_input_ge_f_input: Vec::new(),
+                isomorphic_output_safe_complement: false,
+                monotonic_output_relation_count: 0,
+                unsupported_output_relation: false,
+                isomorphic_output_atoms: Vec::new(),
+                isomorphic_output_is_conjunction: true,
+            },
+            formula_dnf: None,
+        }
+    }
+
+    #[test]
+    fn route_requires_both_typed_gate_and_verdict_only_authority() {
+        let (objectives, thresholds) = exact_rows();
+        let vnnlib = exact_spec();
+        let mut config = BetaCrownConfig::default();
+        assert!(exact_conic_proof_objectives(&config, &vnnlib, &objectives, &thresholds).is_none());
+
+        config.input_split_conic_objective = true;
+        assert_eq!(
+            config.verification_artifact_authority,
+            VerificationArtifactAuthority::CertificateExport
+        );
+        assert!(exact_conic_proof_objectives(&config, &vnnlib, &objectives, &thresholds).is_none());
+
+        config.verification_artifact_authority = VerificationArtifactAuthority::VerdictOnly;
+        let plan = exact_conic_proof_objectives(&config, &vnnlib, &objectives, &thresholds)
+            .expect("verdict-only exact route should admit the authenticated plan");
+        assert_eq!(plan.len(), 3);
+    }
+
+    #[test]
+    fn parser_real_cersyve_shape_survives_planning_and_authentication() {
+        let vnnlib = parse_vnnlib(
+            r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(declare-const Y_1 Real)
+(assert (>= X_0 0.0))
+(assert (<= X_0 1.0))
+(assert (and (<= Y_0 0.0) (>= Y_1 0.0)))
+"#,
+        )
+        .expect("parser-real Cersyve-shaped property");
+        assert!(exact_cersyve_conjunctive_spec(&vnnlib));
+
+        let (objectives, thresholds) =
+            build_multi_objectives(&vnnlib).expect("normalized objectives build");
+        assert_eq!(objectives, vec![vec![1.0, 0.0], vec![0.0, -1.0]]);
+        // Both thresholds are ZERO. The SIGN is deliberately not pinned.
+        //
+        // `exact_cersyve_conjunctive_spec` states the principle directly --
+        // "IEEE zero signs carry no property meaning" -- so pinning a bit
+        // pattern here contradicts the gate this test exercises. It also does
+        // not survive contact: the parser emits `-0.0` for both atoms, and
+        // whether each survives normalization as `-0.0` or flips to `+0.0`
+        // depends on how a row is built, which the conic work has now changed
+        // twice. Both spellings denote the same real bound and feed the same
+        // comparison, and `== 0.0` still rejects NaN and every nonzero.
+        assert_eq!(thresholds[0], 0.0f32);
+        assert_eq!(thresholds[1], 0.0f32);
+
+        let config = BetaCrownConfig {
+            verification_artifact_authority: VerificationArtifactAuthority::VerdictOnly,
+            input_split_conic_objective: true,
+            ..Default::default()
+        };
+        assert!(exact_conic_proof_objectives(&config, &vnnlib, &objectives, &thresholds).is_some());
+    }
+
+    #[test]
+    fn property_authentication_rejects_strict_and_nonzero_lookalikes() {
+        for atoms in [
+            vec![
+                OutputConstraint::LessThanConst(0, 0.0),
+                OutputConstraint::GreaterEqConst(1, 0.0),
+            ],
+            vec![
+                OutputConstraint::LessEqConst(0, 0.0),
+                OutputConstraint::GreaterThanConst(1, 0.0),
+            ],
+            vec![
+                OutputConstraint::LessEqConst(0, 1.0),
+                OutputConstraint::GreaterEqConst(1, 0.0),
+            ],
+        ] {
+            let mut spec = exact_spec();
+            spec.output_constraints = atoms.clone();
+            spec.output_constraint_clauses = vec![atoms];
+            assert!(!exact_cersyve_conjunctive_spec(&spec));
+        }
+    }
+
+    #[test]
+    fn property_authentication_accepts_every_signed_zero_spelling() {
+        for (first, second) in [(0.0, 0.0), (0.0, -0.0), (-0.0, 0.0), (-0.0, -0.0)] {
+            let atoms = vec![
+                OutputConstraint::LessEqConst(0, first),
+                OutputConstraint::GreaterEqConst(1, second),
+            ];
+            let mut spec = exact_spec();
+            spec.output_constraints = atoms.clone();
+            spec.output_constraint_clauses = vec![atoms];
+            assert!(exact_cersyve_conjunctive_spec(&spec));
+        }
+    }
+
+    #[test]
+    fn property_authentication_rejects_clause_and_route_semantic_drift() {
+        let mut missing_clause = exact_spec();
+        missing_clause.output_constraint_clauses.clear();
+        assert!(!exact_cersyve_conjunctive_spec(&missing_clause));
+
+        let mut mismatched_clause = exact_spec();
+        mismatched_clause.output_constraint_clauses[0].swap(0, 1);
+        assert!(!exact_cersyve_conjunctive_spec(&mismatched_clause));
+
+        let mut extra_clause = exact_spec();
+        extra_clause
+            .output_constraint_clauses
+            .push(extra_clause.output_constraints.clone());
+        assert!(!exact_cersyve_conjunctive_spec(&extra_clause));
+
+        let mut per_clause_box = exact_spec();
+        per_clause_box.per_clause_input_bounds = vec![Default::default()];
+        assert!(!exact_cersyve_conjunctive_spec(&per_clause_box));
+
+        let mut dual_network = exact_spec();
+        dual_network.dual_network = Some(placeholder_dual_network());
+        assert!(!exact_cersyve_conjunctive_spec(&dual_network));
+
+        let mut disjunction = exact_spec();
+        disjunction.is_disjunction = true;
+        assert!(!exact_cersyve_conjunctive_spec(&disjunction));
+
+        let mut extra_output = exact_spec();
+        extra_output.num_outputs = 3;
+        assert!(!exact_cersyve_conjunctive_spec(&extra_output));
+    }
 }

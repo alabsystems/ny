@@ -152,6 +152,10 @@ pub(crate) mod celu;
 mod clip;
 pub(crate) mod elu;
 pub(crate) mod elu_family;
+#[cfg(test)]
+mod envelope_audit;
+#[cfg(test)]
+mod envelope_audit_sigmoid;
 pub(crate) mod exp;
 mod hard_sigmoid;
 mod hard_swish;

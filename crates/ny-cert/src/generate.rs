@@ -387,7 +387,11 @@ mod tests {
 
     #[test]
     fn next_u64_has_no_vacuous_opacity_contract() {
-        let source = include_str!("generate.rs");
+        // Normalize line endings first: the `\n    }\n` anchor below spans
+        // lines, but `.rs` checks out CRLF under core.autocrlf, so on Windows
+        // the `rfind` found nothing and this contract test panicked on a file
+        // whose content was exactly right.
+        let source = include_str!("generate.rs").replace("\r\n", "\n");
         let signature = source
             .find("fn next_u64")
             .expect("next_u64 declaration exists");

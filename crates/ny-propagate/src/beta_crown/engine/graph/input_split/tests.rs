@@ -2,17 +2,21 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::batching::bound_deferred_domains_batch;
+use super::batching::{bound_deferred_domains_batch, tighten_obj_lower_bounds};
 use super::grouped_semantics::{disjunctive_domain_priority, disjunctive_domain_verified};
 use super::mul_binary::maybe_optimize_mul_binary_alphas;
+use super::multi_objective::{multi_objective_bab_timeout, multi_objective_loop_batch_decision};
 use super::shared::{
     compute_crown_or_ibp_bounds_batched, compute_crown_or_ibp_bounds_with_node_bounds,
-    graph_spec_crown_with_mul_binary_and_truncation, multi_obj_domain_verified, GraphInputDomain,
-    MultiObjInputDomain,
+    extract_obj_bounds, graph_spec_crown_with_mul_binary_and_truncation, multi_obj_domain_priority,
+    multi_obj_domain_verified, GraphInputDomain, MultiObjInputDomain,
 };
 use super::shared_specs::{compute_crown_or_ibp_bounds_batched_specs, BatchedSpecBounds};
-use crate::beta_crown::config::BetaCrownConfig;
+use crate::beta_crown::config::{BetaCrownConfig, VerificationArtifactAuthority};
 use crate::beta_crown::engine::tensor_ext::BoundedTensorExt;
+use crate::beta_crown::engine::BetaCrownVerifier;
+use crate::beta_crown::result::BabVerificationStatus;
+use crate::beta_crown::BranchingHeuristic;
 use crate::layers::ConcatLayer;
 use crate::layers::ReLULayer;
 use crate::{GraphNetwork, GraphNode, Layer, LinearBounds, LinearLayer, MulBinaryLayer};
@@ -23,7 +27,316 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[test]
+fn multi_objective_explicit_deadline_is_not_post_bab_reserved_twice() {
+    let now = Instant::now();
+    let ledger_reserved = now + Duration::from_secs(75);
+
+    assert_eq!(
+        multi_objective_bab_timeout(Duration::from_secs(100), 0.25, Some(ledger_reserved), now,),
+        Duration::from_secs(75),
+        "an explicit ledger deadline is the exact BaB boundary"
+    );
+    assert_eq!(
+        multi_objective_bab_timeout(Duration::from_secs(100), 0.25, None, now),
+        Duration::from_secs(75),
+        "the no-deadline convenience path still makes one local reservation"
+    );
+}
+
+#[test]
+fn affine_conic_queue_refresh_cap_is_wired_at_512_boundary() {
+    let capped = multi_objective_loop_batch_decision(513, 4, true, 512).unwrap();
+    assert_eq!(capped.effective_batch_size, 512);
+    assert_eq!(capped.clamp_reason.as_str(), "conic_queue_refresh_cap");
+
+    let boundary = multi_objective_loop_batch_decision(512, 4, true, 512).unwrap();
+    assert_eq!(boundary.effective_batch_size, 512);
+    assert_eq!(boundary.clamp_reason.as_str(), "none");
+
+    let smaller = multi_objective_loop_batch_decision(511, 4, true, 512).unwrap();
+    assert_eq!(smaller.effective_batch_size, 511);
+    assert_eq!(smaller.clamp_reason.as_str(), "none");
+
+    let ordinary_lane = multi_objective_loop_batch_decision(513, 4, false, 512).unwrap();
+    assert_eq!(ordinary_lane.effective_batch_size, 513);
+    assert_eq!(ordinary_lane.clamp_reason.as_str(), "none");
+}
+
+fn build_shared_relu_direct_conic_fixture(second_output_bias: f32) -> GraphNetwork {
+    // One wider than the adaptive source-affine lane's hard input cap. This
+    // keeps the regression specific to the directly propagated third row.
+    const INPUT_WIDTH: usize = 4_097;
+    let mut hidden_weights = Array2::zeros((1, INPUT_WIDTH));
+    hidden_weights[[0, 0]] = 1.0;
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "hidden_affine",
+        Layer::Linear(LinearLayer::new(hidden_weights, None).expect("valid wide hidden affine")),
+    ));
+    graph.add_node(GraphNode::new(
+        "hidden_relu",
+        Layer::ReLU(ReLULayer),
+        vec!["hidden_affine".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "outputs",
+        Layer::Linear(
+            LinearLayer::new(
+                arr2(&[[1.0_f32], [1.0_f32]]),
+                Some(arr1(&[-0.4, second_output_bias])),
+            )
+            .expect("valid output affine"),
+        ),
+        vec!["hidden_relu".to_string()],
+    ));
+    graph.set_output("outputs");
+    graph
+}
+
+fn build_selective_direct_loop_fixture() -> GraphNetwork {
+    // y0 = 0.5x + 0.1 sum(z_i), y1 = -0.5x + 0.1 sum(z_i), so the
+    // authenticated direct row is exactly x. The splitter prioritizes x, while
+    // 4,096 shared nuisance dimensions keep both source rows unresolved inside
+    // this test's small domain budget. Their difference cancels every nuisance
+    // coefficient. Width 4,097 also disables the adaptive source-affine lane,
+    // keeping this fixture specific to selective non-root direct CROWN.
+    const INPUT_WIDTH: usize = 4_097;
+    let mut weights = Array2::from_elem((2, INPUT_WIDTH), 0.1_f32);
+    weights[[0, 0]] = 0.5;
+    weights[[1, 0]] = -0.5;
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "outputs",
+        Layer::Linear(LinearLayer::new(weights, None).expect("valid wide output affine")),
+    ));
+    graph.set_output("outputs");
+    graph
+}
+
+#[test]
+fn authenticated_direct_conic_row_cancels_shared_relu_before_relaxation() {
+    // h=ReLU(x), y0=h-0.4, y1=h-0.5. The source conjunction
+    // y0<=0 AND y1>=0 is impossible, but independently relaxed source rows do
+    // not expose that at the root. Directly propagating y0-y1 produces the
+    // exact positive constant 0.1 before the uncertain ReLU is relaxed.
+    let graph = build_shared_relu_direct_conic_fixture(-0.5);
+    let input = BoundedTensor::new(
+        Array1::from_elem(4_097, -1.0_f32).into_dyn(),
+        Array1::from_elem(4_097, 1.0_f32).into_dyn(),
+    )
+    .expect("valid wide input box");
+    let objectives = vec![vec![1.0_f32, 0.0], vec![0.0_f32, -1.0]];
+    let thresholds = vec![0.0_f32, -0.0];
+    let proof = crate::ConjunctiveProofObjectives::try_exact_two_row_zero_threshold_unit_conic(
+        &objectives,
+        &thresholds,
+    )
+    .expect("fixture must produce the sealed conic plan");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        verification_artifact_authority: VerificationArtifactAuthority::VerdictOnly,
+        branching_heuristic: BranchingHeuristic::InputSplit,
+        input_split_conic_objective: true,
+        verify_upper_bound: false,
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        enable_relaxed_clip: false,
+        input_split_ibp_enhancement: false,
+        max_domains: 0,
+        max_depth: 0,
+        batch_size: 1,
+        timeout: Duration::from_secs(30),
+        reorder_bab: false,
+        ..Default::default()
+    });
+
+    let source_only = verifier
+        .verify_graph_input_split_multi_objective_conjunctive(
+            &graph,
+            &input,
+            &objectives,
+            &thresholds,
+            None,
+            None,
+        )
+        .expect("source-only verifier should run");
+    assert!(
+        !matches!(source_only.result, BabVerificationStatus::Verified),
+        "fixture must require direct pre-relaxation cancellation: {source_only:?}"
+    );
+
+    let direct = verifier
+        .verify_graph_input_split_conjunctive_proof_objectives(&graph, &input, &proof, None, None)
+        .expect("authenticated direct-conic verifier should run");
+    assert!(
+        matches!(direct.result, BabVerificationStatus::Verified),
+        "direct conic row should close the root: {direct:?}"
+    );
+    assert_eq!(direct.domains_explored, 1);
+
+    let equality_graph = build_shared_relu_direct_conic_fixture(-0.4);
+    let equality = verifier
+        .verify_graph_input_split_conjunctive_proof_objectives(
+            &equality_graph,
+            &input,
+            &proof,
+            None,
+            None,
+        )
+        .expect("equality direct-conic verifier should run");
+    assert!(
+        !matches!(equality.result, BabVerificationStatus::Verified),
+        "a derived lower bound equal to its threshold must not verify: {equality:?}"
+    );
+}
+
+#[test]
+fn multi_objective_input_split_rejects_upper_bound_mode_at_both_ingresses() {
+    let graph = build_shared_relu_direct_conic_fixture(-0.5);
+    let input = BoundedTensor::new(
+        Array1::from_elem(4_097, -1.0_f32).into_dyn(),
+        Array1::from_elem(4_097, 1.0_f32).into_dyn(),
+    )
+    .expect("valid wide input box");
+    let objectives = vec![vec![1.0_f32, 0.0], vec![0.0_f32, -1.0]];
+    let thresholds = vec![0.0_f32, -0.0];
+    let proof = crate::ConjunctiveProofObjectives::try_exact_two_row_zero_threshold_unit_conic(
+        &objectives,
+        &thresholds,
+    )
+    .expect("fixture must produce the sealed conic plan");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        verification_artifact_authority: VerificationArtifactAuthority::VerdictOnly,
+        branching_heuristic: BranchingHeuristic::InputSplit,
+        input_split_conic_objective: true,
+        verify_upper_bound: true,
+        ..Default::default()
+    });
+
+    let raw_error = verifier
+        .verify_graph_input_split_multi_objective_conjunctive(
+            &graph,
+            &input,
+            &objectives,
+            &thresholds,
+            None,
+            None,
+        )
+        .expect_err("raw multi-objective ingress must reject upper-bound mode");
+    assert!(raw_error.to_string().contains("verify_upper_bound=false"));
+
+    let proof_error = verifier
+        .verify_graph_input_split_conjunctive_proof_objectives(&graph, &input, &proof, None, None)
+        .expect_err("authenticated multi-objective ingress must reject upper-bound mode");
+    assert!(proof_error.to_string().contains("verify_upper_bound=false"));
+}
+
+#[test]
+fn selective_direct_conic_closes_nonroot_domains_without_claiming_the_instance() {
+    let graph = build_selective_direct_loop_fixture();
+    let lower = Array1::from_elem(4_097, -1.0_f32);
+    let upper = Array1::from_elem(4_097, 1.0_f32);
+    let input = BoundedTensor::new(lower.into_dyn(), upper.into_dyn()).expect("valid wide box");
+    let objectives = vec![vec![1.0_f32, 0.0], vec![0.0_f32, -1.0]];
+    let thresholds = vec![0.0_f32, -0.0];
+    let proof = crate::ConjunctiveProofObjectives::try_exact_two_row_zero_threshold_unit_conic(
+        &objectives,
+        &thresholds,
+    )
+    .expect("fixture must produce the sealed conic plan");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        verification_artifact_authority: VerificationArtifactAuthority::VerdictOnly,
+        branching_heuristic: BranchingHeuristic::InputSplit,
+        input_split_conic_objective: true,
+        verify_upper_bound: false,
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_cuts: false,
+        enable_relaxed_clip: false,
+        input_split_ibp_enhancement: false,
+        max_domains: 64,
+        max_depth: 64,
+        batch_size: 8,
+        timeout: Duration::from_secs(30),
+        reorder_bab: true,
+        ..Default::default()
+    });
+
+    let source = verifier
+        .verify_graph_input_split_multi_objective_conjunctive(
+            &graph,
+            &input,
+            &objectives,
+            &thresholds,
+            None,
+            None,
+        )
+        .expect("source-only verifier should run");
+    let direct = verifier
+        .verify_graph_input_split_conjunctive_proof_objectives(&graph, &input, &proof, None, None)
+        .expect("selective direct verifier should run");
+
+    assert!(
+        !matches!(source.result, BabVerificationStatus::Verified)
+            && !matches!(direct.result, BabVerificationStatus::Verified),
+        "the source conjunction is satisfiable and neither route may claim it"
+    );
+    assert!(
+        direct.domains_explored > 1,
+        "the direct root is unresolved; the selective lane must run in the loop"
+    );
+    assert!(
+        direct.domains_verified > source.domains_verified,
+        "non-root direct cancellation should safely close additional domains: source={source:?}, direct={direct:?}"
+    );
+}
+
+#[test]
+fn objective_tightening_never_zip_truncates_layout() {
+    let parent = vec![(-1.0, 2.0), (-2.0, 3.0)];
+    assert_eq!(
+        tighten_obj_lower_bounds(&parent, vec![(0.0, 1.0)]),
+        parent,
+        "a short rebound must retain the complete parent enclosure"
+    );
+    assert_eq!(
+        tighten_obj_lower_bounds(&parent, vec![(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]),
+        parent,
+        "a rebound with trailing rows must not change objective layout"
+    );
+}
+
+#[test]
+fn objective_extraction_and_priority_require_exact_valid_layouts() {
+    let bounds = BoundedTensor::new(
+        arr1(&[-1.0_f32, -2.0]).into_dyn(),
+        arr1(&[1.0_f32, 2.0]).into_dyn(),
+    )
+    .unwrap();
+    assert!(extract_obj_bounds(&bounds, 0).is_err());
+    assert!(extract_obj_bounds(&bounds, 1).is_err());
+    assert_eq!(extract_obj_bounds(&bounds, 2).unwrap().len(), 2);
+    let infinite = BoundedTensor::new_allow_infinite(
+        arr1(&[f32::NEG_INFINITY]).into_dyn(),
+        arr1(&[f32::INFINITY]).into_dyn(),
+    )
+    .unwrap();
+    assert!(extract_obj_bounds(&infinite, 1).is_err());
+
+    assert_eq!(multi_obj_domain_priority(&[], &[]), f32::NEG_INFINITY);
+    assert_eq!(
+        multi_obj_domain_priority(&[(-1.0, 1.0), (-2.0, 2.0)], &[0.0]),
+        f32::NEG_INFINITY
+    );
+    assert_eq!(
+        multi_obj_domain_priority(&[(2.0, 1.0)], &[0.0]),
+        f32::NEG_INFINITY
+    );
+}
+
 mod adv_check_dag_engine;
+mod adv_check_witness;
 mod batching_rebound;
 mod disjunctive_domain_verified;
 mod disjunctive_reorder_batching;
@@ -678,6 +991,59 @@ fn test_compute_crown_or_ibp_bounds_ibp_enhancement_shape_mismatch_keeps_partial
     }
 }
 
+/// Conjunctive closure follows the strict VNN-LIB complement: any finite lower
+/// bound above its row threshold discharges the box, while equality does not.
+#[test]
+fn test_multi_obj_conjunctive_closure_is_strict_any_row() {
+    let thresholds = [0.0_f32; 4];
+
+    assert!(
+        multi_obj_domain_verified(
+            &[(-0.5, 1.0), (0.25, 0.5), (-0.1, 0.2), (-1.0, 1.0)],
+            &thresholds,
+        ),
+        "one certified row above threshold must discharge the unsafe conjunction"
+    );
+    assert!(
+        !multi_obj_domain_verified(
+            &[(-0.5, 1.0), (0.0, 0.5), (-0.1, 0.2), (-1.0, 1.0)],
+            &thresholds,
+        ),
+        "equality is feasible for a <= unsafe row and must not certify UNSAT"
+    );
+    assert!(
+        !multi_obj_domain_verified(
+            &[
+                (f32::NAN, 1.0),
+                (f32::INFINITY, f32::INFINITY),
+                (-0.1, 0.2),
+                (-1.0, 1.0),
+            ],
+            &thresholds,
+        ),
+        "non-finite lower bounds must never acquire proof authority"
+    );
+    assert!(
+        multi_obj_domain_verified(&[(0.25, f32::INFINITY)], &[0.0]),
+        "+inf is a valid unknown upper side of a one-sided certified-lower enclosure"
+    );
+    for malformed in [[(0.25_f32, f32::NAN)], [(0.25_f32, 0.1_f32)]] {
+        assert!(
+            !multi_obj_domain_verified(&malformed, &[0.0]),
+            "a NaN or inverted interval must not close a conjunction"
+        );
+    }
+    assert!(
+        !multi_obj_domain_verified(&[(0.25, 1.0)], &[f32::NEG_INFINITY]),
+        "a non-finite threshold must not acquire proof authority"
+    );
+    assert!(!multi_obj_domain_verified(&[], &[]));
+    assert!(!multi_obj_domain_verified(
+        &[(0.25, 1.0), (-1.0, 1.0)],
+        &[0.0],
+    ));
+}
+
 /// Disjunctive priority uses min(clause_best) not max(all rows).
 ///
 /// For conjunctive multi-objective, the priority is max(gap) across all rows
@@ -923,7 +1289,14 @@ fn batched_fast_path_matches_scalar_crown_ibp_on_sub_towers() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 mod relational_bab_levers {
-    use super::super::batching::bound_deferred_disjunctive_domains_batch;
+    use super::super::batching::{
+        bound_deferred_disjunctive_domains_batch, interval_spec_obj_bounds,
+        root_map_spec_obj_bounds,
+    };
+    use super::super::build_batches::{build_batch_entry_count, reset_build_batch_entry_count};
+    use super::super::single_objective::{
+        reset_root_spec_crown_entry_count, root_spec_crown_entry_count,
+    };
     use super::*;
     use crate::beta_crown::engine::BetaCrownVerifier;
     use crate::beta_crown::result::BabVerificationStatus;
@@ -972,6 +1345,56 @@ mod relational_bab_levers {
             node_bounds_override: None,
             inherited_alpha_state: None,
         }
+    }
+
+    #[test]
+    fn output_box_projection_rounds_outward_across_cancellation_threshold() {
+        // Exact row value: 100_000_000 + 5 - 100_000_000 = 5. Ordinary f32
+        // accumulation rounds the middle sum up by one ULP and returns 8,
+        // which would falsely clear the strict `lower > 5` stop predicate.
+        let output = BoundedTensor::new(
+            arr1(&[100_000_000.0_f32, 5.0, 100_000_000.0]).into_dyn(),
+            arr1(&[100_000_000.0_f32, 5.0, 100_000_000.0]).into_dyn(),
+        )
+        .expect("point output box");
+        let spec_matrix = arr2(&[[1.0_f32, 1.0, -1.0]]);
+
+        let mut naive_lower = 0.0_f32;
+        for (&coefficient, &value) in spec_matrix.row(0).iter().zip(output.lower().iter()) {
+            naive_lower += coefficient * value;
+        }
+        assert_eq!(naive_lower, 8.0, "fixture must exercise f32 cancellation");
+        assert!(multi_obj_domain_verified(
+            &[(naive_lower, naive_lower)],
+            &[5.0]
+        ));
+
+        let projected = interval_spec_obj_bounds(&output, &spec_matrix)
+            .expect("matching output/spec dimensions");
+        assert!(projected[0].0 <= 5.0 && projected[0].1 >= 5.0);
+        assert!(
+            !multi_obj_domain_verified(&projected, &[5.0]),
+            "outward lower endpoint must not cross the strict threshold: {projected:?}"
+        );
+    }
+
+    #[test]
+    fn root_map_projection_uses_implicit_output_and_missing_entry_fails_open() {
+        let mut graph = two_relu_2d_graph();
+        graph.set_output("");
+        let output = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[2.0_f32]).into_dyn())
+            .expect("valid output box");
+        let spec_matrix = arr2(&[[1.0_f32]]);
+        let root_map = HashMap::from([("out".to_string(), output)]);
+
+        let projected = root_map_spec_obj_bounds(&graph, &root_map, &spec_matrix)
+            .expect("empty output name must resolve to the last executable node");
+        assert!(projected[0].0 <= -1.0 && projected[0].1 >= 2.0);
+
+        assert!(
+            root_map_spec_obj_bounds(&graph, &HashMap::new(), &spec_matrix).is_none(),
+            "a missing effective-output entry must decline the shortcut"
+        );
     }
 
     /// Lever 1 parity: the shortcut path's obj bounds match the generic
@@ -1050,6 +1473,166 @@ mod relational_bab_levers {
             &easy,
             &clause_sizes
         ));
+    }
+
+    #[test]
+    fn root_map_clause_retest_exits_before_fresh_spec_crown_or_children() {
+        let graph = two_relu_2d_graph();
+        let input = band_input();
+        let objectives = vec![vec![1.0_f32], vec![-1.0]];
+        let thresholds = vec![-50.0_f32, -50.0];
+        let clause_sizes = vec![1usize, 1];
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            use_alpha_crown: false,
+            use_forward_bounds: true,
+            enable_relaxed_clip: false,
+            enable_pgd_attack: false,
+            beta_iterations: 0,
+            max_domains: 1,
+            timeout: Duration::from_secs(5),
+            ..BetaCrownConfig::default()
+        });
+
+        reset_build_batch_entry_count();
+        let result = verifier
+            .verify_graph_input_split_multi_clause_disjunctive(
+                &graph,
+                &input,
+                &objectives,
+                &thresholds,
+                &clause_sizes,
+                None,
+                None,
+            )
+            .expect("certified root-map retest should complete");
+
+        assert!(matches!(result.result, BabVerificationStatus::Verified));
+        assert_eq!(result.domains_explored, 1);
+        assert_eq!(result.domains_verified, 1);
+        assert_eq!(
+            build_batch_entry_count(),
+            0,
+            "a decisive collected output box must return before fresh spec-CROWN"
+        );
+    }
+
+    #[test]
+    fn single_root_map_retest_exits_before_fresh_spec_crown_or_children() {
+        let mut graph = two_relu_2d_graph();
+        // Exercise the graph-wide convention that an empty explicit output
+        // selects the final executable node.
+        graph.set_output("");
+        let input = band_input();
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            use_alpha_crown: false,
+            use_forward_bounds: true,
+            enable_relaxed_clip: false,
+            enable_pgd_attack: false,
+            beta_iterations: 0,
+            max_domains: 1,
+            timeout: Duration::from_secs(5),
+            ..BetaCrownConfig::default()
+        });
+
+        reset_root_spec_crown_entry_count();
+        let result = verifier
+            .verify_graph_input_split(&graph, &input, &[1.0_f32], -50.0)
+            .expect("certified root-map retest should complete");
+
+        assert!(matches!(result.result, BabVerificationStatus::Verified));
+        assert_eq!(result.domains_explored, 1);
+        assert_eq!(result.domains_verified, 1);
+        assert_eq!(
+            root_spec_crown_entry_count(),
+            0,
+            "a decisive collected output box must return before fresh spec-CROWN"
+        );
+    }
+
+    #[test]
+    fn conjunctive_root_map_retest_exits_before_fresh_spec_crown_or_children() {
+        let graph = two_relu_2d_graph();
+        let input = band_input();
+        let objectives = vec![vec![1.0_f32], vec![-1.0]];
+        let thresholds = vec![-50.0_f32, -50.0];
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            use_alpha_crown: false,
+            use_forward_bounds: true,
+            enable_relaxed_clip: false,
+            enable_pgd_attack: false,
+            beta_iterations: 0,
+            max_domains: 1,
+            timeout: Duration::from_secs(5),
+            ..BetaCrownConfig::default()
+        });
+
+        reset_build_batch_entry_count();
+        let result = verifier
+            .verify_graph_input_split_multi_objective_conjunctive(
+                &graph,
+                &input,
+                &objectives,
+                &thresholds,
+                None,
+                None,
+            )
+            .expect("certified root-map retest should complete");
+
+        assert!(matches!(result.result, BabVerificationStatus::Verified));
+        assert_eq!(result.domains_explored, 1);
+        assert_eq!(result.domains_verified, 1);
+        assert_eq!(
+            build_batch_entry_count(),
+            0,
+            "a decisive collected output box must return before fresh spec-CROWN"
+        );
+    }
+
+    #[test]
+    fn non_decisive_root_maps_retain_fresh_spec_crown_paths() {
+        let graph = two_relu_2d_graph();
+        let input = band_input();
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            use_alpha_crown: false,
+            use_forward_bounds: true,
+            enable_relaxed_clip: false,
+            enable_pgd_attack: false,
+            beta_iterations: 0,
+            max_domains: 0,
+            timeout: Duration::from_secs(5),
+            ..BetaCrownConfig::default()
+        });
+
+        reset_root_spec_crown_entry_count();
+        let _single_result = verifier
+            .verify_graph_input_split(&graph, &input, &[1.0_f32], 0.0)
+            .expect("non-decisive single-objective map must fail open");
+        assert_eq!(
+            root_spec_crown_entry_count(),
+            1,
+            "single-objective non-decision must retain fresh spec-CROWN"
+        );
+
+        reset_build_batch_entry_count();
+        let _multi_result = verifier
+            .verify_graph_input_split_multi_objective_conjunctive(
+                &graph,
+                &input,
+                &[vec![1.0_f32], vec![-1.0]],
+                &[0.0_f32, 0.0],
+                None,
+                None,
+            )
+            .expect("non-decisive conjunctive map must fail open");
+        assert_eq!(
+            build_batch_entry_count(),
+            1,
+            "conjunctive non-decision must retain fresh spec-CROWN"
+        );
     }
 
     /// Both levers end-to-end: the multi-clause lane still reaches the CORRECT

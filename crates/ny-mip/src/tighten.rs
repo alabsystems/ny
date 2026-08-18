@@ -62,6 +62,30 @@ pub(crate) struct NeuronTightenResult {
 }
 
 impl LpTightener {
+    fn deadline_expired(&self) -> bool {
+        self.config
+            .ay_hard_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    fn live_per_neuron_timeout_secs(&self) -> Option<f64> {
+        let nominal = if self.config.ay_hard_deadline.is_some() {
+            (self.config.timeout_secs / 10.0).clamp(0.001, 30.0)
+        } else {
+            (self.config.timeout_secs / 10.0).clamp(1.0, 30.0)
+        };
+        match self.config.ay_hard_deadline {
+            Some(deadline) => {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())?
+                    .as_secs_f64();
+                let live = nominal.min(remaining);
+                (live >= 0.001).then_some(live)
+            }
+            None => Some(nominal),
+        }
+    }
+
     /// Create a new LP tightener from network parameters.
     ///
     /// # Arguments
@@ -118,6 +142,9 @@ impl LpTightener {
                 expected_dim
             )));
         }
+        if self.deadline_expired() {
+            return Ok((current_bounds.to_vec(), 0));
+        }
 
         let max_per_layer = self.config.max_tighten_per_layer;
         let mut tightened = current_bounds.to_vec();
@@ -133,6 +160,9 @@ impl LpTightener {
             crate::config::MipBackend::AyProc => None,
             _ => {
                 let (problem, targets) = self.build_layer_lp(target_layer)?;
+                if self.deadline_expired() {
+                    return Ok((current_bounds.to_vec(), 0));
+                }
                 let model = crate::ay_lib::to_ay_model(&problem)?;
                 // Column order is preserved by the lowering, so the IR
                 // target columns map to ay-milp columns at the same index.
@@ -144,9 +174,14 @@ impl LpTightener {
                         })
                     })
                     .collect::<Result<_>>()?;
-                let per_neuron_timeout = (self.config.timeout_secs / 10.0).clamp(1.0, 30.0);
-                let opts = ay_milp::SolveOpts::new()
+                let Some(per_neuron_timeout) = self.live_per_neuron_timeout_secs() else {
+                    return Ok((current_bounds.to_vec(), 0));
+                };
+                let mut opts = ay_milp::SolveOpts::new()
                     .with_time_limit(std::time::Duration::from_secs_f64(per_neuron_timeout));
+                if let Some(deadline) = self.config.ay_hard_deadline {
+                    opts = opts.with_deadline(deadline);
+                }
                 let session = ay_milp::LpSession::new(&model, &opts)
                     .map_err(|e| MipError::Solver(e.to_string()))?;
                 Some((session, targets))
@@ -177,6 +212,9 @@ impl LpTightener {
         }
 
         for (i, bound) in current_bounds.iter().enumerate() {
+            if self.deadline_expired() {
+                break;
+            }
             // Skip stable neurons
             if bound.lower() >= 0.0 || bound.upper() <= 0.0 {
                 continue;
@@ -481,8 +519,12 @@ impl LpTightener {
         sense: ObjSense,
     ) -> Result<Option<f64>> {
         let (problem, target) = self.build_lp(layer_idx, neuron_idx)?;
-        // Use a per-neuron timeout, not the full verification timeout
-        let per_neuron_timeout = (self.config.timeout_secs / 10.0).clamp(1.0, 30.0);
+        // AyProc has no typed absolute-deadline surface, so recompute a live
+        // relative slice after model construction and poll again between
+        // neurons. The in-process path uses SolveOpts::with_deadline above.
+        let Some(per_neuron_timeout) = self.live_per_neuron_timeout_secs() else {
+            return Ok(None);
+        };
         let result = crate::ay::optimize_col(
             &problem,
             per_neuron_timeout,
@@ -667,12 +709,11 @@ pub struct RelaxationObbt {
 /// reach — and each committed bound persists in the session, so later chunks see
 /// the earlier ones' tightenings.
 ///
-/// DEADLINE-BOUNDED: `ay_milp::LpSession::obbt` has no mid-loop deadline check, so
-/// a single call over hundreds of columns can run for minutes. We instead build
-/// the session ONCE and drive `obbt` over `targets` in `chunk`-sized batches,
-/// checking `deadline` between batches and stopping when it passes. Whatever was
-/// tightened so far is read back from the (persistent) session model, so a
-/// deadline hit yields a valid partial result rather than blowing the slice.
+/// DEADLINE-BOUNDED: the absolute deadline is installed on the persistent
+/// session and also checked between `chunk`-sized OBBT batches. Whatever was
+/// tightened before expiry is read back from the session model, so a deadline
+/// hit yields a valid partial result rather than granting a fresh relative
+/// slice to every target.
 ///
 /// # Soundness
 /// The LP relaxation's feasible set CONTAINS the MILP's (relaxing integrality
@@ -701,7 +742,9 @@ pub fn obbt_relaxation_bounds(
             })
         })
         .collect::<Result<_>>()?;
-    let opts = ay_milp::SolveOpts::new().with_time_limit(per_solve_time_limit);
+    let opts = ay_milp::SolveOpts::new()
+        .with_time_limit(per_solve_time_limit)
+        .with_deadline(deadline);
     let mut session =
         ay_milp::LpSession::new(&model, &opts).map_err(|e| MipError::Solver(e.to_string()))?;
     let obbt_opts = ay_milp::ObbtOpts {

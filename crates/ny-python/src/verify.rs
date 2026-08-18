@@ -672,6 +672,14 @@ fn checked_verification_shape_product(
     })
 }
 
+fn checked_timeout_millis(timeout_secs: u64) -> ny_core::Result<u64> {
+    timeout_secs.checked_mul(1_000).ok_or_else(|| {
+        ny_core::NyError::InvalidSpec(format!(
+            "Verification timeout {timeout_secs} seconds overflows milliseconds"
+        ))
+    })
+}
+
 fn run_verification(
     onnx_model: ny_onnx::OnnxModel,
     prop_method: PropagationMethod,
@@ -762,12 +770,13 @@ fn run_verification(
     let spec_output_bounds = required_output_bounds.unwrap_or_else(|| {
         vec![RustBound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY); output_dim]
     });
+    let timeout_ms = checked_timeout_millis(timeout)?;
 
     // Create specification
     let spec = VerificationSpec::from_parts(
         vec![RustBound::new(-epsilon, epsilon); input_dim],
         spec_output_bounds,
-        Some(timeout * 1000),
+        Some(timeout_ms),
         Some(input_shape.clone()),
     )?;
 
@@ -904,7 +913,14 @@ fn run_verification(
                     }
                 }
             }
-            ny_propagate::BabVerificationStatus::PotentialViolation => {
+            // The witness payload added by `a7830d48b` is deliberately dropped
+            // here. It is a CANDIDATE, not a verdict: the binding has no
+            // downstream confirmer to re-run it through an exact forward, and
+            // `BabVerificationStatus::into_verification_result` maps both the
+            // payloadless and payload-carrying forms to the same Unknown. A
+            // binding that published the point as a counterexample would be
+            // claiming more than the status carries.
+            ny_propagate::BabVerificationStatus::PotentialViolation { witness: _ } => {
                 RustVerificationResult::Unknown {
                     provenance,
                     bounds: actual_output_bounds.unwrap_or_default(),
@@ -1065,7 +1081,7 @@ pub(crate) fn build_verify_result(
 /// Example with β-CROWN config:
 ///     >>> config = ny.BetaCrownConfig()
 ///     >>> config.branching = ny.BranchingHeuristic.Kfsb
-///     >>> config.enable_proactive_cuts = True
+///     >>> config.use_alpha_crown = True
 ///     >>> result = ny.verify("model.onnx", method="beta", beta_config=config,
 ///     ...                    output_bounds=[(0.0, float("inf"))] * 10)
 #[pyfunction]
@@ -1239,7 +1255,9 @@ pub fn verify_torch(
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_verification_shape_product, resolve_verification_shape};
+    use super::{
+        checked_timeout_millis, checked_verification_shape_product, resolve_verification_shape,
+    };
     use ny_core::NyError;
 
     #[test]
@@ -1272,6 +1290,19 @@ mod tests {
             matches!(err, NyError::InvalidSpec(ref message)
                 if message.contains("Verification input shape")
                     && message.contains("overflows usize")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_checked_timeout_millis_rejects_overflow() {
+        assert_eq!(checked_timeout_millis(60).expect("normal timeout"), 60_000);
+
+        let err = checked_timeout_millis(u64::MAX)
+            .expect_err("seconds-to-milliseconds overflow must be rejected");
+        assert!(
+            matches!(err, NyError::InvalidSpec(ref message)
+                if message.contains("timeout") && message.contains("overflows")),
             "unexpected error: {err}"
         );
     }

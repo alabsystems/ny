@@ -20,10 +20,22 @@ set -u
 
 # Locate the tool directory (repo root = parent of vnncomp_scripts/).
 TOOL_DIR=$(dirname "$(dirname "$(realpath "$0")")")
+RECEIPT_HELPER="${TOOL_DIR}/vnncomp_scripts/submission_binary_receipt.sh"
 
-# Resolve the ny binary: explicit NY_BIN, else release, else debug.
-if [ -n "${NY_BIN:-}" ] && [ -f "${NY_BIN}" ]; then
-    : # use provided NY_BIN
+# Resolve the ny binary. An explicit NY_BIN is an intentional developer
+# override and remains compatible with arbitrary mock/external executables; say
+# loudly that it bypasses repository freshness checks. Automatic release/debug
+# selection is different: it is the organizer/scoring path and must carry a
+# receipt matching the exact binary bytes and current NY source identity.
+explicit_ny_bin=0
+if [ -n "${NY_BIN:-}" ]; then
+    explicit_ny_bin=1
+    if [ ! -f "${NY_BIN}" ] || [ ! -x "${NY_BIN}" ]; then
+        [ -n "${5:-}" ] && echo "error" > "$5"
+        echo "Error: explicit NY_BIN is not a regular executable: ${NY_BIN}" >&2
+        exit 1
+    fi
+    echo "NOTE: using explicit NY_BIN override; automatic NY provenance receipt validation is bypassed: ${NY_BIN}" >&2
 elif [ -f "${TOOL_DIR}/target/release/ny" ]; then
     NY_BIN="${TOOL_DIR}/target/release/ny"
 elif [ -f "${TOOL_DIR}/target/debug/ny" ]; then
@@ -33,6 +45,21 @@ else
     [ -n "${5:-}" ] && echo "error" > "$5"
     echo "Error: ny binary not found. Run './vnncomp_scripts/build_submission_binary.sh' first." >&2
     exit 1
+fi
+
+if [ "${explicit_ny_bin}" = "0" ]; then
+    if [ -L "${RECEIPT_HELPER}" ] || [ ! -f "${RECEIPT_HELPER}" ]; then
+        [ -n "${5:-}" ] && echo "error" > "$5"
+        echo "Error: NY receipt validator is missing: ${RECEIPT_HELPER}" >&2
+        exit 1
+    fi
+    if ! bash "${RECEIPT_HELPER}" validate "${NY_BIN}" "${TOOL_DIR}" >&2; then
+        [ -n "${5:-}" ] && echo "error" > "$5"
+        echo "Error: refusing stale or unproven automatic NY binary ${NY_BIN}." >&2
+        echo "  Rebuild with './vnncomp_scripts/build_submission_binary.sh'." >&2
+        echo "  Developers may set NY_BIN explicitly to opt out for a controlled A/B." >&2
+        exit 1
+    fi
 fi
 
 # OS-level wall-clock backstop = scored budget + 10s. Only fires if ny's own internal
@@ -53,16 +80,12 @@ WALL_TIMEOUT=$(( ${WALL_BUDGET:-0} + 10 ))
 # doesn't fight rayon's pool. Rayon itself uses all cores (correctness, not repro).
 export OMP_NUM_THREADS=1
 
-# Margin-row throughput knobs for the scored path (#margin-row-scored-throughput).
-# Both are PROVEN BIT-IDENTICAL to their serial oracle — they change only kernel
-# thread-ownership / BaB frontier exploration order, never a per-domain bound or
-# verdict (tests: conv_backward_grains_bit_identical_to_ic_grain,
-# parallel_domain_bound_bit_identical_to_serial, parallel_frontier_matches_serial_and_moat_holds).
-# So they carry ZERO false-verdict risk (worst case: wasted work) and can only turn
-# a budget-edge timeout into its already-certified UNSAT. A throughput hedge for
-# slower competition hardware (measured a no-op on the fast dev box). Unset to revert.
-export NY_MARGIN_ROW_CONV_BWD_BLOCKED=1
-export NY_MARGIN_ROW_PARALLEL=1
+# NY_MARGIN_ROW_CONV_BWD_BLOCKED / NY_MARGIN_ROW_PARALLEL are deliberately NOT
+# exported: 1 has been the compiled default since 7b004fba (parallel frontier,
+# 07-18) and 2eaa6b13 (cache-blocked backward conv, 07-19), so exporting =1 was
+# a bit-exact no-op (MEASURED: margin_row/tests.rs asserts unset == "1" for both
+# blocked_backward_enabled_from_env and margin_row_frontier_from_env). The =0
+# serial kill switches in ny-propagate still work for developer A/Bs.
 
 # safenlp razor-thin SAT lane (#safenlp-upfront-attack, measured 2026-07-20):
 # force the upfront gradient falsification lane for safenlp only. Its 8 razor-thin
@@ -72,7 +95,9 @@ export NY_MARGIN_ROW_PARALLEL=1
 # scoped: globally forcing the lane would tax every benchmark's budget. Attack-
 # only (every witness passes the unchanged trusted-ORT gate) => moat-safe.
 case "${2:-}" in
-    safenlp_2024) export NY_UPFRONT_ATTACK=1 ;;
+    safenlp_2024)
+        export NY_UPFRONT_ATTACK=1
+        ;;
 esac
 
 # GPU capability hint (#vnncomp-gpu-available-lost): prepare_instance.sh only

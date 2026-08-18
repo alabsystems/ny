@@ -749,31 +749,35 @@ fn dyadic_step_toward_vertex(
 
 #[inline]
 fn next_up_f64(value: f64) -> f64 {
-    if !value.is_finite() {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    if value > 0.0 {
-        f64::from_bits(value.to_bits() + 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits + 1)
     } else {
-        f64::from_bits(value.to_bits() - 1)
+        f64::from_bits(bits - 1)
     }
 }
 
 #[inline]
 fn next_down_f64(value: f64) -> f64 {
-    if !value.is_finite() {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return -f64::from_bits(1);
     }
-    if value > 0.0 {
-        f64::from_bits(value.to_bits() - 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits - 1)
     } else {
-        f64::from_bits(value.to_bits() + 1)
+        f64::from_bits(bits + 1)
     }
 }
 
@@ -864,7 +868,7 @@ mod tests {
     }
 
     fn rational_f32(value: f32) -> BigRational {
-        BigRational::from_float(f64::from(value)).expect("finite f32")
+        BigRational::from_float(value).expect("finite f32")
     }
 
     fn rational_weight(numerator: u32, denominator: u32) -> BigRational {

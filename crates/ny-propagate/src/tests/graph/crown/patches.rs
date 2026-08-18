@@ -282,9 +282,12 @@ fn test_graph_crown_conv2d_residual_no_utils_densification_4382() {
     // The merge point (Add node) should NOT force densification in utils.rs.
     // Before #4382, accumulate_crown_bounds_to_input called into_dense() on the
     // second contribution, which would record utils.rs as a call site.
+    // Normalize separators: `file!()` records `graph_crown\utils.rs` on Windows,
+    // so a POSIX-only match filtered to EMPTY there and this `is_empty()`
+    // assertion passed vacuously — green on the very regression it guards.
     let utils_densifications: Vec<&String> = sites
         .iter()
-        .filter(|s| s.contains("graph_crown/utils.rs"))
+        .filter(|s| s.replace('\\', "/").contains("graph_crown/utils.rs"))
         .collect();
     assert!(
         utils_densifications.is_empty(),
@@ -428,9 +431,10 @@ fn test_graph_crown_conv2d_residual_sub_soundness_4382() {
     assert_eq!(crown_result.provenance, BoundsProvenance::Crown);
     assert_eq!(crown_result.bounds.shape(), &[1, 4, 4]);
 
+    // Separator-normalized for the same reason as above (vacuous on Windows).
     let utils_sites: Vec<&String> = sites
         .iter()
-        .filter(|s| s.contains("graph_crown/utils.rs"))
+        .filter(|s| s.replace('\\', "/").contains("graph_crown/utils.rs"))
         .collect();
     assert!(
         utils_sites.is_empty(),

@@ -681,6 +681,7 @@ fn test_try_finish_target_gpu_suffix_with_pending_input_skips_when_other_nodes_r
         &node_lb,
         &plan,
         Some(&engine),
+        None,
         &target_contract,
         &mut node_crown_bounds,
     )
@@ -700,6 +701,62 @@ fn test_try_finish_target_gpu_suffix_with_pending_input_skips_when_other_nodes_r
             && node_crown_bounds.contains_key("sibling_pending"),
         "#4023 regression: fallback guard must preserve all pending contributions"
     );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_gpu_suffix_declines_before_host_seed_copy_and_preserves_pending_input() {
+    let (graph, input) = build_alpha_skip_merge_graph();
+    let ibp_bounds = graph.collect_node_bounds(&input).unwrap();
+    let alpha_state = init_relu_alpha_state(
+        &graph,
+        &input,
+        &ibp_bounds,
+        "relu1",
+        "finite GPU suffix host-seed gate",
+    );
+    let target_contract = GraphTargetShapeContract::from_bounds(
+        "merge",
+        ibp_bounds.get("merge").expect("merge bounds should exist"),
+    );
+    let mut node_crown_bounds = CrownMergeAccumulator::new();
+    node_crown_bounds.insert(
+        NETWORK_INPUT.to_string(),
+        CrownBounds::Dense(LinearBounds::identity(input.len())),
+    );
+    let node_lb = LinearBounds::identity(input.len());
+    let engine = SeededSuffixScriptedEngine::new(
+        vec![0.0; input.len()],
+        vec![0.0; input.len()],
+        input.len(),
+        input.len(),
+        input.lower().iter().copied().collect(),
+        input.upper().iter().copied().collect(),
+    );
+    let plan = GpuSuffixPlan::build(
+        &graph.ancestors("merge").expect("ancestors should succeed"),
+        &graph,
+        &input,
+        &HashMap::new(),
+        &ibp_bounds,
+        Some(&alpha_state),
+    );
+
+    let result = try_finish_target_gpu_suffix_with_pending_input(
+        &input,
+        "linear2",
+        &node_lb,
+        &plan,
+        Some(&engine),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+        &target_contract,
+        &mut node_crown_bounds,
+    )
+    .expect("live finite authority should select the cooperative CPU path");
+
+    assert!(result.is_none());
+    assert_eq!(engine.seeded_calls(), 0);
+    assert!(node_crown_bounds.contains_key(NETWORK_INPUT));
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +967,7 @@ fn test_take_only_gpu_layer_rejects_empty_and_multi_layer_vectors_4411() {
         bias: None,
         out_features: 1,
         in_features: 1,
+        cert_err: Default::default(),
     };
     assert!(
         take_only_gpu_layer(Vec::new()).is_none(),

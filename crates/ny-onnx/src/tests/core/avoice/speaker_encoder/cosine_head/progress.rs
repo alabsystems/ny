@@ -16,8 +16,9 @@ use std::time::Instant;
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_speaker_cosine_component_incremental_node_bounds_match_full_ibp_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let (dot_graph, norm_sq_graph, _reference_embedding) = build_speaker_cosine_component_graphs();
     let model = avoice_speaker_encoder();
     let input = bounded_speaker_encoder_cosine_input(
@@ -118,8 +119,9 @@ fn run_speaker_cosine_distance_crown_bounds(
 /// pretending the `< 0.1` acceptance target is already proven.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_crown_avoice_speaker_cosine_distance_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let t_start = Instant::now();
     let (dot_graph, norm_sq_graph, _reference_embedding) = build_speaker_cosine_component_graphs();
     let model = avoice_speaker_encoder();

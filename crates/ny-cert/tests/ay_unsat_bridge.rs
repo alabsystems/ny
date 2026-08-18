@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "external-ay")]
+
 //! End-to-end (dark/experimental): drive a live `ay` UNSAT, then re-establish
 //! its `la_generic` arithmetic leaf under ny-cert's kernel-checked Farkas
 //! obligation (`farkas_premise_combination`).
@@ -12,44 +14,20 @@
 //! whole-subdomain verdict (the `MipCert.pattern_tree_cover` case-split cover)
 //! is the documented remaining piece — see `docs/AY_UNSAT_NY_CERT_LOOP.md`.
 //!
-//! Skips honestly (with a stderr note) when no `ay` binary is reachable
-//! (`$NY_AY` or `ay` on `PATH`), so the suite stays green without the solver.
+//! This live-tool contract is an explicit `external-ay` conformance lane. When
+//! selected, it requires the exact `ay` revision pinned by `ny-mip`; absence,
+//! revision drift, and unsupported proof publication all fail the test.
 
 use ny_cert::alethe_bridge::bridge_la_generic;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct AyBinary {
-    path: PathBuf,
-    explicitly_selected: bool,
-}
-
-/// Locate `ay`: `$NY_AY`, then `ay` on `PATH`. Returns `None` (skip) otherwise.
-fn locate_ay() -> Option<AyBinary> {
-    if let Ok(p) = std::env::var("NY_AY") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(AyBinary {
-                path: p,
-                explicitly_selected: true,
-            });
-        }
-    }
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg("command -v ay")
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(AyBinary {
-                path: PathBuf::from(path),
-                explicitly_selected: false,
-            });
-        }
-    }
-    None
+/// Select `$NY_AY` when explicitly set; otherwise let `Command` resolve `ay`
+/// on `PATH`. Validation remains the responsibility of `require_pinned_ay`.
+fn selected_ay() -> PathBuf {
+    std::env::var_os("NY_AY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ay"))
 }
 
 fn pinned_ay_revision() -> &'static str {
@@ -78,6 +56,20 @@ fn ay_build_commit(ay: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn require_pinned_ay() -> PathBuf {
+    let ay = selected_ay();
+    let expected = pinned_ay_revision();
+    let actual = ay_build_commit(&ay);
+    assert_eq!(
+        actual.as_deref(),
+        Some(expected),
+        "live ay-unsat bridge requires pinned AY revision {expected} at {}; \
+         set NY_AY to the pinned executable (got {actual:?})",
+        ay.display()
+    );
+    ay
+}
+
 /// Original-assertion-only QF_LRA contradiction. Keeping the arithmetic leaf
 /// free of Boolean preprocessing is intentional: AY must not publish a proof
 /// whose reachable assumptions depend on preprocessing-derived terms.
@@ -90,34 +82,15 @@ const QF_LRA_UNSAT_SMT2: &str = r#"(set-logic QF_LRA)
 "#;
 
 #[test]
+#[cfg(feature = "external-ay")]
 fn live_ay_unsat_la_generic_bridges_to_ny_cert_farkas() {
-    let ay = match locate_ay() {
-        Some(p) => p,
-        None => {
-            eprintln!("skipping ay-unsat bridge test: no `ay` solver (set NY_AY or PATH)");
-            return;
-        }
-    };
-    let expected_revision = pinned_ay_revision();
-    let actual_revision = ay_build_commit(&ay.path);
-    if actual_revision.as_deref() != Some(expected_revision) {
-        assert!(
-            !ay.explicitly_selected,
-            "NY_AY must name the pinned AY revision {expected_revision}, got {actual_revision:?}"
-        );
-        eprintln!(
-            "skipping ay-unsat bridge test: PATH ay is not pinned AY {expected_revision} (got {actual_revision:?})"
-        );
-        return;
-    }
-
-    let dir = std::env::temp_dir().join(format!("ny-ay-bridge-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let smt = dir.join("qf_lra_unsat.smt2");
-    let alethe = dir.join("qf_lra_unsat.alethe");
+    let ay = require_pinned_ay();
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let smt = dir.path().join("qf_lra_unsat.smt2");
+    let alethe = dir.path().join("qf_lra_unsat.alethe");
     std::fs::write(&smt, QF_LRA_UNSAT_SMT2).expect("write query");
 
-    let out = Command::new(&ay.path)
+    let out = Command::new(&ay)
         .arg("solve")
         .arg("--proof")
         .arg(&alethe)
@@ -126,15 +99,6 @@ fn live_ay_unsat_la_generic_bridges_to_ny_cert_farkas() {
         .expect("run ay");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success()
-        && stderr.contains("atomic no-replace artifact publication is unsupported on this platform")
-    {
-        eprintln!(
-            "skipping ay-unsat bridge test: pinned AY cannot securely publish proof artifacts on this platform"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        return;
-    }
     assert!(
         out.status.success() && stdout.lines().any(|l| l.trim() == "unsat"),
         "ay did not publish UNSAT (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
@@ -149,6 +113,4 @@ fn live_ay_unsat_la_generic_bridges_to_ny_cert_farkas() {
         !witness.is_positive(),
         "Farkas contradiction constant must be ≤ 0, got {witness:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

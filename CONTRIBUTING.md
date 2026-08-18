@@ -10,7 +10,14 @@ cargo build --release -p ny-cli    # → target/release/ny
 
 ```bash
 cargo test
-make test-python    # Python bindings
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+make PYTHON="$VIRTUAL_ENV/bin/python" test-python-tooling
+
+# Optional Python bindings lane:
+python -m pip install maturin
+make PYTHON="$VIRTUAL_ENV/bin/python" test-python
 ```
 
 ## Lint

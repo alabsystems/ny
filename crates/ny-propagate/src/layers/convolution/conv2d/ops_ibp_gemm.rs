@@ -14,7 +14,7 @@ pub(crate) fn propagate_ibp_via_gemm(
     input: &BoundedTensor,
     engine: &dyn GemmEngine,
 ) -> Result<BoundedTensor> {
-    let in_c = layer.in_channels();
+    let (in_c, out_c) = layer.validate_geometry()?;
     let (batch, input_h, input_w, squeeze_batch) = match input.lower().ndim() {
         3 => {
             if input.lower().shape()[0] != in_c {
@@ -47,7 +47,6 @@ pub(crate) fn propagate_ibp_via_gemm(
         }
     };
 
-    let out_c = layer.out_channels();
     let (out_h, out_w) = layer.output_size(input_h, input_w)?;
     let kernel_pos = layer.kernel.mapv(nan_propagating_max_zero);
     let kernel_neg = layer.kernel.mapv(nan_propagating_min_zero);

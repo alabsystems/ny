@@ -386,16 +386,7 @@ pub(crate) fn compute_warm_start_crown_bounds_with_refined_alpha(
     crown_backward_layers: Option<usize>,
     config: &crate::beta_crown::config::BetaCrownConfig,
 ) -> Result<(BoundedTensor, Option<LinearBounds>, GraphAlphaState)> {
-    // Per-domain α-CROWN config: inherit the BaB α settings, then override the
-    // three knobs that make this a *lightweight* per-sub-domain refinement.
-    let mut alpha_config: crate::AlphaCrownConfig = config.alpha_config.clone();
-    alpha_config.iterations = config.input_split_alpha_iteration;
-    alpha_config.learning_rate = config.input_split_lr_alpha;
-    // Skip the O(N²) post-optimization intermediate CROWN pass: the warm-start
-    // path returns the (sound) IBP intermediate bounds directly. Matches the
-    // reference `fix_interm_bounds=True` for input-split refinement.
-    alpha_config.fix_interm_bounds = true;
-    alpha_config.deadline = deadline;
+    let alpha_config = warm_start_alpha_config(config, deadline);
 
     // Step 1: warm-start + re-optimize alphas for this sub-domain's tighter box.
     let (refined_node_bounds, refined_alpha) = graph
@@ -425,6 +416,28 @@ pub(crate) fn compute_warm_start_crown_bounds_with_refined_alpha(
     )?;
 
     Ok((bounds, linear, refined_alpha))
+}
+
+/// Derive the deliberately lightweight child-domain alpha configuration.
+///
+/// Keeping this as one pure helper makes the root/child routing boundary
+/// executable in tests: a root may opt into the cGAN target-complete collector,
+/// but no inherited runtime flag may make a BaB child pay that root-only cost.
+fn warm_start_alpha_config(
+    config: &crate::beta_crown::config::BetaCrownConfig,
+    deadline: Option<Instant>,
+) -> crate::AlphaCrownConfig {
+    let mut alpha_config = config.alpha_config.clone();
+    alpha_config.iterations = config.input_split_alpha_iteration;
+    alpha_config.learning_rate = config.input_split_lr_alpha;
+    // Skip the O(N²) post-optimization intermediate CROWN pass: the warm-start
+    // path returns the (sound) IBP intermediate bounds directly. Matches the
+    // reference `fix_interm_bounds=True` for input-split refinement.
+    alpha_config.fix_interm_bounds = true;
+    alpha_config.cgan_sparse_target_complete_root = false;
+    alpha_config.cgan_complete_crown_ibp_root = false;
+    alpha_config.deadline = deadline;
+    alpha_config
 }
 
 /// Compute CROWN/IBP bounds for a single-objective batch.
@@ -482,21 +495,34 @@ pub(crate) fn compute_crown_or_ibp_bounds_batched(
 }
 
 /// Conjunctive domain check: verified if ANY objective has `lower > threshold`.
-/// Non-finite bounds are never verified. Part of #3646.
+/// The proof-relevant lower endpoint and threshold must be finite, while a
+/// `+inf` upper endpoint remains a valid one-sided enclosure. NaN and inverted
+/// intervals never acquire proof authority. Part of #3646.
 pub(super) fn multi_obj_domain_verified(obj_bounds: &[(f32, f32)], thresholds: &[f32]) -> bool {
+    if obj_bounds.is_empty() || obj_bounds.len() != thresholds.len() {
+        return false;
+    }
     obj_bounds
         .iter()
         .zip(thresholds.iter())
-        .any(|((l, _u), &t)| l.is_finite() && *l > t)
+        .any(|(&(lower, upper), &threshold)| {
+            super::grouped_semantics::objective_interval_verified(lower, upper, threshold)
+        })
 }
 
 /// Conjunctive domain priority: use the closest-to-verified objective.
 /// NaN bounds yield NEG_INFINITY priority. Part of #3646.
 pub(super) fn multi_obj_domain_priority(obj_bounds: &[(f32, f32)], thresholds: &[f32]) -> f32 {
+    if obj_bounds.is_empty() || obj_bounds.len() != thresholds.len() {
+        return f32::NEG_INFINITY;
+    }
     obj_bounds
         .iter()
         .zip(thresholds.iter())
-        .map(|((l, _u), &t)| {
+        .map(|(&(l, u), &t)| {
+            if !l.is_finite() || !u.is_finite() || !t.is_finite() || l > u {
+                return f32::NEG_INFINITY;
+            }
             let gap = l - t;
             if gap.is_finite() {
                 gap
@@ -509,8 +535,9 @@ pub(super) fn multi_obj_domain_priority(obj_bounds: &[(f32, f32)], thresholds: &
 
 /// Extract per-objective bounds from a multi-row BoundedTensor.
 ///
-/// Returns an error if `num_specs` exceeds the number of elements in the
-/// bounds tensor, preventing silent fallback to conservative (-INF, +INF).
+/// Returns an error unless the tensor contains exactly one scalar interval per
+/// objective row. Exact layout prevents trailing or non-contiguous storage
+/// from being silently ignored by verdict code.
 pub(crate) fn extract_obj_bounds(
     bounds: &BoundedTensor,
     num_specs: usize,
@@ -519,17 +546,29 @@ pub(crate) fn extract_obj_bounds(
     let upper = bounds.upper();
     let n_lower = lower.len();
     let n_upper = upper.len();
-    if num_specs > n_lower || num_specs > n_upper {
+    if num_specs == 0 || num_specs != n_lower || num_specs != n_upper {
         return Err(NyError::ShapeMismatch {
             expected: vec![num_specs],
-            got: vec![n_lower.min(n_upper)],
+            got: vec![n_lower.max(n_upper)],
         });
     }
-    let lower_flat = lower.as_slice().unwrap_or(&[]);
-    let upper_flat = upper.as_slice().unwrap_or(&[]);
-    Ok((0..num_specs)
-        .map(|i| (lower_flat[i], upper_flat[i]))
-        .collect())
+    let lower_flat = lower.as_slice().ok_or_else(|| {
+        NyError::InvalidSpec("objective lower bounds must be contiguous".to_string())
+    })?;
+    let upper_flat = upper.as_slice().ok_or_else(|| {
+        NyError::InvalidSpec("objective upper bounds must be contiguous".to_string())
+    })?;
+    let mut extracted = Vec::with_capacity(num_specs);
+    for i in 0..num_specs {
+        let (lower, upper) = (lower_flat[i], upper_flat[i]);
+        if !lower.is_finite() || !upper.is_finite() || lower > upper {
+            return Err(NyError::NumericalInstability(format!(
+                "objective row {i} is malformed: lower={lower}, upper={upper}"
+            )));
+        }
+        extracted.push((lower, upper));
+    }
+    Ok(extracted)
 }
 
 /// Build a child BoundedTensor from flat lower/upper arrays reshaped to `shape`.

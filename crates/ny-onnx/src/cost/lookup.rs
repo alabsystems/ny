@@ -158,7 +158,7 @@ impl<'a> ShapeLookup<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "external-avoice"))]
 pub(super) fn layer_supports_missing_output_shape_fallback(layer: &LayerSpec) -> bool {
     missing_output_shape_strategy(layer).is_some()
 }
@@ -204,6 +204,7 @@ fn missing_output_shape_strategy(layer: &LayerSpec) -> Option<MissingOutputShape
         | LayerType::Cos
         | LayerType::Tan
         | LayerType::Arctan
+        | LayerType::Erf
         | LayerType::RoPE
         | LayerType::LayerNorm
         | LayerType::RMSNorm

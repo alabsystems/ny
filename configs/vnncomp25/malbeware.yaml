@@ -27,6 +27,7 @@ general:
 
 attack:
   pgd_order: after
+  ny_pgd_order_compat: upfront
   pgd_restarts: 1000
 
 bab:

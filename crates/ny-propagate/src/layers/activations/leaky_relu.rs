@@ -23,7 +23,7 @@ pub struct LeakyReLULayer {
 }
 
 #[inline]
-fn leaky_relu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
+pub(super) fn leaky_relu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
     if l.is_nan() || u.is_nan() || !alpha.is_finite() {
         return LinearRelaxation::nan_fallback();
     }

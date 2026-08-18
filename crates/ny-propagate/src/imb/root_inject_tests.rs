@@ -2,41 +2,60 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::{AyTailAffineReachabilityEnvelope, AyTailSharedInputReachabilityEnvelope};
+use super::super::{
+    AyTailAffineReachabilityEnvelope, AyTailRegionReluBounds, AyTailRegionSelectorEnvelope,
+    AyTailRootAnchor, AyTailSharedInputReachabilityEnvelope,
+};
 use super::{
-    anchor_cache_key, authoritative_candidate_lower, batched_replay_gate, bounded_tail_pq_samples,
-    certify_ay_region_affine_reachability_partition_with, certify_ay_region_global_composition,
-    certify_ay_region_partition_with, certify_ay_region_reachability_partition_with,
+    anchor_cache_key, authoritative_candidate_lower, ay_region_selector_envelope_from_frontiers,
+    batched_replay_gate, bounded_tail_pq_samples, build_replay_phase_census,
+    certified_regional_relu_bounds, certify_ay_region_affine_reachability_partition_with,
+    certify_ay_region_global_composition, certify_ay_region_partition_with,
+    certify_ay_region_reachability_partition_with, certify_ay_region_selector_root_with,
     certify_ay_shared_input_root_with, certify_ay_tail_prefix_composition,
     certify_candidates_with_batched_replay, checked_ay_prefix_frontier_bytes,
     checked_budget_deadline, checked_duration_from_secs, checked_imb_region_box_plan,
-    checked_shared_input_bank_deadline, checked_shared_input_proof_deadline,
-    directed_f64_lower_to_f32, evaluate_batched_replay_if_admitted, evaluate_before_deadline,
+    checked_region_selector_proof_deadline, checked_shared_input_bank_deadline,
+    checked_shared_input_proof_deadline, concretize_region_anchors, directed_f64_lower_to_f32,
+    evaluate_batched_replay_if_admitted, evaluate_before_deadline,
     evaluate_original_objective_leaf, exact_replay_box_key, farthest_support_index,
     independently_recheck_original_objective, independently_recheck_original_objectives_batched,
     index_exact_replay_leaves, k2_support_directions, maybe_run_replay_only_diagnostic,
-    minimum_q_for_strict_composition, prefix_anchor_memo_allowed, region_boxes,
-    replay_only_leaf_request, replay_only_objective, shared_support_bases,
-    signed_replay_objective_plan, signed_replay_project_lower, split_box,
-    standard_no_imb_objective_lower, tail_pq_self_check,
+    minimum_q_for_strict_composition, prefix_anchor_memo_allowed,
+    preflight_replay_phase_census_collection, preflight_selector_k4_grid,
+    rank_replay_phase_candidates, region_boxes, registered_replay_or_cpu_fallback,
+    replay_only_leaf_request, replay_only_objective, replay_phase_deadline_truncated_marker,
+    restore_tail_anchor_source_shape, selector_input_lift_kind,
+    selector_k2_lift_enabled_for_objective, selector_k4_lift_enabled_for_objective,
+    shared_input_envelope_crown_error, shared_root_envelope_from_session_cache,
+    shared_support_bases, shared_support_basis_diagnosed, signed_replay_objective_plan,
+    signed_replay_project_lower, split_box, standard_no_imb_objective_lower, tail_pq_self_check,
     validate_batched_replay_structure_if_admitted, validate_binary_partition_cover,
+    validate_cached_shared_root_envelope_context, visit_replay_phase_entries_until_deadline,
     BatchedReplayPrevalidationShape, BatchedReplayResourceShape, ExactPrefixSession,
-    FullObjectiveCertificate, ImbCandidate, RegionProposal, ReplayF64Attempt, ReplayLeafRoute,
-    ReplayStageTimings, SignedReplayProjection, MAX_AY_REGION_TOTAL_LEAVES,
-    MAX_BATCHED_FULL_RECHECK_MEMBERSHIPS, MAX_BATCHED_REPLAY_ESTIMATED_BYTES,
-    MAX_FULL_RECHECK_LEAVES, REPLAY_ONLY_EVALUATIONS, SHARED_INPUT_AY_PROOF_CAP,
-    SHARED_INPUT_BANK_BUILD_CAP,
+    FullObjectiveCertificate, ImbCandidate, RegionProposal, RegisteredFastF32ReplayEngine,
+    RegisteredReplayAttempt, ReplayAuthorityEngineRoute, ReplayF64Attempt, ReplayLeafRoute,
+    ReplayPhaseCandidate, ReplayPhaseCensusCollectionLimits, ReplayPhaseEmissionOutcome,
+    ReplayStageTimings, SelectorInputLiftKind, SharedInputEnvelopeDeadlineStage,
+    SharedInputEnvelopeDecline, SharedSupportBasisDecline, SignedReplayProjection, TailAnchorCoeff,
+    MAX_AY_REGION_TOTAL_LEAVES, MAX_BATCHED_FULL_RECHECK_MEMBERSHIPS,
+    MAX_BATCHED_REPLAY_ESTIMATED_BYTES, MAX_FULL_RECHECK_LEAVES,
+    MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES, REGION_SELECTOR_AY_PROOF_CAP, REPLAY_ONLY_EVALUATIONS,
+    SHARED_INPUT_AY_PROOF_CAP, SHARED_INPUT_BANK_BUILD_CAP, SHARED_INPUT_EVIDENCE_REGION_COUNT,
 };
 use crate::beta_crown::engine::graph::input_split::grouped_semantics::disjunctive_domain_verified;
 use crate::layers::{ConvTranspose2dLayer, Layer, LinearLayer, ReLULayer};
 use crate::{GraphNetwork, GraphNode, LinearBounds};
 use ndarray::{arr1, arr2, array, Array1, Array2, ArrayD, IxDyn};
+use num_rational::BigRational;
+use ny_core::GemmEngine;
 use ny_tensor::{BoundedTensor, L2Constraint};
+use ny_test_utils::CountingGemmEngine;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 fn box1(lower: f32, upper: f32) -> BoundedTensor {
@@ -178,6 +197,30 @@ fn region_proposal(
     }
 }
 
+fn shared_input_evidence_regions() -> Vec<BoundedTensor> {
+    let count = SHARED_INPUT_EVIDENCE_REGION_COUNT as f32;
+    (0..SHARED_INPUT_EVIDENCE_REGION_COUNT)
+        .map(|idx| box1(idx as f32 / count, (idx + 1) as f32 / count))
+        .collect()
+}
+
+fn exact_one_leaf_region_proposals<F>(
+    regions: &[BoundedTensor],
+    mut fields: F,
+) -> Vec<RegionProposal>
+where
+    F: FnMut(usize) -> (f32, f32),
+{
+    regions
+        .iter()
+        .enumerate()
+        .map(|(idx, region)| {
+            let (p, prefix_floor) = fields(idx);
+            region_proposal(p, prefix_floor, vec![region.clone()])
+        })
+        .collect()
+}
+
 fn region_proposal_vec(p: Vec<f32>) -> RegionProposal {
     RegionProposal {
         floor: 0.0,
@@ -228,6 +271,311 @@ fn shared_root_envelope(
     .expect("valid root-wide K4 bank")
 }
 
+fn selector_region_fixture() -> (
+    BoundedTensor,
+    Vec<BoundedTensor>,
+    Vec<RegionProposal>,
+    BoundedTensor,
+) {
+    let root = box1(0.0, 1.0);
+    let regions: Vec<_> = (0..16)
+        .map(|region_idx| box1(region_idx as f32 / 16.0, (region_idx + 1) as f32 / 16.0))
+        .collect();
+    let proposals = regions
+        .iter()
+        .enumerate()
+        .map(|(region_idx, region)| RegionProposal {
+            floor: 1.0,
+            sampled_slack: 0.0,
+            p: vec![1.0 + region_idx as f32 / 16.0, -0.5],
+            prefix_floor: 1.0 + region_idx as f32 / 32.0,
+            terminal_boxes: vec![region.clone()],
+        })
+        .collect();
+    (root, regions, proposals, box2([-2.0, -3.0], [4.0, 5.0]))
+}
+
+fn selector_test_envelope(
+    root: &BoundedTensor,
+    regions: &[BoundedTensor],
+    proposals: &[RegionProposal],
+    seam: &BoundedTensor,
+) -> AyTailRegionSelectorEnvelope {
+    let anchors = selector_root_tail_anchors();
+    let regional_relu_bounds = selector_regional_relu_bounds();
+    ay_region_selector_envelope_from_frontiers(
+        "seam",
+        root,
+        regions,
+        seam,
+        &anchors,
+        &regional_relu_bounds,
+        proposals,
+        future_deadline(),
+    )
+    .expect("valid exact 16-region selector envelope")
+}
+
+fn selector_root_tail_anchors() -> Vec<AyTailRootAnchor> {
+    vec![
+        AyTailRootAnchor::from_certified_root_box("pre_1".to_string(), box1(-0.75, 0.5))
+            .expect("valid first selector root anchor"),
+        AyTailRootAnchor::from_certified_root_box("pre_2".to_string(), box1(-0.5, 0.75))
+            .expect("valid second selector root anchor"),
+    ]
+}
+
+fn selector_regional_relu_bounds() -> Vec<AyTailRegionReluBounds> {
+    vec![
+        AyTailRegionReluBounds::from_certified_region_box(0, "pre_1".to_string(), box1(-0.5, 0.25))
+            .expect("valid region-zero first ReLU box"),
+        AyTailRegionReluBounds::from_certified_region_box(0, "pre_2".to_string(), box1(-0.25, 0.5))
+            .expect("valid region-zero second ReLU box"),
+        AyTailRegionReluBounds::from_certified_region_box(
+            1,
+            "pre_1".to_string(),
+            box1(-0.375, 0.375),
+        )
+        .expect("valid region-one first ReLU box"),
+        AyTailRegionReluBounds::from_certified_region_box(
+            1,
+            "pre_2".to_string(),
+            box1(-0.375, 0.625),
+        )
+        .expect("valid region-one second ReLU box"),
+    ]
+}
+
+#[test]
+fn identity_spec_tail_anchor_restores_spatial_source_shape() {
+    let flat = BoundedTensor::new(
+        array![-4.0, -3.0, -2.0, -1.0].into_dyn(),
+        array![1.0, 2.0, 3.0, 4.0].into_dyn(),
+    )
+    .expect("valid flat identity-spec bounds");
+    let spatial = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 2]), vec![-5.0; 4]).expect("valid spatial lower"),
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 2]), vec![5.0; 4]).expect("valid spatial upper"),
+    )
+    .expect("valid spatial source bounds");
+
+    let restored = restore_tail_anchor_source_shape("pre", flat.clone(), 4, &spatial)
+        .expect("equal element counts restore the source shape");
+    assert_eq!(restored.shape(), &[1, 2, 2]);
+    assert_eq!(
+        restored.flatten().lower().as_slice(),
+        flat.lower().as_slice(),
+        "reshape must preserve the identity-spec row order exactly"
+    );
+    assert_eq!(
+        restored.flatten().upper().as_slice(),
+        flat.upper().as_slice(),
+        "reshape must preserve every certified endpoint exactly"
+    );
+
+    let wrong_size = BoundedTensor::new(ArrayD::zeros(IxDyn(&[5])), ArrayD::ones(IxDyn(&[5])))
+        .expect("valid mismatched source bounds");
+    assert!(
+        restore_tail_anchor_source_shape("pre", flat.clone(), 4, &wrong_size).is_none(),
+        "an element-count mismatch must fail closed"
+    );
+    assert!(
+        restore_tail_anchor_source_shape("pre", flat, 3, &spatial).is_none(),
+        "a linear-row mismatch must fail closed"
+    );
+}
+
+#[test]
+fn selector_regional_relu_bounds_are_fresh_root_valid_concretizations() {
+    let mut tail = GraphNetwork::new();
+    let affine =
+        LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).expect("valid scalar identity affine");
+    tail.add_node(GraphNode::from_input("pre", Layer::Linear(affine)));
+    tail.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer::new()),
+        vec!["pre".to_string()],
+    ));
+    tail.set_output("relu");
+
+    let linear = LinearBounds::new(arr2(&[[1.0]]), arr1(&[0.0]), arr2(&[[1.0]]), arr1(&[0.0]))
+        .expect("exact scalar input-linear map");
+    let root_box = box1(-1.0, 1.0);
+    let coeffs = HashMap::from([(
+        "pre".to_string(),
+        TailAnchorCoeff {
+            lin: linear,
+            root_box: root_box.clone(),
+            shape: vec![1],
+        },
+    )]);
+    let regions: Vec<_> = (0..16)
+        .map(|index| {
+            let lower = -1.0 + index as f32 / 8.0;
+            box1(lower, lower + 0.125)
+        })
+        .collect();
+    let records = certified_regional_relu_bounds(&tail, &coeffs, &regions)
+        .expect("regions zero and one each concretize the exact root-valid map");
+    assert_eq!(records.len(), 2);
+    for (record, expected_region) in records.iter().zip([0, 1]) {
+        assert_eq!(record.region_index(), expected_region);
+        assert_eq!(record.node_name(), "pre");
+        assert!(
+            record.bounds().lower()[[0]] <= regions[expected_region].lower()[[0]]
+                && record.bounds().upper()[[0]] >= regions[expected_region].upper()[[0]],
+            "directed concretization encloses the exact identity image"
+        );
+        assert!(
+            record.bounds().lower()[[0]] >= root_box.lower()[[0]]
+                && record.bounds().upper()[[0]] <= root_box.upper()[[0]],
+            "regional authority remains root-contained"
+        );
+    }
+}
+
+fn exact_f32(value: f32) -> BigRational {
+    BigRational::from_float(value).expect("finite binary32 has an exact rational image")
+}
+
+fn exact_affine_interval(
+    coefficients: &[f32],
+    bias: f32,
+    lower: &[f32],
+    upper: &[f32],
+) -> (BigRational, BigRational) {
+    assert_eq!(coefficients.len(), lower.len());
+    assert_eq!(lower.len(), upper.len());
+    let mut exact_lower = exact_f32(bias);
+    let mut exact_upper = exact_lower.clone();
+    for ((&coefficient, &lo), &hi) in coefficients.iter().zip(lower).zip(upper) {
+        let (lower_input, upper_input) = if coefficient >= 0.0 {
+            (lo, hi)
+        } else {
+            (hi, lo)
+        };
+        let exact_coefficient = exact_f32(coefficient);
+        exact_lower += exact_coefficient.clone() * exact_f32(lower_input);
+        exact_upper += exact_coefficient * exact_f32(upper_input);
+    }
+    (exact_lower, exact_upper)
+}
+
+fn concretize_exact_affine_for_test(
+    coefficients: Vec<f32>,
+    bias: f32,
+    lower: Vec<f32>,
+    upper: Vec<f32>,
+) -> BoundedTensor {
+    let input_dim = coefficients.len();
+    let matrix =
+        Array2::from_shape_vec((1, input_dim), coefficients).expect("one exact affine row");
+    let linear = LinearBounds::new(matrix.clone(), arr1(&[bias]), matrix, arr1(&[bias]))
+        .expect("finite exact affine map");
+    let root_limit = 2.0_f32.powi(100);
+    let coeffs = HashMap::from([(
+        "pre".to_string(),
+        TailAnchorCoeff {
+            lin: linear,
+            root_box: box1(-root_limit, root_limit),
+            shape: vec![1],
+        },
+    )]);
+    let region = BoundedTensor::new(
+        Array1::from_vec(lower).into_dyn(),
+        Array1::from_vec(upper).into_dyn(),
+    )
+    .expect("valid finite region box");
+    concretize_region_anchors(&coeffs, &region)
+        .expect("exact affine map concretizes")
+        .remove("pre")
+        .expect("source is preserved")
+}
+
+#[test]
+fn region_anchor_concretization_encloses_adversarial_cancellation_exactly() {
+    // A nearest-rounded accumulator loses the final unit after this cancellation.
+    // The production path must instead enclose the exact real value, not merely a
+    // sampled or higher-precision floating-point reference.
+    let scale = 2.0_f32.powi(60);
+    let coefficients = vec![scale, -scale, 1.0];
+    let fixed_input = vec![1.0, 1.0, 1.0];
+    let concretized = concretize_exact_affine_for_test(
+        coefficients.clone(),
+        0.0,
+        fixed_input.clone(),
+        fixed_input.clone(),
+    );
+    let (exact_lower, exact_upper) =
+        exact_affine_interval(&coefficients, 0.0, &fixed_input, &fixed_input);
+    assert_eq!(exact_lower, exact_f32(1.0));
+    assert_eq!(exact_upper, exact_f32(1.0));
+
+    let returned_lower = exact_f32(concretized.lower()[[0]]);
+    let returned_upper = exact_f32(concretized.upper()[[0]]);
+    assert!(
+        returned_lower <= exact_lower,
+        "directed lower endpoint must enclose the exact cancellation result"
+    );
+    assert!(
+        returned_upper >= exact_upper,
+        "directed upper endpoint must enclose the exact cancellation result"
+    );
+}
+
+#[test]
+fn region_anchor_concretization_contains_exact_rational_interval_oracle() {
+    // Fixed-seed, mixed-scale dyadic cases give a bit-exact oracle while
+    // exercising both sign-directed corners and severe cancellation.
+    let mut state = 0x6a09_e667_f3bc_c909_u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state
+    };
+
+    for case_index in 0..96 {
+        let cancellation_scale = 2.0_f32.powi(20 + case_index % 31);
+        let cancellation_input = ((next() % 257) as i32 - 128) as f32 / 16.0;
+        let mut coefficients = vec![
+            cancellation_scale,
+            -cancellation_scale,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        let mut lower = vec![cancellation_input, cancellation_input];
+        let mut upper = lower.clone();
+        for coefficient in coefficients.iter_mut().skip(2) {
+            let exponent = ((next() % 61) as i32) - 30;
+            let mantissa = (8 + next() % 8) as f32 / 8.0;
+            let sign = if next() & 1 == 0 { 1.0 } else { -1.0 };
+            *coefficient = sign * mantissa * 2.0_f32.powi(exponent);
+
+            let lo = ((next() % 513) as i32 - 256) as f32 / 16.0;
+            let width = (next() % 33) as f32 / 16.0;
+            lower.push(lo);
+            upper.push(lo + width);
+        }
+        let bias = ((next() % 1025) as i32 - 512) as f32 / 32.0;
+        let (exact_lower, exact_upper) = exact_affine_interval(&coefficients, bias, &lower, &upper);
+        let concretized = concretize_exact_affine_for_test(coefficients, bias, lower, upper);
+        let returned_lower = exact_f32(concretized.lower()[[0]]);
+        let returned_upper = exact_f32(concretized.upper()[[0]]);
+        assert!(
+            returned_lower <= exact_lower,
+            "case {case_index}: returned lower endpoint excludes the exact optimum"
+        );
+        assert!(
+            returned_upper >= exact_upper,
+            "case {case_index}: returned upper endpoint excludes the exact optimum"
+        );
+    }
+}
+
 #[test]
 fn affine_k2_support_picker_is_rank_aware_and_deterministic() {
     let proposals = vec![
@@ -266,7 +614,7 @@ fn shared_support_picker_is_deterministic_and_uses_closed_descending_widths() {
             .iter()
             .map(|(directions, _)| directions.nrows())
             .collect::<Vec<_>>(),
-        vec![16, 8, 4]
+        vec![16, 8, 4, 2]
     );
     for (_, indices) in &bases {
         assert_eq!(
@@ -288,8 +636,345 @@ fn shared_support_picker_is_deterministic_and_uses_closed_descending_widths() {
             .iter()
             .map(|(directions, _)| directions.nrows())
             .collect::<Vec<_>>(),
-        vec![8, 4],
+        vec![8, 4, 2],
         "rank exhaustion falls from K16 to the next closed width"
+    );
+}
+
+#[test]
+fn shared_support_rank_shortfall_reports_selected_indices_and_residual() {
+    let proposals: Vec<_> = (0..16)
+        .map(|row| {
+            if row % 2 == 0 {
+                region_proposal_vec(vec![1.0, 0.0, 0.0, 0.0])
+            } else {
+                region_proposal_vec(vec![0.0, 1.0, 0.0, 0.0])
+            }
+        })
+        .collect();
+    let decline = shared_support_basis_diagnosed(&proposals, 4)
+        .expect_err("two-dimensional proposal span cannot produce K4");
+    let SharedSupportBasisDecline::RankShortfall {
+        requested_rows,
+        selected_indices,
+        max_remaining_relative_residual2,
+        min_relative_residual2,
+    } = &decline
+    else {
+        panic!("unexpected decline: {decline}");
+    };
+    assert_eq!(*requested_rows, 4);
+    assert_eq!(selected_indices, &[0, 1]);
+    assert_eq!(*max_remaining_relative_residual2, 0.0);
+    assert_eq!(
+        *min_relative_residual2,
+        super::SHARED_SUPPORT_MIN_RELATIVE_RESIDUAL2
+    );
+    assert_eq!(
+        decline.to_string(),
+        "support-basis-rank-shortfall requested_rows=4 selected_indices=[0, 1] \
+         max_remaining_relative_residual2=0.00000000000000000e0 \
+         min_relative_residual2=1.00000000000000004e-10"
+    );
+
+    let (directions, selected) =
+        shared_support_basis_diagnosed(&proposals, 2).expect("rank-two K2 bank");
+    assert_eq!(selected, vec![0, 1]);
+    assert_eq!(
+        directions,
+        array![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    );
+}
+
+#[test]
+fn selector_k2_accepts_tail_rank_two_without_lowering_k4_rank_cutoff() {
+    let mut proposals = vec![
+        region_proposal_vec(vec![1.0, 0.0, 0.0, 0.0]),
+        region_proposal_vec(vec![0.0, 1.0, 0.0, 0.0]),
+        region_proposal_vec(vec![1.0, 0.0, 2.0e-6, 0.0]),
+        region_proposal_vec(vec![0.0, 1.0, 0.0, 2.0e-6]),
+    ];
+    while proposals.len() < SHARED_INPUT_EVIDENCE_REGION_COUNT {
+        proposals.push(region_proposal_vec(vec![1.0, 1.0, 0.0, 0.0]));
+    }
+
+    let decline =
+        shared_support_basis_diagnosed(&proposals, 4).expect_err("near-rank-two K4 must decline");
+    let SharedSupportBasisDecline::RankShortfall {
+        selected_indices,
+        max_remaining_relative_residual2,
+        min_relative_residual2,
+        ..
+    } = decline
+    else {
+        panic!("unexpected K4 decline: {decline}");
+    };
+    assert_eq!(selected_indices, vec![0, 1]);
+    assert!(max_remaining_relative_residual2 > 0.0);
+    assert!(max_remaining_relative_residual2 < min_relative_residual2);
+
+    let (directions, selected) =
+        shared_support_basis_diagnosed(&proposals, 2).expect("K2 retains the independent span");
+    assert_eq!(selected, vec![0, 1]);
+    assert_eq!(
+        directions,
+        array![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    );
+}
+
+#[test]
+fn shared_support_rank_cutoff_rejects_equal_or_smaller_residuals() {
+    let proposals = vec![
+        region_proposal_vec(vec![1.0, 0.0]),
+        region_proposal_vec(vec![1.0, 1.0e-5]),
+        region_proposal_vec(vec![1.0, -1.0e-5]),
+        region_proposal_vec(vec![2.0, 0.0]),
+    ];
+    let decline =
+        shared_support_basis_diagnosed(&proposals, 4).expect_err("near-collinear K4 must decline");
+    let SharedSupportBasisDecline::RankShortfall {
+        selected_indices,
+        max_remaining_relative_residual2,
+        min_relative_residual2,
+        ..
+    } = decline
+    else {
+        panic!("unexpected decline: {decline}");
+    };
+    assert_eq!(selected_indices, vec![0]);
+    assert!(max_remaining_relative_residual2 > 0.0);
+    assert!(max_remaining_relative_residual2 <= min_relative_residual2);
+    assert_eq!(
+        min_relative_residual2,
+        super::SHARED_SUPPORT_MIN_RELATIVE_RESIDUAL2
+    );
+}
+
+#[test]
+fn shared_support_diagnostics_distinguish_malformed_inputs() {
+    assert_eq!(
+        shared_support_basis_diagnosed(&[], 4).expect_err("empty bank"),
+        SharedSupportBasisDecline::EmptyProposals
+    );
+
+    let mut proposals: Vec<_> = (0..4)
+        .map(|row| {
+            let mut direction = vec![0.0_f32; 4];
+            direction[row] = 1.0;
+            region_proposal_vec(direction)
+        })
+        .collect();
+    assert!(shared_support_basis_diagnosed(&proposals, 2).is_ok());
+    assert_eq!(
+        shared_support_basis_diagnosed(&proposals, 3).expect_err("K3 is closed"),
+        SharedSupportBasisDecline::UnsupportedRequestedRows { requested_rows: 3 }
+    );
+
+    proposals[2].p.pop();
+    assert_eq!(
+        shared_support_basis_diagnosed(&proposals, 4).expect_err("ragged proposal bank"),
+        SharedSupportBasisDecline::MalformedProposalWidth {
+            proposal_idx: 2,
+            expected_width: 4,
+            actual_width: 3,
+        }
+    );
+    proposals[2].p.push(0.0);
+    proposals[3].p[1] = f32::NAN;
+    assert_eq!(
+        shared_support_basis_diagnosed(&proposals, 4).expect_err("non-finite proposal"),
+        SharedSupportBasisDecline::NonFiniteProposal {
+            proposal_idx: 3,
+            value_idx: 1,
+        }
+    );
+}
+
+#[test]
+fn shared_envelope_diagnostics_distinguish_operational_declines() {
+    assert_eq!(
+        SharedInputEnvelopeDecline::CrownError.to_string(),
+        "crown-err"
+    );
+    assert_eq!(
+        SharedInputEnvelopeDecline::MissingLinear.to_string(),
+        "missing-linear"
+    );
+    assert_eq!(
+        SharedInputEnvelopeDecline::Deadline(SharedInputEnvelopeDeadlineStage::AfterCrown)
+            .to_string(),
+        "deadline stage=after-crown"
+    );
+    assert_eq!(
+        SharedInputEnvelopeDecline::MalformedBoundsShape {
+            expected_values: 4,
+            actual_values: 2,
+        }
+        .to_string(),
+        "malformed-bounds-shape expected_values=4 actual_values=2"
+    );
+    assert_eq!(
+        SharedInputEnvelopeDecline::EnvelopeRejected.to_string(),
+        "envelope-rejection"
+    );
+    assert_eq!(
+        shared_input_envelope_crown_error(&ny_core::NyError::DeadlineExceeded(
+            "test deadline".to_owned()
+        )),
+        SharedInputEnvelopeDecline::Deadline(SharedInputEnvelopeDeadlineStage::DuringCrown)
+    );
+    assert_eq!(
+        shared_input_envelope_crown_error(&ny_core::NyError::UnsupportedOp(
+            "test operation".to_owned()
+        )),
+        SharedInputEnvelopeDecline::CrownError
+    );
+}
+
+#[test]
+fn shared_root_session_cache_builds_once_and_bypasses_later_rank_shortfall() {
+    let root = box2([-1.0, -2.0], [3.0, 4.0]);
+    let cache = OnceLock::new();
+    let builds = Cell::new(0usize);
+    let first = shared_root_envelope_from_session_cache(&cache, "seam", &root, 4, 16, || {
+        builds.set(builds.get() + 1);
+        Some(shared_root_envelope(&root, vec![0, 1, 2, 3]))
+    })
+    .expect("first valid K4 bank populates the session cache");
+
+    let rank_two_proposals: Vec<_> = (0..16)
+        .map(|row| {
+            if row % 2 == 0 {
+                region_proposal_vec(vec![1.0, 0.0, 0.0, 0.0])
+            } else {
+                region_proposal_vec(vec![0.0, 1.0, 0.0, 0.0])
+            }
+        })
+        .collect();
+    assert!(matches!(
+        shared_support_basis_diagnosed(&rank_two_proposals, 4),
+        Err(SharedSupportBasisDecline::RankShortfall { .. })
+    ));
+
+    let second = shared_root_envelope_from_session_cache(&cache, "seam", &root, 4, 16, || {
+        panic!("a valid cached K4 bank must bypass the later rank-two builder")
+    })
+    .expect("later objective consumes the root-valid K4 premise");
+    assert_eq!(builds.get(), 1);
+    assert_eq!(first.support_indices(), second.support_indices());
+    assert_eq!(first.directions(), second.directions());
+}
+
+#[test]
+fn failed_shared_root_session_build_does_not_poison_retry() {
+    let root = box2([-1.0, -2.0], [3.0, 4.0]);
+    let cache = OnceLock::new();
+    let builds = Cell::new(0usize);
+    assert!(
+        shared_root_envelope_from_session_cache(&cache, "seam", &root, 4, 16, || {
+            builds.set(builds.get() + 1);
+            None
+        },)
+        .is_none()
+    );
+    assert!(
+        cache.get().is_none(),
+        "a failed bank build must leave the session cell uninitialized"
+    );
+
+    assert!(
+        shared_root_envelope_from_session_cache(&cache, "seam", &root, 4, 16, || {
+            builds.set(builds.get() + 1);
+            Some(shared_root_envelope(&root, vec![0, 1, 2, 3]))
+        },)
+        .is_some()
+    );
+    assert_eq!(builds.get(), 2);
+    assert!(cache.get().is_some());
+}
+
+#[test]
+fn shared_root_session_cache_context_is_strict_and_mismatch_fails_closed() {
+    let root = box2([-1.0, -2.0], [3.0, 4.0]);
+    let valid = shared_root_envelope(&root, vec![0, 1, 2, 3]);
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&valid, "seam", &root, 4, 16),
+        Ok(())
+    );
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&valid, "other", &root, 4, 16),
+        Err("seam-identity-mismatch")
+    );
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&valid, "seam", &root, 3, 16),
+        Err("seam-width-mismatch")
+    );
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&valid, "seam", &root, 4, 8),
+        Err("region-count-mismatch")
+    );
+    let other_root = box2([-1.0, -2.0], [3.0, 5.0]);
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&valid, "seam", &other_root, 4, 16),
+        Err("certified-root-mismatch")
+    );
+
+    let input_dim = root.flatten().len();
+    let regional = AyTailSharedInputReachabilityEnvelope::from_prefix_crown(
+        "seam".to_owned(),
+        root.clone(),
+        box2([0.0, -1.0], [2.0, 3.0]),
+        vec![0, 1, 2, 3],
+        Array2::eye(4),
+        Array2::zeros((4, input_dim)),
+        Array1::zeros(4),
+        Array2::zeros((4, input_dim)),
+        Array1::zeros(4),
+    )
+    .expect("valid non-global view for mismatch test");
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&regional, "seam", &root, 4, 16),
+        Err("bank-is-not-global-root")
+    );
+
+    let k8 = AyTailSharedInputReachabilityEnvelope::from_prefix_crown(
+        "seam".to_owned(),
+        root.clone(),
+        root.clone(),
+        (0..8).collect(),
+        Array2::eye(8),
+        Array2::zeros((8, input_dim)),
+        Array1::zeros(8),
+        Array2::zeros((8, input_dim)),
+        Array1::zeros(8),
+    )
+    .expect("K8 is a dark but well-formed type capability");
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&k8, "seam", &root, 8, 16),
+        Err("bank-is-not-production-k4")
+    );
+
+    let out_of_range_support =
+        shared_root_envelope(&root, vec![0, 1, 2, SHARED_INPUT_EVIDENCE_REGION_COUNT]);
+    assert_eq!(
+        validate_cached_shared_root_envelope_context(&out_of_range_support, "seam", &root, 4, 16,),
+        Err("support-indices-invalid")
+    );
+
+    let cache = OnceLock::new();
+    cache.set(valid).expect("seed valid immutable bank");
+    let builder_calls = Cell::new(0usize);
+    assert!(
+        shared_root_envelope_from_session_cache(&cache, "other", &root, 4, 16, || {
+            builder_calls.set(builder_calls.get() + 1);
+            Some(shared_root_envelope(&root, vec![0, 1, 2, 3]))
+        },)
+        .is_none()
+    );
+    assert_eq!(
+        builder_calls.get(),
+        0,
+        "a populated context mismatch is an invariant failure, not a rebuild request"
     );
 }
 
@@ -316,6 +1001,15 @@ fn shared_bank_deadline_is_strictly_capped_and_expiry_fails_closed() {
         Some(short_overall)
     );
     assert_eq!(checked_shared_input_proof_deadline(now, now), None);
+    assert_eq!(
+        checked_region_selector_proof_deadline(long_overall, now),
+        Some(now + REGION_SELECTOR_AY_PROOF_CAP)
+    );
+    assert_eq!(
+        checked_region_selector_proof_deadline(short_overall, now),
+        Some(short_overall)
+    );
+    assert_eq!(checked_region_selector_proof_deadline(now, now), None);
 }
 
 #[test]
@@ -539,6 +1233,130 @@ fn shared_root_proof_uses_exactly_one_call_for_sixteen_region_proposals() {
 }
 
 #[test]
+fn selector_root_proof_preflights_all_frontiers_then_uses_one_capped_call() {
+    let (root, regions, proposals, seam) = selector_region_fixture();
+    let envelope = selector_test_envelope(&root, &regions, &proposals, &seam);
+    let anchors = selector_root_tail_anchors();
+    let regional_relu_bounds = selector_regional_relu_bounds();
+    let mut calls = 0usize;
+    let lower = certify_ay_region_selector_root_with(
+        &root,
+        &regions,
+        &proposals,
+        "seam",
+        &anchors,
+        &regional_relu_bounds,
+        &envelope,
+        0.0,
+        Instant::now() + Duration::from_mins(2),
+        |received, requested, proof_deadline| {
+            calls += 1;
+            assert_eq!(received.region_inputs().len(), 16);
+            assert_eq!(received.selector_coefficients().shape(), &[16, 4]);
+            let remaining = proof_deadline
+                .checked_duration_since(Instant::now())
+                .expect("selector callback begins before its hard deadline");
+            assert!(remaining > Duration::ZERO);
+            assert!(remaining <= REGION_SELECTOR_AY_PROOF_CAP);
+            Some(requested)
+        },
+    )
+    .expect("one exact selector-root proof");
+    assert!(lower > 0.0);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn selector_frontier_or_request_mutation_fails_before_solver_admission() {
+    let (root, regions, proposals, seam) = selector_region_fixture();
+    let envelope = selector_test_envelope(&root, &regions, &proposals, &seam);
+    let anchors = selector_root_tail_anchors();
+    let regional_relu_bounds = selector_regional_relu_bounds();
+
+    let mut malformed = proposals;
+    malformed[15].terminal_boxes = vec![box1(15.0 / 16.0, 31.0 / 32.0), box1(63.0 / 64.0, 1.0)];
+    assert!(
+        ay_region_selector_envelope_from_frontiers(
+            "seam",
+            &root,
+            &regions,
+            &seam,
+            &anchors,
+            &regional_relu_bounds,
+            &malformed,
+            future_deadline(),
+        )
+        .is_none(),
+        "a gap in the last prefix frontier must reject before envelope construction"
+    );
+
+    let mut calls = 0usize;
+    assert!(certify_ay_region_selector_root_with(
+        &root,
+        &regions,
+        &malformed,
+        "seam",
+        &anchors,
+        &regional_relu_bounds,
+        &envelope,
+        0.0,
+        future_deadline(),
+        |_, requested, _| {
+            calls += 1;
+            Some(requested)
+        },
+    )
+    .is_none());
+    assert_eq!(
+        calls, 0,
+        "a malformed late frontier cannot partially admit the exact worker"
+    );
+
+    let (_, _, valid_proposals, _) = selector_region_fixture();
+    assert!(certify_ay_region_selector_root_with(
+        &root,
+        &regions,
+        &valid_proposals,
+        "other-seam",
+        &anchors,
+        &regional_relu_bounds,
+        &envelope,
+        0.0,
+        future_deadline(),
+        |_, requested, _| {
+            calls += 1;
+            Some(requested)
+        },
+    )
+    .is_none());
+    let mut changed_anchors = anchors;
+    changed_anchors[0] =
+        AyTailRootAnchor::from_certified_root_box("pre_1".to_string(), box1(-0.75, 0.625))
+            .expect("valid but different root anchor");
+    assert!(certify_ay_region_selector_root_with(
+        &root,
+        &regions,
+        &valid_proposals,
+        "seam",
+        &changed_anchors,
+        &regional_relu_bounds,
+        &envelope,
+        0.0,
+        future_deadline(),
+        |_, requested, _| {
+            calls += 1;
+            Some(requested)
+        },
+    )
+    .is_none());
+    assert_eq!(
+        calls, 0,
+        "root-anchor endpoint mismatch cannot admit the exact worker"
+    );
+    assert_eq!(calls, 0, "seam identity mutation must fail closed");
+}
+
+#[test]
 fn sampled_pass_cannot_authorize_a_verdict() {
     let proposal = candidate(None);
     assert_eq!(authoritative_candidate_lower(&proposal), None);
@@ -679,11 +1497,10 @@ fn ay_region_partition_pairs_each_residual_with_its_own_prefix() {
 #[test]
 fn ay_region_reachability_pairs_each_prefix_fact_with_the_original_proof() {
     let root = box1(0.0, 1.0);
-    let regions = vec![box1(0.0, 0.5), box1(0.5, 1.0)];
-    let proposals = vec![
-        region_proposal(11.0, 0.5, vec![box1(0.0, 0.5)]),
-        region_proposal(22.0, 0.25, vec![box1(0.5, 1.0)]),
-    ];
+    let regions = shared_input_evidence_regions();
+    let proposals = exact_one_leaf_region_proposals(&regions, |idx| {
+        (11.0 + idx as f32, 0.25 + idx as f32 / 64.0)
+    });
     let threshold = -0.679_319_44_f32;
     let expected = ny_tensor::next_up_f32(threshold);
     let mut seen = Vec::new();
@@ -709,23 +1526,25 @@ fn ay_region_reachability_pairs_each_prefix_fact_with_the_original_proof() {
     .expect("both conditional original-objective proofs clear the threshold");
 
     assert_eq!(lower.to_bits(), expected.to_bits());
-    assert_eq!(
-        seen,
-        vec![
-            (0, 0.0, 0.5, 11.0, 0.5, expected),
-            (1, 0.5, 1.0, 22.0, 0.25, expected),
-        ]
-    );
+    assert_eq!(seen.len(), SHARED_INPUT_EVIDENCE_REGION_COUNT);
+    for (idx, &(seen_idx, lower, upper, p, prefix_lower, requested_lower)) in
+        seen.iter().enumerate()
+    {
+        let count = SHARED_INPUT_EVIDENCE_REGION_COUNT as f32;
+        assert_eq!(seen_idx, idx);
+        assert_eq!(lower, idx as f32 / count);
+        assert_eq!(upper, (idx + 1) as f32 / count);
+        assert_eq!(p, 11.0 + idx as f32);
+        assert_eq!(prefix_lower, 0.25 + idx as f32 / 64.0);
+        assert_eq!(requested_lower.to_bits(), expected.to_bits());
+    }
 }
 
 #[test]
 fn ay_region_reachability_is_atomic_and_bit_binds_the_requested_lower() {
     let root = box1(0.0, 1.0);
-    let regions = vec![box1(0.0, 0.5), box1(0.5, 1.0)];
-    let proposals = vec![
-        region_proposal(1.0, 0.5, vec![box1(0.0, 0.5)]),
-        region_proposal(2.0, 0.5, vec![box1(0.5, 1.0)]),
-    ];
+    let regions = shared_input_evidence_regions();
+    let proposals = exact_one_leaf_region_proposals(&regions, |idx| (idx as f32 + 1.0, 0.5));
     let mut calls = 0;
     assert!(certify_ay_region_reachability_partition_with(
         &root,
@@ -749,11 +1568,13 @@ fn ay_region_reachability_is_atomic_and_bit_binds_the_requested_lower() {
 #[test]
 fn ay_region_reachability_preflights_all_covers_before_solver_admission() {
     let root = box1(0.0, 1.0);
-    let regions = vec![box1(0.0, 0.5), box1(0.5, 1.0)];
-    let proposals = vec![
-        region_proposal(1.0, 0.5, vec![box1(0.0, 0.5)]),
-        region_proposal(2.0, 0.5, vec![box1(0.5, 0.7), box1(0.8, 1.0)]),
-    ];
+    let regions = shared_input_evidence_regions();
+    let mut proposals = exact_one_leaf_region_proposals(&regions, |idx| (idx as f32 + 1.0, 0.5));
+    let late_idx = SHARED_INPUT_EVIDENCE_REGION_COUNT - 1;
+    let count = SHARED_INPUT_EVIDENCE_REGION_COUNT as f32;
+    let lower = late_idx as f32 / count;
+    let midpoint = (late_idx as f32 + 0.5) / count;
+    proposals[late_idx].terminal_boxes = vec![box1(lower, midpoint)];
     let mut calls = 0;
     assert!(certify_ay_region_reachability_partition_with(
         &root,
@@ -773,8 +1594,8 @@ fn ay_region_reachability_preflights_all_covers_before_solver_admission() {
 #[test]
 fn ay_region_reachability_threshold_edges_fail_closed_and_preserve_signed_zero() {
     let root = box1(0.0, 1.0);
-    let regions = vec![root.clone()];
-    let proposals = vec![region_proposal(1.0, 0.0, vec![root.clone()])];
+    let regions = shared_input_evidence_regions();
+    let proposals = exact_one_leaf_region_proposals(&regions, |idx| (idx as f32 + 1.0, 0.0));
     for threshold in [f32::MAX, f32::NAN, f32::INFINITY] {
         let mut calls = 0;
         assert!(certify_ay_region_reachability_partition_with(
@@ -819,11 +1640,8 @@ fn ay_region_reachability_rejects_l2_semantics_before_callback() {
     )
     .expect("valid scalar L2 constraint");
     let root = box1(0.0, 1.0).with_l2_constraint(constraint);
-    let regions = vec![box1(0.0, 0.5), box1(0.5, 1.0)];
-    let proposals = vec![
-        region_proposal(1.0, 0.5, vec![box1(0.0, 0.5)]),
-        region_proposal(2.0, 0.5, vec![box1(0.5, 1.0)]),
-    ];
+    let regions = shared_input_evidence_regions();
+    let proposals = exact_one_leaf_region_proposals(&regions, |idx| (idx as f32 + 1.0, 0.5));
     let mut calls = 0;
     assert!(certify_ay_region_reachability_partition_with(
         &root,
@@ -986,6 +1804,10 @@ fn exact_prefix_session_reuses_paired_prefix_and_anchor_allocations() {
     assert!(Arc::ptr_eq(
         first.anchor.as_ref().expect("first anchor"),
         second.anchor.as_ref().expect("second anchor")
+    ));
+    assert!(Arc::ptr_eq(
+        &first.shared_root_envelope,
+        &second.shared_root_envelope
     ));
 }
 
@@ -1411,6 +2233,71 @@ fn batched_replay_gate_is_strict_and_default_off() {
 }
 
 #[test]
+fn replay_authority_engine_route_labels_are_stable() {
+    assert_eq!(ReplayAuthorityEngineRoute::Caller.as_str(), "caller");
+    assert_eq!(
+        ReplayAuthorityEngineRoute::RegisteredFastF32.as_str(),
+        "registered_fast_f32"
+    );
+    assert_eq!(
+        ReplayAuthorityEngineRoute::CpuFallback.as_str(),
+        "cpu_fallback"
+    );
+}
+
+#[test]
+fn registered_replay_failure_never_retries_cpu() {
+    let cpu_calls = Cell::new(0_usize);
+    let selected_failure =
+        registered_replay_or_cpu_fallback(RegisteredReplayAttempt::Evaluated(None::<u32>), || {
+            cpu_calls.set(cpu_calls.get() + 1);
+            Some(7)
+        });
+    assert_eq!(selected_failure, None);
+    assert_eq!(
+        cpu_calls.get(),
+        0,
+        "an evaluated failure is not registry unavailability"
+    );
+
+    let unavailable =
+        registered_replay_or_cpu_fallback(RegisteredReplayAttempt::Unavailable, || {
+            cpu_calls.set(cpu_calls.get() + 1);
+            Some(11)
+        });
+    assert_eq!(unavailable, Some(11));
+    assert_eq!(
+        cpu_calls.get(),
+        1,
+        "only an unavailable registry may enter the CPU fallback"
+    );
+}
+
+#[test]
+fn registered_fast_f32_replay_adapter_confines_optional_capabilities() {
+    let registered = CountingGemmEngine::new();
+    let adapter = RegisteredFastF32ReplayEngine(&registered);
+    let product = adapter
+        .gemm_f32(1, 2, 1, &[2.0, 3.0], &[4.0, 5.0])
+        .expect("registered RN-f32 GEMM delegates");
+
+    assert_eq!(product, vec![23.0]);
+    assert_eq!(registered.gemm_calls(), 1);
+    assert!(
+        adapter.gemm_f64(1, 1, 1, &[1.0_f64], &[1.0_f64]).is_err(),
+        "the fast-f32 registry must not acquire an f64 capability"
+    );
+    assert!(
+        adapter.as_gpu_crown_backward().is_none(),
+        "the fast-f32 registry must not acquire a GPU-CROWN capability"
+    );
+    assert!(
+        adapter.as_gpu_ibp_forward().is_none(),
+        "the fast-f32 registry must not acquire a GPU-IBP capability"
+    );
+}
+
+#[test]
 fn signed_replay_plan_quotients_exact_opposites_and_preserves_other_rows() {
     let positive = [1.0_f32, 0.0];
     // Ordinary +0 is mathematically the negation of either signed zero.
@@ -1711,6 +2598,258 @@ fn uniform_region_leaf_four_matches_run_region_loop_order() {
 }
 
 #[test]
+fn selector_input_lift_canary_gates_are_exact_conflict_closed_and_grid_checked() {
+    assert!(selector_k4_lift_enabled_for_objective(Some("1"), 1));
+    assert!(!selector_k4_lift_enabled_for_objective(Some("1"), 0));
+    assert!(!selector_k4_lift_enabled_for_objective(Some("1"), 2));
+    assert!(selector_k2_lift_enabled_for_objective(Some("1"), 1));
+    assert!(!selector_k2_lift_enabled_for_objective(Some("1"), 0));
+    assert!(!selector_k2_lift_enabled_for_objective(Some("1"), 2));
+    for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+        assert!(!selector_k4_lift_enabled_for_objective(value, 1));
+        assert!(!selector_k2_lift_enabled_for_objective(value, 1));
+    }
+    assert_eq!(
+        selector_input_lift_kind(Some("1"), None, 1),
+        Ok(Some(SelectorInputLiftKind::K2))
+    );
+    assert_eq!(
+        selector_input_lift_kind(None, Some("1"), 1),
+        Ok(Some(SelectorInputLiftKind::K4))
+    );
+    assert_eq!(selector_input_lift_kind(Some("1"), None, 0), Ok(None));
+    assert_eq!(selector_input_lift_kind(None, Some("1"), 0), Ok(None));
+    assert_eq!(
+        selector_input_lift_kind(Some("true"), Some("1"), 1),
+        Ok(Some(SelectorInputLiftKind::K4)),
+        "malformed values remain off and do not create a false conflict"
+    );
+    assert_eq!(
+        selector_input_lift_kind(Some("1"), Some("1"), 1),
+        Err("conflicting-selector-k2-k4-lift-gates")
+    );
+    assert_eq!(
+        selector_input_lift_kind(Some("1"), Some("1"), 0),
+        Err("conflicting-selector-k2-k4-lift-gates"),
+        "conflicting authority requests fail closed before objective filtering"
+    );
+
+    let root = BoundedTensor::new(
+        array![-4.0_f32, 2.0, -9.0, 11.0, 0.0].into_dyn(),
+        array![8.0_f32, 10.0, -1.0, 11.0, 20.0].into_dyn(),
+    )
+    .expect("valid root");
+    let regions = region_boxes(&root, &[0, 1, 2, 4], 2);
+    assert_eq!(regions.len(), 16);
+    preflight_selector_k4_grid(&root, &regions)
+        .expect("the production mixed-radix little-endian grid is admitted");
+
+    let mut misordered = regions;
+    misordered.swap(1, 8);
+    assert!(
+        preflight_selector_k4_grid(&root, &misordered).is_err(),
+        "region count alone cannot authorize a differently ordered 16-cell grid"
+    );
+}
+
+#[test]
+fn replay_phase_census_uses_distance_to_stability_order_and_deterministic_ties() {
+    let closest = ReplayPhaseCandidate::new(3, 8, -0.03125, 0.96875).expect("unstable");
+    let tied_wide = ReplayPhaseCandidate::new(4, 20, -0.25, 2.0).expect("unstable");
+    let tied_early_flat = ReplayPhaseCandidate::new(2, 5, -0.25, 1.0).expect("unstable");
+    let tied_late_flat = ReplayPhaseCandidate::new(2, 9, -0.25, 1.0).expect("unstable");
+
+    let ranked = rank_replay_phase_candidates(
+        [tied_late_flat, tied_early_flat, tied_wide, closest],
+        MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES,
+    );
+    let identities: Vec<(usize, usize)> = ranked
+        .iter()
+        .map(|candidate| (candidate.relu_exec_index, candidate.flat_index))
+        .collect();
+    assert_eq!(identities, vec![(3, 8), (4, 20), (2, 5), (2, 9)]);
+    assert_eq!(ranked[0].score, 0.03125);
+    assert_eq!(ranked[1].score, 0.25);
+}
+
+#[test]
+fn replay_phase_census_preserves_endpoint_bits_and_digest() {
+    let graph = relu_valley_graph();
+    let lower = f32::from_bits(0xbe80_0001);
+    let upper = f32::from_bits(0x3f00_0001);
+    let producer_bounds = BoundedTensor::new(
+        array![lower, -2.0_f32].into_dyn(),
+        array![upper, -0.0_f32].into_dyn(),
+    )
+    .expect("valid producer bounds");
+    let node_bounds = HashMap::from([("split".to_string(), producer_bounds)]);
+    let input = box1(-1.0, 1.0);
+
+    let first = build_replay_phase_census(
+        &graph,
+        &input,
+        &node_bounds,
+        future_deadline(),
+        MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES,
+    )
+    .expect("census");
+    let second = build_replay_phase_census(
+        &graph,
+        &input,
+        &node_bounds,
+        future_deadline(),
+        MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES,
+    )
+    .expect("repeat census");
+
+    assert_eq!(first.relu_nodes, 1);
+    assert_eq!(first.coordinates, 2);
+    assert_eq!(first.unstable, 1);
+    assert_eq!(first.stable_inactive, 1);
+    assert_eq!(first.stable_active, 0);
+    assert_eq!(first.ranked.len(), 1);
+    assert_eq!(first.ranked[0].lower.to_bits(), lower.to_bits());
+    assert_eq!(first.ranked[0].upper.to_bits(), upper.to_bits());
+    assert_eq!(
+        first.node_box_endpoint_digest,
+        second.node_box_endpoint_digest
+    );
+}
+
+#[test]
+fn replay_phase_census_output_is_hard_capped() {
+    let candidates = (0..=MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES)
+        .map(|flat_index| ReplayPhaseCandidate::new(7, flat_index, -0.5, 0.5).expect("unstable"));
+    let ranked = rank_replay_phase_candidates(candidates, usize::MAX);
+    assert_eq!(ranked.len(), MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES);
+    assert_eq!(
+        ranked.first().map(|candidate| candidate.flat_index),
+        Some(0)
+    );
+    assert_eq!(
+        ranked.last().map(|candidate| candidate.flat_index),
+        Some(MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES - 1)
+    );
+}
+
+#[test]
+fn replay_phase_preflight_counts_oversized_non_relu_cached_output() {
+    let mut graph = relu_valley_graph();
+    let oversized = LinearLayer::new(Array2::<f32>::zeros((8, 1)), Some(Array1::<f32>::zeros(8)))
+        .expect("valid disconnected non-ReLU output");
+    graph.add_node(GraphNode::from_input(
+        "oversized_nonrelu",
+        Layer::Linear(oversized),
+    ));
+
+    let cached_box = |len: usize| {
+        BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[len]), -1.0),
+            ArrayD::from_elem(IxDyn(&[len]), 1.0),
+        )
+        .expect("valid cached box")
+    };
+    let node_bounds = HashMap::from([
+        ("split".to_string(), cached_box(2)),
+        ("relu".to_string(), cached_box(2)),
+        ("out".to_string(), cached_box(1)),
+        ("oversized_nonrelu".to_string(), cached_box(8)),
+    ]);
+    let input_l2 = L2Constraint::new(
+        array![0.0_f32].into_dyn(),
+        ArrayD::from_elem(IxDyn(&[]), 1.0),
+        0,
+        &[1],
+    )
+    .expect("valid scalar input L2 annotation");
+    let input = box1(-1.0, 1.0).with_l2_constraint(input_l2);
+    let limits = ReplayPhaseCensusCollectionLimits {
+        graph_nodes: 8,
+        // input endpoints=2 + input L2 center/radius=2, split=4, relu=4,
+        // out=2, non-ReLU=16 => 30 retained f32 values.
+        cached_f32_values: 29,
+        name_bytes: 1_024,
+    };
+
+    assert_eq!(
+        preflight_replay_phase_census_collection(
+            &graph,
+            &input,
+            &node_bounds,
+            future_deadline(),
+            limits,
+        ),
+        Err("cached-f32-value-cap"),
+        "a tiny ReLU producer must not hide an oversized cached non-ReLU output"
+    );
+    preflight_replay_phase_census_collection(
+        &graph,
+        &input,
+        &node_bounds,
+        future_deadline(),
+        ReplayPhaseCensusCollectionLimits {
+            cached_f32_values: 30,
+            ..limits
+        },
+    )
+    .expect("the exact full-cache payload fits at its inclusive cap");
+}
+
+#[test]
+fn replay_phase_entry_output_polls_and_marks_deadline_truncation() {
+    let ranked = rank_replay_phase_candidates(
+        (0..3).map(|flat_index| {
+            ReplayPhaseCandidate::new(7, flat_index, -0.5, 0.5).expect("unstable")
+        }),
+        MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES,
+    );
+    let polls = Cell::new(0usize);
+    let mut emitted_ranks = Vec::new();
+    let outcome = visit_replay_phase_entries_until_deadline(
+        &ranked,
+        || {
+            let poll = polls.get();
+            polls.set(poll + 1);
+            poll < 2
+        },
+        |rank, _candidate| emitted_ranks.push(rank),
+    );
+
+    assert_eq!(emitted_ranks, vec![0, 1]);
+    assert_eq!(polls.get(), 3, "every attempted entry must be pre-polled");
+    assert_eq!(
+        outcome,
+        ReplayPhaseEmissionOutcome {
+            emitted: 2,
+            deadline_truncated: true,
+        }
+    );
+    assert_eq!(
+        replay_phase_deadline_truncated_marker(4, 16, 0xc37c_64a8_b0e1_bd0b, 3, outcome).as_deref(),
+        Some(
+            "[imb-replay-only] phase-census deadline-truncated leaf=4/16 \
+             box_fingerprint=fnv1a64:c37c64a8b0e1bd0b emitted=2 retained=3 authority=false"
+        )
+    );
+}
+
+#[test]
+fn replay_phase_census_expired_deadline_fails_neutral() {
+    let graph = relu_valley_graph();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("system uptime exceeds one millisecond");
+    let result = build_replay_phase_census(
+        &graph,
+        &box1(-1.0, 1.0),
+        &HashMap::new(),
+        expired,
+        MAX_REPLAY_ONLY_PHASE_CENSUS_ENTRIES,
+    );
+    assert_eq!(result.unwrap_err(), "deadline-before-scan");
+}
+
+#[test]
 fn replay_leaf_telemetry_reports_standard_route_and_bound() {
     let graph = linear_graph(1.0, 2.0);
     let leaf = box1(-1.0, 0.0);
@@ -1834,6 +2973,7 @@ fn refused_replay_only_admission_does_not_suppress_later_entry() {
             &objectives,
             &thresholds,
             None,
+            &HashMap::new(),
             Some(future_deadline()),
         ));
         assert!(!crate::imb::replay_only_attempted());
@@ -1846,6 +2986,7 @@ fn refused_replay_only_admission_does_not_suppress_later_entry() {
             &objectives,
             &thresholds,
             None,
+            &HashMap::new(),
             Some(future_deadline()),
         ));
         assert!(crate::imb::replay_only_attempted());
@@ -1931,6 +3072,34 @@ fn batched_original_objective_replay_certifies_distinct_exact_covers_atomically(
     assert!(certificates
         .iter()
         .all(|certificate| certificate.lower > 0.5));
+}
+
+#[test]
+fn batched_original_objective_replay_honors_explicit_caller_engine() {
+    let graph = two_output_affine_graph();
+    let root = box1(-1.0, 1.0);
+    let cover = vec![box1(-1.0, 0.0), box1(0.0, 1.0)];
+    let objective = [1.0_f32, 0.0];
+    let engine = CountingGemmEngine::new();
+
+    let certificates = independently_recheck_original_objectives_batched(
+        &graph,
+        &root,
+        &[&cover],
+        &[&objective],
+        &[0.5],
+        0,
+        Some(&engine),
+        future_deadline(),
+    )
+    .expect("explicit caller engine replay should certify");
+
+    assert_eq!(certificates.len(), 1);
+    assert!(certificates[0].lower > 0.5);
+    assert!(
+        engine.gemm_calls() > 0,
+        "the explicit caller must retain precedence and reach batched propagation"
+    );
 }
 
 #[test]

@@ -18,6 +18,7 @@ use super::tables::{
 };
 use crate::rounding::{next_down_f32, next_up_f32};
 use crate::types::GeluApproximation;
+use ny_core::{f32_affine_eval_error, f64_to_f32_down, f64_to_f32_up};
 
 /// Convert an optionally-assigned bound into a concrete `(slope, intercept)` pair.
 ///
@@ -27,6 +28,72 @@ use crate::types::GeluApproximation;
 #[inline]
 fn finalize_bound(bound: Option<(f32, f32)>, fallback_intercept: f32) -> (f32, f32) {
     bound.unwrap_or((0.0, fallback_intercept))
+}
+
+/// Replace a sloped lower line by the sound interval-minimum floor when the
+/// constant floor is tighter over both endpoints.
+#[inline]
+fn clamp_lower_to_floor(
+    lower_slope: f32,
+    lower_intercept: f32,
+    l: f32,
+    u: f32,
+    min_v: f32,
+) -> (f32, f32) {
+    if !lower_slope.is_finite() || !lower_intercept.is_finite() || !min_v.is_finite() {
+        return (lower_slope, lower_intercept);
+    }
+    let at_l = lower_slope * l + lower_intercept;
+    let at_u = lower_slope * u + lower_intercept;
+    let concretized = nan_min(at_l, at_u);
+    // MATERIAL-GAIN GUARD, ported from production to close a drift caught by
+    // `tests/drift.rs`: at l = 0, u = 1e-8 the bare `min_v > concretized` test
+    // fired and flattened the line to slope 0, while production kept the
+    // slope-0.5 chord (GELU'(0) = 0.5).
+    //
+    // A freshly sound-rounded chord anchored at the interval minimum normally
+    // lands a handful of ULPs below `min_v`, purely from the outward rounding in
+    // `sound_affine_intercepts`. Flattening on that trades away ALL affine
+    // correlation for a numerically meaningless gain. The 32-epsilon allowance
+    // covers that conversion/multiply/add slack; a genuinely bad negative-tail
+    // tangent (which is what the floor exists for — on [-6.5, 1.5] the tangent
+    // concretizes to -7.29 against a true minimum of -0.17) exceeds it by orders
+    // of magnitude.
+    //
+    // Both branches are sound; this only chooses between two valid lower lines.
+    let scale = f64::from(min_v.abs().max(concretized.abs()).max(1.0));
+    let material_gain = 32.0 * f64::from(f32::EPSILON) * scale;
+    if f64::from(min_v) - f64::from(concretized) > material_gain {
+        // Constant floor is the tighter (higher) sound lower bound.
+        (0.0, min_v)
+    } else {
+        (lower_slope, lower_intercept)
+    }
+}
+
+#[inline]
+fn nan_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else {
+        a.min(b)
+    }
+}
+
+#[inline]
+fn sound_affine_intercepts(
+    slope_f64: f64,
+    slope_f32: f32,
+    intercept_f64: f64,
+    max_abs_x: f32,
+) -> (f32, f32) {
+    let eval_err = f32_affine_eval_error(slope_f64, slope_f32, intercept_f64, max_abs_x);
+    (
+        next_down_f32(f64_to_f32_down(intercept_f64 - eval_err)),
+        next_up_f32(f64_to_f32_up(intercept_f64 + eval_err)),
+    )
 }
 
 /// Compute sound linear relaxation for Erf GELU on interval [l, u].
@@ -60,14 +127,8 @@ pub fn gelu_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
     let k_direct_64 = (gu_64 - gl_64) / (u as f64 - l as f64);
     let b_direct_64 = gl_64 - k_direct_64 * l as f64;
     let k_direct = k_direct_64 as f32;
-    let chord_slope_err =
-        next_up_f32(((k_direct_64 - k_direct as f64).abs() * max_abs_x as f64) as f32);
-    // Account for f32 multiplication rounding: `slope * x` has error up to
-    // |slope| * |x| * f32::EPSILON. Same fix as sqrt.rs (#4368).
-    let chord_mul_err = next_up_f32((k_direct.abs() * max_abs_x) * f32::EPSILON);
-    let b_direct_f32 = b_direct_64 as f32;
-    let b_direct_lower = next_down_f32(b_direct_f32 - chord_slope_err - chord_mul_err);
-    let b_direct_upper = next_up_f32(b_direct_f32 + chord_slope_err + chord_mul_err);
+    let (b_direct_lower, b_direct_upper) =
+        sound_affine_intercepts(k_direct_64, k_direct, b_direct_64, max_abs_x);
 
     // auto_LiRPA "not optimized (vanilla CROWN)" mode uses a mid-point tangent in some cases.
     // Compute in f64 to avoid cancellation in b_mid = gelu(m) - k_mid * m.
@@ -77,11 +138,7 @@ pub fn gelu_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
     let k_mid_64 = gelu_derivative_erf_f64(m_64);
     let b_mid_64 = gelu_erf_f64(m_64) - k_mid_64 * m_64;
     let k_mid = k_mid_64 as f32;
-    let mid_slope_err = next_up_f32(((k_mid_64 - k_mid as f64).abs() * max_abs_x as f64) as f32);
-    let mid_mul_err = next_up_f32((k_mid.abs() * max_abs_x) * f32::EPSILON);
-    let b_mid_f32 = b_mid_64 as f32;
-    let b_mid_lower = next_down_f32(b_mid_f32 - mid_slope_err - mid_mul_err);
-    let b_mid_upper = next_up_f32(b_mid_f32 + mid_slope_err + mid_mul_err);
+    let (b_mid_lower, b_mid_upper) = sound_affine_intercepts(k_mid_64, k_mid, b_mid_64, max_abs_x);
 
     // Case masks (scalar version of auto_LiRPA's BoundGelu._init_masks()).
     let mask_left_pos = l >= -SQRT_2 && u <= 0.0;
@@ -178,6 +235,8 @@ pub fn gelu_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32) {
     let (min_v, max_v) = gelu_bound_interval(l, u, GeluApproximation::Erf);
     let (lower_slope, lower_intercept) = finalize_bound(lower, min_v);
     let (upper_slope, upper_intercept) = finalize_bound(upper, max_v);
+    let (lower_slope, lower_intercept) =
+        clamp_lower_to_floor(lower_slope, lower_intercept, l, u, min_v);
 
     // Post-hoc soundness verification: table precomputation uses f64 bisection for
     // high-precision tangent points, but step=0.01 discretization and f32 tangent
@@ -224,12 +283,8 @@ pub fn gelu_tanh_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32)
     let k_direct_64 = (gu_64 - gl_64) / (u as f64 - l as f64);
     let b_direct_64 = gl_64 - k_direct_64 * l as f64;
     let k_direct = k_direct_64 as f32;
-    let chord_slope_err =
-        next_up_f32(((k_direct_64 - k_direct as f64).abs() * max_abs_x as f64) as f32);
-    let chord_mul_err = next_up_f32((k_direct.abs() * max_abs_x) * f32::EPSILON);
-    let b_direct_f32 = b_direct_64 as f32;
-    let b_direct_lower = next_down_f32(b_direct_f32 - chord_slope_err - chord_mul_err);
-    let b_direct_upper = next_up_f32(b_direct_f32 + chord_slope_err + chord_mul_err);
+    let (b_direct_lower, b_direct_upper) =
+        sound_affine_intercepts(k_direct_64, k_direct, b_direct_64, max_abs_x);
 
     // Compute midpoint tangent in f64 to avoid cancellation in b_mid = gelu(m) - k_mid * m.
     // Directed rounding (#3156): same slope truncation error pattern as chord.
@@ -238,11 +293,7 @@ pub fn gelu_tanh_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32)
     let k_mid_64 = gelu_derivative_tanh_f64(m_64);
     let b_mid_64 = gelu_tanh_f64(m_64) - k_mid_64 * m_64;
     let k_mid = k_mid_64 as f32;
-    let mid_slope_err = next_up_f32(((k_mid_64 - k_mid as f64).abs() * max_abs_x as f64) as f32);
-    let mid_mul_err = next_up_f32((k_mid.abs() * max_abs_x) * f32::EPSILON);
-    let b_mid_f32 = b_mid_64 as f32;
-    let b_mid_lower = next_down_f32(b_mid_f32 - mid_slope_err - mid_mul_err);
-    let b_mid_upper = next_up_f32(b_mid_f32 + mid_slope_err + mid_mul_err);
+    let (b_mid_lower, b_mid_upper) = sound_affine_intercepts(k_mid_64, k_mid, b_mid_64, max_abs_x);
 
     // Case masks (tanh-approx split at ±split).
     let mask_left_pos = l >= -split && u <= 0.0;
@@ -330,6 +381,8 @@ pub fn gelu_tanh_sound_linear_relaxation(l: f32, u: f32) -> (f32, f32, f32, f32)
     let (min_v, max_v) = gelu_bound_interval(l, u, GeluApproximation::Tanh);
     let (lower_slope, lower_intercept) = finalize_bound(lower, min_v);
     let (upper_slope, upper_intercept) = finalize_bound(upper, max_v);
+    let (lower_slope, lower_intercept) =
+        clamp_lower_to_floor(lower_slope, lower_intercept, l, u, min_v);
 
     // Post-hoc soundness verification (same as Erf path).
     gelu_posthoc_adjust(
@@ -395,11 +448,8 @@ pub fn gelu_sound_linear_relaxation_with_alpha(l: f32, u: f32, alpha: f32) -> (f
     let k_direct_64 = (gu_64 - gl_64) / (u as f64 - l as f64);
     let b_direct_64 = gl_64 - k_direct_64 * l as f64;
     let k_direct = k_direct_64 as f32;
-    let chord_slope_err =
-        next_up_f32(((k_direct_64 - k_direct as f64).abs() * max_abs_x as f64) as f32);
-    let chord_mul_err = next_up_f32((k_direct.abs() * max_abs_x) * f32::EPSILON);
-    let b_direct_f32 = b_direct_64 as f32;
-    let b_direct_upper = next_up_f32(b_direct_f32 + chord_slope_err + chord_mul_err);
+    let (_b_direct_lower, b_direct_upper) =
+        sound_affine_intercepts(k_direct_64, k_direct, b_direct_64, max_abs_x);
 
     // Compute lower bound: tangent at alpha-parameterized point.
     let t = l + alpha * (u - l);

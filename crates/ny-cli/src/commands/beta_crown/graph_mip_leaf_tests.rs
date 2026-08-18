@@ -11,11 +11,16 @@
 
 use super::*;
 
+#[cfg(test)]
 use super::super::graph_mip::encode_graph;
 
+#[cfg(test)]
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
+#[cfg(test)]
 use ny_propagate::beta_crown::graph_mip_leaf::LeafSplit;
+#[cfg(test)]
 use ny_propagate::layers::{LinearLayer, ReLULayer};
+#[cfg(test)]
 use ny_propagate::{GraphNode, NETWORK_INPUT};
 
 #[test]
@@ -39,6 +44,7 @@ fn graph_mip_leaf_gate_value_contract() {
 }
 
 /// input(2) -> linear (identity 2x2) -> relu, output = relu.
+#[cfg(test)]
 fn tiny_graph() -> GraphNetwork {
     let w = Array2::from_shape_vec((2, 2), vec![1.0f32, 0.0, 0.0, 1.0]).unwrap();
     let b = Array1::from_vec(vec![0.0f32, 0.0]);
@@ -57,6 +63,7 @@ fn tiny_graph() -> GraphNetwork {
     graph
 }
 
+#[cfg(test)]
 fn boxed(lo: Vec<f32>, hi: Vec<f32>) -> Arc<BoundedTensor> {
     let n = lo.len();
     Arc::new(
@@ -68,6 +75,7 @@ fn boxed(lo: Vec<f32>, hi: Vec<f32>) -> Arc<BoundedTensor> {
     )
 }
 
+#[cfg(test)]
 fn tiny_node_bounds() -> HashMap<String, Arc<BoundedTensor>> {
     let mut m = HashMap::new();
     // Both pre-activation neurons unstable in [-1, 1].
@@ -75,6 +83,7 @@ fn tiny_node_bounds() -> HashMap<String, Arc<BoundedTensor>> {
     m
 }
 
+#[cfg(test)]
 fn split(neuron: usize, active: bool) -> LeafSplit {
     LeafSplit {
         relu_node: "relu".to_string(),
@@ -368,14 +377,11 @@ fn leaf_scale_gates_decline_oversize_leaves() {
     let graph = tiny_graph();
     let nb = tiny_node_bounds();
 
-    // Estimator sanity on the tiny net: 2x2 linear (out×(in+1)=6) + 2 unstable
-    // ReLUs (~10) — well under any cap.
+    // Exact estimator parity on the tiny net: 2x2 linear
+    // (out×(in+1)=6) + two unstable ReLUs × seven row coefficients = 20.
     let flat = clamped_flat_bounds(&graph, &nb, &[]).expect("clamp");
     let nnz = estimate_encode_nnz(&graph, &flat).expect("estimate");
-    assert!(
-        (6..=64).contains(&nnz),
-        "tiny-net estimate sane (got {nnz})"
-    );
+    assert_eq!(nnz, 20, "estimator must count every big-M coefficient");
 
     // Free-binary gate: solve_leaf_gated declines when free > leaf cap.
     // (Direct gate check via the counting helpers — env-free.)
@@ -422,6 +428,7 @@ fn confirmed_sat_latches_oracle_off() {
 // #relational-bab: edge-domain escalation with the REAL exact solver.
 // ═════════════════════════════════════════════════════════════════════════════
 
+#[cfg(test)]
 mod relational_edge_milp {
     use ndarray::{arr1, arr2};
     use ny_propagate::{
@@ -639,7 +646,7 @@ mod relational_edge_milp {
 /// escalation's request on the REAL instance_0 iso difference net and a deep
 /// center sub-box; print the verdict + timing + the free-binary count under
 /// BOTH map conventions.
-mod live_decline_probe {
+pub(crate) mod live_decline_probe {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
@@ -649,19 +656,10 @@ mod live_decline_probe {
     };
     use ny_tensor::BoundedTensor;
 
-    #[test]
-    fn probe_real_diffnet_edge_request() {
+    pub(crate) fn probe_real_diffnet_edge_request(base: &std::path::Path) {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("debug")
             .try_init();
-        let base = std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
-        ));
-        if !base.is_dir() {
-            eprintln!("benchmarks absent; skipping");
-            return;
-        }
         let f = base.join("onnx/original/ACASXU_run2a_2_4_batch_2000.onnx");
         let g = base.join("onnx/perturbed/ACASXU_run2a_2_4_batch_2000_perturbed_0.onnx");
         let graph_f = crate::commands::vnncomp::load_graph_network(&f).expect("load f");
@@ -741,52 +739,13 @@ mod live_decline_probe {
             );
         }
     }
-
-    /// Measurement-only A/B for AY's experimental margin optimization on the
-    /// real instance_0 difference-net edge boxes above.  The child-process
-    /// boundary keeps both startup policies exact without mutating this test
-    /// process's environment.  The ordinary/default arm exercises certified
-    /// plain feasibility; the force arm passes NY's typed marker into AY.
-    ///
-    /// Run:
-    ///   cargo test -p ny-cli --features mip --release \
-    ///     trace_real_diffnet_margin_reframe_ab -- --ignored --nocapture
-    #[test]
-    #[ignore = "measurement: needs local isomorphic-ACAS benchmark files"]
-    fn trace_real_diffnet_margin_reframe_ab() {
-        let exe = std::env::current_exe().expect("current test executable");
-        let inner =
-            "commands::beta_crown::graph_mip_leaf::tests::live_decline_probe::probe_real_diffnet_edge_request";
-        for (label, force) in [("plain-default", false), ("margin-force-on", true)] {
-            let mut command = std::process::Command::new(&exe);
-            command
-                .args(["--exact", inner, "--nocapture", "--test-threads=1"])
-                .env_remove("AY_MILP_NO_MARGIN_REFRAME");
-            if force {
-                command.env("NY_AY_MARGIN_REFRAME", "1");
-            } else {
-                command.env_remove("NY_AY_MARGIN_REFRAME");
-            }
-            let started = Instant::now();
-            let output = command.output().expect("run isolated real-fixture arm");
-            eprintln!(
-                "\n===== margin-reframe real-fixture arm: {label} ({:.3}s) =====\n{}{}",
-                started.elapsed().as_secs_f64(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            assert!(
-                output.status.success(),
-                "real-fixture child arm {label} failed"
-            );
-        }
-    }
 }
 
 /// #relational-bab: ZERO-BINARY edge domains (every neuron stable on the box)
 /// are pure LPs and MUST decide through the certified enumeration lane
 /// (`2^0 = 1` Farkas-certified leaf). This is the oracle-level pin for the
 /// live "free_binaries=0" class.
+#[cfg(test)]
 mod zero_binary_edge {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -870,14 +829,19 @@ mod zero_binary_edge {
 // ═════════════════════════════════════════════════════════════════════════════
 // #rel-whole-mip: WHOLE-NET certified-UNSAT MILP on a DIFFERENCE network.
 // ═════════════════════════════════════════════════════════════════════════════
-mod whole_net_diff_mip {
+pub(crate) mod whole_net_diff_mip {
+    #[cfg(test)]
     use ndarray::{arr1, arr2};
     use ny_core::Bound;
+    #[cfg(test)]
     use ny_propagate::layers::{LinearLayer, ReLULayer};
-    use ny_propagate::{build_difference_network, GraphNetwork, GraphNode, Layer};
+    use ny_propagate::{build_difference_network, GraphNetwork};
+    #[cfg(test)]
+    use ny_propagate::{GraphNode, Layer};
 
     /// One isomorphic-style tower: input(2) → Linear(2→3) → ReLU → Linear(3→1),
     /// with an optional per-layer weight scale to model the g perturbation.
+    #[cfg(test)]
     fn tower(scale: f32) -> GraphNetwork {
         let w1 = arr2(&[[1.0_f32, -0.6], [0.5, 0.8], [-0.9, 0.4]]).mapv(|v| v * scale);
         let b1 = arr1(&[0.1_f32, -0.2, 0.05]);
@@ -1065,12 +1029,11 @@ mod whole_net_diff_mip {
     /// ~80-binary MILP exists ONLY per-SUBDOMAIN (after input splitting) — the
     /// per-domain leaf oracle path (NY_REL_EDGE_MILP), not the whole-net root.
     ///
-    /// Run:
-    ///   cargo test -p ny-cli --features mip --release \
-    ///     measure_iso_diff_whole_net_mip_bb2b6088 -- --ignored --nocapture
+    /// Run through `ny vnncomp-research graph-mip whole-net-bb2b6088
+    /// --bench-dir <isomorphic-acas-2.0>`.
     ///
-    /// Overrides (env): NY_ISO_BENCH_DIR, NY_ISO_F_ONNX, NY_ISO_G_ONNX,
-    ///   NY_ISO_VNNLIB, NY_ISO_ROW_SECS (default 60), NY_ISO_TOTAL_SECS (480).
+    /// Overrides (env): NY_ISO_F_ONNX, NY_ISO_G_ONNX, NY_ISO_VNNLIB,
+    ///   NY_ISO_ROW_SECS (default 60), NY_ISO_TOTAL_SECS (480).
     /// MEASUREMENT — coupled-OBBT big-M shrink on the real iso diff nets.
     ///
     /// For each instance, replays the production finisher's tightening pipeline
@@ -1078,51 +1041,49 @@ mod whole_net_diff_mip {
     /// pre-activation box-width distribution at each stage plus the OBBT cost.
     /// This isolates the OBBT lever's effect on the difference-net big-M.
     ///
-    ///   cargo test --release -p ny-cli --features mip \
-    ///     measure_obbt_box_width_iso -- --ignored --nocapture
+    /// Run through `ny vnncomp-research graph-mip obbt-box-width
+    /// --bench-dir <isomorphic-acas-2.0>`.
     ///
-    /// Overrides (env): NY_ISO_BENCH_DIR, NY_ISO_INSTANCES ("0,1,6"),
-    ///   NY_ISO_OBBT_BUDGET_S (20). Reads the same NY_REL_WHOLE_MIP_OBBT_* knobs
+    /// Overrides (env): NY_ISO_INSTANCES ("0,1,6"), NY_ISO_OBBT_BUDGET_S
+    ///   (20). Reads the same NY_REL_WHOLE_MIP_OBBT_* knobs
     ///   the production path reads.
-    #[test]
-    #[ignore = "measurement: needs local iso benchmark files"]
-    fn measure_obbt_box_width_iso() {
+    pub(crate) fn measure_obbt_box_width_iso(base: &std::path::Path) -> anyhow::Result<()> {
         use ndarray::Array1;
         use ny_tensor::BoundedTensor;
         use std::collections::HashMap;
         use std::path::Path;
         use std::time::{Duration, Instant};
 
-        let dir = std::env::var("NY_ISO_BENCH_DIR").unwrap_or_else(|_| {
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../benchmarks/vnncomp2026/benchmarks/isomorphic_acasxu_2026/2.0",
-            )
-            .to_string()
-        });
-        let instances: Vec<usize> = std::env::var("NY_ISO_INSTANCES")
-            .unwrap_or_else(|_| "0,1,2,3,4,5,6,7,8,9".into())
+        let dir = base.display().to_string();
+        let instance_list =
+            std::env::var("NY_ISO_INSTANCES").unwrap_or_else(|_| "0,1,2,3,4,5,6,7,8,9".into());
+        let instances: Vec<usize> = instance_list
             .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
+            .map(|s| {
+                s.trim()
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid NY_ISO_INSTANCES entry {s:?}: {e}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        anyhow::ensure!(
+            !instances.is_empty(),
+            "NY_ISO_INSTANCES must select at least one row"
+        );
         let obbt_budget_s: f64 = std::env::var("NY_ISO_OBBT_BUDGET_S")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(20.0);
 
         let csv = format!("{dir}/instances.csv");
-        let Ok(csv_text) = std::fs::read_to_string(&csv) else {
-            eprintln!("SKIP measure_obbt_box_width_iso: missing {csv}");
-            return;
-        };
+        let csv_text = std::fs::read_to_string(&csv).expect("read validated instances.csv");
         let lines: Vec<&str> = csv_text.lines().collect();
 
         println!("\n════════ coupled-OBBT big-M shrink — iso diff nets ════════");
         println!("bench dir: {dir}");
         for &idx in &instances {
-            let Some(line) = lines.get(idx) else {
-                continue;
-            };
+            let line = lines
+                .get(idx)
+                .ok_or_else(|| anyhow::anyhow!("instances.csv has no row {idx}"))?;
             // Parse the f/g onnx relative paths + the vnnlib path out of the row.
             let f_rel = line
                 .split("'onnx/")
@@ -1139,26 +1100,29 @@ mod whole_net_diff_mip {
                 .nth(1)
                 .and_then(|s| s.split(',').next())
                 .map(|s| s.to_string());
-            let (Some(f_rel), Some(g_rel), Some(v_rel)) = (f_rel, g_rel, v_rel) else {
-                eprintln!("instance {idx}: could not parse csv row; skip");
-                continue;
-            };
+            let f_rel =
+                f_rel.ok_or_else(|| anyhow::anyhow!("instance {idx}: missing first ONNX path"))?;
+            let g_rel =
+                g_rel.ok_or_else(|| anyhow::anyhow!("instance {idx}: missing second ONNX path"))?;
+            let v_rel =
+                v_rel.ok_or_else(|| anyhow::anyhow!("instance {idx}: missing VNN-LIB path"))?;
             let fp = format!("{dir}/{f_rel}");
             let gp = format!("{dir}/{g_rel}");
             let vp = format!("{dir}/{v_rel}");
-            if [&fp, &gp, &vp].iter().any(|p| !Path::new(p).is_file()) {
-                eprintln!("instance {idx}: missing a benchmark file; skip");
-                continue;
+            for p in [&fp, &gp, &vp] {
+                anyhow::ensure!(
+                    Path::new(p).is_file(),
+                    "instance {idx}: missing benchmark file {p}"
+                );
             }
 
             let spec = ny_onnx::vnnlib::load_vnnlib(&vp).expect("load vnnlib");
             let dual = spec.dual_network.as_ref().expect("dual-network spec");
             let epsilon = match dual.property {
                 ny_onnx::vnnlib::DualNetworkProperty::EpsilonEquivalence { epsilon } => epsilon,
-                ref other => {
-                    eprintln!("instance {idx}: not epsilon-equivalence ({other:?}); skip");
-                    continue;
-                }
+                ref other => anyhow::bail!(
+                    "instance {idx}: expected epsilon-equivalence property, found {other:?}"
+                ),
             };
             let input_bounds = crate::commands::vnncomp::bounds_from_f64(&dual.f_input_bounds)
                 .expect("input bounds");
@@ -1286,11 +1250,10 @@ mod whole_net_diff_mip {
             }
         }
         println!("═══════════════════════════════════════════════════════════\n");
+        Ok(())
     }
 
-    #[test]
-    #[ignore = "measurement: needs local iso benchmark files + ay bb2b6088"]
-    fn measure_iso_diff_whole_net_mip_bb2b6088() {
+    pub(crate) fn measure_iso_diff_whole_net_mip_bb2b6088(base: &std::path::Path) {
         use ndarray::Array1;
         use ny_mip::{MipBackend, MipConfig, MipResult, MipSolver};
         use ny_propagate::NETWORK_INPUT;
@@ -1299,13 +1262,7 @@ mod whole_net_diff_mip {
         use std::path::Path;
         use std::time::{Duration, Instant};
 
-        let dir = std::env::var("NY_ISO_BENCH_DIR").unwrap_or_else(|_| {
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
-            )
-            .to_string()
-        });
+        let dir = base.display().to_string();
         let f_rel = std::env::var("NY_ISO_F_ONNX")
             .unwrap_or_else(|_| "onnx/original/ACASXU_run2a_3_8_batch_2000.onnx".into());
         let g_rel = std::env::var("NY_ISO_G_ONNX").unwrap_or_else(|_| {
@@ -1326,10 +1283,10 @@ mod whole_net_diff_mip {
         let gp = format!("{dir}/{g_rel}");
         let vp = format!("{dir}/{v_rel}");
         for p in [&fp, &gp, &vp] {
-            if !Path::new(p).is_file() {
-                eprintln!("SKIP measure_iso_diff_whole_net_mip: missing benchmark file {p}");
-                return;
-            }
+            assert!(
+                Path::new(p).is_file(),
+                "validated benchmark file disappeared: {p}"
+            );
         }
 
         // ε + shared input box from the parsed dual spec (production path).
@@ -1542,14 +1499,8 @@ mod whole_net_diff_mip {
     }
 
     // ── shared helpers for the k-vs-depth + ay-ceiling measurement ──────────
-    fn load_iso_diff() -> Option<(GraphNetwork, Vec<Bound>, f64, String)> {
-        let dir = std::env::var("NY_ISO_BENCH_DIR").unwrap_or_else(|_| {
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
-            )
-            .to_string()
-        });
+    fn load_iso_diff(base: &std::path::Path) -> (GraphNetwork, Vec<Bound>, f64, String) {
+        let dir = base.display().to_string();
         let f_rel = std::env::var("NY_ISO_F_ONNX")
             .unwrap_or_else(|_| "onnx/original/ACASXU_run2a_3_8_batch_2000.onnx".into());
         let g_rel = std::env::var("NY_ISO_G_ONNX").unwrap_or_else(|_| {
@@ -1561,10 +1512,10 @@ mod whole_net_diff_mip {
         let gp = format!("{dir}/{g_rel}");
         let vp = format!("{dir}/{v_rel}");
         for p in [&fp, &gp, &vp] {
-            if !std::path::Path::new(p).is_file() {
-                eprintln!("SKIP k-vs-depth measurement: missing benchmark file {p}");
-                return None;
-            }
+            assert!(
+                std::path::Path::new(p).is_file(),
+                "validated benchmark file disappeared: {p}"
+            );
         }
         let spec = ny_onnx::vnnlib::load_vnnlib(&vp).expect("load vnnlib");
         let dual = spec.dual_network.as_ref().expect("dual-network spec");
@@ -1579,7 +1530,7 @@ mod whole_net_diff_mip {
         let gg = crate::commands::vnncomp::load_graph_network(std::path::Path::new(&gp))
             .expect("load g onnx");
         let diff = build_difference_network(&gf, &gg).expect("diff net");
-        Some((diff, input_bounds, epsilon, v_rel))
+        (diff, input_bounds, epsilon, v_rel)
     }
 
     /// Encode the diff net over `input_bounds` with CROWN-IBP node boxes (the
@@ -1676,17 +1627,13 @@ mod whole_net_diff_mip {
     ///   better splitter (low-k at shallow depth) AND an exact MILP that
     ///   certifies these ~60-250-binary leaves in seconds. Neither exists today.
     ///
-    /// Run: cargo test -p ny-cli --features mip --release \
-    ///        measure_iso_k_vs_depth_and_ay_ceiling -- --ignored --nocapture
-    #[test]
-    #[ignore = "measurement: k-vs-depth curve + ay per-domain tractability ceiling"]
-    fn measure_iso_k_vs_depth_and_ay_ceiling() {
+    /// Run through `ny vnncomp-research graph-mip k-vs-depth-ay
+    /// --bench-dir <isomorphic-acas-2.0>`.
+    pub(crate) fn measure_iso_k_vs_depth_and_ay_ceiling(base: &std::path::Path) {
         use ny_mip::{MipBackend, MipConfig, MipResult, MipSolver};
         use std::time::Instant;
 
-        let Some((diff, input_bounds, epsilon, v_rel)) = load_iso_diff() else {
-            return;
-        };
+        let (diff, input_bounds, epsilon, v_rel) = load_iso_diff(base);
         let eps32 = ny_tensor::next_down_f32(epsilon as f32).max(0.0);
 
         // ── MEASUREMENT A: worst-leaf k vs depth ──────────────────────────
@@ -1812,27 +1759,13 @@ mod whole_net_diff_mip {
     /// streams), so binaries are `{0,1}` disjunctions and every coefficient is
     /// an exact dyadic rational.
     ///
-    /// Files land in the directory named by `NY_ISO_CORPUS_DIR` (required;
-    /// the test skips when unset); the ACTUAL measured k is used in each
-    /// filename.
-    ///
-    /// Run: cargo test -p ny-cli --features mip --release \
-    ///        emit_iso_diff_smtlib_corpus -- --ignored --nocapture
-    #[test]
-    #[ignore = "corpus emit: needs local iso benchmark files; writes SMT-LIB to NY_ISO_CORPUS_DIR"]
-    fn emit_iso_diff_smtlib_corpus() {
-        let Some((diff, input_bounds, epsilon, v_rel)) = load_iso_diff() else {
-            return;
-        };
+    /// Files land in the explicit output directory supplied by the research
+    /// CLI; the ACTUAL measured k is used in each filename.
+    pub(crate) fn emit_iso_diff_smtlib_corpus(base: &std::path::Path, out_dir: &std::path::Path) {
+        let (diff, input_bounds, epsilon, v_rel) = load_iso_diff(base);
         let eps32 = ny_tensor::next_down_f32(epsilon as f32).max(0.0);
 
-        let Ok(out_dir) = std::env::var("NY_ISO_CORPUS_DIR") else {
-            eprintln!(
-                "SKIP emit_iso_diff_smtlib_corpus: set NY_ISO_CORPUS_DIR to an output directory"
-            );
-            return;
-        };
-        std::fs::create_dir_all(&out_dir).expect("create corpus dir");
+        std::fs::create_dir_all(out_dir).expect("create corpus dir");
 
         // ── build the worst-leaf k-vs-depth curve (== MEASUREMENT A) ──────────
         let max_depth = 20usize;
@@ -1919,8 +1852,8 @@ mod whole_net_diff_mip {
 
             let dec_name = format!("acasxu_iso_inst6_{label}{k}_dec.smt2");
             let min_name = format!("acasxu_iso_inst6_{label}{k}_min.smt2");
-            let dec_path = format!("{out_dir}/{dec_name}");
-            let min_path = format!("{out_dir}/{min_name}");
+            let dec_path = out_dir.join(&dec_name);
+            let min_path = out_dir.join(&min_name);
             std::fs::write(&dec_path, &dec_txt).expect("write dec smt2");
             std::fs::write(&min_path, &min_txt).expect("write min smt2");
 
@@ -1941,15 +1874,16 @@ mod whole_net_diff_mip {
                 obj_col.0
             );
         }
-        println!("corpus dir: {out_dir}");
+        println!("corpus dir: {}", out_dir.display());
         println!("═══════════════════════════════════════════════════════════════\n");
     }
 
     /// #rel-multineuron LEVER PROBE — multi-neuron (k-ReLU / octahedral)
     /// intra-layer coupling on the diff-net band objective, vs input-split depth.
     /// The one SOUND method that provably beats the triangle-LP optimum (α gives
-    /// 0 gain there). Intra-layer pair coupling — NOT the f-g paired-ReLU coupling
-    /// measured dead in coupled_relu_probe.rs. Fires on the MLP diff net via
+    /// 0 gain there). Intra-layer pair coupling — NOT the f-g paired-ReLU
+    /// coupling already measured dead by the superseded offline prototype.
+    /// Fires on the MLP diff net via
     /// NY_MULTINEURON_MLP=1 (a 1-line target_relu_nodes scope extension: the
     /// main-path pair machinery is layer-agnostic — combined_rows_octahedra does
     /// set_output(pre_node), so it works on Add/MatMul-fed ReLUs; sound max fold).
@@ -1973,21 +1907,8 @@ mod whole_net_diff_mip {
     ///     gated shot. 90/100 stands. The MLP-scope unlock (sound, default-OFF)
     ///     is kept for other relational surfaces where facets may actually bind.
     ///
-    /// Run: cargo test -p ny-cli --features mip --release \
-    ///   measure_iso_multineuron_root_tightening -- --ignored --nocapture
-    #[test]
-    #[ignore = "measurement: multineuron root injection on the iso diff net"]
-    fn measure_iso_multineuron_root_tightening() {
-        // Arm the lever + the MLP-scope bypass (default-OFF elsewhere).
-        // (Serialized + restored via the blessed env choke point — clippy env
-        // wall.)
-        let _env_lock = ny_test_utils::env::lock_env();
-        let _g_mn = ny_test_utils::env::ScopedEnvVar::set("NY_MULTINEURON", "1");
-        let _g_mlp = ny_test_utils::env::ScopedEnvVar::set("NY_MULTINEURON_MLP", "1");
-
-        let Some((diff, input_bounds, epsilon, v_rel)) = load_iso_diff() else {
-            return;
-        };
+    pub(crate) fn measure_iso_multineuron_root_tightening(base: &std::path::Path) {
+        let (diff, input_bounds, epsilon, v_rel) = load_iso_diff(base);
         let eps = epsilon as f32;
 
         // multineuron-tightened band-objective margin_min over ONE sub-box.

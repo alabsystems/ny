@@ -12,9 +12,10 @@ use ny_tensor::BoundedTensor;
 // =========================================================================
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_load_with_structure() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let whisper = whisper_tiny_encoder();
 
     println!("\n=== Whisper Model Structure ===");
@@ -49,9 +50,10 @@ fn test_whisper_load_with_structure() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_encoder_stem_extraction() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let whisper = whisper_tiny_encoder();
     let stem = whisper.encoder_stem().expect("Failed to extract stem");
 
@@ -90,9 +92,10 @@ fn test_whisper_encoder_stem_extraction() {
 }
 
 #[ntest::timeout(120000)] // ~30s runtime; 4x margin for CI variability.
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_encoder_layer_extraction() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let whisper = whisper_tiny_encoder();
     let full_network = whisper_tiny_propagate_network();
 
@@ -172,9 +175,10 @@ fn test_whisper_encoder_layer_extraction() {
 // timer, which exceeds the old 10s budget under parallel suite load. 120s
 // matches the heavy whisper siblings and still guards against hangs.
 #[ntest::timeout(120000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_single_block_ibp() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test IBP propagation through a single encoder block
     let whisper = whisper_tiny_encoder();
     let full_network = whisper_tiny_propagate_network();
@@ -224,9 +228,10 @@ fn test_whisper_single_block_ibp() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_param_count_from_load() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let whisper = whisper_tiny_encoder();
     let param_count = whisper.param_count();
 
@@ -249,9 +254,10 @@ fn test_whisper_param_count_from_load() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_block_layer_structure() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let whisper = whisper_tiny_encoder();
     let block_info = whisper.block_info(0).expect("Block 0 not found");
 

@@ -11,6 +11,7 @@ use tracing::{debug, info};
 
 use super::stats::{difficulty_score, make_unit_variance_input, median};
 use super::types::{BoundStatus, LayerProfile, ProfileConfig, ProfileError, ProfileResult};
+use crate::analysis_error::validate_analysis_epsilon;
 
 /// Analyze a GraphNetwork's bound profile using the normalized `analyze_*`
 /// verb family.
@@ -31,6 +32,8 @@ pub fn profile_bounds_graph(
     config: &ProfileConfig,
     input_shape: &[usize],
 ) -> Result<ProfileResult, ProfileError> {
+    validate_analysis_epsilon("profile/graph", config.epsilon)?;
+
     // Create input tensor
     // Use unit-variance input to avoid artificial amplification in LayerNorm/RMSNorm
     let input = if let Some(ref inp) = config.input {
@@ -67,6 +70,10 @@ pub fn profile_bounds_graph(
     // Cache bounds for each node
     let mut bounds_cache: std::collections::HashMap<String, BoundedTensor> =
         std::collections::HashMap::new();
+    // Nodes whose diagnostic bounds depend on a substituted value after a
+    // propagation error. Taint follows graph edges, so an independent branch
+    // remains meaningful while every descendant of a failure stays failed.
+    let mut propagation_failed_nodes = std::collections::HashSet::<String>::new();
 
     // Helper to get bounds for an input (either from cache or network input)
     fn get_bounds<'a>(
@@ -110,6 +117,10 @@ pub fn profile_bounds_graph(
         // Concat MUST be checked before is_binary() because Layer::is_binary()
         // returns true for Concat. Without this ordering, n-ary Concat (3+ inputs)
         // would silently drop inputs beyond the first two. (#2405)
+        let mut propagation_failed = node
+            .inputs()
+            .iter()
+            .any(|input_name| propagation_failed_nodes.contains(input_name));
         let output = if let Layer::Concat(concat) = node.layer() {
             // Handle constant_inputs interleaving (same pattern as dispatch.rs). (#2405)
             let owned_inputs: Vec<BoundedTensor> = if let Some(ref ci) = concat.constant_inputs {
@@ -147,6 +158,7 @@ pub fn profile_bounds_graph(
                     if overflow_at_layer.is_none() {
                         overflow_at_layer = Some(i);
                     }
+                    propagation_failed = true;
                     owned_inputs
                         .into_iter()
                         .next()
@@ -172,6 +184,7 @@ pub fn profile_bounds_graph(
                     if overflow_at_layer.is_none() {
                         overflow_at_layer = Some(i);
                     }
+                    propagation_failed = true;
                     input_a.into_owned()
                 }
             }
@@ -193,6 +206,7 @@ pub fn profile_bounds_graph(
                     if overflow_at_layer.is_none() {
                         overflow_at_layer = Some(i);
                     }
+                    propagation_failed = true;
                     node_input.into_owned()
                 }
             }
@@ -224,7 +238,7 @@ pub fn profile_bounds_graph(
         };
 
         // Determine status
-        let has_overflow = !output_width.is_finite();
+        let has_overflow = propagation_failed || !output_width.is_finite();
         let status = if has_overflow {
             if overflow_at_layer.is_none() {
                 overflow_at_layer = Some(i);
@@ -258,6 +272,9 @@ pub fn profile_bounds_graph(
             break;
         }
 
+        if propagation_failed {
+            propagation_failed_nodes.insert(node_name.clone());
+        }
         bounds_cache.insert(node_name.clone(), output);
     }
 

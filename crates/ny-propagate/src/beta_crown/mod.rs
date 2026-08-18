@@ -52,16 +52,20 @@ pub(crate) mod bab_cuts;
 /// surviving-unverified BaB subboxes at exhaustion, exported as attack seeds
 /// for ny-cli's post-BaB falsification lane. Attack-only guidance.
 pub mod bab_frontier_export;
+mod biccos_q_stage0;
 pub(crate) mod branching;
 pub(crate) mod config;
+mod conflict_clause_replay;
 pub(crate) mod conflict_clauses;
 pub(crate) mod conflict_clauses_graph;
+mod conjunctive_proof_objectives;
 pub mod constraint_store;
 pub(crate) mod domain;
 /// Graph-MIP leaf oracle seam (increment 6): implemented by ny-cli, consumed
 /// by the graph ReLU-split BaB requeue (`docs/GRAPH_MIP_LEAF_SOLVER.md`).
 pub mod graph_mip_leaf;
 pub(crate) mod nonlinear_branching;
+mod objective_owner;
 pub(crate) mod result;
 pub(crate) mod state;
 // Exposed at crate scope to support internal test helpers.
@@ -77,15 +81,15 @@ pub use bab_cuts::{
 pub use bab_frontier_export::{
     reset_bab_frontier_export, take_bab_frontier_seeds, BabFrontierSeed, BAB_FRONTIER_CORNER_BOXES,
 };
-// Certified Cut-CROWN C1/C1.5/C2 surface (docs/CERTIFIED_CUT_CROWN_DESIGN.md):
-// cut derivation + L1 generation + the dark NY_CUT_FOLD registry, re-exported
-// for the C2 experiment harness (ny-onnx integration test) and later ny-cert
-// emission. All default-off; the fold registry is inert unless NY_CUT_FOLD=1.
+// Certified Cut-CROWN C1/C1.5 surface (docs/CERTIFIED_CUT_CROWN_DESIGN.md):
+// cut derivation + L1 generation, re-exported for the experiment harness and
+// later ny-cert emission. All default-off. (The C2 `NY_CUT_FOLD` registry that
+// used to live alongside these was deleted — it was statically unreachable and
+// its arithmetic was not enclosure-preserving.)
 pub use bab_cuts::{
-    clear_cut_fold, cut_fold_applied_count, derive_cut_bound, derive_cut_bound_root,
-    generate_l1_cuts, generate_l1_cuts_for_splits, generate_l1_cuts_signed,
-    reset_cut_fold_applied_count, set_cut_fold, AffineRow, CutFoldEntry, CutFoldScope, L1Cut,
-    L1SplitGroupDiag, MultiReluCut, SignedCcMode, SignedCutDiag, SplitState,
+    derive_cut_bound, derive_cut_bound_root, generate_l1_cuts, generate_l1_cuts_for_splits,
+    generate_l1_cuts_signed, AffineRow, CutFoldScope, L1Cut, L1SplitGroupDiag, MultiReluCut,
+    SignedCcMode, SignedCutDiag, SplitState,
 };
 pub use branching::{
     BranchingHeuristic, GenBabConstraint, GeneralSplitHistory, GraphConstraint,
@@ -95,7 +99,12 @@ pub use branching::{
 pub use config::KfsbReduceOp;
 pub use config::{
     AdaptiveOptConfig, BetaCrownConfig, ConvMode, CutEvictionPolicy, CutScoreWeights,
-    InputClipType, LRScheduler, LookaheadConfig, PerLayerLR, PhaseBudgetConfig,
+    DepthTwoBranchLookaheadConfig, DepthTwoBranchLookaheadMode, InputClipType, LRScheduler,
+    LookaheadConfig, PerLayerLR, PhaseBudgetConfig, VerificationArtifactAuthority,
+    ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS,
+};
+pub use conjunctive_proof_objectives::{
+    ConjunctiveProofObjectiveProvenance, ConjunctiveProofObjectives,
 };
 pub use constraint_store::{
     ArenaConstraintStore, ConstraintHeader, ConstraintOrigin, ConstraintSense,
@@ -104,7 +113,10 @@ pub use constraint_store::{
 pub use domain::{
     BabDomain, DomainProcessingConfig, DomainWithUnstable, GraphBabDomain, GraphCrownContext,
     GraphPrecomputedBounds, IntermediateLinearBounds, MultiObjDomainWithUnstable,
-    MultiObjectiveGraphBabDomain, MultiObjectiveTargets,
+    MultiObjectiveGraphBabDomain, MultiObjectiveTargets, NodeBoundsHostAllocationInvalidV1,
+    NodeBoundsHostAllocationObservationV1, NodeBoundsHostAllocationReceiptV1,
+    NodeBoundsHostAllocationUnsupportedV1, NodeBoundsMap, NodeBoundsMapIter, NodeBoundsView,
+    NodeBoundsViewIter, ObjectiveAggregation, NODE_BOUNDS_HOST_ALLOCATION_MODEL_V1,
 };
 pub use engine::{
     BatchedSpecBackwardResult, BetaCrownVerifier, DenseSpecReboundMode, DenseSpecStageTiming,
@@ -120,9 +132,13 @@ pub use nonlinear_branching::{
     BranchingDecision, BranchingPointMethod, NonlinearBranching, NonlinearBranchingConfig,
     NonlinearHeuristicMethod,
 };
-pub use result::{BabVerificationStatus, BetaCrownResult};
+pub use objective_owner::{
+    OwnedSignNormalizedObjectiveSet, ResidentObjectiveInvalidV1, ResidentObjectiveObservationV1,
+    ResidentObjectiveReceiptV1, ResidentObjectiveUnsupportedV1,
+};
+pub use result::{BabVerificationStatus, BetaCrownResult, ViolationWitness};
 pub use state::{
-    compute_arelu_cut_slope_bias, AlphaNeuronState, AreluState, BetaEntry, BetaState,
-    DomainAlphaState, GraphAlphaStateByteCensus, GraphAlphaStateRepresentation, GraphBetaEntry,
-    GraphBetaState, GraphDomainAlphaState, PACKED_GRAPH_ALPHA_FORMAT_VERSION,
+    AlphaNeuronState, BetaEntry, BetaState, DomainAlphaState, GraphAlphaStateByteCensus,
+    GraphAlphaStateRepresentation, GraphBetaEntry, GraphBetaState, GraphDomainAlphaState,
+    PACKED_GRAPH_ALPHA_FORMAT_VERSION,
 };

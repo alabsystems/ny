@@ -4,12 +4,13 @@
 # Licensed under the Apache License, Version 2.0
 
 """
-CIFAR10 ResNet benchmark runner with GCP-CROWN cuts.
+CIFAR10 ResNet benchmark runner for the supported cut-dark beta-CROWN lane.
 
-Tests ny beta-crown with GCP-CROWN cuts on VNN-COMP 2021 cifar10_resnet.
+Tests ny beta-crown on VNN-COMP 2021 cifar10_resnet.
 
-Note: cuts are enabled by default in the CLI; this script passes `--enable-cuts`
-explicitly unless `--no-cuts` is provided.
+Certificate-bearing cut authority is quarantined. This runner defaults to the
+supported no-cuts lane; `--enable-cuts` is retained only as an explicit research
+request and will be rejected until a certified fold replaces the legacy path.
 """
 
 import csv
@@ -197,8 +198,12 @@ def main():
     parser.add_argument("--max-instances", type=int, default=10, help="Max instances to run")
     parser.add_argument("--max-domains", type=int, default=None, help="Maximum number of BaB domains to explore (default: ny's default)")
     cuts_group = parser.add_mutually_exclusive_group()
-    cuts_group.add_argument("--enable-cuts", action="store_true", help="Enable GCP-CROWN cuts (default)")
-    cuts_group.add_argument("--no-cuts", action="store_true", help="Disable GCP-CROWN cuts")
+    cuts_group.add_argument(
+        "--enable-cuts",
+        action="store_true",
+        help="Request quarantined research cuts (verification will reject the request)",
+    )
+    cuts_group.add_argument("--no-cuts", action="store_true", help="Disable cuts (default)")
     parser.add_argument("--model", choices=["2b", "4b", "both"], default="2b", help="Which model to test")
     parser.add_argument("--branching", type=str, default="relu", help="Branching mode (default: relu)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size for domain processing (default: ny's default)")
@@ -208,14 +213,22 @@ def main():
     parser.add_argument("--alpha-gradient-method", type=str, default=None, choices=["spsa", "fd", "analytic", "analytic-chain"], help="Gradient method for α-CROWN (default: spsa)")
     parser.add_argument("--crown-ibp-intermediates", action="store_true", help="Use CROWN-IBP for intermediate bounds (tighter but slower)")
     parser.add_argument("--beta-iterations", type=int, default=None, help="β-CROWN optimization iterations per domain (default: 20)")
-    parser.add_argument("--proactive-cuts", action="store_true", help="Enable proactive cuts (experimental)")
+    parser.add_argument(
+        "--proactive-cuts",
+        action="store_true",
+        help="Request quarantined proactive cuts (verification will reject the request)",
+    )
     parser.add_argument("--max-proactive-cuts", type=int, default=None, help="Maximum proactive cuts to generate")
-    parser.add_argument("--enable-near-miss-cuts", action="store_true", help="Enable near-miss cuts (experimental)")
+    parser.add_argument(
+        "--enable-near-miss-cuts",
+        action="store_true",
+        help="Request quarantined near-miss cuts (verification will reject the request)",
+    )
     parser.add_argument("--near-miss-margin", type=float, default=None, help="Margin for near-miss cut generation")
     parser.add_argument("--pgd-attack", action="store_true", help="Enable PGD attack (debugging)")
     args = parser.parse_args()
 
-    enable_cuts = not args.no_cuts
+    enable_cuts = args.enable_cuts and not args.no_cuts
 
     # Model-specific default timeouts based on α-CROWN initialization time:
     # - 2b: ~5s init, 60s total is sufficient

@@ -11,8 +11,9 @@
 //! — which drives the resident backward but depends on `ny-gpu` only as a
 //! dev-dependency (cycle avoidance) — can WRITE the fold through the shared
 //! `ny-core` dependency, while THIS crate's resident backward READS it. The
-//! registry symbols are re-exported here unchanged so existing `ny-gpu`
-//! experiment harnesses (`NY_CUT_FOLD_RESIDENT`) keep working verbatim.
+//! registry symbols are re-exported here unchanged for raw research
+//! construction. The proof-path reader is hard-quarantined, so environment
+//! requests cannot make those entries influence certificate-bearing bounds.
 //!
 //! What stays local to `ny-gpu`: the read-only C2b frontier CAPTURE channel and
 //! the applied-fold counter (experiment observability the resident backward
@@ -56,10 +57,9 @@ fn capture_slot() -> &'static RwLock<Option<ResidentCutFoldCapture>> {
     SLOT.get_or_init(|| RwLock::new(None))
 }
 
-/// The capture dark gate: the fold site copies the frontier only when
-/// `NY_CUT_FOLD_CAPTURE=1` (and the fold branch itself is active — a
-/// registered entry under the fold gate; a λ=0/empty entry works and keeps the
-/// bounds bit-identical).
+/// Legacy capture request. The proof-path fold branch is hard-quarantined, so
+/// setting this environment variable cannot currently populate a capture
+/// through certificate-bearing resident CROWN.
 pub fn resident_cut_fold_capture_enabled() -> bool {
     matches!(
         std::env::var("NY_CUT_FOLD_CAPTURE").ok().as_deref(),
@@ -108,7 +108,7 @@ mod tests {
     /// Single sequential test: env-var + global-registry manipulation must not
     /// race with itself across parallel test threads. The gate/registry
     /// semantics themselves are covered in `ny_core::resident_cut_fold`; this
-    /// asserts the ny-gpu re-export path + the local applied-counter.
+    /// asserts the ny-gpu re-export quarantine + the local diagnostic counter.
     #[test]
     fn reexport_and_applied_counter() {
         // Serialized env scope (clippy env wall); pre-test state restored on
@@ -125,10 +125,10 @@ mod tests {
             assert!(active_resident_cut_fold().is_none());
 
             env.set("NY_CUT_FOLD_RESIDENT", "1");
-            let fold = active_resident_cut_fold().expect("entry must be active");
-            assert_eq!(fold.coeffs, vec![(3, 0.5)]);
-            assert_eq!(fold.pre_coeffs, vec![(2, 0.75)]);
-            assert!(fold.sound_round);
+            assert!(
+                active_resident_cut_fold().is_none(),
+                "legacy env plus public registry must not grant resident proof authority"
+            );
 
             reset_resident_cut_fold_applied_count();
             assert_eq!(resident_cut_fold_applied_count(), 0);

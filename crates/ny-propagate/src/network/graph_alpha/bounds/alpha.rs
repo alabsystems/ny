@@ -13,6 +13,13 @@ use super::*;
 use crate::layers::BoundPropagation;
 use crate::network::alpha_crown_loop::finite_lower_sum;
 
+/// The complete cGAN root cascade is useful only as a bounded pre-BaB
+/// transaction. Current nCh=1 completes in about 101 seconds and the former
+/// sound route closed both proof rows within 234 seconds; 300 seconds covers
+/// those measurements while preserving most of a 900-second instance for
+/// child search if a different row does not close at the root.
+const CGAN_COMPLETE_CROWN_IBP_ROOT_CAP: std::time::Duration = std::time::Duration::from_mins(5);
+
 /// Which collector actually produced an alpha reference-bounds map
 /// (#dedup-root-collections Fix B).
 ///
@@ -23,6 +30,29 @@ use crate::network::alpha_crown_loop::finite_lower_sum;
 /// legacy per-graph-family bound quality is never weakened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlphaReferenceBoundsSource {
+    /// Typed cGAN root transaction: the complete certified forward-linear map
+    /// followed by the ordinary all-demanded CROWN-IBP cascade. Because every
+    /// published node is either the baseline or its shrink-only intersection
+    /// with another sound enclosure, this map dominates the forward-linear
+    /// Step-1 map and can be reused by the root objective.
+    CganCompleteCrownIbp {
+        /// True only when every demanded target completed its requested CROWN
+        /// computation. False still denotes a sound shrink-only map, but one
+        /// containing an explicit resource/error fallback.
+        all_demanded_targets_completed: bool,
+    },
+    /// Typed cGAN root transaction: a certified forward-linear baseline plus
+    /// at most one atomically published CROWN target and its sound downstream
+    /// resweep.
+    ///
+    /// Keep this distinct from ordinary `CrownIbp`: eligibility alone cannot
+    /// prove that the typed transaction actually ran, because its
+    /// forward-linear baseline may decline and route to an ordinary fallback.
+    CganSparseTargetComplete {
+        /// True only when the selected atomic target (if any) completed. The
+        /// sound forward baseline remains authoritative when this is false.
+        selected_target_completed: bool,
+    },
     /// Per-node CROWN-IBP collection
     /// (`collect_crown_ibp_bounds_dag_with_status_and_deadline`).
     CrownIbp,
@@ -32,7 +62,127 @@ pub(crate) enum AlphaReferenceBoundsSource {
     Ibp,
 }
 
+impl AlphaReferenceBoundsSource {
+    pub(crate) const fn is_typed_cgan(self) -> bool {
+        matches!(
+            self,
+            Self::CganCompleteCrownIbp { .. } | Self::CganSparseTargetComplete { .. }
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn typed_cgan_targets_completed(self) -> Option<bool> {
+        match self {
+            Self::CganCompleteCrownIbp {
+                all_demanded_targets_completed,
+            } => Some(all_demanded_targets_completed),
+            Self::CganSparseTargetComplete {
+                selected_target_completed,
+            } => Some(selected_target_completed),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AlphaReferenceBoundsSource {
+    /// Whether this map came from the per-node CROWN-IBP collector.
+    ///
+    /// Kept as a predicate so crate-internal composition tests can assert
+    /// provenance without exposing the private graph-alpha module.
+    pub(crate) const fn is_crown_ibp(self) -> bool {
+        matches!(self, Self::CrownIbp)
+    }
+}
+
+/// Default-dark wall cap for only the CROWN tightening portion of the
+/// CROWN-IBP reference-map collection that precedes DAG alpha optimization.
+///
+/// The mandatory IBP map keeps its historical foundational contract, and the
+/// caller's `AlphaCrownConfig::deadline` is left unchanged for the subsequent
+/// initial CROWN bound and alpha iterations. This is deliberately narrower
+/// than `NY_ROOT_ALPHA_CAP_SECS`: unfinished intermediate targets keep their
+/// sound IBP bounds, while time recovered from CROWN tightening remains
+/// available to the root optimizer/BaB.
+/// MEASURED, 2026-08-01 — capping this does NOT convert cifar100 timeouts.
+///
+/// Profiled on CIFAR100_resnet_medium at the official 100 s budget (RTX 5080,
+/// 10-CPU cgroup): BaB gets 77.4 s, and this collector consumes 26.2 s of it —
+/// 34% — while still reverting 7 of 11 DEMANDED targets to IBP. `Conv_11` alone
+/// burns 9.09 s and records ZERO completed backward steps. So a third of the
+/// solving budget buys four intermediate CROWN bounds.
+///
+/// Handing that time back to BaB changes nothing. cifar100_2024 rows 1..4:
+///
+///   cap = default (26.2 s used)   solved 1/4   (sat 1, unsat 0)
+///   cap = 12 s                    solved 1/4   (sat 1, unsat 0)
+///   cap = 8 s                     solved 1/4   (sat 1, unsat 0)
+///   cap = 4 s                     solved 1/4   (sat 1, unsat 0)
+///
+/// Flat across a 6.5x swing in collector budget, and every solve is the same
+/// `sat` — no `unsat` at any setting. Together with the #chunk-wave-par result
+/// (narrower objective chunks only ADD reverts), this says cifar100 is not
+/// budget-ALLOCATION-bound: BaB is not short of seconds, it is short of a bound
+/// tight enough to close the property, and redistributing a fixed budget cannot
+/// manufacture tightness. The remaining lever is a genuinely tighter
+/// intermediate bound (docs/CONV_CROWN_WALL_DESIGN_2026-07-27.md), not a
+/// scheduling knob. Do not re-run this sweep.
+pub(super) const CROWN_IBP_COLLECTOR_CAP_ENV: &str = "NY_CROWN_IBP_COLLECTOR_CAP_SECS";
+const MAX_CROWN_IBP_COLLECTOR_CAP_SECS: u64 = 3_600;
+
+fn crown_ibp_collector_cap_from_raw(raw: Option<&str>) -> Option<std::time::Duration> {
+    let raw = raw?;
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse::<u64>()
+        .ok()
+        .filter(|&secs| (1..=MAX_CROWN_IBP_COLLECTOR_CAP_SECS).contains(&secs))
+        .map(std::time::Duration::from_secs)
+}
+
+pub(in crate::network::graph_alpha) fn crown_ibp_collector_cap() -> Option<std::time::Duration> {
+    let raw = std::env::var(CROWN_IBP_COLLECTOR_CAP_ENV).ok();
+    crown_ibp_collector_cap_from_raw(raw.as_deref())
+}
+
 impl GraphNetwork {
+    /// Whether this graph/config pair is allowed to request the complete cGAN
+    /// root cascade.
+    ///
+    /// The explicit flag is root-only and child warm-start constructors clear
+    /// it. Requiring the ordinary fixed-intermediate contract makes the policy
+    /// a targeted replacement for the otherwise-selected forward-linear root
+    /// map without enabling the historical post-optimization all-node pass.
+    pub(crate) fn cgan_complete_crown_ibp_root_eligible(
+        &self,
+        config: &AlphaCrownConfig,
+        exec_order: &[String],
+    ) -> bool {
+        config.cgan_complete_crown_ibp_root
+            && config.fix_interm_bounds
+            && !config.cgan_sparse_target_complete_root
+            && self.is_sequential_graph(exec_order)
+            && self.should_collect_forward_linear_intermediate_reference()
+    }
+
+    /// Whether this graph/config pair is allowed to request the typed cGAN
+    /// root transaction.
+    ///
+    /// Kept as one predicate so initialization and the later AnalyticChain
+    /// dispatch agree on whether the optimizer-owned reference map belongs to
+    /// the single-target route.
+    pub(crate) fn cgan_sparse_target_complete_root_eligible(
+        &self,
+        config: &AlphaCrownConfig,
+        exec_order: &[String],
+    ) -> bool {
+        config.cgan_sparse_target_complete_root
+            && !config.fix_interm_bounds
+            && self.is_sequential_graph(exec_order)
+            && self.should_collect_forward_linear_intermediate_reference()
+    }
+
     /// Collect the intermediate bounds used to initialize alpha-CROWN state.
     ///
     /// With `fix_interm_bounds=true`, DAGs now follow the same IBP reference-bound
@@ -63,16 +213,168 @@ impl GraphNetwork {
         std::collections::HashMap<String, BoundedTensor>,
         AlphaReferenceBoundsSource,
     )> {
-        // #cgan-fwdlin-ref (DARK, `NY_FORWARD_LINEAR_CONV_TRANSPOSE_REF=1`):
+        // Typed, default-dark complete cGAN root lane. The ordinary production
+        // route currently stops at the fast forward-linear map; on the official
+        // nCh=1 proof rows that leaves the scalar output several units wide.
+        // Starting the standard all-demanded CROWN-IBP cascade from that same
+        // certified map preserves it as a floor and lets the topological target
+        // sequence recover the decisive root enclosure. The returned map can
+        // only shrink the baseline, so the later objective backward may reuse
+        // it without repeating or downgrading Step 1.
+        // A typed baseline refusal must not immediately call the identical
+        // uncached forward-linear collector again in the ordinary sequential
+        // branch below. Errors are intentionally not globally cached because a
+        // later call may have more budget; this latch is only for this one
+        // routing decision.
+        let mut typed_forward_linear_refused = false;
+        let mut typed_forward_linear_deadline_refused = false;
+
+        let cgan_complete_crown_ibp =
+            self.cgan_complete_crown_ibp_root_eligible(config, exec_order);
+        if cgan_complete_crown_ibp {
+            match self.collect_forward_linear_bounds_dag_cached_for_typed_cgan(
+                input,
+                config,
+                engine,
+                config.deadline,
+            ) {
+                Ok(bounds) => {
+                    let baseline = (*bounds).clone();
+                    info!(
+                        "cGAN complete CROWN-IBP root reference ({} forward-linear baseline nodes)",
+                        baseline.len()
+                    );
+                    let result = self.collect_crown_ibp_bounds_dag_with_options(
+                        input,
+                        crown::CrownIbpCollectOptions {
+                            engine,
+                            deadline: config.deadline,
+                            precomputed_ibp: Some(baseline),
+                            tightening_cap: Some(CGAN_COMPLETE_CROWN_IBP_ROOT_CAP),
+                            collection_mode: crown_tighten::CrownIbpCollectionMode::CganComplete,
+                            ..Default::default()
+                        },
+                    )?;
+                    let all_demanded_targets_completed =
+                        result.all_requested_crown_targets_completed();
+                    return Ok((
+                        result.bounds,
+                        AlphaReferenceBoundsSource::CganCompleteCrownIbp {
+                            all_demanded_targets_completed,
+                        },
+                    ));
+                }
+                Err(
+                    error @ (NyError::UnsupportedOp(_)
+                    | NyError::UnsupportedConfiguration(_)
+                    | NyError::DeadlineExceeded(_)
+                    | NyError::ShapeMismatch { .. }
+                    | NyError::CpuMemoryExceeded { .. }),
+                ) => {
+                    typed_forward_linear_refused = true;
+                    typed_forward_linear_deadline_refused =
+                        matches!(&error, NyError::DeadlineExceeded(_));
+                    info!(
+                        "cGAN complete CROWN-IBP forward-linear baseline unavailable \
+                         ({error}); retaining ordinary routing"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if config.cgan_complete_crown_ibp_root && !cgan_complete_crown_ibp {
+            info!(
+                "cGAN complete CROWN-IBP root reference declined \
+                 (requires fix_interm_bounds=true, sparse policy off, and the exact \
+                 sequential ConvTranspose+Conv2d Step-1 forward-linear policy); \
+                 retaining ordinary routing"
+            );
+        }
+
+        // Typed, default-dark cGAN root lane. It is structurally restricted to
+        // sequential ConvTranspose graphs and requires the expensive
+        // `fix_interm_bounds=false` root contract. BaB child warm starts clear
+        // the flag explicitly and set `fix_interm_bounds=true`.
+        let cgan_sparse_target_complete =
+            self.cgan_sparse_target_complete_root_eligible(config, exec_order);
+        if cgan_sparse_target_complete {
+            match self.collect_forward_linear_bounds_dag_cached_for_typed_cgan(
+                input,
+                config,
+                engine,
+                config.deadline,
+            ) {
+                Ok(bounds) => {
+                    let baseline = (*bounds).clone();
+                    let collector_cap = crown_ibp_collector_cap();
+                    info!(
+                        "cGAN sparse target-complete root reference ({} forward-linear \
+                         baseline nodes)",
+                        baseline.len()
+                    );
+                    let result = self.collect_crown_ibp_bounds_dag_with_options(
+                        input,
+                        crown::CrownIbpCollectOptions {
+                            engine,
+                            deadline: config.deadline,
+                            precomputed_ibp: Some(baseline),
+                            tightening_cap: collector_cap,
+                            complete_cache_lookup_only: collector_cap.is_some(),
+                            collection_mode:
+                                crown_tighten::CrownIbpCollectionMode::CganSparseTargetComplete,
+                            ..Default::default()
+                        },
+                    )?;
+                    let selected_target_completed = result.all_requested_crown_targets_completed();
+                    return Ok((
+                        result.bounds,
+                        AlphaReferenceBoundsSource::CganSparseTargetComplete {
+                            selected_target_completed,
+                        },
+                    ));
+                }
+                Err(
+                    error @ (NyError::UnsupportedOp(_)
+                    | NyError::UnsupportedConfiguration(_)
+                    | NyError::DeadlineExceeded(_)
+                    | NyError::ShapeMismatch { .. }
+                    | NyError::CpuMemoryExceeded { .. }),
+                ) => {
+                    typed_forward_linear_refused = true;
+                    typed_forward_linear_deadline_refused =
+                        matches!(&error, NyError::DeadlineExceeded(_));
+                    // This policy's authority is specifically a
+                    // forward-linear baseline plus one atomic CROWN target.
+                    // If that baseline cannot be produced, decline the typed
+                    // lane instead of silently changing its semantics to IBP.
+                    info!(
+                        "cGAN sparse target-complete forward-linear baseline unavailable \
+                         ({error}); retaining ordinary routing"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if config.cgan_sparse_target_complete_root && !cgan_sparse_target_complete {
+            info!(
+                "cGAN sparse target-complete root reference declined \
+                 (requires fix_interm_bounds=false and the exact sequential \
+                 ConvTranspose+Conv2d Step-1 forward-linear policy); retaining ordinary routing"
+            );
+        }
+
+        // #cgan-fwdlin-ref (default-ON, opt out with either shared
+        // `NY_NO_FORWARD_LINEAR_REF=1` or surface-specific
+        // `NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF=1`):
         // cgan-class SEQUENTIAL conv chains (Gemm→Reshape→ConvTranspose→…)
         // never reach the conv-DAG forward-linear branch below (is_dag=false),
         // and the deep_seq CROWN-IBP early return additionally shadows it —
         // so the certified ConvTranspose/BatchNorm image surface was
-        // unreachable exactly on the graphs it was built for. Under the dark
-        // surface gate, try the certified forward-linear reference FIRST (a
+        // unreachable exactly on the graphs it was built for. Try the
+        // certified forward-linear reference FIRST (a
         // chain is the easy case for forward substitution; the collector
         // requires no DAG-ness) and fall through to the shipped logic
-        // UNCHANGED on any fail-closed refusal. Gate-off is byte-identical.
+        // UNCHANGED on any fail-closed refusal.
         // #cora-fwdlin-ref (DARK, `NY_FORWARD_LINEAR_SEQ_CONV_REF=1`): same
         // is_dag=false blocker, plain-Conv2d SEQUENTIAL chains (cora
         // cifar10-set: the reference collect burns ~14s of a 25s budget in the
@@ -88,14 +390,43 @@ impl GraphNetwork {
                     .get(n)
                     .is_some_and(|node| matches!(node.layer, Layer::Conv2d(_)))
             });
+        let conv_transpose_surface =
+            GraphNetwork::forward_linear_conv_transpose_reference_enabled()
+                && exec_order.iter().any(|n| {
+                    self.nodes
+                        .get(n)
+                        .is_some_and(|node| matches!(node.layer, Layer::ConvTranspose2d(_)))
+                });
+        if typed_forward_linear_refused
+            && config.fix_interm_bounds
+            && GraphNetwork::forward_linear_reference_enabled()
+            && (seq_conv_gate || conv_transpose_surface)
+        {
+            if typed_forward_linear_deadline_refused
+                && config.forward_linear_deadline_fallback_to_ibp
+            {
+                info!(
+                    "Typed cGAN forward-linear baseline hit its deadline; using the configured \
+                     direct IBP deadline fallback without retrying the same baseline"
+                );
+                return Ok((
+                    self.collect_node_bounds_with_engine_and_deadline(
+                        input,
+                        engine,
+                        config.deadline,
+                    )?,
+                    AlphaReferenceBoundsSource::Ibp,
+                ));
+            }
+            info!(
+                "Typed cGAN forward-linear baseline already refused in this routing episode; \
+                 skipping the duplicate ordinary sequential attempt"
+            );
+        }
         if config.fix_interm_bounds
-            && (seq_conv_gate
-                || (GraphNetwork::forward_linear_conv_transpose_reference_enabled()
-                    && exec_order.iter().any(|n| {
-                        self.nodes
-                            .get(n)
-                            .is_some_and(|node| matches!(node.layer, Layer::ConvTranspose2d(_)))
-                    })))
+            && GraphNetwork::forward_linear_reference_enabled()
+            && (seq_conv_gate || conv_transpose_surface)
+            && !typed_forward_linear_refused
         {
             match self.collect_forward_linear_bounds_dag_cached(input, engine, config.deadline) {
                 Ok(bounds) => {
@@ -104,6 +435,30 @@ impl GraphNetwork {
                         bounds.len()
                     );
                     return Ok(((*bounds).clone(), AlphaReferenceBoundsSource::ForwardLinear));
+                }
+                Err(error @ NyError::DeadlineExceeded(_))
+                    if config.forward_linear_deadline_fallback_to_ibp =>
+                {
+                    // #cgan-forward-deadline-ibp: once the preferred
+                    // forward-linear child map refuses for insufficient
+                    // headroom, the historical deep-sequential fallback can
+                    // spend the entire remaining slice in CROWN-IBP and still
+                    // return IBP at every demanded target. Opted-in categories
+                    // select that same certified (looser) IBP authority
+                    // directly. Deadline-aware collection preserves the
+                    // caller's absolute wall contract.
+                    info!(
+                        "Forward-linear ConvTranspose reference unavailable ({error}); \
+                         using direct IBP deadline fallback"
+                    );
+                    return Ok((
+                        self.collect_node_bounds_with_engine_and_deadline(
+                            input,
+                            engine,
+                            config.deadline,
+                        )?,
+                        AlphaReferenceBoundsSource::Ibp,
+                    ));
                 }
                 Err(
                     error @ (NyError::UnsupportedOp(_)
@@ -167,10 +522,39 @@ impl GraphNetwork {
         //   NY_DENSE_DAG_REF=0 (pre-fix collector)  10/10 unsat
         //   NY_DENSE_DAG_REF=1 (shipped arm)        10/10 unsat
         // No regression from the arm reaching a category nobody sampled.
+        // #vit-interm-floor (dark, `NY_DENSE_DAG_REF_CONV=1`, default OFF ⇒
+        // byte-identical): the `!has_conv_layers()` term above exists to keep
+        // the CERTIFIED FORWARD-LINEAR image reference on conv DAGs. A
+        // transformer with a Conv2d PATCH EMBEDDING trips it while getting no
+        // benefit, because the forward-linear reference refuses that graph for
+        // an unrelated reason and says so in the log:
+        //
+        //   Forward-linear reference bounds unavailable (... does not support
+        //   node '/0/Transpose' (Transpose): operator is outside the certified
+        //   image forward-linear surface); falling back to plain IBP
+        //   (fail-closed)
+        //   IBP reference bounds (dag=true, deep_seq=false, fix_interm_bounds=true)
+        //
+        // — measured on vit_2023 `pgd_2_3_16_2446`, HEAD 1d629b06, official
+        // 100 s budget, preset loaded. So on this family the conv term is not
+        // protecting a tighter reference; it is choosing plain IBP over the
+        // only other candidate.
+        //
+        // It matters: the same run reports root objective bounds of
+        // [-595385.5, +549888.4] on all 9 objectives against a true margin of
+        // about +1.5, and the zero-width ablation
+        // (`crates/ny-onnx/examples/vit_zero_width_node_bisect.rs`) shows the IBP
+        // reference map is 7.06e4 wide at a POINT while exact intermediates
+        // make the same CROWN code EXACT (4.77e-7 vs 1.39e4).
+        let dense_dag_conv_ok = !self.has_conv_layers()
+            || matches!(
+                std::env::var("NY_DENSE_DAG_REF_CONV").ok().as_deref(),
+                Some("1")
+            );
         let dense_dag = is_dag
             && config.fix_interm_bounds
             && act_count >= 3
-            && !self.has_conv_layers()
+            && dense_dag_conv_ok
             && self.should_collect_per_node_crown_ibp_intermediates()
             && !matches!(std::env::var("NY_DENSE_DAG_REF").ok().as_deref(), Some("0"));
 
@@ -179,11 +563,17 @@ impl GraphNetwork {
                 "CROWN-IBP reference bounds (dag={is_dag}, deep_seq={deep_seq}, \
                  dense_dag={dense_dag}, {act_count} acts)"
             );
+            let collector_cap = crown_ibp_collector_cap();
             return Ok((
-                self.collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                self.collect_crown_ibp_bounds_dag_with_options(
                     input,
-                    config.deadline,
-                    engine,
+                    crown::CrownIbpCollectOptions {
+                        engine,
+                        deadline: config.deadline,
+                        tightening_cap: collector_cap,
+                        complete_cache_lookup_only: collector_cap.is_some(),
+                        ..Default::default()
+                    },
                 )?
                 .bounds,
                 AlphaReferenceBoundsSource::CrownIbp,
@@ -197,13 +587,8 @@ impl GraphNetwork {
         // Default ON for conv DAGs; disable with NY_NO_FORWARD_LINEAR_REF=1
         // (disable-flag, never enable-flag). Fails closed to plain IBP on any
         // unsupported op / deadline / memory-cap refusal.
-        let conv_dag = is_dag
-            && exec_order.iter().any(|n| {
-                self.nodes
-                    .get(n)
-                    .is_some_and(|node| matches!(node.layer, Layer::Conv2d(_)))
-            });
-        if conv_dag && GraphNetwork::forward_linear_reference_enabled() {
+        let conv_dag = is_dag && self.should_collect_forward_linear_image_reference();
+        if conv_dag {
             match self.collect_forward_linear_bounds_dag_cached(input, engine, config.deadline) {
                 Ok(bounds) => {
                     info!(
@@ -251,6 +636,54 @@ impl GraphNetwork {
         config: &AlphaCrownConfig,
         engine: Option<&dyn ny_core::GemmEngine>,
     ) -> Result<GraphAlphaCollectionResult> {
+        self.collect_alpha_crown_bounds_dag_with_engine_impl(input, config, engine, None)
+    }
+
+    /// Multi-objective root policy seam for retaining a fully returned DAG
+    /// alpha artifact after its local phase cap expires.  Sequential/SPSA and
+    /// pre-artifact failures deliberately stay on the legacy path.
+    pub(crate) fn collect_alpha_crown_bounds_dag_with_engine_phase_cap_checkpoint(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn ny_core::GemmEngine>,
+    ) -> Result<GraphAlphaCollectionOutcome> {
+        let _l2_lever_off = crate::l2_lever_gate::L2LeverGuard::disabled();
+        let exec_order = self.exec_order()?;
+        if config.gradient_method != crate::bounds::GradientMethod::Spsa
+            && !self.is_sequential_graph(exec_order)
+        {
+            if let Some(outcome) = self.try_dag_gradient_dispatch_with_phase_cap_checkpoint(
+                input, config, engine, exec_order,
+            )? {
+                return Ok(outcome);
+            }
+        }
+
+        self.collect_alpha_crown_bounds_dag_with_engine_impl(input, config, engine, None)
+            .map(GraphAlphaCollectionOutcome::Complete)
+    }
+
+    /// Typed restart-cache entry: reuse only an exact certified reference map
+    /// while constructing and optimizing a fresh alpha state under the current
+    /// restart RNG offset.
+    pub(crate) fn collect_alpha_crown_bounds_dag_with_engine_and_reference(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        reference: PrecomputedAlphaReferenceBounds,
+    ) -> Result<GraphAlphaCollectionResult> {
+        self.collect_alpha_crown_bounds_dag_with_engine_impl(input, config, engine, Some(reference))
+    }
+
+    fn collect_alpha_crown_bounds_dag_with_engine_impl(
+        &self,
+        input: &BoundedTensor,
+        config: &AlphaCrownConfig,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        mut precomputed_reference: Option<PrecomputedAlphaReferenceBounds>,
+    ) -> Result<GraphAlphaCollectionResult> {
         // Disable the L2/Cauchy–Schwarz lever for the DAG alpha-CROWN scope. This
         // entry is reached both from `propagate_alpha_crown_with_config_and_engine_impl`
         // (via the DAG delegate) and directly from beta-CROWN root-bound collection;
@@ -259,21 +692,35 @@ impl GraphNetwork {
         // recomputation. Sound (lever only tightens); restored on drop.
         let _l2_lever_off = crate::l2_lever_gate::L2LeverGuard::disabled();
         let exec_order = self.exec_order()?;
-        if let Some(result) = self.maybe_collect_sequential_alpha_crown_bounds_with_engine(
-            exec_order, input, config, engine,
-        ) {
-            return result;
+        if precomputed_reference.is_none() {
+            if let Some(result) = self.maybe_collect_sequential_alpha_crown_bounds_with_engine(
+                exec_order, input, config, engine,
+            ) {
+                return result;
+            }
         }
 
         // #4036: non-SPSA gradient methods delegate to the DAG optimizer
         // which dispatches AnalyticChain, FD, and Analytic gradients.
-        if let Some(result) = self.try_dag_gradient_dispatch(input, config, engine, exec_order)? {
-            return Ok(result);
+        if config.gradient_method != crate::bounds::GradientMethod::Spsa {
+            if let Some(result) = self.try_dag_gradient_dispatch(
+                input,
+                config,
+                engine,
+                exec_order,
+                precomputed_reference.take(),
+            )? {
+                return Ok(result);
+            }
         }
 
         // Step 1: collect bounds at all nodes. (#3357)
-        let reference_bounds =
-            self.collect_alpha_reference_bounds_with_engine(input, config, engine, exec_order)?;
+        let reference_bounds = match precomputed_reference.take() {
+            Some(reference) => reference.bounds,
+            None => {
+                self.collect_alpha_reference_bounds_with_engine(input, config, engine, exec_order)?
+            }
+        };
         // Step 2: Initialize graph alpha state for all optimizable activation nodes.
         let mut alpha_state = GraphAlphaState::new();
         let relu_nodes: Vec<String> = exec_order
@@ -809,5 +1256,33 @@ impl GraphNetwork {
         }
         debug!("GraphNetwork α-CROWN: Finished optimization, final output_lower={best_output_lower:.4}");
         Ok((best_bounds, alpha_state))
+    }
+}
+
+#[cfg(test)]
+mod crown_ibp_collector_cap_tests {
+    use super::*;
+
+    #[test]
+    fn collector_cap_parser_is_digit_only_positive_and_bounded() {
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("+1"),
+            Some(" 1"),
+            Some("1 "),
+        ] {
+            assert_eq!(crown_ibp_collector_cap_from_raw(raw), None);
+        }
+        assert_eq!(
+            crown_ibp_collector_cap_from_raw(Some("0015")),
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(
+            crown_ibp_collector_cap_from_raw(Some("3600")),
+            Some(std::time::Duration::from_hours(1))
+        );
+        assert_eq!(crown_ibp_collector_cap_from_raw(Some("3601")), None);
     }
 }

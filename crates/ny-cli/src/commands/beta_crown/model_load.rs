@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use ny_onnx::{
-    load_onnx_with_config, vnnlib::VnnLibSpec, CompoundNodePolicy, GraphNetworkOptions,
-    OnnxLoadConfig,
+    load_onnx_bytes_with_config, load_onnx_with_config, read_onnx_bytes_maybe_gzip,
+    vnnlib::VnnLibSpec, CompoundNodePolicy, GraphNetworkOptions, OnnxLoadConfig,
 };
 use ny_propagate::{BranchingHeuristic, Layer, VggMaxPoolRewriteMode};
 use std::path::Path;
@@ -16,7 +16,9 @@ use tracing::{info, warn};
 use super::branching::{
     resolve_auto_branching, AutoBranchingRequest, ModelStructure, ResolvedAutoBranching,
 };
-use super::{routing::route_conv_model_to_graph, BetaCrownModel};
+use super::{
+    routing::route_conv_model_to_graph, AppliedTerminalPeel, BetaCrownModel, TerminalPeelPolicy,
+};
 use crate::CompleteVerifierArg;
 
 pub(super) struct LoadedModel {
@@ -27,11 +29,10 @@ pub(super) struct LoadedModel {
     pub(super) input_shape: Vec<usize>,
     pub(super) is_graph: bool,
     pub(super) preloaded_vnnlib: Option<VnnLibSpec>,
-    /// True when the loader auto-peeled a terminal Sigmoid (#cgan-sigmoid-peel).
-    /// A counterexample's declared Y values then come from the PEELED network
-    /// (pre-sigmoid logits) and must be mapped y = sigmoid(z) at emission so
-    /// the witness matches the ORIGINAL graph.
-    pub(super) sigmoid_peeled: bool,
+    /// Exact activation removed by a qualified loader seam.  This must remain
+    /// typed because each activation has a different original-output witness
+    /// repair policy.
+    pub(super) applied_terminal_peel: AppliedTerminalPeel,
     /// The model-class-aware `--branching auto` decision, resolved here once the
     /// network's structural signals are known. `None` when `auto` was not
     /// requested (a preset or explicit CLI token owns branching instead).
@@ -47,7 +48,7 @@ pub(super) fn load_model(
     model_path: &Path,
     onnx_load_config: &OnnxLoadConfig,
     property: Option<&Path>,
-    peel_last_softmax_layer: bool,
+    terminal_peel_policy: TerminalPeelPolicy,
     effective_branching: Option<&BranchingHeuristic>,
     use_relu_split: bool,
     use_alpha: bool,
@@ -66,6 +67,15 @@ pub(super) fn load_model(
 ) -> Result<(LoadedModel, bool)> {
     let is_nnet = model_path.extension().and_then(|ext| ext.to_str()) == Some("nnet");
     if is_nnet {
+        if onnx_load_config.batch_norm_folding_policy()
+            != ny_onnx::BatchNormFoldingPolicy::LegacyEnvironment
+            || onnx_load_config.require_authored_float32_initializers()
+        {
+            anyhow::bail!(
+                "ONNX authored-graph loader policy was requested for an NNet model; \
+                 refusing to ignore proof admission settings"
+            );
+        }
         use ny_onnx::nnet::load_nnet;
 
         let nnet = load_nnet(model_path)?;
@@ -103,14 +113,32 @@ pub(super) fn load_model(
                 input_shape: vec![1, nnet.input_size()],
                 is_graph: false,
                 preloaded_vnnlib: None,
-                sigmoid_peeled: false,
+                applied_terminal_peel: AppliedTerminalPeel::None,
                 auto_branching,
             },
             resolved_relu_split,
         ));
     }
 
-    let mut onnx_model = load_onnx_with_config(model_path, onnx_load_config)?;
+    // The traffic Softmax certificate authenticates the exact bytes parsed
+    // below. Loading from the same owned byte slice prevents a path swap from
+    // making the digest authorize a different graph. Other routes preserve
+    // path-based loading (including its external-data support).
+    let traffic_model_bytes =
+        if terminal_peel_policy == TerminalPeelPolicy::TrafficSoftmaxSingleGroup {
+            Some(read_onnx_bytes_maybe_gzip(model_path)?)
+        } else {
+            None
+        };
+    let mut onnx_model = if let Some(bytes) = traffic_model_bytes.as_deref() {
+        let name = model_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("traffic-model");
+        load_onnx_bytes_with_config(name, bytes, onnx_load_config)?
+    } else {
+        load_onnx_with_config(model_path, onnx_load_config)?
+    };
     let (network_name, layer_count, param_count) = {
         let onnx_network = &onnx_model.network;
         (
@@ -125,7 +153,7 @@ pub(super) fn load_model(
     );
 
     let mut preloaded_vnnlib = None;
-    let mut sigmoid_peeled = false;
+    let mut applied_terminal_peel = AppliedTerminalPeel::None;
     if let Some(prop_path) = property {
         use ny_onnx::vnnlib::load_vnnlib;
 
@@ -134,22 +162,56 @@ pub(super) fn load_model(
         // decision below needs its per-clause-box disjunction shape, and the
         // softmax peel needs its constraints.
         let mut vnnlib = load_vnnlib(prop_path)?;
-        if peel_last_softmax_layer {
-            let report = ny_onnx::peel_off_last_softmax_layer(&mut onnx_model, &mut vnnlib);
-            if report.peeled && !json {
-                warn!(
-                    "Peeled off terminal {:?} layer using VNN-LIB constraints.",
-                    report.layer_type
-                );
+        match terminal_peel_policy {
+            TerminalPeelPolicy::InteractiveLegacy => {
+                let report = ny_onnx::peel_off_last_softmax_layer(&mut onnx_model, &mut vnnlib);
+                applied_terminal_peel = AppliedTerminalPeel::from_report(&report)?;
+                if report.peeled && !json {
+                    warn!(
+                        "Peeled off terminal {:?} layer using VNN-LIB constraints.",
+                        report.layer_type
+                    );
+                }
             }
-        } else {
-            // #cgan-sigmoid-peel: default-ON auto-peel for the exactly-
-            // invertible case (terminal Sigmoid + all-constant thresholds,
-            // e.g. the cgan upsample band specs). NY_SIGMOID_PEEL=0 disables.
-            let report = ny_onnx::peel_off_terminal_sigmoid_auto(&mut onnx_model, &mut vnnlib);
-            sigmoid_peeled = report.peeled;
-            if report.peeled && !json {
-                warn!("Auto-peeled terminal Sigmoid using VNN-LIB constant thresholds.");
+            TerminalPeelPolicy::TrafficSoftmaxSingleGroup => {
+                let name = model_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("traffic-model");
+                let (qualified_model, report) =
+                    ny_onnx::load_and_peel_terminal_softmax_single_group(
+                        name,
+                        traffic_model_bytes
+                            .as_deref()
+                            .expect("traffic policy always owns the parsed model bytes"),
+                        onnx_load_config,
+                        &mut vnnlib,
+                    )?;
+                onnx_model = qualified_model;
+                applied_terminal_peel = AppliedTerminalPeel::from_report(&report)?;
+                if !json {
+                    if report.peeled {
+                        warn!(
+                            "Peeled authenticated single-group terminal Softmax using VNN-LIB constraints."
+                        );
+                    } else {
+                        warn!(
+                            "Traffic terminal-Softmax peel declined fail-closed: {}",
+                            report.reason.as_deref().unwrap_or("unspecified reason")
+                        );
+                    }
+                }
+            }
+            TerminalPeelPolicy::Off => {
+                // #cgan-sigmoid-peel compatibility seam. Even when its old
+                // env gate is armed, the ny-onnx pass declines constant-
+                // threshold proofs until the measured region-equivalence
+                // defect is resolved.
+                let report = ny_onnx::peel_off_terminal_sigmoid_auto(&mut onnx_model, &mut vnnlib);
+                applied_terminal_peel = AppliedTerminalPeel::from_report(&report)?;
+                if report.peeled && !json {
+                    warn!("Applied a qualified terminal-Sigmoid peel.");
+                }
             }
         }
         preloaded_vnnlib = Some(vnnlib);
@@ -322,7 +384,7 @@ pub(super) fn load_model(
             input_shape,
             is_graph: use_graph,
             preloaded_vnnlib,
-            sigmoid_peeled,
+            applied_terminal_peel,
             auto_branching,
         },
         routed_relu_split,

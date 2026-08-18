@@ -30,7 +30,7 @@ use ny_propagate::{
 };
 use ny_tensor::BoundedTensor;
 
-use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_device};
+use crate::wgpu_device::test_support::{gpu_test_serial_guard, require_verdict_device};
 
 /// Deterministic LCG in [-1, 1).
 struct Lcg(u64);
@@ -149,7 +149,11 @@ fn concrete_pre(graph: &GraphNetwork, point: &BoundedTensor, pre_node: &str) -> 
 /// sampling enclosure oracle over predicate-satisfying points.
 fn run_refine_oracle(splits: &[DebugSplit], seed: u64, label: &str) {
     let _guard = gpu_test_serial_guard();
-    let device = require_device();
+    let device = require_verdict_device();
+    assert!(
+        device.sound_gpu_authority(),
+        "gpu-tests requires a typed, verdict-qualified sound-CROWN device"
+    );
     let mut rng = Lcg(seed);
     let graph = last_relu_resnet(4, &mut rng);
     let input = input_box(4, &mut rng);

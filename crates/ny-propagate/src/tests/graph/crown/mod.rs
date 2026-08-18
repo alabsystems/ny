@@ -46,6 +46,7 @@ mod where_parity;
 use crate::types::{BoundsProvenance, CrownIbpFallbackReason};
 use crate::*;
 use ndarray::{arr1, arr2};
+use ny_core::NyError;
 
 #[ntest::timeout(10000)]
 #[test]
@@ -379,31 +380,26 @@ fn assert_bounds_match_ibp(deadline_bounds: &BoundedTensor, ibp: &BoundedTensor)
     }
 }
 
-/// #3398: expired deadline falls back to IBP with DeadlineExceeded provenance.
+/// An already-expired authority cannot launch a fresh no-deadline IBP pass.
 #[ntest::timeout(10000)]
 #[test]
-fn test_graph_crown_deadline_expired_returns_ibp_3398() {
+fn test_graph_crown_deadline_expired_returns_typed_deadline_3398() {
     use std::time::{Duration, Instant};
     let (graph, input) = build_deadline_test_graph();
 
     let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    let result = graph
+    let error = graph
         .propagate_crown_with_engine_and_deadline(&input, None, Some(expired))
-        .unwrap();
-    assert_eq!(
-        result.provenance,
-        BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::DeadlineExceeded),
-    );
-
-    // Fallback bounds must match IBP exactly (soundness).
-    let ibp = graph.propagate_ibp(&input).unwrap();
-    assert_bounds_match_ibp(&result.bounds, &ibp);
+        .expect_err("expired authority must refuse before forward-bound collection");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
 }
 
-/// #3398: far-future deadline does not trigger fallback — CROWN runs normally.
+/// The legacy Dense seed has no cooperative finite implementation. A live
+/// authority publishes the checked forward enclosure before constructing its
+/// quadratic identity, while the no-deadline lane retains fixed-slope CROWN.
 #[ntest::timeout(10000)]
 #[test]
-fn test_graph_crown_deadline_future_runs_crown_3398() {
+fn test_graph_crown_deadline_future_dense_seed_uses_checked_forward_3398() {
     use std::time::{Duration, Instant};
     let (graph, input) = build_deadline_test_graph();
 
@@ -411,32 +407,43 @@ fn test_graph_crown_deadline_future_runs_crown_3398() {
     let result = graph
         .propagate_crown_with_engine_and_deadline(&input, None, Some(future))
         .unwrap();
-    assert_eq!(result.provenance, BoundsProvenance::Crown);
+    assert_eq!(
+        result.provenance,
+        BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::CrownPropagationError),
+    );
+    let ibp = graph.propagate_ibp(&input).unwrap();
+    for (&forward, &plain) in result.bounds.lower().iter().zip(ibp.lower().iter()) {
+        assert!(
+            forward >= plain - 1e-6,
+            "collected lower bound {forward} must not be looser than IBP {plain}"
+        );
+    }
+    for (&forward, &plain) in result.bounds.upper().iter().zip(ibp.upper().iter()) {
+        assert!(
+            forward <= plain + 1e-6,
+            "collected upper bound {forward} must not be looser than IBP {plain}"
+        );
+    }
 }
 
-/// #3398: the relaxation-aware flat wrapper must preserve deadline fallback provenance.
+/// The relaxation-aware wrapper must preserve typed deadline authority before
+/// any fallback recomputation.
 #[ntest::timeout(10000)]
 #[test]
-fn test_graph_crown_relaxation_deadline_expired_returns_ibp_provenance_3398() {
+fn test_graph_crown_relaxation_deadline_expired_returns_typed_deadline_3398() {
     use std::time::{Duration, Instant};
     let (graph, input) = build_deadline_test_graph();
 
     let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    let result = graph
+    let error = graph
         .propagate_crown_with_engine_relaxation_and_deadline(
             &input,
             None,
             MulBinaryRelaxationMode::default(),
             Some(expired),
         )
-        .unwrap();
-    assert_eq!(
-        result.provenance,
-        BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::DeadlineExceeded),
-    );
-
-    let ibp = graph.propagate_ibp(&input).unwrap();
-    assert_bounds_match_ibp(&result.bounds, &ibp);
+        .expect_err("expired relaxation request must not launch fallback work");
+    assert!(matches!(error, NyError::DeadlineExceeded(_)));
 }
 
 /// #3398: the batched deadline wrapper must expose IBP fallback provenance, not raw bounds alone.

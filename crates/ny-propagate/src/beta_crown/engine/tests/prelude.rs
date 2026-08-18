@@ -14,7 +14,7 @@ pub(super) use crate::beta_crown::{
     CutScoreWeights, CutTerm, CuttingPlane, DomainAlphaState, GeneralSplitHistory, GraphBabDomain,
     GraphBetaState, GraphCutPool, GraphCutTerm, GraphCuttingPlane, GraphNeuronConstraint,
     GraphSplitHistory, LRScheduler, LayerRef, LookaheadConfig, MultiObjectiveGraphBabDomain,
-    NeuronConstraint, NeuronSplit, PerLayerLR, SplitHistory,
+    NeuronConstraint, NeuronSplit, ObjectiveAggregation, PerLayerLR, SplitHistory,
 };
 pub(super) use crate::{
     AddConstantLayer, AddLayer, BoundedTensor, Conv2dLayer, GraphNetwork, GraphNode,

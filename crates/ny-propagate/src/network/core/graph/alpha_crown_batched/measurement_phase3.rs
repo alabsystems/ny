@@ -146,25 +146,24 @@ fn measure_full_at_eps(
     let ibp_max = max_bound_width(&ibp_bounds);
     let n_output = ibp_bounds.lower().len();
 
-    let (crown_total, crown_max) = match graph.propagate_crown_batched(&input) {
-        Ok(b) => {
-            assert_valid_bounds(&b, "CROWN", eps);
-            (total_bound_width(&b), max_bound_width(&b))
-        }
-        Err(_) => (f32::NAN, f32::NAN),
-    };
+    let crown = graph
+        .propagate_crown_batched(&input)
+        .unwrap_or_else(|error| {
+            panic!("CROWN must cover the ReLU-attention fixture at eps={eps}: {error}")
+        });
+    assert_valid_bounds(&crown, "CROWN", eps);
+    let crown_total = total_bound_width(&crown);
+    let crown_max = max_bound_width(&crown);
 
-    let (alpha_total, alpha_max, soundness_ok) =
-        match graph.propagate_alpha_crown_with_config(&input, alpha_config) {
-            Ok(b) => {
-                assert_valid_bounds(&b, "alpha-CROWN", eps);
-                let at = total_bound_width(&b);
-                let am = max_bound_width(&b);
-                let sound = verify_soundness_by_sampling(graph, &b, center, eps, shape);
-                (at, am, sound)
-            }
-            Err(_) => (f32::NAN, f32::NAN, false),
-        };
+    let alpha = graph
+        .propagate_alpha_crown_with_config(&input, alpha_config)
+        .unwrap_or_else(|error| {
+            panic!("alpha-CROWN must cover the ReLU-attention fixture at eps={eps}: {error}")
+        });
+    assert_valid_bounds(&alpha, "alpha-CROWN", eps);
+    let alpha_total = total_bound_width(&alpha);
+    let alpha_max = max_bound_width(&alpha);
+    let soundness_ok = verify_soundness_by_sampling(graph, &alpha, center, eps, shape);
 
     EpsMeasurementFull {
         eps,

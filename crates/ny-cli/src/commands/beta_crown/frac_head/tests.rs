@@ -249,9 +249,19 @@ fn verifies_unsat_when_upper_cover_suffices() {
         &model,
         &[1, 2],
         &spec,
-        Instant::now() + Duration::from_secs(20),
+        Some(Instant::now() + Duration::from_secs(20)),
     )
     .expect("should decide");
+    assert!(matches!(result.result, BabVerificationStatus::Verified));
+}
+
+#[test]
+fn unbounded_deadline_preserves_structural_verification() {
+    let graph = synthetic_model();
+    let model = BetaCrownModel::Graph(Box::new(graph));
+    let spec = spec_with(OutputConstraint::GreaterEqConst(0, 0.0));
+    let result = try_frac_head_verification(&model, &[1, 2], &spec, None)
+        .expect("bounded structural search should complete without a deadline");
     assert!(matches!(result.result, BabVerificationStatus::Verified));
 }
 
@@ -265,7 +275,7 @@ fn reports_sat_from_violating_center() {
         &model,
         &[1, 2],
         &spec,
-        Instant::now() + Duration::from_secs(20),
+        Some(Instant::now() + Duration::from_secs(20)),
     )
     .expect("should decide");
     match result.result {
@@ -297,7 +307,7 @@ fn falls_through_on_non_matching_graph() {
         &model,
         &[1, 2],
         &spec,
-        Instant::now() + Duration::from_secs(5),
+        Some(Instant::now() + Duration::from_secs(5)),
     )
     .is_none());
 }
@@ -469,146 +479,6 @@ fn head_range_with_denominator_fails_open() {
 // -----------------------------------------------------------------------
 // Geometric refinement grid
 // -----------------------------------------------------------------------
-
-// -----------------------------------------------------------------------
-// Fast-path tightness audit probe (#w4-root-margin looseness, 4726b45b)
-// -----------------------------------------------------------------------
-
-/// Measured audit of the forward-linear ROOT fast path vs the full
-/// spec-CROWN backward on the real pensieve pow graph.
-///
-/// `#[ignore]`d: needs the local VNN-COMP 2025 benchmark checkout; run with
-/// `cargo test --release -p ny-cli --lib -- frac_head::tests::pensieve_fastpath_gap_probe --ignored --nocapture`.
-#[test]
-#[ignore = "needs the local VNN-COMP 2025 benchmark checkout; run with --ignored"]
-fn pensieve_fastpath_gap_probe() {
-    let onnx = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../benchmarks/vnncomp2025/benchmarks/nn4sys/onnx/pensieve_big_parallel.onnx",
-    ));
-    let vnnlib_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../benchmarks/vnncomp2025/benchmarks/nn4sys/vnnlib/pensieve_parallel_35.vnnlib",
-    );
-    let model = ny_onnx::load_onnx_with_config(onnx, &ny_onnx::OnnxLoadConfig::default())
-        .expect("load onnx");
-    let graph = model
-        .to_graph_network_with_options(ny_onnx::GraphNetworkOptions::default())
-        .expect("graph");
-    let vnnlib = ny_onnx::vnnlib::load_vnnlib(vnnlib_path).expect("vnnlib");
-
-    let plan = detect(&graph, &[12, 8], &vnnlib).expect("frac-head detect");
-    let n_inputs = plan.root_lo.len();
-    let lower = Array1::from_iter(plan.root_lo.iter().map(|&v| v as f32));
-    let upper = Array1::from_iter(plan.root_hi.iter().map(|&v| v as f32));
-    let input = ny_tensor::BoundedTensor::new(
-        lower
-            .into_shape_with_order(IxDyn(&plan.input_shape))
-            .unwrap(),
-        upper
-            .into_shape_with_order(IxDyn(&plan.input_shape))
-            .unwrap(),
-    )
-    .expect("root box");
-    println!("root box: {n_inputs} inputs, shape {:?}", plan.input_shape);
-
-    for (hidx, head) in plan.heads.iter().enumerate() {
-        let n = head.coeffs.len();
-        // Spec rows: n identity rows (per-logit p boxes) + the ones row
-        // (denominator D = sum p) — the same rows the frac-head grid carries.
-        let mut spec = Array2::<f32>::zeros((n + 1, n));
-        for i in 0..n {
-            spec[[i, i]] = 1.0;
-        }
-        for i in 0..n {
-            spec[[n, i]] = 1.0;
-        }
-
-        let t0 = Instant::now();
-        let fast = head
-            .pow_graph
-            .propagate_crown_with_specs_and_engine(&input, &spec, None)
-            .expect("fast path");
-        let t_fast = t0.elapsed();
-        let t0 = Instant::now();
-        let (full, _) = head
-            .pow_graph
-            .propagate_crown_with_specs_and_engine_with_linear(&input, &spec, None)
-            .expect("full backward");
-        let t_full = t0.elapsed();
-
-        println!(
-            "\nhead {hidx}: pow graph {} nodes; fast(plain entry) {:.3}s vs full(_with_linear) {:.3}s",
-            head.pow_graph.num_nodes(),
-            t_fast.as_secs_f64(),
-            t_full.as_secs_f64()
-        );
-        for r in 0..=n {
-            let name = if r < n {
-                format!("p[{r}]")
-            } else {
-                "sum(p)".to_string()
-            };
-            println!(
-                "  {name:<8} fast [{:>12.5}, {:>12.5}]  full [{:>12.5}, {:>12.5}]  gap(lo {:+.5}, hi {:+.5})",
-                fast.lower()[r],
-                fast.upper()[r],
-                full.lower()[r],
-                full.upper()[r],
-                full.lower()[r] - fast.lower()[r],
-                fast.upper()[r] - full.upper()[r],
-            );
-        }
-
-        // Per-node attribution (head 0 only to keep runtime down): for each
-        // node of the pow graph, compare the forward-linear concretized box
-        // width against the full spec-CROWN backward (identity spec on the
-        // prefix ending at that node).
-        if hidx == 0 {
-            let fwd_boxes = head
-                .pow_graph
-                .collect_forward_linear_bounds_dag_with_engine(&input, None)
-                .expect("forward-linear boxes");
-            println!(
-                "  {:<28} {:>13} {:>13} {:>9}",
-                "node", "fwd_max_w", "bwd_max_w", "ratio"
-            );
-            for name in head.pow_graph.exec_order().expect("order") {
-                let Some(prefix) = extract_prefix(&head.pow_graph, name) else {
-                    continue;
-                };
-                let Some(fwd) = fwd_boxes.get(name) else {
-                    continue;
-                };
-                let dim = fwd.len();
-                if dim > 512 {
-                    continue;
-                }
-                let ident = Array2::<f32>::eye(dim);
-                let Ok((bwd, _)) =
-                    prefix.propagate_crown_with_specs_and_engine_with_linear(&input, &ident, None)
-                else {
-                    continue;
-                };
-                let max_w = |b: &ny_tensor::BoundedTensor| {
-                    b.lower()
-                        .iter()
-                        .zip(b.upper().iter())
-                        .map(|(&l, &u)| u - l)
-                        .fold(0.0f32, f32::max)
-                };
-                let (fw, bw) = (max_w(fwd), max_w(&bwd));
-                println!(
-                    "  {:<28} {:>13.6} {:>13.6} {:>9.3}",
-                    name,
-                    fw,
-                    bw,
-                    if bw > 0.0 { fw / bw } else { f32::NAN }
-                );
-            }
-        }
-    }
-}
 
 #[test]
 fn geometric_offsets_are_fine_near_edge_and_cover_span() {

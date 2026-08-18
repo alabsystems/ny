@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Input-split branch path for GPU BaB.
+//! Input-split branch path for DomainList BaB.
 //!
 //! Input splitting branches on input dimensions (bisecting the input domain)
 //! rather than fixing ReLU states. Each child gets new input bounds and
@@ -103,7 +103,7 @@ impl InputSplitBatchEffects {
 
 fn log_input_split_iteration(state: &BabLoopState, domain_list: &DomainList, batch_size: usize) {
     info!(
-        "GPU BaB input split iteration: explored={}, verified={}, remaining={}, batch_size={}",
+        "DomainList BaB input split iteration: explored={}, verified={}, remaining={}, batch_size={}",
         state.domains_explored,
         state.domains_verified,
         domain_list.len(),
@@ -256,9 +256,10 @@ fn process_input_split_batch_inner(
             state.domains_explored as u64,
             engine,
         )?
+        .is_some()
     {
         info!(
-            "GPU BaB input split: adv_check found counterexample from picked batch at domain {}",
+            "DomainList BaB input split: adv_check found counterexample from picked batch at domain {}",
             state.domains_explored
         );
         return Ok(InputSplitOutcome::Violation);
@@ -281,7 +282,7 @@ fn process_input_split_batch_inner(
                 picked_idx,
                 lower = parent_context.lower_bound,
                 upper = parent_context.upper_bound,
-                "GPU BaB input split: parent domain dropped — non-finite bounds"
+                "DomainList BaB input split: parent domain dropped — non-finite bounds"
             );
             state.unresolved_due_to_propagation_failure = true;
             continue;
@@ -326,7 +327,7 @@ fn process_input_split_batch_inner(
                 picked_idx,
                 split_dim,
                 input_len = flat.len(),
-                "GPU BaB input split: split dimension out of range"
+                "DomainList BaB input split: split dimension out of range"
             );
             state.unresolved_due_to_unsplittable = true;
             continue;
@@ -350,7 +351,7 @@ fn process_input_split_batch_inner(
                     picked_idx,
                     split_dim,
                     error = %err,
-                    "GPU BaB input split: failed to create children"
+                    "DomainList BaB input split: failed to create children"
                 );
                 state.unresolved_due_to_propagation_failure = true;
                 continue;

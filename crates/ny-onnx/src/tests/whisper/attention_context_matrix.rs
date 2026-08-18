@@ -3,10 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::*;
-use super::helpers::{
-    assert_block_width_tuple_finite, assert_tensor_sound_finite, run_whisper_block,
-    run_whisper_block_attention_crown_seed, whisper_tiny_encoder, whisper_zero_input,
-};
+use super::helpers::{assert_tensor_sound_finite, whisper_tiny_encoder, whisper_zero_input};
 use ny_propagate::{ZonotopePropagationOptions, ZonotopeSoftmaxMode};
 use ny_tensor::BoundedTensor;
 use ny_test_utils::assert_bounded_tensor_close;
@@ -14,8 +11,6 @@ use ny_test_utils::assert_bounded_tensor_close;
 struct ContextRow {
     label: &'static str,
     context_width: f32,
-    attn_output_width: f32,
-    block_output_width: f32,
 }
 
 fn expected_context_shape(whisper: &WhisperModel) -> Vec<usize> {
@@ -95,100 +90,60 @@ fn assert_context_row(bounds: &BoundedTensor, whisper: &WhisperModel, label: &st
 fn print_context_rows(rows: &[ContextRow]) {
     println!("\n=== Whisper Block-0 Attention Context Matrix (#318) ===");
     for row in rows {
-        println!(
-            "  [{:>20}] context={:.6e}  attn_output={:.6e}  block_output={:.6e}",
-            row.label, row.context_width, row.attn_output_width, row.block_output_width
-        );
+        println!("  [{:>20}] context={:.6e}", row.label, row.context_width);
     }
 }
 
 fn print_context_ratios(rows: &[ContextRow]) {
-    let mlp = &rows[0];
+    let ibp = &rows[0];
     let zono = &rows[1];
     let attention_crown = &rows[2];
     println!("\n  === Context Ratios ===");
     println!(
-        "  zono_context / mlp_context             = {:.6}",
-        zono.context_width / mlp.context_width
+        "  zonotope / graph_ibp       = {:.6}",
+        zono.context_width / ibp.context_width
     );
     println!(
-        "  attention_crown_context / mlp_context = {:.6}",
-        attention_crown.context_width / mlp.context_width
+        "  attention_crown / graph_ibp = {:.6}",
+        attention_crown.context_width / ibp.context_width
     );
     println!(
-        "  attention_crown_context / zono_context = {:.6}",
+        "  attention_crown / zonotope  = {:.6}",
         attention_crown.context_width / zono.context_width
-    );
-    println!("\n  === Output-From-Context Ratios ===");
-    println!(
-        "  mlp_seed attn_output / context             = {:.6}",
-        mlp.attn_output_width / mlp.context_width
-    );
-    println!(
-        "  zono_seed attn_output / context            = {:.6}",
-        zono.attn_output_width / zono.context_width
-    );
-    println!(
-        "  attention_crown_seed attn_output / context = {:.6}",
-        attention_crown.attn_output_width / attention_crown.context_width
     );
 }
 
 #[ntest::timeout(120000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_block0_attention_context_matrix_318() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let whisper = whisper_tiny_encoder();
     let input = whisper_zero_input(whisper.hidden_dim, 2, 0.01);
-    let mlp_seed_cfg = MultiBlockConfig::default().with_crown_block_wise(true);
-    let zono_seed_cfg = MultiBlockConfig::sound_tight().with_crown_block_wise(true);
 
-    let (mlp_seed_output, mlp_seed) =
-        run_whisper_block(whisper, 0, &input, &mlp_seed_cfg, "mlp_seed");
-    let (zono_seed_output, zono_seed) =
-        run_whisper_block(whisper, 0, &input, &zono_seed_cfg, "zono_seed");
-    let (attention_crown_output, attention_crown_seed) = run_whisper_block_attention_crown_seed(
-        whisper,
-        0,
-        &input,
-        &mlp_seed_cfg,
-        "attention_crown_seed",
-    );
-
-    let ibp_context = ibp_context_bounds(whisper, &input, mlp_seed_cfg.layernorm_forward_mode);
+    // Hold LayerNorm policy constant so this matrix compares the actual context
+    // propagation methods rather than a mixture of method and normalization
+    // policy changes.
+    let ibp_context = ibp_context_bounds(whisper, &input, false);
     let zono_context = zonotope_context_bounds(whisper, &input);
-    let attention_crown_context =
-        attention_crown_context_bounds(whisper, &input, mlp_seed_cfg.layernorm_forward_mode);
+    let attention_crown_context = attention_crown_context_bounds(whisper, &input, false);
 
-    assert_context_row(&ibp_context, whisper, "mlp_seed_context");
-    assert_context_row(&zono_context, whisper, "zono_seed_context");
+    assert_context_row(&ibp_context, whisper, "graph_ibp_context");
+    assert_context_row(&zono_context, whisper, "zonotope_context");
     assert_context_row(&attention_crown_context, whisper, "attention_crown_context");
-    assert_block_width_tuple_finite(&mlp_seed_output, &mlp_seed, "mlp_seed");
-    assert_block_width_tuple_finite(&zono_seed_output, &zono_seed, "zono_seed");
-    assert_block_width_tuple_finite(
-        &attention_crown_output,
-        &attention_crown_seed,
-        "attention_crown_seed",
-    );
 
     let rows = [
         ContextRow {
-            label: "mlp_seed",
+            label: "graph_ibp",
             context_width: ibp_context.max_width(),
-            attn_output_width: mlp_seed.attention_delta_width,
-            block_output_width: mlp_seed.output_width,
         },
         ContextRow {
-            label: "zono_seed",
+            label: "zonotope",
             context_width: zono_context.max_width(),
-            attn_output_width: zono_seed.attention_delta_width,
-            block_output_width: zono_seed.output_width,
         },
         ContextRow {
-            label: "attention_crown_seed",
+            label: "attention_crown",
             context_width: attention_crown_context.max_width(),
-            attn_output_width: attention_crown_seed.attention_delta_width,
-            block_output_width: attention_crown_seed.output_width,
         },
     ];
     print_context_rows(&rows);

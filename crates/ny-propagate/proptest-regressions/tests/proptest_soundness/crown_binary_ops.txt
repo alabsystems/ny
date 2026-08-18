@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 60dd8066f92328b0f5107b459fe0e67fc5e7b06e06ea721ea75e31c82649bda8 # shrinks to la0 = 0.0, da0 = 0.01, la1 = 0.0, da1 = 0.01, lb0 = 0.0, db0 = 0.01, lb1 = 0.30786508, db1 = 1.2177138
 cc 324f091a66f2fda79626cede21dcab505421ef5b2ecde26a47a5976878497303 # shrinks to la0 = -0.01, ra0 = 0.01, la1 = -4.5299635, ra1 = 0.01, lb0 = 0.1, db0 = 0.01, lb1 = 0.1, db1 = 0.01
+cc 5d5ec47729b91569b4efb96ea5edff9d9489b40a7be891dedb4917ac4e2d2868 # shrinks to la0 = 0.0, da0 = 0.01, la1 = 0.53830296, da1 = 1.1366833, lb0 = -4.363009, db0 = 1.8758614, lb1 = -4.3647885, db1 = 1.0738618

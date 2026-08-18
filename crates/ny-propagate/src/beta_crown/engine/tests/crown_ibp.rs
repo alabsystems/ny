@@ -92,7 +92,6 @@ fn test_joint_alpha_beta_conv2d_infers_spatial_dims_from_layout() {
                 None,
                 &beta_state,
                 &alpha_state,
-                None, // No arelu state in tests
                 0,
                 None, // No GPU engine in tests
             )
@@ -228,6 +227,10 @@ fn test_beta_crown_with_crown_ibp() {
 #[ntest::timeout(5000)]
 #[test]
 fn test_beta_crown_verify_with_engine_preserves_gpu_path_for_crown_ibp() {
+    // `MockGpuCrownEngine` deliberately does not claim production soundness.
+    // Release the sound-required process gate under its shared test lock so this
+    // test measures engine plumbing rather than the global safety policy.
+    let _gate = crate::sound_gpu_gate::test_lock::lock_gate();
     let network = deeper_network();
     let input =
         BoundedTensor::new(arr1(&[-0.5, -0.5]).into_dyn(), arr1(&[0.5, 0.5]).into_dyn()).unwrap();
@@ -263,7 +266,13 @@ fn test_beta_crown_verify_with_engine_preserves_gpu_path_for_crown_ibp() {
 
 #[ntest::timeout(5000)]
 #[test]
-fn test_beta_crown_verify_with_engine_reuses_root_crown_ibp_collection() {
+fn test_beta_crown_verify_with_engine_preserves_finite_crown_ibp_fallback() {
+    // Exercise the legacy no-deadline GPU path under the same serialized gate
+    // override used by the other engine-plumbing tests. A verifier run always
+    // carries a finite initial-bound deadline; its opaque GPU partial-CROWN
+    // staging is deliberately closed, so that run must instead retain the
+    // independently certified CPU result without making a GPU call.
+    let _gate = crate::sound_gpu_gate::test_lock::lock_gate();
     let network = deeper_network();
     let input =
         BoundedTensor::new(arr1(&[-0.5, -0.5]).into_dyn(), arr1(&[0.5, 0.5]).into_dyn()).unwrap();
@@ -276,7 +285,7 @@ fn test_beta_crown_verify_with_engine_reuses_root_crown_ibp_collection() {
     let baseline_layer_bounds = network
         .collect_crown_ibp_bounds_with_engine_and_deadline(&input, Some(&baseline_gpu), None)
         .unwrap();
-    let _baseline_output = network
+    let baseline_output = network
         .propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
             &input,
             &baseline_layer_bounds,
@@ -286,6 +295,10 @@ fn test_beta_crown_verify_with_engine_reuses_root_crown_ibp_collection() {
         )
         .unwrap();
     let baseline_calls = baseline_gpu.gpu_calls();
+    assert!(
+        baseline_calls > 0,
+        "the baseline must exercise GPU CROWN before call-count reuse is compared"
+    );
 
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
         max_domains: 0,
@@ -294,6 +307,51 @@ fn test_beta_crown_verify_with_engine_reuses_root_crown_ibp_collection() {
         use_crown_ibp: true,
         ..Default::default()
     });
+    let finite_gpu = MockGpuCrownEngine::from_expected(&expected);
+    let finite_output = verifier
+        .compute_initial_bounds_with_early_exit_engine(
+            &network,
+            &input,
+            None,
+            Some(&finite_gpu),
+            Some(std::time::Instant::now() + Duration::from_secs(10)),
+        )
+        .expect("finite CPU fallback should publish its certified root enclosure");
+    assert_eq!(
+        finite_gpu.gpu_calls(),
+        0,
+        "finite initial-bound setup must decline opaque GPU CROWN staging before launch"
+    );
+    let ibp_output = network
+        .propagate_ibp(&input)
+        .expect("independent IBP enclosure");
+    let mut gpu_strictly_tighter_than_ibp = false;
+    for (((&finite_l, &finite_u), (&gpu_l, &gpu_u)), (&ibp_l, &ibp_u)) in finite_output
+        .lower()
+        .iter()
+        .zip(finite_output.upper())
+        .zip(baseline_output.lower().iter().zip(baseline_output.upper()))
+        .zip(ibp_output.lower().iter().zip(ibp_output.upper()))
+    {
+        // Expiry-only decline semantics (docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md):
+        // a LIVE finite deadline keeps the tight dense CPU path, so the finite
+        // run publishes real CROWN bounds instead of the loose IBP enclosure.
+        // The staging invariant (zero GPU calls under finite authority) is
+        // asserted above and unchanged. Soundness here: IBP must enclose the
+        // finite CROWN result, and the finite result must be at least as tight
+        // as IBP somewhere (non-vacuous).
+        assert!(
+            ibp_l <= finite_l && finite_u <= ibp_u,
+            "the independent IBP enclosure must contain the finite CPU CROWN result"
+        );
+        let _ = (gpu_l, gpu_u);
+        gpu_strictly_tighter_than_ibp |= finite_l > ibp_l || finite_u < ibp_u;
+    }
+    assert!(
+        gpu_strictly_tighter_than_ibp,
+        "the finite CPU CROWN result must be strictly tighter than IBP so the expiry-only path is non-vacuous"
+    );
+
     let mock_gpu = MockGpuCrownEngine::from_expected(&expected);
 
     let result = verifier
@@ -306,8 +364,12 @@ fn test_beta_crown_verify_with_engine_reuses_root_crown_ibp_collection() {
     );
     assert_eq!(
         mock_gpu.gpu_calls(),
-        baseline_calls,
-        "root verification should reuse one CROWN-IBP collection instead of rebuilding it"
+        0,
+        "finite verifier setup must decline opaque GPU CROWN staging before launch"
+    );
+    assert!(
+        result.output_bounds.is_none(),
+        "the domain-limit result intentionally does not claim a terminal output enclosure"
     );
 }
 
@@ -532,6 +594,84 @@ fn test_crown_coefficient_computation() {
     }
 }
 
+/// The verifier must pass preset floor/cap overrides into native sequential
+/// collection, including the precomputed-IBP path used after the root fast
+/// check. A sub-nanosecond explicit budget rounds to an already-expired
+/// per-node deadline, making the configured policy observable without a slow
+/// timing test. The backwards-compatible default easily completes this tiny
+/// pure `Network`.
+#[ntest::timeout(30000)]
+#[test]
+fn test_configured_sequential_carries_crown_ibp_per_node_time_budget() {
+    use crate::types::CrownIbpFallbackReason;
+    use std::time::Instant;
+
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _cap_env = ny_test_utils::env::ScopedEnvVar::unset("NY_PER_NODE_CAP_SECS");
+    let _floor_env = ny_test_utils::env::ScopedEnvVar::unset("NY_PER_NODE_FLOOR_SECS");
+
+    let network = deeper_network();
+    let input =
+        BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn()).unwrap();
+    let configured = BetaCrownVerifier::new(BetaCrownConfig {
+        crown_ibp_per_node_floor_secs: Some(1e-12),
+        crown_ibp_per_node_cap_secs: Some(1e-12),
+        ..Default::default()
+    });
+
+    let fresh = configured
+        .collect_sequential_crown_ibp_bounds_with_status(
+            &network,
+            &input,
+            None,
+            None,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )
+        .unwrap();
+    assert!(
+        fresh
+            .fallback_events
+            .iter()
+            .any(|event| event.reason == CrownIbpFallbackReason::PerNodeDeadlineExceeded),
+        "fresh sequential collection did not receive the configured per-node cap"
+    );
+
+    let precomputed_ibp = network.collect_ibp_bounds(&input).unwrap();
+    let precomputed = configured
+        .collect_sequential_crown_ibp_bounds_with_status(
+            &network,
+            &input,
+            Some(precomputed_ibp),
+            None,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )
+        .unwrap();
+    assert!(
+        precomputed
+            .fallback_events
+            .iter()
+            .any(|event| event.reason == CrownIbpFallbackReason::PerNodeDeadlineExceeded),
+        "precomputed sequential collection did not receive the configured per-node cap"
+    );
+
+    let default_result = BetaCrownVerifier::default()
+        .collect_sequential_crown_ibp_bounds_with_status(
+            &network,
+            &input,
+            None,
+            None,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )
+        .unwrap();
+    assert!(
+        default_result
+            .fallback_events
+            .iter()
+            .all(|event| event.reason != CrownIbpFallbackReason::PerNodeDeadlineExceeded),
+        "the tiny test network should complete under the default per-node policy"
+    );
+}
+
 /// #cgan-bn11-budget: the preset-configurable per-node CROWN-IBP time budget
 /// on `BetaCrownConfig` is stamped onto every engine-configured graph clone,
 /// so the collector's budget computation (`crown_tighten.rs`) sees the preset
@@ -552,10 +692,18 @@ fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
         configured.crown_ibp_per_node_time_budget,
         CrownIbpPerNodeTimeBudget::default(),
     );
+    assert!(
+        !configured.forward_linear_deadline_fallback_to_ibp,
+        "default graph must preserve the historical deadline fallback"
+    );
 
-    // cgan_2023-shaped config: cap 150 s, floor unset.
+    // cgan_2023-shaped config: cap 150 s, floor unset, direct IBP endgame.
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
         crown_ibp_per_node_cap_secs: Some(150.0),
+        alpha_config: crate::AlphaCrownConfig {
+            forward_linear_deadline_fallback_to_ibp: true,
+            ..Default::default()
+        },
         ..Default::default()
     });
     let configured = verifier.configured_graph_for_crown(&graph);
@@ -566,9 +714,12 @@ fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
             cap_secs: Some(150.0),
         },
     );
+    assert!(configured.forward_linear_deadline_fallback_to_ibp);
     // Clones (how BaB paths receive the graph) inherit the stamp.
+    let cloned = configured.clone();
     assert_eq!(
-        configured.clone().crown_ibp_per_node_time_budget,
+        cloned.crown_ibp_per_node_time_budget,
         configured.crown_ibp_per_node_time_budget,
     );
+    assert!(cloned.forward_linear_deadline_fallback_to_ibp);
 }

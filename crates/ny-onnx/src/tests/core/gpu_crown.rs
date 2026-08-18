@@ -12,7 +12,10 @@
 //! validate GPU CROWN soundness via IBP comparison and concrete sampling rather
 //! than GPU-vs-CPU comparison (which would require a 15+ minute test).
 //!
-//! Tests are skipped if benchmark data is unavailable or GPU initialization fails.
+//! Hardware and real-benchmark cases are registered only by explicit external
+//! conformance features. The `ny_onnx_conformance` runner selects those lanes;
+//! missing fixtures or GPU initialization fail actionably instead of being
+//! reported as passing coverage.
 //!
 //! Reference: designs/2026-03-06-gpu-crown-backward.md
 //! Reference: designs/2026-03-09-issue-3397-gpu-crown-plan-cache.md
@@ -35,23 +38,13 @@ fn try_gpu_device(backend: Backend) -> Option<ComputeDevice> {
     ComputeDevice::new(backend).ok()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeviceAvailability {
-    Optional,
-}
-
-fn gpu_device_for_test(
-    backend: Backend,
-    label: &str,
-    _availability: DeviceAvailability,
-) -> Option<ComputeDevice> {
-    match try_gpu_device(backend) {
-        Some(device) => Some(device),
-        None => {
-            eprintln!("{label}: SKIP: {backend:?} device not available");
-            None
-        }
-    }
+fn require_gpu_device(backend: Backend, label: &str) -> ComputeDevice {
+    try_gpu_device(backend).unwrap_or_else(|| {
+        panic!(
+            "{label}: {backend:?} device required; run the external-wgpu conformance lane on a \
+             compatible GPU host"
+        )
+    })
 }
 
 /// Build an epsilon-ball input from the model's input spec (strips batch dim).
@@ -257,22 +250,38 @@ fn gpu_crown_timing_with_precomputed_ibp_soundness(
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// 0. Diagnostic: print layer types for VNN-COMP models
+// 0. Structural conformance for VNN-COMP models
 // ───────────────────────────────────────────────────────────────────────
 
-/// Diagnostic: load metaroom 6cnn_ry and print its layer types.
-/// This helps debug whether `try_extract_gpu_crown_layers` will accept the model.
+/// Loading and lowering metaroom 6cnn_ry must retain a nonempty sequential
+/// network accepted by the GPU-CROWN extraction surface. The layer inventory
+/// remains useful failure context, but eligibility is the conformance claim.
 #[test]
-fn test_gpu_crown_metaroom_layer_diagnostic() {
+#[cfg(feature = "external-vnncomp")]
+fn test_gpu_crown_metaroom_lowering_is_fast_path_eligible() {
     let model_path = benchmark_path(
         "benchmarks/vnncomp2023/benchmarks/metaroom/onnx/6cnn_ry_0_0_no_custom_OP.onnx",
     );
-    if !model_path.exists() {
-        eprintln!("SKIP: metaroom not available");
-        return;
-    }
+    assert!(
+        model_path.is_file(),
+        "external metaroom fixture missing at {}; run benchmarks/download_benchmarks.sh",
+        model_path.display()
+    );
     let model = load_onnx(&model_path).expect("load failed");
     let network = model.to_propagate_network().expect("convert failed");
+    assert!(
+        !network.layers().is_empty(),
+        "metaroom 6cnn_ry lowering must retain a nonempty sequential network"
+    );
+    assert!(
+        network.is_gpu_crown_eligible(),
+        "metaroom 6cnn_ry lowering introduced a layer unsupported by GPU CROWN: {:?}",
+        network
+            .layers()
+            .iter()
+            .map(|layer| layer.layer_type())
+            .collect::<Vec<_>>()
+    );
     eprintln!("metaroom 6cnn_ry: {} layers", network.layers().len());
     for (i, layer) in network.layers().iter().enumerate() {
         eprintln!("  [{i}] {}", layer.layer_type());
@@ -299,25 +308,17 @@ fn test_gpu_crown_metaroom_layer_diagnostic() {
 /// Acceptance: GPU CROWN (with precomputed IBP) completes within 180s.
 #[ntest::timeout(600000)]
 #[test]
+#[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 fn test_gpu_crown_real_metaroom_6cnn_ry_3397() {
     let model_path = benchmark_path(
         "benchmarks/vnncomp2023/benchmarks/metaroom/onnx/6cnn_ry_0_0_no_custom_OP.onnx",
     );
-    if !model_path.exists() {
-        eprintln!(
-            "SKIP: metaroom benchmark data not available at {}",
-            model_path.display()
-        );
-        return;
-    }
-
-    let gpu_device = match try_gpu_device(Backend::Wgpu) {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIP: GPU device not available");
-            return;
-        }
-    };
+    assert!(
+        model_path.is_file(),
+        "external metaroom fixture missing at {}; run benchmarks/download_benchmarks.sh",
+        model_path.display()
+    );
+    let gpu_device = require_gpu_device(Backend::Wgpu, "metaroom_6cnn_ry");
 
     let model =
         load_onnx(&model_path).unwrap_or_else(|e| panic!("Failed to load metaroom model: {e}"));
@@ -444,14 +445,14 @@ fn assert_gpu_phase_within_budget(label: &str, elapsed: Duration, budget: Durati
             elapsed.as_secs_f64(),
             budget.as_secs_f64(),
         );
-        return;
+    } else {
+        assert!(
+            elapsed < budget,
+            "{label}: GPU CROWN (precomputed IBP) took {:.3}s, exceeds {:.3}s VNN-COMP backward timeout",
+            elapsed.as_secs_f64(),
+            budget.as_secs_f64(),
+        );
     }
-    assert!(
-        elapsed < budget,
-        "{label}: GPU CROWN (precomputed IBP) took {:.3}s, exceeds {:.3}s VNN-COMP backward timeout",
-        elapsed.as_secs_f64(),
-        budget.as_secs_f64(),
-    );
 }
 
 /// Compare GPU vs CPU CROWN bounds within tolerance, printing first 10 dims.
@@ -512,15 +513,11 @@ fn gpu_crown_small_model_matches_cpu(
     eps: f32,
     label: &str,
     tol: f32,
-    availability: DeviceAvailability,
 ) {
     let path = require_test_model(model_name);
     let model =
         load_onnx(&path).unwrap_or_else(|e| panic!("{label}: failed to load {model_name}: {e}"));
-    let gpu_device = match gpu_device_for_test(backend, label, availability) {
-        Some(device) => device,
-        None => return,
-    };
+    let gpu_device = require_gpu_device(backend, label);
 
     let network = model
         .to_propagate_network()
@@ -567,23 +564,17 @@ fn gpu_crown_small_model_matches_cpu(
 /// every soundness assertion but get an unbounded deadline.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 fn test_gpu_crown_real_soundnessbench_3397() {
     let model_path =
         benchmark_path("benchmarks/vnncomp2025/benchmarks/soundnessbench/onnx/model.onnx");
-    if !model_path.exists() {
-        eprintln!(
-            "SKIP: soundnessbench not available at {}",
-            model_path.display()
-        );
-        return;
-    }
-    let gpu_device = match try_gpu_device(Backend::Wgpu) {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIP: GPU device not available");
-            return;
-        }
-    };
+    assert!(
+        model_path.is_file(),
+        "external soundnessbench fixture missing at {}; run \
+         benchmarks/download_benchmarks.sh",
+        model_path.display()
+    );
+    let gpu_device = require_gpu_device(Backend::Wgpu, "soundnessbench");
 
     let overall_start = Instant::now();
 
@@ -665,6 +656,7 @@ fn test_gpu_crown_real_soundnessbench_3397() {
 /// directly (both complete in <1s).
 #[ntest::timeout(60000)]
 #[test]
+#[cfg(feature = "external-wgpu")]
 fn test_gpu_crown_mnist_conv_smoke() {
     gpu_crown_small_model_matches_cpu(
         "mnist_conv.onnx",
@@ -672,7 +664,6 @@ fn test_gpu_crown_mnist_conv_smoke() {
         0.1,
         "mnist_conv/wgpu",
         0.01,
-        DeviceAvailability::Optional,
     );
 }
 
@@ -694,25 +685,17 @@ fn test_gpu_crown_mnist_conv_smoke() {
 /// enough for direct GPU-vs-CPU comparison.
 #[ntest::timeout(60000)]
 #[test]
+#[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 fn test_gpu_crown_acasxu_addconstant_3460() {
     let model_path = benchmark_path(
         "benchmarks/vnncomp2023/benchmarks/acasxu/onnx/ACASXU_run2a_1_1_batch_2000.onnx",
     );
-    if !model_path.exists() {
-        eprintln!(
-            "SKIP: ACAS-Xu benchmark data not available at {}",
-            model_path.display()
-        );
-        return;
-    }
-
-    let gpu_device = match try_gpu_device(Backend::Wgpu) {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIP: GPU device not available");
-            return;
-        }
-    };
+    assert!(
+        model_path.is_file(),
+        "external ACAS-Xu fixture missing at {}; run benchmarks/download_benchmarks.sh",
+        model_path.display()
+    );
+    let gpu_device = require_gpu_device(Backend::Wgpu, "ACAS-Xu 1_1");
 
     let model =
         load_onnx(&model_path).unwrap_or_else(|e| panic!("Failed to load ACAS-Xu model: {e}"));
@@ -792,7 +775,7 @@ fn splitmix64_unit(s: &mut u64) -> f32 {
 /// the exact forward evaluation, exactly as the CNN soundness tests do (see
 /// `tests::core::cnn::assert_concrete_within_crown`). Every output must fall
 /// within `[lo, hi]` (1e-4 f32 forward-noise slack). Panics on the first escape.
-fn assert_crown_encloses_acas_samples(
+pub(super) fn assert_crown_encloses_acas_samples(
     network: &ny_propagate::Network,
     input: &BoundedTensor,
     crown: &BoundedTensor,
@@ -864,7 +847,11 @@ fn assert_crown_encloses_acas_samples(
 }
 
 /// Assert a CROWN bound set is finite, non-inverted, and no looser than IBP.
-fn assert_crown_finite_within_ibp(crown: &BoundedTensor, ibp: &BoundedTensor, label: &str) {
+pub(super) fn assert_crown_finite_within_ibp(
+    crown: &BoundedTensor,
+    ibp: &BoundedTensor,
+    label: &str,
+) {
     let cl = crown.lower();
     let cu = crown.upper();
     let cl = cl.as_slice().expect("crown lower contiguous");
@@ -916,21 +903,17 @@ fn assert_crown_finite_within_ibp(crown: &BoundedTensor, ibp: &BoundedTensor, la
 /// directly by concrete sampling (32 corners + 2000 seeded interior points).
 #[ntest::timeout(60000)]
 #[test]
+#[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 fn test_gpu_crown_acasxu_encloses_concrete_samples() {
     let model_path = benchmark_path(
         "benchmarks/vnncomp2023/benchmarks/acasxu/onnx/ACASXU_run2a_1_1_batch_2000.onnx",
     );
-    if !model_path.exists() {
-        eprintln!("SKIP: ACAS-Xu benchmark data not available");
-        return;
-    }
-    let gpu_device = match try_gpu_device(Backend::Wgpu) {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIP: GPU device not available");
-            return;
-        }
-    };
+    assert!(
+        model_path.is_file(),
+        "external ACAS-Xu fixture missing at {}; run benchmarks/download_benchmarks.sh",
+        model_path.display()
+    );
+    let gpu_device = require_gpu_device(Backend::Wgpu, "ACAS-Xu sample enclosure");
     let model = load_onnx(&model_path).expect("load ACAS-Xu");
     let network = model.to_propagate_network().expect("to_propagate_network");
 

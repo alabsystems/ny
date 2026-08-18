@@ -5,7 +5,7 @@
 use crate::{LayerSpec, OnnxModel};
 use ny_core::{LayerType, NyError, Result};
 use ny_gpu::ComputeDevice;
-use ny_propagate::Network as PropNetwork;
+use ny_propagate::{layers::LayerNormCrownMode, Network as PropNetwork};
 use ny_tensor::BoundedTensor;
 use tracing::{info, warn};
 
@@ -30,6 +30,8 @@ pub struct WhisperModel {
 
 impl WhisperModel {
     /// Sequence length at which the historical verifier preferred GPU attention.
+    ///
+    /// The current compatibility backend does not dispatch that path.
     pub const GPU_ATTENTION_THRESHOLD: usize = 64;
 
     /// Get the full encoder as a propagate network.
@@ -44,14 +46,13 @@ impl WhisperModel {
             x_attn_width: width,
             mlp_delta_width: width,
             output_width: width,
+            stage_metrics_available: false,
         }
     }
 
     fn gpu_compositional_details(
         input: &BoundedTensor,
         output: &BoundedTensor,
-        gpu_device: Option<&ComputeDevice>,
-        config: &MultiBlockConfig,
     ) -> GpuCompositionalDetails {
         let width = output.max_width();
         let seq_len = input.shape().get(1).copied().unwrap_or(0);
@@ -60,8 +61,12 @@ impl WhisperModel {
             x_attn_width: width,
             mlp_delta_width: width,
             output_width: width,
-            used_gpu_attention: gpu_device.is_some() && seq_len >= Self::GPU_ATTENTION_THRESHOLD,
-            used_zonotope_attention: config.use_zonotope_attention,
+            stage_metrics_available: false,
+            // This compatibility backend currently executes graph IBP on the
+            // CPU. A requested device or zonotope policy must never be reported
+            // as executed until it is wired into `verify_block_graph_with_config`.
+            used_gpu_attention: false,
+            used_zonotope_attention: false,
             seq_len,
             normalization_row_stats: Vec::new(),
         }
@@ -73,13 +78,83 @@ impl WhisperModel {
         input: &BoundedTensor,
         config: &MultiBlockConfig,
     ) -> Result<BoundedTensor> {
+        self.validate_direct_block_input(input)?;
         let mut graph = self.encoder_layer_graph_full(index)?;
-        graph.set_layernorm_forward_mode(config.layernorm_forward_mode);
-        graph.set_layernorm_crown_mode(config.layernorm_crown_mode);
+        debug_assert!(!config.layernorm_forward_mode);
+        graph.set_layernorm_forward_mode(false);
         graph.propagate_ibp(input)
     }
 
-    /// Verify one encoder block with the compatibility compositional API.
+    pub(super) fn validate_direct_block_input(&self, input: &BoundedTensor) -> Result<()> {
+        let shape = input.shape();
+        if shape.len() != 3 {
+            return Err(NyError::InvalidSpec(format!(
+                "Whisper block input must have shape [batch, sequence, hidden], got {shape:?}"
+            )));
+        }
+        if shape[2] != self.hidden_dim {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![shape[0], shape[1], self.hidden_dim],
+                got: shape.to_vec(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_direct_block_requests(
+        gpu_device: Option<&ComputeDevice>,
+        config: &MultiBlockConfig,
+    ) -> Result<()> {
+        let mut unsupported = Vec::new();
+        if gpu_device.is_some() {
+            unsupported.push("GPU execution");
+        }
+        if config.max_bound_width.to_bits() != f32::MAX.to_bits() {
+            unsupported.push("max_bound_width");
+        }
+        if config.terminate_on_overflow {
+            unsupported.push("terminate_on_overflow");
+        }
+        if config.continue_after_overflow {
+            unsupported.push("continue_after_overflow");
+        }
+        if config.overflow_clamp_value.to_bits() != 1e30_f32.to_bits() {
+            unsupported.push("overflow_clamp_value");
+        }
+        if config.layernorm_forward_mode {
+            unsupported.push("heuristic LayerNorm forward mode");
+        }
+        if config.layernorm_crown_mode != LayerNormCrownMode::Cut {
+            unsupported.push("LayerNorm CROWN");
+        }
+        if config.use_zonotope_attention {
+            unsupported.push("zonotope attention");
+        }
+        if config.reset_zonotope_between_blocks {
+            unsupported.push("zonotope block reset");
+        }
+        if config.use_crown_block_wise {
+            unsupported.push("block-wise CROWN");
+        }
+
+        if unsupported.is_empty() {
+            return Ok(());
+        }
+
+        Err(NyError::UnsupportedConfiguration(format!(
+            "unsupported Whisper direct-block request(s): {}; the current backend supports only \
+             conservative CPU graph IBP; no bounds were produced",
+            unsupported.join(", ")
+        )))
+    }
+
+    /// Propagate bounds for one encoder block with the compatibility API.
+    ///
+    /// The current backend runs the complete extracted block with conservative
+    /// LayerNorm graph IBP. The four reported stage widths all alias the final
+    /// graph output width because no compositional stage split is executed.
+    /// `input` must have shape `[batch, sequence, self.hidden_dim]`.
+    /// This method evaluates no property and produces no verification verdict.
     pub fn verify_block_compositional(
         &self,
         index: usize,
@@ -91,19 +166,29 @@ impl WhisperModel {
         Ok((output, details))
     }
 
-    /// Verify one encoder block through the CROWN-labeled compatibility API.
+    /// Unavailable CROWN-labeled block compatibility API.
+    ///
+    /// No block-wise CROWN backend is implemented in the current tree. Returning
+    /// graph IBP under this method name would make the fallback impossible to
+    /// detect, so this method fails closed and returns no bounds.
     pub fn verify_block_compositional_crown(
         &self,
-        index: usize,
-        input: &BoundedTensor,
+        _index: usize,
+        _input: &BoundedTensor,
     ) -> Result<(BoundedTensor, CompositionalVerificationDetails)> {
-        let config = MultiBlockConfig::conservative().with_crown_block_wise(true);
-        let output = self.verify_block_graph_with_config(index, input, &config)?;
-        let details = Self::compositional_details(&output);
-        Ok((output, details))
+        Err(NyError::UnsupportedConfiguration(
+            "compositional Whisper CROWN verification is unavailable: block-wise CROWN is not \
+             implemented; no bounds were produced"
+                .to_string(),
+        ))
     }
 
-    /// Verify one encoder block with the GPU-aware compatibility API.
+    /// Propagate bounds for one encoder block with the device-aware compatibility API.
+    ///
+    /// With no device, the current compatibility backend runs conservative CPU
+    /// graph IBP and reports both execution flags as false. Supplying a device
+    /// fails closed because GPU attention is unavailable. This method evaluates
+    /// no property and produces no verification verdict.
     pub fn verify_block_compositional_gpu(
         &self,
         index: usize,
@@ -114,11 +199,18 @@ impl WhisperModel {
             index,
             input,
             gpu_device,
-            &MultiBlockConfig::default(),
+            &MultiBlockConfig::conservative(),
         )
     }
 
-    /// Verify one encoder block with explicit multi-block configuration.
+    /// Propagate block bounds with explicit compatibility configuration.
+    ///
+    /// The extracted graph is evaluated with conservative CPU IBP.
+    /// Non-default `gpu_device`, heuristic LayerNorm forward mode, LayerNorm
+    /// CROWN, overflow, zonotope, reset, and block-wise-CROWN requests fail
+    /// closed rather than returning untagged bounds from a different method.
+    /// `input` must have shape `[batch, sequence, self.hidden_dim]`. This method
+    /// evaluates no property and produces no verification verdict.
     pub fn verify_block_compositional_gpu_with_config(
         &self,
         index: usize,
@@ -126,29 +218,41 @@ impl WhisperModel {
         gpu_device: Option<&ComputeDevice>,
         config: &MultiBlockConfig,
     ) -> Result<(BoundedTensor, GpuCompositionalDetails)> {
+        Self::validate_direct_block_requests(gpu_device, config)?;
         let output = self.verify_block_graph_with_config(index, input, config)?;
-        let details = Self::gpu_compositional_details(input, &output, gpu_device, config);
+        let details = Self::gpu_compositional_details(input, &output);
         Ok((output, details))
     }
 
     /// IBP bounds of the attention LayerNorm output for block `index`.
     ///
-    /// Seeds attention suffix analysis: the returned tensor is the input that
-    /// the suffix graph from
-    /// `attention_suffix_subgraph_from_layernorm_output` expects (that graph
-    /// maps the unresolved `ln_output` tensor to `_input`). The LayerNorm
-    /// node is located structurally via `discover_attention_nodes` and the
-    /// attention subgraph is propagated with it as the output node.
+    /// Seeds attention analysis: the returned tensor is the shared input to the
+    /// Q/K/V projections after LayerNorm. The LayerNorm node is located
+    /// structurally via `discover_attention_nodes` and the attention subgraph
+    /// is propagated with it as the output node.
     ///
     /// Historical note: this helper used to propagate the whole attention
     /// subgraph and return the attention-delta bounds — the wrong tensor for
     /// its name and for the suffix-graph contract above.
+    ///
+    /// # Soundness
+    ///
+    /// `forward_mode = false` selects conservative LayerNorm IBP. `true` is
+    /// rejected because the center-statistics heuristic has no machine-readable
+    /// provenance and must not escape as an ordinary `BoundedTensor`.
     pub fn attention_layernorm_output_ibp(
         &self,
         index: usize,
         input: &BoundedTensor,
         forward_mode: bool,
     ) -> Result<BoundedTensor> {
+        if forward_mode {
+            return Err(NyError::UnsupportedConfiguration(
+                "heuristic Whisper LayerNorm forward mode is unavailable through the IBP API; \
+                 no bounds were produced"
+                    .to_string(),
+            ));
+        }
         if index >= self.encoder_layers {
             return Err(NyError::InvalidSpec(format!(
                 "Encoder layer {} out of range (max {})",
@@ -164,71 +268,37 @@ impl WhisperModel {
             )));
         }
         graph.set_output(&ln_node);
-        graph.set_layernorm_forward_mode(forward_mode);
+        graph.set_layernorm_forward_mode(false);
         graph.propagate_ibp(input)
     }
 
-    /// Compatibility surface for the sequential Whisper CLI.
+    /// Unavailable sequential Whisper verification compatibility surface.
     ///
-    /// The old project had experimental multi-block verification code behind this API.
-    /// The fresh `ny` tree keeps the command contract, but does not claim that path is
-    /// production-ready. It returns the input bounds unchanged with explicit metadata.
+    /// No sequential verifier is implemented in the current tree. This method
+    /// fails closed with [`NyError::UnsupportedConfiguration`] and returns no
+    /// bounds or completion metadata.
     #[allow(clippy::too_many_arguments)]
     pub fn verify_encoder_sequential_with_config(
         &self,
-        input: &BoundedTensor,
-        start_block: usize,
-        end_block: usize,
-        include_stem: bool,
-        include_ln_post: bool,
-        gpu_device: Option<&ComputeDevice>,
+        _input: &BoundedTensor,
+        _start_block: usize,
+        _end_block: usize,
+        _include_stem: bool,
+        _include_ln_post: bool,
+        _gpu_device: Option<&ComputeDevice>,
         _config: &MultiBlockConfig,
     ) -> Result<(BoundedTensor, MultiBlockDetails)> {
-        let end = end_block.min(self.encoder_layers);
-        if start_block > end {
-            return Err(NyError::InvalidSpec(format!(
-                "start block {start_block} is after end block {end}"
-            )));
-        }
-
-        let num_blocks = end.saturating_sub(start_block);
-        let final_width = input.max_width();
-        let block_details = (0..num_blocks)
-            .map(|_| GpuCompositionalDetails {
-                attention_delta_width: final_width,
-                x_attn_width: final_width,
-                mlp_delta_width: final_width,
-                output_width: final_width,
-                used_gpu_attention: gpu_device.is_some(),
-                used_zonotope_attention: false,
-                seq_len: input.shape().get(1).copied().unwrap_or(0),
-                normalization_row_stats: Vec::new(),
-            })
-            .collect();
-
-        Ok((
-            input.clone(),
-            MultiBlockDetails {
-                num_blocks,
-                block_details,
-                included_stem: include_stem,
-                included_ln_post: include_ln_post,
-                total_time_ms: 0,
-                stem_output_width: include_stem.then_some(final_width),
-                ln_post_output_width: include_ln_post.then_some(final_width),
-                final_output_width: final_width,
-                blocks_completed: num_blocks,
-                early_terminated: false,
-                overflow_at_block: None,
-                termination_reason: Some(
-                    "sequential Whisper verification is not enabled in this fresh ny tree"
-                        .to_string(),
-                ),
-            },
+        Err(NyError::UnsupportedConfiguration(
+            "sequential Whisper verification is unavailable: verifier execution is not \
+             implemented; no bounds or completion metadata were produced"
+                .to_string(),
         ))
     }
 
-    /// Verify a range of encoder blocks using the default compatibility config.
+    /// Request sequential verification with the default compatibility config.
+    ///
+    /// Currently propagates [`NyError::UnsupportedConfiguration`] without
+    /// returning bounds or completion metadata.
     #[allow(clippy::too_many_arguments)]
     pub fn verify_encoder_sequential(
         &self,
@@ -246,11 +316,14 @@ impl WhisperModel {
             include_stem,
             include_ln_post,
             gpu_device,
-            &MultiBlockConfig::default(),
+            &MultiBlockConfig::conservative(),
         )
     }
 
-    /// Verify all encoder blocks using the default compatibility config.
+    /// Request verification of the full encoder.
+    ///
+    /// Currently propagates [`NyError::UnsupportedConfiguration`] without
+    /// returning bounds or completion metadata.
     pub fn verify_full_encoder(
         &self,
         input: &BoundedTensor,

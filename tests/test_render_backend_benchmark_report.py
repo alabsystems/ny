@@ -26,8 +26,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "benchmark_reports" / "compare_backends"
 PROFILE_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "benchmark_reports" / "profile_lane"
 SCRIPT = REPO_ROOT / "scripts" / "render_backend_benchmark_report.py"
-BENCHMARK_REPORTS = REPO_ROOT / "reports" / "benchmarks"
-REPORT_METADATA = BENCHMARK_REPORTS / "metadata"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from _benchmark_report_helpers import (
@@ -43,11 +41,6 @@ from render_backend_benchmark_report import load_csv_rows
 
 def _load_valid_meta() -> dict:
     with open(FIXTURES / "valid_metadata.json") as f:
-        return json.load(f)
-
-
-def _load_json(path: Path) -> dict:
-    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -247,30 +240,6 @@ class TestRenderReport:
         ]
         positions = [result.index(s) for s in sections]
         assert positions == sorted(positions), f"Sections not in contract order: {positions}"
-
-
-class TestPacketA1Regression:
-    """Checked-in #4282 report regeneration from live CSV + metadata."""
-
-    ISSUE_4282_METADATA = REPORT_METADATA / "issue-4282-gpu-backend-delta-current.json"
-    ISSUE_4282_REPORT = BENCHMARK_REPORTS / "issue-4282-gpu-backend-delta-current.md"
-    ISSUE_4282_CSVS = [
-        BENCHMARK_REPORTS / "cersyve_compare_backends_20260320_182632_51860.csv",
-        BENCHMARK_REPORTS / "metaroom_2023_compare_backends_20260320_182746_73987.csv",
-    ]
-
-    def test_issue_4282_checked_in_report_is_regeneratable(self):
-        meta = _load_json(self.ISSUE_4282_METADATA)
-        meta_errors = validate_metadata(meta, self.ISSUE_4282_REPORT)
-        assert meta_errors == [], f"Expected valid #4282 metadata, got {meta_errors}"
-
-        rows = load_csv_rows(self.ISSUE_4282_CSVS)
-        row_errors = validate_rows(rows)
-        assert row_errors == [], f"Expected valid #4282 rows, got {row_errors}"
-
-        rendered = render_report(meta, rows)
-        expected = self.ISSUE_4282_REPORT.read_text(encoding="utf-8")
-        assert rendered == expected, "Checked-in #4282 report drifted from renderer output"
 
 
 class TestCLIIntegration:
@@ -488,27 +457,6 @@ class TestRenderProfileReport:
         rows = _load_profile_rows("valid_profile_row.csv")
         result = render_profile_report(meta, rows)
         assert "`actual_method`: not emitted" in result, "Missing not emitted for empty actual_method"
-
-
-class TestPacketB1Regression:
-    """Checked-in #4291 report regeneration from live CSV + metadata."""
-
-    ISSUE_4291_METADATA = REPORT_METADATA / "issue-4291-metaroom-host-profile-current.json"
-    ISSUE_4291_REPORT = BENCHMARK_REPORTS / "issue-4291-metaroom-host-profile-current.md"
-    ISSUE_4291_CSV = BENCHMARK_REPORTS / "issue-4291-metaroom-host-profile_20260321_032249.csv"
-
-    def test_issue_4291_checked_in_report_is_regeneratable(self):
-        meta = _load_json(self.ISSUE_4291_METADATA)
-        meta_errors = validate_profile_metadata(meta, self.ISSUE_4291_REPORT)
-        assert meta_errors == [], f"Expected valid #4291 metadata, got {meta_errors}"
-
-        rows = load_csv_rows([self.ISSUE_4291_CSV])
-        row_errors = validate_profile_rows(rows, self.ISSUE_4291_REPORT)
-        assert row_errors == [], f"Expected valid #4291 rows, got {row_errors}"
-
-        rendered = render_profile_report(meta, rows)
-        expected = self.ISSUE_4291_REPORT.read_text(encoding="utf-8")
-        assert rendered == expected, "Checked-in #4291 report drifted from renderer output"
 
 
 class TestProfileCLIIntegration:

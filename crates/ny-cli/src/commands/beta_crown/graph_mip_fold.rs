@@ -580,7 +580,7 @@ pub(crate) fn fold_pinned_columns(enc: &GraphMipEncoding) -> Result<FoldOutcome>
     })))
 }
 
-/// Apply the fold for one escalation clause ([`try_graph_mip_escalation`]).
+/// Apply the fold for one escalation clause (`try_graph_mip_escalation`).
 ///
 ///  * `Some(folded)` — the shrunk encoding to hand to the solver;
 ///  * `Some(original)` — the fold errored internally: solve the UNFOLDED

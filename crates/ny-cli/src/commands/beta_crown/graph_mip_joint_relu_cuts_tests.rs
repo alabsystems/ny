@@ -12,16 +12,25 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
 use ny_core::Bound;
+#[cfg(test)]
 use ny_mip::ir::Col;
+#[cfg(test)]
 use ny_propagate::layers::{AddConstantLayer, LinearLayer, ReLULayer};
-use ny_propagate::{build_difference_network, GraphNetwork, GraphNode, Layer, NETWORK_INPUT};
+use ny_propagate::{build_difference_network, NETWORK_INPUT};
+#[cfg(test)]
+use ny_propagate::{GraphNetwork, GraphNode, Layer};
+#[cfg(test)]
 use ny_tensor::BoundedTensor;
 
-use super::{attach_joint_relu_cuts, neuron_joint_cuts, CutKind, JointCut};
+use super::attach_joint_relu_cuts;
+#[cfg(test)]
+use super::{neuron_joint_cuts, CutKind, JointCut};
 
 /// Evaluate a cut's row body `Σ terms · vals` given a value per column index.
+#[cfg(test)]
 fn eval_cut(cut: &JointCut, vals: &HashMap<usize, f64>) -> f64 {
     cut.terms
         .iter()
@@ -29,6 +38,7 @@ fn eval_cut(cut: &JointCut, vals: &HashMap<usize, f64>) -> f64 {
         .sum()
 }
 
+#[cfg(test)]
 fn relu(x: f64) -> f64 {
     x.max(0.0)
 }
@@ -199,6 +209,7 @@ fn degenerate_box_emits_no_cuts() {
 
 // ── end-to-end on a stitched isomorphic diff net ─────────────────────────────
 
+#[cfg(test)]
 fn mlp(w1: [[f32; 2]; 3], b1: [f32; 3], w2: [[f32; 3]; 2], b2: [f32; 2]) -> GraphNetwork {
     let mut g = GraphNetwork::new();
     g.try_add_node(GraphNode::from_input(
@@ -235,6 +246,7 @@ fn mlp(w1: [[f32; 2]; 3], b1: [f32; 3], w2: [[f32; 3]; 2], b2: [f32; 2]) -> Grap
     g
 }
 
+#[cfg(test)]
 fn base_f() -> GraphNetwork {
     mlp(
         [[0.7, -0.3], [0.2, 0.9], [-0.5, 0.4]],
@@ -244,6 +256,7 @@ fn base_f() -> GraphNetwork {
     )
 }
 
+#[cfg(test)]
 fn perturbed_g(eps: f32) -> GraphNetwork {
     mlp(
         [
@@ -260,10 +273,12 @@ fn perturbed_g(eps: f32) -> GraphNetwork {
     )
 }
 
+#[cfg(test)]
 fn input_box() -> Vec<Bound> {
     vec![Bound::new(-1.0, 1.0), Bound::new(-0.5, 1.5)]
 }
 
+#[cfg(test)]
 fn flat_bounds_of(diff: &GraphNetwork, input_bounds: &[Bound]) -> HashMap<String, Vec<Bound>> {
     let input = ny_propagate::Verifier::bounds_to_tensor(input_bounds, None).unwrap();
     let nb = diff.collect_node_bounds(&input).unwrap();
@@ -282,6 +297,7 @@ fn flat_bounds_of(diff: &GraphNetwork, input_bounds: &[Bound]) -> HashMap<String
     out
 }
 
+#[cfg(test)]
 fn stamp_shapes(diff: &mut GraphNetwork, flat: &HashMap<String, Vec<Bound>>) {
     for (name, v) in flat {
         if diff.declared_shape(name).is_none() {
@@ -371,7 +387,7 @@ fn joint_cuts_hold_at_every_reachable_point_on_a_real_diff_net() {
 /// rows, (c) + JOINT paired-ReLU envelope cuts, on a small isomorphic diff net
 /// whose per-neuron δ is genuinely small. This isolates the MECHANISM: when δ is
 /// tight the diagonal hull SHOULD shrink the output range below the product of
-/// two triangles. (The instance_0 measurement is the ignored ONNX test below;
+/// two triangles. (The instance_0 measurement is an explicit corpus harness;
 /// there δ is IBP-loose, so this is the clean mechanism gauge.)
 #[cfg(feature = "mip")]
 #[test]
@@ -435,8 +451,8 @@ fn measure_joint_cut_output_lp_range_on_tiny_tight_delta_net() {
     assert!(joint_w > 0.0, "range must stay feasible (non-empty)");
 }
 
-/// #rel-joint-relu-cuts THE KEY MEASUREMENT (ignored — needs benchmark ONNX; run
-/// with `--ignored --nocapture`). On the REAL instance_0 diff net, compare the
+/// #rel-joint-relu-cuts THE KEY MEASUREMENT. On the REAL instance_0 diff net,
+/// compare the
 /// LP-relaxation bound on `diff_output` under three encodings:
 ///   (a) baseline (product of two triangles),
 ///   (b) + rel-diff-coupling rows (|node diff| ≤ δ),
@@ -444,19 +460,9 @@ fn measure_joint_cut_output_lp_range_on_tiny_tight_delta_net() {
 /// against the ±0.05 band. The lever's success signal is (c)'s diff_output LP
 /// range shrinking toward ±0.05; a meaningful shrink (3514 → e.g. 10) is a
 /// breakthrough even short of full closure.
-#[cfg(feature = "mip")]
-#[test]
-#[ignore = "requires benchmark ONNX; run explicitly"]
-fn measure_joint_cut_output_lp_shrink_on_real_instance0() {
-    use std::path::PathBuf;
+pub(crate) fn measure_joint_cut_output_lp_shrink_on_real_instance0(base: &std::path::Path) {
     use std::time::{Duration, Instant};
 
-    let base = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-        .join("benchmarks/vnncomp2026/benchmarks/isomorphic_acasxu_2026/2.0");
-    if !base.is_dir() {
-        eprintln!("benchmarks absent; skipping");
-        return;
-    }
     let f = base.join("onnx/original/ACASXU_run2a_2_4_batch_2000.onnx");
     let g = base.join("onnx/perturbed/ACASXU_run2a_2_4_batch_2000_perturbed_0.onnx");
     let vnnlib = base.join("vnnlib/instance_0.vnnlib");

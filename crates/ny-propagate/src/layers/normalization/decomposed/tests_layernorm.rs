@@ -279,12 +279,9 @@ proptest! {
 
         let result = decomposed_norm_crown_backward(
             &upstream, &ny, &beta, eps, &x_ibp, false
-        );
-        // Use prop_assume! so proptest generates replacement cases for numerically
-        // ill-conditioned inputs, rather than silently counting errors as passes.
-        // Without this, a regression that always returns Err passes the test vacuously.
-        prop_assume!(result.is_ok(), "decomposed layernorm returned error: {:?}", result.err());
-        let result = result.unwrap();
+        ).map_err(|error| TestCaseError::fail(
+            format!("decomposed layernorm must accept the generated finite domain: {error}")
+        ))?;
         let bounds = &result.bounds;
 
         let x_sample = vec![

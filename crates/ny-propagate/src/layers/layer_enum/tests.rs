@@ -5,7 +5,7 @@
 use super::super::softmax::GeluApproximation;
 use super::*;
 use crate::BatchedLinearBounds;
-use ndarray::{arr1, Array2, ArrayD, IxDyn};
+use ndarray::{arr1, Array2, Array3, ArrayD, IxDyn};
 use ny_tensor::BoundedTensor;
 
 // -- Helper: create simple test layers --
@@ -122,6 +122,75 @@ fn test_layer_type_activations() {
     );
     assert_eq!(Layer::Tanh(TanhLayer::new()).layer_type(), "Tanh");
     assert_eq!(Layer::Sigmoid(SigmoidLayer::new()).layer_type(), "Sigmoid");
+    assert_eq!(Layer::Erf(ErfLayer::new()).layer_type(), "Erf");
+}
+
+#[test]
+fn propagate_concrete_never_materializes_one_side_of_an_interval() {
+    let input = arr1(&[-1.0_f32, 0.0, 1.0]).into_dyn();
+
+    for layer in [
+        Layer::Erf(ErfLayer::new()),
+        Layer::Tanh(TanhLayer::new()),
+        Layer::Exp(ExpLayer::new()),
+    ] {
+        let error = layer
+            .propagate_concrete(input.clone())
+            .expect_err("outward-rounded point IBP must not be published as an exact constant");
+        assert!(
+            matches!(error, ny_core::NyError::UnsupportedOp(_)),
+            "{} returned unexpected error: {error}",
+            layer.layer_type()
+        );
+    }
+
+    let relu = Layer::ReLU(ReLULayer::new());
+    let exact = relu
+        .propagate_concrete(input)
+        .expect("an exact point-preserving IBP result may be materialized");
+    assert_eq!(exact, arr1(&[0.0_f32, 0.0, 1.0]).into_dyn());
+}
+
+#[test]
+fn propagate_concrete_does_not_publish_rounded_convolution_as_exact() {
+    let kernel = Array3::from_elem((1, 1, 1), 0.1_f32).into_dyn();
+    let input = ArrayD::from_elem(IxDyn(&[1, 1, 1]), 0.1_f32);
+    let conv = Layer::Conv1d(
+        Conv1dLayer::with_input_length(kernel.clone(), None, 1, 0, 1).expect("valid Conv1d"),
+    );
+    let transpose = Layer::ConvTranspose1d(
+        ConvTranspose1dLayer::with_input_length(kernel, None, 1, 0, 1)
+            .expect("valid ConvTranspose1d"),
+    );
+
+    for layer in [conv, transpose] {
+        let error = layer
+            .propagate_concrete(input.clone())
+            .expect_err("the rounded f32 value of 0.1 * 0.1 must not be published as exact-real");
+        assert!(
+            matches!(error, ny_core::NyError::UnsupportedOp(_)),
+            "{} returned unexpected error: {error}",
+            layer.layer_type()
+        );
+    }
+
+    let linear_error = linear()
+        .propagate_concrete(arr1(&[0.1_f32, 0.1]).into_dyn())
+        .expect_err("generic Linear evaluation requires a separately certified evaluator");
+    assert!(matches!(linear_error, ny_core::NyError::UnsupportedOp(_)));
+
+    let transpose_input = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0])
+        .unwrap()
+        .into_dyn();
+    let transposed = transpose_l()
+        .propagate_concrete(transpose_input)
+        .expect("a pure permutation may be materialized exactly");
+    assert_eq!(
+        transposed,
+        Array2::from_shape_vec((2, 2), vec![1.0, 3.0, 2.0, 4.0])
+            .unwrap()
+            .into_dyn()
+    );
 }
 
 #[test]

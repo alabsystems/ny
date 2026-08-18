@@ -40,7 +40,7 @@ pub struct RmsNormLayer {
 impl RmsNormLayer {
     /// Create a new RMSNorm layer.
     ///
-    /// Returns an error if eps is negative, NaN, or infinite.
+    /// Returns an error if eps is non-finite or below the supported minimum.
     pub fn new(ny: Array1<f32>, eps: f32) -> Result<Self> {
         Ok(Self {
             ny,
@@ -52,7 +52,7 @@ impl RmsNormLayer {
 
     /// Create an RMSNorm layer with default ny=1.
     ///
-    /// Returns an error if eps is negative, NaN, or infinite.
+    /// Returns an error if eps is non-finite or below the supported minimum.
     pub fn new_default(size: usize, eps: f32) -> Result<Self> {
         Ok(Self {
             ny: Array1::ones(size),

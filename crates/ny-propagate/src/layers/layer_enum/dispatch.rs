@@ -16,22 +16,67 @@ use crate::{BatchedLinearBounds, LinearBounds};
 impl Layer {
     /// Forward propagation for a concrete (point) input.
     ///
-    /// For Conv1d and ConvTranspose1d, performs a single forward pass instead
-    /// of IBP's 4x W+/W- splitting, giving a ~4x speedup on concrete constants.
-    /// For other layer types, falls back to `propagate_ibp` with a concrete
-    /// `BoundedTensor`.
+    /// Runs point IBP and only publishes the result when every lower/upper
+    /// endpoint is bitwise identical and the operation is known to copy,
+    /// select, reshape, or produce exactly representable values.  A collapsed
+    /// point interval alone is insufficient: ordinary f32 arithmetic can round
+    /// an exact-real result to one shared endpoint.
     ///
-    /// Used by the graph builder's constant pre-evaluation where frozen
-    /// auxiliary tensors (e.g., vocoder harmonics) flow through convolution chains.
+    /// Used by graph-builder constant pre-evaluation. Nontrivial frozen
+    /// arithmetic remains in the runtime graph unless it has a dedicated exact
+    /// evaluator.
     pub fn propagate_concrete(&self, input: ArrayD<f32>) -> Result<ArrayD<f32>> {
-        match self {
-            Layer::Conv1d(conv) => conv.forward_concrete(&input),
-            Layer::ConvTranspose1d(conv) => conv.forward_concrete(&input),
-            _ => {
-                let concrete = BoundedTensor::concrete(input)?;
-                let output = self.propagate_ibp(&concrete)?;
-                Ok(output.lower().clone())
-            }
+        let concrete = BoundedTensor::concrete(input)?;
+        let output = self.propagate_ibp(&concrete)?;
+        // An IBP image of a point is not necessarily a point. Many sound
+        // layers deliberately round their endpoints outward, so returning
+        // `lower` would publish one side of an enclosure as an exact constant.
+        // Only materialize when the layer itself proves point preservation by
+        // returning bitwise identical endpoints. Signed zero is
+        // conservatively treated as distinct as well.
+        let is_point = output
+            .lower()
+            .iter()
+            .zip(output.upper().iter())
+            .all(|(&lower, &upper)| lower.to_bits() == upper.to_bits());
+        // Keep this an explicit allowlist.  Linear, convolution, arithmetic,
+        // normalization, reduction-by-sum, and transcendental operations need
+        // a separately certified exact evaluator even if their current point
+        // IBP implementation happens to collapse.  In particular, f32
+        // 0.1*0.1 collapses in Conv1d IBP but is not the exact-real product.
+        let exact_operation = matches!(
+            self,
+            Layer::ReLU(_)
+                | Layer::Clip(_)
+                | Layer::ThresholdedRelu(_)
+                | Layer::Abs(_)
+                | Layer::MaxPool2d(_)
+                | Layer::ReduceMax(_)
+                | Layer::ReduceMin(_)
+                | Layer::Transpose(_)
+                | Layer::Reshape(_)
+                | Layer::Flatten(_)
+                | Layer::Pad(_)
+                | Layer::Tile(_)
+                | Layer::Gather(_)
+                | Layer::Slice(_)
+                | Layer::Squeeze(_)
+                | Layer::Unsqueeze(_)
+                | Layer::Resize(_)
+                | Layer::Compare(_)
+                | Layer::Floor(_)
+                | Layer::Ceil(_)
+                | Layer::Round(_)
+                | Layer::Trunc(_)
+                | Layer::Sign(_)
+        );
+        if is_point && exact_operation {
+            Ok(output.lower().clone())
+        } else {
+            Err(NyError::UnsupportedOp(format!(
+                "{} concrete evaluation lacks a certified exact singleton result; refusing to materialize a rounded enclosure as an exact constant",
+                self.layer_type(),
+            )))
         }
     }
 
@@ -561,7 +606,7 @@ impl_layer_bound_propagation! {
         ReduceMean(rm), ReduceSum(rs), ReduceMax(rm), ReduceMin(rm),
         Topk(tk), ArgMax(am), ArgMin(am), ArgSort(asort), CumSum(cs),
         // Trigonometric / S-shaped
-        Tanh(t), Sigmoid(s), Softplus(sp), Sin(s), Cos(c), Tan(t), Arctan(a),
+        Tanh(t), Sigmoid(s), Erf(e), Softplus(sp), Sin(s), Cos(c), Tan(t), Arctan(a),
         // Positional encoding
         RoPE(rope),
         // Tensor transforms

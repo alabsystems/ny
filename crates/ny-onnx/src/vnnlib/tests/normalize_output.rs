@@ -250,6 +250,146 @@ fn test_normalize_output_constraints_accepts_single_mixed_and_3192() {
 
 #[ntest::timeout(10000)]
 #[test]
+fn mixed_and_rejects_unrepresentable_input_atom_instead_of_dropping_clause() {
+    let content = r#"
+(declare-const X_0 Real)
+(declare-const X_1 Real)
+(declare-const Y_0 Real)
+(assert (and (<= (+ X_0 X_1) 1.0) (>= Y_0 0.0)))
+"#;
+    let error = vnn_normalize::normalize_output_constraints(
+        content,
+        vnn_normalize::NormalizeOptions::default(),
+    )
+    .expect_err("a partially represented unsafe clause must fail closed");
+    assert!(error
+        .to_string()
+        .contains("cannot be represented as one per-clause bound"));
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn mixed_and_retains_nested_input_conjunction() {
+    let content = r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(assert (and
+  (and (>= X_0 0.25) (<= X_0 0.75))
+  (>= Y_0 0.0)
+))
+"#;
+    let normalized = vnn_normalize::normalize_output_constraints(
+        content,
+        vnn_normalize::NormalizeOptions::default(),
+    )
+    .expect("nested representable input bounds");
+    assert_eq!(normalized.clauses.len(), 1);
+    assert_eq!(
+        normalized.per_clause_input_bounds[0].get(&0),
+        Some(&(0.25, 0.75))
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn mixed_and_rejects_strict_input_endpoint_but_preserves_strict_output() {
+    let strict_input = r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(assert (and (< X_0 1.0) (> Y_0 0.0)))
+"#;
+    let error = vnn_normalize::normalize_output_constraints(
+        strict_input,
+        vnn_normalize::NormalizeOptions::default(),
+    )
+    .expect_err("an exclusive input endpoint must fail closed");
+    assert!(error.to_string().contains("Strict input constraints"));
+
+    let strict_output = r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(assert (and (<= X_0 1.0) (> Y_0 0.0)))
+"#;
+    let normalized = vnn_normalize::normalize_output_constraints(
+        strict_output,
+        vnn_normalize::NormalizeOptions::default(),
+    )
+    .expect("strict output comparisons remain supported");
+    let (clauses, _) =
+        vnn_normalize::to_output_constraint_clauses(&normalized).expect("convert strict output");
+    assert!(matches!(
+        clauses.as_slice(),
+        [clause]
+            if matches!(
+                clause.as_slice(),
+                [OutputConstraint::GreaterThanConst(0, value)] if *value == 0.0
+            )
+    ));
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn nested_strict_input_endpoint_fails_closed() {
+    let content = r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(assert (and
+  (and (>= X_0 0.25) (< X_0 0.75))
+  (>= Y_0 0.0)
+))
+"#;
+    let error = vnn_normalize::normalize_output_constraints(
+        content,
+        vnn_normalize::NormalizeOptions::default(),
+    )
+    .expect_err("a nested exclusive input endpoint must fail closed");
+    assert!(error.to_string().contains("Strict input constraints"));
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn strict_input_box_disjunction_fails_closed() {
+    let content = r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(assert (or
+  (and (>= X_0 0.1) (< X_0 0.5))
+  (and (> X_0 -0.5) (<= X_0 -0.1))
+))
+(assert (>= Y_0 0.0))
+"#;
+    let error = vnn_normalize::normalize_output_constraints(
+        content,
+        vnn_normalize::NormalizeOptions::default(),
+    )
+    .expect_err("strict input-box disjuncts must not become closed clause boxes");
+    assert!(error.to_string().contains("Strict input constraints"));
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn mixed_and_rejects_partially_supported_nested_input_tree() {
+    let content = r#"
+(declare-const X_0 Real)
+(declare-const X_1 Real)
+(declare-const Y_0 Real)
+(assert (and
+  (or (<= (+ X_0 X_1) 1.0) (>= X_0 0.0))
+  (>= Y_0 0.0)
+))
+"#;
+    let error = vnn_normalize::normalize_output_constraints(
+        content,
+        vnn_normalize::NormalizeOptions::default(),
+    )
+    .expect_err("unsupported nested input logic must not disappear");
+    assert!(error
+        .to_string()
+        .contains("Unsupported input expression in mixed input/output"));
+}
+
+#[ntest::timeout(10000)]
+#[test]
 fn test_normalize_output_constraints_rejects_mixed_variables() {
     let content = r#"
 (declare-const X_0 Real)
@@ -515,4 +655,62 @@ fn dnf_atom_fast_path_matches_reference() {
     let fast_err = vnn_normalize::to_dnf(&overflow, &tight).unwrap_err();
     let ref_err = dnf_reference::to_dnf(&overflow, &tight).unwrap_err();
     assert_eq!(fast_err.to_string(), ref_err.to_string());
+}
+
+/// A `0` / `0.0` output threshold must normalize to bit-exact **+0.0**.
+///
+/// `-constant / coeff` yields IEEE -0.0 for a zero literal, which is numerically
+/// identical to +0.0 but not bit-identical. `beta_crown/verify/graph.rs` compares
+/// these thresholds with `to_bits()`, so a -0.0 made the Cersyve conic-proof gate
+/// unreachable from the parser on EVERY real property — it only ever matched a
+/// hand-built fixture. This pins the canonicalization so the lane cannot silently
+/// go dead again.
+#[ntest::timeout(10000)]
+#[test]
+fn zero_literal_output_threshold_normalizes_to_positive_zero() {
+    for literal in ["0", "0.0", "-0.0"] {
+        let content = format!(
+            "(declare-const Y_0 Real)\n(declare-const Y_1 Real)\n\
+             (assert (<= Y_0 {literal}))\n(assert (>= Y_1 {literal}))\n"
+        );
+        let spec = crate::vnnlib::parse_vnnlib(&content)
+            .unwrap_or_else(|e| panic!("literal {literal}: {e}"));
+        for constraint in &spec.output_constraints {
+            let threshold = match constraint {
+                OutputConstraint::LessEqConst(_, value)
+                | OutputConstraint::GreaterEqConst(_, value) => value,
+                other => panic!("literal {literal}: unexpected constraint {other:?}"),
+            };
+            assert_eq!(
+                threshold.to_bits(),
+                0.0f64.to_bits(),
+                "literal {literal} produced a non-canonical zero ({threshold:?}, bits {:#x}); \
+                 bit-exact consumers such as the Cersyve conic gate will not match it",
+                threshold.to_bits()
+            );
+        }
+    }
+}
+
+/// The zero canonicalization must not perturb any non-zero threshold.
+#[ntest::timeout(10000)]
+#[test]
+fn nonzero_output_thresholds_survive_zero_sign_canonicalization() {
+    let content = "(declare-const Y_0 Real)\n(declare-const Y_1 Real)\n\
+                   (assert (<= Y_0 -1.5))\n(assert (>= Y_1 2.25))\n";
+    let spec = crate::vnnlib::parse_vnnlib(content).expect("parse");
+    let mut seen = Vec::new();
+    for constraint in &spec.output_constraints {
+        match constraint {
+            OutputConstraint::LessEqConst(_, value)
+            | OutputConstraint::GreaterEqConst(_, value) => seen.push(value),
+            other => panic!("unexpected constraint {other:?}"),
+        }
+    }
+    seen.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    assert_eq!(
+        seen,
+        vec![&-1.5_f64, &2.25_f64],
+        "non-zero thresholds must be untouched"
+    );
 }

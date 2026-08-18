@@ -6,6 +6,8 @@ vnncomp2022
 vnncomp2023
 vnncomp2024
 vnncomp2025
+vnncomp2026
+vnncomp2026_benchmarks
 
 # Test results
 *.json

@@ -2,13 +2,31 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use ny_tensor::BoundedTensor;
+use rustc_hash::FxHashMap;
 
 use super::neuron::AlphaNeuronState;
+
+/// Layer-name → neuron-index → α state, the pair of maps rebuilt for every BaB
+/// child domain.
+///
+/// Deliberately NOT `std::collections::HashMap`. These keys are node names and
+/// neuron indices that ny generates itself, so SipHash's DoS resistance buys
+/// nothing, and rebuilding these maps per child made hashing the largest
+/// identifiable cost in the serial path (measured 2026-08-08 on oval21
+/// `base_kw`: `hash_one` 193, `insert` 152, `reserve_rehash` 59 samples).
+///
+/// Swapping the hasher changes iteration order. That is sound here because
+/// every consumer is order-independent (`values_mut`, `values().all(..)`,
+/// per-key mutation) — and because `std`'s `RandomState` is seeded per process,
+/// so anything depending on this order would already be non-reproducible.
+pub(crate) type AlphaNeuronMaps = FxHashMap<String, FxHashMap<usize, AlphaNeuronState>>;
 use crate::beta_crown::branching::GraphSplitHistory;
+use crate::beta_crown::domain::NodeBoundsMap;
 use crate::{GraphNetwork, Layer, NETWORK_INPUT};
 
 /// Graph-domain-specific α state for joint α-β optimization in graph BaB.
@@ -28,17 +46,17 @@ pub struct GraphDomainAlphaState {
     /// Nested structure avoids String allocation per lookup: the outer map
     /// is keyed by `&str` (via `HashMap::get`), the inner by `usize`.
     /// Only stores entries for unstable, unconstrained ReLU neurons.
-    pub(crate) neurons: HashMap<String, HashMap<usize, AlphaNeuronState>>,
+    pub(crate) neurons: AlphaNeuronMaps,
     /// Upper-path per-neuron optimization state, mirrored to `neurons`.
-    pub(crate) upper_neurons: HashMap<String, HashMap<usize, AlphaNeuronState>>,
+    pub(crate) upper_neurons: AlphaNeuronMaps,
 }
 
 impl GraphDomainAlphaState {
     /// Create empty alpha state.
     pub fn empty() -> Self {
         Self {
-            neurons: HashMap::new(),
-            upper_neurons: HashMap::new(),
+            neurons: AlphaNeuronMaps::default(),
+            upper_neurons: AlphaNeuronMaps::default(),
         }
     }
 
@@ -63,12 +81,21 @@ impl GraphDomainAlphaState {
     pub fn from_global_alpha_state_for_input_split(
         global: &crate::bounds::GraphAlphaState,
     ) -> Self {
-        let mut neurons = HashMap::new();
-        let mut upper_neurons = HashMap::new();
+        // Pre-sized from the node counts we already know, so neither outer map
+        // rehashes while filling. `reserve_rehash` was 59 samples in the
+        // 2026-08-08 oval21 profile purely from growing these from empty.
+        let mut neurons =
+            AlphaNeuronMaps::with_capacity_and_hasher(global.alphas.len(), Default::default());
+        let mut upper_neurons = AlphaNeuronMaps::with_capacity_and_hasher(
+            global.alphas_upper.len(),
+            Default::default(),
+        );
 
         for (node_name, alphas) in &global.alphas {
             let mask = global.unstable_mask.get(node_name);
-            let mut node_map = HashMap::new();
+            // Upper bound on the unstable count; the map is dropped if empty.
+            let mut node_map =
+                FxHashMap::with_capacity_and_hasher(alphas.len(), Default::default());
             for (i, &alpha_val) in alphas.iter().enumerate() {
                 let is_unstable = mask
                     .map(|m| m.get(i).copied().unwrap_or(false))
@@ -84,7 +111,8 @@ impl GraphDomainAlphaState {
 
         for (node_name, alphas_upper) in &global.alphas_upper {
             let mask = global.unstable_mask.get(node_name);
-            let mut node_map = HashMap::new();
+            let mut node_map =
+                FxHashMap::with_capacity_and_hasher(alphas_upper.len(), Default::default());
             for (i, &alpha_val) in alphas_upper.iter().enumerate() {
                 let is_unstable = mask
                     .map(|m| m.get(i).copied().unwrap_or(false))
@@ -120,6 +148,34 @@ impl GraphDomainAlphaState {
         history: &GraphSplitHistory,
         input_bounds: &BoundedTensor,
     ) -> Self {
+        Self::from_graph_borrowed_bounds(graph, node_bounds, history, input_bounds)
+    }
+
+    /// Borrowed-bounds face of [`Self::from_graph_bounds`].
+    ///
+    /// Root-only bounded experiments already own a certified
+    /// `HashMap<String, BoundedTensor>`.  Building a second full Arc-backed map
+    /// merely to initialize advisory alpha state can consume a material part of
+    /// a sub-second private budget.  This helper preserves the exact
+    /// enumeration and heuristic initialization while accepting either owned
+    /// or Arc-backed bounds without cloning tensor storage.
+    pub(crate) fn from_graph_borrowed_bounds<V: Borrow<BoundedTensor>>(
+        graph: &GraphNetwork,
+        node_bounds: &HashMap<String, V>,
+        history: &GraphSplitHistory,
+        input_bounds: &BoundedTensor,
+    ) -> Self {
+        Self::from_graph_bounds_lookup(graph, history, input_bounds, |name| {
+            node_bounds.get(name).map(Borrow::borrow)
+        })
+    }
+
+    fn from_graph_bounds_lookup<'a>(
+        graph: &GraphNetwork,
+        history: &GraphSplitHistory,
+        input_bounds: &'a BoundedTensor,
+        mut get_bound: impl FnMut(&str) -> Option<&'a BoundedTensor>,
+    ) -> Self {
         let mut state = Self::empty();
 
         for node_name in graph.node_names() {
@@ -144,8 +200,8 @@ impl GraphDomainAlphaState {
             let pre_bounds: &BoundedTensor = if pre_name == NETWORK_INPUT {
                 input_bounds
             } else {
-                match node_bounds.get(pre_name) {
-                    Some(b) => b.as_ref(),
+                match get_bound(pre_name) {
+                    Some(bounds) => bounds,
                     None => continue,
                 }
             };
@@ -207,9 +263,122 @@ impl GraphDomainAlphaState {
         history: &GraphSplitHistory,
         input_bounds: &BoundedTensor,
     ) -> Self {
+        Self::from_root_alpha_state_borrowed(root_alpha, graph, node_bounds, history, input_bounds)
+    }
+
+    /// Borrowed-bounds face of [`Self::from_root_alpha_state`].
+    ///
+    /// The alpha bridge used by bounded root experiments is already dense and
+    /// full-spatial.  Converting it back through this path provides a cheap
+    /// round-trip identity check without cloning the certified bound map.
+    pub(crate) fn from_root_alpha_state_borrowed<V: Borrow<BoundedTensor>>(
+        root_alpha: &crate::bounds::GraphAlphaState,
+        graph: &GraphNetwork,
+        node_bounds: &HashMap<String, V>,
+        history: &GraphSplitHistory,
+        input_bounds: &BoundedTensor,
+    ) -> Self {
+        let expand_channel_only =
+            std::env::var("NY_ALPHA_INHERIT_EXPAND").ok().as_deref() == Some("1");
+        Self::from_root_alpha_state_borrowed_with_expansion(
+            root_alpha,
+            graph,
+            node_bounds,
+            history,
+            input_bounds,
+            expand_channel_only,
+        )
+    }
+
+    /// Convert root α while explicitly expanding channel-only convolutional
+    /// parameters to the flattened per-neuron layout.
+    ///
+    /// This is deliberately separate from `NY_ALPHA_INHERIT_EXPAND`: bounded
+    /// paired-state experiments need a correctly indexed candidate without
+    /// changing the established heuristic/default transport globally.
+    pub(crate) fn try_from_root_alpha_state_borrowed_expanded<V: Borrow<BoundedTensor>>(
+        root_alpha: &crate::bounds::GraphAlphaState,
+        graph: &GraphNetwork,
+        node_bounds: &HashMap<String, V>,
+        history: &GraphSplitHistory,
+        input_bounds: &BoundedTensor,
+    ) -> Option<Self> {
+        // Lower and upper paths are one candidate identity. Refuse a partial
+        // map rather than silently pairing one optimized path with a heuristic
+        // or with the other path's parameters.
+        if !root_alpha.alphas.keys().eq(root_alpha.alphas_upper.keys())
+            || root_alpha
+                .spatial_shapes
+                .keys()
+                .any(|node_name| !root_alpha.alphas.contains_key(node_name))
+        {
+            return None;
+        }
+
+        // Validate and expand every lower/upper ReLU array before constructing
+        // or mutating the sparse candidate. Exact tensor shape is part of the
+        // identity: equal flattened products are not interchangeable because
+        // channel-only expansion depends on the leading channel dimension.
+        let mut expanded_lower = HashMap::new();
+        let mut expanded_upper = HashMap::new();
+        for (node_name, lower) in &root_alpha.alphas {
+            let node = graph.nodes.get(node_name)?;
+            if !matches!(node.layer, Layer::ReLU(_)) {
+                return None;
+            }
+            let pre_name = node.inputs.first()?;
+            let pre_bounds = if pre_name == NETWORK_INPUT {
+                input_bounds
+            } else {
+                node_bounds.get(pre_name)?.borrow()
+            };
+            let upper = root_alpha.alphas_upper.get(node_name)?;
+            let lower = root_alpha.try_expand_alpha(node_name, lower, pre_bounds.shape())?;
+            let upper = root_alpha.try_expand_alpha(node_name, upper, pre_bounds.shape())?;
+            if lower.len() != pre_bounds.len() || upper.len() != pre_bounds.len() {
+                return None;
+            }
+            expanded_lower.insert(node_name.as_str(), lower);
+            expanded_upper.insert(node_name.as_str(), upper);
+        }
+
+        // Only now create the heuristic state and overwrite it. Any malformed
+        // array above returns without a partially updated candidate escaping.
+        let mut state = Self::from_graph_borrowed_bounds(graph, node_bounds, history, input_bounds);
+        for (node_name, neuron_map) in &mut state.neurons {
+            let alpha_arr = expanded_lower.get(node_name.as_str());
+            if let Some(alpha_arr) = alpha_arr {
+                for (&neuron_idx, neuron_state) in neuron_map.iter_mut() {
+                    let &alpha = alpha_arr.get(neuron_idx)?;
+                    neuron_state.set_alpha(alpha);
+                }
+            }
+        }
+
+        for (node_name, neuron_map) in &mut state.upper_neurons {
+            let alpha_arr = expanded_upper.get(node_name.as_str());
+            if let Some(alpha_arr) = alpha_arr {
+                for (&neuron_idx, neuron_state) in neuron_map.iter_mut() {
+                    let &alpha = alpha_arr.get(neuron_idx)?;
+                    neuron_state.set_alpha(alpha);
+                }
+            }
+        }
+
+        Some(state)
+    }
+
+    fn from_root_alpha_state_borrowed_with_expansion<V: Borrow<BoundedTensor>>(
+        root_alpha: &crate::bounds::GraphAlphaState,
+        graph: &GraphNetwork,
+        node_bounds: &HashMap<String, V>,
+        history: &GraphSplitHistory,
+        input_bounds: &BoundedTensor,
+        expand_channel_only: bool,
+    ) -> Self {
         // Start with heuristic initialization (handles neuron enumeration,
         // constraint filtering, and stable neuron skipping).
-        let mut state = Self::from_graph_bounds(graph, node_bounds, history, input_bounds);
+        let mut state = Self::from_graph_borrowed_bounds(graph, node_bounds, history, input_bounds);
 
         // #hard-six α-inherit-expand (dark, NY_ALPHA_INHERIT_EXPAND=1):
         // when the warmup ran CHANNEL-ONLY α (`full_conv_alpha: false`, e.g.
@@ -224,15 +393,14 @@ impl GraphDomainAlphaState {
         // its own channel's warmup-optimized α. Unset ⇒ byte-identical.
         // SOUND either way: any α ∈ [0,1] yields a valid CROWN relaxation;
         // this only changes the ascent's starting point.
-        let expand_gate = std::env::var("NY_ALPHA_INHERIT_EXPAND").ok().as_deref() == Some("1");
-
         // Override heuristic alpha with optimized values from root α-CROWN.
         // GraphAlphaState stores dense Array1 per node name; GraphDomainAlphaState
         // stores sparse node_name → neuron_idx entries.
         for (node_name, neuron_map) in &mut state.neurons {
             if let Some(alpha_arr) = root_alpha.alphas.get(node_name) {
-                let expanded = (expand_gate && root_alpha.spatial_shape(node_name).is_some())
-                    .then(|| root_alpha.expand_alpha(node_name, alpha_arr));
+                let expanded = (expand_channel_only
+                    && root_alpha.spatial_shape(node_name).is_some())
+                .then(|| root_alpha.expand_alpha(node_name, alpha_arr));
                 let alpha_arr = expanded.as_ref().unwrap_or(alpha_arr);
                 for (&neuron_idx, neuron_state) in neuron_map.iter_mut() {
                     if neuron_idx < alpha_arr.len() {
@@ -248,8 +416,9 @@ impl GraphDomainAlphaState {
                 .get(node_name)
                 .or_else(|| root_alpha.alphas.get(node_name));
             if let Some(alpha_arr) = alpha_arr {
-                let expanded = (expand_gate && root_alpha.spatial_shape(node_name).is_some())
-                    .then(|| root_alpha.expand_alpha(node_name, alpha_arr));
+                let expanded = (expand_channel_only
+                    && root_alpha.spatial_shape(node_name).is_some())
+                .then(|| root_alpha.expand_alpha(node_name, alpha_arr));
                 let alpha_arr = expanded.as_ref().unwrap_or(alpha_arr);
                 for (&neuron_idx, neuron_state) in neuron_map.iter_mut() {
                     if neuron_idx < alpha_arr.len() {
@@ -274,8 +443,24 @@ impl GraphDomainAlphaState {
         history: &GraphSplitHistory,
         input_bounds: &BoundedTensor,
     ) -> Self {
-        let mut state = Self::from_graph_bounds(graph, node_bounds, history, input_bounds);
+        let state = Self::from_graph_bounds(graph, node_bounds, history, input_bounds);
+        Self::inherit_parent_values(parent, state)
+    }
 
+    pub(crate) fn from_parent_node_bounds_map(
+        parent: &GraphDomainAlphaState,
+        graph: &GraphNetwork,
+        node_bounds: &NodeBoundsMap,
+        history: &GraphSplitHistory,
+        input_bounds: &BoundedTensor,
+    ) -> Self {
+        let state = Self::from_graph_bounds_lookup(graph, history, input_bounds, |name| {
+            node_bounds.get(name).map(AsRef::as_ref)
+        });
+        Self::inherit_parent_values(parent, state)
+    }
+
+    fn inherit_parent_values(parent: &GraphDomainAlphaState, mut state: Self) -> Self {
         // Warm-start: inherit parent's optimized alpha for matching neurons
         for (node_name, parent_neuron_map) in &parent.neurons {
             if let Some(child_neuron_map) = state.neurons.get_mut(node_name) {

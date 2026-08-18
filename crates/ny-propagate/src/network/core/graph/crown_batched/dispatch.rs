@@ -5,6 +5,7 @@
 //! Dispatch helpers for special-case batched CROWN graph nodes.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
@@ -271,12 +272,25 @@ impl GraphNetwork {
         node_lb: &BatchedLinearBounds,
         pre_activation: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
         first_input: &str,
         node_bounds: &HashMap<String, BoundedTensor>,
         output_shape: &[usize],
         node_linear_bounds: &mut BatchedCrownAccumulator,
     ) -> Result<Option<BoundedTensor>> {
-        match layer.propagate_crown_backward_batched(node_lb, Some(pre_activation), engine) {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(format!(
+                "batched CROWN: deadline exceeded before unary dispatch at '{node_name}'"
+            )));
+        }
+        let propagated =
+            layer.propagate_crown_backward_batched(node_lb, Some(pre_activation), engine);
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(NyError::DeadlineExceeded(format!(
+                "batched CROWN: deadline exceeded after unary dispatch at '{node_name}'"
+            )));
+        }
+        match propagated {
             Ok(new_lb) => {
                 node_linear_bounds.accumulate_dense(first_input, new_lb)?;
                 Ok(None)
@@ -344,6 +358,7 @@ impl GraphNetwork {
         node_name: &str,
         pre_activation: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
         first_input: &str,
         node_bounds: &HashMap<String, BoundedTensor>,
         output_shape: &[usize],
@@ -362,9 +377,17 @@ impl GraphNetwork {
                         );
                         let mut conv_with_shape = conv.clone();
                         conv_with_shape.set_input_shape(in_h, in_w);
-                        match conv_with_shape.propagate_patches_engine(&pb, engine) {
+                        match conv_with_shape
+                            .propagate_patches_engine_and_deadline(&pb, engine, deadline)
+                        {
                             Ok(result) => {
-                                let new_bcb = BatchedCrownBounds::from_crown_bounds(result)?;
+                                let new_bcb = if deadline.is_some() {
+                                    BatchedCrownBounds::from_crown_bounds_with_deadline(
+                                        result, deadline,
+                                    )?
+                                } else {
+                                    BatchedCrownBounds::from_crown_bounds(result)?
+                                };
                                 let node_mem = new_bcb.memory_bytes();
                                 *peak_memory_bytes = (*peak_memory_bytes).max(node_mem);
                                 debug!(
@@ -376,6 +399,7 @@ impl GraphNetwork {
                                 node_linear_bounds.accumulate(first_input, new_bcb)?;
                                 return Ok(PatchesDispatchResult::Handled);
                             }
+                            Err(e) if e.is_deadline_exceeded() => return Err(e),
                             Err(e) => {
                                 debug!(
                                     "GraphNetwork batched CROWN: Conv2d '{}' Patches failed ({}), falling back to Dense",
@@ -390,13 +414,14 @@ impl GraphNetwork {
                         "crown_batched:conv2d_small_input"
                     };
                     let node_lb = BatchedCrownBounds::Patches(pb)
-                        .into_batched_dense_checked(fallback_label)?;
+                        .into_batched_dense_checked_with_deadline(fallback_label, deadline)?;
                     if let Some(fallback) = Self::dispatch_batched_unary(
                         layer,
                         node_name,
                         &node_lb,
                         pre_activation,
                         engine,
+                        deadline,
                         first_input,
                         node_bounds,
                         output_shape,
@@ -414,7 +439,10 @@ impl GraphNetwork {
             }
         }
         Ok(PatchesDispatchResult::DenseBounds(Box::new(
-            node_bcb.into_batched_dense_checked("crown_batched:dense_dispatch")?,
+            node_bcb.into_batched_dense_checked_with_deadline(
+                "crown_batched:dense_dispatch",
+                deadline,
+            )?,
         )))
     }
 }

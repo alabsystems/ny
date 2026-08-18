@@ -12,6 +12,7 @@ arguments exactly and must not reintroduce legacy preset/branching policy.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -24,6 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCORED_RUN_INSTANCE = REPO_ROOT / "run_instance.sh"
 SHARED_RUN_INSTANCE = REPO_ROOT / "vnncomp_scripts" / "run_instance.sh"
 BUILD_SUBMISSION_BINARY = REPO_ROOT / "vnncomp_scripts" / "build_submission_binary.sh"
+SUBMISSION_BINARY_RECEIPT = (
+    REPO_ROOT / "vnncomp_scripts" / "submission_binary_receipt.sh"
+)
 
 
 def _write_fake_ny(tmp_path: Path) -> Path:
@@ -35,12 +39,22 @@ def _write_fake_ny(tmp_path: Path) -> Path:
         textwrap.dedent(f"""\
             #!/bin/bash
             printf '%s\n' "$@" > "{ny_args_file}"
-            printf 'AY_MILP_SMT=%s\nAY_MILP_GUB_CLIQUE=%s\nAY_MILP_STAB_ORBIT=%s\nAY_MILP_COVER_MINIMAL=%s\nAY_DUMP_QUERY_DIR=%s\nMIMALLOC_PURGE_DELAY=%s\nMIMALLOC_FUTURE_OPTION=%s\n' \
+            printf 'AY_MILP_SMT=%s\nAY_MILP_GUB_CLIQUE=%s\nAY_MILP_STAB_ORBIT=%s\nAY_MILP_COVER_MINIMAL=%s\nAY_MILP_NODE_PROP=%s\nAY_MILP_IMPLIED_COL_BOUNDS=%s\nAY_MILP_ADOPT_FT_MAX_ROWS=%s\nAY_MILP_NO_SHAPE_CPR=%s\nAY_DISABLE_PHASE_EPOCH_SKIP=%s\nAY_SAT_L0_UNSAT_TRACE=%s\nAY_DUMP_QUERY_DIR=%s\nNY_MARGIN_ROW_RESERVE_MAX_FRAC=%s\nNY_GPU_AUTHORITY_SELFARM=%s\nNY_UPFRONT_ATTACK=%s\nNY_SAFENLP_SHORT_GRACE=%s\nMIMALLOC_PURGE_DELAY=%s\nMIMALLOC_FUTURE_OPTION=%s\n' \
                 "${{AY_MILP_SMT-<unset>}}" \
                 "${{AY_MILP_GUB_CLIQUE-<unset>}}" \
                 "${{AY_MILP_STAB_ORBIT-<unset>}}" \
                 "${{AY_MILP_COVER_MINIMAL-<unset>}}" \
+                "${{AY_MILP_NODE_PROP-<unset>}}" \
+                "${{AY_MILP_IMPLIED_COL_BOUNDS-<unset>}}" \
+                "${{AY_MILP_ADOPT_FT_MAX_ROWS-<unset>}}" \
+                "${{AY_MILP_NO_SHAPE_CPR-<unset>}}" \
+                "${{AY_DISABLE_PHASE_EPOCH_SKIP-<unset>}}" \
+                "${{AY_SAT_L0_UNSAT_TRACE-<unset>}}" \
                 "${{AY_DUMP_QUERY_DIR-<unset>}}" \
+                "${{NY_MARGIN_ROW_RESERVE_MAX_FRAC-<unset>}}" \
+                "${{NY_GPU_AUTHORITY_SELFARM-<unset>}}" \
+                "${{NY_UPFRONT_ATTACK-<unset>}}" \
+                "${{NY_SAFENLP_SHORT_GRACE-<unset>}}" \
                 "${{MIMALLOC_PURGE_DELAY-<unset>}}" \
                 "${{MIMALLOC_FUTURE_OPTION-<unset>}}" > "{ny_env_file}"
             echo '{{"status": "unknown"}}'
@@ -141,6 +155,18 @@ def _write_fake_cargo(tmp_path: Path) -> None:
     cargo.chmod(0o755)
 
 
+def _write_archive_source_identity(tmp_path: Path) -> None:
+    lock = tmp_path / "Cargo.lock"
+    lock.write_text("version = 4\n", encoding="utf-8")
+    lock_sha256 = hashlib.sha256(lock.read_bytes()).hexdigest()
+    (tmp_path / ".ny-vnncomp-source.txt").write_text(
+        "schema=ny-vnncomp-source-v1\n"
+        "ny_commit=0123456789abcdef0123456789abcdef01234567\n"
+        f"cargo_lock_sha256={lock_sha256}\n",
+        encoding="utf-8",
+    )
+
+
 def _copy_build_submission_binary(tmp_path: Path) -> Path:
     """Copy the submission build script into an isolated temp repo.
 
@@ -152,6 +178,11 @@ def _copy_build_submission_binary(tmp_path: Path) -> Path:
     script = tmp_path / "vnncomp_scripts" / "build_submission_binary.sh"
     script.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(BUILD_SUBMISSION_BINARY, script)
+    shutil.copy(
+        SUBMISSION_BINARY_RECEIPT,
+        script.parent / "submission_binary_receipt.sh",
+    )
+    _write_archive_source_identity(tmp_path)
     return script
 
 
@@ -170,6 +201,78 @@ def _run_build_submission_binary(tmp_path: Path) -> subprocess.CompletedProcess[
         timeout=30,
         check=False,
     )
+
+
+def _automatic_binary_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    scripts = tmp_path / "vnncomp_scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    runner = scripts / "run_instance.sh"
+    helper = scripts / "submission_binary_receipt.sh"
+    shutil.copy(SHARED_RUN_INSTANCE, runner)
+    shutil.copy(SUBMISSION_BINARY_RECEIPT, helper)
+    _write_archive_source_identity(tmp_path)
+
+    recorded_fake = _write_fake_ny(tmp_path)
+    automatic_binary = tmp_path / "target" / "release" / "ny"
+    automatic_binary.parent.mkdir(parents=True)
+    shutil.copy(recorded_fake, automatic_binary)
+    return runner, automatic_binary
+
+
+def _run_automatic_binary_fixture(
+    tmp_path: Path,
+    runner: Path,
+    *,
+    category: str = "cifar100_2024",
+) -> subprocess.CompletedProcess[str]:
+    onnx, vnnlib, results = _setup_fixtures(tmp_path)
+    env = os.environ.copy()
+    env.pop("NY_BIN", None)
+    return subprocess.run(
+        [
+            "bash",
+            str(runner),
+            "v1",
+            category,
+            str(onnx),
+            str(vnnlib),
+            str(results),
+            "20",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def _initialize_git_fixture(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("/target/\n", encoding="utf-8")
+    for args in [
+        ["init", "-q"],
+        ["add", "."],
+        [
+            "-c",
+            "user.name=NY Test",
+            "-c",
+            "user.email=ny@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+    ]:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
@@ -273,6 +376,49 @@ def test_shell_does_not_inject_legacy_policy_flags(
     assert "--preset" not in ny_args, ny_args
 
 
+def test_safenlp_short_grace_remains_default_dark(tmp_path: Path) -> None:
+    """The measured-neutral short-grace experiment must not arm in scoring."""
+    ny = _write_fake_ny(tmp_path)
+    onnx, vnnlib, results = _setup_fixtures(tmp_path)
+
+    result = _run_instance(
+        tmp_path,
+        ny,
+        "safenlp_2024",
+        onnx,
+        vnnlib,
+        results,
+        timeout="20",
+    )
+
+    assert result.returncode == 0, result.stderr
+    environment = _captured_ny_env(tmp_path)
+    assert environment["NY_UPFRONT_ATTACK"] == "1"
+    assert environment["NY_SAFENLP_SHORT_GRACE"] == "<unset>"
+
+
+def test_safenlp_short_grace_preserves_explicit_operator_override(
+    tmp_path: Path,
+) -> None:
+    """The shared helper preserves an explicit value for controlled A/B."""
+    ny = _write_fake_ny(tmp_path)
+    onnx, vnnlib, results = _setup_fixtures(tmp_path)
+
+    result = _run_instance(
+        tmp_path,
+        ny,
+        "safenlp_2024",
+        onnx,
+        vnnlib,
+        results,
+        extra_env={"NY_SAFENLP_SHORT_GRACE": "1"},
+        timeout="20",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _captured_ny_env(tmp_path)["NY_SAFENLP_SHORT_GRACE"] == "1"
+
+
 def test_scored_root_wrapper_sanitizes_operator_environment(tmp_path: Path) -> None:
     """The organizer-facing wrapper must start ny with deterministic runtime knobs."""
     ny = _write_fake_ny(tmp_path)
@@ -294,7 +440,15 @@ def test_scored_root_wrapper_sanitizes_operator_environment(tmp_path: Path) -> N
             "AY_MILP_GUB_CLIQUE": "1",
             "AY_MILP_STAB_ORBIT": "0",
             "AY_MILP_COVER_MINIMAL": "false",
+            "AY_MILP_NODE_PROP": "1",
+            "AY_MILP_IMPLIED_COL_BOUNDS": "0",
+            "AY_MILP_ADOPT_FT_MAX_ROWS": "0",
+            "AY_MILP_NO_SHAPE_CPR": "0",
+            "AY_DISABLE_PHASE_EPOCH_SKIP": "0",
+            "AY_SAT_L0_UNSAT_TRACE": "0",
             "AY_DUMP_QUERY_DIR": str(dump_dir),
+            "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "0.25",
+            "NY_GPU_AUTHORITY_SELFARM": "1",
             "MIMALLOC_PURGE_DELAY": "0",
             "MIMALLOC_FUTURE_OPTION": "future-value",
         },
@@ -306,7 +460,17 @@ def test_scored_root_wrapper_sanitizes_operator_environment(tmp_path: Path) -> N
         "AY_MILP_GUB_CLIQUE": "<unset>",
         "AY_MILP_STAB_ORBIT": "<unset>",
         "AY_MILP_COVER_MINIMAL": "<unset>",
+        "AY_MILP_NODE_PROP": "<unset>",
+        "AY_MILP_IMPLIED_COL_BOUNDS": "<unset>",
+        "AY_MILP_ADOPT_FT_MAX_ROWS": "<unset>",
+        "AY_MILP_NO_SHAPE_CPR": "<unset>",
+        "AY_DISABLE_PHASE_EPOCH_SKIP": "<unset>",
+        "AY_SAT_L0_UNSAT_TRACE": "<unset>",
         "AY_DUMP_QUERY_DIR": "<unset>",
+        "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "<unset>",
+        "NY_GPU_AUTHORITY_SELFARM": "<unset>",
+        "NY_UPFRONT_ATTACK": "<unset>",
+        "NY_SAFENLP_SHORT_GRACE": "<unset>",
         "MIMALLOC_PURGE_DELAY": "<unset>",
         "MIMALLOC_FUTURE_OPTION": "<unset>",
     }
@@ -331,7 +495,15 @@ def test_shared_helper_preserves_operator_environment(tmp_path: Path) -> None:
             "AY_MILP_GUB_CLIQUE": "1",
             "AY_MILP_STAB_ORBIT": "0",
             "AY_MILP_COVER_MINIMAL": "false",
+            "AY_MILP_NODE_PROP": "1",
+            "AY_MILP_IMPLIED_COL_BOUNDS": "1",
+            "AY_MILP_ADOPT_FT_MAX_ROWS": "16384",
+            "AY_MILP_NO_SHAPE_CPR": "1",
+            "AY_DISABLE_PHASE_EPOCH_SKIP": "1",
+            "AY_SAT_L0_UNSAT_TRACE": "1",
             "AY_DUMP_QUERY_DIR": str(dump_dir),
+            "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "0.25",
+            "NY_GPU_AUTHORITY_SELFARM": "1",
             "MIMALLOC_PURGE_DELAY": "17",
             "MIMALLOC_FUTURE_OPTION": "future-value",
         },
@@ -343,7 +515,17 @@ def test_shared_helper_preserves_operator_environment(tmp_path: Path) -> None:
         "AY_MILP_GUB_CLIQUE": "1",
         "AY_MILP_STAB_ORBIT": "0",
         "AY_MILP_COVER_MINIMAL": "false",
+        "AY_MILP_NODE_PROP": "1",
+        "AY_MILP_IMPLIED_COL_BOUNDS": "1",
+        "AY_MILP_ADOPT_FT_MAX_ROWS": "16384",
+        "AY_MILP_NO_SHAPE_CPR": "1",
+        "AY_DISABLE_PHASE_EPOCH_SKIP": "1",
+        "AY_SAT_L0_UNSAT_TRACE": "1",
         "AY_DUMP_QUERY_DIR": str(dump_dir),
+        "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "0.25",
+        "NY_GPU_AUTHORITY_SELFARM": "1",
+        "NY_UPFRONT_ATTACK": "<unset>",
+        "NY_SAFENLP_SHORT_GRACE": "<unset>",
         "MIMALLOC_PURGE_DELAY": "17",
         "MIMALLOC_FUTURE_OPTION": "future-value",
     }
@@ -369,6 +551,11 @@ def test_build_submission_binary_enables_mip_feature(tmp_path: Path) -> None:
     assert staging.name.startswith(".ny-submission-build.")
     assert (tmp_path / "target" / "release" / "ny").is_file(), (
         "expected build_submission_binary.sh to create target/release/ny"
+    )
+    receipt = tmp_path / "target" / "release" / "ny.receipt"
+    assert receipt.is_file()
+    assert "source_commit=0123456789abcdef0123456789abcdef01234567" in (
+        receipt.read_text(encoding="utf-8")
     )
 
 
@@ -400,3 +587,160 @@ def test_build_submission_binary_fails_closed_when_full_tier_fails(
     assert result.returncode != 0
     assert "required competition feature tier 'mip,cuda' failed" in result.stderr
     assert not (tmp_path / "target" / "release" / "ny").exists()
+
+
+def test_automatic_binary_selection_rejects_missing_receipt(tmp_path: Path) -> None:
+    runner, _ = _automatic_binary_fixture(tmp_path)
+
+    result = _run_automatic_binary_fixture(tmp_path, runner)
+
+    assert result.returncode == 1
+    assert "receipt must be a regular non-symlink file" in result.stderr
+    assert "refusing stale or unproven automatic NY binary" in result.stderr
+    assert (tmp_path / "results.txt").read_text(encoding="utf-8") == "error\n"
+    assert not (tmp_path / "ny-args.txt").exists()
+
+
+def test_local_eval_wrappers_preserve_run_instance_refusal_stderr() -> None:
+    for relative in (
+        "scripts/local_eval/official_sample.sh",
+        "scripts/local_eval/capability_triage.sh",
+        "scripts/local_eval/build_test_v2.sh",
+    ):
+        source = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        invocation_lines = [
+            line
+            for line in source.splitlines()
+            if "vnncomp_scripts/run_instance.sh" in line
+        ]
+        assert invocation_lines, relative
+        assert all("2>&1" not in line for line in invocation_lines), relative
+
+
+def test_automatic_binary_selection_accepts_matching_receipt(tmp_path: Path) -> None:
+    runner, binary = _automatic_binary_fixture(tmp_path)
+    helper = tmp_path / "vnncomp_scripts" / "submission_binary_receipt.sh"
+    receipt = subprocess.run(
+        ["bash", str(helper), "create-local", str(binary), str(tmp_path), "mip,cuda"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert receipt.returncode == 0, receipt.stderr
+
+    result = _run_automatic_binary_fixture(tmp_path, runner)
+
+    assert result.returncode == 0, result.stderr
+    assert "NY binary receipt OK" in result.stderr
+    assert _captured_ny_args(tmp_path)[0] == "vnncomp"
+
+
+def test_automatic_binary_selection_rejects_stale_bytes(tmp_path: Path) -> None:
+    runner, binary = _automatic_binary_fixture(tmp_path)
+    helper = tmp_path / "vnncomp_scripts" / "submission_binary_receipt.sh"
+    receipt = subprocess.run(
+        ["bash", str(helper), "create-local", str(binary), str(tmp_path), "mip,cuda"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert receipt.returncode == 0, receipt.stderr
+    with binary.open("ab") as changed:
+        changed.write(b"\n# changed after receipt\n")
+
+    result = _run_automatic_binary_fixture(tmp_path, runner)
+
+    assert result.returncode == 1
+    assert "stale/mismatched binary" in result.stderr
+    assert not (tmp_path / "ny-args.txt").exists()
+
+
+def test_git_source_receipt_rejects_new_untracked_build_input(tmp_path: Path) -> None:
+    runner, binary = _automatic_binary_fixture(tmp_path)
+    _initialize_git_fixture(tmp_path)
+    helper = tmp_path / "vnncomp_scripts" / "submission_binary_receipt.sh"
+    receipt = subprocess.run(
+        ["bash", str(helper), "create-local", str(binary), str(tmp_path), "mip,cuda"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert receipt.returncode == 0, receipt.stderr
+    source = tmp_path / "crates" / "new_build_input.rs"
+    source.parent.mkdir()
+    source.write_text("pub const VALUE: usize = 1;\n", encoding="utf-8")
+
+    result = _run_automatic_binary_fixture(tmp_path, runner)
+
+    assert result.returncode == 1
+    assert "stale source identity" in result.stderr
+    assert not (tmp_path / "ny-args.txt").exists()
+
+
+def test_git_source_receipt_rejects_new_head(tmp_path: Path) -> None:
+    runner, binary = _automatic_binary_fixture(tmp_path)
+    _initialize_git_fixture(tmp_path)
+    helper = tmp_path / "vnncomp_scripts" / "submission_binary_receipt.sh"
+    receipt = subprocess.run(
+        ["bash", str(helper), "create-local", str(binary), str(tmp_path), "mip,cuda"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert receipt.returncode == 0, receipt.stderr
+    tracked = tmp_path / "source-version.txt"
+    tracked.write_text("next source revision\n", encoding="utf-8")
+    for args in [
+        ["add", "source-version.txt"],
+        [
+            "-c",
+            "user.name=NY Test",
+            "-c",
+            "user.email=ny@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "advance source",
+        ],
+    ]:
+        committed = subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert committed.returncode == 0, committed.stderr
+
+    result = _run_automatic_binary_fixture(tmp_path, runner)
+
+    assert result.returncode == 1
+    assert "stale source identity" in result.stderr
+    assert not (tmp_path / "ny-args.txt").exists()
+
+
+def test_explicit_binary_override_remains_receipt_free(tmp_path: Path) -> None:
+    ny = _write_fake_ny(tmp_path)
+    onnx, vnnlib, results = _setup_fixtures(tmp_path)
+
+    result = _run_instance(
+        tmp_path,
+        ny,
+        "cifar100_2024",
+        onnx,
+        vnnlib,
+        results,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "explicit NY_BIN override" in result.stderr
+    assert not ny.with_suffix(".receipt").exists()

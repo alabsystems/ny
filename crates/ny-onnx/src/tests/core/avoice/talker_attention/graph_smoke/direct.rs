@@ -6,8 +6,9 @@ use super::*;
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_ibp_avoice_talker_attention_fixed_aux_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let model = load_talker_attention_with_fixed_aux();
     let graph = model
         .to_graph_network()
@@ -30,8 +31,9 @@ fn test_graph_ibp_avoice_talker_attention_fixed_aux_3497() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_collect_node_bounds_avoice_talker_attention_softmax_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let model = load_talker_attention_with_fixed_aux();
     let graph = configure_sound_softmax_modes(
         model
@@ -58,8 +60,9 @@ fn test_collect_node_bounds_avoice_talker_attention_softmax_3497() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_crown_avoice_talker_attention_softmax_centroid_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, softmax_name) = talker_attention_softmax_output_graph();
     let input = bounded_hidden_states_input(TALKER_ATTENTION_SEQ_LEN, TALKER_ATTENTION_EPSILON);
 
@@ -96,8 +99,9 @@ fn test_graph_crown_avoice_talker_attention_softmax_centroid_3497() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_short_seq_talker_attention_fixed_aux_smoke_3589() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let seq_len = TALKER_ATTENTION_SHORT_SEQ_LEN;
     let graph = talker_attention_graph_with_fixed_aux_for_seq_len(seq_len).unwrap_or_else(|e| {
         panic!("short-seq talker-attention graph setup failed at seq_len={seq_len}: {e}")

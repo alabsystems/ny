@@ -98,11 +98,12 @@ fn is_shape_changing_audited_fallback_layer(layer_type: &LayerType) -> bool {
 }
 
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_timing_shape_fallback_stays_on_audited_layers_3498() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_duration_predictor.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_duration_predictor.onnx");
     let models = [
         ("speaker encoder", load_speaker_encoder_timing_model()),
         ("talker attention", load_talker_attention_timing_model()),

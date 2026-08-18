@@ -48,6 +48,7 @@ fn build_shape_infer_model_bytes() -> Vec<u8> {
         ],
         name: "shape_infer_graph".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![
             tensor_value_info("a", &[1, 3]),
             tensor_value_info("b", &[1, 3]),

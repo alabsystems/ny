@@ -11,6 +11,7 @@ use super::super::FoldedTensor;
 
 const ONNX_INT32_DATA_TYPE: i64 = 6;
 const ONNX_INT64_DATA_TYPE: i64 = 7;
+const ONNX_BOOL_DATA_TYPE: i64 = 9;
 
 pub(super) fn try_fold_cast(
     node: &onnx_proto::NodeProto,
@@ -22,12 +23,27 @@ pub(super) fn try_fold_cast(
         .attribute
         .iter()
         .find(|attr| attr.name == "to")
-        .map(|attr| attr.i)?;
+        .map(|attr| attr.i_value())?;
+    // Cast to BOOL is the indicator `x != 0` — neither truncation nor an
+    // identity. Folding Cast(2.0 -> BOOL) as 2.0 bakes a wrong constant into
+    // the network exactly as folding Cast(0.7 -> INT64) as 0.7 would, and
+    // trunc is also wrong here (trunc(0.5) = 0 but bool(0.5) = 1). Materialize
+    // the indicator, which is exact for every input including NaN
+    // (`NaN != 0` is true, matching ONNX Runtime).
+    if target_type == ONNX_BOOL_DATA_TYPE {
+        let indicator = float_data.mapv(|v| if v != 0.0 { 1.0_f32 } else { 0.0_f32 });
+        let integer_data = indicator.mapv(|v| i64::from(v != 0.0));
+        return Some(FoldedTensor {
+            float_data: indicator,
+            integer_data: Some(integer_data),
+            integer_range: Some((0, 1)),
+        });
+    }
     let integer_data = node
         .attribute
         .iter()
         .find(|attr| attr.name == "to")
-        .and_then(|attr| cast_integer_payload(weights, input_name, attr.i));
+        .and_then(|attr| cast_integer_payload(weights, input_name, attr.i_value()));
     // When Cast produces integer data, derive float_data from the casted values
     // so both views are consistent. This is critical for narrowing casts
     // (INT64→INT32) where wrapping changes the value.
@@ -38,6 +54,13 @@ pub(super) fn try_fold_cast(
     // constant into the network. trunc is a no-op for the common
     // integer-valued shape/index chains.
     let float_data = match &integer_data {
+        Some(ints) if target_type == ONNX_INT64_DATA_TYPE && ints.shape() == float_data.shape() => {
+            // INT64→INT64 is an exact identity.  In particular, an internally
+            // generated dynamic Shape sentinel carries an authenticated 0.0
+            // compatibility marker that must survive redundant Cast nodes;
+            // rebuilding it with `i64 as f32` would destroy that marker.
+            float_data
+        }
         Some(ints) => ints.mapv(|v| v as f32),
         None if is_integer_dtype(target_type) => float_data.mapv(f32::trunc),
         None => float_data,
@@ -45,7 +68,7 @@ pub(super) fn try_fold_cast(
     Some(FoldedTensor {
         float_data,
         integer_data,
-        integer_range: cast_integer_range(input_name, target_type, weights),
+        integer_range: cast_integer_range(target_type),
     })
 }
 
@@ -81,13 +104,9 @@ fn is_integer_dtype(dtype: i64) -> bool {
     matches!(dtype, 2 | 3 | 4 | 5 | 6 | 7 | 12 | 13)
 }
 
-fn cast_integer_range(
-    input_name: &str,
-    target_type: i64,
-    weights: &WeightStore,
-) -> Option<(i64, i64)> {
+fn cast_integer_range(target_type: i64) -> Option<(i64, i64)> {
     match target_type {
-        ONNX_INT64_DATA_TYPE => weights.get_integer_range(input_name),
+        ONNX_INT64_DATA_TYPE => Some((i64::MIN, i64::MAX)),
         ONNX_INT32_DATA_TYPE => Some((i32::MIN as i64, i32::MAX as i64)),
         _ => None,
     }

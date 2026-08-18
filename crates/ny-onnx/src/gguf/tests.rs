@@ -8,9 +8,10 @@ use super::dequant::{
 };
 use super::load::{is_dequantizable, is_quantized_type, load_tensor_data};
 use super::metadata::format_metadata_value;
-use super::parser::{align_up, compute_data_section_offset};
+use super::parser::{align_up, compute_data_section_offset, read_streamed_gguf_descriptor};
 use super::{gguf_info, load_gguf};
 use gguf::{GGMLType, GGUFFile, GGUFMetadataValue, GGUFTensorInfo};
+use std::{fs::File, io::Write};
 
 fn push_u32(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_le_bytes());
@@ -22,6 +23,11 @@ fn push_u64(v: &mut Vec<u8>, x: u64) {
 
 fn push_string(v: &mut Vec<u8>, s: &str) {
     push_u64(v, s.len() as u64);
+    v.extend_from_slice(s.as_bytes());
+}
+
+fn push_string_v1(v: &mut Vec<u8>, s: &str) {
+    push_u32(v, s.len() as u32);
     v.extend_from_slice(s.as_bytes());
 }
 
@@ -452,6 +458,185 @@ fn test_info_file_not_found() {
     let result = gguf_info("/nonexistent/path/model.gguf");
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("File not found"));
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn gguf_info_streams_only_descriptor_prefix() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    push_u32(&mut bytes, 3);
+    push_u64(&mut bytes, 0);
+    push_u64(&mut bytes, 0);
+    bytes.resize(32, 0);
+
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&bytes).expect("write descriptor");
+    // Sparse payload: inspection must not mirror these bytes into memory.
+    temp.as_file_mut()
+        .set_len(64 * 1024 * 1024)
+        .expect("extend sparse file");
+    temp.flush().expect("flush fixture");
+
+    let path = temp.path();
+    let mut file = File::open(path).expect("open fixture");
+    let descriptor =
+        read_streamed_gguf_descriptor(&mut file, path, 64 * 1024 * 1024).expect("descriptor");
+    assert_eq!(descriptor.descriptor_bytes, 24);
+
+    let info = gguf_info(path).expect("streamed info");
+    assert_eq!(info.version, 3);
+    assert_eq!(info.tensor_count, 0);
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn gguf_v1_uses_u32_string_lengths_and_future_versions_fail_closed() {
+    let mut v1 = Vec::new();
+    v1.extend_from_slice(b"GGUF");
+    push_u32(&mut v1, 1);
+    push_u32(&mut v1, 0);
+    push_u32(&mut v1, 1);
+    push_string_v1(&mut v1, "general.name");
+    push_u32(&mut v1, 8);
+    push_string_v1(&mut v1, "legacy");
+    v1.resize(align_up(v1.len(), 32), 0);
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&v1).expect("write v1 fixture");
+    temp.flush().expect("flush fixture");
+    let info = gguf_info(temp.path()).expect("v1 descriptor");
+    assert_eq!(info.version, 1);
+    assert_eq!(info.model_name.as_deref(), Some("legacy"));
+
+    for unsupported in [0, 4, u32::MAX] {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        push_u32(&mut bytes, unsupported);
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, 0);
+        bytes.resize(32, 0);
+        let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+        temp.write_all(&bytes).expect("write unsupported fixture");
+        temp.flush().expect("flush fixture");
+        let error = gguf_info(temp.path()).expect_err("unsupported version");
+        assert!(error.to_string().contains("Unsupported GGUF version"));
+    }
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn gguf_info_rejects_offsets_and_counts_before_allocation() {
+    let mut no_padding = Vec::new();
+    no_padding.extend_from_slice(b"GGUF");
+    push_u32(&mut no_padding, 3);
+    push_u64(&mut no_padding, 0);
+    push_u64(&mut no_padding, 0);
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&no_padding)
+        .expect("write truncated fixture");
+    temp.flush().expect("flush fixture");
+    let error = gguf_info(temp.path()).expect_err("data section beyond EOF");
+    assert!(error.to_string().contains("data-section offset"));
+
+    let mut bad_offset = Vec::new();
+    bad_offset.extend_from_slice(b"GGUF");
+    push_u32(&mut bad_offset, 3);
+    push_u64(&mut bad_offset, 1);
+    push_u64(&mut bad_offset, 0);
+    push_string(&mut bad_offset, "x");
+    push_u32(&mut bad_offset, 1);
+    push_u64(&mut bad_offset, 0);
+    push_u32(&mut bad_offset, GGMLType::F32 as u32);
+    push_u64(&mut bad_offset, 1);
+    bad_offset.resize(align_up(bad_offset.len(), 32), 0);
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&bad_offset).expect("write bad offset");
+    temp.flush().expect("flush fixture");
+    let error = gguf_info(temp.path()).expect_err("tensor offset beyond EOF");
+    assert!(error.to_string().contains("offset"));
+
+    let mut bad_count = Vec::new();
+    bad_count.extend_from_slice(b"GGUF");
+    push_u32(&mut bad_count, 3);
+    push_u64(&mut bad_count, u64::MAX);
+    push_u64(&mut bad_count, 0);
+    bad_count.resize(32, 0);
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&bad_count).expect("write bad count");
+    temp.flush().expect("flush fixture");
+    let error = gguf_info(temp.path()).expect_err("huge tensor count");
+    assert!(error.to_string().contains("tensor count"));
+
+    let mut truncated_string = Vec::new();
+    truncated_string.extend_from_slice(b"GGUF");
+    push_u32(&mut truncated_string, 3);
+    push_u64(&mut truncated_string, 0);
+    push_u64(&mut truncated_string, 1);
+    push_u64(&mut truncated_string, u64::MAX);
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&truncated_string)
+        .expect("write truncated string");
+    temp.flush().expect("flush fixture");
+    let error = gguf_info(temp.path()).expect_err("oversized metadata string");
+    assert!(error.to_string().contains("descriptor") || error.to_string().contains("metadata key"));
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn gguf_info_rejects_parameter_count_overflow() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    push_u32(&mut bytes, 3);
+    push_u64(&mut bytes, 2);
+    push_u64(&mut bytes, 0);
+    for name in ["a", "b"] {
+        push_string(&mut bytes, name);
+        push_u32(&mut bytes, 1);
+        push_u64(&mut bytes, u64::MAX);
+        push_u32(&mut bytes, GGMLType::F32 as u32);
+        push_u64(&mut bytes, 0);
+    }
+    bytes.resize(align_up(bytes.len(), 32), 0);
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&bytes).expect("write overflow fixture");
+    temp.flush().expect("flush fixture");
+
+    let error = gguf_info(temp.path()).expect_err("parameter count overflow");
+    let message = error.to_string();
+    assert!(
+        message.contains("parameter count") || message.contains("does not fit usize"),
+        "unexpected error: {message}"
+    );
+}
+
+#[ntest::timeout(5000)]
+#[test]
+fn load_gguf_streams_tensor_payload_and_preserves_values() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    push_u32(&mut bytes, 3);
+    push_u64(&mut bytes, 1);
+    push_u64(&mut bytes, 0);
+    push_string(&mut bytes, "test.weight");
+    push_u32(&mut bytes, 1);
+    push_u64(&mut bytes, 4);
+    push_u32(&mut bytes, GGMLType::F32 as u32);
+    push_u64(&mut bytes, 0);
+    bytes.resize(align_up(bytes.len(), 32), 0);
+    for value in [1.0f32, 2.0, 3.0, 4.0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut temp = tempfile::NamedTempFile::new().expect("temporary GGUF");
+    temp.write_all(&bytes).expect("write fixture");
+    temp.flush().expect("flush fixture");
+
+    let weights = load_gguf(temp.path()).expect("streamed load");
+    let values = weights
+        .get("test.weight")
+        .expect("loaded tensor")
+        .as_slice()
+        .expect("contiguous tensor");
+    assert_eq!(values, &[1.0, 2.0, 3.0, 4.0]);
 }
 
 // ==========================================================================

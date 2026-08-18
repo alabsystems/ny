@@ -8,7 +8,10 @@ use super::attack_budget::upfront_pgd_deadline;
 use super::disjunctive_pgd::{
     classify_disjunctive_attack, try_disjunctive_sampling_attack, DisjunctiveAttackKind,
 };
-use super::disjunctive_precheck::{build_spec_row, crown_precheck_clauses, SpecRowKind};
+use super::disjunctive_precheck::{
+    build_spec_row, clause_provably_unsat, crown_precheck_clauses, is_clause_unsatisfiable,
+    SpecRowKind,
+};
 use super::pgd_sampling::spsa_step_deadline_exceeded;
 use super::try_pgd_before_mip;
 use super::BetaCrownModel;
@@ -32,6 +35,56 @@ fn spec_row_diff_upper_neg_unsat_when_upper_negative() {
     assert!(!kind.is_unsatisfiable(-1.0, 1.0));
     // both positive → NOT UNSAT
     assert!(!kind.is_unsatisfiable(0.5, 1.0));
+    // Malformed/non-finite bounds are numerical failures, never proofs.
+    assert!(!kind.is_unsatisfiable(f32::NEG_INFINITY, f32::NEG_INFINITY));
+    assert!(!kind.is_unsatisfiable(0.0, -0.1));
+    assert!(!kind.is_unsatisfiable(f32::NAN, -0.1));
+}
+
+#[test]
+fn interval_clause_prechecks_reject_nonfinite_or_inverted_boxes() {
+    let clause = [OutputConstraint::LessEqConst(0, 0.0)];
+    let infinite = BoundedTensor::new_allow_infinite(
+        arr1(&[f32::INFINITY]).into_dyn(),
+        arr1(&[f32::INFINITY]).into_dyn(),
+    )
+    .unwrap();
+    assert!(!clause_provably_unsat(&infinite, &clause));
+
+    for (lower, upper) in [
+        (
+            arr1(&[f32::INFINITY]).into_dyn(),
+            arr1(&[f32::INFINITY]).into_dyn(),
+        ),
+        (arr1(&[2.0]).into_dyn(), arr1(&[1.0]).into_dyn()),
+        (arr1(&[1.0, 2.0]).into_dyn(), arr1(&[2.0]).into_dyn()),
+    ] {
+        assert!(!is_clause_unsatisfiable(&clause, &lower, &upper));
+    }
+}
+
+#[test]
+fn interval_clause_prechecks_use_exact_f64_constants() {
+    let lower = arr1(&[1.0_f32]).into_dyn();
+    let upper = arr1(&[1.0_f32]).into_dyn();
+    let just_below_one = f64::from_bits(1.0_f64.to_bits() - 1);
+    let just_above_one = f64::from_bits(1.0_f64.to_bits() + 1);
+
+    assert!(is_clause_unsatisfiable(
+        &[OutputConstraint::LessEqConst(0, just_below_one)],
+        &lower,
+        &upper
+    ));
+    assert!(is_clause_unsatisfiable(
+        &[OutputConstraint::GreaterEqConst(0, just_above_one)],
+        &lower,
+        &upper
+    ));
+    assert!(!is_clause_unsatisfiable(
+        &[OutputConstraint::LessEqConst(0, f64::NAN)],
+        &lower,
+        &upper
+    ));
 }
 
 /// #3384: build_spec_row for LessEq encodes Y_j - Y_i and returns DiffUpperNeg.

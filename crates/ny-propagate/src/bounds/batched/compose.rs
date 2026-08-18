@@ -7,10 +7,48 @@
 //! Extracted from `mod.rs` as part of #4212.
 
 use super::BatchedLinearBounds;
-use crate::bounds::safe_math::interval_mul_for_bounds;
+use crate::bounds::safe_math::{
+    f32_to_f64_exact_for_bounds, f64_to_f32_down_for_bounds, f64_to_f32_up_for_bounds,
+    interval_mul_for_bounds,
+};
 use ndarray::{Array2, Array3, ArrayD, IxDyn};
-use ny_core::{checked_shape_product, NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32};
+use ny_core::{
+    checked_shape_product,
+    dd::{next_down_f64, next_up_f64},
+    is_crown_coeff_safe, NyError, Result,
+};
+
+/// Add one exact-real lower-bound term with an outward binary64 rounding step.
+///
+/// A single directed binary32 cast after a long binary64 reduction is not
+/// sufficient under catastrophic cancellation: the binary64 reduction can
+/// lose a small residual that is many binary32 ULPs at the cancelled result.
+#[inline]
+pub(super) fn add_f64_down(acc: f64, term: f64) -> f64 {
+    if term == 0.0 {
+        return acc;
+    }
+    let sum = acc + term;
+    if sum.is_nan() {
+        f64::NEG_INFINITY
+    } else {
+        next_down_f64(sum)
+    }
+}
+
+/// Upper-bound counterpart of [`add_f64_down`].
+#[inline]
+pub(super) fn add_f64_up(acc: f64, term: f64) -> f64 {
+    if term == 0.0 {
+        return acc;
+    }
+    let sum = acc + term;
+    if sum.is_nan() {
+        f64::INFINITY
+    } else {
+        next_up_f64(sum)
+    }
+}
 
 impl BatchedLinearBounds {
     /// Compose two sets of linear bounds: result = other . self
@@ -32,6 +70,15 @@ impl BatchedLinearBounds {
     /// - other.lower_a shape: [...batch, out_dim_2, out_dim_1]
     /// - Result lower_a shape: [...batch, out_dim_2, in_dim_1]
     ///
+    /// # Errors
+    ///
+    /// Returns an error when the coefficient/batch shapes are incompatible or
+    /// their products overflow. This operation also fails closed when either
+    /// operand carries certified coefficient error: composing that symmetric
+    /// error through a sign-changing outer coefficient requires interval
+    /// products that this API does not yet implement. Discharge the error over
+    /// the input box before calling `compose`.
+    ///
     /// # SOUNDNESS — VERDICT-SAFE (certified coefficient error)
     ///
     /// Both compose paths are sound for verdict-path use. The BLAS fast path
@@ -45,6 +92,20 @@ impl BatchedLinearBounds {
     /// cast suffices (error 0). Either way the concretized output is a sound
     /// enclosure of the exact real composition.
     pub fn compose(&self, other: &BatchedLinearBounds) -> Result<BatchedLinearBounds> {
+        // The nominal composition below cannot simply discard an input's symmetric
+        // certified coefficient error. In particular, a subsequent sign-changing
+        // composition can cancel the stored coefficients while the hidden exact
+        // residual remains nonzero. Until the full interval product of both
+        // operands' error carriers is implemented, reject this public operation
+        // rather than returning an unsound tight result.
+        if self.has_coeff_err() || other.has_coeff_err() {
+            return Err(NyError::InvalidSpec(
+                "BatchedLinearBounds::compose cannot compose bounds carrying certified \
+                 coefficient error; discharge the error over the input box first"
+                    .to_string(),
+            ));
+        }
+
         // Validate shape compatibility
         let self_shape = self.lower_a.shape();
         let other_shape = other.lower_a.shape();
@@ -260,7 +321,9 @@ impl BatchedLinearBounds {
     /// Scalar fallback for compose with full interval multiplication.
     ///
     /// Handles NaN/Inf in coefficients via `interval_mul_for_bounds`.
-    /// Accumulates in f64 with directed rounding on final cast.
+    /// Binary32 operands and interval products are decoded bit-exactly before
+    /// directed binary64 accumulation, and final publication avoids binary32
+    /// subnormal endpoints. This keeps the enclosure sound under DAZ/FTZ.
     fn compose_scalar(
         a2_lower: &ndarray::ArrayView3<f32>,
         a2_upper: &ndarray::ArrayView3<f32>,
@@ -287,52 +350,48 @@ impl BatchedLinearBounds {
                     let mut upper_sum = 0.0_f64;
 
                     for k in 0..other_in_dim {
-                        let (prod_lower, prod_upper) = interval_mul_for_bounds(
-                            a2_lower[[b, i, k]],
-                            a2_upper[[b, i, k]],
-                            a1_lower[[b, k, j]],
-                            a1_upper[[b, k, j]],
-                        );
-                        lower_sum += prod_lower as f64;
-                        upper_sum += prod_upper as f64;
+                        let a2_l = a2_lower[[b, i, k]];
+                        let a2_u = a2_upper[[b, i, k]];
+                        let a1_l = a1_lower[[b, k, j]];
+                        let a1_u = a1_upper[[b, k, j]];
+                        let (prod_lower, prod_upper) = if [a2_l, a2_u, a1_l, a1_u]
+                            .into_iter()
+                            .all(is_crown_coeff_safe)
+                        {
+                            interval_mul_for_bounds(a2_l, a2_u, a1_l, a1_u)
+                        } else {
+                            // CROWN_COEFF_MAX is also the finite GPU overflow
+                            // transport sentinel. Its taint must survive even
+                            // multiplication by an exact zero.
+                            (f32::NEG_INFINITY, f32::INFINITY)
+                        };
+                        lower_sum =
+                            add_f64_down(lower_sum, f32_to_f64_exact_for_bounds(prod_lower));
+                        upper_sum = add_f64_up(upper_sum, f32_to_f64_exact_for_bounds(prod_upper));
                     }
 
-                    composed_lower_a[[b, i, j]] = if lower_sum.is_nan() {
-                        f32::NEG_INFINITY
-                    } else {
-                        next_down_f32(lower_sum as f32)
-                    };
-                    composed_upper_a[[b, i, j]] = if upper_sum.is_nan() {
-                        f32::INFINITY
-                    } else {
-                        next_up_f32(upper_sum as f32)
-                    };
+                    composed_lower_a[[b, i, j]] = f64_to_f32_down_for_bounds(lower_sum);
+                    composed_upper_a[[b, i, j]] = f64_to_f32_up_for_bounds(upper_sum);
                 }
 
-                let mut bias_lower = b2_lower[[b, i]] as f64;
-                let mut bias_upper = b2_upper[[b, i]] as f64;
+                let mut bias_lower = f32_to_f64_exact_for_bounds(b2_lower[[b, i]]);
+                let mut bias_upper = f32_to_f64_exact_for_bounds(b2_upper[[b, i]]);
 
                 for k in 0..other_in_dim {
-                    let (prod_lower, prod_upper) = interval_mul_for_bounds(
-                        a2_lower[[b, i, k]],
-                        a2_upper[[b, i, k]],
-                        b1_lower[[b, k]],
-                        b1_upper[[b, k]],
-                    );
-                    bias_lower += prod_lower as f64;
-                    bias_upper += prod_upper as f64;
+                    let a2_l = a2_lower[[b, i, k]];
+                    let a2_u = a2_upper[[b, i, k]];
+                    let (prod_lower, prod_upper) =
+                        if is_crown_coeff_safe(a2_l) && is_crown_coeff_safe(a2_u) {
+                            interval_mul_for_bounds(a2_l, a2_u, b1_lower[[b, k]], b1_upper[[b, k]])
+                        } else {
+                            (f32::NEG_INFINITY, f32::INFINITY)
+                        };
+                    bias_lower = add_f64_down(bias_lower, f32_to_f64_exact_for_bounds(prod_lower));
+                    bias_upper = add_f64_up(bias_upper, f32_to_f64_exact_for_bounds(prod_upper));
                 }
 
-                composed_lower_b[[b, i]] = if bias_lower.is_nan() {
-                    f32::NEG_INFINITY
-                } else {
-                    next_down_f32(bias_lower as f32)
-                };
-                composed_upper_b[[b, i]] = if bias_upper.is_nan() {
-                    f32::INFINITY
-                } else {
-                    next_up_f32(bias_upper as f32)
-                };
+                composed_lower_b[[b, i]] = f64_to_f32_down_for_bounds(bias_lower);
+                composed_upper_b[[b, i]] = f64_to_f32_up_for_bounds(bias_upper);
             }
         }
 
@@ -342,5 +401,53 @@ impl BatchedLinearBounds {
             composed_lower_b,
             composed_upper_b,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array2, Array3};
+
+    #[test]
+    fn scalar_compose_preserves_amplified_subnormal_coefficient_and_bias() {
+        let tiny = f32::from_bits(1);
+        let large = 2.0_f32.powi(120);
+        let exact = 2.0_f64.powi(-29);
+
+        let a2_lower = Array3::from_elem((1, 1, 1), tiny);
+        let a2_upper = Array3::from_elem((1, 1, 1), tiny);
+        let a1_lower = Array3::from_elem((1, 1, 1), large);
+        let a1_upper = Array3::from_elem((1, 1, 1), large);
+        let b1_lower = Array2::from_elem((1, 1), large);
+        let b1_upper = Array2::from_elem((1, 1), large);
+        let b2_lower = Array2::zeros((1, 1));
+        let b2_upper = Array2::zeros((1, 1));
+
+        let (lower_a, upper_a, lower_b, upper_b) = BatchedLinearBounds::compose_scalar(
+            &a2_lower.view(),
+            &a2_upper.view(),
+            &a1_lower.view(),
+            &a1_upper.view(),
+            &b1_lower.view(),
+            &b1_upper.view(),
+            &b2_lower.view(),
+            &b2_upper.view(),
+            1,
+            1,
+            1,
+            1,
+        )
+        .expect("scalar composition");
+
+        for (name, lower, upper) in [
+            ("coefficient", lower_a[[0, 0, 0]], upper_a[[0, 0, 0]]),
+            ("bias", lower_b[[0, 0]], upper_b[[0, 0]]),
+        ] {
+            let lower = f32_to_f64_exact_for_bounds(lower);
+            let upper = f32_to_f64_exact_for_bounds(upper);
+            assert!(lower <= exact, "{name} lower {lower:e} excludes {exact:e}");
+            assert!(upper >= exact, "{name} upper {upper:e} excludes {exact:e}");
+        }
     }
 }

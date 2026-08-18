@@ -24,12 +24,29 @@ impl BatchedLinearBounds {
         *self.input_shape.last().unwrap_or(&1)
     }
 
-    /// Total heap memory used by this batched bounds struct, in bytes.
+    /// Total logical heap payload used by this batched bounds struct, in bytes.
     ///
-    /// Includes both A-matrices and bias vectors across all batch dimensions.
+    /// Includes both A-matrices, both bias vectors, and any certified
+    /// per-coefficient error carriers across all batch dimensions, plus the
+    /// logical input/output shape vectors. ndarray does not expose backing-vector
+    /// capacity, so allocator slack is intentionally not claimed here.
     pub fn memory_bytes(&self) -> usize {
-        (self.lower_a.len() + self.upper_a.len() + self.lower_b.len() + self.upper_b.len())
-            * size_of::<f32>()
+        let array_elements = self
+            .lower_a
+            .len()
+            .saturating_add(self.upper_a.len())
+            .saturating_add(self.lower_b.len())
+            .saturating_add(self.upper_b.len())
+            .saturating_add(self.lower_a_err.as_ref().map_or(0, |error| error.len()))
+            .saturating_add(self.upper_a_err.as_ref().map_or(0, |error| error.len()));
+        array_elements
+            .saturating_mul(size_of::<f32>())
+            .saturating_add(
+                self.input_shape
+                    .len()
+                    .saturating_add(self.output_shape.len())
+                    .saturating_mul(size_of::<usize>()),
+            )
     }
 
     /// Flatten batched bounds to a block-diagonal 2D representation.

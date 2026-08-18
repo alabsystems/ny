@@ -5,11 +5,17 @@
 use ny_core::{NyError, Result};
 use ny_propagate::layers::{
     CumsumLayer, LogSumExpLayer, ReduceMaxLayer, ReduceMeanLayer, ReduceMinLayer, ReduceSumLayer,
+    SkipMergeLayer,
 };
 use ny_propagate::Layer;
 use tracing::debug;
 
 use super::{AttributeValue, ConvertContext, LayerSpec};
+
+enum ReductionAxes {
+    Reduce(Vec<i64>),
+    Identity,
+}
 
 impl ConvertContext<'_> {
     /// Read reduction axes from attributes (opset < 13/18) or second input tensor (opset 13+/18+).
@@ -18,52 +24,82 @@ impl ConvertContext<'_> {
     /// ReduceMean, ReduceMax, ReduceMin moved `axes` to input[1] in opset 18.
     /// This helper checks attributes first (backward compat), then falls back
     /// to reading the constant second input.
-    fn read_reduction_axes(&self, spec: &LayerSpec) -> Result<Vec<i64>> {
-        // 1. Try attributes (opset < 13 for ReduceSum, opset < 18 for others)
-        if let Some(AttributeValue::Ints(arr)) = spec.attributes.get("axes") {
-            if !arr.is_empty() {
-                return Ok(arr.clone());
+    fn read_reduction_axes(&self, spec: &LayerSpec) -> Result<ReductionAxes> {
+        let noop_with_empty_axes = match spec.attributes.get("noop_with_empty_axes") {
+            None | Some(AttributeValue::Int(0)) => false,
+            Some(AttributeValue::Int(1)) => true,
+            Some(other) => {
+                return Err(NyError::ModelLoad(format!(
+                    "{} '{}' has invalid noop_with_empty_axes attribute {:?}",
+                    spec.layer_type, spec.name, other
+                )))
             }
+        };
+
+        let attribute_axes = match spec.attributes.get("axes") {
+            None => None,
+            Some(AttributeValue::Ints(axes)) => Some(axes),
+            Some(other) => {
+                return Err(NyError::ModelLoad(format!(
+                    "{} '{}' has invalid axes attribute {:?}",
+                    spec.layer_type, spec.name, other
+                )))
+            }
+        };
+        let input_axes_name = spec.inputs.get(1).filter(|name| !name.is_empty());
+
+        // LayerSpec no longer carries the originating opset. Accepting both
+        // schema encodings would require guessing which one ONNX Runtime used.
+        if attribute_axes.is_some() && input_axes_name.is_some() {
+            return Err(NyError::UnsupportedConfiguration(format!(
+                "{} '{}' supplies axes as both an attribute and an input",
+                spec.layer_type, spec.name
+            )));
+        }
+
+        // 1. Attribute form (older opsets).
+        if let Some(axes) = attribute_axes {
+            return if axes.is_empty() && noop_with_empty_axes {
+                Ok(ReductionAxes::Identity)
+            } else {
+                Ok(ReductionAxes::Reduce(axes.clone()))
+            };
         }
 
         // 2. Try second input tensor (opset 13+/18+): axes as constant tensor
-        if let Some(axes_name) = spec.inputs.get(1).filter(|n| !n.is_empty()) {
-            if let Some(axes_tensor) = self.constant_value(axes_name) {
-                // #2360: Validate axis values before f32→i64 cast. NaN as i64 = 0 (wrong
-                // axis), Inf as i64 = i64::MAX (out-of-range axis), non-integer values
-                // silently round. Reject all three cases.
-                let axes: Vec<i64> = axes_tensor
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(idx, v)| {
-                        if !v.is_finite() {
-                            return Err(NyError::ModelLoad(format!(
-                                "{} '{}': reduction axis at index {} is non-finite ({})",
-                                spec.layer_type, spec.name, idx, v
-                            )));
-                        }
-                        if v.trunc() != v {
-                            return Err(NyError::ModelLoad(format!(
-                                "{} '{}': reduction axis at index {} is non-integer ({})",
-                                spec.layer_type, spec.name, idx, v
-                            )));
-                        }
-                        Ok(v as i64)
-                    })
-                    .collect::<Result<_>>()?;
-                if !axes.is_empty() {
-                    debug!(
-                        "{} {} reading axes from input tensor '{}': {:?}",
-                        spec.layer_type, spec.name, axes_name, axes
-                    );
-                    return Ok(axes);
-                }
+        if let Some(axes_name) = input_axes_name {
+            let axes_tensor = self
+                .discrete_constant_i64(
+                    axes_name,
+                    &format!("{} '{}' reduction axes", spec.layer_type, spec.name),
+                )?
+                .ok_or_else(|| {
+                    NyError::UnsupportedConfiguration(format!(
+                        "{} '{}' requires axes input '{}' to be constant",
+                        spec.layer_type, spec.name, axes_name
+                    ))
+                })?;
+            let axes: Vec<i64> = axes_tensor.iter().copied().collect();
+            if !axes.is_empty() {
+                debug!(
+                    "{} {} reading axes from input tensor '{}': {:?}",
+                    spec.layer_type, spec.name, axes_name, axes
+                );
             }
+            return if axes.is_empty() && noop_with_empty_axes {
+                Ok(ReductionAxes::Identity)
+            } else {
+                Ok(ReductionAxes::Reduce(axes))
+            };
         }
 
-        // 3. Empty = reduce over all axes (ONNX default)
-        Ok(Vec::new())
+        // 3. Missing axes reduces all unless noop_with_empty_axes requests the
+        // schema-defined identity behavior.
+        if noop_with_empty_axes {
+            Ok(ReductionAxes::Identity)
+        } else {
+            Ok(ReductionAxes::Reduce(Vec::new()))
+        }
     }
 
     fn read_cumsum_axis(&self, spec: &LayerSpec) -> Result<i64> {
@@ -77,12 +113,14 @@ impl ConvertContext<'_> {
                     spec.name
                 ))
             })?;
-        let axis_tensor = self.constant_value(axis_name).ok_or_else(|| {
-            NyError::UnsupportedConfiguration(format!(
-                "CumSum {} requires input[1] axis '{}' to be a constant tensor",
-                spec.name, axis_name
-            ))
-        })?;
+        let axis_tensor = self
+            .discrete_constant_i64(axis_name, &format!("CumSum {} axis", spec.name))?
+            .ok_or_else(|| {
+                NyError::UnsupportedConfiguration(format!(
+                    "CumSum {} requires input[1] axis '{}' to be a constant tensor",
+                    spec.name, axis_name
+                ))
+            })?;
 
         if axis_tensor.is_empty() {
             return Err(NyError::UnsupportedConfiguration(format!(
@@ -99,20 +137,12 @@ impl ConvertContext<'_> {
             )));
         }
 
-        let axis_value = axis_tensor.iter().next().copied().ok_or_else(|| {
+        axis_tensor.iter().next().copied().ok_or_else(|| {
             NyError::UnsupportedConfiguration(format!(
                 "CumSum {} axis tensor '{}' is empty",
                 spec.name, axis_name
             ))
-        })?;
-        if !axis_value.is_finite() {
-            return Err(NyError::UnsupportedConfiguration(format!(
-                "CumSum {} axis tensor '{}' must be finite, got {}",
-                spec.name, axis_name, axis_value
-            )));
-        }
-
-        Ok(axis_value.round() as i64)
+        })
     }
 
     /// Remap all reduction axes of `spec` to the trailing-relative internal
@@ -155,7 +185,9 @@ impl ConvertContext<'_> {
         // Attributes: axes (list of ints), keepdims (int, default 1)
         // Opset 18+ moved axes to second input tensor.
 
-        let onnx_axes = self.read_reduction_axes(spec)?;
+        let ReductionAxes::Reduce(onnx_axes) = self.read_reduction_axes(spec)? else {
+            return Ok(Layer::SkipMerge(SkipMergeLayer::new()));
+        };
 
         // Get keepdims from attributes (default is true/1)
         let keepdims = match spec.attributes.get("keepdims") {
@@ -180,7 +212,9 @@ impl ConvertContext<'_> {
         // Attributes: axes (list of ints), keepdims (int, default 1)
         // Opset 13+ moved axes to second input tensor.
 
-        let onnx_axes = self.read_reduction_axes(spec)?;
+        let ReductionAxes::Reduce(onnx_axes) = self.read_reduction_axes(spec)? else {
+            return Ok(Layer::SkipMerge(SkipMergeLayer::new()));
+        };
 
         // Get keepdims from attributes (default is true/1)
         let keepdims = match spec.attributes.get("keepdims") {
@@ -202,7 +236,9 @@ impl ConvertContext<'_> {
     }
     pub(crate) fn convert_reduce_max(&self, spec: &LayerSpec) -> Result<Layer> {
         // Opset 18+ moved axes to second input tensor.
-        let onnx_axes = self.read_reduction_axes(spec)?;
+        let ReductionAxes::Reduce(onnx_axes) = self.read_reduction_axes(spec)? else {
+            return Ok(Layer::SkipMerge(SkipMergeLayer::new()));
+        };
 
         let keepdims = match spec.attributes.get("keepdims") {
             Some(AttributeValue::Int(v)) => *v != 0,
@@ -224,7 +260,9 @@ impl ConvertContext<'_> {
 
     pub(crate) fn convert_reduce_min(&self, spec: &LayerSpec) -> Result<Layer> {
         // Opset 18+ moved axes to second input tensor.
-        let onnx_axes = self.read_reduction_axes(spec)?;
+        let ReductionAxes::Reduce(onnx_axes) = self.read_reduction_axes(spec)? else {
+            return Ok(Layer::SkipMerge(SkipMergeLayer::new()));
+        };
 
         let keepdims = match spec.attributes.get("keepdims") {
             Some(AttributeValue::Int(v)) => *v != 0,
@@ -273,7 +311,9 @@ impl ConvertContext<'_> {
         // LogSumExp in ny: compute log(sum(exp(x))) over specified axes
         // Attributes: axes (list of ints), keepdims (int, default 1)
 
-        let onnx_axes = self.read_reduction_axes(spec)?;
+        let ReductionAxes::Reduce(onnx_axes) = self.read_reduction_axes(spec)? else {
+            return Ok(Layer::SkipMerge(SkipMergeLayer::new()));
+        };
 
         let keepdims = match spec.attributes.get("keepdims") {
             Some(AttributeValue::Int(v)) => *v != 0,

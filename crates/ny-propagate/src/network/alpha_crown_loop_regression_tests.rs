@@ -29,6 +29,209 @@ fn scalar_bounds(lower: f32, upper: f32) -> BoundedTensor {
         .expect("scalar test bounds should be valid")
 }
 
+#[test]
+fn invprop_spsa_directions_are_deterministic_and_not_a_two_direction_checkerboard() {
+    let direction = |iter| {
+        (0..64)
+            .map(|parameter| invprop_spsa_sign(iter, parameter))
+            .collect::<Vec<_>>()
+    };
+    let directions = [direction(0), direction(1), direction(2), direction(3)];
+    assert_eq!(directions[0], direction(0));
+    for left in 0..directions.len() {
+        for right in (left + 1)..directions.len() {
+            assert_ne!(directions[left], directions[right]);
+            assert!(
+                directions[left]
+                    .iter()
+                    .zip(&directions[right])
+                    .any(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits()),
+                "directions {left} and {right} must not be exact negatives"
+            );
+        }
+    }
+}
+
+#[test]
+fn invprop_spsa_score_normalization_is_bounded_and_restores_zero_direction() {
+    let positive = invprop_bounded_spsa_step(-1.0, 1.0e300, 0.1, 0.5).unwrap();
+    let negative = invprop_bounded_spsa_step(-1.0, -1.0e300, 0.1, 0.5).unwrap();
+    let zero = invprop_bounded_spsa_step(-1.0, -1.0, 0.1, 0.5).unwrap();
+    let wide_gap = invprop_bounded_spsa_step(-100.0, -99.95, 0.1, 0.5).unwrap();
+    assert_eq!(positive, 0.5);
+    assert_eq!(negative, -0.5);
+    assert_eq!(zero.to_bits(), 0.0_f64.to_bits());
+    assert!((wide_gap - 0.25).abs() < 1.0e-12);
+    assert!(invprop_bounded_spsa_step(-1.0, f64::INFINITY, 0.1, 0.5).is_none());
+    assert!(invprop_bounded_spsa_step(-1.0, 0.0, 0.0, 0.5).is_none());
+}
+
+#[test]
+fn invprop_rowwise_spsa_moves_a_nonwinning_column_without_touching_other_rows() {
+    let base = Array3::from_elem((2, 1, 2), 1.0_f32);
+    // Row 0 wins the hard max and is unchanged. Row 1 improves substantially
+    // but remains non-winning, so a max-only score would produce a zero update.
+    let updated = invprop_projected_spsa_update(
+        &base,
+        &[Some(-1.0), Some(-100.0)],
+        &[Some(-1.0), Some(-90.0)],
+        0.1,
+        1.0,
+        0,
+    )
+    .expect("the non-winning row response should produce an update");
+    assert_eq!(updated[[0, 0, 0]].to_bits(), base[[0, 0, 0]].to_bits());
+    assert_eq!(updated[[1, 0, 0]].to_bits(), base[[1, 0, 0]].to_bits());
+    assert!(
+        updated[[0, 0, 1]].to_bits() != base[[0, 0, 1]].to_bits()
+            || updated[[1, 0, 1]].to_bits() != base[[1, 0, 1]].to_bits()
+    );
+}
+
+#[test]
+fn invprop_shared_spsa_uses_mean_normalized_row_response() {
+    let base = Array3::from_elem((2, 1, 1), 1.0_f32);
+    let updated = invprop_projected_spsa_update(
+        &base,
+        &[Some(-1.0), Some(-100.0)],
+        &[Some(-1.0), Some(-90.0)],
+        0.1,
+        1.0,
+        0,
+    )
+    .expect("a shared gamma should aggregate the non-winning row response");
+    // Probe-delta-normalized responses are [0, 1] after clipping, so their
+    // mean gives |step|=0.5 without allowing either row to exceed the trust
+    // radius on its own.
+    assert!((updated[[0, 0, 0]] - 1.5).abs() < 1.0e-6);
+    assert!((updated[[1, 0, 0]] - 0.5).abs() < 1.0e-6);
+}
+
+struct DeadlineInvpropProbeBackend {
+    need_grad: std::cell::Cell<Option<bool>>,
+}
+
+impl AlphaCrownBackend for DeadlineInvpropProbeBackend {
+    fn backward_iteration(
+        &self,
+        alpha_state: &AlphaState,
+        _input: &BoundedTensor,
+        _iter: usize,
+        _invprop_enabled: bool,
+        need_grad: bool,
+    ) -> Result<Option<BackwardIterationResult>> {
+        self.need_grad.set(Some(need_grad));
+        let state = alpha_state.invprop_state.as_ref().unwrap();
+        let gammas = state
+            .layer_gammas(crate::invprop::INVPROP_OUTPUT_SEED)
+            .unwrap();
+        let (lower, upper) = gammas.checked_bound_gammas().unwrap();
+        let _discarded_fold =
+            crate::network::graph_alpha::invprop_backward::augment_bounds_with_constraints(
+                &LinearBounds::identity(1),
+                &state.constraints,
+                &lower.to_owned(),
+                &upper.to_owned(),
+            );
+        Err(NyError::DeadlineExceeded(
+            "scripted optional gamma probe deadline".to_string(),
+        ))
+    }
+
+    fn compute_gradients(
+        &self,
+        _config: &AlphaCrownConfig,
+        _alpha_state: &mut AlphaState,
+        _input: &BoundedTensor,
+        _gradients: &[Array1<f32>],
+        _gradients_upper: &[Array1<f32>],
+        _iter: usize,
+    ) -> Result<(Vec<Array1<f32>>, Vec<Array1<f32>>)> {
+        unreachable!("a direct gamma-probe regression never requests alpha gradients")
+    }
+
+    fn crown_fallback(&self, _input: &BoundedTensor) -> Result<BoundedTensor> {
+        unreachable!("a direct gamma-probe regression never requests CROWN fallback")
+    }
+
+    fn log_label(&self) -> &str {
+        "deadline-invprop-probe"
+    }
+}
+
+#[test]
+fn invprop_deadline_probe_restores_seed_and_drops_evaluated_attribution() {
+    let _serial = crate::execution_telemetry::TEST_LOCK.lock().unwrap();
+    let _run = crate::execution_telemetry::begin_run();
+    let mut alpha_state = empty_alpha_state();
+    alpha_state
+        .init_invprop_state(
+            crate::invprop::OutputConstraints::le_threshold(1, 0, -0.5).unwrap(),
+            1,
+        )
+        .unwrap();
+    alpha_state.invprop_mut().unwrap().add_layer_gammas(
+        crate::invprop::INVPROP_OUTPUT_SEED.to_string(),
+        crate::invprop::LayerGammas::new(1, 1, false),
+    );
+    let original_seed = alpha_state
+        .invprop_state
+        .as_ref()
+        .unwrap()
+        .layer_gammas(crate::invprop::INVPROP_OUTPUT_SEED)
+        .unwrap()
+        .gammas
+        .clone();
+    let backend = DeadlineInvpropProbeBackend {
+        need_grad: std::cell::Cell::new(None),
+    };
+    let config = AlphaCrownConfig {
+        iterations: 2,
+        invprop: crate::invprop::InvpropConfig {
+            enabled: true,
+            optimize_gammas: true,
+            ..Default::default()
+        },
+        ..AlphaCrownConfig::default()
+    };
+
+    let outcome = invprop_seed_gamma_ascent_step(
+        &backend,
+        &config,
+        &mut alpha_state,
+        &scalar_bounds(-1.0, 1.0),
+        0,
+        &[Some(-2.0)],
+        1,
+    )
+    .unwrap();
+    assert_eq!(outcome, InvpropGammaStepOutcome::DeadlineExceeded);
+    assert_eq!(backend.need_grad.get(), Some(false));
+    let restored_seed = &alpha_state
+        .invprop_state
+        .as_ref()
+        .unwrap()
+        .layer_gammas(crate::invprop::INVPROP_OUTPUT_SEED)
+        .unwrap()
+        .gammas;
+    assert!(params_bit_identical_for_test(restored_seed, &original_seed));
+
+    let observed = crate::execution_telemetry::snapshot().invprop;
+    assert_eq!(observed.gamma_steps_attempted, 1);
+    assert_eq!(observed.gamma_steps_applied, 0);
+    assert_eq!(observed.nonzero_output_seed_folds, 1);
+    assert_eq!(observed.nonzero_evaluated_output_seed_folds, 0);
+    assert!(!observed.attribution_conflict);
+}
+
+fn params_bit_identical_for_test(lhs: &Array3<f32>, rhs: &Array3<f32>) -> bool {
+    lhs.dim() == rhs.dim()
+        && lhs
+            .iter()
+            .zip(rhs.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 /// Mock backend for testing alpha_crown_optimize behavior with infinite bounds.
 struct InfiniteBoundsBackend {
     /// Bounds returned by crown_fallback. Contains infinities to simulate

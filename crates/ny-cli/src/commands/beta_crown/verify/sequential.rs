@@ -37,12 +37,9 @@ use super::{augment_network_with_spec, classify_constraints, AggregationMode};
 /// Returns `Some((family, lhs_idx, sorted-deduped rhs_indices))` when the
 /// reduction applies, `None` otherwise (e.g. any constant constraint present).
 ///
-/// Also used by the conjunctive dispatch in `verify_relational_constraints_impl`:
-/// when this pattern applies, the reduced max-diff BaB (min over x of
-/// max_j(violation_j) > 0) decides joint-witness conjunctions — where the
-/// verifying conjunct varies across the input box — far more efficiently than
-/// the graph multi-objective any-row lane (MEASURED 2026-07-10: 4_2/prop_3
-/// verifies in 672 max-diff domains vs >100k any-row domains/timeout).
+/// Multi-row conjunctive dispatch now preserves these rows in the graph
+/// multi-objective lane. This detector remains the canonical normalization for
+/// the scalar reduced fallback and for row-parity tests.
 pub(super) fn normalize_same_lhs_reduction(
     vnnlib: &VnnLibSpec,
 ) -> Option<(&'static str, usize, Vec<usize>)> {
@@ -154,10 +151,10 @@ pub(super) fn verify_sequential_relational(
     timeout: u64,
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
+    ledger: &PhaseBudgetLedger,
 ) -> Result<BetaCrownResult> {
     let aggregation = classify_constraints(vnnlib).aggregation;
     let is_disjunction = aggregation == AggregationMode::Disjunctive;
-    let ledger = PhaseBudgetLedger::new(timeout, config.phase_budget.clone());
     let start_time = std::time::Instant::now();
     let pgd_deadline = ledger.upfront_pgd_deadline();
 
@@ -209,7 +206,7 @@ pub(super) fn verify_sequential_relational(
         // verification consumes the entire timeout.
         // Source: PhaseBudgetConfig.reduced_verification_fraction (default 0.40).
         //
-        // EXCEPTION (MEASURED 2026-07-10): when the same-LHS reduction pattern
+        // Direct-call fallback: when the same-LHS reduction pattern
         // applies, the max-diff objective semantically SUBSUMES every
         // per-constraint check — per-constraint-i success means min_x m_i(x) > 0,
         // which implies min_x max_j m_j(x) > 0, the max-diff success criterion —
@@ -220,7 +217,12 @@ pub(super) fn verify_sequential_relational(
         // decomposition is provably useless there (each conjunct individually
         // falsifiable — PGD found Y_1-Y_0 = -3.7e-4 < 0 on 1_5), while the 0.4
         // sub-budget starved the one engine that can decide it (26400 domains
-        // at timeout under the old split).
+        // at timeout under the old split). The default-dark SafeNLP
+        // shared-prefix treatment is the narrow exception: it supplies an
+        // absolute deadline below so this prefix yields to its reserved MIP
+        // slice. Gate-off and unrelated same-LHS categories retain the full
+        // historical wall clock. Ordinary multi-row conjunctions are routed to
+        // graph any-row verification before reaching this fallback.
         let reduction_applies = normalize_same_lhs_reduction(vnnlib).is_some();
         let reduced_timeout = if reduction_applies {
             ledger
@@ -248,6 +250,7 @@ pub(super) fn verify_sequential_relational(
             pgd_restarts,
             pgd_steps,
             pgd_deadline,
+            ledger.safenlp_shared_prefix_bab_deadline(),
             gemm_engine,
             json,
         )?;
@@ -329,6 +332,7 @@ pub(super) fn verify_sequential_relational(
         remaining_timeout,
         gemm_engine,
         json,
+        ledger.bab_deadline(),
     )
 }
 
@@ -346,6 +350,7 @@ fn try_reduced_verification(
     pgd_restarts: usize,
     pgd_steps: usize,
     pgd_deadline: Option<std::time::Instant>,
+    bab_deadline: Option<std::time::Instant>,
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<Option<BetaCrownResult>> {
@@ -418,11 +423,11 @@ fn try_reduced_verification(
     )));
     augmented.add_layer(PropLayer::Reshape(ReshapeLayer::new(vec![1])));
 
-    // JOINT-MARGIN closer (task #40): CROWN's per-domain bound routes the MaxPool
-    // lower relaxation through a single conjunct, which diverges on acasxu prop_2
-    // (diag c7126554). The closer certifies a tighter JOINT lower bound over ALL
-    // conjuncts per domain (min_x max_j g_j via a sound dual certificate). Sound
-    // (only ever raises a domain's lower bound).
+    // JOINT-MARGIN closer (task #40): this legacy scalar fallback routes the
+    // MaxPool lower relaxation through a single conjunct. The closer certifies
+    // a tighter JOINT lower bound over ALL conjuncts per domain (min_x max_j g_j
+    // via a sound dual certificate). Sound (only ever raises a domain's lower
+    // bound).
     //
     // OPT-IN (NY_JOINT_MARGIN_LP=1), default-OFF — MEASURED NEGATIVE (task #40,
     // 1_5/prop_2, contention-matched A/B): the joint over the per-conjunct
@@ -440,6 +445,10 @@ fn try_reduced_verification(
     // not this lever. Default-OFF makes the pipeline byte-identical to baseline;
     // the sound machinery + `NY_JOINT_MARGIN_DIAG` accounting are kept for
     // reproducibility and a future tight-affine integration.
+    //
+    // DARK by design: no typed preset key and no `run_instance.sh` export,
+    // because the measurement above is NEGATIVE — there is nothing to deliver.
+    // Revisit only alongside tight per-conjunct affine bounds.
     let joint_lp_enabled = std::env::var("NY_JOINT_MARGIN_LP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
         .unwrap_or(false);
@@ -448,16 +457,16 @@ fn try_reduced_verification(
         verifier
             .with_config_from(verifier.config.clone())
             .with_joint_margin_closer(std::sync::Arc::new(closer))
-            .verify_with_engine(&augmented, input, 0.0, gemm_engine, None)?
+            .verify_with_engine(&augmented, input, 0.0, gemm_engine, bab_deadline)?
     } else {
-        verifier.verify_with_engine(&augmented, input, 0.0, gemm_engine, None)?
+        verifier.verify_with_engine(&augmented, input, 0.0, gemm_engine, bab_deadline)?
     };
 
     // If reduced verification couldn't prove property and PGD is enabled,
     // try conjunctive PGD attack to find counterexample
     if matches!(
         reduced_result.result,
-        BabVerificationStatus::PotentialViolation
+        BabVerificationStatus::PotentialViolation { .. }
             | BabVerificationStatus::Unknown { .. }
             | BabVerificationStatus::Timeout
     ) && pgd_attack
@@ -495,6 +504,7 @@ fn verify_sequential_per_constraint(
     timeout: u64,
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<BetaCrownResult> {
     // Use total constraint count (not just relational) since constants are now included (#1888)
     let total_constraint_count = vnnlib.output_constraints.len();
@@ -503,9 +513,8 @@ fn verify_sequential_per_constraint(
     // Budget timeout across constraints:
     // - Conjunctive (SAFE if ANY violated): each constraint gets the full remaining time.
     //   Only ONE needs to succeed, so don't split the budget — try each with full time
-    //   and stop on first success. Splitting penalizes the easy constraint that could
-    //   be solved with more time (e.g., ACAS Xu prop_2 with 4 constraints: 116s/5 = 23s
-    //   per constraint is often insufficient, but 116s for the easiest one may suffice).
+    //   and stop on first success. Splitting penalizes an easy constraint that could
+    //   be solved with more time.
     // - Disjunctive (SAFE if ALL violated): split evenly since all must be proved.
     //   The minimum loop threshold is 10ms (not 100ms) to handle specs with many
     //   constraints (e.g., lindex 400 constraints at 30s = 74ms each, sufficient
@@ -581,9 +590,73 @@ fn verify_sequential_per_constraint(
                 input,
                 dispatch.threshold,
                 gemm_engine,
-                None, // TODO(#4321): thread CLI deadline for sequential per-constraint
+                deadline,
             )?)
         },
         Some(&eval_original),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{arr1, arr2};
+    use ny_onnx::vnnlib::parse_vnnlib;
+    use std::time::{Duration, Instant};
+
+    /// The same-LHS reduction is the SafeNLP shared prefix before exact MIP.
+    /// Its verifier must honor the caller's phase deadline even though its
+    /// cloned config still carries a much larger relative timeout.
+    #[test]
+    fn reduced_verification_honors_authoritative_bab_deadline() {
+        let mut network = Network::new();
+        network.add_layer(PropLayer::Linear(
+            LinearLayer::new(arr2(&[[1.0_f32], [-1.0_f32]]), None)
+                .expect("two-output linear layer"),
+        ));
+        let input = BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+            .expect("finite input box");
+        let vnnlib = parse_vnnlib(
+            r#"
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+(declare-const Y_1 Real)
+(assert (>= X_0 -1.0))
+(assert (<= X_0 1.0))
+(assert (<= Y_0 Y_1))
+"#,
+        )
+        .expect("single relational constraint");
+        let config = BetaCrownConfig {
+            timeout: Duration::from_mins(1),
+            use_alpha_crown: false,
+            use_crown_ibp: false,
+            enable_cuts: false,
+            ..Default::default()
+        };
+        let verifier = BetaCrownVerifier::new(config.clone());
+
+        let result = try_reduced_verification(
+            &network,
+            &input,
+            &vnnlib,
+            &config,
+            &verifier,
+            false,
+            0,
+            0,
+            None,
+            Some(Instant::now()),
+            None,
+            true,
+        )
+        .expect("reduced verification should complete")
+        .expect("same-LHS property must take the reduction");
+
+        assert!(
+            matches!(result.result, BabVerificationStatus::Timeout),
+            "expired authoritative deadline must stop the reduced prefix, got {:?}",
+            result.result
+        );
+    }
 }

@@ -7,14 +7,15 @@
 use faer::Mat;
 use ndarray::{Array1, Array2};
 use ny_core::{is_crown_coeff_safe, GemmEngine, NyError, Result};
-use ny_tensor::next_up_f32;
 use tracing::debug;
 
-use super::bias::{accumulate_bias_f64, finalize_bias_directed, BiasBlockParams};
-use super::crown_single::{aw_f64_with_abssum, gamma_n_f32};
+use super::bias::{
+    accumulate_bias_f64, add_coeff_err_bias_product_up, add_f64_down, add_f64_up, f32_to_f64_exact,
+    finalize_bias_directed, publish_error_up_normal, BiasBlockParams,
+};
+use super::crown_single::{aw_f64_with_abssum, gamma_n_f32, incoming_error_product};
 use super::layout::resolve_backward_layout;
 use super::LinearLayer;
-use crate::faer_parallelism::mat_mul;
 use crate::{contiguous_flat_slice_mut, LinearBounds};
 
 /// Multi-domain GPU-batched CROWN backward propagation.
@@ -45,6 +46,11 @@ pub(crate) fn propagate_linear_batched_with_engine(
 ) -> Result<Vec<LinearBounds>> {
     if bounds_batch.is_empty() {
         return Ok(Vec::new());
+    }
+    if engine.forbids_unbounded_cpu_fallback() {
+        return Err(NyError::UnsupportedOp(
+            "bounded multi-domain Linear CROWN has no pollable host implementation".into(),
+        ));
     }
 
     let first = bounds_batch[0];
@@ -169,32 +175,48 @@ pub(crate) fn propagate_linear_batched_with_engine(
             let a_upper_faer = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
                 bounds.upper_a()[[i, in_start + j]]
             });
-            let (_, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
-            let (_, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
+            let (lower_reference, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
+            let (upper_reference, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
 
             // Propagated incoming error: P[i,j] = Σ_k err_in[i,in_start+k]·|W[k,j]|.
-            let prop_lower = bounds.lower_a_err().map(|e| {
-                let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, k| {
-                    e[[i, in_start + k]]
-                });
-                mat_mul(&blk, &w_abs)
-            });
-            let prop_upper = bounds.upper_a_err().map(|e| {
-                let blk = Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, k| {
-                    e[[i, in_start + k]]
-                });
-                mat_mul(&blk, &w_abs)
-            });
+            let prop_lower = match bounds.lower_a_err() {
+                Some(error) => Some(incoming_error_product(
+                    error,
+                    in_start,
+                    layout.out_features,
+                    &w_abs,
+                    None,
+                )?),
+                None => None,
+            };
+            let prop_upper = match bounds.upper_a_err() {
+                Some(error) => Some(incoming_error_product(
+                    error,
+                    in_start,
+                    layout.out_features,
+                    &w_abs,
+                    None,
+                )?),
+                None => None,
+            };
 
             for i in 0..num_outputs {
                 let src_row = row_offset + i;
                 for j in 0..in_features {
                     let lower = result_lower[src_row * in_features + j];
                     let upper = result_upper[src_row * in_features + j];
-                    let l_prop = prop_lower.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                    let u_prop = prop_upper.as_ref().map_or(0.0, |p| p[(i, j)] as f64);
-                    let l_err = next_up_f32((gamma * lower_s[[i, j]] + l_prop) as f32);
-                    let u_err = next_up_f32((gamma * upper_s[[i, j]] + u_prop) as f32);
+                    let lower_gap = (f32_to_f64_exact(lower) - lower_reference[[i, j]]).abs();
+                    let upper_gap = (f32_to_f64_exact(upper) - upper_reference[[i, j]]).abs();
+                    let l_prop = prop_lower
+                        .as_ref()
+                        .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
+                    let u_prop = prop_upper
+                        .as_ref()
+                        .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
+                    let l_err =
+                        publish_error_up_normal(lower_gap + gamma * lower_s[[i, j]] + l_prop);
+                    let u_err =
+                        publish_error_up_normal(upper_gap + gamma * upper_s[[i, j]] + u_prop);
                     // A stored coefficient is sound iff BOTH the coefficient and
                     // its certified error stay finite/in-range; otherwise the row
                     // is degraded to ±inf bias (handled below).
@@ -245,18 +267,18 @@ pub(crate) fn propagate_linear_batched_with_engine(
                 for i in 0..num_outputs {
                     let mut e = 0.0f64;
                     for j in 0..bias.len() {
-                        e += le[[i, j]] as f64 * (bias[j] as f64).abs();
+                        e = add_coeff_err_bias_product_up(e, le[[i, j]], bias[j]);
                     }
-                    bias_accum[domain_idx].0[i] -= e;
+                    bias_accum[domain_idx].0[i] = add_f64_down(bias_accum[domain_idx].0[i], -e);
                 }
             }
             if let Some(ue) = bounds.upper_a_err() {
                 for i in 0..num_outputs {
                     let mut e = 0.0f64;
                     for j in 0..bias.len() {
-                        e += ue[[i, j]] as f64 * (bias[j] as f64).abs();
+                        e = add_coeff_err_bias_product_up(e, ue[[i, j]], bias[j]);
                     }
-                    bias_accum[domain_idx].1[i] += e;
+                    bias_accum[domain_idx].1[i] = add_f64_up(bias_accum[domain_idx].1[i], e);
                 }
             }
         }

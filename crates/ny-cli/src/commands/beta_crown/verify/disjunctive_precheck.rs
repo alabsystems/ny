@@ -61,16 +61,38 @@ pub(super) fn ibp_output_bounds(
 /// previous `k as f32` round-to-NEAREST both lost up to half an ULP of margin
 /// AND could round the constant toward the bound (a half-ULP wrong-"impossible"
 /// hole on adversarially tight thresholds).
+fn bounded_output_box_is_finite_and_ordered(output: &BoundedTensor) -> bool {
+    let lower = output.lower();
+    let upper = output.upper();
+    !lower.is_empty()
+        && lower.shape() == upper.shape()
+        && lower
+            .iter()
+            .zip(upper)
+            .all(|(&lower, &upper)| lower.is_finite() && upper.is_finite() && lower <= upper)
+}
+
 fn constraint_provably_false(output: &BoundedTensor, c: &OutputConstraint) -> bool {
+    if !bounded_output_box_is_finite_and_ordered(output) {
+        return false;
+    }
     let lo = output.lower();
     let hi = output.upper();
     let l = |i: usize| lo.iter().nth(i).copied();
     let u = |i: usize| hi.iter().nth(i).copied();
     match c {
-        OutputConstraint::LessEqConst(i, k) => l(*i).is_some_and(|v| f64::from(v) > *k),
-        OutputConstraint::LessThanConst(i, k) => l(*i).is_some_and(|v| f64::from(v) >= *k),
-        OutputConstraint::GreaterEqConst(i, k) => u(*i).is_some_and(|v| f64::from(v) < *k),
-        OutputConstraint::GreaterThanConst(i, k) => u(*i).is_some_and(|v| f64::from(v) <= *k),
+        OutputConstraint::LessEqConst(i, k) => {
+            k.is_finite() && l(*i).is_some_and(|v| f64::from(v) > *k)
+        }
+        OutputConstraint::LessThanConst(i, k) => {
+            k.is_finite() && l(*i).is_some_and(|v| f64::from(v) >= *k)
+        }
+        OutputConstraint::GreaterEqConst(i, k) => {
+            k.is_finite() && u(*i).is_some_and(|v| f64::from(v) < *k)
+        }
+        OutputConstraint::GreaterThanConst(i, k) => {
+            k.is_finite() && u(*i).is_some_and(|v| f64::from(v) <= *k)
+        }
         OutputConstraint::LessEq(i, j) => matches!((l(*i), u(*j)), (Some(a), Some(b)) if a > b),
         OutputConstraint::LessThan(i, j) => matches!((l(*i), u(*j)), (Some(a), Some(b)) if a >= b),
         OutputConstraint::GreaterEq(i, j) => matches!((u(*i), l(*j)), (Some(a), Some(b)) if a < b),
@@ -84,7 +106,9 @@ fn constraint_provably_false(output: &BoundedTensor, c: &OutputConstraint) -> bo
 /// A clause (conjunction of unsafe constraints) is provably impossible over the box
 /// iff ANY of its constraints is provably false there.
 pub(super) fn clause_provably_unsat(output: &BoundedTensor, clause: &[OutputConstraint]) -> bool {
-    !clause.is_empty() && clause.iter().any(|c| constraint_provably_false(output, c))
+    !clause.is_empty()
+        && bounded_output_box_is_finite_and_ordered(output)
+        && clause.iter().any(|c| constraint_provably_false(output, c))
 }
 
 /// Whether a constraint is one of the variants `constraint_provably_false` can
@@ -401,7 +425,10 @@ pub(crate) enum SpecRowKind {
 }
 
 impl SpecRowKind {
-    pub(crate) fn is_unsatisfiable(&self, _lower: f32, upper: f32) -> bool {
+    pub(crate) fn is_unsatisfiable(&self, lower: f32, upper: f32) -> bool {
+        if !lower.is_finite() || !upper.is_finite() || lower > upper {
+            return false;
+        }
         match self {
             // Constraint is unsatisfiable when the upper bound on the encoded
             // difference is strictly negative. For GreaterEq(i,j) with row
@@ -502,17 +529,26 @@ fn crown_precheck_per_output(
 /// given output lower/upper bounds.
 ///
 /// A clause is unsatisfiable if at least one constraint in it cannot hold
-/// within the computed output intervals. Uses directed rounding for f64→f32
-/// constant conversion to maintain soundness (never falsely declares a
-/// clause unsatisfiable). Matches the logic in
-/// `crates/ny-cli/src/commands/verify/result.rs:evaluate_property_status`.
-fn is_clause_unsatisfiable(
+/// within the computed output intervals. f32 endpoints are embedded exactly
+/// in f64 before comparison with VNNLIB constants, avoiding lossy threshold
+/// casts. Malformed enclosures and non-finite constants fail closed.
+pub(super) fn is_clause_unsatisfiable(
     clause: &[OutputConstraint],
     lower: &ArrayD<f32>,
     upper: &ArrayD<f32>,
 ) -> bool {
-    let flat_lower = lower.as_slice().unwrap_or(&[]);
-    let flat_upper = upper.as_slice().unwrap_or(&[]);
+    let (Some(flat_lower), Some(flat_upper)) = (lower.as_slice(), upper.as_slice()) else {
+        return false;
+    };
+    if flat_lower.is_empty()
+        || flat_lower.len() != flat_upper.len()
+        || flat_lower
+            .iter()
+            .zip(flat_upper)
+            .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+    {
+        return false;
+    }
 
     let get_lower = |idx: usize| -> Option<f32> { flat_lower.get(idx).copied() };
     let get_upper = |idx: usize| -> Option<f32> { flat_upper.get(idx).copied() };
@@ -543,31 +579,21 @@ fn is_clause_unsatisfiable(
                 (Some(ui), Some(lj)) => ui > lj,
                 _ => true,
             },
-            // Directed rounding for f64→f32 constant conversion: round in the
-            // direction that makes satisfiability easier to achieve, so we never
-            // falsely declare a clause unsatisfiable (which would incorrectly
-            // produce a "safe" verdict). Matches verify/result.rs #2658.
-            OutputConstraint::LessEqConst(i, c) => {
-                // lower(Y_i) <= c: round c UP so the check is conservative.
-                match get_lower(*i) {
-                    Some(li) => li <= ny_tensor::next_up_f32(*c as f32),
-                    None => true,
-                }
-            }
-            OutputConstraint::GreaterEqConst(i, c) => {
-                // upper(Y_i) >= c: round c DOWN so the check is conservative.
-                match get_upper(*i) {
-                    Some(ui) => ui >= ny_tensor::next_down_f32(*c as f32),
-                    None => true,
-                }
-            }
-            OutputConstraint::LessThanConst(i, c) => match get_lower(*i) {
-                Some(li) => li < ny_tensor::next_up_f32(*c as f32),
-                None => true,
+            OutputConstraint::LessEqConst(i, c) => match (get_lower(*i), c.is_finite()) {
+                (Some(li), true) => f64::from(li) <= *c,
+                _ => true,
             },
-            OutputConstraint::GreaterThanConst(i, c) => match get_upper(*i) {
-                Some(ui) => ui > ny_tensor::next_down_f32(*c as f32),
-                None => true,
+            OutputConstraint::GreaterEqConst(i, c) => match (get_upper(*i), c.is_finite()) {
+                (Some(ui), true) => f64::from(ui) >= *c,
+                _ => true,
+            },
+            OutputConstraint::LessThanConst(i, c) => match (get_lower(*i), c.is_finite()) {
+                (Some(li), true) => f64::from(li) < *c,
+                _ => true,
+            },
+            OutputConstraint::GreaterThanConst(i, c) => match (get_upper(*i), c.is_finite()) {
+                (Some(ui), true) => f64::from(ui) > *c,
+                _ => true,
             },
             _ => true, // conservatively assume unknown variants are satisfiable
         };

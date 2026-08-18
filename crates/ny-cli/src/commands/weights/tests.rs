@@ -7,6 +7,10 @@
 use super::norms::{
     extract_gguf_block_number, extract_hf_block_number, frobenius_norm, spectral_norm_approx,
 };
+use super::{
+    difference_exceeds_tolerance, handle_weights_command, max_abs_difference, WeightsAction,
+};
+use std::path::PathBuf;
 
 // ============================================================
 // frobenius_norm tests
@@ -181,4 +185,32 @@ fn test_extract_hf_block_not_a_block() {
 fn test_extract_hf_block_malformed() {
     assert_eq!(extract_hf_block_number("encoder.layers."), None);
     assert_eq!(extract_hf_block_number("layers"), None);
+}
+
+#[test]
+fn weights_diff_rejects_invalid_tolerance_before_loading_files() {
+    for tolerance in [-1.0, f32::NAN, f32::INFINITY] {
+        let err = handle_weights_command(WeightsAction::Diff {
+            file_a: PathBuf::from("missing-a.onnx"),
+            file_b: PathBuf::from("missing-b.onnx"),
+            tolerance,
+            show_all: false,
+            json: false,
+        })
+        .expect_err("invalid tolerance must be rejected before model loading");
+        assert!(
+            err.to_string().contains("Tolerance must"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn weights_diff_treats_non_finite_arithmetic_as_a_difference() {
+    let infinity = [f32::INFINITY];
+    let difference = max_abs_difference(infinity.iter(), infinity.iter());
+    assert!(difference.is_nan());
+    assert!(difference_exceeds_tolerance(difference, 1e-5));
+    assert!(difference_exceeds_tolerance(f32::INFINITY, 1e-5));
+    assert!(!difference_exceeds_tolerance(1e-6, 1e-5));
 }

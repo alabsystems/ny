@@ -64,6 +64,20 @@ fn test_sensitivity_transformer_block_dag() {
         !result.layers.is_empty(),
         "Expected at least one node in DAG sensitivity analysis"
     );
+    let erf = result
+        .layers
+        .iter()
+        .find(|layer| layer.layer_type == "Erf")
+        .expect("decomposed GELU Erf must appear in DAG sensitivity results");
+    assert!(
+        !erf.propagation_failed,
+        "Erf sensitivity propagation failed: {erf:?}"
+    );
+    assert!(!erf.has_overflow, "Erf sensitivity overflowed: {erf:?}");
+    assert!(
+        erf.output_width.is_finite() && erf.mean_output_width.is_finite(),
+        "Erf sensitivity widths must be finite: {erf:?}"
+    );
 }
 
 #[ntest::timeout(10000)]
@@ -73,6 +87,35 @@ fn test_sensitivity_config_default() {
     assert_eq!(config.epsilon, 0.01);
     assert!(!config.continue_after_overflow);
     assert!(config.input.is_none());
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_sensitivity_rejects_invalid_epsilon_with_custom_input() {
+    use crate::{Network, OnnxModel, WeightStore};
+    use ndarray::arr1;
+
+    let model = OnnxModel::empty_with_network(
+        Network {
+            name: "invalid_epsilon".to_string(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            layers: Vec::new(),
+            param_count: 0,
+        },
+        WeightStore::new(),
+    );
+    let input = BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
+        .expect("bounded input");
+    let config = SensitivityConfig {
+        epsilon: -0.5,
+        continue_after_overflow: false,
+        input: Some(input),
+    };
+
+    let err = analyze_sensitivity_model(&model, &config)
+        .expect_err("invalid epsilon must fail before model conversion");
+    assert!(err.to_string().contains("epsilon"), "err = {err}");
 }
 
 #[ntest::timeout(10000)]

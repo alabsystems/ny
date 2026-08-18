@@ -11,12 +11,18 @@ use ny_propagate::AlphaCrownConfig;
 use ny_propagate::Layer as PropLayer;
 use ny_tensor::BoundedTensor;
 
+fn load_minimal_attention_fixture(path: &Path) -> OnnxModel {
+    // Q @ K^T is encoded with an explicit standard-domain Transpose, so both
+    // native ONNX schema validation and NY's raw preflight authenticate it.
+    load_onnx(path).expect("Failed to load standard-ONNX minimal attention model")
+}
+
 #[ntest::timeout(10000)]
 #[test]
 fn test_load_minimal_attention_core_graph() {
     let path = require_test_model("minimal_attention_core.onnx");
 
-    let model = load_onnx(&path).expect("Failed to load minimal attention model");
+    let model = load_minimal_attention_fixture(&path);
 
     let has_softmax = model
         .network
@@ -138,17 +144,18 @@ fn test_load_transformer_block() {
     let layer_types: Vec<_> = model.network.layers.iter().map(|l| &l.layer_type).collect();
     println!("Transformer block layer types: {:?}", layer_types);
 
-    // Should have LayerNorm (possibly fused), Softmax, Linear/MatMul, GELU, Add
+    // The fixture contains an exact Erf decomposition of GELU.  Keep the
+    // primitive instead of relying on the disabled canonical GELU fusion.
     let has_layer_norm = model
         .network
         .layers
         .iter()
         .any(|l| l.layer_type == LayerType::LayerNorm);
-    let has_gelu = model
+    let has_erf = model
         .network
         .layers
         .iter()
-        .any(|l| l.layer_type == LayerType::GELU);
+        .any(|l| l.layer_type == LayerType::Erf);
     let has_softmax = model
         .network
         .layers
@@ -156,13 +163,17 @@ fn test_load_transformer_block() {
         .any(|l| l.layer_type == LayerType::Softmax);
 
     // At least two of these should be present (depending on fusion)
-    let transformer_markers = [has_layer_norm, has_gelu, has_softmax]
+    let transformer_markers = [has_layer_norm, has_erf, has_softmax]
         .iter()
         .filter(|&&x| x)
         .count();
     assert!(
         transformer_markers >= 2,
-        "Expected at least 2 transformer markers (LayerNorm/GELU/Softmax)"
+        "Expected at least 2 transformer markers (LayerNorm/Erf/Softmax)"
+    );
+    assert!(
+        has_erf,
+        "transformer block must preserve decomposed GELU Erf"
     );
 }
 
@@ -173,7 +184,7 @@ fn test_load_transformer_mlp() {
 
     let model = load_onnx(&path).expect("Failed to load transformer_mlp model");
 
-    // MLP should have: Linear -> GELU -> Linear
+    // MLP should preserve the exact Linear -> decomposed-Erf GELU -> Linear graph.
     let layer_types: Vec<_> = model
         .network
         .layers
@@ -185,16 +196,24 @@ fn test_load_transformer_mlp() {
     let has_linear = layer_types
         .iter()
         .any(|t| *t == LayerType::Linear || *t == LayerType::MatMul);
-    let has_gelu = layer_types.contains(&LayerType::GELU);
+    let has_erf = layer_types.contains(&LayerType::Erf);
 
     assert!(has_linear, "MLP should have Linear layers");
-    assert!(has_gelu, "MLP should have GELU activation");
+    assert!(
+        has_erf,
+        "MLP should preserve the decomposed GELU Erf primitive"
+    );
+    assert!(
+        !layer_types.contains(&LayerType::GELU),
+        "MLP must not use the disabled canonical GELU fusion"
+    );
 }
 
 #[ntest::timeout(10000)]
 #[test]
 fn test_causal_attention_structure() {
-    // Test that causal attention loads correctly with CausalSoftmax fusion.
+    // Finite additive masks remain an exact Add -> Softmax graph.  They must
+    // not be rewritten to hard zero-probability causal semantics.
     let path = require_test_model_with_hint("causal_attention.onnx", TRANSFORMER_TEST_MODEL_HINT);
 
     let model = load_onnx(&path).expect("Failed to load causal attention model");
@@ -213,6 +232,7 @@ fn test_causal_attention_structure() {
         .layers()
         .iter()
         .any(|l| l.layer_type() == "CausalSoftmax");
+    let has_softmax = network.layers().iter().any(|l| l.layer_type() == "Softmax");
     // Since c93afde62, all activation-activation MatMuls produce BilinearCrown.
     let has_bilinear = network
         .layers()
@@ -220,12 +240,11 @@ fn test_causal_attention_structure() {
         .any(|l| l.layer_type() == "BilinearCrown");
 
     println!("\nHas CausalSoftmax: {}", has_causal_softmax);
+    println!("Has Softmax: {}", has_softmax);
     println!("Has BilinearCrown: {}", has_bilinear);
 
-    assert!(
-        has_causal_softmax,
-        "Causal attention should have CausalSoftmax (fusion should detect mask pattern)"
-    );
+    assert!(!has_causal_softmax, "finite mask must not hard-fuse");
+    assert!(has_softmax, "finite mask must preserve ordinary Softmax");
     assert!(
         has_bilinear,
         "Causal attention should have BilinearCrown (for Q@K^T and attn@V)"
@@ -284,7 +303,8 @@ fn test_encoder_decoder_block_load() {
     let layer_types: Vec<_> = model.network.layers.iter().map(|l| &l.layer_type).collect();
     println!("Layer types: {:?}", layer_types);
 
-    // Should have both CausalSoftmax (self-attention) and Softmax (cross-attention)
+    // The finite additive self-attention mask must remain Add -> Softmax; it is
+    // not equivalent to hard zero-probability causal semantics.
     let has_causal_softmax = model
         .network
         .layers
@@ -299,11 +319,8 @@ fn test_encoder_decoder_block_load() {
     println!("Has CausalSoftmax: {}", has_causal_softmax);
     println!("Has Softmax: {}", has_softmax);
 
-    // Encoder-decoder should have both
-    assert!(
-        has_causal_softmax || has_softmax,
-        "Encoder-decoder block should have attention layers"
-    );
+    assert!(!has_causal_softmax, "finite mask must not hard-fuse");
+    assert!(has_softmax, "encoder-decoder block must preserve Softmax");
 }
 
 #[ntest::timeout(10000)]
@@ -327,25 +344,15 @@ fn test_cross_attention_subgraph() {
         .any(|b| b.has_cross_attention);
     assert!(has_cross, "Model should report cross-attention support");
 
-    // Try to extract cross-attention subgraph
-    let result = decoder.cross_attention_subgraph(0);
-    match result {
-        Ok(graph) => {
-            println!(
-                "Cross-attention subgraph extracted: {} nodes",
-                graph.num_nodes()
-            );
-
-            // Verify graph has expected structure
-            assert!(graph.num_nodes() > 0, "Graph should have nodes");
-
-            // The graph should have Q, K, V projections, attention, and output
-            // Due to reshape/transpose nodes, expect at least 10 nodes
-            println!("Cross-attention subgraph node count: {}", graph.num_nodes());
+    // GraphNetwork cannot represent the independent encoder input, so the
+    // extractor must fail rather than return a dangling two-input graph.
+    match decoder.cross_attention_subgraph(0) {
+        Err(NyError::UnsupportedConfiguration(message)) => {
+            assert!(message.contains("single-input propagation contract"));
+            assert!(message.contains("no graph or bounds were produced"));
         }
-        Err(e) => {
-            panic!("Cross-attention subgraph extraction failed: {:?}", e);
-        }
+        Err(other) => panic!("expected UnsupportedConfiguration, got {other:?}"),
+        Ok(_) => panic!("cross-attention extractor returned an unusable two-input graph"),
     }
 }
 
@@ -459,16 +466,19 @@ fn measure_onnx_at_eps(
     let ibp = graph.propagate_ibp(&input).expect("IBP should succeed");
     let (ibp_max, sound_ibp) = measure_with_soundness(&ibp, graph, center, eps);
 
-    let (crown_max, sound_crown) = match graph.propagate_crown_batched(&input) {
-        Ok(b) => measure_with_soundness(&b, graph, center, eps),
-        Err(_) => (f32::NAN, true),
-    };
+    let crown = graph
+        .propagate_crown_batched(&input)
+        .unwrap_or_else(|error| {
+            panic!("CROWN must cover the attention fixture at eps={eps}: {error}")
+        });
+    let (crown_max, sound_crown) = measure_with_soundness(&crown, graph, center, eps);
 
-    let (alpha_max, sound_alpha) =
-        match graph.propagate_alpha_crown_with_config(&input, alpha_config) {
-            Ok(b) => measure_with_soundness(&b, graph, center, eps),
-            Err(_) => (f32::NAN, true),
-        };
+    let alpha = graph
+        .propagate_alpha_crown_with_config(&input, alpha_config)
+        .unwrap_or_else(|error| {
+            panic!("alpha-CROWN must cover the attention fixture at eps={eps}: {error}")
+        });
+    let (alpha_max, sound_alpha) = measure_with_soundness(&alpha, graph, center, eps);
 
     let tighter = alpha_max.is_finite() && alpha_max < ibp_max * 0.999;
     OnnxEpsMeasurement {
@@ -543,7 +553,7 @@ fn format_onnx_decision_report(results: &[OnnxEpsMeasurement]) -> String {
 #[test]
 fn test_phase3_mccormick_vs_ibp_onnx_attention() {
     let path = require_test_model("minimal_attention_core.onnx");
-    let model = load_onnx(&path).expect("Failed to load minimal_attention_core model");
+    let model = load_minimal_attention_fixture(&path);
     let graph = model
         .to_graph_network()
         .expect("Failed to convert minimal_attention_core to graph network");

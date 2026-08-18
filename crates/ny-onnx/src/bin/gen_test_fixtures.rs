@@ -1,6 +1,9 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+
+#![forbid(unsafe_code)]
+
 use ny_onnx::onnx_proto;
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -42,26 +45,18 @@ fn tensor_f32(name: &str, shape: &[i64], data: &[f32]) -> onnx_proto::TensorProt
 fn attr_int(name: &str, value: i64) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
-        f: 0.0,
-        i: value,
-        s: Vec::new(),
-        t: None,
+        i: Some(value),
         r#type: onnx_proto::attribute_type::INT,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     }
 }
 
 fn attr_ints(name: &str, values: &[i64]) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
-        f: 0.0,
-        i: 0,
-        s: Vec::new(),
-        t: None,
         r#type: onnx_proto::attribute_type::INTS,
-        floats: Vec::new(),
         ints: values.to_vec(),
+        ..Default::default()
     }
 }
 
@@ -109,19 +104,29 @@ fn write_onnx_model(path: &Path, graph: onnx_proto::GraphProto) {
 
 fn write_matmul_transpose_b_const(path: &Path) {
     let graph = onnx_proto::GraphProto {
-        node: vec![node(
-            "matmul",
-            "MatMul",
-            &["input", "weight"],
-            &["output"],
-            vec![attr_int("transpose_b", 1)],
-        )],
+        node: vec![
+            node(
+                "transpose_weight",
+                "Transpose",
+                &["weight"],
+                &["weight_t"],
+                vec![attr_ints("perm", &[1, 0])],
+            ),
+            node(
+                "matmul",
+                "MatMul",
+                &["input", "weight_t"],
+                &["output"],
+                Vec::new(),
+            ),
+        ],
         name: "matmul_transpose_b_const".to_string(),
         initializer: vec![tensor_f32(
             "weight",
             &[2, 3],
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         )],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 3])],
         output: vec![tensor_value_info("output", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -137,12 +142,13 @@ fn write_minimal_attention_core(path: &Path) {
             node("k_matmul", "MatMul", &["x", "wk"], &["k"], Vec::new()),
             node("v_matmul", "MatMul", &["x", "wv"], &["v"], Vec::new()),
             node(
-                "scores",
-                "MatMul",
-                &["q", "k"],
-                &["scores"],
-                vec![attr_int("transpose_b", 1)],
+                "transpose_k",
+                "Transpose",
+                &["k"],
+                &["k_t"],
+                vec![attr_ints("perm", &[1, 0])],
             ),
+            node("scores", "MatMul", &["q", "k_t"], &["scores"], Vec::new()),
             node("softmax", "Softmax", &["scores"], &["probs"], Vec::new()),
             node(
                 "context",
@@ -158,6 +164,7 @@ fn write_minimal_attention_core(path: &Path) {
             tensor_f32("wk", &[2, 2], &[1.0, 0.5, -0.5, 1.0]),
             tensor_f32("wv", &[2, 2], &[0.2, 0.1, 0.3, -0.4]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("x", &[1, 2])],
         output: vec![tensor_value_info("context", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -171,6 +178,7 @@ fn write_mul_binary(path: &Path) {
         node: vec![node("mul", "Mul", &["a", "b"], &["out"], Vec::new())],
         name: "mul_binary".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![
             tensor_value_info("a", &[1, 2]),
             tensor_value_info("b", &[1, 2]),
@@ -190,6 +198,7 @@ fn write_mul_const_broadcast(path: &Path) {
             tensor_f32("a", &[2, 2], &[1.0, 2.0, 3.0, 4.0]),
             tensor_f32("b", &[2], &[5.0, 6.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: Vec::new(),
         output: vec![tensor_value_info("out", &[2, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -207,6 +216,7 @@ fn write_mul_binary_activation_inputs(path: &Path) {
         ],
         name: "mul_binary_activation_inputs".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("x", &[1, 2])],
         output: vec![tensor_value_info("out", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -224,6 +234,7 @@ fn write_mul_binary_activation_broadcast(path: &Path) {
         ],
         name: "mul_binary_activation_broadcast".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![
             tensor_value_info("x", &[1, 2, 3]),
             tensor_value_info("y", &[1, 1, 3]),
@@ -245,6 +256,7 @@ fn write_mul_const_incompatible_shapes(path: &Path) {
             tensor_f32("a", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             tensor_f32("b", &[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: Vec::new(),
         output: vec![tensor_value_info("out", &[2, 3])],
         #[cfg(feature = "onnx-value-info")]
@@ -267,6 +279,7 @@ fn write_single_linear(path: &Path) {
             tensor_f32("weight", &[3, 2], &[1.0, 2.0, 3.0, -1.0, -2.0, 1.0]),
             tensor_f32("bias", &[3], &[0.5, -0.5, 1.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("output", &[1, 3])],
         #[cfg(feature = "onnx-value-info")]
@@ -292,6 +305,7 @@ fn write_linear_relu(path: &Path) {
             tensor_f32("weight", &[3, 2], &[1.0, 2.0, 3.0, -1.0, -2.0, 1.0]),
             tensor_f32("bias", &[3], &[0.5, -0.5, 1.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("output", &[1, 3])],
         #[cfg(feature = "onnx-value-info")]
@@ -326,6 +340,7 @@ fn write_simple_mlp(path: &Path) {
             tensor_f32("w2", &[2, 4], &[1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, 1.0]),
             tensor_f32("b2", &[2], &[0.0, 0.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("output", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -356,6 +371,7 @@ fn write_single_conv2d(path: &Path) {
             ),
             tensor_f32("bias", &[1], &[0.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 1, 5, 5])],
         output: vec![tensor_value_info("output", &[1, 1, 3, 3])],
         #[cfg(feature = "onnx-value-info")]
@@ -389,6 +405,7 @@ fn write_conv_relu(path: &Path) {
             ),
             tensor_f32("bias", &[2], &[0.0, 0.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 1, 4, 4])],
         output: vec![tensor_value_info("output", &[1, 2, 3, 3])],
         #[cfg(feature = "onnx-value-info")]
@@ -437,6 +454,7 @@ fn write_mnist_conv(path: &Path) {
             tensor_f32("fc_weight", &[5, 72], &fc_weight),
             tensor_f32("fc_bias", &[5], &fc_bias),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 1, 8, 8])],
         output: vec![tensor_value_info("output", &[1, 5])],
         #[cfg(feature = "onnx-value-info")]
@@ -470,6 +488,7 @@ fn write_duration_predictor_surrogate(path: &Path) {
             tensor_f32("weight", &[8, 50], &weight),
             tensor_f32("bias", &[50], &bias),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("encoded_features", &[1, 4, 8])],
         output: vec![tensor_value_info("duration_logits", &[1, 4, 50])],
         #[cfg(feature = "onnx-value-info")]
@@ -510,6 +529,7 @@ fn write_conv_relu_maxpool(path: &Path) {
             tensor_f32("conv_weight", &[2, 1, 3, 3], &conv_weight),
             tensor_f32("conv_bias", &[2], &[0.0, 0.0]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 1, 8, 8])],
         output: vec![tensor_value_info("output", &[1, 2, 4, 4])],
         #[cfg(feature = "onnx-value-info")]
@@ -568,6 +588,7 @@ fn write_cnn_with_flatten(path: &Path) {
             tensor_f32("fc_weight", &[2, 64], &fc_weight),
             tensor_f32("fc_bias", &[2], &fc_bias),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 1, 8, 8])],
         output: vec![tensor_value_info("output", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -634,6 +655,7 @@ fn write_test_cnn_maxpool(path: &Path) {
             tensor_f32("fc_weight", &[2, 64], &fc_weight),
             tensor_f32("fc_bias", &[2], &fc_bias),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 1, 8, 8])],
         output: vec![tensor_value_info("output", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]
@@ -657,6 +679,7 @@ fn write_const_activation_binary_op(path: &Path) {
         ],
         name: "const_activation_binary_op".to_string(),
         initializer: vec![tensor_f32("constant", &[1, 2], &[1.0, -0.5])],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("output", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]

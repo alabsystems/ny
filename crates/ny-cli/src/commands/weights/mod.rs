@@ -11,15 +11,31 @@
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use ny_core::nan_propagating_max;
 use ny_onnx::load_onnx;
 use ny_onnx::safetensors::{load_safetensors, safetensors_info};
 use serde_json::json;
 use std::path::PathBuf;
 
+use super::verify::json_f32;
+
 mod norms;
 
 #[cfg(test)]
 mod tests;
+
+fn max_abs_difference<'a>(
+    left: impl Iterator<Item = &'a f32>,
+    right: impl Iterator<Item = &'a f32>,
+) -> f32 {
+    left.zip(right)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, nan_propagating_max)
+}
+
+fn difference_exceeds_tolerance(difference: f32, tolerance: f32) -> bool {
+    !difference.is_finite() || difference > tolerance
+}
 
 /// Weights subcommand actions
 #[derive(Subcommand)]
@@ -392,6 +408,13 @@ pub(crate) fn handle_weights_command(action: WeightsAction) -> Result<()> {
             show_all,
             json,
         } => {
+            if !tolerance.is_finite() {
+                anyhow::bail!("Tolerance must be finite (got {tolerance})");
+            }
+            if tolerance < 0.0 {
+                anyhow::bail!("Tolerance must be non-negative (got {tolerance})");
+            }
+
             // Load weights from both files
             let weights_a = load_weights_from_file(&file_a)?;
             let weights_b = load_weights_from_file(&file_b)?;
@@ -417,27 +440,23 @@ pub(crate) fn handle_weights_command(action: WeightsAction) -> Result<()> {
                     }
 
                     // Compare values
-                    let diff = tensor_a
-                        .iter()
-                        .zip(tensor_b.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0f32, f32::max);
+                    let diff = max_abs_difference(tensor_a.iter(), tensor_b.iter());
 
-                    max_diff = max_diff.max(diff);
+                    max_diff = nan_propagating_max(max_diff, diff);
 
-                    if diff > tolerance {
+                    if difference_exceeds_tolerance(diff, tolerance) {
                         differing_count += 1;
                         comparisons.push(json!({
                             "name": name,
                             "status": "differs",
-                            "max_diff": diff,
+                            "max_diff": json_f32(diff),
                             "shape": tensor_a.shape()
                         }));
                     } else if show_all {
                         comparisons.push(json!({
                             "name": name,
                             "status": "match",
-                            "max_diff": diff,
+                            "max_diff": json_f32(diff),
                             "shape": tensor_a.shape()
                         }));
                     }
@@ -469,7 +488,7 @@ pub(crate) fn handle_weights_command(action: WeightsAction) -> Result<()> {
                     "file_b": file_b.to_string_lossy(),
                     "tolerance": tolerance,
                     "result": if is_match { "match" } else { "differs" },
-                    "max_difference": max_diff,
+                    "max_difference": json_f32(max_diff),
                     "differing_tensors": differing_count,
                     "total_tensors_a": weights_a.len(),
                     "total_tensors_b": weights_b.len(),
@@ -496,8 +515,15 @@ pub(crate) fn handle_weights_command(action: WeightsAction) -> Result<()> {
                         let name = comp["name"].as_str().unwrap_or("");
                         match status {
                             "differs" => {
-                                let diff = comp["max_diff"].as_f64().unwrap_or(0.0);
-                                println!("  {} - max diff: {:.6e}", name, diff);
+                                if let Some(diff) = comp["max_diff"].as_f64() {
+                                    println!("  {} - max diff: {:.6e}", name, diff);
+                                } else {
+                                    println!(
+                                        "  {} - max diff: {}",
+                                        name,
+                                        comp["max_diff"].as_str().unwrap_or("non-finite")
+                                    );
+                                }
                             }
                             "shape_mismatch" => {
                                 println!(

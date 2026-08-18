@@ -53,9 +53,11 @@
 //!   sound (no warm-start), just no lA reuse for the minimal increment.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::sync::Arc;
+use std::time::Instant;
 
-use ny_core::GemmEngine;
+use ny_core::{GemmEngine, NyError};
 use ny_tensor::BoundedTensor;
 
 use crate::batched_domain::{BatchedDomainOptions, BatchedDomains};
@@ -64,6 +66,11 @@ use crate::beta_crown::state::{GraphBetaState, GraphDomainAlphaState};
 use crate::GraphNetwork;
 
 use super::super::super::super::BetaCrownVerifier;
+use super::super::selective_root_alpha::{
+    authoritative_deadline_expired, select_child_bounds_and_continuation_state,
+    selective_candidate_deadline, selective_candidate_start_allowed, ChildArmEvaluation,
+    ChildContinuationStateProvenance, SelectivePairDecision,
+};
 use super::super::shared::{
     build_spec_matrix, merge_pruned_objective_bounds, prune_verified_multi_objective_targets,
     spec_bounds_to_vec, PrunedMultiObjectiveTargets,
@@ -106,16 +113,247 @@ fn clip_input_box_signature(input: &BoundedTensor) -> u64 {
 
 /// Per-child single-pass result, identical in shape to the per-child closure in
 /// `batched_multi.rs`:
-/// `(obj_bounds, node_cache, beta_state, alpha_state, active_cached_las, pruned_targets)`.
+/// `(obj_bounds, node_cache, beta_state, alpha_state, active_cached_las,
+/// pruned_targets, state_provenance)`.
 ///
 /// The `Option<GraphDomainAlphaState>` slot is the wide α ascent's persisted
 /// best-margin α for the child (#hard-six, dark `NY_WIDE_ALPHA_UNSHARED=1`);
 /// `None` = keep the child's inherited α (historical behavior, byte-identical
 /// when the gate is off).
 ///
-/// `Err(true)` mirrors the infeasible-domain signal; `Err(false)` mirrors a
-/// hard propagation failure / non-finite drop.
-type BatchedChildResult = Result<
+/// Preserve the semantic cause of a per-child failure across the batched and
+/// fallback paths. In particular, an effective graph-BaB deadline can be
+/// earlier than the outer loop's nominal timeout, so collapsing it into a
+/// generic propagation failure can otherwise produce a pre-deadline `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::beta_crown::engine::graph) enum MultiObjectiveChildEvalError {
+    Infeasible,
+    PropagationFailure,
+    DeadlineExpired,
+}
+
+/// Whole-adapter decline. Ordinary construction/numerical failures may retry
+/// through the exact per-child path. Deadline expiry and a bounded facade's
+/// host-memory refusal must not launch fresh work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::beta_crown::engine::graph) enum BatchedMultiObjectiveAdapterError {
+    Fallback,
+    ResourceRefused,
+    DeadlineExpired,
+}
+
+fn classify_adapter_error(
+    error: &NyError,
+    engine: &dyn GemmEngine,
+) -> BatchedMultiObjectiveAdapterError {
+    if error.is_deadline_exceeded() {
+        BatchedMultiObjectiveAdapterError::DeadlineExpired
+    } else if error.is_cpu_memory_exceeded() && engine.forbids_unbounded_cpu_fallback() {
+        BatchedMultiObjectiveAdapterError::ResourceRefused
+    } else {
+        BatchedMultiObjectiveAdapterError::Fallback
+    }
+}
+
+fn classify_certified_adapter_fallback_error(error: &NyError) -> BatchedMultiObjectiveAdapterError {
+    if error.is_deadline_exceeded() {
+        BatchedMultiObjectiveAdapterError::DeadlineExpired
+    } else if error.is_cpu_memory_exceeded() {
+        BatchedMultiObjectiveAdapterError::ResourceRefused
+    } else {
+        BatchedMultiObjectiveAdapterError::Fallback
+    }
+}
+
+fn certified_adapter_checkpoint(
+    deadline: Instant,
+) -> Result<(), BatchedMultiObjectiveAdapterError> {
+    if Instant::now() >= deadline {
+        Err(BatchedMultiObjectiveAdapterError::DeadlineExpired)
+    } else {
+        Ok(())
+    }
+}
+
+fn certified_adapter_vec<T>(
+    len: usize,
+    deadline: Instant,
+) -> Result<Vec<T>, BatchedMultiObjectiveAdapterError> {
+    certified_adapter_checkpoint(deadline)?;
+    let required_bytes = len.saturating_mul(size_of::<T>());
+    if required_bytes > crate::network::crown_memory::cpu_crown_dense_budget_bytes() {
+        return Err(BatchedMultiObjectiveAdapterError::ResourceRefused);
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| BatchedMultiObjectiveAdapterError::ResourceRefused)?;
+    certified_adapter_checkpoint(deadline)?;
+    Ok(values)
+}
+
+fn finite_refusal_fallback_admitted(_child_count: usize) -> bool {
+    // At this point the adapter still owns a dense spec matrix, graph-domain
+    // shims, and `BatchedDomains`' opaque nested buffers. Their live retained
+    // payload is not exposed, so even a one-child rescue cannot produce a
+    // truthful aggregate memory receipt. Refuse before allocating any fallback
+    // result; the higher-level caller retains the child as unresolved.
+    false
+}
+
+fn prune_targets_for_certified_adapter_fallback(
+    objectives: &[Vec<f32>],
+    thresholds: &[f32],
+    verified_mask: &[bool],
+    deadline: Instant,
+) -> Result<PrunedMultiObjectiveTargets, BatchedMultiObjectiveAdapterError> {
+    if objectives.len() != thresholds.len() || objectives.len() != verified_mask.len() {
+        return Err(BatchedMultiObjectiveAdapterError::Fallback);
+    }
+    let active_count = verified_mask.iter().filter(|&&verified| !verified).count();
+    let coefficient_count = objectives
+        .iter()
+        .zip(verified_mask)
+        .filter(|(_, verified)| !**verified)
+        .try_fold(0usize, |total, (objective, _)| {
+            total.checked_add(objective.len())
+        })
+        .ok_or(BatchedMultiObjectiveAdapterError::ResourceRefused)?;
+    let required_bytes = coefficient_count
+        .saturating_mul(size_of::<f32>())
+        .saturating_add(active_count.saturating_mul(
+            size_of::<usize>() + size_of::<Vec<f32>>() + size_of::<f32>() + size_of::<bool>(),
+        ));
+    if required_bytes > crate::network::crown_memory::cpu_crown_dense_budget_bytes() {
+        return Err(BatchedMultiObjectiveAdapterError::ResourceRefused);
+    }
+
+    let mut active_indices = certified_adapter_vec(active_count, deadline)?;
+    let mut active_objectives = certified_adapter_vec(active_count, deadline)?;
+    let mut active_thresholds = certified_adapter_vec(active_count, deadline)?;
+    let mut active_verified_mask = certified_adapter_vec(active_count, deadline)?;
+    for (index, ((objective, &threshold), &verified)) in objectives
+        .iter()
+        .zip(thresholds)
+        .zip(verified_mask)
+        .enumerate()
+    {
+        certified_adapter_checkpoint(deadline)?;
+        if verified {
+            continue;
+        }
+        let mut cloned_objective = certified_adapter_vec(objective.len(), deadline)?;
+        for (coefficient_index, &coefficient) in objective.iter().enumerate() {
+            cloned_objective.push(coefficient);
+            if coefficient_index.is_multiple_of(1024) {
+                certified_adapter_checkpoint(deadline)?;
+            }
+        }
+        active_indices.push(index);
+        active_objectives.push(cloned_objective);
+        active_thresholds.push(threshold);
+        active_verified_mask.push(false);
+    }
+    certified_adapter_checkpoint(deadline)?;
+    Ok(PrunedMultiObjectiveTargets {
+        active_indices,
+        objectives: active_objectives,
+        thresholds: active_thresholds,
+        verified_mask: active_verified_mask,
+    })
+}
+
+fn merge_certified_adapter_bounds(
+    inherited: &[(f32, f32)],
+    projected: &[(f32, f32)],
+    active_indices: &[usize],
+    deadline: Instant,
+) -> Result<Vec<(f32, f32)>, BatchedMultiObjectiveAdapterError> {
+    if inherited.len() != projected.len() {
+        return Err(BatchedMultiObjectiveAdapterError::Fallback);
+    }
+    let mut merged = certified_adapter_vec(inherited.len(), deadline)?;
+    for (index, &bounds) in inherited.iter().enumerate() {
+        merged.push(bounds);
+        if index.is_multiple_of(1024) {
+            certified_adapter_checkpoint(deadline)?;
+        }
+    }
+    for &index in active_indices {
+        let Some(&bounds) = projected.get(index) else {
+            return Err(BatchedMultiObjectiveAdapterError::Fallback);
+        };
+        merged[index] = bounds;
+        certified_adapter_checkpoint(deadline)?;
+    }
+    Ok(merged)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectiveCandidateCompletion {
+    CandidateAvailable,
+    RetainEstablished(&'static str),
+    HardDeadlineExpired,
+}
+
+/// Adjudicate W exactly once at the timestamp sampled immediately after its
+/// evaluation returns.
+///
+/// Deadline authority precedes inspection of W's result. Consequently a
+/// `Fallback` cannot mask a crossed hard deadline, and even an `Ok` result
+/// finishing in the protected five-second tail is discarded before any W
+/// bound, continuation state, or advisory write is read.
+fn adjudicate_selective_candidate_completion<T>(
+    finished_at: Instant,
+    candidate_deadline: Option<Instant>,
+    authoritative_deadline: Option<Instant>,
+    candidate_call: &Result<T, BatchedMultiObjectiveAdapterError>,
+) -> SelectiveCandidateCompletion {
+    if authoritative_deadline_expired(finished_at, authoritative_deadline) {
+        return SelectiveCandidateCompletion::HardDeadlineExpired;
+    }
+    if !selective_candidate_start_allowed(finished_at, candidate_deadline) {
+        return SelectiveCandidateCompletion::RetainEstablished(
+            "candidate_private_deadline_after_evaluation",
+        );
+    }
+    match candidate_call {
+        Ok(_) => SelectiveCandidateCompletion::CandidateAvailable,
+        Err(BatchedMultiObjectiveAdapterError::Fallback) => {
+            SelectiveCandidateCompletion::RetainEstablished("candidate_adapter_refusal")
+        }
+        Err(BatchedMultiObjectiveAdapterError::ResourceRefused) => {
+            SelectiveCandidateCompletion::RetainEstablished("candidate_resource_refusal")
+        }
+        Err(BatchedMultiObjectiveAdapterError::DeadlineExpired) => {
+            SelectiveCandidateCompletion::RetainEstablished("candidate_private_deadline")
+        }
+    }
+}
+
+fn evaluate_selective_candidate_with_scopes<T>(
+    verifier: &BetaCrownVerifier,
+    candidate_deadline: Option<Instant>,
+    evaluate: impl FnOnce() -> T,
+) -> (T, Instant) {
+    let _candidate_deadline_scope = verifier
+        .complete_clip_deadline_overrides
+        .scoped(candidate_deadline);
+    // Complete-Clipping affine/template caches are keyed without alpha
+    // identity. W is speculative and may be rejected, so suppress that
+    // optional lane for its entire evaluation rather than letting a W
+    // template affect later H descendants.
+    let _candidate_complete_clip_suppression = verifier
+        .complete_clip_deadline_overrides
+        .suppress_complete_clip_scoped();
+    let result = evaluate();
+    // Sample before either scope is dropped and before the result leaves this
+    // seam, so no caller operation can enter the protected tail first.
+    let finished_at = Instant::now();
+    (result, finished_at)
+}
+
+pub(super) type BatchedChildResult = Result<
     (
         Vec<(f32, f32)>,
         HashMap<String, Arc<BoundedTensor>>,
@@ -123,23 +361,40 @@ type BatchedChildResult = Result<
         Option<GraphDomainAlphaState>,
         Vec<Option<crate::batched_domain::CachedLinearBounds>>,
         PrunedMultiObjectiveTargets,
+        ChildContinuationStateProvenance,
     ),
-    bool,
+    MultiObjectiveChildEvalError,
 >;
+
+#[cfg(test)]
+std::thread_local! {
+    static BATCHED_SINGLE_PASS_DISPATCH_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_batched_single_pass_dispatch_count_for_test() {
+    BATCHED_SINGLE_PASS_DISPATCH_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn batched_single_pass_dispatch_count_for_test() -> usize {
+    BATCHED_SINGLE_PASS_DISPATCH_COUNT.with(std::cell::Cell::get)
+}
 
 impl BetaCrownVerifier {
     /// Domain-batch the single-pass multi-objective child CROWN backward passes.
     ///
     /// Produces one result per `batchable` child, in order, matching the tuple
     /// the per-child `par_iter` closure produces in
-    /// `process_graph_domains_batched_gpu_multi_objective`. On ANY error from the
-    /// batched primitive (`BatchedDomains` construction or the dense-spec
-    /// backward), the whole batch falls back by returning `None`, and the caller
-    /// routes the batchable set back through the existing per-child path — clean,
-    /// sound fallback mirroring `batched_single.rs`.
+    /// `process_graph_domains_batched_gpu_multi_objective`. Ordinary errors from
+    /// the batched primitive (`BatchedDomains` construction or the dense-spec
+    /// backward) return [`BatchedMultiObjectiveAdapterError::Fallback`], and the
+    /// caller routes the batchable set through the existing per-child path.
+    /// [`BatchedMultiObjectiveAdapterError::DeadlineExpired`] is terminal and
+    /// must not launch a fresh fallback wave.
     ///
-    /// Returns `Some(results)` on success (length == `batchable.len()`), or
-    /// `None` to signal "fall back to the per-child path for the whole batch".
+    /// Returns one result per child on success.
     // Justification: this adapter threads graph, the batchable child set, relu
     // node names, the full objective set, thresholds, and the engine together —
     // the same verification context the per-child path consumes.
@@ -153,9 +408,11 @@ impl BetaCrownVerifier {
         thresholds: &[f32],
         engine: &dyn GemmEngine,
         prune_specs_to_union: bool,
-    ) -> Option<Vec<BatchedChildResult>> {
+    ) -> Result<Vec<BatchedChildResult>, BatchedMultiObjectiveAdapterError> {
+        #[cfg(test)]
+        BATCHED_SINGLE_PASS_DISPATCH_COUNT.with(|count| count.set(count.get() + 1));
         if batchable.is_empty() {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         // One UNIFORM spec matrix, shape (num_rows, output_dim). CROWN backward
@@ -183,7 +440,7 @@ impl BetaCrownVerifier {
         if union_indices.is_empty() {
             // Every objective verified in every child — nothing to recompute;
             // let the per-child path handle the (degenerate) batch.
-            return None;
+            return Err(BatchedMultiObjectiveAdapterError::Fallback);
         }
         // Absolute objective index → spec row position.
         let union_pos: HashMap<usize, usize> = union_indices
@@ -195,7 +452,9 @@ impl BetaCrownVerifier {
             .iter()
             .map(|&j| objectives[j].clone())
             .collect();
-        let spec_matrix = build_spec_matrix(&union_objectives)?;
+        let Some(spec_matrix) = build_spec_matrix(&union_objectives) else {
+            return Err(BatchedMultiObjectiveAdapterError::Fallback);
+        };
 
         // Build owned GraphBabDomain shims that outlive the batched call.
         // BatchedDomains/BatchedBackwardContext borrow `&[&GraphBabDomain]`.
@@ -207,7 +466,7 @@ impl BetaCrownVerifier {
         // the legacy environment request is ignored, so this closure returns
         // `graph_bab_domain_shim(child)` unchanged.
         let clip_interm_resnet = clip_interm_resnet_enabled();
-        let __clip_t = std::time::Instant::now();
+        let __clip_t = Instant::now();
         let build_shim = |child: &MultiObjectiveGraphBabDomain| -> GraphBabDomain {
             let mut shim = graph_bab_domain_shim(child);
             if clip_interm_resnet {
@@ -260,7 +519,7 @@ impl BetaCrownVerifier {
                 tracing::warn!(
                     "batched_single_pass_multi_objective_children: BatchedDomains build failed ({e}); falling back to per-child path"
                 );
-                return None;
+                return Err(classify_adapter_error(&e, engine));
             }
         };
 
@@ -336,11 +595,94 @@ impl BetaCrownVerifier {
             beta_opt,
         ) {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    "batched_single_pass_multi_objective_children: dense-spec backward failed ({e}); falling back to per-child path"
+            Err(error)
+                if crate::beta_crown::engine::graph::is_finite_constrained_crown_refusal(
+                    &error,
+                ) && self.effective_graph_bab_deadline().is_some() =>
+            {
+                let deadline = self
+                    .effective_graph_bab_deadline()
+                    .expect("finite refusal guard established a deadline");
+                // Keep the bounded rescue receipt simple and authoritative:
+                // multiple retained child maps have aggregate nested payload
+                // that this adapter cannot yet account exactly.
+                if !finite_refusal_fallback_admitted(batchable.len()) {
+                    return Err(BatchedMultiObjectiveAdapterError::ResourceRefused);
+                }
+                let output_name = if graph.output_name().is_empty() {
+                    graph
+                        .exec_order()
+                        .ok()
+                        .and_then(|order| order.last())
+                        .map(String::as_str)
+                } else {
+                    Some(graph.output_name())
+                };
+                let Some(output_name) = output_name else {
+                    return Err(BatchedMultiObjectiveAdapterError::Fallback);
+                };
+                let mut fallback_results = certified_adapter_vec(batchable.len(), deadline)?;
+                for child in batchable {
+                    let Some(output) = child.node_bounds().get(output_name) else {
+                        return Err(BatchedMultiObjectiveAdapterError::Fallback);
+                    };
+                    let projected =
+                        crate::beta_crown::engine::graph::objectives::objective_bounds_multi_with_deadline(
+                            output,
+                            objectives,
+                            deadline,
+                        )
+                        .map_err(|error| classify_certified_adapter_fallback_error(&error))?;
+                    let pruned = prune_targets_for_certified_adapter_fallback(
+                        objectives,
+                        thresholds,
+                        child.verified(),
+                        deadline,
+                    )?;
+                    let merged = merge_certified_adapter_bounds(
+                        child.objective_bounds(),
+                        &projected,
+                        &pruned.active_indices,
+                        deadline,
+                    )?;
+                    let node_bounds =
+                        crate::beta_crown::engine::graph::objectives::clone_arc_node_bounds_with_deadline(
+                            child.node_bounds(),
+                            deadline,
+                        )
+                        .map_err(|error| classify_certified_adapter_fallback_error(&error))?;
+                    let mut caches = certified_adapter_vec(pruned.active_indices.len(), deadline)?;
+                    caches.resize_with(pruned.active_indices.len(), || None);
+                    certified_adapter_checkpoint(deadline)?;
+                    fallback_results.push(Ok((
+                        merged,
+                        node_bounds,
+                        GraphBetaState::empty(),
+                        None,
+                        caches,
+                        pruned,
+                        ChildContinuationStateProvenance::Established,
+                    )));
+                }
+                tracing::debug!(
+                    %error,
+                    children = fallback_results.len(),
+                    "Finite batched constrained CROWN declined; retaining certified child enclosures"
                 );
-                return None;
+                return Ok(fallback_results);
+            }
+            Err(e) => {
+                let outcome = classify_adapter_error(&e, engine);
+                if outcome == BatchedMultiObjectiveAdapterError::DeadlineExpired {
+                    tracing::debug!(
+                        "batched_single_pass_multi_objective_children: dense-spec backward reached the authoritative deadline"
+                    );
+                } else {
+                    tracing::warn!(
+                        "batched_single_pass_multi_objective_children: dense-spec backward failed ({e}); falling back to per-child path"
+                    );
+                }
+                return Err(outcome);
             }
         };
         let mut optimized_betas = dense_out.optimized_betas.unwrap_or_default();
@@ -351,9 +693,58 @@ impl BetaCrownVerifier {
         optimized_alphas.resize(batchable.len(), None);
         // #interm-refine prune lane (dark, `NY_INTERM_REFINE_PRUNE=1`): domains
         // whose split-premise set the refinement pass PROVED empty verify
-        // vacuously — surfaced below through the same `Err(true)` signal the
+        // vacuously — surfaced below through the same `Infeasible` signal the
         // with_constraint infeasibility path uses (batched_multi: "Infeasible
         // domain = empty = trivially verified").
+        // #bab-throughput: the ONLY view inside the wide pass. MEASURED
+        // 2026-08-13 on cifar100 idx_7641 at the official budget: BaB gets ~44 s
+        // and buys ONE outer iteration — a depth-4 kFSB wave whose 16 leaves are
+        // bounded here — i.e. ~2.8 s per child even inside the "batched" lane.
+        // That per-child cost IS the ~80x separating ny from the reference, and
+        // until now the window was unlit: the phase timeline goes silent after
+        // `bab-first-domain-batch` and the next output is the `[frontier]` frame
+        // 42 s later.
+        //
+        // `stage_timing` is already computed by the primitive
+        // (`propagation/batched/spec_adapters.rs`, `DenseSpecStageTiming`) and
+        // was then DROPPED UNREAD here, so surfacing it costs one field read.
+        // Splitting forward / backward / materialize is what says whether the
+        // cost is the per-domain CPU constrained forward (whose shared and
+        // batched fast arms both require `split_count == 0` and therefore NEVER
+        // fire for BaB children) or the wide GPU backward itself.
+        // #adaptive-chunk: record what a child ACTUALLY cost so the next wave can
+        // size its chunk from measurement instead of a fixed constant. Always on
+        // (one atomic store); the reader treats an unset value as "no estimate".
+        if let Some(t) = dense_out.stage_timing {
+            let n = batchable.len().max(1);
+            let total = t.forward_elapsed_s + t.backward_elapsed_s + t.materialize_elapsed_s;
+            super::batched_multi::record_observed_child_cost(total / n as f64);
+        }
+        if crate::phase_telemetry::phase_telemetry_enabled() {
+            if let Some(t) = dense_out.stage_timing {
+                let n = batchable.len().max(1);
+                let total = t.forward_elapsed_s + t.backward_elapsed_s + t.materialize_elapsed_s;
+                // `union_rows` is the load-bearing number: the backward's
+                // per-layer GEMM cost scales LINEARLY with spec rows, so a wave
+                // costs children x union_rows. The union-pruning comment above
+                // records that on cifar100 91/99 objectives are already
+                // root-verified, which would make union_rows ~8 rather than 99 —
+                // an ~12x difference in the DOMINANT phase. Printing it is how
+                // you tell whether the pruning is actually engaging.
+                eprintln!(
+                    "[phase] mo-wave-stage children={} union_rows={} pruned={} \
+                     fwd={:.2}s bwd={:.2}s mat={:.2}s total={:.2}s per_child={:.2}s",
+                    batchable.len(),
+                    union_indices.len(),
+                    prune_specs_to_union,
+                    t.forward_elapsed_s,
+                    t.backward_elapsed_s,
+                    t.materialize_elapsed_s,
+                    total,
+                    total / n as f64,
+                );
+            }
+        }
         let infeasible_domains = dense_out.infeasible_domains.unwrap_or_default();
         let dense_results = dense_out.results;
 
@@ -364,7 +755,7 @@ impl BetaCrownVerifier {
                 dense_results.len(),
                 batchable.len()
             );
-            return None;
+            return Err(BatchedMultiObjectiveAdapterError::Fallback);
         }
 
         let results: Vec<BatchedChildResult> = batchable
@@ -378,7 +769,7 @@ impl BetaCrownVerifier {
                     // Refinement-proven infeasible subdomain (see above): empty
                     // constraint set ⇒ trivially verified, drop the child.
                     if infeasible_domains.get(dom_idx).copied().unwrap_or(false) {
-                        return Err(true);
+                        return Err(MultiObjectiveChildEvalError::Infeasible);
                     }
                     // Per-objective bounds for every spec row (length = union rows).
                     let full_bounds_i = spec_bounds_to_vec(&result.output_bounds);
@@ -392,7 +783,7 @@ impl BetaCrownVerifier {
                                 spec_matrix.nrows()
                             );
                         }
-                        return Err(false);
+                        return Err(MultiObjectiveChildEvalError::PropagationFailure);
                     }
 
                     // Replicate per-child verified-latch pruning semantics.
@@ -420,7 +811,7 @@ impl BetaCrownVerifier {
                                         union_indices.len()
                                     );
                                 }
-                                return Err(false);
+                                return Err(MultiObjectiveChildEvalError::PropagationFailure);
                             }
                         }
                     }
@@ -569,7 +960,7 @@ impl BetaCrownVerifier {
                     // byte-identical): an active objective's fresh GPU sound-f32
                     // batched bound OVERFLOWED to non-finite (NaN/inf) on a deep
                     // subdomain — an f32-range failure, NOT a real infeasibility.
-                    // Dropping the child (Err(false) below) taints the whole run as
+                    // Dropping the child (PropagationFailure below) taints the whole run as
                     // Unknown via has_unresolved even after the bound otherwise
                     // converges (measured: 224 such drops on cifar100 idx_9502).
                     // Restore the child's INHERITED (parent) bound for the overflowed
@@ -597,7 +988,7 @@ impl BetaCrownVerifier {
                         .iter()
                         .any(|(l, u)| !l.is_finite() || !u.is_finite())
                     {
-                        return Err(false);
+                        return Err(MultiObjectiveChildEvalError::PropagationFailure);
                     }
 
                     // #cone-delta increment 2: Arc-shared map, moved through to the
@@ -621,12 +1012,562 @@ impl BetaCrownVerifier {
                         optimized_alpha,
                         active_cached_las_i,
                         pruned_i,
+                        ChildContinuationStateProvenance::Established,
                     ))
                 },
             )
             .collect();
 
-        Some(results)
+        Ok(results)
+    }
+
+    /// Evaluate established H first, then optionally evaluate expanded W under
+    /// a private cutoff that preserves five seconds before the authoritative
+    /// deadline.
+    ///
+    /// H is returned exactly on every optional-arm refusal. A strict W win
+    /// publishes `max(H_lower, W_lower)` with H's upper endpoints and carries
+    /// W's independently sound node enclosure plus cache-invalidated α/β
+    /// continuation warm state for the next sound recomputation.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::beta_crown::engine::graph) fn batched_selective_root_alpha_multi_objective_children(
+        &self,
+        graph: &GraphNetwork,
+        batchable: &[&MultiObjectiveGraphBabDomain],
+        relu_nodes: &[String],
+        objectives: &[Vec<f32>],
+        thresholds: &[f32],
+        engine: &dyn GemmEngine,
+        prune_specs_to_union: bool,
+        selective_root_alpha_candidate: Option<&GraphDomainAlphaState>,
+        authoritative_deadline: Option<Instant>,
+    ) -> Result<Vec<BatchedChildResult>, BatchedMultiObjectiveAdapterError> {
+        if authoritative_deadline_expired(Instant::now(), authoritative_deadline) {
+            return Err(BatchedMultiObjectiveAdapterError::DeadlineExpired);
+        }
+        let Some(root_candidate) = selective_root_alpha_candidate else {
+            // Exact historical path: without W, H publishes gather advice at
+            // its original sites and timing.
+            return self.batched_single_pass_multi_objective_children(
+                graph,
+                batchable,
+                relu_nodes,
+                objectives,
+                thresholds,
+                engine,
+                prune_specs_to_union,
+            );
+        };
+
+        // H remains first, but its advisory gather writes are staged rather
+        // than made globally visible. This lets per-child selection publish
+        // exactly H or W with no transient rejected-W observation.
+        let h_gather_stage = self.gather_score_cache.stage_writes();
+        let (established_call, established_finished_at) = {
+            let _h_deadline_scope = self
+                .complete_clip_deadline_overrides
+                .scoped(authoritative_deadline);
+            let result = self.batched_single_pass_multi_objective_children(
+                graph,
+                batchable,
+                relu_nodes,
+                objectives,
+                thresholds,
+                engine,
+                prune_specs_to_union,
+            );
+            (result, Instant::now())
+        };
+        if authoritative_deadline_expired(established_finished_at, authoritative_deadline) {
+            drop(h_gather_stage);
+            return Err(BatchedMultiObjectiveAdapterError::DeadlineExpired);
+        }
+        let h_gather_writes = h_gather_stage.finish();
+        let established_results = established_call?;
+        let Ok(candidate_deadline) = selective_candidate_deadline(authoritative_deadline) else {
+            self.gather_score_cache.commit_all(&h_gather_writes);
+            tracing::info!(
+                status = "fallback",
+                reason = "candidate_authority_reserve_unrepresentable",
+                "Selective root alpha paired transport"
+            );
+            return Ok(established_results);
+        };
+        if !selective_candidate_start_allowed(Instant::now(), candidate_deadline) {
+            self.gather_score_cache.commit_all(&h_gather_writes);
+            tracing::info!(
+                status = "fallback",
+                reason = "candidate_five_second_reserve_after_h",
+                "Selective root alpha paired transport"
+            );
+            return Ok(established_results);
+        }
+
+        // Rebase W directly from the root candidate onto each fully committed
+        // first child. This filters newly stable/constrained neurons against the
+        // child's authoritative boxes and history in one step.
+        let mut candidate_children = Vec::with_capacity(batchable.len());
+        for child in batchable {
+            let now = Instant::now();
+            if authoritative_deadline_expired(now, authoritative_deadline) {
+                return Err(BatchedMultiObjectiveAdapterError::DeadlineExpired);
+            }
+            if !selective_candidate_start_allowed(now, candidate_deadline) {
+                self.gather_score_cache.commit_all(&h_gather_writes);
+                return Ok(established_results);
+            }
+            let mut candidate_child = (*child).clone();
+            candidate_child.alpha_state = GraphDomainAlphaState::from_parent_node_bounds_map(
+                root_candidate,
+                graph,
+                child.node_bounds(),
+                child.history(),
+                child.input_bounds(),
+            );
+            // W must never consume an lA produced under H.
+            candidate_child.cached_las.fill(None);
+            candidate_children.push(candidate_child);
+        }
+        if !selective_candidate_start_allowed(Instant::now(), candidate_deadline) {
+            if authoritative_deadline_expired(Instant::now(), authoritative_deadline) {
+                return Err(BatchedMultiObjectiveAdapterError::DeadlineExpired);
+            }
+            self.gather_score_cache.commit_all(&h_gather_writes);
+            tracing::info!(
+                status = "fallback",
+                reason = "candidate_five_second_reserve_after_construction",
+                "Selective root alpha paired transport"
+            );
+            return Ok(established_results);
+        }
+        let candidate_refs: Vec<_> = candidate_children.iter().collect();
+        // H is still deferred, so W observes the exact pre-H cache. Its writes
+        // receive a separate stage. The private deadline scope is
+        // non-bypassable by nested dense/wide dispatch.
+        let w_gather_stage = self.gather_score_cache.stage_writes();
+        let (candidate_call, candidate_finished_at) =
+            evaluate_selective_candidate_with_scopes(self, candidate_deadline, || {
+                self.batched_single_pass_multi_objective_children(
+                    graph,
+                    &candidate_refs,
+                    relu_nodes,
+                    objectives,
+                    thresholds,
+                    engine,
+                    prune_specs_to_union,
+                )
+            });
+        // The helper sampled this timestamp inside W's scope immediately after
+        // evaluation. Adjudicate before matching or reading candidate_call and
+        // before extracting its staged writes.
+        let candidate_completion = adjudicate_selective_candidate_completion(
+            candidate_finished_at,
+            candidate_deadline,
+            authoritative_deadline,
+            &candidate_call,
+        );
+        match candidate_completion {
+            SelectiveCandidateCompletion::HardDeadlineExpired => {
+                drop(w_gather_stage);
+                return Err(BatchedMultiObjectiveAdapterError::DeadlineExpired);
+            }
+            SelectiveCandidateCompletion::RetainEstablished(reason) => {
+                drop(w_gather_stage);
+                self.gather_score_cache.commit_all(&h_gather_writes);
+                tracing::info!(
+                    status = "fallback",
+                    reason,
+                    "Selective root alpha paired transport"
+                );
+                return Ok(established_results);
+            }
+            SelectiveCandidateCompletion::CandidateAvailable => {}
+        }
+        let w_gather_writes = w_gather_stage.finish();
+        let candidate_results =
+            candidate_call.expect("candidate availability requires a successful W evaluation");
+        if candidate_results.len() != established_results.len() {
+            self.gather_score_cache.commit_all(&h_gather_writes);
+            tracing::info!(
+                status = "fallback",
+                reason = "candidate_result_count_mismatch",
+                established = established_results.len(),
+                candidate = candidate_results.len(),
+                "Selective root alpha paired transport"
+            );
+            return Ok(established_results);
+        }
+
+        let candidate_fingerprints: Vec<u64> = candidate_children
+            .iter()
+            .map(|child| {
+                crate::beta_crown::engine::graph::propagation::batched::gather_score::beta_split_fingerprint(
+                    child.beta_state(),
+                )
+            })
+            .collect();
+        let mut fingerprint_counts = HashMap::<u64, usize>::new();
+        for &fingerprint in &candidate_fingerprints {
+            *fingerprint_counts.entry(fingerprint).or_default() += 1;
+        }
+
+        let mut selected = 0usize;
+        let mut retained = 0usize;
+        let mut selected_fingerprints = Vec::new();
+        let results: Vec<BatchedChildResult> = established_results
+            .into_iter()
+            .zip(candidate_results)
+            .zip(candidate_children)
+            .zip(candidate_fingerprints)
+            .map(
+                |(((established, candidate), candidate_child), candidate_fingerprint)| {
+                    let (
+                        h_bounds,
+                        h_node_cache,
+                        h_beta,
+                        h_alpha,
+                        h_cached_las,
+                        h_pruned,
+                        h_provenance,
+                    ) = match established {
+                        Ok(result) => result,
+                        Err(error) => return Err(error),
+                    };
+                    let established_evaluation = ChildArmEvaluation {
+                        bounds: h_bounds,
+                        continuation_state: (
+                            h_node_cache,
+                            h_beta,
+                            h_alpha,
+                            h_cached_las,
+                            h_pruned,
+                            h_provenance,
+                        ),
+                    };
+                    let (
+                        w_bounds,
+                        w_node_cache,
+                        w_beta,
+                        w_optimized_alpha,
+                        _w_cached_las,
+                        w_pruned,
+                        _w_provenance,
+                    ) = match candidate {
+                        Ok(result) => result,
+                        Err(error) => {
+                            retained += 1;
+                            tracing::debug!(
+                                ?error,
+                                reason = "candidate_child_refusal",
+                                "Selective root alpha paired transport"
+                            );
+                            let evaluation = established_evaluation;
+                            return Ok((
+                                evaluation.bounds,
+                                evaluation.continuation_state.0,
+                                evaluation.continuation_state.1,
+                                evaluation.continuation_state.2,
+                                evaluation.continuation_state.3,
+                                evaluation.continuation_state.4,
+                                evaluation.continuation_state.5,
+                            ));
+                        }
+                    };
+                    if established_evaluation.continuation_state.4.active_indices
+                        != w_pruned.active_indices
+                        || established_evaluation.continuation_state.4.verified_mask
+                            != w_pruned.verified_mask
+                        || fingerprint_counts
+                            .get(&candidate_fingerprint)
+                            .copied()
+                            .unwrap_or_default()
+                            != 1
+                    {
+                        retained += 1;
+                        tracing::debug!(
+                            reason = "candidate_identity_or_pruned_target_mismatch",
+                            "Selective root alpha paired transport"
+                        );
+                        let evaluation = established_evaluation;
+                        return Ok((
+                            evaluation.bounds,
+                            evaluation.continuation_state.0,
+                            evaluation.continuation_state.1,
+                            evaluation.continuation_state.2,
+                            evaluation.continuation_state.3,
+                            evaluation.continuation_state.4,
+                            evaluation.continuation_state.5,
+                        ));
+                    }
+
+                    // If the wide adapter did not optimize α, the exact state that
+                    // produced W is the explicitly transported candidate child.
+                    let w_alpha =
+                        w_optimized_alpha.unwrap_or_else(|| candidate_child.alpha_state().clone());
+                    let active_indices = established_evaluation
+                        .continuation_state
+                        .4
+                        .active_indices
+                        .clone();
+                    let candidate_evaluation = ChildArmEvaluation {
+                        bounds: w_bounds,
+                        continuation_state: (
+                            w_node_cache,
+                            w_beta,
+                            Some(w_alpha),
+                            vec![None; active_indices.len()],
+                            w_pruned,
+                            ChildContinuationStateProvenance::SelectiveExpandedWarmup,
+                        ),
+                    };
+                    match select_child_bounds_and_continuation_state(
+                        established_evaluation,
+                        candidate_evaluation,
+                        thresholds,
+                        &active_indices,
+                    ) {
+                        SelectivePairDecision::Established {
+                            evaluation,
+                            refusal,
+                        } => {
+                            retained += 1;
+                            tracing::debug!(
+                                reason = refusal.telemetry_name(),
+                                "Selective root alpha paired transport"
+                            );
+                            Ok((
+                                evaluation.bounds,
+                                evaluation.continuation_state.0,
+                                evaluation.continuation_state.1,
+                                evaluation.continuation_state.2,
+                                evaluation.continuation_state.3,
+                                evaluation.continuation_state.4,
+                                evaluation.continuation_state.5,
+                            ))
+                        }
+                        SelectivePairDecision::ExpandedWarmup {
+                            published_bounds,
+                            continuation_state,
+                        } => {
+                            selected += 1;
+                            selected_fingerprints.push(candidate_fingerprint);
+                            Ok((
+                                published_bounds,
+                                continuation_state.0,
+                                continuation_state.1,
+                                continuation_state.2,
+                                continuation_state.3,
+                                continuation_state.4,
+                                continuation_state.5,
+                            ))
+                        }
+                    }
+                },
+            )
+            .collect();
+        if authoritative_deadline_expired(Instant::now(), authoritative_deadline) {
+            // Neither staged arm may publish after the hard authority expires.
+            return Err(BatchedMultiObjectiveAdapterError::DeadlineExpired);
+        }
+        // Publish the per-child choice only after the terminal deadline check.
+        // One cache lock prevents readers from observing an intermediate image.
+        self.gather_score_cache.commit_pair_selection(
+            &h_gather_writes,
+            &w_gather_writes,
+            &selected_fingerprints,
+        );
+        tracing::info!(
+            status = "complete",
+            selected,
+            retained,
+            "Selective root alpha paired transport"
+        );
+        Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod deadline_outcome_tests {
+    use super::*;
+
+    struct BoundedRefusalEngine;
+
+    impl GemmEngine for BoundedRefusalEngine {
+        fn gemm_f32(
+            &self,
+            _m: usize,
+            _k: usize,
+            _n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> ny_core::Result<Vec<f32>> {
+            unreachable!("adapter classification test does not dispatch GEMM")
+        }
+
+        fn forbids_unbounded_cpu_fallback(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn adapter_preserves_deadline_errors_as_terminal_outcomes() {
+        let ordinary = ny_core::NaiveCpuGemmEngine;
+        let deadline = NyError::DeadlineExceeded("test deadline".to_string());
+        assert_eq!(
+            classify_adapter_error(&deadline, &ordinary),
+            BatchedMultiObjectiveAdapterError::DeadlineExpired
+        );
+
+        let numerical = NyError::InvalidSpec("test failure".to_string());
+        assert_eq!(
+            classify_adapter_error(&numerical, &ordinary),
+            BatchedMultiObjectiveAdapterError::Fallback
+        );
+
+        let memory = NyError::CpuMemoryExceeded {
+            required_bytes: 2,
+            budget_bytes: 1,
+            site: "adapter classification test",
+        };
+        assert_eq!(
+            classify_adapter_error(&memory, &ordinary),
+            BatchedMultiObjectiveAdapterError::Fallback
+        );
+        assert_eq!(
+            classify_adapter_error(&memory, &BoundedRefusalEngine),
+            BatchedMultiObjectiveAdapterError::ResourceRefused
+        );
+    }
+
+    #[test]
+    fn finite_refusal_fallback_conservatively_refuses_without_aggregate_receipt() {
+        assert!(!finite_refusal_fallback_admitted(0));
+        assert!(!finite_refusal_fallback_admitted(1));
+        assert!(
+            !finite_refusal_fallback_admitted(2),
+            "one or more retained child maps require a truthful aggregate receipt"
+        );
+    }
+
+    #[test]
+    fn candidate_ok_after_private_cutoff_retains_h_before_reading_w() {
+        let now = Instant::now();
+        let private = now + std::time::Duration::from_secs(5);
+        let hard = now + std::time::Duration::from_secs(10);
+        assert_eq!(
+            adjudicate_selective_candidate_completion(private, Some(private), Some(hard), &Ok(()),),
+            SelectiveCandidateCompletion::RetainEstablished(
+                "candidate_private_deadline_after_evaluation"
+            )
+        );
+    }
+
+    #[test]
+    fn candidate_ok_after_hard_deadline_is_typed_expiry() {
+        let now = Instant::now();
+        let private = now + std::time::Duration::from_secs(5);
+        let hard = now + std::time::Duration::from_secs(10);
+        assert_eq!(
+            adjudicate_selective_candidate_completion(hard, Some(private), Some(hard), &Ok(()),),
+            SelectiveCandidateCompletion::HardDeadlineExpired
+        );
+    }
+
+    #[test]
+    fn candidate_fallback_cannot_mask_hard_deadline() {
+        let now = Instant::now();
+        let private = now + std::time::Duration::from_secs(5);
+        let hard = now + std::time::Duration::from_secs(10);
+        assert_eq!(
+            adjudicate_selective_candidate_completion(
+                hard,
+                Some(private),
+                Some(hard),
+                &Err::<(), _>(BatchedMultiObjectiveAdapterError::Fallback),
+            ),
+            SelectiveCandidateCompletion::HardDeadlineExpired
+        );
+    }
+
+    #[test]
+    fn rejected_w_suppresses_complete_clip_and_discards_w_but_publishes_h() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(crate::GraphNode::from_input(
+            "relu",
+            crate::Layer::ReLU(crate::ReLULayer),
+        ));
+        graph.set_output("relu");
+        let input = BoundedTensor::new(
+            ndarray::arr1(&[-1.0_f32]).into_dyn(),
+            ndarray::arr1(&[1.0_f32]).into_dyn(),
+        )
+        .expect("valid input");
+        let root_bounds = graph
+            .collect_node_bounds(&input)
+            .expect("root bounds")
+            .into_iter()
+            .map(|(name, bounds)| (name, Arc::new(bounds)))
+            .collect();
+        let verifier = BetaCrownVerifier::default();
+        assert!(verifier.complete_clip_root_bounds_cache.store_finalized(
+            &graph,
+            &input,
+            &root_bounds,
+        ));
+        let complete_clip_before = verifier
+            .complete_clip_root_bounds_cache
+            .test_identity_image();
+
+        let h_stage = verifier.gather_score_cache.stage_writes();
+        verifier
+            .gather_score_cache
+            .insert(901, vec![("h".to_string(), 1, 1.0)]);
+        let h_writes = h_stage.finish();
+
+        let w_stage = verifier.gather_score_cache.stage_writes();
+        let (candidate_call, candidate_finished_at) =
+            evaluate_selective_candidate_with_scopes(&verifier, None, || {
+                assert!(
+                    verifier
+                        .complete_clip_deadline_overrides
+                        .complete_clip_suppressed(),
+                    "the full speculative W evaluation must suppress Complete Clipping"
+                );
+                verifier
+                    .gather_score_cache
+                    .insert(902, vec![("w".to_string(), 2, 2.0)]);
+                Err::<(), _>(BatchedMultiObjectiveAdapterError::Fallback)
+            });
+        assert_eq!(
+            adjudicate_selective_candidate_completion(
+                candidate_finished_at,
+                None,
+                None,
+                &candidate_call,
+            ),
+            SelectiveCandidateCompletion::RetainEstablished("candidate_adapter_refusal")
+        );
+        drop(w_stage);
+        verifier.gather_score_cache.commit_all(&h_writes);
+
+        assert!(verifier.gather_score_cache.get(901).is_some());
+        assert!(
+            verifier.gather_score_cache.get(902).is_none(),
+            "rejected W advisory writes must be discarded"
+        );
+        assert_eq!(
+            verifier
+                .complete_clip_root_bounds_cache
+                .test_identity_image(),
+            complete_clip_before,
+            "rejected W must leave Complete-Clipping cache bytes and identities unchanged"
+        );
+        assert!(
+            !verifier
+                .complete_clip_deadline_overrides
+                .complete_clip_suppressed(),
+            "suppression scope must restore after W"
+        );
     }
 }
 
@@ -726,7 +1667,8 @@ impl BetaCrownVerifier {
         // copies); the clip's `merge_bounds` intersects tightened-against-this
         // and replaces entries with fresh Arcs, so the result is
         // (inherited) ∩ (constrained concretization) — never looser.
-        let mut bounds_cache: HashMap<String, Arc<BoundedTensor>> = child.node_bounds().clone();
+        let mut bounds_cache: HashMap<String, Arc<BoundedTensor>> =
+            child.node_bounds().to_shared_hash_map();
         let before: HashMap<String, (f32, f32)> = bounds_cache
             .iter()
             .map(|(k, v)| {
@@ -888,7 +1830,7 @@ impl BetaCrownVerifier {
 
         // Constrained concretization + sound intersection, in place on the cache.
         // #clip-resnet: NY_CLIP_INTERM_TOPK overrides the per-layer neuron budget
-        // (default config.clip_interm_topk=3) — cost-only (more neurons tightened),
+        // (default config.clip_interm_topk=20) — cost-only (more neurons tightened),
         // never soundness (merge_bounds only intersects).
         let clip_topk = std::env::var("NY_CLIP_INTERM_TOPK")
             .ok()
@@ -941,7 +1883,9 @@ impl BetaCrownVerifier {
     }
 }
 
-pub(super) fn graph_bab_domain_shim(child: &MultiObjectiveGraphBabDomain) -> GraphBabDomain {
+pub(in crate::beta_crown::engine::graph::multi_objective) fn graph_bab_domain_shim(
+    child: &MultiObjectiveGraphBabDomain,
+) -> GraphBabDomain {
     let (lower_bound, upper_bound) = child
         .objective_bounds()
         .first()
@@ -949,7 +1893,7 @@ pub(super) fn graph_bab_domain_shim(child: &MultiObjectiveGraphBabDomain) -> Gra
         .unwrap_or((0.0, 0.0));
     GraphBabDomain {
         history: child.history().clone(),
-        node_bounds: child.node_bounds().clone(),
+        node_bounds: child.node_bounds().to_shared_hash_map(),
         lower_bound,
         upper_bound,
         depth: child.depth(),

@@ -61,7 +61,8 @@
 //! (piecewise, not polynomial) and are reported as ineligible outright.
 
 use ndarray::{Array1, Array2};
-use ny_cert::crown_deep::{DeepReluProblem, QuadTerm};
+use ny_cert::crown_deep::{DeepCrownError, DeepReluProblem, QuadTerm};
+use ny_cert::fp_margin::deployed_fp_output_margin;
 use ny_cert::{check_entailment, check_farkas, entailment_to_json, farkas_to_json, Rat, RatError};
 use ny_core::Bound;
 use ny_propagate::{GraphNetwork, Layer, NETWORK_INPUT};
@@ -74,6 +75,29 @@ pub struct DominanceCertificate {
     pub certificate_json: String,
     /// The exact certified lower bound on `f − g`, as `"n/d"`.
     pub lower_bound: String,
+    /// The deployed-f32 rounding margin folded into the certificate
+    /// threshold, as `"n/d"` (same encoding as [`Self::lower_bound`]), when
+    /// [`DominanceCertOptions::deployed_fp_margin`] was requested. `None` for
+    /// the default real-semantics-only certificate (threshold `0`).
+    pub fp_margin: Option<String>,
+}
+
+/// Options for [`certify_dominance_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DominanceCertOptions {
+    /// Fold the deployed network's f32 rounding error into the certificate.
+    ///
+    /// The certificates prove properties of `f`'s IDEAL real-valued
+    /// semantics; the deployed network executes in f32. When set, the
+    /// certificate threshold becomes `delta =`
+    /// Calling [`ny_cert::fp_margin::deployed_fp_output_margin`] with `f` computes an exact
+    /// rational bound on `|fl32(f(x)) − f(x)|` over the box — instead of
+    /// `0`, so the certified `f(x) − g(x) ≥ delta` implies
+    /// `fl32(f(x)) − g(x) ≥ 0` for the deployed network (`g` is the exact
+    /// analytic ground truth and contributes no rounding). The margin used
+    /// is recorded in [`DominanceCertificate::fp_margin`]. Default `false`:
+    /// byte-identical to the historical threshold-`0` certificate.
+    pub deployed_fp_margin: bool,
 }
 
 /// Why a dominance certificate could not be emitted. Fail-closed and honest:
@@ -132,6 +156,22 @@ pub enum DominanceCertError {
     /// indicates a producer bug; the artifact is refused rather than emitted.
     #[error("certificate self-check failed: {0}")]
     SelfCheck(String),
+
+    /// The deployed-f32 rounding margin was requested
+    /// ([`DominanceCertOptions::deployed_fp_margin`]) but exceeds the best
+    /// certified real-semantics lower bound on `f − g`: the real margin is
+    /// too thin to absorb the deployed network's rounding error, so no
+    /// deployed-sound certificate can be emitted.
+    #[error(
+        "deployed-f32 rounding margin {margin} exceeds the certified lower bound {bound}: \
+         the real-semantics margin cannot absorb the deployed network's rounding error"
+    )]
+    FpMarginAboveBound {
+        /// The requested margin `delta`, as `"n/d"`.
+        margin: String,
+        /// The best certified lower bound, as `"n/d"`.
+        bound: String,
+    },
 }
 
 /// Result alias for this module.
@@ -156,6 +196,27 @@ pub fn certify_dominance(
     f: &GraphNetwork,
     g: &GraphNetwork,
     input_bounds: &[Bound],
+) -> CertResult<DominanceCertificate> {
+    certify_dominance_with(f, g, input_bounds, &DominanceCertOptions::default())
+}
+
+/// Like [`certify_dominance`], with options. With
+/// [`DominanceCertOptions::deployed_fp_margin`] set, the certificate
+/// threshold is the deployed-f32 rounding margin `delta` of `f` instead of
+/// `0`, so the emitted proof covers the DEPLOYED (f32-executing) network,
+/// not only its ideal real-valued semantics; the margin used is recorded in
+/// [`DominanceCertificate::fp_margin`]. Default options reproduce
+/// [`certify_dominance`] byte-identically.
+///
+/// # Errors
+/// As [`certify_dominance`]; additionally
+/// [`DominanceCertError::FpMarginAboveBound`] when the margin was requested
+/// but the certified real-semantics lower bound cannot absorb it.
+pub fn certify_dominance_with(
+    f: &GraphNetwork,
+    g: &GraphNetwork,
+    input_bounds: &[Bound],
+    options: &DominanceCertOptions,
 ) -> CertResult<DominanceCertificate> {
     let folded = fold_ground_truth(g)?;
     let g_coeffs = folded.lin.clone();
@@ -203,6 +264,20 @@ pub fn certify_dominance(
         alpha: None,
         interm_round: false,
     };
+    // Opt-in deployed-FP fold: the threshold becomes the exact rational bound
+    // on |fl32(f(x)) − f(x)| over the box (g is exact analytic ground truth —
+    // only f executes in f32), so `f − g ≥ delta` in real semantics implies
+    // `fl32(f)(x) ≥ g(x)` for the deployed network. Default: threshold 0,
+    // byte-identical to the historical certificate.
+    let fp_margin =
+        if options.deployed_fp_margin {
+            Some(deployed_fp_output_margin(&problem).map_err(|e| {
+                DominanceCertError::Construction(format!("deployed-FP margin: {e}"))
+            })?)
+        } else {
+            None
+        };
+    let threshold = fp_margin.unwrap_or(Rat::ZERO);
     // The CROWN lower-envelope slope α is a free parameter: EVERY α ∈ [0, 1]
     // yields sound premises (the checker validates the combination either
     // way). The adaptive default can be a poor choice for nets with paired
@@ -221,15 +296,18 @@ pub fn certify_dominance(
     ];
     let mut certified = None;
     let mut first_error: Option<String> = None;
+    // Best (largest) certified bound refused only because it sat below the
+    // requested FP margin — surfaced as the dedicated obstruction below.
+    let mut threshold_refusal: Option<(String, String)> = None;
     for alpha in alpha_policies {
         problem.alpha = alpha;
         // Squares present => the quadratic producer (pow2 envelope premises,
         // grounded in the kernel-checked pow2_tangent / pow2_secant theorems);
         // otherwise the pure-linear producer, exactly as before.
         let attempt = if folded.squares.is_empty() {
-            problem.certify_difference_linear(&g_coeffs, g_offset, Rat::ZERO)
+            problem.certify_difference_linear(&g_coeffs, g_offset, threshold)
         } else {
-            problem.certify_difference_quadratic(&g_coeffs, g_offset, &folded.squares, Rat::ZERO)
+            problem.certify_difference_quadratic(&g_coeffs, g_offset, &folded.squares, threshold)
         };
         match attempt {
             Ok(cert) => {
@@ -237,11 +315,26 @@ pub fn certify_dominance(
                 break;
             }
             Err(e) => {
+                if let DeepCrownError::ThresholdAboveBound {
+                    threshold: t,
+                    bound,
+                } = &e
+                {
+                    threshold_refusal.get_or_insert_with(|| (t.clone(), bound.clone()));
+                }
                 first_error.get_or_insert_with(|| e.to_string());
             }
         }
     }
     let Some(certified) = certified else {
+        // A ThresholdAboveBound refusal under the FP-margin option means the
+        // proof machinery worked — the real-semantics margin is simply too
+        // thin to absorb deployed rounding. Name that precisely.
+        if fp_margin.is_some() {
+            if let Some((margin, bound)) = threshold_refusal {
+                return Err(DominanceCertError::FpMarginAboveBound { margin, bound });
+            }
+        }
         return Err(DominanceCertError::Construction(
             first_error.unwrap_or_else(|| "exact CROWN did not close the property".to_string()),
         ));
@@ -258,11 +351,13 @@ pub fn certify_dominance(
         r.to_clean_string()
             .map_err(|e: RatError| DominanceCertError::Construction(e.to_string()))
     };
-    let lower_bound = format!(
-        "{}/{}",
-        certified.lower_bound.num(),
-        certified.lower_bound.den()
-    );
+    // Preserve the public v1 `n/d` representation (including denominator 1)
+    // while failing closed on an unhealthy rational arena.
+    let (lower_num, lower_den) = certified
+        .lower_bound
+        .checked_parts()
+        .map_err(|e| DominanceCertError::Construction(e.to_string()))?;
+    let lower_bound = format!("{lower_num}/{lower_den}");
     let g_coeff_strings = g_coeffs
         .iter()
         .map(|c| ratstr(*c))
@@ -293,7 +388,8 @@ pub fn certify_dominance(
          envelope premises grounded in the kernel-checked pow2_tangent / pow2_secant \
          corpus theorems)"
     };
-    let payload = serde_json::json!({
+    let fp_margin_string = fp_margin.map(|delta| format!("{}/{}", delta.num(), delta.den()));
+    let mut payload = serde_json::json!({
         "format": "ny-cert/ground-truth-dominance/v1",
         "claim": claim,
         "ground_truth": {
@@ -305,11 +401,17 @@ pub fn certify_dominance(
         "entailment": entailment,
         "farkas": farkas,
     });
+    // Only inserted when the option is on: the default payload stays
+    // byte-identical to the historical (threshold-0) certificate.
+    if let Some(margin) = &fp_margin_string {
+        payload["fp_margin"] = serde_json::json!(margin);
+    }
     let certificate_json = serde_json::to_string_pretty(&payload)
         .map_err(|e| DominanceCertError::Construction(format!("serialization: {e}")))?;
     Ok(DominanceCertificate {
         certificate_json,
         lower_bound,
+        fp_margin: fp_margin_string,
     })
 }
 
@@ -442,7 +544,7 @@ fn fold_ground_truth(g: &GraphNetwork) -> CertResult<FoldedGroundTruth> {
             .ok_or_else(|| ineligible(format!("dangling node reference '{name}'")))?;
         if node.inputs().iter().any(|i| i == NETWORK_INPUT) {
             if let Layer::Linear(lin) = node.layer() {
-                let w: &Array2<f32> = &lin.weight;
+                let w: &Array2<f32> = lin.weight();
                 input_dim = Some(w.ncols());
                 break;
             }
@@ -628,7 +730,7 @@ fn fold_node(
 fn linear_to_rats(
     lin: &ny_propagate::layers::LinearLayer,
 ) -> CertResult<(Vec<Vec<Rat>>, Vec<Rat>)> {
-    let w: &Array2<f32> = &lin.weight;
+    let w: &Array2<f32> = lin.weight();
     let mut rows = Vec::with_capacity(w.nrows());
     for row in w.rows() {
         let mut r = Vec::with_capacity(row.len());
@@ -637,7 +739,7 @@ fn linear_to_rats(
         }
         rows.push(r);
     }
-    let bias = match &lin.bias {
+    let bias = match lin.bias() {
         Some(b) => {
             let b: &Array1<f32> = b;
             b.iter()
@@ -911,6 +1013,81 @@ mod tests {
             .map_or((cert.lower_bound.as_str(), "1"), |(n, d)| (n, d));
         let lb: f64 = num.parse::<f64>().unwrap() / den.parse::<f64>().unwrap();
         assert!((0.0..=3.0).contains(&lb), "lower bound {lb} out of range");
+    }
+
+    #[test]
+    fn fp_margin_option_certifies_and_records_the_margin() {
+        // Same plane case as `plane_dominance_certifies_end_to_end` (real
+        // margin 2.5, vastly above the ~1e-6 deployed-FP delta): the
+        // certificate must still close with `threshold = delta`, record the
+        // margin, and self-check.
+        let f = abs_sum_net();
+        let g = signed_plane_distance([0.0, 0.0, 1.0], -0.5).expect("plane builds");
+        let opts = DominanceCertOptions {
+            deployed_fp_margin: true,
+        };
+        let cert =
+            certify_dominance_with(&f, &g, &unit_box(), &opts).expect("margin case certifies");
+        let margin = cert.fp_margin.as_deref().expect("margin is recorded");
+        let (num, den) = margin.split_once('/').expect("margin is n/d");
+        let m: f64 = num.parse::<f64>().unwrap() / den.parse::<f64>().unwrap();
+        assert!(
+            m > 0.0 && m < 1e-3,
+            "deployed-FP margin should be tiny and positive, got {m}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&cert.certificate_json).expect("cert JSON parses");
+        assert_eq!(parsed["fp_margin"], margin, "payload carries the margin");
+        // The proved conclusion is now `y >= delta`, not `y >= 0`.
+        assert_eq!(parsed["entailment"]["conclusion"]["constant"], margin);
+
+        // Default behavior is untouched: no field, no payload key, and the
+        // payload is byte-identical to the historical certificate.
+        let base = certify_dominance(&f, &g, &unit_box()).expect("baseline certifies");
+        assert!(base.fp_margin.is_none(), "default records no margin");
+        assert!(
+            !base.certificate_json.contains("fp_margin"),
+            "default payload has no fp_margin key"
+        );
+        let base_with =
+            certify_dominance_with(&f, &g, &unit_box(), &DominanceCertOptions::default())
+                .expect("default options certify");
+        assert_eq!(
+            base.certificate_json, base_with.certificate_json,
+            "default options reproduce certify_dominance byte-identically"
+        );
+    }
+
+    #[test]
+    fn fp_margin_exceeding_the_bound_is_surfaced_as_the_dedicated_error() {
+        // g(x) = x2 + 2: f − g = |x0| + |x1| + 1 − x2 has true minimum 0 on
+        // the box and exact CROWN certifies the bound EXACTLY 0 — so the
+        // threshold-0 baseline certifies, while any positive deployed-FP
+        // margin cannot be absorbed and must surface as FpMarginAboveBound.
+        let f = abs_sum_net();
+        let g = signed_plane_distance([0.0, 0.0, 1.0], 2.0).expect("plane builds");
+        certify_dominance(&f, &g, &unit_box()).expect("threshold-0 baseline certifies");
+
+        let opts = DominanceCertOptions {
+            deployed_fp_margin: true,
+        };
+        let err = certify_dominance_with(&f, &g, &unit_box(), &opts)
+            .expect_err("zero real margin cannot absorb deployed rounding");
+        let DominanceCertError::FpMarginAboveBound { margin, bound } = err else {
+            panic!("expected FpMarginAboveBound, got: {err:?}");
+        };
+        assert_eq!(bound, "0/1", "the certified bound is exactly zero");
+        // The refused margin is the positive delta. Its numerator is a
+        // bignum (far beyond i64), so check sign/nonzero structurally.
+        let (num, den) = margin.split_once('/').expect("margin is n/d");
+        assert!(
+            num.chars().all(|c| c.is_ascii_digit()) && num != "0",
+            "the refused margin numerator is a positive integer: {margin}"
+        );
+        assert!(
+            den.chars().all(|c| c.is_ascii_digit()) && den != "0",
+            "the refused margin denominator is a positive integer: {margin}"
+        );
     }
 
     #[test]

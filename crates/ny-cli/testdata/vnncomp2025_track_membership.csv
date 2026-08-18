@@ -1,0 +1,29 @@
+# Snapshot of VNN-COMP/vnncomp2025_results
+# commit ea89fbc2518b6729f17c96eeec22c56c88e496a9
+# SCORING-SMALL-TOL/settings.py and SCORING-ZERO-TOL/settings.py
+regular,acasxu_2023
+regular,cersyve
+regular,cgan_2023
+regular,cifar100_2024
+regular,collins_rul_cnn_2022
+regular,cora_2024
+regular,dist_shift_2023
+regular,linearizenn_2024
+regular,malbeware
+regular,metaroom_2023
+regular,nn4sys
+regular,safenlp_2024
+regular,sat_relu
+regular,soundnessbench
+regular,tinyimagenet_2024
+regular,tllverifybench_2023
+extended,cctsdb_yolo_2023
+extended,collins_aerospace_benchmark
+extended,lsnc_relu
+extended,ml4acopf_2023
+extended,ml4acopf_2024
+extended,relusplitter
+extended,traffic_signs_recognition_2023
+extended,vggnet16_2022
+extended,vit_2023
+extended,yolo_2023

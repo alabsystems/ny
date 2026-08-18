@@ -27,17 +27,45 @@ struct SmallClipCase {
     objective: [f32; 2],
 }
 
+/// Generate the bounded scalar corpus through integer sampling.
+///
+/// `proptest` 1.11's debug float sampler can select an interval just beyond a
+/// finite range endpoint and then trip its own clamping assertion. That is a
+/// generator failure, before the clipping property receives a case. Integer
+/// sampling avoids that dependency bug while retaining millions of interior
+/// values and explicitly increasing coverage at the signed endpoints and zero.
+fn signed_clip_scalar() -> impl Strategy<Value = f32> {
+    prop_oneof![
+        Just(-2.0_f32),
+        Just(-0.0_f32),
+        Just(0.0_f32),
+        Just(2.0_f32),
+        (-2_000_000_i32..2_000_001_i32).prop_map(|value| value as f32 / 1_000_000.0),
+    ]
+}
+
+fn positive_clip_margin() -> impl Strategy<Value = f32> {
+    prop_oneof![
+        Just(0.1_f32),
+        Just(2.0_f32),
+        (100_000_u32..2_000_001_u32).prop_map(|value| value as f32 / 1_000_000.0),
+    ]
+}
+
 fn small_clip_case() -> impl Strategy<Value = SmallClipCase> {
     (
-        -2.0f32..2.0,
-        -2.0f32..2.0,
-        0.1f32..2.0,
-        0.1f32..2.0,
-        0.1f32..2.0,
-        0.1f32..2.0,
-        prop::collection::vec(-2.0f32..2.0, 6),
-        prop::collection::vec(0.0f32..2.0, 3),
-        prop::collection::vec(-2.0f32..2.0, 2),
+        signed_clip_scalar(),
+        signed_clip_scalar(),
+        positive_clip_margin(),
+        positive_clip_margin(),
+        positive_clip_margin(),
+        positive_clip_margin(),
+        prop::collection::vec(signed_clip_scalar(), 6),
+        prop::collection::vec(
+            (0_u32..2_000_001_u32).prop_map(|value| value as f32 / 1_000_000.0),
+            3,
+        ),
+        prop::collection::vec(signed_clip_scalar(), 2),
     )
         .prop_map(
             |(

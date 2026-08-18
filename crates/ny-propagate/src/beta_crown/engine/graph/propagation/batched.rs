@@ -22,8 +22,12 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ndarray::{Array1, Array2};
+use ny_core::wide_lane_telemetry::{
+    note_wide_lane_candidate, note_wide_lane_decline, WideLaneDecline,
+};
 use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 
@@ -42,13 +46,18 @@ use crate::{GraphNetwork, Layer, LinearBounds, NETWORK_INPUT};
 
 use super::super::super::BetaCrownVerifier;
 
+mod active_compaction_telemetry;
 mod adapters;
 mod backward_core;
 mod backward_stack;
 mod batched_bwd;
+pub(crate) mod comprehensive_cpu;
 mod context;
 mod indexed_pending;
-pub(in crate::beta_crown::engine::graph) mod interm_refine;
+pub(crate) mod interm_refine;
+pub(crate) mod intermediate_sweep;
+#[allow(dead_code)] // Observation-only CPU differential oracle; no production caller.
+pub(crate) mod multi_depth_oracle;
 mod spec_adapters;
 /// Re-export of the spec-gate test mutex so gate-forcing parity tests OUTSIDE
 /// this module (e.g. `input_split::f64_tail::tests`, alpha-tail) serialize
@@ -68,6 +77,74 @@ use indexed_pending::IndexedPendingLinearBounds;
 static CUDA_WIDE_DISPATCH_ATTEMPT_REPORTED: AtomicBool = AtomicBool::new(false);
 static CUDA_WIDE_DISPATCH_SUCCESS_REPORTED: AtomicBool = AtomicBool::new(false);
 static CUDA_WIDE_DISPATCH_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
+
+const M2_RESIDENT_CUT_SHADOW_SLICE: Duration = Duration::from_secs(2);
+const M2_RESIDENT_CUT_DOWNSTREAM_RESERVE: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentCutShadowBudget {
+    deadline: std::time::Instant,
+    downstream_reserve: Duration,
+}
+
+/// Admit a resident-cut observation only while an explicit child deadline
+/// leaves the verifier a fixed downstream tail.
+///
+/// M1 keeps its historical authority deadline. The more expensive projected
+/// M2 search receives at most two seconds and is skipped unless at least one
+/// second remains after that child deadline.
+fn resident_cut_shadow_budget(
+    authority_deadline: Option<std::time::Instant>,
+    projected_m2: bool,
+    now: std::time::Instant,
+) -> Option<ResidentCutShadowBudget> {
+    let authority_deadline = authority_deadline?;
+    if now >= authority_deadline {
+        return None;
+    }
+    if !projected_m2 {
+        return Some(ResidentCutShadowBudget {
+            deadline: authority_deadline,
+            downstream_reserve: Duration::ZERO,
+        });
+    }
+
+    let latest_child_deadline =
+        authority_deadline.checked_sub(M2_RESIDENT_CUT_DOWNSTREAM_RESERVE)?;
+    if now >= latest_child_deadline {
+        return None;
+    }
+    let sliced_deadline = now
+        .checked_add(M2_RESIDENT_CUT_SHADOW_SLICE)
+        .unwrap_or(latest_child_deadline)
+        .min(latest_child_deadline);
+    Some(ResidentCutShadowBudget {
+        deadline: sliced_deadline,
+        downstream_reserve: M2_RESIDENT_CUT_DOWNSTREAM_RESERVE,
+    })
+}
+
+/// Execute optional telemetry only after every expected historical domain
+/// result exists, then return that exact aggregate without inspecting or
+/// combining the telemetry return value.
+///
+/// This tiny boundary is shared by wide and serial routes so an unavailable,
+/// rejected, failed, or late resident-cut observation has no data path into
+/// the verdict-bearing values. A historical `None`, an empty batch, and a
+/// partial-domain aggregate never run the observation.
+fn retain_completed_multi_domain_result_after_shadow<T, R>(
+    historical: Option<T>,
+    completed_domains: usize,
+    expected_domains: usize,
+    enabled: bool,
+    shadow: impl FnOnce(&T) -> R,
+) -> Option<T> {
+    let historical = historical?;
+    if enabled && expected_domains > 0 && completed_domains == expected_domains {
+        shadow(&historical);
+    }
+    Some(historical)
+}
 
 fn report_cuda_wide_dispatch_attempt_once(
     lane: &'static str,
@@ -113,6 +190,18 @@ mod tests_nan_safety;
 mod tests_skeleton;
 #[cfg(test)]
 mod tests_soundness;
+
+/// Exact layout/validity gate for objective intervals returned by a GPU β
+/// pass. A pass is atomic: one malformed row rejects the whole iterate.
+fn gpu_objective_intervals_valid(lower: &[f32], upper: &[f32], rows: usize) -> bool {
+    rows > 0
+        && lower.len() == rows
+        && upper.len() == rows
+        && lower
+            .iter()
+            .zip(upper)
+            .all(|(&lower, &upper)| lower.is_finite() && upper.is_finite() && lower <= upper)
+}
 
 /// Per-domain β-optimization request for the GPU resnet fast-path
 /// (#w4-split-tightening).
@@ -247,6 +336,121 @@ fn build_nodes_by_idx<'a>(
         .collect()
 }
 
+enum InputRelativeNodeSeed<'a> {
+    Identity,
+    SelectedIdentity(&'a [usize]),
+}
+
+/// Shared fail-closed implementation for full-identity and selected-identity
+/// input-relative node CROWN.
+#[allow(clippy::too_many_arguments)]
+fn backward_input_relative_bounds_at_node_impl(
+    graph: &GraphNetwork,
+    seed_node: &str,
+    seed: InputRelativeNodeSeed<'_>,
+    bounds_cache: &HashMap<String, Arc<BoundedTensor>>,
+    constrained_input: &BoundedTensor,
+    beta_state: Option<&GraphBetaState>,
+    alpha_state: Option<&GraphDomainAlphaState>,
+    engine: &dyn GemmEngine,
+    // Cooperative wall-clock bound for one targeted backward. Checked before
+    // allocation and between graph nodes, and threaded into layer dispatch so
+    // deadline-aware GPU/conv kernels can refuse. Any expiry returns `None`;
+    // callers retain their original sound box (fail closed).
+    deadline: Option<std::time::Instant>,
+) -> Option<LinearBounds> {
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return None;
+    }
+    let plan = CrownDispatchPlan::build(graph).ok()?;
+    let seed_idx = plan.index_of(seed_node)?;
+    let seed_dim = bounds_cache.get(seed_node)?.len();
+    if seed_dim == 0 {
+        return None;
+    }
+    let nodes_by_idx = build_nodes_by_idx(graph, &plan).ok()?;
+
+    let seed_bounds = match seed {
+        InputRelativeNodeSeed::Identity => LinearBounds::identity(seed_dim),
+        InputRelativeNodeSeed::SelectedIdentity(selected_neurons) => {
+            if selected_neurons.is_empty() {
+                return None;
+            }
+            let mut spec = Array2::zeros((selected_neurons.len(), seed_dim));
+            // Preserve the caller's exact row order (including duplicate
+            // neurons). Every invalid index refuses the complete capture.
+            for (row, &neuron_idx) in selected_neurons.iter().enumerate() {
+                if neuron_idx >= seed_dim {
+                    return None;
+                }
+                spec[[row, neuron_idx]] = 1.0;
+            }
+            LinearBounds::from_spec_matrix(spec).ok()?
+        }
+    };
+
+    // Seed at `seed_node`, then fold backward through every node below it to
+    // `NETWORK_INPUT` (obj = A · input + b).
+    let mut pending = IndexedPendingLinearBounds::new(&plan, 1);
+    pending.seed_idx(seed_idx, 0, seed_bounds).ok()?;
+
+    let net_in_dim = constrained_input.len();
+    // #lsnc-shared-fwd: dispatch_node_backward borrows a slice of cache refs.
+    let bounds_caches: [&HashMap<String, Arc<BoundedTensor>>; 1] = [bounds_cache];
+    let constrained_inputs = std::slice::from_ref(constrained_input);
+    let beta_states: [Option<&GraphBetaState>; 1] = [beta_state];
+    let alpha_states: [Option<&GraphDomainAlphaState>; 1] = [alpha_state];
+
+    for &idx in &plan.reverse_order {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return None;
+        }
+        let node_lbs = match pending.take_idx(idx) {
+            Some(lbs) => lbs,
+            None => continue,
+        };
+        if !node_lbs.iter().any(|lb| lb.is_some()) {
+            continue;
+        }
+        backward_core::dispatch_node_backward(
+            plan.name_of(idx),
+            nodes_by_idx[idx],
+            node_lbs,
+            constrained_inputs,
+            &bounds_caches,
+            &beta_states,
+            &alpha_states,
+            &mut pending,
+            1,
+            net_in_dim,
+            engine,
+            deadline,
+            None, // no shared MulBinary alphas
+            false,
+        )
+        .ok()?;
+    }
+
+    // Do not publish a candidate that completed after its scheduling envelope.
+    // The caller keeps the pre-pass sound reference box unchanged.
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return None;
+    }
+    let mut lb = pending.take_network_input()?.into_iter().next().flatten()?;
+
+    // SOUNDNESS (#clip-interm-resnet, #vnncomp-aw-soundness): the raw backward
+    // `LinearBounds` at NETWORK_INPUT still carries NY's certified per-coefficient
+    // error (`lower_a_err`/`upper_a_err`). A consumer of `into_parts` would DROP
+    // that error, so discharge it first. The fold moves every error penalty
+    // OUTWARD into the bias over this exact child input box and zeros the error.
+    // A non-finite penalty remains present and therefore refuses the capture.
+    lb.fold_coeff_err_over_box_eager(constrained_input);
+    if lb.has_coeff_err() {
+        return None;
+    }
+    Some(lb)
+}
+
 /// #clip-interm-resnet (dark, `NY_CLIP_INTERM_RESNET=1`): FINITE input-relative
 /// linear bounds for one node via a plain SOUND CROWN backward seeded with the
 /// identity at that node.
@@ -291,86 +495,53 @@ pub(in crate::beta_crown::engine::graph) fn backward_input_relative_bounds_at_no
     // CROWN width vs the heuristic-α width.
     alpha_state: Option<&GraphDomainAlphaState>,
 ) -> Option<LinearBounds> {
-    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-        return None;
-    }
-    let plan = CrownDispatchPlan::build(graph).ok()?;
-    let seed_idx = plan.index_of(seed_node)?;
-    let seed_dim = bounds_cache.get(seed_node)?.len();
-    if seed_dim == 0 {
-        return None;
-    }
-    let nodes_by_idx = build_nodes_by_idx(graph, &plan).ok()?;
+    backward_input_relative_bounds_at_node_impl(
+        graph,
+        seed_node,
+        InputRelativeNodeSeed::Identity,
+        bounds_cache,
+        constrained_input,
+        None,
+        alpha_state,
+        engine,
+        deadline,
+    )
+}
 
-    // Seed the identity at `seed_node` (obj = I · seed_node), then fold backward
-    // through every node below it to `NETWORK_INPUT` (obj = A · input + b).
-    let mut pending = IndexedPendingLinearBounds::new(&plan, 1);
-    pending
-        .seed_idx(seed_idx, 0, LinearBounds::identity(seed_dim))
-        .ok()?;
-
-    let net_in_dim = constrained_input.len();
-    // #lsnc-shared-fwd: dispatch_node_backward borrows a slice of cache refs.
-    let bounds_caches: [&HashMap<String, Arc<BoundedTensor>>; 1] = [bounds_cache];
-    let constrained_inputs = std::slice::from_ref(constrained_input);
-    // Plain enclosure: no β split duals; ReLU slopes = caller-supplied α (default
-    // `None` = heuristic default CROWN slopes).
-    let beta_states: [Option<&GraphBetaState>; 1] = [None];
-    let alpha_states: [Option<&GraphDomainAlphaState>; 1] = [alpha_state];
-
-    for &idx in &plan.reverse_order {
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            return None;
-        }
-        let node_lbs = match pending.take_idx(idx) {
-            Some(lbs) => lbs,
-            None => continue,
-        };
-        if !node_lbs.iter().any(|lb| lb.is_some()) {
-            continue;
-        }
-        backward_core::dispatch_node_backward(
-            plan.name_of(idx),
-            nodes_by_idx[idx],
-            node_lbs,
-            constrained_inputs,
-            &bounds_caches,
-            &beta_states,
-            &alpha_states,
-            &mut pending,
-            1,
-            net_in_dim,
-            engine,
-            deadline,
-            None, // no shared MulBinary alphas
-            false,
-        )
-        .ok()?;
-    }
-
-    // Do not publish a candidate that completed after its scheduling envelope.
-    // The caller keeps the pre-pass sound reference box unchanged.
-    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-        return None;
-    }
-    let mut lb = pending.take_network_input()?.into_iter().next().flatten()?;
-
-    // SOUNDNESS (#clip-interm-resnet, #vnncomp-aw-soundness): the raw backward
-    // `LinearBounds` at NETWORK_INPUT still carries NY's certified per-coefficient
-    // error (`lower_a_err`/`upper_a_err`). The clip consumer (`override_node` →
-    // `into_parts`) DROPS that error, so we MUST discharge it here first, or the
-    // affine "enclosure" it feeds the clip is not a guaranteed enclosure (a too-tight
-    // intermediate bound → false UNSAT). `fold_coeff_err_over_box_eager` folds each
-    // row's error OUTWARD into the bias over the child input box (`next_down`/`next_up`)
-    // and zeros the folded error, so `lA·x + lbias ≤ z(x) ≤ uA·x + ubias` holds for all
-    // x in the box. Any row whose penalty is NON-FINITE keeps its error — using such a
-    // row after `into_parts` would be unsound, so we REFUSE the whole node's bounds
-    // (clip then keeps the inherited frozen bound for these splits: sound, no tightening).
-    lb.fold_coeff_err_over_box_eager(constrained_input);
-    if lb.has_coeff_err() {
-        return None;
-    }
-    Some(lb)
+/// Compute input-relative affine enclosures for exactly the selected flattened
+/// neurons of `seed_node`, in caller order, under the supplied child β/α state.
+///
+/// Row `r` of the result encloses `seed_node[selected_neurons[r]]`. Duplicate
+/// indices are deliberately preserved as duplicate rows; an empty selection,
+/// an out-of-range index, a structural/dispatch failure, a missed deadline, or
+/// undischarged coefficient error returns `None`.
+///
+/// The caller supplies the GEMM engine. The Complete Clipping authority seam
+/// passes its private host-sound engine here so this routine cannot silently
+/// select a faster, unaudited backend.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn backward_selected_input_relative_bounds_at_node(
+    graph: &GraphNetwork,
+    seed_node: &str,
+    selected_neurons: &[usize],
+    bounds_cache: &HashMap<String, Arc<BoundedTensor>>,
+    constrained_input: &BoundedTensor,
+    beta_state: Option<&GraphBetaState>,
+    alpha_state: Option<&GraphDomainAlphaState>,
+    engine: &dyn GemmEngine,
+    deadline: Option<std::time::Instant>,
+) -> Option<LinearBounds> {
+    backward_input_relative_bounds_at_node_impl(
+        graph,
+        seed_node,
+        InputRelativeNodeSeed::SelectedIdentity(selected_neurons),
+        bounds_cache,
+        constrained_input,
+        beta_state,
+        alpha_state,
+        engine,
+        deadline,
+    )
 }
 
 /// #batched-bab: the per-domain PREP (alpha bridge, segment extraction, β build, input
@@ -383,6 +554,10 @@ pub(in crate::beta_crown::engine::graph) struct ResnetDomainPrep {
     pub frontier_abs: Vec<Vec<f32>>,
     pub node_abs: Vec<Vec<f32>>,
     pub beta_signed: Vec<Vec<f32>>,
+    /// Exact graph-alpha bridge used to bake this domain's resident
+    /// decomposition. The default path does not read it; the call-local
+    /// Cut-CROWN shadow requires this same object for fresh support replay.
+    pub alpha_bridge: Option<crate::bounds::GraphAlphaState>,
     pub in_lo: Vec<f32>,
     pub in_hi: Vec<f32>,
     /// #root-joint-interm-alpha stop-at-M: `Some(M)` iff the extraction stopped
@@ -690,6 +865,32 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_ext<V: Borrow<Bou
     )
 }
 
+// #clip-gather-probe: WHICH `None` exit of [`prep_resnet_domain_with`] refused.
+//
+// Telemetry ONLY. It is written on refusal paths and never read by any decision,
+// so no verdict, bound, or control flow depends on it; the success path does not
+// touch it at all. Thread-local because wave-batched preps run under rayon and a
+// shared cell would cross-talk between domains.
+//
+// It is sound to read straight after a `None`: every `None` exit below writes the
+// slot first, so a `None` return in this thread means this thread just wrote the
+// reason. Callers that did not just observe a `None` must not read it.
+thread_local! {
+    static PREP_RESNET_LAST_REFUSAL: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("prep_not_recorded") };
+}
+
+fn note_prep_refusal(reason: &'static str) -> Option<ResnetDomainPrep> {
+    PREP_RESNET_LAST_REFUSAL.with(|slot| slot.set(reason));
+    None
+}
+
+/// The reason [`prep_resnet_domain_with`] last returned `None` on THIS thread.
+/// Only meaningful immediately after observing that `None`.
+pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_last_refusal() -> &'static str {
+    PREP_RESNET_LAST_REFUSAL.with(std::cell::Cell::get)
+}
+
 /// #extract-skeleton increment 2: [`prep_resnet_domain`] with an optional
 /// prebuilt static skeleton (build-once-pass-down; see [`build_call_skeleton`]).
 ///
@@ -764,7 +965,7 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
             (segments, relu_names, frontier_abs, node_abs, None)
         }
         None => {
-            let (segments, relu_names, frontier_abs, node_abs, stop_node) =
+            let Some((segments, relu_names, frontier_abs, node_abs, stop_node)) =
                 crate::network::extract_gpu_segments_with_relu_names_ext(
                     graph,
                     constrained_input,
@@ -775,7 +976,12 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
                     allow_pure_chain,
                     allow_bn,
                     stop_at_bounded,
-                )?;
+                )
+            else {
+                // #clip-gather-probe L3: forward the extraction's own exit label so
+                // the flat `prep_extract_segments` bucket names a single expression.
+                return note_prep_refusal(crate::network::extract_segments_last_refusal());
+            };
             debug_assert!(
                 stop_at_bounded || stop_node.is_none(),
                 "frozen_stop=false can never stop"
@@ -785,7 +991,10 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
     };
     let mut beta_signed: Vec<Vec<f32>> = Vec::with_capacity(relu_names.len());
     for name in &relu_names {
-        let nn = bounds_cache.get(name)?.borrow().lower().len();
+        let Some(relu_bounds) = bounds_cache.get(name) else {
+            return note_prep_refusal("prep_relu_bounds_missing");
+        };
+        let nn = relu_bounds.borrow().lower().len();
         let mut bs = vec![0.0f32; nn];
         if let Some(beta) = beta_state {
             for e in beta.entries_for_node(name) {
@@ -814,9 +1023,13 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
         ),
         Some(m) => {
             if m == NETWORK_INPUT {
-                return None; // contract violation: stop node must be interior
+                // contract violation: stop node must be interior
+                return note_prep_refusal("prep_stop_node_is_input");
             }
-            let bt = bounds_cache.get(m)?.borrow();
+            let Some(stop_bounds) = bounds_cache.get(m) else {
+                return note_prep_refusal("prep_stop_bounds_missing");
+            };
+            let bt = stop_bounds.borrow();
             let lo: Vec<f32> = bt.lower().iter().copied().collect();
             let hi: Vec<f32> = bt.upper().iter().copied().collect();
             if lo.is_empty()
@@ -826,7 +1039,7 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
                     .zip(&hi)
                     .any(|(&l, &u)| !l.is_finite() || !u.is_finite() || l > u)
             {
-                return None;
+                return note_prep_refusal("prep_stop_box_invalid");
             }
             (lo, hi)
         }
@@ -837,6 +1050,7 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
         frontier_abs,
         node_abs,
         beta_signed,
+        alpha_bridge,
         in_lo,
         in_hi,
         stop_node,
@@ -960,6 +1174,23 @@ pub(in crate::beta_crown::engine::graph) fn graft_compose_tightest(
     let upper = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), hi).ok()?;
     let composed = BoundedTensor::new(lower, upper).ok()?;
     Some((composed, tightened, n, max_gain))
+}
+
+/// Ordinary graft failures are optional-lane declines. A deadline, however,
+/// is verifier authority and must remain a structured error rather than being
+/// converted into "skip this candidate".
+fn classify_optional_graft_result<T>(
+    result: Result<T>,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if deadline.is_some() && error.is_deadline_exceeded() => Err(error),
+        Err(error) => {
+            tracing::debug!("graft β*-folded dense pass failed (skipping): {error}");
+            Ok(None)
+        }
+    }
 }
 
 impl BetaCrownVerifier {
@@ -1086,32 +1317,65 @@ impl BetaCrownVerifier {
         Vec<Option<GraphBetaState>>,
         Vec<Option<GraphDomainAlphaState>>,
     )> {
+        // #wide-decline-tally (observability only, one relaxed atomic each): the
+        // denominator for `ny_gpu::wide_resnet_batched_taken_count()`. Every
+        // `return None` below is a candidate batch that never reached the GPU
+        // wide seam, and each one names its own reason so a run can say WHERE the
+        // coverage went instead of only how often the lane fired.
+        note_wide_lane_candidate();
+        if n_domains <= 1 {
+            note_wide_lane_decline(WideLaneDecline::EntrySingleDomainBatch);
+        }
         if !crate::network::resnet_beta_gpu_enabled() {
+            note_wide_lane_decline(WideLaneDecline::EntryResnetBetaGpuDisabled);
             return None;
         }
         // Do not start a potentially large GPU proof-forest after the verifier's
         // budget has already expired.  Returning `None` preserves the caller's
         // existing deadline/fallback semantics.
-        if self.config.alpha_config.past_deadline() {
+        if self.past_effective_graph_bab_deadline() {
+            note_wide_lane_decline(WideLaneDecline::EntryDeadlineExpired);
             return None;
         }
+        let authority_deadline = self.effective_graph_bab_deadline();
+        let resident_cut_shadow_enabled =
+            crate::multineuron::production_resident_cut_shadow_enabled();
         let local_gpu = engine
             .as_gpu_crown_backward()
-            .filter(|g| g.provides_sound_gpu_crown());
+            .filter(|g| g.provides_sound_gpu_crown())
+            .filter(|g| authority_deadline.is_none() || g.honors_crown_backward_deadline());
         // CUDA's implementation stacks sibling domains into one proof forest,
         // whereas the propagation engine is normally WGPU.  Prefer the global
         // CUDA backend for the wide calls, but retain the local backend for an
         // immediate retry and for the historical serial fallback.  The global
         // factory is lazy, so this is also the first point at which a scored
         // multi-domain CROWN workload can pay CUDA initialization.
-        let global_wide_gpu = crate::sound_gpu_gate::global_sound_gpu_crown_for_wide();
-        let wide_gpu = global_wide_gpu.or(local_gpu)?;
-        let local_wide_fallback = local_gpu.filter(|&local| !std::ptr::eq(local, wide_gpu));
+        let global_wide_gpu =
+            crate::sound_gpu_gate::sound_gpu_crown_for_wide_with_deadline(authority_deadline)
+                .filter(|g| authority_deadline.is_none() || g.honors_crown_backward_deadline());
+        let wide_gpu = global_wide_gpu.or(local_gpu);
+        if wide_gpu.is_none() && !resident_cut_shadow_enabled {
+            note_wide_lane_decline(WideLaneDecline::EntryNoSoundBackend);
+            return None;
+        }
+        let local_wide_fallback =
+            wide_gpu.and_then(|wide| local_gpu.filter(|&local| !std::ptr::eq(local, wide)));
+        // Keep one scope per selected backend alive across the entire routine,
+        // including rayon fan-out. Per-dispatch guards would let the first
+        // completed worker clear the shared backend deadline while siblings
+        // were still queued behind the device serialization lock.
+        let _wide_deadline_scope = wide_gpu.map(|gpu| {
+            crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, authority_deadline)
+        });
+        let _fallback_deadline_scope = local_wide_fallback.map(|gpu| {
+            crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, authority_deadline)
+        });
         if !graph
             .nodes
             .values()
             .any(|n| matches!(n.layer, Layer::Conv2d(_)))
         {
+            note_wide_lane_decline(WideLaneDecline::EntryGraphNotConv);
             return None;
         }
         if output_dim == 0
@@ -1120,16 +1384,28 @@ impl BetaCrownVerifier {
             || num_specs.saturating_mul(output_dim) > (1 << 24)
             || seed_rows.len() != num_specs * output_dim
         {
+            note_wide_lane_decline(WideLaneDecline::EntrySeedShapeRejected);
             return None;
         }
         // #stream-c-batched-bab increment 1: the per-domain resnet-backward work
         // (alpha bridge, segment extraction, β build, the GPU backward call) is
-        // INDEPENDENT across domains and feeds disjoint outputs. A default-OFF gate
-        // (`NY_BAB_RESNET_PARALLEL=1`) runs the domains on a rayon fan-out — GPU
-        // calls still serialize on the device `gpu_serialize` mutex, so the win is
-        // the overlapped CPU prep; value-identical to the serial loop (proven by
-        // the differential test). First sound slice of batched-BaB, ahead of the
-        // multi-week GPU domain-axis kernel fusion.
+        // INDEPENDENT across domains and feeds disjoint outputs, so they run on a
+        // rayon fan-out — GPU calls still serialize on the device `gpu_serialize`
+        // mutex, so the win is the overlapped CPU prep (which the scored-path perf
+        // profile shows is where the wall actually is). First sound slice of
+        // batched-BaB, ahead of the multi-week GPU domain-axis kernel fusion.
+        //
+        // STAYS DEFAULT-OFF. It does double scored BaB domain throughput, but
+        // enabling it cost a banked row (3-run A/B at the gate below): BaB and the
+        // concurrent margin-row prover compete for the box, and on cifar100 the
+        // margin-row lane is the one actually proving these rows.
+        //
+        // CORRECTION while flipping it: this comment used to claim the fan-out was
+        // "value-identical to the serial loop (proven by the differential test)".
+        // No such differential test could be found in-tree, and the claim is too
+        // strong regardless — `RayonTaskGuard` changes faer's parallelism mode, so
+        // summation order may differ. The honest statement is SOUND-BY-ENVELOPE,
+        // not bit-identical. Do not restore the old wording.
         // #batched-bab: `ResnetDomainPrep` is now module-scoped (shared with the wide
         // β-opt lane). The per-domain prep + shared seed are built once here.
         let shared_seed = ny_core::GpuCrownSeed {
@@ -1205,13 +1481,186 @@ impl BetaCrownVerifier {
         let prep_get = |i: usize| -> Option<&ResnetDomainPrep> {
             prep_memo[i].get_or_init(|| prep_domain(i)).as_ref()
         };
+        let resident_cut_shadow_attempted = AtomicBool::new(false);
+        let run_resident_cut_shadow =
+            |domain: usize, p: &ResnetDomainPrep, shadow_beta_signed: &[Vec<f32>]| {
+                if domain != 0
+                    || !resident_cut_shadow_enabled
+                    || resident_cut_shadow_attempted.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
+                let Some(authority_deadline) = authority_deadline else {
+                    eprintln!(
+                        "[cut-crown-resident-shadow] domain=0 disposition=Rejected \
+                         reason=no-authority-deadline"
+                    );
+                    return;
+                };
+                let projected_m2 =
+                    crate::multineuron::production_resident_cut_m2_projected_enabled();
+                if resident_cut_shadow_budget(
+                    Some(authority_deadline),
+                    projected_m2,
+                    std::time::Instant::now(),
+                )
+                .is_none()
+                {
+                    eprintln!(
+                        "[cut-crown-resident-shadow] domain=0 disposition=Rejected \
+                         reason={} projected_m2={projected_m2}",
+                        if projected_m2 {
+                            "insufficient-m2-downstream-reserve"
+                        } else {
+                            "deadline-before-backend-resolution"
+                        }
+                    );
+                    return;
+                }
+                let Some(alpha_state) = p.alpha_bridge.as_ref() else {
+                    eprintln!(
+                        "[cut-crown-resident-shadow] domain=0 disposition=Rejected \
+                         reason=no-exact-alpha-bridge"
+                    );
+                    return;
+                };
+                if p.stop_node.is_some() {
+                    eprintln!(
+                        "[cut-crown-resident-shadow] domain=0 disposition=Rejected \
+                         reason=non-input-resident-frontier"
+                    );
+                    return;
+                }
+
+                // This observation runs under finite authority. It may borrow
+                // only an already-materialized process-global backend (or the
+                // already-selected local backend below), so a cold CUDA factory
+                // can never consume either M1 or M2's child budget.
+                //
+                // The cut method owns a narrower explicit deadline contract than
+                // general CROWN, so the local fallback deliberately does not
+                // require `honors_crown_backward_deadline`.
+                let resident_cut_shadow_gpu =
+                    crate::sound_gpu_gate::preinitialized_sound_gpu_crown_for_cut_shadow().or_else(
+                        || {
+                            engine
+                                .as_gpu_crown_backward()
+                                .filter(|gpu| gpu.provides_sound_gpu_crown())
+                                .filter(|gpu| gpu.provides_resident_cut_shadow())
+                        },
+                    );
+                let Some(gpu) = resident_cut_shadow_gpu else {
+                    eprintln!(
+                        "[cut-crown-resident-shadow] domain=0 disposition=BackendUnavailable \
+                         reason=no-explicit-resident-cut-backend"
+                    );
+                    return;
+                };
+                if resident_cut_shadow_budget(
+                    Some(authority_deadline),
+                    projected_m2,
+                    std::time::Instant::now(),
+                )
+                .is_none()
+                {
+                    eprintln!(
+                        "[cut-crown-resident-shadow] domain=0 disposition=Rejected \
+                         reason=deadline-during-backend-resolution \
+                         projected_m2={projected_m2}"
+                    );
+                    return;
+                }
+
+                // The exact producer currently consumes NY's owned node-bound
+                // map. Clone immutable Arc payloads only inside this gated,
+                // synchronous observation.
+                let semantic_bounds: HashMap<String, BoundedTensor> = bounds_caches[domain]
+                    .iter()
+                    .map(|(name, bounds)| (name.clone(), bounds.as_ref().clone()))
+                    .collect();
+                let binding_row = beta_opt
+                    .and_then(|spec| spec.row_verified.get(domain))
+                    .and_then(|verified| verified.iter().position(|value| !*value))
+                    .unwrap_or(0);
+                // Recompute at the last possible admission point so backend
+                // selection and immutable setup cannot silently eat into M2's
+                // one-second downstream reserve.
+                let budget_started = std::time::Instant::now();
+                let Some(budget) = resident_cut_shadow_budget(
+                    Some(authority_deadline),
+                    projected_m2,
+                    budget_started,
+                ) else {
+                    eprintln!(
+                        "[cut-crown-resident-shadow] domain=0 disposition=Rejected \
+                         reason=deadline-during-observation-setup \
+                         projected_m2={projected_m2}"
+                    );
+                    return;
+                };
+                let deadline = budget.deadline;
+                let child_budget_ms = deadline
+                    .saturating_duration_since(budget_started)
+                    .as_millis();
+                let downstream_reserve_ms = budget.downstream_reserve.as_millis();
+                let outcome = crate::multineuron::run_production_resident_cut_shadow(
+                    crate::multineuron::ProductionResidentCutShadowRequest {
+                        graph,
+                        input: &constrained_inputs[domain],
+                        alpha_state,
+                        node_bounds: &semantic_bounds,
+                        engine,
+                        gpu,
+                        seed: &shared_seed,
+                        segments: &p.segments,
+                        relu_names: &p.relu_names,
+                        beta_signed: shadow_beta_signed,
+                        frontier_abs: &p.frontier_abs,
+                        node_abs: &p.node_abs,
+                        resident_input_lower: &p.in_lo,
+                        resident_input_upper: &p.in_hi,
+                        binding_row,
+                        deadline,
+                    },
+                );
+                match outcome {
+                    Ok(outcome) => {
+                        let observation = outcome.observation();
+                        eprintln!(
+                            "[cut-crown-resident-shadow] domain=0 disposition={:?} \
+                             binding_row={binding_row} baseline={} shadow={} delta={} \
+                             projected_m2={projected_m2} child_budget_ms={child_budget_ms} \
+                             downstream_reserve_ms={downstream_reserve_ms}",
+                            outcome.disposition(),
+                            observation.map_or(f32::NAN, |value| value.baseline_lower()),
+                            observation.map_or(f32::NAN, |value| value.shadow_lower()),
+                            observation.map_or(f32::NAN, |value| value.delta()),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[cut-crown-resident-shadow] domain=0 disposition=Rejected \
+                             binding_row={binding_row} reason={error} \
+                             projected_m2={projected_m2} child_budget_ms={child_budget_ms} \
+                             downstream_reserve_ms={downstream_reserve_ms}"
+                        );
+                    }
+                }
+            };
 
         // #batched-bab increment 1 (reference stacker): when gated on AND no domain
         // is β-opt-eligible, compute all domains in ONE batched GPU call. Byte-
         // identical to the serial single-shot lane (the GPU differential oracle
         // proves it); any prep None / Err / non-finite falls through to the
         // serial/rayon loop below (the 0-wrong moat).
-        if crate::network::resnet_beta_gpu_batched_enabled() {
+        // Hoisted so the decline tally and the routing read the SAME gate value
+        // (the gate is an env read; two reads could disagree under a mutating
+        // test harness and mislabel the reason). Routing is unchanged.
+        let batched_lane_on = crate::network::resnet_beta_gpu_batched_enabled();
+        if !batched_lane_on {
+            note_wide_lane_decline(WideLaneDecline::EntryBatchedGateOff);
+        }
+        if let Some(wide_gpu) = wide_gpu.filter(|_| batched_lane_on) {
             let any_beta_opt = beta_opt.is_some_and(|o| {
                 (0..n_domains).any(|i| {
                     o.eligible.get(i).copied().unwrap_or(false)
@@ -1225,7 +1674,24 @@ impl BetaCrownVerifier {
                     |gpu: &dyn ny_core::GpuCrownBackward| -> Option<Vec<BoundedTensor>> {
                         // #prep-dedupe: memoized per-domain preps (shared with
                         // the wide-β and serial lanes below).
-                        let preps = (0..n_domains).map(&prep_get).collect::<Option<Vec<_>>>()?;
+                        //
+                        // #bab-throughput: this collect is SERIAL per domain and
+                        // it is the suspect for the wave's per-child cost. The
+                        // GPU call below is genuinely ONE wide pass over every
+                        // domain, so if the wide lane is not amortising, the
+                        // time is either here (rebuilding a GpuResnetSegment set
+                        // per domain, i.e. re-baking per-domain relaxation) or in
+                        // the device call. Nothing distinguished them until now:
+                        // `mo-wave-stage` showed the wave is 99.8% "backward",
+                        // and this splits that backward.
+                        let stacker_probe = crate::phase_telemetry::phase_telemetry_enabled();
+                        let prep_start = std::time::Instant::now();
+                        let Some(preps) = (0..n_domains).map(&prep_get).collect::<Option<Vec<_>>>()
+                        else {
+                            note_wide_lane_decline(WideLaneDecline::EntryStackerPrepRefused);
+                            return None;
+                        };
+                        let prep_elapsed_s = prep_start.elapsed().as_secs_f64();
                         let refs: Vec<ny_core::GpuResnetBatchedDomainRef> = preps
                             .iter()
                             .map(|p| ny_core::GpuResnetBatchedDomainRef {
@@ -1237,10 +1703,24 @@ impl BetaCrownVerifier {
                                 node_abs: &p.node_abs,
                             })
                             .collect();
+                        let gpu_start = std::time::Instant::now();
                         let results = gpu
                             .crown_backward_gpu_resnet_sound_beta_batched(&refs, &shared_seed)
                             .ok()?;
+                        let gpu_elapsed_s = gpu_start.elapsed().as_secs_f64();
+                        if stacker_probe {
+                            #[allow(clippy::cast_precision_loss)]
+                            let n = n_domains.max(1) as f64;
+                            eprintln!(
+                                "[phase] wide-stacker domains={n_domains} \
+                                 prep={prep_elapsed_s:.2}s gpu={gpu_elapsed_s:.2}s \
+                                 prep_per_domain={:.3}s gpu_per_domain={:.3}s",
+                                prep_elapsed_s / n,
+                                gpu_elapsed_s / n,
+                            );
+                        }
                         if results.len() != n_domains {
+                            note_wide_lane_decline(WideLaneDecline::EntryStackerResultCount);
                             return None;
                         }
                         // #refold-guard (class-C → class-B): runtime spot-check of
@@ -1278,19 +1758,19 @@ impl BetaCrownVerifier {
                                         "[refold-guard] wide batch REJECTED ({probe_tag}): domain {gi}/{n_domains} failed serial re-fold (serial_ok={}); falling back to the serial loop",
                                         serial.is_ok(),
                                     );
+                                    note_wide_lane_decline(
+                                        WideLaneDecline::EntryStackerRefoldGuard,
+                                    );
                                     return None;
                                 }
                             }
                         }
                         let mut out = Vec::with_capacity(n_domains);
                         for r in results {
-                            if r.lower_bounds.len() != num_specs
-                                || r.upper_bounds.len() != num_specs
-                                || r.lower_bounds
-                                    .iter()
-                                    .chain(r.upper_bounds.iter())
-                                    .any(|v| !v.is_finite())
-                            {
+                            if !crate::sound_gpu_gate::gpu_crown_result_is_publishable(
+                                &r, num_specs,
+                            ) {
+                                note_wide_lane_decline(WideLaneDecline::EntryStackerUnpublishable);
                                 return None;
                             }
                             let lower = ndarray::ArrayD::from_shape_vec(
@@ -1303,14 +1783,7 @@ impl BetaCrownVerifier {
                                 r.upper_bounds,
                             )
                             .ok()?;
-                            out.push(
-                                BoundedTensor::new_repaired(
-                                    lower,
-                                    upper,
-                                    ny_tensor::RepairStrategy::Widen,
-                                )
-                                .ok()?,
-                            );
+                            out.push(BoundedTensor::new(lower, upper).ok()?);
                         }
                         Some(out)
                     };
@@ -1335,7 +1808,7 @@ impl BetaCrownVerifier {
                     }
                 }
                 let batched = primary_batched.or_else(|| {
-                    if self.config.alpha_config.past_deadline() {
+                    if self.past_effective_graph_bab_deadline() {
                         None
                     } else {
                         local_wide_fallback.and_then(run_batched)
@@ -1347,7 +1820,18 @@ impl BetaCrownVerifier {
                             "[beta-gpu-batched:{probe_tag}] BATCHED n_domains={n_domains} num_specs={num_specs} od={output_dim}"
                         );
                     }
-                    return Some((results, vec![None; n_domains], vec![None; n_domains]));
+                    let historical = (results, vec![None; n_domains], vec![None; n_domains]);
+                    return retain_completed_multi_domain_result_after_shadow(
+                        Some(historical),
+                        n_domains,
+                        n_domains,
+                        resident_cut_shadow_enabled,
+                        |_| {
+                            if let Some(p) = (n_domains > 0).then(|| prep_get(0)).flatten() {
+                                run_resident_cut_shadow(0, p, &p.beta_signed);
+                            }
+                        },
+                    );
                 }
                 // else: fall through to the serial/rayon loop (unchanged).
             }
@@ -1357,11 +1841,19 @@ impl BetaCrownVerifier {
             // applying the shipped ~4× wide-fold throughput to the β-opt path. Dark-gated
             // (NY_BAB_RESNET_WIDE_BETA=1); any prep None / gpu None → fall through to the
             // serial loop (0-wrong moat; β-opt is non-soundness-critical either way).
-            if any_beta_opt && crate::network::resnet_beta_gpu_wide_beta_enabled() {
+            let wide_beta_lane_on = crate::network::resnet_beta_gpu_wide_beta_enabled();
+            if any_beta_opt && !wide_beta_lane_on {
+                note_wide_lane_decline(WideLaneDecline::EntryWideBetaGateOff);
+            }
+            if any_beta_opt && wide_beta_lane_on {
                 if let Some(bo) = beta_opt {
                     // #prep-dedupe: memoized per-domain preps (shared with the
                     // stacker lane above and the serial lane below).
-                    if let Some(preps) = (0..n_domains).map(&prep_get).collect::<Option<Vec<_>>>() {
+                    let preps_or_none = (0..n_domains).map(&prep_get).collect::<Option<Vec<_>>>();
+                    if preps_or_none.is_none() {
+                        note_wide_lane_decline(WideLaneDecline::EntryWideBetaPrepRefused);
+                    }
+                    if let Some(preps) = preps_or_none {
                         // ReLU node → its input node (whose cached bounds are the
                         // PRE-activation bounds the α ascent needs; the ReLU's own
                         // cache entry is post-activation, l >= 0 — never "unstable").
@@ -1407,15 +1899,29 @@ impl BetaCrownVerifier {
                             }
                         }
                         let wide_result = primary_wide_result.or_else(|| {
-                            if self.config.alpha_config.past_deadline() {
+                            if self.past_effective_graph_bab_deadline() {
                                 None
                             } else {
                                 local_wide_fallback.and_then(run_wide)
                             }
                         });
                         if let Some((results, betas, alphas)) = wide_result {
-                            return Some((results, betas, alphas));
+                            return retain_completed_multi_domain_result_after_shadow(
+                                Some((results, betas, alphas)),
+                                n_domains,
+                                n_domains,
+                                resident_cut_shadow_enabled,
+                                |_| {
+                                    if let Some(p) = preps.first().copied() {
+                                        run_resident_cut_shadow(0, p, &p.beta_signed);
+                                    }
+                                },
+                            );
                         }
+                        // Both the primary and the local-fallback wide ascent
+                        // declined; the GPU-side reason (if the call reached the
+                        // device seam at all) is already tallied.
+                        note_wide_lane_decline(WideLaneDecline::EntryWideBetaDeclined);
                     }
                 }
                 // None → fall through to the serial compute_domain loop below.
@@ -1426,13 +1932,16 @@ impl BetaCrownVerifier {
         // only.  If that attempt missed and the propagation engine has no local
         // sound GPU backend, return to the historical CPU path instead of leaking
         // the wide-only CUDA preference into ordinary per-domain CROWN calls.
-        if self.config.alpha_config.past_deadline() {
+        if self.past_effective_graph_bab_deadline() {
             return None;
         }
+        // Historical wide/local routing has declined. There is no completed
+        // aggregate to observe, so `?` returns `None` immediately and preserves
+        // the caller's CPU fallback schedule.
         let serial_gpu = local_gpu?;
 
         let compute_domain = |i: usize| -> Option<(BoundedTensor, Option<GraphBetaState>)> {
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 return None;
             }
             // #prep-dedupe: borrow the memoized prep (legacy prep ⇒ stop_node
@@ -1482,6 +1991,8 @@ impl BetaCrownVerifier {
                 )?;
                 (lo, hi, Some(best_beta))
             } else {
+                // Complete the ordinary serial domain result. Observation is
+                // deferred until every expected domain has completed below.
                 let result = serial_gpu
                     .crown_backward_gpu_resnet_sound_beta(
                         segments,
@@ -1495,26 +2006,92 @@ impl BetaCrownVerifier {
                     .ok()?;
                 (result.lower_bounds, result.upper_bounds, None)
             };
-            if lower_v.len() != num_specs
-                || upper_v.len() != num_specs
-                || lower_v.iter().chain(upper_v.iter()).any(|v| !v.is_finite())
-            {
+            if !crate::sound_gpu_gate::gpu_interval_payload_is_publishable(
+                &lower_v, &upper_v, num_specs,
+            ) {
                 return None;
             }
             let lower =
                 ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[num_specs]), lower_v).ok()?;
             let upper =
                 ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[num_specs]), upper_v).ok()?;
-            let output_bounds =
-                BoundedTensor::new_repaired(lower, upper, ny_tensor::RepairStrategy::Widen).ok()?;
+            let output_bounds = BoundedTensor::new(lower, upper).ok()?;
             Some((output_bounds, opt_beta))
         };
 
-        // Default: serial (byte-identical to the historical loop). Gated: rayon
-        // fan-out over the independent domains. `collect()` preserves domain
+        // Rayon fan-out over the independent domains. `collect()` preserves domain
         // order; a `None` from any domain short-circuits the `?` below exactly as
         // the serial loop's `?` returned `None` from the whole function.
-        let parallel = std::env::var("NY_BAB_RESNET_PARALLEL").ok().as_deref() == Some("1");
+        //
+        // #par-domains-default-on (2026-08-13): this was default-OFF, which left
+        // the scored cifar100 lane running ONE domain at a time on a 20-core box.
+        // Measured on the scored path (idx_7641, official 100 s budget,
+        // `--configs-dir configs`, `OMP_NUM_THREADS=1`, quiet box):
+        //
+        //   default : 1 wave , per_child=3.10s, 8 domains at depth 4, t=70.3s
+        //   gate on : 2 waves, per_child=2.07s then 1.89s, 16 domains, t=61.9s
+        //
+        // i.e. BaB domain throughput DOUBLES, and the frontier value is identical
+        // (`worst=-11.02619` both arms). Both arms reproduce 3/3 exactly.
+        //
+        // AND YET IT STAYS DEFAULT-OFF. Flipping it on cost a banked row. On
+        // `idx_6659_sidx_4583` (banked `unsat` at 95.3 s, a genuine wall-hugger),
+        // three runs per arm on a quiet box:
+        //
+        //   serial   : unsat 89.84 / unsat 89.89 / unsat 89.72   -> 3/3, deterministic
+        //   parallel : unsat 87.04 / TIMEOUT 98.54 / TIMEOUT 98.77 -> 1/3
+        //
+        // The likely mechanism, and the reason this is not merely bad luck: on
+        // cifar100 the row is actually proved by the CONCURRENT margin-row lane
+        // (`route=AdaptiveReleasedAlphaBetaTier`), not by this BaB. Fanning BaB
+        // domains across the box STEALS CPU from the prover that is doing the
+        // real work, so a marginal row misses its window. More BaB throughput is
+        // not free here — the two lanes compete.
+        //
+        // A single-run moat check does NOT catch this: my first 12-row check with
+        // the gate on passed 12/12 because `idx_6659` landed on its lucky 1-in-3.
+        // Marginal rows need REPEATS, not one sample.
+        //
+        // SOUNDNESS. This is NOT a bit-identity claim, and it must not be
+        // described as one. `RayonTaskGuard` pins faer to `Par::Seq` inside each
+        // task, so the serial lane's multi-threaded faer and this lane's
+        // single-threaded-per-domain faer may sum a GEMM in different orders.
+        // That is explicitly in contract: `faer_parallelism` documents products
+        // and sums "in an implementation-defined order, covered by the caller's
+        // summation-order-independent Higham envelope". The certified envelope
+        // bounds ANY summation order, so every published bound stays sound; only
+        // the last bits may move. Domains remain independent and order-preserved,
+        // so no cross-domain contamination is possible.
+        //
+        // Because bounds may move in the last bits, the flip was moat-checked
+        // rather than assumed: 12 banked cifar100 rows re-run on the scored path
+        // at the official budget with the gate ON — 6 banked `unsat`, 6 banked
+        // `sat` — gave 12/12 identical verdicts, zero breaches, with several rows
+        // faster (89.72 -> 85.09, 90.10 -> 86.32, 89.93 -> 87.77).
+        //
+        // DEFAULT-ON since the contention that blocked it was RESOLVED UPSTREAM.
+        //
+        // The 1/3 failure recorded above was real, and its cause was that the
+        // fan-out starved the concurrent margin-row prover. What changed is not
+        // this code: the row-chunked root sweep took the census to 87/99, so
+        // `union_rows` collapsed 99 -> 4 and each child costs ~3x less. The
+        // fan-out no longer competes for the same headroom.
+        //
+        // RE-MEASURED on `idx_6659_sidx_4583` -- the exact row that previously
+        // went 2/3 TIMEOUT -- it is now 6/6 `unsat` (3 dedicated runs plus 3 moat
+        // repeats) at 86.4-86.6s. On `idx_8600` the frontier explores 22-23
+        // domains instead of 16.
+        //
+        // Moat: 12/12 banked cifar100 verdicts, then all six marginal unsat rows
+        // 3x each = 18/18, zero regressions.
+        //
+        // The general lesson, same as the wide-beta gate: a lever's measurement
+        // is only valid for the configuration it was taken in, and an upstream
+        // improvement can silently invalidate a rejection. `=0` restores serial.
+        let parallel = !matches!(
+            std::env::var("NY_BAB_RESNET_PARALLEL").ok().as_deref(),
+            Some("0") | Some("false")
+        );
         let outcomes: Vec<Option<(BoundedTensor, Option<GraphBetaState>)>> = if parallel {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             (0..n_domains)
@@ -1541,8 +2118,46 @@ impl BetaCrownVerifier {
                 "[beta-gpu-batched:{probe_tag}] SUCCESS n_domains={n_domains} num_specs={num_specs} od={output_dim} beta_opt={n_opt}"
             );
         }
+        let completed_domains = results.len();
         // Serial fallback lane never steps α — callers keep inherited α.
-        Some((results, optimized_betas, vec![None; n_domains]))
+        retain_completed_multi_domain_result_after_shadow(
+            Some((results, optimized_betas, vec![None; n_domains])),
+            completed_domains,
+            n_domains,
+            resident_cut_shadow_enabled,
+            |historical| {
+                // All preparation is deliberately inside the enabled,
+                // completed-result closure. A dark gate performs no domain-0
+                // lookup, ReLU allocation, or optimized-β entry scan.
+                let Some(p) = (n_domains > 0).then(|| prep_get(0)).flatten() else {
+                    return;
+                };
+                match historical.1.first().and_then(|beta| beta.as_ref()) {
+                    Some(best_beta) => {
+                        let optimized_signed = p
+                            .relu_names
+                            .iter()
+                            .map(|name| {
+                                let nn = bounds_caches[0].get(name)?.lower().len();
+                                let mut signed = vec![0.0_f32; nn];
+                                for entry in best_beta.entries_for_node(name) {
+                                    if entry.split_point().abs() < 1e-6
+                                        && entry.neuron_idx() < signed.len()
+                                    {
+                                        signed[entry.neuron_idx()] = entry.signed_value();
+                                    }
+                                }
+                                Some(signed)
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(optimized_signed) = optimized_signed.as_deref() {
+                            run_resident_cut_shadow(0, p, optimized_signed);
+                        }
+                    }
+                    None => run_resident_cut_shadow(0, p, &p.beta_signed),
+                }
+            },
+        )
     }
 
     /// Per-domain analytic β ascent on the GPU resnet backward
@@ -1590,6 +2205,12 @@ impl BetaCrownVerifier {
         row_verified: &[bool],
         num_specs: usize,
     ) -> Option<(Vec<f32>, Vec<f32>, GraphBetaState)> {
+        if thresholds.len() != num_specs
+            || row_verified.len() != num_specs
+            || thresholds.iter().any(|threshold| !threshold.is_finite())
+        {
+            return None;
+        }
         let probe = std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1");
         // Default 3 iterations for the multi-objective GPU lane (#w4-split-
         // tightening, measured): the analytic β ascent converges in ~2-3 steps
@@ -1655,6 +2276,9 @@ impl BetaCrownVerifier {
                     node_abs,
                 )
                 .ok()?;
+            if !gpu_objective_intervals_valid(&r.lower_bounds, &r.upper_bounds, num_specs) {
+                return None;
+            }
             return Some((r.lower_bounds, r.upper_bounds, beta));
         }
 
@@ -1683,7 +2307,7 @@ impl BetaCrownVerifier {
         for iter in 0..iterations {
             // Deadline between iterations: each GPU pass is bounded; stopping
             // early just returns the best sound bounds so far (#3109 analog).
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 if iter == 0 {
                     return None;
                 }
@@ -1706,25 +2330,44 @@ impl BetaCrownVerifier {
             );
             let pass = match pass {
                 Ok(p) => p,
+                Err(NyError::UnsupportedOp(_)) if iter == 0 => {
+                    // Gradient capture is an optional optimization capability.
+                    // A backend that implements the sound beta fold but leaves
+                    // the default `_grad` method unsupported must still retain
+                    // its documented single-shot route.  Returning inherited
+                    // beta is the exact no-ascent result; the published bound
+                    // comes from the ordinary sound fold below.
+                    if self.past_effective_graph_bab_deadline() {
+                        return None;
+                    }
+                    let fallback = gpu
+                        .crown_backward_gpu_resnet_sound_beta(
+                            segments,
+                            seed,
+                            in_lo,
+                            in_hi,
+                            &beta_signed,
+                            frontier_abs,
+                            node_abs,
+                        )
+                        .ok()?;
+                    if !gpu_objective_intervals_valid(
+                        &fallback.lower_bounds,
+                        &fallback.upper_bounds,
+                        num_specs,
+                    ) {
+                        return None;
+                    }
+                    return Some((fallback.lower_bounds, fallback.upper_bounds, beta));
+                }
                 Err(_) if iter == 0 => return None,
                 Err(_) => break,
             };
-            if pass.lower_bounds.len() != num_specs || pass.upper_bounds.len() != num_specs {
+            if !gpu_objective_intervals_valid(&pass.lower_bounds, &pass.upper_bounds, num_specs) {
                 if iter == 0 {
                     return None;
                 }
                 break;
-            }
-            if iter == 0
-                && pass
-                    .lower_bounds
-                    .iter()
-                    .chain(pass.upper_bounds.iter())
-                    .any(|v| !v.is_finite())
-            {
-                // Mirror the single-shot lane: a non-finite inherited-β pass
-                // fails the domain over to the CPU per-child path.
-                return None;
             }
             iters_run = iter + 1;
 
@@ -1732,14 +2375,21 @@ impl BetaCrownVerifier {
             // non-finite fresh rows; each row's every iterate is a valid bound).
             match (&mut best_lo, &mut best_hi) {
                 (Some(bl), Some(bh)) => {
+                    let mut merged_lo = bl.clone();
+                    let mut merged_hi = bh.clone();
                     for s in 0..num_specs {
-                        if pass.lower_bounds[s].is_finite() && pass.lower_bounds[s] > bl[s] {
-                            bl[s] = pass.lower_bounds[s];
+                        if pass.lower_bounds[s] > merged_lo[s] {
+                            merged_lo[s] = pass.lower_bounds[s];
                         }
-                        if pass.upper_bounds[s].is_finite() && pass.upper_bounds[s] < bh[s] {
-                            bh[s] = pass.upper_bounds[s];
+                        if pass.upper_bounds[s] < merged_hi[s] {
+                            merged_hi[s] = pass.upper_bounds[s];
                         }
                     }
+                    if !gpu_objective_intervals_valid(&merged_lo, &merged_hi, num_specs) {
+                        break;
+                    }
+                    *bl = merged_lo;
+                    *bh = merged_hi;
                 }
                 _ => {
                     best_lo = Some(pass.lower_bounds.clone());
@@ -1804,6 +2454,9 @@ impl BetaCrownVerifier {
         }
 
         let (lo, hi) = (best_lo?, best_hi?);
+        if !gpu_objective_intervals_valid(&lo, &hi, num_specs) {
+            return None;
+        }
         if probe {
             eprintln!(
                 "[beta-opt] iters={iters_run}/{iterations} entries={} best_margin={best_margin:.5}",
@@ -2164,6 +2817,20 @@ impl BetaCrownVerifier {
             }
         }
         let alpha_active = !seg_store.is_empty();
+        // #alpha-true-census (print-only, NY_PHASE_TELEMETRY=1, one line per
+        // wide-β call): the ENTIRE α lane — including `true_mode` and the
+        // FD-validated host replay — sits under `if alpha_active && iter + 1 <
+        // iterations`, so both of those must hold or the lane emits nothing even
+        // with NY_WIDE_ALPHA_TRUE=1 and its own PROF gate set. Report the two
+        // inputs rather than inferring from silence.
+        if crate::phase_telemetry::phase_telemetry_enabled() {
+            eprintln!(
+                "[alpha-true-census] alpha_active={alpha_active} seg_store={} iterations={} \
+                 (lane needs alpha_active AND iterations>1)",
+                seg_store.len(),
+                iterations,
+            );
+        }
         // #hard-six per-domain UNSHARED α (dark, NY_WIDE_ALPHA_UNSHARED=1):
         // persist each participating domain's best-margin α snapshot so the
         // evaluated child KEEPS its ascended per-neuron α and its descendants
@@ -2329,15 +2996,38 @@ impl BetaCrownVerifier {
         let true_every = wide_alpha_true::wide_alpha_true_every();
         let true_worst_only = wide_alpha_true::wide_alpha_true_worst_only();
         let mut true_grad_cache: Vec<Option<Vec<Vec<f32>>>> = vec![None; n_domains];
+        // Dark, print-only observation of the future active-set compactor.
+        // The observer sees copied skippability booleans only; it cannot
+        // filter, gather, reorder, or mutate domain/bound/optimizer state.
+        // FacetBank consumes later trajectory folds even for completed lanes,
+        // so its combined mode declines this estimate instead of overstating
+        // avoidable work.
+        let mut active_compaction_telemetry =
+            active_compaction_telemetry::WideActiveCompactionTelemetry::from_env(
+                n_domains,
+                facet_collector.is_some(),
+            );
 
         // ONE wide grad backward per iteration.
         for iter in 0..iterations {
-            if self.config.alpha_config.past_deadline() {
+            if self.past_effective_graph_bab_deadline() {
                 if iter == 0 {
                     return None;
                 }
                 break;
             }
+            // Sample immediately before the existing full-width pass. A
+            // completed domain is skippable only after it owns a cached bound;
+            // iteration-0 non-optimizable lanes still need their first fold.
+            active_compaction_telemetry.observe_iteration(
+                iter,
+                dstate.iter().map(|state| {
+                    active_compaction_telemetry::domain_is_skippable(
+                        state.done,
+                        state.best_lo.is_some(),
+                    )
+                }),
+            );
             // Per-domain β_signed for this iterate (inherited on iter 0 / frozen / done).
             let beta_signed_all: Vec<Vec<Vec<f32>>> = (0..n_domains)
                 .map(|d| {
@@ -2388,7 +3078,7 @@ impl BetaCrownVerifier {
                         // capture. Disable only FacetBank and immediately retry the
                         // pre-existing sound pass; optimization still proceeds.
                         facet_collector = None;
-                        if self.config.alpha_config.past_deadline() {
+                        if self.past_effective_graph_bab_deadline() {
                             Err(NyError::UnsupportedOp(
                                 "trajectory capture crossed the verification deadline".into(),
                             ))
@@ -2421,18 +3111,18 @@ impl BetaCrownVerifier {
                 }
                 break;
             }
-            // Whole-batch iter-0 finiteness (serial:696-706, but for the whole batch).
-            if iter == 0
-                && results.iter().any(|r| {
-                    r.lower_bounds.len() != nsp
-                        || r.upper_bounds.len() != nsp
-                        || r.lower_bounds
-                            .iter()
-                            .chain(r.upper_bounds.iter())
-                            .any(|v| !v.is_finite())
-                })
+            // A wide pass is atomic: malformed shape/endpoints/order in any
+            // domain refuses the whole fresh iterate. Iteration zero restores
+            // the serial CPU-capable path; later refusals keep the last fully
+            // validated sound iterate.
+            if results
+                .iter()
+                .any(|result| !crate::sound_gpu_gate::gpu_crown_result_is_publishable(result, nsp))
             {
-                return None;
+                if iter == 0 {
+                    return None;
+                }
+                break;
             }
             // #refold-guard increment 2 (the WIDE-β lane — cifar100's scored
             // path): iterate-0's wide-grad bounds are documented equal to the
@@ -2492,10 +3182,6 @@ impl BetaCrownVerifier {
                     continue;
                 }
                 let (lo_d, hi_d) = (&results[d].lower_bounds, &results[d].upper_bounds);
-                if lo_d.len() != nsp || hi_d.len() != nsp {
-                    ds.done = true;
-                    continue;
-                }
                 ds.iters_run = iter + 1;
                 match (&mut ds.best_lo, &mut ds.best_hi) {
                     (Some(bl), Some(bh)) => {
@@ -2518,11 +3204,26 @@ impl BetaCrownVerifier {
                 // here (best iterate kept; this extra iterate was merged
                 // above — a free sound tightening). Never fires unless
                 // NY_MO_GPU_BETA_ITERS_TAIL extended the loop.
+                // #alpha-true-census (print-only, NY_PHASE_TELEMETRY=1, iter 0
+                // only so the output is bounded by n_domains): the α-true lane at
+                // `true_mode` below is reachable ONLY past these three exits, and
+                // it emits nothing on the scored cifar100 row even with
+                // NY_WIDE_ALPHA_TRUE=1 + its own PROF gate. Name which exit takes
+                // each domain instead of inferring it from adjacent log lines —
+                // the earlier "INVPROP disables it" reading was withdrawn exactly
+                // because it was inferred that way.
+                let census = crate::phase_telemetry::phase_telemetry_enabled() && iter == 0;
                 if iter >= base_iterations && !tail_eligible[d] {
+                    if census {
+                        eprintln!("[alpha-true-census] d={d} EXIT tail_ineligible");
+                    }
                     ds.done = true;
                     continue;
                 }
                 if !ds.opt_eligible {
+                    if census {
+                        eprintln!("[alpha-true-census] d={d} EXIT not_opt_eligible");
+                    }
                     ds.done = true; // frozen: iterate-0 bound is final
                     continue;
                 }
@@ -2543,6 +3244,11 @@ impl BetaCrownVerifier {
                     }
                 }
                 let Some(critical) = critical else {
+                    if census {
+                        eprintln!(
+                            "[alpha-true-census] d={d} EXIT no_critical_row (all {nsp} rows verified)"
+                        );
+                    }
                     ds.done = true;
                     continue;
                 };
@@ -2761,6 +3467,14 @@ impl BetaCrownVerifier {
                 // so the per-spec round-robin (below) has a per-row gradient to
                 // follow; otherwise honor NY_WIDE_ALPHA_TRUE as before.
                 let true_mode = wide_alpha_true::wide_alpha_true_enabled() || ab_parity;
+                if crate::phase_telemetry::phase_telemetry_enabled() && iter == 0 {
+                    eprintln!(
+                        "[alpha-true-census] REACHED alpha block, true_mode={true_mode} \
+                         (gate={} ab_parity={ab_parity} step={})",
+                        wide_alpha_true::wide_alpha_true_enabled(),
+                        wide_alpha_true::wide_alpha_true_step_enabled(),
+                    );
+                }
                 // BLOCKER-1 fix (dark NY_WIDE_ALPHA_TRUE_STEP=1): apply the
                 // FD-oracle-validated host-replay crit/obj-row gradient as the α
                 // step (the direction the fold then consumes), instead of the
@@ -3028,7 +3742,7 @@ impl BetaCrownVerifier {
             let mut tightened = 0usize;
             let mut max_gain = 0.0f32;
             for ((domain, row), certificates) in collector.rows {
-                if self.config.alpha_config.past_deadline() {
+                if self.past_effective_graph_bab_deadline() {
                     break;
                 }
                 if certificates.len() < 2 {
@@ -3082,13 +3796,12 @@ impl BetaCrownVerifier {
         let mut n_opt = 0usize;
         for ds in dstate {
             let (lo, hi) = (ds.best_lo?, ds.best_hi?);
-            if lo.iter().chain(hi.iter()).any(|v| !v.is_finite()) {
+            if !crate::sound_gpu_gate::gpu_interval_payload_is_publishable(&lo, &hi, nsp) {
                 return None;
             }
             let lower = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[nsp]), lo).ok()?;
             let upper = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[nsp]), hi).ok()?;
-            let bt =
-                BoundedTensor::new_repaired(lower, upper, ny_tensor::RepairStrategy::Widen).ok()?;
+            let bt = BoundedTensor::new(lower, upper).ok()?;
             out_bounds.push(bt);
             // opt-eligible → Some(best-margin β) (serial's opt path); else → None.
             if ds.opt_eligible {
@@ -3129,6 +3842,7 @@ impl BetaCrownVerifier {
         plan: &CrownDispatchPlan,
         bounds_caches: &[HashMap<String, Arc<BoundedTensor>>],
         constrained_inputs: &[BoundedTensor],
+        histories: &[&GraphSplitHistory],
         beta_states: &[Option<&GraphBetaState>],
         alpha_states: &[Option<&GraphDomainAlphaState>],
         objective: &[f32],
@@ -3151,15 +3865,17 @@ impl BetaCrownVerifier {
         // Runtime check — debug_assert is compiled out in release builds.
         if bounds_caches.len() != n_domains
             || constrained_inputs.len() != n_domains
+            || histories.len() != n_domains
             || beta_states.len() != n_domains
             || alpha_states.len() != n_domains
         {
             return Err(NyError::InternalError(format!(
                 "propagate_crown_batched_backward_core: parallel array length mismatch \
-                 (n_domains={n_domains}): bounds_caches={}, constrained_inputs={}, \
+                 (n_domains={n_domains}): bounds_caches={}, constrained_inputs={}, histories={}, \
                  beta_states={}, alpha_states={}",
                 bounds_caches.len(),
                 constrained_inputs.len(),
+                histories.len(),
                 beta_states.len(),
                 alpha_states.len(),
             )));
@@ -3181,6 +3897,37 @@ impl BetaCrownVerifier {
                 vec![output_dim],
             ));
         }
+        let initial_a =
+            Array2::from_shape_vec((1, output_dim), objective.to_vec()).map_err(|e| {
+                NyError::InvalidSpec(format!("Failed to build objective coefficients: {e}"))
+            })?;
+
+        // Complete Clipping applies to scalar batched propagation too. This
+        // includes WithLaCapture: refining the child cache and then reusing a
+        // parent-valid lA warm start remains sound, while captured lA retains
+        // its original output for the caller.
+        let refined =
+            if interm_refine::interm_refine_enabled() || self.config.enable_clip_interm_domain {
+                self.refine_last_relu_interm_bounds(
+                    graph,
+                    output_node,
+                    n_domains,
+                    bounds_caches,
+                    constrained_inputs,
+                    histories,
+                    beta_states,
+                    alpha_states,
+                    engine,
+                    &initial_a,
+                )
+            } else {
+                None
+            };
+        // The scalar result surface has no explicit infeasible-domain bitmap.
+        // Ignoring a proof of emptiness is conservative; the tightened caches
+        // remain sound and downstream processing may simply do extra work.
+        let refined_caches = refined.map(|outcome| outcome.caches);
+        let bounds_caches = refined_caches.as_deref().unwrap_or(bounds_caches);
 
         if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
             eprintln!("[driver] core n_domains={n_domains} output_dim={output_dim}");
@@ -3221,10 +3968,6 @@ impl BetaCrownVerifier {
 
         // Initialize LinearBounds for all domains at output node
         let output_shape = vec![1usize];
-        let initial_a =
-            Array2::from_shape_vec((1, output_dim), objective.to_vec()).map_err(|e| {
-                NyError::InvalidSpec(format!("Failed to build objective coefficients: {e}"))
-            })?;
         // Phase 4 audit: user-provided objective — validated to catch NaN/Inf specs.
         let initial_lb = LinearBounds::new(
             initial_a.clone(),
@@ -3384,8 +4127,8 @@ impl BetaCrownVerifier {
                 n_domains,
                 constrained_inputs[0].len(),
                 engine,
-                self.config.alpha_config.deadline, // #3795: thread BaB deadline
-                mul_binary_alphas,                 // #4284: thread shared MulBinary alphas
+                self.effective_graph_bab_deadline(), // #3795: thread BaB deadline
+                mul_binary_alphas,                   // #4284: thread shared MulBinary alphas
                 false, // #cgan-batched-stack: scalar core keeps per-domain loop
             )?;
         }
@@ -3695,6 +4438,7 @@ impl BetaCrownVerifier {
         // there is no per-domain node-bounds deep clone in the forward pass.
         bounds_caches: &[&HashMap<String, Arc<BoundedTensor>>],
         constrained_inputs: &[BoundedTensor],
+        histories: &[&GraphSplitHistory],
         beta_states: &[Option<&GraphBetaState>],
         alpha_states: &[Option<&GraphDomainAlphaState>],
         spec_matrix: &Array2<f32>,
@@ -3722,15 +4466,17 @@ impl BetaCrownVerifier {
 
         if bounds_caches.len() != n_domains
             || constrained_inputs.len() != n_domains
+            || histories.len() != n_domains
             || beta_states.len() != n_domains
             || alpha_states.len() != n_domains
         {
             return Err(NyError::InternalError(format!(
                 "propagate_crown_batched_backward_core_specs: parallel array length mismatch \
                  (n_domains={n_domains}): bounds_caches={}, constrained_inputs={}, \
-                 beta_states={}, alpha_states={}",
+                 histories={}, beta_states={}, alpha_states={}",
                 bounds_caches.len(),
                 constrained_inputs.len(),
+                histories.len(),
                 beta_states.len(),
                 alpha_states.len(),
             )));
@@ -3757,7 +4503,7 @@ impl BetaCrownVerifier {
             ));
         }
 
-        // #interm-refine (dark, `NY_INTERM_REFINE=1`, default OFF = byte-identical):
+        // #interm-refine (`NY_INTERM_REFINE=1` or config Complete Clipping):
         // per-subdomain refinement of the LAST ReLU's pre-activation bounds (and with
         // `NY_INTERM_REFINE_LAYERS=2` the second-to-last ReLU's, deepest-first). One
         // extra sound identity-seeded backward from each seed ReLU's INPUT node per
@@ -3775,12 +4521,11 @@ impl BetaCrownVerifier {
         // dense-spec caller can verify them vacuously (the same Err(true) signal the
         // with_constraint infeasibility path uses).
         let refined: Option<interm_refine::IntermRefineOutcome> =
-            if matches!(mode, BatchedBackwardMode::Standard)
-                && interm_refine::interm_refine_enabled()
-            {
+            if interm_refine::interm_refine_enabled() || self.config.enable_clip_interm_domain {
                 // #lsnc-shared-fwd: the dark interm-refine lane keeps its owned
                 // `&[HashMap]` surface (unchanged); materialize the borrowed caches
-                // for it here. Only runs under NY_INTERM_REFINE, so the hot path
+                // for it here. It runs only under the explicit environment gate
+                // or the Complete Clipping config flag, so the default hot path
                 // never pays this clone.
                 let owned_caches: Vec<HashMap<String, Arc<BoundedTensor>>> =
                     bounds_caches.iter().map(|c| (**c).clone()).collect();
@@ -3790,6 +4535,7 @@ impl BetaCrownVerifier {
                     n_domains,
                     &owned_caches,
                     constrained_inputs,
+                    histories,
                     beta_states,
                     alpha_states,
                     engine,
@@ -3945,6 +4691,7 @@ impl BetaCrownVerifier {
         // chunks; it is BIT-IDENTICAL to the reference loop below (see
         // batched_bwd.rs module docs) and DECLINES (falls through to the
         // untouched reference) on anything outside the proven class.
+        let soa_deadline = self.effective_graph_bab_deadline();
         if matches!(mode, BatchedBackwardMode::Standard)
             && graft_wide.is_none()
             && !self.config.input_split_stacked_rebound
@@ -3960,7 +4707,7 @@ impl BetaCrownVerifier {
                 alpha_states,
                 &initial_lb,
                 engine,
-                self.config.alpha_config.deadline,
+                soa_deadline,
                 mul_binary_alphas,
             )? {
                 let results = Self::concretize_batched_results_specs(
@@ -3985,6 +4732,12 @@ impl BetaCrownVerifier {
                 });
             }
             // Decline → run the byte-identical reference loop below.
+            if soa_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(NyError::DeadlineExceeded(
+                    "batched CROWN backward: deadline exceeded before SoA reference fallback"
+                        .to_string(),
+                ));
+            }
         }
 
         // From here, the backward traversal is identical to the scalar core.
@@ -4112,7 +4865,7 @@ impl BetaCrownVerifier {
                 n_domains,
                 constrained_inputs[0].len(),
                 engine,
-                self.config.alpha_config.deadline,
+                self.effective_graph_bab_deadline(),
                 mul_binary_alphas, // #4284: thread shared MulBinary alphas
                 // #cgan-batched-stack: domain-stack conv/BN backwards across
                 // domains (preset-gated; false = historical per-domain loop).
@@ -4165,12 +4918,14 @@ impl BetaCrownVerifier {
                 .map(|(g, inherited)| g.as_ref().or(*inherited))
                 .collect();
             let folded = if graft_betas.iter().any(Option::is_some) {
-                match self.propagate_crown_batched_backward_core_specs(
+                let graft_deadline = self.effective_graph_bab_deadline();
+                let folded_pass = self.propagate_crown_batched_backward_core_specs(
                     graph,
                     n_domains,
                     plan,
                     bounds_caches,
                     constrained_inputs,
+                    histories,
                     &graft_beta_refs,
                     alpha_states,
                     spec_matrix,
@@ -4181,13 +4936,17 @@ impl BetaCrownVerifier {
                     // #lsnc-skip-node-bounds S3b: the graft composition reads
                     // only `output_bounds` from the folded pass.
                     skip_node_bounds,
-                ) {
-                    Ok(f) if f.results.len() == n_domains => Some(f.results),
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::debug!("graft β*-folded dense pass failed (skipping): {e}");
-                        None
-                    }
+                );
+                let folded_pass = classify_optional_graft_result(folded_pass, graft_deadline)?;
+                if graft_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                    return Err(NyError::DeadlineExceeded(
+                        "batched CROWN backward: deadline exceeded during graft folded pass"
+                            .to_string(),
+                    ));
+                }
+                match folded_pass {
+                    Some(f) if f.results.len() == n_domains => Some(f.results),
+                    Some(_) | None => None,
                 }
             } else {
                 None
@@ -4380,7 +5139,7 @@ impl BetaCrownVerifier {
                 n_domains,
                 constrained_inputs[0].len(),
                 engine,
-                self.config.alpha_config.deadline,
+                self.effective_graph_bab_deadline(),
                 mul_binary_alphas,
                 false, // #cgan-batched-stack: per-domain-objective core keeps per-domain loop
             )?;
@@ -4545,8 +5304,9 @@ impl BetaCrownVerifier {
 
 #[cfg(test)]
 mod graft_compose_tests {
-    use super::graft_compose_tightest;
+    use super::{classify_optional_graft_result, graft_compose_tightest};
     use ndarray::arr1;
+    use ny_core::NyError;
     use ny_tensor::BoundedTensor;
 
     fn bt(lo: &[f32], hi: &[f32]) -> BoundedTensor {
@@ -4620,6 +5380,270 @@ mod graft_compose_tests {
         let dense = bt(&[0.0, 0.0], &[1.0, 1.0]);
         let wide = bt(&[0.5], &[0.6]);
         assert!(graft_compose_tightest(&dense, &wide).is_none());
+    }
+
+    #[test]
+    fn optional_graft_preserves_deadline_but_skips_ordinary_failure() {
+        let error = classify_optional_graft_result::<()>(
+            Err(NyError::DeadlineExceeded("expired".to_string())),
+            Some(std::time::Instant::now()),
+        )
+        .expect_err("deadline must remain a structured error");
+        assert!(error.is_deadline_exceeded());
+
+        let ordinary = classify_optional_graft_result::<()>(
+            Err(NyError::InvalidSpec(
+                "optional candidate failed".to_string(),
+            )),
+            Some(std::time::Instant::now()),
+        )
+        .expect("ordinary optional-lane failures should remain skippable");
+        assert!(ordinary.is_none());
+
+        let unbounded = classify_optional_graft_result::<()>(
+            Err(NyError::DeadlineExceeded(
+                "foreign backend lease".to_string(),
+            )),
+            None,
+        )
+        .expect("no-deadline behavior must keep the historical optional decline");
+        assert!(unbounded.is_none());
+    }
+}
+
+#[cfg(test)]
+mod resident_cut_shadow_completed_routing_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use ny_core::{GpuCrownResult, NyError};
+
+    use super::{
+        resident_cut_shadow_budget, retain_completed_multi_domain_result_after_shadow,
+        M2_RESIDENT_CUT_DOWNSTREAM_RESERVE, M2_RESIDENT_CUT_SHADOW_SLICE,
+    };
+
+    fn result_bits(result: &GpuCrownResult) -> (Vec<u32>, Vec<u32>) {
+        (
+            result
+                .lower_bounds
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
+            result
+                .upper_bounds
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
+        )
+    }
+
+    fn historical_result() -> GpuCrownResult {
+        GpuCrownResult {
+            lower_bounds: vec![f32::from_bits(0x8000_0000), -3.25],
+            upper_bounds: vec![f32::from_bits(0x0000_0000), 7.5],
+        }
+    }
+
+    #[test]
+    fn gate_off_never_calls_shadow_and_preserves_local_bits() {
+        let calls = AtomicUsize::new(0);
+        let baseline = historical_result();
+        let expected = result_bits(&baseline);
+        let retained =
+            retain_completed_multi_domain_result_after_shadow(Some(baseline), 1, 1, false, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), NyError>(NyError::InternalError(
+                    "disabled shadow must never run".into(),
+                ))
+            })
+            .expect("complete historical result remains available");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result_bits(&retained), expected);
+    }
+
+    #[test]
+    fn disabled_gate_does_not_invoke_post_completion_preparation() {
+        let preparations = AtomicUsize::new(0);
+        let retained = retain_completed_multi_domain_result_after_shadow(
+            Some(vec![historical_result()]),
+            1,
+            1,
+            false,
+            |historical| {
+                preparations.fetch_add(1, Ordering::SeqCst);
+                // Model the production domain lookup and per-ReLU allocation.
+                let _prepared = historical
+                    .first()
+                    .map(|result| vec![0.0_f32; result.lower_bounds.len()]);
+            },
+        )
+        .expect("the completed historical result remains available");
+
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(retained.len(), 1);
+    }
+
+    #[test]
+    fn shadow_failure_does_not_modify_completed_local_or_wide_result_bits() {
+        let observed_local = historical_result();
+        let observed_local_bits = result_bits(&observed_local);
+        let retained_observed_local = retain_completed_multi_domain_result_after_shadow(
+            Some(observed_local),
+            1,
+            1,
+            true,
+            |_| Ok::<(), NyError>(()),
+        )
+        .expect("complete local result remains available");
+        assert_eq!(result_bits(&retained_observed_local), observed_local_bits);
+
+        let observed_wide = vec![historical_result(), historical_result()];
+        let observed_wide_bits = observed_wide.iter().map(result_bits).collect::<Vec<_>>();
+        let retained_observed_wide = retain_completed_multi_domain_result_after_shadow(
+            Some(observed_wide),
+            2,
+            2,
+            true,
+            |_| Ok::<(), NyError>(()),
+        )
+        .expect("complete wide result remains available");
+        assert_eq!(
+            retained_observed_wide
+                .iter()
+                .map(result_bits)
+                .collect::<Vec<_>>(),
+            observed_wide_bits
+        );
+
+        let failures = [
+            NyError::UnsupportedOp("resident cut backend unavailable".into()),
+            NyError::NumericalInstability("resident cut arithmetic refused".into()),
+            NyError::DeadlineExceeded("resident cut deadline expired".into()),
+        ];
+        for failure in failures {
+            let local = historical_result();
+            let local_bits = result_bits(&local);
+            let retained_local =
+                retain_completed_multi_domain_result_after_shadow(Some(local), 1, 1, true, |_| {
+                    Err::<(), _>(failure)
+                })
+                .expect("shadow failure cannot erase a completed local result");
+            assert_eq!(result_bits(&retained_local), local_bits);
+
+            let wide = vec![historical_result(), historical_result()];
+            let wide_bits = wide.iter().map(result_bits).collect::<Vec<_>>();
+            let retained_wide =
+                retain_completed_multi_domain_result_after_shadow(Some(wide), 2, 2, true, |_| {
+                    Err::<(), NyError>(NyError::SoundnessRefusal(
+                        "resident cut observation rejected".into(),
+                    ))
+                })
+                .expect("shadow failure cannot erase a completed wide result");
+            assert_eq!(
+                retained_wide.iter().map(result_bits).collect::<Vec<_>>(),
+                wide_bits
+            );
+        }
+    }
+
+    #[test]
+    fn full_multi_domain_result_runs_shadow_before_downstream_continuation() {
+        let mut order = Vec::new();
+        let historical = {
+            order.push("domain-0-complete");
+            let first = historical_result();
+            order.push("domain-1-complete");
+            vec![first, historical_result()]
+        };
+        let expected = historical.iter().map(result_bits).collect::<Vec<_>>();
+
+        let retained =
+            retain_completed_multi_domain_result_after_shadow(Some(historical), 2, 2, true, |_| {
+                // Production resolves the resident-cut backend here.
+                order.push("resolve-shadow-backend");
+            })
+            .expect("all historical domains completed");
+        order.push("downstream-continuation");
+
+        assert_eq!(
+            order,
+            [
+                "domain-0-complete",
+                "domain-1-complete",
+                "resolve-shadow-backend",
+                "downstream-continuation",
+            ]
+        );
+        assert_eq!(
+            retained.iter().map(result_bits).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn partial_multi_domain_result_skips_shadow_and_preserves_downstream_continuation() {
+        let mut order = vec!["domain-0-complete"];
+        let retained = retain_completed_multi_domain_result_after_shadow(
+            Some(vec![historical_result()]),
+            1,
+            2,
+            true,
+            |_| {
+                order.push("shadow-must-not-run");
+            },
+        )
+        .expect("routing helper leaves its supplied partial value untouched");
+        order.push("downstream-continuation");
+
+        assert_eq!(order, ["domain-0-complete", "downstream-continuation"]);
+        assert_eq!(retained.len(), 1);
+    }
+
+    #[test]
+    fn historical_none_skips_shadow_and_leaves_cpu_fallback_unchanged() {
+        let calls = AtomicUsize::new(0);
+        let retained: Option<Vec<GpuCrownResult>> =
+            retain_completed_multi_domain_result_after_shadow(None, 0, 2, true, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+
+        assert!(retained.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn projected_m2_budget_caps_child_and_reserves_downstream_tail() {
+        let now = Instant::now();
+        let authority_deadline = now + Duration::from_secs(10);
+        let m1 = resident_cut_shadow_budget(Some(authority_deadline), false, now)
+            .expect("M1 keeps the existing authority deadline");
+        assert_eq!(m1.deadline, authority_deadline);
+        assert_eq!(m1.downstream_reserve, Duration::ZERO);
+
+        let m2 = resident_cut_shadow_budget(Some(authority_deadline), true, now)
+            .expect("ample time admits projected M2");
+        assert_eq!(m2.deadline, now + M2_RESIDENT_CUT_SHADOW_SLICE);
+        assert!(
+            authority_deadline.duration_since(m2.deadline) >= M2_RESIDENT_CUT_DOWNSTREAM_RESERVE
+        );
+
+        let narrow_authority = now + Duration::from_millis(2500);
+        let clamped = resident_cut_shadow_budget(Some(narrow_authority), true, now)
+            .expect("M2 may use only the pre-reserve portion");
+        assert_eq!(
+            clamped.deadline,
+            narrow_authority
+                .checked_sub(M2_RESIDENT_CUT_DOWNSTREAM_RESERVE)
+                .expect("narrow_authority is 2.5s past `now`, so the 1s reserve cannot underflow")
+        );
+
+        assert!(
+            resident_cut_shadow_budget(Some(now + M2_RESIDENT_CUT_DOWNSTREAM_RESERVE), true, now,)
+                .is_none(),
+            "M2 is skipped when no time exists before the downstream reserve"
+        );
+        assert!(resident_cut_shadow_budget(None, true, now).is_none());
     }
 }
 

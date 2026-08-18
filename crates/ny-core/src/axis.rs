@@ -16,15 +16,26 @@ use crate::{NyError, Result};
 /// resolved axis is out of range `[0, ndim)`.
 pub fn resolve_axis(axis: i64, ndim: usize, layer_name: &str) -> Result<usize> {
     if axis < 0 {
-        let resolved = (ndim as i64).checked_add(axis).unwrap_or(-1);
-        if resolved < 0 {
+        // Work in unsigned magnitudes so an unusually large `usize` rank does
+        // not wrap through `i64`, and so `i64::MIN` is handled without negation
+        // overflow.
+        let magnitude = usize::try_from(axis.unsigned_abs()).map_err(|_| {
+            NyError::InvalidSpec(format!(
+                "{layer_name}: axis {axis} magnitude cannot be represented on this platform"
+            ))
+        })?;
+        if magnitude > ndim {
             return Err(NyError::InvalidSpec(format!(
-                "{layer_name}: axis {axis} out of range for {ndim}D tensor (resolves to {resolved})"
+                "{layer_name}: axis {axis} out of range for {ndim}D tensor"
             )));
         }
-        Ok(resolved as usize)
+        Ok(ndim - magnitude)
     } else {
-        let a = axis as usize;
+        let a = usize::try_from(axis).map_err(|_| {
+            NyError::InvalidSpec(format!(
+                "{layer_name}: axis {axis} cannot be represented on this platform"
+            ))
+        })?;
         if a >= ndim {
             return Err(NyError::InvalidSpec(format!(
                 "{layer_name}: axis {axis} out of range for {ndim}D tensor"
@@ -100,6 +111,20 @@ mod tests {
         assert!(
             resolve_axis_i32(3, 3, "Test").is_err(),
             "i32 axis 3 out of range for 3D"
+        );
+    }
+
+    #[test]
+    fn test_i64_min_axis_is_rejected_without_overflow() {
+        assert!(resolve_axis(i64::MIN, 3, "Test").is_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_negative_axis_with_rank_above_i64_max_does_not_wrap() {
+        assert_eq!(
+            resolve_axis(-1, usize::MAX, "Test").unwrap(),
+            usize::MAX - 1
         );
     }
 }

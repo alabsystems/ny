@@ -7,14 +7,11 @@
 //! Combines forward and reverse direction results:
 //! - Y_h: `[2, batch, H]` (ONNX spec — direction dim stacked)
 //! - Y_c: `[2, batch, H]` (ONNX spec — direction dim stacked)
-//! - Y:   `[seq, batch, 2*H]` (PyTorch runtime format — directions concatenated along hidden dim)
 //!
-//! Y uses PyTorch runtime format instead of the ONNX spec format `[seq, 2, batch, H]`
-//! because the graph converter's batch stripping assumes batch is always axis 0.
-//! The 4D ONNX format has batch at axis 2, which breaks batch stripping and causes
-//! downstream Transpose/Reshape failures. PyTorch exports include Transpose+Reshape
-//! nodes to convert from ONNX format to this runtime format; by producing the runtime
-//! format directly, we eliminate the need for those conversion nodes.
+//! The bidirectional sequence output Y is rejected by configuration admission:
+//! emitting a three-dimensional PyTorch convenience layout under its raw ONNX
+//! name would change semantics, while ny does not yet lower the exact four-
+//! dimensional ONNX representation.
 //!
 //! Reference: PyTorch nn.LSTM with bidirectional=True returns `[seq, batch, 2*H]`.
 //! ONNX LSTM spec: https://onnx.ai/onnx/operators/onnx__LSTM.html
@@ -27,8 +24,6 @@ use super::{DirectionResult, LstmConfig};
 /// Wire bidirectional LSTM outputs by combining forward and reverse directions.
 ///
 /// Output formats:
-/// - Y: `[seq, batch, 2*H]` (layout=0) or `[batch, seq, 2*H]` (layout=1).
-///   PyTorch runtime format with fwd/rev hidden states concatenated along last axis.
 /// - Y_h: `[2, batch, H]` (ONNX spec — direction dim stacked)
 /// - Y_c: `[2, batch, H]` (ONNX spec — direction dim stacked)
 pub(super) fn wire_bidirectional_outputs(
@@ -38,9 +33,7 @@ pub(super) fn wire_bidirectional_outputs(
     nodes: &mut Vec<onnx_proto::NodeProto>,
 ) {
     wire_bidirectional_final_states(config, fwd, rev, nodes);
-    if let Some(ref y_out) = config.y_name {
-        wire_bidirectional_sequence_output(config, fwd, rev, y_out, nodes);
-    }
+    debug_assert!(config.y_name.is_none());
 }
 
 /// Stack forward and reverse final states into [2, batch, H] for Y_h, Y_c.
@@ -52,6 +45,7 @@ fn wire_bidirectional_final_states(
 ) {
     let base = &config.base;
     let domain = &config.domain;
+    let direction_axis = if config.layout == 0 { 0 } else { 1 };
 
     if let Some(ref y_h_out) = config.y_h_name {
         let fwd_us = format!("{base}__lstm_bidi_yh_fwd_us");
@@ -61,7 +55,7 @@ fn wire_bidirectional_final_states(
             &[&fwd_us],
             &format!("{base}__lstm_bidi_yh_fwd_unsq"),
             domain,
-            vec![make_ints_attr("axes", &[0])],
+            vec![make_ints_attr("axes", &[direction_axis])],
         ));
         let rev_us = format!("{base}__lstm_bidi_yh_rev_us");
         nodes.push(make_node(
@@ -70,7 +64,7 @@ fn wire_bidirectional_final_states(
             &[&rev_us],
             &format!("{base}__lstm_bidi_yh_rev_unsq"),
             domain,
-            vec![make_ints_attr("axes", &[0])],
+            vec![make_ints_attr("axes", &[direction_axis])],
         ));
         nodes.push(make_node_variadic(
             "Concat",
@@ -78,7 +72,7 @@ fn wire_bidirectional_final_states(
             &[y_h_out],
             &format!("{base}__lstm_bidi_concat_yh"),
             domain,
-            vec![make_int_attr("axis", 0)],
+            vec![make_int_attr("axis", direction_axis)],
         ));
     }
 
@@ -90,7 +84,7 @@ fn wire_bidirectional_final_states(
             &[&fwd_us],
             &format!("{base}__lstm_bidi_yc_fwd_unsq"),
             domain,
-            vec![make_ints_attr("axes", &[0])],
+            vec![make_ints_attr("axes", &[direction_axis])],
         ));
         let rev_us = format!("{base}__lstm_bidi_yc_rev_us");
         nodes.push(make_node(
@@ -99,7 +93,7 @@ fn wire_bidirectional_final_states(
             &[&rev_us],
             &format!("{base}__lstm_bidi_yc_rev_unsq"),
             domain,
-            vec![make_ints_attr("axes", &[0])],
+            vec![make_ints_attr("axes", &[direction_axis])],
         ));
         nodes.push(make_node_variadic(
             "Concat",
@@ -107,75 +101,7 @@ fn wire_bidirectional_final_states(
             &[y_c_out],
             &format!("{base}__lstm_bidi_concat_yc"),
             domain,
-            vec![make_int_attr("axis", 0)],
+            vec![make_int_attr("axis", direction_axis)],
         ));
     }
-}
-
-/// Build bidirectional Y output in PyTorch runtime format: `[seq, batch, 2*H]`.
-///
-/// For each timestep t:
-/// 1. Concat fwd_h_t `[batch, H]` and rev_h_t `[batch, H]` along last axis → `[batch, 2*H]`
-/// 2. Unsqueeze to add time dim → `[1, batch, 2*H]` (layout=0) or `[batch, 1, 2*H]` (layout=1)
-///
-/// Then concat all timesteps along time axis → `[seq, batch, 2*H]` or `[batch, seq, 2*H]`.
-///
-/// This differs from the ONNX spec format `[seq, 2, batch, H]`. We produce the PyTorch
-/// runtime format because ny-propagate's batch stripping assumes batch is axis 0.
-/// The 4D ONNX format has batch at axis 2, which breaks batch stripping. PyTorch ONNX
-/// exports add Transpose+Reshape nodes to convert ONNX→PyTorch format; by producing the
-/// runtime format directly, those conversion nodes should be fused/removed during loading.
-///
-/// After batch stripping: `[seq, 2*H]` — the concatenated hidden states at each timestep.
-fn wire_bidirectional_sequence_output(
-    config: &LstmConfig,
-    fwd: &DirectionResult,
-    rev: &DirectionResult,
-    y_out: &str,
-    nodes: &mut Vec<onnx_proto::NodeProto>,
-) {
-    let base = &config.base;
-    let domain = &config.domain;
-    let layout = config.layout;
-    let mut time_concat_inputs = Vec::new();
-
-    // Time dim: layout=0 -> axis 0 (before batch); layout=1 -> axis 1 (after batch)
-    let time_axis: i64 = if layout == 0 { 0 } else { 1 };
-
-    for t in 0..config.seq_len {
-        // Concat fwd and rev hidden states along the last (hidden) axis.
-        // fwd_h_t: [batch, H], rev_h_t: [batch, H] → [batch, 2*H]
-        let dir_cat = format!("{base}__lstm_bidi_y_t{t}_dir_cat");
-        nodes.push(make_node_variadic(
-            "Concat",
-            &[&fwd.all_h[t], &rev.all_h[t]],
-            &[&dir_cat],
-            &format!("{base}__lstm_bidi_y_t{t}_cat_hidden"),
-            domain,
-            vec![make_int_attr("axis", -1)],
-        ));
-
-        // Unsqueeze to add time dimension.
-        let time_us = format!("{base}__lstm_bidi_y_t{t}_time_us");
-        nodes.push(make_node(
-            "Unsqueeze",
-            &[&dir_cat],
-            &[&time_us],
-            &format!("{base}__lstm_bidi_y_t{t}_time_unsq"),
-            domain,
-            vec![make_ints_attr("axes", &[time_axis])],
-        ));
-
-        time_concat_inputs.push(time_us);
-    }
-
-    let refs: Vec<&str> = time_concat_inputs.iter().map(|s| s.as_str()).collect();
-    nodes.push(make_node_variadic(
-        "Concat",
-        &refs,
-        &[y_out],
-        &format!("{base}__lstm_bidi_concat_Y"),
-        domain,
-        vec![make_int_attr("axis", time_axis)],
-    ));
 }

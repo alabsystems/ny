@@ -926,10 +926,10 @@ pub(crate) fn pool_to_resident_fold(
 }
 
 // ===========================================================================
-// #mn-head-facet increment 1 — HEAD k-ReLU coupling facet → per-subdomain f64
-// critical-row recovery. Build the head pool ONCE at root, reduce to an f64
-// `HeadF64Fold` β-grid, register in the shared `ny-core` registry. The recovery
-// (`sound_f64_lower_bound`) reads it per-subdomain and `max`-intersects (sound).
+// Retired #mn-head-facet research construction. Build the head pool once and
+// retain the f64 `HeadF64Fold` representation for non-authoritative inspection.
+// The shared ny-core proof-path reader is hard-quarantined and never publishes
+// these registry entries into critical-row recovery.
 // ===========================================================================
 
 /// f64 unit roundoff `u = 2⁻⁵³` — the head-fold build-error twin of the recovery's
@@ -943,11 +943,10 @@ pub fn head_facet_enabled() -> bool {
     ny_core::head_f64_fold::head_f64_fold_enabled()
 }
 
-/// #mn-head-f64-certified-measure (RESEARCH ONLY, dark, default-off).
-/// Arms the CPU-f64 masked head fold using EXACT-certified facets
-/// (`certified_coupling_facets_exact`) + binding-select ranking, purely to
-/// MEASURE whether a well-selected k=2 head facet lifts the cifar margin.
-/// Separate from the quarantined production gates; NOT verdict re-authorization.
+/// Legacy #mn-head-f64-certified-measure request (research only).
+///
+/// It may build an exact-facet registry entry for inspection, but cannot arm
+/// the hard-quarantined CPU-f64 proof-path reader or affect a verdict.
 pub fn head_f64_certified_measure_enabled() -> bool {
     matches!(
         std::env::var("NY_MN_HEAD_F64_CERTIFIED_MEASURE")
@@ -1149,18 +1148,17 @@ pub fn build_head_f64_fold(
     Some(folds)
 }
 
-/// Build + register the HEAD coupling-facet fold β-grid (called ONCE at root when
-/// `NY_MN_HEAD_FACET=1`). Registered into the shared `ny-core` registry BEFORE the
-/// wide lane runs; the per-subdomain f64 recovery reads it. Always clears any
-/// stale entry first, so a build that finds no facet leaves the recovery
-/// byte-identical.
+/// Build + register the retired HEAD coupling-facet β-grid for raw research
+/// inspection. The shared `ny-core` proof-path reader is hard-quarantined, so a
+/// populated registry cannot affect per-subdomain f64 recovery. Always clears
+/// any stale research entry first.
 ///
 /// `objectives` threads the output objective spec so the #mn-head-f64-certified-
 /// measure research lane (`NY_MN_HEAD_F64_CERTIFIED_MEASURE=1`) can rank candidate
-/// head pairs by their JOINT effect on the BINDING worst-child margin (via the
-/// existing [`head_objective_coeffs`]) and draw facets from the EXACT-certified
-/// source. When that research gate is OFF the objectives are unused, `binding_coeffs
-/// = None`, `use_certified = false` ⇒ byte-identical to the pre-measurement path.
+/// head pairs by their joint effect on the binding worst-child margin (via the
+/// existing [`head_objective_coeffs`]) and draw facets from the exact-certified
+/// source. This changes only the inert research registry; proof-bearing recovery
+/// remains unchanged.
 pub fn install_head_f64_fold(
     graph: &GraphNetwork,
     input: &BoundedTensor,

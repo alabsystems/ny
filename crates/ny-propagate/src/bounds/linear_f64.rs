@@ -10,7 +10,10 @@
 //! Reference: alpha-beta-CROWN `double_fp` (`abcrown.py:81-82`).
 
 use ndarray::{Array1, Array2};
-use ny_core::{NyError, Result};
+use ny_core::{
+    dd::{two_prod, two_sum},
+    NyError, Result,
+};
 use ny_tensor::BoundedTensor64;
 use tracing::warn;
 
@@ -21,16 +24,18 @@ use super::LinearBounds;
 /// sentinels are preserved. `0.0` maps to the smallest negative subnormal.
 #[inline]
 fn next_down_f64_ulp(x: f64) -> f64 {
-    if !x.is_finite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return -f64::from_bits(1);
     }
-    if x > 0.0 {
-        f64::from_bits(x.to_bits() - 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits - 1)
     } else {
-        f64::from_bits(x.to_bits() + 1)
+        f64::from_bits(bits + 1)
     }
 }
 
@@ -39,16 +44,66 @@ fn next_down_f64_ulp(x: f64) -> f64 {
 /// sentinels are preserved. `0.0` maps to the smallest positive subnormal.
 #[inline]
 fn next_up_f64_ulp(x: f64) -> f64 {
-    if !x.is_finite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    if x > 0.0 {
-        f64::from_bits(x.to_bits() + 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits + 1)
     } else {
-        f64::from_bits(x.to_bits() - 1)
+        f64::from_bits(bits - 1)
+    }
+}
+
+#[inline]
+fn add_down_f64(a: f64, b: f64) -> f64 {
+    let (sum, residual) = two_sum(a, b);
+    if !sum.is_finite() {
+        sum
+    } else if residual < 0.0 {
+        next_down_f64_ulp(sum)
+    } else {
+        sum
+    }
+}
+
+#[inline]
+fn add_up_f64(a: f64, b: f64) -> f64 {
+    let (sum, residual) = two_sum(a, b);
+    if !sum.is_finite() {
+        sum
+    } else if residual > 0.0 {
+        next_up_f64_ulp(sum)
+    } else {
+        sum
+    }
+}
+
+#[inline]
+fn mul_down_f64(a: f64, b: f64) -> f64 {
+    let (product, residual) = two_prod(a, b);
+    if !product.is_finite() {
+        product
+    } else if residual < 0.0 {
+        next_down_f64_ulp(product)
+    } else {
+        product
+    }
+}
+
+#[inline]
+fn mul_up_f64(a: f64, b: f64) -> f64 {
+    let (product, residual) = two_prod(a, b);
+    if !product.is_finite() {
+        product
+    } else if residual > 0.0 {
+        next_up_f64_ulp(product)
+    } else {
+        product
     }
 }
 
@@ -190,6 +245,7 @@ impl LinearBounds64 {
     /// All arithmetic in f64, no intermediate f32 cast.
     pub fn concretize(&self, input: &BoundedTensor64) -> Result<BoundedTensor64> {
         self.validate_shapes()?;
+        self.validate_no_nan()?;
 
         let (in_l, in_u) = input.flatten_to_1d();
         let m = self.lower_a.nrows();
@@ -201,23 +257,9 @@ impl LinearBounds64 {
 
         let (mut lower, mut upper) = self.concretize_dot_products(m, n, &in_l, &in_u);
 
-        // SOUNDNESS (#concretize-soundness-hardening): widen each finite endpoint
-        // outward by one f64 ULP (lower toward -∞, upper toward +∞). The dot-product
-        // sums are accumulated with round-to-nearest f64 arithmetic, so each endpoint
-        // can be optimistic by up to ~0.5 ULP per rounding step; a single directed
-        // 1-ULP step does NOT bound a many-term accumulation in general, but it closes
-        // the *sub-ULP* gap that survives the final cast and guarantees the stored
-        // endpoint is never *exactly* equal to an optimistic round-to-nearest result.
-        //
-        // This is the audit's suggested one-line close. It is intentionally cheap:
-        // the f64 path is not performance-critical (soundnessbench / `--double-fp`
-        // only). The certified coefficient-error penalty (`lower_a_err`/`upper_a_err`,
-        // applied in `concretize_dot_products`) already covers the dominant
-        // coefficient-error term; this final widening hardens the bias/accumulation
-        // boundary so the f64 endpoints are sound *before* any later `to_f32_sound`
-        // conversion (which adds its own much-larger f32-ULP margin). Even a consumer
-        // that reads these f64 endpoints directly (without `to_f32_sound`) now gets a
-        // directed-outward bound. ±inf is preserved unchanged.
+        // The inner loop directs every product/addition using exact EFT residuals.
+        // Retain one publication ULP for compatibility with the historical API
+        // contract and as a final boundary guard.
         for v in lower.iter_mut() {
             *v = next_down_f64_ulp(*v);
         }
@@ -275,33 +317,33 @@ impl LinearBounds64 {
                 if lower_err.is_some() || upper_err.is_some() {
                     let mag = x_l.abs().max(x_u.abs());
                     if let Some(le) = lower_err {
-                        err_penalty_l += le[[i, j]] * mag;
+                        err_penalty_l = add_up_f64(err_penalty_l, mul_up_f64(le[[i, j]], mag));
                     }
                     if let Some(ue) = upper_err {
-                        err_penalty_u += ue[[i, j]] * mag;
+                        err_penalty_u = add_up_f64(err_penalty_u, mul_up_f64(ue[[i, j]], mag));
                     }
                 }
 
                 // Positive/negative split; 0*inf=0 by skipping zero coefficients.
                 if la > 0.0 {
-                    sum_l += la * x_l;
+                    sum_l = add_down_f64(sum_l, mul_down_f64(la, x_l));
                 } else if la < 0.0 {
-                    sum_l += la * x_u;
+                    sum_l = add_down_f64(sum_l, mul_down_f64(la, x_u));
                 }
                 if ua > 0.0 {
-                    sum_u += ua * x_u;
+                    sum_u = add_up_f64(sum_u, mul_up_f64(ua, x_u));
                 } else if ua < 0.0 {
-                    sum_u += ua * x_l;
+                    sum_u = add_up_f64(sum_u, mul_up_f64(ua, x_l));
                 }
             }
 
             // Apply the certified-error penalty: lower DOWN, upper UP. A non-finite
             // penalty drives the bound to ±inf (sound, maximally loose).
             if err_penalty_l != 0.0 {
-                sum_l -= err_penalty_l;
+                sum_l = add_down_f64(sum_l, -err_penalty_l);
             }
             if err_penalty_u != 0.0 {
-                sum_u += err_penalty_u;
+                sum_u = add_up_f64(sum_u, err_penalty_u);
             }
 
             // NaN guard
@@ -418,6 +460,24 @@ impl LinearBounds64 {
                 expected
             )));
         }
+        if self
+            .lower_a_err
+            .as_ref()
+            .is_some_and(|error| error.shape() != self.lower_a.shape())
+        {
+            return Err(NyError::InvalidSpec(
+                "LinearBounds64 lower_a_err shape mismatch".into(),
+            ));
+        }
+        if self
+            .upper_a_err
+            .as_ref()
+            .is_some_and(|error| error.shape() != self.upper_a.shape())
+        {
+            return Err(NyError::InvalidSpec(
+                "LinearBounds64 upper_a_err shape mismatch".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -440,6 +500,17 @@ impl LinearBounds64 {
         if self.upper_b.iter().any(|v| v.is_nan()) {
             return Err(NyError::NumericalInstability(
                 "LinearBounds64 upper_b contains NaN".into(),
+            ));
+        }
+        if self
+            .lower_a_err
+            .iter()
+            .chain(self.upper_a_err.iter())
+            .flat_map(|error| error.iter())
+            .any(|&value| value.is_nan() || value < 0.0)
+        {
+            return Err(NyError::NumericalInstability(
+                "LinearBounds64 coefficient error must be non-negative and non-NaN".into(),
             ));
         }
         Ok(())
@@ -493,6 +564,39 @@ mod tests {
         // (#concretize-soundness-hardening): assert sound enclosure within 1 ULP.
         assert!(result.lower()[0] <= 1.0 && result.lower()[0] >= next_down_f64_ulp(1.0));
         assert!(result.upper()[0] >= 7.0 && result.upper()[0] <= next_up_f64_ulp(7.0));
+    }
+
+    #[test]
+    fn concretize_directs_each_f64_operation_under_cancellation() {
+        let large = 2.0_f64.powi(60);
+        let coefficients = arr2(&[[large, 1.0, -large]]);
+        let bounds = LinearBounds64::new(
+            coefficients.clone(),
+            arr1(&[0.0]),
+            coefficients,
+            arr1(&[0.0]),
+        )
+        .unwrap();
+        let point = arr1(&[1.0, 1.0, 1.0]).into_dyn();
+        let input = BoundedTensor64::new(point.clone(), point).unwrap();
+        let result = bounds.concretize(&input).unwrap();
+
+        assert!(result.lower()[[0]] <= 1.0, "lower={}", result.lower()[[0]]);
+        assert!(result.upper()[[0]] >= 1.0, "upper={}", result.upper()[[0]]);
+    }
+
+    #[test]
+    fn malformed_coefficient_error_is_rejected_before_concretization() {
+        let mut negative = LinearBounds64::identity(1);
+        negative.lower_a_err = Some(arr2(&[[-1.0]]));
+        negative.upper_a_err = Some(arr2(&[[0.0]]));
+        let point = arr1(&[1.0]).into_dyn();
+        let input = BoundedTensor64::new(point.clone(), point).unwrap();
+        assert!(negative.concretize(&input).is_err());
+
+        let mut wrong_shape = LinearBounds64::identity(1);
+        wrong_shape.lower_a_err = Some(Array2::zeros((2, 1)));
+        assert!(wrong_shape.concretize(&input).is_err());
     }
 
     /// #concretize-soundness-hardening: the f64 concretize endpoints are widened

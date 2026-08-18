@@ -233,6 +233,159 @@ fn graph_from_root_alpha_state_channel_only_expand_gate_4404() {
             "gate on: neuron {idx} upper must seed from its channel's α {expected_upper}, got {au}"
         );
     }
+
+    // The selective paired-state experiment has an explicit converter. It
+    // must expand W correctly without arming the global inheritance gate.
+    let state_explicit = GraphDomainAlphaState::try_from_root_alpha_state_borrowed_expanded(
+        &root_alpha,
+        &graph,
+        &node_bounds,
+        &history,
+        &input_bounds,
+    )
+    .expect("well-formed channel metadata must expand");
+    for idx in 0..8 {
+        let expected = if idx < 4 { 0.7 } else { 0.3 };
+        let expected_upper = if idx < 4 { 0.6 } else { 0.4 };
+        assert!((state_explicit.alpha("relu0", idx) - expected).abs() < 1e-6);
+        assert!((state_explicit.alpha_upper("relu0", idx) - expected_upper).abs() < 1e-6);
+    }
+
+    for malformed_shape in [
+        vec![],
+        vec![0, 2, 2],
+        vec![3, 2, 2],
+        vec![2, 1, 4],
+        vec![2, 0, 2],
+        vec![2, usize::MAX, 2],
+    ] {
+        let mut malformed = root_alpha.clone();
+        malformed
+            .spatial_shapes
+            .insert("relu0".to_string(), malformed_shape);
+        assert!(
+            GraphDomainAlphaState::try_from_root_alpha_state_borrowed_expanded(
+                &malformed,
+                &graph,
+                &node_bounds,
+                &history,
+                &input_bounds,
+            )
+            .is_none(),
+            "malformed spatial metadata must fail closed without panicking"
+        );
+    }
+
+    for (lower, upper) in [
+        (arr1(&[f32::NAN, 0.3]), arr1(&[0.6, 0.4])),
+        (arr1(&[0.7, 0.3]), arr1(&[0.6, f32::INFINITY])),
+        (arr1(&[0.7]), arr1(&[0.6, 0.4])),
+        (arr1(&[0.7, 0.3, 0.2]), arr1(&[0.6, 0.4])),
+        (arr1(&[0.7, 0.3]), arr1(&[0.6])),
+        (arr1(&[0.7, 0.3]), arr1(&[0.6, 0.4, 0.2])),
+    ] {
+        let mut malformed = root_alpha.clone();
+        malformed.alphas.insert("relu0".to_string(), lower);
+        malformed.alphas_upper.insert("relu0".to_string(), upper);
+        assert!(
+            GraphDomainAlphaState::try_from_root_alpha_state_borrowed_expanded(
+                &malformed,
+                &graph,
+                &node_bounds,
+                &history,
+                &input_bounds,
+            )
+            .is_none(),
+            "invalid expanded alpha metadata must fail closed"
+        );
+    }
+
+    // Without spatial metadata, both paths must be exact full-neuron arrays;
+    // covering only currently unstable indices is insufficient because stable
+    // neurons may become unstable in a child.
+    let full_lower = ndarray::Array1::from_vec(vec![0.7_f32; 8]);
+    let full_upper = ndarray::Array1::from_vec(vec![0.6_f32; 8]);
+    let mut full = root_alpha.clone();
+    full.spatial_shapes.remove("relu0");
+    full.alphas.insert("relu0".to_string(), full_lower.clone());
+    full.alphas_upper
+        .insert("relu0".to_string(), full_upper.clone());
+    assert!(
+        GraphDomainAlphaState::try_from_root_alpha_state_borrowed_expanded(
+            &full,
+            &graph,
+            &node_bounds,
+            &history,
+            &input_bounds,
+        )
+        .is_some(),
+        "exact non-spatial lower/upper arrays should convert"
+    );
+
+    for (lower, upper) in [
+        (
+            ndarray::Array1::from_vec(vec![0.7_f32; 7]),
+            full_upper.clone(),
+        ),
+        (
+            ndarray::Array1::from_vec(vec![0.7_f32; 9]),
+            full_upper.clone(),
+        ),
+        (
+            full_lower.clone(),
+            ndarray::Array1::from_vec(vec![0.6_f32; 7]),
+        ),
+        (full_lower, ndarray::Array1::from_vec(vec![0.6_f32; 9])),
+        (
+            ndarray::Array1::from_vec(vec![0.7, 0.7, 0.7, f32::NAN, 0.7, 0.7, 0.7, 0.7]),
+            full_upper,
+        ),
+    ] {
+        let mut malformed = full.clone();
+        malformed.alphas.insert("relu0".to_string(), lower);
+        malformed.alphas_upper.insert("relu0".to_string(), upper);
+        assert!(
+            GraphDomainAlphaState::try_from_root_alpha_state_borrowed_expanded(
+                &malformed,
+                &graph,
+                &node_bounds,
+                &history,
+                &input_bounds,
+            )
+            .is_none(),
+            "non-spatial lower/upper arrays require exact finite tensor identity"
+        );
+    }
+
+    let mut missing_upper = root_alpha.clone();
+    missing_upper.alphas_upper.remove("relu0");
+    assert!(
+        GraphDomainAlphaState::try_from_root_alpha_state_borrowed_expanded(
+            &missing_upper,
+            &graph,
+            &node_bounds,
+            &history,
+            &input_bounds,
+        )
+        .is_none(),
+        "a partial lower/upper map must be rejected before candidate mutation"
+    );
+
+    let mut orphan_metadata = root_alpha.clone();
+    orphan_metadata
+        .spatial_shapes
+        .insert("unknown_relu".to_string(), vec![2, 2, 2]);
+    assert!(
+        GraphDomainAlphaState::try_from_root_alpha_state_borrowed_expanded(
+            &orphan_metadata,
+            &graph,
+            &node_bounds,
+            &history,
+            &input_bounds,
+        )
+        .is_none(),
+        "orphan spatial metadata must not produce a partially updated candidate"
+    );
 }
 
 #[test]

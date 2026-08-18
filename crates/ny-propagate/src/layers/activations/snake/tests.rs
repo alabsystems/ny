@@ -392,6 +392,30 @@ fn test_relaxation_point_interval() {
     );
 }
 
+#[test]
+fn test_narrow_nonpoint_interval_does_not_use_tangent() {
+    let l = 0.0_f32;
+    let u = 1e-8_f32;
+    let a = 1e8_f32;
+    let r = snake_linear_relaxation(l, u, a);
+
+    for &x in &[f64::from(l), 0.5 * f64::from(u), f64::from(u)] {
+        let y = snake_eval_f64(x, f64::from(a));
+        let lower = f64::from(r.lower_slope) * x + f64::from(r.lower_intercept);
+        let upper = f64::from(r.upper_slope) * x + f64::from(r.upper_intercept);
+        assert!(
+            lower <= y,
+            "narrow-interval lower envelope missed by {}",
+            lower - y
+        );
+        assert!(
+            upper >= y,
+            "narrow-interval upper envelope missed by {}",
+            y - upper
+        );
+    }
+}
+
 /// Regression test for #3083: infinite upper bound relaxation had slope/intercept swapped.
 /// The lower bound was f(l)*x instead of constant f(l), which is unsound for large x.
 #[test]
@@ -480,6 +504,95 @@ fn test_relaxation_zero_alpha() {
     let r = snake_linear_relaxation(-1.0, 1.0, 0.0);
     assert!((r.lower_slope - 1.0).abs() < 0.01);
     assert!((r.upper_slope - 1.0).abs() < 0.01);
+}
+
+/// A nonzero alpha is never uniformly interchangeable with zero over the full
+/// finite f32 domain.  At x ~= pi/(2a), the residual sin^2(a*x)/a is ~= 1/a
+/// even when alpha is tiny.
+#[test]
+fn test_tiny_nonzero_alpha_relaxation_retains_global_residual() {
+    for &a in &[1e-9_f32, 1e-12_f32, 1e-20_f32] {
+        let x = (std::f64::consts::FRAC_PI_2 / f64::from(a)) as f32;
+        let y = snake_eval_f64(f64::from(x), f64::from(a));
+        assert!(
+            y - f64::from(x) > 0.9 / f64::from(a),
+            "test point must exercise the non-identity residual for a={a}"
+        );
+
+        let r = snake_linear_relaxation(0.0, x, a);
+        let lower = f64::from(r.lower_slope) * f64::from(x) + f64::from(r.lower_intercept);
+        let upper = f64::from(r.upper_slope) * f64::from(x) + f64::from(r.upper_intercept);
+        assert!(
+            lower <= y,
+            "tiny-alpha lower envelope missed by {}",
+            lower - y
+        );
+        assert!(
+            upper >= y,
+            "tiny-alpha upper envelope missed by {}",
+            y - upper
+        );
+        assert!(r.upper_intercept > 0.0);
+    }
+}
+
+#[test]
+fn test_tiny_negative_alpha_internal_relaxation_is_symmetric_and_sound() {
+    let a = -1e-9_f32;
+    let x = (std::f64::consts::FRAC_PI_2 / f64::from(a.abs())) as f32;
+    let y = snake_eval_f64(f64::from(x), f64::from(a));
+    let r = snake_linear_relaxation(0.0, x, a);
+    let lower = f64::from(r.lower_slope) * f64::from(x) + f64::from(r.lower_intercept);
+    let upper = f64::from(r.upper_slope) * f64::from(x) + f64::from(r.upper_intercept);
+
+    assert!(
+        lower <= y,
+        "negative-alpha lower envelope missed by {}",
+        lower - y
+    );
+    assert!(
+        upper >= y,
+        "negative-alpha upper envelope missed by {}",
+        y - upper
+    );
+    assert!(r.lower_intercept < 0.0);
+    assert_eq!(r.upper_intercept, 0.0);
+}
+
+#[test]
+fn test_relaxation_small_alpha_large_input_is_not_identity() {
+    let a = 1.0e-12_f32;
+    let l = 0.0_f32;
+    let u = 3.084_070_9e22_f32;
+    let r = snake_linear_relaxation(l, u, a);
+
+    assert_eq!(r.lower_slope, 1.0);
+    assert_eq!(r.lower_intercept, 0.0);
+    assert_eq!(r.upper_slope, 1.0);
+    assert!(r.upper_intercept >= (1.0 / f64::from(a)) as f32);
+
+    for x in [l, 7.853_982e12_f32, u] {
+        let y = snake_eval_f64(f64::from(x), f64::from(a));
+        let lower = f64::from(r.lower_slope) * f64::from(x) + f64::from(r.lower_intercept);
+        let upper = f64::from(r.upper_slope) * f64::from(x) + f64::from(r.upper_intercept);
+        assert!(lower <= y, "small-alpha lower envelope failed at {x:e}");
+        assert!(upper >= y, "small-alpha upper envelope failed at {x:e}");
+    }
+}
+
+#[test]
+fn test_relaxation_narrow_interval_high_frequency_is_not_a_point() {
+    let a = 1.0e8_f32;
+    let l = 0.0_f32;
+    let u = 1.0e-8_f32;
+    let r = snake_linear_relaxation(l, u, a);
+    let y = snake_eval_f64(f64::from(u), f64::from(a));
+    let upper = f64::from(r.upper_slope) * f64::from(u) + f64::from(r.upper_intercept);
+
+    assert!(
+        upper >= y,
+        "high-frequency narrow interval upper envelope failed: {upper:e} < {y:e}"
+    );
 }
 
 #[test]

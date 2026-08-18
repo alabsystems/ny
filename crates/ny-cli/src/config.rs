@@ -178,6 +178,9 @@ pub(crate) struct VerifySettings {
     pub(crate) mul_binary_relaxation: MulBinaryRelaxationArg,
     pub(crate) timeout: u64,
     pub(crate) backend: BackendArg,
+    /// Whether no CLI/config source selected a backend. This survives default
+    /// resolution so runtime can distinguish AUTO from an explicit CPU pin.
+    pub(crate) backend_automatic: bool,
     pub(crate) max_iterations: usize,
     pub(crate) tolerance: f32,
     pub(crate) peel_off_last_softmax_layer: bool,
@@ -195,6 +198,7 @@ impl VerifySettings {
             mul_binary_relaxation: MulBinaryRelaxationArg::Mccormick,
             timeout: DEFAULT_TIMEOUT,
             backend: BackendArg::Cpu,
+            backend_automatic: true,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             tolerance: DEFAULT_TOLERANCE,
             peel_off_last_softmax_layer: false,
@@ -224,6 +228,7 @@ impl VerifySettings {
         }
         if let Some(backend) = overrides.backend {
             self.backend = backend;
+            self.backend_automatic = false;
         }
         if let Some(max_iterations) = overrides.max_iterations {
             self.max_iterations = max_iterations;
@@ -528,8 +533,12 @@ impl VerifyConfigFile {
                     overrides.max_iterations = Some(max_iterations);
                 }
                 if let Some(use_gpu) = propagation.use_gpu {
-                    if use_gpu && overrides.backend.is_none() {
-                        overrides.backend = Some(BackendArg::Wgpu);
+                    if overrides.backend.is_none() {
+                        overrides.backend = Some(if use_gpu {
+                            BackendArg::Wgpu
+                        } else {
+                            BackendArg::Cpu
+                        });
                     }
                 }
                 if let Some(double_fp) = propagation.double_fp {
@@ -659,6 +668,40 @@ mod tests {
         assert!(overrides.mul_binary_relaxation.is_none());
         assert!(overrides.timeout.is_none());
         assert!(overrides.backend.is_none());
+    }
+
+    #[test]
+    fn explicit_config_use_gpu_false_pins_cpu_and_disables_auto_gpu() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "solver:\n  propagation:\n    use_gpu: false\n",
+        )
+        .unwrap();
+
+        let settings =
+            resolve_verify_settings(Some(config_path), None, VerifyConfigOverrides::default())
+                .unwrap();
+        assert_eq!(settings.backend, BackendArg::Cpu);
+        assert!(!settings.backend_automatic);
+    }
+
+    #[test]
+    fn general_device_keeps_precedence_over_propagation_use_gpu() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "general:\n  device: wgpu\nsolver:\n  propagation:\n    use_gpu: false\n",
+        )
+        .unwrap();
+
+        let settings =
+            resolve_verify_settings(Some(config_path), None, VerifyConfigOverrides::default())
+                .unwrap();
+        assert_eq!(settings.backend, BackendArg::Wgpu);
+        assert!(!settings.backend_automatic);
     }
 
     #[test]
@@ -906,7 +949,7 @@ mod tests {
         let config: VerifyConfigFile = serde_yaml::from_str(
             r#"
 bab:
-  enable_cuts: true
+  enable_cuts: false
   conv_mode: matrix
 "#,
         )
@@ -922,7 +965,7 @@ bab:
         );
         assert!(
             !bab.use_patches(),
-            "#3813: matrix bab.conv_mode must force dense graph CROWN even with cuts enabled"
+            "#3813: matrix bab.conv_mode must force dense graph CROWN without cut authority"
         );
     }
 }

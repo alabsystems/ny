@@ -13,6 +13,21 @@ use super::shared::compute_crown_or_ibp_bounds;
 use crate::bounds::{GraphAlphaState, LinearBounds};
 use crate::GraphNetwork;
 
+#[cfg(test)]
+thread_local! {
+    static BUILD_BATCH_ENTRY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_build_batch_entry_count() {
+    BUILD_BATCH_ENTRY_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn build_batch_entry_count() -> usize {
+    BUILD_BATCH_ENTRY_COUNT.get()
+}
+
 /// Root-build wrapper that chunks large spec matrices into smaller batches.
 ///
 /// Mirrors alpha-beta-CROWN `solver.build_batch_size` for the graph
@@ -34,6 +49,9 @@ pub(crate) fn compute_crown_or_ibp_bounds_in_build_batches(
     crown_backward_layers: Option<usize>,
     ibp_enhancement: bool,
 ) -> Result<(BoundedTensor, Option<LinearBounds>)> {
+    #[cfg(test)]
+    BUILD_BATCH_ENTRY_COUNT.set(BUILD_BATCH_ENTRY_COUNT.get() + 1);
+
     let chunk_size = match build_batch_size {
         Some(0) => {
             return Err(NyError::InvalidConfig(

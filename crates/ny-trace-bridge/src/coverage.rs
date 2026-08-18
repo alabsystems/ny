@@ -32,16 +32,19 @@
 //! - [`BridgeSoundness::SoundButLoose`] — bounds remain a correct
 //!   over-approximation but are *known to be loose*: normalisation, softmax,
 //!   attention, cross-element reductions, and transcendentals
-//!   (`exp`/`log`/`sqrt`/`div`/resize/grid-sample) whose interval relaxations
+//!   (`exp`/`log`/`sqrt`/`div`) whose interval relaxations
 //!   widen quickly. Still safe to verify with; just weaker. The extreme case
 //!   is `Custom`, the trace format's explicit opaque escape hatch: lowered to
 //!   the graph builder's `OpaqueSkip` substitution, whose `[-inf, +inf]`
 //!   bounds are a *vacuous but genuinely sound* over-approximation of any op
 //!   (never an identity) — verification succeeds only if nothing downstream
 //!   depends on that value.
-//! - [`BridgeSoundness::Unsupported`] — the op's output *shape or routing*
-//!   depends on tensor **values** (`Topk`, `Argmax`/`Argmin`, `ArgSort`,
-//!   `Scatter*`, `IndexPut`, `MoeGating`, value comparisons, `WhereCond`).
+//! - [`BridgeSoundness::Unsupported`] — the op's output *shape, routing, or
+//!   source-coordinate mapping* depends on tensor **values** (`Topk`,
+//!   `Argmax`/`Argmin`, `ArgSort`, `Scatter*`, `IndexPut`, `MoeGating`,
+//!   `WhereCond`, resampling), required semantics are absent from the wire
+//!   format (`ToDtype` source dtype, `RepeatInterleave` counts), or no current
+//!   lowering preserves them (`Fract`, general `Powf`).
 //!   The bridge must **refuse** these rather than emit a vacuous/incorrect
 //!   layer (sound by construction); they are handled by graph segmentation
 //!   upstream, not by direct translation.
@@ -131,7 +134,6 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::Upsample1d { .. }
         | TraceOp::IndexSelect { .. }
         | TraceOp::Gather { .. }
-        | TraceOp::RepeatInterleave { .. }
         | TraceOp::ReflectionPad1d { .. }
         | TraceOp::ReflectionPad2d { .. }
         | TraceOp::ConstantPadNd { .. }
@@ -176,7 +178,6 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::Sin
         | TraceOp::Cos
         | TraceOp::Tan
-        | TraceOp::Fract
         | TraceOp::Atan2
         | TraceOp::Activation { .. }
         | TraceOp::Elu { .. }
@@ -190,12 +191,12 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::Softsign
         | TraceOp::PRelu { .. }
         | TraceOp::SwiGlu
-        | TraceOp::Powf { .. }
         | TraceOp::Clamp { .. }
-        | TraceOp::ToDtype { .. }
         | TraceOp::MaxPool1d { .. }
         | TraceOp::MaxPool2d { .. }
         | TraceOp::AdaptiveMaxPool2d { .. } => Sound,
+
+        TraceOp::Powf { exponent } if [0.0, 0.5, 1.0, 2.0, -1.0, -0.5].contains(exponent) => Sound,
 
         // Comparisons: lowered to Compare/CompareTensor layers whose
         // {0,1}-interval IBP is exact off the threshold and the [0,1] hull
@@ -234,9 +235,7 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::AdaptiveAvgPool1d { .. }
         | TraceOp::AdaptiveAvgPool2d { .. }
         | TraceOp::KokoroFused(_)
-        | TraceOp::Upsample2d { .. }
-        | TraceOp::ResizeBilinear { .. }
-        | TraceOp::GridSample { .. } => SoundButLoose,
+        | TraceOp::Upsample2d { .. } => SoundButLoose,
 
         // `Custom` — the explicit opaque escape hatch — is the maximally
         // loose case: lowered to the graph builder's OpaqueSkip substitution,
@@ -245,10 +244,10 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         // ny-propagate layers/misc/skip_merge.rs for the verified rule).
         TraceOp::Custom { .. } => SoundButLoose,
 
-        // -- Unsupported: data-dependent shape/routing ------------------------
-        // Output shape, selection, or routing depends on tensor *values* — the
-        // bridge must refuse (sound by construction) and let upstream graph
-        // segmentation handle the boundary.
+        // -- Unsupported: missing or data-dependent semantics -----------------
+        // Refuse any op whose required routing/parameters are value-dependent
+        // or absent from the serialized trace, and any op without a semantics-
+        // preserving lowering.
         TraceOp::Topk { .. }
         | TraceOp::Argmax { .. }
         | TraceOp::Argmin { .. }
@@ -260,6 +259,12 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::IndexPut { .. }
         | TraceOp::MoeGating { .. }
         | TraceOp::WhereCond
+        | TraceOp::ToDtype { .. }
+        | TraceOp::Powf { .. }
+        | TraceOp::Fract
+        | TraceOp::RepeatInterleave { .. }
+        | TraceOp::ResizeBilinear { .. }
+        | TraceOp::GridSample { .. }
         | TraceOp::SegmentBoundary { .. } => Unsupported,
     }
 }
@@ -801,6 +806,7 @@ pub fn coverage() -> CoverageReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::DType;
     use std::collections::BTreeSet;
 
     /// The number of `TraceOp` variants, pinned identically to `schema`.
@@ -909,6 +915,14 @@ mod tests {
                 top_k: 1,
             },
             TraceOp::WhereCond,
+            TraceOp::ResizeBilinear {
+                target_h: 2,
+                target_w: 2,
+            },
+            TraceOp::GridSample {
+                padding_mode: crate::schema::GridSamplePaddingMode::Zeros,
+                align_corners: false,
+            },
         ];
         for op in must_be_unsupported {
             assert_eq!(
@@ -917,6 +931,51 @@ mod tests {
                 "{op:?} must be Unsupported"
             );
             assert!(!is_translatable(&op));
+        }
+    }
+
+    #[test]
+    fn dtype_cast_soundness_is_fail_closed() {
+        for target_dtype in [
+            DType::F32,
+            DType::F64,
+            DType::F16,
+            DType::Bf16,
+            DType::I32,
+            DType::I64,
+            DType::U32,
+            DType::U8,
+            DType::Bool,
+        ] {
+            let op = TraceOp::ToDtype { target_dtype };
+            assert_eq!(
+                trace_op_soundness(&op),
+                BridgeSoundness::Unsupported,
+                "{target_dtype:?} cannot be classified without the source dtype"
+            );
+            assert!(!is_translatable(&op));
+        }
+    }
+
+    #[test]
+    fn semantics_losing_misc_lowerings_are_unsupported() {
+        for op in [
+            TraceOp::Powf { exponent: 3.0 },
+            TraceOp::Fract,
+            TraceOp::RepeatInterleave { dim: 0 },
+        ] {
+            assert_eq!(
+                trace_op_soundness(&op),
+                BridgeSoundness::Unsupported,
+                "{op:?} must fail closed"
+            );
+            assert!(!is_translatable(&op));
+        }
+
+        for exponent in [0.0, 0.5, 1.0, 2.0, -1.0, -0.5] {
+            let op = TraceOp::Powf { exponent };
+            assert_eq!(trace_op_soundness(&op), BridgeSoundness::Sound);
+            assert!(is_translatable(&op));
         }
     }
 

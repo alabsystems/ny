@@ -14,6 +14,9 @@
 // in its table would signal a bignum regression.
 //
 // For each (precision p, depth k) we build a width-W k-hidden-layer net whose
+
+#![forbid(unsafe_code)]
+
 // weights are p-bit dyadic rationals (denominator 2^p, like a real network
 // quantized to 2^-p), certify exactly, and report whether the arithmetic and
 // the emission both succeeded (they now always do).

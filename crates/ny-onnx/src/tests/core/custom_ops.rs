@@ -51,6 +51,7 @@ fn build_custom_op_model_bytes() -> Vec<u8> {
         node: vec![node("acme_relu", &["input"], &["output"])],
         name: "acme_custom_op".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("output", &[1, 2])],
         #[cfg(feature = "onnx-value-info")]

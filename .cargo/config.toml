@@ -1,9 +1,31 @@
 [net]
 git-fetch-with-cli = true
 
+# Unit tests exercise many production environment policies through scoped
+# process-global overrides. Serializing only the writers is insufficient:
+# unrelated parallel readers can observe those temporary values and take a
+# different proof route. The ny-propagate test binary is also tensor-heavy, so
+# bounding concurrency controls its peak RSS. Keep the workspace's default
+# libtest execution deterministic and within the memory cap. A deliberately
+# isolated test may still override this with an explicit `--test-threads`
+# argument.
+[env]
+RUST_TEST_THREADS = "1"
+
 # Do not source-replace internal repositories with vendored copies. Local AY
 # development happens in the sibling ~/ay checkout; publish AY, then bump the
 # exact Git revision in crates/ny-mip/Cargo.toml. Third-party source vendoring,
 # when needed, is independent of this policy. AY build provenance comes from
 # its real Git checkout; sealed builders derive the expected revision from
 # Cargo.lock and pass it explicitly.
+
+# gemm-f16 0.19 (candle's f16 GEMM backend) contains unconditional fp16 inline
+# asm (`fmla v.8h`) that LLVM refuses to assemble unless the target carries the
+# `fp16` (fullfp16) feature. Apple aarch64 targets have it in their BASELINE,
+# which is why macOS dev boxes never see this; generic aarch64-unknown-linux-gnu
+# does not, so a Linux-aarch64 host (the GB10) fails at `cargo test` time inside
+# a third-party crate. Every deployment aarch64 host of this project (Grace,
+# Apple Silicon) implements ARMv8.2 FP16, so enabling the feature is a
+# baseline statement, not a -Ctarget-cpu=native machine coupling.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+fp16"]

@@ -13,14 +13,14 @@ use crate::{BetaCrownConfig, BetaCrownVerifier, BoundedTensor};
 use ndarray::arr1;
 
 use super::support::{
-    active_relu_history, assert_cache_bounds_close, assert_scalar_bounds, build_input_bounds,
-    build_single_relu_graph, build_two_relu_clip_graph, clip_test_history, scalar_interval,
+    active_relu_history, assert_cache_bounds_close, build_input_bounds, build_single_relu_graph,
+    build_two_relu_clip_graph, clip_test_history, scalar_interval,
 };
 use super::TOL;
 
 use ny_test_utils::assert_bounded_tensor_close;
 #[test]
-fn test_clip_in_alpha_crown_tightens_graph_split_cache_3776() {
+fn test_clip_in_alpha_crown_flag_preserves_bounds_while_authority_is_quarantined() {
     let graph = build_two_relu_clip_graph();
     let input = build_input_bounds();
     let history = clip_test_history();
@@ -43,45 +43,10 @@ fn test_clip_in_alpha_crown_tightens_graph_split_cache_3776() {
 
     assert_bounded_tensor_close(&baseline_output, &clipped_output, TOL, "output parity");
 
-    assert_scalar_bounds(
-        baseline_cache
-            .get("linear1")
-            .expect("baseline linear1 bounds should exist"),
-        0.0,
-        1.0,
-        "baseline linear1",
-    );
-    assert_scalar_bounds(
-        clipped_cache
-            .get("linear1")
-            .expect("clipped linear1 bounds should exist"),
-        0.0,
-        0.2,
-        "clipped linear1",
-    );
-    assert_scalar_bounds(
-        baseline_cache
-            .get("relu1")
-            .expect("baseline relu1 bounds should exist"),
-        0.0,
-        1.0,
-        "baseline relu1",
-    );
-    assert_scalar_bounds(
-        clipped_cache
-            .get("relu1")
-            .expect("clipped relu1 bounds should exist"),
-        0.0,
-        0.2,
-        "clipped relu1",
-    );
-    assert_scalar_bounds(
-        clipped_cache
-            .get("linear2")
-            .expect("clipped linear2 bounds should exist"),
-        -0.2,
-        0.0,
-        "clipped linear2",
+    assert_cache_bounds_close(
+        &baseline_cache,
+        &clipped_cache,
+        "quarantined clip_in_alpha_crown must preserve baseline cache",
     );
 }
 

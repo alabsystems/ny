@@ -2,34 +2,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::GpuConstraintBuffers;
+use super::validate_cpu_buffer;
 use ny_propagate::beta_crown::constraint_store::{
     ConstraintHeader, ConstraintOrigin, ConstraintSense, DomainConstraintStore,
 };
 use ny_propagate::BatchedConstraintBuffer;
 use std::mem::{align_of, size_of};
-use wgpu::Device;
-
-fn create_test_device() -> Device {
-    pollster::block_on(async {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("Failed to find adapter");
-
-        let (device, _queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .expect("Failed to create device");
-
-        device
-    })
-}
 
 fn make_valid_cpu_buffer() -> BatchedConstraintBuffer {
     let mut store = DomainConstraintStore::new();
@@ -69,13 +47,12 @@ fn test_constraint_header_abi_layout() {
 
 #[test]
 fn test_from_cpu_buffer_rejects_invalid_offsets() {
-    let device = create_test_device();
     let mut cpu_buffer = make_valid_cpu_buffer();
     cpu_buffer.domain_header_offsets = vec![0, 2];
 
-    let err = match GpuConstraintBuffers::from_cpu_buffer(&device, &cpu_buffer) {
+    let err = match validate_cpu_buffer(&cpu_buffer) {
         Err(err) => err,
-        Ok(_) => panic!("expected invalid domain_header_offsets to be rejected"),
+        Ok(()) => panic!("expected invalid domain_header_offsets to be rejected"),
     };
     assert!(matches!(
         err,
@@ -86,7 +63,6 @@ fn test_from_cpu_buffer_rejects_invalid_offsets() {
 
 #[test]
 fn test_from_cpu_buffer_rejects_invalid_header_range() {
-    let device = create_test_device();
     let mut cpu_buffer = make_valid_cpu_buffer();
     cpu_buffer.headers[0] = ConstraintHeader::new(
         1,
@@ -96,9 +72,9 @@ fn test_from_cpu_buffer_rejects_invalid_header_range() {
         ConstraintOrigin::Split,
     );
 
-    let err = match GpuConstraintBuffers::from_cpu_buffer(&device, &cpu_buffer) {
+    let err = match validate_cpu_buffer(&cpu_buffer) {
         Err(err) => err,
-        Ok(_) => panic!("expected invalid header term range to be rejected"),
+        Ok(()) => panic!("expected invalid header term range to be rejected"),
     };
     assert!(matches!(
         err,

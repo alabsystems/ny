@@ -10,6 +10,7 @@
 //! - upper_y = W+ @ u + W- @ l + b
 
 use std::borrow::Cow;
+use std::time::Instant;
 
 use faer::Mat;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
@@ -20,6 +21,10 @@ use tracing::debug;
 use super::LinearLayer;
 use crate::faer_parallelism::mat_mul;
 use crate::layers::common::BoundPropagation;
+
+const DEADLINE_LINEAR_IBP_POLL_OPS: usize = 4_096;
+const DEADLINE_LINEAR_IBP_MAX_ELEMENTS: usize = 4 * 1024 * 1024;
+const DEADLINE_LINEAR_IBP_MAX_RANK: usize = 1_024;
 
 impl LinearLayer {
     /// IBP propagation with optional GEMM-engine acceleration.
@@ -40,6 +45,11 @@ impl LinearLayer {
         let Some(engine) = engine else {
             return self.propagate_ibp(input);
         };
+        if engine.forbids_unbounded_cpu_fallback() {
+            return Err(NyError::UnsupportedOp(
+                "bounded Linear IBP requires the explicit deadline-aware entry".into(),
+            ));
+        }
 
         match propagate_ibp_via_gemm(self, input, engine) {
             // The GEMM path produces the same box interval as the CPU path, so
@@ -51,6 +61,36 @@ impl LinearLayer {
                 self.propagate_ibp(input)
             }
         }
+    }
+
+    /// Deadline-authoritative Linear interval forward.
+    ///
+    /// `deadline: None` delegates to [`Self::propagate_ibp_with_engine`]
+    /// exactly. Under a finite authority, the opaque engine helper is refused:
+    /// its surrounding host copies, lazy cache construction, bookkeeping, and
+    /// allocations do not have a cooperative deadline contract. Finite calls
+    /// use a capped direct contraction that polls between bounded work quanta.
+    pub fn propagate_ibp_with_engine_and_deadline(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedTensor> {
+        let Some(deadline) = deadline else {
+            return self.propagate_ibp_with_engine(input, engine);
+        };
+        check_linear_ibp_deadline(deadline, "before entry")?;
+
+        let geometry = linear_deadline_geometry(self, input)?;
+        cap_linear_deadline_elements(geometry.input_elements, "input")?;
+        cap_linear_deadline_elements(geometry.output_elements, "output")?;
+
+        // No existing capability covers the host-side copies, lazy transpose
+        // cache construction, multi-call bookkeeping, and result allocations
+        // around the opaque engine calls. A finite authority therefore refuses
+        // the entire engine helper, including engines whose inner GEMM is
+        // deadline-safe.
+        propagate_ibp_pollable_f64(self, input, &geometry, deadline)
     }
 
     /// Sound IBP propagation with directed rounding proportional to dot product size.
@@ -76,6 +116,311 @@ impl LinearLayer {
         result.round_for_soundness_n_ulps_inplace(rounding_ulps);
         Ok(result)
     }
+}
+
+struct LinearDeadlineGeometry {
+    batch_size: usize,
+    in_features: usize,
+    out_features: usize,
+    input_elements: usize,
+    output_elements: usize,
+    output_shape: Vec<usize>,
+}
+
+#[inline]
+fn check_linear_ibp_deadline(deadline: Instant, stage: &str) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(NyError::DeadlineExceeded(format!(
+            "Linear IBP forward: deadline exceeded {stage}"
+        )));
+    }
+    Ok(())
+}
+
+fn linear_deadline_geometry(
+    layer: &LinearLayer,
+    input: &BoundedTensor,
+) -> Result<LinearDeadlineGeometry> {
+    let shape = input.shape();
+    let ndim = shape.len();
+    if ndim == 0 {
+        return Err(NyError::InvalidSpec(
+            "Linear IBP: rank-0 (scalar) input not supported".to_string(),
+        ));
+    }
+    if ndim > DEADLINE_LINEAR_IBP_MAX_RANK {
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes: ndim.saturating_mul(size_of::<usize>()),
+            budget_bytes: DEADLINE_LINEAR_IBP_MAX_RANK * size_of::<usize>(),
+            site: "Linear finite-deadline IBP shape metadata",
+        });
+    }
+    let in_features = shape[ndim - 1];
+    if in_features != layer.in_features() {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![layer.in_features()],
+            got: vec![in_features],
+        });
+    }
+    let batch_size = checked_batch_size(&shape[..ndim - 1])?;
+    let out_features = layer.out_features();
+    let input_elements = batch_size.checked_mul(in_features).ok_or_else(|| {
+        NyError::InvalidSpec(
+            "Linear finite-deadline IBP input element count overflows usize".to_string(),
+        )
+    })?;
+    let output_elements = batch_size.checked_mul(out_features).ok_or_else(|| {
+        NyError::InvalidSpec(
+            "Linear finite-deadline IBP output element count overflows usize".to_string(),
+        )
+    })?;
+    let mut output_shape = shape[..ndim - 1].to_vec();
+    output_shape.push(out_features);
+    Ok(LinearDeadlineGeometry {
+        batch_size,
+        in_features,
+        out_features,
+        input_elements,
+        output_elements,
+        output_shape,
+    })
+}
+
+fn cap_linear_deadline_elements(elements: usize, kind: &str) -> Result<()> {
+    if elements > DEADLINE_LINEAR_IBP_MAX_ELEMENTS {
+        let required_bytes = elements.saturating_mul(size_of::<f32>());
+        let budget_bytes = DEADLINE_LINEAR_IBP_MAX_ELEMENTS * size_of::<f32>();
+        let site = if kind == "input" {
+            "Linear finite-deadline IBP input buffer"
+        } else {
+            "Linear finite-deadline IBP output buffer"
+        };
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+            site,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn is_binary32_subnormal(value: f32) -> bool {
+    let magnitude = value.to_bits() & 0x7fff_ffff;
+    magnitude != 0 && magnitude < f32::MIN_POSITIVE.to_bits()
+}
+
+fn linear_deadline_contains_subnormal<I>(values: I, deadline: Instant, stage: &str) -> Result<bool>
+where
+    I: IntoIterator<Item = f32>,
+{
+    for (index, value) in values.into_iter().enumerate() {
+        if index.is_multiple_of(DEADLINE_LINEAR_IBP_POLL_OPS) {
+            check_linear_ibp_deadline(deadline, stage)?;
+        }
+        if is_binary32_subnormal(value) {
+            return Ok(true);
+        }
+    }
+    check_linear_ibp_deadline(deadline, stage)?;
+    Ok(false)
+}
+
+fn reserve_linear_deadline_vec<T>(len: usize, deadline: Instant, name: &str) -> Result<Vec<T>> {
+    check_linear_ibp_deadline(deadline, "before bounded CPU allocation")?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NyError::InvalidSpec(format!(
+            "Linear finite-deadline IBP {name} allocation failed for {len} elements: {error}"
+        ))
+    })?;
+    check_linear_ibp_deadline(deadline, "after bounded CPU allocation")?;
+    Ok(values)
+}
+
+#[inline]
+fn linear_f64_to_f32_down(value: f64) -> f32 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return f32::NEG_INFINITY;
+    }
+    if value == f64::INFINITY {
+        return f32::MAX;
+    }
+    if value.abs() < f64::from(f32::MIN_POSITIVE) {
+        return if value.is_sign_negative() {
+            -f32::MIN_POSITIVE
+        } else {
+            0.0
+        };
+    }
+    next_down_f32(value as f32)
+}
+
+#[inline]
+fn linear_f64_to_f32_up(value: f64) -> f32 {
+    if value.is_nan() || value == f64::INFINITY {
+        return f32::INFINITY;
+    }
+    if value == f64::NEG_INFINITY {
+        return f32::MIN;
+    }
+    if value.abs() < f64::from(f32::MIN_POSITIVE) {
+        return if value.is_sign_negative() {
+            0.0
+        } else {
+            f32::MIN_POSITIVE
+        };
+    }
+    next_up_f32(value as f32)
+}
+
+fn linear_deadline_universal(
+    geometry: &LinearDeadlineGeometry,
+    deadline: Instant,
+) -> Result<BoundedTensor> {
+    let mut lower =
+        reserve_linear_deadline_vec(geometry.output_elements, deadline, "universal lower output")?;
+    let mut upper =
+        reserve_linear_deadline_vec(geometry.output_elements, deadline, "universal upper output")?;
+    while lower.len() < geometry.output_elements {
+        let chunk = (geometry.output_elements - lower.len()).min(DEADLINE_LINEAR_IBP_POLL_OPS);
+        lower.extend(std::iter::repeat_n(f32::NEG_INFINITY, chunk));
+        upper.extend(std::iter::repeat_n(f32::INFINITY, chunk));
+        check_linear_ibp_deadline(deadline, "while initializing universal output")?;
+    }
+    let lower = ArrayD::from_shape_vec(IxDyn(&geometry.output_shape), lower)
+        .map_err(|error| NyError::InternalError(format!("Linear IBP lower reshape: {error}")))?;
+    let upper = ArrayD::from_shape_vec(IxDyn(&geometry.output_shape), upper)
+        .map_err(|error| NyError::InternalError(format!("Linear IBP upper reshape: {error}")))?;
+    let result =
+        BoundedTensor::new_repaired_with_poll(lower, upper, RepairStrategy::Conservative, || {
+            check_linear_ibp_deadline(deadline, "during universal output repair")
+        })?;
+    check_linear_ibp_deadline(deadline, "immediately before publishing universal output")?;
+    Ok(result)
+}
+
+fn propagate_ibp_pollable_f64(
+    layer: &LinearLayer,
+    input: &BoundedTensor,
+    geometry: &LinearDeadlineGeometry,
+    deadline: Instant,
+) -> Result<BoundedTensor> {
+    check_linear_ibp_deadline(deadline, "before pollable CPU contraction")?;
+
+    // A DAZ-enabled host can erase a subnormal source operand before the f64
+    // conversion. Fail open rather than relying on that conversion.
+    let weight_has_subnormal = linear_deadline_contains_subnormal(
+        layer.weight.iter().copied(),
+        deadline,
+        "while scanning weights for subnormal operands",
+    )?;
+    let bias_has_subnormal = if let Some(bias) = &layer.bias {
+        linear_deadline_contains_subnormal(
+            bias.iter().copied(),
+            deadline,
+            "while scanning bias for subnormal operands",
+        )?
+    } else {
+        false
+    };
+    let lower_has_subnormal = linear_deadline_contains_subnormal(
+        input.lower().iter().copied(),
+        deadline,
+        "while scanning lower input for subnormal operands",
+    )?;
+    let upper_has_subnormal = linear_deadline_contains_subnormal(
+        input.upper().iter().copied(),
+        deadline,
+        "while scanning upper input for subnormal operands",
+    )?;
+    if weight_has_subnormal || bias_has_subnormal || lower_has_subnormal || upper_has_subnormal {
+        debug!(
+            "Linear finite-deadline IBP: subnormal source operand; \
+             returning universal bounds for DAZ independence"
+        );
+        return linear_deadline_universal(geometry, deadline);
+    }
+
+    let mut lower_input =
+        reserve_linear_deadline_vec(geometry.input_elements, deadline, "lower input")?;
+    let mut upper_input =
+        reserve_linear_deadline_vec(geometry.input_elements, deadline, "upper input")?;
+    for (index, (&lower, &upper)) in input.lower().iter().zip(input.upper().iter()).enumerate() {
+        if index.is_multiple_of(DEADLINE_LINEAR_IBP_POLL_OPS) {
+            check_linear_ibp_deadline(deadline, "while flattening input bounds")?;
+        }
+        lower_input.push(lower);
+        upper_input.push(upper);
+    }
+    if lower_input.len() != geometry.input_elements || upper_input.len() != geometry.input_elements
+    {
+        return Err(NyError::InternalError(format!(
+            "Linear finite-deadline IBP flattened {} elements, expected {}",
+            lower_input.len(),
+            geometry.input_elements
+        )));
+    }
+
+    let mut lower_output =
+        reserve_linear_deadline_vec(geometry.output_elements, deadline, "lower output")?;
+    let mut upper_output =
+        reserve_linear_deadline_vec(geometry.output_elements, deadline, "upper output")?;
+    let mut operations = 0usize;
+    let mut output_cells = 0usize;
+    for batch_index in 0..geometry.batch_size {
+        let input_base = batch_index * geometry.in_features;
+        for output_index in 0..geometry.out_features {
+            output_cells += 1;
+            if output_cells.is_multiple_of(DEADLINE_LINEAR_IBP_POLL_OPS) {
+                check_linear_ibp_deadline(deadline, "while traversing output cells")?;
+            }
+            let bias = layer
+                .bias
+                .as_ref()
+                .map_or(0.0_f64, |values| f64::from(values[output_index]));
+            let mut lower_sum = bias;
+            let mut upper_sum = bias;
+            for input_index in 0..geometry.in_features {
+                operations += 1;
+                if operations == DEADLINE_LINEAR_IBP_POLL_OPS {
+                    check_linear_ibp_deadline(deadline, "during directed CPU contraction")?;
+                    operations = 0;
+                }
+                let weight = f64::from(layer.weight[[output_index, input_index]]);
+                let flat_index = input_base + input_index;
+                let (lower_factor, upper_factor) = if weight >= 0.0 {
+                    (
+                        f64::from(lower_input[flat_index]),
+                        f64::from(upper_input[flat_index]),
+                    )
+                } else {
+                    (
+                        f64::from(upper_input[flat_index]),
+                        f64::from(lower_input[flat_index]),
+                    )
+                };
+                lower_sum = ny_core::dd::next_down_f64(lower_sum + weight * lower_factor);
+                upper_sum = ny_core::dd::next_up_f64(upper_sum + weight * upper_factor);
+            }
+            lower_output.push(linear_f64_to_f32_down(lower_sum));
+            upper_output.push(linear_f64_to_f32_up(upper_sum));
+        }
+    }
+    check_linear_ibp_deadline(deadline, "after directed CPU contraction")?;
+    drop(lower_input);
+    drop(upper_input);
+
+    let lower = ArrayD::from_shape_vec(IxDyn(&geometry.output_shape), lower_output)
+        .map_err(|error| NyError::InternalError(format!("Linear IBP lower reshape: {error}")))?;
+    let upper = ArrayD::from_shape_vec(IxDyn(&geometry.output_shape), upper_output)
+        .map_err(|error| NyError::InternalError(format!("Linear IBP upper reshape: {error}")))?;
+    let result =
+        BoundedTensor::new_repaired_with_poll(lower, upper, RepairStrategy::Conservative, || {
+            check_linear_ibp_deadline(deadline, "during result repair")
+        })?;
+    check_linear_ibp_deadline(deadline, "immediately before publishing result")?;
+    Ok(result)
 }
 
 impl BoundPropagation for LinearLayer {

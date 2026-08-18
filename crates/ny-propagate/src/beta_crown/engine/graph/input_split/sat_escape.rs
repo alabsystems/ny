@@ -20,7 +20,10 @@
 //! (`multi_dim_split_boxes`) is exact and unchanged, so the union cover stays
 //! complete regardless of the ranking. The saturation widths are computed from
 //! the sound IBP node bounds and consumed for the argmax ONLY — never to raise
-//! or lower any verdict bound. Gated off by default via `NY_SAT_ESCAPE_BRANCH`.
+//! or lower any verdict bound. Gated off by default; armed per category via
+//! the preset key `bab.branching.input_split.sat_escape_branch` with env
+//! `NY_SAT_ESCAPE_BRANCH` overriding either way
+//! (`BetaCrownConfig::sat_escape_branch_armed`, the single resolution point).
 
 use std::collections::HashMap;
 
@@ -29,15 +32,6 @@ use ny_tensor::BoundedTensor;
 
 use crate::layers::Layer;
 use crate::GraphNetwork;
-
-/// Env gate for Saturation-Escape Branching (M1). Default OFF ⇒ the shipped
-/// path is byte-identical. Mirrors the `imb::enabled()` convention.
-pub(crate) fn enabled() -> bool {
-    matches!(
-        std::env::var("NY_SAT_ESCAPE_BRANCH").ok().as_deref(),
-        Some("1")
-    )
-}
 
 /// Cap on the number of positive-width candidate dimensions the finite-diff
 /// scorer probes, bounding the per-split IBP cost. When a domain has more ranged
@@ -258,12 +252,5 @@ mod tests {
     fn saturated_width_two_sided() {
         // [-10, 10], τ=4: (-10,-4] width 6 + (4,10] width 6 = 12.
         assert_eq!(saturated_width(-10.0, 10.0, 4.0), 12.0);
-    }
-
-    #[test]
-    fn enabled_defaults_off() {
-        // Not asserting on the process env (test isolation), just that the
-        // helper reads the documented variable name without panicking.
-        let _ = enabled();
     }
 }

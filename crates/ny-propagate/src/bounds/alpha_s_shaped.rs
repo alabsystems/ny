@@ -96,13 +96,16 @@ impl MonotoneSShapedAlpha {
                 expected: vec![flat.len()],
                 got: flat.upper().shape().to_vec(),
             })?;
-        // Bit-identical tangent anchors: f32::midpoint rounds differently at overflow/subnormal edges.
-        #[allow(clippy::manual_midpoint)]
+        // Form the midpoint in f64.  `0.5_f32 * (l + u)` overflows for valid
+        // same-sign finite intervals such as [MAX/2, MAX], seeding the alpha
+        // optimizer with +/-Inf even though the mathematical midpoint is a
+        // finite in-domain tangent point.  Every f32 endpoint lifts exactly to
+        // f64, and their sum is far below f64 overflow.
         let midpoint = Array1::from_iter(
             lower
                 .iter()
                 .zip(upper.iter())
-                .map(|(&l, &u)| 0.5_f32 * (l + u)),
+                .map(|(&l, &u)| f64::midpoint(f64::from(l), f64::from(u)) as f32),
         );
         let d_pairs: Vec<(f32, f32)> = lower
             .iter()

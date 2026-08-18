@@ -11,11 +11,14 @@
 # - Benefits from aggressive batching and kFSB branching
 
 general:
-  root_path: ../../vnncomp2024_benchmarks/benchmarks/cifar100
+  # Repointed 2026-07-29: see configs/vnncomp24/yolo.yaml — the pre-relocation
+  # `../../vnncomp2024_benchmarks/...` spelling resolves to nothing in this repo.
+  root_path: ../../benchmarks/vnncomp2024/benchmarks/cifar100
   csv_name: instances.csv
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 10
 
 bab:

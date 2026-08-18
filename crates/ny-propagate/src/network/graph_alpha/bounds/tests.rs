@@ -4,16 +4,245 @@
 
 use super::*;
 use crate::layers::{
-    AddConstantLayer, AddLayer, ConcatLayer, Conv1dLayer, Conv2dLayer, DivLayer, ExpLayer,
-    LinearLayer, MaxBinaryLayer, MulBinaryLayer, MulConstantLayer, NonZeroLayer, PadLayer, PadMode,
-    ReLULayer, ReduceSumLayer, SigmoidLayer, SliceLayer, SqrtLayer, SubLayer, TanhLayer,
-    WhereLayer,
+    AddConstantLayer, AddLayer, ConcatLayer, Conv1dLayer, Conv2dLayer, ConvTranspose1dLayer,
+    ConvTranspose2dLayer, DivLayer, ExpLayer, LinearLayer, MaxBinaryLayer, MulBinaryLayer,
+    MulConstantLayer, NonZeroLayer, PadLayer, PadMode, ReLULayer, ReduceSumLayer, SigmoidLayer,
+    SliceLayer, SqrtLayer, SubLayer, TanhLayer, WhereLayer,
 };
 use crate::network::core::GraphNode;
 use crate::types::BoundsProvenance;
 use ndarray::{arr1, arr2, array, ArrayD, Ix1, IxDyn};
 use ny_core::NaiveCpuGemmEngine;
 use ny_test_utils::{assert_bounded_tensor_close, CountingGemmEngine};
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_graph_conv2d_node_bounds_are_engine_free_and_structured() {
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![0.5_f32, -0.25, 0.75, 0.1])
+        .expect("kernel");
+    let conv = Conv2dLayer::with_input_shape(kernel, Some(arr1(&[0.2_f32])), (1, 1), (0, 0), 3, 3)
+        .expect("conv");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("conv", Layer::Conv2d(conv)));
+    graph.set_output("conv");
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(
+            IxDyn(&[1, 3, 3]),
+            (0..9).map(|i| -1.0 + i as f32 * 0.1).collect(),
+        )
+        .expect("lower"),
+        ArrayD::from_shape_vec(
+            IxDyn(&[1, 3, 3]),
+            (0..9).map(|i| 0.5 + i as f32 * 0.15).collect(),
+        )
+        .expect("upper"),
+    )
+    .expect("input");
+    let expected = graph.collect_node_bounds(&input).expect("legacy bounds");
+    let engine = CountingGemmEngine::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let actual = graph
+        .collect_node_bounds_with_engine_and_deadline(&input, Some(&engine), Some(deadline))
+        .expect("finite-deadline bounds");
+
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite graph Conv2d node collection must not enter the caller engine"
+    );
+    assert_bounded_tensor_close(
+        actual.get("conv").expect("actual conv bound"),
+        expected.get("conv").expect("expected conv bound"),
+        1e-4,
+        "finite graph Conv2d node collection",
+    );
+
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let error = graph
+        .collect_node_bounds_with_engine_and_deadline(&input, Some(&engine), Some(expired))
+        .expect_err("expired graph node collection must remain structured");
+    assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    assert_eq!(engine.gemm_calls(), 0);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_direct_graph_conv2d_keeps_certified_cancellation_widening() {
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[1, 1, 1, 3]),
+        vec![16_777_216.0_f32, 1.0, -16_777_216.0],
+    )
+    .expect("kernel");
+    let conv = Conv2dLayer::with_input_shape(kernel, None, (1, 1), (0, 0), 1, 3).expect("conv");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("conv", Layer::Conv2d(conv)));
+    graph.set_output("conv");
+    let input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 3]), vec![1.0_f32; 3]).expect("input"),
+    )
+    .expect("concrete input");
+    let engine = CountingGemmEngine::new();
+    let result = graph
+        .propagate_ibp_with_engine_and_deadline(
+            &input,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect("finite-deadline graph IBP");
+
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite graph IBP must not enter the opaque Conv2d engine"
+    );
+    assert!(
+        result.lower()[[0, 0, 0]] <= 1.0 && result.upper()[[0, 0, 0]] >= 1.0,
+        "certified graph Conv2d bounds must enclose the exact real sum 1.0, got [{}, {}]",
+        result.lower()[[0, 0, 0]],
+        result.upper()[[0, 0, 0]],
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_direct_graph_convtranspose2d_is_engine_free_and_certified() {
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[3, 1, 1, 1]),
+        vec![16_777_216.0_f32, 1.0, -16_777_216.0],
+    )
+    .expect("kernel");
+    let conv = ConvTranspose2dLayer::new(kernel, None, (1, 1), (0, 0)).expect("ConvTranspose2d");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "conv_transpose",
+        Layer::ConvTranspose2d(conv),
+    ));
+    graph.set_output("conv_transpose");
+    let input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[3, 1, 1]), vec![1.0_f32; 3]).expect("input"),
+    )
+    .expect("concrete input");
+    let engine = CountingGemmEngine::new();
+    let result = graph
+        .propagate_ibp_with_engine_and_deadline(
+            &input,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect("finite-deadline graph ConvTranspose2d IBP");
+
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite graph ConvTranspose2d IBP must refuse the opaque engine"
+    );
+    assert!(
+        result.lower()[[0, 0, 0]] <= 1.0 && result.upper()[[0, 0, 0]] >= 1.0,
+        "directed graph ConvTranspose2d bounds must enclose exact cancellation result 1.0, \
+         got [{}, {}]",
+        result.lower()[[0, 0, 0]],
+        result.upper()[[0, 0, 0]],
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_graph_conv1d_node_bounds_are_engine_free_and_structured() {
+    let kernel =
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 3]), vec![0.5_f32, -0.25, 0.75]).expect("kernel");
+    let conv =
+        Conv1dLayer::with_input_length(kernel, Some(arr1(&[0.2_f32])), 1, 1, 8).expect("conv");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("conv", Layer::Conv1d(conv)));
+    graph.set_output("conv");
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(
+            IxDyn(&[1, 8]),
+            (0..8).map(|i| -1.0 + i as f32 * 0.1).collect(),
+        )
+        .expect("lower"),
+        ArrayD::from_shape_vec(
+            IxDyn(&[1, 8]),
+            (0..8).map(|i| 0.5 + i as f32 * 0.15).collect(),
+        )
+        .expect("upper"),
+    )
+    .expect("input");
+    let expected = graph.collect_node_bounds(&input).expect("legacy bounds");
+    let engine = CountingGemmEngine::new();
+    let actual = graph
+        .collect_node_bounds_with_engine_and_deadline(
+            &input,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect("finite-deadline bounds");
+
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite graph Conv1d node collection must not enter the caller engine"
+    );
+    assert_bounded_tensor_close(
+        actual.get("conv").expect("actual Conv1d bound"),
+        expected.get("conv").expect("expected Conv1d bound"),
+        1e-4,
+        "finite graph Conv1d node collection",
+    );
+
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let error = graph
+        .collect_node_bounds_with_engine_and_deadline(&input, Some(&engine), Some(expired))
+        .expect_err("expired graph Conv1d collection must remain structured");
+    assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    assert_eq!(engine.gemm_calls(), 0);
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn finite_deadline_direct_graph_convtranspose1d_keeps_certified_cancellation_widening() {
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[3, 1, 1]),
+        vec![16_777_216.0_f32, 1.0, -16_777_216.0],
+    )
+    .expect("kernel");
+    let conv =
+        ConvTranspose1dLayer::with_input_length(kernel, None, 1, 0, 1).expect("ConvTranspose1d");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "conv_transpose",
+        Layer::ConvTranspose1d(conv),
+    ));
+    graph.set_output("conv_transpose");
+    let input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[3, 1]), vec![1.0_f32; 3]).expect("input"),
+    )
+    .expect("concrete input");
+    let engine = CountingGemmEngine::new();
+    let result = graph
+        .propagate_ibp_with_engine_and_deadline(
+            &input,
+            Some(&engine),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect("finite-deadline graph IBP");
+
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite graph IBP must not enter the opaque ConvTranspose1d engine"
+    );
+    assert!(
+        result.lower()[[0, 0]] <= 1.0 && result.upper()[[0, 0]] >= 1.0,
+        "certified graph ConvTranspose1d bounds must enclose exact sum 1.0, got [{}, {}]",
+        result.lower()[[0, 0]],
+        result.upper()[[0, 0]]
+    );
+}
 
 /// Helper: run both CROWN-IBP (non-alpha) and α-CROWN (empty alpha state)
 /// on the same graph and return (crown_ibp_result, alpha_crown_result).
@@ -2872,15 +3101,15 @@ fn test_spec_guided_crown_reuses_graph_alpha_state_3232() {
         heuristic_linear_output.lower()[[0]],
         reused_linear_output.lower()[[0]]
     );
-    // The spec-row reduction accumulates in f64 and casts the endpoint
-    // OUTWARD (next_down), so the exact lower bound 0 may be reported one
-    // subnormal ULP below 0 — and must never be reported above it.
-    let one_ulp_below_zero = -f32::from_bits(1); // == next_down(0.0)
+    // The spec-row reduction casts OUTWARD without publishing binary32
+    // subnormals: on DAZ/FTZ-capable backends a tiny negative endpoint is
+    // widened to -FLT_MIN. The exact lower bound 0 must never be reported
+    // above zero, but this deliberate normal-valued floor is sound.
     for (label, bounds) in [("heuristic", &heuristic.bounds), ("reused", &reused.bounds)] {
         let lo = bounds.lower()[[0]];
         assert!(
-            lo <= 0.0 && lo >= one_ulp_below_zero,
-            "#3232 {label} spec lower must be exact 0 up to the outward 1-ULP cast, got {lo}"
+            (-f32::MIN_POSITIVE..=0.0).contains(&lo),
+            "#3232 {label} spec lower must enclose exact 0 within the FTZ-safe outward floor, got {lo}"
         );
     }
     assert_shifted_relu_bound_sound_3232(&reused.bounds);
@@ -3177,6 +3406,85 @@ fn test_collect_alpha_crown_bounds_dag_fix_interm_bounds_true_uses_ibp_on_dag_44
         1e-6,
         "#4404 output DAG warmup should reuse IBP intermediates",
     );
+}
+
+/// The collector cap must reach the exact production fallback used by a
+/// `fix_interm_bounds=true` residual Conv DAG when forward-linear collection
+/// refuses: DAG-alpha pre-loop CROWN -> Graph-CROWN Step 1 -> CROWN-IBP.
+///
+/// The ordinary arm stores its complete map. The capped arm deliberately
+/// leaves the cache empty (complete-hit-only/no-fresh-store), which is a cheap
+/// deterministic witness that the cap reached Step 1 rather than remaining
+/// stranded in alpha's direct reference-collector arm.
+#[ntest::timeout(10000)]
+#[test]
+fn collector_cap_reaches_fix_interm_conv_dag_preloop_crown_step1() {
+    ny_test_utils::env::with_env_edits(|env| {
+        const COLLECTOR_CAP_ENV: &str = "NY_CROWN_IBP_COLLECTOR_CAP_SECS";
+        for key in [
+            COLLECTOR_CAP_ENV,
+            "NY_DISABLE_CROWN_COLLECTION_CACHE",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_SERVE_TRUNCATED_CACHE",
+            "NY_NO_FORWARD_LINEAR_REF",
+        ] {
+            env.remove(key);
+        }
+
+        let outer_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let config = AlphaCrownConfig {
+            iterations: 0,
+            fix_interm_bounds: true,
+            adaptive_skip: false,
+            adaptive_skip_pilot: false,
+            deadline: Some(outer_deadline),
+            ..AlphaCrownConfig::default()
+        };
+
+        let (ordinary_graph, ordinary_input) = build_fix_interm_bounds_residual_dag_4404();
+        ordinary_graph
+            .collect_alpha_crown_bounds_dag(&ordinary_input, &config)
+            .expect("ordinary pre-loop Graph-CROWN fallback should succeed");
+        let ordinary_cache = ordinary_graph
+            .cached_crown_ibp_collection
+            .slots
+            .read()
+            .expect("cache lock");
+        assert_eq!(
+            ordinary_cache.len(),
+            1,
+            "fixture must reach the ordinary Graph-CROWN Step-1 CROWN-IBP collector"
+        );
+        assert!(
+            ordinary_cache[0].complete,
+            "ordinary fixture collection must finish, making no-store a cap-policy witness"
+        );
+        drop(ordinary_cache);
+
+        env.set(COLLECTOR_CAP_ENV, "1");
+        let (capped_graph, capped_input) = build_fix_interm_bounds_residual_dag_4404();
+        let (capped_bounds, _) = capped_graph
+            .collect_alpha_crown_bounds_dag(&capped_input, &config)
+            .expect("capped pre-loop Graph-CROWN fallback should stay sound and complete");
+        assert!(
+            capped_bounds.contains_key("out"),
+            "capped alpha collection must retain a complete output enclosure"
+        );
+        assert!(
+            capped_graph
+                .cached_crown_ibp_collection
+                .slots
+                .read()
+                .expect("cache lock")
+                .is_empty(),
+            "caller-local cap must reach Step 1 and forbid a fresh cache store"
+        );
+        assert_eq!(
+            config.deadline,
+            Some(outer_deadline),
+            "collector cap must not mutate the alpha/root outer deadline"
+        );
+    });
 }
 
 /// Regression for the warm-start half of #4404: the per-child helper must
@@ -3481,7 +3789,14 @@ fn test_extracted_graph_crown_target_shape_3680() {
 fn test_crown_ibp_precomputed_short_deadline_falls_back_to_exact_ibp_3499() {
     use std::time::{Duration, Instant};
 
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _floor_env = ny_test_utils::env::ScopedEnvVar::unset("NY_PER_NODE_FLOOR_SECS");
+    let _cap_env = ny_test_utils::env::ScopedEnvVar::unset("NY_PER_NODE_CAP_SECS");
     let mut graph = GraphNetwork::new();
+    graph.set_crown_ibp_per_node_time_budget(crate::types::CrownIbpPerNodeTimeBudget {
+        floor_secs: Some(120.0),
+        cap_secs: None,
+    });
     let linear = LinearLayer::new(arr2(&[[1.5_f32, -0.25]]), Some(arr1(&[0.75_f32])))
         .expect("valid linear layer");
     graph.add_node(GraphNode::from_input("lin", Layer::Linear(linear)));
@@ -3496,11 +3811,20 @@ fn test_crown_ibp_precomputed_short_deadline_falls_back_to_exact_ibp_3499() {
         .collect_node_bounds(&input)
         .expect("IBP bounds should succeed");
 
+    // A Linear-only graph now legitimately takes the CPU sequential fast path,
+    // where this tiny backward finishes well inside a short deadline (#4413).
+    // Force the graph-native policy with a no-op width threshold so this test
+    // exercises its configured per-node floor. The 60-second deadline is far
+    // from wall-clock expiry but deterministically below the 120-second floor,
+    // so scheduling jitter cannot decide the expected fallback.
     let result = graph
-        .collect_crown_ibp_bounds_dag_with_precomputed_ibp(
+        .collect_crown_ibp_bounds_core_inner_with_cut_segment(
             &input,
             ibp_bounds.clone(),
-            Some(Instant::now() + Duration::from_secs(1)),
+            Some(Instant::now() + Duration::from_mins(1)),
+            None,
+            Some(0.0),
+            0,
         )
         .expect("CROWN-IBP collection should fall back, not fail");
 
@@ -4283,6 +4607,10 @@ fn assert_node_bounds_bit_equal(
 #[ntest::timeout(10000)]
 #[test]
 fn collection_cache_serves_second_identical_box_and_misses_one_ulp() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _cache_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_DISABLE_CROWN_COLLECTION_CACHE");
+    let _sparse_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_SPARSE_RELU_ROWS");
+    let _resweep_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_DOWNSTREAM_RESWEEP");
     let (graph, input) = build_collection_cache_graph();
     assert_eq!(graph.crown_ibp_collection_cache_hits(), 0);
 
@@ -4333,6 +4661,10 @@ fn collection_cache_serves_second_identical_box_and_misses_one_ulp() {
 #[ntest::timeout(10000)]
 #[test]
 fn collection_cache_backward_runs_once_by_gemm_count() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _cache_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_DISABLE_CROWN_COLLECTION_CACHE");
+    let _sparse_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_SPARSE_RELU_ROWS");
+    let _resweep_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_DOWNSTREAM_RESWEEP");
     let (graph, input) = build_collection_cache_graph();
     let engine = CountingGemmEngine::new();
 
@@ -4364,6 +4696,10 @@ fn collection_cache_backward_runs_once_by_gemm_count() {
 #[ntest::timeout(10000)]
 #[test]
 fn collection_cache_complete_map_replaces_truncated_and_serves_expired_budget() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _cache_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_DISABLE_CROWN_COLLECTION_CACHE");
+    let _sparse_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_SPARSE_RELU_ROWS");
+    let _resweep_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_DOWNSTREAM_RESWEEP");
     let (graph, input) = build_collection_cache_graph();
     let expired = Some(std::time::Instant::now());
 
@@ -4417,6 +4753,10 @@ fn collection_cache_complete_map_replaces_truncated_and_serves_expired_budget() 
 #[ntest::timeout(10000)]
 #[test]
 fn collection_cache_clone_resets_and_adoption_carries_entry() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _cache_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_DISABLE_CROWN_COLLECTION_CACHE");
+    let _sparse_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_SPARSE_RELU_ROWS");
+    let _resweep_gate = ny_test_utils::env::ScopedEnvVar::unset("NY_CROWN_IBP_DOWNSTREAM_RESWEEP");
     let (graph, input) = build_collection_cache_graph();
     let first = graph
         .collect_crown_ibp_bounds_dag_with_status(&input)
@@ -4446,6 +4786,53 @@ fn collection_cache_clone_resets_and_adoption_carries_entry() {
     );
     assert_node_bounds_bit_equal(&first.bounds, &served.bounds, "adopted entry");
 
+    // A separately constructed graph can have identical topology and input
+    // shape while carrying different weights. Neither the direct CROWN
+    // adopter nor the public combined adopter may copy source proof bounds:
+    // only a pure clone shares `cut_fold_scope`.
+    let (mut foreign_direct, foreign_input) = build_collection_cache_graph();
+    foreign_direct
+        .nodes
+        .get_mut("l1")
+        .expect("foreign l1")
+        .layer = Layer::Linear(
+        LinearLayer::new(
+            arr2(&[[9.0_f32, 0.5, -0.3], [-0.5, 1.0, 0.7], [0.3, -0.2, 1.0]]),
+            Some(arr1(&[0.1_f32, -0.1, 0.05])),
+        )
+        .unwrap(),
+    );
+    foreign_direct.adopt_crown_ibp_collection_cache_from(&graph);
+    assert!(
+        foreign_direct
+            .cached_crown_ibp_collection
+            .slots
+            .read()
+            .expect("foreign direct cache lock")
+            .is_empty(),
+        "direct CROWN adoption must reject foreign graph scope"
+    );
+
+    let mut foreign_combined = foreign_direct.clone();
+    foreign_combined.adopt_bound_caches_from(&graph);
+    assert!(
+        foreign_combined
+            .cached_crown_ibp_collection
+            .slots
+            .read()
+            .expect("foreign combined cache lock")
+            .is_empty(),
+        "public combined adoption must reject foreign graph scope"
+    );
+    let _ = foreign_combined
+        .collect_crown_ibp_bounds_dag_with_status(&foreign_input)
+        .unwrap();
+    assert_eq!(
+        foreign_combined.crown_ibp_collection_cache_hits(),
+        0,
+        "same-topology/different-weight graph must recompute, not serve foreign bounds"
+    );
+
     // Mutation invalidates: flipping conv-mode policy clears the entry.
     let mut mutated = graph.clone();
     mutated.adopt_bound_caches_from(&graph);
@@ -4458,6 +4845,1037 @@ fn collection_cache_clone_resets_and_adoption_carries_entry() {
         0,
         "a semantic mutation must invalidate the adopted entry"
     );
+}
+
+/// Tiny ConvTranspose DAG exercising the exact graph family admitted by the
+/// default-dark truncated-cache policy.
+fn build_truncated_collection_cache_graph() -> (GraphNetwork, BoundedTensor) {
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![1.0_f32, -0.5, 0.25, 0.75])
+        .expect("kernel");
+    let conv = ConvTranspose2dLayer::with_input_shape(
+        kernel,
+        Some(arr1(&[0.1_f32])),
+        (1, 1),
+        (0, 0),
+        2,
+        2,
+    )
+    .expect("conv transpose");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("convt", Layer::ConvTranspose2d(conv)));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer),
+        vec!["convt".into()],
+    ));
+    graph.set_output("relu");
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), -1.0_f32),
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), 1.0_f32),
+    )
+    .expect("input");
+    (graph, input)
+}
+
+/// Extend the tiny cGAN-shaped image chain to the three-activation threshold
+/// where alpha's historical post-forward-refusal route is CROWN-IBP.
+fn build_deep_sequential_conv_transpose_alpha_reference_graph() -> (GraphNetwork, BoundedTensor) {
+    let (mut graph, input) = build_truncated_collection_cache_graph();
+    let conv = Conv2dLayer::with_input_shape(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![0.75_f32]).expect("Conv2d kernel"),
+        Some(arr1(&[-0.2_f32])),
+        (1, 1),
+        (0, 0),
+        3,
+        3,
+    )
+    .expect("Conv2d");
+    graph.add_node(GraphNode::new(
+        "conv",
+        Layer::Conv2d(conv),
+        vec!["relu".into()],
+    ));
+    graph.add_node(GraphNode::new(
+        "relu_2",
+        Layer::ReLU(ReLULayer),
+        vec!["conv".into()],
+    ));
+    graph.add_node(GraphNode::new(
+        "relu_3",
+        Layer::ReLU(ReLULayer),
+        vec!["relu_2".into()],
+    ));
+    graph.set_output("relu_3");
+    (graph, input)
+}
+
+/// A short deadline deterministically refuses a cold forward-linear map before
+/// doing any work. The cGAN opt-in must route that refusal straight to the
+/// certified deadline-aware IBP map; default-off retains the historical
+/// deep-sequential CROWN-IBP source.
+#[ntest::timeout(10000)]
+#[test]
+fn alpha_forward_linear_deadline_fallback_is_typed_default_off_and_sound() {
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+            "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
+        ] {
+            env.remove(key);
+        }
+        env.set("NY_DISABLE_CROWN_COLLECTION_CACHE", "1");
+
+        let (historical_graph, historical_input) =
+            build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let historical_order = historical_graph
+            .exec_order()
+            .expect("historical execution order")
+            .to_vec();
+        let historical_config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+            ..AlphaCrownConfig::default()
+        };
+        assert!(
+            !historical_config.forward_linear_deadline_fallback_to_ibp,
+            "the new routing policy must remain default-off"
+        );
+        let (_historical, historical_source) = historical_graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &historical_input,
+                &historical_config,
+                None,
+                &historical_order,
+            )
+            .expect("historical fallback collection");
+        assert_eq!(
+            historical_source,
+            AlphaReferenceBoundsSource::CrownIbp,
+            "default-off must retain the deep-sequential CROWN-IBP fallback"
+        );
+
+        let (opted_in_graph, opted_in_input) =
+            build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let opted_in_order = opted_in_graph
+            .exec_order()
+            .expect("opted-in execution order")
+            .to_vec();
+        let expected_ibp = opted_in_graph
+            .collect_node_bounds_with_engine(&opted_in_input, None)
+            .expect("plain IBP reference");
+        let opted_in_config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            forward_linear_deadline_fallback_to_ibp: true,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+            ..AlphaCrownConfig::default()
+        };
+        let (actual, source) = opted_in_graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &opted_in_input,
+                &opted_in_config,
+                None,
+                &opted_in_order,
+            )
+            .expect("direct deadline fallback");
+        assert_eq!(
+            source,
+            AlphaReferenceBoundsSource::Ibp,
+            "the opt-in must divert only the deadline refusal to plain IBP"
+        );
+        assert_eq!(actual.len(), expected_ibp.len());
+        // The finite-deadline arm runs the certified-f64 conv IBP (2026-08-11
+        // cgan floor fix): same route, and NEVER LOOSER than the no-deadline
+        // plain-IBP reference per element (bit-equality no longer holds by
+        // design — the deadline arm is tighter).
+        for (name, expected) in &expected_ibp {
+            let got = actual
+                .get(name)
+                .unwrap_or_else(|| panic!("deadline fallback omitted node '{name}'"));
+            for (a, e) in got.lower().iter().zip(expected.lower().iter()) {
+                assert!(a >= e, "node '{name}' lower {a} looser than plain-IBP {e}");
+            }
+            for (a, e) in got.upper().iter().zip(expected.upper().iter()) {
+                assert!(a <= e, "node '{name}' upper {a} looser than plain-IBP {e}");
+            }
+        }
+    });
+}
+
+#[test]
+fn sequential_conv_transpose_alpha_reference_honors_both_kill_switches() {
+    let (mut graph, input) = build_truncated_collection_cache_graph();
+    let conv = Conv2dLayer::with_input_shape(
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![0.75_f32]).expect("Conv2d kernel"),
+        Some(arr1(&[-0.2_f32])),
+        (1, 1),
+        (0, 0),
+        3,
+        3,
+    )
+    .expect("Conv2d");
+    graph.add_node(GraphNode::new(
+        "conv",
+        Layer::Conv2d(conv),
+        vec!["relu".into()],
+    ));
+    graph.set_output("conv");
+    let exec_order = graph.exec_order().expect("execution order").to_vec();
+    assert!(
+        graph.is_sequential_graph(&exec_order),
+        "fixture must exercise the sequential alpha route"
+    );
+    let config = AlphaCrownConfig {
+        fix_interm_bounds: true,
+        ..AlphaCrownConfig::default()
+    };
+
+    ny_test_utils::env::with_env_edits(|env| {
+        env.remove("NY_NO_FORWARD_LINEAR_REF");
+        env.remove("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF");
+        env.remove("NY_FORWARD_LINEAR_SEQ_CONV_REF");
+        assert!(
+            graph.should_collect_forward_linear_image_reference(),
+            "default shared image policy must admit the sequential cGAN fixture"
+        );
+        let (_bounds, source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &config,
+                None,
+                &exec_order,
+            )
+            .expect("default alpha reference");
+        assert_eq!(
+            source,
+            AlphaReferenceBoundsSource::ForwardLinear,
+            "default policy must select the sequential ConvTranspose reference"
+        );
+
+        env.set("NY_NO_FORWARD_LINEAR_REF", "1");
+        let (_bounds, source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &config,
+                None,
+                &exec_order,
+            )
+            .expect("shared-gate fallback");
+        assert_eq!(
+            source,
+            AlphaReferenceBoundsSource::Ibp,
+            "shared reference kill switch must disable the sequential alpha route"
+        );
+
+        env.set("NY_NO_FORWARD_LINEAR_REF", "0");
+        env.set("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF", "1");
+        let (_bounds, source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &config,
+                None,
+                &exec_order,
+            )
+            .expect("ConvTranspose-gate fallback");
+        assert_eq!(
+            source,
+            AlphaReferenceBoundsSource::Ibp,
+            "ConvTranspose kill switch must disable the sequential alpha route"
+        );
+    });
+}
+
+#[test]
+fn typed_cgan_eligibility_matches_graph_crown_step1_forward_linear_policy() {
+    ny_test_utils::env::with_env_edits(|env| {
+        env.remove("NY_NO_FORWARD_LINEAR_REF");
+        env.remove("NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF");
+
+        // This chain has ConvTranspose but no Conv2d. The exact Graph-CROWN
+        // Step-1 policy declines it, so the typed route must also decline
+        // instead of collecting a map that the pre-loop objective cannot reuse.
+        let (graph, _input) = build_truncated_collection_cache_graph();
+        let exec_order = graph.exec_order().expect("execution order");
+        assert!(!graph.should_collect_forward_linear_intermediate_reference());
+
+        let complete = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            cgan_complete_crown_ibp_root: true,
+            ..AlphaCrownConfig::default()
+        };
+        assert!(!graph.cgan_complete_crown_ibp_root_eligible(&complete, exec_order));
+
+        let sparse = AlphaCrownConfig {
+            fix_interm_bounds: false,
+            cgan_sparse_target_complete_root: true,
+            ..AlphaCrownConfig::default()
+        };
+        assert!(!graph.cgan_sparse_target_complete_root_eligible(&sparse, exec_order));
+    });
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn typed_complete_forward_baseline_refusal_is_not_retried_in_same_router_call() {
+    use crate::network::core::graph::ForwardLinearCollectionRequestCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+            "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
+        ] {
+            env.remove(key);
+        }
+        env.set("NY_DISABLE_CROWN_COLLECTION_CACHE", "1");
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let exec_order = graph.exec_order().expect("execution order");
+        let config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            cgan_complete_crown_ibp_root: true,
+            // A cold build deterministically refuses before traversal.
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+            ..AlphaCrownConfig::default()
+        };
+
+        let requests = ForwardLinearCollectionRequestCounter::start();
+        let (_bounds, source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input, &config, None, exec_order,
+            )
+            .expect("ordinary fallback after typed refusal");
+        assert_eq!(
+            requests.requests(),
+            1,
+            "the same refusal must not be retried"
+        );
+        assert_eq!(
+            source,
+            AlphaReferenceBoundsSource::CrownIbp,
+            "the declined typed request must report the actual fallback collector"
+        );
+    });
+}
+
+#[test]
+fn typed_cgan_target_complete_routes_root_exact_and_keeps_children_forward_linear() {
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let exec_order = graph.exec_order().expect("execution order").to_vec();
+        let forward = graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, None)
+            .expect("certified forward-linear baseline");
+        let root_config = AlphaCrownConfig {
+            fix_interm_bounds: false,
+            cgan_sparse_target_complete_root: true,
+            ..AlphaCrownConfig::default()
+        };
+        let (root_bounds, root_source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &root_config,
+                None,
+                &exec_order,
+            )
+            .expect("typed root collection");
+        assert!(
+            matches!(
+                root_source,
+                AlphaReferenceBoundsSource::CganSparseTargetComplete { .. }
+            ),
+            "the typed sparse request must expose its actual source: {root_source:?}"
+        );
+        for (name, baseline) in forward.iter() {
+            let actual = root_bounds
+                .get(name)
+                .unwrap_or_else(|| panic!("typed root omitted '{name}'"));
+            for ((&lower, &upper), (&base_lower, &base_upper)) in actual
+                .lower()
+                .iter()
+                .zip(actual.upper())
+                .zip(baseline.lower().iter().zip(baseline.upper()))
+            {
+                assert!(lower >= base_lower, "node '{name}' widened its lower bound");
+                assert!(upper <= base_upper, "node '{name}' widened its upper bound");
+            }
+        }
+
+        let child_config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            cgan_sparse_target_complete_root: false,
+            ..root_config
+        };
+        let (_child_bounds, child_source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &child_config,
+                None,
+                &exec_order,
+            )
+            .expect("child reference");
+        assert_eq!(
+            child_source,
+            AlphaReferenceBoundsSource::ForwardLinear,
+            "child warm starts must retain the cheap forward-linear route"
+        );
+    });
+}
+
+#[test]
+fn typed_cgan_complete_crown_ibp_dominates_forward_map_and_keeps_children_cheap() {
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let exec_order = graph.exec_order().expect("execution order").to_vec();
+        let forward = graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, None)
+            .expect("certified forward-linear baseline");
+        let root_config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            cgan_complete_crown_ibp_root: true,
+            ..AlphaCrownConfig::default()
+        };
+        let (root_bounds, root_source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &root_config,
+                None,
+                &exec_order,
+            )
+            .expect("complete typed root collection");
+        assert!(
+            matches!(
+                root_source,
+                AlphaReferenceBoundsSource::CganCompleteCrownIbp { .. }
+            ),
+            "the typed complete request must expose its actual source: {root_source:?}"
+        );
+        for (name, baseline) in forward.iter() {
+            let actual = root_bounds
+                .get(name)
+                .unwrap_or_else(|| panic!("complete typed root omitted '{name}'"));
+            for ((&lower, &upper), (&base_lower, &base_upper)) in actual
+                .lower()
+                .iter()
+                .zip(actual.upper())
+                .zip(baseline.lower().iter().zip(baseline.upper()))
+            {
+                assert!(lower >= base_lower, "node '{name}' widened its lower bound");
+                assert!(upper <= base_upper, "node '{name}' widened its upper bound");
+            }
+        }
+
+        let child_config = AlphaCrownConfig {
+            cgan_complete_crown_ibp_root: false,
+            ..root_config
+        };
+        let (_child_bounds, child_source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input,
+                &child_config,
+                None,
+                &exec_order,
+            )
+            .expect("child reference");
+        assert_eq!(
+            child_source,
+            AlphaReferenceBoundsSource::ForwardLinear,
+            "children must retain the cheap forward-linear route"
+        );
+    });
+}
+
+#[test]
+fn typed_cgan_complete_outer_collection_reuses_the_single_root_transaction() {
+    use super::crown::CganCompleteCollectionEntryCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
+            "NY_DISABLE_CROWN_COLLECTION_CACHE",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let baseline = graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, None)
+            .expect("certified forward-linear baseline");
+        let config = AlphaCrownConfig {
+            iterations: 0,
+            gradient_method: crate::bounds::GradientMethod::AnalyticChain,
+            fix_interm_bounds: true,
+            cgan_complete_crown_ibp_root: true,
+            ..AlphaCrownConfig::default()
+        };
+
+        let entries = CganCompleteCollectionEntryCounter::start();
+        let (bounds, _alpha_state) = graph
+            .collect_alpha_crown_bounds_dag_with_engine(&input, &config, None)
+            .expect("complete AnalyticChain outer collection");
+        assert_eq!(
+            entries.entries(),
+            1,
+            "the dispatcher must reuse the optimizer-owned complete map instead of \
+             starting a second uncached root cascade"
+        );
+        for (name, baseline_bound) in baseline.iter() {
+            let actual = bounds
+                .get(name)
+                .unwrap_or_else(|| panic!("outer collection omitted baseline node '{name}'"));
+            for ((&lower, &upper), (&baseline_lower, &baseline_upper)) in actual
+                .lower()
+                .iter()
+                .zip(actual.upper())
+                .zip(baseline_bound.lower().iter().zip(baseline_bound.upper()))
+            {
+                assert!(lower >= baseline_lower, "node '{name}' widened lower");
+                assert!(upper <= baseline_upper, "node '{name}' widened upper");
+            }
+        }
+    });
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn typed_cgan_complete_stable_early_return_preserves_the_paid_artifact() {
+    use super::crown::CganCompleteCollectionEntryCounter;
+    use crate::network::core::graph::ForwardLinearCollectionRequestCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, original_input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let fixed = BoundedTensor::new(
+            ArrayD::zeros(original_input.lower().raw_dim()),
+            ArrayD::zeros(original_input.upper().raw_dim()),
+        )
+        .expect("fixed input");
+        let config = AlphaCrownConfig {
+            iterations: 2,
+            gradient_method: crate::bounds::GradientMethod::AnalyticChain,
+            fix_interm_bounds: true,
+            adaptive_skip: false,
+            cgan_complete_crown_ibp_root: true,
+            ..AlphaCrownConfig::default()
+        };
+
+        let complete_entries = CganCompleteCollectionEntryCounter::start();
+        let forward_requests = ForwardLinearCollectionRequestCounter::start();
+        let (_bounds, _alpha) = graph
+            .collect_alpha_crown_bounds_dag_with_engine(&fixed, &config, None)
+            .expect("stable typed collection");
+        assert_eq!(complete_entries.entries(), 1);
+        assert_eq!(
+            forward_requests.requests(),
+            1,
+            "the stable/no-optimizable exit must carry the paid map instead of recollecting"
+        );
+    });
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn typed_cgan_complete_adaptive_skip_reuses_reference_map_for_crown_fallback() {
+    use super::crown::CganCompleteCollectionEntryCounter;
+    use crate::network::core::graph::ForwardLinearCollectionRequestCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let config = AlphaCrownConfig {
+            iterations: 2,
+            gradient_method: crate::bounds::GradientMethod::AnalyticChain,
+            fix_interm_bounds: true,
+            adaptive_skip: true,
+            adaptive_skip_depth_threshold: 0,
+            adaptive_skip_pilot: false,
+            cgan_complete_crown_ibp_root: true,
+            ..AlphaCrownConfig::default()
+        };
+
+        let complete_entries = CganCompleteCollectionEntryCounter::start();
+        let forward_requests = ForwardLinearCollectionRequestCounter::start();
+        let (_bounds, _alpha) = graph
+            .collect_alpha_crown_bounds_dag_with_engine(&input, &config, None)
+            .expect("adaptive-skip typed collection");
+        assert_eq!(complete_entries.entries(), 1);
+        assert_eq!(
+            forward_requests.requests(),
+            1,
+            "adaptive CROWN must consume the typed map instead of running Step 1 again"
+        );
+    });
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn typed_cgan_complete_expired_sweep_reports_partial_status_and_exact_baseline() {
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let baseline = graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, None)
+            .expect("warm certified baseline");
+        let exec_order = graph.exec_order().expect("execution order");
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("past deadline");
+        let config = AlphaCrownConfig {
+            fix_interm_bounds: true,
+            cgan_complete_crown_ibp_root: true,
+            deadline: Some(expired),
+            ..AlphaCrownConfig::default()
+        };
+
+        let (actual, source) = graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &input, &config, None, exec_order,
+            )
+            .expect("deadline-truncated typed collection");
+        assert_eq!(
+            source.typed_cgan_targets_completed(),
+            Some(false),
+            "a sound baseline fallback must not be labeled complete"
+        );
+        assert_eq!(actual.len(), baseline.len());
+        for (name, expected) in baseline.iter() {
+            let bound = actual
+                .get(name)
+                .unwrap_or_else(|| panic!("missing baseline node '{name}'"));
+            assert_eq!(bound.lower(), expected.lower(), "node '{name}' lower");
+            assert_eq!(bound.upper(), expected.upper(), "node '{name}' upper");
+        }
+    });
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn typed_cgan_analytic_chain_outer_collection_enters_atomic_collector_once() {
+    use super::alpha_explicit::AlphaIntermediateCollectionEntryCounter;
+    use super::crown::CganAtomicCollectionEntryCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
+            "NY_DISABLE_CROWN_COLLECTION_CACHE",
+        ] {
+            env.remove(key);
+        }
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let baseline = graph
+            .collect_forward_linear_bounds_dag_cached(&input, None, None)
+            .expect("certified forward-linear baseline");
+        let config = AlphaCrownConfig {
+            iterations: 0,
+            gradient_method: crate::bounds::GradientMethod::AnalyticChain,
+            fix_interm_bounds: false,
+            cgan_sparse_target_complete_root: true,
+            ..AlphaCrownConfig::default()
+        };
+
+        let entries = CganAtomicCollectionEntryCounter::start();
+        let full_intermediate_walks = AlphaIntermediateCollectionEntryCounter::start();
+        let (bounds, _alpha_state) = graph
+            .collect_alpha_crown_bounds_dag_with_engine(&input, &config, None)
+            .expect("full AnalyticChain outer collection");
+        assert_eq!(
+            entries.entries(),
+            1,
+            "the dispatch must reuse the optimizer-owned final reference map instead of \
+             starting an uncached second atomic collection"
+        );
+        assert_eq!(
+            full_intermediate_walks.entries(),
+            0,
+            "the one-target transaction must publish its optimizer-owned sound map instead of \
+             widening into an all-node explicit-alpha collection"
+        );
+
+        for (name, baseline_bound) in baseline.iter() {
+            let actual = bounds
+                .get(name)
+                .unwrap_or_else(|| panic!("outer collection omitted baseline node '{name}'"));
+            assert_eq!(
+                actual.shape(),
+                baseline_bound.shape(),
+                "node '{name}' shape changed"
+            );
+            for ((&lower, &upper), (&baseline_lower, &baseline_upper)) in actual
+                .lower()
+                .iter()
+                .zip(actual.upper())
+                .zip(baseline_bound.lower().iter().zip(baseline_bound.upper()))
+            {
+                assert!(
+                    lower >= baseline_lower,
+                    "node '{name}' widened its forward-linear lower bound"
+                );
+                assert!(
+                    upper <= baseline_upper,
+                    "node '{name}' widened its forward-linear upper bound"
+                );
+            }
+        }
+    });
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn typed_cgan_forward_linear_refusal_retains_ordinary_post_alpha_contract() {
+    use super::alpha_explicit::AlphaIntermediateCollectionEntryCounter;
+    use super::crown::CganAtomicCollectionEntryCounter;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        for key in [
+            "NY_NO_FORWARD_LINEAR_REF",
+            "NY_NO_FORWARD_LINEAR_CONV_TRANSPOSE_REF",
+            "NY_FORWARD_LINEAR_SEQ_CONV_REF",
+            "NY_CROWN_IBP_SPARSE_RELU_ROWS",
+            "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+            "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+            "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
+            "NY_DISABLE_CROWN_COLLECTION_CACHE",
+        ] {
+            env.remove(key);
+        }
+
+        // A cold forward-linear map requires at least 30 seconds of headroom.
+        // Five seconds therefore deterministically declines the requested typed
+        // lane before it enters the atomic collector.
+        let config_with_short_deadline = || AlphaCrownConfig {
+            iterations: 0,
+            gradient_method: crate::bounds::GradientMethod::AnalyticChain,
+            fix_interm_bounds: false,
+            cgan_sparse_target_complete_root: true,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+            ..AlphaCrownConfig::default()
+        };
+
+        let (source_graph, source_input) =
+            build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let source_order = source_graph
+            .exec_order()
+            .expect("fallback execution order")
+            .to_vec();
+        let (_fallback, source) = source_graph
+            .collect_alpha_reference_bounds_with_engine_and_source(
+                &source_input,
+                &config_with_short_deadline(),
+                None,
+                &source_order,
+            )
+            .expect("ordinary reference fallback");
+        assert_eq!(
+            source,
+            AlphaReferenceBoundsSource::CrownIbp,
+            "a declined typed request must expose the collector that actually ran"
+        );
+
+        let (graph, input) = build_deep_sequential_conv_transpose_alpha_reference_graph();
+        let expected_ibp = graph
+            .collect_node_bounds_with_engine(&input, None)
+            .expect("certified plain-IBP baseline");
+        let entries = CganAtomicCollectionEntryCounter::start();
+        let full_intermediate_walks = AlphaIntermediateCollectionEntryCounter::start();
+        let (bounds, _alpha_state) = graph
+            .collect_alpha_crown_bounds_dag_with_engine(&input, &config_with_short_deadline(), None)
+            .expect("ordinary post-alpha fallback");
+        assert_eq!(
+            entries.entries(),
+            0,
+            "an eligibility match must not claim a typed transaction after its baseline refused"
+        );
+        assert_eq!(
+            full_intermediate_walks.entries(),
+            1,
+            "the declined typed lane must retain fix_interm_bounds=false ordinary post-alpha \
+             collection"
+        );
+        for (name, baseline) in &expected_ibp {
+            let actual = bounds
+                .get(name)
+                .unwrap_or_else(|| panic!("ordinary fallback omitted baseline node '{name}'"));
+            assert_eq!(actual.shape(), baseline.shape(), "node '{name}' shape");
+            for ((&lower, &upper), (&base_lower, &base_upper)) in actual
+                .lower()
+                .iter()
+                .zip(actual.upper())
+                .zip(baseline.lower().iter().zip(baseline.upper()))
+            {
+                assert!(lower >= base_lower, "node '{name}' widened its lower bound");
+                assert!(upper <= base_upper, "node '{name}' widened its upper bound");
+            }
+        }
+    });
+}
+
+/// #cgan-truncated-cache: a deadline-cut full enclosure map is safe to reuse
+/// without relabeling it complete. The second same-box call must return every
+/// bound/provenance/event bit-for-bit, while a different input box misses; the
+/// downstream fixed-slope bound and its threshold verdict remain identical.
+#[ntest::timeout(10000)]
+#[test]
+fn truncated_cache_gate_preserves_bounds_provenance_and_verdict() {
+    ny_test_utils::env::with_env_edits(|env| {
+        env.set("NY_CROWN_SERVE_TRUNCATED_CACHE", "1");
+        for key in [
+            "NY_DISABLE_CROWN_COLLECTION_CACHE",
+            "NY_CROWN_CUT_SEGMENT",
+            "NY_CROWN_OBJ_CHUNK",
+            "NY_NO_CHUNK_ABORT",
+            "NY_NO_CHUNK_GROW",
+            "NY_NO_CHUNK_WAVE_PAR",
+            "NY_DENSE_BUDGET_MB",
+            "NY_PATCHES_BUDGET_SECS",
+            "NY_DIM_CAP_SCALE",
+            "NY_CROWN_CHUNK_AWARE_BUDGET",
+            "NY_CONV_PATCHES_COLLECT",
+            "NY_CROWN_MEM_CAP_MB",
+            "NY_PATCHES_GPU",
+            "NY_CONV_SKIP_DEAD_F32",
+            "NY_CONVTRANSPOSE_SOUND_F64_GPU",
+            "NY_PATCHES_REENTRY_MIN_ROWS",
+        ] {
+            env.remove(key);
+        }
+
+        // An already-expired producer is all-IBP and deliberately remains
+        // unscoped. A later useful phase must recompute rather than inherit it.
+        let (expired_graph, expired_input) = build_truncated_collection_cache_graph();
+        let _all_ibp = expired_graph
+            .collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                &expired_input,
+                Some(std::time::Instant::now()),
+                None,
+            )
+            .expect("already-expired producer");
+        let _recomputed = expired_graph
+            .collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                &expired_input,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+                None,
+            )
+            .expect("later useful phase recomputes");
+        assert_eq!(
+            expired_graph.crown_ibp_collection_truncated_cache_hits(),
+            0,
+            "an already-expired/all-IBP producer must never poison a live phase"
+        );
+
+        // Build a deterministic mixed-quality fixture from a completed sound
+        // collection: retain the ConvTranspose CROWN target and mark the ReLU
+        // target as an explicit deadline fallback. This models the measured
+        // expensive-partial state without a wall-clock race in the test.
+        let (certifier, source_input) = build_truncated_collection_cache_graph();
+        let mut first = certifier
+            .collect_crown_ibp_bounds_dag_with_status(&source_input)
+            .expect("completed source collection");
+        let source_ibp = certifier
+            .collect_node_bounds(&source_input)
+            .expect("source IBP map");
+        first.bounds.insert(
+            "relu".to_string(),
+            source_ibp.get("relu").expect("ReLU IBP bound").clone(),
+        );
+        first.provenance.insert(
+            "relu".to_string(),
+            BoundsProvenance::ForwardFallback(
+                crate::types::CrownIbpFallbackReason::DeadlineExceeded,
+            ),
+        );
+        first
+            .fallback_events
+            .push(crate::types::CrownIbpFallbackEvent {
+                layer_index: 1,
+                layer_type: "ReLU".to_string(),
+                reason: crate::types::CrownIbpFallbackReason::DeadlineExceeded,
+                details: "deterministic mixed-quality production fixture".to_string(),
+            });
+        assert!(
+            first
+                .provenance
+                .values()
+                .any(|provenance| matches!(provenance, BoundsProvenance::Crown)),
+            "fixture must retain a real CROWN target"
+        );
+        let (cache_source, input) = build_truncated_collection_cache_graph();
+        let first = cache_source.seed_truncated_collection_cache_for_test(&input, first);
+        let mut graph = cache_source.clone();
+        graph.adopt_bound_caches_from(&cache_source);
+        assert_eq!(graph.crown_ibp_collection_cache_hits(), 0);
+        assert_eq!(graph.crown_ibp_collection_truncated_cache_hits(), 0);
+
+        // Different domain: exact input fingerprint mismatch, no partial hit.
+        let mut other_upper = input.upper().clone();
+        let old = other_upper.as_slice().expect("contiguous")[0];
+        other_upper.as_slice_mut().expect("contiguous")[0] = ny_tensor::next_down_f32(old);
+        let other = BoundedTensor::new(input.lower().clone(), other_upper).expect("narrower box");
+        let _ = graph
+            .collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                &other,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+                None,
+            )
+            .expect("different-box collection");
+        assert_eq!(
+            graph.crown_ibp_collection_truncated_cache_hits(),
+            0,
+            "different input box must miss"
+        );
+
+        // M1 exact-dark compatibility: the entry was produced and seeded with
+        // the gate unset. An explicit `0` must have the identical cache scope
+        // and serve the exact same production result.
+        env.set("NY_CROWN_CHUNK_AWARE_BUDGET", "0");
+        let served = graph
+            .collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                &input,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+                None,
+            )
+            .expect("same-box partial cache serve");
+        assert_eq!(graph.crown_ibp_collection_cache_hits(), 1);
+        assert_eq!(graph.crown_ibp_collection_truncated_cache_hits(), 1);
+        assert_node_bounds_bit_equal(&first.bounds, &served.bounds, "truncated cache hit");
+        assert_eq!(
+            first.provenance, served.provenance,
+            "a partial hit must preserve every fallback provenance tag"
+        );
+        assert_eq!(
+            first.fallback_events, served.fallback_events,
+            "a partial hit must preserve the producer's incompleteness evidence"
+        );
+
+        // Production consumer seam: both maps drive the exact same
+        // fixed-slope CROWN backward and therefore the same threshold verdict.
+        let downstream_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        let baseline_bound = graph
+            .propagate_crown_with_engine_and_deadline_and_node_bounds(
+                &input,
+                None,
+                downstream_deadline,
+                Some(&first.bounds),
+            )
+            .expect("baseline downstream bound");
+        let cached_bound = graph
+            .propagate_crown_with_engine_and_deadline_and_node_bounds(
+                &input,
+                None,
+                downstream_deadline,
+                Some(&served.bounds),
+            )
+            .expect("cached downstream bound");
+        assert_eq!(baseline_bound.bounds.lower(), cached_bound.bounds.lower());
+        assert_eq!(baseline_bound.bounds.upper(), cached_bound.bounds.upper());
+        assert_eq!(baseline_bound.provenance, cached_bound.provenance);
+        let threshold = 0.0_f32;
+        let baseline_verified = baseline_bound.bounds.lower().iter().all(|&v| v > threshold);
+        let cached_verified = cached_bound.bounds.lower().iter().all(|&v| v > threshold);
+        assert_eq!(
+            baseline_verified, cached_verified,
+            "the cache cannot change the bound-derived verdict"
+        );
+
+        // The stronger whole-cache kill switch bypasses both lookup and store,
+        // even while the partial gate remains armed.
+        env.set("NY_DISABLE_CROWN_COLLECTION_CACHE", "1");
+        let _ = graph
+            .collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                &input,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+                None,
+            )
+            .expect("whole-cache kill-switch recomputation");
+        assert_eq!(
+            graph.crown_ibp_collection_truncated_cache_hits(),
+            1,
+            "whole-cache kill switch must prevent another truncated serve"
+        );
+        env.remove("NY_DISABLE_CROWN_COLLECTION_CACHE");
+
+        // Exact gate kill switch: every value except `1` returns to historical
+        // recomputation and must not increment the partial-hit counter.
+        env.set("NY_CROWN_SERVE_TRUNCATED_CACHE", "0");
+        let _ = graph
+            .collect_crown_ibp_bounds_dag_with_status_and_deadline(
+                &input,
+                Some(std::time::Instant::now()),
+                None,
+            )
+            .expect("gate-off historical recomputation");
+        assert_eq!(
+            graph.crown_ibp_collection_truncated_cache_hits(),
+            1,
+            "kill switch must prevent another truncated serve"
+        );
+    });
 }
 
 // ============ FC-head pre-activation tightening soundness (#cifar100-fchead) ============

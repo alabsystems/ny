@@ -14,6 +14,8 @@
 //! - `bias.rs`: Shared f64 bias accumulation + directed-rounding helper
 //! - `spectral.rs`: Spectral norm computation
 
+#[allow(dead_code)]
+pub(crate) mod allocation_provenance;
 pub(crate) mod bias;
 pub(crate) mod crown_batched;
 mod crown_batched_multi_domain;
@@ -44,6 +46,8 @@ use std::borrow::Cow;
 use crate::bounds::{nan_propagating_max_zero, nan_propagating_min_zero};
 use crate::{BatchedLinearBounds, LinearBounds};
 
+use self::allocation_provenance::TrackedLinearArray;
+
 // These imports are used by the test submodule (which accesses the parent's namespace).
 // They are not used by production code in this file.
 #[cfg(test)]
@@ -55,16 +59,22 @@ use crate::BoundedTensor;
 ///
 /// Stores weight matrix W and optional bias b for bound propagation.
 /// Precomputes W+ = max(W,0) and W- = min(W,0) as faer matrices for fast IBP.
-#[derive(Clone)]
 pub struct LinearLayer {
     /// Weight matrix of shape (out_features, in_features)
-    pub weight: Array2<f32>,
+    ///
+    /// Parameters are immutable after construction because every accelerated
+    /// propagation path relies on construction-time positive/negative,
+    /// transpose, norm, and faer caches. Expose read-only access through
+    /// [`Self::weight`].
+    pub(crate) weight: TrackedLinearArray<ndarray::Ix2>,
     /// Optional bias of shape (out_features,)
-    pub bias: Option<Array1<f32>>,
+    ///
+    /// Exposed read-only through [`Self::bias`].
+    pub(crate) bias: Option<TrackedLinearArray<ndarray::Ix1>>,
     /// Cached positive part of weight for IBP (ndarray): max(W, 0)
-    w_pos: Array2<f32>,
+    w_pos: TrackedLinearArray<ndarray::Ix2>,
     /// Cached negative part of weight for IBP (ndarray): min(W, 0)
-    w_neg: Array2<f32>,
+    w_neg: TrackedLinearArray<ndarray::Ix2>,
     /// Cached transpose of w_pos as faer Mat: [in_features, out_features] for fast matmul
     w_pos_t_faer: Mat<f32>,
     /// Cached transpose of w_neg as faer Mat: [in_features, out_features] for fast matmul
@@ -77,20 +87,46 @@ pub struct LinearLayer {
     /// Cached per-output-row L2 norm ‖W[o,:]‖₂ (rounded outward), computed once.
     /// Reused by the L2/Cauchy-Schwarz tightening so it is not recomputed per IBP
     /// call (the per-call recompute was an O(out·in) hot loop on deep models).
-    row_l2_norms: Array1<f32>,
+    row_l2_norms: TrackedLinearArray<ndarray::Ix1>,
     /// Lazily cached ROW-MAJOR transposes (in×out) of weight / W+ / W− for the
     /// engine-GEMM paths (#cora-transpose-cache): `propagate_concrete_via_gemm`
     /// / `propagate_ibp_via_gemm` previously rebuilt these on EVERY call —
     /// measured 62% of ALL samples on a cora PGD run (thousands of concrete
     /// point evaluations per second, each re-transposing the same immutable
-    /// weight). `Arc<OnceLock<..>>` keeps `derive(Clone)` and shares the
-    /// filled cache across clones — consistent with the existing invariant
-    /// that `weight` is immutable after construction (every other cached
-    /// field above already relies on it). Lazy so layers never touched by an
+    /// weight). `Arc<OnceLock<..>>` preserves the historical clone/cache-sharing
+    /// semantics: the manual `Clone` shares filled caches while recapturing all
+    /// deep owner allocations. This is consistent with the existing invariant
+    /// that `weight` is immutable after construction (every other cached field
+    /// above already relies on it). Lazy so layers never touched by an
     /// engine-GEMM path pay no memory.
     weight_t_rm: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     w_pos_t_rm: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     w_neg_t_rm: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
+}
+
+impl Clone for LinearLayer {
+    fn clone(&self) -> Self {
+        Self {
+            // Each tracked ndarray clone captures the allocation actually
+            // produced by ndarray. Provenance facts are never copied from the
+            // source owner.
+            weight: self.weight.clone(),
+            bias: self.bias.clone(),
+            w_pos: self.w_pos.clone(),
+            w_neg: self.w_neg.clone(),
+            w_pos_t_faer: self.w_pos_t_faer.clone(),
+            w_neg_t_faer: self.w_neg_t_faer.clone(),
+            weight_faer: self.weight_faer.clone(),
+            spectral_norm: self.spectral_norm,
+            row_l2_norms: self.row_l2_norms.clone(),
+            // Preserve the historical cache-sharing behavior. A retained-v1
+            // observation is issued only after all three cells are filled and
+            // their immutable Vec owners have been validated.
+            weight_t_rm: self.weight_t_rm.clone(),
+            w_pos_t_rm: self.w_pos_t_rm.clone(),
+            w_neg_t_rm: self.w_neg_t_rm.clone(),
+        }
+    }
 }
 
 /// Transpose an (r×c) row-major ndarray into a (c×r) row-major flat Vec.
@@ -177,15 +213,15 @@ impl LinearLayer {
         }
 
         Ok(Self {
-            weight,
-            bias,
-            w_pos,
-            w_neg,
+            weight: TrackedLinearArray::new(weight),
+            bias: bias.map(TrackedLinearArray::new),
+            w_pos: TrackedLinearArray::new(w_pos),
+            w_neg: TrackedLinearArray::new(w_neg),
             w_pos_t_faer,
             w_neg_t_faer,
             weight_faer,
             spectral_norm,
-            row_l2_norms,
+            row_l2_norms: TrackedLinearArray::new(row_l2_norms),
             weight_t_rm: std::sync::Arc::new(std::sync::OnceLock::new()),
             w_pos_t_rm: std::sync::Arc::new(std::sync::OnceLock::new()),
             w_neg_t_rm: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -299,6 +335,50 @@ impl LinearLayer {
         self.weight.ncols()
     }
 
+    /// Immutable weight matrix of shape `(out_features, in_features)`.
+    pub fn weight(&self) -> &Array2<f32> {
+        self.weight.as_array()
+    }
+
+    /// Immutable optional bias of shape `(out_features,)`.
+    pub fn bias(&self) -> Option<&Array1<f32>> {
+        self.bias.as_ref().map(TrackedLinearArray::as_array)
+    }
+
+    /// Replace both parameter tensors and rebuild every derived propagation cache.
+    ///
+    /// This is the supported mutation boundary for a constructed layer. Direct
+    /// field mutation cannot keep the positive/negative, transpose, spectral,
+    /// and row-norm caches coherent, so parameters are exposed read-only and
+    /// updates are committed atomically through this method.
+    ///
+    /// If validation fails, `self` is left unchanged.
+    pub fn replace_parameters(
+        &mut self,
+        weight: Array2<f32>,
+        bias: Option<Array1<f32>>,
+    ) -> Result<()> {
+        let replacement = Self::new(weight, bias)?;
+        *self = replacement;
+        Ok(())
+    }
+
+    /// Replace the weight matrix and rebuild every derived propagation cache.
+    ///
+    /// The existing bias is retained. If the new output dimension is
+    /// incompatible with that bias, `self` is left unchanged and a shape error
+    /// is returned.
+    pub fn set_weight(&mut self, weight: Array2<f32>) -> Result<()> {
+        self.replace_parameters(weight, self.bias().cloned())
+    }
+
+    /// Replace the optional bias and rebuild the layer atomically.
+    ///
+    /// If the bias shape is invalid, `self` is left unchanged.
+    pub fn set_bias(&mut self, bias: Option<Array1<f32>>) -> Result<()> {
+        self.replace_parameters(self.weight().clone(), bias)
+    }
+
     /// Output dimension.
     pub fn out_features(&self) -> usize {
         self.weight.nrows()
@@ -313,19 +393,19 @@ impl LinearLayer {
     /// Cached per-output-row L2 norm ‖W[o,:]‖₂ (rounded outward), for the
     /// L2/Cauchy-Schwarz IBP tightening. Computed once at construction.
     pub(crate) fn row_l2_norms(&self) -> &Array1<f32> {
-        &self.row_l2_norms
+        self.row_l2_norms.as_array()
     }
 
     // --- Internal accessors for submodules ---
 
     /// Cached positive part of weight (ndarray): max(W, 0).
     pub(super) fn w_pos(&self) -> &Array2<f32> {
-        &self.w_pos
+        self.w_pos.as_array()
     }
 
     /// Cached negative part of weight (ndarray): min(W, 0).
     pub(super) fn w_neg(&self) -> &Array2<f32> {
-        &self.w_neg
+        self.w_neg.as_array()
     }
 
     /// Cached transpose of w_pos as faer Mat.
@@ -359,11 +439,11 @@ impl LinearLayer {
 
     /// Deadline-aware CROWN backward propagation (#4321).
     ///
-    /// Identical bounds to [`propagate_linear_with_engine`], but when a deadline
-    /// is present the dense `A @ W` GEMM is chunked over output (spec) rows so the
-    /// wall clock is checked mid-op. A wide classifier-head GEMM with many
-    /// objective rows is otherwise the single longest uninterrupted op on the
-    /// spec-matrix root output-bound path, and can overrun the verifier timeout.
+    /// When a deadline is present, the dense `A @ W` work uses a pollable CPU
+    /// implementation and never enters a generic or process-global GEMM engine,
+    /// whose API has no cancellation contract. A wide classifier-head GEMM is
+    /// otherwise the single longest uninterrupted op on the spec-matrix root
+    /// output-bound path and can overrun the verifier timeout.
     /// Returns [`ny_core::NyError::DeadlineExceeded`] once the deadline passes,
     /// which the graph-CROWN dispatch degrades to a sound per-node IBP fallback.
     #[inline]
@@ -421,10 +501,10 @@ pub fn merge_linear(layer1: &LinearLayer, layer2: &LinearLayer) -> LinearLayer {
         layer2.in_features()
     );
 
-    let weight = layer2.weight.dot(&layer1.weight);
-    let bias = match (&layer1.bias, &layer2.bias) {
-        (Some(b1), Some(b2)) => Some(layer2.weight.dot(b1) + b2),
-        (Some(b1), None) => Some(layer2.weight.dot(b1)),
+    let weight = layer2.weight().dot(layer1.weight());
+    let bias = match (layer1.bias(), layer2.bias()) {
+        (Some(b1), Some(b2)) => Some(layer2.weight().dot(b1) + b2),
+        (Some(b1), None) => Some(layer2.weight().dot(b1)),
         (None, Some(b2)) => Some(b2.clone()),
         (None, None) => None,
     };

@@ -104,9 +104,43 @@ where
         ctx.deadline,
     )
     .map_err(|e| preserve_structured_error(e, ctx.node_name, layer_name))?;
-    Ok(BackwardDispatchResult::Single(Box::new(
-        new_lb.into_owned(),
-    )))
+    let new_lb =
+        own_propagated_linear_with_deadline(new_lb, ctx.deadline, ctx.node_name, layer_name)?;
+    Ok(BackwardDispatchResult::Single(Box::new(new_lb)))
+}
+
+/// Convert a propagation result to an owned carrier without allowing a finite
+/// dispatch to hide an infallible `Cow::into_owned()` clone.
+///
+/// The dispatcher only sees the incoming carrier, not the caller's wider graph
+/// frontier.  [`LinearBounds::try_clone_with_deadline`] therefore receives no
+/// additional retained-base charge here; that API itself charges both the
+/// still-live borrowed source and the staged clone, reconciles allocations, and
+/// polls the copy.  Propagation kernels that return an owned carrier have
+/// already admitted their output storage; they are deadline-checked again
+/// immediately before publication.  `deadline: None` preserves the historical
+/// `Cow::into_owned()` behavior exactly.
+pub(super) fn own_propagated_linear_with_deadline(
+    propagated: Cow<'_, LinearBounds>,
+    deadline: Option<Instant>,
+    node_name: &str,
+    layer_name: &str,
+) -> Result<LinearBounds> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(format!(
+            "CROWN failed at node '{node_name}' ({layer_name}): deadline exceeded before owning propagated bounds"
+        )));
+    }
+    let owned = match (deadline, propagated) {
+        (Some(limit), Cow::Borrowed(bounds)) => bounds.try_clone_with_deadline(Some(limit), 0)?,
+        (_, propagated) => propagated.into_owned(),
+    };
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(NyError::DeadlineExceeded(format!(
+            "CROWN failed at node '{node_name}' ({layer_name}): deadline exceeded before publishing propagated bounds"
+        )));
+    }
+    Ok(owned)
 }
 
 /// Dispatch a layer through its `propagate_linear` trait method.
@@ -126,6 +160,7 @@ pub(super) fn dispatch_propagate_linear(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// #conv-crown-oom regression: the Conv2d backward per-buffer memory-cap
     /// backstop raises `CpuMemoryExceeded`, and every downstream catch site
@@ -161,5 +196,44 @@ mod tests {
         };
         let out = preserve_structured_error(e, "n", "Conv2d");
         assert!(matches!(out, NyError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn finite_borrowed_propagation_is_owned_through_checked_clone() {
+        let source = LinearBounds::identity(3);
+        let owned = own_propagated_linear_with_deadline(
+            Cow::Borrowed(&source),
+            Some(Instant::now() + Duration::from_secs(30)),
+            "node",
+            "IdentityTest",
+        )
+        .unwrap();
+
+        assert_eq!(owned.lower_a(), source.lower_a());
+        assert_eq!(owned.upper_a(), source.upper_a());
+        assert_eq!(owned.lower_b(), source.lower_b());
+        assert_eq!(owned.upper_b(), source.upper_b());
+        assert_ne!(owned.lower_a().as_ptr(), source.lower_a().as_ptr());
+        assert_ne!(owned.upper_a().as_ptr(), source.upper_a().as_ptr());
+    }
+
+    #[test]
+    fn expired_borrowed_propagation_fails_before_publication() {
+        let source = LinearBounds::identity(3);
+        let error = own_propagated_linear_with_deadline(
+            Cow::Borrowed(&source),
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond fits before now"),
+            ),
+            "node",
+            "IdentityTest",
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, NyError::DeadlineExceeded(_)));
+        assert_eq!(source.lower_a(), &ndarray::Array2::<f32>::eye(3));
+        assert_eq!(source.upper_a(), &ndarray::Array2::<f32>::eye(3));
     }
 }

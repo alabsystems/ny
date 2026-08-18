@@ -18,6 +18,10 @@ mod alpha_s_shaped_update;
 mod alpha_sqrt;
 mod batched;
 mod batched_f64;
+mod certified_reduction;
+pub(crate) use certified_reduction::{
+    certified_affine_sum_f32, certified_affine_sum_f32_with_poll, OutwardDirection,
+};
 mod concretize;
 pub(crate) use concretize::concretize_row_directed;
 pub mod facet_bank;
@@ -35,8 +39,9 @@ mod alpha_s_shaped_tests;
 mod tests;
 
 pub use alpha::{
-    AdamParams, AlphaCrownConfig, AlphaCrownIntermediate, AlphaSpecEarlyExit, AlphaState,
-    GradientMethod, GraphAlphaCrownIntermediate, GraphAlphaState, MultiSpecKeep, Optimizer,
+    AdamParams, AlphaCrownConfig, AlphaCrownIntermediate, AlphaSpecAscent, AlphaSpecEarlyExit,
+    AlphaState, GradientMethod, GraphAlphaCrownIntermediate, GraphAlphaState, MultiSpecKeep,
+    Optimizer,
 };
 pub(crate) use alpha_s_shaped::{MonotoneSShapedAlpha, MonotoneSShapedPathAlpha};
 pub(crate) use alpha_s_shaped_update::MonotoneSShapedGradients;

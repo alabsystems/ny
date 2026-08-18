@@ -42,7 +42,7 @@ fn test_crown_backward_step_linear_composes_weight_matrix() -> Result<()> {
     let mut lb = identity_bounds(3);
     let pre_act = bounded_1d(&[0.0, 0.0], &[1.0, 1.0]);
 
-    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test")?;
+    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test", None)?;
     assert!(matches!(result, CrownStepResult::Continue));
 
     // After backward through y = Wx + b with identity incoming bounds:
@@ -102,7 +102,7 @@ fn test_crown_backward_step_relu_fully_active() -> Result<()> {
     // Pre-activation: all positive → ReLU is identity.
     let pre_act = bounded_1d(&[1.0, 2.0], &[3.0, 4.0]);
 
-    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test")?;
+    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test", None)?;
     assert!(matches!(result, CrownStepResult::Continue));
 
     // Identity pass-through: A matrices unchanged, bias unchanged.
@@ -127,7 +127,7 @@ fn test_crown_backward_step_relu_fully_inactive() -> Result<()> {
     // Pre-activation: all negative → ReLU kills everything.
     let pre_act = bounded_1d(&[-4.0, -3.0], &[-2.0, -1.0]);
 
-    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test")?;
+    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test", None)?;
     assert!(matches!(result, CrownStepResult::Continue));
 
     // Zero output: A matrices should be zero, biases should be zero.
@@ -165,7 +165,7 @@ fn test_crown_backward_step_relu_unstable_soundness() -> Result<()> {
     // Upper intercept = -(-2)*4 / 6 = 8/6 = 4/3
     let pre_act = bounded_1d(&[-2.0], &[4.0]);
 
-    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test")?;
+    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test", None)?;
     assert!(matches!(result, CrownStepResult::Continue));
 
     // Concretize and verify soundness: bounds must contain true ReLU output.
@@ -197,7 +197,7 @@ fn test_crown_backward_step_add_returns_ibp_fallback() -> Result<()> {
     let mut lb = identity_bounds(2);
     let pre_act = bounded_1d(&[0.0, 0.0], &[1.0, 1.0]);
 
-    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test")?;
+    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test", None)?;
     assert!(
         matches!(result, CrownStepResult::IbpFallback(_)),
         "Add must return IbpFallback in sequential CROWN"
@@ -211,7 +211,7 @@ fn test_crown_backward_step_mul_binary_returns_ibp_fallback() -> Result<()> {
     let mut lb = identity_bounds(2);
     let pre_act = bounded_1d(&[0.0, 0.0], &[1.0, 1.0]);
 
-    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test")?;
+    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test", None)?;
     assert!(
         matches!(result, CrownStepResult::IbpFallback(_)),
         "MulBinary must return IbpFallback in sequential CROWN"
@@ -238,7 +238,7 @@ fn test_crown_backward_step_skip_merge_passthrough() -> Result<()> {
     let original_lower_b = lb.lower_b().clone();
     let original_upper_b = lb.upper_b().clone();
 
-    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test")?;
+    let result = crown_backward_step(&layer, &mut lb, &pre_act, None, 0, "test", None)?;
     assert!(matches!(result, CrownStepResult::Continue));
 
     // Bounds must be exactly unchanged.
@@ -266,8 +266,15 @@ fn test_crown_backward_ibp_concretize_produces_sound_constant_bounds() -> Result
     // Pre-activation: [-3, 5] and [1, 4]. IBP of ReLU: [0, 5] and [1, 4].
     let pre_act = bounded_1d(&[-3.0, 1.0], &[5.0, 4.0]);
 
-    let result =
-        crown_backward_ibp_concretize(&layer, &mut lb, &pre_act, 0, "test", "test concretization")?;
+    let result = crown_backward_ibp_concretize(
+        &layer,
+        &mut lb,
+        &pre_act,
+        0,
+        "test",
+        "test concretization",
+        None,
+    )?;
     assert!(matches!(result, CrownStepResult::Continue));
 
     // A matrices must be all zeros (constant bounds).
@@ -330,6 +337,7 @@ fn test_crown_backward_ibp_concretize_with_scaled_incoming_bounds() -> Result<()
         0,
         "test",
         "test scaled concretization",
+        None,
     )?;
     assert!(matches!(result, CrownStepResult::Continue));
 
@@ -378,10 +386,12 @@ fn test_crown_backward_linear_relu_end_to_end_soundness() -> Result<()> {
     // CROWN backward: start from identity at output, go through ReLU then Linear.
     let mut lb = identity_bounds(post_relu.len());
 
-    let relu_result = crown_backward_step(&relu_layer, &mut lb, &post_linear, None, 1, "test")?;
+    let relu_result =
+        crown_backward_step(&relu_layer, &mut lb, &post_linear, None, 1, "test", None)?;
     assert!(matches!(relu_result, CrownStepResult::Continue));
 
-    let linear_result = crown_backward_step(&linear_layer, &mut lb, &pre_linear, None, 0, "test")?;
+    let linear_result =
+        crown_backward_step(&linear_layer, &mut lb, &pre_linear, None, 0, "test", None)?;
     assert!(matches!(linear_result, CrownStepResult::Continue));
 
     // Concretize CROWN bounds.

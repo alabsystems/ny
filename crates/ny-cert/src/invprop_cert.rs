@@ -78,14 +78,28 @@ impl InvpropAugmentedCertificate {
     /// pre-flight, not the trusted check.
     #[must_use]
     pub fn gammas_nonneg(&self) -> bool {
-        self.output_rows.iter().all(|r| !r.gamma.is_negative())
+        // Explicit loop (not `.iter().all(..)`): the `all` adapter is an
+        // absent-callee for the panic-freedom checker; the loop is the identical
+        // short-circuit (return `false` on the first negative gamma, else `true`,
+        // vacuously `true` on no rows).
+        for r in self.output_rows.iter() {
+            if r.gamma.is_negative() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Number of base premises + violation rows (must equal the multiplier count
     /// in the lowered Farkas certificate).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.base_premises.len() + self.output_rows.len()
+        // `saturating_add` (not `+`): two `Vec::len()` are each `<= isize::MAX`,
+        // so `2 * isize::MAX < usize::MAX` — the sum never saturates and equals
+        // `+` exactly, while clearing the Add-overflow obligation.
+        self.base_premises
+            .len()
+            .saturating_add(self.output_rows.len())
     }
 
     /// Whether the certificate carries no premises at all.

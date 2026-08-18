@@ -10,7 +10,7 @@
 //! (`dag_alpha_backward_pass_*`), which analytic formula equals dlb/dalpha_i
 //! for the lower bound of one spec row:
 //!
-//! LOCAL rule — what EVERY analytic path in NY computes today
+//! LOCAL rule — what NY's default analytic paths compute
 //! (`propagate_linear_with_alpha` relu/mod.rs:631, AnalyticChain
 //! backward/gradients.rs:105-110, GPU warmup `..._sound_grad`
 //! ny-cuda/sound_crown.rs:1051-1057, refuted wide-alpha batched.rs):
@@ -382,6 +382,115 @@ fn run_oracle(a1: [f32; 4], a2: [f32; 4]) -> (f32, f32, bool) {
         }
     }
     (max_err_true, max_err_local, sign_flip_seen)
+}
+
+/// The gated point-forward surrogate, held to the finite-difference probe that
+/// refuted the rule it replaces. `#envelope-grad` uses the concrete activation
+/// at the concretization argmin as a proxy for `ĥ_i(x*)`, instead of the
+/// constant `pre_lower[i]`; it is exact at the first ReLU and heuristic deeper.
+///
+/// TWO claims, and deliberately not a third:
+///
+/// 1. The worst-case FD error strictly improves in BOTH α settings.
+/// 2. THE DECISIVE ONE — the local rule is sign-definite `<= 0`
+///    (`local_rule_nonpos`, machine-checked in Lean), so wherever the true
+///    derivative is POSITIVE it points exactly the wrong way and Adam walks
+///    downhill. The envelope rule recovers that sign. This is the property that
+///    makes the ascent able to move at all, and no step size can substitute for
+///    it.
+///
+/// NOT claimed: per-neuron dominance. On deeper layers the degenerate-box
+/// forward uses the concrete rather than the relaxed ReLU, and a neuron can come
+/// out further from FD than the local rule happened to be (setting B,
+/// `relu2[2]`: envelope 9.7e-1 vs local 1.5e-1). The aggregate and the sign both
+/// still improve. Overstating this to "uniformly better" is the kind of claim
+/// that survives review and then quietly fails in measurement.
+#[ntest::timeout(60000)]
+#[test]
+fn fd_oracle_envelope_grad_beats_the_local_rule() {
+    for (label, a1, a2) in [
+        (
+            "A",
+            [0.30f32, 0.55, 0.45, 0.70],
+            [0.35f32, 0.60, 0.50, 0.65],
+        ),
+        (
+            "B",
+            [0.62f32, 0.28, 0.71, 0.44],
+            [0.57f32, 0.39, 0.66, 0.52],
+        ),
+    ] {
+        let h = OracleHarness::new();
+        let st = h.make_alpha_state(&a1, &a2);
+        let cand = compute_candidates(&h, &st);
+
+        let mut g = vec![Array1::<f32>::zeros(4), Array1::<f32>::zeros(4)];
+        let mut gu = vec![Array1::<f32>::zeros(4), Array1::<f32>::zeros(4)];
+        let (_b, inter) = h
+            .graph
+            .dag_alpha_backward_pass_with_intermediates(
+                &h.input,
+                &h.ibp,
+                &h.exec_order,
+                1,
+                3,
+                &h.relu_name_to_idx,
+                &st,
+                None,
+                &mut g,
+                &mut gu,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("alpha backward with intermediates");
+
+        let names = vec!["relu1".to_string(), "relu2".to_string()];
+        let env = h
+            .graph
+            .compute_graph_chain_rule_gradients_envelope_for_test(
+                &h.input, &names, &inter, &st, None,
+            );
+        assert_eq!(env.len(), 2, "one gradient array per ReLU");
+
+        let (mut err_env, mut err_local) = (0.0f32, 0.0f32);
+        let mut sign_recovered = false;
+        for (k, name) in ["relu1", "relu2"].iter().enumerate() {
+            for i in 0..4 {
+                let fd = h.fd_grad(&st, name, i, 5e-3);
+                let (e, l) = (env[k][i], cand.local[k][i]);
+                eprintln!(
+                    "[envelope-{label}] {name}[{i}] fd={fd:+.5} envelope={e:+.5} local={l:+.5}"
+                );
+                assert!(
+                    l <= 1e-6,
+                    "{name}[{i}]: the local rule is sign-definite <= 0 by construction \
+                     (local_rule_nonpos); a positive {l} means the rule under test changed"
+                );
+                if fd > 1e-3 && l < -1e-3 && e > 1e-3 {
+                    sign_recovered = true;
+                }
+                err_env = err_env.max((fd - e).abs());
+                err_local = err_local.max((fd - l).abs());
+            }
+        }
+        eprintln!(
+            "[envelope-{label}] max|fd-envelope|={err_env:.2e} max|fd-local|={err_local:.2e}"
+        );
+        assert!(
+            err_env < err_local,
+            "setting {label}: the envelope rule must beat the local rule on \
+             worst-case FD error (envelope {err_env:.2e}, local {err_local:.2e})"
+        );
+        assert!(
+            sign_recovered,
+            "setting {label}: expected at least one neuron where the true \
+             derivative is positive, the local rule is negative (walks downhill) \
+             and the envelope rule recovers the positive sign — that recovery is \
+             the entire point of the change"
+        );
+    }
 }
 
 /// THE decisive oracle: central finite differences of NY's actual CPU CROWN

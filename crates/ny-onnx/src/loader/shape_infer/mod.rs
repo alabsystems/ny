@@ -29,6 +29,9 @@ use tempfile::TempPath;
 use tracing::debug;
 use tracing::warn;
 
+#[cfg(feature = "ort")]
+use super::const_fold::is_standard_onnx_domain;
+
 /// Maximum time to wait for ONNX Runtime shape inference session creation.
 /// Models with problematic shape inference (e.g., Gemm with non-rank-2 inputs)
 /// can cause ORT to hang indefinitely in its C++ optimization passes.
@@ -37,6 +40,7 @@ const ORT_SHAPE_INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "ort")]
 const DEFAULT_IR_VERSION: i64 = 9;
+#[cfg(any(feature = "ort", test))]
 pub(super) const DEFAULT_OPSET_VERSION: i64 = 13;
 
 #[cfg(feature = "ort")]
@@ -440,7 +444,10 @@ fn known_tensor_ranks(graph: &onnx_proto::GraphProto) -> HashMap<String, usize> 
 fn normalize_transpose_perms_for_ort(graph: &mut onnx_proto::GraphProto) {
     let ranks = known_tensor_ranks(graph);
     for node in graph.node.iter_mut() {
-        if node.op_type != "Transpose" || node.input.is_empty() {
+        if node.op_type != "Transpose"
+            || !is_standard_onnx_domain(&node.domain)
+            || node.input.is_empty()
+        {
             continue;
         }
         let Some(&rank) = node.input.first().and_then(|name| ranks.get(name)) else {
@@ -595,8 +602,6 @@ fn expose_intermediate_outputs(model_bytes: &[u8]) -> Result<ExposedModel> {
         "InstanceNormalization",
         "GroupNormalization",
         "Identity",
-        "Cast",
-        "CastLike",
     ]
     .into_iter()
     .collect();
@@ -619,13 +624,52 @@ fn expose_intermediate_outputs(model_bytes: &[u8]) -> Result<ExposedModel> {
         // ORT then aborts the whole pass at the next `Transpose` (perm rank
         // mismatch). Using input 0 only keeps the annotation rank-correct or
         // absent (letting ORT infer it).
-        let inferred_type = if shape_preserving_ops.contains(node.op_type.as_str()) {
-            node.input
-                .first()
-                .filter(|name| !name.is_empty())
-                .and_then(|input| type_map.get(input).cloned())
-        } else {
+        let inferred_type = if !is_standard_onnx_domain(&node.domain) {
             None
+        } else {
+            match node.op_type.as_str() {
+                "Cast" => (|| {
+                    let mut ty = node
+                        .input
+                        .first()
+                        .filter(|name| !name.is_empty())
+                        .and_then(|input| type_map.get(input).cloned())?;
+                    let mut targets = node
+                        .attribute
+                        .iter()
+                        .filter(|attribute| attribute.name == "to");
+                    let target = targets.next()?;
+                    if target.r#type != onnx_proto::attribute_type::INT || targets.next().is_some()
+                    {
+                        return None;
+                    }
+                    ty.tensor_type.as_mut()?.elem_type = i32::try_from(target.i_value()).ok()?;
+                    Some(ty)
+                })(),
+                "CastLike" => (|| {
+                    let mut ty = node
+                        .input
+                        .first()
+                        .filter(|name| !name.is_empty())
+                        .and_then(|input| type_map.get(input).cloned())?;
+                    let target_elem_type = node
+                        .input
+                        .get(1)
+                        .filter(|name| !name.is_empty())
+                        .and_then(|input| type_map.get(input))?
+                        .tensor_type
+                        .as_ref()?
+                        .elem_type;
+                    ty.tensor_type.as_mut()?.elem_type = target_elem_type;
+                    Some(ty)
+                })(),
+                op_type if shape_preserving_ops.contains(op_type) => node
+                    .input
+                    .first()
+                    .filter(|name| !name.is_empty())
+                    .and_then(|input| type_map.get(input).cloned()),
+                _ => None,
+            }
         };
         for output_name in &node.output {
             if output_name.is_empty()

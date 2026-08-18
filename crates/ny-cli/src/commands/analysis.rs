@@ -17,6 +17,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::info;
 
+fn validate_nonnegative_finite(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() {
+        anyhow::bail!("{name} must be finite (got {value})");
+    }
+    if value < 0.0 {
+        anyhow::bail!("{name} must be non-negative (got {value})");
+    }
+    Ok(())
+}
+
 /// Handle the `ny diff` command.
 ///
 /// Compares two ONNX models layer-by-layer, identifying divergence points and
@@ -35,6 +45,8 @@ pub(crate) fn handle_diff_command(
     json: bool,
 ) -> Result<()> {
     use ny_onnx::diff::{diff_models, load_npy, DiffConfig, DiffStatus};
+
+    validate_nonnegative_finite("tolerance", tolerance)?;
 
     if !json {
         info!("Comparing models layer-by-layer:");
@@ -216,6 +228,11 @@ pub(crate) fn handle_sensitivity_command(
 ) -> Result<()> {
     use ny_onnx::sensitivity::{analyze_sensitivity, SensitivityConfig};
 
+    validate_nonnegative_finite("epsilon", epsilon)?;
+    if let Some(threshold) = threshold {
+        validate_nonnegative_finite("threshold", threshold)?;
+    }
+
     info!("Analyzing sensitivity: {}", model.display());
 
     let config = SensitivityConfig {
@@ -295,6 +312,8 @@ pub(crate) fn handle_quantize_check_command(
     json: bool,
 ) -> Result<()> {
     use ny_onnx::quantize::{analyze_quantization, QuantizeConfig};
+
+    validate_nonnegative_finite("epsilon", epsilon)?;
 
     info!("Analyzing quantization safety: {}", model.display());
 
@@ -400,6 +419,11 @@ pub(crate) fn handle_profile_bounds_command(
 ) -> Result<()> {
     use ny_onnx::profile::{profile_bounds_graph, ProfileConfig};
 
+    validate_nonnegative_finite("epsilon", epsilon)?;
+    if let Some(threshold) = threshold {
+        validate_nonnegative_finite("threshold", threshold)?;
+    }
+
     info!("Profiling bounds: {}", model.display());
 
     // Note: input will be set below based on model input shape
@@ -414,9 +438,13 @@ pub(crate) fn handle_profile_bounds_command(
 
     // Auto-detect native format based on extension if --native not specified
     let use_native = native || model.is_dir() || {
-        let ext = model.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let ext = model
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         matches!(
-            ext,
+            ext.as_str(),
             "pt" | "pth" | "bin" | "safetensors" | "gguf" | "mlmodel" | "mlpackage"
         )
     };
@@ -561,7 +589,7 @@ pub(crate) fn handle_profile_bounds_command(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_center_zeros_onnx_shape;
+    use super::{resolve_center_zeros_onnx_shape, validate_nonnegative_finite};
 
     #[test]
     fn test_resolve_center_zeros_onnx_shape_substitutes_zero_and_negative_dims_2883() {
@@ -569,5 +597,14 @@ mod tests {
             resolve_center_zeros_onnx_shape(&[0, 80, -1]),
             vec![1, 80, 1]
         );
+    }
+
+    #[test]
+    fn analysis_numeric_options_reject_negative_and_non_finite_values() {
+        assert!(validate_nonnegative_finite("epsilon", 0.0).is_ok());
+        assert!(validate_nonnegative_finite("epsilon", 0.01).is_ok());
+        assert!(validate_nonnegative_finite("epsilon", -0.01).is_err());
+        assert!(validate_nonnegative_finite("epsilon", f32::NAN).is_err());
+        assert!(validate_nonnegative_finite("epsilon", f32::INFINITY).is_err());
     }
 }

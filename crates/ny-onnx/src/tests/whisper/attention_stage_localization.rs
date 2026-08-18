@@ -155,9 +155,28 @@ fn load_prefix_cut_stage_localization_case(
     let input_shape = vec![1, 2, hidden_dim];
     let input_data = ArrayD::from_elem(ndarray::IxDyn(&input_shape), 0.0f32);
     let block_input = BoundedTensor::from_epsilon(input_data, 0.01).expect("valid input");
-    let ln_output = whisper
-        .attention_layernorm_output_ibp(0, &block_input, layernorm_forward_mode)
-        .expect("LayerNorm IBP failed");
+    let ln_output = if layernorm_forward_mode {
+        // Test-only diagnostic path. Production IBP APIs reject heuristic
+        // forward mode because BoundedTensor carries no soundness provenance.
+        let ln_node = whisper
+            .discover_attention_nodes(0)
+            .expect("attention discovery failed")
+            .attn_ln
+            .name
+            .clone();
+        let mut graph = whisper
+            .attention_subgraph(0)
+            .expect("attention subgraph failed");
+        graph.set_output(&ln_node);
+        graph.set_layernorm_forward_mode(true);
+        graph
+            .propagate_ibp(&block_input)
+            .expect("diagnostic forward-mode LayerNorm propagation failed")
+    } else {
+        whisper
+            .attention_layernorm_output_ibp(0, &block_input, false)
+            .expect("conservative LayerNorm IBP failed")
+    };
 
     PrefixCutStageLocalizationCase {
         graph: artifacts.graph,
@@ -197,9 +216,10 @@ fn assert_shared_prefix_topology(
 /// prior #318 packet, then intentionally degrade the Softmax node to IBP so the
 /// next widening boundary can be measured downstream of Softmax.
 #[ntest::timeout(60000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_attention_softmax_cut_stage_localization_318() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let case = load_prefix_cut_stage_localization_case(false);
 
     println!("\n=== Whisper Attention Softmax-Cut Stage Localization (#318) ===");
@@ -344,9 +364,10 @@ fn assert_prefix_seam_stage(
 }
 
 #[ntest::timeout(60000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_attention_softmax_cut_prefix_seam_comparison_318() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let forward_case = load_prefix_cut_stage_localization_case(true);
     let conservative_case = load_prefix_cut_stage_localization_case(false);
 
@@ -461,9 +482,10 @@ fn localized_stage_nodes<'a>(
 }
 
 #[ntest::timeout(60000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_attention_stage_localization_real_weights_318() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let path = require_test_model_with_hint("whisper_tiny_encoder.onnx", WHISPER_TEST_MODEL_HINT);
     let whisper = load_whisper(&path).expect("Failed to load model");
     let hidden_dim = whisper.hidden_dim;
@@ -537,9 +559,10 @@ fn reachable_external_inputs(graph: &GraphNetwork, start: &str) -> BTreeSet<Stri
 /// Part of #318: shared-source prefix cut.
 /// Design: designs/2026-03-11-issue-318-whisper-shared-source-prefix-cut.md
 #[ntest::timeout(60000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_attention_prefix_cut_stage_localization_318() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let case = load_prefix_cut_stage_localization_case(false);
 
     println!("\n=== Whisper Attention Prefix-Cut Stage Localization (#318) ===");

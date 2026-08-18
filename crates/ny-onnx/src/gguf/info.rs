@@ -2,13 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use super::file_data::{capture_file_stamp, ensure_file_unchanged};
 use super::load::is_quantized_type;
-use super::metadata::format_metadata_value;
-use super::mmap::map_read_only_gguf;
-use gguf::{GGUFFile, GGUFMetadataValue};
+use super::parser::{read_streamed_gguf_descriptor, StreamedGgufDescriptor};
 use ny_core::{NyError, Result};
-use std::fs::File;
-use std::path::Path;
+use std::{fs::File, mem::size_of, path::Path};
 
 /// Metadata about a GGUF file.
 #[derive(Debug, Clone)]
@@ -29,18 +27,65 @@ pub struct GGUFInfo {
     pub metadata: Vec<(String, String)>,
 }
 
-/// Checked product of u64 dimensions, returning error on overflow.
-fn checked_dim_product(dims: &[u64]) -> Result<u64> {
-    dims.iter()
-        .try_fold(1u64, |a, &d| a.checked_mul(d))
-        .ok_or_else(|| NyError::ModelLoad("Tensor dimensions overflow u64".into()))
+/// Checked conversion and product of GGUF's u64 dimensions.
+fn checked_dim_product(dims: &[u64]) -> Result<usize> {
+    dims.iter().try_fold(1usize, |product, &dimension| {
+        let dimension = usize::try_from(dimension).map_err(|_| {
+            NyError::ModelLoad(format!(
+                "GGUF tensor dimension {dimension} does not fit usize"
+            ))
+        })?;
+        product
+            .checked_mul(dimension)
+            .ok_or_else(|| NyError::ModelLoad("Tensor dimensions overflow usize".into()))
+    })
 }
 
-/// Get information about a GGUF file without fully loading tensor data.
+fn info_from_descriptor(descriptor: StreamedGgufDescriptor) -> Result<GGUFInfo> {
+    let tensor_count = descriptor.tensors.len();
+    let required_bytes = tensor_count
+        .checked_mul(size_of::<(String, Vec<u64>, String, bool)>())
+        .ok_or_else(|| NyError::ModelLoad("GGUF info tensor allocation overflows usize".into()))?;
+    let mut tensors = Vec::new();
+    tensors
+        .try_reserve_exact(tensor_count)
+        .map_err(|_| NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes: usize::MAX,
+            site: "ny-onnx::gguf::gguf_info/tensors",
+        })?;
+
+    let mut param_count = 0usize;
+    for tensor in descriptor.tensors {
+        let elements = checked_dim_product(&tensor.dimensions)?;
+        param_count = param_count.checked_add(elements).ok_or_else(|| {
+            NyError::ModelLoad("Total GGUF parameter count overflows usize".into())
+        })?;
+        tensors.push((
+            tensor.name,
+            tensor.dimensions,
+            format!("{:?}", tensor.tensor_type),
+            is_quantized_type(&tensor.tensor_type),
+        ));
+    }
+
+    Ok(GGUFInfo {
+        version: descriptor.version,
+        tensor_count,
+        param_count,
+        architecture: descriptor.architecture,
+        model_name: descriptor.model_name,
+        tensors,
+        metadata: descriptor.metadata,
+    })
+}
+
+/// Get information about a GGUF file without reading its tensor payloads.
 ///
-/// The GGUF file must remain immutable for the duration of the call. Like all
-/// file-backed memory maps, concurrent writes from this or another process
-/// while inspection is in progress are outside the loader's safety contract.
+/// Only the metadata/tensor-descriptor prefix is streamed, subject to a fixed
+/// safety bound. The file must remain immutable for the duration of the call.
+/// Normal identity, size, or modification-time changes are detected and
+/// rejected as a potentially mixed read.
 pub fn gguf_info<P: AsRef<Path>>(path: P) -> Result<GGUFInfo> {
     let path = path.as_ref();
 
@@ -51,73 +96,11 @@ pub fn gguf_info<P: AsRef<Path>>(path: P) -> Result<GGUFInfo> {
         )));
     }
 
-    // Use memory-mapped I/O for efficient large file handling.
-    let file = File::open(path)
+    let mut file = File::open(path)
         .map_err(|e| NyError::ModelLoad(format!("Failed to open GGUF file: {}", e)))?;
+    let stamp = capture_file_stamp(&file, path)?;
+    let descriptor = read_streamed_gguf_descriptor(&mut file, path, stamp.len())?;
+    ensure_file_unchanged(&file, path, &stamp, "reading metadata")?;
 
-    let mmap = map_read_only_gguf(&file, path)?;
-
-    let data: &[u8] = &mmap;
-
-    let gguf_file = GGUFFile::read(data)
-        .map_err(|e| NyError::ModelLoad(format!("Failed to parse GGUF: {}", e)))?
-        .ok_or_else(|| NyError::ModelLoad("Incomplete GGUF file".to_string()))?;
-
-    // Extract architecture and model name from metadata
-    let mut architecture = None;
-    let mut model_name = None;
-    let mut metadata = Vec::new();
-
-    for meta in &gguf_file.header.metadata {
-        let value_str = format_metadata_value(&meta.value);
-
-        // Look for key metadata
-        if meta.key == "general.architecture" {
-            if let GGUFMetadataValue::String(s) = &meta.value {
-                architecture = Some(s.clone());
-            }
-        }
-        if meta.key == "general.name" {
-            if let GGUFMetadataValue::String(s) = &meta.value {
-                model_name = Some(s.clone());
-            }
-        }
-
-        // Store interesting metadata
-        if meta.key.starts_with("general.")
-            || meta.key.contains(".context_length")
-            || meta.key.contains(".embedding_length")
-            || meta.key.contains(".block_count")
-            || meta.key.contains(".attention.head_count")
-        {
-            metadata.push((meta.key.clone(), value_str));
-        }
-    }
-
-    // Process tensor info
-    let mut tensors = Vec::new();
-    let mut param_count = 0;
-
-    for tensor in &gguf_file.tensors {
-        let elements = checked_dim_product(&tensor.dimensions)?;
-        param_count += elements as usize;
-
-        let is_quantized = is_quantized_type(&tensor.tensor_type);
-        tensors.push((
-            tensor.name.clone(),
-            tensor.dimensions.clone(),
-            format!("{:?}", tensor.tensor_type),
-            is_quantized,
-        ));
-    }
-
-    Ok(GGUFInfo {
-        version: gguf_file.header.version,
-        tensor_count: gguf_file.tensors.len(),
-        param_count,
-        architecture,
-        model_name,
-        tensors,
-        metadata,
-    })
+    info_from_descriptor(descriptor)
 }

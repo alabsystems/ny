@@ -8,9 +8,10 @@ use super::{make_float_attr, make_int_attr, make_node, make_weight};
 use crate::loader::fusion::{
     fold_batch_norm_into_conv_linear, fold_batch_norm_into_conv_linear_with_context,
 };
+use crate::loader::BatchNormFoldingPolicy;
 use crate::model::WeightStore;
 use approx::assert_relative_eq;
-use ndarray::{arr0, arr1, arr2};
+use ndarray::{arr0, arr1, arr2, ArrayD, IxDyn};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 
@@ -82,6 +83,7 @@ fn fold_tail_with_context(
         weights,
         &tensor_shapes,
         &graph_output_names,
+        BatchNormFoldingPolicy::LegacyEnvironment,
     )
 }
 
@@ -164,6 +166,20 @@ fn cgan_tail_accepts_only_row_invariant_gemm_c_broadcasts() {
         assert_relative_eq!(bias[[0]], -3.75, epsilon = 1e-6);
         assert_relative_eq!(bias[[1]], 0.25, epsilon = 1e-6);
 
+        // Singleton vector/matrix spellings are also scalar broadcasts.
+        for scalar_shape in [&[1_usize][..], &[1_usize, 1][..]] {
+            let (mut nodes, mut weights) = tail_fixture(true, &[-1, 4]);
+            weights.insert(
+                "gemm_b".to_string(),
+                ArrayD::from_shape_vec(IxDyn(scalar_shape), vec![0.25]).unwrap(),
+            );
+            assert!(fold_tail(&mut nodes, &mut weights).contains(&0));
+            let bias = weights.get("gemm_b").expect("normalized scalar C");
+            assert_eq!(bias.shape(), &[2]);
+            assert_relative_eq!(bias[[0]], -3.75, epsilon = 1e-6);
+            assert_relative_eq!(bias[[1]], 0.25, epsilon = 1e-6);
+        }
+
         // `[1,N]` is the other rank-2 form whose broadcast is independent of M.
         let (mut nodes, mut weights) = tail_fixture(true, &[-1, 4]);
         weights.insert(
@@ -242,6 +258,7 @@ fn cgan_tail_requires_exact_channel_major_source_shape() {
             &mut weights,
             &HashMap::new(),
             &HashSet::new(),
+            BatchNormFoldingPolicy::LegacyEnvironment,
         )
         .is_empty());
         let (mut nodes, mut weights) = tail_fixture(true, &[-1, 4]);

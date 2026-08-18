@@ -107,17 +107,17 @@ impl BetaCrownVerifier {
 
             match layer {
                 Layer::Linear(linear) => {
-                    let weight = &linear.weight;
+                    let weight = linear.weight();
                     let mut new_lower_a = lin_bounds.lower_a().dot(weight);
                     let mut new_upper_a = lin_bounds.upper_a().dot(weight);
 
-                    let mut new_lower_b = if let Some(bias) = &linear.bias {
+                    let mut new_lower_b = if let Some(bias) = linear.bias() {
                         lin_bounds.lower_b() + &lin_bounds.lower_a().dot(bias)
                     } else {
                         lin_bounds.lower_b().clone()
                     };
 
-                    let mut new_upper_b = if let Some(bias) = &linear.bias {
+                    let mut new_upper_b = if let Some(bias) = linear.bias() {
                         lin_bounds.upper_b() + &lin_bounds.upper_a().dot(bias)
                     } else {
                         lin_bounds.upper_b().clone()
@@ -298,7 +298,7 @@ impl BetaCrownVerifier {
                 Layer::Conv2d(conv) => {
                     let (in_h, in_w) = infer_spatial_2d(
                         pre_bounds.shape(),
-                        conv.in_channels(),
+                        conv.try_in_channels()?,
                         "Conv2d",
                         layer_idx,
                     )?;
@@ -309,7 +309,7 @@ impl BetaCrownVerifier {
                 Layer::ConvTranspose2d(conv) => {
                     let (in_h, in_w) = infer_spatial_2d(
                         pre_bounds.shape(),
-                        conv.in_channels(),
+                        conv.try_in_channels()?,
                         "ConvTranspose2d",
                         layer_idx,
                     )?;
@@ -365,6 +365,7 @@ impl BetaCrownVerifier {
                 | Layer::SiLU(_)
                 | Layer::Tanh(_)
                 | Layer::Sigmoid(_)
+                | Layer::Erf(_)
                 | Layer::Exp(_)
                 | Layer::Log(_)
                 | Layer::Sqrt(_)
@@ -599,6 +600,7 @@ impl BetaCrownVerifier {
                 | Layer::SiLU(_)
                 | Layer::Tanh(_)
                 | Layer::Sigmoid(_)
+                | Layer::Erf(_)
                 | Layer::Exp(_)
                 | Layer::Log(_)
                 | Layer::Sqrt(_)

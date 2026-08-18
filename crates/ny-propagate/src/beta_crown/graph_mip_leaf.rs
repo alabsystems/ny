@@ -16,11 +16,18 @@
 //!
 //! # Soundness contract (the implementor's obligations)
 //!
-//! - `VerifiedAllRows` may be returned ONLY when every row in
-//!   [`GraphMipLeafRequest::rows`] is proven infeasible-to-violate on the
-//!   subdomain with CERTIFIED evidence (verified Farkas certificate — the
-//!   0-wrong moat). The loop then counts the child verified instead of
-//!   queueing it.
+//! - `VerifiedAllRows` from [`GraphMipLeafOracle::solve_leaf`] may be returned
+//!   ONLY when every row in [`GraphMipLeafRequest::rows`] is proven
+//!   infeasible-to-violate on the subdomain with CERTIFIED evidence (verified
+//!   Farkas certificate — the 0-wrong moat).
+//! - `VerifiedAllRows` from [`GraphMipLeafOracle::solve_input_leaf`] may be
+//!   returned ONLY when every row in [`GraphInputLeafRequest::objectives`] is
+//!   strictly certified over the complete input box by that implementation's
+//!   independently audited proof system. The loop then counts the child
+//!   verified instead of queueing it. The packed grouped layout does not weaken
+//!   this foundation contract to "one row per clause": doing that safely will
+//!   require a future typed certified-row mask whose coverage the caller can
+//!   validate before granting authority.
 //! - `Violated` may be returned ONLY for a witness that was clamped into the
 //!   domain's input box and CONFIRMED by an independent forward pass through
 //!   the original graph. It is ADVISORY: the loop logs it and REQUEUES the
@@ -35,6 +42,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ndarray::Array2;
 use ny_tensor::BoundedTensor;
 
 use crate::{GraphNetwork, PhaseBudgetConfig};
@@ -51,6 +59,56 @@ pub struct LeafSplit {
     pub neuron_idx: usize,
     /// `true` = active piece (`x >= 0`), `false` = inactive (`x <= 0`).
     pub is_active: bool,
+}
+
+/// A lightweight, input-box-only leaf request.
+///
+/// Unlike [`GraphMipLeafRequest`], this request deliberately carries no
+/// intermediate node bounds or split premises.  It is offered before the
+/// Graph-MIP leaf path collects its big-M ranges, allowing an independently
+/// attached certified verifier to replay the complete graph directly on the
+/// exact input sub-box without paying for an unrelated bound collection.
+///
+/// The objective rows use the grouped disjunctive layout described by
+/// `clause_sizes`.  Returning [`GraphMipLeafVerdict::VerifiedAllRows`] from
+/// [`GraphMipLeafOracle::solve_input_leaf`] requires a certified strict proof
+/// of *every* objective row in this request over the complete input box.  Any
+/// unsupported layout, timeout, internal error, or partial proof must return
+/// [`GraphMipLeafVerdict::Undecided`]. In particular, a proof of only one row
+/// per clause has no authority at this seam yet: a future extension must carry
+/// a typed certified-row mask and validate its grouped coverage explicitly.
+///
+/// [`GraphInputLeafRequest::advisory_objective_bounds`] is scheduling metadata
+/// only. It lets an implementation decline leaves far from its useful frontier
+/// before launching an expensive independent proof. Those carried BaB bounds
+/// have no certificate identity at this trait seam and grant no verdict
+/// authority: an implementation that elects to run must still certify every
+/// objective row over [`GraphInputLeafRequest::input_bounds`] independently.
+pub struct GraphInputLeafRequest<'a> {
+    /// The ORIGINAL graph whose reachable outputs must be enclosed.
+    pub graph: &'a GraphNetwork,
+    /// The subdomain's exact input box.
+    pub input_bounds: &'a BoundedTensor,
+    /// Sign-normalized objective rows over the graph output.
+    pub objectives: &'a Array2<f32>,
+    /// Advisory lower/upper bounds for `objectives`, in the same row order.
+    ///
+    /// These are borrowed from the BaB domain solely for scheduling (for
+    /// example, bounded near-frontier admission). They may be loose and are
+    /// not authenticated proof artifacts at this seam. They MUST NOT justify
+    /// `VerifiedAllRows`, replace an implementation's independent row replay,
+    /// or weaken the all-rows contract. Implementations must validate shape
+    /// and finiteness before using them even for scheduling.
+    pub advisory_objective_bounds: &'a [(f32, f32)],
+    /// One strict lower-bound threshold per objective row.
+    pub thresholds: &'a [f32],
+    /// Clause widths for the packed grouped-disjunctive objective layout.
+    pub clause_sizes: &'a [usize],
+    /// The subdomain's BaB depth.
+    pub depth: usize,
+    /// Wall-clock deadline for the whole verification.  A proof completed at
+    /// or after this instant has no verdict authority.
+    pub deadline: Option<Instant>,
 }
 
 /// Everything the leaf oracle needs to encode + solve one subdomain.
@@ -99,15 +157,51 @@ pub enum GraphMipLeafVerdict {
     Undecided,
 }
 
-/// The leaf-solving oracle. Implementations live outside ny-propagate (the
-/// ny-cli Graph-MIP encoder + ny-mip/ay solver); the signature is infallible
-/// by design — implementors map every internal failure to
+/// The leaf-solving oracle. Implementations live outside ny-propagate (for
+/// example the ny-cli Graph-MIP encoder + ny-mip/ay solver); the signatures
+/// are infallible by design — implementors map every internal failure to
 /// [`GraphMipLeafVerdict::Undecided`].
 pub trait GraphMipLeafOracle: Send + Sync {
+    /// Attempt to certify all objective rows directly on an exact input-box
+    /// leaf, before the Graph-MIP path collects intermediate node bounds.
+    ///
+    /// This default is intentionally fail-closed and source-compatible for
+    /// every existing Graph-MIP-only oracle.  Implementations that opt in must
+    /// enforce the [`GraphInputLeafRequest`] all-rows contract and their own
+    /// bounded resource policy; grouped per-clause proofs are not sufficient
+    /// without a future typed certified-row mask.
+    fn solve_input_leaf(&self, _req: &GraphInputLeafRequest<'_>) -> GraphMipLeafVerdict {
+        GraphMipLeafVerdict::Undecided
+    }
+
     /// Attempt to decide one subdomain's undecided rows exactly. Must honor
     /// its own budget policy (eligibility gates + time slices) and the
     /// module-level soundness contract.
     fn solve_leaf(&self, req: &GraphMipLeafRequest<'_>) -> GraphMipLeafVerdict;
+
+    /// May a `Violated` witness from this oracle be PUBLISHED as the run's sat
+    /// candidate (#mip-leaf-witness)?
+    ///
+    /// FAIL-CLOSED DEFAULT: `false`. Publication requires an implementation to
+    /// affirmatively state that the property's clause layout makes the lane's
+    /// all-rows check sufficient, and only the caller that can SEE the layout
+    /// can state it.
+    ///
+    /// Why this cannot be decided in this crate: the lane receives objectives
+    /// already FLATTENED (`build_multi_objectives` walks
+    /// `VnnLibSpec::output_constraints` and discards clause boundaries), and
+    /// `ny-propagate` has no knowledge of `per_clause_input_bounds` at all. On
+    /// an OR-of-AND property whose clauses carry their OWN input boxes, every
+    /// output row holding at one point does NOT imply any clause holds, so the
+    /// all-rows rule is NOT sufficient there — the honest statement of its
+    /// scope lives on `witness_violates_every_objective_row`.
+    ///
+    /// Returning `false` costs at most a `sat` this lane would have had to
+    /// guess at; the child is requeued and the search continues, exactly as
+    /// before the witness plumbing existed.
+    fn may_publish_violation_witness(&self) -> bool {
+        false
+    }
 }
 
 // ===========================================================================

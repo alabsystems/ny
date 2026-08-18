@@ -313,7 +313,11 @@ fn test_crown_ibp_dag_graph_conv1d_uses_gpu_partial_fast_path_4023() {
         };
         let scripted = Conv1dScriptedGpuEngine::new(vec![expectation]);
 
-        let with_gpu = graph
+        // Clone resets the input-keyed collection cache so this assertion
+        // exercises the scripted GPU engine instead of serving the baseline.
+        #[allow(clippy::redundant_clone)]
+        let engine_graph = graph.clone();
+        let with_gpu = engine_graph
             .collect_crown_ibp_bounds_dag_with_status_and_engine(&input, Some(&scripted))
             .unwrap();
 

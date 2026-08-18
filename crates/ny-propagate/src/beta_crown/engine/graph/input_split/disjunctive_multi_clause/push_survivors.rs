@@ -22,7 +22,7 @@ use tracing::trace;
 use crate::beta_crown::config::InputClipType;
 use crate::beta_crown::engine::graph::shared::state::GraphBabLifecycle;
 use crate::beta_crown::engine::BetaCrownVerifier;
-use crate::bounds::LinearBounds;
+use crate::bounds::{certified_affine_sum_f32, LinearBounds, OutwardDirection};
 use crate::GraphNetwork;
 
 use super::super::batched_clip::batched_relaxed_clip_from_flat;
@@ -281,18 +281,23 @@ pub(super) fn concretize_postclip_lower_bounds(
         };
 
         // Sound lower bound: use x_l when coeff positive, x_u when negative.
-        let mut lb_val: f64 = bias as f64;
-        for d in 0..x_dim.min(coeffs_row.len()) {
-            let a = coeffs_row[d] as f64;
-            if a >= 0.0 {
-                lb_val += a * (clipped_lower[[d]] as f64);
-            } else {
-                lb_val += a * (clipped_upper[[d]] as f64);
-            }
-        }
+        let lb_val = certified_affine_sum_f32(
+            bias,
+            (0..x_dim.min(coeffs_row.len())).map(|d| {
+                let a = coeffs_row[d];
+                let endpoint = if a >= 0.0 {
+                    clipped_lower[[d]]
+                } else {
+                    clipped_upper[[d]]
+                };
+                (a, endpoint)
+            }),
+            OutwardDirection::Lower,
+        );
 
-        // Directed rounding: a verdict-bearing lower bound rounds DOWN on the
-        // f64→f32 cast (#2303); NaN degrades to -inf (never verifies).
+        // Each f64 addition above and the final f64→f32 cast round DOWN:
+        // a verdict-bearing lower bound cannot rely on final-only widening
+        // after cancellation. NaN degrades to -inf (never verifies).
         let lb_f32 = if lb_val.is_nan() {
             f32::NEG_INFINITY
         } else {

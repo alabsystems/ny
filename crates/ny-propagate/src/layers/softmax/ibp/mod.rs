@@ -34,7 +34,10 @@ impl SoftmaxLayer {
     }
 
     /// Shared IBP implementation parameterized by resolved axis.
-    fn propagate_ibp_with_axis(input: &BoundedTensor, axis: usize) -> Result<BoundedTensor> {
+    pub(super) fn propagate_ibp_with_axis(
+        input: &BoundedTensor,
+        axis: usize,
+    ) -> Result<BoundedTensor> {
         let mut output_lower = input.lower().clone();
         let mut output_upper = input.upper().clone();
 

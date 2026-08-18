@@ -23,7 +23,7 @@ pub use export::generate_whisper_export_script;
 pub use loader::load_whisper;
 /// Whisper model container with parsed architecture metadata.
 pub use model::WhisperModel;
-/// Whisper compositional-verification and encoder-structure metadata types.
+/// Whisper block-compatibility and encoder-structure metadata types.
 pub use types::{
     CompositionalVerificationDetails, GpuCompositionalDetails, MultiBlockConfig, MultiBlockDetails,
     WhisperBlockInfo, WhisperEncoderStructure,
@@ -41,5 +41,3 @@ pub(crate) use loader::structure::parse_whisper_structure;
 pub(crate) use ny_core::LayerType;
 #[cfg(test)]
 pub(crate) use ny_propagate::Layer;
-#[cfg(test)]
-pub(crate) use types::NormalizationRowStats;

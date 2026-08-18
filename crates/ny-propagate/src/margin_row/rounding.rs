@@ -64,32 +64,36 @@ impl RoundMode {
 /// Next representable f64 toward +inf. Non-finite inputs pass through.
 #[inline]
 pub fn next_up(x: f64) -> f64 {
-    if !x.is_finite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    if x > 0.0 {
-        f64::from_bits(x.to_bits() + 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits + 1)
     } else {
-        f64::from_bits(x.to_bits() - 1)
+        f64::from_bits(bits - 1)
     }
 }
 
 /// Next representable f64 toward -inf. Non-finite inputs pass through.
 #[inline]
 pub fn next_down(x: f64) -> f64 {
-    if !x.is_finite() {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude >= f64::INFINITY.to_bits() {
         return x;
     }
-    if x == 0.0 {
+    if magnitude == 0 {
         return -f64::from_bits(1);
     }
-    if x > 0.0 {
-        f64::from_bits(x.to_bits() - 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits - 1)
     } else {
-        f64::from_bits(x.to_bits() + 1)
+        f64::from_bits(bits + 1)
     }
 }
 

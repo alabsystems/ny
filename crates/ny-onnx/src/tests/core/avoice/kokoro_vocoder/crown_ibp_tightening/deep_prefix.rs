@@ -70,8 +70,9 @@ fn build_deep_prefix_crown_fixture() -> PrefixCrownFixture {
 /// ~20-60s CROWN backward = ~190-260s.  600s accommodates variance.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_spec_guided_crown_deep_prefix_boundary_smoke_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     use ny_core::NaiveCpuGemmEngine;
 
     with_kokoro_crown_lock(|| {

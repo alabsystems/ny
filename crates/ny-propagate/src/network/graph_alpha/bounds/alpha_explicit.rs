@@ -4,9 +4,123 @@
 
 //! Explicit-alpha backward helpers for DAG α-CROWN.
 
+use super::budget_policy::ObjectiveChunkSchedulingPlan;
+use super::target_backward::{ObjectiveChunkFixedWavePlan, ObjectiveChunkRoutePlan};
 use super::*;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+thread_local! {
+    static ALPHA_INTERMEDIATE_COLLECTION_ENTRIES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only observation scope for full explicit-alpha intermediate walks.
+///
+/// The typed cGAN transaction returns an already-complete sound reference map;
+/// its dispatcher must not widen that one-target authority into this all-node
+/// collection after the optimizer returns.
+#[cfg(test)]
+pub(crate) struct AlphaIntermediateCollectionEntryCounter {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl AlphaIntermediateCollectionEntryCounter {
+    pub(crate) fn start() -> Self {
+        let previous = ALPHA_INTERMEDIATE_COLLECTION_ENTRIES.with(|slot| slot.replace(Some(0)));
+        Self { previous }
+    }
+
+    pub(crate) fn entries(&self) -> usize {
+        ALPHA_INTERMEDIATE_COLLECTION_ENTRIES.with(|slot| {
+            slot.get()
+                .expect("alpha intermediate collection counter scope must still be active")
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for AlphaIntermediateCollectionEntryCounter {
+    fn drop(&mut self) {
+        ALPHA_INTERMEDIATE_COLLECTION_ENTRIES.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn record_alpha_intermediate_collection_entry() {
+    ALPHA_INTERMEDIATE_COLLECTION_ENTRIES.with(|slot| {
+        if let Some(entries) = slot.get() {
+            slot.set(Some(entries.saturating_add(1)));
+        }
+    });
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChunkAwareAlphaRoute {
+    execution: ObjectiveChunkRoutePlan,
+    scheduling: Option<ObjectiveChunkSchedulingPlan>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::network::graph_alpha) enum M1AlphaBudgetOutcome {
+    NotAdmitted,
+    BelowFloor,
+    Allocate,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::network::graph_alpha) enum M1AlphaTraceEvent {
+    BudgetAdmission {
+        node: String,
+        outcome: M1AlphaBudgetOutcome,
+        deadline_present: bool,
+    },
+    BackwardDispatch {
+        node: String,
+        retained_fixed_wave: bool,
+    },
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static M1_ALPHA_TRACE: std::cell::RefCell<Option<Vec<M1AlphaTraceEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_m1_alpha_trace(event: M1AlphaTraceEvent) {
+    M1_ALPHA_TRACE.with(|trace| {
+        if let Some(events) = trace.borrow_mut().as_mut() {
+            events.push(event);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(in crate::network::graph_alpha) fn run_with_m1_alpha_trace<T>(
+    f: impl FnOnce() -> T,
+) -> (T, Vec<M1AlphaTraceEvent>) {
+    struct RestoreTrace(Option<Vec<M1AlphaTraceEvent>>);
+
+    impl Drop for RestoreTrace {
+        fn drop(&mut self) {
+            M1_ALPHA_TRACE.with(|trace| {
+                trace.replace(self.0.take());
+            });
+        }
+    }
+
+    let previous = M1_ALPHA_TRACE.with(|trace| trace.replace(Some(Vec::new())));
+    let restore = RestoreTrace(previous);
+    let output = f();
+    let events = M1_ALPHA_TRACE.with(|trace| trace.replace(None).unwrap_or_default());
+    drop(restore);
+    (output, events)
+}
 
 impl GraphNetwork {
     /// Compute CROWN bounds for all nodes using explicit alpha values.
@@ -26,6 +140,9 @@ impl GraphNetwork {
         engine: Option<&dyn ny_core::GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<HashMap<String, BoundedTensor>> {
+        #[cfg(test)]
+        record_alpha_intermediate_collection_entry();
+
         let exec_order = self.exec_order()?;
         let mut crown_bounds: HashMap<String, BoundedTensor> = HashMap::new();
 
@@ -222,17 +339,56 @@ impl GraphNetwork {
         }
 
         let exec_order = self.exec_order()?;
+        let exec_node_set: std::collections::HashSet<String> = exec_order.iter().cloned().collect();
         let target_set: std::collections::HashSet<String> = targets.iter().cloned().collect();
         let mut crown_bounds: HashMap<String, BoundedTensor> = HashMap::new();
         let mut selected: HashMap<String, BoundedTensor> = HashMap::with_capacity(targets.len());
+
+        let chunk_aware_budget = budget_policy::crown_chunk_aware_budget_enabled();
+        // Disabled mode deliberately does not enter this closure. It retains
+        // the historical lazy `alpha_target_chunk_override` calls in both the
+        // gate and each backward. Armed M1 resolves TARGET routes once so the
+        // denominator, numerator, and execution consume one central plan.
+        let chunk_aware_target_routes: Option<HashMap<String, Option<ChunkAwareAlphaRoute>>> =
+            chunk_aware_budget.then(|| {
+                let dense_budget = cpu_crown_dense_budget_bytes();
+                targets
+                    .iter()
+                    .filter_map(|target| {
+                        reference_bounds.get(target).map(|bounds| {
+                            let route = budget_policy::auto_objective_chunk_route_plan(
+                                self,
+                                target,
+                                bounds,
+                                input.len(),
+                                dense_budget,
+                                deadline.is_some(),
+                                true,
+                            )
+                            .map(|execution| ChunkAwareAlphaRoute {
+                                execution,
+                                scheduling: budget_policy::objective_chunk_scheduling_plan(
+                                    bounds.len(),
+                                    execution,
+                                    deadline.is_some(),
+                                    false,
+                                ),
+                            });
+                            (target.clone(), route)
+                        })
+                    })
+                    .collect()
+            });
 
         // STEP 2b (#cgan-alpha-refresh-budget): cgan-like graphs give each node its
         // own equal-share time window (capped at the preset per-node cap) within the
         // overall refresh envelope, instead of racing one flat shared deadline that
         // the first expensive generator target would consume — starving the rest
         // into a reference fallback. Non-cgan graphs keep the flat `deadline`.
-        let use_per_node_budget =
-            self.alpha_refresh_uses_per_node_budget(targets, reference_bounds);
+        let use_per_node_budget = match chunk_aware_target_routes.as_ref() {
+            Some(routes) => self.alpha_refresh_uses_per_node_budget_with_plans(targets, routes),
+            None => self.alpha_refresh_uses_per_node_budget(targets, reference_bounds),
+        };
 
         for node_name in exec_order {
             if selected.len() == targets.len() {
@@ -270,14 +426,17 @@ impl GraphNetwork {
                 }
             }
 
-            // STEP 2b: the per-node window. When gated, each node gets its own
-            // equal-share of the remaining envelope (capped at the preset per-node
-            // cap, floored — below floor reverts to the full envelope), bounded by
-            // the envelope end. A node that overruns its window returns
-            // DeadlineExceeded → sound reference fallback (below) → the sweep
-            // continues, so one slow generator target no longer eats every other
-            // target's time. Schedule-only: the fallback and the chunked-f64
-            // equivalence are unchanged.
+            // STEP 2b: the per-node window. Dark M1 preserves the parent policy
+            // exactly. Armed M1 admits only still-unselected requested targets:
+            // numerator and denominator are therefore the SAME set. A non-target
+            // or below-floor target takes its reference bound directly; neither
+            // can reinterpret "no allocation" as the full remaining envelope.
+            let chunk_route = chunk_aware_target_routes
+                .as_ref()
+                .and_then(|routes| routes.get(node_name))
+                .copied()
+                .flatten();
+            let mut armed_budget_reference_fallback = false;
             let node_deadline = if use_per_node_budget {
                 match deadline {
                     Some(env) => {
@@ -291,27 +450,114 @@ impl GraphNetwork {
                         // cgan (its ~95-112s refresh needs remaining >= ~8x95s under equal
                         // share), so its α-tightened bound was never installed and the map
                         // kept the loose ±2500 reference enclosure — the measured cgan
-                        // verdict bottleneck. Weight = the node's pre-activation dim (a
-                        // faithful cost proxy for the dense conv backward). Schedule-only:
-                        // overrun still => sound reference fallback; below-floor still
-                        // punts to the full envelope (unchanged semantics).
-                        let weight_of = |name: &str| -> f64 {
-                            reference_bounds.get(name).map_or(0.0, |b| b.len() as f64)
+                        // verdict bottleneck. Armed M1 models only the invariant
+                        // fixed-wave route; sequential/adaptive routes retain raw
+                        // rows.
+                        let raw_dims_of = |name: &str| -> usize {
+                            reference_bounds.get(name).map_or(0, BoundedTensor::len)
                         };
-                        let remaining_weight_sum: f64 = targets
-                            .iter()
-                            .filter(|tn| !selected.contains_key(tn.as_str()))
-                            .map(|tn| weight_of(tn))
-                            .filter(|w| w.is_finite() && *w > 0.0)
-                            .sum();
-                        match budget_policy::compute_weighted_per_node_budget_secs(
-                            remaining,
-                            remaining_weight_sum,
-                            weight_of(node_name),
-                            &self.crown_ibp_per_node_time_budget,
-                        ) {
-                            Some(secs) => Some((now + Duration::from_secs_f64(secs)).min(env)),
-                            None => Some(env),
+                        let work_weight_of = |name: &str| -> f64 {
+                            let route = chunk_aware_target_routes
+                                .as_ref()
+                                .and_then(|routes| routes.get(name))
+                                .copied()
+                                .flatten()
+                                .and_then(|route| route.scheduling);
+                            budget_policy::demanded_target_work_weight(
+                                raw_dims_of(name),
+                                route,
+                                true,
+                                chunk_aware_budget,
+                            )
+                        };
+                        if chunk_aware_budget {
+                            let mut seen = std::collections::HashSet::new();
+                            let admitted_targets: Vec<&str> = targets
+                                .iter()
+                                .map(String::as_str)
+                                .filter(|target| seen.insert(*target))
+                                .filter(|target| !selected.contains_key(*target))
+                                .filter(|target| reference_bounds.contains_key(*target))
+                                .filter(|target| exec_node_set.contains(*target))
+                                .collect();
+                            let admitted = admitted_targets.contains(&node_name.as_str());
+                            let admitted_weight_sum: f64 = admitted_targets
+                                .iter()
+                                .map(|target| work_weight_of(target))
+                                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                                .sum();
+                            let this_weight = if admitted {
+                                work_weight_of(node_name)
+                            } else {
+                                0.0
+                            };
+                            let cap_dims = budget_policy::weighted_budget_cap_dims(
+                                this_weight,
+                                raw_dims_of(node_name) as f64,
+                                true,
+                            );
+                            let admission = budget_policy::admitted_weighted_budget_secs(
+                                admitted,
+                                remaining,
+                                admitted_weight_sum,
+                                this_weight,
+                                cap_dims,
+                                &self.crown_ibp_per_node_time_budget,
+                            );
+                            #[cfg(test)]
+                            record_m1_alpha_trace(M1AlphaTraceEvent::BudgetAdmission {
+                                node: node_name.clone(),
+                                outcome: match admission {
+                                    budget_policy::WeightedBudgetAdmission::NotAdmitted => {
+                                        M1AlphaBudgetOutcome::NotAdmitted
+                                    }
+                                    budget_policy::WeightedBudgetAdmission::BelowFloor => {
+                                        M1AlphaBudgetOutcome::BelowFloor
+                                    }
+                                    budget_policy::WeightedBudgetAdmission::Allocate(_) => {
+                                        M1AlphaBudgetOutcome::Allocate
+                                    }
+                                },
+                                deadline_present: matches!(
+                                    admission,
+                                    budget_policy::WeightedBudgetAdmission::Allocate(_)
+                                ),
+                            });
+                            match admission {
+                                budget_policy::WeightedBudgetAdmission::Allocate(secs) => {
+                                    Some((now + Duration::from_secs_f64(secs)).min(env))
+                                }
+                                budget_policy::WeightedBudgetAdmission::NotAdmitted
+                                | budget_policy::WeightedBudgetAdmission::BelowFloor => {
+                                    armed_budget_reference_fallback = true;
+                                    None
+                                }
+                            }
+                        } else {
+                            // Historical default-dark allocation, including its
+                            // lazy raw-row numerator and None=>envelope fallback.
+                            let remaining_weight_sum: f64 = targets
+                                .iter()
+                                .filter(|target| !selected.contains_key(target.as_str()))
+                                .map(|target| work_weight_of(target))
+                                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                                .sum();
+                            let this_weight = work_weight_of(node_name);
+                            let cap_dims = budget_policy::weighted_budget_cap_dims(
+                                this_weight,
+                                raw_dims_of(node_name) as f64,
+                                false,
+                            );
+                            match budget_policy::compute_weighted_per_node_budget_secs(
+                                remaining,
+                                remaining_weight_sum,
+                                this_weight,
+                                cap_dims,
+                                &self.crown_ibp_per_node_time_budget,
+                            ) {
+                                Some(secs) => Some((now + Duration::from_secs_f64(secs)).min(env)),
+                                None => Some(env),
+                            }
                         }
                     }
                     None => None,
@@ -320,15 +566,52 @@ impl GraphNetwork {
                 deadline
             };
 
-            let bounds = match self.propagate_crown_to_node_with_alpha(
-                input,
-                node_name,
-                &crown_bounds,
-                reference_bounds,
-                alpha_state,
-                engine,
-                node_deadline,
-            ) {
+            let backward = if armed_budget_reference_fallback {
+                reference_bounds.get(node_name).cloned().ok_or_else(|| {
+                    NyError::InvalidSpec(format!(
+                        "Reference bounds for budget-fallback node '{}' not found",
+                        node_name
+                    ))
+                })
+            } else if chunk_aware_budget && target_set.contains(node_name.as_str()) {
+                let retained_fixed_waves = chunk_route
+                    .and_then(|route| route.scheduling)
+                    .map(|plan| plan.fixed_waves);
+                #[cfg(test)]
+                record_m1_alpha_trace(M1AlphaTraceEvent::BackwardDispatch {
+                    node: node_name.clone(),
+                    retained_fixed_wave: retained_fixed_waves.is_some(),
+                });
+                self.propagate_crown_to_node_with_alpha_and_chunk_override(
+                    input,
+                    node_name,
+                    &crown_bounds,
+                    reference_bounds,
+                    alpha_state,
+                    engine,
+                    node_deadline,
+                    chunk_route.map(|route| route.execution.requested_rows),
+                    retained_fixed_waves,
+                )
+            } else {
+                // Historical lazy route resolution for disabled M1 and for
+                // non-denominator nodes in an armed targets-only=false sweep.
+                #[cfg(test)]
+                record_m1_alpha_trace(M1AlphaTraceEvent::BackwardDispatch {
+                    node: node_name.clone(),
+                    retained_fixed_wave: false,
+                });
+                self.propagate_crown_to_node_with_alpha(
+                    input,
+                    node_name,
+                    &crown_bounds,
+                    reference_bounds,
+                    alpha_state,
+                    engine,
+                    node_deadline,
+                )
+            };
+            let bounds = match backward {
                 Ok(bounds) => bounds,
                 // CpuMemoryExceeded: Conv2d backward memory-cap backstop
                 // (#conv-crown-oom). Reference (IBP) bounds are the sound fallback.
@@ -442,12 +725,17 @@ impl GraphNetwork {
     fn alpha_target_chunk_override(
         &self,
         node_name: &str,
+        input_dim: usize,
         ref_bounds: &HashMap<String, BoundedTensor>,
     ) -> Option<usize> {
         let budget = cpu_crown_dense_budget_bytes();
         let ibp = ref_bounds.get(node_name)?;
         if self.graph_native_target_exceeds_budget(node_name, ibp, budget) {
-            Some(budget_policy::auto_objective_chunk_rows(ibp.len(), budget))
+            Some(budget_policy::auto_objective_chunk_rows(
+                ibp.len(),
+                input_dim,
+                budget,
+            ))
         } else {
             None
         }
@@ -475,9 +763,33 @@ impl GraphNetwork {
         });
         has_convtranspose
             && targets.iter().any(|t| {
-                self.alpha_target_chunk_override(t, reference_bounds)
+                // Only PRESENCE is read here, and presence turns on
+                // `graph_native_target_exceeds_budget` alone — the row count is
+                // discarded — so the input dimension cannot change this answer.
+                self.alpha_target_chunk_override(t, 0, reference_bounds)
                     .is_some()
             })
+    }
+
+    /// Armed-M1 equivalent of [`Self::alpha_refresh_uses_per_node_budget`].
+    ///
+    /// The caller has already resolved target-only execution plans, so this
+    /// consumes those retained plans instead of rediscovering routes.
+    fn alpha_refresh_uses_per_node_budget_with_plans(
+        &self,
+        targets: &[String],
+        plans: &HashMap<String, Option<ChunkAwareAlphaRoute>>,
+    ) -> bool {
+        let has_convtranspose = self.nodes.values().any(|n| {
+            matches!(
+                n.layer,
+                Layer::ConvTranspose2d(_) | Layer::ConvTranspose1d(_)
+            )
+        });
+        has_convtranspose
+            && targets
+                .iter()
+                .any(|target| plans.get(target).copied().flatten().is_some())
     }
 
     pub(in crate::network::graph_alpha) fn propagate_crown_to_node_with_alpha(
@@ -497,7 +809,33 @@ impl GraphNetwork {
         // rerouting them to the bound-equivalent chunked backward is strictly an
         // improvement everywhere, and under-budget targets stay byte-identical
         // (`None` → the existing single-pass path).
-        let chunk_override = self.alpha_target_chunk_override(target_node, ibp_bounds);
+        let chunk_override = self.alpha_target_chunk_override(target_node, input.len(), ibp_bounds);
+        self.propagate_crown_to_node_with_alpha_and_chunk_override(
+            input,
+            target_node,
+            crown_bounds,
+            ibp_bounds,
+            alpha_state,
+            engine,
+            deadline,
+            chunk_override,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propagate_crown_to_node_with_alpha_and_chunk_override(
+        &self,
+        input: &BoundedTensor,
+        target_node: &str,
+        crown_bounds: &HashMap<String, BoundedTensor>,
+        ibp_bounds: &HashMap<String, BoundedTensor>,
+        alpha_state: &GraphAlphaState,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        deadline: Option<Instant>,
+        chunk_override: Option<usize>,
+        expected_fixed_waves: Option<ObjectiveChunkFixedWavePlan>,
+    ) -> Result<BoundedTensor> {
         self.propagate_crown_to_node_core(
             input,
             target_node,
@@ -512,6 +850,7 @@ impl GraphNetwork {
             // #crown-cut-segment: never cut the verdict-shaped α-CROWN
             // backward — cuts are a sweep-only throughput lever.
             None,
+            expected_fixed_waves,
         )
     }
 

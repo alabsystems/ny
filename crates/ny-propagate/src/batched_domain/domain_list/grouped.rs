@@ -1601,17 +1601,19 @@ fn validate_phase_split(
 fn collect_queued_children(
     outcome: GroupedParentOutcome,
     queued: &mut Vec<SealedGroupedQueueEntry>,
-) {
+) -> Result<()> {
     let children = match outcome {
         GroupedParentOutcome::InputBisection { children }
         | GroupedParentOutcome::PhaseSplit { children } => children,
-        GroupedParentOutcome::Verified | GroupedParentOutcome::UnresolvedDropped => return,
+        GroupedParentOutcome::Verified | GroupedParentOutcome::UnresolvedDropped => return Ok(()),
     };
     for child in *children {
         if child.disposition == GroupedChildDisposition::Queued {
-            let row_bounds = child
-                .row_bounds
-                .expect("sealed queued grouped child must carry row bounds");
+            let row_bounds = child.row_bounds.ok_or_else(|| {
+                NyError::InternalError(
+                    "sealed queued grouped child lost its required row bounds".to_string(),
+                )
+            })?;
             queued.push(SealedGroupedQueueEntry {
                 queue_token: child.authority.queue_token,
                 layout: child.layout,
@@ -1622,6 +1624,7 @@ fn collect_queued_children(
             });
         }
     }
+    Ok(())
 }
 
 /// Private proof state emitted only after every lease and exact-cover check
@@ -1914,7 +1917,7 @@ impl super::DomainList {
                 })?;
             let mut queued_children = Vec::new();
             for resolution in resolutions {
-                collect_queued_children(resolution.outcome, &mut queued_children);
+                collect_queued_children(resolution.outcome, &mut queued_children)?;
             }
             SealedGroupedResolution {
                 completion,

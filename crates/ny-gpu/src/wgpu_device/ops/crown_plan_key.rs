@@ -77,8 +77,17 @@ pub(crate) fn crown_plan_key(
                 bias,
                 out_features,
                 in_features,
+                cert_err,
             } => {
                 0u8.hash(&mut topology);
+                // #cert-err: two otherwise identical layers that declare
+                // DIFFERENT BN-fold errors charge different certified radii, so
+                // they must never share a cached plan. Hashed as raw bits (f32
+                // is not Hash) into BOTH streams.
+                cert_err.weight_rel_err.to_bits().hash(&mut topology);
+                cert_err.bias_abs_err.to_bits().hash(&mut topology);
+                cert_err.weight_rel_err.to_bits().hash(&mut static_data);
+                cert_err.bias_abs_err.to_bits().hash(&mut static_data);
                 out_features.hash(&mut topology);
                 in_features.hash(&mut topology);
                 bias.is_some().hash(&mut topology);
@@ -123,8 +132,14 @@ pub(crate) fn crown_plan_key(
                 out_w,
                 in_h,
                 in_w,
+                cert_err,
             } => {
                 3u8.hash(&mut topology);
+                // #cert-err: see the Linear arm.
+                cert_err.weight_rel_err.to_bits().hash(&mut topology);
+                cert_err.bias_abs_err.to_bits().hash(&mut topology);
+                cert_err.weight_rel_err.to_bits().hash(&mut static_data);
+                cert_err.bias_abs_err.to_bits().hash(&mut static_data);
                 out_channels.hash(&mut topology);
                 in_channels.hash(&mut topology);
                 kernel_h.hash(&mut topology);
@@ -203,6 +218,7 @@ mod tests {
             bias,
             out_features: 2,
             in_features: 3,
+            cert_err: Default::default(),
         }]
     }
 

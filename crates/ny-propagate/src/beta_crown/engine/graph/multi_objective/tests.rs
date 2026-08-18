@@ -8,8 +8,9 @@ use ny_tensor::BoundedTensor;
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::beta_crown::result::BabVerificationStatus;
 use crate::beta_crown::BetaCrownVerifier;
-use crate::layers::{Layer, LinearLayer, ReLULayer};
+use crate::layers::{FlattenLayer, Layer, LinearLayer, ReLULayer};
 use crate::network::{GraphNetwork, GraphNode, Network};
+use std::time::Instant;
 
 /// Build a deep+wide Linear/ReLU graph whose root spec-CROWN output-bound
 /// backward is dominated by a single very wide `Linear` GEMM (#4321).
@@ -96,35 +97,80 @@ fn build_unverifiable_specs(num_specs: usize, out_dim: usize) -> (Vec<Vec<f32>>,
     (objectives, thresholds)
 }
 
-/// MEASUREMENT (ignored): time the UNBOUNDED root output-bound backward so the
-/// regression test below can be sized confidently. Prints elapsed + verdict.
+/// The DD-zonotope root lane runs before the shared graph bootstrap and can
+/// issue Verified directly. A cut-authority request must be rejected at the
+/// multi-objective ingress before that otherwise-valid fast verdict.
+#[ntest::timeout(10000)]
 #[test]
-#[ignore = "manual measurement lane: times the unbounded root backward to size the #4321 regression test"]
-fn measure_deep_wide_linear_root_unbounded_4321() {
-    let (graph, input) = build_deep_wide_linear_graph(512, 512, 200, 12);
-    let (objectives, thresholds) = build_unverifiable_specs(200, 200);
-    let config = BetaCrownConfig {
-        timeout: std::time::Duration::from_mins(10),
-        use_alpha_crown: false,
-        batch_size: 1,
-        ..Default::default()
-    };
-    let start = std::time::Instant::now();
-    let result = BetaCrownVerifier::new(config)
-        .verify_graph_relu_split_multi_objective_with_engine(
+fn dd_zonotope_prebootstrap_early_verified_rejects_cut_authority() {
+    let _box_guard = crate::dd_zonotope::certified_box::test_lock();
+    crate::dd_zonotope::certified_box::reset_for_test();
+
+    ny_test_utils::env::with_env_edits(|env| {
+        env.set("NY_DD_ZONOTOPE", "1");
+        env.set("NY_DD_ZONOTOPE_MIN_INPUT", "1");
+
+        // y = flatten(x) + 2 on x ∈ [-1,1], shaped CHW for the DD detector.
+        // Its certified lower margin is 1 > 0.
+        let mut network = Network::new();
+        network.add_layer(Layer::Flatten(FlattenLayer::new(0)));
+        network.add_layer(Layer::Linear(
+            LinearLayer::new(ndarray::arr2(&[[1.0_f32]]), Some(ndarray::arr1(&[2.0_f32])))
+                .expect("one-dimensional affine head"),
+        ));
+        let graph = GraphNetwork::from_sequential(&network).expect("test graph");
+        let input = BoundedTensor::new(
+            ndarray::ArrayD::from_elem(ndarray::IxDyn(&[1, 1, 1]), -1.0_f32),
+            ndarray::ArrayD::from_elem(ndarray::IxDyn(&[1, 1, 1]), 1.0_f32),
+        )
+        .expect("CHW input box");
+        crate::dd_zonotope::certified_box::register(
+            &[-1.0_f32],
+            &[1.0_f32],
+            crate::dd_zonotope::certified_box::ExactBox {
+                lower: vec![-1.0],
+                upper: vec![1.0],
+                center_hi: vec![0.0],
+                center_lo: vec![0.0],
+                center_err: vec![0.0],
+                half_width: vec![1.0],
+            },
+        );
+        let objectives = vec![vec![1.0_f32]];
+        let thresholds = vec![0.0_f32];
+
+        let dd = super::dd_zono_root::run_dd_zono_root(
             &graph,
             &input,
             &objectives,
-            &thresholds,
             None,
-            None,
+            &BetaCrownConfig::default(),
         )
-        .expect("verify should not error");
-    eprintln!(
-        "[#4321] UNBOUNDED deep-wide-linear root elapsed = {:?}, verdict = {:?}",
-        start.elapsed(),
-        result.result
-    );
+        .expect("fixture must be admitted by the pre-bootstrap DD-zonotope");
+        assert!(
+            dd.margin.lower_with_safety(
+                0,
+                crate::dd_zonotope::DdZonoConfig::from_env().safety_factor
+            ) > 0.0,
+            "fixture must independently establish a DD-zonotope early-Verified verdict"
+        );
+
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            enable_cuts: true,
+            ..Default::default()
+        });
+        let error = verifier
+            .verify_graph_relu_split_multi_objective(&graph, &input, &objectives, &thresholds)
+            .expect_err("DD would verify, but cut authority must reject at ingress");
+        assert!(
+            error
+                .to_string()
+                .contains("cut proof authority is quarantined"),
+            "expected quarantine error, got {error}"
+        );
+    });
+
+    crate::dd_zonotope::certified_box::reset_for_test();
 }
 
 /// Regression (#4321): a deep+wide Linear/ReLU graph with many output specs must
@@ -142,8 +188,8 @@ fn measure_deep_wide_linear_root_unbounded_4321() {
 #[ntest::timeout(60000)]
 #[test]
 fn test_deep_wide_linear_root_self_terminates_at_deadline_4321() {
-    // Sized (via the measurement test above) so the UNBOUNDED root pass takes
-    // well over the `margin` below; the short deadline must cut it off promptly.
+    // Sized so the root pass cannot finish within the short deadline below; the
+    // deadline-aware chunks must cut it off promptly.
     let (graph, input) = build_deep_wide_linear_graph(512, 512, 200, 12);
     let (objectives, thresholds) = build_unverifiable_specs(200, 200);
 
@@ -151,7 +197,7 @@ fn test_deep_wide_linear_root_self_terminates_at_deadline_4321() {
     // Leave enough scheduler slack for loaded CI hosts while remaining well
     // below the measured unbounded root pass this fixture is sized to catch.
     let margin = std::time::Duration::from_secs(8);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
+    let deadline = Instant::now() + std::time::Duration::from_secs(deadline_secs);
 
     let config = BetaCrownConfig {
         // Config timeout is generous; the wall-clock `deadline` arg drives budgets.
@@ -162,7 +208,7 @@ fn test_deep_wide_linear_root_self_terminates_at_deadline_4321() {
         ..Default::default()
     };
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let result = BetaCrownVerifier::new(config)
         .verify_graph_relu_split_multi_objective_with_engine(
             &graph,
@@ -237,6 +283,229 @@ fn build_single_relu_anti_correlated_graph() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
+#[ntest::timeout(15000)]
+#[test]
+fn owned_multi_objective_ingress_matches_borrowed_root_result() {
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        0
+    );
+    let (graph, input) = build_single_relu_anti_correlated_graph();
+    let objectives = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+    let thresholds = vec![-1.0_f32, -1.0];
+    let config = BetaCrownConfig {
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_pgd_attack: false,
+        enable_cuts: false,
+        batch_size: 1,
+        ..Default::default()
+    };
+
+    let borrowed = BetaCrownVerifier::new(config.clone())
+        .verify_graph_relu_split_multi_objective_with_engine(
+            &graph,
+            &input,
+            &objectives,
+            &thresholds,
+            None,
+            None,
+        )
+        .expect("borrowed verifier result");
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        0,
+        "a borrowed root-finished call must not construct owned custody"
+    );
+    let owned = BetaCrownVerifier::new(config)
+        .verify_graph_relu_split_multi_objective_owned_with_engine(
+            &graph,
+            &input,
+            crate::OwnedSignNormalizedObjectiveSet::new(objectives, thresholds),
+            None,
+            None,
+        )
+        .expect("owned verifier result");
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        0,
+        "an owned root-finished call must not construct continuing custody"
+    );
+
+    assert_eq!(owned.result, borrowed.result);
+    assert_eq!(owned.domains_explored, borrowed.domains_explored);
+    assert_eq!(owned.max_depth_reached, borrowed.max_depth_reached);
+    assert_eq!(owned.cuts_generated, borrowed.cuts_generated);
+    assert_eq!(owned.domains_verified, borrowed.domains_verified);
+    match (&owned.output_bounds, &borrowed.output_bounds) {
+        (Some(owned), Some(borrowed)) => {
+            assert_eq!(owned.shape(), borrowed.shape());
+            assert!(owned
+                .lower()
+                .iter()
+                .zip(borrowed.lower())
+                .all(|(left, right)| left.to_bits() == right.to_bits()));
+            assert!(owned
+                .upper()
+                .iter()
+                .zip(borrowed.upper())
+                .all(|(left, right)| left.to_bits() == right.to_bits()));
+        }
+        (None, None) => {}
+        _ => panic!("owned and borrowed results must carry the same output bounds"),
+    }
+}
+
+#[ntest::timeout(15000)]
+#[test]
+fn owned_continuing_ingress_crosses_one_handoff_and_preserves_parity() {
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        0
+    );
+    let (graph, input) = build_single_relu_anti_correlated_graph();
+    // Both identical rows remain unresolved at the root: Y0 spans [0.5, 1.5]
+    // against 0.75, so this fixture must cross the finalized-root Continue seam.
+    let objectives = vec![vec![1.0_f32, 0.0], vec![1.0_f32, 0.0]];
+    let thresholds = vec![0.75_f32, 0.75];
+    let config = BetaCrownConfig {
+        timeout: std::time::Duration::from_secs(5),
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_pgd_attack: false,
+        enable_cuts: false,
+        batch_size: 1,
+        ..Default::default()
+    };
+
+    let borrowed = BetaCrownVerifier::new(config.clone())
+        .verify_graph_relu_split_multi_objective_with_engine(
+            &graph,
+            &input,
+            &objectives,
+            &thresholds,
+            None,
+            None,
+        )
+        .expect("borrowed continuing result");
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        0,
+        "borrowed Continue must bypass the owned handoff"
+    );
+
+    let owned = BetaCrownVerifier::new(config)
+        .verify_graph_relu_split_multi_objective_owned_with_engine(
+            &graph,
+            &input,
+            crate::OwnedSignNormalizedObjectiveSet::new(objectives, thresholds),
+            None,
+            None,
+        )
+        .expect("owned continuing result");
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        1,
+        "owned Continue must cross exactly one finalized-root handoff"
+    );
+
+    assert_eq!(owned.result, borrowed.result);
+    assert_eq!(owned.domains_explored, borrowed.domains_explored);
+    assert_eq!(owned.max_depth_reached, borrowed.max_depth_reached);
+    assert_eq!(owned.cuts_generated, borrowed.cuts_generated);
+    assert_eq!(owned.domains_verified, borrowed.domains_verified);
+    match (&owned.output_bounds, &borrowed.output_bounds) {
+        (Some(owned), Some(borrowed)) => {
+            assert_eq!(owned.shape(), borrowed.shape());
+            assert!(owned
+                .lower()
+                .iter()
+                .zip(borrowed.lower())
+                .all(|(left, right)| left.to_bits() == right.to_bits()));
+            assert!(owned
+                .upper()
+                .iter()
+                .zip(borrowed.upper())
+                .all(|(left, right)| left.to_bits() == right.to_bits()));
+        }
+        (None, None) => {}
+        _ => panic!("owned and borrowed continuing results must preserve output bounds"),
+    }
+}
+
+#[ntest::timeout(15000)]
+#[test]
+fn owned_terminal_timeout_never_constructs_continuing_handoff() {
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        0
+    );
+    let (graph, input) = build_single_relu_anti_correlated_graph();
+    let expired = Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant subtraction");
+    let result = BetaCrownVerifier::new(BetaCrownConfig {
+        timeout: std::time::Duration::from_secs(5),
+        use_alpha_crown: false,
+        use_crown_ibp: false,
+        enable_pgd_attack: false,
+        enable_cuts: false,
+        batch_size: 1,
+        ..Default::default()
+    })
+    .verify_graph_relu_split_multi_objective_owned_with_engine(
+        &graph,
+        &input,
+        crate::OwnedSignNormalizedObjectiveSet::new(
+            vec![vec![1.0_f32, 0.0], vec![1.0_f32, 0.0]],
+            vec![0.75_f32, 0.75],
+        ),
+        None,
+        Some(expired),
+    )
+    .expect("expired root authority returns an ordinary terminal result");
+
+    assert!(matches!(
+        result.result,
+        BabVerificationStatus::Timeout | BabVerificationStatus::Unknown { .. }
+    ));
+    assert_eq!(
+        super::finalized_root_handoff::take_handoff_constructions_for_test(),
+        0,
+        "a terminal timeout must drop custody before the Continue-only handoff"
+    );
+}
+
+#[test]
+fn owned_multi_objective_ingress_preserves_borrowed_validation() {
+    let (graph, input) = build_single_relu_anti_correlated_graph();
+    let objectives = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+    let thresholds = vec![0.0_f32];
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+
+    let borrowed_error = verifier
+        .verify_graph_relu_split_multi_objective_with_engine(
+            &graph,
+            &input,
+            &objectives,
+            &thresholds,
+            None,
+            None,
+        )
+        .expect_err("borrowed mismatch must fail");
+    let owned_error = verifier
+        .verify_graph_relu_split_multi_objective_owned_with_engine(
+            &graph,
+            &input,
+            crate::OwnedSignNormalizedObjectiveSet::new(objectives, thresholds),
+            None,
+            None,
+        )
+        .expect_err("owned mismatch must fail");
+
+    assert_eq!(owned_error.to_string(), borrowed_error.to_string());
+}
+
 fn assert_output_bounds_match_ibp(actual: &BoundedTensor, expected: &BoundedTensor) {
     assert_eq!(
         actual.lower().iter().copied().collect::<Vec<_>>(),
@@ -259,18 +528,13 @@ fn expired_deadline_bootstrap_for_fallback(
 
     use crate::beta_crown::engine::graph::shared::init::compute_graph_bab_bootstrap;
 
-    let mut bootstrap = compute_graph_bab_bootstrap(
-        graph,
-        input,
-        &verifier.config,
-        None,
-        Some(
-            Instant::now()
-                .checked_sub(Duration::from_millis(1))
-                .unwrap(),
-        ),
-    )
-    .expect("expired warmup bootstrap should still build");
+    let mut bootstrap = compute_graph_bab_bootstrap(graph, input, &verifier.config, None, None)
+        .expect("warmup bootstrap should build before its phase checkpoint expires");
+    bootstrap.alpha_config.deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap(),
+    );
     // Force the exact `Err(_) => fallback CROWN output` branch by making the
     // spec-guided request miss its required pre-activation cache.
     bootstrap.initial_node_bounds.clear();
@@ -356,6 +620,7 @@ fn unchanged_root_boxes_keep_historical_spec_request() {
         None,
         &bootstrap,
         None,
+        false,
         false,
     )
     .expect("unchanged-box root evaluation should succeed");
@@ -587,6 +852,41 @@ fn test_empty_objectives_returns_error_2266() {
     );
 }
 
+/// Graph multi-objective stopping rules are intentionally lower-bound-only.
+/// Before the ingress guard, this fixture reached the hard-coded
+/// `lower > threshold` root close and returned a false `Verified`: in upper
+/// mode the requested proof is instead `upper < threshold`, while the exact
+/// constant output is 1 and the threshold is 0.
+#[ntest::timeout(5000)]
+#[test]
+fn upper_mode_constant_counterexample_is_rejected_before_false_root_verified() {
+    let mut network = Network::new();
+    network.add_layer(Layer::Linear(
+        LinearLayer::new(ndarray::arr2(&[[0.0_f32]]), Some(ndarray::arr1(&[1.0_f32])))
+            .expect("constant affine output"),
+    ));
+    let graph = GraphNetwork::from_sequential(&network).expect("constant graph");
+    let input = BoundedTensor::new(
+        ndarray::arr1(&[0.0_f32]).into_dyn(),
+        ndarray::arr1(&[0.0_f32]).into_dyn(),
+    )
+    .expect("point input");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        verify_upper_bound: true,
+        ..Default::default()
+    });
+
+    let error = verifier
+        .verify_graph_relu_split_multi_objective(&graph, &input, &[vec![1.0]], &[0.0])
+        .expect_err("upper mode must be refused before lower-bound root authority");
+    assert!(
+        error
+            .to_string()
+            .contains("requires sign-normalized lower-bound objectives"),
+        "unexpected refusal: {error}"
+    );
+}
+
 /// #3383: mismatched objectives/thresholds lengths must return error, not silently truncate.
 ///
 /// .zip() truncates to the shorter iterator. Without the entry-point guard,
@@ -730,7 +1030,7 @@ fn test_conjunctive_bab_respects_timeout_3388() {
         ..Default::default()
     };
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let result = BetaCrownVerifier::new(config)
         .verify_graph_relu_split_multi_objective_conjunctive_with_engine(
             &graph,
@@ -780,7 +1080,7 @@ fn test_disjunctive_bab_respects_timeout_3388() {
         ..Default::default()
     };
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let result = BetaCrownVerifier::new(config)
         .verify_graph_relu_split_multi_objective_with_engine(
             &graph,
@@ -832,10 +1132,11 @@ fn test_multi_objective_root_fallback_respects_warmup_deadline_4260() {
     });
     let bootstrap = expired_deadline_bootstrap_for_fallback(&verifier, &graph, &input);
 
-    // Global deadline also expired (#w4-root-gpu): the root-pass grace slice
-    // applies only while the GLOBAL budget has room; with everything spent the
-    // spec pass must stay capped by the expired warmup deadline and bail to
-    // IBP-level bounds immediately — the original #4260 contract.
+    // The local warmup checkpoint is expired, but the outer verifier still
+    // owns a short live budget.  The root phase may rebase only onto that
+    // explicit authority, and its typed Dense-ReLU refusal must use the local
+    // deadline-aware IBP fallback rather than uncapped CROWN.
+    let global_deadline = Some(Instant::now() + Duration::from_secs(1));
     let evaluation = super::root::compute_root_objective_bounds(
         &verifier,
         &graph,
@@ -845,7 +1146,8 @@ fn test_multi_objective_root_fallback_respects_warmup_deadline_4260() {
         false,
         None,
         &bootstrap,
-        bootstrap.alpha_config.deadline,
+        global_deadline,
+        false,
         false,
     )
     .expect("spec-guided failure should fall back to bounded root-output CROWN");
@@ -866,6 +1168,51 @@ fn test_multi_objective_root_fallback_respects_warmup_deadline_4260() {
         "expired warmup fallback must match IBP objective bounds: actual={:?} expected={:?}",
         evaluation.initial_obj_bounds,
         expected_obj_bounds
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_multi_objective_root_fallback_expired_global_authority_is_terminal_4260() {
+    use std::time::{Duration, Instant};
+
+    let (graph, input) = build_single_relu_anti_correlated_graph();
+    let objectives = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0_f32]];
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        timeout: Duration::from_secs(2),
+        use_alpha_crown: false,
+        ..Default::default()
+    });
+    let bootstrap = expired_deadline_bootstrap_for_fallback(&verifier, &graph, &input);
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("representable expired deadline");
+
+    super::root::reset_root_objective_spec_build_count_for_test();
+    let error = match super::root::compute_root_objective_bounds(
+        &verifier,
+        &graph,
+        &input,
+        &objectives,
+        &[1.0e9, 1.0e9],
+        false,
+        None,
+        &bootstrap,
+        Some(expired),
+        false,
+        false,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("an exhausted hard authority must not launch a fallback pass"),
+    };
+    assert!(
+        error.is_deadline_exceeded(),
+        "expected terminal DeadlineExceeded, got {error:?}"
+    );
+    assert_eq!(
+        super::root::root_objective_spec_build_count_for_test(),
+        0,
+        "expired global authority must refuse before dense-spec allocation"
     );
 }
 

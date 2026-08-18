@@ -44,8 +44,9 @@ fn speaker_smoke_region_spec(model: &OnnxModel) -> Vec<RegionSpec> {
 /// Multi-region ranking is proven by synthetic unit tests in runner_tests.
 #[cfg_attr(not(debug_assertions), ntest::timeout(600000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_speaker_training_signal_smoke() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let model = shared::avoice_speaker_encoder();
     let config = RegionSweepConfig {
         primary_input: model.network.inputs[0].name.clone(),

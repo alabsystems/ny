@@ -30,8 +30,9 @@ use super::*;
 // corrected har contract at features_t=1.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_ibp_kokoro_vocoder_prefix_subgraph_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let model = load_kokoro_vocoder_with_fixed_aux(KOKORO_VOCODER_MIN_FIXED_AUX_T);
     let graph = model
         .to_graph_network()
@@ -110,8 +111,9 @@ fn test_graph_ibp_kokoro_vocoder_prefix_subgraph_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_ibp_through_fused_instance_norm_prefix_3591() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let model = load_kokoro_vocoder_with_fixed_aux(KOKORO_VOCODER_MIN_FIXED_AUX_T);
     let graph = model
         .to_graph_network()
@@ -197,8 +199,9 @@ pub(super) fn first_conv1d_after_conv_transpose(graph: &GraphNetwork) -> String 
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_ibp_kokoro_vocoder_first_conv1d_prefix_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let model = load_kokoro_vocoder_with_fixed_aux(KOKORO_VOCODER_MIN_FIXED_AUX_T);
     let graph = model
         .to_graph_network()

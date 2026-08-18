@@ -98,6 +98,43 @@ impl GraphNetwork {
                 .unwrap_or(false)
         });
 
+        // The Graph-sequential INVPROP implementation has no true output-seed
+        // fold and no gamma optimizer: its historical post-layer hooks are
+        // identity-gated no-ops. Route an admissible, explicitly enabled gamma
+        // optimization through the existing DAG implementation, which owns the
+        // sound output seed and projected optimizer. The default-dark OFF arm
+        // retains the historical sequential/GPU-capable route. This precedes
+        // the no-activation return:
+        // gamma-only optimization can prove coupled linear constraints even
+        // when the ordinary output box is individually feasible in every row.
+        let invprop_dag_route = config.iterations > 0
+            && config.invprop.enabled
+            && config.invprop.optimize_gammas
+            && config
+                .output_constraints
+                .as_ref()
+                .is_some_and(|constraints| {
+                    constraints.is_conjunction
+                        && constraints.clause_indices.is_none()
+                        && constraints.num_constraints() > 0
+                        && constraints.output_dim() > 0
+                        && constraints.rhs.len() == constraints.num_constraints()
+                        && constraints
+                            .a_matrix
+                            .iter()
+                            .chain(constraints.rhs.iter())
+                            .all(|value| value.is_finite())
+                });
+        if invprop_dag_route {
+            debug!(
+                optimize_gammas = config.invprop.optimize_gammas,
+                "GraphNetwork α-CROWN: admissible sequential INVPROP request, using DAG output-seed implementation"
+            );
+            return self
+                .propagate_dag_alpha_crown_with_config_and_engine(input, config, engine)
+                .map(SequentialAlphaOptimizationResult::from_bounds);
+        }
+
         if relu_nodes.is_empty() && has_non_relu_alpha_nodes {
             debug!(
                 "GraphNetwork α-CROWN: no ReLU but has Sigmoid/Tanh/Sqrt, using DAG α-CROWN for non-ReLU alpha optimization (#3619, #3773)"
@@ -311,6 +348,9 @@ impl GraphNetwork {
                     constraints.num_constraints(),
                     alpha_state.invprop_state.as_ref().map(|s| s.layer_gammas.len()).unwrap_or(0)
                 );
+                if alpha_state.invprop_state.is_some() {
+                    crate::execution_telemetry::record_invprop_alpha_initialization();
+                }
             } else {
                 tracing::warn!(
                     "GraphNetwork α-CROWN: INVPROP enabled in config but no output_constraints provided"
@@ -387,6 +427,7 @@ impl GraphNetwork {
 mod tests {
     use super::SEQUENTIAL_ROOT_COLLECTION_EPISODES;
     use crate::bounds::AlphaCrownConfig;
+    use crate::invprop::{InvpropConfig, OutputConstraints};
     use crate::layers::{Conv2dLayer, Layer, LinearLayer, ReLULayer};
     use crate::network::{GraphNetwork, GraphNode};
     use ndarray::{arr1, arr2, ArrayD, IxDyn};
@@ -398,6 +439,106 @@ mod tests {
 
     fn collection_episodes() -> usize {
         SEQUENTIAL_ROOT_COLLECTION_EPISODES.with(std::cell::Cell::get)
+    }
+
+    fn pure_sequential_fixture() -> (GraphNetwork, BoundedTensor) {
+        let mut graph = GraphNetwork::new();
+        let lin1 = LinearLayer::new(
+            arr2(&[[1.0_f32, -0.5], [0.25, 0.75]]),
+            Some(arr1(&[0.1_f32, -0.2])),
+        )
+        .unwrap();
+        let lin2 = LinearLayer::new(arr2(&[[0.5_f32, -1.0]]), Some(arr1(&[0.0_f32]))).unwrap();
+        graph.add_node(GraphNode::from_input("lin1", Layer::Linear(lin1)));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["lin1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "lin2",
+            Layer::Linear(lin2),
+            vec!["relu1".to_string()],
+        ));
+        graph.set_output("lin2");
+
+        let input = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0_f32, -0.5]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.5_f32, 1.0]).unwrap(),
+        )
+        .unwrap();
+        (graph, input)
+    }
+
+    /// The small two-ReLU regression network used by the native α-CROWN
+    /// improvement tests.  Keeping a graph-shaped copy here exercises the DAG
+    /// INVPROP route rather than the native sequential optimizer.
+    fn alpha_improvement_fixture() -> (GraphNetwork, BoundedTensor) {
+        let mut graph = GraphNetwork::new();
+        let lin1 = LinearLayer::new(
+            arr2(&[[0.5_f32, 0.3], [-0.4, 0.6], [0.2, -0.3], [-0.1, 0.4]]),
+            Some(arr1(&[0.1_f32, -0.1, 0.0, 0.05])),
+        )
+        .unwrap();
+        let lin2 = LinearLayer::new(
+            arr2(&[
+                [0.3_f32, -0.2, 0.4, 0.1],
+                [-0.3, 0.5, -0.1, 0.2],
+                [0.2, 0.1, -0.3, 0.4],
+                [0.1, -0.4, 0.2, -0.1],
+            ]),
+            Some(arr1(&[0.0_f32, 0.1, -0.05, 0.02])),
+        )
+        .unwrap();
+        let output = LinearLayer::new(
+            arr2(&[[0.4_f32, 0.3, -0.2, 0.1], [-0.3, 0.2, 0.4, -0.1]]),
+            Some(arr1(&[0.0_f32, 0.0])),
+        )
+        .unwrap();
+
+        graph.add_node(GraphNode::from_input("lin1", Layer::Linear(lin1)));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["lin1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "lin2",
+            Layer::Linear(lin2),
+            vec!["relu1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "relu2",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["lin2".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "output",
+            Layer::Linear(output),
+            vec!["relu2".to_string()],
+        ));
+        graph.set_output("output");
+
+        let input =
+            BoundedTensor::new(arr1(&[-0.5, -0.5]).into_dyn(), arr1(&[0.5, 0.5]).into_dyn())
+                .unwrap();
+        (graph, input)
+    }
+
+    fn invprop_config(constraints: OutputConstraints, optimize_gammas: bool) -> AlphaCrownConfig {
+        AlphaCrownConfig {
+            iterations: 3,
+            adaptive_skip: false,
+            adaptive_skip_pilot: false,
+            invprop: InvpropConfig {
+                enabled: true,
+                optimize_gammas,
+                gamma_lr: 0.5,
+                ..Default::default()
+            },
+            output_constraints: Some(constraints),
+            ..Default::default()
+        }
     }
 
     /// #dedup-root-collections Fix A: a sequential graph containing Conv2d
@@ -454,31 +595,7 @@ mod tests {
     #[ntest::timeout(60000)]
     #[test]
     fn pure_sequential_relu_graph_starts_exactly_one_collection_episode() {
-        let mut graph = GraphNetwork::new();
-        let lin1 = LinearLayer::new(
-            arr2(&[[1.0_f32, -0.5], [0.25, 0.75]]),
-            Some(arr1(&[0.1_f32, -0.2])),
-        )
-        .unwrap();
-        let lin2 = LinearLayer::new(arr2(&[[0.5_f32, -1.0]]), Some(arr1(&[0.0_f32]))).unwrap();
-        graph.add_node(GraphNode::from_input("lin1", Layer::Linear(lin1)));
-        graph.add_node(GraphNode::new(
-            "relu1",
-            Layer::ReLU(ReLULayer::new()),
-            vec!["lin1".to_string()],
-        ));
-        graph.add_node(GraphNode::new(
-            "lin2",
-            Layer::Linear(lin2),
-            vec!["relu1".to_string()],
-        ));
-        graph.set_output("lin2");
-
-        let input = BoundedTensor::new(
-            ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0_f32, -0.5]).unwrap(),
-            ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.5_f32, 1.0]).unwrap(),
-        )
-        .unwrap();
+        let (graph, input) = pure_sequential_fixture();
 
         let config = AlphaCrownConfig {
             iterations: 1,
@@ -494,5 +611,323 @@ mod tests {
             1,
             "pure sequential graph must collect intermediate bounds exactly once"
         );
+    }
+
+    /// Default-dark gamma OFF must preserve the historical sequential route,
+    /// including its single intermediate-bound collection episode.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn eligible_invprop_off_preserves_historical_sequential_route() {
+        let _telemetry_lock = crate::execution_telemetry::TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let _run = crate::execution_telemetry::begin_run();
+        let (graph, input) = pure_sequential_fixture();
+        let constraints =
+            OutputConstraints::new(arr2(&[[1.0_f32]]), arr1(&[-10.0_f32]), true).unwrap();
+        let config = invprop_config(constraints, false);
+
+        reset_collection_episode_counter();
+        graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("eligible INVPROP OFF should preserve the sequential route");
+        assert_eq!(collection_episodes(), 1);
+
+        let observed = crate::execution_telemetry::snapshot();
+        assert!(observed.invprop.alpha_initializations > 0);
+        assert_eq!(observed.invprop.gamma_steps_attempted, 0);
+        assert_eq!(observed.invprop.gamma_steps_applied, 0);
+        assert_eq!(observed.invprop.nonzero_output_seed_folds, 0);
+        assert_eq!(observed.invprop.nonzero_evaluated_output_seed_folds, 0);
+        assert!(!observed.invprop.attribution_conflict);
+    }
+
+    #[ntest::timeout(60000)]
+    #[test]
+    fn eligible_invprop_on_routes_to_dag_and_executes_seed_fold() {
+        let _telemetry_lock = crate::execution_telemetry::TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let _run = crate::execution_telemetry::begin_run();
+        let (graph, input) = pure_sequential_fixture();
+        // The assume-violation region y <= -10 is empty for this small net,
+        // providing a strong nonzero gamma objective without affecting safety.
+        let constraints =
+            OutputConstraints::new(arr2(&[[1.0_f32]]), arr1(&[-10.0_f32]), true).unwrap();
+        let config = invprop_config(constraints, true);
+
+        reset_collection_episode_counter();
+        let bounds = graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("eligible INVPROP ON should use DAG output seed");
+        assert_eq!(collection_episodes(), 0);
+        assert!(
+            bounds
+                .lower()
+                .iter()
+                .zip(bounds.upper().iter())
+                .any(|(&lower, &upper)| lower > upper),
+            "empty assume-violation region must return the typed infeasibility sentinel"
+        );
+
+        let observed = crate::execution_telemetry::snapshot();
+        assert!(observed.invprop.alpha_initializations > 0);
+        assert!(observed.invprop.gamma_steps_attempted > 0);
+        assert!(observed.invprop.gamma_steps_applied > 0);
+        assert!(observed.invprop.nonzero_output_seed_folds > 0);
+        assert!(observed.invprop.nonzero_evaluated_output_seed_folds > 0);
+        assert!(observed.invprop.gamma_steps_applied <= observed.invprop.gamma_steps_attempted);
+        assert!(!observed.invprop.attribution_conflict);
+    }
+
+    /// Coupled constraints can be empty even though every coordinate's plain
+    /// output interval intersects its corresponding halfspace. A gamma-only
+    /// pure-linear graph must therefore reach the DAG optimizer despite having
+    /// no ReLU/activation alpha state.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn pure_linear_coupled_empty_region_is_proved_by_gamma_only_route() {
+        let _telemetry_lock = crate::execution_telemetry::TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let _run = crate::execution_telemetry::begin_run();
+        let mut graph = GraphNetwork::new();
+        let output = LinearLayer::new(arr2(&[[1.0_f32], [-1.0]]), None).unwrap();
+        graph.add_node(GraphNode::from_input("output", Layer::Linear(output)));
+        graph.set_output("output");
+        let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+        // y=[x,-x]. Each y_i <= -0.5 is individually box-feasible, while
+        // their conjunction requires x<=-0.5 and x>=0.5 and is empty.
+        let constraints = OutputConstraints::new(
+            arr2(&[[1.0_f32, 0.0], [0.0, 1.0]]),
+            arr1(&[-0.5_f32, -0.5]),
+            true,
+        )
+        .unwrap();
+        let mut config = invprop_config(constraints, true);
+        config.iterations = 20;
+        // Row-wise progress must not be cut off just because the current hard
+        // max row stalls while a different output row is advancing.
+        config.early_stop_patience = 1;
+
+        reset_collection_episode_counter();
+        let bounds = graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("pure-linear gamma-only INVPROP should succeed");
+
+        assert_eq!(collection_episodes(), 0);
+        assert!(
+            bounds
+                .lower()
+                .iter()
+                .zip(bounds.upper().iter())
+                .any(|(&lower, &upper)| lower > upper),
+            "coupled-empty pure-linear violation region must return the infeasibility sentinel"
+        );
+        let observed = crate::execution_telemetry::snapshot();
+        assert!(observed.invprop.gamma_steps_attempted > 0);
+        assert!(observed.invprop.gamma_steps_applied > 0);
+        assert!(observed.invprop.nonzero_evaluated_output_seed_folds > 0);
+        assert!(!observed.invprop.attribution_conflict);
+    }
+
+    #[ntest::timeout(60000)]
+    #[test]
+    fn pure_linear_nonempty_condition_never_escapes_as_global_box() {
+        let mut graph = GraphNetwork::new();
+        let output = LinearLayer::new(arr2(&[[1.0_f32], [-1.0]]), None).unwrap();
+        graph.add_node(GraphNode::from_input("output", Layer::Linear(output)));
+        graph.set_output("output");
+        let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+        // -0.5 <= x <= 0.5 is a nonempty proper conditioned region.
+        let constraints = OutputConstraints::new(
+            arr2(&[[1.0_f32, 0.0], [0.0, 1.0]]),
+            arr1(&[0.5_f32, 0.5]),
+            true,
+        )
+        .unwrap();
+        let mut config = invprop_config(constraints, true);
+        config.iterations = 8;
+
+        let bounds = graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("nonempty pure-linear INVPROP should succeed");
+        assert!(bounds
+            .lower()
+            .iter()
+            .zip(bounds.upper().iter())
+            .all(|(&lower, &upper)| lower <= upper));
+        for step in 0..=40 {
+            let x = -1.0 + 2.0 * step as f32 / 40.0;
+            for (row, y) in [x, -x].into_iter().enumerate() {
+                assert!(
+                    y >= bounds.lower()[[row]] - 1e-5 && y <= bounds.upper()[[row]] + 1e-5,
+                    "y[{row}]={y} escaped [{}, {}] at x={x}",
+                    bounds.lower()[[row]],
+                    bounds.upper()[[row]],
+                );
+            }
+        }
+    }
+
+    /// With one configured iteration there is no later loop-top evaluation.
+    /// The only way to prove this coupled-empty region is to promote the typed
+    /// inversion found by the perturbed gamma probe itself.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn pure_linear_one_iteration_promotes_typed_probe_inversion() {
+        let _telemetry_lock = crate::execution_telemetry::TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let _run = crate::execution_telemetry::begin_run();
+        let mut graph = GraphNetwork::new();
+        let output = LinearLayer::new(arr2(&[[1.0_f32], [1.0]]), None).unwrap();
+        graph.add_node(GraphNode::from_input("output", Layer::Linear(output)));
+        graph.set_output("output");
+        let input = BoundedTensor::new(arr1(&[0.0]).into_dyn(), arr1(&[1.0]).into_dyn()).unwrap();
+        // y=[x,x]. These scaled halfspaces encode y0<=0.4 and y1>=0.6:
+        // each is individually feasible over [0,1], but not simultaneously.
+        // The deterministic iter-0 mixed direction activates both upper seed
+        // multipliers for row 1, yielding the promoted finite inversion.
+        let constraints = OutputConstraints::new(
+            arr2(&[[100.0_f32, 0.0], [0.0, -100.0]]),
+            arr1(&[40.0_f32, -60.0]),
+            true,
+        )
+        .unwrap();
+        let mut config = invprop_config(constraints, true);
+        config.iterations = 1;
+
+        let bounds = graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("typed probe promotion should succeed");
+        assert!(bounds
+            .lower()
+            .iter()
+            .zip(bounds.upper().iter())
+            .any(|(&lower, &upper)| lower > upper));
+        let observed = crate::execution_telemetry::snapshot();
+        assert_eq!(observed.invprop.gamma_steps_attempted, 1);
+        assert_eq!(observed.invprop.gamma_steps_applied, 1);
+        assert!(observed.invprop.nonzero_output_seed_folds > 0);
+        assert!(observed.invprop.nonzero_evaluated_output_seed_folds > 0);
+        assert!(!observed.invprop.attribution_conflict);
+    }
+
+    #[ntest::timeout(60000)]
+    #[test]
+    fn disjunctive_invprop_fails_closed_on_sequential_route() {
+        let _telemetry_lock = crate::execution_telemetry::TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let _run = crate::execution_telemetry::begin_run();
+        let (graph, input) = pure_sequential_fixture();
+        let mut constraints =
+            OutputConstraints::new(arr2(&[[1.0_f32]]), arr1(&[0.0_f32]), false).unwrap();
+        constraints.clause_indices = Some(vec![vec![0]]);
+        let config = invprop_config(constraints, true);
+
+        reset_collection_episode_counter();
+        graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("unsupported disjunction should preserve the safe sequential baseline");
+        assert_eq!(collection_episodes(), 1);
+
+        let observed = crate::execution_telemetry::snapshot();
+        assert_eq!(observed.invprop.gamma_steps_attempted, 0);
+        assert_eq!(observed.invprop.gamma_steps_applied, 0);
+        assert_eq!(observed.invprop.nonzero_output_seed_folds, 0);
+        assert_eq!(observed.invprop.nonzero_evaluated_output_seed_folds, 0);
+        assert!(!observed.invprop.attribution_conflict);
+    }
+
+    /// The routed assume-violation optimizer must not escape its proof context
+    /// and manufacture a globally too-tight box when the violation region is
+    /// nonempty. Check both sides against a dense concrete input grid.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn routed_invprop_on_preserves_sampled_box_soundness() {
+        let (graph, input) = pure_sequential_fixture();
+        let constraints =
+            OutputConstraints::new(arr2(&[[1.0_f32]]), arr1(&[0.0_f32]), true).unwrap();
+        let mut config = invprop_config(constraints, true);
+        config.iterations = 8;
+
+        let bounds = graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("routed INVPROP optimization should succeed");
+
+        let mut saw_violation_region = false;
+        let mut saw_outside_region = false;
+        for i in 0..=20 {
+            for j in 0..=20 {
+                let x0 = -1.0 + 1.5 * i as f32 / 20.0;
+                let x1 = -0.5 + 1.5 * j as f32 / 20.0;
+                let h0 = (x0 - 0.5 * x1 + 0.1).max(0.0);
+                let h1 = (0.25 * x0 + 0.75 * x1 - 0.2).max(0.0);
+                let y = 0.5 * h0 - h1;
+                saw_violation_region |= y <= 0.0;
+                saw_outside_region |= y > 0.0;
+                assert!(
+                    y >= bounds.lower()[[0]] - 1e-4 && y <= bounds.upper()[[0]] + 1e-4,
+                    "sample y={y} outside [{}, {}] at ({x0}, {x1})",
+                    bounds.lower()[[0]],
+                    bounds.upper()[[0]],
+                );
+            }
+        }
+        assert!(saw_violation_region && saw_outside_region);
+    }
+
+    /// A nonzero gamma seed makes the main optimization iterates conditional,
+    /// so they cannot be merged into the returned global output box.  After
+    /// optimizing alpha, the DAG route must re-evaluate that alpha checkpoint
+    /// with an exact zero gamma seed; otherwise all post-initial alpha gains are
+    /// silently lost whenever INVPROP does not prove emptiness.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn invprop_nonproof_recovers_later_global_alpha_gain() {
+        let _telemetry_lock = crate::execution_telemetry::TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let _run = crate::execution_telemetry::begin_run();
+        let (graph, input) = alpha_improvement_fixture();
+        crate::network::graph_alpha::propagate_dag::INVPROP_ZERO_GAMMA_RECOVERY_IMPROVEMENTS
+            .with(|slot| slot.set(0));
+
+        // This region is demonstrably nonempty: x=(-0.5,-0.5) produces
+        // y0=0.0395 <= 0.06.  A small gamma learning rate keeps the alpha
+        // objective close to the ordinary global-bound objective while still
+        // exercising a genuine nonzero output-seed update.
+        let constraints =
+            OutputConstraints::new(arr2(&[[1.0_f32, 0.0]]), arr1(&[0.06_f32]), true).unwrap();
+        let mut config = invprop_config(constraints, true);
+        config.iterations = 50;
+        config.tolerance = 1e-10;
+        config.early_stop_patience = 50;
+        config.invprop.gamma_lr = 1e-3;
+
+        let optimized = graph
+            .propagate_alpha_crown_with_config(&input, &config)
+            .expect("nonempty INVPROP optimization should succeed");
+        assert!(optimized
+            .lower()
+            .iter()
+            .zip(optimized.upper().iter())
+            .all(|(&lower, &upper)| lower <= upper));
+
+        let recovery_improvements =
+            crate::network::graph_alpha::propagate_dag::INVPROP_ZERO_GAMMA_RECOVERY_IMPROVEMENTS
+                .with(std::cell::Cell::get);
+        assert_eq!(
+            recovery_improvements, 1,
+            "the successful zero-gamma recovery must strictly tighten the pre-recovery global best"
+        );
+
+        let observed = crate::execution_telemetry::snapshot();
+        assert!(observed.invprop.gamma_steps_attempted > 0);
+        assert!(observed.invprop.gamma_steps_applied > 0);
+        assert!(observed.invprop.nonzero_evaluated_output_seed_folds > 0);
+        assert!(!observed.invprop.attribution_conflict);
     }
 }

@@ -4,16 +4,19 @@
 
 //! INVPROP: Output Constraint Backward Propagation
 //!
-//! This module implements INVPROP (Kotha et al., 2023), which propagates output
-//! constraints backward through the network to tighten intermediate bounds.
+//! This module implements INVPROP (Kotha et al., 2023), which propagates a
+//! candidate output region backward through the network to tighten bounds.
 //!
 //! # Overview
 //!
-//! INVPROP introduces nonnegative dual variables ("gammas") that dualize output
-//! constraints `A*y <= rhs`. The backward pass carries the dualized constraint
-//! terms, but the optimization step for the gammas is NOT implemented yet: they
-//! stay at their zero initialization, so enabling INVPROP currently does not
-//! tighten any bounds.
+//! [`OutputConstraints`] is a generic, polarity-neutral representation of a
+//! linear region `A*y <= rhs`. At the verifier boundary, the supplied
+//! conjunction has a stricter meaning: it is the candidate **violation** region.
+//! INVPROP introduces nonnegative dual variables ("gammas"), folds those
+//! inequalities into the output seed, and performs projected gamma ascent
+//! alongside alpha optimization. A certified infeasibility result for the
+//! conditioned violation region proves that the original property holds; the
+//! constraints must not instead encode the property-holding region.
 //!
 //! # Key Components
 //!

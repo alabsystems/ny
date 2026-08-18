@@ -31,6 +31,28 @@ attack:
   # OSI-diversified restarts + GAMA guidance on the relational disjuncts
   # (#1449); attack-only, same downstream validation.
   attack_mode: diversed_GAMA_PGD
+  # LP-guided sign-space falsification (#bnn-sign-space). THE reason this key
+  # exists: gradients through `Sign` are meaningless and BaB cannot progress
+  # through a piecewise-constant activation, so on this family both the DLR-APGD
+  # lane and the verifier are structurally weak. Searching sign space directly,
+  # with an LP proving each candidate pattern is realizable by a real pixel
+  # vector in the box, is the only method that has taken the three `model_30`
+  # eps=1 rows — open rows, 0 verified / 36 falsified by every entrant across
+  # three competition years.
+  #
+  # MEASURED at the official 480 s budget, 2026-08-14 (see
+  # reports/measured-2026/traffic_signs_recognition_2023_NOTES.md): 30/45 armed
+  # vs 27/45 unarmed, exactly the three targeted rows flipping
+  # (`error` -> `sat` at 132.4 / 58.3 / 97.9 s), and no other row changing. The
+  # 48x48 and 64x64 nets are outside the admitted fragment and are REFUSED
+  # structurally — measured 442 s armed vs 445 s unarmed, i.e. no budget lost.
+  #
+  # SOUNDNESS. The lane has no verified/unsat outcome by construction, so it
+  # cannot cause a false `unsat`; a candidate becomes a `sat` only by passing
+  # the unchanged trusted-oracle gate (real ONNX Runtime forward on the
+  # ORIGINAL model plus the true-f64 recheck). `NY_BNN_SIGN_SPACE` still wins
+  # where present: `1` arms, `0` disarms this key.
+  bnn_sign_space: true
 
 bab:
   batch_size: 64

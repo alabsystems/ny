@@ -257,6 +257,29 @@ fn grouped_uninitialized_empty_queue_is_not_a_proof() {
 }
 
 #[test]
+fn grouped_queue_rejects_uncensused_byte_cap_and_upper_priority() {
+    let mut list = DomainList::new_grouped(
+        grouped_config(TreeTraversal::BreadthFirst, 0),
+        grouped_layout(),
+    )
+    .unwrap();
+
+    let byte_error = list.configure_queue_eviction(1024, false).unwrap_err();
+    assert!(
+        byte_error.to_string().contains("row-sidecar bytes"),
+        "grouped byte-cap refusal must identify the uncensused sidecar: {byte_error}"
+    );
+
+    let upper_error = list.configure_queue_eviction(0, true).unwrap_err();
+    assert!(
+        upper_error
+            .to_string()
+            .contains("only supports lower-margin verification"),
+        "grouped upper-priority refusal must be explicit: {upper_error}"
+    );
+}
+
+#[test]
 fn grouped_root_token_rejects_non_neutral_keep_mask() {
     let list = DomainList::new_grouped(
         grouped_config(TreeTraversal::BreadthFirst, 0),

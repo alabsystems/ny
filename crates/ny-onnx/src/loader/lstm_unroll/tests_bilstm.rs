@@ -65,7 +65,7 @@ fn make_bilstm_node(x_input: &str, hidden_size: i64, layout: i64) -> NodeProto {
             make_int_attr("layout", layout),
             onnx_proto::AttributeProto {
                 name: "direction".to_string(),
-                s: b"bidirectional".to_vec(),
+                s: Some(b"bidirectional".to_vec()),
                 r#type: onnx_proto::attribute_type::STRING,
                 ..Default::default()
             },
@@ -103,13 +103,10 @@ fn build_bilstm_onnx_bytes(
         .iter()
         .filter(|s| !s.is_empty())
         .map(|name| match *name {
-            // Y shape: PyTorch runtime format [batch, seq, 2*H] — the unroller
-            // concatenates fwd/rev hidden states along the last axis instead of
-            // producing the ONNX spec 4D format [batch, seq, 2, H].
-            "Y" => tensor_value_info(name, &[batch, seq, num_directions * hidden_size]),
-            "Y_h" => tensor_value_info(name, &[num_directions, batch, hidden_size]),
-            "Y_c" => tensor_value_info(name, &[num_directions, batch, hidden_size]),
-            _ => tensor_value_info(name, &[num_directions, batch, hidden_size]),
+            "Y" => tensor_value_info(name, &[batch, seq, num_directions, hidden_size]),
+            "Y_h" => tensor_value_info(name, &[batch, num_directions, hidden_size]),
+            "Y_c" => tensor_value_info(name, &[batch, num_directions, hidden_size]),
+            _ => tensor_value_info(name, &[batch, num_directions, hidden_size]),
         })
         .collect();
 
@@ -140,10 +137,18 @@ fn build_bilstm_onnx_bytes(
     model_proto.encode_to_vec()
 }
 
+fn load_bilstm_fixture(name: &str, bytes: &[u8]) -> crate::OnnxModel {
+    let config = crate::OnnxLoadConfig::default()
+        .with_shape_inference_policy(crate::ShapeInferencePolicy::Skip);
+    crate::loader::load_onnx_bytes_with_config(name, bytes, &config)
+        .expect("BiLSTM fixture should load without native shape inference")
+}
+
 /// Verify that a bidirectional LSTM node is unrolled into primitive ops.
 #[test]
 fn test_bilstm_lowering_produces_expected_node_types_3497() {
-    let bilstm_node = make_bilstm_node("X", 4, 1);
+    let mut bilstm_node = make_bilstm_node("X", 4, 1);
+    bilstm_node.output = vec![String::new(), "Y_h".to_string(), "Y_c".to_string()];
     let graph = GraphProto {
         input: vec![tensor_value_info("X", &[1, 3, 2])],
         node: vec![bilstm_node],
@@ -188,18 +193,13 @@ fn test_bilstm_lowering_produces_expected_node_types_3497() {
         all_outputs.contains(&"Y_c"),
         "BiLSTM Y_c output must be preserved"
     );
-    assert!(
-        all_outputs.contains(&"Y"),
-        "BiLSTM Y output must be preserved"
-    );
 }
 
 /// End-to-end: load BiLSTM ONNX model, parse, convert to graph, run IBP.
 #[test]
 fn test_bilstm_ibp_produces_finite_ordered_bounds_3497() {
-    let bytes = build_bilstm_onnx_bytes(1, 3, 2, 4, &["Y_h", "", ""]);
-    let model = crate::loader::load_onnx_bytes("bilstm_ibp", &bytes)
-        .expect("BiLSTM model should load after unrolling");
+    let bytes = build_bilstm_onnx_bytes(1, 3, 2, 4, &["", "Y_h", ""]);
+    let model = load_bilstm_fixture("bilstm_ibp", &bytes);
     let graph = model
         .to_graph_network()
         .expect("BiLSTM model should convert to graph network");
@@ -330,8 +330,7 @@ fn build_bilstm_duration_predictor_bytes(
 #[test]
 fn test_bilstm_duration_predictor_loads_3497() {
     let bytes = build_bilstm_duration_predictor_bytes(3, 2, 4, 8);
-    let model = crate::loader::load_onnx_bytes("bilstm_dur", &bytes)
-        .expect("BiLSTM duration predictor should load after unrolling");
+    let model = load_bilstm_fixture("bilstm_dur", &bytes);
     assert!(
         model.network.layers.len() > 10,
         "BiLSTM + projection should produce many layers, got {}",
@@ -357,8 +356,7 @@ fn test_bilstm_duration_predictor_positive_bounds_3497() {
     let num_buckets = 8_i64;
 
     let bytes = build_bilstm_duration_predictor_bytes(seq, input_size, hidden_size, num_buckets);
-    let model = crate::loader::load_onnx_bytes("bilstm_dur_ibp", &bytes)
-        .expect("BiLSTM duration predictor should load");
+    let model = load_bilstm_fixture("bilstm_dur_ibp", &bytes);
     let graph = model
         .to_graph_network()
         .expect("BiLSTM duration predictor should convert to graph network");
@@ -386,12 +384,9 @@ fn test_bilstm_duration_predictor_positive_bounds_3497() {
     }
 }
 
-/// Build a BiLSTM duration predictor that uses Y (full sequence output) directly.
-///
-/// Architecture: BiLSTM → Y[batch, seq, 2*H] → MatMul[2*H, num_buckets] → Sigmoid
-///               → MatMul[num_buckets, 1] → expected_duration[batch, seq, 1]
-///
-/// This matches the real Kokoro duration predictor's per-timestep architecture.
+/// Build the legacy fixture that depended on changing ONNX's four-dimensional
+/// bidirectional Y into a three-dimensional convenience tensor. It is retained
+/// solely to prove that this unsound route now fails closed.
 fn build_bilstm_y_output_duration_predictor_bytes(
     seq: i64,
     input_size: i64,
@@ -416,8 +411,9 @@ fn build_bilstm_y_output_duration_predictor_bytes(
         .collect();
     let sum_weight_data: Vec<f32> = vec![1.0; num_buckets as usize];
 
-    // BiLSTM: use Y output (full sequence, all timesteps)
-    // Y shape after unrolling: [batch, seq, 2*H] (layout=1, PyTorch runtime format)
+    // Raw ONNX Y is [batch, seq, directions, hidden]. The following MatMul only
+    // typechecked after the old lowering silently concatenated the last two
+    // axes; admission must reject before that substitution can occur.
     let mut bilstm_node = make_bilstm_node("X", hidden_size, 1);
     bilstm_node.output = vec!["Y".to_string(), String::new(), String::new()];
 
@@ -475,80 +471,30 @@ fn build_bilstm_y_output_duration_predictor_bytes(
     model_proto.encode_to_vec()
 }
 
-/// BiLSTM Y (full sequence) duration predictor loads and converts to graph.
+/// BiLSTM Y must fail closed until lowering preserves its exact 4-D ONNX
+/// layout. The prior 3-D convenience rewrite changed the type and semantics of
+/// the value consumed by the projection.
 #[test]
-fn test_bilstm_y_output_duration_predictor_loads_3497() {
+fn test_bilstm_y_output_duration_predictor_fails_closed_3497() {
     let bytes = build_bilstm_y_output_duration_predictor_bytes(3, 2, 4, 8);
-    let model = crate::loader::load_onnx_bytes("bilstm_y_dur", &bytes)
-        .expect("BiLSTM Y-output duration predictor should load after unrolling");
-    assert!(
-        model.network.layers.len() > 10,
-        "BiLSTM Y + projection should produce many layers, got {}",
-        model.network.layers.len()
-    );
-
-    let graph = model
-        .to_graph_network()
-        .expect("BiLSTM Y-output duration predictor should convert to graph network");
-    assert!(
-        !graph.output_name().is_empty(),
-        "Graph must have a named output"
-    );
+    let config = crate::OnnxLoadConfig::default()
+        .with_shape_inference_policy(crate::ShapeInferencePolicy::Skip);
+    let error = crate::loader::load_onnx_bytes_with_config("bilstm_y_dur", &bytes, &config)
+        .expect_err("unsupported bidirectional Y must reject the model");
+    assert!(error.to_string().contains("LSTM"), "{error}");
 }
 
-/// End-to-end: BiLSTM Y (full sequence) → per-timestep projection → Sigmoid → Sum
-/// proves positive expected durations at EVERY timestep.
-///
-/// This is the critical test for the Kokoro duration predictor verification:
-/// the real model uses Y output (all timesteps) rather than Y_h (final state only).
+/// Refusal is stable across the former end-to-end proof fixture as well: a
+/// positive proof over a semantically changed 3-D tensor had no authority.
 #[test]
-fn test_bilstm_y_output_per_timestep_positive_bounds_3497() {
-    let seq = 3_i64;
-    let input_size = 2_i64;
-    let hidden_size = 4_i64;
-    let num_buckets = 8_i64;
-
-    let bytes =
-        build_bilstm_y_output_duration_predictor_bytes(seq, input_size, hidden_size, num_buckets);
-    let model = crate::loader::load_onnx_bytes("bilstm_y_dur_ibp", &bytes)
-        .expect("BiLSTM Y-output duration predictor should load");
-    let graph = model
-        .to_graph_network()
-        .expect("BiLSTM Y-output duration predictor should convert to graph");
-
-    let center = ArrayD::zeros(IxDyn(&[seq as usize, input_size as usize]));
-    let input = ny_tensor::BoundedTensor::from_epsilon(center, 0.1).expect("epsilon ball");
-    let output = graph
-        .propagate_ibp(&input)
-        .expect("IBP should succeed on BiLSTM Y-output duration predictor");
-
-    assert_eq!(
-        output.lower().len(),
-        seq as usize,
-        "BiLSTM Y-output should produce {} outputs (one per timestep), got {}",
-        seq,
-        output.lower().len()
+fn test_bilstm_y_output_proof_fixture_never_reaches_propagation_3497() {
+    let bytes = build_bilstm_y_output_duration_predictor_bytes(3, 2, 4, 8);
+    let config = crate::OnnxLoadConfig::default()
+        .with_shape_inference_policy(crate::ShapeInferencePolicy::Skip);
+    assert!(
+        crate::loader::load_onnx_bytes_with_config("bilstm_y_dur_ibp", &bytes, &config).is_err(),
+        "bidirectional Y cannot reach bound propagation through a changed layout"
     );
-
-    for (t, (&lo, &hi)) in output.lower().iter().zip(output.upper().iter()).enumerate() {
-        assert!(
-            lo.is_finite(),
-            "Timestep {t}: lower bound must be finite, got {lo}"
-        );
-        assert!(
-            hi.is_finite(),
-            "Timestep {t}: upper bound must be finite, got {hi}"
-        );
-        assert!(
-            lo <= hi,
-            "Timestep {t}: bounds must be ordered: {lo} <= {hi}"
-        );
-        assert!(
-            lo > 0.0,
-            "Timestep {t}: BiLSTM Y-output expected duration lower bound must be strictly \
-             positive (sigmoid+sum proof head), got {lo}"
-        );
-    }
 }
 
 // --- Weight slicing unit tests (proof_coverage: Re: #3497) ---

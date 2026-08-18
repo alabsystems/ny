@@ -6,11 +6,7 @@ use crate::onnx_proto;
 use crate::WeightStore;
 use ndarray::{ArrayD, Axis, IxDyn};
 
-use super::super::common::{parse_scalar_i64, read_tensor_i64s};
-
-fn fits_exact_i64_f32(value: f32) -> bool {
-    value >= i64::MIN as f32 && value < i64::MAX as f32
-}
+use super::super::common::parse_scalar_i64;
 
 fn parse_slice_scalar_i64(value: f32, allow_positive_infinity: bool) -> Option<i64> {
     if value.is_nan() {
@@ -22,10 +18,7 @@ fn parse_slice_scalar_i64(value: f32, allow_positive_infinity: bool) -> Option<i
         }
         return None;
     }
-    parse_scalar_i64(value).or_else(|| {
-        let truncated = value.trunc();
-        (truncated.is_finite() && fits_exact_i64_f32(truncated)).then_some(truncated as i64)
-    })
+    parse_scalar_i64(value)
 }
 
 pub(super) fn try_fold_slice(
@@ -102,13 +95,20 @@ fn read_slice_input_i64s(
     name: &str,
     allow_positive_infinity: bool,
 ) -> Option<Vec<i64>> {
-    read_tensor_i64s(weights, name).or_else(|| {
-        weights.get(name).and_then(|array| {
-            array
-                .iter()
-                .map(|&value| parse_slice_scalar_i64(value, allow_positive_infinity))
-                .collect::<Option<Vec<_>>>()
-        })
+    if let Some(values) = weights.get_integers(name) {
+        if let Some(float_values) = weights.get(name) {
+            if float_values.shape() != values.shape() {
+                return None;
+            }
+        }
+        return Some(values.iter().copied().collect());
+    }
+
+    weights.get(name).and_then(|array| {
+        array
+            .iter()
+            .map(|&value| parse_slice_scalar_i64(value, allow_positive_infinity))
+            .collect::<Option<Vec<_>>>()
     })
 }
 
@@ -171,10 +171,7 @@ fn resolve_slice_ops(args: &SliceArgs, ndim: usize) -> Option<Vec<SliceOp>> {
 
 fn apply_slice_ops<T: Clone>(mut result: ArrayD<T>, slice_ops: Vec<SliceOp>) -> Option<ArrayD<T>> {
     for (axis, start_raw, end_raw, step) in slice_ops {
-        let indices = match slice_indices(start_raw, end_raw, step, result.shape()[axis] as i64) {
-            Some(indices) => indices,
-            None => return Some(result),
-        };
+        let indices = slice_indices(start_raw, end_raw, step, result.shape()[axis] as i64)?;
         if indices.is_empty() {
             let mut shape = result.shape().to_vec();
             shape[axis] = 0;
@@ -291,5 +288,45 @@ mod tests {
 
         let out = try_fold_slice(&node, &weights).expect("Slice should use exact integer end");
         assert_eq!(out.iter().copied().collect::<Vec<_>>(), vec![20.0, 30.0]);
+    }
+
+    #[test]
+    fn try_fold_slice_fails_closed_when_exact_step_overflows() {
+        let mut weights = WeightStore::new();
+        weights.insert(
+            "data".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0, 1.0, 2.0]).unwrap(),
+        );
+        for (name, value) in [("starts", 1.0), ("ends", 3.0), ("axes", 0.0)] {
+            weights.insert(
+                name.to_string(),
+                ArrayD::from_shape_vec(IxDyn(&[1]), vec![value]).unwrap(),
+            );
+        }
+        weights.insert(
+            "steps".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![i64::MAX as f32]).unwrap(),
+        );
+        weights.insert_integers(
+            "steps".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![i64::MAX]).unwrap(),
+        );
+
+        let node = NodeProto {
+            input: vec![
+                "data".to_string(),
+                "starts".to_string(),
+                "ends".to_string(),
+                "axes".to_string(),
+                "steps".to_string(),
+            ],
+            op_type: "Slice".to_string(),
+            ..Default::default()
+        };
+
+        assert!(
+            try_fold_slice(&node, &weights).is_none(),
+            "overflow while enumerating Slice indices must not turn the operation into identity"
+        );
     }
 }

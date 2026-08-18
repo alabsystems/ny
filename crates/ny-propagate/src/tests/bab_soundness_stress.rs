@@ -559,6 +559,7 @@ struct Tally {
     unknown: usize,
     timeout: usize,
     potential: usize,
+    zero_budget_refused: usize,
 }
 
 /// Run one verification case and assert the soundness invariant. Returns the
@@ -577,11 +578,33 @@ fn run_case(
     tally: &mut Tally,
 ) {
     let verifier = BetaCrownVerifier::new(config_for(case_idx));
-    let result = verifier
-        .verify_graph_relu_split(graph, input, objective, threshold)
-        .unwrap_or_else(|e| {
-            panic!("[{family} #{case_idx}] verify_graph_relu_split errored: {e:?}")
-        });
+    // A separate fallback regression deliberately sets the process-global
+    // dense budget to zero. Serialize each verifier call against that mutation
+    // and pin the ordinary budget so this soundness stress cannot inherit its
+    // temporary policy. Keep the guard per case so other environment tests are
+    // never starved behind this multi-minute stress lane.
+    let verification = crate::tests::with_crown_dense_budget_mb("2048", || {
+        verifier.verify_graph_relu_split(graph, input, objective, threshold)
+    });
+    let result = match verification {
+        Ok(result) => result,
+        // The full parallel suite contains explicit zero-budget gate tests.
+        // This stress lane does not mutate process-global policy, so it can
+        // briefly observe that override.  A direct zero-budget refusal carries
+        // no proof authority and is therefore recorded as a non-verdict, not
+        // mistaken for a soundness failure.  Every other verifier error remains
+        // fatal, and the suite-level coverage assertions below prevent these
+        // refusals from making the oracle vacuous.
+        Err(ny_core::NyError::CpuMemoryExceeded {
+            budget_bytes: 0, ..
+        }) => {
+            tally.zero_budget_refused += 1;
+            return;
+        }
+        Err(error) => {
+            panic!("[{family} #{case_idx}] verify_graph_relu_split errored: {error:?}")
+        }
+    };
 
     // Float slack for the soundness comparison. The verifier proves
     // m(x) >= threshold; sampling is exact (point-IBP), so we only need a small
@@ -641,7 +664,7 @@ fn run_case(
                  counterexample={counterexample:?} output={out:?} objective={objective:?}"
             );
         }
-        BabVerificationStatus::PotentialViolation => tally.potential += 1,
+        BabVerificationStatus::PotentialViolation { .. } => tally.potential += 1,
         BabVerificationStatus::Unknown { .. } => tally.unknown += 1,
         BabVerificationStatus::Timeout => tally.timeout += 1,
     }
@@ -783,8 +806,13 @@ fn bab_never_verifies_a_violated_property_stress() {
 
     println!(
         "BaB soundness stress: {cases} cases | verified={} violated={} \
-         unknown={} potential={} timeout={}",
-        tally.verified, tally.violated, tally.unknown, tally.potential, tally.timeout
+         unknown={} potential={} timeout={} zero_budget_refused={}",
+        tally.verified,
+        tally.violated,
+        tally.unknown,
+        tally.potential,
+        tally.timeout,
+        tally.zero_budget_refused
     );
 
     // Coverage sanity: the suite must actually exercise meaningful BaB outcomes,
@@ -807,6 +835,12 @@ fn bab_never_verifies_a_violated_property_stress() {
          exercising the near-optimum thresholds (got violated={} potential={})",
         tally.violated,
         tally.potential
+    );
+    assert!(
+        tally.zero_budget_refused <= cases / 4,
+        "too many cases ({}) observed a parallel zero-budget refusal; \
+         the soundness coverage is no longer representative",
+        tally.zero_budget_refused
     );
     assert!(cases >= 200, "expected hundreds of cases (got {cases})");
 }

@@ -33,10 +33,101 @@ fn tensor_value_info(name: &str, shape: &[i64]) -> ValueInfoProto {
 fn attr_int(name: &str, value: i64) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        i: value,
+        i: Some(value),
         r#type: crate::onnx_proto::attribute_type::INT,
         ..Default::default()
     }
+}
+
+fn squeeze_node() -> NodeProto {
+    NodeProto {
+        input: vec!["data".to_string()],
+        output: vec!["scalar".to_string()],
+        op_type: "Squeeze".to_string(),
+        attribute: vec![AttributeProto {
+            name: "axes".to_string(),
+            ints: vec![0],
+            r#type: crate::onnx_proto::attribute_type::INTS,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn squeeze_singleton_vector_produces_float_scalar() {
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "data".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![42.0]).unwrap(),
+    );
+
+    let folded = try_fold(&squeeze_node(), &weights, false).expect("Squeeze should fold");
+    assert!(folded.float_data.shape().is_empty());
+    assert_eq!(
+        folded.float_data.iter().copied().collect::<Vec<_>>(),
+        vec![42.0]
+    );
+}
+
+#[test]
+fn squeeze_singleton_vector_preserves_integer_scalar_rank() {
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "data".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![16_777_216.0]).unwrap(),
+    );
+    weights.insert_integers(
+        "data".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![16_777_217]).unwrap(),
+    );
+
+    let folded = try_fold(&squeeze_node(), &weights, false).expect("Squeeze should fold");
+    assert!(folded.float_data.shape().is_empty());
+    let integer_data = folded.integer_data.expect("exact integer payload");
+    assert!(integer_data.shape().is_empty());
+    assert_eq!(
+        integer_data.iter().copied().collect::<Vec<_>>(),
+        vec![16_777_217]
+    );
+}
+
+#[test]
+fn cast_int64_identity_preserves_internal_shape_marker() {
+    let sentinel = ny_core::reshape_copy_axis_sentinel(1).expect("axis sentinel");
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "shape".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap(),
+    );
+    weights.insert_integers(
+        "shape".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![sentinel]).unwrap(),
+    );
+    weights.insert_integer_range("shape".to_string(), i64::MIN, i64::MAX);
+    let cast = NodeProto {
+        input: vec!["shape".to_string()],
+        output: vec!["cast_shape".to_string()],
+        op_type: "Cast".to_string(),
+        attribute: vec![attr_int("to", 7)],
+        ..Default::default()
+    };
+
+    let folded = try_fold(&cast, &weights, false).expect("INT64 identity Cast should fold");
+
+    assert_eq!(
+        folded.float_data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0]
+    );
+    assert_eq!(
+        folded
+            .integer_data
+            .expect("exact sentinel payload")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![sentinel]
+    );
 }
 
 #[test]
@@ -124,6 +215,30 @@ fn shape_const_fold_honors_start_end_attributes() {
         vec![80, 3000],
         "Shape(start=-2) must report the trailing two dims"
     );
+}
+
+#[test]
+fn shape_const_fold_start_after_end_is_empty_vector() {
+    let graph = GraphProto {
+        input: vec![tensor_value_info("input", &[2, 3, 4])],
+        ..Default::default()
+    };
+    let lookups = ConstFoldLookups::new(&graph, &HashMap::new(), false);
+    let weights = WeightStore::new();
+    let node = NodeProto {
+        input: vec!["input".to_string()],
+        output: vec!["empty_shape".to_string()],
+        op_type: "Shape".to_string(),
+        attribute: vec![attr_int("start", 2), attr_int("end", 1)],
+        ..Default::default()
+    };
+
+    let folded = try_fold_shape_node(&node, &graph, &lookups, &weights)
+        .expect("Shape(start > end) is a valid empty vector");
+    assert_eq!(folded.float_data.shape(), &[0]);
+    let integers = folded.integer_data.expect("exact INT64 empty vector");
+    assert_eq!(integers.shape(), &[0]);
+    assert!(integers.is_empty());
 }
 
 #[test]
@@ -486,6 +601,45 @@ fn cast_float_to_int_const_fold_truncates_float_view() {
         vec![0.0, -1.0, 2.0, -0.0],
         "float view must be truncated toward zero, not passed through"
     );
+}
+
+/// Cast->BOOL const-fold must materialize the indicator `x != 0`, not pass the
+/// value through: folding Cast(2.0 -> BOOL) as 2.0 bakes a wrong constant into
+/// the network exactly as folding Cast(0.7 -> INT64) as 0.7 would. It is also
+/// NOT truncation — trunc(0.5) = 0 but bool(0.5) = 1.
+#[test]
+fn cast_to_bool_const_fold_materializes_indicator() {
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "src".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[5]), vec![2.0_f32, 0.0, -3.5, 0.5, 1.0]).unwrap(),
+    );
+
+    let cast_node = NodeProto {
+        input: vec!["src".to_string()],
+        output: vec!["dst".to_string()],
+        op_type: "Cast".to_string(),
+        attribute: vec![attr_int("to", 9)], // ONNX BOOL = 9
+        ..Default::default()
+    };
+
+    let result = try_fold(&cast_node, &weights, false).expect("Cast should fold");
+    assert_eq!(
+        result.float_data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 0.0, 1.0, 1.0, 1.0],
+        "BOOL cast is x != 0, neither identity nor truncation"
+    );
+    assert_eq!(
+        result
+            .integer_data
+            .as_ref()
+            .expect("BOOL cast should produce integer_data")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![1_i64, 0, 1, 1, 1]
+    );
+    assert_eq!(result.integer_range, Some((0, 1)));
 }
 
 /// Float->FLOAT Cast const-fold stays identity (no truncation).

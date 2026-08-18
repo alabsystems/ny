@@ -62,6 +62,7 @@ fn build_merge_linear_model_bytes() -> Vec<u8> {
             tensor_f32("w1", &[2, 3], &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
             tensor_f32("w2", &[3, 1], &[2.0, -1.0, 0.5]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2])],
         output: vec![tensor_value_info("output", &[1, 1])],
         #[cfg(feature = "onnx-value-info")]
@@ -85,7 +86,7 @@ fn build_merge_linear_model_bytes() -> Vec<u8> {
 }
 
 #[test]
-fn merge_linear_flag_reduces_loaded_layer_count() {
+fn merge_linear_flag_remains_dark_without_exact_composition_certificate() {
     let bytes = build_merge_linear_model_bytes();
     let plain = load_onnx_bytes("plain_merge_linear.onnx", &bytes).expect("plain load should work");
     let config =
@@ -94,14 +95,14 @@ fn merge_linear_flag_reduces_loaded_layer_count() {
         .expect("merge_linear load should work");
 
     assert_eq!(plain.network.layers.len(), 3);
-    assert_eq!(merged.network.layers.len(), 2);
+    assert_eq!(merged.network.layers.len(), 3);
     assert_eq!(
         plain.network.layers[0].layer_type,
         ny_core::LayerType::MatMul
     );
     assert_eq!(
         merged.network.layers[0].layer_type,
-        ny_core::LayerType::Linear
+        ny_core::LayerType::MatMul
     );
 }
 

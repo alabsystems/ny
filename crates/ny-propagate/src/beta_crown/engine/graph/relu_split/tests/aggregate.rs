@@ -74,7 +74,7 @@ fn test_aggregate_violation_returns_early() {
 
     let r = violation.expect("Violation should return Some");
     assert!(
-        matches!(r.result, BabVerificationStatus::PotentialViolation),
+        matches!(r.result, BabVerificationStatus::PotentialViolation { .. }),
         "should be PotentialViolation, got {:?}",
         r.result
     );
@@ -199,7 +199,7 @@ fn test_aggregate_no_unstable_violation() {
 
     let r = violation.expect("should return violation");
     assert!(
-        matches!(r.result, BabVerificationStatus::PotentialViolation),
+        matches!(r.result, BabVerificationStatus::PotentialViolation { .. }),
         "NoUnstable with violation bounds should be PotentialViolation, got {:?}",
         r.result
     );

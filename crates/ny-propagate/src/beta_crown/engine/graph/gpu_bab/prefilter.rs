@@ -49,7 +49,7 @@ pub(crate) fn prefilter_picked_domains(
                 depth = meta.depth,
                 lower = meta.lower_bound,
                 upper = meta.upper_bound,
-                "GPU BaB prefilter: domain dropped — non-finite bounds"
+                "DomainList BaB prefilter: domain dropped — non-finite bounds"
             );
             state.unresolved_due_to_propagation_failure = true;
             continue;
@@ -77,7 +77,7 @@ pub(crate) fn prefilter_picked_domains(
         // Check max depth — domain is unresolved, not verified
         if meta.depth >= max_depth {
             tracing::info!(
-                "GPU BaB: domain at max depth {} dropped (unresolved)",
+                "DomainList BaB: domain at max depth {} dropped (unresolved)",
                 meta.depth
             );
             state.unresolved_due_to_depth = true;

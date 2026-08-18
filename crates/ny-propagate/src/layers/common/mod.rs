@@ -16,6 +16,7 @@ mod crown_batched;
 mod crown_dense;
 mod crown_patches;
 mod crown_patches_alpha;
+mod crown_patches_alpha_in_place;
 mod crown_patches_sparse;
 pub(crate) mod per_channel;
 mod traits;
@@ -31,9 +32,19 @@ pub use crown_dense::crown_elementwise_backward_indexed;
 pub use crown_batched::crown_elementwise_backward_batched;
 pub use crown_batched::crown_elementwise_backward_batched_indexed;
 
-pub(crate) use crown_patches::crown_elementwise_backward_patches;
+#[cfg(test)]
+pub(crate) use crown_patches::crown_elementwise_backward_patches_with_poll_for_test;
+pub(crate) use crown_patches::{
+    crown_elementwise_backward_patches, crown_elementwise_backward_patches_with_deadline,
+};
 pub(crate) use crown_patches_alpha::{
     crown_relu_backward_patches_with_alpha, crown_relu_backward_patches_with_alpha_bound_only,
+};
+#[cfg(test)]
+pub(crate) use crown_patches_alpha_in_place::crown_relu_backward_patches_with_alpha_in_place_with_poll_for_test;
+pub(crate) use crown_patches_alpha_in_place::{
+    crown_relu_backward_patches_with_alpha_in_place,
+    prepare_crown_relu_backward_patches_with_alpha_in_place, PreparedAlphaPatchesReluInPlace,
 };
 
 use ny_core::{NyError, Result};

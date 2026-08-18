@@ -14,8 +14,8 @@
 //! ```text
 //! center' = W center + b          computed in DOUBLE-DOUBLE
 //! gens'_j = W gens_j              computed in plain f64
-//! ec'     = |W| ec + gamma_{2K+2}(U_DD) * (|W| |center| + |b|)
-//! eg'     = |W| eg + gamma_{K+1}(U_F64) * (|W| radius)
+//! ec'     = |W| ec + gamma_{2K+2}(U_DD) * (|W| |center| + |b|) + Ωc
+//! eg'     = |W| eg + gamma_{K+1}(U_F64) * (|W| radius) + Ωg
 //! ```
 //!
 //! * `|W| ec` transports the incoming center error through the map — this is
@@ -29,14 +29,67 @@
 //! * `gamma_{K+1}(U_F64)` is the same for the plain-f64 generator columns,
 //!   applied to `|W| * sum_j |gens_j|` — the sum over columns of each column's
 //!   own dot-product error bound.
+//! * `Ωc = (48K+32)·2^-1074` and
+//!   `Ωg = ((4·n_generators+16)K+32)·2^-1074` are absolute floors. They
+//!   conservatively charge every elementary operation in the double-double
+//!   EFTs, every generator multiply/add, the radius aggregation, both
+//!   transported error-channel reductions, and final assembly. This is needed
+//!   because a purely relative gamma bound cannot see a result that rounded
+//!   away in the subnormal range.
 //!
 //! Every error-channel value is rounded OUTWARD (`err_up`) after each step.
 
-use ny_core::dd::{dd_fma, gamma_n_dd, gamma_n_f64, Dd};
+use ny_core::dd::{dd_fma, gamma_n_dd, gamma_n_f64, next_up_f64, Dd};
 use ny_core::{NyError, Result};
 use rayon::prelude::*;
 
 use super::state::{err_up, DdZono};
+
+/// Build an outward absolute rounding floor for a checked elementary-op count.
+pub(super) fn operation_underflow_floor(operations: usize) -> Result<f64> {
+    if operations == 0 {
+        return Ok(0.0);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let floor = operations as f64 * f64::from_bits(1);
+    if !floor.is_finite() || floor <= 0.0 {
+        return Err(NyError::SoundnessRefusal(
+            "#dd-zonotope could not construct its affine operation-underflow floor".to_string(),
+        ));
+    }
+    Ok(next_up_f64(floor))
+}
+
+/// Conservative absolute-floor operation counts for one affine output.
+///
+/// `center`: two `dd_fma`s per term, each with about 16 elementary
+/// operations, plus `abs_upper`, the `s_c`/`ec_t` reductions, and assembly.
+/// `generator`: `2K` multiply/add operations for every generator column,
+/// `K` radius additions per column, the `s_g`/`eg_t` reductions, and assembly.
+pub(super) fn affine_underflow_operation_counts(
+    k: usize,
+    generators: usize,
+) -> Result<(usize, usize)> {
+    let center = k
+        .checked_mul(48)
+        .and_then(|count| count.checked_add(32))
+        .ok_or_else(|| {
+            NyError::SoundnessRefusal("#dd-zonotope center operation count overflow".to_string())
+        })?;
+    let generator_ops_per_term = generators
+        .checked_mul(4)
+        .and_then(|count| count.checked_add(16))
+        .ok_or_else(|| {
+            NyError::SoundnessRefusal("#dd-zonotope generator operation count overflow".to_string())
+        })?;
+    let generator = k
+        .checked_mul(generator_ops_per_term)
+        .and_then(|count| count.checked_add(32))
+        .ok_or_else(|| {
+            NyError::SoundnessRefusal("#dd-zonotope generator operation count overflow".to_string())
+        })?;
+    Ok((center, generator))
+}
 
 /// Fully-resolved Conv2d geometry (unbatched NCHW).
 #[derive(Debug, Clone, Copy)]
@@ -55,18 +108,18 @@ pub(crate) struct ConvPlan {
     pub(crate) pw: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConvSizes {
+    in_hw: usize,
+    out_hw: usize,
+    kernel_hw: usize,
+    dot_terms: usize,
+    input_numel: usize,
+    output_numel: usize,
+    weight_numel: usize,
+}
+
 impl ConvPlan {
-    /// Dot length per output element (`in_c * kh * kw`).
-    #[inline]
-    pub(crate) fn k(&self) -> usize {
-        self.in_c * self.kh * self.kw
-    }
-
-    #[inline]
-    pub(crate) fn out_numel(&self) -> usize {
-        self.out_c * self.out_h * self.out_w
-    }
-
     /// Build the plan, refusing (`None`) anything outside the supported
     /// surface: dilation must be 1, groups must be 1, and the output must be
     /// non-empty. Refusing is always sound — the caller falls back.
@@ -80,21 +133,37 @@ impl ConvPlan {
         dilation: (usize, usize),
         groups: usize,
     ) -> Option<Self> {
-        if dilation != (1, 1) || groups != 1 || stride.0 == 0 || stride.1 == 0 {
+        if dilation != (1, 1)
+            || groups != 1
+            || stride.0 == 0
+            || stride.1 == 0
+            || out_c == 0
+            || kh == 0
+            || kw == 0
+        {
             return None;
         }
         let (in_c, in_h, in_w) = in_shape;
-        let num_h = in_h + 2 * padding.0;
-        let num_w = in_w + 2 * padding.1;
+        if in_c == 0 || in_h == 0 || in_w == 0 {
+            return None;
+        }
+        let num_h = padding
+            .0
+            .checked_mul(2)
+            .and_then(|pad| in_h.checked_add(pad))?;
+        let num_w = padding
+            .1
+            .checked_mul(2)
+            .and_then(|pad| in_w.checked_add(pad))?;
         if num_h < kh || num_w < kw {
             return None;
         }
         let out_h = (num_h - kh) / stride.0 + 1;
         let out_w = (num_w - kw) / stride.1 + 1;
-        if out_h == 0 || out_w == 0 || out_c == 0 {
+        if out_h == 0 || out_w == 0 {
             return None;
         }
-        Some(ConvPlan {
+        let plan = ConvPlan {
             in_c,
             in_h,
             in_w,
@@ -107,6 +176,57 @@ impl ConvPlan {
             sw: stride.1,
             ph: padding.0,
             pw: padding.1,
+        };
+        plan.checked_sizes()?;
+        Some(plan)
+    }
+
+    /// Revalidate crate-visible geometry and every derived product before
+    /// indexed arithmetic.
+    fn checked_sizes(&self) -> Option<ConvSizes> {
+        if self.in_c == 0
+            || self.in_h == 0
+            || self.in_w == 0
+            || self.out_c == 0
+            || self.kh == 0
+            || self.kw == 0
+            || self.sh == 0
+            || self.sw == 0
+        {
+            return None;
+        }
+        let padded_h = self
+            .ph
+            .checked_mul(2)
+            .and_then(|pad| self.in_h.checked_add(pad))?;
+        let padded_w = self
+            .pw
+            .checked_mul(2)
+            .and_then(|pad| self.in_w.checked_add(pad))?;
+        if padded_h < self.kh || padded_w < self.kw {
+            return None;
+        }
+        let expected_out_h = (padded_h - self.kh) / self.sh + 1;
+        let expected_out_w = (padded_w - self.kw) / self.sw + 1;
+        if (self.out_h, self.out_w) != (expected_out_h, expected_out_w) {
+            return None;
+        }
+
+        let in_hw = self.in_h.checked_mul(self.in_w)?;
+        let out_hw = self.out_h.checked_mul(self.out_w)?;
+        let kernel_hw = self.kh.checked_mul(self.kw)?;
+        let dot_terms = self.in_c.checked_mul(kernel_hw)?;
+        let input_numel = self.in_c.checked_mul(in_hw)?;
+        let output_numel = self.out_c.checked_mul(out_hw)?;
+        let weight_numel = self.out_c.checked_mul(dot_terms)?;
+        Some(ConvSizes {
+            in_hw,
+            out_hw,
+            kernel_hw,
+            dot_terms,
+            input_numel,
+            output_numel,
+            weight_numel,
         })
     }
 }
@@ -116,19 +236,28 @@ impl ConvPlan {
 /// `w` is C-order `(out_c, in_c, kh, kw)`. Parallel over output channels; the
 /// innermost loop is a contiguous AXPY over the output row so the backend can
 /// vectorize it.
-pub(crate) fn conv_f64(plan: &ConvPlan, w: &[f64], bias: Option<&[f64]>, x: &[f64]) -> Vec<f64> {
-    let mut out = vec![0.0_f64; plan.out_numel()];
-    let ohw = plan.out_h * plan.out_w;
-    let ihw = plan.in_h * plan.in_w;
-    let kk = plan.kh * plan.kw;
-    out.par_chunks_mut(ohw)
+pub(crate) fn conv_f64(
+    plan: &ConvPlan,
+    w: &[f64],
+    bias: Option<&[f64]>,
+    x: &[f64],
+) -> Option<Vec<f64>> {
+    let sizes = plan.checked_sizes()?;
+    if w.len() != sizes.weight_numel
+        || x.len() != sizes.input_numel
+        || bias.is_some_and(|values| values.len() != plan.out_c)
+    {
+        return None;
+    }
+    let mut out = vec![0.0_f64; sizes.output_numel];
+    out.par_chunks_mut(sizes.out_hw)
         .enumerate()
         .for_each(|(oc, out_c_slice)| {
             let b = bias.map_or(0.0, |b| b[oc]);
             out_c_slice.fill(b);
             for ic in 0..plan.in_c {
-                let wbase = (oc * plan.in_c + ic) * kk;
-                let xbase = ic * ihw;
+                let wbase = (oc * plan.in_c + ic) * sizes.kernel_hw;
+                let xbase = ic * sizes.in_hw;
                 for ky in 0..plan.kh {
                     for kx in 0..plan.kw {
                         let wv = w[wbase + ky * plan.kw + kx];
@@ -159,7 +288,7 @@ pub(crate) fn conv_f64(plan: &ConvPlan, w: &[f64], bias: Option<&[f64]>, x: &[f6
                 }
             }
         });
-    out
+    Some(out)
 }
 
 /// Double-double direct convolution over a double-double input center.
@@ -167,12 +296,21 @@ pub(crate) fn conv_f64(plan: &ConvPlan, w: &[f64], bias: Option<&[f64]>, x: &[f6
 /// Each input element contributes TWO exact products (`w*hi`, `w*lo`), so the
 /// accumulator sees a dot of length `2K`; the caller's `gamma_{2K+2}(U_DD)`
 /// term is sized for exactly that.
-pub(crate) fn conv_dd(plan: &ConvPlan, w: &[f64], bias: Option<&[f64]>, x: &[Dd]) -> Vec<Dd> {
-    let mut out = vec![Dd::ZERO; plan.out_numel()];
-    let ohw = plan.out_h * plan.out_w;
-    let ihw = plan.in_h * plan.in_w;
-    let kk = plan.kh * plan.kw;
-    out.par_chunks_mut(ohw)
+pub(crate) fn conv_dd(
+    plan: &ConvPlan,
+    w: &[f64],
+    bias: Option<&[f64]>,
+    x: &[Dd],
+) -> Option<Vec<Dd>> {
+    let sizes = plan.checked_sizes()?;
+    if w.len() != sizes.weight_numel
+        || x.len() != sizes.input_numel
+        || bias.is_some_and(|values| values.len() != plan.out_c)
+    {
+        return None;
+    }
+    let mut out = vec![Dd::ZERO; sizes.output_numel];
+    out.par_chunks_mut(sizes.out_hw)
         .enumerate()
         .for_each(|(oc, out_c_slice)| {
             let b = bias.map_or(0.0, |b| b[oc]);
@@ -180,8 +318,8 @@ pub(crate) fn conv_dd(plan: &ConvPlan, w: &[f64], bias: Option<&[f64]>, x: &[Dd]
                 *o = Dd::from_f64(b);
             }
             for ic in 0..plan.in_c {
-                let wbase = (oc * plan.in_c + ic) * kk;
-                let xbase = ic * ihw;
+                let wbase = (oc * plan.in_c + ic) * sizes.kernel_hw;
+                let xbase = ic * sizes.in_hw;
                 for ky in 0..plan.kh {
                     for kx in 0..plan.kw {
                         let wv = w[wbase + ky * plan.kw + kx];
@@ -214,7 +352,7 @@ pub(crate) fn conv_dd(plan: &ConvPlan, w: &[f64], bias: Option<&[f64]>, x: &[Dd]
                 }
             }
         });
-    out
+    Some(out)
 }
 
 /// Plain-f64 dense matvec `out = W x (+ bias)`; `w` is C-order `(out, in)`.
@@ -224,7 +362,16 @@ pub(crate) fn linear_f64(
     w: &[f64],
     bias: Option<&[f64]>,
     x: &[f64],
-) -> Vec<f64> {
+) -> Option<Vec<f64>> {
+    let weight_numel = out_features.checked_mul(in_features)?;
+    if out_features == 0
+        || in_features == 0
+        || w.len() != weight_numel
+        || x.len() != in_features
+        || bias.is_some_and(|values| values.len() != out_features)
+    {
+        return None;
+    }
     let mut out = vec![0.0_f64; out_features];
     out.par_iter_mut().enumerate().for_each(|(o, dst)| {
         let row = &w[o * in_features..(o + 1) * in_features];
@@ -234,7 +381,7 @@ pub(crate) fn linear_f64(
         }
         *dst = acc;
     });
-    out
+    Some(out)
 }
 
 /// Double-double dense matvec over a double-double input center.
@@ -244,7 +391,16 @@ pub(crate) fn linear_dd(
     w: &[f64],
     bias: Option<&[f64]>,
     x: &[Dd],
-) -> Vec<Dd> {
+) -> Option<Vec<Dd>> {
+    let weight_numel = out_features.checked_mul(in_features)?;
+    if out_features == 0
+        || in_features == 0
+        || w.len() != weight_numel
+        || x.len() != in_features
+        || bias.is_some_and(|values| values.len() != out_features)
+    {
+        return None;
+    }
     let mut out = vec![Dd::ZERO; out_features];
     out.par_iter_mut().enumerate().for_each(|(o, dst)| {
         let row = &w[o * in_features..(o + 1) * in_features];
@@ -255,7 +411,7 @@ pub(crate) fn linear_dd(
         }
         *dst = acc;
     });
-    out
+    Some(out)
 }
 
 /// The abstract affine map an op presents to [`apply_affine`].
@@ -288,25 +444,49 @@ impl AffineOp<'_> {
         }
     }
 
-    fn out_numel(&self) -> usize {
-        match self {
-            AffineOp::Conv { plan, .. } => plan.out_numel(),
-            AffineOp::Linear { out_features, .. } => *out_features,
+    /// Validate every shape and slice used by the low-level indexed kernels,
+    /// returning checked `(input_numel, output_numel, dot_terms)`.
+    fn preflight(&self, z: &DdZono) -> Option<(usize, usize, usize)> {
+        if !z.has_valid_layout() {
+            return None;
         }
-    }
-
-    /// Dot length `K` per output element.
-    fn k(&self) -> usize {
         match self {
-            AffineOp::Conv { plan, .. } => plan.k(),
-            AffineOp::Linear { in_features, .. } => *in_features,
-        }
-    }
-
-    fn in_numel(&self) -> usize {
-        match self {
-            AffineOp::Conv { plan, .. } => plan.in_c * plan.in_h * plan.in_w,
-            AffineOp::Linear { in_features, .. } => *in_features,
+            AffineOp::Conv {
+                plan,
+                w,
+                wabs,
+                bias,
+            } => {
+                let sizes = plan.checked_sizes()?;
+                if z.shape.as_slice() != [plan.in_c, plan.in_h, plan.in_w]
+                    || z.numel() != sizes.input_numel
+                    || w.len() != sizes.weight_numel
+                    || wabs.len() != sizes.weight_numel
+                    || bias.is_some_and(|values| values.len() != plan.out_c)
+                {
+                    return None;
+                }
+                Some((sizes.input_numel, sizes.output_numel, sizes.dot_terms))
+            }
+            AffineOp::Linear {
+                out_features,
+                in_features,
+                w,
+                wabs,
+                bias,
+            } => {
+                let weight_numel = out_features.checked_mul(*in_features)?;
+                if *out_features == 0
+                    || *in_features == 0
+                    || z.numel() != *in_features
+                    || w.len() != weight_numel
+                    || wabs.len() != weight_numel
+                    || bias.is_some_and(|values| values.len() != *out_features)
+                {
+                    return None;
+                }
+                Some((*in_features, *out_features, *in_features))
+            }
         }
     }
 
@@ -316,7 +496,7 @@ impl AffineOp<'_> {
         }
     }
 
-    fn apply_f64(&self, x: &[f64], with_bias: bool) -> Vec<f64> {
+    fn apply_f64(&self, x: &[f64], with_bias: bool) -> Option<Vec<f64>> {
         match self {
             AffineOp::Conv { plan, w, bias, .. } => {
                 conv_f64(plan, w, if with_bias { *bias } else { None }, x)
@@ -338,7 +518,7 @@ impl AffineOp<'_> {
     }
 
     /// Apply `|W|` with no bias — the error-channel transfer operator.
-    fn apply_abs(&self, x: &[f64]) -> Vec<f64> {
+    fn apply_abs(&self, x: &[f64]) -> Option<Vec<f64>> {
         match self {
             AffineOp::Conv { plan, wabs, .. } => conv_f64(plan, wabs, None, x),
             AffineOp::Linear {
@@ -350,7 +530,7 @@ impl AffineOp<'_> {
         }
     }
 
-    fn apply_dd(&self, x: &[Dd]) -> Vec<Dd> {
+    fn apply_dd(&self, x: &[Dd]) -> Option<Vec<Dd>> {
         match self {
             AffineOp::Conv { plan, w, bias, .. } => conv_dd(plan, w, *bias, x),
             AffineOp::Linear {
@@ -373,48 +553,52 @@ pub(crate) fn apply_affine(
     op: &AffineOp<'_>,
     mut poll: impl FnMut() -> Result<()>,
 ) -> Result<DdZono> {
-    if z.numel() != op.in_numel() {
-        return Err(NyError::InvalidSpec(format!(
-            "#dd-zonotope affine arity mismatch: state has {} elements, op expects {}",
-            z.numel(),
-            op.in_numel()
-        )));
-    }
-    let n_out = op.out_numel();
-    let k = op.k();
+    let (_, n_out, k) = op.preflight(z).ok_or_else(|| {
+        NyError::SoundnessRefusal("#dd-zonotope affine shape/slice preflight failed".to_string())
+    })?;
 
     // --- error channel, computed BEFORE the state is consumed --------------
     let rad = z.radius();
     let abs_c: Vec<f64> = z.center.iter().map(|c| c.abs_upper()).collect();
 
-    let s_c = op.apply_abs(&abs_c);
+    let kernel_refusal =
+        || NyError::SoundnessRefusal("#dd-zonotope affine kernel validation failed".to_string());
+    let s_c = op.apply_abs(&abs_c).ok_or_else(kernel_refusal)?;
     poll()?;
-    let s_g = op.apply_abs(&rad);
+    let s_g = op.apply_abs(&rad).ok_or_else(kernel_refusal)?;
     poll()?;
-    let ec_t = op.apply_abs(&z.ec);
+    let ec_t = op.apply_abs(&z.ec).ok_or_else(kernel_refusal)?;
     poll()?;
-    let eg_t = op.apply_abs(&z.eg);
+    let eg_t = op.apply_abs(&z.eg).ok_or_else(kernel_refusal)?;
     poll()?;
 
     // gamma_{2K+2} at the double-double effective unit roundoff: each input
     // element enters the accumulator as two exact products, plus the bias add.
-    let g_dd = gamma_n_dd(2 * k + 2);
+    let dd_gamma_terms = k
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(2))
+        .ok_or_else(|| {
+            NyError::SoundnessRefusal(
+                "#dd-zonotope center gamma operation count overflow".to_string(),
+            )
+        })?;
+    let g_dd = gamma_n_dd(dd_gamma_terms);
     // gamma_{K+1} at plain f64 for the generator columns.
-    let g_f64 = gamma_n_f64(k + 1);
+    let f64_gamma_terms = k.checked_add(1).ok_or_else(|| {
+        NyError::SoundnessRefusal(
+            "#dd-zonotope generator gamma operation count overflow".to_string(),
+        )
+    })?;
+    let g_f64 = gamma_n_f64(f64_gamma_terms);
     let bias = op.bias();
 
-    // ABSOLUTE underflow floor (soundness audit 2026-07-23). `two_prod` is
-    // error-free ONLY when the product does not underflow (< f64::MIN_POSITIVE);
-    // a subnormal/flushed product drops a residual < 2^-1074 that the RELATIVE
-    // gamma envelope (gamma*S, and S itself underflows) cannot see. Charge an
-    // absolute floor of one lost residual per accumulated op. UNREACHABLE on
-    // vggnet16 (f32 weights >= 2^-149, O(1) activations -> products O(1)),
-    // negligible when reached (~1e-320), and sound when it is not -- fail-closed.
-    let eta = f64::from_bits(1); // smallest positive subnormal, 2^-1074
-    #[allow(clippy::cast_precision_loss)]
-    let uf_ec = (2 * k + 2) as f64 * eta; // dd center dot: 2K products + bias
-    #[allow(clippy::cast_precision_loss)]
-    let uf_eg = (k + 1) as f64 * eta; // plain-f64 generator dot: K products
+    // Absolute floors cover every multiply/add/EFT/reduction, not just the K
+    // mathematical products. In particular, generator errors aggregate over
+    // every live column, and ec_t/eg_t each perform another plain-f64 dot.
+    let (center_operations, generator_operations) =
+        affine_underflow_operation_counts(k, z.n_gens())?;
+    let uf_ec = operation_underflow_floor(center_operations)?;
+    let uf_eg = operation_underflow_floor(generator_operations)?;
 
     let mut ec = vec![0.0_f64; n_out];
     let mut eg = vec![0.0_f64; n_out];
@@ -431,11 +615,11 @@ pub(crate) fn apply_affine(
     }
 
     // --- values ------------------------------------------------------------
-    let center = op.apply_dd(&z.center);
+    let center = op.apply_dd(&z.center).ok_or_else(kernel_refusal)?;
     poll()?;
     let mut gens: Vec<Vec<f64>> = Vec::with_capacity(z.n_gens());
     for g in &z.gens {
-        gens.push(op.apply_f64(g, false));
+        gens.push(op.apply_f64(g, false).ok_or_else(kernel_refusal)?);
         poll()?;
     }
 

@@ -164,15 +164,24 @@ fn assert_dynamic_reshape_error(result: Result<PropNetwork>, layer_name: &str) {
     }
 }
 
+#[cfg(feature = "external-vnncomp")]
 mod acasxu_1923;
 mod attention;
+#[cfg_attr(not(feature = "external-avoice"), allow(dead_code, unused_imports))]
 mod avoice;
+#[cfg_attr(not(feature = "external-vnncomp"), allow(dead_code, unused_imports))]
 mod cnn;
 mod custom_ops;
 mod decoder;
 mod differential_translation;
 mod fusion;
+#[cfg(any(
+    feature = "benchmarks",
+    feature = "external-vnncomp",
+    feature = "external-wgpu"
+))]
 mod gpu_crown;
+#[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 mod gpu_crown_graph;
 #[cfg(feature = "benchmarks")]
 mod gpu_crown_timing;
@@ -185,6 +194,7 @@ mod probabilistic_integration;
 mod propagate;
 mod reduce_batch_axis;
 mod reshape;
+#[cfg_attr(not(feature = "external-vnncomp"), allow(dead_code, unused_imports))]
 mod resize;
 mod scatter_nd;
 mod shape_inference_policy;

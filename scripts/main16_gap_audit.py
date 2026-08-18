@@ -8,11 +8,14 @@ over old measured CSVs.  The exact-current section is restricted to immutable
 measurement completions captured at ``--exact-commit`` under the explicitly
 listed ``--artifact-root`` directories.  SAT rows require an immutable replay
 sidecar before they receive either credit or an incorrect-result penalty.
+Exact-2025 SAT qualification additionally requires ``--benchmark-root`` so the
+sidecar can be rebound to the pinned official Git payloads.
 
 Examples::
 
   python3 scripts/main16_gap_audit.py \
     --official /data/vnncomp2025_results \
+    --benchmark-root /data/vnncomp2025_benchmarks/benchmarks \
     --legacy-measured reports/measured \
     --artifact-root /data/ny-run/artifacts \
     --exact-commit "$(git rev-parse HEAD)"
@@ -46,7 +49,6 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import ny_measurement_provenance as provenance  # noqa: E402
 import ny_retroactive_scorecard as retro  # noqa: E402
-import replay_ny_counterexamples as replay  # noqa: E402
 import vnncomp_competitive_score as competitive  # noqa: E402
 
 SCHEMA = "ny_main16_gap_audit_v1"
@@ -90,6 +92,30 @@ def _json_bytes(value: object) -> bytes:
     )
 
 
+def _json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise AuditError(f"duplicate JSON key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _strict_json_loads(data: bytes, label: str) -> Any:
+    try:
+        return json.loads(
+            data,
+            object_pairs_hook=_json_pairs,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {token}")
+            ),
+        )
+    except AuditError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise AuditError(f"{label} is not strict JSON") from error
+
+
 def _require_directory(path: Path, label: str) -> Path:
     if path.is_symlink():
         raise AuditError(f"{label} must not be a symlink: {path}")
@@ -107,11 +133,10 @@ def _stable_json(path: Path, label: str) -> tuple[dict[str, Any], str, int]:
         raise AuditError(f"{label} must not be a symlink: {path}")
     try:
         data, digest, fingerprint = provenance._stable_file_bytes(path)
-        value = json.loads(data)
+        value = _strict_json_loads(data, label)
     except (
         OSError,
         UnicodeDecodeError,
-        json.JSONDecodeError,
         provenance.ProvenanceError,
     ) as error:
         raise AuditError(f"could not read {label} {path}: {error}") from error
@@ -235,7 +260,16 @@ def _legacy_section(
     )
     suites: list[dict[str, Any]] = []
     for category in retro.REGULAR:
-        raw, score, winner, credited, incorrect, assumed_sats = breakdown[category]
+        # `retro.CategoryProjection`, read by FIELD NAME on purpose: this value
+        # has grown twice (the field-falsified moat, then the unconfirmable
+        # split) and each growth silently broke a positional unpack here.
+        projection = breakdown[category]
+        raw = projection.raw
+        score = projection.normalized
+        winner = projection.official_winner_raw
+        credited = projection.credited
+        incorrect = projection.contradictions
+        assumed_sats = projection.assumed_sat_count
         total_rows = len(official.reference_order[category])
         suites.append(
             {
@@ -243,7 +277,14 @@ def _legacy_section(
                 "official_instances": total_rows,
                 "credited": credited,
                 "incorrect": incorrect,
-                "unmeasured": total_rows - credited - incorrect,
+                "unmeasured": total_rows
+                - credited
+                - incorrect
+                - projection.unconfirmable,
+                # Decided ny rows the published field never decided: they score
+                # 0 because nothing could ever contradict them. Surfaced so the
+                # audit's `unmeasured` bucket does not silently absorb them.
+                "unconfirmable": projection.unconfirmable,
                 "assumed_sat_credits": assumed_sats,
                 "raw_points": raw,
                 "official_winner_raw_points": winner,
@@ -298,6 +339,14 @@ def _validate_start(
         raise AuditError(
             f"internal: start manifest is not for requested commit: {start_path}"
         )
+    tracked_diff_format = ny.get("tracked_diff_format")
+    if tracked_diff_format not in {None, "ny_tracked_worktree_evidence_v2"}:
+        raise AuditError(f"unsupported NY tracked-diff evidence format: {start_path}")
+    if tracked_diff_format == "ny_tracked_worktree_evidence_v2" and (
+        ny.get("tracked_diff_sha256") != provenance._sha256(b"")
+        or ny.get("tracked_worktree_paths") != []
+    ):
+        raise AuditError(f"invalid clean NY tracked-diff evidence: {start_path}")
     if (
         ny.get("clean") is not True
         or ny.get("status_porcelain_v1_z_entries") != []
@@ -335,104 +384,86 @@ def _validate_replay_sidecar(
     metadata_digest: str,
     metadata_size: int,
     result_path: Path,
+    result_data: bytes,
     result_digest: str,
     result_size: int,
+    official_evidence: Any | None = None,
+    benchmark_evidence: Any | None = None,
+    replay_session: dict[str, Any] | None = None,
 ) -> tuple[competitive.CounterexampleResult | None, str]:
-    sidecar_path = metadata_path.with_name(
+    exact_sidecar = metadata_path.with_name(
+        f"{metadata_path.stem}.vnncomp2025-zero-tol-validation.json"
+    )
+    retired_sidecar = metadata_path.with_name(
         f"{metadata_path.stem}.counterexample-validation.json"
     )
-    if not sidecar_path.exists():
+    if not exact_sidecar.exists():
+        if retired_sidecar.exists():
+            return None, "retired_2026_replay_sidecar_ignored"
         return None, "missing_replay_sidecar"
-    sidecar, _, _ = _stable_json(sidecar_path, "counterexample replay sidecar")
-    if (
-        sidecar.get("schema") != "ny_counterexample_validation_v1"
-        or sidecar.get("schema_version") != 1
-    ):
-        raise AuditError(f"unsupported counterexample replay sidecar: {sidecar_path}")
-    official_result = sidecar.get("official_result")
-    if not isinstance(official_result, str):
-        raise AuditError(
-            f"counterexample sidecar has no official result: {sidecar_path}"
-        )
-    expected_status, expected_classification, expected_credit = replay._classification(
-        official_result
-    )
-    if (
-        sidecar.get("status") != expected_status
-        or sidecar.get("classification") != expected_classification
-        or sidecar.get("score_credit") is not expected_credit
-        or sidecar.get("provider") != replay.CPU_PROVIDER
-    ):
-        raise AuditError(
-            f"counterexample replay classification is inconsistent: {sidecar_path}"
-        )
-    checker = sidecar.get("checker")
-    vnnlib_source = sidecar.get("vnnlib_python_source")
-    if (
-        not isinstance(checker, dict)
-        or checker.get("commit") != replay.PINNED_CHECKER_COMMIT
-        or not isinstance(vnnlib_source, dict)
-        or vnnlib_source.get("commit") != replay.PINNED_VNNLIB_PYTHON_COMMIT
-    ):
-        raise AuditError(
-            f"counterexample replay did not use pinned sources: {sidecar_path}"
-        )
-    measurement = sidecar.get("measurement")
-    if not isinstance(measurement, dict) or (
-        measurement.get("run_id"),
-        measurement.get("category"),
-        measurement.get("instance_index"),
-    ) != (run_id, record.get("category"), record.get("instance_index")):
-        raise AuditError(
-            f"counterexample sidecar measurement identity differs: {sidecar_path}"
-        )
-    evidence = sidecar.get("evidence")
-    if not isinstance(evidence, dict):
-        raise AuditError(
-            f"counterexample sidecar has no evidence links: {sidecar_path}"
-        )
+    if official_evidence is None or benchmark_evidence is None:
+        return None, "exact_2025_replay_requires_pinned_benchmark_context"
 
-    expected_links = (
-        (
-            "metadata",
-            metadata_path.relative_to(root).as_posix(),
-            metadata_digest,
-            metadata_size,
-        ),
-        (
-            "raw_result",
-            result_path.relative_to(root).as_posix(),
-            result_digest,
-            result_size,
-        ),
-        (
-            "start_manifest",
-            start_path.relative_to(root).as_posix(),
-            start_digest,
-            start_size,
-        ),
-    )
-    for name, artifact, digest, size in expected_links:
-        link = evidence.get(name)
-        if not isinstance(link, dict) or (
-            link.get("artifact"),
-            link.get("sha256"),
-            link.get("size_bytes"),
-        ) != (artifact, digest, size):
-            raise AuditError(
-                f"counterexample sidecar {name} link differs: {sidecar_path}"
-            )
+    # Lazy import avoids the module-import cycle: regular_bank_evidence uses
+    # this audit's sealed completion parser.
+    import regular_bank_evidence as regular  # noqa: PLC0415
 
-    if official_result == "correct":
-        return competitive.CounterexampleResult.CORRECT, "strictly_correct"
-    if official_result == "correct_up_to_tolerance":
-        return (
-            competitive.CounterexampleResult.CORRECT_UP_TO_TOLERANCE,
-            "correct_up_to_tolerance",
+    category = record.get("category")
+    instance_index = record.get("instance_index")
+    assert isinstance(category, str)
+    assert type(instance_index) is int
+    try:
+        occurrence, _ = regular._load_occurrence(
+            category=category,
+            instance_index=instance_index,
+            benchmark=benchmark_evidence,
+            official=official_evidence,
         )
-    if expected_status == "validated":
-        return competitive.CounterexampleResult.NO_COUNTEREXAMPLE, "validated_invalid"
-    return None, "replay_not_validated"
+        authoritative_inputs = {
+            label: regular.authoritative_benchmark_input(
+                benchmark=benchmark_evidence,
+                category=category,
+                declared_name=(
+                    occurrence.onnx if label == "onnx" else occurrence.vnnlib
+                ),
+                label=label,
+            )[0]
+            for label in ("onnx", "vnnlib")
+        }
+        binding = regular.validate_exact_2025_sat_replay(
+            root=root,
+            metadata_path=metadata_path,
+            metadata_digest=metadata_digest,
+            metadata_size=metadata_size,
+            result_path=result_path,
+            result_digest=result_digest,
+            result_size=result_size,
+            result_data=result_data,
+            start_path=start_path,
+            start_digest=start_digest,
+            start_size=start_size,
+            run_id=run_id,
+            category=category,
+            instance_index=instance_index,
+            official=official_evidence,
+            benchmark=benchmark_evidence,
+            authoritative_inputs=authoritative_inputs,
+            replay_session=replay_session,
+        )
+    except regular.EvidenceError as error:
+        raise AuditError(f"exact 2025 SAT replay is invalid: {error}") from error
+    result = binding["official_result"]
+    mapping = {
+        "correct": competitive.CounterexampleResult.CORRECT,
+        "correct_up_to_tolerance": (
+            competitive.CounterexampleResult.CORRECT_UP_TO_TOLERANCE
+        ),
+        "no_ce": competitive.CounterexampleResult.NO_COUNTEREXAMPLE,
+        "exec_doesnt_match": competitive.CounterexampleResult.EXEC_DOESNT_MATCH,
+        "wrong_shape": competitive.CounterexampleResult.EXEC_DOESNT_MATCH,
+        "spec_not_violated": competitive.CounterexampleResult.SPEC_NOT_VIOLATED,
+    }
+    return mapping[str(result)], f"exact_2025_zero_tol:{result}"
 
 
 def _validate_record(
@@ -444,6 +475,9 @@ def _validate_record(
     run_id: str,
     record: object,
     official: OfficialContext,
+    official_evidence: Any | None = None,
+    benchmark_evidence: Any | None = None,
+    replay_session: dict[str, Any] | None = None,
 ) -> SealedRecord:
     if not isinstance(record, dict):
         raise AuditError(f"run {run_id} completion contains a non-object record")
@@ -515,8 +549,8 @@ def _validate_record(
             )
 
     try:
-        metadata = json.loads(metadata_data)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        metadata = _strict_json_loads(metadata_data, "measurement metadata")
+    except AuditError as error:
         raise AuditError(
             f"run {run_id} metadata is invalid JSON: {metadata_path}"
         ) from error
@@ -567,8 +601,12 @@ def _validate_record(
             metadata_digest=metadata_digest,
             metadata_size=metadata_size,
             result_path=result_path,
+            result_data=result_data,
             result_digest=result_digest,
             result_size=result_size,
+            official_evidence=official_evidence,
+            benchmark_evidence=benchmark_evidence,
+            replay_session=replay_session,
         )
     return SealedRecord(
         root,
@@ -590,6 +628,9 @@ def _validate_completion(
     start_digest: str,
     start_size: int,
     official: OfficialContext,
+    official_evidence: Any | None = None,
+    benchmark_evidence: Any | None = None,
+    replay_session: dict[str, Any] | None = None,
 ) -> list[SealedRecord]:
     completion_path = start_path.with_name("completion.json")
     if not completion_path.exists():
@@ -612,6 +653,11 @@ def _validate_completion(
             f"exact-commit completion is not successfully integrity-qualified: {completion_path}"
         )
     checks = integrity.get("checks")
+    cuda_runtime = checks.get("cuda_runtime") if isinstance(checks, dict) else None
+    if not isinstance(cuda_runtime, dict) or cuda_runtime.get("status") != "valid":
+        raise AuditError(
+            f"completion lacks valid CUDA runtime identity: {completion_path}"
+        )
     run_evidence = checks.get("run_evidence") if isinstance(checks, dict) else None
     if not isinstance(run_evidence, dict) or run_evidence.get("status") != "valid":
         raise AuditError(f"completion lacks valid run evidence: {completion_path}")
@@ -642,6 +688,9 @@ def _validate_completion(
             run_id=run_id,
             record=record,
             official=official,
+            official_evidence=official_evidence,
+            benchmark_evidence=benchmark_evidence,
+            replay_session=replay_session,
         )
         for record in records
     ]
@@ -651,6 +700,9 @@ def load_sealed_records(
     roots: list[Path],
     exact_commit: str,
     official: OfficialContext,
+    *,
+    official_evidence: Any | None = None,
+    benchmark_evidence: Any | None = None,
 ) -> tuple[list[SealedRecord], dict[str, Any], bool]:
     resolved_roots = [
         _require_directory(root, "measurement artifact root") for root in roots
@@ -668,6 +720,7 @@ def load_sealed_records(
     accepted_runs: list[str] = []
     seen_run_ids: set[str] = set()
     duplicate_run_ids: set[str] = set()
+    replay_session: dict[str, Any] = {}
     for root in sorted(resolved_roots, key=str):
         runs_dir = root / "runs"
         if not runs_dir.exists():
@@ -709,6 +762,9 @@ def load_sealed_records(
                     start_digest=start_digest,
                     start_size=start_size,
                     official=official,
+                    official_evidence=official_evidence,
+                    benchmark_evidence=benchmark_evidence,
+                    replay_session=replay_session,
                 )
                 seen_run_ids.add(run_id)
                 accepted_runs.append(run_id)
@@ -750,6 +806,13 @@ def load_sealed_records(
         "rejected_runs": rejected,
         "ambiguous_rows": ambiguous,
     }
+    if "snapshot" in replay_session:
+        import regular_bank_evidence as regular  # noqa: PLC0415
+
+        try:
+            regular.revalidate_replay_session(replay_session)
+        except regular.EvidenceError as error:
+            raise AuditError(str(error)) from error
     return (
         sorted(usable, key=lambda row: (row.category, row.instance_index)),
         audit,
@@ -761,6 +824,15 @@ def _score_record(record: SealedRecord, truth: str) -> int | None:
     if record.verdict in {"unknown", "timeout", "error"}:
         return None
     if record.verdict == "sat" and record.counterexample is None:
+        return None
+    if (
+        record.verdict == "sat"
+        and record.counterexample == competitive.CounterexampleResult.CORRECT
+        and truth == "holds"
+    ):
+        # A strict new witness changes the published field truth and can
+        # penalize incumbent holds results, changing the frozen denominator.
+        # This projection cannot reproduce that dynamic organizer rescore.
         return None
     result = "holds" if record.verdict == "unsat" else "violated"
     target = competitive.InstanceResult(
@@ -846,7 +918,9 @@ def _qualified_section(
         "is_exact_current_evidence": True,
         "exact_commit": exact_commit,
         "artifact_roots": sorted(str(path.resolve()) for path in roots),
-        "sat_policy": "immutable_pinned_official_replay_sidecar_required",
+        "sat_policy": (
+            "exact_2025_zero_tol_replay_required_2026_sidecars_unqualified"
+        ),
         "metric_caveat": (
             "Frozen published denominators are retained; a new strictly correct SAT "
             "witness can change incumbent penalties and the official denominator"
@@ -870,6 +944,7 @@ def build_audit(
     legacy_measured_root: Path,
     artifact_roots: list[Path],
     exact_commit: str,
+    benchmark_root: Path | None = None,
 ) -> tuple[dict[str, Any], bool]:
     if EXACT_COMMIT_RE.fullmatch(exact_commit) is None:
         raise AuditError(
@@ -877,13 +952,37 @@ def build_audit(
         )
     if not artifact_roots:
         raise AuditError("at least one --artifact-root is required")
-    official = load_official_context(official_root)
+    official_evidence = None
+    benchmark_evidence = None
+    if benchmark_root is not None:
+        # Imported lazily to avoid the regular-bank validator's dependency on
+        # this module while both modules are initialized.
+        import regular_bank_evidence as regular  # noqa: PLC0415
+
+        try:
+            official_evidence = regular.validate_official_results(official_root)
+            benchmark_evidence = regular.validate_official_benchmark(benchmark_root)
+        except regular.EvidenceError as error:
+            raise AuditError(
+                f"pinned exact-2025 SAT replay context is invalid: {error}"
+            ) from error
+        official = official_evidence.context
+    else:
+        official = load_official_context(official_root)
     legacy = load_legacy_results(legacy_measured_root, official)
     sealed, qualification_audit, incomplete = load_sealed_records(
-        artifact_roots, exact_commit, official
+        artifact_roots,
+        exact_commit,
+        official,
+        official_evidence=official_evidence,
+        benchmark_evidence=benchmark_evidence,
     )
     report = {
         "schema": SCHEMA,
+        "claim_scope": (
+            "local_reproducible_internal_counterfactual_"
+            "not_official_or_independently_attested"
+        ),
         "metric": METRIC,
         "theoretical_perfect_score": 1600.0,
         "suite_order": list(retro.REGULAR),
@@ -971,11 +1070,17 @@ def render_table(report: dict[str, Any]) -> str:
     qualified_by_suite = {row["suite"]: row for row in qualified["suites"]}
     lines = [
         "MAIN16 GAP AUDIT — EVIDENCE TIERS MUST NOT BE COMBINED",
+        (
+            "claim scope: local counterfactual; nonofficial; "
+            "not independently attested"
+        ),
         f"legacy:    {legacy['evidence_tier']} (NOT QUALIFIED)",
         f"qualified: {qualified['evidence_tier']} @ {qualified['exact_commit']}",
         "",
-        f"{'suite':24s} {'legacy':>9s} {'gap':>9s} {'need':>5s}  "
-        f"{'q_ok':>5s} {'q_bad':>5s} {'q_none':>6s} {'q_score':>9s}",
+        (
+            f"{'suite':24s} {'legacy':>9s} {'gap':>9s} {'need':>5s}  "
+            f"{'q_ok':>5s} {'q_bad':>5s} {'q_none':>6s} {'q_score':>9s}"
+        ),
     ]
     for suite in report["suite_order"]:
         left = legacy_by_suite[suite]
@@ -989,13 +1094,17 @@ def render_table(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "-" * 91,
-            f"legacy optimistic: {legacy['score']:.6f}/1600; "
-            f"gap={legacy['gap_to_perfect']:.6f}; "
-            f"minimum extra credits={legacy['min_extra_credits_to_perfect']}",
-            f"exact-current:     {qualified['score']:.6f}/1600; "
-            f"solved={qualified['qualified_solved']}; "
-            f"incorrect={qualified['qualified_incorrect']}; "
-            f"unmeasured={qualified['unmeasured']}",
+            (
+                f"legacy optimistic: {legacy['score']:.6f}/1600; "
+                f"gap={legacy['gap_to_perfect']:.6f}; "
+                f"minimum extra credits={legacy['min_extra_credits_to_perfect']}"
+            ),
+            (
+                f"exact-current:     {qualified['score']:.6f}/1600; "
+                f"solved={qualified['qualified_solved']}; "
+                f"incorrect={qualified['qualified_incorrect']}; "
+                f"unmeasured={qualified['unmeasured']}"
+            ),
             f"qualification: {qualified['qualification_audit']['status']}",
         ]
     )
@@ -1034,6 +1143,14 @@ def _parser() -> argparse.ArgumentParser:
         help="direct artifact root containing runs/<run-id>/start.json; repeatable",
     )
     parser.add_argument(
+        "--benchmark-root",
+        type=Path,
+        help=(
+            "pinned VNN-COMP 2025 benchmarks/ tree; required for exact-2025 "
+            "SAT replay qualification"
+        ),
+    )
+    parser.add_argument(
         "--exact-commit",
         required=True,
         help="40-lowercase-hex NY commit required in qualified start manifests",
@@ -1057,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
             legacy_measured_root=args.legacy_measured,
             artifact_roots=args.artifact_root,
             exact_commit=args.exact_commit,
+            benchmark_root=args.benchmark_root,
         )
         json_data = _json_bytes(report)
         csv_data = render_csv(report).encode("utf-8")

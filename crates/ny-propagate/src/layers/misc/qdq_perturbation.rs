@@ -2,11 +2,16 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sound relaxation for ONNX activation QuantizeLinear -> DequantizeLinear pairs.
+//! Disabled candidate relaxation for activation QuantizeLinear -> DequantizeLinear pairs.
+//!
+//! A half-scale exact-real envelope is not sufficient for ONNX's typed
+//! binary32 divide, ties-to-even rounding, and binary32 reconstruction.  The
+//! type remains in the internal layer inventory for compatibility, but its
+//! only constructor fails closed until that full program has a certificate.
 
 use ndarray::{Array1, Axis};
 use ny_core::{NyError, Result};
-use ny_tensor::BoundedTensor;
+use ny_tensor::{add_up_f32, sub_down_f32, BoundedTensor};
 use std::borrow::Cow;
 
 use crate::layers::common::BoundPropagation;
@@ -32,18 +37,9 @@ impl QdqPerturbationLayer {
             )));
         }
 
-        let epsilon = next_up_f32(scale * 0.5);
-        if !(epsilon.is_finite() && epsilon > 0.0) {
-            return Err(NyError::InvalidSpec(format!(
-                "QDQ perturbation produced invalid epsilon from scale {scale}"
-            )));
-        }
-
-        Ok(Self {
-            epsilon,
-            lower_saturation_edge: scale * (qmin - zero_point - 0.5),
-            upper_saturation_edge: scale * (qmax - zero_point + 0.5),
-        })
+        Err(NyError::UnsupportedOp(format!(
+            "QDQ perturbation for scale {scale}, zero_point {zero_point}, and range [{qmin}, {qmax}] is disabled: the full FLOAT32 division, rounding, reconstruction, and outward-bound envelope is not certified"
+        )))
     }
 
     pub fn epsilon(&self) -> f32 {
@@ -98,9 +94,15 @@ impl QdqPerturbationLayer {
 impl BoundPropagation for QdqPerturbationLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.require_no_saturation(input, "IBP")?;
+        // DIRECTED: `value - epsilon` under round-to-nearest can land ABOVE the
+        // true difference, so the widened lower bound could sit inside the
+        // interval it is meant to enlarge — the perturbation would be silently
+        // smaller than requested. Exact whenever the shift is representable.
         BoundedTensor::new(
-            input.lower().mapv(|value| value - self.epsilon),
-            input.upper().mapv(|value| value + self.epsilon),
+            input
+                .lower()
+                .mapv(|value| sub_down_f32(value, self.epsilon)),
+            input.upper().mapv(|value| add_up_f32(value, self.epsilon)),
         )
     }
 
@@ -134,68 +136,22 @@ impl BoundPropagation for QdqPerturbationLayer {
     }
 }
 
-fn next_up_f32(value: f32) -> f32 {
-    if value.is_nan() || value == f32::INFINITY {
-        return value;
-    }
-    if value == -0.0 {
-        return f32::MIN_POSITIVE.min(f32::from_bits(1));
-    }
-    let bits = value.to_bits();
-    if value >= 0.0 {
-        f32::from_bits(bits + 1)
-    } else {
-        f32::from_bits(bits - 1)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::QdqPerturbationLayer;
-    use crate::layers::common::BoundPropagation;
-    use crate::LinearBounds;
-    use ndarray::{arr1, arr2};
-    use ny_tensor::BoundedTensor;
 
     #[test]
-    fn ibp_widens_by_outward_half_scale_inside_non_saturating_range() {
-        let layer = QdqPerturbationLayer::new(0.25, 10.0, 0.0, 255.0).unwrap();
-        let input = BoundedTensor::new(arr1(&[-1.0, 2.0]).into_dyn(), arr1(&[0.5, 3.0]).into_dyn())
-            .unwrap();
+    fn constructor_fails_closed_at_float32_rounding_counterexample() {
+        let scale = 0.1_f32;
+        let x = f32::from_bits(0x4154_0001);
+        let quantized = (x / scale).round_ties_even();
+        let dequantized = quantized * scale;
+        let old_half_scale = f32::from_bits((scale * 0.5).to_bits() + 1);
+        assert_eq!(quantized, 132.0);
+        assert!(dequantized < x - old_half_scale);
 
-        let output = layer.propagate_ibp(&input).unwrap();
-
-        assert!(output.lower()[[0]] <= -1.125);
-        assert!(output.upper()[[1]] >= 3.125);
-    }
-
-    #[test]
-    fn crown_bias_widening_uses_absolute_coefficients() {
-        let layer = QdqPerturbationLayer::new(0.5, 0.0, -128.0, 127.0).unwrap();
-        let bounds = LinearBounds::new(
-            arr2(&[[2.0, -3.0]]),
-            arr1(&[1.0]),
-            arr2(&[[-4.0, 5.0]]),
-            arr1(&[2.0]),
-        )
-        .unwrap();
-        let input =
-            BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn())
-                .unwrap();
-
-        let output = layer.propagate_linear_with_bounds(&bounds, &input).unwrap();
-
-        assert!(output.lower_b()[0] <= 1.0 - 1.25);
-        assert!(output.upper_b()[0] >= 2.0 + 2.25);
-    }
-
-    #[test]
-    fn crown_rejects_when_saturation_may_be_active() {
-        let layer = QdqPerturbationLayer::new(1.0, 0.0, 0.0, 255.0).unwrap();
-        let bounds = LinearBounds::identity(1);
-        let input =
-            BoundedTensor::new(arr1(&[-10.0]).into_dyn(), arr1(&[-9.0]).into_dyn()).unwrap();
-
-        assert!(layer.propagate_linear_with_bounds(&bounds, &input).is_err());
+        let error = QdqPerturbationLayer::new(scale, 0.0, 0.0, 255.0)
+            .expect_err("uncertified FLOAT32 QDQ envelope must remain unavailable");
+        assert!(error.to_string().contains("not certified"), "{error}");
     }
 }

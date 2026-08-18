@@ -111,8 +111,9 @@ fn assert_talker_frozen_aux_metadata(graph_model: &ny_build::GraphModel, baselin
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_talker_attention_graph_model_round_trip_matches_direct_softmax_ibp_3923() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let seq_len = TALKER_ATTENTION_SHORT_SEQ_LEN;
     let baseline = load_talker_attention_with_fixed_aux_for_seq_len(seq_len);
     let graph_model = load_talker_attention_with_fixed_aux_for_seq_len(seq_len).to_graph_model();

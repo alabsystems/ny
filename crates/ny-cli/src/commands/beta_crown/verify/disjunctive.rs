@@ -15,7 +15,7 @@ use ny_propagate::{
 };
 use ny_tensor::BoundedTensor;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::attack_budget::disjunctive_sampling_budget;
 use super::disjunctive_pgd::{beta_crown_pgd_config, try_disjunctive_sampling_attack_with_config};
@@ -26,7 +26,100 @@ use super::disjunctive_unified::{
 };
 use super::phase_budget::PhaseBudgetLedger;
 use super::BetaCrownModel;
+use crate::commands::beta_crown::attack_arming::{AttackEngineSource, ResolvedAttackEngine};
 use crate::commands::beta_crown::constraint_plan::build_grouped_disjunctive_objectives;
+
+fn disable_clause_invprop(config: &mut BetaCrownConfig) {
+    config.alpha_config.output_constraints = None;
+    config.alpha_config.invprop.enabled = false;
+    config.alpha_config.invprop.optimize_gammas = false;
+}
+
+/// Rebind INVPROP's assume-violation region to one extracted disjunct.
+///
+/// Top-level setup deliberately refuses to dualize a disjunction as one
+/// conjunction.  Once the serial disjunctive lane has isolated a clause,
+/// however, that clause is exactly the conjunctive region whose emptiness this
+/// invocation must prove.  Keep the rebinding local so learned gamma state and
+/// constraint matrices can never leak across clauses.
+pub(super) fn config_for_clause_invprop(
+    config: &BetaCrownConfig,
+    clause_spec: &VnnLibSpec,
+) -> BetaCrownConfig {
+    let observe_rebind = config.alpha_config.invprop.enabled;
+    if observe_rebind {
+        ny_propagate::execution_telemetry::record_invprop_clause_rebind_attempt();
+    }
+    let mut clause_config = config.clone();
+    // Clear first: a malformed/programmatic clause must fall back to ordinary
+    // proof with INVPROP inert, never inherit another clause's conditional
+    // matrix.  Refusing this optimization must not abort the whole instance.
+    clause_config.alpha_config.output_constraints = None;
+
+    let refusal = if clause_spec.is_disjunction {
+        Some("clause is still marked as a disjunction")
+    } else if !clause_spec.output_constraint_clauses.is_empty() {
+        Some("residual clause grouping was not cleared")
+    } else if clause_spec.output_constraints.is_empty() {
+        Some("clause has no output constraints")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        warn!(reason, "Skipping clause-local INVPROP rebinding");
+        if observe_rebind {
+            ny_propagate::execution_telemetry::record_invprop_clause_rebind_refused();
+        }
+        disable_clause_invprop(&mut clause_config);
+        return clause_config;
+    }
+
+    // Parsed specs already carry this guarantee, but programmatic callers can
+    // construct VnnLibSpec directly.  Validate before matrix conversion so a
+    // malformed output index fails closed instead of indexing ndarray storage.
+    if let Err(error) = clause_spec.validate_output_indices() {
+        warn!(%error, "Skipping clause-local INVPROP rebinding");
+        if observe_rebind {
+            ny_propagate::execution_telemetry::record_invprop_clause_rebind_refused();
+        }
+        disable_clause_invprop(&mut clause_config);
+        return clause_config;
+    }
+
+    let output_constraints = match clause_spec.to_output_constraints() {
+        Ok(constraints) if constraints.is_conjunction && constraints.clause_indices.is_none() => {
+            constraints
+        }
+        Ok(_) => {
+            // Structurally unreachable after the checks above; keep this guard
+            // as defense in depth.  The propagation layer independently no-ops
+            // on non-conjunctive matrices as its final soundness boundary.
+            warn!("Skipping clause-local INVPROP rebinding: conversion was not conjunctive");
+            if observe_rebind {
+                ny_propagate::execution_telemetry::record_invprop_clause_rebind_refused();
+            }
+            disable_clause_invprop(&mut clause_config);
+            return clause_config;
+        }
+        Err(error) => {
+            warn!(%error, "Skipping clause-local INVPROP rebinding");
+            if observe_rebind {
+                ny_propagate::execution_telemetry::record_invprop_clause_rebind_refused();
+            }
+            disable_clause_invprop(&mut clause_config);
+            return clause_config;
+        }
+    };
+
+    // Overwrite unconditionally: a programmatic caller may carry a matrix for
+    // another property even though the CLI top-level disjunction leaves None.
+    clause_config.alpha_config.output_constraints = Some(output_constraints);
+    if observe_rebind {
+        ny_propagate::execution_telemetry::record_invprop_clause_rebind_accepted();
+    }
+    clause_config
+}
+
 pub(super) fn finalize_disjunctive_result(
     aggregated: BetaCrownResult,
     overall_start: Instant,
@@ -97,8 +190,21 @@ pub(super) fn verify_multi_clause_disjunction(
     pgd_steps: usize,
     timeout: u64,
     gemm_engine: Option<&dyn GemmEngine>,
+    attack_engine_source: AttackEngineSource<'_>,
     json: bool,
+    ledger: &PhaseBudgetLedger,
 ) -> Result<BetaCrownResult> {
+    // #attack-steering-unquarantine: falsification lanes take the live
+    // steering accelerator when one exists, else whatever the proof channel
+    // carries (CPU / None). Bound-bearing consumers below keep `gemm_engine`.
+    // #wallhugger-arming-cost: the take is NON-BLOCKING — while background
+    // arming is still in flight the attack runs un-steered (best-effort by
+    // nature); later take-points below re-take for late pickup.
+    let attack_take = attack_engine_source.take();
+    let attack_engine = attack_take
+        .as_ref()
+        .map(ResolvedAttackEngine::as_gemm)
+        .or(gemm_engine);
     // LEVER 1: fresh IMB early-attempt flag per verify (scopes the in-lane suppression
     // to this instance; no-op today since ny runs one instance per process).
     ny_propagate::imb::reset_early_attempted();
@@ -111,8 +217,10 @@ pub(super) fn verify_multi_clause_disjunction(
 
     let num_clauses = clauses.len() as u64;
 
-    let ledger = PhaseBudgetLedger::new(timeout, config.phase_budget.clone());
-    let overall_timeout = Duration::from_secs(timeout);
+    // Keep all nested work on the caller's authoritative ledger; rebasing it
+    // here would extend the wall-clock deadline and could re-arm an explicitly
+    // disabled MIP reservation.
+    ledger.emit_telemetry("disjunctive-enter");
     let overall_start = Instant::now();
     let overall_deadline = ledger.overall_deadline();
     let timeout_result = || BetaCrownResult {
@@ -227,6 +335,19 @@ pub(super) fn verify_multi_clause_disjunction(
                     }
                 }
         });
+        // #attack-stall (design S4): the adaptive per-INSTANCE cutoff for this
+        // phase. Default-inert — no shipped preset sets the knob — so this is a
+        // no-op until a category arms it behind its own A/B. When armed it can
+        // only end candidate GENERATION early; the reclaimed seconds flow to
+        // BaB automatically because the fast-path re-bases on
+        // `ledger.remaining()`.
+        let stall = super::attack_stall::AttackStallPolicy::from_phase_policy(ledger.policy());
+        if stall.is_armed() {
+            info!(
+                "Adaptive attack stall cutoff ARMED for the disjunctive PGD phase (#attack-stall); \
+                 NY_ATTACK_STALL_CUT=0 disables"
+            );
+        }
         let attack_outcome = run_with_optional_forward_linear_warmer(warmer, || {
             try_disjunctive_sampling_attack_with_config(
                 model_net,
@@ -234,8 +355,9 @@ pub(super) fn verify_multi_clause_disjunction(
                 &clauses,
                 &vnnlib.per_clause_input_bounds,
                 beta_crown_pgd_config(config, attack_restarts, attack_steps, pgd_deadline),
-                gemm_engine,
+                attack_engine,
                 json,
+                stall,
                 Some(&mut attack_feedback),
             )
         });
@@ -293,14 +415,27 @@ pub(super) fn verify_multi_clause_disjunction(
                             Some(ext_deadline),
                         )
                     };
+                    // #wallhugger-arming-cost late pickup: arming may have
+                    // finished during the first attack wave; re-take so the
+                    // extension retry is steered when the engine is now ready.
+                    let ext_take = attack_engine_source.take();
+                    let ext_attack_engine = ext_take
+                        .as_ref()
+                        .map(ResolvedAttackEngine::as_gemm)
+                        .or(attack_engine);
                     match try_disjunctive_sampling_attack_with_config(
                         model_net,
                         input,
                         &clauses,
                         &vnnlib.per_clause_input_bounds,
                         ext_config,
-                        gemm_engine,
+                        ext_attack_engine,
                         json,
+                        // The extension retry keeps the measured #attack-extend
+                        // behavior exactly: it is granted only to an ascent the
+                        // margin gate already called promising, and it is
+                        // reached only when no stall cut fired.
+                        super::attack_stall::AttackStallPolicy::disabled(),
                         None,
                     ) {
                         Ok(Some(result)) => return Ok(result),
@@ -311,6 +446,21 @@ pub(super) fn verify_multi_clause_disjunction(
                             debug!(error = %e, "Attack extension failed, continuing to BaB");
                         }
                     }
+                } else if attack_feedback.stalled_out {
+                    // Flight note only. "The attack stopped improving" is a
+                    // statement about the FALSIFIER, never about the property:
+                    // the bound/BaB phases below run exactly as they would have
+                    // after a finished or deadline-cut attack, over the same
+                    // certified bounds, and remain the only source of a verdict.
+                    info!(
+                        best_margin = attack_feedback.best_margin.unwrap_or(f32::NEG_INFINITY),
+                        restarts_started = attack_feedback.restarts_started,
+                        steps_taken = attack_feedback.steps_taken,
+                        remaining_s = ledger
+                            .remaining()
+                            .map_or(f64::INFINITY, |d| d.as_secs_f64()),
+                        "Attack stall cutoff fired: margin plateaued, remaining attack budget handed to the bound/BaB phases (#attack-stall)"
+                    );
                 } else if attack_feedback.best_margin.is_some() {
                     debug!(
                         best_margin = attack_feedback.best_margin.unwrap_or(f32::NEG_INFINITY),
@@ -324,7 +474,12 @@ pub(super) fn verify_multi_clause_disjunction(
         }
     }
 
-    if timeout > 0 && overall_start.elapsed() >= overall_timeout {
+    // Print-only discriminator for the scored-100 vs 200 ResNet pathology:
+    // this lands after the PGD worker AND the scoped forward-linear warmer
+    // have joined, so its elapsed field prices their complete serial wall tax.
+    ledger.emit_telemetry("disjunctive-after-pgd-and-warmer");
+
+    if overall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Ok(timeout_result());
     }
 
@@ -344,7 +499,7 @@ pub(super) fn verify_multi_clause_disjunction(
             json,
             timeout,
             overall_start,
-            &ledger,
+            ledger,
         );
     }
 
@@ -357,7 +512,7 @@ pub(super) fn verify_multi_clause_disjunction(
         use_relu_split,
         gpu_bab,
     ) {
-        let remaining_timeout = ledger.remaining().unwrap_or(Duration::from_secs(u64::MAX));
+        let remaining_timeout = ledger.remaining_for_engine();
         if timeout > 0 && remaining_timeout.is_zero() {
             return Ok(timeout_result());
         }
@@ -369,11 +524,7 @@ pub(super) fn verify_multi_clause_disjunction(
             remaining_timeout_secs.max(1)
         };
         let remaining_config = BetaCrownConfig {
-            timeout: if timeout == 0 {
-                config.timeout
-            } else {
-                remaining_timeout
-            },
+            timeout: remaining_timeout,
             ..config.clone()
         };
         let remaining_verifier = verifier.with_config_from(remaining_config.clone());
@@ -383,7 +534,9 @@ pub(super) fn verify_multi_clause_disjunction(
             timeout_s = remaining_timeout_secs,
             "Graph multi-objective fast-path: skipping precheck, routing all clauses to BaB"
         );
+        ledger.emit_telemetry("disjunctive-graph-handoff");
 
+        let nested_ledger = ledger.child_with_timeout_secs(remaining_timeout_secs);
         let mut result = super::verify_relational_constraints_impl(
             model_net,
             input,
@@ -397,11 +550,21 @@ pub(super) fn verify_multi_clause_disjunction(
             pgd_steps,
             remaining_timeout_secs,
             gemm_engine,
+            attack_engine_source,
             json,
+            &nested_ledger,
         )?;
         result.time_elapsed = overall_start.elapsed();
 
         // Fallback PGD for no-branchable-neuron BaB results (#3769).
+        // #wallhugger-arming-cost late pickup: this runs after BaB, so arming
+        // has long since settled; re-take rather than reuse the phase-start
+        // resolution.
+        let fallback_take = attack_engine_source.take();
+        let fallback_attack_engine = fallback_take
+            .as_ref()
+            .map(ResolvedAttackEngine::as_gemm)
+            .or(attack_engine);
         if let Some(sat) = try_no_branchable_neuron_pgd_fallback(
             &result,
             pgd_attack,
@@ -412,9 +575,9 @@ pub(super) fn verify_multi_clause_disjunction(
             config,
             pgd_restarts,
             pgd_steps,
-            gemm_engine,
+            fallback_attack_engine,
             json,
-            &ledger,
+            ledger,
         ) {
             return Ok(sat);
         }
@@ -490,8 +653,10 @@ pub(super) fn verify_multi_clause_disjunction(
     // prop_6-class input-box disjunctions) the screen is one cheap CROWN pass
     // per clause and the real solver is the per-clause input-split BaB loop
     // below — a bumped slice starved it, so sequential keeps the policy value.
-    // Saturation-Escape Branching engagement (M1; gate `NY_SAT_ESCAPE_BRANCH=1`,
-    // default OFF ⇒ this whole block is byte-identical). On the mscn `_dual`
+    // Saturation-Escape Branching engagement (M1; preset key
+    // `bab.branching.input_split.sat_escape_branch`, env `NY_SAT_ESCAPE_BRANCH`
+    // overriding either way — default OFF ⇒ this whole block is byte-identical).
+    // On the mscn `_dual`
     // per-clause-box graphs the box-refinement screen structurally CANNOT close
     // the near-closing multi-dim boxes (f64 enclosure below the f32 margin
     // floor), so the 0.95 precheck fraction burns the whole budget on a doomed
@@ -503,12 +668,10 @@ pub(super) fn verify_multi_clause_disjunction(
     // de-saturating dims. Soundness is unchanged: the serial loop still proves
     // HOLD only when every inconclusive disjunct is refuted on its exact box
     // partition (`multi_dim_split_boxes` is a complete cover), identical to today.
-    // Matches `sat_escape::enabled()` in ny-propagate; read directly here to
-    // avoid widening that crate-internal module's visibility across crates.
-    let seb = matches!(
-        std::env::var("NY_SAT_ESCAPE_BRANCH").ok().as_deref(),
-        Some("1")
-    );
+    // `sat_escape_branch_armed` is the ONE resolution point shared with the
+    // ny-propagate SEB scorer gate, so this budget cap and the brancher it
+    // funds can never disagree (#nn4sys-seb-dark).
+    let seb = config.sat_escape_branch_armed();
     let has_per_clause_boxes = vnnlib.per_clause_input_bounds.iter().any(|b| !b.is_empty());
     let precheck_fraction = if has_per_clause_boxes && matches!(model_net, BetaCrownModel::Graph(_))
     {
@@ -520,8 +683,15 @@ pub(super) fn verify_multi_clause_disjunction(
     } else {
         ledger.policy().disjunctive_precheck_fraction
     };
+    // #precheck-abs-cap: the fraction slice, additionally clamped by the
+    // optional ABSOLUTE ceiling `disjunctive_precheck_max_secs`. A FRACTION of
+    // TOTAL granted from NOW bounds nothing relative to what is left (the
+    // attack phase's spend is not deducted) and the work it sizes grows with
+    // the model, so the fraction alone degenerates into a BaB-starvation lever
+    // on large budgets. `None` (every category that does not set the knob)
+    // keeps the pure-fraction deadline byte-identical.
     let precheck_deadline = {
-        let phase = ledger.phase_deadline_from_now(precheck_fraction);
+        let phase = ledger.disjunctive_precheck_deadline(precheck_fraction);
         match (phase, overall_deadline) {
             (Some(p), Some(o)) => Some(p.min(o)),
             (p, o) => p.or(o),
@@ -544,7 +714,7 @@ pub(super) fn verify_multi_clause_disjunction(
         "CROWN precheck phase complete"
     );
 
-    if timeout > 0 && overall_start.elapsed() >= overall_timeout {
+    if overall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Ok(timeout_result());
     }
 
@@ -575,8 +745,12 @@ pub(super) fn verify_multi_clause_disjunction(
     // precheck above (#four-walls).
     let pre_verified = if config.use_alpha_crown {
         let deadline = {
+            // #precheck-abs-cap: same absolute ceiling as the CROWN precheck
+            // above. This phase is a SECOND full fraction slice, so without an
+            // absolute bound the two prechecks together can spend
+            // `2 * fraction * total` after the attack phase already ran.
             let phase =
-                ledger.phase_deadline_from_now(ledger.policy().disjunctive_precheck_fraction);
+                ledger.disjunctive_precheck_deadline(ledger.policy().disjunctive_precheck_fraction);
             match (phase, overall_deadline) {
                 (Some(p), Some(o)) => Some(p.min(o)),
                 (p, o) => p.or(o),
@@ -606,7 +780,7 @@ pub(super) fn verify_multi_clause_disjunction(
     };
     let pre_verified_count = pre_verified.iter().filter(|&&v| v).count();
 
-    if timeout > 0 && overall_start.elapsed() >= overall_timeout {
+    if overall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Ok(timeout_result());
     }
 
@@ -651,8 +825,9 @@ pub(super) fn verify_multi_clause_disjunction(
         pgd_steps,
         timeout,
         gemm_engine,
+        attack_engine_source,
         json,
-        &ledger,
+        ledger,
         overall_start,
     )? {
         return Ok(result);
@@ -675,7 +850,7 @@ pub(super) fn verify_multi_clause_disjunction(
         timeout,
         gemm_engine,
         json,
-        &ledger,
+        ledger,
         overall_start,
     )? {
         return Ok(result);
@@ -699,7 +874,7 @@ pub(super) fn verify_multi_clause_disjunction(
             continue;
         }
 
-        if timeout > 0 && overall_start.elapsed() >= overall_timeout {
+        if overall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             unknown_reason
                 .get_or_insert_with(|| format!("Timeout before clause {} verification", idx + 1));
             break;
@@ -792,12 +967,24 @@ pub(super) fn verify_multi_clause_disjunction(
         // clause checks "can class k beat the true class" individually, but a single global
         // PGD could check all classes at once. Disabling per-clause PGD lets each clause
         // use its full adaptive timeout budget for CROWN + BaB verification.
+        let clause_ledger = ledger.child_with_timeout_secs(clause_timeout);
+        let mut clause_config = config_for_clause_invprop(config, &clause_spec);
+        // Anchor every engine-local deadline to the exact child budget.  In
+        // particular, do not give later clauses a fresh copy of the full
+        // property timeout when their adaptive slice is much smaller.
+        clause_config.timeout = clause_config
+            .timeout
+            .min(clause_ledger.remaining_for_engine());
+        // Keep the config/verifier pair coherent at this dispatch boundary.
+        // Current proof-bearing descendants rebuild from `clause_config`, and
+        // this matching parent also makes future direct verifier reads safe.
+        let clause_verifier = verifier.with_config_from(clause_config.clone());
         let clause_result = super::verify_relational_constraints_impl(
             model_net,
             effective_input,
             &clause_spec,
-            config,
-            verifier,
+            &clause_config,
+            &clause_verifier,
             use_relu_split,
             gpu_bab,
             false, // pgd_attack disabled — per-clause PGD is too expensive
@@ -805,7 +992,9 @@ pub(super) fn verify_multi_clause_disjunction(
             pgd_steps,
             clause_timeout,
             gemm_engine,
+            attack_engine_source,
             json,
+            &clause_ledger,
         )?;
 
         aggregated.domains_explored += clause_result.domains_explored;
@@ -825,7 +1014,7 @@ pub(super) fn verify_multi_clause_disjunction(
                     violation,
                 ));
             }
-            BabVerificationStatus::PotentialViolation => {
+            BabVerificationStatus::PotentialViolation { .. } => {
                 saw_potential = true;
             }
             BabVerificationStatus::Unknown { reason } => {
@@ -842,7 +1031,7 @@ pub(super) fn verify_multi_clause_disjunction(
     }
 
     let final_status = if saw_potential {
-        BabVerificationStatus::PotentialViolation
+        BabVerificationStatus::potential_violation()
     } else if let Some(reason) = unknown_reason {
         BabVerificationStatus::Unknown { reason }
     } else {
@@ -909,6 +1098,7 @@ fn try_box_grouped_disjunctive(
     pgd_steps: usize,
     timeout: u64,
     gemm_engine: Option<&dyn GemmEngine>,
+    attack_engine_source: AttackEngineSource<'_>,
     json: bool,
     ledger: &PhaseBudgetLedger,
     overall_start: Instant,
@@ -994,7 +1184,7 @@ fn try_box_grouped_disjunctive(
     let mut nodes_processed = 0usize;
 
     while let Some((clause_bounds, clause_indices, depth)) = stack.pop() {
-        let remaining = ledger.remaining().unwrap_or(Duration::from_secs(u64::MAX));
+        let remaining = ledger.remaining_for_engine();
         if timeout > 0 && remaining.is_zero() {
             unknown_reason
                 .get_or_insert_with(|| "Timeout before box sub-problem verification".to_string());
@@ -1070,6 +1260,7 @@ fn try_box_grouped_disjunctive(
         // the grouped unified input-split lane (or the serial per-clause loop
         // for shapes the unified gate declines). The global disjunctive PGD
         // already ran over the full hull, so per-group attack stays off.
+        let group_ledger = ledger.child_with_timeout_secs(group_timeout);
         let group_result = verify_multi_clause_disjunction(
             model_net,
             &group_input,
@@ -1083,7 +1274,9 @@ fn try_box_grouped_disjunctive(
             pgd_steps,
             group_timeout,
             gemm_engine,
+            attack_engine_source,
             json,
+            &group_ledger,
         )?;
 
         aggregated.domains_explored += group_result.domains_explored;
@@ -1102,7 +1295,7 @@ fn try_box_grouped_disjunctive(
                     violation,
                 )));
             }
-            BabVerificationStatus::PotentialViolation => {
+            BabVerificationStatus::PotentialViolation { .. } => {
                 saw_potential = true;
             }
             BabVerificationStatus::Unknown { .. } | BabVerificationStatus::Timeout => {
@@ -1132,7 +1325,7 @@ fn try_box_grouped_disjunctive(
     }
 
     let final_status = if saw_potential {
-        BabVerificationStatus::PotentialViolation
+        BabVerificationStatus::potential_violation()
     } else if let Some(reason) = unknown_reason {
         BabVerificationStatus::Unknown { reason }
     } else {

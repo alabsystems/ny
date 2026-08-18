@@ -6,12 +6,15 @@
 
 use ndarray::{Array2, Axis, IxDyn};
 use ny_core::{checked_shape_product, NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    cast_f64_to_f32_down, cast_f64_to_f32_up, next_up_f32, BoundedTensor, RepairStrategy,
+};
 use std::borrow::Cow;
 
 use super::common::{compute_strides, BoundPropagation};
 use crate::LinearBounds;
 
+mod certified_mean;
 mod crown_batched;
 mod cumsum;
 mod cumsum_batched;
@@ -54,7 +57,7 @@ fn resolve_reduction_axes(axes: &[i64], ndim: usize, layer_name: &str) -> Result
 ///
 /// This is the sign witness for the outward directed cast: when every LOWER
 /// term of an output element is >= 0, the true sum/mean there is >= 0, so a
-/// `next_down_f32` result may be clamped at zero without losing soundness.
+/// downward-cast result may be clamped at zero without losing soundness.
 /// Without the clamp, an exactly-zero lower bound (sum of squares, variance)
 /// is pushed one denormal below zero, which spuriously triggers
 /// sqrt-negative-domain handling and fails `>= 0` output specs downstream.
@@ -109,7 +112,7 @@ fn directed_cast_with_sign_witness(
     let lower = ndarray::Zip::from(lower)
         .and(lower_min)
         .map_collect(|&x, &witness| {
-            let stepped = next_down_f32(x as f32);
+            let stepped = cast_f64_to_f32_down(x);
             if witness >= 0.0 && stepped < 0.0 {
                 0.0
             } else {
@@ -119,7 +122,7 @@ fn directed_cast_with_sign_witness(
     let upper = ndarray::Zip::from(upper)
         .and(upper_max)
         .map_collect(|&x, &witness| {
-            let stepped = next_up_f32(x as f32);
+            let stepped = cast_f64_to_f32_up(x);
             if witness <= 0.0 && stepped > 0.0 {
                 0.0
             } else {
@@ -127,6 +130,29 @@ fn directed_cast_with_sign_witness(
             }
         });
     (lower, upper)
+}
+
+/// Reduce `values` along `axis` by a CERTIFIED mean: each output element is the
+/// endpoint of a rigorous enclosure of the exact arithmetic mean of the terms
+/// that fed it (see [`certified_mean::certified_mean_enclosure`]).
+///
+/// `take_lower` selects which endpoint is kept. The mean is monotone in every
+/// argument, so folding the lower array with `take_lower = true` and the upper
+/// array with `take_lower = false` composes correctly across successive axes:
+/// each intermediate stays a valid endpoint of the running interval.
+fn certified_mean_axis(
+    values: &ndarray::ArrayD<f64>,
+    axis: Axis,
+    take_lower: bool,
+) -> ndarray::ArrayD<f64> {
+    values.map_axis(axis, |lane| {
+        let (lo, hi) = certified_mean::certified_mean_enclosure(lane.iter().copied());
+        if take_lower {
+            lo
+        } else {
+            hi
+        }
+    })
 }
 
 /// Shared CROWN backward pass for reduction operations (ReduceMean and ReduceSum).
@@ -333,14 +359,19 @@ impl BoundPropagation for ReduceMeanLayer {
         let ndim = input.lower().ndim();
         let axes = self.resolve_axes(ndim)?;
 
-        // Accumulate the reduction in f64, then directed-cast OUTWARD (lower -> next_down,
-        // upper -> next_up). The f32 `mean_axis` is round-to-NEAREST over axis_len terms, so
-        // it can produce a box that EXCLUDES the true value under cancellation/absorption
-        // (e.g. mean over [2^24, 1] gives 2^24 < true 2^24+1) — unsound as a node bound feeding
-        // ReLU stability. f64 accumulation is exact to ~2^-53 and the directed cast widens past
-        // the f32 grid. (#vnncomp-aw-soundness self-audit; mirrors linear/ibp.rs:157-170.)
-        let mut lower = input.lower().mapv(|x| x as f64);
-        let mut upper = input.upper().mapv(|x| x as f64);
+        // Accumulate the reduction in f64, then directed-cast OUTWARD to f32. The f32
+        // `mean_axis` is round-to-NEAREST over axis_len terms, so it can produce a box that
+        // EXCLUDES the true value under cancellation/absorption (e.g. mean over [2^24, 1]
+        // gives 2^24 < true 2^24+1) — unsound as a node bound feeding ReLU stability.
+        // (#vnncomp-aw-soundness self-audit; mirrors linear/ibp.rs.)
+        //
+        // The f64 accumulation CERTIFIES ITSELF: `certified_mean_axis` charges the exact
+        // TwoSum residual and the exact fma division remainder rather than assuming the
+        // subsequent f32 ULP step covers them. It reports zero width whenever the reduction
+        // was exact — every size-1 axis, which ONNX emits as an identity — so the cast below
+        // is the only place a bound can move, and it moves only when it must.
+        let mut lower = input.lower().mapv(f64::from);
+        let mut upper = input.upper().mapv(f64::from);
 
         // Sort axes in descending order to avoid index shifting issues
         let mut sorted_axes = axes;
@@ -350,19 +381,15 @@ impl BoundPropagation for ReduceMeanLayer {
             // Compute mean along this axis (in f64)
             let axis_obj = Axis(axis);
 
-            let new_lower = lower
-                .mean_axis(axis_obj)
-                .ok_or_else(|| NyError::ShapeMismatch {
+            if lower.len_of(axis_obj) == 0 {
+                return Err(NyError::ShapeMismatch {
                     expected: vec![],
                     got: lower.shape().to_vec(),
-                })?;
+                });
+            }
 
-            let new_upper = upper
-                .mean_axis(axis_obj)
-                .ok_or_else(|| NyError::ShapeMismatch {
-                    expected: vec![],
-                    got: upper.shape().to_vec(),
-                })?;
+            let new_lower = certified_mean_axis(&lower, axis_obj, true);
+            let new_upper = certified_mean_axis(&upper, axis_obj, false);
 
             if self.keepdims {
                 // Insert a dimension of size 1 at the reduced axis

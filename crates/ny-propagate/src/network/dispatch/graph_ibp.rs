@@ -74,9 +74,10 @@ impl GraphNetwork {
     /// Propagate bounds through the graph using IBP with an optional GEMM engine
     /// and a wall-clock deadline.
     ///
-    /// Aborts with `DeadlineExceeded` between nodes once `deadline` passes, so a
-    /// single forward pass over a deep conv DAG cannot overrun the verifier's own
-    /// timeout (#4321). Passing `None` is equivalent to `propagate_ibp_with_engine`.
+    /// Aborts with `DeadlineExceeded` between nodes and cooperatively within
+    /// deadline-aware convolution nodes once `deadline` passes, so a single
+    /// forward pass over a deep conv DAG cannot overrun the verifier's own timeout
+    /// (#4321). Passing `None` is equivalent to `propagate_ibp_with_engine`.
     #[inline]
     pub fn propagate_ibp_with_engine_and_deadline(
         &self,

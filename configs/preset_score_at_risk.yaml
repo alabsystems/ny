@@ -1,0 +1,247 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# SCORE AT RISK — what a shipped preset's benchmark root is WORTH, in banked
+# normalized points, if its models stop loading.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# EIGHT separate commits have silently zeroed a banked category by refusing to
+# load its model. Every one of them was individually CORRECT about ONNX or float
+# semantics. Every one of them shipped without its capability cost measured. The
+# guard that exists to catch this — `preset::model_load_smoke_tests` — was red at
+# origin/main for weeks and every lane classified it "inherited" and moved on.
+#
+# "A test is red" got ignored eight times. "This deletes 100.0 banked points"
+# will not. That number has to be IN the failure message, and the only way it can
+# be in the failure message is if it is recorded here.
+#
+# WHAT `banked_normalized` MEANS
+# ------------------------------
+# The per-benchmark `ny_norm` (regular track) or `meas_norm` (extended track)
+# column of the retroactive scorecard: `min(100, 100 * ny_raw / winner_raw)`. It
+# is the number this repo would LOSE from its total if every instance of that
+# benchmark returned `unknown`, which is exactly what a model-load refusal does.
+#
+# It is a LEDGER reading, not a live re-measurement: the ledger itself may be
+# stale or phantom (see reports/measured*/README.md). That is fine for this
+# file's purpose — it is the stake the repo currently BELIEVES it holds, and a
+# loader gate that zeroes it owes that number either way.
+#
+# PROVENANCE
+# ----------
+# This is the latest checked-in aggregate ledger, not a live score. The official
+# 2025 aggregate displays 1566.9; the pinned category table supports the exact
+# scorer-derived value 1400 + 990/1000*100 + 1290/1900*100 = 1566.894737:
+# https://github.com/VNN-COMP/vnncomp2025_results/blob/ea89fbc2518b6729f17c96eeec22c56c88e496a9/SCORING-ZERO-TOL/latex/scored.tex
+# Thus this ledger's 1406.8 regular snapshot is approximately 160.1 points
+# behind. Later CSV mutations do not change this snapshot until the scorecard is
+# rerun and the values and provenance below are refreshed together.
+#
+# REFRESHED 2026-08-11. The 2026-08-07 / 5382ddb8 snapshot (1394.5 / 477.6 /
+# 1872.1) had gone stale: eight score-affecting bank files changed after it, as
+# docs/CURRENT_STATE_2026-08-10.md recorded. Rerun of the SAME command against
+# the SAME pinned official checkout (ea89fbc2518b) moves five benchmarks, all
+# upward, and every one of them is a category whose bank changed:
+#
+#     cifar100_2024                   43.4 -> 46.5   (+3.1)
+#     ml4acopf_2024                   68.3 -> 71.4   (+3.1)
+#     tinyimagenet_2024               46.9 -> 56.0   (+9.1)
+#     traffic_signs_recognition_2023  90.7 -> 100.0  (+9.3)
+#     vit_2023                          7.2 -> 16.8   (+9.6)
+#
+#     regular 16   1394.5 -> 1406.8   (+12.3)
+#     extended 9    477.6 ->  499.6   (+22.0)
+#     full field   1872.1 -> 1906.4   (+34.3)
+#
+# cgan_2023 and collins_rul_cnn_2022 banks also changed but their normalized
+# values did not move.
+#
+# WHAT THIS NUMBER IS NOT. The scorecard's own raw-verdict model assumes every
+# reported `sat` carries a strictly valid counterexample; it is neither the
+# official ZERO-TOL nor SMALL-TOL scoreboard. The run reports 112 extended sat
+# rows credited WITHOUT validated evidence. Modeled contradictions are 0, but
+# the moat is only falsifiable over 1082/2699 regular and 115/749 extended rows;
+# nn4sys (regular) and vit_2023 / yolo_2023 (extended) are STRUCTURALLY BLIND —
+# no evidence in the field could contradict ny there at all.
+#
+# Counterfactual standing in that field: 3rd of 8, behind alpha_beta_crown
+# (1600.0) and neuralsat (1418.9).
+measured_on: "2026-08-11"
+measured_at_sha: "0cb3005a"
+command: >-
+  python3 scripts/ny_retroactive_scorecard.py
+  --official external_tools/vnncomp2025_results
+  --measured reports/measured --ext-measured reports/measured-ext --extended
+  --results-txt external_tools/vnncomp2025_results/SCORING-ZERO-TOL/results.txt
+totals:
+  regular_16: 1406.8
+  extended_9: 499.6
+  full_field_25: 1906.4
+
+# ROOTS
+# -----
+# Keyed by the repo-relative directory a shipped preset's `general.root_path`
+# resolves to — mechanical, and shared automatically by every canary/gpu_bab
+# variant that reuses its category's root.
+#
+#   benchmark          the scorecard row this root's instances are banked under
+#   track              regular | extended | unscored
+#   banked_normalized  the stake, in normalized points
+#   note               anything that makes the number mean less than it looks
+roots:
+  # ---- vnncomp2025 (the scored roots) -------------------------------------
+  - root: benchmarks/vnncomp2025/benchmarks/acasxu_2023
+    benchmark: acasxu_2023
+    track: regular
+    banked_normalized: 98.4
+  - root: benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023
+    benchmark: cctsdb_yolo_2023
+    track: extended
+    banked_normalized: 100.0
+  - root: benchmarks/vnncomp2025/benchmarks/cersyve
+    benchmark: cersyve
+    track: regular
+    banked_normalized: 100.0
+  - root: benchmarks/vnncomp2025/benchmarks/cgan_2023
+    benchmark: cgan_2023
+    track: regular
+    banked_normalized: 57.1
+  - root: benchmarks/vnncomp2025/benchmarks/cifar100_2024
+    benchmark: cifar100_2024
+    track: regular
+    banked_normalized: 46.5
+  - root: benchmarks/vnncomp2025/benchmarks/collins_rul_cnn_2022
+    benchmark: collins_rul_cnn_2022
+    track: regular
+    banked_normalized: 87.1
+  - root: benchmarks/vnncomp2025/benchmarks/cora_2024
+    benchmark: cora_2024
+    track: regular
+    banked_normalized: 96.7
+  - root: benchmarks/vnncomp2025/benchmarks/dist_shift_2023
+    benchmark: dist_shift_2023
+    track: regular
+    banked_normalized: 98.6
+  - root: benchmarks/vnncomp2025/benchmarks/linearizenn_2024
+    benchmark: linearizenn_2024
+    track: regular
+    banked_normalized: 100.0
+  - root: benchmarks/vnncomp2025/benchmarks/lsnc_relu
+    benchmark: lsnc_relu
+    track: extended
+    banked_normalized: 13.8
+  - root: benchmarks/vnncomp2025/benchmarks/malbeware
+    benchmark: malbeware
+    track: regular
+    banked_normalized: 94.7
+  - root: benchmarks/vnncomp2025/benchmarks/metaroom_2023
+    benchmark: metaroom_2023
+    track: regular
+    banked_normalized: 99.0
+  - root: benchmarks/vnncomp2025/benchmarks/ml4acopf_2024
+    benchmark: ml4acopf_2024
+    track: extended
+    banked_normalized: 71.4
+  - root: benchmarks/vnncomp2025/benchmarks/nn4sys
+    benchmark: nn4sys
+    track: regular
+    banked_normalized: 83.0
+  - root: benchmarks/vnncomp2025/benchmarks/relusplitter
+    benchmark: relusplitter
+    track: extended
+    banked_normalized: 19.9
+  - root: benchmarks/vnncomp2025/benchmarks/safenlp_2024
+    benchmark: safenlp_2024
+    track: regular
+    banked_normalized: 89.6
+  - root: benchmarks/vnncomp2025/benchmarks/sat_relu
+    benchmark: sat_relu
+    track: regular
+    banked_normalized: 100.0
+  - root: benchmarks/vnncomp2025/benchmarks/soundnessbench
+    benchmark: soundnessbench
+    track: regular
+    banked_normalized: 100.0
+    note: >-
+      also the SOUNDNESS GATE (model_0/1/2 must return sat,sat,sat); a load
+      refusal here silently disarms the gate as well as zeroing the score.
+  - root: benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024
+    benchmark: tinyimagenet_2024
+    track: regular
+    banked_normalized: 56.0
+  - root: benchmarks/vnncomp2025/benchmarks/tllverifybench_2023
+    benchmark: tllverifybench_2023
+    track: regular
+    banked_normalized: 100.0
+  - root: benchmarks/vnncomp2025/benchmarks/traffic_signs_recognition_2023
+    benchmark: traffic_signs_recognition_2023
+    track: extended
+    banked_normalized: 100.0
+  - root: benchmarks/vnncomp2025/benchmarks/vggnet16_2022
+    benchmark: vggnet16_2022
+    track: extended
+    banked_normalized: 77.8
+  - root: benchmarks/vnncomp2025/benchmarks/vit_2023
+    benchmark: vit_2023
+    track: extended
+    banked_normalized: 16.8
+  - root: benchmarks/vnncomp2025/benchmarks/yolo_2023
+    benchmark: yolo_2023
+    track: extended
+    banked_normalized: 0.0
+    note: >-
+      0.0 is measured, not unknown: 0/72 sampled, the category is dead on the
+      CROWN axis (raw root bound 3.6e8x wider than IBP). A load refusal here
+      costs nothing TODAY, which is exactly why it must still be recorded —
+      the moment the category is recovered the stake stops being zero.
+
+  # ---- vnncomp2024 (alternate-year roots for already-scored benchmarks) ----
+  - root: benchmarks/vnncomp2024/benchmarks/cifar100
+    benchmark: cifar100_2024
+    track: regular
+    banked_normalized: 46.5
+    note: >-
+      alternate-year root for the SAME scored benchmark; the banked ledger was
+      measured through the vnncomp2025 root. Recorded at the shared benchmark's
+      stake because a loader gate that refuses this graph refuses the other one.
+  - root: benchmarks/vnncomp2024/benchmarks/ml4acopf_2024
+    benchmark: ml4acopf_2024
+    track: extended
+    banked_normalized: 71.4
+    note: alternate-year root for the same scored benchmark.
+  - root: benchmarks/vnncomp2024/benchmarks/yolo_2023
+    benchmark: yolo_2023
+    track: extended
+    banked_normalized: 0.0
+    note: alternate-year root for the same scored benchmark (measured 0.0).
+
+  # ---- vnncomp2026 --------------------------------------------------------
+  - root: benchmarks/vnncomp2026/benchmarks/collins_aerospace_benchmark/2.0
+    benchmark: collins_aerospace_benchmark
+    track: extended
+    banked_normalized: 100.0
+    note: >-
+      this IS the scored root for the extended collins row — the 2026 repository
+      is where its instances live.
+  - root: benchmarks/vnncomp2026/benchmarks/safenlp_2024/2.0
+    benchmark: safenlp_2024
+    track: regular
+    banked_normalized: 89.6
+    note: alternate-year root for the same scored benchmark.
+  - root: benchmarks/vnncomp2026/benchmarks/cgan2026/1.0
+    benchmark: cgan2026
+    track: unscored
+    banked_normalized: 0.0
+    note: >-
+      2026-only benchmark with no row on the 25-track board and no ledger under
+      reports/. Stake is 0.0 TODAY; it becomes non-zero the moment the category
+      is swept, and the entry exists so that sweep cannot happen against a
+      silently unloadable model.
+  - root: benchmarks/vnncomp2026/benchmarks/challenging_certified_training_2026/2.0
+    benchmark: challenging_certified_training_2026
+    track: unscored
+    banked_normalized: 0.0
+    note: >-
+      2026-only benchmark, no board row, no ledger. Same reasoning as cgan2026.

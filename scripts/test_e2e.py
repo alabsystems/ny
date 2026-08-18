@@ -48,7 +48,7 @@ NY_BIN = REPO_ROOT / "target" / "release" / "ny"
 class TestResult:
     """Result of a single test."""
     name: str
-    passed: bool
+    status: str
     duration_ms: float
     message: str
     stdout: str = ""
@@ -62,7 +62,7 @@ class EndToEndTests:
         self.verbose = verbose
         self.results: list[TestResult] = []
 
-    def run_ny(self, args: list[str], timeout: int = 60) -> tuple[int, str, str]:
+    def run_ny(self, args: list[str], timeout: int = 60) -> tuple[int, str, str, float]:
         """Run ny CLI command."""
         cmd = [str(NY_BIN)] + args
         start = time.time()
@@ -80,14 +80,14 @@ class EndToEndTests:
         return result.returncode, result.stdout, result.stderr, duration
 
     def add_result(self, name: str, passed: bool, duration_ms: float, message: str,
-                   stdout: str = "", stderr: str = ""):
+                   stdout: str = "", stderr: str = "", *, skipped: bool = False):
         """Record a test result."""
-        result = TestResult(name, passed, duration_ms, message, stdout, stderr)
+        status = "SKIP" if skipped else ("PASS" if passed else "FAIL")
+        result = TestResult(name, status, duration_ms, message, stdout, stderr)
         self.results.append(result)
 
         if self.verbose:
-            status = "PASS" if passed else "FAIL"
-            print(f"  [{status}] {name}: {message} ({duration_ms:.1f}ms)")
+            print(f"  [{result.status}] {name}: {message} ({duration_ms:.1f}ms)")
 
     # ========================================================================
     # Test Group 1: CLI Commands Work
@@ -276,9 +276,11 @@ class EndToEndTests:
             "diff", str(model_a), str(model_b)
         ])
 
-        # Should either fail or report a mismatch
+        # The command must fail specifically because the input dimensions differ.
+        # An unrelated invocation error is not evidence that shape checking worked.
         output = stdout + stderr
-        passed = rc != 0 or "shape" in output.lower() or "mismatch" in output.lower() or "different" in output.lower()
+        mismatch_terms = ("shape", "mismatch", "dimension", "expected")
+        passed = rc != 0 and any(term in output.lower() for term in mismatch_terms)
         self.add_result(
             "error_shape_mismatch",
             passed,
@@ -296,9 +298,10 @@ class EndToEndTests:
         if not HAS_TORCH or not HAS_ONNX:
             self.add_result(
                 "pytorch_onnx_workflow",
-                True,
+                False,
                 0,
-                "SKIPPED: torch/onnx not available"
+                "torch/onnx not available",
+                skipped=True,
             )
             return
 
@@ -369,9 +372,10 @@ class EndToEndTests:
         if not HAS_TORCH or not HAS_ONNX:
             self.add_result(
                 "pytorch_perturbed_diff",
-                True,
+                False,
                 0,
-                "SKIPPED: torch/onnx not available"
+                "torch/onnx not available",
+                skipped=True,
             )
             return
 
@@ -418,7 +422,7 @@ class EndToEndTests:
             ])
 
             duration = (time.time() - start) * 1000
-            passed = "DIVERGENT" in stdout or rc != 0
+            passed = rc == 0 and "DIVERGENT" in stdout
             self.add_result(
                 "pytorch_perturbed_diff",
                 passed,
@@ -451,7 +455,10 @@ class EndToEndTests:
             "verify", str(model), "--epsilon", "0.01", "--method", "alpha"
         ])
 
-        passed = rc == 0
+        output = stdout + stderr
+        passed = rc == 0 and any(
+            status in output.lower() for status in ("verified", "unknown", "violated")
+        )
         self.add_result(
             "readme_verify_example",
             passed,
@@ -494,21 +501,36 @@ class EndToEndTests:
         """Test verification on transformer block model."""
         model = TEST_MODELS_DIR / "transformer_block.onnx"
         if not model.exists():
-            self.add_result("transformer_block_verify", True, 0, "SKIPPED: model not found")
+            self.add_result("transformer_block_verify", False, 0, "required model not found")
             return
 
         rc, stdout, stderr, duration = self.run_ny([
-            "verify", str(model), "--epsilon", "0.001", "--method", "ibp"
+            "verify", str(model), "--epsilon", "0.001", "--method", "ibp",
+            "--allow-unknown",
         ])
 
         output = stdout + stderr
 
         # Transformer models use LayerNorm which has unsupported ops (Div, Pow, Sub, ReduceMean)
         # This causes shape mismatches - a known limitation
-        # The test passes if: runs successfully, reports overflow, reports unknown, or has known op limitation
+        # Known unsupported-operation failures are explicitly non-gating.
         has_unsupported_ops = "shape mismatch" in output.lower() or "unsupported" in output.lower()
-        passed = rc == 0 or "overflow" in output.lower() or "unknown" in output.lower() or has_unsupported_ops
-        msg = "runs (or has expected limitation)" if passed else f"failed: {stderr[:100]}"
+        if rc != 0 and has_unsupported_ops:
+            self.add_result(
+                "transformer_block_verify",
+                False,
+                duration,
+                "known unsupported transformer operation",
+                stdout,
+                stderr,
+                skipped=True,
+            )
+            return
+
+        passed = rc == 0 and any(
+            status in output.lower() for status in ("verified", "unknown", "violated")
+        )
+        msg = "verification completed" if passed else f"failed: {(stderr or stdout)[:100]}"
         self.add_result(
             "transformer_block_verify",
             passed,
@@ -521,7 +543,7 @@ class EndToEndTests:
         """Test diff on attention model."""
         model = TEST_MODELS_DIR / "simple_attention.onnx"
         if not model.exists():
-            self.add_result("attention_model_diff", True, 0, "SKIPPED: model not found")
+            self.add_result("attention_model_diff", False, 0, "required model not found")
             return
 
         input_file = self._create_test_input((1, 2, 4))  # batch, seq, dim
@@ -607,26 +629,27 @@ class EndToEndTests:
         print("SUMMARY")
         print("=" * 70)
 
-        passed = sum(1 for r in self.results if r.passed)
+        passed = sum(1 for r in self.results if r.status == "PASS")
+        failed = sum(1 for r in self.results if r.status == "FAIL")
+        skipped = sum(1 for r in self.results if r.status == "SKIP")
         total = len(self.results)
-        skipped = sum(1 for r in self.results if "SKIPPED" in r.message)
 
         print(f"\n{'Test':<40} {'Status':<10} {'Time (ms)':<12}")
         print("-" * 70)
 
         for r in self.results:
-            status = "PASS" if r.passed else "FAIL"
-            if "SKIPPED" in r.message:
-                status = "SKIP"
-            print(f"{r.name:<40} {status:<10} {r.duration_ms:>8.1f}")
+            print(f"{r.name:<40} {r.status:<10} {r.duration_ms:>8.1f}")
 
         print("-" * 70)
-        print(f"\nTotal: {passed}/{total} passed, {skipped} skipped")
+        print(f"\nTotal: {passed} passed, {failed} failed, {skipped} skipped ({total} total)")
 
-        if passed == total:
-            print("\nAll tests PASSED!")
+        if failed == 0:
+            if skipped:
+                print("\nAll runnable tests PASSED; skipped tests were not counted as passes.")
+            else:
+                print("\nAll tests PASSED!")
             return 0
-        print(f"\n{total - passed} tests FAILED")
+        print(f"\n{failed} tests FAILED")
         return 1
 
 
@@ -640,6 +663,24 @@ def main():
     if not NY_BIN.exists():
         print(f"ERROR: ny binary not found at {NY_BIN}")
         print("Run: cargo build --release")
+        return 1
+
+    required_models = (
+        "simple_mlp.onnx",
+        "single_linear.onnx",
+        "transformer_mlp.onnx",
+        "transformer_block.onnx",
+        "simple_attention.onnx",
+    )
+    missing_models = [
+        str(TEST_MODELS_DIR / name)
+        for name in required_models
+        if not (TEST_MODELS_DIR / name).is_file()
+    ]
+    if missing_models:
+        print("ERROR: required tracked test fixtures are missing:")
+        for path in missing_models:
+            print(f"  - {path}")
         return 1
 
     tests = EndToEndTests(verbose=args.verbose)

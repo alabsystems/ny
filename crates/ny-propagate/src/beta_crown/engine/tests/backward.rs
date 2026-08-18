@@ -2,18 +2,23 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for backward.rs, specifically relu_backward_with_alpha_beta_arelu.
-//! Part of #1520: Add unit tests for arelu_cut integration.
+//! Unit tests for the beta-CROWN backward passes.
+//!
+//! The `arelu_cut` variant these originally targeted has been deleted (it was
+//! dead behind `BetaCrownConfig::cut_proof_authority_enabled()`). The cases
+//! that ran it with an EMPTY cut state were exercising arithmetic identical to
+//! `relu_backward_with_alpha_beta`, so they were retargeted at that live
+//! function rather than dropped; the cases that asserted cut arithmetic went
+//! with the code.
 
 use super::prelude::*;
-use crate::beta_crown::state::{compute_arelu_cut_slope_bias, AreluState};
 use crate::tests::assert_linear_bounds_close;
 
-/// Test relu_backward_with_alpha_beta_arelu on stable positive neurons.
-/// Stable neurons should have slope=1, intercept=0 and arelu_cut should not apply.
+/// Test relu_backward_with_alpha_beta on stable positive neurons.
+/// Stable neurons should have slope=1, intercept=0.
 #[ntest::timeout(5000)]
 #[test]
-fn test_arelu_backward_stable_positive() {
+fn test_relu_backward_alpha_beta_stable_positive() {
     // Network with one ReLU layer
     let w1 = arr2(&[[1.0, 0.5], [-0.5, 1.0]]);
     let linear1 = LinearLayer::new(w1, None).unwrap();
@@ -48,12 +53,11 @@ fn test_arelu_backward_stable_positive() {
         "Expected stable positive neurons"
     );
 
-    // Empty state objects (no constraints, no arelu cuts)
+    // Empty state objects (no constraints)
     let history = SplitHistory::new();
     let beta_state = BetaState::empty();
     let alpha_state =
         DomainAlphaState::from_layer_bounds_and_constraints(&network, &layer_bounds, &history);
-    let arelu_state = AreluState::empty();
 
     // Create verifier and use its backward method
     let config = BetaCrownConfig::default();
@@ -62,14 +66,13 @@ fn test_arelu_backward_stable_positive() {
     // Create output bounds (identity matrix for 2 outputs)
     let output_bounds = LinearBounds::identity(2);
 
-    // Call relu_backward_with_alpha_beta_arelu through the verifier
-    let result = verifier.relu_backward_with_alpha_beta_arelu(
+    // Call relu_backward_with_alpha_beta through the verifier
+    let result = verifier.relu_backward_with_alpha_beta(
         &output_bounds,
         pre_relu,
         None,
         &beta_state,
         &alpha_state,
-        &arelu_state,
         1, // ReLU is layer 1
     );
 
@@ -106,11 +109,11 @@ fn test_arelu_backward_stable_positive() {
     }
 }
 
-/// Test relu_backward_with_alpha_beta_arelu on stable negative neurons.
+/// Test relu_backward_with_alpha_beta on stable negative neurons.
 /// Stable neurons should have slope=0, intercept=0.
 #[ntest::timeout(5000)]
 #[test]
-fn test_arelu_backward_stable_negative() {
+fn test_relu_backward_alpha_beta_stable_negative() {
     let w1 = arr2(&[[1.0, 0.5], [-0.5, 1.0]]);
     let linear1 = LinearLayer::new(w1, None).unwrap();
 
@@ -149,20 +152,18 @@ fn test_arelu_backward_stable_negative() {
     let beta_state = BetaState::empty();
     let alpha_state =
         DomainAlphaState::from_layer_bounds_and_constraints(&network, &layer_bounds, &history);
-    let arelu_state = AreluState::empty();
 
     let config = BetaCrownConfig::default();
     let verifier = BetaCrownVerifier::new(config);
 
     let output_bounds = LinearBounds::identity(2);
 
-    let result = verifier.relu_backward_with_alpha_beta_arelu(
+    let result = verifier.relu_backward_with_alpha_beta(
         &output_bounds,
         pre_relu,
         None,
         &beta_state,
         &alpha_state,
-        &arelu_state,
         1,
     );
 
@@ -195,11 +196,11 @@ fn test_arelu_backward_stable_negative() {
     }
 }
 
-/// Test relu_backward_with_alpha_beta_arelu on unstable neurons without arelu_cut.
+/// Test relu_backward_with_alpha_beta on unstable neurons.
 /// Unstable neurons use alpha for lower bound and triangle relaxation for upper.
 #[ntest::timeout(5000)]
 #[test]
-fn test_arelu_backward_unstable_no_arelu() {
+fn test_relu_backward_alpha_beta_unstable() {
     let w1 = arr2(&[[1.0, 0.0], [0.0, 1.0]]); // Identity
     let linear1 = LinearLayer::new(w1, None).unwrap();
 
@@ -229,7 +230,6 @@ fn test_arelu_backward_unstable_no_arelu() {
     let beta_state = BetaState::empty();
     let alpha_state =
         DomainAlphaState::from_layer_bounds_and_constraints(&network, &layer_bounds, &history);
-    let arelu_state = AreluState::empty();
 
     let config = BetaCrownConfig::default();
     let verifier = BetaCrownVerifier::new(config);
@@ -237,13 +237,12 @@ fn test_arelu_backward_unstable_no_arelu() {
     // Use identity output bounds
     let output_bounds = LinearBounds::identity(2);
 
-    let result = verifier.relu_backward_with_alpha_beta_arelu(
+    let result = verifier.relu_backward_with_alpha_beta(
         &output_bounds,
         pre_relu,
         None,
         &beta_state,
         &alpha_state,
-        &arelu_state,
         1,
     );
 
@@ -284,170 +283,11 @@ fn test_arelu_backward_unstable_no_arelu() {
     }
 }
 
-/// Test compute_arelu_cut_slope_bias helper function directly.
-/// This is the core computation that tightens upper bound relaxation.
+/// Test that a branching constraint overrides the unstable relaxation.
+/// Constrained neurons should use fixed slopes regardless of their bounds.
 #[ntest::timeout(5000)]
 #[test]
-fn test_compute_arelu_cut_slope_bias_basic() {
-    let l = -1.0_f32;
-    let u = 2.0_f32;
-
-    // Standard upper slope without arelu_cut: u/(u-l) = 2/3 ≈ 0.667
-    let standard_slope = u / (u - l);
-
-    // Test with a_coeff < 0 and small beta_mm_coeff
-    // When beta_mm_coeff is small, slope should be close to standard
-    let a_coeff = -1.0_f32;
-    let beta_mm_coeff = 0.0_f32;
-    let (slope, lbias) = compute_arelu_cut_slope_bias(l, u, a_coeff, beta_mm_coeff);
-
-    println!(
-        "arelu_cut(l={}, u={}, a={}, beta_mm={}): slope={:.4}, lbias={:.4}",
-        l, u, a_coeff, beta_mm_coeff, slope, lbias
-    );
-    println!("Standard upper slope: {:.4}", standard_slope);
-
-    // With beta_mm_coeff=0, behavior matches standard relaxation
-    assert!(
-        (slope - standard_slope).abs() < 1e-5,
-        "With beta_mm=0, slope should match standard: {} vs {}",
-        slope,
-        standard_slope
-    );
-}
-
-/// Test that arelu_cut produces tighter bounds (lower slope) with negative beta_mm_coeff.
-///
-/// The arelu_cut formula is: pi = (u * nu_hat_pos + beta_mm_coeff) / (u - l)
-/// For tightening (smaller slope than standard u/(u-l)), we need beta_mm_coeff < 0.
-///
-/// Positive beta_mm_coeff increases the slope (loosens the bound).
-/// Negative beta_mm_coeff decreases the slope (tightens the bound).
-#[ntest::timeout(5000)]
-#[test]
-fn test_compute_arelu_cut_tightening() {
-    let l = -1.0_f32;
-    let u = 2.0_f32;
-    let a_coeff = -1.0_f32;
-
-    let standard_slope = u / (u - l);
-
-    // With NEGATIVE beta_mm_coeff, the slope should be reduced (tighter bound)
-    // Using -0.5 makes pi = (2.0 * 1.0 - 0.5) / 3.0 = 0.5, so slope = 0.5
-    let beta_mm_coeff = -0.5_f32;
-    let (slope_with_cut, _lbias) = compute_arelu_cut_slope_bias(l, u, a_coeff, beta_mm_coeff);
-
-    println!(
-        "Standard slope: {:.4}, arelu_cut slope: {:.4}",
-        standard_slope, slope_with_cut
-    );
-
-    // arelu_cut with negative coefficient should provide tighter (smaller or equal) slope
-    assert!(
-        slope_with_cut <= standard_slope + 1e-6,
-        "arelu_cut with negative coeff should not increase slope: {} > {}",
-        slope_with_cut,
-        standard_slope
-    );
-
-    // Also verify positive coefficient increases slope (loosens bound)
-    let positive_coeff = 0.5_f32;
-    let (loose_slope, _) = compute_arelu_cut_slope_bias(l, u, a_coeff, positive_coeff);
-    assert!(
-        loose_slope >= standard_slope - 1e-6,
-        "arelu_cut with positive coeff should not decrease slope: {} < {}",
-        loose_slope,
-        standard_slope
-    );
-}
-
-/// Test relu_backward_with_alpha_beta_arelu with arelu_cut enabled.
-/// This tests that the backward pass integrates with arelu_cut coefficients correctly.
-///
-/// Note: This test uses a positive coefficient which loosens the bound.
-/// For tightening behavior, use negative coefficients (see test_compute_arelu_cut_tightening).
-#[ntest::timeout(5000)]
-#[test]
-fn test_arelu_backward_with_cuts() {
-    let w1 = arr2(&[[1.0, 0.0], [0.0, 1.0]]); // Identity
-    let linear1 = LinearLayer::new(w1, None).unwrap();
-
-    let mut network = Network::new();
-    network.add_layer(Layer::Linear(linear1));
-    network.add_layer(Layer::ReLU(ReLULayer));
-
-    // Unstable neurons with l=-1, u=2
-    let input =
-        BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[2.0, 2.0]).into_dyn()).unwrap();
-
-    let layer_bounds: Vec<Arc<BoundedTensor>> = network
-        .collect_ibp_bounds(&input)
-        .unwrap()
-        .into_iter()
-        .map(Arc::new)
-        .collect();
-
-    let pre_relu = &layer_bounds[0];
-
-    let history = SplitHistory::new();
-    let beta_state = BetaState::empty();
-    let alpha_state =
-        DomainAlphaState::from_layer_bounds_and_constraints(&network, &layer_bounds, &history);
-
-    // Create arelu_state with cut coefficient for neuron 0
-    // Positive coefficient loosens bound; negative would tighten it
-    let mut arelu_state = AreluState::empty();
-    arelu_state.set_weighted_coeff(1, 0, 0.5); // layer_idx=1 (ReLU), neuron_idx=0
-
-    let config = BetaCrownConfig::default();
-    let verifier = BetaCrownVerifier::new(config);
-
-    // Output bounds with negative A coefficient to trigger arelu_cut
-    // When la_ij < 0, the upper bound relaxation is used, and arelu_cut applies
-    let mut lower_a = Array2::<f32>::eye(2);
-    lower_a[[0, 0]] = -1.0; // Negative coefficient for neuron 0
-    let output_bounds = LinearBounds {
-        lower_a: lower_a.clone(),
-        lower_b: Array1::zeros(2),
-        upper_a: Array2::eye(2),
-        upper_b: Array1::zeros(2),
-        lower_a_err: None,
-        upper_a_err: None,
-    };
-
-    let result = verifier.relu_backward_with_alpha_beta_arelu(
-        &output_bounds,
-        pre_relu,
-        None,
-        &beta_state,
-        &alpha_state,
-        &arelu_state,
-        1,
-    );
-
-    let new_bounds = result.expect("Should succeed");
-
-    // Neuron 0 should have arelu_cut applied (since we set coefficient and la < 0)
-    // The exact values depend on the arelu_cut formula
-    println!(
-        "With arelu_cut: lower_a[0,0]={:.4}, lower_b[0]={:.4}",
-        new_bounds.lower_a[[0, 0]],
-        new_bounds.lower_b[0]
-    );
-
-    // Just verify the computation completes without error
-    // The correctness of arelu_cut is tested in compute_arelu_cut_slope_bias tests
-    assert!(
-        new_bounds.lower_a[[0, 0]].is_finite(),
-        "Result should be finite"
-    );
-}
-
-/// Test that constraints override arelu_cut behavior.
-/// Constrained neurons should use fixed slopes regardless of arelu_state.
-#[ntest::timeout(5000)]
-#[test]
-fn test_arelu_backward_constrained_neurons() {
+fn test_relu_backward_alpha_beta_constrained_neurons() {
     let w1 = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
     let linear1 = LinearLayer::new(w1, None).unwrap();
 
@@ -473,10 +313,6 @@ fn test_arelu_backward_constrained_neurons() {
     let alpha_state =
         DomainAlphaState::from_layer_bounds_and_constraints(&network, &layer_bounds, &history);
 
-    // Add arelu_state with cuts
-    let mut arelu_state = AreluState::empty();
-    arelu_state.set_weighted_coeff(1, 0, 0.5);
-
     let config = BetaCrownConfig::default();
     let verifier = BetaCrownVerifier::new(config);
 
@@ -486,13 +322,12 @@ fn test_arelu_backward_constrained_neurons() {
     let mut constraints = std::collections::HashMap::new();
     constraints.insert(0_usize, true); // Neuron 0 is active
 
-    let result = verifier.relu_backward_with_alpha_beta_arelu(
+    let result = verifier.relu_backward_with_alpha_beta(
         &output_bounds,
         pre_relu,
         Some(&constraints),
         &beta_state,
         &alpha_state,
-        &arelu_state,
         1,
     );
 
@@ -688,50 +523,6 @@ fn test_non_finite_beta_alpha_beta_2826() {
     }
 }
 
-/// #2826 regression: relu_backward_with_alpha_beta_arelu must skip non-finite β.
-#[ntest::timeout(5000)]
-#[test]
-fn test_non_finite_beta_alpha_beta_arelu_2826() {
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
-    let output_bounds = LinearBounds::identity(2);
-    let arelu_state = AreluState::empty();
-    for is_active in [true, false] {
-        let label = if is_active { "+inf" } else { "-inf" };
-        let (pre_relu, alpha, inf_beta) = non_finite_beta_setup(is_active);
-        let mut zero_beta = inf_beta.clone();
-        zero_beta.entries[0].value = 0.0;
-        let baseline = verifier
-            .relu_backward_with_alpha_beta_arelu(
-                &output_bounds,
-                pre_relu.as_ref(),
-                None,
-                &zero_beta,
-                &alpha,
-                &arelu_state,
-                1,
-            )
-            .expect("zero-beta should succeed");
-        let result = verifier
-            .relu_backward_with_alpha_beta_arelu(
-                &output_bounds,
-                pre_relu.as_ref(),
-                None,
-                &inf_beta,
-                &alpha,
-                &arelu_state,
-                1,
-            )
-            .expect("non-finite beta should succeed");
-        assert_linear_bounds_close(
-            &result,
-            &baseline,
-            1e-6,
-            &format!("alpha_beta_arelu ({label})"),
-        );
-        assert_bounds_finite(&result, &format!("alpha_beta_arelu ({label})"));
-    }
-}
-
 /// #2826 regression: relu_backward_with_beta must skip non-finite β.
 #[ntest::timeout(5000)]
 #[test]
@@ -846,32 +637,6 @@ fn test_relu_backward_alpha_beta_near_zero_width_1645() {
     assert_bounds_finite(&bounds, "relu_backward_with_alpha_beta");
 }
 
-/// #1645 regression: relu_backward_with_alpha_beta_arelu with near-zero-width interval.
-#[ntest::timeout(5000)]
-#[test]
-fn test_relu_backward_alpha_beta_arelu_near_zero_width_1645() {
-    let (_network, layer_bounds, alpha_state, beta_state) = near_zero_width_setup();
-    let pre_relu = &layer_bounds[0];
-    let arelu_state = AreluState::empty();
-
-    let config = BetaCrownConfig::default();
-    let verifier = BetaCrownVerifier::new(config);
-    let output_bounds = LinearBounds::identity(2);
-
-    let result = verifier.relu_backward_with_alpha_beta_arelu(
-        &output_bounds,
-        pre_relu,
-        None,
-        &beta_state,
-        &alpha_state,
-        &arelu_state,
-        1,
-    );
-
-    let bounds = result.expect("Should succeed with near-zero-width interval");
-    assert_bounds_finite(&bounds, "relu_backward_with_alpha_beta_arelu");
-}
-
 /// #1645 regression: relu_backward_with_beta with near-zero-width interval.
 #[ntest::timeout(5000)]
 #[test]
@@ -968,16 +733,15 @@ fn test_relu_backward_alpha_beta_nan_pre_bounds_2805() {
     }
 }
 
-/// #2805 regression: arelu-enhanced ReLU backward must bypass arelu_cut on NaN bounds.
+/// #2805 regression: NaN pre-activation bounds must fail closed on the NEGATIVE
+/// `la_ij` branch too. The sibling test above uses `LinearBounds::identity`, so
+/// it only drives `la_ij >= 0`; this one covers `la_ij < 0`, where the
+/// fail-closed `+inf` upper intercept has to flip the lower bias to `-inf`.
 #[ntest::timeout(5000)]
 #[test]
-fn test_relu_backward_alpha_beta_arelu_nan_pre_bounds_2805() {
+fn test_relu_backward_alpha_beta_nan_pre_bounds_negative_coeffs_2805() {
     let (_network, layer_bounds, alpha_state, beta_state) = nan_bounds_setup();
     let pre_relu = &layer_bounds[0];
-
-    let mut arelu_state = AreluState::empty();
-    arelu_state.set_weighted_coeff(1, 0, 0.5);
-    arelu_state.set_weighted_coeff(1, 1, -0.25);
 
     let config = BetaCrownConfig::default();
     let verifier = BetaCrownVerifier::new(config);
@@ -992,18 +756,20 @@ fn test_relu_backward_alpha_beta_arelu_nan_pre_bounds_2805() {
         upper_a_err: None,
     };
 
-    let result = verifier.relu_backward_with_alpha_beta_arelu(
+    let result = verifier.relu_backward_with_alpha_beta(
         &output_bounds,
         pre_relu,
         None,
         &beta_state,
         &alpha_state,
-        &arelu_state,
         1,
     );
 
     let bounds = result.expect("NaN pre-bounds should fail closed, not error");
-    assert_bounds_no_nan(&bounds, "relu_backward_with_alpha_beta_arelu NaN guard");
+    assert_bounds_no_nan(
+        &bounds,
+        "relu_backward_with_alpha_beta NaN guard (negative coeffs)",
+    );
 
     for (i, v) in bounds.lower_b.iter().enumerate() {
         assert!(
@@ -1126,7 +892,6 @@ fn test_propagate_layer_backward_alpha_beta_dispatches_sigmoid_1840() {
             None,
             &beta_state,
             &alpha_state,
-            None,
             0,
             None,
         )
@@ -1363,37 +1128,10 @@ fn setup_f64_bias_accumulation_scenario(n: usize) -> (BoundedTensor, LinearBound
     (pre_bounds, output_bounds, network)
 }
 
-/// Regression test for #3343: arelu code path (empty AreluState, falls through
-/// to standard upper bound). Reference: auto_LiRPA/operators/cut_ops.py:298-491
-#[ntest::timeout(5000)]
-#[test]
-fn test_relu_backward_alpha_beta_arelu_f64_bias_accumulation_3343() {
-    let n = 256;
-    let (pre_bounds, output_bounds, network) = setup_f64_bias_accumulation_scenario(n);
-    let layer_bounds: Vec<Arc<BoundedTensor>> = vec![Arc::new(pre_bounds.clone())];
-    let alpha_state = DomainAlphaState::from_layer_bounds_and_constraints(
-        &network,
-        &layer_bounds,
-        &SplitHistory::new(),
-    );
-    let bounds = BetaCrownVerifier::new(BetaCrownConfig::default())
-        .relu_backward_with_alpha_beta_arelu(
-            &output_bounds,
-            &pre_bounds,
-            None,
-            &BetaState::empty(),
-            &alpha_state,
-            &AreluState::empty(),
-            1,
-        )
-        .unwrap();
-    assert_f64_bias_accumulation_bounds(&bounds, n);
-}
-
 /// Variant with n=512 (double the base test). Part of #3343.
 #[ntest::timeout(5000)]
 #[test]
-fn test_relu_backward_alpha_beta_arelu_f64_bias_accumulation_large_3343() {
+fn test_relu_backward_alpha_beta_f64_bias_accumulation_large_3343() {
     let n = 512;
     let (pre_bounds, output_bounds, network) = setup_f64_bias_accumulation_scenario(n);
     let layer_bounds: Vec<Arc<BoundedTensor>> = vec![Arc::new(pre_bounds.clone())];
@@ -1403,13 +1141,12 @@ fn test_relu_backward_alpha_beta_arelu_f64_bias_accumulation_large_3343() {
         &SplitHistory::new(),
     );
     let bounds = BetaCrownVerifier::new(BetaCrownConfig::default())
-        .relu_backward_with_alpha_beta_arelu(
+        .relu_backward_with_alpha_beta(
             &output_bounds,
             &pre_bounds,
             None,
             &BetaState::empty(),
             &alpha_state,
-            &AreluState::empty(),
             1,
         )
         .unwrap();

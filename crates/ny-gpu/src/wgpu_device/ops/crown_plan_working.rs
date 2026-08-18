@@ -80,6 +80,52 @@ pub(super) struct CrownWorkingBuffers {
 }
 
 impl CrownWorkingBuffers {
+    /// Exact logical bytes owned by this cached plan's working buffers.
+    pub(super) fn retained_device_bytes(&self) -> Result<usize> {
+        fn add(total: &mut usize, buffer: &wgpu::Buffer, label: &str) -> Result<()> {
+            let bytes = usize::try_from(buffer.size()).map_err(|_| {
+                NyError::InternalError(format!("CROWN plan buffer `{label}` does not fit in usize"))
+            })?;
+            *total = total.checked_add(bytes).ok_or_else(|| {
+                NyError::InternalError("CROWN plan working-buffer byte count overflow".into())
+            })?;
+            Ok(())
+        }
+
+        let mut total = 0usize;
+        for (label, buffer) in [
+            ("params", &self.params_buf),
+            ("a_lower_0", &self.a_lower_0),
+            ("a_upper_0", &self.a_upper_0),
+            ("a_lower_1", &self.a_lower_1),
+            ("a_upper_1", &self.a_upper_1),
+            ("bias_lower", &self.bias_lower),
+            ("bias_upper", &self.bias_upper),
+            ("slopes", &self.slopes_buf),
+            ("weight", &self.weight_buf),
+            ("layer_bias", &self.layer_bias_buf),
+            ("input_lower", &self.inp_lower_buf),
+            ("input_upper", &self.inp_upper_buf),
+            ("output_lower", &self.out_lower),
+            ("output_upper", &self.out_upper),
+            ("readback_lower", &self.readback_lower),
+            ("readback_upper", &self.readback_upper),
+        ] {
+            add(&mut total, buffer, label)?;
+        }
+        for (label, buffer) in [
+            ("conv_reshaped_lower", self.conv_reshaped_lower.as_ref()),
+            ("conv_reshaped_upper", self.conv_reshaped_upper.as_ref()),
+            ("conv_gemm_lower", self.conv_gemm_lower.as_ref()),
+            ("conv_gemm_upper", self.conv_gemm_upper.as_ref()),
+        ] {
+            if let Some(buffer) = buffer {
+                add(&mut total, buffer, label)?;
+            }
+        }
+        Ok(total)
+    }
+
     /// Allocate all working buffers for the given plan dimensions.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(

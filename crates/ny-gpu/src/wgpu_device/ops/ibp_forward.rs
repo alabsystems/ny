@@ -21,6 +21,12 @@ pub(super) fn create_buffer(
     size: u64,
     usage: wgpu::BufferUsages,
 ) -> wgpu::Buffer {
+    // #gpu-pool-highwater: this helper is the OTHER allocation choke point --
+    // the IBP/DAG plan builders allocate per-op lower/upper buffers through it,
+    // entirely outside `BufferPool`, so a ledger that only watched the pool
+    // would attribute nothing to them. These are owned by their plan and freed
+    // when it drops; the plan caches are cleared via `clear_crown_working_set`.
+    crate::gpu_memory_ledger::record_alloc(label, size);
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
@@ -64,15 +70,11 @@ impl GpuIbpForward for WgpuDevice {
         self.ibp_forward_gpu_sound_dispatch(layers, input_lower, input_upper, input_shape)
     }
 
-    /// Advertise the sound resident driver: the certified Linear/ReLU keystone is
-    /// live, so the soundness gate may route a verdict-deciding sequential
-    /// dense-chain IBP bound onto the GPU sound path (with CPU fallback on any
-    /// unsupported layer / wgpu error) — but ONLY on an adapter that passed the
-    /// one-time IEEE-754 f32-model self-check (`ops/f32_selfcheck.rs`). An adapter
-    /// with covert reduced precision / broken bitcast reports `false` here, so its
-    /// verdicts fall back to the CPU f64+γ·S sound path (fail-safe). Cached.
+    /// WGPU resident IBP is excluded from verdict authority while authenticated
+    /// overflow-taint transport, terminal consultation, and the remaining
+    /// general-authority obligations are incomplete.
     fn provides_sound_gpu_ibp(&self) -> bool {
-        self.verify_ieee_f32_model()
+        false
     }
 }
 

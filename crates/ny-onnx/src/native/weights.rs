@@ -354,6 +354,13 @@ fn load_pytorch_shards(shard_paths: &[PathBuf]) -> Result<WeightStore> {
         let shard_weights = crate::pytorch::load_pytorch(shard_path)?;
 
         for (name, tensor) in shard_weights.iter() {
+            if combined.contains_key(name) {
+                return Err(NyError::ModelLoad(format!(
+                    "Duplicate tensor '{}' found across PyTorch shards (at {})",
+                    name,
+                    shard_path.display()
+                )));
+            }
             combined.insert(name.to_string(), tensor.clone());
         }
     }
@@ -394,6 +401,13 @@ fn load_sharded_safetensors(dir: &Path) -> Result<WeightStore> {
         let shard_weights = crate::safetensors::load_safetensors(&shard_path)?;
 
         for (name, tensor) in shard_weights.iter() {
+            if combined.contains_key(name) {
+                return Err(NyError::ModelLoad(format!(
+                    "Duplicate tensor '{}' found across SafeTensors shards (at {})",
+                    name,
+                    shard_path.display()
+                )));
+            }
             combined.insert(name.to_string(), tensor.clone());
         }
     }

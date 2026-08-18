@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::load_onnx_bytes;
-use ndarray::{arr1, arr2};
+use ndarray::arr1;
 use ny_core::LayerType;
 use ny_tensor::BoundedTensor;
 use prost::Message;
@@ -74,6 +74,7 @@ fn test_load_scatter_nd_end_to_end() {
             tensor_f32("data", &[4], &[0.0, 0.0, 0.0, 0.0]),
             tensor_i64("indices", &[2, 1], &[1, 3]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("updates", &[2])],
         output: vec![tensor_value_info("out", &[4])],
         #[cfg(feature = "onnx-value-info")]
@@ -116,7 +117,7 @@ fn test_load_scatter_nd_end_to_end() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_load_scatter_nd_dynamic_indices_end_to_end() {
+fn test_reject_scatter_nd_dynamic_float_indices() {
     let graph = onnx_proto::GraphProto {
         node: vec![
             onnx_proto::NodeProto {
@@ -145,6 +146,7 @@ fn test_load_scatter_nd_dynamic_indices_end_to_end() {
             tensor_f32("data", &[4], &[0.0, 0.0, 0.0, 0.0]),
             tensor_i64("updates_shape", &[1], &[2]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[2, 1])],
         output: vec![tensor_value_info("out", &[4])],
         #[cfg(feature = "onnx-value-info")]
@@ -165,20 +167,10 @@ fn test_load_scatter_nd_dynamic_indices_end_to_end() {
     };
     let bytes = model.encode_to_vec();
 
-    let model = load_onnx_bytes("scatter_nd_dynamic.onnx", &bytes)
-        .expect("Failed to load dynamic ScatterND");
-    let graph = model
-        .to_graph_network()
-        .expect("Failed to convert dynamic ScatterND model to graph network");
-    let input = BoundedTensor::new(
-        arr2(&[[0.0_f32], [1.0]]).into_dyn(),
-        arr2(&[[3.0_f32], [3.0]]).into_dyn(),
-    )
-    .unwrap();
-    let output = graph
-        .propagate_ibp(&input)
-        .expect("Dynamic ScatterND graph IBP should succeed");
-
-    assert_eq!(output.lower().as_slice().unwrap(), &[0.0, 0.0, 0.0, 0.0]);
-    assert_eq!(output.upper().as_slice().unwrap(), &[3.0, 3.0, 3.0, 3.0]);
+    let error = load_onnx_bytes("scatter_nd_dynamic.onnx", &bytes)
+        .expect_err("standard ScatterND indices must be INT64, not a FLOAT activation");
+    assert!(
+        error.to_string().contains("indices") && error.to_string().contains("dtype 1"),
+        "{error}"
+    );
 }

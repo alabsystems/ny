@@ -19,7 +19,7 @@ fn make_node(op: &str, inputs: &[&str], outputs: &[&str]) -> NodeProto {
 fn make_int_attr(name: &str, value: i64) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        i: value,
+        i: Some(value),
         ..Default::default()
     }
 }
@@ -48,7 +48,7 @@ fn test_lower_reduce_l2_nodes_rewrites_to_supported_primitives() {
     );
     assert_eq!(nodes[0].attribute.len(), 1);
     assert_eq!(nodes[0].attribute[0].name, "value_float");
-    assert_eq!(nodes[0].attribute[0].f, 2.0);
+    assert_eq!(nodes[0].attribute[0].f, Some(2.0));
 
     assert_eq!(nodes[1].op_type, "Pow");
     assert_eq!(

@@ -358,7 +358,7 @@ where
             let status_str = match &status {
                 BabVerificationStatus::Verified => "Verified",
                 BabVerificationStatus::Violated { .. } => "Falsified",
-                BabVerificationStatus::PotentialViolation => "PotentialViolation",
+                BabVerificationStatus::PotentialViolation { .. } => "PotentialViolation",
                 BabVerificationStatus::Unknown { reason } => {
                     if reason.contains("timeout") || elapsed >= Duration::from_secs(problem.timeout)
                     {

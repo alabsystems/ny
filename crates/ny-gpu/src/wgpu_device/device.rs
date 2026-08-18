@@ -9,6 +9,17 @@ use super::WgpuDevice;
 use ny_core::{NyError, Result};
 use tracing::info;
 
+/// What the cheap adapter probe saw, as plain strings (#backend-detect).
+///
+/// `backend` is wgpu's backend debug name (`Metal`, `Vulkan`, `Dx12`, `Gl`),
+/// `device_type` its device class (`IntegratedGpu`, `DiscreteGpu`, ...).
+#[derive(Debug, Clone)]
+pub struct AdapterProbe {
+    pub backend: String,
+    pub name: String,
+    pub device_type: String,
+}
+
 /// All pipeline + bind group layout pairs, extracted for function size (#3397).
 pub(super) struct PipelineSet {
     pub(super) linear_ibp: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
@@ -38,10 +49,40 @@ impl WgpuDevice {
     /// This initializes wgpu, selects the best available GPU backend,
     /// and compiles the compute shaders.
     pub fn new() -> Result<Self> {
-        pollster::block_on(Self::new_async())
+        pollster::block_on(Self::new_async(None))
+    }
+
+    /// #flush-charge admission-config: construct a device with a PROGRAMMATIC
+    /// DenormPreserve policy override. `None` is env resolution — the existing
+    /// behavior, byte-identical to [`WgpuDevice::new`]. The only defined
+    /// override is [`shader_loading::DenormPreservePolicy::ForcedDisabled`]
+    /// (the charged-flush constructors): every shader module on the returned
+    /// device is created through the plain-WGSL (flushing) path regardless of
+    /// ambient env, except that an explicit `NY_GPU_DENORM_PRESERVE=1` pin
+    /// refuses with a typed error (env wins, repo-wide precedence rule).
+    pub(crate) fn new_with_denorm_preserve_override(
+        denorm_override: Option<super::shader_loading::DenormPreservePolicy>,
+    ) -> Result<Self> {
+        pollster::block_on(Self::new_async(denorm_override))
+    }
+
+    /// Per-device DenormPreserve loading-path contract: composes the
+    /// process-wide sticky passthrough-fallback poison with THIS device's
+    /// resolved loading profile (`denorm_preserve_enabled`). A device that
+    /// never requested passthrough creates plain-WGSL modules only and is
+    /// structurally immune to the poison.
+    pub(crate) fn denorm_preserve_contract_intact(&self) -> bool {
+        super::shader_loading::denorm_preserve_contract_intact_for(self.denorm_preserve_enabled)
     }
 
     /// Get a reference to the underlying wgpu device.
+    ///
+    /// Capability boundary: buffers allocated directly through this raw handle
+    /// are not owned by [`WgpuDevice`], cannot participate in its serialized
+    /// intermediate-sweep reservation ledger, and are therefore outside that
+    /// backend's `peak_device_bytes` receipt. Prefer typed methods whenever a
+    /// call needs wrapper-enforced memory authority. Removing or wrapping this
+    /// legacy escape hatch is follow-up work.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -51,10 +92,37 @@ impl WgpuDevice {
         &self.queue
     }
 
-    async fn new_async() -> Result<Self> {
+    async fn new_async(
+        denorm_override: Option<super::shader_loading::DenormPreservePolicy>,
+    ) -> Result<Self> {
         let (adapter, adapter_info) = Self::request_adapter().await?;
         info!("wgpu adapter: {}", Self::format_adapter_info(&adapter_info));
-        let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        // Resolve the shader-loading profile from the adapter's live capability,
+        // never its name. AUTO enables DenormPreserve only when passthrough is
+        // advertised; forced `1` refuses here if it cannot possibly work. The
+        // complete verdict ladder still measures the exact created device and
+        // is the only route to authority. A programmatic ForcedDisabled
+        // override (#flush-charge admission-config) instead forces the
+        // plain-WGSL path for every module on this device, refusing only when
+        // the user explicitly pinned `NY_GPU_DENORM_PRESERVE=1` (env wins).
+        let adapter_features = adapter.features();
+        let passthrough_supported = adapter_features.contains(wgpu::Features::PASSTHROUGH_SHADERS);
+        let (denorm_preserve_policy, denorm_preserve_enabled) = match denorm_override {
+            None => super::shader_loading::resolve_denorm_preserve(passthrough_supported)?,
+            Some(super::shader_loading::DenormPreservePolicy::ForcedDisabled) => {
+                super::shader_loading::resolve_denorm_preserve_forced_disabled()?
+            }
+            Some(other) => {
+                return Err(NyError::InternalError(format!(
+                    "unsupported programmatic DenormPreserve override {other:?}: \
+                     only ForcedDisabled is defined"
+                )))
+            }
+        };
+        let mut required_features = adapter_features & wgpu::Features::TIMESTAMP_QUERY;
+        if denorm_preserve_enabled {
+            required_features |= wgpu::Features::PASSTHROUGH_SHADERS;
+        }
         let timestamp_queries_enabled = required_features.contains(wgpu::Features::TIMESTAMP_QUERY);
         // #big-bindings (dark, `NY_GPU_BIG_BINDINGS=1`, default OFF = wgpu defaults,
         // byte-identical): request the ADAPTER's actual buffer limits instead of
@@ -83,6 +151,16 @@ impl WgpuDevice {
             wgpu::Limits {
                 max_storage_buffer_binding_size: a.max_storage_buffer_binding_size,
                 max_buffer_size: a.max_buffer_size,
+                // #u4 taint channel: the activation taint twin binds 11 storage
+                // buffers (7 value/error + 4 taint words); the wgpu default is
+                // 8 per stage, and exceeding it fails the bind group ASYNC —
+                // the dispatch silently no-ops and readbacks return zeros,
+                // which is exactly how the first taint-probe run "measured"
+                // taint words that never reached the shader. Take the
+                // adapter's real limit (clamped for sanity).
+                max_storage_buffers_per_shader_stage: a
+                    .max_storage_buffers_per_shader_stage
+                    .min(16),
                 ..wgpu::Limits::default()
             }
         } else {
@@ -104,14 +182,24 @@ impl WgpuDevice {
                     Self::format_adapter_info(&adapter_info),
                 ))
             })?;
+        // Publish only ENV-RESOLVED selections: two env devices with
+        // conflicting resolutions still refuse (unchanged). The ForcedDisabled
+        // device neither installs nor consults the process selection — its
+        // loading path is threaded per-device into every module creation, so
+        // it coexists with an env passthrough device without mixing paths.
+        if denorm_override.is_none() {
+            super::shader_loading::install_denorm_preserve_selection(denorm_preserve_enabled)?;
+        }
         info!(timestamp_queries_enabled, "wgpu optional features");
         // Install a non-panicking uncaptured-error backstop BEFORE compiling
         // pipelines or running any GPU work, so that no stray validation/
         // internal error can reach wgpu's default handler and abort the process.
         let uncaptured_errors = Self::install_uncaptured_error_handler(&device);
-        let p = Self::init_pipelines(&device).await?;
+        let p = Self::init_pipelines(&device, denorm_preserve_enabled).await?;
         let constructed = Self {
             adapter_info,
+            denorm_preserve_policy,
+            denorm_preserve_enabled,
             device,
             queue,
             linear_ibp_pipeline: p.linear_ibp.0,
@@ -142,6 +230,8 @@ impl WgpuDevice {
             crown_bias_accumulate_bind_group_layout: p.crown_bias_accumulate.1,
             crown_concretize_pipeline: p.crown_concretize.0,
             crown_concretize_bind_group_layout: p.crown_concretize.1,
+            sound_concretize_pipeline: std::sync::OnceLock::new(),
+            intermediate_sweep_dag_pipelines: std::sync::OnceLock::new(),
             conv_reshape_pipeline: p.conv_reshape.0,
             conv_reshape_bind_group_layout: p.conv_reshape.1,
             conv_col2im_pipeline: p.conv_col2im.0,
@@ -152,11 +242,13 @@ impl WgpuDevice {
             avgpool_ibp_bind_group_layout: p.avgpool_ibp.1,
             buffer_pool: std::sync::Mutex::new(BufferPool::default()),
             resident_pipelines: std::sync::OnceLock::new(),
+            resident_gather_pipeline: std::sync::OnceLock::new(),
             joint_adjoint_pipelines: std::sync::OnceLock::new(),
             ibp_sound_pipelines: std::sync::OnceLock::new(),
             crown_plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             conv_transpose_plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             resident_weight_buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            intermediate_sweep_reserved_bytes: std::sync::Mutex::new(0),
             resident_weight_uploads: std::sync::atomic::AtomicUsize::new(0),
             point_vjp_resident_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
             point_vjp_resident_builds: std::sync::atomic::AtomicUsize::new(0),
@@ -167,6 +259,14 @@ impl WgpuDevice {
             crown_backward_deadline: std::sync::Mutex::new(None),
             f32_selfcheck: std::sync::OnceLock::new(),
             eft_selfcheck: std::sync::OnceLock::new(),
+            subnormal_selfcheck: std::sync::OnceLock::new(),
+            sentinel_taint_selfcheck: std::sync::OnceLock::new(),
+            subnormal_mult_taint_selfcheck: std::sync::OnceLock::new(),
+            resident_cut_selfcheck: std::sync::OnceLock::new(),
+            verdict_report: None,
+            bab_bound_provider: super::ops::bab_bound_authority::WgpuBabBoundProvider::new(),
+            charged_policy: None,
+            submit_tick: std::sync::atomic::AtomicU64::new(0),
         };
         // #eft-err DEADLOCK GUARD: the EFT self-check dispatches GPU work, so it
         // must NEVER be first-initialized from inside a fold that already holds
@@ -216,17 +316,20 @@ impl WgpuDevice {
         Ok((adapter, info))
     }
 
-    async fn init_pipelines(device: &wgpu::Device) -> Result<PipelineSet> {
+    async fn init_pipelines(device: &wgpu::Device, denorm_preserve: bool) -> Result<PipelineSet> {
         macro_rules! scoped {
             ($name:literal, $method:ident) => {
-                Self::create_pipeline_scoped(device, $name, || Self::$method(device)).await?
+                Self::create_pipeline_scoped(device, $name, || {
+                    Self::$method(device, denorm_preserve)
+                })
+                .await?
             };
         }
 
         // gemm_f32 first: its bind group layout is shared with gemm_f32_small_k.
         let gemm_f32 = scoped!("gemm_f32", create_gemm_f32_pipeline);
         let gemm_f32_small_k = Self::create_pipeline_scoped(device, "gemm_f32_small_k", || {
-            Self::create_gemm_f32_small_k_pipeline(device, &gemm_f32.1)
+            Self::create_gemm_f32_small_k_pipeline(device, denorm_preserve, &gemm_f32.1)
         })
         .await?;
 
@@ -265,9 +368,23 @@ impl WgpuDevice {
     /// Get information about the GPU device.
     pub fn info(&self) -> String {
         format!(
-            "wgpu device: {}",
-            Self::format_adapter_info(&self.adapter_info)
+            "wgpu device: {}; denorm_preserve={} policy={}",
+            Self::format_adapter_info(&self.adapter_info),
+            self.denorm_preserve_enabled,
+            self.denorm_preserve_policy.name(),
         )
+    }
+
+    /// Stable diagnostic name for the capability/override shader policy.
+    #[must_use]
+    pub fn denorm_preserve_policy_name(&self) -> &'static str {
+        self.denorm_preserve_policy.name()
+    }
+
+    /// Whether this device creates shaders through the DenormPreserve seam.
+    #[must_use]
+    pub fn denorm_preserve_enabled(&self) -> bool {
+        self.denorm_preserve_enabled
     }
 
     fn format_adapter_info(info: &wgpu::AdapterInfo) -> String {
@@ -275,6 +392,43 @@ impl WgpuDevice {
             "{} (backend: {:?}, device: {}, vendor: 0x{:x}, driver: {}, driver_info: {})",
             info.name, info.backend, info.device, info.vendor, info.driver, info.driver_info
         )
+    }
+
+    /// Probe the highest-preference GPU adapter WITHOUT building a device or
+    /// compiling any shader (#backend-detect).
+    ///
+    /// `WgpuDevice::new` pays full pipeline compilation; host backend
+    /// *detection* must not, because it runs at the top of every scored
+    /// instance. This is the adapter half of `request_adapter` alone —
+    /// a few milliseconds — reduced to plain strings so callers outside this
+    /// crate need no wgpu types.
+    pub fn probe_adapter() -> Option<AdapterProbe> {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .ok()?;
+            let info = adapter.get_info();
+            // llvmpipe/WARP-class adapters are CPU rasterizers wearing a GPU
+            // API; reporting one as a GPU would repeat the exact measurement
+            // confusion this probe exists to prevent.
+            if info.device_type == wgpu::DeviceType::Cpu {
+                return None;
+            }
+            Some(AdapterProbe {
+                backend: format!("{:?}", info.backend),
+                name: info.name,
+                device_type: format!("{:?}", info.device_type),
+            })
+        })
     }
 
     fn format_adapter_list(adapters: &[wgpu::AdapterInfo]) -> String {

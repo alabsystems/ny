@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "external-vnncomp")]
+
 //! Integration tests for the 6 new VNN-COMP 2025 categories.
 //!
 //! These tests verify that ny can load benchmark models, parse VNNLIB
@@ -46,8 +48,9 @@ fn relusplitter_dir() -> PathBuf {
 
 /// Parse JSON from ny output, accepting any exit code.
 ///
-/// beta-crown returns exit code 0 for Verified/Violated, 2 for Unknown/Timeout.
-/// Smoke tests accept any exit code as long as JSON output is valid.
+/// Standalone beta-crown reserves 0/1/2/3 for
+/// Verified/Violated/Unknown/Timeout. These VNN-COMP smoke tests inspect the
+/// protocol JSON independently of the child process code.
 fn parse_json_any_exit(output: &std::process::Output, label: &str) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

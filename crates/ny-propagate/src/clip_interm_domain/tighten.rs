@@ -297,30 +297,34 @@ fn f64_upper_to_f32(upper: f64) -> f32 {
 }
 
 fn next_down_f64(value: f64) -> f64 {
-    if value == f64::NEG_INFINITY || value.is_nan() {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > f64::INFINITY.to_bits() || bits == f64::NEG_INFINITY.to_bits() {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return -f64::from_bits(1);
     }
-    if value > 0.0 {
-        f64::from_bits(value.to_bits() - 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits - 1)
     } else {
-        f64::from_bits(value.to_bits() + 1)
+        f64::from_bits(bits + 1)
     }
 }
 
 fn next_up_f64(value: f64) -> f64 {
-    if value == f64::INFINITY || value.is_nan() {
+    let bits = value.to_bits();
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    if magnitude > f64::INFINITY.to_bits() || bits == f64::INFINITY.to_bits() {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-    if value > 0.0 {
-        f64::from_bits(value.to_bits() + 1)
+    if bits & 0x8000_0000_0000_0000 == 0 {
+        f64::from_bits(bits + 1)
     } else {
-        f64::from_bits(value.to_bits() - 1)
+        f64::from_bits(bits - 1)
     }
 }
 

@@ -11,25 +11,34 @@ readme.workspace = true
 [features]
 benchmarks = []
 kani-proofs = []
+# Real-adapter integration for propagation's GPU-CROWN consumer seams. Default
+# tests use hermetic recording engines; this explicit lane fails fast when the
+# explicitly requested device cannot pass the five-rung sound-authority ladder.
+gpu-tests = []
 
 [lints]
 workspace = true
 
 [dependencies]
 ny-core = { path = "../ny-core" }
+ny-levers = { path = "../ny-levers" }
+trust.workspace = true
 ny-tensor = { path = "../ny-tensor" }
 anyhow.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
+rustc-hash.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+hashbrown.workspace = true
 libm.workspace = true
 faer.workspace = true
 rand.workspace = true
 bytemuck.workspace = true
 sha2.workspace = true
 num-rational.workspace = true
+num-bigint.workspace = true
 num-traits.workspace = true
 
 [dev-dependencies]
@@ -44,7 +53,6 @@ ny-test-utils = { path = "../ny-test-utils" }
 # (#vnncomp-aw-soundness). ny-cert has no dependency on ny-propagate, so this
 # dev-dependency introduces no cycle.
 ny-cert = { path = "../ny-cert" }
-num-bigint.workspace = true
 half.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

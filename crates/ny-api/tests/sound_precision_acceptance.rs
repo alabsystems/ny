@@ -2,23 +2,19 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Acceptance tests for the SOUND, layer-aware deployed-precision verification
-//! path (`verify_with_sound_precision`, PART D).
+//! Acceptance tests for the fail-closed deployed-precision verification entry
+//! point (`verify_with_sound_precision`).
 //!
-//! These build the exact adversarial counterexample nets that the prior
-//! representation-only widening got WRONG, compute the REAL deployed f16/bf16
-//! value with the `half` crate, and assert that the sound path's effective output
-//! interval CONTAINS that deployed value. They also assert the F32 policy is a
-//! strict no-op equal to the normal verdict, and that the sound path never
-//! returns `Verified` for a property the deployed computation violates.
+//! Non-F32 policies remain experimental and must be rejected until every
+//! deployed store and reduction is modeled rigorously. The all-F32 policy is a
+//! strict no-op equal to the ordinary sound verifier.
 
-use half::{bf16, f16};
 use ndarray::{arr2, Array2};
 use ny_api::graph::{GraphNetwork, GraphNode};
 use ny_api::layers::{Layer, LinearLayer};
 use ny_api::precision::{verify_with_sound_precision, FloatPrecision, MixedPrecisionPolicy};
 use ny_api::verify::{PropagationConfig, Verifier};
-use ny_api::{Bound, VerificationResult, VerificationSoundnessMode, VerificationSpec};
+use ny_api::{Bound, NyError, VerificationResult, VerificationSoundnessMode, VerificationSpec};
 
 /// Build a single-`Linear` graph network computing `y = W x` (no bias).
 /// `weight` has shape `[out_features, in_features]`.
@@ -50,34 +46,30 @@ fn effective_bounds(result: &VerificationResult) -> Vec<Bound> {
     }
 }
 
-/// Real deployed f16 recursive (left-to-right) dot product sum_i w_i * x_i,
-/// rounding to f16 after each multiply and each add.
-fn f16_dot(weights: &[f32], xs: &[f32]) -> f32 {
-    let mut acc = f16::from_f32(0.0);
-    for (&w, &x) in weights.iter().zip(xs.iter()) {
-        let prod = f16::from_f32(f16::from_f32(w).to_f32() * f16::from_f32(x).to_f32());
-        acc = f16::from_f32(acc.to_f32() + prod.to_f32());
+fn assert_non_f32_policy_rejected(
+    graph: &GraphNetwork,
+    spec: &VerificationSpec,
+    policy: &MixedPrecisionPolicy,
+) {
+    let error = verify_with_sound_precision(graph, spec, policy)
+        .expect_err("non-F32 verification must fail closed");
+    match error {
+        NyError::UnsupportedConfiguration(message) => {
+            assert!(
+                message.contains("not yet implemented"),
+                "rejection should explain the unsupported proof obligation: {message}"
+            );
+        }
+        other => panic!("expected UnsupportedConfiguration, got {other:?}"),
     }
-    acc.to_f32()
-}
-
-/// Real deployed bf16 recursive dot product.
-fn bf16_dot(weights: &[f32], xs: &[f32]) -> f32 {
-    let mut acc = bf16::from_f32(0.0);
-    for (&w, &x) in weights.iter().zip(xs.iter()) {
-        let prod = bf16::from_f32(bf16::from_f32(w).to_f32() * bf16::from_f32(x).to_f32());
-        acc = bf16::from_f32(acc.to_f32() + prod.to_f32());
-    }
-    acc.to_f32()
 }
 
 // ---------------------------------------------------------------------------
-// Counterexample 1: uniform f16, reduction summing 5000 ones.
-// f32 sum = 5000 (point); deployed f16 saturates near 2048. The sound bound
-// MUST contain 2048.
+// Counterexample 1 formerly exercised an experimental f16 widening path.
+// The public proof API must reject it until that path is fully sound.
 // ---------------------------------------------------------------------------
 #[test]
-fn counterexample_1_f16_5000_ones_sum_is_contained() {
+fn counterexample_1_f16_5000_ones_sum_is_rejected() {
     let n = 5000usize;
     // A 1x5000 all-ones weight makes y = sum_i x_i.
     let weight = Array2::from_elem((1, n), 1.0_f32);
@@ -87,68 +79,31 @@ fn counterexample_1_f16_5000_ones_sum_is_contained() {
     let spec = spec_with_input(input, 1);
     let policy = MixedPrecisionPolicy::uniform(FloatPrecision::F16);
 
-    let result = verify_with_sound_precision(&g, &spec, &policy).expect("sound verify");
-    let bounds = effective_bounds(&result);
-    assert_eq!(bounds.len(), 1, "single output neuron");
-
-    let deployed = f16_dot(&vec![1.0; n], &vec![1.0; n]);
-    assert!(
-        deployed < 2100.0,
-        "deployed f16 sum should saturate, got {deployed}"
-    );
-    assert!(
-        bounds[0].lower() <= deployed && deployed <= bounds[0].upper(),
-        "sound bound [{}, {}] must contain deployed f16 value {deployed}",
-        bounds[0].lower(),
-        bounds[0].upper()
-    );
-    // Acceptance: must contain 2048 specifically.
-    assert!(
-        bounds[0].lower() <= 2048.0 && 2048.0 <= bounds[0].upper(),
-        "sound bound must contain 2048 (got [{}, {}])",
-        bounds[0].lower(),
-        bounds[0].upper()
-    );
+    assert_non_f32_policy_rejected(&g, &spec, &policy);
 }
 
 // ---------------------------------------------------------------------------
-// Counterexample 2: uniform f16, 4096-term dot product x_i = f16(1/3), w_i = 1.
-// f32 bound ~ [1365, 1365]; deployed f16 drifts far below; bound MUST contain it.
+// Counterexample 2: a long f16 dot product with substantial reduction drift.
 // ---------------------------------------------------------------------------
 #[test]
-fn counterexample_2_f16_4096_dot_drift_is_contained() {
+fn counterexample_2_f16_4096_dot_drift_is_rejected() {
     let n = 4096usize;
     let weight = Array2::from_elem((1, n), 1.0_f32);
     let g = single_linear_graph(weight);
-    let x = f16::from_f32(1.0 / 3.0).to_f32(); // ~0.33325, exactly f16-representable
+    let x = 0.333_251_95_f32; // exactly representable in f16
     let input = vec![Bound::new(x, x); n];
     let spec = spec_with_input(input, 1);
     let policy = MixedPrecisionPolicy::uniform(FloatPrecision::F16);
 
-    let result = verify_with_sound_precision(&g, &spec, &policy).expect("sound verify");
-    let bounds = effective_bounds(&result);
-
-    let deployed = f16_dot(&vec![1.0; n], &vec![x; n]);
-    let ideal = (n as f64) * f64::from(x);
-    assert!(
-        f64::from(deployed) < ideal - 50.0,
-        "deployed f16 dot {deployed} should drift well below ideal {ideal}"
-    );
-    assert!(
-        bounds[0].lower() <= deployed && deployed <= bounds[0].upper(),
-        "sound bound [{}, {}] must contain deployed f16 value {deployed}",
-        bounds[0].lower(),
-        bounds[0].upper()
-    );
+    assert_non_f32_policy_rejected(&g, &spec, &policy);
 }
 
 // ---------------------------------------------------------------------------
-// Counterexample 3: uniform bf16, 512-term, w_i = 0.5, x_i in [0.9, 1.1].
-// f32 IBP interval ~ [230, 282]; deployed bf16 worst corner escapes; bound MUST
-// contain it.
+// Counterexample 3: a bf16 interval dot product whose deployed corners differ
+// from the idealized f32 computation.
 // ---------------------------------------------------------------------------
 #[test]
-fn counterexample_3_bf16_512_dot_corner_is_contained() {
+fn counterexample_3_bf16_512_dot_corner_is_rejected() {
     let n = 512usize;
     let weight = Array2::from_elem((1, n), 0.5_f32);
     let g = single_linear_graph(weight);
@@ -156,20 +111,7 @@ fn counterexample_3_bf16_512_dot_corner_is_contained() {
     let spec = spec_with_input(input, 1);
     let policy = MixedPrecisionPolicy::uniform(FloatPrecision::Bf16);
 
-    let result = verify_with_sound_precision(&g, &spec, &policy).expect("sound verify");
-    let bounds = effective_bounds(&result);
-
-    // Worst deployed corners: all-high (1.1) and all-low (0.9).
-    let deployed_hi = bf16_dot(&vec![0.5; n], &vec![1.1; n]);
-    let deployed_lo = bf16_dot(&vec![0.5; n], &vec![0.9; n]);
-    for d in [deployed_hi, deployed_lo] {
-        assert!(
-            bounds[0].lower() <= d && d <= bounds[0].upper(),
-            "sound bound [{}, {}] must contain deployed bf16 corner {d}",
-            bounds[0].lower(),
-            bounds[0].upper()
-        );
-    }
+    assert_non_f32_policy_rejected(&g, &spec, &policy);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,12 +150,11 @@ fn f32_policy_equals_normal_verdict() {
 }
 
 // ---------------------------------------------------------------------------
-// The sound path must NOT return Verified for a property the deployed
-// computation violates. Use the 5000-ones net: claim the output is within
-// [4999, 5001] (true in f32, FALSE for deployed f16 which saturates ~2048).
+// A property that the deployed computation violates must be rejected before a
+// verification verdict is produced.
 // ---------------------------------------------------------------------------
 #[test]
-fn sound_path_does_not_verify_a_deployed_violation() {
+fn non_f32_path_rejects_a_deployed_violation_query() {
     let n = 5000usize;
     let weight = Array2::from_elem((1, n), 1.0_f32);
     let g = single_linear_graph(weight);
@@ -224,11 +165,7 @@ fn sound_path_does_not_verify_a_deployed_violation() {
     let spec = VerificationSpec::from_parts(input, req, None, Some(vec![n])).expect("valid spec");
     let policy = MixedPrecisionPolicy::uniform(FloatPrecision::F16);
 
-    let result = verify_with_sound_precision(&g, &spec, &policy).expect("sound verify");
-    assert!(
-        !result.is_verified(),
-        "sound path must NOT verify a property the deployed f16 computation violates; got {result:?}"
-    );
+    assert_non_f32_policy_rejected(&g, &spec, &policy);
 
     // Sanity: the f32-idealized verdict WOULD verify the same property.
     let normal = Verifier::new(PropagationConfig::default())
@@ -241,31 +178,18 @@ fn sound_path_does_not_verify_a_deployed_violation() {
 }
 
 // ---------------------------------------------------------------------------
-// When the property holds with enough margin for the deployed precision, the
-// sound path returns Verified with SOUND provenance (Linear is exactly accounted).
+// Even an open output requirement cannot turn an unsupported non-F32 execution
+// policy into a proof.
 // ---------------------------------------------------------------------------
 #[test]
-fn sound_path_verifies_with_margin_and_sound_provenance() {
+fn non_f32_path_rejects_even_an_open_output_requirement() {
     let n = 5000usize;
     let weight = Array2::from_elem((1, n), 1.0_f32);
     let g = single_linear_graph(weight);
     let input = vec![Bound::new(1.0, 1.0); n];
-    // Deployed f16 saturates near 2048; the sound bound saturates to a very wide
-    // interval (gamma_N is +inf for n=5000 in f16). A finite requirement cannot
-    // be Verified, but a [-inf, +inf] requirement can — proving SOUND provenance.
     let req = vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY)];
     let spec = VerificationSpec::from_parts(input, req, None, Some(vec![n])).expect("valid spec");
     let policy = MixedPrecisionPolicy::uniform(FloatPrecision::F16);
 
-    let result = verify_with_sound_precision(&g, &spec, &policy).expect("sound verify");
-    match result {
-        VerificationResult::Verified { provenance, .. } => {
-            assert_eq!(
-                provenance.mode(),
-                VerificationSoundnessMode::Sound,
-                "Linear-only net: every accumulating layer is exactly accounted -> Sound"
-            );
-        }
-        other => panic!("expected Verified (open requirement), got {other:?}"),
-    }
+    assert_non_f32_policy_rejected(&g, &spec, &policy);
 }

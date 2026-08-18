@@ -18,7 +18,8 @@
 // (4) certified-UNSAT-only admission + graph-forward witness revalidation.
 //
 // SOUNDNESS: the MIP feasible set contains the subdomain's reachable set
-// (exact affine rows; the domain's own sound boxes ±DELTA as big-M ranges;
+// (exact or certified-outward affine rows; the domain's own sound boxes ±DELTA
+// as big-M ranges;
 // the domain's exact input box; premise pieces implied by the premises that
 // DEFINE the subdomain). `VerifiedAllRows` requires a VERIFIED Farkas
 // certificate on every row; every other outcome degrades to `Undecided`
@@ -30,6 +31,7 @@ use std::time::Instant;
 
 use ny_core::Bound;
 use ny_mip::{obbt_relaxation_bounds, MipBackend, MipConfig, MipResult, MipSolver};
+use ny_onnx::vnnlib::VnnLibSpec;
 use ny_propagate::beta_crown::graph_mip_leaf::{
     GraphMipLeafOracle, GraphMipLeafRequest, GraphMipLeafVerdict,
 };
@@ -114,7 +116,7 @@ fn leaf_max_nnz() -> usize {
 /// Cheap OVER-estimate of the encoded problem's nonzeros, from layer shapes +
 /// the flattened bounds (no allocation): Linear `out×in`, Conv2d
 /// `out_len × (in_c/groups × kh × kw + 1)` (the im2col row density),
-/// BatchNorm `2×len`, Add `3×len`, ReLU `~5×unstable`. `None` fails closed
+/// BatchNorm `2×len`, Add `3×len`, ReLU `7×unstable`. `None` fails closed
 /// (unknown layer / missing box → the encoder would bail anyway).
 pub(super) fn estimate_encode_nnz(
     graph: &GraphNetwork,
@@ -127,7 +129,7 @@ pub(super) fn estimate_encode_nnz(
         let out_len = |n: &str| flat_bounds.get(n).map(Vec::len);
         match node.layer() {
             Layer::Linear(lin) => {
-                let (out_dim, in_dim) = lin.weight.dim();
+                let (out_dim, in_dim) = lin.weight().dim();
                 nnz = nnz.saturating_add(out_dim.saturating_mul(in_dim + 1));
             }
             Layer::Conv2d(conv) => {
@@ -161,7 +163,8 @@ pub(super) fn estimate_encode_nnz(
                     .iter()
                     .filter(|b| b.lower() < 0.0 && b.upper() > 0.0)
                     .count();
-                nnz = nnz.saturating_add(unstable.saturating_mul(5));
+                // Three big-M rows carry 2 + 3 + 2 coefficients.
+                nnz = nnz.saturating_add(unstable.saturating_mul(7));
             }
             Layer::Flatten(_) | Layer::Reshape(_) => {}
             // #relational-bab: the encoder's remaining exact ops (the mscn
@@ -220,6 +223,17 @@ struct LeafBudgetState {
 /// solves → certified admission. All internal failures map to `Undecided`.
 pub(super) struct GraphMipLeafSolver {
     backend: MipBackend,
+    /// May a confirmed `Violated` witness be PUBLISHED as the run's sat
+    /// candidate (#mip-leaf-witness)? Answered HERE because this is the only
+    /// layer that can see the property's clause layout: the BaB lane receives
+    /// objectives already flattened by `build_multi_objectives`, and
+    /// `ny-propagate` cannot see `per_clause_input_bounds` at all.
+    ///
+    /// `false` whenever the spec carries per-clause input boxes — there, every
+    /// output row holding at a hull point does NOT imply any clause holds, so
+    /// the lane's all-rows check is not sufficient. Fail-closed: anything we
+    /// cannot positively classify stays advisory.
+    may_publish_violation_witness: bool,
     budget: Mutex<LeafBudgetState>,
     /// Latched after a graph-forward-CONFIRMED SAT witness (defect 3): a real
     /// margin≤threshold point means certified-UNSAT is unreachable in this
@@ -232,8 +246,15 @@ pub(super) struct GraphMipLeafSolver {
 
 impl GraphMipLeafSolver {
     pub(super) fn new(backend: MipBackend) -> Self {
+        Self::with_publication(backend, false)
+    }
+
+    /// `may_publish` must be computed from the property's clause layout by the
+    /// caller — see the field's contract. `new` keeps the fail-closed default.
+    pub(super) fn with_publication(backend: MipBackend, may_publish: bool) -> Self {
         Self {
             backend,
+            may_publish_violation_witness: may_publish,
             budget: Mutex::new(LeafBudgetState::default()),
             sat_latch: std::sync::atomic::AtomicBool::new(false),
         }
@@ -464,6 +485,10 @@ impl GraphMipLeafOracle for GraphMipLeafSolver {
     fn solve_leaf(&self, req: &GraphMipLeafRequest<'_>) -> GraphMipLeafVerdict {
         contain_leaf_panics(|| self.solve_leaf_gated(req))
     }
+
+    fn may_publish_violation_witness(&self) -> bool {
+        self.may_publish_violation_witness
+    }
 }
 
 impl GraphMipLeafSolver {
@@ -570,7 +595,8 @@ impl GraphMipLeafSolver {
         flat_bounds: &HashMap<String, Vec<Bound>>,
         slice: f64,
     ) -> GraphMipLeafVerdict {
-        // --- encode ONCE (exact rows + DELTA inflation), pin the premises ---
+        // --- encode ONCE (exact-or-certified-outward rows + DELTA inflation),
+        //     pin the premises ---
         let Ok(input_bounds) = bounded_tensor_to_bounds(req.input_bounds) else {
             return GraphMipLeafVerdict::Undecided;
         };
@@ -663,11 +689,13 @@ impl GraphMipLeafSolver {
                     }
                 }
             }
+            let ay_node_warm_time_limit = enc.ay_node_warm_time_limit();
             let solver = MipSolver::new(
                 enc.into_parts(),
                 MipConfig {
                     backend: self.backend,
                     timeout_secs: per_row,
+                    ay_node_warm_time_limit,
                     // NO phase-split racing for LEAF solves (defect 2): the
                     // measured racing fan-out (2^4 = 16 concurrent subproblems,
                     // each an exact-rational copy of the model) is the 24GB-box
@@ -927,6 +955,10 @@ fn intersect_alpha_crown_tightening(
 /// `obbt_relaxation_tightens_coupled_box`) as a reusable capability; the lever
 /// that WOULD bite is property-CONDITIONED OBBT (the violation row in the LP),
 /// which is a larger, per-band-row change.
+///
+/// DARK by design: no typed preset key and no `run_instance.sh` export, because
+/// the measurement above is a ZERO — there is nothing to deliver. Wire a preset
+/// key only if property-CONDITIONED OBBT lands and measures non-zero.
 fn whole_net_obbt_enabled() -> bool {
     matches!(
         std::env::var("NY_REL_WHOLE_MIP_OBBT").ok().as_deref(),
@@ -1495,12 +1527,14 @@ fn whole_net_certified_band_unsat_inner(
             debug!("rel whole-net MIP: less than 0.1s remains before row {ri}; fail-open");
             return GraphMipLeafVerdict::Undecided;
         }
+        let ay_node_warm_time_limit = enc.ay_node_warm_time_limit();
         let solver = MipSolver::new(
             enc.into_parts(),
             MipConfig {
                 backend: MipBackend::Ay,
                 timeout_secs: per_row.min(remaining),
                 parallel_split: 1,
+                ay_node_warm_time_limit,
                 ..Default::default()
             },
         );
@@ -1650,12 +1684,14 @@ fn whole_net_certified_band_unsat_conditioned(
             return GraphMipLeafVerdict::Undecided;
         }
         let solve_budget = (per_row_total * (1.0 - frac)).max(0.1).min(remaining);
+        let ay_node_warm_time_limit = enc.ay_node_warm_time_limit();
         let solver = MipSolver::new(
             enc.into_parts(),
             MipConfig {
                 backend: MipBackend::Ay,
                 timeout_secs: solve_budget,
                 parallel_split: 1,
+                ay_node_warm_time_limit,
                 ..Default::default()
             },
         );
@@ -1696,14 +1732,102 @@ impl IsVerified for GraphMipLeafVerdict {
 /// verifier; exact `NY_GRAPH_MIP_LEAF=0` returns `None` and leaves BaB unchanged.
 pub(super) fn maybe_graph_mip_leaf_oracle(
     backend: MipBackend,
+    vnnlib: Option<&VnnLibSpec>,
 ) -> Option<Arc<dyn GraphMipLeafOracle>> {
     if !graph_mip_leaf_enabled() {
         return None;
     }
-    info!("Graph-MIP LEAF oracle armed (default-on; NY_GRAPH_MIP_LEAF=0 disables)");
-    Some(Arc::new(GraphMipLeafSolver::new(backend)))
+    // Witness publication is admissible only when the property has no
+    // per-clause input boxes; see `GraphMipLeafSolver::may_publish_violation_witness`.
+    let may_publish = witness_publication_is_admissible(vnnlib);
+    info!(
+        may_publish_violation_witness = may_publish,
+        "Graph-MIP LEAF oracle armed (default-on; NY_GRAPH_MIP_LEAF=0 disables)"
+    );
+    Some(Arc::new(GraphMipLeafSolver::with_publication(
+        backend,
+        may_publish,
+    )))
 }
 
-#[cfg(test)]
+/// A leaf witness may be published only when EVERY output row holding at the
+/// point implies the property is violated. Per-clause input boxes break that
+/// implication (the point comes from the hull, not from any clause's own box),
+/// so their presence disqualifies publication.
+///
+/// `None` — no spec reached this dispatch — is NOT admissible: without the spec
+/// the clause layout is unknown, and unknown must fail closed.
+pub(super) fn witness_publication_is_admissible(vnnlib: Option<&VnnLibSpec>) -> bool {
+    vnnlib.is_some_and(|spec| spec.per_clause_input_bounds.is_empty())
+}
+
 #[path = "graph_mip_leaf_tests.rs"]
-mod tests;
+pub(crate) mod research;
+
+#[cfg(test)]
+mod witness_publication_tests {
+    use super::{witness_publication_is_admissible, GraphMipLeafSolver};
+    use ny_mip::MipBackend;
+    use ny_onnx::vnnlib::VnnLibSpec;
+    use ny_propagate::beta_crown::graph_mip_leaf::GraphMipLeafOracle;
+
+    fn spec_with_per_clause_boxes(n: usize) -> VnnLibSpec {
+        let mut spec = VnnLibSpec::default();
+        for i in 0..n {
+            let mut box_i = std::collections::BTreeMap::new();
+            box_i.insert(0usize, (i as f64, i as f64 + 1.0));
+            spec.per_clause_input_bounds.push(box_i);
+        }
+        spec
+    }
+
+    /// A spec whose clauses carry their OWN input boxes must NOT publish leaf
+    /// witnesses: every output row holding at a hull point implies nothing
+    /// about any clause, so the lane's all-rows check is not sufficient there.
+    #[test]
+    fn per_clause_input_boxes_disqualify_witness_publication() {
+        assert!(!witness_publication_is_admissible(Some(
+            &spec_with_per_clause_boxes(2)
+        )));
+        assert!(!witness_publication_is_admissible(Some(
+            &spec_with_per_clause_boxes(1)
+        )));
+    }
+
+    /// Without per-clause input boxes the all-rows check IS sufficient
+    /// (conjunctive: exact; single-box disjunctions: sufficient).
+    #[test]
+    fn a_single_shared_input_box_admits_publication() {
+        assert!(witness_publication_is_admissible(Some(
+            &VnnLibSpec::default()
+        )));
+    }
+
+    /// No spec reaching dispatch means the clause layout is unknown, and
+    /// unknown must fail closed rather than default to publishing.
+    #[test]
+    fn an_absent_spec_is_not_admissible() {
+        assert!(!witness_publication_is_admissible(None));
+    }
+
+    /// The plain constructor must stay FAIL-CLOSED, so a future call site that
+    /// forgets to classify the layout cannot silently start publishing.
+    #[test]
+    fn the_default_constructor_does_not_publish() {
+        let solver = GraphMipLeafSolver::new(MipBackend::default());
+        assert!(
+            !solver.may_publish_violation_witness(),
+            "GraphMipLeafSolver::new must default to advisory-only"
+        );
+    }
+
+    /// And the explicit constructor carries the caller's answer through to the
+    /// trait method the BaB lane consults.
+    #[test]
+    fn the_explicit_constructor_carries_the_layout_answer() {
+        let publishing = GraphMipLeafSolver::with_publication(MipBackend::default(), true);
+        assert!(publishing.may_publish_violation_witness());
+        let advisory = GraphMipLeafSolver::with_publication(MipBackend::default(), false);
+        assert!(!advisory.may_publish_violation_witness());
+    }
+}

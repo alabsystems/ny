@@ -23,8 +23,9 @@ use super::*;
 /// Part of #3520 Packet C.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_talker_training_signal_property_smoke_3520() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let seq_len = TALKER_ATTENTION_SHORT_SEQ_LEN;
     let epsilon = 5e-4;
     let fixture = build_talker_property_sweep_fixture(seq_len, epsilon);
@@ -48,8 +49,9 @@ fn test_talker_training_signal_property_smoke_3520() {
 /// provenance, not just the lower-level graph API.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_talker_training_signal_property_deadline_fallback_3520() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let fixture = build_talker_property_sweep_fixture_with_deadline(
         TALKER_ATTENTION_SHORT_SEQ_LEN,
         5e-4,
@@ -82,8 +84,9 @@ fn test_talker_training_signal_property_deadline_fallback_3520() {
 /// certification status as the conservative centroid-gap interval check.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_talker_training_signal_property_slack_tracks_centroid_status_3520() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let seq_len = TALKER_ATTENTION_SHORT_SEQ_LEN;
     let epsilon = 5e-4;
     let fixture = build_talker_property_sweep_fixture(seq_len, epsilon);

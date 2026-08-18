@@ -47,4 +47,5 @@ mod structural;
 mod training_signal;
 pub(crate) mod verifier_smoke;
 
+#[cfg(feature = "ort")]
 pub(super) use self::structural::kokoro_vocoder_concrete_waveform_from_ort;

@@ -300,13 +300,9 @@ fn tensor_f32(name: &str, shape: &[i64], data: &[f32]) -> onnx_proto::TensorProt
 fn float_attr(name: &str, value: f32) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
-        f: value,
-        i: 0,
-        s: Vec::new(),
-        t: None,
+        f: Some(value),
         r#type: onnx_proto::attribute_type::FLOAT,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -344,6 +340,7 @@ fn standalone_bn_relu_model_bytes() -> Vec<u8> {
             tensor_f32("bn_mean", &[2], &[0.1, -0.2]),
             tensor_f32("bn_var", &[2], &[0.9, 1.6]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 2, 2, 2], 1)],
         output: vec![tensor_value_info("out", &[1, 2, 2, 2], 1)],
         #[cfg(feature = "onnx-value-info")]

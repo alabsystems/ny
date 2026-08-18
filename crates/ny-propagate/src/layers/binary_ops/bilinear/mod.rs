@@ -10,7 +10,7 @@ use crate::layers::activations::validate::validate_finite;
 
 mod batched;
 mod linear;
-mod mccormick;
+pub(super) mod mccormick;
 mod nd_compose;
 mod relaxation;
 #[cfg(test)]

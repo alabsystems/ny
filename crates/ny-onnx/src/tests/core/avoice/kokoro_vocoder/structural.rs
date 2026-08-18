@@ -10,7 +10,9 @@ use super::model::{
     KOKORO_VOCODER_STRUCTURAL_T,
 };
 use super::*;
+#[cfg(feature = "ort")]
 use ndarray::{ArrayD, IxDyn};
+#[cfg(feature = "ort")]
 use ort::{session::Session, value::TensorRef};
 
 fn synthetic_kokoro_vocoder_shape_model(output_shape: Vec<i64>) -> OnnxModel {
@@ -49,6 +51,7 @@ fn synthetic_kokoro_vocoder_shape_model(output_shape: Vec<i64>) -> OnnxModel {
 /// Run the real Kokoro vocoder via ORT and return (shape, data).
 ///
 /// Shared backend for the shape-only helper and the full waveform helper.
+#[cfg(feature = "ort")]
 fn kokoro_vocoder_ort_forward(
     feature_t: usize,
     har_t: usize,
@@ -93,6 +96,7 @@ fn kokoro_vocoder_ort_forward(
     Ok((shape_vec, data.to_vec()))
 }
 
+#[cfg(feature = "ort")]
 fn kokoro_vocoder_output_shape_from_ort(
     feature_t: usize,
     har_t: usize,
@@ -109,6 +113,7 @@ fn kokoro_vocoder_output_shape_from_ort(
 /// infeasible on CPU.
 ///
 /// Reference: designs/2026-03-15-issue-3719-ort-concrete-speaker-bridge.md
+#[cfg(feature = "ort")]
 pub(crate) fn kokoro_vocoder_concrete_waveform_from_ort(
     feature_t: usize,
     center_value: f32,
@@ -167,8 +172,9 @@ fn test_unbatched_shape_from_input_spec_replaces_dynamic_axes_3500() {
 }
 
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_load_kokoro_vocoder_with_fixed_aux_uses_exported_har_contract_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let model = load_kokoro_vocoder_with_fixed_aux(KOKORO_VOCODER_MIN_FIXED_AUX_T);
     let style = model
         .weights
@@ -224,8 +230,9 @@ fn test_assert_kokoro_vocoder_io_shapes_rejects_non_channel_axis_one_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(60000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_load_avoice_kokoro_vocoder_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let path = require_test_model_with_hint(KOKORO_VOCODER_FILE, AVOICE_TEST_MODEL_HINT);
     let model = load_onnx(&path).expect("Failed to load kokoro_vocoder.onnx");
 
@@ -283,9 +290,11 @@ fn test_load_avoice_kokoro_vocoder_3500() {
 }
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(60000))]
+#[cfg(feature = "ort")]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_kokoro_vocoder_ort_forward_accepts_exported_har_contract_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     for feature_t in [1, 6] {
         let har_t = kokoro_har_time_for_features_t(feature_t);
         let output_shape = kokoro_vocoder_output_shape_from_ort(feature_t, har_t)
@@ -316,9 +325,11 @@ fn test_kokoro_vocoder_ort_forward_accepts_exported_har_contract_3500() {
 }
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(60000))]
+#[cfg(feature = "ort")]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_kokoro_vocoder_ort_rejects_equal_axis_har_shape_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     // Use features_t=6 explicitly (not MIN_FIXED_AUX_T) because har_t=1
     // broadcasts universally — the rejection only triggers when har_t > 1
     // but differs from the expected contract.
@@ -348,8 +359,9 @@ fn test_kokoro_vocoder_ort_rejects_equal_axis_har_shape_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_graph_avoice_kokoro_vocoder_fixed_aux_fuses_instance_norm_3591() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let model = load_kokoro_vocoder_with_fixed_aux(KOKORO_VOCODER_STRUCTURAL_T);
     let graph = model
         .to_graph_network()
@@ -379,8 +391,9 @@ fn test_graph_avoice_kokoro_vocoder_fixed_aux_fuses_instance_norm_3591() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_kokoro_vocoder_graph_node_inventory_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     let model = load_kokoro_vocoder_with_fixed_aux(KOKORO_VOCODER_STRUCTURAL_T);
     let graph = model
         .to_graph_network()

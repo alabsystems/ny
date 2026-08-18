@@ -64,8 +64,8 @@ pub(crate) struct ConstantConstraintParams {
 #[derive(Debug, Clone)]
 pub(crate) struct RelationalObjective {
     /// Specification coefficient vector. Length = num_outputs.
-    /// For LessEq(i,j): coeffs[i] = 1.0, coeffs[j] = -1.0 (compute Y_i - Y_j).
-    /// For GreaterEq(i,j): coeffs[j] = 1.0, coeffs[i] = -1.0 (compute Y_j - Y_i).
+    /// For LessEq(i,j): `coeffs[i] = 1.0`, `coeffs[j] = -1.0` (compute Y_i - Y_j).
+    /// For GreaterEq(i,j): `coeffs[j] = 1.0`, `coeffs[i] = -1.0` (compute Y_j - Y_i).
     pub(crate) spec_coeffs: Vec<f32>,
     /// Human-readable constraint description (e.g., "Y_0 <= Y_1").
     pub(crate) constraint_desc: String,
@@ -91,8 +91,8 @@ pub(crate) enum ConstraintObjective {
         /// Extracted constant constraint parameters.
         params: ConstantConstraintParams,
         /// Specification coefficient vector (one-hot at output_idx, sign-adjusted).
-        /// For GreaterEqConst(i, c): coeffs[i] = 1.0 (verify upper < c).
-        /// For LessEqConst(i, c): coeffs[i] = -1.0 (verify -lower > -c).
+        /// For GreaterEqConst(i, c): `coeffs[i] = 1.0` (verify upper < c).
+        /// For LessEqConst(i, c): `coeffs[i] = -1.0` (verify -lower > -c).
         spec_coeffs: Vec<f32>,
         /// Effective threshold after sign adjustment.
         threshold: f32,
@@ -177,13 +177,12 @@ pub(crate) fn classify_constraints(vnnlib: &VnnLibSpec) -> ConstraintClassificat
 /// "no constant found" case explicit via `Option`, preventing silent fallback
 /// to `(0.0, false, 0)`.
 pub(crate) fn extract_constant_params(vnnlib: &VnnLibSpec) -> Option<ConstantConstraintParams> {
-    use ny_tensor::{next_down_f32, next_up_f32};
     vnnlib.output_constraints.iter().find_map(|c| match c {
         OutputConstraint::GreaterEqConst(i, val) | OutputConstraint::GreaterThanConst(i, val) => {
             // Property: Y_i >= c (unsafe). Standard verification proves upper(Y_i) < threshold.
             // Round DOWN so threshold <= c → verified upper(Y_i) is still < c. (#3462)
             Some(ConstantConstraintParams {
-                threshold: next_down_f32(*val as f32),
+                threshold: ny_core::f64_to_f32_down(*val),
                 verify_upper: true,
                 output_idx: *i,
             })
@@ -192,7 +191,7 @@ pub(crate) fn extract_constant_params(vnnlib: &VnnLibSpec) -> Option<ConstantCon
             // Property: Y_i <= c (unsafe). Standard verification proves lower(Y_i) > threshold.
             // Round UP so threshold >= c → verified lower(Y_i) is still > c. (#3462)
             Some(ConstantConstraintParams {
-                threshold: next_up_f32(*val as f32),
+                threshold: ny_core::f64_to_f32_up(*val),
                 verify_upper: false,
                 output_idx: *i,
             })
@@ -223,29 +222,26 @@ pub(crate) fn extract_all_constant_params(vnnlib: &VnnLibSpec) -> Vec<ConstantCo
 ///
 /// Returns `None` for relational constraints.
 ///
-/// Uses EXACT f64→f32 cast for thresholds (no ULP shift). This function is
-/// used by `build_constraint_objective` for per-constraint and multi-objective
-/// violation proofs, where the spec coefficients are NEGATED. In the negated
-/// context, `next_up_f32` would make verification EASIER (proving Y_0 < c+ε
-/// instead of Y_0 < c), which is unsound for violation proofs.
-///
-/// The standard path (`extract_constant_params`) uses directed rounding aligned
-/// with the proof direction: `next_down_f32` when proving `upper(Y) < c`, and
-/// `next_up_f32` when proving `lower(Y) > c`.
+/// Uses directed f64→f32 conversion aligned with the eventual *negated*
+/// violation proof. For unsafe `Y >= c`, the objective proves `-Y > -c`, so we
+/// store `floor_f32(c)` and later negate it: `-floor(c) >= -c` is a stricter,
+/// sound threshold. For unsafe `Y <= c`, the objective proves `Y > c`, so the
+/// stored threshold is `ceil_f32(c) >= c`. A plain nearest cast can move either
+/// threshold in the proof-easier direction.
 fn constant_params_from_constraint(
     constraint: &OutputConstraint,
 ) -> Option<ConstantConstraintParams> {
     match constraint {
         OutputConstraint::GreaterEqConst(i, val) | OutputConstraint::GreaterThanConst(i, val) => {
             Some(ConstantConstraintParams {
-                threshold: *val as f32,
+                threshold: ny_core::f64_to_f32_down(*val),
                 verify_upper: true,
                 output_idx: *i,
             })
         }
         OutputConstraint::LessEqConst(i, val) | OutputConstraint::LessThanConst(i, val) => {
             Some(ConstantConstraintParams {
-                threshold: *val as f32,
+                threshold: ny_core::f64_to_f32_up(*val),
                 verify_upper: false,
                 output_idx: *i,
             })
@@ -337,8 +333,8 @@ pub(crate) fn build_constraint_objective(
 ///
 /// The coefficient vector encodes the constraint as a linear combination of
 /// outputs suitable for verification:
-/// - `LessEq(i,j)` / `LessThan(i,j)` → coeffs[i]=1.0, coeffs[j]=-1.0, verify upper
-/// - `GreaterEq(i,j)` / `GreaterThan(i,j)` → coeffs[j]=1.0, coeffs[i]=-1.0, verify lower
+/// - `LessEq(i,j)` / `LessThan(i,j)` → `coeffs[i]=1.0`, `coeffs[j]=-1.0`, verify upper
+/// - `GreaterEq(i,j)` / `GreaterThan(i,j)` → `coeffs[j]=1.0`, `coeffs[i]=-1.0`, verify lower
 ///
 /// Reference: alpha-beta-CROWN constructs identical objective vectors for
 /// per-property BaB verification in `bab_verification.py`.
@@ -531,24 +527,16 @@ mod tests {
     fn test_extract_constant_params_greater_eq() {
         let spec = make_spec(vec![OutputConstraint::GreaterEqConst(2, 3.99)], false);
         let params = extract_constant_params(&spec).expect("should find constant");
-        // Proving upper(Y_2) < c requires rounding the threshold DOWN so the
-        // proof target stays at or below the original constant.
-        let raw = 3.99f32;
+        // Proving upper(Y_2) < c requires a threshold no greater than the
+        // original f64 constant, without an unnecessary extra ULP.
+        let original = 3.99_f64;
         assert!(
-            params.threshold < raw,
-            "next_down_f32 must round DOWN for soundness: got {}, expected < {}",
+            f64::from(params.threshold) <= original,
+            "threshold must round DOWN for soundness: got {}, expected <= {}",
             params.threshold,
-            raw
+            original
         );
-        assert!(
-            (params.threshold - raw).abs() < 1e-6,
-            "ULP shift should be tiny: delta = {}",
-            (params.threshold - raw).abs()
-        );
-        assert_ne!(
-            params.threshold, raw,
-            "threshold must differ from raw cast — next_down_f32 must be applied"
-        );
+        assert_eq!(params.threshold, ny_core::f64_to_f32_down(original));
         assert!(params.verify_upper);
         assert_eq!(params.output_idx, 2);
     }
@@ -557,24 +545,16 @@ mod tests {
     fn test_extract_constant_params_less_eq() {
         let spec = make_spec(vec![OutputConstraint::LessEqConst(1, 5.0)], false);
         let params = extract_constant_params(&spec).expect("should find constant");
-        // Proving lower(Y_1) > c requires rounding the threshold UP so the
-        // proof target stays at or above the original constant.
-        let raw = 5.0f32;
+        // Proving lower(Y_1) > c requires a threshold no less than the
+        // original f64 constant. Exactly representable constants remain exact.
+        let original = 5.0_f64;
         assert!(
-            params.threshold > raw,
-            "next_up_f32 must round UP for soundness: got {}, expected > {}",
+            f64::from(params.threshold) >= original,
+            "threshold must round UP for soundness: got {}, expected >= {}",
             params.threshold,
-            raw
+            original
         );
-        assert!(
-            (params.threshold - raw).abs() < 1e-6,
-            "ULP shift should be tiny: delta = {}",
-            (params.threshold - raw).abs()
-        );
-        assert_ne!(
-            params.threshold, raw,
-            "threshold must differ from raw cast — next_up_f32 must be applied"
-        );
+        assert_eq!(params.threshold, 5.0_f32);
         assert!(!params.verify_upper);
         assert_eq!(params.output_idx, 1);
     }
@@ -836,18 +816,10 @@ mod tests {
         );
     }
 
-    /// Verify that `build_multi_objectives` produces EXACT thresholds for constant
-    /// constraints (no ULP shift). The multi-objective path proves constraints are
-    /// VIOLATED (negated sense), so any ULP shift in the "easier" direction is
-    /// unsound — it could cause false Verified results at boundary values.
-    ///
-    /// The standard path (`extract_constant_params`) shifts thresholds toward the
-    /// proof obligation: `next_down_f32` for `upper(Y) < c`, `next_up_f32` for
-    /// `lower(Y) > c`.
-    ///
-    /// Part of #3334: caught by sat_relu SAT instances returning false Verified.
+    /// Exactly representable constants need no gratuitous ULP widening even
+    /// though the conversion is directed.
     #[test]
-    fn test_build_multi_objectives_exact_thresholds_no_ulp_shift() {
+    fn test_build_multi_objectives_exactly_representable_thresholds_do_not_shift() {
         // Mimics sat_relu property: Y_0 >= 1.0 AND Y_1 <= 0.0
         let spec = make_spec(
             vec![
@@ -863,17 +835,17 @@ mod tests {
         assert_eq!(thresholds.len(), 2);
 
         // GreaterEqConst(0, 1.0): prove violation -Y_0 > -1.0
-        // Threshold must be EXACTLY -1.0, not -1.0000001 (next_up_f32 would be unsound)
+        // Directed floor(1.0) is exactly 1.0, then the objective negates it.
         assert_eq!(
             thresholds[0], -1.0f32,
-            "threshold for GreaterEqConst must be exact (no ULP shift)"
+            "exactly representable GreaterEqConst must not shift"
         );
 
         // LessEqConst(1, 0.0): prove violation Y_1 > 0.0
-        // Threshold must be EXACTLY 0.0, not -0.0 or any shifted value
+        // Directed ceil(0.0) is exactly 0.0.
         assert_eq!(
             thresholds[1], 0.0f32,
-            "threshold for LessEqConst must be exact (no ULP shift)"
+            "exactly representable LessEqConst must not shift"
         );
 
         // Verify spec coefficients are correct
@@ -881,6 +853,68 @@ mod tests {
         assert_eq!(objectives[0], vec![-1.0, 0.0, 0.0, 0.0, 0.0]);
         // LessEqConst(1, 0.0): prove Y_1 > 0.0 → coeffs[1] = 1.0
         assert_eq!(objectives[1], vec![0.0, 1.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// Pin the planner-to-proof-plan signed-zero contract used by the exact
+    /// Cersyve conic objective. `GreaterEqConst(_, +0.0)` is normalized by
+    /// negation and therefore deliberately produces a `-0.0` threshold.
+    #[test]
+    fn cersyve_atoms_build_the_exact_authenticated_conic_shape() {
+        let mut spec = make_spec(
+            vec![
+                OutputConstraint::LessEqConst(0, 0.0),
+                OutputConstraint::GreaterEqConst(1, 0.0),
+            ],
+            false,
+        );
+        spec.num_outputs = 2;
+
+        let (objectives, thresholds) =
+            build_multi_objectives(&spec).expect("Cersyve objectives should build");
+        assert_eq!(objectives, vec![vec![1.0, 0.0], vec![0.0, -1.0]]);
+        assert_eq!(thresholds[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(thresholds[1].to_bits(), (-0.0f32).to_bits());
+
+        let proof =
+            ny_propagate::ConjunctiveProofObjectives::try_exact_two_row_zero_threshold_unit_conic(
+                &objectives,
+                &thresholds,
+            )
+            .expect("the actual planner output must enter the authenticated proof plan");
+        assert_eq!(proof.len(), 3);
+    }
+
+    /// Non-representable f64 constants are rounded toward the stricter side of
+    /// the proof obligation. These inequalities are the load-bearing contract:
+    /// `spec·Y > threshold_f32` must imply violation of the original real-valued
+    /// constraint, not merely of a nearest-f32 surrogate.
+    #[test]
+    fn test_build_multi_objectives_directs_nonrepresentable_thresholds_soundly() {
+        let c = 0.1_f64;
+        let spec = make_spec(
+            vec![
+                OutputConstraint::GreaterEqConst(0, c),
+                OutputConstraint::LessEqConst(1, c),
+            ],
+            false,
+        );
+        let (_objectives, thresholds) =
+            build_multi_objectives(&spec).expect("should build directed objectives");
+
+        assert!(
+            f64::from(thresholds[0]) >= -c,
+            "-Y > threshold must be at least as strict as -Y > -c: {} < {}",
+            thresholds[0],
+            -c
+        );
+        assert!(
+            f64::from(thresholds[1]) >= c,
+            "Y > threshold must be at least as strict as Y > c: {} < {}",
+            thresholds[1],
+            c
+        );
+        assert_eq!(thresholds[0], -ny_core::f64_to_f32_down(c));
+        assert_eq!(thresholds[1], ny_core::f64_to_f32_up(c));
     }
 
     /// Grouped planner preserves clause boundaries as clause_sizes.

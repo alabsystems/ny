@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ndarray::{Array, Array1, Array2, ArrayBase, ArrayD, ArrayViewD, Data, Dimension, Zip};
-use ny_core::checked_shape_product;
+use ny_core::{
+    checked_shape_product,
+    dd::{next_down_f64, next_up_f64, two_sum},
+};
 use ny_tensor::{next_down_f32, next_up_f32};
 use std::mem::size_of;
 
@@ -29,6 +32,11 @@ pub(crate) struct BatchedLinearBounds64 {
     lower_b: ArrayD<f64>,
     upper_a: ArrayD<f64>,
     upper_b: ArrayD<f64>,
+    /// Certified absolute coefficient error carried across f64 fan-in.
+    /// `None` means the stored coefficients are exact at this point.
+    lower_a_err: Option<ArrayD<f64>>,
+    /// Upper-coefficient counterpart of [`Self::lower_a_err`].
+    upper_a_err: Option<ArrayD<f64>>,
     input_shape: Vec<usize>,
     output_shape: Vec<usize>,
 }
@@ -40,8 +48,30 @@ impl BatchedLinearBounds64 {
             lower_b: bounds.lower_b().mapv(f64::from),
             upper_a: bounds.upper_a().mapv(f64::from),
             upper_b: bounds.upper_b().mapv(f64::from),
+            lower_a_err: bounds
+                .lower_a_err
+                .as_ref()
+                .map(|error| Self::widen_coefficient_error(error, bounds.lower_a())),
+            upper_a_err: bounds
+                .upper_a_err
+                .as_ref()
+                .map(|error| Self::widen_coefficient_error(error, bounds.upper_a())),
             input_shape: bounds.input_shape().to_vec(),
             output_shape: bounds.output_shape().to_vec(),
+        }
+    }
+
+    fn widen_coefficient_error(error: &ArrayD<f32>, coefficients: &ArrayD<f32>) -> ArrayD<f64> {
+        if error.shape() == coefficients.shape() {
+            error.mapv(|value| {
+                if value.is_finite() && value >= 0.0 {
+                    f64::from(value)
+                } else {
+                    f64::INFINITY
+                }
+            })
+        } else {
+            ArrayD::from_elem(coefficients.raw_dim(), f64::INFINITY)
         }
     }
 
@@ -50,6 +80,7 @@ impl BatchedLinearBounds64 {
         let num_rows = self.lower_b.len();
         let input_shape = self.input_shape;
         let output_shape = self.output_shape;
+        let has_err = self.lower_a_err.is_some() || self.upper_a_err.is_some();
         let Some(lower_a) = Self::reshape_coefficients(self.lower_a, num_rows, in_dim, "lower_a")
         else {
             return BatchedLinearBounds::conservative(input_shape, output_shape);
@@ -64,6 +95,28 @@ impl BatchedLinearBounds64 {
         let Some(upper_b) = Self::reshape_bias(self.upper_b, num_rows, "upper_b") else {
             return BatchedLinearBounds::conservative(input_shape, output_shape);
         };
+        let lower_a_err = match self.lower_a_err {
+            Some(error) => {
+                let Some(error) =
+                    Self::reshape_coefficients(error, num_rows, in_dim, "lower_a_err")
+                else {
+                    return BatchedLinearBounds::conservative(input_shape, output_shape);
+                };
+                Some(error)
+            }
+            None => None,
+        };
+        let upper_a_err = match self.upper_a_err {
+            Some(error) => {
+                let Some(error) =
+                    Self::reshape_coefficients(error, num_rows, in_dim, "upper_a_err")
+                else {
+                    return BatchedLinearBounds::conservative(input_shape, output_shape);
+                };
+                Some(error)
+            }
+            None => None,
+        };
 
         let mut result =
             BatchedLinearBounds::conservative(input_shape.clone(), output_shape.clone());
@@ -76,18 +129,87 @@ impl BatchedLinearBounds64 {
             num_rows,
             in_dim,
         ) {
+            if has_err {
+                let lower_err = Self::downcast_coefficient_error(
+                    &lower_a,
+                    result.lower_a(),
+                    lower_a_err.as_ref(),
+                );
+                let upper_err = Self::downcast_coefficient_error(
+                    &upper_a,
+                    result.upper_a(),
+                    upper_a_err.as_ref(),
+                );
+                result.set_coeff_err(lower_err, upper_err);
+            }
             result
         } else {
             BatchedLinearBounds::conservative(input_shape, output_shape)
         }
     }
 
+    /// Reconstitute an f32 coefficient certificate after the f64 sidecar is
+    /// downcast. The certificate includes both carried fan-in error and the
+    /// exact gap between the f64 coefficient and its stored f32 value.
+    fn downcast_coefficient_error(
+        source: &Array2<f64>,
+        stored: &ArrayD<f32>,
+        carried: Option<&Array2<f64>>,
+    ) -> ArrayD<f32> {
+        let mut result = ArrayD::zeros(stored.raw_dim());
+        let mut carried_values = carried.map(|error| error.iter());
+        for ((out, &stored_value), &source_value) in
+            result.iter_mut().zip(stored.iter()).zip(source.iter())
+        {
+            let carried_value = carried_values
+                .as_mut()
+                .and_then(|values| values.next())
+                .copied()
+                .unwrap_or(0.0);
+            let cast_gap = (f64::from(stored_value) - source_value).abs();
+            *out = Self::err_to_f32(Self::add_nonnegative_f64_up(carried_value, cast_gap));
+        }
+        result
+    }
+
     pub(crate) fn accumulate(&mut self, new_bounds: &BatchedLinearBounds) {
+        if new_bounds
+            .lower_a_err
+            .as_ref()
+            .is_some_and(|error| error.shape() != new_bounds.lower_a().shape())
+            || new_bounds
+                .upper_a_err
+                .as_ref()
+                .is_some_and(|error| error.shape() != new_bounds.upper_a().shape())
+        {
+            tracing::warn!(
+                "BatchedLinearBounds64 incoming coefficient-error shape mismatch; widening accumulator to infinities"
+            );
+            Self::widen_to_infinities(self);
+            return;
+        }
+
         if self.matches(new_bounds) {
-            Self::accumulate_array(&mut self.lower_a, new_bounds.lower_a(), true);
+            let lower_roundoff =
+                Self::accumulate_coeff_array(&mut self.lower_a, new_bounds.lower_a());
             Self::accumulate_array(&mut self.lower_b, new_bounds.lower_b(), true);
-            Self::accumulate_array(&mut self.upper_a, new_bounds.upper_a(), false);
+            let upper_roundoff =
+                Self::accumulate_coeff_array(&mut self.upper_a, new_bounds.upper_a());
             Self::accumulate_array(&mut self.upper_b, new_bounds.upper_b(), false);
+            let lower_shape = self.lower_a.raw_dim();
+            let upper_shape = self.upper_a.raw_dim();
+            Self::accumulate_err(
+                &mut self.lower_a_err,
+                new_bounds.lower_a_err.as_ref(),
+                &lower_roundoff,
+                lower_shape,
+            );
+            Self::accumulate_err(
+                &mut self.upper_a_err,
+                new_bounds.upper_a_err.as_ref(),
+                &upper_roundoff,
+                upper_shape,
+            );
             return;
         }
 
@@ -101,10 +223,24 @@ impl BatchedLinearBounds64 {
                 new_output_shape = ?new_bounds.output_shape(),
                 "BatchedLinearBounds64 reshaping same-count contribution before accumulation"
             );
-            Self::accumulate_array(&mut self.lower_a, &lower_a, true);
+            let lower_roundoff = Self::accumulate_coeff_array(&mut self.lower_a, &lower_a);
             Self::accumulate_array(&mut self.lower_b, &lower_b, true);
-            Self::accumulate_array(&mut self.upper_a, &upper_a, false);
+            let upper_roundoff = Self::accumulate_coeff_array(&mut self.upper_a, &upper_a);
             Self::accumulate_array(&mut self.upper_b, &upper_b, false);
+            let lower_shape = self.lower_a.raw_dim();
+            let upper_shape = self.upper_a.raw_dim();
+            Self::accumulate_err(
+                &mut self.lower_a_err,
+                new_bounds.lower_a_err.as_ref(),
+                &lower_roundoff,
+                lower_shape,
+            );
+            Self::accumulate_err(
+                &mut self.upper_a_err,
+                new_bounds.upper_a_err.as_ref(),
+                &upper_roundoff,
+                upper_shape,
+            );
             return;
         }
 
@@ -123,7 +259,12 @@ impl BatchedLinearBounds64 {
     }
 
     pub(crate) fn memory_bytes(&self) -> usize {
-        (self.lower_a.len() + self.lower_b.len() + self.upper_a.len() + self.upper_b.len())
+        (self.lower_a.len()
+            + self.lower_b.len()
+            + self.upper_a.len()
+            + self.upper_b.len()
+            + self.lower_a_err.as_ref().map_or(0, ArrayD::len)
+            + self.upper_a_err.as_ref().map_or(0, ArrayD::len))
             * size_of::<f64>()
     }
 
@@ -184,6 +325,90 @@ impl BatchedLinearBounds64 {
         existing.lower_b = Array::from_elem(existing.lower_b.raw_dim(), f64::NEG_INFINITY);
         existing.upper_a = Array::from_elem(existing.upper_a.raw_dim(), f64::INFINITY);
         existing.upper_b = Array::from_elem(existing.upper_b.raw_dim(), f64::INFINITY);
+        existing.lower_a_err = None;
+        existing.upper_a_err = None;
+    }
+
+    fn accumulate_coeff_array<D, S>(
+        existing: &mut ArrayD<f64>,
+        new: &ArrayBase<S, D>,
+    ) -> ArrayD<f64>
+    where
+        D: Dimension,
+        S: Data<Elem = f32>,
+    {
+        let mut roundoff = ArrayD::zeros(existing.raw_dim());
+        for ((existing_value, &new_value), roundoff_value) in
+            existing.iter_mut().zip(new.iter()).zip(roundoff.iter_mut())
+        {
+            if existing_value.is_nan() || new_value.is_nan() {
+                *existing_value = f64::NAN;
+                *roundoff_value = 0.0;
+                continue;
+            }
+            let (sum, residual) = two_sum(*existing_value, f64::from(new_value));
+            *existing_value = sum;
+            *roundoff_value = if sum.is_finite() { residual.abs() } else { 0.0 };
+        }
+        roundoff
+    }
+
+    fn accumulate_err(
+        existing_err: &mut Option<ArrayD<f64>>,
+        new_err: Option<&ArrayD<f32>>,
+        roundoff: &ArrayD<f64>,
+        expected_shape: ndarray::IxDyn,
+    ) {
+        let roundoff_has = roundoff.iter().any(|&value| value != 0.0);
+        if existing_err.is_none() && new_err.is_none() && !roundoff_has {
+            return;
+        }
+        if existing_err
+            .as_ref()
+            .is_some_and(|error| error.shape() != expected_shape.slice())
+            || new_err.is_some_and(|error| error.len() != roundoff.len())
+        {
+            *existing_err = Some(ArrayD::from_elem(expected_shape, f64::INFINITY));
+            return;
+        }
+        let accumulator =
+            existing_err.get_or_insert_with(|| ArrayD::<f64>::zeros(expected_shape.clone()));
+        for (value, &roundoff_value) in accumulator.iter_mut().zip(roundoff.iter()) {
+            *value = Self::add_nonnegative_f64_up(*value, roundoff_value);
+        }
+        if let Some(new_error) = new_err {
+            for (value, &incoming) in accumulator.iter_mut().zip(new_error.iter()) {
+                *value = Self::add_nonnegative_f64_up(*value, f64::from(incoming));
+            }
+        }
+    }
+
+    #[inline]
+    fn add_nonnegative_f64_up(a: f64, b: f64) -> f64 {
+        if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+            return f64::INFINITY;
+        }
+        let (sum, residual) = two_sum(a, b);
+        if !sum.is_finite() {
+            f64::INFINITY
+        } else if residual > 0.0 {
+            next_up_f64(sum)
+        } else {
+            sum
+        }
+    }
+
+    #[inline]
+    fn err_to_f32(error: f64) -> f32 {
+        if !error.is_finite() || error < 0.0 {
+            return f32::INFINITY;
+        }
+        let widened = next_up_f32(error as f32);
+        if widened.is_finite() {
+            widened
+        } else {
+            f32::INFINITY
+        }
     }
 
     fn accumulate_array<D, S>(existing: &mut Array<f64, D>, new: &ArrayBase<S, D>, is_lower: bool)
@@ -203,8 +428,18 @@ impl BatchedLinearBounds64 {
                     *existing_value = nan_fallback;
                     return;
                 }
-                let sum = *existing_value + f64::from(new_value);
-                *existing_value = if sum.is_nan() { nan_fallback } else { sum };
+                let (sum, residual) = two_sum(*existing_value, f64::from(new_value));
+                *existing_value = if sum.is_nan() {
+                    nan_fallback
+                } else if !sum.is_finite() {
+                    sum
+                } else if is_lower && residual < 0.0 {
+                    next_down_f64(sum)
+                } else if !is_lower && residual > 0.0 {
+                    next_up_f64(sum)
+                } else {
+                    sum
+                };
             });
     }
 

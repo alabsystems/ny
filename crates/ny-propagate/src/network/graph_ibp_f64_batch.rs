@@ -47,25 +47,31 @@
 //! at same-kernel shapes, containment at fat shapes, and a cross-box
 //! contamination test (mutating one box leaves the others bit-identical).
 //!
-//! Fail-closed: ANY per-box op error (unsupported op, Div straddling zero
-//! for one box, shape surprise) fails the WHOLE batched walk; the caller
-//! must fall back to per-box evaluation — which reproduces current behavior
-//! byte-for-byte and lets the healthy boxes proceed.
+//! Fail-closed: ANY non-deadline per-box op error (unsupported op, Div
+//! straddling zero for one box, shape surprise) fails the WHOLE batched walk;
+//! the caller may fall back to per-box evaluation, which reproduces current
+//! behavior byte-for-byte and lets the healthy boxes proceed. A
+//! [`NyError::DeadlineExceeded`] from the deadline-aware entry point instead
+//! requires a conservative stop; retrying would repeat expired work.
 //!
 //! Kill-switch: callers gate on [`batch_boxes_enabled`]
 //! (`NY_F64_BATCH_BOXES=0` disables the batched lane; batteries-included
 //! default-ON).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ndarray::{Array2, ArrayD, Ix2, IxDyn};
 use ny_core::{NyError, Result};
 use rayon::prelude::*;
 
+use crate::bounds::safe_math::f32_to_f64_exact_for_bounds;
 use crate::layers::Layer;
 
 use super::core::graph::{GraphNetwork, NETWORK_INPUT};
-use super::graph_ibp_f64_cell::{eval_linear_with_bias, eval_node, Interval64};
+use super::graph_ibp_f64_cell::{
+    eval_linear_with_bias, eval_node, require_f64_interval_proof_environment_rayon, Interval64,
+};
 use super::graph_ibp_f64_gemm::{
     abs_colmax, fast_gemm_enabled, rump_interval_matmul_point_b, FAST_GEMM_MIN_ROWS,
     FAST_GEMM_MIN_VOLUME,
@@ -161,7 +167,7 @@ impl GraphNetwork {
                 let node = self.node(name)?;
                 match node.layer() {
                     Layer::Linear(linear) => {
-                        let wt = linear.weight.t().map(|&w| f64::from(w));
+                        let wt = linear.weight.t().map(|&w| f32_to_f64_exact_for_bounds(w));
                         let wt_abs = wt.mapv(f64::abs);
                         let wt_colmax = abs_colmax(&wt_abs.view());
                         Some((
@@ -191,9 +197,11 @@ impl GraphNetwork {
     /// whenever the stacked Linear takes the same kernel, and a containing
     /// superset when the stacked shape promotes the fast Rump kernel.
     ///
-    /// Errors fail the WHOLE batch (fail-closed): callers must fall back to
-    /// per-box walks, which also isolates any single poisoned box (e.g. a
-    /// Div divisor straddling zero for that box only).
+    /// Non-deadline errors fail the WHOLE batch (fail-closed): callers may
+    /// fall back to per-box walks, which also isolates any single poisoned
+    /// box (e.g. a Div divisor straddling zero for that box only). Deadline
+    /// expiry from the deadline-aware entry point requires a conservative
+    /// stop rather than fallback.
     pub fn propagate_ibp_f64_cells(&self, inputs: &[Interval64]) -> Result<Vec<Interval64>> {
         self.propagate_ibp_f64_cells_cached(inputs, None)
     }
@@ -206,12 +214,42 @@ impl GraphNetwork {
         inputs: &[Interval64],
         weights: Option<&F64WeightCache>,
     ) -> Result<Vec<Interval64>> {
+        self.propagate_ibp_f64_cells_cached_with_deadline(inputs, weights, None)
+    }
+
+    /// Deadline-aware variant of
+    /// [`Self::propagate_ibp_f64_cells_cached`].
+    ///
+    /// Polls between graph nodes.  A currently executing dense kernel remains
+    /// atomic, but a long DAG cannot start another node after expiry.  The
+    /// caller must treat [`NyError::DeadlineExceeded`] as a conservative stop,
+    /// not as a reason to repeat the same boxes through the per-box fallback.
+    pub fn propagate_ibp_f64_cells_cached_with_deadline(
+        &self,
+        inputs: &[Interval64],
+        weights: Option<&F64WeightCache>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Interval64>> {
+        let check_deadline = |stage: &str| -> Result<()> {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                Err(NyError::DeadlineExceeded(format!(
+                    "f64 batched cell forward deadline exceeded {stage}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+
+        check_deadline("before setup")?;
+        require_f64_interval_proof_environment_rayon()?;
+
         let w = inputs.len();
         if w == 0 {
             return Ok(Vec::new());
         }
         let in_shape = inputs[0].lower.shape().to_vec();
         for x in inputs {
+            check_deadline("while validating input boxes")?;
             if x.lower.shape() != in_shape.as_slice() || x.upper.shape() != in_shape.as_slice() {
                 return Err(NyError::InvalidSpec(
                     "f64 batch eval: input boxes must share one shape".to_string(),
@@ -243,6 +281,7 @@ impl GraphNetwork {
             if !needed.contains(node_name.as_str()) {
                 continue;
             }
+            check_deadline("before graph node")?;
             let node = self.node(node_name).ok_or_else(|| {
                 NyError::InvalidSpec(format!("f64 batch eval: missing node '{node_name}'"))
             })?;
@@ -267,7 +306,7 @@ impl GraphNetwork {
                             })?
                     };
                     let prepared = weights.and_then(|c| c.get(node_name.as_str()));
-                    eval_linear_stacked_prepared(linear, xs, true, prepared)?
+                    eval_linear_stacked_prepared(linear, xs, true, prepared, deadline)?
                 }
                 // Everything else: the EXACT single-box rules, per box
                 // (parallel across boxes — read-only view of the cache).
@@ -276,6 +315,7 @@ impl GraphNetwork {
                     (0..w)
                         .into_par_iter()
                         .map(|b| {
+                            check_deadline("before per-box graph-node worker")?;
                             let resolve = |name: &str| -> Result<Interval64> {
                                 resolve_box(inputs, cache_ref, name, b)
                             };
@@ -316,6 +356,7 @@ impl GraphNetwork {
                 }
             }
             cache.insert(node.name(), outs);
+            check_deadline("after graph node")?;
         }
 
         cache.remove(self.output_name()).ok_or_else(|| {
@@ -359,12 +400,12 @@ fn try_eval_linear_prepared(
         if let Some(bias) = linear.bias.as_ref() {
             for mut row_lo in lo.rows_mut() {
                 for (l, &b) in row_lo.iter_mut().zip(bias.iter()) {
-                    *l = (*l + f64::from(b)).next_down();
+                    *l = (*l + f32_to_f64_exact_for_bounds(b)).next_down();
                 }
             }
             for mut row_hi in hi.rows_mut() {
                 for (h, &b) in row_hi.iter_mut().zip(bias.iter()) {
-                    *h = (*h + f64::from(b)).next_up();
+                    *h = (*h + f32_to_f64_exact_for_bounds(b)).next_up();
                 }
             }
         }
@@ -410,12 +451,28 @@ fn resolve_box(
 /// Rump point-B kernel — bit-identical to the unprepared fast path minus
 /// its per-call weight conversion/split; every other case (thin stacks,
 /// `NY_F64_BLAS=0`, kernel decline) takes the standard entry unchanged.
+///
+/// The optional deadline is polled while copying box rows, after the complete
+/// stack has been constructed and immediately before the dense kernel, and
+/// while unstacking. One already-started dense kernel remains atomic.
 pub(super) fn eval_linear_stacked_prepared(
     linear: &crate::layers::LinearLayer,
     xs: &[Interval64],
     include_bias: bool,
     prepared: Option<&PreparedPointWeight>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<Interval64>> {
+    let check_deadline = |stage: &str| -> Result<()> {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            Err(NyError::DeadlineExceeded(format!(
+                "f64 batched Linear deadline exceeded {stage}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+
+    check_deadline("before stacking")?;
     let w = xs.len();
     let shape = xs[0].lower.shape().to_vec();
     if shape.is_empty() {
@@ -434,9 +491,37 @@ pub(super) fn eval_linear_stacked_prepared(
     let in_dim = shape[shape.len() - 1];
     let per_box = rows * in_dim;
 
+    // Stacking is useful only when the combined rows promote this Linear to
+    // the fat Rump kernel.  Below those gates, evaluate each independent
+    // input through the ordinary entry.  Besides avoiding copy overhead,
+    // this preserves its per-input exact-integer reduction decision: applying
+    // that gate to the combined stack let one fractional box disable the
+    // exact path for an unrelated integral box, widening it by a few ulps.
+    // The result stayed sound, but violated the documented same-kernel
+    // bit-identity and needlessly weakened exact SAT/NN4SYS-style rows.
+    let stacked_rows = w.checked_mul(rows).ok_or_else(|| {
+        NyError::InvalidSpec("f64 batch eval: stacked row count overflow".to_string())
+    })?;
+    let stacked_volume = stacked_rows
+        .checked_mul(linear.weight.dim().0)
+        .and_then(|v| v.checked_mul(in_dim));
+    let promotes_fast_kernel = fast_gemm_enabled()
+        && stacked_rows >= FAST_GEMM_MIN_ROWS
+        && stacked_volume.is_some_and(|volume| volume > FAST_GEMM_MIN_VOLUME);
+    if !promotes_fast_kernel {
+        return xs
+            .iter()
+            .map(|x| {
+                check_deadline("while evaluating an unstacked thin Linear")?;
+                eval_linear_with_bias(linear, x, include_bias)
+            })
+            .collect();
+    }
+
     let mut lo = Vec::with_capacity(w * per_box);
     let mut hi = Vec::with_capacity(w * per_box);
     for x in xs {
+        check_deadline("while stacking")?;
         let l_std = x.lower.as_standard_layout();
         let h_std = x.upper.as_standard_layout();
         let (l, h) = match (l_std.as_slice(), h_std.as_slice()) {
@@ -456,6 +541,7 @@ pub(super) fn eval_linear_stacked_prepared(
         upper: ArrayD::from_shape_vec(IxDyn(&[w * rows, in_dim]), hi)
             .map_err(|e| NyError::InvalidSpec(format!("f64 batch eval: stack: {e}")))?,
     };
+    check_deadline("before dense kernel")?;
 
     // Prepared point-B kernel when the stacked shape crosses the same gates
     // the standard entry's fast path uses; a kernel decline (`None`) falls
@@ -466,6 +552,7 @@ pub(super) fn eval_linear_stacked_prepared(
             Some(out) => out,
             None => eval_linear_with_bias(linear, &stacked, include_bias)?,
         };
+    check_deadline("after dense kernel")?;
 
     let (out_dim, _) = linear.weight.dim();
     let mut out_shape = shape[..shape.len() - 1].to_vec();
@@ -489,6 +576,7 @@ pub(super) fn eval_linear_stacked_prepared(
 
     (0..w)
         .map(|b| {
+            check_deadline("while unstacking")?;
             let base = b * out_per_box;
             Ok(Interval64 {
                 lower: ArrayD::from_shape_vec(
@@ -626,6 +714,36 @@ mod tests {
         arr.iter().map(|v| v.to_bits()).collect()
     }
 
+    #[test]
+    fn expired_deadline_stops_batched_cell_before_graph_walk() {
+        let mut rng = Rng(0x00C0_FFEE_5EED_DA7A);
+        let g = build_test_graph(&mut rng);
+        let boxes = vec![random_box(&mut rng, 0.1), random_box(&mut rng, 0.1)];
+        let error = g
+            .propagate_ibp_f64_cells_cached_with_deadline(&boxes, None, Some(Instant::now()))
+            .expect_err("expired deadline must cancel the batched cell walk");
+        assert!(error.is_deadline_exceeded());
+
+        let deadline_none = g
+            .propagate_ibp_f64_cells_cached_with_deadline(&boxes, None, None)
+            .expect("deadline=None batched cell walk");
+        for (index, (input, observed)) in boxes.iter().zip(&deadline_none).enumerate() {
+            let reference = g
+                .propagate_ibp_f64_cell(input)
+                .expect("independent per-box reference");
+            assert_eq!(
+                bits(&reference.lower),
+                bits(&observed.lower),
+                "box {index}: deadline=None changed lower bits versus the independent per-box walk"
+            );
+            assert_eq!(
+                bits(&reference.upper),
+                bits(&observed.upper),
+                "box {index}: deadline=None changed upper bits versus the independent per-box walk"
+            );
+        }
+    }
+
     /// GATE 1 (task test, "same kernel selection forced"): W = 3 boxes keep
     /// the stacked Linear m = 12 BELOW the fast-kernel row gate (16), so the
     /// batched walk uses the EXACT same scalar kernels as three independent
@@ -653,6 +771,42 @@ mod tests {
                 "box {b}: batched upper diverged from per-box (same-kernel regime)"
             );
         }
+    }
+
+    /// A fractional neighbor must not disable the exact-integer Linear path
+    /// for an independent box when the combined stack remains below the fast
+    /// kernel gates.
+    #[test]
+    fn thin_batch_keeps_exact_integer_reduction_isolated_per_box() {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "linear",
+            Layer::Linear(
+                LinearLayer::new(ndarray::arr2(&[[1.0]]), Some(ndarray::arr1(&[0.0]))).unwrap(),
+            ),
+        ));
+        graph.set_output("linear");
+
+        let boxes = vec![
+            Interval64 {
+                lower: ndarray::arr1(&[-1.0]).into_dyn(),
+                upper: ndarray::arr1(&[1.0]).into_dyn(),
+            },
+            Interval64 {
+                lower: ndarray::arr1(&[-0.5]).into_dyn(),
+                upper: ndarray::arr1(&[0.5]).into_dyn(),
+            },
+        ];
+        let batched = graph.propagate_ibp_f64_cells(&boxes).expect("batched walk");
+        for (box_index, input) in boxes.iter().enumerate() {
+            let single = graph
+                .propagate_ibp_f64_cell(input)
+                .expect("independent walk");
+            assert_eq!(bits(&batched[box_index].lower), bits(&single.lower));
+            assert_eq!(bits(&batched[box_index].upper), bits(&single.upper));
+        }
+        assert_eq!(batched[0].lower[[0]], -1.0);
+        assert_eq!(batched[0].upper[[0]], 1.0);
     }
 
     /// GATE 2: W = 16 boxes promote the stacked Linears to the fast Rump
@@ -844,85 +998,5 @@ mod tests {
             env.remove("NY_F64_BATCH_BOXES");
             assert!(batch_boxes_enabled());
         });
-    }
-
-    /// Timing probe (ignored; run with --ignored --nocapture): batched wave
-    /// vs per-box loop at the REAL mscn_2048d shapes (rows 6, k = n = 2048
-    /// Linears), W in {16, 64, 256}.
-    #[test]
-    #[ignore = "manual timing probe"]
-    fn bench_batched_vs_per_box_mscn_shapes() {
-        use std::time::Instant;
-        let mut rng = Rng(0xB7E1_5162_8AED_2A6A);
-        let (rows, k) = (6usize, 2048usize);
-        let mut w1 = Array2::<f32>::zeros((k, k));
-        for v in w1.iter_mut() {
-            *v = (rng.next_unit() * 2.0 - 1.0) as f32;
-        }
-        let mut g = GraphNetwork::new();
-        g.add_node(GraphNode::from_input(
-            "lin1",
-            Layer::Linear(LinearLayer::new(w1.clone(), None).unwrap()),
-        ));
-        g.add_node(GraphNode::new(
-            "relu",
-            Layer::ReLU(ReLULayer),
-            vec!["lin1".to_string()],
-        ));
-        g.add_node(GraphNode::new(
-            "lin2",
-            Layer::Linear(LinearLayer::new(w1, None).unwrap()),
-            vec!["relu".to_string()],
-        ));
-        g.add_node(GraphNode::new(
-            "sum",
-            Layer::ReduceSum(ReduceSumLayer::new(vec![-1], true)),
-            vec!["lin2".to_string()],
-        ));
-        g.add_node(GraphNode::new(
-            "out",
-            Layer::Sigmoid(SigmoidLayer::new()),
-            vec!["sum".to_string()],
-        ));
-        g.set_output("out");
-
-        for &w in &[16usize, 64, 256] {
-            let boxes: Vec<Interval64> = (0..w)
-                .map(|_| {
-                    let n = rows * k;
-                    let mut lo = Vec::with_capacity(n);
-                    let mut hi = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        let c = rng.next_unit() * 2.0 - 1.0;
-                        let r = rng.next_unit() * 1e-6;
-                        lo.push(c - r);
-                        hi.push(c + r);
-                    }
-                    Interval64 {
-                        lower: ArrayD::from_shape_vec(IxDyn(&[rows, k]), lo).unwrap(),
-                        upper: ArrayD::from_shape_vec(IxDyn(&[rows, k]), hi).unwrap(),
-                    }
-                })
-                .collect();
-
-            let t0 = Instant::now();
-            let batched = g.propagate_ibp_f64_cells(&boxes).unwrap();
-            let batched_t = t0.elapsed();
-            std::hint::black_box(batched);
-
-            let t1 = Instant::now();
-            let per_box: Vec<Interval64> = boxes
-                .iter()
-                .map(|x| g.propagate_ibp_f64_cell(x).unwrap())
-                .collect();
-            let per_box_t = t1.elapsed();
-            std::hint::black_box(per_box);
-
-            println!(
-                "[W={w} rows={rows} k=n={k}] batched {batched_t:?} per-box(serial) {per_box_t:?} \
-                 speedup {:.1}x",
-                per_box_t.as_secs_f64() / batched_t.as_secs_f64()
-            );
-        }
     }
 }

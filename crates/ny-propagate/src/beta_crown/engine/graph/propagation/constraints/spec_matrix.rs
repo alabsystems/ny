@@ -19,6 +19,7 @@ use crate::GraphNetwork;
 
 use super::super::super::super::BetaCrownVerifier;
 use super::backward::{BackwardMode, BackwardParams};
+use super::ensure_constrained_propagation_deadline;
 use super::lookups::build_constraint_lookups;
 use super::patches::ConstrainedPatchesPolicy;
 
@@ -44,8 +45,28 @@ impl BetaCrownVerifier {
         std::collections::HashMap<String, Arc<BoundedTensor>>,
         Option<CachedLinearBounds>,
     )> {
+        let deadline = self.effective_graph_bab_deadline();
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "before spec-matrix constrained forward preparation",
+        )?;
         let (mut bounds_cache, constrained_input, exec_order) =
             self.prepare_constrained_graph_bounds(graph, input, context, beta_state, None)?;
+        ensure_constrained_propagation_deadline(deadline, "before spec-matrix Complete Clip")?;
+        self.maybe_apply_complete_clip_root_bank(
+            graph,
+            context,
+            beta_state,
+            None,
+            Some(spec_matrix),
+            &constrained_input,
+            &exec_order,
+            &mut bounds_cache,
+        );
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "after spec-matrix Complete Clip and before constrained backward preparation",
+        )?;
 
         let params = BackwardParams {
             graph,
@@ -57,8 +78,8 @@ impl BetaCrownVerifier {
             spec_matrix: Some(spec_matrix),
             seed_cache,
             capture_linear_bounds,
-            deadline: self.config.alpha_config.deadline,
-            patches_policy: ConstrainedPatchesPolicy::selective_matrix_reentry(),
+            deadline,
+            patches_policy: ConstrainedPatchesPolicy::for_engine(context.engine),
         };
         let result =
             self.backward_crown_constrained(&params, &mut bounds_cache, BackwardMode::Standard)?;
@@ -79,8 +100,28 @@ impl BetaCrownVerifier {
         beta_state: Option<&GraphBetaState>,
         spec_matrix: &ndarray::Array2<f32>,
     ) -> Result<DomainCrownResultWithIntermediates> {
+        let deadline = self.effective_graph_bab_deadline();
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "before spec-matrix constrained forward preparation",
+        )?;
         let (mut bounds_cache, constrained_input, exec_order) =
             self.prepare_constrained_graph_bounds(graph, input, context, beta_state, None)?;
+        ensure_constrained_propagation_deadline(deadline, "before spec-matrix Complete Clip")?;
+        self.maybe_apply_complete_clip_root_bank(
+            graph,
+            context,
+            beta_state,
+            None,
+            Some(spec_matrix),
+            &constrained_input,
+            &exec_order,
+            &mut bounds_cache,
+        );
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "after spec-matrix Complete Clip and before constrained backward preparation",
+        )?;
 
         let lookups = build_constraint_lookups(
             &context.history.constraints,
@@ -88,6 +129,10 @@ impl BetaCrownVerifier {
             graph,
         )?;
 
+        ensure_constrained_propagation_deadline(
+            deadline,
+            "before spec-matrix constrained backward dispatch",
+        )?;
         let params = BackwardParams {
             graph,
             constrained_input: &constrained_input,
@@ -98,8 +143,8 @@ impl BetaCrownVerifier {
             spec_matrix: Some(spec_matrix),
             seed_cache: None,
             capture_linear_bounds: false,
-            deadline: self.config.alpha_config.deadline,
-            patches_policy: ConstrainedPatchesPolicy::selective_matrix_reentry(),
+            deadline,
+            patches_policy: ConstrainedPatchesPolicy::for_engine(context.engine),
         };
         let result = self.backward_crown_constrained(
             &params,

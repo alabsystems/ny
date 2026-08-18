@@ -160,15 +160,15 @@ Next (build-gated): wire cert emission to attest the manifest **by default**
 
 ## VNN-COMP positioning (honest, measured)
 
-Official VNN-COMP 2025 (the most recent edition): 8 teams; ranking
-**α,β-CROWN (1st) · NeuralSAT · PyRAT · CORA · NNV · nnenum · SobolBox**. α,β-CROWN ran
-all benchmarks and scores ~100 on most; scoring = Σ per-benchmark-normalized (top=100;
-+10 correct / −150 wrong / 0 timeout).
+NY was not an official VNN-COMP 2025 or 2026 entrant, so it has no official
+score, rank, or defensible “would place mid-field” result. The repository's
+latest reproducible aggregate is instead a stale, local counterfactual ledger
+measured at a pinned commit; later bank changes have not been re-aggregated and
+most inherited SAT rows lack organizer-replayable witness bundles. Coverage
+research remains useful, but it must not be presented as an official or current
+competition placement. See
+the internal current-state note (`docs/CURRENT_STATE_2026-08-10.md`, not part of the public snapshot)
+for the canonical values, provenance limits, and current evidence boundary.
 
-NY's measured coverage is strong on many benchmarks (collins-rul 100%, dist-shift 100%,
-safenlp ~92%, acasxu ~89%) but has genuine algorithmic gaps where the SOTA scores ~100
-(nn4sys 41/194; lsnc_relu / cora / cifar100 / tinyimagenet timeout). **NY would place
-mid-field, not 1st** — it does not retroactively win on coverage. Closing that gap is a
-multi-year coverage-research program (graph+input-split α-CROWN convergence, the
-deep-resnet keystone BaB). The **proof-carrying moat above is NY's genuine win** on an
-axis the competition does not measure.
+The proof-carrying machinery above remains a separate technical contribution;
+VNN-COMP scoring does not certify that axis.

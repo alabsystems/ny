@@ -5,7 +5,9 @@
 //! Domain processing and split handling.
 
 mod child;
-mod clip;
+// `pub(crate)` for the capability predicate only (see `engine.rs`).
+pub(crate) mod clip;
+mod clip_provenance;
 mod processing;
 mod strengthening;
 

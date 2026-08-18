@@ -12,19 +12,60 @@
 # - STATUS: 100% solve rate on 15-instance sample — all solved instantly
 # - Reference uses sb branching with input_split
 #
-# NN_rul_full_window_* THROUGHPUT NOTE (bound_prop_method: crown):
-#   On the conv NN_rul_full models the α-CROWN-in-BaB path STALLS at the root:
-#   the graph multi-objective BaB burns the whole budget optimizing α (+ GCP
-#   cuts) on the conv graph and NEVER splits (Domains explored: 0-1), so any
-#   instance whose root bound is just-insufficient times out (e.g. abc-unsat
-#   robustness_4perturbations_delta20_w40, monotonicity_CI_shift*_w40).
-#   Plain CROWN makes each per-domain bound ~3-6x cheaper, so BaB actually
-#   branches (hundreds-thousands of domains) and closes the medium band while
-#   matching or beating α-CROWN on the instances it already solved
-#   (2p_delta20 82->51s, 2p_delta40 87->53s, 16p_delta5 88->53s,
-#   mono_shift5 102->64s, mono_shift10 solved 76s, 4p_delta20 timeout->61s).
-#   SOUND: plain CROWN bounds are valid; a VERIFIED verdict is still proven,
-#   and SAT is decided by the PGD/attack lane (unaffected). No wrong verdicts.
+# NN_rul_full_window_* — bound_prop_method: alpha-crown (RESTORED 2026-08-12)
+#
+#   THE PREVIOUS NOTE HERE IS STALE AND ITS CHOICE COST 8 ROWS. It recorded that
+#   the alpha-CROWN-in-BaB path "STALLS at the root ... and NEVER splits
+#   (Domains explored: 0-1), so any instance whose root bound is
+#   just-insufficient times out", and switched the benchmark to plain CROWN so
+#   that BaB would actually branch.
+#
+#   Re-measured on the current binary, that trade is LOSING ON BOTH SIDES.
+#   Under plain CROWN, BaB branches enthusiastically and gets nowhere: on
+#   full_window_20 / 8perturbations_delta20_w20, NY_BRANCH_TRACE reports 8,531
+#   of 8,706 splits (98.0%) with EXACTLY ZERO frontier-bound lift, 17,212
+#   domains explored, and the worst bound taking five distinct values all run
+#   (it gets 7x WORSE at depth 4, then freezes). alpha-beta-CROWN solves the
+#   same row in 7.10 s.
+#
+#   Under alpha-crown the root bound is now sufficient and the row closes with
+#   NO BaB AT ALL (frontier frames: 0), which is exactly how the reference does
+#   it. Full-benchmark re-measure at official per-instance budgets:
+#
+#     plain crown : 54/62 solved, 8 timeouts   (raw 540)
+#     alpha-crown : 62/62 solved, 0 timeouts   (raw 620 == the field best)
+#
+#   All 8 recovered rows land far inside budget (24-102 s against 300-1200 s):
+#   8p_d20_w20 72s, 16p_d20_w20 24s, 8p_d10_w40 58s, 8p_d20_w40 102s,
+#   16p_d10_w40 58s, 16p_d20_w40 58s, 16p_d40_w40 61s, mono_CI_shift20_w40 57s.
+#
+#   CORRECTNESS: all 62 verdicts cross-checked against every tool's published
+#   results.csv — 62 agree, 0 mismatches, 0 rows without field ground truth.
+#   +12.9 normalized points (87.1 -> 100.0).
+#
+#   If a future change makes the root ascent expensive again, re-measure before
+#   reverting: the failure mode this guards against is real, but it is a
+#   THROUGHPUT symptom, and plain CROWN only trades a stalled root for a
+#   useless search.
+#
+# DISJUNCTIVE PREWAVE CAP (audited 2026-08-08, release a0097db7):
+#   The default fractional window admits an optional forward-linear cache warmer
+#   whose cold build dominates these CNNs. An absolute 15s attack cap keeps the
+#   warmer's 10s grace below its 30s cold-build admission floor at every timeout
+#   tier, while leaving the bounded attack-extension rescue available. Use an
+#   absolute cap, not a fractional override: a fraction grows again at the
+#   600/1200s tiers and can re-admit the expensive optional warmer.
+#
+#   Exact official-2025 corpus regression (benchmark rev 8b7b811b): all 23 SAT
+#   rows retained trusted SAT verdicts in 2.18s total (76,884 KiB peak RSS).
+#   Official row 32 repeated UNSAT in 18.41s (125,984/125,772 KiB peak RSS),
+#   down from the canonical 101.26s measurement; both result files are
+#   byte-identical. This is a time/memory improvement, not an added solve.
+#   Rows 33/37/53 reached sound BaB 15s into capped 75s diagnostics but did not
+#   finish, so no solve or score credit is claimed. Same-architecture 2023 proxy
+#   properties did demonstrate the mechanism (root proof after the warmer was
+#   suppressed), but those differently-hashed properties are not 2025 evidence;
+#   see reports/measured-ext/evidence/collins_rul_cnn_2022/corpus_correction_20260808.md.
 
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/collins_rul_cnn_2022
@@ -33,7 +74,7 @@ general:
 solver:
   # Disable α-CROWN (use plain CROWN) so BaB splits instead of stalling at the
   # root on the conv NN_rul_full models. See THROUGHPUT NOTE above.
-  bound_prop_method: crown
+  bound_prop_method: alpha-crown
 
 attack:
   pgd_order: before
@@ -41,6 +82,8 @@ attack:
 
 bab:
   batch_size: 100
+  phase_budget:
+    disjunctive_pgd_max_secs: 15
   branching:
     method: kfsb
     candidates: 8

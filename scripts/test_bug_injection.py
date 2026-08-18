@@ -128,7 +128,7 @@ def test_identical_models(model_path: str, input_shape: tuple, verbose: bool = F
         result = run_ny_diff(model_path, model_path, input_path=input_path)
 
         # Should pass (identical models)
-        passed = "EQUIVALENT" in result["stdout"] or result["returncode"] == 0
+        passed = result["returncode"] == 0 and "EQUIVALENT" in result["stdout"]
 
         if verbose:
             if passed:
@@ -164,8 +164,7 @@ def test_broken_model_detection(model_path: str, input_shape: tuple, verbose: bo
 
         # Should fail (divergent models)
         found_divergence = (
-            "DIVERGENT" in result["stdout"] or
-            result["returncode"] != 0
+            result["returncode"] == 0 and "DIVERGENT" in result["stdout"]
         )
 
         if verbose:
@@ -209,8 +208,7 @@ def test_small_perturbation_detection(model_path: str, input_shape: tuple, verbo
         result = run_ny_diff(model_path, broken_path, input_path=input_path, tolerance=1e-6)
 
         found_divergence = (
-            "DIVERGENT" in result["stdout"] or
-            result["returncode"] != 0
+            result["returncode"] == 0 and "DIVERGENT" in result["stdout"]
         )
 
         if verbose:
@@ -240,6 +238,12 @@ def main():
         (str(TEST_MODELS_DIR / "single_linear.onnx"), (1, 2)),
         (str(TEST_MODELS_DIR / "simple_mlp.onnx"), (1, 2)),
     ]
+    missing = [model for model, _ in test_models if not Path(model).is_file()]
+    if missing:
+        print("ERROR: required tracked fixtures are missing:")
+        for model in missing:
+            print(f"  - {model}")
+        return 1
 
     results = []
 

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use ny_core::{NyError, Result};
+use ny_core::Result;
 use ny_tensor::BoundedTensor;
 
 use crate::beta_crown::branching::SplitHistory;
@@ -130,11 +130,7 @@ impl BabDomain {
         lower_bound: f32,
         upper_bound: f32,
     ) -> Result<Self> {
-        if !lower_bound.is_finite() || !upper_bound.is_finite() {
-            return Err(NyError::NumericalInstability(format!(
-                "BaB root domain bounds are non-finite: lower={lower_bound}, upper={upper_bound}"
-            )));
-        }
+        super::validate_domain_interval("BaB root domain", lower_bound, upper_bound)?;
         let layer_bounds: Vec<Arc<BoundedTensor>> =
             layer_bounds.into_iter().map(Arc::new).collect();
         Ok(Self {
@@ -161,11 +157,7 @@ impl BabDomain {
         upper_bound: f32,
         input: &BoundedTensor,
     ) -> Result<Self> {
-        if !lower_bound.is_finite() || !upper_bound.is_finite() {
-            return Err(NyError::NumericalInstability(format!(
-                "BaB root domain bounds are non-finite: lower={lower_bound}, upper={upper_bound}"
-            )));
-        }
+        super::validate_domain_interval("BaB root domain", lower_bound, upper_bound)?;
         let layer_bounds: Vec<Arc<BoundedTensor>> =
             layer_bounds.into_iter().map(Arc::new).collect();
         Ok(Self {
@@ -192,11 +184,7 @@ impl BabDomain {
         lower_bound: f32,
         upper_bound: f32,
     ) -> Result<Self> {
-        if !lower_bound.is_finite() || !upper_bound.is_finite() {
-            return Err(NyError::NumericalInstability(format!(
-                "BaB root domain bounds are non-finite: lower={lower_bound}, upper={upper_bound}"
-            )));
-        }
+        super::validate_domain_interval("BaB root domain", lower_bound, upper_bound)?;
         let layer_bounds: Vec<Arc<BoundedTensor>> =
             layer_bounds.into_iter().map(Arc::new).collect();
         let history = SplitHistory::new();
@@ -238,11 +226,7 @@ impl BabDomain {
         input_split_count: usize,
         intermediate_bounds: IntermediateLinearBounds,
     ) -> Result<Self> {
-        if !lower_bound.is_finite() || !upper_bound.is_finite() {
-            return Err(NyError::NumericalInstability(format!(
-                "BaB child domain bounds are non-finite: lower={lower_bound}, upper={upper_bound}"
-            )));
-        }
+        super::validate_domain_interval("BaB child domain", lower_bound, upper_bound)?;
         Ok(Self {
             history,
             lower_bound,
@@ -382,6 +366,31 @@ mod tests {
         // Finite bounds are accepted
         let result = BabDomain::root(vec![bounds], 0.0, 1.0);
         assert!(result.is_ok(), "Finite bounds should be accepted");
+    }
+
+    #[test]
+    fn sequential_domain_constructors_reject_inverted_objective_bounds() {
+        let bounds = BoundedTensor::new(
+            ndarray::arr1(&[0.0_f32]).into_dyn(),
+            ndarray::arr1(&[1.0_f32]).into_dyn(),
+        )
+        .unwrap();
+        assert!(BabDomain::root(vec![bounds.clone()], 1.0, 0.0).is_err());
+        assert!(BabDomain::root_with_input(vec![bounds.clone()], 1.0, 0.0, &bounds,).is_err());
+        assert!(BabDomain::root_with_alpha(&Network::new(), vec![bounds], 1.0, 0.0,).is_err());
+        assert!(BabDomain::child(
+            SplitHistory::new(),
+            1.0,
+            0.0,
+            Vec::new(),
+            None,
+            DomainAlphaState::empty(),
+            BetaState::empty(),
+            None,
+            0,
+            IntermediateLinearBounds::empty(),
+        )
+        .is_err());
     }
 
     #[test]

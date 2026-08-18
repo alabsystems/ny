@@ -908,9 +908,16 @@ class BetaCrownConfig:
 
     Attributes:
         max_domains: Maximum number of domains to explore
+        max_queue_bytes: Estimated payload budget for supported graph BaB
+            frontiers: ordinary/precomputed ReLU heaps and GPU DomainList
+            ReLU/input-split queues. 0 disables it. This is not an RSS limit,
+            and one oversized domain may exceed it because at least one is
+            retained. Grouped-disjunctive DomainList rejects a nonzero cap.
         timeout_secs: Timeout in seconds
         max_depth: Maximum search tree depth
         use_alpha_crown: Use α-CROWN optimization within each domain
+        use_forward_bounds: Reuse forward-linear intermediate bounds in the
+            final backward pass
         use_crown_ibp: Use CROWN-IBP for tighter intermediate bounds
         branching: Branching heuristic
         fsb_candidates: Number of candidates for FSB/kFSB
@@ -920,9 +927,11 @@ class BetaCrownConfig:
         beta_tolerance: β optimization tolerance
         alpha_lr: Learning rate for α optimization
         batch_size: Number of domains to process in parallel
-        enable_cuts: Enable GCP-CROWN cutting planes
+        enable_cuts: Request GCP-CROWN cutting planes; currently rejected by
+            the certificate-authority quarantine
         max_cuts: Maximum number of cutting planes
-        enable_proactive_cuts: Enable proactive cut generation (BICCOS-lite)
+        enable_proactive_cuts: Request proactive cut generation; currently
+            rejected by the certificate-authority quarantine
         max_proactive_cuts: Maximum number of proactive cuts
         enable_biccos_constraint_strengthening: Enable BICCOS constraint strengthening for verified cuts
         biccos_drop_ratio: Drop ratio for constraint strengthening (quantile over influence scores)
@@ -948,19 +957,21 @@ class BetaCrownConfig:
         enable_clip_interm_domain: Enable intermediate domain clipping (clip_interm_domain, requires ReLU branching)
         clip_interm_topk: Number of objective neurons per layer to tighten (clip_interm_domain)
         clip_in_alpha_crown: Apply clip_interm_domain during alpha-CROWN optimization
-        clip_interm_prune: Prune infeasible domains during activation-space clipping
-        clip_interm_use_final_layer: Use final-layer constraints when pruning clipped domains
+        clip_interm_prune: Reserved pruning authority; enabling it with Complete Clip raises ValueError until certificate-backed pruning is implemented
+        clip_interm_use_final_layer: Reserved final-layer pruning extension; has no effect while pruning authority is quarantined
 
     Example:
         >>> config = ny.BetaCrownConfig()
         >>> config.branching = ny.BranchingHeuristic.Kfsb
-        >>> config.enable_proactive_cuts = True
+        >>> config.use_alpha_crown = True
         >>> result = ny.verify("model.onnx", method="beta", beta_config=config)
     """
     max_domains: int
+    max_queue_bytes: int
     timeout_secs: int
     max_depth: int
     use_alpha_crown: bool
+    use_forward_bounds: bool
     use_crown_ibp: bool
     branching: BranchingHeuristic
     fsb_candidates: int
@@ -1140,7 +1151,7 @@ def verify(
 
         >>> # With β-CROWN configuration
         >>> config = ny.BetaCrownConfig.precise()
-        >>> config.enable_proactive_cuts = True
+        >>> config.use_alpha_crown = True
         >>> result = ny.verify("model.onnx", method="beta", beta_config=config,
         ...                    output_bounds=[(0.0, float("inf"))] * 10)
     """
@@ -1258,7 +1269,8 @@ class CompareResult:
     """Result of comparing two models using bound propagation.
 
     Attributes:
-        is_equivalent: True if bounds match within tolerance
+        is_equivalent: True only when a sound shared-input difference-network
+            proof establishes pointwise equivalence within tolerance
         max_lower_diff: Maximum difference in lower bounds
         max_upper_diff: Maximum difference in upper bounds
         tolerance: Tolerance threshold used
@@ -1306,17 +1318,19 @@ def compare(
         epsilon: Input perturbation radius (default: 0.01)
         method: Verification method - 'ibp', 'crown', 'alpha' (default: 'crown')
         input: Optional numpy array for input center (default: zeros)
-        input_index: Optional 0-based input index to use when models declare multiple inputs
+        input_index: Retained for compatibility; only 0 is valid because
+            multi-input models are rejected
         backend: Compute backend - 'auto', 'cpu', or 'wgpu'/'gpu' (default: 'cpu').
             Only used for CROWN/alpha methods; ignored for IBP. Compare keeps both
             model propagations in one call, so CPU remains the conservative default;
             pass backend="auto" to opt into GPU probing.
 
     Notes:
-        compare currently propagates bounds for a single input tensor. For models
-        with multiple inputs, pass input_index to select which input to use. Other
-        inputs are ignored, so models must not depend on them (e.g., they are
-        constant-folded or otherwise unused).
+        compare currently propagates bounds for exactly one model input. Models
+        declaring multiple inputs are rejected until joint multi-input bounds are
+        supported. The endpoint-difference fields remain diagnostics;
+        is_equivalent is true only when a sound shared-input difference-network
+        proof establishes pointwise equivalence within tolerance.
 
     Returns:
         CompareResult with comparison results
@@ -1332,9 +1346,6 @@ def compare(
         >>> import numpy as np
         >>> input_data = np.zeros((1, 3, 224, 224), dtype=np.float32)
         >>> result = ny.compare("model_a.onnx", "model_b.onnx", input=input_data)
-
-        >>> # Select input for multi-input models
-        >>> result = ny.compare("model_a.onnx", "model_b.onnx", input_index=0, input=input_data)
 
         >>> # With different method
         >>> result = ny.compare("model_a.onnx", "model_b.onnx", method="ibp")
@@ -1362,13 +1373,20 @@ def compare_bytes(
         epsilon: Input perturbation radius (default: 0.01)
         method: Verification method - 'ibp', 'crown', 'alpha' (default: 'crown')
         input: Optional numpy array for input center (default: zeros)
-        input_index: Optional 0-based input index for multi-input models
+        input_index: Retained for compatibility; only 0 is valid because
+            multi-input models are rejected
         ref_name: Friendly name for reference model (default: 'reference')
         target_name: Friendly name for target model (default: 'target')
         backend: Compute backend - 'auto', 'cpu', or 'wgpu'/'gpu' (default: 'cpu').
             Only used for CROWN/alpha methods; ignored for IBP. Compare keeps both
             model propagations in one call, so CPU remains the conservative default;
             pass backend="auto" to opt into GPU probing.
+
+    Notes:
+        Models declaring multiple inputs are rejected. The endpoint-difference
+        fields remain diagnostics; is_equivalent is true only when a sound
+        shared-input difference-network proof establishes pointwise equivalence
+        within tolerance.
 
     Returns:
         CompareResult with comparison results
@@ -1397,12 +1415,18 @@ def compare_torch(
         epsilon: Input perturbation radius (default: 0.01)
         method: Verification method - 'ibp', 'crown', 'alpha' (default: 'crown')
         input: Optional numpy array for input center (default: zeros)
-        input_index: Optional 0-based input index for multi-input models
+        input_index: Retained for compatibility; only 0 is valid because
+            multi-input models are rejected
         opset: ONNX opset version for export (default: 17)
         backend: Compute backend - 'auto', 'cpu', or 'wgpu'/'gpu' (default: 'cpu').
             Only used for CROWN/alpha methods; ignored for IBP. Compare defaults to
             CPU because the dual-model path is more memory-hungry; pass
             backend="auto" to opt into GPU probing.
+
+    Notes:
+        Models declaring multiple inputs are rejected. is_equivalent is true
+        only when a sound shared-input difference-network proof establishes
+        pointwise equivalence within tolerance.
 
     Returns:
         CompareResult with comparison results

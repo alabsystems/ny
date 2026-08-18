@@ -100,8 +100,9 @@ const REAL_ROPE_IBP_CERT_EPSILON: f32 = 1e-6;
 /// the provability of monotonicity and the critical epsilon.
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_centroid_monotonicity_real_rope_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let identity = {
         let (graph, _) = talker_attention_softmax_output_graph();
         let input =
@@ -146,8 +147,9 @@ fn test_centroid_monotonicity_real_rope_3497() {
 /// and compares against the identity-RoPE critical epsilon from Phase 2.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_centroid_monotonicity_real_rope_epsilon_sweep_3497() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, _) = talker_attention_softmax_output_graph_real_rope();
 
     // Sweep bracketing the measured real-RoPE critical epsilon 2.535e-6 on

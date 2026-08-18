@@ -5,8 +5,8 @@
 use super::estimate_model_cost;
 use super::lookup::ShapeLookup;
 use crate::{
-    load_onnx_bytes, onnx_proto, AttributeValue, DataType, LayerSpec, Network, OnnxModel,
-    TensorSpec, WeightStore,
+    load_onnx_bytes_with_config, onnx_proto, AttributeValue, DataType, LayerSpec, Network,
+    OnnxLoadConfig, OnnxModel, ShapeInferencePolicy, TensorSpec, WeightStore,
 };
 use ndarray::{ArrayD, IxDyn};
 use ny_core::LayerType;
@@ -71,7 +71,7 @@ fn node(name: &str, op_type: &str, inputs: &[&str], outputs: &[&str]) -> onnx_pr
 fn attr_int(name: &str, value: i64) -> onnx_proto::AttributeProto {
     onnx_proto::AttributeProto {
         name: name.to_string(),
-        i: value,
+        i: Some(value),
         r#type: onnx_proto::attribute_type::INT,
         ..Default::default()
     }
@@ -103,6 +103,15 @@ fn load_inline_onnx_model_with_opset(
     opset_version: i64,
     graph: onnx_proto::GraphProto,
 ) -> OnnxModel {
+    try_load_inline_onnx_model_with_opset(name, opset_version, graph)
+        .expect("inline ONNX fixture should load")
+}
+
+fn try_load_inline_onnx_model_with_opset(
+    name: &str,
+    opset_version: i64,
+    graph: onnx_proto::GraphProto,
+) -> ny_core::Result<OnnxModel> {
     let model = onnx_proto::ModelProto {
         ir_version: 9,
         opset_import: vec![onnx_proto::OperatorSetIdProto {
@@ -116,7 +125,11 @@ fn load_inline_onnx_model_with_opset(
         doc_string: String::new(),
         graph: Some(graph),
     };
-    load_onnx_bytes(name, &model.encode_to_vec()).expect("inline ONNX fixture should load")
+    // These fixtures specifically exercise ShapeLookup's local fallbacks for
+    // missing intermediate metadata. Running ORT here both defeats that
+    // purpose and exposes deliberately adverse schema cases to native FFI.
+    let config = OnnxLoadConfig::default().with_shape_inference_policy(ShapeInferencePolicy::Skip);
+    load_onnx_bytes_with_config(name, &model.encode_to_vec(), &config)
 }
 
 fn load_inline_onnx_model(name: &str, graph: onnx_proto::GraphProto) -> OnnxModel {
@@ -127,11 +140,12 @@ fn load_inline_onnx_model(name: &str, graph: onnx_proto::GraphProto) -> OnnxMode
 fn test_estimate_model_cost_infers_missing_shape_for_pointwise_intermediate_3498() {
     let graph = onnx_proto::GraphProto {
         node: vec![
-            node("relu1", "Relu", &["input"], &["hidden"]),
+            node("erf", "Erf", &["input"], &["hidden"]),
             node("relu2", "Relu", &["hidden"], &["out"]),
         ],
         name: "pointwise_missing_shape".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 4], 1)],
         output: vec![tensor_value_info("out", &[1, 4], 1)],
         #[cfg(feature = "onnx-value-info")]
@@ -144,6 +158,8 @@ fn test_estimate_model_cost_infers_missing_shape_for_pointwise_intermediate_3498
     assert_eq!(cost.layers.len(), 2);
     assert_eq!(cost.layers[0].output_shapes, vec![vec![1, 4]]);
     assert_eq!(cost.layers[1].output_shapes, vec![vec![1, 4]]);
+    assert_eq!(cost.layers[0].layer_type, "Erf");
+    assert_eq!(cost.layers[0].flops, 24);
     assert_eq!(cost.layers[0].timing_family, "elementwise");
     assert_eq!(cost.layers[1].timing_family, "elementwise");
 }
@@ -252,6 +268,7 @@ fn test_infer_output_shape_handles_broadcasted_binary_missing_shape_3500() {
         ],
         name: "broadcasted_binary_missing_shape".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![
             tensor_value_info("lhs", &[1, 1], 1),
             tensor_value_info("rhs", &[1, 4], 1),
@@ -276,6 +293,7 @@ fn test_infer_output_shape_rejects_incompatible_broadcast_binary_missing_shape_3
         ],
         name: "incompatible_broadcast_binary_missing_shape".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![
             tensor_value_info("lhs", &[2, 3], 1),
             tensor_value_info("rhs", &[4], 1),
@@ -303,6 +321,7 @@ fn test_infer_output_shape_handles_missing_shape_for_constant_reshape_intermedia
         ],
         name: "reshape_missing_shape".to_string(),
         initializer: vec![tensor_i64("shape", &[2], &[2, 2])],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 4], 1)],
         output: vec![tensor_value_info("out", &[2, 2], 1)],
         #[cfg(feature = "onnx-value-info")]
@@ -317,22 +336,46 @@ fn test_infer_output_shape_handles_missing_shape_for_constant_reshape_intermedia
 
 #[test]
 fn test_infer_output_shape_rejects_missing_shape_for_runtime_reshape_intermediate_3498() {
-    let graph = onnx_proto::GraphProto {
-        node: vec![
-            node("reshape", "Reshape", &["input", "shape"], &["reshaped"]),
-            node("relu", "Relu", &["reshaped"], &["out"]),
-        ],
-        name: "reshape_runtime_shape_missing_shape".to_string(),
-        initializer: Vec::new(),
-        input: vec![
-            tensor_value_info("input", &[1, 4], 1),
-            tensor_value_info("shape", &[2], 7),
-        ],
-        output: vec![tensor_value_info("out", &[2, 2], 1)],
-        #[cfg(feature = "onnx-value-info")]
-        value_info: Vec::new(),
-    };
-    let model = load_inline_onnx_model("reshape_runtime_shape_missing_shape.onnx", graph);
+    // The public loader now rejects non-FLOAT32 runtime inputs before cost
+    // analysis. Construct the otherwise possible internal state directly so
+    // ShapeLookup's own fail-closed contract remains covered as well.
+    let model = OnnxModel::empty_with_network(
+        Network {
+            name: "reshape_runtime_shape_missing_shape".to_string(),
+            inputs: vec![
+                TensorSpec {
+                    name: "input".to_string(),
+                    shape: vec![1, 4],
+                    dtype: DataType::Float32,
+                },
+                TensorSpec {
+                    name: "shape".to_string(),
+                    shape: vec![2],
+                    dtype: DataType::Int64,
+                },
+            ],
+            outputs: vec![TensorSpec {
+                name: "out".to_string(),
+                shape: vec![2, 2],
+                dtype: DataType::Float32,
+            }],
+            layers: vec![LayerSpec {
+                name: "reshape".to_string(),
+                layer_type: LayerType::Reshape,
+                inputs: vec!["input".to_string(), "shape".to_string()],
+                outputs: vec!["reshaped".to_string()],
+                weights: None,
+                attributes: HashMap::new(),
+            }],
+            param_count: 0,
+        },
+        WeightStore::new(),
+    )
+    .with_tensor_shapes(HashMap::from([
+        ("input".to_string(), vec![1, 4]),
+        ("shape".to_string(), vec![2]),
+        ("out".to_string(), vec![2, 2]),
+    ]));
 
     let message = infer_first_layer_output_shape(&model)
         .expect_err("runtime-driven reshape fallback must stay rejected");
@@ -350,6 +393,7 @@ fn test_infer_output_shape_handles_transpose_intermediate_3498() {
         node: vec![transpose, node("relu", "Relu", &["hidden"], &["out"])],
         name: "transpose_missing_shape".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[4, 1, 640], 1)],
         output: vec![tensor_value_info("out", &[1, 4, 640], 1)],
         #[cfg(feature = "onnx-value-info")]
@@ -370,12 +414,16 @@ fn test_infer_output_shape_handles_reduce_sum_keepdims_intermediate_3498() {
         node: vec![reduce_sum, node("sqrt", "Sqrt", &["reduced"], &["out"])],
         name: "reduce_sum_missing_shape".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[5, 1024], 1)],
         output: vec![tensor_value_info("out", &[5, 1], 1)],
         #[cfg(feature = "onnx-value-info")]
         value_info: Vec::new(),
     };
-    let model = load_inline_onnx_model("reduce_sum_missing_shape.onnx", graph);
+    // Attribute-based axes are valid through opset 12; opset 13+ moved axes
+    // to an input. Keep the fixture schema-valid so ORT shape inference cannot
+    // enter undefined native behavior on a malformed model.
+    let model = load_inline_onnx_model_with_opset("reduce_sum_missing_shape.onnx", 11, graph);
 
     let inferred_shape =
         infer_first_layer_output_shape(&model).expect("reduction fallback should use axes");
@@ -390,6 +438,7 @@ fn test_infer_output_shape_handles_reduce_sum_input_axes_intermediate_3498() {
         node: vec![reduce_sum, node("sqrt", "Sqrt", &["reduced"], &["out"])],
         name: "reduce_sum_input_axes_missing_shape".to_string(),
         initializer: vec![tensor_i64("axes", &[1], &[-1])],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[5, 1024], 1)],
         output: vec![tensor_value_info("out", &[5, 1], 1)],
         #[cfg(feature = "onnx-value-info")]
@@ -420,6 +469,7 @@ fn test_infer_output_shape_handles_slice_intermediate_3498() {
             tensor_i64("axes", &[1], &[1]),
             tensor_i64("steps", &[1], &[1]),
         ],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 4, 640], 1)],
         output: vec![tensor_value_info("out", &[1, 1, 640], 1)],
         #[cfg(feature = "onnx-value-info")]
@@ -450,6 +500,7 @@ fn test_infer_output_shape_handles_weighted_matmul_intermediate_3498() {
                 10.0, 11.0, 12.0,
             ],
         )],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[1, 4], 1)],
         output: vec![tensor_value_info("out", &[1, 3], 1)],
         #[cfg(feature = "onnx-value-info")]
@@ -470,12 +521,16 @@ fn test_infer_output_shape_handles_unsqueeze_intermediate_3498() {
         node: vec![unsqueeze, node("relu", "Relu", &["hidden"], &["out"])],
         name: "unsqueeze_missing_shape".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[2, 3], 1)],
         output: vec![tensor_value_info("out", &[1, 2, 3], 1)],
         #[cfg(feature = "onnx-value-info")]
         value_info: Vec::new(),
     };
-    let model = load_inline_onnx_model("unsqueeze_missing_shape.onnx", graph);
+    // Attribute-form axes are valid through opset 12; opset 13 moved axes to
+    // the second input. Keep the fixture schema-valid so native ORT shape
+    // inference cannot abort on malformed protobuf.
+    let model = load_inline_onnx_model_with_opset("unsqueeze_missing_shape.onnx", 11, graph);
 
     let inferred_shape =
         infer_first_layer_output_shape(&model).expect("unsqueeze fallback should use axes");
@@ -489,6 +544,7 @@ fn test_infer_output_shape_handles_unsqueeze_input_axes_intermediate_3498() {
         node: vec![unsqueeze, node("relu", "Relu", &["hidden"], &["out"])],
         name: "unsqueeze_input_axes_missing_shape".to_string(),
         initializer: vec![tensor_i64("axes", &[1], &[0])],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[2, 3], 1)],
         output: vec![tensor_value_info("out", &[1, 2, 3], 1)],
         #[cfg(feature = "onnx-value-info")]
@@ -510,6 +566,7 @@ fn test_infer_output_shape_handles_concat_intermediate_3498() {
         node: vec![concat, node("relu", "Relu", &["hidden"], &["out"])],
         name: "concat_missing_shape".to_string(),
         initializer: Vec::new(),
+        sparse_initializer: Vec::new(),
         input: vec![
             tensor_value_info("lhs", &[1, 2], 1),
             tensor_value_info("rhs", &[1, 3], 1),
@@ -723,17 +780,18 @@ fn test_infer_output_shape_rejects_allowzero_reshape_intermediate_3498() {
         node: vec![reshape, node("relu", "Relu", &["reshaped"], &["out"])],
         name: "reshape_allowzero_missing_shape".to_string(),
         initializer: vec![tensor_i64("shape", &[2], &[0, -1])],
+        sparse_initializer: Vec::new(),
         input: vec![tensor_value_info("input", &[2, 2], 1)],
         output: vec![tensor_value_info("out", &[2, 2], 1)],
         #[cfg(feature = "onnx-value-info")]
         value_info: Vec::new(),
     };
-    let model = load_inline_onnx_model("reshape_allowzero_missing_shape.onnx", graph);
-
-    let message = infer_first_layer_output_shape(&model)
-        .expect_err("allowzero reshape fallback must fail closed");
+    let message =
+        try_load_inline_onnx_model_with_opset("reshape_allowzero_missing_shape.onnx", 17, graph)
+            .expect_err("allowzero=1 must fail at raw-schema preflight before conversion")
+            .to_string();
     assert!(
         message.contains("allowzero=1"),
-        "error should explain why allowzero reshape fallback is rejected, got: {message}",
+        "error should explain why allowzero Reshape is rejected, got: {message}",
     );
 }

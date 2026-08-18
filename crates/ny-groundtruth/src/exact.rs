@@ -57,7 +57,7 @@ pub(crate) fn require_exact_vec3(name: &str, v: [f64; 3]) -> Result<[f32; 3]> {
 
 /// Exact rational value of a finite f32 (every finite float is rational).
 pub(crate) fn rational(value: f32) -> BigRational {
-    BigRational::from_float(f64::from(value)).expect("finite f32 is a finite f64")
+    BigRational::from_float(value).expect("finite f32 has an exact rational image")
 }
 
 /// Convert an exactly computed rational constant to f32, rejecting any value

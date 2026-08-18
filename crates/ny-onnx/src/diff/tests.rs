@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+#[cfg(feature = "ort")]
 use crate::test_fixtures::{
     require_test_model, require_test_model_with_hint, TRANSFORMER_TEST_MODEL_HINT,
 };
@@ -46,6 +47,7 @@ fn test_compare_arrays_shape_mismatch() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "ort")]
 #[test]
 fn test_intermediate_extraction() {
     let model_path = require_test_model("simple_mlp.onnx");
@@ -76,6 +78,7 @@ fn test_intermediate_extraction() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "ort")]
 #[test]
 fn test_diff_models_same_model() {
     let model_path = require_test_model("simple_mlp.onnx");
@@ -106,6 +109,7 @@ fn test_diff_models_same_model() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "ort")]
 #[test]
 fn test_diff_models_layer_count() {
     let model_path =
@@ -113,15 +117,42 @@ fn test_diff_models_layer_count() {
 
     let config = DiffConfig::default();
 
+    let model_info = load_model_info(&model_path).expect("Failed to load model metadata");
+    assert!(
+        model_info
+            .layers
+            .iter()
+            .any(|layer| layer.layer_type == LayerType::Erf),
+        "transformer MLP metadata must preserve decomposed GELU Erf"
+    );
+    assert!(
+        !model_info
+            .layers
+            .iter()
+            .any(|layer| layer.layer_type == LayerType::GELU),
+        "transformer MLP must not use the disabled canonical GELU fusion"
+    );
+
     let result = diff_models(&model_path, &model_path, &config).expect("Failed to diff model");
 
-    // transformer_mlp has multiple layers (fc1, gelu, fc2)
-    // Verify we're getting multiple comparisons
+    assert!(
+        result.is_equivalent(),
+        "a model must be equivalent to itself"
+    );
+
+    // transformer_mlp has fc1, a decomposed Erf GELU chain, and fc2.
     assert!(
         result.layers.len() >= 2,
         "Expected >= 2 layer comparisons for transformer_mlp, got {}",
         result.layers.len()
     );
+    let erf_comparison = result
+        .layers
+        .iter()
+        .find(|layer| layer.name.contains("Erf"))
+        .expect("diff must compare the preserved Erf output");
+    assert!(!erf_comparison.exceeds_tolerance);
+    assert_eq!(erf_comparison.max_diff, 0.0);
 
     // Print layers for debugging
     for layer in &result.layers {

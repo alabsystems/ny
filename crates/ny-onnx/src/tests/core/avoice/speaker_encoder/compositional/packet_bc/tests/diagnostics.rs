@@ -67,8 +67,9 @@ fn log_all_crown_ibp_fallbacks(
 /// Reference: `designs/2026-03-13-issue-3499-res2net-bound-widening-root-cause.md`
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_stage_a_crown_ibp_fallback_diagnostic_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let t_start = Instant::now();
     let model = avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
@@ -143,11 +144,10 @@ fn test_ecapa_stage_a_crown_ibp_fallback_diagnostic_3499() {
 /// default CPU-only collector path.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_stage_a_crown_ibp_uses_gemm_engine_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     use ny_test_utils::CountingGemmEngine;
-
-    const ENGINE_TEST_STAGE_DEADLINE_SECS: u64 = 20;
 
     let model = avoice_speaker_encoder();
     let graph = avoice_speaker_encoder_graph();
@@ -162,12 +162,11 @@ fn test_ecapa_stage_a_crown_ibp_uses_gemm_engine_3499() {
         .expect("stage graph extraction should succeed");
     let engine = CountingGemmEngine::new();
 
-    let crown_result = collect_ecapa_stage_local_crown_ibp(
+    let crown_result = collect_ecapa_stage_local_crown_ibp_with_unbounded_engine(
         &stage_a,
         &input,
         "stage_a_engine",
-        ENGINE_TEST_STAGE_DEADLINE_SECS,
-        Some(&engine),
+        &engine,
     )
     .expect("Stage A engine-aware CROWN-IBP collection should succeed");
     let gemm_count = engine.gemm_calls();
@@ -183,8 +182,5 @@ fn test_ecapa_stage_a_crown_ibp_uses_gemm_engine_3499() {
         "GemmEngine received 0 GEMM calls — Stage A CROWN-IBP is not threading engine through Conv1d backward"
     );
     assert_finite_and_ordered(&output_bounds, "Stage A engine-aware CROWN-IBP output");
-    eprintln!(
-        "Stage A engine-aware CROWN-IBP dispatched {gemm_count} GEMM calls with a {}s deadline",
-        ENGINE_TEST_STAGE_DEADLINE_SECS
-    );
+    eprintln!("Stage A unbounded engine-wiring probe dispatched {gemm_count} GEMM calls");
 }

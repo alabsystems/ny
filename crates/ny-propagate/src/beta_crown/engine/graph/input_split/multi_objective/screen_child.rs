@@ -261,11 +261,8 @@ pub(super) fn screen_multi_obj_child(
 
     // Monotonicity guard: per-spec lower bound cannot regress below parent.
     // Reference: alpha-beta-CROWN input_split/bounding.py:154
-    let obj_bounds: Vec<(f32, f32)> = obj_bounds
-        .into_iter()
-        .zip(parent_domain.obj_bounds.iter())
-        .map(|((new_l, new_u), &(old_l, _))| (new_l.max(old_l), new_u))
-        .collect();
+    let obj_bounds =
+        super::super::batching::tighten_obj_lower_bounds(&parent_domain.obj_bounds, obj_bounds);
     let priority = multi_obj_domain_priority(&obj_bounds, thresholds);
     queue.push(MultiObjInputDomain {
         input_bounds: Arc::new(child_input),

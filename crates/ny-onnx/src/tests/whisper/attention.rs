@@ -518,9 +518,10 @@ fn test_find_whisper_attn_weight_key_proj_without_attn() {
 }
 
 #[ntest::timeout(10000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_attention_with_real_weights() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test attention subgraph using actual Whisper model weights.
     // This validates that the verification works with production-scale weights.
     let path = require_test_model_with_hint("whisper_tiny_encoder.onnx", WHISPER_TEST_MODEL_HINT);
@@ -573,10 +574,14 @@ fn test_whisper_attention_with_real_weights() {
     );
 }
 
-#[ntest::timeout(10000)]
+// This production-weight zonotope path takes about 7s alone and can exceed
+// 10s under the full suite's parallel load. Keep a CI-safe margin while still
+// bounding hangs.
+#[ntest::timeout(60000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_attention_with_real_weights_zonotope_context_shape_regression_3464() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     let path = require_test_model_with_hint("whisper_tiny_encoder.onnx", WHISPER_TEST_MODEL_HINT);
 
     let whisper = load_whisper(&path).expect("Failed to load model");

@@ -16,7 +16,7 @@ use pyo3::prelude::*;
 ///     >>> config = ny.BetaCrownConfig()
 ///     >>> config.branching = ny.BranchingHeuristic.Kfsb
 ///     >>> config.fsb_candidates = 8
-///     >>> config.enable_proactive_cuts = True
+///     >>> config.use_alpha_crown = True
 ///     >>> result = ny.verify("model.onnx", method="beta", beta_config=config)
 #[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
@@ -24,6 +24,11 @@ pub struct BetaCrownConfig {
     /// Maximum number of domains to explore.
     #[pyo3(get, set)]
     pub max_domains: usize,
+    /// Estimated resident-payload cap for supported graph BaB frontiers:
+    /// ordinary/precomputed ReLU heaps and GPU DomainList ReLU/input split.
+    /// `0` disables the cap. Grouped-disjunctive DomainList rejects nonzero.
+    #[pyo3(get, set)]
+    pub max_queue_bytes: usize,
     /// Timeout in seconds.
     #[pyo3(get, set)]
     pub timeout_secs: u64,
@@ -63,13 +68,15 @@ pub struct BetaCrownConfig {
     /// Number of domains to process in parallel.
     #[pyo3(get, set)]
     pub batch_size: usize,
-    /// Enable GCP-CROWN cutting planes.
+    /// Request GCP-CROWN cutting planes (currently rejected by the
+    /// certificate-authority quarantine).
     #[pyo3(get, set)]
     pub enable_cuts: bool,
     /// Maximum number of cutting planes to retain.
     #[pyo3(get, set)]
     pub max_cuts: usize,
-    /// Enable proactive cut generation (BICCOS-lite).
+    /// Request proactive cut generation (currently rejected by the
+    /// certificate-authority quarantine).
     #[pyo3(get, set)]
     pub enable_proactive_cuts: bool,
     /// Maximum number of proactive cuts.
@@ -149,10 +156,12 @@ pub struct BetaCrownConfig {
     /// Apply clip_interm_domain during alpha-CROWN optimization.
     #[pyo3(get, set)]
     pub clip_in_alpha_crown: bool,
-    /// Prune infeasible domains during activation-space clipping.
+    /// Reserved pruning authority. Enabling this with `enable_clip_interm_domain`
+    /// is rejected until certificate-backed pruning is implemented.
     #[pyo3(get, set)]
     pub clip_interm_prune: bool,
-    /// Use final-layer constraints when pruning clipped domains.
+    /// Reserved final-layer pruning extension. This has no effect while
+    /// `clip_interm_prune` remains quarantined.
     #[pyo3(get, set)]
     pub clip_interm_use_final_layer: bool,
 }
@@ -168,7 +177,7 @@ impl BetaCrownConfig {
 
     pub(crate) fn __repr__(&self) -> String {
         format!(
-            "BetaCrownConfig(max_domains={}, timeout_secs={}s, max_depth={}, use_alpha_crown={}, \
+            "BetaCrownConfig(max_domains={}, max_queue_bytes={}, timeout_secs={}s, max_depth={}, use_alpha_crown={}, \
              use_forward_bounds={}, use_crown_ibp={}, branching={}, fsb_candidates={}, kfsb_reduce_op={}, beta_lr={:.3e}, \
              beta_iterations={}, beta_tolerance={:.3e}, alpha_lr={:.3e}, batch_size={}, \
              enable_cuts={}, max_cuts={}, enable_proactive_cuts={}, max_proactive_cuts={}, \
@@ -180,8 +189,9 @@ impl BetaCrownConfig {
              enable_pgd_attack={}, pgd_restarts={}, pgd_steps={}, enable_relaxed_clip={}, \
              relaxed_clip_iterations={}, enable_clip_interm_domain={}, clip_interm_topk={}, \
              clip_in_alpha_crown={}, clip_interm_prune={}, clip_interm_use_final_layer={}, \
-             enable_interm_transfer={})",
+            enable_interm_transfer={})",
             self.max_domains,
+            self.max_queue_bytes,
             self.timeout_secs,
             self.max_depth,
             self.use_alpha_crown,
@@ -233,6 +243,7 @@ impl BetaCrownConfig {
     pub(crate) fn fast() -> Self {
         BetaCrownConfig {
             max_domains: 100,
+            max_queue_bytes: 0,
             timeout_secs: 30,
             max_depth: 10,
             use_alpha_crown: false,
@@ -284,6 +295,7 @@ impl BetaCrownConfig {
     pub(crate) fn precise() -> Self {
         BetaCrownConfig {
             max_domains: 10000,
+            max_queue_bytes: 0,
             timeout_secs: 300,
             max_depth: 50,
             use_alpha_crown: true,
@@ -297,11 +309,13 @@ impl BetaCrownConfig {
             beta_tolerance: 1e-5,
             alpha_lr: 0.05,
             batch_size: 16,
-            enable_cuts: true,
+            // Cut proof authority is quarantined until proof-derived cuts are
+            // folded through backward CROWN.
+            enable_cuts: false,
             max_cuts: 2000,
-            enable_proactive_cuts: true,
+            enable_proactive_cuts: false,
             max_proactive_cuts: 200,
-            enable_biccos_constraint_strengthening: true,
+            enable_biccos_constraint_strengthening: false,
             biccos_drop_ratio: 0.5,
             enable_biccos_cold_start: false,
             biccos_min_verified: 5,
@@ -336,6 +350,7 @@ impl BetaCrownConfig {
     pub(crate) fn from_rust(config: &RustBetaCrownConfig) -> Self {
         BetaCrownConfig {
             max_domains: config.max_domains,
+            max_queue_bytes: config.max_queue_bytes,
             timeout_secs: config.timeout.as_secs(),
             max_depth: config.max_depth,
             use_alpha_crown: config.use_alpha_crown,
@@ -437,6 +452,7 @@ impl BetaCrownConfig {
         self.validate()?;
         let mut config = RustBetaCrownConfig::default();
         config.max_domains = self.max_domains;
+        config.max_queue_bytes = self.max_queue_bytes;
         config.timeout = std::time::Duration::from_secs(self.timeout_secs);
         config.max_depth = self.max_depth;
         config.use_alpha_crown = self.use_alpha_crown;

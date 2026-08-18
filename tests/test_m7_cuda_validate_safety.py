@@ -14,7 +14,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "m7_cuda_validate.sh"
 GUARD = REPO_ROOT / "scripts" / "ny-safe-gpu-run"
-ATTESTED_VMEM_KIB = 83_886_080
+ATTESTED_VMEM_KIB = 167_772_160
 
 
 def _lower_child_vmem_below_attestation() -> None:
@@ -32,7 +32,7 @@ def _lower_child_vmem_below_attestation() -> None:
     except (OSError, ValueError):
         # Darwin exposes RLIMIT_AS but rejects attempts to change its synthetic
         # infinity value. Its `ulimit -v` remains `unlimited`, which is already
-        # distinct from the guard's exact 80-GiB attestation and therefore
+        # distinct from the guard's exact 160-GiB attestation and therefore
         # exercises the same re-exec/refusal paths without a child limit.
         pass
 
@@ -56,12 +56,14 @@ def _require_user_systemd() -> None:
             capture_output=True,
             check=False,
         )
-    except FileNotFoundError:
-        pytest.skip("systemd-run is unavailable on this host")
-    if probe.returncode != 0:
-        pytest.skip(
-            f"user systemd transient services unavailable: {probe.stderr.strip()}"
-        )
+    except FileNotFoundError as error:
+        raise AssertionError(
+            "systemd-run is required for the guarded M7 integration test"
+        ) from error
+    assert probe.returncode == 0, (
+        "user systemd transient services are required for the guarded M7 "
+        f"integration test: {probe.stderr.strip()}"
+    )
 
 
 def test_m7_validation_reexecs_through_gpu_guard(tmp_path: Path) -> None:
@@ -156,7 +158,7 @@ def test_m7_validation_rejects_a_forged_wrapped_marker(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 2
-    assert "without the required 80-GiB/slice attestation" in result.stderr
+    assert "without the required 160-GiB/slice attestation" in result.stderr
     assert not guard_log.exists(), "forged marker must not invoke or bypass the guard"
 
 
@@ -165,14 +167,25 @@ def test_m7_forces_the_full_competition_feature_tier() -> None:
     assert "NY_ALLOW_DEGRADED_BUILD=0 NY_REQUIRE_MIP=1" in source
 
 
+def test_m7_attests_both_sides_of_the_exact_address_space_limit() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'current_vmem_soft_kib="$(builtin ulimit -Sv)"' in source
+    assert 'current_vmem_hard_kib="$(builtin ulimit -Hv)"' in source
+    assert '[ "${current_vmem_soft_kib}" = "167772160" ]' in source
+    assert '[ "${current_vmem_hard_kib}" = "167772160" ]' in source
+
+
 def test_m7_requires_the_actual_device_test_pipeline_status() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
     assert 'device_test_status="${PIPESTATUS[0]}"' in source
-    assert '[ "${device_test_status}" -eq 0 ] && grep -q "test result: ok"' in source
+    assert (
+        'if [ "${device_test_status}" -ne 0 ] '
+        '|| ! grep -q "test result: ok"' in source
+    )
     assert "cargo status ${device_test_status}" in source
 
 
-def test_m7_overrides_inherited_degraded_build_inside_real_guard(
+def external_m7_overrides_inherited_degraded_build_inside_real_guard(
     tmp_path: Path,
 ) -> None:
     _require_user_systemd()
@@ -202,6 +215,7 @@ def test_m7_overrides_inherited_degraded_build_inside_real_guard(
     env["NY_ALLOW_DEGRADED_BUILD"] = "1"
     env["NY_REQUIRE_MIP"] = "0"
     env["NY_GPU_LOCK_PATH"] = str(tmp_path / "gpu.lock")
+    env["NY_BUILD_MIN_FREE_KIB"] = "1"
     result = subprocess.run(
         [str(GUARD), "/bin/bash", str(fake_script)],
         cwd=fake_repo,

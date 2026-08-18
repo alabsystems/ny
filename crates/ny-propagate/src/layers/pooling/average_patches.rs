@@ -17,7 +17,7 @@ use ndarray::{Array1, Axis};
 use ny_core::{NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
-use crate::bounds::patches::{CrownBounds, PatchesData, PatchesLinearBounds};
+use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds};
 use crate::bounds::patches_ops::nearest_neighbor_upsample_last2;
 use crate::layers::common::PatchesPropagation;
 
@@ -45,10 +45,24 @@ impl PatchesPropagation for AveragePoolLayer {
                 "AvgPool Patches requires kernel_size == stride".into(),
             ));
         }
-        // Guard: count_include_pad must be true (alpha-beta-CROWN default)
-        if !self.count_include_pad {
+        // Guard: the divisor used below is the constant `pool_size = kh*kw`, which
+        // is only correct when every window averages exactly kh*kw REAL inputs.
+        // That holds when `count_include_pad=true` (padding zeros are counted), and
+        // ALSO — exactly, not approximately — when there is no padding at all: with
+        // `padding == (0,0)` no window touches a pad cell, so the
+        // `count_include_pad=false` divisor (number of non-pad cells) equals kh*kw
+        // too. `ceil_mode != 0` is rejected at model load
+        // (ny-build/src/convert/pooling.rs:178), so with zero padding the floor
+        // output formula guarantees every window lies fully inside the input and
+        // no partial windows exist. This matches the dense backward, whose divisor
+        // is likewise `count == kh*kw` for both settings when ph == pw == 0
+        // (pooling/average.rs:600-619). Refusing this case forced a dense
+        // materialization on TinyYOLO (ONNX default count_include_pad=0, pads=0),
+        // which blew the Conv2d CROWN scratch cap and returned the conservative
+        // ±inf relation for 4 of 8 demanded targets.
+        if !self.count_include_pad && self.padding != (0, 0) {
             return Err(NyError::UnsupportedOp(
-                "AvgPool Patches requires count_include_pad=true".into(),
+                "AvgPool Patches requires count_include_pad=true when padding != 0".into(),
             ));
         }
         // Guard: global pooling not supported in Patches mode
@@ -57,6 +71,17 @@ impl PatchesPropagation for AveragePoolLayer {
                 "Global AvgPool not supported in Patches mode".into(),
             ));
         }
+        // This legacy pool kernel is affine-only. Reject Anchored in O(1)
+        // before common validation scans its origin axes.
+        let affine_geometry = bounds
+            .lower_a
+            .geometry
+            .require_affine("AveragePool Patches backward")?;
+        bounds
+            .upper_a
+            .geometry
+            .require_affine("AveragePool Patches backward")?;
+        bounds.lower_a.validate_common_geometry(&bounds.upper_a)?;
 
         let (pool_kh, pool_kw) = self.kernel_size;
         let (pool_sh, pool_sw) = self.stride;
@@ -82,8 +107,32 @@ impl PatchesPropagation for AveragePoolLayer {
         let spec_rows = bounds.row_count;
 
         let upsample_patches = |data: &PatchesData| -> Result<PatchesData> {
+            let (data_sh, data_sw) = affine_geometry.stride();
+            let (data_pl, data_pr, data_pt, data_pb) = affine_geometry.padding();
+            let compose = |value: usize, scale: usize, add: usize, label: &str| {
+                value
+                    .checked_mul(scale)
+                    .and_then(|scaled| scaled.checked_add(add))
+                    .ok_or_else(|| {
+                        NyError::InvalidSpec(format!(
+                            "AveragePool Patches composed {label} overflows usize"
+                        ))
+                    })
+            };
+            let new_geometry = PatchGeometry::affine(
+                (
+                    compose(data_sh, pool_sh, 0, "height stride")?,
+                    compose(data_sw, pool_sw, 0, "width stride")?,
+                ),
+                (
+                    compose(data_pl, pool_sw, pool_pw, "left padding")?,
+                    compose(data_pr, pool_sw, pool_pw, "right padding")?,
+                    compose(data_pt, pool_sh, pool_ph, "top padding")?,
+                    compose(data_pb, pool_sh, pool_ph, "bottom padding")?,
+                ),
+            );
             let materialized = if data.identity {
-                data.materialize_identity()
+                data.try_materialize_identity()?
             } else {
                 data.clone()
             };
@@ -221,17 +270,10 @@ impl PatchesPropagation for AveragePoolLayer {
             Ok(PatchesData {
                 coeff_err,
                 patches: Some(patches),
-                // Stride composition: new_stride = patches.stride * pool_stride
-                stride: (data.stride.0 * pool_sh, data.stride.1 * pool_sw),
-                // Padding composition (simplified, no inserted_zeros):
-                // new_padding = patches.padding * pool_stride + pool_padding
-                // Reference: alpha-beta-CROWN patches.py:354
-                padding: (
-                    data.padding.0 * pool_sw + pool_pw, // left
-                    data.padding.1 * pool_sw + pool_pw, // right
-                    data.padding.2 * pool_sh + pool_ph, // top
-                    data.padding.3 * pool_sh + pool_ph, // bottom
-                ),
+                // Affine stride/padding composition. Anchored layouts are
+                // refused before materialization until phase composition lands.
+                // Reference: alpha-beta-CROWN patches.py:354.
+                geometry: new_geometry,
                 identity: false,
                 output_shape: data.output_shape,
                 input_shape: (channels, in_h, in_w),
@@ -481,8 +523,7 @@ mod bitwise_regression_pins {
         let make_side = |vals: Vec<f32>, err: Vec<f32>| PatchesData {
             coeff_err: Some(Array1::from_vec(err)),
             patches: Some(ArrayD::from_shape_vec(IxDyn(&[1, 2, 2, 1, 1, 1]), vals).unwrap()),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
             identity: false,
             output_shape: (1, 2, 2),
             input_shape: (1, 2, 2),
@@ -514,8 +555,10 @@ mod bitwise_regression_pins {
 
         // Metadata composition (layout-independent, must not move either).
         assert_eq!(pb.row_count, 4);
-        assert_eq!(pb.lower_a.stride, (1, 3));
-        assert_eq!(pb.lower_a.padding, (0, 0, 0, 0));
+        assert_eq!(
+            pb.lower_a.geometry,
+            PatchGeometry::affine((1, 3), (0, 0, 0, 0))
+        );
         assert_eq!(pb.lower_a.output_shape, (1, 2, 2));
         assert_eq!(pb.lower_a.input_shape, (1, 2, 6));
         assert_eq!(
@@ -611,13 +654,43 @@ mod coeff_err_7d_tests {
         PatchesData {
             coeff_err: err.map(Array1::from_vec),
             patches: Some(ArrayD::from_shape_vec(IxDyn(&[2, 1, 2, 2, 1, 1, 1]), vals).unwrap()),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
             identity: false,
             output_shape: (1, 2, 2),
             input_shape: (1, 2, 2),
             unstable_idx: None,
         }
+    }
+
+    #[test]
+    fn avgpool_anchored_geometry_refuses_before_coefficient_arithmetic() {
+        let (avgpool, pre) = avgpool_fixture();
+        let mut bounds = PatchesLinearBounds {
+            row_count: 2,
+            lower_a: make_side_7d(vec![0.25, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0], None),
+            lower_b: Array1::from_vec(vec![0.125, -0.25]),
+            upper_a: make_side_7d(vec![-0.75, 0.5, -0.25, 1.0, -1.25, 1.5, -1.75, 2.0], None),
+            upper_b: Array1::from_vec(vec![-0.375, 0.5]),
+        };
+        let anchored = PatchGeometry::anchored(vec![0, 1], vec![0, 1]).unwrap();
+        bounds.lower_a.geometry = anchored.clone();
+        bounds.upper_a.geometry = anchored;
+
+        let lower_patches_before = bounds.lower_a.patches.clone();
+        let upper_patches_before = bounds.upper_a.patches.clone();
+        let lower_bias_before = bounds.lower_b.clone();
+        let upper_bias_before = bounds.upper_b.clone();
+
+        let result = avgpool.propagate_patches_with_bounds(&bounds, &pre);
+        assert!(matches!(
+            result,
+            Err(NyError::UnsupportedConfiguration(message))
+                if message.contains("AveragePool Patches backward")
+        ));
+        assert_eq!(bounds.lower_a.patches, lower_patches_before);
+        assert_eq!(bounds.upper_a.patches, upper_patches_before);
+        assert_eq!(bounds.lower_b, lower_bias_before);
+        assert_eq!(bounds.upper_b, upper_bias_before);
     }
 
     /// Per-row carried err from an explicit truth model:
@@ -901,5 +974,234 @@ mod division_err_soundness_tests {
             assert_eq!(pb.lower_b[i], expected_lower, "row {i}: lower bias");
             assert_eq!(pb.upper_b[i], expected_upper, "row {i}: upper bias");
         }
+    }
+}
+
+// --- yolo_2023 regression: zero-padding admission of count_include_pad=false ---
+//
+// MEASURED CONTEXT. On yolo_2023 (TinyYOLO) the ONNX `AveragePool_11` /
+// `AveragePool_18` nodes carry `kernel_shape=[2,2] strides=[2,2] pads=[0,0,0,0]`
+// and NO `count_include_pad` attribute, so ny-build defaults it to `false`
+// (ny-build/src/convert/pooling.rs:258). The old guard refused the Patches
+// backward outright ("AvgPool Patches requires count_include_pad=true"), the
+// walk fell back to Dense, the dense materialization needed a 33.7 GB transient,
+// the Conv2d CROWN scratch cap (3 GB) soundly refused it, and the caller
+// returned the CONSERVATIVE relation. That relation's lower bias is
+// `f32::NEG_INFINITY`, the target concretized to [-inf, inf], the per-element
+// intersection with IBP silently restored the IBP box, and provenance still
+// reported "Crown" — 4 of 8 demanded targets (Conv_12, Add_15, Conv_20, Conv_25)
+// billed as CROWN-tightened while contributing nothing. (Same failure signature
+// as a NaN reaching `LinearBounds::new_or_conservative`, which repairs NaN ->
+// -inf/+inf for exactly the same reason: a degraded target that still claims
+// Crown provenance.) Conv_5 / Add_8, whose walks cross no AveragePool, gained
+// 15x and 14.7x over IBP.
+//
+// WHY ADMITTING IT IS SOUND. The backward above divides by the CONSTANT
+// `pool_size = kh*kw`. With `padding == (0,0)` no window touches a pad cell, so
+// the `count_include_pad=false` divisor (the non-pad count) is also exactly
+// `kh*kw` — identical arithmetic, not an approximation. `ceil_mode != 0` is
+// rejected at load (ny-build/src/convert/pooling.rs:178), so the floor output
+// formula admits no partial windows. These tests pin both halves: the admitted
+// geometry is BIT-IDENTICAL to the `count_include_pad=true` result and the dense
+// oracle uses the same divisor, and `padding != (0,0)` with
+// `count_include_pad=false` is still refused.
+#[cfg(test)]
+mod zero_padding_count_include_pad_tests {
+    use super::*;
+    use crate::bounds::LinearBounds;
+    use ndarray::{ArrayD, IxDyn};
+
+    /// Pre-activation (1, 4, 4); pool 2x2 / stride 2 -> output (1, 2, 2).
+    /// Concrete point used for the enclosure check, inside the [-3, 3] box.
+    const X: [f32; 16] = [
+        0.7, -1.3, 0.55, 2.4, //
+        -0.35, 0.85, 1.15, -0.65, //
+        0.9, -2.3, 0.55, 1.05, //
+        -1.1, 0.25, 1.6, -0.45,
+    ];
+
+    fn pre_activation() -> BoundedTensor {
+        let lower = ArrayD::from_elem(IxDyn(&[1, 4, 4]), -3.0f32);
+        let upper = ArrayD::from_elem(IxDyn(&[1, 4, 4]), 3.0f32);
+        BoundedTensor::new(lower, upper).unwrap()
+    }
+
+    fn run(count_include_pad: bool) -> Result<CrownBounds> {
+        let avgpool = AveragePoolLayer::new((2, 2), (2, 2), (0, 0), count_include_pad);
+        let identity = PatchesLinearBounds::identity((1, 2, 2), (1, 2, 2));
+        avgpool.propagate_patches_with_bounds(&identity, &pre_activation())
+    }
+
+    fn as_patches(result: CrownBounds) -> Box<PatchesLinearBounds> {
+        match result {
+            CrownBounds::Patches(pb) => pb,
+            CrownBounds::Dense(_) => {
+                panic!("expected Patches mode (kernel area 4 < input area 16)")
+            }
+        }
+    }
+
+    /// THE FIX. With zero padding, `count_include_pad=false` is now admitted and
+    /// produces a result BIT-IDENTICAL to `count_include_pad=true` — coefficients,
+    /// certified coeff_err, and both biases. That is the whole soundness argument
+    /// made executable: the two settings are the same linear map here, so
+    /// admitting the `false` case changes no arithmetic whatsoever.
+    #[test]
+    fn zero_padding_cip_false_is_bit_identical_to_cip_true() {
+        let t = as_patches(run(true).expect("count_include_pad=true must be admitted"));
+        let f = as_patches(
+            run(false).expect("zero padding + count_include_pad=false must now be admitted"),
+        );
+
+        assert_eq!(t.row_count, f.row_count);
+        for (label, a, b) in [
+            ("lower", &t.lower_a, &f.lower_a),
+            ("upper", &t.upper_a, &f.upper_a),
+        ] {
+            let pa = a.patches.as_ref().expect("materialized patches");
+            let pb = b.patches.as_ref().expect("materialized patches");
+            assert_eq!(pa.shape(), pb.shape(), "{label}: patches shape");
+            for (x, y) in pa.iter().zip(pb.iter()) {
+                assert_eq!(x.to_bits(), y.to_bits(), "{label}: patch coefficient");
+            }
+            match (a.coeff_err.as_ref(), b.coeff_err.as_ref()) {
+                (None, None) => {}
+                (Some(x), Some(y)) => {
+                    assert_eq!(x.len(), y.len(), "{label}: coeff_err length");
+                    for (p, q) in x.iter().zip(y.iter()) {
+                        assert_eq!(p.to_bits(), q.to_bits(), "{label}: coeff_err");
+                    }
+                }
+                _ => panic!("{label}: coeff_err presence differs between the two settings"),
+            }
+            assert_eq!(a.geometry, b.geometry, "{label}: geometry");
+            assert_eq!(a.input_shape, b.input_shape, "{label}: input_shape");
+        }
+        for r in 0..t.lower_b.len() {
+            assert_eq!(
+                t.lower_b[r].to_bits(),
+                f.lower_b[r].to_bits(),
+                "row {r}: lower bias"
+            );
+            assert_eq!(
+                t.upper_b[r].to_bits(),
+                f.upper_b[r].to_bits(),
+                "row {r}: upper bias"
+            );
+        }
+    }
+
+    /// The admitted relation is FINITE and SOUND: every coefficient and bias is
+    /// finite (no -inf conservative degrade), and for a concrete point in the
+    /// input box the relation encloses the true AvgPool output. The width check
+    /// is what a degraded [-inf, +inf] target would fail: this relation is a real
+    /// tightening, not a box restored by the IBP intersection.
+    #[test]
+    fn zero_padding_cip_false_relation_is_finite_and_encloses_avgpool() {
+        let pb = as_patches(run(false).expect("zero padding + count_include_pad=false admitted"));
+        let dense = pb.to_dense().expect("materialize the admitted relation");
+        assert_eq!(dense.num_outputs(), 4, "one row per output position");
+        assert_eq!(dense.num_inputs(), 16, "1x4x4 input");
+
+        assert!(
+            dense.lower_a().iter().all(|v| v.is_finite())
+                && dense.upper_a().iter().all(|v| v.is_finite()),
+            "coefficients must be finite (a NaN/inf here degrades the target to \
+             [-inf, inf] while provenance still reports Crown)"
+        );
+
+        for (r, (oh, ow)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+            .iter()
+            .enumerate()
+        {
+            // True AvgPool output at X for this window, in exact f64.
+            let mut sum = 0.0f64;
+            for kh in 0..2usize {
+                for kw in 0..2usize {
+                    sum += f64::from(X[(oh * 2 + kh) * 4 + (ow * 2 + kw)]);
+                }
+            }
+            let truth = sum / 4.0;
+
+            let mut lo = f64::from(dense.lower_b()[r]);
+            let mut up = f64::from(dense.upper_b()[r]);
+            for j in 0..16usize {
+                lo += f64::from(dense.lower_a()[[r, j]]) * f64::from(X[j]);
+                up += f64::from(dense.upper_a()[[r, j]]) * f64::from(X[j]);
+            }
+            assert!(
+                lo.is_finite() && up.is_finite(),
+                "row {r}: non-finite bound {lo} / {up}"
+            );
+            assert!(lo <= truth, "row {r}: UNSOUND lower {lo} > truth {truth}");
+            assert!(up >= truth, "row {r}: UNSOUND upper {up} < truth {truth}");
+            assert!(
+                up - lo < 1.0e-3,
+                "row {r}: width {} is not a real tightening — a conservative \
+                 (degraded) relation would land here",
+                up - lo
+            );
+        }
+    }
+
+    /// The dense backward — the trusted oracle that handles BOTH settings — uses
+    /// divisor `count.max(1)`, which equals `kh*kw = 4` for every window when
+    /// padding is zero. Pinning that the two settings give the identical dense
+    /// Jacobian is the proof that the patches path's constant `pool_size`
+    /// divisor is correct on the newly-admitted geometry.
+    #[test]
+    fn zero_padding_dense_divisor_is_pool_size_for_both_settings() {
+        let pre = pre_activation();
+        let incoming = LinearBounds::identity(4);
+        let t = AveragePoolLayer::new((2, 2), (2, 2), (0, 0), true)
+            .propagate_linear_with_bounds(&incoming, &pre)
+            .expect("dense backward, count_include_pad=true");
+        let f = AveragePoolLayer::new((2, 2), (2, 2), (0, 0), false)
+            .propagate_linear_with_bounds(&incoming, &pre)
+            .expect("dense backward, count_include_pad=false");
+        assert_eq!(
+            t.lower_a(),
+            f.lower_a(),
+            "dense Jacobian must not depend on \
+             count_include_pad when padding == 0"
+        );
+        assert_eq!(t.upper_a(), f.upper_a());
+        for v in t.lower_a().iter() {
+            assert!(
+                *v == 0.0 || *v == 0.25,
+                "every nonzero dense weight must be 1/(kh*kw) = 0.25, got {v}"
+            );
+        }
+    }
+
+    /// The guard still refuses the case it was written for: with real padding a
+    /// `count_include_pad=false` window averages FEWER than kh*kw real inputs, so
+    /// the constant `pool_size` divisor would be wrong (and dividing by too much
+    /// is not automatically the sound direction). Refusal -> sound dense fallback.
+    #[test]
+    fn nonzero_padding_cip_false_is_still_refused() {
+        let avgpool = AveragePoolLayer::new((2, 2), (2, 2), (1, 1), false);
+        let identity = PatchesLinearBounds::identity((1, 3, 3), (1, 3, 3));
+        let result = avgpool.propagate_patches_with_bounds(&identity, &pre_activation());
+        match result {
+            Err(NyError::UnsupportedOp(msg)) => assert!(
+                msg.contains("count_include_pad"),
+                "unexpected refusal reason: {msg}"
+            ),
+            other => {
+                panic!("padding != 0 with count_include_pad=false must be refused, got {other:?}")
+            }
+        }
+        // ... while the same padded geometry with count_include_pad=true stays
+        // admitted (the divisor really is kh*kw there).
+        let padded_true = AveragePoolLayer::new((2, 2), (2, 2), (1, 1), true)
+            .propagate_patches_with_bounds(
+                &PatchesLinearBounds::identity((1, 3, 3), (1, 3, 3)),
+                &pre_activation(),
+            );
+        assert!(
+            padded_true.is_ok(),
+            "count_include_pad=true with padding must remain admitted: {padded_true:?}"
+        );
     }
 }

@@ -36,11 +36,13 @@
 //! - `(declare-network ...)` wrapper (input/output declarations are parsed; network metadata ignored)
 //! - Linear arithmetic in constraints (add/sub, mul/div by constants)
 //!
-//! Still unsupported:
-//! - Non-linear arithmetic expressions within constraints
+//! The ordinary [`parse_vnnlib`] representation remains affine. Non-linear
+//! arithmetic is handled by [`nonlinear::NonLinearFormula`], which retains exact
+//! decimal literals and supports sound concrete and interval evaluation for the
+//! dedicated nonlinear verification lane. Unsupported operators fail closed.
 //!
 //! If a `(vnnlib-version 2.0)` declaration is detected, a warning is emitted for
-//! unsupported features (e.g., non-linear arithmetic).
+//! features unsupported by the ordinary affine representation.
 //!
 //! # Usage
 //!
@@ -57,6 +59,7 @@
 mod certified_input_box;
 /// Full-coverage dual-network formula DNF extraction (relational gate-flip).
 pub mod dual_formula;
+pub mod nonlinear;
 mod normalize;
 mod parser;
 mod spec;
@@ -66,7 +69,11 @@ mod syntax;
 mod tests;
 
 pub use certified_input_box::{
-    load_vnnlib_with_certified_input_box, parse_vnnlib_with_certified_input_box, CertifiedInputBox,
+    load_vnnlib_with_certified_affine_property, load_vnnlib_with_certified_input_box,
+    load_vnnlib_with_certified_scalar_moat, parse_vnnlib_with_certified_affine_property,
+    parse_vnnlib_with_certified_input_box, parse_vnnlib_with_certified_scalar_moat,
+    CertifiedInputBox, CertifiedRelationalOutputAtom, CertifiedRelationalOutputConjunction,
+    CertifiedScalarMoat,
 };
 /// VNN-LIB parsers for file-based and in-memory property specifications.
 pub use parser::{load_vnnlib, parse_vnnlib};

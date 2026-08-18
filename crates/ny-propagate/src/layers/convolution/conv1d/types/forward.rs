@@ -80,6 +80,21 @@ impl Conv1dLayer {
             });
         }
         let out_channels = kernel.shape()[0];
+        let input_channels_per_group = kernel.shape()[1];
+        let kernel_size = kernel.shape()[2];
+        if out_channels == 0 || input_channels_per_group == 0 || kernel_size == 0 {
+            return Err(NyError::InvalidSpec(format!(
+                "Conv1d kernel dimensions must be nonzero, got {:?}",
+                kernel.shape()
+            )));
+        }
+        input_channels_per_group
+            .checked_mul(groups)
+            .ok_or_else(|| {
+                NyError::InvalidSpec(format!(
+                    "Conv1d total input channels overflow: {input_channels_per_group} * {groups}"
+                ))
+            })?;
         if !out_channels.is_multiple_of(groups) {
             return Err(NyError::InvalidSpec(format!(
                 "Conv1d out_channels ({out_channels}) must be divisible by groups ({groups})"
@@ -163,9 +178,21 @@ impl Conv1dLayer {
     /// Returns an error if the effective kernel exceeds the padded input.
     pub fn output_length(&self, input_len: usize) -> Result<usize> {
         let k = self.kernel_size();
-        let effective_k = self.dilation * (k - 1) + 1;
-        let padded = input_len
-            .checked_add(2 * self.padding)
+        if self.stride == 0 || self.dilation == 0 || k == 0 {
+            return Err(NyError::InvalidSpec(
+                "Conv1d output length requires nonzero stride, dilation, and kernel length"
+                    .to_string(),
+            ));
+        }
+        let effective_k = k
+            .checked_sub(1)
+            .and_then(|extent| extent.checked_mul(self.dilation))
+            .and_then(|extent| extent.checked_add(1))
+            .ok_or_else(|| NyError::InvalidSpec("Conv1d effective kernel overflow".to_string()))?;
+        let padded = self
+            .padding
+            .checked_mul(2)
+            .and_then(|padding| input_len.checked_add(padding))
             .ok_or_else(|| NyError::InvalidSpec("Conv1d padded length overflow".to_string()))?;
         if padded < effective_k {
             return Err(NyError::InvalidSpec(format!(
@@ -446,6 +473,7 @@ impl Conv1dLayer {
             kernel_l1,
             n_contraction,
             None,
+            None,
         );
         let mut upper_err_2d = batched_conv_coeff_err(
             &upper_a_2d,
@@ -454,6 +482,7 @@ impl Conv1dLayer {
             coeff_f64_u.as_ref().filter(|_| upper_recompute_ok),
             kernel_l1,
             n_contraction,
+            None,
             None,
         );
         // A WANTED-but-failed recompute degrades all rows of that bound to ±inf bias.

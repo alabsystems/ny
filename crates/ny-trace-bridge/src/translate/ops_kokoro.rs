@@ -201,6 +201,7 @@ fn translate_adain_snake(
         &beta_input,
         eps_f32,
         num_channels,
+        output_shape.len(),
         ctx,
     )?;
     let snake_spec = emit_native_snake(name, alpha, &adain_out, output_tensor, "AdainSnake", ctx)?;
@@ -258,6 +259,7 @@ fn translate_adain_leaky_relu(
         &beta_input,
         eps_f32,
         num_channels,
+        output_shape.len(),
         ctx,
     )?;
     emit_leaky_relu_specs(name, slope_f32, &adain_out, output_tensor, ctx, &mut specs)?;
@@ -664,6 +666,7 @@ fn emit_variable_adain(
     beta_input: &str,
     eps_f32: f32,
     num_channels: usize,
+    activation_rank: usize,
     ctx: &mut Ctx,
 ) -> Result<(Vec<LayerSpec>, String)> {
     let mut specs = Vec::with_capacity(6);
@@ -682,6 +685,12 @@ fn emit_variable_adain(
     )?;
     let mut eps_attrs = HashMap::new();
     eps_attrs.insert("epsilon".to_string(), AttributeValue::Float(eps_f32));
+    if activation_rank == 2 {
+        eps_attrs.insert(
+            ny_build::INTERNAL_CT_INSTANCE_NORM_ATTR.to_string(),
+            AttributeValue::Int(1),
+        );
+    }
     let norm_out = format!("{norm_name}_out");
     specs.push(simple_spec(
         &norm_name,

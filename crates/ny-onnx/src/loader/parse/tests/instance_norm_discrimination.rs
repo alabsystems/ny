@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::parse_onnx_bytes;
-use crate::loader::{CustomOpRegistry, ShapeInferBackend, ShapeInferencePolicy};
+use crate::loader::{
+    BatchNormFoldingPolicy, CustomOpRegistry, ShapeInferBackend, ShapeInferencePolicy,
+};
 use crate::onnx_proto::{
     AttributeProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorProto,
     TensorShapeProto, TensorTypeProto, TypeProto, ValueInfoProto,
@@ -59,7 +61,7 @@ fn attr_ints(name: &str, values: &[i64]) -> AttributeProto {
     }
 }
 
-fn build_instance_norm_model_bytes() -> Vec<u8> {
+fn build_last_axis_norm_model_bytes(affine_shape: &[i64], affine_values: usize) -> Vec<u8> {
     let mut mean1 = node("mean1", "ReduceMean", &["x"], &["mean1_out"]);
     mean1.attribute.push(attr_ints("axes", &[-1]));
 
@@ -85,8 +87,8 @@ fn build_instance_norm_model_bytes() -> Vec<u8> {
         ],
         initializer: vec![
             tensor_f32("eps", &[], &[1e-5]),
-            tensor_f32("ny", &[4], &[1.0, 1.0, 1.0, 1.0]),
-            tensor_f32("beta", &[4], &[0.0, 0.0, 0.0, 0.0]),
+            tensor_f32("ny", affine_shape, &vec![1.0; affine_values]),
+            tensor_f32("beta", affine_shape, &vec![0.0; affine_values]),
         ],
         ..Default::default()
     };
@@ -94,7 +96,9 @@ fn build_instance_norm_model_bytes() -> Vec<u8> {
     let model = ModelProto {
         ir_version: 9,
         opset_import: vec![OperatorSetIdProto {
-            version: 13,
+            // ReduceMean uses attribute-form axes in this fixture, valid
+            // through opset 12.
+            version: 12,
             domain: String::new(),
         }],
         producer_name: "ny-onnx-parse-test".to_string(),
@@ -105,15 +109,21 @@ fn build_instance_norm_model_bytes() -> Vec<u8> {
 }
 
 #[test]
-fn test_parse_onnx_bytes_discriminates_instance_norm_before_conversion_3591() {
-    let bytes = build_instance_norm_model_bytes();
+fn channel_affine_after_last_axis_normalization_is_not_fused_as_layer_norm() {
+    // These parameters broadcast channel-wise over [B, C, T].  They are valid
+    // for the authored primitive graph but cannot be embedded in ny's
+    // one-dimensional, last-axis LayerNorm affine.
+    let bytes = build_last_axis_norm_model_bytes(&[1, 4, 1], 4);
     let registry = CustomOpRegistry::default();
     let (layers, _, _, _, _, _, tensor_shapes, _, _) = parse_onnx_bytes(
         &bytes,
         &registry,
-        ShapeInferencePolicy::Ort,
+        // Fusion discrimination is based on authored input/initializer
+        // shapes; do not make this coverage conditional on ORT.
+        ShapeInferencePolicy::Skip,
         &ShapeInferBackend::InProcess,
         false,
+        BatchNormFoldingPolicy::LegacyEnvironment,
         false,
     )
     .expect("parse onnx bytes");
@@ -124,9 +134,41 @@ fn test_parse_onnx_bytes_discriminates_instance_norm_before_conversion_3591() {
         "parser should retain the input tensor shape used for normalization fusion"
     );
     assert!(
+        layers.iter().all(|layer| !matches!(
+            layer.layer_type,
+            LayerType::LayerNorm | LayerType::InstanceNorm
+        )),
+        "channel-shaped affine must keep the authored primitive graph"
+    );
+    assert_eq!(
         layers
             .iter()
-            .any(|layer| layer.layer_type == LayerType::InstanceNorm),
-        "decomposed normalization on [B, C, T] with ny [C] should fuse to InstanceNorm"
+            .filter(|layer| layer.layer_type == LayerType::ReduceMean)
+            .count(),
+        2,
+        "both authored reductions should remain after declining fusion"
+    );
+}
+
+#[test]
+fn one_dimensional_last_axis_affine_still_fuses_as_layer_norm() {
+    let bytes = build_last_axis_norm_model_bytes(&[3], 3);
+    let registry = CustomOpRegistry::default();
+    let (layers, _, _, _, _, _, _, _, _) = parse_onnx_bytes(
+        &bytes,
+        &registry,
+        ShapeInferencePolicy::Skip,
+        &ShapeInferBackend::InProcess,
+        false,
+        BatchNormFoldingPolicy::LegacyEnvironment,
+        false,
+    )
+    .expect("parse onnx bytes");
+
+    assert!(
+        layers
+            .iter()
+            .any(|layer| layer.layer_type == LayerType::LayerNorm),
+        "a matching one-dimensional last-axis affine should retain LayerNorm fusion"
     );
 }

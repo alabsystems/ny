@@ -2,8 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{arr1, Array1, ArrayD, IxDyn};
+use ndarray::{arr1, Array1, ArrayD, Dimension, IxDyn};
 use ny_core::Result;
+use std::time::Instant;
 
 use super::*;
 
@@ -14,8 +15,7 @@ fn test_identity_patches_to_dense() -> Result<()> {
     let patches_data = PatchesData {
         coeff_err: None,
         patches: None,
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: true,
         output_shape: shape,
         input_shape: shape,
@@ -66,8 +66,7 @@ fn test_crown_bounds_ensure_dense_converts_patches() -> Result<()> {
     let patches_data = PatchesData {
         coeff_err: None,
         patches: None,
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: true,
         output_shape: shape,
         input_shape: shape,
@@ -94,8 +93,7 @@ fn test_patches_to_dense_1x1_conv_identity() -> Result<()> {
     let patches_data = PatchesData {
         coeff_err: None,
         patches: Some(patches_arr),
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: false,
         output_shape: (1, 2, 2),
         input_shape: (1, 2, 2),
@@ -132,8 +130,7 @@ fn test_patches_to_dense_3x3_conv_with_padding() -> Result<()> {
     let patches_data = PatchesData {
         coeff_err: None,
         patches: Some(patches_arr),
-        stride: (1, 1),
-        padding: (1, 1, 1, 1),
+        geometry: PatchGeometry::affine((1, 1), (1, 1, 1, 1)),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -158,13 +155,115 @@ fn test_patches_to_dense_3x3_conv_with_padding() -> Result<()> {
     Ok(())
 }
 
+fn explicit_row_overlap_bounds() -> PatchesLinearBounds {
+    let shape = IxDyn(&[3, 2, 2, 2, 1, 3, 3]);
+    let lower = ArrayD::from_shape_fn(shape, |index| {
+        let ordinal = index
+            .slice()
+            .iter()
+            .fold(0usize, |acc, &part| acc.wrapping_mul(7).wrapping_add(part));
+        if ordinal % 29 == 0 {
+            -0.0
+        } else {
+            ((ordinal % 19) as f32 - 9.0) * 0.125
+        }
+    });
+    let upper = lower.mapv(|value| value * -0.5);
+    let side = |patches| PatchesData {
+        coeff_err: Some(arr1(&[1.0e-4, 2.0e-4, 3.0e-4])),
+        patches: Some(patches),
+        geometry: PatchGeometry::affine((1, 1), (1, 1, 1, 1)),
+        identity: false,
+        output_shape: (2, 2, 2),
+        input_shape: (1, 2, 2),
+        unstable_idx: None,
+    };
+    PatchesLinearBounds {
+        row_count: 3,
+        lower_a: side(lower),
+        lower_b: arr1(&[-0.0, 0.25, -0.5]),
+        upper_a: side(upper),
+        upper_b: arr1(&[0.0, -0.25, 0.5]),
+    }
+}
+
+#[test]
+fn test_explicit_rows_selected_beta_columns_match_full_dense_bitwise() -> Result<()> {
+    let bounds = explicit_row_overlap_bounds();
+    let dense = bounds.to_dense()?;
+    let (indices, compact) = bounds
+        .try_lower_a_beta_columns(&[3, 0, 3, usize::MAX, 2])
+        .expect("narrow explicit-row carrier should admit selected-column capture");
+
+    assert_eq!(indices, vec![0, 2, 3]);
+    assert_eq!(compact.shape(), &[3, 3]);
+    for row in 0..compact.nrows() {
+        for (compact_col, &global_col) in indices.iter().enumerate() {
+            assert_eq!(
+                compact[[row, compact_col]].to_bits(),
+                dense.lower_a()[[row, global_col]].to_bits(),
+                "selected scatter must preserve dense += order at row={row}, global_col={global_col}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_selected_beta_columns_refuse_non_narrow_or_malformed_carriers() {
+    let bounds = explicit_row_overlap_bounds();
+    assert!(
+        bounds.try_lower_a_beta_columns(&[0, 1, 2, 3]).is_none(),
+        "capturing every input column is not a sparse win"
+    );
+
+    let mut malformed_err = bounds.clone();
+    malformed_err.lower_a.coeff_err = Some(arr1(&[1.0e-4]));
+    assert!(
+        malformed_err.try_lower_a_beta_columns(&[0]).is_none(),
+        "malformed 7D coeff-error metadata must use historical materialization"
+    );
+
+    let mut selected_non_finite = bounds;
+    selected_non_finite
+        .lower_a
+        .patches
+        .as_mut()
+        .expect("explicit lower patches")[[0, 0, 0, 0, 0, 1, 1]] = f32::INFINITY;
+    assert!(
+        selected_non_finite.try_lower_a_beta_columns(&[0]).is_none(),
+        "non-finite selected results must use the historical firewall"
+    );
+
+    let legacy_shape = IxDyn(&[2, 2, 2, 1, 3, 3]);
+    let legacy_side = PatchesData {
+        coeff_err: None,
+        patches: Some(ArrayD::zeros(legacy_shape)),
+        geometry: PatchGeometry::affine((1, 1), (1, 1, 1, 1)),
+        identity: false,
+        output_shape: (2, 2, 2),
+        input_shape: (1, 2, 2),
+        unstable_idx: None,
+    };
+    let legacy = PatchesLinearBounds {
+        row_count: 8,
+        lower_a: legacy_side.clone(),
+        lower_b: Array1::zeros(8),
+        upper_a: legacy_side,
+        upper_b: Array1::zeros(8),
+    };
+    assert!(
+        legacy.try_lower_a_beta_columns(&[0]).is_none(),
+        "legacy 6D layout stays on the established full-dense path"
+    );
+}
+
 #[test]
 fn test_should_fallback_to_dense() {
     let data = PatchesData {
         coeff_err: None,
         patches: Some(ArrayD::zeros(IxDyn(&[1, 3, 3, 1, 5, 5]))),
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: false,
         output_shape: (1, 3, 3),
         input_shape: (1, 5, 5),
@@ -175,8 +274,7 @@ fn test_should_fallback_to_dense() {
     let data2 = PatchesData {
         coeff_err: None,
         patches: Some(ArrayD::zeros(IxDyn(&[1, 6, 6, 1, 3, 3]))),
-        stride: (1, 1),
-        padding: (1, 1, 1, 1),
+        geometry: PatchGeometry::affine((1, 1), (1, 1, 1, 1)),
         identity: false,
         output_shape: (1, 6, 6),
         input_shape: (1, 6, 6),
@@ -191,8 +289,7 @@ fn patches_with_kernel(kh: usize, kw: usize, in_h: usize, in_w: usize) -> Patche
     PatchesData {
         coeff_err: None,
         patches: Some(ArrayD::zeros(IxDyn(&[1, 1, 1, 1, kh, kw]))),
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: false,
         output_shape: (1, 1, 1),
         input_shape: (1, in_h, in_w),
@@ -291,8 +388,7 @@ fn test_patches_vs_dense_memory_savings_2613() {
         let pd = PatchesData {
             coeff_err: None,
             patches: Some(patches_arr),
-            stride: (1, 1),
-            padding: (0, 0, 0, 0),
+            geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
             identity: false,
             output_shape: (*oc, *oh, *ow),
             input_shape: (*ic, *ih, *iw),
@@ -377,8 +473,7 @@ fn test_filter_to_unstable_roundtrip() -> Result<()> {
     let patches_data = PatchesData {
         coeff_err: None,
         patches: Some(patches_arr),
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -677,8 +772,7 @@ fn test_scatter_dense_equiv_random() {
         let pd = PatchesData {
             coeff_err: None,
             patches: Some(patches.clone()),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -700,7 +794,8 @@ fn test_scatter_dense_equiv_random() {
             kw,
             0,
             out_c * out_h * out_w,
-        );
+        )
+        .unwrap();
         ref_scatter(
             &mut reference,
             &patches,
@@ -740,8 +835,7 @@ fn test_scatter_rows_equiv_random() {
         let pd = PatchesData {
             coeff_err: None,
             patches: Some(patches.clone()),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -753,7 +847,8 @@ fn test_scatter_rows_equiv_random() {
         let mut reference = Array2::<f32>::zeros((row_count, in_dim));
         scatter_rows_with_unfold_map(
             &mut opt, &patches, &index_map, 0, row_count, out_c, out_h, out_w, in_c, kh, kw,
-        );
+        )
+        .unwrap();
         ref_scatter_rows(
             &mut reference,
             &patches,
@@ -820,8 +915,7 @@ fn test_scatter_sparse_equiv_random() {
         let pd = PatchesData {
             coeff_err: None,
             patches: Some(sparse.clone()),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -833,7 +927,8 @@ fn test_scatter_sparse_equiv_random() {
         let mut reference = Array2::<f32>::zeros((out_dim, in_dim));
         scatter_sparse_with_unfold_map(
             &mut opt, &sparse, &index_map, &idx, out_h, out_w, in_c, kh, kw, 0, out_dim,
-        );
+        )
+        .unwrap();
         ref_scatter_sparse(
             &mut reference,
             &sparse,
@@ -898,8 +993,7 @@ fn test_scatter_sparse_rows_equiv_random() {
         let pd = PatchesData {
             coeff_err: None,
             patches: Some(sparse.clone()),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -911,7 +1005,8 @@ fn test_scatter_sparse_rows_equiv_random() {
         let mut reference = Array2::<f32>::zeros((row_count, in_dim));
         scatter_sparse_rows_with_unfold_map(
             &mut opt, &sparse, &index_map, 0, row_count, &idx, in_c, kh, kw,
-        );
+        )
+        .unwrap();
         ref_scatter_sparse_rows(
             &mut reference,
             &sparse,
@@ -954,8 +1049,7 @@ fn test_to_dense_equiv_random_dense() -> Result<()> {
         let make_pd = |p: &ArrayD<f32>| PatchesData {
             coeff_err: None,
             patches: Some(p.clone()),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -1083,8 +1177,7 @@ fn test_sparse_to_dense_nonidentity_out_of_bounds_returns_error_not_panic() {
     let make_data = || PatchesData {
         coeff_err: None,
         patches: Some(sparse_patches.clone()),
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -1122,6 +1215,123 @@ fn test_sparse_to_dense_valid_layout_still_succeeds() -> Result<()> {
     Ok(())
 }
 
+/// Small well-formed 4D sparse pair used to exercise the shared lower/upper
+/// authentication boundary.  The 2x2 kernel over a 3x3 input has a 2x2 output.
+fn sparse_pair_validation_fixture() -> PatchesLinearBounds {
+    let idx = UnstableIdx {
+        channels: vec![0, 0],
+        heights: vec![0, 1],
+        widths: vec![0, 1],
+    };
+    let patches = ArrayD::<f32>::ones(IxDyn(&[2, 1, 2, 2]));
+    let side = || PatchesData {
+        coeff_err: None,
+        patches: Some(patches.clone()),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+        identity: false,
+        output_shape: (1, 2, 2),
+        input_shape: (1, 3, 3),
+        unstable_idx: Some(idx.clone()),
+    };
+    PatchesLinearBounds {
+        row_count: 2,
+        lower_a: side(),
+        lower_b: Array1::zeros(2),
+        upper_a: side(),
+        upper_b: Array1::zeros(2),
+    }
+}
+
+/// Both sparse terminal consumers must reject a malformed pair before their
+/// unchecked scatter/concretize loops run.
+fn assert_sparse_pair_rejected(bounds: &PatchesLinearBounds, context: &str) {
+    let dense = bounds.to_dense();
+    assert!(dense.is_err(), "{context}: to_dense unexpectedly succeeded");
+
+    let input = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[1, 3, 3])),
+        ArrayD::ones(IxDyn(&[1, 3, 3])),
+    )
+    .expect("valid input box");
+    let concrete = bounds.concretize_sound_sparse(&input, None);
+    assert!(
+        concrete.is_err(),
+        "{context}: sparse concretize unexpectedly succeeded"
+    );
+}
+
+#[test]
+fn sparse_pair_rejects_missing_or_permuted_upper_index() {
+    let mut missing = sparse_pair_validation_fixture();
+    missing.upper_a.unstable_idx = None;
+    assert_sparse_pair_rejected(&missing, "missing upper unstable_idx");
+
+    let mut permuted = sparse_pair_validation_fixture();
+    permuted.upper_a.unstable_idx = Some(UnstableIdx {
+        channels: vec![0, 0],
+        heights: vec![1, 0],
+        widths: vec![1, 0],
+    });
+    assert_sparse_pair_rejected(&permuted, "permuted upper unstable_idx");
+}
+
+#[test]
+fn sparse_identity_pair_authenticates_upper_index_and_bias_length() {
+    let idx = UnstableIdx {
+        channels: vec![0, 0],
+        heights: vec![0, 2],
+        widths: vec![0, 2],
+    };
+    let mut permuted = PatchesLinearBounds::sparse_identity((1, 3, 3), (1, 3, 3), idx);
+    permuted.upper_a.unstable_idx = Some(UnstableIdx {
+        channels: vec![0, 0],
+        heights: vec![2, 0],
+        widths: vec![2, 0],
+    });
+    assert_sparse_pair_rejected(&permuted, "sparse identity upper index mismatch");
+
+    let idx = UnstableIdx {
+        channels: vec![0, 0],
+        heights: vec![0, 2],
+        widths: vec![0, 2],
+    };
+    let mut short_bias = PatchesLinearBounds::sparse_identity((1, 3, 3), (1, 3, 3), idx);
+    short_bias.upper_b = Array1::zeros(1);
+    assert_sparse_pair_rejected(&short_bias, "sparse identity upper bias length mismatch");
+}
+
+#[test]
+fn sparse_pair_rejects_upper_geometry_mismatch() {
+    let mut bounds = sparse_pair_validation_fixture();
+    bounds.upper_a.geometry = PatchGeometry::affine((2, 1), (0, 0, 0, 0));
+    assert_sparse_pair_rejected(&bounds, "upper stride mismatch");
+}
+
+#[test]
+fn sparse_pair_rejects_sparse_axis_or_rank_mismatch() {
+    let mut short_axis = sparse_pair_validation_fixture();
+    short_axis.lower_a.patches = Some(ArrayD::zeros(IxDyn(&[1, 1, 2, 2])));
+    short_axis.upper_a.patches = Some(ArrayD::zeros(IxDyn(&[1, 1, 2, 2])));
+    assert_sparse_pair_rejected(&short_axis, "short sparse tensor axis");
+
+    let mut mixed_rank = sparse_pair_validation_fixture();
+    mixed_rank.upper_a.patches = Some(ArrayD::zeros(IxDyn(&[2, 2, 1, 2, 2])));
+    assert_sparse_pair_rejected(&mixed_rank, "4D/5D lower/upper rank mismatch");
+}
+
+#[test]
+fn sparse_pair_rejects_duplicate_output_indices() {
+    let mut bounds = sparse_pair_validation_fixture();
+    let duplicate = UnstableIdx {
+        channels: vec![0, 0],
+        heights: vec![1, 1],
+        widths: vec![0, 0],
+    };
+    bounds.lower_a.unstable_idx = Some(duplicate.clone());
+    bounds.upper_a.unstable_idx = Some(duplicate);
+    assert_sparse_pair_rejected(&bounds, "duplicate sparse output index");
+}
+
 // ---------------------------------------------------------------------------
 // Byte-identity PIN tests for the 7D explicit-rows coeff_err closure
 // (docs/PATCHES_7D_COEFF_ERR_CLOSURE.md §3.4 T3, §10.4 T2; validation gate
@@ -1156,9 +1366,8 @@ fn assert_arrd_bit_identical(a: &ArrayD<f32>, b: &ArrayD<f32>, ctx: &str) {
 /// (`to_dense.rs`): naive strided scatter of per-cell tap `count`/`absacc` into
 /// **f32** accumulators — deliberately f32, pinning that the 7D closure does
 /// NOT migrate the 6D arm to the new f64 accumulators (spec §3.4 T3(b), R1) —
-/// followed by the verbatim second phase (including the 6D-only silent
-/// `.get(i).unwrap_or(0.0)` read and `.max(0.0)` sanitize, kept for
-/// byte-identity per spec I6/R3).
+/// followed by the same valid-certificate second phase. Malformed and
+/// non-finite certificates have separate fail-closed tests below.
 #[allow(clippy::too_many_arguments)]
 fn ref_err_matrix_6d_f32(
     patches: &ArrayD<f32>,
@@ -1197,7 +1406,9 @@ fn ref_err_matrix_6d_f32(
     }
     let mut err = Array2::<f32>::zeros((row_count, in_dim));
     for i in 0..row_count {
-        let er = f64::from(err_row.get(i).copied().unwrap_or(0.0)).max(0.0);
+        let carried = err_row[i];
+        assert!(carried.is_finite() && carried >= 0.0);
+        let er = f64::from(carried);
         for j in 0..in_dim {
             let c = count[[i, j]];
             if c > 0.0 {
@@ -1285,8 +1496,7 @@ fn test_to_dense_6d_behavior_byte_identical() -> Result<()> {
         let make_pd = |p: &ArrayD<f32>, err: Option<Array1<f32>>| PatchesData {
             coeff_err: err,
             patches: Some(p.clone()),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -1451,8 +1661,7 @@ fn from_dense_spatial_rows_no_err_source_byte_identical() -> Result<()> {
             pb.patches.as_ref().expect("err-source patches tensor"),
             &format!("from_dense {side} patches tensor"),
         );
-        assert_eq!(pa.stride, pb.stride, "{side}: stride");
-        assert_eq!(pa.padding, pb.padding, "{side}: padding");
+        assert_eq!(pa.geometry, pb.geometry, "{side}: geometry");
         assert_eq!(pa.identity, pb.identity, "{side}: identity flag");
         assert_eq!(pa.output_shape, pb.output_shape, "{side}: output_shape");
         assert_eq!(pa.input_shape, pb.input_shape, "{side}: input_shape");
@@ -1835,8 +2044,7 @@ fn make_pd_7d(
     PatchesData {
         coeff_err: err,
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape,
         input_shape,
@@ -2222,8 +2430,7 @@ fn test_to_dense_mixed_layout_pair_err_dispatch() -> Result<()> {
         lower_a: PatchesData {
             coeff_err: None,
             patches: Some(lower6),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -2276,11 +2483,9 @@ fn test_to_dense_mixed_layout_pair_err_dispatch() -> Result<()> {
     Ok(())
 }
 
-/// T6 (spec §3.4/I6): a carried `Some` err whose length != row_count is a hard
-/// `Err` on the 7D arm (whose `patches_err_matrix_rows` indexes `e[r]` directly);
-/// the 6D arm KEEPS its silent `.get(i).unwrap_or(0.0)` read for byte-identity
-/// (spec I6: "the 6D arms keep their silent reads ... hardening them is a
-/// separate follow-up"), matching every producer site's `if explicit_rows` guard.
+/// A row-wide certificate has exactly one entry per logical row. Both 6D and
+/// 7D materializers reject a malformed length before their infallible scatter
+/// kernels, so missing rows can never be reinterpreted as exact-zero error.
 #[test]
 fn test_to_dense_err_row_length_mismatch_is_error() {
     let mut rng = Rng(0x1e46_7bad_1346_2006);
@@ -2289,14 +2494,12 @@ fn test_to_dense_err_row_length_mismatch_is_error() {
     let (out_h, out_w) = unfold_out_dims(in_h, in_w, kh, kw, stride, padding);
     let out_dim = out_c * out_h * out_w;
 
-    // 6D pair, lower err too long: silent read (byte-identity), NOT a hard error
-    // (spec I6). The extra entry is simply ignored by `.get(i).unwrap_or(0.0)`.
+    // 6D pair, lower err too long.
     let p6 = random_arr(&mut rng, &[out_c, out_h, out_w, in_c, kh, kw]);
     let make_pd6 = |err: Option<Array1<f32>>| PatchesData {
         coeff_err: err,
         patches: Some(p6.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -2311,8 +2514,18 @@ fn test_to_dense_err_row_length_mismatch_is_error() {
     };
     let res6 = plb6.to_dense();
     assert!(
-        res6.is_ok(),
-        "6D wrong-length Some err keeps its silent read (spec I6, byte-identity), got {res6:?}"
+        matches!(res6, Err(NyError::ShapeMismatch { .. })),
+        "6D wrong-length Some err must be a hard ShapeMismatch, got {res6:?}"
+    );
+    let input6 = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[in_c, in_h, in_w])),
+        ArrayD::ones(IxDyn(&[in_c, in_h, in_w])),
+    )
+    .expect("valid input box");
+    let sparse6 = plb6.concretize_sound_sparse(&input6, None);
+    assert!(
+        matches!(sparse6, Err(NyError::ShapeMismatch { .. })),
+        "sparse 6D concretize must reject the same malformed certificate, got {sparse6:?}"
     );
 
     // 7D pair, upper err too short.
@@ -2346,9 +2559,66 @@ fn test_to_dense_err_row_length_mismatch_is_error() {
     );
 }
 
+/// Invalid 6D row certificates poison every represented cell outward. This is
+/// the 6D counterpart of the 7D I5/R3 test below and specifically prevents
+/// `NaN.max(0)` from erasing an unknown error.
+#[test]
+fn test_to_dense_6d_nonfinite_err_degrades() -> Result<()> {
+    let shape = (1usize, 2usize, 2usize);
+    let rows = 4usize;
+    let patches = ArrayD::from_elem(IxDyn(&[1, 2, 2, 1, 1, 1]), 1.0f32);
+    let make_pd = |err: Array1<f32>| PatchesData {
+        coeff_err: Some(err),
+        patches: Some(patches.clone()),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
+        identity: false,
+        output_shape: shape,
+        input_shape: shape,
+        unstable_idx: None,
+    };
+    let errors = Array1::from_vec(vec![f32::NAN, f32::INFINITY, -1.0, 1e-4]);
+    let bounds = PatchesLinearBounds {
+        row_count: rows,
+        lower_a: make_pd(errors.clone()),
+        lower_b: Array1::zeros(rows),
+        upper_a: make_pd(errors),
+        upper_b: Array1::zeros(rows),
+    };
+    let dense = bounds.to_dense()?;
+    for err in [
+        dense.lower_a_err().expect("lower error matrix"),
+        dense.upper_a_err().expect("upper error matrix"),
+    ] {
+        for row in 0..3 {
+            assert_eq!(
+                err[[row, row]],
+                f32::INFINITY,
+                "invalid certificate row {row} must poison its represented cell"
+            );
+        }
+        assert!(err.iter().all(|value| !value.is_nan()));
+        assert!(err[[3, 3]].is_finite(), "valid row must remain finite");
+    }
+
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), -1.0f32),
+        ArrayD::from_elem(IxDyn(&[1, 2, 2]), 1.0f32),
+    )?;
+    let sparse = bounds.concretize_sound_sparse(&input, None)?;
+    let sparse_lower = sparse.lower().as_slice().expect("contiguous lower");
+    let sparse_upper = sparse.upper().as_slice().expect("contiguous upper");
+    for row in 0..3 {
+        assert_eq!(sparse_lower[row], f32::NEG_INFINITY);
+        assert_eq!(sparse_upper[row], f32::INFINITY);
+    }
+    assert!(sparse_lower[3].is_finite());
+    assert!(sparse_upper[3].is_finite());
+    Ok(())
+}
+
 /// T7 (spec §3.4, I5/R3): non-finite or negative carried err rows degrade to
-/// `+INF` at every count>0 cell (NEVER the 6D `NaN -> 0` false-proof hazard);
-/// finite rows are unaffected.
+/// `+INF` at every count>0 cell, matching the 6D policy; finite rows are
+/// unaffected.
 #[test]
 fn test_patches_err_matrix_rows_nonfinite_err_degrades() -> Result<()> {
     let mut rng = Rng(0x404f_1417_e444_2007);
@@ -2458,16 +2728,28 @@ fn test_sparse_to_dense_carried_coeff_err_is_error() {
     );
 }
 
-/// T8 (spec §3.4): identity patches must be exact — a carried coeff_err trips
-/// the identity_to_dense debug_assert (debug builds only).
-#[cfg(debug_assertions)]
+/// Identity patches must be exact. A carried certificate is a hard error in
+/// every build profile rather than a debug-only assertion and release drop.
 #[test]
-#[should_panic(expected = "identity patches must be exact")]
-fn test_identity_to_dense_coeff_err_debug_asserts() {
+fn test_identity_to_dense_carried_coeff_err_is_error() {
     let shape = (1, 2, 2);
     let mut plb = PatchesLinearBounds::identity(shape, shape);
     plb.lower_a.coeff_err = Some(Array1::zeros(4));
-    let _ = plb.to_dense();
+    let result = plb.to_dense();
+    assert!(
+        matches!(result, Err(NyError::InternalError(_))),
+        "identity coeff_err must hard-error, got {result:?}"
+    );
+    let input = BoundedTensor::new(
+        ArrayD::zeros(IxDyn(&[1, 2, 2])),
+        ArrayD::ones(IxDyn(&[1, 2, 2])),
+    )
+    .expect("valid input box");
+    let sparse_result = plb.concretize_sound_sparse(&input, None);
+    assert!(
+        matches!(sparse_result, Err(NyError::InternalError(_))),
+        "sparse identity coeff_err must hard-error, got {sparse_result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2607,8 +2889,7 @@ fn test_to_dense_rows_slices_match_to_dense_all_variants() -> Result<()> {
     let pd_6d = |patches: &ArrayD<f32>, err: Option<Array1<f32>>| PatchesData {
         coeff_err: err,
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -2688,8 +2969,7 @@ fn test_to_dense_rows_slices_match_to_dense_all_variants() -> Result<()> {
     let pd_sparse = |patches: &ArrayD<f32>| PatchesData {
         coeff_err: None,
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -2766,8 +3046,7 @@ fn test_concretize_sound_chunked_matches_unchunked() -> Result<()> {
     let pd = |patches: &ArrayD<f32>, err: Array1<f32>| PatchesData {
         coeff_err: Some(err),
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -2828,7 +3107,7 @@ fn test_concretize_sound_chunked_matches_unchunked() -> Result<()> {
 
     // An already-expired deadline is a clean DeadlineExceeded (checked before
     // the first block), matching the walk's per-node budget handling.
-    let expired = std::time::Instant::now();
+    let expired = Instant::now();
     let res = plb.concretize_sound_chunked(&input, 1, Some(expired));
     assert!(
         matches!(res, Err(NyError::DeadlineExceeded(_))),
@@ -2965,8 +3244,7 @@ fn sparse_concretize_matches_dense_bit_identical() -> Result<()> {
     let pd_6d = |patches: &ArrayD<f32>, err: Option<Array1<f32>>| PatchesData {
         coeff_err: err,
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -3045,8 +3323,7 @@ fn sparse_concretize_matches_dense_bit_identical() -> Result<()> {
     let pd_sparse = |patches: &ArrayD<f32>| PatchesData {
         coeff_err: None,
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -3103,8 +3380,7 @@ fn sparse_concretize_encloses_exact_eval() -> Result<()> {
     let pd_6d = |patches: &ArrayD<f32>| PatchesData {
         coeff_err: None,
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -3232,8 +3508,7 @@ fn sparse_concretize_rejects_explicit_rows_layouts() -> Result<()> {
     let pd_sparse = |patches: &ArrayD<f32>| PatchesData {
         coeff_err: None,
         patches: Some(patches.clone()),
-        stride,
-        padding,
+        geometry: PatchGeometry::affine(stride, padding),
         identity: false,
         output_shape: (out_c, out_h, out_w),
         input_shape: (in_c, in_h, in_w),
@@ -3275,8 +3550,7 @@ fn sparse_concretize_honors_expired_deadline() -> Result<()> {
         lower_a: PatchesData {
             coeff_err: None,
             patches: Some(random_arr(&mut rng, &[out_c, out_h, out_w, in_c, kh, kw])),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -3286,8 +3560,7 @@ fn sparse_concretize_honors_expired_deadline() -> Result<()> {
         upper_a: PatchesData {
             coeff_err: None,
             patches: Some(random_arr(&mut rng, &[out_c, out_h, out_w, in_c, kh, kw])),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape: (out_c, out_h, out_w),
             input_shape: (in_c, in_h, in_w),
@@ -3296,7 +3569,7 @@ fn sparse_concretize_honors_expired_deadline() -> Result<()> {
         upper_b: bias(&mut rng, out_dim),
     };
     let input = sparse_input_box(&mut rng, in_c, in_h, in_w, |_| false);
-    let expired = std::time::Instant::now();
+    let expired = Instant::now();
     assert!(
         matches!(
             plb.concretize_sound_sparse(&input, Some(expired)),

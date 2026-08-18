@@ -169,8 +169,8 @@ fn validate_output_bounds(bounds: &[Bound]) -> crate::Result<()> {
 /// Validate output constraints: each must be structurally well-formed.
 ///
 /// An empty constraint list is valid (the legacy / default case). Each present
-/// constraint is checked via [`OutputConstraint::validate`] (cheap shape checks
-/// only — e.g. `Linear.coeffs` non-empty).
+/// constraint is checked via [`OutputConstraint::validate`] (for example,
+/// `Linear.coeffs` must be non-empty and finite).
 fn validate_output_constraints(constraints: &[OutputConstraint]) -> crate::Result<()> {
     for (i, c) in constraints.iter().enumerate() {
         c.validate()
@@ -261,8 +261,9 @@ impl VerificationSpec {
     ///
     /// # Errors
     /// - Everything [`from_parts`](Self::from_parts) can error on, plus
-    /// - `NyError::InvalidSpec` if any `output_constraint` is structurally invalid
-    ///   (e.g. a `Linear` constraint with empty `coeffs`).
+    /// - `NyError::InvalidSpec` if any `output_constraint` is structurally or
+    ///   numerically invalid (e.g. a `Linear` constraint with empty or non-finite
+    ///   `coeffs`).
     pub fn from_parts_with_constraints(
         input_bounds: Vec<Bound>,
         output_bounds: Vec<Bound>,
@@ -389,12 +390,13 @@ impl VerificationSpec {
     /// Set the additional output constraints (P7).
     ///
     /// Each constraint is validated via [`OutputConstraint::validate`] (cheap
-    /// shape checks). This is additive: a spec without output constraints keeps
-    /// the legacy `output_bounds`-only behavior.
+    /// structural and numeric checks). This is additive: a spec without output
+    /// constraints keeps the legacy `output_bounds`-only behavior.
     ///
     /// # Errors
-    /// * `Err(NyError::InvalidSpec)` if any constraint is structurally invalid
-    ///   (e.g. a `Linear` constraint with empty `coeffs`).
+    /// * `Err(NyError::InvalidSpec)` if any constraint is structurally or
+    ///   numerically invalid (e.g. a `Linear` constraint with empty or non-finite
+    ///   `coeffs`).
     ///
     /// # Example
     /// ```

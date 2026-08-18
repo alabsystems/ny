@@ -76,6 +76,10 @@ pub mod bound_export;
 pub mod cost;
 /// Model comparison and layer-by-layer diff for identifying where two models' outputs diverge.
 pub mod diff;
+/// Graph-fidelity gate: bit-diffs post-load weights against the authored ONNX
+/// initializers so a certificate can state whether it is about the benchmark
+/// network or a load-time rewrite. Diagnostic only; changes no verdict.
+pub mod fidelity;
 /// Joint ONNX + VNN-LIB optimization passes (e.g., peeling off final layers).
 pub mod optimization;
 /// Bound width profiling: analyzes how bound widths propagate through a network.
@@ -113,7 +117,6 @@ pub mod analysis_error;
 mod decoder;
 /// Bridge conversions from analysis error types to `NyError`.
 mod error_bridge;
-mod fallback_logging;
 mod io;
 mod loader;
 mod model;
@@ -132,13 +135,19 @@ pub use cost::{
     estimate_model_cost, estimate_model_timing, CostResult, FamilyTimingCalibration, LayerCost,
     LayerTimingEstimate, TimingEstimate, TimingProfile,
 };
-/// Decoder model loading: auto-detect and parse transformer decoder blocks.
-pub use decoder::{load_decoder, DecoderBlockInfo, DecoderModel, DecoderStructure};
+/// Decoder model loading and structural analysis.
+///
+/// Decoder verification compatibility methods currently fail closed without
+/// producing bounds.
+pub use decoder::{
+    load_decoder, DecoderBlockInfo, DecoderModel, DecoderStructure, DecoderVerificationDetails,
+};
 /// ONNX model loaders with optional custom operator registry.
 pub use loader::{
     load_onnx, load_onnx_bytes, load_onnx_bytes_with_config, load_onnx_with_config,
-    serve_shape_infer_request, CustomOpHandler, CustomOpRegistry, OnnxLoadConfig,
-    OnnxOptimizationFlag, ShapeInferBackend, ShapeInferencePolicy, SHAPE_INFER_SUBCOMMAND,
+    read_onnx_bytes_maybe_gzip, serve_shape_infer_request, BatchNormFoldingPolicy, CustomOpHandler,
+    CustomOpRegistry, OnnxLoadConfig, OnnxOptimizationFlag, ShapeInferBackend,
+    ShapeInferencePolicy, SHAPE_INFER_SUBCOMMAND,
 };
 /// ONNX model representation: layer specs, weight storage, and conversion options.
 pub use model::{
@@ -148,9 +157,12 @@ pub use model::{
 };
 /// Network optimization passes (e.g., peeling off final softmax layers).
 pub use optimization::{
-    peel_off_last_softmax_layer, peel_off_terminal_sigmoid_auto, PeelOffReport,
+    load_and_peel_terminal_softmax_single_group,
+    load_and_peel_terminal_softmax_single_group_with_original_graph, peel_off_last_softmax_layer,
+    peel_off_terminal_sigmoid_auto, strip_terminal_softmax, PeelOffReport,
+    STRIP_TERMINAL_SOFTMAX_ENV,
 };
-/// Whisper model loading: encoder structure detection and compositional verification support.
+/// Whisper model loading, encoder extraction, and block-compatibility APIs.
 pub use whisper::{
     generate_whisper_export_script, load_whisper, CompositionalVerificationDetails,
     GpuCompositionalDetails, MultiBlockConfig, MultiBlockDetails, WhisperBlockInfo,

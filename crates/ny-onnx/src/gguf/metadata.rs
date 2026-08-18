@@ -2,9 +2,11 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(test)]
 use gguf::GGUFMetadataValue;
 
 /// Format a metadata value for display.
+#[cfg(test)]
 pub(super) fn format_metadata_value(value: &GGUFMetadataValue) -> String {
     match value {
         GGUFMetadataValue::Uint8(v) => v.to_string(),

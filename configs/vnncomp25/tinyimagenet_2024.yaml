@@ -8,7 +8,10 @@
 #
 # Benchmark characteristics:
 # - Large image classification ResNets (DAG topology, residual skip connections)
-# - High-dimensional inputs (64x64x3)
+# - High-dimensional inputs: the shipped TinyImageNet_resnet_medium.onnx takes
+#   1x3x56x56 = 9408 elements (NOT the 64x64x3 the benchmark name suggests;
+#   corrected from the ONNX graph input, which the branching note below already
+#   quoted correctly as 9408)
 # - Benefits from aggressive batching
 # - ny: graph kFSB with child evaluation (#4300)
 # - Reference uses kfsb (alpha-beta-CROWN supports kfsb on DAG models natively)
@@ -20,8 +23,56 @@ general:
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 10
   pgd_restart_when_stuck: true
+
+# MARGIN-ROW TWIN-WALL LANE (#twinwall-provenance, measured 2026-08-03, GB10)
+#
+# THE PROVENANCE PROBLEM THIS FIXES. Every one of this category's 67 banked
+# `unsat` rows came from adee6117, whose body records the sweep it was gathered
+# with: `NY_ROOT_BLAS=1 NY_MARGIN_ROW_PARALLEL=1 reserve=82`. Both env vars are
+# compiled defaults now (7b004fba, 5ec405c4) and are no-ops — but the sweep was
+# the margin-row BATCH RUNNER (`sweep_targets`, `ny vnncomp-research margin-row
+# sweep`), which calls `run_margin_row_lane` DIRECTLY with the full 100 s and no
+# harness at all. Its own ledger diff says so:
+#     -...prop_idx_9419...,0,timeout,92
+#     +...prop_idx_9419...,0,unsat,53
+# i.e. the harness had already measured that row as a timeout and the bank
+# overwrote it with the bare lane's verdict. So the numbers in column 6 are PURE
+# LANE seconds, and the smallest of the 67 is 50 s.
+#
+# Through `ny vnncomp` the lane gets `margin_row.reserve_secs` and nothing else,
+# and that slice only STARTS once the internal verifier gives up. The shipped
+# default is 45 s. 45 < 50, so not one of the 67 rows can fit at ANY load, on
+# ANY binary — which is exactly what the 2026-08-02 honest table found (67 of 67
+# lost, zero verdict flips). Confirmed directly: the bank's own binary
+# (adee6117, rebuilt here) with the bank's own env at the official 100 s budget
+# still returns `timeout` on prop_idx_5478. There is no regression to bisect.
+#
+# THE FIX, MEASURED. Two keys, both sound, both preset-scoped:
+#   * concurrent: true  — the lane runs from instance start alongside the
+#     verifier instead of on its leftovers, which is the only shipped way to
+#     hand it the budget its bank measured. Fail-closed: it returns `unsat` or
+#     nothing, and its verdict is consumed only if the verifier came back
+#     undecided, so it cannot cost a `sat`.
+#   * root_f32: true — the 9409-wide root tableau's forward conv is
+#     memory-bandwidth-bound and is ~99% of the lane's wall time (measured:
+#     lane 128.8 s, of which the BaB tree is 0.5 s / 2 expansions). The sound
+#     f32 path (50c044f5) halves the streamed width and charges every f32
+#     rounding into a certified additive concretize slack — pure loosening, so
+#     it can lose a proof but never invent one.
+#
+# A/B on prop_idx_5478 at the official 100 s budget through `ny vnncomp`:
+#     concurrent, f64 root   -> timeout (load 6.8)
+#     concurrent, f32 root   -> UNSAT, lane 58.1 s, wall 90.4 s (load 14.7)
+# `reserve_secs: 0` is required with `concurrent`: keeping a reserve would tax
+# the verifier twice (it loses the slice AND contends), the combination
+# 31949bcc refused for want of evidence.
+margin_row:
+  reserve_secs: 0
+  concurrent: true
+  root_f32: true
 
 bab:
   batch_size: 128
@@ -55,16 +106,60 @@ bab:
     # replaced the old RANDOM-SAMPLING disjunctive attack, which found nothing on these
     # conv ResNets and was therefore cut to 0.10. Gradient PGD is productive — it finds
     # the `sat` counterexamples (oracle-confirmed) in seconds, as α,β-CROWN does — so the
-    # budget is restored to 0.40. The unsat instances time out regardless (BaB cannot
-    # close them yet), so attack budget is "free": it can only convert timeouts into sound
-    # sat solves, never a wrong verdict.
+    # budget is restored to 0.40. The CIFAR allocation trio (root cap 40s, PGD 0.05,
+    # adaptive margin reserve) was tested here and regressed the official-budget sample
+    # from 5/10 to 2/10, losing three SAT rows. Keep TinyImageNet's measured baseline;
+    # see docs/TINYIMAGENET_ALLOCATION_PARITY_2026-07-30.md.
     #
-    # #reclaim-pgd (measured 2026-07-09 on the sibling cifar100 resnet): hold-heavy
-    # conv-ResNet, so the falsifier's slice is dead time on UNSAT instances. The
-    # disjunctive fast-path BaB re-bases on REMAINING time. Keep the 0.40 fraction
-    # (so sat instances keep their full falsification budget) and add a 30s ABSOLUTE
-    # ceiling (disjunctive_pgd_max_secs): reclaims 10s@100s / 90s@300s for BaB and
-    # fixes the large-budget hang, with zero sat-regression risk.
+    # The 30s absolute ceiling still reclaims excess attack time at longer budgets while
+    # leaving the full 0.40 slice available on the official 100s rows.
     disjunctive_pgd_fraction: 0.40
     disjunctive_pgd_max_secs: 30
+    # #graph-mip-admission-refund, mirrored from cifar100_2024.yaml (which
+    # measured the A/B on the sibling ResNet). All 200 tinyimagenet rows load
+    # ONE model, TinyImageNet_resnet_medium.onnx, whose op multiset is IDENTICAL
+    # to the already-refunded CIFAR100_resnet_medium — {Conv:19,
+    # BatchNormalization:19, Relu:10, Add:8, Flatten:1, Gemm:2} (verified by
+    # onnx op-type census on both files) — at 3x the spatial extent (3x56x56 =
+    # 9408 input elements vs 3x32x32 = 3072; 3.06x, NOT the 4x a 64x64 reading
+    # of "tiny-imagenet" suggests).
+    #
+    # Every op in that set is INSIDE the Graph-MIP encoder's layer set
+    # (dispatch.rs `graph_mip_layer_set_supported`: Linear|Conv2d|Flatten|
+    # Reshape|BatchNorm|Add|ReLU), so the static #deadlane disarm
+    # (`with_static_mip_ineligibility`) does NOT fire here the way it does on
+    # vit_2023/yolo_2023 — the reservation stays ARMED and the slice is carved
+    # out of the scored budget on every row. What declines instead is the
+    # MEMORY cap: replaying `graph_mip_leaf::estimate_encode_nnz`'s shape
+    # formula over the ONNX graphs gives ~281M nnz for TinyImageNet_resnet_medium
+    # vs ~91M for CIFAR100_resnet_medium (the same 3.07x), i.e. ~56x the shipped
+    # 5M `NY_GRAPH_MIP_MAX_NNZ` admission cap that already rejects cifar100. The
+    # nnz gate is the binding one (cifar100's ~494 binaries already cleared the
+    # 1024-binary ladder). The estimate is NOT purely shape-derived — it also
+    # counts UNSTABLE ReLUs, which is bounds-dependent — but that term is
+    # strictly ADDITIVE, and the shape-only floor alone is ~281M. So no bound,
+    # budget, or verdict can bring the encode under 5M. The whole-net escalation
+    # is therefore unreachable on 200/200 rows.
+    #
+    # Cost of leaving it armed (arithmetic from verify/phase_budget.rs
+    # `bab_deadline`/`mip_reserved_slice`, default policy 0.25/[5,30]):
+    #   - shipped 100s row -> 95s internal tier (`internal_timeout_secs`):
+    #     BaB ends at 95*0.9 - clamp(23,5,30) = 62.5s instead of 85.5s, and the
+    #     ~32s grant DOES clear the 20s `NY_GRAPH_MIP_MIN_SLICE_S` gate, so it
+    #     additionally pays up to an 8s post-BaB bounds recompute before the nnz
+    #     line prints "NOT eligible".
+    #   - 50s tier: BaB ends at 50*0.9 - 12 = 33s and the 17s grant is below the
+    #     20s min-slice gate, so the reserved time is pure dead wall.
+    # Zeroing both keys makes `requests_mip_reservation()` false, which (a)
+    # returns the slice to BaB inside the same scored budget, (b) declines the
+    # whole-net AUTO escalation up front (graph_mip_escalate.rs
+    # `graph_mip_policy_admitted`), and (c) suppresses the root-bounds stash
+    # clone (graph_mip_leaf.rs `graph_mip_stash_enabled`). Explicit
+    # `--complete-verifier mip` remains an override and the independent per-leaf
+    # MIP oracle is untouched. Sound by construction: this only moves the BaB
+    # deadline LATER inside the unchanged `overall_deadline`, and removes a code
+    # path that could only ever return "not eligible" — no bound is loosened and
+    # no verdict can change.
+    mip_min_fraction: 0.0
+    mip_min_secs: 0
     post_bab_pgd_fraction: 0.10

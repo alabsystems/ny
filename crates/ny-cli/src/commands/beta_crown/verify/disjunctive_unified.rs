@@ -15,13 +15,15 @@ use anyhow::Result;
 use ny_core::GemmEngine;
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_propagate::{
-    BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier, GraphNetwork,
+    BabVerificationStatus, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier, BranchingHeuristic,
+    GraphNetwork,
 };
 use ny_tensor::BoundedTensor;
-use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use std::time::Instant;
+use tracing::{debug, info, warn};
 
 use super::super::constraint_plan::build_grouped_disjunctive_objectives;
+use super::super::supports_independent_singleton_domain_list_spec;
 use super::disjunctive_pgd::{beta_crown_pgd_config, try_disjunctive_sampling_attack_with_config};
 use super::phase_budget::PhaseBudgetLedger;
 use super::BetaCrownModel;
@@ -94,6 +96,26 @@ impl RestartPlan {
             self.probe_domains
         }
     }
+}
+
+/// Root collection is restart-invariant only after the propagate crate's
+/// exact cache key and RNG-consumption checks accept it. Explicitly typed cGAN
+/// roots pay a bounded, root-only transaction, so automatically provide that
+/// exact call-local cache; ordinary categories retain the historical opt-in.
+fn disjunctive_restart_root_cache_enabled(config: &BetaCrownConfig, raw: Option<&str>) -> bool {
+    raw == Some("1")
+        || (config.use_alpha_crown
+            && (config.alpha_config.cgan_complete_crown_ibp_root
+                || config.alpha_config.cgan_sparse_target_complete_root))
+}
+
+/// One absolute authority boundary for the grouped BaB restart sweep.
+///
+/// The ledger's later overall deadline belongs to post-BaB consumers (MIP or
+/// the wrapper attack). Passing it into grouped BaB would erase that reserved
+/// tail and disagree with leaf oracles sealed to the BaB boundary.
+fn grouped_disjunctive_bab_deadline(ledger: &PhaseBudgetLedger) -> Option<Instant> {
+    ledger.bab_deadline()
 }
 
 /// Gate for grouped disjunctive contract (backend-agnostic).
@@ -175,6 +197,464 @@ pub(super) fn filter_unverified_clauses_for_unified(
     Some((filtered_vnnlib, unresolved_clauses))
 }
 
+const INDEPENDENT_SINGLETON_ROUTE: &str = "independent-singleton-domain-list-v1";
+
+#[derive(Debug, Clone, Copy)]
+struct DomainListBackendProvenance {
+    call_engine_source: &'static str,
+    call_engine_backend: &'static str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IndependentSingletonAttemptMetrics {
+    clauses_started: usize,
+    clauses_completed: usize,
+    domain_list_verified_clauses: usize,
+    domains_explored: usize,
+    domains_verified: usize,
+    cuts_generated: usize,
+    max_depth_reached: usize,
+    failed_original_clause_index: Option<usize>,
+}
+
+#[derive(Debug)]
+struct IndependentSingletonPlanFailure {
+    error: anyhow::Error,
+    metrics: IndependentSingletonAttemptMetrics,
+}
+
+enum IndependentSingletonDispatchOutcome {
+    Declined,
+    Handled(Box<BetaCrownResult>),
+    Fallback {
+        failure: Box<IndependentSingletonPlanFailure>,
+        provenance: DomainListBackendProvenance,
+    },
+}
+
+fn specs_match_exactly(left: &VnnLibSpec, right: &VnnLibSpec) -> bool {
+    left.num_inputs == right.num_inputs
+        && left.num_outputs == right.num_outputs
+        && left.input_bounds == right.input_bounds
+        && left.output_constraints == right.output_constraints
+        && left.output_constraint_clauses == right.output_constraint_clauses
+        && left.is_disjunction == right.is_disjunction
+        && left.version == right.version
+        && left.per_clause_input_bounds == right.per_clause_input_bounds
+        && left.declared_input_bounds == right.declared_input_bounds
+        && left.dual_network == right.dual_network
+}
+
+/// Validate that the spec handed to the singleton planner is the exact
+/// complement of the original precheck bitmap, not merely the same cardinality.
+fn exact_unverified_bitmap_complement(
+    original: &VnnLibSpec,
+    unified: &VnnLibSpec,
+    pre_verified: &[bool],
+) -> Option<Vec<usize>> {
+    if pre_verified.len() != original.output_constraint_clauses.len() {
+        return None;
+    }
+    let unresolved_indices: Vec<usize> = pre_verified
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &verified)| (!verified).then_some(index))
+        .collect();
+    if unresolved_indices.is_empty() {
+        return None;
+    }
+
+    let unresolved_clauses: Vec<Vec<OutputConstraint>> = unresolved_indices
+        .iter()
+        .map(|&index| original.output_constraint_clauses[index].clone())
+        .collect();
+    let mut expected = original.clone();
+    expected.output_constraints = unresolved_clauses.iter().flatten().cloned().collect();
+    expected.output_constraint_clauses = unresolved_clauses;
+    expected.per_clause_input_bounds = if original.per_clause_input_bounds.is_empty() {
+        Vec::new()
+    } else {
+        unresolved_indices
+            .iter()
+            .map(|&index| original.per_clause_input_bounds[index].clone())
+            .collect()
+    };
+
+    specs_match_exactly(&expected, unified).then_some(unresolved_indices)
+}
+
+/// Run one DomainList search per unresolved singleton clause under one
+/// immutable absolute BaB deadline, then conservatively aggregate the proof
+/// states.
+///
+/// This function owns no verifier state, so tests can inject deterministic
+/// outcomes and assert that each launch receives the exact same `Instant`.
+#[allow(clippy::too_many_arguments)]
+fn run_independent_singleton_plan(
+    objectives: &[Vec<f32>],
+    thresholds: &[f32],
+    original_clause_indices: &[usize],
+    preverified_count: usize,
+    original_clause_count: usize,
+    shared_bab_deadline: Option<Instant>,
+    overall_start: Instant,
+    mut run_clause: impl FnMut(usize, &[f32], f32, Option<Instant>) -> Result<BetaCrownResult>,
+) -> std::result::Result<BetaCrownResult, IndependentSingletonPlanFailure> {
+    let mut attempt = IndependentSingletonAttemptMetrics::default();
+    if objectives.len() != thresholds.len()
+        || objectives.len() != original_clause_indices.len()
+        || preverified_count > original_clause_count
+        || preverified_count.saturating_add(objectives.len()) != original_clause_count
+        || original_clause_indices
+            .iter()
+            .any(|&index| index >= original_clause_count)
+        || original_clause_indices
+            .windows(2)
+            .any(|indices| indices[0] >= indices[1])
+    {
+        return Err(IndependentSingletonPlanFailure {
+            error: anyhow::anyhow!("independent singleton DomainList plan invariant failed"),
+            metrics: attempt,
+        });
+    }
+
+    let mut verified_count = preverified_count;
+    let mut saw_potential = false;
+    let mut saw_timeout = false;
+    let mut unknown_reason: Option<String> = None;
+
+    for ((objective, &threshold), &clause_index) in objectives
+        .iter()
+        .zip(thresholds)
+        .zip(original_clause_indices)
+    {
+        if shared_bab_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            saw_timeout = true;
+            break;
+        }
+
+        attempt.clauses_started = attempt.clauses_started.saturating_add(1);
+        info!(
+            route = INDEPENDENT_SINGLETON_ROUTE,
+            clause_index,
+            clause_number = clause_index + 1,
+            deadline_remaining_ms = ?shared_bab_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_millis()),
+            "Independent singleton DomainList: clause start"
+        );
+        let clause_result =
+            match run_clause(clause_index, objective, threshold, shared_bab_deadline) {
+                Ok(result) => result,
+                Err(error) => {
+                    attempt.failed_original_clause_index = Some(clause_index);
+                    return Err(IndependentSingletonPlanFailure {
+                        error,
+                        metrics: attempt,
+                    });
+                }
+            };
+        attempt.clauses_completed = attempt.clauses_completed.saturating_add(1);
+        info!(
+            route = INDEPENDENT_SINGLETON_ROUTE,
+            clause_index,
+            clause_number = clause_index + 1,
+            status = ?clause_result.result,
+            domains_explored = clause_result.domains_explored,
+            domains_verified = clause_result.domains_verified,
+            "Independent singleton DomainList: clause complete"
+        );
+
+        attempt.domains_explored = attempt
+            .domains_explored
+            .saturating_add(clause_result.domains_explored);
+        attempt.domains_verified = attempt
+            .domains_verified
+            .saturating_add(clause_result.domains_verified);
+        attempt.cuts_generated = attempt
+            .cuts_generated
+            .saturating_add(clause_result.cuts_generated);
+        attempt.max_depth_reached = attempt
+            .max_depth_reached
+            .max(clause_result.max_depth_reached);
+
+        match clause_result.result {
+            BabVerificationStatus::Verified => {
+                verified_count = verified_count.saturating_add(1);
+                attempt.domain_list_verified_clauses =
+                    attempt.domain_list_verified_clauses.saturating_add(1);
+            }
+            violated @ BabVerificationStatus::Violated { .. } => {
+                return Ok(BetaCrownResult {
+                    result: violated,
+                    domains_explored: attempt.domains_explored,
+                    time_elapsed: overall_start.elapsed(),
+                    max_depth_reached: attempt.max_depth_reached,
+                    output_bounds: None,
+                    cuts_generated: attempt.cuts_generated,
+                    domains_verified: attempt.domains_verified,
+                });
+            }
+            BabVerificationStatus::PotentialViolation { .. } => saw_potential = true,
+            BabVerificationStatus::Timeout => saw_timeout = true,
+            BabVerificationStatus::Unknown { reason } => {
+                unknown_reason
+                    .get_or_insert_with(|| format!("Clause {}: {}", clause_index + 1, reason));
+            }
+        }
+    }
+
+    // All-or-none proof authority: no partial set of singleton proofs may
+    // become an UNSAT result for the original disjunction.
+    let result = if verified_count == original_clause_count {
+        BabVerificationStatus::Verified
+    } else if saw_potential {
+        BabVerificationStatus::potential_violation()
+    } else if saw_timeout {
+        BabVerificationStatus::Timeout
+    } else {
+        BabVerificationStatus::Unknown {
+            reason: unknown_reason.unwrap_or_else(|| {
+                "Independent singleton DomainList did not account for every clause".to_string()
+            }),
+        }
+    };
+
+    Ok(BetaCrownResult {
+        result,
+        domains_explored: attempt.domains_explored,
+        time_elapsed: overall_start.elapsed(),
+        max_depth_reached: attempt.max_depth_reached,
+        output_bounds: None,
+        cuts_generated: attempt.cuts_generated,
+        domains_verified: attempt.domains_verified,
+    })
+}
+
+/// Injectible dispatch seam used by production and parser-to-objective tests.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_independent_singleton_domain_list(
+    model_is_graph: bool,
+    original_vnnlib: &VnnLibSpec,
+    unified_vnnlib: &VnnLibSpec,
+    pre_verified: &[bool],
+    config: &BetaCrownConfig,
+    use_relu_split: bool,
+    gpu_bab: bool,
+    shared_bab_deadline: Option<Instant>,
+    overall_start: Instant,
+    provenance: DomainListBackendProvenance,
+    run_clause: impl FnMut(usize, &[f32], f32, Option<Instant>) -> Result<BetaCrownResult>,
+) -> IndependentSingletonDispatchOutcome {
+    // Grouped objectives encode clause violation as
+    // `lower(spec · output) > threshold`. Refuse an unnormalized upper-bound
+    // verifier even if every structural route gate otherwise matches.
+    if !model_is_graph
+        || !gpu_bab
+        || use_relu_split
+        || config.verify_upper_bound
+        || !config.input_split_independent_singleton_disjunction
+        || !matches!(&config.branching_heuristic, BranchingHeuristic::InputSplit)
+        || !supports_independent_singleton_domain_list_spec(original_vnnlib)
+    {
+        return IndependentSingletonDispatchOutcome::Declined;
+    }
+
+    let Some(original_clause_indices) =
+        exact_unverified_bitmap_complement(original_vnnlib, unified_vnnlib, pre_verified)
+    else {
+        return IndependentSingletonDispatchOutcome::Declined;
+    };
+    let plan = match build_grouped_disjunctive_objectives(unified_vnnlib) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return IndependentSingletonDispatchOutcome::Fallback {
+                failure: Box::new(IndependentSingletonPlanFailure {
+                    error: error.into(),
+                    metrics: IndependentSingletonAttemptMetrics::default(),
+                }),
+                provenance,
+            };
+        }
+    };
+    if plan.clause_sizes.len() != original_clause_indices.len()
+        || plan.clause_sizes.iter().any(|&size| size != 1)
+        || plan.objectives.len() != original_clause_indices.len()
+        || plan.thresholds.len() != original_clause_indices.len()
+    {
+        return IndependentSingletonDispatchOutcome::Fallback {
+            failure: Box::new(IndependentSingletonPlanFailure {
+                error: anyhow::anyhow!(
+                    "independent singleton objective plan did not match bitmap complement"
+                ),
+                metrics: IndependentSingletonAttemptMetrics::default(),
+            }),
+            provenance,
+        };
+    }
+
+    info!(
+        route = INDEPENDENT_SINGLETON_ROUTE,
+        original_clauses = original_vnnlib.output_constraint_clauses.len(),
+        unresolved_clauses = original_clause_indices.len(),
+        shared_deadline = ?shared_bab_deadline,
+        call_engine_source = provenance.call_engine_source,
+        call_engine_backend = provenance.call_engine_backend,
+        "Independent singleton disjunction: DomainList scheduler engaged"
+    );
+
+    match run_independent_singleton_plan(
+        &plan.objectives,
+        &plan.thresholds,
+        &original_clause_indices,
+        pre_verified.iter().filter(|&&verified| verified).count(),
+        original_vnnlib.output_constraint_clauses.len(),
+        shared_bab_deadline,
+        overall_start,
+        run_clause,
+    ) {
+        Ok(result) => IndependentSingletonDispatchOutcome::Handled(Box::new(result)),
+        Err(failure) => IndependentSingletonDispatchOutcome::Fallback {
+            failure: Box::new(failure),
+            provenance,
+        },
+    }
+}
+
+/// Strict exception for the preset-enabled canonical two-singleton disjunction.
+///
+/// The two searches are sequential, so only one DomainList frontier is live at
+/// a time. They share the exact same ledger deadline; an engine error discards
+/// every partial result and returns `None` for the existing grouped CPU lane.
+#[allow(clippy::too_many_arguments)]
+fn try_independent_singleton_domain_list(
+    model_net: &BetaCrownModel,
+    input: &BoundedTensor,
+    original_vnnlib: &VnnLibSpec,
+    unified_vnnlib: &VnnLibSpec,
+    pre_verified: &[bool],
+    config: &BetaCrownConfig,
+    verifier: &BetaCrownVerifier,
+    use_relu_split: bool,
+    gpu_bab: bool,
+    gemm_engine: Option<&dyn GemmEngine>,
+    ledger: &PhaseBudgetLedger,
+    overall_start: Instant,
+) -> Result<Option<BetaCrownResult>> {
+    // Keep every non-opted-in category byte-for-byte on the existing grouped
+    // route: do not even clone a verifier or sample backend telemetry. The
+    // normalized-objective subtree is lower-bound-only; duplicate that
+    // soundness-critical ingress invariant here before touching runtime state.
+    if !gpu_bab
+        || use_relu_split
+        || config.verify_upper_bound
+        || !config.input_split_independent_singleton_disjunction
+        || !matches!(&config.branching_heuristic, BranchingHeuristic::InputSplit)
+        || !supports_independent_singleton_domain_list_spec(original_vnnlib)
+    {
+        return Ok(None);
+    }
+    let BetaCrownModel::Graph(graph) = model_net else {
+        return Ok(None);
+    };
+
+    // Obtain this once. Every singleton launch receives this identical
+    // absolute Instant; no child duration is sliced or re-anchored.
+    let shared_bab_deadline = ledger.bab_deadline();
+    let remaining_config = BetaCrownConfig {
+        timeout: ledger.remaining_for_engine(),
+        ..config.clone()
+    };
+    let domain_verifier = verifier.with_config_from(remaining_config);
+    let stored_engine = domain_verifier.engine_arc();
+    let (call_engine_source, effective_call_engine) = match (gemm_engine, stored_engine.as_deref())
+    {
+        (Some(engine), _) => ("argument", Some(engine)),
+        (None, Some(engine)) => ("verifier-stored", Some(engine)),
+        (None, None) => ("none", None),
+    };
+    let provenance = DomainListBackendProvenance {
+        call_engine_source,
+        call_engine_backend: effective_call_engine
+            .map(GemmEngine::backend_provenance)
+            .unwrap_or("none"),
+    };
+    let fast_f32_before = ny_propagate::fast_f32_gemm::telemetry_snapshot();
+
+    let outcome = dispatch_independent_singleton_domain_list(
+        true,
+        original_vnnlib,
+        unified_vnnlib,
+        pre_verified,
+        config,
+        use_relu_split,
+        gpu_bab,
+        shared_bab_deadline,
+        overall_start,
+        provenance,
+        |_, objective, threshold, deadline| {
+            Ok(domain_verifier.verify_graph_gpu_domain_list(
+                graph,
+                input,
+                objective,
+                threshold,
+                gemm_engine,
+                deadline,
+            )?)
+        },
+    );
+    let fast_f32_after = ny_propagate::fast_f32_gemm::telemetry_snapshot();
+    let fast_f32_calls_delta = fast_f32_after.calls.saturating_sub(fast_f32_before.calls);
+
+    match outcome {
+        IndependentSingletonDispatchOutcome::Declined => Ok(None),
+        IndependentSingletonDispatchOutcome::Handled(result) => {
+            info!(
+                route = INDEPENDENT_SINGLETON_ROUTE,
+                call_engine_source = provenance.call_engine_source,
+                call_engine_backend = provenance.call_engine_backend,
+                process_global_fast_f32_materialized_backend =
+                    fast_f32_after.backend.unwrap_or("not-materialized"),
+                process_global_fast_f32_calls_before = fast_f32_before.calls,
+                process_global_fast_f32_calls_after = fast_f32_after.calls,
+                process_global_fast_f32_calls_delta = fast_f32_calls_delta,
+                "Independent singleton DomainList: route complete"
+            );
+            Ok(Some(*result))
+        }
+        IndependentSingletonDispatchOutcome::Fallback {
+            failure,
+            provenance,
+        } => {
+            let metrics = failure.metrics;
+            warn!(
+                route = INDEPENDENT_SINGLETON_ROUTE,
+                error = %failure.error,
+                failed_original_clause_index = ?metrics.failed_original_clause_index,
+                failed_original_clause_number = ?metrics
+                    .failed_original_clause_index
+                    .map(|index| index + 1),
+                call_engine_source = provenance.call_engine_source,
+                call_engine_backend = provenance.call_engine_backend,
+                process_global_fast_f32_materialized_backend =
+                    fast_f32_after.backend.unwrap_or("not-materialized"),
+                process_global_fast_f32_calls_before = fast_f32_before.calls,
+                process_global_fast_f32_calls_after = fast_f32_after.calls,
+                process_global_fast_f32_calls_delta = fast_f32_calls_delta,
+                clauses_started = metrics.clauses_started,
+                clauses_completed = metrics.clauses_completed,
+                domain_list_verified_clauses = metrics.domain_list_verified_clauses,
+                domains_explored = metrics.domains_explored,
+                domains_verified = metrics.domains_verified,
+                cuts_generated = metrics.cuts_generated,
+                max_depth_reached = metrics.max_depth_reached,
+                partial_proof_authority_published = false,
+                "Independent singleton DomainList failed closed; falling back to grouped CPU lane"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Variant of the unified grouped lane that preserves the legacy clause-screening
 /// contract by pruning any clauses already discharged by the disjunctive
 /// precheck. This keeps lsnc-style grouped searches from spending spec-guided
@@ -213,6 +693,28 @@ pub(super) fn try_prechecked_unified_input_split_disjunctive_bab(
             }
             None => (vnnlib, clauses),
         };
+
+    // The bitmap is meaningful only for this exact parsed clause list. Keep
+    // the optimized route closed when a caller supplies a separately derived
+    // or reordered clause view; the generic grouped path remains available.
+    if clauses == vnnlib.output_constraint_clauses {
+        if let Some(result) = try_independent_singleton_domain_list(
+            model_net,
+            input,
+            vnnlib,
+            unified_vnnlib,
+            pre_verified,
+            config,
+            verifier,
+            use_relu_split,
+            gpu_bab,
+            gemm_engine,
+            ledger,
+            overall_start,
+        )? {
+            return Ok(Some(result));
+        }
+    }
 
     try_unified_input_split_disjunctive_bab(
         model_net,
@@ -269,7 +771,11 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
         return Ok(None);
     }
 
-    let remaining_timeout = ledger.remaining().unwrap_or(Duration::from_secs(u64::MAX));
+    let bab_deadline = grouped_disjunctive_bab_deadline(ledger);
+    let remaining_timeout = bab_deadline.map_or_else(
+        || ledger.remaining_for_engine(),
+        |deadline| deadline.saturating_duration_since(Instant::now()),
+    );
     if timeout > 0 && remaining_timeout.is_zero() {
         return Ok(Some(BetaCrownResult {
             result: BabVerificationStatus::Timeout,
@@ -283,11 +789,7 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
     }
 
     let remaining_config = BetaCrownConfig {
-        timeout: if timeout == 0 {
-            config.timeout
-        } else {
-            remaining_timeout
-        },
+        timeout: remaining_timeout,
         ..config.clone()
     };
 
@@ -318,14 +820,14 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
         debug!(
             clauses = plan.clause_sizes.len(),
             total_rows = plan.objectives.len(),
-            timeout_s = ledger.remaining_secs_clamped(),
+            timeout_s = remaining_timeout.as_secs_f64(),
             "Grouped disjunctive BaB: gpu_bab DomainList multi-clause not yet implemented, falling back to CPU input-split"
         );
     } else {
         debug!(
             clauses = plan.clause_sizes.len(),
             total_rows = plan.objectives.len(),
-            timeout_s = ledger.remaining_secs_clamped(),
+            timeout_s = remaining_timeout.as_secs_f64(),
             "Grouped disjunctive BaB: CPU BinaryHeap lane"
         );
     }
@@ -341,42 +843,43 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
     // a FIXED order and keeps the first success — reproducible run-to-run AND
     // recovers the UNSAT without betting on one seed.
     //
-    // The shared overall deadline is only a wall-clock backstop that keeps the
-    // whole sweep inside the scored budget; on a machine fast enough to finish the
-    // committing restart within budget the entire trajectory is deterministic. A
+    // The shared BaB deadline is the wall-clock backstop that keeps the sweep
+    // inside the ledger's proof slice and preserves the reserved post-BaB tail;
+    // on a machine fast enough to finish the committing restart within budget
+    // the entire trajectory is deterministic. A
     // Verified/Violated result returns immediately; otherwise the tightest
     // (most-verified) result is kept.
     let restart_plan = RestartPlan::from_env(remaining_config.max_domains);
-    let overall_deadline = ledger.overall_deadline();
-    // Dark, call-local reuse of the deterministic root/intermediate map across
-    // restart verifier clones. A fresh owner is created for THIS unified call
-    // only; `with_config_from` below shares its exact-keyed cache. The cache is
-    // bound to `overall_deadline`, so a hit saves collection time but cannot
-    // create a new grace period or extend the scored budget.
-    let cache_owner = (std::env::var("NY_DISJUNCTIVE_RESTART_ROOT_CACHE")
-        .ok()
-        .as_deref()
-        == Some("1"))
-    .then(|| {
-        eprintln!(
-            "[restart-root-cache] armed call-local cache rows={} clauses={} deadline={}",
-            plan.objectives.len(),
-            plan.clause_sizes.len(),
-            if overall_deadline.is_some() {
-                "shared-absolute"
-            } else {
-                "none"
-            }
-        );
-        verifier
-            .with_config_from(remaining_config.clone())
-            .with_fresh_disjunctive_restart_root_cache(
-                &plan.objectives,
-                &plan.thresholds,
-                &plan.clause_sizes,
-                overall_deadline,
-            )
-    });
+    // Call-local reuse of the deterministic root/intermediate map across
+    // restart verifier clones. Ordinary categories remain behind the exact
+    // environment opt-in; typed cGAN roots arm it automatically. The propagate
+    // layer still rejects SPSA/supplement RNG consumers and every key mismatch.
+    // A fresh owner is created for THIS unified call only and is bound to the
+    // original absolute BaB deadline, so a hit cannot create a new grace period
+    // or borrow from the reserved post-BaB tail.
+    let restart_cache_raw = std::env::var("NY_DISJUNCTIVE_RESTART_ROOT_CACHE").ok();
+    let cache_owner =
+        disjunctive_restart_root_cache_enabled(&remaining_config, restart_cache_raw.as_deref())
+            .then(|| {
+                eprintln!(
+                    "[restart-root-cache] armed call-local cache rows={} clauses={} deadline={}",
+                    plan.objectives.len(),
+                    plan.clause_sizes.len(),
+                    if bab_deadline.is_some() {
+                        "shared-absolute"
+                    } else {
+                        "none"
+                    }
+                );
+                verifier
+                    .with_config_from(remaining_config.clone())
+                    .with_fresh_disjunctive_restart_root_cache(
+                        &plan.objectives,
+                        &plan.thresholds,
+                        &plan.clause_sizes,
+                        bab_deadline,
+                    )
+            });
     let restart_parent = cache_owner.as_ref().unwrap_or(verifier);
     let committing_idx = restart_plan.num_restarts.saturating_sub(1);
     let mut best: Option<BetaCrownResult> = None;
@@ -386,7 +889,7 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
         // return Timeout. This skips solely UNAFFORDABLE seeds; the SET of
         // affordable seeds is stable on a fast-enough machine, so the winning
         // seed is reached every run (the loop stays deterministic).
-        if let Some(dl) = overall_deadline {
+        if let Some(dl) = bab_deadline {
             if Instant::now() >= dl {
                 debug!(
                     restart_idx,
@@ -413,7 +916,7 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
             &plan.thresholds,
             &plan.clause_sizes,
             gemm_engine,
-            overall_deadline,
+            bab_deadline,
         )?;
         drop(_seed_guard);
 
@@ -539,7 +1042,7 @@ pub(super) fn try_no_branchable_neuron_pgd_fallback(
     if !is_no_branchable {
         return None;
     }
-    let remaining = ledger.remaining().unwrap_or(Duration::from_secs(u64::MAX));
+    let remaining = ledger.remaining_for_engine();
     if remaining.as_secs() < 5 {
         return None;
     }
@@ -555,9 +1058,582 @@ pub(super) fn try_no_branchable_neuron_pgd_fallback(
         beta_crown_pgd_config(config, pgd_restarts, pgd_steps, ledger.overall_deadline()),
         gemm_engine,
         json,
+        // #attack-stall does not apply here: this is the POST-BaB fallback for a
+        // BaB that produced nothing, so there is no later phase to hand a
+        // reclaimed slice to. Cutting it could only lose a `sat`.
+        super::attack_stall::AttackStallPolicy::disabled(),
         None,
     ) {
         Ok(Some(sat)) => Some(sat),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod restart_root_cache_policy_tests {
+    use super::{
+        disjunctive_restart_root_cache_enabled, grouped_disjunctive_bab_deadline, PhaseBudgetLedger,
+    };
+    use ny_propagate::{BetaCrownConfig, PhaseBudgetConfig};
+
+    #[test]
+    fn typed_cgan_roots_arm_exact_restart_reuse_without_changing_ordinary_default() {
+        let ordinary = BetaCrownConfig::default();
+        assert!(!disjunctive_restart_root_cache_enabled(&ordinary, None));
+        assert!(disjunctive_restart_root_cache_enabled(&ordinary, Some("1")));
+
+        let mut complete = ordinary.clone();
+        complete.use_alpha_crown = true;
+        complete.alpha_config.cgan_complete_crown_ibp_root = true;
+        assert!(disjunctive_restart_root_cache_enabled(&complete, None));
+
+        let mut sparse = ordinary;
+        sparse.use_alpha_crown = true;
+        sparse.alpha_config.cgan_sparse_target_complete_root = true;
+        assert!(disjunctive_restart_root_cache_enabled(&sparse, Some("0")));
+    }
+
+    #[test]
+    fn grouped_restart_authority_is_the_ledger_bab_deadline_not_the_tail_deadline() {
+        let ledger = PhaseBudgetLedger::new(
+            100,
+            PhaseBudgetConfig {
+                post_bab_pgd_fraction: 0.25,
+                ..Default::default()
+            },
+        );
+        let selected = grouped_disjunctive_bab_deadline(&ledger).expect("bounded BaB deadline");
+
+        assert_eq!(selected, ledger.bab_deadline().unwrap());
+        assert!(
+            selected < ledger.overall_deadline().unwrap(),
+            "the grouped caller must preserve the ledger's reserved tail"
+        );
+    }
+}
+
+#[cfg(test)]
+mod independent_singleton_tests {
+    use super::*;
+    use ny_onnx::vnnlib::parse_vnnlib;
+    use std::time::Duration;
+
+    fn parsed_linearizenn_two_singletons() -> VnnLibSpec {
+        parse_vnnlib(
+            r#"
+            (declare-const X_0 Real)
+            (declare-const Y_0 Real)
+            (declare-const Y_1 Real)
+            (assert (>= X_0 0.0))
+            (assert (<= X_0 1.0))
+            (assert (or
+                (>= Y_0 -37.459446)
+                (>= Y_1 42.806675)))
+            "#,
+        )
+        .expect("canonical parsed two-singleton property")
+    }
+
+    fn opted_in_input_split_config() -> BetaCrownConfig {
+        super::super::config_for_normalized_objectives(&BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::InputSplit,
+            input_split_independent_singleton_disjunction: true,
+            // Exercise the actual subtree normalization seam.
+            verify_upper_bound: true,
+            ..Default::default()
+        })
+    }
+
+    fn clause_result(
+        status: BabVerificationStatus,
+        domains_explored: usize,
+        domains_verified: usize,
+        max_depth_reached: usize,
+        cuts_generated: usize,
+    ) -> BetaCrownResult {
+        BetaCrownResult {
+            result: status,
+            domains_explored,
+            time_elapsed: Duration::ZERO,
+            max_depth_reached,
+            output_bounds: None,
+            cuts_generated,
+            domains_verified,
+        }
+    }
+
+    fn run_statuses(statuses: Vec<BabVerificationStatus>) -> BetaCrownResult {
+        let objectives = vec![vec![1.0], vec![-1.0]];
+        let thresholds = vec![0.0, 0.0];
+        let mut statuses = statuses.into_iter();
+        run_independent_singleton_plan(
+            &objectives,
+            &thresholds,
+            &[0, 1],
+            0,
+            2,
+            Some(Instant::now() + Duration::from_mins(1)),
+            Instant::now(),
+            |_, _, _, _| {
+                Ok(clause_result(
+                    statuses.next().expect("one status per singleton"),
+                    1,
+                    1,
+                    1,
+                    0,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sequential_launches_receive_exact_same_deadline_and_saturate_metrics() {
+        let objectives = vec![vec![1.0, 0.0], vec![0.0, -1.0]];
+        let thresholds = vec![37.459_446, -42.806_675];
+        let shared_deadline = Instant::now() + Duration::from_mins(1);
+        let mut deadlines = Vec::new();
+        let mut call = 0usize;
+
+        let result = run_independent_singleton_plan(
+            &objectives,
+            &thresholds,
+            &[0, 1],
+            0,
+            2,
+            Some(shared_deadline),
+            Instant::now(),
+            |_, _, _, deadline| {
+                deadlines.push(deadline);
+                call += 1;
+                Ok(if call == 1 {
+                    clause_result(
+                        BabVerificationStatus::Verified,
+                        usize::MAX - 1,
+                        usize::MAX - 2,
+                        3,
+                        usize::MAX - 3,
+                    )
+                } else {
+                    clause_result(BabVerificationStatus::Verified, 10, 11, 7, 12)
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            deadlines,
+            vec![Some(shared_deadline), Some(shared_deadline)]
+        );
+        assert_eq!(result.result, BabVerificationStatus::Verified);
+        assert_eq!(result.domains_explored, usize::MAX);
+        assert_eq!(result.domains_verified, usize::MAX);
+        assert_eq!(result.cuts_generated, usize::MAX);
+        assert_eq!(result.max_depth_reached, 7);
+        assert!(result.output_bounds.is_none());
+    }
+
+    #[test]
+    fn preverified_clause_plus_one_domain_list_proof_is_all_verified() {
+        let mut calls = Vec::new();
+        let result = run_independent_singleton_plan(
+            &[vec![-1.0, 0.0]],
+            &[1.0],
+            &[1],
+            1,
+            2,
+            None,
+            Instant::now(),
+            |clause_index, _, _, deadline| {
+                calls.push((clause_index, deadline));
+                Ok(clause_result(BabVerificationStatus::Verified, 2, 2, 1, 0))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, vec![(1, None)]);
+        assert_eq!(result.result, BabVerificationStatus::Verified);
+    }
+
+    #[test]
+    fn partial_proof_never_becomes_verified() {
+        let result = run_statuses(vec![
+            BabVerificationStatus::Verified,
+            BabVerificationStatus::Unknown {
+                reason: "domain cap".to_string(),
+            },
+        ]);
+        assert_eq!(
+            result.result,
+            BabVerificationStatus::Unknown {
+                reason: "Clause 2: domain cap".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn conservative_inconclusive_lattice_is_order_independent() {
+        let potential_then_unknown = run_statuses(vec![
+            BabVerificationStatus::potential_violation(),
+            BabVerificationStatus::Unknown {
+                reason: "inconclusive".to_string(),
+            },
+        ]);
+        let unknown_then_potential = run_statuses(vec![
+            BabVerificationStatus::Unknown {
+                reason: "inconclusive".to_string(),
+            },
+            BabVerificationStatus::potential_violation(),
+        ]);
+        assert_eq!(
+            potential_then_unknown.result,
+            BabVerificationStatus::potential_violation()
+        );
+        assert_eq!(
+            unknown_then_potential.result,
+            BabVerificationStatus::potential_violation()
+        );
+
+        let timeout_then_unknown = run_statuses(vec![
+            BabVerificationStatus::Timeout,
+            BabVerificationStatus::Unknown {
+                reason: "inconclusive".to_string(),
+            },
+        ]);
+        let unknown_then_timeout = run_statuses(vec![
+            BabVerificationStatus::Unknown {
+                reason: "inconclusive".to_string(),
+            },
+            BabVerificationStatus::Timeout,
+        ]);
+        assert_eq!(timeout_then_unknown.result, BabVerificationStatus::Timeout);
+        assert_eq!(unknown_then_timeout.result, BabVerificationStatus::Timeout);
+    }
+
+    #[test]
+    fn concrete_violation_is_preserved_and_stops_later_launches() {
+        let mut calls = 0usize;
+        let result = run_independent_singleton_plan(
+            &[vec![1.0], vec![-1.0]],
+            &[0.0, 0.0],
+            &[0, 1],
+            0,
+            2,
+            None,
+            Instant::now(),
+            |_, _, _, _| {
+                calls += 1;
+                Ok(clause_result(
+                    BabVerificationStatus::Violated {
+                        counterexample: vec![0.25],
+                        output: vec![1.5],
+                    },
+                    4,
+                    0,
+                    2,
+                    0,
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(
+            result.result,
+            BabVerificationStatus::Violated {
+                counterexample: vec![0.25],
+                output: vec![1.5],
+            }
+        );
+    }
+
+    #[test]
+    fn expired_shared_deadline_launches_nothing_and_times_out() {
+        let mut calls = 0usize;
+        let result = run_independent_singleton_plan(
+            &[vec![1.0], vec![-1.0]],
+            &[0.0, 0.0],
+            &[0, 1],
+            0,
+            2,
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("one second must be representable"),
+            ),
+            Instant::now(),
+            |_, _, _, _| {
+                calls += 1;
+                Ok(clause_result(BabVerificationStatus::Verified, 0, 0, 0, 0))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, 0);
+        assert_eq!(result.result, BabVerificationStatus::Timeout);
+    }
+
+    #[test]
+    fn clause_error_discards_partial_aggregation_for_fallback() {
+        let mut calls = 0usize;
+        let result = run_independent_singleton_plan(
+            &[vec![1.0], vec![-1.0]],
+            &[0.0, 0.0],
+            &[0, 1],
+            0,
+            2,
+            None,
+            Instant::now(),
+            |_, _, _, _| {
+                calls += 1;
+                if calls == 2 {
+                    anyhow::bail!("injected DomainList error");
+                }
+                Ok(clause_result(BabVerificationStatus::Verified, 1, 1, 1, 0))
+            },
+        );
+
+        let failure = result.expect_err("second clause error must fail the route");
+        assert_eq!(calls, 2);
+        assert_eq!(failure.metrics.clauses_started, 2);
+        assert_eq!(failure.metrics.clauses_completed, 1);
+        assert_eq!(failure.metrics.domain_list_verified_clauses, 1);
+        assert_eq!(failure.metrics.domains_explored, 1);
+        assert_eq!(failure.metrics.failed_original_clause_index, Some(1));
+    }
+
+    #[test]
+    fn parsed_dispatch_normalizes_objectives_and_reuses_exact_deadline() {
+        let spec = parsed_linearizenn_two_singletons();
+        let config = opted_in_input_split_config();
+        assert!(!config.verify_upper_bound);
+        let shared_deadline = Instant::now() + Duration::from_mins(1);
+        let mut calls = Vec::new();
+
+        let outcome = dispatch_independent_singleton_domain_list(
+            true,
+            &spec,
+            &spec,
+            &[false, false],
+            &config,
+            false,
+            true,
+            Some(shared_deadline),
+            Instant::now(),
+            DomainListBackendProvenance {
+                call_engine_source: "injected-test",
+                call_engine_backend: "deterministic-test-engine",
+            },
+            |clause_index, objective, threshold, deadline| {
+                calls.push((clause_index, objective.to_vec(), threshold, deadline));
+                Ok(clause_result(BabVerificationStatus::Verified, 1, 1, 1, 0))
+            },
+        );
+
+        let IndependentSingletonDispatchOutcome::Handled(result) = outcome else {
+            panic!("parsed opted-in spec must engage and complete");
+        };
+        assert_eq!(result.result, BabVerificationStatus::Verified);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, 0);
+        assert_eq!(calls[0].1, vec![-1.0, 0.0]);
+        // Decimal VNN-LIB thresholds enter as f64. The verifier must preserve
+        // the directed conversion used by the objective builder instead of
+        // comparing against a nearest-f32 literal that can be one ULP easier.
+        assert_eq!(
+            calls[0].2.to_bits(),
+            (-ny_core::f64_to_f32_down(-37.459_446_f64)).to_bits()
+        );
+        assert_eq!(calls[0].3, Some(shared_deadline));
+        assert_eq!(calls[1].0, 1);
+        assert_eq!(calls[1].1, vec![0.0, -1.0]);
+        assert_eq!(
+            calls[1].2.to_bits(),
+            (-ny_core::f64_to_f32_down(42.806_675_f64)).to_bits()
+        );
+        assert_eq!(calls[1].3, Some(shared_deadline));
+    }
+
+    #[test]
+    fn unnormalized_upper_bound_mode_declines_both_gates_without_launch() {
+        struct PanicIfSampledEngine;
+
+        impl GemmEngine for PanicIfSampledEngine {
+            fn backend_provenance(&self) -> &'static str {
+                panic!("early eligibility gate must not sample backend provenance")
+            }
+
+            fn gemm_f32(
+                &self,
+                _m: usize,
+                _k: usize,
+                _n: usize,
+                _a: &[f32],
+                _b: &[f32],
+            ) -> ny_core::Result<Vec<f32>> {
+                panic!("unnormalized singleton route must not launch an engine")
+            }
+        }
+
+        let spec = parsed_linearizenn_two_singletons();
+        let mut config = opted_in_input_split_config();
+        config.verify_upper_bound = true;
+
+        assert!(matches!(
+            dispatch_independent_singleton_domain_list(
+                true,
+                &spec,
+                &spec,
+                &[false, false],
+                &config,
+                false,
+                true,
+                None,
+                Instant::now(),
+                DomainListBackendProvenance {
+                    call_engine_source: "must-not-launch",
+                    call_engine_backend: "must-not-launch",
+                },
+                |_, _, _, _| panic!("dispatch gate must decline before launching a clause"),
+            ),
+            IndependentSingletonDispatchOutcome::Declined
+        ));
+
+        let input = BoundedTensor::new(
+            ndarray::arr1(&[0.0_f32]).into_dyn(),
+            ndarray::arr1(&[1.0_f32]).into_dyn(),
+        )
+        .expect("one-dimensional test input");
+        let model = BetaCrownModel::Graph(Box::new(GraphNetwork::new()));
+        let verifier = BetaCrownVerifier::new(config.clone());
+        let ledger = PhaseBudgetLedger::new(60, config.phase_budget.clone());
+        let engine = PanicIfSampledEngine;
+        let result = try_independent_singleton_domain_list(
+            &model,
+            &input,
+            &spec,
+            &spec,
+            &[false, false],
+            &config,
+            &verifier,
+            false,
+            true,
+            Some(&engine),
+            &ledger,
+            Instant::now(),
+        )
+        .expect("the early gate must decline cleanly");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parsed_dispatch_prunes_exact_preverified_bitmap_complement() {
+        let spec = parsed_linearizenn_two_singletons();
+        let pre_verified = [true, false];
+        let (filtered, _) = filter_unverified_clauses_for_unified(
+            &spec,
+            &spec.output_constraint_clauses,
+            &pre_verified,
+        )
+        .expect("one preverified clause must produce a filtered spec");
+        let shared_deadline = Instant::now() + Duration::from_mins(1);
+        let mut calls = Vec::new();
+
+        let outcome = dispatch_independent_singleton_domain_list(
+            true,
+            &spec,
+            &filtered,
+            &pre_verified,
+            &opted_in_input_split_config(),
+            false,
+            true,
+            Some(shared_deadline),
+            Instant::now(),
+            DomainListBackendProvenance {
+                call_engine_source: "injected-test",
+                call_engine_backend: "deterministic-test-engine",
+            },
+            |clause_index, objective, threshold, deadline| {
+                calls.push((clause_index, objective.to_vec(), threshold, deadline));
+                Ok(clause_result(BabVerificationStatus::Verified, 2, 2, 2, 0))
+            },
+        );
+
+        let IndependentSingletonDispatchOutcome::Handled(result) = outcome else {
+            panic!("exact bitmap complement must engage");
+        };
+        assert_eq!(result.result, BabVerificationStatus::Verified);
+        assert_eq!(
+            calls,
+            vec![(1, vec![0.0, -1.0], -42.806_675_f32, Some(shared_deadline))]
+        );
+
+        assert!(matches!(
+            dispatch_independent_singleton_domain_list(
+                true,
+                &spec,
+                &filtered,
+                &[false, true],
+                &opted_in_input_split_config(),
+                false,
+                true,
+                Some(shared_deadline),
+                Instant::now(),
+                DomainListBackendProvenance {
+                    call_engine_source: "injected-test",
+                    call_engine_backend: "deterministic-test-engine",
+                },
+                |_, _, _, _| panic!("mismatched bitmap must not launch"),
+            ),
+            IndependentSingletonDispatchOutcome::Declined
+        ));
+    }
+
+    #[test]
+    fn parsed_dispatch_second_clause_error_returns_fallback_with_attempt_telemetry() {
+        let spec = parsed_linearizenn_two_singletons();
+        let provenance = DomainListBackendProvenance {
+            call_engine_source: "injected-test",
+            call_engine_backend: "deterministic-test-engine",
+        };
+        let mut calls = 0usize;
+        let outcome = dispatch_independent_singleton_domain_list(
+            true,
+            &spec,
+            &spec,
+            &[false, false],
+            &opted_in_input_split_config(),
+            false,
+            true,
+            None,
+            Instant::now(),
+            provenance,
+            |_, _, _, _| {
+                calls += 1;
+                if calls == 2 {
+                    anyhow::bail!("injected second-clause engine error");
+                }
+                Ok(clause_result(BabVerificationStatus::Verified, 7, 5, 3, 2))
+            },
+        );
+
+        let IndependentSingletonDispatchOutcome::Fallback {
+            failure,
+            provenance: observed,
+        } = outcome
+        else {
+            panic!("a second-clause error must request grouped fallback");
+        };
+        assert_eq!(calls, 2);
+        assert_eq!(observed.call_engine_source, provenance.call_engine_source);
+        assert_eq!(observed.call_engine_backend, provenance.call_engine_backend);
+        assert_eq!(failure.metrics.clauses_started, 2);
+        assert_eq!(failure.metrics.clauses_completed, 1);
+        assert_eq!(failure.metrics.domain_list_verified_clauses, 1);
+        assert_eq!(failure.metrics.domains_explored, 7);
+        assert_eq!(failure.metrics.domains_verified, 5);
+        assert_eq!(failure.metrics.cuts_generated, 2);
+        assert_eq!(failure.metrics.max_depth_reached, 3);
+        assert_eq!(failure.metrics.failed_original_clause_index, Some(1));
     }
 }

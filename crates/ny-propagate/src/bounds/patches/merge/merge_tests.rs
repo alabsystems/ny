@@ -6,7 +6,7 @@ use ndarray::{Array1, ArrayD, Axis, IxDyn};
 
 use super::reconcile_padding;
 use crate::bounds::patches::types::{PatchesData, UnstableIdx};
-use crate::bounds::patches::PatchesLinearBounds;
+use crate::bounds::patches::{PatchGeometry, PatchesLinearBounds};
 
 fn make_simple_patches(
     output_shape: (usize, usize, usize),
@@ -30,8 +30,7 @@ fn make_simple_patches(
                 IxDyn(&[oc, oh, ow, ic, kh, kw]),
                 fill_lower,
             )),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape,
             input_shape,
@@ -44,8 +43,7 @@ fn make_simple_patches(
                 IxDyn(&[oc, oh, ow, ic, kh, kw]),
                 fill_upper,
             )),
-            stride,
-            padding,
+            geometry: PatchGeometry::affine(stride, padding),
             identity: false,
             output_shape,
             input_shape,
@@ -57,7 +55,7 @@ fn make_simple_patches(
 
 #[test]
 fn test_clone_with_zero_bias() {
-    let p = make_simple_patches((2, 3, 3), (2, 5, 5), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
+    let p = make_simple_patches((2, 3, 3), (2, 3, 3), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
     let zeroed = p.clone_with_zero_bias();
     assert_eq!(zeroed.row_count, p.row_count);
     assert!(zeroed.lower_b.iter().all(|&v| v == 0.0));
@@ -69,9 +67,9 @@ fn test_clone_with_zero_bias() {
 }
 
 #[test]
-fn test_negated_swapped_zero_bias() {
-    let p = make_simple_patches((1, 2, 2), (1, 4, 4), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.5);
-    let neg = p.negated_swapped_zero_bias();
+fn test_negated_zero_bias() {
+    let p = make_simple_patches((1, 2, 2), (1, 2, 2), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.5);
+    let neg = p.negated_zero_bias().unwrap();
     assert!(neg.lower_b.iter().all(|&v| v == 0.0));
     assert!(neg.upper_b.iter().all(|&v| v == 0.0));
     assert!(neg
@@ -80,20 +78,20 @@ fn test_negated_swapped_zero_bias() {
         .as_ref()
         .unwrap()
         .iter()
-        .all(|&v| (v - (-1.5)).abs() < 1e-7));
+        .all(|&v| (v - (-0.5)).abs() < 1e-7));
     assert!(neg
         .upper_a
         .patches
         .as_ref()
         .unwrap()
         .iter()
-        .all(|&v| (v - (-0.5)).abs() < 1e-7));
+        .all(|&v| (v - (-1.5)).abs() < 1e-7));
 }
 
 #[test]
-fn test_negated_swapped_with_identity() {
-    let p = PatchesLinearBounds::identity((2, 3, 3), (2, 5, 5));
-    let neg = p.negated_swapped_zero_bias();
+fn test_negated_with_identity() {
+    let p = PatchesLinearBounds::identity((2, 3, 3), (2, 3, 3));
+    let neg = p.negated_zero_bias().unwrap();
     assert!(!neg.lower_a.identity);
     assert!(!neg.upper_a.identity);
     assert!(neg.lower_a.patches.is_some());
@@ -104,7 +102,7 @@ fn test_negated_swapped_with_identity() {
 fn test_try_merge_compatible_patches() {
     let mut a = make_simple_patches(
         (2, 3, 3),
-        (2, 5, 5),
+        (2, 3, 3),
         (3, 3),
         (1, 1),
         (1, 1, 1, 1),
@@ -113,7 +111,7 @@ fn test_try_merge_compatible_patches() {
     );
     let b = make_simple_patches(
         (2, 3, 3),
-        (2, 5, 5),
+        (2, 3, 3),
         (3, 3),
         (1, 1),
         (1, 1, 1, 1),
@@ -130,23 +128,92 @@ fn test_try_merge_compatible_patches() {
 }
 
 #[test]
+fn test_try_merge_refuses_anchored_geometry_without_mutation() {
+    let mut a = make_simple_patches((1, 2, 2), (1, 3, 3), (2, 2), (1, 1), (0, 0, 0, 0), 0.5, 1.0);
+    let b = a.clone();
+    let anchored = PatchGeometry::anchored(vec![0, 1], vec![0, 1]).unwrap();
+    a.lower_a.geometry = anchored.clone();
+    a.upper_a.geometry = anchored.clone();
+    let before_lower = a.lower_a.patches.clone();
+    let before_upper = a.upper_a.patches.clone();
+
+    assert!(!a.try_merge_inplace(&b).unwrap());
+    assert_eq!(a.lower_a.geometry, anchored);
+    assert_eq!(a.upper_a.geometry, anchored);
+    assert_eq!(a.lower_a.patches, before_lower);
+    assert_eq!(a.upper_a.patches, before_upper);
+}
+
+#[test]
+fn test_try_merge_rejects_malformed_affine_padding_atomically() {
+    let mut receiver = make_simple_patches(
+        (1, 2, 2),
+        (1, 2, 2),
+        (1, 1),
+        (1, 1),
+        (0, 0, 0, 0),
+        0.25,
+        0.75,
+    );
+    let mut peer = receiver.clone();
+    peer.lower_a.geometry =
+        PatchGeometry::affine((1, 1), (usize::MAX, usize::MAX, usize::MAX, usize::MAX));
+    peer.upper_a.geometry = peer.lower_a.geometry.clone();
+
+    let before_lower = receiver.lower_a.clone();
+    let before_upper = receiver.upper_a.clone();
+    let before_lower_b = receiver.lower_b.clone();
+    let before_upper_b = receiver.upper_b.clone();
+
+    let error = receiver
+        .try_merge_inplace(&peer)
+        .expect_err("overflowing padding must be rejected during geometry validation");
+    assert!(
+        error.to_string().contains("padding overflows usize"),
+        "unexpected malformed-padding error: {error}"
+    );
+    assert_arrd_bits_eq(
+        receiver.lower_a.patches.as_ref().unwrap(),
+        before_lower.patches.as_ref().unwrap(),
+        "malformed-padding refusal lower coefficients",
+    );
+    assert_arrd_bits_eq(
+        receiver.upper_a.patches.as_ref().unwrap(),
+        before_upper.patches.as_ref().unwrap(),
+        "malformed-padding refusal upper coefficients",
+    );
+    assert_eq!(receiver.lower_a.geometry, before_lower.geometry);
+    assert_eq!(receiver.upper_a.geometry, before_upper.geometry);
+    assert_arr1_bits_eq(
+        &receiver.lower_b,
+        &before_lower_b,
+        "malformed-padding refusal lower bias",
+    );
+    assert_arr1_bits_eq(
+        &receiver.upper_b,
+        &before_upper_b,
+        "malformed-padding refusal upper bias",
+    );
+}
+
+#[test]
 fn test_try_merge_incompatible_row_count() {
-    let mut a = make_simple_patches((2, 3, 3), (2, 5, 5), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
-    let b = make_simple_patches((1, 3, 3), (2, 5, 5), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
+    let mut a = make_simple_patches((2, 3, 3), (2, 3, 3), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
+    let b = make_simple_patches((1, 3, 3), (2, 3, 3), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
     assert!(!a.try_merge_inplace(&b).unwrap());
 }
 
 #[test]
 fn test_try_merge_incompatible_stride() {
-    let mut a = make_simple_patches((2, 3, 3), (2, 5, 5), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
-    let b = make_simple_patches((2, 3, 3), (2, 5, 5), (3, 3), (2, 2), (1, 1, 1, 1), 0.5, 1.0);
+    let mut a = make_simple_patches((2, 1, 1), (2, 3, 3), (3, 3), (1, 1), (0, 0, 0, 0), 0.5, 1.0);
+    let b = make_simple_patches((2, 1, 1), (2, 3, 3), (3, 3), (2, 2), (0, 0, 0, 0), 0.5, 1.0);
     assert!(!a.try_merge_inplace(&b).unwrap());
 }
 
 #[test]
 fn test_try_merge_incomparable_padding() {
-    let mut a = make_simple_patches((2, 3, 3), (2, 5, 5), (3, 3), (1, 1), (2, 0, 1, 1), 0.5, 1.0);
-    let b = make_simple_patches((2, 3, 3), (2, 5, 5), (3, 3), (1, 1), (0, 2, 1, 1), 0.5, 1.0);
+    let mut a = make_simple_patches((2, 3, 3), (2, 3, 3), (3, 3), (1, 1), (2, 0, 1, 1), 0.5, 1.0);
+    let b = make_simple_patches((2, 3, 3), (2, 3, 3), (3, 3), (1, 1), (0, 2, 1, 1), 0.5, 1.0);
     assert!(!a.try_merge_inplace(&b).unwrap());
 }
 
@@ -158,15 +225,18 @@ fn test_try_merge_padding_dominance() {
     let mut a = make_simple_patches((1, 2, 2), (1, 4, 4), (5, 5), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
     let b = make_simple_patches((1, 2, 2), (1, 4, 4), (3, 3), (1, 1), (0, 0, 0, 0), 0.5, 1.0);
     assert!(a.try_merge_inplace(&b).unwrap());
-    assert_eq!(a.lower_a.padding, (1, 1, 1, 1));
+    assert_eq!(
+        a.lower_a.geometry,
+        PatchGeometry::affine((1, 1), (1, 1, 1, 1))
+    );
 }
 
 #[test]
 fn test_try_merge_identity_with_explicit() {
-    let mut a = PatchesLinearBounds::identity((2, 3, 3), (2, 5, 5));
+    let mut a = PatchesLinearBounds::identity((2, 3, 3), (2, 3, 3));
     let b = make_simple_patches(
         (2, 3, 3),
-        (2, 5, 5),
+        (2, 3, 3),
         (1, 1),
         (1, 1),
         (0, 0, 0, 0),
@@ -179,14 +249,48 @@ fn test_try_merge_identity_with_explicit() {
 
 #[test]
 fn test_try_merge_mixed_sparse_dense_falls_back() {
-    let mut a = make_simple_patches((2, 3, 3), (2, 5, 5), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
+    let mut a = make_simple_patches((2, 3, 3), (2, 3, 3), (3, 3), (1, 1), (1, 1, 1, 1), 0.5, 1.0);
     let idx = UnstableIdx {
         channels: vec![0, 1],
         heights: vec![0, 1],
         widths: vec![0, 0],
     };
-    let b = PatchesLinearBounds::sparse_identity((2, 3, 3), (2, 5, 5), idx);
+    let b = PatchesLinearBounds::sparse_identity((2, 3, 3), (2, 3, 3), idx);
     assert!(!a.try_merge_inplace(&b).unwrap());
+}
+
+#[test]
+fn test_try_merge_two_sparse_carriers_refuses_before_rounded_add() {
+    let make = || {
+        let idx = UnstableIdx {
+            channels: vec![0, 0],
+            heights: vec![0, 0],
+            widths: vec![0, 1],
+        };
+        let mut bounds = PatchesLinearBounds::sparse_identity((1, 1, 2), (1, 1, 2), idx);
+        bounds.lower_a = bounds.lower_a.materialize_identity();
+        bounds.upper_a = bounds.upper_a.materialize_identity();
+        bounds
+    };
+    let mut receiver = make();
+    let peer = make();
+    let lower_before = receiver.lower_a.patches.clone().unwrap();
+    let upper_before = receiver.upper_a.patches.clone().unwrap();
+
+    assert!(
+        !receiver.try_merge_inplace(&peer).unwrap(),
+        "sparse merge must wait for a 4D/5D intrinsic-error receipt"
+    );
+    assert_arrd_bits_eq(
+        receiver.lower_a.patches.as_ref().unwrap(),
+        &lower_before,
+        "sparse refusal lower atomicity",
+    );
+    assert_arrd_bits_eq(
+        receiver.upper_a.patches.as_ref().unwrap(),
+        &upper_before,
+        "sparse refusal upper atomicity",
+    );
 }
 
 #[test]
@@ -345,8 +449,8 @@ fn ref_merge_coeff_err_6d(
 /// literals were confirmed from a run of the unmodified tree per §12 G5.
 #[test]
 fn test_merge_6d_byte_identical_micro_bits() {
-    let mut a = make_simple_patches((1, 2, 2), (1, 4, 4), (3, 3), (1, 1), (1, 1, 1, 1), 0.1, 0.1);
-    let b = make_simple_patches((1, 2, 2), (1, 4, 4), (3, 3), (1, 1), (1, 1, 1, 1), 0.2, 0.2);
+    let mut a = make_simple_patches((1, 2, 2), (1, 2, 2), (3, 3), (1, 1), (1, 1, 1, 1), 0.1, 0.1);
+    let b = make_simple_patches((1, 2, 2), (1, 2, 2), (3, 3), (1, 1), (1, 1, 1, 1), 0.2, 0.2);
     assert!(a.try_merge_inplace(&b).unwrap());
 
     for (i, &v) in a.lower_a.patches.as_ref().unwrap().iter().enumerate() {
@@ -412,7 +516,7 @@ fn test_merge_6d_byte_identical_micro_bits() {
 #[test]
 fn test_merge_6d_byte_identical_reference() {
     let output_shape = (2, 2, 2);
-    let input_shape = (2, 4, 4);
+    let input_shape = (2, 2, 2);
     let row_count = output_shape.0 * output_shape.1 * output_shape.2; // 8
 
     let make_filled = |seed: f32, err_seed: Option<f32>| {
@@ -531,7 +635,7 @@ fn test_merge_6d_byte_identical_reference() {
 
 /// Build a 7D explicit-rows carrier `[rows, out_c, out_h, out_w, in_c, kh, kw]`
 /// mirroring the metadata `PatchesLinearBounds::from_dense_spatial_rows`
-/// produces (stride `(1,1)`, `in_c == out_c`, `input_shape == output_shape`,
+/// produces (stride `(1,1)`, `in_c == out_c`, geometry-consistent input shape,
 /// dense `unstable_idx: None`, `coeff_err: None`), with parameterizable
 /// kernel/padding and per-flat-index (row-major) fill functions.
 fn make_7d_patches(
@@ -551,14 +655,22 @@ fn make_7d_patches(
         .expect("shape/vec length agree");
     let upper = ArrayD::from_shape_vec(shape, (0..n).map(upper_fill).collect())
         .expect("shape/vec length agree");
+    let input_shape = (
+        oc,
+        oh.checked_add(kh - 1)
+            .and_then(|extent| extent.checked_sub(padding.2 + padding.3))
+            .expect("test 7D vertical geometry must be representable"),
+        ow.checked_add(kw - 1)
+            .and_then(|extent| extent.checked_sub(padding.0 + padding.1))
+            .expect("test 7D horizontal geometry must be representable"),
+    );
     let side = |patches: ArrayD<f32>| PatchesData {
         coeff_err: None,
         patches: Some(patches),
-        stride: (1, 1),
-        padding,
+        geometry: PatchGeometry::affine((1, 1), padding),
         identity: false,
         output_shape,
-        input_shape: output_shape,
+        input_shape,
         unstable_idx: None,
     };
     PatchesLinearBounds {
@@ -736,7 +848,10 @@ fn test_merge_7d_padding_reconcile_err_oracle() {
         a.try_merge_inplace(&b).unwrap(),
         "7D pad-merge must succeed"
     );
-    assert_eq!(a.lower_a.padding, (1, 1, 1, 1));
+    assert_eq!(
+        a.lower_a.geometry,
+        PatchGeometry::affine((1, 1), (1, 1, 1, 1))
+    );
 
     let tiny = f32::from_bits(1); // 2^-149, smallest positive subnormal
     let sides = [
@@ -877,11 +992,12 @@ fn test_merge_7d_none_none_emits_intrinsic_err() {
     assert!(le.iter().chain(ue.iter()).all(|&e| e >= tiny));
 }
 
-/// T4 (spec §4.4): Sub-negate — the per-row err arrays swap lower<->upper
-/// BITWISE on the 7D path (negation is exact; each source carries its own
-/// err through `negated_swapped_zero_bias`).
+/// T4 (spec §4.4): Sub-negate — each side keeps its OWN per-row err array
+/// BITWISE on the 7D path. Negation is exact, and `negated_zero_bias` does not
+/// swap lower<->upper (see its doc: swapping a relation's coefficients is not
+/// sound), so lower keeps the lower err and upper keeps the upper err.
 #[test]
-fn test_negated_swapped_7d_err_swapped_bitwise() {
+fn test_negated_7d_err_preserved_bitwise() {
     let rows = 3;
     let mut p = make_7d_patches(
         rows,
@@ -898,32 +1014,32 @@ fn test_negated_swapped_7d_err_swapped_bitwise() {
     let low_vals = p.lower_a.patches.clone().unwrap();
     let up_vals = p.upper_a.patches.clone().unwrap();
 
-    let neg = p.negated_swapped_zero_bias();
+    let neg = p.negated_zero_bias().unwrap();
 
     assert_arr1_bits_eq(
         neg.lower_a
             .coeff_err
             .as_ref()
-            .expect("negated 7D lower must carry the old upper err"),
-        &ue,
-        "neg lower err = old upper err",
+            .expect("negated 7D lower must carry its own lower err"),
+        &le,
+        "neg lower err = old lower err",
     );
     assert_arr1_bits_eq(
         neg.upper_a
             .coeff_err
             .as_ref()
-            .expect("negated 7D upper must carry the old lower err"),
-        &le,
-        "neg upper err = old lower err",
+            .expect("negated 7D upper must carry its own upper err"),
+        &ue,
+        "neg upper err = old upper err",
     );
-    // Values: exact sign flip of the swapped source, bitwise.
+    // Values: exact sign flip of each side's OWN source, bitwise.
     for (k, (&nv, &ov)) in neg
         .lower_a
         .patches
         .as_ref()
         .unwrap()
         .iter()
-        .zip(up_vals.iter())
+        .zip(low_vals.iter())
         .enumerate()
     {
         assert_eq!(nv.to_bits(), (-ov).to_bits(), "neg lower elem {k}");
@@ -934,7 +1050,7 @@ fn test_negated_swapped_7d_err_swapped_bitwise() {
         .as_ref()
         .unwrap()
         .iter()
-        .zip(low_vals.iter())
+        .zip(up_vals.iter())
         .enumerate()
     {
         assert_eq!(nv.to_bits(), (-ov).to_bits(), "neg upper elem {k}");
@@ -943,11 +1059,11 @@ fn test_negated_swapped_7d_err_swapped_bitwise() {
     assert!(neg.upper_b.iter().all(|&v| v == 0.0));
 }
 
-/// T4 (spec §4.4, sparse scope guard): negate on a sparse (unstable_idx Some)
-/// carrier keeps `coeff_err = None` even if a `Some` was (illegally) attached
-/// — sparse stays outside the err channel (I2).
+/// Negation is exact for sparse carriers too. Preserve an attached receipt so
+/// the next unsupported sparse consumer can refuse it; silently dropping the
+/// receipt would authenticate unknown coefficients as exact.
 #[test]
-fn test_negated_sparse_err_stays_none() {
+fn test_negated_sparse_err_is_preserved_for_fail_closed_consumers() {
     let idx = UnstableIdx {
         channels: vec![0, 1],
         heights: vec![0, 1],
@@ -956,17 +1072,17 @@ fn test_negated_sparse_err_stays_none() {
     let sparse = PatchesData {
         coeff_err: Some(Array1::from(vec![1e-3f32, 2e-3])),
         patches: Some(ArrayD::from_elem(IxDyn(&[2, 2, 1, 1]), 0.5f32)),
-        stride: (1, 1),
-        padding: (0, 0, 0, 0),
+        geometry: PatchGeometry::affine((1, 1), (0, 0, 0, 0)),
         identity: false,
         output_shape: (2, 2, 2),
         input_shape: (2, 2, 2),
         unstable_idx: Some(idx),
     };
     let neg = sparse.negated();
-    assert!(
-        neg.coeff_err.is_none(),
-        "sparse negate must keep coeff_err None"
+    assert_arr1_bits_eq(
+        neg.coeff_err.as_ref().expect("sparse err must survive"),
+        &Array1::from(vec![1e-3f32, 2e-3]),
+        "sparse negation receipt",
     );
 }
 
@@ -1048,6 +1164,37 @@ fn test_merge_7d_gate_rejects_err_length_mismatch() {
     a3.lower_a.coeff_err = Some(Array1::zeros(rows));
     let b3 = mk();
     assert!(a3.try_merge_inplace(&b3).unwrap());
+}
+
+#[test]
+fn test_merge_6d_gate_rejects_err_length_mismatch_and_sanitizes_nan() {
+    let mk = || {
+        make_simple_patches(
+            (1, 1, 2),
+            (1, 1, 2),
+            (1, 1),
+            (1, 1),
+            (0, 0, 0, 0),
+            0.25,
+            0.5,
+        )
+    };
+
+    let mut malformed = mk();
+    malformed.lower_a.coeff_err = Some(Array1::from_vec(vec![1.0e-3]));
+    let peer = mk();
+    assert!(
+        !malformed.try_merge_inplace(&peer).unwrap(),
+        "a short 6D error receipt must decline atomically"
+    );
+
+    let mut poisoned = mk();
+    poisoned.lower_a.coeff_err = Some(Array1::from_vec(vec![f32::NAN, 0.0]));
+    let peer = mk();
+    assert!(poisoned.try_merge_inplace(&peer).unwrap());
+    let error = poisoned.lower_a.coeff_err.as_ref().unwrap();
+    assert_eq!(error[0], f32::INFINITY, "NaN must poison outward");
+    assert!(error[1].is_finite());
 }
 
 /// T5 (spec §4.4): a 6D/7D pair is incompatible (representation-family check)

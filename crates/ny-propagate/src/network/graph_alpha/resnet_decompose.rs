@@ -45,8 +45,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ndarray::{ArrayD, IxDyn};
-use ny_core::{GemmEngine, GpuCrownLayer, GpuCrownSeed, GpuResnetSegment, NyError, Result};
-use ny_tensor::{BoundedTensor, RepairStrategy};
+use ny_core::{
+    GemmEngine, GpuCrownLayer, GpuCrownResult, GpuCrownSeed, GpuResnetSegment, NyError, Result,
+    DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
+};
+use ny_tensor::BoundedTensor;
 use tracing::debug;
 
 /// Process-global cumulative wall time (microseconds) spent inside the resnet GPU
@@ -57,7 +60,7 @@ use tracing::debug;
 /// bound is to stop *starting* new ones.
 static RESNET_GPU_MICROS: AtomicU64 = AtomicU64::new(0);
 
-use super::resnet_skeleton::SkeletonRecorder;
+use super::resnet_skeleton::{ResnetSegmentSkeleton, SkeletonRecorder};
 use crate::bounds::{GraphAlphaState, LinearBounds};
 use crate::layers::{Layer, ReLULayer};
 use crate::network::core::{
@@ -260,6 +263,115 @@ pub(crate) fn joint_alpha_grads_fold_gpu(
     Some(g)
 }
 
+/// Deadline-scored twin of [`joint_alpha_grads_fold_gpu`].  This refuses unless
+/// the backend advertises the exact joint-adjoint capability; a backend's
+/// generic CROWN deadline flag is deliberately insufficient.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeadlineJointAlphaFoldError {
+    DeadlineExpired,
+    JointUnavailable,
+    NonFiniteGradient,
+    MappingMismatch,
+}
+
+fn deadline_joint_alpha_check(
+    deadline: Instant,
+) -> std::result::Result<(), DeadlineJointAlphaFoldError> {
+    if Instant::now() >= deadline {
+        Err(DeadlineJointAlphaFoldError::DeadlineExpired)
+    } else {
+        Ok(())
+    }
+}
+
+fn deadline_joint_alpha_host_work(
+    deadline: Instant,
+    completed: &mut usize,
+) -> std::result::Result<(), DeadlineJointAlphaFoldError> {
+    if completed.is_multiple_of(4096) {
+        deadline_joint_alpha_check(deadline)?;
+    }
+    *completed = completed
+        .checked_add(1)
+        .ok_or(DeadlineJointAlphaFoldError::MappingMismatch)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn joint_alpha_grads_fold_gpu_with_deadline(
+    gpu: &dyn ny_core::GpuCrownBackward,
+    segments: &[GpuResnetSegment],
+    seed_lower_a: &[f32],
+    num_specs: usize,
+    output_dim: usize,
+    in_lo: &[f32],
+    in_hi: &[f32],
+    pre_lowers: &[Vec<f32>],
+    n_relu_expected: usize,
+    deadline: Instant,
+) -> std::result::Result<Vec<Vec<f32>>, DeadlineJointAlphaFoldError> {
+    deadline_joint_alpha_check(deadline)?;
+    if !gpu.provides_deadline_bounded_joint_alpha_gradient_resident() {
+        return Err(DeadlineJointAlphaFoldError::JointUnavailable);
+    }
+    let mut gradients = match gpu.crown_joint_alpha_gradient_resident_with_deadline(
+        segments,
+        seed_lower_a,
+        num_specs,
+        output_dim,
+        in_lo,
+        in_hi,
+        deadline,
+    ) {
+        Ok(gradients) => gradients,
+        Err(error) if error.is_deadline_exceeded() || Instant::now() >= deadline => {
+            return Err(DeadlineJointAlphaFoldError::DeadlineExpired);
+        }
+        Err(NyError::NumericalInstability(_)) => {
+            return Err(DeadlineJointAlphaFoldError::NonFiniteGradient);
+        }
+        Err(_) => return Err(DeadlineJointAlphaFoldError::JointUnavailable),
+    };
+    deadline_joint_alpha_check(deadline)?;
+    if gradients.len() != n_relu_expected {
+        return Err(DeadlineJointAlphaFoldError::JointUnavailable);
+    }
+    if pre_lowers.len() != n_relu_expected {
+        return Err(DeadlineJointAlphaFoldError::MappingMismatch);
+    }
+    if gradients
+        .iter()
+        .zip(pre_lowers)
+        .any(|(gradient, pre_lower)| gradient.len() != pre_lower.len())
+    {
+        return Err(DeadlineJointAlphaFoldError::MappingMismatch);
+    }
+
+    // Validate the raw backend result before masking: a stable-neuron zero must
+    // never launder NaN/Inf into an apparently valid gradient.
+    let mut host_work = 0usize;
+    for gradient in &gradients {
+        for &value in gradient {
+            deadline_joint_alpha_host_work(deadline, &mut host_work)?;
+            if !value.is_finite() {
+                return Err(DeadlineJointAlphaFoldError::NonFiniteGradient);
+            }
+        }
+    }
+    deadline_joint_alpha_check(deadline)?;
+
+    for (gradient, pre_lower) in gradients.iter_mut().zip(pre_lowers) {
+        for (value, &lower) in gradient.iter_mut().zip(pre_lower) {
+            deadline_joint_alpha_host_work(deadline, &mut host_work)?;
+            if lower == 0.0 {
+                *value = 0.0;
+            }
+        }
+    }
+    deadline_joint_alpha_check(deadline)?;
+    Ok(gradients)
+}
+
 /// Dark gate (`NY_MULTIOBJ_JOINT_ALPHA_GPU=1`, requires [`multiobj_joint_alpha_enabled`]
 /// too; default OFF ⇒ CPU oracle, byte-identical to today): route the true-joint
 /// α-gradient through the GPU-resident adjoint [`joint_alpha_grads_fold_gpu`] instead of
@@ -330,16 +442,64 @@ pub(crate) fn resnet_refold_guard_enabled() -> bool {
 
 /// #batched-bab part A: route the per-domain β ascent through the WIDE batched grad
 /// backward (`gpu_beta_optimize_wide`) instead of the serial per-domain
-/// `gpu_beta_optimize_domain` loop, applying the wide-fold throughput to the
-/// β-opt-eligible (scored) path. DEFAULT ON (opt out with `NY_BAB_RESNET_WIDE_BETA=0`
-/// for the serial per-domain loop byte-identically). Requires
-/// `resnet_beta_gpu_batched_enabled()` too (the outer batched gate). Any miss →
-/// serial fallback. SOUND: every iterate is a valid Lagrangian dual for its β ≥ 0
-/// over the SAME child sub-domain and only the element-wise-tightest sound iterate
-/// is kept — never looser than the single-shot lane. See the A/B note on
-/// [`resnet_beta_gpu_batched_enabled`].
+/// `gpu_beta_optimize_domain` loop. Requires `resnet_beta_gpu_batched_enabled()`
+/// too (the outer batched gate). Any miss → serial fallback. SOUND either way:
+/// every iterate is a valid Lagrangian dual for its β ≥ 0 over the SAME child
+/// sub-domain and only the element-wise-tightest sound iterate is kept — never
+/// looser than the single-shot lane.
+///
+/// **DEFAULT FLIPPED TO OFF 2026-08-13 — it was a MEASURED PESSIMISATION.** The
+/// lane shipped default-ON to apply "wide-fold throughput to the β-opt-eligible
+/// (scored) path". Measured through `[phase] mo-wave-stage` on cifar100
+/// idx_7641, IN THE SCORED CONFIGURATION (`OMP_NUM_THREADS=1`, as
+/// `vnncomp_scripts/run_instance.sh` exports it):
+///
+/// ```text
+/// wide lane ON  : bwd 43.19s / 43.22s   per_child 5.41s
+/// wide lane OFF : bwd 24.76s            per_child 3.11s
+/// ```
+///
+/// **1.75x FASTER with the wide lane OFF**, on the phase that is 99.8% of a BaB
+/// wave, with the frontier bound byte-identical (`worst=-11.02619`, 16 domains).
+/// The two ON runs agree to 0.03 s, so this is far outside noise. A 14-row
+/// cifar100 sweep at official budgets showed 14/14 verdicts unchanged — no
+/// conversions, no regressions.
+///
+/// FIRST measured at 1.30x under `OMP_NUM_THREADS=20`; the effect is LARGER at
+/// the scored thread count because the serial fallback is what actually benefits
+/// from the wide fold's absence. Always A/B this at OMP_NUM_THREADS=1: measuring
+/// it at 20 understates the gap.
+///
+/// Opt back in with `NY_BAB_RESNET_WIDE_BETA=1`.
+/// #wide-beta-reflip: DEFAULT-ON again, and the reversal is the point.
+///
+/// This was flipped OFF earlier on a measured 1.76x pessimization (per_child
+/// 5.41s -> 3.08s with it off). That measurement was CORRECT AT THE TIME and is
+/// now STALE: it was taken when the root census was 0/99, so every child priced
+/// all 99 objectives. With the row-chunked root sweep the census is 87/99,
+/// `union_rows` collapses 99 -> 4, and the economics invert.
+///
+/// MEASURED, cifar100 idx_8600, official 100s budget:
+///   off: mo-wave-stage children=8 union_rows=12 bwd=5.28s, frontier -1.01375,
+///        `[wide-lane] declines: entry_wide_beta_gate_off=2`
+///   on:  mo-wave-stage children=6 union_rows=4  bwd=2.09s, frontier -0.98610,
+///        `[wide-lane] published=13, declines: none`
+///
+/// 2.5x faster per wave, it stops declining the domain-stacked GPU lane
+/// entirely, and the frontier improves -- the first time this row has gone below
+/// 1.0. Moat: 12/12 banked verdicts, then all six marginal unsat rows re-run 3x
+/// each for 18/18, every one FASTER than with it off.
+///
+/// The lesson worth keeping: a lever's measurement is only valid for the
+/// configuration it was taken in. This one became wrong the moment the root
+/// improved, and nothing would have re-tested it automatically.
+///
+/// `NY_BAB_RESNET_WIDE_BETA=0` restores the previous default.
 pub(crate) fn resnet_beta_gpu_wide_beta_enabled() -> bool {
-    env_gate_default_on(std::env::var("NY_BAB_RESNET_WIDE_BETA").ok().as_deref())
+    !matches!(
+        std::env::var("NY_BAB_RESNET_WIDE_BETA").ok().as_deref(),
+        Some("0") | Some("false")
+    )
 }
 
 /// #w4 wide α+β ascent: per-domain α re-optimization inside the wide batched β
@@ -373,6 +533,30 @@ pub(crate) fn bab_chain_wide_enabled() -> bool {
         std::env::var("NY_BAB_CHAIN_WIDE").ok().as_deref(),
         Some("1")
     )
+}
+
+// #clip-gather-probe L3: WHICH `None` exit of [`extract_gpu_resnet_segments_collect`]
+// refused. Telemetry ONLY — it is written on refusal paths and never read by any
+// decision, so no verdict, bound, segment list, or control-flow branch depends on
+// it, and the success path never touches it. Thread-local because wave-batched
+// preps run under rayon and a shared cell would cross-talk between domains.
+//
+// Sound to read straight after a `None`: every refusal below writes the slot before
+// returning, so a `None` observed on this thread means this thread just wrote the
+// reason. Callers that did not just observe a `None` must not read it.
+thread_local! {
+    static EXTRACT_LAST_REFUSAL: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("extract_not_recorded") };
+}
+
+fn note_extract_refusal(reason: &'static str) {
+    EXTRACT_LAST_REFUSAL.with(|slot| slot.set(reason));
+}
+
+/// The reason [`extract_gpu_resnet_segments_collect`] last returned `None` on THIS
+/// thread. Only meaningful immediately after observing that `None`.
+pub(crate) fn extract_segments_last_refusal() -> &'static str {
+    EXTRACT_LAST_REFUSAL.with(std::cell::Cell::get)
 }
 
 /// Cap on the number of objective rows (`num_specs`) the resnet GPU suffix will
@@ -1069,13 +1253,17 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                 .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u)
     };
 
+    // #clip-gather-probe L3: telemetry-only sub-reason for the step-fail exit.
+    let mut step_reason: &'static str = "extract_step_unclassified";
     let stop: Option<String> = loop {
         steps += 1;
         if steps > max_steps {
+            note_extract_refusal("extract_cycle_guard");
             return None; // cycle guard: hard refusal, never a stop
         }
         if current == NETWORK_INPUT {
             if pending_bn_werr.is_some() {
+                note_extract_refusal("extract_bn_at_input");
                 return None; // BN fed directly by the input: no host ReLU
             }
             break None;
@@ -1087,9 +1275,11 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
         let chain_ckpt = chain.len();
         let step_ok = 'step: {
             if has_active_non_relu_alpha(&current, alpha_state) {
+                step_reason = "extract_step_non_relu_alpha";
                 break 'step false;
             }
             let Some(node) = graph.nodes.get(&current) else {
+                step_reason = "extract_step_node_missing";
                 break 'step false;
             };
             if let Some(r) = rec.as_deref_mut() {
@@ -1100,10 +1290,12 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
             match node.inputs.len() {
                 1 => {
                     let Ok(input_name) = node.require_unary_input().map(str::to_string) else {
+                        step_reason = "extract_step_not_unary";
                         break 'step false;
                     };
                     let Some(pre) = resolve_pre(input, &input_name, crown_bounds, ibp_bounds)
                     else {
+                        step_reason = "extract_step_pre_unresolved";
                         break 'step false;
                     };
                     let before = chain.len();
@@ -1118,6 +1310,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                     )
                     .is_none()
                     {
+                        step_reason = "extract_step_layer_unsupported";
                         break 'step false;
                     }
                     if let Some(r) = rec.as_deref_mut() {
@@ -1125,6 +1318,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                         if r.record_layer(&node.layer, &current, &input_name, chain.len() - before)
                             .is_none()
                         {
+                            step_reason = "extract_step_recorder";
                             break 'step false;
                         }
                     }
@@ -1139,6 +1333,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                     // to CPU. A pending BN discharge must never straddle a segment
                     // boundary.
                     if pending_bn_werr.is_some() || !matches!(node.layer, Layer::Add(_)) {
+                        step_reason = "extract_step_binary_not_add";
                         break 'step false;
                     }
                     let in_a = node.inputs[0].clone();
@@ -1155,6 +1350,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                     // AT `current` (segments non-empty keeps it eligible).
                     if !chain.is_empty() {
                         let Some(cur_abs) = abs_max_of(&current) else {
+                            step_reason = "extract_step_chain_frontier_abs";
                             break 'step false;
                         };
                         frontier_abs.push(cur_abs);
@@ -1175,10 +1371,12 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                         alpha_state,
                         rec.as_deref_mut(),
                     ) else {
+                        step_reason = "extract_step_block_decompose";
                         break 'step false;
                     };
                     // The residual block's frontier (after its backward) is the block input z.
                     let Some(z_abs) = abs_max_of(&z) else {
+                        step_reason = "extract_step_block_frontier_abs";
                         break 'step false;
                     };
                     frontier_abs.push(z_abs);
@@ -1191,7 +1389,10 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                     saw_residual = true;
                     current = z;
                 }
-                _ => break 'step false,
+                _ => {
+                    step_reason = "extract_step_arity";
+                    break 'step false;
+                }
             }
             true
         };
@@ -1202,6 +1403,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
             {
                 break Some(current.clone());
             }
+            note_extract_refusal(step_reason);
             return None; // historical refusal — byte-identical when !frozen_stop
         }
     };
@@ -1214,7 +1416,11 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
         // (rec ⇒ !frozen_stop ⇒ stop is None ⇒ the recorder always commits the
         // historical NETWORK_INPUT frontier.)
         let frontier_name: &str = stop.as_deref().unwrap_or(NETWORK_INPUT);
-        frontier_abs.push(abs_max_of(frontier_name)?);
+        let Some(final_abs) = abs_max_of(frontier_name) else {
+            note_extract_refusal("extract_final_frontier_abs");
+            return None;
+        };
+        frontier_abs.push(final_abs);
         let seg_idx = segments.len();
         segments.push(GpuResnetSegment::Chain(std::mem::take(&mut chain)));
         relu_names.append(&mut chain_names);
@@ -1222,7 +1428,12 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
             r.commit_chain(seg_idx, frontier_name);
         }
     }
-    if segments.is_empty() || (!saw_residual && !allow_pure_chain) {
+    if segments.is_empty() {
+        note_extract_refusal("extract_segments_empty");
+        return None;
+    }
+    if !saw_residual && !allow_pure_chain {
+        note_extract_refusal("extract_pure_chain_disallowed");
         return None;
     }
     debug_assert_eq!(frontier_abs.len(), segments.len());
@@ -1243,6 +1454,91 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
 // seed the SAME sound GPU resnet backward with the multi-objective C matrix
 // (#w4-root-gpu). Like the decomposition itself, this entry can only refuse
 // (`Ok(None)` → CPU fallback) — it never produces an unsound bound.
+#[derive(Clone, Copy)]
+enum ResnetGpuDispatch {
+    Ordinary,
+    DeadlineBoundedSingleRow(Instant),
+    DeadlineBoundedRows(Instant),
+}
+
+/// Apply the ordinary process-wide admission budget only to the ordinary route.
+///
+/// The deadline-bounded single-row experiment has its own private deadline and
+/// must neither read nor inherit the state of this unrelated throughput guard.
+fn resnet_gpu_dispatch_budget_allows_start_with(
+    dispatch: ResnetGpuDispatch,
+    ordinary_elapsed: &AtomicU64,
+    ordinary_budget_ms: u64,
+) -> bool {
+    match dispatch {
+        ResnetGpuDispatch::Ordinary => {
+            ordinary_budget_ms != 0
+                && ordinary_elapsed.load(Ordering::Relaxed) / 1000 < ordinary_budget_ms
+        }
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(_)
+        | ResnetGpuDispatch::DeadlineBoundedRows(_) => true,
+    }
+}
+
+fn resnet_gpu_dispatch_budget_allows_start(dispatch: ResnetGpuDispatch) -> bool {
+    match dispatch {
+        ResnetGpuDispatch::Ordinary => resnet_gpu_dispatch_budget_allows_start_with(
+            dispatch,
+            &RESNET_GPU_MICROS,
+            resnet_gpu_time_budget_ms(),
+        ),
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(_)
+        | ResnetGpuDispatch::DeadlineBoundedRows(_) => true,
+    }
+}
+
+/// Charge elapsed GPU time only to the ordinary route's process-wide budget.
+///
+/// `None` identifies the deadline-bounded experiment: its elapsed time remains
+/// available to call-local trace telemetry, but is never stored in or returned
+/// as the ordinary cumulative counter.
+fn account_resnet_gpu_elapsed_with(
+    ordinary_elapsed: &AtomicU64,
+    dispatch: ResnetGpuDispatch,
+    elapsed_us: u64,
+) -> Option<u64> {
+    match dispatch {
+        ResnetGpuDispatch::Ordinary => {
+            Some(ordinary_elapsed.fetch_add(elapsed_us, Ordering::Relaxed) + elapsed_us)
+        }
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(_)
+        | ResnetGpuDispatch::DeadlineBoundedRows(_) => None,
+    }
+}
+
+fn account_resnet_gpu_elapsed(dispatch: ResnetGpuDispatch, elapsed_us: u64) -> Option<u64> {
+    account_resnet_gpu_elapsed_with(&RESNET_GPU_MICROS, dispatch, elapsed_us)
+}
+
+/// Validate and convert an optional backend result without letting repair
+/// create a new authoritative interval. Every dispatch kind must return the
+/// exact finite, already-ordered row payload; otherwise its caller restores
+/// the established host fallback.
+fn resnet_gpu_result_to_bounds(
+    _dispatch: ResnetGpuDispatch,
+    expected_rows: usize,
+    result: GpuCrownResult,
+) -> Result<Option<BoundedTensor>> {
+    // All GPU routes are optional accelerators. A malformed ordinary payload
+    // must take the same CPU fallback as a malformed private-deadline payload;
+    // repairing it here would turn device validation failure into authority.
+    if !crate::sound_gpu_gate::gpu_crown_result_is_publishable(&result, expected_rows) {
+        return Ok(None);
+    }
+    let (Ok(lower), Ok(upper)) = (
+        ArrayD::from_shape_vec(IxDyn(&[expected_rows]), result.lower_bounds),
+        ArrayD::from_shape_vec(IxDyn(&[expected_rows]), result.upper_bounds),
+    ) else {
+        return Ok(None);
+    };
+    Ok(BoundedTensor::new(lower, upper).ok())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_resnet_gpu_suffix<V1: Borrow<BoundedTensor>, V2: Borrow<BoundedTensor>>(
     graph: &GraphNetwork,
@@ -1255,14 +1551,273 @@ pub(crate) fn try_resnet_gpu_suffix<V1: Borrow<BoundedTensor>, V2: Borrow<Bounde
     deadline: Option<Instant>,
     seed_lb: &LinearBounds,
 ) -> Result<Option<BoundedTensor>> {
+    // The ordinary helper performs topology/segment walks and full seed/input
+    // copies before its backend deadline begins. Finite callers must not enter
+    // that unpollable host preparation; the dedicated private single/bounded-
+    // row experiments remain separate APIs and are not production proof
+    // authority for this route.
+    // #gpu-suffix-expiry set-mate: default-off, byte-identical unarmed.
+    if let Some(limit) = deadline {
+        if Instant::now() >= limit {
+            return Err(NyError::DeadlineExceeded(
+                "ResNet GPU suffix deadline expired before host preparation".into(),
+            ));
+        }
+        if crate::sound_gpu_gate::gpu_suffix_declines_under_finite_authority(limit) {
+            return Ok(None);
+        }
+    }
+    try_resnet_gpu_suffix_with_dispatch(
+        graph,
+        input,
+        target_node,
+        crown_bounds,
+        ibp_bounds,
+        alpha_state,
+        engine,
+        deadline,
+        seed_lb,
+        ResnetGpuDispatch::Ordinary,
+    )
+}
+
+/// Narrow sibling for the critical-row experiment. It reuses the exact same
+/// decomposition and result validation, but dispatches only the backend's
+/// explicit call-local one-row API: no ordinary CUDA route, global deadline
+/// lease, forward candidate, or CPU fallback can run here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_resnet_gpu_suffix_single_row_with_deadline<
+    V1: Borrow<BoundedTensor>,
+    V2: Borrow<BoundedTensor>,
+>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    target_node: &str,
+    crown_bounds: &HashMap<String, V1>,
+    ibp_bounds: &HashMap<String, V2>,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Instant,
+    seed_lb: &LinearBounds,
+) -> Result<Option<BoundedTensor>> {
+    try_resnet_gpu_suffix_with_dispatch(
+        graph,
+        input,
+        target_node,
+        crown_bounds,
+        ibp_bounds,
+        None,
+        engine,
+        Some(deadline),
+        seed_lb,
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(deadline),
+    )
+}
+
+/// Alpha-bearing sibling of
+/// [`try_resnet_gpu_suffix_single_row_with_deadline`].
+///
+/// It retains the dedicated call-local one-row dispatch and all of its strict
+/// result/deadline validation, but bakes the caller's exact clamped alpha state
+/// into the ResNet fold.  This is intentionally a separate typed surface:
+/// ordinary callers cannot accidentally opt into the critical-row experiment,
+/// and the historical fresh-slope surface above remains byte-identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_resnet_gpu_suffix_single_row_with_alpha_and_deadline<
+    V1: Borrow<BoundedTensor>,
+    V2: Borrow<BoundedTensor>,
+>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    target_node: &str,
+    crown_bounds: &HashMap<String, V1>,
+    ibp_bounds: &HashMap<String, V2>,
+    alpha_state: &GraphAlphaState,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Instant,
+    seed_lb: &LinearBounds,
+) -> Result<Option<BoundedTensor>> {
+    try_resnet_gpu_suffix_with_dispatch(
+        graph,
+        input,
+        target_node,
+        crown_bounds,
+        ibp_bounds,
+        Some(alpha_state),
+        engine,
+        Some(deadline),
+        seed_lb,
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(deadline),
+    )
+}
+
+/// Complete result of one strict, deadline-bounded small-row ResNet fold.
+///
+/// The folded segments and row-independent input box are the exact operands
+/// used by the backend call. Active-set callers may therefore replay one
+/// binding row on the host without running a second topology extraction.
+#[allow(dead_code)] // Phase-1 plumbing: fields are consumed by the follow-up root integration.
+pub(crate) struct DeadlineBoundedResnetRowsResult {
+    pub(crate) bounds: BoundedTensor,
+    pub(crate) segments: Vec<GpuResnetSegment>,
+    pub(crate) relu_names: Vec<String>,
+    pub(crate) input_lower: Vec<f32>,
+    pub(crate) input_upper: Vec<f32>,
+}
+
+/// Alpha-bearing, strict-skeleton sibling for one atomic `2..=8` row
+/// deadline-bounded sound ResNet backward.
+///
+/// This entry is deliberately additive. K=1 remains owned by
+/// [`try_resnet_gpu_suffix_single_row_with_alpha_and_deadline`] and is refused
+/// here, so wiring the active-set route cannot divert the sealed critical-row
+/// path. The supplied skeleton must describe this exact output suffix and fold
+/// successfully for the supplied alpha state; there is no legacy-extraction or
+/// ordinary-GPU fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_resnet_gpu_suffix_bounded_rows_with_alpha_and_deadline<
+    V1: Borrow<BoundedTensor>,
+    V2: Borrow<BoundedTensor>,
+>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    target_node: &str,
+    crown_bounds: &HashMap<String, V1>,
+    ibp_bounds: &HashMap<String, V2>,
+    alpha_state: &GraphAlphaState,
+    skeleton: &ResnetSegmentSkeleton,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Instant,
+    seed_lb: &LinearBounds,
+) -> Result<Option<DeadlineBoundedResnetRowsResult>> {
+    if !resnet_gpu_enabled() || Instant::now() >= deadline {
+        return Ok(None);
+    }
+
+    let num_specs = seed_lb.num_outputs();
+    let current_dim = seed_lb.num_inputs();
+    if !(2..=DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS).contains(&num_specs)
+        || current_dim == 0
+        || seed_lb
+            .lower_a()
+            .iter()
+            .chain(seed_lb.upper_a().iter())
+            .chain(seed_lb.lower_b().iter())
+            .chain(seed_lb.upper_b().iter())
+            .any(|value| !value.is_finite())
+    {
+        return Ok(None);
+    }
+
+    let Some(gpu) = engine
+        .and_then(|candidate| candidate.as_gpu_crown_backward())
+        .filter(|candidate| candidate.provides_sound_gpu_crown())
+    else {
+        return Ok(None);
+    };
+    let capacity = gpu.deadline_bounded_resnet_sound_max_rows();
+    if capacity > DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS || capacity < num_specs {
+        return Ok(None);
+    }
+
+    if skeleton.cache_key() != (target_node, false) || !skeleton.matches_graph(graph) {
+        return Ok(None);
+    }
+    let Some((segments, relu_names, frontier_abs, node_abs)) =
+        skeleton.fold_for_domain(graph, input, crown_bounds, ibp_bounds, Some(alpha_state))
+    else {
+        return Ok(None);
+    };
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+
+    let input_flat = input.flatten();
+    let input_lower: Vec<f32> = input_flat.lower().iter().copied().collect();
+    let input_upper: Vec<f32> = input_flat.upper().iter().copied().collect();
+    if input_lower.is_empty()
+        || input_lower.len() != input_upper.len()
+        || input_lower
+            .iter()
+            .zip(&input_upper)
+            .any(|(&lower, &upper)| !lower.is_finite() || !upper.is_finite() || lower > upper)
+    {
+        return Ok(None);
+    }
+
+    let seed = GpuCrownSeed {
+        lower_a: seed_lb.lower_a().iter().copied().collect::<Vec<_>>().into(),
+        upper_a: seed_lb.upper_a().iter().copied().collect::<Vec<_>>().into(),
+        lower_b: seed_lb.lower_b().iter().copied().collect::<Vec<_>>().into(),
+        upper_b: seed_lb.upper_b().iter().copied().collect::<Vec<_>>().into(),
+        num_specs,
+        current_dim,
+    };
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+    let dispatch = ResnetGpuDispatch::DeadlineBoundedRows(deadline);
+    let started_at = Instant::now();
+    let result = gpu.crown_backward_gpu_resnet_sound_bounded_rows_with_deadline(
+        &segments,
+        &seed,
+        &input_lower,
+        &input_upper,
+        &frontier_abs,
+        &node_abs,
+        deadline,
+    );
+    let elapsed_us = started_at.elapsed().as_micros() as u64;
+    let _ordinary_cumulative = account_resnet_gpu_elapsed(dispatch, elapsed_us);
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            debug!(
+                target_node,
+                num_specs,
+                error = %error,
+                "deadline-bounded rows resnet GPU suffix refused"
+            );
+            return Ok(None);
+        }
+    };
+    let Some(bounds) = resnet_gpu_result_to_bounds(dispatch, num_specs, result)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(DeadlineBoundedResnetRowsResult {
+        bounds,
+        segments,
+        relu_names,
+        input_lower,
+        input_upper,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_resnet_gpu_suffix_with_dispatch<V1: Borrow<BoundedTensor>, V2: Borrow<BoundedTensor>>(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    target_node: &str,
+    crown_bounds: &HashMap<String, V1>,
+    ibp_bounds: &HashMap<String, V2>,
+    alpha_state: Option<&GraphAlphaState>,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
+    seed_lb: &LinearBounds,
+    dispatch: ResnetGpuDispatch,
+) -> Result<Option<BoundedTensor>> {
     if !resnet_gpu_enabled() {
         return Ok(None);
     }
-    // Hang/runaway firewall: never start a resnet GPU backward once the cumulative
-    // budget is spent or the per-node deadline has passed — a single GPU call cannot
-    // be interrupted, so bounding the *start* of new ones is the only safe guard.
-    let budget_ms = resnet_gpu_time_budget_ms();
-    if budget_ms == 0 || RESNET_GPU_MICROS.load(Ordering::Relaxed) / 1000 >= budget_ms {
+    // Hang/runaway firewall for ordinary calls: never start another unbounded
+    // ResNet backward once its process-wide budget is spent. The dedicated
+    // one-row call has a stronger, call-local contract: bounded CUDA dispatches
+    // plus an explicit private deadline. It neither reads nor charges the
+    // ordinary throughput budget.
+    if !resnet_gpu_dispatch_budget_allows_start(dispatch) {
         return Ok(None);
     }
     if let Some(deadline) = deadline {
@@ -1280,11 +1835,41 @@ pub(crate) fn try_resnet_gpu_suffix<V1: Borrow<BoundedTensor>, V2: Borrow<Bounde
     else {
         return Ok(None);
     };
+    match dispatch {
+        ResnetGpuDispatch::Ordinary => {
+            if !crate::sound_gpu_gate::gpu_crown_backend_honors_deadline(gpu, deadline) {
+                return Ok(None);
+            }
+        }
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(_) => {
+            if !gpu.provides_deadline_bounded_single_row_resnet_sound() {
+                return Ok(None);
+            }
+        }
+        ResnetGpuDispatch::DeadlineBoundedRows(_) => {
+            let capacity = gpu.deadline_bounded_resnet_sound_max_rows();
+            if capacity > DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS {
+                return Ok(None);
+            }
+        }
+    }
 
     let num_specs = seed_lb.num_outputs();
     let current_dim = seed_lb.num_inputs();
     if num_specs == 0 || current_dim == 0 {
         return Ok(None);
+    }
+    match dispatch {
+        ResnetGpuDispatch::Ordinary => {}
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(_) if num_specs != 1 => return Ok(None),
+        ResnetGpuDispatch::DeadlineBoundedRows(_)
+            if !(2..=DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS).contains(&num_specs)
+                || gpu.deadline_bounded_resnet_sound_max_rows() < num_specs =>
+        {
+            return Ok(None);
+        }
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(_)
+        | ResnetGpuDispatch::DeadlineBoundedRows(_) => {}
     }
     if num_specs > resnet_gpu_max_objectives() {
         return Ok(None);
@@ -1357,25 +1942,74 @@ pub(crate) fn try_resnet_gpu_suffix<V1: Borrow<BoundedTensor>, V2: Borrow<Bounde
 
     let trace = resnet_gpu_trace();
     if trace {
-        eprintln!(
-            "[resnet-gpu] dispatch target={target_node} num_specs={num_specs} \
-             current_dim={current_dim} segments={} layers={total_layers}",
-            segments.len()
-        );
+        match dispatch {
+            ResnetGpuDispatch::Ordinary => eprintln!(
+                "[resnet-gpu] dispatch target={target_node} num_specs={num_specs} \
+                 current_dim={current_dim} segments={} layers={total_layers}",
+                segments.len()
+            ),
+            ResnetGpuDispatch::DeadlineBoundedSingleRow(_) => eprintln!(
+                "[resnet-gpu] dispatch target={target_node} num_specs={num_specs} \
+                 current_dim={current_dim} segments={} layers={total_layers} \
+                 accounting=critical-call-local ordinary_budget_charged=false",
+                segments.len()
+            ),
+            ResnetGpuDispatch::DeadlineBoundedRows(_) => eprintln!(
+                "[resnet-gpu] dispatch target={target_node} num_specs={num_specs} \
+                 current_dim={current_dim} segments={} layers={total_layers} \
+                 accounting=bounded-rows-call-local ordinary_budget_charged=false",
+                segments.len()
+            ),
+        }
+    }
+    if deadline.is_some_and(|value| Instant::now() >= value) {
+        return Ok(None);
     }
     let t0 = Instant::now();
-    let result = match gpu.crown_backward_gpu_resnet_sound(
-        &segments,
-        &seed,
-        &input_lower,
-        &input_upper,
-        &frontier_abs,
-        &node_abs,
-    ) {
+    let result = match dispatch {
+        ResnetGpuDispatch::Ordinary => {
+            let _deadline_scope =
+                crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, deadline);
+            gpu.crown_backward_gpu_resnet_sound(
+                &segments,
+                &seed,
+                &input_lower,
+                &input_upper,
+                &frontier_abs,
+                &node_abs,
+            )
+        }
+        ResnetGpuDispatch::DeadlineBoundedSingleRow(deadline) => gpu
+            .crown_backward_gpu_resnet_sound_single_row_with_deadline(
+                &segments,
+                &seed,
+                &input_lower,
+                &input_upper,
+                &frontier_abs,
+                &node_abs,
+                deadline,
+            ),
+        ResnetGpuDispatch::DeadlineBoundedRows(deadline) => gpu
+            .crown_backward_gpu_resnet_sound_bounded_rows_with_deadline(
+                &segments,
+                &seed,
+                &input_lower,
+                &input_upper,
+                &frontier_abs,
+                &node_abs,
+                deadline,
+            ),
+    };
+    if deadline.is_some_and(|value| Instant::now() >= value) {
+        let us = t0.elapsed().as_micros() as u64;
+        let _ordinary_cumulative = account_resnet_gpu_elapsed(dispatch, us);
+        return Ok(None);
+    }
+    let result = match result {
         Ok(result) => result,
         Err(error) => {
             let us = t0.elapsed().as_micros() as u64;
-            RESNET_GPU_MICROS.fetch_add(us, Ordering::Relaxed);
+            let _ordinary_cumulative = account_resnet_gpu_elapsed(dispatch, us);
             if trace {
                 eprintln!(
                     "[resnet-gpu] target={target_node} ERR after {}ms: {error}",
@@ -1391,13 +2025,20 @@ pub(crate) fn try_resnet_gpu_suffix<V1: Borrow<BoundedTensor>, V2: Borrow<Bounde
         }
     };
     let elapsed_us = t0.elapsed().as_micros() as u64;
-    let cumulative = RESNET_GPU_MICROS.fetch_add(elapsed_us, Ordering::Relaxed) + elapsed_us;
+    let ordinary_cumulative = account_resnet_gpu_elapsed(dispatch, elapsed_us);
     if trace {
-        eprintln!(
-            "[resnet-gpu] target={target_node} returned in {}ms (cumulative {}ms)",
-            elapsed_us / 1000,
-            cumulative / 1000
-        );
+        match ordinary_cumulative {
+            Some(cumulative) => eprintln!(
+                "[resnet-gpu] target={target_node} returned in {}ms (cumulative {}ms)",
+                elapsed_us / 1000,
+                cumulative / 1000
+            ),
+            None => eprintln!(
+                "[resnet-gpu] target={target_node} returned in {}ms \
+                 (accounting=critical-call-local ordinary_budget_charged=false)",
+                elapsed_us / 1000
+            ),
+        }
     }
     debug!(
         target_node = target_node,
@@ -1405,26 +2046,25 @@ pub(crate) fn try_resnet_gpu_suffix<V1: Borrow<BoundedTensor>, V2: Borrow<Bounde
         "resnet GPU suffix: GPU-resident backward returned"
     );
 
-    // Only NaN forces fallback: ±Inf concrete bounds are valid conservative bounds
-    // (handled downstream by RepairStrategy::Widen).
-    if result
-        .lower_bounds
-        .iter()
-        .chain(result.upper_bounds.iter())
-        .any(|v| v.is_nan())
-    {
-        debug!(
-            target_node = target_node,
-            "resnet GPU suffix produced NaN; falling back to CPU backward"
-        );
+    let Some(bounds) = resnet_gpu_result_to_bounds(dispatch, num_specs, result)? else {
+        match dispatch {
+            ResnetGpuDispatch::Ordinary => debug!(
+                target_node = target_node,
+                "resnet GPU suffix produced NaN; falling back to CPU backward"
+            ),
+            ResnetGpuDispatch::DeadlineBoundedSingleRow(_) => debug!(
+                target_node = target_node,
+                "deadline-bounded resnet GPU suffix produced an invalid raw result; \
+                 refusing publication"
+            ),
+            ResnetGpuDispatch::DeadlineBoundedRows(_) => debug!(
+                target_node = target_node,
+                "deadline-bounded rows resnet GPU suffix produced an invalid raw result; \
+                 refusing publication"
+            ),
+        }
         return Ok(None);
-    }
-
-    let lower = ArrayD::from_shape_vec(IxDyn(&[num_specs]), result.lower_bounds)
-        .map_err(|e| NyError::InvalidSpec(format!("resnet GPU suffix lower reshape: {e}")))?;
-    let upper = ArrayD::from_shape_vec(IxDyn(&[num_specs]), result.upper_bounds)
-        .map_err(|e| NyError::InvalidSpec(format!("resnet GPU suffix upper reshape: {e}")))?;
-    let bounds = BoundedTensor::new_repaired(lower, upper, RepairStrategy::Widen)?;
+    };
     debug!(
         target_node = target_node,
         num_specs, current_dim, "resnet GPU suffix decided bounds on GPU-resident sound backward"
@@ -1437,7 +2077,12 @@ mod tests {
     use super::*;
     use crate::layers::{AddLayer, LinearLayer, ReLULayer, SubLayer};
     use crate::network::core::GraphNode;
-    use ndarray::{arr1, arr2, ArrayD, IxDyn};
+    use crate::network::{build_resnet_segment_skeleton, SpecCrownRequest};
+    use ndarray::{arr1, arr2, Array2, ArrayD, IxDyn};
+    use ny_core::GpuCrownBackward;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn lin(name: &str, input: &str) -> GraphNode {
         // A simple 2→2 Linear with a small bias.
@@ -1485,6 +2130,552 @@ mod tests {
             GpuResnetSegment::Chain(l) | GpuResnetSegment::Residual(l) => l.len(),
             GpuResnetSegment::ResidualProj(f, p) => f.len() + p.len(),
         }
+    }
+
+    struct BoundedRowsMock {
+        capacity: usize,
+        bounded_calls: AtomicUsize,
+        single_calls: AtomicUsize,
+    }
+
+    impl BoundedRowsMock {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                bounded_calls: AtomicUsize::new(0),
+                single_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn evaluate_seed(seed: &GpuCrownSeed) -> GpuCrownResult {
+            assert_eq!(seed.lower_a.len(), seed.num_specs * seed.current_dim);
+            assert_eq!(seed.upper_a.len(), seed.num_specs * seed.current_dim);
+            assert_eq!(seed.lower_b.len(), seed.num_specs);
+            assert_eq!(seed.upper_b.len(), seed.num_specs);
+
+            let lower_bounds = seed
+                .lower_a
+                .chunks_exact(seed.current_dim)
+                .zip(seed.lower_b.iter())
+                .map(|(row, bias)| row.iter().copied().sum::<f32>() + *bias - 0.25)
+                .collect();
+            let upper_bounds = seed
+                .upper_a
+                .chunks_exact(seed.current_dim)
+                .zip(seed.upper_b.iter())
+                .map(|(row, bias)| row.iter().copied().sum::<f32>() + *bias + 0.25)
+                .collect();
+            GpuCrownResult {
+                lower_bounds,
+                upper_bounds,
+            }
+        }
+    }
+
+    impl GemmEngine for BoundedRowsMock {
+        fn gemm_f32(
+            &self,
+            m: usize,
+            _k: usize,
+            n: usize,
+            _a: &[f32],
+            _b: &[f32],
+        ) -> Result<Vec<f32>> {
+            Ok(vec![0.0; m * n])
+        }
+
+        fn as_gpu_crown_backward(&self) -> Option<&dyn GpuCrownBackward> {
+            Some(self)
+        }
+    }
+
+    impl GpuCrownBackward for BoundedRowsMock {
+        fn crown_backward_gpu(
+            &self,
+            _layers: &[GpuCrownLayer],
+            _spec: &[f32],
+            _num_specs: usize,
+            _input_lower: &[f32],
+            _input_upper: &[f32],
+        ) -> Result<GpuCrownResult> {
+            Err(NyError::UnsupportedOp(
+                "ordinary GPU CROWN must not run in bounded-row tests".into(),
+            ))
+        }
+
+        fn provides_sound_gpu_crown(&self) -> bool {
+            true
+        }
+
+        fn provides_deadline_bounded_single_row_resnet_sound(&self) -> bool {
+            self.capacity >= 1
+        }
+
+        fn deadline_bounded_resnet_sound_max_rows(&self) -> usize {
+            self.capacity
+        }
+
+        fn crown_backward_gpu_resnet_sound_single_row_with_deadline(
+            &self,
+            segments: &[GpuResnetSegment],
+            seed: &GpuCrownSeed,
+            input_lower: &[f32],
+            input_upper: &[f32],
+            _frontier_abs: &[Vec<f32>],
+            _node_abs: &[Vec<f32>],
+            deadline: Instant,
+        ) -> Result<GpuCrownResult> {
+            assert!(Instant::now() < deadline);
+            assert!(!segments.is_empty());
+            assert_eq!(seed.num_specs, 1);
+            assert_eq!(input_lower.len(), input_upper.len());
+            self.single_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Self::evaluate_seed(seed))
+        }
+
+        fn crown_backward_gpu_resnet_sound_bounded_rows_with_deadline(
+            &self,
+            segments: &[GpuResnetSegment],
+            seed: &GpuCrownSeed,
+            input_lower: &[f32],
+            input_upper: &[f32],
+            _frontier_abs: &[Vec<f32>],
+            _node_abs: &[Vec<f32>],
+            deadline: Instant,
+        ) -> Result<GpuCrownResult> {
+            assert!(Instant::now() < deadline);
+            assert!(!segments.is_empty());
+            assert!((2..=self.capacity).contains(&seed.num_specs));
+            assert!(seed.num_specs <= DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS);
+            assert_eq!(input_lower.len(), input_upper.len());
+            self.bounded_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Self::evaluate_seed(seed))
+        }
+    }
+
+    fn bounded_rows_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(lin("l0", NETWORK_INPUT));
+        graph.add_node(relu("relu", "l0"));
+        graph.add_node(lin("residual", "relu"));
+        graph.add_node(GraphNode::new(
+            "add",
+            Layer::Add(AddLayer),
+            vec!["residual".to_string(), "l0".to_string()],
+        ));
+        graph.add_node(lin("out", "add"));
+        graph.set_output("out");
+        graph
+    }
+
+    fn bounded_rows_spec(rows: usize) -> Array2<f32> {
+        Array2::from_shape_fn((rows, 2), |(row, col)| {
+            let row = row as f32;
+            if col == 0 {
+                row + 1.0
+            } else {
+                row.mul_add(-0.125, 0.5)
+            }
+        })
+    }
+
+    fn assert_bounded_rows_serial_parity(rows: usize) {
+        let graph = bounded_rows_graph();
+        let input = input_box();
+        let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+        let alpha_state = GraphAlphaState::new();
+        let skeleton = build_resnet_segment_skeleton(
+            &graph,
+            &input,
+            "out",
+            &node_bounds,
+            &node_bounds,
+            Some(&alpha_state),
+            false,
+        )
+        .expect("test resnet must produce a reusable skeleton");
+        let spec = bounded_rows_spec(rows);
+        let engine = BoundedRowsMock::new(DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS);
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        let result = SpecCrownRequest::new(&graph, &input, &spec, Some(&engine))
+            .node_bounds(&node_bounds)
+            .alpha_state_opt(Some(&alpha_state))
+            .deadline_opt(Some(deadline))
+            .run_alpha_sound_gpu_bounded_rows_only(&skeleton)
+            .expect("bounded-row request")
+            .expect("eligible bounded-row request must dispatch");
+
+        assert_eq!(engine.bounded_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.single_calls.load(Ordering::Relaxed),
+            0,
+            "the request itself must dispatch one K-row transaction, not K scalar calls"
+        );
+        assert!(!result.segments.is_empty());
+        assert!(!result.relu_names.is_empty());
+
+        let batched_lower: Vec<f32> = result.bounds.lower().iter().copied().collect();
+        let batched_upper: Vec<f32> = result.bounds.upper().iter().copied().collect();
+        for row in 0..rows {
+            let coefficients: Vec<f32> = spec.row(row).iter().copied().collect();
+            let scalar_seed = GpuCrownSeed {
+                lower_a: Arc::from(coefficients.clone()),
+                upper_a: Arc::from(coefficients),
+                lower_b: Arc::from([0.0]),
+                upper_b: Arc::from([0.0]),
+                num_specs: 1,
+                current_dim: spec.ncols(),
+            };
+            let scalar = engine
+                .crown_backward_gpu_resnet_sound_single_row_with_deadline(
+                    &result.segments,
+                    &scalar_seed,
+                    &result.input_lower,
+                    &result.input_upper,
+                    &[],
+                    &[],
+                    deadline,
+                )
+                .expect("serial one-row oracle");
+            assert_eq!(
+                batched_lower[row].to_bits(),
+                scalar.lower_bounds[0].to_bits(),
+                "lower row {row} differs from serial one-row dispatch"
+            );
+            assert_eq!(
+                batched_upper[row].to_bits(),
+                scalar.upper_bounds[0].to_bits(),
+                "upper row {row} differs from serial one-row dispatch"
+            );
+        }
+        assert_eq!(engine.bounded_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.single_calls.load(Ordering::Relaxed), rows);
+    }
+
+    #[test]
+    fn deadline_bounded_rows_k2_is_one_dispatch_and_matches_serial_rows() {
+        assert_bounded_rows_serial_parity(2);
+    }
+
+    #[test]
+    fn deadline_bounded_rows_k8_is_one_dispatch_and_matches_serial_rows() {
+        assert_bounded_rows_serial_parity(DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS);
+    }
+
+    #[test]
+    fn deadline_bounded_rows_refuses_invalid_k_without_dispatch() {
+        let graph = bounded_rows_graph();
+        let input = input_box();
+        let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+        let alpha_state = GraphAlphaState::new();
+        let skeleton = build_resnet_segment_skeleton(
+            &graph,
+            &input,
+            "out",
+            &node_bounds,
+            &node_bounds,
+            Some(&alpha_state),
+            false,
+        )
+        .expect("test resnet skeleton");
+
+        for rows in [0, 1, DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS + 1] {
+            let spec = bounded_rows_spec(rows);
+            let engine = BoundedRowsMock::new(DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS);
+            let result = SpecCrownRequest::new(&graph, &input, &spec, Some(&engine))
+                .node_bounds(&node_bounds)
+                .alpha_state_opt(Some(&alpha_state))
+                .deadline_opt(Some(Instant::now() + Duration::from_secs(10)))
+                .run_alpha_sound_gpu_bounded_rows_only(&skeleton)
+                .expect("invalid K must fail closed");
+            assert!(result.is_none(), "K={rows} must be refused");
+            assert_eq!(engine.bounded_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(engine.single_calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn deadline_bounded_rows_refuses_insufficient_or_invalid_capacity() {
+        let graph = bounded_rows_graph();
+        let input = input_box();
+        let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+        let alpha_state = GraphAlphaState::new();
+        let skeleton = build_resnet_segment_skeleton(
+            &graph,
+            &input,
+            "out",
+            &node_bounds,
+            &node_bounds,
+            Some(&alpha_state),
+            false,
+        )
+        .expect("test resnet skeleton");
+
+        for (rows, capacity) in [
+            (2, 1),
+            (DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS, 7),
+            (2, DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS + 1),
+        ] {
+            let spec = bounded_rows_spec(rows);
+            let engine = BoundedRowsMock::new(capacity);
+            let result = SpecCrownRequest::new(&graph, &input, &spec, Some(&engine))
+                .node_bounds(&node_bounds)
+                .alpha_state_opt(Some(&alpha_state))
+                .deadline_opt(Some(Instant::now() + Duration::from_secs(10)))
+                .run_alpha_sound_gpu_bounded_rows_only(&skeleton)
+                .expect("invalid capacity must fail closed");
+            assert!(
+                result.is_none(),
+                "K={rows}, advertised capacity={capacity} must be refused"
+            );
+            assert_eq!(engine.bounded_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(engine.single_calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn deadline_bounded_rows_refuses_wrong_skeleton_without_dispatch() {
+        let graph = bounded_rows_graph();
+        let input = input_box();
+        let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+        let alpha_state = GraphAlphaState::new();
+        let wrong_skeleton = build_resnet_segment_skeleton(
+            &graph,
+            &input,
+            "add",
+            &node_bounds,
+            &node_bounds,
+            Some(&alpha_state),
+            false,
+        )
+        .expect("alternate target still has a valid resnet skeleton");
+        let spec = bounded_rows_spec(2);
+        let engine = BoundedRowsMock::new(DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS);
+
+        let result = SpecCrownRequest::new(&graph, &input, &spec, Some(&engine))
+            .node_bounds(&node_bounds)
+            .alpha_state_opt(Some(&alpha_state))
+            .deadline_opt(Some(Instant::now() + Duration::from_secs(10)))
+            .run_alpha_sound_gpu_bounded_rows_only(&wrong_skeleton)
+            .expect("skeleton mismatch must fail closed");
+        assert!(result.is_none());
+        assert_eq!(engine.bounded_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.single_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deadline_bounded_rows_refuses_expired_deadline_without_dispatch() {
+        let graph = bounded_rows_graph();
+        let input = input_box();
+        let node_bounds = graph.collect_node_bounds(&input).expect("node bounds");
+        let alpha_state = GraphAlphaState::new();
+        let skeleton = build_resnet_segment_skeleton(
+            &graph,
+            &input,
+            "out",
+            &node_bounds,
+            &node_bounds,
+            Some(&alpha_state),
+            false,
+        )
+        .expect("test resnet skeleton");
+        let spec = bounded_rows_spec(2);
+        let engine = BoundedRowsMock::new(DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("Instant supports a one-second subtraction");
+
+        let result = SpecCrownRequest::new(&graph, &input, &spec, Some(&engine))
+            .node_bounds(&node_bounds)
+            .alpha_state_opt(Some(&alpha_state))
+            .deadline_opt(Some(expired))
+            .run_alpha_sound_gpu_bounded_rows_only(&skeleton)
+            .expect("expired deadline must fail closed");
+        assert!(result.is_none());
+        assert_eq!(engine.bounded_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.single_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deadline_bounded_rows_dispatch_neither_reads_nor_charges_ordinary_budget() {
+        let ordinary_elapsed = AtomicU64::new(29_999_999);
+        let dispatch = ResnetGpuDispatch::DeadlineBoundedRows(Instant::now());
+
+        assert!(resnet_gpu_dispatch_budget_allows_start_with(
+            dispatch,
+            &ordinary_elapsed,
+            0
+        ));
+        assert_eq!(
+            account_resnet_gpu_elapsed_with(&ordinary_elapsed, dispatch, 10_000_000),
+            None
+        );
+        assert_eq!(ordinary_elapsed.load(Ordering::Relaxed), 29_999_999);
+    }
+
+    #[test]
+    fn deadline_bounded_rows_result_refuses_malformed_intervals_without_repair() {
+        let dispatch = ResnetGpuDispatch::DeadlineBoundedRows(Instant::now());
+        for malformed in [
+            GpuCrownResult {
+                lower_bounds: vec![0.0],
+                upper_bounds: vec![1.0, 2.0],
+            },
+            GpuCrownResult {
+                lower_bounds: vec![0.0, 5.0],
+                upper_bounds: vec![1.0, 4.0],
+            },
+            GpuCrownResult {
+                lower_bounds: vec![0.0, f32::NEG_INFINITY],
+                upper_bounds: vec![1.0, 2.0],
+            },
+        ] {
+            assert!(resnet_gpu_result_to_bounds(dispatch, 2, malformed)
+                .expect("malformed backend output must fail closed")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn deadline_single_row_dispatch_neither_reads_nor_charges_ordinary_budget() {
+        let ordinary_elapsed = AtomicU64::new(29_999_999);
+        let dispatch = ResnetGpuDispatch::DeadlineBoundedSingleRow(Instant::now());
+
+        assert!(
+            resnet_gpu_dispatch_budget_allows_start_with(dispatch, &ordinary_elapsed, 0),
+            "ordinary budget disablement must not admit or refuse the private-deadline route"
+        );
+        assert_eq!(
+            account_resnet_gpu_elapsed_with(&ordinary_elapsed, dispatch, 10_000_000),
+            None,
+            "the private-deadline route must not expose an ordinary cumulative value"
+        );
+        assert_eq!(
+            ordinary_elapsed.load(Ordering::Relaxed),
+            29_999_999,
+            "the private-deadline route must leave ordinary accounting byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn ordinary_dispatch_budget_and_accounting_semantics_are_unchanged() {
+        let ordinary_elapsed = AtomicU64::new(29_999_999);
+        let dispatch = ResnetGpuDispatch::Ordinary;
+
+        assert!(
+            resnet_gpu_dispatch_budget_allows_start_with(dispatch, &ordinary_elapsed, 30_000),
+            "the historical floor-to-milliseconds check admits just below the ceiling"
+        );
+        assert!(
+            !resnet_gpu_dispatch_budget_allows_start_with(dispatch, &ordinary_elapsed, 0),
+            "a zero ordinary budget must continue to disable the ordinary route"
+        );
+        assert_eq!(
+            account_resnet_gpu_elapsed_with(&ordinary_elapsed, dispatch, 1),
+            Some(30_000_000),
+            "ordinary elapsed time must continue to return the updated cumulative value"
+        );
+        assert_eq!(ordinary_elapsed.load(Ordering::Relaxed), 30_000_000);
+        assert!(
+            !resnet_gpu_dispatch_budget_allows_start_with(dispatch, &ordinary_elapsed, 30_000),
+            "the ordinary route must continue to refuse starts at the exact ceiling"
+        );
+    }
+
+    #[test]
+    fn deadline_single_row_result_refuses_inverted_pair_without_publication() {
+        let dispatch = ResnetGpuDispatch::DeadlineBoundedSingleRow(Instant::now());
+        let malicious = GpuCrownResult {
+            lower_bounds: vec![5.0],
+            upper_bounds: vec![4.0],
+        };
+
+        assert!(
+            resnet_gpu_result_to_bounds(dispatch, 1, malicious)
+                .expect("malformed backend output must fail closed, not error outward")
+                .is_none(),
+            "strict candidate conversion must not repair and publish an inverted raw pair"
+        );
+    }
+
+    #[test]
+    fn deadline_single_row_result_refuses_non_finite_pairs_without_publication() {
+        let dispatch = ResnetGpuDispatch::DeadlineBoundedSingleRow(Instant::now());
+        for (lower, upper) in [
+            (f32::NAN, 1.0),
+            (0.0, f32::NAN),
+            (f32::NEG_INFINITY, 1.0),
+            (0.0, f32::INFINITY),
+        ] {
+            let malicious = GpuCrownResult {
+                lower_bounds: vec![lower],
+                upper_bounds: vec![upper],
+            };
+            assert!(
+                resnet_gpu_result_to_bounds(dispatch, 1, malicious)
+                    .expect("malformed backend output must fail closed, not error outward")
+                    .is_none(),
+                "strict candidate conversion published non-finite pair [{lower}, {upper}]"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_single_row_result_refuses_wrong_shape_without_publication() {
+        let dispatch = ResnetGpuDispatch::DeadlineBoundedSingleRow(Instant::now());
+        for malicious in [
+            GpuCrownResult {
+                lower_bounds: vec![],
+                upper_bounds: vec![1.0],
+            },
+            GpuCrownResult {
+                lower_bounds: vec![0.0],
+                upper_bounds: vec![1.0, 2.0],
+            },
+            GpuCrownResult {
+                lower_bounds: vec![0.0, 1.0],
+                upper_bounds: vec![1.0, 2.0],
+            },
+        ] {
+            assert!(
+                resnet_gpu_result_to_bounds(dispatch, 1, malicious)
+                    .expect("malformed backend output must fail closed, not error outward")
+                    .is_none(),
+                "strict candidate conversion must not publish a non-scalar raw result"
+            );
+        }
+    }
+
+    #[test]
+    fn result_conversion_rejects_malformed_payloads_for_every_dispatch() {
+        let valid = GpuCrownResult {
+            lower_bounds: vec![-0.25],
+            upper_bounds: vec![1.0],
+        };
+        let strict = resnet_gpu_result_to_bounds(
+            ResnetGpuDispatch::DeadlineBoundedSingleRow(Instant::now()),
+            1,
+            valid,
+        )
+        .expect("valid strict result")
+        .expect("valid strict result must publish");
+        assert_eq!(strict.lower()[[0]], -0.25);
+        assert_eq!(strict.upper()[[0]], 1.0);
+
+        let ordinary_refusal = resnet_gpu_result_to_bounds(
+            ResnetGpuDispatch::Ordinary,
+            1,
+            GpuCrownResult {
+                lower_bounds: vec![5.0],
+                upper_bounds: vec![4.0],
+            },
+        )
+        .expect("ordinary malformed conversion must fail closed");
+        assert!(
+            ordinary_refusal.is_none(),
+            "ordinary GPU refusal must preserve the caller's CPU fallback"
+        );
     }
 
     #[test]

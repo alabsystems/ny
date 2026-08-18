@@ -58,6 +58,33 @@ pub(in crate::beta_crown::engine) fn select_graph_kfsb_eval_candidates(
     eval_candidates
 }
 
+/// Select at most `total` unique candidates from the main BaBSR ranking.
+///
+/// Unlike [`select_graph_kfsb_eval_candidates`], this helper is a TOTAL cap,
+/// not a per-channel cap: backup scores never double the requested portfolio.
+/// The input must be sorted by main score descending. Non-finite main scores
+/// are excluded so a full requested portfolio is also a completeness signal
+/// for callers that require exactly `total` candidates.
+pub(in crate::beta_crown::engine) fn select_graph_kfsb_eval_candidates_exact_total(
+    scored: &[GraphKfsbCandidate],
+    total: usize,
+) -> Vec<GraphKfsbCandidate> {
+    let mut selected = Vec::with_capacity(total.min(scored.len()));
+    let mut seen = HashSet::new();
+    for candidate in scored {
+        if selected.len() == total {
+            break;
+        }
+        if !candidate.main_score.is_finite() {
+            continue;
+        }
+        if seen.insert((candidate.node_name.clone(), candidate.neuron_idx)) {
+            selected.push(candidate.clone());
+        }
+    }
+    selected
+}
+
 /// Fold the two child bound values into the kFSB candidate score, honoring the
 /// configured reduce op (α,β-CROWN's `branching:reduceop` parity knob — `Min`
 /// is the classic conservative choice; `Max` rewards ONE-SIDED verifiers,
@@ -80,7 +107,10 @@ pub(in crate::beta_crown::engine) fn kfsb_reduce(
 
 #[cfg(test)]
 mod tests {
-    use super::{select_graph_kfsb_eval_candidates, GraphKfsbCandidate};
+    use super::{
+        select_graph_kfsb_eval_candidates, select_graph_kfsb_eval_candidates_exact_total,
+        GraphKfsbCandidate,
+    };
 
     /// A pool of `n` candidates whose main scores STRICTLY decrease (rank 0
     /// highest, all distinct) and sorted by main score descending — the input
@@ -141,5 +171,61 @@ mod tests {
         let small = descending_pool(3);
         assert_eq!(select_graph_kfsb_eval_candidates(&small, 3, true).len(), 3);
         assert_eq!(select_graph_kfsb_eval_candidates(&small, 7, true).len(), 3);
+    }
+
+    #[test]
+    fn depth_two_portfolio_is_one_exact_total_cap_not_a_channel_union() {
+        let mut pool = descending_pool(30);
+        // Reverse the backup ordering so the legacy top-15 union contains all
+        // 30 candidates. The lookahead selector must still return exactly the
+        // 15 main-BaBSR candidates.
+        for (index, candidate) in pool.iter_mut().enumerate() {
+            candidate.backup_score = -(index as f32);
+        }
+        assert_eq!(select_graph_kfsb_eval_candidates(&pool, 15, true).len(), 30);
+
+        let selected = select_graph_kfsb_eval_candidates_exact_total(&pool, 15);
+        assert_eq!(selected.len(), 15);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.neuron_idx)
+                .collect::<Vec<_>>(),
+            (0..15).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn depth_two_portfolio_deduplicates_and_rejects_nonfinite_main_scores() {
+        let pool = vec![
+            GraphKfsbCandidate {
+                node_name: "relu".to_string(),
+                neuron_idx: 0,
+                main_score: 3.0,
+                backup_score: 0.0,
+            },
+            GraphKfsbCandidate {
+                node_name: "relu".to_string(),
+                neuron_idx: 0,
+                main_score: 2.0,
+                backup_score: 1.0,
+            },
+            GraphKfsbCandidate {
+                node_name: "relu".to_string(),
+                neuron_idx: 1,
+                main_score: f32::NAN,
+                backup_score: 2.0,
+            },
+            GraphKfsbCandidate {
+                node_name: "relu".to_string(),
+                neuron_idx: 2,
+                main_score: 1.0,
+                backup_score: 3.0,
+            },
+        ];
+        let selected = select_graph_kfsb_eval_candidates_exact_total(&pool, 15);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].neuron_idx, 0);
+        assert_eq!(selected[1].neuron_idx, 2);
     }
 }

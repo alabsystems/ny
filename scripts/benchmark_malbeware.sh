@@ -53,9 +53,9 @@ mkdir -p "$REPORT_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 REPORT="$REPORT_DIR/malbeware_${FILTER}_${TIMESTAMP}.csv"
 TMPOUT=$(mktemp)
-trap "rm -f $TMPOUT" EXIT
+trap 'rm -f "$TMPOUT"' EXIT
 
-echo "model,property,timeout,result,elapsed" > "$REPORT"
+echo "model,property,timeout,result,elapsed,exit_code" > "$REPORT"
 
 FILTERED_INDEX=0
 TOTAL=0
@@ -96,16 +96,36 @@ while IFS=',' read -r onnx vnnlib timeout; do
     START_TIME=$(python3 -c "import time; print(time.time())")
 
     # Write output to temp file to avoid pipe buffer issues with large outputs
-    "$NY_BIN" beta-crown "$ONNX_PATH" \
-        --property "$VNNLIB_PATH" \
-        --preset "$PRESET" \
-        --timeout "$timeout" > "$TMPOUT" 2>&1 || true
+    NY_STATUS=0
+    if "$NY_BIN" beta-crown "$ONNX_PATH" \
+            --property "$VNNLIB_PATH" \
+            --preset "$PRESET" \
+            --timeout "$timeout" > "$TMPOUT" 2>&1
+    then
+        NY_STATUS=0
+    else
+        NY_STATUS=$?
+    fi
 
     END_TIME=$(python3 -c "import time; print(time.time())")
     ELAPSED=$(python3 -c "print(f'{$END_TIME - $START_TIME:.2f}')")
 
-    # Parse result from temp file
+    # The verifier uses 0=verified, 1=violated, 2=unknown, 3=timeout. Require
+    # the rendered verdict and exit code to agree; crashes and contradictory
+    # output are benchmark errors rather than silently accepted outcomes.
+    PARSED_RESULT="error"
     if grep -q "Status: VERIFIED" "$TMPOUT"; then
+        PARSED_RESULT="verified"
+    elif grep -q "Status: VIOLATED" "$TMPOUT"; then
+        PARSED_RESULT="violated"
+    elif grep -q "Status: UNKNOWN" "$TMPOUT"; then
+        PARSED_RESULT="unknown"
+    elif grep -Eq "Status: TIMEOUT|Timed out" "$TMPOUT"; then
+        PARSED_RESULT="timeout"
+    fi
+
+    case "$NY_STATUS:$PARSED_RESULT" in
+    0:verified)
         if python3 -c "exit(0 if float('$ELAPSED') <= float('$timeout') else 1)"; then
             RESULT="verified"
             VERIFIED=$((VERIFIED + 1))
@@ -113,24 +133,29 @@ while IFS=',' read -r onnx vnnlib timeout; do
             RESULT="timeout"
             UNKNOWN=$((UNKNOWN + 1))
         fi
-    elif grep -q "Status: VIOLATED" "$TMPOUT"; then
+        ;;
+    1:violated)
         RESULT="violated"
         VIOLATED=$((VIOLATED + 1))
-    elif grep -q "Status: UNKNOWN" "$TMPOUT"; then
+        ;;
+    2:unknown)
         RESULT="unknown"
         UNKNOWN=$((UNKNOWN + 1))
-    elif grep -q "Timed out" "$TMPOUT"; then
+        ;;
+    3:timeout)
         RESULT="timeout"
         UNKNOWN=$((UNKNOWN + 1))
-    else
+        ;;
+    *)
         RESULT="error"
         ERROR=$((ERROR + 1))
         echo ""
-        echo "  DEBUG: $(tail -5 "$TMPOUT")"
-    fi
+        echo "  DEBUG: ny exit=$NY_STATUS parsed=$PARSED_RESULT: $(tail -5 "$TMPOUT")"
+        ;;
+    esac
 
     echo "$RESULT (${ELAPSED}s)"
-    echo "$(basename "$onnx"),$(basename "$vnnlib"),${timeout},${RESULT},${ELAPSED}" >> "$REPORT"
+    echo "$(basename "$onnx"),$(basename "$vnnlib"),${timeout},${RESULT},${ELAPSED},${NY_STATUS}" >> "$REPORT"
 
 done < "$BENCH_DIR/instances.csv"
 
@@ -146,3 +171,7 @@ echo "Error: $ERROR"
 echo "Score: $((VERIFIED + VIOLATED))/$TOTAL"
 echo ""
 echo "Report: $REPORT"
+
+if [[ "$ERROR" -gt 0 ]]; then
+    exit 1
+fi

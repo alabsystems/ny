@@ -21,10 +21,7 @@ mod multi_relu_cut;
 mod multi_relu_cut_gen;
 mod types;
 
-pub use cut_fold::{
-    clear_cut_fold, cut_fold_applied_count, fold_lower_side, reset_cut_fold_applied_count,
-    set_cut_fold, CutFoldEntry, CutFoldScope,
-};
+pub use cut_fold::CutFoldScope;
 pub use cut_pool::CutPool;
 pub use cutting_plane::{CuttingPlane, StrengthenedCut};
 pub use graph_cut_pool::GraphCutPool;

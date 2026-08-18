@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ny"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python bindings for ny neural network verification"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -47,7 +47,9 @@ ny = "ny_pytest.plugin"
 # This allows cargo test to work without the feature enabled.
 features = ["extension-module", "ort", "wgpu", "pytorch", "gguf", "coreml"]
 module-name = "ny"
-include = ["ny.pyi", "py.typed", "ny_pytest/**/*.py"]
+include = ["ny.pyi", "py.typed"]
+python-packages = ["ny_pytest"]
+exclude = ["ny_pytest/**/__pycache__/**", "ny_pytest/**/*.pyc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "ny_pytest/tests"]

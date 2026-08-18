@@ -29,6 +29,9 @@ attack:
 
 bab:
   batch_size: 64
+  phase_budget:
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false
   branching:
     method: input
     candidates: 10

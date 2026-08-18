@@ -116,21 +116,21 @@ fn measure_at_eps(
         .expect("invariant: IBP succeeds on valid bilinear graph");
     let ibp_max = max_bound_width(&ibp_bounds);
 
-    let crown_max = match graph.propagate_crown_batched(&input) {
-        Ok(b) => {
-            assert_valid_bounds(&b, "CROWN", eps);
-            max_bound_width(&b)
-        }
-        Err(_) => f32::NAN,
-    };
+    let crown = graph
+        .propagate_crown_batched(&input)
+        .unwrap_or_else(|error| {
+            panic!("CROWN must cover the bilinear fixture at eps={eps}: {error}")
+        });
+    assert_valid_bounds(&crown, "CROWN", eps);
+    let crown_max = max_bound_width(&crown);
 
-    let alpha_max = match graph.alpha_crown_batched_optimize(&input, alpha_config, None) {
-        Ok(r) => {
-            assert_valid_bounds(&r.bounds, "alpha-CROWN", eps);
-            max_bound_width(&r.bounds)
-        }
-        Err(_) => f32::NAN,
-    };
+    let alpha = graph
+        .alpha_crown_batched_optimize(&input, alpha_config, None)
+        .unwrap_or_else(|error| {
+            panic!("alpha-CROWN must cover the bilinear fixture at eps={eps}: {error}")
+        });
+    assert_valid_bounds(&alpha.bounds, "alpha-CROWN", eps);
+    let alpha_max = max_bound_width(&alpha.bounds);
 
     EpsMeasurement {
         eps,
@@ -157,6 +157,26 @@ fn format_measurements(label: &str, results: &[EpsMeasurement]) -> String {
         );
     }
     out
+}
+
+fn assert_measurements_exercised(label: &str, results: &[EpsMeasurement]) {
+    assert_eq!(
+        results.len(),
+        EPS_VALUES.len(),
+        "{label}: incomplete eps corpus"
+    );
+    for result in results {
+        assert!(
+            [result.ibp_max, result.crown_max, result.alpha_max]
+                .into_iter()
+                .all(|width| width.is_finite() && width >= 0.0),
+            "{label}: every method must publish a finite nonnegative width at eps={}: ibp={} crown={} alpha={}",
+            result.eps,
+            result.ibp_max,
+            result.crown_max,
+            result.alpha_max
+        );
+    }
 }
 
 fn default_alpha_config(iterations: usize) -> AlphaCrownConfig {
@@ -194,6 +214,7 @@ fn test_phase3_mccormick_vs_ibp_2x2() {
         .iter()
         .map(|&e| measure_at_eps(&graph_id, &center, e, &config))
         .collect();
+    assert_measurements_exercised("2x2 Identity", &id_results);
     eprint!("{}", format_measurements("2x2 Identity", &id_results));
 
     // Asymmetric weights (partially decorrelated Q/K)
@@ -208,6 +229,7 @@ fn test_phase3_mccormick_vs_ibp_2x2() {
         .iter()
         .map(|&e| measure_at_eps(&graph_asym, &center, e, &config))
         .collect();
+    assert_measurements_exercised("2x2 Asymmetric", &asym_results);
     eprint!("{}", format_measurements("2x2 Asymmetric", &asym_results));
 }
 
@@ -245,6 +267,7 @@ fn test_phase3_mccormick_vs_ibp_4x4() {
         .iter()
         .map(|&e| measure_at_eps(&graph, &center, e, &config))
         .collect();
+    assert_measurements_exercised("4x4 Asymmetric", &results);
     let report = format_measurements("4x4 Asymmetric", &results);
     let crown_tighter = results.iter().any(|r| r.crown_max < r.ibp_max * 0.999);
     eprint!("{}  decision: crown_tighter={crown_tighter}", report);

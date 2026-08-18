@@ -15,19 +15,48 @@ workspace = true
 name = "ny"
 path = "src/main.rs"
 
+[[example]]
+name = "cz-metaroom-qualification"
+path = "examples/cz_metaroom_qualification.rs"
+required-features = ["mip"]
+test = false
+
+[[example]]
+name = "cz-cgan-sequential-probe"
+path = "examples/cz_cgan_sequential_probe.rs"
+required-features = ["mip"]
+test = false
+
+[[example]]
+name = "cz-cgan-protected-cover-probe"
+path = "examples/cz_cgan_protected_cover_probe.rs"
+required-features = ["mip"]
+test = false
+
 [features]
 default = ["pytorch", "coreml", "gguf"]
 pytorch = ["ny-onnx/pytorch"]
 coreml = ["ny-onnx/coreml"]
 gguf = ["ny-onnx/gguf"]
 mip = ["ny-mip", "dep:num-rational", "dep:num-traits"]
-# Native CUDA / cuBLAS acceleration for the sound f64 CROWN backward (NVIDIA
-# datacenter GPUs, e.g. GB10). When built with this feature and a CUDA device is
-# present, the sound f64 A·W GEMMs run on cuBLAS Dgemm — a SOUND, ~18–34x faster
-# verdict path (works even under the sound_gpu_gate). Opt-in: needs CUDA + driver.
+# Native CUDA / cuBLAS acceleration for NVIDIA GPUs. Sound f64 CROWN GEMMs,
+# IEEE f32 seams, and proposal-only fast-f32 traffic share one qualified engine;
+# topology and precision determine whether a lane is actually faster. Runtime
+# use requires a CUDA driver and cuBLAS. Live memory capabilities automatically
+# select direct host-page-table, managed, or cached explicit-copy transport;
+# NY_CUDA_GEMM_TRANSPORT supplies exact A/B overrides.
 cuda = ["dep:ny-cuda"]
 # Enable tests that require external models (whisper, kokoro, gemma)
 external-models = []
+# Real VNN-COMP corpus conformance. The default suite uses generated/tracked
+# hermetic fixtures; this explicit lane hard-fails if the downloaded corpus is
+# incomplete instead of reporting ignored tests. See EXTERNAL_CONFORMANCE.md.
+external-vnncomp = []
+# Nonlinear-SMT CLI conformance through the exact revision-pinned `ay` binary.
+external-ay = []
+# Native AArch64 toolchain/cpu-feature integration that cannot be emulated by a
+# host-target unit test.
+native-arm-conformance = []
 
 [dependencies]
 mimalloc = "0.1"
@@ -42,7 +71,25 @@ ny-cuda = { path = "../ny-cuda", optional = true }
 ny-cert = { path = "../ny-cert" }
 ny-api = { path = "../ny-api", features = ["cert"] }
 ny-groundtruth = { path = "../ny-groundtruth" }
+ny-levers = { path = "../ny-levers" }
 ny-mip = { path = "../ny-mip", optional = true }
+# In-process CDCL SAT backend for the sat_relu CNF-recovery route
+# (`commands/beta_crown/cnf_route.rs`). Rev-pinned to the SAME ay commit
+# `crates/ny-mip/Cargo.toml` pins for ay-milp, so one git checkout serves both
+# and the two can never drift apart.
+#
+# This makes the SAT backend part of the default CLI build. Builds with the
+# optional `mip` feature already include ay-sat transitively
+# (ay-milp -> ay-dpll -> ay-sat), and both paths share the same git checkout.
+# `default-features = false` mirrors ay's own workspace pin so the `jit`
+# default feature (ay-jit) stays out of the build.
+#
+# `unsat-cert` adds ONE leaf module (ay-sat's lib.rs gates nothing else on it,
+# and it pulls zero extra crates). It supplies `prove_cnf_unsat_dimacs` +
+# `ResolutionDag::validate` — the in-memory refutation certificate and its
+# independent RUP replay that the UNSAT direction is required to pass before
+# any `Verified` verdict is emitted.
+ay-sat = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60", default-features = false, features = ["unsat-cert"] }
 # Exact rational arithmetic for the graph-MIP pinned-column fold (inc5c) —
 # the same exact seam ny-mip already uses (`num_rational::BigRational`).
 num-rational = { workspace = true, optional = true }
@@ -56,16 +103,38 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 prost.workspace = true
+serde_ignored.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+# `_exit(2)` for the scored `ny vnncomp` exit path (#attack-steering-segv):
+# ending a completed instance without running libc `atexit` handlers or ELF
+# fini sections is what keeps process teardown from racing detached driver
+# threads. Already in the dependency graph transitively; declared here because
+# `commands::vnncomp` calls it directly.
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ndarray = { workspace = true, features = ["blas"] }
 blas-src.workspace = true
 
+# Apple Accelerate (vecLib BLAS) GEMM engine. Built on every Apple-silicon host;
+# DEFAULT OFF at runtime (needs `NY_ACCELERATE_F64=1` / `NY_ACCELERATE_F32=1`),
+# so merely linking it changes nothing. Isolated crate because it holds the only
+# `unsafe` FFI of the CPU stack, exactly like `ny-cuda`.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ny-accelerate = { path = "../ny-accelerate" }
+
 [dev-dependencies]
 ny-test-utils = { path = "../ny-test-utils" }
+# #flush-charge Lane B: the metaroom charged wall-clock acceptance test needs
+# the TEST-SCOPED charged constructor, which ny-gpu compiles only under its
+# `gpu-tests` feature (never enabled by any production dependency edge; this
+# dev-only edge affects `cargo test -p ny-cli` builds exclusively).
+ny-gpu = { path = "../ny-gpu", features = ["gpu-tests"] }
 rand.workspace = true
 flate2 = "1.0"
 prost.workspace = true

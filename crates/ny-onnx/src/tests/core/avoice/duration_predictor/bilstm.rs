@@ -2,30 +2,26 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::common;
-use super::proof_head::{
-    assert_positive_expected_durations, assert_production_duration_counts, avg_bound_width,
-    kokoro_duration_count_bounds_from_logits, kokoro_expected_duration_bounds_from_logits,
-    KOKORO_DEFAULT_SPEED, KOKORO_DURATION_BUCKETS,
-};
+use super::proof_head::{avg_bound_width, KOKORO_DURATION_BUCKETS};
 use super::*;
 use crate::onnx_proto::{
     self, AttributeProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorProto,
     TensorShapeProto, TensorTypeProto, TypeProto, ValueInfoProto,
 };
-use ndarray::{ArrayD, IxDyn};
 use ny_propagate::types::BoundsProvenance;
 use prost::Message;
 
 // ---------------------------------------------------------------------------
-// BiLSTM integration pipeline (ONNX BiLSTM → unrolling → graph → IBP →
-// external proof head → positive expected durations / production duration counts)
+// BiLSTM full-sequence admission regression.
 //
-// This tests the exact pipeline the real Kokoro duration predictor will use:
+// This models the path the real Kokoro duration predictor wants to use:
 // - ONNX LSTM node with num_directions=2 (BiLSTM)
 // - Y output (full sequence, all timesteps)
 // - Linear projection to 50-bucket logits
-// - External sigmoid+sum proof head (NOT in the ONNX model)
+//
+// Raw ONNX Y is four-dimensional. The old lowering substituted a three-
+// dimensional convenience layout under the same name; these tests require
+// model admission to stop until the exact representation is implemented.
 //
 // Sources:
 // - ./avoice/scripts/export_kokoro_onnx.py (DurationWrapper)
@@ -78,19 +74,19 @@ fn make_bilstm_onnx_node(hidden_size: i64) -> NodeProto {
             AttributeProto {
                 name: "hidden_size".to_string(),
                 r#type: onnx_proto::attribute_proto::AttributeType::Int as i32,
-                i: hidden_size,
+                i: Some(hidden_size),
                 ..Default::default()
             },
             AttributeProto {
                 name: "direction".to_string(),
                 r#type: onnx_proto::attribute_proto::AttributeType::String as i32,
-                s: b"bidirectional".to_vec(),
+                s: Some(b"bidirectional".to_vec()),
                 ..Default::default()
             },
             AttributeProto {
                 name: "layout".to_string(),
                 r#type: onnx_proto::attribute_proto::AttributeType::Int as i32,
-                i: 1,
+                i: Some(1),
                 ..Default::default()
             },
         ],
@@ -105,14 +101,8 @@ fn test_weights(count: i64, modulus: i64, offset: f32, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Build a BiLSTM model that outputs LOGITS (not expected durations).
-///
-/// Architecture matches the real Kokoro DurationWrapper:
-///   encoded_features [1, T, input_size] → BiLSTM → Y [1, T, 2*H]
-///   → MatMul(W_proj [2*H, 50]) → duration_logits [1, T, 50]
-///
-/// The post-logit interval head is applied externally so tests can check both
-/// the raw expected-duration property and the production count surface.
+/// Build the legacy BiLSTM logits fixture. Its projection assumes the old 3-D
+/// substitution for Y, so it is useful only as a fail-closed admission test.
 fn build_bilstm_logits_model_bytes(seq: i64, input_size: i64, hidden_size: i64) -> Vec<u8> {
     let num_dir = 2_i64;
     let proj_dim = num_dir * hidden_size;
@@ -178,128 +168,22 @@ fn build_bilstm_logits_model_bytes(seq: i64, input_size: i64, hidden_size: i64) 
     .encode_to_vec()
 }
 
-fn log_bilstm_duration_predictor_results(
-    seq: i64,
-    input_size: i64,
-    hidden_size: i64,
-    logits: &BoundedTensor,
-    expected_durations: &BoundedTensor,
-    duration_counts: &BoundedTensor,
-) {
-    eprintln!("--- BiLSTM duration predictor integration results ---");
-    eprintln!("  seq_len: {seq}, input_size: {input_size}, hidden_size: {hidden_size}");
-    eprintln!("  logit shape: {:?}", logits.lower().shape());
-    eprintln!(
-        "  expected-duration shape: {:?}",
-        expected_durations.lower().shape()
-    );
-    eprintln!(
-        "  avg expected-duration width: {:.6}",
-        avg_bound_width(expected_durations)
-    );
-    eprintln!(
-        "  avg production-count width: {:.6}",
-        avg_bound_width(duration_counts)
-    );
-    for (t, (&lo, &hi)) in expected_durations
-        .lower()
-        .iter()
-        .zip(expected_durations.upper().iter())
-        .enumerate()
-    {
-        eprintln!(
-            "  expected duration timestep {t}: [{lo:.4}, {hi:.4}] (width: {:.4})",
-            hi - lo
-        );
-    }
-    for (t, (&lo, &hi)) in duration_counts
-        .lower()
-        .iter()
-        .zip(duration_counts.upper().iter())
-        .enumerate()
-    {
-        eprintln!(
-            "  production count timestep {t}: [{lo:.4}, {hi:.4}] (width: {:.4})",
-            hi - lo
-        );
-    }
+fn assert_bilstm_sequence_output_rejected(name: &str, bytes: &[u8]) {
+    let config = crate::OnnxLoadConfig::default()
+        .with_shape_inference_policy(crate::ShapeInferencePolicy::Skip);
+    let error = crate::load_onnx_bytes_with_config(name, bytes, &config)
+        .expect_err("bidirectional sequence output must fail closed");
+    assert!(error.to_string().contains("LSTM"), "{error}");
 }
 
-/// End-to-end: BiLSTM ONNX → LSTM unrolling → graph → IBP → external proof head
-/// → positive expected durations / production duration counts at every timestep.
-///
-/// This is the integration test for the exact pipeline the real Kokoro duration
-/// predictor will use. The model outputs logits [1, T, 50], and the proof head
-/// is applied externally:
-/// - `kokoro_expected_duration_bounds_from_logits` for the non-vacuous research
-///   property
-/// - `kokoro_duration_count_bounds_from_logits(..., 1.0)` for the production
-///   `duration_to_counts` surface
-///
-/// Sources:
-/// - ./avoice/scripts/export_kokoro_onnx.py (DurationWrapper arch)
-/// - designs/2026-03-11-avoice-phase1-onnx-execution.md (section 4)
+/// The former end-to-end proof used a three-dimensional substitute for ONNX's
+/// four-dimensional bidirectional Y. It must stop at model admission until the
+/// exact layout is implemented.
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
-fn test_bilstm_duration_predictor_logits_to_positive_expected_duration_3497() {
-    let seq = 4_i64;
-    let input_size = 8_i64;
-    let hidden_size = 4_i64;
-
-    let bytes = build_bilstm_logits_model_bytes(seq, input_size, hidden_size);
-    let model = crate::loader::load_onnx_bytes("bilstm_dur_logits", &bytes)
-        .expect("BiLSTM duration logits model should load after LSTM unrolling");
-
-    // Verify the ONNX loader correctly unrolled the BiLSTM
-    assert_eq!(model.network.inputs.len(), 1, "single activation input");
-    let input_spec = common::input_spec_by_name(&model, "encoded_features");
-    assert_eq!(
-        input_spec.shape.len(),
-        3,
-        "encoded_features should be 3D [B, T, D]"
-    );
-
-    let graph = model
-        .to_graph_network()
-        .expect("BiLSTM duration predictor should convert to graph");
-
-    // Run IBP to get logit bounds
-    let center = ArrayD::zeros(IxDyn(&[seq as usize, input_size as usize]));
-    let input = BoundedTensor::from_epsilon(center, 1e-3).expect("valid epsilon ball");
-    let logits = graph
-        .propagate_ibp(&input)
-        .expect("IBP should succeed on BiLSTM graph");
-
-    common::assert_finite_and_ordered(&logits, "BiLSTM duration predictor logit bounds");
-    assert_eq!(
-        logits.lower().shape().last().copied(),
-        Some(KOKORO_DURATION_BUCKETS),
-        "logit output should have {KOKORO_DURATION_BUCKETS} buckets, got shape {:?}",
-        logits.lower().shape()
-    );
-
-    // Check both the non-vacuous Bernoulli-sum property and the production
-    // avoice count surface.
-    let expected_durations = kokoro_expected_duration_bounds_from_logits(&logits);
-    assert_positive_expected_durations(&expected_durations);
-    let duration_counts = kokoro_duration_count_bounds_from_logits(&logits, KOKORO_DEFAULT_SPEED);
-    assert_production_duration_counts(&duration_counts);
-
-    // Every timestep must have a positive lower bound
-    assert_eq!(
-        expected_durations.lower().len(),
-        seq as usize,
-        "expected one duration per timestep"
-    );
-
-    log_bilstm_duration_predictor_results(
-        seq,
-        input_size,
-        hidden_size,
-        &logits,
-        &expected_durations,
-        &duration_counts,
-    );
+fn test_bilstm_duration_predictor_sequence_output_fails_closed_3497() {
+    let bytes = build_bilstm_logits_model_bytes(4, 8, 4);
+    assert_bilstm_sequence_output_rejected("bilstm_dur_logits", &bytes);
 }
 
 /// Log and assert CROWN-vs-IBP comparison: CROWN no looser per dimension.
@@ -350,93 +234,18 @@ pub(super) fn assert_crown_no_looser_than_ibp_durations(
     }
 }
 
-/// CROWN backward through the BiLSTM duration predictor → sigmoid+sum proof
-/// head → positive expected durations at every timestep.
-///
-/// The BiLSTM has nonlinear LSTM gates (sigmoid/tanh) where CROWN linear
-/// relaxation should provide tighter bounds than naive IBP.
-///
-/// Sources:
-/// - designs/2026-03-11-avoice-phase1-onnx-execution.md (section 4)
-/// - alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/abcrown.py (CROWN backward)
+/// The unauthenticated layout must not reach CROWN either.
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
-fn test_bilstm_duration_predictor_crown_positive_expected_duration_3497() {
-    let seq = 4_i64;
-    let input_size = 8_i64;
-    let hidden_size = 4_i64;
-
-    let bytes = build_bilstm_logits_model_bytes(seq, input_size, hidden_size);
-    let model = crate::loader::load_onnx_bytes("bilstm_dur_crown", &bytes)
-        .expect("BiLSTM duration predictor should load");
-    let graph = model
-        .to_graph_network()
-        .expect("BiLSTM duration predictor should convert to graph");
-
-    let center = ArrayD::zeros(IxDyn(&[seq as usize, input_size as usize]));
-    let input = BoundedTensor::from_epsilon(center, 1e-3).expect("valid epsilon ball");
-
-    let crown_result = graph
-        .propagate_crown_with_provenance(&input)
-        .expect("CROWN backward should succeed on BiLSTM graph");
-
-    common::assert_finite_and_ordered(&crown_result.bounds, "BiLSTM CROWN logit bounds");
-    assert_eq!(
-        crown_result.bounds.lower().shape().last().copied(),
-        Some(KOKORO_DURATION_BUCKETS),
-        "CROWN logit output should have {KOKORO_DURATION_BUCKETS} buckets"
-    );
-
-    let crown_durations = kokoro_expected_duration_bounds_from_logits(&crown_result.bounds);
-    assert_positive_expected_durations(&crown_durations);
-    let crown_counts =
-        kokoro_duration_count_bounds_from_logits(&crown_result.bounds, KOKORO_DEFAULT_SPEED);
-    assert_production_duration_counts(&crown_counts);
-
-    let ibp_logits = graph.propagate_ibp(&input).expect("IBP");
-    let ibp_durations = kokoro_expected_duration_bounds_from_logits(&ibp_logits);
-    assert_crown_no_looser_than_ibp_durations(
-        &crown_durations,
-        &ibp_durations,
-        &crown_result.provenance,
-        "BiLSTM",
-    );
+fn test_bilstm_duration_predictor_never_reaches_crown_3497() {
+    let bytes = build_bilstm_logits_model_bytes(4, 8, 4);
+    assert_bilstm_sequence_output_rejected("bilstm_dur_crown", &bytes);
 }
 
-/// BiLSTM duration predictor tighter bounds at smaller epsilon.
-///
-/// Validates that the BiLSTM pipeline preserves the fundamental property that
-/// tighter input regions yield tighter output bounds, same as the surrogate.
+/// Refusal does not depend on a verification epsilon.
 #[cfg_attr(not(debug_assertions), ntest::timeout(120000))]
 #[test]
-fn test_bilstm_duration_predictor_tighter_bounds_at_smaller_epsilon_3497() {
-    let seq = 4_i64;
-    let input_size = 8_i64;
-    let hidden_size = 4_i64;
-
-    let bytes = build_bilstm_logits_model_bytes(seq, input_size, hidden_size);
-    let model = crate::loader::load_onnx_bytes("bilstm_dur_eps", &bytes)
-        .expect("BiLSTM duration predictor should load");
-    let graph = model
-        .to_graph_network()
-        .expect("BiLSTM duration predictor should convert to graph");
-
-    let widths: Vec<f32> = [1e-2, 1e-4]
-        .iter()
-        .map(|&eps| {
-            let center = ArrayD::zeros(IxDyn(&[seq as usize, input_size as usize]));
-            let input = BoundedTensor::from_epsilon(center, eps).expect("valid epsilon");
-            let logits = graph.propagate_ibp(&input).expect("IBP");
-            let durations = kokoro_expected_duration_bounds_from_logits(&logits);
-            avg_bound_width(&durations)
-        })
-        .collect();
-
-    assert!(
-        widths[1] < widths[0],
-        "BiLSTM: smaller epsilon should yield tighter duration bounds: \
-         eps=1e-2 width={:.6}, eps=1e-4 width={:.6}",
-        widths[0],
-        widths[1]
-    );
+fn test_bilstm_duration_predictor_refusal_is_epsilon_independent_3497() {
+    let bytes = build_bilstm_logits_model_bytes(4, 8, 4);
+    assert_bilstm_sequence_output_rejected("bilstm_dur_eps", &bytes);
 }

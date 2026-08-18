@@ -14,7 +14,7 @@
 use anyhow::Result;
 use ny_core::LayerType;
 use ny_onnx::Network;
-use ny_propagate::BranchingHeuristic;
+use ny_propagate::{BetaCrownConfig, BranchingHeuristic};
 
 /// The eight base tokens accepted everywhere (including aliases).
 ///
@@ -255,6 +255,9 @@ pub(crate) struct ResolvedAutoBranching {
     pub(crate) reason: AutoBranchingReason,
     /// The input element count actually used for the decision.
     pub(crate) input_element_count: usize,
+    /// Enable aggregation-critical full kFSB for the high-dimensional
+    /// auto-selected lane. MIP fallback kFSB deliberately leaves this off.
+    pub(crate) use_multi_objective_critical_kfsb: bool,
 }
 
 /// Resolve `--branching auto` from a request plus the loaded model's structure.
@@ -285,13 +288,33 @@ pub(crate) fn resolve_auto_branching(
     // A resolved Kfsb heuristic implies ReLU splitting, which routes conv/DAG
     // models to the GRAPH engine. Mirrors explicit-kfsb behavior.
     let use_relu_split = matches!(heuristic, BranchingHeuristic::Kfsb);
+    let use_multi_objective_critical_kfsb = matches!(
+        (&heuristic, reason),
+        (
+            BranchingHeuristic::Kfsb,
+            AutoBranchingReason::HighDimOrManyRelu
+        )
+    );
     ResolvedAutoBranching {
         heuristic,
         use_relu_split,
         is_input_split,
         reason,
         input_element_count,
+        use_multi_objective_critical_kfsb,
     }
+}
+
+/// Stamp policy that is valid only after model-aware auto branching resolves.
+///
+/// Keeping this separate from reusable preset application prevents explicit
+/// kFSB, MIP-fallback, and unrelated presets from inheriting the costly full
+/// multi-objective scorer.
+pub(crate) fn apply_resolved_auto_branching_runtime_policy(
+    config: &mut BetaCrownConfig,
+    resolved: &ResolvedAutoBranching,
+) {
+    config.use_multi_objective_critical_kfsb = resolved.use_multi_objective_critical_kfsb;
 }
 
 /// Model-CLASS-aware auto-selection of the branching method.

@@ -44,7 +44,7 @@ def run_instance(
     prop: Path,
     timeout: int,
     method: str = "beta",
-    enable_cuts: bool = True,
+    enable_cuts: bool = False,
     branching: str = "width",
     pgd_attack: bool = False,
     pgd_restarts: int = 100,
@@ -177,7 +177,8 @@ BENCHMARK_PROFILES = {
         "branching": "width",
         "beta_iterations": 20,  # α,β-CROWN uses 20
         "lr_beta": 0.03,        # α,β-CROWN uses 0.03 for MNIST
-        "proactive_cuts": True, # Essential for 80% vs 40% verification rate
+        # Legacy proactive cuts are quarantined because they are not proof-derived.
+        "proactive_cuts": False,
     },
     "cifar10_resnet": {
         "branching": "relu",
@@ -216,7 +217,7 @@ def assess_benchmark(
     sample_size: int = 20,
     timeout: int = 30,
     method: str = "beta",
-    enable_cuts: bool = True,
+    enable_cuts: bool = False,
     pgd_mode: str = "auto",
     pgd_restarts: int = 100,
     use_tuned_params: bool = False,
@@ -366,7 +367,17 @@ def main():
     parser.add_argument("sample_size", nargs="?", type=int, default=10, help="Instances per benchmark to run")
     parser.add_argument("timeout", nargs="?", type=int, default=30, help="Timeout per instance (seconds)")
     parser.add_argument("--method", default="beta", help="Verification method (default: beta)")
-    parser.add_argument("--no-cuts", action="store_true", help="Disable GCP-CROWN cuts (beta-crown only)")
+    cuts_group = parser.add_mutually_exclusive_group()
+    cuts_group.add_argument(
+        "--enable-cuts",
+        action="store_true",
+        help="Request quarantined research cuts (verification will reject the request)",
+    )
+    cuts_group.add_argument(
+        "--no-cuts",
+        action="store_true",
+        help="Explicitly disable cuts (the default)",
+    )
     parser.add_argument(
         "--pgd",
         choices=["auto", "on", "off"],
@@ -415,7 +426,7 @@ def main():
         skipped_benchmarks = list(SKIP_DONE_BENCHMARKS)
         benchmarks = benchmarks[len(SKIP_DONE_BENCHMARKS):]
 
-    enable_cuts = not args.no_cuts
+    enable_cuts = args.enable_cuts and not args.no_cuts
     use_tuned_params = args.tuned
 
     print(f"VNN-COMP 2021 Assessment (sample={args.sample_size}, timeout={args.timeout}s)")

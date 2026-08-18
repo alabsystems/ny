@@ -8,8 +8,6 @@
 //! bind group layout setup for the three CROWN backward compute shaders:
 //! activation backward, linear bias accumulation, and concretization.
 
-use std::borrow::Cow;
-
 use super::shaders::{
     CROWN_ACTIVATION_BACKWARD_SHADER, CROWN_ACTIVATION_RELU_DUAL_ALPHA_BACKWARD_SHADER,
     CROWN_BIAS_ACCUMULATE_SHADER, CROWN_MAXPOOL2D_BACKWARD_SHADER,
@@ -19,11 +17,14 @@ use super::WgpuDevice;
 impl WgpuDevice {
     pub(super) fn create_crown_activation_backward_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("crown_activation_backward_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CROWN_ACTIVATION_BACKWARD_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "crown_activation_backward_shader",
+            CROWN_ACTIVATION_BACKWARD_SHADER,
+        );
 
         // Bind group layout: 8 bindings (was 11 before #3444 fix).
         // Slopes/intercepts packed into a single buffer (binding 3) to avoid
@@ -148,17 +149,19 @@ impl WgpuDevice {
     /// dual-alpha parity.
     pub(super) fn create_crown_activation_relu_dual_alpha_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> wgpu::ComputePipeline {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("crown_activation_relu_dual_alpha_backward_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                CROWN_ACTIVATION_RELU_DUAL_ALPHA_BACKWARD_SHADER,
-            )),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "crown_activation_relu_dual_alpha_backward_shader",
+            CROWN_ACTIVATION_RELU_DUAL_ALPHA_BACKWARD_SHADER,
+        );
 
         // Reuse the standard activation backward bind-group layout.
         // Both shaders use identical bindings: params, a_src×2, slopes, a_dst×2, bias×2.
-        let (_, bind_group_layout) = Self::create_crown_activation_backward_pipeline(device);
+        let (_, bind_group_layout) =
+            Self::create_crown_activation_backward_pipeline(device, denorm_preserve);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("crown_activation_relu_dual_alpha_pipeline_layout"),
@@ -178,11 +181,14 @@ impl WgpuDevice {
 
     pub(super) fn create_crown_bias_accumulate_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("crown_bias_accumulate_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CROWN_BIAS_ACCUMULATE_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "crown_bias_accumulate_shader",
+            CROWN_BIAS_ACCUMULATE_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("crown_bias_accumulate_bind_group_layout"),
@@ -276,11 +282,14 @@ impl WgpuDevice {
 
     pub(super) fn create_crown_maxpool2d_backward_pipeline(
         device: &wgpu::Device,
+        denorm_preserve: bool,
     ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("crown_maxpool2d_backward_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CROWN_MAXPOOL2D_BACKWARD_SHADER)),
-        });
+        let shader = crate::wgpu_device::shader_loading::create_compute_module(
+            device,
+            denorm_preserve,
+            "crown_maxpool2d_backward_shader",
+            CROWN_MAXPOOL2D_BACKWARD_SHADER,
+        );
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("crown_maxpool2d_backward_bind_group_layout"),

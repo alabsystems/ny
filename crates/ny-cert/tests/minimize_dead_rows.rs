@@ -6,58 +6,67 @@
 //! cheap): certificates carrying premise rows with multiplier exactly zero
 //! minimize to the same verdict — `check_entailment` / `check_farkas` return
 //! the IDENTICAL bounds/residual on the minimized cert — and the Alethe
-//! emission of the dead-row cert is smaller yet still validates via carcara
-//! (when a `carcara` binary is installed; skips honestly otherwise, mirroring
-//! `alethe_emit_carcara.rs`).
+//! emission of the dead-row cert is smaller. Those offline assertions run in
+//! the default suite. The live Carcara validation is an explicit
+//! `external-carcara` conformance lane and hard-requires a reachable checker.
 
+#[cfg(feature = "external-carcara")]
+use ny_cert::AletheEmission;
 use ny_cert::{
-    check_entailment, check_farkas, entailment_to_alethe, farkas_to_alethe, AletheEmission,
-    ConstraintKind, EntailmentCertificate, FarkasCertificate, LinearConstraint, Rat,
+    check_entailment, check_farkas, entailment_to_alethe, farkas_to_alethe, ConstraintKind,
+    EntailmentCertificate, FarkasCertificate, LinearConstraint, Rat,
 };
-use std::path::PathBuf;
+#[cfg(feature = "external-carcara")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "external-carcara")]
 use std::process::Command;
 
 fn r(n: i128, d: i128) -> Rat {
     Rat::new(n, d).unwrap()
 }
 
-/// Locate `carcara`: `$NY_CARCARA`, then `carcara` on `PATH`.
-fn locate_carcara() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NY_CARCARA") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg("command -v carcara")
+/// Select `$NY_CARCARA` when explicitly set; otherwise let `Command` resolve
+/// `carcara` on `PATH`.
+#[cfg(feature = "external-carcara")]
+fn selected_carcara() -> PathBuf {
+    std::env::var_os("NY_CARCARA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("carcara"))
+}
+
+#[cfg(feature = "external-carcara")]
+fn require_carcara() -> PathBuf {
+    let carcara = selected_carcara();
+    let output = Command::new(&carcara)
+        .arg("--version")
         .output()
-        .ok()?;
-    if out.status.success() {
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
+        .unwrap_or_else(|error| {
+            panic!(
+                "live Carcara test requires a checker at {} \
+                 (set NY_CARCARA or install carcara on PATH): {error}",
+                carcara.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "Carcara preflight failed at {} (status={}):\nstdout:\n{}\nstderr:\n{}",
+        carcara.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    carcara
 }
 
 /// Write the pair to a scratch dir and require carcara to report `valid`.
-fn assert_carcara_valid(em: &AletheEmission, name: &str) {
-    let carcara = match locate_carcara() {
-        Some(p) => p,
-        None => {
-            eprintln!("skipping carcara validation ({name}): no `carcara` binary (set NY_CARCARA or PATH)");
-            return;
-        }
-    };
+#[cfg(feature = "external-carcara")]
+fn assert_carcara_valid(carcara: &Path, em: &AletheEmission, name: &str) {
     let dir = tempfile::tempdir().expect("scratch dir");
     let problem = dir.path().join(format!("{name}.smt2"));
     let proof = dir.path().join(format!("{name}.alethe"));
     std::fs::write(&problem, &em.problem).expect("write problem");
     std::fs::write(&proof, &em.proof).expect("write proof");
-    let out = Command::new(&carcara)
+    let out = Command::new(carcara)
         .arg("check")
         .arg(&proof)
         .arg(&problem)
@@ -218,7 +227,7 @@ fn minimization_is_fail_closed_on_certs_that_do_not_check() {
 }
 
 #[test]
-fn alethe_emission_of_dead_row_certs_is_minimized_and_carcara_valid() {
+fn alethe_emission_of_dead_row_certs_is_minimized() {
     let cert = farkas_with_dead_rows();
     let em = farkas_to_alethe(&cert).expect("dead-row Farkas cert emits");
     // The dead rows' variable and atoms are gone from BOTH problem and proof:
@@ -230,9 +239,6 @@ fn alethe_emission_of_dead_row_certs_is_minimized_and_carcara_valid() {
     assert!(!em.proof.contains("wdead"));
     assert!(em.proof.contains("h1"));
     assert!(!em.proof.contains("h2"), "only the live rows are assumed");
-    // And the pair still refutes under carcara (when installed).
-    assert_carcara_valid(&em, "farkas_minimized");
-
     let ent = entailment_with_dead_rows();
     let em = entailment_to_alethe(&ent).expect("dead-row entailment emits");
     assert!(
@@ -246,5 +252,16 @@ fn alethe_emission_of_dead_row_certs_is_minimized_and_carcara_valid() {
         !em.proof.contains("h2"),
         "only live premise + negated conclusion"
     );
-    assert_carcara_valid(&em, "entailment_minimized");
+}
+
+#[test]
+#[cfg(feature = "external-carcara")]
+fn minimized_dead_row_alethe_is_carcara_valid() {
+    let carcara = require_carcara();
+    let farkas = farkas_to_alethe(&farkas_with_dead_rows()).expect("dead-row Farkas cert emits");
+    assert_carcara_valid(&carcara, &farkas, "farkas_minimized");
+
+    let entailment =
+        entailment_to_alethe(&entailment_with_dead_rows()).expect("dead-row entailment emits");
+    assert_carcara_valid(&carcara, &entailment, "entailment_minimized");
 }

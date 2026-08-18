@@ -186,3 +186,4 @@ for k, (a1v, a2v) in enumerate([(0.5,0.5),(0.3,0.7),(0.8,0.2),(0.5,0.9),(0.1,0.4
 print()
 print(f"WORST joint-vs-FD relative error across all points: {worst_joint:.3e}")
 print("PASS" if worst_joint < 1e-4 else "FAIL -- derivation error!")
+raise SystemExit(0 if worst_joint < 1e-4 else 1)

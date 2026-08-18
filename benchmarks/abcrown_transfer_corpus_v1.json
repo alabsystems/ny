@@ -45,6 +45,149 @@
       }
     },
     {
+      "id": "vnncomp2025-cifar100-row11",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "residual_dag",
+        "relu_split",
+        "cifar100",
+        "exact_c_diagnostic"
+      ],
+      "category": "cifar100_2024",
+      "source_index": 11,
+      "model": "onnx/CIFAR100_resnet_medium.onnx",
+      "property": "vnnlib/CIFAR100_resnet_medium_prop_idx_7704_sidx_3701_eps_0.0039.vnnlib",
+      "timeout_seconds": 100,
+      "preset": "configs/vnncomp25/cifar100_2024.yaml",
+      "source_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+      "source_commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+      "expected": {
+        "model_sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4",
+        "property_sha256": "c508645aecb7042aa37fa1c6c98088026438b2a3a5fd270e8c2eabd2998cf4db"
+      }
+    },
+    {
+      "id": "vnncomp2025-ml4acopf-row5",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "ml4acopf",
+        "graph_dag",
+        "invprop",
+        "disjunctive_singleton_clauses"
+      ],
+      "category": "ml4acopf_2024",
+      "source_index": 5,
+      "model": "onnx/14_ieee_ml4acopf-linear-residual.onnx",
+      "property": "vnnlib/14_ieee_prop4.vnnlib",
+      "timeout_seconds": 600,
+      "preset": "configs/vnncomp25/ml4acopf_2024.yaml",
+      "source_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+      "source_commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+      "expected": {
+        "model_sha256": "d6542b0a23f662490160780403a715f05b80a0e25aa7199cf6e6f2fbed558d11",
+        "property_sha256": "8ca24b5eaa3c7f43568db855e6bf3df17b6d5bae26d665b980fd10b7d5c13a7b"
+      }
+    },
+    {
+      "id": "vnncomp2025-ml4acopf-row52",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "ml4acopf",
+        "graph_dag",
+        "invprop",
+        "disjunctive_singleton_clauses"
+      ],
+      "category": "ml4acopf_2024",
+      "source_index": 52,
+      "model": "onnx/14_ieee_ml4acopf.onnx",
+      "property": "vnnlib/14_ieee_prop1.vnnlib",
+      "timeout_seconds": 600,
+      "preset": "configs/vnncomp25/ml4acopf_2024.yaml",
+      "source_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+      "source_commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+      "expected": {
+        "model_sha256": "70f97f64531637254bc7f0063e25a5ce7a9b67b5a01a707cb0c1392eda30c0ea",
+        "property_sha256": "3b26c03c4ef7312e9537c8c468038757137ca308e88edaf685be6f4514ffa3b6"
+      }
+    },
+    {
+      "id": "vnncomp2025-lsnc-row1-unsat-target",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "lsnc",
+        "grouped_disjunctive",
+        "input_split",
+        "fresh_domain_clip",
+        "unsat_target"
+      ],
+      "category": "lsnc_relu",
+      "source_index": 1,
+      "model": "onnx/relu_quadrotor2d_state.onnx",
+      "property": "vnnlib/quadrotor2d_state_0.vnnlib",
+      "timeout_seconds": 25,
+      "preset": "configs/vnncomp25/lsnc_relu.yaml",
+      "source_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+      "source_commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+      "expected": {
+        "model_sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af",
+        "property_sha256": "4729491af536b9f5eac11602fedc152e0eba1f0176096ad1cb33fbd261a9f215"
+      }
+    },
+    {
+      "id": "vnncomp2025-lsnc-row35-sat-sentinel",
+      "kind": "vnncomp",
+      "role": "sentinel",
+      "tags": [
+        "lsnc",
+        "grouped_disjunctive",
+        "input_split",
+        "fresh_domain_clip",
+        "known_counterexample"
+      ],
+      "category": "lsnc_relu",
+      "source_index": 35,
+      "model": "onnx/relu_quadrotor2d_state.onnx",
+      "property": "vnnlib/quadrotor2d_state_34.vnnlib",
+      "timeout_seconds": 25,
+      "preset": "configs/vnncomp25/lsnc_relu.yaml",
+      "source_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+      "source_commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+      "expected": {
+        "model_sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af",
+        "property_sha256": "1ef98bcf91309f1d58e69baca5eaf005b2743ab2108403509b6134bbd0413412",
+        "expected_result": "falsified"
+      }
+    },
+    {
+      "id": "vnncomp2025-lsnc-row46-sat-sentinel",
+      "kind": "vnncomp",
+      "role": "sentinel",
+      "tags": [
+        "lsnc",
+        "grouped_disjunctive",
+        "input_split",
+        "fresh_domain_clip",
+        "known_counterexample"
+      ],
+      "category": "lsnc_relu",
+      "source_index": 46,
+      "model": "onnx/relu_quadrotor2d_state.onnx",
+      "property": "vnnlib/quadrotor2d_state_45.vnnlib",
+      "timeout_seconds": 25,
+      "preset": "configs/vnncomp25/lsnc_relu.yaml",
+      "source_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+      "source_commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+      "expected": {
+        "model_sha256": "f5f9704f027ba5c7d45674c4a1407c8594f2d75c54f54f660ae872d91ff8c8af",
+        "property_sha256": "e5910ebebc27ce1542930fec085df4cdbc85dc178089870e7ba622fff6f973f9",
+        "expected_result": "falsified"
+      }
+    },
+    {
       "id": "tinyimagenet-medium-1126",
       "kind": "vnncomp",
       "role": "sentinel",
@@ -122,6 +265,29 @@
       "expected": {
         "model_sha256": "3a8b7a57cec0ca576ed873fe93734ce800a7b27a0b0fb707f95eb2c3db1497f0",
         "property_sha256": "9ed547db5dd45a300e6e5e8b62439ad6f0a2268c0b27f6e654f43faea00154a8"
+      }
+    },
+    {
+      "id": "cgan-nch1-prop1-backend-canary",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "cgan_backend_route",
+        "input_split",
+        "convtranspose",
+        "official_row_2"
+      ],
+      "category": "cgan_2023",
+      "source_index": 2,
+      "model": "onnx/cGAN_imgSz32_nCh_1.onnx",
+      "property": "vnnlib/cGAN_imgSz32_nCh_1_prop_1_input_eps_0.010_output_eps_0.015.vnnlib",
+      "timeout_seconds": 900,
+      "preset": "configs/vnncomp25/cgan_2023.yaml",
+      "source_repository": "https://github.com/VNN-COMP/vnncomp2025_benchmarks",
+      "source_commit": "8b7b811b78ce6a329dc96f04ae6652da3c245948",
+      "expected": {
+        "model_sha256": "3a8b7a57cec0ca576ed873fe93734ce800a7b27a0b0fb707f95eb2c3db1497f0",
+        "property_sha256": "1072a88791e6f8238acf59b071c62b0c08c81ba374b8a9539af94b5606027634"
       }
     },
     {

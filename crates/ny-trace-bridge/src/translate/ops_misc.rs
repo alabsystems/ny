@@ -9,22 +9,24 @@
 //! `MoeGating`.
 //!
 //! Ported from NN's `trace_to_graph_layerspec_dispatch_extended.rs` /
-//! `trace_to_graph_layerspec_decompose{,_scan}.rs` with the emissions kept
-//! byte-compatible (layer types, attribute names, sub-spec naming, decompose
-//! structure).
+//! `trace_to_graph_layerspec_decompose{,_scan}.rs`, retaining compatible
+//! emissions where they preserve semantics and failing closed where the legacy
+//! lowering or serialized data is insufficient.
 //!
-//! ## Implemented (mirrors NN's emission exactly)
+//! ## Implemented and audited behavior
 //!
 //! - `SwiGlu` → `SiLU(gate) * up` (SiLU + Mul).
 //! - `Powf` → exact primitives for exponents 0 / 0.5 / 1 / 2 / −1 / −0.5;
-//!   general case `Exp(n · Log(Abs(x)))` with a pre-Exp domain Clip(±88).
-//! - `Fract` → `x − floor(x)` (Floor + Neg + Add).
+//!   every other exponent is refused because the former
+//!   `Exp(n · Log(Abs(x)))` lowering lost the sign of negative bases.
+//! - `Fract` is refused: source semantics use truncation toward zero, while
+//!   the former `x − floor(x)` lowering was wrong for negative inputs.
 //! - `Atan2` → `LayerType::Atan2` binary spec.
 //! - `Cumsum` → N × Slice + (N−1) × Add + Concat; dims above the decompose cap
-//!   use NN's analytical bypass (`Clip(±1e30)` identity — sound for the
-//!   `cumsum → sin` harmonic-source pattern, see NN #2411).
+//!   are refused instead of receiving a semantics-changing identity shortcut.
 //! - `Flip` → N × Slice (reversed) + Concat.
-//! - `RepeatInterleave` → Reshape (unsqueeze) + Tile + Reshape (merge).
+//! - `RepeatInterleave` is refused because its serialized op omits the
+//!   per-element repeat counts needed to reconstruct source semantics.
 //! - `Arange` → constant weight tensor (data-independent, fixed at trace time).
 //! - `Triu` / `Tril` → `LayerType::Triu` / `Tril` with `diagonal` attribute.
 //! - `SliceSet` → up to 3 × Slice + Concat (before / src / after).
@@ -54,8 +56,8 @@
 //!   refused: NN's `m*x + (1-m)*y` decompose is unsound when a realizable
 //!   mask value is outside {0,1}.
 //!
-//! (`ToDtype` is NOT in scope: it is already implemented in `ops_core` as
-//! Clip-at-downcast / identity-at-upcast with cast counting. `Scatter`,
+//! (`ToDtype` is NOT in scope: `ops_core` fails closed because the trace omits
+//! its source dtype. `Scatter`,
 //! `Topk`, `Argmax`, `Argmin`, `ArgSort`, `Sort` are NOT in scope either:
 //! they stay in the dispatch's refused-forever arm.)
 
@@ -63,9 +65,9 @@ use std::collections::HashMap;
 
 use ndarray::{ArrayD, IxDyn};
 use ny_build::{AttributeValue, LayerSpec};
-use ny_core::{LayerType, NyError, Result};
+use ny_core::{checked_shape_product, LayerType, NyError, Result};
 
-use crate::schema::{CompareOp, DType, TraceNode, TraceOp};
+use crate::schema::{CompareOp, TraceNode, TraceOp};
 
 use super::{
     checked_f64_to_f32, dim_as_i64, first_input, insert_scalar_constant, op_name, ops_core,
@@ -78,6 +80,9 @@ use super::{
 // this constant is now the single source of truth — nn's
 // `HarmonicSourceBounds::MAX_DECOMPOSE_DIM` matches it.)
 const MAX_DECOMPOSE_DIM: usize = 2048;
+
+/// Match the loader's constant-folding resource limit for materialized ranges.
+const MAX_ARANGE_ELEMENTS: usize = 10_000_000;
 
 /// Translate a misc-family op (`SwiGlu`, `Powf`, `Fract`, `Atan2`, `Cumsum`, `Flip`, `Roll`, `RepeatInterleave`, `Arange`, `Triu`, `Tril`, `SliceSet`, `Unfold`, `IndexSelect`, `Gather`, `Compare`, `CompareTensor`, `WhereCond`, `ScatterAdd`, `IndexAdd`, `IndexPut`, `MoeGating`) node.
 ///
@@ -98,7 +103,9 @@ pub(super) fn translate_misc(
         TraceOp::Powf { exponent } => {
             translate_powf(name, *exponent, input_tensors, output_tensor, ctx)
         }
-        TraceOp::Fract => translate_fract(name, input_tensors, output_tensor),
+        TraceOp::Fract => Err(NyError::UnsupportedOp(
+            "Fract has no sound lowering for truncation-toward-zero semantics".to_string(),
+        )),
         TraceOp::Atan2 => translate_atan2(name, input_tensors, output_tensor),
         // Cumsum preserves rank: trailing-relative axis vs the output rank.
         // Mirrors NN's post-rework dispatch (nn d7144ea7).
@@ -119,9 +126,10 @@ pub(super) fn translate_misc(
             output_tensor,
             output_shape,
         ),
-        TraceOp::RepeatInterleave { dim } => {
-            translate_repeat_interleave(name, *dim, input_tensors, output_tensor, output_shape, ctx)
-        }
+        TraceOp::RepeatInterleave { .. } => Err(NyError::UnsupportedOp(
+            "RepeatInterleave cannot be lowered because per-element repeat counts are not serialized"
+                .to_string(),
+        )),
         TraceOp::Arange { start, end, step } => {
             translate_arange(name, *start, *end, *step, output_shape, output_tensor, ctx)
         }
@@ -251,19 +259,16 @@ fn translate_swiglu(
     })
 }
 
-/// Translate `TraceOp::Powf` with extended exponent support.
+/// Translate only independently sound `TraceOp::Powf` special cases.
 ///
 /// Special cases map to exact primitives (mirrors NN's `translate_powf`,
 /// #3557):
 ///   - 0 → Clip\[1,1\] (constant 1.0)
 ///   - 0.5 → Sqrt
-///   - 1.0 → identity (ToDtype F32)
+///   - 1.0 → identity (`Add + 0`)
 ///   - 2.0 → Sqr (Pow(2))
 ///   - −1.0 → Reciprocal
 ///   - −0.5 → Sqrt + Reciprocal
-///
-/// General case: `Exp(n · Log(Abs(x)))` with a Clip(±88) domain constraint
-/// before the Exp for overflow protection.
 fn translate_powf(
     name: &str,
     exponent: f64,
@@ -288,7 +293,13 @@ fn translate_powf(
         )));
     }
     if exponent == 1.0 {
-        return ops_core::translate_to_dtype(name, DType::F32, input_tensors, output_tensor, ctx);
+        return ops_core::translate_identity_add_zero(
+            name,
+            "Powf exponent 1",
+            input_tensors,
+            output_tensor,
+            ctx,
+        );
     }
     if exponent == 2.0 {
         return ops_core::translate_sqr(name, input_tensors, output_tensor, ctx);
@@ -334,116 +345,9 @@ fn translate_powf(
         });
     }
 
-    // General case: Exp(n * Log(Abs(x))).
-    // Step 1: Abs(x) — ensure positive domain for Log.
-    let abs_name = format!("{name}_abs");
-    let abs_out = format!("{abs_name}_out");
-    let abs_spec = simple_spec(
-        &abs_name,
-        LayerType::Abs,
-        vec![data_input],
-        &abs_out,
-        HashMap::new(),
-    );
-
-    // Step 2: Log(|x|).
-    let log_name = format!("{name}_log");
-    let log_out = format!("{log_name}_out");
-    let log_spec = simple_spec(
-        &log_name,
-        LayerType::Log,
-        vec![abs_out],
-        &log_out,
-        HashMap::new(),
-    );
-
-    // Step 3: n * Log(|x|) via Mul with scalar constant.
-    let n_f32 = checked_f64_to_f32(exponent, "Powf exponent")?;
-    let n_const = format!("{name}_exp_const");
-    insert_scalar_constant(ctx, &n_const, n_f32)?;
-    let mul_name = format!("{name}_mul_n");
-    let mul_out = format!("{mul_name}_out");
-    let mul_spec = simple_spec(
-        &mul_name,
-        LayerType::Mul,
-        vec![log_out, n_const],
-        &mul_out,
-        HashMap::new(),
-    );
-
-    // Step 4: Clip(-88, 88) — prevent overflow in Exp.
-    let clip_name = format!("{name}_clip");
-    let clip_out = format!("{clip_name}_out");
-    let mut clip_attrs = HashMap::new();
-    clip_attrs.insert("min".to_string(), AttributeValue::Float(-88.0));
-    clip_attrs.insert("max".to_string(), AttributeValue::Float(88.0));
-    let clip_spec = simple_spec(
-        &clip_name,
-        LayerType::Clip,
-        vec![mul_out],
-        &clip_out,
-        clip_attrs,
-    );
-
-    // Step 5: Exp(clipped).
-    let exp_spec = simple_spec(
-        name,
-        LayerType::Exp,
-        vec![clip_out],
-        output_tensor,
-        HashMap::new(),
-    );
-
-    Ok(NodeOutput {
-        specs: vec![abs_spec, log_spec, mul_spec, clip_spec, exp_spec],
-    })
-}
-
-/// Translate `TraceOp::Fract` by decomposing to `x - floor(x)`.
-///
-/// No direct NY LayerType for fract. Mirrors NN's `translate_fract` (#2271):
-///   floor_out = Floor(x); fract_out = x + (-floor_out) (via Neg + Add).
-fn translate_fract(
-    name: &str,
-    input_tensors: &[String],
-    output_tensor: &str,
-) -> Result<NodeOutput> {
-    let data_input = first_input(input_tensors, "Fract")?;
-
-    // Step 1: floor(x)
-    let floor_name = format!("{name}_floor");
-    let floor_out = format!("{floor_name}_out");
-    let floor_spec = simple_spec(
-        &floor_name,
-        LayerType::Floor,
-        vec![data_input.clone()],
-        &floor_out,
-        HashMap::new(),
-    );
-
-    // Step 2: -floor(x)
-    let neg_name = format!("{name}_neg_floor");
-    let neg_out = format!("{neg_name}_out");
-    let neg_spec = simple_spec(
-        &neg_name,
-        LayerType::Neg,
-        vec![floor_out],
-        &neg_out,
-        HashMap::new(),
-    );
-
-    // Step 3: x + (-floor(x)) = x - floor(x)
-    let add_spec = simple_spec(
-        name,
-        LayerType::Add,
-        vec![data_input, neg_out],
-        output_tensor,
-        HashMap::new(),
-    );
-
-    Ok(NodeOutput {
-        specs: vec![floor_spec, neg_spec, add_spec],
-    })
+    Err(NyError::UnsupportedOp(format!(
+        "Powf exponent {exponent} has no sound lowering outside the supported special cases"
+    )))
 }
 
 /// Translate `TraceOp::Atan2` — binary `LayerType::Atan2` spec.
@@ -541,12 +445,9 @@ fn translate_flip(
 
 /// Cumsum → N × Slice + (N−1) × Add + Concat.
 ///
-/// Mirrors NN's `translate_cumsum` (#2987) including the large-dimension
-/// analytical bypass (#2411): when `n > MAX_DECOMPOSE_DIM` the O(N) decompose
-/// would explode the graph, so a `Clip(±1e30)` identity passes input bounds
-/// through. That is sound for the `cumsum → sin` harmonic-source pattern the
-/// bypass exists for: `sin(x) ∈ [-1, 1]` for all real x, so the downstream
-/// sin() bounds the chain exactly regardless of the accumulation depth.
+/// Dimensions above the decomposition cap are refused. Replacing Cumsum with
+/// an identity or Clamp changes its values and is unsound even when one known
+/// caller happens to feed the result into a bounded activation.
 fn translate_cumsum(
     name: &str,
     dim: usize,
@@ -568,19 +469,9 @@ fn translate_cumsum(
         return Err(NyError::UnsupportedOp("Cumsum: dim size is 0".to_string()));
     }
 
-    // Large-dimension analytical bypass: emit identity instead of O(N)
-    // decompose. Wide finite Clip acts as identity graph structure; the real
-    // bounding happens at the downstream sin(). Mirrors NN #2411.
     if n > MAX_DECOMPOSE_DIM {
-        let mut attrs = HashMap::new();
-        attrs.insert("min".to_string(), AttributeValue::Float(-1e30));
-        attrs.insert("max".to_string(), AttributeValue::Float(1e30));
-        return Ok(NodeOutput::one(simple_spec(
-            name,
-            LayerType::Clip,
-            vec![data_input],
-            output_tensor,
-            attrs,
+        return Err(NyError::UnsupportedOp(format!(
+            "Cumsum: dim size {n} exceeds decomposition limit {MAX_DECOMPOSE_DIM}"
         )));
     }
 
@@ -899,82 +790,6 @@ fn translate_slice_set(
 }
 
 // ---------------------------------------------------------------------------
-// Structural decompositions (mirror NN's decompose)
-// ---------------------------------------------------------------------------
-
-/// RepeatInterleave → Reshape (unsqueeze) + Tile + Reshape (merge).
-///
-/// RepeatInterleave duplicates elements along `dim`: input `[S]` → output
-/// `[S*R]`. This changes element count, so a single (element-preserving)
-/// Reshape is wrong. Instead: unsqueeze a size-1 dim after the target dim,
-/// Tile it R times, merge back. Mirrors NN's `translate_repeat_interleave`.
-fn translate_repeat_interleave(
-    name: &str,
-    dim: usize,
-    input_tensors: &[String],
-    output_tensor: &str,
-    output_shape: &[usize],
-    ctx: &Ctx,
-) -> Result<NodeOutput> {
-    let data_input = first_input(input_tensors, "RepeatInterleave")?;
-    if dim >= output_shape.len() {
-        return Err(NyError::UnsupportedOp(format!(
-            "RepeatInterleave: dim {dim} >= output rank {}",
-            output_shape.len()
-        )));
-    }
-
-    // Look up input shape from context.
-    let input_shape_i64 = lookup_tensor_shape(ctx, &data_input, "RepeatInterleave")?;
-    let input_dim = checked_i64_to_usize(
-        *input_shape_i64.get(dim).ok_or_else(|| {
-            NyError::InternalError(format!(
-                "RepeatInterleave: dim {dim} >= input rank {}",
-                input_shape_i64.len()
-            ))
-        })?,
-        "RepeatInterleave input dim",
-    )?;
-    let output_dim = output_shape[dim];
-    if input_dim == 0 || !output_dim.is_multiple_of(input_dim) {
-        return Err(NyError::UnsupportedOp(format!(
-            "RepeatInterleave: variable repeats (input_dim={input_dim}, output_dim={output_dim})"
-        )));
-    }
-    let repeats = output_dim / input_dim;
-
-    let mut specs = Vec::new();
-    let input_shape: Vec<usize> = input_shape_i64
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| checked_i64_to_usize(v, &format!("RepeatInterleave input shape dim {i}")))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Step 1: Unsqueeze — insert dim of size 1 after target dim.
-    let mut unsq_shape = input_shape;
-    unsq_shape.insert(dim + 1, 1);
-    let rs1 = format!("{name}_unsq");
-    let rs1_out = format!("{rs1}_out");
-    specs.push(reshape_to_output(&rs1, data_input, &rs1_out, &unsq_shape)?);
-
-    // Step 2: Tile — repeat the new dim `repeats` times.
-    let tile_axis = dim_as_i64(dim + 1, "RepeatInterleave tile")?;
-    let t1 = format!("{name}_tile");
-    let t1_out = format!("{t1}_out");
-    specs.push(tile_spec(&t1, vec![rs1_out], &t1_out, tile_axis, repeats)?);
-
-    // Step 3: Reshape — merge dims back to output_shape.
-    specs.push(reshape_to_output(
-        name,
-        t1_out,
-        output_tensor,
-        output_shape,
-    )?);
-
-    Ok(NodeOutput { specs })
-}
-
-// ---------------------------------------------------------------------------
 // Constant / mask / gather emissions (mirror NN's dispatch_extended)
 // ---------------------------------------------------------------------------
 
@@ -993,30 +808,65 @@ fn translate_arange(
     output_tensor: &str,
     ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
+    if !start.is_finite() || !end.is_finite() || !step.is_finite() {
+        return Err(NyError::ModelLoad(format!(
+            "Arange start/end/step must be finite, got start={start}, end={end}, step={step}"
+        )));
+    }
     if step == 0.0 {
         return Err(NyError::UnsupportedOp(
             "Arange with step=0 is undefined".to_string(),
         ));
     }
-
-    // Compute the arange values.
-    let n = ((end - start) / step).ceil() as usize;
-    let mut data = Vec::with_capacity(n);
-    let mut val = start;
-    for _ in 0..n {
-        let val_f32 = checked_f64_to_f32(val, "Arange element")?;
-        data.push(val_f32);
-        val += step;
+    if (step > 0.0 && start > end) || (step < 0.0 && start < end) {
+        return Err(NyError::ModelLoad(format!(
+            "Arange step {step} points away from end {end} starting at {start}"
+        )));
     }
 
-    // Use the traced output_shape if available, else infer 1D.
-    let shape = if output_shape.is_empty() {
-        vec![data.len()]
-    } else {
-        output_shape.to_vec()
-    };
+    let ratio = (end - start) / step;
+    let count_f64 = ratio.ceil().max(0.0);
+    if !count_f64.is_finite() {
+        return Err(NyError::ModelLoad(format!(
+            "Arange element count is non-finite for start={start}, end={end}, step={step}"
+        )));
+    }
+    if count_f64 > MAX_ARANGE_ELEMENTS as f64 {
+        return Err(NyError::ModelLoad(format!(
+            "Arange requires {count_f64} elements, exceeding the {MAX_ARANGE_ELEMENTS}-element limit"
+        )));
+    }
+    let count = count_f64 as usize;
 
-    let arr = ArrayD::from_shape_vec(IxDyn(&shape), data)
+    if output_shape.len() != 1 {
+        return Err(NyError::ModelLoad(format!(
+            "Arange must declare a rank-1 output shape, got {output_shape:?}"
+        )));
+    }
+    let declared_elements = checked_shape_product(output_shape).ok_or_else(|| {
+        NyError::ModelLoad(format!(
+            "Arange output shape {output_shape:?} has a dimension product that overflows usize"
+        ))
+    })?;
+    if declared_elements != count {
+        return Err(NyError::ModelLoad(format!(
+            "Arange declared output shape {output_shape:?} has {declared_elements} elements but parameters produce {count}"
+        )));
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(count).map_err(|error| {
+        NyError::ModelLoad(format!(
+            "Arange allocation failed for {count} elements: {error}"
+        ))
+    })?;
+    for index in 0..count {
+        let val = start + (index as f64) * step;
+        let val_f32 = checked_f64_to_f32(val, "Arange element")?;
+        data.push(val_f32);
+    }
+
+    let arr = ArrayD::from_shape_vec(IxDyn(output_shape), data)
         .map_err(|e| NyError::InternalError(format!("{name} Arange shape mismatch: {e}")))?;
     ctx.insert_weight(output_tensor, arr)?;
     Ok(NodeOutput::none())
@@ -1156,22 +1006,6 @@ fn reshape_to_output(
         output,
         attrs,
     ))
-}
-
-fn tile_spec(
-    name: &str,
-    inputs: Vec<String>,
-    output: &str,
-    axis: i64,
-    reps: usize,
-) -> Result<LayerSpec> {
-    let mut attrs = HashMap::new();
-    attrs.insert("axis".to_string(), AttributeValue::Int(axis));
-    attrs.insert(
-        "reps".to_string(),
-        AttributeValue::Int(dim_as_i64(reps, "tile reps")?),
-    );
-    Ok(simple_spec(name, LayerType::Tile, inputs, output, attrs))
 }
 
 /// Look up a tensor's recorded shape, mirroring NN's
@@ -1400,68 +1234,35 @@ mod tests {
         assert_builds(&m, "Powf(-0.5)");
     }
 
-    /// General Powf → Abs, Log, Mul(n), Clip(±88), Exp — NN's exact chain.
     #[test]
-    fn powf_general_decomposes_via_exp_log() {
-        let graph = ComputationGraph::from_nodes(vec![
-            node(0, "x", TraceOp::Input, &[], &[4]),
-            node(1, "p", TraceOp::Powf { exponent: 3.0 }, &[0], &[4]),
-        ]);
-        let model = translate(&graph).expect("Powf(3.0) translates");
-        assert_eq!(
-            layer(&model, "layer0_trace_1_abs").layer_type,
-            LayerType::Abs
-        );
-        assert_eq!(
-            layer(&model, "layer0_trace_1_log").layer_type,
-            LayerType::Log
-        );
-        let mul = layer(&model, "layer0_trace_1_mul_n");
-        assert_eq!(mul.layer_type, LayerType::Mul);
-        assert!(mul.inputs.contains(&"layer0_trace_1_exp_const".to_string()));
-        assert_eq!(
-            model.weights.get("layer0_trace_1_exp_const").map(|w| w[[]]),
-            Some(3.0)
-        );
-        let clip = layer(&model, "layer0_trace_1_clip");
-        assert_eq!(
-            clip.attributes.get("min"),
-            Some(&AttributeValue::Float(-88.0))
-        );
-        assert_eq!(
-            clip.attributes.get("max"),
-            Some(&AttributeValue::Float(88.0))
-        );
-        assert_eq!(layer(&model, "layer0_trace_1").layer_type, LayerType::Exp);
-        assert_builds(&model, "Powf(3.0)");
+    fn powf_general_exponents_fail_closed() {
+        for exponent in [3.0, 1.5, -3.0, f64::NAN] {
+            let graph = ComputationGraph::from_nodes(vec![
+                node(0, "x", TraceOp::Input, &[], &[4]),
+                node(1, "p", TraceOp::Powf { exponent }, &[0], &[4]),
+            ]);
+            let err = translate(&graph).expect_err("general Powf must fail closed");
+            assert!(
+                matches!(err, NyError::UnsupportedOp(ref message)
+                    if message.contains("Powf exponent")
+                        && message.contains("no sound lowering")),
+                "{exponent:?}: got {err:?}"
+            );
+        }
     }
 
-    /// Fract → Floor + Neg + Add (x - floor(x)) — NN #2271.
     #[test]
-    fn fract_decomposes_to_floor_neg_add() {
+    fn fract_refuses_unsound_floor_lowering_for_negative_inputs() {
         let graph = ComputationGraph::from_nodes(vec![
-            node(0, "x", TraceOp::Input, &[], &[4]),
-            node(1, "f", TraceOp::Fract, &[0], &[4]),
+            node(0, "x", TraceOp::Input, &[], &[1]),
+            node(1, "f", TraceOp::Fract, &[0], &[1]),
         ]);
-        let model = translate(&graph).expect("Fract translates");
-        assert_eq!(
-            layer(&model, "layer0_trace_1_floor").layer_type,
-            LayerType::Floor
+        let err = translate(&graph).expect_err("Fract must fail closed");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref message)
+                if message.contains("Fract") && message.contains("truncation")),
+            "got {err:?}"
         );
-        assert_eq!(
-            layer(&model, "layer0_trace_1_neg_floor").layer_type,
-            LayerType::Neg
-        );
-        let add = layer(&model, "layer0_trace_1");
-        assert_eq!(add.layer_type, LayerType::Add);
-        assert_eq!(
-            add.inputs,
-            vec![
-                "layer0_trace_0_out".to_string(),
-                "layer0_trace_1_neg_floor_out".to_string()
-            ]
-        );
-        assert_builds(&model, "Fract");
     }
 
     /// Atan2 → binary LayerType::Atan2 spec (inputs y, x) — NN binary arm.
@@ -1515,26 +1316,18 @@ mod tests {
         assert_builds(&model, "Cumsum");
     }
 
-    /// Cumsum beyond the decompose cap emits NN's analytical bypass
-    /// (Clip ±1e30 identity, sound for the cumsum → sin pattern).
     #[test]
-    fn cumsum_large_dim_uses_analytical_bypass() {
+    fn cumsum_large_dim_is_refused_instead_of_substituting_identity() {
         let n = super::MAX_DECOMPOSE_DIM + 1;
         let graph = ComputationGraph::from_nodes(vec![
             node(0, "x", TraceOp::Input, &[], &[n]),
             node(1, "c", TraceOp::Cumsum { dim: 0 }, &[0], &[n]),
         ]);
-        let model = translate(&graph).expect("large Cumsum translates");
-        assert_eq!(count(&model, &LayerType::Slice), 0, "no O(N) decompose");
-        let clip = layer(&model, "layer0_trace_1");
-        assert_eq!(clip.layer_type, LayerType::Clip);
-        assert_eq!(
-            clip.attributes.get("min"),
-            Some(&AttributeValue::Float(-1e30))
-        );
-        assert_eq!(
-            clip.attributes.get("max"),
-            Some(&AttributeValue::Float(1e30))
+        let err = translate(&graph).expect_err("large Cumsum must fail closed");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref message)
+                if message.contains("Cumsum") && message.contains("decomposition limit")),
+            "got {err:?}"
         );
     }
 
@@ -1564,31 +1357,20 @@ mod tests {
         assert_builds(&model, "Flip");
     }
 
-    /// RepeatInterleave([2] → [4], dim 0) → Reshape(unsq) + Tile + Reshape.
+    /// Shape ratios cannot recover omitted per-element repeat counts.
     #[test]
-    fn repeat_interleave_decomposes_to_reshape_tile_reshape() {
+    fn repeat_interleave_refuses_missing_per_element_counts() {
         let graph = ComputationGraph::from_nodes(vec![
             node(0, "x", TraceOp::Input, &[], &[2]),
             node(1, "r", TraceOp::RepeatInterleave { dim: 0 }, &[0], &[4]),
         ]);
-        let model = translate(&graph).expect("RepeatInterleave translates");
-        let unsq = layer(&model, "layer0_trace_1_unsq");
-        assert_eq!(unsq.layer_type, LayerType::Reshape);
-        assert_eq!(
-            unsq.attributes.get("shape"),
-            Some(&AttributeValue::Ints(vec![2, 1]))
+        let err = translate(&graph).expect_err("RepeatInterleave must fail closed");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref message)
+                if message.contains("RepeatInterleave")
+                    && message.contains("repeat counts")),
+            "got {err:?}"
         );
-        let tile = layer(&model, "layer0_trace_1_tile");
-        assert_eq!(tile.layer_type, LayerType::Tile);
-        assert_eq!(tile.attributes.get("axis"), Some(&AttributeValue::Int(1)));
-        assert_eq!(tile.attributes.get("reps"), Some(&AttributeValue::Int(2)));
-        let merge = layer(&model, "layer0_trace_1");
-        assert_eq!(merge.layer_type, LayerType::Reshape);
-        assert_eq!(
-            merge.attributes.get("shape"),
-            Some(&AttributeValue::Ints(vec![4]))
-        );
-        assert_builds(&model, "RepeatInterleave");
     }
 
     /// Arange is emitted as a constant weight (no layer), like NN #2271.
@@ -1638,6 +1420,98 @@ mod tests {
         assert!(
             matches!(err, NyError::UnsupportedOp(ref m) if m.contains("Arange with step=0")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn arange_rejects_non_finite_or_inconsistent_parameters() {
+        for (start, end, step, expected) in [
+            (f64::NAN, 3.0, 1.0, "must be finite"),
+            (0.0, f64::INFINITY, 1.0, "must be finite"),
+            (0.0, 3.0, f64::NEG_INFINITY, "must be finite"),
+            (0.0, 3.0, -1.0, "points away"),
+            (3.0, 0.0, 1.0, "points away"),
+        ] {
+            let graph = ComputationGraph::from_nodes(vec![node(
+                0,
+                "ar",
+                TraceOp::Arange { start, end, step },
+                &[],
+                &[3],
+            )]);
+            let err = translate(&graph).expect_err("invalid Arange must fail closed");
+            assert!(
+                matches!(err, NyError::ModelLoad(ref message)
+                    if message.contains("Arange") && message.contains(expected)),
+                "{start:?}, {end:?}, {step:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arange_validates_declared_shape_and_resource_cap() {
+        let shape_mismatch = ComputationGraph::from_nodes(vec![node(
+            0,
+            "ar",
+            TraceOp::Arange {
+                start: 0.0,
+                end: 3.0,
+                step: 1.0,
+            },
+            &[],
+            &[2],
+        )]);
+        let err = translate(&shape_mismatch).expect_err("shape mismatch must fail closed");
+        assert!(
+            matches!(err, NyError::ModelLoad(ref message)
+                if message.contains("declared output shape")
+                    && message.contains("parameters produce 3")),
+            "got {err:?}"
+        );
+
+        let oversized = super::MAX_ARANGE_ELEMENTS + 1;
+        let over_cap = ComputationGraph::from_nodes(vec![node(
+            0,
+            "ar",
+            TraceOp::Arange {
+                start: 0.0,
+                end: oversized as f64,
+                step: 1.0,
+            },
+            &[],
+            &[oversized],
+        )]);
+        let err = translate(&over_cap).expect_err("oversized Arange must fail before allocation");
+        assert!(
+            matches!(err, NyError::ModelLoad(ref message)
+                if message.contains("exceeding")
+                    && message.contains("element limit")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn arange_negative_step_translates_exactly() {
+        let graph = ComputationGraph::from_nodes(vec![node(
+            0,
+            "ar",
+            TraceOp::Arange {
+                start: 3.0,
+                end: 0.0,
+                step: -1.0,
+            },
+            &[],
+            &[3],
+        )]);
+        let model = translate(&graph).expect("negative-step Arange translates");
+        assert_eq!(
+            model
+                .weights
+                .get("layer0_trace_0_out")
+                .expect("range weight")
+                .as_slice()
+                .expect("contiguous"),
+            &[3.0, 2.0, 1.0]
         );
     }
 

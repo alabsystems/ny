@@ -27,6 +27,15 @@ experiments:
         env:
           NY_ALPHA_FINAL_BOUND_ONLY: "1"
         disposition: default_off_execution_treatment
+      # INERT ARM — MEASURES NOTHING (verified at HEAD, 2026-08-09, lane 3).
+      # `general.device: wgpu` is the arm's ONLY change, and the engine contract
+      # drops it: `preset::contract::validate_preset` (contract.rs:276) classifies
+      # a wgpu request as Unhonoured/PerformanceOnly and "the requested backend is
+      # overridden with the sound CPU verifier" while WGPU proof authority is
+      # quarantined. So this arm is byte-identical to `baseline` by construction.
+      # Its July result was recorded as a measured arm; it was not one.
+      # Do not re-run it, and do not compare its wall to baseline as CPU-vs-GPU,
+      # until `ny_gpu::wgpu_proof_authority()` is true.
       - name: device_wgpu
         overrides:
           general.device: wgpu
@@ -45,6 +54,11 @@ experiments:
       - name: reorder_bab
         overrides:
           bab.branching.input_split.reorder_bab: true
+      - name: adv_check_0
+        # Sentinel semantics: 0 enables periodic SAT-only probes immediately;
+        # -1 disables them. This arm remains isolated/default-off.
+        overrides:
+          bab.branching.input_split.adv_check: 0
       - name: batch_1_auto_enlarge
         overrides:
           bab.batch_size: 1
@@ -59,6 +73,11 @@ experiments:
       - name: crown_build_batch_512
         overrides:
           solver.build_batch_size: 512
+      # PARTIALLY INERT BUNDLE (verified at HEAD, 2026-08-09, lane 3). Nine of the
+      # ten fields below are honoured; `general.device: wgpu` is dropped by the same
+      # quarantine that makes `device_wgpu` inert. This arm therefore measures the
+      # bundle MINUS its headline backend change — report it as a 9-field bundle,
+      # never as "the upstream recipe".
       - name: supported_upstream_bundle
         overrides:
           general.device: wgpu
@@ -70,6 +89,30 @@ experiments:
           bab.auto_enlarge_batch_size: true
           bab.branching.input_split.sb_coeff_thresh: 0.01
           bab.branching.input_split.reorder_bab: true
+          bab.branching.input_split.adv_check: 0
+
+  # Default-dark routing canary for the exact official nCh1/prop1 row.  Both
+  # arms remain non-promotional while verdict-bearing WGPU is quarantined.
+  # The WGPU-request arm records adapter name/type/API and a structured
+  # requested=wgpu/effective=cpu quarantine warning in raw stderr. Promotion is
+  # forbidden unless a future sound adapter makes the effective backend WGPU.
+  # Today `WgpuDevice::provides_sound_gpu_crown()` is false; separate direct GPU
+  # IBP/kernel oracles are diagnostics only. Do not infer CGAN CROWN throughput
+  # from this canary or compare its two wall times as CPU-vs-GPU performance.
+  - name: cgan_nch1_prop1_backend_route
+    year: 2025
+    category: cgan_2023
+    base_preset: configs/vnncomp25/cgan_2023.yaml
+    corpus_ids: [cgan-nch1-prop1-backend-canary]
+    arms:
+      - name: cgan_nch1_prop1_explicit_cpu
+        overrides:
+          general.device: cpu
+        disposition: default_off_routing_diagnostic
+      - name: cgan_nch1_prop1_explicit_wgpu_request
+        overrides:
+          general.device: wgpu
+        disposition: default_off_quarantined_routing_diagnostic
 
   - name: cifar100_recipe
     year: 2025
@@ -115,6 +158,106 @@ experiments:
           NY_ROOT_SPARSE_INTERM_CROWN: "1"
         disposition: ny_control_not_upstream_parity
 
+  # Sealed 2x2 composition factorial on the medium prop1761 target. Runtime
+  # observations must independently prove pruning, exact-C selection, and the
+  # authenticated compact publication in the combined arm.
+  - name: cifar100_exact_c_iterations
+    year: 2025
+    category: cifar100_2024
+    base_preset: configs/vnncomp25/cifar100_2024.yaml
+    corpus_ids: [cifar100-medium-1761]
+    arms:
+      - name: exact_c_0_prune_0
+        overrides:
+          bab.atomic_root_c_margin_iterations: 0
+        env:
+          NY_ROOT_SPEC_PRUNE: "0"
+        disposition: default_off_execution_control
+      - name: exact_c_4_prune_0
+        overrides:
+          bab.atomic_root_c_margin_iterations: 4
+        env:
+          NY_ROOT_SPEC_PRUNE: "0"
+        disposition: default_off_execution_treatment
+      - name: exact_c_0_prune_1
+        overrides:
+          bab.atomic_root_c_margin_iterations: 0
+        env:
+          NY_ROOT_SPEC_PRUNE: "1"
+        disposition: default_off_execution_treatment
+      - name: exact_c_4_prune_1
+        overrides:
+          bab.atomic_root_c_margin_iterations: 4
+        env:
+          NY_ROOT_SPEC_PRUNE: "1"
+        disposition: default_off_execution_treatment
+
+  # INVPROP clause-local gamma A/Bs are split by row so route-specific runtime
+  # counters cannot be hidden by a multi-row aggregate. Both arms pin ingress
+  # and learning rate identically; only gamma optimization changes.
+  - name: ml4acopf_row5_invprop_gamma
+    year: 2025
+    category: ml4acopf_2024
+    base_preset: configs/vnncomp25/ml4acopf_2024.yaml
+    corpus_ids: [vnncomp2025-ml4acopf-row5]
+    arms:
+      - name: invprop_gamma_off
+        overrides: {}
+        env:
+          NY_INVPROP: "1"
+          NY_INVPROP_OPTIMIZE: "0"
+          NY_INVPROP_LR: "0.5"
+        disposition: default_off_execution_control
+      - name: invprop_gamma_on
+        overrides: {}
+        env:
+          NY_INVPROP: "1"
+          NY_INVPROP_OPTIMIZE: "1"
+          NY_INVPROP_LR: "0.5"
+        disposition: default_off_execution_treatment
+
+  - name: ml4acopf_row52_invprop_gamma
+    year: 2025
+    category: ml4acopf_2024
+    base_preset: configs/vnncomp25/ml4acopf_2024.yaml
+    corpus_ids: [vnncomp2025-ml4acopf-row52]
+    arms:
+      - name: invprop_gamma_off
+        overrides: {}
+        env:
+          NY_INVPROP: "1"
+          NY_INVPROP_OPTIMIZE: "0"
+          NY_INVPROP_LR: "0.5"
+        disposition: default_off_execution_control
+      - name: invprop_gamma_on
+        overrides: {}
+        env:
+          NY_INVPROP: "1"
+          NY_INVPROP_OPTIMIZE: "1"
+          NY_INVPROP_LR: "0.5"
+        disposition: default_off_execution_treatment
+
+  # Sound Clip-and-Verify A/B on one official UNSAT target plus both historical
+  # false-UNSAT sentinels. Runtime observations must prove that the exact-box
+  # route was authorized and attempted; the SAT sentinels must remain SAT.
+  - name: lsnc_fresh_domain_clip
+    year: 2025
+    category: lsnc_relu
+    base_preset: configs/vnncomp25/lsnc_relu.yaml
+    corpus_ids:
+      - vnncomp2025-lsnc-row1-unsat-target
+      - vnncomp2025-lsnc-row35-sat-sentinel
+      - vnncomp2025-lsnc-row46-sat-sentinel
+    arms:
+      - name: fresh_domain_clip_off
+        overrides:
+          bab.clip.input_split_fresh_domain_clip: false
+        disposition: default_off_execution_control
+      - name: fresh_domain_clip_on
+        overrides:
+          bab.clip.input_split_fresh_domain_clip: true
+        disposition: default_off_execution_treatment
+
   - name: tinyimagenet_recipe
     year: 2025
     category: tinyimagenet_2024
@@ -152,10 +295,28 @@ experiments:
       - name: upstream_v25_bundle
         overrides:
           bab.batch_size: 256
+          bab.branching.method: kfsb
           bab.branching.candidates: 7
+          bab.branching.reduceop: max
+          # NY's explicit-kFSB preset path does not inherit the model-aware
+          # multi-objective kFSB runtime policy. Arm the wave selector so this
+          # treatment executes the upstream kFSB recipe rather than falling
+          # back to NY's historical intercept-only multi-objective brancher.
+          bab.branching.kfsb_multi: true
+          bab.alpha_crown.lr_alpha: 0.25
+          bab.alpha_crown.iterations: 20
+          bab.beta_crown.lr_alpha: 0.1
+          bab.beta_crown.lr_beta: 0.15
           bab.beta_crown.iterations: 8
           bab.clip.interm_domain: true
-          bab.clip.in_alpha_crown: true
+          # alpha-beta-CROWN's complete intermediate clip default is 20;
+          # NY deliberately keeps a smaller global default (3), so parity must
+          # pin this treatment explicitly.
+          bab.clip.interm_topk: 20
+          # Upstream v25 enables complete intermediate-domain clipping but
+          # leaves clip_in_alpha_crown at its false default. NY folds batch
+          # normalization during ONNX conversion, matching merge_bn.
+          bab.clip.in_alpha_crown: false
 
   - name: vgg_recipe
     year: 2025

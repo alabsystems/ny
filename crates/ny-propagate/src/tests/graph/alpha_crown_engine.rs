@@ -365,9 +365,10 @@ fn test_collect_alpha_crown_bounds_dag_deadline_engine_parity_diamond_3499() {
         1e-4,
         "#3499 deadline DAG alpha-CROWN engine parity",
     );
-    assert!(
-        engine.gemm_calls() > 0,
-        "#3499 regression: deadline-carrying DAG alpha-CROWN should hit GemmEngine"
+    assert_eq!(
+        engine.gemm_calls(),
+        0,
+        "finite DAG alpha-CROWN must decline opaque dense GemmEngine kernels until they expose cooperative deadline polling"
     );
 }
 

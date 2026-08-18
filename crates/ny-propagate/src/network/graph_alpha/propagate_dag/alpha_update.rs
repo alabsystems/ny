@@ -18,7 +18,88 @@ use ny_core::{NyError, Result};
 use std::collections::{BTreeMap, HashMap};
 use tracing::warn;
 
+// Under `targo trust ... --contracts` tRustc supplies the first-class contract
+// attributes and STATICALLY verifies them; otherwise the `trust` facade provides
+// the no-op form. Same pattern as `crates/ny-cert/src/selfcheck.rs`.
+#[cfg(trust_verify)]
+use core::contracts::ensures;
+#[cfg(not(trust_verify))]
+use trust::ensures;
+
 use super::super::runtime_state::DagAlphaRuntimeState;
+
+/// One clamped α step — the ONLY way an α value is ever written.
+///
+/// # Why this is a contract and not just a `clamp`
+///
+/// α is the slope of the ReLU LOWER envelope `relu z ≥ α·z`. That envelope is valid
+/// for **every** `α ∈ [0,1]` and for no `α` outside it. So this single postcondition
+/// is what separates "the α optimizer is a bound-QUALITY component" from "the α
+/// optimizer is part of the soundness argument".
+///
+/// `#[ensures]` states the locally-provable range property.
+/// `#[trust::cite(crownproof::relu_lower)]` grounds the entailment in the
+/// Clean-kernel-checked theorem
+///
+/// ```text
+/// theorem relu_lower (alpha z : ℚ) (h0 : 0 ≤ alpha) (h1 : alpha ≤ 1) :
+///     alpha * z ≤ relu z
+/// ```
+///
+/// (`Crownproof.Basic`, in the pinned Clean dependency; axioms
+/// `[propext, Classical.choice, Quot.sound]`, no `sorryAx`).
+///
+/// Together: **no gradient, however wrong, can make ny unsound through α.** That is
+/// not a style claim — it is the load-bearing licence for changing the α gradient,
+/// which is currently provably broken. `gradients.rs:91,115,119` computes
+/// `g_i = Σ_{j : A[j,i] > 0} A[j,i] · l_i` with `l_i < 0` forced by the
+/// unstable-neuron guard, so `g_i ≤ 0` for every neuron, objective and iteration —
+/// a constant-sign field carrying no directional information, which drives every α
+/// monotonically to the `0` clamp. Measured on cifar100 `idx_7704`: `best_impr =
+/// 0.000e0` at every iteration, and sweeping `lr_alpha` over 0.25 / 0.05 / 0.01
+/// leaves `best_lower_sum` bit-identical at −3564.689453. Machine-checked in
+/// `crates/ny-cert/proofs/lean/NyProof/AlphaGradientDefect.lean`
+/// (`local_rule_nonpos`, `clamped_step_nonincreasing`,
+/// `local_rule_sign_can_be_wrong`, `alpha_sound_regardless`).
+///
+/// Because of the contract below, replacing that gradient is a bound-quality change
+/// with **zero** false-`unsat` exposure — the one direction that costs −150.
+///
+/// VERIFICATION STATUS of the `#[ensures]`, measured 2026-08-03 — it is NOT yet
+/// machine-checked, and the reason is upstream, not here. `targo trust check`
+/// does reach this crate (350 functions, 470 obligations, 290 proved), but no
+/// postcondition on a multi-branch function can be proved by the current
+/// toolchain at any level:
+///
+/// * L0 refutes them. `#[ensures(|r: &i32| *r >= 0)] fn f(x) { if x<0 {1} else {2} }`
+///   reports `postcond FAILED`, pinning the merged return SSA name to −1 — a
+///   value no branch returns. L0 should not be discharging these at all;
+///   `trust-ir-bridge/src/flip.rs` asserts `[L0] postcondition is an L1
+///   obligation`, so L0 evaluates an L1 obligation without L1's per-predecessor
+///   guards.
+/// * L1 declines them: "trust-wp native pure verifier does not support
+///   obligation ... TrustContractBundle lowering into TrustWpPureExprV1 ... is
+///   required".
+///
+/// Reproducer committed upstream at `~/trust`
+/// `examples/contracts/postcondition-branch-repro` (`41962e43e1`). This function
+/// branches (NaN guard, then range), so it is squarely in the refuted class.
+/// Until that is fixed the `#[ensures]` is a precise, executable statement of
+/// the invariant whose PROOF lives in Lean; do not read it as solver-checked,
+/// and do not "fix" a red verdict here by weakening it.
+#[ensures(|r: &f32| *r >= 0.0 && *r <= 1.0)]
+#[trust::cite(crownproof::relu_lower)]
+#[inline]
+pub(crate) fn clamp_alpha_to_envelope_domain(candidate: f32) -> f32 {
+    // NaN maps to the interior point 0.5 rather than propagating: `f32::clamp`
+    // panics on a NaN bound and returns NaN for a NaN input, and a NaN α would make
+    // the envelope meaningless. 0.5 is in range, so the postcondition holds on every
+    // path. This mirrors the NaN reset the Adam loop already performs.
+    if candidate.is_nan() {
+        return 0.5;
+    }
+    candidate.clamp(0.0, 1.0)
+}
 
 /// Generic Adam update for ndarray alpha parameters.
 ///
@@ -66,9 +147,15 @@ fn adam_update_alpha_map<D: ndarray::Dimension>(
                     let m_hat = *m_val / bias_correction1;
                     let v_hat = *v_val / bias_correction2;
                     *a -= adam_params.learning_rate * m_hat / (v_hat.sqrt() + adam_params.epsilon);
-                    *a = a.clamp(0.0, 1.0);
-                    if a.is_nan() {
-                        *a = 0.5;
+                    // Single contracted write site (#alpha-envelope-domain): the
+                    // `#[ensures]` on this call is what guarantees every stored α
+                    // lies in the envelope's domain [0,1], which by the cited
+                    // `crownproof::relu_lower` makes the resulting relaxation sound
+                    // for ANY gradient. Reset the Adam moments on NaN as before, so
+                    // a poisoned history cannot persist past the repair.
+                    let was_nan = a.is_nan();
+                    *a = clamp_alpha_to_envelope_domain(*a);
+                    if was_nan {
                         *m_val = 0.0;
                         *v_val = 0.0;
                     }
@@ -111,6 +198,7 @@ pub(super) fn update_all_alphas(
     total_gradient_skips: &mut usize,
 ) -> Result<()> {
     let adam_params = config.adam_params(lr, iter + 1);
+    let grad_probe = std::env::var("NY_ALPHA_GRAD_PROBE").ok().as_deref() == Some("1");
 
     // ReLU alpha update
     for (relu_idx, (grad, grad_upper)) in numerical_gradients
@@ -149,8 +237,41 @@ pub(super) fn update_all_alphas(
         // Channel-only alpha reduction (#4404): when full_conv_alpha is False,
         // gradients are per-neuron [C*H*W] but alpha is per-channel [C].
         // Reduce gradients to match alpha shape before optimizer update.
+        let raw_len = neg_grad.len();
+        let raw_nz = neg_grad.iter().filter(|v| **v != 0.0).count();
         let neg_grad = runtime.graph().reduce_gradient(&node_name, &neg_grad);
         let neg_grad_upper = runtime.graph().reduce_gradient(&node_name, &neg_grad_upper);
+        if grad_probe {
+            let n = neg_grad.len();
+            let nz = neg_grad.iter().filter(|v| **v != 0.0).count();
+            let absmax = neg_grad.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let absmean = if n > 0 {
+                neg_grad.iter().map(|v| v.abs()).sum::<f32>() / n as f32
+            } else {
+                0.0
+            };
+            let (a_lo, a_hi, a_int, a_n) = runtime.graph().alpha(&node_name).map_or(
+                (f32::NAN, f32::NAN, 0usize, 0usize),
+                |a| {
+                    (
+                        a.iter().copied().fold(f32::INFINITY, f32::min),
+                        a.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                        a.iter().filter(|v| **v != 0.0 && **v != 1.0).count(),
+                        a.len(),
+                    )
+                },
+            );
+            let unstable = runtime
+                .graph()
+                .relu_unstable_mask(&node_name)
+                .map_or(0usize, |m| m.iter().filter(|b| **b).count());
+            eprintln!(
+                "[grad-probe] iter={iter} relu={relu_idx} name={node_name} raw_len={raw_len} \
+                 raw_nz={raw_nz} n={n} nz={nz} absmean={absmean:.3e} absmax={absmax:.3e} \
+                 alpha_n={a_n} alpha_interior={a_int} alpha_range=[{a_lo:.3},{a_hi:.3}] \
+                 unstable_mask={unstable}"
+            );
+        }
         match config.optimizer {
             Optimizer::Adam => {
                 runtime

@@ -15,14 +15,18 @@ mod proptest_soundness;
 #[cfg(test)]
 mod tests;
 
-/// Core interval-bounded tensor type used across bound propagation layers.
-pub use core::BoundedTensor;
 /// Shared inverted-bounds repair strategy for propagation and readback code. Part of #3307.
 pub use core::InversionRepair;
 /// Strategy for automatic NaN/Inf repair at the type boundary. Part of #3423.
 pub use core::RepairStrategy;
 /// Shared inverted-bounds repair helpers. Part of #3307.
 pub use core::{repair_inverted_bounds, repair_inverted_bounds_nd};
+/// Core interval-bounded tensor type used across bound propagation layers.
+pub use core::{
+    BoundedTensor, BoundedTensorHostAllocationEndpointV1, BoundedTensorHostAllocationInvalidV1,
+    BoundedTensorHostAllocationProvenanceV1, BoundedTensorHostAllocationReceiptV1,
+    BoundedTensorHostAllocationUnsupportedV1, BOUNDED_TENSOR_HOST_ALLOCATION_MAX_RANK_V1,
+};
 /// Double-precision bounded tensor for f64 propagation (soundnessbench, sat_relu).
 pub use float64::BoundedTensor64;
 /// Optional per-normalization-slice Euclidean-ball annotation enabling exact

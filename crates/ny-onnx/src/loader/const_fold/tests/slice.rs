@@ -181,10 +181,11 @@ fn test_slice_constant_fold_end_clamp() {
     assert!((out[1] - 30.0).abs() < 1.0e-6);
 }
 
-/// Slice bounds that lost their original integer type during constant folding
-/// should still truncate the same way the converter does (#3500).
+/// Slice operands are integer-by-semantics. A fractional float-only operand
+/// must not be silently truncated into a different slice; valid Cast-to-INT64
+/// constant chains retain an exact integer payload instead.
 #[test]
-fn test_slice_constant_fold_truncates_float_bounds_3500() {
+fn test_slice_constant_fold_rejects_fractional_float_bounds_3500() {
     let data = ArrayD::from_shape_vec(IxDyn(&[5]), vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
     let starts = ArrayD::from_shape_vec(IxDyn(&[1]), vec![0.0]).unwrap();
     let ends = ArrayD::from_shape_vec(IxDyn(&[1]), vec![2.5]).unwrap();
@@ -209,12 +210,10 @@ fn test_slice_constant_fold_truncates_float_bounds_3500() {
 
     fold(&graph, &mut weights);
 
-    let out = weights
-        .get("out")
-        .expect("Slice with truncated float bounds should fold");
-    assert_eq!(out.shape(), &[2]);
-    assert!((out[0] - 10.0).abs() < 1.0e-6);
-    assert!((out[1] - 20.0).abs() < 1.0e-6);
+    assert!(
+        weights.get("out").is_none(),
+        "fractional Slice bounds must not be truncated"
+    );
 }
 
 /// Slice in a 2D tensor along axis 1.

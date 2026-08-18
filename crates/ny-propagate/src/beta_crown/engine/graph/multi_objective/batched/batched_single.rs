@@ -47,6 +47,7 @@ impl BetaCrownVerifier {
         threshold: f32,
         engine: &dyn GemmEngine,
         cut_pool: Option<&GraphCutPool>,
+        split_depth: usize,
         retry_refusals: bool,
     ) -> Result<Vec<GraphDomainResult>, MicrobatchRefusalReason> {
         if domains.is_empty() {
@@ -192,6 +193,56 @@ impl BetaCrownVerifier {
         let child_creation_results: Vec<_> = domains_with_unstable
             .par_iter()
             .map(|(idx, domain, unstable)| {
+                let remaining_depth = self.config.max_depth.saturating_sub(domain.depth);
+                let effective_split_depth =
+                    split_depth.max(1).min(unstable.len()).min(remaining_depth);
+                if effective_split_depth == 0 {
+                    tracing::warn!(
+                        parent_idx = idx,
+                        parent_depth = domain.depth,
+                        max_depth = self.config.max_depth,
+                        "shared single-objective executor refused a parent with no depth budget"
+                    );
+                    return Err(*idx);
+                }
+
+                if effective_split_depth > 1 {
+                    let branches = match self.select_graph_branches(
+                        graph,
+                        domain,
+                        unstable,
+                        effective_split_depth,
+                    ) {
+                        Ok(branches) => branches,
+                        Err(error) => {
+                            tracing::warn!("select_graph_branches failed for idx {}: {error}", idx);
+                            return Err(*idx);
+                        }
+                    };
+                    let children = match domain.with_multi_constraints(
+                        graph,
+                        &branches,
+                        self.config.verify_upper_bound,
+                    ) {
+                        Ok(children) => children,
+                        Err(error) if error.is_infeasible_domain() => Vec::new(),
+                        Err(error) => {
+                            tracing::warn!(
+                                "with_multi_constraints failed for idx {}: {error}",
+                                idx
+                            );
+                            return Err(*idx);
+                        }
+                    };
+                    let children_info = children
+                        .into_iter()
+                        // The phase bit is legacy metadata and is ignored by
+                        // every downstream bound/result path.
+                        .map(|child| (*idx, child, true))
+                        .collect();
+                    return Ok((*idx, children_info));
+                }
+
                 let (node_name, neuron_idx, score) = match self
                     .select_graph_branch(graph, domain, unstable)
                 {

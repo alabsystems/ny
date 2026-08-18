@@ -68,12 +68,15 @@ impl PoolPlan {
             return None;
         }
         let (c, in_h, in_w) = in_shape;
+        if c == 0 {
+            return None;
+        }
         if in_h < kernel.0 || in_w < kernel.1 {
             return None;
         }
         let out_h = (in_h - kernel.0) / stride.0 + 1;
         let out_w = (in_w - kernel.1) / stride.1 + 1;
-        Some(PoolPlan {
+        let plan = PoolPlan {
             c,
             in_h,
             in_w,
@@ -83,10 +86,38 @@ impl PoolPlan {
             kw: kernel.1,
             sh: stride.0,
             sw: stride.1,
-        })
+        };
+        plan.checked_sizes()?;
+        Some(plan)
     }
 
+    fn checked_sizes(&self) -> Option<(usize, usize, usize)> {
+        if self.c == 0
+            || self.kh == 0
+            || self.kw == 0
+            || self.sh == 0
+            || self.sw == 0
+            || self.in_h < self.kh
+            || self.in_w < self.kw
+        {
+            return None;
+        }
+        let expected_out_h = (self.in_h - self.kh) / self.sh + 1;
+        let expected_out_w = (self.in_w - self.kw) / self.sw + 1;
+        if (self.out_h, self.out_w) != (expected_out_h, expected_out_w) {
+            return None;
+        }
+        let in_hw = self.in_h.checked_mul(self.in_w)?;
+        let out_hw = self.out_h.checked_mul(self.out_w)?;
+        self.c.checked_mul(in_hw)?;
+        let n_out = self.c.checked_mul(out_hw)?;
+        Some((in_hw, out_hw, n_out))
+    }
+
+    #[cfg(test)]
     pub(crate) fn out_numel(&self) -> usize {
+        // Every plan returned by `build` has passed `checked_sizes`; runtime
+        // consumers revalidate before indexing because the fields are crate-visible.
         self.c * self.out_h * self.out_w
     }
 }
@@ -95,7 +126,10 @@ impl PoolPlan {
 ///
 /// Returns `None` when a certified bound is non-finite.
 pub(crate) fn apply_maxpool(z: &DdZono, plan: &PoolPlan) -> Option<(DdZono, RelaxOutcome)> {
-    let n_out = plan.out_numel();
+    let (ihw, ohw, n_out) = plan.checked_sizes()?;
+    if !z.has_valid_layout() || z.shape.as_slice() != [plan.c, plan.in_h, plan.in_w] {
+        return None;
+    }
     let rad = z.radius();
     let (lo, up) = z.concretize_with_radius(&rad);
     if lo.iter().chain(up.iter()).any(|v| !v.is_finite()) {
@@ -103,9 +137,6 @@ pub(crate) fn apply_maxpool(z: &DdZono, plan: &PoolPlan) -> Option<(DdZono, Rela
     }
 
     let err = z.error_half_width(&rad, &lo, &up);
-    let ihw = plan.in_h * plan.in_w;
-    let ohw = plan.out_h * plan.out_w;
-
     let mut sel = vec![0usize; n_out];
     let mut half = vec![0.0_f64; n_out];
     // Exact bound on the part of each window's slack that the ERROR CHANNEL
@@ -225,4 +256,40 @@ pub(crate) fn apply_maxpool(z: &DdZono, plan: &PoolPlan) -> Option<(DdZono, Rela
             folded,
         },
     ))
+}
+
+#[cfg(test)]
+mod plan_validation_tests {
+    use ny_core::dd::Dd;
+
+    use super::{apply_maxpool, PoolPlan};
+    use crate::dd_zonotope::state::DdZono;
+
+    fn state() -> DdZono {
+        DdZono {
+            shape: vec![1, 2, 2],
+            center: vec![Dd::ZERO; 4],
+            gens: vec![vec![0.0; 4]],
+            ec: vec![0.0; 4],
+            eg: vec![0.0; 4],
+        }
+    }
+
+    #[test]
+    fn pool_plan_rejects_zero_channels_and_overflowing_products() {
+        assert!(PoolPlan::build((0, 2, 2), (1, 1), (1, 1), (0, 0)).is_none());
+        assert!(PoolPlan::build((usize::MAX, 2, 2), (1, 1), (1, 1), (0, 0)).is_none());
+    }
+
+    #[test]
+    fn maxpool_refuses_malformed_plan_or_state_before_indexing() {
+        let mut malformed_plan = PoolPlan::build((1, 2, 2), (1, 1), (1, 1), (0, 0)).unwrap();
+        malformed_plan.out_h = 3;
+        assert!(apply_maxpool(&state(), &malformed_plan).is_none());
+
+        let valid_plan = PoolPlan::build((1, 2, 2), (1, 1), (1, 1), (0, 0)).unwrap();
+        let mut malformed_state = state();
+        malformed_state.ec.pop();
+        assert!(apply_maxpool(&malformed_state, &valid_plan).is_none());
+    }
 }

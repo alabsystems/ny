@@ -264,13 +264,26 @@ class SourceSchemaTests(unittest.TestCase):
     def test_actual_alias_header_artifacts_remain_loadable(self) -> None:
         for track in ("lsnc_relu", "relusplitter"):
             source = REPO_ROOT / "reports/measured" / f"{track}.csv"
-            if not source.is_file():
-                self.skipTest("measured report artifacts are not installed")
             with self.subTest(track=track):
+                self.assertTrue(
+                    source.is_file(),
+                    f"tracked measured report artifact is missing: {source}",
+                )
                 results = validate_bank.load_source_results(source, track)
                 self.assertTrue(results)
+                # These two ledgers moved to the 7-column `measured_v2` header
+                # when a re-sweep started recording run_id on the rows it
+                # actually re-ran. The declared header must keep binding EVERY
+                # row to one schema (that strictness is pinned by
+                # test_declared_header_rejects_every_target_schema_mismatch), so
+                # rows nobody re-ran carry the repository's existing
+                # `inherited-unverified` token rather than an empty field.
                 self.assertTrue(
-                    all(result.schema == "measured_v1" for result in results)
+                    all(result.schema == "measured_v2" for result in results)
+                )
+                self.assertTrue(
+                    all(result.run_id for result in results),
+                    "a measured_v2 ledger must not leave provenance blank",
                 )
 
     def test_headerless_five_six_and_seven_column_schemas_remain_supported(
@@ -300,12 +313,38 @@ class PortabilityTests(unittest.TestCase):
         args = validate_bank._resolve_cli(parser.parse_args(["track", "source.csv"]))
         self.assertEqual(validate_bank.REPO_ROOT, REPO_ROOT)
         self.assertEqual(args.ny_bin, REPO_ROOT / "target/release/ny")
-        self.assertEqual(args.ay_bin, REPO_ROOT.parent / "ay/target/release/ay")
+        self.assertEqual(
+            args.ay_bin,
+            (REPO_ROOT.parent / "ay/target/release/ay").resolve(),
+        )
         self.assertEqual(
             args.bench_root,
-            REPO_ROOT / "benchmarks/vnncomp2025/benchmarks",
+            (REPO_ROOT / "benchmarks/vnncomp2025/benchmarks").resolve(),
         )
         self.assertEqual(args.output, REPO_ROOT / "reports/measured-ext/track.csv")
+
+    def test_default_ay_binary_resolves_a_symlinked_sibling_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            repo_root = parent / "ny"
+            actual_ay = parent / "immutable-ay"
+            repo_root.mkdir()
+            (actual_ay / "target/release").mkdir(parents=True)
+            try:
+                (parent / "ay").symlink_to(actual_ay, target_is_directory=True)
+            except OSError as error:
+                self.fail(
+                    "directory symlinks are required by the sibling-repository "
+                    f"portability contract: {error}"
+                )
+
+            resolved = validate_bank._resolve_from_repo(
+                None,
+                repo_root,
+                repo_root.parent / "ay/target/release/ay",
+            )
+
+            self.assertEqual(resolved, actual_ay.resolve() / "target/release/ay")
 
     def test_help_does_not_import_numpy_or_onnxruntime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -516,26 +555,6 @@ class StreamingParserTests(unittest.TestCase):
                 tracemalloc.stop()
         self.assertEqual(requirements.input_assertion_count, assertion_count)
         self.assertLess(peak, 4 * 1024 * 1024)
-
-    @unittest.skipUnless(
-        (
-            REPO_ROOT
-            / "benchmarks/vnncomp2025/benchmarks/collins_aerospace_benchmark"
-            / "vnnlib/img_8758_perturbed_bbox_4_delta_0.05.vnnlib"
-        ).is_file(),
-        "Collins benchmark corpus is not installed",
-    )
-    def test_real_collins_property_structural_smoke(self) -> None:
-        path = (
-            REPO_ROOT
-            / "benchmarks/vnncomp2025/benchmarks/collins_aerospace_benchmark"
-            / "vnnlib/img_8758_perturbed_bbox_4_delta_0.05.vnnlib"
-        )
-        requirements = vnnlib_ce.property_requirements(path)
-        self.assertEqual(requirements.input_count, 1_228_800)
-        self.assertEqual(requirements.input_assertion_count, 2_457_600)
-        self.assertEqual(requirements.output_assertion_count, 1)
-
 
 class FailClosedWitnessTests(unittest.TestCase):
     @staticmethod
@@ -1174,6 +1193,12 @@ class EnvironmentDependencyTests(unittest.TestCase):
         def fake_import_module(target, package=None):
             if target == name:
                 raise ModuleNotFoundError(f"No module named {name!r}")
+            if target in validate_bank.VALIDATION_DEPENDENCIES:
+                # Keep this dependency-order test hermetic: the repository's
+                # base test requirements intentionally do not install ONNX or
+                # ONNX Runtime, and an earlier absent package must not mask the
+                # package selected by this subtest.
+                return SimpleNamespace(__name__=target)
             return real_import_module(target, package)
 
         return mock.patch.object(

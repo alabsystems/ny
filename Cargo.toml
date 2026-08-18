@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ny-api",
+    "crates/ny-gpu-passthrough",
     "crates/ny-build",
     "crates/ny-core",
     "crates/ny-load",
@@ -18,8 +19,10 @@ members = [
     "crates/ny-trace-bridge",
     "crates/ny-contracts",
     "crates/ny-cuda",
+    "crates/ny-accelerate",
     "crates/ny-groundtruth",
     "crates/ny-lint-guard",
+    "crates/ny-levers",
 ]
 # Kani proofs excluded: verified separately with `cargo kani`
 exclude = ["proofs/kani", "fuzz"]
@@ -35,10 +38,16 @@ default-members = [
     "crates/ny-gpu",
     "crates/ny-mip",
     "crates/ny-groundtruth",
+    # Macos/aarch64 Accelerate seam. Already compiled on Apple silicon as a
+    # ny-cli target dependency; listed here so `cargo test` at the workspace
+    # root runs its conformance + mutation + exact-rational suites (the probe
+    # spec's "CI (not runtime)" obligation). Compiles to an inert stub with zero
+    # tests on every other target.
+    "crates/ny-accelerate",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 license = "Apache-2.0"
@@ -183,6 +192,16 @@ unused_async = "allow"               # Async scaffolding for wgpu device methods
 
 [workspace.dependencies]
 # Core
+# Non-cryptographic hasher for INTERNAL maps only. SipHash's DoS resistance buys
+# nothing for keys ny generates itself (node names, neuron indices). Never use
+# this where a map is exposed to untrusted input.
+#
+# Scope honestly: on the 2026-08-08 oval21 `base_kw` profile the BaB alpha-state
+# maps were the largest *identifiable* ny cluster (hash_one 193 + insert 152 +
+# reserve_rehash 59 + rustc_entry 44) but only ~2.8% of thread samples, so the
+# ceiling here is ~2%. A 40-row A/B measured +0 solves. Kept because it is free
+# and semantics-preserving, NOT because it converts verdicts.
+rustc-hash = "2.1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -191,11 +210,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Tensor operations - matrixmultiply provides fast matrix ops
 # On macOS, ndarray/blas + blas-src/accelerate routes dot() through Accelerate.framework BLAS.
 # The base feature set is platform-neutral; macOS crates add blas via target-specific deps.
-ndarray = { version = "0.17", features = ["rayon", "serde", "matrixmultiply-threading"] }
+# Exact pin: BoundedTensor allocation provenance audits ndarray's owned-array
+# representation and reconstruction behavior. Upgrades require re-audit and KATs.
+ndarray = { version = "=0.17.2", features = ["rayon", "serde", "matrixmultiply-threading"] }
 blas-src = { version = "0.14", features = ["accelerate"] }
 
 # High-performance linear algebra (competitive with BLAS, pure Rust)
-faer = "0.24"
+faer = "=0.24.0"
 num-traits = "0.2"
 # Arbitrary-precision exact rationals (ny-cert proof-carrying certificates).
 num-bigint = "0.4"
@@ -208,6 +229,7 @@ trust = { package = "ny-contracts", path = "crates/ny-contracts" }
 rayon = "1.10"
 libm = "0.2"
 rand = "0.10"
+rustix = { version = "1.1.4", features = ["process", "time"] }
 
 # GPU acceleration
 wgpu = "29"  # Upgraded from 24 for cross-crate consistency
@@ -215,7 +237,18 @@ pollster = "0.4"  # For blocking on async wgpu calls
 bytemuck = { version = "1.20", features = ["derive"] }
 
 # ONNX support
-ort = "2.0.0-rc.12"  # ONNX Runtime bindings
+# ONNX Runtime bindings. Spell out the upstream defaults so the build uses
+# rustls for the optional prebuilt-runtime download instead of requiring a
+# system OpenSSL development package just to build the default CLI.
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+    "api-24",
+] }
 prost = "0.14"
 
 # SafeTensors support
@@ -230,16 +263,19 @@ coreml-proto = "0.1"
 # GGUF support (for loading llama.cpp .gguf files)
 gguf = "0.1"
 
-# Memory-mapped file I/O (for efficient large model loading)
-memmap2 = "0.9"
-
 # Zip archive support (for PyTorch nested models)
 zip = "4.2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1"
 serde_json = "1"
 serde_yaml = "0.9"
+
+# `ny-propagate` uses the pinned table-allocation observation contract for
+# finalized-graph structural-map provenance. Do not relax this pin without
+# reviewing that accounting model and its known-answer tests.
+hashbrown = { version = "=0.16.1", features = ["serde"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -258,12 +294,39 @@ npyz = "0.8"
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 
-# Cryptographic hashing (SHA256 for model fingerprinting)
+# SHA-256 model fingerprinting and ONNX's specified SHA-1 sidecar checksum.
 sha2 = "0.10"
+sha1 = "0.10"
+
+# Capability-relative filesystem access for securely resolving ONNX external data.
+cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
 
 # Half-precision floats
 half = { version = "2.4", features = ["num-traits", "serde"] }
 
+
+# Debug info was 139GB of a 159GB target/ — larger than every other artifact in
+# the tree combined, and it is also rustc memory, which is what OOM-killed this
+# host on 2026-08-01 (see .cargo/config.toml).
+#
+# `line-tables-only` keeps what is actually used day to day: backtraces still
+# carry file and line for every frame, so `RUST_BACKTRACE=1` on a panicking
+# solve reads exactly as before. What is given up is variable inspection under
+# a debugger. If you need to step through ny in lldb, set `debug = true` here
+# and rebuild that one crate — the setting is per-profile, not per-run, so
+# flipping it back costs a rebuild and nothing else.
+#
+# `[profile.dev.package."*"]` turns it off entirely for dependencies. Roughly
+# 500 upstream crates were carrying full DWARF that nobody steps through.
+#
+# `[profile.test]` inherits from `[profile.dev]`, so this covers the 9,115-test
+# ny-propagate binary too.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = true

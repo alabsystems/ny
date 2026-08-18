@@ -10,7 +10,7 @@ use crate::WeightStore;
 use ndarray::{ArrayD, IxDyn};
 
 #[test]
-fn test_lsnc_chain_constant_matmul_add_relu() {
+fn test_lsnc_chain_stops_before_inexact_constant_add() {
     // Tests the chain: Constant -> MatMul(with weight) -> Add(with bias) -> Relu
     // This is the exact pattern from the lsnc quadrotor2d model
     let const_tensor = tensor_f32("const_val", &[1, 2], &[1.0, -1.0]);
@@ -51,15 +51,14 @@ fn test_lsnc_chain_constant_matmul_add_relu() {
         "Constant should be folded"
     );
     assert!(weights.contains_key("mm_out"), "MatMul should be folded");
-    assert!(weights.contains_key("add_out"), "Add should be folded");
-    let relu_out = weights.get("relu_out").expect("Relu should be folded");
-    // Const [1,2] @ Weight [2,3] = [1,3]: [1*1+(-1)*0, 1*0+(-1)*1, 1*0.5+(-1)*(-0.5)] = [[1, -1, 1]]
-    // Add bias [3] broadcasts: [[1.1, -0.8, 1.3]]
-    // Relu: [[1.1, 0.0, 1.3]]
-    assert_eq!(relu_out.shape(), &[1, 3]);
-    assert!((relu_out[[0, 0]] - 1.1).abs() < 1.0e-4);
-    assert!((relu_out[[0, 1]] - 0.0).abs() < 1.0e-4);
-    assert!((relu_out[[0, 2]] - 1.3).abs() < 1.0e-4);
+    assert!(
+        !weights.contains_key("add_out"),
+        "1.0 + authored f32(0.1) is not exactly binary32 and must remain explicit"
+    );
+    assert!(
+        !weights.contains_key("relu_out"),
+        "the dependent ReLU cannot fold after the certified chain stops"
+    );
 }
 
 #[test]

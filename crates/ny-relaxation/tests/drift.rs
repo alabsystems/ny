@@ -14,29 +14,15 @@
 //! 1. BIT-EXACT — the implementations are copies; any bit difference in any
 //!    output field fails: `abs`, `pow2`, `exp`, `gelu_eval`, `silu_eval`,
 //!    `gelu_tanh_inflection_point`, the softmax/logsoftmax/logsumexp IBP
-//!    helpers, and all `safe_*`/`interval_mul` helpers. (For `silu` the
-//!    near-point path `|u-l| < 1e-8` is also bit-exact.)
+//!    helpers, all `safe_*`/`interval_mul` helpers, and the `log`/`sqrt`
+//!    relaxations. The latter two include the caller-side f32 multiplication
+//!    corrections required by the Kani proofs, in both crates.
 //!
-//! 2. DIRECTIONAL — the pair intentionally differs: the mirror keeps extra
-//!    caller-side f32 multiplication-rounding corrections (`mul_err`, Kani
-//!    lineage: proof `sqrt_alpha_upper_sound_mid_at_lower`) that production
-//!    lacks. Slopes must be bit-equal; the mirror's intercepts must be
-//!    OUTSIDE (looser than) production's by no more than the correction
-//!    magnitude: `log`, `sqrt`. NOTE (residual gap): because the mirror band
-//!    strictly contains the production band, the Kani proofs do NOT transfer
-//!    to production — certifying the wider mirror band says nothing about the
-//!    tighter production band at the ~1-ulp scale of the missing `mul_err`
-//!    term. Closing the gap requires porting the mirror's corrections into
-//!    ny-propagate. As a stopgap, every directional test ALSO empirically
-//!    checks both bands against an f64 reference on a dense x-grid.
-//!
-//! Pairs that cannot be held to either policy are covered by
-//! empirical-soundness + partial-relation tests, each with a NOTE naming the
-//! residual gap: `silu` (branch-verification fallbacks may diverge), the
-//! `gelu` sound relaxations (production adds a `clamp_lower_to_floor`
-//! tightening the mirror lacks), and `relu` (the mirror is a standalone
-//! reference; the production scalar `relu_linear_relaxation` is pub(crate)
-//! and is exercised through the public `ReLULayer` CROWN backward path).
+//! `silu` and the standard sound `gelu` relaxations are likewise bound
+//! bit-exact after their proof-required multiplication corrections and GELU
+//! floor tightening were shared. `relu` remains a standalone reference; the
+//! production scalar path is pub(crate) and is exercised through the public
+//! `ReLULayer` CROWN backward path.
 
 use ndarray::{ArrayD, IxDyn};
 use ny_relaxation as mirror;
@@ -254,15 +240,6 @@ fn assert_band_sound(
     }
 }
 
-/// Bound on how far the mirror's intercept may sit outside production's:
-/// the mirror's extra `mul_err` correction (|slope|*max|x|*eps, rounded up)
-/// plus a few ulps from the extra directed-rounding steps.
-fn intercept_gap_bound(slope: f32, max_abs_x: f32, intercept: f32) -> f64 {
-    let eps = f32::EPSILON as f64;
-    let mul = (slope.abs() as f64) * (max_abs_x as f64) * eps;
-    4.0 * mul + 8.0 * eps * (intercept.abs() as f64) + f32::MIN_POSITIVE as f64
-}
-
 // =========================================================================
 // Tier 1: bit-exact pairs
 // =========================================================================
@@ -473,184 +450,69 @@ fn drift_safe_math_bit_exact() {
 }
 
 // =========================================================================
-// Tier 2: directional pairs (mirror = production + extra mul_err corrections)
+// Tier 2: proof-bound nonlinear pairs
 // =========================================================================
 
 #[test]
-fn drift_log_directional() {
+fn drift_log_bit_exact() {
     for (l, u) in intervals() {
         let m = mirror_band(mirror::log_linear_relaxation(l, u));
         let p = prod_band(prod_layers::log_linear_relaxation(l, u));
 
-        // Slopes are computed identically (chord / parallel-to-chord tangent
-        // with identical branch conditions) and must match bit-for-bit.
         assert!(
-            feq(m.0, p.0) && feq(m.2, p.2),
-            "log slope drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
+            band_eq(m, p),
+            "log drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
         );
 
-        // Intercepts: mirror must be outside production by at most the
-        // mirror's extra mul_err correction. NOTE (residual gap): production
-        // log lacks the f32 multiplication-rounding term; the Kani log proofs
-        // certify only the wider mirror band.
-        let lc = if l > 1e-10 { l } else { 1e-10 };
-        let uc = if u > 1e-10 { u } else { 1e-10 };
-        // The infinite-upper branch derives its corrections from the clamped
-        // lower bound only (and inf would poison the gap bound via 0 * inf).
-        let max_abs_x = if u.is_finite() {
-            lc.abs().max(uc.abs())
-        } else {
-            lc.abs()
-        };
-        if m.1.is_finite() && p.1.is_finite() {
-            let gap = intercept_gap_bound(m.0, max_abs_x, p.1);
-            assert!(
-                m.1 <= p.1 && (p.1 as f64 - m.1 as f64) <= gap,
-                "log lower intercept drift at l={l:e} u={u:e}: \
-                 mirror={:e} prod={:e} gap_bound={gap:e}",
-                m.1,
-                p.1
-            );
-        }
-        if m.3.is_finite() && p.3.is_finite() {
-            let gap = intercept_gap_bound(m.2, max_abs_x, p.3);
-            assert!(
-                m.3 >= p.3 && (m.3 as f64 - p.3 as f64) <= gap,
-                "log upper intercept drift at l={l:e} u={u:e}: \
-                 mirror={:e} prod={:e} gap_bound={gap:e}",
-                m.3,
-                p.3
-            );
-        }
-
-        // Empirical soundness of BOTH bands (production is not proof-covered).
-        // log's domain contract is x > 0 (callers validate via IBP); check on
-        // the clamped domain the implementations actually bound.
-        //
-        // #drift-log-narrow-tiny (RESOLVED): the shared narrow-interval path
-        // used an ABSOLUTE width guard (|u-l| < 1e-8 after the 1e-10 clamp)
-        // and returned the tangent at l for BOTH lines; a tangent lies ABOVE
-        // concave ln, so the certified LOWER line overshot ln(u) by
-        // r - ln(1+r), r = (u-l)/l — +45.09 at [1e-12, 5e-9] (post-clamp
-        // [1e-10, 5e-9]), 1.1e-5 at [1e-6, 1e-6+5e-9]. Both crates now guard
-        // RELATIVE to l ((u-l) < l * 1e-7) and return the endpoint-constant
-        // band [ln(l) rounded down, ln(u) rounded up]. The constant band has
-        // no slope and hence no mul_err divergence, so the narrow path is
-        // held BIT-EXACT and the soundness sweep below runs with no
-        // degenerate exemption. The historical adversarial intervals are
-        // asserted as positive checks after the loop.
-        let narrow = ((uc as f64) - (lc as f64)) < (lc as f64) * 1e-7;
-        if u.is_finite() && narrow {
-            assert!(
-                band_eq(m, p),
-                "log narrow-path drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
-            );
-        }
-        if u.is_finite() {
-            let f = |x: f64| x.max(1e-10).ln();
-            assert_band_sound("log", "mirror", lc, uc, m, &f, 1e-12, 0.0);
-            // KNOWN UNSOUND (#drift-log-missing-mul-err): production's f32-
-            // evaluated lower line can exceed ln(x) by exactly the omitted
-            // mul_err correction — observed at [1e-10, 1e8]: line(1e8) =
-            // 18.420681 vs ln(1e8) = 18.42068074 (violation 2.6e-8). The
-            // mirror (with mul_err) passes at zero extra slack; production is
-            // granted precisely the missing-correction budget so any LARGER
-            // violation still fails.
-            let mul_gap = (m.0.abs().max(m.2.abs()) as f64)
-                * (max_abs_x as f64)
-                * (f32::EPSILON as f64)
-                * 2.0;
-            assert_band_sound("log", "prod", lc, uc, p, &f, 1e-12, mul_gap);
+        // ln accepts every positive f32; invalid/non-finite domains fail
+        // closed and are already covered by the bit-exact check above.
+        if l.is_finite() && u.is_finite() && l > 0.0 {
+            let f = |x: f64| x.ln();
+            assert_band_sound("log", "mirror", l, u, m, &f, 1e-12, 0.0);
+            assert_band_sound("log", "prod", l, u, p, &f, 1e-12, 0.0);
         }
     }
 
-    // Positive soundness checks at the #drift-log-narrow-tiny adversarial
-    // intervals (formerly exempted as KNOWN UNSOUND): the old absolute narrow
-    // guard certified a LOWER line +45.09 above ln(u) on the first of these.
-    // Only the post-clamp point interval still takes the (bit-exact) narrow
-    // path; the others now fall through to the general chord/tangent path,
-    // where production keeps its #drift-log-missing-mul-err budget.
-    let f = |x: f64| x.max(1e-10).ln();
+    // Positive soundness checks at tiny and narrow adversarial intervals. The
+    // old absolute-width path used an invalid lower tangent; both crates now
+    // use a relative-width constant band and preserve subnormal domains.
+    let f = |x: f64| x.ln();
     let adversarial: [(f32, f32); 4] = [
-        (1e-12, 5e-9),       // clamps to [1e-10, 5e-9]; was unsound by 45.09
-        (1e-10, 5e-9),       // same interval, no clamp involved
+        (f32::from_bits(1), f32::from_bits(2)),
+        (1e-12, 5e-9),
         (1e-6, 1e-6 + 5e-9), // was unsound by 1.1e-5
-        (1e-12, 2e-12),      // clamps to the point interval [1e-10, 1e-10]
+        (1e-12, 2e-12),
     ];
     for (l, u) in adversarial {
-        let lc = if l > 1e-10 { l } else { 1e-10 };
-        let uc = if u > 1e-10 { u } else { 1e-10 };
         let m = mirror_band(mirror::log_linear_relaxation(l, u));
         let p = prod_band(prod_layers::log_linear_relaxation(l, u));
-        if ((uc as f64) - (lc as f64)) < (lc as f64) * 1e-7 {
-            assert!(
-                band_eq(m, p),
-                "log adversarial narrow drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
-            );
-        }
-        assert_band_sound("log", "mirror", lc, uc, m, &f, 1e-12, 0.0);
-        let mul_gap = (m.0.abs().max(m.2.abs()) as f64) * (uc as f64) * (f32::EPSILON as f64) * 2.0;
-        assert_band_sound("log", "prod", lc, uc, p, &f, 1e-12, mul_gap);
+        assert!(band_eq(m, p));
+        assert_band_sound("log", "mirror", l, u, m, &f, 1e-12, 0.0);
+        assert_band_sound("log", "prod", l, u, p, &f, 1e-12, 0.0);
     }
 }
 
 #[test]
-fn drift_sqrt_directional() {
+fn drift_sqrt_bit_exact() {
     for (l, u) in intervals() {
         let m = mirror_band(mirror::sqrt_linear_relaxation(l, u));
         let p = prod_band(prod_layers::sqrt_linear_relaxation(l, u));
 
         assert!(
-            feq(m.0, p.0) && feq(m.2, p.2),
-            "sqrt slope drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
+            band_eq(m, p),
+            "sqrt drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
         );
-
-        // NOTE (residual gap): production sqrt lacks the mul-rounding
-        // corrections the Kani proof `sqrt_alpha_upper_sound_mid_at_lower`
-        // forced into the mirror; production's alpha path
-        // (`sqrt_linear_relaxation_with_alpha`, pub(crate)) is additionally
-        // unreachable from here and only its default tangent point is bound.
-        let max_abs_x = l.max(0.0).abs().max(u.max(0.0).abs());
-        if m.1.is_finite() && p.1.is_finite() {
-            let gap = intercept_gap_bound(m.0, max_abs_x, p.1);
-            assert!(
-                m.1 <= p.1 && (p.1 as f64 - m.1 as f64) <= gap,
-                "sqrt lower intercept drift at l={l:e} u={u:e}: \
-                 mirror={:e} prod={:e} gap_bound={gap:e}",
-                m.1,
-                p.1
-            );
-        }
-        if m.3.is_finite() && p.3.is_finite() {
-            let gap = intercept_gap_bound(m.2, max_abs_x, p.3);
-            assert!(
-                m.3 >= p.3 && (m.3 as f64 - p.3 as f64) <= gap,
-                "sqrt upper intercept drift at l={l:e} u={u:e}: \
-                 mirror={:e} prod={:e} gap_bound={gap:e}",
-                m.3,
-                p.3
-            );
-        }
 
         if l.is_finite() && u.is_finite() {
             let f = |x: f64| x.max(0.0).sqrt();
             assert_band_sound("sqrt", "mirror", l, u, m, &f, 1e-13, 0.0);
-            // KNOWN UNSOUND (#drift-sqrt-missing-mul-err): as for log,
-            // production's f32-evaluated chord can cross sqrt(x) by the
-            // omitted mul_err — observed at [0, 2e-8]: lower line(2e-8) =
-            // 1.4142136e-4 vs sqrt = 1.41421356e-4 (violation 5.2e-12).
-            // Production gets exactly the missing-correction budget.
-            let mul_gap = (m.0.abs().max(m.2.abs()) as f64)
-                * (max_abs_x as f64)
-                * (f32::EPSILON as f64)
-                * 2.0;
-            assert_band_sound("sqrt", "prod", l, u, p, &f, 1e-13, mul_gap);
+            assert_band_sound("sqrt", "prod", l, u, p, &f, 1e-13, 0.0);
         }
     }
 }
 
 // =========================================================================
-// Tier 3: structurally diverging pairs (partial relations + soundness)
+// Tier 3: nonlinear proof mirrors and the standalone ReLU reference
 // =========================================================================
 
 #[test]
@@ -660,47 +522,14 @@ fn drift_silu() {
         let m = mirror_band(mirror::silu_sound_linear_relaxation(l, u));
         let p = prod_band(prod_layers::silu_sound_linear_relaxation(l, u));
 
-        if l.is_finite() && u.is_finite() && (u - l).abs() < 1e-8 {
-            // Near-point path is a literal copy: bit-exact.
-            assert!(
-                band_eq(m, p),
-                "silu near-point drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
-            );
-        } else {
-            // NOTE (residual gap): outside the near-point path the pair can
-            // legitimately diverge in branch, not just intercept: both sides
-            // verify their tangent/chord candidates against silu and fall
-            // back to constant bounds on failure, and the mirror's wider
-            // (mul_err-corrected) intercepts can pass a verification the
-            // tighter production intercepts fail (or vice versa). When
-            // neither side fell back, slopes must agree bit-for-bit and the
-            // mirror's intercepts must enclose production's.
-            let same_shape = feq(m.0, p.0) && feq(m.2, p.2);
-            let a_fallback = m.0 == 0.0 || m.2 == 0.0 || p.0 == 0.0 || p.2 == 0.0;
-            assert!(
-                same_shape || a_fallback,
-                "silu slope drift without fallback at l={l:e} u={u:e}: \
-                 mirror={m:?} prod={p:?}"
-            );
-            if same_shape && !a_fallback {
-                assert!(
-                    m.1 <= p.1 && m.3 >= p.3,
-                    "silu intercept direction drift at l={l:e} u={u:e}: \
-                     mirror={m:?} prod={p:?}"
-                );
-            }
-        }
+        assert!(
+            band_eq(m, p),
+            "silu drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
+        );
 
-        // NOTE: 1e-7 (~2 f32 ulps) rather than the 1e-11 used elsewhere —
-        // silu's constant bands (near-point path, min_val/max_val fallbacks)
-        // are round-to-nearest `silu_eval` values without directed rounding,
-        // so both crates are sound only to half an output ulp (e.g. at
-        // l=u=0.05 the upper band sits 8.2e-10 BELOW true silu). Shared
-        // mirror/production behavior; the Kani proof
-        // `silu_sound_point_interval` likewise asserts only a tolerance.
         if l.is_finite() && u.is_finite() {
-            assert_band_sound("silu", "mirror", l, u, m, &silu, 1e-7, 0.0);
-            assert_band_sound("silu", "prod", l, u, p, &silu, 1e-7, 0.0);
+            assert_band_sound("silu", "mirror", l, u, m, &silu, 1e-11, 0.0);
+            assert_band_sound("silu", "prod", l, u, p, &silu, 1e-11, 0.0);
         }
     }
 }
@@ -727,70 +556,15 @@ fn drift_gelu_sound() {
             };
             let name = if erf { "gelu_erf" } else { "gelu_tanh" };
 
-            // Upper: chord/tangent slope selection is computed identically;
-            // the intercepts differ by the mirror's extra chord/mid mul_err
-            // AND by `gelu_posthoc_adjust`, which widens each side by its own
-            // observed sample violations, so the difference is bounded but
-            // NOT directional. NOTE (residual gap): production's intercepts
-            // are generally tighter than what the Kani gelu proofs certify.
             assert!(
-                feq(m.2, p.2),
-                "{name} upper slope drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
+                band_eq(m, p),
+                "{name} drift at l={l:e} u={u:e}: mirror={m:?} prod={p:?}"
             );
-            let max_abs_x = if l.is_finite() && u.is_finite() {
-                l.abs().max(u.abs())
-            } else {
-                0.0
-            };
-            if m.3.is_finite() && p.3.is_finite() && m.2.is_finite() {
-                let gap = 2.0 * intercept_gap_bound(m.2, max_abs_x, p.3);
-                assert!(
-                    (m.3 as f64 - p.3 as f64).abs() <= gap,
-                    "{name} upper intercept drift at l={l:e} u={u:e}: \
-                     mirror={:e} prod={:e} gap_bound={gap:e}",
-                    m.3,
-                    p.3
-                );
-            }
-
-            // Lower: production additionally applies clamp_lower_to_floor
-            // (raises the lower line to the constant interval minimum when
-            // the line concretizes below it) — a tightening the mirror lacks.
-            // NOTE (residual gap): when the clamp fires (prod slope 0.0) the
-            // production lower bound is NOT covered by the Kani gelu proofs.
-            if feq(m.0, p.0) {
-                if m.1.is_finite() && p.1.is_finite() && m.0.is_finite() {
-                    let gap = 2.0 * intercept_gap_bound(m.0, max_abs_x, p.1);
-                    assert!(
-                        (m.1 as f64 - p.1 as f64).abs() <= gap,
-                        "{name} lower intercept drift at l={l:e} u={u:e}: \
-                         mirror={:e} prod={:e} gap_bound={gap:e}",
-                        m.1,
-                        p.1
-                    );
-                }
-            } else {
-                assert!(
-                    p.0 == 0.0,
-                    "{name} lower drift is not the production clamp at l={l:e} u={u:e}: \
-                     mirror={m:?} prod={p:?}"
-                );
-            }
 
             if l.is_finite() && u.is_finite() {
                 let f: &dyn Fn(f64) -> f64 = if erf { &gelu_erf } else { &gelu_tanh };
                 assert_band_sound(name, "mirror", l, u, m, f, 1e-11, 0.0);
-                // KNOWN UNSOUND (#drift-gelu-missing-mul-err): same class as
-                // log/sqrt — production's f32-evaluated lines can cross gelu
-                // by the omitted mul_err (observed at l=u=-1e-3: lower line
-                // -4.9960107e-4 vs gelu -4.9960108e-4, violation 1.1e-11).
-                // Production gets exactly the missing-correction budget.
-                let mul_gap = (m.0.abs().max(m.2.abs()) as f64)
-                    * (max_abs_x as f64)
-                    * (f32::EPSILON as f64)
-                    * 2.0;
-                let mul_gap = if mul_gap.is_finite() { mul_gap } else { 0.0 };
-                assert_band_sound(name, "prod", l, u, p, f, 1e-11, mul_gap);
+                assert_band_sound(name, "prod", l, u, p, f, 1e-11, 0.0);
             }
         }
     }

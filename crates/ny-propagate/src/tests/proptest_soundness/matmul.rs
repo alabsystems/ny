@@ -276,9 +276,10 @@ proptest! {
 
         let result = matmul.propagate_linear_binary(&identity, &a_bounds, &b_bounds);
         match result {
-            Err(_) => {
-                // McCormick CROWN may reject infinite/overflow bounds — skip case
-                return Err(TestCaseError::reject("McCormick CROWN rejected overflow bounds"));
+            Err(e) => {
+                return Err(TestCaseError::fail(format!(
+                    "McCormick CROWN rejected generated finite scalar inputs: {e}"
+                )));
             }
             Ok((bounds_a, bounds_b)) => {
                 // Sample corners and midpoints
@@ -344,7 +345,9 @@ proptest! {
 
         let result = matmul.propagate_linear_binary(&identity, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick CROWN rejected generated finite vector inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 let a_samples = [
                     (a0_l, a1_l), (a0_l, a1_u), (a0_u, a1_l), (a0_u, a1_u),
@@ -413,7 +416,9 @@ proptest! {
 
         let result = matmul.propagate_linear_binary(&identity, &a_bounds, &b_bounds);
         match result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick CROWN rejected generated finite matrix inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 let true_output = a_val * b_val;
 
@@ -469,7 +474,9 @@ proptest! {
         let identity = LinearBounds::identity(1);
         let crown_result = matmul.propagate_linear_binary(&identity, &a_bounds, &b_bounds);
         match crown_result {
-            Err(_) => return Err(TestCaseError::reject("McCormick CROWN rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "McCormick CROWN rejected generated finite batched inputs: {e}"
+            ))),
             Ok((bounds_a, bounds_b)) => {
                 // Concretize both paths and sum
                 let concrete_a: BoundedTensor = bounds_a.concretize(&a_bounds);

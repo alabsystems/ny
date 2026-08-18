@@ -25,15 +25,11 @@
 //! - Bit-exact pairs: `abs`, `pow2`, `exp`, `gelu_eval`, `silu_eval`,
 //!   `gelu_tanh_inflection_point`, the softmax/logsoftmax/logsumexp IBP
 //!   helpers, and the `safe_*`/`interval_mul` helpers.
-//! - Directional pairs (`log`, `sqrt`, the sound `gelu`/`silu`
-//!   relaxations): slopes are bit-equal but this crate keeps extra
-//!   caller-side f32 multiplication-rounding intercept corrections
-//!   (`mul_err`, forced by Kani proof `sqrt_alpha_upper_sound_mid_at_lower`)
-//!   that production lacks, so the mirror band strictly encloses the
-//!   production band. The Kani proofs therefore certify only the wider
-//!   mirror band; production's tighter intercepts (and production-only
-//!   tightenings such as gelu's `clamp_lower_to_floor`) are covered
-//!   empirically by the drift tests, not by proofs.
+//! - Proof-bound pairs (`log`, `sqrt`, and the sound `gelu`/`silu`
+//!   relaxations) are bit-exact with production. Their intercepts include the
+//!   full f32 affine-evaluation allowance (slope conversion, multiplication,
+//!   addition, and FTZ floors), and the GELU mirror includes production's
+//!   sound interval-minimum floor tightening.
 //! - `relu` remains a standalone reference implementation; the production
 //!   `relu_linear_relaxation`/`relu_crossing_upper_chord` path is pub(crate)
 //!   and is exercised through the public `ReLULayer` CROWN backward pass in

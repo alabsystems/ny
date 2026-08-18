@@ -24,7 +24,7 @@ mod validate;
 
 mod abs;
 mod pow;
-mod pow_relaxation;
+pub(crate) mod pow_relaxation;
 mod sqrt;
 
 #[cfg(test)]

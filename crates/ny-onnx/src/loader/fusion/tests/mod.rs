@@ -6,6 +6,7 @@ mod batch_norm;
 #[cfg(feature = "ort")]
 mod batch_norm_ort_prop;
 mod batch_norm_tail;
+mod bn_fold_interval;
 mod instance_norm;
 mod layer_norm;
 mod merge_linear;
@@ -27,13 +28,9 @@ fn make_node(op_type: &str, inputs: &[&str], outputs: &[&str]) -> NodeProto {
 fn make_axes_attr(axes: &[i64]) -> AttributeProto {
     AttributeProto {
         name: "axes".to_string(),
-        f: 0.0,
-        i: 0,
-        s: Vec::new(),
-        t: None,
         r#type: 7,
-        floats: Vec::new(),
         ints: axes.to_vec(),
+        ..Default::default()
     }
 }
 
@@ -48,13 +45,9 @@ fn make_const_scalar(output: &str, value: f32) -> NodeProto {
     };
     let attr = AttributeProto {
         name: "value".to_string(),
-        f: 0.0,
-        i: 0,
-        s: Vec::new(),
         t: Some(tensor),
         r#type: 4,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     };
     let mut node = make_node("Constant", &[], &[output]);
     node.attribute.push(attr);
@@ -64,26 +57,18 @@ fn make_const_scalar(output: &str, value: f32) -> NodeProto {
 fn make_float_attr(name: &str, value: f32) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        f: value,
-        i: 0,
-        s: Vec::new(),
-        t: None,
+        f: Some(value),
         r#type: attribute_type::FLOAT,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     }
 }
 
 fn make_int_attr(name: &str, value: i64) -> AttributeProto {
     AttributeProto {
         name: name.to_string(),
-        f: 0.0,
-        i: value,
-        s: Vec::new(),
-        t: None,
+        i: Some(value),
         r#type: attribute_type::INT,
-        floats: Vec::new(),
-        ints: Vec::new(),
+        ..Default::default()
     }
 }
 

@@ -12,6 +12,7 @@ use ny_propagate::Layer;
 use tracing::{debug, warn};
 
 use super::{AttributeValue, ConvertContext, LayerSpec};
+use crate::EXPAND_LIVE_SHAPE_REFERENCE_ATTR;
 
 fn parse_slice_scalar_value(
     spec: &LayerSpec,
@@ -42,14 +43,13 @@ fn parse_slice_scalar_value(
         )));
     }
 
-    let truncated = value.trunc();
-    if truncated < i64::MIN as f32 || truncated > i64::MAX as f32 {
+    let integral = value.trunc();
+    if integral != value {
         return Err(NyError::ModelLoad(format!(
-            "Slice '{}': {} value {} out of valid range",
+            "Slice '{}': {} value {} must be integral",
             spec.name, field, value
         )));
     }
-
     // ONNX's "slice to the end of the axis" sentinel is `INT64_MAX`, but the
     // converter reads Slice bounds out of the f32 constant store, so the
     // sentinel arrives here as the *finite* f32 `2^63` (i64::MAX is not f32
@@ -70,8 +70,14 @@ fn parse_slice_scalar_value(
     // equivalent to "to end" for every tensor this process can represent, so
     // promotion cannot change the selected elements.
     const SLICE_END_SENTINEL_FLOOR: f32 = (1u64 << 62) as f32;
-    if allow_positive_infinity && truncated >= SLICE_END_SENTINEL_FLOOR {
+    if allow_positive_infinity && integral >= SLICE_END_SENTINEL_FLOOR {
         return Ok(i64::MAX);
+    }
+    if integral < i64::MIN as f32 || integral >= i64::MAX as f32 {
+        return Err(NyError::ModelLoad(format!(
+            "Slice '{}': {} value {} out of valid range",
+            spec.name, field, value
+        )));
     }
 
     // Clamp finite slice indices to a sane range. Real indices are bounded by the
@@ -84,7 +90,7 @@ fn parse_slice_scalar_value(
     // `+inf` "slice to end" sentinel (i64::MAX) is returned above, before this, so
     // it is preserved.
     const SLICE_INDEX_BOUND: i64 = 1 << 48;
-    Ok((truncated as i64).clamp(-SLICE_INDEX_BOUND, SLICE_INDEX_BOUND))
+    Ok((integral as i64).clamp(-SLICE_INDEX_BOUND, SLICE_INDEX_BOUND))
 }
 
 fn adjust_copy_axis_for_unbatched_shape(dim: i64, target_idx: usize) -> i64 {
@@ -194,6 +200,14 @@ fn reshape_shape_from_integer_tensor(
 ) -> Result<Vec<i64>> {
     let onnx_target_shape: Vec<i64> = shape_tensor.iter().copied().collect();
     if let Some(float_tensor) = float_tensor {
+        if shape_tensor.shape() != float_tensor.shape() {
+            return Err(NyError::InvalidSpec(format!(
+                "Reshape '{}': exact integer shape tensor has shape {:?}, but its paired float view has shape {:?}",
+                spec.name,
+                shape_tensor.shape(),
+                float_tensor.shape()
+            )));
+        }
         for (idx, (&int_dim, &float_dim)) in onnx_target_shape
             .iter()
             .zip(float_tensor.iter())
@@ -206,6 +220,14 @@ fn reshape_shape_from_integer_tensor(
                 )));
             }
         }
+    } else if onnx_target_shape
+        .iter()
+        .any(|&dim| reshape_copy_axis_from_sentinel(dim).is_some())
+    {
+        return Err(NyError::InvalidSpec(format!(
+            "Reshape '{}': internal copy-axis sentinel is missing its paired float provenance view",
+            spec.name
+        )));
     }
     validate_reshape_target_shape_with_copy_axes(spec, &onnx_target_shape)?;
     Ok(onnx_target_shape)
@@ -513,17 +535,65 @@ impl ConvertContext<'_> {
     }
 
     pub(crate) fn convert_expand(&self, spec: &LayerSpec) -> Result<Layer> {
-        if spec.inputs.len() < 2 {
+        if spec.inputs.len() != 2 || spec.inputs.iter().any(String::is_empty) {
             return Err(NyError::ModelLoad(format!(
-                "Expand '{}' requires 2 inputs (data, shape), got {}",
-                spec.name,
-                spec.inputs.len()
+                "Expand '{}' requires exactly 2 non-empty inputs (data, shape), got {:?}",
+                spec.name, spec.inputs
             )));
         }
         let data_name = &spec.inputs[0];
         let shape_name = &spec.inputs[1];
+        let live_shape_reference = if spec.attributes.is_empty() {
+            None
+        } else if spec.attributes.len() == 1 {
+            match spec.attributes.get(EXPAND_LIVE_SHAPE_REFERENCE_ATTR) {
+                Some(AttributeValue::String(reference)) => Some(reference.as_str()),
+                _ => {
+                    return Err(NyError::ModelLoad(format!(
+                        "Expand '{}' has unsupported or malformed attributes {:?}",
+                        spec.name, spec.attributes
+                    )))
+                }
+            }
+        } else {
+            return Err(NyError::ModelLoad(format!(
+                "Expand '{}' has unsupported or malformed attributes {:?}",
+                spec.name, spec.attributes
+            )));
+        };
         let data_is_constant = self.constant_value(data_name).is_some();
         let shape_is_constant = self.constant_value(shape_name).is_some();
+
+        // Dynamic ONNX Expand does not consume the shape tensor's *values* as a
+        // normal bounded operand.  The narrow binary layer is valid only after
+        // a source frontend has authenticated and normalized an exact
+        // Shape(reference) edge to the live reference tensor itself.  A generic
+        // first-producer trace is insufficient: Gather/Slice/Concat arithmetic
+        // on a shape vector can still trace to an activation while denoting a
+        // different target shape.
+        if let Some(reference) = live_shape_reference {
+            if reference != shape_name {
+                return Err(NyError::ModelLoad(format!(
+                    "Expand '{}' live-shape certificate names '{}', but normalized input 1 is '{}'",
+                    spec.name, reference, shape_name
+                )));
+            }
+            if data_is_constant || self.is_constant(reference) {
+                return Err(NyError::ModelLoad(format!(
+                    "Expand '{}' live-shape lowering requires two activation tensors, got data_constant={} reference_constant={}",
+                    spec.name,
+                    data_is_constant,
+                    self.is_constant(reference)
+                )));
+            }
+            self.authenticate_expand_like_last_axis_shapes(spec, data_name, reference)?;
+            debug!(
+                "Converting authenticated Expand '{}' to narrow last-axis runtime lowering using reference '{}'",
+                spec.name, reference
+            );
+            return Ok(Layer::ExpandLikeLastAxis(ExpandLikeLastAxisLayer::new()));
+        }
+
         // Variable data broadcast to a CONSTANT static target shape (#cctsdb):
         // ONNX Expand is multidirectional broadcasting, which is EXACTLY
         // elementwise multiplication by a ones tensor of the target shape
@@ -548,11 +618,60 @@ impl ConvertContext<'_> {
                 spec.name, spec.inputs
             )));
         }
-        debug!(
-            "Converting Expand '{}' to narrow last-axis runtime lowering",
-            spec.name
-        );
-        Ok(Layer::ExpandLikeLastAxis(ExpandLikeLastAxisLayer::new()))
+        Err(NyError::UnsupportedOp(format!(
+            "Expand '{}': dynamic shape input '{}' lacks an authenticated full Shape(reference) source",
+            spec.name, shape_name
+        )))
+    }
+
+    fn authenticate_expand_like_last_axis_shapes(
+        &self,
+        spec: &LayerSpec,
+        data_name: &str,
+        reference_name: &str,
+    ) -> Result<()> {
+        let data_shape = self.tensor_shapes.get(data_name).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "Expand '{}' needs an authenticated source shape for '{}'",
+                spec.name, data_name
+            ))
+        })?;
+        let reference_shape = self.tensor_shapes.get(reference_name).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "Expand '{}' needs an authenticated live-reference shape for '{}'",
+                spec.name, reference_name
+            ))
+        })?;
+        if data_shape.is_empty() || data_shape.len() != reference_shape.len() {
+            return Err(NyError::ModelLoad(format!(
+                "Expand '{}' live last-axis contract requires equal non-zero ranks, got source {:?} and reference {:?}",
+                spec.name, data_shape, reference_shape
+            )));
+        }
+        let last = data_shape.len() - 1;
+        if data_shape[last] != 1 {
+            return Err(NyError::ModelLoad(format!(
+                "Expand '{}' live last-axis contract requires source last dimension 1, got {:?}",
+                spec.name, data_shape
+            )));
+        }
+        if reference_shape[last] == 0 {
+            return Err(NyError::ModelLoad(format!(
+                "Expand '{}' live-reference last dimension must be non-zero, got {:?}",
+                spec.name, reference_shape
+            )));
+        }
+        if data_shape[..last]
+            .iter()
+            .zip(&reference_shape[..last])
+            .any(|(&source, &reference)| source <= 0 || source != reference)
+        {
+            return Err(NyError::ModelLoad(format!(
+                "Expand '{}' live last-axis contract requires identical concrete prefixes, got source {:?} and reference {:?}",
+                spec.name, data_shape, reference_shape
+            )));
+        }
+        Ok(())
     }
 
     /// Static Expand target shape from a constant shape tensor: all dims must
@@ -723,108 +842,27 @@ impl ConvertContext<'_> {
         )))
     }
 
-    /// Exact affine lowering for a variable-start Slice of a constant
-    /// arithmetic progression (#cctsdb B3a).
-    ///
-    /// `Slice(range, starts=[x], ends=[x+w], axes=[0], steps=[1])` over a
-    /// rank-1 constant `range[k] = r0 + step*k` has
-    /// `out[k] = range[x+k] = step*x + (r0 + step*k)` — an AFFINE function of
-    /// the scalar starts activation, lowered to a `Linear` layer
-    /// (weight = step column, bias = r0 + step*k). Exact and CROWN-compatible.
-    ///
-    /// The static extent `w` comes from the output tensor shape recorded by
-    /// the affine-extent const-fold pass (B2). Right-edge caveat: when the
-    /// true graph clamps (`x + w > len`), the runtime output has fewer
-    /// elements; this lowering emits the UNCLAMPED extrapolation for the
-    /// extra positions — the out-of-range sentinel value (`len` for a 0..len
-    /// range), which the bounded-index ScatterND (B4) rejects, matching
-    /// exactly the writes the clipped graph performs. See the design's B3/B4
-    /// exactness argument.
-    ///
-    /// Returns `Ok(None)` when the pattern does not apply (caller keeps the
-    /// conservative reject).
-    fn try_lower_variable_start_slice_of_progression(
+    fn slice_constant_i64_values(
         &self,
         spec: &LayerSpec,
-    ) -> Result<Option<Layer>> {
-        let data_name = &spec.inputs[0];
-        let starts_name = &spec.inputs[1];
-
-        // Data: rank-1 constant arithmetic progression with at least 2 elements.
-        let Some(data) = self.constant_value(data_name) else {
+        name: &str,
+        field: &str,
+        allow_positive_infinity: bool,
+    ) -> Result<Option<Vec<i64>>> {
+        if self.weights.get_integers(name).is_some() {
+            return self
+                .discrete_constant_i64(name, &format!("Slice '{}' {field}", spec.name))
+                .map(|values| values.map(|values| values.iter().copied().collect()));
+        }
+        let Some(values) = self.constant_value(name) else {
             return Ok(None);
         };
-        if data.ndim() != 1 || data.len() < 2 {
-            return Ok(None);
-        }
-        let values: Vec<f32> = data.iter().copied().collect();
-        let step = values[1] - values[0];
-        let is_progression = values
-            .windows(2)
-            .all(|pair| (pair[1] - pair[0] - step).abs() == 0.0);
-        if !is_progression {
-            return Ok(None);
-        }
-
-        // Starts: a 1-element activation (scalar index). Shape must be known.
-        let starts_is_scalar = self
-            .tensor_shapes
-            .get(starts_name)
-            .is_some_and(|shape| shape.iter().product::<i64>() == 1 && shape.len() <= 1);
-        if !starts_is_scalar {
-            return Ok(None);
-        }
-
-        // Axes: the single axis 0 of the rank-1 data (default or explicit).
-        if let Some(axes_name) = spec.inputs.get(3).filter(|name| !name.is_empty()) {
-            let Some(axes) = self.constant_value(axes_name) else {
-                return Ok(None);
-            };
-            let axes: Vec<f32> = axes.iter().copied().collect();
-            if axes.len() != 1 || (axes[0] != 0.0 && axes[0] != -1.0) {
-                return Ok(None);
-            }
-        }
-        // Steps: 1 (or absent).
-        if let Some(steps_name) = spec.inputs.get(4).filter(|name| !name.is_empty()) {
-            let Some(steps) = self.constant_value(steps_name) else {
-                return Ok(None);
-            };
-            let steps: Vec<f32> = steps.iter().copied().collect();
-            if steps != vec![1.0] {
-                return Ok(None);
-            }
-        }
-
-        // Static extent w from the recorded output shape (B2 affine pass).
-        let Some(output_name) = spec.outputs.first() else {
-            return Ok(None);
-        };
-        let Some(output_shape) = self.tensor_shapes.get(output_name) else {
-            return Ok(None);
-        };
-        if output_shape.len() != 1 || output_shape[0] <= 0 {
-            return Ok(None);
-        }
-        let extent = output_shape[0] as usize;
-        if extent > data.len() {
-            return Ok(None);
-        }
-
-        // out[k] = step * x + (r0 + step * k), computed in f64 for exact
-        // integer-valued biases.
-        let r0 = values[0] as f64;
-        let step_f64 = step as f64;
-        let weight = ndarray::Array2::<f32>::from_shape_fn((extent, 1), |(_, _)| step_f64 as f32);
-        let bias =
-            ndarray::Array1::<f32>::from_shape_fn(extent, |k| (r0 + step_f64 * k as f64) as f32);
-        let linear = ny_propagate::layers::LinearLayer::new(weight, Some(bias))?;
-        debug!(
-            "Slice '{}': lowered variable-start slice of arithmetic progression \
-             (r0={}, step={}, extent={}) to exact affine Linear",
-            spec.name, values[0], step, extent
-        );
-        Ok(Some(Layer::Linear(linear)))
+        values
+            .iter()
+            .copied()
+            .map(|value| parse_slice_scalar_value(spec, field, value, allow_positive_infinity))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     pub(crate) fn convert_slice(&self, spec: &LayerSpec) -> Result<Layer> {
@@ -887,14 +925,9 @@ impl ConvertContext<'_> {
             let starts_name = &spec.inputs[1];
             let ends_name = &spec.inputs[2];
             // Get starts tensor (input[1])
-            let starts = match self.constant_value(starts_name) {
+            let starts = match self.slice_constant_i64_values(spec, starts_name, "start", false)? {
                 Some(starts) => starts,
                 None => {
-                    // Variable-start Slice of a constant arithmetic
-                    // progression (#cctsdb B3a): exact affine lowering.
-                    if let Some(layer) = self.try_lower_variable_start_slice_of_progression(spec)? {
-                        return Ok(layer);
-                    }
                     return Err(NyError::UnsupportedOp(format!(
                         "Slice '{}': starts input '{}' not found in constant values (needs constant folding)",
                         spec.name, starts_name
@@ -903,30 +936,26 @@ impl ConvertContext<'_> {
             };
 
             // Get ends tensor (input[2])
-            let ends = self.constant_value(ends_name).ok_or_else(|| {
-                NyError::UnsupportedOp(format!(
-                    "Slice '{}': ends input '{}' not found in constant values (needs constant folding)",
-                    spec.name, ends_name
-                ))
-            })?;
+            let ends = self
+                .slice_constant_i64_values(spec, ends_name, "end", true)?
+                .ok_or_else(|| {
+                    NyError::UnsupportedOp(format!(
+                        "Slice '{}': ends input '{}' not found in constant values (needs constant folding)",
+                        spec.name, ends_name
+                    ))
+                })?;
 
             // Get axes tensor (input[3], optional)
-            let axes = spec.inputs.get(3).and_then(|name| {
-                if name.is_empty() {
-                    None
-                } else {
-                    self.constant_value(name)
-                }
-            });
+            let axes = match spec.inputs.get(3).filter(|name| !name.is_empty()) {
+                Some(name) => self.slice_constant_i64_values(spec, name, "axis", false)?,
+                None => None,
+            };
 
             // Get steps tensor (input[4], optional)
-            let steps = spec.inputs.get(4).and_then(|name| {
-                if name.is_empty() {
-                    None
-                } else {
-                    self.constant_value(name)
-                }
-            });
+            let steps = match spec.inputs.get(4).filter(|name| !name.is_empty()) {
+                Some(name) => self.slice_constant_i64_values(spec, name, "step", false)?,
+                None => None,
+            };
 
             // For now, we only support single-axis slicing with step=1
             // This is the most common case in VNN-COMP models
@@ -958,21 +987,14 @@ impl ConvertContext<'_> {
                 }
             }
 
-            // Constant-folded Slice bounds can lose their original ONNX integer type
-            // when they round-trip through f32 storage. Match the converter's
-            // truncation behavior for finite values so fixed-aux shape chains keep
-            // folding instead of leaking into graph inputs (#3500).
-            let start_f32 = starts.iter().next().copied().unwrap_or(0.0);
-            let end_f32 = ends.iter().next().copied().unwrap_or(f32::INFINITY);
-            let start = parse_slice_scalar_value(spec, "start", start_f32, false)?;
-            let end = parse_slice_scalar_value(spec, "end", end_f32, true)?;
+            let start = starts.first().copied().unwrap_or(0);
+            let end = ends.first().copied().unwrap_or(i64::MAX);
 
             // Get axis (default 0 if not specified) — resolve before normalizing
             // negative indices since we need the axis to find the dimension size.
-            let axis_f32 = axes.as_ref().and_then(|arr| arr.iter().next().copied());
-            let axis = axis_f32
-                .map(|v| parse_slice_scalar_value(spec, "axis", v, false))
-                .transpose()?
+            let axis = axes
+                .as_ref()
+                .and_then(|values| values.first().copied())
                 .map(|v| {
                     i32::try_from(v).map_err(|_| {
                         NyError::ModelLoad(format!(
@@ -1005,12 +1027,12 @@ impl ConvertContext<'_> {
                 });
                 if let Some(dim) = static_dim {
                     let norm_start = if start < 0 {
-                        (dim + start).max(0)
+                        dim.saturating_add(start).max(0)
                     } else {
                         start.min(dim)
                     };
                     let norm_end = if end < 0 {
-                        (dim + end).max(0)
+                        dim.saturating_add(end).max(0)
                     } else if end == i64::MAX {
                         dim
                     } else {
@@ -1026,7 +1048,13 @@ impl ConvertContext<'_> {
                     // axis dimension is dynamic): a non-negative start with a
                     // negative end is still exactly representable by counting
                     // the end offset from the axis end at propagation time.
-                    end_offset_from_axis_end = Some(usize::try_from(-end).map_err(|_| {
+                    let end_offset = end.checked_neg().ok_or_else(|| {
+                        NyError::ModelLoad(format!(
+                            "Slice '{}': negative end {} cannot be represented safely without a static input dimension",
+                            spec.name, end
+                        ))
+                    })?;
+                    end_offset_from_axis_end = Some(usize::try_from(end_offset).map_err(|_| {
                         NyError::ModelLoad(format!(
                             "Slice '{}': negative end {} out of valid range",
                             spec.name, end
@@ -1046,8 +1074,7 @@ impl ConvertContext<'_> {
 
             // Verify step is 1 (or not specified)
             if let Some(steps_arr) = steps.as_ref() {
-                let step_f32 = steps_arr.iter().next().copied().unwrap_or(1.0);
-                let step = parse_slice_scalar_value(spec, "step", step_f32, false)?;
+                let step = steps_arr.first().copied().unwrap_or(1);
                 if step != 1 {
                     return Err(NyError::ModelLoad(format!(
                         "Slice '{}': only step=1 supported (got step={})",
@@ -1127,7 +1154,36 @@ impl ConvertContext<'_> {
         )))
     }
     pub(crate) fn convert_transpose(&self, spec: &LayerSpec) -> Result<Layer> {
-        // ONNX Transpose: has 'perm' attribute specifying the permutation
+        if let Some(attribute) = spec.attributes.keys().find(|name| name.as_str() != "perm") {
+            return Err(NyError::ModelLoad(format!(
+                "Transpose '{}': unsupported attribute '{}'",
+                spec.name, attribute
+            )));
+        }
+
+        let input_name = spec
+            .inputs
+            .first()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                NyError::ModelLoad(format!(
+                    "Transpose '{}' requires one non-empty data input",
+                    spec.name
+                ))
+            })?;
+        let authored_rank = self
+            .tensor_shapes
+            .get(input_name)
+            .map(Vec::len)
+            .or_else(|| self.weights.get(input_name).map(ArrayD::ndim))
+            .or_else(|| self.weights.get_integers(input_name).map(ArrayD::ndim))
+            .or_else(|| self.evaluated_constants.get(input_name).map(ArrayD::ndim));
+
+        // ONNX Transpose's omitted `perm` reverses *all* authored dimensions.
+        // `TransposeLayer` reserves an empty axes vector for its internal
+        // dynamic "swap the final two" helper, so constructing that value here
+        // silently changed every rank > 2 standard Transpose.  Materialize the
+        // full default permutation from authenticated raw shape provenance.
         let axes = match spec.attributes.get("perm") {
             Some(AttributeValue::Ints(perm)) => {
                 // #2983: Guard negative permutation indices.
@@ -1142,11 +1198,44 @@ impl ConvertContext<'_> {
                     })
                     .collect::<Result<Vec<usize>>>()?
             }
-            _ => {
-                // Default: reverse all dimensions
-                Vec::new() // TransposeLayer handles empty axes as batched transpose
+            Some(other) => {
+                return Err(NyError::ModelLoad(format!(
+                    "Transpose '{}': perm must be an INTS attribute, got {:?}",
+                    spec.name, other
+                )))
+            }
+            None => {
+                let rank = authored_rank.ok_or_else(|| {
+                    NyError::UnsupportedOp(format!(
+                        "Transpose '{}': omitted perm requires an authenticated input rank to construct ONNX's reverse-all-axes default",
+                        spec.name
+                    ))
+                })?;
+                (0..rank).rev().collect()
             }
         };
+
+        if let Some(rank) = authored_rank {
+            let mut sorted = axes.clone();
+            sorted.sort_unstable();
+            if axes.len() != rank || sorted != (0..rank).collect::<Vec<_>>() {
+                return Err(NyError::ModelLoad(format!(
+                    "Transpose '{}': perm {:?} is not a permutation of 0..{} for the authenticated input rank",
+                    spec.name, axes, rank
+                )));
+            }
+            if rank == 0 {
+                // A scalar's sole valid permutation is the empty list and the
+                // operator is exactly identity.  Avoid the internal empty-axes
+                // sentinel, whose separate meaning is "swap final two axes".
+                return Ok(Layer::MulConstant(MulConstantLayer::scalar(1.0)));
+            }
+        } else if axes.is_empty() {
+            return Err(NyError::UnsupportedOp(format!(
+                "Transpose '{}': empty perm cannot be authenticated without an input rank",
+                spec.name
+            )));
+        }
 
         Ok(Layer::Transpose(TransposeLayer::new(axes)))
     }
@@ -1222,7 +1311,9 @@ impl ConvertContext<'_> {
         // Input-based (opset >= 13): axes from second input
         if spec.inputs.len() >= 2 {
             let axes_name = &spec.inputs[1];
-            if let Some(axes_tensor) = self.weights.get(axes_name) {
+            if let Some(axes_tensor) =
+                self.discrete_constant_i64(axes_name, &format!("Squeeze '{}' axes", spec.name))?
+            {
                 if axes_tensor.len() != 1 {
                     return Err(NyError::ModelLoad(format!(
                         "Squeeze '{}': only single-axis supported (got {} axes from input)",
@@ -1230,18 +1321,13 @@ impl ConvertContext<'_> {
                         axes_tensor.len()
                     )));
                 }
-                let axis_f32 = axes_tensor.iter().next().copied().unwrap_or(0.0);
-                // SAFETY(#3100): Guard against NaN/Inf/out-of-range f32 axis values
-                // before casting to i32. Finiteness + range check: a finite f32 like
-                // 1e20 would saturate `as i32` to i32::MAX (garbage axis).
-                if !axis_f32.is_finite() || axis_f32 > i32::MAX as f32 || axis_f32 < i32::MIN as f32
-                {
-                    return Err(NyError::ModelLoad(format!(
+                let axis_i64 = axes_tensor.iter().next().copied().unwrap_or(0);
+                let onnx_axis = i32::try_from(axis_i64).map_err(|_| {
+                    NyError::ModelLoad(format!(
                         "Squeeze '{}': axis value {} out of valid range",
-                        spec.name, axis_f32
-                    )));
-                }
-                let onnx_axis = axis_f32 as i32;
+                        spec.name, axis_i64
+                    ))
+                })?;
 
                 // Adjust for unbatched operation
                 // ONNX axis=0 targets the batch dimension — reject unless it is a genuine
@@ -1364,7 +1450,9 @@ impl ConvertContext<'_> {
         // Input-based (opset >= 13): axes from second input
         if spec.inputs.len() >= 2 {
             let axes_name = &spec.inputs[1];
-            if let Some(axes_tensor) = self.weights.get(axes_name) {
+            if let Some(axes_tensor) =
+                self.discrete_constant_i64(axes_name, &format!("Unsqueeze '{}' axes", spec.name))?
+            {
                 if axes_tensor.len() != 1 {
                     return Err(NyError::ModelLoad(format!(
                         "Unsqueeze '{}': only single-axis supported (got {} axes from input)",
@@ -1372,17 +1460,13 @@ impl ConvertContext<'_> {
                         axes_tensor.len()
                     )));
                 }
-                let axis_f32 = axes_tensor.iter().next().copied().unwrap_or(0.0);
-                // SAFETY(#3100): Guard against NaN/Inf/out-of-range f32 axis values
-                // before casting to i32. Range check prevents saturation on large finite values.
-                if !axis_f32.is_finite() || axis_f32 > i32::MAX as f32 || axis_f32 < i32::MIN as f32
-                {
-                    return Err(NyError::ModelLoad(format!(
+                let axis_i64 = axes_tensor.iter().next().copied().unwrap_or(0);
+                let onnx_axis = i32::try_from(axis_i64).map_err(|_| {
+                    NyError::ModelLoad(format!(
                         "Unsqueeze '{}': axis value {} out of valid range",
-                        spec.name, axis_f32
-                    )));
-                }
-                let onnx_axis = axis_f32 as i32;
+                        spec.name, axis_i64
+                    ))
+                })?;
 
                 // Adjust for unbatched operation: trailing-relative remap
                 // against the recorded OUTPUT rank; axis=0 keeps the "insert
@@ -1493,6 +1577,46 @@ mod tests {
             Layer::Unsqueeze(usq) => usq.axis,
             other => unreachable!("expected Layer::Unsqueeze, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn transpose_omitted_perm_reverses_every_authored_axis() {
+        let ws = WeightStore::new();
+        for (shape, expected) in [
+            (vec![1_i64, 2, 3], vec![2_usize, 1, 0]),
+            (vec![1_i64, 2, 3, 4], vec![3_usize, 2, 1, 0]),
+        ] {
+            let shapes = HashMap::from([("data".to_string(), shape)]);
+            let context = make_context_with_shapes(&ws, &shapes);
+            let layer = context
+                .convert_transpose(&bare_spec("transpose", LayerType::Transpose))
+                .expect("authenticated rank determines ONNX's reverse permutation");
+            let Layer::Transpose(transpose) = layer else {
+                panic!("expected Transpose layer")
+            };
+            assert_eq!(transpose.axes, expected);
+        }
+    }
+
+    #[test]
+    fn transpose_default_and_explicit_perm_fail_closed_when_unauthenticated() {
+        let ws = WeightStore::new();
+        let context = make_context(&ws);
+        let error = context
+            .convert_transpose(&bare_spec("transpose", LayerType::Transpose))
+            .expect_err("the reverse-all default needs a known rank");
+        assert!(
+            error.to_string().contains("authenticated input rank"),
+            "{error}"
+        );
+
+        let shapes = HashMap::from([("data".to_string(), vec![1_i64, 2, 3])]);
+        let context = make_context_with_shapes(&ws, &shapes);
+        let malformed = LayerSpec {
+            attributes: HashMap::from([("perm".to_string(), AttributeValue::Ints(vec![0, 0, 2]))]),
+            ..bare_spec("transpose", LayerType::Transpose)
+        };
+        assert!(context.convert_transpose(&malformed).is_err());
     }
 
     // ---- Squeeze: attribute-based (opset < 13) ----
@@ -1656,6 +1780,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn squeeze_input_rejects_adjacent_non_integer_axis() {
+        let mut ws = WeightStore::new();
+        let axis = f32::from_bits(1.0_f32.to_bits() - 1);
+        ws.insert("axes_tensor".to_string(), arr1(&[axis]).into_dyn());
+        let m = make_context(&ws);
+        let spec = input_spec("sq", LayerType::Squeeze);
+        let err = m
+            .convert_squeeze(&spec)
+            .expect_err("fractional Squeeze axis must not be truncated");
+        assert!(err.to_string().contains("integral"));
+    }
+
+    #[test]
+    fn squeeze_input_prefers_exact_integer_axis_payload() {
+        let mut ws = WeightStore::new();
+        ws.insert("axes_tensor".to_string(), arr1(&[2.0_f32]).into_dyn());
+        ws.insert_integers("axes_tensor".to_string(), arr1(&[1_i64]).into_dyn());
+        let shapes = HashMap::from([("data".to_string(), vec![1_i64, 1, 6])]);
+        let m = make_context_with_shapes(&ws, &shapes);
+        let layer = m
+            .convert_squeeze(&input_spec("sq", LayerType::Squeeze))
+            .unwrap();
+        assert_eq!(squeeze_axis(&layer), -2);
+    }
+
     // ---- Squeeze: missing axes ----
 
     #[test]
@@ -1805,6 +1955,19 @@ mod tests {
         assert_eq!(unsqueeze_axis(&layer), 0);
     }
 
+    #[test]
+    fn unsqueeze_input_rejects_adjacent_non_integer_axis() {
+        let mut ws = WeightStore::new();
+        let axis = f32::from_bits(1.0_f32.to_bits() + 1);
+        ws.insert("axes_tensor".to_string(), arr1(&[axis]).into_dyn());
+        let m = make_context(&ws);
+        let spec = input_spec("usq", LayerType::Unsqueeze);
+        let err = m
+            .convert_unsqueeze(&spec)
+            .expect_err("fractional Unsqueeze axis must not be truncated");
+        assert!(err.to_string().contains("integral"));
+    }
+
     // ---- Unsqueeze: missing axes ----
 
     #[test]
@@ -1945,6 +2108,23 @@ mod tests {
             }
             other => panic!("expected Layer::Slice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn slice_int64_min_end_with_dynamic_extent_fails_closed_without_overflow() {
+        let mut ws = WeightStore::new();
+        ws.insert("starts".to_string(), arr1(&[0.0_f32]).into_dyn());
+        ws.insert_integers("starts".to_string(), arr1(&[0_i64]).into_dyn());
+        ws.insert("ends".to_string(), arr1(&[i64::MIN as f32]).into_dyn());
+        ws.insert_integers("ends".to_string(), arr1(&[i64::MIN]).into_dyn());
+        ws.insert("axes".to_string(), arr1(&[1.0_f32]).into_dyn());
+        ws.insert_integers("axes".to_string(), arr1(&[1_i64]).into_dyn());
+        let shapes = HashMap::from([("data".to_string(), vec![1_i64, -1])]);
+        let m = make_context_with_shapes(&ws, &shapes);
+        let spec = slice_spec_with_axes("starts", "ends", Some("axes"));
+
+        let err = m.convert_slice(&spec).unwrap_err();
+        assert!(err.to_string().contains("cannot be represented safely"));
     }
 
     /// The behavioural consequence: an ONNX axis-0 `[0:INT64_MAX)` slice on a
@@ -2450,6 +2630,43 @@ mod tests {
     }
 
     #[test]
+    fn reshape_exact_integer_shape_rejects_mismatched_float_view_shape() {
+        let sentinel = ny_core::reshape_copy_axis_sentinel(1).expect("copy-axis sentinel in range");
+        let mut ws = WeightStore::new();
+        ws.insert(
+            "shape".to_string(),
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[2, 1]), vec![1.0_f32, 0.0]).unwrap(),
+        );
+        ws.insert_integers("shape".to_string(), arr1(&[1_i64, sentinel]).into_dyn());
+        let m = make_context(&ws);
+        let spec = reshape_spec("r_mismatched_exact_shape_views", "shape");
+        let err = m
+            .try_convert_reshape(&spec)
+            .expect_err("integer and float views with different shapes must fail closed");
+        assert!(
+            err.to_string().contains("paired float view has shape"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reshape_copy_axis_sentinel_requires_paired_float_provenance_view() {
+        let sentinel = ny_core::reshape_copy_axis_sentinel(1).expect("copy-axis sentinel in range");
+        let mut ws = WeightStore::new();
+        ws.insert_integers("shape".to_string(), arr1(&[1_i64, sentinel]).into_dyn());
+        let m = make_context(&ws);
+        let spec = reshape_spec("r_missing_sentinel_provenance", "shape");
+        let err = m
+            .try_convert_reshape(&spec)
+            .expect_err("an unauthenticated internal sentinel must fail closed");
+        assert!(
+            err.to_string()
+                .contains("missing its paired float provenance"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn reshape_prefers_exact_integer_shape_over_float_compatibility_view() {
         let mut ws = WeightStore::new();
         ws.insert(
@@ -2731,8 +2948,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Variable-start Slice of an arithmetic progression -> exact affine Linear
-    // (#cctsdb B3a)
+    // Variable-start Slice stays fail-closed until clamped dynamic extents can
+    // be represented without changing ONNX semantics.
     // -----------------------------------------------------------------------
 
     fn progression_slice_spec() -> LayerSpec {
@@ -2768,62 +2985,19 @@ mod tests {
         HashMap::from([("x".to_string(), vec![1]), ("window".to_string(), vec![3])])
     }
 
-    /// Slice(range, [x], [x+w]) lowers to a Linear whose output is exactly
-    /// [x, x+1, x+2]; the IBP hull over an index interval encloses every
-    /// concrete instantiation of the slice.
+    /// Even an exact arithmetic progression cannot be lowered to a fixed-size
+    /// affine output: ONNX clamps the slice at the data edge, changing its
+    /// runtime extent.
     #[ntest::timeout(10000)]
     #[test]
-    fn variable_start_slice_of_range_lowers_to_exact_affine_linear() {
-        use ny_propagate::layers::BoundPropagation;
-        use ny_tensor::BoundedTensor;
-
+    fn variable_start_slice_of_range_is_rejected_without_clamp_proof() {
         let weights = progression_weights();
         let shapes = progression_shapes();
         let ctx = make_context_with_shapes(&weights, &shapes);
-        let layer = ctx
+        let error = ctx
             .convert_slice(&progression_slice_spec())
-            .expect("variable-start slice of a progression must lower");
-        let Layer::Linear(linear) = layer else {
-            panic!("expected affine Linear lowering, got {layer:?}");
-        };
-
-        // Point starts x = 2 -> [2, 3, 4] up to the Linear IBP's 1-ULP
-        // directed rounding (sound outward widening).
-        let point =
-            BoundedTensor::new(arr1(&[2.0_f32]).into_dyn(), arr1(&[2.0_f32]).into_dyn()).unwrap();
-        let out = linear.propagate_ibp(&point).unwrap();
-        for (k, expected) in [2.0_f32, 3.0, 4.0].into_iter().enumerate() {
-            let lo = out.lower().as_slice().unwrap()[k];
-            let up = out.upper().as_slice().unwrap()[k];
-            assert!(
-                lo <= expected && expected <= up && (up - lo) < 1e-4,
-                "k={k}: expected tight enclosure of {expected}, got [{lo}, {up}]"
-            );
-        }
-
-        // Interval starts x in [1, 4]: bounds must enclose data[x..x+3] for
-        // every integer x in the range (the enclosure property).
-        let interval =
-            BoundedTensor::new(arr1(&[1.0_f32]).into_dyn(), arr1(&[4.0_f32]).into_dyn()).unwrap();
-        let bounds = linear.propagate_ibp(&interval).unwrap();
-        let data: Vec<f32> = (0..8).map(|v| v as f32).collect();
-        for x in 1..=4_usize {
-            for k in 0..3_usize {
-                let concrete = if x + k < data.len() {
-                    data[x + k]
-                } else {
-                    // Unclamped sentinel (out-of-range) position: the lowering
-                    // extrapolates the progression.
-                    (x + k) as f32
-                };
-                let lo = bounds.lower().as_slice().unwrap()[k];
-                let up = bounds.upper().as_slice().unwrap()[k];
-                assert!(
-                    lo <= concrete && concrete <= up,
-                    "x={x} k={k}: {concrete} not in [{lo}, {up}]"
-                );
-            }
-        }
+            .expect_err("variable-start Slice must remain explicit without a clamp proof");
+        assert!(matches!(error, NyError::UnsupportedOp(_)));
     }
 
     /// Non-progression data must keep the conservative reject.

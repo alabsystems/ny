@@ -29,9 +29,10 @@ const KOKORO_BRIDGE_AUDIO_LEN_3719: usize = 1500;
 // to_graph_network() path which exceeded 600s at features_t>=5.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_avoice_kokoro_to_speaker_bridge_concrete_smoke_3719() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     // Stage 1: Produce a real concrete Kokoro waveform via ORT.
     // The shared speaker floor comes from fixed TDNN pads [2, 2, 3, 4, 0], so
     // T=5 is the smallest valid real-weight sequence for the encoder.

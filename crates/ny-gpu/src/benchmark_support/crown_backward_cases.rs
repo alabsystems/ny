@@ -116,7 +116,9 @@ impl BenchCase {
             .map(|_| ())
     }
 
-    #[cfg(test)]
+    // Its only caller, `crown_backward_cases_tests`, is selected by the same
+    // real-adapter conformance feature.
+    #[cfg(all(test, feature = "gpu-tests"))]
     pub(crate) fn assert_graph_matches_sequential(
         &self,
         engine: Option<&dyn GemmEngine>,

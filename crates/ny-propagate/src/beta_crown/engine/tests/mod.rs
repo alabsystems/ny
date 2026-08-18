@@ -17,6 +17,7 @@ mod bilinear_bab;
 mod branch_stem;
 mod branching;
 mod clause_learning;
+mod clip_interm_domain_gate;
 mod clipping_proptests;
 mod complete_clipping_error_guards;
 mod core_engine_identity;

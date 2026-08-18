@@ -102,8 +102,9 @@ fn log_packet2_comparison(comparison: &Packet2Comparison) {
 /// Reference: designs/2026-03-13-issue-3499-suffix-linear-certificate-composition.md
 #[cfg_attr(not(debug_assertions), ntest::timeout(1800000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_ecapa_composed_cosine_no_worse_than_concretized_3499() {
-    crate::test_fixtures::require_test_model_or_skip!("speaker_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("speaker_encoder.onnx");
     let comparison = run_packet2_comparison();
     log_packet2_comparison(&comparison);
 

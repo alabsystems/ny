@@ -10,6 +10,8 @@
 //
 // Usage: certify_onnx <model.onnx> <prop.vnnlib> <out_dir>
 
+#![forbid(unsafe_code)]
+
 use ny_cert::crown_deep::DeepReluProblem;
 use ny_cert::rational::{Rat, RatError};
 use ny_cert::schema::{
@@ -292,37 +294,9 @@ fn parse_onnx(data: &[u8]) -> OnnxGraph {
 // f32 -> exact Rat (n / 2^k), lossless.  f32 == m * 2^e with m an integer.
 // ---------------------------------------------------------------------------
 fn f32_to_rat(v: f32) -> Result<Rat, RatError> {
-    if v == 0.0 {
-        return Ok(Rat::ZERO);
-    }
-    assert!(v.is_finite(), "non-finite weight {v}");
     let bits = v.to_bits();
-    let sign = if bits >> 31 == 1 { -1i128 } else { 1i128 };
-    let exp_field = ((bits >> 23) & 0xff) as i32;
-    let mant_field = (bits & 0x7f_ffff) as i128;
-    // value = sign * mantissa * 2^exp
-    let (mantissa, exp) = if exp_field == 0 {
-        // subnormal: value = mant * 2^(-126-23)
-        (mant_field, -149)
-    } else {
-        // normal: implicit leading 1
-        (mant_field + (1i128 << 23), exp_field - 127 - 23)
-    };
-    let mantissa = sign * mantissa;
-    // value = mantissa * 2^exp, exactly, in arbitrary precision (no i128 cap:
-    // a large normal f32 has exp up to +104 and mantissa up to 2^24, whose
-    // product exceeds i128 — bignum makes this lossless for every f32).
-    use num_bigint::BigInt;
-    let m = BigInt::from(mantissa);
-    if exp >= 0 {
-        // n = mantissa * 2^exp, den = 1
-        let num = m << (exp as u32);
-        Rat::from_bigints(num, BigInt::from(1))
-    } else {
-        // n / 2^(-exp)
-        let den = BigInt::from(1) << ((-exp) as u32);
-        Rat::from_bigints(m, den)
-    }
+    assert!(bits & 0x7f80_0000 != 0x7f80_0000, "non-finite weight {v}");
+    Rat::from_f32_exact(v).ok_or(RatError::Poisoned)
 }
 
 // ---------------------------------------------------------------------------
@@ -2178,12 +2152,8 @@ fn main() {
         let mut explored = 0usize;
         let mut max_depth_used = 0usize;
         let rat_str = |r: &Rat| -> String {
-            use num_traits::One;
-            if r.den().is_one() {
-                format!("{}", r.num())
-            } else {
-                format!("{}/{}", r.num(), r.den())
-            }
+            r.to_clean_string()
+                .expect("refusing to serialize a poisoned rational arena")
         };
         let path_json = |path: &[(usize, Rat, bool)]| -> String {
             let parts: Vec<String> = path
@@ -2276,6 +2246,10 @@ fn main() {
         let json = format!(
             "{{\"root_lo\":{},\"root_hi\":{},\"leaves\":{},\"failed_leaves\":{},\"explored_nodes\":{},\"max_depth_used\":{},\"nodes\":{{{}}}}}",
             root_lo_j, root_hi_j, n_leaves, n_failed, explored, max_depth_used, node_json.join(","));
+        assert!(
+            !ny_cert::rational::poisoned(),
+            "refusing to write a bisection tree after a rational arena fallback"
+        );
         std::fs::write(&treepath, json).expect("write tree json");
         println!("BISECT leaves={n_leaves} failed={n_failed} explored={explored} max_depth={max_depth_used} out={treepath}");
         return;
@@ -2599,14 +2573,241 @@ fn run_parity(g: &OnnxGraph, dag: &DagNet, flat: &LoadedNet, lo: &[Rat], hi: &[R
     );
 }
 
-/// One refutation target derived from an unsafe-region atom: the atom holds
-/// nowhere on a box iff the exact lower bound of `y' = out_w·a + out_b` over
-/// the box exceeds `u_bound` (`y'` is `Y_j` for a `<=` atom, `-Y_j` for `>=`).
+/// Typed identity of one ORIGINAL VNNLIB unsafe row (index among output rows,
+/// before any synthetic conic targets are added).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnsafeSourceRowId(usize);
+
+/// One exact original unsafe row in both output-variable and final-readout
+/// coordinates. The latter is what the scalar exact CROWN worker certifies.
+#[derive(Debug, Clone)]
+struct UnsafeSourceRow {
+    id: UnsafeSourceRowId,
+    label: String,
+    original_constraint: LinearConstraint,
+    normalized_constraint: LinearConstraint,
+    out_w: Vec<Rat>,
+    out_b: Rat,
+    u_bound: Rat,
+}
+
+/// One exact non-negative multiplier naming its original VNNLIB source row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConicSourceTerm {
+    source_row: UnsafeSourceRowId,
+    multiplier: Rat,
+}
+
+/// Exact provenance for a pure or synthetic target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConicProvenance {
+    terms: Vec<ConicSourceTerm>,
+}
+
+impl ConicProvenance {
+    fn pure(source_row: UnsafeSourceRowId) -> Self {
+        Self {
+            terms: vec![ConicSourceTerm {
+                source_row,
+                multiplier: Rat::ONE,
+            }],
+        }
+    }
+}
+
+/// One validated refutation target derived from original unsafe-region rows:
+/// the atom holds nowhere on a box iff the exact lower bound of
+/// `y' = out_w·a + out_b` exceeds `u_bound`. Construction is private to
+/// [`trusted_conj_target`], which exactly reconstructs all three values from
+/// typed source rows/multipliers and checks the corresponding entailment.
 struct ConjTarget {
     label: String,
     out_w: Vec<Rat>,
     out_b: Rat,
     u_bound: Rat,
+    provenance: ConicProvenance,
+    source_entailment: EntailmentCertificate,
+}
+
+/// Fail-closed parser for `NYCERT_MIX_SET="a:b,c:d,..."`.
+///
+/// Zero on one side is useful (it repeats a pure atom) and remains accepted;
+/// negative weights are not conic, while `0:0` proves nothing, so both are
+/// rejected before target construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MixPair {
+    left: i64,
+    right: i64,
+}
+
+fn parse_mix_set(raw: &str) -> Result<Vec<MixPair>, String> {
+    if raw.trim().is_empty() {
+        return Err("mix set is empty".to_string());
+    }
+    let mut mixes = Vec::new();
+    for (index, pair) in raw.split(',').enumerate() {
+        let pair = pair.trim();
+        let Some((left, right)) = pair.split_once(':') else {
+            return Err(format!("mix {index} must have form a:b (got {pair:?})"));
+        };
+        let left: i64 = left
+            .trim()
+            .parse()
+            .map_err(|_| format!("mix {index} has invalid left multiplier"))?;
+        let right: i64 = right
+            .trim()
+            .parse()
+            .map_err(|_| format!("mix {index} has invalid right multiplier"))?;
+        if left < 0 || right < 0 {
+            return Err(format!(
+                "mix {index} has negative multiplier ({left}:{right}); conic weights must be >= 0"
+            ));
+        }
+        if left == 0 && right == 0 {
+            return Err(format!(
+                "mix {index} is 0:0; at least one conic multiplier must be positive"
+            ));
+        }
+        mixes.push(MixPair { left, right });
+    }
+    Ok(mixes)
+}
+
+/// Reconstruct a target exactly from ORIGINAL VNNLIB unsafe rows and validate
+/// the output-level conic entailment before any f64 screen or exact leaf can
+/// consume it. This is the authority gate for synthetic targets.
+fn trusted_conj_target(
+    label: String,
+    out_w: Vec<Rat>,
+    out_b: Rat,
+    u_bound: Rat,
+    provenance: ConicProvenance,
+    source_rows: &[UnsafeSourceRow],
+) -> Result<ConjTarget, String> {
+    if provenance.terms.is_empty() {
+        return Err("target has no source rows".to_string());
+    }
+    let mut rebuilt_w = vec![Rat::ZERO; out_w.len()];
+    let mut rebuilt_b = Rat::ZERO;
+    let mut rebuilt_u = Rat::ZERO;
+    let mut conclusion_coefficients: BTreeMap<String, Rat> = BTreeMap::new();
+    let mut premises = Vec::new();
+    let mut multipliers = Vec::new();
+    let mut has_positive = false;
+
+    for term in &provenance.terms {
+        if term.multiplier.is_negative() {
+            return Err(format!(
+                "source row {} has negative multiplier",
+                term.source_row.0
+            ));
+        }
+        has_positive |= term.multiplier.is_positive();
+        let row = source_rows
+            .get(term.source_row.0)
+            .ok_or_else(|| format!("missing source row {}", term.source_row.0))?;
+        if row.id != term.source_row || row.out_w.len() != rebuilt_w.len() {
+            return Err(format!(
+                "source row {} shape/id mismatch",
+                term.source_row.0
+            ));
+        }
+        if row.normalized_constraint.kind != ConstraintKind::Le
+            || row.normalized_constraint.constant != row.u_bound
+        {
+            return Err(format!(
+                "source row {} normalization mismatch",
+                term.source_row.0
+            ));
+        }
+        for (slot, coefficient) in rebuilt_w.iter_mut().zip(&row.out_w) {
+            *slot = slot
+                .add(
+                    coefficient
+                        .mul(term.multiplier)
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        rebuilt_b = rebuilt_b
+            .add(row.out_b.mul(term.multiplier).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        rebuilt_u = rebuilt_u
+            .add(
+                row.u_bound
+                    .mul(term.multiplier)
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        for (name, coefficient) in &row.normalized_constraint.coefficients {
+            let scaled = coefficient
+                .mul(term.multiplier)
+                .map_err(|e| e.to_string())?;
+            let prior = conclusion_coefficients.remove(name).unwrap_or(Rat::ZERO);
+            let combined = prior.add(scaled).map_err(|e| e.to_string())?;
+            if !combined.is_zero() {
+                conclusion_coefficients.insert(name.clone(), combined);
+            }
+        }
+        premises.push(row.original_constraint.clone());
+        multipliers.push(term.multiplier);
+    }
+    if !has_positive {
+        return Err("all source multipliers are zero".to_string());
+    }
+    if rebuilt_w != out_w || rebuilt_b != out_b || rebuilt_u != u_bound {
+        return Err("target does not exactly reconstruct from its source rows".to_string());
+    }
+
+    let source_entailment = EntailmentCertificate {
+        premises,
+        multipliers,
+        conclusion: LinearConstraint {
+            kind: ConstraintKind::Le,
+            coefficients: conclusion_coefficients,
+            constant: rebuilt_u,
+        },
+    };
+    let (derived, claimed) =
+        check_entailment(&source_entailment).map_err(|e| format!("source entailment: {e}"))?;
+    if derived != claimed {
+        return Err("source entailment was not the exact stated combination".to_string());
+    }
+    Ok(ConjTarget {
+        label,
+        out_w,
+        out_b,
+        u_bound,
+        provenance,
+        source_entailment,
+    })
+}
+
+fn target_authority_json(index: usize, target: &ConjTarget) -> serde_json::Value {
+    let terms: Vec<serde_json::Value> = target
+        .provenance
+        .terms
+        .iter()
+        .map(|term| {
+            serde_json::json!({
+                "source_row": term.source_row.0,
+                "multiplier": fmt_rat(&term.multiplier),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "target": index,
+        "label": target.label,
+        "source_terms": terms,
+        "reconstructed_readout": {
+            "weights": target.out_w.iter().map(fmt_rat).collect::<Vec<_>>(),
+            "bias": fmt_rat(&target.out_b),
+            "upper_bound": fmt_rat(&target.u_bound),
+        },
+        "source_entailment": entailment_to_json(&target.source_entailment)
+            .expect("checked source entailment must serialize"),
+        "leaf_certificate_composition": "the leaf Farkas refutes the reconstructed scalar atom; source_entailment proves the original VNNLIB unsafe rows entail the corresponding output-space row. NY checks the exact readout reconstruction, but Clean does not compose these artifacts",
+    })
 }
 
 /// Metadata for a certified leaf of the conjunction branch-and-bound (the
@@ -2751,7 +2952,10 @@ fn split_node(
 /// `NYCERT_JOBS` boxes certify concurrently. All exact values cross the
 /// boundary as canonical `n/d` strings (lossless), and the returned
 /// certificate is already SELF-CHECKED (in-tree mirror of Clean's verifier)
-/// and serialized to Clean's external-cert JSON.
+/// and serialized to Clean's external-cert JSON. That JSON proves only the
+/// leaf-local scalar contradiction; Clean does not consume `tree.json` and
+/// therefore does not check the target's source-row composition or the tree
+/// cover. Those separate obligations remain explicit in the manifest.
 ///
 /// Returns `None` when the exact bound does not refute the atom on this box
 /// (the caller splits further). Worker panics (soundness asserts) propagate.
@@ -2835,6 +3039,13 @@ fn exact_leaf_compute(
         let margin = m.sub(u_bound).unwrap();
         let mut fc = cert.entailment.premises.clone();
         let mut fm = cert.entailment.multipliers.clone();
+        // This scalar row is the exact target passed by `conj_pipeline`. Every
+        // such target was admitted only by `trusted_conj_target`, which
+        // reconstructs it from original VNNLIB rows and checks their conic
+        // entailment. The leaf Farkas remains a certificate relative to this
+        // scalar premise; `tree.json.target_authority` carries the checked
+        // source entailment required to compose it back to the VNNLIB unsafe
+        // region (the standalone leaf JSON is intentionally not overclaimed).
         fc.push(LinearConstraint::with_kind(
             ConstraintKind::Le,
             &[("y", Rat::ONE)],
@@ -2874,6 +3085,9 @@ fn exact_leaf_compute(
 /// exact midpoint of its widest coordinate. The f64 CROWN screen only navigates
 /// — every leaf is decided by the exact bignum pass, self-checked with the
 /// in-tree mirror of Clean's verifier, and emitted as Clean external-cert JSON.
+/// Clean checks each leaf's local arithmetic only; it does not establish the
+/// external source-row composition recorded in `target_authority` or the tree
+/// cover recorded in `tree.json`.
 fn conj_pipeline(
     net: &LoadedNet,
     root_lo: &[Rat],
@@ -2889,8 +3103,9 @@ fn conj_pipeline(
     let readout = &net.layers[n_hidden];
     let out_dim = readout.w.len();
 
-    // Build the refutation targets (one per unsafe atom).
-    let mut targets: Vec<ConjTarget> = vec![];
+    // Build the ORIGINAL exact source rows first. Synthetic targets may only be
+    // constructed from these rows through `trusted_conj_target` below.
+    let mut source_rows: Vec<UnsafeSourceRow> = vec![];
     for a in y_atoms {
         let j = match var_index(&a.var) {
             Some(j) if j < out_dim => j,
@@ -2906,25 +3121,64 @@ fn conj_pipeline(
                 std::process::exit(2);
             }
         };
-        if a.op == "<=" {
+        let source_row = UnsafeSourceRowId(source_rows.len());
+        let (label, original_constraint, normalized_constraint, out_w, out_b, u_bound) = if a.op
+            == "<="
+        {
             // unsafe atom Y_j <= c ; refuted on a box iff  min Y_j > c.
-            targets.push(ConjTarget {
-                label: format!("Y_{j}<={}", a.rhs_raw),
-                out_w: readout.w[j].clone(),
-                out_b: readout.b[j],
-                u_bound: c,
-            });
+            (
+                format!("Y_{j}<={}", a.rhs_raw),
+                LinearConstraint::with_kind(ConstraintKind::Le, &[(a.var.as_str(), Rat::ONE)], c),
+                LinearConstraint::with_kind(ConstraintKind::Le, &[(a.var.as_str(), Rat::ONE)], c),
+                readout.w[j].clone(),
+                readout.b[j],
+                c,
+            )
         } else {
             // unsafe atom Y_j >= c ; refuted iff  min (-Y_j) > -c.
-            targets.push(ConjTarget {
-                label: format!("Y_{j}>={}", a.rhs_raw),
-                out_w: readout.w[j].iter().map(|r| r.neg()).collect(),
-                out_b: readout.b[j].neg(),
-                u_bound: c.neg(),
-            });
-        }
+            (
+                format!("Y_{j}>={}", a.rhs_raw),
+                LinearConstraint::with_kind(ConstraintKind::Ge, &[(a.var.as_str(), Rat::ONE)], c),
+                LinearConstraint::with_kind(
+                    ConstraintKind::Le,
+                    &[(a.var.as_str(), Rat::ONE.neg())],
+                    c.neg(),
+                ),
+                readout.w[j].iter().map(|r| r.neg()).collect(),
+                readout.b[j].neg(),
+                c.neg(),
+            )
+        };
+        source_rows.push(UnsafeSourceRow {
+            id: source_row,
+            label,
+            original_constraint,
+            normalized_constraint,
+            out_w,
+            out_b,
+            u_bound,
+        });
     }
-    assert!(!targets.is_empty(), "CONJ: no Y atoms");
+    assert!(!source_rows.is_empty(), "CONJ: no Y atoms");
+
+    let reject_authority = |reason: String| -> ! {
+        eprintln!("CONJ_AUTHORITY_REJECTED: {reason}");
+        std::process::exit(2);
+    };
+    let mut targets: Vec<ConjTarget> = source_rows
+        .iter()
+        .map(|row| {
+            trusted_conj_target(
+                row.label.clone(),
+                row.out_w.clone(),
+                row.out_b,
+                row.u_bound,
+                ConicProvenance::pure(row.id),
+                &source_rows,
+            )
+            .unwrap_or_else(|reason| reject_authority(reason))
+        })
+        .collect();
     // CONIC MIXES: every target is normalized to "unsafe ⊨ y'_t ≤ u_t", so any
     // non-negative combination Σ λ_t·y'_t ≤ Σ λ_t·u_t is ALSO entailed by the
     // unsafe region — refuting it on a box refutes the conjunction there. A
@@ -2933,18 +3187,16 @@ fn conj_pipeline(
     // The leaf Farkas pushes the combined atom; tree.json records the mix.
     if targets.len() == 2 && std::env::var("NYCERT_MIX").ok().as_deref() != Some("0") {
         // NYCERT_MIX_SET overrides the default ratio ladder: "1:1,2:1,1:2,...".
-        let mixes: Vec<(i64, i64)> = std::env::var("NYCERT_MIX_SET")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|p| {
-                        let (a, b) = p.trim().split_once(':').expect("mix a:b");
-                        (a.parse().expect("mix l0"), b.parse().expect("mix l1"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![(1, 1), (2, 1), (1, 2)]);
-        for &(l0, l1) in &mixes {
+        let mixes = match std::env::var("NYCERT_MIX_SET") {
+            Ok(raw) => parse_mix_set(&raw).unwrap_or_else(|reason| reject_authority(reason)),
+            Err(_) => vec![
+                MixPair { left: 1, right: 1 },
+                MixPair { left: 2, right: 1 },
+                MixPair { left: 1, right: 2 },
+            ],
+        };
+        for mix in mixes {
+            let (l0, l1) = (mix.left, mix.right);
             let (a, b) = (&targets[0], &targets[1]);
             let s0 = Rat::from_int(i128::from(l0));
             let s1 = Rat::from_int(i128::from(l1));
@@ -2954,22 +3206,35 @@ fn conj_pipeline(
                 .zip(&b.out_w)
                 .map(|(x, y)| x.mul(s0).unwrap().add(y.mul(s1).unwrap()).unwrap())
                 .collect();
-            targets.push(ConjTarget {
-                label: format!("{l0}*[{}] + {l1}*[{}]", a.label, b.label),
-                out_w,
-                out_b: a
-                    .out_b
-                    .mul(s0)
-                    .unwrap()
-                    .add(b.out_b.mul(s1).unwrap())
-                    .unwrap(),
-                u_bound: a
-                    .u_bound
-                    .mul(s0)
-                    .unwrap()
-                    .add(b.u_bound.mul(s1).unwrap())
-                    .unwrap(),
-            });
+            let label = format!("{l0}*[{}] + {l1}*[{}]", a.label, b.label);
+            let out_b = a
+                .out_b
+                .mul(s0)
+                .unwrap()
+                .add(b.out_b.mul(s1).unwrap())
+                .unwrap();
+            let u_bound = a
+                .u_bound
+                .mul(s0)
+                .unwrap()
+                .add(b.u_bound.mul(s1).unwrap())
+                .unwrap();
+            let provenance = ConicProvenance {
+                terms: vec![
+                    ConicSourceTerm {
+                        source_row: source_rows[0].id,
+                        multiplier: s0,
+                    },
+                    ConicSourceTerm {
+                        source_row: source_rows[1].id,
+                        multiplier: s1,
+                    },
+                ],
+            };
+            targets.push(
+                trusted_conj_target(label, out_w, out_b, u_bound, provenance, &source_rows)
+                    .unwrap_or_else(|reason| reject_authority(reason)),
+            );
         }
     }
 
@@ -3269,6 +3534,7 @@ fn conj_pipeline(
                 "id": leaf.id,
                 "lo": box_json(&leaf.lo),
                 "hi": box_json(&leaf.hi),
+                "screened_target": leaf.target,
                 "screened_atom": targets[leaf.target].label,
                 "margin_approx": leaf.margin_f64,
             }));
@@ -3285,6 +3551,7 @@ fn conj_pipeline(
                 "id": leaf.id,
                 "lo": box_json(&leaf.lo),
                 "hi": box_json(&leaf.hi),
+                "refuted_target": leaf.target,
                 "refuted_atom": targets[leaf.target].label,
                 "margin": leaf.margin_s,
                 "margin_approx": leaf.margin_f64,
@@ -3301,6 +3568,20 @@ fn conj_pipeline(
             })
         })
         .collect();
+    let original_unsafe_rows: Vec<serde_json::Value> = source_rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "source_row": row.id.0,
+                "label": row.label,
+            })
+        })
+        .collect();
+    let target_authority: Vec<serde_json::Value> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| target_authority_json(index, target))
+        .collect();
 
     // Screen-only dry run: nothing was proved — no exact pass ran and no
     // certificates exist. Emit a shape-only manifest under a distinct name
@@ -3311,12 +3592,18 @@ fn conj_pipeline(
             "type": "conjunctive_screen_only_tree",
             "version": "1.0",
             "unsafe_atoms": targets.iter().map(|t| t.label.clone()).collect::<Vec<_>>(),
+            "original_unsafe_rows": original_unsafe_rows,
+            "target_authority": target_authority,
             "semantics": "f64 CROWN screen dry run (no directed rounding, no exact pass, no certificates): each leaf's screen margin was positive on its box; the split tree partitions the root box (re-checked structurally). A tree size/shape measurement, NOT a verdict.",
             "root_lo": box_json(root_lo),
             "root_hi": box_json(root_hi),
             "splits": split_manifest,
             "leaves": leaf_manifest,
         });
+        assert!(
+            !ny_cert::rational::poisoned(),
+            "refusing to write a screen tree after a rational arena fallback"
+        );
         std::fs::write(
             format!("{out_dir}/screen_tree.json"),
             serde_json::to_string_pretty(&tree).unwrap(),
@@ -3339,12 +3626,18 @@ fn conj_pipeline(
         "type": "conjunctive_unsat_tree",
         "version": "1.0",
         "unsafe_atoms": targets.iter().map(|t| t.label.clone()).collect::<Vec<_>>(),
-        "semantics": "unsafe region = AND of atoms; each leaf refutes ONE entailed atom on its box (a pure atom, or a non-negative conic combination of the atoms, which the conjunction entails); the split tree partitions the root box (re-checked structurally)",
+        "original_unsafe_rows": original_unsafe_rows,
+        "target_authority": target_authority,
+        "semantics": "unsafe region = AND of original_unsafe_rows; each leaf refutes ONE exactly reconstructed target on its box. target_authority carries a checked non-negative source-row entailment for every pure or conic target; the leaf Farkas is composition-dependent on that linkage. The split tree partitions the root box (re-checked structurally)",
         "root_lo": box_json(root_lo),
         "root_hi": box_json(root_hi),
         "splits": split_manifest,
         "leaves": leaf_manifest,
     });
+    assert!(
+        !ny_cert::rational::poisoned(),
+        "refusing to write a certificate tree after a rational arena fallback"
+    );
     std::fs::write(
         format!("{out_dir}/tree.json"),
         serde_json::to_string_pretty(&tree).unwrap(),
@@ -3367,7 +3660,12 @@ fn conj_pipeline(
 /// entailment certificate (multipliers, premise coefficients/constants, and the
 /// conclusion). Demonstrates the certificate genuinely exceeds the i128 wall.
 fn cert_max_bits(cert: &EntailmentCertificate) -> u64 {
-    let bits = |r: &Rat| r.num().bits().max(r.den().bits());
+    let bits = |r: &Rat| {
+        let (num, den) = r
+            .checked_parts()
+            .expect("refusing to inspect a poisoned rational arena");
+        num.bits().max(den.bits())
+    };
     let mut m = 0u64;
     for mu in &cert.multipliers {
         m = m.max(bits(mu));
@@ -3386,12 +3684,8 @@ fn cert_max_bits(cert: &EntailmentCertificate) -> u64 {
 }
 
 fn fmt_rat(r: &Rat) -> String {
-    use num_traits::One;
-    if r.den().is_one() {
-        format!("{}", r.num())
-    } else {
-        format!("{}/{}", r.num(), r.den())
-    }
+    r.to_clean_string()
+        .expect("refusing to format a poisoned rational arena")
 }
 
 /// Derive the snake-case system stem used for the emitted theorem names from the
@@ -3418,8 +3712,7 @@ fn module_to_sys(module: &str) -> String {
 /// Approximate a (possibly huge) exact rational as `f64` for human-readable
 /// diagnostics only. Never used in a certificate or a soundness decision.
 fn rat_to_f64(r: &Rat) -> f64 {
-    use num_traits::ToPrimitive;
-    r.to_big().to_f64().unwrap_or(f64::NAN)
+    r.to_f64_approx()
 }
 
 // ---------------------------------------------------------------------------
@@ -3436,7 +3729,10 @@ fn rat_to_f64(r: &Rat) -> f64 {
 /// One exact rational as a Lean `ℚ` literal `(mkRat n d)` (denominator kept
 /// positive by `Rat`'s `BigRational` normalization). Lossless.
 fn rat_lean(r: &Rat) -> String {
-    format!("(mkRat ({}) ({}))", r.num(), r.den())
+    let (num, den) = r
+        .checked_parts()
+        .expect("refusing to emit a poisoned rational arena");
+    format!("(mkRat ({num}) ({den}))")
 }
 
 /// Emit a flattened `LoadedNet` as a Lean `Net` literal (hidden ReLU layers +
@@ -3787,6 +4083,10 @@ end Crownproof
 "#
     );
 
+    assert!(
+        !ny_cert::rational::poisoned(),
+        "refusing to write Lean after a rational arena fallback"
+    );
     std::fs::write(out_path, &out).expect("write lean file");
     eprintln!(
         "[emit-lean] wrote {out_path} ({} bytes, module {module})",
@@ -3930,6 +4230,124 @@ mod dag_tests {
             })
             .collect();
         (0..2).map(|o| head_a[o].add(head_b[o]).unwrap()).collect()
+    }
+
+    #[test]
+    fn mix_set_parser_rejects_non_conic_and_zero_authority() {
+        for raw in ["-1:1", "1:-1", "0:0", "", "1", "x:1", "1:x"] {
+            assert!(parse_mix_set(raw).is_err(), "raw={raw:?}");
+        }
+        assert_eq!(
+            parse_mix_set("1:1, 2:0, 0:3").unwrap(),
+            vec![
+                MixPair { left: 1, right: 1 },
+                MixPair { left: 2, right: 0 },
+                MixPair { left: 0, right: 3 },
+            ]
+        );
+    }
+
+    fn authority_source_rows() -> Vec<UnsafeSourceRow> {
+        vec![
+            UnsafeSourceRow {
+                id: UnsafeSourceRowId(0),
+                label: "Y_0<=5".to_string(),
+                original_constraint: LinearConstraint::with_kind(
+                    ConstraintKind::Le,
+                    &[("Y_0", Rat::ONE)],
+                    Rat::from_int(5),
+                ),
+                normalized_constraint: LinearConstraint::with_kind(
+                    ConstraintKind::Le,
+                    &[("Y_0", Rat::ONE)],
+                    Rat::from_int(5),
+                ),
+                out_w: vec![Rat::ONE, Rat::from_int(2)],
+                out_b: Rat::from_int(3),
+                u_bound: Rat::from_int(5),
+            },
+            UnsafeSourceRow {
+                id: UnsafeSourceRowId(1),
+                label: "Y_1>=7".to_string(),
+                original_constraint: LinearConstraint::with_kind(
+                    ConstraintKind::Ge,
+                    &[("Y_1", Rat::ONE)],
+                    Rat::from_int(7),
+                ),
+                normalized_constraint: LinearConstraint::with_kind(
+                    ConstraintKind::Le,
+                    &[("Y_1", Rat::from_int(-1))],
+                    Rat::from_int(-7),
+                ),
+                out_w: vec![Rat::from_int(-3), Rat::from_int(-4)],
+                out_b: Rat::from_int(-6),
+                u_bound: Rat::from_int(-7),
+            },
+        ]
+    }
+
+    #[test]
+    fn trusted_conic_target_reconstructs_exact_rows_and_rejects_forgery() {
+        let rows = authority_source_rows();
+        let provenance = ConicProvenance {
+            terms: vec![
+                ConicSourceTerm {
+                    source_row: UnsafeSourceRowId(0),
+                    multiplier: Rat::from_int(2),
+                },
+                ConicSourceTerm {
+                    source_row: UnsafeSourceRowId(1),
+                    multiplier: Rat::ONE,
+                },
+            ],
+        };
+        let target = trusted_conj_target(
+            "2*row0 + row1".to_string(),
+            vec![Rat::from_int(-1), Rat::ZERO],
+            Rat::ZERO,
+            Rat::from_int(3),
+            provenance.clone(),
+            &rows,
+        )
+        .expect("exact conic reconstruction");
+        assert_eq!(target.provenance, provenance);
+        assert!(check_entailment(&target.source_entailment).is_ok());
+
+        assert!(trusted_conj_target(
+            "forged bound".to_string(),
+            vec![Rat::from_int(-1), Rat::ZERO],
+            Rat::ZERO,
+            Rat::from_int(4),
+            provenance,
+            &rows,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn trusted_conic_target_rejects_negative_and_all_zero_provenance() {
+        let rows = authority_source_rows();
+        for multipliers in [[-1, 1], [0, 0]] {
+            let provenance = ConicProvenance {
+                terms: multipliers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(source_row, multiplier)| ConicSourceTerm {
+                        source_row: UnsafeSourceRowId(source_row),
+                        multiplier: Rat::from_int(multiplier),
+                    })
+                    .collect(),
+            };
+            assert!(trusted_conj_target(
+                "invalid".to_string(),
+                vec![Rat::ZERO, Rat::ZERO],
+                Rat::ZERO,
+                Rat::ZERO,
+                provenance,
+                &rows,
+            )
+            .is_err());
+        }
     }
 
     #[test]

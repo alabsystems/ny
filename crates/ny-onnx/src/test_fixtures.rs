@@ -11,6 +11,7 @@
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
+    io::Write,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -19,7 +20,6 @@ use crate::onnx_proto;
 
 pub(crate) const TEST_MODELS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/models");
 pub(crate) const TEST_MODELS_ENV: &str = "NY_TEST_MODELS_DIR";
-pub(crate) const REQUIRE_FIXTURES_ENV: &str = "NY_REQUIRE_TEST_FIXTURES";
 pub(crate) const DEFAULT_FIXTURE_HINT: &str =
     "Generate fixtures with: python scripts/generate_test_models.py (or cargo run -p ny-onnx --bin gen_test_fixtures for minimal fixtures)";
 pub(crate) const TRANSFORMER_TEST_MODEL_HINT: &str =
@@ -27,7 +27,7 @@ pub(crate) const TRANSFORMER_TEST_MODEL_HINT: &str =
 pub(crate) const WHISPER_TEST_MODEL_HINT: &str =
     "Generate with: python scripts/export_whisper_encoder.py";
 pub(crate) const AVOICE_TEST_MODEL_HINT: &str =
-    "Set NY_TEST_MODELS_DIR to the directory containing the ONNX exports, or place speaker_encoder.onnx / talker_attention_layer0.onnx / kokoro_vocoder.onnx / kokoro_duration_predictor.onnx in tests/models/. Optional adjacent <model>.contract.json sidecars are supported.";
+    "Set NY_TEST_MODELS_DIR to the directory containing the ONNX exports, or place speaker_encoder.onnx / talker_attention_layer0.onnx / kokoro_vocoder.onnx / kokoro_duration_predictor.onnx in tests/models/. Run the explicit AVoice lane with cargo run -p ny-onnx --bin ny_onnx_conformance -- avoice after staging its models. Optional adjacent <model>.contract.json sidecars are supported.";
 
 const AVOICE_EXPORT_FILES: &[&str] = &[
     "speaker_encoder.onnx",
@@ -202,7 +202,32 @@ pub(crate) fn try_restore_test_model(path: &Path, name: &str) -> bool {
         }
     }
 
-    std::fs::write(path, output.stdout).is_ok()
+    publish_test_model_atomically(path, &output.stdout)
+}
+
+fn publish_test_model_atomically(path: &Path, bytes: &[u8]) -> bool {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut staged = match tempfile::NamedTempFile::new_in(parent) {
+        Ok(staged) => staged,
+        Err(_) => return false,
+    };
+    if staged.write_all(bytes).is_err()
+        || staged.flush().is_err()
+        || staged.as_file().sync_all().is_err()
+    {
+        return false;
+    }
+
+    // Tests load fixtures concurrently and even separate cargo processes can
+    // restore the same missing file. Publish a complete same-directory
+    // snapshot atomically so readers never observe a protobuf prefix.
+    if staged.persist(path).is_err() {
+        // Another publisher may have won (or Windows may have refused a
+        // replace). Count that as success only when the complete expected
+        // fixture is now visible.
+        return std::fs::read(path).is_ok_and(|published| published == bytes);
+    }
+    std::fs::read(path).is_ok_and(|published| published == bytes)
 }
 
 pub(crate) fn optional_test_model(name: &str) -> Option<PathBuf> {
@@ -266,12 +291,9 @@ pub(crate) fn require_test_model(name: &str) -> PathBuf {
     require_test_model_with_hint(name, DEFAULT_FIXTURE_HINT)
 }
 
-pub(crate) fn fixtures_required() -> bool {
-    std::env::var(REQUIRE_FIXTURES_ENV).is_ok_and(|value| value.trim() == "1")
-}
-
 /// Hint matching what the hard-require call sites pass for this fixture, so
-/// skip notices (and env-forced panics) from bare guards stay consistent.
+/// fixture diagnostics from bare guards stay consistent.
+#[cfg(any(feature = "external-avoice", feature = "external-whisper"))]
 pub(crate) fn default_hint_for(name: &str) -> &'static str {
     if is_avoice_export(name) {
         AVOICE_TEST_MODEL_HINT
@@ -282,50 +304,23 @@ pub(crate) fn default_hint_for(name: &str) -> &'static str {
     }
 }
 
-/// Resolve a fixture like `require_test_model_with_hint`, except that when the
-/// fixture is absent and `NY_REQUIRE_TEST_FIXTURES` != "1" it prints a
-/// "SKIP: missing fixture" notice and returns `None` so the calling test can
-/// early-return instead of failing. With the env var set (fixture-bearing
-/// machines / CI), a missing fixture stays the same hard panic as before.
-pub(crate) fn test_model_or_skip_with_hint(name: &str, hint: &str) -> Option<PathBuf> {
-    if let Some(path) = optional_test_model(name) {
-        return Some(path);
-    }
-
-    assert!(
-        !fixtures_required(),
-        "Test model missing at {:?}. {}",
-        test_model_path(name),
-        missing_test_model_details(name, hint)
-    );
-    eprintln!(
-        "SKIP: missing fixture {:?}. {} Set {}=1 to make missing fixtures a hard failure.",
-        test_model_path(name),
-        missing_test_model_details(name, hint),
-        REQUIRE_FIXTURES_ENV
-    );
-    None
-}
-
-/// Test-body guard statement: when the fixture is absent locally, print the
-/// "SKIP: missing fixture" notice from `test_model_or_skip_with_hint` and
-/// return early from the test; with `NY_REQUIRE_TEST_FIXTURES=1` a missing
-/// fixture panics exactly like `require_test_model_with_hint`. Place before
-/// helpers that hard-require the fixture (e.g. `OnceLock`-cached loaders).
-macro_rules! require_test_model_or_skip {
+/// Test-body guard for model-backed tests.
+///
+/// Every explicitly selected model-backed conformance test requires its
+/// fixture. External suites are registered only by their explicit Cargo
+/// feature, and an unavailable asset is always a hard failure.
+#[cfg(any(feature = "external-avoice", feature = "external-whisper"))]
+macro_rules! assert_test_model_available {
     ($name:expr) => {
         let name = $name;
-        if crate::test_fixtures::test_model_or_skip_with_hint(
+        let _fixture_path = crate::test_fixtures::require_test_model_with_hint(
             name,
             crate::test_fixtures::default_hint_for(name),
-        )
-        .is_none()
-        {
-            return;
-        }
+        );
     };
 }
-pub(crate) use require_test_model_or_skip;
+#[cfg(any(feature = "external-avoice", feature = "external-whisper"))]
+pub(crate) use assert_test_model_available;
 
 pub(crate) fn specialize_kokoro_duration_predictor_for_lstm_unroll(
     proto: &mut onnx_proto::ModelProto,
@@ -337,15 +332,18 @@ pub(crate) fn specialize_kokoro_duration_predictor_for_lstm_unroll(
         return;
     };
 
-    if !graph
-        .value_info
-        .iter()
-        .any(|info| info.name == "/lstm/Transpose_output_0")
+    #[cfg(feature = "onnx-value-info")]
     {
-        graph.value_info.push(f32_tensor_value_info(
-            "/lstm/Transpose_output_0",
-            &[seq_len, 1, 640],
-        ));
+        if !graph
+            .value_info
+            .iter()
+            .any(|info| info.name == "/lstm/Transpose_output_0")
+        {
+            graph.value_info.push(f32_tensor_value_info(
+                "/lstm/Transpose_output_0",
+                &[seq_len, 1, 640],
+            ));
+        }
     }
 
     for node in &mut graph.node {
@@ -406,11 +404,15 @@ fn concretize_symbolic_dim(proto: &mut onnx_proto::ModelProto, symbol: &str, con
     for value_info in &mut graph.output {
         set_dim(value_info);
     }
-    for value_info in &mut graph.value_info {
-        set_dim(value_info);
+    #[cfg(feature = "onnx-value-info")]
+    {
+        for value_info in &mut graph.value_info {
+            set_dim(value_info);
+        }
     }
 }
 
+#[cfg(feature = "onnx-value-info")]
 fn f32_tensor_value_info(name: &str, shape: &[i64]) -> onnx_proto::ValueInfoProto {
     use onnx_proto::tensor_shape_proto::{dimension::Value, Dimension};
 

@@ -5,6 +5,7 @@
 //! Deadline-threading regressions (#3816).
 
 use ndarray::{arr1, arr2};
+use ny_core::NyError;
 
 use crate::beta_crown::{GraphCrownContext, GraphSplitHistory};
 use crate::{
@@ -137,5 +138,137 @@ fn test_constrained_backward_storing_intermediates_expired_deadline_returns_erro
     assert!(
         err_msg.contains("deadline") || err_msg.contains("Deadline"),
         "Error should mention deadline, got: {err_msg}"
+    );
+}
+
+/// Expired authority must be rejected at wrapper entry, before malformed graph
+/// preparation can replace the timeout with an unrelated validation error.
+#[test]
+fn test_constrained_wrappers_preflight_deadline_before_preparation() {
+    use std::time::{Duration, Instant};
+
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    verifier.config.alpha_config.deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond fits before the current instant"),
+    );
+
+    // Deliberately has no output node. Reaching constrained forward preparation
+    // would therefore return InvalidSpec instead of the authority timeout.
+    let graph = GraphNetwork::new();
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())
+        .expect("valid input bounds");
+    let history = GraphSplitHistory::new();
+    let context = GraphCrownContext::for_history(&history);
+    let spec_matrix = arr2(&[[1.0]]);
+
+    let standard =
+        verifier.propagate_crown_with_graph_constraints(&graph, &input, &context, None, None);
+    assert!(matches!(standard, Err(NyError::DeadlineExceeded(_))));
+
+    let storing = verifier.propagate_crown_with_graph_constraints_storing_intermediates(
+        &graph, &input, &context, None, None,
+    );
+    assert!(matches!(storing, Err(NyError::DeadlineExceeded(_))));
+
+    let spec = verifier.propagate_crown_with_graph_constraints_with_spec_matrix(
+        &graph,
+        &input,
+        &context,
+        None,
+        &spec_matrix,
+        None,
+        false,
+    );
+    assert!(matches!(spec, Err(NyError::DeadlineExceeded(_))));
+
+    let spec_storing = verifier
+        .propagate_crown_with_graph_constraints_storing_intermediates_with_spec_matrix(
+            &graph,
+            &input,
+            &context,
+            None,
+            &spec_matrix,
+        );
+    assert!(matches!(spec_storing, Err(NyError::DeadlineExceeded(_))));
+}
+
+#[test]
+fn test_constrained_preflight_none_preserves_unbounded_path() {
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    verifier.config.alpha_config.deadline = None;
+
+    let graph = build_conv2d_deadline_graph();
+    let lower = ndarray::ArrayD::from_elem(ndarray::IxDyn(&[1, 4, 4]), 0.0_f32);
+    let upper = ndarray::ArrayD::from_elem(ndarray::IxDyn(&[1, 4, 4]), 1.0_f32);
+    let input = BoundedTensor::new(lower, upper).expect("valid input bounds");
+    let history = GraphSplitHistory::new();
+    let context = GraphCrownContext::for_history(&history);
+
+    let result =
+        verifier.propagate_crown_with_graph_constraints(&graph, &input, &context, None, None);
+    assert!(
+        result.is_ok(),
+        "deadline=None must preserve constrained propagation: {result:?}"
+    );
+}
+
+#[test]
+fn constrained_forward_inner_captures_effective_deadline() {
+    use std::time::{Duration, Instant};
+
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    verifier.config.alpha_config.deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond fits before the current instant"),
+    );
+    let graph = build_conv2d_deadline_graph();
+    let input = BoundedTensor::new(
+        ndarray::ArrayD::from_elem(ndarray::IxDyn(&[1, 4, 4]), 0.0_f32),
+        ndarray::ArrayD::from_elem(ndarray::IxDyn(&[1, 4, 4]), 1.0_f32),
+    )
+    .expect("valid input bounds");
+    let history = GraphSplitHistory::new();
+
+    let error = verifier
+        .compute_constrained_forward_bounds_inner(&graph, &input, &history, None, None, false)
+        .expect_err("the inner constrained forward must retain deadline authority");
+    assert!(
+        matches!(error, NyError::DeadlineExceeded(_)),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn constrained_forward_conv2d_intersection_keeps_certified_cancellation_widening() {
+    let kernel = ndarray::ArrayD::from_shape_vec(
+        ndarray::IxDyn(&[1, 1, 1, 3]),
+        vec![16_777_216.0_f32, 1.0, -16_777_216.0],
+    )
+    .expect("kernel");
+    let conv =
+        crate::Conv2dLayer::with_input_shape(kernel, None, (1, 1), (0, 0), 1, 3).expect("conv");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("conv", Layer::Conv2d(conv)));
+    graph.set_output("conv");
+    let input = BoundedTensor::concrete(
+        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 3]), vec![1.0_f32; 3])
+            .expect("input"),
+    )
+    .expect("concrete input");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let history = GraphSplitHistory::new();
+
+    let (bounds, _) = verifier
+        .compute_constrained_forward_bounds_inner(&graph, &input, &history, None, None, false)
+        .expect("constrained forward");
+    let conv_bounds = bounds.get("conv").expect("conv bounds");
+    assert!(
+        conv_bounds.lower()[[0, 0, 0]] <= 1.0 && conv_bounds.upper()[[0, 0, 0]] >= 1.0,
+        "the constrained intersection must retain the exact real sum 1.0, got [{}, {}]",
+        conv_bounds.lower()[[0, 0, 0]],
+        conv_bounds.upper()[[0, 0, 0]],
     );
 }

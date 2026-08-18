@@ -174,7 +174,7 @@ fn test_gpu_bab_conv2d_graph_branching() {
         BabVerificationStatus::Unknown { .. } => {
             // Unknown is acceptable - the point is no panic/NaN from Conv2d backward.
         }
-        BabVerificationStatus::PotentialViolation => {
+        BabVerificationStatus::PotentialViolation { .. } => {
             // Also acceptable for some threshold values.
         }
         other => {
@@ -266,7 +266,10 @@ fn test_gpu_bab_input_split_uses_sb_linear_scoring_3870() {
         .expect("GPU input split should complete on SB-scoring regression");
 
     assert!(
-        matches!(result.result, BabVerificationStatus::PotentialViolation),
+        matches!(
+            result.result,
+            BabVerificationStatus::PotentialViolation { .. }
+        ),
         "SB scoring should split x0 and expose the violating child immediately, got {:?}",
         result.result
     );
@@ -325,7 +328,7 @@ fn test_gpu_bab_input_split_reorder_bab_preserves_status_3870() {
     assert!(
         matches!(
             reorder_result.result,
-            BabVerificationStatus::PotentialViolation
+            BabVerificationStatus::PotentialViolation { .. }
         ),
         "the reordered path should still surface the violating x0 child, got {:?}",
         reorder_result.result

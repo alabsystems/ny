@@ -15,11 +15,111 @@
 use crate::network::tighten_crown_with_forward_bounds;
 use crate::types::{BoundsProvenance, CrownIbpFallbackReason};
 
-use ny_core::Result;
+use ndarray::{ArrayD, IxDyn};
+use ny_core::{f32_to_f64_exact, NyError, Result};
 use ny_tensor::BoundedTensor;
+use std::mem::size_of;
+use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::bounds_validation::has_nan_bounds;
+
+const TIGHTEN_POLL_STRIDE: usize = 4_096;
+
+#[inline]
+fn check_tighten_deadline(deadline: Option<Instant>, phase: &'static str) -> Result<()> {
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        Err(NyError::DeadlineExceeded(format!(
+            "CROWN output tightening: deadline exceeded {phase}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn has_nan_bounds_with_deadline(bounds: &BoundedTensor, deadline: Option<Instant>) -> Result<bool> {
+    for endpoints in [bounds.lower(), bounds.upper()] {
+        for (index, &value) in endpoints.iter().enumerate() {
+            if index.is_multiple_of(TIGHTEN_POLL_STRIDE) {
+                check_tighten_deadline(deadline, "while scanning endpoints")?;
+            }
+            if value.is_nan() {
+                return Ok(true);
+            }
+        }
+    }
+    check_tighten_deadline(deadline, "after scanning endpoints")?;
+    Ok(false)
+}
+
+pub(super) fn clone_forward_bounds_with_deadline(
+    forward_bounds: &BoundedTensor,
+    deadline: Option<Instant>,
+) -> Result<BoundedTensor> {
+    const SITE: &str = "CROWN output tightening forward fallback clone";
+    check_tighten_deadline(deadline, "before forward fallback clone")?;
+    let elements = forward_bounds.len();
+    let source_bytes = elements.saturating_mul(2).saturating_mul(size_of::<f32>());
+    let required_bytes = source_bytes.saturating_mul(2);
+    let budget_bytes = crate::network::crown_memory::cpu_crown_dense_budget_bytes();
+    if required_bytes > budget_bytes {
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+            site: SITE,
+        });
+    }
+
+    let mut lower = Vec::new();
+    lower
+        .try_reserve_exact(elements)
+        .map_err(|_| NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+            site: SITE,
+        })?;
+    let lower_capacity = lower.capacity();
+    let mut upper = Vec::new();
+    upper
+        .try_reserve_exact(elements)
+        .map_err(|_| NyError::CpuMemoryExceeded {
+            required_bytes,
+            budget_bytes,
+            site: SITE,
+        })?;
+    let actual_required_bytes = source_bytes.saturating_add(
+        lower_capacity
+            .saturating_add(upper.capacity())
+            .saturating_mul(size_of::<f32>()),
+    );
+    if actual_required_bytes > budget_bytes {
+        return Err(NyError::CpuMemoryExceeded {
+            required_bytes: actual_required_bytes,
+            budget_bytes,
+            site: SITE,
+        });
+    }
+    for (index, (&lower_value, &upper_value)) in forward_bounds
+        .lower()
+        .iter()
+        .zip(forward_bounds.upper().iter())
+        .enumerate()
+    {
+        if index.is_multiple_of(TIGHTEN_POLL_STRIDE) {
+            check_tighten_deadline(deadline, "while cloning forward fallback")?;
+        }
+        lower.push(lower_value);
+        upper.push(upper_value);
+    }
+    check_tighten_deadline(deadline, "after cloning forward fallback")?;
+    let lower = ArrayD::from_shape_vec(IxDyn(forward_bounds.shape()), lower)
+        .map_err(|error| NyError::InternalError(format!("{SITE}: lower shape: {error}")))?;
+    let upper = ArrayD::from_shape_vec(IxDyn(forward_bounds.shape()), upper)
+        .map_err(|error| NyError::InternalError(format!("{SITE}: upper shape: {error}")))?;
+    BoundedTensor::new_allow_infinite_with_poll(lower, upper, || {
+        check_tighten_deadline(deadline, "validating forward fallback clone")
+    })
+}
 
 /// Reference: #3043 — duplication of this pattern caused #2990 and #3037.
 /// Reference: alpha-beta-CROWN optimized_bounds.py:937-947.
@@ -88,6 +188,142 @@ pub(crate) fn tighten_crown_output(
     }
 }
 
+/// Finite-authority counterpart to [`tighten_crown_output`]. All endpoint
+/// scans and intersection writes are cooperatively polled; shape adjustment
+/// moves standard-layout buffers without copying; the only required clone
+/// (full forward fallback) is fallible and charged against the CROWN budget.
+pub(crate) fn tighten_crown_output_with_deadline(
+    crown_output: BoundedTensor,
+    forward_bounds: &BoundedTensor,
+    label: &str,
+    deadline: Option<Instant>,
+) -> Result<BoundedTensor> {
+    tighten_crown_output_with_provenance_and_deadline(crown_output, forward_bounds, label, deadline)
+        .map(|(bounds, _)| bounds)
+}
+
+/// Transactional, deadline-aware post-concretization tightening with
+/// provenance. No partially scanned, reshaped, or intersected tensor is
+/// published on deadline or allocation refusal.
+pub(crate) fn tighten_crown_output_with_provenance_and_deadline(
+    mut crown_output: BoundedTensor,
+    forward_bounds: &BoundedTensor,
+    label: &str,
+    deadline: Option<Instant>,
+) -> Result<(BoundedTensor, BoundsProvenance)> {
+    check_tighten_deadline(deadline, "before tightening")?;
+    let crown_nan = has_nan_bounds_with_deadline(&crown_output, deadline)?;
+    let fwd_nan = has_nan_bounds_with_deadline(forward_bounds, deadline)?;
+
+    if crown_nan && !fwd_nan {
+        debug!(
+            "{}: falling back to forward bounds — CROWN contains NaN",
+            label
+        );
+        drop(crown_output);
+        let fallback = clone_forward_bounds_with_deadline(forward_bounds, deadline)?;
+        return Ok((
+            fallback,
+            BoundsProvenance::ForwardFallback(CrownIbpFallbackReason::CrownPropagationError),
+        ));
+    }
+
+    if crown_output.shape() != forward_bounds.shape()
+        && crown_output.len() == forward_bounds.len()
+        && crown_output.lower().is_standard_layout()
+        && crown_output.upper().is_standard_layout()
+    {
+        debug!(
+            "{}: moving CROWN {:?} to forward {:?} shape for finite intersection",
+            label,
+            crown_output.shape(),
+            forward_bounds.shape()
+        );
+        crown_output = crown_output.into_reshape_with_poll(forward_bounds.shape(), || {
+            check_tighten_deadline(deadline, "during shape adjustment")
+        })?;
+    }
+
+    if crown_output.shape() != forward_bounds.shape() {
+        debug!(
+            "{}: skipping forward-bound tightening — shape mismatch \
+             (crown={:?}, forward={:?})",
+            label,
+            crown_output.shape(),
+            forward_bounds.shape()
+        );
+        check_tighten_deadline(deadline, "before mismatched publication")?;
+        return Ok((crown_output, BoundsProvenance::Crown));
+    }
+    if fwd_nan || crown_nan {
+        debug!(
+            "{}: skipping intersection — NaN bounds present \
+             (fwd_nan={}, crown_nan={})",
+            label, fwd_nan, crown_nan
+        );
+        check_tighten_deadline(deadline, "before NaN-bearing publication")?;
+        return Ok((crown_output, BoundsProvenance::Crown));
+    }
+
+    let (mut lower, mut upper) = crown_output.into_parts();
+    let mut disjoint_count = 0usize;
+    for (index, (((crown_lower, crown_upper), &forward_lower), &forward_upper)) in lower
+        .iter_mut()
+        .zip(upper.iter_mut())
+        .zip(forward_bounds.lower().iter())
+        .zip(forward_bounds.upper().iter())
+        .enumerate()
+    {
+        if index.is_multiple_of(TIGHTEN_POLL_STRIDE) {
+            check_tighten_deadline(deadline, "while intersecting endpoints")?;
+        }
+        let crown_lower_exact = f32_to_f64_exact(*crown_lower);
+        let crown_upper_exact = f32_to_f64_exact(*crown_upper);
+        let forward_lower_exact = f32_to_f64_exact(forward_lower);
+        let forward_upper_exact = f32_to_f64_exact(forward_upper);
+        let (tightened_lower, tightened_lower_exact) = if crown_lower_exact >= forward_lower_exact {
+            (*crown_lower, crown_lower_exact)
+        } else {
+            (forward_lower, forward_lower_exact)
+        };
+        let (tightened_upper, tightened_upper_exact) = if crown_upper_exact <= forward_upper_exact {
+            (*crown_upper, crown_upper_exact)
+        } else {
+            (forward_upper, forward_upper_exact)
+        };
+        if tightened_lower_exact <= tightened_upper_exact {
+            *crown_lower = tightened_lower;
+            *crown_upper = tightened_upper;
+        } else {
+            disjoint_count += 1;
+            *crown_lower = if crown_lower_exact <= forward_lower_exact {
+                *crown_lower
+            } else {
+                forward_lower
+            };
+            *crown_upper = if crown_upper_exact >= forward_upper_exact {
+                *crown_upper
+            } else {
+                forward_upper
+            };
+        }
+    }
+    check_tighten_deadline(deadline, "after intersecting endpoints")?;
+    let tightened = BoundedTensor::new_allow_infinite_with_poll(lower, upper, || {
+        check_tighten_deadline(deadline, "validating tightened output")
+    })?;
+    if disjoint_count > 0 {
+        warn!(
+            "{}: forward-bound tightening has {} disjoint intervals (out of {}); used union fallback",
+            label,
+            disjoint_count,
+            tightened.len()
+        );
+    }
+    check_tighten_deadline(deadline, "before tightened publication")?;
+    Ok((tightened, BoundsProvenance::Crown))
+}
+
 /// Post-concretization tightening with provenance tracking for graph CROWN.
 ///
 /// Like [`tighten_crown_output`] but additionally:
@@ -100,6 +336,7 @@ pub(crate) fn tighten_crown_output(
 ///
 /// Reference: #3043 — graph_crown had its own `bounds_invalid_flags` + inline logic.
 /// Reference: alpha-beta-CROWN optimized_bounds.py:937-947.
+#[cfg(test)]
 pub(crate) fn tighten_crown_output_with_provenance(
     crown_output: BoundedTensor,
     forward_bounds: &BoundedTensor,

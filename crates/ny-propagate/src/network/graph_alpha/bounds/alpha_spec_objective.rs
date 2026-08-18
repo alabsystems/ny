@@ -10,6 +10,7 @@ use crate::bounds::{AlphaCrownConfig, GraphAlphaState, Optimizer};
 use crate::network::core::GraphNetwork;
 use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
+use std::time::Instant;
 use tracing::debug;
 
 use crate::network::graph_alpha::spsa::DagSpsaGradients;
@@ -148,6 +149,7 @@ impl GraphNetwork {
                     &output_node,
                     spec_row,
                     engine,
+                    config.deadline,
                 )
             } else {
                 None
@@ -246,6 +248,7 @@ impl GraphNetwork {
                     &output_node,
                     spec_row,
                     engine,
+                    config.deadline,
                 ) {
                     Some(evaluation) => evaluation.gradients,
                     None => self.compute_spsa_gradients_for_spec_objective(
@@ -338,6 +341,7 @@ impl GraphNetwork {
         output_node: &str,
         spec_row: &[f32],
         engine: Option<&dyn ny_core::GemmEngine>,
+        deadline: Option<Instant>,
     ) -> Option<GpuSpecObjectiveEvaluation> {
         use crate::network::core::NETWORK_INPUT;
         use ndarray::Array1;
@@ -347,6 +351,11 @@ impl GraphNetwork {
         let gpu = engine
             .and_then(|e| e.as_gpu_crown_backward())
             .filter(|g| g.provides_sound_gpu_crown())?;
+        if !crate::sound_gpu_gate::gpu_crown_backend_honors_deadline(gpu, deadline)
+            || deadline.is_some_and(|value| Instant::now() >= value)
+        {
+            return None;
+        }
         let (segments, relu_names, frontier_abs, node_abs) =
             crate::network::graph_alpha::resnet_decompose::extract_gpu_resnet_segments_with_relu_names(
                 self,
@@ -403,8 +412,13 @@ impl GraphNetwork {
         };
         let in_lo: Vec<f32> = input.lower().iter().copied().collect();
         let in_hi: Vec<f32> = input.upper().iter().copied().collect();
-        let result = gpu
-            .crown_backward_gpu_resnet_sound_grad(
+        if deadline.is_some_and(|value| Instant::now() >= value) {
+            return None;
+        }
+        let result = {
+            let _deadline_scope =
+                crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, deadline);
+            gpu.crown_backward_gpu_resnet_sound_grad(
                 &segments,
                 &seed,
                 &in_lo,
@@ -413,13 +427,22 @@ impl GraphNetwork {
                 &frontier_abs,
                 &node_abs,
             )
-            .ok()?;
+            .ok()?
+        };
+        if deadline.is_some_and(|value| Instant::now() >= value) {
+            return None;
+        }
         if result.relu_grads.len() != relu_names.len()
             || result
-                .lower_bounds
+                .relu_grads
                 .iter()
-                .chain(result.upper_bounds.iter())
-                .any(|v| v.is_nan())
+                .flatten()
+                .any(|value| !value.is_finite())
+            || !crate::sound_gpu_gate::gpu_interval_payload_is_publishable(
+                &result.lower_bounds,
+                &result.upper_bounds,
+                1,
+            )
         {
             return None;
         }
@@ -445,20 +468,31 @@ impl GraphNetwork {
                 // re-fold), so the straggler tightening does not spend the BaB budget.
                 // GPU → CPU-oracle → local grads, sound at every rung (steers α∈[0,1]).
                 let gpu_joint = if crate::network::graph_alpha::resnet_decompose::multiobj_joint_alpha_gpu_enabled() {
-                crate::network::graph_alpha::resnet_decompose::joint_alpha_grads_fold_gpu(
-                    gpu,
-                    &segments,
-                    spec_row,
-                    1,
-                    od,
-                    &in_lo,
-                    &in_hi,
-                    &pre_lowers,
-                    relu_names.len(),
-                )
-            } else {
-                None
-            };
+                    if deadline.is_some_and(|value| Instant::now() >= value) {
+                        return None;
+                    }
+                    let result = {
+                        let _deadline_scope =
+                            crate::sound_gpu_gate::GpuCrownBackendDeadlineScope::set(gpu, deadline);
+                        crate::network::graph_alpha::resnet_decompose::joint_alpha_grads_fold_gpu(
+                            gpu,
+                            &segments,
+                            spec_row,
+                            1,
+                            od,
+                            &in_lo,
+                            &in_hi,
+                            &pre_lowers,
+                            relu_names.len(),
+                        )
+                    };
+                    if deadline.is_some_and(|value| Instant::now() >= value) {
+                        return None;
+                    }
+                    result
+                } else {
+                    None
+                };
                 match gpu_joint {
                     Some(g) => g,
                     None => {
@@ -480,9 +514,27 @@ impl GraphNetwork {
                 }
             } else if std::env::var("NY_ROOT_ALPHA_TRUE").ok().as_deref() == Some("1") {
                 let gpu_lb = result.lower_bounds.first().copied().unwrap_or(f32::NAN);
-                match crate::beta_crown::engine::graph::propagation::batched::wide_alpha_true::true_alpha_grads_for_row(
+                // #true-grad-gpu-replay: run the TRUE-gradient replay's backward
+                // walk on the SAME armed sound backend that produced `result`
+                // (real certified-error tables), instead of the per-iteration
+                // full CPU replay. Fail-closed: any refusal — including the
+                // replay-vs-fold lb tolerance oracle — takes the byte-identical
+                // CPU replay path inside.
+                let gpu_replay_ops =
+                    crate::beta_crown::engine::graph::propagation::batched::wide_alpha_true::TrueGradGpuReplayOps::new(
+                        gpu, &frontier_abs, &node_abs,
+                    );
+                // BEHAVIOR NOTE (review defect 2, accepted as an improvement):
+                // HEAD called the deadline-free face here, so a CPU replay
+                // could complete LATE past the verifier deadline. Threading
+                // `deadline` means an expiring budget now aborts the replay
+                // mid-walk and falls to the local gradient — the sound,
+                // budget-honest direction for scored runs.
+                match crate::beta_crown::engine::graph::propagation::batched::wide_alpha_true::true_alpha_grads_for_row_gpu_until(
+                gpu_replay_ops.as_ref(),
                 &segments, spec_row, &[], &in_lo, &in_hi, relu_names.len(), gpu_lb,
                 std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1"),
+                deadline,
             ) {
                 Some(mut g) => {
                     // Mask stable neurons (pre_lower==0), matching the local path.
@@ -541,6 +593,8 @@ mod direct_objective_tests {
     };
     use ny_test_utils::env::with_env_edits;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     /// Deterministic stand-in for the sound GPU direct-C fold. Each call pairs
     /// one scripted lower bound with a call-tagged gradient, which lets the
@@ -550,6 +604,8 @@ mod direct_objective_tests {
         gradient: f32,
         nonfinite_gradient_call: Option<usize>,
         calls: AtomicUsize,
+        cooperative_deadline: bool,
+        deadline_writes: Mutex<Vec<Option<Instant>>>,
     }
 
     impl ScriptedDirectEngine {
@@ -559,7 +615,14 @@ mod direct_objective_tests {
                 gradient,
                 nonfinite_gradient_call: None,
                 calls: AtomicUsize::new(0),
+                cooperative_deadline: false,
+                deadline_writes: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_deadline_support(mut self) -> Self {
+            self.cooperative_deadline = true;
+            self
         }
 
         fn with_nonfinite_gradient_call(mut self, call: usize) -> Self {
@@ -569,6 +632,13 @@ mod direct_objective_tests {
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn deadline_writes(&self) -> Vec<Option<Instant>> {
+            self.deadline_writes
+                .lock()
+                .expect("deadline_writes mutex")
+                .clone()
         }
     }
 
@@ -598,6 +668,17 @@ mod direct_objective_tests {
 
         fn provides_sound_gpu_crown(&self) -> bool {
             true
+        }
+
+        fn honors_crown_backward_deadline(&self) -> bool {
+            self.cooperative_deadline
+        }
+
+        fn set_crown_backward_deadline(&self, deadline: Option<Instant>) {
+            self.deadline_writes
+                .lock()
+                .expect("deadline_writes mutex")
+                .push(deadline);
         }
 
         fn crown_backward_gpu_resnet_sound_grad(
@@ -718,6 +799,7 @@ mod direct_objective_tests {
                     "conv_out",
                     &spec,
                     Some(&engine),
+                    None,
                 )
                 .expect("fixture must use direct GPU fold");
 
@@ -727,6 +809,59 @@ mod direct_objective_tests {
             for gradient in evaluation.gradients.relu.values() {
                 assert!(gradient.iter().all(|&value| value == 3.5));
             }
+        });
+    }
+
+    #[test]
+    fn direct_fold_obeys_deadline_admission_and_exact_scope() {
+        direct_test_env(|| {
+            let (graph, input, bounds, alpha, spec) = fixture();
+
+            let expired_engine = ScriptedDirectEngine::new(vec![7.25], 3.5).with_deadline_support();
+            let expired = graph.try_gpu_spec_objective_evaluation(
+                &input,
+                &bounds,
+                &alpha,
+                "conv_out",
+                &spec,
+                Some(&expired_engine),
+                Some(
+                    Instant::now()
+                        .checked_sub(Duration::from_millis(1))
+                        .expect("one millisecond fits before the current instant"),
+                ),
+            );
+            assert!(expired.is_none());
+            assert_eq!(expired_engine.calls(), 0);
+            assert!(expired_engine.deadline_writes().is_empty());
+
+            let noncoop_engine = ScriptedDirectEngine::new(vec![7.25], 3.5);
+            let noncoop = graph.try_gpu_spec_objective_evaluation(
+                &input,
+                &bounds,
+                &alpha,
+                "conv_out",
+                &spec,
+                Some(&noncoop_engine),
+                Some(Instant::now() + Duration::from_secs(30)),
+            );
+            assert!(noncoop.is_none());
+            assert_eq!(noncoop_engine.calls(), 0);
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let live_engine = ScriptedDirectEngine::new(vec![7.25], 3.5).with_deadline_support();
+            let live = graph.try_gpu_spec_objective_evaluation(
+                &input,
+                &bounds,
+                &alpha,
+                "conv_out",
+                &spec,
+                Some(&live_engine),
+                Some(deadline),
+            );
+            assert!(live.is_some());
+            assert_eq!(live_engine.calls(), 1);
+            assert_eq!(live_engine.deadline_writes(), vec![Some(deadline), None]);
         });
     }
 

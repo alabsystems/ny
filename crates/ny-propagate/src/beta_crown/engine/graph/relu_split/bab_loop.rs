@@ -24,7 +24,7 @@ use crate::beta_crown::engine::graph::adaptive_microbatch::{
 };
 use crate::beta_crown::engine::graph::domain_batch::{
     GraphDomainBatchEmitTiming, GraphDomainBatchExecutionMode, GraphDomainBatchExecutor,
-    GraphDomainBatchPlan, SingleObjectiveBatchRequest,
+    GraphDomainBatchPlan, ReluSplitBatchContext, SingleObjectiveBatchRequest,
 };
 use crate::beta_crown::engine::graph::shared::init::{
     compute_graph_bab_bootstrap, compute_graph_root_output_bounds,
@@ -41,6 +41,7 @@ use super::super::super::domain_results::GraphDomainResult;
 use super::super::super::BetaCrownVerifier;
 use super::super::objectives::objective_bounds;
 use super::domain_filter::PreFilterOutcome;
+use super::queue_budget::{enforce_graph_queue_budget, GraphBabQueueBudget};
 
 /// Initial bounds for the BaB loop: (node_bounds, optional_alpha_state, root_lower, root_upper).
 type InitialBounds = (
@@ -50,16 +51,44 @@ type InitialBounds = (
     f32,
 );
 
+/// Immutable branch-expansion decision for one popped queue wave.
+///
+/// Device refusal backoff may change the attempted prefix width, but must not
+/// silently change how many ReLU decisions each accepted parent expands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReluSplitWavePlan {
+    split_depth: usize,
+}
+
+impl ReluSplitWavePlan {
+    pub(super) fn new(
+        config: &crate::beta_crown::config::BetaCrownConfig,
+        outer_wave_width: usize,
+    ) -> Self {
+        Self {
+            split_depth: config.effective_relu_split_depth(outer_wave_width),
+        }
+    }
+
+    pub(super) fn split_depth(self) -> usize {
+        self.split_depth
+    }
+}
+
 fn initial_bounds_deadline_status(
     now: Instant,
     bootstrap_deadline: Option<Instant>,
 ) -> BabVerificationStatus {
-    if bootstrap_deadline.is_some_and(|deadline| now >= deadline) {
-        BabVerificationStatus::Timeout
-    } else {
-        BabVerificationStatus::Unknown {
+    // Invariant I2 (#phase-yield): route the "whose deadline?" question through
+    // the single classifier so it cannot drift between the sites that ask it.
+    // This site was already correct -- `bootstrap_deadline` IS the BaB deadline
+    // here -- and delegating keeps it that way by construction rather than by
+    // comment. The sites that got it WRONG compared against a phase cap.
+    match ny_core::phase_yield::classify_expiry(now, None, bootstrap_deadline) {
+        ny_core::phase_yield::Expiry::Global => BabVerificationStatus::Timeout,
+        ny_core::phase_yield::Expiry::PhaseOnly => BabVerificationStatus::Unknown {
             reason: "Initial-bound warmup exceeded its deadline cap before branching".to_string(),
-        }
+        },
     }
 }
 
@@ -79,6 +108,9 @@ impl BetaCrownVerifier {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
+        // Keep every graph-verification ingress uniformly fail-closed, even
+        // though the later shared bootstrap currently validates as well.
+        self.config.validate()?;
         let graph = self.configured_graph_for_crown(graph);
         let graph = &graph;
         let now = Instant::now();
@@ -99,25 +131,32 @@ impl BetaCrownVerifier {
             .phase_budget
             .post_bab_pgd_fraction
             .clamp(0.0, 0.5);
-        let effective_total = match deadline {
+        let bab_timeout = match deadline {
+            // An explicit deadline is the caller ledger's already-reserved BaB
+            // boundary; do not reserve post-BaB time a second time.
             Some(dl) => dl.saturating_duration_since(now),
-            None => self.config.timeout,
+            None => self.config.timeout.mul_f32(1.0 - pgd_frac),
         };
-        let bab_timeout = effective_total.mul_f32(1.0 - pgd_frac);
+        let _complete_clip_deadline = self.complete_clip_deadline_overrides.scoped(Some(
+            GraphBabLifecycle::fail_closed_deadline(now, bab_timeout),
+        ));
         // The mandatory foundational node-bounds sweep (IBP/CROWN-IBP) must visit
         // every node before BaB can start, so it gets the full global deadline —
         // capping it at `initial_bounds_fraction` choked conv-heavy DAGs (yolo,
         // tinyimagenet) into "deadline exceeded before node 'Conv_0'" with most of
         // the budget unused (#4321). The warmup cap is retained only for the
         // genuinely-iterative root α-CROWN output-bound optimization below.
-        let bootstrap_deadline = Some(now + bab_timeout);
+        let bootstrap_deadline = Some(GraphBabLifecycle::fail_closed_deadline(now, bab_timeout));
         let iterative_deadline = {
             let frac = self
                 .config
                 .phase_budget
                 .initial_bounds_fraction
                 .clamp(0.0, 1.0);
-            Some(now + bab_timeout.mul_f32(frac))
+            Some(GraphBabLifecycle::fail_closed_deadline(
+                now,
+                bab_timeout.mul_f32(frac),
+            ))
         };
         let (initial_node_bounds, root_alpha_state, root_lower, root_upper) = match self
             .compute_relu_split_initial_bounds(
@@ -130,7 +169,7 @@ impl BetaCrownVerifier {
                 iterative_deadline,
             ) {
             Ok(bounds) => bounds,
-            Err(NyError::DeadlineExceeded(_)) => {
+            Err(error) if error.is_deadline_exceeded() => {
                 // The foundational bootstrap owns the full BaB deadline; if
                 // that deadline is spent, the whole verifier timed out. The
                 // root optimizer has a deliberately shorter warmup cap, whose
@@ -197,9 +236,25 @@ impl BetaCrownVerifier {
             root_alpha_state.as_ref(),
             self.config.beta_iterations > 0,
         );
+        if self.config.enable_clip_interm_domain {
+            self.complete_clip_root_bounds_cache.store_finalized(
+                graph,
+                input,
+                &graph_setup.initial_node_bounds_arc,
+            );
+        }
 
-        // Branch-and-bound queue
+        // Branch-and-bound queue.
+        //
+        // #ml4acopf-bab-queue-mem: the resident queue is the process. Every
+        // `GraphBabDomain` owns its per-node bounds map and its per-neuron α
+        // state (1.37 MB/domain on ml4acopf 118_ieee-linear-residual), and the
+        // only shipped limits are count-based, so `max_domains = 100_000`
+        // authorizes 137 GB of heap on that model. `queue_budget` bounds the
+        // heap in BYTES; it is inert (`0` = unlimited) unless a preset arms it.
         let queue_priority = |lower: f32, upper: f32| self.config.violation_priority(lower, upper);
+        let queue_budget = GraphBabQueueBudget::from_config(&self.config);
+        let queue_wave_bytes = queue_budget.wave_bytes();
         let mut queue: BinaryHeap<GraphBabDomain> = BinaryHeap::new();
         root_domain.priority = queue_priority(root_domain.lower_bound, root_domain.upper_bound)?;
         queue.push(root_domain);
@@ -243,6 +298,10 @@ impl BetaCrownVerifier {
             )
         });
         let mut batch_index = 0usize;
+        // Complete Clip's `total_round` is a BaB frontier-wave stamp. Adaptive
+        // retries and successful microbatches within one popped queue wave must
+        // not advance it independently.
+        let mut complete_clip_bab_iteration = 0usize;
 
         while !queue.is_empty() {
             // Check termination conditions
@@ -269,8 +328,24 @@ impl BetaCrownVerifier {
             // Pop one queue batch.  In adaptive mode it stays owned here while
             // an independent device cursor can retry smaller prefixes.
             let mut batch: Vec<GraphBabDomain> = Vec::with_capacity(queue_batch_size);
+            // #ml4acopf-bab-queue-mem: the popped wave lives OUTSIDE the heap
+            // and its children are materialized while the parents are still
+            // alive, so the queue cap alone does not bound it (8,192 x 1.37 MB
+            // = 11 GB for one wave). When the budget is armed a wave may hold
+            // at most `queue_wave_bytes`; the first domain is always admitted
+            // so the loop cannot stall. Unarmed, this is the original pop loop
+            // plus one `Option` test per domain.
+            let mut wave_bytes = 0usize;
             while batch.len() < queue_batch_size {
                 if let Some(domain) = queue.pop() {
+                    if let Some(cap) = queue_wave_bytes {
+                        let domain_bytes = estimate_graph_domain_bytes(&domain);
+                        if !batch.is_empty() && wave_bytes.saturating_add(domain_bytes) > cap {
+                            queue.push(domain);
+                            break;
+                        }
+                        wave_bytes = wave_bytes.saturating_add(domain_bytes);
+                    }
                     batch.push(domain);
                 } else {
                     break;
@@ -287,7 +362,7 @@ impl BetaCrownVerifier {
                     PreFilterOutcome::Violation => {
                         lifecycle.cuts_generated = cut_pool.total_generated;
                         return Ok(
-                            lifecycle.build_result(BabVerificationStatus::PotentialViolation)
+                            lifecycle.build_result(BabVerificationStatus::potential_violation())
                         );
                     }
                     PreFilterOutcome::Process(domains) => domains,
@@ -295,6 +370,24 @@ impl BetaCrownVerifier {
 
             if domains_to_process.is_empty() {
                 continue;
+            }
+
+            // Freeze multi-depth at the outer queue-wave boundary. A retry may
+            // shrink the device prefix, but it must preserve the same branch
+            // expansion that the original wave selected.
+            let wave_plan = ReluSplitWavePlan::new(&self.config, domains_to_process.len());
+            let split_depth = wave_plan.split_depth();
+
+            if self.config.enable_clip_interm_domain {
+                // αβ-CROWN increments total_round once before each executable
+                // BaB wave. Speculative kFSB and final CROWN calls beneath this
+                // wave must all see the same value.
+                complete_clip_bab_iteration = complete_clip_bab_iteration.saturating_add(1);
+                let _ = self.complete_clip_root_bounds_cache.set_bab_iteration(
+                    graph,
+                    input,
+                    complete_clip_bab_iteration,
+                );
             }
 
             // Lambda optimization: periodically optimize cut lambdas
@@ -336,18 +429,28 @@ impl BetaCrownVerifier {
             if let Some(controller) = adaptive_microbatch.as_mut() {
                 let mut cursor = OrderedBatchCursor::new(domains_to_process.len());
                 while !cursor.is_done() {
+                    // The outer-loop termination check is insufficient once a
+                    // large popped wave is split into several microbatches.
+                    // Consult the same authoritative deadline before every new
+                    // attempt, including retries.
+                    if self.past_effective_graph_bab_deadline() {
+                        lifecycle.cuts_generated = cut_pool.total_generated;
+                        return Ok(lifecycle.timeout_result());
+                    }
                     let requested = controller.current();
                     let range = cursor.next_range(requested);
                     let microbatch = &domains_to_process[range.clone()];
-                    let split_depth = self.config.effective_relu_split_depth(microbatch.len());
                     let has_active_cuts = !cut_pool.is_empty() && self.config.enable_cuts;
                     let batch_start = Instant::now();
                     let batch_plan = GraphDomainBatchPlan::for_relu_split(
                         batch_index,
                         microbatch.len(),
-                        requested,
-                        engine.is_some(),
-                        has_active_cuts,
+                        ReluSplitBatchContext::new(
+                            requested,
+                            engine.is_some(),
+                            has_active_cuts,
+                            &self.config.branching_heuristic,
+                        ),
                     );
 
                     let execution = match batch_plan.execution_mode() {
@@ -368,6 +471,7 @@ impl BetaCrownVerifier {
                                         )
                                     })?,
                                     cut_pool: None,
+                                    split_depth,
                                     retry_refusals: true,
                                 },
                             )
@@ -434,6 +538,7 @@ impl BetaCrownVerifier {
                                             )
                                         })?,
                                         cut_pool: None,
+                                        split_depth,
                                         retry_refusals: false,
                                     },
                                 )
@@ -457,10 +562,8 @@ impl BetaCrownVerifier {
                         microbatch.len(),
                         observed_bytes,
                         batch_start.elapsed(),
-                        Some(
-                            (lifecycle.start_time + bab_timeout)
-                                .saturating_duration_since(Instant::now()),
-                        ),
+                        self.effective_graph_bab_deadline()
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now())),
                     );
 
                     let queue_update_start = Instant::now();
@@ -479,6 +582,12 @@ impl BetaCrownVerifier {
                         )?;
                         return Ok(violation_result);
                     }
+                    enforce_graph_queue_budget(
+                        queue_budget,
+                        &mut queue,
+                        &mut lifecycle,
+                        "relu-split",
+                    );
                     batch_plan.emit_to_sink(
                         self.graph_domain_batch_metrics_sink(),
                         GraphDomainBatchEmitTiming::new(batch_start.elapsed().as_secs_f64())
@@ -489,14 +598,6 @@ impl BetaCrownVerifier {
                 continue;
             }
 
-            // Compute effective split depth for multi-depth ReLU splitting (#2767).
-            // When the batch is smaller than the target, increase depth to generate
-            // more children (2^k per domain instead of 2).
-            // Reference: alpha-beta-CROWN `get_split_depth()` (bab.py:40-48).
-            let split_depth = self
-                .config
-                .effective_relu_split_depth(domains_to_process.len());
-
             // Process domains: GPU-batched when engine available, parallel CPU otherwise
             let has_active_cuts = !cut_pool.is_empty() && self.config.enable_cuts;
             let batch_start = Instant::now();
@@ -504,9 +605,12 @@ impl BetaCrownVerifier {
             let batch_plan = GraphDomainBatchPlan::for_relu_split(
                 batch_index,
                 batch_width,
-                batch_size,
-                engine.is_some(),
-                has_active_cuts,
+                ReluSplitBatchContext::new(
+                    batch_size,
+                    engine.is_some(),
+                    has_active_cuts,
+                    &self.config.branching_heuristic,
+                ),
             );
 
             let results: Vec<GraphDomainResult> = match batch_plan.execution_mode() {
@@ -526,6 +630,7 @@ impl BetaCrownVerifier {
                                 )
                             })?,
                             cut_pool: None, // Single-objective path gates on !has_active_cuts
+                            split_depth,
                             retry_refusals: false,
                         },
                     )
@@ -578,6 +683,7 @@ impl BetaCrownVerifier {
                 )?;
                 return Ok(violation_result);
             }
+            enforce_graph_queue_budget(queue_budget, &mut queue, &mut lifecycle, "relu-split");
             batch_plan.emit_to_sink(
                 self.graph_domain_batch_metrics_sink(),
                 GraphDomainBatchEmitTiming::new(batch_start.elapsed().as_secs_f64())

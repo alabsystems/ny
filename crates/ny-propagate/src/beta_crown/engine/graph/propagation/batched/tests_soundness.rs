@@ -4,8 +4,11 @@
 
 use ndarray::{arr1, arr2, Array2};
 use ny_core::NaiveCpuGemmEngine;
+use std::time::Duration;
 
-use super::{BatchedBackwardContext, BetaCrownVerifier};
+use super::{
+    interm_refine::HermeticSoundGpuCrownEngine, BatchedBackwardContext, BetaCrownVerifier,
+};
 use crate::batched_domain::BatchedDomains;
 use crate::beta_crown::{BetaCrownConfig, GraphBabDomain};
 use crate::{BoundedTensor, GraphNetwork, GraphNode, Layer, LinearLayer, ReLULayer};
@@ -59,6 +62,53 @@ fn root_graph_domain_2769(graph: &GraphNetwork) -> GraphBabDomain {
         .expect("graph bounds should collect");
     GraphBabDomain::root(initial_bounds, -10.0, 10.0, &input, false)
         .expect("root domain with finite bounds should not fail")
+}
+
+#[test]
+fn batched_forward_adapter_preserves_expired_deadline() {
+    let graph = build_single_relu_graph_for_batched_soundness_tests();
+    let root = root_graph_domain_2769(&graph);
+    let domains = vec![&root];
+    let layer_names = vec!["relu1".to_string()];
+    let batched =
+        BatchedDomains::from_graph_domains(&domains, &layer_names).expect("batched domains");
+    let ctx = BatchedBackwardContext::from_domains(&domains, &batched).expect("valid context");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        timeout: Duration::ZERO,
+        ..Default::default()
+    });
+
+    let error = verifier
+        .propagate_crown_batched_with_context(&graph, &ctx, &[1.0_f32], &NaiveCpuGemmEngine)
+        .expect_err("expired constrained forward must refuse");
+    assert!(
+        error.is_deadline_exceeded(),
+        "batched adapter must preserve DeadlineExceeded, got {error:?}"
+    );
+}
+
+#[test]
+fn batched_dense_spec_forward_adapter_preserves_expired_deadline() {
+    let graph = build_single_relu_graph_for_batched_soundness_tests();
+    let root = root_graph_domain_2769(&graph);
+    let domains = vec![&root];
+    let layer_names = vec!["relu1".to_string()];
+    let batched =
+        BatchedDomains::from_graph_domains(&domains, &layer_names).expect("batched domains");
+    let ctx = BatchedBackwardContext::from_domains(&domains, &batched).expect("valid context");
+    let spec_matrix = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("valid spec matrix");
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        timeout: Duration::ZERO,
+        ..Default::default()
+    });
+
+    let error = verifier
+        .propagate_crown_batched_with_context_specs(&graph, &ctx, &spec_matrix, &NaiveCpuGemmEngine)
+        .expect_err("expired dense-spec forward must refuse");
+    assert!(
+        error.is_deadline_exceeded(),
+        "dense-spec adapter must preserve DeadlineExceeded, got {error:?}"
+    );
 }
 
 #[test]
@@ -629,336 +679,27 @@ fn test_batched_relu_full_pipeline_bit_identical_multi_layer_lsnc_step2() {
     }
 }
 
-/// #lsnc-relu STEP 2 THROUGHPUT micro-benchmark (`#[ignore]`, run with
-/// `cargo test --release -p ny-propagate bench_batched_relu_throughput -- --ignored --nocapture`).
-///
-/// Drives the production input-split batched spec backward over a LARGE batch of
-/// sub-boxes of a small ReLU net and reports domains/s for three configurations:
-///   - baseline: per-domain node-bounds clones + per-domain ReLU (pre-STEP-1 shape);
-///   - Step 1:   shared warmup node-bounds map + per-domain ReLU;
-///   - Step 1+2: shared warmup map + DOMAIN-batched ReLU (this change).
-///
-/// Batch size via `NY_RELU_BENCH_DOMAINS` (default 8000).
-#[test]
-#[ignore = "throughput micro-benchmark; run with --release --ignored --nocapture"]
-fn bench_batched_relu_throughput_lsnc_step2() {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    use super::backward_core::force_batched_relu;
-    use crate::batched_domain::{BatchedDomainOptions, BatchedDomainsBuilder};
-    use crate::beta_crown::branching::GraphSplitHistory;
-    use ndarray::Array1;
-
-    let n: usize = std::env::var("NY_RELU_BENCH_DOMAINS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8000);
-
-    // Small 4 -> 8 (ReLU) -> 8 (ReLU) -> 4 net (the small-net / large-batch regime
-    // where per-domain fixed overhead dominates).
-    let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
-    let mut w = |rows: usize, cols: usize| {
-        LinearLayer::new(
-            Array2::from_shape_fn((rows, cols), |_| {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-            }),
-            Some(Array1::from_shape_fn(rows, |_| {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((rng >> 40) as f32 / (1u64 << 24) as f32) * 0.4 - 0.2
-            })),
-        )
-        .expect("valid linear")
-    };
-    let mut graph = GraphNetwork::new();
-    graph.add_node(GraphNode::from_input("l1", Layer::Linear(w(8, 4))));
-    graph.add_node(GraphNode::new(
-        "r1",
-        Layer::ReLU(ReLULayer),
-        vec!["l1".into()],
-    ));
-    graph.add_node(GraphNode::new(
-        "l2",
-        Layer::Linear(w(8, 8)),
-        vec!["r1".into()],
-    ));
-    graph.add_node(GraphNode::new(
-        "r2",
-        Layer::ReLU(ReLULayer),
-        vec!["l2".into()],
-    ));
-    graph.add_node(GraphNode::new(
-        "l3",
-        Layer::Linear(w(4, 8)),
-        vec!["r2".into()],
-    ));
-    graph.set_output("l3");
-
-    let root = BoundedTensor::new(arr1(&[-1.0; 4]).into_dyn(), arr1(&[1.0; 4]).into_dyn())
-        .expect("root box");
-    let warmup: HashMap<String, BoundedTensor> = graph
-        .collect_node_bounds(&root)
-        .expect("warmup node bounds");
-    let shared_arc: HashMap<String, Arc<BoundedTensor>> = warmup
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
-        .collect();
-
-    // n disjoint-ish sub-boxes (jittered) of the root.
-    let mut builder =
-        BatchedDomainsBuilder::new_with_options(Vec::new(), BatchedDomainOptions::default());
-    let empty_layer_bounds: HashMap<String, (ndarray::ArrayD<f32>, ndarray::ArrayD<f32>)> =
-        HashMap::new();
-    for d in 0..n {
-        let t = (d as f32) / (n as f32);
-        let lo = arr1(&[-1.0 + t, -1.0, -1.0 + 0.5 * t, -1.0]);
-        let hi = arr1(&[1.0, 1.0 - 0.5 * t, 1.0, 1.0 - t]);
-        let b = BoundedTensor::new(lo.into_dyn(), hi.into_dyn()).unwrap();
-        builder.add_domain(
-            &empty_layer_bounds,
-            b.lower().clone(),
-            b.upper().clone(),
-            0.0,
-            0.0,
-            0,
-            Vec::new(),
-        );
-    }
-    let batched = builder.build().expect("batched domains");
-    let empty_history = GraphSplitHistory::new();
-    let spec_matrix = Array2::from_shape_vec((2, 4), vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
-        .expect("spec matrix");
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
-
-    // base_bounds: `shared` = one aliased Arc map (STEP 1); `distinct` = per-domain
-    // clones (the pre-STEP-1 baseline shape).
-    let distinct_maps: Vec<HashMap<String, Arc<BoundedTensor>>> =
-        (0..n).map(|_| shared_arc.clone()).collect();
-
-    let run = |shared: bool| {
-        let ctx = if shared {
-            BatchedBackwardContext {
-                batched: &batched,
-                histories: vec![&empty_history; n],
-                beta_states: vec![None; n],
-                base_bounds: vec![Some(&shared_arc); n],
-                delta_seeds: vec![None; n],
-                alpha_states: vec![None; n],
-                cached_la: vec![None; n],
-                mul_binary_alphas: None,
-            }
-        } else {
-            BatchedBackwardContext {
-                batched: &batched,
-                histories: vec![&empty_history; n],
-                beta_states: vec![None; n],
-                base_bounds: distinct_maps.iter().map(Some).collect(),
-                delta_seeds: vec![None; n],
-                alpha_states: vec![None; n],
-                cached_la: vec![None; n],
-                mul_binary_alphas: None,
-            }
-        };
-        verifier
-            .propagate_crown_batched_with_context_specs(
-                &graph,
-                &ctx,
-                &spec_matrix,
-                &NaiveCpuGemmEngine,
-            )
-            .expect("batched spec propagation should succeed")
-    };
-
-    let time = |label: &str, shared: bool, batched_relu: bool| -> f64 {
-        force_batched_relu(Some(batched_relu));
-        let _ = run(shared); // warm up
-        let start = Instant::now();
-        let reps = 3;
-        for _ in 0..reps {
-            let _ = run(shared);
-        }
-        let secs = start.elapsed().as_secs_f64() / reps as f64;
-        let dps = n as f64 / secs;
-        eprintln!("[relu-bench] {label:<28} {secs:>9.4} s  {dps:>12.0} domains/s");
-        dps
-    };
-
-    eprintln!("[relu-bench] n_domains = {n}");
-    let baseline = time("baseline (distinct + scalar)", false, false);
-    let step1 = time("Step1 (shared + scalar)", true, false);
-    let step12 = time("Step1+2 (shared + batched)", true, true);
-    force_batched_relu(None);
-
-    eprintln!(
-        "[relu-bench] Step2 speedup over Step1: {:.2}x   over baseline: {:.2}x",
-        step12 / step1,
-        step12 / baseline
-    );
-}
-
-/// #lsnc-relu STEP 2 KERNEL throughput micro-benchmark (`#[ignore]`). Isolates the
-/// ReLU backward op — the exact thing Step 2 changes — timing the DOMAIN-batched
-/// kernel against the per-domain scalar loop (the two functions the ReLU dispatch arm
-/// calls), for both the α-CROWN and the heuristic path, with incoming certified error.
-/// This factors out the rest of the pipeline (forward, Linear certified-error GEMM,
-/// concretize) so the ReLU-specific speedup is visible directly.
-/// `NY_RELU_KBENCH_DOMAINS` (default 20000), `_OUT` (default 8), `_N` (default 128).
-#[test]
-#[ignore = "throughput micro-benchmark; run with --release --ignored --nocapture"]
-fn bench_batched_relu_kernel_lsnc_step2() {
-    use crate::LinearBounds;
-    use ndarray::{Array1, Array2};
-    use std::time::Instant;
-
-    let n: usize = std::env::var("NY_RELU_KBENCH_DOMAINS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20000);
-    let num_outputs: usize = std::env::var("NY_RELU_KBENCH_OUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let num_neurons: usize = std::env::var("NY_RELU_KBENCH_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
-
-    let mut rng: u64 = 0xDEAD_BEEF_1234_5678;
-    let mut u = move || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (rng >> 40) as f32 / (1u64 << 24) as f32
-    };
-
-    let mut bounds_owned: Vec<LinearBounds> = Vec::with_capacity(n);
-    let mut pre_owned: Vec<BoundedTensor> = Vec::with_capacity(n);
-    let mut alpha_owned: Vec<Option<(Array1<f32>, Array1<f32>)>> = Vec::with_capacity(n);
-    for d in 0..n {
-        let lower_a = Array2::from_shape_fn((num_outputs, num_neurons), |_| u() * 2.0 - 1.0);
-        let upper_a = Array2::from_shape_fn((num_outputs, num_neurons), |_| u() * 2.0 - 1.0);
-        let lb0 = Array1::from_shape_fn(num_outputs, |_| u() - 0.5);
-        let ub0 = Array1::from_shape_fn(num_outputs, |_| u() - 0.5);
-        let mut lb = LinearBounds::new(lower_a, lb0, upper_a, ub0).expect("bounds");
-        // Incoming certified error (the realistic input-split state: the Linear above
-        // attaches γ_n·S error), so the error-carry path is exercised.
-        let le = Array2::from_shape_fn((num_outputs, num_neurons), |_| u() * 0.01);
-        let ue = Array2::from_shape_fn((num_outputs, num_neurons), |_| u() * 0.01);
-        lb.set_coeff_err(le, ue);
-        bounds_owned.push(lb);
-
-        let (mut lo, mut hi) = (
-            Array1::<f32>::zeros(num_neurons),
-            Array1::<f32>::zeros(num_neurons),
-        );
-        for i in 0..num_neurons {
-            match (i + d) % 3 {
-                0 => {
-                    lo[i] = u() * 1.5;
-                    hi[i] = lo[i] + 0.1 + u();
-                }
-                1 => {
-                    hi[i] = -(u() * 1.5);
-                    lo[i] = hi[i] - 0.1 - u();
-                }
-                _ => {
-                    lo[i] = -(0.1 + u() * 2.0);
-                    hi[i] = 0.1 + u() * 2.0;
-                }
-            }
-        }
-        pre_owned.push(BoundedTensor::new(lo.into_dyn(), hi.into_dyn()).expect("pre"));
-        alpha_owned.push(Some((
-            Array1::from_shape_fn(num_neurons, |_| u()),
-            Array1::from_shape_fn(num_neurons, |_| u()),
-        )));
-    }
-    let bounds_refs: Vec<&LinearBounds> = bounds_owned.iter().collect();
-    let pre_refs: Vec<&BoundedTensor> = pre_owned.iter().collect();
-    let heuristic: Vec<Option<(Array1<f32>, Array1<f32>)>> = (0..n).map(|_| None).collect();
-    let relu = ReLULayer;
-
-    let bench = |label: &str, f: &mut dyn FnMut()| {
-        f(); // warm
-        let reps = 5;
-        let start = Instant::now();
-        for _ in 0..reps {
-            f();
-        }
-        let secs = start.elapsed().as_secs_f64() / reps as f64;
-        eprintln!(
-            "[relu-kbench] {label:<34} {secs:>9.5} s  {:>12.0} domains/s",
-            n as f64 / secs
-        );
-        n as f64 / secs
-    };
-
-    eprintln!("[relu-kbench] n={n} num_outputs={num_outputs} num_neurons={num_neurons}");
-
-    // --- α-CROWN path (the input-split hot path: bridged optimized α) ---
-    let a_batched = bench("alpha  batched (Step2)", &mut || {
-        let _ = relu
-            .propagate_linear_multi_domain_relu(&bounds_refs, &pre_refs, &alpha_owned)
-            .expect("ok")
-            .expect("some");
-    });
-    let a_scalar = bench("alpha  per-domain (Step1)", &mut || {
-        let mut out = Vec::with_capacity(n);
-        for d in 0..n {
-            let (al, au) = alpha_owned[d].as_ref().unwrap();
-            out.push(
-                relu.propagate_linear_with_alpha(bounds_refs[d], pre_refs[d], al, Some(au))
-                    .unwrap()
-                    .0,
-            );
-        }
-        std::hint::black_box(out);
-    });
-
-    // --- heuristic path ---
-    let h_batched = bench("heur   batched (Step2)", &mut || {
-        let _ = relu
-            .propagate_linear_multi_domain_relu(&bounds_refs, &pre_refs, &heuristic)
-            .expect("ok")
-            .expect("some");
-    });
-    let h_scalar = bench("heur   per-domain (Step1)", &mut || {
-        let mut out = Vec::with_capacity(n);
-        for d in 0..n {
-            out.push(
-                relu.propagate_linear_with_bounds(bounds_refs[d], pre_refs[d])
-                    .unwrap(),
-            );
-        }
-        std::hint::black_box(out);
-    });
-
-    eprintln!(
-        "[relu-kbench] ReLU-op Step2 speedup: alpha {:.2}x   heuristic {:.2}x",
-        a_batched / a_scalar,
-        h_batched / h_scalar
-    );
-}
-
 /// #mo-beta-graft end-to-end enclosure on a PURE CONV chain with ReLU splits
 /// (the metaroom shape): with `config.mo_beta_graft = true` and NO
 /// `NY_BAB_CHAIN_WIDE`, the wide segment-lane ascent must engage (pure-chain
 /// extraction forced for the ascent-only pass), the dense-spec bound must be
 /// evaluated with the ascended β folded in, and the composed
 /// elementwise-tightest bound must still ENCLOSE the true network values at
-/// every premise-satisfying sample of each child subdomain. Skips gracefully
-/// without a wgpu adapter.
+/// every premise-satisfying sample of each child subdomain.
 #[test]
 fn graft_composed_bound_encloses_true_forward_on_split_conv_chain_mo_graft() {
     use crate::beta_crown::branching::GraphNeuronConstraint;
     use crate::layers::Conv2dLayer;
     use ndarray::{Array, IxDyn};
 
-    let Ok(device) = ny_gpu::ComputeDevice::new(ny_gpu::Backend::Wgpu) else {
-        eprintln!("SKIP: no wgpu adapter for graft enclosure test");
-        return;
-    };
+    let device = HermeticSoundGpuCrownEngine::default();
     let engine: &dyn ny_core::GemmEngine = &device;
+    assert!(
+        engine
+            .as_gpu_crown_backward()
+            .is_some_and(|gpu| gpu.provides_sound_gpu_crown()),
+        "hermetic graft enclosure test requires its injected sound CROWN backend"
+    );
 
     // conv1 (1x1, w=1) -> relu1 -> conv2 (1x1, w=0.5, b=0.1) over a [1,2,2]
     // input: out_i = 0.5*relu(x_i) + 0.1 per pixel.
@@ -1116,7 +857,7 @@ fn graft_composed_bound_encloses_true_forward_on_split_conv_chain_mo_graft() {
     }
 }
 
-/// #metaroom-chain-wide ACTIVATION-GATE differential oracle (`NY_BAB_CHAIN_WIDE`).
+/// #metaroom-chain-wide differential soundness oracle (`NY_BAB_CHAIN_WIDE`).
 ///
 /// The chain-wide lane routes PURE-CHAIN conv suffixes (`segments = [Chain(..)]`,
 /// metaroom's 6cnn shape class) onto the wide batched GPU β lane, whose bound
@@ -1131,10 +872,9 @@ fn graft_composed_bound_encloses_true_forward_on_split_conv_chain_mo_graft() {
 ///     network spec values at every premise-satisfying sample of the domain
 ///     (points are evaluated through the production forward on a degenerate box,
 ///     so the reference is the network itself, not a re-implementation).
-/// (b) NEVER-LOOSER (the activation criterion): the wide bound must be at least
-///     as tight as the dense bound on every row beyond an f32 tolerance. All
-///     violations are collected and reported in one panic so a failing gate
-///     documents the exact fixture/domain/row/values.
+/// (b) TIGHTNESS DIAGNOSTIC: compare the wide and dense bounds row-by-row. The
+///     wide replacement is intentionally opt-in because it is not universally
+///     tighter; the default-off contract is covered at the gate definition.
 ///
 /// Coverage: chain lengths 2/3/4 convs (1/2/3 ReLUs), a stride-2 conv, biased
 /// and bias-free convs, domains without β (root), with β (single and double
@@ -1145,22 +885,13 @@ fn graft_composed_bound_encloses_true_forward_on_split_conv_chain_mo_graft() {
 /// `allow_pure_chain` boolean that `NY_BAB_CHAIN_WIDE=1` sets (`allow_pure_chain =
 /// bab_chain_wide_enabled() || graft_pure_chain`) — so the routing under test is
 /// exactly the gate's, without mutating process-global env (racy under the
-/// parallel test harness). Skips gracefully without a wgpu adapter or under an
-/// env that would contaminate one leg.
+/// parallel test harness). The injected authority adapter makes this contract
+/// deterministic and hardware-independent.
 ///
-/// Two entry points share this body:
-/// - [`chain_wide_replacement_oracle_pure_conv_chains_is_sound`] (always-on):
-///   hard-asserts leg (a) and PRINTS the (b) violation table.
-/// - [`chain_wide_activation_gate_wide_never_looser_than_dense`] (#[ignore] —
-///   the RED activation gate): additionally hard-asserts leg (b). Measured
-///   2026-07-17 (debug, wgpu): (a) held everywhere; (b) FAILED on 17/26 rows
-///   (β-folding domains of the 1x1 chain, gaps 0.02–0.11; ALL domains of the
-///   stride-2 chain including the β-free root, gaps to 0.21) while the plain
-///   deep k3/s1/p1 chain matched dense within f32 tolerance — consistent with
-///   the a6ff48f9 metaroom measurement (~2.9x looser at depth 1) and the
-///   #mo-beta-graft rationale. NY_BAB_CHAIN_WIDE must stay DARK until this
-///   gate passes (`cargo test -p ny-propagate chain_wide -- --ignored`).
-fn chain_wide_replacement_oracle_body(strict_never_looser: bool) {
+/// Measured 2026-07-17 (debug, wgpu): soundness held everywhere while the wide
+/// bound was looser on 17/26 rows. A never-looser assertion is therefore not a
+/// valid property of this algorithm.
+fn chain_wide_replacement_oracle_body() {
     use crate::beta_crown::branching::GraphNeuronConstraint;
     use crate::beta_crown::state::AlphaNeuronState;
     use crate::layers::Conv2dLayer;
@@ -1185,23 +916,19 @@ fn chain_wide_replacement_oracle_body(strict_never_looser: bool) {
             "forces one wide sub-path for both values",
         ),
     ] {
-        if std::env::var(var).is_ok() {
-            eprintln!("SKIP chain-wide oracle: {var} is set ({why})");
-            return;
-        }
+        assert!(
+            std::env::var(var).is_err(),
+            "live chain-wide oracle requires {var} to be unset ({why})"
+        );
     }
-    let Ok(device) = ny_gpu::ComputeDevice::new(ny_gpu::Backend::Wgpu) else {
-        eprintln!("SKIP chain-wide oracle: no wgpu adapter");
-        return;
-    };
+    let device = HermeticSoundGpuCrownEngine::default();
     let engine: &dyn ny_core::GemmEngine = &device;
-    if !engine
-        .as_gpu_crown_backward()
-        .is_some_and(|g| g.provides_sound_gpu_crown())
-    {
-        eprintln!("SKIP chain-wide oracle: engine provides no sound GPU CROWN backward");
-        return;
-    }
+    assert!(
+        engine
+            .as_gpu_crown_backward()
+            .is_some_and(|g| g.provides_sound_gpu_crown()),
+        "chain-wide oracle requires its injected sound CROWN backend"
+    );
 
     // Deterministic LCG (the ny-gpu differential-oracle pattern).
     let mut state: u64 = 0xC4A1_57AC_71F3;
@@ -1382,7 +1109,7 @@ fn chain_wide_replacement_oracle_body(strict_never_looser: bool) {
                     .filter(|&j| bt.lower()[[j]] < 0.0 && bt.upper()[[j]] > 0.0)
                     .take(4)
                     .map(|j| (j, AlphaNeuronState::new(0.3)))
-                    .collect::<HashMap<_, _>>()
+                    .collect::<rustc_hash::FxHashMap<_, _>>()
             };
             alpha_child.alpha_state.neurons.insert(rname.clone(), mk());
             alpha_child
@@ -1413,6 +1140,8 @@ fn chain_wide_replacement_oracle_body(strict_never_looser: bool) {
         // #lsnc-shared-fwd: the batched cores now borrow per-domain caches.
         let caches_ref: Vec<&HashMap<String, std::sync::Arc<BoundedTensor>>> =
             caches.iter().collect();
+        let histories: Vec<&crate::beta_crown::branching::GraphSplitHistory> =
+            doms.iter().map(|(d, _)| &d.history).collect();
         let beta_refs: Vec<Option<&crate::beta_crown::state::GraphBetaState>> =
             doms.iter().map(|(d, _)| Some(&d.beta_state)).collect();
         let alpha_refs: Vec<Option<&crate::beta_crown::state::GraphDomainAlphaState>> =
@@ -1434,6 +1163,7 @@ fn chain_wide_replacement_oracle_body(strict_never_looser: bool) {
                 plan,
                 &caches_ref,
                 &cinputs,
+                &histories,
                 &beta_refs,
                 &alpha_refs,
                 &spec,
@@ -1466,10 +1196,19 @@ fn chain_wide_replacement_oracle_body(strict_never_looser: bool) {
                 true, // the chain-wide routing under test
             )
             .unwrap_or_else(|| {
+                // The decline tally turns "it refused" into "it refused HERE".
+                // This oracle previously went vacuous on
+                // `EntryNoSoundBackend` — an entry-level backend admission, not
+                // the chain-segment extraction everyone assumed — and the bare
+                // message cost a diagnosis to recover.
                 panic!(
                     "{}: chain-wide lane refused a pure conv chain — oracle vacuous \
-                     (extraction or GPU path regressed)",
-                    fx.name
+                     (extraction or GPU path regressed). declines: {:?}",
+                    fx.name,
+                    ny_core::wide_lane_telemetry::wide_lane_decline_tally()
+                        .into_iter()
+                        .filter(|(_, n)| *n > 0)
+                        .collect::<Vec<_>>()
                 )
             })
             .0;
@@ -1576,36 +1315,13 @@ fn chain_wide_replacement_oracle_body(strict_never_looser: bool) {
             looser.join("\n"),
         );
     }
-    assert!(
-        !strict_never_looser || looser.is_empty(),
-        "chain-wide ACTIVATION GATE FAILED — the wide replacement bound is LOOSER than \
-         the dense node-by-node bound on {}/{} rows (do NOT enable NY_BAB_CHAIN_WIDE):\n{}",
-        looser.len(),
-        compared_rows,
-        looser.join("\n"),
-    );
 }
 
-/// Always-on leg of the #metaroom-chain-wide oracle: the wide chain lane must be
-/// a SOUND enclosure on every pure-conv-chain fixture/domain/row (and the fixture
-/// coverage — extraction fires, sampling non-vacuous — must hold). Prints the
-/// never-looser violation table as evidence without failing on it; the strict
-/// activation gate is the #[ignore] test below.
+/// The wide chain lane must be a sound enclosure on every pure-conv-chain
+/// fixture/domain/row. Extraction and sampling coverage must be non-vacuous.
 #[test]
 fn chain_wide_replacement_oracle_pure_conv_chains_is_sound() {
-    chain_wide_replacement_oracle_body(false);
-}
-
-/// #metaroom-chain-wide ACTIVATION GATE (strict never-looser leg). Currently RED
-/// — see the measurement in the oracle-body doc comment — therefore #[ignore]:
-/// the lane stays dark (`NY_BAB_CHAIN_WIDE` default OFF) and this gate documents
-/// exactly what must pass before anyone may flip it. Re-evaluate with
-/// `cargo test --release -p ny-propagate chain_wide -- --ignored`.
-#[test]
-#[ignore = "ACTIVATION GATE RED: wide replacement bound measurably LOOSER than dense \
-            (17/26 rows, gaps to 0.21 — 2026-07-17); NY_BAB_CHAIN_WIDE stays dark"]
-fn chain_wide_activation_gate_wide_never_looser_than_dense() {
-    chain_wide_replacement_oracle_body(true);
+    chain_wide_replacement_oracle_body();
 }
 
 /// #lsnc-skip-node-bounds (S3b) parity: skipping the DISCARDED per-domain
@@ -2255,7 +1971,11 @@ fn test_input_split_batched_bwd_full_pipeline_bit_identical_lsnc_s3() {
     let spec_matrix =
         Array2::from_shape_vec((3, 3), vec![1.0, 0.0, -1.0, 0.0, 1.0, 0.5, -0.25, 0.0, 1.0])
             .expect("valid spec matrix");
-    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    // This parity test exercises the historical unscored SoA lane. A finite
+    // deadline intentionally declines that lane because its whole-batch kernel
+    // has no cooperative cancellation seam.
+    verifier.config.alpha_config.deadline = None;
 
     let run = || {
         let ctx = BatchedBackwardContext {

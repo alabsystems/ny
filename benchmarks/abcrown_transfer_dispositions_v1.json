@@ -15,7 +15,7 @@
       "status": "retained_default_off",
       "default_changed": false,
       "rollback_or_fallback": "Use configs/vnncomp25/cgan_2023.yaml and omit every cgan_recipe factorial arm.",
-      "rationale": "The sealed canary and one-field factorials exist, but there is no sealed solved-count win or qualifying equal-solve wall result, so the recipe remains an experiment.",
+      "rationale": "UNCHANGED disposition, CORRECTED reason. The July verdict rested partly on arms that cannot measure anything. 2 of the 13 cgan_recipe arms carry `general.device: wgpu`, and `preset::contract::validate_preset` (crates/ny-cli/src/preset/contract.rs:276) classifies a wgpu request as Unhonoured/PerformanceOnly - 'the requested backend is overridden with the sound CPU verifier' while WGPU proof authority is quarantined. `device_wgpu` changes ONLY that key, so it is byte-identical to `baseline` BY CONSTRUCTION and is INERT; `supported_upstream_bundle` silently measures 9 of its 10 fields. scripts/run_abcrown_transfer_factorials.py does not surface unhonoured-field warnings, so an inert arm is indistinguishable from a real one in its output. Both arms are now annotated in configs/experiments/abcrown_transfer_factorials.yaml. No solved-count win is claimed or refuted here; the point is that two arms never tested what their names say. [lane3-requalify-20260809 @ HEAD efb15df8, GB10 CUDA (CudaGemmEngine on NVIDIA GB10), official budgets]",
       "evidence_paths": [
         "benchmarks/abcrown_transfer_corpus_v1.json",
         "configs/experiments/abcrown_transfer_factorials.yaml",
@@ -30,13 +30,14 @@
       "status": "retained_default_off",
       "default_changed": false,
       "rollback_or_fallback": "Run the unchanged category presets with no cifar100_recipe or tinyimagenet_recipe factorial override.",
-      "rationale": "Independent parity arms are sealed and selectable, but no arm has a sealed solved-count win or the required equal-solve wall and fixed-depth evidence.",
+      "rationale": "MEASURED NULL AND NOT EXERCISED (re-measured 2026-08-09 on GB10 CUDA at the official 100 s budget; see docs/TINYIMAGENET_PARITY_A2_NOT_EXERCISED_2026-08-09.md). Arming the full cross-category parity bundle on tinyimagenet_2024 (batch_size 128->256, candidates 10->7, min_batch_size_ratio, max_split_depth, kfsb_multi, alpha_crown.lr_alpha 0.2->0.25, beta_crown.lr_beta 0.15->0.2, beta_crown.iterations 15->10, the clip block, root_crown_interm_dense_head) is NET +0/-0 over 44 paired runs on 22 rows: 0 of 10 sampled GT-unsat rows ny misses converted, and the 12 rows ny banks came back with identical per-class tallies. The arms were confirmed LIVE from the run's effective_config receipt, so this is a not-exercised result rather than a vacuous one: the internal verifier reports domains_explored=0 in ALL 44 runs, and every key except root_crown_interm_dense_head is consumed inside the BaB loop. The category's unsat verdicts come from the concurrent margin-row lane, whose entry point run_margin_row_lane takes no BetaCrownConfig, so no bab.* key can reach it by signature; the lane's published root_bound is identical between arms on every row where both published (5/5). One banked wall-hugger (prop_idx_5478) closes 4/4 under the shipped preset and 2/4 under parity, so the bundle never paid and marginally costs. PROVENANCE NOTE: this entry's default_changed=false is accurate for both halves, but must not be read as 'cifar100 does not carry these values' - git log -S dates five of them (batch_size 256, candidates 7, lr_alpha 0.25, lr_beta 0.2, iterations 10) to 3c6c271b 'Initial ny rebrand' (2026-05-24) and the other two to cifar100-scoped waves 35e72d2e (2026-07-21) and 355d24b3 (2026-07-23). None came from this transfer campaign.",
       "evidence_paths": [
         "benchmarks/abcrown_transfer_corpus_v1.json",
         "configs/experiments/abcrown_transfer_factorials.yaml",
         "configs/vnncomp25/cifar100_2024.yaml",
         "configs/vnncomp25/tinyimagenet_2024.yaml",
-        "tests/test_run_abcrown_transfer_factorials.py"
+        "tests/test_run_abcrown_transfer_factorials.py",
+        "docs/TINYIMAGENET_PARITY_A2_NOT_EXERCISED_2026-08-09.md"
       ]
     },
     {
@@ -62,7 +63,7 @@
       "status": "retained_default_off",
       "default_changed": false,
       "rollback_or_fallback": "Unset NY_ALPHA_FINAL_BOUND_ONLY to execute the legacy final gradient, probe, refresh, and update path.",
-      "rationale": "The bound-only terminal pass is implemented and state-regression tested behind an exact opt-in gate, but a qualifying sealed affected-phase speedup has not been established.",
+      "rationale": "UNCHANGED disposition, and the ceiling is far LOWER than 'a missing speedup result' implies. REACHABILITY (read at 6 production sites): on DAG/graph models the three collection entry points (crates/ny-propagate/src/network/graph_alpha/propagate_dag/collect.rs:38/58/78) pass `DagAlphaLoopResultUse::BoundsAndState`, and `terminal_bound_only()` is `gate_enabled && matches!(self, BoundsOnly)` (propagate_dag/mod.rs:143), so B1 FAILS CLOSED on every DAG root-alpha collection - the expensive alpha phase that warm-starts BaB. The collection core says so itself: 'Collection always marks the returned state as observable.' B1 is live only via propagate_dag/mod.rs:637 (BoundsOnly bound query) and alpha_crown_loop.rs:782 (sequential `alpha_crown_optimize`). CEILING where live: it removes exactly 1 of `iterations` alpha iterations (<=5% of the alpha phase at `iterations: 20`), WALL ONLY - it cannot move a bound, so it cannot convert a bound-quality row. MEASURED at the official 116s budget on acasxu_2023 1_1/prop_1, 3 arms x 3 repeats: unsat 9/9, 29 domains explored / 88 verified in EVERY arm, root bound [-342.0013, 1294.4406] identical in every arm - verdict- and bound-neutral as designed. At -vv (DEBUG) the 'NY_ALPHA_FINAL_BOUND_ONLY terminal pass' marker fired 0 times in 32,986 DEBUG lines: on this route B1 is NOT EXERCISED, which is not the same as neutral. [lane3-requalify-20260809 @ HEAD efb15df8, GB10 CUDA (CudaGemmEngine on NVIDIA GB10), official budgets]",
       "evidence_paths": [
         "configs/experiments/abcrown_transfer_factorials.yaml",
         "crates/ny-propagate/src/network/alpha_crown_loop.rs",
@@ -122,7 +123,7 @@
       "status": "retained_default_off",
       "default_changed": false,
       "rollback_or_fallback": "Use the nested-map GraphDomainAlphaState representation and its existing DomainList round-trip path.",
-      "rationale": "The f32 packed queue preserves exact optimizer trajectories and cuts the measured alpha-heavy state estimate by 51.50%, but it lacks the required 5% queue-throughput result and therefore remains independently default-off.",
+      "rationale": "UNCHANGED disposition, but the ledger's '5% queue-throughput result' framing is misleading: the throughput gate was never measurable on the categories it was aimed at, because C2 is OFF-ROUTE there. The gate is read at EXACTLY ONE production site - crates/ny-propagate/src/batched_domain/domain_list/storage.rs:705, inside `DomainList::add`. The only production `DomainList` constructors are gpu_bab/init.rs:310 and gpu_bab/input_split.rs:585, both reached only through `verify_graph_gpu_domain_list`, which runs only when `gpu_bab` is true. `should_auto_promote_gpu_bab` (crates/ny-cli/src/commands/beta_crown/mod.rs:2234) grants that only for graph models whose branching heuristic is BoundImpact or InputSplit and which are not generic multi-clause disjunctions (its own comment names cGAN and ml4acopf as deliberately excluded). cifar100_2024 and tinyimagenet_2024 set NO `bab.branching.method` at all, and at RUNTIME the auto-selector logs 'Auto-branching selected Kfsb: high-dimensional input or large unstable-ReLU frontier (ReLU/kFSB splitting)' with input_elements=3072 (cifar100) and 9408 (tinyimagenet). Kfsb is in neither admitted class, so gpu_bab is never promoted. Note this is driven by the benchmark's own shape, not by a preset omission: no preset edit reaches C2 without changing the branching strategy wholesale. MEASURED: 'DomainList BaB:' is an INFO-level marker emitted on EVERY path of that function including all early returns, and it appears 0 times in every run of acasxu_2023, cifar100_2024 and tinyimagenet_2024 at official budgets. So on cgan, relusplitter, cifar100, tinyimagenet AND acasxu, C2 is NOT EXERCISED - report it as off-route, never as throughput-neutral. The 51.5% per-domain memory reduction is real but unrealised: to qualify C2 at all it must be measured on a category that actually builds a DomainList (input-split, non-disjunctive: nn4sys, linearizenn_2024, dist_shift_2023, cersyve, lsnc_relu). [lane3-requalify-20260809 @ HEAD efb15df8, GB10 CUDA (CudaGemmEngine on NVIDIA GB10), official budgets]",
       "evidence_paths": [
         "crates/ny-propagate/src/beta_crown/state/alpha/packed.rs",
         "crates/ny-propagate/src/batched_domain/domain_list/alpha_queue.rs",
@@ -137,7 +138,7 @@
       "status": "retained_default_off",
       "default_changed": false,
       "rollback_or_fallback": "Use the owned-copy TensorStorage and PooledArray path for unsupported, alias-uncertain, or small-queue cases.",
-      "rationale": "Reusable pooled storage and no-restack conversions exist, but copied-byte and queue-wall promotion gates have not been demonstrated for asynchronous or device-resident frontier variants.",
+      "rationale": "NOT ARMABLE - it needs implementing, not arming, and the previous rationale reads as though a gate existed and failed its promotion bar. There is NO env var and NO preset key anywhere in the tree for this item: all three of its own evidence paths (crates/ny-tensor/src/pooled_array.rs, crates/ny-tensor/src/tensor_storage/mod.rs, crates/ny-propagate/src/batched_domain/picked_conversion.rs) contain zero `env::var` reads, and no `bab.*` preset field maps to it. Its shipped parts (PooledArray no-restack conversion, cached lA retention) are already default-on. Any future 'C3 measured X' claim is unsupportable until a gate exists. [lane3-requalify-20260809 @ HEAD efb15df8, GB10 CUDA (CudaGemmEngine on NVIDIA GB10), official budgets]",
       "evidence_paths": [
         "crates/ny-tensor/src/pooled_array.rs",
         "crates/ny-tensor/src/tensor_storage/mod.rs",

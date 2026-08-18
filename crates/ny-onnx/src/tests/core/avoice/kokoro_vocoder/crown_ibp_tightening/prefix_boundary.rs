@@ -6,8 +6,8 @@ use super::super::boundary::{extract_waveform_boundary_bounds, KOKORO_BOUNDARY_S
 use super::support::{
     assert_crown_no_looser, assert_finite_and_ordered_slices, boundary_spec_matrix,
     boundary_spec_matrix_range, cached_prefix_crown_fixture, spec_guided_crown,
-    spec_guided_crown_with_engine, with_kokoro_crown_lock, FULL_BOUNDARY_SPEC_CHUNK_SAMPLES,
-    SMOKE_BOUNDARY_SPEC_SAMPLES,
+    spec_guided_crown_with_engine, spec_guided_crown_with_unbounded_engine, with_kokoro_crown_lock,
+    FULL_BOUNDARY_SPEC_CHUNK_SAMPLES, SMOKE_BOUNDARY_SPEC_SAMPLES,
 };
 use ny_test_utils::assert_slice_close_relative;
 use std::time::Instant;
@@ -55,8 +55,9 @@ fn run_boundary_chunk_with_engine(
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     with_kokoro_crown_lock(|| {
         let f = cached_prefix_crown_fixture();
         let flat_len = f.ibp_output.lower().len();
@@ -94,8 +95,9 @@ fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_3500() {
 /// prefix. This validates the dispatch wiring added in the #3598 fix.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_crown_engine_dispatched_conv1d_kokoro_prefix_3598() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     use ny_test_utils::CountingGemmEngine;
 
     // Use fewer boundary specs to keep CROWN fast (~3s CROWN, ~87s fixture).
@@ -110,12 +112,12 @@ fn test_crown_engine_dispatched_conv1d_kokoro_prefix_3598() {
         let engine = CountingGemmEngine::new();
 
         let t0 = Instant::now();
-        let (crown_lo, crown_hi) = spec_guided_crown_with_engine(
+        let (crown_lo, crown_hi) = spec_guided_crown_with_unbounded_engine(
             &f.prefix,
             &f.input,
             &f.ibp_node_bounds,
             &spec,
-            Some(&engine),
+            &engine,
             "engine-aware CROWN",
         );
         let elapsed = t0.elapsed().as_secs_f64();
@@ -134,9 +136,29 @@ fn test_crown_engine_dispatched_conv1d_kokoro_prefix_3598() {
         );
         assert_finite_and_ordered_slices(&crown_lo, &crown_hi, "engine CROWN");
 
+        // The same generic engine must be refused when the real scored
+        // deadline is present: GemmEngine cannot cooperatively cancel an
+        // in-flight launch. The pollable certified CPU route still returns
+        // valid bounds.
+        let deadline_engine = CountingGemmEngine::new();
+        let (deadline_lo, deadline_hi) = spec_guided_crown_with_engine(
+            &f.prefix,
+            &f.input,
+            &f.ibp_node_bounds,
+            &spec,
+            Some(&deadline_engine),
+            "deadline-scored CROWN",
+        );
+        assert_eq!(
+            deadline_engine.gemm_calls(),
+            0,
+            "finite-deadline Conv1d CROWN must refuse a generic opaque GEMM engine"
+        );
+        assert_finite_and_ordered_slices(&deadline_lo, &deadline_hi, "deadline-scored CROWN");
+
         eprintln!(
             "Conv1d CROWN engine wiring validated: {gemm_count} GEMM dispatches, \
-             {n} boundary specs, all finite and ordered"
+             {n} boundary specs; deadline-scored opaque dispatch correctly refused"
         );
     });
 }
@@ -145,8 +167,9 @@ fn test_crown_engine_dispatched_conv1d_kokoro_prefix_3598() {
 /// preserve the baseline `engine=None` bounds on the real Kokoro prefix.
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_crown_engine_matches_cpu_baseline_on_kokoro_prefix_3598() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     use ny_core::NaiveCpuGemmEngine;
 
     const EQUIVALENCE_SPECS: usize = 2;
@@ -179,8 +202,9 @@ fn test_crown_engine_matches_cpu_baseline_on_kokoro_prefix_3598() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_chunk0_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     with_kokoro_crown_lock(|| {
         let (covered, tighter, equal) = run_boundary_chunk_with_engine(
             0,
@@ -193,8 +217,9 @@ fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_chunk0_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_chunk1_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     with_kokoro_crown_lock(|| {
         let (covered, tighter, equal) = run_boundary_chunk_with_engine(
             FULL_BOUNDARY_SPEC_CHUNK_SAMPLES,
@@ -207,8 +232,9 @@ fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_chunk1_3500() {
 
 #[cfg_attr(not(debug_assertions), ntest::timeout(300000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_spec_guided_crown_kokoro_vocoder_prefix_boundary_chunk2_3500() {
-    crate::test_fixtures::require_test_model_or_skip!("kokoro_vocoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("kokoro_vocoder.onnx");
     with_kokoro_crown_lock(|| {
         let (covered, tighter, equal) = run_boundary_chunk_with_engine(
             2 * FULL_BOUNDARY_SPEC_CHUNK_SAMPLES,

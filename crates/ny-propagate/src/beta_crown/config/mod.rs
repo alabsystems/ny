@@ -15,7 +15,12 @@ mod tests;
 
 // Re-export all public types to preserve `crate::beta_crown::config::*` paths.
 pub(crate) use beta_config::AUTO_ENLARGE_BATCH_CAP;
-pub use beta_config::{BetaCrownConfig, ConvMode, InputClipType, KfsbReduceOp};
+pub use beta_config::{
+    BetaCrownConfig, ConvMode, DepthTwoBranchLookaheadConfig, DepthTwoBranchLookaheadMode,
+    InputClipType, KfsbReduceOp, VerificationArtifactAuthority,
+    ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS, DEPTH_TWO_LOOKAHEAD_MAX_CANDIDATES,
+    DEPTH_TWO_LOOKAHEAD_MAX_ROUNDS,
+};
 pub use cut_config::{CutEvictionPolicy, CutScoreWeights};
 pub(crate) use optimization::radam_rectification_factor;
 pub use optimization::{AdaptiveOptConfig, LRScheduler, LookaheadConfig, PerLayerLR};

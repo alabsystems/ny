@@ -238,7 +238,7 @@ fn aggregate_disjunctive_clause_results(
                     total_verified,
                 );
             }
-            BabVerificationStatus::PotentialViolation => {
+            BabVerificationStatus::PotentialViolation { .. } => {
                 saw_potential = true;
             }
             BabVerificationStatus::Unknown { reason } => {
@@ -255,7 +255,7 @@ fn aggregate_disjunctive_clause_results(
     }
 
     let status = if saw_potential {
-        BabVerificationStatus::PotentialViolation
+        BabVerificationStatus::potential_violation()
     } else if let Some(reason) = unknown_reason {
         BabVerificationStatus::Unknown { reason }
     } else {
@@ -368,13 +368,21 @@ fn verify_constant(
     vnnlib: &VnnLibSpec,
     verifier: &BetaCrownVerifier,
 ) -> Result<(BabVerificationStatus, usize, usize)> {
+    anyhow::ensure!(
+        vnnlib.output_constraints.len() == 1,
+        "constant verification requires exactly one scalar output constraint"
+    );
     // Extract threshold and output index via shared planning module (#1881)
-    let params = extract_constant_params(vnnlib).unwrap_or(
-        crate::commands::beta_crown::constraint_plan::ConstantConstraintParams {
-            threshold: 0.0,
-            verify_upper: false,
-            output_idx: 0,
-        },
+    let params = extract_constant_params(vnnlib).ok_or_else(|| {
+        anyhow::anyhow!(
+            "constant verification requires exactly one supported scalar output constraint"
+        )
+    })?;
+    anyhow::ensure!(
+        params.output_idx < vnnlib.num_outputs,
+        "constant constraint references Y_{} but only {} outputs are declared",
+        params.output_idx,
+        vnnlib.num_outputs
     );
 
     // Build augmented network via shared eval helper (#1881 Step 4)
@@ -429,13 +437,21 @@ fn verify_constant_gpu_bab(
     vnnlib: &VnnLibSpec,
     verifier: &BetaCrownVerifier,
 ) -> Result<(BabVerificationStatus, usize, usize)> {
+    anyhow::ensure!(
+        vnnlib.output_constraints.len() == 1,
+        "constant GPU-BaB verification requires exactly one scalar output constraint"
+    );
     // Extract constant params via shared planning module (#1881)
-    let params = extract_constant_params(vnnlib).unwrap_or(
-        crate::commands::beta_crown::constraint_plan::ConstantConstraintParams {
-            threshold: 0.0,
-            verify_upper: false,
-            output_idx: 0,
-        },
+    let params = extract_constant_params(vnnlib).ok_or_else(|| {
+        anyhow::anyhow!(
+            "constant GPU-BaB verification requires exactly one supported scalar output constraint"
+        )
+    })?;
+    anyhow::ensure!(
+        params.output_idx < vnnlib.num_outputs,
+        "constant constraint references Y_{} but only {} outputs are declared",
+        params.output_idx,
+        vnnlib.num_outputs
     );
 
     // Build objective and threshold via shared eval helpers (#1881 Step 4)
@@ -505,7 +521,9 @@ fn verify_relational_gpu_bab(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::{arr1, arr2};
     use ny_onnx::vnnlib::OutputConstraint;
+    use ny_propagate::{layers::LinearLayer, Layer, Network};
 
     fn make_spec(
         output_constraints: Vec<OutputConstraint>,
@@ -524,6 +542,103 @@ mod tests {
             declared_input_bounds: Vec::new(),
             dual_network: None,
         }
+    }
+
+    fn fixed_scalar_fixture(output: f32) -> (Network, BoundedTensor, BetaCrownVerifier) {
+        let mut network = Network::new();
+        network.add_layer(Layer::Linear(
+            LinearLayer::new(arr2(&[[0.0_f32]]), Some(arr1(&[output])))
+                .expect("fixed-output layer should be valid"),
+        ));
+        let input = BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[0.0_f32]).into_dyn())
+            .expect("point input should be valid");
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+        (network, input, verifier)
+    }
+
+    fn verify_fixed_scalar(output: f32, constraint: OutputConstraint) -> BabVerificationStatus {
+        let (network, input, verifier) = fixed_scalar_fixture(output);
+        let spec = VnnLibSpec {
+            num_outputs: 1,
+            ..make_spec(vec![constraint], Vec::new(), false)
+        };
+        verify_constant(&network, &input, &spec, &verifier)
+            .expect("constant verification should run")
+            .0
+    }
+
+    /// Regression for the historical lower-mode sign inversion. For unsafe
+    /// `Y <= 5`, only a strict lower proof `Y > 5` establishes safety.
+    #[test]
+    fn test_constant_less_eq_uses_original_output_and_direct_threshold() {
+        let unsafe_status = verify_fixed_scalar(0.0, OutputConstraint::LessEqConst(0, 5.0));
+        assert!(
+            !matches!(unsafe_status, BabVerificationStatus::Verified),
+            "an actually unsafe fixed output must not be certified safe"
+        );
+
+        let safe_status = verify_fixed_scalar(6.0, OutputConstraint::LessEqConst(0, 5.0));
+        assert!(matches!(safe_status, BabVerificationStatus::Verified));
+
+        let boundary_status = verify_fixed_scalar(5.0, OutputConstraint::LessEqConst(0, 5.0));
+        assert!(
+            !matches!(boundary_status, BabVerificationStatus::Verified),
+            "the non-strict unsafe boundary must not be certified safe"
+        );
+    }
+
+    /// The sibling upper-mode obligation remains `upper(Y) < c` for unsafe
+    /// `Y >= c`, including strict rejection at the unsafe boundary.
+    #[test]
+    fn test_constant_greater_eq_uses_original_output_and_direct_threshold() {
+        let unsafe_status = verify_fixed_scalar(6.0, OutputConstraint::GreaterEqConst(0, 5.0));
+        assert!(
+            !matches!(unsafe_status, BabVerificationStatus::Verified),
+            "an actually unsafe fixed output must not be certified safe"
+        );
+
+        let safe_status = verify_fixed_scalar(4.0, OutputConstraint::GreaterEqConst(0, 5.0));
+        assert!(matches!(safe_status, BabVerificationStatus::Verified));
+
+        let boundary_status = verify_fixed_scalar(5.0, OutputConstraint::GreaterEqConst(0, 5.0));
+        assert!(
+            !matches!(boundary_status, BabVerificationStatus::Verified),
+            "the non-strict unsafe boundary must not be certified safe"
+        );
+    }
+
+    #[test]
+    fn test_constant_fast_path_rejects_missing_multiple_and_out_of_range_constraints() {
+        let (network, input, verifier) = fixed_scalar_fixture(0.0);
+
+        let missing = VnnLibSpec {
+            num_outputs: 1,
+            ..make_spec(Vec::new(), Vec::new(), false)
+        };
+        assert!(verify_constant(&network, &input, &missing, &verifier).is_err());
+
+        let multiple = VnnLibSpec {
+            num_outputs: 1,
+            ..make_spec(
+                vec![
+                    OutputConstraint::LessEqConst(0, 1.0),
+                    OutputConstraint::GreaterEqConst(0, -1.0),
+                ],
+                Vec::new(),
+                false,
+            )
+        };
+        assert!(verify_constant(&network, &input, &multiple, &verifier).is_err());
+
+        let out_of_range = VnnLibSpec {
+            num_outputs: 1,
+            ..make_spec(
+                vec![OutputConstraint::LessEqConst(1, 1.0)],
+                Vec::new(),
+                false,
+            )
+        };
+        assert!(verify_constant(&network, &input, &out_of_range, &verifier).is_err());
     }
 
     #[test]
@@ -619,11 +734,11 @@ mod tests {
                 8,
                 0,
             ),
-            (BabVerificationStatus::PotentialViolation, 12, 0),
+            (BabVerificationStatus::potential_violation(), 12, 0),
         ];
         let (status, domains, verified) = aggregate_disjunctive_clause_results(&results);
         assert!(
-            matches!(status, BabVerificationStatus::PotentialViolation),
+            matches!(status, BabVerificationStatus::PotentialViolation { .. }),
             "PotentialViolation should outrank Unknown when no concrete violation exists"
         );
         assert_eq!(domains, 20);

@@ -13,15 +13,75 @@
 use ny_propagate::PhaseBudgetConfig;
 use std::time::{Duration, Instant};
 
+/// A representable engine-local horizon for a logically unbounded CLI run.
+///
+/// Several low-level BaB APIs still carry `Duration` rather than
+/// `Option<Instant>`. Give them a decades-long operational horizon instead of
+/// `u64::MAX`, which panics when those APIs add it to `Instant::now()`.
+pub(in crate::commands::beta_crown) fn operational_unbounded_timeout() -> Duration {
+    const FIFTY_YEARS_SECS: u64 = 50 * 365 * 24 * 60 * 60;
+    let now = Instant::now();
+    let mut seconds = FIFTY_YEARS_SECS;
+    while seconds > 0 {
+        let candidate = Duration::from_secs(seconds);
+        if now.checked_add(candidate).is_some() {
+            return candidate;
+        }
+        seconds /= 2;
+    }
+    Duration::ZERO
+}
+
 /// Budgets at or below this total get the small-budget attack cap.
 const SMALL_BUDGET_TOTAL: Duration = Duration::from_secs(30);
 
 /// Attack-phase ceiling (fraction of total) on small budgets.
 const SMALL_BUDGET_ATTACK_FRACTION: f32 = 0.15;
 
+/// Whether the short-budget MIP grant should retain a tail for the independent
+/// outer VNN-COMP post-BaB falsifier.
+///
+/// `None` is the interactive/legacy route and preserves the historical
+/// reserve. VNN-COMP supplies an explicit typed decision from the same preset
+/// snapshot that controls the wrapper.
+fn small_budget_postbab_tail_armed(wrapper_attack_enabled: Option<bool>) -> bool {
+    wrapper_attack_enabled.unwrap_or(true)
+}
+
+const SMALL_BUDGET_POSTBAB_MIP_TAIL: Duration = Duration::from_secs(3);
+const SMALL_BUDGET_POSTBAB_MIP_MAX_TOTAL: Duration = Duration::from_secs(25);
+
+fn small_budget_postbab_mip_reserve(
+    total: Duration,
+    wrapper_attack_enabled: Option<bool>,
+) -> Duration {
+    if total <= SMALL_BUDGET_POSTBAB_MIP_MAX_TOTAL
+        && small_budget_postbab_tail_armed(wrapper_attack_enabled)
+    {
+        SMALL_BUDGET_POSTBAB_MIP_TAIL
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// Whether the small-budget attack time cap is disabled (`NY_NO_PGD_TIME_CAP=1`).
 fn pgd_time_cap_disabled() -> bool {
-    std::env::var("NY_NO_PGD_TIME_CAP").is_ok_and(|v| v == "1")
+    crate::plan_resolver::env_value_is_exact_one(
+        std::env::var_os(crate::plan_resolver::PGD_TIME_CAP_DISABLE_ENV).as_deref(),
+    )
+}
+
+/// Share the existing `NY_PHASE_TELEMETRY=1` diagnostic gate with the
+/// propagate-side phase/frontier markers, resolved through the ny-levers
+/// chokepoint at call time (lever-debt batch B1 preparation). Emission happens
+/// a handful of times per verify run, so a per-call env read costs nothing;
+/// the chokepoint's exact-`"1"` `Bool` parse preserves the historical arming
+/// rule. This remains live process state until Phase 2 injects a per-run
+/// `LeverSet`.
+fn phase_telemetry_enabled() -> bool {
+    ny_levers::read(&ny_levers::decls::telemetry::PHASE_TELEMETRY)
+        .value
+        .as_bool()
 }
 
 /// Runtime budget ledger for β-CROWN verification.
@@ -30,6 +90,7 @@ fn pgd_time_cap_disabled() -> bool {
 /// a single [`PhaseBudgetConfig`]. Replaces the scattered local fraction
 /// arithmetic in `attack_budget.rs`, `sequential.rs`, `graph.rs`,
 /// `disjunctive.rs`, and `mod.rs`.
+#[derive(Clone)]
 pub(in crate::commands::beta_crown) struct PhaseBudgetLedger {
     start: Instant,
     total: Option<Duration>,
@@ -44,6 +105,23 @@ pub(in crate::commands::beta_crown) struct PhaseBudgetLedger {
     /// keeps every formula byte-identical. A zero-reservation category policy
     /// also leaves the full BaB slice available.
     mip_reservation_armed: bool,
+    /// Independently resolved outer VNN-COMP attack route. `None` retains the
+    /// historical interactive small-budget reserve.
+    post_bab_wrapper_attack_enabled: Option<bool>,
+    /// MIP-handoff enforcement (#mip-handoff). TWO independent arming sources
+    /// reach this one budget treatment:
+    ///
+    /// 1. the default-dark SafeNLP shared-prefix solver experiment
+    ///    (`NY_MIP_SAFENLP_SHARED_PREFIX=1`), which needs a reachable MIP
+    ///    handoff: keep the policy-sized slice even when the already-loaded
+    ///    graph is statically unsupported, because dispatch can still reload an
+    ///    encodable sequential network before the AY solve;
+    /// 2. the typed preset opt-in `phase_budget.enforce_mip_handoff`, which
+    ///    touches NOTHING but this schedule.
+    ///
+    /// This flag never arms MIP on its own; explicit `bab`, a non-MIP build,
+    /// `NY_GRAPH_MIP=0`, and zero-reservation policies remain disarmed.
+    safenlp_shared_prefix_budget_repair: bool,
 }
 
 impl PhaseBudgetLedger {
@@ -51,32 +129,203 @@ impl PhaseBudgetLedger {
     ///
     /// - `timeout_secs`: 0 means unbounded (no deadline).
     /// - `policy`: phase budget fractions from `BetaCrownConfig.phase_budget`.
+    #[cfg(test)]
     pub(in crate::commands::beta_crown) fn new(
         timeout_secs: u64,
         policy: PhaseBudgetConfig,
     ) -> Self {
-        let total = if timeout_secs > 0 {
-            Some(Duration::from_secs(timeout_secs))
-        } else {
-            None
-        };
+        Self::new_duration(
+            (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)),
+            policy,
+        )
+    }
+
+    /// Create a ledger from an exact duration.
+    ///
+    /// `None` means unbounded; `Some(Duration::ZERO)` means the bounded budget
+    /// is already exhausted. This is used when an earlier verification phase
+    /// consumed part or all of the CLI timeout.
+    #[cfg(test)]
+    pub(in crate::commands::beta_crown) fn new_duration(
+        total: Option<Duration>,
+        policy: PhaseBudgetConfig,
+    ) -> Self {
+        Self::from_start_and_total(Instant::now(), total, policy)
+    }
+
+    /// Create a ledger that preserves an existing absolute deadline.
+    ///
+    /// This prevents an earlier verification phase's remaining duration from
+    /// being re-anchored to a later clock read. `None` remains unbounded.
+    pub(in crate::commands::beta_crown) fn from_deadline(
+        deadline: Option<Instant>,
+        policy: PhaseBudgetConfig,
+    ) -> Self {
+        let now = Instant::now();
+        match deadline {
+            Some(deadline) if deadline <= now => {
+                // Preserve an already-expired absolute deadline exactly. Using
+                // `now + saturating_duration_since(now)` would silently move it
+                // forward to this constructor's clock read.
+                Self::from_start_and_total(deadline, Some(Duration::ZERO), policy)
+            }
+            Some(deadline) => {
+                Self::from_start_and_total(now, Some(deadline.duration_since(now)), policy)
+            }
+            None => Self::from_start_and_total(now, None, policy),
+        }
+    }
+
+    fn from_start_and_total(
+        start: Instant,
+        total: Option<Duration>,
+        policy: PhaseBudgetConfig,
+    ) -> Self {
         #[cfg(feature = "mip")]
         let mip_reservation_armed =
             super::super::graph_mip::graph_mip_enabled() && policy.requests_mip_reservation();
         #[cfg(not(feature = "mip"))]
         let mip_reservation_armed = false;
+        // #mip-handoff: the typed preset opt-in is part of the POLICY, so it
+        // must hold on every ledger construction path, not only the one that
+        // threads the environment experiment through
+        // `with_safenlp_shared_prefix_budget_repair`.
+        let safenlp_shared_prefix_budget_repair =
+            mip_reservation_armed && policy.enforce_mip_handoff;
         Self {
-            start: Instant::now(),
+            start,
             total,
             policy,
             mip_reservation_armed,
+            post_bab_wrapper_attack_enabled: None,
+            safenlp_shared_prefix_budget_repair,
         }
     }
 
+    /// Thread the outer VNN-COMP attack route into the small-budget MIP ledger.
+    ///
+    /// This is independent of the engine's `post_bab_pgd_fraction`: changing
+    /// either policy must not silently rewrite the other's allocation.
+    pub(in crate::commands::beta_crown) fn with_post_bab_wrapper_attack(
+        mut self,
+        enabled: Option<bool>,
+    ) -> Self {
+        self.post_bab_wrapper_attack_enabled = enabled;
+        self
+    }
+
+    /// Arm the MIP reservation only when the selected complete-verifier policy
+    /// can actually escalate after BaB. Explicit `bab` runs must retain that
+    /// otherwise-unused slice.
+    pub(in crate::commands::beta_crown) fn with_mip_escalation_allowed(
+        mut self,
+        allowed: bool,
+    ) -> Self {
+        if !allowed {
+            self.mip_reservation_armed = false;
+            // #mip-handoff: an unarmed ledger must not retain the handoff
+            // treatment either — explicit `bab` keeps its exact historical
+            // schedule even when a preset opted the category in.
+            self.safenlp_shared_prefix_budget_repair = false;
+        }
+        self
+    }
+
+    /// Derive a phase-local ledger without ever extending this ledger's
+    /// authoritative wall-clock deadline.
+    ///
+    /// Relational verification uses this for adaptive clause/group slices.
+    /// The child starts now, but its duration is capped by the parent's exact
+    /// remaining duration and it inherits the parent's MIP-reservation policy.
+    /// Thus an explicit `bab` run cannot accidentally re-arm MIP in a nested
+    /// lane, and no nested lane can rebase the competition timeout.
+    pub(in crate::commands::beta_crown) fn child_with_timeout_secs(
+        &self,
+        timeout_secs: u64,
+    ) -> Self {
+        let start = Instant::now();
+        let parent_remaining = self
+            .overall_deadline()
+            .map(|deadline| deadline.saturating_duration_since(start));
+        let requested = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+        let total = match (parent_remaining, requested) {
+            (Some(parent_remaining), Some(requested)) => Some(parent_remaining.min(requested)),
+            (Some(parent_remaining), None) => Some(parent_remaining),
+            (None, Some(requested)) => Some(requested),
+            (None, None) => None,
+        };
+        Self {
+            start,
+            total,
+            policy: self.policy.clone(),
+            mip_reservation_armed: self.mip_reservation_armed,
+            post_bab_wrapper_attack_enabled: self.post_bab_wrapper_attack_enabled,
+            safenlp_shared_prefix_budget_repair: self.safenlp_shared_prefix_budget_repair,
+        }
+    }
+
+    /// Latch the existing SafeNLP shared-prefix experiment into the budget
+    /// policy selected by production dispatch.
+    ///
+    /// The experiment does not grant authority and cannot arm an escalation:
+    /// it only changes how an already-armed whole-net MIP reservation is
+    /// protected and sized. Keeping this as an explicit dispatch input makes
+    /// gate-off construction and every non-dispatch ledger byte-for-byte
+    /// identical to the historical path.
+    pub(in crate::commands::beta_crown) fn with_safenlp_shared_prefix_budget_repair(
+        mut self,
+        enabled: bool,
+    ) -> Self {
+        self.safenlp_shared_prefix_budget_repair =
+            (enabled || self.policy.enforce_mip_handoff) && self.mip_reservation_armed;
+        self
+    }
+
     /// Test-only override for the arming flag (env-free, race-free tests).
+    ///
+    /// `safenlp_shared_prefix_budget_repair` is DERIVED from
+    /// `mip_reservation_armed && policy.enforce_mip_handoff`. The constructor and
+    /// `with_safenlp_shared_prefix_budget_repair` both re-derive it; this
+    /// override did not, so flipping the arming flag left the derived field
+    /// stale at whatever the constructor computed. Under `cargo test -p ny-cli
+    /// --bin ny` the `mip` feature is off (ny-cli's defaults are
+    /// pytorch/coreml/gguf), so the constructor takes the
+    /// `#[cfg(not(feature = "mip"))]` arm, derives `false`, and the override
+    /// then armed the ledger without ever setting the flag the preset path
+    /// asserts.
     #[cfg(test)]
-    fn with_mip_reservation(mut self, armed: bool) -> Self {
+    pub(in crate::commands::beta_crown) fn with_mip_reservation(mut self, armed: bool) -> Self {
         self.mip_reservation_armed = armed;
+        self.safenlp_shared_prefix_budget_repair = armed && self.policy.enforce_mip_handoff;
+        self
+    }
+
+    /// #deadlane — DISARM the Graph-MIP reservation when a purely STATIC scan of
+    /// the model proves the escalation can never fire.
+    ///
+    /// `ineligible == true` means the already-loaded graph cannot reach the
+    /// Graph-MIP encoder (see `dispatch::graph_mip_layer_set_supported`), so
+    /// the slice [`Self::bab_deadline`] carves out of the SCORED budget can only
+    /// be dead time on the historical route. Measured on vit_2023: 23 s of
+    /// BaB's 95 s internal tier reserved for an escalation whose own log line
+    /// says "NOT eligible (unsupported layer …)" on every one of the 200 rows.
+    ///
+    /// The default-dark SafeNLP shared-prefix treatment is the narrow
+    /// exception: its tiny graph can be reloaded as an encodable sequential
+    /// network by production dispatch, so graph-static ineligibility does not
+    /// prove that its later whole-net MIP path is dead.
+    ///
+    /// This does NOT weaken deadline discipline: it moves the BaB deadline later
+    /// INSIDE the same scored budget (never past `overall_deadline`), so the
+    /// out-of-process watchdog still bounds the run. `ineligible == false` leaves
+    /// every formula byte-identical.
+    pub(in crate::commands::beta_crown) fn with_static_mip_ineligibility(
+        mut self,
+        ineligible: bool,
+    ) -> Self {
+        if ineligible && !self.safenlp_shared_prefix_budget_repair {
+            self.mip_reservation_armed = false;
+        }
         self
     }
 
@@ -130,7 +379,44 @@ impl PhaseBudgetLedger {
         let total = self.total?;
         let slice = total.mul_f32(fraction.clamp(0.0, 1.0));
         let overall = self.start + total;
-        Some((Instant::now() + slice).min(overall))
+        let candidate = Instant::now().checked_add(slice).unwrap_or(overall);
+        Some(candidate.min(overall))
+    }
+
+    /// Disjunctive CROWN/alpha-precheck deadline: the from-now fraction slice
+    /// ([`Self::phase_deadline_from_now`]), additionally clamped to the
+    /// optional ABSOLUTE ceiling `policy.disjunctive_precheck_max_secs`
+    /// (#precheck-abs-cap).
+    ///
+    /// A FRACTION bounds nothing here: the slice is `now + total*frac`, so it
+    /// is granted in full no matter how much of the budget the attack phase
+    /// already spent, and the phase it sizes (the CROWN-IBP root collection)
+    /// grows with the model. `disjunctive_precheck_max_secs` bounds the phase
+    /// in absolute terms — the precheck keeps a slice big enough for the work
+    /// it needs and every second it does not spend is reclaimed by BaB, which
+    /// re-bases on [`Self::remaining`]. `None` keeps the pure-fraction slice,
+    /// so every category that does not set the knob is byte-identical.
+    ///
+    /// The cap is measured from NOW (the phase start), matching the from-now
+    /// slice it clamps — unlike `disjunctive_pgd_max_secs`, whose phase is
+    /// anchored at the ledger start.
+    pub(in crate::commands::beta_crown) fn disjunctive_precheck_deadline(
+        &self,
+        fraction: f32,
+    ) -> Option<Instant> {
+        let abs_cap = self.policy.disjunctive_precheck_max_secs.map(|max_secs| {
+            let capped = Instant::now() + Duration::from_secs(max_secs);
+            match self.overall_deadline() {
+                Some(overall) => capped.min(overall),
+                None => capped,
+            }
+        });
+        match (self.phase_deadline_from_now(fraction), abs_cap) {
+            (Some(frac_deadline), Some(cap)) => Some(frac_deadline.min(cap)),
+            (Some(frac_deadline), None) => Some(frac_deadline),
+            // Unbounded total: the absolute ceiling still bounds the phase.
+            (None, cap) => cap,
+        }
     }
 
     /// Attack-phase deadline with a hard cap on tiny budgets.
@@ -147,8 +433,18 @@ impl PhaseBudgetLedger {
         &self,
         fraction: f32,
     ) -> Option<Instant> {
+        self.attack_phase_deadline_with_cap_policy(fraction, pgd_time_cap_disabled())
+    }
+
+    /// Environment-free core used by the disjunctive ledger and differential
+    /// policy tests. `pgd_time_cap_disabled` is captured by the public boundary.
+    fn attack_phase_deadline_with_cap_policy(
+        &self,
+        fraction: f32,
+        pgd_time_cap_disabled: bool,
+    ) -> Option<Instant> {
         let total = self.total?;
-        let capped_fraction = if total <= SMALL_BUDGET_TOTAL && !pgd_time_cap_disabled() {
+        let capped_fraction = if total <= SMALL_BUDGET_TOTAL && !pgd_time_cap_disabled {
             fraction.min(SMALL_BUDGET_ATTACK_FRACTION)
         } else {
             fraction
@@ -167,20 +463,137 @@ impl PhaseBudgetLedger {
     /// bounds that in absolute terms; every second not spent here is reclaimed by
     /// the fast-path BaB, which re-bases on [`Self::remaining`]. `None` leaves the
     /// pure-fraction behavior unchanged.
+    ///
+    /// #attack-floor: the optional `policy.disjunctive_pgd_min_secs` is applied
+    /// LAST, as an absolute FLOOR that outranks the tiny-budget cap. It exists
+    /// for categories where BaB provably cannot decide, so the 15 % cap is pure
+    /// loss (measured on lsnc_relu — see the field docs). The floor is itself
+    /// clamped to HALF the scored total, so BaB always keeps at least half the
+    /// budget and the phase can never pass the overall deadline. `None`
+    /// (default) is byte-identical to before the knob existed.
+    ///
+    /// #attack-anchor: `policy.disjunctive_pgd_from_phase_start` moves the
+    /// anchor from the LEDGER START to the PHASE START (`now`), for both the
+    /// fraction slice and `disjunctive_pgd_max_secs`. The ledger-start anchor
+    /// charges everything that ran before the falsifier — model load, graph
+    /// build, VNN-LIB parse — against the falsifier's own slice, and on a big
+    /// model that consumes all of it: MEASURED on cifar100_2024
+    /// `CIFAR100_resnet_large` at the official 100 s budget with the shipped
+    /// `0.05` fraction, the batched exact-VJP lane got **0.1 s of its 5 s
+    /// slice and took ZERO steps**. The overall deadline still clamps the
+    /// phase, and every second the falsifier does not spend is reclaimed by
+    /// BaB (which re-bases on [`Self::remaining`]).
     pub(in crate::commands::beta_crown) fn disjunctive_pgd_deadline(&self) -> Option<Instant> {
-        let frac_deadline = self.attack_phase_deadline(self.policy.disjunctive_pgd_fraction)?;
-        match self.policy.disjunctive_pgd_max_secs {
+        self.disjunctive_pgd_deadline_with_cap_policy(pgd_time_cap_disabled())
+    }
+
+    /// Environment-free deadline core. The public method captures the exact
+    /// diagnostic input once; tests inject it directly without mutating global
+    /// process state.
+    fn disjunctive_pgd_deadline_with_cap_policy(
+        &self,
+        pgd_time_cap_disabled: bool,
+    ) -> Option<Instant> {
+        let total = self.total?;
+        let from_phase_start = self.policy.disjunctive_pgd_from_phase_start;
+        let frac_deadline = if from_phase_start {
+            self.attack_phase_deadline_from_now(
+                self.policy.disjunctive_pgd_fraction,
+                pgd_time_cap_disabled,
+            )?
+        } else {
+            self.attack_phase_deadline_with_cap_policy(
+                self.policy.disjunctive_pgd_fraction,
+                pgd_time_cap_disabled,
+            )?
+        };
+        let overall = self.overall_deadline();
+        let capped = match self.policy.disjunctive_pgd_max_secs {
             Some(max_secs) => {
-                let abs_cap = self.start + Duration::from_secs(max_secs);
-                Some(frac_deadline.min(abs_cap))
+                let anchor = if from_phase_start {
+                    Instant::now()
+                } else {
+                    self.start
+                };
+                // `max_secs` is an authored u64. A diagnostic or malformed
+                // preset may legitimately contain `u64::MAX`; adding that
+                // duration to an Instant panics on supported platforms. A cap
+                // larger than the whole ledger is semantically inert anyway,
+                // so clamp before checked addition and fall back to the
+                // already-authoritative overall/fraction deadline if the host
+                // Instant range is narrower still.
+                let cap_duration = Duration::from_secs(max_secs).min(total);
+                let abs_cap = anchor
+                    .checked_add(cap_duration)
+                    .or(overall)
+                    .unwrap_or(frac_deadline);
+                // The overall deadline still binds: a from-phase-start cap can
+                // never push the falsifier past the scored budget.
+                let abs_cap = overall.map_or(abs_cap, |o| abs_cap.min(o));
+                frac_deadline.min(abs_cap)
             }
-            None => Some(frac_deadline),
+            None => frac_deadline,
+        };
+        let floored = self
+            .disjunctive_pgd_floor()
+            .map_or(capped, |f| capped.max(f));
+        // The floor is the last word on the slice, but never on the budget: a
+        // phase-start-anchored floor is clamped back to the scored deadline.
+        Some(overall.map_or(floored, |o| floored.min(o)))
+    }
+
+    /// [`Self::attack_phase_deadline`] measured from NOW (#attack-anchor).
+    /// Applies the same tiny-budget attack cap, then defers to
+    /// [`Self::phase_deadline_from_now`], which already clamps to the overall
+    /// deadline.
+    fn attack_phase_deadline_from_now(
+        &self,
+        fraction: f32,
+        pgd_time_cap_disabled: bool,
+    ) -> Option<Instant> {
+        let total = self.total?;
+        let capped_fraction = if total <= SMALL_BUDGET_TOTAL && !pgd_time_cap_disabled {
+            fraction.min(SMALL_BUDGET_ATTACK_FRACTION)
+        } else {
+            fraction
+        };
+        self.phase_deadline_from_now(capped_fraction)
+    }
+
+    /// #attack-floor: `anchor + min(disjunctive_pgd_min_secs, total/2)`, or
+    /// `None` when the knob is unset/zero or the ledger is unbounded.
+    ///
+    /// The anchor is the ledger start, or — under #attack-anchor
+    /// (`disjunctive_pgd_from_phase_start`) — the PHASE start, so that "give the
+    /// falsifier N seconds" means N seconds of falsification rather than N
+    /// seconds minus whatever model load and spec parsing already cost. The
+    /// half-budget clamp is unchanged, and the caller clamps the result to the
+    /// overall deadline, so BaB can never be starved past the scored budget.
+    fn disjunctive_pgd_floor(&self) -> Option<Instant> {
+        let total = self.total?;
+        let min_secs = self.policy.disjunctive_pgd_min_secs?;
+        if min_secs == 0 {
+            return None;
         }
+        let anchor = if self.policy.disjunctive_pgd_from_phase_start {
+            Instant::now()
+        } else {
+            self.start
+        };
+        let requested = Duration::from_secs(min_secs);
+        Some(anchor + requested.min(total.mul_f32(0.5)))
     }
 
     /// Wall-clock time remaining, or `None` if unbounded.
     pub(in crate::commands::beta_crown) fn remaining(&self) -> Option<Duration> {
         self.total.map(|d| d.saturating_sub(self.start.elapsed()))
+    }
+
+    /// Remaining duration for legacy engine APIs that cannot express an
+    /// optional deadline.
+    pub(in crate::commands::beta_crown) fn remaining_for_engine(&self) -> Duration {
+        self.remaining()
+            .unwrap_or_else(operational_unbounded_timeout)
     }
 
     /// Remaining wall-clock seconds, clamped to `[0, u64::MAX]`.
@@ -216,15 +629,94 @@ impl PhaseBudgetLedger {
         // request a zero MIP slice leave this unarmed.
         if self.mip_reservation_armed {
             if let Some(reserved) = self.mip_reserved_slice() {
-                bab = bab.saturating_sub(reserved).max(total.mul_f32(0.5));
+                bab = bab.saturating_sub(reserved);
+                if !self.safenlp_shared_prefix_budget_repair {
+                    bab = bab.max(total.mul_f32(0.5));
+                }
             }
         }
         Some(self.start + bab)
     }
 
+    /// BaB deadline for the default-dark SafeNLP shared-prefix experiment.
+    ///
+    /// Same-LHS reduced verification historically receives no absolute
+    /// deadline and intentionally owns the full remaining wall clock (needed
+    /// by ACAS-Xu). Only the exact shared-prefix treatment may interrupt that
+    /// historical lane early enough to reach its reserved MIP slice.
+    pub(in crate::commands::beta_crown) fn safenlp_shared_prefix_bab_deadline(
+        &self,
+    ) -> Option<Instant> {
+        self.safenlp_shared_prefix_budget_repair
+            .then(|| self.bab_deadline())
+            .flatten()
+    }
+
     /// Access the underlying policy for callers that need specific fractions.
     pub(in crate::commands::beta_crown) fn policy(&self) -> &PhaseBudgetConfig {
         &self.policy
+    }
+
+    /// Emit the complete phase-ledger allocation under the shared dark
+    /// `NY_PHASE_TELEMETRY=1` gate.
+    ///
+    /// This is deliberately print-only: deadlines and policy values are read
+    /// after they have already been computed, and no returned value can affect
+    /// scheduling or proof authority. Planned deadline fields are offsets from
+    /// this ledger's own start; `elapsed_s`/`remaining_s` expose nested-ledger
+    /// rebasing (notably disjunctive PGD -> graph multi-objective BaB).
+    pub(in crate::commands::beta_crown) fn emit_telemetry(&self, label: &str) {
+        if !phase_telemetry_enabled() {
+            return;
+        }
+        eprintln!("{}", self.telemetry_line(label, Instant::now()));
+    }
+
+    /// Pure formatter used by [`Self::emit_telemetry`] and deterministic tests.
+    fn telemetry_line(&self, label: &str, now: Instant) -> String {
+        fn duration_field(value: Option<Duration>) -> String {
+            value.map_or_else(
+                || "none".to_string(),
+                |duration| format!("{:.3}", duration.as_secs_f64()),
+            )
+        }
+
+        let elapsed = now.saturating_duration_since(self.start);
+        let remaining = self.total.map(|total| total.saturating_sub(elapsed));
+        let offset = |deadline: Option<Instant>| {
+            deadline.map(|instant| instant.saturating_duration_since(self.start))
+        };
+        let pgd_cap = self
+            .policy
+            .disjunctive_pgd_max_secs
+            .map(Duration::from_secs);
+        let mip_reserved = if self.mip_reservation_armed {
+            self.mip_reserved_slice()
+        } else {
+            None
+        };
+
+        format!(
+            "[budget] {label} total_s={} elapsed_s={} remaining_s={} \
+             disj_pgd_end_s={} bab_end_s={} overall_end_s={} \
+             initial_bounds_fraction={:.3} post_bab_pgd_fraction={:.3} \
+             disjunctive_pgd_fraction={:.3} disjunctive_pgd_cap_s={} \
+             mip_reservation_armed={} mip_reserved_s={} \
+             safenlp_shared_prefix_budget_repair={}",
+            duration_field(self.total),
+            duration_field(Some(elapsed)),
+            duration_field(remaining),
+            duration_field(offset(self.disjunctive_pgd_deadline())),
+            duration_field(offset(self.bab_deadline())),
+            duration_field(offset(self.overall_deadline())),
+            self.policy.initial_bounds_fraction,
+            self.policy.post_bab_pgd_fraction,
+            self.policy.disjunctive_pgd_fraction,
+            duration_field(pgd_cap),
+            self.mip_reservation_armed,
+            duration_field(mip_reserved),
+            self.safenlp_shared_prefix_budget_repair,
+        )
     }
 
     /// Per-clause timeout for constraint iteration.
@@ -279,16 +771,63 @@ impl PhaseBudgetLedger {
         // final phase-split slice (15/16 subproblems, no verdict), so the
         // reservation costs nothing on that class; a genuinely-late MIP proof
         // loses at most 3s of its final slice. Larger budgets are unchanged.
-        let small_budget_attack_reserve = if total <= Duration::from_secs(25) {
-            3
-        } else {
+        let small_budget_attack_reserve = if self.safenlp_shared_prefix_budget_repair {
             0
+        } else {
+            small_budget_postbab_mip_reserve(total, self.post_bab_wrapper_attack_enabled).as_secs()
         };
         // Hard invariant: a phase-local timeout may not exceed the enclosing
         // wall-clock budget.  Reservation (armed or not) only determines how
         // much time BaB leaves; it does not authorize borrowing beyond the
         // overall deadline.
         Some(remaining_secs.saturating_sub(small_budget_attack_reserve))
+    }
+
+    /// Absolute deadline for a MIP escalation started now.
+    ///
+    /// This is the live [`Self::mip_timeout`] grant capped at the enclosing
+    /// overall deadline. On small budgets it therefore preserves the final
+    /// falsification reserve instead of handing the solver the entire
+    /// remaining wall clock.
+    #[cfg_attr(all(not(feature = "mip"), not(test)), allow(dead_code))]
+    pub(in crate::commands::beta_crown) fn mip_deadline(&self) -> Option<Instant> {
+        let overall = self.overall_deadline()?;
+        let grant = Duration::from_secs(self.mip_timeout()?);
+        let candidate = Instant::now().checked_add(grant).unwrap_or(overall);
+        Some(candidate.min(overall))
+    }
+
+    /// Deterministic production-schedule probe used by dispatch regressions:
+    /// how many whole seconds would MIP receive if BaB returned exactly at its
+    /// planned deadline? This mirrors [`Self::mip_timeout`] without sleeping or
+    /// rebasing either absolute deadline.
+    #[cfg(test)]
+    pub(in crate::commands::beta_crown) fn planned_mip_timeout_at_bab_deadline(
+        &self,
+    ) -> Option<u64> {
+        let total = self.total?;
+        let bab_deadline = self.bab_deadline()?;
+        let remaining_secs = self
+            .overall_deadline()?
+            .saturating_duration_since(bab_deadline)
+            .as_secs();
+        let small_budget_attack_reserve = if self.safenlp_shared_prefix_budget_repair {
+            0
+        } else {
+            small_budget_postbab_mip_reserve(total, self.post_bab_wrapper_attack_enabled).as_secs()
+        };
+        Some(remaining_secs.saturating_sub(small_budget_attack_reserve))
+    }
+
+    // The only consumer is `dispatch`'s `#[cfg(all(test, feature = "mip"))]`
+    // module, so a non-mip test build legitimately sees this accessor as dead.
+    // Keep it compiled in both builds instead of narrowing the `cfg` — a
+    // non-mip regression must be able to read the arming flag without first
+    // re-widening the gate.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "mip"), allow(dead_code))]
+    pub(in crate::commands::beta_crown) fn mip_reservation_armed_for_test(&self) -> bool {
+        self.mip_reservation_armed
     }
 }
 
@@ -297,12 +836,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn small_budget_postbab_tail_uses_independent_wrapper_policy() {
+        assert!(small_budget_postbab_tail_armed(None));
+        assert!(small_budget_postbab_tail_armed(Some(true)));
+        assert!(!small_budget_postbab_tail_armed(Some(false)));
+        assert_eq!(
+            small_budget_postbab_mip_reserve(Duration::from_secs(25), Some(true)),
+            Duration::from_secs(3),
+            "the inclusive small-budget boundary retains the attack tail"
+        );
+        assert_eq!(
+            small_budget_postbab_mip_reserve(Duration::from_secs(26), Some(true)),
+            Duration::ZERO,
+            "larger totals leave MIP untouched"
+        );
+        assert_eq!(
+            small_budget_postbab_mip_reserve(Duration::from_secs(25), Some(false)),
+            Duration::ZERO,
+            "an explicit wrapper opt-out has no outer attack consumer"
+        );
+    }
+
+    #[test]
     fn ledger_unbounded_timeout_returns_none_deadlines() {
         let ledger = PhaseBudgetLedger::new(0, PhaseBudgetConfig::default());
         assert!(ledger.overall_deadline().is_none());
         assert!(ledger.upfront_pgd_deadline().is_none());
         assert!(ledger.remaining().is_none());
         assert_eq!(ledger.remaining_secs_clamped(), u64::MAX);
+        let engine_timeout = ledger.remaining_for_engine();
+        assert!(engine_timeout >= Duration::from_hours(24));
+        assert!(Instant::now().checked_add(engine_timeout).is_some());
+    }
+
+    #[test]
+    fn exact_zero_duration_is_an_exhausted_bounded_budget() {
+        let ledger =
+            PhaseBudgetLedger::new_duration(Some(Duration::ZERO), PhaseBudgetConfig::default());
+        let deadline = ledger.overall_deadline().expect("bounded");
+        assert!(deadline <= Instant::now());
+        assert_eq!(ledger.remaining(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn existing_deadline_is_not_reanchored() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ledger = PhaseBudgetLedger::from_deadline(Some(deadline), PhaseBudgetConfig::default());
+        assert_eq!(ledger.overall_deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn expired_deadline_is_not_reanchored() {
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second before now is representable");
+        let ledger = PhaseBudgetLedger::from_deadline(Some(deadline), PhaseBudgetConfig::default());
+        assert_eq!(ledger.overall_deadline(), Some(deadline));
+        assert_eq!(ledger.remaining(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn mip_deadline_never_exceeds_overall_deadline() {
+        let ledger = PhaseBudgetLedger::new(100, PhaseBudgetConfig::default());
+        assert!(ledger.mip_deadline().expect("bounded") <= ledger.overall_deadline().unwrap());
+    }
+
+    #[test]
+    fn small_budget_mip_deadline_preserves_attack_tail() {
+        // Assert the POLICY, not the clock.
+        //
+        // This used to compare `overall_deadline()` against `mip_deadline()`.
+        // The ledger anchors `overall` at construction, but `mip_deadline()`
+        // reads `Instant::now()` a SECOND time and adds the grant to it, so the
+        // measured gap is `total - grant - (elapsed between the two reads)`.
+        // With the tail sized at exactly three seconds, any scheduling delay at
+        // all pushes it under and the test fails — which is why it only ever
+        // failed inside a loaded parallel workspace run and passed 5/5 in
+        // isolation.
+        //
+        // `mip_timeout()` is the quantity the reserve actually governs, and the
+        // property that matters is that the grant leaves the tail inside the
+        // budget. That is clock-independent.
+        let total_secs = 20;
+        let ledger = PhaseBudgetLedger::new(total_secs, PhaseBudgetConfig::default());
+        let grant = ledger.mip_timeout().expect("bounded");
+        assert!(
+            total_secs - grant >= 3,
+            "small-budget MIP grant must leave the configured three-second tail: \
+             total={total_secs}s grant={grant}s"
+        );
+        // And the absolute deadline still respects the enclosing budget.
+        assert!(
+            ledger.mip_deadline().expect("bounded") <= ledger.overall_deadline().expect("bounded"),
+            "the MIP deadline may never exceed the overall deadline"
+        );
     }
 
     #[test]
@@ -312,6 +939,36 @@ mod tests {
         assert!(ledger.upfront_pgd_deadline().is_some());
         assert!(ledger.remaining().is_some());
         assert!(ledger.remaining_secs_clamped() <= 100);
+    }
+
+    #[test]
+    fn budget_telemetry_exposes_planned_offsets_and_nested_elapsed_time() {
+        let policy = PhaseBudgetConfig {
+            initial_bounds_fraction: 0.15,
+            disjunctive_pgd_fraction: 0.40,
+            disjunctive_pgd_max_secs: Some(30),
+            post_bab_pgd_fraction: 0.10,
+            ..Default::default()
+        };
+        let ledger = PhaseBudgetLedger::new(100, policy).with_mip_reservation(false);
+        let line = ledger.telemetry_line(
+            "disjunctive-graph-handoff",
+            ledger.start + Duration::from_secs(30),
+        );
+        assert!(line.starts_with("[budget] disjunctive-graph-handoff "));
+        assert!(line.contains("total_s=100.000"));
+        assert!(line.contains("elapsed_s=30.000"));
+        assert!(line.contains("remaining_s=70.000"));
+        assert!(line.contains("disj_pgd_end_s=30.000"));
+        assert!(line.contains("bab_end_s=90.000"));
+        assert!(line.contains("overall_end_s=100.000"));
+        assert!(line.contains("initial_bounds_fraction=0.150"));
+        assert!(line.contains("post_bab_pgd_fraction=0.100"));
+        assert!(line.contains("disjunctive_pgd_fraction=0.400"));
+        assert!(line.contains("disjunctive_pgd_cap_s=30.000"));
+        assert!(line.contains("mip_reservation_armed=false"));
+        assert!(line.contains("mip_reserved_s=none"));
+        assert!(line.contains("safenlp_shared_prefix_budget_repair=false"));
     }
 
     #[test]
@@ -387,6 +1044,36 @@ mod tests {
             mip >= 99,
             "large-budget grant must be untouched (got {mip}s)"
         );
+
+        // Engine and wrapper policies are independent. Exercise the complete
+        // 2x2 matrix: only the outer wrapper decision controls this reserve.
+        for (engine_fraction, wrapper_enabled, expect_reserve) in [
+            (0.0, true, true),
+            (0.0, false, false),
+            (0.1, true, true),
+            (0.1, false, false),
+        ] {
+            let ledger = PhaseBudgetLedger::new(
+                15,
+                PhaseBudgetConfig {
+                    post_bab_pgd_fraction: engine_fraction,
+                    ..Default::default()
+                },
+            )
+            .with_post_bab_wrapper_attack(Some(wrapper_enabled));
+            let mip = ledger.mip_timeout().expect("bounded");
+            if expect_reserve {
+                assert!(
+                    mip <= 12,
+                    "wrapper-on fraction={engine_fraction} must reserve 3s (got {mip}s)"
+                );
+            } else {
+                assert!(
+                    mip >= 14,
+                    "wrapper-off fraction={engine_fraction} must reclaim the tail (got {mip}s)"
+                );
+            }
+        }
     }
 
     #[test]
@@ -445,6 +1132,195 @@ mod tests {
         let deadline = ledger.attack_phase_deadline(0.50).expect("bounded");
         let slice = deadline.duration_since(ledger.start);
         assert_eq!(slice, Duration::from_secs(20).mul_f32(0.15));
+    }
+
+    /// #attack-anchor — the defect, reproduced without a clock read: with the
+    /// LEDGER-START anchor, work that ran before the falsifier is charged
+    /// against the falsifier's own slice, and enough of it leaves the phase
+    /// with nothing. cifar100 shape: 100s budget, `disjunctive_pgd_fraction`
+    /// 0.05 (a 5s slice), 4.9s already spent on model load / graph build /
+    /// VNN-LIB parse.
+    #[test]
+    fn ledger_start_anchor_charges_setup_time_to_the_falsifier() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_pgd_fraction: 0.05,
+            disjunctive_pgd_max_secs: Some(30),
+            ..Default::default()
+        };
+        // The ledger started 4.9s ago; only 0.1s of the 5s slice is left.
+        let start = Instant::now()
+            .checked_sub(Duration::from_millis(4_900))
+            .expect("4.9s before now is representable");
+        let ledger =
+            PhaseBudgetLedger::from_start_and_total(start, Some(Duration::from_secs(100)), policy);
+        let left = ledger
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            left < Duration::from_millis(400),
+            "ledger-start anchor leaves the falsifier ~0.1s, got {left:?}"
+        );
+    }
+
+    /// #attack-anchor — the fix: the same 4.9s of setup, and the phase gets the
+    /// 5% the preset actually asked for, measured from the phase start.
+    #[test]
+    fn phase_start_anchor_delivers_the_fraction_the_preset_asked_for() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_pgd_fraction: 0.05,
+            disjunctive_pgd_max_secs: Some(30),
+            disjunctive_pgd_from_phase_start: true,
+            ..Default::default()
+        };
+        let start = Instant::now()
+            .checked_sub(Duration::from_millis(4_900))
+            .expect("4.9s before now is representable");
+        let ledger =
+            PhaseBudgetLedger::from_start_and_total(start, Some(Duration::from_secs(100)), policy);
+        let left = ledger
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            left > Duration::from_millis(4_500) && left <= Duration::from_secs(5),
+            "phase-start anchor must grant ~5s, got {left:?}"
+        );
+    }
+
+    /// #attack-anchor — the phase-start anchor can never push the falsifier
+    /// past the scored budget, however large the fraction or the cap.
+    #[test]
+    fn phase_start_anchor_never_passes_the_overall_deadline() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_pgd_fraction: 0.90,
+            disjunctive_pgd_max_secs: Some(300),
+            disjunctive_pgd_from_phase_start: true,
+            ..Default::default()
+        };
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(90))
+            .expect("90s before now is representable");
+        let ledger =
+            PhaseBudgetLedger::from_start_and_total(start, Some(Duration::from_secs(100)), policy);
+        let deadline = ledger.disjunctive_pgd_deadline().expect("bounded");
+        assert!(
+            deadline <= ledger.overall_deadline().expect("bounded"),
+            "phase-start anchor must stay inside the scored budget"
+        );
+    }
+
+    /// #attack-anchor — default `false` is byte-identical to before the knob.
+    #[test]
+    fn phase_start_anchor_is_inert_by_default() {
+        for max_secs in [None, Some(30)] {
+            let base = PhaseBudgetConfig {
+                disjunctive_pgd_fraction: 0.05,
+                disjunctive_pgd_max_secs: max_secs,
+                ..Default::default()
+            };
+            let start = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("two seconds before now is representable");
+            let baseline = PhaseBudgetLedger::from_start_and_total(
+                start,
+                Some(Duration::from_secs(100)),
+                base.clone(),
+            );
+            let explicit = PhaseBudgetLedger::from_start_and_total(
+                start,
+                Some(Duration::from_secs(100)),
+                PhaseBudgetConfig {
+                    disjunctive_pgd_from_phase_start: false,
+                    ..base
+                },
+            );
+            assert_eq!(
+                baseline
+                    .disjunctive_pgd_deadline()
+                    .expect("bounded")
+                    .duration_since(start),
+                explicit
+                    .disjunctive_pgd_deadline()
+                    .expect("bounded")
+                    .duration_since(start),
+                "max_secs={max_secs:?}"
+            );
+        }
+    }
+
+    /// #attack-floor — the opt-in absolute floor outranks the tiny-budget cap.
+    /// lsnc_relu at its measured 20s internal budget: the cap alone gives the
+    /// disjunctive attack 3.0s and the ORT-confirmed `quadrotor2d_state_34`
+    /// counterexample lands ~3.6s in (measured), so the row times out; the 5s
+    /// floor restores it.
+    #[test]
+    fn disjunctive_pgd_floor_outranks_the_small_budget_cap() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_pgd_min_secs: Some(5),
+            ..Default::default()
+        };
+        let ledger = PhaseBudgetLedger::new(20, policy);
+        let slice = ledger
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .duration_since(ledger.start);
+        assert_eq!(slice, Duration::from_secs(5), "floor must beat the 3s cap");
+    }
+
+    /// The floor NEVER takes more than half the scored budget, so BaB keeps at
+    /// least half however large the requested floor is.
+    #[test]
+    fn disjunctive_pgd_floor_is_clamped_to_half_the_budget() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_pgd_min_secs: Some(999),
+            ..Default::default()
+        };
+        let ledger = PhaseBudgetLedger::new(20, policy);
+        let slice = ledger
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .duration_since(ledger.start);
+        assert_eq!(slice, Duration::from_secs(10));
+    }
+
+    /// Unset (and explicit `0`) leave the phase byte-identical to the pure
+    /// cap/ceiling behavior — no other category can be perturbed by this knob.
+    #[test]
+    fn disjunctive_pgd_floor_unset_or_zero_is_byte_identical() {
+        let baseline = PhaseBudgetLedger::new(20, PhaseBudgetConfig::default());
+        let baseline_slice = baseline
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .duration_since(baseline.start);
+        for min_secs in [None, Some(0)] {
+            let policy = PhaseBudgetConfig {
+                disjunctive_pgd_min_secs: min_secs,
+                ..Default::default()
+            };
+            let ledger = PhaseBudgetLedger::new(20, policy);
+            let slice = ledger
+                .disjunctive_pgd_deadline()
+                .expect("bounded")
+                .duration_since(ledger.start);
+            assert_eq!(slice, baseline_slice, "min_secs={min_secs:?} must be inert");
+        }
+    }
+
+    /// A floor BELOW the already-granted slice cannot shrink the phase (it is a
+    /// floor, not a cap): a large budget keeps its full fraction.
+    #[test]
+    fn disjunctive_pgd_floor_never_shrinks_a_larger_slice() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_pgd_min_secs: Some(5),
+            ..Default::default()
+        };
+        let ledger = PhaseBudgetLedger::new(200, policy);
+        let slice = ledger
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .duration_since(ledger.start);
+        assert_eq!(slice, Duration::from_secs(200).mul_f32(0.50));
     }
 
     #[test]
@@ -506,6 +1382,82 @@ mod tests {
     }
 
     #[test]
+    fn disjunctive_pgd_deadline_u64_max_cap_is_inert_and_cannot_overflow() {
+        // The authored cap is an unconstrained u64. It is a ceiling, so a cap
+        // larger than the whole ledger must behave like no cap rather than
+        // panicking while constructing `start + Duration::MAX`.
+        for from_phase_start in [false, true] {
+            let policy = PhaseBudgetConfig {
+                disjunctive_pgd_fraction: 0.20,
+                disjunctive_pgd_max_secs: Some(u64::MAX),
+                disjunctive_pgd_from_phase_start: from_phase_start,
+                ..Default::default()
+            };
+            let ledger = PhaseBudgetLedger::new(100, policy);
+            let deadline = ledger.disjunctive_pgd_deadline().expect("bounded");
+            if !from_phase_start {
+                assert_eq!(
+                    deadline.duration_since(ledger.start),
+                    Duration::from_secs(20)
+                );
+            }
+            assert!(deadline <= ledger.overall_deadline().expect("bounded"));
+        }
+    }
+
+    #[test]
+    fn collins_runtime_slice_matches_the_nominal_plan_at_tiers_and_boundary() {
+        for from_phase_start in [false, true] {
+            for min_secs in [None, Some(20)] {
+                let policy = PhaseBudgetConfig {
+                    disjunctive_pgd_fraction: 0.50,
+                    disjunctive_pgd_max_secs: Some(15),
+                    disjunctive_pgd_min_secs: min_secs,
+                    disjunctive_pgd_from_phase_start: from_phase_start,
+                    ..Default::default()
+                };
+                for pgd_time_cap_disabled in [false, true] {
+                    for total_secs in [25_u64, 30, 31, 285, 570, 1140] {
+                        let ledger = PhaseBudgetLedger::new(total_secs, policy.clone());
+                        let before = Instant::now();
+                        let deadline = ledger
+                            .disjunctive_pgd_deadline_with_cap_policy(pgd_time_cap_disabled)
+                            .expect("bounded");
+                        let after = Instant::now();
+                        let nominal_slice =
+                            crate::plan_resolver::planned_disjunctive_pgd_slice_secs(
+                                total_secs,
+                                0.50,
+                                Some(15),
+                                min_secs,
+                                pgd_time_cap_disabled,
+                            );
+                        if from_phase_start {
+                            // The runtime samples its anchor between these two
+                            // clocks. Bracket the exact nominal duration without
+                            // assuming a zero-cost call.
+                            let lower = deadline.saturating_duration_since(after).as_secs_f64();
+                            let upper = deadline.saturating_duration_since(before).as_secs_f64();
+                            assert!(
+                                lower <= nominal_slice && nominal_slice <= upper,
+                                "total={total_secs}, min={min_secs:?}, cap_disabled={pgd_time_cap_disabled}: \
+                                 nominal={nominal_slice}, bracket=[{lower},{upper}]"
+                            );
+                        } else {
+                            let runtime_slice = deadline.duration_since(ledger.start).as_secs_f64();
+                            assert_eq!(
+                                runtime_slice, nominal_slice,
+                                "total={total_secs}, min={min_secs:?}, \
+                                 cap_disabled={pgd_time_cap_disabled}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn disjunctive_pgd_deadline_cap_inactive_when_fraction_smaller() {
         // At a small budget the fraction slice is already under the cap, so the
         // cap is a no-op (0.20 * 100s = 20s < 30s cap).
@@ -530,6 +1482,109 @@ mod tests {
         };
         let ledger = PhaseBudgetLedger::new(0, policy);
         assert!(ledger.disjunctive_pgd_deadline().is_none());
+    }
+
+    /// TEETH for #reclaim-pgd at relusplitter's REAL official budgets.
+    ///
+    /// relusplitter runs four budgets — 30/60/90/180 s — against the sealed default
+    /// `disjunctive_pgd_fraction: 0.50`. This pins exactly what
+    /// `configs/vnncomp25/relusplitter.yaml`'s `disjunctive_pgd_max_secs: 5` does at
+    /// each one, INCLUDING the budget where it is deliberately inert. Changing the
+    /// preset value without re-measuring moves these numbers.
+    #[test]
+    fn relusplitter_pgd_cap_reclaims_at_official_budgets() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_pgd_max_secs: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.disjunctive_pgd_fraction, 0.50,
+            "relusplitter does not override the fraction — this arithmetic assumes \
+             the sealed default"
+        );
+
+        // 30 s (mnist_fc rows): the pre-existing small-budget attack cap already
+        // holds the slice to 0.15 * 30 = 4.5 s, which is BELOW the 5 s ceiling, so
+        // the ceiling is INERT here. This is the `min` direction that matters: an
+        // absolute CAP must never LENGTHEN a phase, or it would steal budget from
+        // the bound phases that actually produce verdicts.
+        let ledger = PhaseBudgetLedger::new(30, policy.clone());
+        let slice = ledger
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .duration_since(ledger.start);
+        assert_eq!(
+            slice,
+            Duration::from_secs(30).mul_f32(0.15),
+            "the 5s ceiling must not lengthen the already-smaller 30s attack slice",
+        );
+
+        // 60 / 90 / 180 s: the fraction grants 30 / 45 / 90 s and the ceiling holds
+        // each to 5 s. The reclaimed remainder flows to BaB, which re-bases on
+        // `remaining()`.
+        for (total_secs, uncapped_secs) in [(60_u64, 30_u64), (90, 45), (180, 90)] {
+            let baseline = PhaseBudgetLedger::new(total_secs, PhaseBudgetConfig::default());
+            let baseline_slice = baseline
+                .disjunctive_pgd_deadline()
+                .expect("bounded")
+                .duration_since(baseline.start);
+            assert_eq!(
+                baseline_slice,
+                Duration::from_secs(uncapped_secs),
+                "uncapped {total_secs}s budget grants the plain 0.50 fraction",
+            );
+
+            let capped_ledger = PhaseBudgetLedger::new(total_secs, policy.clone());
+            let capped_slice = capped_ledger
+                .disjunctive_pgd_deadline()
+                .expect("bounded")
+                .duration_since(capped_ledger.start);
+            assert_eq!(
+                capped_slice,
+                Duration::from_secs(5),
+                "the absolute ceiling must bind at a {total_secs}s budget",
+            );
+            assert!(
+                capped_slice < baseline_slice,
+                "the ceiling must actually reclaim time at {total_secs}s: \
+                 capped={capped_slice:?} baseline={baseline_slice:?}",
+            );
+            assert!(
+                capped_slice < Duration::from_secs(total_secs),
+                "an attack slice must stay strictly inside the overall budget",
+            );
+        }
+    }
+
+    /// The ceiling bounds an ATTACK phase and NOTHING else. Every bound-producing
+    /// phase — initial bounds, reduced verification, MIP, post-BaB reservation —
+    /// must be byte-identical with and without it.
+    ///
+    /// This is the machine-checkable half of the soundness argument for
+    /// #reclaim-pgd: a knob that cannot shorten a bound phase cannot change which
+    /// verdicts are provable, so it cannot turn an `unknown` into an `unsat`.
+    #[test]
+    fn disjunctive_pgd_cap_does_not_move_any_bound_phase() {
+        let baseline = PhaseBudgetLedger::new(180, PhaseBudgetConfig::default());
+        let capped = PhaseBudgetLedger::new(
+            180,
+            PhaseBudgetConfig {
+                disjunctive_pgd_max_secs: Some(5),
+                ..Default::default()
+            },
+        );
+
+        for fraction in [0.05_f32, 0.20, 0.40, 0.50, 1.0] {
+            assert_eq!(
+                baseline
+                    .phase_deadline(fraction)
+                    .map(|d| d.duration_since(baseline.start)),
+                capped
+                    .phase_deadline(fraction)
+                    .map(|d| d.duration_since(capped.start)),
+                "phase_deadline({fraction}) must be unaffected by the attack ceiling",
+            );
+        }
     }
 
     #[test]
@@ -571,6 +1626,68 @@ mod tests {
         assert!(ledger.phase_deadline_from_now(0.20).is_none());
     }
 
+    /// #precheck-abs-cap: with no absolute ceiling the precheck deadline is
+    /// exactly the from-now fraction slice — every category that does not set
+    /// the knob is byte-identical.
+    #[test]
+    fn disjunctive_precheck_deadline_without_cap_is_the_fraction_slice() {
+        let ledger = PhaseBudgetLedger::new(900, PhaseBudgetConfig::default());
+        assert!(ledger.policy().disjunctive_precheck_max_secs.is_none());
+        let before = Instant::now();
+        let deadline = ledger.disjunctive_precheck_deadline(0.85).expect("bounded");
+        let slice = deadline.duration_since(before);
+        // 0.85 * 900 = 765s from now (clamped only by the overall deadline).
+        assert!(slice >= Duration::from_secs(764), "slice={slice:?}");
+        assert!(slice <= Duration::from_secs(766), "slice={slice:?}");
+    }
+
+    /// #precheck-abs-cap: the absolute ceiling wins over a ballooned fraction.
+    #[test]
+    fn disjunctive_precheck_deadline_respects_the_absolute_ceiling() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_precheck_max_secs: Some(250),
+            ..PhaseBudgetConfig::default()
+        };
+        let ledger = PhaseBudgetLedger::new(900, policy);
+        let before = Instant::now();
+        let deadline = ledger.disjunctive_precheck_deadline(0.85).expect("bounded");
+        let slice = deadline.duration_since(before);
+        assert!(slice <= Duration::from_secs(251), "slice={slice:?}");
+        assert!(slice >= Duration::from_secs(249), "slice={slice:?}");
+    }
+
+    /// #precheck-abs-cap: a ceiling LARGER than the fraction slice never
+    /// extends the phase, and the overall deadline still dominates.
+    #[test]
+    fn disjunctive_precheck_deadline_ceiling_never_extends_the_slice() {
+        let policy = PhaseBudgetConfig {
+            disjunctive_precheck_max_secs: Some(10_000),
+            ..PhaseBudgetConfig::default()
+        };
+        let ledger = PhaseBudgetLedger::new(100, policy);
+        let deadline = ledger.disjunctive_precheck_deadline(0.20).expect("bounded");
+        let overall = ledger.overall_deadline().expect("bounded");
+        assert!(deadline <= overall);
+        let slice = deadline.saturating_duration_since(Instant::now());
+        assert!(slice <= Duration::from_secs(21), "slice={slice:?}");
+    }
+
+    /// #precheck-abs-cap: on an UNBOUNDED ledger the fraction yields nothing,
+    /// so the absolute ceiling is the only bound the phase has.
+    #[test]
+    fn disjunctive_precheck_deadline_unbounded_uses_only_the_ceiling() {
+        let unbounded = PhaseBudgetLedger::new(0, PhaseBudgetConfig::default());
+        assert!(unbounded.disjunctive_precheck_deadline(0.85).is_none());
+        let policy = PhaseBudgetConfig {
+            disjunctive_precheck_max_secs: Some(30),
+            ..PhaseBudgetConfig::default()
+        };
+        let capped = PhaseBudgetLedger::new(0, policy);
+        let deadline = capped.disjunctive_precheck_deadline(0.85).expect("capped");
+        let slice = deadline.saturating_duration_since(Instant::now());
+        assert!(slice <= Duration::from_secs(31), "slice={slice:?}");
+    }
+
     /// FIX 2 — armed reservation math: the BaB deadline carves the MIP slice
     /// (`total*mip_min_fraction` clamped `[mip_min_secs, mip_max_secs]`) out of
     /// the scored budget, floored at half the total.
@@ -598,6 +1715,341 @@ mod tests {
             delta + Duration::from_secs(1) >= reserved && delta <= reserved,
             "armed BaB deadline must reserve the MIP slice (delta={delta:?}, reserved={reserved:?})"
         );
+    }
+
+    /// #deadlane — a STATICALLY ineligible Graph-MIP escalation must not reserve
+    /// any of the scored budget: BaB gets the slice back (measured 23 s of
+    /// vit_2023's 95 s internal tier), while an ELIGIBLE net keeps the
+    /// reservation byte-identically. The reclaimed time stays INSIDE the scored
+    /// budget — `overall_deadline` is untouched, so the watchdog still bounds it.
+    #[test]
+    fn static_mip_ineligibility_returns_the_reserved_slice_to_bab() {
+        let policy = PhaseBudgetConfig::default();
+        let armed = PhaseBudgetLedger::new(120, policy.clone()).with_mip_reservation(true);
+        let mut reclaimed = PhaseBudgetLedger::new(120, policy.clone())
+            .with_mip_reservation(true)
+            .with_static_mip_ineligibility(true);
+        let mut still_armed = PhaseBudgetLedger::new(120, policy)
+            .with_mip_reservation(true)
+            .with_static_mip_ineligibility(false);
+        // Remove constructor-time skew so the arithmetic compares exactly.
+        reclaimed.start = armed.start;
+        still_armed.start = armed.start;
+
+        assert!(
+            reclaimed.bab_deadline().expect("bounded") > armed.bab_deadline().expect("bounded"),
+            "a statically-impossible escalation must not shorten BaB's deadline"
+        );
+        assert_eq!(
+            still_armed.bab_deadline(),
+            armed.bab_deadline(),
+            "an ELIGIBLE net keeps the reservation byte-identically"
+        );
+        // The reclaim never pushes BaB past the scored deadline.
+        assert!(
+            reclaimed.bab_deadline().expect("bounded")
+                <= reclaimed.overall_deadline().expect("bounded"),
+            "the reclaimed BaB deadline must stay inside the scored budget"
+        );
+    }
+
+    /// The SafeNLP treatment keeps the full policy-sized reservation through a
+    /// graph-static decline because production can still reload a sequential
+    /// network. On the official 15-second internal tier this also bypasses the
+    /// historical half-budget clamp and three-second attack tail, leaving a
+    /// dispatch-admissible AY-MIP grant.
+    #[test]
+    fn safenlp_shared_prefix_repair_makes_the_policy_slice_reachable() {
+        let policy = PhaseBudgetConfig {
+            mip_min_fraction: 0.65,
+            mip_min_secs: 8,
+            mip_max_secs: 30,
+            post_bab_pgd_fraction: 0.10,
+            ..PhaseBudgetConfig::default()
+        };
+        let historical = PhaseBudgetLedger::new(15, policy.clone())
+            .with_mip_reservation(true)
+            .with_static_mip_ineligibility(true);
+        assert!(!historical.mip_reservation_armed);
+        assert_eq!(
+            historical.planned_mip_timeout_at_bab_deadline(),
+            Some(0),
+            "13.5s BaB end leaves one whole second, then the 3s tail starves MIP"
+        );
+        assert_eq!(
+            historical.safenlp_shared_prefix_bab_deadline(),
+            None,
+            "gate-off same-LHS verification must retain its full historical wall clock"
+        );
+
+        let repaired = PhaseBudgetLedger::new(15, policy)
+            .with_mip_reservation(true)
+            .with_safenlp_shared_prefix_budget_repair(true)
+            .with_static_mip_ineligibility(true);
+        assert!(repaired.mip_reservation_armed);
+        assert_eq!(repaired.mip_reserved_slice(), Some(Duration::from_secs(9)));
+        assert_eq!(
+            repaired.safenlp_shared_prefix_bab_deadline(),
+            repaired.bab_deadline(),
+            "gate-on same-LHS verification must stop at the reserved MIP handoff"
+        );
+        assert_eq!(
+            repaired.planned_mip_timeout_at_bab_deadline(),
+            Some(10),
+            "the 9s policy slice plus the existing 1.5s post-BaB share must reach MIP"
+        );
+        assert!(
+            repaired
+                .planned_mip_timeout_at_bab_deadline()
+                .expect("bounded")
+                >= 5,
+            "production dispatch admits only grants of at least five seconds"
+        );
+    }
+
+    /// #mip-handoff — the TYPED PRESET opt-in must reach the same schedule the
+    /// environment experiment reaches, without any environment read.
+    ///
+    /// This is the regression guard for the defect measured on safenlp_2024
+    /// (2026-08-06): `mip_min_fraction: 0.65` carved a 9 s slice that the
+    /// same-LHS BaB never yielded, so `mip_timeout` was 0 s and the escalation
+    /// gate (`>= 5`) refused on every row of the category.
+    #[test]
+    fn preset_enforce_mip_handoff_arms_the_same_schedule_as_the_environment_gate() {
+        let policy = PhaseBudgetConfig {
+            mip_min_fraction: 0.65,
+            mip_min_secs: 8,
+            mip_max_secs: 30,
+            post_bab_pgd_fraction: 0.10,
+            enforce_mip_handoff: true,
+            ..PhaseBudgetConfig::default()
+        };
+        // No `with_safenlp_shared_prefix_budget_repair(true)` anywhere: the
+        // policy alone must arm it.
+        let by_preset = PhaseBudgetLedger::new(15, policy.clone()).with_mip_reservation(true);
+        assert!(by_preset.safenlp_shared_prefix_budget_repair);
+        assert_eq!(
+            by_preset.safenlp_shared_prefix_bab_deadline(),
+            by_preset.bab_deadline(),
+            "the preset opt-in must hand the same-LHS lane an absolute deadline"
+        );
+        assert_eq!(
+            by_preset.planned_mip_timeout_at_bab_deadline(),
+            Some(10),
+            "the escalation must receive the slice the preset declares"
+        );
+
+        // Identical to the environment-gated arm.
+        let by_env = PhaseBudgetLedger::new(
+            15,
+            PhaseBudgetConfig {
+                enforce_mip_handoff: false,
+                ..policy
+            },
+        )
+        .with_mip_reservation(true)
+        .with_safenlp_shared_prefix_budget_repair(true);
+        assert_eq!(
+            by_preset.planned_mip_timeout_at_bab_deadline(),
+            by_env.planned_mip_timeout_at_bab_deadline()
+        );
+
+        // OFF is byte-identical to the historical schedule, and starves MIP.
+        let historical = PhaseBudgetLedger::new(
+            15,
+            PhaseBudgetConfig {
+                enforce_mip_handoff: false,
+                ..policy
+            },
+        )
+        .with_mip_reservation(true);
+        assert!(!historical.safenlp_shared_prefix_budget_repair);
+        assert_eq!(historical.safenlp_shared_prefix_bab_deadline(), None);
+        // The historical schedule cannot reach the gate even in the best case
+        // where BaB stops exactly at its planned deadline: the half-budget floor
+        // pushes the handoff to 7.5s and the 3s attack tail then leaves 4s < 5s.
+        // In production it is worse still — with no absolute deadline the
+        // same-LHS lane runs to the internal deadline and the grant is 0s.
+        assert_eq!(historical.planned_mip_timeout_at_bab_deadline(), Some(4));
+    }
+
+    /// The preset opt-in must never survive an explicit `--complete-verifier bab`.
+    #[test]
+    fn preset_enforce_mip_handoff_yields_to_explicit_bab() {
+        let policy = PhaseBudgetConfig {
+            mip_min_fraction: 0.65,
+            mip_min_secs: 8,
+            enforce_mip_handoff: true,
+            ..PhaseBudgetConfig::default()
+        };
+        let historical = PhaseBudgetLedger::new(
+            15,
+            PhaseBudgetConfig {
+                enforce_mip_handoff: false,
+                ..policy
+            },
+        )
+        .with_mip_reservation(true)
+        .with_mip_escalation_allowed(false);
+        let mut bab_only = PhaseBudgetLedger::new(15, policy)
+            .with_mip_reservation(true)
+            .with_mip_escalation_allowed(false);
+        bab_only.start = historical.start;
+        assert!(!bab_only.safenlp_shared_prefix_budget_repair);
+        assert_eq!(bab_only.safenlp_shared_prefix_bab_deadline(), None);
+        assert_eq!(bab_only.bab_deadline(), historical.bab_deadline());
+    }
+
+    #[test]
+    fn safenlp_shared_prefix_repair_does_not_rearm_explicit_bab() {
+        let base = PhaseBudgetLedger::new(
+            15,
+            PhaseBudgetConfig {
+                mip_min_fraction: 0.65,
+                mip_min_secs: 8,
+                ..PhaseBudgetConfig::default()
+            },
+        )
+        .with_mip_reservation(true)
+        .with_mip_escalation_allowed(false);
+        let historical_bab_only = base.clone();
+        let repaired_bab_only = base
+            .with_safenlp_shared_prefix_budget_repair(true)
+            .with_static_mip_ineligibility(true);
+        assert!(
+            !repaired_bab_only.mip_reservation_armed,
+            "the experiment must never override explicit complete-verifier=bab"
+        );
+        assert!(
+            !repaired_bab_only.safenlp_shared_prefix_budget_repair,
+            "an unarmed ledger must not latch the budget treatment"
+        );
+        assert_eq!(
+            repaired_bab_only.safenlp_shared_prefix_bab_deadline(),
+            None,
+            "explicit BaB must not acquire a shared-prefix handoff deadline"
+        );
+        assert_eq!(
+            repaired_bab_only.bab_deadline(),
+            historical_bab_only.bab_deadline(),
+            "explicit BaB must retain its exact historical deadline"
+        );
+        assert_eq!(
+            repaired_bab_only.planned_mip_timeout_at_bab_deadline(),
+            historical_bab_only.planned_mip_timeout_at_bab_deadline(),
+            "explicit BaB must retain the historical (unused) grant formula"
+        );
+    }
+
+    #[test]
+    fn safenlp_shared_prefix_repair_is_inert_on_every_unarmed_ledger() {
+        let zero_policy = PhaseBudgetConfig {
+            mip_min_fraction: 0.0,
+            mip_min_secs: 0,
+            post_bab_pgd_fraction: 0.10,
+            ..PhaseBudgetConfig::default()
+        };
+        let zero_base = PhaseBudgetLedger::new(15, zero_policy).with_mip_reservation(false);
+        let zero_historical = zero_base.clone();
+        let zero_treatment = zero_base.with_safenlp_shared_prefix_budget_repair(true);
+        assert!(!zero_treatment.mip_reservation_armed);
+        assert!(!zero_treatment.safenlp_shared_prefix_budget_repair);
+        assert_eq!(
+            zero_treatment.bab_deadline(),
+            zero_historical.bab_deadline(),
+            "zero-reservation policy must retain its historical BaB deadline"
+        );
+        assert_eq!(
+            zero_treatment.planned_mip_timeout_at_bab_deadline(),
+            zero_historical.planned_mip_timeout_at_bab_deadline(),
+            "zero-reservation policy must keep the three-second attack tail"
+        );
+
+        let unarmed_base =
+            PhaseBudgetLedger::new(15, PhaseBudgetConfig::default()).with_mip_reservation(false);
+        let unarmed_historical = unarmed_base.clone();
+        let unarmed_treatment = unarmed_base.with_safenlp_shared_prefix_budget_repair(true);
+        assert!(!unarmed_treatment.safenlp_shared_prefix_budget_repair);
+        assert_eq!(
+            unarmed_treatment.bab_deadline(),
+            unarmed_historical.bab_deadline()
+        );
+        assert_eq!(
+            unarmed_treatment.planned_mip_timeout_at_bab_deadline(),
+            unarmed_historical.planned_mip_timeout_at_bab_deadline()
+        );
+    }
+
+    #[test]
+    fn explicit_bab_policy_disarms_unusable_mip_reservation() {
+        let policy = PhaseBudgetConfig::default();
+        let armed = PhaseBudgetLedger::new(120, policy.clone()).with_mip_reservation(true);
+        let mut bab_only = PhaseBudgetLedger::new(120, policy)
+            .with_mip_reservation(true)
+            .with_mip_escalation_allowed(false);
+        bab_only.start = armed.start;
+
+        assert!(
+            bab_only.bab_deadline() > armed.bab_deadline(),
+            "explicit BaB must receive the slice that cannot be used for MIP"
+        );
+        let expected = bab_only.start
+            + Duration::from_mins(2)
+                .mul_f32(1.0 - bab_only.policy.post_bab_pgd_fraction.clamp(0.0, 0.5));
+        assert_eq!(bab_only.bab_deadline(), Some(expected));
+    }
+
+    #[test]
+    fn relational_child_ledger_preserves_disarm_and_parent_wall() {
+        let policy = PhaseBudgetConfig::default();
+        let parent = PhaseBudgetLedger::new(120, policy)
+            .with_mip_reservation(true)
+            .with_mip_escalation_allowed(false);
+        let child = parent.child_with_timeout_secs(300);
+
+        assert!(
+            !child.mip_reservation_armed,
+            "nested relational lanes must not re-arm MIP for explicit BaB"
+        );
+        assert!(
+            child.overall_deadline() <= parent.overall_deadline(),
+            "a nested relational timeout must be capped by the authoritative parent wall"
+        );
+        let expected = child.start
+            + child
+                .total
+                .expect("bounded child")
+                .mul_f32(1.0 - child.policy.post_bab_pgd_fraction.clamp(0.0, 0.5));
+        assert_eq!(child.bab_deadline(), Some(expected));
+    }
+
+    #[test]
+    fn relational_dispatch_uses_the_same_authoritative_ledger() {
+        let dispatch = include_str!("../dispatch.rs");
+        let production = dispatch
+            .split("#[cfg(all(test")
+            .next()
+            .expect("production dispatch source");
+        let call_start = production
+            .rfind("verify_relational_constraints_with_ledger(")
+            .expect("relational ledger-aware dispatch call");
+        let call = &production[call_start..];
+        let call_end = call.find(")?").expect("end of relational dispatch call");
+        assert!(
+            call[..call_end].contains("&bab_ledger"),
+            "relational verification must borrow the same disarmed/started ledger"
+        );
+
+        for source in [
+            include_str!("graph.rs"),
+            include_str!("sequential.rs"),
+            include_str!("disjunctive.rs"),
+        ] {
+            assert!(
+                !source.contains("PhaseBudgetLedger::new(timeout"),
+                "a relational lane must not reset the authoritative timeout or MIP policy"
+            );
+        }
     }
 
     #[test]

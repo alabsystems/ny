@@ -317,8 +317,14 @@ impl BatchedDomains {
         let mut builder = BatchedDomainsBuilder::new_with_options(layer_names.to_vec(), options);
 
         for domain in domains {
-            // Extract layer bounds from the domain
-            let mut layer_bounds = HashMap::new();
+            // #stack-double-copy: BORROW each layer's bounds rather than cloning
+            // them into a temporary map the builder immediately clones again and
+            // then drops. Only the builder's copy is retained, so the first clone
+            // was pure waste — paid per layer per domain, on a path the kFSB
+            // simulation walks for every candidate split rather than only the
+            // committed one. Byte-identical output, one clone earlier.
+            let mut layer_bounds: HashMap<&str, (&ArrayD<f32>, &ArrayD<f32>)> =
+                HashMap::with_capacity(layer_names.len());
             for name in layer_names {
                 let bounded = domain.node_bounds.get(name).ok_or_else(|| {
                     NyError::InvalidSpec(format!(
@@ -326,10 +332,7 @@ impl BatchedDomains {
                         name
                     ))
                 })?;
-                layer_bounds.insert(
-                    name.clone(),
-                    (bounded.lower().clone(), bounded.upper().clone()),
-                );
+                layer_bounds.insert(name.as_str(), (bounded.lower(), bounded.upper()));
             }
 
             // Extract input bounds
@@ -339,7 +342,7 @@ impl BatchedDomains {
             // Extract constraints from history, interleaving ReLU and GenBaB by split order
             let constraints = serialize_constraints(&domain.history)?;
 
-            builder.add_domain(
+            builder.add_domain_borrowed(
                 &layer_bounds,
                 input_lower,
                 input_upper,

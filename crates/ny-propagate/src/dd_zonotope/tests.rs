@@ -313,7 +313,7 @@ fn conv_encloses_the_true_output_on_a_dense_sample() {
     for _ in 0..400 {
         let t: Vec<f64> = (0..n).map(|_| (rng.next_f64() + 1.0) * 0.5).collect();
         let x = point_from_box(&lo, &up, &t);
-        let y = super::affine::conv_f64(&plan, &w, Some(&bias), &x);
+        let y = super::affine::conv_f64(&plan, &w, Some(&bias), &x).expect("conv");
         for (i, &yi) in y.iter().enumerate() {
             assert!(
                 yi >= olo[i] && yi <= oup[i],
@@ -329,6 +329,48 @@ fn conv_encloses_the_true_output_on_a_dense_sample() {
 fn conv_refuses_dilation_and_groups() {
     assert!(ConvPlan::build((2, 5, 5), 3, 3, 3, (1, 1), (1, 1), (2, 2), 1).is_none());
     assert!(ConvPlan::build((2, 5, 5), 3, 3, 3, (1, 1), (1, 1), (1, 1), 2).is_none());
+    assert!(
+        ConvPlan::build((1, usize::MAX, 1), 1, 1, 1, (1, 1), (1, 0), (1, 1), 1,).is_none(),
+        "padded input geometry must refuse on overflow"
+    );
+}
+
+#[test]
+fn affine_preflight_refuses_malformed_shapes_and_slices() {
+    let plan = ConvPlan::build((1, 2, 2), 1, 1, 1, (1, 1), (0, 0), (1, 1), 1).expect("plan");
+    let z = box_zono(&[0.0; 4], &[1.0; 4], vec![1, 2, 2]);
+    let short_weight = [1.0; 3];
+    let op = AffineOp::Conv {
+        plan,
+        w: &short_weight,
+        wabs: &short_weight,
+        bias: Some(&[0.0]),
+    };
+    assert!(apply_affine(&z, &op, || Ok(())).is_err());
+    assert!(super::affine::conv_f64(&plan, &short_weight, None, &[0.0; 4]).is_none());
+
+    let mut malformed_plan = plan;
+    malformed_plan.out_h = 3;
+    let weight = [1.0];
+    let malformed_op = AffineOp::Conv {
+        plan: malformed_plan,
+        w: &weight,
+        wabs: &weight,
+        bias: None,
+    };
+    assert!(apply_affine(&z, &malformed_op, || Ok(())).is_err());
+
+    let mut wrong_linear_shape = z;
+    wrong_linear_shape.shape = vec![3, 2];
+    let linear_weight = [1.0; 4];
+    let linear = AffineOp::Linear {
+        out_features: 1,
+        in_features: 4,
+        w: &linear_weight,
+        wabs: &linear_weight,
+        bias: None,
+    };
+    assert!(apply_affine(&wrong_linear_shape, &linear, || Ok(())).is_err());
 }
 
 #[test]
@@ -353,11 +395,72 @@ fn linear_encloses_the_true_output_on_a_dense_sample() {
     for _ in 0..500 {
         let t: Vec<f64> = (0..in_f).map(|_| (rng.next_f64() + 1.0) * 0.5).collect();
         let x = point_from_box(&lo, &up, &t);
-        let y = super::affine::linear_f64(out_f, in_f, &w, Some(&bias), &x);
+        let y = super::affine::linear_f64(out_f, in_f, &w, Some(&bias), &x).expect("linear");
         for (i, &yi) in y.iter().enumerate() {
             assert!(yi >= olo[i] && yi <= oup[i]);
         }
     }
+}
+
+#[test]
+fn linear_absolute_floor_aggregates_generators_and_error_reductions() {
+    let weight = ny_core::f32_to_f64_exact(f32::from_bits(1)); // 2^-149
+    let input_value = f64::from_bits(u64::from(1023_u16 - 926) << 52); // 2^-926
+    assert_eq!(
+        (std::hint::black_box(weight) * std::hint::black_box(input_value)).to_bits(),
+        0,
+        "each exact product is 2^-1075 and ties to zero"
+    );
+
+    // The exact affine image has center 0.5η, transported eg 0.5η, and 32
+    // generator coefficients of magnitude 0.5η. All plain computed products
+    // are zero, so a floor independent of the generator count would miss the
+    // aggregate 16η generator radius.
+    let generators = 32usize;
+    let z = DdZono {
+        shape: vec![1],
+        center: vec![Dd::from_f64(input_value)],
+        gens: vec![vec![input_value]; generators],
+        ec: vec![0.0],
+        eg: vec![input_value],
+    };
+    let weights = [weight];
+    let op = AffineOp::Linear {
+        out_features: 1,
+        in_features: 1,
+        w: &weights,
+        wabs: &weights,
+        bias: None,
+    };
+    let out = apply_affine(&z, &op, || Ok(())).expect("affine");
+    assert!(out.gens.iter().all(|g| g[0].to_bits() == 0));
+
+    let (lo, up) = out.concretize();
+    let exact_lower = -f64::from_bits(16);
+    let exact_upper = f64::from_bits(17);
+    assert!(
+        lo[0] <= exact_lower && up[0] >= exact_upper,
+        "aggregate underflow image [{exact_lower:e}, {exact_upper:e}] escaped [{:e}, {:e}]",
+        lo[0],
+        up[0]
+    );
+
+    let (_, generator_operations) =
+        super::affine::affine_underflow_operation_counts(1, generators).expect("count");
+    assert!(
+        generator_operations >= 2 * generators,
+        "every generator multiply/add pair must be charged"
+    );
+
+    let margin =
+        super::evaluate_objectives(&z, &[vec![f32::from_bits(1)]], std::time::Duration::ZERO)
+            .expect("objective");
+    assert!(
+        margin.lower[0] <= exact_lower && margin.upper[0] >= exact_upper,
+        "objective reduction underflow image [{exact_lower:e}, {exact_upper:e}] escaped [{:e}, {:e}]",
+        margin.lower[0],
+        margin.upper[0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +545,7 @@ fn tiny_vgg_forward(graph: &GraphNetwork, x: &[f32], shape: (usize, usize, usize
                     .iter()
                     .map(|&v| f64::from(v))
                     .collect();
-                cur = super::affine::conv_f64(&plan, &w, Some(&b), &cur);
+                cur = super::affine::conv_f64(&plan, &w, Some(&b), &cur).expect("conv");
                 sh = (plan.out_c, plan.out_h, plan.out_w);
             }
             Layer::ReLU(_) => {
@@ -487,7 +590,8 @@ fn tiny_vgg_forward(graph: &GraphNetwork, x: &[f32], shape: (usize, usize, usize
                     &w,
                     Some(&b),
                     &cur,
-                );
+                )
+                .expect("linear");
                 sh = (cur.len(), 1, 1);
             }
             other => panic!("unexpected layer {other:?}"),
@@ -542,7 +646,6 @@ fn end_to_end_margin_encloses_the_sampled_truth() {
         perturbed: pert.clone(),
         input_shape: vec![3, h, w],
         exact: exact_box_from_f32(&lower, &upper),
-        declared_point_exact: false,
     };
     let margin = dd_zonotope_margins(&graph, &input, &objectives, &plan, &cfg, None)
         .expect("no error")
@@ -710,7 +813,6 @@ fn generator_cap_fails_closed() {
             &base.iter().map(|&v| v - 2.0).collect::<Vec<f32>>(),
             &base.iter().map(|&v| v + 2.0).collect::<Vec<f32>>(),
         ),
-        declared_point_exact: false,
     };
     let cfg = DdZonoConfig {
         min_input_numel: 1,
@@ -738,6 +840,7 @@ fn precision_gate_rejects_a_wide_rounding_channel() {
         output_shape: vec![],
         n_generators: 1,
         wall: std::time::Duration::from_secs(0),
+        interm: std::collections::HashMap::new(),
     };
     assert!(m.precision_ok(1e-2));
 
@@ -746,12 +849,48 @@ fn precision_gate_rejects_a_wide_rounding_channel() {
         ..m.clone()
     };
     assert!(!bad.precision_ok(1e-2));
+    assert!(!bad.precision_ok(f64::INFINITY));
+    assert!(!bad.precision_ok(f64::NAN));
+    assert!(!bad.precision_ok(0.0));
 
     let nonfinite = DdZonoMargin {
         rounding_half_width: vec![f64::INFINITY],
-        ..m
+        ..m.clone()
     };
     assert!(!nonfinite.precision_ok(1e-2));
+
+    let negative = DdZonoMargin {
+        rounding_half_width: vec![-0.25],
+        ..m.clone()
+    };
+    assert!(!negative.precision_ok(1e-2));
+    assert_eq!(
+        negative.lower_with_safety(0, 2.0),
+        f64::NEG_INFINITY,
+        "a negative public error width must fail closed, never raise the lower bound"
+    );
+
+    let midpoint_sum_overflow = DdZonoMargin {
+        lower: vec![0.75 * f64::MAX],
+        upper: vec![f64::MAX],
+        rounding_half_width: vec![0.75 * f64::MAX],
+        ..m.clone()
+    };
+    assert!(
+        !midpoint_sum_overflow.precision_ok(0.5),
+        "finite endpoints must use a non-overflowing midpoint"
+    );
+
+    let threshold_overflow = DdZonoMargin {
+        lower: vec![f64::MAX],
+        upper: vec![f64::MAX],
+        rounding_half_width: vec![1.0],
+        ..m
+    };
+    assert!(
+        !threshold_overflow.precision_ok(2.0),
+        "an overflowed precision threshold must fail closed"
+    );
 }
 
 #[test]

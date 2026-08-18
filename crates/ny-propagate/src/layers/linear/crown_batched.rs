@@ -13,7 +13,10 @@ use ndarray::{s, Array1, Array2, ArrayD, ArrayView3, IxDyn};
 use ny_core::{checked_shape_product, is_crown_coeff_safe, GemmEngine, NyError, Result};
 use tracing::debug;
 
-use super::bias::{accumulate_bias_f64, finalize_bias_directed, BiasBlockParams};
+use super::bias::{
+    accumulate_bias_f64, add_coeff_err_bias_product_up, add_f64_down, add_f64_up, f32_to_f64_exact,
+    finalize_bias_directed, publish_error_up_normal, BiasBlockParams,
+};
 use super::LinearLayer;
 use crate::{contiguous_flat_slice, BatchedLinearBounds};
 
@@ -29,12 +32,32 @@ pub(crate) fn propagate_linear_batched(
     propagate_linear_batched_maybe_engine(layer, bounds, None)
 }
 
+/// Preserve historical fallback for ordinary engines. A bounded host facade's
+/// structured memory refusal is terminal because local fallback would allocate
+/// the refused buffer; a deadline is terminal only when the engine proves
+/// expiry through the cooperative CROWN poll seam.
+#[inline]
+fn engine_error_is_terminal(error: &NyError, engine: &dyn GemmEngine) -> bool {
+    (error.is_cpu_memory_exceeded() && engine.forbids_unbounded_cpu_fallback())
+        || (error.is_deadline_exceeded()
+            && matches!(
+                engine.poll_crown_backward_deadline(),
+                Err(error) if error.is_deadline_exceeded()
+            ))
+}
+
 pub(crate) fn propagate_linear_batched_maybe_engine(
     layer: &LinearLayer,
     bounds: &BatchedLinearBounds,
     engine: Option<&dyn GemmEngine>,
 ) -> Result<BatchedLinearBounds> {
     debug!("Linear layer batched CROWN backward propagation");
+
+    if engine.is_some_and(|engine| engine.forbids_unbounded_cpu_fallback()) {
+        return Err(NyError::UnsupportedOp(
+            "bounded Linear batched CROWN has no pollable host implementation".into(),
+        ));
+    }
 
     let a_shape = bounds.lower_a.shape();
     if a_shape.len() < 2 {
@@ -124,6 +147,9 @@ pub(crate) fn propagate_linear_batched_maybe_engine(
                 engine,
             ) {
                 Ok(results) => results,
+                Err(err) if engine_error_is_terminal(&err, engine) => {
+                    return Err(err);
+                }
                 Err(err) => {
                     debug!("Linear batched CROWN: GEMM engine failed, falling back to faer: {err}");
                     compute_batched_linear_coefficients_cpu(
@@ -136,7 +162,7 @@ pub(crate) fn propagate_linear_batched_maybe_engine(
                         out_dim,
                         mid_dim,
                         in_dim,
-                    )
+                    )?
                 }
             }
         } else {
@@ -150,7 +176,7 @@ pub(crate) fn propagate_linear_batched_maybe_engine(
                 out_dim,
                 mid_dim,
                 in_dim,
-            )
+            )?
         };
 
     let mut new_lower_a = Array2::from_shape_vec((total_rows, in_dim), result_lower_flat)
@@ -272,9 +298,9 @@ pub(crate) fn propagate_linear_batched_maybe_engine(
                 for i in 0..out_dim {
                     let mut acc = 0.0f64;
                     for k in 0..mid_dim {
-                        acc += e[[i, k]] as f64 * (bias[k] as f64).abs();
+                        acc = add_coeff_err_bias_product_up(acc, e[[i, k]], bias[k]);
                     }
-                    lower_accum[i] -= acc;
+                    lower_accum[i] = add_f64_down(lower_accum[i], -acc);
                 }
             }
             if let Some(ue) = in_upper_err_3d.as_ref() {
@@ -282,9 +308,9 @@ pub(crate) fn propagate_linear_batched_maybe_engine(
                 for i in 0..out_dim {
                     let mut acc = 0.0f64;
                     for k in 0..mid_dim {
-                        acc += e[[i, k]] as f64 * (bias[k] as f64).abs();
+                        acc = add_coeff_err_bias_product_up(acc, e[[i, k]], bias[k]);
                     }
-                    upper_accum[i] += acc;
+                    upper_accum[i] = add_f64_up(upper_accum[i], acc);
                 }
             }
 
@@ -377,10 +403,11 @@ fn compute_batched_linear_coefficients_cpu(
     out_dim: usize,
     mid_dim: usize,
     in_dim: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
     use crate::faer_parallelism::mat_mul;
-    use crate::layers::linear::crown_single::{aw_f64_with_abssum, gamma_n_f64};
-    use ny_tensor::next_up_f32;
+    use crate::layers::linear::crown_single::{
+        aw_f64_with_abssum, gamma_n_f64, incoming_error_product,
+    };
 
     let total_rows = total_batch * out_dim;
     let mut result_lower_flat = vec![0.0_f32; total_rows * in_dim];
@@ -425,14 +452,22 @@ fn compute_batched_linear_coefficients_cpu(
         let (upper_a64, upper_s) = aw_f64_with_abssum(&a_upper_faer, layer.weight_faer());
 
         // Propagated incoming error P[i,j] = Σ_k err_in[i,k]·|W[k,j]| (per batch).
-        let prop_lower = in_lower_err_3d.as_ref().map(|e| {
-            let blk = Mat::<f32>::from_fn(out_dim, mid_dim, |i, k| e[[batch_idx, i, k]]);
-            mat_mul(&blk, &w_abs)
-        });
-        let prop_upper = in_upper_err_3d.as_ref().map(|e| {
-            let blk = Mat::<f32>::from_fn(out_dim, mid_dim, |i, k| e[[batch_idx, i, k]]);
-            mat_mul(&blk, &w_abs)
-        });
+        let prop_lower = match in_lower_err_3d.as_ref() {
+            Some(error) => {
+                let block =
+                    Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
+                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+            }
+            None => None,
+        };
+        let prop_upper = match in_upper_err_3d.as_ref() {
+            Some(error) => {
+                let block =
+                    Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
+                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+            }
+            None => None,
+        };
 
         for out_idx in 0..out_dim {
             let row = batch_idx * out_dim + out_idx;
@@ -441,28 +476,30 @@ fn compute_batched_linear_coefficients_cpu(
                 let u = upper_a64[[out_idx, in_idx]] as f32;
                 result_lower_flat[row * in_dim + in_idx] = l;
                 result_upper_flat[row * in_dim + in_idx] = u;
-                let l_cast_err = (lower_a64[[out_idx, in_idx]] - l as f64).abs();
-                let u_cast_err = (upper_a64[[out_idx, in_idx]] - u as f64).abs();
+                let l_cast_err = (lower_a64[[out_idx, in_idx]] - f32_to_f64_exact(l)).abs();
+                let u_cast_err = (upper_a64[[out_idx, in_idx]] - f32_to_f64_exact(u)).abs();
                 let l_prop = prop_lower
                     .as_ref()
-                    .map_or(0.0, |p| p[(out_idx, in_idx)] as f64);
+                    .map_or(0.0, |p| f32_to_f64_exact(p[(out_idx, in_idx)]));
                 let u_prop = prop_upper
                     .as_ref()
-                    .map_or(0.0, |p| p[(out_idx, in_idx)] as f64);
-                lower_err_flat[row * in_dim + in_idx] =
-                    next_up_f32((l_cast_err + gamma * lower_s[[out_idx, in_idx]] + l_prop) as f32);
-                upper_err_flat[row * in_dim + in_idx] =
-                    next_up_f32((u_cast_err + gamma * upper_s[[out_idx, in_idx]] + u_prop) as f32);
+                    .map_or(0.0, |p| f32_to_f64_exact(p[(out_idx, in_idx)]));
+                lower_err_flat[row * in_dim + in_idx] = publish_error_up_normal(
+                    l_cast_err + gamma * lower_s[[out_idx, in_idx]] + l_prop,
+                );
+                upper_err_flat[row * in_dim + in_idx] = publish_error_up_normal(
+                    u_cast_err + gamma * upper_s[[out_idx, in_idx]] + u_prop,
+                );
             }
         }
     }
 
-    (
+    Ok((
         result_lower_flat,
         result_upper_flat,
         lower_err_flat,
         upper_err_flat,
-    )
+    ))
 }
 
 /// Engine (GPU) batched `A·W`: the point coefficients come from the f32 GEMM
@@ -484,9 +521,9 @@ fn compute_batched_linear_coefficients_engine(
     in_dim: usize,
     engine: &dyn GemmEngine,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
-    use crate::faer_parallelism::mat_mul;
-    use crate::layers::linear::crown_single::{aw_f64_with_abssum, gamma_n_f32};
-    use ny_tensor::next_up_f32;
+    use crate::layers::linear::crown_single::{
+        aw_f64_with_abssum, gamma_n_f32, incoming_error_product,
+    };
 
     let weight_slice = layer
         .weight
@@ -514,30 +551,46 @@ fn compute_batched_linear_coefficients_engine(
         let a_upper = upper_a_3d.slice(s![batch_idx, .., ..]);
         let a_lower_faer = Mat::<f32>::from_fn(out_dim, mid_dim, |i, j| a_lower[[i, j]]);
         let a_upper_faer = Mat::<f32>::from_fn(out_dim, mid_dim, |i, j| a_upper[[i, j]]);
-        let (_, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
-        let (_, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
+        let (lower_reference, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
+        let (upper_reference, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
         // Propagated incoming error per batch.
-        let prop_lower = in_lower_err_3d.as_ref().map(|e| {
-            let blk = Mat::<f32>::from_fn(out_dim, mid_dim, |i, k| e[[batch_idx, i, k]]);
-            mat_mul(&blk, &w_abs)
-        });
-        let prop_upper = in_upper_err_3d.as_ref().map(|e| {
-            let blk = Mat::<f32>::from_fn(out_dim, mid_dim, |i, k| e[[batch_idx, i, k]]);
-            mat_mul(&blk, &w_abs)
-        });
+        let prop_lower = match in_lower_err_3d.as_ref() {
+            Some(error) => {
+                let block =
+                    Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
+                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+            }
+            None => None,
+        };
+        let prop_upper = match in_upper_err_3d.as_ref() {
+            Some(error) => {
+                let block =
+                    Array2::from_shape_fn((out_dim, mid_dim), |(i, k)| error[[batch_idx, i, k]]);
+                Some(incoming_error_product(&block, 0, mid_dim, &w_abs, None)?)
+            }
+            None => None,
+        };
         for out_idx in 0..out_dim {
             let row = batch_idx * out_dim + out_idx;
             for in_idx in 0..in_dim {
+                let stored_lower = result_lower[row * in_dim + in_idx];
+                let stored_upper = result_upper[row * in_dim + in_idx];
+                let lower_gap =
+                    (f32_to_f64_exact(stored_lower) - lower_reference[[out_idx, in_idx]]).abs();
+                let upper_gap =
+                    (f32_to_f64_exact(stored_upper) - upper_reference[[out_idx, in_idx]]).abs();
                 let l_prop = prop_lower
                     .as_ref()
-                    .map_or(0.0, |p| p[(out_idx, in_idx)] as f64);
+                    .map_or(0.0, |p| f32_to_f64_exact(p[(out_idx, in_idx)]));
                 let u_prop = prop_upper
                     .as_ref()
-                    .map_or(0.0, |p| p[(out_idx, in_idx)] as f64);
-                lower_err[row * in_dim + in_idx] =
-                    next_up_f32((gamma * lower_s[[out_idx, in_idx]] + l_prop) as f32);
-                upper_err[row * in_dim + in_idx] =
-                    next_up_f32((gamma * upper_s[[out_idx, in_idx]] + u_prop) as f32);
+                    .map_or(0.0, |p| f32_to_f64_exact(p[(out_idx, in_idx)]));
+                lower_err[row * in_dim + in_idx] = publish_error_up_normal(
+                    lower_gap + gamma * lower_s[[out_idx, in_idx]] + l_prop,
+                );
+                upper_err[row * in_dim + in_idx] = publish_error_up_normal(
+                    upper_gap + gamma * upper_s[[out_idx, in_idx]] + u_prop,
+                );
             }
         }
     }

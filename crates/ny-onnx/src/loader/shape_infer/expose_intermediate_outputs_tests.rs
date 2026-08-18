@@ -8,6 +8,9 @@ use super::{
 use crate::onnx_proto;
 use prost::Message;
 use std::collections::HashMap;
+// Used only by the `#[cfg(unix)]` read-only-directory test below, whose mode
+// bits have no Windows equivalent; gated to match its uses.
+#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -498,6 +501,44 @@ fn test_expose_intermediate_outputs_dedupes_output_names() {
         .count();
 
     assert_eq!(output_count, 1);
+}
+
+#[test]
+fn test_expose_intermediate_cast_uses_target_dtype_not_source_dtype() {
+    let mut cast = node("cast", "Cast", &["input"], &["integer_shape"]);
+    cast.attribute = vec![onnx_proto::AttributeProto {
+        name: "to".to_string(),
+        i: Some(7),
+        r#type: onnx_proto::attribute_type::INT,
+        ..Default::default()
+    }];
+    let graph = onnx_proto::GraphProto {
+        name: "cast_target_dtype".to_string(),
+        input: vec![tensor_value_info("input", &[1, 3])],
+        output: Vec::new(),
+        node: vec![cast],
+        ..Default::default()
+    };
+    let bytes = model_from_graph(graph).encode_to_vec();
+    let exposed = super::expose_intermediate_outputs(&bytes).expect("expose outputs");
+    let decoded = onnx_proto::ModelProto::decode(exposed.bytes.as_slice()).expect("decode");
+    let output = decoded
+        .graph
+        .expect("graph")
+        .output
+        .into_iter()
+        .find(|output| output.name == "integer_shape")
+        .expect("Cast output exposed");
+    let tensor_type = output
+        .r#type
+        .and_then(|ty| ty.tensor_type)
+        .expect("Cast output tensor type");
+
+    assert_eq!(tensor_type.elem_type, 7, "Cast target dtype must win");
+    assert_eq!(
+        tensor_type.shape.expect("source shape retained").dim.len(),
+        2
+    );
 }
 
 // ─── vit_2023 Transpose-on-rank-mismatch normalization (ORT) ───────────────

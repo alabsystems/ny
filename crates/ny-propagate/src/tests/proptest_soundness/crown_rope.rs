@@ -275,15 +275,20 @@ proptest! {
             Array1::zeros(1),
         );
 
-        // LinearBounds::new can fail for invalid combinations; reject as proptest filter
+        // All generated matrices have matching finite shapes; rejection is a
+        // counterexample, not a domain filter.
         let incoming = match incoming {
             Ok(b) => b,
-            Err(_) => return Err(TestCaseError::reject("LinearBounds::new rejected invalid combination")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "LinearBounds::new rejected generated finite RoPE coefficients: {e}"
+            ))),
         };
 
         let result = match layer.propagate_linear(&incoming) {
             Ok(r) => r,
-            Err(_) => return Err(TestCaseError::reject("RoPE CROWN backward rejected inputs")),
+            Err(e) => return Err(TestCaseError::fail(format!(
+                "RoPE CROWN backward rejected generated finite inputs: {e}"
+            ))),
         };
         let concrete = result.concretize(&input);
 

@@ -2,21 +2,36 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use super::helpers::assert_bounds_finite;
 use super::*;
 use ndarray::{arr1, arr2};
 use ny_core::{
-    GemmEngine, GpuCrownBackward, GpuCrownLayer, GpuCrownResult, NaiveCpuGemmEngine, Result,
+    GemmEngine, GpuCrownBackward, GpuCrownLayer, GpuCrownResult, NaiveCpuGemmEngine, NyError,
+    Result,
 };
 use ny_test_utils::assert_bounded_tensor_close;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 struct ScriptedGpuFastPathEngine {
     lower_bounds: Vec<f32>,
     upper_bounds: Vec<f32>,
+    failure: Option<ScriptedGpuFailure>,
     gpu_calls: AtomicUsize,
     observed_num_specs: Mutex<Option<usize>>,
     observed_layer_kinds: Mutex<Option<Vec<&'static str>>>,
+    honors_deadline: bool,
+    deadline_writes: Mutex<Vec<Option<Instant>>>,
+}
+
+#[derive(Clone, Copy)]
+enum ScriptedGpuFailure {
+    UnsupportedOp,
+    Device,
+    Validation,
+    Oom,
+    Deadline,
 }
 
 impl ScriptedGpuFastPathEngine {
@@ -24,10 +39,24 @@ impl ScriptedGpuFastPathEngine {
         Self {
             lower_bounds,
             upper_bounds,
+            failure: None,
             gpu_calls: AtomicUsize::new(0),
             observed_num_specs: Mutex::new(None),
             observed_layer_kinds: Mutex::new(None),
+            honors_deadline: false,
+            deadline_writes: Mutex::new(Vec::new()),
         }
+    }
+
+    fn failing(failure: ScriptedGpuFailure) -> Self {
+        let mut engine = Self::new(Vec::new(), Vec::new());
+        engine.failure = Some(failure);
+        engine
+    }
+
+    fn with_deadline_support(mut self) -> Self {
+        self.honors_deadline = true;
+        self
     }
 
     fn gpu_calls(&self) -> usize {
@@ -45,6 +74,13 @@ impl ScriptedGpuFastPathEngine {
         self.observed_layer_kinds
             .lock()
             .expect("observed_layer_kinds mutex should not be poisoned")
+            .clone()
+    }
+
+    fn deadline_writes(&self) -> Vec<Option<Instant>> {
+        self.deadline_writes
+            .lock()
+            .expect("deadline_writes mutex should not be poisoned")
             .clone()
     }
 }
@@ -84,21 +120,40 @@ impl GpuCrownBackward for ScriptedGpuFastPathEngine {
             input_upper.len(),
             "scripted GPU engine expects matching input bound lengths"
         );
-        assert_eq!(
-            self.lower_bounds.len(),
-            self.upper_bounds.len(),
-            "scripted GPU engine expected bounds must have matching lengths"
-        );
-        assert_eq!(
-            self.lower_bounds.len(),
-            num_specs,
-            "scripted GPU engine expects one scalar bound per output spec"
-        );
+        if let Some(failure) = self.failure {
+            return Err(match failure {
+                ScriptedGpuFailure::UnsupportedOp => {
+                    NyError::UnsupportedOp("scripted unsupported GPU op".into())
+                }
+                ScriptedGpuFailure::Device => NyError::InternalError("scripted device loss".into()),
+                ScriptedGpuFailure::Validation => {
+                    NyError::InvalidSpec("scripted GPU validation failure".into())
+                }
+                ScriptedGpuFailure::Oom => NyError::GpuMemoryExceeded {
+                    required_bytes: 2,
+                    budget_bytes: 1,
+                },
+                ScriptedGpuFailure::Deadline => {
+                    NyError::DeadlineExceeded("scripted GPU deadline refusal".into())
+                }
+            });
+        }
 
         Ok(GpuCrownResult {
             lower_bounds: self.lower_bounds.clone(),
             upper_bounds: self.upper_bounds.clone(),
         })
+    }
+
+    fn honors_crown_backward_deadline(&self) -> bool {
+        self.honors_deadline
+    }
+
+    fn set_crown_backward_deadline(&self, deadline: Option<Instant>) {
+        self.deadline_writes
+            .lock()
+            .expect("deadline_writes mutex should not be poisoned")
+            .push(deadline);
     }
 }
 
@@ -217,5 +272,227 @@ fn test_propagate_crown_gpu_fast_path_nan_result_falls_back_to_cpu_3757() -> Res
             .all(|v| !v.is_nan()),
         "CPU fallback should be NaN-free (corrupted: {corrupted})"
     );
+    Ok(())
+}
+
+#[test]
+fn malformed_full_gpu_payloads_fall_back_to_cpu_as_a_unit() -> Result<()> {
+    let _gate = sound_gpu_gate::test_lock::lock_gate();
+    let (network, input) = build_linear_relu_network()?;
+    let layer_bounds =
+        network.collect_crown_ibp_bounds_with_engine_and_deadline(&input, None, None)?;
+    let expected = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        None,
+        None,
+        None,
+    )?;
+    let rows = expected.len();
+    assert!(rows >= 2, "fixture needs two output rows");
+
+    let malformed = [
+        (vec![-1.0; rows - 1], vec![1.0; rows], "wrong lower shape"),
+        (vec![-1.0; rows], vec![1.0; rows + 1], "wrong upper shape"),
+        (
+            {
+                let mut values = vec![-1.0; rows];
+                values[0] = f32::NAN;
+                values
+            },
+            vec![1.0; rows],
+            "NaN",
+        ),
+        (
+            vec![-1.0; rows],
+            {
+                let mut values = vec![1.0; rows];
+                values[0] = f32::INFINITY;
+                values
+            },
+            "infinity",
+        ),
+        (
+            {
+                let mut values = vec![-1.0; rows];
+                values[0] = 2.0;
+                values
+            },
+            vec![1.0; rows],
+            "inverted interval",
+        ),
+    ];
+
+    for (lower, upper, label) in malformed {
+        let engine = ScriptedGpuFastPathEngine::new(lower, upper);
+        let actual = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+            &input,
+            &layer_bounds,
+            Some(&engine),
+            None,
+            None,
+        )?;
+        assert_eq!(engine.gpu_calls(), 1, "{label}: GPU attempt count");
+        assert_bounded_tensor_close(&actual, &expected, 1e-6, label);
+    }
+    Ok(())
+}
+
+#[test]
+fn full_gpu_backend_refusals_all_reach_cpu_crown() -> Result<()> {
+    let _gate = sound_gpu_gate::test_lock::lock_gate();
+    let (network, input) = build_linear_relu_network()?;
+    let layer_bounds =
+        network.collect_crown_ibp_bounds_with_engine_and_deadline(&input, None, None)?;
+    let expected = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        None,
+        None,
+        None,
+    )?;
+
+    for (failure, label) in [
+        (ScriptedGpuFailure::UnsupportedOp, "unsupported op"),
+        (ScriptedGpuFailure::Device, "device failure"),
+        (ScriptedGpuFailure::Validation, "validation failure"),
+        (ScriptedGpuFailure::Oom, "GPU OOM"),
+        (ScriptedGpuFailure::Deadline, "backend deadline refusal"),
+    ] {
+        let engine = ScriptedGpuFastPathEngine::failing(failure);
+        let actual = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+            &input,
+            &layer_bounds,
+            Some(&engine),
+            None,
+            None,
+        )?;
+        assert_eq!(engine.gpu_calls(), 1, "{label}: GPU attempt count");
+        assert_bounded_tensor_close(&actual, &expected, 1e-6, label);
+    }
+    Ok(())
+}
+
+#[test]
+fn expired_full_gpu_crown_deadline_refuses_before_borrowed_fallback_clone() -> Result<()> {
+    let _gate = sound_gpu_gate::test_lock::lock_gate();
+    let (network, input) = build_linear_relu_network()?;
+    let layer_bounds =
+        network.collect_crown_ibp_bounds_with_engine_and_deadline(&input, None, None)?;
+    let output_dim = layer_bounds
+        .last()
+        .expect("network has output bounds")
+        .len();
+    let engine = ScriptedGpuFastPathEngine::new(vec![-1.0; output_dim], vec![1.0; output_dim])
+        .with_deadline_support();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("one millisecond fits before the current instant");
+
+    let error = network
+        .propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+            &input,
+            &layer_bounds,
+            Some(&engine),
+            Some(expired),
+            None,
+        )
+        .expect_err("expired authority must refuse before cloning borrowed forward bounds");
+    assert!(
+        matches!(error, NyError::DeadlineExceeded(_)),
+        "expected typed deadline refusal, got {error:?}"
+    );
+    assert_eq!(
+        engine.gpu_calls(),
+        0,
+        "an expired deadline must refuse before launching the GPU backend"
+    );
+    assert!(
+        engine.deadline_writes().is_empty(),
+        "no backend lease is needed when the pre-launch check already expired"
+    );
+    Ok(())
+}
+
+#[test]
+fn noncooperative_full_gpu_backend_is_skipped_for_finite_deadline() -> Result<()> {
+    let _gate = sound_gpu_gate::test_lock::lock_gate();
+    let (network, input) = build_linear_relu_network()?;
+    let layer_bounds =
+        network.collect_crown_ibp_bounds_with_engine_and_deadline(&input, None, None)?;
+    let expected = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        None,
+        None,
+        None,
+    )?;
+    let engine = ScriptedGpuFastPathEngine::new(
+        expected.lower().iter().copied().collect(),
+        expected.upper().iter().copied().collect(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let actual = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        Some(&engine),
+        Some(deadline),
+        None,
+    )?;
+
+    assert_eq!(
+        engine.gpu_calls(),
+        0,
+        "a noncooperative full-GPU backend must fall through to the deadline-aware CPU path"
+    );
+    assert_bounds_finite(&actual, "finite-deadline CPU fallback");
+    assert_bounded_tensor_close(
+        &actual,
+        &expected,
+        1e-5,
+        "noncooperative GPU route vs CPU fallback",
+    );
+    Ok(())
+}
+
+#[test]
+fn cooperative_full_gpu_backend_is_skipped_before_unpollable_host_setup() -> Result<()> {
+    let _gate = sound_gpu_gate::test_lock::lock_gate();
+    let (network, input) = build_linear_relu_network()?;
+    let layer_bounds =
+        network.collect_crown_ibp_bounds_with_engine_and_deadline(&input, None, None)?;
+    let expected = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        None,
+        None,
+        None,
+    )?;
+    let engine = ScriptedGpuFastPathEngine::new(
+        expected.lower().iter().copied().collect(),
+        expected.upper().iter().copied().collect(),
+    )
+    .with_deadline_support();
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let actual = network.propagate_crown_with_layer_bounds_and_engine_and_deadline_and_limits(
+        &input,
+        &layer_bounds,
+        Some(&engine),
+        Some(deadline),
+        None,
+    )?;
+
+    assert_eq!(
+        engine.gpu_calls(),
+        0,
+        "finite authority must stay on the pollable CPU path before host GPU setup"
+    );
+    assert!(
+        engine.deadline_writes().is_empty(),
+        "a GPU route declined before host preparation must not install a device lease"
+    );
+    assert_bounded_tensor_close(&actual, &expected, 1e-5, "finite CPU fallback");
     Ok(())
 }

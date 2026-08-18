@@ -7,6 +7,7 @@ use crate::loader::fusion::{
     fold_batch_norm_into_conv_linear, fold_batch_norm_into_conv_linear_with_context,
     gemm_has_exact_default_affine,
 };
+use crate::loader::BatchNormFoldingPolicy;
 use crate::model::WeightStore;
 use approx::assert_relative_eq;
 use ndarray::arr1;
@@ -74,6 +75,7 @@ fn fold_with_graph_outputs(
         weights,
         &HashMap::new(),
         &graph_output_names,
+        BatchNormFoldingPolicy::LegacyEnvironment,
     )
 }
 

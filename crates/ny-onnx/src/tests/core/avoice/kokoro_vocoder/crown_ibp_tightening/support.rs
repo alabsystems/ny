@@ -139,13 +139,57 @@ pub(in crate::tests::core::avoice::kokoro_vocoder) fn spec_guided_crown_with_eng
     label: &str,
 ) -> (Vec<f32>, Vec<f32>) {
     let deadline = Instant::now() + Duration::from_secs(SPEC_CROWN_DEADLINE_SECS);
+    spec_guided_crown_with_engine_and_deadline(
+        graph,
+        input,
+        node_bounds,
+        spec,
+        engine,
+        Some(deadline),
+        label,
+    )
+}
+
+/// Engine-wiring probe for a generic [`ny_core::GemmEngine`].
+///
+/// Generic GEMM has no cooperative-cancellation contract, so production
+/// finite-deadline CROWN must refuse it. Tests that specifically need to
+/// observe generic engine dispatch use this explicitly unbounded entry.
+pub(in crate::tests::core::avoice::kokoro_vocoder) fn spec_guided_crown_with_unbounded_engine(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    node_bounds: &HashMap<String, BoundedTensor>,
+    spec: &Array2<f32>,
+    engine: &dyn ny_core::GemmEngine,
+    label: &str,
+) -> (Vec<f32>, Vec<f32>) {
+    spec_guided_crown_with_engine_and_deadline(
+        graph,
+        input,
+        node_bounds,
+        spec,
+        Some(engine),
+        None,
+        label,
+    )
+}
+
+fn spec_guided_crown_with_engine_and_deadline(
+    graph: &GraphNetwork,
+    input: &BoundedTensor,
+    node_bounds: &HashMap<String, BoundedTensor>,
+    spec: &Array2<f32>,
+    engine: Option<&dyn ny_core::GemmEngine>,
+    deadline: Option<Instant>,
+    label: &str,
+) -> (Vec<f32>, Vec<f32>) {
     let result = graph
         .propagate_crown_with_specs_and_engine_with_node_bounds_and_deadline(
             input,
             spec,
             engine,
             node_bounds,
-            Some(deadline),
+            deadline,
         )
         .unwrap_or_else(|err| panic!("{label}: {err}"));
     let flat = result.flatten();

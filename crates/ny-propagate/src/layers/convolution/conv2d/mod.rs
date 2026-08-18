@@ -23,18 +23,28 @@ mod types;
 mod tests;
 
 #[cfg(test)]
+pub(crate) use bound_transpose_patches::ConvTransposePatchesDeadlineFailpoint;
+#[cfg(test)]
 pub(crate) use ops::conv2d_single_grouped;
 #[cfg(test)]
 pub(crate) use ops::conv2d_transpose;
+pub(crate) use ops::conv2d_transpose_grouped_into_f64;
+pub(crate) use ops::conv2d_transpose_operator_matrix;
 pub(crate) use ops::{conv2d_single, conv2d_transpose_grouped};
 pub(crate) use ops_gemm::conv2d_forward_backward_coeff_f64;
 pub(crate) use ops_gemm::conv2d_forward_backward_coeff_f64_pair_with_deadline;
 pub(crate) use ops_gemm::conv2d_forward_backward_coeff_f64_with_deadline;
 pub(crate) use ops_gemm::conv2d_forward_batched_gemm;
+pub(crate) use ops_gemm::conv2d_forward_batched_gemm_with_deadline;
 pub(crate) use ops_transpose_fwd::conv2d_transpose_forward;
 pub(crate) use ops_transpose_gemm::conv2d_transpose_backward_coeff_f64;
+pub(crate) use ops_transpose_gemm::conv2d_transpose_backward_coeff_f64_with_deadline;
+pub(crate) use ops_transpose_gemm::conv2d_transpose_backward_coeff_f64_with_engine_and_deadline;
 pub(crate) use ops_transpose_gemm::conv2d_transpose_batched_gemm_grouped_with_deadline;
 pub(crate) use ops_transpose_gemm::conv2d_transpose_pair_batched_gemm_grouped_with_deadline;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use ops_transpose_gemm::effective_crown_mem_cap_mb_for_test;
+pub(crate) use ops_transpose_gemm::DEADLINE_BOUNDED_CONV_HOST_BUFFER_BYTES;
 pub use types::{Conv2dLayer, ConvTranspose2dLayer};
 
 /// Batched conv2d transpose via GEMM for CROWN backward pass with groups support.

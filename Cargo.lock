@@ -55,6 +55,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ambient-authority"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -185,8 +191,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay-arrays"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -195,8 +201,8 @@ dependencies = [
 
 [[package]]
 name = "ay-bv"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-sys",
@@ -207,8 +213,8 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
@@ -224,8 +230,8 @@ dependencies = [
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -234,8 +240,8 @@ dependencies = [
 
 [[package]]
 name = "ay-dpll"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -274,18 +280,19 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-proof-common",
+ "ay-sys",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ay-dt"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -294,8 +301,8 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
@@ -305,8 +312,8 @@ dependencies = [
 
 [[package]]
 name = "ay-fp"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -317,8 +324,8 @@ dependencies = [
 
 [[package]]
 name = "ay-frontend"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "logos",
@@ -331,8 +338,8 @@ dependencies = [
 
 [[package]]
 name = "ay-intsat"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -342,8 +349,8 @@ dependencies = [
 
 [[package]]
 name = "ay-jit"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "serde",
@@ -352,8 +359,8 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-intsat",
@@ -367,8 +374,8 @@ dependencies = [
 
 [[package]]
 name = "ay-lra"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -383,30 +390,37 @@ dependencies = [
 
 [[package]]
 name = "ay-map"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-milp"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-dpll",
  "ay-lra",
+ "ay-pb-core",
+ "ay-sat",
+ "ay-sys",
  "num-bigint",
  "num-integer",
  "num-rational",
  "num-traits",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ay-model-check"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -417,16 +431,16 @@ dependencies = [
 
 [[package]]
 name = "ay-multiset"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-lia",
@@ -443,8 +457,8 @@ dependencies = [
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -452,8 +466,8 @@ dependencies = [
 
 [[package]]
 name = "ay-nra"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-lra",
@@ -468,14 +482,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "ay-pb-core"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
+dependencies = [
+ "ay-core",
+ "ay-sat",
+ "ay-sys",
+ "libc",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ay-prefetch"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 
 [[package]]
 name = "ay-proof"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -488,16 +522,16 @@ dependencies = [
 
 [[package]]
 name = "ay-proof-common"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -520,13 +554,13 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 
 [[package]]
 name = "ay-seq"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -534,16 +568,16 @@ dependencies = [
 
 [[package]]
 name = "ay-set"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -552,10 +586,11 @@ dependencies = [
 
 [[package]]
 name = "ay-sys"
-version = "0.3.0"
-source = "git+https://github.com/alabsystems/ay.git?rev=d766b0365d2cf614428bfea6debb8c02a815f384#d766b0365d2cf614428bfea6debb8c02a815f384"
+version = "0.10.0"
+source = "git+https://github.com/alabsystems/ay.git?rev=ac00c30a825721e7a6dd82043e43d01af35e7b60#ac00c30a825721e7a6dd82043e43d01af35e7b60"
 dependencies = [
  "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -569,12 +604,6 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
-name = "base64ct"
-version = "1.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beef"
@@ -714,6 +743,48 @@ dependencies = [
  "tokenizers",
  "yoke",
  "zip 7.2.0",
+]
+
+[[package]]
+name = "cap-fs-ext"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b"
+dependencies = [
+ "cap-primitives",
+ "cap-std",
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "cap-primitives"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdadbd7c002d3a484b35243669abdae85a0ebaded5a61117169dc3400f9a7ff0"
+dependencies = [
+ "ambient-authority",
+ "fs-set-times",
+ "io-extras",
+ "io-lifetimes 3.0.1",
+ "ipnet",
+ "maybe-owned",
+ "rustix",
+ "rustix-linux-procfs",
+ "windows-sys 0.61.2",
+ "winx",
+]
+
+[[package]]
+name = "cap-std"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
+dependencies = [
+ "cap-primitives",
+ "io-extras",
+ "io-lifetimes 3.0.1",
+ "rustix",
 ]
 
 [[package]]
@@ -889,22 +960,6 @@ name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
-
-[[package]]
-name = "core-foundation"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
-name = "core-foundation-sys"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "coreml-proto"
@@ -1117,16 +1172,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac6b926516df9c60bfa16e107b21086399f8285a44ca9711344b9e553c5146e2"
 
 [[package]]
-name = "der"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
-dependencies = [
- "pem-rfc7468",
- "zeroize",
-]
-
-[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1315,7 +1360,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1427,19 +1472,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
-name = "foreign-types"
-version = "0.3.2"
+name = "fs-set-times"
+version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
+checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
- "foreign-types-shared",
+ "io-lifetimes 2.0.4",
+ "rustix",
+ "windows-sys 0.52.0",
 ]
-
-[[package]]
-name = "foreign-types-shared"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "futures-core"
@@ -1613,6 +1654,17 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasi",
 ]
 
 [[package]]
@@ -1847,6 +1899,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-extras"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
+dependencies = [
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "io-lifetimes"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
+
+[[package]]
+name = "io-lifetimes"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96"
+
+[[package]]
+name = "ipnet"
+version = "2.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+
+[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1854,7 +1934,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2145,6 +2225,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "maybe-owned"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2301,23 +2387,6 @@ checksum = "b9a513473dce7dc00c7e7c318481ca4494034e76997218d8dad51bd9f007a815"
 dependencies = [
  "nano-gemm-codegen",
  "nano-gemm-core",
-]
-
-[[package]]
-name = "native-tls"
-version = "0.2.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "465500e14ea162429d264d44189adc38b199b62b1c21eea9f69e4b73cb03bbf2"
-dependencies = [
- "libc",
- "log",
- "openssl",
- "openssl-probe",
- "openssl-sys",
- "schannel",
- "security-framework",
- "security-framework-sys",
- "tempfile",
 ]
 
 [[package]]
@@ -2497,8 +2566,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ny-accelerate"
+version = "0.2.0"
+dependencies = [
+ "faer",
+ "libc",
+ "ndarray",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "ny-core",
+ "ny-propagate",
+ "rayon",
+ "tracing",
+]
+
+[[package]]
 name = "ny-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blas-src",
  "half",
@@ -2515,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "ny-build"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blas-src",
  "ndarray",
@@ -2530,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "ny-cert"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ntest",
  "num-bigint",
@@ -2545,23 +2630,27 @@ dependencies = [
 
 [[package]]
 name = "ny-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "ay-sat",
  "blas-src",
  "clap",
  "flate2",
+ "libc",
  "mimalloc",
  "ndarray",
  "ntest",
  "num-rational",
  "num-traits",
+ "ny-accelerate",
  "ny-api",
  "ny-cert",
  "ny-core",
  "ny-cuda",
  "ny-gpu",
  "ny-groundtruth",
+ "ny-levers",
  "ny-mip",
  "ny-onnx",
  "ny-propagate",
@@ -2571,7 +2660,9 @@ dependencies = [
  "prost",
  "rand 0.10.1",
  "rayon",
+ "rustix",
  "serde",
+ "serde_ignored",
  "serde_json",
  "serde_yaml",
  "sha2",
@@ -2583,11 +2674,11 @@ dependencies = [
 
 [[package]]
 name = "ny-contracts"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ny-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "half",
  "ntest",
@@ -2599,22 +2690,26 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ny-cuda"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cudarc",
+ "libc",
  "ny-core",
+ "ny-test-utils",
+ "sha2",
  "tracing",
 ]
 
 [[package]]
 name = "ny-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "blas-src",
@@ -2622,13 +2717,19 @@ dependencies = [
  "criterion",
  "naga",
  "ndarray",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
  "ny-core",
+ "ny-gpu-passthrough",
+ "ny-levers",
  "ny-propagate",
  "ny-tensor",
  "ny-test-utils",
  "pollster",
  "proptest",
  "rayon",
+ "sha2",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -2636,8 +2737,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ny-gpu-passthrough"
+version = "0.2.0"
+dependencies = [
+ "naga",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "ny-groundtruth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ndarray",
  "num-bigint",
@@ -2654,12 +2764,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ny-levers"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "ny-lint-guard"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ny-load"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blas-src",
  "flate2",
@@ -2675,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "ny-mip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ay-milp",
  "blas-src",
@@ -2687,27 +2804,32 @@ dependencies = [
  "num-traits",
  "ny-cert",
  "ny-core",
+ "ny-levers",
  "ny-tensor",
  "ny-test-utils",
  "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tracing",
 ]
 
 [[package]]
 name = "ny-onnx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "blas-src",
  "bytemuck",
  "candle-core",
+ "cap-fs-ext",
+ "cap-std",
  "coreml-proto",
  "flate2",
  "gguf",
  "half",
  "libm",
- "memmap2",
  "ndarray",
  "npyz",
  "ntest",
@@ -2717,6 +2839,7 @@ dependencies = [
  "ny-build",
  "ny-core",
  "ny-gpu",
+ "ny-levers",
  "ny-load",
  "ny-propagate",
  "ny-tensor",
@@ -2724,8 +2847,10 @@ dependencies = [
  "ort",
  "prost",
  "safetensors",
+ "same-file",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -2736,7 +2861,7 @@ dependencies = [
 
 [[package]]
 name = "ny-propagate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "approx",
@@ -2745,6 +2870,7 @@ dependencies = [
  "criterion",
  "faer",
  "half",
+ "hashbrown 0.16.1",
  "libm",
  "ndarray",
  "ntest",
@@ -2752,13 +2878,16 @@ dependencies = [
  "num-rational",
  "num-traits",
  "ny-cert",
+ "ny-contracts",
  "ny-core",
  "ny-gpu",
+ "ny-levers",
  "ny-tensor",
  "ny-test-utils",
  "proptest",
  "rand 0.10.1",
  "rayon",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "sha2",
@@ -2767,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "ny-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blas-src",
  "ndarray",
@@ -2784,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "ny-relaxation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libm",
  "ndarray",
@@ -2795,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "ny-tensor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "blas-src",
@@ -2808,12 +2937,13 @@ dependencies = [
  "proptest",
  "rayon",
  "serde",
+ "serde_json",
  "tracing",
 ]
 
 [[package]]
 name = "ny-test-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ny-core",
  "ny-tensor",
@@ -2821,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "ny-trace-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "half",
  "ndarray",
@@ -2948,49 +3078,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "openssl"
-version = "0.10.81"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77823a27f0babb03091cb9ed9ef80af3b39dbc82f97e8fa530374b7dafd87a45"
-dependencies = [
- "bitflags",
- "cfg-if",
- "foreign-types",
- "libc",
- "openssl-macros",
- "openssl-sys",
-]
-
-[[package]]
-name = "openssl-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "openssl-probe"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "openssl-sys"
-version = "0.9.117"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "ordered-float"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3060,15 +3147,6 @@ checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest",
  "hmac",
-]
-
-[[package]]
-name = "pem-rfc7468"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
-dependencies = [
- "base64ct",
 ]
 
 [[package]]
@@ -3642,6 +3720,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "ring"
+version = "0.17.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "getrandom 0.2.17",
+ "libc",
+ "untrusted",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3672,7 +3764,32 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rustix-linux-procfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
+dependencies = [
+ "once_cell",
+ "rustix",
+]
+
+[[package]]
+name = "rustls"
+version = "0.23.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+dependencies = [
+ "log",
+ "once_cell",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -3682,6 +3799,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted",
 ]
 
 [[package]]
@@ -3729,15 +3857,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "schannel"
-version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3748,29 +3867,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "security-framework"
-version = "3.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
-dependencies = [
- "bitflags",
- "core-foundation",
- "core-foundation-sys",
- "libc",
- "security-framework-sys",
-]
-
-[[package]]
-name = "security-framework-sys"
-version = "2.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
 
 [[package]]
 name = "semver"
@@ -3812,6 +3908,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3876,6 +3982,26 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
 
 [[package]]
 name = "simd-adler32"
@@ -4049,7 +4175,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4349,21 +4475,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
+name = "untrusted"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
 name = "ureq"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64 0.22.1",
- "der",
  "log",
- "native-tls",
  "percent-encoding",
+ "rustls",
  "rustls-pki-types",
  "socks",
  "ureq-proto",
  "utf8-zero",
- "webpki-root-certs",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4397,12 +4528,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4426,6 +4551,12 @@ dependencies = [
  "same-file",
  "winapi-util",
 ]
+
+[[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
@@ -4514,10 +4645,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "webpki-root-certs"
-version = "1.0.8"
+name = "webpki-roots"
+version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -4712,7 +4843,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4828,13 +4959,22 @@ version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a3e1820f08b8513f676f7ab6c1f99ff312fb97b553d30ff4dd86f9f15728aa7"
 dependencies = [
- "windows_aarch64_gnullvm",
- "windows_aarch64_msvc",
- "windows_i686_gnu",
- "windows_i686_msvc",
- "windows_x86_64_gnu",
- "windows_x86_64_gnullvm",
- "windows_x86_64_msvc",
+ "windows_aarch64_gnullvm 0.42.2",
+ "windows_aarch64_msvc 0.42.2",
+ "windows_i686_gnu 0.42.2",
+ "windows_i686_msvc 0.42.2",
+ "windows_x86_64_gnu 0.42.2",
+ "windows_x86_64_gnullvm 0.42.2",
+ "windows_x86_64_msvc 0.42.2",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
 ]
 
 [[package]]
@@ -4844,6 +4984,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "windows-targets"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
+dependencies = [
+ "windows_aarch64_gnullvm 0.52.6",
+ "windows_aarch64_msvc 0.52.6",
+ "windows_i686_gnu 0.52.6",
+ "windows_i686_gnullvm",
+ "windows_i686_msvc 0.52.6",
+ "windows_x86_64_gnu 0.52.6",
+ "windows_x86_64_gnullvm 0.52.6",
+ "windows_x86_64_msvc 0.52.6",
 ]
 
 [[package]]
@@ -4862,10 +5018,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "597a5118570b68bc08d8d59125332c54f1ba9d9adeedeef5b99b02ba2b0698f8"
 
 [[package]]
+name = "windows_aarch64_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
+
+[[package]]
 name = "windows_aarch64_msvc"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e08e8864a60f06ef0d0ff4ba04124db8b0fb3be5776a5cd47641e942e58c4d43"
+
+[[package]]
+name = "windows_aarch64_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -4874,10 +5042,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c61d927d8da41da96a81f029489353e68739737d3beca43145c8afec9a31a84f"
 
 [[package]]
+name = "windows_i686_gnu"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
+
+[[package]]
+name = "windows_i686_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
+
+[[package]]
 name = "windows_i686_msvc"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44d840b6ec649f480a41c8d80f9c65108b92d89345dd94027bfe06ac444d1060"
+
+[[package]]
+name = "windows_i686_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
 
 [[package]]
 name = "windows_x86_64_gnu"
@@ -4886,10 +5072,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8de912b8b8feb55c064867cf047dda097f92d51efad5b491dfb98f6bbb70cb36"
 
 [[package]]
+name = "windows_x86_64_gnu"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
+
+[[package]]
 name = "windows_x86_64_gnullvm"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26d41b46a36d453748aedef1486d5c7a85db22e56aff34643984ea85514e94a3"
+
+[[package]]
+name = "windows_x86_64_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
 
 [[package]]
 name = "windows_x86_64_msvc"
@@ -4898,12 +5096,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9aec5da331524158c6d1a4ac0ab1541149c0b9505fde06423b02f5ef0106b9f0"
 
 [[package]]
+name = "windows_x86_64_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
 name = "winnow"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winx"
+version = "0.36.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
+dependencies = [
+ "bitflags",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -166,16 +166,46 @@ fn base_tensor_shapes() -> HashMap<String, Vec<i64>> {
     ])
 }
 
+fn rank_two_tensor_shapes() -> HashMap<String, Vec<i64>> {
+    HashMap::from([
+        ("input".to_string(), vec![1, 4]),
+        ("mean_a_out".to_string(), vec![1, 1]),
+        ("mean_b_out".to_string(), vec![1, 1]),
+        ("center_var_out".to_string(), vec![1, 4]),
+        ("square_out".to_string(), vec![1, 4]),
+        ("var_mean_out".to_string(), vec![1, 1]),
+        ("var_eps_out".to_string(), vec![1, 1]),
+        ("std_out".to_string(), vec![1, 1]),
+        ("center_norm_out".to_string(), vec![1, 4]),
+        ("norm_out".to_string(), vec![1, 4]),
+        ("eps".to_string(), vec![]),
+    ])
+}
+
 fn build_graph_from_layers(
     layers: Vec<LayerSpec>,
     tensor_shapes: HashMap<String, Vec<i64>>,
 ) -> ny_propagate::GraphNetwork {
-    let inputs = vec![tensor_spec("input", &[1, 2, 4])];
-    let outputs = vec![tensor_spec("norm_out", &[1, 2, 4])];
+    build_graph_from_layers_with_eps(layers, tensor_shapes, 1e-5)
+}
+
+fn build_graph_from_layers_with_eps(
+    layers: Vec<LayerSpec>,
+    tensor_shapes: HashMap<String, Vec<i64>>,
+    eps: f32,
+) -> ny_propagate::GraphNetwork {
+    let inputs = vec![tensor_spec(
+        "input",
+        tensor_shapes.get("input").expect("input shape"),
+    )];
+    let outputs = vec![tensor_spec(
+        "norm_out",
+        tensor_shapes.get("norm_out").expect("output shape"),
+    )];
     let mut weights = WeightStore::new();
     weights.insert(
         "eps".to_string(),
-        ArrayD::from_shape_vec(IxDyn(&[]), vec![1e-5]).expect("scalar eps"),
+        ArrayD::from_shape_vec(IxDyn(&[]), vec![eps]).expect("scalar eps"),
     );
     let tensor_producer = HashMap::new();
     let constant_tensors = HashSet::new();
@@ -202,6 +232,44 @@ fn build_decomposed_instance_norm_reciprocal_mul_graph(axes: i64) -> ny_propagat
     let mut shapes = base_tensor_shapes();
     shapes.insert("inv_std_out".to_string(), vec![1, 2, 1]);
     build_graph_from_layers(decomposed_instance_norm_reciprocal_mul_layers(axes), shapes)
+}
+
+fn pow_square_pattern_matches(exponent: f32) -> bool {
+    let mut layers = variance_chain_layers(2);
+    layers[3] = layer_spec(
+        "square",
+        LayerType::Pow,
+        &["center_var_out", "exponent"],
+        &["square_out"],
+        HashMap::new(),
+    );
+    let output_to_spec = layers
+        .iter()
+        .enumerate()
+        .flat_map(|(index, spec)| spec.outputs.iter().cloned().map(move |name| (name, index)))
+        .collect::<HashMap<_, _>>();
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "exponent".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[]), vec![exponent]).expect("scalar exponent"),
+    );
+    let shapes = base_tensor_shapes();
+    let constants = HashSet::new();
+    let context = ConvertContext::new(&weights, &shapes, &constants);
+
+    extract_squared_centered_input_tensor("square_out", &layers, &output_to_spec, &context)
+        .is_some()
+}
+
+#[test]
+fn pow_square_fusion_requires_exact_exponent() {
+    assert!(pow_square_pattern_matches(2.0));
+    assert!(!pow_square_pattern_matches(f32::from_bits(
+        2.0_f32.to_bits() - 1
+    )));
+    assert!(!pow_square_pattern_matches(f32::from_bits(
+        2.0_f32.to_bits() + 1
+    )));
 }
 
 #[test]
@@ -238,6 +306,34 @@ fn does_not_fuse_reduce_mean_over_non_terminal_axis_3591() {
     assert!(
         matches!(norm_div.layer(), Layer::Div(_)),
         "expected non-matching pattern to remain a Div node, got {:?}",
+        norm_div.layer()
+    );
+}
+
+#[test]
+fn does_not_fuse_rank_two_last_axis_normalization_to_instance_norm() {
+    let graph =
+        build_graph_from_layers(decomposed_instance_norm_layers(1), rank_two_tensor_shapes());
+    let norm_div = graph.node("norm_div").expect("norm_div node should exist");
+    assert!(
+        matches!(norm_div.layer(), Layer::Div(_)),
+        "rank-2 last-axis normalization must remain decomposed, got {:?}",
+        norm_div.layer()
+    );
+}
+
+#[test]
+fn does_not_fuse_epsilon_below_supported_normalization_range() {
+    let unsupported_eps = f32::from_bits(NORMALIZATION_MIN_EPS.to_bits() - 1);
+    let graph = build_graph_from_layers_with_eps(
+        decomposed_instance_norm_layers(2),
+        base_tensor_shapes(),
+        unsupported_eps,
+    );
+    let norm_div = graph.node("norm_div").expect("norm_div node should exist");
+    assert!(
+        matches!(norm_div.layer(), Layer::Div(_)),
+        "a semantically distinct epsilon must remain decomposed, got {:?}",
         norm_div.layer()
     );
 }

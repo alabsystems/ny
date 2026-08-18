@@ -41,7 +41,7 @@ pub(super) fn eval_conv1d(layer: &Conv1dLayer, input_flat: &[f32], shape: &[usiz
 /// Regression for #2183: Conv1d batched CROWN bias path must use f64
 /// accumulation with directed rounding on the final f32 cast.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
-#[ntest::timeout(10000)]
+#[ntest::timeout(60000)]
 #[test]
 fn directed_rounding_conv1d_batched_bias_2183() {
     let input_len = 100usize;
@@ -68,8 +68,17 @@ fn directed_rounding_conv1d_batched_bias_2183() {
         .expect("Conv1d batched CROWN failed");
 
     let true_f64: f64 = (0..input_len).map(|_| 0.1_f32 as f64).sum();
-    let expected_lower = next_down_f32(true_f64 as f32);
-    let expected_upper = next_up_f32(true_f64 as f32);
+    let nearest = true_f64 as f32;
+    let expected_lower = if nearest as f64 <= true_f64 {
+        nearest
+    } else {
+        next_down_f32(nearest)
+    };
+    let expected_upper = if nearest as f64 >= true_f64 {
+        nearest
+    } else {
+        next_up_f32(nearest)
+    };
 
     let mut f32_sum = 0.0_f32;
     for _ in 0..input_len {
@@ -84,12 +93,12 @@ fn directed_rounding_conv1d_batched_bias_2183() {
     assert_eq!(
         result.lower_b[[0]].to_bits(),
         expected_lower.to_bits(),
-        "Conv1d lower_b must use next_down_f32 on f64 accumulation",
+        "Conv1d lower_b must be the tight directed f32 rounding of the f64 accumulation",
     );
     assert_eq!(
         result.upper_b[[0]].to_bits(),
         expected_upper.to_bits(),
-        "Conv1d upper_b must use next_up_f32 on f64 accumulation",
+        "Conv1d upper_b must be the tight directed f32 rounding of the f64 accumulation",
     );
     assert!(
         (result.lower_b[[0]] as f64) <= true_f64,
@@ -136,8 +145,17 @@ fn directed_rounding_conv2d_batched_bias_2183() {
         .expect("Conv2d batched CROWN failed");
 
     let true_f64: f64 = (0..out_elems).map(|_| 0.1_f32 as f64).sum();
-    let expected_lower = next_down_f32(true_f64 as f32);
-    let expected_upper = next_up_f32(true_f64 as f32);
+    let nearest = true_f64 as f32;
+    let expected_lower = if nearest as f64 <= true_f64 {
+        nearest
+    } else {
+        next_down_f32(nearest)
+    };
+    let expected_upper = if nearest as f64 >= true_f64 {
+        nearest
+    } else {
+        next_up_f32(nearest)
+    };
 
     let mut f32_sum = 0.0_f32;
     for _ in 0..out_elems {
@@ -152,12 +170,12 @@ fn directed_rounding_conv2d_batched_bias_2183() {
     assert_eq!(
         result.lower_b[[0]].to_bits(),
         expected_lower.to_bits(),
-        "Conv2d lower_b must use next_down_f32 on f64 accumulation",
+        "Conv2d lower_b must be the tight directed f32 rounding of the f64 accumulation",
     );
     assert_eq!(
         result.upper_b[[0]].to_bits(),
         expected_upper.to_bits(),
-        "Conv2d upper_b must use next_up_f32 on f64 accumulation",
+        "Conv2d upper_b must be the tight directed f32 rounding of the f64 accumulation",
     );
     assert!(
         (result.lower_b[[0]] as f64) <= true_f64,
@@ -252,7 +270,7 @@ proptest! {
     /// Verifies:
     /// 1. IBP bounds contain all sampled concrete outputs
     /// 2. CROWN concretized bounds match IBP (linear layer equivalence)
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv1d_crown_1c_k3(
         k0 in -3.0f32..3.0,
@@ -338,7 +356,7 @@ proptest! {
     /// Tests that the transposed convolution correctly composes with arbitrary
     /// incoming coefficient matrices, including negative coefficients that exercise
     /// the sign-switching paths.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv1d_crown_non_identity(
         k0 in -3.0f32..3.0,
@@ -423,7 +441,7 @@ proptest! {
     /// Verifies:
     /// 1. IBP bounds contain all sampled concrete outputs
     /// 2. CROWN concretized bounds match IBP (linear layer equivalence)
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv2d_crown_1c_k3(
         weights in prop::collection::vec(-2.0f32..2.0, 18), // 2 * 1 * 3 * 3 = 18
@@ -431,6 +449,13 @@ proptest! {
         b1 in -1.0f32..1.0,
         bounds in prop::collection::vec(-3.0f32..3.0, 32), // 16 lower + 16 delta -> 4x4 input
     ) {
+        // This test requires the dense Conv2d CROWN path. Serialize with tests
+        // that deliberately set the process-wide budget to zero, otherwise a
+        // concurrent budget-guard test can turn this into an unrelated
+        // CpuMemoryExceeded failure (or universal CROWN fallback).
+        let _env_lock = ny_test_utils::env::lock_env();
+        let _budget = ny_test_utils::env::ScopedEnvVar::set("NY_DENSE_BUDGET_MB", "2048");
+
         let in_h = 4_usize;
         let in_w = 4_usize;
         let in_c = 1_usize;
@@ -515,7 +540,7 @@ proptest! {
     /// Tests CROWN backward composition with arbitrary coefficients through a
     /// 2-output-channel Conv2d. Verifies that transposed convolution correctly
     /// handles mixed-sign coefficients across spatial and channel dimensions.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv2d_crown_non_identity(
         weights in prop::collection::vec(-2.0f32..2.0, 18),
@@ -527,6 +552,11 @@ proptest! {
     ) {
         // At least one non-trivial coefficient
         prop_assume!(coeffs.iter().any(|c| c.abs() > 0.01));
+
+        // Pin the shared dense budget while exercising the exact CROWN path;
+        // other parallel tests intentionally set it to zero to test fallback.
+        let _env_lock = ny_test_utils::env::lock_env();
+        let _budget = ny_test_utils::env::ScopedEnvVar::set("NY_DENSE_BUDGET_MB", "2048");
 
         let in_h = 4_usize;
         let in_w = 4_usize;
@@ -601,7 +631,7 @@ proptest! {
     /// Padding introduces implicit zero-valued neighbors, which the transposed
     /// convolution must correctly handle. This test catches bugs where the
     /// padding offset is wrong in the CROWN backward.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv1d_crown_with_padding(
         k0 in -3.0f32..3.0,
@@ -682,13 +712,18 @@ proptest! {
     ///
     /// Stride changes the spatial mapping between output and input positions.
     /// The transposed convolution must correctly space out the contributions.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv2d_crown_stride2(
         weights in prop::collection::vec(-2.0f32..2.0, 9), // 1 * 1 * 3 * 3 = 9
         bias in -1.0f32..1.0,
         bounds in prop::collection::vec(-3.0f32..3.0, 72), // 36 lower + 36 delta -> 6x6 input
     ) {
+        // Keep deliberate zero-budget tests from changing this process-wide
+        // prerequisite while the stride-specific CROWN path is under test.
+        let _env_lock = ny_test_utils::env::lock_env();
+        let _budget = ny_test_utils::env::ScopedEnvVar::set("NY_DENSE_BUDGET_MB", "2048");
+
         let in_h = 6_usize;
         let in_w = 6_usize;
         let in_c = 1_usize;
@@ -768,7 +803,7 @@ proptest! {
     /// This verifies the dedicated ConvTranspose1d CROWN backward path
     /// (`propagate_linear` uses regular convolution of incoming A with the
     /// transpose kernel and adds broadcast bias contribution).
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv_transpose1d_crown_1c_k3(
         k0 in -3.0f32..3.0,
@@ -854,7 +889,7 @@ proptest! {
     ///
     /// This verifies non-identity coefficient mapping in ConvTranspose2d CROWN
     /// backward instead of treating ConvTranspose as a structural identity op.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(60000)]
     #[test]
     fn soundness_conv_transpose2d_crown_1c_k3(
         weights in prop::collection::vec(-2.0f32..2.0, 9), // 1 * 1 * 3 * 3

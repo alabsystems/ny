@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "external-vnncomp")]
+
 //! Regression coverage for the real nn4sys parallel pensieve lane.
 //!
 //! This pins the `pensieve_big_parallel` path that regressed from running BaB

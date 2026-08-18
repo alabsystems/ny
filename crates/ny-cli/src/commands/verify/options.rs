@@ -6,35 +6,37 @@
 //! and verification spec construction.
 
 use anyhow::Result;
-use ny_core::{checked_shape_product, Bound, VerificationSpec};
+use ny_core::{checked_shape_product, Bound, GemmEngine, VerificationSpec};
 use ny_onnx::vnnlib::{load_vnnlib, VnnLibSpec};
 use ny_propagate::layers::{LayerNormCrownMode, LayerNormMode};
 use ny_propagate::{MulBinaryRelaxationMode, PropagationConfig, PropagationMethod};
 use std::path::Path;
 use tracing::{debug, info};
 
+#[cfg(test)]
+use super::super::backend::emit_backend_override;
+use super::super::backend::{
+    BackendRequest, BackendRequestSource, ProofBackendReceipt, WgpuProofRefusal,
+};
 use super::super::JsonCliError;
 use crate::BackendArg;
 
 /// Parse a CLI method string into a `PropagationMethod`.
 ///
-/// `sdp`/`sdp-crown` parses so the method stays addressable, but SDP-CROWN is
-/// only valid over an ℓ2 input ball: verification refuses it for the ℓ∞ box
-/// specs this command builds (epsilon balls and VNN-LIB boxes), so it fails
-/// at verify time rather than here.
+/// SDP-CROWN is intentionally rejected here: the CLI currently constructs
+/// only ℓ∞ box specifications, while SDP-CROWN requires an ℓ2 input ball.
 pub(crate) fn parse_method(method: &str) -> Result<PropagationMethod> {
     match method {
         "ibp" => Ok(PropagationMethod::Ibp),
         "crown" => Ok(PropagationMethod::Crown),
         "alpha" => Ok(PropagationMethod::AlphaCrown),
-        "sdp" | "sdp-crown" => Ok(PropagationMethod::SdpCrown),
+        "sdp" | "sdp-crown" => anyhow::bail!(
+            "SDP-CROWN requires an ℓ2 input-ball specification, which `ny verify` \
+             does not yet expose; use crown or alpha"
+        ),
         "beta" => Ok(PropagationMethod::BetaCrown),
         _ => {
-            anyhow::bail!(
-                "Unknown method: {}. Use ibp, crown, alpha, sdp-crown (ℓ2 input balls only; \
-                 refused for ℓ∞ box specs), or beta",
-                method
-            );
+            anyhow::bail!("Unknown method: {}. Use ibp, crown, alpha, or beta", method);
         }
     }
 }
@@ -46,7 +48,24 @@ pub(crate) fn validate_option_compatibility(
     use_block_wise: bool,
     allow_heuristic_logsoftmax: bool,
     allow_heuristic_softmax: bool,
+    max_blocks: usize,
 ) -> Result<()> {
+    if layer_by_layer && use_block_wise {
+        return Err(JsonCliError::new(
+            "incompatible_options",
+            "--layer-by-layer cannot be combined with --block-wise or --checkpoint.",
+        )
+        .into());
+    }
+
+    if max_blocks > 0 && !use_block_wise {
+        return Err(JsonCliError::new(
+            "incompatible_options",
+            "--max-blocks requires --block-wise or --checkpoint.",
+        )
+        .into());
+    }
+
     if require_sound && (layer_by_layer || use_block_wise) {
         let mode = if layer_by_layer {
             "layer-by-layer"
@@ -101,30 +120,94 @@ pub(crate) fn resolve_effective_method(
     }
 }
 
-/// Resolved backend configuration after GPU fallback handling.
+/// Resolved backend configuration after live proof qualification and fallback.
 ///
-/// Wraps the shared `GemmBackendResolution` from `backend.rs`, keeping the
-/// selected device alive so standard verification can call the explicit
-/// `*_with_engine` verifier APIs.
+/// Keeps an admitted device alive so standard verification can call the
+/// explicit `*_with_engine` verifier APIs. `backend` always names execution,
+/// not merely the request.
 pub(crate) struct ResolvedBackend<T = ny_gpu::ComputeDevice> {
     pub(crate) backend: BackendArg,
     pub(crate) use_gpu: bool,
     pub(crate) device: Option<T>,
+    pub(crate) receipt: ProofBackendReceipt,
+}
+
+/// Whether this verify execution path can consume the qualified f32 CROWN
+/// engine. IBP-only diagnostic modes and the independent f64 implementation do
+/// not reach that seam, so qualifying WGPU for them would create an unused
+/// context and falsely report accelerated proof execution.
+#[must_use]
+pub(crate) const fn supports_qualified_wgpu_proof(
+    method: PropagationMethod,
+    layer_by_layer: bool,
+    use_block_wise: bool,
+    double_fp: bool,
+) -> bool {
+    !layer_by_layer
+        && !use_block_wise
+        && !double_fp
+        && matches!(
+            method,
+            PropagationMethod::Crown | PropagationMethod::AlphaCrown | PropagationMethod::BetaCrown
+        )
 }
 
 /// Resolve the effective backend and initialize a compute device if applicable.
 ///
-/// Delegates to the shared `resolve_gemm_backend` helper in `backend.rs` so the
-/// GPU probe/fallback logic is not duplicated. The resolved `ComputeDevice` is
-/// kept alive for downstream `verify_with_engine` / `verify_graph_with_engine`
-/// calls (#3643).
+/// WGPU uses the typed proof constructor, which eagerly qualifies the exact
+/// device it returns. Any initialization/rung refusal emits the unconditional
+/// override receipt and returns a concrete CPU device instead.
 pub(crate) fn resolve_effective_backend(
     backend: BackendArg,
+    backend_automatic: bool,
     gpu: bool,
-    json: bool,
-) -> ResolvedBackend {
-    resolve_effective_backend_with_factory(backend, gpu, json, |effective_backend| {
-        Ok(ny_gpu::ComputeDevice::new(effective_backend.into())?)
+    _json: bool,
+    supports_wgpu_proof: bool,
+) -> Result<ResolvedBackend> {
+    use super::super::backend::{resolve_proof_backend, resolve_proof_backend_with_factories};
+
+    let requested = super::super::backend::resolve_backend(backend, gpu);
+    let source = if backend == BackendArg::Cpu && gpu {
+        BackendRequestSource::LegacyGpuFlag
+    } else if backend_automatic {
+        BackendRequestSource::Auto
+    } else {
+        BackendRequestSource::DefaultedCliValue
+    };
+    let request = BackendRequest {
+        backend: requested,
+        source,
+        selection_reason: None,
+    };
+    let request =
+        super::super::backend::resolve_automatic_wgpu_request(request, supports_wgpu_proof)?;
+    let requested = request.backend;
+    let resolved = if requested == BackendArg::Wgpu && !supports_wgpu_proof {
+        resolve_proof_backend_with_factories(
+            request,
+            "verify",
+            || {
+                let device = ny_gpu::ComputeDevice::new(ny_gpu::Backend::Cpu)?;
+                let provenance = device.backend_provenance().to_string();
+                Ok((device, provenance))
+            },
+            || {
+                Err(WgpuProofRefusal {
+                    reason: "selected verify mode has no qualified f32 CROWN consumer".to_string(),
+                    failed_rung: Some("verify_mode_capability".to_string()),
+                    qualification_provenance: None,
+                })
+            },
+        )?
+    } else {
+        resolve_proof_backend(request, "verify")?
+    };
+    let use_gpu = resolved.receipt.qualified_wgpu_active();
+    Ok(ResolvedBackend {
+        backend: resolved.receipt.effective,
+        use_gpu,
+        device: Some(resolved.device),
+        receipt: resolved.receipt,
     })
 }
 
@@ -132,22 +215,80 @@ pub(crate) fn resolve_effective_backend(
 ///
 /// The verify command uses this in tests to inject a counting `GemmEngine`
 /// while keeping the production code on the normal `ComputeDevice` path.
+#[cfg(test)]
 pub(crate) fn resolve_effective_backend_with_factory<T, F>(
     backend: BackendArg,
     gpu: bool,
-    json: bool,
+    _json: bool,
+    supports_wgpu_proof: bool,
     build_device: F,
 ) -> ResolvedBackend<T>
 where
     F: FnOnce(BackendArg) -> Result<T>,
 {
-    let resolved =
-        super::super::backend::resolve_gemm_backend_with_factory(backend, gpu, json, build_device);
-    let use_gpu = resolved.device.is_some();
-    ResolvedBackend {
-        backend: resolved.backend,
-        use_gpu,
-        device: resolved.device,
+    let requested = super::super::backend::resolve_backend(backend, gpu);
+    let source = if backend == BackendArg::Cpu && gpu {
+        BackendRequestSource::LegacyGpuFlag
+    } else {
+        BackendRequestSource::DefaultedCliValue
+    };
+    let request = BackendRequest {
+        backend: requested,
+        source,
+        selection_reason: None,
+    };
+
+    match requested {
+        BackendArg::Cpu => ResolvedBackend {
+            backend: BackendArg::Cpu,
+            use_gpu: false,
+            device: None,
+            receipt: ProofBackendReceipt::cpu(request, "cpu"),
+        },
+        BackendArg::Wgpu if !supports_wgpu_proof => {
+            let receipt = ProofBackendReceipt::refused_wgpu(
+                request,
+                "cpu",
+                None,
+                Some("verify_mode_capability".to_string()),
+                "selected verify mode has no qualified f32 CROWN consumer",
+            );
+            emit_backend_override("verify", &receipt);
+            ResolvedBackend {
+                backend: BackendArg::Cpu,
+                use_gpu: false,
+                device: None,
+                receipt,
+            }
+        }
+        BackendArg::Wgpu => match build_device(BackendArg::Wgpu) {
+            Ok(device) => ResolvedBackend {
+                backend: BackendArg::Wgpu,
+                use_gpu: true,
+                device: Some(device),
+                receipt: ProofBackendReceipt::qualified_wgpu(
+                    request,
+                    "injected-qualified-proof-device",
+                    "injected-test-adapter",
+                ),
+            },
+            Err(error) => {
+                let receipt = ProofBackendReceipt::refused_wgpu(
+                    request,
+                    "cpu",
+                    None,
+                    Some("proof_device_construction".to_string()),
+                    error.to_string(),
+                );
+                emit_backend_override("verify", &receipt);
+                ResolvedBackend {
+                    backend: BackendArg::Cpu,
+                    use_gpu: false,
+                    device: None,
+                    receipt,
+                }
+            }
+        },
     }
 }
 
@@ -236,6 +377,65 @@ fn checked_verify_shape_product(shape: &[usize], shape_role: &str) -> Result<usi
     })
 }
 
+/// Bound-vector resource ceiling for the CLI adapter. Each entry is two f32
+/// endpoints; larger model dimensions should use a streaming specification
+/// path rather than one attacker-controlled monolithic allocation.
+const MAX_VERIFICATION_BOUND_ELEMENTS: usize = 16 * 1024 * 1024;
+
+fn validate_bound_count(count: usize, role: &str) -> Result<()> {
+    if count > MAX_VERIFICATION_BOUND_ELEMENTS {
+        anyhow::bail!(
+            "Verification adapter {role} dimension {count} exceeds the \
+             {MAX_VERIFICATION_BOUND_ELEMENTS}-element resource limit"
+        );
+    }
+    Ok(())
+}
+
+fn repeated_bounds(bound: Bound, count: usize, role: &str) -> Result<Vec<Bound>> {
+    validate_bound_count(count, role)?;
+    let mut bounds = Vec::new();
+    bounds.try_reserve_exact(count).map_err(|error| {
+        anyhow::anyhow!("Verification adapter could not allocate {count} {role} bounds: {error}")
+    })?;
+    bounds.resize(count, bound);
+    Ok(bounds)
+}
+
+fn shrink_vnnlib_input_bounds_checked(vnnlib: &mut VnnLibSpec, eps: f64) -> Result<()> {
+    if !eps.is_finite() || eps <= 0.0 {
+        anyhow::bail!("--shrink-eps must be positive and finite (got {eps})");
+    }
+
+    let invalid_after_shrink = |lower: f64, upper: f64| {
+        let shrunk_lower = lower + eps;
+        let shrunk_upper = upper - eps;
+        shrunk_lower.is_nan() || shrunk_upper.is_nan() || shrunk_lower > shrunk_upper
+    };
+
+    for (input, &(lower, upper)) in vnnlib.input_bounds.iter().enumerate() {
+        if invalid_after_shrink(lower, upper) {
+            anyhow::bail!(
+                "--shrink-eps {eps} would invalidate VNN-LIB input X_{input} bounds \
+                 [{lower}, {upper}]"
+            );
+        }
+    }
+    for (clause, bounds) in vnnlib.per_clause_input_bounds.iter().enumerate() {
+        for (&input, &(lower, upper)) in bounds {
+            if invalid_after_shrink(lower, upper) {
+                anyhow::bail!(
+                    "--shrink-eps {eps} would invalidate VNN-LIB clause {clause} \
+                     input X_{input} bounds [{lower}, {upper}]"
+                );
+            }
+        }
+    }
+
+    vnnlib.shrink_input_bounds(eps);
+    Ok(())
+}
+
 /// Build a `VerificationSpec` from CLI inputs: epsilon-ball or VNNLIB property.
 ///
 /// Handles batch-dimension squeezing and VNNLIB dimension validation.
@@ -252,8 +452,13 @@ pub(crate) fn build_verification_spec(
     shrink_eps: Option<f64>,
     json: bool,
 ) -> Result<BuiltSpec> {
+    let timeout_ms = timeout.checked_mul(1000).ok_or_else(|| {
+        anyhow::anyhow!("Verification timeout {timeout} seconds overflows milliseconds")
+    })?;
     let input_shape_original = input_shape.clone();
     let input_dim_original = checked_verify_shape_product(&input_shape, "input")?;
+    validate_bound_count(input_dim_original, "input")?;
+    validate_bound_count(output_dim, "output")?;
 
     // Squeeze out leading batch dimension of 1 for epsilon-ball input_dim computation.
     // Conv1d/Conv2d layers expect unbatched inputs.
@@ -275,9 +480,12 @@ pub(crate) fn build_verification_spec(
         // Apply shrink_eps at f64 precision before f32 conversion (#4299).
         // Reference: alpha-beta-CROWN `shrink_vnnlib` (`specifications.py:535-540`).
         if let Some(eps) = shrink_eps {
-            vnnlib.shrink_input_bounds(eps);
+            shrink_vnnlib_input_bounds_checked(&mut vnnlib, eps)?;
             if !json {
-                info!("Shrunk VNN-LIB input bounds by {eps} (soundness defense)");
+                info!(
+                    "Shrunk VNN-LIB input bounds by {eps}; verification now covers \
+                     the resulting smaller property domain"
+                );
             }
         }
         if !json {
@@ -330,8 +538,12 @@ pub(crate) fn build_verification_spec(
 
         let spec = VerificationSpec::from_parts(
             input_bounds,
-            vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY); output_dim],
-            Some(timeout * 1000),
+            repeated_bounds(
+                Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY),
+                output_dim,
+                "output",
+            )?,
+            Some(timeout_ms),
             Some(vnnlib_shape),
         )?;
 
@@ -340,9 +552,13 @@ pub(crate) fn build_verification_spec(
         let eps_bound = Bound::try_new(-epsilon, epsilon)
             .map_err(|e| anyhow::anyhow!("invalid epsilon {epsilon}: {e}"))?;
         let spec = VerificationSpec::from_parts(
-            vec![eps_bound; input_dim],
-            vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY); output_dim],
-            Some(timeout * 1000),
+            repeated_bounds(eps_bound, input_dim, "input")?,
+            repeated_bounds(
+                Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY),
+                output_dim,
+                "output",
+            )?,
+            Some(timeout_ms),
             Some(input_shape),
         )?;
         (spec, None)
@@ -353,7 +569,14 @@ pub(crate) fn build_verification_spec(
 
 #[cfg(test)]
 mod tests {
-    use super::build_verification_spec;
+    use super::{
+        build_verification_spec, parse_method, shrink_vnnlib_input_bounds_checked,
+        supports_qualified_wgpu_proof, validate_option_compatibility,
+        MAX_VERIFICATION_BOUND_ELEMENTS,
+    };
+    use ny_onnx::vnnlib::VnnLibSpec;
+    use ny_propagate::PropagationMethod;
+    use std::path::Path;
 
     #[test]
     fn test_build_verification_spec_rejects_overflowed_input_shape_2602() {
@@ -367,5 +590,125 @@ mod tests {
                 && message.contains("overflows usize"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn build_verification_spec_rejects_timeout_conversion_overflow() {
+        let err = build_verification_spec(vec![1], 1, 0.1, u64::MAX, None, None, None, true)
+            .err()
+            .expect("overflowed timeout must be rejected");
+        assert!(err.to_string().contains("overflows milliseconds"), "{err}");
+    }
+
+    #[test]
+    fn build_verification_spec_rejects_oversized_bound_vectors() {
+        let err = build_verification_spec(
+            vec![1],
+            MAX_VERIFICATION_BOUND_ELEMENTS + 1,
+            0.1,
+            1,
+            None,
+            None,
+            None,
+            true,
+        )
+        .err()
+        .expect("oversized output bounds must reject before allocation");
+        assert!(err.to_string().contains("resource limit"), "{err}");
+    }
+
+    #[test]
+    fn build_verification_spec_rejects_oversized_input_before_loading_property() {
+        let err = build_verification_spec(
+            vec![MAX_VERIFICATION_BOUND_ELEMENTS + 1],
+            1,
+            0.1,
+            1,
+            Some(Path::new("missing.vnnlib")),
+            None,
+            None,
+            true,
+        )
+        .err()
+        .expect("oversized input dimensions must reject before property parsing");
+        assert!(err.to_string().contains("resource limit"), "{err}");
+        assert!(
+            !err.to_string().contains("missing.vnnlib"),
+            "resource validation must precede property I/O: {err}"
+        );
+    }
+
+    #[test]
+    fn shrink_eps_rejects_invalid_values_and_inverted_domains() {
+        for eps in [0.0, -1e-10, f64::NAN, f64::INFINITY] {
+            let err = shrink_vnnlib_input_bounds_checked(&mut VnnLibSpec::new(), eps)
+                .expect_err("invalid shrink epsilon must return an error, not panic");
+            assert!(err.to_string().contains("positive and finite"), "{err}");
+        }
+
+        let mut spec = VnnLibSpec::new();
+        spec.input_bounds = vec![(0.0, 0.1)];
+        let err = shrink_vnnlib_input_bounds_checked(&mut spec, 0.051)
+            .expect_err("shrinking past the midpoint must be rejected");
+        assert!(err.to_string().contains("would invalidate"), "{err}");
+        assert_eq!(
+            spec.input_bounds,
+            vec![(0.0, 0.1)],
+            "failed validation must not partially mutate the property"
+        );
+    }
+
+    #[test]
+    fn parse_method_rejects_sdp_until_l2_specs_are_exposed() {
+        let err = parse_method("sdp-crown").expect_err("box-only CLI must reject SDP-CROWN");
+        assert!(
+            err.to_string().contains("requires an ℓ2 input-ball"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn max_blocks_requires_block_wise_execution() {
+        let err = validate_option_compatibility(false, false, false, false, false, 2)
+            .expect_err("--max-blocks must not be silently ignored");
+        assert!(
+            err.to_string()
+                .contains("--max-blocks requires --block-wise or --checkpoint"),
+            "unexpected error: {err}"
+        );
+
+        validate_option_compatibility(false, false, true, false, false, 2)
+            .expect("block-wise verification may cap the number of blocks");
+    }
+
+    #[test]
+    fn checkpoint_cannot_be_combined_with_layer_by_layer() {
+        let err = validate_option_compatibility(false, true, true, false, false, 0)
+            .expect_err("checkpoint-backed block-wise mode must conflict with layer-by-layer");
+        assert!(
+            err.to_string()
+                .contains("--layer-by-layer cannot be combined"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn only_standard_f32_crown_modes_can_consume_qualified_wgpu() {
+        for method in [
+            PropagationMethod::Crown,
+            PropagationMethod::AlphaCrown,
+            PropagationMethod::BetaCrown,
+        ] {
+            assert!(supports_qualified_wgpu_proof(method, false, false, false));
+            assert!(!supports_qualified_wgpu_proof(method, true, false, false));
+            assert!(!supports_qualified_wgpu_proof(method, false, true, false));
+            assert!(!supports_qualified_wgpu_proof(method, false, false, true));
+        }
+        assert!(!supports_qualified_wgpu_proof(
+            PropagationMethod::Ibp,
+            false,
+            false,
+            false,
+        ));
     }
 }

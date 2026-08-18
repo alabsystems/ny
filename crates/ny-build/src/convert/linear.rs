@@ -2,6 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use ndarray::Array1;
 use ny_core::{NyError, Result};
 use ny_propagate::layers::LinearLayer;
 use ny_propagate::Layer;
@@ -21,30 +22,70 @@ impl ConvertContext<'_> {
         //   transA: int = 0
         //   transB: int = 0
         // Reference: https://onnx.ai/onnx/operators/onnx__Gemm.html
-        if spec.inputs.len() < 2 {
+        if !matches!(spec.inputs.len(), 2 | 3)
+            || spec.inputs[0..2].iter().any(String::is_empty)
+            || spec.outputs.len() != 1
+            || spec.outputs[0].is_empty()
+        {
             return Err(NyError::ModelLoad(format!(
-                "Linear layer {} has fewer than 2 inputs",
-                spec.name
+                "Linear layer {} requires A, B, an optional C placeholder, and one output",
+                spec.name,
+            )));
+        }
+
+        if let Some(unsupported) = spec
+            .attributes
+            .keys()
+            .find(|name| !matches!(name.as_str(), "alpha" | "beta" | "transA" | "transB"))
+        {
+            return Err(NyError::UnsupportedConfiguration(format!(
+                "Gemm node '{}' has unsupported attribute '{}'",
+                spec.name, unsupported
             )));
         }
 
         // Read ONNX Gemm attributes (#2244)
         let alpha = match spec.attributes.get("alpha") {
             Some(AttributeValue::Float(v)) => *v,
-            _ => 1.0,
+            None => 1.0,
+            Some(_) => {
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "Gemm node '{}' has non-FLOAT alpha",
+                    spec.name
+                )))
+            }
         };
         let beta = match spec.attributes.get("beta") {
             Some(AttributeValue::Float(v)) => *v,
-            _ => 1.0,
+            None => 1.0,
+            Some(_) => {
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "Gemm node '{}' has non-FLOAT beta",
+                    spec.name
+                )))
+            }
         };
         let trans_a = match spec.attributes.get("transA") {
-            Some(AttributeValue::Int(v)) => *v != 0,
-            _ => false,
+            Some(AttributeValue::Int(0)) | None => false,
+            Some(AttributeValue::Int(1)) => true,
+            Some(_) => {
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "Gemm node '{}' requires transA to be INT 0 or 1",
+                    spec.name
+                )))
+            }
         };
-        let trans_b_explicit = spec.attributes.get("transB").map(|v| match v {
-            AttributeValue::Int(v) => *v != 0,
-            _ => false,
-        });
+        let trans_b_explicit = match spec.attributes.get("transB") {
+            Some(AttributeValue::Int(0)) => Some(false),
+            Some(AttributeValue::Int(1)) => Some(true),
+            None => None,
+            Some(_) => {
+                return Err(NyError::UnsupportedConfiguration(format!(
+                    "Gemm node '{}' requires transB to be INT 0 or 1",
+                    spec.name
+                )))
+            }
+        };
 
         // transA requires input transposition, which ny-propagate doesn't model
         if trans_a {
@@ -56,13 +97,13 @@ impl ConvertContext<'_> {
         }
 
         // alpha != 1.0 and beta != 1.0 require scaling weights/bias
-        if (alpha - 1.0).abs() > f32::EPSILON {
+        if alpha != 1.0 {
             return Err(NyError::UnsupportedConfiguration(format!(
                 "Gemm node '{}' has alpha={}, only alpha=1.0 is supported",
                 spec.name, alpha
             )));
         }
-        if (beta - 1.0).abs() > f32::EPSILON {
+        if beta != 1.0 {
             return Err(NyError::UnsupportedConfiguration(format!(
                 "Gemm node '{}' has beta={}, only beta=1.0 is supported",
                 spec.name, beta
@@ -141,18 +182,40 @@ impl ConvertContext<'_> {
             }
         }
 
-        let bias = if spec.inputs.len() >= 3 {
+        let bias = if spec.inputs.get(2).is_some_and(|name| !name.is_empty()) {
             let bias_name = &spec.inputs[2];
             let bias_arr = self
                 .weights
                 .get(bias_name)
                 .ok_or_else(|| NyError::ModelLoad(format!("Bias {} not found", bias_name)))?;
-            let bias_1d = bias_arr
-                .clone()
-                .into_dimensionality::<ndarray::Ix1>()
-                .map_err(|_| {
-                    NyError::shape_mismatch(vec![weight_2d.nrows()], bias_arr.shape().to_vec())
-                })?;
+            let output_features = weight_2d.nrows();
+            let bias_1d = match bias_arr.shape() {
+                [] if bias_arr.len() == 1 => Array1::from_elem(
+                    output_features,
+                    *bias_arr.iter().next().expect("length checked"),
+                ),
+                [one] if *one == 1 => Array1::from_elem(
+                    output_features,
+                    *bias_arr.iter().next().expect("length checked"),
+                ),
+                [features] if *features == output_features => bias_arr
+                    .clone()
+                    .into_dimensionality::<ndarray::Ix1>()
+                    .expect("rank and length checked"),
+                [one, features] if *one == 1 && *features == output_features => {
+                    Array1::from_iter(bias_arr.iter().copied())
+                }
+                [one_a, one_b] if *one_a == 1 && *one_b == 1 => Array1::from_elem(
+                    output_features,
+                    *bias_arr.iter().next().expect("length checked"),
+                ),
+                _ => {
+                    return Err(NyError::shape_mismatch(
+                        vec![output_features],
+                        bias_arr.shape().to_vec(),
+                    ));
+                }
+            };
             Some(bias_1d)
         } else {
             None
@@ -256,7 +319,96 @@ mod tests {
             unreachable!("expected Layer::Linear");
         };
         // Weight (2, 3) transposed to (3, 2) by ONNX default transB=0
-        assert_eq!(lin.weight.shape(), &[3, 2]);
+        assert_eq!(lin.weight().shape(), &[3, 2]);
+    }
+
+    #[test]
+    fn gemm_normalizes_row_invariant_c_broadcasts() {
+        for (shape, values, expected) in [
+            (vec![], vec![0.25], vec![0.25, 0.25, 0.25]),
+            (vec![1], vec![0.25], vec![0.25, 0.25, 0.25]),
+            (vec![1, 1], vec![0.25], vec![0.25, 0.25, 0.25]),
+            (vec![3], vec![0.1, 0.2, 0.3], vec![0.1, 0.2, 0.3]),
+            (vec![1, 3], vec![0.1, 0.2, 0.3], vec![0.1, 0.2, 0.3]),
+        ] {
+            let (mut weights, spec) = gemm_spec_transb1(
+                "gemm_c_broadcast",
+                HashMap::from([("transB".to_string(), AttributeValue::Int(1))]),
+            );
+            weights.insert(
+                "bias".to_string(),
+                ArrayD::from_shape_vec(IxDyn(&shape), values).expect("valid bias fixture"),
+            );
+            let Layer::Linear(linear) = make_context(&weights)
+                .convert_linear(&spec)
+                .expect("row-invariant Gemm C should be supported")
+            else {
+                panic!("expected Linear layer");
+            };
+            assert_eq!(linear.bias().expect("bias").to_vec(), expected);
+        }
+    }
+
+    #[test]
+    fn gemm_rejects_row_varying_c_broadcast() {
+        let (mut weights, spec) = gemm_spec_transb1(
+            "gemm_row_bias",
+            HashMap::from([("transB".to_string(), AttributeValue::Int(1))]),
+        );
+        weights.insert(
+            "bias".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[2, 1]), vec![0.1, 0.2]).expect("valid bias fixture"),
+        );
+        assert!(matches!(
+            make_context(&weights).convert_linear(&spec),
+            Err(NyError::ShapeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn gemm_accepts_empty_optional_c_placeholder() {
+        let (weights, mut spec) = gemm_spec_transb1(
+            "gemm_without_c",
+            HashMap::from([("transB".to_string(), AttributeValue::Int(1))]),
+        );
+        spec.inputs[2].clear();
+        let Layer::Linear(linear) = make_context(&weights)
+            .convert_linear(&spec)
+            .expect("an empty optional C means no bias")
+        else {
+            panic!("expected Linear layer");
+        };
+        assert!(linear.bias().is_none());
+    }
+
+    #[test]
+    fn gemm_layer_spec_rejects_malformed_attributes_and_extra_inputs() {
+        for value in [
+            AttributeValue::Int(1),
+            AttributeValue::String("1".to_string()),
+        ] {
+            let (weights, mut spec) = gemm_spec_transb1("gemm_bad_alpha", HashMap::new());
+            spec.attributes.insert("alpha".to_string(), value);
+            assert!(matches!(
+                make_context(&weights).convert_linear(&spec),
+                Err(NyError::UnsupportedConfiguration(_))
+            ));
+        }
+
+        let (weights, mut spec) = gemm_spec_transb1("gemm_bad_transpose", HashMap::new());
+        spec.attributes
+            .insert("transB".to_string(), AttributeValue::Int(2));
+        assert!(matches!(
+            make_context(&weights).convert_linear(&spec),
+            Err(NyError::UnsupportedConfiguration(_))
+        ));
+
+        let (weights, mut spec) = gemm_spec_transb1("gemm_extra_input", HashMap::new());
+        spec.inputs.push("ignored".to_string());
+        assert!(matches!(
+            make_context(&weights).convert_linear(&spec),
+            Err(NyError::ModelLoad(_))
+        ));
     }
 
     #[ntest::timeout(10000)]
@@ -278,7 +430,7 @@ mod tests {
             unreachable!("expected Layer::Linear");
         };
         // gemm_spec_transb1 creates weight (3, 2) — preserved as-is with transB=1
-        assert_eq!(lin.weight.shape(), &[3, 2]);
+        assert_eq!(lin.weight().shape(), &[3, 2]);
     }
 
     #[ntest::timeout(10000)]
@@ -298,7 +450,7 @@ mod tests {
         let Layer::Linear(lin) = layer else {
             unreachable!("expected Layer::Linear");
         };
-        assert_eq!(lin.weight.shape(), &[3, 2]);
+        assert_eq!(lin.weight().shape(), &[3, 2]);
     }
 
     #[ntest::timeout(10000)]
@@ -349,6 +501,44 @@ mod tests {
         assert!(
             matches!(err, NyError::UnsupportedConfiguration(ref msg) if msg.contains("beta")),
             "expected UnsupportedConfiguration mentioning beta, got: {err:?}"
+        );
+    }
+
+    /// A tolerance is invalid here: the converter does not implement Gemm's
+    /// alpha scaling, so accepting even the adjacent float above 1.0 changes
+    /// the represented network.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn gemm_adjacent_non_unit_alpha_rejected() {
+        let adjacent = f32::from_bits(1.0_f32.to_bits() + 1);
+        assert_eq!(adjacent - 1.0, f32::EPSILON);
+        let mut attrs = HashMap::new();
+        attrs.insert("alpha".to_string(), AttributeValue::Float(adjacent));
+        let (ws, spec) = gemm_spec_transb1("gemm_adjacent_alpha", attrs);
+        let error = make_context(&ws)
+            .convert_linear(&spec)
+            .expect_err("every non-unit alpha must be rejected");
+        assert!(
+            matches!(error, NyError::UnsupportedConfiguration(ref message) if message.contains("alpha"))
+        );
+    }
+
+    /// The adjacent float below 1.0 is only half `f32::EPSILON` away because
+    /// the binade changes at one. It was also silently ignored by the old
+    /// epsilon comparison.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn gemm_adjacent_non_unit_beta_rejected() {
+        let adjacent = f32::from_bits(1.0_f32.to_bits() - 1);
+        assert_eq!(1.0 - adjacent, f32::EPSILON * 0.5);
+        let mut attrs = HashMap::new();
+        attrs.insert("beta".to_string(), AttributeValue::Float(adjacent));
+        let (ws, spec) = gemm_spec_transb1("gemm_adjacent_beta", attrs);
+        let error = make_context(&ws)
+            .convert_linear(&spec)
+            .expect_err("every non-unit beta must be rejected");
+        assert!(
+            matches!(error, NyError::UnsupportedConfiguration(ref message) if message.contains("beta"))
         );
     }
 }

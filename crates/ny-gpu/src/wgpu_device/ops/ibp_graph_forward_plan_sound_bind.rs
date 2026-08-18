@@ -54,7 +54,9 @@ impl WgpuDevice {
             .collect();
         let bias_data: Vec<f32> = bias.map_or_else(|| vec![0.0; out_features], |b| b.to_vec());
 
-        let k = in_features + 3;
+        let k = in_features.checked_add(3).ok_or_else(|| {
+            ny_core::NyError::InvalidSpec("sound dag linear reduction length overflow".into())
+        })?;
         let k_u32 = gpu_checked_u32(k, "sound dag lin k")?;
         let params = LinearIbpSoundParams {
             batch_size: gpu_checked_u32(batch_size, "sound dag lin batch")?,
@@ -64,8 +66,8 @@ impl WgpuDevice {
                 2usize.saturating_mul(in_features.saturating_add(2)),
                 "sound dag lin n_ulps",
             )?,
-            gamma_k: gamma_k_f32(k),
-            slack: combine_slack_f32(k),
+            gamma_k: gamma_k_f32(k)?,
+            slack: combine_slack_f32(k)?,
             additive: ftz_safe_underflow_floor(k_u32),
             _pad: 0,
         };
@@ -162,7 +164,9 @@ impl WgpuDevice {
             .checked_mul(kernel_h)
             .and_then(|v| v.checked_mul(kernel_w))
             .ok_or_else(|| ny_core::NyError::InvalidSpec("sound dag conv MAC overflow".into()))?;
-        let k = macs + 3;
+        let k = macs.checked_add(3).ok_or_else(|| {
+            ny_core::NyError::InvalidSpec("sound dag conv reduction length overflow".into())
+        })?;
         let k_u32 = gpu_checked_u32(k, "sound dag conv k")?;
         let params = Conv2dIbpSoundParams {
             batch_size: gpu_checked_u32(batch_size, "sound dag conv batch")?,
@@ -183,8 +187,8 @@ impl WgpuDevice {
                 2usize.saturating_mul(macs.saturating_add(2)),
                 "sound dag conv n_ulps",
             )?,
-            gamma_k: gamma_k_f32(k),
-            slack: combine_slack_f32(k),
+            gamma_k: gamma_k_f32(k)?,
+            slack: combine_slack_f32(k)?,
             additive: ftz_safe_underflow_floor(k_u32),
             _pad0: 0,
             _pad1: 0,

@@ -117,8 +117,8 @@ fn test_multi_objective_deep_conv_self_terminates_at_deadline_4321() {
     let out_logits = 4;
     let (graph, input) = build_deep_conv_graph(channels, hw, depth, out_logits);
 
-    // Sanity: this MUST be classified as a large conv graph (input > 5000 elems)
-    // so it exercises the IBP-bootstrap path that previously ran without a deadline.
+    // Sanity: this MUST be classified as a large conv graph (input > 5000
+    // elements), so it exercises the deadline-aware large-conv bootstrap path.
     assert!(
         input.len() > 5000,
         "test graph must be a large conv graph (input {} elems) to exercise the IBP bootstrap path",

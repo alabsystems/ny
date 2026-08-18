@@ -9,6 +9,7 @@ mod batch_resolve;
 mod config;
 mod const_fold;
 mod convert;
+mod external_data;
 mod fusion;
 mod lstm_unroll;
 pub(crate) mod numeric_cast;
@@ -24,8 +25,8 @@ use tracing::info;
 
 /// Custom-operator extension traits and configuration for ONNX loading.
 pub use config::{
-    CustomOpHandler, CustomOpRegistry, OnnxLoadConfig, OnnxOptimizationFlag, ShapeInferBackend,
-    ShapeInferencePolicy,
+    BatchNormFoldingPolicy, CustomOpHandler, CustomOpRegistry, OnnxLoadConfig,
+    OnnxOptimizationFlag, ShapeInferBackend, ShapeInferencePolicy,
 };
 /// Subprocess shape-inference protocol: server entry + hidden subcommand name.
 pub use shape_infer::subprocess::{serve_shape_infer_request, SHAPE_INFER_SUBCOMMAND};
@@ -46,6 +47,15 @@ type ParsedOnnx = (
 
 /// Load an ONNX model from a file.
 ///
+/// External tensor data is resolved relative to the model's parent directory
+/// through a capability-scoped loader. Absolute paths, parent traversal, and
+/// symbolic-link components are rejected. Because ONNX Runtime cannot consume
+/// that directory capability, external-data models rely on model-authored
+/// shape metadata rather than ambient-path shape inference. The model and its
+/// sidecars must remain unchanged for the duration of this synchronous load;
+/// filesystem capabilities constrain names but do not make writable files
+/// immutable.
+///
 /// This function:
 /// 1. Parses the ONNX protobuf
 /// 2. Extracts graph structure (nodes, inputs, outputs)
@@ -58,6 +68,9 @@ pub fn load_onnx<P: AsRef<Path>>(path: P) -> Result<OnnxModel> {
 }
 
 /// Load an ONNX model from a file with explicit configuration.
+///
+/// External tensor data uses the same model-relative, capability-scoped policy
+/// as [`load_onnx`].
 pub fn load_onnx_with_config<P: AsRef<Path>>(
     path: P,
     config: &OnnxLoadConfig,
@@ -92,6 +105,7 @@ pub fn load_onnx_with_config<P: AsRef<Path>>(
         config.shape_inference_policy(),
         config.shape_infer_backend(),
         config.has_optimization_flag(OnnxOptimizationFlag::MergeLinear),
+        config.batch_norm_folding_policy(),
         capture_provenance,
     )?;
 
@@ -120,7 +134,7 @@ pub fn load_onnx_with_config<P: AsRef<Path>>(
         constant_tensors.len()
     );
 
-    Ok(OnnxModel {
+    let model = OnnxModel {
         network,
         weights,
         tensor_producer,
@@ -129,16 +143,35 @@ pub fn load_onnx_with_config<P: AsRef<Path>>(
         original_float32_initializers,
         original_network_topology,
         opset_imports,
-    })
+    };
+    enforce_authored_float32_admission(&model, config)?;
+    Ok(model)
+}
+
+/// Read the logical ONNX protobuf bytes from a plain `.onnx` or gzip-wrapped
+/// `.onnx.gz` path.
+///
+/// Proof-admission callers that authenticate model bytes should retain this
+/// returned buffer and pass the same slice to [`load_onnx_bytes_with_config`].
+/// That binds the parsed graph and its digest to one read and avoids both path
+/// swaps and hashing the gzip container rather than the model protobuf.
+pub fn read_onnx_bytes_maybe_gzip(path: &Path) -> Result<Vec<u8>> {
+    ny_load::io::read_bytes_maybe_gzip(path)
 }
 
 /// Load an ONNX model from in-memory bytes.
+///
+/// Models containing external tensor data are rejected because bytes have no
+/// authoritative filesystem origin. Use [`load_onnx`] for those models.
 pub fn load_onnx_bytes(name: &str, data: &[u8]) -> Result<OnnxModel> {
     let config = OnnxLoadConfig::default();
     load_onnx_bytes_with_config(name, data, &config)
 }
 
 /// Load an ONNX model from in-memory bytes with explicit configuration.
+///
+/// As with [`load_onnx_bytes`], external tensor data is rejected rather than
+/// deriving filesystem authority from the display-only `name`.
 pub fn load_onnx_bytes_with_config(
     name: &str,
     data: &[u8],
@@ -166,6 +199,7 @@ pub fn load_onnx_bytes_with_config(
         config.shape_inference_policy(),
         config.shape_infer_backend(),
         config.has_optimization_flag(OnnxOptimizationFlag::MergeLinear),
+        config.batch_norm_folding_policy(),
         capture_provenance,
     )?;
 
@@ -188,7 +222,7 @@ pub fn load_onnx_bytes_with_config(
         constant_tensors.len()
     );
 
-    Ok(OnnxModel {
+    let model = OnnxModel {
         network,
         weights,
         tensor_producer,
@@ -197,7 +231,22 @@ pub fn load_onnx_bytes_with_config(
         original_float32_initializers,
         original_network_topology,
         opset_imports,
-    })
+    };
+    enforce_authored_float32_admission(&model, config)?;
+    Ok(model)
+}
+
+fn enforce_authored_float32_admission(model: &OnnxModel, config: &OnnxLoadConfig) -> Result<()> {
+    if config.require_authored_float32_initializers()
+        && model.authored_float32_initializers_match_current() != Some(true)
+    {
+        return Err(NyError::ModelLoad(
+            "authored FLOAT initializer admission failed: loader provenance was absent, empty, \
+             or at least one initializer changed during conversion"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn reject_custom_handlers_for_provenance(
@@ -211,4 +260,26 @@ fn reject_custom_handlers_for_provenance(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod authenticated_bytes_tests {
+    use super::read_onnx_bytes_maybe_gzip;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    #[test]
+    fn authenticated_bytes_are_the_same_for_plain_and_onnx_gzip() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let logical = b"logical ONNX protobuf bytes";
+        let plain = directory.path().join("model.onnx");
+        let gzip = directory.path().join("model.onnx.gz");
+        std::fs::write(&plain, logical).expect("write plain fixture");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(logical).expect("compress fixture");
+        std::fs::write(&gzip, encoder.finish().expect("finish gzip")).expect("write gzip fixture");
+
+        assert_eq!(read_onnx_bytes_maybe_gzip(&plain).unwrap(), logical);
+        assert_eq!(read_onnx_bytes_maybe_gzip(&gzip).unwrap(), logical);
+    }
 }

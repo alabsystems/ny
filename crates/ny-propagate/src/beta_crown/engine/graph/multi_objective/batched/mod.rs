@@ -13,5 +13,9 @@ mod batched_multi;
 mod batched_single;
 pub(super) mod children;
 mod kfsb_multi;
+mod multi_depth;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(super) use batched_dense_specs::graph_bab_domain_shim;

@@ -114,15 +114,14 @@ where
 
     // Incoming certified coefficient error (#vnncomp-aw-soundness). The batched
     // activation backward MUST propagate it through the relaxation exactly like
-    // the scalar `crown_elementwise_backward` (crown_dense.rs): composed coeff
-    // `a·slope(sign a)` carries error `err_a·(|lower_slope|+|upper_slope|) + gap`,
-    // and the intercept picks up `err_a·(|lower_intercept|+|upper_intercept|)`
-    // folded OUTWARD into the bias. Dropping it (as this path previously did)
-    // collapses the downstream linear-layer penalty → the batched (β-CROWN/BaB)
-    // verdict bound becomes TIGHTER than the proven-sound scalar path.
+    // the scalar `crown_elementwise_backward` (crown_dense.rs). Every composed
+    // coefficient carries the fresh f32 product gap, even when no incoming error
+    // exists. Incoming error uses the chosen envelope while its sign is stable;
+    // otherwise both envelopes cover a possible sign flip. Intercept uncertainty
+    // is folded OUTWARD into the bias. Dropping any of these terms makes the
+    // batched (β-CROWN/BaB) verdict optimistic relative to the real composition.
     let in_lower_err = bounds.lower_a_err.as_ref();
     let in_upper_err = bounds.upper_a_err.as_ref();
-    let propagate_err = in_lower_err.is_some() || in_upper_err.is_some();
     let in_lower_err_3d = in_lower_err
         .map(|e| {
             e.view()
@@ -197,23 +196,66 @@ where
                 new_upper_b[[b, j]] += ur.intercept_contrib;
                 upper_nonfinite_rows[row_idx] |= ur.nonfinite;
 
-                if propagate_err {
-                    if let Some(le) = in_lower_err_3d.as_ref() {
-                        let ea = le[[b, j, i]] as f64;
+                // Always carry the fresh coefficient-product rounding gap, even
+                // when the incoming bound had no error carrier. Otherwise a
+                // first batched activation silently treats its stored f32
+                // coefficient as the exact real product. Directed coefficient
+                // rounding alone is not a box-independent enclosure: moving a
+                // lower coefficient downward raises the affine value at negative
+                // inputs (and conversely for an upper coefficient).
+                {
+                    let gap = if la != 0.0 {
+                        (la as f64 * lr_slope(la) - lr.new_coeff as f64).abs()
+                    } else {
+                        0.0
+                    };
+                    let ea = in_lower_err_3d
+                        .as_ref()
+                        .map_or(0.0, |e| e[[b, j, i]] as f64);
+                    if gap != 0.0 || ea != 0.0 {
+                        let (slope_cover, int_cover) = if (la as f64).abs() > ea {
+                            let slope = lr_slope(la).abs();
+                            let intercept = if la > 0.0 {
+                                relax.lower_intercept.abs() as f64
+                            } else {
+                                relax.upper_intercept.abs() as f64
+                            };
+                            (slope, intercept)
+                        } else {
+                            (slope_sum, int_sum)
+                        };
+                        new_lower_a_err[[row_idx, i]] =
+                            next_up_f32((ea * slope_cover + gap) as f32);
                         if ea != 0.0 {
-                            let gap = (la as f64 * lr_slope(la) - lr.new_coeff as f64).abs();
-                            new_lower_a_err[[row_idx, i]] =
-                                next_up_f32((ea * slope_sum + gap) as f32);
-                            lower_b_err[[b, j]] += ea * int_sum;
+                            lower_b_err[[b, j]] += ea * int_cover;
                         }
                     }
-                    if let Some(ue) = in_upper_err_3d.as_ref() {
-                        let ea = ue[[b, j, i]] as f64;
+                }
+                {
+                    let gap = if ua != 0.0 {
+                        (ua as f64 * ur_slope(ua) - ur.new_coeff as f64).abs()
+                    } else {
+                        0.0
+                    };
+                    let ea = in_upper_err_3d
+                        .as_ref()
+                        .map_or(0.0, |e| e[[b, j, i]] as f64);
+                    if gap != 0.0 || ea != 0.0 {
+                        let (slope_cover, int_cover) = if (ua as f64).abs() > ea {
+                            let slope = ur_slope(ua).abs();
+                            let intercept = if ua > 0.0 {
+                                relax.upper_intercept.abs() as f64
+                            } else {
+                                relax.lower_intercept.abs() as f64
+                            };
+                            (slope, intercept)
+                        } else {
+                            (slope_sum, int_sum)
+                        };
+                        new_upper_a_err[[row_idx, i]] =
+                            next_up_f32((ea * slope_cover + gap) as f32);
                         if ea != 0.0 {
-                            let gap = (ua as f64 * ur_slope(ua) - ur.new_coeff as f64).abs();
-                            new_upper_a_err[[row_idx, i]] =
-                                next_up_f32((ea * slope_sum + gap) as f32);
-                            upper_b_err[[b, j]] += ea * int_sum;
+                            upper_b_err[[b, j]] += ea * int_cover;
                         }
                     }
                 }
@@ -223,12 +265,10 @@ where
 
     // Fold the certified intercept error OUTWARD into the bias accumulators BEFORE
     // the directed cast (lower decreases, upper increases).
-    if propagate_err {
-        for b in 0..total_batch {
-            for j in 0..out_dim {
-                new_lower_b[[b, j]] -= lower_b_err[[b, j]];
-                new_upper_b[[b, j]] += upper_b_err[[b, j]];
-            }
+    for b in 0..total_batch {
+        for j in 0..out_dim {
+            new_lower_b[[b, j]] -= lower_b_err[[b, j]];
+            new_upper_b[[b, j]] += upper_b_err[[b, j]];
         }
     }
 
@@ -261,18 +301,14 @@ where
         if lower_nonfinite_rows[row_idx] {
             for i in 0..in_dim {
                 new_lower_a[[row_idx, i]] = 0.0;
-                if propagate_err {
-                    new_lower_a_err[[row_idx, i]] = 0.0;
-                }
+                new_lower_a_err[[row_idx, i]] = 0.0;
             }
             new_lower_b_f32[bias_idx] = f32::NEG_INFINITY;
         }
         if upper_nonfinite_rows[row_idx] {
             for i in 0..in_dim {
                 new_upper_a[[row_idx, i]] = 0.0;
-                if propagate_err {
-                    new_upper_a_err[[row_idx, i]] = 0.0;
-                }
+                new_upper_a_err[[row_idx, i]] = 0.0;
             }
             new_upper_b_f32[bias_idx] = f32::INFINITY;
         }
@@ -307,18 +343,16 @@ where
     // Attach the propagated certified error (#vnncomp-aw-soundness). `set_coeff_err`
     // no-ops on shape mismatch (i.e. if the NaN firewall degraded to conservative),
     // which is sound: the conservative bounds already dominate any penalty.
-    if propagate_err {
-        let le = ArrayD::from_shape_vec(
-            IxDyn(&out_a_shape),
-            new_lower_a_err.into_raw_vec_and_offset().0,
-        )
-        .map_err(|_| NyError::InvalidSpec("Cannot reshape new_lower_a_err".to_string()))?;
-        let ue = ArrayD::from_shape_vec(
-            IxDyn(&out_a_shape),
-            new_upper_a_err.into_raw_vec_and_offset().0,
-        )
-        .map_err(|_| NyError::InvalidSpec("Cannot reshape new_upper_a_err".to_string()))?;
-        result.set_coeff_err(le, ue);
-    }
+    let le = ArrayD::from_shape_vec(
+        IxDyn(&out_a_shape),
+        new_lower_a_err.into_raw_vec_and_offset().0,
+    )
+    .map_err(|_| NyError::InvalidSpec("Cannot reshape new_lower_a_err".to_string()))?;
+    let ue = ArrayD::from_shape_vec(
+        IxDyn(&out_a_shape),
+        new_upper_a_err.into_raw_vec_and_offset().0,
+    )
+    .map_err(|_| NyError::InvalidSpec("Cannot reshape new_upper_a_err".to_string()))?;
+    result.set_coeff_err(le, ue);
     Ok(result)
 }

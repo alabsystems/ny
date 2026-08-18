@@ -21,6 +21,8 @@ use std::path::Path;
 use tracing::info;
 
 use super::model_load::VerifiableNetwork;
+use crate::commands::backend::ProofBackendReceipt;
+use crate::commands::terminal_peel::AppliedTerminalPeel;
 
 /// Run verification using the f64 propagation path.
 ///
@@ -37,6 +39,8 @@ pub(super) fn run_f64_verification(
     strict: bool,
     allow_unknown: bool,
     json: bool,
+    applied_terminal_peel: AppliedTerminalPeel,
+    backend_receipt: &ProofBackendReceipt,
 ) -> Result<()> {
     let sequential = match network {
         VerifiableNetwork::Sequential(net) => net,
@@ -143,9 +147,16 @@ pub(super) fn run_f64_verification(
             &output_bounds,
             property_status,
             property,
+            applied_terminal_peel,
+            backend_receipt,
         )?;
     } else {
-        render_f64_text(&result, &output_bounds, property_status)?;
+        render_f64_text(
+            &result,
+            &output_bounds,
+            property_status,
+            applied_terminal_peel,
+        )?;
     }
 
     // Determine and apply exit code
@@ -242,6 +253,8 @@ fn render_f64_json(
     output_bounds: &[Bound],
     property_status: Option<&str>,
     property: Option<&Path>,
+    applied_terminal_peel: AppliedTerminalPeel,
+    backend_receipt: &ProofBackendReceipt,
 ) -> Result<()> {
     use super::result::json_f32;
 
@@ -259,7 +272,18 @@ fn render_f64_json(
         "status": reported_status(result, property_status),
         "method": actual_method.as_str(),
         "double_fp": true,
+        "backend": backend_receipt.effective.to_string(),
+        "backend_receipt": super::result::backend_receipt_json(backend_receipt),
         "output_bounds": bounds_arr,
+        "terminal_peel": {
+            "applied": applied_terminal_peel.applied(),
+            "activation": applied_terminal_peel,
+        },
+        "output_coordinates": if applied_terminal_peel.applied() {
+            "peeled_preactivation"
+        } else {
+            "original_model"
+        },
     });
 
     if let Some(status) = property_status {
@@ -279,6 +303,7 @@ fn render_f64_text(
     result: &VerificationResult,
     output_bounds: &[Bound],
     property_status: Option<&str>,
+    applied_terminal_peel: AppliedTerminalPeel,
 ) -> Result<()> {
     println!(
         "Result: {} (f64 double precision)",
@@ -289,11 +314,20 @@ fn render_f64_text(
     }
 
     if !output_bounds.is_empty() {
-        println!(
-            "  Output bounds: [{:.6}, {:.6}]",
-            output_bounds[0].lower(),
-            output_bounds[0].upper()
-        );
+        if applied_terminal_peel.applied() {
+            println!(
+                "  Peeled {} preactivation bounds (not original-model Y): [{:.6}, {:.6}]",
+                applied_terminal_peel.activation_name(),
+                output_bounds[0].lower(),
+                output_bounds[0].upper()
+            );
+        } else {
+            println!(
+                "  Output bounds: [{:.6}, {:.6}]",
+                output_bounds[0].lower(),
+                output_bounds[0].upper()
+            );
+        }
         if output_bounds.len() > 1 {
             println!("  ({} total output dimensions)", output_bounds.len());
         }

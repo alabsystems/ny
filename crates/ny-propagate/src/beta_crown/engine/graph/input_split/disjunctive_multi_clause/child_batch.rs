@@ -43,7 +43,7 @@ use tracing::trace;
 use crate::beta_crown::engine::graph::shared::state::GraphBabLifecycle;
 use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
-use crate::bounds::LinearBounds;
+use crate::bounds::{certified_affine_sum_f32, LinearBounds, OutwardDirection};
 use crate::GraphNetwork;
 
 use super::super::batched_clip::{
@@ -255,7 +255,7 @@ pub(super) fn process_reorder_prescreen_child_batch(
                     spec_matrix,
                     &row_indices,
                     engine,
-                    lifecycle.start_time + bab_timeout,
+                    lifecycle.deadline(bab_timeout),
                 ) {
                     domain.obj_bounds =
                         super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
@@ -275,7 +275,7 @@ pub(super) fn process_reorder_prescreen_child_batch(
             thresholds,
             clause_sizes,
             engine,
-            lifecycle.start_time + bab_timeout,
+            lifecycle.deadline(bab_timeout),
         ) {
             lifecycle.domains_verified += 1;
             continue;
@@ -765,13 +765,11 @@ fn try_push_child_batch_clip_survivors_planes(
     // The clip sign negation (upper direction) is applied AFTER the fold,
     // exactly as the reference folds first and negates at gather.
     let mut bias_used = vec![0f32; m * n_thr];
-    let mut mag = vec![0f64; x_dim];
+    let mut mag = vec![0f32; x_dim];
     for k in 0..m {
         let s = k * x_dim;
         for j in 0..x_dim {
-            mag[j] = (orig_l[s + j] as f64)
-                .abs()
-                .max((orig_u[s + j] as f64).abs());
+            mag[j] = orig_l[s + j].abs().max(orig_u[s + j].abs());
         }
         let slot = child_plane[k];
         let lb = plane_src[slot];
@@ -789,16 +787,19 @@ fn try_push_child_batch_clip_survivors_planes(
         for i in 0..nrows.min(n_thr) {
             let mut bv = base_b[i];
             if let Some(err) = err {
-                let mut p = 0.0f64;
-                for j in 0..x_dim {
-                    p += err[[i, j]] as f64 * mag[j];
-                }
+                let p = certified_affine_sum_f32(
+                    0.0,
+                    (0..x_dim).map(|j| (err[[i, j]], mag[j])),
+                    OutwardDirection::Upper,
+                );
                 if p != 0.0 {
                     if p.is_finite() {
                         bv = if verify_upper {
-                            ny_tensor::next_up_f32((bv as f64 + p) as f32)
+                            ny_tensor::next_up_f32(ny_core::dd::next_up_f64(bv as f64 + p) as f32)
                         } else {
-                            ny_tensor::next_down_f32((bv as f64 - p) as f32)
+                            ny_tensor::next_down_f32(
+                                ny_core::dd::next_down_f64(bv as f64 - p) as f32
+                            )
                         };
                     } else {
                         bv = if verify_upper {

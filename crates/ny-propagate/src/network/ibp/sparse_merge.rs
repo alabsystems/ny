@@ -20,6 +20,7 @@ use ny_tensor::{BoundedTensor, RepairStrategy};
 pub(super) fn merge_sparse_crown_with_ibp(
     crown: &BoundedTensor,
     ibp: &BoundedTensor,
+    tracked_flat: &[usize],
 ) -> Result<BoundedTensor> {
     let crown_lower = crown.lower();
     let crown_upper = crown.upper();
@@ -33,36 +34,70 @@ pub(super) fn merge_sparse_crown_with_ibp(
         });
     }
 
-    // For each output position: use CROWN bounds if they're non-trivial
-    // (CROWN lower > -Inf or CROWN upper < Inf), else use IBP bounds.
-    // Stable neurons in sparse CROWN get zero rows → concretize → [0, 0],
-    // which is trivially narrower than IBP bounds. So we detect sparse-zero
-    // rows by checking if both lower and upper are exactly 0.
-    let mut merged_lower = crown_lower.clone();
-    let mut merged_upper = crown_upper.clone();
+    // POSITIONAL, not value-based. Start from IBP everywhere and keep the CROWN
+    // value only at positions the sparse seed actually TRACKED.
+    //
+    // This used to identify untracked rows by their VALUE:
+    //
+    //     if *cl == 0.0 && *cu == 0.0 { take IBP }
+    //
+    // An untracked (stable) neuron gets a zero COEFFICIENT row, but its
+    // concretized bound is `[bias, bias]` — only `[0, 0]` when the bias happens
+    // to be zero. With any nonzero bias the value test missed the row and the
+    // spurious point interval `[b, b]` was published as the neuron's bound in
+    // place of IBP's real, wider one. Narrower than the truth is the false-proof
+    // direction, and a degenerate interval is as narrow as it gets: downstream
+    // it reads as a provably-stable neuron, so the ReLU is never split and the
+    // property can verify at the root on a bound that was never established.
+    //
+    // Value-based identification also cannot distinguish "untracked" from
+    // "tracked, and legitimately [0, 0]" — the two are the same bits. Only the
+    // seed's index list knows, which is why the sibling
+    // `scatter_sparse_crown_into_ibp` in this file has always taken it. This is
+    // now the same shape as that function.
+    let ibp_lower_slice = ibp_lower
+        .as_slice()
+        .ok_or_else(|| NyError::InternalError("Non-contiguous IBP lower array".into()))?;
+    let ibp_upper_slice = ibp_upper
+        .as_slice()
+        .ok_or_else(|| NyError::InternalError("Non-contiguous IBP upper array".into()))?;
+    let crown_lower_slice = crown_lower
+        .as_slice()
+        .ok_or_else(|| NyError::InternalError("Non-contiguous CROWN lower array".into()))?;
+    let crown_upper_slice = crown_upper
+        .as_slice()
+        .ok_or_else(|| NyError::InternalError("Non-contiguous CROWN upper array".into()))?;
 
-    for (i, ((cl, cu), (il, iu))) in crown_lower
-        .iter()
-        .zip(crown_upper.iter())
-        .zip(ibp_lower.iter().zip(ibp_upper.iter()))
-        .enumerate()
+    let mut merged_lower = ibp_lower.clone();
+    let mut merged_upper = ibp_upper.clone();
     {
-        // Sparse CROWN zero row: both bounds are exactly 0. Replace with IBP.
-        // Also handles the case where CROWN gave wider bounds than IBP by
-        // taking the tighter of the two (intersection).
-        if *cl == 0.0 && *cu == 0.0 {
-            merged_lower
-                .as_slice_mut()
-                .ok_or_else(|| NyError::InternalError("Non-contiguous lower array".into()))?[i] =
-                *il;
-            merged_upper
-                .as_slice_mut()
-                .ok_or_else(|| NyError::InternalError("Non-contiguous upper array".into()))?[i] =
-                *iu;
+        let out_lower = merged_lower
+            .as_slice_mut()
+            .ok_or_else(|| NyError::InternalError("Non-contiguous lower array".into()))?;
+        let out_upper = merged_upper
+            .as_slice_mut()
+            .ok_or_else(|| NyError::InternalError("Non-contiguous upper array".into()))?;
+        for &position in tracked_flat {
+            // Out-of-range indices mean the seed and the output disagree about
+            // shape. Fail closed rather than tightening a neuron by accident.
+            if position >= out_lower.len() {
+                return Err(NyError::InternalError(format!(
+                    "sparse CROWN merge: tracked index {position} outside output of length {}",
+                    out_lower.len()
+                )));
+            }
+            // Intersect rather than overwrite: CROWN is not uniformly tighter
+            // than IBP, and the merge must never widen a neuron that IBP already
+            // bounded better. Both arms enclose, so the intersection does too.
+            out_lower[position] = crown_lower_slice[position].max(ibp_lower_slice[position]);
+            out_upper[position] = crown_upper_slice[position].min(ibp_upper_slice[position]);
         }
     }
 
-    BoundedTensor::new(merged_lower, merged_upper)
+    // `Widen` repair: the intersection above can invert a pair by a few ULPs
+    // when CROWN and IBP straddle each other, exactly as in
+    // `scatter_sparse_crown_into_ibp`.
+    BoundedTensor::new_repaired(merged_lower, merged_upper, RepairStrategy::Widen)
 }
 
 /// Find flat indices of unstable neurons in Dense CROWN-IBP output bounds.

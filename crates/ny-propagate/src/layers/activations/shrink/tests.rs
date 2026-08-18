@@ -678,15 +678,100 @@ fn test_ibp_nan_input_upper_rejected_3278() {
     assert!(matches!(err, NyError::NumericalInstability(_)));
 }
 
+/// #3278 originally rejected ±Inf here too. That was wrong: ±Inf is what an
+/// upstream OpaqueSkip legitimately emits, and `NumericalInstability` is not
+/// degradable, so one tainted element aborted the whole graph-IBP pass. Shrink
+/// must now widen instead — `[-inf, +inf]` in, `[-inf, +inf]` out.
 #[test]
-fn test_ibp_inf_input_rejected_3278() {
+fn test_ibp_inf_input_propagates_widened_3278() {
     let layer = ShrinkLayer::default();
-    let input = BoundedTensor::new_unchecked(
+    let input = BoundedTensor::new_allow_infinite(
         ArrayD::from_elem(IxDyn(&[1]), f32::NEG_INFINITY),
         ArrayD::from_elem(IxDyn(&[1]), f32::INFINITY),
     )
     .unwrap();
-    let err = layer.propagate_ibp(&input).expect_err("Inf input");
+    let out = layer
+        .propagate_ibp(&input)
+        .expect("a tainted element must widen, not abort the pass");
+    assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+    assert_eq!(out.upper()[[0]], f32::INFINITY);
+}
+
+// ── OpaqueSkip taint propagation (#3278 follow-up) ─────────────────────
+
+/// Probe: a mixed tensor where one element carries an upstream OpaqueSkip's
+/// `[-inf, +inf]` and the other is a normal finite interval. The tainted
+/// element must widen; the finite element must keep its exact bounds.
+#[test]
+fn test_ibp_opaque_skip_taint_widens_only_tainted_element() {
+    let layer = ShrinkLayer::new(0.25, 0.5);
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NEG_INFINITY, 1.0]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, 2.0]).unwrap(),
+    )
+    .unwrap();
+    let out = layer
+        .propagate_ibp(&input)
+        .expect("[-inf, +inf] is a sound enclosure, not an error");
+
+    assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+    assert_eq!(out.upper()[[0]], f32::INFINITY);
+    // Element 1 sits entirely in the positive piece: y = x - bias, exact.
+    assert!(
+        (out.lower()[[1]] - 0.75).abs() < 1e-6,
+        "{}",
+        out.lower()[[1]]
+    );
+    assert!(
+        (out.upper()[[1]] - 1.75).abs() < 1e-6,
+        "{}",
+        out.upper()[[1]]
+    );
+}
+
+/// Soundness: a half-infinite input must still enclose shrink over the whole
+/// interval, including the discontinuities at ±lambd.
+#[test]
+fn test_ibp_half_infinite_output_encloses_true_range() {
+    let (bias, lambd) = (0.25f32, 0.5f32);
+    let layer = ShrinkLayer::new(bias, lambd);
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_elem(IxDyn(&[1]), f32::NEG_INFINITY),
+        ArrayD::from_elem(IxDyn(&[1]), 2.0),
+    )
+    .unwrap();
+    let out = layer.propagate_ibp(&input).unwrap();
+    assert_eq!(out.lower()[[0]], f32::NEG_INFINITY);
+    for x in [
+        -1e30f32, -100.0, -0.51, -0.5, -0.4, 0.0, 0.4, 0.5, 0.51, 1.0, 2.0,
+    ] {
+        let y = shrink_scalar(x, bias, lambd);
+        assert!(
+            out.lower()[[0]] <= y,
+            "lower {} > shrink({x})={y}",
+            out.lower()[[0]]
+        );
+        assert!(
+            out.upper()[[0]] >= y,
+            "upper {} < shrink({x})={y}",
+            out.upper()[[0]]
+        );
+    }
+}
+
+/// The relaxation must NOT relax the NaN firewall: NaN from finite inputs
+/// (or any NaN endpoint) is still a hard error.
+#[test]
+fn test_ibp_nan_still_rejected_after_inf_relaxation() {
+    let layer = ShrinkLayer::default();
+    let input = BoundedTensor::new_unchecked(
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NEG_INFINITY, f32::NAN]).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::INFINITY, 1.0]).unwrap(),
+    )
+    .unwrap();
+    let err = layer
+        .propagate_ibp(&input)
+        .expect_err("NaN must not be absorbed alongside a tainted element");
     assert!(matches!(err, NyError::NumericalInstability(_)));
 }
 

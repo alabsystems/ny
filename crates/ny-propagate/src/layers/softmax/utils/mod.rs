@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ndarray::{Array1, Array2};
-use ny_core::NyError;
-use ny_core::Result;
+use ny_core::{f64_to_f32_down, f64_to_f32_up, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32};
 
 use crate::bounds::nan_propagating_max;
@@ -27,13 +26,37 @@ pub(super) const SOFTMAX_SANITIZE_MARGIN: f32 = 1e-6;
 /// Returns (exp_lower, exp_upper) where exp_lower <= exp(x) <= exp_upper for all x in [lower, upper].
 #[inline]
 pub fn exp_interval_bounds(lower: f32, upper: f32) -> Result<(f32, f32)> {
-    if lower > upper {
+    if lower.is_nan() || upper.is_nan() || lower > upper {
         return Err(NyError::NumericalInstability(format!(
-            "exp_interval_bounds received inverted interval: lower ({lower}) > upper ({upper})"
+            "exp_interval_bounds received invalid interval: lower ({lower}), upper ({upper})"
         )));
     }
-    // exp is monotonically increasing, so bounds are simply exp at endpoints
-    Ok((lower.exp(), upper.exp()))
+    // `f32::exp` is rounded to nearest, so using it verbatim for both
+    // directions is not an enclosure even for a point interval.  Evaluate in
+    // f64 and take one binary32 ULP outward at both endpoints.
+    let exp_lower = if lower == f32::NEG_INFINITY {
+        0.0
+    } else if lower == f32::INFINITY {
+        f32::INFINITY
+    } else {
+        let reference = (lower as f64).exp();
+        if reference > f32::MAX as f64 {
+            // Mathematical exp(finite) is finite.  +inf cannot be a lower
+            // endpoint, while MAX is representable and remains below it.
+            f32::MAX
+        } else {
+            // Classify the binary32-subnormal range in f64 before conversion.
+            // A direct `as f32` may flush to zero under FTZ/DAZ; stepping once
+            // from that zero is still below exp(-100).
+            next_down_f32(f64_to_f32_down(reference)).max(0.0)
+        }
+    };
+    let exp_upper = if upper == f32::NEG_INFINITY {
+        0.0
+    } else {
+        next_up_f32(f64_to_f32_up((upper as f64).exp()))
+    };
+    Ok((exp_lower, exp_upper))
 }
 
 /// Compute softmax_i(x) for x in [lower, upper] using IBP bounds.

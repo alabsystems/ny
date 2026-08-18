@@ -15,6 +15,7 @@ use crate::layers::{
     AddConstantLayer, Conv1dLayer, DivConstantLayer, Layer, LinearLayer, MaxPool2dLayer,
     MulConstantLayer, ReLULayer, SubConstantLayer,
 };
+use crate::network::Network;
 use ndarray::{arr0, arr1, arr2, Array1, Array2, Array3};
 use ny_core::{GpuCrownLayer, Result};
 use ny_tensor::BoundedTensor;
@@ -124,6 +125,7 @@ fn assert_conv1d_height_one_conv2d_descriptor(layer: &GpuCrownLayer) {
             out_w,
             in_h,
             in_w,
+            ..
         } => {
             assert_eq!(weight_col.as_ref(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
             assert_eq!(*out_channels, 2);
@@ -180,6 +182,7 @@ fn assert_linear_identity_descriptor(layer: &GpuCrownLayer) {
             bias,
             out_features,
             in_features,
+            ..
         } => {
             assert_eq!(weight.as_ref(), &[1.0]);
             assert!(bias.is_none());
@@ -378,6 +381,61 @@ fn test_extract_gpu_crown_layers_cached_refreshes_dynamic_relu_from_intermediate
         .expect("cache refresh should succeed");
     assert_activation_descriptor(&second[0], &[1.0], &[1.0], &[0.0], &[0.0]);
     assert_linear_identity_descriptor(&second[1]);
+
+    Ok(())
+}
+
+#[test]
+fn network_mutation_invalidates_static_gpu_crown_extraction() -> Result<()> {
+    fn assert_linear(
+        layer: &GpuCrownLayer,
+        expected_weight: &[f32],
+        expected_bias: Option<&[f32]>,
+    ) {
+        let GpuCrownLayer::Linear { weight, bias, .. } = layer else {
+            panic!("expected GPU extraction to yield Linear");
+        };
+        assert_eq!(weight.as_ref(), expected_weight);
+        assert_eq!(bias.as_deref(), expected_bias);
+    }
+
+    let mut network = Network::new();
+    network.add_layer(Layer::Linear(LinearLayer::new(
+        arr2(&[[1.0_f32]]),
+        Some(arr1(&[0.25_f32])),
+    )?));
+    let input = bounded_1d(&[-1.0], &[1.0]);
+
+    let first =
+        extract_gpu_crown_layers_cached(network.layers(), &[], &input, &network.gpu_crown_cache)
+            .expect("initial extraction should populate the static cache");
+    assert_linear(&first[0], &[1.0], Some(&[0.25]));
+
+    let Layer::Linear(linear) = &mut network.layers_mut()[0] else {
+        panic!("test network should retain its Linear layer");
+    };
+    linear.replace_parameters(arr2(&[[2.0_f32]]), Some(arr1(&[0.5_f32])))?;
+
+    let second =
+        extract_gpu_crown_layers_cached(network.layers(), &[], &input, &network.gpu_crown_cache)
+            .expect("post-mutation extraction should rebuild the static cache");
+    assert_linear(&second[0], &[2.0], Some(&[0.5]));
+
+    network.add_layer(Layer::Linear(LinearLayer::new(
+        arr2(&[[3.0_f32]]),
+        Some(arr1(&[0.75_f32])),
+    )?));
+    let intermediate = vec![bounded_1d(&[-2.5], &[2.5])];
+    let third = extract_gpu_crown_layers_cached(
+        network.layers(),
+        &intermediate,
+        &input,
+        &network.gpu_crown_cache,
+    )
+    .expect("post-append extraction should rebuild the static topology");
+    assert_eq!(third.len(), 2);
+    assert_linear(&third[0], &[3.0], Some(&[0.75]));
+    assert_linear(&third[1], &[2.0], Some(&[0.5]));
 
     Ok(())
 }

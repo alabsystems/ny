@@ -92,15 +92,18 @@ where
 {
     assert!(l <= u, "{name}: bad interval [{l}, {u}]");
 
-    // Skip degenerate / non-finite envelopes (NaN fallback etc.); those are the
-    // maximally-loose [-inf, +inf] bounds, trivially sound.
-    if !lines.lower_slope.is_finite()
-        || !lines.lower_intercept.is_finite()
-        || !lines.upper_slope.is_finite()
-        || !lines.upper_intercept.is_finite()
-    {
-        return;
-    }
+    // Every fixture in this suite has a finite, supported domain. Treating a
+    // non-finite relaxation as "trivially sound" used to turn regressions into
+    // vacuous passes: NaN is not an authenticated [-inf,+inf] fallback, and an
+    // unexpected infinity means the useful relaxation disappeared. Pin the
+    // production contract instead.
+    assert!(
+        lines.lower_slope.is_finite()
+            && lines.lower_intercept.is_finite()
+            && lines.upper_slope.is_finite()
+            && lines.upper_intercept.is_finite(),
+        "{name}: finite interval [{l}, {u}] produced a non-finite envelope: {lines:?}"
+    );
 
     let l64 = l as f64;
     let u64 = u as f64;
@@ -172,6 +175,8 @@ fn general_intervals() -> Vec<(f32, f32)> {
 }
 
 /// Positive-domain intervals for functions defined only on x > 0 (sqrt, log).
+/// Intervals with `l >= 0`. Suitable for `sqrt` (defined AT 0) but NOT for
+/// `log`, whose domain is strictly `x > 0` — see [`strictly_positive_intervals`].
 fn positive_intervals() -> Vec<(f32, f32)> {
     vec![
         (0.01, 1.0),
@@ -238,14 +243,50 @@ fn sqrt_relaxation_is_sound() {
     }
 }
 
+/// `log`'s domain is STRICTLY `x > 0`, so it gets its own fixture list.
+///
+/// `positive_intervals()` includes `(0.0, 4.0)`, which is correct for `sqrt`
+/// (defined at 0) and out of domain for `log`: `ln(0) = -inf`, so the only sound
+/// lower bound there is `-inf` and no finite envelope exists. Production
+/// correctly returns the authenticated maximally-loose fallback for `l <= 0`,
+/// which `assert_envelope_contains` then rejects for being non-finite — by
+/// design, since a vacuous infinite envelope must not read as "sound".
+fn strictly_positive_intervals() -> Vec<(f32, f32)> {
+    positive_intervals()
+        .into_iter()
+        .filter(|&(l, _)| l > 0.0)
+        .collect()
+}
+
 #[test]
 fn log_relaxation_is_sound() {
-    for (l, u) in positive_intervals() {
-        // log clamps its domain to >= 1e-10 internally; evaluate the same way so
-        // the comparison reflects what the relaxation actually bounds.
+    for (l, u) in strictly_positive_intervals() {
+        // NOTE: `log` does NOT clamp its domain. This comment used to say it
+        // clamped to >= 1e-10 and evaluated the reference as `x.max(1e-10).ln()`
+        // to match — but that clamp was REMOVED as unsound
+        // (#log-epsilon-nonenclosing): raising `l` MOVES THE DOMAIN, so the
+        // relaxation built for `[1e-10, u]` sits ABOVE `ln` on `(l, 1e-10)` and
+        // stops enclosing. `envelope_audit_expologpow` measured 10,484,626 of
+        // 37,861,389 sampled points violating the lower line, worst violation
+        // 64.47, every one of them inside the clamped region. Compare against
+        // the TRUE `ln`, which is what production now bounds.
         let lines: Lines = log_linear_relaxation(l, u).into();
-        assert_envelope_contains("log", l, u, lines, |x| x.max(1e-10).ln());
+        assert_envelope_contains("log", l, u, lines, |x| x.ln());
     }
+}
+
+/// The domain edge itself, pinned rather than skipped: an interval touching 0 is
+/// OUT OF DOMAIN for `log`, and the sound answer is the maximally-loose
+/// envelope, not a finite one. This is what keeps the filter above honest — if
+/// production ever started returning a finite lower bound here it would be
+/// claiming `ln` is bounded below on `(0, 4]`, which is false.
+#[test]
+fn log_refuses_an_interval_touching_zero() {
+    let lines: Lines = log_linear_relaxation(0.0, 4.0).into();
+    assert!(
+        lines.lower_intercept == f64::NEG_INFINITY,
+        "ln(0) = -inf, so no finite lower bound on [0, 4] can be sound: {lines:?}"
+    );
 }
 
 #[test]

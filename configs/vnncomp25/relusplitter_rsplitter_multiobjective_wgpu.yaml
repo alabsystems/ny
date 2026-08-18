@@ -2,15 +2,15 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# RSPLITTER biasfield sidecar for #3813 cut-aware WGPU multi-objective experiment.
-# Preserves the cuts-enabled shared-search settings from the main relusplitter
-# preset (the only measured-positive relusplitter lane) and explicitly requests
-# a WGPU backend so the benchmark runner cannot silently fall back to CPU.
+# RSPLITTER biasfield sidecar for #3813 WGPU multi-objective experiment.
+# Preserves the measured dense-matrix shared-search lane and explicitly requests
+# a WGPU backend so the benchmark runner cannot silently fall back to CPU. Cut
+# proof authority remains quarantined.
 #
 # Key difference from relusplitter_rsplitter_gpu_bab.yaml (#3862):
 # - Keeps kfsb branching (shared multi-objective path) instead of babsr
 # - Explicitly sets device: wgpu
-# - This exercises the cut-aware GPU batched multi-objective lane
+# - This exercises the GPU batched multi-objective lane without cut authority
 #
 # Design: designs/2026-03-14-issue-3813-cut-aware-wgpu-multi-objective-alternative.md
 
@@ -18,10 +18,11 @@ general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/relusplitter
   csv_name: instances.csv
   device: wgpu
-  conv_mode: auto
+  conv_mode: matrix
 
 attack:
   pgd_order: middle
+  ny_pgd_order_compat: upfront
   pgd_restarts: 50
 
 bab:
@@ -31,10 +32,10 @@ bab:
     candidates: 10
     reduceop: max
   cuts:
-    enabled: true
-    near_miss: true
+    enabled: false
+    near_miss: false
     near_miss_margin: 0.01
-    proactive: true
+    proactive: false
   clip:
     relaxed: true
     relaxed_iterations: 20

@@ -52,9 +52,10 @@ fn test_whisper_param_count() {
 // =========================================================================
 
 #[ntest::timeout(300000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_tiny_layernorm_fusion() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test that LayerNorm fusion works on Whisper-tiny encoder
     let model = &whisper_tiny_encoder().model;
 
@@ -131,9 +132,10 @@ fn test_whisper_tiny_layernorm_fusion() {
 // timer, which exceeds the old 10s budget under parallel suite load. 120s
 // matches the heavy whisper siblings and still guards against hangs.
 #[ntest::timeout(120000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_tiny_propagate_network_conversion() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test that the Whisper model can be converted to a propagate network
     let model = &whisper_tiny_encoder().model;
     let result = model.to_propagate_network();
@@ -194,9 +196,10 @@ fn test_whisper_tiny_propagate_network_conversion() {
 // exceed 10s under a parallel full-workspace run. Same ~10x margin convention
 // as the 120s/~30s timeouts elsewhere in this suite.
 #[ntest::timeout(60000)]
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_conv1d_ibp() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test IBP propagation through the first Conv1d layer of Whisper
     let network = whisper_tiny_propagate_network();
 
@@ -257,9 +260,10 @@ fn test_whisper_conv1d_ibp() {
 }
 
 #[ntest::timeout(120000)] // ~30s runtime; 4x margin for CI variability.
+#[cfg(feature = "external-whisper")]
 #[test]
 fn test_whisper_first_layers_ibp() {
-    crate::test_fixtures::require_test_model_or_skip!("whisper_tiny_encoder.onnx");
+    crate::test_fixtures::assert_test_model_available!("whisper_tiny_encoder.onnx");
     // Test IBP through Conv1d -> GELU sequence (first few layers)
     let network = whisper_tiny_propagate_network();
 
@@ -267,15 +271,26 @@ fn test_whisper_first_layers_ibp() {
     let mut small_network = PropNetwork::new();
 
     // Find and add the first Conv1d
+    let mut found_conv = false;
     for layer in network.layers() {
         if let PropLayer::Conv1d(c) = layer {
             small_network.add_layer(PropLayer::Conv1d(c.clone()));
+            found_conv = true;
             break;
         }
     }
+    assert!(
+        found_conv,
+        "Whisper conversion must retain a Conv1d layer for the Conv1d -> GELU conformance test"
+    );
 
     // Add a GELU after it
     small_network.add_layer(PropLayer::GELU(GELULayer::default()));
+    assert_eq!(
+        small_network.layers().len(),
+        2,
+        "the bounded fixture must be exactly Conv1d -> GELU"
+    );
 
     // Create test input
     // Keep the sequence length short to keep IBP runtime bounded.

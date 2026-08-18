@@ -8,7 +8,7 @@
 # runtime (no build-script linking), so this builds under the Trust toolchain.
 [package]
 name = "ny-cuda"
-description = "Native CUDA / cuBLAS GEMM engine for ny (NVIDIA datacenter GPUs)"
+description = "Native CUDA / cuBLAS GEMM engine for ny (coherent and discrete NVIDIA GPUs)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,6 +22,17 @@ workspace = true
 [dependencies]
 ny-core = { path = "../ny-core" }
 # dynamic-loading => dlopen CUDA/cuBLAS at runtime (no build-script CUDA link).
-# cuda-13000 bindings (CUDA 13). cudarc < 0.19 rejects CUDA 13 at build time.
+# cuda-13000 bindings (CUDA 13). Runtime provenance uses public CUDA-13
+# symbols across toolkit minors and additionally binds a complete pair of
+# known cuBLASLt delegation exports when that implementation exposes them.
+# cudarc < 0.19 rejects CUDA 13 at build time.
 cudarc = { version = "0.19", default-features = false, features = ["cublas", "driver", "dynamic-loading", "cuda-13000"] }
+libc = "0.2"
+sha2.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Only for `ny_test_utils::env`, the serialized env-var choke point the clippy
+# env wall requires. `default-features = false` keeps ny-tensor out of ny-cuda's
+# dev graph — that module is deliberately dependency-free.
+ny-test-utils = { path = "../ny-test-utils", default-features = false }

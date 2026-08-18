@@ -56,3 +56,8 @@ confidence-threshold = 0.8
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# Every first-party Git dependency is revision-pinned in its manifest. Reject
+# branch/tag/default-branch specifications and allow only NY's exact AY source;
+# a new repository must be reviewed and listed explicitly.
+required-git-spec = "rev"
+allow-git = ["https://github.com/alabsystems/ay.git"]

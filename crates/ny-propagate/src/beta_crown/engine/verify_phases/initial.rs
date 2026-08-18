@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ny_core::{GemmEngine, Result};
+use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::info;
 
@@ -49,7 +49,12 @@ impl BetaCrownVerifier {
             Some(dl) => dl.saturating_duration_since(start_time),
             None => self.config.timeout,
         };
-        let crown_deadline = Some(start_time + effective_total);
+        let crown_deadline = Some(start_time.checked_add(effective_total).ok_or_else(|| {
+            NyError::InvalidConfig(format!(
+                "effective timeout {:?} is too large for the platform monotonic clock",
+                effective_total
+            ))
+        })?);
         let pgd_frac = self
             .config
             .phase_budget
@@ -63,16 +68,44 @@ impl BetaCrownVerifier {
                 .phase_budget
                 .initial_bounds_fraction
                 .clamp(0.0, 1.0);
-            Some(start_time + bab_timeout.mul_f32(frac))
+            Some(
+                start_time
+                    .checked_add(bab_timeout.mul_f32(frac))
+                    .ok_or_else(|| {
+                        NyError::InvalidConfig(
+                            "initial-bounds timeout is too large for the platform monotonic clock"
+                                .to_string(),
+                        )
+                    })?,
+            )
         };
 
-        let initial_computation = self.compute_initial_bounds_and_layer_bounds_engine(
+        let initial_computation = match self.compute_initial_bounds_and_layer_bounds_engine(
             network,
             input,
             Some((threshold, self.config.verify_upper_bound)),
             engine,
             initial_deadline,
-        )?;
+        ) {
+            Ok(computation) => computation,
+            Err(NyError::DeadlineExceeded(_)) => {
+                // A finite bound pass has no authority to start a fresh IBP
+                // sweep after expiry merely to populate `output_bounds`.
+                // Deadline exhaustion is nevertheless a normal verifier
+                // outcome, so translate the typed propagation refusal at this
+                // public BaB boundary into a sound, allocation-free Timeout.
+                return Ok(InitialPhaseOutcome::Early(BetaCrownResult {
+                    result: BabVerificationStatus::Timeout,
+                    domains_explored: 0,
+                    time_elapsed: start_time.elapsed(),
+                    max_depth_reached: 0,
+                    output_bounds: None,
+                    cuts_generated: 0,
+                    domains_verified: 0,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
         let initial_bounds = initial_computation.output_bounds;
         let initial_lower = initial_bounds.lower_scalar();
         let initial_upper = initial_bounds.upper_scalar();
@@ -104,7 +137,7 @@ impl BetaCrownVerifier {
             .domain_is_violation(initial_lower, initial_upper, threshold)
         {
             return Ok(InitialPhaseOutcome::Early(BetaCrownResult {
-                result: BabVerificationStatus::PotentialViolation,
+                result: BabVerificationStatus::potential_violation(),
                 domains_explored: 1,
                 time_elapsed: start_time.elapsed(),
                 max_depth_reached: 0,
@@ -117,11 +150,14 @@ impl BetaCrownVerifier {
         let layer_bounds = if let Some(layer_bounds) = initial_computation.root_layer_bounds {
             layer_bounds
         } else if self.config.use_crown_ibp {
-            network.collect_crown_ibp_bounds_with_engine_and_deadline(
+            self.collect_sequential_crown_ibp_bounds_with_status(
+                network,
                 input,
+                None,
                 engine,
                 initial_deadline,
             )?
+            .bounds
         } else {
             network.collect_ibp_bounds_with_deadline(input, initial_deadline)?
         };

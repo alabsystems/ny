@@ -27,6 +27,28 @@ pub struct BetaCrownResult {
     pub domains_verified: usize,
 }
 
+/// A concrete point a BaB stage already evaluated with its own exact concrete
+/// forward and scored as violating (#advcheck-witness).
+///
+/// SOUNDNESS CONTRACT — this is a CANDIDATE, never a verdict. It rides along
+/// a [`BabVerificationStatus::PotentialViolation`] purely so the post-BaB
+/// confirmer can VERIFY THIS POINT instead of re-searching the root box for a
+/// point the search already held. It confers no trust: the confirmer still
+/// re-evaluates the model at the point and still checks the FULL VNN-LIB
+/// output constraints, and the emitted `sat` still passes the unchanged
+/// trusted ONNX-Runtime gate. A witness that fails either check is discarded
+/// and the caller behaves exactly as it did without one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViolationWitness {
+    /// Flattened input coordinates of the candidate point.
+    pub input: Vec<f32>,
+    /// Shape of `input` as the network consumed it.
+    pub input_shape: Vec<usize>,
+    /// Network output at `input` per the producing stage's concrete forward.
+    /// Diagnostic only — the confirmer re-evaluates rather than trusting it.
+    pub output: Vec<f32>,
+}
+
 /// Status of β-CROWN verification.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BabVerificationStatus {
@@ -39,13 +61,50 @@ pub enum BabVerificationStatus {
         /// Output at the counterexample.
         output: Vec<f32>,
     },
-    /// Property potentially violated: found a domain where upper bound < threshold,
-    /// but no concrete counterexample found.
-    PotentialViolation,
+    /// Property potentially violated: found a domain where upper bound < threshold.
+    ///
+    /// `witness` is `Some` only when the producing stage held a concrete point
+    /// its own exact forward scored as violating (currently the input-split
+    /// `adv_check` PGD probe). `None` is the historical payloadless case: a
+    /// bounds-only violation with no point in hand. The verdict semantics of
+    /// the two are identical — the payload only saves the confirmer from
+    /// re-searching for something already found.
+    PotentialViolation {
+        /// Concrete candidate point, when the producing stage held one.
+        witness: Option<Box<ViolationWitness>>,
+    },
     /// Inconclusive: timed out or hit domain limit.
     Unknown { reason: String },
     /// Verification timed out before completion.
     Timeout,
+}
+
+impl BabVerificationStatus {
+    /// Payloadless `PotentialViolation` — a bounds-only violation with no
+    /// concrete point in hand. This is the historical behaviour and remains
+    /// the right constructor for every producer that only has bounds.
+    pub const fn potential_violation() -> Self {
+        Self::PotentialViolation { witness: None }
+    }
+
+    /// `PotentialViolation` carrying a concrete candidate point.
+    ///
+    /// Callers must only pass a point their own exact concrete forward scored
+    /// as violating. It is still re-verified downstream (see
+    /// [`ViolationWitness`]).
+    pub fn potential_violation_with(witness: ViolationWitness) -> Self {
+        Self::PotentialViolation {
+            witness: Some(Box::new(witness)),
+        }
+    }
+
+    /// The carried candidate point, if any.
+    pub fn potential_violation_witness(&self) -> Option<&ViolationWitness> {
+        match self {
+            Self::PotentialViolation { witness } => witness.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Convert a `BoundedTensor` to a flat `Vec<Bound>`.
@@ -120,7 +179,7 @@ impl From<BetaCrownResult> for VerificationResult {
                 details: None,
                 actual_method: method,
             },
-            BabVerificationStatus::PotentialViolation => {
+            BabVerificationStatus::PotentialViolation { .. } => {
                 let bounds = result
                     .output_bounds
                     .as_ref()
@@ -212,7 +271,7 @@ mod tests {
     #[ntest::timeout(5000)]
     #[test]
     fn test_from_potential_violation() {
-        let beta = make_beta_result(BabVerificationStatus::PotentialViolation);
+        let beta = make_beta_result(BabVerificationStatus::potential_violation());
         let result: VerificationResult = beta.into();
         if let VerificationResult::Unknown { reason, .. } = result {
             assert_eq!(reason, UnknownReason::PotentialViolation);

@@ -77,7 +77,7 @@ fn test_gpu_bab_immediate_potential_violation_upper() {
 
     assert_eq!(
         result.result,
-        BabVerificationStatus::PotentialViolation,
+        BabVerificationStatus::potential_violation(),
         "Should return PotentialViolation when lower >= threshold"
     );
     assert_eq!(result.domains_explored, 1);
@@ -150,7 +150,7 @@ fn test_gpu_bab_lower_bound_potential_violation() {
 
     assert_eq!(
         result.result,
-        BabVerificationStatus::PotentialViolation,
+        BabVerificationStatus::potential_violation(),
         "Should return PotentialViolation when upper < threshold in lower-bound mode"
     );
 }

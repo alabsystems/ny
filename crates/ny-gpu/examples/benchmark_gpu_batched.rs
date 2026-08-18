@@ -78,7 +78,7 @@ fn create_linear_layer(in_features: usize, out_features: usize) -> LinearLayer {
     LinearLayer::new(weight, Some(bias)).expect("LinearLayer creation failed")
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("GPU Batched Domain Processing Benchmark");
     println!("========================================");
     println!();
@@ -88,17 +88,13 @@ fn main() {
     println!();
 
     // Initialize GPU device
-    let gpu_device = match WgpuDevice::new() {
-        Ok(device) => {
-            println!("GPU: wgpu device initialized");
-            device
-        }
-        Err(e) => {
-            println!("GPU initialization failed: {}", e);
-            println!("This benchmark requires a GPU. Use benchmark_batched_domains for CPU-only.");
-            return;
-        }
-    };
+    let gpu_device = WgpuDevice::new().map_err(|error| {
+        format!(
+            "GPU initialization failed: {error}. This benchmark requires a usable WGPU device; \
+             use benchmark_batched_domains for CPU-only measurements"
+        )
+    })?;
+    println!("GPU: wgpu device initialized");
 
     // Network dimensions - larger for GPU benefit
     // At small sizes, GPU overhead dominates. At larger sizes, GPU parallelism wins.
@@ -144,7 +140,9 @@ fn main() {
 
             // Warmup GPU
             for _ in 0..2 {
-                let _ = layer.propagate_linear_batched_with_engine(&domain_refs, &gpu_device);
+                layer
+                    .propagate_linear_batched_with_engine(&domain_refs, &gpu_device)
+                    .expect("GPU warmup propagation must succeed");
             }
 
             // Serial CPU baseline: process one at a time
@@ -152,7 +150,9 @@ fn main() {
             for _ in 0..iterations {
                 for domain in &domain_refs {
                     let single = vec![*domain];
-                    let _ = layer.propagate_linear_batched_with_engine(&single, &cpu_engine);
+                    layer
+                        .propagate_linear_batched_with_engine(&single, &cpu_engine)
+                        .expect("serial CPU propagation must succeed");
                 }
             }
             let serial_time = start.elapsed();
@@ -161,7 +161,9 @@ fn main() {
             // GPU Batched: process all at once
             let start = Instant::now();
             for _ in 0..iterations {
-                let _ = layer.propagate_linear_batched_with_engine(&domain_refs, &gpu_device);
+                layer
+                    .propagate_linear_batched_with_engine(&domain_refs, &gpu_device)
+                    .expect("batched GPU propagation must succeed");
             }
             let gpu_time = start.elapsed();
             let gpu_ms = gpu_time.as_secs_f64() * 1000.0 / iterations as f64;
@@ -214,4 +216,13 @@ fn main() {
         }
     );
     println!();
+
+    if !passed_64_domains || !achieved_10x {
+        return Err(format!(
+            "GPU batched benchmark acceptance failed: 64+ domains={}, best speedup={best_speedup:.2}x",
+            passed_64_domains
+        )
+        .into());
+    }
+    Ok(())
 }

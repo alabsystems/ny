@@ -295,3 +295,72 @@ fn test_constrained_forward_three_input_concat_uses_nary_path_2398() {
         out_hi
     );
 }
+
+// =========================================================================
+// Regression test for #ml4acopf-genbab: n-ary bias wrapper width
+// =========================================================================
+
+/// The constrained n-ary dispatch accumulates a zero-A bias wrapper under
+/// NETWORK_INPUT. Its column count must be the network-input width — the old
+/// code used the FIRST CHILD bound's ncols, which is only right when the
+/// n-ary node's first input IS the network input. On ml4acopf every
+/// constrained pass hit the output `Concat` (first child 38 cols vs input 22),
+/// `CrownMergeAccumulator` widened the input accumulator to infinities, and
+/// every BaB domain bound came back [-inf, +inf].
+///
+/// Miniature of the ml4acopf topology: Concat whose first input is a WIDER
+/// intermediate node (3 cols) than the network input (2 cols). The network is
+/// affine, so constrained CROWN must be exact — and above all FINITE.
+#[test]
+fn test_constrained_backward_concat_bias_wrapper_uses_input_width_ml4acopf() {
+    let linear_a = LinearLayer::new(
+        arr2(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        Some(arr1(&[0.5, -0.5, 1.0])),
+    )
+    .expect("valid linear_a");
+    let linear_b = LinearLayer::new(arr2(&[[1.0, -1.0]]), Some(arr1(&[0.25]))).expect("valid b");
+    let linear_out =
+        LinearLayer::new(arr2(&[[1.0, 2.0, -1.0, 3.0]]), Some(arr1(&[0.0]))).expect("valid out");
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("wide_a", Layer::Linear(linear_a)));
+    graph.add_node(GraphNode::from_input("narrow_b", Layer::Linear(linear_b)));
+    graph.add_node(GraphNode::new(
+        "concat",
+        Layer::Concat(ConcatLayer::new(0)),
+        vec!["wide_a".to_string(), "narrow_b".to_string()],
+    ));
+    graph.add_node(GraphNode::new(
+        "linear_out",
+        Layer::Linear(linear_out),
+        vec!["concat".to_string()],
+    ));
+    graph.set_output("linear_out");
+
+    let input = BoundedTensor::new(arr1(&[-1.0, -1.0]).into_dyn(), arr1(&[1.0, 1.0]).into_dyn())
+        .expect("valid input bounds");
+
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let history = GraphSplitHistory::new();
+    let context = GraphCrownContext::for_history(&history);
+    let (output, _cache) = verifier
+        .propagate_crown_with_graph_constraints(&graph, &input, &context, None, None)
+        .expect("constrained propagation must succeed");
+
+    let (lo, hi) = scalar_interval(&output);
+    assert!(
+        lo.is_finite() && hi.is_finite(),
+        "bias wrapper width mismatch must not widen the input accumulator \
+         to infinities: got [{lo}, {hi}]"
+    );
+    // y = (x0+0.5) + 2(x1-0.5) - (x0+x1+1.0) + 3(x0-x1+0.25) = 3*x0 - 2*x1 - 0.75.
+    // Over x in [-1,1]^2: [-5.75, 4.25]. Affine network => CROWN is exact.
+    assert!(
+        (lo - (-5.75)).abs() < 1e-4,
+        "expected exact affine lower -5.75, got {lo}"
+    );
+    assert!(
+        (hi - 4.25).abs() < 1e-4,
+        "expected exact affine upper 4.25, got {hi}"
+    );
+}

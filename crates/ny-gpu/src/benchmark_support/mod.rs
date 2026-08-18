@@ -13,7 +13,7 @@ pub mod crown_backward_measurements;
 pub mod crown_backward_profiles;
 pub mod crown_backward_workloads;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu-tests"))]
 mod crown_backward_cases_tests;
 #[cfg(test)]
 mod crown_backward_measurements_tests;

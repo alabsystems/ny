@@ -96,8 +96,9 @@ fn measure_crown_baseline(
 /// watchdog in debug, matching the avoice smoke convention).
 #[cfg_attr(not(debug_assertions), ntest::timeout(360000))]
 #[test]
+#[cfg(feature = "external-avoice")]
 fn test_crown_baseline_talker_attention_seq16_3588() {
-    crate::test_fixtures::require_test_model_or_skip!("talker_attention_layer0.onnx");
+    crate::test_fixtures::assert_test_model_available!("talker_attention_layer0.onnx");
     let (graph, softmax_name) = talker_attention_softmax_output_graph();
     let input = bounded_hidden_states_input(TALKER_ATTENTION_SEQ_LEN, TALKER_ATTENTION_EPSILON);
 

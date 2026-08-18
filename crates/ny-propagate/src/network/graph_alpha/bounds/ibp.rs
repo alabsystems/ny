@@ -8,7 +8,8 @@
 
 use crate::layers::{BoundPropagation, Layer};
 use crate::network::core::graph::ibp::dispatch::{
-    check_nan_firewall, classify_node_inputs, ResolvedInputNames,
+    check_nan_firewall, check_nan_firewall_with_poll, classify_node_inputs, intersect_zonotope_ibp,
+    intersect_zonotope_ibp_with_poll, ResolvedInputNames,
 };
 
 use ny_core::{GemmEngine, NyError, Result};
@@ -16,6 +17,33 @@ use ny_tensor::BoundedTensor;
 use std::time::Instant;
 
 use crate::network::core::GraphNetwork;
+
+#[inline]
+fn check_graph_alpha_ibp_deadline(deadline: Instant, node_name: &str, stage: &str) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(NyError::DeadlineExceeded(format!(
+            "Graph IBP: deadline exceeded {stage} for node '{node_name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn concrete_center_with_deadline(
+    bounds: &BoundedTensor,
+    deadline: Option<Instant>,
+    node_name: &str,
+) -> Result<BoundedTensor> {
+    if let Some(deadline) = deadline {
+        let center = bounds.center_with_poll(|| {
+            check_graph_alpha_ibp_deadline(deadline, node_name, "while centering output bounds")
+        })?;
+        BoundedTensor::concrete_with_poll(center, || {
+            check_graph_alpha_ibp_deadline(deadline, node_name, "while centering output bounds")
+        })
+    } else {
+        BoundedTensor::concrete(bounds.center())
+    }
+}
 
 /// Dispatch a single layer's IBP through the engine-aware path when the layer
 /// is a GEMM-heavy type (Linear, Conv1d, Conv2d, ConvTranspose1d,
@@ -26,6 +54,23 @@ pub(super) fn propagate_node_ibp_with_engine(
     layer: &Layer,
     input: &BoundedTensor,
     engine: Option<&dyn GemmEngine>,
+) -> Result<BoundedTensor> {
+    propagate_node_ibp_with_engine_and_deadline(layer, input, engine, None)
+}
+
+/// Deadline-bearing graph-node IBP dispatch.
+///
+/// With a finite deadline, Conv1d, Conv2d, and ConvTranspose1d route their
+/// certified pass through pollable CPU work and never enter the caller engine
+/// or faer. The 1D certificate is a directed-f64 interval contraction; Conv2d's
+/// finite-deadline certificate is the f64 dual-accumulator kernel (strictly
+/// tighter than its deadline=None coefficient-abssum widening,
+/// #cgan-conv-ibp-magnitude-floor).
+pub(super) fn propagate_node_ibp_with_engine_and_deadline(
+    layer: &Layer,
+    input: &BoundedTensor,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
 ) -> Result<BoundedTensor> {
     match layer {
         // Linear/MatMul already round their IBP endpoints OUTWARD internally (1-D:
@@ -39,11 +84,15 @@ pub(super) fn propagate_node_ibp_with_engine(
         // mis-classifies a truly-unstable neuron as stable-active → a FALSE VERIFIED.
         // Node bounds MUST be the SOUND (abssum-Higham, directed) forward.
         // (#vnncomp-aw-soundness self-audit — intermediate-bound false-proof.)
-        Layer::Conv2d(c) => c.propagate_ibp_sound_with_engine(input, engine),
-        // Conv1d / ConvTranspose1d / ConvTranspose2d share the identical round-to-nearest
-        // f32 node-bound gap; each now has the same Higham-sound forward.
-        Layer::Conv1d(c) => c.propagate_ibp_sound_with_engine(input, engine),
-        Layer::ConvTranspose1d(c) => c.propagate_ibp_sound_with_engine(input, engine),
+        Layer::Conv2d(c) => c.propagate_ibp_sound_with_engine_and_deadline(input, engine, deadline),
+        // Conv1d / ConvTranspose1d / ConvTranspose2d share the identical
+        // round-to-nearest f32 node-bound gap. The 1D variants also carry the
+        // graph authority through their pollable primary and directed-f64
+        // certificate passes.
+        Layer::Conv1d(c) => c.propagate_ibp_sound_with_engine_and_deadline(input, engine, deadline),
+        Layer::ConvTranspose1d(c) => {
+            c.propagate_ibp_sound_with_engine_and_deadline(input, engine, deadline)
+        }
         Layer::ConvTranspose2d(c) => c.propagate_ibp_sound_with_engine(input, engine),
         _ => layer.propagate_ibp(input),
     }
@@ -55,7 +104,7 @@ impl GraphNetwork {
         &self,
         input: &BoundedTensor,
     ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
-        self.collect_node_bounds_core(input, false, None, None, false)
+        self.collect_node_bounds_core(input, false, None, None, None, false)
     }
 
     /// Collect per-node activations for a POINT (degenerate) input, collapsing
@@ -64,14 +113,19 @@ impl GraphNetwork {
     /// center-collapse, #cgan-eval). Returns the full per-node cache whose
     /// `.center()`/`.lower()` equal the true network activation of that node to ~ULP.
     ///
-    /// Diagnostic-only (used by the `NY_LOOSENESS_PROBE`): non-soundness-critical,
-    /// never feeds a verdict. The caller must pass a degenerate box (lower == upper).
+    /// Current consumers are the `NY_LOOSENESS_PROBE` and the default-dark
+    /// envelope-gradient steering heuristic. This cache is not a certified
+    /// enclosure for any non-degenerate domain and must not be published as a
+    /// verdict-bearing bound. The steering consumer can influence a later
+    /// certified bound indirectly through its choice of alpha, which remains in
+    /// the valid [0,1] relaxation domain. The caller must pass a degenerate box
+    /// (lower == upper).
     pub fn collect_node_activations_pointwise(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
-        self.collect_node_bounds_core(input, false, engine, None, true)
+        self.collect_node_bounds_core(input, false, engine, None, None, true)
     }
 
     /// Collect IBP bounds at each node, with optional GPU engine acceleration.
@@ -84,7 +138,7 @@ impl GraphNetwork {
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
     ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
-        self.collect_node_bounds_core(input, false, engine, None, false)
+        self.collect_node_bounds_core(input, false, engine, None, None, false)
     }
 
     /// Collect IBP bounds at each node, aborting when the deadline is exceeded.
@@ -94,7 +148,7 @@ impl GraphNetwork {
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
     ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
-        self.collect_node_bounds_core(input, false, engine, deadline, false)
+        self.collect_node_bounds_core(input, false, engine, deadline, deadline, false)
     }
 
     /// Collect IBP bounds at each node, allowing sqrt inputs to be clamped.
@@ -105,7 +159,56 @@ impl GraphNetwork {
         &self,
         input: &BoundedTensor,
     ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
-        self.collect_node_bounds_core(input, true, None, None, false)
+        self.collect_node_bounds_core(input, true, None, None, None, false)
+    }
+
+    /// `deadline` is the LOOP authority: it aborts the collection between nodes.
+    /// `layer_deadline` is what reaches the layer kernels, and it is a different
+    /// question. A finite layer deadline forces every Conv2d off im2col+GEMM onto
+    /// `conv2d_ibp_forward_grouped_with_deadline`, a serial per-MAC pollable scalar
+    /// contraction (`conv2d/ops_ibp_fwd.rs`), and makes `conv2d/bound.rs`'s
+    /// `propagate_ibp_with_engine_and_deadline`
+    /// discard the engine outright. The two routes are documented as
+    /// "mathematically identical"; the finite-deadline one buys INTRA-node
+    /// cancellation and pays for it in throughput.
+    ///
+    /// Verdict paths want that trade and keep passing `layer_deadline == deadline`.
+    /// ATTACK-ONLY node collection: layer kernels keep their im2col/GEMM route.
+    ///
+    /// `attack_point_gradient` was measured at **8.5 s/step** on
+    /// CIFAR100_resnet_large, which gives the upfront falsification lane ZERO
+    /// gradient steps inside its 4 s slice. This module's own
+    /// `point_vjp_batched_resnet.rs:9-12` records the same call on the same model
+    /// family at **~93 ms/step** — a ~91x regression, and the cause is entirely
+    /// the finite deadline reaching the kernels: 20 convs x 2 passes is ~718M
+    /// serial per-MAC scalar iterations with `IxDyn` indexing, checked arithmetic
+    /// and a poll counter, on one core.
+    ///
+    /// THE BOUND ONLY EVER TIGHTENS. The plain forward
+    /// `conv2d_ibp_forward_grouped_with_deadline` is documented as
+    /// "mathematically identical to `conv2d_ibp_forward_grouped`", and since
+    /// #cgan-conv-ibp-magnitude-floor the finite-deadline SOUND arm is the
+    /// certified f64 dual-accumulator kernel, whose enclosure is at least as
+    /// tight as the deadline=None abssum-Higham construction — so this
+    /// attack-only route (which skips the layer deadline) sees node boxes that
+    /// are the same or LOOSER than the verdict route's, never tighter. What is
+    /// given up is INTRA-node cancellation, so a timeout can overshoot by at
+    /// most one node's kernel — the largest here is a 37.7M-MAC f32 im2col
+    /// GEMM, single-digit milliseconds. The per-NODE check in the collection
+    /// loop still fires.
+    ///
+    /// NEVER call this from a verdict path. It is admissible here only because
+    /// `attack_point_gradient` carries NO verdict authority: it steers a search,
+    /// and every candidate it produces still passes the trusted-ORT and true-f64
+    /// admission gates before it can become a `sat`. A wrong or late attack
+    /// gradient can only waste steps; it cannot manufacture a verdict.
+    pub fn collect_node_bounds_attack_point(
+        &self,
+        input: &BoundedTensor,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
+    ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
+        self.collect_node_bounds_core(input, false, engine, deadline, None, false)
     }
 
     fn collect_node_bounds_core(
@@ -114,6 +217,7 @@ impl GraphNetwork {
         allow_negative_sqrt: bool,
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
+        layer_deadline: Option<Instant>,
         collapse_to_center: bool,
     ) -> Result<std::collections::HashMap<String, BoundedTensor>> {
         // NOTE on the L2/Cauchy–Schwarz lever inside CROWN: an outer CROWN scope
@@ -149,25 +253,49 @@ impl GraphNetwork {
                 &bounds_cache,
                 allow_negative_sqrt,
                 engine,
+                layer_deadline,
             )?;
 
             // NaN firewall (#3768): guard the 5th IBP path like the other 4.
-            check_nan_firewall(
-                &output_bounds,
-                "collect_node_bounds",
-                node_name,
-                node.layer.layer_type(),
-            )?;
+            if let Some(deadline) = deadline {
+                check_nan_firewall_with_poll(
+                    &output_bounds,
+                    "collect_node_bounds",
+                    node_name,
+                    node.layer.layer_type(),
+                    || {
+                        check_graph_alpha_ibp_deadline(
+                            deadline,
+                            node_name,
+                            "while checking the NaN firewall",
+                        )
+                    },
+                )?;
+            } else {
+                check_nan_firewall(
+                    &output_bounds,
+                    "collect_node_bounds",
+                    node_name,
+                    node.layer.layer_type(),
+                )?;
+            }
 
             // Faithful point forward (#cgan-eval): collapse to the interval center so a
             // point input stays degenerate through every node and per-node soundness
             // widening cannot be amplified downstream. Diagnostic use only.
             let output_bounds = if collapse_to_center {
-                BoundedTensor::concrete(output_bounds.center())?
+                concrete_center_with_deadline(&output_bounds, deadline, node_name)?
             } else {
                 output_bounds
             };
 
+            if let Some(deadline) = deadline {
+                check_graph_alpha_ibp_deadline(
+                    deadline,
+                    node_name,
+                    "before caching output bounds",
+                )?;
+            }
             bounds_cache.insert(node_name.clone(), output_bounds);
         }
 
@@ -178,7 +306,7 @@ impl GraphNetwork {
     /// `bounds_cache` (the network input box for `NETWORK_INPUT`). Extracted
     /// verbatim from [`Self::collect_node_bounds_core`] so the #stabilize
     /// downstream resweep can reuse the exact same sound per-node dispatch.
-    fn node_ibp_step(
+    pub(super) fn node_ibp_step(
         &self,
         node_name: &str,
         node: &crate::network::GraphNode,
@@ -186,6 +314,7 @@ impl GraphNetwork {
         bounds_cache: &std::collections::HashMap<String, BoundedTensor>,
         allow_negative_sqrt: bool,
         engine: Option<&dyn GemmEngine>,
+        deadline: Option<Instant>,
     ) -> Result<BoundedTensor> {
         // Classify node arity via the shared accessor-based classifier (#2633).
         // This replaces 15 direct `node.inputs[N]` indexing sites with safe
@@ -204,7 +333,12 @@ impl GraphNetwork {
                         sqrt.propagate_ibp_lenient(bounds)?
                     }
                     // Route GEMM-heavy layers through engine-aware IBP (#4174).
-                    _ => propagate_node_ibp_with_engine(&node.layer, bounds, engine)?,
+                    _ => propagate_node_ibp_with_engine_and_deadline(
+                        &node.layer,
+                        bounds,
+                        engine,
+                        deadline,
+                    )?,
                 }
             }
             ResolvedInputNames::Binary(name_a, name_b) => {
@@ -227,9 +361,17 @@ impl GraphNetwork {
                         let ibp = node.layer.propagate_ibp_binary(input_a, input_b)?;
                         match self.try_ffn_swiglu_bounds_zonotope(node, input, bounds_cache)? {
                             Some(zono) => {
-                                crate::network::core::graph::ibp::dispatch::intersect_zonotope_ibp(
-                                    zono, ibp,
-                                )
+                                if let Some(deadline) = deadline {
+                                    intersect_zonotope_ibp_with_poll(zono, ibp, || {
+                                        check_graph_alpha_ibp_deadline(
+                                            deadline,
+                                            node_name,
+                                            "while intersecting zonotope bounds",
+                                        )
+                                    })?
+                                } else {
+                                    intersect_zonotope_ibp(zono, ibp)
+                                }
                             }
                             None => ibp,
                         }
@@ -335,11 +477,12 @@ impl GraphNetwork {
             if !bounds.contains_key(node_name) {
                 continue;
             }
-            let step = match self.node_ibp_step(node_name, node, input, bounds, false, engine) {
-                Ok(b) => b,
-                // Keep the stored sound bound on any per-node failure.
-                Err(_) => continue,
-            };
+            let step =
+                match self.node_ibp_step(node_name, node, input, bounds, false, engine, deadline) {
+                    Ok(b) => b,
+                    // Keep the stored sound bound on any per-node failure.
+                    Err(_) => continue,
+                };
             let Some(stored) = bounds.get(node_name) else {
                 continue;
             };
@@ -347,7 +490,25 @@ impl GraphNetwork {
                 continue;
             }
             // Shrink-only merge (NaN ⇒ None ⇒ keep stored; disjoint ⇒ union).
-            if let Some((tightened, _disjoint)) = stored.intersection_per_element(&step) {
+            // Under a finite deadline, build the candidate off-map and poll
+            // bounded chunks. Expiry leaves this node uncommitted and preserves
+            // the documented sound prefix of prior merges.
+            let tightened = if let Some(deadline) = deadline {
+                match stored.intersection_per_element_with_poll(&step, || {
+                    check_graph_alpha_ibp_deadline(
+                        deadline,
+                        node_name,
+                        "while intersecting stored bounds",
+                    )
+                }) {
+                    Ok(result) => result,
+                    Err(error) if error.is_deadline_exceeded() => break,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                stored.intersection_per_element(&step)
+            };
+            if let Some((tightened, _disjoint)) = tightened {
                 bounds.insert(node_name.clone(), tightened);
                 merged += 1;
             }

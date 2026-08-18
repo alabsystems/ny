@@ -12,6 +12,10 @@
 
 mod attack_budget;
 mod attack_extension;
+/// Adaptive attack stall cutoff (#attack-stall, design S4): stop a disjunctive
+/// PGD phase whose margin has plateaued and let the bound/BaB phases have the
+/// rest. Default-inert; attack-budget only.
+mod attack_stall;
 mod constraint_iter;
 mod disjunctive;
 /// Batched box-refinement screen for per-clause-input-box disjunctions
@@ -29,6 +33,13 @@ mod graph_pgd_exact;
 mod graph_pgd_init;
 mod graph_pgd_vjp_batched;
 mod graph_pgd_vjp_batched_disj;
+/// Default-off exact adaptive complete cover for authenticated NN4SYS clause
+/// boxes with two or three genuinely ranged input coordinates.
+mod nn4sys_nd_cover;
+/// Default-off exact dyadic complete-cover prepass for NN4SYS per-clause
+/// boxes with one genuinely ranged input coordinate. A result is authoritative
+/// only after all leaves in the eligible subset close.
+mod nn4sys_scalar_cover;
 pub(super) mod ort_attack;
 mod pgd;
 mod pgd_precheck;
@@ -47,6 +58,8 @@ mod tests_graph_disjunctive;
 #[cfg(test)]
 mod tests_graph_pgd;
 #[cfg(test)]
+mod tests_objective_direction;
+#[cfg(test)]
 mod tests_precheck;
 
 use anyhow::Result;
@@ -58,6 +71,8 @@ use ny_propagate::{
 };
 use ny_tensor::BoundedTensor;
 use std::time::Instant;
+
+use self::phase_budget::PhaseBudgetLedger;
 
 // Re-exports for submodules — these items are used across multiple split files.
 pub(crate) use super::constraint_eval::augment_network_with_spec;
@@ -78,10 +93,59 @@ pub(super) fn normalize_result_wall_time(
     result
 }
 
+/// Pin `verify_upper_bound` to the objective ENCODING this subtree uses.
+///
+/// `BetaCrownConfig::verify_upper_bound` does not describe the property — it
+/// describes how the objective handed to the engine is written down. The
+/// engine's stop test is `BetaCrownConfig::domain_is_verified_for_mode`:
+/// `upper < threshold` when the flag is set, `lower > threshold` when it is not.
+///
+/// This CLI has exactly two encodings and only ONE of them is flag-driven:
+///
+/// * [`verify_standard`] passes the RAW one-hot objective `+Y_idx` together with
+///   the spec's own constant, so the direction genuinely varies per constraint
+///   (`Y_i >= c` unsafe ⇒ prove `upper(Y_i) < c`). `prepare_inputs` /
+///   `constraint_plan::extract_constant_params` computes exactly that flag, and
+///   that path keeps it.
+///
+/// * everything reachable from [`verify_relational_constraints_with_ledger`] builds its
+///   objectives with `constraint_plan::build_constraint_objective`, which
+///   SIGN-NORMALIZES every row into violation semantics: `Y_i >= c` becomes
+///   `(-1·Y_i, -c)` and `Y_i <= c` becomes `(+1·Y_i, +c)`. Proving a row's
+///   constraint impossible is then ALWAYS `lower(spec·Y) > threshold`, for
+///   every row, regardless of the original comparator — i.e.
+///   `verify_upper_bound == false`, unconditionally.
+///
+/// The two conventions used to be crossed. The flag was derived from the FIRST
+/// constant constraint of the WHOLE spec and then handed, unchanged, to the
+/// sign-normalized subtree. On the ml4acopf disjunction
+/// `(or (>= Y_159 0.01) (<= Y_159 -0.01))` the first constraint is `>=`, so the
+/// flag came out `true` and the per-clause lane tested `upper(-Y_159) < -0.01`,
+/// i.e. `lower(Y_159) > 0.01` — the exact NEGATION of the clause it was asked to
+/// refute (measured: both clauses logged `threshold: -0.01, verify_upper=true`).
+///
+/// That is not merely incomplete. On a box where the unsafe clause holds
+/// everywhere the inverted test SUCCEEDS, reporting `Verified` for a property
+/// that is actually violated — an unsound `unsat`.
+///
+/// The graph multi-objective engine is lower-bound-only: its domains pass a hard
+/// `false` (`MultiObjectiveGraphBabDomain::update_bounds(.., false)`), and its
+/// public ingress now rejects `verify_upper_bound=true` before any root or child
+/// verdict can acquire authority. This helper states the same contract at the
+/// entry to the sign-normalized CLI subtree, so the single-objective
+/// per-constraint / per-clause / grouped-disjunctive lanes agree with it.
+pub(super) fn config_for_normalized_objectives(config: &BetaCrownConfig) -> BetaCrownConfig {
+    BetaCrownConfig {
+        verify_upper_bound: false,
+        ..config.clone()
+    }
+}
+
 /// Verify with relational constraints (Y_i <= Y_j, Y_i >= Y_j, etc.)
 // Justification: Verification dispatch forwards CLI-specified parameters (model, input,
 // spec, config, verifier, flags, engine) that are assembled by different callers.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn verify_relational_constraints(
     model_net: &BetaCrownModel,
     input: &BoundedTensor,
@@ -97,6 +161,63 @@ pub(super) fn verify_relational_constraints(
     gemm_engine: Option<&dyn GemmEngine>,
     json: bool,
 ) -> Result<BetaCrownResult> {
+    let ledger = PhaseBudgetLedger::new(timeout, config.phase_budget.clone())
+        .with_static_mip_ineligibility(super::dispatch::graph_mip_statically_ineligible(model_net));
+    verify_relational_constraints_with_ledger(
+        model_net,
+        input,
+        vnnlib,
+        config,
+        verifier,
+        use_relu_split,
+        gpu_bab,
+        pgd_attack,
+        pgd_restarts,
+        pgd_steps,
+        timeout,
+        gemm_engine,
+        // Test face: mirror the pre-quarantine world where the single engine
+        // handle also reached the attack lanes (pre-resolved, no arming).
+        super::attack_arming::AttackEngineSource::Static(gemm_engine),
+        json,
+        &ledger,
+    )
+}
+
+/// Dispatch relational verification under an already-started authoritative
+/// phase ledger. The CLI BaB entry uses this face so IBP/model setup time is
+/// charged once and explicit-`bab` MIP policy reaches every nested lane.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_relational_constraints_with_ledger(
+    model_net: &BetaCrownModel,
+    input: &BoundedTensor,
+    vnnlib: &VnnLibSpec,
+    config: &BetaCrownConfig,
+    verifier: &BetaCrownVerifier,
+    use_relu_split: bool,
+    gpu_bab: bool,
+    pgd_attack: bool,
+    pgd_restarts: usize,
+    pgd_steps: usize,
+    timeout: u64,
+    gemm_engine: Option<&dyn GemmEngine>,
+    attack_engine_source: super::attack_arming::AttackEngineSource<'_>,
+    json: bool,
+    ledger: &PhaseBudgetLedger,
+) -> Result<BetaCrownResult> {
+    // ENTRY to the sign-normalized objective subtree: every lane below builds
+    // its rows with `build_constraint_objective`, whose violation-semantics
+    // encoding is decided by `lower(spec·Y) > threshold` for EVERY row. Pin the
+    // engine's direction flag to that encoding here — see
+    // `config_for_normalized_objectives` for why the incoming flag (computed
+    // from the raw spec for `verify_standard`) is the wrong one to carry in.
+    // The verifier is rebuilt from the same config so the lanes that read
+    // `verifier.config.verify_upper_bound` directly (grouped-disjunctive child
+    // batches, relaxed clip, input-split scoring) agree with the stop test.
+    let config = &config_for_normalized_objectives(config);
+    let normalized_verifier = verifier.with_config_from(config.clone());
+    let verifier = &normalized_verifier;
+
     // Per-clause-box disjunctions route to the disjunctive lane even with a
     // SINGLE clause (nn4sys mscn `_dual` cardinality_1_1): the clause's own
     // input box + band constraint can only be decided by the box-refinement
@@ -118,7 +239,9 @@ pub(super) fn verify_relational_constraints(
             pgd_steps,
             timeout,
             gemm_engine,
+            attack_engine_source,
             json,
+            ledger,
         );
     }
 
@@ -135,8 +258,95 @@ pub(super) fn verify_relational_constraints(
         pgd_steps,
         timeout,
         gemm_engine,
+        attack_engine_source,
         json,
+        ledger,
     )
+}
+
+/// Whether a sequential relational property needs the shared multi-row graph lane.
+///
+/// For an unsafe conjunction, proving any one normalized row impossible is enough
+/// to discharge a subdomain, and the any-row certificate is never weaker than the
+/// sequential max-diff one GIVEN THE SAME INTERMEDIATES (dense MaxPool lowers via
+/// a single argmax row, `layers/pooling/max.rs:455-505`, so `lb(d_i*) <= max_j
+/// lb(d_j)`).
+///
+/// But the intermediates are NOT the same. An input-split same-LHS property that
+/// is reducible stays on the sequential engine precisely because that engine
+/// recomputes CROWN-IBP intermediate bounds PER DOMAIN
+/// (`engine/input_split.rs:484-501`), while the graph input-split engine
+/// structurally forbids CROWN-IBP (`beta_crown/mod.rs:1544-1554`, "disabling
+/// unsupported CROWN-IBP") and falls back to a forward-linear root map plus
+/// per-domain IBP. Looser intermediates give looser ReLU triangles, so each input
+/// split discharges less and the frontier outgrows the search.
+///
+/// Measured: dropping this exclusion (faa66c38) sent official acasxu prop_3/prop_4
+/// from `unsat` in ~45-51s to `timeout` at 116s with ~71k domains explored; the
+/// commit's own removed comment recorded 4_2/prop_3 at 672 domains / ~4s on the
+/// sequential lane versus >100k domains / timeout on the graph lane. Restoring the
+/// exclusion trades one SOUND certificate for another — faa66c38 added no verdict
+/// authority (its comment: "adds no new verdict authority") — so this is a routing
+/// choice, never a soundness one.
+pub(super) fn should_upgrade_sequential_conjunction_to_graph(
+    vnnlib: &VnnLibSpec,
+    use_relu_split: bool,
+) -> bool {
+    if classify_constraints(vnnlib).aggregation != AggregationMode::Conjunctive
+        || vnnlib.output_constraints.len() < 2
+    {
+        return false;
+    }
+    // Reducible same-LHS input-split properties (acasxu prop_2/3/4) keep the
+    // sequential lane and its per-domain CROWN-IBP intermediates. ReLU splitting
+    // and non-reducible conjunctions still upgrade.
+    use_relu_split || sequential::normalize_same_lhs_reduction(vnnlib).is_none()
+}
+
+/// Adapt the bound bootstrap when a same-LHS Sequential conjunction is routed
+/// through the Graph input-split engine.
+///
+/// Top-level capability resolution still sees a Sequential model, so an ACAS
+/// invocation can arrive here with `use_crown_ibp=true` (as the proof-only trace
+/// did). Carrying that bit literally across this later representation boundary
+/// has a very different cost: with no precomputed map, graph spec-CROWN runs its
+/// O(N^2) per-target DAG CROWN-IBP collector. On CPU the converted ACAS MLP can
+/// spend the complete property deadline there before exploring a domain. A
+/// forward-linear root map is a certified, bounded-cost bootstrap for this small
+/// unary graph. Per-domain IBP enhancement then refreshes the references after
+/// every input split, retaining plain-CROWN behavior instead of freezing root
+/// intermediates.
+///
+/// Keep this adaptation restricted to the newly upgraded same-LHS input-split
+/// route. Native Graph models, ReLU splitting, non-reducible conjunctions, and
+/// explicitly selected alpha-CROWN retain their incoming configuration.
+pub(super) fn config_for_sequential_conjunction_graph(
+    config: &BetaCrownConfig,
+    vnnlib: &VnnLibSpec,
+    use_relu_split: bool,
+) -> BetaCrownConfig {
+    let mut graph_config = config.clone();
+    if !use_relu_split
+        && !config.use_alpha_crown
+        && sequential::normalize_same_lhs_reduction(vnnlib).is_some()
+    {
+        graph_config.use_forward_bounds = true;
+        graph_config.use_crown_ibp = false;
+        graph_config.input_split_ibp_enhancement = true;
+    }
+    graph_config
+}
+
+/// Resolve the exact config used after the late Sequential-to-Graph
+/// representation boundary. Keeping this as one planning seam lets both the
+/// verifier and the effective-treatment evidence describe the same route.
+pub(super) fn planned_sequential_conjunction_graph_config(
+    config: &BetaCrownConfig,
+    vnnlib: &VnnLibSpec,
+    use_relu_split: bool,
+) -> Option<BetaCrownConfig> {
+    should_upgrade_sequential_conjunction_to_graph(vnnlib, use_relu_split)
+        .then(|| config_for_sequential_conjunction_graph(config, vnnlib, use_relu_split))
 }
 
 // Justification: Core verification implementation — parameters represent independent
@@ -155,7 +365,12 @@ fn verify_relational_constraints_impl(
     pgd_steps: usize,
     timeout: u64,
     gemm_engine: Option<&dyn GemmEngine>,
+    // #attack-steering-conjunctive: the falsification accelerator channel. Kept
+    // SEPARATE from `gemm_engine` (the quarantined proof handle) all the way to
+    // the upfront-PGD call site — see `graph::verify_graph_relational`.
+    attack_engine_source: super::attack_arming::AttackEngineSource<'_>,
     json: bool,
+    ledger: &PhaseBudgetLedger,
 ) -> Result<BetaCrownResult> {
     // For conjunctive properties with >=2 constraints on Sequential models, convert
     // to Graph and use the multi-objective conjunctive BaB path. Joint BaB is
@@ -167,46 +382,30 @@ fn verify_relational_constraints_impl(
     // (shared CROWN backward pass across all specs). Sequential feedforward networks
     // (e.g., sat_relu, lsnc_relu) are trivially convertible via from_sequential.
     //
+    // Same-LHS relational conjunctions belong on this path too. The sequential
+    // reduction appends a synthetic MaxPool to the signed-difference rows. For an
+    // unstable MaxPool window its certified lower relaxation routes through one
+    // `argmax(lower)` row, discarding the other per-row CROWN certificates. The
+    // graph lane retains every signed-difference row and closes a box only when
+    // ANY row has a certified `lower > threshold`. This is the reference
+    // `stop_criterion_batch_any` semantics and adds no new verdict authority.
+    //
+    // `use_relu_split` is threaded through unchanged below: input-split callers
+    // still enter the graph input-split engine, not ReLU-split BaB.
     // Reference: designs/2026-03-05-joint-conjunctive-bab.md Phase 4.
     if let BetaCrownModel::Sequential(network) = model_net {
-        let classification = classify_constraints(vnnlib);
-        let is_conjunctive = classification.aggregation == AggregationMode::Conjunctive;
-        let total_constraints = vnnlib.output_constraints.len();
-
-        // Upgrade Sequential → Graph for multi-objective conjunctive BaB when using
-        // ReLU splitting, OR when input splitting and the same-LHS max-diff reduction
-        // does NOT apply.
-        //
-        // With input splitting, the routing is decided by the property SHAPE
-        // (MEASURED 2026-07-10, contention-matched A/B):
-        //
-        // - Same-LHS relational conjunctions (acasxu prop_2/3/4: Y_0 vs Y_1..Y_4):
-        //   stay on the sequential pipeline, whose reduced max-diff phase encodes
-        //   min over x of max_j(violation_j) via MaxPool. CROWN's max relaxation can
-        //   pick convex combinations that dominate EVERY single row, so it decides
-        //   joint-witness conjunctions (the verifying conjunct varies across the box)
-        //   per-domain, where the multi-objective any-row check needs to split until
-        //   one row dominates each box: 4_2/prop_3 = 672 max-diff domains (~4s BaB)
-        //   vs any-row TIMEOUT at 116s (>100k domains); 1_5/prop_2 any-row explored
-        //   981k domains (depth 33, 494s BaB) without converging.
-        //
-        // - Everything else (constant/mixed conjunctions, no max-diff reduction:
-        //   sat_relu Y_0>=1 AND Y_1<=0, lsnc band constraints): upgrade to the graph
-        //   multi-objective conjunctive input-split lane — the sequential pipeline
-        //   has no joint engine for these (reduced verification bails to the weaker
-        //   per-constraint decomposition). MEASURED: sat_relu unsat_v30_c38
-        //   unsat 36.4s → 2s; lsnc quadrotor2d_state_0 unsat 29.9s → 28s (contended).
-        //
-        // Ref: #1923 — the conjunctive upgrade previously hardcoded use_relu_split=true,
-        // routing input-split models through ReLU-split BaB and causing ACAS-Xu 4_x
-        // timeout (19583 domains, 0 verified). That regression does not reapply:
-        // `use_relu_split` is threaded through unchanged, so input-split models that
-        // upgrade here run `verify_graph_input_split_multi_objective_conjunctive`,
-        // not ReLU-split BaB; and acasxu-shaped properties don't upgrade at all.
-        let same_lhs_reducible = sequential::normalize_same_lhs_reduction(vnnlib).is_some();
-        if is_conjunctive && total_constraints >= 2 && (use_relu_split || !same_lhs_reducible) {
+        if let Some(mut graph_config) =
+            planned_sequential_conjunction_graph_config(config, vnnlib, use_relu_split)
+        {
+            // This is a late representation boundary: carry the adapted
+            // config into a matching verifier and anchor it to the ledger's
+            // actual remaining budget.  Passing the incoming verifier left
+            // its forward/CROWN-IBP policy inconsistent with graph_config.
+            graph_config.timeout = graph_config.timeout.min(ledger.remaining_for_engine());
+            let graph_verifier = verifier.with_config_from(graph_config.clone());
+            let total_constraints = vnnlib.output_constraints.len();
             let mut graph = GraphNetwork::from_sequential(network)?;
-            graph.set_use_patches_mode(config.use_patches());
+            graph.set_use_patches_mode(graph_config.use_patches());
             if !json {
                 println!(
                     "\n  Conjunctive property ({} constraints): upgrading to Graph multi-objective BaB",
@@ -217,13 +416,16 @@ fn verify_relational_constraints_impl(
                 &graph,
                 input,
                 vnnlib,
-                config,
-                verifier,
+                &graph_config,
+                &graph_verifier,
                 use_relu_split,
                 gpu_bab,
+                pgd_attack,
                 timeout,
                 gemm_engine,
+                attack_engine_source,
                 json,
+                ledger,
             );
         }
     }
@@ -237,9 +439,12 @@ fn verify_relational_constraints_impl(
             verifier,
             use_relu_split,
             gpu_bab,
+            pgd_attack,
             timeout,
             gemm_engine,
+            attack_engine_source,
             json,
+            ledger,
         )
     } else {
         let network = match model_net {
@@ -263,6 +468,7 @@ fn verify_relational_constraints_impl(
             timeout,
             gemm_engine,
             json,
+            ledger,
         )
     }
 }
@@ -297,7 +503,7 @@ fn disjunctive_failure_to_final_status(
             counterexample: counterexample.clone(),
             output: output.clone(),
         },
-        BabVerificationStatus::PotentialViolation => BabVerificationStatus::Unknown {
+        BabVerificationStatus::PotentialViolation { .. } => BabVerificationStatus::Unknown {
             reason: format!(
                 "Constraint {} may hold; disjunctive safety requires all constraints to be provably violated",
                 constraint_desc
@@ -365,6 +571,13 @@ pub(super) fn check_unsafe_counterexample(
     output: &ArrayD<f32>,
     constraints: &[OutputConstraint],
 ) -> bool {
+    // This is the final SAT authority used by attacks and exact-cell routes.
+    // Non-finite network outputs are numerical failures, not witnesses; IEEE
+    // comparisons such as `inf <= inf` must not confirm a counterexample.
+    if output.is_empty() || output.iter().any(|value| !value.is_finite()) {
+        return false;
+    }
+
     /// Safely retrieve an output value by index. Returns `None` on OOB,
     /// preventing silent 0.0 substitution. Part of #4375.
     fn out_at(output: &ArrayD<f32>, i: usize) -> Option<f32> {
@@ -385,16 +598,16 @@ pub(super) fn check_unsafe_counterexample(
                 matches!((out_at(output, *i), out_at(output, *j)), (Some(yi), Some(yj)) if yi > yj)
             }
             OutputConstraint::LessEqConst(i, c) => {
-                out_at(output, *i).is_some_and(|y| y <= *c as f32)
+                c.is_finite() && out_at(output, *i).is_some_and(|y| f64::from(y) <= *c)
             }
             OutputConstraint::LessThanConst(i, c) => {
-                out_at(output, *i).is_some_and(|y| y < *c as f32)
+                c.is_finite() && out_at(output, *i).is_some_and(|y| f64::from(y) < *c)
             }
             OutputConstraint::GreaterEqConst(i, c) => {
-                out_at(output, *i).is_some_and(|y| y >= *c as f32)
+                c.is_finite() && out_at(output, *i).is_some_and(|y| f64::from(y) >= *c)
             }
             OutputConstraint::GreaterThanConst(i, c) => {
-                out_at(output, *i).is_some_and(|y| y > *c as f32)
+                c.is_finite() && out_at(output, *i).is_some_and(|y| f64::from(y) > *c)
             }
             _ => false, // unknown constraint variants cannot confirm unsafe
         };

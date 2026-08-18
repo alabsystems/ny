@@ -122,6 +122,23 @@ fn resident_weights_enabled() -> bool {
 }
 
 impl WgpuDevice {
+    /// Checked bytes retained by the resident-weight cache on this exact
+    /// device. Use the actual logical buffer size so API-required padding is
+    /// charged as well as the retained tensor payload.
+    pub(crate) fn resident_weight_cache_bytes(&self) -> Result<usize> {
+        let cache = self.resident_weight_buffers.lock().map_err(|err| {
+            NyError::InternalError(format!("resident weight cache lock poisoned: {err}"))
+        })?;
+        cache.values().try_fold(0usize, |total, entry| {
+            let bytes = usize::try_from(entry.buffer.size()).map_err(|_| {
+                NyError::InternalError("resident weight buffer size does not fit in usize".into())
+            })?;
+            total.checked_add(bytes).ok_or_else(|| {
+                NyError::InternalError("resident weight cache byte count overflow".into())
+            })
+        })
+    }
+
     /// Look up (or upload once) the GPU-resident buffer for `weight` in `form`.
     ///
     /// On a hit the buffer is returned without touching the queue (no upload,
@@ -210,6 +227,9 @@ impl WgpuDevice {
                 self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&wt));
             }
         }
+        super::intermediate_sweep::note_host_to_device(
+            weight.len().saturating_mul(size_of::<f32>()),
+        );
         self.resident_weight_uploads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(buf)
